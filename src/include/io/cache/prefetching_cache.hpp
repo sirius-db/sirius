@@ -17,10 +17,12 @@
 #pragma once
 
 #include "blockingconcurrentqueue.h"
+#include "cuda/device_copy_batch.hpp"
 #include "exec/admission_control.hpp"
 #include "exec/invocable.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/semi_future.hpp"
+#include "exec/stream_ordered_retirer.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/cache/config.hpp"
 #include "io/cache/types.hpp"
@@ -111,6 +113,21 @@ class prefetching_handle {
   void update(scan_stage stage) noexcept;
 
   [[nodiscard]] bool is_active() const noexcept;
+
+  /// True while this request's prefetch IO is in flight.  A read that lands now
+  /// would duplicate IO the cache is already doing, so callers wait it out via
+  /// @ref wait_until_ready instead of issuing their own.
+  [[nodiscard]] bool is_prefetch_in_flight() const noexcept;
+
+  /// True once the consumer reached @c scan_stage::reading — the executor is
+  /// pulling this split's bytes through itself, so a prefetch started now would
+  /// only duplicate that IO.
+  [[nodiscard]] bool has_started_reading() const noexcept;
+
+  /// Block until the prefetch IO settles.  Returns true iff it completed
+  /// successfully (the chunks are now cache-resident); false if it failed or
+  /// the request was abandoned.  No-op and returns false on an empty handle.
+  [[nodiscard]] bool wait_until_ready() noexcept;
 
   /// Block until the prepare_loop has allocated staging buffers for every
   /// chunk in this request (producer state >= prepared).  Returns true iff
@@ -247,39 +264,64 @@ class prefetching_cache {
     size_t chunk_size{1};
   };
 
-  /// Pin every chunk of @p chunks over the part of @p range it covers and copy
-  /// it to the range's device destination on @p stream, appending the pins to
-  /// @p pinned — which the caller must release only after draining @p stream,
-  /// since a released pin makes its chunk evictable mid-copy.  Returns false if
-  /// the range went unserved: a chunk populated too little releases its own pins
-  /// and issues nothing, a failed copy leaves its pins for the caller.
+  /// Pin every chunk of @p chunks over the part of @p range it covers and stage
+  /// the copy to the range's device destination into @p copies, appending the
+  /// pins to @p pinned — which the caller must release only after draining the
+  /// stream the batch is issued on, since a released pin makes its chunk
+  /// evictable mid-copy.  Returns false if the range went unserved: a chunk
+  /// populated too little releases its own pins and stages nothing.
+  ///
+  /// Nothing reaches the driver here.  The caller owns @p copies across every
+  /// range of the batch and issues them in one @c cudaMemcpyBatchAsync, so a
+  /// scan's worth of column chunks costs one driver round-trip, not one each.
   [[nodiscard]] bool copy_range_from_cache(std::span<cached_chunk* const> chunks,
                                            const io::io_device_range& range,
-                                           rmm::cuda_stream_view stream,
-                                           std::vector<cached_chunk*>& pinned);
+                                           std::vector<cached_chunk*>& pinned,
+                                           sirius::cuda::device_copy_batch& copies);
 
   /// How a batch of ranges resolves against the cache: chunks pinned for a
-  /// direct copy, chunks claimed for loading, and the IO ranges covering
-  /// everything that still has to be read.  Both chunk lists stay held until the
-  /// caller retires them once the IO and the copies have drained.
+  /// direct copy, chunks claimed for loading, the staged copies for everything
+  /// already resident, and the IO ranges covering everything that still has to
+  /// be read.  Both chunk lists stay held until the caller retires them once the
+  /// IO and the copies have drained.
   struct device_read_plan {
     std::vector<cached_chunk*> pinned;
     std::vector<cached_chunk*> loading;
     std::vector<io::io_host_device_range> io_ranges;
+    /// Cache-resident copies for the whole batch, issued once by the caller.
+    sirius::cuda::device_copy_batch copies;
     std::size_t served{0};
     std::size_t hits{0};
     std::size_t h2d{0};
     std::size_t misses{0};
   };
 
-  /// Classify every chunk position of @p range into @p plan: copy what is
-  /// already populated to the device on @p stream, claim what can be loaded and
-  /// read it through the chunk's own buffer, and bounce the rest through the
-  /// backend.  Throws if a copy fails to enqueue.
+  /// Classify every chunk position of @p range into @p plan: stage what is
+  /// already populated into @c plan.copies, claim what can be loaded and read it
+  /// through the chunk's own buffer, and bounce the rest through the backend.
   void plan_device_range(std::span<cached_chunk* const> chunks,
                          const io::io_device_range& range,
-                         rmm::cuda_stream_view stream,
                          device_read_plan& plan);
+
+  /// Apply a device read's outcome to its chunks once @p stream has executed
+  /// the copies: drop the read pins in @p pinned and publish (or fail) the
+  /// chunks in @p loading.
+  ///
+  /// Deferred through @ref _retirer rather than waited on.  Both lists must
+  /// stay untouched until the copies have drained — a released pin makes its
+  /// chunk evictable, and its staging buffer reusable, while the copy engines
+  /// are still reading it.
+  ///
+  /// @p host_ok — the host-side result of the read — is what decides whether
+  /// the chunks in @p loading are published or failed.  `cached` is a claim
+  /// about the pinned staging buffer, and only the host read can establish it;
+  /// the stream's completion status describes the copy out of that buffer into
+  /// the caller's device memory, which cannot invalidate its source.  A device
+  /// fault is therefore reported, not folded into the chunk state.
+  void retire_after_stream(rmm::cuda_stream_view stream,
+                           std::vector<cached_chunk*>&& pinned,
+                           std::vector<cached_chunk*>&& loading,
+                           bool host_ok) noexcept;
 
   /// Pop every request still sitting in @p queue and retire its producer on
   /// @c producer_stage::abandoned, so a shutdown never leaves a request parked
@@ -345,6 +387,17 @@ class prefetching_cache {
   exec::static_thread_pool _io_cb_thread_pool{
     2, "io_cb"};  // single-threaded pool for IO completion callbacks
   exec::scoped_dispatcher _io_cb_dispatcher{_io_cb_thread_pool, 2};
+
+  /// Retires each device read's chunk-state transitions when its stream's
+  /// completion frontier passes the copies, instead of parking a thread on a
+  /// per-read CUDA event.  Drained opportunistically by whoever is about to
+  /// need a staging buffer (prepare_loop, evict_loop) or a cache hit (the read
+  /// paths); nothing polls it in steady state.
+  ///
+  /// Declared last so it is destroyed first — its lanes hand staging buffers
+  /// back to @ref _pool, which must still be alive.  @c ~prefetching_cache
+  /// quiesces it explicitly as well, so the order is not load-bearing.
+  exec::stream_ordered_retirer _retirer;
 };
 
 }  // namespace sirius::io::cache

@@ -16,7 +16,6 @@
 
 #include "io/cache/prefetching_cache.hpp"
 
-#include "cucascade/cuda/event.hpp"
 #include "exec/semi_future.hpp"
 #include "exec/try.hpp"
 #include "io/cache/types.hpp"
@@ -79,6 +78,22 @@ void prefetching_handle::update(scan_stage stage) noexcept
 }
 
 bool prefetching_handle::is_active() const noexcept { return _req.is_active(); }
+
+bool prefetching_handle::is_prefetch_in_flight() const noexcept
+{
+  return _req.producer && _req.producer->get() == producer_stage::loading;
+}
+
+bool prefetching_handle::has_started_reading() const noexcept
+{
+  return _req.consumer && _req.consumer->get() >= consumer_stage::reading;
+}
+
+bool prefetching_handle::wait_until_ready() noexcept
+{
+  if (!_req.producer) { return false; }
+  return _req.producer->wait_for_ready();
+}
 
 bool prefetching_handle::wait_until_prepared() noexcept
 {
@@ -208,6 +223,18 @@ prefetching_cache::~prefetching_cache()
   _rate_limiter.wait_for_all();
   _preparation_thread.join();
   _evictor_thread.join();
+
+  // After the workers are joined, so nothing can submit while we resync, and
+  // before the member destructors run: retirement touches chunk state, which
+  // must still be alive.
+  //
+  // Detach first.  The cache does not own the streams its reads ran on —
+  // callers pass them in per read — so by now their owner may well have
+  // destroyed them, and synchronizing a dangling cudaStream_t faults inside the
+  // driver rather than returning an error.  Detaching is safe exactly here:
+  // to destroy those streams their owner had to drain them first.
+  _retirer.detach();
+  std::ignore = _retirer.quiesce();
 }
 
 // ===========================================================================
@@ -380,6 +407,12 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const io_obj
 {
   if (size == 0 || dst == nullptr) { return std::size_t{0}; }
 
+  // Retire whatever has already completed before looking anything up: a chunk
+  // whose load finished is only observable as `cached` once its batch retires,
+  // so draining here is what turns a just-finished load into a hit rather than
+  // a redundant re-read.  One relaxed load per lane when nothing is ready.
+  std::ignore = _retirer.drain_all();
+
   _counters.n_reads.fetch_add(1, std::memory_order_relaxed);
 
   coverage_policy policy =
@@ -491,29 +524,44 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const io_obj
     _counters.h2d.fetch_add(h2d, std::memory_order_relaxed);
     _counters.misses.fetch_add(misses, std::memory_order_relaxed);
 
-    // (1) copy the already-cached chunks straight to the device on `stream`.
+    // (1) copy the already-cached chunks straight to the device on `stream`, as
+    // one batched submission rather than a driver round-trip per chunk.  The
+    // sources are the pinned staging chunks, which the continuation below keeps
+    // pinned until the stream has drained — exactly the lifetime the batch API's
+    // stream-ordered source access requires.
+    sirius::cuda::device_copy_batch copies;
+    copies.reserve(cached_chunks.size());
     for (cached_chunk* c : cached_chunks) {
       size_t const copy_start = std::max(c->offset, offset);
       size_t const copy_end   = std::min(c->offset + chunk_bytes, offset + size);
-      cudaMemcpyAsync(dst + (copy_start - offset),
-                      c->data + (copy_start - c->offset),
-                      copy_end - copy_start,
-                      cudaMemcpyHostToDevice,
-                      stream);
+      copies.add(
+        dst + (copy_start - offset), c->data + (copy_start - c->offset), copy_end - copy_start);
+    }
+    if (cudaError_t const err = copies.enqueue(stream); err != cudaSuccess) {
+      // Reporting success here would hand back a device buffer holding whatever
+      // was in it before, so fail the read instead.  Drain first: a partially
+      // submitted batch may still have copies in flight against the pinned
+      // chunks, and releasing a pin makes its chunk evictable mid-copy.
+      SIRIUS_LOG_ERROR("prefetching_cache: batched host-to-device copy failed to enqueue: {}",
+                       cudaGetErrorString(err));
+      SIRIUS_TRY_AND_LOG_EXCEPTION(
+        stream.synchronize(),
+        "prefetching_cache: failed to synchronize CUDA stream while unwinding cached copies");
+      std::ranges::for_each(cached_chunks, [](cached_chunk* c) { c->state.release_read(); });
+      std::ranges::for_each(io_chunks,
+                            [](cached_chunk* c) { std::ignore = c->state.mark_load_failed(); });
+      return exec::make_semi_future<std::size_t>(std::make_exception_ptr(
+        std::runtime_error("prefetching_cache: batched host-to-device copy failed to enqueue")));
     }
 
     auto device_id = rmm::get_current_cuda_device();
 
     // (2)+(3): file -> (own bounce | internal bounce) -> device through the IO
-    // context.  The future resolves once the H2D copies are *enqueued*; we then
-    // synchronize the stream (covering both these copies and the case-(1) copies
-    // above) before mutating chunk state, since releasing a read pin or publishing
-    // loading -> cached makes a chunk evictable.  Run the continuation on the IO
-    // callback pool, not inline on the reactor thread, because it blocks on
-    // stream.synchronize().  When there are no IO segments (cache-only path) we
-    // synthesize a ready future so both paths share one continuation; stream.synchronize()
-    // is equivalent to the previous event.synchronize() since only case-(1) copies are
-    // on the stream at that point.
+    // context.  The future resolves once every copy — the case-(1) batch above
+    // and the IO context's own — is ENQUEUED on `stream`, which is exactly the
+    // point at which a retirement callback can be staged behind all of them.
+    // When there are no IO segments (cache-only path) we synthesize a ready
+    // future so both paths share one continuation.
     auto io_fut = io_segments.empty() ? exec::make_semi_future<size_t>(size)
                                       : _io_ctx->host_to_device_read_async_io(
                                           obj, io_segments, offset, size, dst, stream);
@@ -524,31 +572,11 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const io_obj
                  device_id,
                  size,
                  read_pinned = std::move(cached_chunks),
-                 loading     = std::move(io_chunks)](exec::try_t<size_t>&& res) -> size_t {
-        bool ok = !res.has_exception();
+                 loading     = std::move(io_chunks)](exec::try_t<size_t>&& res) mutable -> size_t {
+        bool const host_ok = !res.has_exception();
 
         rmm::cuda_set_device_raii guard(device_id);
-        std::unique_ptr<cucascade::cuda::cuda_event> event;
-        if (ok) {
-          event = std::make_unique<cucascade::cuda::cuda_event>();
-          event->record(stream);
-        }
-
-        _io_cb_dispatcher.enqueue([read_pinned = std::move(read_pinned),
-                                   loading     = std::move(loading),
-                                   event       = std::move(event),
-                                   ok          = ok]() mutable {
-          if (event) {
-            SIRIUS_TRY_AND_LOG_EXCEPTION(
-              event->synchronize(),
-              "prefetching_cache: failed to synchronize CUDA stream after host-to-device copies");
-          }
-
-          std::ranges::for_each(read_pinned, [](cached_chunk* c) { c->state.release_read(); });
-          auto transition = ok ? &chunk_state::mark_cached : &chunk_state::mark_load_failed;
-          std::ranges::for_each(
-            loading, [transition](cached_chunk* c) { std::ignore = (c->state.*transition)(); });
-        });
+        retire_after_stream(stream, std::move(read_pinned), std::move(loading), host_ok);
 
         if (res.has_exception()) { std::rethrow_exception(std::move(res).exception()); }
         return size;
@@ -561,8 +589,8 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const io_obj
 
 bool prefetching_cache::copy_range_from_cache(std::span<cached_chunk* const> chunks,
                                               const io::io_device_range& range,
-                                              rmm::cuda_stream_view stream,
-                                              std::vector<cached_chunk*>& pinned)
+                                              std::vector<cached_chunk*>& pinned,
+                                              sirius::cuda::device_copy_batch& copies)
 {
   size_t const end_offset = range.offset + range.size;
   size_t const n_before   = pinned.size();
@@ -581,29 +609,19 @@ bool prefetching_cache::copy_range_from_cache(std::span<cached_chunk* const> chu
     return false;
   }
 
-  bool ok = true;
+  // Every chunk of this range is pinned, so stage the copies.  They are not
+  // submitted here: the caller batches every range of the request together and
+  // issues them in one go.
   for (cached_chunk* c : chunks) {
     size_t const lo = std::max(range.offset, c->offset);
     size_t const hi = std::min(end_offset, c->offset + _chunk_size);
-    cudaError_t err = cudaMemcpyAsync(range.device_dst + (lo - range.offset),
-                                      c->data + (lo - c->offset),
-                                      hi - lo,
-                                      cudaMemcpyHostToDevice,
-                                      stream);
-    if (err != cudaSuccess) {
-      SIRIUS_LOG_ERROR("prefetching_cache: cached chunk at offset {} failed to copy to device: {}",
-                       c->offset,
-                       cudaGetErrorString(err));
-      ok = false;
-      break;
-    }
+    copies.add(range.device_dst + (lo - range.offset), c->data + (lo - c->offset), hi - lo);
   }
-  return ok;
+  return true;
 }
 
 void prefetching_cache::plan_device_range(std::span<cached_chunk* const> chunks,
                                           const io::io_device_range& range,
-                                          rmm::cuda_stream_view stream,
                                           device_read_plan& plan)
 {
   size_t const chunk_bytes     = _chunk_size;
@@ -624,13 +642,9 @@ void prefetching_cache::plan_device_range(std::span<cached_chunk* const> chunks,
 
     if (c != nullptr && c->state.try_pin_covering(off, chunk_bytes, need_lo, need_hi)) {
       plan.pinned.push_back(c);
-      cudaError_t err = cudaMemcpyAsync(
-        dev, c->data + (need_lo - off), need_hi - need_lo, cudaMemcpyHostToDevice, stream);
-      if (err != cudaSuccess) {
-        throw std::runtime_error("prefetching_cache: cached chunk at offset " +
-                                 std::to_string(off) +
-                                 " failed to copy to device: " + cudaGetErrorString(err));
-      }
+      // Staged, not submitted — the whole batch of ranges goes to the driver in
+      // a single call once planning is done.
+      plan.copies.add(dev, c->data + (need_lo - off), need_hi - need_lo);
       plan.served += need_hi - need_lo;
       plan.hits++;
       continue;
@@ -662,6 +676,10 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_ranges_async(
   prefetching_handle* out_handle)
 {
   if (ranges.empty()) { return exec::make_semi_future<std::size_t>(0); }
+
+  // See device_read_async: retiring first is what makes a just-completed load
+  // visible as a hit instead of being re-read.
+  std::ignore = _retirer.drain_all();
 
   bool const cache_while_reading = _io_ctx->supports_host_to_device_range_read();
   if (!cache_while_reading && !_io_ctx->supports_device_range_read()) {
@@ -704,16 +722,27 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_ranges_async(
       }
 
       if (cache_while_reading) {
-        plan_device_range(chunks, range, stream, plan);
+        plan_device_range(chunks, range, plan);
         continue;
       }
-      if (!chunks.empty() && copy_range_from_cache(chunks, range, stream, plan.pinned)) {
+      if (!chunks.empty() && copy_range_from_cache(chunks, range, plan.pinned, plan.copies)) {
         plan.hits += chunks.size();
         plan.served += range.size;
         continue;
       }
       plan.misses += (range.size + _chunk_size - 1) / _chunk_size;
       uncached.push_back(range);
+    }
+
+    // Every cache-resident copy for every range of this request, submitted as
+    // one batch.  A projected parquet scan resolves hundreds of column chunks
+    // per call, so this is the difference between one driver round-trip and
+    // hundreds.  On failure the catch below drains the stream before releasing
+    // any pin, so a partially submitted batch cannot outlive its sources.
+    if (cudaError_t const err = plan.copies.enqueue(stream); err != cudaSuccess) {
+      throw std::runtime_error(
+        std::string("prefetching_cache: batched host-to-device copy failed to enqueue: ") +
+        cudaGetErrorString(err));
     }
   } catch (...) {
     if (!plan.pinned.empty()) {
@@ -762,42 +791,98 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_ranges_async(
                served,
                read_pinned = std::move(plan.pinned),
                loading     = std::move(plan.loading)](exec::try_t<size_t>&& res) mutable -> size_t {
-      bool const ok = !res.has_exception();
+      bool const host_ok = !res.has_exception();
 
       rmm::cuda_set_device_raii guard(device_id);
-      // The deferred task must not outlive-capture `stream` — only the caller
-      // knows its lifetime.  When the event cannot be recorded, wait here
-      // instead, so the pins below still drop after the copies have drained.
-      std::unique_ptr<cucascade::cuda::cuda_event> event;
-      try {
-        event = std::make_unique<cucascade::cuda::cuda_event>();
-        event->record(stream);
-      } catch (...) {
-        event.reset();
-        SIRIUS_TRY_AND_LOG_EXCEPTION(
-          stream.synchronize(),
-          "prefetching_cache: failed to synchronize CUDA stream after cached range copies");
-      }
-
-      _io_cb_dispatcher.enqueue([read_pinned = std::move(read_pinned),
-                                 loading     = std::move(loading),
-                                 event       = std::move(event),
-                                 ok]() mutable {
-        if (event) {
-          SIRIUS_TRY_AND_LOG_EXCEPTION(
-            event->synchronize(),
-            "prefetching_cache: failed to synchronize CUDA event after cached range copies");
-        }
-        std::ranges::for_each(read_pinned, [](cached_chunk* c) { c->state.release_read(); });
-        auto transition = ok ? &chunk_state::mark_cached : &chunk_state::mark_load_failed;
-        std::ranges::for_each(
-          loading, [transition](cached_chunk* c) { std::ignore = (c->state.*transition)(); });
-      });
+      retire_after_stream(stream, std::move(read_pinned), std::move(loading), host_ok);
 
       if (res.has_exception()) { std::rethrow_exception(std::move(res).exception()); }
       return served + res.value();
     })
     .semi();
+}
+
+void prefetching_cache::retire_after_stream(rmm::cuda_stream_view stream,
+                                            std::vector<cached_chunk*>&& pinned,
+                                            std::vector<cached_chunk*>&& loading,
+                                            bool host_ok) noexcept
+{
+  if (pinned.empty() && loading.empty()) { return; }
+
+  // The batch's outcome, applied to its chunks.
+  //
+  // ONLY the host-side result decides cached-vs-failed.  `cached` is a claim
+  // about the chunk's pinned staging buffer — that it holds the file's bytes —
+  // and that is exactly what the host read establishes.  The stream status
+  // describes the copy OUT of that buffer into the caller's device memory: a
+  // failed H2D copy leaves the caller's destination holding garbage, but it
+  // cannot corrupt the source it was reading from, so the cache entry behind it
+  // is still good.  Failing the chunk on a device fault would throw away a
+  // valid entry and force every later reader to re-read it.
+  //
+  // The status is still worth having — it is the only signal that the caller
+  // was handed a device buffer that was never written — so it is reported here
+  // rather than folded into the chunk state.
+  auto apply = [](std::span<cached_chunk* const> pins,
+                  std::span<cached_chunk* const> claimed,
+                  bool host_ok,
+                  cudaError_t status) noexcept {
+    if (status != cudaSuccess) {
+      // Retirement runs on an allocation path and must not throw.
+      try {
+        SIRIUS_LOG_ERROR(
+          "prefetching_cache: host-to-device copies failed on the stream ({}); the destination "
+          "device buffer holds unwritten data",
+          cudaGetErrorString(status));
+      } catch (...) {  // NOLINT(bugprone-empty-catch)
+      }
+    }
+    auto transition = host_ok ? &chunk_state::mark_cached : &chunk_state::mark_load_failed;
+    for (cached_chunk* c : pins) {
+      c->state.release_read();
+    }
+    for (cached_chunk* c : claimed) {
+      std::ignore = (c->state.*transition)();
+    }
+  };
+
+  // Registration is the only realistic throw here (more distinct streams than
+  // the registry holds).  Take the lane before staging anything, so the
+  // fallback below still owns the chunk lists.
+  exec::retire_lane* lane = nullptr;
+  try {
+    lane = &_retirer.lane_for(stream.value());
+  } catch (...) {  // NOLINT(bugprone-empty-catch)
+    lane = nullptr;
+  }
+
+  if (lane == nullptr) {
+    // Dropping the retirement would strand these pins for the life of the
+    // cache, so degrade to the blocking form rather than lose them.
+    SIRIUS_LOG_WARN(
+      "prefetching_cache: no retire lane available for stream; falling back to a blocking "
+      "synchronize");
+    SIRIUS_TRY_AND_LOG_EXCEPTION(
+      stream.synchronize(),
+      "prefetching_cache: failed to synchronize CUDA stream while retiring a device read");
+    apply(pinned, loading, host_ok, cudaSuccess);
+    return;
+  }
+
+  // Nothing is launched inside this scope.  Callers open it only once every
+  // copy of the batch is already enqueued on the stream, so the ticket's
+  // callback lands behind all of them; the scope exists to keep ticket order
+  // and callback order identical.
+  auto sub = lane->begin();
+  sub.on_retire([apply, pins = std::move(pinned), claimed = std::move(loading), host_ok](
+                  cudaError_t status) noexcept { apply(pins, claimed, host_ok, status); });
+
+  if (cudaError_t const e = sub.commit(); e != cudaSuccess) {
+    // publish() has already synchronized the stream and run the staged work
+    // inline with this error, so the chunks are resolved either way.
+    SIRIUS_LOG_ERROR("prefetching_cache: failed to enqueue the retirement callback: {}",
+                     cudaGetErrorString(e));
+  }
 }
 
 std::string prefetching_cache::summary() const
@@ -877,6 +962,12 @@ void prefetching_cache::prepare_loop(const std::stop_token& st)
     }
 
     std::ignore = req.producer->mark_preparing();
+
+    // Nothing polls the retirer, so this is where completed reads give their
+    // pins back before we ask the pool for buffers.  Without it a chunk stays
+    // pinned — and its buffer unreclaimable — until some other path happens to
+    // drain, and the pool exhausts under steady load.
+    std::ignore = _retirer.drain_all();
 
     auto const& chunks = *req.chunks;
 
@@ -1041,6 +1132,12 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
     }
 
     if (_shutting_down || st.stop_requested()) { break; }
+
+    // Retire completed reads before scoring anything.  A chunk stays pinned
+    // until its batch retires, and mark_evicting refuses a pinned chunk, so a
+    // sweep that ran first would walk straight past everything that just
+    // finished — and the pressure test below would read stale, too.
+    std::ignore = _retirer.drain_all();
 
     // Hand back the subscriber reference of every request whose consumer is
     // gone — exactly once, which is what makes the count an accurate reference
