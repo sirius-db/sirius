@@ -166,11 +166,14 @@ sirius_gpu_scan_operator::sirius_gpu_scan_operator(
     _compressed_materialization_observer(compressed_materialization_observer)
 {
   // Resolve the scan's dynamic-filter channel once (null for non-parquet
-  // ingestibles): every split gets it stamped so prepare_for_processing can
-  // snapshot membership filters at decode time.
-  if (auto const* pq = dynamic_cast<parquet_ingestible_table_info const*>(
-        &_ingestible->table_info())) {
-    _dynamic_filters_channel = pq->sirius_dynamic_filters;
+  // ingestibles, and for ingestible-less operators built by estimator tests):
+  // every split gets it stamped so prepare_for_processing can snapshot
+  // membership filters at decode time.
+  if (_ingestible) {
+    if (auto const* pq = dynamic_cast<parquet_ingestible_table_info const*>(
+          &_ingestible->table_info())) {
+      _dynamic_filters_channel = pq->sirius_dynamic_filters;
+    }
   }
   _native_physical_types.reserve(this->types.size());
   for (std::size_t column_idx = 0; column_idx < this->types.size(); ++column_idx) {
