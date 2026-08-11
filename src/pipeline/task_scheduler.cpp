@@ -329,47 +329,59 @@ void task_scheduler::management_eventloop()
   // A single blocking site can't hear both sources: blocking only on the
   // channel misses the downgrade's silent returns (queued tasks + parked
   // devices + no future event = permanent deadlock, seen at SF1000 q18), and
-  // blocking only on the queue misses device_ready. So the loop picks its
-  // sleep site from queue state:
-  //   - queue EMPTY            -> sleep on _task_queue.wait_non_empty(), which
-  //                               hears every push, silent or not. device_ready
-  //                               events meanwhile buffer in the channel and are
-  //                               drained on wake.
-  //   - queue non-empty but no  -> sleep on _task_request_channel.get(); only a
-  //     task dispatchable         device_ready (or a schedule() push that might
-  //                               match a parked device) can change the outcome.
+  // blocking only on the queue misses device_ready. So each pass picks where
+  // to wait from what the matcher is missing:
+  //   - channel events pending    -> drain them and match.
+  //   - a device is parked        -> the missing ingredient is a task: sleep on
+  //                                  _task_queue.wait_non_empty(), which hears
+  //                                  every push, silent or not. Non-empty queue
+  //                                  -> returns immediately and the matcher
+  //                                  re-runs (busy-wait by design when every
+  //                                  queued task prefers a busy device; ends at
+  //                                  that device's device_ready, and re-checks
+  //                                  the queue every pass so a downgrade return
+  //                                  is dispatched immediately).
+  //   - no device is parked       -> the missing ingredient is a device: only a
+  //                                  channel event helps, block on get().
+  //                                  Deadlock-free: no parked device means every
+  //                                  executor is busy and will post device_ready.
   // Tasks remain in _task_queue (downgrade-visible) until we have a ready
   // device to match them against — this is the property the push model in
   // PR #732 lost and that the pull-signal loop restores.
-  //
-  // Known trade-off: while asleep on the channel (non-empty queue, nothing
-  // dispatchable), a silent downgrade return is not noticed until the next
-  // channel event — a dispatch-latency bubble, not a deadlock, since sleeping
-  // there implies at least one device is busy and will post device_ready.
   while (_running.load()) {
-    // Collect any pending events without blocking, so the matcher sees the
-    // freshest set of parked devices no matter which site we last slept on.
-    while (auto evt = _task_request_channel.try_get()) {
-      if (evt->kind == task_request_kind::device_ready && !evt->is_scan) {
-        _ready_devices.emplace_back(evt->device_id);
+    auto evt = _task_request_channel.try_get();
+    if (evt) {
+      // Drain the pending burst so one matcher pass sees all of it.
+      while (evt) {
+        if (evt->kind == task_request_kind::device_ready && !evt->is_scan) {
+          _ready_devices.emplace_back(evt->device_id);
+        }
+        evt = _task_request_channel.try_get();
       }
-    }
-
-    if (_task_queue.empty()) {
+    } else if (!_ready_devices.empty()) {
       // With an empty queue and a waiting device, ask the creator to
       // pre-create work before sleeping (lookahead strategy only; no-op under
       // the default `active` strategy). Any task it creates arrives through
       // schedule() and wakes the queue sleep below.
-      if (_task_creator && !_ready_devices.empty()) {
+      if (_task_queue.empty() && _task_creator) {
         _task_creator->schedule_lookahead(*_ready_devices.begin());
       }
-      // Sleep site 1: wait for any push into the queue. Returns false only
-      // when the queue is interrupted (stop()).
+      // Returns false only when the queue is interrupted (stop()).
       if (!_task_queue.wait_non_empty()) {
         SIRIUS_LOG_INFO("Task queue interrupted, exiting management event loop.");
         break;
       }
-      continue;  // re-drain the channel, then match
+    } else {
+      // Block for the next event; get() returns nullptr when the channel is
+      // closed (stop()).
+      evt = _task_request_channel.get();
+      if (evt == nullptr) {
+        SIRIUS_LOG_INFO("Task request channel closed, exiting management event loop.");
+        break;
+      }
+      if (evt->kind == task_request_kind::device_ready && !evt->is_scan) {
+        _ready_devices.emplace_back(evt->device_id);
+      }
     }
 
     // Matcher: for each ready device, try to find a dispatchable task.
@@ -381,7 +393,6 @@ void task_scheduler::management_eventloop()
     // is only valid on the preferred device. Step (ii) will introduce an
     // explicit strict-vs-prefer bit; for now, all preferences are treated as
     // binding to guarantee correctness.
-    size_t dispatched = 0;
     for (auto it = _ready_devices.begin(); it != _ready_devices.end();) {
       const int device_id = *it;
       std::unique_ptr<sirius::parallel::itask> task;
@@ -419,21 +430,6 @@ void task_scheduler::management_eventloop()
       //   "[mgpu-audit] pipeline_task dispatched to GPU {} task_id={}", device_id, task_id);
       _gpu_executors.at(device_id)->schedule(std::move(task));
       it = _ready_devices.erase(it);
-      ++dispatched;
-    }
-
-    if (dispatched == 0) {
-      // Tasks exist but none is dispatchable: every queued task prefers a
-      // device that is not parked. Sleep site 2: only a channel event can
-      // change the outcome — block for it rather than spinning.
-      auto evt = _task_request_channel.get();
-      if (evt == nullptr) {
-        SIRIUS_LOG_INFO("Task request channel closed, exiting management event loop.");
-        break;
-      }
-      if (evt->kind == task_request_kind::device_ready && !evt->is_scan) {
-        _ready_devices.emplace_back(evt->device_id);
-      }
     }
   }
 }
