@@ -355,6 +355,14 @@ class Walker {
   // (emit_selection_stage) and write compacted output.
   void emit_selection_stage();
   void emit_mask_survivor_loop(const std::string& sink);
+
+  // How a Delta producer writes its reconstructed chunk.
+  //   plain        — every row to dst[row], as the full-column decode does.
+  //   mask_compact — survivors only, compacted to dst[rank] (K3-delta).
+  //                  Requires emit_selection_stage() to have run.
+  // The reconstruction itself (striped load, block scan, transpose) is
+  // identical either way, which is why both share emit_delta_producer.
+  enum class DeltaStore { plain, mask_compact };
   void emit_delta_mask_consume(const ::codegen::jit::FusedTree& node);
   void emit_bitpack_mask_dict_gather(const ::codegen::jit::FusedTree& node);
   void emit_bitpack_index_consume(const ::codegen::jit::FusedTree& node);
@@ -365,7 +373,8 @@ class Walker {
   void emit_delta_producer(const ::codegen::jit::FusedTree& node,
                            const std::string& dst,
                            const std::string& len,
-                           const std::string& elem_type);
+                           const std::string& elem_type,
+                           DeltaStore store = DeltaStore::plain);
   void emit_rle_producer(const ::codegen::jit::FusedTree& node,
                          const std::string& dst,
                          const std::string& len,
@@ -658,14 +667,11 @@ void Walker::emit_mask_survivor_loop(const std::string& sink)
 }
 
 // =====================================================================
-// Delta mask_consume — masked-store variant of emit_delta_producer's
-// root-level (striped) path.  The prefix-sum reconstruction is inherently
-// sequential within a chunk, so ALL rows are still decoded; the mask only
-// gates the global STORE (row idx+1 lands at its compacted survivor slot).
-// Saves the full-width column write + the downstream gather/compaction,
-// not the unpack compute.  Kept as a standalone emitter (instead of
-// threading a store-sink through emit_delta_producer) so the plain
-// rendered source stays byte-identical.
+// Delta mask_consume (K3-delta) — the same reconstruction as the plain Delta
+// producer, storing only survivors.  The prefix sum is inherently sequential
+// within a chunk, so ALL rows are still decoded; the mask gates only the
+// global STORE (row idx+1 lands at its compacted survivor slot).  Saves the
+// full-width column write + the downstream gather, not the unpack compute.
 // =====================================================================
 void Walker::emit_delta_mask_consume(const ::codegen::jit::FusedTree& node)
 {
@@ -674,97 +680,15 @@ void Walker::emit_delta_mask_consume(const ::codegen::jit::FusedTree& node)
       "decode render: mask_consume Delta root must have exactly one "
       "'differences' child");
   }
-  auto vit = node.children.find("differences");
-  if (vit == node.children.end()) {
+  if (node.children.find("differences") == node.children.end()) {
     throw RenderError("decode render: mask_consume Delta root missing 'differences' child");
   }
-  const std::size_t esize = dtype_elem_size(dtype_);
-  if (esize == 0) {
-    throw RenderError("decode render: Delta op-local dtype '" + dtype_ + "' not supported");
-  }
 
-  const std::int32_t id     = id_of(node);
-  const std::string idstr   = std::to_string(id);
-  const std::string p_first = "delta_first_" + idstr;
-  add_param("const " + dtype_ + "* __restrict__", p_first);
-  add_buffer(id, "delta_first", esize);
-
-  body_ << "    // --- node " << id << ": Delta masked decode -> compacted output (K3-delta) ---\n";
+  body_ << "    // --- node " << id_of(node)
+        << ": Delta masked decode -> compacted output (K3-delta) ---\n";
   emit_selection_stage();
-
-  const std::string dlen  = "dlen_" + idstr;
-  const std::string ndiff = "ndiff_" + idstr;
-  const std::string items = "ditems_" + idstr;
-  const std::string first = "dfirst_" + idstr;
-  const std::string scan  = "DScan_" + idstr;
-  const std::string exch  = "DExch_" + idstr;
-  const std::string tmp   = "dtmp_" + idstr;
-
-  body_ << "    {\n"
-        << "        constexpr int32_t TBS = " << tbs_ << ";\n"
-        << "        constexpr int32_t IPT = CHUNK / TBS;\n"
-        << "        const int32_t " << dlen << " = static_cast<int32_t>(len);\n"
-        << "        const int32_t " << ndiff << " = (" << dlen << " > 0) ? (" << dlen
-        << " - 1) : 0;\n";
-
-  // Child value source (closed-form expr, or a materialised slab read) —
-  // same contract as the plain Delta producer.
-  const auto mark      = sm_.mark();
-  ValueSource child_vs = value_source(*vit->second, dtype_, "((len) > 0 ? ((len) - 1) : 0)");
-
-  // Root level: STRIPED loads + BlockExchange transpose, exactly like the
-  // plain producer's use_striped branch (masked variants are root-only, so
-  // the blocked/nested-smem branch never applies here).
-  body_ << "        " << dtype_ << " " << items << "[IPT];\n"
-        << "        #pragma unroll\n"
-        << "        for (int32_t j = 0; j < IPT; ++j) {\n"
-        << "            const int32_t idx = j * TBS + tid;  // striped\n"
-        << "            " << items << "[j] = (idx < " << ndiff << ")\n"
-        << "                ? static_cast<" << dtype_ << ">(" << at_pos(child_vs.read_expr, "idx")
-        << ")\n"
-        << "                : " << dtype_ << "{0};\n"
-        << "        }\n"
-        << "        typedef cub::BlockScan<" << dtype_ << ", TBS> " << scan << ";\n"
-        << "        typedef cub::BlockExchange<" << dtype_ << ", TBS, IPT> " << exch << ";\n"
-        << "        __shared__ union {\n"
-        << "            typename " << exch << "::TempStorage ex;\n"
-        << "            typename " << scan << "::TempStorage sc;\n"
-        << "        } " << tmp << ";\n"
-        << "        " << exch << "(" << tmp << ".ex).StripedToBlocked(" << items << ", " << items
-        << ");\n"
-        << "        __syncthreads();\n"
-        << "        " << scan << "(" << tmp << ".sc).InclusiveSum(" << items << ", " << items
-        << ");\n"
-        << "        __syncthreads();\n"
-        << "        " << exch << "(" << tmp << ".ex).BlockedToStriped(" << items << ", " << items
-        << ");\n"
-        << "        __syncthreads();\n";
-
-  // Masked stores: row 0 = first, row idx+1 = first + prefix[idx]; only
-  // survivor rows are written, at out_base + rank.  Row 0's rank is always
-  // 0 when its bit is set (no lower bits in word 0).
-  const std::string dutype = unsigned_counterpart(esize);
-  body_ << "        const " << dtype_ << " " << first << " = " << p_first << "[chunk_id];\n"
-        << "        const int64_t out_base = static_cast<int64_t>(chunk_offsets[chunk_id]);\n"
-        << "        if (tid == 0 && " << dlen
-        << " > 0 && (sel_words[0] & 1u)) (out + out_base)[0] "
-           "= "
-        << first << ";\n"
-        << "        #pragma unroll\n"
-        << "        for (int32_t j = 0; j < IPT; ++j) {\n"
-        << "            const int32_t idx = j * TBS + tid;  // striped global pos\n"
-        << "            const int32_t row = idx + 1;\n"
-        << "            if (row < " << dlen << ") {\n"
-        << "                const uint32_t w = sel_words[row >> 5];\n"
-        << "                if ((w >> (row & 31)) & 1u) {\n"
-        << "                    const int32_t rank = " << rank_expr("row") << ";\n"
-        << "                    (out + out_base)[rank] = static_cast<" << dtype_ << ">(static_cast<"
-        << dutype << ">(" << first << ") + static_cast<" << dutype << ">(" << items << "[j]));\n"
-        << "                }\n"
-        << "            }\n"
-        << "        }\n"
-        << "    }\n";
-  sm_.release_to(mark);
+  // out_base is declared by the masked store inside the producer's block.
+  emit_delta_producer(node, "(out + out_base)", "len", dtype_, DeltaStore::mask_compact);
 }
 
 // =====================================================================
@@ -1021,8 +945,10 @@ DecodeKernelSpec Walker::finalize_pair(const std::string& dtype_b)
 void Walker::emit_delta_producer(const ::codegen::jit::FusedTree& node,
                                  const std::string& dst,
                                  const std::string& len,
-                                 const std::string& elem_type)
+                                 const std::string& elem_type,
+                                 DeltaStore store)
 {
+  const bool masked = store == DeltaStore::mask_compact;
   if (node.children.size() != 1) {
     throw RenderError("decode render: Delta must have exactly one 'differences' child");
   }
@@ -1058,9 +984,11 @@ void Walker::emit_delta_producer(const ::codegen::jit::FusedTree& node,
   const std::string scan = "DScan_" + idstr;
   const std::string exch = "DExch_" + idstr;
   const std::string tmp  = "dtmp_" + idstr;
-  body_ << "    // --- node " << id << ": Delta (inline-fused scan, coalesced, " << elem_type
-        << ") ---\n"
-        << "    {\n"
+  if (!masked) {
+    body_ << "    // --- node " << id << ": Delta (inline-fused scan, coalesced, " << elem_type
+          << ") ---\n";
+  }
+  body_ << "    {\n"
         << "        constexpr int32_t TBS = " << tbs_ << ";\n"
         << "        constexpr int32_t IPT = CHUNK / TBS;\n"
         << "        const int32_t " << dlen << " = static_cast<int32_t>(" << len << ");\n"
@@ -1084,7 +1012,10 @@ void Walker::emit_delta_producer(const ::codegen::jit::FusedTree& node,
   // and halve SM occupancy.  The diff stream is tiny (few inner runs × small
   // bit widths) so it stays L1-resident regardless of access pattern —
   // profiling confirmed DRAM<10%, bytes/sector=32 (L1-cached).
-  const bool use_striped = (sm_.mark() == 0);
+  //
+  // The masked store is root-only (the mask is row-space), so it always takes
+  // the striped branch — the nested/blocked case cannot arise there.
+  const bool use_striped = masked || (sm_.mark() == 0);
 
   body_ << "        " << elem_type << " " << items << "[IPT];\n"
         << "        #pragma unroll\n"
@@ -1133,8 +1064,35 @@ void Walker::emit_delta_producer(const ::codegen::jit::FusedTree& node,
   // encode side), so the add is done in the unsigned counterpart type to
   // avoid relying on signed-overflow wraparound (UB).
   const std::string dutype = unsigned_counterpart(esize);
-  body_ << "        const " << elem_type << " " << first << " = " << p_first << "[chunk_id];\n"
-        << "        if (tid == 0 && " << dlen << " > 0) (" << dst << ")[0] = " << first << ";\n"
+  body_ << "        const " << elem_type << " " << first << " = " << p_first << "[chunk_id];\n";
+
+  if (masked) {
+    // Row 0 = first, row idx+1 = first + prefix[idx]; only survivor rows are
+    // written, at out_base + rank. Row 0's rank is always 0 when its bit is
+    // set (no lower bits in word 0).
+    body_ << "        const int64_t out_base = static_cast<int64_t>(chunk_offsets[chunk_id]);\n"
+          << "        if (tid == 0 && " << dlen << " > 0 && (sel_words[0] & 1u)) " << dst
+          << "[0] = " << first << ";\n"
+          << "        #pragma unroll\n"
+          << "        for (int32_t j = 0; j < IPT; ++j) {\n"
+          << "            const int32_t idx = j * TBS + tid;  // striped global pos\n"
+          << "            const int32_t row = idx + 1;\n"
+          << "            if (row < " << dlen << ") {\n"
+          << "                const uint32_t w = sel_words[row >> 5];\n"
+          << "                if ((w >> (row & 31)) & 1u) {\n"
+          << "                    const int32_t rank = " << rank_expr("row") << ";\n"
+          << "                    " << dst << "[rank] = static_cast<" << elem_type
+          << ">(static_cast<" << dutype << ">(" << first << ") + static_cast<" << dutype << ">("
+          << items << "[j]));\n"
+          << "                }\n"
+          << "            }\n"
+          << "        }\n"
+          << "    }\n";
+    sm_.release_to(mark);
+    return;
+  }
+
+  body_ << "        if (tid == 0 && " << dlen << " > 0) (" << dst << ")[0] = " << first << ";\n"
         << "        #pragma unroll\n"
         << "        for (int32_t j = 0; j < IPT; ++j) {\n";
   if (use_striped) {
