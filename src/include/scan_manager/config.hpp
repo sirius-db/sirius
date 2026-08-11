@@ -17,13 +17,30 @@
 
 #pragma once
 
+#include "creator/config.hpp"
 #include "exec/config.hpp"
 #include "io/cache/config.hpp"
 #include "io/object_store_config.hpp"
 #include "io/rest/config.hpp"
 #include "io/uring/config.hpp"
 
+#include <algorithm>
+#include <thread>
+
 namespace sirius::scan_manager {
+
+/// Default uring reactor count; counted in the scan-manager sizing budget below.
+inline constexpr std::size_t default_uring_n_reactors = 1;
+
+/// Default scan-manager pool size: every core left after the other default pools
+/// (downgrade, task_creator, pipeline, uring reactor), never below 4.
+[[nodiscard]] inline int default_scan_manager_num_threads()
+{
+  constexpr int reserved =
+    exec::default_downgrade_num_threads + creator::default_task_creator_num_threads +
+    exec::default_gpu_pipeline_num_threads + static_cast<int>(default_uring_n_reactors);
+  return std::max(4, static_cast<int>(std::thread::hardware_concurrency()) - reserved);
+}
 
 /**
  * @brief Configuration for the background host->GPU memory prefetcher
@@ -66,11 +83,12 @@ struct memory_prefetcher_config {
  *  - @c object_store — object-store credentials and endpoint.
  */
 struct scan_manager_config {
-  exec::thread_pool_config thread_pool{.num_threads = 8, .thread_name_prefix = "scan_manager"};
+  exec::thread_pool_config thread_pool{.num_threads        = default_scan_manager_num_threads(),
+                                       .thread_name_prefix = "scan_manager"};
   bool use_sirius_datasource{true};
 
   /// Number of uring reactor worker threads for the local-disk IO path.
-  std::size_t uring_n_reactors{1};
+  std::size_t uring_n_reactors{default_uring_n_reactors};
 
   /// Number of REST reactor worker threads for the S3/object-store IO path
   /// (each its own libcurl event loop + connection pool).

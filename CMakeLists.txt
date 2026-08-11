@@ -205,6 +205,19 @@ if(VCPKG_BUILD AND TARGET CUDA::cudart_static)
       sirius_prefer_static_cudart("${_target}")
     endif()
   endforeach()
+
+  # cucascade's topology discovery gained rmm includes (NUMA capacity
+  # detection), so it needs the same vcpkg-over-toolkit include priority as
+  # sirius's own rapids consumers: without it GCC drops the duplicated vcpkg -I
+  # in favor of the later -isystem, the CUDA toolkit's CCCL wins the search
+  # order, and CUDA 12's bundled CCCL (< 3.3) trips rmm's version check. Only
+  # the object target compiles TUs; the static wrapper just links the objects.
+  if(TARGET cucascade_topology_discovery_objects)
+    set_target_properties(cucascade_topology_discovery_objects
+                          PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+    target_include_directories(cucascade_topology_discovery_objects BEFORE
+                               PRIVATE ${_VCPKG_INC})
+  endif()
 endif()
 
 # Rust telemetry instrumentation (C++ FFI via Corrosion)
@@ -457,6 +470,9 @@ build_loadable_extension(sirius CPP ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 set_target_properties(sirius_loadable_extension PROPERTIES LINKER_TYPE BFD)
 
 # Shared configuration for both extension targets
+set(SIRIUS_CLANG_CXX_WARNING_OPTIONS -Wunreachable-code -Wimplicit-fallthrough
+                                     -Wrange-loop-analysis -Wnull-dereference)
+
 foreach(_target sirius_extension sirius_loadable_extension)
   set_target_properties(
     ${_target}
@@ -471,7 +487,10 @@ foreach(_target sirius_extension sirius_loadable_extension)
   # consumers (tests/benchmarks) with --expt-extended-lambda.
   target_compile_options(
     ${_target}
-    PRIVATE $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-extended-lambda>)
+    PRIVATE
+      $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-extended-lambda>
+      "$<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:${SIRIUS_CLANG_CXX_WARNING_OPTIONS}>"
+  )
 
   if(VCPKG_BUILD)
     set_target_properties(${_target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
@@ -645,6 +664,8 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_null_safe_join.cpp
     test/cpp/integration/test_gpu_execution_order_nulls.cpp
+    test/cpp/integration/test_gpu_execution_parquet_nulls.cpp
+    test/cpp/integration/test_parquet_null_predicate_pushdown.cpp
     test/cpp/integration/test_query_lifecycle_slot.cpp
     test/cpp/integration/test_gpu_execution_tpcds_nulls.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
@@ -655,6 +676,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_pin_table_mvcc_delete.cpp
     test/cpp/integration/test_pin_table_mvcc_foundation.cpp
     test/cpp/integration/test_pin_table_mvcc_insert.cpp
+    test/cpp/integration/test_pin_table_mvcc_update.cpp
     test/cpp/integration/test_pin_table_zone_map_pruning.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/integration/test_transparent_runtime_fallback.cpp
@@ -752,6 +774,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_owning_table_view.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
+    test/cpp/scan/test_parquet_null_count_pruning.cpp
     test/cpp/scan/test_parquet_scan_sizing.cpp
     test/cpp/scan/test_scan_schema_normalization.cpp
     test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp

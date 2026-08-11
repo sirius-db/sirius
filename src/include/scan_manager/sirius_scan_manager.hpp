@@ -47,6 +47,7 @@ class sirius_dynamic_filter_set;  // membership pushdown channel (op/sirius_dyna
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
+#include <duckdb/storage/storage_lock.hpp>
 #include <io/types.hpp>
 
 namespace cucascade::memory {
@@ -698,6 +699,10 @@ class sirius_scan_manager {
   /// union their columns into the pending request. The job no-ops when the
   /// table has no rows beyond the pinned prefix.
   std::vector<insert_delta_job_request> _pending_insert_delta_jobs;
+
+  /// Prevents DuckDB checkpoints from replacing row groups between pinned
+  /// query validation and completion.
+  std::vector<duckdb::unique_ptr<duckdb::StorageLockKey>> _checkpoint_locks;
 
   /// Per-query sequencer for opportunistic fadvise calls.  Built fresh
   /// in @ref prepare_for_query, gets one @c pipeline_slot per scan,

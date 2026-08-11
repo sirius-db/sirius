@@ -250,6 +250,14 @@ class parquet_file_scan_info : public scan_info {
   [[nodiscard]] std::vector<fadvise_entry> fadvise_entries() const override;
 };
 
+/// A top-level `<col> IS [NOT] NULL` conjunct, recorded so the row groups it
+/// excludes can still be pruned from the parquet null_count statistic even
+/// though cuDF's stats filter cannot evaluate the predicate itself.
+struct null_prune_predicate {
+  duckdb::idx_t batch_index;  ///< index into the scan's batch column order
+  bool expects_null;          ///< true for IS NULL, false for IS NOT NULL
+};
+
 //===----------------------------------------------------------------------===//
 // parquet_gpu_ingestible
 //===----------------------------------------------------------------------===//
@@ -348,6 +356,26 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   std::vector<std::pair<std::size_t, std::size_t>> _pushdown_primary_by_batch_position;
   // What decode_predicate_candidates() advertises: primary index → constant set.
   std::unordered_map<std::size_t, std::vector<std::string>> _decode_predicate_candidates;
+
+  // The part of _duckdb_filter_expression safe to push into the reader: the
+  // full predicate minus any top-level AND conjunct that cuDF's row-group
+  // stats filter cannot handle (a null test, or a bare column reference used
+  // as the predicate). Surviving conjuncts still prune, so
+  // `v IS NULL AND id > 3000` keeps pruning on `id`. Shares the full
+  // expression when nothing needs stripping; null when none survive.
+  //
+  // Separate from disable_filter_pushdown, which also suppresses dynamic join
+  // filters — those carry no null predicate and stay safe to push down.
+  std::shared_ptr<duckdb::Expression> _static_pushdown_expression;
+  // False when the above is a strict subset: the reader has then only
+  // partially filtered, so the scan must NOT be reported ROW_FILTERED or the
+  // dropped conjuncts would never be applied.
+  bool _static_pushdown_is_complete = true;
+
+  // Only the simple `IS [NOT] NULL` over a bare column reference shape is
+  // recorded; anything compound is left to the post-decode filter. Empty when
+  // the predicate has no such conjunct.
+  std::vector<null_prune_predicate> _null_prune_predicates;
 
   std::vector<std::string> _file_paths;
 

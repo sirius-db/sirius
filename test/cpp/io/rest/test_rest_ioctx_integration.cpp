@@ -255,6 +255,9 @@ struct range_fault_policy {
   bool unknown_content_range_total{false};
   bool ignore_range_with_200{false};
   bool fail_suffix_with_416{false};
+  std::string failed_get_etag;
+  std::string successful_get_etag;
+  std::string successful_head_etag;
 };
 
 struct listed_object {
@@ -362,6 +365,11 @@ class range_http_server {
   }
 
  private:
+  static void append_etag_header(std::string& response, std::string const& etag)
+  {
+    if (!etag.empty()) { response += "\r\nETag: " + etag; }
+  }
+
   struct active_get_guard {
     explicit active_get_guard(range_http_server& server) : _server(server)
     {
@@ -507,9 +515,9 @@ class range_http_server {
         send_all(fd, response);
         return;
       }
-      std::string response =
-        "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size()) +
-        "\r\nConnection: close\r\n\r\n";
+      std::string response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size());
+      append_etag_header(response, _fault.successful_head_etag);
+      response += "\r\nConnection: close\r\n\r\n";
       send_all(fd, response);
       return;
     }
@@ -528,9 +536,10 @@ class range_http_server {
 
     auto const get_idx = _get_count.fetch_add(1, std::memory_order_relaxed);
     if (_fault.fail_all_gets || get_idx < _fault.fail_first_gets) {
-      std::string response =
-        "HTTP/1.1 " + std::to_string(_fault.fail_status) +
-        " Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+      std::string response = "HTTP/1.1 " + std::to_string(_fault.fail_status) +
+                             " Service Unavailable\r\nContent-Length: 0";
+      append_etag_header(response, _fault.failed_get_etag);
+      response += "\r\nConnection: close\r\n\r\n";
       send_all(fd, response);
       return;
     }
@@ -545,8 +554,9 @@ class range_http_server {
       }
       if (_fault.ignore_range_with_200 && is_suffix_range(request)) {
         std::string response =
-          "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size()) +
-          "\r\nConnection: close\r\n\r\n";
+          "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size());
+        append_etag_header(response, _fault.successful_get_etag);
+        response += "\r\nConnection: close\r\n\r\n";
         send_all(fd, response);
         send_body(fd, _object.data(), _object.size());
         return;
@@ -559,14 +569,16 @@ class range_http_server {
           "\r\nContent-Range: bytes " + std::to_string(start) + "-" + std::to_string(end) + "/" +
           (_fault.unknown_content_range_total ? std::string{"*"} : std::to_string(_object.size()));
       }
+      append_etag_header(response, _fault.successful_get_etag);
       response += "\r\nConnection: close\r\n\r\n";
       send_all(fd, response);
       send_body(fd, _object.data() + start, len);
       return;
     }
 
-    std::string response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size()) +
-                           "\r\nConnection: close\r\n\r\n";
+    std::string response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size());
+    append_etag_header(response, _fault.successful_get_etag);
+    response += "\r\nConnection: close\r\n\r\n";
     send_all(fd, response);
     send_body(fd, _object.data(), _object.size());
   }
@@ -1705,12 +1717,14 @@ TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
   {
     range_fault_policy fault{};
     fault.ignore_range_with_200 = true;
+    fault.successful_get_etag   = "\"discarded-200-tag\"";
     range_http_server server(parquet, fault);
     auto ioctx      = make_direct_rest_ioctx(server.endpoint());
     auto datasource = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
                                              sirius::io::open_hint::parquet_footer_probe);
     REQUIRE(datasource != nullptr);
     CHECK(datasource->size() == parquet.size());
+    CHECK(datasource->io_object().validation_etag().empty());
     CHECK(server.head_count() == 1);
     CHECK(server.get_count() == 1);
   }
@@ -1790,6 +1804,7 @@ TEST_CASE("footer suffix probe retries transient GET failures",
     range_fault_policy fault{};
     fault.fail_first_gets = 2;
     fault.fail_status     = 503;
+    fault.failed_get_etag = "\"stale-retry-tag\"";
     range_http_server server(parquet, fault);
     auto authorizer             = std::make_shared<fixed_url_authorizer>(server.endpoint());
     auto cfg                    = direct_rest_test_config();
@@ -1803,6 +1818,7 @@ TEST_CASE("footer suffix probe retries transient GET failures",
 
     CHECK(probe.object_size == parquet.size());
     CHECK(probe.window_lo == 0);
+    CHECK(probe.etag.empty());
     REQUIRE(probe.bytes != nullptr);
     CHECK(probe.bytes->size() == parquet.size());
     CHECK(server.head_count() == 0);
@@ -1871,7 +1887,9 @@ TEST_CASE("footer suffix probe retries transient GET failures",
 
   SECTION("clean 206 has no retry or terminal-failure telemetry")
   {
-    range_http_server server(parquet);
+    range_fault_policy fault{};
+    fault.successful_get_etag = "\"footer-v1\"";
+    range_http_server server(parquet, fault);
     auto authorizer             = std::make_shared<fixed_url_authorizer>(server.endpoint());
     auto cfg                    = direct_rest_test_config();
     cfg.max_retry_attempts      = 3;
@@ -1884,6 +1902,7 @@ TEST_CASE("footer suffix probe retries transient GET failures",
 
     CHECK(probe.object_size == parquet.size());
     CHECK(probe.window_lo == 0);
+    CHECK(probe.etag == "\"footer-v1\"");
     REQUIRE(probe.bytes != nullptr);
     CHECK(probe.bytes->size() == parquet.size());
     CHECK(server.head_count() == 0);
@@ -1902,8 +1921,9 @@ TEST_CASE("HEAD object-size retries update REST perf counters",
   SECTION("transient 503s are retried and the final HEAD returns the size")
   {
     range_fault_policy fault{};
-    fault.fail_first_heads = 2;
-    fault.fail_head_status = 503;
+    fault.fail_first_heads     = 2;
+    fault.fail_head_status     = 503;
+    fault.successful_head_etag = "\"head-v2\"";
     range_http_server server(payload, fault);
     auto authorizer             = std::make_shared<fixed_url_authorizer>(server.endpoint());
     auto cfg                    = direct_rest_test_config();
@@ -1913,7 +1933,9 @@ TEST_CASE("HEAD object-size retries update REST perf counters",
       cfg, std::move(authorizer), nullptr);
     sirius::io::rest::rest_reactor reactor(ctx, "head-retry-success");
 
-    CHECK(reactor.head_object_size("head-bucket", "head-success.bin") == payload.size());
+    auto const result = reactor.head_object_size("head-bucket", "head-success.bin");
+    CHECK(result.object_size == payload.size());
+    CHECK(result.etag == "\"head-v2\"");
     CHECK(server.head_count() == 3);
     CHECK(server.get_count() == 0);
     auto const perf = reactor.perf_snapshot();
@@ -1989,7 +2011,9 @@ TEST_CASE("HEAD object-size retries update REST perf counters",
       cfg, std::move(authorizer), nullptr);
     sirius::io::rest::rest_reactor reactor(ctx, "head-clean");
 
-    CHECK(reactor.head_object_size("head-bucket", "head-clean.bin") == payload.size());
+    auto const result = reactor.head_object_size("head-bucket", "head-clean.bin");
+    CHECK(result.object_size == payload.size());
+    CHECK(result.etag.empty());
     CHECK(server.head_count() == 1);
     CHECK(server.get_count() == 0);
     auto const perf = reactor.perf_snapshot();
@@ -2043,7 +2067,7 @@ TEST_CASE("REST retry logging includes object keys and stays quiet on clean requ
     scoped_log_capture logs;
     auto probe = reactor.fetch_footer_suffix("log-bucket", "clean.parquet", 1024);
     REQUIRE(probe.bytes != nullptr);
-    CHECK(reactor.head_object_size("log-bucket", "clean.parquet") == payload.size());
+    CHECK(reactor.head_object_size("log-bucket", "clean.parquet").object_size == payload.size());
 
     auto const records        = logs.records();
     auto const warning_or_bad = std::any_of(records.begin(), records.end(), [](auto const& r) {

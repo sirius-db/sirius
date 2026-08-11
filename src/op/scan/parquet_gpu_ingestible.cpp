@@ -49,6 +49,12 @@
 
 // duckdb
 #include <duckdb/common/hive_partitioning.hpp>
+#include <duckdb/planner/expression/bound_conjunction_expression.hpp>
+#include <duckdb/planner/expression/bound_operator_expression.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <duckdb/planner/expression_iterator.hpp>
+#include <duckdb/planner/filter/conjunction_filter.hpp>
+#include <duckdb/planner/filter/null_filter.hpp>
 
 // uring_reactor MUST be included last among sirius headers: liburing.h,
 // pulled in transitively, defines a BLOCK_SIZE macro that collides with the
@@ -65,12 +71,138 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 namespace sirius::op::scan {
 
 namespace {
+
+/// True when @p expr contains an IS NULL / IS NOT NULL predicate anywhere.
+///
+/// cuDF's row-group statistics filter rewrites every column reference into that
+/// row group's (min, max) pair. A null test has no min/max analogue — only
+/// null_count answers it — and handing one to filter_row_groups_with_stats
+/// faults rather than merely mis-pruning.
+///
+/// IS NOT NULL counts: it lowers to IS_NULL + NOT in the cuDF AST, and
+/// convert_table_filters_to_expression only drops it when it is a column's
+/// top-level filter, so one nested in a conjunction still reaches here.
+bool expression_has_null_predicate(duckdb::Expression const& expr)
+{
+  auto const expr_type = expr.GetExpressionType();
+  if (expr_type == duckdb::ExpressionType::OPERATOR_IS_NULL ||
+      expr_type == duckdb::ExpressionType::OPERATOR_IS_NOT_NULL) {
+    return true;
+  }
+  bool found = false;
+  duckdb::ExpressionIterator::EnumerateChildren(expr, [&found](duckdb::Expression const& child) {
+    if (!found) { found = expression_has_null_predicate(child); }
+  });
+  return found;
+}
+
+/// True when @p expr cannot be handed to cuDF's row-group statistics filter as
+/// a predicate in its own right.
+///
+/// Two shapes fault there, both because the stats rewrite replaces each column
+/// reference with that row group's (min, max) pair:
+///
+///   - a null test, which has no min/max analogue (only null_count answers it);
+///   - a BARE column reference used directly as the predicate, e.g.
+///     `WHERE flag` on a BOOLEAN column, where the rewrite leaves a pair of
+///     stats columns with no comparison to evaluate over them.
+///
+/// The bare-reference case is only unsafe when the reference IS the predicate.
+/// `WHERE flag AND v > 5000` prunes fine, as do `NOT flag`, IN and BETWEEN, so
+/// this deliberately does not recurse — over-rejecting would forfeit pruning
+/// that demonstrably works.
+bool is_unsafe_for_stats_filter(duckdb::Expression const& expr)
+{
+  return expr.GetExpressionType() == duckdb::ExpressionType::BOUND_REF ||
+         expression_has_null_predicate(expr);
+}
+
+/// @p expr minus every top-level AND conjunct the stats filter cannot handle;
+/// nullptr when none survive. Only meaningful when @p expr is itself unsafe —
+/// callers check that first.
+///
+/// Sound because pruning on part of a conjunction can only keep extra row
+/// groups, never drop wanted ones: nothing failing `id > 3000` can satisfy
+/// `v IS NULL AND id > 3000`. The caller must still apply the full predicate
+/// post-decode.
+///
+/// Only the top level is split: a compound conjunct (an OR, or a nested AND)
+/// containing anything unsafe is dropped whole. Conservative, not wrong.
+duckdb::unique_ptr<duckdb::Expression> stats_safe_conjuncts(duckdb::Expression const& expr)
+{
+  if (expr.GetExpressionType() != duckdb::ExpressionType::CONJUNCTION_AND) { return nullptr; }
+
+  auto const& conjunction = expr.Cast<duckdb::BoundConjunctionExpression>();
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> kept;
+  for (auto const& child : conjunction.children) {
+    if (!is_unsafe_for_stats_filter(*child)) { kept.push_back(child->Copy()); }
+  }
+  if (kept.empty()) { return nullptr; }
+  if (kept.size() == 1) { return std::move(kept[0]); }
+
+  auto out =
+    duckdb::make_uniq<duckdb::BoundConjunctionExpression>(duckdb::ExpressionType::CONJUNCTION_AND);
+  for (auto& child : kept) {
+    out->children.push_back(std::move(child));
+  }
+  return out;
+}
+
+/// Every `<col> IS [NOT] NULL` filter usable for null_count row-group pruning.
+///
+/// Read from the TableFilterSet rather than from the converted expression,
+/// because convert_table_filters_to_expression DROPS a column's top-level
+/// IS_NOT_NULL before building the expression. Collecting downstream of that
+/// would leave the ordinary `WHERE v IS NOT NULL` with no pruning at all, which
+/// is the common form of the predicate.
+///
+/// Both a top-level filter and one nested in a conjunction qualify. A
+/// conjunction is an AND of per-column filters, so each null test in it must
+/// hold independently -- unlike an OR, where the other branch could still
+/// match, so those are not collected.
+std::vector<null_prune_predicate> collect_null_prune_predicates(
+  duckdb::TableFilterSet const& filters,
+  duckdb::vector<duckdb::ColumnIndex> const& column_ids,
+  std::vector<std::optional<std::size_t>> const& batch_position_by_column_id,
+  std::unordered_set<std::size_t> const& skip_primary_indices)
+{
+  std::vector<null_prune_predicate> out;
+
+  auto classify = [](duckdb::TableFilterType type) -> std::optional<bool> {
+    if (type == duckdb::TableFilterType::IS_NULL) { return true; }
+    if (type == duckdb::TableFilterType::IS_NOT_NULL) { return false; }
+    return std::nullopt;
+  };
+
+  for (auto const& [column_index, filter] : filters.filters) {
+    // Hive-partition columns are not in the parquet file, so they have no
+    // statistics to prune on.
+    if (column_index >= column_ids.size()) { continue; }
+    if (skip_primary_indices.count(column_ids[column_index].GetPrimaryIndex()) != 0) { continue; }
+    if (column_index >= batch_position_by_column_id.size()) { continue; }
+    auto const& batch_pos = batch_position_by_column_id[column_index];
+    if (!batch_pos.has_value()) { continue; }
+    auto const index = static_cast<duckdb::idx_t>(*batch_pos);
+
+    if (auto expects_null = classify(filter->filter_type)) {
+      out.push_back(null_prune_predicate{index, *expects_null});
+    } else if (filter->filter_type == duckdb::TableFilterType::CONJUNCTION_AND) {
+      for (auto const& child : filter->Cast<duckdb::ConjunctionAndFilter>().child_filters) {
+        if (auto nested = classify(child->filter_type)) {
+          out.push_back(null_prune_predicate{index, *nested});
+        }
+      }
+    }
+  }
+  return out;
+}
 
 bool has_uri_scheme(std::string const& p) { return p.find("://") != std::string::npos; }
 
@@ -370,6 +502,14 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
   // Filters on hive-partition columns are dropped — those columns aren't in the
   // parquet file (DuckDB prunes them at the file-list level already).
   if (bind.table_filters && !bind.table_filters->filters.empty()) {
+    // Collected from the filters themselves, not the expression built below --
+    // see collect_null_prune_predicates. Independent of whether any part of the
+    // predicate survives into reader-side pushdown.
+    _null_prune_predicates = collect_null_prune_predicates(*bind.table_filters,
+                                                           bind.column_ids,
+                                                           _plan->batch_position_by_column_id,
+                                                           _plan->partition_primary_indices);
+
     auto duckdb_expression =
       sirius::op::convert_table_filters_to_expression(*bind.table_filters,
                                                       bind.column_ids,
@@ -384,6 +524,23 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
           duckdb_expression->ToString());
       }
       _duckdb_filter_expression = std::move(duckdb_expression);
+
+      if (!is_unsafe_for_stats_filter(*_duckdb_filter_expression)) {
+        // Nothing to strip — push the whole predicate, sharing it rather than
+        // copying.
+        _static_pushdown_expression = _duckdb_filter_expression;
+      } else {
+        _static_pushdown_is_complete = false;
+        _static_pushdown_expression  = stats_safe_conjuncts(*_duckdb_filter_expression);
+        // Whatever survives must itself be safe, or the crash returns.
+        D_ASSERT(!_static_pushdown_expression ||
+                 !is_unsafe_for_stats_filter(*_static_pushdown_expression));
+        SIRIUS_LOG_DEBUG(
+          "[parquet_gpu_ingestible] Predicate is unsupported by the row-group stats filter; "
+          "pushing only the safe conjuncts ({}), full predicate applied post-decode: {}",
+          _static_pushdown_expression ? _static_pushdown_expression->ToString() : "none",
+          _duckdb_filter_expression->ToString());
+      }
     }
 
     // Decode-time predicate pushdown: a pure-filter string column whose whole
@@ -557,13 +714,14 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
 
   // Translate the filter for reader-side row-group pruning unless disabled. The
   // translated cuDF AST must outlive filter_row_groups_with_stats below.
+  // Pushes _static_pushdown_expression, not the full predicate.
   std::optional<gpu_expression_translator::translated_expression> ast_expression = std::nullopt;
-  if (_duckdb_filter_expression && !disable_filter_pushdown) {
+  if (_static_pushdown_expression && !disable_filter_pushdown) {
     auto name_resolver = [this](duckdb::idx_t ref_index) -> std::string {
       return _plan->batch_column_name(ref_index);
     };
     gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
-    auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
+    auto sirius_filter_ast = sirius::ast::from_duckdb(*_static_pushdown_expression);
     D_ASSERT(sirius_filter_ast != nullptr);
     ast_expression = translator.translate_expression_with_names(*sirius_filter_ast, name_resolver);
     if (ast_expression) { opts.set_filter(ast_expression->back()); }
@@ -637,6 +795,86 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
                      file_path,
                      rgs_before,
                      row_group_indices.size());
+  }
+
+  // Prune from null_count for the conjuncts cuDF could not take. `IS NULL`
+  // excludes a row group whose column has no nulls; `IS NOT NULL` excludes one
+  // that is entirely null. Both are exact, so this loses no matching rows.
+  //
+  // null_count is optional in the parquet spec — an absent value means unknown,
+  // never zero, so the row group is kept.
+  if (!_null_prune_predicates.empty() && !row_group_indices.empty()) {
+    struct resolved_predicate {
+      std::size_t chunk_index;
+      bool expects_null;
+    };
+    std::vector<resolved_predicate> resolved;
+    resolved.reserve(_null_prune_predicates.size());
+    for (auto const& pred : _null_prune_predicates) {
+      // Only a scalar top-level column qualifies. For anything nested, the leaf
+      // statistic counts repeated values or leaf-level nulls, neither of which
+      // is the top-level column's nullness -- pruning on it can drop row groups
+      // that do contain matching rows.
+      //
+      // The DECLARED type is what decides this, not the parquet encoding. A
+      // single leaf does not imply scalar (a one-field struct has one), and
+      // neither does a one-component path: legacy parquet allows a top-level
+      // REPEATED primitive, whose path is just the column name, and DuckDB
+      // surfaces that as a LIST.
+      auto const batch_index = static_cast<std::size_t>(pred.batch_index);
+      if (batch_index >= _plan->data_columns.size()) { continue; }
+      auto const primary_idx = _plan->data_columns[batch_index].primary_idx;
+      if (primary_idx >= _info->returned_types.size()) { continue; }
+      auto const& column_type = _info->returned_types[primary_idx];
+      // MAP is normalized to Sirius LIST by from_duckdb(). DuckDB UNION is not
+      // supported by that conversion, so it cannot reach this scan path.
+      if (column_type.id() == sirius::type_id::LIST || column_type.id() == sirius::type_id::ARRAY ||
+          column_type.id() == sirius::type_id::STRUCT) {
+        continue;
+      }
+
+      auto const leaves =
+        detail::leaf_indices_for_column(metadata, _plan->batch_column_name(pred.batch_index));
+      if (leaves.size() != 1) { continue; }
+      auto const chunk_index = leaves.front();
+      auto const& first_rg   = metadata.row_groups.front();
+      if (chunk_index >= first_rg.columns.size() ||
+          first_rg.columns[chunk_index].meta_data.path_in_schema.size() != 1) {
+        continue;
+      }
+      resolved.push_back({chunk_index, pred.expects_null});
+    }
+
+    if (!resolved.empty()) {
+      auto const rgs_before = row_group_indices.size();
+      auto kept             = decltype(row_group_indices){};
+      kept.reserve(row_group_indices.size());
+      for (auto const rg_idx : row_group_indices) {
+        auto const& rg_meta = metadata.row_groups[static_cast<std::size_t>(rg_idx)];
+        bool keep           = true;
+        for (auto const& pred : resolved) {
+          if (pred.chunk_index >= rg_meta.columns.size()) { continue; }
+          auto const& null_count =
+            rg_meta.columns[pred.chunk_index].meta_data.statistics.null_count;
+          if (!null_count.has_value()) { continue; }
+          bool const provably_empty =
+            pred.expects_null ? (*null_count == 0) : (*null_count == rg_meta.num_rows);
+          if (provably_empty) {
+            keep = false;
+            break;
+          }
+        }
+        if (keep) { kept.push_back(rg_idx); }
+      }
+      row_group_indices = std::move(kept);
+      if (row_group_indices.size() != rgs_before) {
+        SIRIUS_LOG_DEBUG(
+          "[parquet_gpu_ingestible] null_count row group pruning {}: {} -> {} row group(s)",
+          file_path,
+          rgs_before,
+          row_group_indices.size());
+      }
+    }
   }
 
   struct row_group_size_estimate {
@@ -800,8 +1038,9 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
     std::nullopt;
   cudf::ast::expression const* reader_filter_root = nullptr;
 
-  if (_duckdb_filter_expression && !split.disable_filter_pushdown && !all_slices_pruned) {
-    auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
+  // Null-free conjuncts only; the dynamic-filter block below is unaffected.
+  if (_static_pushdown_expression && !split.disable_filter_pushdown && !all_slices_pruned) {
+    auto sirius_filter_ast = sirius::ast::from_duckdb(*_static_pushdown_expression);
     D_ASSERT(sirius_filter_ast != nullptr);
     auto name_resolver = [plan = split.plan](duckdb::idx_t ref_index) -> std::string {
       return plan->batch_column_name(ref_index);
@@ -842,9 +1081,15 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   // inject the partition columns and project to the output layout, so the
   // result is fully ROW_FILTERED_AND_PROJECTED and post_filter_and_project is
   // skipped. `sirius_filter_ast` must outlive `exec` — the evaluator borrows it.
+
+  // The reader discharged the row filter only if it pushed the WHOLE predicate.
+  // After a partial push the dropped conjuncts still have to be applied below.
+  bool const reader_applied_full_filter =
+    ast_expression.has_value() && _static_pushdown_is_complete;
+
   if (_plan->has_partitions()) {
     owning_table_view view{std::move(table)};
-    if (!ast_expression.has_value() && _duckdb_filter_expression) {
+    if (!reader_applied_full_filter && _duckdb_filter_expression) {
       auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
       sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
       auto const data_positions = output_data_positions(*_plan);
@@ -856,7 +1101,7 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
                                     op::scan::filter_state::ROW_FILTERED_AND_PROJECTED};
   }
 
-  auto const state = ast_expression.has_value() ? op::scan::filter_state::ROW_FILTERED
+  auto const state = reader_applied_full_filter ? op::scan::filter_state::ROW_FILTERED
                                                 : op::scan::filter_state::UNFILTERED;
   return op::scan::filtered_table{owning_table_view{std::move(table)}, state};
 }

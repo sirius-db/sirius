@@ -157,6 +157,147 @@ TEST_CASE("Sirius configuration loading from file with configurator",
   REQUIRE(telemetry.engine_name == "sirius_config_test");
 }
 
+TEST_CASE("Sirius configuration rejects zero hash partition bytes", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  fs::path cfg =
+    fs::path(loc.file_name()).parent_path() / "data" / "invalid_hash_partition_zero.yaml";
+
+  sirius::sirius_config config;
+  REQUIRE_THROWS_WITH(
+    config.load_from_file(cfg),
+    Catch::Contains("hash_partition_bytes") && Catch::Contains("greater than zero"));
+}
+
+TEST_CASE("DuckDB setting rejects zero hash partition bytes without a Sirius context",
+          "[sirius][context][config][isolated_context]")
+{
+  finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
+  setenv("SIRIUS_DISABLE", "1", 1);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+
+  auto result = con.Query("SET hash_partition_bytes = 0");
+  REQUIRE(result != nullptr);
+  REQUIRE(result->HasError());
+  REQUIRE_THAT(result->GetError(),
+               Catch::Contains("hash_partition_bytes must be greater than zero"));
+}
+
+TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
+          "[sirius][context][config][isolated_context]")
+{
+  finally cleanup_env{[]() {
+    unsetenv("SIRIUS_CONFIG_FILE");
+    setenv("SIRIUS_DISABLE", "1", 1);
+  }};
+
+  std::source_location loc = std::source_location::current();
+  fs::path cfg = fs::path(loc.file_name()).parent_path() / "data" / "setting_defaults.yaml";
+
+  unsetenv("SIRIUS_DISABLE");
+  setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+
+  auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+
+  auto settings = con.Query(R"(
+    SELECT
+      current_setting('scan_task_batch_size')::UBIGINT,
+      current_setting('max_sort_partition_bytes')::UBIGINT,
+      current_setting('max_sort_partition_memory_fraction')::DOUBLE,
+      current_setting('hash_partition_bytes')::UBIGINT,
+      current_setting('concat_batch_bytes')::UBIGINT,
+      current_setting('sort_sample_bytes')::UBIGINT,
+      current_setting('max_build_hash_table_bytes')::UBIGINT,
+      current_setting('max_broadcast_join_size')::UBIGINT,
+      current_setting('mark_join_build_switch_ratio')::DOUBLE,
+      current_setting('enable_dynamic_filter_pushdown')::BOOLEAN,
+      current_setting('enable_dynamic_zone_map_filter')::BOOLEAN,
+      current_setting('dynamic_filter_domain_coverage_threshold')::DOUBLE,
+      current_setting('dynamic_filter_keep_threshold')::DOUBLE,
+      current_setting('enable_pinned_zone_map_pruning')::BOOLEAN,
+      current_setting('enable_compressed_materialization')::BOOLEAN,
+      current_setting('pin_table_compression')::BOOLEAN,
+      current_setting('pin_table_input_compression_plan_dir')::VARCHAR,
+      current_setting('pin_table_compression_min_batch_size_bytes')::UBIGINT,
+      current_setting('pin_table_compression_max_compressed_fraction')::DOUBLE
+  )");
+  REQUIRE(settings != nullptr);
+  REQUIRE_FALSE(settings->HasError());
+
+  constexpr uint64_t mib = 1024ULL * 1024;
+  REQUIRE(settings->GetValue(0, 0).GetValue<uint64_t>() == 1 * mib);
+  REQUIRE(settings->GetValue(1, 0).GetValue<uint64_t>() == 2 * mib);
+  REQUIRE(settings->GetValue(2, 0).GetValue<double>() == Approx(0.25));
+  REQUIRE(settings->GetValue(3, 0).GetValue<uint64_t>() == 3 * mib);
+  REQUIRE(settings->GetValue(4, 0).GetValue<uint64_t>() == 4 * mib);
+  REQUIRE(settings->GetValue(5, 0).GetValue<uint64_t>() == 5 * mib);
+  REQUIRE(settings->GetValue(6, 0).GetValue<uint64_t>() == 6 * mib);
+  REQUIRE(settings->GetValue(7, 0).GetValue<uint64_t>() == 7 * mib);
+  REQUIRE(settings->GetValue(8, 0).GetValue<double>() == Approx(3.0));
+  REQUIRE_FALSE(settings->GetValue(9, 0).GetValue<bool>());
+  REQUIRE(settings->GetValue(10, 0).GetValue<bool>());
+  REQUIRE(settings->GetValue(11, 0).GetValue<double>() == Approx(0.8));
+  REQUIRE(settings->GetValue(12, 0).GetValue<double>() == Approx(0.7));
+  REQUIRE_FALSE(settings->GetValue(13, 0).GetValue<bool>());
+  REQUIRE_FALSE(settings->GetValue(14, 0).GetValue<bool>());
+  REQUIRE(settings->GetValue(15, 0).GetValue<bool>());
+  REQUIRE(settings->GetValue(16, 0).GetValue<std::string>() == "/tmp/sirius-compression-plans");
+  REQUIRE(settings->GetValue(17, 0).GetValue<uint64_t>() == 8 * mib);
+  REQUIRE(settings->GetValue(18, 0).GetValue<double>() == Approx(0.6));
+
+  auto zero_partition = con.Query("SET hash_partition_bytes = 0");
+  REQUIRE(zero_partition != nullptr);
+  REQUIRE(zero_partition->HasError());
+  REQUIRE(sirius_ctx->get_config().get_operator_params().hash_partition_bytes == 3 * mib);
+
+  auto const require_ok = [&con](std::string const& sql) {
+    auto result = con.Query(sql);
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+  };
+
+  require_ok("SET scan_task_batch_size = 99");
+  require_ok("RESET scan_task_batch_size");
+  require_ok("SET max_sort_partition_memory_fraction = 0.9");
+  require_ok("RESET max_sort_partition_memory_fraction");
+  require_ok("SET enable_dynamic_filter_pushdown = true");
+  require_ok("RESET enable_dynamic_filter_pushdown");
+  require_ok("SET pin_table_compression = false");
+  require_ok("RESET pin_table_compression");
+  require_ok("SET pin_table_compression_max_compressed_fraction = 0.9");
+  require_ok("RESET pin_table_compression_max_compressed_fraction");
+
+  auto reset = con.Query(R"(
+    SELECT
+      current_setting('scan_task_batch_size')::UBIGINT,
+      current_setting('max_sort_partition_memory_fraction')::DOUBLE,
+      current_setting('enable_dynamic_filter_pushdown')::BOOLEAN,
+      current_setting('pin_table_compression')::BOOLEAN,
+      current_setting('pin_table_compression_max_compressed_fraction')::DOUBLE
+  )");
+  REQUIRE(reset != nullptr);
+  REQUIRE_FALSE(reset->HasError());
+  REQUIRE(reset->GetValue(0, 0).GetValue<uint64_t>() == 1 * mib);
+  REQUIRE(reset->GetValue(1, 0).GetValue<double>() == Approx(0.25));
+  REQUIRE_FALSE(reset->GetValue(2, 0).GetValue<bool>());
+  REQUIRE(reset->GetValue(3, 0).GetValue<bool>());
+  REQUIRE(reset->GetValue(4, 0).GetValue<double>() == Approx(0.6));
+
+  auto const& params = sirius_ctx->get_config().get_operator_params();
+  REQUIRE(params.scan_task_batch_size == 1 * mib);
+  REQUIRE(params.max_sort_partition_memory_fraction == Approx(0.25));
+  REQUIRE_FALSE(params.enable_dynamic_filter_pushdown);
+  auto const& compression = sirius_ctx->get_config().get_compression_config();
+  REQUIRE(compression.enable_pin_table_compression);
+  REQUIRE(compression.max_compressed_fraction == Approx(0.6));
+}
+
 TEST_CASE("Sirius configuration loading from file with spaces",
           "[sirius][context][isolated_context]")
 {
@@ -259,7 +400,7 @@ TEST_CASE("reservation_manager_configurator builds N GPU spaces", "[multi_gpu_fo
   auto const& topology = discovery.get_topology();
 
   cucascade::memory::reservation_manager_configurator builder;
-  builder.set_number_of_gpus(topology.num_gpus).use_host_per_numa();
+  builder.set_number_of_gpus(topology.num_gpus).use_numa_id_as_host_id();
   auto configs = builder.build(topology);
 
   // Count GPU and HOST tier configs (memory_space_config is a variant post-bump f47de0b)
@@ -290,9 +431,9 @@ TEST_CASE("memory_manager creates independent spaces per GPU", "[multi_gpu_found
   builder.set_number_of_gpus(static_cast<size_t>(device_count))
     .set_gpu_usage_limit(gpu_capacity)
     .set_reservation_fraction_per_gpu(limit_ratio)
-    .set_per_host_capacity(host_capacity)
-    .use_host_per_gpu()
-    .set_reservation_fraction_per_host(limit_ratio);
+    .set_per_numa_region_capacity(host_capacity)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(limit_ratio);
 
   auto space_configs = builder.build();
   auto manager =
@@ -375,9 +516,9 @@ TEST_CASE("multi_gpu_config_two_gpus", "[.][multi_gpu_foundation]")
   builder.set_number_of_gpus(2)
     .set_gpu_usage_limit(gpu_capacity)
     .set_reservation_fraction_per_gpu(limit_ratio)
-    .set_per_host_capacity(host_capacity)
-    .use_host_per_gpu()
-    .set_reservation_fraction_per_host(limit_ratio);
+    .set_per_numa_region_capacity(host_capacity)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(limit_ratio);
 
   auto space_configs = builder.build();
   auto manager =
@@ -424,9 +565,9 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
   builder.set_number_of_gpus(2)
     .set_gpu_usage_limit(gpu_capacity)
     .set_reservation_fraction_per_gpu(limit_ratio)
-    .set_per_host_capacity(host_capacity)
-    .use_host_per_numa()
-    .set_reservation_fraction_per_host(limit_ratio);
+    .set_per_numa_region_capacity(host_capacity)
+    .use_numa_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(limit_ratio);
 
   auto space_configs = builder.build();
   auto manager =
