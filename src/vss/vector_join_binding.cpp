@@ -71,7 +71,7 @@ std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
   }
   auto const dim = static_cast<std::int64_t>(duckdb::ArrayType::GetSize(vec_type));
 
-  // The side must be pinned; output columns must be a subset of the pin.
+  // Tables must be pinned for now; output columns must be a subset of the pin.
   const auto* pin = sirius_ctx.get_scan_manager().find_pinned_entry_for_duckdb_table(
     side.catalog, side.schema, side.table);
   if (pin == nullptr) {

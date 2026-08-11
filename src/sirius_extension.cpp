@@ -2036,7 +2036,7 @@ using sirius::vss::parse_output_columns;
 using sirius::vss::resolve_vector_join_side;
 using sirius::vss::SiriusVectorJoinBindData;
 using sirius::vss::vector_join_mode;
-
+using sirius::vss::vector_join_output_type;
 static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
                                                      TableFunctionBindInput& input,
                                                      vector<LogicalType>& return_types,
@@ -2064,7 +2064,8 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
   req.n_clusters           = 0;
   req.n_probes             = 1;
   req.eps                  = 0.0;
-  bool join_mode_set       = false;
+  bool join_mode_is_set    = false;
+  bool output_type_is_set  = false;
   std::string left_schema  = "main";
   std::string right_schema = "main";
   std::vector<std::string> left_out_cols;
@@ -2100,9 +2101,20 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
         req.mode = vector_join_mode::threshold;
       } else {
         throw BinderException(
-          "sirius_knn_join: join_mode must be one of 'global', 'per-row', 'threshold'");
+          "sirius_knn_join: join_mode must be 'global', 'per-row', or 'threshold'");
       }
-      join_mode_set = true;
+      join_mode_is_set = true;
+    } else if (key == "output_type") {
+      auto const out_type = StringUtil::Lower(kv.second.ToString());
+      if (out_type == "similarity") {
+        req.output_type = vector_join_output_type::similarity;
+      } else if (out_type == "distance") {
+        req.output_type = vector_join_output_type::distance;
+      } else {
+        throw BinderException(
+          "sirius_knn_join: output_type must be 'similarity' or 'distance'");
+      }
+      output_type_is_set = true;
     } else if (key == "left_schema_name") {
       left_schema = kv.second.ToString();
     } else if (key == "right_schema_name") {
@@ -2121,9 +2133,12 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
     throw BinderException("sirius_knn_join: metric must be one of 'l2', 'cosine', got '" +
                           req.metric + "'");
   }
-  // Default the mode when join_mode isn't given
-  if (!join_mode_set) {
-    req.mode = (req.eps > 0.0) ? vector_join_mode::threshold : vector_join_mode::per_row_top_k;
+  if (!join_mode_is_set) {
+    req.mode = req.eps > 0.0 ? vector_join_mode::threshold : vector_join_mode::per_row_top_k;
+  }
+  if (!output_type_is_set) {
+    req.output_type = req.metric == "cosine" ? vector_join_output_type::similarity
+                                             : vector_join_output_type::distance;
   }
 
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -2159,7 +2174,8 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
   req.dim = left_dim;
 
   return_types.push_back(LogicalType::FLOAT);
-  names.push_back("distance");
+  names.push_back(req.output_type == vector_join_output_type::similarity ? "similarity"
+                                                                         : "distance");
   return std::move(result);
 }
 
@@ -2284,11 +2300,10 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo vector_search_info(vector_search);
   catalog.CreateTableFunction(transaction, vector_search_info);
 
-  // sirius_knn_join(left_table, left_column, right_table, right_column,
-  //   k =>, metric =>, search_mode =>, join_mode =>, n_clusters =>, n_probes =>, eps =>,
+  // sirius_knn_join(left_table, left_column, right_table, right_column, k =>, metric =>,
+  //   search_mode =>, join_mode =>, n_clusters =>, n_probes =>, eps =>, output_type =>,
   //   left_schema_name =>, right_schema_name =>,
   //   left_output_columns =>, right_output_columns =>)
-  // join_mode is one of 'global' | 'per-row' | 'threshold'.
   TableFunction vector_join(
     "sirius_knn_join",
     {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
@@ -2301,6 +2316,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   vector_join.named_parameters["n_clusters"]           = LogicalType::BIGINT;
   vector_join.named_parameters["n_probes"]             = LogicalType::BIGINT;
   vector_join.named_parameters["eps"]                  = LogicalType::DOUBLE;
+  vector_join.named_parameters["output_type"]          = LogicalType::VARCHAR;
   vector_join.named_parameters["left_schema_name"]     = LogicalType::VARCHAR;
   vector_join.named_parameters["right_schema_name"]    = LogicalType::VARCHAR;
   vector_join.named_parameters["left_output_columns"]  = LogicalType::LIST(LogicalType::VARCHAR);

@@ -660,9 +660,6 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
     duckdb::make_uniq<sirius::op::sirius_physical_vector_join>(
       sirius::from_duckdb_vec(op.returned_types), op.estimated_cardinality, bind_data.req);
 
-  // The op emits its full return schema (corpus cols, probe cols, distance) at
-  // positions 0..N-1 by column index. When column_ids just requests those columns
-  // in order we hand the op back directly; otherwise a projection reorders/subsets.
   auto column_ids  = op.GetColumnIds();
   bool is_identity = column_ids.size() == op.returned_types.size();
   for (std::size_t i = 0; is_identity && i < column_ids.size(); ++i) {
