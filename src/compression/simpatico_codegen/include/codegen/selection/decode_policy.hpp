@@ -10,6 +10,16 @@
 // value like "true" turned the feature on in one layer and off in another.
 //
 // All are read once and cached: the gate check sits on the per-batch path.
+//
+// TODO: these should be Sirius parameters, not environment variables. As env
+// vars they are invisible to duckdb_settings(), cannot be set per session, and
+// — because the values cache on first read — cannot be varied within one test
+// binary, which is why some decode paths can only be reached by a unit test
+// rather than end to end. The obstacle is layering: this library has no DuckDB
+// dependency, so the values cannot be pulled from the setting registry here.
+// They would have to arrive from Sirius, either pushed down once per query or
+// passed into the decode call as a policy value. Left as env while the feature
+// is experimental; revisit before it ships.
 
 #pragma once
 

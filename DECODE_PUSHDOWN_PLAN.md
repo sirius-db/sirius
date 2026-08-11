@@ -72,6 +72,16 @@ layer and off in another. All six knobs now live once, with the decode that acts
 No `fusion_policy` object was needed — free functions with one parse helper each say the same
 thing without a lifetime to thread.
 
+**Still open, deliberately deferred:** they are environment variables, not Sirius parameters, so
+they bypass the ~62 typed `SET` options in `sirius_extension.cpp` — invisible to
+`duckdb_settings()`, not settable per session, and cached on first read, which is why some decode
+paths are only reachable by a unit test rather than end to end. The obstacle is layering:
+simpatico has no DuckDB dependency, so the values cannot be pulled from the setting registry where
+they are read; they would have to be pushed down per query or passed into the decode call as a
+policy value (the latter preferred — it makes policy a value like everything else, and removes the
+cache-on-first-read testing problem). Left as env while the feature is experimental; revisit
+before it ships.
+
 **P9 — Emitter duplication.** See §5.
 
 ## 2. Part A — top-level API (intent only)
