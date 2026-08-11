@@ -256,6 +256,38 @@ class pipelineable_operator_data : public operator_data {
   }
 
   /**
+   * @brief Record which repository each batch was taken from, positionally.
+   *
+   * Only meaningful for input data popped from an operator's ports, where the
+   * port names the producing edge. Output batches an operator just computed have
+   * no such origin and leave this empty.
+   *
+   * The spill path needs it: compression plans are keyed by source repository,
+   * and a batch reaching the downgrade executor without one is not compressed at
+   * all. Batches held by queued tasks used to arrive that way, which is why 92%
+   * of spill traffic on q3/SF1000 bypassed the encoder.
+   *
+   * @param repos One entry per batch, in get_data_batches() order. Entries may be
+   *              null for ports that carry no repository.
+   */
+  void set_source_repos(std::vector<const ::cucascade::shared_data_repository*> repos)
+  {
+    _source_repos = std::move(repos);
+  }
+
+  /**
+   * @brief The repository batch @p index came from, or nullptr when unrecorded.
+   *
+   * Bounds-checked rather than asserting: the vector is populated only on the
+   * port-popping path, so an absent or short entry is the normal case for
+   * operator-produced data, not a bug.
+   */
+  [[nodiscard]] const ::cucascade::shared_data_repository* source_repo_for(std::size_t index) const
+  {
+    return index < _source_repos.size() ? _source_repos[index] : nullptr;
+  }
+
+  /**
    * @brief Get idle data batch pointers, lazily populating from read-only batches if needed.
    */
   [[nodiscard]] const std::vector<std::shared_ptr<::cucascade::data_batch>>& get_data_batches()
@@ -319,6 +351,9 @@ class pipelineable_operator_data : public operator_data {
  private:
   mutable std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> _data_batches;
   mutable std::optional<std::vector<::cucascade::read_only_data_batch>> _read_only_data_batches;
+  /// Positional origin of each batch; see set_source_repos(). Empty for
+  /// operator-produced output, which has no producing port.
+  std::vector<const ::cucascade::shared_data_repository*> _source_repos;
 };
 
 /**

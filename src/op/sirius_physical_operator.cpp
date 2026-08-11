@@ -351,15 +351,25 @@ std::unique_ptr<operator_data> sirius_physical_operator::get_next_task_input_dat
   // take one data batch from each port and schedule a task (a task takes one data batch from each
   // port), do this repeatedly until all ports are empty
   std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
+  // Kept in step with input_batch: this is the only point where a batch and the
+  // repository it came from are both in hand, and the spill path needs that
+  // origin to key its compression plan (see pipelineable_operator_data::
+  // set_source_repos).
+  std::vector<const ::cucascade::shared_data_repository*> source_repos;
   for (auto& [port_name, port_ptr] : ports) {
     if (!port_ptr->repo) { continue; }  // dependency-only port; nothing to pop
     // For Pipeline barrier: need at least one data batch in the port's repository
     // TODO: later on we will adjust to the new data repository interface in cuCascade
     auto batch_and_handle = port_ptr->repo->pop_next_data_batch();
-    if (batch_and_handle) { input_batch.push_back(std::move(batch_and_handle)); }
+    if (batch_and_handle) {
+      input_batch.push_back(std::move(batch_and_handle));
+      source_repos.push_back(port_ptr->repo);
+    }
   }
   if (input_batch.empty()) { return nullptr; }
-  return std::make_unique<pipelineable_operator_data>(input_batch);
+  auto data = std::make_unique<pipelineable_operator_data>(input_batch);
+  data->set_source_repos(std::move(source_repos));
+  return data;
 }
 
 bool sirius_physical_operator::all_ports_empty()
