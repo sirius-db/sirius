@@ -436,18 +436,14 @@ std::unique_ptr<cudf::table> decode_with_filters(simpatico::compressed_table con
   wave_request.source_generation = request.membership_generation;
 
   sirius::codegen::scan_filter_result result;
-  auto decoded =
-    simpatico::decompress_scan_filter(chunk, selected, wave_request, result, decode_pool(), mr);
   std::string error;
-  auto table =
-    simpatico::compact_scan_filter_output(std::move(decoded), result, stream, mr, &error);
-  // compact_scan_filter_output synchronized `stream`; re-point the selection
-  // buffers there anyway so their teardown follows the batch's ordering.
+  auto table = simpatico::decompress_scan_filter(
+    chunk, selected, wave_request, result, decode_pool(), stream, mr, &error);
+  // The decode synchronized `stream`; re-point the selection buffers there
+  // anyway so their teardown follows the batch's ordering.
   result.set_stream(stream);
-  if (!table) {
-    SIRIUS_DECODE_DIAG("[decode-filter] assembly REFUSED ({}); falling back to a plain decode",
-                       error);
-    return nullptr;
+  if (!error.empty()) {
+    SIRIUS_DECODE_DIAG("[decode-filter] assembly REFUSED ({}); the batch decoded plainly", error);
   }
   // row_filtered only when the decode carried EVERY restricting conjunct: a
   // partially applied request must leave the batch untagged so the scan

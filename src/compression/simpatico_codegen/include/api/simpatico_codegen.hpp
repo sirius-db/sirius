@@ -229,8 +229,9 @@ std::unique_ptr<cudf::table> decompress(
 /// survivor count), then wave 2 decodes the compactable columns straight into
 /// survivor_count-row columns and the rest full width. @p result comes back
 /// with applied=true, the selection mask/offsets, and the gather map
-/// (row_indices) for the full-width columns — the caller compacts those and
-/// skips its own filter pass.
+/// (row_indices) it used. The returned table is uniformly survivor-sized —
+/// the compacted routes came back that way and the full-width ones are
+/// compacted here — so the caller only has to skip its own filter pass.
 ///
 /// When the gate is off, @p request is empty, or any precondition fails
 /// (non-bitpack filter column, nulls, ...), this is EXACTLY the unfiltered
@@ -249,12 +250,21 @@ std::unique_ptr<cudf::table> decompress(
 /// substitution columns exactly like the ordinary pushdown, never a plain
 /// decode (the dictionary win survives every fallback). Callers must therefore
 /// be ready for BOOL8 at those columns whenever result.applied is false.
-std::vector<std::unique_ptr<cudf::column>> decompress_scan_filter(
+/// Assembling the output can itself refuse (a null-masked column, an output
+/// that is neither full width nor survivor-sized): the call then falls back to
+/// the unfiltered decode, sets result.status = failed and writes @p error_out.
+/// A caller never sees a half-filtered batch.
+///
+/// Synchronizes @p stream before returning when the filtering applied, so the
+/// caller may free or rebind the inputs immediately.
+std::unique_ptr<cudf::table> decompress_scan_filter(
   const compressed_table& table,
   std::span<const std::size_t> selected_columns,
   sirius::codegen::scan_filter_request const& request,
   sirius::codegen::scan_filter_result& result,
   simpatico::stream_pool& pool,
-  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
+  std::string* error_out            = nullptr);
 
 }  // namespace simpatico

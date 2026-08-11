@@ -1130,13 +1130,15 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
   return decompress_columns_parallel(table, selected_columns, predicates, pool, mr);
 }
 
-std::vector<std::unique_ptr<cudf::column>> decompress_scan_filter(
+std::unique_ptr<cudf::table> decompress_scan_filter(
   const compressed_table& table,
   std::span<const std::size_t> selected_columns,
   sirius::codegen::scan_filter_request const& request,
   sirius::codegen::scan_filter_result& result,
   simpatico::stream_pool& pool,
-  rmm::device_async_resource_ref mr)
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  std::string* error_out)
 {
   nvtx3::scoped_range nvtx_range{"simpatico::decompress_table[scan_filter,pool]"};
   result = sirius::codegen::scan_filter_result{};
@@ -1163,7 +1165,16 @@ std::vector<std::unique_ptr<cudf::column>> decompress_scan_filter(
         n_b,
         request.filters.size() + request.pair_filters.size() + request.bool8_filters.size());
     }
-    return std::move(*cols);
+    // Reconcile the wave's ragged output into one uniformly survivor-sized
+    // table before it leaves: the compacted routes came back survivor-sized and
+    // the `full` ones full width, and nothing outside knows which is which.
+    auto reconciled = compact_scan_filter_output(std::move(*cols), result, stream, mr, error_out);
+    if (reconciled) { return reconciled; }
+    // The assembly refused (a null-masked column, a mis-sized output). Fall
+    // through to the unfiltered decode below and report nothing applied — the
+    // caller must not see a half-filtered batch.
+    result        = sirius::codegen::scan_filter_result{};
+    result.status = sirius::codegen::scan_filter_status::failed;
   }
   // Gate off / nothing requested / policy refusal / mid-flight fallback:
   // exactly the unfiltered path — with one obligation: when the request routed
@@ -1177,9 +1188,9 @@ std::vector<std::unique_ptr<cudf::column>> decompress_scan_filter(
     for (auto const& b : request.bool8_filters) {
       if (b.column < predicates.size()) predicates[b.column].equals_any = b.equals_any;
     }
-    return decompress_columns_parallel(table, selected_columns, predicates, pool, mr)->release();
+    return decompress_columns_parallel(table, selected_columns, predicates, pool, mr);
   }
-  return decompress_columns_parallel(table, selected_columns, pool, mr)->release();
+  return decompress_columns_parallel(table, selected_columns, pool, mr);
 }
 
 }  // namespace simpatico

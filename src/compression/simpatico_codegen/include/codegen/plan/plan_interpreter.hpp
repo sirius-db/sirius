@@ -243,15 +243,16 @@ std::unique_ptr<cudf::column> decompress_column_compacted(
   rmm::device_async_resource_ref mr,
   std::string* error_out);
 
-/// Assemble the filtered decode's output (see
-/// ``simpatico::decompress_scan_filter``) into one uniformly survivor-sized
-/// table: compacted-route columns pass through; ALL full-width columns are
-/// compacted with ONE ``cudf::gather`` over
-/// ``result.row_indices``. When ``result.applied`` is false the columns are
-/// assembled unchanged (the ordinary full-width decode). Null-masked columns
-/// are refused (returns nullptr + @p error_out; the caller must fall back to
-/// the ordinary decode — never corrupt). Synchronizes @p stream before
-/// returning, so the caller may free/rebind the inputs immediately.
+/// Assemble one filtered decode's ragged output into a uniformly
+/// survivor-sized table: compacted-route columns pass through; ALL full-width
+/// columns are compacted with ONE ``cudf::gather`` over ``result.row_indices``.
+/// When ``result.applied`` is false the columns are assembled unchanged.
+/// Null-masked columns are refused (returns nullptr + @p error_out).
+/// Synchronizes @p stream before returning, so the caller may free/rebind the
+/// inputs immediately.
+///
+/// Internal to the decode: ``decompress_scan_filter`` calls this before
+/// returning, so no caller outside sees the ragged intermediate.
 std::unique_ptr<cudf::table> compact_scan_filter_output(
   std::vector<std::unique_ptr<cudf::column>>&& columns,
   sirius::codegen::scan_filter_result const& result,
