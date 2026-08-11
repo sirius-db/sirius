@@ -85,40 +85,62 @@ lowered_plan lower_substrait(duckdb::Connection& conn, const std::string& plan_b
 {
   auto& client = *conn.context;
 
-  // Byte-ranged parquet splits ride the plan's LocalFiles items, but DuckDB's consumer and
-  // parquet binding cannot carry them — extract into a per-plan state the physical plan
-  // generator consumes. Always replaced (and removed when this plan has none), so a stale
-  // registry can never leak a previous plan's ranges into this one.
-  client.registered_state->Remove(sirius::planner::scan_byte_ranges_state::kStateKey);
-  if (auto ranges = sirius::planner::extract_scan_byte_ranges(plan_bytes); !ranges.empty()) {
-    client.registered_state->Insert(
-      sirius::planner::scan_byte_ranges_state::kStateKey,
-      duckdb::make_shared_ptr<sirius::planner::scan_byte_ranges_state>(std::move(ranges)));
+  // Substrait transformation and planning both bind against the catalog, and every catalog lookup
+  // goes through TransactionContext::ActiveTransaction(). DuckDB 1.5.5 throws there when no
+  // transaction is open ("TransactionContext::ActiveTransaction called without active
+  // transaction"); 1.5.4 tolerated it, which is why this only surfaced with the submodule bump in
+  // a3c99f4a. Fragment::build() commits its view-creation transaction before opening the
+  // StandaloneQueryScope, so by the time we are called there is usually none.
+  //
+  // Own one only if the caller has not already opened it -- the single-shot path in
+  // ExecuteSubstrait() begins its own and expects to still own it on return.
+  //
+  // ClientContext::transaction, NOT Connection::BeginTransaction(): the latter runs
+  // Query("BEGIN TRANSACTION") (duckdb/src/main/connection.cpp:341), an ordinary statement that
+  // would take the lifecycle mutex the enclosing StandaloneQueryScope already holds.
+  const bool owned_transaction = !client.transaction.HasActiveTransaction();
+  if (owned_transaction) { client.transaction.BeginTransaction(); }
+
+  try {
+    // Byte-ranged parquet splits ride the plan's LocalFiles items, but DuckDB's consumer and
+    // parquet binding cannot carry them — extract into a per-plan state the physical plan
+    // generator consumes. Always replaced (and removed when this plan has none), so a stale
+    // registry can never leak a previous plan's ranges into this one.
+    client.registered_state->Remove(sirius::planner::scan_byte_ranges_state::kStateKey);
+    if (auto ranges = sirius::planner::extract_scan_byte_ranges(plan_bytes); !ranges.empty()) {
+      client.registered_state->Insert(
+        sirius::planner::scan_byte_ranges_state::kStateKey,
+        duckdb::make_shared_ptr<sirius::planner::scan_byte_ranges_state>(std::move(ranges)));
+    }
+
+    duckdb::SubstraitToDuckDB transformer(conn.context, plan_bytes, /*json=*/false);
+    auto relation = transformer.TransformPlan();
+
+    duckdb::Planner planner(client);
+    planner.CreatePlan(duckdb::make_uniq<duckdb::RelationStatement>(relation));
+
+    auto prepared = duckdb::make_shared_ptr<duckdb::PreparedStatementData>(
+      duckdb::StatementType::SELECT_STATEMENT);
+    prepared->names     = planner.names;
+    prepared->types     = planner.types;
+    prepared->value_map = std::move(planner.value_map);
+
+    auto logical_plan = std::move(planner.plan);
+    if (client.config.enable_optimizer) {
+      duckdb::Optimizer optimizer(*planner.binder, client);
+      logical_plan = optimizer.Optimize(std::move(logical_plan));
+    }
+    logical_plan->ResolveOperatorTypes();
+    duckdb::ColumnBindingResolver resolver;
+    duckdb::ColumnBindingResolver::Verify(*logical_plan);
+    resolver.VisitOperator(*logical_plan);
+
+    if (owned_transaction) { client.transaction.Commit(); }
+    return lowered_plan{std::move(logical_plan), std::move(prepared)};
+  } catch (...) {
+    if (owned_transaction) { client.transaction.Rollback(nullptr); }
+    throw;
   }
-
-  duckdb::SubstraitToDuckDB transformer(conn.context, plan_bytes, /*json=*/false);
-  auto relation = transformer.TransformPlan();
-
-  duckdb::Planner planner(client);
-  planner.CreatePlan(duckdb::make_uniq<duckdb::RelationStatement>(relation));
-
-  auto prepared =
-    duckdb::make_shared_ptr<duckdb::PreparedStatementData>(duckdb::StatementType::SELECT_STATEMENT);
-  prepared->names     = planner.names;
-  prepared->types     = planner.types;
-  prepared->value_map = std::move(planner.value_map);
-
-  auto logical_plan = std::move(planner.plan);
-  if (client.config.enable_optimizer) {
-    duckdb::Optimizer optimizer(*planner.binder, client);
-    logical_plan = optimizer.Optimize(std::move(logical_plan));
-  }
-  logical_plan->ResolveOperatorTypes();
-  duckdb::ColumnBindingResolver resolver;
-  duckdb::ColumnBindingResolver::Verify(*logical_plan);
-  resolver.VisitOperator(*logical_plan);
-
-  return lowered_plan{std::move(logical_plan), std::move(prepared)};
 }
 }  // namespace
 
