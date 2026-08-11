@@ -37,15 +37,13 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
-#include <unistd.h>
+#include <utils/parquet_fixture_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 
 #include <cstdint>
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
-#include <system_error>
 
 namespace fs = std::filesystem;
 
@@ -63,39 +61,33 @@ constexpr char const* kWhere = "k >= 0 AND a < b";
 // row except the first (range 0 → a == b).
 void generate_parquet(fs::path const& path)
 {
-  setenv("SIRIUS_DISABLE", "1", 1);
-  {
-    duckdb::DuckDB gen_db(nullptr);
-    duckdb::Connection gen(gen_db);
-    auto r = gen.Query(
-      "COPY (SELECT range AS k, "
-      "             DATE '1990-01-01' + CAST(range AS INTEGER) AS a, "
-      "             DATE '1990-01-01' + CAST(range * 2 AS INTEGER) AS b "
-      "      FROM range(" +
-      std::to_string(kRows) + ")) TO '" + path.string() + "' (FORMAT PARQUET);");
-    REQUIRE(r);
-    REQUIRE_FALSE(r->HasError());
-  }
-  unsetenv("SIRIUS_DISABLE");
+  sirius::test::scoped_sirius_disable disable_sirius;
+  duckdb::DuckDB gen_db(nullptr);
+  duckdb::Connection gen(gen_db);
+  auto r = gen.Query(
+    "COPY (SELECT range AS k, "
+    "             DATE '1990-01-01' + CAST(range AS INTEGER) AS a, "
+    "             DATE '1990-01-01' + CAST(range * 2 AS INTEGER) AS b "
+    "      FROM range(" +
+    std::to_string(kRows) + ")) TO " + sirius::test::sql_literal(path.string()) +
+    " (FORMAT PARQUET);");
+  REQUIRE(r);
+  REQUIRE_FALSE(r->HasError());
 }
 
 // CPU (DuckDB, Sirius disabled) baseline for the same query — the ground truth the GPU result
 // must match.
 std::string cpu_count(fs::path const& path)
 {
-  setenv("SIRIUS_DISABLE", "1", 1);
-  std::string out;
-  {
-    duckdb::DuckDB db(nullptr);
-    duckdb::Connection con(db);
-    auto r = con.Query("SELECT count(*) FROM read_parquet('" + path.string() + "') WHERE " +
-                       std::string(kWhere) + ";");
-    REQUIRE(r);
-    REQUIRE_FALSE(r->HasError());
-    out = r->GetValue(0, 0).ToString();
-  }
-  unsetenv("SIRIUS_DISABLE");
-  return out;
+  sirius::test::scoped_sirius_disable disable_sirius;
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto r =
+    con.Query("SELECT count(*) FROM read_parquet(" + sirius::test::sql_literal(path.string()) +
+              ") WHERE " + std::string(kWhere) + ";");
+  REQUIRE(r);
+  REQUIRE_FALSE(r->HasError());
+  return r->GetValue(0, 0).ToString();
 }
 
 void write_config(fs::path const& yaml_path)
@@ -146,10 +138,8 @@ TEST_CASE("pin_table - cached scan serves columns in materialized order (column-
     sirius::test::g_integration_env_2gpu->pause();
   }
 
-  auto tmp = fs::temp_directory_path() / ("sirius-pin-colorder-" + std::to_string(::getpid()));
-  std::error_code ec;
-  fs::remove_all(tmp, ec);
-  fs::create_directories(tmp);
+  sirius::test::scratch_dir scratch{"pin_colorder"};
+  auto const& tmp = scratch.path();
 
   auto parquet_path = tmp / "kab.parquet";
   generate_parquet(parquet_path);
@@ -176,14 +166,15 @@ TEST_CASE("pin_table - cached scan serves columns in materialized order (column-
     for (auto const* tier : {"host", "gpu"}) {
       DYNAMIC_SECTION("pin tier = " << tier)
       {
-        auto pin = con.Query("CALL pin_table('" + parquet_path.string() + "', tier='" + tier +
-                             "', name='colorder', cols=['k', 'a', 'b']);");
+        auto pin = con.Query("CALL pin_table(" + sirius::test::sql_literal(parquet_path.string()) +
+                             ", tier='" + tier + "', name='colorder', cols=['k', 'a', 'b']);");
         REQUIRE(pin);
         if (pin->HasError()) { UNSCOPED_INFO("pin_table error: " << pin->GetError()); }
         REQUIRE_FALSE(pin->HasError());
 
-        auto res = con.Query("SELECT count(*) FROM read_parquet('" + parquet_path.string() +
-                             "') WHERE " + std::string(kWhere) + ";");
+        auto res = con.Query("SELECT count(*) FROM read_parquet(" +
+                             sirius::test::sql_literal(parquet_path.string()) + ") WHERE " +
+                             std::string(kWhere) + ";");
         REQUIRE(res);
         if (res->HasError()) { UNSCOPED_INFO("query error: " << res->GetError()); }
         REQUIRE_FALSE(res->HasError());  // before the fix: cuDF non-matching-operand crash
@@ -195,6 +186,4 @@ TEST_CASE("pin_table - cached scan serves columns in materialized order (column-
       }
     }
   }
-
-  fs::remove_all(tmp, ec);
 }

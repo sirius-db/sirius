@@ -30,6 +30,19 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Test thread sweep harness
+        run: |
+          set -o pipefail
+          bash test/tpch_performance/test_sweep_threads.sh 2>&1 | tee /tmp/harness.log
+
+      - name: Surface thread sweep harness errors
+        if: failure()
+        run: |
+          echo '## Thread sweep harness errors' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/harness.log >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
       - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f # v0.10.0
         with:
           cache: false

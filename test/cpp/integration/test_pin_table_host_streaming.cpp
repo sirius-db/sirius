@@ -37,16 +37,14 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <duckdb.hpp>
-#include <unistd.h>
+#include <utils/parquet_fixture_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
-#include <system_error>
 
 namespace fs = std::filesystem;
 
@@ -63,16 +61,13 @@ constexpr std::size_t kBatchBytes = 8ull << 20;  // 8 MiB scan batches -> ~80 ba
 // build a SiriusContext on it — the real (tiny-budget) instance is created later from the yaml.
 void generate_parquet(fs::path const& path)
 {
-  setenv("SIRIUS_DISABLE", "1", 1);
-  {
-    duckdb::DuckDB gen_db(nullptr);
-    duckdb::Connection gen(gen_db);
-    auto r = gen.Query("COPY (SELECT range AS k, range * 2 AS v FROM range(" +
-                       std::to_string(kRows) + ")) TO '" + path.string() + "' (FORMAT PARQUET);");
-    REQUIRE(r);
-    REQUIRE_FALSE(r->HasError());
-  }
-  unsetenv("SIRIUS_DISABLE");
+  sirius::test::scoped_sirius_disable disable_sirius;
+  duckdb::DuckDB gen_db(nullptr);
+  duckdb::Connection gen(gen_db);
+  auto r = gen.Query("COPY (SELECT range AS k, range * 2 AS v FROM range(" + std::to_string(kRows) +
+                     ")) TO " + sirius::test::sql_literal(path.string()) + " (FORMAT PARQUET);");
+  REQUIRE(r);
+  REQUIRE_FALSE(r->HasError());
 }
 
 // Mirror integration.yaml, but cap GPU memory well below the table size and shrink the scan
@@ -132,10 +127,8 @@ TEST_CASE("gpu_execution - pin_table host tier streams without fitting the whole
     sirius::test::g_integration_env_2gpu->pause();
   }
 
-  auto tmp = fs::temp_directory_path() / ("sirius-pin-host-stream-" + std::to_string(::getpid()));
-  std::error_code ec;
-  fs::remove_all(tmp, ec);
-  fs::create_directories(tmp);
+  sirius::test::scratch_dir scratch{"pin_host_stream"};
+  auto const& tmp = scratch.path();
 
   auto parquet_path = tmp / "wide.parquet";
   generate_parquet(parquet_path);
@@ -157,8 +150,8 @@ TEST_CASE("gpu_execution - pin_table host tier streams without fitting the whole
 
     // The view over the generated parquet is the queryable relation; the pinned cache entry is
     // keyed by the same resolved file path, so a scan of `t` is served from the host cache.
-    auto v =
-      con.Query("CREATE VIEW t AS SELECT * FROM read_parquet('" + parquet_path.string() + "');");
+    auto v = con.Query("CREATE VIEW t AS SELECT * FROM read_parquet(" +
+                       sirius::test::sql_literal(parquet_path.string()) + ");");
     REQUIRE(v);
     REQUIRE_FALSE(v->HasError());
 
@@ -177,7 +170,8 @@ TEST_CASE("gpu_execution - pin_table host tier streams without fitting the whole
     // through GPU at a time, this must succeed; materializing the whole table on GPU (the
     // pre-streaming behavior) could not fit the budget.
     auto pin_result =
-      con.Query("CALL pin_table('" + parquet_path.string() + "', tier='host', name='t');");
+      con.Query("CALL pin_table(" + sirius::test::sql_literal(parquet_path.string()) +
+                ", tier='host', name='t');");
     REQUIRE(pin_result);
     if (pin_result->HasError()) { UNSCOPED_INFO("pin_table error: " << pin_result->GetError()); }
     REQUIRE_FALSE(pin_result->HasError());
@@ -205,6 +199,4 @@ TEST_CASE("gpu_execution - pin_table host tier streams without fitting the whole
     REQUIRE(unpin_result);
     REQUIRE_FALSE(unpin_result->HasError());
   }
-
-  fs::remove_all(tmp, ec);
 }
