@@ -60,18 +60,24 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
   std::lock_guard<std::mutex> lg(_drain_mutex);
 
   auto* repo = ports.begin()->second->repo;
-  if (_current_partition_index < repo->num_partitions()) {
+  while (_current_partition_index < repo->num_partitions()) {
     std::vector<std::shared_ptr<cucascade::data_batch>> all_batches;
     while (true) {
       auto batch = repo->pop_next_data_batch(_current_partition_index);
       if (!batch) { break; }
       all_batches.push_back(std::move(batch));
     }
+    if (all_batches.empty()) {
+      // A partition with nothing to drain (all rows range-partitioned elsewhere). Skip it and
+      // keep scanning: returning nullptr here without a batch would still consume the index,
+      // and any batch deposited into it later could never be drained (issue #1452 review).
+      _current_partition_index++;
+      continue;
+    }
     _current_partition_index++;
     SIRIUS_LOG_DEBUG("merge_sort: drained {} batches for partition {}",
                      all_batches.size(),
                      _current_partition_index - 1);
-    if (all_batches.empty()) { return nullptr; }
     return std::make_unique<pipelineable_operator_data>(all_batches);
   }
   return nullptr;

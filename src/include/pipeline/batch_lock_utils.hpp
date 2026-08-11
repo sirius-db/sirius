@@ -99,9 +99,18 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
     requested_memory_space != nullptr ? requested_memory_space : read_accessor.get_memory_space();
   if (target_space == nullptr) { return std::nullopt; }
 
-  // Memory space matches — return the read-only accessor directly
+  // Memory space matches — return the read-only accessor directly. Before handing the data to
+  // this task's stream, wait on the producer's writer event (recorded by make_data_batch):
+  // task-side stream.synchronize() calls normally make the data visible before publish, but any
+  // path that publishes work still in flight on another pooled stream would otherwise race
+  // (issue #1452). The wait is device-side only and free when the event already retired.
   if (read_accessor.get_memory_space() != nullptr &&
       read_accessor.get_memory_space()->get_id() == target_space->get_id()) {
+    if (const auto* data = read_accessor.get_data()) {
+      if (auto writer_event = data->get_writer_event(); writer_event != nullptr) {
+        cudaStreamWaitEvent(stream.value(), writer_event, 0);
+      }
+    }
     return std::move(read_accessor);
   }
 
