@@ -229,6 +229,7 @@ add_codegen_host_test(test_representation_contract)
 add_codegen_host_test(test_bitpack_layout_contract)
 add_codegen_host_test(test_multi_gpu_stream_affinity)
 add_codegen_host_test(test_masked_decode_variants)
+add_codegen_host_test(test_selection_wave)
 add_codegen_host_test(test_render_signature_contract)
 
 # Multi-mode CLI. Target is simpatico_cli to avoid clashing with the lib target;
@@ -264,4 +265,5 @@ add_test(NAME representation_contract COMMAND test_representation_contract)
 add_test(NAME bitpack_layout_contract COMMAND test_bitpack_layout_contract)
 add_test(NAME multi_gpu_stream_affinity COMMAND test_multi_gpu_stream_affinity)
 add_test(NAME masked_decode_variants COMMAND test_masked_decode_variants)
+add_test(NAME selection_wave COMMAND test_selection_wave)
 add_test(NAME render_signature_contract COMMAND test_render_signature_contract)
