@@ -312,51 +312,79 @@ capability probe and tier:
 
 ### Can the axes grow?
 
-Yes, and that is the main reason to hold the shape open rather than freeze the seven points.
-Growth on either axis is **additive**: a new consumer works under every enumerator that composes
-with it, so one emitter buys several kernels.
+New *points* on the two axes, derived from what each axis can express rather than listed ad hoc.
+Growth is additive: a consumer works under every enumerator it composes with, so one emitter
+buys several kernels.
 
-**Enumerator — how rows are walked.** Candidates, roughly by expected value:
+**Consumer — bounded by what it emits per row.**
 
-- **`run_list`** — survivors as `(start, length)` runs rather than individual ids. Sits between
-  `mask_bits` and `index_list`: strictly better than `index_list` when survivors are *clustered*,
-  which is exactly what a range predicate on clustered or sorted data produces. `index_list`
-  pays random access per row; a run keeps coalescing.
-- **`range_slice`** — a contiguous `[lo, hi)` sub-range of the chunk. A chunk is all-or-nothing
-  today, so this is what LIMIT/OFFSET pushdown and split boundaries that cut mid-chunk would
-  need.
-- **`stride`** — every Nth row, for `TABLESAMPLE` / approximate aggregation.
+| category | shipped | candidates |
+|---|---|---|
+| store the value | `write_column` | **`transform_store`** — store *f(v)*, not *v* |
+| store a derived payload | `dict_gather`, `offsets_meta` | `lookup_gather` (generalised side-table expansion) |
+| reduce to one bit | `ballot_range`, `ballot_pair` | **`ballot_membership`**, `ballot_expression`, `ballot_null` |
+| reduce across rows | — | `count`, `aggregate` (SUM/MIN/MAX), `zone_map` (per-chunk min/max) |
+| derive a value for elsewhere | — | `hash` (join hashes at decode time) |
 
-**Consumer — what happens per row.** This axis has more headroom, because the decode already
-holds the value in a register and currently throws that away:
-
-- **`ballot_membership`** — probe a device hash set / Bloom per row and ballot. This directly
-  fixes the asymmetry that makes membership the most expensive conjunct today: it is expensive
+- **`ballot_membership`** is the highest-value: membership is the most expensive conjunct today
   *because* it cannot work on packed bits, so wave 1 decodes the key column full width and the
-  cap is 1 (q8: 3 probes = +134 ms probe-side vs −48 ms compaction). A consumer sees decoded
-  values in-register and never materialises the column. Probably the highest-value future
-  consumer.
-- **`aggregate`** — accumulate SUM / MIN / MAX during decode instead of writing a column.
-  `SELECT SUM(l_extendedprice) WHERE …` currently materialises a column purely to reduce it.
-- **`count`** — popcount the ballot per block with no mask buffer at all. §7's count-only work is
-  `all_rows × count` once this exists; the mask words become unnecessary rather than merely
-  unused.
-- **`hash`** — compute join hash values at decode time.
-- **`null_ballot`** — `IS [NOT] NULL` masks, once a null model exists.
+  source cap is 1 (q8: 3 probes = +134 ms probe-side vs −48 ms compaction). A consumer sees the
+  value in-register and never materialises the column.
+- **`transform_store`** is the sleeper: projection pushdown into decode. q1/q6's
+  `l_extendedprice * (1 - l_discount)` materialises two full columns to compute one; the
+  arithmetic is free where the values already sit in registers.
+- **`ballot_expression`** would make `ballot_range` and `ballot_pair` special cases rather than
+  siblings, and is how predicate coverage widens (`LIKE 'x%'`, `year(d) = 1994`, disjunctions)
+  without a new consumer per shape.
 
-**Constraints worth recording**, so the product is not mistaken for fully orthogonal:
+**Enumerator — bounded by how the row set is described.**
 
-- **Ballot consumers require a non-compacting enumerator.** The mask layout depends on ballot
-  lanes lining up with mask bits (one `uint32` per 32 *consecutive* rows). Under `mask_bits` or
-  `index_list` the surviving rows are no longer contiguous, so the ballot cannot address the
-  output word. That is why `mask_bits × ballot_*` is unsupported rather than merely unbuilt —
-  refining a mask in a second pass would need a different output layout, not just an emitter.
-- **Arity currently hides inside the consumer** (`ballot_range` = 1 tree, `ballot_pair` = 2).
-  That is fine at 1–2. If a 3-ary consumer ever appears, arity should become explicit rather
-  than spawning `ballot_triple` — treating arity as a fork rather than a parameter is precisely
-  what produced F4's 165-line duplicate.
-- **Some consumers constrain the plan shape, not the axis** — `dict_gather` needs a bitpack code
-  leaf, `offsets_meta` needs a terminal chars channel. Those stay per-consumer render checks.
+| | description | output slot | status |
+|---|---|---|---|
+| `all_rows` | implicit, all | identity | shipped |
+| `mask_bits` | bitmap | survivor rank | shipped |
+| `index_list` | **ascending** ids | position in list | shipped |
+| `run_list` | `(start, len)` runs | running offset | candidate |
+| `range_slice` | one `[lo, hi)` | offset from lo | candidate |
+| `stride` | `(offset, step)` | index / step | candidate |
+| `gather_list` | **arbitrary** ids | position in list | candidate |
+
+- **`run_list`** beats `index_list` whenever survivors are clustered — what a range predicate on
+  sorted or clustered data produces. `index_list` pays random access per row; a run coalesces.
+- **`gather_list`** is a capability, not a tuning win: dropping `index_list`'s ascending
+  requirement lets an arbitrary gather fuse into decode — a join's probe-side output or sort
+  order materialised straight from compressed bytes, with no full-width intermediate. Same class
+  of win as the fused scan-filter, applied to a different operator. **It is not free** — see
+  below.
+- **`range_slice`** is what LIMIT/OFFSET pushdown and splits that cut mid-chunk would need; a
+  chunk is all-or-nothing today.
+
+#### Why `gather_list` costs more than dropping a sort
+
+K4's launch maps **one block per chunk** (`chunk_id = blockIdx.x`), and block *c* handles exactly
+`row_indices[chunk_offsets[c] .. chunk_offsets[c+1])`. Two invariants make that work, both
+supplied by the mask→indices wave that produces the list:
+
+1. **Ids are partitioned by chunk.** The kernel computes the in-chunk position as
+   `idxs[k] - chunk_start`. If an id in slice *c* belonged to another chunk, that subtraction
+   lands outside `[0, 1024)` and the bitpack read addresses outside the chunk's packed region.
+2. **Per-chunk scalars are loaded once per block.** `bitpack_value_source` emits the
+   `chunk_min[c]` / `chunk_bits[c]` / `bp_offsets[c]` prelude in the block header, amortised over
+   every element the block decodes. Bit-unpacking is parameterised *per chunk*, so this only
+   works if a block's elements all share a chunk.
+
+The output slot itself is fine — `(out + out_base)[k]` is the position in the list, which is
+exactly gather semantics. It is the *partitioning* that breaks. So an arbitrary permutation needs
+one of:
+
+- a stable pre-pass partitioning the gather list by chunk, each entry carrying its destination
+  index so the caller's ordering survives — an extra pass, and a scatter instead of a contiguous
+  store; or
+- a launch over the list instead of over chunks, with each element looking up its own chunk's
+  scalars — which gives up both the per-block scalar amortisation and coalescing.
+
+Neither is fatal, but it means `gather_list` is a new launch strategy, not just a new way to
+enumerate — the one candidate here that does not drop into the existing frame unchanged.
 
 **Count-only and existence.** Wave 1 + CNT already computes the exact survivor count and
 `run_selection_cnt` already returns it; everything after is waste for `COUNT(*)`. Reads
