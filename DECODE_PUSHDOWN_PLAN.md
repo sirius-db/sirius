@@ -429,6 +429,33 @@ cd build/release/simpatico_codegen && pixi run --manifest-path ../../../pixi.tom
 
 `ctest` without that build step reports "Not Run", not a failure.
 
+## 6c. Reuse review
+
+A sweep for functionality the branch reimplemented. Findings, and what was done:
+
+- **Numeric range extraction — DONE** (`0f894f89`). The decode-side constant lowering had its own
+  int128 floor/ceil, accumulator and payload switch alongside `sirius::numeric_range` and
+  `ast::constant_numeric_range`, which are the same thing and older. Folded onto them; what stays
+  local is restating a constant at the COLUMN's scale, which narrowing has no notion of.
+- **Decode policy knobs — DEFERRED** (see P8). They are env vars, not Sirius parameters.
+- **The four mask kernels — EVALUATED, NOT SWAPPED.** cudf has an apparent equivalent for each and
+  none fits: these are in-place, chunk-segmented operations over a caller-owned arena with a
+  padding invariant, and cudf's bitmask API is allocating and whole-column. The reasoning is
+  recorded at the top of `selection_wave.cu` so it is not re-litigated. The evaluation did surface
+  the real gap — none of the four had a direct test, and `combine_masks_and` was almost certainly
+  never executed anywhere, since the decode calls it only with two or more sources and no test
+  built such a request. Now covered (`160657e0`).
+- **Stream pools — OPEN.** Three mechanisms: `pin_table.cpp::compress_pool`,
+  `compressed_scan.cpp::decode_pool` (near-identical thread_locals) and `simpatico_codegen.cpp`'s
+  `leased_pool`. A thread that both pins and decodes holds 8 streams from two thread_locals that
+  do not know about each other.
+- **Two TableFilterSet walkers — OPEN.** `collect_null_prune_predicates` and
+  `decompose_table_filters` walk the same set with the same skip rules, from the same constructor.
+- **Zone-map filter bounds — NOT a duplicate, a missed connection.** A
+  `sirius_dynamic_zone_map_filter` holds `[min, max]`; a decode range holds decoded-domain bounds.
+  A zone-map filter could feed the range ballot instead of a full-width membership probe, which
+  would use a kernel that already exists.
+
 ## 7. Future directions this unlocks
 
 **Missing kernel combinations become constructible.** With the op expressed as the enumerator ×

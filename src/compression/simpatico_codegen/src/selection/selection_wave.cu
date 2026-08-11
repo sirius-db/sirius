@@ -16,6 +16,33 @@
 // (scratchpad/fusebench/fusebench.cu: k1/cnt/k2a idioms), with CNT re-shaped
 // from its slow one-block-per-chunk form to word-per-thread grid-stride with a
 // warp reduce (a warp's 32 lanes cover exactly one chunk's 32 words).
+//
+// WHY THESE ARE NOT cudf CALLS. cudf has an apparent equivalent for each
+// (bitmask_and, bools_to_mask, segmented_count_set_bits, stream compaction) and
+// they were evaluated; none fits, for one structural reason. These four are
+// IN-PLACE, CHUNK-SEGMENTED operations over a caller-owned arena, and cudf's
+// bitmask API is allocating and whole-column:
+//
+//   * bitmask_and and bools_to_mask return a fresh device_buffer. Every call
+//     here writes into a pre-planned slot — and the combine deliberately
+//     aliases its destination onto source 0 — so using them would add a
+//     per-batch allocation on the hot path.
+//   * they also size by bit count, not by our padded strip, so the tail words
+//     a mask must own (and must have zeroed) would be neither allocated nor
+//     written. That invariant is load-bearing: the count and the gather map
+//     read the full strip.
+//   * segmented_count_set_bits returns a HOST vector, i.e. a D2H of every
+//     per-chunk count. run_selection_cnt keeps the counts and their scan on
+//     device and copies back 4 bytes.
+//   * a thrust::copy_if for the row ids would redo the prefix sum that
+//     chunk_offsets already holds.
+//
+// The closest call is combine_masks_and: cudf::detail::inplace_bitmask_and does
+// write into a caller-owned destination. It is an internal detail header
+// (Sirius depends on cudf/detail in only three files), it takes per-mask bit
+// offsets we never use and returns a set-bit count we do not want, and it would
+// replace twenty lines of uint4-vectorized code. Judged not worth the coupling
+// — but it is the one worth revisiting if cudf promotes it.
 
 #include "codegen/selection/selection.hpp"
 
