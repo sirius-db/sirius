@@ -49,13 +49,13 @@ with its own cap arithmetic, ordering rule and coverage rule, all hand-written i
 `vector<unique_ptr<column>>` where TierA columns are survivor-sized and TierB are full-width;
 only `compact_scan_filter_output` reconciles them. Nothing in the types enforces the second call.
 
-**P5 — Type sniffing.** `parquet_gpu_ingestible.cpp:886` infers the BOOL8 substitution from
+**P5 — Type sniffing. CLOSED (`11cef624`).** `parquet_gpu_ingestible.cpp:886` infers the BOOL8 substitution from
 `batch.column(pos).type().id() == BOOL8`, then rebuilds the filter expression and throws if the
 rebuild degenerates (`:908-912`). Unambiguous today only because candidates are VARCHAR-only;
 extend the pushdown to numeric or boolean equality and a genuine BOOL8 column becomes
 indistinguishable.
 
-**P6 — RTTI as a signalling channel.** `row_filtered_gpu_table_representation` and
+**P6 — RTTI as a signalling channel. CLOSED (`2b085d81`).** `row_filtered_gpu_table_representation` and
 `rule2_bailed_gpu_table_representation` each carry one bit via dynamic type;
 `clone()` "intentionally degrades". Safe only because two call sites are adjacent on one thread.
 
@@ -275,12 +275,21 @@ an API refactor.
 no emitted code, so it neither helps nor blocks them. It does make every later kernel-shape
 change cheap, which is the point.
 
-**Phase 1 — value-carrying results.** Replace P5's type sniff and P6's RTTI tags with one
-result type carrying `position` / `rows` / `unapplied`.
-*Accept:* `build_filter_expression_for`, `boolean_substituted_primary_indices`, both marker
-classes and the two `dynamic_cast`s are gone; TPC-H results unchanged.
-**Now the highest-value item**: since #1371 put #1380's pushdown on `dev`, P5's hazard is in
-shipped mainline code, not an unmerged PR.
+**Phase 1 — value-carrying results. DONE** (`2b085d81`, `11cef624`).
+Both marker representations collapsed into one `decoded_batch_representation` carrying
+`decode_outcome{row_filtered, rule2_bailed, predicate_columns}`; the scan does one
+`dynamic_cast` to fetch a struct instead of two to test identity, and the BOOL8 type sniff in
+`build_filter_expression_for` is gone — the converter reports the substituted positions, which
+reach `post_filter_and_project` through `filtered_table::predicate_columns`.
+
+Not yet delivered from §2's design: `position` (column elision) and `unapplied` (the residual as
+a predicate). Those need the facade, so they land in Phase 2.
+
+**Caveat carried into Phase 2:** `predicate_columns` is populated only on the compression
+converter path. A source that substitutes by some other route reports nothing and simply gets no
+rewrite — safe, but it makes the field a *converter* fact rather than a universal one. Phase 2
+generalises it: under `compressed_scan` the outcome is the engine's answer for every source, not
+one converter's.
 
 **Phase 2 — the facade.** Introduce `compressed_scan` over the *existing*
 `build_fused_scan_directives` + `decompress_scan_filter`, moving the three `extract_*` functions
@@ -294,6 +303,38 @@ behind it. No kernel changes.
 
 Phase 2 must precede Phase 3: the facade is what buys freedom to change internals without
 touching the scan. Today every internal change is scan-visible.
+
+## 6b. Starting Phase 2
+
+Entry points, so this can be picked up cold.
+
+**Read first, in order:**
+
+1. `src/compression/compression_converters.cpp` — `try_decompress_scan_filter` (~190 lines) is
+   the whole request-assembly problem (P3) in one function, and `decompress_host_to_gpu` /
+   `decompress_device_to_gpu` are where the facade will be called from.
+2. `src/op/scan/parquet_gpu_ingestible.cpp` — the scan side: the constructor's candidate
+   extraction, `materialize_table`, `post_filter_and_project`.
+3. `src/op/scan/sirius_gpu_scan_operator_data.cpp::prepare_for_processing` — where pushdowns are
+   attached to the projected representation and the outcome is read back.
+4. `src/include/op/scan/scan_utils.hpp` — the three `extract_*` functions that move behind the
+   facade.
+
+**Shape of the change:** `compressed_scan` wraps the existing
+`build_fused_scan_directives` + `decompress_scan_filter` unchanged. No kernel work, no
+measurement risk. The three `extract_*` functions become internal; the scan stops digesting its
+own filter and passes `where` whole.
+
+**Watch for:** the representation carries five separate pushdown setters today (P7) and `clone()`
+must copy each — the facade replaces all of them with one
+`shared_ptr<const scan_decode_request>`. That is the change that makes Phase 3 possible, so do
+not skip it in favour of going straight at the internals.
+
+**Verification that works here:** `sirius_unittest [compression]` (36 cases) and `[scan]`
+(265 cases) both exercise the real paths end to end — in particular cases 9–11 of
+`[compression]` run SQL through the equality pushdown and check the aggregate, so they catch a
+broken substitution rather than just a broken build. `pixi run make` then those two suites is
+the loop.
 
 ## 7. Future directions this unlocks
 
