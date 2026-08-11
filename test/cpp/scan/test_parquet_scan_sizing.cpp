@@ -168,7 +168,7 @@ TEST_CASE("parquet scans without a prefetch cache skip advisory ranges",
 
   auto* batch = dynamic_cast<scan::parquet_split_info*>(batches.front().get());
   REQUIRE(batch);
-  CHECK(batch->fadvise_entries().empty());
+  CHECK(batch->fadvise_hints().empty());
 }
 
 TEST_CASE("parquet batches are capped by decode working set", "[scan][parquet][sizing]")

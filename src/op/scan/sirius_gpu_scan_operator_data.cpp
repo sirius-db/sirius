@@ -71,9 +71,11 @@ void scan_operator_input::update(io::cache::scan_stage site) const
                             : nullptr;
   if (_readahead) { _readahead->update(_operator_id, task, site); }
   if (task == nullptr) { return; }
-  auto hints = get_fadvise_hints();
-  for (auto& hint : hints) {
-    hint.datasource->update(site);
+  // Datasources only, not the fadvise hints: this runs on every stage
+  // transition of every split, and the hints carry the split's entire
+  // byte-range list with them.
+  for (auto const& ds : get_datasources()) {
+    ds->update(site);
   }
 }
 

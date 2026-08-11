@@ -89,10 +89,23 @@ class scan_operator_input : public op::operator_data {
            std::get<std::shared_ptr<scan_info>>(materialization_info) != nullptr;
   }
 
-  [[nodiscard]] std::vector<op::scan::scan_info::fadvise_entry> get_fadvise_hints() const
+  /// This split's prefetch hints.  A view onto the scan_info's memoized list —
+  /// building them walks every row group and projected column, so callers must
+  /// not treat this as cheap enough to rebuild per stage.
+  [[nodiscard]] std::span<const op::scan::scan_info::fadvise_entry> get_fadvise_hints() const
   {
     if (!has_scan_metadata()) { return {}; }
-    return std::get<std::shared_ptr<scan_info>>(materialization_info)->fadvise_entries();
+    return std::get<std::shared_ptr<scan_info>>(materialization_info)->fadvise_hints();
+  }
+
+  /// The datasources this split reads through.  Stage reporting wants only
+  /// these; going through @ref get_fadvise_hints for it would drag every byte
+  /// range along.
+  [[nodiscard]] std::span<const std::shared_ptr<sirius::io::sirius_datasource>> get_datasources()
+    const
+  {
+    if (!has_scan_metadata()) { return {}; }
+    return std::get<std::shared_ptr<scan_info>>(materialization_info)->datasources();
   }
 
   /// Report @p site to the readahead manager and to every hinted datasource.

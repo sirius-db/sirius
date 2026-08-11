@@ -124,7 +124,7 @@ class duckdb_native_scan_info : public op::scan::scan_info {
 
   /// On-disk byte ranges this unit reads, derived from @ref row_groups so they always match the row
   /// groups currently held. The scan sequencer fadvises these to prefetch.
-  [[nodiscard]] std::vector<fadvise_entry> fadvise_entries() const override
+  [[nodiscard]] std::vector<fadvise_entry> build_fadvise_entries() const override
   {
     if (block_manager == nullptr) { return {}; }
     std::vector<fadvise_entry> entries;

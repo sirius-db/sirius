@@ -378,7 +378,7 @@ void canonicalize_scan_file_paths(std::vector<std::string>& paths)
 //===----------------------------------------------------------------------===//
 // scan_info fadvise_entries — prefetch byte ranges
 //===----------------------------------------------------------------------===//
-std::vector<scan_info::fadvise_entry> parquet_file_scan_info::fadvise_entries() const
+std::vector<scan_info::fadvise_entry> parquet_file_scan_info::build_fadvise_entries() const
 {
   if (!file_metadata || !reader_options) { return {}; }
   std::vector<fadvise_entry> entries;
@@ -393,7 +393,7 @@ std::vector<scan_info::fadvise_entry> parquet_file_scan_info::fadvise_entries() 
   return entries;
 }
 
-std::vector<scan_info::fadvise_entry> parquet_split_info::fadvise_entries() const
+std::vector<scan_info::fadvise_entry> parquet_split_info::build_fadvise_entries() const
 {
   if (!reader_options) { return {}; }
   std::vector<fadvise_entry> entries;

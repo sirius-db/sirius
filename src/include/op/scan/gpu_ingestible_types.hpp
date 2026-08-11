@@ -19,7 +19,9 @@
 #include <io/sirius_datasource.hpp>
 
 #include <memory>
+#include <mutex>
 #include <span>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -83,7 +85,45 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
 
   virtual ~scan_info() = default;
 
-  virtual std::vector<fadvise_entry> fadvise_entries() const { return {}; }
+  /// This split's prefetch hints, built once and memoized.
+  ///
+  /// Building them is expensive — @ref build_fadvise_entries walks the split's
+  /// row groups and projected columns to derive every on-disk byte range — and
+  /// the result is a pure function of immutable split metadata, so it is
+  /// computed on first use and reused thereafter.  Note the cost is invisible
+  /// when the prefetching cache is off: @ref append_fadvise_entry short-circuits
+  /// before the range factory runs, so only a cache-enabled run pays it.
+  ///
+  /// Returns a view: the entries live on this scan_info, which outlives every
+  /// caller that holds the split.
+  [[nodiscard]] std::span<const fadvise_entry> fadvise_hints() const
+  {
+    std::call_once(_hints_once, [this] {
+      _hints = build_fadvise_entries();
+      _datasources.reserve(_hints.size());
+      for (auto const& e : _hints) {
+        if (e.datasource) { _datasources.push_back(e.datasource); }
+      }
+    });
+    return _hints;
+  }
+
+  /// Just the datasources these hints cover.
+  ///
+  /// Stage reporting only needs to reach each datasource; going through
+  /// @ref fadvise_hints for that would copy every byte range with it.
+  [[nodiscard]] std::span<const std::shared_ptr<sirius::io::sirius_datasource>> datasources() const
+  {
+    std::ignore = fadvise_hints();  // materialises both
+    return _datasources;
+  }
+
+ protected:
+  /// Derive this split's prefetch hints.  Called at most once per scan_info,
+  /// through @ref fadvise_hints.
+  virtual std::vector<fadvise_entry> build_fadvise_entries() const { return {}; }
+
+ public:
 
   /**
    * @brief Estimated decoded bytes for projected data columns before row filtering.
@@ -119,6 +159,11 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     if (ranges.empty()) { return; }
     entries.push_back(fadvise_entry{datasource, std::move(ranges)});
   }
+
+ private:
+  mutable std::once_flag _hints_once;
+  mutable std::vector<fadvise_entry> _hints;
+  mutable std::vector<std::shared_ptr<sirius::io::sirius_datasource>> _datasources;
 };
 
 //===----------------------------------------------------------------------===//

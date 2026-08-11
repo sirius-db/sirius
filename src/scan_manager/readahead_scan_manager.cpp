@@ -215,8 +215,9 @@ readahead_scan_manager::collect_prefetch_batch_locked()
     chosen->prefetched = true;
 
     // A split with no file ranges (host-backed, or fully cached) has no IO to
-    // issue, so it never occupies a slot.
-    if (task->fadvise_entries().empty()) {
+    // issue, so it never occupies a slot.  Memoized, so this does not rebuild
+    // the range list under the lock.
+    if (task->fadvise_hints().empty()) {
       chosen->prefetch_done = true;
       continue;
     }
@@ -231,7 +232,7 @@ readahead_scan_manager::collect_prefetch_batch_locked()
 void readahead_scan_manager::issue_prefetches(std::vector<pending_prefetch> batch)
 {
   for (auto& p : batch) {
-    auto entries = p.task->fadvise_entries();
+    auto entries = p.task->fadvise_hints();
     // One completion per datasource, but the split only frees its slot once all
     // of them have landed -- so count them down and report once.
     auto remaining  = std::make_shared<std::atomic<std::size_t>>(entries.size());

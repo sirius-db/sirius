@@ -168,7 +168,7 @@ class parquet_split_info : public scan_info {
   /// (computed via @c hybrid_scan_reader::all_column_chunks_byte_ranges, honoring
   /// the reader_options column projection). Drives prefetch for the materialize
   /// read across every file in the batch.
-  [[nodiscard]] std::vector<fadvise_entry> fadvise_entries() const override;
+  [[nodiscard]] std::vector<fadvise_entry> build_fadvise_entries() const override;
 };
 
 //===----------------------------------------------------------------------===//
@@ -247,7 +247,7 @@ class parquet_file_scan_info : public scan_info {
   /// byte ranges the read will fetch for its row groups (via
   /// @c hybrid_scan_reader::all_column_chunks_byte_ranges, honoring the
   /// reader_options column projection).
-  [[nodiscard]] std::vector<fadvise_entry> fadvise_entries() const override;
+  [[nodiscard]] std::vector<fadvise_entry> build_fadvise_entries() const override;
 };
 
 //===----------------------------------------------------------------------===//
