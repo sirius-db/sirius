@@ -297,6 +297,64 @@ TEST_CASE("Sirius configuration rejects zero hash partition bytes", "[sirius][co
     Catch::Contains("hash_partition_bytes") && Catch::Contains("greater than zero"));
 }
 
+TEST_CASE("Sirius configuration rejects conflicting memory budget forms", "[sirius][config]")
+{
+  struct invalid_config {
+    const char* filename;
+    const char* context;
+    const char* first;
+    const char* second;
+  };
+  const invalid_config cases[] = {
+    {"invalid_memory_gpu_usage_limit_both.yaml",
+     "memory.gpu",
+     "usage_limit_bytes",
+     "usage_limit_fraction"},
+    {"invalid_memory_gpu_reservation_limit_both.yaml",
+     "memory.gpu",
+     "reservation_limit_bytes",
+     "reservation_limit_fraction"},
+    {"invalid_memory_host_capacity_both.yaml",
+     "memory.host",
+     "capacity_bytes",
+     "capacity_fraction"},
+    {"invalid_memory_host_reservation_limit_both.yaml",
+     "memory.host",
+     "reservation_limit_bytes",
+     "reservation_limit_fraction"},
+  };
+
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+  for (auto const& test : cases) {
+    INFO(test.filename);
+    sirius::sirius_config config;
+    REQUIRE_THROWS_WITH(config.load_from_file(data_dir / test.filename),
+                        Catch::Contains(test.context) && Catch::Contains(test.first) &&
+                          Catch::Contains(test.second) && Catch::Contains("mutually exclusive"));
+  }
+}
+
+TEST_CASE("Sirius configuration accepts one form of each memory budget", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const cfg =
+    fs::path(loc.file_name()).parent_path() / "data" / "valid_memory_budget_single_forms.yaml";
+
+  sirius::sirius_config config;
+  REQUIRE_NOTHROW(config.load_from_file(cfg));
+}
+
+TEST_CASE("Sirius configuration treats null memory budget forms as absent", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const cfg =
+    fs::path(loc.file_name()).parent_path() / "data" / "valid_memory_budget_null_alternates.yaml";
+
+  sirius::sirius_config config;
+  REQUIRE_NOTHROW(config.load_from_file(cfg));
+}
+
 TEST_CASE("DuckDB setting rejects zero hash partition bytes without a Sirius context",
           "[sirius][context][config][isolated_context]")
 {
