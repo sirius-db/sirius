@@ -47,7 +47,27 @@ unset CXXFLAGS CFLAGS CPPFLAGS CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH LIBRARY_P
 export CC=/usr/bin/gcc CXX=/usr/bin/g++
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/gcc
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/gcc
-export LIBRARY_PATH="$UCX_PREFIX/lib"
+# libsirius.so declares libcuda.so.1 and libnvidia-ml.so.1 in DT_NEEDED, so the CN link has to be
+# able to FIND them -- LIBRARY_PATH is link time, LD_LIBRARY_PATH above is only run time. Without
+# the driver dir the link fails with:
+#   libsirius.so: undefined reference to `cuLaunchKernel'
+#   libsirius.so: undefined reference to `nvmlDeviceGetMemoryAffinity'
+# (MEASURED 2026-08-11. This surfaced only once the engine started calling the CUDA driver API
+# directly; an older libsirius had no such DT_NEEDED entry, so the omission was latent.)
+_driver_lib=/usr/lib/$(uname -m)-linux-gnu
+export LIBRARY_PATH="$UCX_PREFIX/lib:$_driver_lib:/usr/local/cuda/lib64/stubs"
+
+# Force the SYSTEM linker. CC is /usr/bin/gcc above, but gcc resolves `ld` from PATH, and under
+# `pixi run` that is the conda ld -- which then links the conda sysroot's libpthread.so.0 against
+# the system libc and fails with 39 GLIBC_PRIVATE undefined references
+# (__libc_dlopen_mode, __nanosleep_nocancel, _dl_make_stack_executable, ...). MEASURED 2026-08-11.
+#
+# Do NOT do this with RUSTFLAGS="-C link-arg=-B/usr/bin": setting RUSTFLAGS invalidates cargo's
+# whole fingerprint cache, which re-runs the nixl-sys build script, which then fails on
+# `/usr/include/features-time64.h: fatal error: bits/timesize.h: No such file or directory`
+# -- a separate latent breakage that a warm target/ dir had been hiding. Prepending PATH gets the
+# system ld without touching the fingerprint.
+export PATH="/usr/bin:$PATH"
 
 # nixl-sys bindgen needs libclang plus its builtin headers; the system libclang ships none, the
 # repo pixi env's clang does. Glob the version so a clang bump doesn't break the build.

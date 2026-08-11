@@ -473,7 +473,9 @@ mod agent_tier {
     /// Creates one nixl agent with a UCX backend and the staging arena registered as VRAM.
     /// Returns the agent, the registration (kept alive for the agent's lifetime), and the
     /// serialized local metadata peers load.
-    fn bring_up_agent(
+    ///
+    /// Reachable from the tests so they can register an arena the engine does not own.
+    pub(super) fn bring_up_agent(
         agent_name: &str,
         staging_base: u64,
         staging_capacity: u64,
@@ -989,3 +991,13 @@ mod agent_tier {
 /// `pub(super)` `TransportState`/`write_and_wait` — the same calls production uses.
 #[cfg(all(test, feature = "nixl-transport"))]
 mod nixl_bench;
+
+/// Two-host GPU buffer echo over those same primitives: the multi-box counterpart of
+/// `nixl_bench`, which only ever crosses GPUs within one machine.
+#[cfg(all(test, feature = "nixl-transport"))]
+mod nixl_echo;
+
+/// Scaffolding both multi-process tests share (CUDA shim, control socket, verification pattern,
+/// NVLink counters).
+#[cfg(all(test, feature = "nixl-transport"))]
+mod two_node_harness;
