@@ -110,7 +110,8 @@ admitted between the check and the lock could be reported as end-of-stream and d
 
 **The live wake-up.** The head is scheduled once by `start_query()` and task completion only
 nominates downstream consumers, so `on_data` — fired by every successful `push()` — is the only
-thing that brings a dropped source back. It is deliberately not one-shot; the header explains why.
+thing that brings a dropped source back. It is deliberately not one-shot; `batch_stream::set_on_data`
+explains why.
 
 End-of-stream separately notifies the pipeline (`update_pipeline_status(false)`, via a weak
 pipeline reference wired in `set_pipeline`), so an empty or late-closed stream still finishes its

@@ -1,9 +1,5 @@
 /*
-<<<<<<< HEAD
- * Copyright 2025, Sirius Contributors.
-=======
  * Copyright 2026, Sirius Contributors.
->>>>>>> f6d96a5d (feat(exec): repository-backed streaming source with sender-aware EOS (#836))
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -97,23 +93,8 @@ class batch_stream {
   // Hooks fire after unlock; may re-enter. Do not capture raw this.
   // -----------------------------------------------------------------------
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-  /// Fired by every successful `push()`, and by the close that records an error. A consumer that
-  /// found the queue empty has already been dropped by its driver; this is how it gets picked up
-  /// again.
-=======
-  /// Fired by every successful `push()`, and by `fail()` (P4). A consumer that found the queue
-  /// empty has already been dropped by its driver; this is how it gets picked up again.
-  ///
-  /// Deliberately not one-shot: the hook stays installed for the life of the stream. A one-shot
-  /// hook would have to be re-armed by the consumer, and a push landing between the fire and the
-  /// re-arm would go unannounced — the starved consumer would never be picked up.
->>>>>>> f6d96a5d (feat(exec): repository-backed streaming source with sender-aware EOS (#836))
-=======
   /// Fires on every successful push() and on fail() (P4). Not one-shot: a one-shot hook would
   /// need re-arming, and a push between fire and re-arm would go unannounced.
->>>>>>> 2844d76d (docs(op): enhance streaming operator documentation and clarify design invariants)
   void set_on_data(std::function<void()> hook);
 
   /// Replaces prior hook; if already terminal, fires immediately inside this call.
