@@ -1,7 +1,6 @@
 # Filter-into-decompression: API and renderer plan
 
-Status: proposal. Target branch: `exp/fused-scan-filter` (PR #1391) and follow-ups.
-Written against worktree `sirius-pr1391` @ `a82a24a0` (builds clean, 1280/1280).
+Target: `exp/fused-scan-filter` (PR #1391) and follow-ups.
 
 ## 0. What this is about
 
@@ -12,11 +11,16 @@ Two PRs push filtering into decompression:
 - **#1391** (open) — decode-time selection masks: range/pair/dict/membership conjuncts
   produce a mask during decode, output columns are decoded survivor-compacted.
 
-`dev` has neither: in `git diff origin/dev...pr-1391`, `decode_equality_pushdown`,
-`decode_predicate`, `decompress_predicate` and `extract_string_equality_pushdown` all appear
-as **additions**, so #1380's content lives only inside #1391. *(Inferred from diff direction —
-worth confirming with a symbol grep on `dev` before acting on it.)* There is one PR to
-integrate, not two.
+**Note: #1380's work is now on `dev`.** It arrived via #1371 (`84c49bee`, "TPC-H SF1000
+campaign integration") — `decode_predicate`, `decode_equality_pushdown` and
+`extract_string_equality_pushdown` are all in mainline; #1391's fused scan-filter machinery
+(`decompress_scan_filter`, `selection_mask`, `range_predicate`) is not, yet.
+
+So this plan covers refactoring APIs that are **already shipped**, not only unmerged ones. In
+particular P5 — the BOOL8 type sniff, and the hazard that a genuine BOOL8 column becomes
+indistinguishable from a substituted one once the pushdown widens past VARCHAR — is a fix to
+`dev` rather than a cleanup of a PR. Part A's design is unchanged; its starting point is
+`dev`'s shipped surface plus #1391's additions.
 
 The mechanism works and is measured (SF1000 8.180 s → 6.918 s). The problem is the boundary:
 ~40 new public names across five layers, four encodings of one internal fact, and two
@@ -205,7 +209,7 @@ part of this section.
 `renderer.cpp` is 1700 lines (+649 in this PR) with seven variant emitters plus a separate pair
 builder. Findings:
 
-**F1 — two emitters are exact duplicates. [DONE — verified and applied]**
+**F1 — two emitters are exact duplicates.**
 `value_source` (`renderer.cpp:1587-1590`) routes a Bitpack leaf straight to
 `bitpack_value_source`, so for a Bitpack root the "tuned" and "generic" emitters produce
 character-identical bodies:
@@ -213,29 +217,18 @@ character-identical bodies:
 - `emit_bitpack_mask_out` (554-578) ≡ `emit_generic_mask_out` (939-959)
 - `emit_bitpack_mask_consume` (614-639) ≡ `emit_generic_mask_consume` (835-856)
 
-Verification (renderer is pure string generation and depends only on `fused_tree.hpp` /
-`render_util.hpp` / stdlib — no CUDA, cudf or rmm — so this compiles standalone with `g++` in
-seconds and needs no GPU): dumped `render()` for a Bitpack leaf and a Delta→Bitpack root across
-4 dtypes × 6 variants, before and after routing Bitpack roots to the generic emitters.
+Removing them costs 53 lines and no behaviour. Their `RenderError` throws are **unreachable**:
+`emit_bitpack_mask_out` is only called when `tree.op == Bitpack` yet throws if
+`node.op != Bitpack`. The one reachable case (Bitpack *with* children) is rejected by
+`value_source`'s own "Bitpack must be a leaf" anyway; only the message text differs.
 
-- full diff: 32 lines, **all comment text** (`Bitpack`→`BITPACK` from `op_kind_name`,
-  `(K1)`→`(K1-generic)`, `(K3)`→`(K3-generic)`, one comment moving 4 lines earlier);
-- comment lines stripped: **zero** diff — every line of emitted CUDA identical;
-- `delta_bitpack` section byte-identical (delta emitter untouched);
-- post-deletion render output identical to pre-deletion; full build clean;
-  `test_masked_decode_variants` 28/28 PASS on GPU.
+The emitted comment text does differ (`Bitpack`→`BITPACK` from `op_kind_name`,
+`(K1)`→`(K1-generic)`), which alters the JIT cache key — a one-time NVRTC recompile per
+(shape, dtype, variant). Making the diff empty would mean hardcoding `Bitpack` in an emitter
+that serves every shape, which would be a lie; the blip is accepted.
 
-53 lines removed (1700 → 1647). The deleted `RenderError` throws were **unreachable** —
-`emit_bitpack_mask_out` was only called when `tree.op == Bitpack` yet threw if
-`node.op != Bitpack`. The one reachable case (Bitpack *with* children) is still rejected by
-`value_source`'s own "Bitpack must be a leaf"; only the message text differs.
-
-The comment-text change does alter the JIT cache key, so expect a one-time NVRTC recompile per
-(shape, dtype, variant). Making the diff empty is not achievable without hardcoding `Bitpack`
-in an emitter that now serves every shape, which would be a lie; the blip is accepted.
-
-The "tuned closed-form path" comments at `build()` lines 150 and 161 were wrong and went with
-the emitters.
+The "tuned closed-form path" comments at `build()` lines 150 and 161 are wrong and should go
+with the emitters.
 
 **F2 — one skeleton, four copies.** The mask-consuming emitters share
 `emit_selection_stage()` + the same strided loop + the same rank expression, differing only in a
@@ -300,7 +293,7 @@ The launcher layer is **already** factored around a shared core
 Five entry points are thin: of their 27-34 lines, ~12-22 is the precondition block and its
 `fprintf`, ~5-8 fills `VariantLaunchArgs`, one line calls the core. The duplication is elsewhere.
 
-**F4 — the pair launcher reimplements the core. [DONE]** `launch_decode_fused_tree_pair_mask_out`
+**F4 — the pair launcher reimplements the core.** `launch_decode_fused_tree_pair_mask_out`
 (932-1096) is 165 lines, ~120 of which duplicate the core: the 4-arm try/catch (945, 1083-1095
 vs 699-712), `dtype_to_cxx` + report (962-970 vs 657-663), the elem_size ternary (997-1002 vs
 664-667, a third copy), transients + alloc lambda (990-996 vs 671-677),
@@ -314,43 +307,16 @@ vs 699-712), `dtype_to_cxx` + report (962-970 vs 657-663), the elem_size ternary
 > `run_rendered_decode:520-547`, whose comment states it prevents an out-of-bounds read that
 > "would fault the CUDA context". This is a missing check, not just redundancy.
 
-**F5 — two switches over one enum, unchecked. [DONE]** `run_rendered_decode:568-586` pushes trailing
+**F5 — two switches over one enum, unchecked.** `run_rendered_decode:568-586` pushes trailing
 kernel *arguments* per variant; `renderer.cpp:343-387` emits the matching trailing
 *parameters*. They must agree exactly across two files, and `cuLaunchKernel` takes `void**` —
 **a mismatch is silent argument misalignment, not a compile error.** Highest-risk duplication
 in this area.
 
-**F6 — five bespoke precondition blocks. [DONE]** (737-745, 773-785, 803-815, 833-846,
+**F6 — five bespoke precondition blocks.** (737-745, 773-785, 803-815, 833-846,
 1109-1123), ~60 lines differing only in which `VariantLaunchArgs` slots must be non-null — a
 property of the variant.
 
-### Status (commit fd9e45ae)
-
-F1, F4, F5 and F6 are implemented and verified; the §5 safety net is in place.
-
-- `TrailingParam` + `DecodeKernelSpec::trailing`: declaration text and tag list come from one
-  table (`trailing_params()` / `pair_trailing_params()`); both launch paths bind via
-  `TrailingArgStorage`, and a tag with no storage is a reported error.
-- `launch_rendered_spec()` is shared by the single-tree and pair paths, so the pair path now
-  enforces the per-chunk metadata bounds guard. **Behaviour change:** a pair launch with
-  under-sized per-chunk channels is refused rather than proceeding into an OOB read.
-- `VariantContract` + `check_variant_contract()` replace the five hand-written precondition
-  blocks; diagnostics now name the specific missing field
-  (`incomplete inputs — chunk_offsets (did the CNT wave run?)`).
-- New `tests/test_render_signature_contract.cpp` (CTest: `render_signature_contract`) asserts
-  `declared params == buffers + 2 + trailing` for every shape × dtype × variant and the pair
-  path, plus tag validity/uniqueness. It parses the signature instead of diffing a golden
-  string, so kernel-body changes do not churn it. **Mutation-tested**: injecting one undeclared
-  parameter fails it across every variant. No GPU, no NVRTC — milliseconds.
-
-Rendered source is byte-identical across F4/F5/F6; only F1 changed emitted text (comments).
-
-Verification harness worth reusing: `renderer.cpp` depends only on `fused_tree.hpp` /
-`render_util.hpp` / stdlib, so a dump-and-diff of `render()` output compiles standalone with
-`g++ -std=c++20 -I include` in seconds and needs no GPU. That is how every claim above was
-checked.
-
-**Remaining in this section: F2 and F3.**
 
 ### Launcher refactor
 
@@ -582,10 +548,9 @@ per shape.
    filtering may shrink the batch. Unavoidable; keep it a forecast, not a route list.
 4. The membership probe closure must pin its device structure (`shared_ptr` capture) for the
    call's duration — preserve that contract when conjuncts move into the AST.
-5. ~~`masked_launch.cpp` / `codegen_runtime.cpp` unread~~ — now read. The original prior ("six
-   launchers repeat bind-push-launch") was **wrong**: the core is already shared and five
-   wrappers are thin. The real findings are F4/F5/F6 in §5. F5 (two unchecked switches over one
-   enum) is a live correctness hazard and should not wait for the rest of the plan.
+5. F5 (two unchecked switches over one enum) is a live correctness hazard — a mismatch is
+   silent argument misalignment through `void**`, not a compile error — and should not wait for
+   the rest of the plan.
 6. F4's fix changes the pair path's behaviour in one respect: it starts enforcing the metadata
    bounds guard. If any shipped plan currently launches a pair kernel with under-sized per-chunk
    channels, it will now refuse instead of silently reading OOB. That is the intended outcome,
