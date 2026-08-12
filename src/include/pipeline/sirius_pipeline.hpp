@@ -186,6 +186,10 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   //! Checks if the pipeline has been finished
   virtual bool is_pipeline_finished() const;
 
+  //! Query-terminal sink (RESULT_COLLECTOR or STREAMING_SINK): no downstream schedule/wiring;
+  //! completion signals execute().
+  [[nodiscard]] bool is_query_terminal() const;
+
   void mark_task_created();
   void mark_task_completed();
 
@@ -196,10 +200,8 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   //! Set the task_creator pointer so this pipeline can schedule downstream consumers on finish.
   void set_task_creator(sirius::creator::task_creator* tc);
 
-  //! The task_creator this pipeline schedules through, or nullptr when none is wired (tests,
-  //! or a pipeline built before the executor attached). Used by streaming sources to re-arm a
-  //! starved head from a producer thread; schedule() only touches the thread-safe creation
-  //! queue, so calling it off-thread is safe.
+  //! task_creator for schedule(), or nullptr when unwired. Streaming sources use this to
+  //! re-arm a starved head; schedule() only enqueues, so off-thread calls are safe.
   [[nodiscard]] sirius::creator::task_creator* get_task_creator() const noexcept
   {
     return _task_creator;
