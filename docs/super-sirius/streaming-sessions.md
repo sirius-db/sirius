@@ -44,7 +44,8 @@ currently sit. Nothing is materialized to Arrow on the way in or out, so a queue
 spillable (GPU → host → disk) right up until it is pulled, and `pull()` hands it back in its
 current tier without forcing an upgrade.
 
-There is no bounded channel and no channel-level backpressure.
+There is no bounded channel and no channel-level backpressure; see
+[No backpressure](#no-backpressure).
 
 ## `exec::batch_stream`
 
@@ -256,7 +257,7 @@ consumers see END_OF_STREAM via wait(i) / drained(i)
 The sink has exactly **one sender** (`PIPELINE_SENDER`). `on_finalize_operator()` is called only
 when the sink is in the pipeline's `operators` vector — if it is reachable only through the
 `sink` member, `finalize_operator()` skips it, the streams never close, and every `wait()` caller
-blocks forever.
+blocks forever (see the gotcha in [exec::stream_session](#execstream_session--the-id-addressed-router)).
 
 ### Partition fan-out
 
@@ -296,3 +297,67 @@ Construction invariants:
   EOS together.
 - *Which* compute node each partition ships to is the wrapper's routing table — the sink stays
   oblivious to destinations.
+
+## `exec::stream_session` — the id-addressed router
+
+**Files:** `src/include/exec/stream_session.hpp`, `src/exec/stream_session.cpp`
+
+```
+push(stream_id, batch)              // → source.push
+close_input(stream_id, sender_id)   // → source.close_input(sender)
+fail_input(stream_id, error)        // → source.fail_input(error)   — poison an input stream
+pull(stream_id) -> optional         // → sink.pull(partition)
+wait(stream_id)                     // → sink.wait(partition)
+drained(stream_id) -> bool          // → sink.drained(partition)
+fail_output(stream_id, error)       // → sink.fail_output(error)    — poison all sink partitions
+```
+
+- Stream ids are **session-local** and **direction-separated** — two independent namespaces:
+  `push`/`close_input` resolve input streams (sources); `pull`/`wait`/`drained` resolve output
+  streams (sink partitions). A partitioned sink registers N ids, one per destination. An unknown
+  id is a defined error.
+- The session holds **no repositories** — it forwards to the operators, which own the queues. It
+  builds no plan, submits nothing to the scheduler, and owns no teardown; it wraps
+  already-instantiated operators.
+- A **leaf**-fragment session registers only sink ids (a session with no input streams is
+  legitimate); a **root**-fragment session registers a source id plus sink ids.
+
+> **Gotcha for plan-launcher work.** The sink is the pipeline **tail**, and it must be a member of
+> that pipeline's `operators` vector — being the pipeline's `sink` member is not enough. Pipeline
+> finish calls `finalize_operator()` on `get_operators()`, which returns `operators` and excludes
+> the `source`/`sink` members, so *membership* is what fires end-of-stream, not position. A sink
+> reachable only through the `sink` member never sees `on_finalize_operator()`, the streams never
+> close, and every consumer blocks in `wait()` forever with no error anywhere. The sink is
+> appended first and lands at `operators.back()` once `is_ready()` reverses the vector. A plan
+> launcher must key on that structure rather than on `is_source()`.
+
+## Worked example: distributed GROUP BY
+
+The flagship case composes entirely from the pieces above — no extra operator, no new mechanism.
+The front end emits two fragment shapes:
+
+```
+Leaf fragment (every node, over its shard)    Root fragment (every node, owns one key range)
+  partitioned STREAMING_SINK                    STREAMING_SINK (N = 1)
+  └─ HASH_GROUP_BY  (partial)                   └─ MERGE_GROUP_BY (final)
+     └─ GPU_SCAN                                   └─ STREAMING_SOURCE
+                                                      (expected = {0 … N-1})
+```
+
+The shuffle in the middle becomes the leaf sink's N per-destination streams, the wrapper's
+transport hop, and the root source's sender-aware fan-in. The aggregate algebra is unchanged
+(`SUM→SUM`, `COUNT→SUM` of partial counts, `AVG` carrying `(sum, cnt)`) — distributed GROUP BY is
+a data-movement and lifecycle problem, which is exactly the seam these pieces fill.
+
+The leaf session's EOS comes from its scan finishing (pipeline finish → close), not from any
+`close_input`. The root session's source reaches EOS only after all N distinct senders close — a
+repeated close from one sender cannot terminate it early.
+
+## No backpressure
+
+Streams never infer pressure from queue depth, and the engine has no "slow down" task hint — so
+the streaming layer deliberately carries no channel-level backpressure. Pressure relief comes
+from the **downgrade executor** instead: queued batches sit in repositories where the memory
+sweep can see and spill them (GPU → host → disk). Cross-fragment and cross-query pressure is a
+scheduling concern (per-fragment priority), and a future sink↔source slowness signal would be
+additive — nothing in this design forecloses it.
