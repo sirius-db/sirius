@@ -55,7 +55,6 @@ dynamic_filter_publish_plan::dynamic_filter_publish_plan(
   auto const same_device = [](auto const& lhs, auto const& rhs) {
     return lhs.get_gpu_space().get_device_id() == rhs.get_gpu_space().get_device_id();
   };
-  // Ensure no duplicated device ids
   std::sort(_replica_spaces.begin(), _replica_spaces.end(), device_less);
   _replica_spaces.erase(std::unique(_replica_spaces.begin(), _replica_spaces.end(), same_device),
                         _replica_spaces.end());
@@ -102,9 +101,8 @@ dynamic_filter_publish_plan::dynamic_filter_publish_plan(
       }
       bound_keys.push_back(binding.admitted_key_index);
     }
-    // Duplicate channel_push_ordinal values stay legal -- two admitted keys may bind the same
-    // probe column, and the channel conjoins same-column filters -- but one admitted key bound
-    // twice on one target would push the same filter twice.
+    // Duplicate channel_push_ordinals are legal (the channel conjoins same-column filters); the
+    // same admitted key bound twice on one target would push the same filter twice.
     std::ranges::sort(bound_keys);
     if (std::ranges::adjacent_find(bound_keys) != bound_keys.end()) {
       throw std::invalid_argument(

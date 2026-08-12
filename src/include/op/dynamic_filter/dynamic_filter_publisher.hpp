@@ -26,16 +26,11 @@
 
 namespace sirius::op {
 
-//===----------------------------------------------------------------------===//
-// publish_dynamic_filters
-//===----------------------------------------------------------------------===//
-
 /**
  * @brief What one publication attempt did
  *
- * `publish_dynamic_filters()` returns these counts without retaining a context or updating
- * `dynamic_filter_stats`. The producing `sirius_physical_hash_join` folds the outcome into its
- * optional stats sink.
+ * The publisher only returns these counts; the calling join folds them into its optional
+ * `dynamic_filter_stats` sink.
  */
 struct dynamic_filter_publication_outcome {
   std::size_t keys_considered            = 0;  ///< Bound admitted keys the attempt walked
@@ -54,17 +49,10 @@ struct dynamic_filter_publication_outcome {
  * @brief Build, replicate, and fan out one immutable dynamic-filter snapshot from a complete
  * hash-join build table
  *
- * The immutable @ref dynamic_filter_publish_plan is the only key and target input. The function
- * constructs filters only for admitted keys with at least one binding, completes device
- * replication, and pushes each filter at the binding's channel push ordinal. It retains none of its
- * inputs.
- *
- * @ref sirius_physical_hash_join::publish_dynamic_filters owns source readiness and exactly-once
- * arbitration.
- *
- * A key whose recorded storage type disagrees with its runtime build column is skipped and counted.
- * Before accessing a build column, the function validates its ordinal against @p build_view; an
- * out-of-range ordinal fails the publication attempt with `std::logic_error`.
+ * Constructs filters only for admitted keys with at least one binding, completes device
+ * replication before publishing, and pushes each filter at its binding's channel push ordinal.
+ * Retains none of its inputs. A key whose recorded storage type disagrees with its runtime build
+ * column is skipped and counted. The caller owns source readiness and exactly-once arbitration.
  *
  * @pre @p plan is enabled
  * @throw std::runtime_error if the source GPU cannot be identified
@@ -72,10 +60,8 @@ struct dynamic_filter_publication_outcome {
  * source GPU is absent from the plan's replica spaces, or if a constructed filter does not
  * implement `sirius_device_replicable`
  *
- * @param[in] plan The join's enabled publication plan (admitted keys, targets, policy, replica
- * placements)
- * @param[in] build_view The complete build table to reduce / build membership over; admitted build
- * key ordinals index its columns
+ * @param[in] plan The join's enabled publication plan
+ * @param[in] build_view The complete build table; admitted keys' build ordinals index its columns
  * @param[in] stream Stream used for filter construction
  * @return Counts describing what the attempt constructed, skipped, and pushed
  */

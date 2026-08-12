@@ -29,19 +29,13 @@ namespace sirius::op {
 
 class sirius_dynamic_filter_set;
 
-//===----------------------------------------------------------------------===//
-// dynamic_filter_publish_plan
-//===----------------------------------------------------------------------===//
-
 /**
  * @brief Shape of one join-condition side, classified before computed-key materialization
  *
- * `sirius_plan_comparison_join` materializes computed equality keys into plain bound references
- * backed by an injected projection before the conditions reach `sirius_physical_hash_join`, so a
- * post-materialization condition cannot distinguish a computed key from a direct column reference.
- * The planner therefore classifies each condition side while the original expression is still
- * visible and carries the immutable result here and on the physical join. Admission consumes the
- * carried classification and never re-derives shape from post-materialization conditions.
+ * The planner materializes computed equality keys into plain bound references before the
+ * conditions reach the physical join, so shape is classified while the original expression is
+ * still visible and carried here; admission never re-derives it from post-materialization
+ * conditions.
  */
 enum class dynamic_filter_key_shape : std::uint8_t {
   direct,   ///< A plain bound column reference
@@ -65,9 +59,7 @@ struct dynamic_filter_condition_shape {
  * Both classes push the consumer operator's own output ordinal -- the coordinate the channel
  * stores and every lookup uses. A scan route pushes the bound scan's output ordinal, the discovery
  * walk's exit ordinal at that scan; a direct route pushes `planner::place_endpoint()`'s site
- * ordinal, in the output schema of the operator the endpoint wraps. Either exit ordinal is derived
- * by mapping the producing join's probe-key entry ordinal through each accepted descent step, so
- * entry and exit ordinals differ whenever a hop was accepted.
+ * ordinal, in the output schema of the operator the endpoint wraps.
  */
 enum class dynamic_filter_route_class : std::uint8_t {
   scan,   ///< A GPU scan consumer; zone-map capable
@@ -77,10 +69,8 @@ enum class dynamic_filter_route_class : std::uint8_t {
 /**
  * @brief Publication policy transported from configuration
  *
- * `config::valid_domain_coverage_threshold` validates the threshold before planning;
- * `dynamic_filter_publish_plan` stores it without revalidation.
- *
- * @note The coverage threshold is armed only for unique keys with DuckDB-native cardinality
+ * Validated by `config::valid_domain_coverage_threshold` before planning and stored here without
+ * revalidation. The coverage gate arms only for unique keys with DuckDB-native cardinality
  * evidence.
  */
 struct dynamic_filter_publication_policy {
@@ -157,9 +147,9 @@ class dynamic_filter_publish_plan final {
     /**
      * @brief Unfiltered cardinality of the base table this build key traces to
      *
-     * Stored with the admitted key. 0 when untraceable, which disables the membership coverage gate
-     * for this key. The value is a true upper bound, never an estimate; see
-     * `planner/dynamic_filter/build_key_domain.hpp` for the evidence contract.
+     * 0 when untraceable, which disables the membership coverage gate for this key. The value is a
+     * true upper bound, never an estimate; see `planner/dynamic_filter/build_key_domain.hpp` for
+     * the evidence contract.
      */
     std::size_t build_key_domain_cardinality = 0;
     /**
@@ -175,9 +165,6 @@ class dynamic_filter_publish_plan final {
 
   /**
    * @brief One admitted key's binding onto one target channel
-   *
-   * Contains only the admitted keys routed to this target. `publish_dynamic_filters()` iterates the
-   * target's bindings rather than the full admitted-key array.
    */
   struct key_binding {
     /**
@@ -232,10 +219,10 @@ class dynamic_filter_publish_plan final {
     0.9;  ///< Default coverage fraction at or above which publication skips a key
 
   /**
-   * @brief Construct the canonical disabled plan
+   * @brief Construct the disabled plan
    *
-   * No admitted keys, no targets, `enabled() == false` -- every constructor invariant holds
-   * vacuously. The validating constructor below is the only path that can produce an enabled plan.
+   * No admitted keys, no targets, `enabled() == false`; only the validating constructor can
+   * produce an enabled plan.
    */
   dynamic_filter_publish_plan() = default;
 
@@ -248,14 +235,13 @@ class dynamic_filter_publish_plan final {
    * verify that a channel push ordinal is meaningful in the target channel's schema; the discovery
    * walk (`trace_probe_key()` / `place_endpoint()`) owns that precondition.
    *
-   * @p replica_spaces is sorted by device ID and deduplicated. Duplicate admitted keys for the same
-   * planner condition are rejected.
+   * @p replica_spaces is sorted by device ID and deduplicated.
    *
    * @throw std::invalid_argument if the plan has probe targets but no replica space
    * @throw std::invalid_argument if a replica space is not a GPU space with HOST-tier staging
    * @throw std::invalid_argument if two admitted keys name the same planner condition
    * @throw std::invalid_argument if an admitted key has a negative build ordinal or an EMPTY
-   * storage type (either is the signature of an upstream conversion defect)
+   * storage type
    * @throw std::invalid_argument if a probe target has a null channel, is a membership-only
    * (direct) target accepting zone maps, binds an admitted key that does not exist, or binds the
    * same admitted key more than once
@@ -263,8 +249,7 @@ class dynamic_filter_publish_plan final {
    * @param[in] admitted_keys Statically admitted build keys, in admitted order
    * @param[in] probe_targets Endpoint channels with their sparse key bindings
    * @param[in] replica_spaces GPU/HOST placements for device-local filter replicas
-   * @param[in] policy Publication policy transported from configuration and validated at its
-   * ingress; see @ref dynamic_filter_publication_policy
+   * @param[in] policy Publication policy; see @ref dynamic_filter_publication_policy
    */
   dynamic_filter_publish_plan(std::vector<admitted_key> admitted_keys,
                               std::vector<probe_target> probe_targets,
@@ -274,26 +259,19 @@ class dynamic_filter_publish_plan final {
   /**
    * @brief Whether this producer publishes at all
    *
-   * A plan with admitted keys but no target is disabled. A plan with a target but no admitted key
-   * is enabled and completes a publication attempt without emitting a filter.
-   *
-   * @return True when at least one probe target exists
+   * A plan with a target but no admitted key is enabled and completes a publication attempt
+   * without emitting a filter.
    */
   [[nodiscard]] bool enabled() const noexcept { return !_probe_targets.empty(); }
   /**
-   * @brief Admitted build keys in admitted order
-   *
-   * @return The dense admitted-key array; a key's position in it is the admitted-key index that
-   * `key_binding::admitted_key_index` refers to
+   * @brief Admitted build keys, in admitted order
    */
   [[nodiscard]] std::vector<admitted_key> const& admitted_keys() const noexcept
   {
     return _admitted_keys;
   }
   /**
-   * @brief Target channels and their sparse bindings
-   *
-   * @return Targets in planner-defined order
+   * @brief Target channels and their sparse bindings, in planner-defined order
    */
   [[nodiscard]] std::vector<probe_target> const& probe_targets() const noexcept
   {
@@ -301,17 +279,13 @@ class dynamic_filter_publish_plan final {
   }
   /**
    * @brief Whether the publisher also constructs zone-map filters
-   *
-   * @return The configured zone-map publication setting
    */
   [[nodiscard]] bool emit_zone_map_filters() const noexcept
   {
     return _policy.emit_zone_map_filters;
   }
   /**
-   * @brief Canonical device-replica placements
-   *
-   * @return Non-owning placements sorted by GPU device ID
+   * @brief Device-replica placements, sorted by GPU device ID
    */
   [[nodiscard]] std::vector<dynamic_filter_replica_space> const& replica_spaces() const noexcept
   {
@@ -319,8 +293,6 @@ class dynamic_filter_publish_plan final {
   }
   /**
    * @brief Domain coverage at or above which publication skips an eligible key
-   *
-   * @return The validated configuration value
    */
   [[nodiscard]] double domain_coverage_threshold() const noexcept
   {

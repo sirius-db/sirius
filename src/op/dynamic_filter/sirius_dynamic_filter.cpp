@@ -366,8 +366,8 @@ void sirius_dynamic_zone_map_filter::replicate_to_devices(
     return;
   }
 
-  // The publisher synchronized source construction before replication. Use the source memory
-  // space's pooled stream to read exact scalar values.
+  // The publisher synchronized source construction before replication, so scalar reads here see
+  // final values.
   rmm::cuda_set_device_raii source_guard{rmm::cuda_device_id{_source_device}};
   auto const source_stream = source->get_gpu_space().acquire_stream();
 
@@ -379,7 +379,6 @@ void sirius_dynamic_zone_map_filter::replicate_to_devices(
       auto replica       = std::make_unique<device_zones>();
       replica->device_id = device_id;
 
-      // Target scalars use the target space's allocator and pooled stream.
       {
         rmm::cuda_set_device_raii target_guard{rmm::cuda_device_id{device_id}};
         auto const target_stream = target_space.acquire_stream();
@@ -442,11 +441,7 @@ cudf::ast::expression const& sirius_dynamic_zone_map_filter::to_ast(
   return *result;
 }
 
-//===----------------------------------------------------------------------===//
-// sirius_dynamic_in_list_filter --
-//   implemented in src/cuda/sirius_dynamic_in_list_filter.cu (the
-//   persistent cuco::static_set is device code, PIMPL'd behind set_impl).
-//===----------------------------------------------------------------------===//
+// The membership filters (in-list, small in-list, Bloom) are implemented in src/cuda/.
 
 //===----------------------------------------------------------------------===//
 // sirius_dynamic_filter_set

@@ -22,7 +22,6 @@ namespace sirius::planner {
 
 bool build_subtree_is_filtering(duckdb::LogicalOperator const& op)
 {
-  // Match DuckDB's join-filter pushdown predicate.
   switch (op.type) {
     case duckdb::LogicalOperatorType::LOGICAL_GET:
       return !op.Cast<duckdb::LogicalGet>().table_filters.filters.empty();
@@ -39,13 +38,12 @@ bool build_subtree_is_filtering(duckdb::LogicalOperator const& op)
 bool build_relation_is_derived(duckdb::LogicalOperator const& op)
 {
   switch (op.type) {
-    // Childless derived leaves. The build_subtree_is_filtering mirror bottoms out here, so its
-    // "unfiltered" verdict means "cannot see", not "whole key domain".
+    // Childless derived leaves: the filtering walk bottoms out here, so its "unfiltered" verdict
+    // means "cannot see", not "whole key domain".
     case duckdb::LogicalOperatorType::LOGICAL_DELIM_GET:
     case duckdb::LogicalOperatorType::LOGICAL_CTE_REF:
-    // Reducing operators. Their output key set is a subset of the domain even when no predicate
-    // appears anywhere below them: a join output carries only surviving keys, an aggregate
-    // collapses to its groups, a set operation removes rows.
+    // Reducing operators: their output key set is a subset of the domain even when no predicate
+    // appears anywhere below them.
     case duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
     case duckdb::LogicalOperatorType::LOGICAL_ANY_JOIN:
     case duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN:

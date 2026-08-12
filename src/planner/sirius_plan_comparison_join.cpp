@@ -411,14 +411,11 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   std::size_t lhs_cardinality = op.children[0]->EstimateCardinality(context);
   std::size_t rhs_cardinality = op.children[1]->EstimateCardinality(context);
 
-  // A missing Sirius context disables dynamic-filter evidence and discovery.
   auto sirius_context = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   bool const dynamic_filter_enabled =
     sirius_context && sirius_context->get_config().get_operator_params().enable_dynamic_filter;
 
-  // Either filter or derived-relation evidence enables discovery; route-specific admission follows.
-  // The two are tracked apart only so the wired log can say which one armed the join: derived-only
-  // evidence is structural, so the publish-time and runtime gates are what decide its worth.
+  // Filter or derived-relation evidence enables discovery; tracked apart only for the wired log.
   bool const build_filtered = dynamic_filter_enabled && build_subtree_is_filtering(*op.children[1]);
   bool const build_derived  = dynamic_filter_enabled && build_relation_is_derived(*op.children[1]);
   bool const build_evidence = build_filtered || build_derived;
@@ -498,18 +495,16 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     auto admitted_keys = admit_dynamic_filter_keys(
       conditions, condition_key_shapes, condition_domains, build_side_unique_column);
 
-    // Trace each admitted key through the built probe subtree. Scan bindings take precedence over
-    // join-edge endpoints, so one key never publishes through both routes. Delim joins share this
-    // planner entry point but are not dynamic-filter producers.
+    // Scan bindings take precedence over join-edge endpoints, so one key never publishes through
+    // both routes. Delim joins share this planner entry point but are not dynamic-filter
+    // producers.
     std::vector<sirius::op::dynamic_filter_publish_plan::probe_target> targets;
     std::size_t scan_target_count = 0;
     bool const discovery_runs     = build_evidence &&
                                 op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
                                 !gpu_spaces.empty() && !host_spaces.empty();
     if (discovery_runs) {
-      // Scan binding additionally requires a producer join type that may pre-filter its probe side.
       bool const scan_bind_armed = scan_route_join_type_admissible(op.join_type);
-      // The planner enables build-block descent; the policy remains independently testable.
       descent_policy const policy{.descend_build_blocks = true};
       std::unordered_map<sirius::op::sirius_physical_operator const*, std::size_t> target_by_scan;
       for (std::size_t key_index = 0; key_index < admitted_keys.size(); ++key_index) {
@@ -526,8 +521,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
             continue;
           }
           auto& scan = terminal.node->Cast<sirius::op::sirius_physical_table_scan>();
-          // The exit ordinal is a position in the bound scan's output space (scan.types), which is
-          // also the channel's store and lookup coordinate -- no translation exists between them.
+          // The exit ordinal is the scan-route push coordinate; see dynamic_filter_route_class.
           assert(terminal.ordinal < scan.types.size());
           auto const [entry, inserted] = target_by_scan.try_emplace(terminal.node, targets.size());
           if (inserted) {
@@ -552,15 +546,10 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           scan_bound = true;
         }
         if (scan_bound) { continue; }
-        // A key with no scan bind may try the join-edge route; runtime gates suppress filters that
-        // prune too little.
-        //
-        // Build-block descent depends on equality admission: under null-equal
-        // semantics, pruning a LEFT join's build input could add a NULL-padded row accepted by
-        // the producing join.
-        //
-        // Projection folding preserves the outer output and inner input spaces, so a recorded
-        // site ordinal remains valid when fold_adjacent_projections() runs later.
+        // Build-block descent is safe only for admission-vetted equality keys; the null-equal
+        // hazard is documented at admit_scan_route_key. Projection folding preserves the outer
+        // output and inner input spaces, so a recorded site ordinal remains valid when
+        // fold_adjacent_projections() runs later.
         if (!direct_route_admissible(op.join_type,
                                      condition.comparison,
                                      key.key_shape,
@@ -568,8 +557,6 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                                      key.storage_type)) {
           continue;
         }
-        // Mint one channel per endpoint. If any branch was scan-bound, scan bindings win and this
-        // key receives no direct endpoint on its other branches.
         std::vector<std::shared_ptr<sirius::op::sirius_dynamic_filter_set>> site_channels;
         auto placed = place_endpoint(
           std::move(left),
@@ -577,7 +564,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           policy,
           [&site_channels, &op_params](sirius::op::sirius_physical_operator const& site)
             -> duckdb::unique_ptr<sirius::op::sirius_physical_operator> {
-            auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+            auto channel  = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
             auto endpoint = duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
               site.types,
               site.estimated_cardinality,
@@ -590,8 +577,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
         left = std::move(placed.subtree);
         assert(site_channels.size() == placed.site_ordinals.size());
         for (std::size_t site = 0; site < site_channels.size(); ++site) {
-          // A direct channel's push, storage, and lookup coordinate is the site ordinal in the
-          // sited operator's output space, not the probe-child entry ordinal.
+          // The site ordinal is the direct-route push coordinate; see dynamic_filter_route_class.
           targets.push_back({.filter_set  = std::move(site_channels[site]),
                              .route_class = sirius::op::dynamic_filter_route_class::direct,
                              .accepts_zone_map_filters = false,
@@ -624,7 +610,6 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
         rhs_cardinality);
     } else if (build_evidence && op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
                !admitted_keys.empty() && (gpu_spaces.empty() || host_spaces.empty())) {
-      // Report missing placement before less specific discovery gates.
       SIRIUS_LOG_INFO(
         "[sirius_plan_comparison_join] Not wiring dynamic filter(s): a GPU and HOST "
         "memory space are required for device-local replicas.");

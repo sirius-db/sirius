@@ -69,9 +69,7 @@ class dynamic_filter_gate {
   //===--------------------------------------------------------------------===//
   // Per-filter marginal usefulness
   //===--------------------------------------------------------------------===//
-  // Membership filters also record their marginal keep ratio after earlier masks. A skippable
-  // verdict omits the filter from every later split permanently; a selective reading goes stale
-  // on channel growth and is remeasured.
+  // A filter's marginal keep ratio is its keep fraction on the rows surviving earlier masks.
 
   /// Marginal keep ratio for @p filter, or `std::nullopt` when unmeasured. A skippable ratio is
   /// returned at any channel size; a selective one only when measured against at least
@@ -114,17 +112,13 @@ class dynamic_filter_gate {
   /// contract when batches from different filter generations finish concurrently.
   std::mutex _decision_mu;
 
-  /// One filter's marginal keep ratio and the channel size it was measured against. The size is
-  /// carried so channel growth can invalidate a selective reading; a skippable one is permanent —
-  /// see @ref filter_keep_ratio.
+  /// One filter's marginal keep ratio and the channel size it was measured against.
   struct filter_measurement {
     double kept                       = 1.0;
     std::size_t observed_filter_count = 0;
   };
 
-  /// Marginal keep ratio per filter, each with the channel size it was measured against.
-  /// Mutex-guarded: touched once per (split, filter) on the apply slow path, never on the
-  /// zero-copy fast path.
+  /// Per-filter measurements, mutex-guarded; never touched on the zero-copy fast path.
   mutable std::mutex _filter_ratios_mu;
   std::unordered_map<sirius::op::sirius_dynamic_filter const*, filter_measurement>
     _filter_keep_ratios;

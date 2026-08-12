@@ -15,13 +15,8 @@
  */
 
 /*
- * Unit tests for `planner/dynamic_filter/build_filter_evidence.hpp`.
- *
- * `build_subtree_is_filtering` mirrors DuckDB's join-filter evidence rules for filtered scans,
- * filters, top-N operators, and containing subtrees; the parity suite compares both implementations
- * on optimized plans. `build_relation_is_derived` fires on a derivation marker anywhere in the
- * subtree -- a derived leaf or a reducing operator; the tests pin which operators are markers and
- * that the walk is any-descendant.
+ * Unit tests for `planner/dynamic_filter/build_filter_evidence.hpp`. The parity suite compares
+ * the DuckDB-mirroring rules against DuckDB's own implementation on optimized plans.
  */
 
 #include "planner/dynamic_filter/build_filter_evidence.hpp"
@@ -219,7 +214,6 @@ TEST_CASE("a derived-leaf root is a derived relation", "[dynamic_filter][evidenc
 
 TEST_CASE("projection wrappers are transparent to derivation", "[dynamic_filter][evidence]")
 {
-  // Projection expressions do not affect whether the input is a derived leaf.
   SECTION("a projection over a DELIM_GET")
   {
     auto const projection = make_projection_over(make_delim_get());
@@ -235,7 +229,6 @@ TEST_CASE("projection wrappers are transparent to derivation", "[dynamic_filter]
 
 TEST_CASE("derivation is orthogonal to filtering", "[dynamic_filter][evidence]")
 {
-  // The two predicates disagree on purpose in both directions.
   SECTION("a base-table GET is never derived, filtered or not")
   {
     REQUIRE_FALSE(build_relation_is_derived(*make_get()));
@@ -244,7 +237,6 @@ TEST_CASE("derivation is orthogonal to filtering", "[dynamic_filter][evidence]")
 
   SECTION("the mirror carries no evidence at a derived leaf")
   {
-    // The opacity this predicate exists for: the mirror bottoms out at the childless reference.
     REQUIRE_FALSE(build_subtree_is_filtering(*make_delim_get()));
     REQUIRE_FALSE(build_subtree_is_filtering(*make_cte_ref()));
   }
@@ -281,16 +273,12 @@ TEST_CASE("derivation is any-descendant over derivation markers", "[dynamic_filt
 
   SECTION("a marker below a non-projection wrapper is still found")
   {
-    // The property the walk exists for: no operator between the root and a marker hides it.
     REQUIRE(build_relation_is_derived(*make_order_over(make_join_over(make_get(), make_get()))));
     REQUIRE(build_relation_is_derived(*make_limit_over(make_join_over(make_get(), make_get()))));
   }
 
   SECTION("a LIMIT over a CTE_REF is derived")
   {
-    // Deliberate: one uniform rule for leaves and reducing operators alike. A rule that admitted
-    // an unfiltered aggregate under this LIMIT but refused the CTE reference -- the more clearly
-    // derived relation of the two -- would be incoherent.
     REQUIRE(build_relation_is_derived(*make_limit_over(make_cte_ref())));
   }
 }

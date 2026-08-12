@@ -842,8 +842,7 @@ bool sirius_physical_hash_join::is_build_probe_mode()
 
 bool sirius_physical_hash_join::publishes_dynamic_filters() const
 {
-  // Fixed at construction, so this needs no lock. An enabled plan means probe targets are
-  // wired; DuckDB's pushdown metadata is consumed at plan time and never reaches the operator.
+  // Fixed at construction, so this needs no lock.
   return _dynamic_filter_plan.enabled();
 }
 
@@ -2081,8 +2080,7 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
       claim            = open && wired && _build_arrives_whole;
 
       // A join that has a filter plan and is still open but cannot use the one-shot publisher
-      // silently publishes nothing — say so, once per join. _build_arrives_whole is fixed at
-      // sizing time, so on a multi-partition build every build batch would repeat the same fact.
+      // silently publishes nothing — say so, once per join.
       wired_but_unusable = open && wired && !claim && !_build_not_whole_reported;
       if (wired_but_unusable) { _build_not_whole_reported = true; }
       mode = _join_mode;
@@ -2139,7 +2137,6 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
         cudaGetErrorString(status));
     }
   } else {
-    // Synchronize the source device when no writer event is available.
     auto const status = cudaDeviceSynchronize();
     if (status != cudaSuccess) {
       throw std::runtime_error(

@@ -324,7 +324,6 @@ void require_delim_join_common(sirius::op::sirius_physical_delim_join& delim)
   require_join_child_wrap(delim.join->children[1].get(), delim.join.get(), /*is_build=*/true);
 }
 
-// Set the dynamic-filter switch for one scope and restore its previous value.
 class dynamic_filter_switch_guard {
  public:
   dynamic_filter_switch_guard(Connection& con, bool enabled)
@@ -476,7 +475,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   const std::vector<OptimizerType> keep_shape{OptimizerType::JOIN_ORDER,
                                               OptimizerType::BUILD_SIDE_PROBE_SIDE};
 
-  // Identify the inner join by containment in the outer probe subtree.
   auto require_inner_join = [](sirius_physical_operator* plan) {
     auto joins = collect(plan, SiriusPhysicalOperatorType::HASH_JOIN);
     REQUIRE(joins.size() == 2);
@@ -487,10 +485,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("filter on, unfiltered build: no endpoint wires anywhere")
   {
-    // The producing join's build (small_c) is an unfiltered base-table image: its membership set
-    // covers the whole key domain and would keep every probe row. The scan route lacks the filter
-    // evidence it requires, and the join-edge route refuses too because a base-table build is not
-    // a derived relation.
+    // An unfiltered base-table build supplies neither filter nor derivation evidence, and either
+    // kind would arm discovery for both routes -- with neither, no route wires.
     dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
     auto plan = generate_sirius_plan(*con, query, keep_shape);
     INFO(tree_to_string(plan.get()));
@@ -526,8 +522,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   SECTION("filter on: the endpoint lands on a LEFT join's build input")
   {
     // The producing join's build filter (pushed into the small_c scan) supplies the required
-    // evidence; holding back join reordering is what preserves the LEFT join. The equality key's
-    // trace crosses the LEFT join's build block down to its scan.
+    // evidence; holding back join reordering preserves the LEFT join.
     const std::string left_query =
       "SELECT * FROM big_left l LEFT JOIN small_right r ON l.id = r.rid "
       "JOIN small_c c ON r.other = c.ckey WHERE c.cother >= 0";
@@ -624,7 +619,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
       return target.route_class == sirius::op::dynamic_filter_route_class::direct;
     }));
 
-    // The inner build's GPU scan carries the bound scan-route endpoint.
     auto* inner = joins[1];
     auto* build_subtree =
       require_join_child_wrap(inner->children[1].get(), inner, /*is_build=*/true);
@@ -659,7 +653,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     REQUIRE(endpoints.front()->children.size() == 1);
     CHECK(endpoints.front()->children[0]->type == SiriusPhysicalOperatorType::GPU_SCAN);
 
-    // The wired endpoint is on the PROBE side: the outer join's probe wrap contains it.
+    // The endpoint is on the probe side (children[0]).
     auto* hj = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
     REQUIRE(hj != nullptr);
     CHECK(contains(hj->children[0].get(), endpoints.front()));
@@ -680,7 +674,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   SECTION("unfiltered aggregate build: derived evidence wires the scan route")
   {
     // No predicate appears anywhere in the build subtree, so the aggregate is the only derivation
-    // marker arming discovery. The wiring must otherwise match the filtered-build section.
+    // marker arming discovery.
     dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
     auto plan = generate_sirius_plan(*con,
                                      "SELECT * FROM big_left l JOIN "

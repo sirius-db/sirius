@@ -76,7 +76,6 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   auto const num_cols = static_cast<std::size_t>(input.num_columns());
   auto const mr       = cudf::get_current_device_resource_ref();
 
-  // Apply one combined AST mask, then membership masks ordered by recorded selectivity.
   std::unique_ptr<cudf::table> owned;  // most recent step's product backing `current`
   cudf::table_view current = input;
   auto const cascade_step  = [&](std::unique_ptr<cudf::column> mask) -> double {
@@ -201,7 +200,6 @@ bool dynamic_filter_gate::applicable(sirius::op::sirius_dynamic_filter_set const
 {
   if (!filters.has_filters()) { return false; }
   if (_state.load(std::memory_order_relaxed) != state::disabled) { return true; }
-  // Channel growth after a disable decision permits one measurement of the larger filter set.
   return filters.filter_count() > _decided_filter_count.load(std::memory_order_relaxed);
 }
 
@@ -211,7 +209,6 @@ void dynamic_filter_gate::record_keep_ratio(std::size_t rows_before,
 {
   if (rows_before == 0) { return; }
 
-  // Serialize state and filter-count updates so an older batch cannot overwrite ACTIVE.
   std::scoped_lock decision_lock(_decision_mu);
   auto const current = _state.load(std::memory_order_relaxed);
   if (current == state::active) { return; }
@@ -241,7 +238,6 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_gated_view(
   auto const observed_filters = filters.filter_count();
   auto const rows_before      = input.num_rows();
   auto filtered = apply_dynamic_filters_to_view(input, filters, stream, mode, &gate, device_id);
-  // A device with no applicable local filter must not train the gate shared with other devices.
   if (!filtered) { return nullptr; }
   gate.record_keep_ratio(
     rows_before, static_cast<std::size_t>(filtered->num_rows()), observed_filters);

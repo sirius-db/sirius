@@ -32,10 +32,9 @@ using sirius::op::domain_coverage_gate_fires;
 using sirius::op::membership_filter_kind;
 using sirius::op::zone_map_range_gate_fires;
 
-// Cache budget used to test the exact hash-set fit boundary.
 constexpr std::size_t kL2Bytes = 1024;
 
-// Exactly representable threshold used to test the inclusive gate boundary.
+// Exactly representable, so the inclusive gate-boundary tests are deterministic.
 constexpr double kThreshold = 0.5;
 
 }  // namespace
@@ -83,7 +82,6 @@ TEST_CASE("membership policy chooses the hash IN-list exactly while its set fits
                                     .supports_bloom           = true}) ==
           membership_filter_kind::hash_in_list);
 
-  // One byte over, and the exact set gives way to the probabilistic fallback.
   REQUIRE(choose_membership_filter({.build_rows               = 4096,
                                     .l2_cache_bytes           = kL2Bytes,
                                     .estimated_hash_set_bytes = kL2Bytes + 1,
@@ -95,8 +93,7 @@ TEST_CASE("membership policy chooses the hash IN-list exactly while its set fits
 TEST_CASE("membership policy treats an unknown L2 size as no hash IN-list",
           "[dynamic_filter][source_policy]")
 {
-  // An unknown cache size is reported as 0, which a size comparison alone would read as "every set
-  // of 0 estimated bytes fits". The eligibility test must reject it outright.
+  // An unknown cache size is reported as 0 and must be rejected outright, not read as a fit.
   REQUIRE(choose_membership_filter({.build_rows               = 4096,
                                     .l2_cache_bytes           = 0,
                                     .estimated_hash_set_bytes = 0,
@@ -164,7 +161,6 @@ TEST_CASE("domain-coverage gate fires only for proven-unique keys",
 TEST_CASE("domain-coverage gate treats a threshold above 1.0 as disabled outright",
           "[dynamic_filter][source_policy]")
 {
-  // A threshold above 1.0 disables the gate before considering any other input.
   REQUIRE_FALSE(domain_coverage_gate_fires(2'000'000, 1'000'000, true, 2.0));
   REQUIRE_FALSE(domain_coverage_gate_fires(2'000'000, 1'000'000, false, 2.0));
   REQUIRE_FALSE(domain_coverage_gate_fires(1'000'000, 1'000'000, true, 1.5));
@@ -175,8 +171,7 @@ TEST_CASE("domain-coverage gate treats a threshold above 1.0 as disabled outrigh
 
 TEST_CASE("zone-map range gate fires at and above its threshold", "[dynamic_filter][source_policy]")
 {
-  // The span is inclusive of both bounds: [10, 59] covers 50 of the 100 domain values, so the
-  // at-threshold case also pins that the endpoint is counted.
+  // The span is inclusive of both bounds: [10, 59] covers 50 of the 100 domain values.
   REQUIRE(zone_map_range_gate_fires(10.0, 59.0, 100, kThreshold));
   REQUIRE(zone_map_range_gate_fires(10.0, 60.0, 100, kThreshold));
   REQUIRE_FALSE(zone_map_range_gate_fires(10.0, 58.0, 100, kThreshold));

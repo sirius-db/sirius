@@ -1395,8 +1395,6 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     duckdb::unique_ptr<duckdb::LogicalOperator> validation_plan;
     bool plan_is_copyable = true;
     try {
-      // LogicalOperator::Copy strips DuckDB join-filter metadata. Sirius discovers targets from
-      // plan structure, so the copy still matches the plan that GPU execution consumes.
       validation_plan = sirius::transparent::copy_logical_plan(*logical_plan, context);
     } catch (NotImplementedException&) {
       plan_is_copyable = false;

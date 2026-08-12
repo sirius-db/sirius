@@ -456,7 +456,7 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
 
     // A plan-time-placed dynamic-filter endpoint (build-side placement) applies membership masks
     // whose probe storage types were recorded native at admission, so narrowed carriers stop at
-    // the boundary restore below. Scan-companion DYNAMIC_FILTER wrappers still only appear after
+    // the boundary restore below. Scan-companion DYNAMIC_FILTER wrappers only appear after
     // these passes, at insert_gpu_pipeline_operators time.
     case sirius::op::SiriusPhysicalOperatorType::DYNAMIC_FILTER: break;
 

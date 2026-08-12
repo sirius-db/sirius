@@ -100,12 +100,10 @@ std::optional<ordinal_origin> pass_through_origin(duckdb::LogicalOperator const&
       switch (join.join_type) {
         case duckdb::JoinType::SEMI:
         case duckdb::JoinType::ANTI:
-          // Output is only the left block, a subset of the left rows.
           if (output_ordinal >= left_width) { return std::nullopt; }
           return std::optional{left_origin(output_ordinal)};
         case duckdb::JoinType::RIGHT_SEMI:
         case duckdb::JoinType::RIGHT_ANTI: {
-          // Output is only the right block, a subset of the right rows.
           auto const right_width = join.right_projection_map.empty()
                                      ? join.children[1]->types.size()
                                      : join.right_projection_map.size();
@@ -130,8 +128,7 @@ std::optional<ordinal_origin> pass_through_origin(duckdb::LogicalOperator const&
       }
     }
     case duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN:
-      // Refused explicitly rather than by omission: dynamic-filter routing excludes CTE/DELIM
-      // producer paths entirely, and this walk must not quietly disagree.
+      // Dynamic-filter routing excludes CTE/DELIM producer paths; this walk must agree.
       return std::nullopt;
     default: return std::nullopt;
   }
@@ -174,8 +171,7 @@ std::vector<duckdb::LogicalGet const*> resolve_build_key_scans(
        ++condition_index) {
     auto const& build_side = *join.conditions[condition_index].right;
     // Post-ColumnBindingResolver a plain build key is a BOUND_REF whose index is an output
-    // ordinal of the build child. A cast or computed side stays null: a cast key is never
-    // admitted, and a computed key's values are not the base column's values.
+    // ordinal of the build child; a cast or computed side stays null.
     if (build_side.GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) { continue; }
     auto const ordinal =
       static_cast<std::size_t>(build_side.Cast<duckdb::BoundReferenceExpression>().index);
@@ -195,10 +191,8 @@ duckdb_base_table_cardinality::duckdb_base_table_cardinality(
 std::optional<std::size_t> duckdb_base_table_cardinality::operator()(
   duckdb::LogicalGet const& get) const noexcept
 {
-  // Allowlist: only DuckDB's native table scan, whose cardinality callback returns
-  // NodeStatistics::max_cardinality = committed rows plus transaction-local inserts -- a true
-  // upper bound on the table's rows. Every other table function promises only an expected
-  // cardinality, which may under-state the domain and over-fire the gate.
+  // Only seq_scan's max_cardinality (committed rows plus transaction-local inserts) is a true
+  // upper bound; other table functions report estimates that may under-state the domain.
   if (get.function.name != "seq_scan" || !get.function.cardinality || !get.bind_data) {
     return std::nullopt;
   }

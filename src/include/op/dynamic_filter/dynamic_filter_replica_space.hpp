@@ -42,8 +42,6 @@ class dynamic_filter_replica_space final {
 
   /**
    * @brief GPU placement and mutable runtime accounting state for the replica
-   *
-   * @return The GPU memory space this handle refers to
    */
   [[nodiscard]] cucascade::memory::memory_space& get_gpu_space() const noexcept
   {
@@ -52,8 +50,6 @@ class dynamic_filter_replica_space final {
 
   /**
    * @brief Host staging space paired with the GPU placement
-   *
-   * @return The HOST memory space this handle refers to
    */
   [[nodiscard]] cucascade::memory::memory_space const& get_host_staging_space() const noexcept
   {

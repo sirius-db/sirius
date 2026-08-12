@@ -392,9 +392,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   // batch when this holds. Guarded by op_state_mutex.
   bool _build_arrives_whole = false;
 
-  // One-shot latch for the "dynamic filter NOT published" diagnostic and its stats counter: a
-  // wired join whose build cannot arrive whole reports that once, not once per build batch.
-  // Guarded by op_state_mutex.
+  // Latches the "dynamic filter NOT published" diagnostic and its stats counter to once per
+  // join, not once per build batch. Guarded by op_state_mutex.
   bool _build_not_whole_reported = false;
 
   // Whether any build-side join key column contains a NULL. Used exclusively for MARK join
@@ -506,11 +505,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
                                    std::shared_ptr<::cucascade::data_batch> batch,
                                    std::size_t partition_idx) override;
 
-  /**
-   * @brief Return this join's dynamic-filter publication plan
-   *
-   * @return The plan, which is not mutated after construction
-   */
+  /// @brief This join's dynamic-filter publication plan.
   [[nodiscard]] dynamic_filter_publish_plan const& dynamic_filter_plan() const noexcept
   {
     return _dynamic_filter_plan;

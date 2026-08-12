@@ -56,28 +56,16 @@ struct dynamic_filter_stats_snapshot {
  * owning `SiriusContext` outlives every plan built during a query -- the same lifetime contract as
  * `dynamic_filter_replica_space`.
  *
- * The fields have three timing classes.
- *
- * `producers_enabled` is a plan-time fact. `sirius_physical_hash_join` increments it when
- * constructed with an enabled `dynamic_filter_publish_plan`, before execution begins. It counts
- * plan constructions, not executed producers: the transparent path builds the physical plan once at
- * prepare and again at execution, so a single query contributes twice per producing join. Compare
- * it across runs or use it as a direction, never as the left side of an accounting identity.
+ * `producers_enabled` counts plan constructions, not executed producers: the transparent path
+ * builds the physical plan at prepare and again at execution, so one query contributes twice per
+ * producing join. Never use it in an accounting identity against the other counters.
  *
  * The key and filter counters record policy decisions for attempts that reach per-key processing. A
  * source-residency or all-targets-drained return occurs earlier and does not increment them.
  *
- * The publication and delivery counters may vary with probe-side draining and target lifetime. Each
- * atomic is coherent independently; `snapshot()` does not provide a transactionally consistent view
- * across fields.
- *
- * The delivery counters classify *build deliveries*, not joins, and they are disjoint but not
- * exhaustive. A delivery that claims the window goes on to either attempt publication or report its
- * source not resident. The first delivery of a wired join that cannot claim increments
- * `publications_skipped_build_not_whole`; that counter is latched, so the same join's later
- * non-claiming deliveries are counted nowhere, and neither is a delivery arriving after the window
- * has closed. Only the not-whole counter is latched -- the others can fire repeatedly for one join,
- * because a broadcast build delivers one batch per GPU.
+ * The delivery counters classify build deliveries, not joins, and are disjoint but not exhaustive:
+ * `publications_skipped_build_not_whole` is latched once per join, so a join's later non-claiming
+ * deliveries, and deliveries after the publication window closes, are counted nowhere.
  */
 struct dynamic_filter_stats {
   // Plan-time fact
@@ -111,8 +99,6 @@ struct dynamic_filter_stats {
 
   /**
    * @brief Read every counter with relaxed ordering
-   *
-   * @return A copyable, non-transactional snapshot
    */
   [[nodiscard]] dynamic_filter_stats_snapshot snapshot() const noexcept
   {

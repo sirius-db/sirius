@@ -229,8 +229,8 @@ TEST_CASE("ignore_columns drops pushes for the marked output columns", "[dynamic
   sirius_dynamic_filter_set set;
   set.ignore_columns({0});
 
-  REQUIRE_FALSE(set.push_filter(0, make_single_zone_filter(0, 100)));  // ignored
-  REQUIRE(set.push_filter(1, make_single_zone_filter(0, 100)));        // kept
+  REQUIRE_FALSE(set.push_filter(0, make_single_zone_filter(0, 100)));
+  REQUIRE(set.push_filter(1, make_single_zone_filter(0, 100)));
   REQUIRE(set.filtered_columns() == std::vector<std::size_t>{1});
 }
 

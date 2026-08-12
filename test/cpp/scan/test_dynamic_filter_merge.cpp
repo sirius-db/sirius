@@ -1102,7 +1102,6 @@ TEST_CASE("per-filter gate keeps a dead verdict when the channel grows",
   stream.synchronize();
   REQUIRE(out != nullptr);
 
-  // Measured against a one-filter cascade and found skippable.
   auto const measured = gate.filter_keep_ratio(useless.get(), filters.filter_count());
   REQUIRE(measured.has_value());
   REQUIRE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*measured));
@@ -1136,13 +1135,12 @@ TEST_CASE("per-filter gate excludes a dead filter from the re-armed apply withou
   REQUIRE(useless->mask_calls() == 1);
   REQUIRE_FALSE(gate.applicable(filters));
 
-  // A selective filter lands later: growth re-arms the scan-level gate for one measurement...
+  // Growth re-arms the scan-level gate; the dead verdict is permanent, so the re-armed apply
+  // runs only the newcomer.
   auto selective = make_in_list_prefix(2, stream);
   filters.push_filter(0, selective);
   REQUIRE(gate.applicable(filters));
 
-  // ...and the re-armed apply runs only the newcomer — the dead filter's verdict is permanent,
-  // so its mask kernel never runs again.
   auto out2 = sirius::op::scan::apply_dynamic_filters_gated_view(
     table->view(), filters, gate, stream, dynamic_filter_apply_mode::include_ast_row_masks);
   stream.synchronize();
@@ -1150,7 +1148,6 @@ TEST_CASE("per-filter gate excludes a dead filter from the re-armed apply withou
   REQUIRE(out2->num_rows() == 2);
   REQUIRE(useless->mask_calls() == 1);
 
-  // The dead verdict survives at the larger channel size; the newcomer measured selective.
   auto const useless_kept = gate.filter_keep_ratio(useless.get(), filters.filter_count());
   REQUIRE(useless_kept.has_value());
   REQUIRE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*useless_kept));
@@ -1177,7 +1174,6 @@ TEST_CASE("per-filter gate stales a selective verdict when the channel grows",
   REQUIRE(out != nullptr);
   REQUIRE(out->num_rows() == 2);
 
-  // Measured against a one-filter cascade and found selective: the verdict is live at this size.
   auto const measured = gate.filter_keep_ratio(selective.get(), filters.filter_count());
   REQUIRE(measured.has_value());
   REQUIRE_FALSE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*measured));

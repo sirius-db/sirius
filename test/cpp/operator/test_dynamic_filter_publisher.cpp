@@ -118,7 +118,6 @@ struct publisher_fixture {
   }
 };
 
-// Copy INT64 values into a device column.
 std::unique_ptr<cudf::column> make_int64_values(publisher_fixture const& fixture,
                                                 std::vector<std::int64_t> const& values)
 {
@@ -213,7 +212,6 @@ void require_published_membership(std::size_t rows)
   }
 }
 
-// Require a publication attempt with no considered keys, built filters, or active targets.
 void require_nothing_published(sirius::op::dynamic_filter_publication_outcome const& outcome)
 {
   REQUIRE(outcome.keys_considered == 0);
@@ -225,7 +223,6 @@ void require_nothing_published(sirius::op::dynamic_filter_publication_outcome co
   REQUIRE(outcome.filters_pushed == 0);
 }
 
-// Return a mutable host memory space for invalid-tier plan tests.
 cucascade::memory::memory_space& host_memory_space(publisher_fixture& fixture)
 {
   auto const host_spaces =
@@ -352,9 +349,8 @@ TEST_CASE("dynamic-filter publisher fans out sparsely: each target receives only
   REQUIRE(channel_b->filters_for_column(5).size() == 1);
   REQUIRE(channel_b->filters_for_column(3).empty());
 
-  // Verify key identity, not just placement: apply each published membership filter to a probe
-  // column holding one value from each build key's domain. Channel A must represent {0,1,2}
-  // (build column 1) and channel B {100,101,102} (build column 0).
+  // Verify key identity, not just placement: channel A must hold build column 1's domain
+  // ({0,1,2}) and channel B build column 0's ({100,101,102}).
   auto const probe = make_int64_values(fixture, {0, 100});
   REQUIRE(membership_mask(*channel_a->filters_for_column(3).front(), probe->view(), fixture) ==
           std::vector<std::uint8_t>{1, 0});
@@ -398,8 +394,8 @@ TEST_CASE("dynamic-filter publisher fails loudly on a plan/runtime key-mapping i
   }
   SECTION("recorded storage type disagreeing with the runtime build column skips the key")
   {
-    // Advisory data: the join stays authoritative, so a type-derivation disagreement skips the
-    // key and is counted rather than failing the query.
+    // The join stays authoritative, so a type-derivation disagreement is a counted skip, not
+    // a failure.
     auto key         = make_int64_key(0, 0);
     key.storage_type = cudf::data_type{cudf::type_id::INT32};
     auto const plan  = make_plan(key);
@@ -519,9 +515,7 @@ TEST_CASE("dynamic-filter publisher completes on a plan with targets but no admi
 TEST_CASE("dynamic-filter publisher publishes nothing from an empty build",
           "[dynamic_filter][publisher]")
 {
-  // An empty build carries no key values to construct from, and its join emits no rows whatever the
-  // probe side keeps, so nothing is built, replicated, or pushed. Zone maps are enabled here so the
-  // reduction path is skipped too.
+  // Zone maps are enabled so the empty build skips the range-reduction path too.
   publisher_fixture fixture;
   fixture.add_key_column(0);
 
@@ -695,7 +689,6 @@ TEST_CASE("dynamic-filter publish plan rejects invalid targets and bindings",
 TEST_CASE("dynamic-filter publish plan validates a mixed scan-plus-direct target set",
           "[dynamic_filter][publisher]")
 {
-  // The constructor validates direct-target invariants in the combined route set.
   publisher_fixture fixture;
   auto scan_channel   = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
   auto direct_channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
@@ -757,8 +750,8 @@ TEST_CASE("dynamic-filter publish plan validates a mixed scan-plus-direct target
 TEST_CASE("dynamic-filter publisher builds filters only for bound keys",
           "[dynamic_filter][publisher]")
 {
-  // Admission records legality beyond consumption, so a plan can carry an admitted key no target
-  // binds. Such a key must cost no filter construction and must not be counted as walked.
+  // A plan may carry an admitted key no target binds; such a key must cost no filter
+  // construction and must not be counted.
   constexpr std::size_t kBuildRows        = 3;
   constexpr std::size_t kBoundPushOrdinal = 5;
 
@@ -799,8 +792,7 @@ TEST_CASE("dynamic-filter publisher builds filters only for bound keys",
 TEST_CASE("dynamic-filter publish plan rejects unusable replica placements",
           "[dynamic_filter][publisher]")
 {
-  // A placement the publisher cannot allocate a replica in, or stage a transfer through, would
-  // otherwise surface as an allocation failure mid-publication rather than at plan construction.
+  // Unusable placements must fail at plan construction, not mid-publication as allocation errors.
   publisher_fixture fixture;
   auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
 

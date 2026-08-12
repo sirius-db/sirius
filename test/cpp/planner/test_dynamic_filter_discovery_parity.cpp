@@ -18,11 +18,9 @@
  * @file test_dynamic_filter_discovery_parity.cpp
  * @brief Compares Sirius scan-target discovery with DuckDB's join-filter pushdown walk.
  *
- * Each admissible equality key is compared by target table and output ordinal. Separate cases
- * cover conservative routes that Sirius rejects even though DuckDB accepts them. The DuckDB
- * oracle uses a pre-binding-resolver plan copy; Sirius converts the original optimized plan.
- * Derived-build widening is covered by the evidence, plan-shape, and integration suites rather
- * than this parity suite.
+ * The DuckDB oracle uses a pre-binding-resolver plan copy; Sirius converts the original
+ * optimized plan. Derived-build widening is covered by the evidence, plan-shape, and
+ * integration suites rather than this parity suite.
  */
 
 // Reaching a join operator through these headers instantiates `vector<join_condition>`'s
@@ -100,7 +98,6 @@ class scoped_temp_db_path {
   std::string _path;
 };
 
-// Enable dynamic filtering for one scope and restore the previous setting.
 class dynamic_filter_on_guard {
  public:
   explicit dynamic_filter_on_guard(Connection& con)
@@ -403,8 +400,6 @@ TEST_CASE_METHOD(discovery_parity_fixture,
                             "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid "
                             "WHERE r.other > 0");
 
-  // Oracle side: the single key reaches big_left; the expected push ordinal is the DuckDB-computed
-  // output position of l.id in that scan.
   auto joins = comparison_joins_of(*c.oracle_plan);
   REQUIRE(joins.size() == 1);
   auto const oracle = oracle_targets_for_join(*joins[0]);
@@ -412,7 +407,6 @@ TEST_CASE_METHOD(discovery_parity_fixture,
   REQUIRE(oracle[0].condition_index == 0);
   REQUIRE(oracle[0].table_name == "big_left");
 
-  // Sirius side: exactly that binding, at exactly that ordinal.
   auto physical_joins = hash_joins_of(c.physical.get());
   REQUIRE(physical_joins.size() == 1);
   auto const bindings = scan_bindings_of(*physical_joins[0], c.physical.get());
@@ -429,8 +423,6 @@ TEST_CASE_METHOD(discovery_parity_fixture,
   dynamic_filter_on_guard filter_on(*con);
   auto c = plan_parity_case(*con, "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid");
 
-  // Evidence parity: the Sirius mirror and DuckDB's IsFiltering agree the build child is
-  // unfiltered.
   auto joins = comparison_joins_of(*c.oracle_plan);
   REQUIRE(joins.size() == 1);
   REQUIRE_FALSE(sirius::planner::build_subtree_is_filtering(*joins[0]->children[1]));
@@ -505,13 +497,12 @@ TEST_CASE_METHOD(discovery_parity_fixture,
   auto joins = comparison_joins_of(*c.oracle_plan);
   REQUIRE(joins.size() == 1);
   auto const oracle = oracle_targets_for_join(*joins[0]);
-  REQUIRE(oracle.size() == 1);  // DuckDB descends through LOGICAL_LIMIT
+  REQUIRE(oracle.size() == 1);
   REQUIRE(oracle[0].table_name == "big_left");
 
   auto physical_joins = hash_joins_of(c.physical.get());
   REQUIRE(physical_joins.size() == 1);
-  REQUIRE(
-    scan_bindings_of(*physical_joins[0], c.physical.get()).empty());  // Sirius refuses at the LIMIT
+  REQUIRE(scan_bindings_of(*physical_joins[0], c.physical.get()).empty());
 }
 
 TEST_CASE_METHOD(discovery_parity_fixture,
@@ -526,13 +517,12 @@ TEST_CASE_METHOD(discovery_parity_fixture,
   auto joins = comparison_joins_of(*c.oracle_plan);
   REQUIRE(joins.size() == 1);
   auto const oracle = oracle_targets_for_join(*joins[0]);
-  REQUIRE(oracle.size() == 1);  // DuckDB descends through LOGICAL_TOP_N
+  REQUIRE(oracle.size() == 1);
   REQUIRE(oracle[0].table_name == "big_left");
 
   auto physical_joins = hash_joins_of(c.physical.get());
   REQUIRE(physical_joins.size() == 1);
-  REQUIRE(
-    scan_bindings_of(*physical_joins[0], c.physical.get()).empty());  // Sirius refuses at the TOP_N
+  REQUIRE(scan_bindings_of(*physical_joins[0], c.physical.get()).empty());
 }
 
 TEST_CASE_METHOD(discovery_parity_fixture,
@@ -548,7 +538,6 @@ TEST_CASE_METHOD(discovery_parity_fixture,
                             "RIGHT JOIN small_c c ON l.val = c.ckey) x "
                             "JOIN small_right r ON x.id = r.rid WHERE r.other > 0");
 
-  // Identify the producing and intervening joins before comparing their behavior.
   auto joins = comparison_joins_of(*c.oracle_plan);
   REQUIRE(joins.size() == 2);
   auto* producing   = joins[0];
@@ -558,7 +547,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
   REQUIRE(intervening->join_type == duckdb::JoinType::RIGHT);
 
   auto const oracle = oracle_targets_for_join(*producing);
-  REQUIRE(oracle.size() == 1);  // DuckDB descends the RIGHT join's children[0]
+  REQUIRE(oracle.size() == 1);
   REQUIRE(oracle[0].condition_index == 0);
   REQUIRE(oracle[0].table_name == "big_left");
 
@@ -584,13 +573,12 @@ TEST_CASE_METHOD(discovery_parity_fixture,
   auto joins = comparison_joins_of(*c.oracle_plan);
   REQUIRE(joins.size() == 1);
   auto const oracle = oracle_targets_for_join(*joins[0]);
-  REQUIRE(oracle.size() == 1);  // DuckDB reaches big_left through the cast
+  REQUIRE(oracle.size() == 1);
   REQUIRE(oracle[0].table_name == "big_left");
 
   auto physical_joins = hash_joins_of(c.physical.get());
   REQUIRE(physical_joins.size() == 1);
-  REQUIRE(scan_bindings_of(*physical_joins[0], c.physical.get())
-            .empty());  // Sirius refuses the cast crossing
+  REQUIRE(scan_bindings_of(*physical_joins[0], c.physical.get()).empty());
 }
 
 TEST_CASE_METHOD(discovery_parity_fixture,
@@ -604,7 +592,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
 
   auto joins = comparison_joins_of(*c.oracle_plan);
   REQUIRE(joins.size() == 1);
-  REQUIRE(oracle_targets_for_join(*joins[0]).empty());  // DuckDB bails at the computed expression
+  REQUIRE(oracle_targets_for_join(*joins[0]).empty());
 
   auto physical_joins = hash_joins_of(c.physical.get());
   REQUIRE(physical_joins.size() == 1);
@@ -658,7 +646,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
                  "[dynamic_filter][parity][isolated_context]")
 {
   // Q19-class shape: a predicate table filters cannot express keeps a FILTER between the join and
-  // the probe scan. The FILTER descent row exists precisely so this shape keeps its filter.
+  // the probe scan.
   dynamic_filter_on_guard filter_on(*con);
   auto c = plan_parity_case(*con,
                             "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid "
@@ -667,7 +655,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
   auto joins = comparison_joins_of(*c.oracle_plan);
   REQUIRE(joins.size() == 1);
   auto const oracle = oracle_targets_for_join(*joins[0]);
-  REQUIRE(oracle.size() == 1);  // DuckDB descends LOGICAL_FILTER
+  REQUIRE(oracle.size() == 1);
   REQUIRE(oracle[0].table_name == "big_left");
 
   auto physical_joins = hash_joins_of(c.physical.get());
@@ -684,8 +672,8 @@ TEST_CASE_METHOD(discovery_parity_fixture,
                  "[dynamic_filter][parity][isolated_context]")
 {
   // DuckDB walks all hinted columns jointly and abandons the whole branch when any column fails;
-  // Sirius walks per key. The per-key never-more contract still holds: the extra binding is one
-  // DuckDB itself makes for that key in isolation, which the per-key oracle verifies.
+  // Sirius walks per key. The extra binding is still one DuckDB itself makes for that key in
+  // isolation.
   dynamic_filter_on_guard filter_on(*con);
   auto c = plan_parity_case(*con,
                             "SELECT * FROM (SELECT id, val + 1 AS w FROM big_left) l "
@@ -695,7 +683,6 @@ TEST_CASE_METHOD(discovery_parity_fixture,
   // DuckDB's own joint walk found nothing: no filter_pushdown was attached to the original join.
   REQUIRE(c.original_join_had_pushdown == std::vector<bool>{false});
 
-  // The per-key oracle binds the clean key (condition 0, id) and refuses the computed one.
   auto joins = comparison_joins_of(*c.oracle_plan);
   REQUIRE(joins.size() == 1);
   auto const oracle = oracle_targets_for_join(*joins[0]);
@@ -703,7 +690,6 @@ TEST_CASE_METHOD(discovery_parity_fixture,
   REQUIRE(oracle[0].condition_index == 0);
   REQUIRE(oracle[0].table_name == "big_left");
 
-  // Sirius binds exactly the clean key at the oracle's ordinal.
   auto physical_joins = hash_joins_of(c.physical.get());
   REQUIRE(physical_joins.size() == 1);
   auto const bindings = scan_bindings_of(*physical_joins[0], c.physical.get());
@@ -743,8 +729,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
 
   SECTION("a LEFT producer refuses on both sides")
   {
-    // LEFT keeps every probe row, so a probe-side membership filter would change results. DuckDB
-    // returns early from GenerateJoinFilters; Sirius's join-type gate refuses the bind.
+    // LEFT keeps every probe row, so a probe-side membership filter would change results.
     auto c = plan_parity_case(*con,
                               "SELECT * FROM big_left l LEFT JOIN "
                               "(SELECT * FROM small_right WHERE other > 0) r ON l.id = r.rid");
@@ -799,8 +784,8 @@ TEST_CASE_METHOD(discovery_parity_fixture,
   SECTION("an ANTI producer refuses on both sides")
   {
     // ANTI keeps exactly the probe rows without a build match -- the rows a probe-side membership
-    // filter would remove. DuckDB returns early from GenerateJoinFilters; Sirius's join-type gate
-    // refuses the bind. Explicit ANTI JOIN produces the bare comparison join needed by this case.
+    // filter would remove. Explicit ANTI JOIN produces the bare comparison join needed by this
+    // case.
     auto c = plan_parity_case(*con,
                               "SELECT * FROM big_left l ANTI JOIN "
                               "(SELECT * FROM small_right WHERE other > 0) r ON l.id = r.rid");
@@ -817,10 +802,8 @@ TEST_CASE_METHOD(discovery_parity_fixture,
 
   SECTION("an ANTI producer with a derived build still refuses on both sides")
   {
-    // A derived build does not soften the join-type gate: a membership filter keeps exactly the
-    // probe rows an ANTI join discards, and a CTE reference has no enclosing join that could
-    // re-check the removed rows. A materialized CTE build arms discovery with derived evidence, so
-    // this pins the refusal to the join type rather than to missing evidence.
+    // A materialized CTE build arms discovery with derived evidence, so this pins the refusal to
+    // the join type rather than to missing evidence.
     auto c = plan_parity_case(*con,
                               "WITH c AS MATERIALIZED "
                               "(SELECT rid FROM small_right WHERE other > 0) "
@@ -830,7 +813,6 @@ TEST_CASE_METHOD(discovery_parity_fixture,
     auto joins = comparison_joins_of(*c.oracle_plan);
     REQUIRE(joins.size() == 1);
     REQUIRE(joins[0]->join_type == duckdb::JoinType::ANTI);
-    // The build is a bare CTE reference: derived, and the only evidence available.
     REQUIRE(sirius::planner::build_relation_is_derived(*joins[0]->children[1]));
     REQUIRE_FALSE(sirius::planner::build_subtree_is_filtering(*joins[0]->children[1]));
 
@@ -844,7 +826,6 @@ TEST_CASE_METHOD(discovery_parity_fixture,
                  "discovery parity - the adapter oracle agrees with the per-key walk",
                  "[dynamic_filter][parity][isolated_context]")
 {
-  // Cross-check the test-only metadata adapter against the independent per-key DuckDB walk.
   dynamic_filter_on_guard filter_on(*con);
   auto original = optimize_query(*con,
                                  "SELECT * FROM big_left l "

@@ -39,9 +39,6 @@ namespace sirius::op::detail {
  *
  * The reservation-aware allocator tracks each allocation at CUDA's allocation alignment. Callers
  * with multiple allocations must align each allocation separately before summing them.
- *
- * @param[in] allocation_bytes Size of a single RMM allocation, in bytes
- * @return `allocation_bytes` rounded up to CUDA's allocation alignment
  */
 [[nodiscard]] inline std::size_t tracked_replica_allocation_bytes(
   std::size_t allocation_bytes) noexcept
@@ -69,8 +66,6 @@ class scoped_replica_reservation final {
    *
    * @throw std::invalid_argument if @p bytes is zero
    * @throw std::logic_error if @p target has no GPU reservation-aware allocator
-   * @param[in] target Destination replica space whose GPU memory space admits the reservation
-   * @param[in] bytes Number of bytes to reserve
    * @param[in] stream Stream the reservation is attached to
    * @return An attached scope, or `std::nullopt` when the destination reservation limit cannot
    * admit the request or the selected execution context already tracks another reservation
@@ -118,8 +113,6 @@ class scoped_replica_reservation final {
 
   /**
    * @brief The destination allocator backed by the attached reservation
-   *
-   * @return The reservation-aware device allocator
    */
   [[nodiscard]] rmm::device_async_resource_ref allocator() const noexcept
   {

@@ -47,9 +47,8 @@ namespace sirius::planner {
  *
  * Answers the unfiltered row count of the scanned base table as an exact figure or a true upper
  * bound, never an estimate that may under-state the domain. Answers `std::nullopt` when the scan
- * cannot vouch for such a figure; the walk then reports 0 for that key and the coverage gate stays
- * off. The production source converts callback failures to `std::nullopt`; exceptions from a
- * caller-supplied source propagate.
+ * cannot vouch for such a figure. The production source converts callback failures to
+ * `std::nullopt`; exceptions from a caller-supplied source propagate.
  */
 template <class Source>
 concept base_table_cardinality_source =
@@ -57,7 +56,7 @@ concept base_table_cardinality_source =
   std::same_as<std::invoke_result_t<Source const&, duckdb::LogicalGet const&>,
                std::optional<std::size_t>>;
 
-// Internal implementation for the overload that accepts a caller-supplied cardinality source.
+// Implementation details of build_key_domain_cardinalities.
 namespace detail {
 
 /**
@@ -66,11 +65,10 @@ namespace detail {
  * Follows the ordinal down through operators that (a) produce it by value-preserving pass-through
  * and (b) emit rows that are an injective image of the traced child's rows. Refuses -- returns
  * null -- at every other operator, at a computed expression, and at a scan that is not a plain
- * base-table scan. Refusal is the only failure mode; the walk neither throws nor logs.
+ * base-table scan. Refusal is the only failure mode.
  *
  * @param[in] subtree Root of the logical subtree the ordinal is an output of
  * @param[in] output_ordinal Position in `subtree.types`
- * @return The producing base scan, or null
  */
 [[nodiscard]] duckdb::LogicalGet const* resolve_pass_through_scan(
   duckdb::LogicalOperator const& subtree, std::size_t output_ordinal) noexcept;
@@ -81,9 +79,8 @@ namespace detail {
  * Entry `i` is null unless `join.conditions[i].right` is a plain bound reference that
  * @ref resolve_pass_through_scan resolves through `join.children[1]`.
  *
- * The tree must have been through `ResolveOperatorTypes` and `ColumnBindingResolver` (true for
- * every tree `sirius_physical_plan_generator` sees), and the call must precede `create_plan`,
- * which moves data out of `join.children`.
+ * The tree must have been through `ResolveOperatorTypes` and `ColumnBindingResolver`, and the
+ * call must precede `create_plan`, which moves data out of `join.children`.
  *
  * @param[in] join The producing join, with both logical children still intact
  * @return One scan pointer per condition, in original planner condition order
@@ -96,13 +93,10 @@ namespace detail {
 /**
  * @brief Unfiltered base-table cardinality behind each build key; 0 = not established
  *
- * The value `admit_dynamic_filter_keys` records on each admitted key as
- * `build_key_domain_cardinality`. The source is consulted once per distinct resolved scan, not
- * once per key. The result owns its values and remains valid after `create_plan()` moves state out
- * of the logical children.
+ * The source is consulted once per distinct resolved scan, not once per key. The result owns its
+ * values and remains valid after `create_plan()` moves state out of the logical children.
  *
  * @param[in] join The producing join, with both logical children still intact
- * @param[in] evidence_for The domain-evidence source; see @ref base_table_cardinality_source
  * @return One cardinality per condition, in original planner condition order
  */
 template <base_table_cardinality_source Source>
@@ -139,9 +133,6 @@ class duckdb_base_table_cardinality {
 
   /**
    * @brief The scanned base table's unfiltered row upper bound, or `std::nullopt` when refused
-   *
-   * @param[in] get The resolved base scan
-   * @return The row count, or `std::nullopt` for any scan that is not a DuckDB-native table scan
    */
   [[nodiscard]] std::optional<std::size_t> operator()(duckdb::LogicalGet const& get) const noexcept;
 

@@ -125,8 +125,7 @@ TEST_CASE("admission reads build and probe ordinals from their own sides, not th
   REQUIRE(admitted[0].build_key_ordinal == 4);
   REQUIRE(admitted[1].planner_condition_index == 1);
   REQUIRE(admitted[1].build_key_ordinal == 7);
-  // The probe ordinal is read from the probe (left) side, never the build side: keys[0] is
-  // condition 0 (probe 9), keys[1] is condition 1 (probe 3).
+  // The probe ordinal is read from the probe (left) side, never the build side.
   REQUIRE(admitted[0].probe_key_ordinal == 9);
   REQUIRE(admitted[1].probe_key_ordinal == 3);
 }
@@ -148,8 +147,7 @@ TEST_CASE("admission records each side's own storage type", "[dynamic_filter][ke
   REQUIRE(admitted[0].storage_type == kInt32);
   REQUIRE(admitted[1].storage_type == kInt64);
   REQUIRE(admitted[2].storage_type == cudf::data_type{cudf::type_id::TIMESTAMP_DAYS});
-  // The probe type is recorded beside the build type; `direct_route_admissible` compares the two,
-  // so substituting the build type for both would make that comparison vacuous.
+  // Each side records its own type; `direct_route_admissible` compares the two.
   REQUIRE(admitted[0].probe_storage_type == kInt32);
   REQUIRE(admitted[1].probe_storage_type == kInt64);
   REQUIRE(admitted[2].probe_storage_type == cudf::data_type{cudf::type_id::TIMESTAMP_DAYS});
@@ -157,10 +155,8 @@ TEST_CASE("admission records each side's own storage type", "[dynamic_filter][ke
 
 TEST_CASE("admission requires a probe-side bound reference", "[dynamic_filter][key_admission]")
 {
-  // Every use of an admitted key starts a discovery trace at its probe ordinal, so a condition
-  // without a probe-side reference admits no key: there is no entry ordinal to trace from, and
-  // such a key could never produce a filter on any route. (A cast probe side over a direct build
-  // side reaches admission when only the expression -- not the carried shape -- differs.)
+  // Discovery traces start at the key's probe ordinal, so a condition without a probe-side
+  // reference admits no key. (The carried shape stays direct so only the expression differs.)
   duckdb::vector<duckdb::JoinCondition> raw;
   raw.push_back(make_condition(
     duckdb::BoundCastExpression::AddDefaultCastToType(make_ref(0), duckdb::LogicalType::BIGINT),
@@ -268,8 +264,6 @@ TEST_CASE("admission never admits an inequality condition", "[dynamic_filter][ke
 
 TEST_CASE("admission never admits a null-equal condition", "[dynamic_filter][key_admission]")
 {
-  // Pruning a LEFT join's build input is unsafe for null-equal conditions because it can add
-  // NULL-padded rows that the producing join would otherwise match.
   duckdb::vector<duckdb::JoinCondition> raw;
   raw.push_back(
     make_condition(make_ref(0), make_ref(0), duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM));
@@ -303,7 +297,6 @@ TEST_CASE("admission re-emits domain cardinalities in admitted order",
   std::vector<std::size_t> const condition_domains{10, 20, 30};
 
   auto const admitted = admit_dynamic_filter_keys(conditions, shapes, condition_domains);
-  // Recorded on each key rather than in a parallel array, so it cannot drift out of alignment.
   REQUIRE(admitted.size() == 3);
   REQUIRE(admitted[0].build_key_domain_cardinality == 10);
   REQUIRE(admitted[1].build_key_domain_cardinality == 20);
@@ -328,8 +321,7 @@ TEST_CASE("admission records zero domains from an empty domain vector",
 TEST_CASE("admission marks only the key whose build ordinal is the proven-unique column",
           "[dynamic_filter][key_admission]")
 {
-  // Build ordinals 4 and 7; the planner proved ordinal 7 unique. Only that key arms the gate --
-  // and passing no proof arms nothing.
+  // Build ordinals 4 and 7; the planner proved ordinal 7 unique.
   auto const conditions = make_wrapped_equalities_at({{9, 4}, {3, 7}});
   std::vector<dynamic_filter_condition_shape> const shapes(2, kDirectDirect);
 
@@ -396,7 +388,7 @@ TEST_CASE("join-edge route accepts only direct matching INT32/INT64 equality key
       direct_route_admissible(duckdb::JoinType::INNER, equal, build_computed, kInt32, kInt32));
 
     // The scan route keeps admitting the same computed shapes (materialized keys are
-    // value-correct); assert both variants so the scopes cannot silently converge.
+    // value-correct).
     auto const conditions = make_wrapped_equalities(2);
     std::vector<dynamic_filter_condition_shape> const shapes{probe_computed, build_computed};
     auto const admitted = admit_dynamic_filter_keys(conditions, shapes, {});
@@ -460,8 +452,7 @@ TEST_CASE("publish plan rejects inconsistent admitted-key metadata",
   }
   SECTION("equality is differential over every field")
   {
-    // A structured binding fails to compile if a field is added without extending this section,
-    // so the check cannot silently fall behind the struct.
+    // The structured binding fails to compile if a field is added without extending this section.
     auto const& [planner_condition_index,
                  build_key_ordinal,
                  probe_key_ordinal,

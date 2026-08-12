@@ -592,19 +592,18 @@ TEST_CASE("yaml reader error messages include context", "[config_opt][errors]")
 TEST_CASE("the domain-coverage threshold is validated where it enters the engine",
           "[config_opt][conditional][dynamic_filter]")
 {
-  // YAML and SQL configuration share this ingress validator; publication plans transport the
-  // validated value without repeating the check.
+  // YAML and SQL configuration share this ingress validator.
   config::valid_domain_coverage_threshold const accepts;
 
   REQUIRE(accepts(0.9));
   REQUIRE(accepts(1.5));  // values above 1.0 disable the gate
 
-  REQUIRE_FALSE(accepts(0.0));   // would suppress every filter
-  REQUIRE_FALSE(accepts(-0.5));  // likewise, and nonsensical as a coverage fraction
-  REQUIRE_FALSE(accepts(std::numeric_limits<double>::quiet_NaN()));  // would disable the gate
+  REQUIRE_FALSE(accepts(0.0));  // would suppress every filter
+  REQUIRE_FALSE(accepts(-0.5));
+  REQUIRE_FALSE(accepts(std::numeric_limits<double>::quiet_NaN()));
   REQUIRE_FALSE(accepts(std::numeric_limits<double>::infinity()));
 
-  // The YAML surface rejects the same values the SQL surface rejects, and leaves the default.
+  // On rejection the YAML surface throws and leaves the default untouched.
   auto node    = YAML::Load("dynamic_filter_domain_coverage_threshold: 0");
   double value = 0.9;
   yaml::reader r(node);

@@ -96,10 +96,8 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
 
   auto const& admitted_keys = plan.admitted_keys();
 
-  // Publication constructs a filter only for a key some target binds. Admission records legality
-  // beyond consumption -- a legal key for which the discovery walk bound no target (scan or
-  // join-edge) stays in the array as a fact -- and such a key must cost no filter construction.
-  // Binding indexes are constructor-validated, so no bounds check is needed here.
+  // Admission records legality, not consumption: an admitted key may have no binding, and such a
+  // key must cost no filter construction. Binding indexes are constructor-validated.
   std::vector<char> key_bound(admitted_keys.size(), 0);
   for (auto const& target : probe_targets) {
     for (auto const& binding : target.key_bindings) {
@@ -127,12 +125,9 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
   auto const build_rows    = static_cast<std::size_t>(build_view.num_rows());
   auto const l2_bytes      = device_l2_cache_bytes(plan.replica_spaces());
 
-  // Build up to two complementary filters per admitted key:
-  //  1) a zone-map (read-time ROW-GROUP pruning, the only path that cuts scan I/O)
-  //  2) a post-decode membership filter: linear-scan IN-list for a tiny build, otherwise a
-  //     hash-set IN-list or Bloom filter chosen by L2-cache fit.
-  // The two ride different consumer paths and compose; either may be absent for a key. All three
-  // vectors are indexed by admitted-key index.
+  // Up to two complementary filters per key: a zone map (read-time row-group pruning) and a
+  // post-decode membership filter; either may be absent. All three vectors are indexed by
+  // admitted-key index.
   std::vector<std::shared_ptr<sirius_dynamic_filter>> per_key_zone_map(admitted_keys.size());
   std::vector<std::shared_ptr<sirius_dynamic_filter>> per_key_membership(admitted_keys.size());
   std::vector<cudf::data_type> per_key_build_type(admitted_keys.size(),
@@ -144,8 +139,6 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
     ++outcome.keys_considered;
     auto const& admitted_key = admitted_keys[admitted_key_index];
 
-    // Skip domain-covering keys before paying to build a membership structure; their filters keep
-    // most probe rows, and the consumer-side gate remains the runtime backstop.
     auto const key_domain = admitted_key.build_key_domain_cardinality;
     if (key_domain > 0) {
       ++outcome.keys_with_known_domain;
@@ -166,8 +159,6 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
       continue;
     }
 
-    // An out-of-range ordinal is a plan invariant failure. A type mismatch remains an advisory
-    // per-key skip because the authoritative join still checks the result.
     if (admitted_key.build_key_ordinal >= build_view.num_columns()) {
       throw std::logic_error(
         "[publish_dynamic_filters] An admitted key's build ordinal lies outside the runtime build "
@@ -175,9 +166,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
     }
     auto const& col = build_view.column(admitted_key.build_key_ordinal);
     if (col.type() != admitted_key.storage_type) {
-      // Plan-time and runtime type derivation disagree. Skip the key rather than fail the query:
-      // dynamic filters are advisory, the join remains authoritative, and this check cannot
-      // detect the wrong-column case that would actually remove valid rows.
+      // Advisory skip rather than a query failure: the join remains authoritative.
       SIRIUS_LOG_WARN(
         "[sirius_physical_hash_join] dynamic filter key {}: skipped (plan recorded type id {} but "
         "build column {} carries type id {}).",
@@ -190,7 +179,6 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
     }
     per_key_build_type[admitted_key_index] = col.type();
 
-    // Zone maps can prune Parquet row groups or apply as row masks on native scans.
     if (plan.emit_zone_map_filters()) {
       nvtx3::scoped_range vr{"dynfilter::build_zone_map"};
       auto min_s = cudf::reduce(col,
@@ -204,8 +192,6 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
                                 stream,
                                 allocator_ref);
       if (min_s && max_s && min_s->is_valid(stream) && max_s->is_valid(stream)) {
-        // Publish one zone map for every valid min/max reduction. The range gate is inactive
-        // because no value-range domain is available.
         std::vector<sirius::op::zone_map_entry> zones;
         zones.push_back({std::move(min_s), std::move(max_s)});
         per_key_zone_map[admitted_key_index] =
@@ -214,10 +200,6 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
       }
     }
 
-    // Membership filters apply after decode. choose_membership_filter() prefers
-    // sirius_dynamic_small_in_list_filter for a supported small build,
-    // sirius_dynamic_in_list_filter when its set fits L2, and sirius_dynamic_bloom_filter for the
-    // remaining supported keys. It returns none when no representation supports the key.
     auto const set_bytes =
       sirius::op::sirius_dynamic_in_list_filter::estimated_set_bytes(build_rows, col.type());
     auto const bloom_bytes = sirius::op::sirius_dynamic_bloom_filter::estimated_bytes(build_rows);
@@ -277,9 +259,8 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
       std::any_of(per_key_zone_map.begin(), per_key_zone_map.end(), built)) {
     stream.synchronize();
 
-    // Build each structure only on the producer. Remote GPUs receive raw needles, finished
-    // static-set slots, Bloom words, or exact zone bounds. Replication completes before the filter
-    // is published, so consumers never wait and never observe a cross-device pointer.
+    // Replication completes before any filter is published, so consumers never wait and never
+    // observe a cross-device pointer.
     nvtx3::scoped_range replicate_range{"dynfilter::replicate_devices"};
     auto replicate = [&plan](std::shared_ptr<sirius_dynamic_filter> const& filter) {
       if (!filter) { return; }

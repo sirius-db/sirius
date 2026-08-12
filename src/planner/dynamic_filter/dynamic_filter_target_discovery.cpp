@@ -69,7 +69,7 @@ bool build_block_is_value_preserving(duckdb::JoinType join_type) noexcept
     case duckdb::JoinType::RIGHT_ANTI:
     case duckdb::JoinType::INVALID: return false;
   }
-  return false;  // unreachable;
+  return false;  // unreachable
 }
 
 std::vector<descent_step> as_steps(std::optional<descent_step> step)
@@ -158,8 +158,6 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
       return {descent_step{.child_index   = 0,
                            .child_ordinal = static_cast<std::size_t>((*gather)[output_ordinal])}};
     }
-    // A physical union's output is positionally aligned with every child by construction, so the
-    // trace fans out into each child at the same ordinal.
     case SiriusPhysicalOperatorType::UNION: {
       std::vector<descent_step> steps;
       steps.reserve(node.children.size());
@@ -169,8 +167,6 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
       }
       return steps;
     }
-    // A row mask passes every column through unchanged and commutes with any other row filter, so a
-    // later key's endpoint may descend past an earlier key's rather than stopping on it.
     case SiriusPhysicalOperatorType::DYNAMIC_FILTER:
       return {descent_step{.child_index = 0, .child_ordinal = output_ordinal}};
     case SiriusPhysicalOperatorType::INVALID:
@@ -327,7 +323,6 @@ endpoint_placement place_endpoint(duckdb::unique_ptr<sirius::op::sirius_physical
     result.subtree = std::move(subtree);
     return result;
   }
-  // Deepest safe site: the endpoint becomes this operator's new parent.
   auto endpoint = make_endpoint(*subtree);
   endpoint->children.push_back(std::move(subtree));
   return endpoint_placement{.subtree = std::move(endpoint), .site_ordinals = {a0}};

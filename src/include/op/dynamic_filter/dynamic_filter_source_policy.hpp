@@ -42,8 +42,7 @@ enum class membership_filter_kind : std::uint8_t {
 /**
  * @brief Everything the representation choice depends on
  *
- * Contains the cache budget, size estimate, and capability flags passed to
- * `choose_membership_filter()`. The small-list capability also incorporates its row-count limit.
+ * The small-list capability already incorporates its row-count limit.
  */
 struct membership_choice_inputs {
   std::size_t build_rows               = 0;
@@ -57,10 +56,6 @@ struct membership_choice_inputs {
 /**
  * @brief Choose a key's membership representation
  *
- * The function selects the small exact list when supported, otherwise the exact hash set when its
- * footprint fits the smallest probe GPU's L2 cache, otherwise a Bloom filter when supported.
- *
- * @param[in] inputs Cache budget, size estimate, and per-kind capability answers
  * @return The representation to construct, or `membership_filter_kind::none`
  */
 [[nodiscard]] constexpr membership_filter_kind choose_membership_filter(
@@ -79,8 +74,7 @@ struct membership_choice_inputs {
  * @brief Whether a build is too dense a sample of its key domain for a filter to repay itself
  *
  * The ratio is valid only for a key proven unique in its base relation; otherwise row count does
- * not equal distinct-key count. An unknown domain, an unproven key, or a threshold above 1.0
- * disables the gate.
+ * not equal distinct-key count.
  *
  * @param[in] build_rows Rows in the completed build
  * @param[in] domain_cardinality Unfiltered row upper bound of the base table the key traces to; 0
@@ -105,10 +99,9 @@ struct membership_choice_inputs {
 /**
  * @brief The zone-map analogue of @ref domain_coverage_gate_fires
  *
- * A `[min, max]` bound spanning most of the key domain prunes no row group.
- *
- * The publisher has no base-column value-range domain and does not call this function. A row-count
- * domain cannot substitute for a value span. A 0 domain disables the gate.
+ * A `[min, max]` bound spanning most of the key domain prunes no row group. The gate requires a
+ * value-range domain (a row-count domain cannot substitute), which the publisher does not yet
+ * have, so this function is currently uncalled.
  *
  * @param[in] min_value Lowest build key value
  * @param[in] max_value Highest build key value

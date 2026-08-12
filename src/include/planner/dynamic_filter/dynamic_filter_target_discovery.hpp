@@ -76,10 +76,8 @@ struct route_terminal {
 /**
  * @brief Result of splicing endpoints into a subtree
  *
- * `subtree` owns the complete rewrapped subtree. `site_ordinals` holds one entry per spliced site,
- * in the same deterministic pre-order (ascending child index) the walk visits terminals, so a
- * caller minting one channel per `endpoint_factory` invocation can zip its mints with these
- * ordinals. Every plan without a physical set operation has exactly one site.
+ * `site_ordinals` holds one entry per spliced site, in the same pre-order (ascending child index)
+ * `trace_probe_key()` visits terminals.
  */
 struct endpoint_placement {
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>
@@ -101,7 +99,6 @@ struct endpoint_placement {
  * @brief Resolve the input column forwarded by a group-by output
  *
  * @param[in] group_idx Input column for each grouping-key output
- * @param[in] grouping_set_count Number of grouping sets
  * @param[in] output_ordinal The traced ordinal in the aggregate's output space
  * @return The input column, or `std::nullopt` when the ordinal is not a key of a single grouping
  * set
@@ -113,15 +110,11 @@ struct endpoint_placement {
 /**
  * @brief Resolve the join child that supplies one output column
  *
- * The probe block is pure mechanism; the build block is additionally gated on
- * `descent_policy::descend_build_blocks`, because a build-block hop is the SIP capability rather
- * than a property of the join's output layout.
+ * Build-block descent is additionally gated on `descent_policy::descend_build_blocks`.
  *
- * @param[in] join_type Join type whose output is being traced
  * @param[in] probe_block_output_columns Probe-child columns emitted by the join
  * @param[in] build_block_output_columns Build-child columns emitted by the join
  * @param[in] output_ordinal The traced ordinal in the join's output space
- * @param[in] policy Which hops the walking producer may take
  * @return The child and its corresponding ordinal, or `std::nullopt` when the join output cannot be
  * traced safely
  */
@@ -139,9 +132,7 @@ struct endpoint_placement {
  * one is a set-operation fan-out (a physical UNION's output is positionally aligned with every
  * child, so each step carries the same ordinal). Steps are ordered by ascending child index.
  *
- * @param[in] node The operator to descend through
  * @param[in] output_ordinal The traced ordinal in @p node's output space
- * @param[in] policy Which hops the walking producer may take
  * @return The accepted child steps; empty when the trace terminates at @p node
  */
 [[nodiscard]] std::vector<descent_step> descent_steps(
@@ -154,13 +145,10 @@ struct endpoint_placement {
  *
  * Follows `descent_steps()` pre-order with ascending child index and returns one terminal per
  * reached branch; no plan without a physical set operation produces more than one. The walk
- * mutates nothing and transfers no ownership; terminal node pointers are borrowed from the walked
- * subtree.
+ * mutates nothing and transfers no ownership.
  *
- * @param[in] root The probe subtree to trace
  * @param[in] a0 The traced key ordinal in @p root's output space (the producing join's probe-child
  * entry ordinal)
- * @param[in] policy Which hops this producer may take
  * @return The terminal node and exit ordinal of every reached branch
  */
 [[nodiscard]] std::vector<route_terminal> trace_probe_key(
@@ -169,13 +157,10 @@ struct endpoint_placement {
 /**
  * @brief Whether a producing join of type @p t may bind a key INTO a probe-side scan
  *
- * Mirrors the early-return gate of DuckDB's `JoinFilterPushdownOptimizer::GenerateJoinFilters`,
- * which generates scan filters only for INNER, RIGHT, and SEMI producers. The other types preserve
- * or negate unmatched probe rows, so pre-filtering the probe by build-key membership would change
- * results. RIGHT is sound even though it is not direct-route admissible: a RIGHT join keeps every
- * BUILD row and drops probe rows that match nothing, so removing probe rows whose key is outside
- * the build-key set removes only rows the join was going to drop -- the NULL-padded rows a RIGHT
- * join fabricates come from unmatched BUILD rows, which a probe-side filter cannot touch.
+ * Matches the gate of DuckDB's `JoinFilterPushdownOptimizer::GenerateJoinFilters`: the other join
+ * types preserve or negate unmatched probe rows, so pre-filtering the probe by build-key
+ * membership would change results. RIGHT is sound because its NULL-padded rows come from unmatched
+ * BUILD rows, which a probe-side filter cannot touch.
  */
 [[nodiscard]] constexpr bool scan_route_join_type_admissible(duckdb::JoinType t) noexcept
 {
@@ -199,9 +184,7 @@ using endpoint_factory = std::function<duckdb::unique_ptr<sirius::op::sirius_phy
  * Starting with @p a0 in @p subtree's output space, the function follows `descent_steps()` until
  * an operator refuses the trace, then inserts an endpoint immediately above that operator. If the
  * root refuses, the endpoint wraps the root. A fan-out step splices one endpoint per reached
- * branch. The factory has no scan knowledge, so a caller that scan-binds any branch of a key must
- * not call this for that key. On mixed branches, unbound branches therefore receive no direct
- * endpoint.
+ * branch. A caller that scan-binds any branch of a key must not call this for that key.
  *
  * Existing `sirius_physical_dynamic_filter` operators are transparent to the trace, so placing one
  * key does not prevent later keys from reaching the same depth.
@@ -212,8 +195,6 @@ using endpoint_factory = std::function<duckdb::unique_ptr<sirius::op::sirius_phy
  *
  * @param[in] subtree Probe subtree whose ownership transfers to the result
  * @param[in] a0 The traced key ordinal in @p subtree's output space
- * @param[in] policy Which hops this producer may take
- * @param[in] make_endpoint Factory for the endpoint operator(s)
  * @return The rewrapped subtree and the traced ordinal at each spliced site
  */
 [[nodiscard]] endpoint_placement place_endpoint(

@@ -15,13 +15,11 @@
  */
 
 /*
- * Unit tests for the build-port claim condition in
- * `sirius_physical_hash_join::push_data_batch_partitioned`.
- *
- * The one-shot publisher may only claim a build batch that carries the whole build side. The
- * upstream PARTITION reports that at sizing time through `set_build_arrives_whole`, and the join
- * mode is not part of the condition. These tests drive the build port directly, so they pin the
- * claim condition itself rather than any partitioning decision that leads to it.
+ * Tests the build-port claim condition in
+ * `sirius_physical_hash_join::push_data_batch_partitioned`: the one-shot publisher may claim only
+ * a build batch carrying the whole build side, as reported through `set_build_arrives_whole`; the
+ * join mode is not part of the condition. The tests drive the build port directly, pinning the
+ * claim condition rather than any partitioning decision.
  */
 
 #include "expression/join_condition.hpp"
@@ -149,9 +147,8 @@ struct claim_fixture {
       if (child) { child->operator_id = next_id++; }
     }
 
-    // The ports the converter would normally materialize. Their repositories stay null: the base
-    // push treats a null repo as "nowhere to route", which is all these tests need -- the
-    // publication hook runs before routing and reads only the batch.
+    // Ports the converter would normally materialize. Repositories stay null ("nowhere to
+    // route"); publication claims and reads only the batch, independent of routing.
     for (auto const port_id : {std::string_view{"build"}, std::string_view{"default"}}) {
       auto port  = std::make_unique<sirius::op::sirius_physical_operator::port>();
       port->type = sirius::op::MemoryBarrierType::FULL;
@@ -185,8 +182,6 @@ struct claim_fixture {
 TEST_CASE("hash join claims a whole build for publication in any join mode",
           "[dynamic_filter][publication_claim][gpu_execution]")
 {
-  // The claim condition reads `_build_arrives_whole`, not the join mode: a single-partition
-  // STANDARD build publishes on the same terms as BUILD_PROBE.
   claim_fixture fixture;
   REQUIRE_FALSE(fixture.hash_join->is_build_probe_mode());
 
@@ -204,8 +199,7 @@ TEST_CASE("hash join in BUILD_PROBE mode still publishes from a whole build",
 {
   claim_fixture fixture;
 
-  // Sizing from a small foldable build side selects BUILD_PROBE, the shape that published before
-  // the claim condition became mode-agnostic.
+  // Sizing from a small foldable build side selects BUILD_PROBE.
   auto const strategy =
     fixture.hash_join->get_partition_strategy(sirius::op::partition_sizing_input{
       .total_bytes = 1024, .is_build_side = true, .build_foldable = true});

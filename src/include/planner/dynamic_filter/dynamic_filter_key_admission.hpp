@@ -52,7 +52,6 @@ namespace sirius::planner {
  * expression -- is computed.
  *
  * @param[in] key_side One side of a join condition, before computed-key materialization
- * @return The side's shape
  */
 [[nodiscard]] op::dynamic_filter_key_shape classify_key_side(duckdb::Expression const& key_side);
 
@@ -73,27 +72,19 @@ namespace sirius::planner {
  *
  * A key is admitted when its condition uses `sirius::comparison_type::equal`, neither carried side
  * shape is a cast, both materialized sides are bound references, and cuDF can represent the build
- * type. Computed keys remain eligible after materialization. Conditions are considered in planner
- * order, so the returned vector's order is deterministic.
- *
- * Every use of an admitted key begins a discovery trace at `admitted_key::probe_key_ordinal`, so a
- * condition whose probe side is not a bound reference admits no key -- there is no real entry
- * ordinal to trace from, and such a key could never produce a filter on any route.
+ * type. Computed keys remain eligible after materialization.
  *
  * @throw std::invalid_argument if `condition_shapes` or a non-empty
  * `condition_domain_cardinalities` is not aligned one-to-one with `conditions`
  *
- * @param[in] conditions The wrapped join conditions in original planner order
- * (post-materialization; wrapping preserves that order)
+ * @param[in] conditions The wrapped join conditions in original planner order, post-materialization
  * @param[in] condition_shapes Carried pre-materialization classification, aligned with `conditions`
  * @param[in] condition_domain_cardinalities Per condition index, the base-table row bound used as
- * the coverage denominator (0 = unknown); empty when no evidence exists. Recorded on each admitted
- * key, so the result carries no parallel array.
- * @param[in] build_side_unique_column The build child's sole proven-unique output ordinal, when
- * the planner's proven-unique column set is exactly one column; empty otherwise -- a composite
- * uniqueness proof bounds distinct tuples, not distinct values of one column, and must not arm
- * any key's coverage gate. An admitted key whose build ordinal equals this value is marked
- * `build_key_proven_unique`.
+ * the coverage denominator (0 = unknown); empty when no evidence exists
+ * @param[in] build_side_unique_column The build child's sole proven-unique output ordinal; empty
+ * unless exactly one column is proven unique -- a composite uniqueness proof bounds distinct
+ * tuples, not one column's values, and must not arm any key's coverage gate. An admitted key whose
+ * build ordinal equals this value is marked `build_key_proven_unique`.
  * @return The admitted keys, in admitted (planner) order; a key's position is the admitted-key
  * index `key_binding::admitted_key_index` refers to
  */
@@ -107,14 +98,9 @@ namespace sirius::planner {
  * @brief Static legality of one admitted key for a join-edge (direct) endpoint
  *
  * A direct route requires an INNER or SEMI join, equality comparison, direct references on both
- * sides, and identical INT32 or INT64 storage types. `sirius_plan_comparison_join` calls this only
- * for admitted keys without a scan binding.
+ * sides, and identical INT32 or INT64 storage types.
  *
- * @param[in] join_type The producing join's type
- * @param[in] comparison The condition's comparison operator
  * @param[in] shape The condition's carried pre-materialization side shapes
- * @param[in] probe_storage_type The probe-side key storage type
- * @param[in] build_storage_type The build-side key storage type
  * @return True when `place_endpoint()` may place the key in the producing join's probe subtree
  */
 [[nodiscard]] bool direct_route_admissible(duckdb::JoinType join_type,

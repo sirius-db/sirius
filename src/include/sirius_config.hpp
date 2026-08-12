@@ -76,10 +76,7 @@ constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
 constexpr double DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO = 8.0;
 
 /**
- * @brief Accepted range for `dynamic_filter_domain_coverage_threshold`
- *
- * The YAML reader and SQL `SET` handler use this predicate to reject non-finite and non-positive
- * values at configuration ingress.
+ * @brief Ingress validation predicate for `dynamic_filter_domain_coverage_threshold`
  */
 struct valid_domain_coverage_threshold {
   [[nodiscard]] bool operator()(double value) const noexcept
@@ -135,7 +132,7 @@ struct operator_params {
   double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
 
   /// Enable runtime dynamic-filter discovery for eligible BUILD_PROBE hash joins. Targets may be
-  /// probe-side scans or join-edge endpoints. When disabled, discovery does not run.
+  /// probe-side scans or join-edge endpoints.
   bool enable_dynamic_filter = true;
 
   /// Emit build-key min/max filters in addition to membership filters. Parquet scans use them for
@@ -145,8 +142,7 @@ struct operator_params {
 
   /// Skip all publication for a key when the build covers at least this fraction of its unfiltered
   /// base-table row bound. The gate applies only to proven-unique keys with DuckDB-native
-  /// cardinality evidence. Values above 1.0 disable it; 1.0 skips full coverage. The separate
-  /// zone-map range gate remains inactive because no base-column value range is available.
+  /// cardinality evidence. Values above 1.0 disable it; 1.0 skips full coverage.
   double dynamic_filter_domain_coverage_threshold = 0.9;
 
   /// Consumer-side scan gate: disable a scan's post-decode dynamic filtering once a measured split

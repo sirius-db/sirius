@@ -385,7 +385,7 @@ TEST_CASE("walk continues through row-subset joins to the emitted side",
     auto join            = make_join(join_type, std::move(left), std::move(right));
     join->ResolveOperatorTypes();
 
-    // Output is only the left block: both ordinals resolve left, none resolves right.
+    // Output is only the left block.
     REQUIRE(join->types.size() == 2);
     REQUIRE(resolve_pass_through_scan(*join, 0) == left_raw);
     REQUIRE(resolve_pass_through_scan(*join, 1) == left_raw);
@@ -434,8 +434,7 @@ TEST_CASE("walk continues through SINGLE's left block and refuses its right bloc
   REQUIRE(join->types.size() == 5);
   REQUIRE(resolve_pass_through_scan(*join, 0) == left_raw);
   REQUIRE(resolve_pass_through_scan(*join, 1) == left_raw);
-  // Right-block values may repeat across left rows: every right ordinal refuses, and in
-  // particular none resolves to the right GET.
+  // Right-block values may repeat across left rows, so every right ordinal refuses.
   for (auto const ordinal : std::views::iota(std::size_t{2}, std::size_t{5})) {
     REQUIRE(resolve_pass_through_scan(*join, ordinal) == nullptr);
   }
@@ -572,9 +571,8 @@ TEST_CASE("walk locates join ordinals through non-empty projection maps",
 TEST_CASE("walk never resolves an ordinal to the opposite join side",
           "[dynamic_filter][build_key_domain]")
 {
-  // The decisive negative: two GETs with different table indexes under one modelled join. Every
-  // output ordinal resolves to the emitted side's GET or refuses -- a recurse-into-every-child
-  // default would find the wrong GET for refused ordinals.
+  // Two GETs with different table indexes under one modelled join: a recurse-into-every-child
+  // default would resolve the wrong GET for refused ordinals.
   auto left             = make_get(/*table_index=*/0, /*width=*/2);
   auto const* left_raw  = left.get();
   auto right            = make_get(/*table_index=*/1, /*width=*/3);

@@ -31,20 +31,17 @@ namespace sirius::op::scan {
 //===----------------------------------------------------------------------===//
 /// @brief Applies dynamic filters to the batches flowing through one point in the plan.
 ///
-/// The planner installs this operator in two roles.
+/// The planner installs it in two roles: on a scan route directly above
+/// `sirius_gpu_scan_operator`, and on a @c dynamic_filter_route_class::direct route in the
+/// producing join's probe subtree (via `planner::place_endpoint()`; membership masks only). The
+/// apply mode matches the scan format's read-time capabilities: parquet already ran AST-capable
+/// filters through the reader (@c membership_masks_only); a duckdb-native scan did not
+/// (@c include_ast_row_masks).
 ///
-/// On a scan route it sits directly above `sirius_gpu_scan_operator`. Parquet has already applied
-/// AST-capable filters through the reader, so the endpoint uses @c membership_masks_only. A
-/// DuckDB-native scan has no reader filter and uses @c include_ast_row_masks.
-///
-/// On a direct route, `planner::place_endpoint()` inserts it in the producing join's probe
-/// subtree. A @c dynamic_filter_route_class::direct target accepts membership filters, and the
-/// operator uses @c membership_masks_only.
-///
-/// Each execution snapshots the currently visible filters. The batch passes through unchanged when
-/// the channel has no applicable filter, the current device has no replica, or
-/// @ref dynamic_filter_gate declines the work. `on_finalize_operator()` closes the channel after
-/// the endpoint drains.
+/// Each batch is filtered against the filters visible when its apply starts. A batch passes
+/// through unchanged when the channel has no applicable filter, the current device has no
+/// replica, or @ref dynamic_filter_gate declines the work. `on_finalize_operator()` closes the
+/// channel after the endpoint drains.
 class sirius_physical_dynamic_filter : public sirius_physical_operator {
  public:
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::DYNAMIC_FILTER;
@@ -61,8 +58,7 @@ class sirius_physical_dynamic_filter : public sirius_physical_operator {
 
   void on_finalize_operator() override;
 
-  /// Returns the input footprint. Filtering passes rows through or removes them and never expands
-  /// the input.
+  /// Filtering never expands its input, so the peak estimate is the input footprint.
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(const input_stats& stats) const override
   {
     return stats.bytes;

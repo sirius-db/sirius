@@ -42,7 +42,6 @@ bool side_blocks_scan_route(op::dynamic_filter_key_shape shape) noexcept
   return true;  // Reject unrecognized enum values conservatively.
 }
 
-// Validate before narrowing an AST reference ordinal to cuDF's column-index type.
 cudf::size_type to_key_column_ordinal(std::uint32_t bound_reference_index)
 {
   constexpr auto k_max_ordinal =
@@ -69,7 +68,6 @@ std::optional<op::dynamic_filter_publish_plan::admitted_key> admit_scan_route_ke
     return std::nullopt;
   }
 
-  // Admission requires a Sirius build reference and a cuDF-representable type.
   if (!condition.right->is_reference()) { return std::nullopt; }
   auto const& build_ref = condition.right->as_reference();
 
@@ -127,11 +125,6 @@ std::vector<op::dynamic_filter_condition_shape> classify_join_key_shapes(
   return shapes;
 }
 
-// Which space each input is indexed in, in parameter order:
-//   conditions                      condition index
-//   condition_shapes                condition index
-//   condition_domain_cardinalities  condition index
-//   build_side_unique_column        a build-child output ordinal, not a condition index
 std::vector<op::dynamic_filter_publish_plan::admitted_key> admit_dynamic_filter_keys(
   duckdb::vector<sirius::join_condition> const& conditions,
   std::vector<op::dynamic_filter_condition_shape> const& condition_shapes,
