@@ -329,58 +329,56 @@ void task_scheduler::management_eventloop()
   // A single blocking site can't hear both sources: blocking only on the
   // channel misses the downgrade's silent returns (queued tasks + parked
   // devices + no future event = permanent deadlock, seen at SF1000 q18), and
-  // blocking only on the queue misses device_ready. So each pass picks where
-  // to wait from what the matcher is missing:
-  //   - channel events pending    -> drain them and match.
-  //   - a device is parked        -> the missing ingredient is a task: sleep on
-  //                                  _task_queue.wait_non_empty(), which hears
-  //                                  every push, silent or not. Non-empty queue
-  //                                  -> returns immediately and the matcher
-  //                                  re-runs (busy-wait by design when every
-  //                                  queued task prefers a busy device; ends at
-  //                                  that device's device_ready, and re-checks
-  //                                  the queue every pass so a downgrade return
-  //                                  is dispatched immediately).
-  //   - no device is parked       -> the missing ingredient is a device: only a
-  //                                  channel event helps, block on get().
-  //                                  Deadlock-free: no parked device means every
-  //                                  executor is busy and will post device_ready.
+  // blocking only on the queue misses device_ready. So each pass tops up the
+  // two things the matcher needs, sleeping at most once per missing ingredient:
+  //
+  //   1. Devices: collect pending events without blocking; block on the
+  //      channel only when no device is parked (deadlock-free: no parked
+  //      device means every executor is busy and will post device_ready).
+  //   2. Work: sleep on _task_queue.wait_non_empty() when the queue is empty.
+  //      The queue's own condvar hears every push — schedule() or the
+  //      downgrade's silent RAII return.
+  //
+  // When a parked device coexists with tasks that all prefer busy devices,
+  // both guards fall through and the loop busy-waits by design: each pass
+  // re-drains the channel and re-checks the queue, so a downgrade return is
+  // dispatched immediately and the spin ends at the busy device's
+  // device_ready.
+  //
   // Tasks remain in _task_queue (downgrade-visible) until we have a ready
   // device to match them against — this is the property the push model in
   // PR #732 lost and that the pull-signal loop restores.
   while (_running.load()) {
+    // Step 1: devices. Block only when none is parked; then drain the pending
+    // burst so the queue-sleep guard below sees current state.
     auto evt = _task_request_channel.try_get();
-    if (evt) {
-      // Drain the pending burst so one matcher pass sees all of it.
-      while (evt) {
-        if (evt->kind == task_request_kind::device_ready && !evt->is_scan) {
-          _ready_devices.emplace_back(evt->device_id);
-        }
-        evt = _task_request_channel.try_get();
+    if (!evt && _ready_devices.empty()) {
+      // get() returns nullptr when the channel is closed (stop()).
+      evt = _task_request_channel.get();
+      if (evt == nullptr) {
+        SIRIUS_LOG_INFO("Task request channel closed, exiting management event loop.");
+        break;
       }
-    } else if (!_ready_devices.empty()) {
-      // With an empty queue and a waiting device, ask the creator to
-      // pre-create work before sleeping (lookahead strategy only; no-op under
-      // the default `active` strategy). Any task it creates arrives through
-      // schedule() and wakes the queue sleep below.
-      if (_task_queue.empty() && _task_creator) {
+    }
+    while (evt) {
+      if (evt->kind == task_request_kind::device_ready && !evt->is_scan) {
+        _ready_devices.emplace_back(evt->device_id);
+      }
+      evt = _task_request_channel.try_get();
+    }
+
+    // Step 2: work. With an empty queue and a waiting device, ask the creator
+    // to pre-create work before sleeping (lookahead strategy only; no-op under
+    // the default `active` strategy) — anything it creates arrives through
+    // schedule() and wakes the queue sleep.
+    if (_task_queue.empty()) {
+      if (_task_creator && !_ready_devices.empty()) {
         _task_creator->schedule_lookahead(*_ready_devices.begin());
       }
       // Returns false only when the queue is interrupted (stop()).
       if (!_task_queue.wait_non_empty()) {
         SIRIUS_LOG_INFO("Task queue interrupted, exiting management event loop.");
         break;
-      }
-    } else {
-      // Block for the next event; get() returns nullptr when the channel is
-      // closed (stop()).
-      evt = _task_request_channel.get();
-      if (evt == nullptr) {
-        SIRIUS_LOG_INFO("Task request channel closed, exiting management event loop.");
-        break;
-      }
-      if (evt->kind == task_request_kind::device_ready && !evt->is_scan) {
-        _ready_devices.emplace_back(evt->device_id);
       }
     }
 
