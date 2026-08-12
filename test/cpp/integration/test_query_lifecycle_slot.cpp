@@ -1828,7 +1828,10 @@ bool parse_ac12_operator_windows(std::vector<std::string> const& lines,
     bool in_pipeline_overview = false;
     for (std::size_t index = begin_index; index <= end_index; ++index) {
       auto const& line = lines[index];
-      if (line.find("Creating sirius physical plan") != std::string::npos) {
+      // Plan provenance: the window either rebuilt the Sirius plan or (first execution only)
+      // consumed the one OnFinalizePrepare built. Both satisfy AC-12.
+      if (line.find("Creating sirius physical plan") != std::string::npos ||
+          line.find("reusing finalize-validated Sirius plan") != std::string::npos) {
         window.saw_runtime_plan_creation = true;
       }
       if (line.find("Query Plan:") != std::string::npos) { window.saw_query_plan = true; }

@@ -108,6 +108,10 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
 
   virtual std::unique_ptr<batch_coalescer> create_batch_coalescer() const = 0;
 
+  /// Complete any metadata preparation deferred out of the constructor. Idempotent; throws on
+  /// failure. Called by the scan manager before it builds a disk-reading split_provider.
+  virtual void ensure_metadata_prepared() {}
+
   /**
    * @brief Snapshot check for remaining work. Thread-safe.
    *

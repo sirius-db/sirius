@@ -189,6 +189,12 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       // prepared operator fall through to the rebuild below.
       duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_plan =
         std::move(validated_sirius_plan_);
+      if (sirius_plan) {
+        SIRIUS_LOG_INFO("Transparent execution: reusing finalize-validated Sirius plan");
+      } else {
+        SIRIUS_LOG_INFO("Transparent execution: rebuilding Sirius plan at execute ({})",
+                        logical_plan_ ? "from logical plan template" : "from SQL replan");
+      }
       if (!sirius_plan) {
         // Rebuild a fresh Sirius physical plan for this execution. DuckDB may reuse
         // the same prepared physical operator across multiple EXECUTE calls.
