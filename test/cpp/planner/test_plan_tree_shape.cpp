@@ -361,6 +361,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   REQUIRE(!gpu_scans.empty());
   for (auto* scan : gpu_scans) {
     CHECK(scan->children.empty());
+    CHECK(scan->declared_output_schema_is_runtime_schema());
   }
 }
 
@@ -810,6 +811,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     gen.insert_gpu_pipeline_operators(plan);
 
     auto& delim_ref = plan->Cast<sirius::op::sirius_physical_delim_join>();
+    CHECK_FALSE(delim_ref.declared_output_schema_is_runtime_schema());
     REQUIRE(delim_ref.distinct_root);
     auto* merge = delim_ref.distinct_root.get();
     REQUIRE(merge->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
