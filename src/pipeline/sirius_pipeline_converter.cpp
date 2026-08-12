@@ -480,7 +480,7 @@ void sirius_pipeline_converter::link_join_partition_siblings()
 
 void sirius_pipeline_converter::configure_partition_min_partitions()
 {
-  // Pull num_gpus from the build context (populated from sirius_engine's hardware topology at
+  // Pull num_gpus from the build context (derived from sirius_engine's configured GPU set at
   // convert time). Single-GPU runs keep the consumer default of 1 (no-op). For multi-GPU we hand
   // num_gpus to each partition's downstream sizing consumer, which derives the partition floor and
   // small-table threshold internally (see natural_num_partitions / partition_small_table_bytes) and
