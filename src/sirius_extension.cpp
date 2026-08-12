@@ -2042,6 +2042,18 @@ static void SetPinTableCompressionMaxCompressedFraction(ClientContext& context,
   SIRIUS_LOG_DEBUG("Updated pin_table_compression_max_compressed_fraction");
 }
 
+static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
+                                               SetScope scope,
+                                               Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                                   = lock_operator_params_slot(context);
+  params->enable_runtime_distinct_build_probe = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_RUNTIME_DISTINCT_BUILD_PROBE to {}",
+                   params->enable_runtime_distinct_build_probe);
+}
+
 static void SetEnableDynamicFilterPushdown(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2328,6 +2340,16 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     LogicalType::DOUBLE,
     Value::DOUBLE(operator_defaults.mark_join_build_switch_ratio),
     SetMarkJoinBuildSwitchRatio);
+
+  config.AddExtensionOption(
+    "enable_runtime_distinct_build_probe",
+    "For BUILD_PROBE hash joins whose build-key uniqueness the planner could not prove, test "
+    "distinctness at runtime (one cudf::distinct_count pass over the cached build) and take the "
+    "single-pass cudf::distinct_hash_join instead of the general two-pass join when the keys are "
+    "distinct (on by default)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.enable_runtime_distinct_build_probe),
+    SetEnableRuntimeDistinctBuildProbe);
 
   config.AddExtensionOption(
     "gpu_execution",
