@@ -22,7 +22,7 @@ Sirius searches for a config file in this order:
 2. **`./sirius.yaml`** — current working directory
 3. **`~/.sirius/sirius.yaml`** — user's home directory
 
-If no config file is found, Sirius initializes with built-in defaults (95% GPU memory, 8 GB pinned host memory per NUMA node).
+If no config file is found, Sirius initializes with built-in defaults (95% GPU memory, 90% of each NUMA node's RAM as pinned host memory).
 
 ### `SIRIUS_DISABLE`
 
@@ -109,7 +109,7 @@ Sirius uses cuCascade for tiered memory management across GPU, Host (pinned), an
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_gpus` | int | 1 | Number of GPUs to use. Mutually exclusive with `gpu_ids`. |
+| `num_gpus` | int | all visible GPUs | Number of GPUs to use. Defaults to every GPU visible to topology discovery (honors `CUDA_VISIBLE_DEVICES`); `0` also means auto. Mutually exclusive with `gpu_ids`. |
 | `gpu_ids` | list of int | — | Explicit GPU device IDs. Mutually exclusive with `num_gpus`. |
 
 ### GPU Memory (`sirius.memory.gpu`)
@@ -118,12 +118,12 @@ Controls how much GPU VRAM Sirius claims and when it starts evicting data to hos
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `usage_limit_fraction` | double | 0.95 | Fraction of total VRAM to use as Sirius's GPU memory capacity. The remaining 5% is left for the CUDA runtime, cuDF temporaries, and other GPU consumers. |
-| `usage_limit_bytes` | bytes | — | Absolute VRAM limit. Mutually exclusive with `usage_limit_fraction`. |
-| `reservation_limit_fraction` | double | 0.9 | Fraction of the GPU capacity (set by `usage_limit_*`) that can be reserved by pipeline tasks. Reservations are acquired before task execution and prevent overcommit. |
-| `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`. |
-| `downgrade_trigger_fraction` | double | 1.0 | Start evicting GPU-resident data to host when reserved memory exceeds this fraction of capacity. At the default of 1.0, downgrading only triggers when the GPU is fully reserved. |
-| `downgrade_stop_fraction` | double | 0.7 | Stop evicting when reserved memory drops to this fraction of capacity. The gap between trigger and stop prevents oscillation. |
+| `usage_limit_fraction` | double | 0.95 | Fraction of total VRAM to use as Sirius's GPU memory capacity. The remaining 5% is left for the CUDA runtime, cuDF temporaries, and other GPU consumers. Mutually exclusive with `usage_limit_bytes`; configuration loading rejects both when both values are non-null. |
+| `usage_limit_bytes` | bytes | — | Absolute VRAM limit. Mutually exclusive with `usage_limit_fraction`; configuration loading rejects both when both values are non-null. |
+| `reservation_limit_fraction` | double | 1.0 | Fraction of the GPU capacity (set by `usage_limit_*`) that can be reserved by pipeline tasks. Reservations are acquired before task execution and prevent overcommit. Mutually exclusive with `reservation_limit_bytes`; configuration loading rejects both when both values are non-null. |
+| `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`; configuration loading rejects both when both values are non-null. |
+| `downgrade_trigger_fraction` | double (0,1] | 0.8 | Start evicting GPU-resident data to host when reserved memory exceeds this fraction of capacity. Must be greater than `downgrade_stop_fraction`. |
+| `downgrade_stop_fraction` | double (0,1] | 0.6 | Stop evicting when reserved memory drops to this fraction of capacity. Must be less than `downgrade_trigger_fraction`; configuration loading rejects an invalid pair. |
 | `track_per_stream_reservation` | bool | false | Track memory reservations per CUDA stream instead of globally. Useful for debugging per-task memory usage. |
 
 ### Host Memory (`sirius.memory.host`)
@@ -132,11 +132,12 @@ Controls pinned host memory pools. One pool group is created per NUMA node (auto
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `capacity_bytes` | bytes | 8Gi | Pinned host memory capacity **per NUMA node**. This memory is allocated at startup using `cudaMallocHost`. |
-| `reservation_limit_fraction` | double | 0.9 | Fraction of host capacity that can be reserved. |
-| `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`. |
-| `downgrade_trigger_fraction` | double | 0.8 | Start evicting host-resident data to disk when reserved memory exceeds this fraction. |
-| `downgrade_stop_fraction` | double | 0.7 | Stop evicting when reserved memory drops to this fraction. |
+| `capacity_fraction` | double (0,1] | 0.9 | Pinned host memory capacity as a fraction of **each backing NUMA node's total RAM** (read from `/sys/devices/system/node/node<id>/meminfo`). Mutually exclusive with `capacity_bytes`; configuration loading rejects both when both values are non-null. Initialization fails if a node's capacity cannot be determined. |
+| `capacity_bytes` | bytes | — | Pinned host memory capacity **per NUMA node** as absolute bytes, allocated with `cudaMallocHost`. Mutually exclusive with `capacity_fraction`; configuration loading rejects both when both values are non-null. |
+| `reservation_limit_fraction` | double | 1.0 | Fraction of host capacity that can be reserved. Mutually exclusive with `reservation_limit_bytes`; configuration loading rejects both when both values are non-null. |
+| `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`; configuration loading rejects both when both values are non-null. |
+| `downgrade_trigger_fraction` | double (0,1] | 0.9 | Start evicting host-resident data to disk when reserved memory exceeds this fraction. Must be greater than `downgrade_stop_fraction`. Eviction also requires a configured `downgrade_root_dirs`; without one the downgrade executor logs a warning and skips. |
+| `downgrade_stop_fraction` | double (0,1] | 0.8 | Stop evicting when reserved memory drops to this fraction. Must be less than `downgrade_trigger_fraction`; configuration loading rejects an invalid pair. |
 | `block_size` | bytes | 1Mi | Size of each allocation block in the pool. Larger blocks reduce allocation overhead but waste memory on small allocations. |
 | `pool_size` | int | 128 | Number of blocks per pool. Total pool capacity = `block_size × pool_size`. |
 | `initial_number_pools` | int | 4 | Number of pools pre-allocated at startup. Additional pools are created on demand. Initial host footprint = `block_size × pool_size × initial_number_pools`. |
@@ -167,16 +168,21 @@ Each memory tier uses a trigger/stop threshold pair to control data eviction:
 - Above `reservation_limit`: new reservations are denied (triggers OOM retry)
 
 The gap between `trigger` and `stop` prevents oscillation — without it, evicting one batch could drop below trigger, then the next allocation re-triggers eviction.
+Configuration loading enforces `0 < downgrade_stop_fraction < downgrade_trigger_fraction <= 1`
+for both the high-level and low-level GPU and host surfaces. Missing or explicit-null
+members retain their surface defaults before the pair is validated.
 
 ### Low-Level Explicit Memory Spaces (`sirius.space`) — advanced
 
-> **Mutually exclusive with `sirius.memory`.** `sirius.space` is a low-level alternative that
-> declares individual memory spaces directly, bypassing the high-level `sirius.memory`
-> configurator. **If any `sirius.space.{gpu,host,disk}` list is non-empty, it completely
-> replaces the space set that `sirius.memory` would have produced** (the `sirius.memory` block is
-> then ignored for space construction). This path is generally reserved for **low-level developer
-> testing** — e.g. hand-placing spaces on specific devices/NUMA nodes. Most users should use
-> `sirius.memory` instead.
+> **Mutually exclusive with configured `sirius.memory` sub-blocks.** `sirius.space` is a low-level
+> alternative that declares individual memory spaces directly, bypassing the high-level
+> `sirius.memory` configurator. If any `sirius.space.{gpu,host,disk}` list is non-empty, the
+> configuration loader rejects a simultaneous non-null `sirius.memory.{gpu,host,disk}` sub-block
+> instead of silently ignoring it. A null memory sub-block is absent; a non-null mapping selects
+> the high-level path even when the mapping is empty or its individual values are null. Empty
+> `sirius.space` lists do not select the low-level path. This path is generally reserved for
+> **low-level developer testing** — e.g. hand-placing spaces on specific devices/NUMA nodes. Most
+> users should use `sirius.memory` instead.
 >
 > Note the key names differ from `sirius.memory`: capacities are `memory_capacity` (not
 > `capacity_bytes`), and the GPU/host tiers key on `device_id` / `numa_id`.
@@ -190,8 +196,8 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 | `device_id` | int | 0 | CUDA device the space lives on. |
 | `per_stream_reservation` | bool | false | Track reservations per CUDA stream (forced false unless set). |
 | `reservation_limit_fraction` | double [0,1] | space default | Fraction of the space that may be reserved. |
-| `downgrade_trigger_fraction` | double [0,1] | space default | Start evicting above this fraction. |
-| `downgrade_stop_fraction` | double [0,1] | space default | Stop evicting below this fraction. |
+| `downgrade_trigger_fraction` | double (0,1] | space default | Start evicting above this fraction. Must be greater than `downgrade_stop_fraction`. |
+| `downgrade_stop_fraction` | double (0,1] | space default | Stop evicting below this fraction. Must be less than `downgrade_trigger_fraction`. |
 | `memory_capacity` | bytes | space default | Absolute capacity of the space. |
 
 #### `sirius.space.host[]` — one entry per host (pinned) memory space
@@ -200,8 +206,8 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 |-----|------|---------|-------------|
 | `numa_id` | int | 0 | NUMA node the pinned pool is bound to. |
 | `reservation_limit_fraction` | double [0,1] | space default | Fraction of the space that may be reserved. |
-| `downgrade_trigger_fraction` | double [0,1] | space default | Start evicting above this fraction. |
-| `downgrade_stop_fraction` | double [0,1] | space default | Stop evicting below this fraction. |
+| `downgrade_trigger_fraction` | double (0,1] | space default | Start evicting above this fraction. Must be greater than `downgrade_stop_fraction`. |
+| `downgrade_stop_fraction` | double (0,1] | space default | Stop evicting below this fraction. Must be less than `downgrade_trigger_fraction`. |
 | `memory_capacity` | bytes | space default | Absolute capacity of the space. |
 | `block_size` | bytes | pool default | Allocation block size. |
 | `pool_size` | int | pool default | Blocks per pool. |
@@ -217,7 +223,7 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 
 ```yaml
 sirius:
-  # NOTE: do NOT also set sirius.memory — space overrides it.
+  # NOTE: do NOT also configure sirius.memory — the loader rejects both paths together.
   space:
     gpu:
       - { device_id: 0, memory_capacity: 40Gi, reservation_limit_fraction: 0.9 }
@@ -246,7 +252,7 @@ Every thread-pool sub-block shares three keys:
 
 ### `sirius.executor.task_creator`
 
-Thread pool (default `num_threads: 2`, prefix `task_creator`) plus:
+Thread pool (default `num_threads: 1`, prefix `task_creator`) plus:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -259,7 +265,7 @@ Thread pool only (default `num_threads: 4`, prefix `gpu_pipeline`). No extra key
 
 ### `sirius.executor.downgrade`
 
-Thread pool (default `num_threads: 4`, prefix `downgrade`) plus:
+Thread pool (default `num_threads: 1`, prefix `downgrade`) plus:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -273,7 +279,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_threads` | int (**> 2**) | 8 | Threads in the scan-manager pool that run metadata tasks. Rejected unless strictly greater than 2 (i.e. minimum 3). |
+| `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 1 uring reactor), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
 | `thread_name_prefix` | string | `scan_manager` | Thread name prefix for logs. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `use_sirius_datasource` | bool | true | Route reads through the Sirius `io_uring` datasource. When false, the kvikio fallback is used (single-GPU only; multi-GPU requires the Sirius datasource). |
@@ -281,7 +287,23 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
 | `enable_prefetch_cache` | bool | false | Attach the pinned-memory prefetching cache in front of the backend. |
 
-Four optional nested sub-configs tune the individual backends and caches:
+Five optional nested sub-configs tune the individual backends, caches, and the memory prefetcher:
+
+### `scan_manager.memory_prefetcher` — background host→GPU upload of pinned-cache scan splits (`scan_manager/config.hpp`)
+
+Overlaps the host→GPU upload of queued pinned-cache scan splits with compute:
+worker threads walk the pending splits in scan execution order and convert
+resident batches to GPU tier ahead of task creation, gated on GPU memory
+headroom (see `scan_manager/memory_prefetcher.hpp`). Disabled by default;
+single-GPU configurations only (logs a warning and disables itself otherwise).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enable` | bool | false | Master switch for the prefetcher. |
+| `num_threads` | int (**> 0**) | 2 | Prefetch worker threads; each drives one in-flight batch conversion on its own stream. |
+| `min_free_fraction` | double [0,1] | 0.4 | Keep at least this fraction of the GPU space free after each prefetch; conversions (and their reservations) are only attempted above this floor. |
+| `poll_interval_ms` | int (**> 0**) | 2 | Worker sweep interval while waiting for headroom / new splits. |
+| `drain_quiet_ms` | int (ms) | 100 | A connector counts as actively draining (and is skipped) until this long passes since its last pop. Must exceed the scan's inter-pop interval. |
 
 ### `scan_manager.local` — io_uring backend (`io/uring/config.hpp`)
 
@@ -340,15 +362,27 @@ Four optional nested sub-configs tune the individual backends and caches:
 
 **File:** `src/include/sirius_config.hpp` — `operator_params` struct
 
+The four batch/partition sizes (`scan_task_batch_size`, `hash_partition_bytes`,
+`concat_batch_bytes`, `sort_sample_bytes`) share one built-in default. Without an
+explicit GPU capacity in YAML, it is computed at startup as
+`clamp(smallest visible physical GPU memory / 40, 512 MiB, 5 GiB)` (800 MiB when no
+GPU is visible). When the active YAML memory path explicitly caps GPU capacity, the
+default is narrowed to
+`min(physical-memory default, max(1 byte, smallest resolved GPU capacity / 40))`.
+`max_build_hash_table_bytes` defaults to **2× that batch default**. Explicit
+`operator_params` values are applied afterward and still override each value
+individually.
+
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `scan_task_batch_size` | 512 MB | Target batch size for DuckDB scan tasks |
+| `scan_task_batch_size` | Shared physical/effective GPU batch default described above | Target batch size for DuckDB scan tasks |
+| `enable_compressed_materialization` | true | Store eligible integer and fixed-point DECIMAL values in value-preserving narrower carriers when exact pin-time bounds permit it; restore native carriers at type-sensitive boundaries. |
 | `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. Auto = 33% of GPU memory. |
-| `hash_partition_bytes` | 512 MB | Target partition size for hash joins and group-bys |
-| `concat_batch_bytes` | 512 MB | Target output batch size for CONCAT operator |
-| `sort_sample_bytes` | 512 MB | Bytes sampled before computing sort partition boundaries |
-| `max_build_hash_table_bytes` | 500 MB | Max build-side size for BUILD_PROBE join mode |
-| `max_broadcast_join_size` | 256 MB | Max build-side size eligible for a broadcast join. A build below this size is replicated to every GPU (instead of hash-partitioned) when it is tiny, or when the DuckDB-estimated probe-to-build row ratio is at least `num_gpus * 1.25`. |
+| `hash_partition_bytes` | Shared physical/effective GPU batch default described above | Target partition size for hash joins and group-bys; must be greater than zero |
+| `concat_batch_bytes` | Shared physical/effective GPU batch default described above | Target output batch size for CONCAT operator |
+| `sort_sample_bytes` | Shared physical/effective GPU batch default described above | Bytes sampled before computing sort partition boundaries |
+| `max_build_hash_table_bytes` | 2× batch default | Max build-side size for BUILD_PROBE join mode |
+| `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join. A build below this size is replicated to every GPU (instead of hash-partitioned) when it is tiny, or when the DuckDB-estimated probe-to-build row ratio is at least `num_gpus * 1.25`. |
 | `max_sort_partition_memory_fraction` | 0.33 | Fraction of GPU memory per sort partition when `max_sort_partition_bytes` is 0 |
 | `mark_join_build_switch_ratio` | 8.0 | For STANDARD MARK joins, build on the smaller (left) side when `right_rows >= ratio * left_rows` (0 disables) |
 | `enable_dynamic_filter` | true | Enable runtime filters for eligible `BUILD_PROBE` joins. Targets may be probe scans or join-edge endpoints. |
@@ -454,10 +488,10 @@ per-pool extras.
 
 | Pool | YAML block | Default Threads | Thread Name Prefix | Purpose |
 |------|-----------|----------------|-------------------|---------|
-| `task_creator` | `executor.task_creator` | 2 | `task_creator` | Task creation from scheduling requests |
+| `task_creator` | `executor.task_creator` | 1 | `task_creator` | Task creation from scheduling requests |
 | `gpu_pipeline_executor` | `executor.pipeline` | 4 | `gpu_pipeline` | GPU pipeline task execution |
-| `downgrade_executor` | `executor.downgrade` | 4 | `downgrade` | Data tier migration (GPU→Host) |
-| `scan_manager` | `executor.scan_manager` | 8 | `scan_manager` | Scan metadata production + IO reactor management |
+| `downgrade_executor` | `executor.downgrade` | 1 | `downgrade` | Data tier migration (GPU→Host) |
+| `scan_manager` | `executor.scan_manager` | remaining cores (min 4) | `scan_manager` | Scan metadata production + IO reactor management |
 
 Each pool supports optional CPU affinity lists (`cpu_affinity`) for core pinning. `num_threads`
 must be `> 0` for every pool except `scan_manager`, which requires `> 2`.
@@ -485,22 +519,13 @@ Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
 These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, and
 `SIRIUS_LOG_LEVEL` environment variables.
 
-### Memory
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `use_pin_memory` | true | Use pinned memory for CPU↔GPU transfers |
-| `use_pin_memory_for_caching` | false | Use pinned memory for scan caching |
-
 ### Expression Evaluation
 
 **File:** `src/include/expression_evaluator/expression_evaluator_strategy.hpp`
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `use_cudf_expr` | true | Use cuDF-based expression evaluation |
 | `expression_evaluator_strategy` | `ast_interpret` | Expression evaluator strategy: `materialize`, `ast_interpret`, or `ast_jit` |
-| `use_custom_top_n` | false | Use custom top-N implementation |
 
 `expression_executor_strategy` remains registered as a deprecated compatibility alias for
 `expression_evaluator_strategy`; new configuration should use the evaluator name.
@@ -509,24 +534,34 @@ These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, an
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `use_opt_table_scan` | - | Enable optimized table scan |
-| `opt_table_scan_num_streams` | - | Number of CUDA streams for optimized scan |
-| `opt_table_scan_memcpy_size` | - | Memcpy size for optimized scan |
-| `scan_task_batch_size` | 512 MB | Target scan batch size |
+| `scan_task_batch_size` | Shared physical/effective GPU batch default | Target scan batch size |
+| `enable_compressed_materialization` | true | Keep eligible integer and fixed-point DECIMAL values in narrower physical carriers until a native semantic boundary. |
+
+`enable_compressed_materialization` is also accepted in YAML under `sirius.operator_params`.
+At pin time, exact per-chunk bounds select stored carriers. At query planning, a matching pinned
+entry's recorded column-storage metadata determines the scan carriers; Parquet footer and DuckDB
+catalog statistics are not consulted for this decision. Unpinned scans stay native, and exact
+runtime bounds guard any narrowing cast required after a plan becomes stale. Changing the setting
+does not rewrite an existing pinned entry; cached scans normalize its stored carriers for the
+current query. See [Compressed Materialization](compressed-materialization.md) for eligibility,
+restoration boundaries, and cache-reservation behavior.
+
+```sql
+SET enable_compressed_materialization = false;
+```
 
 ### Pipeline / Operator
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `modified_pipeline` | - | Enable modified pipeline execution |
 | `fuse_merge_pipelines` | true | Fuse eligible GROUP BY / TOP_N merges into their downstream pipeline instead of cutting a boundary (see [physical-plan-generation.md](physical-plan-generation.md) → Merge fusion) |
 | `max_sort_partition_bytes` | 0 (auto) | Max sort partition bytes |
 | `max_sort_partition_memory_fraction` | 0.33 | Auto sort-partition fraction when `max_sort_partition_bytes` is 0 |
-| `hash_partition_bytes` | 512 MB | Hash partition target size |
-| `concat_batch_bytes` | 512 MB | CONCAT output batch size |
-| `sort_sample_bytes` | 512 MB | Bytes sampled before computing sort boundaries |
-| `max_build_hash_table_bytes` | 500 MB | Max build-side hash table bytes |
-| `max_broadcast_join_size` | 256 MB | Max build-side size eligible for a broadcast join |
+| `hash_partition_bytes` | Shared physical/effective GPU batch default | Hash partition target size; must be greater than zero |
+| `concat_batch_bytes` | Shared physical/effective GPU batch default | CONCAT output batch size |
+| `sort_sample_bytes` | Shared physical/effective GPU batch default | Bytes sampled before computing sort boundaries |
+| `max_build_hash_table_bytes` | 2× batch default | Max build-side hash table bytes |
+| `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
 
 ### Dynamic Filters
@@ -577,13 +612,33 @@ SET enable_pinned_zone_map_pruning = false;
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `print_gpu_table_max_rows` | - | Max rows to print in debug output |
-| `enable_fallback_check` | - | Enable fallback validation |
 | `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates both plan-time fallback (unsupported operator/type) and runtime fallback (GPU execution failure) on the transparent path, plus the legacy `CALL gpu_execution(...)` path. Set to `false` to surface Sirius errors instead of falling back. |
 | `enable_regex_jit_impl` | - | Use JIT regex implementation |
 
 
 ## Legacy Config Flags
+
+### Legacy-release DuckDB settings
+
+The following settings only control the legacy `gpu_processing` path. Sirius registers them
+when built with `ENABLE_LEGACY_SIRIUS=ON`, including the `legacy-release` preset used by
+`make legacy-release`. Normal builds omit them from `duckdb_settings()` and reject attempts to
+`SET` them.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `use_pin_memory` | true | Use pinned memory for legacy CPU↔GPU transfers |
+| `use_pin_memory_for_caching` | false | Use pinned memory for the legacy scan cache |
+| `use_cudf_expr` | true | Use cuDF in the legacy expression executor |
+| `use_custom_top_n` | true | Use the legacy custom top-N kernel |
+| `use_opt_table_scan` | true | Use the legacy optimized table scan |
+| `opt_table_scan_num_streams` | 8 | CUDA streams used by the legacy optimized scan |
+| `opt_table_scan_memcpy_size` | 64 MiB | Copy chunk size used by the legacy optimized scan |
+| `print_gpu_table_max_rows` | 1000 | Maximum rows rendered by the legacy GPU-table printer |
+| `enable_fallback_check` | false | Enable legacy fallback validation |
+| `modified_pipeline` | false | Enable legacy modified-pipeline scheduling |
+
+### Static flags
 
 **File:** `src/include/config.hpp`
 
@@ -610,3 +665,39 @@ These are compile-time defaults. Runtime configuration via `sirius_config` and D
 | `src/sirius_extension.cpp` | SET variable registration |
 | `src/include/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, prefetch cache, object store) |
 | `src/include/io/uring/config.hpp`, `io/rest/config.hpp`, `io/cache/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / cache / object-store sub-configs |
+
+## Tuned profile: GB300, TPC-H SF1000 host-pinned
+
+Measured 2026-07-31 (72-core GB300, 256 GB HBM, 3 hot iterations, results
+byte-identical to defaults). Relative to the stock config the following
+deltas are worth **-13% suite hot time** (20.8 s → 18.1 s; q9 -19%):
+
+```yaml
+sirius:
+  memory:
+    host:
+      block_size: 64Mi       # default 1Mi: ~5000 copy segments per 5 GB batch
+      pool_size: 8           # keep block_size x pool_size at 512Mi per pool
+  executor:
+    scan_manager:
+      memory_prefetcher:     # requires the memory prefetcher (PR #1181)
+        enable: true
+        num_threads: 3       # 2 is the swept default; 3 buys q21 ~3% under 8 pipeline threads
+    pipeline:
+      num_threads: 8         # default 4; cliff at 12 (q1/q6 regress)
+```
+
+Attribution: host `block_size` 1 Mi → 64 Mi removes per-segment submission
+overhead in batched host→GPU copies (~11 ms of every 39 ms five-GB
+conversion); sweep 16-64 Mi if small-host-allocation fragmentation is a
+concern. `pipeline.num_threads` 4 → 8 helps task-parallel aggregation
+queries (q1 -16%, q12 -14%). The prefetcher block overlaps pinned-cache
+uploads with compute (see `scan_manager.memory_prefetcher` above). Numbers
+include the cuCascade all-valid null-mask conversion fix; without it,
+expect roughly half the converter-side gain.
+
+The knobs that did NOT help on this hardware, all measured full-suite:
+prefetcher `min_free_fraction` below 0.4, prefetcher threads above 3,
+pipeline threads above 8. The H2D interconnect sustains ~350-380 GB/s
+regardless of stream count; past these settings the link, not scheduling,
+is the bound.

@@ -214,23 +214,18 @@ inline cudf::data_type get_cudf_type(const logical_type& t)
 }
 
 /**
- * @brief Map a sirius::logical_type to its cudf::data_type, or nothing when it has no mapping
+ * @brief Native cuDF mapping of @p t, or `std::nullopt` when no cuDF carrier exists
  *
- * For callers to whom conversion failure is a routine classification rather than an error, such
- * as plan-time admission of GPU filter keys. Any exception from @ref get_cudf_type is treated as an
- * unsupported conversion.
- *
- * @param[in] t The Sirius type to map
- * @return The cuDF type, or `std::nullopt` when conversion fails
+ * The optional-returning counterpart of `get_cudf_type` for callers that treat an unmappable type
+ * as a fallback signal rather than an error. Only that signal is absorbed: `get_cudf_type` builds
+ * its message by formatting the type name, so an allocation failure there still propagates rather
+ * than being reported as an unmappable type.
  */
-[[nodiscard]] inline std::optional<cudf::data_type> try_get_cudf_type(
-  logical_type const& t) noexcept
+[[nodiscard]] inline std::optional<cudf::data_type> try_get_cudf_type(const logical_type& t)
 {
   try {
     return get_cudf_type(t);
   } catch (duckdb::InvalidInputException const&) {
-    return std::nullopt;
-  } catch (...) {
     return std::nullopt;
   }
 }
@@ -324,6 +319,23 @@ inline std::unique_ptr<cudf::table> make_empty_table(const duckdb::vector<logica
   columns.reserve(types.size());
   for (auto const& t : types) {
     columns.push_back(cudf::make_empty_column(get_cudf_type(t)));
+  }
+  return std::make_unique<cudf::table>(std::move(columns));
+}
+
+/**
+ * @brief Build a zero-row cuDF table with one column per cuDF type
+ *
+ * The carrier-exact counterpart of the logical-type overload, for callers holding an operator's
+ * `physical_types` sidecar: the result reproduces those carriers instead of re-deriving native
+ * ones.
+ */
+inline std::unique_ptr<cudf::table> make_empty_table(const std::vector<cudf::data_type>& types)
+{
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.reserve(types.size());
+  for (auto const& t : types) {
+    columns.push_back(cudf::make_empty_column(t));
   }
   return std::make_unique<cudf::table>(std::move(columns));
 }

@@ -334,7 +334,7 @@ std::string owning_scan_table_of(
     if (op->type != SiriusPhysicalOperatorType::GPU_SCAN) { return; }
     auto const& scan = op->Cast<sirius::op::scan::sirius_gpu_scan_operator>();
     auto const* info = dynamic_cast<sirius::op::scan::duckdb_native_ingestible_table_info const*>(
-      &scan.peek_table_info());
+      &scan.get_ingestible().table_info());
     REQUIRE(info != nullptr);
     if (info->sirius_dynamic_filters.get() == filter_set.get()) { owners.push_back(info); }
   });

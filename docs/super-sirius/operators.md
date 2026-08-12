@@ -55,46 +55,56 @@ See [Scan](scan.md) for the full scan subsystem (scan manager, `gpu_ingestible`,
 ### `sirius_physical_streaming_source` — `STREAMING_SOURCE`
 **File:** `src/include/op/sirius_physical_streaming_source.hpp`
 
-Source operator that marks the bottom boundary of an intermediate pipeline fragment. It pulls
-`exchange_batch_handle` records (batch-id + size) from a bounded `exec::exchange_channel`, resolves
-each handle via a `cucascade::shared_data_repository`, and publishes the batch into the pipeline
-as a `pipelineable_operator_data`. Used only when a fragment's input arrives from another node
-over exchange; a leaf fragment keeps its normal `GPU_SCAN` source.
+Source operator that marks the bottom boundary of an intermediate pipeline fragment. Producers
+call `push(batch)` / `close_input(sender_id)`; the operator publishes each queued
+`cucascade::data_batch` into the pipeline as a `pipelineable_operator_data`, one per task. Used
+only when a fragment's input arrives from another node over exchange; a leaf fragment keeps its
+normal `GPU_SCAN` source.
 
-Key design invariants:
-- The channel carries **handles**, not `shared_ptr`s — the repository owns the batch so queued
-  items remain spill-visible to the downgrade executor.
-- Engine workers use `try_pop` only (non-blocking); `push`/`pop` are provided for the wrapper/test side.
-- EOS is **close-then-drain**: `close()` forbids new pushes; queued handles stay poppable;
-  `drained()` (= `closed() && empty()`) is the terminal predicate.
+Unlike a `GPU_SCAN` it does not own its input — batches arrive at runtime — so an empty queue means
+*wait*, not *exhausted*. It holds one `exec::batch_stream`: a borrowed
+`cucascade::shared_data_repository` (**the queue** — batches sit there until a task claims one,
+spill-visible to the downgrade executor when the caller registered that repository with the memory
+manager) bound to the stream state (sender-aware end-of-stream, the availability classification,
+the `on_data` notification, and the producer-error plane).
+
+Key design invariants (S1–S5 are the named stream contracts defined in `exec/batch_stream.hpp`):
+- Batches cross natively, in their current tier — no Arrow, no forced GPU upgrade.
+- EOS is **sender-aware**: `close_input(sender)` is idempotent per sender, and the stream ends
+  only once every *expected* sender has closed. An unexpected sender id is a defined error.
+- **S1** — every batch lands in the repository before `on_data` announces it; `push()` returns
+  false once the stream is terminal, so no batch can arrive after a consumer has seen EOS.
+- **S2–S3** — a producer failure (`fail_input(error)`) fires `on_data` so a parked consumer
+  wakes to collect the rethrow; the stream never reports `END_OF_STREAM` or `drained()` while an
+  error is pending (the only exit is the rethrow).
 - `execute()` is a pure pass-through (COLUMN_DATA_SCAN shape — no GPU work).
 - `no_history_peak_memory_estimate()` returns `stats.bytes` (no extra allocation).
 
 Hint table:
 
-| Channel state | `get_next_task_hint()` |
+| Stream state | `get_next_task_hint()` |
 |---|---|
-| non-empty (open or closed) | `READY{this}` |
-| open, empty | `WAITING{nullptr}` — re-armable by the session on push (#839) |
-| closed && drained | `std::nullopt` — EOS |
+| `HAS_DATA` (queued or errored, open or ended) | `READY{this}` |
+| `WAITING` (open, empty) | `WAITING{nullptr}` — the next `push()` re-nominates the head |
+| `END_OF_STREAM` | `std::nullopt` |
 
-`all_ports_empty()` is overridden to `_input_channel->drained()`, driving both the task-creation
-loop guard and the port-less source pipeline-finish predicate.
+`all_ports_empty()` is `stream.drained()` — a clean end only: every sender closed, queue empty, no
+pending error. It drives both the task-creation loop guard and the port-less source
+pipeline-finish predicate. Emptiness is evaluated under the stream's own lock — otherwise a batch
+admitted between the check and the lock could be reported as end-of-stream and dropped.
 
-Channel close notifies the pipeline (`update_pipeline_status(false)`, via a weak pipeline
-reference wired in `set_pipeline`), so an empty or late-closed stream still finishes its
+**The live wake-up.** The head is scheduled once by `start_query()` and task completion only
+nominates downstream consumers, so `on_data` — fired by every successful `push()` — is the only
+thing that brings a dropped source back. It is deliberately not one-shot; the header explains why.
+
+End-of-stream separately notifies the pipeline (`update_pipeline_status(false)`, via a weak
+pipeline reference wired in `set_pipeline`), so an empty or late-closed stream still finishes its
 pipeline — and re-arms downstream consumers — even when no task is left in flight.
 
-**Producer contract**: register the incoming batch in the input repository (`add_data_batch`) *first*,
-then push the handle. The session (#839) owns edge-triggered re-scheduling; the plan generator (#838)
-owns channel wiring.
-
-**Backpressure (open integration requirement for #839)**: `try_pop()` frees channel item/byte
-capacity at task-creation time, but the popped batches move into the unbounded task-scheduler
-queue — the channel bound therefore does not bound total outstanding data. When #839 wires the
-session, task creation must be gated on in-flight work (e.g. counting via the channel's `on_pop`
-hook and the task-completion path) so a fast producer cannot accumulate an arbitrarily large GPU
-backlog behind a nominally bounded channel.
+**No channel-level backpressure.** Producers push into the repository and the downgrade executor
+relieves memory pressure. Sirius has no upward "stop producing" signal today (hints are only
+`READY` / `WAITING` / nothing), so the intended lever is per-fragment priority, not a bounded
+queue.
 
 ### `sirius_physical_dummy_scan` — `DUMMY_SCAN`
 **File:** `src/include/op/sirius_physical_dummy_scan.hpp`
@@ -152,7 +162,7 @@ Three execution modes:
 |------|-----------|----------|
 | `STANDARD` | Default, multi-partition Cartesian product | `cudf::inner_join()`, `cudf::left_join()`, etc. |
 | `BUILD_PROBE` | Up to one partition per GPU, per-partition build side (< `max_build_hash_table_bytes`) foldable to one batch | `cudf::hash_join`, `cudf::distinct_hash_join`, or `cudf::filtered_join` — built once per partition, probed many times |
-| `MIXED_JOIN` | Equality + inequality conditions on disjoint columns | `cudf::mixed_join()` with cuDF AST |
+| `MIXED_JOIN` | Equality plus either inequality conditions or a null-safe `IS NOT DISTINCT FROM` key (mixed with a plain `=`), on disjoint columns | `cudf::mixed_join()` with cuDF AST |
 
 `update_join_exec_mode()` selects BUILD_PROBE when `num_partitions <= num_gpus` (one hash table per partition, at most one partition per GPU — this reduces to the historical single-partition rule when `num_gpus == 1`), the per-GPU build side fits `max_build_hash_table_bytes` and folds to a single batch, and the join is not RIGHT-family (`RIGHT`, `RIGHT_SEMI`, `RIGHT_ANTI`), `MIXED_JOIN`, or full `OUTER`. INNER, LEFT, MARK, SEMI, and ANTI joins are eligible (SEMI/ANTI/MARK build a persistent `cudf::filtered_join` on the right and stream left probe batches). Full outer is excluded because BUILD_PROBE streams probe batches and calls `full_join` per batch, which would re-emit unmatched build rows on every batch (and, under broadcast/partitioning, on every GPU) with no global accumulation — full outer joins use the STANDARD path. The pure eligibility gate is `build_probe_mode_eligible()`. For a broadcast join the **full** replicated build size is charged against `max_build_hash_table_bytes` (each GPU builds the entire table); a hash-partitioned build charges the per-partition average.
 
@@ -181,7 +191,7 @@ The following table summarizes, per join type, what concat folds, which side str
 | RIGHT_ANTI | probe → 1 | build | ✅ | ✅ | ❌ | STANDARD, MIXED_JOIN† |
 | SINGLE | — | — | — | — | — | unsupported (throws) |
 
-† MIXED_JOIN applies to any of these types when the join carries both equality **and** inequality conditions (MARK + MIXED is rejected at construction). "Streams multi-batch" describes the STANDARD/MIXED partial-barrier behavior; BUILD_PROBE already streamed its probe side. The whole-side fold is chosen in the `sirius_physical_concat` constructor from the downstream join type (`_concat_all`); partition / broadcast / mode eligibility is decided in `compute_hash_join_partition_strategy`.
+† MIXED_JOIN applies to any of these types when the join carries equality conditions **plus** either an inequality condition or a null-safe `IS NOT DISTINCT FROM` key mixed with a plain `=` (the null-safe key is routed to the AST predicate as `NULL_EQUAL`, since cuDF's single `null_equality` flag can't give `=` and null-safe keys opposite semantics). MARK is never routed to MIXED_JOIN: MARK + inequality is rejected at construction, and a MARK + null-safe key stays a `UNEQUAL` hash key (a known null-safe limitation). "Streams multi-batch" describes the STANDARD/MIXED partial-barrier behavior; BUILD_PROBE already streamed its probe side. The whole-side fold is chosen in the `sirius_physical_concat` constructor from the downstream join type (`_concat_all`); partition / broadcast / mode eligibility is decided in `compute_hash_join_partition_strategy`.
 
 #### MARK joins
 A MARK join emits every left row plus a `BOOL8` mark column indicating whether each left row had a match. Both build strategies funnel through `resolve_mark_join_result`, which scatters left-row match indices into the mark column.
@@ -371,7 +381,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | Operator | Category | GPU Method |
 |----------|----------|-----------|
 | GPU_SCAN | Scan | Unified GPU scan source served by `sirius_scan_manager` via a per-format `gpu_ingestible` |
-| STREAMING_SOURCE | Scan | Exchange-input source; pulls batch handles from `exchange_channel`, resolves via `shared_data_repository` |
+| STREAMING_SOURCE | Scan | Exchange-input source; drains an `exec::batch_stream` (repository fed by `push()`, sender-aware EOS, producer-error plane) |
 | DUMMY_SCAN | Scan | Generates 1 row |
 | COLUMN_DATA_SCAN | Scan | Reads ColumnDataCollection |
 | FILTER | Relational | `expression_evaluator::select()` |

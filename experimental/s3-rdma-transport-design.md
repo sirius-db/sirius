@@ -1,0 +1,361 @@
+# S3 RDMA Transport for Sirius — V1 Design
+
+Date: 2026-07-20. Author: Sirius Contributors. Benchmark:
+<https://github.com/sirius-db/s3RDMA-benchmarktool> (~91 Gbps GPU-mode GET
+on CX-6 RoCE).
+
+## 1. Summary
+
+- V1 adds an opt-in RDMA path (`s3_transport=RDMA`) for Parquet reads on
+  one GPU, by exact key (`read_parquet('s3://bucket/path/file.parquet')`)
+  or by glob (`read_parquet('s3://bucket/path/*.parquet')`). A glob is
+  resolved on the host control plane with ordinary signed S3 requests
+  (HTTP or HTTPS, following the configured host endpoint and its TLS
+  settings); every matched object is then read by its exact key. The
+  data plane never lists; it only ever serves exact-key reads.
+- Payload lands in a pre-registered GPU arena and is copied to caller-owned
+  RMM memory on the caller stream, with zero Sirius-side host staging or H2D
+  traffic. Metadata and footer reads remain on the existing S3 path.
+- No automatic probing and no runtime fallback to HTTP: when RDMA is selected
+  and cannot serve a request, the request fails with an explicit error. Retry
+  and demotion for the RDMA path belong to the scan-manager layer above the
+  transport, and are added there later rather than inside the transport.
+- GO requires hardware correctness, at least 85% of the qualified RDMA link
+  rate for objects of 16 MiB or larger, and a zero-failure 100-million-GET
+  soak.
+- For smaller objects the gate measures RDMA against HTTP side by side; if
+  RDMA shows no advantage there, V1 may add a size-based fallback that routes
+  small objects to the HTTP path — a routing choice, distinct from the
+  failure semantics above.
+- The prefetch cache is off on the RDMA path in V1. Whether V1 grows a cache
+  is decided from the benchmark results, not up front.
+
+## 2. Scope and Non-Goals
+
+| Supported in v1 | Not in v1 |
+|---|---|
+| Exact-key data reads; wildcard glob and S3 LIST resolved on the host control plane | Merging the two listing HTTP legs into one implementation (the signer, parser, and listing interface are already shared); the per-object footer stash at open (RDMA opens with a plain HEAD); custom LIST caps (RDMA uses the built-in limits for now) |
+| Two logical endpoints — host plane + RDMA data plane; the configured addresses may be identical | A single shared endpoint configuration (no separate data-plane settings) |
+| Fixed per-GPU registered arena | Multi-GPU enablement (structure ships, gate covers one GPU) |
+| Basic byte/request/failure metrics | Full metric parity with the REST backend |
+| One-shot device reads | Automatic RDMA retry (a single pre-approved retry exists as a response to a soak failure, Section 5) |
+| Restart-based recovery | Hot recovery of a failed transport context |
+
+Known-size open is also out of scope; footer and metadata reads are
+plain HEAD and range GET on the host plane.
+
+## 3. Architecture and Ownership
+
+```mermaid
+flowchart LR
+  subgraph proc["Sirius process"]
+    scan["Parquet scan"] --> ioctx["s3_rdma_ioctx"]
+    ioctx --> ctl["control client<br/>(one HTTP attempt per call)"]
+    ioctx --> q["bounded request-envelope queue"]
+    q --> w["workers<br/>(one RDMA session each)"]
+    w --> arena["per-GPU registered arena<br/>(slot layout settled at preflight)"]
+    arena -->|"D2D on the caller stream"| rmm["RMM destination<br/>(caller-owned, not registered)"]
+  end
+  ctl -->|"HEAD / footer / range GET"| s3["s3_endpoint<br/>(any S3 service)"]
+  w -->|"token-bearing signed GET"| gw["s3_rdma_data.endpoint<br/>(cuObject gateway, direct connect)"]
+  gw -->|"RDMA write"| arena
+  s3 --- store[("same backing store,<br/>immutable keys")]
+  gw --- store
+```
+
+The host plane (`s3_endpoint`) is any S3 service, speaking standard
+SigV4 HEAD, footer, and range GETs. The data plane (`s3_rdma_data.endpoint`)
+is a direct-connect cuObject gateway carrying token-bearing GETs plus the
+publisher HEAD of the visibility barrier below; both front the same
+backing store and bucket namespace.
+
+The ioctx owns the reactor, the reactor the worker pool, and each worker
+its own RDMA session; sessions are not shared. Registration-to-session
+binding — and with it the arena slot layout — is a preflight result
+(Section 7). The caller's RMM destination is not registered with the NIC.
+
+The request queue holds envelopes, not chunks: a submitter enqueues one
+descriptor and returns, workers expand chunks lazily, and admission
+blocks only at the per-ioctx bound — a per-chunk bound would block a
+large read's submitter on its own transfer.
+
+Two deployment rules keep the endpoints consistent. Keys are append-only
+and immutable while readable. Before a key becomes queryable, the
+publisher completes a visibility barrier: HEAD succeeds at both endpoints
+with matching sizes, and content identity is confirmed by a trusted ETag
+or the publishing manifest's object hash. The query path does not send
+HEAD to the gateway.
+
+For split addresses, the publisher visibility barrier above applies. If
+the two configured addresses are identical and one service serves both
+planes, cross-endpoint checks reduce to that service's native S3
+consistency; immutable keys remain required, and reads do not revalidate
+object versions.
+
+## 4. Read Lifecycle
+
+```mermaid
+sequenceDiagram
+  participant S as Scanner
+  participant I as s3_rdma_ioctx
+  participant Q as envelope queue
+  participant W as worker
+  participant G as gateway
+  participant C as CUDA runtime
+  S->>I: open exact-key object (size from HEAD on the host plane)
+  S->>I: device read into an RMM destination
+  I->>Q: submit one request envelope (blocks only at the cap)
+  Q->>W: worker claims a chunk (lazy, FIFO)
+  W->>W: stream capture check - before the GET is issued
+  W->>G: signed token-bearing GET (token and Range inside the signature)
+  G-->>W: RDMA write into the arena slot, then the wire reply - HTTP status + reply tag
+  W->>W: session result - transferred byte count n
+  W->>W: exact completion check - reply tag AND HTTP status AND n == expected
+  W->>C: flush (only when the ordering attribute is NONE)
+  W->>C: enqueue the D2D copy and its completion event on the caller stream
+  W->>C: wait on the event from the worker thread
+  C-->>W: cudaSuccess
+  W->>W: complete the chunk and release the slot
+  W-->>S: the request future resolves after all chunks complete
+```
+
+Object sizes come from a host-plane HEAD (its timing relative to open is
+an implementation choice). The stream capture check runs before the GET —
+in release builds too — so an undeliverable request makes no remote
+write.
+
+A chunk proceeds to delivery on exact completion — valid reply tag,
+successful HTTP status, and a byte count equal to the request — with the
+accepted values recorded at preflight and reused unchanged.
+
+Flush policy follows the GPU's RDMA write-ordering attribute, read once
+at initialization: `OWNER` and `ALL_DEVICES` need no flush; `NONE` takes
+one flush after each exact completion, before that chunk's copy; an
+unknown attribute, or `NONE` without a working flush mechanism, fails
+RDMA initialization.
+
+The request future succeeds only after every chunk completes; a chunk
+error that is not process-fatal resolves it as an error, and no partial
+result is reported as success. Callers use the future to decide whether
+the destination is valid.
+
+## 5. Safety and Failure Semantics
+
+The safety model has two irreversible boundaries. A token-bearing GET
+that may have reached the gateway creates a possible remote writer to
+the registered arena; the first `cudaMemcpyAsync` call creates a
+possible local GPU writer to caller-owned RMM memory. A failure is recoverable only when Sirius
+can prove the relevant writer has stopped: an uncertain RDMA completion
+therefore fail-stops the transport, and an uncertain copy is
+process-fatal.
+
+The local-delivery half follows the existing REST staged-device-read
+lifecycle — a reactor-owned source slot is retained until the CUDA copy
+on the caller stream is confirmed by an event; the rules here add what
+that lifecycle never faced: remote-writer ambiguity and
+registered-memory lifetime.
+
+The diagram shows the state flow for one chunk; the outcome table below
+remains the normative definition of the effects on the request future
+and arena lifetime.
+
+```mermaid
+stateDiagram-v2
+  [*] --> PreIssue: chunk claimed / slot leased
+
+  PreIssue --> RequestError: non-sticky local failure (GET provably not issued)
+  PreIssue --> ProcessFatal: sticky CUDA error
+  PreIssue --> RDMAInFlight: token-bearing GET may have reached the gateway
+
+  RDMAInFlight --> TransportFailStop: completion non-exact or unknown
+  RDMAInFlight --> ReadyToDeliver: exact completion (tag + status + expected bytes)
+
+  ReadyToDeliver --> RequestError: non-sticky failure before the first cudaMemcpyAsync call
+  ReadyToDeliver --> ProcessFatal: sticky CUDA error
+  ReadyToDeliver --> CopyInFlight: flush if required, then the first cudaMemcpyAsync call (the boundary)
+
+  CopyInFlight --> Delivered: event wait reports cudaSuccess
+  CopyInFlight --> ProcessFatal: any error from memcpy, record, or wait
+
+  Delivered --> [*]: chunk complete / slot reusable
+  RequestError --> [*]: request marked failed / slot released
+
+  note right of TransportFailStop
+    The request future errors after issued work settles.
+    The arena remains allocated.
+    Recovery requires process restart.
+  end note
+
+  note right of ProcessFatal
+    A sticky CUDA error at any phase enters this state.
+    The future is not resolved and the arena is not freed.
+  end note
+```
+
+The sticky set is CUDA's documented classification, checked against the
+tree's classifier. After the first `cudaMemcpyAsync` call, only an event wait
+reporting `cudaSuccess` proves the copy has stopped writing; an
+event-destroy failure after that successful wait is logged and does not
+change the delivery outcome.
+
+| Outcome | Action | Future | Arena |
+|---|---|---|---|
+| Exact RDMA completion and confirmed D2D | Complete; resolve after all chunks | Success | Slot reusable |
+| Non-sticky error before the first `cudaMemcpyAsync` call | Report the error; the reactor continues | Error | Slot released |
+| Non-exact or unknown RDMA outcome | Reactor fail-stop; process restart required | Error | Entire arena non-freeable |
+| Sticky CUDA error, or any error at or after the first `cudaMemcpyAsync` call (event-destroy excepted) | Process-fatal termination | Not resolved | Never freed |
+
+On entering `TransportFailStop`, the ioctx marks the shared admission
+gate terminal and refuses new work; host- and device-plane operations
+alike surface the same terminal error. An operation already past its
+side-effect point — holding the permit acquired when its control call
+starts or its transfer is issued — settles;
+queued envelopes and their ungenerated chunks error-complete; work
+claimed but not issued aborts and releases its slot; blocked submitters
+wake. Shutdown completes when the last in-flight permit releases, so the
+worker that triggered the fail-stop never waits on itself.
+
+Destination contents are unspecified after any failed read: earlier
+chunks may already have landed in the caller's buffer.
+
+Token-bearing GETs are one-shot, and the gateway must not retry, hedge,
+mirror, cache, or coalesce them: a replay can reuse an RDMA descriptor
+after its slot has been reassigned. The direct-connect endpoint enforces
+this on the path, and a gateway conformance check verifies it. The only
+exception is the soak-failure retry of Section 7, for requests provably
+never issued to the gateway.
+
+Normal teardown frees the arena only behind a drain barrier: admission
+stopped, every issued transfer exactly complete, every enqueued copy
+confirmed, all workers joined. After a fail-stop or a process-fatal
+failure the barrier is unreachable, and the arena stays allocated for the
+life of the process.
+
+## 6. Configuration and Security
+
+| Key | Meaning | Default |
+|---|---|---|
+| `s3_transport` | `HTTP` or `RDMA`; explicit opt-in | `HTTP` |
+| `s3_endpoint` | Host plane: any S3 service | existing setting |
+| `s3_rdma_data.endpoint` | Data plane: cuObject gateway; required in RDMA mode — initialization fails when unset. The `s3_rdma_data` block also carries region, credentials, signing mode, and TLS for the data plane; when its access key is unset, host-plane credentials are inherited as a whole | none |
+| `s3_rdma_queue_cap` | Per-ioctx bound on pending request envelopes | not yet defined — set when the bounded queue lands |
+| `SIRIUS_ENABLE_S3_RDMA` | Build flag for the cuObject data plane | off |
+
+This phase adds no new tuning surface: worker count and arena slot size
+keep their settings. Reads are one-shot, so the retry counter
+must read zero; a nonzero value is a defect.
+
+Signing is per endpoint. The data endpoint requires header-signing (the
+descriptor token and `Range` header travel inside the SigV4 signature)
+and rejects a presigned-mode authorizer at initialization; the host
+endpoint keeps its configured mode. Descriptor tokens are redacted from
+logs and traces in every profile.
+
+Request-level fault-injection hooks exist only in test builds: release
+artifacts contain none, a production-mode start refuses to run with hooks
+enabled, and hooks cannot be reached through request headers. CUDA
+delivery calls are injectable at construction time for tests.
+Configuration and request headers cannot reach that seam; release builds
+construct with the real CUDA entry points.
+
+The rig may run an unsigned gateway and a non-TLS control plane, but not
+with production data or credentials, and not on an uncontrolled network.
+Gateway-side SigV4 verification, end-to-end TLS, authorization, replay
+and token hardening, and signed-profile qualification form the post-GO
+production gate (Section 7); unsigned rig results do not extrapolate to
+the signed path.
+
+## 7. Validation and GO/STOP
+
+Validation runs in three stages on the rig, each gating the next, then
+the post-GO production gate. Throughout this section, a **clean run**
+means correct payload checksums and no fail-stops, process-fatal exits,
+or short, missing, or wrong completions.
+
+| Gate | What runs | Pass condition |
+|---|---|---|
+| Preflight | Probes for the registration/session shape, completion constants, and write-ordering attribute with flush availability (Appendix A) | Constants recorded once, reused unchanged by every later test; one arena layout selected, or the phase stops here |
+| Hardware correctness | The correctness workload and fault matrix of Appendix A | Checksums correct; flush counts match the ordering attribute; no Sirius-side host staging or H2D; every injected fault ends in its Section 5 outcome, and no failed read is reported as a partial success |
+| Performance | Sustained reads at six object sizes from 128 KiB to 1 GiB; the three small sizes also run HTTP for comparison (procedure: Appendix A) | Sizes of 16 MiB and above reach the 85% bound; the small-size comparison is reported and settles the fallback question of Section 1; every size is a clean run with no host staging or H2D |
+| Reliability | 100 million 4 MiB token-bearing GETs with varied payload patterns | Every GET is a clean run, with zero unexpected runner restarts |
+| Production (post-GO) | The signed/TLS/security profile of Section 6 | Full correctness, performance, and soak re-run on the signed profile |
+
+A failed soak has one recovery path: when the client can prove the
+failing request was never issued, the Section 5 retry may be enabled and
+the full soak re-run from zero, the re-run deciding GO or STOP under the
+same criteria. Otherwise — the re-run fails, the proof cannot be made, or
+any other gate fails — the decision is STOP: restart the process and
+return to `s3_transport=HTTP`. The build flag stays off by default
+throughout.
+
+## 8. Open Risks and Preconditions
+
+The real cuObject path has not yet completed hardware qualification;
+implementation progress is tracked in the implementation PR. The risks
+below are resolved or measured by the Section 7 gates and do not change
+the V1 safety contract.
+
+| Risk | Treatment |
+|---|---|
+| SDK registration scope | Preflight selects a supported registration/session layout; if none of the planned arena layouts can absorb the SDK's binding, the evaluation stops there. |
+| Gateway dependency | The data plane requires a controlled cuObject gateway; the evaluation cannot run against a plain S3 endpoint. |
+| GPU/NIC topology | PCIe placement across root complexes can halve bandwidth; hardware qualification records the locality and the performance gate verifies the selected topology. |
+| No-retry reliability | A transient-fault rate above roughly one in twenty-five million GETs fails the soak; the 100-million-GET soak measures this before any retry mechanism is considered. |
+| D2D delivery cost | Staging-window and per-chunk D2D costs are estimates; the performance gate measures delivery end to end into caller-owned RMM, so the copy cost sits inside the 85% bound. |
+
+## 9. Decisions Requested
+
+The positions are the ones this document describes; the team is asked:
+
+1. GPU destination (Section 3): is the extra GPU-local copy acceptable,
+   rather than registering arbitrary RMM allocations?
+2. Endpoint topology (Section 3): is the two-plane configuration
+   acceptable — the full publisher barrier for split addresses, native S3
+   consistency plus immutable keys for same-address deployments?
+3. Failure policy (Section 5): is restart-based recovery acceptable for
+   V1 — no fallback after an RDMA request is selected or fails?
+4. CUDA boundary (Section 5): when delivery cannot be proven, is
+   terminating the process and never freeing the arena acceptable?
+5. Concurrency model (Sections 3 and 6): is the envelope bound with one
+   RDMA session per worker the right resource model? (Registration layout
+   is a preflight result.)
+6. Evaluation gate (Section 7): are these the right GO/STOP criteria?
+   (The small-object routing threshold is a follow-up decision, not set
+   in this PR.)
+
+Registration scope, reply-tag constants, and GPU write-ordering behavior
+are preflight measurements, not design votes. Worker count, chunk size,
+and slot layout are implementation choices within the proposed V1
+contract.
+
+## Appendix A. Qualification Procedure
+
+Preflight records, once, the constants every later test reuses
+unchanged: the registration/session shape and the arena layout it
+permits, the accepted HTTP status set, the reply-tag value and parse
+rule, the byte count reported on failed responses, and the GPU
+write-ordering attribute with flush availability.
+
+The hardware-correctness stage runs checksum stress at full worker count
+with one session per worker, slot-reuse churn, flush counting, and decode
+stress on the copy stream. Its fault matrix injects missing, wrong, and
+short replies; an ambiguous transport fault; and a session result with a
+valid reply tag, `n == expected`, and a non-success HTTP status.
+
+Performance runs use one configuration frozen after preflight — worker,
+chunk, slot, and arena settings held constant, no per-size tuning —
+against a warm server cache, at 128 KiB, 1 MiB, 4 MiB, 16 MiB, 128 MiB,
+and 1 GiB. Object size and RDMA chunk size are distinct: transfers keep
+normal Sirius chunking rather than forcing one RDMA request per object.
+Each size sustains repeated reads for at least
+ten seconds per trial, with two warm-ups and at least seven measured
+trials. Throughput is measured from device-read submission through
+delivery into the caller-owned RMM buffer — queueing, RDMA, required
+flushes, D2D copies, and request completion — excluding one-time
+initialization, arena registration, object HEAD, and warm-up. A large
+size passes when the one-sided 95% Student-t lower confidence bound of
+the arithmetic mean of its per-trial throughputs reaches 85% of the link
+rate (85 Gbps on the current 100 Gbps rig); the same statistic is
+computed for both arms at the small sizes. HTTP results are a required
+output but do not determine GO or STOP; the 85% floor is grounded in the
+~91 Gbps standalone-benchmark measurement cited in the header.

@@ -78,7 +78,7 @@ struct claim_fixture {
 
   explicit claim_fixture(duckdb::JoinType join_type = duckdb::JoinType::INNER)
   {
-    channel->register_producer();
+    channel->register_producer({kProbeColumnIndex});
 
     gpu_space = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, kDeviceId);
     REQUIRE(gpu_space != nullptr);

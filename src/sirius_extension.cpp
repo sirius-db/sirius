@@ -66,6 +66,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "duckdb/storage/single_file_block_manager.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -118,7 +119,9 @@ extern "C" int cudaProfilerStop();
 #include "io/types.hpp"                // sirius::io::sirius_ioctx
 #include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
 
+#include <cstdint>
 #include <cstdlib>
+#include <string_view>
 #include <unordered_map>
 
 namespace duckdb {
@@ -131,6 +134,24 @@ bool SiriusExtension::buffer_is_initialized = false;
 constexpr std::string QUERY_LABEL_PARAM_KEY = "query_label";
 
 namespace {
+
+bool test_options_enabled() noexcept
+{
+  auto const* value = std::getenv("SIRIUS_ENABLE_TEST_OPTIONS");
+  return value != nullptr && std::string_view{value} == "1";
+}
+
+std::uint64_t count_narrowed_columns(
+  sirius::pinned_column_storage_matrix const& column_storage) noexcept
+{
+  std::uint64_t count = 0;
+  for (auto const& chunk : column_storage) {
+    for (auto const& column : chunk) {
+      count += column.narrowed ? 1 : 0;
+    }
+  }
+  return count;
+}
 
 unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
                                                         Connection& connection,
@@ -1171,6 +1192,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     throw InvalidInputException("pin_table requires the Sirius context to be initialized");
   }
 
+  auto pin_registry_guard = sirius_ctx->lock_pinned_table_registry();
+
   // Pin materialization mutates the shared scan-manager registry and drives
   // the shared GPU runtime, so it runs inside its own execution window.
   // finish() at the end of this body quiesces any transient per-query state
@@ -1241,7 +1264,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   vector<LogicalType> pinned_column_types;
   // The pin transaction's MVCC fence on the pinned table's own AttachedDatabase;
   // meaningful only for format == "duckdb" (see duckdb_mvcc_metadata::v_base).
-  transaction_t duckdb_pin_v_base = 0;
+  transaction_t duckdb_pin_v_base               = 0;
+  std::uint64_t duckdb_pin_checkpoint_iteration = 0;
 
   if (data.args.format == "duckdb") {
     auto info = build_duckdb_pin_info(
@@ -1253,9 +1277,15 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     // start_time domain, and pins usually target an ATTACHed .db (the catalog
     // resolved by build_duckdb_pin_info), so read the fence off that catalog's
     // DuckTransaction.
-    auto& pinned_catalog = Catalog::GetCatalog(context, info->catalog_name);
-    duckdb_pin_v_base    = DuckTransaction::Get(context, pinned_catalog).start_time;
-    ingestible           = sirius::op::scan::make_ingestible(std::move(info));
+    auto& pinned_catalog      = Catalog::GetCatalog(context, info->catalog_name);
+    duckdb_pin_v_base         = DuckTransaction::Get(context, pinned_catalog).start_time;
+    auto const* block_manager = dynamic_cast<SingleFileBlockManager const*>(
+      &info->storage->GetAttached().GetStorageManager().GetBlockManager());
+    if (block_manager == nullptr) {
+      throw InvalidInputException("pin_table: DuckDB-native pins require a single-file database");
+    }
+    duckdb_pin_checkpoint_iteration = block_manager->GetCheckpointIteration();
+    ingestible                      = sirius::op::scan::make_ingestible(std::move(info));
   } else {  // parquet
     auto& fs   = FileSystem::GetFileSystem(context);
     auto files = fs.GlobFiles(data.args.path);
@@ -1272,9 +1302,12 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     ingestible = sirius::op::scan::make_ingestible(std::move(info));
   }
 
-  if (!sirius_ctx->get_config().get_operator_params().enable_pinned_zone_map_pruning) {
-    pinned_column_types.clear();
-  }
+  auto const& pin_op_params      = sirius_ctx->get_config().get_operator_params();
+  bool const capture_chunk_stats = pin_op_params.enable_pinned_zone_map_pruning;
+  // Read from the connection running the CALL, so a table pins with the carriers that
+  // connection asked for rather than whatever another connection set last.
+  bool const compressed_pin = duckdb::compressed_materialization_enabled(context);
+  if (!capture_chunk_stats && !compressed_pin) { pinned_column_types.clear(); }
 
   // Build the cache descriptor (table identity + column layout) from the
   // ingestible; it is stored on the pinned entry in place of the heavyweight
@@ -1332,9 +1365,6 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
         pin_comp.min_batch_size_bytes    = comp_cfg.min_batch_size_bytes;
         pin_comp.max_compressed_fraction = comp_cfg.max_compressed_fraction;
         pin_comp.column_names            = cache_info.column_names();
-        pin_comp.column_threads          = comp_cfg.column_threads;
-        // Mirror into the decompress converters (no per-context config there).
-        sirius::set_decompress_column_threads(comp_cfg.column_threads);
         SIRIUS_LOG_INFO("[pin_table] '{}' tier={}: compressing with plan for {} column(s)",
                         data.args.name,
                         data.args.tier,
@@ -1353,14 +1383,33 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     }
   }
 
-  if (data.args.tier == "host") {
-    auto host_result = sirius::materialize_pin_to_host(*ingestible,
-                                                       gpu_spaces_mut,
-                                                       host_space_by_gpu,
-                                                       *scan_mgr.io_ctx(),
-                                                       pinned_column_types,
-                                                       pin_comp);
+  auto attach_duckdb_mvcc_metadata = [&](std::vector<std::size_t> base_row_count_per_chunk) {
+    if (data.args.format != "duckdb") { return; }
+    sirius::scan_manager::duckdb_mvcc_metadata mvcc;
+    mvcc.v_base                   = duckdb_pin_v_base;
+    mvcc.base_row_count_per_chunk = std::move(base_row_count_per_chunk);
+    mvcc.checkpoint_iteration     = duckdb_pin_checkpoint_iteration;
+    scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
+  };
 
+  if (data.args.tier == "host") {
+    // Stream each batch GPU->host: materialize one batch on its round-robin GPU, convert it
+    // to a pinned host representation (compressed when it qualifies) on that GPU's NUMA-local
+    // host space, then free the GPU table before materializing the next. Peak GPU residency
+    // stays at ~one batch, so the whole table never needs to fit in GPU memory. On multi-GPU
+    // the chunks land round-robin across NUMA nodes; the cached-serve path then reads each
+    // chunk back on a NUMA-local GPU.
+    auto host_result =
+      sirius::materialize_pin_to_host(*ingestible,
+                                      gpu_spaces_mut,
+                                      host_space_by_gpu,
+                                      *scan_mgr.io_ctx(),
+                                      pinned_column_types,
+                                      pin_comp,
+                                      {.capture_chunk_stats               = capture_chunk_stats,
+                                       .enable_compressed_materialization = compressed_pin});
+    sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
+      count_narrowed_columns(host_result.column_storage));
     // entry.memory_space is metadata only; each host_chunk carries its own per-GPU
     // NUMA-local memory_space. Pass a representative (the first GPU's host space).
     int const first_gpu_id          = gpu_spaces_mut[0]->get_device_id();
@@ -1371,47 +1420,51 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                       std::move(host_result.chunks),
                                       *representative_host_space,
                                       std::move(pinned_column_types),
-                                      std::move(host_result.chunk_stats));
-    if (data.args.format == "duckdb") {
-      sirius::scan_manager::duckdb_mvcc_metadata mvcc;
-      mvcc.v_base                   = duckdb_pin_v_base;
-      mvcc.base_row_count_per_chunk = std::move(host_result.base_row_count_per_chunk);
-      scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
-    }
+                                      std::move(host_result.chunk_stats),
+                                      std::move(host_result.column_storage));
+    attach_duckdb_mvcc_metadata(std::move(host_result.base_row_count_per_chunk));
   } else if (pin_comp.enabled) {
-    // GPU tier, compression enabled: materialize each batch and compress it when it
-    // qualifies, keeping the compressed payload in device memory; batches that do
-    // not qualify are pinned uncompressed. Both forms land in one ordered chunk
-    // vector, so a table that mixes them pins without special-casing.
+    // GPU tier, compression enabled: narrow each materialized batch (when narrowing is
+    // on), then compress it when it qualifies, keeping the compressed payload in device
+    // memory; batches that do not qualify are pinned uncompressed. Both forms land in
+    // one ordered chunk vector, so a table that mixes them pins without special-casing.
     auto dev_result = sirius::materialize_all_batches_compressed(
-      *ingestible, gpu_spaces_mut, *scan_mgr.io_ctx(), pin_comp);
+      *ingestible,
+      gpu_spaces_mut,
+      *scan_mgr.io_ctx(),
+      pinned_column_types,
+      pin_comp,
+      {.capture_chunk_stats = false, .enable_compressed_materialization = compressed_pin});
+    sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
+      count_narrowed_columns(dev_result.column_storage));
 
-    scan_mgr.insert_pinned_entry_device(
-      data.args.name, std::move(cache_info), std::move(dev_result.chunks), *gpu_spaces_mut[0]);
-    if (data.args.format == "duckdb") {
-      sirius::scan_manager::duckdb_mvcc_metadata mvcc;
-      mvcc.v_base                   = duckdb_pin_v_base;
-      mvcc.base_row_count_per_chunk = std::move(dev_result.base_row_count_per_chunk);
-      scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
-    }
+    scan_mgr.insert_pinned_entry_device(data.args.name,
+                                        std::move(cache_info),
+                                        std::move(dev_result.chunks),
+                                        *gpu_spaces_mut[0],
+                                        std::move(dev_result.column_storage));
+    attach_duckdb_mvcc_metadata(std::move(dev_result.base_row_count_per_chunk));
   } else {
     // GPU tier, uncompressed: materialize every batch as a GPU-resident cudf::table
     // (with its GPU placement) and pin them in place.
-    auto mat = sirius::materialize_all_batches(
-      *ingestible, gpu_spaces_mut, *scan_mgr.io_ctx(), pinned_column_types);
+    auto mat =
+      sirius::materialize_all_batches(*ingestible,
+                                      gpu_spaces_mut,
+                                      *scan_mgr.io_ctx(),
+                                      pinned_column_types,
+                                      {.capture_chunk_stats               = capture_chunk_stats,
+                                       .enable_compressed_materialization = compressed_pin});
+    sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
+      count_narrowed_columns(mat.column_storage));
     auto base_row_count_per_chunk = std::move(mat.base_row_count_per_chunk);
     scan_mgr.insert_pinned_entry(data.args.name,
                                  std::move(cache_info),
                                  std::move(mat.tables),
                                  std::move(mat.chunk_memory_spaces),
                                  std::move(pinned_column_types),
-                                 std::move(mat.chunk_stats));
-    if (data.args.format == "duckdb") {
-      sirius::scan_manager::duckdb_mvcc_metadata mvcc;
-      mvcc.v_base                   = duckdb_pin_v_base;
-      mvcc.base_row_count_per_chunk = std::move(base_row_count_per_chunk);
-      scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
-    }
+                                 std::move(mat.chunk_stats),
+                                 std::move(mat.column_storage));
+    attach_duckdb_mvcc_metadata(std::move(base_row_count_per_chunk));
   }
 
   output.SetCardinality(1);
@@ -1453,6 +1506,7 @@ void SiriusExtension::UnpinTableFunction(ClientContext& context,
   if (!sirius_ctx) {
     throw InvalidInputException("unpin_table requires the Sirius context to be initialized");
   }
+  auto pin_registry_guard = sirius_ctx->lock_pinned_table_registry();
   {
     // Registry removal must be serialized against execution windows (plan
     // generation reads pinned entries); a lock-only guard suffices — unpin
@@ -1635,6 +1689,7 @@ static void throw_if_sirius_runtime_unavailable(ClientContext& context)
   }
 }
 
+#ifdef SIRIUS_ENABLE_LEGACY
 static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& parameter)
 {
   throw_if_sirius_runtime_unavailable(context);
@@ -1656,6 +1711,7 @@ static void SetUseCudfExpr(ClientContext& context, SetScope scope, Value& parame
   Config::USE_CUDF_EXPR = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config USE_CUDF_EXPR to {}", Config::USE_CUDF_EXPR);
 }
+#endif
 
 static void ApplyExpressionEvaluatorStrategy(const std::string& value)
 {
@@ -1692,6 +1748,7 @@ static void SetExpressionExecutorStrategyDeprecated(ClientContext& context,
   ApplyExpressionEvaluatorStrategy(StringValue::Get(parameter));
 }
 
+#ifdef SIRIUS_ENABLE_LEGACY
 static void SetUseCustomTopN(ClientContext& context, SetScope scope, Value& parameter)
 {
   throw_if_sirius_runtime_unavailable(context);
@@ -1736,6 +1793,7 @@ static void SetEnableFallbackCheck(ClientContext& context, SetScope scope, Value
   Config::ENABLE_FALLBACK_CHECK = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_FALLBACK_CHECK to {}", Config::ENABLE_FALLBACK_CHECK);
 }
+#endif
 
 static void SetEnableDuckdbFallback(ClientContext& /*context*/,
                                     SetScope /*scope*/,
@@ -1755,12 +1813,14 @@ static void SetEnableRegexJitImpl(ClientContext& context, SetScope scope, Value&
   SIRIUS_LOG_DEBUG("Updated config ENABLE_REGEX_JIT_IMPL to {}", Config::ENABLE_REGEX_JIT_IMPL);
 }
 
+#ifdef SIRIUS_ENABLE_LEGACY
 static void SetModifiedPipeline(ClientContext& context, SetScope scope, Value& parameter)
 {
   throw_if_sirius_runtime_unavailable(context);
   Config::MODIFIED_PIPELINE = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config MODIFIED_PIPELINE to {}", Config::MODIFIED_PIPELINE);
 }
+#endif
 
 static void SetFuseMergePipelines(ClientContext& /*context*/,
                                   SetScope /*scope*/,
@@ -1831,10 +1891,12 @@ static void SetMaxSortPartitionMemoryFraction(ClientContext& context,
 
 static void SetHashPartitionBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
+  auto const bytes = UBigIntValue::Get(parameter);
+  if (bytes == 0) { throw InvalidInputException("hash_partition_bytes must be greater than zero"); }
   auto* params = get_operator_params(context);
   if (!params) { return; }
   auto slot                    = lock_operator_params_slot(context);
-  params->hash_partition_bytes = UBigIntValue::Get(parameter);
+  params->hash_partition_bytes = bytes;
   SIRIUS_LOG_DEBUG("Updated config HASH_PARTITION_BYTES to {}", params->hash_partition_bytes);
 }
 
@@ -1980,16 +2042,6 @@ static void SetPinTableCompressionMaxCompressedFraction(ClientContext& context,
   SIRIUS_LOG_DEBUG("Updated pin_table_compression_max_compressed_fraction");
 }
 
-static void SetCompressionColumnThreads(ClientContext& context, SetScope scope, Value& parameter)
-{
-  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!sirius_ctx) { return; }
-  const auto n = static_cast<int>(BigIntValue::Get(parameter));
-  sirius_ctx->get_config().get_compression_config().column_threads = n;
-  sirius::set_decompress_column_threads(n);
-  SIRIUS_LOG_DEBUG("Updated compression_column_threads to {}", n);
-}
-
 static void SetEnableDynamicFilter(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2052,8 +2104,24 @@ static void SetEnablePinnedZoneMapPruning(ClientContext& context, SetScope scope
                    params->enable_pinned_zone_map_pruning);
 }
 
-void SiriusExtension::InitialGPUConfigs(DBConfig& config)
+static void SetEnableCompressedMaterialization(ClientContext& /*context*/,
+                                               SetScope /*scope*/,
+                                               Value& /*parameter*/)
 {
+  // Deliberately empty: DuckDB has already stored the value on the connection that ran the SET
+  // by the time this hook runs. The hook exists only to copy that value somewhere else, and
+  // there is nowhere else it belongs — planning and pinning read it straight back with
+  // compressed_materialization_enabled(). A copy kept in shared state would answer for every
+  // connection, so one connection's SET would redirect another's scans while that connection's
+  // current_setting still reported the old value.
+}
+
+void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_config& defaults)
+{
+  auto const& operator_defaults    = defaults.get_operator_params();
+  auto const& compression_defaults = defaults.get_compression_config();
+
+#ifdef SIRIUS_ENABLE_LEGACY
   // Add in config option for gpu buffer manager
   config.AddExtensionOption("use_pin_memory",
                             "Whether or not the buffer manager is initialized with pinned memory",
@@ -2074,6 +2142,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(Config::USE_CUDF_EXPR),
                             SetUseCudfExpr);
+#endif
 
   config.AddExtensionOption(
     "expression_evaluator_strategy",
@@ -2092,6 +2161,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     Value(std::string(sirius::strategy_to_string(Config::EXPRESSION_EVALUATOR_STRATEGY))),
     SetExpressionExecutorStrategyDeprecated);
 
+#ifdef SIRIUS_ENABLE_LEGACY
   // Add in config option for top-N
   config.AddExtensionOption("use_custom_top_n",
                             "Whether or not custom kernel is used to evalaute top n",
@@ -2129,6 +2199,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(Config::ENABLE_FALLBACK_CHECK),
                             SetEnableFallbackCheck);
+#endif
 
   config.AddExtensionOption(
     "enable_duckdb_fallback",
@@ -2139,14 +2210,15 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                            // fallback policy into every freshly-created database).
     SetEnableDuckdbFallback);
 
-  // TEST ONLY: when non-empty, transparent GPU execution fails at runtime with that
-  // message after plan generation succeeds, to exercise the CPU fallback path. No
-  // setter — the value is read via TryGetCurrentSetting in PhysicalSiriusExecution.
-  config.AddExtensionOption(
-    "sirius_test_inject_transparent_gpu_error",
-    "TEST ONLY: force transparent GPU execution to fail at runtime with this message",
-    LogicalType::VARCHAR,
-    Value(""));
+  // Test hooks are absent from normal duckdb_settings(). The unittest harness opts in before
+  // constructing any database so fallback tests can still inject a deterministic runtime error.
+  if (test_options_enabled()) {
+    config.AddExtensionOption(
+      "sirius_test_inject_transparent_gpu_error",
+      "TEST ONLY: force transparent GPU execution to fail at runtime with this message",
+      LogicalType::VARCHAR,
+      Value(""));
+  }
 
   // Add in config options for special JIT implementation for regex
   config.AddExtensionOption(
@@ -2156,12 +2228,14 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     Value::BOOLEAN(Config::ENABLE_REGEX_JIT_IMPL),
     SetEnableRegexJitImpl);
 
+#ifdef SIRIUS_ENABLE_LEGACY
   // Add in config options for modified pipeline
   config.AddExtensionOption("modified_pipeline",
                             "Whether to use modified pipeline for GPU execution",
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(Config::MODIFIED_PIPELINE),
                             SetModifiedPipeline);
+#endif
 
   config.AddExtensionOption("fuse_merge_pipelines",
                             "Fuse eligible GROUP BY and TOP_N merges into downstream pipelines",
@@ -2174,7 +2248,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
   config.AddExtensionOption("scan_task_batch_size",
                             "The default batch size for a duckdb scan task",
                             LogicalType::UBIGINT,
-                            Value::UBIGINT(sirius::operator_params{}.scan_task_batch_size),
+                            Value::UBIGINT(operator_defaults.scan_task_batch_size),
                             SetDefaultScanTaskBatchSize);
 
   // Add in config option for sort partition size
@@ -2182,13 +2256,13 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             "Maximum bytes per sort partition (0 = auto based on "
                             "max_sort_partition_memory_fraction of GPU memory)",
                             LogicalType::UBIGINT,
-                            Value::UBIGINT(sirius::operator_params{}.max_sort_partition_bytes),
+                            Value::UBIGINT(operator_defaults.max_sort_partition_bytes),
                             SetMaxSortPartitionBytes);
   config.AddExtensionOption(
     "max_sort_partition_memory_fraction",
     "Fraction of available GPU memory per sort partition when max_sort_partition_bytes is 0",
     LogicalType::DOUBLE,
-    Value::DOUBLE(sirius::operator_params{}.max_sort_partition_memory_fraction),
+    Value::DOUBLE(operator_defaults.max_sort_partition_memory_fraction),
     SetMaxSortPartitionMemoryFraction);
 
   // Logging configuration
@@ -2216,26 +2290,26 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
   config.AddExtensionOption("hash_partition_bytes",
                             "Target size in bytes per hash partition",
                             LogicalType::UBIGINT,
-                            Value::UBIGINT(sirius::operator_params{}.hash_partition_bytes),
+                            Value::UBIGINT(operator_defaults.hash_partition_bytes),
                             SetHashPartitionBytes);
 
   config.AddExtensionOption("concat_batch_bytes",
                             "Target size for concat operator",
                             LogicalType::UBIGINT,
-                            Value::UBIGINT(sirius::operator_params{}.concat_batch_bytes),
+                            Value::UBIGINT(operator_defaults.concat_batch_bytes),
                             SetConcatBatchBytes);
 
   config.AddExtensionOption("sort_sample_bytes",
                             "Target bytes to sample before computing sort partition boundaries",
                             LogicalType::UBIGINT,
-                            Value::UBIGINT(sirius::operator_params{}.sort_sample_bytes),
+                            Value::UBIGINT(operator_defaults.sort_sample_bytes),
                             SetSortSampleBytes);
 
   config.AddExtensionOption("max_build_hash_table_bytes",
                             "Maximum size a build-side table can be where it will create a "
                             "reusable hash table for hash joins (i.e. BUILD_PROBE mode)",
                             LogicalType::UBIGINT,
-                            Value::UBIGINT(sirius::operator_params{}.max_build_hash_table_bytes),
+                            Value::UBIGINT(operator_defaults.max_build_hash_table_bytes),
                             SetMaxBuildHashTableBytes);
 
   config.AddExtensionOption("max_broadcast_join_size",
@@ -2243,7 +2317,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             "(small) build table is replicated to every GPU instead of "
                             "hash-partitioned across GPUs",
                             LogicalType::UBIGINT,
-                            Value::UBIGINT(sirius::operator_params{}.max_broadcast_join_size),
+                            Value::UBIGINT(operator_defaults.max_broadcast_join_size),
                             SetMaxBroadcastJoinSize);
 
   config.AddExtensionOption(
@@ -2252,7 +2326,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     "right (probe) side has at least this many times more rows than the left side (0 disables). "
     "Hardware-dependent — recalibrate per GPU.",
     LogicalType::DOUBLE,
-    Value::DOUBLE(sirius::operator_params{}.mark_join_build_switch_ratio),
+    Value::DOUBLE(operator_defaults.mark_join_build_switch_ratio),
     SetMarkJoinBuildSwitchRatio);
 
   config.AddExtensionOption(
@@ -2265,7 +2339,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
   config.AddExtensionOption("pin_table_compression",
                             "Enable Simpatico compression for pin_table(tier=>'host') chunks",
                             LogicalType::BOOLEAN,
-                            Value::BOOLEAN(false),
+                            Value::BOOLEAN(compression_defaults.enable_pin_table_compression),
                             SetEnablePinTableCompression);
 
   config.AddExtensionOption(
@@ -2274,14 +2348,14 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     "Files are named '<table_name>.<ext>'; their contents are the multi-column plan DSL. "
     "Tables with no matching file are pinned uncompressed. No effect on spill compression.",
     LogicalType::VARCHAR,
-    Value(std::string{}),
+    Value(compression_defaults.input_plan_dir),
     SetPinTableInputCompressionPlanDir);
 
   config.AddExtensionOption(
     "pin_table_compression_min_batch_size_bytes",
     "Minimum uncompressed batch size in bytes below which pin_table compression is skipped",
     LogicalType::UBIGINT,
-    Value::UBIGINT(1ULL * 1024 * 1024),
+    Value::UBIGINT(compression_defaults.min_batch_size_bytes),
     SetPinTableCompressionMinBatchSizeBytes);
 
   config.AddExtensionOption(
@@ -2289,24 +2363,15 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     "Discard the compressed form and pin uncompressed when the compressed size exceeds this "
     "fraction of the batch's original size (i.e. compression saved too little)",
     LogicalType::DOUBLE,
-    Value::DOUBLE(0.95),
+    Value::DOUBLE(compression_defaults.max_compressed_fraction),
     SetPinTableCompressionMaxCompressedFraction);
-
-  config.AddExtensionOption(
-    "compression_column_threads",
-    "Column-parallelism degree for Simpatico (de)compression: fan a table's columns across this "
-    "many worker threads/streams (one column per stream). <=1 = sequential. Capped at the column "
-    "count. Applies to both the pin-time compress path and the scan-time decompress converters",
-    LogicalType::BIGINT,
-    Value::BIGINT(4),
-    SetCompressionColumnThreads);
 
   config.AddExtensionOption(
     "enable_dynamic_filter",
     "Enable runtime dynamic-filter discovery for eligible BUILD_PROBE hash joins; targets may be "
     "probe-side scans or join-edge endpoints (on by default)",
     LogicalType::BOOLEAN,
-    Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_filter),
+    Value::BOOLEAN(operator_defaults.enable_dynamic_filter),
     SetEnableDynamicFilter);
 
   config.AddExtensionOption(
@@ -2314,7 +2379,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     "Additionally emit build-key min/max filters: parquet scans use them for row-group pruning; "
     "duckdb-native scans apply them post-decode; requires enable_dynamic_filter (off by default)",
     LogicalType::BOOLEAN,
-    Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_zone_map_filter),
+    Value::BOOLEAN(operator_defaults.enable_dynamic_zone_map_filter),
     SetEnableDynamicZoneMapFilter);
 
   config.AddExtensionOption(
@@ -2322,7 +2387,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     "Skip publishing a key's dynamic filters when the hash-join build covers at least this "
     "fraction of the key's domain; >= 1.0 effectively disables the gate",
     LogicalType::DOUBLE,
-    Value::DOUBLE(sirius::operator_params{}.dynamic_filter_domain_coverage_threshold),
+    Value::DOUBLE(operator_defaults.dynamic_filter_domain_coverage_threshold),
     SetDynamicFilterDomainCoverageThreshold);
 
   config.AddExtensionOption(
@@ -2331,7 +2396,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     "this fraction of its rows (too unselective to repay the mask kernel); in [0.0, 1.0], 1.0 "
     "keeps filtering always on",
     LogicalType::DOUBLE,
-    Value::DOUBLE(sirius::operator_params{}.dynamic_filter_keep_threshold),
+    Value::DOUBLE(operator_defaults.dynamic_filter_keep_threshold),
     SetDynamicFilterKeepThreshold);
 
   config.AddExtensionOption(
@@ -2340,8 +2405,18 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     "filter matches no rows; also gates the statistics capture during CALL pin_table, so a table "
     "pinned while off carries no zone maps until re-pinned with the flag on",
     LogicalType::BOOLEAN,
-    Value::BOOLEAN(sirius::operator_params{}.enable_pinned_zone_map_pruning),
+    Value::BOOLEAN(operator_defaults.enable_pinned_zone_map_pruning),
     SetEnablePinnedZoneMapPruning);
+
+  // Default from the YAML-loaded params, so a sirius.yaml value is what connections inherit.
+  config.AddExtensionOption(
+    "enable_compressed_materialization",
+    "Keep eligible integer and fixed-point DECIMAL columns in value-preserving narrow cuDF "
+    "carriers selected from exact pin-time bounds; restore native carriers at type-sensitive "
+    "boundaries (on by default)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.enable_compressed_materialization),
+    SetEnableCompressedMaterialization);
 }
 
 // Publish the transparent optimizer mask once at extension load, unioned
@@ -2393,7 +2468,9 @@ static void LoadInternal(ExtensionLoader& loader)
   install_configured_log_sink(&db);
 
   sirius::converter_registry::initialize();
-  SiriusExtension::InitialGPUConfigs(config);
+  // The callback constructor above already read sirius.yaml, so its params are the defaults the
+  // per-connection options register with.
+  SiriusExtension::InitialGPUConfigs(config, callback_ptr->get_loaded_config());
   SiriusExtension::RegisterGPUFunctions(db);
 
   // Register the s3:// FileSystem so DuckDB's native read_parquet('s3://') binds
@@ -2405,13 +2482,15 @@ static void LoadInternal(ExtensionLoader& loader)
   // "S3 CPU fallback is not supported" error; local reads fall back to CPU).
   db.GetFileSystem().RegisterSubSystem(make_uniq<sirius::io::s3::sirius_httpfs>());
 
-  // Register optimizer extension for transparent GPU execution. Only the
-  // post-hook remains (plan capture); the optimizer mask a pre-hook used to
-  // write per query is published once at load (see
-  // publish_transparent_optimizer_mask above), and DuckDB skips a null
-  // pre_optimize_function.
+  // Register optimizer extension for transparent GPU execution. The post-hook
+  // captures the optimized plan; the pre-hook derives the single-table
+  // restrictions implied by OR-ed multi-table filters so DuckDB's own pushdown,
+  // join-order and build/probe-side passes can act on them. (The optimizer mask
+  // an earlier pre-hook used to write per query is published once at load — see
+  // publish_transparent_optimizer_mask above.)
   OptimizerExtension opt_ext;
-  opt_ext.optimize_function = sirius::transparent::sirius_optimizer_hook;
+  opt_ext.pre_optimize_function = sirius::transparent::sirius_pre_optimizer_hook;
+  opt_ext.optimize_function     = sirius::transparent::sirius_optimizer_hook;
   OptimizerExtension::Register(config, std::move(opt_ext));
 
   // Register SiriusContext on connections that were opened before the extension

@@ -36,6 +36,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <span>
 #include <unordered_map>
 #include <unordered_set>
@@ -603,9 +604,14 @@ class sirius_dynamic_filter_set {
   void ignore_columns(std::vector<std::size_t> const& cols);
 
   /**
-   * @brief Mark that a producer has been wired to this channel at plan time
+   * @brief Mark that a producer has been wired to this channel at plan time, together with the
+   * columns it plans to publish filters for
+   *
+   * @p planned_target_columns is in the channel's push-coordinate space (the same space @ref
+   * push_filter receives). An empty vector registers an unscoped producer: consumers that need
+   * the target set must then assume every column is a potential target.
    */
-  void register_producer();
+  void register_producer(std::vector<std::size_t> planned_target_columns);
 
   /**
    * @brief True iff at least one producer can publish into this channel
@@ -613,6 +619,22 @@ class sirius_dynamic_filter_set {
   [[nodiscard]] bool has_producers() const noexcept
   {
     return _producer_count.load(std::memory_order_acquire) > 0;
+  }
+
+  /**
+   * @brief Union of all producers' planned target columns, sorted, in the channel's
+   * push-coordinate space
+   *
+   * Meaningful only when has_producers() && !has_unscoped_producer().
+   */
+  [[nodiscard]] std::vector<std::size_t> planned_target_columns() const;
+
+  /**
+   * @brief True iff any producer registered without declaring its target columns
+   */
+  [[nodiscard]] bool has_unscoped_producer() const noexcept
+  {
+    return _has_unscoped_producer.load(std::memory_order_acquire);
   }
 
   /**
@@ -665,6 +687,12 @@ class sirius_dynamic_filter_set {
   std::unordered_set<std::size_t> _ignored_columns;
 
   /**
+   * @brief Union of the plan-time producers' planned target columns (channel push-coordinate
+   * space); see @ref register_producer
+   */
+  std::set<std::size_t> _planned_target_columns;
+
+  /**
    * @brief Total filters pushed across all columns; backs the lock-free @ref has_filters
    */
   std::atomic<std::size_t> _filter_count{0};
@@ -674,6 +702,12 @@ class sirius_dynamic_filter_set {
    * elided
    */
   std::atomic<std::size_t> _producer_count{0};
+
+  /**
+   * @brief True once any producer registered without declaring its target columns; backs the
+   * lock-free @ref has_unscoped_producer
+   */
+  std::atomic<bool> _has_unscoped_producer{false};
 
   /**
    * @brief False once the consumer has drained

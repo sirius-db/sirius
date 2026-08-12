@@ -29,11 +29,14 @@ void stream_pool::shutdown()
   streams.clear();
 }
 
-void stream_pool::sync_all()
+cudaError_t stream_pool::sync_all()
 {
+  cudaError_t first = cudaSuccess;
   for (auto& stream : streams) {
-    cudaStreamSynchronize(stream);
+    cudaError_t err = cudaStreamSynchronize(stream);
+    if (first == cudaSuccess && err != cudaSuccess) { first = err; }
   }
+  return first;
 }
 
 }  // namespace simpatico

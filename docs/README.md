@@ -44,9 +44,10 @@ For full build instructions, alternate build types, pre-commit setup, and testin
 Quick start:
 
 ```bash
-git clone --recurse-submodules https://github.com/sirius-db/sirius.git
+git clone --no-recurse-submodules https://github.com/sirius-db/sirius.git
 cd sirius
-pixi run make
+git submodule update --init --depth=1 --jobs 3 duckdb substrait cucascade
+pixi run make TEST_BUILD_TARGET=
 ./build/release/duckdb
 ```
 
@@ -97,6 +98,12 @@ CALL unpin_table('lineitem');
 
 `tier = 'gpu'` pins columns in GPU memory for the fastest scans; `tier = 'host'` pins them in
 pinned host memory instead, for tables larger than GPU memory.
+
+Deletes and committed inserts on pinned DuckDB tables are reconciled per query. `UPDATE`,
+`MERGE ... UPDATE`, and `INSERT ... ON CONFLICT DO UPDATE` are rejected while the target table is
+pinned; run `CALL unpin_table(...)` before updating it. An explicit `CHECKPOINT` while a pin is
+live makes that pin ineligible to serve: subsequent queries fall back or error until the table is
+unpinned and pinned again.
 
 ## Configuration
 

@@ -3996,11 +3996,16 @@ TEST_CASE("gpu_execution - empty parquet count identity",
                    "COPY (SELECT 1 AS i WHERE false) TO " +
                      sql_string_literal(parquet_path.string()) + " (FORMAT PARQUET);");
   require_query_ok(*fixture.con, "SET gpu_execution = true;");
-  auto result = compare_gpu_vs_cpu_with_watchdog(
+  require_query_ok(*fixture.con, "SET enable_compressed_materialization = false;");
+  auto const before_stats = sirius::test::get_compressed_materialization_stats(*fixture.con);
+  auto result             = compare_gpu_vs_cpu_with_watchdog(
     *fixture.con,
     "select count(*) as c from read_parquet(" + sql_string_literal(parquet_path.string()) + ");",
     std::chrono::seconds{30},
     [&fixture] { fixture.leak_after_timeout(); });
+  auto const after_stats = sirius::test::get_compressed_materialization_stats(*fixture.con);
+  REQUIRE(after_stats.scan_columns_narrowed == before_stats.scan_columns_narrowed);
+  REQUIRE(after_stats.scan_columns_restored == before_stats.scan_columns_restored);
   REQUIRE(result.row_count == 1);
   REQUIRE(result.column_count == 1);
   CHECK(result.rows == std::vector<std::vector<std::string>>{{"0"}});

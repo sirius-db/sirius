@@ -43,6 +43,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <shared_mutex>
 #include <string_view>
 #include <unordered_set>
 #include <utility>
@@ -91,6 +92,17 @@ class SiriusConnectionState : public ClientContextState {
 
   /// A new query on this connection invalidates any leftover capture.
   void QueryBegin(ClientContext& context) final { captured_plan_.reset(); }
+
+  void QueryEnd() final { pinned_update_guard_.reset(); }
+
+  [[nodiscard]] bool has_pinned_update_guard() const noexcept
+  {
+    return pinned_update_guard_.has_value();
+  }
+  void set_pinned_update_guard(std::shared_lock<std::shared_mutex> guard)
+  {
+    pinned_update_guard_.emplace(std::move(guard));
+  }
 
   /// \brief Per-connection monotonic query ordinal, advanced by the shared
   /// SiriusContext's QueryBegin for SQL↔(instance, connection, query) log
@@ -175,6 +187,7 @@ class SiriusConnectionState : public ClientContextState {
   std::optional<std::string> pending_query_label_;
   std::atomic<int> internal_query_depth_{0};
   std::atomic<int> cpu_fallback_depth_{0};
+  std::optional<std::shared_lock<std::shared_mutex>> pinned_update_guard_;
   uint64_t connection_id_;
   uint64_t query_ordinal_ = 0;
 };
@@ -213,6 +226,28 @@ class SiriusContext : public ClientContextState {
     // via DuckDB CPU fallback (same transaction). Distinct from `fallbacks`, which
     // counts plan-time (create_plan) fallbacks that never reached the GPU.
     uint64_t runtime_fallbacks = 0;
+  };
+
+  /// Monotonic counters describing compressed-materialization activity.
+  ///
+  /// These counters intentionally describe columns rather than queries: a
+  /// single scan or pinned chunk can narrow or restore several columns.
+  struct compressed_materialization_stats {
+    uint64_t scan_columns_narrowed = 0;
+    uint64_t scan_columns_restored = 0;
+    uint64_t pin_columns_narrowed  = 0;
+    /// Plan-time count of TABLE_SCAN nodes that received a narrow physical
+    /// sidecar (post-residency-gate, pre-propagation/pruning — a later pass may
+    /// still clear or prune it).
+    uint64_t scan_sidecars_installed = 0;
+    /// Runtime count of input-batch columns that crossed an engaged hash
+    /// PARTITION with a carrier narrower than their native mapping. Derived
+    /// from actual batch types, so a regression anywhere in the narrow-carrier
+    /// chain drops it to zero.
+    uint64_t partition_narrow_columns = 0;
+    /// Plan-time count of narrow scan sidecar targets flipped back to native; the keep/retract rule
+    /// is `apply_tier_narrowing_policy`'s.
+    uint64_t scan_narrow_targets_retracted = 0;
   };
 
   SiriusContext();
@@ -478,6 +513,10 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] sirius::scan_manager::sirius_scan_manager& get_scan_manager();
   [[nodiscard]] const sirius::scan_manager::sirius_scan_manager& get_scan_manager() const;
 
+  /// Coordinate update execution with pin-registry mutations.
+  std::shared_lock<std::shared_mutex> lock_pinned_table_updates();
+  std::unique_lock<std::shared_mutex> lock_pinned_table_registry();
+
   [[nodiscard]] std::shared_ptr<const sirius::telemetry::telemetry_context> get_telemetry_context()
     const;
 
@@ -532,6 +571,28 @@ class SiriusContext : public ClientContextState {
   /// via DuckDB CPU fallback (same transaction).
   void record_transparent_runtime_fallback() noexcept;
 
+  /// \brief Snapshot counters for compressed-materialization observability.
+  [[nodiscard]] compressed_materialization_stats get_compressed_materialization_stats()
+    const noexcept;
+
+  /// \brief Record columns narrowed while materializing a scan batch.
+  void record_compressed_materialization_scan_columns_narrowed(uint64_t count = 1) noexcept;
+
+  /// \brief Record columns restored to their native type at a scan boundary.
+  void record_compressed_materialization_scan_columns_restored(uint64_t count = 1) noexcept;
+
+  /// \brief Record columns narrowed while materializing a pinned chunk.
+  void record_compressed_materialization_pin_columns_narrowed(uint64_t count = 1) noexcept;
+
+  /// \brief Record a TABLE_SCAN node that received a narrow physical sidecar at plan time.
+  void record_compressed_materialization_scan_sidecar_installed() noexcept;
+
+  /// \brief Record narrow-carrier columns crossing an engaged hash PARTITION.
+  void record_compressed_materialization_partition_narrow_columns(uint64_t count = 1) noexcept;
+
+  /// \brief Record narrow scan targets flipped back to native by the tier narrowing policy.
+  void record_compressed_materialization_scan_narrow_targets_retracted(uint64_t count = 1) noexcept;
+
  private:
   void throw_if_not_initialized() const;
   /// Acquire the slot. Errors on same-thread reacquire — a nested acquire on
@@ -572,6 +633,9 @@ class SiriusContext : public ClientContextState {
   // DuckDB's user-visible result lifetime, so an abandoned stream or pending
   // result holds nothing.
   std::mutex query_lifecycle_mutex_;
+  // Pin and unpin take this exclusively; updates hold it from validation
+  // through QueryEnd so neither operation can pass the other between checks.
+  std::shared_mutex pinned_table_update_mutex_;
   std::atomic<bool> query_lifecycle_held_{false};
   // Hash of the holder's thread id, written under the gate while held, 0 when
   // free. Read (relaxed) before acquiring ONLY to detect a same-thread
@@ -636,6 +700,12 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_fallback_count_{0};
   std::atomic<uint64_t> transparent_execution_count_{0};
   std::atomic<uint64_t> transparent_runtime_fallback_count_{0};
+  std::atomic<uint64_t> compressed_materialization_scan_columns_narrowed_count_{0};
+  std::atomic<uint64_t> compressed_materialization_scan_columns_restored_count_{0};
+  std::atomic<uint64_t> compressed_materialization_pin_columns_narrowed_count_{0};
+  std::atomic<uint64_t> compressed_materialization_scan_sidecars_installed_count_{0};
+  std::atomic<uint64_t> compressed_materialization_partition_narrow_columns_count_{0};
+  std::atomic<uint64_t> compressed_materialization_scan_narrow_targets_retracted_count_{0};
 };
 
 /// Installs the sink selected by `Config::LOG_BACKEND` (with `Config::LOG_*`).
@@ -670,6 +740,15 @@ class SiriusContextExtensionCallback : public ExtensionCallback {
   //! Called after an extension fails to load loading
   void OnExtensionLoadFail(DatabaseInstance& db, const string& name, const ErrorData& error) final;
 
+  /// \brief The configuration this callback read from sirius.yaml, or compiled defaults when no
+  ///        file was found.
+  ///
+  /// The constructor reads the file, so this is populated before InitialGPUConfigs registers the
+  /// extension options. Options whose value DuckDB stores per connection take their registered
+  /// default from here, which is what makes a YAML value the default every connection inherits
+  /// and reports through `current_setting`.
+  [[nodiscard]] const sirius::sirius_config& get_loaded_config() const noexcept { return config_; }
+
  private:
   void read_config_file_if_exists();
 
@@ -682,6 +761,17 @@ class SiriusContextExtensionCallback : public ExtensionCallback {
 /// Gates both plan-time and runtime fallback from GPU to DuckDB CPU. Set per
 /// connection via `SET enable_duckdb_fallback = ...`.
 bool duckdb_fallback_enabled(ClientContext& context);
+
+/// \brief Read the per-session `enable_compressed_materialization` setting.
+///
+/// DuckDB stores this value per connection, so it is the only authority on whether narrowing
+/// runs: planning and `CALL pin_table` both resolve it through here, against the context whose
+/// work they are doing. Reading it anywhere else would let one connection's `SET` decide another
+/// connection's behavior while `current_setting` still reported the old value.
+///
+/// The registered default carries the YAML value (see InitialGPUConfigs), so a
+/// `sirius.operator_params` entry is what a connection inherits until it sets its own.
+bool compressed_materialization_enabled(ClientContext& context);
 
 /// \brief Print the "GPU execution failed, falling back to DuckDB" banner.
 ///

@@ -51,6 +51,9 @@
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 #include <duckdb/common/allocator.hpp>
+#include <duckdb/execution/operator/persistent/physical_insert.hpp>
+#include <duckdb/execution/operator/persistent/physical_merge_into.hpp>
+#include <duckdb/execution/operator/persistent/physical_update.hpp>
 #include <duckdb/execution/physical_plan_generator.hpp>
 #include <io/types.hpp>
 #include <io/uring/uring_ioctx.hpp>
@@ -80,6 +83,89 @@ static constexpr std::string_view CONFIG_FILE_NAME        = "sirius.yaml";
 static constexpr std::string_view LEGACY_CONFIG_FILE_NAME = "sirius.cfg";
 static constexpr std::string_view CONFIG_FILE_DIR         = ".sirius";
 static constexpr std::string_view CONFIG_FILE_ENV_NAME    = "SIRIUS_CONFIG_FILE";
+
+optional_ptr<TableCatalogEntry const> find_update_target(PhysicalOperator const& op)
+{
+  switch (op.type) {
+    case PhysicalOperatorType::UPDATE: return &op.Cast<PhysicalUpdate>().tableref;
+    case PhysicalOperatorType::INSERT: {
+      auto const& insert = op.Cast<PhysicalInsert>();
+      if (insert.action_type == OnConflictAction::UPDATE && insert.insert_table) {
+        return &*insert.insert_table;
+      }
+      break;
+    }
+    case PhysicalOperatorType::MERGE_INTO: {
+      auto const& merge = op.Cast<PhysicalMergeInto>();
+      for (auto const& action : merge.actions) {
+        if (action->action_type == MergeActionType::MERGE_UPDATE && action->op) {
+          return find_update_target(*action->op);
+        }
+      }
+      break;
+    }
+    default: break;
+  }
+  for (auto const& child : op.GetChildren()) {
+    if (auto target = find_update_target(child.get())) { return target; }
+  }
+  return nullptr;
+}
+
+std::optional<std::string> pinned_name_for_table(
+  sirius::scan_manager::sirius_scan_manager const& scan_manager, TableCatalogEntry const& table)
+{
+  std::optional<std::string> result;
+  scan_manager.visit_pinned_entries([&](std::string_view name, auto const& entry) {
+    if (!entry.cache_info.matches_duckdb_table(
+          table.ParentCatalog().GetName(), table.ParentSchema().name, table.name)) {
+      return true;
+    }
+    result = name;
+    return false;
+  });
+  return result;
+}
+
+void reject_update_to_pinned_table(SiriusContext& sirius_context,
+                                   ClientContext& context,
+                                   PreparedStatementData& prepared)
+{
+  switch (prepared.statement_type) {
+    case StatementType::UPDATE_STATEMENT:
+    case StatementType::INSERT_STATEMENT:
+    case StatementType::MERGE_INTO_STATEMENT: break;
+    default: return;
+  }
+  if (!prepared.physical_plan) { return; }
+  auto target = find_update_target(prepared.physical_plan->Root());
+  if (!target) { return; }
+
+  auto connection_state = get_sirius_connection_state(context);
+  if (!connection_state) {
+    throw InternalException("Sirius connection state is unavailable while guarding UPDATE");
+  }
+
+  std::shared_lock<std::shared_mutex> update_guard;
+  if (!connection_state->has_pinned_update_guard()) {
+    update_guard = sirius_context.lock_pinned_table_updates();
+  }
+  {
+    SiriusContext::SlotGuard pin_registry_guard(sirius_context, context);
+    auto pinned_name = pinned_name_for_table(sirius_context.get_scan_manager(), *target);
+    if (pinned_name) {
+      throw InvalidInputException(
+        "Sirius does not support UPDATE on pinned DuckDB table '%s'. Run CALL "
+        "unpin_table('%s') before updating it",
+        target->name,
+        *pinned_name);
+    }
+  }
+
+  if (update_guard.owns_lock()) {
+    connection_state->set_pinned_update_guard(std::move(update_guard));
+  }
+}
 
 /// Resolve the config file path. Search order:
 ///   1. SIRIUS_CONFIG_FILE environment variable (explicit path)
@@ -598,7 +684,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
       SIRIUS_LOG_WARN(
         "SiriusContext: host space count ({}) != NUMA node count ({}) — "
         "expected one host space per NUMA domain. Check "
-        "sirius_config apply_defaults (.use_host_per_numa()) or YAML host "
+        "sirius_config apply_defaults (.use_numa_id_as_host_id()) or YAML host "
         "configuration.",
         mgpu05_host_spaces.size(),
         topo.num_numa_nodes);
@@ -936,6 +1022,16 @@ const sirius::scan_manager::sirius_scan_manager& SiriusContext::get_scan_manager
   return *scan_manager_;
 }
 
+std::shared_lock<std::shared_mutex> SiriusContext::lock_pinned_table_updates()
+{
+  return std::shared_lock(pinned_table_update_mutex_);
+}
+
+std::unique_lock<std::shared_mutex> SiriusContext::lock_pinned_table_registry()
+{
+  return std::unique_lock(pinned_table_update_mutex_);
+}
+
 std::shared_ptr<const sirius::telemetry::telemetry_context> SiriusContext::get_telemetry_context()
   const
 {
@@ -1024,6 +1120,63 @@ void SiriusContext::record_transparent_runtime_fallback() noexcept
   transparent_runtime_fallback_count_.fetch_add(1, std::memory_order_relaxed);
 }
 
+SiriusContext::compressed_materialization_stats
+SiriusContext::get_compressed_materialization_stats() const noexcept
+{
+  return compressed_materialization_stats{
+    .scan_columns_narrowed =
+      compressed_materialization_scan_columns_narrowed_count_.load(std::memory_order_relaxed),
+    .scan_columns_restored =
+      compressed_materialization_scan_columns_restored_count_.load(std::memory_order_relaxed),
+    .pin_columns_narrowed =
+      compressed_materialization_pin_columns_narrowed_count_.load(std::memory_order_relaxed),
+    .scan_sidecars_installed =
+      compressed_materialization_scan_sidecars_installed_count_.load(std::memory_order_relaxed),
+    .partition_narrow_columns =
+      compressed_materialization_partition_narrow_columns_count_.load(std::memory_order_relaxed),
+    .scan_narrow_targets_retracted =
+      compressed_materialization_scan_narrow_targets_retracted_count_.load(
+        std::memory_order_relaxed),
+  };
+}
+
+void SiriusContext::record_compressed_materialization_scan_columns_narrowed(uint64_t count) noexcept
+{
+  compressed_materialization_scan_columns_narrowed_count_.fetch_add(count,
+                                                                    std::memory_order_relaxed);
+}
+
+void SiriusContext::record_compressed_materialization_scan_columns_restored(uint64_t count) noexcept
+{
+  compressed_materialization_scan_columns_restored_count_.fetch_add(count,
+                                                                    std::memory_order_relaxed);
+}
+
+void SiriusContext::record_compressed_materialization_pin_columns_narrowed(uint64_t count) noexcept
+{
+  compressed_materialization_pin_columns_narrowed_count_.fetch_add(count,
+                                                                   std::memory_order_relaxed);
+}
+
+void SiriusContext::record_compressed_materialization_scan_sidecar_installed() noexcept
+{
+  compressed_materialization_scan_sidecars_installed_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SiriusContext::record_compressed_materialization_partition_narrow_columns(
+  uint64_t count) noexcept
+{
+  compressed_materialization_partition_narrow_columns_count_.fetch_add(count,
+                                                                       std::memory_order_relaxed);
+}
+
+void SiriusContext::record_compressed_materialization_scan_narrow_targets_retracted(
+  uint64_t count) noexcept
+{
+  compressed_materialization_scan_narrow_targets_retracted_count_.fetch_add(
+    count, std::memory_order_relaxed);
+}
+
 namespace {
 
 bool logical_plan_reads_s3(duckdb::LogicalOperator const& op)
@@ -1091,6 +1244,18 @@ bool duckdb_fallback_enabled(ClientContext& context)
   return true;
 }
 
+bool compressed_materialization_enabled(ClientContext& context)
+{
+  Value setting;
+  if (context.TryGetCurrentSetting("enable_compressed_materialization", setting) &&
+      !setting.IsNull()) {
+    return setting.GetValue<bool>();
+  }
+  // Reached only when the extension option is not registered, which is every caller that runs
+  // without a loaded Sirius extension.
+  return sirius::operator_params{}.enable_compressed_materialization;
+}
+
 void print_cpu_fallback_banner()
 {
   const bool tty  = ::isatty(::fileno(stdout)) != 0;
@@ -1109,6 +1274,9 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
                                                  PreparedStatementData& prepared,
                                                  PreparedStatementMode mode)
 {
+  if (!is_internal_query_active(context)) {
+    reject_update_to_pinned_table(*this, context, prepared);
+  }
   if (is_internal_query_active(context)) { return RebindQueryInfo::DO_NOT_REBIND; }
   auto conn_state = get_sirius_connection_state(context);
   // Mirror the optimizer hook's gpu_execution gate: when transparent execution
@@ -1308,13 +1476,15 @@ RebindQueryInfo SiriusContext::OnExecutePrepared(ClientContext& context,
                                                  PreparedStatementCallbackInfo& info,
                                                  RebindQueryInfo current_rebind)
 {
+  auto& prepared = info.prepared_statement;
+  reject_update_to_pinned_table(*this, context, prepared);
+
   // GPU eligibility can drift with data alone (e.g. an insert pushes a varchar past
   // the overflow-string limit) and data changes never trigger DuckDB's own rebind.
   // By execute time the CPU plan has been discarded, so a stale
   // PhysicalSiriusExecution would error with no fallback. Rebind instead:
   // OnFinalizePrepare re-decides against current stats and keeps the fresh CPU plan
   // when create_plan now refuses.
-  auto& prepared = info.prepared_statement;
   if (!prepared.unbound_statement || !prepared.physical_plan) { return current_rebind; }
   auto& root = prepared.physical_plan->Root();
   if (root.type == sirius::transparent::PhysicalSiriusExecution::TYPE &&

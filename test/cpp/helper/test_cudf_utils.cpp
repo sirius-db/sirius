@@ -14,19 +14,23 @@
  * limitations under the License.
  */
 
-// Tests for sirius::estimate_referenced_column_bytes (cudf/cudf_utils.hpp).
+// Tests for the type-mapping and schema helpers in cudf/cudf_utils.hpp:
+// sirius::estimate_referenced_column_bytes, the get_cudf_type / duckdb::GetCudfType mappings, and
+// the two sirius::make_empty_table overloads.
 //
 // The estimator only reads column metadata (type, size, nullability) and never dereferences
-// device buffers, so these tests fabricate metadata-only column_views over dummy non-null
-// sentinel pointers — no GPU memory is allocated or touched.
+// device buffers, so its tests fabricate metadata-only column_views over dummy non-null
+// sentinel pointers. The make_empty_table tests build real zero-row cuDF columns.
 
 #include "catch.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "helper/logical_type.hpp"
 
+#include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/traits.hpp>
@@ -188,4 +192,41 @@ TEST_CASE("GetCudfType - duckdb ARRAY mapping is independent of child and size",
   REQUIRE(
     duckdb::GetCudfType(LogicalType::ARRAY(LogicalType::BIGINT, duckdb::optional_idx(16))).id() ==
     cudf::type_id::LIST);
+}
+
+// ============================================================================
+// sirius::make_empty_table — the two schema sources
+// ============================================================================
+
+TEST_CASE("make_empty_table - the cudf-type overload reproduces the given carriers", "[cudf_utils]")
+{
+  // The carrier-exact overload is what lets a caller holding a physical_types sidecar reproduce
+  // narrow carriers verbatim; the hash join builds an absent side's empty batch this way.
+  std::vector<cudf::data_type> const carriers{cudf::data_type{cudf::type_id::INT16},
+                                              cudf::data_type{cudf::type_id::DECIMAL32, -2},
+                                              cudf::data_type{cudf::type_id::STRING}};
+
+  auto const table = sirius::make_empty_table(carriers);
+  REQUIRE(table != nullptr);
+  REQUIRE(table->num_columns() == static_cast<cudf::size_type>(carriers.size()));
+  REQUIRE(table->num_rows() == 0);
+  for (std::size_t column_idx = 0; column_idx < carriers.size(); column_idx++) {
+    REQUIRE(table->get_column(static_cast<cudf::size_type>(column_idx)).type() ==
+            carriers[column_idx]);
+  }
+}
+
+TEST_CASE("make_empty_table - the logical-type overload derives native carriers", "[cudf_utils]")
+{
+  // Columns whose narrow carriers the overload above reproduces verbatim come out at their wider
+  // native carriers here, which is what distinguishes the two schema sources.
+  duckdb::vector<logical_type> const types{logical_type::make(type_id::BIGINT),
+                                           logical_type::make_decimal(18, 2)};
+
+  auto const table = sirius::make_empty_table(types);
+  REQUIRE(table != nullptr);
+  REQUIRE(table->num_columns() == 2);
+  REQUIRE(table->num_rows() == 0);
+  REQUIRE(table->get_column(0).type() == cudf::data_type{cudf::type_id::INT64});
+  REQUIRE(table->get_column(1).type() == cudf::data_type{cudf::type_id::DECIMAL64, -2});
 }

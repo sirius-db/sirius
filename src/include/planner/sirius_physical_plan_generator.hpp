@@ -25,6 +25,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace sirius::op {
 class sirius_physical_table_scan;
@@ -33,7 +34,9 @@ class sirius_physical_table_scan;
 namespace duckdb {
 class ClientContext;
 class Expression;
+class FunctionData;
 class LogicalType;
+class Value;
 class GPUContext;
 class ColumnDataCollection;
 class LogicalOperator;
@@ -55,6 +58,18 @@ class LogicalCTERef;
 }  // namespace duckdb
 
 namespace sirius::planner {
+
+/// Resolved parquet file set identifying a parquet-family scan
+/// ("parquet_scan" / "read_parquet" / "sirius_read_parquet"), derived exactly
+/// as the scan's ingestible_table_info derives it — so a plan-time cache probe
+/// and the prepare-time cache match see the same identity. Returns empty when
+/// the identity cannot be resolved (non-parquet function, missing bind data,
+/// empty file list, or a missing/NULL sirius_read_parquet URI parameter);
+/// callers treat empty as "no identity", never as an error.
+[[nodiscard]] std::vector<std::string> resolve_parquet_scan_file_paths(
+  std::string_view function_name,
+  duckdb::FunctionData const* bind_data,
+  duckdb::vector<duckdb::Value> const& parameters);
 
 //! The physical plan generator generates a physical execution plan from a
 //! logical query plan
@@ -213,9 +228,12 @@ class sirius_physical_plan_generator {
   static void mark_fusable_merge_pipelines(sirius::op::sirius_physical_operator& op,
                                            bool fusion_enabled);
 
+ public:
   //! Walk the plan tree and insert the GPU pipeline operators (PARTITION, CONCAT, sort chain,
   //! merge operators, scan companions, GPU_VALUES) so the tree carries the full execution
-  //! structure before the pipeline converter runs.
+  //! structure before the pipeline converter runs. Public so wrap-contract tests can drive the
+  //! rewrite over hand-built operator trees and assert the wrapper shapes and physical-sidecar
+  //! copies directly.
   void insert_gpu_pipeline_operators(
     duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan);
 };

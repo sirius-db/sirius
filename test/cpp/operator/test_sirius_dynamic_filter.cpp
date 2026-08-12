@@ -193,10 +193,34 @@ TEST_CASE("sirius_dynamic_filter_set tracks wired producers", "[dynamic_filter]"
 {
   sirius_dynamic_filter_set set;
   REQUIRE_FALSE(set.has_producers());
+  REQUIRE_FALSE(set.has_unscoped_producer());
 
-  set.register_producer();
+  SECTION("a scoped producer declares its planned target columns")
+  {
+    set.register_producer({2, 0});
 
-  REQUIRE(set.has_producers());
+    REQUIRE(set.has_producers());
+    REQUIRE_FALSE(set.has_unscoped_producer());
+    REQUIRE(set.planned_target_columns() == std::vector<std::size_t>{0, 2});
+  }
+
+  SECTION("multiple scoped producers union their targets")
+  {
+    set.register_producer({1});
+    set.register_producer({3, 1});
+
+    REQUIRE(set.has_producers());
+    REQUIRE_FALSE(set.has_unscoped_producer());
+    REQUIRE(set.planned_target_columns() == std::vector<std::size_t>{1, 3});
+  }
+
+  SECTION("an empty target list registers an unscoped producer")
+  {
+    set.register_producer({});
+
+    REQUIRE(set.has_producers());
+    REQUIRE(set.has_unscoped_producer());
+  }
 }
 
 TEST_CASE("ignore_columns drops pushes for the marked output columns", "[dynamic_filter]")

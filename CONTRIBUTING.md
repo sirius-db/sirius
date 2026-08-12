@@ -46,7 +46,8 @@ To run all checks manually:
 pre-commit run -a
 ```
 
-Tools enforced: `clang-format` (C++/CUDA), `black` (Python), `cmake-format`, `codespell`.
+Tools enforced: `clang-format` (C++/CUDA), `black` (Python), `cmake-format`, `codespell`, and
+`rumdl` (Markdown links and anchors).
 
 ## Submodules
 
