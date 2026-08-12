@@ -30,15 +30,22 @@ enum class vector_join_mode : std::uint8_t {
   threshold,
 };
 
+/// - exact:      brute force, L2 computed Unexpanded, no GEMM.
+/// - exact_gemm: brute force, L2 computed Expanded (with GEMM). Exact for
+///               normalized / moderate-magnitude vectors.
+/// - approx:     not implemented yet
+enum class vector_join_search_mode : std::uint8_t {
+  exact,
+  exact_gemm,
+  approx,
+};
+
 /// The type of score to emit for each result pair, and which value space the join
 /// selects/thresholds in.
-///
-/// - similarity: higher is closer. For cosine on unit-normalized vectors this
-///   is the raw GEMM inner product, so it needs no exact-refine pass (the fast
-///   path). Threshold semantics are score >= eps.
-/// - distance:   lower is closer. The natural output for L2. Emitting an
-///   accurate value near zero requires an unexpanded recompute on the selected
-///   survivors. Threshold semantics are score <= eps.
+/// - similarity: higher is closer. For cosine this is the inner product
+///   (1 - distance). Threshold semantics are score >= eps.
+/// - distance:   lower is closer. The natural output for L2. Threshold semantics
+///   are score <= eps.
 enum class vector_join_output_type : std::uint8_t {
   similarity,
   distance,
@@ -56,8 +63,8 @@ struct vector_join_request {
   vector_join_side left;
   vector_join_side right;
   vector_join_mode mode;
-  std::string metric;          ///< distance metric
-  bool use_index{false};       ///< search_mode 'approx' => true, 'exact' => false
+  std::string metric;  ///< distance metric
+  vector_join_search_mode search_mode{vector_join_search_mode::exact_gemm};
   std::int64_t k{0};           ///< top-k
   std::int64_t n_clusters{0};  ///< number of clusters of k-means cluster
   std::int64_t n_probes{1};    ///< nearest clusters each point is assigned to
@@ -65,18 +72,6 @@ struct vector_join_request {
   double eps{0.0};             ///< distance/similarity threshold
   vector_join_output_type output_type{vector_join_output_type::distance};
 };
-
-/// True when the emitted score cannot be read straight off the GEMM and needs
-/// the exact unexpanded recompute on the selected survivors.
-///
-/// Only cosine + similarity is refine-free: on unit-normalized vectors the GEMM
-/// inner product is the cosine similarity. Every other combination derives its value
-/// from a subtraction that catastrophically cancels near zero, so it is
-/// recomputed unexpanded on the survivors.
-[[nodiscard]] inline bool needs_exact_refine(const vector_join_request& req)
-{
-  return !(req.metric == "cosine" && req.output_type == vector_join_output_type::similarity);
-}
 
 struct SiriusVectorJoinBindData : public duckdb::TableFunctionData {
   vector_join_request req;

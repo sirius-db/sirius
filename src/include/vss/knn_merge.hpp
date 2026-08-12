@@ -32,16 +32,16 @@ namespace sirius::vss {
 
 /**
  * @brief Merge per-part top-k results (one part per right batch) into a single
- *        per-query top-k, via cuVS `knn_merge_parts`.
+ *        per-query top-k, via cuVS knn_merge_parts.
  *
  * The join's selection stage searches each right batch separately, producing for
- * every left row a sorted top-k *within that batch*. This reduces those parts to
+ * every left row a sorted top-k within that batch. This reduces those parts to
  * the global top-k per left row.
  *
  * Input layout is part-major and flat: @p stacked_distances / @p stacked_neighbors
  * are `[n_parts * n_samples * k]`, part `p`'s `[n_samples, k]` block at offset
- * `p * n_samples * k` — exactly what concatenating the per-part partials in order
- * yields. Neighbor ids are expected to be *already global* (the selection stage
+ * `p * n_samples * k`, which is exactly what concatenating the per-part partials in
+ * order yields. Neighbor ids are expected to be *already global* (the selection stage
  * shifts them), so no per-part translation is applied here.
  *
  * Both parts must share @p n_samples and @p k (uniform k across right batches).
@@ -59,14 +59,14 @@ namespace sirius::vss {
  * @return Merged neighbor-index and distance columns `[n_samples*k]`, plus
  *         `n_samples` and `k`.
  */
-knn_result knn_merge_parts_topk(raft::device_resources const& res,
-                                cudf::column_view const& stacked_distances,
-                                cudf::column_view const& stacked_neighbors,
-                                int64_t n_samples,
-                                int64_t n_parts,
-                                int64_t k,
-                                rmm::cuda_stream_view stream,
-                                rmm::device_async_resource_ref mr =
-                                  cudf::get_current_device_resource_ref());
+knn_result knn_merge_parts_topk(
+  raft::device_resources const& res,
+  cudf::column_view const& stacked_distances,
+  cudf::column_view const& stacked_neighbors,
+  int64_t n_samples,
+  int64_t n_parts,
+  int64_t k,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 }  // namespace sirius::vss

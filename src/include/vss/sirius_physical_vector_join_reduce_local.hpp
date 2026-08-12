@@ -37,14 +37,15 @@ namespace sirius::op {
  * gather each left row's columns. Assumes right batches held >= k rows, so every
  * partial has k columns (the ragged-batch case is a TODO).
  */
-class sirius_physical_vector_join_local_merge : public sirius_physical_partition_consumer_operator {
+class sirius_physical_vector_join_reduce_local
+  : public sirius_physical_partition_consumer_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE =
-    SiriusPhysicalOperatorType::VECTOR_JOIN_LOCAL_MERGE;
+    SiriusPhysicalOperatorType::VECTOR_JOIN_REDUCE_LOCAL;
 
-  sirius_physical_vector_join_local_merge(duckdb::vector<sirius::logical_type> types,
-                               duckdb::idx_t estimated_cardinality,
-                               std::int64_t k);
+  sirius_physical_vector_join_reduce_local(duckdb::vector<sirius::logical_type> types,
+                                           duckdb::idx_t estimated_cardinality,
+                                           std::int64_t k);
 
   // Source + sink: blocking reduction between the selection and materialize pipelines.
   bool is_source() const override { return true; }
@@ -69,7 +70,7 @@ class sirius_physical_vector_join_local_merge : public sirius_physical_partition
 
  private:
   std::int64_t _k;
-  std::mutex _drain_mutex;             // guards concurrent get_next_task_input_data()
+  std::mutex _drain_mutex;                  // guards concurrent get_next_task_input_data()
   std::size_t _current_partition_index{0};  // next partition (left batch) to drain
 };
 

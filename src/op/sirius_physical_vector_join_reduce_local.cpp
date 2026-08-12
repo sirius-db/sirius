@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "vss/sirius_physical_vector_join_local_merge.hpp"
+#include "vss/sirius_physical_vector_join_reduce_local.hpp"
 
 #include "data/data_batch_utils.hpp"
 #include "vss/knn_merge.hpp"
@@ -26,9 +26,9 @@
 
 #include <raft/core/device_resources.hpp>
 
-#include <cucascade/memory/memory_space.hpp>
-
 #include <nvtx3/nvtx3.hpp>
+
+#include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -40,15 +40,17 @@
 
 namespace sirius::op {
 
-sirius_physical_vector_join_local_merge::sirius_physical_vector_join_local_merge(
+sirius_physical_vector_join_reduce_local::sirius_physical_vector_join_reduce_local(
   duckdb::vector<sirius::logical_type> types, duckdb::idx_t estimated_cardinality, std::int64_t k)
   : sirius_physical_partition_consumer_operator(
-      SiriusPhysicalOperatorType::VECTOR_JOIN_LOCAL_MERGE, std::move(types), estimated_cardinality),
+      SiriusPhysicalOperatorType::VECTOR_JOIN_REDUCE_LOCAL,
+      std::move(types),
+      estimated_cardinality),
     _k(k)
 {
 }
 
-std::unique_ptr<operator_data> sirius_physical_vector_join_local_merge::get_next_task_input_data()
+std::unique_ptr<operator_data> sirius_physical_vector_join_reduce_local::get_next_task_input_data()
 {
   // One merge task per partition (= one left batch): drain all its partials.
   std::lock_guard<std::mutex> lg(_drain_mutex);
@@ -67,14 +69,14 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_local_merge::get_next
   return std::make_unique<partitioned_operator_data>(std::move(all_batches), partition_idx);
 }
 
-std::unique_ptr<operator_data> sirius_physical_vector_join_local_merge::execute(
+std::unique_ptr<operator_data> sirius_physical_vector_join_reduce_local::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_vector_join_local_merge::execute"};
+  nvtx3::scoped_range nvtx_range{"sirius_physical_vector_join_reduce_local::execute"};
 
-  auto const& input          = dynamic_cast<const partitioned_operator_data&>(input_data);
-  auto const partition_idx   = input.get_partition_idx();
-  auto const& input_batches  = input.get_read_only_batches();
+  auto const& input         = dynamic_cast<const partitioned_operator_data&>(input_data);
+  auto const partition_idx  = input.get_partition_idx();
+  auto const& input_batches = input.get_read_only_batches();
 
   cucascade::memory::memory_space* space = nullptr;
   for (auto const& batch : input_batches) {
@@ -89,19 +91,30 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_local_merge::execute(
   // flattened row-major [n_samples * k]. Collect the two columns from every
   // partial; concatenating in order yields the part-major layout knn_merge_parts
   // expects (part p's [n_samples, k] block at row p*n_samples).
+  auto const part_rows =
+    static_cast<std::int64_t>(sirius::get_cudf_table_view(input_batches[0]).num_rows());
   std::vector<cudf::column_view> neighbor_views;
   std::vector<cudf::column_view> distance_views;
   neighbor_views.reserve(input_batches.size());
   distance_views.reserve(input_batches.size());
   for (auto const& ro : input_batches) {
     auto const tv = sirius::get_cudf_table_view(ro);
+    // knn_merge needs the same per-batch k across every right batch. Unequal part
+    // sizes mean one right batch had fewer than k rows (an uneven multi-batch
+    // right table); reject it rather than merge mismatched blocks into wrong
+    // results. k is already lowered to the right-table row count at plan time, so
+    // a single right batch never trips this.
+    if (static_cast<std::int64_t>(tv.num_rows()) != part_rows) {
+      throw std::runtime_error(
+        "[sirius_physical_vector_join_reduce_local] uneven right batches: a right batch "
+        "has fewer than k rows; reduce k or repartition the right table");
+    }
     neighbor_views.push_back(tv.column(0));
     distance_views.push_back(tv.column(1));
   }
 
   auto const n_parts   = static_cast<std::int64_t>(input_batches.size());
-  auto const part_rows = static_cast<std::int64_t>(sirius::get_cudf_table_view(input_batches[0]).num_rows());
-  auto const n_samples = part_rows / _k;  // uniform k assumed; leaf re-checks the total size
+  auto const n_samples = part_rows / _k;  // uniform k (checked above); leaf re-checks total size
 
   auto const mr = space->get_default_allocator();
 
@@ -109,14 +122,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_local_merge::execute(
   auto const stacked_distances = cudf::concatenate(distance_views, stream, mr);
 
   raft::device_resources res{stream};
-  auto merged = vss::knn_merge_parts_topk(res,
-                                          stacked_distances->view(),
-                                          stacked_neighbors->view(),
-                                          n_samples,
-                                          n_parts,
-                                          _k,
-                                          stream,
-                                          mr);
+  auto merged = vss::knn_merge_parts_topk(
+    res, stacked_distances->view(), stacked_neighbors->view(), n_samples, n_parts, _k, stream, mr);
 
   // Preserve the [neighbor_id, distance] layout and the partition (left batch)
   // so the materialize stage can gather each left row's output columns.
@@ -132,18 +139,19 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_local_merge::execute(
   return std::make_unique<partitioned_operator_data>(std::move(batches), partition_idx);
 }
 
-void sirius_physical_vector_join_local_merge::sink(const operator_data& output_data,
-                                        rmm::cuda_stream_view /*stream*/)
+void sirius_physical_vector_join_reduce_local::sink(const operator_data& output_data,
+                                                    rmm::cuda_stream_view /*stream*/)
 {
   auto const& part         = dynamic_cast<const partitioned_operator_data&>(output_data);
   auto const partition_idx = part.get_partition_idx();
   for (auto& batch : part.get_data_batches()) {
     for (auto& next_port_info : next_port_after_sink) {
-      auto* consumer = dynamic_cast<sirius_physical_partition_consumer_operator*>(
-        next_port_info.next_operator);
+      auto* consumer =
+        dynamic_cast<sirius_physical_partition_consumer_operator*>(next_port_info.next_operator);
       if (consumer == nullptr) {
         throw std::runtime_error(
-          "[sirius_physical_vector_join_local_merge::sink] next operator is not a partition consumer");
+          "[sirius_physical_vector_join_reduce_local::sink] next operator is not a partition "
+          "consumer");
       }
       consumer->push_data_batch_partitioned(
         next_port_info.next_operator_port_name, batch, partition_idx);
@@ -151,14 +159,14 @@ void sirius_physical_vector_join_local_merge::sink(const operator_data& output_d
   }
 }
 
-std::size_t sirius_physical_vector_join_local_merge::no_history_peak_memory_estimate(
+std::size_t sirius_physical_vector_join_reduce_local::no_history_peak_memory_estimate(
   const input_stats& stats) const
 {
   // Peak ~ the stacked partials (input) + the merged output; floor at 1 MiB.
   return std::max<std::size_t>(stats.bytes, std::size_t{1} << 20);
 }
 
-std::string sirius_physical_vector_join_local_merge::params_to_string() const
+std::string sirius_physical_vector_join_reduce_local::params_to_string() const
 {
   return "k=" + std::to_string(_k);
 }

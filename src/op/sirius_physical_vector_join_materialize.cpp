@@ -25,13 +25,14 @@
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
+#include <cudf/replace.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
-#include <cucascade/memory/memory_space.hpp>
-
 #include <nvtx3/nvtx3.hpp>
+
+#include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -169,24 +170,33 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::execute(
   auto const left_rows  = static_cast<int64_t>(left_table.num_rows());
   CUDF_EXPECTS(left_rows > 0 && total_rows % left_rows == 0,
                "VSS materialize: result rows are not a whole multiple of the left batch rows");
-  auto const k_eff = static_cast<cudf::size_type>(total_rows / left_rows);
+  auto const k_eff   = static_cast<cudf::size_type>(total_rows / left_rows);
   auto left_repeated = cudf::repeat(left_table, k_eff, stream, mr);
 
   // Right columns gathered by the global neighbor id.
-  auto right_gathered = cudf::gather(
-    _right_output_concat->view(), neighbor_view, cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
+  auto right_gathered = cudf::gather(_right_output_concat->view(),
+                                     neighbor_view,
+                                     cudf::out_of_bounds_policy::DONT_CHECK,
+                                     stream,
+                                     mr);
 
-  // Score: distance, or cosine similarity (1 - distance) when similarity is asked.
+  // Score: distance, or cosine similarity = max(0, 1 - distance).
   std::unique_ptr<cudf::column> score;
-  if (_request.output_type == sirius::vss::vector_join_output_type::similarity &&
-      _request.metric == "cosine") {
-    cudf::numeric_scalar<float> const one(1.0F, true, stream);
-    score = cudf::binary_operation(one,
-                                   distance_view,
-                                   cudf::binary_operator::SUB,
-                                   cudf::data_type{cudf::type_id::FLOAT32},
-                                   stream,
-                                   mr);
+  if (_request.metric == "cosine") {
+    cudf::numeric_scalar<float> const lo(0.0F, true, stream);
+    cudf::numeric_scalar<float> const hi(2.0F, true, stream);
+    auto distance = cudf::clamp(distance_view, lo, hi, stream, mr);
+    if (_request.output_type == sirius::vss::vector_join_output_type::similarity) {
+      cudf::numeric_scalar<float> const one(1.0F, true, stream);
+      score = cudf::binary_operation(one,
+                                     distance->view(),
+                                     cudf::binary_operator::SUB,
+                                     cudf::data_type{cudf::type_id::FLOAT32},
+                                     stream,
+                                     mr);
+    } else {
+      score = std::move(distance);
+    }
   } else {
     score = std::make_unique<cudf::column>(distance_view, stream, mr);
   }
@@ -196,8 +206,12 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::execute(
   auto left_cols  = left_repeated->release();
   auto right_cols = right_gathered->release();
   out_cols.reserve(left_cols.size() + right_cols.size() + 1);
-  for (auto& c : left_cols) { out_cols.push_back(std::move(c)); }
-  for (auto& c : right_cols) { out_cols.push_back(std::move(c)); }
+  for (auto& c : left_cols) {
+    out_cols.push_back(std::move(c));
+  }
+  for (auto& c : right_cols) {
+    out_cols.push_back(std::move(c));
+  }
   out_cols.push_back(std::move(score));
   auto out_table = std::make_unique<cudf::table>(std::move(out_cols));
 

@@ -32,9 +32,9 @@ class sirius_scan_manager;
 namespace sirius::op {
 
 /**
- * @brief The input handed to one sirius_physical_vector_join_selection::execute() call.
+ * @brief The input handed to one sirius_physical_vector_join_select::execute() call.
  *
- * VECTOR_JOIN_SELECTION (search stage) is a source: it Cartesian-walks the left×right
+ * VECTOR_JOIN_SELECT (search stage) is a source: it Cartesian-walks the left×right
  * pinned batch grid and emits one task per (left batch, right batch) pair. This
  * parcel names that pair by index into the operator's snapshotted batch views,
  * carries the estimated size (so the scheduler can reserve GPU memory), and once
@@ -56,14 +56,20 @@ class vector_join_input : public operator_data {
   /// execute() reads it via get_gpu_memory_space() and builds its output there.
   void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
                               rmm::cuda_stream_view /*stream*/) override
-  { _gpu_memory_space = const_cast<::cucascade::memory::memory_space*>(requested_memory_space); }
+  {
+    _gpu_memory_space = const_cast<::cucascade::memory::memory_space*>(requested_memory_space);
+  }
 
   /// Feeds the reservation system so the scheduler knows how much GPU memory this task needs.
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
-  { return _estimated_bytes; }
+  {
+    return _estimated_bytes;
+  }
 
   [[nodiscard]] ::cucascade::memory::memory_space* get_gpu_memory_space() const
-  { return _gpu_memory_space; }
+  {
+    return _gpu_memory_space;
+  }
 
   /// Index of this task's left batch (also the output partition, all of a left
   /// batch's per-right-batch partials share it, so the merge stage groups them).
@@ -92,14 +98,15 @@ class vector_join_input : public operator_data {
  * Dedup is the special case where left == right. Assumes both pinned tables fit
  * on the device for now.
  */
-class sirius_physical_vector_join_selection : public sirius_physical_operator {
+class sirius_physical_vector_join_select : public sirius_physical_operator {
  public:
-  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::VECTOR_JOIN_SELECTION;
+  static constexpr const SiriusPhysicalOperatorType TYPE =
+    SiriusPhysicalOperatorType::VECTOR_JOIN_SELECT;
 
-  sirius_physical_vector_join_selection(duckdb::vector<sirius::logical_type> types,
-                              duckdb::idx_t estimated_cardinality,
-                              sirius::vss::vector_join_request request,
-                              sirius::scan_manager::sirius_scan_manager* scan_manager);
+  sirius_physical_vector_join_select(duckdb::vector<sirius::logical_type> types,
+                                     duckdb::idx_t estimated_cardinality,
+                                     sirius::vss::vector_join_request request,
+                                     sirius::scan_manager::sirius_scan_manager* scan_manager);
 
   [[nodiscard]] const sirius::vss::vector_join_request& request() const { return _request; }
 

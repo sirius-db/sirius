@@ -53,7 +53,7 @@ void query::build_indices()
       if (source->type == op::SiriusPhysicalOperatorType::GPU_SCAN ||
           source->type == op::SiriusPhysicalOperatorType::GPU_VALUES ||
           source->type == op::SiriusPhysicalOperatorType::STREAMING_SOURCE ||
-          source->type == op::SiriusPhysicalOperatorType::VECTOR_JOIN_SELECTION) {
+          source->type == op::SiriusPhysicalOperatorType::VECTOR_JOIN_SELECT) {
         _scan_operators.push_back(source.get());
       }
     }

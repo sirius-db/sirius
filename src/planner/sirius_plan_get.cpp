@@ -41,9 +41,9 @@
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
-#include "vss/sirius_physical_vector_join_selection.hpp"
 #include "vss/sirius_physical_vector_join_materialize.hpp"
-#include "vss/sirius_physical_vector_join_local_merge.hpp"
+#include "vss/sirius_physical_vector_join_reduce_local.hpp"
+#include "vss/sirius_physical_vector_join_select.hpp"
 #include "vss/vector_join.hpp"
 
 #include <memory>
@@ -665,13 +665,25 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
                         ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                         : nullptr;
   if (!sirius_state) {
-    throw duckdb::InternalException("sirius_knn_join requires the Sirius context to be initialized");
+    throw duckdb::InternalException(
+      "sirius_knn_join requires the Sirius context to be initialized");
   }
   auto& scan_manager = sirius_state->get_scan_manager();
 
-  // Three-stage pipeline: selection (per-pair top-k) → merge (per-left-batch
+  // If k is larger than the number of rows in the right table, lower it to that row count.
+  auto req = bind_data.req;
+  {
+    const auto* right_pin = scan_manager.find_pinned_entry_for_duckdb_table(
+      req.right.catalog, req.right.schema, req.right.table);
+    if (right_pin != nullptr) {
+      auto const right_rows = static_cast<std::int64_t>(right_pin->num_rows);
+      if (req.k > right_rows) { req.k = right_rows; }
+    }
+  }
+
+  // Three-stage pipeline: select (per-pair top-k) → reduce_local (per-left-batch
   // reduction) → materialize (gather output columns + score into the TVF rows).
-  // The intermediate stages carry a [neighbor_id BIGINT, distance FLOAT] schema;
+  // The select/reduce stages carry a [neighbor_id BIGINT, distance FLOAT] schema;
   // only materialize emits the TVF's declared columns.
   auto intermediate_types = []() {
     duckdb::vector<sirius::logical_type> t;
@@ -680,20 +692,18 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
     return t;
   };
 
-  auto selection = duckdb::make_uniq<sirius::op::sirius_physical_vector_join_selection>(
-    intermediate_types(), op.estimated_cardinality, bind_data.req, &scan_manager);
+  auto selection = duckdb::make_uniq<sirius::op::sirius_physical_vector_join_select>(
+    intermediate_types(), op.estimated_cardinality, req, &scan_manager);
 
-  auto merge = duckdb::make_uniq<sirius::op::sirius_physical_vector_join_local_merge>(
-    intermediate_types(), op.estimated_cardinality, bind_data.req.k);
-  merge->children.push_back(std::move(selection));
+  auto reduce_local = duckdb::make_uniq<sirius::op::sirius_physical_vector_join_reduce_local>(
+    intermediate_types(), op.estimated_cardinality, req.k);
+
+  reduce_local->children.push_back(std::move(selection));
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> node =
     duckdb::make_uniq<sirius::op::sirius_physical_vector_join_materialize>(
-      sirius::from_duckdb_vec(op.returned_types),
-      op.estimated_cardinality,
-      bind_data.req,
-      &scan_manager);
-  node->children.push_back(std::move(merge));
+      sirius::from_duckdb_vec(op.returned_types), op.estimated_cardinality, req, &scan_manager);
+  node->children.push_back(std::move(reduce_local));
 
   auto column_ids  = op.GetColumnIds();
   bool is_identity = column_ids.size() == op.returned_types.size();

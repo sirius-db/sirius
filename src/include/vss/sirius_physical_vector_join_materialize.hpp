@@ -57,9 +57,9 @@ class sirius_physical_vector_join_materialize : public sirius_physical_partition
     SiriusPhysicalOperatorType::VECTOR_JOIN_MATERIALIZE;
 
   sirius_physical_vector_join_materialize(duckdb::vector<sirius::logical_type> types,
-                                     duckdb::idx_t estimated_cardinality,
-                                     sirius::vss::vector_join_request request,
-                                     sirius::scan_manager::sirius_scan_manager* scan_manager);
+                                          duckdb::idx_t estimated_cardinality,
+                                          sirius::vss::vector_join_request request,
+                                          sirius::scan_manager::sirius_scan_manager* scan_manager);
 
   bool is_source() const override { return true; }
   bool is_sink() const override { return true; }
@@ -68,8 +68,7 @@ class sirius_physical_vector_join_materialize : public sirius_physical_partition
   /// Drains all merge outputs of one partition (one left batch) per call.
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
-  /// Gathers the left/right output columns for one left batch's top-k and emits
-  /// the final rows.
+  /// Gathers the left/right output columns for one left batch's top-k and emits the final rows.
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
@@ -82,16 +81,15 @@ class sirius_physical_vector_join_materialize : public sirius_physical_partition
   /// Resolve both pinned tables, snapshot the left output columns per batch, and
   /// concatenate the right output columns once (indexed by global right id).
   /// Idempotent; needs a stream + memory space, so it runs on first execute().
-  void ensure_initialized(rmm::cuda_stream_view stream,
-                          ::cucascade::memory::memory_space& space);
+  void ensure_initialized(rmm::cuda_stream_view stream, ::cucascade::memory::memory_space& space);
 
   sirius::vss::vector_join_request _request;
   sirius::scan_manager::sirius_scan_manager* _scan_manager;
 
-  std::mutex _drain_mutex;                    // guards get_next_task_input_data()
-  std::size_t _current_partition_index{0};    // next partition (left batch) to drain
+  std::mutex _drain_mutex;                  // guards get_next_task_input_data()
+  std::size_t _current_partition_index{0};  // next partition (left batch) to drain
 
-  std::mutex _init_mutex;                      // guards the one-time init below
+  std::mutex _init_mutex;  // guards the one-time init below
   bool _initialized{false};
   //! Left output columns as zero-copy views, indexed [output_col][batch].
   std::vector<std::vector<cudf::column_view>> _left_output_cols;

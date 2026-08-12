@@ -2037,6 +2037,7 @@ using sirius::vss::resolve_vector_join_side;
 using sirius::vss::SiriusVectorJoinBindData;
 using sirius::vss::vector_join_mode;
 using sirius::vss::vector_join_output_type;
+using sirius::vss::vector_join_search_mode;
 static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
                                                      TableFunctionBindInput& input,
                                                      vector<LogicalType>& return_types,
@@ -2060,7 +2061,7 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
   // Optional params' default values
   req.metric               = "l2";
   req.k                    = 10;
-  req.use_index            = false;
+  req.search_mode          = vector_join_search_mode::exact_gemm;
   req.n_clusters           = 0;
   req.n_probes             = 1;
   req.eps                  = 0.0;
@@ -2087,10 +2088,16 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
       req.metric = StringUtil::Lower(kv.second.ToString());
     } else if (key == "search_mode") {
       auto const mode = StringUtil::Lower(kv.second.ToString());
-      if (mode != "exact" && mode != "approx") {
-        throw BinderException("sirius_knn_join: search_mode must be 'exact' or 'approx'");
+      if (mode == "exact") {
+        req.search_mode = vector_join_search_mode::exact;
+      } else if (mode == "exact-gemm") {
+        req.search_mode = vector_join_search_mode::exact_gemm;
+      } else if (mode == "approx") {
+        req.search_mode = vector_join_search_mode::approx;
+      } else {
+        throw BinderException(
+          "sirius_knn_join: search_mode must be 'exact', 'exact-gemm', or 'approx'");
       }
-      req.use_index = (mode == "approx");
     } else if (key == "join_mode") {
       auto const jm = StringUtil::Lower(kv.second.ToString());
       if (jm == "global") {
@@ -2111,8 +2118,7 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
       } else if (out_type == "distance") {
         req.output_type = vector_join_output_type::distance;
       } else {
-        throw BinderException(
-          "sirius_knn_join: output_type must be 'similarity' or 'distance'");
+        throw BinderException("sirius_knn_join: output_type must be 'similarity' or 'distance'");
       }
       output_type_is_set = true;
     } else if (key == "left_schema_name") {
@@ -2139,6 +2145,12 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
   if (!output_type_is_set) {
     req.output_type = req.metric == "cosine" ? vector_join_output_type::similarity
                                              : vector_join_output_type::distance;
+  }
+  // Similarity is only well-defined for cosine (1 - distance). L2 has no natural similarity.
+  if (req.metric == "l2" && req.output_type == vector_join_output_type::similarity) {
+    throw BinderException(
+      "sirius_knn_join: output_type => 'similarity' is only meaningful for metric => 'cosine'; "
+      "use output_type => 'distance' for l2");
   }
 
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");

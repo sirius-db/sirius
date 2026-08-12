@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "vss/sirius_physical_vector_join_selection.hpp"
+#include "vss/sirius_physical_vector_join_select.hpp"
 
 #include "data/data_batch_utils.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
@@ -23,19 +23,19 @@
 #include "vss/cudf_raft_interop.hpp"
 #include "vss/distance_metric.hpp"
 #include "vss/pinned_column.hpp"
-#include "vss/vector_join_refine.hpp"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <raft/core/device_resources.hpp>
 
-#include <cucascade/memory/memory_space.hpp>
-
 #include <nvtx3/nvtx3.hpp>
+
+#include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
 #include <stdexcept>
@@ -46,13 +46,13 @@
 
 namespace sirius::op {
 
-sirius_physical_vector_join_selection::sirius_physical_vector_join_selection(
+sirius_physical_vector_join_select::sirius_physical_vector_join_select(
   duckdb::vector<sirius::logical_type> types,
   duckdb::idx_t estimated_cardinality,
   sirius::vss::vector_join_request request,
   sirius::scan_manager::sirius_scan_manager* scan_manager)
   : sirius_physical_operator(
-      SiriusPhysicalOperatorType::VECTOR_JOIN_SELECTION, std::move(types), estimated_cardinality),
+      SiriusPhysicalOperatorType::VECTOR_JOIN_SELECT, std::move(types), estimated_cardinality),
     _request(std::move(request)),
     _scan_manager(scan_manager)
 {
@@ -61,11 +61,11 @@ sirius_physical_vector_join_selection::sirius_physical_vector_join_selection(
 //===----------------------------------------------------------------------===//
 // Initialization
 //===----------------------------------------------------------------------===//
-void sirius_physical_vector_join_selection::ensure_initialized_locked()
+void sirius_physical_vector_join_select::ensure_initialized_locked()
 {
   if (_initialized) { return; }
   if (_scan_manager == nullptr) {
-    throw std::runtime_error("[sirius_physical_vector_join_selection] no scan manager set");
+    throw std::runtime_error("[sirius_physical_vector_join_select] no scan manager set");
   }
 
   auto const& left  = _request.left;
@@ -77,12 +77,12 @@ void sirius_physical_vector_join_selection::ensure_initialized_locked()
     _scan_manager->find_pinned_entry_for_duckdb_table(right.catalog, right.schema, right.table);
   if (left_pin == nullptr || right_pin == nullptr) {
     throw std::runtime_error(
-      "[sirius_physical_vector_join_selection] left or right table is no longer pinned");
+      "[sirius_physical_vector_join_select] left or right table is no longer pinned");
   }
 
   // Zero-copy views over each pinned batch's vector column, in row order.
-  _left_views  = vss::pinned_column_chunk_views(
-    *left_pin, left.column, vss::pinned_entry_gpu_space(*left_pin));
+  _left_views =
+    vss::pinned_column_chunk_views(*left_pin, left.column, vss::pinned_entry_gpu_space(*left_pin));
   _right_views = vss::pinned_column_chunk_views(
     *right_pin, right.column, vss::pinned_entry_gpu_space(*right_pin));
 
@@ -102,7 +102,7 @@ void sirius_physical_vector_join_selection::ensure_initialized_locked()
 //===----------------------------------------------------------------------===//
 // Source / scheduling interface
 //===----------------------------------------------------------------------===//
-std::optional<task_creation_hint> sirius_physical_vector_join_selection::get_next_task_hint()
+std::optional<task_creation_hint> sirius_physical_vector_join_select::get_next_task_hint()
 {
   std::lock_guard<std::mutex> lg(_op_mutex);
   ensure_initialized_locked();
@@ -113,14 +113,14 @@ std::optional<task_creation_hint> sirius_physical_vector_join_selection::get_nex
   return task_creation_hint{TaskCreationHint::READY, this};
 }
 
-bool sirius_physical_vector_join_selection::all_ports_empty()
+bool sirius_physical_vector_join_select::all_ports_empty()
 {
   std::lock_guard<std::mutex> lg(_op_mutex);
   ensure_initialized_locked();
   return _next_pair >= _num_pairs;
 }
 
-std::unique_ptr<operator_data> sirius_physical_vector_join_selection::get_next_task_input_data()
+std::unique_ptr<operator_data> sirius_physical_vector_join_select::get_next_task_input_data()
 {
   std::lock_guard<std::mutex> lg(_op_mutex);
   ensure_initialized_locked();
@@ -137,21 +137,21 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_selection::get_next_t
 //===----------------------------------------------------------------------===//
 // Execution
 //===----------------------------------------------------------------------===//
-std::unique_ptr<operator_data> sirius_physical_vector_join_selection::execute(
+std::unique_ptr<operator_data> sirius_physical_vector_join_select::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_vector_join_selection::execute"};
+  nvtx3::scoped_range nvtx_range{"sirius_physical_vector_join_select::execute"};
 
   auto const* join_in = dynamic_cast<const vector_join_input*>(&input_data);
   if (join_in == nullptr) {
     throw std::runtime_error(
-      "[sirius_physical_vector_join_selection::execute] expected vector_join_input; got " +
+      "[sirius_physical_vector_join_select::execute] expected vector_join_input; got " +
       std::string(typeid(input_data).name()));
   }
   auto* mem_space = join_in->get_gpu_memory_space();
   if (mem_space == nullptr) {
     throw std::runtime_error(
-      "[sirius_physical_vector_join_selection::execute] no memory space set; prepare_for_processing "
+      "[sirius_physical_vector_join_select::execute] no memory space set; prepare_for_processing "
       "was not called");
   }
 
@@ -170,22 +170,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_selection::execute(
   // internally, so the dense [n_left, n_right] block is never materialized.
   // Allocations flow through the task's reservation-aware current resource.
   raft::device_resources res{stream};
-  auto const metric = vss::join_selection_distance_type_from_metric(_request.metric);
-  auto knn          = vss::brute_force_knn(res, dataset, queries, k_eff, metric);
-
-  // Refine the selected top-k distances to exact values (before ids go global):
-  // the GEMM metric loses precision near zero, so recompute directly from the
-  // Ri/Sj vectors already in hand. Skipped for cosine+similarity (the GEMM inner
-  // product is already exact) per needs_exact_refine.
-  if (vss::needs_exact_refine(_request)) {
-    vss::refine_topk_distances(queries,
-                               dataset,
-                               knn.neighbors->view(),
-                               knn.distances->mutable_view(),
-                               k_eff,
-                               metric,
-                               stream);
-  }
+  auto const exact_unexpanded = _request.search_mode == vss::vector_join_search_mode::exact;
+  auto const metric =
+    vss::join_selection_distance_type_from_metric(_request.metric, exact_unexpanded);
+  auto knn = vss::brute_force_knn(res, dataset, queries, k_eff, metric);
 
   // Shift local neighbor ids into the global right-table row space so the
   // downstream merge can combine batches without tracking per-batch offsets.
@@ -202,8 +190,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_selection::execute(
   }
 
   // Partial layout: [neighbor_global_id (INT64), distance (FLOAT32)], flattened
-  // row-major [n_left * k_eff]. Tag with the left batch index so all of a left
-  // batch's per-right-batch partials land in one partition for the merge stage.
+  // row-major [n_left * k_eff]. The distance is the final value: L2 rides the
+  // expanded/GEMM path and cosine is intrinsically well-conditioned, so no
+  // downstream recompute is needed. Tag with the left batch index so all of a
+  // left batch's per-right-batch partials land in one partition for reduce.
   std::vector<std::unique_ptr<cudf::column>> out_cols;
   out_cols.reserve(2);
   out_cols.push_back(std::move(neighbors));
@@ -219,18 +209,18 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_selection::execute(
 //===----------------------------------------------------------------------===//
 // Sink: route each partial to the merge partition for its left batch
 //===----------------------------------------------------------------------===//
-void sirius_physical_vector_join_selection::sink(const operator_data& output_data,
-                                       rmm::cuda_stream_view /*stream*/)
+void sirius_physical_vector_join_select::sink(const operator_data& output_data,
+                                              rmm::cuda_stream_view /*stream*/)
 {
   auto const& part         = dynamic_cast<const partitioned_operator_data&>(output_data);
   auto const partition_idx = part.get_partition_idx();
   for (auto& batch : part.get_data_batches()) {
     for (auto& next_port_info : next_port_after_sink) {
-      auto* consumer = dynamic_cast<sirius_physical_partition_consumer_operator*>(
-        next_port_info.next_operator);
+      auto* consumer =
+        dynamic_cast<sirius_physical_partition_consumer_operator*>(next_port_info.next_operator);
       if (consumer == nullptr) {
         throw std::runtime_error(
-          "[sirius_physical_vector_join_selection::sink] next operator is not a partition consumer");
+          "[sirius_physical_vector_join_select::sink] next operator is not a partition consumer");
       }
       consumer->push_data_batch_partitioned(
         next_port_info.next_operator_port_name, batch, partition_idx);
@@ -241,7 +231,7 @@ void sirius_physical_vector_join_selection::sink(const operator_data& output_dat
 //===----------------------------------------------------------------------===//
 // Memory estimation
 //===----------------------------------------------------------------------===//
-std::size_t sirius_physical_vector_join_selection::per_pair_estimate(std::size_t left_idx) const
+std::size_t sirius_physical_vector_join_select::per_pair_estimate(std::size_t left_idx) const
 {
   // Output is [n_left * k] of (INT64 id + FLOAT32 distance) = n_left*k*12 bytes;
   // add the same order again for brute-force scratch, plus a 1 MiB floor.
@@ -251,15 +241,19 @@ std::size_t sirius_physical_vector_join_selection::per_pair_estimate(std::size_t
   return (output * 3) + (std::size_t{1} << 20);
 }
 
-std::size_t sirius_physical_vector_join_selection::no_history_peak_memory_estimate(
+std::size_t sirius_physical_vector_join_select::no_history_peak_memory_estimate(
   const input_stats& stats) const
 {
   // The per-pair input already carries a sized estimate; floor it so the
   // reservation request is always well-formed.
+  //
+  // Note: this ignores cuVS's on-demand search scratch, which is much larger and
+  // metric-dependent (~209 MB cosine vs ~35 MB L2 on a 50k x 50k pair), so the
+  // estimate could be improved.
   return std::max<std::size_t>(stats.bytes, std::size_t{1} << 20);
 }
 
-std::string sirius_physical_vector_join_selection::params_to_string() const
+std::string sirius_physical_vector_join_select::params_to_string() const
 {
   return _request.left.table + "(" + _request.left.column + ") x " + _request.right.table + "(" +
          _request.right.column + ") metric=" + _request.metric +

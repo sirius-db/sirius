@@ -37,7 +37,8 @@ knn_result knn_merge_parts_topk(raft::device_resources const& res,
                                 rmm::cuda_stream_view stream,
                                 rmm::device_async_resource_ref mr)
 {
-  CUDF_EXPECTS(n_samples >= 1 && n_parts >= 1 && k >= 1, "VSS merge: n_samples/n_parts/k must be >= 1");
+  CUDF_EXPECTS(n_samples >= 1 && n_parts >= 1 && k >= 1,
+               "VSS merge: n_samples/n_parts/k must be >= 1");
   CUDF_EXPECTS(stacked_distances.type().id() == cudf::type_id::FLOAT32,
                "VSS merge: distances must be FLOAT32");
   CUDF_EXPECTS(stacked_neighbors.type().id() == cudf::type_id::INT64,
@@ -66,8 +67,8 @@ knn_result knn_merge_parts_topk(raft::device_resources const& res,
   // Neighbor ids are already global (shifted in the selection stage), so every
   // part's translation is zero.
   rmm::device_uvector<int64_t> translations(static_cast<std::size_t>(n_parts), stream, mr);
-  CUDF_CUDA_TRY(cudaMemsetAsync(
-    translations.data(), 0, translations.size() * sizeof(int64_t), stream.value()));
+  CUDF_CUDA_TRY(
+    cudaMemsetAsync(translations.data(), 0, translations.size() * sizeof(int64_t), stream.value()));
   auto const trans_view =
     raft::make_device_vector_view<int64_t, int64_t>(translations.data(), n_parts);
 
