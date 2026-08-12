@@ -174,13 +174,15 @@ members retain their surface defaults before the pair is validated.
 
 ### Low-Level Explicit Memory Spaces (`sirius.space`) — advanced
 
-> **Mutually exclusive with `sirius.memory`.** `sirius.space` is a low-level alternative that
-> declares individual memory spaces directly, bypassing the high-level `sirius.memory`
-> configurator. **If any `sirius.space.{gpu,host,disk}` list is non-empty, it completely
-> replaces the space set that `sirius.memory` would have produced** (the `sirius.memory` block is
-> then ignored for space construction). This path is generally reserved for **low-level developer
-> testing** — e.g. hand-placing spaces on specific devices/NUMA nodes. Most users should use
-> `sirius.memory` instead.
+> **Mutually exclusive with configured `sirius.memory` sub-blocks.** `sirius.space` is a low-level
+> alternative that declares individual memory spaces directly, bypassing the high-level
+> `sirius.memory` configurator. If any `sirius.space.{gpu,host,disk}` list is non-empty, the
+> configuration loader rejects a simultaneous non-null `sirius.memory.{gpu,host,disk}` sub-block
+> instead of silently ignoring it. A null memory sub-block is absent; a non-null mapping selects
+> the high-level path even when the mapping is empty or its individual values are null. Empty
+> `sirius.space` lists do not select the low-level path. This path is generally reserved for
+> **low-level developer testing** — e.g. hand-placing spaces on specific devices/NUMA nodes. Most
+> users should use `sirius.memory` instead.
 >
 > Note the key names differ from `sirius.memory`: capacities are `memory_capacity` (not
 > `capacity_bytes`), and the GPU/host tiers key on `device_id` / `numa_id`.
@@ -221,7 +223,7 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 
 ```yaml
 sirius:
-  # NOTE: do NOT also set sirius.memory — space overrides it.
+  # NOTE: do NOT also configure sirius.memory — the loader rejects both paths together.
   space:
     gpu:
       - { device_id: 0, memory_capacity: 40Gi, reservation_limit_fraction: 0.9 }

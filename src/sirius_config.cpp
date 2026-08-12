@@ -591,18 +591,26 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
     gpu_mem_config gpu_cfg;
     host_mem_config host_cfg;
     disk_mem_config disk_cfg;
+    bool high_level_memory_configured     = false;
     bool explicit_high_level_gpu_capacity = false;
 
     if (auto mem_node = r.optional_node("memory")) {
       yaml::reader mr(*mem_node, "sirius.memory");
       if (auto n = mr.optional_node("gpu")) {
+        high_level_memory_configured = true;
         yaml::reader gpu_reader(*n, "sirius.memory.gpu");
         explicit_high_level_gpu_capacity =
           gpu_reader.has_value("usage_limit_bytes") || gpu_reader.has_value("usage_limit_fraction");
         gpu_mem_config::from_yaml(*n, gpu_cfg);
       }
-      if (auto n = mr.optional_node("host")) host_mem_config::from_yaml(*n, host_cfg);
-      if (auto n = mr.optional_node("disk")) disk_mem_config::from_yaml(*n, disk_cfg);
+      if (auto n = mr.optional_node("host")) {
+        high_level_memory_configured = true;
+        host_mem_config::from_yaml(*n, host_cfg);
+      }
+      if (auto n = mr.optional_node("disk")) {
+        high_level_memory_configured = true;
+        disk_mem_config::from_yaml(*n, disk_cfg);
+      }
       mr.reject_unknown();
     }
 
@@ -637,6 +645,13 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
       if (auto n = sr.optional_node("host")) read_yaml_vec(*n, host_space_configs);
       if (auto n = sr.optional_node("disk")) read_yaml_vec(*n, disk_space_configs);
       sr.reject_unknown();
+    }
+
+    bool const explicit_space_configured =
+      !gpu_space_configs.empty() || !host_space_configs.empty() || !disk_space_configs.empty();
+    if (high_level_memory_configured && explicit_space_configured) {
+      throw std::runtime_error(
+        "sirius.memory and non-empty sirius.space lists are mutually exclusive");
     }
 
     r.reject_unknown();
