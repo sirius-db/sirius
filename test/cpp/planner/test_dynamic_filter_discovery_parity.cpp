@@ -823,6 +823,51 @@ TEST_CASE_METHOD(discovery_parity_fixture,
 }
 
 TEST_CASE_METHOD(discovery_parity_fixture,
+                 "discovery parity - wiring is independent of DuckDB pushdown metadata",
+                 "[dynamic_filter][parity][isolated_context]")
+{
+  dynamic_filter_on_guard filter_on(*con);
+  auto c = plan_parity_case(*con,
+                            "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid "
+                            "WHERE r.other > 0");
+
+  // Premise: the original plan carried DuckDB's pushdown metadata and the serialization
+  // round-trip stripped it from the copy.
+  REQUIRE(c.original_join_had_pushdown == std::vector<bool>{true});
+  auto joins = comparison_joins_of(*c.oracle_plan);
+  REQUIRE(joins.size() == 1);
+  REQUIRE(joins[0]->filter_pushdown == nullptr);
+
+  // Build a second Sirius physical plan from the stripped copy, mirroring plan_parity_case's
+  // transaction discipline.
+  duckdb::unique_ptr<sirius_physical_operator> from_stripped;
+  con->Query("BEGIN TRANSACTION");
+  try {
+    c.oracle_plan->ResolveOperatorTypes();
+    ColumnBindingResolver resolver;
+    ColumnBindingResolver::Verify(*c.oracle_plan);
+    resolver.VisitOperator(*c.oracle_plan);
+
+    sirius::planner::sirius_physical_plan_generator gen(*con->context);
+    from_stripped = gen.create_plan(std::move(c.oracle_plan));
+  } catch (...) {
+    con->Query("ROLLBACK");
+    throw;
+  }
+  con->Query("COMMIT");
+
+  // The stripped plan wires the same scan route as the original.
+  auto original_joins = hash_joins_of(c.physical.get());
+  auto stripped_joins = hash_joins_of(from_stripped.get());
+  REQUIRE(original_joins.size() == 1);
+  REQUIRE(stripped_joins.size() == 1);
+  REQUIRE(stripped_joins[0]->dynamic_filter_plan().enabled());
+  auto const stripped_bindings = scan_bindings_of(*stripped_joins[0], from_stripped.get());
+  REQUIRE_FALSE(stripped_bindings.empty());
+  REQUIRE(stripped_bindings == scan_bindings_of(*original_joins[0], c.physical.get()));
+}
+
+TEST_CASE_METHOD(discovery_parity_fixture,
                  "discovery parity - the adapter oracle agrees with the per-key walk",
                  "[dynamic_filter][parity][isolated_context]")
 {

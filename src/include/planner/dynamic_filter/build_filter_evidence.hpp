@@ -19,7 +19,8 @@
  * @brief Classifies logical join builds for dynamic-filter routing
  *
  * Either `build_subtree_is_filtering` or `build_relation_is_derived` can arm scan and join-edge
- * target discovery.
+ * target discovery. These are Sirius-owned conservative mirrors of DuckDB's join-filter-pushdown
+ * arming policy: drift in DuckDB can reduce pruning opportunities but never affects results.
  */
 
 #pragma once

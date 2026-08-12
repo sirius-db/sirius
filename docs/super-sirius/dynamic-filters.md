@@ -591,7 +591,7 @@ Descending into a join's **build** input is sound only because the producing joi
 
 The endpoint's push ordinal is the descent's **exit** ordinal, in the sited operator's output space — not the probe-key ordinal it started from, which the two share only when no hop was accepted. Push space, store space, and lookup space are all that one ordinal, on both routes.
 
-One route per key, structurally: both routes are terminal actions of the same per-key trace, so a key's terminal is either a scan bind or an endpoint site and no second walk can disagree. A scan bind wins (it applies earlier and can prune row groups); the join-edge route takes only the keys no scan bound. No key is filtered twice.
+One route per key, structurally: both routes are terminal actions of the same per-key trace, so a key's terminal is either a scan bind or an endpoint site and no second walk can disagree. A scan bind wins (it applies earlier and can prune row groups); the join-edge route takes only the keys no scan bound. No key is filtered twice — a known optimization gap: when any branch of a key's trace binds a scan, no endpoint is placed for that key on the other branches, so a mixed UNION-like fan-out filters only through the scan route.
 
 ### Ordering
 

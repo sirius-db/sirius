@@ -99,6 +99,18 @@ dynamic_filter_publish_plan::dynamic_filter_publish_plan(
           "[dynamic_filter_publish_plan] A key binding references an admitted key that does not "
           "exist");
       }
+      // planner::direct_route_admissible admits only INT32/INT64 keys whose probe and build
+      // storage types match; a direct binding that disagrees bypassed admission.
+      if (target.route_class == dynamic_filter_route_class::direct) {
+        auto const& key = _admitted_keys[binding.admitted_key_index];
+        if ((binding.probe_storage_type.id() != cudf::type_id::INT32 &&
+             binding.probe_storage_type.id() != cudf::type_id::INT64) ||
+            binding.probe_storage_type != key.storage_type) {
+          throw std::invalid_argument(
+            "[dynamic_filter_publish_plan] A join-edge endpoint binding requires an INT32/INT64 "
+            "probe storage type equal to the admitted key's build storage type");
+        }
+      }
       bound_keys.push_back(binding.admitted_key_index);
     }
     // Duplicate channel_push_ordinals are legal (the channel conjoins same-column filters); the

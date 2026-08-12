@@ -779,9 +779,11 @@ TEST_CASE("physical_hash_join - broadcast BUILD_PROBE publishes dynamic filters 
   }
 
   INFO("log dir: " << log_dir.path());
-  // Broadcast engaged AND the publisher ran (exactly one GPU won the publication race).
+  // Broadcast engaged AND the publication winner's success summary appears; no delivery may log
+  // the not-published diagnostic.
   REQUIRE(log_dir_contains(log_dir.path(), "[broadcast]"));
-  REQUIRE(log_dir_contains(log_dir.path(), "dynamic filter"));
+  REQUIRE(log_dir_contains(log_dir.path(), "dynamic-filter publication:"));
+  REQUIRE_FALSE(log_dir_contains(log_dir.path(), "dynamic filter NOT published"));
 
   fs::remove_all(tmp, ec);
 }

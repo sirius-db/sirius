@@ -15,11 +15,11 @@
  */
 
 /*
- * Tests the build-port claim condition in
- * `sirius_physical_hash_join::push_data_batch_partitioned`: the one-shot publisher may claim only
- * a build batch carrying the whole build side, as reported through `set_build_arrives_whole`; the
- * join mode is not part of the condition. The tests drive the build port directly, pinning the
- * claim condition rather than any partitioning decision.
+ * Tests the build-port claim condition in `sirius_physical_hash_join::push_data_batch_partitioned`:
+ * the one-shot publisher may claim only a build batch carrying the whole build side, as reported
+ * through `set_build_arrives_whole`; the join mode is not part of the condition. The tests drive
+ * the build port directly, pinning the claim condition -- and the reopening of a claimed window
+ * whose build batch is not GPU-resident -- rather than any partitioning decision.
  */
 
 #include "expression/join_condition.hpp"
@@ -34,8 +34,10 @@
 #include <rmm/cuda_device.hpp>
 
 #include <catch.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <data/sirius_converter_registry.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 
@@ -70,7 +72,8 @@ struct claim_fixture {
   std::shared_ptr<sirius_dynamic_filter_set> channel =
     std::make_shared<sirius_dynamic_filter_set>();
   dynamic_filter_stats stats;
-  cucascade::memory::memory_space* gpu_space = nullptr;
+  cucascade::memory::memory_space* gpu_space        = nullptr;
+  cucascade::memory::memory_space const* host_space = nullptr;
   duckdb::unique_ptr<duckdb::LogicalComparisonJoin> logical_join;
   duckdb::unique_ptr<sirius_physical_hash_join> hash_join;
 
@@ -84,10 +87,10 @@ struct claim_fixture {
       memory_manager->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
     REQUIRE_FALSE(host_spaces.empty());
     auto const local_host =
-      std::find_if(host_spaces.begin(), host_spaces.end(), [this](auto const* host_space) {
-        return host_space->get_device_id() == gpu_space->get_device_id();
+      std::find_if(host_spaces.begin(), host_spaces.end(), [this](auto const* candidate) {
+        return candidate->get_device_id() == gpu_space->get_device_id();
       });
-    auto const* host_space = local_host == host_spaces.end() ? host_spaces.front() : *local_host;
+    host_space = local_host == host_spaces.end() ? host_spaces.front() : *local_host;
 
     std::vector<dynamic_filter_publish_plan::probe_target> targets;
     targets.push_back({.filter_set               = channel,
@@ -175,6 +178,21 @@ struct claim_fixture {
   {
     hash_join->push_data_batch_partitioned("build", make_build_batch(), /*partition_idx=*/0);
   }
+
+  /// The same whole-build batch, converted in place to the host tier before delivery (the shape of
+  /// a batch downgraded ahead of the publish hook).
+  [[nodiscard]] std::shared_ptr<cucascade::data_batch> make_host_build_batch()
+  {
+    auto batch     = make_build_batch();
+    auto& registry = sirius::converter_registry::get();
+    // The converter's batched copy path (cudaMemcpyBatchAsync) rejects the default stream.
+    auto const stream = gpu_space->acquire_stream();
+    {
+      auto mut = batch->to_mutable();
+      mut.convert_to<cucascade::host_data_representation>(registry, host_space, stream);
+    }
+    return batch;
+  }
 };
 
 }  // namespace
@@ -229,4 +247,32 @@ TEST_CASE("a wired join whose build is not whole reports the skip exactly once",
 
   CHECK(fixture.stats.publication_attempts.load() == 0);
   CHECK(fixture.channel->filters_for_column(kProbeColumnIndex).empty());
+}
+
+TEST_CASE("a claimed but not GPU-resident whole build reopens the window for a sibling delivery",
+          "[dynamic_filter][publication_claim][gpu_execution]")
+{
+  // On a multi-GPU broadcast build every GPU delivers the whole build side, so a first delivery
+  // that was already downgraded to the host tier must not end the window terminally: a sibling
+  // delivery with a GPU-resident replica can still claim and publish.
+  claim_fixture fixture;
+  fixture.hash_join->set_build_arrives_whole(true);
+
+  fixture.hash_join->push_data_batch_partitioned(
+    "build", fixture.make_host_build_batch(), /*partition_idx=*/0);
+
+  CHECK(fixture.stats.publication_attempts.load() == 1);
+  CHECK(fixture.stats.publications_skipped_source_not_resident.load() == 1);
+  CHECK(fixture.stats.publications_finished.load() == 0);
+  CHECK(fixture.stats.publications_failed.load() == 0);
+  CHECK(fixture.channel->filters_for_column(kProbeColumnIndex).empty());
+
+  fixture.push_build_batch();
+
+  // The full accounting identity after the rescue: attempts == finished + failed + skipped.
+  CHECK(fixture.stats.publication_attempts.load() == 2);
+  CHECK(fixture.stats.publications_finished.load() == 1);
+  CHECK(fixture.stats.publications_failed.load() == 0);
+  CHECK(fixture.stats.publications_skipped_source_not_resident.load() == 1);
+  CHECK_FALSE(fixture.channel->filters_for_column(kProbeColumnIndex).empty());
 }

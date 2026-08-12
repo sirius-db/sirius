@@ -63,9 +63,13 @@ struct dynamic_filter_stats_snapshot {
  * The key and filter counters record policy decisions for attempts that reach per-key processing. A
  * source-residency or all-targets-drained return occurs earlier and does not increment them.
  *
- * The delivery counters classify build deliveries, not joins, and are disjoint but not exhaustive:
- * `publications_skipped_build_not_whole` is latched once per join, so a join's later non-claiming
- * deliveries, and deliveries after the publication window closes, are counted nowhere.
+ * The delivery counters classify build deliveries, not joins. Each claim counts one attempt and
+ * lands in exactly one of the three outcome counters, so `publication_attempts ==
+ * publications_finished + publications_failed + publications_skipped_source_not_resident`; a
+ * not-resident skip reopens the window, so a skipped-then-rescued broadcast build counts two
+ * attempts, one skip, and one finish. `publications_skipped_build_not_whole` is latched once per
+ * join, so a join's later non-claiming deliveries, and deliveries after the publication window
+ * closes, are counted nowhere.
  */
 struct dynamic_filter_stats {
   // Plan-time fact
@@ -86,7 +90,8 @@ struct dynamic_filter_stats {
   std::atomic<std::uint64_t> publication_attempts{0};  ///< OPEN -> PUBLISHING claims
   std::atomic<std::uint64_t> publications_finished{0};
   std::atomic<std::uint64_t> publications_failed{0};
-  /// Build batch was not GPU-resident at delivery; publication skipped without claiming
+  /// Build batch was not GPU-resident at delivery; the claimed window reopens so a sibling
+  /// (broadcast) delivery with a GPU-resident replica can claim it
   std::atomic<std::uint64_t> publications_skipped_source_not_resident{0};
   /// Wired join the upstream PARTITION never reported a whole build for, so its one-shot
   /// publication window can never claim: probe-driven sizing, a hash-partitioned multi-partition

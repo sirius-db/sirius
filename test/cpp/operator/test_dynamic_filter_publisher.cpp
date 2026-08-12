@@ -670,6 +670,41 @@ TEST_CASE("dynamic-filter publish plan rejects invalid targets and bindings",
       std::invalid_argument);
   }
 
+  SECTION("direct binding with a non-INT32/INT64 probe storage type")
+  {
+    std::vector<dynamic_filter_publish_plan::probe_target> targets;
+    targets.push_back(
+      {.filter_set               = channel,
+       .route_class              = dynamic_filter_route_class::direct,
+       .accepts_zone_map_filters = false,
+       .key_bindings             = {{.admitted_key_index   = 0,
+                                     .channel_push_ordinal = 0,
+                                     .probe_storage_type   = cudf::data_type{cudf::type_id::INT8}}}});
+    // The admitted key is INT8 as well, so probe/build equality holds and only the INT32/INT64
+    // whitelist arm rejects.
+    auto key         = make_int64_key(0, 0);
+    key.storage_type = cudf::data_type{cudf::type_id::INT8};
+    REQUIRE_THROWS_AS(
+      dynamic_filter_publish_plan({key}, std::move(targets), std::move(fixture.replica_spaces)),
+      std::invalid_argument);
+  }
+
+  SECTION("direct binding whose probe storage type differs from the admitted key's build type")
+  {
+    std::vector<dynamic_filter_publish_plan::probe_target> targets;
+    targets.push_back(
+      {.filter_set               = channel,
+       .route_class              = dynamic_filter_route_class::direct,
+       .accepts_zone_map_filters = false,
+       .key_bindings             = {{.admitted_key_index   = 0,
+                                     .channel_push_ordinal = 0,
+                                     .probe_storage_type   = cudf::data_type{cudf::type_id::INT32}}}});
+    REQUIRE_THROWS_AS(
+      dynamic_filter_publish_plan(
+        {make_int64_key(0, 0)}, std::move(targets), std::move(fixture.replica_spaces)),
+      std::invalid_argument);
+  }
+
   SECTION("two admitted keys binding one probe column stays legal")
   {
     std::vector<dynamic_filter_publish_plan::probe_target> targets;

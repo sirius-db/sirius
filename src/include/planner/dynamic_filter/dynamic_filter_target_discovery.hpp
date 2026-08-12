@@ -21,7 +21,9 @@
  * `trace_probe_key()` follows one admitted probe key through the physical probe subtree.
  * `TABLE_SCAN` terminals are scan-binding sites; other terminals can be wrapped by
  * `place_endpoint()`. Both operations use @ref descent_steps. Each accepted step remaps the key
- * ordinal into its child's output space.
+ * ordinal into its child's output space. The walk is a Sirius-owned conservative mirror of
+ * DuckDB's `JoinFilterPushdownOptimizer` target walk: drift in DuckDB can reduce pruning
+ * opportunities but never affects results.
  */
 
 #pragma once

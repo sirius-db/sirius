@@ -2028,19 +2028,11 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
 void sirius_physical_hash_join::publish_dynamic_filters(cudf::table_view const& build_view,
                                                         rmm::cuda_stream_view stream)
 {
-  // Publication is independent of the join state machine.
-  auto expected = dynamic_filter_publication_state::OPEN;
-  if (!_dynamic_filter_publication_state.compare_exchange_strong(
-        expected,
-        dynamic_filter_publication_state::PUBLISHING,
-        std::memory_order_acq_rel,
-        std::memory_order_acquire)) {
-    return;
-  }
+  // The delivery hook claims OPEN -> PUBLISHING under op_state_mutex at decision time; this
+  // publisher runs only inside a claimed window and owns its terminal transition.
+  D_ASSERT(_dynamic_filter_publication_state.load(std::memory_order_acquire) ==
+           dynamic_filter_publication_state::PUBLISHING);
 
-  if (_dynamic_filter_stats != nullptr) {
-    _dynamic_filter_stats->publication_attempts.fetch_add(1, std::memory_order_relaxed);
-  }
   try {
     if (_dynamic_filter_plan.enabled()) {
       auto const outcome =
@@ -2103,9 +2095,8 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
   // by a concat_all build-side CONCAT) and reports it at sizing time through
   // `set_build_arrives_whole`. The join mode is deliberately not part of the condition: a
   // single-partition STANDARD / MIXED_JOIN build publishes on the same terms as BUILD_PROBE.
-  std::optional<::cucascade::read_only_data_batch> build_ro;
+  bool claimed = false;
   if (port_id == "build" && batch) {
-    bool claim              = false;
     bool wired_but_unusable = false;
     HASH_JOIN_MODE mode     = HASH_JOIN_MODE::STANDARD;
     {
@@ -2113,13 +2104,24 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
       const bool open = _dynamic_filter_publication_state.load(std::memory_order_acquire) ==
                         dynamic_filter_publication_state::OPEN;
       const bool wired = _dynamic_filter_plan.enabled();
-      claim            = open && wired && _build_arrives_whole;
+      claimed          = open && wired && _build_arrives_whole;
+      // Claim the one-shot window at decision time: on_finalize_operator closes only an unclaimed
+      // OPEN window under this same mutex, so an early pipeline finish cannot land between the
+      // decision and the publication. A plain store suffices because every transition out of OPEN
+      // happens under this mutex.
+      if (claimed) {
+        _dynamic_filter_publication_state.store(dynamic_filter_publication_state::PUBLISHING,
+                                                std::memory_order_release);
+      }
 
       // A join that has a filter plan and is still open but cannot use the one-shot publisher
       // silently publishes nothing — say so, once per join.
-      wired_but_unusable = open && wired && !claim && !_build_not_whole_reported;
+      wired_but_unusable = open && wired && !claimed && !_build_not_whole_reported;
       if (wired_but_unusable) { _build_not_whole_reported = true; }
       mode = _join_mode;
+    }
+    if (claimed && _dynamic_filter_stats != nullptr) {
+      _dynamic_filter_stats->publication_attempts.fetch_add(1, std::memory_order_relaxed);
     }
     if (wired_but_unusable) {
       SIRIUS_LOG_DEBUG(
@@ -2139,49 +2141,85 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
           1, std::memory_order_relaxed);
       }
     }
-    if (claim) { build_ro.emplace(batch->to_read_only()); }
   }
 
-  // Route the batch to the target port exactly as the base does.
-  sirius_physical_partition_consumer_operator::push_data_batch_partitioned(
-    port_id, batch, partition_idx);
-
-  if (!build_ro) { return; }
-
-  nvtx3::scoped_range nvtx_range{"dynfilter::publish_hook"};
-  auto* ms = build_ro->get_data() ? build_ro->get_memory_space() : nullptr;
-  // Non-GPU residency here means the batch was already downgraded before this delivery (it can be
-  // shared with an earlier consumer, e.g. CTE fan-out). Publication is best-effort: skip it.
-  if (!ms || build_ro->get_current_tier() != ::cucascade::memory::Tier::GPU) {
-    if (_dynamic_filter_stats != nullptr) {
-      _dynamic_filter_stats->publications_skipped_source_not_resident.fetch_add(
-        1, std::memory_order_relaxed);
-    }
+  if (!claimed) {
+    // Every non-claiming delivery only routes the batch to the target port exactly as the base
+    // does.
+    sirius_physical_partition_consumer_operator::push_data_batch_partitioned(
+      port_id, batch, partition_idx);
     return;
   }
 
-  // The build batch was produced on a different stream than the publication stream. Order the
-  // publication stream after the batch's writer event.
-  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{ms->get_device_id()}};
-  auto publish_stream = ms->acquire_stream();
-  if (auto const writer_event = build_ro->get_writer_event(); writer_event != nullptr) {
-    auto const status = cudaStreamWaitEvent(publish_stream.value(), writer_event, 0);
-    if (status != cudaSuccess) {
-      throw std::runtime_error(
-        std::string("[sirius_physical_hash_join::push_data_batch_partitioned] dynamic-filter "
-                    "writer-event wait failed: ") +
-        cudaGetErrorString(status));
+  // A claimed window must end terminal; this guard covers a throw before the publisher's own
+  // PUBLISHING -> FINISHED/FAILED transition.
+  try {
+    // The read-only accessor is acquired BEFORE routing: once deposited into a repository the
+    // batch becomes a downgrade candidate, and the shared lock pins its GPU representation.
+    auto build_ro = batch->to_read_only();
+    sirius_physical_partition_consumer_operator::push_data_batch_partitioned(
+      port_id, batch, partition_idx);
+
+    nvtx3::scoped_range nvtx_range{"dynfilter::publish_hook"};
+    auto* ms = build_ro.get_data() ? build_ro.get_memory_space() : nullptr;
+    // Non-GPU residency here means the batch was already downgraded before this delivery (it can
+    // be shared with an earlier consumer, e.g. CTE fan-out). Publication is best-effort: skip it.
+    if (!ms || build_ro.get_current_tier() != ::cucascade::memory::Tier::GPU) {
+      if (_dynamic_filter_stats != nullptr) {
+        _dynamic_filter_stats->publications_skipped_source_not_resident.fetch_add(
+          1, std::memory_order_relaxed);
+      }
+      // Reopen the claimed window rather than ending terminal: on a multi-GPU broadcast build every
+      // GPU delivers the whole build side, so a sibling delivery with a GPU-resident replica may
+      // still claim and publish. on_finalize_operator may close the reopened window; if
+      // finalization already ran, the window stays OPEN with no further deliveries possible, which
+      // nothing reads (target channels close at drain). A plain store suffices because this
+      // delivery exclusively holds PUBLISHING and every transition into or out of OPEN stays
+      // guarded by op_state_mutex. Nothing between this store and the return can throw, so the
+      // enclosing catch cannot fail a window this delivery has already given up.
+      std::scoped_lock lg(op_state_mutex);
+      _dynamic_filter_publication_state.store(dynamic_filter_publication_state::OPEN,
+                                              std::memory_order_release);
+      return;
     }
-  } else {
-    auto const status = cudaDeviceSynchronize();
-    if (status != cudaSuccess) {
-      throw std::runtime_error(
-        std::string("[sirius_physical_hash_join::push_data_batch_partitioned] dynamic-filter "
-                    "source synchronization failed: ") +
-        cudaGetErrorString(status));
+
+    // The build batch was produced on a different stream than the publication stream. Order the
+    // publication stream after the batch's writer event.
+    rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{ms->get_device_id()}};
+    auto publish_stream = ms->acquire_stream();
+    if (auto const writer_event = build_ro.get_writer_event(); writer_event != nullptr) {
+      auto const status = cudaStreamWaitEvent(publish_stream.value(), writer_event, 0);
+      if (status != cudaSuccess) {
+        throw std::runtime_error(
+          std::string("[sirius_physical_hash_join::push_data_batch_partitioned] dynamic-filter "
+                      "writer-event wait failed: ") +
+          cudaGetErrorString(status));
+      }
+    } else {
+      auto const status = cudaDeviceSynchronize();
+      if (status != cudaSuccess) {
+        throw std::runtime_error(
+          std::string("[sirius_physical_hash_join::push_data_batch_partitioned] dynamic-filter "
+                      "source synchronization failed: ") +
+          cudaGetErrorString(status));
+      }
     }
+    publish_dynamic_filters(sirius::get_cudf_table_view(build_ro), publish_stream);
+  } catch (...) {
+    // The CAS no-ops when this delivery no longer holds PUBLISHING: the publisher terminal-izes
+    // (and counts) its own failure, and the not-GPU-resident skip reopens the window before
+    // returning.
+    auto expected = dynamic_filter_publication_state::PUBLISHING;
+    if (_dynamic_filter_publication_state.compare_exchange_strong(
+          expected,
+          dynamic_filter_publication_state::FAILED,
+          std::memory_order_acq_rel,
+          std::memory_order_acquire) &&
+        _dynamic_filter_stats != nullptr) {
+      _dynamic_filter_stats->publications_failed.fetch_add(1, std::memory_order_relaxed);
+    }
+    throw;
   }
-  publish_dynamic_filters(sirius::get_cudf_table_view(*build_ro), publish_stream);
 }
 
 void sirius_physical_hash_join::on_finalize_operator()
