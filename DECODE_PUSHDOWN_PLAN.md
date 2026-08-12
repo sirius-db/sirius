@@ -445,12 +445,28 @@ A sweep for functionality the branch reimplemented. Findings, and what was done:
   the real gap — none of the four had a direct test, and `combine_masks_and` was almost certainly
   never executed anywhere, since the decode calls it only with two or more sources and no test
   built such a request. Now covered (`160657e0`).
-- **Stream pools — OPEN.** Three mechanisms: `pin_table.cpp::compress_pool`,
-  `compressed_scan.cpp::decode_pool` (near-identical thread_locals) and `simpatico_codegen.cpp`'s
-  `leased_pool`. A thread that both pins and decodes holds 8 streams from two thread_locals that
-  do not know about each other.
-- **Two TableFilterSet walkers — OPEN.** `collect_null_prune_predicates` and
-  `decompose_table_filters` walk the same set with the same skip rules, from the same constructor.
+- **Stream pools — DONE** (`ed568684`), and it was a bug, not tidying. The two thread_locals were
+  device-oblivious: `stream_pool::init` creates streams on whatever device is current at first use
+  and never re-creates them, so a thread that decoded on device 0 and later worked on device 1
+  would submit device-1 work onto device-0 streams. Both now go through
+  `simpatico::thread_device_stream_pool`, keyed per (thread, device). **Unverified on hardware** —
+  this box has one GPU, so `test_multi_gpu_stream_affinity` still self-skips.
+- **Two TableFilterSet walkers — DONE, but not by merging** (`0171b1c7`). They are not duplicates:
+  `collect_null_prune_predicates` exists BECAUSE `decompose_table_filters` drops IS_NOT_NULL, so
+  one keeps what the other skips. What they did duplicate is the column bookkeeping underneath,
+  which had drifted (an out-of-range index skipped in one and threw from `.at()` in the other).
+  `resolve_filtered_column` states it once, with three outcomes — the third being where the callers
+  legitimately differ: a conjunct that must be EVALUATED cannot reference an unmaterialized column,
+  while one used only to PRUNE drops silently.
+- **The orchestrator's "duplicate" validation — EXAMINED, KEPT.** The premise did not survive
+  counting. Of the 29 refusal points in `try_decompress_fused`'s preconditions, 25 are structural
+  (bounds, arity, chunk geometry, the source cap) and protect the kernels; only 4 re-derive plan
+  capability, about 20 lines. Deleting those would remove the last check before a WRONG MASK — a
+  range ballot rendered over a non-bitpack root reads the wrong bits and drops the wrong rows —
+  in exchange for 20 lines, on the path with the thinnest coverage. They now say in the code that
+  they are boundary assertions rather than a second opinion: since Phase 3 both sides call the same
+  `probe_column`, they cannot disagree, and the caller's guarantee holds only through a chain of
+  reasoning across several files.
 - **Zone-map filter bounds — NOT a duplicate, a missed connection.** A
   `sirius_dynamic_zone_map_filter` holds `[min, max]`; a decode range holds decoded-domain bounds.
   A zone-map filter could feed the range ballot instead of a full-width membership probe, which

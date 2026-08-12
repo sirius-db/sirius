@@ -404,8 +404,25 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
   namespace sc = sirius::codegen;
 
   // Preconditions — all checked before touching the device. A refusal is a
-  // normal-path decision (the caller runs today's byte-identical decode), not
-  // an error; the reason line only appears under SIRIUS_EXP_FUSED_SCAN_DIAG.
+  // normal-path decision (the caller runs the unfiltered decode, byte-identical
+  // to what it would have run anyway), not an error; the reason line only
+  // appears under SIRIUS_EXP_FUSED_SCAN_DIAG.
+  //
+  // Most of these are structural — index bounds, arity, chunk geometry, the
+  // source cap — and protect the kernels from a request that would fault or
+  // address outside a packed region.
+  //
+  // The four that call probe_column are different in kind and worth keeping
+  // deliberately. The caller narrows its request with the SAME probe before
+  // sending it, so these cannot disagree with it; they are assertions on the
+  // boundary, not a second opinion. They stay because the failure they catch is
+  // a WRONG MASK rather than a crash — render a range ballot over a plan that
+  // is not bitpack-rooted and it reads the wrong bits and silently drops the
+  // wrong rows — and because the caller's guarantee holds only through a chain
+  // of reasoning across several files (a request reaches us only via
+  // compressed_scan::for_chunk, whose narrowing is what makes the claim true).
+  // They are host-side plan-tree walks, once per batch, against device work
+  // measured in milliseconds.
   auto refuse = [](char const* why) {
     if (sc::decode_diag_enabled())
       std::fprintf(stderr, "simpatico: filtered decode refused: %s\n", why);
