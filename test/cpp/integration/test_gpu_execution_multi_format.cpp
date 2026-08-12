@@ -551,6 +551,8 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
     auto const conf       = root / "test/cpp/integration/data/iceberg_conformance";
     conf_append_only_path = (conf / "append_only/conf/append_only").string();
     conf_drop_readd_path  = (conf / "drop_readd/conf/drop_readd").string();
+    conf_rename_col_path  = (conf / "rename_col/conf/rename_col").string();
+    conf_add_column_path  = (conf / "add_column/conf/add_column").string();
   }
 
   /**
@@ -706,6 +708,8 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
   std::string v2_path;
   std::string conf_append_only_path;
   std::string conf_drop_readd_path;
+  std::string conf_rename_col_path;
+  std::string conf_add_column_path;
 };
 
 //===----------------------------------------------------------------------===//
@@ -718,13 +722,16 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
 // the same assumption the implementation makes — that Iceberg columns resolve by NAME.
 // They resolve by field ID.
 //
-// Two further cases exist in the corpus but are deliberately NOT wired up here:
-// `rename_col` and `add_column` currently DEADLOCK. Name resolution fails at runtime, the
-// query takes the runtime fallback, and the next GPU query on that connection hangs
-// forever. Catch2 has no per-case timeout, so a hang stalls the entire suite rather than
-// failing it — no tag can express "expected to hang". They are covered meanwhile by
-// run_conformance.py, which isolates each case in its own process behind a timeout.
-// Wire them up here once the scan declines at PLAN time instead of failing at runtime.
+// `rename_col` and `add_column` were previously NOT wired up here: name resolution failed at
+// runtime, the query took the runtime fallback, and the next GPU query on that connection hung
+// forever. Catch2 has no per-case timeout, so a hang stalls the whole suite rather than failing
+// it, and no tag expresses "expected to hang". They now decline at PLAN time, so they are safe
+// to run in-process and are wired up below.
+//
+// run_conformance.py still covers all four, and still matters: it asserts LIVENESS by issuing a
+// second query on the same connection, which is the observable difference between "declined at
+// plan time" and "fell back at runtime". A route assertion here cannot see that, and a hang here
+// would stall the suite rather than report.
 //===----------------------------------------------------------------------===//
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
@@ -788,6 +795,36 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     "SELECT id, x, y FROM iceberg_scan('" + conf_drop_readd_path + "') ORDER BY id;",
     gpu_route::plan_fallback,
     {{"1", "10", "NULL"}, {"2", "20", "NULL"}});
+}
+
+// A rename keeps the field id and changes the NAME, so the id space stays contiguous and the
+// field-id gap test cannot see it. The older data file still spells the column `val` where the
+// table now says `value`, so resolving by name finds nothing and throws — at SCAN time, which
+// takes the runtime fallback and then deadlocks the connection. Declining at plan time is what
+// makes this case runnable in-process at all.
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - conformance renamed column declines at plan time",
+                 "[integration][gpu_execution][iceberg]")
+{
+  enable_version_guessing_session_scope();
+  expect_iceberg_rows(
+    "SELECT id, value FROM iceberg_scan('" + conf_rename_col_path + "') ORDER BY id;",
+    gpu_route::plan_fallback,
+    {{"1", "old_a"}, {"2", "old_b"}, {"3", "new_c"}, {"4", "new_d"}});
+}
+
+// An ADD keeps ids contiguous too (1,2,3 over three columns), so the gap test misses it for the
+// same reason. `b` is simply absent from the first data file and must read NULL there. Same
+// runtime-throw-then-deadlock path as the rename before the plan-time decline.
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - conformance added column declines at plan time",
+                 "[integration][gpu_execution][iceberg]")
+{
+  enable_version_guessing_session_scope();
+  expect_iceberg_rows(
+    "SELECT id, a, b FROM iceberg_scan('" + conf_add_column_path + "') ORDER BY id;",
+    gpu_route::plan_fallback,
+    {{"1", "10", "NULL"}, {"2", "20", "NULL"}, {"3", "30", "300"}, {"4", "40", "400"}});
 }
 
 //===----------------------------------------------------------------------===//
@@ -1085,6 +1122,63 @@ TEST_CASE_METHOD(GPUExecutionIcebergDVReplacedFixture,
     "SELECT fruit, count FROM iceberg_scan('" + dv_replaced_path + "') ORDER BY count;",
     kDeletionVectorRoute,
     {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+}
+
+//===----------------------------------------------------------------------===//
+// Delete entries that a later commit RETIRED.
+//
+// Both tables still LIST a delete file; neither still applies one. See
+// data/generate_retired_entry_fixtures.py.
+//===----------------------------------------------------------------------===//
+
+class GPUExecutionIcebergRetiredFixture : public GPUExecutionIcebergFixture {
+ public:
+  GPUExecutionIcebergRetiredFixture()
+  {
+    auto const root      = get_project_root() / "test/cpp/integration/data";
+    pos_retired_path     = (root / "iceberg_v2_pos_delete_retired").string();
+    eq_retired_path      = (root / "iceberg_v2_eq_delete_retired").string();
+  }
+
+  std::string pos_retired_path;
+  std::string eq_retired_path;
+};
+
+TEST_CASE_METHOD(GPUExecutionIcebergRetiredFixture,
+                 "gpu_execution iceberg - a retired positional-delete file stops applying",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // The canary counts what the manifest LISTS, so it is 1 here even though nothing applies —
+  // which is the whole point: the table looks like it has a delete file and must behave as
+  // though it does not. A status-blind reader returns 3 of these 5 rows.
+  require_delete_files(pos_retired_path, 1);
+  expect_iceberg_rows(
+    "SELECT fruit, count FROM iceberg_scan('" + pos_retired_path + "') ORDER BY count;",
+    gpu_route::gpu,
+    {{"apple", "1"},
+     {"banana", "2"},
+     {"cherry", "3"},
+     {"date", "4"},
+     {"elderberry", "5"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergRetiredFixture,
+                 "gpu_execution iceberg - a retired equality-delete file does not refuse the GPU",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // Equality deletes are the one thing this path refuses outright, so the ROUTE is the
+  // assertion. With the table's only equality-delete entry retired there is nothing to apply,
+  // and the gate must not keep refusing over it. Getting this wrong costs performance rather
+  // than correctness, which is exactly why the rows alone would never reveal it.
+  require_delete_files(eq_retired_path, 1);
+  expect_iceberg_rows(
+    "SELECT fruit, count FROM iceberg_scan('" + eq_retired_path + "') ORDER BY count;",
+    gpu_route::gpu,
+    {{"apple", "1"},
+     {"banana", "2"},
+     {"cherry", "3"},
+     {"date", "4"},
+     {"elderberry", "5"}});
 }
 
 //===----------------------------------------------------------------------===//
