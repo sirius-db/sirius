@@ -385,6 +385,7 @@ individually.
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join. A build below this size is replicated to every GPU (instead of hash-partitioned) when it is tiny, or when the DuckDB-estimated probe-to-build row ratio is at least `num_gpus * 1.25`. |
 | `max_sort_partition_memory_fraction` | 0.33 | Fraction of GPU memory per sort partition when `max_sort_partition_bytes` is 0 |
 | `mark_join_build_switch_ratio` | 8.0 | For STANDARD MARK joins, build on the smaller (left) side when `right_rows >= ratio * left_rows` (0 disables) |
+| `enable_runtime_distinct_build_probe` | true | For `BUILD_PROBE` INNER/LEFT equality joins whose build-key uniqueness the planner could not prove, test distinctness at runtime (one `cudf::distinct_count` pass over the cached build, dimension-scale builds only) and take the single-pass `cudf::distinct_hash_join` instead of the general two-pass join when the keys are distinct. |
 | `enable_dynamic_filter` | true | Enable runtime filters for eligible `BUILD_PROBE` joins. Targets may be probe scans or join-edge endpoints. |
 | `enable_dynamic_zone_map_filter` | false | Publish build-key min/max filters in addition to membership filters. Parquet scans use them for row-group pruning; duckdb-native scans apply them post-decode. Requires `enable_dynamic_filter`. |
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Skip publishing a key's membership filter when the build covers at least this fraction of the key's unfiltered base-table row bound. Fires only for build keys proven unique in their base relation, with evidence from DuckDB-native scans; the zone-map range gate receives no domain and stays inactive. A value above 1.0 is the explicit disabled state (the rollback lever: setting it above 1.0 restores pre-gate publication behavior without disabling dynamic filtering); exactly 1.0 fires only at full coverage. |
@@ -563,6 +564,7 @@ SET enable_compressed_materialization = false;
 | `max_build_hash_table_bytes` | 2× batch default | Max build-side hash table bytes |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
+| `enable_runtime_distinct_build_probe` | true | Runtime distinct-build test for `BUILD_PROBE` joins; promotes to the single-pass `cudf::distinct_hash_join` when the build keys prove distinct |
 
 ### Dynamic Filters
 

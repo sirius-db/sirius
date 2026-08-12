@@ -89,6 +89,15 @@ struct valid_domain_coverage_threshold {
   }
 };
 
+/// Test build-key uniqueness at runtime when the planner could not prove it statically.
+///
+/// cudf's general hash join probes twice — a count pass to size the output, then a retrieve pass —
+/// while cudf::distinct_hash_join probes once, because a distinct build bounds the output by the
+/// probe row count. Sirius already implements both, but the distinct path is gated on a *proof* of
+/// uniqueness, which only a declared PRIMARY KEY on a catalog table can supply. The runtime test is
+/// one cudf::distinct_count pass over the build keys, taken only in BUILD_PROBE mode.
+constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = true;
+
 }  // namespace config
 
 /// Parameters controlling operator-level resource sizing.
@@ -130,6 +139,13 @@ struct operator_params {
   /// L4 in the issue #510 microbenchmark, defaulted higher to stay conservative). Set to 0 to
   /// disable (always use filtered_join).
   double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
+
+  /// When the planner could not prove build-key uniqueness, test it at runtime (one
+  /// cudf::distinct_count pass over the build keys) and take the single-pass
+  /// cudf::distinct_hash_join instead of the two-pass general path when the keys are in fact
+  /// distinct. BUILD_PROBE mode only, INNER/LEFT equality joins with null-unequal semantics. See
+  /// DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE.
+  bool enable_runtime_distinct_build_probe = config::DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE;
 
   /// Enable runtime dynamic-filter discovery for eligible BUILD_PROBE hash joins. Targets may be
   /// probe-side scans or join-edge endpoints.

@@ -274,6 +274,13 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   mutable bool unique_probe_keys = false;
 
+  //! When the planner could not *prove* build-key uniqueness, test it at runtime instead (one hash
+  //! pass over the build keys) and, if the keys are in fact distinct, take the single-pass
+  //! cudf::distinct_hash_join path rather than the general two-pass multiset path. Proving
+  //! uniqueness statically needs a declared PRIMARY KEY on a catalog table. Set from
+  //! operator_params at planning time.
+  bool runtime_distinct_build_probe = config::DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE;
+
   //! Row-count ratio gate for switching STANDARD-mode MARK joins to cudf::mark_join (build on the
   //! left/output side) instead of filtered_join (build on the right side). Switch when
   //! right_rows >= ratio * left_rows; 0 disables. Set from operator_params at planning time.
