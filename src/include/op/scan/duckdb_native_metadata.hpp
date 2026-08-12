@@ -122,6 +122,12 @@ constexpr std::size_t kCudfInt32StringsThreshold =
 bool is_supported_data_compression(duckdb::CompressionType c);
 bool is_supported_validity_compression(duckdb::CompressionType c);
 
+/// @brief The walker's type gate, factored out so a deferred-walk ingestible can still refuse
+/// unsupported types at plan time.
+std::optional<std::string> unsupported_projected_type_reason(
+  const std::vector<projected_column>& projected_cols,
+  const std::vector<sirius::logical_type>& projected_types);
+
 //===----------------------------------------------------------------------===//
 // Two-phase metadata walk:
 //  - prepare_duckdb_native_walk(): one-time setup.

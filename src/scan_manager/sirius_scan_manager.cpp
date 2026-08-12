@@ -663,6 +663,9 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
       _scan_op_order.push_back(op);
       continue;
     }
+    // This scan reads disk, so it needs any walk the ingestible deferred. Must run here on the
+    // query thread: GetPartitionStats touches ClientContext/LocalStorage.
+    op->get_ingestible().ensure_metadata_prepared();
     auto provider = std::make_unique<split_provider>(
       op->get_ingestible(),
       [this](std::string_view file_path) -> std::shared_ptr<io::sirius_ioctx> {
