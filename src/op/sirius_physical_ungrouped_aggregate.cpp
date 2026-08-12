@@ -277,7 +277,15 @@ std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
 duckdb::vector<sirius::logical_type> sirius_physical_ungrouped_aggregate::get_local_output_types()
   const
 {
-  auto layout = build_aggregate_layout(aggregates);
+  aggregate_layout layout;
+  try {
+    layout = build_aggregate_layout(aggregates);
+  } catch (const not_implemented_exception&) {
+    // Keep unsupported aggregates on their established runtime-fallback path. Their local output
+    // is never consumed, so retaining the declared schema here avoids turning a runtime fallback
+    // into an earlier planning refusal merely to describe an output that will not be produced.
+    return types;
+  }
   duckdb::vector<sirius::logical_type> local_types;
   local_types.reserve(layout.local_types.size());
   for (auto const& type : layout.local_types) {
