@@ -56,6 +56,7 @@
 #include "op/sirius_physical_top_n_merge.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
+#include "planner/dynamic_filter/dynamic_filter_target_discovery.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
@@ -221,11 +222,13 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
 //! `unique_ptr<InfoT>`.
 //!
 //! `mode` selects the wrapped operator's post-decode capability and is the scan format's only
-//! behavioral input here: a parquet scan already evaluated AST-capable filters (zone maps)
-//! through the reader's `set_filter`, so it wraps in `membership_masks_only`; a duckdb-native
-//! scan has no read-time dynamic path, so it wraps in `include_ast_row_masks` to also evaluate
-//! zone maps row-wise. Channels without registered producers are elided. Registration finishes
-//! after the whole tree is built, so `has_producers()` is settled.
+//! behavioral input here: a scan whose reader evaluated AST-capable filters (zone maps) while
+//! reading has already applied them, so it wraps in `membership_masks_only`; one with no
+//! read-time filter path wraps in `include_ast_row_masks` to also evaluate zone maps row-wise.
+//! Callers derive it from `sirius::planner::target_skips_reads`, which is the same question the
+//! Top-N siting rule asks, so the two answers cannot drift apart. Channels without registered
+//! producers are elided. Registration finishes after the whole tree is built, so
+//! `has_producers()` is settled.
 template <typename InfoT>
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
   std::unique_ptr<InfoT> info,
@@ -274,24 +277,22 @@ void wrap_table_scan_source(
   auto& scan     = table_scan_slot->Cast<sirius::op::sirius_physical_table_scan>();
   const auto& fn = scan.function.name;
 
+  // A reader that filters while reading has already applied the AST-capable filters, so its
+  // wrapped DYNAMIC_FILTER only needs membership masks; one without such a path must evaluate them
+  // row-wise after decode. This is the same property the Top-N siting rule consults, asked once.
+  auto const mode = sirius::planner::target_skips_reads(scan)
+                      ? sirius::op::scan::dynamic_filter_apply_mode::membership_masks_only
+                      : sirius::op::scan::dynamic_filter_apply_mode::include_ast_row_masks;
+
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf;
   bool replace_slot = false;
   if (fn == "seq_scan") {
-    // The duckdb-native scan has no read-time dynamic-filter path, so its wrapped DYNAMIC_FILTER
-    // also evaluates AST-capable filters (zone maps) row-wise, not membership masks alone.
-    leaf = make_gpu_scan_leaf(build_duckdb_native_table_info(scan, op_params, context),
-                              scan,
-                              op_params,
-                              sirius::op::scan::dynamic_filter_apply_mode::include_ast_row_masks);
+    leaf = make_gpu_scan_leaf(
+      build_duckdb_native_table_info(scan, op_params, context), scan, op_params, mode);
     // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
     replace_slot = true;
-  } else if (fn == "parquet_scan" || fn == "read_parquet" || fn == "sirius_read_parquet") {
-    // The parquet ingestible consumes AST filters for read-time row-group pruning, so its wrapped
-    // DYNAMIC_FILTER applies membership masks only.
-    leaf = make_gpu_scan_leaf(build_parquet_table_info(scan, op_params),
-                              scan,
-                              op_params,
-                              sirius::op::scan::dynamic_filter_apply_mode::membership_masks_only);
+  } else if (sirius::planner::is_parquet_reader_function(fn)) {
+    leaf = make_gpu_scan_leaf(build_parquet_table_info(scan, op_params), scan, op_params, mode);
     // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
     replace_slot = true;
   } else {

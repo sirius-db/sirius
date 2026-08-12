@@ -21,12 +21,11 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <unistd.h>
 #include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
-
-#include <unistd.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -144,6 +143,34 @@ struct scoped_topn_db {
   std::filesystem::path path;
 };
 
+// Parquet copy of one scratch table, removed on destruction. The publication sections read this
+// instead of the native table: the duckdb-native scan has no read-time filter path, so the siting
+// rule binds no Top-N target there and the publication counters those sections assert cannot
+// move. Parquet is the consumer that skips reads. The native shapes stay covered by the sections
+// whose subject is refusal or self-consumption, which are scan-format-independent.
+struct scoped_topn_parquet {
+  scoped_topn_parquet(duckdb::Connection& con, std::string const& table)
+    : path(std::filesystem::temp_directory_path() /
+           ("sirius_topn_" + table + "." + std::to_string(::getpid()) + ".parquet"))
+  {
+    auto r = con.Query("COPY " + table + " TO '" + path.string() + "' (FORMAT PARQUET);");
+    REQUIRE(r);
+    REQUIRE_FALSE(r->HasError());
+  }
+  ~scoped_topn_parquet()
+  {
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+  }
+
+  scoped_topn_parquet(const scoped_topn_parquet&)            = delete;
+  scoped_topn_parquet& operator=(const scoped_topn_parquet&) = delete;
+
+  [[nodiscard]] std::string scan() const { return "read_parquet('" + path.string() + "')"; }
+
+  std::filesystem::path path;
+};
+
 void create_test_tables(duckdb::Connection& con)
 {
   // v is a permutation (10007 is prime and coprime to 37), so single- and multi-key orders over
@@ -216,10 +243,11 @@ TEST_CASE("gpu_execution - top-n dynamic filter sink self-consumption",
   auto con = sirius::test::g_integration_env->make_connection();
   scoped_topn_db scratch_db(con);
   create_test_tables(con);
+  scoped_topn_parquet facts_pq(con, "topn_facts");
 
   SECTION("eligible multi-key query: equivalence plus producer and offer movement")
   {
-    std::string const query = "SELECT id, v, w FROM topn_facts ORDER BY v, w LIMIT 10";
+    std::string const query = "SELECT id, v, w FROM " + facts_pq.scan() + " ORDER BY v, w LIMIT 10";
     require_flag_equivalence(con, query);
 
     top_n_flag_guard flag(con, true);
@@ -242,7 +270,9 @@ TEST_CASE("gpu_execution - top-n dynamic filter sink self-consumption",
 
     // Publication is producer-side, so it does not race the scan: both keys come from one table,
     // so the all-keys trace binds that scan and every accepted offer installs a revision. The
-    // *effect* on the scan is what races, and is therefore never asserted here (R2).
+    // scan is the parquet copy -- the siting rule binds only a consumer that skips reads, and the
+    // native table would leave every publication counter below flat. The *effect* on the scan is
+    // what races, and is therefore never asserted here (R2).
     REQUIRE(after.top_n_lex_scan_targets > before.top_n_lex_scan_targets);
     REQUIRE(after.top_n_revisions_published > before.top_n_revisions_published);
     REQUIRE(after.top_n_lex_filters_pushed > before.top_n_lex_filters_pushed);
@@ -318,6 +348,7 @@ TEST_CASE("gpu_execution - top-n dynamic filter group-key producer",
   auto con = sirius::test::g_integration_env->make_connection();
   scoped_topn_db scratch_db(con);
   create_test_tables(con);
+  scoped_topn_parquet groups_pq(con, "topn_groups");
 
   SECTION("grouping-key order: the producer witnesses distinct keys and prunes its own input")
   {
@@ -325,7 +356,7 @@ TEST_CASE("gpu_execution - top-n dynamic filter group-key producer",
     // group-key producer is admitted, roots below the aggregate, and prunes the aggregate's input.
     scan_batch_size_guard batches(con, 65536);
     std::string const query =
-      "SELECT grp, min(v) AS m FROM topn_groups GROUP BY grp ORDER BY grp LIMIT 5";
+      "SELECT grp, min(v) AS m FROM " + groups_pq.scan() + " GROUP BY grp ORDER BY grp LIMIT 5";
     require_flag_equivalence(con, query);
 
     top_n_flag_guard flag(con, true);
@@ -362,7 +393,7 @@ TEST_CASE("gpu_execution - top-n dynamic filter group-key producer",
     // the query still returns five rows and no error. Only exact equality with CPU sees it.
     scan_batch_size_guard batches(con, 65536);
     std::string const query =
-      "SELECT grp, sum(v) AS s FROM topn_groups GROUP BY grp ORDER BY grp LIMIT 5";
+      "SELECT grp, sum(v) AS s FROM " + groups_pq.scan() + " GROUP BY grp ORDER BY grp LIMIT 5";
     require_flag_equivalence(con, query);
 
     top_n_flag_guard flag(con, true);
@@ -388,8 +419,8 @@ TEST_CASE("gpu_execution - top-n dynamic filter group-key producer",
     // *inclusive* full-tuple predicate there. A strict one would drop rows tying the whole
     // boundary tuple -- rows of a group that is in the answer -- and lower that group's sum.
     scan_batch_size_guard batches(con, 65536);
-    std::string const query =
-      "SELECT grp, sub, sum(v) AS s FROM topn_groups GROUP BY grp, sub ORDER BY grp, sub LIMIT 5";
+    std::string const query = "SELECT grp, sub, sum(v) AS s FROM " + groups_pq.scan() +
+                              " GROUP BY grp, sub ORDER BY grp, sub LIMIT 5";
     require_flag_equivalence(con, query);
 
     top_n_flag_guard flag(con, true);

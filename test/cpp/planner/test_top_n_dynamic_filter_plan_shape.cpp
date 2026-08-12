@@ -27,12 +27,22 @@
  * These also exercise `trace_top_n_all_keys` on real plans: the all-ordinals-survive rule shows
  * up as a two-ordinal slot (scenario 9), UNION fan-out as one slot per branch (scenario 6), and
  * hop refusal as no slot at all (scenario 5).
+ *
+ * **Why the scan-binding cases read Parquet.** The siting rule sites a target only where it saves
+ * work nothing else saves: the consumer skips reads, or material work lies between the site and
+ * the sink. A DuckDB-native scan reached over pass-through hops alone satisfies neither, so the
+ * planner correctly binds nothing there and a native table cannot pin *where* a trace bottoms out.
+ * Every case whose subject is trace mechanics therefore scans Parquet, whose reader prunes row
+ * groups by statistics. Rewriting one of them back to a native table would leave it asserting the
+ * siting rule instead, and the trace it was written to pin would go untested. The native shapes
+ * are covered deliberately and separately, by the refusal cases and by the material-work cases
+ * that must still bind.
  */
 
 #include "expression/ast/node.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
-#include "op/scan/sirius_physical_dynamic_filter.hpp"
 #include "op/dynamic_filter/top_n_group_key_producer.hpp"
+#include "op/scan/sirius_physical_dynamic_filter.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_top_n.hpp"
 #include "planner/dynamic_filter/dynamic_filter_target_discovery.hpp"
@@ -259,10 +269,13 @@ struct top_n_plan_shape_fixture {
     con->Query("INSERT INTO other SELECT range, range % 17 FROM range(50)");
     con->Query("CREATE TABLE dim (dk INTEGER, dv INTEGER)");
     con->Query("INSERT INTO dim SELECT range, range FROM range(200)");
+    facts_parquet = _db_path.path() + ".facts.parquet";
+    con->Query("COPY facts TO '" + facts_parquet + "' (FORMAT PARQUET)");
     // One column per decimal admission band: DECIMAL32 (p<=9), DECIMAL64 (p<=18), and DECIMAL128
-    // (p>=19), which the boundary components cannot hold. The duckdb-native scan refuses a
-    // DECIMAL128 column outright, so `huge_dec` is exercised through parquet, which has no such
-    // gate and is the path on which the p>=19 refusal is actually live.
+    // (p>=19), which the boundary components cannot hold. The decimal cases scan the parquet
+    // copy (see the file comment). For `huge_dec` parquet is also the only reachable path: the
+    // duckdb-native scan refuses a DECIMAL128 column outright, while parquet has no precision
+    // gate and is where the p>=19 refusal is actually live.
     con->Query(
       "CREATE TABLE money (id INTEGER, small_dec DECIMAL(9,2), big_dec DECIMAL(18,4), "
       "huge_dec DECIMAL(38,4))");
@@ -275,8 +288,17 @@ struct top_n_plan_shape_fixture {
   {
     unsetenv("SIRIUS_CONFIG_FILE");
     if (!money_parquet.empty()) { std::remove(money_parquet.c_str()); }
+    if (!facts_parquet.empty()) { std::remove(facts_parquet.c_str()); }
   }
 
+  /// `facts`, read through the Parquet scan -- a consumer that can skip reads, which is what makes
+  /// a trace's stop point observable at all (see the file comment).
+  [[nodiscard]] std::string facts_scan() const { return "read_parquet('" + facts_parquet + "')"; }
+
+  /// `money`, read through the Parquet scan, for the same reason as `facts_scan()`.
+  [[nodiscard]] std::string money_scan() const { return "read_parquet('" + money_parquet + "')"; }
+
+  std::string facts_parquet;
   std::string money_parquet;
   scoped_temp_db_path _db_path;
   std::unique_ptr<DuckDB> db;
@@ -290,7 +312,8 @@ TEST_CASE_METHOD(top_n_plan_shape_fixture,
                  "[plan_tree_shape][isolated_context][top_n]")
 {
   top_n_filter_switch_guard flag(*con, false);
-  auto plan = generate_sirius_plan(*con, "SELECT id, v FROM facts ORDER BY v LIMIT 10");
+  auto plan =
+    generate_sirius_plan(*con, "SELECT id, v FROM " + facts_scan() + " ORDER BY v LIMIT 10");
   // Feature dark: no channel is minted for Top-N, so the scan carries no producer and the
   // scan-route wrapper is elided entirely.
   CHECK(scan_route_filters(plan.get()).empty());
@@ -302,10 +325,68 @@ TEST_CASE_METHOD(top_n_plan_shape_fixture,
                  "[plan_tree_shape][isolated_context][top_n]")
 {
   top_n_filter_switch_guard flag(*con, true);
-  auto plan  = generate_sirius_plan(*con, "SELECT id, v FROM facts ORDER BY v LIMIT 10");
+  auto plan =
+    generate_sirius_plan(*con, "SELECT id, v FROM " + facts_scan() + " ORDER BY v LIMIT 10");
   auto slots = single_scan_slots(plan.get());
 
   // One producer, one slot; a lone key references no further ordinal.
+  REQUIRE(slots.size() == 1);
+  CHECK(slots.front().referenced_ordinals.empty());
+}
+
+TEST_CASE_METHOD(top_n_plan_shape_fixture,
+                 "top-n plan shape - a scan that cannot skip reads is not sited",
+                 "[plan_tree_shape][isolated_context][top_n]")
+{
+  top_n_filter_switch_guard flag(*con, true);
+  auto* state = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
+  REQUIRE(state != nullptr);
+  auto const before = state->get_dynamic_filter_stats_snapshot();
+
+  // Scenario 2, and the siting rule's whole point. This is scenario 1's query over the *native*
+  // table: the trace reaches the scan exactly as it does on Parquet, but the DuckDB-native reader
+  // has no read-time filter path, so a predicate published there prunes nothing before decode --
+  // it buys one O(rows) compaction pass at the scan to save the sink prefilter an identical pass
+  // over the same rows. Measured, that shape regresses (+6.8% adversary, +11.5% at 0.52% rows
+  // kept), which is why "is it a scan?" is no longer accepted as a proxy for "can it skip reads?".
+  auto plan        = generate_sirius_plan(*con, "SELECT id, v FROM facts ORDER BY v LIMIT 10");
+  auto const after = state->get_dynamic_filter_stats_snapshot();
+
+  // The producer still exists and still self-consumes; only the external target is refused.
+  CHECK(after.top_n_producers_eligible > before.top_n_producers_eligible);
+  CHECK(after.top_n_sites_skipped_no_work_saved > before.top_n_sites_skipped_no_work_saved);
+  CHECK(after.top_n_first_key_scan_targets == before.top_n_first_key_scan_targets);
+  CHECK(after.top_n_lex_scan_targets == before.top_n_lex_scan_targets);
+  CHECK(after.top_n_endpoint_sites_placed == before.top_n_endpoint_sites_placed);
+  CHECK(registered_slots(plan.get()).empty());
+  CHECK(scan_route_filters(plan.get()).empty());
+}
+
+TEST_CASE_METHOD(top_n_plan_shape_fixture,
+                 "top-n plan shape - a scan that cannot skip reads is sited when it shields "
+                 "material work",
+                 "[plan_tree_shape][isolated_context][top_n]")
+{
+  top_n_filter_switch_guard flag(*con, true);
+  auto* state = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
+  REQUIRE(state != nullptr);
+  auto const before = state->get_dynamic_filter_stats_snapshot();
+
+  // The asymmetry the rule must preserve, on the same native table the case above refuses. The
+  // predicate is over a computed expression, so DuckDB cannot lower it into the scan's table
+  // filters and a FILTER operator survives between the scan and the Top-N. That filter evaluates
+  // per row, so a boundary applied at the scan shields real work on every rejected row and the
+  // target pays for itself -- the rule refuses sites that duplicate the sink's own pass, never a
+  // backend. Collapse the rule to "refuse native scans" and this case stops binding.
+  auto plan =
+    generate_sirius_plan(*con, "SELECT v FROM facts WHERE v + w <> 12345 ORDER BY v LIMIT 10");
+  auto const after = state->get_dynamic_filter_stats_snapshot();
+
+  // The shape is genuinely the intended one: a FILTER, not a pushed-down table filter.
+  REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::FILTER) != nullptr);
+  CHECK(after.top_n_first_key_scan_targets > before.top_n_first_key_scan_targets);
+  CHECK(after.top_n_sites_skipped_no_work_saved == before.top_n_sites_skipped_no_work_saved);
+  auto slots = single_scan_slots(plan.get());
   REQUIRE(slots.size() == 1);
   CHECK(slots.front().referenced_ordinals.empty());
 }
@@ -315,7 +396,8 @@ TEST_CASE_METHOD(top_n_plan_shape_fixture,
                  "[plan_tree_shape][isolated_context][top_n]")
 {
   top_n_filter_switch_guard flag(*con, true);
-  auto plan  = generate_sirius_plan(*con, "SELECT id, v, w FROM facts ORDER BY v, w LIMIT 10");
+  auto plan =
+    generate_sirius_plan(*con, "SELECT id, v, w FROM " + facts_scan() + " ORDER BY v, w LIMIT 10");
   auto slots = single_scan_slots(plan.get());
 
   // Both ordinals survived every hop together, so the site carries the full tuple: one slot with
@@ -332,7 +414,8 @@ TEST_CASE_METHOD(top_n_plan_shape_fixture,
 {
   top_n_filter_switch_guard flag(*con, true);
   // A VARCHAR tail is outside the allowlist, so no LEX layer exists and only key zero is bound.
-  auto plan  = generate_sirius_plan(*con, "SELECT v, pay FROM facts ORDER BY v, pay LIMIT 10");
+  auto plan =
+    generate_sirius_plan(*con, "SELECT v, pay FROM " + facts_scan() + " ORDER BY v, pay LIMIT 10");
   auto slots = single_scan_slots(plan.get());
 
   REQUIRE(slots.size() == 1);
@@ -346,7 +429,8 @@ TEST_CASE_METHOD(top_n_plan_shape_fixture,
   top_n_filter_switch_guard flag(*con, true);
   // A FILTER and a plain projection are accepted hops, so the trace bottoms out at the scan and
   // binds it rather than siting an endpoint above the filter.
-  auto plan  = generate_sirius_plan(*con, "SELECT v FROM facts WHERE id <> 3 ORDER BY v LIMIT 10");
+  auto plan = generate_sirius_plan(
+    *con, "SELECT v FROM " + facts_scan() + " WHERE id <> 3 ORDER BY v LIMIT 10");
   auto slots = single_scan_slots(plan.get());
 
   REQUIRE(slots.size() == 1);
@@ -378,8 +462,8 @@ TEST_CASE_METHOD(top_n_plan_shape_fixture,
   auto* state = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
   REQUIRE(state != nullptr);
   auto const before = state->get_dynamic_filter_stats_snapshot();
-  auto plan =
-    generate_sirius_plan(*con, "SELECT w, min(v) AS m FROM facts GROUP BY w ORDER BY w LIMIT 5");
+  auto plan         = generate_sirius_plan(
+    *con, "SELECT w, min(v) AS m FROM " + facts_scan() + " GROUP BY w ORDER BY w LIMIT 5");
   auto const after = state->get_dynamic_filter_stats_snapshot();
 
   auto* aggregate = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_GROUP_BY);
@@ -417,8 +501,8 @@ TEST_CASE_METHOD(top_n_plan_shape_fixture,
   // Scenario 15. Every ORDER BY key is a grouping key, nothing filters between the aggregate and
   // the Top-N, so the group-key producer is admitted and traces from the aggregate's *input* into
   // the scan feeding it.
-  auto plan =
-    generate_sirius_plan(*con, "SELECT w, min(v) AS m FROM facts GROUP BY w ORDER BY w LIMIT 5");
+  auto plan = generate_sirius_plan(
+    *con, "SELECT w, min(v) AS m FROM " + facts_scan() + " GROUP BY w ORDER BY w LIMIT 5");
   auto const after = state->get_dynamic_filter_stats_snapshot();
 
   CHECK(after.top_n_group_producers_eligible > before.top_n_group_producers_eligible);
@@ -452,8 +536,8 @@ TEST_CASE_METHOD(top_n_plan_shape_fixture,
   // sees `w` at ordinal 1 while the aggregate emits it at ordinal 0. Every other group-key
   // scenario in the repo has an identity remap, so without this shape a producer that used the
   // pre-remap ordinal would bind the same column anyway and no test would notice.
-  auto plan =
-    generate_sirius_plan(*con, "SELECT min(v) AS m, w FROM facts GROUP BY w ORDER BY w LIMIT 5");
+  auto plan = generate_sirius_plan(
+    *con, "SELECT min(v) AS m, w FROM " + facts_scan() + " GROUP BY w ORDER BY w LIMIT 5");
 
   auto* top_n = find_first(plan.get(), SiriusPhysicalOperatorType::TOP_N);
   REQUIRE(top_n != nullptr);
@@ -487,7 +571,8 @@ TEST_CASE_METHOD(top_n_plan_shape_fixture,
   // never plans a LEX target at all, so this is the only place the multi-key remap, the LEX target
   // creation, and the two-ordinal slot are exercised on a real plan.
   auto plan = generate_sirius_plan(
-    *con, "SELECT v, w, count(*) AS c FROM facts GROUP BY v, w ORDER BY v, w LIMIT 5");
+    *con,
+    "SELECT v, w, count(*) AS c FROM " + facts_scan() + " GROUP BY v, w ORDER BY v, w LIMIT 5");
   auto const after = state->get_dynamic_filter_stats_snapshot();
 
   CHECK(after.top_n_group_producers_eligible > before.top_n_group_producers_eligible);
@@ -548,8 +633,8 @@ TEST_CASE_METHOD(top_n_plan_shape_fixture,
   SECTION("DECIMAL32 (p<=9) binds its scan")
   {
     auto const before = state->get_dynamic_filter_stats_snapshot();
-    auto plan =
-      generate_sirius_plan(*con, "SELECT small_dec FROM money ORDER BY small_dec LIMIT 5");
+    auto plan         = generate_sirius_plan(
+      *con, "SELECT small_dec FROM " + money_scan() + " ORDER BY small_dec LIMIT 5");
     auto const after = state->get_dynamic_filter_stats_snapshot();
     CHECK(after.top_n_producers_eligible > before.top_n_producers_eligible);
     CHECK(after.top_n_producers_rejected == before.top_n_producers_rejected);
@@ -560,7 +645,8 @@ TEST_CASE_METHOD(top_n_plan_shape_fixture,
   SECTION("DECIMAL64 (p<=18) binds its scan")
   {
     auto const before = state->get_dynamic_filter_stats_snapshot();
-    auto plan = generate_sirius_plan(*con, "SELECT big_dec FROM money ORDER BY big_dec LIMIT 5");
+    auto plan         = generate_sirius_plan(
+      *con, "SELECT big_dec FROM " + money_scan() + " ORDER BY big_dec LIMIT 5");
     auto const after = state->get_dynamic_filter_stats_snapshot();
     CHECK(after.top_n_producers_eligible > before.top_n_producers_eligible);
     CHECK(after.top_n_producers_rejected == before.top_n_producers_rejected);
@@ -576,7 +662,7 @@ TEST_CASE_METHOD(top_n_plan_shape_fixture,
     // integer has no case there and would be read as zero rather than rejected.
     auto const before = state->get_dynamic_filter_stats_snapshot();
     auto plan         = generate_sirius_plan(
-      *con, "SELECT huge_dec FROM read_parquet('" + money_parquet + "') ORDER BY huge_dec LIMIT 5");
+      *con, "SELECT huge_dec FROM " + money_scan() + " ORDER BY huge_dec LIMIT 5");
     auto const after = state->get_dynamic_filter_stats_snapshot();
     CHECK(after.top_n_producers_rejected > before.top_n_producers_rejected);
     CHECK(after.top_n_producers_eligible == before.top_n_producers_eligible);
@@ -585,8 +671,8 @@ TEST_CASE_METHOD(top_n_plan_shape_fixture,
 
   SECTION("a decimal tail beside an integer head enables the LEX layer")
   {
-    auto plan =
-      generate_sirius_plan(*con, "SELECT id, small_dec FROM money ORDER BY id, small_dec LIMIT 5");
+    auto plan = generate_sirius_plan(
+      *con, "SELECT id, small_dec FROM " + money_scan() + " ORDER BY id, small_dec LIMIT 5");
     auto slots = single_scan_slots(plan.get());
     REQUIRE(slots.size() == 1);
     // Both keys admitted, so the site carries the full tuple rather than degrading to first-key.
@@ -665,8 +751,12 @@ TEST_CASE_METHOD(top_n_plan_shape_fixture,
   // The self-trace refuses join hops, so the trace stops at the join output. Only pass-through
   // hops separate that stop point from the sink, so the site is immaterial and is skipped -- the
   // sink prefilter already applies the same predicate over the same rows.
+  //
+  // Facts reads Parquet so the refusal itself stays observable: a wrongly widened join hop would
+  // continue into the scan and mint a slot, failing the emptiness check below. On a native table
+  // that regression would be absorbed by the siting rule's skip and the test would pass vacuously.
   auto plan = generate_sirius_plan(
-    *con, "SELECT f.v FROM facts f JOIN dim d ON f.id = d.dk ORDER BY f.v LIMIT 10");
+    *con, "SELECT f.v FROM " + facts_scan() + " f JOIN dim d ON f.id = d.dk ORDER BY f.v LIMIT 10");
 
   CHECK(registered_slots(plan.get()).empty());
   for (auto* node : collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER)) {
@@ -689,9 +779,9 @@ TEST_CASE_METHOD(top_n_plan_shape_fixture,
   // join output while key zero continues into its own scan. A residual FILTER above the join
   // makes that stop point material, so the LEX site is worth having -- and is deferred, not
   // cost-gate skipped, because splicing it needs multi-ordinal placement (Stage 7).
-  auto plan = generate_sirius_plan(*con,
+  auto plan        = generate_sirius_plan(*con,
                                    "SELECT f.v, d.dv FROM facts f JOIN dim d ON f.id = d.dk "
-                                   "WHERE f.v + d.dv <> 12345 ORDER BY f.v, d.dv LIMIT 10");
+                                          "WHERE f.v + d.dv <> 12345 ORDER BY f.v, d.dv LIMIT 10");
   auto const after = state->get_dynamic_filter_stats_snapshot();
 
   // The staged gap is reported as itself, never folded into the cost-gate skip counter.

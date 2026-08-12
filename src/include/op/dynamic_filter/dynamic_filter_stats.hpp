@@ -60,7 +60,7 @@ struct dynamic_filter_stats_snapshot {
   std::uint64_t top_n_first_key_scan_targets      = 0;
   std::uint64_t top_n_lex_scan_targets            = 0;
   std::uint64_t top_n_endpoint_sites_placed       = 0;
-  std::uint64_t top_n_endpoint_sites_skipped      = 0;
+  std::uint64_t top_n_sites_skipped_no_work_saved = 0;
   std::uint64_t top_n_lex_endpoint_sites_deferred = 0;
   std::uint64_t top_n_first_key_subsumed_by_lex   = 0;
   std::uint64_t top_n_revisions_published         = 0;
@@ -165,7 +165,13 @@ struct dynamic_filter_stats {
   std::atomic<std::uint64_t> top_n_first_key_scan_targets{0};  ///< Plan-time
   std::atomic<std::uint64_t> top_n_lex_scan_targets{0};        ///< Plan-time; all keys one scan
   std::atomic<std::uint64_t> top_n_endpoint_sites_placed{0};   ///< Plan-time; either layer
-  std::atomic<std::uint64_t> top_n_endpoint_sites_skipped{0};  ///< Plan-time; cost gate said no
+  /// Plan-time; the siting rule declined -- the target neither reads less because of the predicate
+  /// nor shields per-row work from it, so it would only repeat the sink prefilter's own pass.
+  /// Covers endpoints and post-decode-only scan binds alike. Also counts the type-admission
+  /// refusal (`boundary_key_matches_site_type` mismatch) -- deliberately shared: type-preserving
+  /// hops make that refusal unconstructible through a built plan, so it is pinned at the
+  /// pure-function level rather than given a counter no plan can move.
+  std::atomic<std::uint64_t> top_n_sites_skipped_no_work_saved{0};
   /// Plan-time; a material LEX site this stage cannot splice (multi-ordinal placement is Stage 7).
   /// Kept apart from the skip counter so a staged gap never reads as a cost-gate decision.
   std::atomic<std::uint64_t> top_n_lex_endpoint_sites_deferred{0};
@@ -228,7 +234,8 @@ struct dynamic_filter_stats {
       .top_n_first_key_scan_targets = top_n_first_key_scan_targets.load(std::memory_order_relaxed),
       .top_n_lex_scan_targets       = top_n_lex_scan_targets.load(std::memory_order_relaxed),
       .top_n_endpoint_sites_placed  = top_n_endpoint_sites_placed.load(std::memory_order_relaxed),
-      .top_n_endpoint_sites_skipped = top_n_endpoint_sites_skipped.load(std::memory_order_relaxed),
+      .top_n_sites_skipped_no_work_saved =
+        top_n_sites_skipped_no_work_saved.load(std::memory_order_relaxed),
       .top_n_lex_endpoint_sites_deferred =
         top_n_lex_endpoint_sites_deferred.load(std::memory_order_relaxed),
       .top_n_first_key_subsumed_by_lex =

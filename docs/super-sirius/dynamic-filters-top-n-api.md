@@ -17,7 +17,7 @@ byte-identical:
 
 | File | Untouched declarations |
 |---|---|
-| `src/include/op/dynamic_filter/sirius_dynamic_filter.hpp` | `sirius_dynamic_filter`, `sirius_device_replicable`, `sirius_ast_lowerable`, `sirius_mask_applicable`, zone-map/IN-list/Bloom classes, `push_filter`, `filters_for_column`, `filtered_columns`, `empty`, `ignore_columns`, `register_producer`, `has_producers`, `close_for_new_filters`, `accepting_filters`, `has_filters`, `filter_count`, `merge_ast_dynamic_filters_into_tree`, `column_ref_resolver_fn` (declaration text unchanged; it moved earlier in the header so the Stage-3 capability classes can reference it — no signature or semantic change) |
+| `src/include/op/dynamic_filter/sirius_dynamic_filter.hpp` | `sirius_dynamic_filter`, `sirius_device_replicable`, `sirius_ast_lowerable`, `sirius_mask_applicable`, zone-map/IN-list/Bloom classes, `push_filter`, `filters_for_column`, `filtered_columns`, `empty`, `ignore_columns`, `register_producer`, `has_producers`, `close_for_new_filters`, `accepting_filters`, `has_filters`, `filter_count`, `column_ref_resolver_fn` (declaration text unchanged; it moved earlier in the header so the Stage-3 capability classes can reference it — no signature or semantic change). `merge_ast_dynamic_filters_into_tree` was on this list until the implementation deleted it: its by-value per-column re-fetch reproduced the parquet snapshot lifetime defect and it had no production callers — `scan::merge_dynamic_filters_into_ast` over a snapshot is the sole AST merge path. |
 | `src/include/op/dynamic_filter/dynamic_filter_publisher.hpp` | Everything — the join publisher is not a refinement producer |
 | `src/include/op/dynamic_filter/dynamic_filter_replica_space.hpp` | Everything — reused as-is by Stage 3 replication |
 | `src/planner/dynamic_filter/*` join admission/evidence/domain | Everything — the Top-N trace is separate |
@@ -336,7 +336,8 @@ the existing `SiriusContext::get_dynamic_filter_stats_snapshot()`; no new access
   std::atomic<std::uint64_t> top_n_first_key_scan_targets{0};     ///< Plan-time
   std::atomic<std::uint64_t> top_n_lex_scan_targets{0};           ///< Plan-time; all keys one scan
   std::atomic<std::uint64_t> top_n_endpoint_sites_placed{0};      ///< Plan-time; either layer
-  std::atomic<std::uint64_t> top_n_endpoint_sites_skipped{0};     ///< Plan-time; immaterial gap
+  /// Plan-time; endpoints and post-decode-only scan binds
+  std::atomic<std::uint64_t> top_n_sites_skipped_no_work_saved{0};
   std::atomic<std::uint64_t> top_n_lex_endpoint_sites_deferred{0};///< Plan-time; staged gap, not a cost decision
   std::atomic<std::uint64_t> top_n_first_key_subsumed_by_lex{0};  ///< Plan-time; dedup fired
   std::atomic<std::uint64_t> top_n_revisions_published{0};        ///< Boundary updates fanned out
@@ -385,6 +386,27 @@ struct column_filter_snapshot {
  * Generation-to-pointer coherence is the guarantee; `logical_filter_count` may lag `columns` by
  * an in-flight append — the pre-existing outside-mutex count bump is deliberately untouched for
  * join byte-equivalence.
+ *
+ * **The snapshot must outlive every artifact derived from it**, not merely the derivation. A
+ * lowered AST tree references device scalars owned by the filters the snapshot holds, so the
+ * snapshot — not just the tree — has to stay alive across the consuming call. Holding it in a
+ * narrower scope than the `read_parquet`/evaluate call it feeds is a use-after-free.
+ *
+ * **Only a replacing producer can expose that error, which is why it can lie dormant.** For an
+ * append-only producer the channel keeps its sole reference forever, so a prematurely dropped
+ * snapshot reference costs nothing and the bug is unobservable. A refinement slot replaces its
+ * filter on every accepted revision: once the channel's reference moves to the new filter, a
+ * snapshot that has already died leaves refcount 0 and frees device scalars underneath a live
+ * reader. Exactly this sat latent in the parquet consumer through two phases — the snapshot was
+ * scoped to an inner block while its tree was correctly kept for the read — and surfaced as a
+ * SIGSEGV only when Top-N became the first producer to supersede a filter.
+ *
+ * Consequence for whoever adds the *next* replacing producer: re-audit every consumer's snapshot
+ * scope. That the existing consumers are correct is not evidence of anything — it is an artifact
+ * of nothing having replaced before. A workload that republishes hard is what makes the window
+ * reachable: the regression stress uses a descending variant republishing ~4,340 times per run
+ * (~26,000 boundary replacements) against ~18 for ascending, and the fix was accepted at 2400
+ * clean iterations where ~1000 had reproduced the original crash.
  */
 struct dynamic_filter_snapshot {
   std::uint64_t generation = 0;
@@ -491,7 +513,8 @@ cleanup.
 Snapshot-consuming overloads of `scan::merge_dynamic_filters_into_ast`,
 `apply_dynamic_filters_to_view`, and `apply_dynamic_filters_gated_view` (same semantics,
 `dynamic_filter_snapshot const&` in place of the live set); the resolver-based
-`merge_ast_dynamic_filters_into_tree` in the channel header is untouched. Parquet and native
+`merge_ast_dynamic_filters_into_tree` in the channel header was untouched at this stage (it was
+deleted later — see the untouched-declarations table's note). Parquet and native
 consumers switch to one snapshot per checkpoint; the set-based overloads retire in the Stage-4
 consumer cleanup.
 
@@ -610,8 +633,7 @@ class sirius_compaction_applicable {
  *
  * The multi-column sibling of @ref sirius_ast_lowerable. Instead of one pre-emplaced column
  * reference, the consumer supplies its existing @ref column_ref_resolver_fn; the filter resolves
- * each ordinal it references. `merge_ast_dynamic_filters_into_tree` dispatches on this capability
- * exactly as it does on the single-column one and already owns the resolver it needs.
+ * each ordinal it references.
  */
 class sirius_multi_column_ast_lowerable {
  public:
@@ -787,7 +809,7 @@ all-keys stop point that differs from key zero's. Stage 4 therefore delivers LEX
 binds**; a non-scan LEX terminal is classified `LEX_ENDPOINT_DEFERRED`, counted separately, and
 nothing is spliced. This is always sound — the sink prefilter applies the identical predicate, so
 only pruning is lost — and it is a staged gap, not a cost decision, which is why it does not fold
-into `top_n_endpoint_sites_skipped`.
+into the skipped-site counter.
 
 Siting one needs a multi-ordinal `place_endpoint` that guarantees three things the single-ordinal
 form never had to: every component ordinal survives the *same* hop into the *same* child (a set
@@ -846,27 +868,45 @@ struct descent_policy {
 /**
  * @brief Classify one Top-N trace terminal into its target kind
  *
- * A supported scan terminal is a scan bind (for the all-keys trace: every component must land on
- * a supported decoded scan column). Any other terminal is an endpoint site, marked immaterial
- * when only pass-through hops separate it from the Top-N input — the planner then skips it
- * because sink self-consumption applies the same predicate (main doc, "Sited endpoint"). A
- * FIRST_KEY terminal coinciding with a planned LEX target's site is marked subsumed.
+ * A terminal is worth siting only if it saves work nothing else already saves (main doc, "Siting
+ * rule"). At least one of these must hold:
+ *
+ *  - `consumer_skips_reads` — the consumer turns the predicate into data never read (Parquet's
+ *    reader `set_filter` prunes row groups by statistics). Sited unconditionally; the saving is
+ *    upstream of any pass.
+ *  - `material_hops_above > 0` — real per-row work sits between the site and the sink, so the
+ *    site's compaction pass buys more than it costs.
+ *
+ * A terminal meeting neither is `SKIPPED_NO_WORK_SAVED`. This subsumes the old
+ * `ENDPOINT_SKIPPED_IMMATERIAL` rule and extends it to scan binds, which were previously exempt
+ * on the false premise that binding to a scan always avoids reads — true for Parquet, false for
+ * the DuckDB-native scan, whose only filter path is post-decode. A native scan-sited target
+ * duplicates the sink's own self-consumption pass and measurably regresses.
+ *
+ * `consumer_skips_reads` is a property of the consumer's filter path, not of its format tag:
+ * ask the target whether a predicate reduces what it reads, so a future backend that gains
+ * read-time filtering is admitted without editing this rule.
+ *
+ * A FIRST_KEY terminal coinciding with a planned LEX target's site is marked subsumed.
  */
 enum class top_n_target_kind {
   SCAN_BIND,
   ENDPOINT_SITE,
-  ENDPOINT_SKIPPED_IMMATERIAL,
+  /// Neither read-skipping nor material downstream work: the site would duplicate the sink's own
+  /// pass. Replaces `ENDPOINT_SKIPPED_IMMATERIAL` and now also covers post-decode-only scans.
+  SKIPPED_NO_WORK_SAVED,
   SUBSUMED_BY_LEX,
   /// A LEX terminal that is not a scan. Siting one requires addressing every component ordinal
   /// at the splice, which the single-ordinal `place_endpoint` cannot express; deferred to the
   /// trace-widening stage (see "LEX endpoints are deferred"). Distinct from
-  /// `ENDPOINT_SKIPPED_IMMATERIAL` so a staged gap never hides inside a cost-gate decision.
+  /// `SKIPPED_NO_WORK_SAVED` so a staged gap never hides inside a cost-gate decision.
   LEX_ENDPOINT_DEFERRED
 };
 
 [[nodiscard]] top_n_target_kind classify_top_n_terminal(route_terminal const& terminal,
                                                         top_n_filter_layer layer,
-                                                        std::size_t material_hops_above);
+                                                        std::size_t material_hops_above,
+                                                        bool consumer_skips_reads);
 ```
 
 Endpoint splicing itself is the existing `place_endpoint` with an `endpoint_factory` that
@@ -1086,12 +1126,21 @@ group-key query as shared accounting, not as a mislabelled bug.
   following the existing dynamic-filter integration tests.
 **Standing criterion — a guard needs a test that triggers it.** A guard added because a failure
 was hard to reach is exactly the guard most likely to be unfalsifiable, and this project has now
-caught four: the negative-value guard, the K cap, the boundary-key type check, and the
-component-width guard — each written without a test, each now pinned by one that fails when the
-guard is removed. Treat "I could not easily construct the failing case" as the reason to write
+caught five: the negative-value guard, the K cap, the boundary-key type check, the
+component-width guard, and the parquet pushdown-safety probe — each unpinned, each now either
+tested or removed. Treat "I could not easily construct the failing case" as the reason to write
 the test, not the excuse for skipping it; if the case is genuinely unconstructible through a
 built plan, move the rule to a pure function and test it there (the allowlist's home is exactly
 this).
+
+**Deleting a guard's test is as consequential as deleting the guard.** The pushdown probe had two
+regression tests when it was written against a real cuDF failure. A later file move removed them
+wholesale, and the guard then sat unfalsifiable for two months while the upstream behavior it
+defended against was fixed — so by the time anyone looked, a guard that had been *justified* was
+indistinguishable from one that never was, and the only way to tell was to reconstruct the
+original failure. That is the second failure mode: an untested guard does not merely risk being
+wrong, it destroys the evidence of why it exists. When a move or refactor drops a guard's test,
+it is deleting the guard's rationale; carry the test or delete the guard deliberately.
 
 - **Catch2 kernel parity (`test/cpp/operator/test_top_n_boundary_filter.cpp`,
   `[dynamic_filter][top_n]`)** — `apply_boundary_filter` against a host reference over the full
@@ -1120,7 +1169,7 @@ shape publishes its strict predicate as RANGE, and multi-key shapes publish per 
 | # | Scenario | Query shape | Expected site and layer (stage it becomes real) | Test layers |
 |---|---|---|---|---|
 | 1 | Parquet scan, single key | `SELECT * FROM topn_parquet ORDER BY v LIMIT 10` | Strict RANGE in the scan's reader AST (S4) | plan, integration, sqllogic |
-| 2 | Native scan, single key | Same over the native table | RANGE at the scan's post-decode operator via the fused-kernel capability (S4) | plan, integration |
+| 2 | Native scan, single key | Same over the native table | **No target sited**: the native scan cannot skip reads and nothing material separates it from the sink, so the siting rule refuses it and `top_n_sites_skipped_no_work_saved` increments. Self-consumption alone covers the shape | plan, integration |
 | 3 | Aggregate disruptor | `SELECT grp, sum(v) s FROM t GROUP BY grp ORDER BY s DESC LIMIT 5` | No endpoint — site immaterial, self-consumption covers (S1/S4 skip assert); endpoint above the aggregate read-out only when material work intervenes, e.g. a dimension join between aggregate and Top-N (S7) | plan, integration |
 | 4 | Expression-key projection | `SELECT a + b AS k FROM t2 ORDER BY k LIMIT 10` | Trace stops at the materializing projection; endpoint skipped as immaterial (S4 skip assert); self-consumption covers | plan, integration |
 | 5 | Join disruptor, single key | `SELECT o.*, l.v FROM t l JOIN dim o ON ... ORDER BY l.v LIMIT 10` | Endpoint above the join is immaterial → skipped (S4); widened probe-block hop reaches the scan → scan bind (S7) | plan, integration |
@@ -1163,7 +1212,7 @@ Pruning  : direction-only — parquet rows-decoded telemetry where cuDF exposes 
 Stage    : equivalence rows runnable from S1 (filter inert), site/publication asserts from S4.
 ```
 
-Scenarios 3–5 and 10 assert the *skip* explicitly at Stage 4 — `top_n_endpoint_sites_skipped`
+Scenarios 3–5 and 10 assert the *skip* explicitly at Stage 4 — the skipped-site counter
 delta and absence of a `top_n_endpoint` node — so the cost-gate behavior is pinned, not
 accidental. Their Stage 7 variants (join between aggregate and Top-N; probe-block descent) flip
 the same assertions to `top_n_endpoint_sites_placed`/scan-bind and are written up front but

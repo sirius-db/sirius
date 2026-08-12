@@ -33,6 +33,7 @@
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/dynamic_filter/top_n_dynamic_filter_publish_plan.hpp>
 #include <op/dynamic_filter/top_n_threshold_coordinator.hpp>
+#include <op/sirius_physical_table_scan.hpp>
 #include <planner/dynamic_filter/dynamic_filter_target_discovery.hpp>
 
 #include <cstdint>
@@ -48,14 +49,15 @@ using sirius::op::exact_host_scalar;
 using sirius::op::sirius_dynamic_filter_kind;
 using sirius::op::sirius_dynamic_filter_set;
 using sirius::op::threshold_offer_result;
+using sirius::op::top_n_distinct_key_witness;
 using sirius::op::top_n_dynamic_filter_publish_plan;
 using sirius::op::top_n_filter_layer;
 using sirius::op::top_n_key_semantics;
 using sirius::op::top_n_threshold_coordinator;
-using sirius::op::top_n_distinct_key_witness;
 using sirius::op::top_n_threshold_witness;
 using sirius::planner::classify_top_n_terminal;
 using sirius::planner::route_terminal;
+using sirius::planner::target_skips_reads;
 using sirius::planner::top_n_target_kind;
 
 namespace {
@@ -107,31 +109,85 @@ top_n_distinct_key_witness distinct_witness(std::vector<std::vector<std::int32_t
   return witness;
 }
 
+/// A table scan carrying @p table_function, which is all `target_skips_reads` consults.
+sirius::op::sirius_physical_table_scan scan_over(std::string table_function)
+{
+  duckdb::TableFunction function;
+  function.name = std::move(table_function);
+  return sirius::op::sirius_physical_table_scan{{},
+                                                std::move(function),
+                                                nullptr,
+                                                {},
+                                                {},
+                                                {},
+                                                {},
+                                                nullptr,
+                                                0,
+                                                duckdb::ExtraOperatorInfo{},
+                                                {},
+                                                {}};
+}
+
 }  // namespace
 
 TEST_CASE("terminal classification follows the documented table", "[dynamic_filter][top_n]")
 {
   route_terminal const non_scan{.node = nullptr, .ordinal = 0};
+  auto scan_node = scan_over("seq_scan");
+  route_terminal const scan{.node = &scan_node, .ordinal = 0};
 
-  // Not a scan and nothing material between site and sink: the cost gate declines, because the
-  // sink prefilter already applies the same predicate over the same rows.
-  REQUIRE(classify_top_n_terminal(non_scan, top_n_filter_layer::LEX, 0) ==
-          top_n_target_kind::ENDPOINT_SKIPPED_IMMATERIAL);
-  REQUIRE(classify_top_n_terminal(non_scan, top_n_filter_layer::FIRST_KEY, 0) ==
-          top_n_target_kind::ENDPOINT_SKIPPED_IMMATERIAL);
-  // Material work in between makes an endpoint worth its cost. A single-ordinal first-key site is
-  // spliceable today; a LEX site needs multi-ordinal placement, so it is reported as deferred --
-  // a staged gap, deliberately distinct from the cost gate declining.
-  REQUIRE(classify_top_n_terminal(non_scan, top_n_filter_layer::FIRST_KEY, 1) ==
+  // Nothing material between site and sink and no reads to skip: the siting rule declines, because
+  // the sink prefilter already applies the same predicate over the same rows.
+  REQUIRE(classify_top_n_terminal(non_scan, top_n_filter_layer::LEX, 0, false) ==
+          top_n_target_kind::SKIPPED_NO_WORK_SAVED);
+  REQUIRE(classify_top_n_terminal(non_scan, top_n_filter_layer::FIRST_KEY, 0, false) ==
+          top_n_target_kind::SKIPPED_NO_WORK_SAVED);
+  // The same test governs a scan: one that cannot skip reads and shields no work would buy an
+  // O(rows) compaction pass to save the identical pass the sink already makes.
+  REQUIRE(classify_top_n_terminal(scan, top_n_filter_layer::FIRST_KEY, 0, false) ==
+          top_n_target_kind::SKIPPED_NO_WORK_SAVED);
+  REQUIRE(classify_top_n_terminal(scan, top_n_filter_layer::LEX, 0, false) ==
+          top_n_target_kind::SKIPPED_NO_WORK_SAVED);
+  // Either condition alone admits the scan: reads it never makes, or per-row work it shields.
+  REQUIRE(classify_top_n_terminal(scan, top_n_filter_layer::FIRST_KEY, 0, true) ==
+          top_n_target_kind::SCAN_BIND);
+  REQUIRE(classify_top_n_terminal(scan, top_n_filter_layer::LEX, 0, true) ==
+          top_n_target_kind::SCAN_BIND);
+  REQUIRE(classify_top_n_terminal(scan, top_n_filter_layer::FIRST_KEY, 1, false) ==
+          top_n_target_kind::SCAN_BIND);
+  // Material work in between makes an endpoint worth its cost even where no read can be skipped --
+  // the rule refuses sites that duplicate the sink's pass, not a backend. A single-ordinal
+  // first-key site is spliceable today; a LEX site needs multi-ordinal placement, so it is
+  // reported as deferred -- a staged gap, deliberately distinct from the siting rule declining.
+  REQUIRE(classify_top_n_terminal(non_scan, top_n_filter_layer::FIRST_KEY, 1, false) ==
           top_n_target_kind::ENDPOINT_SITE);
-  REQUIRE(classify_top_n_terminal(non_scan, top_n_filter_layer::LEX, 1) ==
+  REQUIRE(classify_top_n_terminal(non_scan, top_n_filter_layer::LEX, 1, false) ==
           top_n_target_kind::LEX_ENDPOINT_DEFERRED);
   // A LEX site already carries the stronger predicate, so the first-key bound is redundant there.
-  REQUIRE(classify_top_n_terminal(non_scan, top_n_filter_layer::FIRST_KEY, 3, true) ==
+  REQUIRE(classify_top_n_terminal(non_scan, top_n_filter_layer::FIRST_KEY, 3, false, true) ==
           top_n_target_kind::SUBSUMED_BY_LEX);
   // Subsumption applies only to the first-key layer.
-  REQUIRE(classify_top_n_terminal(non_scan, top_n_filter_layer::LEX, 3, true) ==
+  REQUIRE(classify_top_n_terminal(non_scan, top_n_filter_layer::LEX, 3, false, true) ==
           top_n_target_kind::LEX_ENDPOINT_DEFERRED);
+}
+
+TEST_CASE("only a reader with a read-time filter path skips reads", "[dynamic_filter][top_n]")
+{
+  // The consumer half of the siting rule. Every table function the plan generator routes to the
+  // Parquet reader answers yes -- its `set_filter` prunes row groups before they are fetched --
+  // and the DuckDB-native reader, whose only filter path runs after decode, answers no.
+  for (auto const* parquet : {"parquet_scan", "read_parquet", "sirius_read_parquet"}) {
+    auto const scan = scan_over(parquet);
+    CHECK(target_skips_reads(scan));
+  }
+  auto const native = scan_over("seq_scan");
+  CHECK_FALSE(target_skips_reads(native));
+
+  // A sited endpoint reads nothing itself: its rows arrive already decoded, so it can only shorten
+  // what follows it.
+  sirius::op::sirius_physical_operator endpoint;
+  endpoint.type = sirius::op::SiriusPhysicalOperatorType::DYNAMIC_FILTER;
+  CHECK_FALSE(target_skips_reads(endpoint));
 }
 
 TEST_CASE("coordinator publishes a revision per accepted offer and tightens monotonically",
@@ -150,8 +206,7 @@ TEST_CASE("coordinator publishes a revision per accepted offer and tightens mono
                           .component_ordinals = {0, 1}});
   coordinator.set_publish_plan(std::move(plan));
 
-  REQUIRE(coordinator.offer(witness({50, 5})) ==
-          threshold_offer_result::ACCEPTED_FOR_PUBLICATION);
+  REQUIRE(coordinator.offer(witness({50, 5})) == threshold_offer_result::ACCEPTED_FOR_PUBLICATION);
   REQUIRE(stats.top_n_revisions_published.load() == 1);
   REQUIRE(stats.top_n_lex_filters_pushed.load() == 1);
   REQUIRE(stats.top_n_revisions_failed.load() == 0);
@@ -327,8 +382,8 @@ TEST_CASE("one RANGE fans to every first-key target while each LEX target gets i
           "[dynamic_filter][top_n]")
 {
   dynamic_filter_stats stats;
-  auto lex_a  = std::make_shared<sirius_dynamic_filter_set>();
-  auto lex_b  = std::make_shared<sirius_dynamic_filter_set>();
+  auto lex_a   = std::make_shared<sirius_dynamic_filter_set>();
+  auto lex_b   = std::make_shared<sirius_dynamic_filter_set>();
   auto range_a = std::make_shared<sirius_dynamic_filter_set>();
   auto range_b = std::make_shared<sirius_dynamic_filter_set>();
 
@@ -364,10 +419,8 @@ TEST_CASE("one RANGE fans to every first-key target while each LEX target gets i
   REQUIRE(b != nullptr);
   // Distinct objects, each carrying its own site's ordinals.
   REQUIRE(a != b);
-  auto const& lex_filter_a =
-    static_cast<sirius::op::sirius_dynamic_lex_range_filter const&>(*a);
-  auto const& lex_filter_b =
-    static_cast<sirius::op::sirius_dynamic_lex_range_filter const&>(*b);
+  auto const& lex_filter_a = static_cast<sirius::op::sirius_dynamic_lex_range_filter const&>(*a);
+  auto const& lex_filter_b = static_cast<sirius::op::sirius_dynamic_lex_range_filter const&>(*b);
   REQUIRE(lex_filter_a.referenced_ordinals()[0] == 0);
   REQUIRE(lex_filter_a.referenced_ordinals()[1] == 1);
   REQUIRE(lex_filter_b.referenced_ordinals()[0] == 5);
@@ -433,8 +486,7 @@ TEST_CASE("a GROUP_KEY producer publishes inclusive predicates at every key coun
     auto const published = visible_filter(*channel, 0);
     REQUIRE(published != nullptr);
     REQUIRE(published->kind() == sirius_dynamic_filter_kind::LEX_RANGE);
-    auto const& lex =
-      static_cast<sirius::op::sirius_dynamic_lex_range_filter const&>(*published);
+    auto const& lex = static_cast<sirius::op::sirius_dynamic_lex_range_filter const&>(*published);
     REQUIRE(lex.inclusive());
   }
 }
@@ -491,9 +543,9 @@ TEST_CASE("a GROUP_KEY producer's published LEX predicate keeps rows tying the w
   auto const mr     = space->get_default_allocator();
 
   auto const publish_lex = [&](sirius::op::top_n_producer_kind kind) {
-    auto channel     = std::make_shared<sirius_dynamic_filter_set>();
-    auto coordinator = std::make_shared<top_n_threshold_coordinator>(
-      2, ascending_keys(2), true, nullptr, kind);
+    auto channel = std::make_shared<sirius_dynamic_filter_set>();
+    auto coordinator =
+      std::make_shared<top_n_threshold_coordinator>(2, ascending_keys(2), true, nullptr, kind);
     top_n_dynamic_filter_publish_plan plan;
     plan.k    = 2;
     plan.kind = kind;
@@ -516,8 +568,8 @@ TEST_CASE("a GROUP_KEY producer's published LEX predicate keeps rows tying the w
 
   // Two key columns: one row strictly better than the boundary (7,7), one tying it exactly, one
   // strictly worse.
-  auto const key0 = std::vector<std::int32_t>{7, 7, 7};
-  auto const key1 = std::vector<std::int32_t>{6, 7, 8};
+  auto const key0        = std::vector<std::int32_t>{7, 7, 7};
+  auto const key1        = std::vector<std::int32_t>{6, 7, 8};
   auto const make_column = [&](std::vector<std::int32_t> const& values) {
     auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
                                             static_cast<cudf::size_type>(values.size()),
@@ -571,7 +623,7 @@ TEST_CASE("a decimal boundary publishes a fixed-point literal at its own scale",
 
   SECTION("DECIMAL32 keeps its scale on the published bound")
   {
-    auto channel = std::make_shared<sirius_dynamic_filter_set>();
+    auto channel    = std::make_shared<sirius_dynamic_filter_set>();
     auto const keys = scaled_key(-2, cudf::type_id::DECIMAL32);
     top_n_threshold_coordinator coordinator{3, keys, true, nullptr};
     top_n_dynamic_filter_publish_plan plan;
@@ -584,8 +636,8 @@ TEST_CASE("a decimal boundary publishes a fixed-point literal at its own scale",
 
     // 1234 at scale -2 is 12.34; the scaled integer is what travels.
     top_n_threshold_witness witness{
-      exact_host_key_tuple{{exact_host_scalar{std::int32_t{1234},
-                                              cudf::data_type{cudf::type_id::DECIMAL32, -2}}}},
+      exact_host_key_tuple{
+        {exact_host_scalar{std::int32_t{1234}, cudf::data_type{cudf::type_id::DECIMAL32, -2}}}},
       {}};
     REQUIRE(coordinator.offer(std::move(witness)) ==
             threshold_offer_result::ACCEPTED_FOR_PUBLICATION);
@@ -599,7 +651,7 @@ TEST_CASE("a decimal boundary publishes a fixed-point literal at its own scale",
 
   SECTION("DECIMAL64 keeps its scale on the published bound")
   {
-    auto channel = std::make_shared<sirius_dynamic_filter_set>();
+    auto channel    = std::make_shared<sirius_dynamic_filter_set>();
     auto const keys = scaled_key(-4, cudf::type_id::DECIMAL64);
     top_n_threshold_coordinator coordinator{3, keys, true, nullptr};
     top_n_dynamic_filter_publish_plan plan;
@@ -611,8 +663,8 @@ TEST_CASE("a decimal boundary publishes a fixed-point literal at its own scale",
     coordinator.set_publish_plan(std::move(plan));
 
     top_n_threshold_witness witness{
-      exact_host_key_tuple{{exact_host_scalar{std::int64_t{987654},
-                                              cudf::data_type{cudf::type_id::DECIMAL64, -4}}}},
+      exact_host_key_tuple{
+        {exact_host_scalar{std::int64_t{987654}, cudf::data_type{cudf::type_id::DECIMAL64, -4}}}},
       {}};
     REQUIRE(coordinator.offer(std::move(witness)) ==
             threshold_offer_result::ACCEPTED_FOR_PUBLICATION);
@@ -661,10 +713,10 @@ TEST_CASE("a null-headed distinct-key boundary publishes nothing", "[dynamic_fil
           threshold_offer_result::ACCEPTED_FOR_PUBLICATION);
   auto const published = visible_filter(*channel, 0);
   REQUIRE(published != nullptr);
-  REQUIRE(std::get<std::int32_t>(
-            static_cast<sirius::op::sirius_dynamic_range_filter const&>(*published)
-              .bound()
-              .value()) == 7);
+  REQUIRE(
+    std::get<std::int32_t>(
+      static_cast<sirius::op::sirius_dynamic_range_filter const&>(*published).bound().value()) ==
+    7);
 }
 
 TEST_CASE("distinct-key offers are rejected by a ROW coordinator", "[dynamic_filter][top_n]")

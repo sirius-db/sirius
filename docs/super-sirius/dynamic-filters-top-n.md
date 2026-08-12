@@ -713,13 +713,13 @@ Restoring the hop is part of supporting set operations, together with those guar
 test.
 
 - **Key-zero trace (FIRST_KEY layer, multi-key producers).** Follows key zero's single ordinal —
-  the existing single-column mechanics. A supported scan terminal binds the inclusive first-key
-  bound to that scan (preferred: reader AST saves I/O and decode); any other terminal is a
-  cost-gated endpoint site.
+  the existing single-column mechanics. A read-skipping scan terminal binds the inclusive
+  first-key bound to that scan, where the reader AST saves I/O and decode; every other terminal —
+  including a scan that can only filter post-decode — is cost-gated by the siting rule below.
 - **All-keys trace (LEX layer).** Follows the set of all key ordinals; a hop is accepted only if
   every component survives it. Its terminal is the deepest schema where the keys coexist — at
-  worst the Top-N child itself, which always exists. A supported scan terminal (all keys from one
-  table) puts the full LEX predicate into that scan's reader AST; any other terminal is a
+  worst the Top-N child itself, which always exists. A read-skipping scan terminal (all keys from
+  one table) puts the full LEX predicate into that scan's reader AST; any other terminal is a
   cost-gated endpoint site.
 
 A first-key target whose site coincides with a LEX target is dropped: the LEX predicate implies
@@ -952,13 +952,26 @@ reader AST and `cudf::io::read_parquet`.
 - A split already past AST construction is not revisited.
 - If `disable_filter_pushdown` is set, the first release skips both layers for that split.
 
-**Open question — the FLBA-decimal probe.** A split containing FLBA/BYTE_ARRAY decimals sets
-`disable_filter_pushdown`, which drops every reader-side filter for that split, boundary layers
-included. The rationale for that probe appears obsolete at the pinned cuDF. It matters because
-DuckDB writes `DECIMAL(38,4)` as FLBA and Spark writes all decimals that way, so on the commonest
-decimal layouts the reader path is inert despite decimals being admitted. Removing the probe
-requires reproducing the original failure it guards against rather than inferring obsolescence
-from source reading, and establishing whether its scope is decimals or FLBA generally.
+**Resolved — the FLBA arm of the pushdown-safety probe is gone.** A split containing an
+FLBA-encoded decimal used to set `disable_filter_pushdown`, dropping every reader-side filter for
+that split, boundary layers included. The guard was justified when written: cuDF's stats filter
+threw `"Invalid type and stats combination"` on FLBA decimals. At the pinned cuDF it no longer
+does — verified by reproducing the case rather than reading source, across FLBA widths 4/8/16
+(decimal32/64/128) over row groups in disjoint bands, where pruning is exact and matches DuckDB's
+CPU results, including on all-negative groups. That last part is the discriminator: broken sign
+extension would have kept or dropped whole groups rather than pruning them correctly. Mismatched
+literals do still throw, but they throw identically for an INT32-backed column, so that behavior
+is encoding-agnostic and never justified an FLBA-specific rule.
+
+Consequence for this design: decimal boundary filters now reach the reader on the layouts DuckDB
+and Spark actually write — DuckDB emits `DECIMAL(38,4)` as FLBA, Spark emits all decimals that
+way — which is what makes decimal support materially useful rather than merely admitted.
+Measured over the real scan path, removing the arm took 17 queries from 2 pruning events and 15
+post-decode fallbacks to 17 pruning events and no fallbacks.
+
+The `BYTE_ARRAY` arm is retained, deliberately untested: neither DuckDB nor pyarrow can emit that
+encoding, so the case could not be constructed. It is kept as an untested conservatism, not as a
+claim that cuDF is broken there.
 
 **Statistics pruning of LEX.** At the pinned cuDF (pixi pins libcudf 26.06.*; verified at
 v26.06.01 in `stats_filter_helpers.cpp` and `predicate_pushdown.cpp`), the statistics converter
@@ -1007,6 +1020,74 @@ pass-through hops is not created; with the initial minimal hop set, the planner 
 skip most sites, and endpoints become material as later stages widen the trace below expensive
 operators.
 
+### Siting rule: a target must save work it would not otherwise save
+
+The materiality test above is not an endpoint concern — it is the general condition, and scan
+binds were wrongly exempted from it. A target is worth siting only if it satisfies at least one
+of:
+
+1. **It can skip reads.** The consumer converts the predicate into data never read: Parquet's
+   `reader_options::set_filter` prunes row groups by statistics, so the saving is I/O and decode
+   that never happens. Nothing downstream is required to justify it.
+2. **Material work lies between it and the sink.** The predicate costs one O(rows) compaction
+   pass at the site and saves that per-row work on every rejected row.
+
+A target meeting neither is not sited. This is what the earlier rule got wrong: it used *"is it a
+scan?"* as a proxy for *"can it skip reads?"*, which holds for Parquet and fails for the
+DuckDB-native scan, whose only filter path is post-decode. A native scan-sited target meets
+neither condition — it cannot skip reads, and the pass-through hops that made it a scan bind
+guarantee nothing material sits between it and a sink that already applies the same predicate by
+self-consumption. It buys an O(rows) compaction pass at the scan to save the sink a pass over the
+same rows: a wash in work, with publication and replication overhead on top.
+
+Measured, this is not marginal. Against an A/A control resolving ±2.3%: native adversary
+**+6.8%**, native `S-scan` **+11.5%** *while keeping only 0.52% of rows* — maximal selectivity and
+still a regression, which is the clearest evidence that selectivity is the wrong criterion — and
+Parquet-clustered **−57.4%**. Enable-by-default criterion C2 (≤+2% on the adversary) fails on
+native for exactly this reason.
+
+The asymmetry to preserve: this is about **read-unskippable scan-sited targets**, not about native
+consumers. A native *endpoint* sited deep in a probe pipeline can pay for itself under condition 2,
+because joins, unnests, and expensive projections between it and the sink do real per-row work on
+rows it rejects. The rule refuses sites that duplicate the sink's own pass; it does not refuse a
+backend.
+
+### The siting rule is necessary but not sufficient: the reader path needs a runtime gate
+
+Condition 1 asks whether the consumer *can* convert the predicate into avoided reads. That is a
+property of the **mechanism**, and it is decidable at plan time. Whether the mechanism actually
+avoids reads is a property of the **data**, and it is not.
+
+Parquet always satisfies condition 1, and a shape exists where satisfying it costs 8.4%: the same
+file as the −57% winner, ordered so the boundary starts at the low end and no row group can ever
+be excluded. Measured, 2006 filters pushed, **82.5% of rows kept**. Merging the boundary into the
+reader AST buys two things — row groups never read (statistics pruning, the real win) and
+decode-time row filtering (which only duplicates the sink's own pass, per the argument above).
+When the data cannot be pruned, the first is zero and only the cost remains, paid on every split.
+
+So enable-by-default criterion C2 fails on **both** backends, for two different reasons, and the
+plan-time rule fixes only one of them. The reader path therefore gains a runtime gate:
+
+- **Signal — row groups pruned over row groups considered, per split**, taken from the reader's
+  own accounting rather than a measurement pass. Deliberately *not* the post-decode gate's mask
+  keep-ratio: that measures rows the predicate rejects, which the sink would reject anyway; only
+  unread row groups are work uniquely saved here. This is a distinct gate instance with a distinct
+  signal domain, consistent with the one-domain-per-instance rule.
+- **Decision** — after a small fixed number of splits, if the median pruned fraction is
+  negligible, stop merging the boundary into that scan's reader AST.
+- **Terminal on success** — a gate that has observed real pruning stays on. Boundaries only
+  tighten, and a tighter boundary prunes at least as many row groups, so usefulness cannot
+  regress.
+- **Re-arm on exponential backoff in revisions, not per generation.** Tightening genuinely can
+  flip a boundary from useless to useful — one at the 90th percentile prunes nothing where one at
+  the 1st prunes almost everything — so permanent disable is wrong. But re-arming per generation
+  would re-measure thousands of times on the adversarial shape. Doubling the revision gap between
+  measurements bounds this to O(log R) re-measurements while still catching a boundary that
+  eventually pays.
+
+The residual is bounded, not zero: the first few splits are paid before the gate can learn
+anything, and that is the honest floor for any runtime-adaptive scheme.
+
 ### Generation-aware gate
 
 The current gate remeasures after an append only when `filter_count()` grows. Replacement does not
@@ -1020,7 +1101,9 @@ grow it, so decisions must record snapshot generation.
 - A device with no applicable filter does not train the gate.
 
 Layers published to a Parquet scan execute inside the reader and remain outside this post-decode
-gate.
+gate. They are not meant to stay ungated: the reader-side gate specified above (WI-0b — not yet
+implemented) will govern them on a different signal (row groups pruned, not mask keep-ratio).
+Until it lands, reader-path publications are the one ungated consumption path.
 
 ## Scheduling and lifecycle
 

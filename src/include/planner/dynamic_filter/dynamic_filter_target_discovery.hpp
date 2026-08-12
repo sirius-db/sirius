@@ -41,6 +41,7 @@
 #include <functional>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace sirius::ast {
@@ -202,12 +203,17 @@ struct multi_key_route_terminal {
 };
 
 /**
- * @brief Whether an accepted hop crosses per-row work a sited endpoint would save
+ * @brief Whether an accepted hop crosses per-row work a target below it would save
  *
- * Material today means `FILTER`: an endpoint below it prunes rows the filter would otherwise
+ * Material today means `FILTER`: a target below it prunes rows the filter would otherwise
  * evaluate. Pass-through projections, `UNION` fan-out, and existing endpoints move no work, so a
- * site separated from the Top-N input by those alone is immaterial -- the sink prefilter already
+ * site separated from the Top-N input by those alone saves nothing -- the sink prefilter already
  * applies the same predicate over the same rows.
+ *
+ * Deliberate under-approximation: an accepted PROJECTION hop may still compute non-traced
+ * expressions per row, and an existing endpoint applies masks per row; both count as immaterial
+ * today, so the rule can only under-site -- skipping is always sound. Treating computing
+ * projections as material (with a plan-shape test to pin it) is recorded follow-up work.
  */
 [[nodiscard]] bool hop_is_material(sirius::op::sirius_physical_operator const& node) noexcept;
 
@@ -231,39 +237,85 @@ struct multi_key_route_terminal {
   descent_policy policy);
 
 /**
+ * @brief Whether table function @p function_name builds the Parquet reader
+ *
+ * The single name list shared by @ref target_skips_reads and the plan generator's scan-leaf
+ * dispatch (`wrap_table_scan_source`), so the siting decision and the reader construction cannot
+ * disagree about which functions carry a read-time filter path.
+ */
+[[nodiscard]] bool is_parquet_reader_function(std::string const& function_name) noexcept;
+
+/**
+ * @brief Whether a predicate published at @p node reduces the data @p node reads
+ *
+ * The consumer half of the siting rule, asked of the target rather than inferred from its format:
+ * a scan whose reader evaluates dynamic-filter predicates while reading turns the predicate into
+ * row groups it never fetches or decodes, which is a saving nothing downstream has to justify.
+ * Every other target -- a sited endpoint, and any scan whose only filter path runs after decode --
+ * answers false, because its rows are already read by the time the predicate can be applied.
+ *
+ * The answer follows the reader a scan will be given, which the table function it carries decides:
+ * `parquet_scan` / `read_parquet` / `sirius_read_parquet` build the Parquet reader, whose
+ * `reader_options::set_filter` prunes by row-group statistics; `seq_scan` builds the DuckDB-native
+ * reader, which has no read-time filter hook at all. `wrap_table_scan_source` asks the same
+ * question to decide whether the scan's dynamic-filter wrapper must re-evaluate AST-capable
+ * filters after decode, so the two decisions cannot drift apart. When a backend gains a read-time
+ * filter path, this function is the only place that changes -- neither the siting rule nor its
+ * callers mention a format.
+ */
+[[nodiscard]] bool target_skips_reads(sirius::op::sirius_physical_operator const& node) noexcept;
+
+/**
  * @brief How one Top-N trace terminal should be consumed
  */
 enum class top_n_target_kind {
-  SCAN_BIND,                    ///< Bind into the scan's reader AST
-  ENDPOINT_SITE,                ///< Splice a sited endpoint above the terminal
-  ENDPOINT_SKIPPED_IMMATERIAL,  ///< No material work between site and sink; the prefilter covers it
-  SUBSUMED_BY_LEX,              ///< A LEX target already covers this site, which implies this bound
-  LEX_ENDPOINT_DEFERRED         ///< Worth siting, but multi-ordinal placement lands in Stage 7
+  SCAN_BIND,              ///< Bind into the scan's reader AST
+  ENDPOINT_SITE,          ///< Splice a sited endpoint above the terminal
+  SKIPPED_NO_WORK_SAVED,  ///< Saves no work the sink prefilter does not already save
+  SUBSUMED_BY_LEX,        ///< A LEX target already covers this site, which implies this bound
+  LEX_ENDPOINT_DEFERRED   ///< Worth siting, but multi-ordinal placement lands in Stage 7
 };
 
 /**
  * @brief Classify one Top-N trace terminal into its target kind
  *
- * A supported scan terminal is a scan bind (for the all-keys trace, every component must land on
- * a supported decoded scan column -- the caller checks that before calling). Any other terminal
- * is an endpoint site, marked immaterial when only pass-through hops separate it from the Top-N
- * input, because sink self-consumption applies the same predicate there. A `FIRST_KEY` terminal
- * coinciding with a planned `LEX` target's site is marked subsumed by the caller, which alone
- * knows the LEX sites; pass @p coincides_with_lex_site to have it reported here.
+ * A terminal is worth siting only when it saves work nothing else already saves (main doc,
+ * "Siting rule: a target must save work it would not otherwise save"). At least one of these must
+ * hold:
  *
- * A material `LEX` terminal that is not a scan reports @c LEX_ENDPOINT_DEFERRED rather than
+ *  - @p consumer_skips_reads -- the target turns the predicate into data it never reads, so the
+ *    saving is upstream of any pass and nothing downstream is required to justify it.
+ *  - @p material_hops_above is non-zero -- per-row work sits between the site and the sink, so the
+ *    site's own compaction pass buys more than it costs on every rejected row.
+ *
+ * A terminal meeting neither is @c SKIPPED_NO_WORK_SAVED: sink self-consumption already applies
+ * the same predicate over the same rows, so the site would buy one O(rows) pass to save an
+ * identical one. This test governs scan binds exactly as it governs endpoints -- a scan was
+ * previously exempt on the premise that binding a scan always avoids reads, which holds for a
+ * reader with a read-time filter path and fails for one whose only path is post-decode.
+ *
+ * A terminal that passes the test is a scan bind when it is a supported scan (for the all-keys
+ * trace, every component must land on a supported decoded scan column -- the caller checks that
+ * before calling) and a sited endpoint otherwise. A `FIRST_KEY` terminal coinciding with a planned
+ * `LEX` target's site is marked subsumed by the caller, which alone knows the LEX sites; pass
+ * @p coincides_with_lex_site to have it reported here.
+ *
+ * A `LEX` terminal that is not a scan reports @c LEX_ENDPOINT_DEFERRED rather than
  * @c ENDPOINT_SITE: siting it needs multi-ordinal placement, which lands in Stage 7. Keeping it
- * distinct from @c ENDPOINT_SKIPPED_IMMATERIAL is deliberate -- the skip counter must mean "the
- * cost gate said no", never "this stage cannot express it".
+ * distinct from @c SKIPPED_NO_WORK_SAVED is deliberate -- the skip counter must mean "the cost
+ * gate said no", never "this stage cannot express it".
  *
  * @param[in] terminal Where the trace bottomed out
  * @param[in] layer Which layer this terminal would carry
  * @param[in] material_hops_above Accepted hops over per-row work between the site and the sink
+ * @param[in] consumer_skips_reads Whether the target reads less because of the predicate, from
+ * @ref target_skips_reads
  * @param[in] coincides_with_lex_site Whether a planned LEX target sits at the same node
  */
 [[nodiscard]] top_n_target_kind classify_top_n_terminal(route_terminal const& terminal,
                                                         sirius::op::top_n_filter_layer layer,
                                                         std::size_t material_hops_above,
+                                                        bool consumer_skips_reads,
                                                         bool coincides_with_lex_site = false);
 
 /**

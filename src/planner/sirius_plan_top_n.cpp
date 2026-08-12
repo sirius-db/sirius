@@ -258,13 +258,16 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> discover_top_n_targets(
   std::unordered_set<sirius::op::sirius_physical_operator const*> lex_sites;
   if (multi_key) {
     for (auto const& terminal : trace_top_n_all_keys(*child, key_ordinals, policy)) {
-      auto const kind = classify_top_n_terminal(
-        {.node = terminal.node, .ordinal = 0}, top_n_filter_layer::LEX, terminal.material_hops);
+      auto const kind = classify_top_n_terminal({.node = terminal.node, .ordinal = 0},
+                                                top_n_filter_layer::LEX,
+                                                terminal.material_hops,
+                                                target_skips_reads(*terminal.node));
       if (kind == top_n_target_kind::SCAN_BIND &&
           !site_admits_keys(*terminal.node, terminal.ordinals, coordinator.keys())) {
         // The site's columns do not carry the keys' exact types; publishing there could compare
-        // differently scaled fixed-point values. Skip the target, keep the producer.
-        stats.top_n_endpoint_sites_skipped.fetch_add(1, std::memory_order_relaxed);
+        // differently scaled fixed-point values. Skip the target, keep the producer. This shares
+        // the siting rule's counter: no target is created either way.
+        stats.top_n_sites_skipped_no_work_saved.fetch_add(1, std::memory_order_relaxed);
       } else if (kind == top_n_target_kind::SCAN_BIND) {
         auto& scan = terminal.node->Cast<sirius::op::sirius_physical_table_scan>();
         publish_plan.targets.push_back({.publisher = register_scan_slot(scan, terminal.ordinals),
@@ -279,7 +282,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> discover_top_n_targets(
         // lost, never correctness.
         stats.top_n_lex_endpoint_sites_deferred.fetch_add(1, std::memory_order_relaxed);
       } else {
-        stats.top_n_endpoint_sites_skipped.fetch_add(1, std::memory_order_relaxed);
+        stats.top_n_sites_skipped_no_work_saved.fetch_add(1, std::memory_order_relaxed);
       }
     }
   }
@@ -298,12 +301,14 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> discover_top_n_targets(
       classify_top_n_terminal({.node = terminal.node, .ordinal = terminal.ordinals.front()},
                               top_n_filter_layer::FIRST_KEY,
                               terminal.material_hops,
+                              target_skips_reads(*terminal.node),
                               lex_sites.count(terminal.node) != 0);
-    // The first-key layer binds key zero alone, so only key zero's type must match this site.
+    // The first-key layer binds key zero alone, so only key zero's type must match this site. A
+    // refusal here shares the siting rule's counter: no target is created either way.
     if ((kind == top_n_target_kind::SCAN_BIND || kind == top_n_target_kind::ENDPOINT_SITE) &&
         !site_admits_keys(
           *terminal.node, {terminal.ordinals.front()}, coordinator.keys().first(1))) {
-      kind = top_n_target_kind::ENDPOINT_SKIPPED_IMMATERIAL;
+      kind = top_n_target_kind::SKIPPED_NO_WORK_SAVED;
     }
     key_zero_kinds.push_back(kind);
   }
@@ -317,6 +322,9 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> discover_top_n_targets(
     switch (key_zero_kinds[i]) {
       case top_n_target_kind::SUBSUMED_BY_LEX:
         stats.top_n_first_key_subsumed_by_lex.fetch_add(1, std::memory_order_relaxed);
+        break;
+      case top_n_target_kind::SKIPPED_NO_WORK_SAVED:
+        stats.top_n_sites_skipped_no_work_saved.fetch_add(1, std::memory_order_relaxed);
         break;
       case top_n_target_kind::SCAN_BIND: {
         auto& scan = terminal.node->Cast<sirius::op::sirius_physical_table_scan>();
@@ -365,12 +373,6 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> discover_top_n_targets(
          .layer              = top_n_filter_layer::FIRST_KEY,
          .component_ordinals = ordinals});
       stats.top_n_endpoint_sites_placed.fetch_add(1, std::memory_order_relaxed);
-    }
-  } else {
-    for (auto const kind : key_zero_kinds) {
-      if (kind == top_n_target_kind::ENDPOINT_SKIPPED_IMMATERIAL) {
-        stats.top_n_endpoint_sites_skipped.fetch_add(1, std::memory_order_relaxed);
-      }
     }
   }
 
@@ -553,9 +555,9 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalTopN& op)
     }
   }
 
-  // Stage-4 target discovery: run both traces over the built physical child, bind scans, site
-  // cost-gated endpoints, and freeze the publication plan. Registration happens here, during tree
-  // construction, so it precedes scan wrapping's has_producers() elision.
+  // Stage-4 target discovery: run both traces over the built physical child, apply the siting rule
+  // to every terminal it reaches, and freeze the publication plan. Registration happens here,
+  // during tree construction, so it precedes scan wrapping's has_producers() elision.
   if (coordinator) {
     auto& stats = sirius_context->get_dynamic_filter_stats();
     plan        = discover_top_n_targets(std::move(plan),

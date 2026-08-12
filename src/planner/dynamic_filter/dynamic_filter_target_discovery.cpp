@@ -24,6 +24,7 @@
 #include <op/sirius_physical_operator.hpp>
 #include <op/sirius_physical_operator_type.hpp>
 #include <op/sirius_physical_projection.hpp>
+#include <op/sirius_physical_table_scan.hpp>
 #include <planner/dynamic_filter/dynamic_filter_target_discovery.hpp>
 
 // stdlib
@@ -335,7 +336,9 @@ bool hop_is_material(sirius::op::sirius_physical_operator const& node) noexcept
 {
   // Only per-row work an endpoint below the node would save counts. A FILTER evaluates its
   // predicate per row; projections that merely forward references, UNION fan-out, and existing
-  // endpoints move no work.
+  // endpoints move no work. (An accepted projection hop may still compute non-traced expressions
+  // per row -- counted immaterial today, an under-approximation that can only under-site; see the
+  // header contract.)
   return node.type == sirius::op::SiriusPhysicalOperatorType::FILTER;
 }
 
@@ -421,9 +424,23 @@ std::vector<multi_key_route_terminal> trace_top_n_all_keys(
   return terminals;
 }
 
+bool is_parquet_reader_function(std::string const& function_name) noexcept
+{
+  return function_name == "parquet_scan" || function_name == "read_parquet" ||
+         function_name == "sirius_read_parquet";
+}
+
+bool target_skips_reads(sirius::op::sirius_physical_operator const& node) noexcept
+{
+  if (node.type != sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN) { return false; }
+  return is_parquet_reader_function(
+    node.Cast<sirius::op::sirius_physical_table_scan>().function.name);
+}
+
 top_n_target_kind classify_top_n_terminal(route_terminal const& terminal,
                                           sirius::op::top_n_filter_layer layer,
                                           std::size_t material_hops_above,
+                                          bool consumer_skips_reads,
                                           bool coincides_with_lex_site)
 {
   // The LEX predicate implies the inclusive first-key bound, so a site already receiving LEX must
@@ -431,14 +448,16 @@ top_n_target_kind classify_top_n_terminal(route_terminal const& terminal,
   if (layer == sirius::op::top_n_filter_layer::FIRST_KEY && coincides_with_lex_site) {
     return top_n_target_kind::SUBSUMED_BY_LEX;
   }
+  // The siting rule, applied to every terminal alike: the target either reads less because of the
+  // predicate, or shields per-row work the sink would otherwise repeat over the same rows. Meeting
+  // neither, its compaction pass buys back exactly the pass sink self-consumption already makes.
+  if (!consumer_skips_reads && material_hops_above == 0) {
+    return top_n_target_kind::SKIPPED_NO_WORK_SAVED;
+  }
   if (terminal.node != nullptr &&
       terminal.node->type == sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN) {
     return top_n_target_kind::SCAN_BIND;
   }
-  // Only pass-through hops separate this site from the sink, so the sink prefilter already
-  // applies the same predicate over the same rows -- an endpoint here would buy nothing. This is
-  // a cost-gate decision, and stays distinct from the staged gap below.
-  if (material_hops_above == 0) { return top_n_target_kind::ENDPOINT_SKIPPED_IMMATERIAL; }
   // A LEX site is worth having, but splicing it needs placement addressing every component
   // ordinal; that generalization lands in Stage 7. Reported distinctly so a staged gap is never
   // mistaken for the cost gate declining.
