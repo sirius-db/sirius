@@ -59,6 +59,7 @@ pipeline_conversion_result sirius_pipeline_converter::convert(sirius_meta_pipeli
   finalize_pipeline_structure();
   link_join_partition_siblings();
   configure_partition_min_partitions();
+  restrict_dynamic_filter_replicas();
   // Must run after finalize_pipeline_structure (populates `dependencies`) and after
   // link_join_partition_siblings (reads dependencies[0]/[1] positionally pre-reorder).
   reorder_pipelines_topologically(scheduled_);
@@ -474,6 +475,31 @@ void sirius_pipeline_converter::link_join_partition_siblings()
         build_partition_op.set_drives_partition_count(false);
         probe_partition_op.set_drives_partition_count(true);
       }
+    }
+  }
+}
+
+void sirius_pipeline_converter::restrict_dynamic_filter_replicas()
+{
+  auto const& admitted = build_ctx_.active_gpu_ids();
+  if (admitted.empty()) return;
+
+  auto apply_to_op = [&](op::sirius_physical_operator* op) {
+    if (auto* join = dynamic_cast<op::sirius_physical_hash_join*>(op)) {
+      join->restrict_dynamic_filter_replicas(admitted);
+    }
+  };
+  for (auto& pipe : scheduled_) {
+    if (!pipe) continue;
+    auto sink   = pipe->get_sink();
+    auto source = pipe->get_source();
+    if (sink) apply_to_op(sink.get());
+    if (source) apply_to_op(source.get());
+    // A join is not always a pipeline boundary — fusion can leave one among the intermediate
+    // operators, where source/sink alone would miss it. Restriction is idempotent, so an
+    // operator reached twice is harmless.
+    for (auto op_ref : pipe->get_operators()) {
+      apply_to_op(&op_ref.get());
     }
   }
 }

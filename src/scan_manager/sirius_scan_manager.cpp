@@ -570,7 +570,8 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
 }
 
 void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
-                                            bool enable_pinned_zone_map_pruning)
+                                            bool enable_pinned_zone_map_pruning,
+                                            const std::vector<int>& allocated_gpu_ids)
 {
   _pruning_enabled = enable_pinned_zone_map_pruning;
   reset();
@@ -591,9 +592,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     }
   }
 
-  auto const gpu_ids = _topology_index->gpu_ids();
-  auto round_robin =
-    std::make_shared<round_robin_strategy>(std::vector<int>(gpu_ids.begin(), gpu_ids.end()));
+  auto round_robin = std::make_shared<round_robin_strategy>(allocated_gpu_ids);
 
   _metadata_processor = std::make_unique<load_balancing_scan_batch_coalescer>();
 
@@ -670,7 +669,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   // masks must be finished before serving starts. No-op when no pinned
   // table has rows beyond its prefix.
   if (!_pending_insert_delta_jobs.empty()) {
-    std::vector<int> const delta_gpu_ids(gpu_ids.begin(), gpu_ids.end());
+    std::vector<int> const delta_gpu_ids(allocated_gpu_ids.begin(), allocated_gpu_ids.end());
     run_insert_delta_jobs(_pending_insert_delta_jobs,
                           *_dispatcher,
                           _reservation_manager,

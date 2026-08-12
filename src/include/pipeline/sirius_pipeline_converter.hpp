@@ -115,6 +115,13 @@ class sirius_pipeline_converter {
   // num_gpus from build_ctx_; no-op when num_gpus <= 1.
   void configure_partition_min_partitions();
 
+  /// Drop dynamic-filter replica targets on GPUs outside the admitted subset. Replica spaces
+  /// are resolved during plan generation, which runs before admission, so they cover every
+  /// GPU the process owns; publishing against that set would allocate and copy a filter
+  /// replica onto GPUs this query was not admitted to. Runs regardless of GPU count — the
+  /// narrowest admission is exactly where it matters most.
+  void restrict_dynamic_filter_replicas();
+
   const pipeline_build_context build_ctx_;
   const sirius::operator_params& op_params_;
 
