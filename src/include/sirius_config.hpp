@@ -247,6 +247,13 @@ struct sirius_config {
   /// the override takes effect. Called from the end of @ref load_from_file.
   void enforce_sirius_backend_for_multi_gpu();
 
+  /// Re-default @c _scan_manager_config.uring.n_max_concurrent_scans to the
+  /// CONFIGURED pipeline pool size. The struct default can only use the
+  /// compile-time thread count, so resizing the pipeline in config would
+  /// otherwise leave the readahead budget behind. Called from the end of
+  /// @ref load_from_file; an explicit config value is left alone.
+  void derive_uring_scan_budget();
+
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   creator::task_creator_config _task_creator_config;

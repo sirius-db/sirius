@@ -599,12 +599,37 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
       _memory_space_configs = builder.build(_hw_topology);
     }
 
+    derive_uring_scan_budget();
     enforce_sirius_backend_for_multi_gpu();
 
   } catch (const std::exception& e) {
     throw std::runtime_error("Failed to load config from " + config_path.string() + ": " +
                              e.what());
   }
+}
+
+void sirius_config::derive_uring_scan_budget()
+{
+  // The uring backend wants one concurrent scan per pipeline executor thread.
+  // io::uring::config can only spell that as the COMPILE-TIME thread count, so
+  // a config that resizes the pipeline pool would otherwise leave the readahead
+  // budget pinned to the old default and unable to keep the pool fed.
+  //
+  // Only the untouched default is replaced, so an explicit
+  // uring.n_max_concurrent_scans in the config still wins.
+  constexpr auto struct_default = static_cast<std::size_t>(exec::default_gpu_pipeline_num_threads);
+  if (_scan_manager_config.uring.n_max_concurrent_scans != struct_default) { return; }
+
+  auto const pipeline_threads =
+    static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
+  if (pipeline_threads == struct_default) { return; }
+
+  SIRIUS_LOG_INFO(
+    "sirius_config: uring.n_max_concurrent_scans defaulted to the configured pipeline pool size "
+    "({} threads), replacing the built-in default of {}",
+    pipeline_threads,
+    struct_default);
+  _scan_manager_config.uring.n_max_concurrent_scans = pipeline_threads;
 }
 
 void sirius_config::enforce_sirius_backend_for_multi_gpu()
