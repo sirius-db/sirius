@@ -826,7 +826,7 @@ bool sirius_physical_hash_join::arm_multi_partition_dynamic_filters(
 void sirius_physical_hash_join::contribute_dynamic_filter_build_batch(
   uint64_t batch_id, cudf::table_view const& build_view, rmm::cuda_stream_view stream)
 {
-  _dynamic_filter_publication_session.contribute(batch_id, build_view, stream);
+  _dynamic_filter_publication_session.contribute(get_operator_id(), batch_id, build_view, stream);
 }
 
 void sirius_physical_hash_join::set_build_arrives_whole(bool arrives_whole)
@@ -1035,9 +1035,9 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     return std::make_unique<partitioned_operator_data>(std::move(input_batch), partition_tag(p));
   }
 
-  // No SCHEDULING slot and no BUILT slot with probe data. This happens when a hint's READY raced
-  // ahead of another task draining the same probe data; there is simply nothing to issue now.
-  SIRIUS_LOG_WARN(
+  // A stale READY can race another task that drains the same build/probe input. This is a benign
+  // scheduling miss: there is no task to issue and no correctness failure to report.
+  SIRIUS_LOG_DEBUG(
     "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: no schedulable "
     "partition (build/probe already drained) in operator {}",
     this->get_operator_id());

@@ -140,11 +140,14 @@ When `enable_dynamic_filter_multi_partition` is true, a non-broadcast build with
 
 Each one-batch PARTITION task captures one immutable task-input ID when the original batch is popped. Cross-GPU preparation assigns a fresh physical ID to a clone, and retry can retain that clone, but PARTITION contributes the unchanged task-input ID. Each original batch therefore matches the identity frozen before pop while inserting its admitted INT32/INT64 keys before scatter into a full-global-geometry partial on its producing GPU. Per-device locks allow different GPUs to insert concurrently; in-flight and completed ID sets prevent retries from advancing completion twice.
 
-After all expected IDs complete, the last contribution OR-reduces non-root partials on the lowest
-planned GPU. It transfers at most 4 MiB per chunk through PR #1277's peer-DMA/host-staging helper,
+After all expected IDs complete, the final accepted contribution OR-reduces non-root partials on
+its own GPU. It transfers at most 4 MiB per chunk through PR #1277's peer-DMA/host-staging helper,
 runs the OR kernels on one root stream, drains that stream on success or failure, drops non-root
-partials and scratch, and strictly completes every planned replica before channel fan-out. An
-unknown, missing, incompatible, or failed contribution publishes no filter.
+partials and scratch, and strictly completes every planned replica before channel fan-out. This
+completion-selected root reuses the task thread's existing source reservation under per-thread
+reservation tracking; strict replication attaches only the other GPU adaptors. Bloom OR is
+associative and commutative, so the selected source does not affect membership. An unknown,
+missing, incompatible, or failed contribution publishes no filter.
 
 Before any per-device partial is allocated, `max_dynamic_filter_bloom_bytes_per_gpu` admits the complete active-key set against one GPU's allocator-aligned global-geometry footprint. The calculation does not multiply by GPU count: each GPU holds the same steady-state key set. If the aggregate exceeds the cap, every Bloom candidate is skipped and the exact build still completes normally.
 

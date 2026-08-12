@@ -180,6 +180,9 @@ struct dynamic_filter_accumulation_result {
 
   status state = status::pending;
   dynamic_filter_publication_outcome publication;  ///< Current outcome counters
+  std::size_t exact_contribution_count = 0;        ///< Completed unique IDs at publication
+  std::size_t global_build_rows        = 0;        ///< Validated global build geometry
+  int root_device_id = -1;  ///< Final contributor selected as reduction/replication source
 };
 
 namespace detail {
@@ -324,11 +327,13 @@ class dynamic_filter_publication_session final {
    *
    * Invalid contributions fail the optional publication without failing query execution.
    *
+   * @param[in] join_operator_id Stable producing hash-join identity for terminal observability
    * @param[in] batch_id Original pre-scatter batch ID
    * @param[in] build_view Batch containing the admitted build-key ordinals
    * @param[in] stream Stream used for insertion
    */
-  void contribute(std::uint64_t batch_id,
+  void contribute(std::uint64_t join_operator_id,
+                  std::uint64_t batch_id,
                   cudf::table_view const& build_view,
                   rmm::cuda_stream_view stream) noexcept;
 
@@ -369,6 +374,9 @@ class dynamic_filter_publication_session final {
 
   void commit_terminal_locked(state terminal,
                               dynamic_filter_publication_outcome const& outcome) noexcept;
+  void commit_accumulation_terminal_locked(state terminal,
+                                           dynamic_filter_accumulation_result const& result,
+                                           std::uint64_t join_operator_id) noexcept;
 
   dynamic_filter_publish_plan const& _plan;
   dynamic_filter_stats* _stats;

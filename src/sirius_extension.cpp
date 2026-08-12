@@ -1512,6 +1512,133 @@ struct ProfilerFunctionData : public GlobalTableFunctionState {
   bool finished = false;
 };
 
+enum class DynamicFilterObservabilityColumn : idx_t {
+  record_type = 0,
+  event_id,
+  event_high_watermark,
+  join_operator_id,
+  exact_contribution_count,
+  device_id,
+  build_rows,
+  filters_built,
+  active_targets,
+  filters_pushed,
+  stats_begin
+};
+
+struct DynamicFilterObservabilityState : public GlobalTableFunctionState {
+  sirius::op::dynamic_filter_stats_snapshot stats;
+  sirius::op::dynamic_filter_event_snapshot events;
+  idx_t next_row = 0;
+};
+
+static unique_ptr<FunctionData> DynamicFilterObservabilityBind(ClientContext&,
+                                                               TableFunctionBindInput&,
+                                                               vector<LogicalType>& return_types,
+                                                               vector<string>& names)
+{
+  auto add = [&](char const* name, LogicalType type) {
+    names.emplace_back(name);
+    return_types.emplace_back(std::move(type));
+  };
+  add("record_type", LogicalType::VARCHAR);
+  add("event_id", LogicalType::UBIGINT);
+  add("event_high_watermark", LogicalType::UBIGINT);
+  add("join_operator_id", LogicalType::UBIGINT);
+  add("exact_contribution_count", LogicalType::UBIGINT);
+  add("device_id", LogicalType::INTEGER);
+  add("build_rows", LogicalType::UBIGINT);
+  add("filters_built", LogicalType::UBIGINT);
+  add("active_targets", LogicalType::UBIGINT);
+  add("filters_pushed", LogicalType::UBIGINT);
+  for (auto const& stat : sirius::op::dynamic_filter_stats_snapshot{}.named_values()) {
+    names.emplace_back("stats_" + std::string(stat.name));
+    return_types.emplace_back(LogicalType::UBIGINT);
+  }
+  return nullptr;
+}
+
+static unique_ptr<GlobalTableFunctionState> DynamicFilterObservabilityInit(ClientContext& context,
+                                                                           TableFunctionInitInput&)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw InvalidInputException(
+      "sirius_dynamic_filter_observability requires Sirius to be initialized");
+  }
+  auto result    = make_uniq<DynamicFilterObservabilityState>();
+  result->stats  = sirius_ctx->get_dynamic_filter_stats_snapshot();
+  result->events = sirius_ctx->get_dynamic_filter_event_snapshot();
+  return result;
+}
+
+static void DynamicFilterObservabilityFunction(ClientContext&,
+                                               TableFunctionInput& data_p,
+                                               DataChunk& output)
+{
+  auto& state       = data_p.global_state->Cast<DynamicFilterObservabilityState>();
+  auto const total  = static_cast<idx_t>(state.events.records.size()) + 1;
+  idx_t output_rows = 0;
+
+  auto const record_type_col = static_cast<idx_t>(DynamicFilterObservabilityColumn::record_type);
+  auto const event_id_col    = static_cast<idx_t>(DynamicFilterObservabilityColumn::event_id);
+  auto const high_water_col =
+    static_cast<idx_t>(DynamicFilterObservabilityColumn::event_high_watermark);
+  auto const join_id_col = static_cast<idx_t>(DynamicFilterObservabilityColumn::join_operator_id);
+  auto const contribution_col =
+    static_cast<idx_t>(DynamicFilterObservabilityColumn::exact_contribution_count);
+  auto const device_col     = static_cast<idx_t>(DynamicFilterObservabilityColumn::device_id);
+  auto const build_rows_col = static_cast<idx_t>(DynamicFilterObservabilityColumn::build_rows);
+  auto const filters_col    = static_cast<idx_t>(DynamicFilterObservabilityColumn::filters_built);
+  auto const active_targets_col =
+    static_cast<idx_t>(DynamicFilterObservabilityColumn::active_targets);
+  auto const filters_pushed_col =
+    static_cast<idx_t>(DynamicFilterObservabilityColumn::filters_pushed);
+  auto const stats_begin = static_cast<idx_t>(DynamicFilterObservabilityColumn::stats_begin);
+
+  auto set_null = [&](idx_t column, idx_t row, LogicalType type) {
+    output.SetValue(column, row, Value(std::move(type)));
+  };
+  while (state.next_row < total && output_rows < STANDARD_VECTOR_SIZE) {
+    if (state.next_row == 0) {
+      output.SetValue(record_type_col, output_rows, Value("stats"));
+      set_null(event_id_col, output_rows, LogicalType::UBIGINT);
+      output.SetValue(high_water_col, output_rows, Value::UBIGINT(state.events.last_event_id));
+      set_null(join_id_col, output_rows, LogicalType::UBIGINT);
+      set_null(contribution_col, output_rows, LogicalType::UBIGINT);
+      set_null(device_col, output_rows, LogicalType::INTEGER);
+      set_null(build_rows_col, output_rows, LogicalType::UBIGINT);
+      set_null(filters_col, output_rows, LogicalType::UBIGINT);
+      set_null(active_targets_col, output_rows, LogicalType::UBIGINT);
+      set_null(filters_pushed_col, output_rows, LogicalType::UBIGINT);
+      auto const named_stats = state.stats.named_values();
+      for (idx_t stat_idx = 0; stat_idx < named_stats.size(); ++stat_idx) {
+        output.SetValue(
+          stats_begin + stat_idx, output_rows, Value::UBIGINT(named_stats[stat_idx].value));
+      }
+    } else {
+      auto const& event = state.events.records[state.next_row - 1];
+      output.SetValue(record_type_col, output_rows, Value("global_accumulator_completion"));
+      output.SetValue(event_id_col, output_rows, Value::UBIGINT(event.event_id));
+      set_null(high_water_col, output_rows, LogicalType::UBIGINT);
+      output.SetValue(join_id_col, output_rows, Value::UBIGINT(event.join_operator_id));
+      output.SetValue(
+        contribution_col, output_rows, Value::UBIGINT(event.exact_contribution_count));
+      output.SetValue(device_col, output_rows, Value::INTEGER(event.device_id));
+      output.SetValue(build_rows_col, output_rows, Value::UBIGINT(event.build_rows));
+      output.SetValue(filters_col, output_rows, Value::UBIGINT(event.filters_built));
+      output.SetValue(active_targets_col, output_rows, Value::UBIGINT(event.active_targets));
+      output.SetValue(filters_pushed_col, output_rows, Value::UBIGINT(event.filters_pushed));
+      for (idx_t stat_idx = 0; stat_idx < state.stats.named_values().size(); ++stat_idx) {
+        set_null(stats_begin + stat_idx, output_rows, LogicalType::UBIGINT);
+      }
+    }
+    ++state.next_row;
+    ++output_rows;
+  }
+  output.SetCardinality(output_rows);
+}
+
 static unique_ptr<GlobalTableFunctionState> ProfilerInit(ClientContext& context,
                                                          TableFunctionInitInput& input)
 {
@@ -1627,6 +1754,14 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                                 SiriusSetQueryLabelBind);
   CreateTableFunctionInfo set_query_label_info(set_query_label);
   catalog.CreateTableFunction(transaction, set_query_label_info);
+
+  TableFunction dynamic_filter_observability("sirius_dynamic_filter_observability",
+                                             {},
+                                             DynamicFilterObservabilityFunction,
+                                             DynamicFilterObservabilityBind,
+                                             DynamicFilterObservabilityInit);
+  CreateTableFunctionInfo dynamic_filter_observability_info(dynamic_filter_observability);
+  catalog.CreateTableFunction(transaction, dynamic_filter_observability_info);
 
   // Profiler control functions for nsys --capture-range=cudaProfilerApi
   TableFunction profiler_start(

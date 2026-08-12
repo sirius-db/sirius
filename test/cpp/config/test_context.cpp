@@ -187,6 +187,58 @@ TEST_CASE("Sirius configuration loading from file with spaces",
   REQUIRE(manager.get_all_memory_spaces().size() == 4);
 }
 
+TEST_CASE("global dynamic-filter observability is exposed as a SiriusContext read-only table",
+          "[sirius][context][dynamic_filter][observability][isolated_context]")
+{
+  finally cleanup_env{[]() {
+    unsetenv("SIRIUS_CONFIG_FILE");
+    setenv("SIRIUS_DISABLE", "1", 1);
+  }};
+
+  std::source_location loc = std::source_location::current();
+  fs::path cfg             = fs::path(loc.file_name()).parent_path() / "data" / "configurator.yaml";
+  unsetenv("SIRIUS_DISABLE");
+  setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+
+  auto& stats = sirius_ctx->get_dynamic_filter_stats();
+  stats.keys_considered.store(7, std::memory_order_relaxed);
+  stats.record_global_accumulator_completion(11, 3, 1, 128, 2, 1, 2);
+
+  auto set_cpu = con.Query("SET gpu_execution = false");
+  REQUIRE(set_cpu != nullptr);
+  REQUIRE_FALSE(set_cpu->HasError());
+  auto result = con.Query(
+    "SELECT record_type, event_id, event_high_watermark, join_operator_id, "
+    "exact_contribution_count, device_id, build_rows, filters_built, active_targets, "
+    "filters_pushed, stats_keys_considered "
+    "FROM sirius_dynamic_filter_observability() ORDER BY event_id NULLS FIRST");
+  REQUIRE(result != nullptr);
+  REQUIRE_FALSE(result->HasError());
+  REQUIRE(result->RowCount() == 2);
+
+  CHECK(result->GetValue(0, 0).ToString() == "stats");
+  CHECK(result->GetValue(1, 0).IsNull());
+  CHECK(result->GetValue(2, 0).GetValue<std::uint64_t>() == 1);
+  CHECK(result->GetValue(10, 0).GetValue<std::uint64_t>() == 7);
+
+  CHECK(result->GetValue(0, 1).ToString() == "global_accumulator_completion");
+  CHECK(result->GetValue(1, 1).GetValue<std::uint64_t>() == 1);
+  CHECK(result->GetValue(2, 1).IsNull());
+  CHECK(result->GetValue(3, 1).GetValue<std::uint64_t>() == 11);
+  CHECK(result->GetValue(4, 1).GetValue<std::uint64_t>() == 3);
+  CHECK(result->GetValue(5, 1).GetValue<std::int32_t>() == 1);
+  CHECK(result->GetValue(6, 1).GetValue<std::uint64_t>() == 128);
+  CHECK(result->GetValue(7, 1).GetValue<std::uint64_t>() == 2);
+  CHECK(result->GetValue(8, 1).GetValue<std::uint64_t>() == 1);
+  CHECK(result->GetValue(9, 1).GetValue<std::uint64_t>() == 2);
+  CHECK(result->GetValue(10, 1).IsNull());
+}
+
 // ============================================================================
 // Multi-GPU Foundation Validation Tests
 // ============================================================================

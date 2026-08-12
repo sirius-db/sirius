@@ -101,6 +101,8 @@ def setup_benchmark_dir(
     name=None,
     nsys_profile=False,
     data_source="parquet",
+    dynamic_filter_observability=False,
+    skip_os_cache_drop=False,
 ):
     """Create the benchmark output directory and return its paths.
 
@@ -145,7 +147,13 @@ def setup_benchmark_dir(
         "pin": pin,
         "nsys_profile": nsys_profile,
         "runtime_file": os.path.relpath(runtime_csv, benchmark_dir),
+        "dynamic_filter_observability": dynamic_filter_observability,
+        "os_cache_policy": "skip" if skip_os_cache_drop else "drop",
     }
+    if dynamic_filter_observability:
+        metadata["dynamic_filter_observability_file"] = os.path.join(
+            "csv", "dynamic_filter_observability.jsonl"
+        )
     with open(os.path.join(benchmark_dir, "metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
 
@@ -348,8 +356,133 @@ def _record(writer, name, qnum, it, runtime):
     log(f"[{name}] q{qnum} iter{it}: {runtime:.4f}s")
 
 
+_DYNAMIC_FILTER_OBSERVABILITY_SQL = (
+    "SELECT * FROM sirius_dynamic_filter_observability() ORDER BY event_id NULLS FIRST"
+)
+_DYNAMIC_FILTER_EVENT_FIELDS = (
+    "event_id",
+    "record_type",
+    "join_operator_id",
+    "exact_contribution_count",
+    "device_id",
+    "build_rows",
+    "filters_built",
+    "active_targets",
+    "filters_pushed",
+)
+
+
+def _read_dynamic_filter_observability(con):
+    """Read one cumulative counter/event snapshot through Sirius's SQL surface."""
+    # Keep this instrumentation query on DuckDB and outside the timed region. time_query()
+    # explicitly restores gpu_execution=true before the next GPU iteration.
+    con.execute("SET gpu_execution = false;")
+    result = con.execute(_DYNAMIC_FILTER_OBSERVABILITY_SQL)
+    columns = [description[0] for description in result.description]
+    rows = [dict(zip(columns, row)) for row in result.fetchall()]
+    snapshot_rows = [row for row in rows if row["record_type"] == "stats"]
+    if len(snapshot_rows) != 1:
+        raise RuntimeError(
+            "sirius_dynamic_filter_observability() returned "
+            f"{len(snapshot_rows)} stats rows; expected exactly one"
+        )
+    snapshot = snapshot_rows[0]
+    stat_columns = [column for column in columns if column.startswith("stats_")]
+    if not stat_columns:
+        raise RuntimeError(
+            "sirius_dynamic_filter_observability() exposed no stats_* columns"
+        )
+    stats = {
+        column.removeprefix("stats_"): int(snapshot[column])
+        for column in stat_columns
+    }
+    events = []
+    for row in rows:
+        if row["record_type"] == "stats":
+            continue
+        events.append(
+            {
+                field: row[field]
+                for field in _DYNAMIC_FILTER_EVENT_FIELDS
+                if row[field] is not None
+            }
+        )
+
+    high_watermark = int(snapshot["event_high_watermark"])
+    event_ids = sorted(int(event["event_id"]) for event in events)
+    expected_ids = list(range(1, high_watermark + 1))
+    if event_ids != expected_ids:
+        raise RuntimeError(
+            "dynamic-filter event snapshot is not contiguous: "
+            f"expected IDs {expected_ids}, got {event_ids}"
+        )
+    return {
+        "event_high_watermark": high_watermark,
+        "stats": stats,
+        "events": events,
+    }
+
+
+def _write_dynamic_filter_iteration_observability(
+    path, qnum, iteration, before, after
+):
+    """Append one query/iteration delta and only its newly completed event records."""
+    if before["stats"].keys() != after["stats"].keys():
+        raise RuntimeError("dynamic-filter stats schema changed within one query iteration")
+    stats_delta = {}
+    for field, before_value in before["stats"].items():
+        after_value = after["stats"][field]
+        if after_value < before_value:
+            raise RuntimeError(
+                f"dynamic-filter cumulative counter {field!r} decreased "
+                f"from {before_value} to {after_value}"
+            )
+        stats_delta[field] = after_value - before_value
+
+    before_event = before["event_high_watermark"]
+    after_event = after["event_high_watermark"]
+    if after_event < before_event:
+        raise RuntimeError(
+            "dynamic-filter event high-water mark decreased "
+            f"from {before_event} to {after_event}"
+        )
+    new_events = [
+        event for event in after["events"] if int(event["event_id"]) > before_event
+    ]
+    new_events.sort(key=lambda event: int(event["event_id"]))
+    actual_event_ids = [int(event["event_id"]) for event in new_events]
+    expected_event_ids = list(range(before_event + 1, after_event + 1))
+    if actual_event_ids != expected_event_ids:
+        raise RuntimeError(
+            "dynamic-filter event rows do not exactly cover the query interval: "
+            f"expected IDs {expected_event_ids}, got {actual_event_ids}"
+        )
+    record = {
+        "engine": "sirius",
+        "query": f"q{qnum}",
+        "iteration": iteration,
+        "stats_before": before["stats"],
+        "stats_after": after["stats"],
+        "stats_delta": stats_delta,
+        "event_id_before": before_event,
+        "event_id_after": after_event,
+        "events": new_events,
+    }
+    with open(path, "a") as output:
+        json.dump(record, output, sort_keys=True, separators=(",", ":"))
+        output.write("\n")
+
+
 def _run_one(
-    writer, con, name, qnum, it, use_gpu, benchmark_dir, duckdb_profiling=False
+    writer,
+    con,
+    name,
+    qnum,
+    it,
+    use_gpu,
+    benchmark_dir,
+    duckdb_profiling=False,
+    dynamic_filter_observability_path=None,
 ):
     profile_path = None
     if duckdb_profiling and not use_gpu:
@@ -358,7 +491,15 @@ def _run_one(
         profile_path = os.path.join(
             _query_dir(benchmark_dir, name, qnum), f"profile_iter{it}.json"
         )
+    before = None
+    if use_gpu and dynamic_filter_observability_path is not None:
+        before = _read_dynamic_filter_observability(con)
     elapsed, rows = time_query(con, qnum, use_gpu, profile_path=profile_path)
+    if before is not None:
+        after = _read_dynamic_filter_observability(con)
+        _write_dynamic_filter_iteration_observability(
+            dynamic_filter_observability_path, qnum, it, before, after
+        )
     _record(writer, name, qnum, it, elapsed)
     _write_result(benchmark_dir, name, qnum, rows)
 
@@ -374,6 +515,7 @@ def run_grouped(
     pin,
     data_source="parquet",
     duckdb_profiling=False,
+    dynamic_filter_observability_path=None,
 ):
     """Per-query iterations back-to-back; one connection per engine. Pin per query."""
     log(
@@ -399,6 +541,7 @@ def run_grouped(
                             use_gpu,
                             benchmark_dir,
                             duckdb_profiling,
+                            dynamic_filter_observability_path,
                         )
                 finally:
                     if pin_enabled and use_gpu:
@@ -420,6 +563,7 @@ def run_sequential(
     pin,
     data_source="parquet",
     duckdb_profiling=False,
+    dynamic_filter_observability_path=None,
 ):
     """Round-robin iterations; one connection per engine. Single union-pin at session start."""
     log("Mode 'sequential': single connection per engine, round-robin iterations")
@@ -443,6 +587,7 @@ def run_sequential(
                             use_gpu,
                             benchmark_dir,
                             duckdb_profiling,
+                            dynamic_filter_observability_path,
                         )
             finally:
                 if pin_enabled and use_gpu:
@@ -464,9 +609,14 @@ def run_isolated(
     pin,
     data_source="parquet",
     duckdb_profiling=False,
+    dynamic_filter_observability_path=None,
+    skip_os_cache_drop=False,
 ):
     """Fresh connection + OS cache drop per (query, iteration). Pin per execution."""
-    log("Mode 'isolated': renewing connection and dropping OS cache before every run")
+    log(
+        "Mode 'isolated': renewing connection before every run; OS cache "
+        f"policy={'skip' if skip_os_cache_drop else 'drop-per-iteration'}"
+    )
     pin_enabled = pin != "none"
     for name, use_gpu in engine_modes:
         for qnum in queries:
@@ -476,7 +626,8 @@ def run_isolated(
                     source, gpu_execution=use_gpu, data_source=data_source
                 )
                 try:
-                    drop_os_cache()
+                    if not skip_os_cache_drop:
+                        drop_os_cache()
                     if pin_enabled and use_gpu:
                         log(f"  Pinning tables for q{qnum}")
                         _execute_multi(con, emit_pin(qnum, source, data_source))
@@ -489,6 +640,7 @@ def run_isolated(
                         use_gpu,
                         benchmark_dir,
                         duckdb_profiling,
+                        dynamic_filter_observability_path,
                     )
                     if pin_enabled and use_gpu:
                         log(f"  Unpinning tables for q{qnum}")
@@ -984,6 +1136,25 @@ def parse_args():
         ),
     )
     p.add_argument(
+        "--dynamic-filter-observability",
+        action="store_true",
+        help=(
+            "Around every GPU query iteration, outside the timed region, snapshot all "
+            "SiriusContext dynamic-filter counters and successful global completion events. "
+            "Write per-iteration deltas and newly completed events to "
+            "csv/dynamic_filter_observability.jsonl. Incompatible with nsys-profile mode."
+        ),
+    )
+    p.add_argument(
+        "--skip-os-cache-drop",
+        action="store_true",
+        help=(
+            "Do not run the benchmark's normal sudo drop_caches step. This is an explicit "
+            "protocol deviation for environments where cache dropping is unavailable or "
+            "intentionally waived; the selected policy is recorded in metadata and logs."
+        ),
+    )
+    p.add_argument(
         "--query-timeout",
         type=int,
         default=90,
@@ -1021,6 +1192,11 @@ def main():
             "--validation requires --engine both (needs both result sets to compare)"
         )
 
+    if args.dynamic_filter_observability and args.engine == "cpu":
+        raise SystemExit(
+            "--dynamic-filter-observability requires --engine gpu or --engine both"
+        )
+
     nsys_profile = args.mode == "nsys-profile"
     if nsys_profile:
         if args.engine != "gpu":
@@ -1030,6 +1206,11 @@ def main():
         if args.duckdb_profiling:
             raise SystemExit(
                 "--mode nsys-profile is incompatible with --duckdb-profiling"
+            )
+        if args.dynamic_filter_observability:
+            raise SystemExit(
+                "--mode nsys-profile is incompatible with "
+                "--dynamic-filter-observability"
             )
 
     config_path = (args.config or "").strip()
@@ -1055,8 +1236,17 @@ def main():
         name=args.name,
         nsys_profile=nsys_profile,
         data_source=args.data_source,
+        dynamic_filter_observability=args.dynamic_filter_observability,
+        skip_os_cache_drop=args.skip_os_cache_drop,
     )
     os.environ["SIRIUS_LOG_DIR"] = log_dir
+    dynamic_filter_observability_path = None
+    if args.dynamic_filter_observability:
+        dynamic_filter_observability_path = os.path.join(
+            benchmark_dir, "csv", "dynamic_filter_observability.jsonl"
+        )
+        with open(dynamic_filter_observability_path, "w"):
+            pass
 
     log(f"Source:        {source}")
     log(f"Data source:   {args.data_source}")
@@ -1067,12 +1257,20 @@ def main():
     log(f"Config:        {config_path or '(default)'}")
     log(f"Pin:           {args.pin}")
     log(f"DuckDB profiling: {args.duckdb_profiling}")
+    log(f"Dynamic-filter observability: {args.dynamic_filter_observability}")
+    log(f"OS cache policy: {'skip' if args.skip_os_cache_drop else 'drop'}")
     log(f"nsys-profile:  {nsys_profile}")
     log(f"Benchmark dir: {benchmark_dir}")
     log(f"Runtime CSV:   {runtime_csv}")
     log(f"Log dir:       {log_dir}")
 
-    drop_os_cache()
+    if args.skip_os_cache_drop:
+        log(
+            "PROTOCOL DEVIATION: --skip-os-cache-drop was requested; OS page cache "
+            "will not be dropped. Preserve this fact with the benchmark report."
+        )
+    else:
+        drop_os_cache()
     with open(runtime_csv, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["engine", "query", "iteration", "runtime_s"])
@@ -1090,16 +1288,22 @@ def main():
                 data_source=args.data_source,
             )
         else:
+            runner_kwargs = {
+                "benchmark_dir": benchmark_dir,
+                "pin": args.pin,
+                "data_source": args.data_source,
+                "duckdb_profiling": args.duckdb_profiling,
+                "dynamic_filter_observability_path": dynamic_filter_observability_path,
+            }
+            if args.mode == "isolated":
+                runner_kwargs["skip_os_cache_drop"] = args.skip_os_cache_drop
             RUNNERS[args.mode](
                 source,
                 queries,
                 engine_modes,
                 args.iterations,
                 writer,
-                benchmark_dir=benchmark_dir,
-                pin=args.pin,
-                data_source=args.data_source,
-                duckdb_profiling=args.duckdb_profiling,
+                **runner_kwargs,
             )
 
     log("Benchmark run complete")

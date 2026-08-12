@@ -406,7 +406,7 @@ Under broadcast there is one build CONCAT per GPU, each racing the build-port ho
 
 For a genuinely hash-partitioned, non-broadcast build, `enable_dynamic_filter_multi_partition` (default **false**) enables a separate exact-ID path. At the build PARTITION's FULL barrier, `sirius_physical_partition::try_freeze_complete_build` creates a move-owned `complete_build_snapshot` before the first original batch is popped. PARTITION supplies the complete original batch IDs and exact global row count; the snapshot structurally validates non-empty unique IDs, row-count representability as `std::size_t`, and a selected partition count greater than one. Zero build rows are valid. Moving a snapshot invalidates the source object, and `dynamic_filter_publication_session::try_arm` rejects invalid or moved-from values before claiming the session or incrementing `publication_attempts`.
 
-Each one-batch PARTITION payload captures its popped batch's immutable task-input ID. Cross-GPU preparation may replace that batch with a fresh-ID physical clone, and retry may retain the clone, but PARTITION always contributes the captured task-input ID that the frozen snapshot expects. Each original batch inserts its admitted INT32/INT64 keys into one full-global-geometry Bloom partial on its producing GPU before scatter. Duplicate or in-flight IDs do not advance completion; an unknown, missing, incompatible, or failed contribution publishes nothing. A zero-row snapshot completes without constructing a Bloom. The last complete contribution OR-reduces device partials on the lowest planned GPU using bounded 4 MiB scratch, strictly prepares every planned replica, and only then fans one immutable global Bloom through the existing sparse target bindings. No source partial enters a channel, and no filter ownership is added to CONCAT.
+Each one-batch PARTITION payload captures its popped batch's immutable task-input ID. Cross-GPU preparation may replace that batch with a fresh-ID physical clone, and retry may retain the clone, but PARTITION always contributes the captured task-input ID that the frozen snapshot expects. Each original batch inserts its admitted INT32/INT64 keys into one full-global-geometry Bloom partial on its producing GPU before scatter. Duplicate or in-flight IDs do not advance completion; an unknown, missing, incompatible, or failed contribution publishes nothing. A zero-row snapshot completes without constructing a Bloom. The final accepted contribution OR-reduces device partials on its own GPU using bounded 4 MiB scratch, strictly prepares every planned replica, and only then fans one immutable global Bloom through the existing sparse target bindings. Selecting the final contributor as root preserves the task thread's already-attached source reservation when CuCascade tracks reservations per thread; choosing an unrelated fixed GPU could require a second reservation on the final GPU during strict fan-out. Bloom OR is associative and commutative, so root selection does not change filter contents. No source partial enters a channel, and no filter ownership is added to CONCAT.
 
 A wired join that can use neither the whole-build path nor an armed accumulator would otherwise
 publish nothing silently, so the first build delivery that observes the condition logs a
@@ -517,6 +517,15 @@ wired join that can claim neither a whole-build one-shot publication nor an enab
 accumulator. It is counted once at the first build delivery that observes the condition. Read it
 against the other delivery counters per *delivery*, not per join; no sum over the delivery family
 reaches `producers_enabled`.
+
+`sirius_dynamic_filter_observability()` exposes one cumulative `stats` row plus the append-only
+`global_accumulator_completion` journal. Each completion records a monotonic event ID, producing
+join operator ID, exact contribution count, completion-selected root `device_id`, global build
+rows, filters built, active targets, and accepted pushes. The publication session appends the event
+at the same exactly-once terminal commit that folds a successfully completed accumulator. One-shot,
+failed, and incomplete attempts never append a completion event. The benchmark harness snapshots
+this table before and after each timed GPU query while `gpu_execution=false`, then restores GPU
+execution for the query itself.
 
 #### Ready replicas and per-split snapshots
 

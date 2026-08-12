@@ -208,6 +208,12 @@ while running:
 
 The `mark_task_created()` call before data popping prevents a race condition where the pipeline could appear finished between data check and task creation.
 
+For BUILD_PROBE hash joins, a `READY` hint is advisory across concurrent task-creator workers. A
+different worker may drain the selected build/probe input before
+`get_next_task_input_data_for_build_probe()` consumes it. The resulting "no schedulable partition
+(build/probe already drained)" path returns no task and logs at DEBUG: it is a benign stale-hint
+miss, not a failed query or lost batch.
+
 ## Device Assignment for GPU Tasks
 
 **File:** `src/creator/task_creator.cpp`

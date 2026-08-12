@@ -529,8 +529,9 @@ struct dynamic_filter_accumulator::impl {
   dynamic_filter_publication_outcome outcome;
   detail::dynamic_filter_accumulator_test_hooks test_hooks;
   mutable std::mutex mutex;
-  bool is_complete = false;
-  bool is_aborted  = false;
+  bool is_complete             = false;
+  bool is_aborted              = false;
+  int published_root_device_id = -1;
 
   impl(dynamic_filter_publish_plan const& plan,
        complete_build_snapshot snapshot,
@@ -609,11 +610,20 @@ struct dynamic_filter_accumulator::impl {
     return {.state = dynamic_filter_accumulation_result::status::aborted, .publication = outcome};
   }
 
+  [[nodiscard]] dynamic_filter_accumulation_result completed_result(
+    dynamic_filter_accumulation_result::status state) const
+  {
+    return {.state                    = state,
+            .publication              = outcome,
+            .exact_contribution_count = completed_ids.size(),
+            .global_build_rows        = build_rows,
+            .root_device_id           = published_root_device_id};
+  }
+
   [[nodiscard]] std::optional<dynamic_filter_accumulation_result> terminal_result_locked() const
   {
     if (is_complete) {
-      return dynamic_filter_accumulation_result{
-        .state = dynamic_filter_accumulation_result::status::duplicate, .publication = outcome};
+      return completed_result(dynamic_filter_accumulation_result::status::duplicate);
     }
     if (is_aborted) { return aborted_result(); }
     return std::nullopt;
@@ -629,23 +639,26 @@ struct dynamic_filter_accumulator::impl {
     return aborted_result();
   }
 
-  [[nodiscard]] dynamic_filter_accumulation_result publish_locked()
+  [[nodiscard]] dynamic_filter_accumulation_result publish_locked(int root_device)
   {
+    auto const* root_space = replica_space(root_device);
+    if (root_space == nullptr) {
+      throw std::logic_error("the final contribution GPU is absent from the replica plan");
+    }
+
     auto target_accepts_filters = [](dynamic_filter_publish_plan::probe_target const& target) {
       return target.filter_set && target.filter_set->accepting_filters();
     };
     if (std::none_of(
           plan.probe_targets().begin(), plan.probe_targets().end(), target_accepts_filters)) {
       outcome.skipped_targets_drained = 1;
+      published_root_device_id        = root_device;
       is_complete                     = true;
-      return {.state       = dynamic_filter_accumulation_result::status::published,
-              .publication = outcome};
+      return completed_result(dynamic_filter_accumulation_result::status::published);
     }
 
-    auto const& root_space = plan.replica_spaces().front();
-    auto const root_device = root_space.get_gpu_space().get_device_id();
     rmm::cuda_set_device_raii root_guard{rmm::cuda_device_id{root_device}};
-    auto const root_stream = root_space.get_gpu_space().acquire_stream();
+    auto const root_stream = root_space->get_gpu_space().acquire_stream();
     auto& root_filters     = partials.at(root_device)->filters;
     root_filters.resize(active_keys.size());
 
@@ -657,7 +670,7 @@ struct dynamic_filter_accumulator::impl {
             build_types[key_index],
             build_rows,
             root_stream,
-            root_space.get_gpu_space().get_default_allocator());
+            root_space->get_gpu_space().get_default_allocator());
         }
         for (auto const& [device_id, partial] : partials) {
           if (device_id == root_device || key_index >= partial->filters.size() ||
@@ -669,7 +682,7 @@ struct dynamic_filter_accumulator::impl {
             throw std::logic_error("a contributing GPU is absent from the immutable replica plan");
           }
           root_filters[key_index]->merge_from(
-            *partial->filters[key_index], *source_space, root_space, root_stream);
+            *partial->filters[key_index], *source_space, *root_space, root_stream);
         }
       }
       root_stream.synchronize();
@@ -712,17 +725,19 @@ struct dynamic_filter_accumulator::impl {
       }
     }
 
-    is_complete = true;
+    published_root_device_id = root_device;
+    is_complete              = true;
     invoke_noexcept([&] {
       SIRIUS_LOG_INFO(
         "[dynamic_filter_accumulator] published {} global Bloom filter(s) across {} active "
-        "target(s) after {} exact build contribution(s), {} build rows.",
+        "target(s) after {} exact build contribution(s), {} build rows, root GPU {}.",
         outcome.membership_filters_built,
         outcome.active_targets,
         completed_ids.size(),
-        build_rows);
+        build_rows,
+        root_device);
     });
-    return {.state = dynamic_filter_accumulation_result::status::published, .publication = outcome};
+    return completed_result(dynamic_filter_accumulation_result::status::published);
   }
 
   [[nodiscard]] dynamic_filter_accumulation_result contribute(std::uint64_t batch_id,
@@ -825,7 +840,10 @@ struct dynamic_filter_accumulator::impl {
       return {.state = dynamic_filter_accumulation_result::status::pending, .publication = outcome};
     }
     try {
-      return publish_locked();
+      // gpu_pipeline_task owns a reservation on this host thread's current GPU when reservation
+      // tracking is per thread. Keeping the final contributor as the source avoids attaching a
+      // second reservation to that same adaptor during strict replica fan-out.
+      return publish_locked(device_id);
     } catch (std::exception const& error) {
       return abort_locked(error.what());
     } catch (...) {
@@ -878,8 +896,7 @@ dynamic_filter_accumulation_result dynamic_filter_accumulator::abort_or_get_term
   {
     std::scoped_lock lock(_impl->mutex);
     if (_impl->is_complete) {
-      result = {.state       = dynamic_filter_accumulation_result::status::published,
-                .publication = _impl->outcome};
+      result = _impl->completed_result(dynamic_filter_accumulation_result::status::published);
     } else {
       newly_aborted     = !_impl->is_aborted;
       _impl->is_aborted = true;
@@ -951,6 +968,25 @@ void dynamic_filter_publication_session::commit_terminal_locked(
   }
 }
 
+void dynamic_filter_publication_session::commit_accumulation_terminal_locked(
+  state terminal,
+  dynamic_filter_accumulation_result const& result,
+  std::uint64_t join_operator_id) noexcept
+{
+  commit_terminal_locked(terminal, result.publication);
+  if (_stats == nullptr || terminal != state::finished ||
+      result.state != dynamic_filter_accumulation_result::status::published) {
+    return;
+  }
+  _stats->record_global_accumulator_completion(join_operator_id,
+                                               result.exact_contribution_count,
+                                               result.root_device_id,
+                                               result.global_build_rows,
+                                               result.publication.membership_filters_built,
+                                               result.publication.active_targets,
+                                               result.publication.filters_pushed);
+}
+
 bool dynamic_filter_publication_session::try_arm(complete_build_snapshot snapshot)
 {
   if (!wants_multi_partition() || !snapshot.valid()) { return false; }
@@ -1000,7 +1036,8 @@ bool dynamic_filter_publication_session::try_arm(complete_build_snapshot snapsho
   }
 }
 
-void dynamic_filter_publication_session::contribute(std::uint64_t batch_id,
+void dynamic_filter_publication_session::contribute(std::uint64_t join_operator_id,
+                                                    std::uint64_t batch_id,
                                                     cudf::table_view const& build_view,
                                                     rmm::cuda_stream_view stream) noexcept
 {
@@ -1016,10 +1053,11 @@ void dynamic_filter_publication_session::contribute(std::uint64_t batch_id,
     auto const terminal = accumulator->abort_or_get_terminal();
     std::scoped_lock lock(_mutex);
     if (_state != state::accumulating) { return; }
-    commit_terminal_locked(terminal.state == dynamic_filter_accumulation_result::status::published
-                             ? state::finished
-                             : state::failed,
-                           terminal.publication);
+    commit_accumulation_terminal_locked(
+      terminal.state == dynamic_filter_accumulation_result::status::published ? state::finished
+                                                                              : state::failed,
+      terminal,
+      join_operator_id);
   };
   try {
     result = accumulator->contribute(batch_id, build_view, stream);
@@ -1045,9 +1083,9 @@ void dynamic_filter_publication_session::contribute(std::uint64_t batch_id,
   std::scoped_lock lock(_mutex);
   if (_state != state::accumulating) { return; }
   if (result.state == dynamic_filter_accumulation_result::status::published) {
-    commit_terminal_locked(state::finished, result.publication);
+    commit_accumulation_terminal_locked(state::finished, result, join_operator_id);
   } else if (result.state == dynamic_filter_accumulation_result::status::aborted) {
-    commit_terminal_locked(state::failed, result.publication);
+    commit_accumulation_terminal_locked(state::failed, result, join_operator_id);
   }
 }
 

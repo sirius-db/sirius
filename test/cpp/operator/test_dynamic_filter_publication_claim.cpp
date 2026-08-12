@@ -357,6 +357,46 @@ TEST_CASE("hash join arms a multi-partition snapshot exactly once and closes it 
   REQUIRE(fixture.stats.publications_failed.load() == 1);
   REQUIRE(fixture.stats.publications_finished.load() == 0);
   REQUIRE(fixture.channel->empty());
+  REQUIRE(fixture.stats.event_snapshot().records.empty());
+}
+
+TEST_CASE("hash join identifies one successful global accumulator completion event",
+          "[dynamic_filter][publication_claim][accumulator][observability]")
+{
+  claim_fixture fixture(duckdb::JoinType::INNER, true);
+  auto first_batch  = fixture.make_build_batch();
+  auto second_batch = fixture.make_build_batch();
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  auto const first_id  = first_batch->get_batch_id();
+  auto const second_id = second_batch->get_batch_id();
+  REQUIRE(fixture.hash_join->arm_multi_partition_dynamic_filters(
+    make_complete_build_snapshot(2 * kBuildRows, {first_id, second_id})));
+
+  auto const stream = fixture.gpu_space->acquire_stream();
+  auto first_ro     = first_batch->to_read_only();
+  fixture.hash_join->contribute_dynamic_filter_build_batch(
+    first_id, sirius::get_cudf_table_view(first_ro), stream);
+  REQUIRE(fixture.stats.event_snapshot().records.empty());
+
+  auto second_ro = second_batch->to_read_only();
+  fixture.hash_join->contribute_dynamic_filter_build_batch(
+    second_id, sirius::get_cudf_table_view(second_ro), stream);
+
+  auto const events = fixture.stats.event_snapshot();
+  REQUIRE(events.last_event_id == 1);
+  REQUIRE(events.records.size() == 1);
+  CHECK(events.records[0].join_operator_id == fixture.hash_join->get_operator_id());
+  CHECK(events.records[0].exact_contribution_count == 2);
+  CHECK(events.records[0].device_id == kDeviceId);
+  CHECK(events.records[0].build_rows == 2 * kBuildRows);
+  CHECK(events.records[0].filters_built == 1);
+  CHECK(events.records[0].active_targets == 1);
+  CHECK(events.records[0].filters_pushed == 1);
+
+  fixture.hash_join->contribute_dynamic_filter_build_batch(
+    second_id, sirius::get_cudf_table_view(second_ro), stream);
+  REQUIRE(fixture.stats.event_snapshot().records.size() == 1);
 }
 
 TEST_CASE("an aborted accumulator folds policy counters into hash-join stats exactly once",
@@ -395,6 +435,7 @@ TEST_CASE("an aborted accumulator folds policy counters into hash-join stats exa
     mismatch_id, sirius::get_cudf_table_view(mismatch_ro), stream);
   REQUIRE(fixture.stats.keys_skipped_type_mismatch.load() == 1);
   REQUIRE(fixture.stats.publications_failed.load() == 1);
+  REQUIRE(fixture.stats.event_snapshot().records.empty());
 }
 
 TEST_CASE("a source batch can become resident before claiming one-shot publication",

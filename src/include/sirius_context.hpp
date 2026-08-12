@@ -540,6 +540,11 @@ class SiriusContext : public ClientContextState {
   {
     return dynamic_filter_stats_.snapshot();
   }
+  /// \brief Return a coherent copy of the shared SiriusContext dynamic-filter event journal.
+  [[nodiscard]] sirius::op::dynamic_filter_event_snapshot get_dynamic_filter_event_snapshot() const
+  {
+    return dynamic_filter_stats_.event_snapshot();
+  }
 
   /// \brief Record a successful transparent rebind to Sirius.
   void record_transparent_rebind_success() noexcept;

@@ -150,6 +150,17 @@ Key flags:
 - `--queries 1,3,6-10` — subset selection.
 - `--pin gpu|host|none` — Sirius cache pre-load tier. Both `gpu` and `host` are supported; `host` converts the pinned table into NUMA-local pinned host memory. Any other tier throws `NotImplementedException` at bind time (`src/sirius_extension.cpp:811-813`).
 - `--validation` — byte-compare GPU vs CPU `result.txt` after timing (with `abs_tol=1e-10` on float columns). Requires `--engine both`.
+- `--dynamic-filter-observability` — outside each GPU iteration's timed region, snapshot
+  `sirius_dynamic_filter_observability()`, subtract every cumulative counter, select newly completed
+  global-accumulator records by event high-water mark, and write
+  `csv/dynamic_filter_observability.jsonl`. Attribution assumes one process/connection and no
+  concurrent Sirius work between the immediately-before and post-`fetchall()` snapshots. For the
+  tested global multi-partition design, require a record with contribution count greater than one
+  and positive filters built, active targets, and accepted pushes, plus zero publication-failure
+  and targets-drained deltas. Not supported in `nsys-profile` mode.
+- `--skip-os-cache-drop` — explicitly bypass the normal `drop_caches` call when the protocol
+  deviation is intentional; the choice is recorded in metadata and logged prominently. In
+  `isolated` mode it also skips the per-iteration drops.
 - `--mode nsys-profile` — wrap each query in `nsys profile` (one DuckDB CLI subprocess per query; the cudaProfilerApi capture range covers the cold + hot iterations). Requires `--engine gpu`; incompatible with `--validation` and `--duckdb-profiling`.
 - `--query-timeout N` — per-query subprocess timeout in nsys-profile mode (default 90s).
 - `--name <NAME>` — override the auto-timestamped benchmark subdirectory name.

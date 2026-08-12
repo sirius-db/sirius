@@ -32,7 +32,9 @@
 
 #include <catch.hpp>
 #include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -55,6 +57,7 @@ namespace {
 
 constexpr int kDeviceId                 = 0;
 constexpr std::size_t kProbeColumnIndex = 7;
+constexpr std::uint64_t kJoinOperatorId = 41;
 constexpr auto kConcurrencyTimeout      = std::chrono::seconds{30};
 
 using sirius::op::dynamic_filter_publish_plan;
@@ -118,22 +121,55 @@ constexpr auto kInt64 = cudf::data_type{cudf::type_id::INT64};
 
 template <typename MemoryManager>
 std::vector<sirius::op::dynamic_filter_replica_space> get_replica_spaces(
-  MemoryManager& memory_manager)
+  MemoryManager& memory_manager, std::size_t expected_device_count = 1)
 {
   auto const gpu_spaces  = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   auto const host_spaces = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
-  REQUIRE(gpu_spaces.size() == 1);
+  REQUIRE(gpu_spaces.size() == expected_device_count);
   REQUIRE_FALSE(host_spaces.empty());
 
-  auto* gpu_space = memory_manager.get_memory_space(cucascade::memory::Tier::GPU,
-                                                    gpu_spaces.front()->get_device_id());
-  REQUIRE(gpu_space != nullptr);
-  auto const local_host =
-    std::find_if(host_spaces.begin(), host_spaces.end(), [gpu_space](auto const* host_space) {
-      return host_space->get_device_id() == gpu_space->get_device_id();
-    });
-  auto const* host_space = local_host == host_spaces.end() ? host_spaces.front() : *local_host;
-  return {{*gpu_space, *host_space}};
+  std::vector<sirius::op::dynamic_filter_replica_space> result;
+  result.reserve(gpu_spaces.size());
+  for (auto const* gpu_space_view : gpu_spaces) {
+    auto* gpu_space = memory_manager.get_memory_space(cucascade::memory::Tier::GPU,
+                                                      gpu_space_view->get_device_id());
+    REQUIRE(gpu_space != nullptr);
+    auto const local_host =
+      std::find_if(host_spaces.begin(), host_spaces.end(), [gpu_space](auto const* host_space) {
+        return host_space->get_device_id() == gpu_space->get_device_id();
+      });
+    auto const* host_space = local_host == host_spaces.end() ? host_spaces.front() : *local_host;
+    result.emplace_back(*gpu_space, *host_space);
+  }
+  std::sort(result.begin(), result.end(), [](auto const& lhs, auto const& rhs) {
+    return lhs.get_gpu_space().get_device_id() < rhs.get_gpu_space().get_device_id();
+  });
+  return result;
+}
+
+std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> make_per_thread_memory_manager(
+  std::size_t n_gpus)
+{
+  cucascade::memory::reservation_manager_configurator builder;
+  builder.set_number_of_gpus(n_gpus)
+    .set_gpu_usage_limit(256ull << 20)
+    .set_reservation_fraction_per_gpu(0.75)
+    .set_per_numa_region_capacity(512ull << 20)
+    .use_gpu_id_as_host_id()
+    .track_reservation_per_stream(false)
+    .set_reservation_fraction_per_numa_region(0.75);
+  return std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
+}
+
+bool require_two_gpus()
+{
+  int count      = 0;
+  auto const err = cudaGetDeviceCount(&count);
+  if (err != cudaSuccess || count < 2) {
+    WARN("dynamic-filter accumulator reservation test requires two visible GPUs; skipping");
+    return false;
+  }
+  return true;
 }
 
 // Build an admitted INT64 key; a nonzero domain marks it unique and enables coverage gating.
@@ -376,6 +412,22 @@ dynamic_filter_publish_plan make_accumulator_plan(
                                                    .probe_storage_type   = kInt64}}});
   return dynamic_filter_publish_plan{
     {make_int64_key(0, 0)}, std::move(targets), std::move(fixture.replica_spaces), policy};
+}
+
+dynamic_filter_publish_plan make_accumulator_plan_from_spaces(
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> const& channel,
+  std::vector<sirius::op::dynamic_filter_replica_space> replica_spaces,
+  sirius::op::dynamic_filter_publication_policy policy = {})
+{
+  std::vector<dynamic_filter_publish_plan::probe_target> targets;
+  targets.push_back({.filter_set               = channel,
+                     .route_class              = dynamic_filter_route_class::scan,
+                     .accepts_zone_map_filters = false,
+                     .key_bindings             = {{.admitted_key_index   = 0,
+                                                   .channel_push_ordinal = kProbeColumnIndex,
+                                                   .probe_storage_type   = kInt64}}});
+  return dynamic_filter_publish_plan{
+    {make_int64_key(0, 0)}, std::move(targets), std::move(replica_spaces), policy};
 }
 
 cudf::table_view one_column_view(cudf::column const& column)
@@ -1195,6 +1247,9 @@ TEST_CASE("multi-partition accumulator publishes only after every exact build ID
   auto const last =
     accumulator.contribute(202, one_column_view(*fixture.columns[1]), fixture.stream);
   REQUIRE(last.state == sirius::op::dynamic_filter_accumulation_result::status::published);
+  REQUIRE(last.exact_contribution_count == 2);
+  REQUIRE(last.global_build_rows == 6);
+  REQUIRE(last.root_device_id == kDeviceId);
   REQUIRE(last.publication.keys_skipped_bloom_size_gate == 0);
   REQUIRE(accumulator.complete());
   REQUIRE_FALSE(accumulator.aborted());
@@ -1253,6 +1308,9 @@ TEST_CASE("zero-row accumulated snapshots complete without constructing a Bloom"
   auto const last =
     accumulator.contribute(202, one_column_view(*fixture.columns[1]), fixture.stream);
   REQUIRE(last.state == sirius::op::dynamic_filter_accumulation_result::status::published);
+  REQUIRE(last.exact_contribution_count == 2);
+  REQUIRE(last.global_build_rows == 0);
+  REQUIRE(last.root_device_id == kDeviceId);
   REQUIRE(last.publication.membership_filters_built == 0);
   REQUIRE(last.publication.filters_pushed == 0);
   REQUIRE(accumulator.complete());
@@ -1277,9 +1335,12 @@ TEST_CASE("publication session excludes one-shot and accumulated paths",
     session.publish_one_shot(fixture.build_view(), fixture.stream);
     REQUIRE(channel->empty());
 
-    session.contribute(101, one_column_view(*fixture.columns[0]), fixture.stream);
-    session.contribute(202, one_column_view(*fixture.columns[1]), fixture.stream);
+    session.contribute(kJoinOperatorId, 101, one_column_view(*fixture.columns[0]), fixture.stream);
+    session.contribute(kJoinOperatorId, 202, one_column_view(*fixture.columns[1]), fixture.stream);
     REQUIRE(channel->filter_count() == 1);
+    auto const events = stats.event_snapshot();
+    REQUIRE(events.last_event_id == 1);
+    REQUIRE(events.records.size() == 1);
   }
 
   SECTION("one-shot claim excludes accumulator arming")
@@ -1287,8 +1348,9 @@ TEST_CASE("publication session excludes one-shot and accumulated paths",
     session.publish_one_shot(fixture.build_view(), fixture.stream);
     REQUIRE(channel->filter_count() == 1);
     REQUIRE_FALSE(session.try_arm(make_complete_build_snapshot(6, {101, 202})));
-    session.contribute(101, one_column_view(*fixture.columns[0]), fixture.stream);
+    session.contribute(kJoinOperatorId, 101, one_column_view(*fixture.columns[0]), fixture.stream);
     REQUIRE(channel->filter_count() == 1);
+    REQUIRE(stats.event_snapshot().records.empty());
   }
 
   REQUIRE(stats.publication_attempts.load() == 1);
@@ -1346,12 +1408,13 @@ TEST_CASE("publication failure cleanup survives a throwing log sink",
   {
     scoped_throwing_log_sink throwing_sink;
     REQUIRE(session.try_arm(make_complete_build_snapshot(6, {101, 202})));
-    session.contribute(999, one_column_view(*fixture.columns[0]), fixture.stream);
+    session.contribute(kJoinOperatorId, 999, one_column_view(*fixture.columns[0]), fixture.stream);
   }
 
   REQUIRE(stats.publication_attempts.load() == 1);
   REQUIRE(stats.publications_failed.load() == 1);
   REQUIRE(stats.publications_finished.load() == 0);
+  REQUIRE(stats.event_snapshot().records.empty());
   REQUIRE(channel->empty());
 }
 
@@ -1375,6 +1438,7 @@ TEST_CASE("incomplete-session cleanup survives a throwing log sink",
   REQUIRE(stats.publication_attempts.load() == 1);
   REQUIRE(stats.publications_failed.load() == 1);
   REQUIRE(stats.publications_finished.load() == 0);
+  REQUIRE(stats.event_snapshot().records.empty());
   REQUIRE(channel->empty());
 }
 
@@ -1390,9 +1454,9 @@ TEST_CASE("successful accumulated session folds statistics exactly once",
   sirius::op::dynamic_filter_publication_session session(plan, &stats, true);
 
   REQUIRE(session.try_arm(make_complete_build_snapshot(6, {101, 202})));
-  session.contribute(101, one_column_view(*fixture.columns[0]), fixture.stream);
+  session.contribute(kJoinOperatorId, 101, one_column_view(*fixture.columns[0]), fixture.stream);
   REQUIRE(stats.keys_considered.load() == 0);
-  session.contribute(202, one_column_view(*fixture.columns[1]), fixture.stream);
+  session.contribute(kJoinOperatorId, 202, one_column_view(*fixture.columns[1]), fixture.stream);
 
   REQUIRE(channel->filter_count() == 1);
   REQUIRE(stats.producers_enabled.load() == 1);
@@ -1402,8 +1466,18 @@ TEST_CASE("successful accumulated session folds statistics exactly once",
   REQUIRE(stats.filters_pushed.load() == 1);
   REQUIRE(stats.publications_finished.load() == 1);
   REQUIRE(stats.publications_failed.load() == 0);
+  auto const first_events = stats.event_snapshot();
+  REQUIRE(first_events.last_event_id == 1);
+  REQUIRE(first_events.records.size() == 1);
+  CHECK(first_events.records[0].join_operator_id == kJoinOperatorId);
+  CHECK(first_events.records[0].exact_contribution_count == 2);
+  CHECK(first_events.records[0].device_id == kDeviceId);
+  CHECK(first_events.records[0].build_rows == 6);
+  CHECK(first_events.records[0].filters_built == 1);
+  CHECK(first_events.records[0].active_targets == 1);
+  CHECK(first_events.records[0].filters_pushed == 1);
 
-  session.contribute(202, one_column_view(*fixture.columns[1]), fixture.stream);
+  session.contribute(kJoinOperatorId, 202, one_column_view(*fixture.columns[1]), fixture.stream);
   session.finalize_or_abort();
   session.finalize_or_abort();
   REQUIRE(channel->filter_count() == 1);
@@ -1412,6 +1486,9 @@ TEST_CASE("successful accumulated session folds statistics exactly once",
   REQUIRE(stats.filters_pushed.load() == 1);
   REQUIRE(stats.publications_finished.load() == 1);
   REQUIRE(stats.publications_failed.load() == 0);
+  auto const final_events = stats.event_snapshot();
+  REQUIRE(final_events.last_event_id == 1);
+  REQUIRE(final_events.records.size() == 1);
 }
 
 TEST_CASE("drained targets complete an accumulated session without fan-out",
@@ -1427,8 +1504,8 @@ TEST_CASE("drained targets complete an accumulated session without fan-out",
   sirius::op::dynamic_filter_publication_session session(plan, &stats, true);
 
   REQUIRE(session.try_arm(make_complete_build_snapshot(6, {101, 202})));
-  session.contribute(101, one_column_view(*fixture.columns[0]), fixture.stream);
-  session.contribute(202, one_column_view(*fixture.columns[1]), fixture.stream);
+  session.contribute(kJoinOperatorId, 101, one_column_view(*fixture.columns[0]), fixture.stream);
+  session.contribute(kJoinOperatorId, 202, one_column_view(*fixture.columns[1]), fixture.stream);
 
   REQUIRE(channel->empty());
   REQUIRE(stats.publication_attempts.load() == 1);
@@ -1438,6 +1515,16 @@ TEST_CASE("drained targets complete an accumulated session without fan-out",
   REQUIRE(stats.filters_pushed.load() == 0);
   REQUIRE(stats.publications_finished.load() == 1);
   REQUIRE(stats.publications_failed.load() == 0);
+  auto const events = stats.event_snapshot();
+  REQUIRE(events.last_event_id == 1);
+  REQUIRE(events.records.size() == 1);
+  CHECK(events.records[0].join_operator_id == kJoinOperatorId);
+  CHECK(events.records[0].exact_contribution_count == 2);
+  CHECK(events.records[0].device_id == kDeviceId);
+  CHECK(events.records[0].build_rows == 6);
+  CHECK(events.records[0].filters_built == 0);
+  CHECK(events.records[0].active_targets == 0);
+  CHECK(events.records[0].filters_pushed == 0);
 }
 
 TEST_CASE("multi-partition Bloom admission accounts for every key on one GPU",
@@ -1687,12 +1774,13 @@ TEST_CASE("finalize wins against an in-flight final contribution",
   sirius::op::dynamic_filter_stats stats;
   sirius::op::dynamic_filter_publication_session session(plan, &stats, true, std::move(hooks));
   REQUIRE(session.try_arm(make_complete_build_snapshot(6, {101, 202})));
-  session.contribute(101, one_column_view(*fixture.columns[0]), fixture.stream);
+  session.contribute(kJoinOperatorId, 101, one_column_view(*fixture.columns[0]), fixture.stream);
 
   rmm::cuda_stream final_stream{rmm::cuda_stream::flags::non_blocking};
   auto final_future             = std::async(std::launch::async, [&] {
     rmm::cuda_set_device_raii device{rmm::cuda_device_id{kDeviceId}};
-    session.contribute(202, one_column_view(*fixture.columns[1]), final_stream.view());
+    session.contribute(
+      kJoinOperatorId, 202, one_column_view(*fixture.columns[1]), final_stream.view());
   });
   auto const insertion_observed = final_insertion_complete.try_acquire_for(kConcurrencyTimeout);
   if (!insertion_observed) { release_final_contribution.release(); }
@@ -1712,6 +1800,7 @@ TEST_CASE("finalize wins against an in-flight final contribution",
   REQUIRE(channel->empty());
   REQUIRE(stats.publications_failed.load() == 1);
   REQUIRE(stats.publications_finished.load() == 0);
+  REQUIRE(stats.event_snapshot().records.empty());
 }
 
 TEST_CASE("final contribution wins against finalization after publication",
@@ -1738,12 +1827,13 @@ TEST_CASE("final contribution wins against finalization after publication",
   sirius::op::dynamic_filter_stats stats;
   sirius::op::dynamic_filter_publication_session session(plan, &stats, true, std::move(hooks));
   REQUIRE(session.try_arm(make_complete_build_snapshot(6, {101, 202})));
-  session.contribute(101, one_column_view(*fixture.columns[0]), fixture.stream);
+  session.contribute(kJoinOperatorId, 101, one_column_view(*fixture.columns[0]), fixture.stream);
 
   rmm::cuda_stream final_stream{rmm::cuda_stream::flags::non_blocking};
   auto final_future               = std::async(std::launch::async, [&] {
     rmm::cuda_set_device_raii device{rmm::cuda_device_id{kDeviceId}};
-    session.contribute(202, one_column_view(*fixture.columns[1]), final_stream.view());
+    session.contribute(
+      kJoinOperatorId, 202, one_column_view(*fixture.columns[1]), final_stream.view());
   });
   auto const publication_observed = publication_complete.try_acquire_for(kConcurrencyTimeout);
   if (!publication_observed) { release_terminal_commit.release(); }
@@ -1765,6 +1855,10 @@ TEST_CASE("final contribution wins against finalization after publication",
   REQUIRE(stats.filters_pushed.load() == 1);
   REQUIRE(stats.publications_failed.load() == 0);
   REQUIRE(stats.publications_finished.load() == 1);
+  auto const events = stats.event_snapshot();
+  REQUIRE(events.last_event_id == 1);
+  REQUIRE(events.records.size() == 1);
+  CHECK(events.records[0].join_operator_id == kJoinOperatorId);
 }
 
 TEST_CASE("a late invalid contribution cannot overturn completed publication",
@@ -1791,18 +1885,19 @@ TEST_CASE("a late invalid contribution cannot overturn completed publication",
   sirius::op::dynamic_filter_stats stats;
   sirius::op::dynamic_filter_publication_session session(plan, &stats, true, std::move(hooks));
   REQUIRE(session.try_arm(make_complete_build_snapshot(6, {101, 202})));
-  session.contribute(101, one_column_view(*fixture.columns[0]), fixture.stream);
+  session.contribute(kJoinOperatorId, 101, one_column_view(*fixture.columns[0]), fixture.stream);
 
   rmm::cuda_stream final_stream{rmm::cuda_stream::flags::non_blocking};
   auto final_future               = std::async(std::launch::async, [&] {
     rmm::cuda_set_device_raii device{rmm::cuda_device_id{kDeviceId}};
-    session.contribute(202, one_column_view(*fixture.columns[1]), final_stream.view());
+    session.contribute(
+      kJoinOperatorId, 202, one_column_view(*fixture.columns[1]), final_stream.view());
   });
   auto const publication_observed = publication_complete.try_acquire_for(kConcurrencyTimeout);
   if (!publication_observed) { release_terminal_commit.release(); }
   REQUIRE(publication_observed);
 
-  session.contribute(999, one_column_view(*fixture.columns[0]), fixture.stream);
+  session.contribute(kJoinOperatorId, 999, one_column_view(*fixture.columns[0]), fixture.stream);
   REQUIRE(channel->filter_count() == 1);
   REQUIRE(stats.publications_failed.load() == 0);
   REQUIRE(stats.publications_finished.load() == 0);
@@ -1815,6 +1910,7 @@ TEST_CASE("a late invalid contribution cannot overturn completed publication",
   REQUIRE(stats.filters_pushed.load() == 1);
   REQUIRE(stats.publications_failed.load() == 0);
   REQUIRE(stats.publications_finished.load() == 1);
+  REQUIRE(stats.event_snapshot().records.size() == 1);
 }
 
 TEST_CASE("a throwing pending-result hook cannot overturn concurrent completed publication",
@@ -1858,7 +1954,8 @@ TEST_CASE("a throwing pending-result hook cannot overturn concurrent completed p
   rmm::cuda_stream first_stream{rmm::cuda_stream::flags::non_blocking};
   auto first_contribution     = std::async(std::launch::async, [&] {
     rmm::cuda_set_device_raii device{rmm::cuda_device_id{kDeviceId}};
-    session.contribute(101, one_column_view(*fixture.columns[0]), first_stream.view());
+    session.contribute(
+      kJoinOperatorId, 101, one_column_view(*fixture.columns[0]), first_stream.view());
   });
   auto const pending_observed = pending_result_reached.try_acquire_for(kConcurrencyTimeout);
   if (!pending_observed) {
@@ -1870,7 +1967,8 @@ TEST_CASE("a throwing pending-result hook cannot overturn concurrent completed p
   rmm::cuda_stream final_stream{rmm::cuda_stream::flags::non_blocking};
   auto final_contribution       = std::async(std::launch::async, [&] {
     rmm::cuda_set_device_raii device{rmm::cuda_device_id{kDeviceId}};
-    session.contribute(202, one_column_view(*fixture.columns[1]), final_stream.view());
+    session.contribute(
+      kJoinOperatorId, 202, one_column_view(*fixture.columns[1]), final_stream.view());
   });
   auto const published_observed = published_result_reached.try_acquire_for(kConcurrencyTimeout);
   if (!published_observed) {
@@ -1900,6 +1998,12 @@ TEST_CASE("a throwing pending-result hook cannot overturn concurrent completed p
   REQUIRE(stats.filters_pushed.load() == 1);
   REQUIRE(stats.publications_finished.load() == 1);
   REQUIRE(stats.publications_failed.load() == 0);
+  auto const events = stats.event_snapshot();
+  REQUIRE(events.last_event_id == 1);
+  REQUIRE(events.records.size() == 1);
+  CHECK(events.records[0].exact_contribution_count == 2);
+  CHECK(events.records[0].build_rows == 6);
+  CHECK(events.records[0].device_id == kDeviceId);
 }
 
 TEST_CASE("a throwing aborted-result hook preserves the accumulator outcome",
@@ -1919,11 +2023,12 @@ TEST_CASE("a throwing aborted-result hook preserves the accumulator outcome",
   sirius::op::dynamic_filter_publication_session session(plan, &stats, true, std::move(hooks));
   REQUIRE(session.try_arm(make_complete_build_snapshot(6, {101, 202})));
 
-  session.contribute(999, one_column_view(*fixture.columns[0]), fixture.stream);
+  session.contribute(kJoinOperatorId, 999, one_column_view(*fixture.columns[0]), fixture.stream);
   REQUIRE(stats.publication_attempts.load() == 1);
   REQUIRE(stats.keys_considered.load() == 1);
   REQUIRE(stats.publications_finished.load() == 0);
   REQUIRE(stats.publications_failed.load() == 1);
+  REQUIRE(stats.event_snapshot().records.empty());
   REQUIRE(channel->empty());
 }
 
@@ -1975,6 +2080,91 @@ TEST_CASE("strict replica failure aborts before any accumulator fan-out",
   REQUIRE(failed.publication.filters_pushed == 0);
   REQUIRE(accumulator.aborted());
   REQUIRE(channel->empty());
+}
+
+TEST_CASE("the final contribution GPU roots strict replication under per-thread reservations",
+          "[dynamic_filter][publisher][accumulator][mgpu][reservation]")
+{
+  if (!require_two_gpus()) { return; }
+
+  constexpr int first_device                  = 0;
+  constexpr int final_device                  = 1;
+  constexpr std::size_t rows_per_contribution = 3;
+  auto memory_manager                         = make_per_thread_memory_manager(2);
+  auto replica_spaces                         = get_replica_spaces(*memory_manager, 2);
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto plan    = make_accumulator_plan_from_spaces(channel, replica_spaces);
+  sirius::op::dynamic_filter_accumulator accumulator(
+    plan, make_complete_build_snapshot(2 * rows_per_contribution, {101, 202}));
+
+  std::unique_ptr<cudf::column> first_column;
+  {
+    rmm::cuda_set_device_raii device{rmm::cuda_device_id{first_device}};
+    auto& space       = replica_spaces[0].get_gpu_space();
+    auto const stream = space.acquire_stream();
+    first_column      = cudf::sequence(rows_per_contribution,
+                                  cudf::numeric_scalar<std::int64_t>(0, true, stream),
+                                  cudf::numeric_scalar<std::int64_t>(1, true, stream),
+                                  stream,
+                                  space.get_default_allocator());
+    stream.synchronize();
+    auto const first = accumulator.contribute(101, one_column_view(*first_column), stream);
+    REQUIRE(first.state == sirius::op::dynamic_filter_accumulation_result::status::pending);
+  }
+
+  std::unique_ptr<cudf::column> final_column;
+  {
+    rmm::cuda_set_device_raii device{rmm::cuda_device_id{final_device}};
+    auto& space       = replica_spaces[1].get_gpu_space();
+    auto const stream = space.acquire_stream();
+    final_column =
+      cudf::sequence(rows_per_contribution,
+                     cudf::numeric_scalar<std::int64_t>(rows_per_contribution, true, stream),
+                     cudf::numeric_scalar<std::int64_t>(1, true, stream),
+                     stream,
+                     space.get_default_allocator());
+    stream.synchronize();
+
+    // Match gpu_pipeline_task::execute: PER_THREAD tracking occupies GPU 1's adaptor for the
+    // whole contribution, regardless of which stream strict replication later acquires.
+    auto task_reservation = space.make_reservation_or_null(16ull << 20);
+    REQUIRE(task_reservation != nullptr);
+    auto* allocator =
+      task_reservation
+        ->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
+    REQUIRE(allocator != nullptr);
+    REQUIRE(allocator->attach_reservation_to_tracker(stream, std::move(task_reservation)));
+    struct tracker_reset {
+      cucascade::memory::reservation_aware_resource_adaptor* allocator;
+      rmm::cuda_stream_view stream;
+      ~tracker_reset() { allocator->reset_stream_reservation(stream); }
+    } reset{allocator, stream};
+
+    auto const last = accumulator.contribute(202, one_column_view(*final_column), stream);
+    REQUIRE(last.state == sirius::op::dynamic_filter_accumulation_result::status::published);
+    REQUIRE(last.exact_contribution_count == 2);
+    REQUIRE(last.global_build_rows == 2 * rows_per_contribution);
+    REQUIRE(last.root_device_id == final_device);
+    REQUIRE(accumulator.complete());
+
+    auto const filters = channel->filters_for_column(kProbeColumnIndex);
+    REQUIRE(filters.size() == 1);
+    auto const* bloom =
+      dynamic_cast<sirius::op::sirius_dynamic_bloom_filter const*>(filters.front().get());
+    REQUIRE(bloom != nullptr);
+    REQUIRE(bloom->is_available_on_device(first_device));
+    REQUIRE(bloom->is_available_on_device(final_device));
+  }
+
+  // Destroy every device allocation under its owning CUDA context.
+  {
+    rmm::cuda_set_device_raii device{rmm::cuda_device_id{final_device}};
+    final_column.reset();
+  }
+  {
+    rmm::cuda_set_device_raii device{rmm::cuda_device_id{first_device}};
+    first_column.reset();
+  }
 }
 
 TEST_CASE("equal-geometry Bloom partials OR into the root without false negatives",
