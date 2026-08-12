@@ -1,7 +1,7 @@
 # Multi-partition dynamic filters: implemented design and engineering handoff
 
-**Date:** 2026-08-10
-**Status:** Implemented behind a default-off switch with a per-GPU Bloom policy cap; single-GPU build and focused validation complete; multi-GPU runtime validation deferred
+**Date:** 2026-08-12
+**Status:** Implemented behind a default-off switch with a per-GPU Bloom policy cap; single-GPU focused validation and TPC-H SF1000 evaluation complete; multi-GPU runtime validation deferred
 **Base:** PR #1277 head `49de08e8`, integrated by merge commit `bdeaa56b`
 **Audience:** Engineers and reviewers extending, validating, or enabling the feature
 
@@ -9,7 +9,7 @@
 
 Sirius should use one globally complete Bloom filter per eligible join key for a hash-partitioned build. The filter is built incrementally from the original build batches before hash scatter. On multiple GPUs, each producing GPU builds an equal-geometry partial, the partials are bitwise-OR reduced on a deterministic root GPU, and the complete result is replicated before it is published through the existing dynamic-filter channels.
 
-This is implemented as an extension of PR #1277. It is controlled by `enable_dynamic_filter_multi_partition`, which defaults to `false` and is subordinate to the existing `enable_dynamic_filter` master switch. Bloom construction is additionally bounded by `max_dynamic_filter_bloom_bytes_per_gpu`, default 256 MiB per producing join on each GPU. The default multi-partition switch remains off because the measured TPC-H benefit on the current single-GPU system is zero and multi-GPU runtime testing belongs on another machine.
+This is implemented as an extension of PR #1277. It is controlled by `enable_dynamic_filter_multi_partition`, which defaults to `false` and is subordinate to the existing `enable_dynamic_filter` master switch. Bloom construction is additionally bounded by `max_dynamic_filter_bloom_bytes_per_gpu`, default 256 MiB per producing join on each GPU. A controlled TPC-H SF1000 study measured 5.93% lower paired-block suite runtime than one-shot-only mode and 9.31% lower equal-query cohort runtime for the three true multi-build-batch publications. The switch remains off by default because the result used an activation-oriented single-GPU configuration and multi-GPU runtime evaluation is still outstanding. See `DYNAMIC_FILTER_TPCH_SF1000_EVAL.md` for the complete methodology and qualification.
 
 Partition-specific filters delivered to `CONCAT` are not the primary architecture. They would become available after probe partitioning and scatter, require the consumer to reproduce or carry the exact partition identity, and would not fit the current global channel semantics without a new filter kind and routing contract. The global Bloom reuses the existing post-scan consumer, preserves one membership predicate for the whole join key, and keeps the exact hash join authoritative.
 
@@ -19,7 +19,7 @@ Partition-specific filters delivered to `CONCAT` are not the primary architectur
 |---|---|---|
 | Feature control | Master switch plus default-off multi-partition subordinate switch in YAML and SQL | Unit and SQL tests pass |
 | Bloom admission | Per-join, per-GPU allocator-accounted bit-array cap across all Bloom keys; fail-open all-or-none skip | Boundary, one-shot, accumulator, and planned-policy tests pass |
-| Build snapshot | Exact pre-scatter batch IDs and row count frozen at the build `PARTITION` FULL barrier | Unit/integration coverage and static review |
+| Build snapshot | Validated `complete_build_snapshot` with exact pre-scatter IDs, global row count, and partition count frozen at the build `PARTITION` FULL barrier | Focused summary/validation and integration coverage |
 | Single GPU | Incremental global Bloom with one `add` per exact build contribution | Focused GPU tests pass |
 | Multiple GPUs | One full-geometry partial per producing GPU, deterministic-root OR, strict replication, then fan-out | Compiles; runtime evaluation deferred |
 | Existing one-shot path | Preserved for whole single-partition and broadcast builds | Existing PR #1277 behavior retained |
@@ -64,38 +64,39 @@ The cap applies to both the whole-build one-shot path and multi-partition accumu
 
 ## 5. Build snapshot and contribution identity
 
-The build `PARTITION` input is a FULL pipeline barrier. After the partition strategy is known and before the first source batch is removed, `sirius_physical_partition` freezes:
+The build `PARTITION` input is a FULL pipeline barrier. After the partition strategy is known and before the first source batch is removed, `sirius_physical_partition::try_freeze_complete_build` freezes a move-owned `complete_build_snapshot`:
 
 - the exact original data-batch ID set;
 - the exact global build row count;
 - the selected number of hash partitions.
 
-The snapshot succeeds only when the source pipeline is finished, every snapshotted representation is GPU resident, and row-count accumulation does not overflow. Arming additionally requires a non-empty unique ID set. Otherwise the optional publication is not armed.
+`sirius_physical_partition::try_freeze_complete_build` succeeds only when the source pipeline is finished, every snapshotted representation is GPU resident, and row-count accumulation does not overflow. It then calls `complete_build_snapshot::try_create`, which validates a non-empty unique ID set, a partition count greater than one, and a global row count representable as `std::size_t`. Zero build rows are valid. Moving the snapshot invalidates its source; `dynamic_filter_publication_session::try_arm` rejects invalid or moved-from values before claiming the session or incrementing `publication_attempts`.
 
-Each call to `sirius_physical_partition::execute` contributes the original batch ID and the admitted build-key columns before `gpu_partition_impl` scatters the table. The pre-scatter ID is the stable retry identity. Hash partition outputs are never treated as independent logical contributions.
+`pipelineable_operator_data` captures the original task-input ID when the repository batch is popped. Cross-GPU preparation may replace that batch with a fresh-ID physical clone, and retry can retain the clone, but each call to `sirius_physical_partition::execute` contributes the unchanged task-input ID and the admitted build-key columns before `gpu_partition_impl` scatters the table. Hash partition outputs are never treated as independent logical contributions.
 
 This design also handles strategies whose sizing decision is driven by the sibling partition: arming occurs on the build `PARTITION` only after the shared strategy is fixed and its own FULL source is complete.
 
 ## 6. Publication lifecycle
 
-The hash join owns the arbitration state:
+The hash-join-owned `dynamic_filter_publication_session` owns the arbitration state:
 
 ```text
                          +-> PUBLISHING -> FINISHED
                          |                `-> FAILED
 OPEN --one-shot claim---+
   |
-  +--accumulator claim----> ACCUMULATING -> FINISHED
-  |                                         `-> FAILED
+  +--successful accumulator initialization-> ACCUMULATING -> FINISHED
+  |                                                          `-> FAILED
+  +--failed accumulator initialization-------------------------------> FAILED
   |
   `--finalize unclaimed--------------------> CLOSED
 ```
 
-The one-shot and accumulator paths claim `OPEN` under `op_state_mutex`, so they cannot both publish. Arming installs the exact-ID accumulator and changes the state to `ACCUMULATING`. A complete accumulator moves that state to `FINISHED`; a construction, reduction, replica, or incomplete-finalization failure moves it to `FAILED`.
+The one-shot and accumulator paths claim `OPEN` under the session mutex, so they cannot both publish. `publication_attempts` increments when a one-shot claim succeeds or when accumulated-claim initialization begins; accumulator-construction failure therefore records both an attempt and a failure. Arming installs the exact-ID accumulator and changes the state to `ACCUMULATING`. A complete accumulator moves that state to `FINISHED`; a construction, reduction, replica, or incomplete-finalization failure moves it to `FAILED`. GPU construction, insertion, synchronization, reduction, replication, and fan-out run without the session mutex or `op_state_mutex`. Source-not-resident and build-not-whole diagnostics increment only while the session remains `OPEN`.
 
-`on_finalize_operator` never manufactures a filter. It closes an unclaimed `OPEN` window or aborts an `ACCUMULATING` window that is still missing an expected contribution.
+`sirius_physical_hash_join::on_finalize_operator` delegates to `dynamic_filter_publication_session::finalize_or_abort`, which never manufactures a filter. It closes an unclaimed `OPEN` window or aborts an `ACCUMULATING` window that is still missing an expected contribution.
 
-Counters are committed once by the hash join after the accumulator reports its terminal result. This preserves the existing dynamic-filter statistics surface for attempts, success, failure, policy decisions, filters built, active targets, and accepted pushes.
+`dynamic_filter_publication_session` folds each terminal outcome exactly once. An accumulator-construction failure has no outcome and records failure directly. This preserves the existing counters for attempts, success, failure, policy decisions, filters built, drained targets, and accepted pushes.
 
 ## 7. Accumulator contract
 
@@ -114,7 +115,7 @@ For each contribution:
 
 Different GPUs use different partial mutexes and can insert concurrently. Contributions on the same GPU serialize. Coordinator state is not held during ordinary insertion, but the final contribution performs reduction, replication, and fan-out while holding the accumulator coordinator mutex. That simple exactly-once policy is acceptable for a default-off first implementation, but its scheduling cost should be measured.
 
-A runtime type mismatch aborts the entire optional publication. The all-key preflight prevents a contribution from updating one key before discovering that another key is incompatible. Previously completed private partials remain unreachable and are never fanned out.
+A runtime type mismatch aborts the entire optional publication. The all-key preflight prevents a contribution from updating one key before discovering that another key is incompatible. Previously completed private partials remain unreachable and are never fanned out. When the session commits any terminal result, it drops its accumulator reference; an in-flight caller's local shared reference keeps the accumulator valid until that call returns.
 
 ## 8. Single-GPU completion
 
@@ -157,8 +158,10 @@ The implementation maintains these invariants:
 6. Missing, unknown, incompatible, or failed contributions cannot produce a filter.
 7. The exact hash join remains present and authoritative.
 8. Optional-filter absence is a safe pass-through.
+9. A validated zero-row snapshot completes successfully without constructing or publishing a Bloom.
+10. Once publication completes, a late duplicate or invalid contribution cannot replace its terminal success.
 
-Construction exceptions are caught at the accumulator boundary and close the publication attempt without fan-out. A best-effort stream drain runs after insertion or root-reduction failure before private storage can be released. An incomplete build at operator finalization is recorded as a failed publication. A target set that has already drained completes successfully with no filter.
+Construction exceptions are caught at the accumulator boundary and close the publication attempt without fan-out. A best-effort stream drain runs after one-shot construction, accumulated insertion, or root-reduction failure before source or private storage can be released; the one-shot path preserves the original exception after its drain. Mandatory abort and terminal accounting happen before best-effort logging, so logging failures cannot escape contribution or finalization cleanup or replace the original one-shot exception. An incomplete build at operator finalization is recorded as a failed publication. A target set that has already drained completes successfully with no filter; because accumulated policy is evaluated when the session is armed, that terminal result may retain deterministic policy counters alongside the drained-target counter. Terminal resolution is read atomically from the accumulator, so a throwing in-flight caller cannot replace another caller's completed publication or discard an aborted outcome's counters.
 
 A CUDA failure that also makes ordinary query execution unusable can still surface later through the normal execution path. The dynamic-filter layer does not claim to recover a poisoned device or stream; it guarantees only that an incomplete optional predicate is not published.
 
@@ -173,6 +176,8 @@ For an allocator-accounted Bloom bit array of `m` bytes, `D` producing GPUs, `S`
 - transfer staging uses the existing planned host memory space.
 
 All allocations use the GPU allocators and replica/staging spaces captured by the immutable publish plan. Device guards make destruction and reduction device-correct. In particular, cuCO filter storage is constructed on a durable memory-space stream rather than an executor task stream, because its deleter retains the construction stream. Initialization is synchronized before the first task-stream insertion; contribution and failure paths drain task or reduction streams before private storage can be released.
+
+A terminal session transition releases its accumulator reference. Contributions that were already in flight retain a local shared reference until they return, so failure cleanup cannot invalidate active work; successful filters remain alive through their target channels. This prevents a failed optional publication from retaining private Bloom partials for the rest of the hash join's lifetime.
 
 Before Bloom construction, the producer requires `K * m <= max_dynamic_filter_bloom_bytes_per_gpu` on each GPU. The check uses division rather than overflowing multiplication and skips all `K` Bloom candidates when it fails. Destination replicas additionally acquire explicit scoped reservations. The one-shot source Bloom and per-device accumulator partials allocate through CuCascade's reservation-aware default GPU allocator without a separate up-front reservation; they remain allocator-accounted and hard-limit checked.
 
@@ -193,47 +198,63 @@ The earlier design evaluation found that placement can dominate filter-construct
 | Default and YAML option | `src/include/sirius_config.hpp`, `src/sirius_config.cpp` |
 | SQL option and setter | `src/sirius_extension.cpp` |
 | Effective planner gate | `src/planner/sirius_plan_comparison_join.cpp` |
-| Exact build snapshot and pre-scatter contribution | `src/include/op/sirius_physical_partition.hpp`, `src/op/sirius_physical_partition.cpp` |
-| Join ownership and state arbitration | `src/include/op/sirius_physical_hash_join.hpp`, `src/op/sirius_physical_hash_join.cpp` |
-| Exact-ID accumulator and fan-out | `src/include/op/dynamic_filter/dynamic_filter_publisher.hpp`, `src/op/dynamic_filter/dynamic_filter_publisher.cpp` |
+| Snapshot validation, session arbitration, terminal statistics, exact-ID accumulator, and fan-out | `src/include/op/dynamic_filter/dynamic_filter_publisher.hpp`, `src/op/dynamic_filter/dynamic_filter_publisher.cpp` |
+| PARTITION freezing and pre-scatter contribution | `src/include/op/sirius_physical_partition.hpp`, `src/op/sirius_physical_partition.cpp` |
+| Hash-join source readiness, routing, and session facade | `src/include/op/sirius_physical_hash_join.hpp`, `src/op/sirius_physical_hash_join.cpp` |
 | Empty Bloom, incremental add, strict replicas, chunked OR | `src/include/op/dynamic_filter/sirius_dynamic_filter.hpp`, `src/cuda/sirius_dynamic_bloom_filter.cu` |
 | Configuration tests | `test/cpp/config/test_config.cpp` |
-| Accumulator and reduction tests | `test/cpp/operator/test_dynamic_filter_publisher.cpp` |
-| Join state/finalization tests | `test/cpp/operator/test_dynamic_filter_publication_claim.cpp` |
+| Snapshot, accumulator, session, and reduction tests | `test/cpp/operator/test_dynamic_filter_publisher.cpp` |
+| Hash-join facade and build-delivery tests | `test/cpp/operator/test_dynamic_filter_publication_claim.cpp` |
 | SQL and result-parity integration | `test/cpp/integration/test_gpu_execution_dynamic_filter_sip.cpp` |
 
 ## 14. Validation completed on this machine
 
-The release build completes with:
+The release build completed with:
 
 ```bash
-/localhome/local-kkristensen/.pixi/bin/pixi run make
+pixi run ninja -C build/release -t clean sirius_extension sirius_loadable_extension sirius_unittest
+# cleaned 1,204 target files from the copied build tree
+SCCACHE_RECACHE=1 pixi run make
+# exit 0 after 1,210 steps in 483.1 seconds
+pixi run make
+# final exit 0 after 300 steps in 147.3 seconds
 ```
 
 Focused validation completed:
 
 ```bash
-/localhome/local-kkristensen/.pixi/bin/pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[accumulator],[bloom_reduction]"
-# 105 assertions in 10 test cases
+pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[partition_snapshot]"
+# 87 assertions in 5 test cases
 
-/localhome/local-kkristensen/.pixi/bin/pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[publication_claim]"
-# 54 assertions in 5 test cases
+pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[publisher]~[accumulator]~[publication_session]~[snapshot]"
+# 242 assertions in 19 test cases
 
-/localhome/local-kkristensen/.pixi/bin/pixi run build/release/extension/sirius/test/cpp/sirius_unittest "the dynamic-filter switch is consumed from the operator_params YAML section"
-# 4 assertions in 1 test case
+pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[accumulator]"
+# 135 assertions in 12 test cases
 
-/localhome/local-kkristensen/.pixi/bin/pixi run build/release/extension/sirius/test/cpp/sirius_unittest "the multi-partition dynamic-filter switch is exposed through SQL"
-# 13 assertions in 1 test case
+pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[publication_session]"
+# 189 assertions in 14 test cases
 
-/localhome/local-kkristensen/.pixi/bin/pixi run build/release/extension/sirius/test/cpp/sirius_unittest "gpu_execution - derived-build and build-block routes preserve results" -c "a multi-partition build obeys the subordinate switch"
-# 108 assertions in 1 test case
+pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[publication_claim]"
+# 144 assertions in 9 test cases
+
+pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[physical_partition]"
+# 1,720 assertions in 25 test cases
+
+pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[batch_lock_utils]"
+# 36 assertions in 9 test cases
+
+pixi run build/release/extension/sirius/test/cpp/sirius_unittest "gpu_execution - derived-build and build-block routes preserve results" -c "a multi-partition build obeys the subordinate switch"
+# 166 assertions in 1 test case
 ```
 
-Together these focused runs cover 284 assertions in 18 test cases.
+Together these commands executed 2,719 assertions across 94 selected test-case executions. The counts intentionally include overlap: `[accumulator]` and `[publication_claim]` rerun two hash-join facade cases, while three PARTITION claim cases run under `[partition_snapshot]`, `[publication_claim]`, and `[physical_partition]`.
+
+The executed focused runs cover structural and moved-from snapshot validation, direct accumulator rejection, PARTITION summarization, zero-row completion, exact-ID accounting, policy budgets, object lifetime, drained targets, one-shot-versus-accumulator mutual exclusion, exceptional one-shot stream drain with original-exception preservation, no-throw diagnostic cleanup, source-residency retry, real-repository freeze-before-pop and fail-open behavior, terminal statistics, strict replication failure, bounded contribution races, both finalize-versus-final-contribution winners, and late-invalid and terminal-result exception races. The physical PARTITION selection also preserves existing operator behavior.
 
 The integration test forces a non-broadcast multi-partition build. With the subordinate switch off, it preserves PR #1277 one-shot-only behavior and records the build-not-whole skip. With the subordinate switch on and the master on, it verifies result parity and observes producer, membership-filter, successful-publication, and pushed-filter counters. With the master off, the subordinate switch alone creates no producer.
 
-The full test suite and all `[mgpu]` tests were not run.
+The full test suite was not run. The broad selections discovered the two-GPU clone and preparation tests, but those branches warned and returned before device-1 work because only one GPU was visible. Their code compiled; physical multi-GPU execution was not exercised.
 
 ## 15. Deferred multi-GPU validation
 
@@ -267,12 +288,12 @@ The current implementation intentionally has these limits:
 - strict all-device replication can abandon a filter when only one target device fails;
 - the Bloom cap is per join rather than query-wide, excludes reduction scratch, and does not explicitly pre-reserve source partials;
 - the current counters do not break out per-device insert, reduction, and replication time;
-- no performance benefit was measured for TPC-H on the current box.
+- the completed SF1000 performance evidence is single-GPU and uses deliberate 1 GB (1,000,000,000 bytes) partition and CONCAT sizes to expose the path; production-natural activation and performance remain unmeasured.
 
-Therefore `enable_dynamic_filter_multi_partition` must remain false by default. Enable it explicitly for correctness validation and targeted performance work. Consider default enablement only after the deferred multi-GPU matrix passes and representative workloads show benefit or at least neutrality after construction, reduction, replication, and missed-readiness costs are included.
+Therefore `enable_dynamic_filter_multi_partition` must remain false by default. Enable it explicitly for correctness validation and targeted performance work. The SF1000 study shows that the architecture can pay for itself, most clearly on q10, but q8 was neutral and q16 was block-variable. Consider default enablement only after the deferred multi-GPU matrix and production-natural single-GPU configuration pass, with representative workloads showing benefit or at least neutrality after construction, reduction, replication, and missed-readiness costs are included.
 
 ## 17. Final engineering judgment
 
 The implemented architecture is the correct base for single- and multi-GPU Sirius: freeze exact pre-scatter build identity, construct one global-layout Bloom per key, OR producer partials, prepare complete replicas, and publish atomically through the existing channel.
 
-It preserves PR #1277, does not put dynamic-filter ownership into `CONCAT`, and keeps single- and multi-GPU semantics identical except for reduction. The default-off subordinate switch is the appropriate rollout boundary given the zero TPC-H gain on this machine and the intentionally deferred multi-GPU evidence.
+It preserves PR #1277, does not put dynamic-filter ownership into `CONCAT`, and keeps single- and multi-GPU semantics identical except for reduction. The controlled SF1000 result supports retaining this implementation, while the default-off subordinate switch remains the appropriate rollout boundary until production-natural and physical multi-GPU evidence are available.
