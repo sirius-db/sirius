@@ -1432,13 +1432,16 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     } catch (NotImplementedException&) {
       plan_is_copyable = false;
     }
+    // Hand the validated plan over instead of discarding it, so the first execution can skip
+    // an identical rebuild.
+    duckdb::unique_ptr<sirius::op::sirius_physical_operator> validated_sirius_plan;
     if (plan_is_copyable) {
-      planner.create_plan(std::move(validation_plan));
+      validated_sirius_plan = planner.create_plan(std::move(validation_plan));
     } else {
       // Validate by consuming the freshly re-planned logical_plan; the
-      // PhysicalSiriusExecution operator will re-plan again at execute time
-      // using the SQL string we cached above.
-      planner.create_plan(std::move(logical_plan));
+      // PhysicalSiriusExecution operator re-plans from the SQL string we
+      // cached above when the one-shot validated plan has been consumed.
+      validated_sirius_plan = planner.create_plan(std::move(logical_plan));
       logical_plan.reset();  // signal PhysicalSiriusExecution to use the SQL replan path
     }
 
@@ -1456,14 +1459,15 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
 
     // Create a new DuckDB PhysicalPlan containing our custom operator.
     auto new_physical_plan = make_uniq<PhysicalPlan>(Allocator::Get(context));
-    auto& sirius_op =
-      new_physical_plan->Make<sirius::transparent::PhysicalSiriusExecution>(std::move(logical_plan),
-                                                                            current_query_sql,
-                                                                            prepared.types,
-                                                                            prepared.names,
-                                                                            std::move(cpu_fallback),
-                                                                            plan_reads_s3,
-                                                                            0);
+    auto& sirius_op        = new_physical_plan->Make<sirius::transparent::PhysicalSiriusExecution>(
+      std::move(logical_plan),
+      current_query_sql,
+      prepared.types,
+      prepared.names,
+      std::move(cpu_fallback),
+      plan_reads_s3,
+      0,
+      std::move(validated_sirius_plan));
     new_physical_plan->SetRoot(sirius_op);
 
     // Replace the DuckDB CPU physical plan.
