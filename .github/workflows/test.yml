@@ -56,7 +56,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Init build submodules
-        run: ./scripts/init_build_submodules.sh
+        run: git submodule update --init --depth=1 --jobs 3 duckdb substrait cucascade
 
       - uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347 # v0.10.1
         with:
@@ -152,10 +152,19 @@ jobs:
         # band. avro comes in as an iceberg dependency but is named explicitly so a failure
         # says which extension is missing.
         #
-        # This resolves only because the build carries a real DuckDB version — see
-        # scripts/init_build_submodules.sh. Against a v0.0.1 build there is no extension
-        # repository to install from.
-        run: ./build/release/duckdb -c "INSTALL avro; INSTALL iceberg;"
+        # This resolves only because OVERRIDE_GIT_DESCRIBE (cmake/CMakePresets.json) gives the
+        # build a real DuckDB version. Against the dummy v0.0.1 a shallow submodule would
+        # otherwise produce, there is no extension repository to install from.
+        run: |
+          for attempt in 1 2 3; do
+            if ./build/release/duckdb -c "INSTALL avro; INSTALL iceberg;"; then
+              exit 0
+            fi
+            echo "::warning::Extension install attempt ${attempt} failed; retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          echo "::error::Could not install the avro and iceberg extensions after 3 attempts." >&2
+          exit 1
 
       - name: Run C++ unit tests
         run: |
