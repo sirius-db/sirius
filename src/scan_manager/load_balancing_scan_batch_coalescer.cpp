@@ -20,6 +20,7 @@
 #include "log/logging.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "scan_manager/readahead_scan_manager.hpp"
 
 #include <stop_token>
 #include <utility>
@@ -100,6 +101,16 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
   });
   auto& batch_queue = state.queue;
 
+  // Every exit from this function closes the slot through here.  The readahead
+  // cannot retire an operator until it knows no further split will be emitted,
+  // and that includes the failure paths: a slot that closed with an exception
+  // produces nothing more either.  Registration happens inside emit() on this
+  // same thread, so the close always follows the last register in program order.
+  auto close_slot = [&state](std::exception_ptr const& ex = nullptr) {
+    if (state.readahead) { state.readahead->mark_operator_closed(state.op_id); }
+    state.connector->close(ex);
+  };
+
   // Balance one coalesced batch onto a GPU and hand it to the connector.
   auto emit = [&state](std::unique_ptr<op::scan::scan_info> batch) {
     auto op_data = std::make_unique<op::scan::scan_operator_input>(
@@ -123,7 +134,7 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
       metadata_processing_state::provider_value_t entry;
       batch_queue.wait_dequeue(entry);
       if (entry.has_exception()) {
-        state.connector->close(entry.exception());
+        close_slot(entry.exception());
         return;
       }
 
@@ -145,7 +156,7 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
       metadata_processing_state::provider_value_t leftover;
       while (batch_queue.try_dequeue(leftover)) {
         if (leftover.has_exception()) {
-          state.connector->close(leftover.exception());
+          close_slot(leftover.exception());
           return;
         }
         if (leftover.is_empty()) { continue; }  // extra (e.g. stop) sentinel — ignore
@@ -158,15 +169,15 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
       for (auto& batch : final_batches) {
         emit(std::move(batch));
       }
-      state.connector->close();
+      close_slot();
     } catch (...) {
-      state.connector->close(std::current_exception());
+      close_slot(std::current_exception());
     }
     return;
   }
 
   // Stop requested between iterations — close so downstream consumers unblock.
-  state.connector->close();
+  close_slot();
 }
 
 void load_balancing_scan_batch_coalescer::process_cached_entries(metadata_processing_state& state,
@@ -188,6 +199,14 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(
   std::shared_ptr<readahead_scan_manager> readahead,
   std::size_t operator_id)
 {
+  // See process_provider_inputs: the readahead needs "no more splits" on every
+  // exit, success or failure, or the operator can never be retired.
+  auto close_slot = [&connector, &readahead, operator_id](
+                      std::exception_ptr const& ex = nullptr) {
+    if (readahead) { readahead->mark_operator_closed(operator_id); }
+    connector.close(ex);
+  };
+
   try {
     while (!stop.stop_requested()) {
       auto next = provider.get_next_batch();
@@ -225,12 +244,12 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(
       }
       break;  // end-of-stream
     }
-    connector.close();
+    close_slot();
   } catch (...) {
     // Surface the provider failure to the consumer: get_next_split() rethrows
     // once the queue drains. Without this close the connector never closes —
     // the dispatcher swallows task exceptions — and the query hangs silently.
-    connector.close(std::current_exception());
+    close_slot(std::current_exception());
   }
 }
 

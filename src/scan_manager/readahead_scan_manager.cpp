@@ -93,12 +93,18 @@ std::size_t readahead_scan_manager::ongoing_scans() const
 
 void readahead_scan_manager::prepare_for_query(const sirius::planner::query& query)
 {
-  reset();
-
   auto index = planner::query_index::build_index(query, planner::build_index_options{});
-  if (!index) { return; }
+  if (!index) {
+    reset();
+    return;
+  }
 
-  auto const order = index->prefetching_orders();
+  prepare_for_order(index->prefetching_orders());
+}
+
+void readahead_scan_manager::prepare_for_order(std::span<const planner::prefetch_step> order)
+{
+  reset();
 
   std::lock_guard lock{_mutex};
   for (auto const& step : order) {
@@ -132,10 +138,45 @@ bool readahead_scan_manager::is_operator_depleted(std::size_t operator_id) const
 {
   auto it = _by_operator.find(operator_id);
   if (it == _by_operator.end()) { return false; }
-  if (it->second.stage != io::cache::scan_stage::disposed) { return false; }
+  // The producer may still emit more splits, so an all-disposed split list says
+  // nothing yet.  Retirement is one-way in the scheduler -- see advance() -- so
+  // retiring here on a between-waves lull would drop the operator out of the
+  // prefetch order for the rest of the query.
+  if (!it->second.closed) { return false; }
   return std::ranges::all_of(it->second.tasks, [](task_entry const& t) {
     return t.task.expired() || t.stage == io::cache::scan_stage::disposed;
   });
+}
+
+void readahead_scan_manager::publish_stage_locked(std::size_t operator_id,
+                                                  io::cache::scan_stage reported)
+{
+  if (is_operator_depleted(operator_id)) {
+    _scheduler.update(operator_id, io::cache::scan_stage::disposed);
+  } else if (reported != io::cache::scan_stage::disposed) {
+    // `disposed` is the scheduler's retirement edge and retirement is one-way,
+    // so a single split reporting it must not reach the scheduler at all --
+    // not even as the operator's "latest stage".  The operator has many splits
+    // and only the depletion check above can speak for all of them.
+    _scheduler.update(operator_id, reported);
+  }
+  _wake = true;
+}
+
+void readahead_scan_manager::mark_operator_closed(std::size_t operator_id)
+{
+  {
+    std::lock_guard lock{_mutex};
+    auto it = _by_operator.find(operator_id);
+    if (it == _by_operator.end()) { return; }
+    if (std::exchange(it->second.closed, true)) { return; }
+    // Close is itself a retirement edge: a short operator typically disposes its
+    // last split before the producer closes, so nothing else would re-evaluate
+    // depletion and the scheduler would keep handing out an operator that can
+    // never yield another split.
+    publish_stage_locked(operator_id, it->second.stage);
+  }
+  _cv.notify_one();
 }
 
 void readahead_scan_manager::update(std::size_t operator_id,
@@ -154,13 +195,10 @@ void readahead_scan_manager::update(std::size_t operator_id,
     }
 
     // Splits report independently, so one of them reaching `disposed` does not
-    // retire the operator.  Only forward `disposed` once every split has
-    // finished as well; until then the scheduler sees the reported stage and
-    // keeps the operator in its rotation.
-    _scheduler.update(operator_id,
-                      is_operator_depleted(operator_id) ? io::cache::scan_stage::disposed : stage);
-
-    _wake = true;
+    // retire the operator.  Until the producer closes and every split has
+    // finished, the scheduler sees the reported stage and keeps the operator in
+    // its rotation.
+    publish_stage_locked(operator_id, stage);
   }
   // A scan moved, so a slot may have opened -- let the worker refill it.
   // Notified outside the lock so the woken worker does not immediately block on

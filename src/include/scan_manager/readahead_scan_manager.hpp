@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <stop_token>
 #include <thread>
 #include <unordered_map>
@@ -75,6 +76,10 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   /// Seed the per-operator readahead order for @p query.
   void prepare_for_query(const sirius::planner::query& query);
 
+  /// Seed directly from a prefetching order, bypassing plan analysis.  The
+  /// query path is this plus @c query_index::prefetching_orders.
+  void prepare_for_order(std::span<const planner::prefetch_step> order);
+
   /// Record a split under the operator that produced it.  Splits are kept in
   /// emission order, which is the order the worker prefetches them in.
   void register_scan_task(std::shared_ptr<op::scan::scan_info> const& task,
@@ -85,6 +90,16 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   void update(std::size_t operator_id,
               const op::scan::scan_info* task,
               io::cache::scan_stage stage);
+
+  /// Report that @p operator_id's producer has finished: every split it will
+  /// ever emit has been registered.  Until this arrives the operator cannot be
+  /// retired, because "all splits registered so far are done" is indistinguishable
+  /// from "the next split has not been emitted yet" — and retirement is one-way,
+  /// so guessing wrong permanently drops the operator out of the prefetch order.
+  ///
+  /// Called from every close path of the producer, including failures: a slot
+  /// that closed with an exception emits nothing further either.
+  void mark_operator_closed(std::size_t operator_id);
 
   /// The scan that should be prefetched next, or nullptr once the query's
   /// prefetching order is exhausted.  Consumes one unit of the current step's
@@ -115,6 +130,8 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
     std::size_t count{0};
     /// Most recent stage reported by any of this operator's splits.
     io::cache::scan_stage stage{io::cache::scan_stage::none};
+    /// The producer has emitted its last split; @ref tasks will not grow again.
+    bool closed{false};
     /// Splits in emission order.  Never erased — indices below point into it.
     std::vector<task_entry> tasks;
     std::unordered_map<const op::scan::scan_info*, std::size_t> index;
@@ -137,11 +154,20 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
 
   [[nodiscard]] std::size_t count_ongoing_locked() const;
 
-  /// True once @p operator_id has reported @c disposed and none of its splits
-  /// are still live and unfinished.  A single split reaching @c disposed says
-  /// nothing about the operator, which is why the scheduler is only told the
-  /// operator is finished once its split list has drained too.
+  /// True once @p operator_id's producer has closed and none of its splits are
+  /// still live and unfinished.  A single split reaching @c disposed says
+  /// nothing about the operator, and neither does "every split registered so
+  /// far is disposed" — splits are emitted progressively, so that state is also
+  /// what an operator looks like between two waves.  Only @ref
+  /// mark_operator_closed distinguishes the two.
   [[nodiscard]] bool is_operator_depleted(std::size_t operator_id) const;
+
+  /// Publish the operator's progress to the scheduler: @c disposed once the
+  /// operator is depleted, otherwise @p reported — except that a bare
+  /// @c disposed from one split is swallowed, since that is the scheduler's
+  /// retirement edge and only @ref is_operator_depleted may trip it.  Caller
+  /// must hold @ref _mutex; wakes the worker.
+  void publish_stage_locked(std::size_t operator_id, io::cache::scan_stage reported);
 
   /// Pull work off the scheduler while the budget has room.  Marks each chosen
   /// split prefetched so it is only issued once.  Caller must hold @ref _mutex.

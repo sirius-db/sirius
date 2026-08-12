@@ -20,11 +20,14 @@
 #include "io/rest/config.hpp"
 #include "io/uring/config.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
+#include "op/sirius_physical_operator.hpp"
+#include "planner/query_index.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/readahead_scan_manager.hpp"
 
 #include <cstddef>
 #include <memory>
+#include <vector>
 
 using sirius::io::cache::scan_stage;
 using sirius::scan_manager::cache_mode;
@@ -254,6 +257,109 @@ TEST_CASE("updates for an unknown split still record the operator stage",
 
   m.update(OP, split.get(), scan_stage::reading);
   CHECK(m.ongoing_scans() == 1);
+}
+
+// ===========================================================================
+// operator retirement
+// ===========================================================================
+//
+// Retirement is one-way: prefetching_scheduler::advance() only ever moves the
+// cursor forward, so an operator retired while its producer is still emitting
+// splits is dropped from the prefetch order for the rest of the query.  These
+// pin the rule that only mark_operator_closed() can retire an operator.
+
+namespace {
+
+/// Minimal concrete scan carrying only the operator id the scheduler keys on.
+struct test_scan : sirius::op::sirius_physical_operator {
+  explicit test_scan(std::size_t id)
+    : sirius::op::sirius_physical_operator(sirius::op::SiriusPhysicalOperatorType::GPU_SCAN, {}, 0)
+  {
+    operator_id = id;
+  }
+};
+
+/// Seeds @p m with a single pipeline-mode scan for operator @ref OP.
+struct single_scan_order {
+  test_scan scan{OP};
+  std::vector<sirius::planner::prefetch_step> steps{
+    sirius::planner::prefetch_step{&scan, 0, sirius::planner::scheduling_mode::pipeline, 1}};
+
+  void seed(readahead_scan_manager& m) { m.prepare_for_order(steps); }
+};
+
+}  // namespace
+
+TEST_CASE("a lull between split waves does not retire the operator",
+          "[scan_manager][readahead]")
+{
+  // The regression: with only one split emitted so far, "every split I know
+  // about is disposed" also describes an operator whose producer is between
+  // waves.  Retiring there loses every split the producer has yet to emit.
+  readahead_scan_manager m;
+  single_scan_order order;
+  order.seed(m);
+
+  auto first = std::make_shared<test_split>();
+  m.register_scan_task(first, OP);
+  m.update(OP, first.get(), scan_stage::reading);
+  m.update(OP, first.get(), scan_stage::disposed);
+
+  REQUIRE(m.get_next_prefetching_operator() != nullptr);
+
+  // The second wave arrives and must still be reachable.
+  auto second = std::make_shared<test_split>();
+  m.register_scan_task(second, OP);
+  CHECK(m.get_next_prefetching_operator() != nullptr);
+}
+
+TEST_CASE("closing the producer retires an operator whose splits are done",
+          "[scan_manager][readahead]")
+{
+  readahead_scan_manager m;
+  single_scan_order order;
+  order.seed(m);
+
+  auto split = std::make_shared<test_split>();
+  m.register_scan_task(split, OP);
+  m.update(OP, split.get(), scan_stage::disposed);
+  REQUIRE(m.get_next_prefetching_operator() != nullptr);
+
+  // Close is itself a retirement edge: the last split disposed before the
+  // producer closed, so nothing else would re-evaluate depletion.
+  m.mark_operator_closed(OP);
+  CHECK(m.get_next_prefetching_operator() == nullptr);
+}
+
+TEST_CASE("a closed operator with live splits is not retired until they finish",
+          "[scan_manager][readahead]")
+{
+  readahead_scan_manager m;
+  single_scan_order order;
+  order.seed(m);
+
+  auto split = std::make_shared<test_split>();
+  m.register_scan_task(split, OP);
+  m.update(OP, split.get(), scan_stage::reading);
+
+  m.mark_operator_closed(OP);
+  CHECK(m.get_next_prefetching_operator() != nullptr);
+
+  m.update(OP, split.get(), scan_stage::disposed);
+  CHECK(m.get_next_prefetching_operator() == nullptr);
+}
+
+TEST_CASE("mark_operator_closed is idempotent and tolerates unknown operators",
+          "[scan_manager][readahead]")
+{
+  readahead_scan_manager m;
+  single_scan_order order;
+  order.seed(m);
+
+  m.mark_operator_closed(OP);
+  m.mark_operator_closed(OP);
+  m.mark_operator_closed(OP + 99);  // never seeded
+  SUCCEED("no crash and no deadlock");
 }
 
 TEST_CASE("a stopped manager can be restarted", "[scan_manager][readahead]")
