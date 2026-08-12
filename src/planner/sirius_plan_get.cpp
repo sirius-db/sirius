@@ -540,11 +540,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         }
 #if 0
         // Disabled — these guards walk every row group of the table at plan
-        // time, per query; #1160 tracks running the checks from the scan
-        // manager at execution time instead. With this block off, (d) above
-        // has no clean-table relaxation and (c) is unguarded: post-pin UPDATE
-        // chains serve stale cached values (UPDATE support is #1162; pin_table
-        // still refuses tables that already carry update chains).
+        // time, per query. With this block off, (d) above has no clean-table
+        // relaxation. The update-chain branch is redundant because UPDATE
+        // statements on pinned tables are rejected before execution; direct
+        // UPDATE serving remains out of scope here (#1162).
         std::vector<duckdb::storage_t> projected;
         for (auto const& col_idx : column_ids) {
           if (col_idx.HasPrimaryIndex() && !col_idx.IsRowIdColumn() &&

@@ -344,7 +344,7 @@ The zone-map captures only the build keys' `[min,max]` range, which is useless f
 
 - **`sirius_dynamic_small_in_list_filter`** — exact membership for 1–12 null-free INT32/INT64 build rows, counting duplicates. Each successfully materialized device-local replica owns a raw snapshot of the build values (the *needles*), and one CUB bulk kernel compares every probe value with every needle. It has no hash build, slot array, or reserved empty-key sentinel.
 - **`sirius_dynamic_in_list_filter`** — hash-based membership via a persistent `cuco::static_set`, with a device kernel probing its read-only set reference. It is exact for representable set keys and conservatively passes cuCO's reserved empty-key value, so it remains a safe join-filter superset.
-- **`sirius_dynamic_bloom_filter`** — a `cuco::bloom_filter` (PIMPL'd in a `.cu`; INT32/INT64 keys), a few bits/key, for large builds where the hash IN-list is too big. False positives only let extra rows through — harmless, because the join is authoritative; no false negatives means a true match is never dropped.
+- **`sirius_dynamic_bloom_filter`** — a `cuco::bloom_filter` (PIMPL'd in a `.cu`; INT32/INT64 keys) at 16 bits/key under Sirius's own fingerprint policy (see [Fingerprint policy](#fingerprint-policy--why-neither-cuco-stock-policy-is-used)), for large builds where the hash IN-list is too big. False positives only let extra rows through — harmless, because the join is authoritative; no false negatives means a true match is never dropped.
 
 **Producer policy** (`dynamic_filter_publisher::publish`). The master switch `enable_dynamic_filter_pushdown` emits at most one **membership filter** per key, in this order:
 
@@ -400,6 +400,47 @@ Bloom filters are runtime-only — there is no AST node that evaluates "is this 
 A channel may carry both a zone map for the reader and a Bloom for the post-decode operator. Each becomes visible only after its device replicas are ready. A direct target normally sees both; a transitive target can safely observe either one or both at its per-split checkpoints because the filters are optional conjuncts and the join remains authoritative.
 
 **Build heuristic: raw exact list, then L2-sized hash set, then Bloom (implemented).** The producer first handles 1–12 null-free INT32/INT64 build rows with a linear scan over raw needles. For larger supported columns, it queries the active GPUs' L2 sizes (`cudaDeviceGetAttribute(cudaDevAttrL2CacheSize)`) and selects the hash IN-list only if its set fits the smallest L2; otherwise it uses the smaller Bloom, even if that bitset also spills L2. This L2 decision subsumed the original fixed row-count hash/Bloom cutover.
+
+#### Fingerprint policy — why neither cuco stock policy is used
+
+The filter is a `cuco::bloom_filter` at a fixed 16 bits/key over 256-bit (32-byte, i.e. one memory
+sector) blocks. cuCollections ships two policies and Sirius uses neither:
+
+- `cuco::arrow_filter_policy` maps the hash to a block with a cheap multiply-shift but hard-caps
+  the filter at Arrow's 128 MiB (2²² blocks ⇒ 67.1M keys at 16 bits/key). Every Bloom the publisher
+  emits at SF1000 is larger than that, so it was never selected.
+- `cuco::default_filter_policy` has no cap but computes `hash % num_blocks`. GPUs have no integer
+  divide, so a 64-bit modulo by a runtime value is a long emulated instruction sequence. It — not
+  the random gather — dominates the probe kernel.
+
+`sirius_bloom_policy` (in `src/cuda/sirius_dynamic_bloom_filter.cu`) keeps the uncapped sizing and
+`default_filter_policy`'s exact hash and fingerprint layout, and replaces only the block index with
+Lemire fast-range, `(hash * num_blocks) >> 64`, one `mul.hi.u64`. One policy now covers every size,
+so the replica variant carries two alternatives (one per key width) instead of four.
+
+Measured on GB300 (152 SM, 115.5 MiB L2, 7.16 TB/s) at TPC-H SF1000 q21's real probe shape —
+389M clustered `l_orderkey` probes per split, `contains_async` only:
+
+| build keys | filter | `hash % n` | fast-range | |
+|---|---|---|---|---|
+| 73.2M (q21 `l1` key set) | 139.7 MB | 5.06 ms | 2.34 ms | 2.16× |
+| 730.8M (q21 `orders` F key set) | 1393.9 MB | 5.21 ms | 2.73 ms | 1.91× |
+
+Filter *size* is not the lever, which is directly falsifiable and was falsified: a 69.8 MB filter
+small enough to live entirely in L2 still took 4.93 ms with the modulo against 2.18 ms with
+fast-range. Cutting bits/key is likewise not worth it — 8 bits/key bought 1.07× on the probe while
+raising the false-positive rate from 0.11% to 2.86%, which on a 6-billion-row scan means ~170M
+extra rows handed to the downstream join. Note the asymmetry that hid this: `cuco::static_set`,
+backing the hash IN-list, already avoids the divide via `cuco::utility::fast_int` magic-number
+reciprocals, so the IN-list never showed the symptom.
+
+Fast-range preserves the no-false-negative contract: it is a deterministic uniform map of a 64-bit
+hash onto `[0, num_blocks)` applied identically on `add` and `contains`, so an inserted key always
+tests positive. Only the false-positive *set* can move, which is harmless because the join stays
+authoritative — and it moved in the right direction, because fast-range consumes the high hash bits
+while the fingerprint consumes the low 40, whereas the modulo drew both from the low bits. At the
+73.2M-key shape the measured keep ratio fell from 5.002% to 4.878% against a 4.77% true-match rate,
+roughly halving the false-positive rate at identical footprint.
 
 ### 1.4 IN-list representations (raw needles + hash set)
 

@@ -31,6 +31,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <utils/parquet_fixture_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
@@ -67,19 +68,6 @@ struct sirius_config_env_guard {
   }
   ~sirius_config_env_guard() { unsetenv("SIRIUS_CONFIG_FILE"); }
 };
-
-std::string sql_string_literal(std::string const& value)
-{
-  std::string escaped;
-  escaped.reserve(value.size() + 2);
-  escaped.push_back('\'');
-  for (auto const c : value) {
-    if (c == '\'') { escaped.push_back('\''); }
-    escaped.push_back(c);
-  }
-  escaped.push_back('\'');
-  return escaped;
-}
 
 /**
  * @brief How a query is expected to be routed by the transparent optimizer.
@@ -1180,7 +1168,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
  */
 class HivePartitionDataset {
  public:
-  HivePartitionDataset()
+  HivePartitionDataset() : scratch{"hive_count_star"}, hive_dir{scratch.path()}
   {
     auto const source_root = get_project_root() / "test/cpp/integration/data/hive_partitioned";
     auto const y2024_m01   = source_root / "year=2024/month=01/data.parquet";
@@ -1190,10 +1178,6 @@ class HivePartitionDataset {
     REQUIRE(fs::exists(y2024_m02));
     REQUIRE(fs::exists(y2025_m01));
 
-    static std::atomic<std::uint64_t> next_fixture_id{0};
-    hive_dir = fs::temp_directory_path() /
-               ("sirius_hive_count_star_" + std::to_string(next_fixture_id.fetch_add(1)));
-    fs::remove_all(hive_dir);
     fs::create_directories(hive_dir / "h/year=2024/month=01");
     fs::create_directories(hive_dir / "h/year=2024/month=02");
     fs::create_directories(hive_dir / "h/year=2025/month=01");
@@ -1223,8 +1207,6 @@ class HivePartitionDataset {
     is_hive_available = true;
   }
 
-  ~HivePartitionDataset() { fs::remove_all(hive_dir); }
-
   struct watchdog_result {
     bool timed_out{false};
     duckdb::idx_t row_count{0};
@@ -1235,10 +1217,13 @@ class HivePartitionDataset {
 
   std::string hive_scan() const
   {
-    return "read_parquet(" + sql_string_literal(hive_path) + ", hive_partitioning=true)";
+    return "read_parquet(" + sirius::test::sql_literal(hive_path) + ", hive_partitioning=true)";
   }
 
-  std::string flat_scan() const { return "read_parquet(" + sql_string_literal(flat_path) + ")"; }
+  std::string flat_scan() const
+  {
+    return "read_parquet(" + sirius::test::sql_literal(flat_path) + ")";
+  }
 
   static std::vector<std::string> split_row(std::string const& line)
   {
@@ -1382,6 +1367,7 @@ class HivePartitionDataset {
     CHECK(result.rows == expected_rows);
   }
 
+  sirius::test::scratch_dir scratch;
   fs::path hive_dir;
   fs::path config_path;
   std::string hive_path;
@@ -1391,17 +1377,12 @@ class HivePartitionDataset {
 
 class EscapedHivePartitionDataset {
  public:
-  EscapedHivePartitionDataset()
+  EscapedHivePartitionDataset() : scratch{"hive_unescape"}, hive_dir{scratch.path()}
   {
     auto const source =
       get_project_root() /
       "test/cpp/integration/data/hive_partitioned/year=2024/month=01/data.parquet";
     REQUIRE(fs::exists(source));
-
-    static std::atomic<std::uint64_t> next_fixture_id{0};
-    hive_dir = fs::temp_directory_path() /
-               ("sirius_hive_unescape_" + std::to_string(next_fixture_id.fetch_add(1)));
-    fs::remove_all(hive_dir);
 
     copy_partition(source, hive_dir / "space/city=New%20York/data.parquet");
     copy_partition(source, hive_dir / "slash/city=Path%2FTeam/data.parquet");
@@ -1411,11 +1392,9 @@ class EscapedHivePartitionDataset {
     copy_partition(source, hive_dir / "plain/city=Boston/data.parquet");
   }
 
-  ~EscapedHivePartitionDataset() { fs::remove_all(hive_dir); }
-
   std::string partition_scan(fs::path const& relative_glob) const
   {
-    return "read_parquet(" + sql_string_literal((hive_dir / relative_glob).string()) +
+    return "read_parquet(" + sirius::test::sql_literal((hive_dir / relative_glob).string()) +
            ", hive_partitioning=true)";
   }
 
@@ -1426,6 +1405,7 @@ class EscapedHivePartitionDataset {
     fs::copy_file(source, target, fs::copy_options::overwrite_existing);
   }
 
+  sirius::test::scratch_dir scratch;
   fs::path hive_dir;
 };
 

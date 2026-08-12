@@ -1,0 +1,6 @@
+sirius:
+  space:
+    host:
+      - numa_id: 0
+        downgrade_trigger_fraction: 0.8
+        downgrade_stop_fraction: 0.0

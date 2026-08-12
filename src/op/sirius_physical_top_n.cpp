@@ -258,15 +258,11 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operat
   // gpu_pipeline_task::execute_pipeline_task_round ->
   // pipelineable_operator_data::prepare_for_processing -> lock_or_prepare_batch.
   // batches[0]->get_memory_space() == target_space here.
-  cucascade::memory::memory_space* space = nullptr;
-  for (auto const& batch : input_batches) {
-    space = batch.get_memory_space();
-    break;
-  }
-  if (space == nullptr) {
+  if (input_batches.empty()) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
+  auto* space = input_batches.front().get_memory_space();
 
   // R1 — read-only accessors held in a vector for the duration of cudf::concatenate
   // so the underlying table_views remain valid.

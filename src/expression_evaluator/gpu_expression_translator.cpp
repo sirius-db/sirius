@@ -277,6 +277,9 @@ std::optional<expr_ref> gpu_expression_translator::add_join_condition(
     case ge:
       return _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::GREATER_EQUAL, *left_expr, *right_expr);
+    case not_distinct_from:
+      return _ast_tree.emplace<cudf::ast::operation>(
+        cudf::ast::ast_operator::NULL_EQUAL, *left_expr, *right_expr);
     default:
       SIRIUS_LOG_DEBUG("[expression_translator] Unsupported join condition comparison type: {}",
                        static_cast<int>(condition.comparison));

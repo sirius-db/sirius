@@ -102,10 +102,6 @@ void sirius_physical_column_data_scan::build_pipelines(
     case SiriusPhysicalOperatorType::RECURSIVE_RECURRING_CTE_SCAN:
     case SiriusPhysicalOperatorType::RECURSIVE_CTE_SCAN:
       throw not_implemented_exception("Recursive CTE scan not implemented for GPU");
-      if (!meta_pipeline.has_recursive_cte()) {
-        throw internal_exception("Recursive CTE scan found without recursive CTE node");
-      }
-      break;
     default: break;
   }
   D_ASSERT(children.empty());

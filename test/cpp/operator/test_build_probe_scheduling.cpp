@@ -108,18 +108,54 @@ TEST_CASE("compute_hash_join_partition_strategy - single-GPU small foldable inne
   REQUIRE(s.build_probe);
 }
 
-TEST_CASE("compute_hash_join_partition_strategy - single-GPU large build splits and stays STANDARD",
-          "[hash_join][build_probe][unit]")
+TEST_CASE("compute_hash_join_partition_strategy rejects a zero partition target",
+          "[hash_join][build_probe][unit][config]")
 {
-  // 400 MB / 100 MB per partition -> 4 natural partitions; on 1 GPU that exceeds num_gpus so
-  // BUILD_PROBE is refused, and the natural count is reported.
+  REQUIRE_THROWS_AS(strategy(k100MB,
+                             /*is_build_side=*/true,
+                             /*build_foldable=*/true,
+                             /*num_gpus=*/1,
+                             duckdb::JoinType::INNER,
+                             HASH_JOIN_MODE::STANDARD,
+                             /*hash_partition_bytes=*/0),
+                    std::invalid_argument);
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - single-GPU build over the batch target still "
+  "BUILD_PROBEs within the hash-table budget",
+  "[hash_join][build_probe][unit]")
+{
+  // 4 natural partitions (400 MB / 100 MB), but the folded build fits the 500 MB hash-table
+  // budget — the batch target must not veto BUILD_PROBE, so this collapses to one partition.
   auto const s = strategy(4 * k100MB,
                           true,
                           true,
                           /*num_gpus=*/1,
                           duckdb::JoinType::INNER,
                           HASH_JOIN_MODE::STANDARD,
-                          /*hash_partition_bytes=*/k100MB);
+                          /*hash_partition_bytes=*/k100MB,
+                          /*max_build_hash_table_bytes=*/kMaxBuildBytes);
+  REQUIRE(s.num_partitions == 1);
+  REQUIRE_FALSE(s.broadcast);
+  REQUIRE(s.build_probe);
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - single-GPU build over both targets splits and stays "
+  "STANDARD",
+  "[hash_join][build_probe][unit]")
+{
+  // Same 4 natural partitions, but the build also exceeds the hash-table budget (400 MB > 200 MB),
+  // so there is no single-table shape to fall back to and the natural count is reported.
+  auto const s = strategy(4 * k100MB,
+                          true,
+                          true,
+                          /*num_gpus=*/1,
+                          duckdb::JoinType::INNER,
+                          HASH_JOIN_MODE::STANDARD,
+                          /*hash_partition_bytes=*/k100MB,
+                          /*max_build_hash_table_bytes=*/2 * k100MB);
   REQUIRE(s.num_partitions == 4);
   REQUIRE_FALSE(s.broadcast);
   REQUIRE_FALSE(s.build_probe);
@@ -140,6 +176,25 @@ TEST_CASE(
                           /*max_build_hash_table_bytes=*/kMaxBuildBytes);
   REQUIRE(s.num_partitions == 1);
   REQUIRE_FALSE(s.build_probe);
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - build just over hash_partition_bytes is BUILD_PROBE",
+  "[hash_join][build_probe][unit]")
+{
+  // TPC-H SF1000 q21: 5.94 GB build, 5 GiB batch target (natural count 2), 10 GiB hash-table
+  // budget — fits one hash table, so BUILD_PROBE on one partition.
+  auto const s = strategy(/*total=*/5'937'804'664ull,
+                          true,
+                          true,
+                          /*num_gpus=*/1,
+                          duckdb::JoinType::INNER,
+                          HASH_JOIN_MODE::STANDARD,
+                          /*hash_partition_bytes=*/5ull * 1024 * 1024 * 1024,
+                          /*max_build_hash_table_bytes=*/10ull * 1024 * 1024 * 1024);
+  REQUIRE(s.num_partitions == 1);
+  REQUIRE_FALSE(s.broadcast);
+  REQUIRE(s.build_probe);
 }
 
 TEST_CASE(
