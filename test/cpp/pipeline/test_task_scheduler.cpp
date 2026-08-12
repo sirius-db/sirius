@@ -176,59 +176,16 @@ void wait_or_fail(Pred done, std::chrono::seconds timeout, const char* what)
 
 }  // namespace
 
-// Regression test for the PR #1467 deadlock (scheduler side, minimal mechanism).
+// Regression test for the PR #1467 deadlock.
 //
-// The downgrade executor returns extracted pipeline tasks to the scheduler's
-// queue via convertible_gpu_pipeline_task's RAII destructor — a direct
-// _task_queue.push() that emits no task_available event. If every executor had
-// already posted device_ready and parked (empty queue) by then, no channel
-// event would ever arrive again and the returned tasks were never dispatched:
-// a permanent all-workers-idle deadlock (SF1000 TPC-H q18, hung 7/7).
-//
-// This stages that interleaving directly: start the scheduler with an empty
-// queue, give the executors time to park, then push a task into the pipeline
-// task queue WITHOUT going through schedule(). The management loop must
-// dispatch it anyway. On the pre-fix event loop this test times out.
-TEST_CASE("Direct queue push after executors park is still dispatched",
-          "[task_scheduler][deadlock-1467]")
-{
-  auto manager = initialize_memory_manager(1);
-  sirius::exec::thread_pool_config gpu_config{2};
-  task_scheduler sched(gpu_config, *manager, sirius::test::make_test_telemetry_context());
-
-  auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
-
-  sched.start();
-  // Let every executor reserve a worker, post its device_ready, and park in
-  // the management loop's ready list against the empty queue. (Generous margin;
-  // if an executor were somehow not yet parked, its later device_ready would
-  // mask the bug and the test would pass spuriously — it can never fail
-  // spuriously.)
-  std::this_thread::sleep_for(500ms);
-
-  // The downgrade-return path: a push that bypasses schedule(), so no
-  // task_available event is emitted — exactly what
-  // convertible_gpu_pipeline_task's destructor does.
-  {
-    auto local_state = std::make_unique<mock_gpu_pipeline_task_local_state>(0, 0);
-    auto task = std::make_unique<mock_gpu_pipeline_task>(0, std::move(local_state), global_state);
-    sched.get_pipeline_task_queue()->push(std::move(task));
-  }
-
-  wait_or_fail([&] { return global_state->executed_count.load() == 1; },
-               10s,
-               "DEADLOCK REGRESSION: silently pushed task was never dispatched "
-               "(management loop asleep with a parked device and a non-empty queue)");
-
-  sched.stop();
-}
-
-// Same deadlock, staged with full fidelity to the downgrade executor's TIER-2
-// pass: tasks are scheduled normally, extracted from the queue with
-// mutable_pop_if (as convertible_gpu_pipeline_task_provider does), and returned
-// through convertible_gpu_pipeline_task's RAII destructor after the executors
-// have drained and parked. The destructor's direct queue push must still get
-// the tasks dispatched.
+// The downgrade executor's TIER-2 pass extracts queued pipeline tasks with
+// mutable_pop_if and returns them via convertible_gpu_pipeline_task's RAII
+// destructor — a direct _task_queue.push() that emits no task_available event.
+// If every executor had already posted device_ready and parked (empty queue)
+// by then, no channel event would ever arrive again and the returned tasks
+// were never dispatched: a permanent all-workers-idle deadlock (SF1000 TPC-H
+// q18, hung 7/7). This stages that interleaving deterministically; on the
+// pre-fix event loop it times out.
 TEST_CASE("Tasks extracted and RAII-returned while executors are parked still run",
           "[task_scheduler][deadlock-1467]")
 {
