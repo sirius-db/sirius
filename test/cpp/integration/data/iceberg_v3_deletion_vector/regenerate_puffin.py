@@ -89,6 +89,20 @@ def build_puffin(blob: bytes, snapshot_id: int, sequence_number: int) -> bytes:
     )
 
 
+def dv_cardinality(raw: bytes) -> int:
+    """Count the vector's deleted positions with a reader we did not write.
+
+    Iceberg defines a deletion vector's manifest `record_count` as its cardinality, and the scan
+    cross-checks the two: the blob's magic and CRC prove it is *a* valid vector, not that it is
+    the one the manifest entry points at, so a wrong offset landing on another valid blob is
+    caught only by the count disagreeing. Deriving it here rather than hardcoding keeps the
+    fixture honest if the blob is ever rebuilt.
+    """
+    from pyiceberg.table.puffin import PuffinFile
+
+    return sum(len(positions) for positions in PuffinFile(raw).to_vector().values())
+
+
 def verify(puffin_path: pathlib.Path) -> bool:
     """Validate against a reader we did not write. Self-consistency proves nothing."""
     raw = puffin_path.read_bytes()
@@ -147,6 +161,7 @@ def main() -> int:
     # The blob no longer starts at 0, so the manifest has to agree.
     entry["data_file"]["content_offset"] = len(MAGIC)
     entry["data_file"]["content_size_in_bytes"] = len(blob)
+    entry["data_file"]["record_count"] = dv_cardinality(puffin)
 
     shutil.copy2(MANIFEST, MANIFEST.with_suffix(".avro.bak"))
     with MANIFEST.open("wb") as fh:

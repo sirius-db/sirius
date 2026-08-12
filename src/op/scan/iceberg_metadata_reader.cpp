@@ -57,11 +57,17 @@ struct IcebergDeleteFileEntry {
   int64_t content_offset{-1};         // byte offset in Puffin file (V3, -1 if absent)
   int64_t content_size_in_bytes{-1};  // byte length of DV blob (V3, -1 if absent)
   int64_t sequence_number{0};         // manifest entry sequence number (for eq delete filtering)
+  int64_t record_count{-1};           // deleted positions the manifest claims (V3, -1 if absent)
 
-  /// Requires file_format already lowercased by the reader.
-  [[nodiscard]] bool is_deletion_vector() const
+  /// Requires file_format already lowercased by the reader. Format alone: an entry that IS a
+  /// deletion vector but describes itself incompletely must be rejected, not reclassified as
+  /// something other than a deletion vector and skipped.
+  [[nodiscard]] bool is_deletion_vector() const { return file_format == "puffin"; }
+
+  /// Whether the manifest gave this vector a locatable blob.
+  [[nodiscard]] bool has_complete_descriptor() const
   {
-    return file_format == "puffin" && content_offset >= 0 && content_size_in_bytes > 0;
+    return content_offset >= 0 && content_size_in_bytes > 0;
   }
 };
 
@@ -82,9 +88,16 @@ std::string escape_sql_string(std::string const& s)
   return out;
 }
 
-/// Reads one manifest's POSITION_DELETES entries. @p conn must already be bracketed as an
+/// Reads one manifest's live POSITION_DELETES entries. @p conn must already be bracketed as an
 /// internal query. `lower()` is load-bearing: Iceberg writes "PUFFIN" but is_deletion_vector()
 /// tests "puffin", and without the fold the table reads as having no deletes.
+///
+/// `status <> 2` drops DELETED entries. A manifest is a log, not a picture of the present: an
+/// entry retired by a later commit stays listed, and a compaction that REPLACES a deletion vector
+/// leaves the old one at status 2 beside its status 1 replacement. Both describe the same
+/// referenced_data_file, so materialize_positional_deletes() would file them under one key and
+/// the survivor would be whichever the manifest happens to list last -- an order Iceberg gives no
+/// precedence meaning. Reading the retired one restores rows the table deleted.
 std::vector<IcebergDeleteFileEntry> read_deletion_vectors_from_manifest(
   duckdb::Connection& conn, std::string const& manifest_path)
 {
@@ -92,11 +105,12 @@ std::vector<IcebergDeleteFileEntry> read_deletion_vectors_from_manifest(
     "SELECT data_file.file_path, lower(data_file.file_format), "
     "COALESCE(data_file.referenced_data_file, ''), "
     "COALESCE(data_file.content_offset, -1), "
-    "COALESCE(data_file.content_size_in_bytes, -1) "
+    "COALESCE(data_file.content_size_in_bytes, -1), "
+    "COALESCE(data_file.record_count, -1) "
     "FROM read_avro('" +
     escape_sql_string(manifest_path) +
     "') "
-    "WHERE data_file.content = 1");
+    "WHERE data_file.content = 1 AND status <> 2");
 
   if (!result || result->HasError()) {
     // Never degrade to an empty list: that means "no deletion vectors" and returns deleted rows.
@@ -117,6 +131,24 @@ std::vector<IcebergDeleteFileEntry> read_deletion_vectors_from_manifest(
       entry.referenced_data_file  = chunk->GetValue(2, i).ToString();
       entry.content_offset        = chunk->GetValue(3, i).GetValue<int64_t>();
       entry.content_size_in_bytes = chunk->GetValue(4, i).GetValue<int64_t>();
+      entry.record_count          = chunk->GetValue(5, i).GetValue<int64_t>();
+
+      // Every entry here is live. A Puffin one the manifest failed to locate cannot be skipped:
+      // skipping drops its deletes, and dropped deletes are returned rows.
+      if (entry.is_deletion_vector() && !entry.has_complete_descriptor()) {
+        throw std::runtime_error(
+          "[iceberg] Manifest '" + manifest_path + "' lists a live deletion vector at '" +
+          entry.file_path + "' with no usable blob descriptor (content_offset=" +
+          std::to_string(entry.content_offset) +
+          ", content_size_in_bytes=" + std::to_string(entry.content_size_in_bytes) +
+          "); its deletes cannot be read and ignoring it would return deleted rows");
+      }
+      if (entry.is_deletion_vector() && entry.referenced_data_file.empty()) {
+        throw std::runtime_error("[iceberg] Manifest '" + manifest_path +
+                                 "' lists a live deletion vector at '" + entry.file_path +
+                                 "' with no referenced_data_file, so the data file its deletes "
+                                 "apply to is unknown");
+      }
       entries.push_back(std::move(entry));
     }
   }
@@ -145,7 +177,14 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
   if (snapshot_id.has_value()) {
     query += ", snapshot_from_id = " + std::to_string(snapshot_id.value());
   }
-  query += ")";
+  // status is the entry's liveness (ADDED / EXISTING / DELETED); a manifest keeps listing entries
+  // that later commits retired. Without this filter a delete file that a compaction replaced is
+  // read back as live and removes rows the current snapshot keeps.
+  //
+  // ⚠️ status and content BOTH use the string "EXISTING" for unrelated things: status EXISTING
+  // means "carried over from an earlier snapshot", content EXISTING means "this is a DATA file"
+  // (which is what kExisting below tests). Do not merge these two tests.
+  query += ") WHERE status <> 'DELETED'";
 
   auto meta_result = conn.Query(query);
   if (!meta_result || meta_result->HasError()) {
@@ -321,12 +360,39 @@ void materialize_positional_deletes(duckdb::DatabaseInstance& db,
   if (!files.deletion_vector_entries.empty()) {
     SIRIUS_LOG_INFO("[iceberg] Loading {} deletion vector(s).",
                     files.deletion_vector_entries.size());
+    // Which data files a DV has already claimed. Superseding a POSITIONAL entry in out_map is the
+    // spec'd behaviour above; a second DV claiming the same data file is not, and assigning it
+    // would make the result depend on manifest order, which carries no precedence meaning.
+    std::unordered_set<std::string> claimed_by_dv;
+
     for (auto const& dv_entry : files.deletion_vector_entries) {
       SIRIUS_LOG_DEBUG("[iceberg] Reading deletion vector for data file '{}' from '{}'",
                        dv_entry.referenced_data_file,
                        dv_entry.file_path);
+      if (!claimed_by_dv.insert(dv_entry.referenced_data_file).second) {
+        throw std::runtime_error(
+          "[iceberg] Two live deletion vectors both claim data file '" +
+          dv_entry.referenced_data_file + "' (the second is in '" + dv_entry.file_path +
+          "'); which one applies would depend on manifest order, which Iceberg does not define");
+      }
+
       auto positions = read_deletion_vector(
         dv_entry.file_path, dv_entry.content_offset, dv_entry.content_size_in_bytes);
+
+      // The manifest states how many positions this vector holds. The blob's magic and CRC prove
+      // it is *a* well-formed deletion vector, not that it is *this* entry's -- a wrong
+      // offset/length that happens to land on another valid vector passes both. Comparing against
+      // the count the manifest independently recorded is what ties the blob to this entry.
+      if (dv_entry.record_count >= 0 &&
+          dv_entry.record_count != static_cast<int64_t>(positions.size())) {
+        throw std::runtime_error(
+          "[iceberg] Deletion vector for data file '" + dv_entry.referenced_data_file + "' in '" +
+          dv_entry.file_path + "' decoded " + std::to_string(positions.size()) +
+          " positions, but its manifest entry records " + std::to_string(dv_entry.record_count) +
+          "; the blob at offset " + std::to_string(dv_entry.content_offset) +
+          " is not the one this entry describes");
+      }
+
       out_map[dv_entry.referenced_data_file] = std::move(positions);
     }
   }

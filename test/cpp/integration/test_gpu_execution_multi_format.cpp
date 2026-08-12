@@ -1042,6 +1042,44 @@ TEST_CASE_METHOD(GPUExecutionIcebergDVFixture,
 }
 
 //===----------------------------------------------------------------------===//
+// A deletion vector that a later commit REPLACED.
+//
+// Every other fixture here is a single snapshot in which every manifest entry is ADDED — the one
+// shape where reading a manifest as a picture of the present is accidentally correct. A manifest
+// is a log: compaction routinely rewrites a deletion vector, leaving the superseded entry at
+// status DELETED beside its replacement, both naming the same data file.
+//
+// Hand-forged, because pyiceberg refuses to write delete files at all, so the conformance corpus
+// cannot reach this. See data/iceberg_v3_dv_replaced/generate.py.
+//===----------------------------------------------------------------------===//
+
+class GPUExecutionIcebergDVReplacedFixture : public GPUExecutionIcebergFixture {
+ public:
+  GPUExecutionIcebergDVReplacedFixture()
+  {
+    dv_replaced_path =
+      (get_project_root() / "test/cpp/integration/data/iceberg_v3_dv_replaced").string();
+  }
+
+  std::string dv_replaced_path;
+};
+
+TEST_CASE_METHOD(GPUExecutionIcebergDVReplacedFixture,
+                 "gpu_execution iceberg - a retired deletion vector stays retired",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // Two PUFFIN entries for one data file: the live replacement (ADDED, deletes positions 1 and 3)
+  // and the vector it replaced (DELETED, deletes 0, 1, 2 and 4). The retired one is written LAST,
+  // so a reader that ignores `status` and lets the last entry win returns 1 row rather than 3 —
+  // resurrecting rows the table deleted and dropping rows it kept.
+  REQUIRE(delete_file_count(dv_replaced_path) == 2);
+  expect_iceberg_rows(
+    "SELECT fruit, count FROM iceberg_scan('" + dv_replaced_path + "') ORDER BY count;",
+    kDeletionVectorRoute,
+    {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+}
+
+//===----------------------------------------------------------------------===//
 // Schema evolution, snapshot selection, and sequence numbers.
 //===----------------------------------------------------------------------===//
 
