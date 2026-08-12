@@ -182,14 +182,13 @@ std::vector<null_prune_predicate> collect_null_prune_predicates(
   };
 
   for (auto const& [column_index, filter] : filters.filters) {
-    // Hive-partition columns are not in the parquet file, so they have no
-    // statistics to prune on.
-    if (column_index >= column_ids.size()) { continue; }
-    if (skip_primary_indices.count(column_ids[column_index].GetPrimaryIndex()) != 0) { continue; }
-    if (column_index >= batch_position_by_column_id.size()) { continue; }
-    auto const& batch_pos = batch_position_by_column_id[column_index];
-    if (!batch_pos.has_value()) { continue; }
-    auto const index = static_cast<duckdb::idx_t>(*batch_pos);
+    // A partition column has no statistics in the file to prune on, and a
+    // column that is not in the batch cannot be pruned by — both are simply
+    // skipped here, unlike a conjunct that has to be evaluated.
+    auto const column = sirius::op::resolve_filtered_column(
+      column_index, column_ids, batch_position_by_column_id, skip_primary_indices);
+    if (column.status != sirius::op::filter_column_status::usable) { continue; }
+    auto const index = static_cast<duckdb::idx_t>(column.batch_position);
 
     if (auto expects_null = classify(filter->filter_type)) {
       out.push_back(null_prune_predicate{index, *expects_null});

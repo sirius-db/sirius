@@ -25,6 +25,7 @@
 // unbounded.
 
 #include "op/scan/scan_filter_analysis.hpp"
+#include "op/scan/scan_utils.hpp"
 
 #include <catch.hpp>
 #include <duckdb/common/types/date.hpp>
@@ -207,4 +208,63 @@ TEST_CASE("scan filter ranges: coverage reflects what could not be converted", "
     REQUIRE(result.ranges.empty());
     REQUIRE_FALSE(result.ranges_cover_whole_filter);
   }
+}
+
+// The column bookkeeping every walk over a filter set repeats. Two walks share
+// it with deliberately different reactions to the third outcome, which is the
+// part worth pinning: a conjunct that must be EVALUATED cannot reference an
+// unmaterialized column, while one used only to PRUNE can be dropped.
+TEST_CASE("resolve_filtered_column: the three outcomes", "[scan]")
+{
+  duckdb::vector<duckdb::ColumnIndex> column_ids;
+  column_ids.emplace_back(7);  // filter column 0 -> primary index 7
+  std::vector<std::optional<std::size_t>> batch_positions{std::optional<std::size_t>{3}};
+
+  SECTION("usable: resolved to its batch position")
+  {
+    auto const r = resolve_filtered_column(0, column_ids, batch_positions, {});
+    REQUIRE(r.status == filter_column_status::usable);
+    REQUIRE(r.primary_index == 7);
+    REQUIRE(r.batch_position == 3);
+  }
+
+  SECTION("skipped: a hive partition is enforced at the file-list level")
+  {
+    auto const r = resolve_filtered_column(0, column_ids, batch_positions, {7});
+    REQUIRE(r.status == filter_column_status::skipped);
+  }
+
+  SECTION("skipped: a filter naming no column of the scan")
+  {
+    auto const r = resolve_filtered_column(9, column_ids, batch_positions, {});
+    REQUIRE(r.status == filter_column_status::skipped);
+  }
+
+  SECTION("not_in_batch: the scan's column, but never materialized")
+  {
+    std::vector<std::optional<std::size_t>> absent{std::nullopt};
+    auto const r = resolve_filtered_column(0, column_ids, absent, {});
+    REQUIRE(r.status == filter_column_status::not_in_batch);
+    // The primary index still resolves — a caller that fails on this reports
+    // WHICH column was missing.
+    REQUIRE(r.primary_index == 7);
+  }
+
+  SECTION("not_in_batch: a map shorter than the filter's column index")
+  {
+    std::vector<std::optional<std::size_t>> empty;
+    auto const r = resolve_filtered_column(0, column_ids, empty, {});
+    REQUIRE(r.status == filter_column_status::not_in_batch);
+  }
+}
+
+TEST_CASE("decompose_table_filters fails loudly on an unmaterialized column", "[scan]")
+{
+  filter_fixture f{duckdb::LogicalType::BIGINT};
+  f.push(duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::Value::BIGINT(1));
+  // The conjunct has to be evaluated, so a column that is not in the batch is a
+  // wiring bug, not a shape to skip: silently dropping it would return rows the
+  // filter rejects.
+  std::vector<std::optional<std::size_t>> absent{std::nullopt};
+  REQUIRE_THROWS(decompose_table_filters(f.filters, f.column_ids, f.returned_types, absent, {}));
 }

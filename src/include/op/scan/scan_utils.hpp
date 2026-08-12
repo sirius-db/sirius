@@ -25,6 +25,7 @@
 #include <duckdb/planner/table_filter.hpp>
 
 // standard library
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -49,6 +50,40 @@ namespace sirius::op {
  */
 std::vector<std::optional<std::size_t>> build_batch_column_map(
   const duckdb::vector<duckdb::idx_t>& projection_ids, std::size_t column_ids_count);
+
+/// Where a filter's column lands in the decoded batch.
+enum class filter_column_status : std::uint8_t {
+  /// Resolved: the filter constrains @c batch_position of the decoded batch.
+  usable,
+  /// Not this scan's to apply — a hive partition, which DuckDB already enforced
+  /// at the file-list level, or a filter naming no column of the scan.
+  skipped,
+  /// The column is the scan's but is not in the batch. Every caller has to
+  /// decide this one for itself: a filter that must be evaluated cannot
+  /// reference a column that was never materialized (a wiring bug worth
+  /// failing on), while a filter used only to PRUNE can be dropped silently.
+  not_in_batch,
+};
+
+struct resolved_filter_column {
+  filter_column_status status = filter_column_status::skipped;
+  std::size_t primary_index   = 0;
+  std::size_t batch_position  = 0;
+};
+
+/**
+ * @brief Resolve one entry of a TableFilterSet onto the decoded batch.
+ *
+ * The bookkeeping every walk over a filter set repeats: column_index → primary
+ * index → is it ours → which batch column. Shared so the skip rules and the
+ * bounds checks are stated once; what each walk does with a given filter TYPE
+ * is its own business and deliberately not here.
+ */
+[[nodiscard]] resolved_filter_column resolve_filtered_column(
+  duckdb::idx_t column_index,
+  const duckdb::vector<duckdb::ColumnIndex>& column_ids,
+  const std::vector<std::optional<std::size_t>>& batch_position_by_column_id,
+  const std::unordered_set<std::size_t>& skip_primary_indices);
 
 /**
  * @brief One top-level conjunct of a scan's pushed-down filter.
