@@ -15,6 +15,7 @@
  */
 
 #include "catch.hpp"
+#include "data/convertible_gpu_pipeline_task.hpp"
 #include "exec/config.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_scheduler.hpp"
@@ -158,6 +159,123 @@ TEST_CASE("Task queue handles empty queue gracefully", "[pipeline_queue]")
   REQUIRE(global_state->executed_count.load() == 0);
 
   REQUIRE_NOTHROW(executor.stop());
+}
+
+namespace {
+
+/// Poll until @p done() or @p timeout elapses; FAIL the test on timeout.
+template <typename Pred>
+void wait_or_fail(Pred done, std::chrono::seconds timeout, const char* what)
+{
+  const auto start = std::chrono::steady_clock::now();
+  while (!done()) {
+    std::this_thread::sleep_for(10ms);
+    if (std::chrono::steady_clock::now() - start > timeout) { FAIL(what); }
+  }
+}
+
+}  // namespace
+
+// Regression test for the PR #1467 deadlock (scheduler side, minimal mechanism).
+//
+// The downgrade executor returns extracted pipeline tasks to the scheduler's
+// queue via convertible_gpu_pipeline_task's RAII destructor — a direct
+// _task_queue.push() that emits no task_available event. If every executor had
+// already posted device_ready and parked (empty queue) by then, no channel
+// event would ever arrive again and the returned tasks were never dispatched:
+// a permanent all-workers-idle deadlock (SF1000 TPC-H q18, hung 7/7).
+//
+// This stages that interleaving directly: start the scheduler with an empty
+// queue, give the executors time to park, then push a task into the pipeline
+// task queue WITHOUT going through schedule(). The management loop must
+// dispatch it anyway. On the pre-fix event loop this test times out.
+TEST_CASE("Direct queue push after executors park is still dispatched",
+          "[task_scheduler][deadlock-1467]")
+{
+  auto manager = initialize_memory_manager(1);
+  sirius::exec::thread_pool_config gpu_config{2};
+  task_scheduler sched(gpu_config, *manager, sirius::test::make_test_telemetry_context());
+
+  auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
+
+  sched.start();
+  // Let every executor reserve a worker, post its device_ready, and park in
+  // the management loop's ready list against the empty queue. (Generous margin;
+  // if an executor were somehow not yet parked, its later device_ready would
+  // mask the bug and the test would pass spuriously — it can never fail
+  // spuriously.)
+  std::this_thread::sleep_for(500ms);
+
+  // The downgrade-return path: a push that bypasses schedule(), so no
+  // task_available event is emitted — exactly what
+  // convertible_gpu_pipeline_task's destructor does.
+  {
+    auto local_state = std::make_unique<mock_gpu_pipeline_task_local_state>(0, 0);
+    auto task = std::make_unique<mock_gpu_pipeline_task>(0, std::move(local_state), global_state);
+    sched.get_pipeline_task_queue()->push(std::move(task));
+  }
+
+  wait_or_fail([&] { return global_state->executed_count.load() == 1; },
+               10s,
+               "DEADLOCK REGRESSION: silently pushed task was never dispatched "
+               "(management loop asleep with a parked device and a non-empty queue)");
+
+  sched.stop();
+}
+
+// Same deadlock, staged with full fidelity to the downgrade executor's TIER-2
+// pass: tasks are scheduled normally, extracted from the queue with
+// mutable_pop_if (as convertible_gpu_pipeline_task_provider does), and returned
+// through convertible_gpu_pipeline_task's RAII destructor after the executors
+// have drained and parked. The destructor's direct queue push must still get
+// the tasks dispatched.
+TEST_CASE("Tasks extracted and RAII-returned while executors are parked still run",
+          "[task_scheduler][deadlock-1467]")
+{
+  auto manager = initialize_memory_manager(1);
+  sirius::exec::thread_pool_config gpu_config{2};
+  task_scheduler sched(gpu_config, *manager, sirius::test::make_test_telemetry_context());
+
+  auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
+  auto* queue       = sched.get_pipeline_task_queue();
+
+  // Schedule before start(): the tasks sit in the queue and the
+  // task_available events buffer in the channel, so the extraction below
+  // cannot race the matcher.
+  const int num_tasks = 2;  // the captured failure extracted exactly 2 tasks
+  for (int i = 0; i < num_tasks; ++i) {
+    auto local_state = std::make_unique<mock_gpu_pipeline_task_local_state>(i, 0);
+    auto task = std::make_unique<mock_gpu_pipeline_task>(i, std::move(local_state), global_state);
+    sched.schedule(std::move(task));
+  }
+
+  // TIER-2 extraction: pull every task out of the queue, wrapping each so the
+  // RAII destructor returns it (convertible_gpu_pipeline_task_provider does the
+  // same, with a memory-space predicate).
+  std::vector<std::unique_ptr<sirius::convertible_gpu_pipeline_task>> extracted;
+  while (auto t = queue->mutable_pop_if([](sirius::parallel::itask&) { return true; },
+                                        /*front_to_back=*/false)) {
+    extracted.push_back(
+      std::make_unique<sirius::convertible_gpu_pipeline_task>(std::move(*t), *queue));
+  }
+  REQUIRE(extracted.size() == num_tasks);
+
+  // Start the scheduler: the buffered task_available events are consumed
+  // against a now-empty queue, every executor posts device_ready and parks.
+  sched.start();
+  std::this_thread::sleep_for(500ms);
+  REQUIRE(global_state->executed_count.load() == 0);  // nothing to run yet
+
+  // "Conversion finishes": destroying the wrappers pushes the tasks back via
+  // the RAII destructor — the silent return that deadlocked the pre-fix loop.
+  extracted.clear();
+
+  wait_or_fail([&] { return global_state->executed_count.load() == num_tasks; },
+               10s,
+               "DEADLOCK REGRESSION: RAII-returned tasks were never dispatched "
+               "(downgrade return emitted no event and the matcher never re-ran)");
+
+  sched.stop();
 }
 
 TEST_CASE("Task scheduler dispatches tasks with device preference", "[task_scheduler]")
