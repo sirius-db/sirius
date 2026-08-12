@@ -591,7 +591,7 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
     gpu_mem_config gpu_cfg;
     host_mem_config host_cfg;
     disk_mem_config disk_cfg;
-    bool high_level_memory_configured = false;
+    bool high_level_memory_configured     = false;
     bool explicit_high_level_gpu_capacity = false;
 
     if (auto mem_node = r.optional_node("memory")) {
