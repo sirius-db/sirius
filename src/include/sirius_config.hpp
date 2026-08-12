@@ -39,7 +39,9 @@ constexpr uint64_t DEFAULT_BATCH_SIZE = 800ULL * 1024 * 1024;  // 800 MiB
 /// Shared operator batch default: 2.5% of the smallest visible GPU's total memory,
 /// clamped to [512 MiB, 5 GiB]; DEFAULT_BATCH_SIZE when no GPU is visible. Queried
 /// once per process (memoized). operator_params derives its batch members from this,
-/// so every default-constructed instance (config, SET registration) agrees.
+/// so every default-constructed instance agrees. When YAML explicitly configures an
+/// effective GPU capacity, sirius_config narrows the shared defaults from the resolved
+/// memory-space configs before applying explicit operator_params overrides.
 uint64_t derived_default_batch_size();
 
 constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE       = DEFAULT_BATCH_SIZE;

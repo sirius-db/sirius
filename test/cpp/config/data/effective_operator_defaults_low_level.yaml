@@ -1,0 +1,12 @@
+sirius:
+  # Explicit space configs are the active path; this ignored high-level value
+  # guards against accidentally OR-ing the two capacity signals.
+  memory:
+    gpu:
+      usage_limit_bytes: 128MiB
+  space:
+    gpu:
+      - device_id: 0
+        memory_capacity: 512MiB
+      - device_id: 1
+        memory_capacity: 256MiB
