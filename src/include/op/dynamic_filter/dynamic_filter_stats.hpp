@@ -52,33 +52,35 @@ struct dynamic_filter_stats_snapshot {
 /**
  * @brief Connection-lifetime dynamic-filter publication counters, owned by `SiriusContext`
  *
- * `sirius_physical_hash_join` folds each `dynamic_filter_publication_outcome` into this sink
- * through a non-owning pointer handed to it at construction by `sirius_plan_comparison_join`. The
- * owning `SiriusContext` outlives every plan built during a query -- the same lifetime contract as
+ * `dynamic_filter_publication_session` folds each terminal `dynamic_filter_publication_outcome`
+ * into this sink through a non-owning pointer supplied by `sirius_plan_comparison_join`. The owning
+ * `SiriusContext` outlives every plan built during a query -- the same lifetime contract as
  * `dynamic_filter_replica_space`.
  *
  * The fields have three timing classes.
  *
- * `producers_enabled` is a plan-time fact. `sirius_physical_hash_join` increments it when
+ * `producers_enabled` is a plan-time fact. `dynamic_filter_publication_session` increments it when
  * constructed with an enabled `dynamic_filter_publish_plan`, before execution begins. It counts
  * plan constructions, not executed producers: the transparent path builds the physical plan once at
  * prepare and again at execution, so a single query contributes twice per producing join. Compare
  * it across runs or use it as a direction, never as the left side of an accounting identity.
  *
- * The key and filter counters record policy decisions for attempts that reach per-key processing. A
- * source-residency or all-targets-drained return occurs earlier and does not increment them.
+ * The key and filter counters record policy decisions for attempts that reach per-key processing.
+ * One-shot source-residency and all-targets-drained returns occur before that processing.
+ * Accumulated attempts evaluate policy when armed and may therefore record those counters together
+ * with a later all-targets-drained completion.
  *
  * The publication and delivery counters may vary with probe-side draining and target lifetime. Each
  * atomic is coherent independently; `snapshot()` does not provide a transactionally consistent view
  * across fields.
  *
- * The delivery counters classify *build deliveries*, not joins, and they are disjoint but not
- * exhaustive. A delivery that claims the window goes on to either attempt publication or report its
- * source not resident. The first delivery of a wired join that cannot claim increments
- * `publications_skipped_build_not_whole`; that counter is latched, so the same join's later
- * non-claiming deliveries are counted nowhere, and neither is a delivery arriving after the window
- * has closed. Only the not-whole counter is latched -- the others can fire repeatedly for one join,
- * because a broadcast build delivers one batch per GPU.
+ * Session counters describe publication claims rather than disjoint build deliveries.
+ * `publication_attempts` begins when one-shot publication claims the session or accumulated-claim
+ * initialization begins, and exactly one finished or failed terminal counter follows. Outside that
+ * lifecycle, an otherwise eligible whole-build delivery that is not GPU resident increments
+ * `publications_skipped_source_not_resident` without claiming the session, so broadcast deliveries
+ * may repeat it. The caller latches `publications_skipped_build_not_whole` once per join.
+ * Deliveries after the session closes are counted nowhere.
  */
 struct dynamic_filter_stats {
   // Plan-time fact
@@ -98,7 +100,7 @@ struct dynamic_filter_stats {
 
   // Opportunistic delivery
   std::atomic<std::uint64_t> publication_attempts{
-    0};  ///< OPEN to PUBLISHING or ACCUMULATING transitions
+    0};  ///< OPEN claim initialization, including accumulator construction failure
   std::atomic<std::uint64_t> publications_finished{0};
   std::atomic<std::uint64_t> publications_failed{0};
   /// Build batch was not GPU-resident at delivery; publication skipped without claiming
@@ -106,7 +108,7 @@ struct dynamic_filter_stats {
   /// First build delivery for a wired join that is still OPEN but lacks a whole-build batch;
   /// counted once per join.
   std::atomic<std::uint64_t> publications_skipped_build_not_whole{0};
-  /// Attempt hit the all-targets-drained early return; no deterministic counter moved for it
+  /// Attempt found every target drained; accumulated attempts may retain arm-time policy counters
   std::atomic<std::uint64_t> publications_skipped_targets_drained{0};
   std::atomic<std::uint64_t> filters_pushed{0};  ///< Accepted pushes; drain-dependent
 

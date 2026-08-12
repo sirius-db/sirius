@@ -31,6 +31,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <limits>
 #include <list>
 #include <memory>
@@ -229,25 +230,18 @@ class operator_data {
  *   - get_data_batches() populates _data_batches from _read_only_data_batches if needed
  *   - get_read_only_batches() populates _read_only_data_batches from _data_batches if needed
  *
- * prepare_for_processing() locks idle batches and stores the result in
- * _read_only_data_batches. remove_read_only_lock() releases all shared locks.
+ * prepare_for_processing() locks idle batches and stores the result in _read_only_data_batches.
+ * remove_read_only_lock() releases all shared locks. A payload constructed with exactly one
+ * non-null batch captures that batch's task-input ID, which remains unchanged when preparation
+ * replaces the physical batch with a clone.
  */
 class pipelineable_operator_data : public operator_data {
  public:
-  pipelineable_operator_data()
-  {
-    _data_batches = std::vector<std::shared_ptr<::cucascade::data_batch>>();
-  }
+  pipelineable_operator_data();
   explicit pipelineable_operator_data(
-    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
-    : _data_batches(std::move(data_batches))
-  {
-  }
+    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches);
   explicit pipelineable_operator_data(
-    std::vector<::cucascade::read_only_data_batch> read_only_data_batches)
-    : _read_only_data_batches(std::move(read_only_data_batches))
-  {
-  }
+    std::vector<::cucascade::read_only_data_batch> read_only_data_batches);
 
   [[nodiscard]] operator_data_type get_type() const override
   {
@@ -265,6 +259,14 @@ class pipelineable_operator_data : public operator_data {
    */
   [[nodiscard]] std::vector<::cucascade::read_only_data_batch> get_read_only_batches(
     bool leave_locked = false) const;
+
+  /**
+   * @brief Get the immutable task-input ID
+   *
+   * @return Captured ID for a payload constructed with exactly one non-null batch; std::nullopt
+   * otherwise
+   */
+  [[nodiscard]] std::optional<std::uint64_t> task_input_batch_id() const noexcept;
 
   /**
    * @brief Release all read-only locks by resetting _read_only_data_batches.
@@ -318,6 +320,7 @@ class pipelineable_operator_data : public operator_data {
  private:
   mutable std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> _data_batches;
   mutable std::optional<std::vector<::cucascade::read_only_data_batch>> _read_only_data_batches;
+  std::optional<std::uint64_t> _task_input_batch_id;
 };
 
 /**

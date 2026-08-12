@@ -60,7 +60,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <format>
-#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
@@ -84,22 +83,6 @@ static void collect_bound_ref_indices(const duckdb::Expression& expr,
 static bool is_equality(sirius::comparison_type c)
 {
   return c == sirius::comparison_type::equal || c == sirius::comparison_type::not_distinct_from;
-}
-
-static void fold_dynamic_filter_outcome(dynamic_filter_stats& stats,
-                                        dynamic_filter_publication_outcome const& outcome) noexcept
-{
-  auto const relaxed = std::memory_order_relaxed;
-  stats.keys_considered.fetch_add(outcome.keys_considered, relaxed);
-  stats.keys_with_known_domain.fetch_add(outcome.keys_with_known_domain, relaxed);
-  stats.keys_skipped_domain_gate.fetch_add(outcome.keys_skipped_domain_gate, relaxed);
-  stats.keys_skipped_bloom_size_gate.fetch_add(outcome.keys_skipped_bloom_size_gate, relaxed);
-  stats.keys_skipped_type_mismatch.fetch_add(outcome.keys_skipped_type_mismatch, relaxed);
-  stats.keys_build_exceeded_domain.fetch_add(outcome.keys_build_exceeded_domain, relaxed);
-  stats.membership_filters_built.fetch_add(outcome.membership_filters_built, relaxed);
-  stats.zone_map_filters_built.fetch_add(outcome.zone_map_filters_built, relaxed);
-  stats.publications_skipped_targets_drained.fetch_add(outcome.skipped_targets_drained, relaxed);
-  stats.filters_pushed.fetch_add(outcome.filters_pushed, relaxed);
 }
 
 static cudf::filtered_join make_right_filtered_join(cudf::table_view const& right_keys,
@@ -253,7 +236,8 @@ sirius_physical_hash_join::sirius_physical_hash_join(
     join_type(join_type),
     delim_types(std::move(delim_types)),
     _dynamic_filter_plan(std::move(dynamic_filter_plan)),
-    _enable_dynamic_filter_multi_partition(enable_dynamic_filter_multi_partition)
+    _dynamic_filter_publication_session(
+      _dynamic_filter_plan, dynamic_filter_stats_sink, enable_dynamic_filter_multi_partition)
 {
   _max_build_hash_table_bytes = max_build_hash_table_bytes;
   _hash_partition_bytes       = hash_partition_bytes;
@@ -284,11 +268,6 @@ sirius_physical_hash_join::sirius_physical_hash_join(
       }
     }
     if (saw_null_safe && !saw_plain_equal) { compare_nulls_ = cudf::null_equality::EQUAL; }
-  }
-
-  _dynamic_filter_stats = dynamic_filter_stats_sink;
-  if (_dynamic_filter_stats != nullptr && _dynamic_filter_plan.enabled()) {
-    _dynamic_filter_stats->producers_enabled.fetch_add(1, std::memory_order_relaxed);
   }
 
   children.push_back(std::move(left));
@@ -832,94 +811,22 @@ bool sirius_physical_hash_join::publishes_dynamic_filters() const
 {
   // Fixed at construction, so this needs no lock. An enabled plan means probe targets are
   // wired; DuckDB's pushdown metadata is consumed at plan time and never reaches the operator.
-  return _dynamic_filter_plan.enabled();
+  return _dynamic_filter_publication_session.enabled();
 }
 
 bool sirius_physical_hash_join::arm_multi_partition_dynamic_filters(
-  uint64_t build_rows, std::vector<uint64_t> build_batch_ids, int num_partitions)
+  complete_build_snapshot snapshot)
 {
-  if (!wants_multi_partition_dynamic_filters() || num_partitions <= 1 || build_batch_ids.empty()) {
-    return false;
-  }
+  if (!wants_multi_partition_dynamic_filters()) { return false; }
 
   std::scoped_lock lock(op_state_mutex);
-  if (_broadcast || _dynamic_filter_publication_state.load(std::memory_order_acquire) !=
-                      dynamic_filter_publication_state::OPEN) {
-    return false;
-  }
-
-  _dynamic_filter_publication_state.store(dynamic_filter_publication_state::ACCUMULATING,
-                                          std::memory_order_release);
-  if (_dynamic_filter_stats != nullptr) {
-    _dynamic_filter_stats->publication_attempts.fetch_add(1, std::memory_order_relaxed);
-  }
-  try {
-    if constexpr (sizeof(std::size_t) < sizeof(uint64_t)) {
-      if (build_rows > static_cast<uint64_t>(std::numeric_limits<std::size_t>::max())) {
-        throw std::overflow_error("global dynamic Bloom row count exceeds size_t");
-      }
-    }
-    auto const expected_count   = build_batch_ids.size();
-    _dynamic_filter_accumulator = std::make_shared<dynamic_filter_accumulator>(
-      _dynamic_filter_plan, static_cast<std::size_t>(build_rows), std::move(build_batch_ids));
-    SIRIUS_LOG_DEBUG(
-      "[sirius_physical_hash_join] armed global dynamic Bloom for {} exact build batch(es), "
-      "{} rows, {} partition(s).",
-      expected_count,
-      build_rows,
-      num_partitions);
-    return true;
-  } catch (std::exception const& error) {
-    _dynamic_filter_accumulator.reset();
-    _dynamic_filter_publication_state.store(dynamic_filter_publication_state::FAILED,
-                                            std::memory_order_release);
-    if (_dynamic_filter_stats != nullptr) {
-      _dynamic_filter_stats->publications_failed.fetch_add(1, std::memory_order_relaxed);
-    }
-    SIRIUS_LOG_WARN("[sirius_physical_hash_join] global dynamic Bloom disabled for this join: {}",
-                    error.what());
-    return false;
-  }
+  return !_broadcast && _dynamic_filter_publication_session.try_arm(std::move(snapshot));
 }
 
 void sirius_physical_hash_join::contribute_dynamic_filter_build_batch(
   uint64_t batch_id, cudf::table_view const& build_view, rmm::cuda_stream_view stream)
 {
-  std::shared_ptr<dynamic_filter_accumulator> accumulator;
-  {
-    std::scoped_lock lock(op_state_mutex);
-    if (_dynamic_filter_publication_state.load(std::memory_order_acquire) !=
-        dynamic_filter_publication_state::ACCUMULATING) {
-      return;
-    }
-    accumulator = _dynamic_filter_accumulator;
-  }
-  if (!accumulator) { return; }
-
-  auto const result = accumulator->contribute(batch_id, build_view, stream);
-  if (result.state == dynamic_filter_accumulation_result::status::published) {
-    auto expected = dynamic_filter_publication_state::ACCUMULATING;
-    if (_dynamic_filter_publication_state.compare_exchange_strong(
-          expected,
-          dynamic_filter_publication_state::FINISHED,
-          std::memory_order_acq_rel,
-          std::memory_order_acquire) &&
-        _dynamic_filter_stats != nullptr) {
-      fold_dynamic_filter_outcome(*_dynamic_filter_stats, result.publication);
-      _dynamic_filter_stats->publications_finished.fetch_add(1, std::memory_order_relaxed);
-    }
-  } else if (result.state == dynamic_filter_accumulation_result::status::aborted) {
-    auto expected = dynamic_filter_publication_state::ACCUMULATING;
-    if (_dynamic_filter_publication_state.compare_exchange_strong(
-          expected,
-          dynamic_filter_publication_state::FAILED,
-          std::memory_order_acq_rel,
-          std::memory_order_acquire) &&
-        _dynamic_filter_stats != nullptr) {
-      fold_dynamic_filter_outcome(*_dynamic_filter_stats, result.publication);
-      _dynamic_filter_stats->publications_failed.fetch_add(1, std::memory_order_relaxed);
-    }
-  }
+  _dynamic_filter_publication_session.contribute(batch_id, build_view, stream);
 }
 
 void sirius_physical_hash_join::set_build_arrives_whole(bool arrives_whole)
@@ -2068,55 +1975,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
 void sirius_physical_hash_join::publish_dynamic_filters(cudf::table_view const& build_view,
                                                         rmm::cuda_stream_view stream)
 {
-  // Serialize with accumulator arming so exactly one path can claim OPEN.
-  {
-    std::scoped_lock lock(op_state_mutex);
-    if (_dynamic_filter_publication_state.load(std::memory_order_acquire) !=
-        dynamic_filter_publication_state::OPEN) {
-      return;
-    }
-    _dynamic_filter_publication_state.store(dynamic_filter_publication_state::PUBLISHING,
-                                            std::memory_order_release);
-  }
-
-  if (_dynamic_filter_stats != nullptr) {
-    _dynamic_filter_stats->publication_attempts.fetch_add(1, std::memory_order_relaxed);
-  }
-  try {
-    if (_dynamic_filter_plan.enabled()) {
-      auto const outcome =
-        sirius::op::publish_dynamic_filters(_dynamic_filter_plan, build_view, stream);
-      SIRIUS_LOG_DEBUG(
-        "[sirius_physical_hash_join] dynamic-filter publication: {} key(s) considered, {} skipped "
-        "(domain gate), {} skipped (Bloom size gate), {} skipped (type mismatch), {} membership + "
-        "{} zone-map built, {} "
-        "filter(s) "
-        "pushed across {} active target(s).",
-        outcome.keys_considered,
-        outcome.keys_skipped_domain_gate,
-        outcome.keys_skipped_bloom_size_gate,
-        outcome.keys_skipped_type_mismatch,
-        outcome.membership_filters_built,
-        outcome.zone_map_filters_built,
-        outcome.filters_pushed,
-        outcome.active_targets);
-      if (_dynamic_filter_stats != nullptr) {
-        fold_dynamic_filter_outcome(*_dynamic_filter_stats, outcome);
-      }
-    }
-    _dynamic_filter_publication_state.store(dynamic_filter_publication_state::FINISHED,
-                                            std::memory_order_release);
-    if (_dynamic_filter_stats != nullptr) {
-      _dynamic_filter_stats->publications_finished.fetch_add(1, std::memory_order_relaxed);
-    }
-  } catch (...) {
-    _dynamic_filter_publication_state.store(dynamic_filter_publication_state::FAILED,
-                                            std::memory_order_release);
-    if (_dynamic_filter_stats != nullptr) {
-      _dynamic_filter_stats->publications_failed.fetch_add(1, std::memory_order_relaxed);
-    }
-    throw;
-  }
+  _dynamic_filter_publication_session.publish_one_shot(build_view, stream);
 }
 //===----------------------------------------------------------------------===//
 
@@ -2142,9 +2001,8 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
     HASH_JOIN_MODE mode     = HASH_JOIN_MODE::STANDARD;
     {
       std::scoped_lock lg(op_state_mutex);
-      const bool open = _dynamic_filter_publication_state.load(std::memory_order_acquire) ==
-                        dynamic_filter_publication_state::OPEN;
-      const bool wired = _dynamic_filter_plan.enabled();
+      auto const open  = _dynamic_filter_publication_session.is_open();
+      auto const wired = _dynamic_filter_publication_session.enabled();
       claim            = open && wired && _build_arrives_whole;
 
       // A join that has a filter plan and is still open but cannot use the one-shot publisher
@@ -2167,10 +2025,7 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
         mode == HASH_JOIN_MODE::BUILD_PROBE  ? "BUILD_PROBE"
         : mode == HASH_JOIN_MODE::MIXED_JOIN ? "MIXED_JOIN"
                                              : "STANDARD");
-      if (_dynamic_filter_stats != nullptr) {
-        _dynamic_filter_stats->publications_skipped_build_not_whole.fetch_add(
-          1, std::memory_order_relaxed);
-      }
+      _dynamic_filter_publication_session.record_build_not_whole();
     }
     if (claim) { build_ro.emplace(batch->to_read_only()); }
   }
@@ -2186,10 +2041,7 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
   // Non-GPU residency here means the batch was already downgraded before this delivery (it can be
   // shared with an earlier consumer, e.g. CTE fan-out). Publication is best-effort: skip it.
   if (!ms || build_ro->get_current_tier() != ::cucascade::memory::Tier::GPU) {
-    if (_dynamic_filter_stats != nullptr) {
-      _dynamic_filter_stats->publications_skipped_source_not_resident.fetch_add(
-        1, std::memory_order_relaxed);
-    }
+    _dynamic_filter_publication_session.record_source_not_resident();
     return;
   }
 
@@ -2220,38 +2072,7 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
 
 void sirius_physical_hash_join::on_finalize_operator()
 {
-  std::shared_ptr<dynamic_filter_accumulator> accumulator;
-  {
-    std::scoped_lock lock(op_state_mutex);
-    auto expected = dynamic_filter_publication_state::OPEN;
-    _dynamic_filter_publication_state.compare_exchange_strong(
-      expected,
-      dynamic_filter_publication_state::CLOSED,
-      std::memory_order_acq_rel,
-      std::memory_order_acquire);
-    if (_dynamic_filter_publication_state.load(std::memory_order_acquire) ==
-        dynamic_filter_publication_state::ACCUMULATING) {
-      accumulator = _dynamic_filter_accumulator;
-    }
-  }
-
-  if (accumulator) {
-    auto const outcome = accumulator->abort_if_incomplete();
-    auto expected      = dynamic_filter_publication_state::ACCUMULATING;
-    if (outcome && _dynamic_filter_publication_state.compare_exchange_strong(
-                     expected,
-                     dynamic_filter_publication_state::FAILED,
-                     std::memory_order_acq_rel,
-                     std::memory_order_acquire)) {
-      SIRIUS_LOG_WARN(
-        "[sirius_physical_hash_join] global dynamic Bloom closed with a missing build "
-        "contribution; no filter was published.");
-      if (_dynamic_filter_stats != nullptr) {
-        fold_dynamic_filter_outcome(*_dynamic_filter_stats, *outcome);
-        _dynamic_filter_stats->publications_failed.fetch_add(1, std::memory_order_relaxed);
-      }
-    }
-  }
+  _dynamic_filter_publication_session.finalize_or_abort();
 
   std::scoped_lock lock(op_state_mutex);
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {

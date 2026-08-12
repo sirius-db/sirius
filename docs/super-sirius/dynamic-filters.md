@@ -48,7 +48,7 @@ flowchart LR
     end
 
     subgraph RUN["Runtime"]
-        JOIN["sirius_physical_hash_join<br/>dynamic_filter_publisher"]
+        JOIN["sirius_physical_hash_join<br/>source readiness + dynamic_filter_publication_session"]
         CHANNEL["shared sirius_dynamic_filter_set<br/>append-only publication channel"]
         READER["parquet_gpu_ingestible<br/>zone-map AST at read (parquet only)"]
         APPLY["sirius_physical_dynamic_filter<br/>IN-list / Bloom post-decode<br/>+ zone-map row masks on duckdb-native"]
@@ -227,7 +227,7 @@ Admission keeps five persisted coordinates distinct:
 The entry and exit ordinals relate only through the walk. Every other index (a target index
 selecting matching target entries) aligns plan-construction vectors only and persists nowhere.
 
-The planner freezes routing, placement, and policy into the hash join's `const dynamic_filter_publish_plan`. Each `dynamic_filter_replica_space` pairs one target GPU space with its selected HOST staging space. The build-port hook claims publication as soon as the complete build batch arrives, holding the batch's read-only accessor from before it is routed so the GPU representation cannot be downgraded underneath publication. The producer builds and replicates each filter, then fans it into the accepting channels. Finalization only closes an unclaimed publication window.
+The planner freezes routing, placement, and policy into the hash join's retained `dynamic_filter_publish_plan`. Each `dynamic_filter_replica_space` pairs one target GPU space with its selected HOST staging space. The hash join owns source readiness, pre-route pinning, stream acquisition, routing, and teardown; its `dynamic_filter_publication_session` owns the one-shot-versus-accumulator claim, accumulator lifetime, terminal outcome folding, and exactly-once statistics. Finalization closes an unclaimed window or aborts an incomplete accumulator but never constructs a filter.
 
 A **consumer** holds the channel directly via `std::shared_ptr<sirius_dynamic_filter_set> sirius_dynamic_filters` and reads from it during execution.
 
@@ -247,7 +247,7 @@ This is an ordering property of the producing join's **immediate** probe edge, n
 sequenceDiagram
     participant B as Build GPU_SCAN / PARTITION
     participant C as Build CONCAT (concat_all)
-    participant J as Hash join (build arrives whole)
+    participant J as Hash join / publication session
     participant R as Device replica spaces
     participant F as Dynamic-filter channel(s)
     participant T as task_creator
@@ -388,14 +388,12 @@ The normal path is deliberately ordered:
 1. Pipeline construction places the build child before the probe child. The remainder of this sequence applies when partitioning selects `BUILD_PROBE`.
 2. Build `PARTITION` selects `BUILD_PROBE` only when a build-side CONCAT can fold the input, then sets that CONCAT to `concat_all`.
 3. Build CONCAT waits for its source pipeline, folds the complete build side to one GPU batch, and synchronously calls `push_data_batch_partitioned("build", batch)`.
-4. The hook acquires the batch's read-only accessor before routing it — once deposited into a repository the batch becomes a downgrade candidate, and the shared lock pins its GPU representation until publication completes. It then waits for the representation's writer event, claims `OPEN -> PUBLISHING`, constructs the selected filters, completes device replication, pushes the immutable filters into every accepting channel, and stores `FINISHED` before returning.
+4. The hook acquires the batch's read-only accessor before routing it -- once deposited into a repository the batch becomes a downgrade candidate, and the shared lock pins its GPU representation until publication completes. It then waits for the representation's writer event and calls `dynamic_filter_publication_session::publish_one_shot`; the session claims `OPEN -> PUBLISHING`, constructs the selected filters without its mutex held, completes device replication and fan-out, folds the terminal outcome once, and stores `FINISHED` before returning.
 5. Only after the CONCAT task returns does downstream task creation ask the join for its next hint and follow `WAITING_FOR_INPUT_DATA` into the immediate probe producer. A scan on that edge therefore cannot run while normal build-port publication is in progress.
 
-The one-shot publish gate is `OPEN && _dynamic_filter_plan.enabled() && _build_arrives_whole` in
-`sirius_physical_hash_join::push_data_batch_partitioned`. The batch it claims must carry the whole
-build side: a filter built from a slice of the key set would drop probe rows that do in fact join.
-The join mode is deliberately not part of the condition -- a single-partition STANDARD or
-MIXED_JOIN build publishes on the same terms as a `BUILD_PROBE` one.
+If one-shot construction throws after queuing source reads, it best-effort synchronizes the construction stream before the exception leaves the publication call and preserves the original exception. The hook can therefore release its pinned build accessor during unwinding without racing queued GPU work.
+
+`sirius_physical_hash_join::push_data_batch_partitioned` offers one-shot publication only while its `dynamic_filter_publication_session` is open, the retained plan is enabled, and `_build_arrives_whole` is true. `dynamic_filter_publication_session::publish_one_shot` then performs the `OPEN -> PUBLISHING` claim. The batch must carry the whole build side: a filter built from a slice of the key set would drop probe rows that do in fact join. The join mode is deliberately not part of this gate -- a single-partition STANDARD or MIXED_JOIN build publishes on the same terms as a `BUILD_PROBE` one.
 
 That equivalence is about the *gate*, not the *ordering*. The sequence above holds only for `BUILD_PROBE`, whose probe edge cannot be scheduled until the build CONCAT task returns. A non-BUILD_PROBE join instead cross-schedules build and probe pairs as batches arrive on either side (`refresh_cross_schedule` / `peek_cross_schedule_kind`), so nothing holds its probe edge back while publication runs. The newly admitted publishers therefore get opportunistic delivery even on their own probe edge, exactly as [transitive scan targets](#transitive-scan-targets-and-publication-timing) always have: correctness never depends on the filter arriving, only the amount of pruning does.
 
@@ -404,19 +402,11 @@ That equivalence is about the *gate*, not the *ordering*. The sequence above hol
 - **`BUILD_PROBE`** — whole iff `num_partitions == 1 || broadcast`. Under broadcast the small build table is replicated to every GPU, so each partition's `concat_all`-folded batch is the full build.
 - **Any other mode** — a build-side sizing decision that lands in one partition, for a join whose `publishes_dynamic_filters()` is true. The PARTITION then enables build-side `concat_all` on itself or its sibling; the build arrives whole only if such a CONCAT was found, so this is best effort. The canonical client is the **`MIXED_JOIN`** (equality plus inequality conditions), which `compute_hash_join_partition_strategy` excludes from `BUILD_PROBE` and which therefore could not publish at all before. Full-outer joins and builds too large for the hash-table budget reach it the same way. Build-side sizing is a real precondition for this one-shot path; a right-family join sized from its probe may instead use the multi-partition accumulator after the build FULL barrier completes.
 
-Under broadcast there is one build CONCAT per GPU, each racing the build-port hook; the shared
-`OPEN -> PUBLISHING` claim selects exactly one publisher before filter construction.
+Under broadcast there is one build CONCAT per GPU, each racing the build-port hook; `dynamic_filter_publication_session` grants exactly one `OPEN -> PUBLISHING` claim before filter construction.
 
-For a genuinely hash-partitioned, non-broadcast build,
-`enable_dynamic_filter_multi_partition` (default **false**) enables a separate exact-ID path. At
-the build PARTITION's FULL barrier, before the first original batch is popped, the operator freezes
-the complete batch-ID set and row count. Each original batch inserts its admitted INT32/INT64 keys
-into one full-global-geometry Bloom partial on its producing GPU before scatter. Duplicate or
-in-flight IDs do not advance completion; an unknown, missing, incompatible, or failed contribution
-publishes nothing. The last complete contribution OR-reduces device partials on the lowest planned
-GPU using bounded 4 MiB scratch, strictly prepares every planned replica, and only then fans one
-immutable global Bloom through the existing sparse target bindings. No source partial enters a
-channel, and no filter ownership is added to CONCAT.
+For a genuinely hash-partitioned, non-broadcast build, `enable_dynamic_filter_multi_partition` (default **false**) enables a separate exact-ID path. At the build PARTITION's FULL barrier, `sirius_physical_partition::try_freeze_complete_build` creates a move-owned `complete_build_snapshot` before the first original batch is popped. PARTITION supplies the complete original batch IDs and exact global row count; the snapshot structurally validates non-empty unique IDs, row-count representability as `std::size_t`, and a selected partition count greater than one. Zero build rows are valid. Moving a snapshot invalidates the source object, and `dynamic_filter_publication_session::try_arm` rejects invalid or moved-from values before claiming the session or incrementing `publication_attempts`.
+
+Each one-batch PARTITION payload captures its popped batch's immutable task-input ID. Cross-GPU preparation may replace that batch with a fresh-ID physical clone, and retry may retain the clone, but PARTITION always contributes the captured task-input ID that the frozen snapshot expects. Each original batch inserts its admitted INT32/INT64 keys into one full-global-geometry Bloom partial on its producing GPU before scatter. Duplicate or in-flight IDs do not advance completion; an unknown, missing, incompatible, or failed contribution publishes nothing. A zero-row snapshot completes without constructing a Bloom. The last complete contribution OR-reduces device partials on the lowest planned GPU using bounded 4 MiB scratch, strictly prepares every planned replica, and only then fans one immutable global Bloom through the existing sparse target bindings. No source partial enters a channel, and no filter ownership is added to CONCAT.
 
 A wired join that can use neither the whole-build path nor an armed accumulator would otherwise
 publish nothing silently, so the first build delivery that observes the condition logs a
@@ -436,7 +426,7 @@ retain PR #1277's best-effort per-target replica behavior. The accumulated path 
 stricter: if any planned replica cannot be completed, it aborts before fan-out so no target can
 observe only a subset of the global publication.
 
-A batch that arrives already non-GPU-resident (possible only when it was shared with an earlier consumer, e.g. CTE fan-out, and downgraded before delivery) skips publication -- filters are optional. `on_finalize_operator` never publishes; it changes an unclaimed `OPEN` state to `CLOSED` or atomically aborts an incomplete `ACCUMULATING` state. GPU construction and replication run without holding `op_state_mutex`.
+A batch that arrives already non-GPU-resident (possible only when it was shared with an earlier consumer, e.g. CTE fan-out, and downgraded before delivery) skips publication -- filters are optional. `sirius_physical_hash_join::on_finalize_operator` delegates to `dynamic_filter_publication_session::finalize_or_abort`, which closes an unclaimed `OPEN` state or atomically aborts an incomplete `ACCUMULATING` state but never publishes. The session mutex protects arbitration, accumulator ownership, and terminal statistics only; GPU construction, insertion, synchronization, reduction, replication, and fan-out run without either the session mutex or `op_state_mutex`. A terminal transition drops the session's accumulator reference, while any in-flight contribution keeps its own shared reference until it returns.
 
 Replica bytes use direct peer DMA where empirically verified, otherwise they borrow chunked pre-pinned storage from the planned Sirius/CuCascade HOST memory space. The dynamic-filter code performs no direct pinned allocation and does not modify CuCascade. See [dynamic-filters-multi-gpu.md](dynamic-filters-multi-gpu.md) for the replica design and validation.
 
@@ -469,7 +459,7 @@ key set whose bounds span the whole domain — even a highly selective build can
 - **`sirius_dynamic_in_list_filter`** — hash-based membership via a persistent `cuco::static_set`, with a device kernel probing its read-only set reference. It is exact for representable set keys and conservatively passes cuCO's reserved empty-key value, so it remains a safe join-filter superset.
 - **`sirius_dynamic_bloom_filter`** — a `cuco::bloom_filter` (PIMPL'd in a `.cu`; INT32/INT64 keys), a few bits/key, for large builds where the hash IN-list is too big. False positives only let extra rows through — harmless, because the join is authoritative; no false negatives means a true match is never dropped.
 
-**Producer policy** (`dynamic_filter_publisher::publish`). The feature switch `enable_dynamic_filter` emits at most one **membership filter** per key, in this order:
+**One-shot producer policy** (`publish_dynamic_filters`). The feature switch `enable_dynamic_filter` emits at most one **membership filter** per key, in this order:
 
 1. Use the raw-needle exact IN-list when `sirius_dynamic_small_in_list_filter::supports(col)` sees 1–12 null-free INT32/INT64 build rows. The gate uses the view's row count, including duplicates; it does not compute distinct cardinality.
 2. Otherwise use the hash IN-list when the column is supported and its estimated `cuco::static_set` footprint fits the minimum L2 size across the active probe GPUs.
@@ -518,7 +508,9 @@ Set `dynamic_filter_domain_coverage_threshold` above 1.0 to disable the coverage
 
 #### Observability
 
-`SiriusContext` owns connection-lifetime cumulative counters, read through `get_dynamic_filter_stats_snapshot()`; tests take before/after snapshots around a query. The counters split into three families and the split is a contract. `producers_enabled` stands alone as a **plan-time fact**: the hash-join constructor increments it on receiving an enabled plan, before execution begins, so nothing races it. It counts plan constructions rather than executed producers -- the transparent path builds the Sirius plan twice per query, once as a discarded validation plan at prepare and once at execution -- so read it as a direction or compare it across runs, and never anchor an accounting identity on it. It is an honest capability signal: discovery creates a target only when a key actually binds, so an enabled producer always has at least one bound key and a publication attempt that can push. The **policy-decision** family (`keys_considered`, `keys_with_known_domain`, `keys_skipped_domain_gate`, `keys_skipped_bloom_size_gate`, `keys_skipped_type_mismatch`, `keys_build_exceeded_domain`, filters built) is deterministic for attempts that reach per-key processing, and is the anchor for gate regressions. The **delivery** family (attempts, finished/failed, source-not-resident, build-not-whole, targets-drained, `filters_pushed`) races probe-side draining and target liveness: assert it as deltas or directions, never as an equality anchor. `keys_with_known_domain` means only that nonzero row evidence exists -- uniqueness is separate, so the counter alone does not mean the gate was armed.
+`SiriusContext` owns connection-lifetime cumulative counters, read through `get_dynamic_filter_stats_snapshot()`; tests take before/after snapshots around a query. The counters split into three families and the split is a contract. `producers_enabled` stands alone as a **plan-time fact**: `dynamic_filter_publication_session` increments it when constructed with an enabled plan and a non-null sink, before execution begins. It counts plan constructions rather than executed producers -- the transparent path builds the Sirius plan twice per query, once as a discarded validation plan at prepare and once at execution -- so read it as a direction or compare it across runs, and never anchor an accounting identity on it. It is an honest capability signal: discovery creates a target only when a key actually binds, so an enabled producer always has at least one bound key and a publication attempt that can push. The **policy-decision** family (`keys_considered`, `keys_with_known_domain`, `keys_skipped_domain_gate`, `keys_skipped_bloom_size_gate`, `keys_skipped_type_mismatch`, `keys_build_exceeded_domain`, filters built) is deterministic for attempts that reach per-key processing, and is the anchor for gate regressions. One-shot all-targets-drained publication returns before per-key processing; accumulated publication evaluates policy when the session is armed, so a target that drains before completion may record both policy counters and `publications_skipped_targets_drained`. The **delivery** family (attempts, finished/failed, source-not-resident, build-not-whole, targets-drained, `filters_pushed`) races probe-side draining and target liveness: assert it as deltas or directions, never as an equality anchor. `keys_with_known_domain` means only that nonzero row evidence exists -- uniqueness is separate, so the counter alone does not mean the gate was armed.
+
+`publication_attempts` starts when one-shot publication claims the session or when accumulated-claim initialization begins; an accumulator-construction failure therefore records both an attempt and a failure. A nonresident or not-whole diagnostic is recorded only while the session remains open.
 
 `publications_skipped_build_not_whole` is the delivery family's one per-join counter: it records a
 wired join that can claim neither a whole-build one-shot publication nor an enabled exact-ID
@@ -643,8 +635,8 @@ Which test pins which contract, so a change to one knows where its guard lives:
 | `test/cpp/planner/test_dynamic_filter_target_discovery.cpp` | The discovery rules: which hop each operator kind accepts (FILTER and UNION fan-out included), how the traced ordinal is remapped, the SIP policy bit, the producer join-type gate, and that trace and splice agree |
 | `test/cpp/planner/test_dynamic_filter_discovery_parity.cpp` | Per-key parity with DuckDB's own `GetPushdownFilterTargets`, with every conservative divergence (LIMIT, TOP_N, cast crossing, joint-bail) asserted on BOTH sides |
 | `test/cpp/operator/test_dynamic_filter_source_policy.cpp` | Membership-representation selection and both publication gates, as pure functions with no device |
-| `test/cpp/operator/test_dynamic_filter_publisher.cpp` | Publication builds filters only for bound keys and fans out sparsely; accumulator cases pin exact-ID completion, duplicate suppression, fail-closed mismatch behavior, and Bloom OR without false negatives |
-| `test/cpp/operator/test_dynamic_filter_publication_claim.cpp` | The build-port claim reads only `_build_arrives_whole`, while the multi-partition claim arms exactly once and finalization aborts an incomplete accumulator |
+| `test/cpp/operator/test_dynamic_filter_publisher.cpp` | Publication builds filters only for bound keys and fans out sparsely; snapshot and PARTITION-summary validation, exact-ID accumulation, terminal statistics, drained targets, and both finalize-versus-final-contribution winners are pinned directly |
+| `test/cpp/operator/test_dynamic_filter_publication_claim.cpp` | The hash-join facade reads `_build_arrives_whole`, retries after a nonresident delivery, and delegates terminal statistics; real-repository PARTITION cases pin the FULL-barrier freeze, exact IDs and rows including zero-row batches, fail-open inputs, and clone-stable task identity |
 | `test/cpp/planner/test_plan_tree_shape.cpp` | Where the endpoint sits in the finished plan tree, including on a join's build input, and that no endpoint appears when a guard rejects the key |
 | `test/cpp/pipeline/test_pipeline_dynamic_filter_native_shape.cpp` | Every endpoint is fed pipelineable data, never a PARTITION's output, on both routes |
 | `test/cpp/integration/test_gpu_execution_dynamic_filter_native.cpp` | Scan-route results match CPU exactly, and the coverage gate fires and stays quiet where it should |

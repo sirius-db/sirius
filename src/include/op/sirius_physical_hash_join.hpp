@@ -28,8 +28,7 @@
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "expression/ast/node.hpp"  // complete sirius::ast::node for join_condition's destructor
 #include "expression/join_condition.hpp"
-#include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
-#include "op/dynamic_filter/dynamic_filter_stats.hpp"
+#include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "sirius_config.hpp"
 #include "utils.hpp"
@@ -332,21 +331,17 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   [[nodiscard]] bool wants_multi_partition_dynamic_filters() const noexcept
   {
-    return _enable_dynamic_filter_multi_partition && _dynamic_filter_plan.enabled();
+    return _dynamic_filter_publication_session.wants_multi_partition();
   }
 
   /**
    * @brief Attempt to arm accumulation from a complete pre-scatter build snapshot
    *
-   * @param[in] build_rows Complete build row count
-   * @param[in] build_batch_ids Complete set of original batch IDs
-   * @param[in] num_partitions Planned build partition count
+   * @param[in] snapshot Complete pre-scatter build identity and row geometry
    * @return True if this call armed the accumulator; false if ineligible, already claimed, or
    * initialization failed
    */
-  [[nodiscard]] bool arm_multi_partition_dynamic_filters(uint64_t build_rows,
-                                                         std::vector<uint64_t> build_batch_ids,
-                                                         int num_partitions);
+  [[nodiscard]] bool arm_multi_partition_dynamic_filters(complete_build_snapshot snapshot);
 
   /**
    * @brief Contribute one original build batch before hash scatter
@@ -491,54 +486,31 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //===----------------------------------------------------------------------===//
   // Dynamic Filters
   //===----------------------------------------------------------------------===//
-  /// @brief Claim and perform this join's one dynamic-filter publication attempt.
-  ///
-  /// The only publishing caller is @ref push_data_batch_partitioned: it publishes as soon as the
-  /// single, concat-folded build batch reaches the build port, before any probe batch is required.
-  ///
-  /// The caller that changes @c OPEN to @c PUBLISHING owns construction, device replication,
-  /// and channel fan-out. GPU work runs without holding @ref op_state_mutex. A successful attempt
-  /// ends in @c FINISHED even when selectivity gates or drained targets cause it to emit no
-  /// filters. @ref on_finalize_operator never publishes; it closes an unclaimed @c OPEN window or
-  /// aborts an incomplete @c ACCUMULATING window before releasing BUILD_PROBE state.
-  ///
-  /// @param build_view The build side to reduce / build membership over.
-  /// @param stream     Durable build-memory-space stream used for filter construction.
+  /// @brief Forward one-shot publication to the hash-join-owned session.
+  /// @param build_view The complete build side to reduce or build membership over.
+  /// @param stream Durable build-memory-space stream used for filter construction.
   void publish_dynamic_filters(cudf::table_view const& build_view, rmm::cuda_stream_view stream);
-
-  enum class dynamic_filter_publication_state : std::uint8_t {
-    OPEN,          ///< No publication path has claimed the build.
-    ACCUMULATING,  ///< Exact-ID multi-partition contributions are private and incomplete.
-    PUBLISHING,    ///< The one-shot caller owns construction, replication, and fan-out.
-    FINISHED,      ///< The one publication attempt completed successfully (possibly emitting none).
-    FAILED,        ///< A claimed attempt failed or was closed incomplete.
-    CLOSED         ///< Finalization closed the window before either path claimed it.
-  };
 
   /// Plan-time routing, policy, and replica placement; not mutated after construction.
   dynamic_filter_publish_plan _dynamic_filter_plan;
-  bool _enable_dynamic_filter_multi_partition = false;
-  std::shared_ptr<class dynamic_filter_accumulator> _dynamic_filter_accumulator;
-  // Optional non-owning counter sink. SiriusContext owns it and outlives the plan.
-  dynamic_filter_stats* _dynamic_filter_stats = nullptr;
-  /// Exactly-once arbitration between the publication hook and finalization.
-  std::atomic<dynamic_filter_publication_state> _dynamic_filter_publication_state{
-    dynamic_filter_publication_state::OPEN};
+  /// Publication lifetime and one-shot versus accumulated arbitration. Declared after the plan so
+  /// its retained plan reference remains valid through destruction.
+  dynamic_filter_publication_session _dynamic_filter_publication_session;
   //===----------------------------------------------------------------------===//
 
  public:
   /// @brief Route a partitioned batch and publish dynamic filters from an eligible build batch.
   ///
-  /// For the @c build port of a wired @c BUILD_PROBE join, the single concat-folded batch is the
-  /// publication point. Its read-only accessor is acquired BEFORE the batch is routed: once
-  /// deposited into a repository the batch becomes a downgrade candidate, and holding the shared
-  /// lock across the deposit pins its GPU representation until publication completes. A stream
-  /// borrowed from the build memory space then waits on the batch writer event and builds and
-  /// replicates filters from the build keys without requiring a probe batch or a built hash table.
+  /// For the @c build port of a wired join whose build arrives whole, the concat-folded batch is
+  /// the publication point. Its read-only accessor is acquired before routing, which pins its GPU
+  /// representation until publication completes. A stream borrowed from the build memory space
+  /// waits on the batch writer event and builds and replicates filters without requiring a probe
+  /// batch or built hash table.
   ///
-  /// Other ports and join modes only route. This synchronous hook completes before this join's
-  /// immediate probe producer is scheduled. A scan target reached through an intervening join is
-  /// not gated by that edge.
+  /// In @c BUILD_PROBE mode this synchronous hook completes before the immediate probe producer is
+  /// scheduled. @c STANDARD and @c MIXED_JOIN builds may also publish when they arrive whole, but
+  /// they do not gain that ordering. Other ports only route, and a scan target reached through an
+  /// intervening join is never gated by this edge.
   void push_data_batch_partitioned(std::string_view port_id,
                                    std::shared_ptr<::cucascade::data_batch> batch,
                                    std::size_t partition_idx) override;

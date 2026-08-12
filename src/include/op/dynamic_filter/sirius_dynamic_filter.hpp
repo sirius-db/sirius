@@ -176,7 +176,7 @@ struct zone_map_entry {
  *
  * Lowers to `OR_i ( min_i <= col AND col <= max_i )` (or strict variants based on `inclusive_*`).
  *
- * `dynamic_filter_publisher` supplies one global range per key. The representation also accepts
+ * `publish_dynamic_filters` supplies one global range per key. The representation also accepts
  * multiple ranges and combines them with OR.
  *
  * @pre Every bound has the same @ref cudf::data_type as the consumer column.
@@ -284,8 +284,8 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
    * probe kernel.
    *
    * @pre The backing storage for @p keys remains valid until work enqueued on @p stream completes.
-   * `dynamic_filter_publisher` satisfies this by retaining the build batch and synchronizing before
-   * replication.
+   * `sirius_physical_hash_join::push_data_batch_partitioned` retains the build batch while
+   * `publish_dynamic_filters` synchronizes construction before returning.
    *
    * @throw std::invalid_argument if @p keys is not a null-free INT32 or INT64 column
    * @throw std::runtime_error if the current CUDA device cannot be identified

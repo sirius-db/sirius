@@ -23,6 +23,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression/ast/to_duckdb.hpp"
 #include "log/logging.hpp"
+#include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
@@ -34,7 +35,6 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <algorithm>
-#include <limits>
 #include <mutex>
 
 namespace sirius {
@@ -171,11 +171,13 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
                                                                   rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_partition::execute"};
-  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_read_only_batches();
-  if (input_batches.size() != 1) {
-    throw std::runtime_error("We expect only one input batch for partition operator " +
-                             std::to_string(this->get_operator_id()));
+  auto& input                    = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches      = input.get_read_only_batches();
+  auto const task_input_batch_id = input.task_input_batch_id();
+  if (input_batches.size() != 1 || !task_input_batch_id.has_value()) {
+    throw std::runtime_error(
+      "We expect one input batch and its task identity for partition operator " +
+      std::to_string(this->get_operator_id()));
   }
   if (!_num_partitions.has_value()) {
     throw std::runtime_error("Num partitions was not set in sirius_physical_partition operator " +
@@ -190,8 +192,9 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
       _partition_type == PartitionType::HASH) {
     auto* hash_join = dynamic_cast<sirius_physical_hash_join*>(_downstream_consumer_op);
     if (hash_join != nullptr && hash_join->wants_multi_partition_dynamic_filters()) {
+      // Preparation may replace the physical batch with a fresh-ID cross-GPU clone.
       hash_join->contribute_dynamic_filter_build_batch(
-        input_batch_ro.get_batch_id(), get_cudf_table_view(input_batch_ro), stream);
+        *task_input_batch_id, get_cudf_table_view(input_batch_ro), stream);
     }
   }
 
@@ -306,62 +309,65 @@ void sirius_physical_partition::sink(const operator_data& input_data, rmm::cuda_
   }
 }
 
-uint64_t sirius_physical_partition::compute_total_bytes(std::vector<uint64_t>* batch_ids_out,
-                                                        uint64_t* total_rows,
-                                                        bool* exact_rows)
+uint64_t sirius_physical_partition::compute_total_bytes()
 {
   if (ports.find("default") == ports.end()) {
     throw std::runtime_error(
       "sirius_physical_partition::compute_total_bytes() did not find default repo for id " +
       std::to_string(this->get_operator_id()));
   }
-  auto& repo           = ports.at("default")->repo;
-  auto batch_ids       = repo->get_batch_ids(0);
-  uint64_t total_bytes = 0;
-  bool exact           = true;
-  if (batch_ids_out != nullptr) {
-    batch_ids_out->clear();
-    batch_ids_out->reserve(batch_ids.size());
+  auto& repo = ports.at("default")->repo;
+  if (!repo) {
+    throw std::runtime_error(
+      "sirius_physical_partition::compute_total_bytes() found a null default repo for id " +
+      std::to_string(this->get_operator_id()));
   }
-  if (total_rows != nullptr) { *total_rows = 0; }
 
-  for (auto batch_id : batch_ids) {
+  uint64_t total_bytes = 0;
+  for (auto const batch_id : repo->get_batch_ids(0)) {
     auto batch = repo->get_data_batch_by_id(batch_id, 0);
-    if (!batch) {
-      exact = false;
-      continue;
-    }
+    if (!batch) { continue; }
     auto ro          = batch->to_read_only();
     auto const* data = ro.get_data();
-    if (data == nullptr) {
-      exact = false;
-      continue;
-    }
-    total_bytes += data->get_size_in_bytes();
-    if (batch_ids_out == nullptr || total_rows == nullptr) { continue; }
-
-    auto const* gpu = dynamic_cast<cucascade::gpu_table_representation const*>(data);
-    if (gpu == nullptr) {
-      exact = false;
-      continue;
-    }
-    auto const rows = static_cast<uint64_t>(gpu->get_table_view().num_rows());
-    if (*total_rows > std::numeric_limits<uint64_t>::max() - rows) {
-      exact = false;
-      continue;
-    }
-    *total_rows += rows;
-    batch_ids_out->push_back(batch_id);
-  }
-
-  if (batch_ids_out != nullptr && (!exact || batch_ids_out->size() != batch_ids.size())) {
-    batch_ids_out->clear();
-    if (total_rows != nullptr) { *total_rows = 0; }
-  }
-  if (exact_rows != nullptr) {
-    *exact_rows = exact && batch_ids_out != nullptr && batch_ids_out->size() == batch_ids.size();
+    if (data != nullptr) { total_bytes += data->get_size_in_bytes(); }
   }
   return total_bytes;
+}
+
+std::optional<complete_build_snapshot> sirius_physical_partition::try_freeze_complete_build(
+  std::size_t partition_count)
+{
+  auto const port_it = ports.find("default");
+  if (port_it == ports.end()) {
+    throw std::runtime_error(
+      "sirius_physical_partition::try_freeze_complete_build() did not find default repo for id " +
+      std::to_string(this->get_operator_id()));
+  }
+  auto const& port = port_it->second;
+  if (!port->repo) {
+    throw std::runtime_error(
+      "sirius_physical_partition::try_freeze_complete_build() found a null default repo for id " +
+      std::to_string(this->get_operator_id()));
+  }
+  if (port->type != MemoryBarrierType::FULL || port->src_pipeline == nullptr ||
+      !port->src_pipeline->is_pipeline_finished()) {
+    return std::nullopt;
+  }
+
+  auto const batch_ids = port->repo->get_batch_ids(0);
+  std::vector<detail::complete_build_batch_summary> batches;
+  batches.reserve(batch_ids.size());
+  for (auto const batch_id : batch_ids) {
+    auto batch = port->repo->get_data_batch_by_id(batch_id, 0);
+    if (!batch) { return std::nullopt; }
+    auto const read_only = batch->to_read_only();
+    auto const* gpu =
+      dynamic_cast<cucascade::gpu_table_representation const*>(read_only.get_data());
+    if (gpu == nullptr || gpu->get_table_view().num_rows() < 0) { return std::nullopt; }
+    batches.push_back(
+      {.batch_id = batch_id, .rows = static_cast<std::uint64_t>(gpu->get_table_view().num_rows())});
+  }
+  return detail::try_summarize_complete_build(batches, partition_count);
 }
 
 void sirius_physical_partition::set_num_partitions(int num_partitions)
@@ -538,24 +544,17 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
       std::lock_guard<std::mutex> guard(lock);
       if (_num_partitions.has_value() && *_num_partitions > 1 && !_broadcast &&
           !_dynamic_filter_snapshot_attempted) {
-        auto const port_it         = ports.find("default");
-        bool const source_finished = port_it != ports.end() &&
-                                     port_it->second->src_pipeline != nullptr &&
-                                     port_it->second->src_pipeline->is_pipeline_finished();
-        if (!source_finished && port_it != ports.end() &&
-            port_it->second->src_pipeline != nullptr) {
+        auto const port_it = ports.find("default");
+        if (port_it != ports.end() && port_it->second->src_pipeline != nullptr &&
+            !port_it->second->src_pipeline->is_pipeline_finished()) {
           return nullptr;
         }
 
         _dynamic_filter_snapshot_attempted = true;
-        std::vector<uint64_t> build_batch_ids;
-        uint64_t build_rows = 0;
-        bool exact_snapshot = false;
-        compute_total_bytes(&build_batch_ids, &build_rows, &exact_snapshot);
-        if (source_finished && exact_snapshot && !build_batch_ids.empty()) {
-          static_cast<void>(hash_join->arm_multi_partition_dynamic_filters(
-            build_rows, std::move(build_batch_ids), *_num_partitions));
-        } else if (!source_finished || !exact_snapshot) {
+        auto snapshot = try_freeze_complete_build(static_cast<std::size_t>(*_num_partitions));
+        if (snapshot) {
+          static_cast<void>(hash_join->arm_multi_partition_dynamic_filters(std::move(*snapshot)));
+        } else {
           SIRIUS_LOG_WARN(
             "sirius_physical_partition id {} could not freeze an exact build snapshot; global "
             "dynamic Bloom publication is disabled for this join.",

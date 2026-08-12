@@ -113,11 +113,7 @@ Each `dynamic_filter_replica_space` pairs a non-null CuCascade GPU
 `memory_space` with the NUMA-selected CuCascade HOST `memory_space` used for
 staging when peer DMA is unavailable. The plan validates both tiers and
 sorts/deduplicates placements by the GPU's actual device ID. The completed plan
-is moved into the hash join's
-`const _dynamic_filter_plan`. Runtime publication can observe that a channel has
-drained, but it cannot add targets, rediscover devices, or change policy. This
-also avoids assuming that active devices are numbered `0..N-1`, which matters
-with explicit GPU selections and `CUDA_VISIBLE_DEVICES` remapping.
+is moved into the hash join's `_dynamic_filter_plan` and referenced by its `dynamic_filter_publication_session`. Neither object mutates the plan after construction. Runtime publication can observe that a channel has drained, but it cannot add targets, rediscover devices, or change policy. This also avoids assuming that active devices are numbered `0..N-1`, which matters with explicit GPU selections and `CUDA_VISIBLE_DEVICES` remapping.
 
 The handle is deliberately non-owning. The Sirius memory manager owns each
 space, its default allocator, and its CUDA stream pool. That manager must outlive
@@ -136,23 +132,13 @@ first queried `cudaDevAttrL2CacheSize`.
 
 ### 2. Keep publication local and exactly once
 
-`dynamic_filter_publisher` is declared in
-`src/include/op/dynamic_filter/dynamic_filter_publisher.hpp` and implemented in
-`src/op/dynamic_filter/dynamic_filter_publisher.cpp`; the physical hash join owns both its
-whole-build one-shot invocation and the exact-ID accumulator used for partitioned builds. Neither
-path is a shared scheduler service or a mutable routing registry.
+`publish_dynamic_filters` and `dynamic_filter_publication_session` are declared in `src/include/op/dynamic_filter/dynamic_filter_publisher.hpp` and implemented in `src/op/dynamic_filter/dynamic_filter_publisher.cpp`. `sirius_physical_hash_join` owns source readiness, routing, and the session object; the session owns one-shot-versus-accumulator arbitration, the exact-ID accumulator, terminal outcome folding, and exactly-once statistics. Neither path is a shared scheduler service or a mutable routing registry.
 
-The build-port hook retains PR #1277's one-shot behavior for a concat-folded complete build. A
-single-partition join has one whole batch; under broadcast, each candidate batch represents the
-full build and the shared `OPEN -> PUBLISHING` claim lets exactly one caller construct and
-replicate filters.
+The build-port hook retains PR #1277's one-shot behavior for a concat-folded complete build. A single-partition join has one whole batch; under broadcast, each candidate batch represents the full build and `dynamic_filter_publication_session` grants exactly one `OPEN -> PUBLISHING` claim before construction and replication.
 
-When `enable_dynamic_filter_multi_partition` is true, a non-broadcast build with more than one
-partition instead claims `OPEN -> ACCUMULATING`. The build PARTITION freezes the exact original
-batch-ID set and global row count at its FULL barrier before popping the first batch. Each original
-batch inserts its admitted INT32/INT64 keys before scatter into a full-global-geometry partial on
-its producing GPU. Per-device locks allow different GPUs to insert concurrently; in-flight and
-completed ID sets prevent retries from advancing completion twice.
+When `enable_dynamic_filter_multi_partition` is true, a non-broadcast build with more than one partition instead asks `dynamic_filter_publication_session` to claim `OPEN -> ACCUMULATING`. At its FULL barrier and before the first pop, `sirius_physical_partition::try_freeze_complete_build` creates a move-owned `complete_build_snapshot` containing the exact unique original batch IDs, global row count representable as `std::size_t`, and selected partition count greater than one. Zero rows are valid and complete without Bloom construction. Moving the snapshot invalidates its source, and the session rejects an invalid or moved-from snapshot before claim initialization.
+
+Each one-batch PARTITION task captures one immutable task-input ID when the original batch is popped. Cross-GPU preparation assigns a fresh physical ID to a clone, and retry can retain that clone, but PARTITION contributes the unchanged task-input ID. Each original batch therefore matches the identity frozen before pop while inserting its admitted INT32/INT64 keys before scatter into a full-global-geometry partial on its producing GPU. Per-device locks allow different GPUs to insert concurrently; in-flight and completed ID sets prevent retries from advancing completion twice.
 
 After all expected IDs complete, the last contribution OR-reduces non-root partials on the lowest
 planned GPU. It transfers at most 4 MiB per chunk through PR #1277's peer-DMA/host-staging helper,
@@ -167,15 +153,14 @@ Before any per-device partial is allocated, `max_dynamic_filter_bloom_bytes_per_
                          |                `-> FAILED
 OPEN --one-shot claim---+
   |
-  +--accumulator claim----> ACCUMULATING -> FINISHED
-  |                                         `-> FAILED
+  +--successful accumulator initialization-> ACCUMULATING -> FINISHED
+  |                                                          `-> FAILED
+  +--failed accumulator initialization-------------------------------> FAILED
   |
   `--finalize unclaimed--------------------> CLOSED
 ```
 
-`op_state_mutex` protects only claim, pointer, and terminal-state coordination; GPU insertion,
-reduction, replication, and synchronization do not hold it. Finalization closes an unclaimed
-window or atomically aborts an incomplete accumulator, but never manufactures a filter.
+`dynamic_filter_publication_session` owns claim, accumulator, and terminal-state coordination under its own mutex; `op_state_mutex` remains limited to hash-join source and routing state. GPU construction, insertion, synchronization, reduction, replication, and fan-out hold neither mutex. Finalization closes an unclaimed window or atomically aborts an incomplete accumulator, but never manufactures a filter. A terminal transition releases the session's accumulator reference; any in-flight contribution retains a shared reference until it returns.
 
 At the early build-port site, a stream borrowed from the build memory space first waits on the
 build representation's writer event. Persistent cuDF/cuCO/RMM filter storage is constructed on a
@@ -184,6 +169,8 @@ can be torn down earlier. Its asynchronous initialization completes before the f
 Accumulated contributions then use their task stream and synchronize before their ID becomes
 complete, preserving both the input lifetime and the deleter's retained-stream lifetime without
 exposing mutable storage.
+
+The one-shot path also best-effort synchronizes its construction stream before propagating an exceptional exit. The original exception remains authoritative, and the build-port hook can release its pinned source accessor only after queued source reads have drained.
 
 ### 3. Expose replication as a producer-only capability
 
@@ -414,15 +401,8 @@ The reservation-denial suite also covers the raw small IN-list. These multi-GPU
 cases skip automatically when fewer than two devices are visible, so a passing
 two-device run is still required before the raw path can be called revalidated.
 
-The multi-partition accumulator's exact-ID accounting, OR reduction, failure
-handling, flag gates, and result equivalence are covered by focused tests on
-this single-GPU host. Deterministic synchronization hooks additionally cover an
-in-flight duplicate, competing final contributions with exactly one publisher,
-strict-replication failure before fan-out, and destruction after a short-lived
-task stream. The hooks replace no behavior unless explicitly supplied by a
-test. Physical multi-GPU execution and performance have not been evaluated
-here. That validation is intentionally deferred to a machine with at least two
-visible GPUs and representative peer and staged-copy routes.
+The multi-partition accumulator's typed snapshot validation, exact-ID accounting, zero-row no-op, drained-target completion, OR reduction, failure handling, flag gates, and result equivalence are covered by focused tests on this single-GPU host. Timed synchronization hooks cover an in-flight duplicate, competing final contributions with exactly one publisher, terminal-result exception races, both deterministic finalize-versus-in-flight-final-contribution winners, strict-replication failure before fan-out, and destruction after a short-lived task stream. A real-repository PARTITION regression pins freeze-before-pop and stable task identity; its cross-GPU clone/retry branch automatically returns with a warning when fewer than two GPUs are visible.
+Physical multi-GPU execution and performance have not been evaluated here. That validation is intentionally deferred to a machine with at least two visible GPUs and representative peer and staged-copy routes.
 
 ## Code map
 
@@ -434,10 +414,15 @@ visible GPUs and representative peer and staged-copy routes.
   `src/cuda/sirius_dynamic_bloom_filter.cu`
 - Exact typed zone-map replication:
   `src/op/dynamic_filter/sirius_dynamic_filter.cpp`
-- Producer device discovery and publication:
-  `src/planner/sirius_plan_comparison_join.cpp`,
+- Producer discovery:
+  `src/planner/sirius_plan_comparison_join.cpp`
+- Snapshot validation, publication arbitration, accumulation, and terminal statistics:
   `src/include/op/dynamic_filter/dynamic_filter_publisher.hpp`,
-  `src/op/dynamic_filter/dynamic_filter_publisher.cpp`,
+  `src/op/dynamic_filter/dynamic_filter_publisher.cpp`
+- PARTITION freezing and hash-join source/routing integration:
+  `src/include/op/sirius_physical_partition.hpp`,
+  `src/op/sirius_physical_partition.cpp`,
+  `src/include/op/sirius_physical_hash_join.hpp`,
   `src/op/sirius_physical_hash_join.cpp`
 - Consumer device selection:
   `src/include/op/scan/dynamic_filter_gate.hpp`,
@@ -450,5 +435,7 @@ visible GPUs and representative peer and staged-copy routes.
   `src/cuda/dynamic_filter_replica_transfer.cu`
 - Focused regressions:
   `test/cpp/operator/test_dynamic_filter_publisher.cpp`,
+  `test/cpp/operator/test_dynamic_filter_publication_claim.cpp`,
+  `test/cpp/pipeline/test_batch_lock_utils.cpp`,
   `test/cpp/operator/test_sirius_dynamic_filter_mgpu.cpp`,
   `test/cpp/scan/test_dynamic_filter_merge.cpp`

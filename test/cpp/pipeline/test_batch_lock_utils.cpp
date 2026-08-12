@@ -520,11 +520,15 @@ TEST_CASE("prepare_for_processing rebinds idle batches to the prepared clones",
   REQUIRE(f.setup(2));
 
   rmm::cuda_stream stream;
-  auto batch = f.make_gpu_batch(kNumRows, *f.gpu0, stream.view());
+  auto batch           = f.make_gpu_batch(kNumRows, *f.gpu0, stream.view());
+  auto const source_id = batch->get_batch_id();
 
   sirius::op::pipelineable_operator_data op_data(
     std::vector<std::shared_ptr<cucascade::data_batch>>{batch});
+  auto const require_source_identity = [&] { REQUIRE(op_data.task_input_batch_id() == source_id); };
+  require_source_identity();
   op_data.prepare_for_processing(f.gpu1, stream.view());
+  require_source_identity();
 
   // get_data_batches() must return the clone underlying the read-only accessor, not the
   // stale original — downstream forwarding (dynamic_filter, sink) relies on this.
@@ -542,7 +546,12 @@ TEST_CASE("prepare_for_processing rebinds idle batches to the prepared clones",
   // accessors before dropping them, so the clone (and its transfer work) outlives the locks.
   op_data.remove_read_only_lock();
   REQUIRE(op_data.get_data_batches().at(0) == clone_sp);
+  require_source_identity();
   REQUIRE(clone_sp->get_state() == cucascade::batch_state::idle);
+
+  op_data.prepare_for_processing(f.gpu1, stream.view());
+  require_source_identity();
+  REQUIRE(op_data.get_data_batches().at(0) == clone_sp);
   {
     auto ro = clone_sp->to_read_only();
     REQUIRE(ro.get_memory_space()->get_id() == f.gpu1->get_id());

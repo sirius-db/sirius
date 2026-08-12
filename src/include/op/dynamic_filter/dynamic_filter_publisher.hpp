@@ -17,6 +17,7 @@
 #pragma once
 
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
+#include "op/dynamic_filter/dynamic_filter_stats.hpp"
 
 #include <cudf/table/table_view.hpp>
 
@@ -26,13 +27,83 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace sirius::op {
 
 class sirius_dynamic_bloom_filter;
+
+/**
+ * @brief Structurally validated identity and global row geometry of a complete partitioned build
+ *
+ * The caller supplies the completeness and pre-scatter meaning of the owned batch IDs. The type
+ * validates that the snapshot has more than one partition, a non-empty set of unique IDs, and a
+ * representable global row count. Zero build rows are valid. Moving a snapshot invalidates the
+ * source object; `valid()` reports whether a snapshot still carries its validated structure.
+ */
+class complete_build_snapshot final {
+ public:
+  /**
+   * @brief Validate and take ownership of a complete build snapshot
+   *
+   * @param[in] total_rows Global build row count
+   * @param[in] batch_ids Original pre-scatter batch IDs
+   * @param[in] partition_count Number of hash partitions
+   * @return The validated snapshot, or `std::nullopt` when the row count is not representable as
+   * `std::size_t`, the IDs are empty or non-unique, or `partition_count` is not greater than one
+   */
+  [[nodiscard]] static std::optional<complete_build_snapshot> try_create(
+    std::uint64_t total_rows, std::vector<std::uint64_t> batch_ids, std::size_t partition_count);
+
+  complete_build_snapshot(complete_build_snapshot const&)            = delete;
+  complete_build_snapshot& operator=(complete_build_snapshot const&) = delete;
+  complete_build_snapshot(complete_build_snapshot&& other) noexcept;
+  complete_build_snapshot& operator=(complete_build_snapshot&& other) noexcept;
+  ~complete_build_snapshot() = default;
+
+  [[nodiscard]] bool valid() const noexcept { return _partition_count > 1 && !_batch_ids.empty(); }
+  [[nodiscard]] std::size_t total_rows() const noexcept { return _total_rows; }
+  [[nodiscard]] std::size_t partition_count() const noexcept { return _partition_count; }
+  [[nodiscard]] std::span<std::uint64_t const> batch_ids() const noexcept { return _batch_ids; }
+
+ private:
+  complete_build_snapshot(std::size_t total_rows,
+                          std::vector<std::uint64_t> batch_ids,
+                          std::size_t partition_count)
+    : _total_rows(total_rows), _batch_ids(std::move(batch_ids)), _partition_count(partition_count)
+  {
+  }
+
+  std::size_t _total_rows;
+  std::vector<std::uint64_t> _batch_ids;
+  std::size_t _partition_count;
+};
+
+namespace detail {
+
+/**
+ * @brief Row contribution of one original build batch
+ */
+struct complete_build_batch_summary {
+  std::uint64_t batch_id;  ///< Original pre-scatter batch ID
+  std::uint64_t rows;      ///< Rows in the GPU table representation
+};
+
+/**
+ * @brief Sum exact batch rows and create a validated complete build snapshot
+ *
+ * @param[in] batches Original build batch identities and row counts
+ * @param[in] partition_count Number of hash partitions
+ * @return The snapshot, or `std::nullopt` when row summation overflows or validation fails
+ */
+[[nodiscard]] std::optional<complete_build_snapshot> try_summarize_complete_build(
+  std::span<complete_build_batch_summary const> batches, std::size_t partition_count);
+
+}  // namespace detail
 
 //===----------------------------------------------------------------------===//
 // publish_dynamic_filters
@@ -41,9 +112,8 @@ class sirius_dynamic_bloom_filter;
 /**
  * @brief What one publication attempt did
  *
- * `publish_dynamic_filters()` returns these counts without retaining a context or updating
- * `dynamic_filter_stats`. The producing `sirius_physical_hash_join` folds the outcome into its
- * optional stats sink.
+ * `publish_dynamic_filters()` returns these counts without updating `dynamic_filter_stats`;
+ * `dynamic_filter_publication_session` folds a claimed attempt into its optional sink.
  */
 struct dynamic_filter_publication_outcome {
   std::size_t keys_considered            = 0;  ///< Bound admitted keys the attempt walked
@@ -68,12 +138,16 @@ struct dynamic_filter_publication_outcome {
  * replication, and pushes each filter at the binding's channel push ordinal. It retains none of its
  * inputs.
  *
- * @ref sirius_physical_hash_join::publish_dynamic_filters owns source readiness and exactly-once
- * arbitration.
+ * `sirius_physical_hash_join` owns source readiness.
+ * `dynamic_filter_publication_session::publish_one_shot` owns exactly-once arbitration.
  *
  * A key whose recorded storage type disagrees with its runtime build column is skipped and counted.
  * Before accessing a build column, the function validates its ordinal against @p build_view; an
  * out-of-range ordinal fails the publication attempt with `std::logic_error`.
+ *
+ * Before propagating an exception after filter work begins, the function best-effort synchronizes
+ * @p stream without replacing the original exception. The caller may therefore release storage
+ * backing @p build_view when the call exits normally or exceptionally.
  *
  * @pre @p plan is enabled
  * @throw std::runtime_error if the source GPU cannot be identified
@@ -99,7 +173,7 @@ struct dynamic_filter_publication_outcome {
 struct dynamic_filter_accumulation_result {
   enum class status : std::uint8_t {
     pending,    ///< Accepted; expected IDs remain
-    duplicate,  ///< Expected ID is already in flight or complete
+    duplicate,  ///< Ignored after completion or because the expected ID was already accepted
     published,  ///< This call completed publication
     aborted     ///< Publication cannot proceed for this contribution
   };
@@ -129,19 +203,20 @@ class dynamic_filter_accumulator final {
   /**
    * @brief Create an accumulator for a complete build snapshot
    *
-   * @throw std::invalid_argument if @p plan is disabled or @p expected_batch_ids is empty or
-   * non-unique
+   * @throw std::invalid_argument if @p plan is disabled or @p snapshot is invalid
    *
    * @param[in] plan Enabled plan that outlives this accumulator
-   * @param[in] build_rows Complete build row count used for Bloom sizing
-   * @param[in] expected_batch_ids Complete set of pre-scatter batch IDs
+   * @param[in] snapshot Validated complete pre-scatter build identity and row geometry
    */
   dynamic_filter_accumulator(dynamic_filter_publish_plan const& plan,
-                             std::size_t build_rows,
-                             std::vector<std::uint64_t> expected_batch_ids);
+                             complete_build_snapshot snapshot);
+
+  /**
+   * @copydoc dynamic_filter_accumulator(dynamic_filter_publish_plan const&,complete_build_snapshot)
+   * @param[in] test_hooks Deterministic test hooks
+   */
   dynamic_filter_accumulator(dynamic_filter_publish_plan const& plan,
-                             std::size_t build_rows,
-                             std::vector<std::uint64_t> expected_batch_ids,
+                             complete_build_snapshot snapshot,
                              detail::dynamic_filter_accumulator_test_hooks test_hooks);
   ~dynamic_filter_accumulator();
 
@@ -170,12 +245,138 @@ class dynamic_filter_accumulator final {
    */
   [[nodiscard]] std::optional<dynamic_filter_publication_outcome> abort_if_incomplete() noexcept;
 
+  /**
+   * @brief Resolve the accumulator to its current terminal result, aborting it if incomplete
+   *
+   * @return `published` with the complete outcome, or `aborted` with the failure outcome
+   */
+  [[nodiscard]] dynamic_filter_accumulation_result abort_or_get_terminal() noexcept;
+
   [[nodiscard]] bool complete() const noexcept;
   [[nodiscard]] bool aborted() const noexcept;
 
  private:
   struct impl;
   std::unique_ptr<impl> _impl;
+};
+
+namespace detail {
+
+struct dynamic_filter_publication_session_test_hooks {
+  dynamic_filter_accumulator_test_hooks accumulator;
+  std::function<void(dynamic_filter_accumulation_result::status)> after_accumulation_result;
+  std::function<void(std::size_t)> before_one_shot_key;
+};
+
+}  // namespace detail
+
+/**
+ * @brief Coordinates one hash join's one-shot or accumulated dynamic-filter publication
+ *
+ * The immutable `dynamic_filter_publish_plan` must outlive the session. The statistics sink may be
+ * null; a non-null sink must also outlive the session.
+ *
+ * Construction increments `dynamic_filter_stats::producers_enabled` when the plan is enabled and a
+ * sink is present.
+ *
+ * Calls are thread-safe. Publication work runs without holding the session mutex. Each claimed
+ * attempt that produces a `dynamic_filter_publication_outcome` folds it exactly once; accumulator
+ * construction failure records failure without an outcome. A terminal transition releases the
+ * session-owned accumulator; in-flight calls retain shared ownership until they return.
+ */
+class dynamic_filter_publication_session final {
+ public:
+  /**
+   * @brief Create a publication session
+   *
+   * @param[in] plan Immutable publication plan
+   * @param[in] stats Optional non-owning statistics sink
+   * @param[in] enable_multi_partition Whether exact-ID accumulation may claim the session
+   */
+  dynamic_filter_publication_session(dynamic_filter_publish_plan const& plan,
+                                     dynamic_filter_stats* stats,
+                                     bool enable_multi_partition);
+  dynamic_filter_publication_session(
+    dynamic_filter_publish_plan const& plan,
+    dynamic_filter_stats* stats,
+    bool enable_multi_partition,
+    detail::dynamic_filter_publication_session_test_hooks test_hooks);
+
+  [[nodiscard]] bool enabled() const noexcept { return _plan.enabled(); }
+  [[nodiscard]] bool wants_multi_partition() const noexcept
+  {
+    return _enable_multi_partition && enabled();
+  }
+  [[nodiscard]] bool is_open() const noexcept;
+
+  /**
+   * @brief Install an exact-ID accumulator if the publication window is still open
+   *
+   * @param[in] snapshot Complete build snapshot consumed by the accumulator
+   * @return True when the accumulator was installed; false when multi-partition publication is
+   * disabled, the snapshot is invalid, the session is no longer open, or construction fails. Only
+   * construction failure begins an attempt and records failure.
+   */
+  [[nodiscard]] bool try_arm(complete_build_snapshot snapshot);
+
+  /**
+   * @brief Contribute one original build batch to an armed accumulator
+   *
+   * Invalid contributions fail the optional publication without failing query execution.
+   *
+   * @param[in] batch_id Original pre-scatter batch ID
+   * @param[in] build_view Batch containing the admitted build-key ordinals
+   * @param[in] stream Stream used for insertion
+   */
+  void contribute(std::uint64_t batch_id,
+                  cudf::table_view const& build_view,
+                  rmm::cuda_stream_view stream) noexcept;
+
+  /**
+   * @brief Claim and perform one-shot publication from a complete build table
+   *
+   * Does nothing after another path claims or closes the session. Publication exceptions mark the
+   * session failed and are rethrown. Exceptional stream and input-lifetime behavior follows
+   * `publish_dynamic_filters()`.
+   *
+   * @param[in] complete_build Complete build table
+   * @param[in] stream Durable construction stream
+   */
+  void publish_one_shot(cudf::table_view const& complete_build, rmm::cuda_stream_view stream);
+
+  /**
+   * @brief Close an open session or abort an incomplete accumulator
+   */
+  void finalize_or_abort() noexcept;
+
+  /**
+   * @brief Record one source-not-resident delivery without claiming the session
+   *
+   * Does nothing after the session leaves OPEN or when the statistics sink is null.
+   */
+  void record_source_not_resident() noexcept;
+
+  /**
+   * @brief Record one build-not-whole delivery without claiming the session
+   *
+   * Does nothing after the session leaves OPEN or when the statistics sink is null. The caller owns
+   * once-per-join latching.
+   */
+  void record_build_not_whole() noexcept;
+
+ private:
+  enum class state : std::uint8_t { open, accumulating, publishing, finished, failed, closed };
+
+  void commit_terminal_locked(state terminal,
+                              dynamic_filter_publication_outcome const& outcome) noexcept;
+
+  dynamic_filter_publish_plan const& _plan;
+  dynamic_filter_stats* _stats;
+  bool _enable_multi_partition;
+  detail::dynamic_filter_publication_session_test_hooks _test_hooks;
+  std::shared_ptr<dynamic_filter_accumulator> _accumulator;
+  mutable std::mutex _mutex;
+  state _state{state::open};
 };
 
 }  // namespace sirius::op
