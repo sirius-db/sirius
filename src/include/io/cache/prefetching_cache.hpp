@@ -114,6 +114,9 @@ class prefetching_handle {
 
   [[nodiscard]] bool is_active() const noexcept;
 
+  /// Producer-side state of this request, for the prefetch census.
+  [[nodiscard]] producer_stage::value producer_state() const noexcept;
+
   /// True while this request's prefetch IO is in flight.  A read that lands now
   /// would duplicate IO the cache is already doing, so callers wait it out via
   /// @ref wait_until_ready instead of issuing their own.

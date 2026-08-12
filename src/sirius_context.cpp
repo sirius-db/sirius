@@ -18,6 +18,11 @@
 
 #include "config.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
+
+#include <ctrack.hpp>
+#include <io/prefetch_census.hpp>
+
+#include <iostream>
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -299,6 +304,14 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // and thereby poison the runtime — a logging or telemetry failure must not.
   try {
     SIRIUS_LOG_INFO("QueryEnd");
+  } catch (...) {
+  }
+
+  try {
+    std::cerr << "\n" << sirius::io::prefetch_census::instance().to_string() << "\n=== ctrack "
+              << "(query end) ===\n"
+              << ctrack::result_as_string() << std::endl;
+    sirius::io::prefetch_census::instance().reset();
   } catch (...) {
   }
 

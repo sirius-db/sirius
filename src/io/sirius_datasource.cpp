@@ -22,7 +22,9 @@
 
 #include <rmm/device_buffer.hpp>
 
+#include <ctrack.hpp>
 #include <fcntl.h>
+#include <io/prefetch_census.hpp>
 #include <log/logging.hpp>
 #include <sys/stat.h>
 
@@ -167,6 +169,7 @@ std::future<size_t> sirius_datasource::device_read_async(size_t offset,
                                                          uint8_t* dst,
                                                          rmm::cuda_stream_view stream)
 {
+  CTRACK_NAME("ds::device_read_async");
   await_inflight_prefetch();
   exec::semi_future<size_t> semi;
   if (uses_prefetching_cache()) {
@@ -233,9 +236,32 @@ void sirius_datasource::update(cache::scan_stage site)
   _prefetch_handle.update(site);
 }
 
+void sirius_datasource::record_prefetch_outcome_once() noexcept
+{
+  if (_census_recorded) { return; }
+  _census_recorded = true;
+
+  auto& census = prefetch_census::instance();
+  if (!_prefetch_handle) {
+    census.read_no_handle.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  switch (_prefetch_handle.producer_state()) {
+    // The prefetch landed before anybody asked for the bytes -- the case the
+    // readahead exists to produce.
+    case cache::producer_stage::ready: census.read_ready.fetch_add(1); break;
+    // Half-covered: the IO is running but not done, so this read pays for it.
+    case cache::producer_stage::loading: census.read_waited.fetch_add(1); break;
+    // The worker never got to this scan before its reader did.
+    default: census.read_not_started.fetch_add(1); break;
+  }
+}
+
 void sirius_datasource::await_inflight_prefetch() noexcept
 {
+  record_prefetch_outcome_once();
   if (!_prefetch_handle || !_prefetch_handle.is_prefetch_in_flight()) { return; }
+  CTRACK_NAME("ds::await_inflight_prefetch(blocked)");
   // The readahead already has this split's IO in flight.  Reading now would
   // find every chunk `loading`, miss, and re-read the same bytes through a
   // bounce buffer — the one thing the prefetch exists to avoid.  Waiting costs
@@ -254,6 +280,7 @@ bool sirius_datasource::prefetch_async(exec::invocable<void(bool) noexcept> on_d
   // pulling the bytes through.  Prefetching now would issue the same IO a
   // second time and race the reader for the same chunks.
   if (_prefetch_handle.has_started_reading()) {
+    prefetch_census::instance().declined_reading.fetch_add(1, std::memory_order_relaxed);
     on_done(false);
     return false;
   }

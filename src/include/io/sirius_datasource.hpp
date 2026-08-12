@@ -157,6 +157,13 @@ class sirius_datasource : public cudf::io::datasource {
   /// No-op when nothing is in flight.
   void await_inflight_prefetch() noexcept;
 
+  /// Bucket this scan into the prefetch census, once, on its first device read.
+  void record_prefetch_outcome_once() noexcept;
+
+  /// Set after @ref record_prefetch_outcome_once fires, so a scan is counted
+  /// once rather than once per column-chunk read.
+  bool _census_recorded{false};
+
   std::shared_ptr<ioctx> _io_ctx;
   std::shared_ptr<io_object> _io_object;
   /// Handle of the most recent insert into the prefetching cache, or empty

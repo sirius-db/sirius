@@ -16,6 +16,7 @@
 
 #include "op/scan/owning_table_view.hpp"
 
+#include <ctrack.hpp>
 #include <data/data_batch_utils.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/host_keep_mask.hpp>
@@ -30,6 +31,7 @@ namespace sirius::op::scan {
 filtered_table gpu_ingestible::materialize_table(const op::scan::scan_operator_input& split,
                                                  rmm::cuda_stream_view stream)
 {
+  CTRACK_NAME("ingestible::materialize_table");
   auto* mem_space = split.gpu_memory_space;
   if (split.has_scan_metadata()) [[likely]] {
     split.update(io::cache::scan_stage::reading);

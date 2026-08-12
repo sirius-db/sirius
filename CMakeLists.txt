@@ -153,6 +153,20 @@ else()
   endif()
 endif()
 
+# --- ctrack (profiling instrumentation) --- #
+include(FetchContent)
+FetchContent_Declare(
+  ctrack
+  GIT_REPOSITORY https://github.com/Compaile/ctrack.git
+  GIT_TAG 6dfa9b0eef26507cfa9bc17ae4d817ab011a28f5 # v1.1.0
+  SOURCE_SUBDIR do-not-build)
+FetchContent_MakeAvailable(ctrack)
+if(NOT TARGET ctrack::ctrack)
+  add_library(ctrack::ctrack INTERFACE IMPORTED)
+  set_target_properties(ctrack::ctrack PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
+                                                  "${ctrack_SOURCE_DIR}/include")
+endif()
+
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
 pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
@@ -548,6 +562,7 @@ foreach(_target sirius_extension sirius_loadable_extension)
     ${_target}
     cudf::cudf
     cuco::cuco
+    ctrack::ctrack
     rmm::rmm
     spdlog::spdlog
     cuCascade::cucascade
