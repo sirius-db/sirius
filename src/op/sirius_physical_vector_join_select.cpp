@@ -29,7 +29,6 @@
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
-#include <cudf/utilities/memory_resource.hpp>
 
 #include <raft/core/device_resources.hpp>
 
@@ -169,11 +168,12 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_select::execute(
   // Per-pair brute-force top-k. brute_force_knn tiles the pairwise distances
   // internally, so the dense [n_left, n_right] block is never materialized.
   // Allocations flow through the task's reservation-aware current resource.
+  auto const mr = mem_space->get_default_allocator();
   raft::device_resources res{stream};
   auto const exact_unexpanded = _request.search_mode == vss::vector_join_search_mode::exact;
   auto const metric =
     vss::join_selection_distance_type_from_metric(_request.metric, exact_unexpanded);
-  auto knn = vss::brute_force_knn(res, dataset, queries, k_eff, metric);
+  auto knn = vss::brute_force_knn(res, dataset, queries, k_eff, metric, mr);
 
   // Shift local neighbor ids into the global right-table row space so the
   // downstream merge can combine batches without tracking per-batch offsets.
@@ -186,7 +186,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_select::execute(
                                        cudf::binary_operator::ADD,
                                        cudf::data_type{cudf::type_id::INT64},
                                        stream,
-                                       cudf::get_current_device_resource_ref());
+                                       mr);
   }
 
   // Partial layout: [neighbor_global_id (INT64), distance (FLOAT32)], flattened
