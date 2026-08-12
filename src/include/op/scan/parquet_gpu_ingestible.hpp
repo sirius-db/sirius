@@ -132,9 +132,10 @@ class parquet_split_info : public scan_info {
   /// this ingestible.
   std::shared_ptr<scan_plan const> plan;
   /// When true, @c materialize_table MUST NOT call @c set_filter on its
-  /// reader options; the parquet file has a FLBA-decimal column whose
-  /// row-group stats cudf cannot compare against an AST literal. The
-  /// filter still applies post-decode via @c expression_evaluator.
+  /// reader options; the parquet file stores a decimal column in the
+  /// variable-length BYTE_ARRAY physical type, for which cudf's row-group
+  /// stats filter is not known to compare against an AST literal correctly.
+  /// The filter still applies post-decode via @c expression_evaluator.
   bool disable_filter_pushdown = false;
   /// Hive partition values for this split, in @c scan_plan::partition_columns
   /// order. Empty when the plan has no partition columns. Kept on the split so
@@ -220,9 +221,10 @@ class parquet_file_scan_info : public scan_info {
   /// Hive partition values for this file, in @c scan_plan::partition_columns
   /// order. Empty when the plan has no partition columns.
   std::vector<std::string> partition_values;
-  /// When true, this file has an FLBA-decimal column whose row-group stats cudf
-  /// cannot compare against an AST literal — reader-side pushdown must be
-  /// disabled for any split that includes it.
+  /// When true, this file stores a decimal column in the variable-length BYTE_ARRAY
+  /// physical type, for which cudf's row-group stats filter is not known to compare
+  /// against an AST literal correctly -- reader-side pushdown must be disabled for any
+  /// split that includes it.
   bool disable_filter_pushdown = false;
 
   [[nodiscard]] std::size_t estimated_bytes() const noexcept override

@@ -1098,30 +1098,8 @@ class sirius_dynamic_filter_set : public std::enable_shared_from_this<sirius_dyn
   std::atomic<bool> _accepting_filters{true};
 };
 
-/**
- * @brief AND-conjoin @p set's AST-lowerable filters with @p existing_root in @p tree
- *
- * For each column with filters, all AST-capable filters are AND-conjoined (multiple producers);
- * across columns, the per-column conjunctions are AND-conjoined; the final dynamic root is then
- * AND-ed with @p existing_root and that AND-node is returned.
- *
- * If @p set is empty, or every filter declines the AST capability, the function emplaces nothing
- * and returns @p existing_root unchanged.
- *
- * @param[in,out] tree The AST tree the consumer is constructing. @p existing_root must already be
- * emplaced in @p tree.
- * @param[in] existing_root The root expression to AND with the dynamic filters' fragments. Returned
- * unchanged if no filter contributes.
- * @param[in] set The dynamic filter channel.
- * @param[in] column_ref_resolver Callback that returns the AST column expression for a column
- * index. Invoked at most once per column with at least one AST-capable filter. Must remain valid
- * for the duration of this call.
- * @return Reference to the new root, owned by @p tree. Stable across further `emplace` calls.
- */
-[[nodiscard]] cudf::ast::expression const& merge_ast_dynamic_filters_into_tree(
-  cudf::ast::tree& tree,
-  cudf::ast::expression const& existing_root,
-  sirius_dynamic_filter_set const& set,
-  column_ref_resolver_fn const& column_ref_resolver);
+// Consumers build AST predicates from a `dynamic_filter_snapshot`, whose owning copies keep the
+// referenced filters' device scalars alive: see `merge_dynamic_filters_into_ast` in
+// `op/scan/dynamic_filter_merge.hpp`.
 
 }  // namespace sirius::op

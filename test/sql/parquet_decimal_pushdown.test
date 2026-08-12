@@ -1,0 +1,160 @@
+# =============================================================================
+# Copyright 2026, Sirius Contributors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+# in compliance with the License. You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software distributed under the License
+# is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied. See the License for the specific language governing permissions and limitations under
+# the License.
+# =============================================================================
+
+# name: test/sql/parquet_decimal_pushdown.test
+# description: decoded values from decimal parquet scans that push their filter into the reader
+# group: [sirius]
+#
+# test/cpp/scan/test_parquet_decimal_pushdown.cpp pins which row groups survive pruning; that is
+# metadata only, so it would still pass if the surviving rows decoded to the wrong values. This
+# file pins the values. Both matter for the same reason: a sign-extension defect in the reader's
+# handling of FIXED_LEN_BYTE_ARRAY decimals shows up either as row groups wrongly pruned or as
+# negative amounts decoded as large positive ones, and only the second is visible here.
+#
+# The fixtures store the same banded data at FIXED_LEN_BYTE_ARRAY widths 4, 8 and 16 -- see
+# test/cpp/scan/data/generate_flba_decimal_bands.py. Row groups 0-4 hold only negative amounts,
+# so every predicate below selects across a sign boundary. Expected values follow from the
+# generator: amount = ((id // 2048) - 5) * 10000 + (id % 2048), NULL whenever id % 97 == 0.
+
+require parquet
+
+require sirius
+
+# ---------------------------------------------------------------------------
+# FIXED_LEN_BYTE_ARRAY(4) -- DECIMAL(9,2)
+# ---------------------------------------------------------------------------
+
+query II
+SELECT count(*), sum(id) FROM 'test/cpp/scan/data/flba4_decimal_bands.parquet' WHERE amount < -5;
+----
+10134	51883875
+
+# min is -49999.00 rather than -50000.00 because id 0 is one of the NULLs.
+query I
+SELECT min(amount) = -49999.00 AND max(amount) = -7953.00 AND sum(amount) = -293629085.00
+FROM 'test/cpp/scan/data/flba4_decimal_bands.parquet' WHERE amount < -5;
+----
+true
+
+query II
+SELECT count(*), sum(id) FROM 'test/cpp/scan/data/flba4_decimal_bands.parquet' WHERE amount > 35000;
+----
+2027	39435427
+
+query I
+SELECT amount = -30000.00 FROM 'test/cpp/scan/data/flba4_decimal_bands.parquet' WHERE id = 4096;
+----
+true
+
+query I
+SELECT count(*) FROM 'test/cpp/scan/data/flba4_decimal_bands.parquet' WHERE amount IS NULL;
+----
+212
+
+# ---------------------------------------------------------------------------
+# FIXED_LEN_BYTE_ARRAY(8) -- DECIMAL(18,2)
+# ---------------------------------------------------------------------------
+
+query II
+SELECT count(*), sum(id) FROM 'test/cpp/scan/data/flba8_decimal_bands.parquet' WHERE amount < -5;
+----
+10134	51883875
+
+query I
+SELECT min(amount) = -49999.00 AND max(amount) = -7953.00 AND sum(amount) = -293629085.00
+FROM 'test/cpp/scan/data/flba8_decimal_bands.parquet' WHERE amount < -5;
+----
+true
+
+query II
+SELECT count(*), sum(id) FROM 'test/cpp/scan/data/flba8_decimal_bands.parquet' WHERE amount > 35000;
+----
+2027	39435427
+
+query I
+SELECT amount = -30000.00 FROM 'test/cpp/scan/data/flba8_decimal_bands.parquet' WHERE id = 4096;
+----
+true
+
+query I
+SELECT count(*) FROM 'test/cpp/scan/data/flba8_decimal_bands.parquet' WHERE amount IS NULL;
+----
+212
+
+# ---------------------------------------------------------------------------
+# FIXED_LEN_BYTE_ARRAY(16) -- DECIMAL(38,4)
+# ---------------------------------------------------------------------------
+
+query II
+SELECT count(*), sum(id) FROM 'test/cpp/scan/data/flba16_decimal_bands.parquet' WHERE amount < -5;
+----
+10134	51883875
+
+query I
+SELECT min(amount) = -49999.0000 AND max(amount) = -7953.0000 AND sum(amount) = -293629085.0000
+FROM 'test/cpp/scan/data/flba16_decimal_bands.parquet' WHERE amount < -5;
+----
+true
+
+query II
+SELECT count(*), sum(id) FROM 'test/cpp/scan/data/flba16_decimal_bands.parquet' WHERE amount > 35000;
+----
+2027	39435427
+
+query I
+SELECT amount = -30000.0000 FROM 'test/cpp/scan/data/flba16_decimal_bands.parquet' WHERE id = 4096;
+----
+true
+
+query I
+SELECT count(*) FROM 'test/cpp/scan/data/flba16_decimal_bands.parquet' WHERE amount IS NULL;
+----
+212
+
+# A predicate spanning the sign boundary must not lose either side of it.
+query II
+SELECT count(*), sum(id) FROM 'test/cpp/scan/data/flba16_decimal_bands.parquet'
+WHERE amount BETWEEN -15000.0 AND 15000.0;
+----
+6081	68494068
+
+# ---------------------------------------------------------------------------
+# A DuckDB-written file, which stores DECIMAL(38,4) as FIXED_LEN_BYTE_ARRAY(16). This covers the
+# writer these tests can drive themselves, so a fixture regenerated by a future pyarrow is not the
+# only thing standing behind the 16-byte case.
+# ---------------------------------------------------------------------------
+
+statement ok
+COPY (SELECT (range)::INTEGER AS id,
+             CASE WHEN range % 97 = 0 THEN NULL
+                  ELSE CAST(((range // 2048) - 5) * 10000 + (range % 2048) AS DECIMAL(38,4))
+             END AS amount
+      FROM range(0, 20480))
+TO '__TEST_DIR__/duckdb_flba16_bands.parquet' (FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE 2048);
+
+query II
+SELECT count(*), sum(id) FROM '__TEST_DIR__/duckdb_flba16_bands.parquet' WHERE amount < -5;
+----
+10134	51883875
+
+query I
+SELECT min(amount) = -49999.0000 AND max(amount) = -7953.0000 AND sum(amount) = -293629085.0000
+FROM '__TEST_DIR__/duckdb_flba16_bands.parquet' WHERE amount < -5;
+----
+true
+
+query I
+SELECT count(*) FROM '__TEST_DIR__/duckdb_flba16_bands.parquet' WHERE amount IS NULL;
+----
+212

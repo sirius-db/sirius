@@ -95,7 +95,7 @@ class sirius_dynamic_zone_map_filter
     public sirius_device_replicable { /* AST consumer + producer replication */ };
 ```
 
-**Consumer-side dispatch** is by `dynamic_cast` from a `sirius_dynamic_filter` pointer to the capability the consumer needs. The `merge_ast_dynamic_filters_into_tree` helper performs the AST-capability cast internally and silently skips filters that lack it, so consumers building an AST tree don't need any per-call-site logic. `sirius_dynamic_filter::kind()` remains for cases where the consumer needs filter-kind-specific behavior beyond what a capability mixin describes (e.g., a parquet reader that natively understands bloom filters via a path other than `apply`).
+**Consumer-side dispatch** is by `dynamic_cast` from a `sirius_dynamic_filter` pointer to the capability the consumer needs. The `scan::merge_dynamic_filters_into_ast` helper (`op/scan/dynamic_filter_merge.hpp`) performs the AST-capability cast internally over a coherent channel snapshot and silently skips filters that lack it, so consumers building an AST tree don't need any per-call-site logic. `sirius_dynamic_filter::kind()` remains for cases where the consumer needs filter-kind-specific behavior beyond what a capability mixin describes (e.g., a parquet reader that natively understands bloom filters via a path other than `apply`).
 
 **AST lowering** — for consumers that build a `cudf::ast::tree` (parquet reader `set_filter`, expression evaluator). Tree nodes are owned by `tree`; device scalars referenced by literals are owned by the filter instance.
 
@@ -115,7 +115,7 @@ Properties:
   filter object into each one.
 - **Filters are co-owned via `shared_ptr<filter const>`.** Producers may push the same filter object into multiple channels. Phase 1 uses this for scan-target fan-out, and a Phase 2 producer with both a scan-routed and a join-edge key fans distinct filters into distinct channels the same way.
 
-Consumer access is via `filters_for_column(col_idx)` and `filtered_columns()`. The free helper `merge_ast_dynamic_filters_into_tree(tree, existing_root, set, resolver)` walks the channel, lowers every AST-capable filter, AND-conjoins the per-column and cross-column fragments, and returns `AND(existing_root, dynamic_root)` — or `existing_root` unchanged if no filter contributed.
+Consumer access is via `snapshot()` (coherent generation + filter pointers) or, for simple probes, `filters_for_column(col_idx)` and `filtered_columns()`. The free helper `scan::merge_dynamic_filters_into_ast` (`op/scan/dynamic_filter_merge.hpp`) takes a snapshot, lowers every AST-capable filter, AND-conjoins the per-column and cross-column fragments, and returns `AND(existing_root, dynamic_root)` — or `existing_root` unchanged if no filter contributed. (An earlier set-walking helper, `merge_ast_dynamic_filters_into_tree`, was deleted: it re-fetched each column's filters by value inside its loop — the same lifetime shape as the parquet snapshot defect fixed alongside the Top-N work — and had no production callers.)
 
 ### Target discovery — the producing join's own walk (routing axis)
 

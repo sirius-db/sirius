@@ -1059,38 +1059,4 @@ bool sirius_dynamic_filter_set::empty() const
   return _filters.empty();
 }
 
-cudf::ast::expression const& merge_ast_dynamic_filters_into_tree(
-  cudf::ast::tree& tree,
-  cudf::ast::expression const& existing_root,
-  sirius_dynamic_filter_set const& set,
-  column_ref_resolver_fn const& column_ref_resolver)
-{
-  if (set.empty()) { return existing_root; }
-  auto const device_id = detail::resolve_dynamic_filter_device_id(-1);
-
-  auto cols = set.filtered_columns();
-  std::sort(cols.begin(), cols.end());
-
-  cudf::ast::expression const* dynamic_root = nullptr;
-  for (auto const col_idx : cols) {
-    auto filters = set.filters_for_column(col_idx);
-    if (filters.empty()) { continue; }
-
-    cudf::ast::expression const* column_ref = nullptr;
-    cudf::ast::expression const* per_col    = nullptr;
-    for (auto const& f : filters) {
-      if (!f->is_available_on_device(device_id)) { continue; }
-      auto const* lowerable = dynamic_cast<sirius_ast_lowerable const*>(f.get());
-      if (!lowerable) { continue; }
-      if (!column_ref) { column_ref = &column_ref_resolver(col_idx); }
-      auto const& fragment = lowerable->to_ast(tree, *column_ref, device_id);
-      per_col              = per_col ? &and_join(tree, *per_col, fragment) : &fragment;
-    }
-    if (!per_col) { continue; }
-    dynamic_root = dynamic_root ? &and_join(tree, *dynamic_root, *per_col) : per_col;
-  }
-  if (!dynamic_root) { return existing_root; }
-  return and_join(tree, existing_root, *dynamic_root);
-}
-
 }  // namespace sirius::op

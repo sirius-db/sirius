@@ -28,8 +28,6 @@
 #include <thread>
 #include <vector>
 
-using sirius::op::column_ref_resolver_fn;
-using sirius::op::merge_ast_dynamic_filters_into_tree;
 using sirius::op::sirius_ast_lowerable;
 using sirius::op::sirius_dynamic_filter;
 using sirius::op::sirius_dynamic_filter_kind;
@@ -56,16 +54,6 @@ std::unique_ptr<sirius_dynamic_zone_map_filter> make_single_zone_filter(int32_t 
   zones.push_back(make_zone(lo, hi));
   return std::make_unique<sirius_dynamic_zone_map_filter>(std::move(zones));
 }
-
-// Stand-in for a runtime-only filter (e.g., bloom): inherits the base but NOT the AST mixin.
-// Lets us verify that the consumer-side merge skips filters lacking the AST capability.
-class stub_runtime_only_filter final : public sirius_dynamic_filter {
- public:
-  [[nodiscard]] sirius_dynamic_filter_kind kind() const override
-  {
-    return sirius_dynamic_filter_kind::ZONE_MAP;
-  }
-};
 
 }  // namespace
 
@@ -275,112 +263,4 @@ TEST_CASE("sirius_ast_lowerable::to_standalone_ast wraps to_ast in a fresh tree"
 
   // Same node count as the in-place to_ast for N=1: 1 col_ref + 2 lit + 2 op + 1 AND = 6.
   REQUIRE(tree.size() == 6);
-}
-
-TEST_CASE("merge_ast_dynamic_filters_into_tree returns existing_root unchanged for empty set",
-          "[dynamic_filter]")
-{
-  sirius_dynamic_filter_set set;
-  cudf::ast::tree tree;
-  auto const& base = tree.emplace<cudf::ast::column_reference>(99);
-
-  auto const& root = merge_ast_dynamic_filters_into_tree(
-    tree, base, set, [&tree](std::size_t) -> cudf::ast::expression const& {
-      return tree.emplace<cudf::ast::column_reference>(0);
-    });
-
-  REQUIRE(&root == &base);
-  REQUIRE(tree.size() == 1);
-}
-
-TEST_CASE(
-  "merge_ast_dynamic_filters_into_tree AND-conjoins per-column fragments with existing root",
-  "[dynamic_filter]")
-{
-  sirius_dynamic_filter_set set;
-  set.push_filter(0, make_single_zone_filter(0, 100));
-  set.push_filter(1, make_single_zone_filter(-5, 5));
-
-  cudf::ast::tree tree;
-  auto const& base = tree.emplace<cudf::ast::column_reference>(99);
-
-  std::vector<std::size_t> resolved_cols;
-  auto const& root = merge_ast_dynamic_filters_into_tree(
-    tree, base, set, [&tree, &resolved_cols](std::size_t col_idx) -> cudf::ast::expression const& {
-      resolved_cols.push_back(col_idx);
-      return tree.emplace<cudf::ast::column_reference>(static_cast<cudf::size_type>(col_idx));
-    });
-
-  REQUIRE(&tree.back() == &root);
-
-  // Resolver should have been called once per column with AST-capable filters.
-  std::sort(resolved_cols.begin(), resolved_cols.end());
-  REQUIRE(resolved_cols == std::vector<std::size_t>{0, 1});
-
-  // 1 base col_ref + 2 cols × (1 col_ref + 2 lit + 2 op + 1 AND) + 1 cross-col AND
-  //   + 1 final AND with base = 1 + 12 + 1 + 1 = 15.
-  REQUIRE(tree.size() == 15);
-}
-
-TEST_CASE("merge_ast_dynamic_filters_into_tree AND-conjoins multiple filters per column",
-          "[dynamic_filter]")
-{
-  sirius_dynamic_filter_set set;
-  set.push_filter(0, make_single_zone_filter(0, 100));
-  set.push_filter(0, make_single_zone_filter(10, 200));
-
-  cudf::ast::tree tree;
-  auto const& base = tree.emplace<cudf::ast::column_reference>(99);
-
-  auto const& root = merge_ast_dynamic_filters_into_tree(
-    tree, base, set, [&tree](std::size_t col_idx) -> cudf::ast::expression const& {
-      return tree.emplace<cudf::ast::column_reference>(static_cast<cudf::size_type>(col_idx));
-    });
-
-  REQUIRE(&tree.back() == &root);
-  // 1 base + (1 col_ref + 2*(2 lit + 2 op + 1 AND) + 1 AND combining filters)
-  //   + 1 final AND with base = 1 + 12 + 1 = 14.
-  REQUIRE(tree.size() == 14);
-}
-
-TEST_CASE("merge_ast_dynamic_filters_into_tree skips filters lacking the AST capability",
-          "[dynamic_filter]")
-{
-  sirius_dynamic_filter_set set;
-  set.push_filter(0, std::make_unique<stub_runtime_only_filter>());
-
-  cudf::ast::tree tree;
-  auto const& base = tree.emplace<cudf::ast::column_reference>(99);
-
-  std::size_t resolver_calls = 0;
-  auto const& root           = merge_ast_dynamic_filters_into_tree(
-    tree, base, set, [&tree, &resolver_calls](std::size_t col_idx) -> cudf::ast::expression const& {
-      ++resolver_calls;
-      return tree.emplace<cudf::ast::column_reference>(static_cast<cudf::size_type>(col_idx));
-    });
-
-  REQUIRE(&root == &base);
-  REQUIRE(resolver_calls == 0);  // resolver is lazy; no AST-capable filter, no resolve
-  REQUIRE(tree.size() == 1);     // only the base remains
-}
-
-TEST_CASE(
-  "merge_ast_dynamic_filters_into_tree mixes AST-capable and non-capable filters per column",
-  "[dynamic_filter]")
-{
-  sirius_dynamic_filter_set set;
-  set.push_filter(0, std::make_unique<stub_runtime_only_filter>());
-  set.push_filter(0, make_single_zone_filter(0, 100));
-
-  cudf::ast::tree tree;
-  auto const& base = tree.emplace<cudf::ast::column_reference>(99);
-
-  auto const& root = merge_ast_dynamic_filters_into_tree(
-    tree, base, set, [&tree](std::size_t col_idx) -> cudf::ast::expression const& {
-      return tree.emplace<cudf::ast::column_reference>(static_cast<cudf::size_type>(col_idx));
-    });
-
-  REQUIRE(&tree.back() == &root);
-  // 1 base + 1 col_ref + 2 lit + 2 op + 1 AND (zone_map) + 1 final AND with base = 8.
-  REQUIRE(tree.size() == 8);
 }

@@ -25,10 +25,10 @@ pixi run bash generate_tpch_data.sh 100
 pixi run bash generate_tpch_data.sh 100 /data/tpch_sf100 16
 ```
 
-### Clustered (sorted) DuckDB datasets for zone-map pruning
+### Clustered (sorted) datasets for zone-map pruning
 
-`--cluster` (duckdb format only) physically sorts tables at load so each row group's
-per-column min/max becomes selective. This is what makes Sirius's native-scan row-group
+`--cluster` physically sorts tables so each row group's
+per-column min/max becomes selective. Supported for **both** formats. This is what makes Sirius's native-scan row-group
 pruning (`mark_row_groups_pruned_by_filter_stats`) actually skip work on date-filtered
 queries — on an unsorted dbgen dataset every row group spans the full date range and
 nothing prunes. It writes a fresh, compact `tpch_sf<SF>_sorted.duckdb` (dbgen → staging →
@@ -39,10 +39,17 @@ sorted copy, so there is no dead-block bloat).
 pixi run bash generate_tpch_data.sh 10 --format duckdb --cluster
 # → test_datasets/tpch_sf10_sorted.duckdb
 
+pixi run bash generate_tpch_data.sh 10 --format parquet --cluster
+# → test_datasets/tpch_parquet_sf10_sorted/
+
 # Override the sort keys (implies --cluster); "table:col,table:col,..."
 pixi run bash generate_tpch_data.sh 10 --format duckdb \
     --cluster-keys "lineitem:l_shipdate,orders:o_orderdate"
 ```
+
+Clustered output goes to a `_sorted` name so it coexists with the unsorted dataset, and
+generation stages into a `.staging` dir/file cleaned by a trap — an interrupted run cannot
+leave a half-sorted dataset under the real name.
 
 Benchmark it through the unchanged native runner and validate against DuckDB CPU:
 
@@ -61,31 +68,25 @@ SIRIUS_NATIVE_SCAN_VERIFY=1 OUTPUT_DIR=/tmp/cluster_verify \
 grep -oE 'stats-pruned [0-9]+ row groups' /tmp/cluster_verify/sirius_*.log
 ```
 
-> **Why duckdb-only.** Sorting works for parquet too in principle, but the default
-> tpchgen-rs (Arrow) writes `DECIMAL` as `FIXED_LEN_BYTE_ARRAY`, which trips Sirius's
-> `skip_pushdown_due_to_flba` and disables row-group pruning for the *whole* parquet file —
-> so a sorted parquet wouldn't prune. The duckdb path stores decimals as `INT64` and prunes
-> correctly. `--cluster` therefore errors if combined with `--format parquet`.
+> **Parquet clustering: DuckDB sorts, pyarrow writes.** `cluster_parquet.py` runs the sort
+> pass, and the split is deliberate. Writing the sorted output through DuckDB would re-encode
+> `DECIMAL` as `INT64`, producing a dataset no longer comparable to the unclustered original it
+> exists to be benchmarked against; pyarrow preserves `FIXED_LEN_BYTE_ARRAY`. Do not "simplify"
+> this into a single DuckDB write.
+>
+> This was duckdb-only until recently: Sirius disabled reader-side pruning for any parquet file
+> containing an FLBA decimal, so a sorted parquet could not pay off. That guard's FLBA arm has
+> been removed (the cuDF failure it was written against no longer reproduces), so clustered
+> parquet now prunes.
+>
+> Verified at SF0.05: FLBA in → FLBA out, 0 out-of-order rows, row counts preserved, and row
+> groups touched for `l_shipdate` in 1994 went from 15/15 unsorted to 3/16 clustered.
 
 ### From DuckDB's built-in TPC-H generator
 
 ```bash
 # From project root - generates parquet files with DuckDB's default row groups (122K rows)
 ./build/release/duckdb -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=100); EXPORT DATABASE 'test_datasets/tpch_parquet_sf100' (FORMAT PARQUET);"
-```
-
-### Rewriting parquet with GPU-optimized settings
-
-The `rewrite_parquet.py` script reads existing parquet files and rewrites them with larger row groups, snappy compression, V2 page headers, dictionary encoding, and configurable max file size (large tables are split into numbered files). Uses cudf (GPU) if available, otherwise falls back to pyarrow (CPU-only). Requires the pixi environment in this directory (`pixi install`).
-
-```bash
-cd test/tpch_performance
-
-# Rewrite with 10M-row row groups (recommended for GPU workloads)
-pixi run python rewrite_parquet.py ../../test_datasets/tpch_parquet_sf100 ../../test_datasets/tpch_parquet_sf100_optimized 10000000
-
-# Rewrite with 2M-row row groups, 20 GB max file size
-pixi run python rewrite_parquet.py ../../test_datasets/tpch_parquet_sf100 ../../test_datasets/tpch_parquet_sf100_rg2m 2000000 20
 ```
 
 ### From tpchgen-rs Python wrapper (alternative, supports partitioned output)
@@ -354,7 +355,7 @@ Output: `reports/<label>_<YYYYMMDD_HHMMSS>/` containing `report.md`, `summary.js
 | `nsys_compare.sh` | Compare two nsys reports and flag regressions |
 | `nsys_hotspots.sh` | Map GPU hotspots to source functions, detect bottlenecks |
 | `nsys_report.sh` | Orchestrate profiling + analysis into a self-contained report |
-| `rewrite_parquet.py` | Rewrite parquet with GPU-optimized row groups (cudf or pyarrow fallback) |
+| `cluster_parquet.py` | Sort pass for `--cluster --format parquet`: DuckDB sorts, pyarrow writes (preserves FLBA decimals) |
 | `performance_test.py` | Python-based benchmark with result verification |
 | `queries.py` | TPC-H query definitions (base SQL) |
 | `tpch_pin_columns.py` | Per-query and union column → table mapping for `--pinning-mode per-query` / `pinned-hot` (union helpers also used by `performance_test.py --mode sequential`); emits `CALL pin_table(...)` / `CALL unpin_table(...)` SQL |
@@ -377,7 +378,10 @@ The Sirius config file (`test/cpp/integration/integration.yaml`) controls:
 ## Parquet Format Notes
 
 - DuckDB's default export creates 122,880-row row groups (its internal vector size)
-- For GPU workloads, 2M-10M row groups perform significantly better
-- The `rewrite_parquet.py` script preserves the original schema (date32, decimal128) to avoid type mismatch issues with Sirius
-- cudf internally promotes date32 to timestamp; the rewriter casts back before writing
-- Large tables are split into multiple numbered files when exceeding the max file size limit
+- For GPU workloads, 2M-10M row groups perform significantly better; `generate_tpch_data.sh`
+  (tpchgen-rs) already writes GPU-sized row groups
+- Preserve the original schema (date32, decimal128) when rewriting parquet — casting types
+  causes mismatches with Sirius. Note cudf promotes date32 to timestamp on read, so cast back
+  before writing
+- tpchgen-rs writes `DECIMAL` as `FIXED_LEN_BYTE_ARRAY`; Sirius prunes on that encoding, and
+  the clustered-parquet path preserves it deliberately (see above)

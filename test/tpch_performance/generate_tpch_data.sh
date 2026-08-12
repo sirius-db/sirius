@@ -3,7 +3,7 @@
 #
 # Usage:
 #   ./generate_tpch_data.sh <scale_factor> [--format duckdb|parquet] [--output <path>] [--jobs N]
-#   ./generate_tpch_data.sh <scale_factor> --format duckdb --cluster [--cluster-keys <spec>]
+#   ./generate_tpch_data.sh <scale_factor> [--format duckdb|parquet] --cluster [--cluster-keys <spec>]
 #   ./generate_tpch_data.sh <scale_factor> [output_dir] [jobs]     # backward-compatible
 #
 # Arguments:
@@ -11,21 +11,24 @@
 #   --format        - Output format: 'parquet' (default) or 'duckdb'
 #   --output        - Output path (default depends on format)
 #   --jobs          - Number of parallel jobs for parquet generation (default: nproc)
-#   --cluster       - (duckdb only) physically sort tables at load so on-disk zone
-#                     maps (per-row-group min/max) become selective. This is what
-#                     makes Sirius's native-scan row-group pruning effective on
-#                     date-filtered queries. Default sort keys cluster the fact and
-#                     order tables on their date columns.
+#   --cluster       - physically sort tables so on-disk zone maps (per-row-group
+#                     min/max) become selective. This is what makes Sirius's
+#                     row-group pruning effective on date-filtered queries. Default
+#                     sort keys cluster the fact and order tables on their date
+#                     columns. Supported for both formats; parquet is sorted by a
+#                     post-generation pass (cluster_parquet.py).
 #   --cluster-keys  - Override the sort keys, as "table:col,table:col,...".
 #                     Default: "lineitem:l_shipdate,orders:o_orderdate". Implies --cluster.
 #
 # Parquet format uses tpchgen-rs for optimized row groups and compression.
 # DuckDB format uses DuckDB's built-in dbgen() extension.
 #
-# --cluster is duckdb-only on purpose: tpchgen-rs writes Arrow Decimal128 as
-# FIXED_LEN_BYTE_ARRAY, which trips Sirius's `skip_pushdown_due_to_flba` and
-# disables row-group pruning for the whole parquet file (so sorting wouldn't help).
-# The duckdb path stores decimals as INT64 and prunes correctly.
+# --cluster used to be duckdb-only: tpchgen-rs writes Arrow Decimal128 as
+# FIXED_LEN_BYTE_ARRAY, and Sirius disabled reader-side row-group pruning for any parquet
+# file containing such a column, so sorting a parquet dataset could not pay off. Sirius now
+# pushes FIXED_LEN_BYTE_ARRAY decimals down and prunes on them, so clustering is supported
+# for both formats. The parquet sort pass keeps that encoding rather than re-encoding
+# decimals as INT64, so a clustered dataset stays comparable to its unclustered original.
 #
 # Examples:
 #   cd test/tpch_performance
@@ -34,6 +37,7 @@
 #   pixi run bash generate_tpch_data.sh 100 --format duckdb --cluster
 #   pixi run bash generate_tpch_data.sh 10 --format duckdb --cluster-keys "lineitem:l_shipdate,orders:o_orderdate"
 #   pixi run bash generate_tpch_data.sh 100 --format parquet --output /data/tpch_sf100
+#   pixi run bash generate_tpch_data.sh 100 --format parquet --cluster
 #
 # Or it can be called standalone if rust, python, and pyarrow are in PATH.
 
@@ -50,6 +54,7 @@ if [ $# -lt 1 ]; then
     echo "  $0 100 --format duckdb          # SF100, duckdb database"
     echo "  $0 100 --format duckdb --cluster  # SF100, duckdb database sorted on date columns"
     echo "  $0 100 --format parquet --output /data/tpch_sf100"
+    echo "  $0 100 --format parquet --cluster  # SF100, parquet sorted on date columns"
     exit 1
 fi
 
@@ -106,14 +111,6 @@ if [ "$FORMAT" != "duckdb" ] && [ "$FORMAT" != "parquet" ]; then
     exit 1
 fi
 
-if [ "$CLUSTER" = "true" ] && [ "$FORMAT" != "duckdb" ]; then
-    echo "ERROR: --cluster is only supported with --format duckdb."
-    echo "       Parquet clustering is intentionally not implemented: tpchgen-rs writes Arrow"
-    echo "       Decimal128 as FIXED_LEN_BYTE_ARRAY, which disables Sirius row-group pruning for"
-    echo "       the whole file (skip_pushdown_due_to_flba). Use --format duckdb."
-    exit 1
-fi
-
 # --- Set default output path ---
 if [ -z "$OUTPUT" ]; then
     if [ "$FORMAT" = "duckdb" ]; then
@@ -124,7 +121,12 @@ if [ -z "$OUTPUT" ]; then
             OUTPUT="$PROJECT_DIR/test_datasets/tpch_sf${SF}.duckdb"
         fi
     else
-        OUTPUT="$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}"
+        if [ "$CLUSTER" = "true" ]; then
+            # Distinct name so the sorted dataset can coexist with the unsorted one.
+            OUTPUT="$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}_sorted"
+        else
+            OUTPUT="$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}"
+        fi
     fi
 fi
 
@@ -156,14 +158,34 @@ if [ "$FORMAT" = "parquet" ]; then
         echo "tpchgen-cli already built at $TPCHGEN_CLI"
     fi
 
-    # Step 3: Generate parquet data
+    # Step 3: Generate parquet data. When clustering, tpchgen-rs writes into a staging
+    # directory and the sort pass below produces $OUTPUT, so an interrupted run never
+    # leaves a half-sorted dataset behind under the final name.
+    if [ "$CLUSTER" = "true" ]; then
+        GEN_DIR="${OUTPUT}.staging"
+        rm -rf "$GEN_DIR"
+        trap 'rm -rf "$GEN_DIR"' EXIT
+    else
+        GEN_DIR="$OUTPUT"
+    fi
+
     echo "Generating TPC-H SF${SF} parquet data with ${JOBS} parallel jobs..."
-    echo "Output: $OUTPUT"
+    echo "Output: $GEN_DIR"
     python "$TPCHGEN_DIR/scripts/generate_tpch.py" \
         -s "$SF" \
         -f parquet \
         -j "$JOBS" \
-        -o "$OUTPUT"
+        -o "$GEN_DIR"
+
+    if [ "$CLUSTER" = "true" ]; then
+        echo "Clustering parquet tables ($CLUSTER_KEYS) into $OUTPUT ..."
+        python "$SCRIPT_DIR/cluster_parquet.py" \
+            --input "$GEN_DIR" \
+            --output "$OUTPUT" \
+            --keys "$CLUSTER_KEYS"
+        rm -rf "$GEN_DIR"
+        trap - EXIT
+    fi
 
 elif [ "$FORMAT" = "duckdb" ]; then
     # Use DuckDB's built-in dbgen() for DuckDB format

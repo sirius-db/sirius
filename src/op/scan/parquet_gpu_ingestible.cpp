@@ -388,7 +388,7 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
   }
 
   // Shared reader options — column projection only. set_filter is never applied
-  // here: it is a per-split decision (FLBA files disable it) made in
+  // here: it is a per-split decision (BYTE_ARRAY-decimal files disable it) made in
   // materialize_table on a copy of these options.
   _reader_options = std::make_shared<cudf::io::parquet_reader_options>(
     cudf::io::parquet_reader_options::builder().build());
@@ -502,10 +502,24 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   }
   auto const& metadata = *file_metadata;
 
-  // FLBA-decimal pushdown probe: cudf's row-group stats filter cannot compare a
-  // fixed_point_scalar AST literal against FLBA / BYTE_ARRAY decimal stats, so
-  // reader-side pushdown is disabled when such a decimal is among the columns
-  // this scan reads (the filter still applies post-decode).
+  // BYTE_ARRAY-decimal pushdown probe: reader-side pushdown is disabled when a decimal stored in
+  // the variable-length BYTE_ARRAY physical type is among the columns this scan reads (the filter
+  // still applies post-decode). This probe once covered FIXED_LEN_BYTE_ARRAY decimals as well,
+  // because cudf's row-group stats filter threw "Invalid type and stats combination" when
+  // comparing a fixed_point_scalar AST literal against them. At the pinned cudf that comparison
+  // succeeds and prunes correctly at each stored width, including negative values and nulls, so
+  // those decimals are pushed down -- which matters because DuckDB stores every DECIMAL wider
+  // than 18 digits as FIXED_LEN_BYTE_ARRAY and Arrow-based writers store every decimal that way.
+  // `test/cpp/scan/test_parquet_decimal_pushdown.cpp` covers the surviving row groups at widths
+  // 4, 8 and 16, and `test/sql/parquet_decimal_pushdown.test` covers the values they decode to.
+  //
+  // Two consequences worth stating. Neither the stats filter below nor the read in
+  // materialize_metadata_to_table is wrapped in a try/catch, so while it was in force this probe
+  // also served as an exception net: anything the reader threw on a FIXED_LEN_BYTE_ARRAY decimal
+  // propagated out of the scan instead of being caught, and that is now the behaviour for those
+  // files. And BYTE_ARRAY decimals stay disabled only because no writer available here emits
+  // them, so the fix could not be confirmed for that encoding; they are rare enough that leaving
+  // pushdown off costs nothing.
   bool const restrict_to_scanned = _plan->is_projected();
   std::unordered_set<std::string> scanned_column_names;
   if (restrict_to_scanned) {
@@ -520,8 +534,7 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
                             (elem.logical_type.has_value() &&
                              elem.logical_type->type == cudf::io::parquet::LogicalType::DECIMAL);
     if (!is_decimal) { continue; }
-    if (elem.type == cudf::io::parquet::Type::FIXED_LEN_BYTE_ARRAY ||
-        elem.type == cudf::io::parquet::Type::BYTE_ARRAY) {
+    if (elem.type == cudf::io::parquet::Type::BYTE_ARRAY) {
       disable_filter_pushdown = true;
       break;
     }
@@ -760,16 +773,26 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
 
   // Per-task AST translation for reader-side row-group + row pushdown. set_filter
   // is gated on translation success AND on the per-batch disable_filter_pushdown
-  // flag (set when the FLBA-decimal probe failed). When pushdown does not engage
+  // flag (set when the BYTE_ARRAY-decimal probe matched). When pushdown does not engage
   // — disabled, translation fails, or the split is the all-pruned zero-row
   // fallback (zero rows need no reader filter; skipping keeps GPU AST
   // translation off that path) — the row filter is left for
   // post_filter_and_project to apply post-decode. The translated cuDF AST
   // (`ast_expression`) must outlive read_parquet; the borrowed Sirius AST and
   // the translator are only needed during translation.
+  //
+  // `filters_snapshot` must outlive read_parquet for the same reason, and is declared here rather
+  // than where it is taken so that it does. A tree owns its AST nodes, but the device scalars a
+  // dynamic filter's literals point at are owned by the filter, and the snapshot's owning copies
+  // are what keep a *superseded* filter alive while a consumer still references it. A refinement
+  // slot replaces its filter on every accepted revision, so releasing the snapshot before the
+  // reader has finished walking the AST can drop the last owner of the filter whose scalars
+  // `opts` still points at -- which cuDF then dereferences on the device. Append-only join
+  // filters never expose this, because the channel keeps its own reference forever.
   std::optional<gpu_expression_translator::translated_expression> ast_expression = std::nullopt;
   std::optional<gpu_expression_translator::translated_expression> dynamic_ast_expression =
     std::nullopt;
+  sirius::op::dynamic_filter_snapshot filters_snapshot;
   cudf::ast::expression const* reader_filter_root = nullptr;
 
   if (_duckdb_filter_expression && !split.disable_filter_pushdown && !all_slices_pruned) {
@@ -787,7 +810,7 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
       _sirius_dynamic_filters->has_filters()) {
     // One coherent snapshot per checkpoint: taken after the lock-free fast path, before any
     // other lock, and used for every predicate built for this split.
-    auto const filters_snapshot = _sirius_dynamic_filters->snapshot();
+    filters_snapshot = _sirius_dynamic_filters->snapshot();
     if (ast_expression) {
       reader_filter_root = merge_dynamic_filters_into_ast(ast_expression->tree,
                                                           reader_filter_root,
@@ -851,7 +874,7 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
 
   // Apply the row filter post-decode when materialization did not — reader-side
-  // pushdown was disabled (FLBA-decimal file) or AST translation failed. A
+  // pushdown was disabled (BYTE_ARRAY-decimal file) or AST translation failed. A
   // ROW_FILTERED / ROW_FILTERED_AND_PROJECTED state means the reader already
   // applied it. `sirius_filter_ast` must outlive `exec` — the evaluator only
   // borrows the AST.
