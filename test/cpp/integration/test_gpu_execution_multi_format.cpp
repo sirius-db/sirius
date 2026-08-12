@@ -1135,9 +1135,9 @@ class GPUExecutionIcebergRetiredFixture : public GPUExecutionIcebergFixture {
  public:
   GPUExecutionIcebergRetiredFixture()
   {
-    auto const root      = get_project_root() / "test/cpp/integration/data";
-    pos_retired_path     = (root / "iceberg_v2_pos_delete_retired").string();
-    eq_retired_path      = (root / "iceberg_v2_eq_delete_retired").string();
+    auto const root  = get_project_root() / "test/cpp/integration/data";
+    pos_retired_path = (root / "iceberg_v2_pos_delete_retired").string();
+    eq_retired_path  = (root / "iceberg_v2_eq_delete_retired").string();
   }
 
   std::string pos_retired_path;
@@ -1155,11 +1155,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergRetiredFixture,
   expect_iceberg_rows(
     "SELECT fruit, count FROM iceberg_scan('" + pos_retired_path + "') ORDER BY count;",
     gpu_route::gpu,
-    {{"apple", "1"},
-     {"banana", "2"},
-     {"cherry", "3"},
-     {"date", "4"},
-     {"elderberry", "5"}});
+    {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}, {"date", "4"}, {"elderberry", "5"}});
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergRetiredFixture,
@@ -1174,11 +1170,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergRetiredFixture,
   expect_iceberg_rows(
     "SELECT fruit, count FROM iceberg_scan('" + eq_retired_path + "') ORDER BY count;",
     gpu_route::gpu,
-    {{"apple", "1"},
-     {"banana", "2"},
-     {"cherry", "3"},
-     {"date", "4"},
-     {"elderberry", "5"}});
+    {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}, {"date", "4"}, {"elderberry", "5"}});
 }
 
 //===----------------------------------------------------------------------===//

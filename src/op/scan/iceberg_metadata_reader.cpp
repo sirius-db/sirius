@@ -199,10 +199,10 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
   // (which the query above filters on) it means "carried over from an earlier snapshot". Here it
   // means "this is a DATA file" -- DuckDB's name for what the Iceberg spec calls DATA. Reading
   // one as the other silently reclassifies every data file as a delete file, or vice versa.
-  static constexpr auto kPositionDeletes  = "POSITION_DELETES";
-  static constexpr auto kEqualityDeletes  = "EQUALITY_DELETES";
-  static constexpr auto kContentDataFile  = "EXISTING";
-  static constexpr auto kFormatPuffin     = "PUFFIN";
+  static constexpr auto kPositionDeletes = "POSITION_DELETES";
+  static constexpr auto kEqualityDeletes = "EQUALITY_DELETES";
+  static constexpr auto kContentDataFile = "EXISTING";
+  static constexpr auto kFormatPuffin    = "PUFFIN";
 
   // iceberg_metadata() returns one PUFFIN row per deletion vector, but read_avro returns ALL of
   // a manifest's vectors at once — so a manifest must be expanded exactly once. Keyed on the

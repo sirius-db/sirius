@@ -94,7 +94,11 @@ def roaring64(positions):
 def dv_blob(positions):
     """deletion-vector-v1: [4B BE length of magic+vector][magic][vector][4B BE CRC-32]."""
     body = DV_MAGIC + roaring64(positions)
-    return struct.pack(">I", len(body)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+    return (
+        struct.pack(">I", len(body))
+        + body
+        + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+    )
 
 
 def build_puffin(blob, referenced_data_file, snapshot_id, sequence_number):
@@ -152,21 +156,30 @@ def verify():
 
     puffins = sorted((HERE / "data").glob("*.puffin"))
     if len(puffins) != 2:
-        print(f"  expected 2 Puffin files (active + retired), found {len(puffins)}", file=sys.stderr)
+        print(
+            f"  expected 2 Puffin files (active + retired), found {len(puffins)}",
+            file=sys.stderr,
+        )
         return False
     for path in puffins:
         blobs = PuffinFile(path.read_bytes()).footer.blobs
-        print(f"  pyiceberg: OK - {path.name}: {len(blobs)} blob(s), type={blobs[0].type}")
+        print(
+            f"  pyiceberg: OK - {path.name}: {len(blobs)} blob(s), type={blobs[0].type}"
+        )
 
     manifest = next(p for p in (HERE / "metadata").glob("*-m1.avro"))
     with manifest.open("rb") as fh:
         entries = [r for r in fastavro.reader(fh)]
 
     puffin_entries = [
-        r for r in entries if (r["data_file"].get("file_format") or "").upper() == "PUFFIN"
+        r
+        for r in entries
+        if (r["data_file"].get("file_format") or "").upper() == "PUFFIN"
     ]
     statuses = [r["status"] for r in puffin_entries]
-    print(f"  manifest: {len(puffin_entries)} PUFFIN entries, statuses in order {statuses}")
+    print(
+        f"  manifest: {len(puffin_entries)} PUFFIN entries, statuses in order {statuses}"
+    )
 
     if statuses != [STATUS_ADDED, STATUS_DELETED]:
         print(
@@ -177,7 +190,9 @@ def verify():
 
     referenced = {r["data_file"]["referenced_data_file"] for r in puffin_entries}
     if len(referenced) != 1:
-        print(f"  both entries must name ONE data file; got {referenced}", file=sys.stderr)
+        print(
+            f"  both entries must name ONE data file; got {referenced}", file=sys.stderr
+        )
         return False
 
     for entry, expected in zip(puffin_entries, (ACTIVE_POSITIONS, RETIRED_POSITIONS)):
@@ -194,9 +209,12 @@ def verify():
     from pyiceberg.table import StaticTable
 
     expected = TOTAL_ROWS - len(ACTIVE_POSITIONS)
-    rows = StaticTable.from_metadata(
-        str(HERE / "metadata" / "v1.metadata.json")
-    ).scan().to_arrow().num_rows
+    rows = (
+        StaticTable.from_metadata(str(HERE / "metadata" / "v1.metadata.json"))
+        .scan()
+        .to_arrow()
+        .num_rows
+    )
 
     if rows != expected:
         blind = TOTAL_ROWS - len(set(ACTIVE_POSITIONS) | set(RETIRED_POSITIONS))
@@ -204,17 +222,24 @@ def verify():
             TOTAL_ROWS: "NEITHER vector applied - referenced_data_file matches no data file",
             blind: "both vectors applied - the retired entry was not filtered out",
         }.get(rows, "unexpected")
-        print(f"  pyiceberg scan: FAIL - {rows} rows, expected {expected} ({hint})", file=sys.stderr)
+        print(
+            f"  pyiceberg scan: FAIL - {rows} rows, expected {expected} ({hint})",
+            file=sys.stderr,
+        )
         return False
 
     print(f"  pyiceberg scan: OK - {rows} rows, deletes {ACTIVE_POSITIONS} applied")
-    print(f"  a status-blind reader would instead return {TOTAL_ROWS - len(RETIRED_POSITIONS)}")
+    print(
+        f"  a status-blind reader would instead return {TOTAL_ROWS - len(RETIRED_POSITIONS)}"
+    )
     return True
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--verify", action="store_true", help="validate only, write nothing")
+    ap.add_argument(
+        "--verify", action="store_true", help="validate only, write nothing"
+    )
     args = ap.parse_args()
 
     if args.verify:
@@ -234,7 +259,9 @@ def main():
 
     for sub in ("data", "metadata"):
         shutil.copytree(SRC / sub, HERE / sub)
-    for stray in list((HERE / "data").glob("*.bak")) + list((HERE / "metadata").glob("*.bak")):
+    for stray in list((HERE / "data").glob("*.bak")) + list(
+        (HERE / "metadata").glob("*.bak")
+    ):
         stray.unlink()
     for stray in (HERE / "metadata").glob("*.py"):
         stray.unlink()
@@ -272,13 +299,21 @@ def main():
     next((HERE / "data").glob("*.puffin")).unlink()
     data_dir = HERE / "data"
     descriptors = {}
-    for label, positions in (("active", ACTIVE_POSITIONS), ("retired", RETIRED_POSITIONS)):
+    for label, positions in (
+        ("active", ACTIVE_POSITIONS),
+        ("retired", RETIRED_POSITIONS),
+    ):
         container, descriptor = build_puffin(
             dv_blob(positions), data_file, snapshot_id, sequence_number
         )
-        path = data_dir / f"dv-{label}-00000-0-d7e8f9a0-0007-0007-0007-000000000002.puffin"
+        path = (
+            data_dir / f"dv-{label}-00000-0-d7e8f9a0-0007-0007-0007-000000000002.puffin"
+        )
         path.write_bytes(container)
-        descriptors[label] = (f"{HERE.relative_to(pathlib.Path.cwd())}/data/{path.name}", descriptor)
+        descriptors[label] = (
+            f"{HERE.relative_to(pathlib.Path.cwd())}/data/{path.name}",
+            descriptor,
+        )
         print(f"wrote {path.name}: {len(container)}B, {len(positions)} position(s)")
 
     # --- the delete manifest: ADDED first, DELETED last -------------------------------------
@@ -288,10 +323,14 @@ def main():
         schema, records = reader.writer_schema, list(reader)
 
     template = next(
-        r for r in records if (r["data_file"].get("file_format") or "").upper() == "PUFFIN"
+        r
+        for r in records
+        if (r["data_file"].get("file_format") or "").upper() == "PUFFIN"
     )
     others = [
-        r for r in records if (r["data_file"].get("file_format") or "").upper() != "PUFFIN"
+        r
+        for r in records
+        if (r["data_file"].get("file_format") or "").upper() != "PUFFIN"
     ]
 
     rebuilt = []
@@ -312,7 +351,9 @@ def main():
 
     with manifest_path.open("wb") as fh:
         fastavro.writer(fh, schema, others + rebuilt, codec="null")
-    print(f"wrote {manifest_path.name}: statuses {[r['status'] for r in rebuilt]} (DELETED last)")
+    print(
+        f"wrote {manifest_path.name}: statuses {[r['status'] for r in rebuilt]} (DELETED last)"
+    )
 
     with list_path.open("wb") as fh:
         fastavro.writer(fh, list_schema, list_records, codec="null")

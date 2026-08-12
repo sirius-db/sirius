@@ -108,7 +108,10 @@ def verify(dst_name, total_rows, would_delete):
                 if "data_file" in record and record["data_file"]["content"] != 0:
                     statuses.append(record["status"])
     if not statuses or any(s != STATUS_DELETED for s in statuses):
-        print(f"  {dst_name}: FAIL - delete entries not all retired: {statuses}", file=sys.stderr)
+        print(
+            f"  {dst_name}: FAIL - delete entries not all retired: {statuses}",
+            file=sys.stderr,
+        )
         return False
 
     rows = (
@@ -125,7 +128,8 @@ def verify(dst_name, total_rows, would_delete):
             else "unexpected - check the fixture's paths were repointed"
         )
         print(
-            f"  {dst_name}: FAIL - {rows} rows, expected {total_rows} ({hint})", file=sys.stderr
+            f"  {dst_name}: FAIL - {rows} rows, expected {total_rows} ({hint})",
+            file=sys.stderr,
         )
         return False
 
@@ -138,7 +142,9 @@ def verify(dst_name, total_rows, would_delete):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--verify", action="store_true", help="validate only, write nothing")
+    ap.add_argument(
+        "--verify", action="store_true", help="validate only, write nothing"
+    )
     args = ap.parse_args()
 
     if not args.verify:
