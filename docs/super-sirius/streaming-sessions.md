@@ -361,3 +361,109 @@ from the **downgrade executor** instead: queued batches sit in repositories wher
 sweep can see and spill them (GPU → host → disk). Cross-fragment and cross-query pressure is a
 scheduling concern (per-fragment priority), and a future sink↔source slowness signal would be
 additive — nothing in this design forecloses it.
+
+## `exec::streaming_fragment` — plan builder + blocking runner
+
+**Files:** `src/include/exec/streaming_fragment.hpp`, `src/exec/streaming_fragment.cpp`
+
+Owns a complete fragment life cycle: declares inputs, builds the plan, constructs the sink, runs,
+and keeps the output pullable after `run()` returns.
+
+```
+fragment_spec spec = { plan_source, inputs, outputs, partitioning };
+streaming_fragment frag(context, spec);
+frag.build(query_id);   // declare → plan → create operators → register with session
+// push batches into frag.session() here if this fragment has inputs
+frag.run();             // blocks until all pipelines finish
+// pull from frag.session() until drained
+```
+
+Two lifetime decisions are load-bearing:
+
+**Repositories outlive the engine.** The fragment creates every repository before planning and
+registers none of them with `data_repository_manager_`. The query window's mandatory cleanup
+(`StandaloneQueryScope::finish()`) therefore cannot touch them. A sender's output stays in its
+repository and is still there when the receiver runs — which is what makes sequential streaming
+work without copying.
+
+**One query window, shared.** `run()` reuses the caller's `StandaloneQueryScope` rather than
+opening its own. A second scope resets the task creator and scan manager that `build()` populated;
+the fragment would then run zero tasks and return silently empty. The caller brackets `build()`
+and `run()` in one window (as `Context::execute_substrait` does for ordinary queries).
+
+**Hash key cast normalization.** When the spec carries a `partition_spec` with `key_cast_types`
+left empty, `build()` derives a cast type per key column so independently-planned senders always
+produce the same hash for the same logical value. cuDF's murmur3 hashes raw bytes, so without
+normalization an INT32 sender and an INT64 sender assign the same key to different partitions and
+groups are silently split. Rules:
+
+| Column type | Normalized cast |
+|---|---|
+| `TINYINT`, `SMALLINT`, `INTEGER` | `INT64` (canonical 64-bit) |
+| `BIGINT`, `BOOLEAN`, `VARCHAR` | `EMPTY` (hash as-is — already canonical) |
+| `DECIMAL` (any precision/scale) | `FLOAT64` |
+| anything else | throws at build time |
+
+Callers that supply their own `key_cast_types` bypass normalization.
+
+**`sink_types()` exposes the plan root's output column types** (set during `build()`; throws if
+called before `build()`). Relay steps use this to validate schema agreement — column count and
+type-id must match the target fragment's declared input types — before pulling any batches.
+Without this check, a misrouted relay silently corrupts downstream cuDF operations.
+
+**`stream_bind_catalog` bridges bind time and plan time.** DuckDB's table-function bind runs
+long before physical planning. The catalog is registered as a `ClientContextState` so
+`sirius_stream_source(id)` can resolve a schema at bind time; the physical plan generator
+re-reads the catalog at plan time to build each `STREAMING_SOURCE`.
+
+## Fragment FFI (`sirius_ffi.hpp` / `sirius_ffi.cpp`)
+
+**Files:** `src/include/sirius_ffi.hpp`, `src/sirius_ffi.cpp`
+
+A thin PIMPL layer that lets the Rust wrapper (or any C++ caller) drive multi-fragment execution
+without including any DuckDB/cuDF headers. Two public classes:
+
+**`Context`** — RAII handle to one engine instance. `execute_substrait()` runs a single-fragment
+query end-to-end. `make_context()` / `make_context_from_config()` are the factories.
+
+**`Fragment`** — one plan fragment of a multi-fragment query. Usage is strictly ordered:
+
+```
+declare_input_column / declare_input_sender   (schema of each input stream)
+declare_output / declare_output_broadcast / declare_output_hash_key
+build(substrait_plan)      ← opens the query lifecycle
+relay_from(source, ...)    ← move batches from a finished source fragment (or close_input for remote)
+run()                      ← executes; closes the lifecycle
+result_to_arrow(addr)      ← result fragments only: write Arrow stream
+```
+
+A fragment is **intermediate** (has output streams, rooted in a `STREAMING_SINK`) or a **result**
+fragment (no output streams, executes via `sirius_interface` and produces Arrow). Both kinds may
+have input streams declared and fed by other fragments.
+
+`relay_from()` validates column count and type-ids (using `sink_types()`) before moving any
+batches — a schema mismatch throws before data moves rather than reinterpreting columns silently.
+
+`stream_view_name(id)` returns `"sirius_stream_<id>"` — the DuckDB view name a Substrait plan
+must read to consume that input stream. `build()` creates the view on the embedded connection.
+
+**Not yet ported:** `export_packed` / `push_packed` / `StagingArena` — these require the
+exchange staging arena (`exchange_staging_arena`) which is a separate porting item (PRD §6).
+
+## Tests
+
+| File | Catch2 tags |
+|---|---|
+| `test/cpp/exec/test_batch_stream.cpp` | `[batch_stream]` |
+| `test/cpp/operator/test_physical_streaming_source.cpp` | `[streaming_source]`, `[streaming_source][pipeline_completion]` |
+| `test/cpp/operator/test_physical_streaming_sink.cpp` | `[streaming_sink]` |
+| `test/cpp/exec/test_stream_session.cpp` | `[stream_session]` |
+| `test/cpp/exec/test_stream_bind_catalog.cpp` | `[stream_bind_catalog]` |
+| `test/cpp/exec/test_streaming_fragment.cpp` | `[integration][streaming_fragment]`, `[integration][streaming_fragment_control]` |
+| `test/cpp/pipeline/test_streaming_sink_root.cpp` | `[integration][pipeline][streaming_sink_root]`, `[integration][pipeline][streaming_sink_root_exec]` |
+
+A `recording_task_creator` stands in for the scheduler, so the live re-arm and the `on_data`
+hook path are proven without a live executor. The `[pipeline_completion]` cases drive the real
+`sirius_pipeline` completion predicate rather than the operator in isolation, because the bugs
+they cover live in what *calls* `update_pipeline_status()`. Everything tagged `[integration]`
+needs a GPU and the real DuckDB integration database.
