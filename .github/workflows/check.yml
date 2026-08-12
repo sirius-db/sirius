@@ -156,8 +156,10 @@ jobs:
             echo "SCCACHE_BUCKET UNDEFINED -> GitHub Runner, Enable GHA sccache"
             echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
           fi
+          # Use 'sirius' prefix for sccache and vcpkg caches
+          echo "SCCACHE_S3_KEY_PREFIX=sirius" >> $GITHUB_ENV
           if [[ -n "${VCPKG_BUCKET}" ]]; then
-            echo "VCPKG_BINARY_SOURCES=clear;x-aws,s3://${VCPKG_BUCKET}/,readwrite" >> $GITHUB_ENV
+            echo "VCPKG_BINARY_SOURCES=clear;x-aws,s3://${VCPKG_BUCKET}/sirius/,readwrite" >> $GITHUB_ENV
           fi
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
