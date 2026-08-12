@@ -112,7 +112,7 @@ jobs:
         exclude:
           # On PRs, drop rows marked merge/dev-only; on merge_group/dev, match nothing.
           - build:
-              run-on-pr: ${{ fromJSON(github.event_name == 'pull_request' && 'false' || 'null') }}
+              run-on-pr: ${{ case(github.event_name == 'pull_request', false, 'no-match') }}
       fail-fast: false
     name: build (${{ matrix.build.arch }}, ${{ matrix.build.compiler }}, ${{ matrix.build.build-type }}, ${{ matrix.build.environment }}, ${{ matrix.build.cudf-channel }})
     runs-on: >-

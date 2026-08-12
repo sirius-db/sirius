@@ -2,8 +2,8 @@
 # in cmake/CMakePresets.json to match the new version.
 [submodule "duckdb"]
 	path = duckdb
-	url = https://github.com/duckdb/duckdb
-	branch = main
+	url = https://github.com/sirius-db/duckdb
+	branch = v1.5.5-patches
 	ignore = dirty
 [submodule "substrait"]
 	path = substrait
