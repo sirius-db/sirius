@@ -254,6 +254,85 @@ TEST_CASE("sirius_config defaults chunk prewarm to enabled when YAML omits the k
   std::filesystem::remove(path, ec);
 }
 
+TEST_CASE("sirius_config rejects inactive prefetch cache settings",
+          "[scan_manager][config][prefetching_cache]")
+{
+  for (auto const enable_line : {std::string{},
+                                 std::string{"      enable_prefetch_cache: false\n"}}) {
+    auto const path = std::filesystem::temp_directory_path() /
+                      (enable_line.empty() ? "sirius_cache_disabled_implicitly.yaml"
+                                           : "sirius_cache_disabled_explicitly.yaml");
+    write_yaml(path,
+               "sirius:\n"
+               "  executor:\n"
+               "    scan_manager:\n" +
+                 enable_line +
+                 "      cache:\n"
+                 "        inflight_io_chunk_budget: 64\n");
+
+    sirius::sirius_config cfg;
+    CHECK_THROWS_WITH(cfg.load_from_file(path),
+                      Catch::Contains("scan_manager.cache") &&
+                        Catch::Contains("requires enable_prefetch_cache: true"));
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+  }
+}
+
+TEST_CASE("sirius_config treats null and empty prefetch cache blocks as absent",
+          "[scan_manager][config][prefetching_cache]")
+{
+  for (auto const cache_line : {std::string{"      cache: null\n"},
+                                std::string{"      cache: {}\n"},
+                                std::string{"      cache:\n"
+                                            "        inflight_io_chunk_budget: null\n"}}) {
+    auto const path =
+      std::filesystem::temp_directory_path() / "sirius_cache_inactive_absent.yaml";
+    write_yaml(path,
+               "sirius:\n"
+               "  executor:\n"
+               "    scan_manager:\n" +
+                 cache_line);
+
+    sirius::sirius_config cfg;
+    REQUIRE_NOTHROW(cfg.load_from_file(path));
+    CHECK_FALSE(cfg.get_scan_manager_config().enable_prefetch_cache);
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+  }
+}
+
+TEST_CASE("sirius_config accepts prefetch cache settings when enabled",
+          "[scan_manager][config][prefetching_cache]")
+{
+  auto const path =
+    std::filesystem::temp_directory_path() / "sirius_cache_enabled_settings.yaml";
+  write_yaml(path,
+             "sirius:\n"
+             "  executor:\n"
+             "    scan_manager:\n"
+             "      enable_prefetch_cache: true\n"
+             "      cache:\n"
+             "        inflight_io_chunk_budget: 64\n"
+             "        min_prefetching_budget_fraction: 0.1\n"
+             "        eviction_threshold_fraction: 0.7\n"
+             "        dispose_after_use: true\n");
+
+  sirius::sirius_config cfg;
+  REQUIRE_NOTHROW(cfg.load_from_file(path));
+  auto const& scan = cfg.get_scan_manager_config();
+  CHECK(scan.enable_prefetch_cache);
+  CHECK(scan.cache.inflight_io_chunk_budget == 64);
+  CHECK(scan.cache.min_prefetching_budget_fraction == 0.1);
+  CHECK(scan.cache.eviction_threshold_fraction == 0.7);
+  CHECK(scan.cache.dispose_after_use);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
 TEST_CASE("sirius_config parses rest perf instrumentation flag",
           "[scan_manager][config][s3][rest][perf]")
 {
