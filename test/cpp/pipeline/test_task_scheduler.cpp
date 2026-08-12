@@ -176,16 +176,11 @@ void wait_or_fail(Pred done, std::chrono::seconds timeout, const char* what)
 
 }  // namespace
 
-// Regression test for the PR #1467 deadlock.
-//
-// The downgrade executor's TIER-2 pass extracts queued pipeline tasks with
-// mutable_pop_if and returns them via convertible_gpu_pipeline_task's RAII
-// destructor — a direct _task_queue.push() that emits no task_available event.
-// If every executor had already posted device_ready and parked (empty queue)
-// by then, no channel event would ever arrive again and the returned tasks
-// were never dispatched: a permanent all-workers-idle deadlock (SF1000 TPC-H
-// q18, hung 7/7). This stages that interleaving deterministically; on the
-// pre-fix event loop it times out.
+// Regression test for the #1467 deadlock: the downgrade executor extracts
+// queued tasks and returns them via convertible_gpu_pipeline_task's RAII
+// destructor — a direct queue push with no task_available event. With every
+// executor already parked, the pre-fix loop (blocked on the channel) never
+// dispatched them; this stages that interleaving and times out on it.
 TEST_CASE("Tasks extracted and RAII-returned while executors are parked still run",
           "[task_scheduler][deadlock-1467]")
 {
@@ -196,19 +191,16 @@ TEST_CASE("Tasks extracted and RAII-returned while executors are parked still ru
   auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
   auto* queue       = sched.get_pipeline_task_queue();
 
-  // Schedule before start(): the tasks sit in the queue and the
-  // task_available events buffer in the channel, so the extraction below
-  // cannot race the matcher.
-  const int num_tasks = 2;  // the captured failure extracted exactly 2 tasks
+  // Schedule before start() so the extraction below cannot race the matcher.
+  const int num_tasks = 2;
   for (int i = 0; i < num_tasks; ++i) {
     auto local_state = std::make_unique<mock_gpu_pipeline_task_local_state>(i, 0);
     auto task = std::make_unique<mock_gpu_pipeline_task>(i, std::move(local_state), global_state);
     sched.schedule(std::move(task));
   }
 
-  // TIER-2 extraction: pull every task out of the queue, wrapping each so the
-  // RAII destructor returns it (convertible_gpu_pipeline_task_provider does the
-  // same, with a memory-space predicate).
+  // Extract every task, wrapped so the RAII destructor returns it (as the
+  // downgrade's TIER-2 pass does).
   std::vector<std::unique_ptr<sirius::convertible_gpu_pipeline_task>> extracted;
   while (auto t = queue->mutable_pop_if([](sirius::parallel::itask&) { return true; },
                                         /*front_to_back=*/false)) {
@@ -217,14 +209,12 @@ TEST_CASE("Tasks extracted and RAII-returned while executors are parked still ru
   }
   REQUIRE(extracted.size() == num_tasks);
 
-  // Start the scheduler: the buffered task_available events are consumed
-  // against a now-empty queue, every executor posts device_ready and parks.
+  // Start with an empty queue; every executor posts device_ready and parks.
   sched.start();
   std::this_thread::sleep_for(500ms);
-  REQUIRE(global_state->executed_count.load() == 0);  // nothing to run yet
+  REQUIRE(global_state->executed_count.load() == 0);
 
-  // "Conversion finishes": destroying the wrappers pushes the tasks back via
-  // the RAII destructor — the silent return that deadlocked the pre-fix loop.
+  // Destroying the wrappers pushes the tasks back — the silent return.
   extracted.clear();
 
   wait_or_fail([&] { return global_state->executed_count.load() == num_tasks; },

@@ -168,9 +168,9 @@ class multi_index_priority_queue {
   ~multi_index_priority_queue()                                            = default;
 
   /// Inserts a task, computing its priority and secondary-index keys once, then
-  /// wakes every thread blocked in pop()/pop_back()/wait() (see wait() for why
-  /// notify_one() would be a lost wakeup once waiter kinds are mixed). If the
-  /// queue is interrupted
+  /// wakes every thread blocked in pop()/pop_back()/wait() (notify_all: with
+  /// mixed waiter kinds, notify_one could wake a non-consuming wait() and
+  /// strand a pop()). If the queue is interrupted
   /// (i.e. shutting down) the task is dropped rather than enqueued, matching the
   /// teardown contract callers rely on (e.g. returning a task to a closed queue).
   /// Strongly exception-safe: if any allocation throws, the queue is left as it
@@ -242,16 +242,9 @@ class multi_index_priority_queue {
     return extract_node(&_levels.begin()->second.tasks.front());
   }
 
-  /// Blocks until the queue is non-empty WITHOUT extracting anything, so the
-  /// caller can then choose what to take via the non-blocking accessors (e.g.
-  /// try_pop_from() by device preference). Returns true when a task is present,
-  /// false if the queue was interrupted while empty (shutdown).
-  ///
-  /// The waiter shares _cv with pop()/pop_back(). push() must therefore use
-  /// notify_all(): with notify_one(), a push could wake only a wait() caller
-  /// (which takes nothing) while a pop() caller stays blocked, or vice versa a
-  /// pop() could consume the task and leave this waiter correctly asleep on an
-  /// empty queue.
+  /// Blocks until the queue is non-empty, without extracting — the caller
+  /// picks what to take via the non-blocking accessors. Returns false if
+  /// interrupted while empty (shutdown).
   [[nodiscard]] bool wait() const
   {
     std::unique_lock<std::mutex> lock(_mutex);
@@ -675,10 +668,8 @@ class multi_index_priority_queue {
   }
 
   mutable std::mutex _mutex;
-  /// mutable so const wait() can block on it (mirrors the mutable _mutex the
-  /// const accessors already lock).
-  mutable std::condition_variable _cv;
-  bool _active{true};  ///< false after interrupt(): blocked pops stop waiting.
+  mutable std::condition_variable _cv;  ///< mutable so const wait() can block on it
+  bool _active{true};                   ///< false after interrupt(): blocked pops stop waiting.
 
   level_map _levels;  ///< Spine: priority -> level.
   std::unordered_map<query_key, std::set<queue_priority>> _query_levels;  ///< query -> its levels.

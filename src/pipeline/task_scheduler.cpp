@@ -319,41 +319,17 @@ void task_scheduler::management_eventloop()
   telemetry::TaskManagerLoopThreadHandleWrapper manager_thread_telemetry{
     *_telemetry_context, "task-scheduler-thread", _telemetry_context->shared_group_id()};
 
-  // Two-sleep-site pull-signal scheduler. The matcher needs two kinds of news:
-  //   - a task arrived in _task_queue. Most pushes go through schedule(), which
-  //     also emits a task_available channel event — but the downgrade executor
-  //     returns extracted tasks via convertible_gpu_pipeline_task's RAII
-  //     destructor, a direct _task_queue.push() that emits NO event.
-  //   - a device became ready (device_ready on _task_request_channel, sent by a
-  //     gpu_pipeline_executor once it has reserved a worker thread).
-  // A single blocking site can't hear both sources: blocking only on the
-  // channel misses the downgrade's silent returns (queued tasks + parked
-  // devices + no future event = permanent deadlock, seen at SF1000 q18), and
-  // blocking only on the queue misses device_ready. So each pass tops up the
-  // two things the matcher needs, sleeping at most once per missing ingredient:
-  //
-  //   1. Devices: collect pending events without blocking; block on the
-  //      channel only when no device is parked (deadlock-free: no parked
-  //      device means every executor is busy and will post device_ready).
-  //   2. Work: sleep on _task_queue.wait() when the queue is empty.
-  //      The queue's own condvar hears every push — schedule() or the
-  //      downgrade's silent RAII return.
-  //
-  // When a parked device coexists with tasks that all prefer busy devices,
-  // both guards fall through and the loop busy-waits by design: each pass
-  // re-drains the channel and re-checks the queue, so a downgrade return is
-  // dispatched immediately and the spin ends at the busy device's
-  // device_ready.
-  //
-  // Tasks remain in _task_queue (downgrade-visible) until we have a ready
-  // device to match them against — this is the property the push model in
-  // PR #732 lost and that the pull-signal loop restores.
+  // Each pass tops up the two things the matcher needs — known ready devices
+  // and a non-empty queue — sleeping only for whichever is missing. The queue
+  // sleep (not the channel) is what hears the downgrade executor returning
+  // extracted tasks: that return is a direct _task_queue.push() with no
+  // task_available event, and blocking solely on the channel deadlocked once
+  // every executor had parked (#1467). Both sleeps are interrupted by stop().
   while (_running.load()) {
-    // Step 1: devices. Block only when none is parked; then drain the pending
-    // burst so the queue-sleep guard below sees current state.
+    // Devices: block only when none is parked (every executor is then busy
+    // and will post device_ready), then drain the pending burst.
     auto evt = _task_request_channel.try_get();
     if (!evt && _ready_devices.empty()) {
-      // get() returns nullptr when the channel is closed (stop()).
       evt = _task_request_channel.get();
       if (evt == nullptr) {
         SIRIUS_LOG_INFO("Task request channel closed, exiting management event loop.");
@@ -367,15 +343,12 @@ void task_scheduler::management_eventloop()
       evt = _task_request_channel.try_get();
     }
 
-    // Step 2: work. With an empty queue and a waiting device, ask the creator
-    // to pre-create work before sleeping (lookahead strategy only; no-op under
-    // the default `active` strategy) — anything it creates arrives through
-    // schedule() and wakes the queue sleep.
+    // Work: let the creator pre-create for a waiting device (lookahead
+    // strategy only), then sleep until something is pushed.
     if (_task_queue.empty()) {
       if (_task_creator && !_ready_devices.empty()) {
         _task_creator->schedule_lookahead(*_ready_devices.begin());
       }
-      // Returns false only when the queue is interrupted (stop()).
       if (!_task_queue.wait()) {
         SIRIUS_LOG_INFO("Task queue interrupted, exiting management event loop.");
         break;
