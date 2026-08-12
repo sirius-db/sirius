@@ -36,6 +36,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -53,6 +54,11 @@ namespace parallel {
  */
 struct downgrade_request {
   std::function<bool()> predicate;
+  /// Byte target for requests whose demand is known in bytes. When set, the processing loop
+  /// stops dispatching once planned (freed + in-flight) bytes cover it, and right-sizes the
+  /// final pick per repository (see spill_policy.hpp). Unset for pure-predicate requests,
+  /// which keep the dispatch-until-satisfied behavior.
+  std::optional<std::size_t> target_bytes;
   std::promise<size_t> result;
   std::atomic<size_t> bytes_freed{0};
   std::atomic<size_t> batches_downgraded{0};

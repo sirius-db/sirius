@@ -254,6 +254,7 @@ set(EXTENSION_SOURCES
     src/helper/type_conversions.cpp
     src/debug_utils.cpp
     src/creator/task_creator.cpp
+    src/data/spill_chunked_converters.cpp
     src/downgrade/downgrade_executor.cpp
     src/expression/aggregate_id.cpp
     src/expression/ast/constant_range.cpp
@@ -667,6 +668,7 @@ set(TEST_SOURCES
     test/cpp/config/test_context.cpp
     test/cpp/config/test_object_store_config.cpp
     test/cpp/config/test_topology_config.cpp
+    test/cpp/data/test_chunked_spill_copy.cpp
     test/cpp/data/test_convertible_data_batch.cpp
     test/cpp/data/test_data_repository_manager_registry.cpp
     test/cpp/data/test_convertible_gpu_pipeline_task.cpp
@@ -674,6 +676,7 @@ set(TEST_SOURCES
     test/cpp/creator/test_task_creator.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
+    test/cpp/downgrade/test_spill_policy.cpp
     test/cpp/exec/test_batch_stream.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp

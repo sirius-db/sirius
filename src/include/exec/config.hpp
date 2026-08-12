@@ -17,6 +17,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <vector>
@@ -43,6 +44,18 @@ struct downgrade_executor_config {
   /// Period for the memory pressure monitor loop.
   /// Set to 0 to disable the monitor loop entirely.
   std::chrono::milliseconds monitor_period{std::chrono::milliseconds{10}};
+
+  /// Copy submission granularity for GPU->HOST spill conversions. When non-zero, Sirius
+  /// replaces the builtin cucascade converter (which submits an entire batch's D2H copies as
+  /// one monolithic batched call) with a chunked one that flushes every ~copy_chunk_bytes while
+  /// the column tree is still being walked. 0 keeps the builtin converter.
+  std::size_t copy_chunk_bytes{1ull << 30};
+
+  /// When true (default), a monitor-issued downgrade request stops as soon as live pressure
+  /// drops back below the *trigger* threshold, so the spilled set is proportional to the actual
+  /// overflow. When false, it runs down to the stop threshold, flushing the whole trigger->stop
+  /// band.
+  bool overflow_proportional_spill{true};
 
   /// Preferred HOST memory_space device_id (NUMA node) for the downgrade target.
   /// When set, the GPU->HOST downgrade dispatch uses
