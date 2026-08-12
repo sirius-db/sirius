@@ -21,10 +21,11 @@
 
 #include "operator_test_utils.hpp"
 
-#include <catch.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
+
+#include <catch.hpp>
 #include <op/dynamic_filter/top_n_boundary_filter.hpp>
 
 #include <array>
@@ -99,11 +100,10 @@ std::unique_ptr<cudf::column> make_key_column(host_column const& values,
   }
 
   auto const dtype = cudf::data_type{type_id};
-  auto column      = type_id == cudf::type_id::TIMESTAMP_DAYS
-                       ? cudf::make_timestamp_column(dtype, size, std::move(null_mask), null_count,
-                                                     stream, mr)
-                       : cudf::make_numeric_column(dtype, size, std::move(null_mask), null_count,
-                                                   stream, mr);
+  auto column =
+    type_id == cudf::type_id::TIMESTAMP_DAYS
+      ? cudf::make_timestamp_column(dtype, size, std::move(null_mask), null_count, stream, mr)
+      : cudf::make_numeric_column(dtype, size, std::move(null_mask), null_count, stream, mr);
   switch (type_id) {
     case cudf::type_id::INT8: fill_column_data<std::int8_t>(column->mutable_view(), values); break;
     case cudf::type_id::INT16:
@@ -195,7 +195,7 @@ TEST_CASE("boundary filter kernel parity: single-component sweep", "[dynamic_fil
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space);
 
-  auto const type_id = std::array{cudf::type_id::INT8,
+  auto const type_id     = std::array{cudf::type_id::INT8,
                                   cudf::type_id::INT16,
                                   cudf::type_id::INT32,
                                   cudf::type_id::INT64,
@@ -207,11 +207,11 @@ TEST_CASE("boundary filter kernel parity: single-component sweep", "[dynamic_fil
 
   // Ties, nulls, and both strict sides of the boundary; values fit every tested width.
   host_column const values{40, std::nullopt, 38, 42, 40, std::nullopt, 39, 41};
-  check_parity(*space,
-               {{.type = type_id, .descending = descending, .nulls_first = nulls_first,
-                 .bound = 40}},
-               {values},
-               strict);
+  check_parity(
+    *space,
+    {{.type = type_id, .descending = descending, .nulls_first = nulls_first, .bound = 40}},
+    {values},
+    strict);
 }
 
 TEST_CASE("boundary filter kernel parity: multi-component cascade with null tails",
@@ -229,8 +229,7 @@ TEST_CASE("boundary filter kernel parity: multi-component cascade with null tail
   // component 2.
   std::vector<component_spec> const components{
     {.type = cudf::type_id::INT32, .descending = false, .nulls_first = false, .bound = 5},
-    {.type = cudf::type_id::INT64, .descending = true, .nulls_first = true,
-     .bound = std::nullopt},
+    {.type = cudf::type_id::INT64, .descending = true, .nulls_first = true, .bound = std::nullopt},
     {.type = cudf::type_id::INT16, .descending = false, .nulls_first = true, .bound = 7}};
   std::vector<host_column> const columns{
     {4, 6, 5, 5, 5, 5, 5, std::nullopt},
@@ -251,9 +250,8 @@ TEST_CASE("boundary marshalling refuses a component width the kernel cannot read
     {.storage_type = cudf::data_type{cudf::type_id::DECIMAL128, -2},
      .order        = cudf::order::ASCENDING,
      .null_order   = cudf::null_order::AFTER}};
-  sirius::op::exact_host_key_tuple const boundary{
-    {sirius::op::exact_host_scalar{std::int64_t{1234},
-                                   cudf::data_type{cudf::type_id::DECIMAL128, -2}}}};
+  sirius::op::exact_host_key_tuple const boundary{{sirius::op::exact_host_scalar{
+    std::int64_t{1234}, cudf::data_type{cudf::type_id::DECIMAL128, -2}}}};
   REQUIRE(cudf::size_of(wide.front().storage_type) == 16);
   REQUIRE_THROWS_AS(
     sirius::op::detail::make_boundary_filter_params(boundary, wide, 1, /*strict=*/true),
@@ -264,9 +262,8 @@ TEST_CASE("boundary marshalling refuses a component width the kernel cannot read
     {.storage_type = cudf::data_type{cudf::type_id::DECIMAL64, -2},
      .order        = cudf::order::ASCENDING,
      .null_order   = cudf::null_order::AFTER}};
-  sirius::op::exact_host_key_tuple const ok{
-    {sirius::op::exact_host_scalar{std::int64_t{1234},
-                                   cudf::data_type{cudf::type_id::DECIMAL64, -2}}}};
+  sirius::op::exact_host_key_tuple const ok{{sirius::op::exact_host_scalar{
+    std::int64_t{1234}, cudf::data_type{cudf::type_id::DECIMAL64, -2}}}};
   auto const params = sirius::op::detail::make_boundary_filter_params(ok, narrow, 1, true);
   REQUIRE(params.components[0].width == 8);
   REQUIRE(params.components[0].value == 1234);

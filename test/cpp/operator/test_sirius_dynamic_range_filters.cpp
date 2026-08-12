@@ -32,19 +32,20 @@
 
 #include "operator_test_utils.hpp"
 
-#include <catch.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
-#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
-#include <op/dynamic_filter/top_n_boundary_filter.hpp>
 
 #include <rmm/aligned.hpp>
 #include <rmm/cuda_device.hpp>
 
 #include <cuda_runtime.h>
+
+#include <catch.hpp>
+#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
+#include <op/dynamic_filter/top_n_boundary_filter.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -97,7 +98,8 @@ std::unique_ptr<cudf::column> make_int32_column(host_column const& values,
       ++null_count;
     }
   }
-  auto column = cudf::make_numeric_column(k_int32, size, std::move(null_mask), null_count, stream, mr);
+  auto column =
+    cudf::make_numeric_column(k_int32, size, std::move(null_mask), null_count, stream, mr);
   std::vector<std::int32_t> host(values.size(), 0);
   for (std::size_t i = 0; i < values.size(); ++i) {
     if (values[i]) { host[i] = static_cast<std::int32_t>(*values[i]); }
@@ -300,8 +302,7 @@ TEST_CASE("the output-order null-placement derivation is what the oracle indepen
   REQUIRE_FALSE(oracle_nulls_first(int32_key(cudf::order::DESCENDING, cudf::null_order::BEFORE)));
 }
 
-TEST_CASE("RANGE parameter mapping matches the kernel's keep semantics",
-          "[dynamic_filter][top_n]")
+TEST_CASE("RANGE parameter mapping matches the kernel's keep semantics", "[dynamic_filter][top_n]")
 {
   auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
@@ -309,7 +310,7 @@ TEST_CASE("RANGE parameter mapping matches the kernel's keep semantics",
   auto const stream = cudf::get_default_stream();
   auto const mr     = space->get_default_allocator();
 
-  auto const side = GENERATE(range_bound_side::LOWER, range_bound_side::UPPER);
+  auto const side      = GENERATE(range_bound_side::LOWER, range_bound_side::UPPER);
   bool const inclusive = GENERATE(false, true);
   auto const policy =
     GENERATE(dynamic_filter_null_policy::ADMIT, dynamic_filter_null_policy::REJECT);
@@ -319,9 +320,8 @@ TEST_CASE("RANGE parameter mapping matches the kernel's keep semantics",
   host_column const values{39, 40, 41, std::nullopt, 0, 100};
 
   // The mapping's own claims, spelled out independently of the kernel.
-  auto const params =
-    sirius_dynamic_range_filter::make_boundary_filter_params(int32_bound(k_bound), side, inclusive,
-                                                             policy);
+  auto const params = sirius_dynamic_range_filter::make_boundary_filter_params(
+    int32_bound(k_bound), side, inclusive, policy);
   REQUIRE(params.count == 1);
   REQUIRE(params.strict == !inclusive);
   REQUIRE(params.components[0].engaged);
@@ -355,7 +355,7 @@ TEST_CASE("RANGE lowers to the documented comparison under both null policies",
   auto const stream = cudf::get_default_stream();
   auto const mr     = space->get_default_allocator();
 
-  auto const side = GENERATE(range_bound_side::LOWER, range_bound_side::UPPER);
+  auto const side      = GENERATE(range_bound_side::LOWER, range_bound_side::UPPER);
   bool const inclusive = GENERATE(false, true);
   auto const policy =
     GENERATE(dynamic_filter_null_policy::ADMIT, dynamic_filter_null_policy::REJECT);
@@ -363,7 +363,7 @@ TEST_CASE("RANGE lowers to the documented comparison under both null policies",
 
   constexpr std::int32_t k_bound = 40;
   host_column const values{39, 40, 41, std::nullopt, 0, 100};
-  auto column = make_int32_column(values, stream, mr);
+  auto column      = make_int32_column(values, stream, mr);
   auto const table = cudf::table_view{{column->view()}};
 
   sirius_dynamic_range_filter const filter{int32_bound(k_bound), side, inclusive, policy};
@@ -388,10 +388,10 @@ TEST_CASE("LEX_RANGE lowering matches the derivation table across directions and
   auto const stream = cudf::get_default_stream();
   auto const mr     = space->get_default_allocator();
 
-  auto const head_order = GENERATE(cudf::order::ASCENDING, cudf::order::DESCENDING);
-  auto const tail_order = GENERATE(cudf::order::ASCENDING, cudf::order::DESCENDING);
-  auto const tail_nulls = GENERATE(cudf::null_order::BEFORE, cudf::null_order::AFTER);
-  bool const inclusive  = GENERATE(false, true);
+  auto const head_order         = GENERATE(cudf::order::ASCENDING, cudf::order::DESCENDING);
+  auto const tail_order         = GENERATE(cudf::order::ASCENDING, cudf::order::DESCENDING);
+  auto const tail_nulls         = GENERATE(cudf::null_order::BEFORE, cudf::null_order::AFTER);
+  bool const inclusive          = GENERATE(false, true);
   bool const null_tail_boundary = GENERATE(false, true);
   CAPTURE(head_order == cudf::order::DESCENDING,
           tail_order == cudf::order::DESCENDING,
@@ -484,10 +484,8 @@ TEST_CASE("a single-component LEX boundary agrees with the equivalent RANGE",
   // LEX requires two components, so pin the tail to a constant that never decides: the head's
   // strict ascending verdict must equal an UPPER strict RANGE on the same bound.
   std::vector<lex_component_semantics> const components{
-    {.consumer_ordinal = 0,
-     .key = int32_key(cudf::order::ASCENDING, cudf::null_order::AFTER)},
-    {.consumer_ordinal = 1,
-     .key = int32_key(cudf::order::ASCENDING, cudf::null_order::AFTER)}};
+    {.consumer_ordinal = 0, .key = int32_key(cudf::order::ASCENDING, cudf::null_order::AFTER)},
+    {.consumer_ordinal = 1, .key = int32_key(cudf::order::ASCENDING, cudf::null_order::AFTER)}};
   std::vector<std::optional<exact_host_scalar>> boundary_components{int32_bound(40),
                                                                     int32_bound(0)};
   std::vector<host_column> const columns{{39, 40, 41, 0, 100}, {5, 5, 5, 5, 5}};
@@ -533,33 +531,30 @@ TEST_CASE("boundary filters reject inadmissible construction", "[dynamic_filter]
   SECTION("LEX requires at least two components")
   {
     std::vector<std::optional<exact_host_scalar>> single{int32_bound(1)};
-    REQUIRE_THROWS_AS(
-      sirius_dynamic_lex_range_filter(
-        exact_host_key_tuple{single},
-        std::vector<lex_component_semantics>{{.consumer_ordinal = 0, .key = admitted}},
-        false),
-      std::invalid_argument);
+    REQUIRE_THROWS_AS(sirius_dynamic_lex_range_filter(exact_host_key_tuple{single},
+                                                      std::vector<lex_component_semantics>{
+                                                        {.consumer_ordinal = 0, .key = admitted}},
+                                                      false),
+                      std::invalid_argument);
   }
   SECTION("LEX requires an engaged head component")
   {
     std::vector<std::optional<exact_host_scalar>> head_null{std::nullopt, int32_bound(2)};
-    REQUIRE_THROWS_AS(sirius_dynamic_lex_range_filter(
-                        exact_host_key_tuple{head_null},
-                        std::vector<lex_component_semantics>{
-                          {.consumer_ordinal = 0, .key = admitted},
-                          {.consumer_ordinal = 1, .key = admitted}},
-                        false),
+    REQUIRE_THROWS_AS(sirius_dynamic_lex_range_filter(exact_host_key_tuple{head_null},
+                                                      std::vector<lex_component_semantics>{
+                                                        {.consumer_ordinal = 0, .key = admitted},
+                                                        {.consumer_ordinal = 1, .key = admitted}},
+                                                      false),
                       std::invalid_argument);
   }
   SECTION("LEX rejects a component type outside the allowlist")
   {
     std::vector<std::optional<exact_host_scalar>> pair{int32_bound(1), int32_bound(2)};
-    REQUIRE_THROWS_AS(sirius_dynamic_lex_range_filter(
-                        exact_host_key_tuple{pair},
-                        std::vector<lex_component_semantics>{
-                          {.consumer_ordinal = 0, .key = admitted},
-                          {.consumer_ordinal = 1, .key = unadmitted}},
-                        false),
+    REQUIRE_THROWS_AS(sirius_dynamic_lex_range_filter(exact_host_key_tuple{pair},
+                                                      std::vector<lex_component_semantics>{
+                                                        {.consumer_ordinal = 0, .key = admitted},
+                                                        {.consumer_ordinal = 1, .key = unadmitted}},
+                                                      false),
                       std::invalid_argument);
   }
 }
@@ -570,17 +565,12 @@ TEST_CASE("boundary filters expose exactly their intended capabilities", "[dynam
   REQUIRE(memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0));
 
   std::vector<lex_component_semantics> const components{
-    {.consumer_ordinal = 3,
-     .key = int32_key(cudf::order::ASCENDING, cudf::null_order::AFTER)},
-    {.consumer_ordinal = 7,
-     .key = int32_key(cudf::order::DESCENDING, cudf::null_order::BEFORE)}};
-  std::vector<std::optional<exact_host_scalar>> boundary_components{int32_bound(1),
-                                                                    int32_bound(2)};
+    {.consumer_ordinal = 3, .key = int32_key(cudf::order::ASCENDING, cudf::null_order::AFTER)},
+    {.consumer_ordinal = 7, .key = int32_key(cudf::order::DESCENDING, cudf::null_order::BEFORE)}};
+  std::vector<std::optional<exact_host_scalar>> boundary_components{int32_bound(1), int32_bound(2)};
 
-  sirius_dynamic_range_filter range{int32_bound(1),
-                                    range_bound_side::LOWER,
-                                    true,
-                                    dynamic_filter_null_policy::ADMIT};
+  sirius_dynamic_range_filter range{
+    int32_bound(1), range_bound_side::LOWER, true, dynamic_filter_null_policy::ADMIT};
   sirius_dynamic_lex_range_filter lex{exact_host_key_tuple{boundary_components}, components, true};
 
   sirius_dynamic_filter* range_base = &range;
@@ -607,10 +597,11 @@ TEST_CASE("boundary filters expose exactly their intended capabilities", "[dynam
 
   // The existing join filters must not acquire the new capability.
   std::vector<sirius::op::zone_map_entry> zones;
-  zones.push_back({std::make_unique<cudf::numeric_scalar<std::int32_t>>(
-                     0, true, cudf::get_default_stream(), cudf::get_current_device_resource_ref()),
-                   std::make_unique<cudf::numeric_scalar<std::int32_t>>(
-                     9, true, cudf::get_default_stream(), cudf::get_current_device_resource_ref())});
+  zones.push_back(
+    {std::make_unique<cudf::numeric_scalar<std::int32_t>>(
+       0, true, cudf::get_default_stream(), cudf::get_current_device_resource_ref()),
+     std::make_unique<cudf::numeric_scalar<std::int32_t>>(
+       9, true, cudf::get_default_stream(), cudf::get_current_device_resource_ref())});
   sirius::op::sirius_dynamic_zone_map_filter zone_map{std::move(zones)};
   sirius_dynamic_filter* zone_base = &zone_map;
   REQUIRE(dynamic_cast<sirius_compaction_applicable*>(zone_base) == nullptr);
@@ -652,12 +643,9 @@ TEST_CASE("boundary filter state is immutable across lowering and application",
   REQUIRE(range.null_policy() == dynamic_filter_null_policy::ADMIT);
 
   std::vector<lex_component_semantics> const components{
-    {.consumer_ordinal = 0,
-     .key = int32_key(cudf::order::ASCENDING, cudf::null_order::AFTER)},
-    {.consumer_ordinal = 1,
-     .key = int32_key(cudf::order::ASCENDING, cudf::null_order::AFTER)}};
-  std::vector<std::optional<exact_host_scalar>> boundary_components{int32_bound(4),
-                                                                    std::nullopt};
+    {.consumer_ordinal = 0, .key = int32_key(cudf::order::ASCENDING, cudf::null_order::AFTER)},
+    {.consumer_ordinal = 1, .key = int32_key(cudf::order::ASCENDING, cudf::null_order::AFTER)}};
+  std::vector<std::optional<exact_host_scalar>> boundary_components{int32_bound(4), std::nullopt};
   sirius_dynamic_lex_range_filter const lex{exact_host_key_tuple{boundary_components},
                                             components,
                                             /*inclusive=*/false};
@@ -683,9 +671,9 @@ TEST_CASE("boundary filter replication is all-or-nothing under a denied target r
 {
   if (!require_two_gpus()) { return; }
 
-  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager(2);
-  auto replica_spaces = get_replica_spaces(*memory_manager);
-  auto& target_space  = replica_spaces.back().get_gpu_space();
+  auto memory_manager      = sirius::test::operator_utils::initialize_memory_manager(2);
+  auto replica_spaces      = get_replica_spaces(*memory_manager);
+  auto& target_space       = replica_spaces.back().get_gpu_space();
   auto const target_device = target_space.get_device_id();
   auto* target_mr =
     target_space.get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
@@ -700,12 +688,9 @@ TEST_CASE("boundary filter replication is all-or-nothing under a denied target r
 
   rmm::cuda_set_device_raii const source_device{rmm::cuda_device_id{0}};
   std::vector<lex_component_semantics> const components{
-    {.consumer_ordinal = 0,
-     .key = int32_key(cudf::order::ASCENDING, cudf::null_order::AFTER)},
-    {.consumer_ordinal = 1,
-     .key = int32_key(cudf::order::DESCENDING, cudf::null_order::BEFORE)}};
-  std::vector<std::optional<exact_host_scalar>> boundary_components{int32_bound(1),
-                                                                    int32_bound(2)};
+    {.consumer_ordinal = 0, .key = int32_key(cudf::order::ASCENDING, cudf::null_order::AFTER)},
+    {.consumer_ordinal = 1, .key = int32_key(cudf::order::DESCENDING, cudf::null_order::BEFORE)}};
+  std::vector<std::optional<exact_host_scalar>> boundary_components{int32_bound(1), int32_bound(2)};
 
   auto require_all_or_nothing = [&](auto& filter) {
     REQUIRE(filter.is_available_on_device(0));
@@ -723,10 +708,8 @@ TEST_CASE("boundary filter replication is all-or-nothing under a denied target r
 
   SECTION("RANGE")
   {
-    sirius_dynamic_range_filter filter{int32_bound(7),
-                                       range_bound_side::LOWER,
-                                       true,
-                                       dynamic_filter_null_policy::REJECT};
+    sirius_dynamic_range_filter filter{
+      int32_bound(7), range_bound_side::LOWER, true, dynamic_filter_null_policy::REJECT};
     require_all_or_nothing(filter);
   }
   SECTION("LEX_RANGE")
@@ -743,17 +726,15 @@ TEST_CASE("boundary filter replicas serve the AST path on every planned device",
 {
   if (!require_two_gpus()) { return; }
 
-  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager(2);
-  auto replica_spaces = get_replica_spaces(*memory_manager);
+  auto memory_manager      = sirius::test::operator_utils::initialize_memory_manager(2);
+  auto replica_spaces      = get_replica_spaces(*memory_manager);
   auto const target_device = replica_spaces.back().get_gpu_space().get_device_id();
 
   rmm::cuda_set_device_raii const source_device{rmm::cuda_device_id{0}};
   // A null tail component owns no scalar on any device, so replication must still succeed.
   std::vector<lex_component_semantics> const components{
-    {.consumer_ordinal = 0,
-     .key = int32_key(cudf::order::ASCENDING, cudf::null_order::AFTER)},
-    {.consumer_ordinal = 1,
-     .key = int32_key(cudf::order::ASCENDING, cudf::null_order::AFTER)}};
+    {.consumer_ordinal = 0, .key = int32_key(cudf::order::ASCENDING, cudf::null_order::AFTER)},
+    {.consumer_ordinal = 1, .key = int32_key(cudf::order::ASCENDING, cudf::null_order::AFTER)}};
   std::vector<std::optional<exact_host_scalar>> boundary_components{int32_bound(5), std::nullopt};
   sirius_dynamic_lex_range_filter lex{exact_host_key_tuple{boundary_components}, components, false};
 

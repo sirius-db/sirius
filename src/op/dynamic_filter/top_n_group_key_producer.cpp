@@ -14,12 +14,12 @@
  * limitations under the License.
  */
 
-#include <op/dynamic_filter/top_n_group_key_producer.hpp>
-
 #include <cudf/sorting.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/error.hpp>
+
+#include <op/dynamic_filter/top_n_group_key_producer.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -37,11 +37,11 @@ namespace {
 /// One key column's host image of the leading rows of the sorted distinct-key table: the raw
 /// element bytes and, for a nullable column, the validity words covering those rows.
 struct host_key_column {
-  std::vector<std::byte> elements;            ///< Row-major element bytes of the leading rows
-  std::vector<cudf::bitmask_type> validity;   ///< Empty when the column cannot hold nulls
-  cudf::size_type first_bit = 0;              ///< Bit index of row 0 within @c validity
-  std::size_t element_width = 0;              ///< Bytes per element of the key's storage type
-  bool extractable          = false;          ///< False: every row's component is recorded null
+  std::vector<std::byte> elements;           ///< Row-major element bytes of the leading rows
+  std::vector<cudf::bitmask_type> validity;  ///< Empty when the column cannot hold nulls
+  cudf::size_type first_bit = 0;             ///< Bit index of row 0 within @c validity
+  std::size_t element_width = 0;             ///< Bytes per element of the key's storage type
+  bool extractable          = false;         ///< False: every row's component is recorded null
 };
 
 /// Physical width of an admitted ORDER BY key's storage type, or zero when it is not admitted.
@@ -124,18 +124,18 @@ host_key_column stage_key_column(cudf::column_view const& column,
   staged.extractable = true;
 
   staged.elements.resize(static_cast<std::size_t>(rows) * staged.element_width);
-  CUDF_CUDA_TRY(cudaMemcpyAsync(
-    staged.elements.data(),
-    column.head<std::byte>() + static_cast<std::ptrdiff_t>(column.offset()) *
-                                 static_cast<std::ptrdiff_t>(staged.element_width),
-    staged.elements.size(),
-    cudaMemcpyDeviceToHost,
-    stream.value()));
+  CUDF_CUDA_TRY(
+    cudaMemcpyAsync(staged.elements.data(),
+                    column.head<std::byte>() + static_cast<std::ptrdiff_t>(column.offset()) *
+                                                 static_cast<std::ptrdiff_t>(staged.element_width),
+                    staged.elements.size(),
+                    cudaMemcpyDeviceToHost,
+                    stream.value()));
 
   if (column.nullable()) {
-    staged.first_bit       = column.offset();
-    auto const first_word  = cudf::word_index(staged.first_bit);
-    auto const last_word   = cudf::word_index(staged.first_bit + rows - 1);
+    staged.first_bit      = column.offset();
+    auto const first_word = cudf::word_index(staged.first_bit);
+    auto const last_word  = cudf::word_index(staged.first_bit + rows - 1);
     staged.validity.resize(static_cast<std::size_t>(last_word - first_word) + 1);
     CUDF_CUDA_TRY(cudaMemcpyAsync(staged.validity.data(),
                                   column.null_mask() + first_word,
@@ -199,10 +199,8 @@ std::vector<exact_host_key_tuple> best_distinct_keys(cudf::table_view const& bat
   std::vector<host_key_column> staged;
   staged.reserve(keys.size());
   for (std::size_t i = 0; i < keys.size(); ++i) {
-    staged.push_back(stage_key_column(sorted->view().column(static_cast<cudf::size_type>(i)),
-                                      keys[i].storage_type,
-                                      rows,
-                                      stream));
+    staged.push_back(stage_key_column(
+      sorted->view().column(static_cast<cudf::size_type>(i)), keys[i].storage_type, rows, stream));
   }
   stream.synchronize();  // observed completion: every host value below is final
 

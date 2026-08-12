@@ -59,7 +59,8 @@ threshold_offer_result top_n_threshold_coordinator::offer(top_n_distinct_key_wit
   };
   for (auto& candidate : witness.best_keys) {
     if (candidate.size() != _keys.size()) { continue; }
-    auto const at = std::lower_bound(_distinct_keys.begin(), _distinct_keys.end(), candidate, better);
+    auto const at =
+      std::lower_bound(_distinct_keys.begin(), _distinct_keys.end(), candidate, better);
     if (at != _distinct_keys.end() && equal(*at, candidate)) { continue; }  // already witnessed
     _distinct_keys.insert(at, std::move(candidate));
     if (_distinct_keys.size() > _k) {
@@ -228,7 +229,8 @@ void top_n_threshold_coordinator::publish_revision(exact_host_key_tuple const& b
   // device scalars for a revision that can only be rejected (main doc failure table, "All
   // channels closed"). The boundary still tightens for the sink prefilter.
   if (!_target_closed.empty() &&
-      std::all_of(_target_closed.begin(), _target_closed.end(), [](bool closed) { return closed; })) {
+      std::all_of(
+        _target_closed.begin(), _target_closed.end(), [](bool closed) { return closed; })) {
     return;
   }
 
@@ -277,8 +279,8 @@ void top_n_threshold_coordinator::publish_revision(exact_host_key_tuple const& b
     for (auto const& [index, filter] : ready) {
       // const_cast is confined here: replication is the one producer-side mutation before the
       // filter becomes visible, and every consumer only ever sees the immutable handle.
-      auto* replicable = dynamic_cast<sirius_device_replicable*>(
-        const_cast<sirius_dynamic_filter*>(filter.get()));
+      auto* replicable =
+        dynamic_cast<sirius_device_replicable*>(const_cast<sirius_dynamic_filter*>(filter.get()));
       if (replicable != nullptr) { replicable->replicate_to_devices(_plan.replica_spaces); }
     }
   } catch (std::exception const& e) {

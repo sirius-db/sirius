@@ -69,9 +69,10 @@ static_assert(!std::is_copy_constructible_v<dynamic_filter_refinement_publisher>
 static_assert(!std::is_copy_assignable_v<dynamic_filter_refinement_publisher>);
 static_assert(std::is_move_constructible_v<dynamic_filter_refinement_publisher>);
 
-TEST_CASE("refinement slot: first publish populates and counts once, replacement bumps only the "
-          "generation",
-          "[dynamic_filter]")
+TEST_CASE(
+  "refinement slot: first publish populates and counts once, replacement bumps only the "
+  "generation",
+  "[dynamic_filter]")
 {
   auto set       = std::make_shared<sirius_dynamic_filter_set>();
   auto publisher = set->register_refinement_slot(3);
@@ -187,8 +188,7 @@ TEST_CASE("appends bump count and generation, slots merge after appends per colu
   REQUIRE(set->generation() == 4);
 }
 
-TEST_CASE("snapshots survive replacement, close, and the channel's destruction",
-          "[dynamic_filter]")
+TEST_CASE("snapshots survive replacement, close, and the channel's destruction", "[dynamic_filter]")
 {
   sirius::op::dynamic_filter_snapshot snapshot;
   {
@@ -254,8 +254,7 @@ TEST_CASE("snapshot coherence holds under concurrent replacement", "[dynamic_fil
     });
   }
   for (std::uint64_t revision = 1; revision <= k_revisions; ++revision) {
-    if (publisher.publish(revision, make_tagged(revision)) !=
-        refinement_publish_result::ACCEPTED) {
+    if (publisher.publish(revision, make_tagged(revision)) != refinement_publish_result::ACCEPTED) {
       violations.fetch_add(1, std::memory_order_relaxed);
     }
   }

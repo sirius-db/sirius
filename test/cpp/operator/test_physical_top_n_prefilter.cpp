@@ -21,8 +21,9 @@
 
 #include "operator_test_utils.hpp"
 
-#include <catch.hpp>
 #include <cudf/null_mask.hpp>
+
+#include <catch.hpp>
 #include <duckdb/planner/bound_result_modifier.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <helper/type_conversions.hpp>
@@ -68,7 +69,7 @@ std::shared_ptr<top_n_threshold_coordinator> make_test_coordinator(
   for (std::size_t i = 0; i < orders.size(); ++i) {
     keys.push_back({.storage_type = storage_types[i],
                     .order        = to_cudf_order(orders[i].type),
-                    .null_order = to_cudf_null_order(orders[i].type, orders[i].null_order)});
+                    .null_order   = to_cudf_null_order(orders[i].type, orders[i].null_order)});
   }
   return std::make_shared<top_n_threshold_coordinator>(k, std::move(keys), lex_admitted, stats);
 }
@@ -86,10 +87,8 @@ std::vector<std::optional<std::int64_t>> copy_int64_with_nulls(cudf::column_view
     return out;
   }
   std::vector<cudf::bitmask_type> mask(cudf::num_bitmask_words(col.size()));
-  cudaMemcpy(mask.data(),
-             col.null_mask(),
-             mask.size() * sizeof(cudf::bitmask_type),
-             cudaMemcpyDeviceToHost);
+  cudaMemcpy(
+    mask.data(), col.null_mask(), mask.size() * sizeof(cudf::bitmask_type), cudaMemcpyDeviceToHost);
   for (std::size_t i = 0; i < values.size(); ++i) {
     bool const valid = (mask[i / 32] >> (i % 32)) & 1U;
     if (valid) { out[i] = values[i]; }
@@ -149,7 +148,7 @@ std::shared_ptr<data_batch> make_decimal32_batch(cucascade::memory::memory_space
 {
   auto const stream = default_stream();
   auto const mr     = get_resource_ref(space);
-  auto column       = cudf::make_fixed_point_column(cudf::data_type{cudf::type_id::DECIMAL32, scale},
+  auto column = cudf::make_fixed_point_column(cudf::data_type{cudf::type_id::DECIMAL32, scale},
                                               static_cast<cudf::size_type>(values.size()),
                                               cudf::mask_state::UNALLOCATED,
                                               stream,
@@ -185,13 +184,14 @@ TEST_CASE("top_n prefilter single-key equivalence across direction and null orde
   // One key column with duplicates and nulls; batch 1 establishes a boundary that prunes batch 2
   // (and a stale boundary for batch 3 remains safe).
   std::vector<std::shared_ptr<data_batch>> batches;
-  batches.push_back(make_numeric_batch_with_nulls<std::int64_t>(
-    *space, {5, 0, 9, 3, 0, 7, 4, 8}, {true, false, true, true, false, true, true, true},
-    cudf::type_id::INT64));
+  batches.push_back(
+    make_numeric_batch_with_nulls<std::int64_t>(*space,
+                                                {5, 0, 9, 3, 0, 7, 4, 8},
+                                                {true, false, true, true, false, true, true, true},
+                                                cudf::type_id::INT64));
   batches.push_back(make_numeric_batch_with_nulls<std::int64_t>(
     *space, {2, 0, 6, 1, 10, 3}, {true, false, true, true, true, true}, cudf::type_id::INT64));
-  batches.push_back(make_numeric_batch<std::int64_t>(*space, {12, 11, 2, 6},
-                                                     cudf::type_id::INT64));
+  batches.push_back(make_numeric_batch<std::int64_t>(*space, {12, 11, 2, 6}, cudf::type_id::INT64));
 
   auto const make_orders = [&] {
     duckdb::vector<duckdb::BoundOrderByNode> orders;
@@ -238,13 +238,13 @@ TEST_CASE("top_n prefilter equivalence per allowlisted key storage type",
                                   cudf::type_id::TIMESTAMP_DAYS,
                                   cudf::type_id::DECIMAL32,
                                   cudf::type_id::DECIMAL64}[type_case];
-  auto const key_type = std::array<duckdb::LogicalType, 6>{duckdb::LogicalType::TINYINT,
-                                                           duckdb::LogicalType::SMALLINT,
-                                                           duckdb::LogicalType::INTEGER,
-                                                           duckdb::LogicalType::DATE,
-                                                           duckdb::LogicalType::DECIMAL(9, 2),
-                                                           duckdb::LogicalType::DECIMAL(18, 4)}
-                          [static_cast<std::size_t>(type_case)];
+  auto const key_type = std::array<duckdb::LogicalType, 6>{
+    duckdb::LogicalType::TINYINT,
+    duckdb::LogicalType::SMALLINT,
+    duckdb::LogicalType::INTEGER,
+    duckdb::LogicalType::DATE,
+    duckdb::LogicalType::DECIMAL(9, 2),
+    duckdb::LogicalType::DECIMAL(18, 4)}[static_cast<std::size_t>(type_case)];
   // The fixed-point cases carry a non-zero scale deliberately: the values below are the *scaled*
   // integers, so a path that rescaled anywhere -- extraction, the device literal, or the kernel's
   // widening -- would order them differently and the equivalence below would fail.
@@ -333,8 +333,7 @@ TEST_CASE("top_n prefilter equivalence per allowlisted key storage type",
 
   auto const run = [&](sirius_physical_top_n& local, sirius_physical_top_n_merge& merge) {
     auto const local_outputs = run_local(local, batches);
-    auto out =
-      merge.execute(pipelineable_operator_data(local_outputs), cudf::get_default_stream());
+    auto out = merge.execute(pipelineable_operator_data(local_outputs), cudf::get_default_stream());
     auto const& merged = dynamic_cast<pipelineable_operator_data const&>(*out).get_data_batches();
     REQUIRE(merged.size() == 1);
     return read_key_column(sirius::get_cudf_table_view(*merged[0]).column(0));
@@ -392,18 +391,13 @@ TEST_CASE("top_n extraction refuses a column whose type does not match the key's
   dynamic_filter_stats stats;
   sirius_physical_top_n armed(
     sirius::from_duckdb_vec(types), make_orders(), limit, offset, nullptr, 0);
-  armed.threshold_coordinator =
-    make_test_coordinator(armed.orders,
-                          {cudf::data_type{cudf::type_id::DECIMAL64, -2}},
-                          limit + offset,
-                          true,
-                          &stats);
+  armed.threshold_coordinator = make_test_coordinator(
+    armed.orders, {cudf::data_type{cudf::type_id::DECIMAL64, -2}}, limit + offset, true, &stats);
   sirius_physical_top_n_merge armed_merge(&armed);
 
   auto const run = [&](sirius_physical_top_n& local, sirius_physical_top_n_merge& merge) {
     auto const local_outputs = run_local(local, batches);
-    auto out =
-      merge.execute(pipelineable_operator_data(local_outputs), cudf::get_default_stream());
+    auto out = merge.execute(pipelineable_operator_data(local_outputs), cudf::get_default_stream());
     auto const& merged = dynamic_cast<pipelineable_operator_data const&>(*out).get_data_batches();
     REQUIRE(merged.size() == 1);
     return copy_column_to_host<std::int64_t>(sirius::get_cudf_table_view(*merged[0]).column(0));
@@ -437,21 +431,18 @@ TEST_CASE("top_n prefilter beyond the boundary component limit keeps prefix-tied
       for (auto const& row : rows) {
         column.push_back(row[key]);
       }
-      key_batches.push_back(make_numeric_batch<std::int64_t>(*space, column,
-                                                             cudf::type_id::INT64));
+      key_batches.push_back(make_numeric_batch<std::int64_t>(*space, column, cudf::type_id::INT64));
     }
     return concatenate_batches_horizontal(key_batches, *space);
   };
 
   std::vector<std::shared_ptr<data_batch>> batches;
   // Batch 1: exactly K rows, so the offered boundary is (1 x8, 9).
-  batches.push_back(make_batch({{1, 1, 1, 1, 1, 1, 1, 1, 5},
-                                {1, 1, 1, 1, 1, 1, 1, 1, 7},
-                                {1, 1, 1, 1, 1, 1, 1, 1, 9}}));
+  batches.push_back(make_batch(
+    {{1, 1, 1, 1, 1, 1, 1, 1, 5}, {1, 1, 1, 1, 1, 1, 1, 1, 7}, {1, 1, 1, 1, 1, 1, 1, 1, 9}}));
   // Batch 2: one 8-prefix tie that wins on key 9, one row worse on key 0, one better on key 0.
-  batches.push_back(make_batch({{1, 1, 1, 1, 1, 1, 1, 1, 2},
-                                {2, 1, 1, 1, 1, 1, 1, 1, 0},
-                                {0, 9, 9, 9, 9, 9, 9, 9, 9}}));
+  batches.push_back(make_batch(
+    {{1, 1, 1, 1, 1, 1, 1, 1, 2}, {2, 1, 1, 1, 1, 1, 1, 1, 0}, {0, 9, 9, 9, 9, 9, 9, 9, 9}}));
 
   auto const make_orders = [&] {
     duckdb::vector<duckdb::BoundOrderByNode> orders;
@@ -512,13 +503,13 @@ TEST_CASE("top_n prefilter multi-key equivalence with null tails",
   batches.push_back(make_batch({3, 3, 3, 5, 5, 9, 1, 1},
                                {4, 0, 7, 2, 0, 1, 6, 0},
                                {true, false, true, true, false, true, true, false}));
-  batches.push_back(make_batch({2, 3, 3, 7, 1, 1},
-                               {5, 1, 0, 3, 2, 9},
-                               {true, true, false, true, true, true}));
+  batches.push_back(
+    make_batch({2, 3, 3, 7, 1, 1}, {5, 1, 0, 3, 2, 9}, {true, true, false, true, true, true}));
 
   auto const make_orders = [&] {
     duckdb::vector<duckdb::BoundOrderByNode> orders;
-    orders.push_back(order_on(0, duckdb::OrderType::ASCENDING, duckdb::OrderByNullType::NULLS_LAST));
+    orders.push_back(
+      order_on(0, duckdb::OrderType::ASCENDING, duckdb::OrderByNullType::NULLS_LAST));
     orders.push_back(order_on(1, tail_dir, tail_nulls));
     return orders;
   };
@@ -641,8 +632,7 @@ TEST_CASE("top_n degraded first-key prefilter with an unsupported tail type",
   // comparison, keeping head ties for the tail to order.
   auto const make_batch = [&](std::vector<std::int64_t> const& k0,
                               std::vector<std::string> const& k1) {
-    return make_two_column_batch<std::int64_t, std::string>(
-      *space, k0, k1, cudf::type_id::STRING);
+    return make_two_column_batch<std::int64_t, std::string>(*space, k0, k1, cudf::type_id::STRING);
   };
   std::vector<std::shared_ptr<data_batch>> batches;
   batches.push_back(make_batch({5, 3, 3, 9, 7, 3}, {"e", "c", "a", "x", "q", "b"}));
@@ -652,9 +642,10 @@ TEST_CASE("top_n degraded first-key prefilter with an unsupported tail type",
     duckdb::vector<duckdb::BoundOrderByNode> orders;
     orders.push_back(
       order_on(0, duckdb::OrderType::ASCENDING, duckdb::OrderByNullType::NULLS_LAST));
-    orders.push_back(order_on(
-      1, duckdb::OrderType::ASCENDING, duckdb::OrderByNullType::NULLS_LAST,
-      duckdb::LogicalType::VARCHAR));
+    orders.push_back(order_on(1,
+                              duckdb::OrderType::ASCENDING,
+                              duckdb::OrderByNullType::NULLS_LAST,
+                              duckdb::LogicalType::VARCHAR));
     return orders;
   };
   duckdb::vector<duckdb::LogicalType> types;
@@ -662,25 +653,22 @@ TEST_CASE("top_n degraded first-key prefilter with an unsupported tail type",
   types.push_back(duckdb::LogicalType::VARCHAR);
   std::size_t const limit = 4;
 
-  sirius_physical_top_n plain(
-    sirius::from_duckdb_vec(types), make_orders(), limit, 0, nullptr, 0);
+  sirius_physical_top_n plain(sirius::from_duckdb_vec(types), make_orders(), limit, 0, nullptr, 0);
   sirius_physical_top_n_merge plain_merge(&plain);
 
   dynamic_filter_stats stats;
-  sirius_physical_top_n armed(
-    sirius::from_duckdb_vec(types), make_orders(), limit, 0, nullptr, 0);
-  armed.threshold_coordinator = make_test_coordinator(
-    armed.orders,
-    {k_int64, cudf::data_type{cudf::type_id::EMPTY}},
-    limit,
-    /*lex_admitted=*/false,
-    &stats);
+  sirius_physical_top_n armed(sirius::from_duckdb_vec(types), make_orders(), limit, 0, nullptr, 0);
+  armed.threshold_coordinator =
+    make_test_coordinator(armed.orders,
+                          {k_int64, cudf::data_type{cudf::type_id::EMPTY}},
+                          limit,
+                          /*lex_admitted=*/false,
+                          &stats);
   sirius_physical_top_n_merge armed_merge(&armed);
 
   auto const run_strings = [&](sirius_physical_top_n& local, sirius_physical_top_n_merge& merge) {
     auto const local_outputs = run_local(local, batches);
-    auto out =
-      merge.execute(pipelineable_operator_data(local_outputs), cudf::get_default_stream());
+    auto out = merge.execute(pipelineable_operator_data(local_outputs), cudf::get_default_stream());
     auto const& merged = dynamic_cast<pipelineable_operator_data const&>(*out).get_data_batches();
     REQUIRE(merged.size() == 1);
     auto const view = sirius::get_cudf_table_view(*merged[0]);

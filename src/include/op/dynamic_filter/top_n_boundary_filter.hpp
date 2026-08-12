@@ -47,15 +47,15 @@ struct boundary_filter_params {
   static constexpr std::size_t k_max_components = 8;
 
   struct component {
-    std::int64_t value = 0;   ///< Widened exact boundary value; meaningful only when engaged
+    std::int64_t value = 0;      ///< Widened exact boundary value; meaningful only when engaged
     bool engaged       = false;  ///< False: the boundary row's key is null here
     bool descending    = false;  ///< Key direction
     bool nulls_first   = false;  ///< Null placement in the final output order
-    std::uint8_t width = 0;   ///< Physical representation width in bytes (1/2/4/8)
+    std::uint8_t width = 0;      ///< Physical representation width in bytes (1/2/4/8)
   };
 
   component components[k_max_components]{};
-  std::uint32_t count = 0;  ///< Leading components populated; at most k_max_components
+  std::uint32_t count = 0;      ///< Leading components populated; at most k_max_components
   bool strict         = false;  ///< Drop full-tuple ties (strict) or keep them (inclusive)
 };
 
@@ -89,12 +89,12 @@ struct boundary_filter_result {
  * @param[in] stream Stream the compare, compaction, gather, and count read-back are ordered on
  * @param[in] mr Allocator for the gather map, CUB temporary storage, and the gathered table
  */
-[[nodiscard]] boundary_filter_result apply_boundary_filter(cudf::table_view const& batch,
-                                                           std::span<cudf::size_type const>
-                                                             key_columns,
-                                                           boundary_filter_params const& params,
-                                                           rmm::cuda_stream_view stream,
-                                                           rmm::device_async_resource_ref mr);
+[[nodiscard]] boundary_filter_result apply_boundary_filter(
+  cudf::table_view const& batch,
+  std::span<cudf::size_type const> key_columns,
+  boundary_filter_params const& params,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
 
 /**
  * @brief Whether a key's nulls sort before every value in the final output order

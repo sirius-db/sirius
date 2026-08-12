@@ -90,17 +90,17 @@ class top_n_dynamic_filter_publish_plan final {
 
   top_n_dynamic_filter_publish_plan() = default;
 
-  top_n_dynamic_filter_publish_plan(top_n_dynamic_filter_publish_plan&&) noexcept            = default;
-  top_n_dynamic_filter_publish_plan& operator=(top_n_dynamic_filter_publish_plan&&) noexcept = default;
-  top_n_dynamic_filter_publish_plan(top_n_dynamic_filter_publish_plan const&)                = delete;
-  top_n_dynamic_filter_publish_plan& operator=(top_n_dynamic_filter_publish_plan const&)     = delete;
+  top_n_dynamic_filter_publish_plan(top_n_dynamic_filter_publish_plan&&) noexcept = default;
+  top_n_dynamic_filter_publish_plan& operator=(top_n_dynamic_filter_publish_plan&&) noexcept =
+    default;
+  top_n_dynamic_filter_publish_plan(top_n_dynamic_filter_publish_plan const&)            = delete;
+  top_n_dynamic_filter_publish_plan& operator=(top_n_dynamic_filter_publish_plan const&) = delete;
 
-  std::size_t k = 0;                ///< Checked limit + offset
+  std::size_t k            = 0;  ///< Checked limit + offset
   top_n_producer_kind kind = top_n_producer_kind::ROW;
-  std::vector<key> keys;            ///< Complete ORDER BY, in order; keys[0] feeds FIRST_KEY
-  std::vector<target> targets;      ///< Scan channels and endpoint channels, uniformly
+  std::vector<key> keys;        ///< Complete ORDER BY, in order; keys[0] feeds FIRST_KEY
+  std::vector<target> targets;  ///< Scan channels and endpoint channels, uniformly
   std::vector<dynamic_filter_replica_space> replica_spaces;
-
 };
 
 }  // namespace sirius::op

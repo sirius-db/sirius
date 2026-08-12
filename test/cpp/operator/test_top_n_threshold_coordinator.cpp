@@ -213,8 +213,7 @@ TEST_CASE("top_n_threshold_coordinator concurrent offers settle on the tightest 
   REQUIRE(head_value(*coordinator.tightest_boundary()) == global_min);
   REQUIRE(stats.top_n_offers.load() == k_threads * k_offers_per_thread);
   REQUIRE(coordinator.boundary_update_count() >= 1);
-  REQUIRE(coordinator.boundary_update_count() +
-            stats.top_n_offers_not_tighter.load() ==
+  REQUIRE(coordinator.boundary_update_count() + stats.top_n_offers_not_tighter.load() ==
           static_cast<std::uint64_t>(k_threads * k_offers_per_thread));
 }
 

@@ -201,18 +201,30 @@ TEST_CASE("gated view re-arms once when a refinement replacement advances the ge
 
   // Measured batch keeps everything (10/10): the gate disables at the snapshot's generation.
   auto first = sirius::op::scan::apply_dynamic_filters_gated_view(
-    table->view(), filters->snapshot(), gate, stream, dynamic_filter_apply_mode::include_ast_row_masks);
+    table->view(),
+    filters->snapshot(),
+    gate,
+    stream,
+    dynamic_filter_apply_mode::include_ast_row_masks);
   REQUIRE(first != nullptr);
   REQUIRE(first->num_rows() == 10);
   auto second = sirius::op::scan::apply_dynamic_filters_gated_view(
-    table->view(), filters->snapshot(), gate, stream, dynamic_filter_apply_mode::include_ast_row_masks);
+    table->view(),
+    filters->snapshot(),
+    gate,
+    stream,
+    dynamic_filter_apply_mode::include_ast_row_masks);
   REQUIRE(second == nullptr);  // disabled; filter_count did not change
 
   // Replacement bumps only the generation -- exactly the change the count-based rule would miss.
   REQUIRE(publisher.publish(2, make_zone_map(3, 6)) == refinement_publish_result::ACCEPTED);
   REQUIRE(filters->filter_count() == 1);
   auto rearmed = sirius::op::scan::apply_dynamic_filters_gated_view(
-    table->view(), filters->snapshot(), gate, stream, dynamic_filter_apply_mode::include_ast_row_masks);
+    table->view(),
+    filters->snapshot(),
+    gate,
+    stream,
+    dynamic_filter_apply_mode::include_ast_row_masks);
   stream.synchronize();
   REQUIRE(rearmed != nullptr);  // one re-measurement: 4/10 kept -> ACTIVE
   REQUIRE(to_host_int32(rearmed->view().column(0), stream) == std::vector<int32_t>{3, 4, 5, 6});
@@ -257,9 +269,10 @@ std::vector<std::string> referenced_column_names(cudf::ast::tree const& tree)
 std::shared_ptr<sirius::op::sirius_dynamic_lex_range_filter> make_lex_filter(
   std::size_t primary_ordinal, std::size_t tail_ordinal)
 {
-  auto const key = sirius::op::top_n_key_semantics{.storage_type = cudf::data_type{cudf::type_id::INT32},
-                                                   .order      = cudf::order::ASCENDING,
-                                                   .null_order = cudf::null_order::AFTER};
+  auto const key =
+    sirius::op::top_n_key_semantics{.storage_type = cudf::data_type{cudf::type_id::INT32},
+                                    .order        = cudf::order::ASCENDING,
+                                    .null_order   = cudf::null_order::AFTER};
   std::vector<sirius::op::lex_component_semantics> components{
     {.consumer_ordinal = primary_ordinal, .key = key},
     {.consumer_ordinal = tail_ordinal, .key = key}};

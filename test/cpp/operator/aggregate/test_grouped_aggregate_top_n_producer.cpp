@@ -63,8 +63,8 @@ std::vector<top_n_key_semantics> ascending_int64_key()
 /// A grouped aggregate computing `SUM(col 1) GROUP BY col 0` over two INT64 columns.
 std::unique_ptr<sirius_physical_grouped_aggregate> make_sum_aggregate()
 {
-  auto expressions = sirius::test::create_aggregate_expressions<gpu_type_traits<std::int64_t>>(
-    {0}, {"sum"}, {1});
+  auto expressions =
+    sirius::test::create_aggregate_expressions<gpu_type_traits<std::int64_t>>({0}, {"sum"}, {1});
   return std::make_unique<sirius_physical_grouped_aggregate>(std::move(expressions.output_types),
                                                              std::move(expressions.aggregates),
                                                              std::move(expressions.groups),
@@ -79,8 +79,8 @@ std::map<std::int64_t, std::int64_t> run_and_merge(
 {
   std::map<std::int64_t, std::int64_t> sums;
   for (auto const& batch : batches) {
-    auto outputs =
-      aggregate.execute(pipelineable_operator_data({batch}), sirius::test::operator_utils::default_stream());
+    auto outputs = aggregate.execute(pipelineable_operator_data({batch}),
+                                     sirius::test::operator_utils::default_stream());
     for (auto const& produced :
          dynamic_cast<pipelineable_operator_data const&>(*outputs).get_data_batches()) {
       auto const view   = sirius::get_cudf_table_view(*produced);
@@ -118,15 +118,17 @@ TEST_CASE("the group-key producer keeps boundary-tied rows so their group's sum 
   batches.push_back(make_two_column_batch<std::int64_t, std::int64_t>(
     *space, {4, 4, 9, 0, 9}, {1000, 2000, 5, 7, 6}, cudf::type_id::INT64));
 
-  auto reference = make_sum_aggregate();
+  auto reference      = make_sum_aggregate();
   auto const expected = run_and_merge(*reference, batches);
 
   dynamic_filter_stats stats;
   auto coordinator = std::make_shared<top_n_threshold_coordinator>(
     5, ascending_int64_key(), true, &stats, top_n_producer_kind::GROUP_KEY);
   auto armed = make_sum_aggregate();
-  armed->top_n_producer = std::make_unique<top_n_group_key_producer>(
-    coordinator, std::vector<cudf::size_type>{0}, scan::dynamic_filter_gate::k_default_keep_threshold);
+  armed->top_n_producer =
+    std::make_unique<top_n_group_key_producer>(coordinator,
+                                               std::vector<cudf::size_type>{0},
+                                               scan::dynamic_filter_gate::k_default_keep_threshold);
   auto const actual = run_and_merge(*armed, batches);
 
   // The damage assertion comes first, deliberately. A counter assertion proves which rows the

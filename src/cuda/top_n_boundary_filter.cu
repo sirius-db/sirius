@@ -39,8 +39,8 @@
 // standard library
 #include <algorithm>
 #include <cassert>
-#include <stdexcept>
 #include <cstdint>
+#include <stdexcept>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -56,8 +56,9 @@ struct boundary_row_predicate {
   cudf::table_device_view keys;  ///< The key columns only, in component order
   sirius::op::detail::boundary_filter_params params;
 
-  __device__ __forceinline__ static std::int64_t load_widened(
-    cudf::column_device_view const& col, cudf::size_type row, std::uint8_t width) noexcept
+  __device__ __forceinline__ static std::int64_t load_widened(cudf::column_device_view const& col,
+                                                              cudf::size_type row,
+                                                              std::uint8_t width) noexcept
   {
     switch (width) {
       case 1: return static_cast<std::int64_t>(col.data<std::int8_t>()[row]);
@@ -144,10 +145,8 @@ boundary_filter_result apply_boundary_filter(cudf::table_view const& batch,
   if (rows_kept == 0) { return {cudf::empty_like(batch), 0}; }
 
   auto const map_view = cudf::column_view{
-    cudf::data_type{cudf::type_to_id<cudf::size_type>()}, rows_kept, gather_map.data(), nullptr,
-    0};
-  auto filtered =
-    cudf::gather(batch, map_view, cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
+    cudf::data_type{cudf::type_to_id<cudf::size_type>()}, rows_kept, gather_map.data(), nullptr, 0};
+  auto filtered = cudf::gather(batch, map_view, cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
   return {std::move(filtered), rows_kept};
 }
 

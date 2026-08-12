@@ -50,8 +50,7 @@ exact_host_key_tuple int32_tuple(std::vector<std::optional<std::int32_t>> const&
 
 }  // namespace
 
-TEST_CASE("exact_host_scalar::compare honors direction per storage type",
-          "[dynamic_filter][top_n]")
+TEST_CASE("exact_host_scalar::compare honors direction per storage type", "[dynamic_filter][top_n]")
 {
   auto const lo = exact_host_scalar{std::int64_t{-5}, cudf::data_type{cudf::type_id::INT64}};
   auto const hi = exact_host_scalar{std::int64_t{7}, cudf::data_type{cudf::type_id::INT64}};
@@ -121,10 +120,10 @@ TEST_CASE("exact_host_key_tuple::lex_compare null placement mirrors cuDF",
   SECTION("SQL placement derived through to_cudf_null_order")
   {
     // ORDER BY x DESC NULLS FIRST: nulls must order before every value.
-    std::vector<top_n_key_semantics> const keys{int32_key(
-      cudf::order::DESCENDING,
-      sirius::op::to_cudf_null_order(duckdb::OrderType::DESCENDING,
-                                     duckdb::OrderByNullType::NULLS_FIRST))};
+    std::vector<top_n_key_semantics> const keys{
+      int32_key(cudf::order::DESCENDING,
+                sirius::op::to_cudf_null_order(duckdb::OrderType::DESCENDING,
+                                               duckdb::OrderByNullType::NULLS_FIRST))};
     REQUIRE(null_tuple.lex_compare(value_tuple, keys) < 0);
   }
 }

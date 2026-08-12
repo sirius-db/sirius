@@ -31,9 +31,9 @@
 
 #include "helper/logical_type.hpp"
 
-#include <duckdb/common/types.hpp>
-
 #include <cudf/types.hpp>
+
+#include <duckdb/common/types.hpp>
 
 #include <cstdint>
 #include <optional>

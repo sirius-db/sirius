@@ -42,7 +42,7 @@ struct dynamic_filter_stats;
 enum class threshold_offer_result {
   ACCEPTED_FOR_PUBLICATION,  ///< Tightest so far; this call owns the publisher loop (Stage 4)
   COALESCED,                 ///< Tightest so far; an active publisher will flush it (Stage 4)
-  NOT_TIGHTER,       ///< Boundary does not lexicographically strengthen the tightest; ignored
+  NOT_TIGHTER,           ///< Boundary does not lexicographically strengthen the tightest; ignored
   NO_ACCEPTING_TARGET,   ///< Tightened `tightest_seen` only; no channel target exists/accepts
   UNSUPPORTED_BOUNDARY,  ///< Null first component or otherwise unpublishable Kth-row tuple
   REJECTED_STATE         ///< Coordinator is FINISHING, FINISHED, or CANCELLED
@@ -58,7 +58,7 @@ enum class threshold_offer_result {
  * refers to them.
  */
 struct top_n_threshold_witness {
-  exact_host_key_tuple boundary;  ///< Completed exact host Kth-row key tuple
+  exact_host_key_tuple boundary;                     ///< Completed exact host Kth-row key tuple
   std::shared_ptr<cucascade::data_batch> witnesses;  ///< The K-row local result, kept alive
 };
 
@@ -274,7 +274,7 @@ class top_n_threshold_coordinator final {
 
   /// Tightest candidate awaiting publication, and whether a publisher loop owns the drain.
   std::optional<exact_host_key_tuple> _pending;
-  bool _publisher_active   = false;
+  bool _publisher_active       = false;
   std::uint64_t _next_revision = 1;
 };
 

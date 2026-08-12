@@ -24,7 +24,7 @@ using sirius::planner::checked_top_n_k;
 
 namespace {
 constexpr auto k_size_max = std::numeric_limits<std::size_t>::max();
-constexpr auto k_row_max = static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
+constexpr auto k_row_max  = static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
 }  // namespace
 
 TEST_CASE("checked_top_n_k admits plain limit and limit-plus-offset shapes",
