@@ -137,6 +137,7 @@ mvcc_mask_workset prepare_mvcc_mask_tasks(
   plan_requests.reserve(requests.size());
   bool any_dirty = false;
   for (auto& request : requests) {
+    if (request.masks_ready) { continue; }
     if (!request.storage || !request.context) {
       throw std::runtime_error(
         "[prepare_mvcc_mask_tasks] malformed mask request for pinned entry '" + request.entry_name +

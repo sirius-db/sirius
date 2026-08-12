@@ -30,6 +30,7 @@
 #include "scan_manager/insert_delta_job.hpp"
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
 #include "scan_manager/memory_prefetcher.hpp"
+#include "scan_manager/mvcc_mask_cache.hpp"
 #include "scan_manager/mvcc_mask_job.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
 #include "scan_manager/split_provider.hpp"
@@ -239,6 +240,10 @@ struct pinned_entry {
   /// @ref sirius_scan_manager::attach_mvcc_metadata right after insert. nullptr
   /// for parquet pins (immutable sources need no visibility reconciliation).
   std::unique_ptr<duckdb_mvcc_metadata> mvcc;
+  /// Version-keyed cache of the last keep-mask set: a query at an unchanged table version
+  /// reuses it instead of re-running the capture+fill walk. Lazily created, reset on
+  /// unpin/re-pin, null for parquet pins.
+  std::shared_ptr<mvcc_mask_version_cache> mvcc_mask_cache;
 };
 
 /// Validate that @p entry can serve @p selected_columns (positions into
@@ -368,8 +373,9 @@ struct cached_scan_plan {
 /// publish into it mid-scan); the provider snapshots it PER BATCH onto the
 /// attached scan, so later batches legitimately see more filters. Null (the
 /// default) disables it.
-/// Both are gated per chunk on @p mvcc_masks: a masked chunk gives up row
-/// dropping, while its default-slot siblings keep the decode-side pushdown.
+/// The attaches compose with @p mvcc_masks PER CHUNK: a masked slot also gets the mask
+/// itself (set_visibility_mask), so the decode compacts to visible survivors; a default
+/// slot gets the pushdown alone.
 std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   pinned_entry const& entry,
   std::span<std::size_t const> selected_columns,
