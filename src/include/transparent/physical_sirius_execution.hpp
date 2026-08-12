@@ -40,14 +40,16 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
   static constexpr const duckdb::PhysicalOperatorType TYPE =
     duckdb::PhysicalOperatorType::EXTENSION;
 
-  PhysicalSiriusExecution(duckdb::PhysicalPlan& physical_plan,
-                          duckdb::unique_ptr<duckdb::LogicalOperator> logical_plan,
-                          std::string query_sql,
-                          duckdb::vector<duckdb::LogicalType> types,
-                          duckdb::vector<std::string> names,
-                          duckdb::shared_ptr<duckdb::PreparedStatementData> cpu_fallback_prepared,
-                          bool cpu_plan_reads_s3,
-                          duckdb::idx_t estimated_cardinality);
+  PhysicalSiriusExecution(
+    duckdb::PhysicalPlan& physical_plan,
+    duckdb::unique_ptr<duckdb::LogicalOperator> logical_plan,
+    std::string query_sql,
+    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::vector<std::string> names,
+    duckdb::shared_ptr<duckdb::PreparedStatementData> cpu_fallback_prepared,
+    bool cpu_plan_reads_s3,
+    duckdb::idx_t estimated_cardinality,
+    duckdb::unique_ptr<sirius::op::sirius_physical_operator> validated_sirius_plan = nullptr);
 
   // Source operator interface
   bool IsSource() const override { return true; }
@@ -94,6 +96,10 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
   /// read_parquet cannot serve Sirius-owned s3://), so a runtime GPU failure on an
   /// s3 query surfaces a clear error instead of falling back to CPU.
   bool cpu_plan_reads_s3_ = false;
+
+  /// The plan OnFinalizePrepare built while validating GPU support. The first GetData consumes
+  /// it rather than rebuilding an identical one. Mutable: consumed from a `const` GetData.
+  mutable duckdb::unique_ptr<sirius::op::sirius_physical_operator> validated_sirius_plan_;
 };
 
 }  // namespace sirius::transparent
