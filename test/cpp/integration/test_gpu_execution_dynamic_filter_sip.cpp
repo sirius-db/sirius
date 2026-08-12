@@ -126,7 +126,6 @@ switch_comparison require_switch_result_equivalence(duckdb::Connection& con,
 
 }  // namespace
 
-// Verify result parity for derived-build and build-block routes; plan-shape tests pin placement.
 TEST_CASE("gpu_execution - derived-build and build-block routes preserve results",
           "[integration][gpu_execution][dynamic_filter]")
 {
@@ -158,8 +157,6 @@ TEST_CASE("gpu_execution - derived-build and build-block routes preserve results
                                         "WHERE c.c_nationkey = 3");
 
     REQUIRE(deltas.off.producers_enabled == 0);
-
-    // Check each publication stage independently.
     REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
     REQUIRE(deltas.on.membership_filters_built > deltas.off.membership_filters_built);
     REQUIRE(deltas.on.filters_pushed > deltas.off.filters_pushed);
@@ -167,8 +164,7 @@ TEST_CASE("gpu_execution - derived-build and build-block routes preserve results
 
   SECTION("a LEFT join in the query keeps results identical while SIP is active")
   {
-    // Use the same structural attribution as the inner-join case. Dedicated plan-shape tests
-    // cover LEFT-join descent.
+    // Dedicated plan-shape tests cover LEFT-join descent.
     sirius::test::disabled_optimizers_guard shape(
       con, "statistics_propagation,join_order,build_side_probe_side");
     sirius::test::coverage_gate_disable_guard gate_off(con);
@@ -203,7 +199,7 @@ TEST_CASE("gpu_execution - derived-build and build-block routes preserve results
   SECTION("an endpoint whose channel receives no filter passes rows through")
   {
     // The customer predicate produces no rows but remains inside the column statistics, preserving
-    // the join in the plan. The empty-build endpoint receives no filter and must pass rows through.
+    // the join in the plan.
     require_switch_result_equivalence(con,
                                       "SELECT count(*), sum(o.o_custkey) "
                                       "FROM lineitem l "
@@ -215,9 +211,7 @@ TEST_CASE("gpu_execution - derived-build and build-block routes preserve results
   SECTION("a single-partition MIXED_JOIN publishes through the partition fold")
   {
     // An equality plus an inequality condition puts the join in MIXED_JOIN mode, which
-    // compute_hash_join_partition_strategy excludes from BUILD_PROBE. Such a join could not
-    // publish at all until the PARTITION started folding a single-partition build for any
-    // publishing join.
+    // compute_hash_join_partition_strategy excludes from BUILD_PROBE.
     sirius::test::coverage_gate_disable_guard gate_off(con);
     auto const deltas = require_switch_result_equivalence(
       con,
@@ -233,23 +227,19 @@ TEST_CASE("gpu_execution - derived-build and build-block routes preserve results
 
   SECTION("a multi-partition build publishes nothing")
   {
-    // The one property here whose violation is a wrong result rather than a lost optimization: a
-    // filter built from one partition's slice of the build keys would drop probe rows that do
-    // join. The join no longer decides this itself, it trusts the PARTITION, so pin it end to end
-    // on a build that really does span partitions rather than on a join that was simply never
-    // told.
-    //
-    // Reaching that shape needs the build to clear the small-table threshold: a build under it is
-    // a broadcast candidate, and broadcast collapses to a single partition no matter how small
-    // the hash-partition target is. Hence the wide build -- the summed columns exist to keep the
-    // projection from pruning them, not for their values. Disabling broadcast outright removes
-    // the remaining candidacy path, and the small hash-partition target then drives the natural
-    // count above one, which also makes the join ineligible for BUILD_PROBE.
+    // Correctness stake: a filter built from one partition's slice of the build keys would drop
+    // probe rows that do join, so this must be pinned on a build that really spans partitions.
+    // The summed columns exist only to keep the projection from pruning them, widening the build
+    // past broadcast candidacy. Reaching a genuinely partition-sliced build needs all three pins:
+    // broadcast off, a small hash-partition target so the natural count exceeds one, and a build
+    // budget below the build size so BUILD_PROBE cannot fold it back to one table per GPU.
     sirius::test::disabled_optimizers_guard shape(
       con, "statistics_propagation,join_order,build_side_probe_side");
     sirius::test::coverage_gate_disable_guard gate_off(con);
     sirius::test::scoped_setting no_broadcast(con, "max_broadcast_join_size", 1);
     sirius::test::scoped_setting small_partitions(con, "hash_partition_bytes", 8ULL * 1024 * 1024);
+    sirius::test::scoped_setting small_build_budget(
+      con, "max_build_hash_table_bytes", 8ULL * 1024 * 1024);
     auto const deltas = require_switch_result_equivalence(
       con,
       "select count(*), sum(l.l_partkey), sum(l.l_suppkey), sum(l.l_linenumber), "
@@ -257,7 +247,6 @@ TEST_CASE("gpu_execution - derived-build and build-block routes preserve results
       "from orders o join lineitem l on o.o_orderkey = l.l_orderkey "
       "where l.l_shipdate >= date '1992-01-01'");
 
-    // The producer is wired, so the window opens and then can never claim.
     REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
     REQUIRE(deltas.on.publications_finished == 0);
     REQUIRE(deltas.on.publications_skipped_build_not_whole > 0);
@@ -280,7 +269,6 @@ TEST_CASE("gpu_execution - derived-build and build-block routes preserve results
 
   SECTION("TPC-H q17: a delim-scan build wires only through derived-build evidence")
   {
-    // q17's DELIM_GET build uses derived evidence to bind the internal lineitem scan.
     auto const deltas =
       require_switch_result_equivalence(con,
                                         "select sum(l.l_extendedprice) / 7.0 as avg_yearly "
