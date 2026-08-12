@@ -472,6 +472,11 @@ void wrap_ungrouped_aggregate(duckdb::unique_ptr<sirius::op::sirius_physical_ope
     auto* ungrouped_ptr = ungrouped_op.get();
     auto merge          = duckdb::make_uniq<sirius::op::sirius_physical_ungrouped_aggregate_merge>(
       &ungrouped_ptr->Cast<sirius::op::sirius_physical_ungrouped_aggregate>());
+    // MERGE_AGGREGATE keeps the final SQL schema copied above. The child emits per-task
+    // accumulator carriers instead: AVG is SUM + COUNT, so its runtime width is larger than the
+    // final width. Recording that schema on the child keeps task-level output validation exact.
+    ungrouped_ptr->types = ungrouped_ptr->Cast<sirius::op::sirius_physical_ungrouped_aggregate>()
+                             .get_local_output_types();
     merge->children.push_back(std::move(ungrouped_op));
     return merge;
   });
