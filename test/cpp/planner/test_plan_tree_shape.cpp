@@ -439,6 +439,30 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(partition->children[0]->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
   }
 
+  SECTION("COUNT(DISTINCT) records LIST locally and BIGINT after merge")
+  {
+    auto plan =
+      generate_sirius_plan(*con, "SELECT val, count(DISTINCT id) FROM big_left GROUP BY val");
+    INFO(tree_to_string(plan.get()));
+
+    auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+    REQUIRE(merge != nullptr);
+    REQUIRE(merge->get_types().size() == 2);
+    CHECK(merge->get_types()[1].id() == sirius::type_id::BIGINT);
+    REQUIRE(merge->children.size() == 1);
+
+    auto* partition = merge->children[0].get();
+    REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
+    REQUIRE(partition->get_types().size() == 2);
+    CHECK(partition->get_types()[1].id() == sirius::type_id::LIST);
+    REQUIRE(partition->children.size() == 1);
+
+    auto* local = partition->children[0].get();
+    REQUIRE(local->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
+    REQUIRE(local->get_types().size() == 2);
+    CHECK(local->get_types()[1].id() == sirius::type_id::LIST);
+  }
+
   SECTION("ungrouped aggregate gains MERGE_AGGREGATE with no PARTITION")
   {
     auto plan = generate_sirius_plan(*con, "SELECT sum(val) FROM big_left");
