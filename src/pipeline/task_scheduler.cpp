@@ -335,7 +335,7 @@ void task_scheduler::management_eventloop()
   //   1. Devices: collect pending events without blocking; block on the
   //      channel only when no device is parked (deadlock-free: no parked
   //      device means every executor is busy and will post device_ready).
-  //   2. Work: sleep on _task_queue.wait_non_empty() when the queue is empty.
+  //   2. Work: sleep on _task_queue.wait() when the queue is empty.
   //      The queue's own condvar hears every push — schedule() or the
   //      downgrade's silent RAII return.
   //
@@ -361,7 +361,7 @@ void task_scheduler::management_eventloop()
       }
     }
     while (evt) {
-      if (evt->kind == task_request_kind::device_ready && !evt->is_scan) {
+      if (evt->kind == task_request_kind::device_ready) {
         _ready_devices.emplace_back(evt->device_id);
       }
       evt = _task_request_channel.try_get();
@@ -376,7 +376,7 @@ void task_scheduler::management_eventloop()
         _task_creator->schedule_lookahead(*_ready_devices.begin());
       }
       // Returns false only when the queue is interrupted (stop()).
-      if (!_task_queue.wait_non_empty()) {
+      if (!_task_queue.wait()) {
         SIRIUS_LOG_INFO("Task queue interrupted, exiting management event loop.");
         break;
       }

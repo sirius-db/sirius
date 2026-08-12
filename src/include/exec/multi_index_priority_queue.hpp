@@ -168,9 +168,9 @@ class multi_index_priority_queue {
   ~multi_index_priority_queue()                                            = default;
 
   /// Inserts a task, computing its priority and secondary-index keys once, then
-  /// wakes every thread blocked in pop()/pop_back()/wait_non_empty() (see
-  /// wait_non_empty() for why notify_one() would be a lost wakeup once waiter
-  /// kinds are mixed). If the queue is interrupted
+  /// wakes every thread blocked in pop()/pop_back()/wait() (see wait() for why
+  /// notify_one() would be a lost wakeup once waiter kinds are mixed). If the
+  /// queue is interrupted
   /// (i.e. shutting down) the task is dropped rather than enqueued, matching the
   /// teardown contract callers rely on (e.g. returning a task to a closed queue).
   /// Strongly exception-safe: if any allocation throws, the queue is left as it
@@ -248,11 +248,11 @@ class multi_index_priority_queue {
   /// false if the queue was interrupted while empty (shutdown).
   ///
   /// The waiter shares _cv with pop()/pop_back(). push() must therefore use
-  /// notify_all(): with notify_one(), a push could wake only a wait_non_empty()
-  /// caller (which takes nothing) while a pop() caller stays blocked, or vice
-  /// versa a pop() could consume the task and leave this waiter correctly
-  /// asleep on an empty queue.
-  [[nodiscard]] bool wait_non_empty()
+  /// notify_all(): with notify_one(), a push could wake only a wait() caller
+  /// (which takes nothing) while a pop() caller stays blocked, or vice versa a
+  /// pop() could consume the task and leave this waiter correctly asleep on an
+  /// empty queue.
+  [[nodiscard]] bool wait() const
   {
     std::unique_lock<std::mutex> lock(_mutex);
     _cv.wait(lock, [this] { return !_levels.empty() || !_active; });
@@ -675,7 +675,9 @@ class multi_index_priority_queue {
   }
 
   mutable std::mutex _mutex;
-  std::condition_variable _cv;
+  /// mutable so const wait() can block on it (mirrors the mutable _mutex the
+  /// const accessors already lock).
+  mutable std::condition_variable _cv;
   bool _active{true};  ///< false after interrupt(): blocked pops stop waiting.
 
   level_map _levels;  ///< Spine: priority -> level.

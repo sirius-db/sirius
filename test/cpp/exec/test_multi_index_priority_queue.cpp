@@ -495,14 +495,13 @@ TEST_CASE("multi_index interrupt wakes a blocked pop with nullptr", "[multi_inde
   REQUIRE(q.pop()->id == 7);
 }
 
-TEST_CASE("multi_index wait_non_empty wakes on push without extracting",
-          "[multi_index_priority_queue]")
+TEST_CASE("multi_index wait wakes on push without extracting", "[multi_index_priority_queue]")
 {
   multi_index_priority_queue<payload> q(by_keys());
 
   bool has_task = false;
   std::thread waiter([&] {
-    has_task = q.wait_non_empty();  // blocks until the producer pushes
+    has_task = q.wait();  // blocks until the producer pushes
   });
 
   std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -516,17 +515,16 @@ TEST_CASE("multi_index wait_non_empty wakes on push without extracting",
 
   // Non-empty queue: returns true immediately without blocking.
   q.push(task(7, keys_of(2)));
-  REQUIRE(q.wait_non_empty());
+  REQUIRE(q.wait());
   REQUIRE(q.size() == 1);
 }
 
-TEST_CASE("multi_index interrupt wakes a blocked wait_non_empty with false",
-          "[multi_index_priority_queue]")
+TEST_CASE("multi_index interrupt wakes a blocked wait with false", "[multi_index_priority_queue]")
 {
   multi_index_priority_queue<payload> q(by_keys());
 
   bool has_task = true;
-  std::thread waiter([&] { has_task = q.wait_non_empty(); });
+  std::thread waiter([&] { has_task = q.wait(); });
 
   std::this_thread::sleep_for(std::chrono::milliseconds(20));
   q.interrupt();
@@ -535,13 +533,12 @@ TEST_CASE("multi_index interrupt wakes a blocked wait_non_empty with false",
   REQUIRE_FALSE(has_task);
 }
 
-TEST_CASE("multi_index push wakes wait_non_empty and pop waiters together",
-          "[multi_index_priority_queue]")
+TEST_CASE("multi_index push wakes wait and pop waiters together", "[multi_index_priority_queue]")
 {
-  // push() must notify_all: a wait_non_empty() waiter (which extracts nothing)
+  // push() must notify_all: a wait() waiter (which extracts nothing)
   // and a pop() waiter (which extracts the task) can block concurrently, and a
   // single push must satisfy the pop() while also waking the non-consuming
-  // waiter. With notify_one, the push could wake only wait_non_empty() and
+  // waiter. With notify_one, the push could wake only wait() and
   // strand the pop() despite an available task.
   multi_index_priority_queue<payload> q(by_keys());
 
@@ -552,7 +549,7 @@ TEST_CASE("multi_index push wakes wait_non_empty and pop waiters together",
     if (t) { popped_id.store(t->id); }
   });
   std::thread waiter([&] {
-    (void)q.wait_non_empty();
+    (void)q.wait();
     waited.store(true);
   });
 
