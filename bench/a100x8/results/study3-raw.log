@@ -1,0 +1,131 @@
+=== box free after 1200s wait; starting Study 3 ===
+
+############################################################
+# Study 3 · Engine A · sf500
+#   data=/home/ubuntu/tpch_parquet_sf500
+#   8 CNs · pool=66GiB · arena=12GiB · host=100GiB
+############################################################
+=== cluster up: 8/8 CNs ===
+=== FE query_timeout = 600s ===
+cluster: 8 alive compute nodes + 0 alive backends (MIN_BACKENDS=8)
+q01 r0 cold pass 19141ms rows=4
+q01 r1 warm pass 16148ms rows=4
+q01 r2 warm pass 17458ms rows=4
+q01 r3 warm pass 18409ms rows=4
+q03 r0 cold pass 7602ms rows=10
+q03 r1 warm pass 8937ms rows=10
+q03 r2 warm pass 7503ms rows=10
+q03 r3 warm pass 7477ms rows=10
+q04 r0 cold pass 7063ms rows=5
+q04 r1 warm pass 2868ms rows=5
+q04 r2 warm pass 4533ms rows=5
+q04 r3 warm pass 5790ms rows=5
+q06 r0 cold pass 7979ms rows=1
+q06 r1 warm pass 7643ms rows=1
+q06 r2 warm pass 11114ms rows=1
+q06 r3 warm pass 9278ms rows=1
+q07 r0 cold pass 10824ms rows=4
+q07 r1 warm pass 10850ms rows=4
+q07 r2 warm pass 12405ms rows=4
+q07 r3 warm pass 9884ms rows=4
+q12 r0 cold pass 5940ms rows=2
+q12 r1 warm pass 6821ms rows=2
+q12 r2 warm pass 6506ms rows=2
+q12 r3 warm pass 5314ms rows=2
+q13 r0 cold pass 6552ms rows=40
+q13 r1 warm pass 3991ms rows=40
+q13 r2 warm pass 3682ms rows=40
+q13 r3 warm pass 3687ms rows=40
+q14 r0 cold pass 6583ms rows=1
+q14 r1 warm pass 5252ms rows=1
+q14 r2 warm pass 6615ms rows=1
+q14 r3 warm pass 6339ms rows=1
+q16 r0 cold pass 2909ms rows=27840
+q16 r1 warm pass 2372ms rows=27840
+q16 r2 warm pass 3892ms rows=27840
+q16 r3 warm pass 3363ms rows=27840
+q19 r0 cold pass 8915ms rows=1
+q19 r1 warm pass 6339ms rows=1
+q19 r2 warm pass 8952ms rows=1
+q19 r3 warm pass 11861ms rows=1
+q20 r0 cold pass 9595ms rows=72343
+q20 r1 warm pass 9175ms rows=72343
+q20 r2 warm pass 7311ms rows=72343
+q20 r3 warm pass 7667ms rows=72343
+q22 r0 cold pass 3389ms rows=7
+q22 r1 warm pass 2624ms rows=7
+q22 r2 warm pass 5307ms rows=7
+q22 r3 warm pass 2384ms rows=7
+q02 r0 cold WEDGE/TIMEOUT (rc=124, cut at 600s)
+restarting cluster...
+q17 r0 cold REFUSED: ERROR 1064 (HY000) at line 1: rpc failed with 127.0.0.1: exec rpc error. backend [id=10009] [host=127.0.0.1] 
+restarting cluster...
+q11 r0 cold WEDGE/TIMEOUT (rc=0, cut at 600s)
+restarting cluster...
+== bench complete: /tmp/bench/study3/sf500/timings.csv ==
+=== sf500 sweep wall time: 1831 s ===
+
+############################################################
+# Study 3 · Engine A · sf1000
+#   data=/home/ubuntu/tpch_parquet_sf1000
+#   8 CNs · pool=54GiB · arena=24GiB · host=100GiB
+############################################################
+=== cluster up: 8/8 CNs ===
+=== FE query_timeout = 1800s ===
+cluster: 8 alive compute nodes + 0 alive backends (MIN_BACKENDS=8)
+q01 r0 cold pass 30859ms rows=4
+q01 r1 warm pass 34405ms rows=4
+q01 r2 warm pass 31915ms rows=4
+q01 r3 warm pass 33100ms rows=4
+q03 r0 cold pass 13402ms rows=10
+q03 r1 warm pass 13103ms rows=10
+q03 r2 warm pass 13714ms rows=10
+q03 r3 warm pass 14266ms rows=10
+q04 r0 cold pass 11349ms rows=5
+q04 r1 warm pass 8562ms rows=5
+q04 r2 warm pass 12457ms rows=5
+q04 r3 warm pass 6771ms rows=5
+q06 r0 cold pass 15216ms rows=1
+q06 r1 warm pass 16395ms rows=1
+q06 r2 warm pass 14221ms rows=1
+q06 r3 warm pass 15041ms rows=1
+q07 r0 cold REFUSED: ERROR 1064 (HY000) at line 1: fragment instance 019ff7b1-4195-77ec-b8c3-96a1aa5f1476 failed: timed out after 600s waiting for fragment instance 019ff7b1-4195-77
+restarting cluster...
+q12 r0 cold REFUSED: ERROR 1064 (HY000) at line 1: rpc failed with 127.0.0.1: exec rpc error. backend [id=10005] [host=127.0.0.1] 
+restarting cluster...
+q13 r0 cold pass 12896ms rows=30
+q13 r1 warm pass 5971ms rows=30
+q13 r2 warm pass 5935ms rows=30
+q13 r3 warm pass 6161ms rows=30
+q14 r0 cold pass 11298ms rows=1
+q14 r1 warm pass 9110ms rows=1
+q14 r2 warm pass 10488ms rows=1
+q14 r3 warm pass 10146ms rows=1
+q16 r0 cold pass 7387ms rows=27840
+q16 r1 warm pass 5110ms rows=27840
+q16 r2 warm pass 2870ms rows=27840
+q16 r3 warm pass 3101ms rows=27840
+q19 r0 cold pass 15167ms rows=1
+q19 r1 warm pass 16018ms rows=1
+q19 r2 warm pass 14729ms rows=1
+q19 r3 warm pass 15066ms rows=1
+q20 r0 cold pass 18001ms rows=112013
+q20 r1 warm pass 15518ms rows=112013
+q20 r2 warm pass 14232ms rows=112013
+q20 r3 warm pass 13992ms rows=112013
+q22 r0 cold pass 3916ms rows=7
+q22 r1 warm pass 4036ms rows=7
+q22 r2 warm pass 5012ms rows=7
+q22 r3 warm pass 6337ms rows=7
+q02 r0 cold REFUSED: ERROR 5024 (53400) at line 1: Query reached its timeout of 300 seconds, please increase the 'query_timeout' session variable and retry 
+restarting cluster...
+q17 r0 cold pass 33958ms rows=1
+q17 r1 warm pass 30033ms rows=1
+q17 r2 warm pass 19957ms rows=1
+q17 r3 warm pass 19984ms rows=1
+q11 r0 cold WEDGE/TIMEOUT (rc=0, cut at 1800s)
+restarting cluster...
+== bench complete: /tmp/bench/study3/sf1000/timings.csv ==
+=== sf1000 sweep wall time: 2511 s ===
+
+=== Study 3 Engine A complete -> /tmp/bench/study3 ===

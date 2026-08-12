@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Bring up 1 FE + N Sirius GPU compute nodes, one CN per GPU, cross-node exchange over nixl.
 #
-# Defaults target this box: 4x H100 80GB HBM3, NV18 between every pair, 104 vCPU / 885 GB.
+# Defaults target this box: 8x A100-SXM4-80GB, NV12 between every pair, 240 vCPU / 1771 GB.
+# Memory budget per GPU: 68 GiB pool (0.85 x 80 GiB) + 8 GiB staging arena + ~1 GiB context
+# = 77 GiB of the 80 GiB device. DO NOT copy GPU_MEM/STAGING from the H100 notes (40/32 GiB)
+# -- that leaves only a 40 GiB pool, halving throughput.
 #
 # The `cluster2` pixi task generalized to a loop. Two CNs could offset their ports by +2; past
 # a handful the heartbeat range would collide with the thrift range, so each CN instead gets a
@@ -12,7 +15,7 @@
 # (advertise_host, heartbeat_port), and the nixl agent is named {advertise_host}:{brpc_port}.
 #
 # Usage:  ./benchmarks/nixl-nvlink/script-box.sh
-#         NUM_CNS=2 GPU_MEM=48GiB ./benchmarks/nixl-nvlink/script-box.sh
+#         NUM_CNS=4 ./benchmarks/nixl-nvlink/script-box.sh   # scale-out study, 4-GPU arm
 #
 # Run it in its own terminal or as its own background task -- never chained behind `&` inside
 # another shell command, or the cluster dies with that shell.
@@ -29,21 +32,23 @@ NUM_CNS=${NUM_CNS:-$avail}
 PORT_BASE=${PORT_BASE:-9100}
 PORT_STRIDE=${PORT_STRIDE:-10}
 # The staging arena sits OUTSIDE --gpu-memory-limit, so a CN really occupies
-# GPU_MEM + STAGING + CUDA context: ~75 of the 79.6 GiB an H100 80GB reports.
+# GPU_MEM + STAGING + CUDA context. On an 80 GiB A100 the budget is tight:
+#   62 GiB pool + 16 GiB arena + ~1 GiB context = 79 GiB < 80 GiB.
 # Raising STAGING therefore REQUIRES lowering GPU_MEM by the same amount.
 #
-# 64GiB/8GiB failed at SF100: TPC-H q05 died with `exchange staging arena exhausted:
-# requested 42134144 bytes, 12926976 free of 8589934592 capacity with 21 leases
-# outstanding`. Fewer CNs makes it worse, not better -- each node then carries more of
-# the fan-out, so packed batches and concurrent leases both grow. Scale the arena with
-# the scale factor (notes-setup.md section 12).
-# Defaults size an H100 80GB; on smaller GPUs override both so GPU_MEM + STAGING + ~3GiB
-# of CUDA context fits the device (notes-setup.md section 12).
-GPU_MEM=${GPU_MEM:-40GiB}
-# Sized for this box (885 GB of host RAM / 4 CNs, leaving the page cache room for the
-# parquet reads); scale to host RAM / NUM_CNS elsewhere.
-HOST_MEM=${HOST_MEM:-192GiB}
-STAGING=${STAGING:-32GiB}
+# STAGING=16GiB derived from GB200 SF500 learning: q17 failed at 16 GiB and passed
+# at 32 GiB on a 4-CN GB200 cluster. With 8 CNs each handles half the fan-out, so
+# ~16 GiB/CN should suffice. q21 is a lease-lifecycle bug -- NOT a sizing issue --
+# and will fail regardless of arena size. q15 is non-deterministic (FP64 decimal
+# lowering / float-equality predicate); expect ~50% pass rate.
+# q07 and q13 passed comfortably on GB200; include them in the sweep.
+GPU_MEM=${GPU_MEM:-62GiB}
+# 120 GiB x 8 CNs = 960 GiB of ~1649 GiB, leaving ~437 GiB page cache = 3.4x SF500.
+# [SF1000 arm]: override with HOST_MEM=107GiB (800 GiB total, ~597 GiB cache = 2.3x)
+# [4-CN arm]:   override with HOST_MEM=200GiB
+# [2-CN arm]:   override with HOST_MEM=300GiB
+HOST_MEM=${HOST_MEM:-120GiB}
+STAGING=${STAGING:-16GiB}
 
 CN_BIN=$SR_DIR/target/release/sirius-starrocks-cn
 FE_BIN=$SR_DIR/starrocks/output/fe/bin/start_fe.sh
@@ -71,8 +76,8 @@ source "$SR_DIR/scripts/cn-env.sh"
 # `cudaErrorInsufficientDriver`. /usr/local/cuda/compat ships the forward-compat user-mode
 # driver (libcuda.so.580.x) that pairs a CUDA 13 runtime with the older kernel driver -- it must
 # come FIRST so its libcuda.so.1 wins over the system one. Supported because these are
-# data-center GPUs (H100); on a box whose driver is already r580+, this directory is absent and
-# the guard below simply skips it.
+# data-center GPUs (A100-SXM4); on a box whose driver is already r580+, this directory is
+# absent and the guard below simply skips it.
 CUDA_COMPAT=${CUDA_COMPAT:-/usr/local/cuda/compat}
 COMPAT_PREFIX=""
 if [ -e "$CUDA_COMPAT/libcuda.so.1" ]; then

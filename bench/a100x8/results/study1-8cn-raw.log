@@ -1,0 +1,62 @@
+=== Study 1 | 8 CN | pool=66GiB arena=12GiB host=100GiB ===
+=== queries: q01 q03 q04 q06 q07 q12 q13 q14 q16 q19 q20 q22 q02 q17 q11
+=== cluster up: 8/8 CNs ===
+cluster: 8 alive compute nodes + 0 alive backends (MIN_BACKENDS=8)
+q01 r0 cold pass 11988ms rows=4
+q01 r1 warm pass 9172ms rows=4
+q01 r2 warm pass 11468ms rows=4
+q01 r3 warm pass 12182ms rows=4
+q03 r0 cold pass 4613ms rows=10
+q03 r1 warm pass 3422ms rows=10
+q03 r2 warm pass 4580ms rows=10
+q03 r3 warm pass 3702ms rows=10
+q04 r0 cold pass 4095ms rows=5
+q04 r1 warm pass 1612ms rows=5
+q04 r2 warm pass 4155ms rows=5
+q04 r3 warm pass 2791ms rows=5
+q06 r0 cold pass 3279ms rows=1
+q06 r1 warm pass 2971ms rows=1
+q06 r2 warm pass 5217ms rows=1
+q06 r3 warm pass 3202ms rows=1
+q07 r0 cold pass 4825ms rows=4
+q07 r1 warm pass 5678ms rows=4
+q07 r2 warm pass 6378ms rows=4
+q07 r3 warm pass 6118ms rows=4
+q12 r0 cold pass 3651ms rows=2
+q12 r1 warm pass 3282ms rows=2
+q12 r2 warm pass 3070ms rows=2
+q12 r3 warm pass 2900ms rows=2
+q13 r0 cold pass 3943ms rows=40
+q13 r1 warm pass 3219ms rows=40
+q13 r2 warm pass 3178ms rows=40
+q13 r3 warm pass 3041ms rows=40
+q14 r0 cold pass 4943ms rows=1
+q14 r1 warm pass 3316ms rows=1
+q14 r2 warm pass 3371ms rows=1
+q14 r3 warm pass 2803ms rows=1
+q16 r0 cold pass 772ms rows=27840
+q16 r1 warm pass 2394ms rows=27840
+q16 r2 warm pass 2197ms rows=27840
+q16 r3 warm pass 2152ms rows=27840
+q19 r0 cold pass 3985ms rows=1
+q19 r1 warm pass 4582ms rows=1
+q19 r2 warm pass 5520ms rows=1
+q19 r3 warm pass 3923ms rows=1
+q20 r0 cold pass 4662ms rows=72343
+q20 r1 warm pass 6399ms rows=72343
+q20 r2 warm pass 4463ms rows=72343
+q20 r3 warm pass 3079ms rows=72343
+q22 r0 cold pass 1890ms rows=7
+q22 r1 warm pass 751ms rows=7
+q22 r2 warm pass 2398ms rows=7
+q22 r3 warm pass 2154ms rows=7
+q02 r0 cold REFUSED: ERROR 5024 (53400) at line 1: Query reached its timeout of 300 seconds, please increase the 'query_timeout' session variable and retry 
+restarting cluster...
+q17 r0 cold pass 10809ms rows=1
+q17 r1 warm pass 8372ms rows=1
+q17 r2 warm pass 8556ms rows=1
+q17 r3 warm pass 6445ms rows=1
+q11 r0 cold WEDGE/TIMEOUT (rc=0, cut at 420s)
+restarting cluster...
+== bench complete: /tmp/bench/study1-8cn/timings.csv ==
+=== 8-CN arm complete -> /tmp/bench/study1-8cn/timings.csv ===
