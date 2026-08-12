@@ -1,0 +1,116 @@
+# ============================================================================
+# Engine A (Sirius as StarRocks CN) — TPC-H SF500 on presto-gb200-gcn-17/18
+#
+# Adapted from felipeblazing/sirius@901287a1 bench/sf1000-repro/sirius-sf1000.yaml
+# (GB300, 256 GB HBM, 72-core single-socket Grace, SF1000, Engine D standalone).
+#
+# Derivation of every delta: ./README.md
+# In-repo source config:     ../sf1000-repro/sirius-sf1000.yaml  (PR #1371)
+# Study plan:                ../../TPCH-BENCHMARK-PLAN.md
+#
+# SCOPE: this file targets GB200 (185 GiB HBM). The benchmark has been retargeted to
+# 8x A100 80 GB -- 43% of the HBM. See the A100 re-derivation table in the study plan;
+# usage_limit_fraction, scan_task_batch_size, hash_partition_bytes and
+# max_build_hash_table_bytes all need to shrink again before this runs on A100.
+#
+# THIS BOX:  GB200, 189,471 MiB = 185.03 GiB HBM per GPU, 4 GPUs
+#            144 cores / 2 CPU NUMA nodes, 956.82 GiB LPDDR
+#            /raid = 11.4 TB free on /dev/md0 (local NVMe RAID0)
+#            SF500 dataset = 132 GB at /raid/prestouser/aocsa/tpch_parquet_sf500/
+#
+# TOPOLOGY:  values below are for the 4-CN configuration (1 GPU per CN).
+#            Lines marked [2CN] / [8CN] give the alternates for Study 1.
+#
+# PREREQUISITES — this config alone is not sufficient:
+#   1. Patched libcudf from felipeblazing/cudf (3 commits) via LD_PRELOAD.
+#      Without it the source's q13/q9/q1 gains do not materialise.
+#   2. mkdir -p /raid/prestouser/aocsa/sirius_disk_memory/cn{0,1,2,3}
+#   3. SIRIUS_PIN_TIER_* must be UNSET for cold/streaming runs (Study 2).
+#      Set them to 'gpu' only for the pinned/hot arm (Study 1).
+# ============================================================================
+
+sirius:
+    topology:
+        num_gpus: 1                       # one GPU per CN. [2CN]/[8CN]: still 1
+    memory:
+        gpu:
+            # SOURCE USED 0.95. LOWERED DELIBERATELY.
+            # Engine A adds a 16 GiB SIRIUS_EXCHANGE_STAGING_BYTES arena that is a
+            # bare cudaMalloc OUTSIDE the RMM pool, which usage_limit_fraction does
+            # not account for. The standalone source config has no such arena.
+            #   0.95 x 185.03 GiB = 175.8 GiB, + 16 GiB staging = 191.8 GiB > 185.03  -> OOM
+            #   0.86 x 185.03 GiB = 159.1 GiB, + 16 GiB staging = 175.1 GiB           -> 9.9 GiB headroom
+            # Raise toward 0.90 only after confirming the staging arena is accounted for.
+            usage_limit_fraction: 0.86
+            reservation_limit_fraction: 1.0
+            # The device->host->disk downgrade path. The SF100 audit recorded Engine A
+            # as having "no host spill implemented"; these three settings plus the disk
+            # block below are what close that gap. VERIFY IT ACTUALLY ENGAGES.
+            downgrade_trigger_fraction: 0.9
+            downgrade_stop_fraction: 0.85
+        host:
+            # 160 GiB per CN. 4 CNs x 160 GiB = 640 GiB of 956.82 GiB, leaving ~317 GiB
+            # of page cache = 2.4x the 132 GB dataset. Matches the CN's existing HOST_MEM.
+            # [2CN]: 343597383680 (320 GiB)   [8CN]: 171798691840, 4 CNs per box unchanged
+            capacity_bytes: 171798691840
+            # Source: 392 pools x 8 x 64 MiB = 210.5 GB initial against a 471.2 GB ceiling
+            # (44.7%). Held at the same ratio against our 171.8 GB ceiling -> 143 pools.
+            initial_number_pools: 143      # [2CN]: 286
+            pool_size: 8
+            block_size: 67108864           # 64 MiB
+        disk:
+            disk_id: 0
+            capacity_bytes: 1000000000000  # 1 TB per CN; 4 CNs = 4 TB of 11.4 TB free
+            # PER-CN PATH — must differ per CN or they collide.
+            # Substitute cn0/cn1/cn2/cn3 when generating each CN's derived config.
+            downgrade_root_dirs: "/raid/prestouser/aocsa/sirius_disk_memory/cn0"
+    executor:
+        scan_manager:
+          memory_prefetcher:
+            enable: true                   # not present in our previous CN configs
+            num_threads: 3
+          # Source used 18 on a 72-core single socket, and measured 18 vs 24 as inert
+          # (-0.33%). With 4 CNs each physcpubind'd to 36 cores, 18 would oversubscribe.
+          # [2CN]: 18 (72 cores each)      [8CN]: 9 (36 cores each, same as 4CN)
+          num_threads: 9
+          # The uring datasource, NOT KvikIO. Agrees with scan-defaults-sweep.md and
+          # is required anyway for num_gpus > 1.
+          use_sirius_datasource: true
+          # SWEEP THIS. Source used 4 (GB300). Our own sweep on this box found r=8 best
+          # on NFS and r=32 best on local NVMe. Different media, different optimum.
+          uring_n_reactors: 4
+          # Confirmed by two independent sources: true is a 2.1x regression. Do not flip.
+          enable_prefetch_cache: false
+          # NOT in the source config (it has no explicit use_odirect, so it inherits the
+          # true default). On /raid (local NVMe) scan-defaults-sweep.md measured O_DIRECT
+          # and buffered as equal (231 ms both). Left at the default; if the dataset ever
+          # moves to NFS this MUST become false.
+          # local:
+          #   use_odirect: true
+        pipeline:
+            num_threads: 8                 # source measured 6/8/12 within 0.55% — inert
+            thread_name_prefix: "sirius_pipeline_executor"
+        downgrade:
+            # Source used 1 and barely spilled at 0.95 usage on 256 GB. We run 22% less
+            # HBM, so spill is more likely to be on the critical path. Consider 2-4 if
+            # the downgrade executor shows up as a bottleneck in telemetry.
+            num_threads: 1
+            thread_name_prefix: "sirius_downgrade_executor"
+        task_creator:
+            num_threads: 4
+            thread_name_prefix: "sirius_task_creator"
+    operator_params:
+        # THE ONE KNOB THE SOURCE SAYS MATTERS: 5GB -> 8GB was -1.85% overall
+        # (q4 -25%, q12 -18%), and it is a STEP not a gradient.
+        # But 8GB peaked at 253.9 of 256 GB — 99.2% of HBM. Scaled naively to our
+        # 198.7 GB that is 6.2 GB. SF500 is half of SF1000, which relieves the pressure.
+        # SWEEP {5, 6, 8} GB. Starting at 6GB as the risk-adjusted midpoint.
+        scan_task_batch_size: 6GB
+        max_sort_partition_bytes: 0
+        hash_partition_bytes: 32GB         # source: 16 vs 32 GB = -0.06%, inert
+        concat_batch_bytes: 5GB
+        max_build_hash_table_bytes: 32GB
+    telemetry:
+        enable_quent: false                # true only for diagnostic passes — it costs time
+        output_directory: telemetry_data
+        engine_name: siriusDB

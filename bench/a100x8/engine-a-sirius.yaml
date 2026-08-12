@@ -1,0 +1,144 @@
+# ============================================================================
+# Engine A (Sirius as StarRocks CN) — TPC-H on 8x A100-SXM4-80GB
+#
+# Box:        ./HARDWARE.md          Plan:  ./PLAN.md
+# Lineage:    ../sf1000-repro/sirius-sf1000.yaml  (GB300 256 GB, PR #1371)
+#             ../gb200-4gpu/          (GB200 185 GiB sibling of this file)
+# Retarget:   ../common/RETARGETING.md
+#
+# THIS BOX:   8x A100-SXM4-80GB = 81,920 MiB = 80.0 GiB (85.9 GB) per GPU
+#             240 cores, 2 NUMA nodes (120 cores each), ~1500 GB host RAM
+#             Driver 570.148.08, CUDA 12.8
+#             All GPU pairs NV12; NO GPU->socket affinity; NO GPU HBM NUMA nodes
+#
+# TOPOLOGY:   values below are for the 8-CN arm (1 GPU per CN).
+#             [4CN] / [2CN] / [1CN] give the alternates for the scale-out study.
+#
+# !! THE BINDING CONSTRAINT ON THIS BOX IS PER-GPU MEMORY !!
+#    80.0 GiB is 43% of a GB200. After the out-of-pool staging arena and CUDA
+#    context, the usable pool is ~68 GiB vs the GB200's ~159 GiB. Every
+#    memory-sized knob below is smaller than its GB200 counterpart, and the
+#    reductions are NOT proportional -- they are set by what a single operator
+#    peak must fit in.
+#
+# PREREQUISITES:
+#   1. x86_64 rebuild of Sirius against CUDA 12.8 (the GB200 build is aarch64/13.x)
+#   2. Stage the datasets -- 132 GB (SF500) / 283 GB (SF1000). Set <DATA_ROOT> below.
+#   3. mkdir -p <SPILL_ROOT>/cn{0..7} on local NVMe, never network storage
+#   4. SIRIUS_PIN_TIER_* UNSET for cold runs; 'gpu' only for the pinned arm
+#      (pinning fits only at 4-8 GPUs for SF500, 8 GPUs for SF1000)
+#   5. Pre-warm the NVRTC cache for sm_80 -- ~19 s one-time, else it lands in run 0
+# ============================================================================
+
+sirius:
+    topology:
+        num_gpus: 1                       # one GPU per CN, every arm
+    memory:
+        gpu:
+            # 80.0 GiB - 8 GiB staging arena - ~1 GiB context = 71 GiB.
+            # 0.85 x 80.0 = 68.0 GiB pool, leaving ~3 GiB real headroom.
+            #
+            # DO NOT COPY 0.95 FROM THE GB300 CONFIG, OR 0.86 FROM THE GB200 ONE.
+            # The exchange staging arena is a bare cudaMalloc OUTSIDE the RMM pool;
+            # usage_limit_fraction knows nothing about it. On an 80 GiB card the
+            # default 16 GiB arena is 20% of the device.
+            usage_limit_fraction: 0.85
+            reservation_limit_fraction: 1.0
+            # Device->host->disk downgrade. On the GB200 (Grace C2C, 900 GB/s) this
+            # is a gentle slope. HERE IT IS A CLIFF: host transfers cross PCIe, not
+            # a coherent link. Configure to AVOID spilling, not to spill gracefully.
+            # If telemetry shows sustained downgrade activity, shrink
+            # scan_task_batch_size before raising these.
+            downgrade_trigger_fraction: 0.9
+            downgrade_stop_fraction: 0.85
+        host:
+            # 120 GiB x 8 CNs = 960 GiB of ~1397 GiB, leaving ~437 GiB page cache
+            # = 3.6x the SF500 dataset.
+            # [SF1000]: 107374182400 (100 GiB) -> 800 GiB, ~597 GiB cache = 2.3x
+            # [4CN]: 214748364800 (200 GiB)   [2CN]: 322122547200 (300 GiB)
+            capacity_bytes: 128849018880
+            # Hold the reference ratio (~45% of capacity as initial allocation):
+            # 107 pools x 8 x 64 MiB = 57.5 GB against a 128.8 GB ceiling.
+            initial_number_pools: 107      # [4CN]: 179   [2CN]: 268
+            pool_size: 8
+            block_size: 67108864           # 64 MiB
+        disk:
+            disk_id: 0
+            capacity_bytes: 500000000000   # 500 GB per CN; 8 CNs = 4 TB. CHECK df FIRST.
+            # PER-CN PATH -- must differ per CN or they collide.
+            # Substitute cn0..cn7 when generating each CN's derived config.
+            # MUST be local NVMe. Spilling to network storage makes the cliff a wall.
+            downgrade_root_dirs: "<SPILL_ROOT>/cn0"
+    executor:
+        scan_manager:
+          memory_prefetcher:
+            enable: true
+            num_threads: 3
+          # 30 cores per CN at 8 CNs. The GB300 reference used 18 of 72 (25%);
+          # 25% of 30 is ~8. Source measured 18 vs 24 as INERT (-0.33%), so this
+          # is not worth tuning -- just never exceed the CN's physcpubind width.
+          # [4CN]: 15 (60 cores)   [2CN]: 30 (120 cores)   [1CN]: 30
+          num_threads: 8
+          # The uring datasource, not KvikIO. Required anyway for num_gpus > 1.
+          use_sirius_datasource: true
+          # SWEEP {4, 8, 32}. The GB300 reference used 4; our GB200 sweep found
+          # 8 best on NFS and 32 on local NVMe. This box's storage is unprobed,
+          # so the optimum is unknown -- measure it, do not inherit it.
+          uring_n_reactors: 4
+          # Confirmed by two independent sources: true is a 2.1x REGRESSION.
+          enable_prefetch_cache: false
+          # local:
+          #   use_odirect: true      # fine on local NVMe.
+          #                          # IF THE DATA LANDS ON NETWORK STORAGE, SET false --
+          #                          # O_DIRECT on NFS measured a 12.5x regression.
+        pipeline:
+            num_threads: 8             # measured inert (6/8/12 within 0.55%)
+            thread_name_prefix: "sirius_pipeline_executor"
+        downgrade:
+            # The GB300 reference used 1 and barely spilled at 0.95 on a 256 GB card.
+            # This box has 68 GiB of pool, so spill is far more likely to be on the
+            # critical path -- and it crosses PCIe here. Start at 2.
+            num_threads: 2
+            thread_name_prefix: "sirius_downgrade_executor"
+        task_creator:
+            num_threads: 4
+            thread_name_prefix: "sirius_task_creator"
+    operator_params:
+        # THE ONE KNOB THE REFERENCE SAYS MATTERS. It is a STEP, not a gradient:
+        # 5GB -> 8GB was -1.85% suite (q4 -25%, q12 -18%), 10GB added nothing.
+        # But 8GB peaked at 253.9 of 256 GB on the GB300 -- 99.2% of HBM.
+        # Scaled to 85.9 GB that is ~2.7 GB. SF500 across 8 GPUs relieves it further.
+        # SWEEP {2, 3, 4} GB. Starting at 3GB.
+        scan_task_batch_size: 3GB
+        max_sort_partition_bytes: 0        # 0 = auto (33% of GPU memory)
+        # GB300/GB200 used 32GB. That is 47% of this card's ENTIRE pool -- a single
+        # partition would evict everything else. 8GB = 12% of pool. Sweep to 16GB
+        # only if partitioning shows up as a bottleneck.
+        hash_partition_bytes: 8GB
+        concat_batch_bytes: 2GB            # GB200: 5GB
+        max_build_hash_table_bytes: 8GB    # GB200: 32GB
+    telemetry:
+        enable_quent: false                # true only for diagnostic passes
+        output_directory: telemetry_data
+        engine_name: siriusDB
+
+# ============================================================================
+# COMPANION SETTINGS THAT DO NOT LIVE IN THIS FILE
+#
+#   SIRIUS_EXCHANGE_STAGING_BYTES = 8GiB     <-- NOT 16GiB. See ./HARDWARE.md.
+#       Tension: q17/q21 stage ~4.75-15 GB/CN at SF500 on 8 CNs, so 8 GiB may be
+#       exceeded at the top end. Raising it shrinks the pool 1:1. There is no
+#       comfortable setting; treat q17/q21 failures here as a measurement.
+#
+#   UCX_TLS = cuda_copy,cuda_ipc,tcp,self   <-- cuda_ipc is LOAD-BEARING.
+#       Without it nixl falls off a 1349x cliff.
+#
+#   SIRIUS_QUERY_WATCHDOG_SECS = <nonzero>   <-- currently 0 = OFF everywhere.
+#       A wedge should report, not consume the full timeout and poison what follows.
+#
+#   SET expression_evaluator_strategy = 'ast_jit'
+#       -4.17% suite for ZERO code. src/config.cpp:27 ships the slow AST_INTERPRET.
+#       Session setting, not YAML -- confirm the CN applies it.
+#       NVRTC cache lives at $HOME/.cudf/$VERSION/$ARCH and persists across restarts;
+#       sm_80 starts cold, so pre-warm it or run 0 eats ~19 s of compilation.
+# ============================================================================
