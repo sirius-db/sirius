@@ -84,8 +84,7 @@ sirius_physical_grouped_aggregate::get_count_distinct_local_output_types() const
   auto local_types = types;
   for (size_t slot_idx = 0; slot_idx < aggregate_slots.size(); ++slot_idx) {
     if (aggregate_slots[slot_idx].is_count_distinct) {
-      local_types[aggregate_offset + slot_idx] =
-        sirius::logical_type::make(sirius::type_id::LIST);
+      local_types[aggregate_offset + slot_idx] = sirius::logical_type::make(sirius::type_id::LIST);
     }
   }
   return local_types;

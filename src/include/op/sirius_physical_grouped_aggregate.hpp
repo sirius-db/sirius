@@ -96,8 +96,7 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
 
   //! Runtime schema of the local COUNT(DISTINCT) accumulator. The local aggregate and PARTITION
   //! carry LIST sets; MERGE_GROUP_BY later converts those sets to the declared BIGINT count.
-  [[nodiscard]] duckdb::vector<sirius::logical_type>
-  get_count_distinct_local_output_types() const;
+  [[nodiscard]] duckdb::vector<sirius::logical_type> get_count_distinct_local_output_types() const;
 
   // Source interface
   bool is_source() const override { return true; }
