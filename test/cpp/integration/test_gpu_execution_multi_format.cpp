@@ -603,6 +603,14 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
 
   /// Non-data manifest entries (V2 positional, V2 equality, V3 deletion vectors — the last
   /// reported as content='POSITION_DELETES', file_format='PUFFIN') at the snapshot being read.
+  ///
+  /// ⚠️ The 'EXISTING' here is the `content` column's, where it means "is a DATA file" — NOT the
+  /// `status` column's, where it means "carried over from an earlier snapshot". Both columns use
+  /// that string for unrelated things.
+  ///
+  /// Counts entries regardless of status, so this is a count of what the manifest LISTS, not of
+  /// what still applies. That is deliberate: it keeps the canary honest about a table whose only
+  /// delete entry has been retired, which still lists one and applies none.
   int64_t delete_file_count(const std::string& table_path, const std::string& extra_args = "")
   {
     auto result = con->Query("SELECT count(*) FROM iceberg_metadata('" + table_path + "'" +

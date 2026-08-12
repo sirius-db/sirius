@@ -193,10 +193,16 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
                              "': " + (meta_result ? meta_result->GetError() : "null result"));
   }
 
-  static constexpr auto kPositionDeletes = "POSITION_DELETES";
-  static constexpr auto kEqualityDeletes = "EQUALITY_DELETES";
-  static constexpr auto kExisting        = "EXISTING";
-  static constexpr auto kFormatPuffin    = "PUFFIN";
+  // Values of iceberg_metadata()'s `content` column -- what KIND of file an entry describes.
+  //
+  // ⚠️ `content` and `status` both use the string "EXISTING" for unrelated things. On `status`
+  // (which the query above filters on) it means "carried over from an earlier snapshot". Here it
+  // means "this is a DATA file" -- DuckDB's name for what the Iceberg spec calls DATA. Reading
+  // one as the other silently reclassifies every data file as a delete file, or vice versa.
+  static constexpr auto kPositionDeletes  = "POSITION_DELETES";
+  static constexpr auto kEqualityDeletes  = "EQUALITY_DELETES";
+  static constexpr auto kContentDataFile  = "EXISTING";
+  static constexpr auto kFormatPuffin     = "PUFFIN";
 
   // iceberg_metadata() returns one PUFFIN row per deletion vector, but read_avro returns ALL of
   // a manifest's vectors at once — so a manifest must be expanded exactly once. Keyed on the
@@ -234,8 +240,19 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
         entry.content         = 2;
         entry.sequence_number = seq;
         result.equality_delete_entries.push_back(std::move(entry));
-      } else if (content == kExisting) {
+      } else if (content == kContentDataFile) {
         result.data_file_sequence_numbers[filepath] = seq;
+      } else {
+        // Refuse rather than skip. "EXISTING" is DuckDB's name for the spec's DATA, so if a
+        // future iceberg extension corrects it, this branch is the difference between the scan
+        // declining and it quietly collecting NO data-file sequence numbers -- which is what
+        // decides whether an equality delete applies to a file. Silently ignoring an unknown
+        // content kind would also drop a delete class Iceberg adds later.
+        throw std::runtime_error(
+          "[iceberg] iceberg_metadata() returned an unrecognized content kind '" + content +
+          "' for '" + filepath +
+          "'; this scan path knows only POSITION_DELETES, EQUALITY_DELETES and EXISTING (data), "
+          "and guessing which one it resembles would risk applying or skipping deletes wrongly");
       }
     }
   }
