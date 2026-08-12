@@ -51,18 +51,16 @@ bool scan_decode_request::selects_rows() const noexcept
 
 namespace {
 
-// Thread-local pool of 4 CUDA streams for cross-column decode parallelism.
+// Streams for cross-column decode parallelism, one pool per thread and device.
 // Work is submitted from the calling thread so cuCascade memory-reservation
 // tracking (attached to the calling thread) sees all allocations.
 // 4 is not a configuration parameter — it matches the typical SM occupancy
 // sweet spot for column-parallel decode without thread-spawn overhead.
+constexpr std::size_t kDecodeStreams = 4;
+
 simpatico::stream_pool& decode_pool()
 {
-  thread_local simpatico::stream_pool pool;
-  if (pool.streams.empty()) {
-    if (!pool.init(4)) { throw std::runtime_error("[compressed_scan] stream_pool init failed"); }
-  }
-  return pool;
+  return simpatico::thread_device_stream_pool(kDecodeStreams);
 }
 
 //===----------------------------------------------------------------------===//
