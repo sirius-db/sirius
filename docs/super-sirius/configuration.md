@@ -325,7 +325,6 @@ and transport use one trust policy; there are no separate REST YAML controls.
 | `chunk_size` | bytes | 8Mi | Target bytes per ranged GET (scatter/device-staging paths). |
 | `max_n_chunks` | int | 16 | Max file-adjacent segments fused into one scatter GET. |
 | `max_read_split` | int | 16 | Max parallel ranged GETs for one contiguous host read (reads < 2 MiB stay a single GET). |
-| `bounce_block_size` | bytes | 0 | Bounce-slot size for the reactor-staged device path (0 disables that path; normally set from the staging resource at runtime). |
 | `upkeep_interval_ms` | int (ms) | 15000 | Idle-connection keepalive interval (`curl_easy_upkeep`; 0 disables). |
 | `conn_max_age_s` | int (seconds) | 20 | Max age curl may reuse a pooled connection (`CURLOPT_MAXAGE_CONN`; 0 = curl default). |
 | `retry_backoff_base_ms` | int (ms) | 50 | Base backoff between retries. |

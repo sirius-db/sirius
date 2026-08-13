@@ -350,3 +350,22 @@ TEST_CASE("sirius_config still loads unrelated REST YAML fields",
   std::error_code ec;
   std::filesystem::remove(path, ec);
 }
+
+TEST_CASE("sirius_config keeps REST bounce sizing internal", "[scan_manager][config][rest]")
+{
+  auto const path = std::filesystem::temp_directory_path() / "sirius_rest_bounce_size.yaml";
+  write_yaml(path,
+             "sirius:\n"
+             "  executor:\n"
+             "    scan_manager:\n"
+             "      rest:\n"
+             "        bounce_block_size: 4MiB\n");
+
+  sirius::sirius_config cfg;
+  REQUIRE_THROWS_WITH(cfg.load_from_file(path),
+                      Catch::Contains("unknown config key: 'bounce_block_size' in rest"));
+  CHECK(cfg.get_scan_manager_config().rest.bounce_block_size == 0);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
