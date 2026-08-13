@@ -567,6 +567,19 @@ bool check_variant_contract(const VariantLaunchArgs& va,
   return true;
 }
 
+// The invariant half of every masked launch. Bundled because each public
+// launcher otherwise repeats the same six parameters, and because the contract
+// check and the launch belong together: a launcher that skipped the check would
+// bind a missing pointer and fault.
+struct masked_launch {
+  codegen::jit::FusedTree const& tree;
+  codegen::jit::LabeledBuffers& labeled;
+  char const* dtype;
+  std::int64_t num_rows;  // ROW-space count the mask describes
+  ::sirius::codegen::selection_mask const& mask;
+  rmm::cuda_stream_view stream;
+};
+
 // Storage for the trailing kernel arguments, bound by TAG rather than by
 // variant.  The ORDER comes from the renderer (DecodeKernelSpec::trailing),
 // which emitted the matching declarations from the same table — so this side
@@ -876,6 +889,25 @@ bool launch_decode_fused_tree(codegen::jit::FusedTree const& tree,
     tree, labeled, dtype, num_rows, out, stream, VariantLaunchArgs{});
 }
 
+namespace {
+
+// Check the shape's contract, then launch it. `kernel_rows` is the domain the
+// KERNEL runs over, which differs from the mask's row space only for the
+// str_split metadata shape (offsets = rows + 1).
+bool check_and_launch(masked_launch const& m,
+                      VariantLaunchArgs const& va,
+                      void* out,
+                      char const* what,
+                      std::int64_t kernel_rows)
+{
+  if (!check_variant_contract(va, &m.mask, m.num_rows, out, m.dtype, what)) { return false; }
+  return launch_decode_fused_tree_impl(m.tree, m.labeled, m.dtype, kernel_rows, out, m.stream, va);
+}
+
+CUdeviceptr dev(void const* p) { return reinterpret_cast<CUdeviceptr>(const_cast<void*>(p)); }
+
+}  // namespace
+
 // Range ballot: fused decode + range predicate -> selection-mask words (masked_launch.hpp).
 bool launch_decode_fused_tree_mask_out(codegen::jit::FusedTree const& tree,
                                        codegen::jit::LabeledBuffers& labeled,
@@ -889,13 +921,10 @@ bool launch_decode_fused_tree_mask_out(codegen::jit::FusedTree const& tree,
   va.shape    = cdj::kShapeMaskOut;
   va.pred_lo  = pred.lo;
   va.pred_hi  = pred.hi;
-  va.sel_mask = reinterpret_cast<CUdeviceptr>(mask.words);
-  if (!check_variant_contract(
-        va, &mask, num_rows, mask.words, dtype, "launch_decode_fused_tree_mask_out")) {
-    return false;
-  }
-  return launch_decode_fused_tree_impl(
-    tree, labeled, dtype, num_rows, /*out=*/mask.words, stream, va);
+  va.sel_mask = dev(mask.words);
+  // The `out` slot carries the mask words: a ballot writes no column.
+  return check_and_launch(
+    {tree, labeled, dtype, num_rows, mask, stream}, va, mask.words, "range ballot", num_rows);
 }
 
 // Compacting value decode, either enumeration (masked_launch.hpp). The
@@ -913,25 +942,22 @@ bool launch_decode_fused_tree_compacted(codegen::jit::FusedTree const& tree,
   bool const by_index = row_indices != nullptr;
   VariantLaunchArgs va;
   va.shape         = by_index ? cdj::kShapeIndexConsume : cdj::kShapeMaskConsume;
-  va.chunk_offsets = reinterpret_cast<CUdeviceptr>(mask.chunk_offsets);
+  va.chunk_offsets = dev(mask.chunk_offsets);
   if (by_index) {
-    va.row_indices = reinterpret_cast<CUdeviceptr>(const_cast<std::int32_t*>(row_indices));
+    va.row_indices = dev(row_indices);
   } else {
-    va.sel_mask = reinterpret_cast<CUdeviceptr>(mask.words);
+    va.sel_mask = dev(mask.words);
   }
-  if (!check_variant_contract(va,
-                              &mask,
-                              num_rows,
-                              out,
-                              dtype,
-                              by_index ? "launch_decode_fused_tree_compacted (index walk)"
-                                       : "launch_decode_fused_tree_compacted (mask walk)")) {
-    return false;
-  }
-  return launch_decode_fused_tree_impl(tree, labeled, dtype, num_rows, out, stream, va);
+  return check_and_launch(
+    {tree, labeled, dtype, num_rows, mask, stream},
+    va,
+    out,
+    by_index ? "compacted decode (index walk)" : "compacted decode (mask walk)",
+    num_rows);
 }
 
-// str_split phase 1: masked survivor metadata (masked_launch.hpp).
+// str_split phase 1: survivor metadata (masked_launch.hpp). The kernel runs over
+// the OFFSETS domain (rows + 1) while the mask stays row-space.
 bool launch_decode_fused_tree_str_split_meta(codegen::jit::FusedTree const& tree,
                                              codegen::jit::LabeledBuffers& labeled,
                                              char const* dtype,
@@ -943,51 +969,40 @@ bool launch_decode_fused_tree_str_split_meta(codegen::jit::FusedTree const& tree
 {
   VariantLaunchArgs va;
   va.shape         = cdj::kShapeStrSplitMeta;
-  va.sel_mask      = reinterpret_cast<CUdeviceptr>(mask.words);
-  va.chunk_offsets = reinterpret_cast<CUdeviceptr>(mask.chunk_offsets);
-  va.len_out       = reinterpret_cast<CUdeviceptr>(lengths_out);
-  // The mask is ROW-space (string rows), while the kernel's `n` is the offsets
-  // count below — so the contract is checked against num_string_rows.
-  if (!check_variant_contract(va,
-                              &mask,
-                              num_string_rows,
-                              src_offsets_out,
-                              dtype,
-                              "launch_decode_fused_tree_str_split_meta")) {
-    return false;
-  }
-  // The kernel runs over the OFFSETS domain: n = string rows + 1 (mask and
-  // chunk_offsets stay row-space; row chunks and offsets chunks are aligned).
-  return launch_decode_fused_tree_impl(
-    tree, labeled, dtype, num_string_rows + 1, src_offsets_out, stream, va);
+  va.sel_mask      = dev(mask.words);
+  va.chunk_offsets = dev(mask.chunk_offsets);
+  va.len_out       = dev(lengths_out);
+  return check_and_launch({tree, labeled, dtype, num_string_rows, mask, stream},
+                          va,
+                          src_offsets_out,
+                          "str_split metadata",
+                          num_string_rows + 1);
 }
 
-// str_split phase 2: fixed masked char-range copy (masked_launch.hpp).  Constant
-// source — no tree, no per-column state; compiled once via the shared JIT
-// cache (in-memory + on-disk cubin) like every rendered kernel.
-namespace {
-
-constexpr const char* kMaskedCharCopySrc = R"src(
-extern "C" __global__ void simpatico_masked_char_copy(
-    const unsigned char* __restrict__ chars,
-    const long long* __restrict__ src_offsets,
-    const int* __restrict__ out_offsets,
-    long long n_survivors,
-    unsigned char* __restrict__ out)
+// Dictionary gather: constant-width key gather (masked_launch.hpp).
+bool launch_decode_fused_tree_dict_gather(codegen::jit::FusedTree const& tree,
+                                          codegen::jit::LabeledBuffers& labeled,
+                                          char const* dtype,
+                                          std::int64_t num_rows,
+                                          ::sirius::codegen::selection_mask const& mask,
+                                          void const* keys_chars,
+                                          std::int32_t key_width,
+                                          void* out_chars,
+                                          rmm::cuda_stream_view stream)
 {
-    const long long stride = static_cast<long long>(gridDim.x) * blockDim.x;
-    for (long long j = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-         j < n_survivors; j += stride) {
-        const long long s = src_offsets[j];
-        const int o       = out_offsets[j];
-        const int len     = out_offsets[j + 1] - o;
-        for (int b = 0; b < len; ++b) out[o + b] = chars[s + b];
-    }
+  VariantLaunchArgs va;
+  va.shape         = cdj::kShapeDictGather;
+  va.sel_mask      = dev(mask.words);
+  va.chunk_offsets = dev(mask.chunk_offsets);
+  va.keys_chars    = dev(keys_chars);
+  va.key_width     = key_width;
+  return check_and_launch(
+    {tree, labeled, dtype, num_rows, mask, stream}, va, out_chars, "dictionary gather", num_rows);
 }
-)src";
 
-}  // namespace
-
+// str_split phase 2: fixed masked char-range copy (masked_launch.hpp).  The
+// source comes from the renderer like every other kernel's — no tree behind it,
+// so it takes no arguments — and compiles through the same JIT cache.
 bool launch_masked_char_copy(void const* chars,
                              std::int64_t const* src_offsets,
                              std::int32_t const* out_offsets,
@@ -1001,8 +1016,9 @@ bool launch_masked_char_copy(void const* chars,
     std::fprintf(stderr, "simpatico::codegen: launch_masked_char_copy: null input\n");
     return false;
   }
-  const jit::CompiledKernel* kernel = compile_rendered(kMaskedCharCopySrc,
-                                                       "simpatico_masked_char_copy",
+  const cdj::DecodeKernelSpec spec  = cdj::render_masked_char_copy();
+  const jit::CompiledKernel* kernel = compile_rendered(spec.source,
+                                                       spec.entry_symbol,
                                                        /*default_device=*/false,
                                                        "CODEGEN_JIT_DUMP_DECODE_SOURCE",
                                                        "masked char copy");
@@ -1014,7 +1030,7 @@ bool launch_masked_char_copy(void const* chars,
   CUdeviceptr d_out    = reinterpret_cast<CUdeviceptr>(out_chars);
   long long n          = static_cast<long long>(n_survivors);
   void* args[]         = {&d_chars, &d_src, &d_offs, &n, &d_out};
-  const unsigned block = 256;
+  const unsigned block = static_cast<unsigned>(spec.block_x);
   const unsigned grid =
     static_cast<unsigned>(std::min<std::int64_t>(8192, (n_survivors + block - 1) / block));
   SIMPATICO_CU_CHECK(cuLaunchKernel(kernel->func_for_current_device(),
@@ -1033,30 +1049,6 @@ bool launch_masked_char_copy(void const* chars,
   SIMPATICO_CUDA_CHECK(
     cudaStreamSynchronize(stream.value()), false, "masked char copy: stream sync failed");
   return true;
-}
-
-// Dictionary gather: constant-width key gather (masked_launch.hpp).
-bool launch_decode_fused_tree_dict_gather(codegen::jit::FusedTree const& tree,
-                                          codegen::jit::LabeledBuffers& labeled,
-                                          char const* dtype,
-                                          std::int64_t num_rows,
-                                          ::sirius::codegen::selection_mask const& mask,
-                                          void const* keys_chars,
-                                          std::int32_t key_width,
-                                          void* out_chars,
-                                          rmm::cuda_stream_view stream)
-{
-  VariantLaunchArgs va;
-  va.shape         = cdj::kShapeDictGather;
-  va.sel_mask      = reinterpret_cast<CUdeviceptr>(mask.words);
-  va.chunk_offsets = reinterpret_cast<CUdeviceptr>(mask.chunk_offsets);
-  va.keys_chars    = reinterpret_cast<CUdeviceptr>(const_cast<void*>(keys_chars));
-  va.key_width     = key_width;
-  if (!check_variant_contract(
-        va, &mask, num_rows, out_chars, dtype, "launch_decode_fused_tree_dict_gather")) {
-    return false;
-  }
-  return launch_decode_fused_tree_impl(tree, labeled, dtype, num_rows, out_chars, stream, va);
 }
 
 }  // namespace simpatico

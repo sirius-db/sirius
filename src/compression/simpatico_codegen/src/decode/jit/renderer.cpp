@@ -1134,7 +1134,8 @@ void Walker::emit_rle_producer(const ::codegen::jit::FusedTree& node,
             << "            }\n"
             << "        } " << cread << " { packed_" << c_child_id << ", bpbits_" << c_child_id
             << ", bpmin_" << c_child_id << ", bpbase_" << c_child_id << " };\n"
-            << "        ::codegen::block_rle_decompress_fv<" << elem_type << ">(\n"
+            << "        ::codegen::block_rle_decompress_fv<" << elem_type << ", "
+            << ::codegen::kChunkSize << ", " << tbs_ << ">(\n"
             << "            " << vread << ", " << cread << ",\n"
             << "            " << sh_starts << ",\n"
             << "            " << nruns << ", static_cast<int32_t>(" << len << "), (" << dst
@@ -1143,7 +1144,8 @@ void Walker::emit_rle_producer(const ::codegen::jit::FusedTree& node,
       // Runs child needs materialisation; use SmemCountsReader functor.
       emit_producer(*rit->second, sh_counts, nruns, "int32_t");
       body_ << "        __syncthreads();\n"
-            << "        ::codegen::block_rle_decompress_fv<" << elem_type << ">(\n"
+            << "        ::codegen::block_rle_decompress_fv<" << elem_type << ", "
+            << ::codegen::kChunkSize << ", " << tbs_ << ">(\n"
             << "            " << vread << ",\n"
             << "            ::codegen::detail::SmemCountsReader{" << sh_counts << "},\n"
             << "            " << sh_starts << ",\n"
@@ -1534,6 +1536,33 @@ bool shape_is_supported(DecodeShape shape)
   // the moment their emitters land; see DECODE_PUSHDOWN_PLAN.md section 7.
   return shape == kShapePlain || shape == kShapeMaskOut || shape == kShapeMaskConsume ||
          shape == kShapeIndexConsume || shape == kShapeDictGather || shape == kShapeStrSplitMeta;
+}
+
+DecodeKernelSpec render_masked_char_copy()
+{
+  DecodeKernelSpec spec;
+  spec.entry_symbol = "simpatico_masked_char_copy";
+  spec.block_x      = 256;
+  spec.note         = "fixed masked char-range copy (str_split phase 2)";
+  spec.source       = R"src(
+extern "C" __global__ void simpatico_masked_char_copy(
+    const unsigned char* __restrict__ chars,
+    const long long* __restrict__ src_offsets,
+    const int* __restrict__ out_offsets,
+    long long n_survivors,
+    unsigned char* __restrict__ out)
+{
+    const long long stride = static_cast<long long>(gridDim.x) * blockDim.x;
+    for (long long j = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+         j < n_survivors; j += stride) {
+        const long long s = src_offsets[j];
+        const int o       = out_offsets[j];
+        const int len     = out_offsets[j + 1] - o;
+        for (int b = 0; b < len; ++b) out[o + b] = chars[s + b];
+    }
+}
+)src";
+  return spec;
 }
 
 DecodeKernelSpec render(const ::codegen::jit::FusedTree& tree,

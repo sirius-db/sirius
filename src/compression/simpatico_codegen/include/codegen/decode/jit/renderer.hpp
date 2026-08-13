@@ -193,6 +193,14 @@ using ::codegen::jit::RenderError;
 // `shape` selects the enumerator + consumer (see DecodeShape above); the
 // default renders the plain full-column decode.  Unsupported points of the
 // product are rejected with RenderError (see shape_is_supported).
+// The one kernel with no tree behind it: str_split phase 2, copying each
+// survivor's byte range out of the RAW chars buffer.  Rendered rather than kept
+// as a string constant in the launcher, so ALL emitted CUDA comes from this
+// file and is reachable by the dump-and-diff check the other shapes use.
+// `buffers` is empty and `trailing` unused — the launcher binds its five
+// arguments positionally, as the doc comment on it states.
+DecodeKernelSpec render_masked_char_copy();
+
 DecodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
                         const std::string& element_dtype,
                         std::int32_t num_chunks,

@@ -18,6 +18,8 @@
 
 #pragma once
 
+#include "codegen/jit/fused_tree.hpp"
+
 #include <cudf/column/column_view.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
@@ -36,11 +38,13 @@ class column;
 
 namespace sirius::codegen {
 
-// Number of rows covered by one CNT chunk (one chunk_offsets entry). MUST match
-// the simpatico bitpack chunk (codegen::kChunkSize): a mask-consuming decode
+// Number of rows covered by one CNT chunk (one chunk_offsets entry). This IS
+// the simpatico bitpack chunk, not merely equal to it: a mask-consuming decode
 // addresses its packed bits per chunk and uses chunk_offsets[chunk] as that
-// chunk's base in the compacted output, so the two chunkings are the same one.
-inline constexpr int64_t SELECTION_CHUNK_ROWS = 1024;
+// chunk's base in the compacted output, so a selection chunk and a bitpack
+// chunk are the same 1024 rows. Derived rather than restated, because the two
+// silently diverging would mean every mask bit addressing the wrong row.
+inline constexpr int64_t SELECTION_CHUNK_ROWS = ::codegen::kChunkSize;
 
 // 1 bit per row, 1 = survivor. Words are uint32_t, row r -> word r/32, bit r%32.
 // Tail bits beyond num_rows MUST be zero (CNT and gather rely on it).
