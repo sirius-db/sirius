@@ -704,9 +704,10 @@ TEST_CASE("DuckDB setting rejects unknown Sirius log levels without mutation",
   auto invalid = con.Query("SET sirius_log_level = 'verbose'");
   REQUIRE(invalid != nullptr);
   REQUIRE(invalid->HasError());
-  REQUIRE_THAT(invalid->GetError(),
-               Catch::Contains(
-                 "sirius_log_level must be one of: trace, debug, info, warn, error, critical, off"));
+  REQUIRE_THAT(
+    invalid->GetError(),
+    Catch::Contains(
+      "sirius_log_level must be one of: trace, debug, info, warn, error, critical, off"));
 
   auto after_invalid = con.Query("SELECT current_setting('sirius_log_level')::VARCHAR");
   REQUIRE(after_invalid != nullptr);
