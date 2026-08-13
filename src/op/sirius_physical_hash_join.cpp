@@ -26,6 +26,7 @@
 #include "cudf/join/mixed_join.hpp"
 #include "cudf/null_mask.hpp"
 #include "cudf/reduction.hpp"
+#include "cudf/reduction/distinct_count.hpp"
 #include "cudf/table/table_view.hpp"
 #include "cudf/transform.hpp"
 #include "cudf/types.hpp"
@@ -1462,6 +1463,41 @@ static bool table_has_any_null(cudf::table_view const& keys)
   return std::ranges::any_of(keys, [](auto const& col) { return col.null_count() > 0; });
 }
 
+/// @brief Largest build cudf::distinct_count can answer for. Hard limitation.
+static constexpr cudf::size_type k_max_distinct_count_rows =
+  std::numeric_limits<cudf::size_type>::max() / 2;
+
+/// @brief Largest build the runtime distinctness test is allowed to probe at all. Heuristic
+/// limitation.
+static constexpr cudf::size_type k_max_distinct_probe_rows = 128 * 1024 * 1024;
+static_assert(k_max_distinct_probe_rows <= k_max_distinct_count_rows);
+
+/// @brief Number of rows with which to sample the keys cheaply for a quick refutation of
+/// non-distinctness. The static set for the sample will fit in the L2 cache for recent
+/// architectures at 16MB.
+static constexpr cudf::size_type k_distinct_refute_sample_rows = 1024 * 1024;
+
+/// @brief Exact runtime test that the build keys hold no duplicate rows.
+/// @note Reads a count back to the host, so it synchronizes the stream.
+static bool build_keys_are_distinct(cudf::table_view const& build_keys,
+                                    cudf::null_equality nulls_equal,
+                                    rmm::cuda_stream_view stream)
+{
+  auto const num_rows = build_keys.num_rows();
+  if (num_rows == 1) { return true; }
+  if (build_keys.num_columns() == 0 || num_rows <= 0 || num_rows > k_max_distinct_probe_rows) {
+    return false;
+  }
+  // Guard the full uniqueness test on a sample.
+  if (num_rows > 4 * k_distinct_refute_sample_rows) {
+    auto const prefix = cudf::slice(build_keys, {0, k_distinct_refute_sample_rows}, stream).front();
+    if (cudf::distinct_count(prefix, nulls_equal, stream) != k_distinct_refute_sample_rows) {
+      return false;
+    }
+  }
+  return cudf::distinct_count(build_keys, nulls_equal, stream) == num_rows;
+}
+
 /// @brief Thread-safe check-and-set for the join-wide _build_has_null sentinel.
 ///
 /// Sentinel encoding: -1 = unset, 0 = false, 1 = true.
@@ -1661,17 +1697,17 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
           SIRIUS_LOG_DEBUG("sirius_physical_hash_join id {}: using filtered_join (BUILD_PROBE {})",
                            this->get_operator_id(),
                            duckdb::JoinTypeToString(join_type));
-        } else if (unique_build_keys &&
-                   (join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT)) {
-          // The planner only sets unique_build_keys for pure-equal joins (the
-          // build-uniqueness gate in sirius_plan_comparison_join excludes
-          // not_distinct_from), so compare_nulls() is UNEQUAL here -- the
-          // distinct_hash_join path is never asked to be null-safe.
+        } else if ((join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT) &&
+                   (unique_build_keys ||
+                    (runtime_distinct_build_probe &&
+                     compare_nulls() == cudf::null_equality::UNEQUAL &&
+                     build_keys_are_distinct(build_keys, compare_nulls(), stream)))) {
           slot.distinct_hash_table =
             std::make_unique<cudf::distinct_hash_join>(build_keys, compare_nulls(), 0.5, stream);
           SIRIUS_LOG_DEBUG(
-            "sirius_physical_hash_join id {}: using distinct_hash_join (BUILD_PROBE)",
-            this->get_operator_id());
+            "sirius_physical_hash_join id {}: using distinct_hash_join (BUILD_PROBE, {})",
+            this->get_operator_id(),
+            unique_build_keys ? "proven unique" : "runtime-distinct");
         } else {
           slot.hash_table = std::make_unique<cudf::hash_join>(build_keys, compare_nulls(), stream);
         }

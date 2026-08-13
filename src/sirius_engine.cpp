@@ -220,7 +220,6 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   const pipeline::pipeline_build_context build_ctx{
     sirius_ctx_ptr->get_telemetry_context(),
     duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context),
-    static_cast<int>(sirius_ctx_ptr->get_config().get_hw_topology().gpus.size()),
     std::move(active_gpu_ids)};
 
   // The collector is added after planning, so refresh parent pointers before marking fusion.

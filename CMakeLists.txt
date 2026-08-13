@@ -269,6 +269,7 @@ set(EXTENSION_SOURCES
     src/expression_evaluator/specializations/reference.cpp
     # Execution primitives (slot-based backpressure / completion tracking)
     src/exec/admission_control.cpp
+    src/exec/batch_stream.cpp
     # I/O adapters (Phase 19 — io_uring + sirius_datasource)
     src/io/datasource_factory.cpp
     src/io/io_context.cpp
@@ -629,8 +630,8 @@ set(TEST_SOURCES
     test/cpp/creator/test_task_creator.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
+    test/cpp/exec/test_batch_stream.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
-    test/cpp/exec/test_exchange_channel.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_multi_index_priority_queue.cpp
@@ -751,6 +752,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_get_next_ports_after_sink.cpp
     test/cpp/pipeline/test_merge_pipeline_fusion.cpp
     test/cpp/pipeline/test_partition_build_pipelines.cpp
+    test/cpp/pipeline/test_pipeline_build_context.cpp
     test/cpp/pipeline/test_pipeline_dynamic_filter_native_shape.cpp
     test/cpp/pipeline/test_pipeline_schedule_canonical.cpp
     test/cpp/pipeline/test_plan_printer.cpp

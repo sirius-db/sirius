@@ -50,6 +50,7 @@ void validate_operator_output_types(const op::operator_data* data,
                                     const op::sirius_physical_operator& op)
 {
   if (data == nullptr) { return; }
+  if (!op.declared_output_schema_is_runtime_schema()) { return; }
   auto* pipelineable_data = dynamic_cast<const op::pipelineable_operator_data*>(data);
   if (pipelineable_data == nullptr) { return; }
   const auto& expected_types = op.get_types();
@@ -71,8 +72,6 @@ void validate_operator_output_types(const op::operator_data* data,
     if (!batch) { continue; }
     cudf::table_view tbl = get_cudf_table_view(*batch);
     if (static_cast<size_t>(tbl.num_columns()) != expected_types.size()) {
-      // bobbi (todo): delim join will return this warning for now, but there is no bug here, so we
-      // can ignore it. we can do something about this after gtc
       SIRIUS_LOG_WARN(
         "gpu_pipeline_task: operator '{}' (id={}) output batch {} column count mismatch: got "
         "{}, expected {}",

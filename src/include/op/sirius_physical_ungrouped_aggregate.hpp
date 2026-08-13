@@ -44,6 +44,10 @@ class sirius_physical_ungrouped_aggregate : public sirius_physical_operator {
   //! The aggregates that have to be computed
   duckdb::vector<std::unique_ptr<sirius::ast::node>> aggregates;
 
+  //! Schema emitted by the per-task partial aggregate. AVG expands to SUM + COUNT here; the
+  //! MERGE_AGGREGATE above this operator collapses those carriers to the declared SQL schema.
+  [[nodiscard]] duckdb::vector<sirius::logical_type> get_local_output_types() const;
+
   bool is_source() const override { return true; }
 
  public:
