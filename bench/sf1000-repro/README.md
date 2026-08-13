@@ -39,6 +39,22 @@ pixi run bash test/tpch_performance/generate_tpch_refresh.sh 1000 9   # one-time
 DB=/path/to/tpch_sf1000.duckdb pixi run bash bench/sf1000-repro/run-power.sh
 ```
 
+### run-power.sh knobs
+
+All knobs are environment variables with working defaults; extra arguments after the script name
+are forwarded to `tpch_power_throughput.py` verbatim (e.g. `--scratch-db`, `--update-set-offset`).
+
+| knob | default | effect |
+|---|---|---|
+| `MODE` | `both` | `power` \| `throughput` \| `both` — which phases to run and score. |
+| `QUENT` | `0` | `1`: capture Quent telemetry via a derived config (`enable_quent`, per-run `QUENT_DIR`). Adds a small per-query overhead — leave off for record attempts. The GPU-pool probe stays on the original config so the capture never sees a second same-named engine. |
+| `NSYS` | `0` | `1`: run under nsys with per-query cudaProfilerApi repeat ranges (`--nsys-per-query`), reports + `nsys_manifest.json` under `NSYS_DIR`. Analysis runs only — never quote nsys-wrapped scores. Incompatible with `ROLLBACK=1`. |
+| `ROLLBACK` | `0` | `1`: append `--rollback-scratch` and delete `<scratch>.wal` after the run — refresh mutations stay in the WAL, so discarding it restores the scratch DB to content-pristine without a 440 GB re-copy. Requires passing `--scratch-db <path>` in the forwarded args. |
+| `PROBE_TRIES` | `20` | Attempts (60 s apart) of the GPU-pool probe before giving up. On a shared box the pool reservation fails for minutes after another workload exits (lazy driver reclaim) — the failing LOAD itself is the only reliable gate; nvidia-smi lies. |
+| `SF`, `DB`, `REFRESH` | SF1000 paths | Scale factor, native `.duckdb` input, refresh-set directory. |
+| `CUDF_SO`, `PLANS`, `LAYOUT`, `CFG` | repro-kit paths | Patched libcudf to `LD_PRELOAD`, compression-plan dir, pin-layout JSON, Sirius config YAML. |
+| `SIRIUS_PRE_SQL` | `ast_jit` SET | SQL run after `LOAD`, before any pin; override for diagnosis runs (e.g. append a log-level SET). |
+
 ---
 
 ## What produces the number
