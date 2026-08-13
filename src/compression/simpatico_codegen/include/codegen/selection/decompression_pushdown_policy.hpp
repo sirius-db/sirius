@@ -28,7 +28,7 @@
 namespace sirius::codegen {
 
 /// Master gate (SIRIUS_EXP_FUSED_SCAN_FILTER). Set and not exactly "0" = on.
-bool decode_filtering_enabled();
+bool decompression_pushdown_enabled();
 
 /// Promote the decision trace to INFO / stderr (SIRIUS_EXP_FUSED_SCAN_DIAG),
 /// same "set and not exactly 0" contract.
@@ -36,7 +36,7 @@ bool decode_filtering_enabled();
 /// The trace is permanent tooling, not temporary instrumentation: it records
 /// every accept/decline decision, and raising the level is the first move
 /// whenever a batch quietly falls back to a plain decode.
-bool decode_diag_enabled();
+bool decompression_pushdown_diag_enabled();
 
 /// Surviving-row fraction above which the decode gives compaction up and
 /// produces ordinary full-width columns (SIRIUS_EXP_FUSED_SCAN_MAX_SEL,
@@ -45,21 +45,21 @@ bool decode_diag_enabled();
 ///
 /// Measured: wins at sel <= .152, losses by .526; the mask walk costs about the
 /// plain decode at .5.
-double decode_max_selectivity();
+double decompression_pushdown_max_selectivity();
 
 /// The same, for a batch with any full-width output
 /// (SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL, default 0.10): a full decode plus
 /// gather costs about the unfiltered path, so the win is the compacted batch
 /// (and, when the decode carries the whole filter, the skipped post-filter),
 /// which only pays off at low selectivity.
-double decode_full_route_max_selectivity();
+double decompression_pushdown_full_route_max_selectivity();
 
 /// Surviving-row fraction at or below which walking the survivor index list
 /// beats walking the mask bits (SIRIUS_EXP_FUSED_SCAN_K4_MAX_SEL, default
 /// 0.15). The microbench crossover sits at 15-50% depending on bit width, so
 /// this is the conservative edge. Setting it tiny is the effective kill switch
 /// for the index walk (the parse requires > 0).
-double decode_index_walk_max_selectivity();
+double decompression_pushdown_index_walk_max_selectivity();
 
 /// How many join-filter probes one decode carries
 /// (SIRIUS_EXP_FUSED_SCAN_MAX_MEMBER, default 1).
@@ -73,6 +73,6 @@ double decode_index_walk_max_selectivity();
 /// such batches are never tagged as fully filtered, so the downstream operator
 /// completes the conjunction on the compacted batch. The caller must order the
 /// probes by ascending expected keep-rate so the kept prefix is the strongest.
-std::size_t decode_max_membership_sources();
+std::size_t decompression_pushdown_max_membership_sources();
 
 }  // namespace sirius::codegen

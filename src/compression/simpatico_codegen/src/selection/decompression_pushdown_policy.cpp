@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#include "codegen/selection/decode_policy.hpp"
+#include "codegen/selection/decompression_pushdown_policy.hpp"
 
 #include <cstdlib>
 #include <string_view>
@@ -29,37 +29,37 @@ double env_fraction(char const* name, double fallback)
 
 }  // namespace
 
-bool decode_filtering_enabled()
+bool decompression_pushdown_enabled()
 {
   static bool const enabled = env_flag("SIRIUS_EXP_FUSED_SCAN_FILTER");
   return enabled;
 }
 
-bool decode_diag_enabled()
+bool decompression_pushdown_diag_enabled()
 {
   static bool const enabled = env_flag("SIRIUS_EXP_FUSED_SCAN_DIAG");
   return enabled;
 }
 
-double decode_max_selectivity()
+double decompression_pushdown_max_selectivity()
 {
   static double const value = env_fraction("SIRIUS_EXP_FUSED_SCAN_MAX_SEL", 0.35);
   return value;
 }
 
-double decode_full_route_max_selectivity()
+double decompression_pushdown_full_route_max_selectivity()
 {
   static double const value = env_fraction("SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL", 0.10);
   return value;
 }
 
-double decode_index_walk_max_selectivity()
+double decompression_pushdown_index_walk_max_selectivity()
 {
   static double const value = env_fraction("SIRIUS_EXP_FUSED_SCAN_K4_MAX_SEL", 0.15);
   return value;
 }
 
-std::size_t decode_max_membership_sources()
+std::size_t decompression_pushdown_max_membership_sources()
 {
   static std::size_t const cap = [] {
     char const* value = std::getenv("SIRIUS_EXP_FUSED_SCAN_MAX_MEMBER");

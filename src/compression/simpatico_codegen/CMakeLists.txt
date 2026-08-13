@@ -146,7 +146,7 @@ add_library(
   src/encode/jit/renderer.cpp
   src/decode/jit/renderer.cpp
   # Runtime: plan executor + bridge + API + rep glue
-  src/selection/decode_policy.cpp
+  src/selection/decompression_pushdown_policy.cpp
   src/plan/bit_spec.cpp
   src/plan/plan_dsl.cpp
   src/plan/plan_tree.cpp

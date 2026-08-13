@@ -19,7 +19,7 @@
 
 #include <cudf/table/table.hpp>
 
-#include <compression/decode_filter_policy.hpp>
+#include <compression/decompression_pushdown_policy.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <log/logging.hpp>
@@ -164,14 +164,14 @@ void scan_operator_input::prepare_for_processing(
       // with a fresh per-batch snapshot here, replacing the (typically empty)
       // drain-time one. The mapping invariant lives in
       // snapshot_membership_probes; same mvcc guard as the row selection.
-      if (sirius::decode_filtering_enabled() && dynamic_filters && dynamic_filters->has_filters() &&
-          !mvcc_keep_mask.has_mask()) {
+      if (sirius::decompression_pushdown_enabled() && dynamic_filters &&
+          dynamic_filters->has_filters() && !mvcc_keep_mask.has_mask()) {
         auto snapshot_onto = [&](auto* rep) {
           std::size_t const n_slots = rep->selected_indices().has_value()
                                         ? rep->selected_indices()->size()
                                         : rep->column_names().size();
           auto snap                 = snapshot_membership_probes(*dynamic_filters, n_slots);
-          SIRIUS_DECODE_DIAG(
+          SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
             "[decode-filter] join filter attach (decode time) channel={}: slots={} attached={} "
             "generation={} skipped_non_maskable={}",
             static_cast<void const*>(dynamic_filters.get()),
@@ -330,7 +330,8 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
       // over-reservation handling; by policy that only happens where the
       // forecast was wrong. Replaces a ~5x over-reservation on
       // highly-selective batches.
-      auto const cap = forecast.survivors_bounded ? sirius::decode_max_selectivity() : 1.0;
+      auto const cap =
+        forecast.survivors_bounded ? sirius::decompression_pushdown_max_selectivity() : 1.0;
       return batch_bytes / 4 + static_cast<std::size_t>(static_cast<double>(batch_bytes) * cap);
     }
     // post_filter_and_project filters by copy: the materialized input and the

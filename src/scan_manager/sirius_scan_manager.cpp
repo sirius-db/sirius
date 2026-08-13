@@ -16,7 +16,7 @@
 
 #include "scan_manager/sirius_scan_manager.hpp"
 
-#include "compression/decode_filter_policy.hpp"
+#include "compression/decompression_pushdown_policy.hpp"
 #include "compression/device_compressed_blob.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
@@ -225,11 +225,11 @@ struct cached_databatch_provider : public databatch_provider {
         // is kept as a free early base; the authoritative snapshot is taken at
         // decode time by scan_operator_input::prepare_for_processing (same
         // builder, same mapping invariant), which replaces this one.
-        if (sirius::decode_filtering_enabled() && _dynamic_filters && _mvcc_masks.empty()) {
+        if (sirius::decompression_pushdown_enabled() && _dynamic_filters && _mvcc_masks.empty()) {
           if (_dynamic_filters->has_filters()) {
             auto snap = sirius::op::scan::snapshot_membership_probes(*_dynamic_filters,
                                                                      _column_indices.size());
-            SIRIUS_DECODE_DIAG(
+            SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
               "[decode-filter] join filter attach (drain) channel={}: slots={} attached={} "
               "generation={} skipped_non_maskable={}",
               static_cast<void const*>(_dynamic_filters.get()),
@@ -245,7 +245,7 @@ struct cached_databatch_provider : public databatch_provider {
               decode_scan = base->with_membership_probes(std::move(snap.probes), snap.generation);
             }
           } else {
-            SIRIUS_DECODE_DIAG(
+            SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
               "[decode-filter] join filter attach (drain) channel={}: none published yet "
               "(expected — the drain precedes join publication; the decode-time snapshot "
               "retries)",
@@ -796,7 +796,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     // snapshot) so each compressed batch can pick up join-published filters at
     // serve time.
     std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters;
-    if (sirius::decode_filtering_enabled()) {
+    if (sirius::decompression_pushdown_enabled()) {
       auto const* pq = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(
         &assignment.op->get_ingestible().table_info());
       if (pq != nullptr) { dynamic_filters = pq->sirius_dynamic_filters; }
@@ -804,7 +804,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
       // publishes into (both resolve through the generator's channel map, keyed
       // by duckdb's DynamicTableFilterSet pointer) and the one the decode-time
       // snapshot logs.
-      SIRIUS_DECODE_DIAG(
+      SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
         "[decode-filter] entry '{}': join filter channel={} published_now={} decode request: "
         "{} slot(s), covers_whole_filter={}",
         assignment.entry_name,

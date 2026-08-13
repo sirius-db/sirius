@@ -3,7 +3,7 @@
 
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/representation.hpp"
-#include "codegen/selection/decode_policy.hpp"
+#include "codegen/selection/decompression_pushdown_policy.hpp"
 #include "codegen/selection/selection.hpp"
 #include "codegen/util/stream_pool.hpp"
 
@@ -412,19 +412,19 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
   // They are host-side plan-tree walks, once per batch, against device work
   // measured in milliseconds.
   auto refuse = [](char const* why) {
-    if (sc::decode_diag_enabled())
+    if (sc::decompression_pushdown_diag_enabled())
       std::fprintf(stderr, "simpatico: filtered decode refused: %s\n", why);
     return std::nullopt;
   };
-  if (!sc::decode_filtering_enabled()) return refuse("env gate off");
+  if (!sc::decompression_pushdown_enabled()) return refuse("env gate off");
   size_t const k_range = request.filters.size();
   size_t const k_bool8 = request.bool8_filters.size();
   // Membership cap (drop-tail, sound — see max_membership_sources).
-  size_t const k_member =
-    std::min(request.membership_filters.size(), sc::decode_max_membership_sources());
+  size_t const k_member    = std::min(request.membership_filters.size(),
+                                   sc::decompression_pushdown_max_membership_sources());
   size_t const k_total     = k_range + k_bool8 + k_member;
   result.source_generation = request.source_generation;  // echoed on every outcome
-  if (k_member < request.membership_filters.size() && sc::decode_diag_enabled()) {
+  if (k_member < request.membership_filters.size() && sc::decompression_pushdown_diag_enabled()) {
     std::fprintf(stderr,
                  "simpatico: filtered decode membership sources capped %zu -> %zu "
                  "(SIRIUS_EXP_FUSED_SCAN_MAX_MEMBER)\n",
@@ -510,7 +510,7 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     }
   }
 
-  if (sc::decode_diag_enabled()) {
+  if (sc::decompression_pushdown_diag_enabled()) {
     std::string line = "simpatico: filtered decode wave-1 sources:";
     for (auto const& f : request.filters) {
       line += " range(col ";
@@ -677,14 +677,15 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
       any_full |= routes[i] == sc::decode_route::full;
     }
     double const sel_frac = static_cast<double>(sel.survivor_count) / static_cast<double>(num_rows);
-    bool const give_up    = any_full ? sel_frac > sc::decode_full_route_max_selectivity()
-                                     : (sel_frac > sc::decode_max_selectivity() && !any_dict_gather);
+    bool const give_up =
+      any_full ? sel_frac > sc::decompression_pushdown_full_route_max_selectivity()
+               : (sel_frac > sc::decompression_pushdown_max_selectivity() && !any_dict_gather);
     if (give_up) {
-      double const threshold =
-        any_full ? sc::decode_full_route_max_selectivity() : sc::decode_max_selectivity();
+      double const threshold = any_full ? sc::decompression_pushdown_full_route_max_selectivity()
+                                        : sc::decompression_pushdown_max_selectivity();
       char const* env_name =
         any_full ? "SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL" : "SIRIUS_EXP_FUSED_SCAN_MAX_SEL";
-      if (sc::decode_diag_enabled()) {
+      if (sc::decompression_pushdown_diag_enabled()) {
         std::fprintf(stderr,
                      "simpatico: filtered decode gave compaction up: sel=%.4f > %.4f (%s, "
                      "survivors=%lld/%lld)\n",
@@ -707,13 +708,13 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     for (auto const t : routes)
       any_bitpack_mask |= t == sc::decode_route::bitpack_mask;
     bool const index_walk_pick =
-      any_bitpack_mask && sel_frac <= sc::decode_index_walk_max_selectivity();
-    if (sc::decode_diag_enabled()) {
+      any_bitpack_mask && sel_frac <= sc::decompression_pushdown_index_walk_max_selectivity();
+    if (sc::decompression_pushdown_diag_enabled()) {
       std::fprintf(stderr,
                    "simpatico: filtered decode row enumeration: %s (sel=%.4f, max=%.4f)\n",
                    index_walk_pick ? "index list" : "mask bits",
                    sel_frac,
-                   sc::decode_index_walk_max_selectivity());
+                   sc::decompression_pushdown_index_walk_max_selectivity());
     }
 
     // ── Survivor index map on stream 0, overlapping wave 2 (column 0's wave-2
@@ -1009,7 +1010,7 @@ std::unique_ptr<cudf::table> decompress_scan_filter(
   nvtx3::scoped_range nvtx_range{"simpatico::decompress_table[scan_filter,pool]"};
   result = sirius::codegen::scan_filter_result{};
   if (auto cols = try_decompress_fused(table, selected_columns, request, result, pool, mr)) {
-    if (sirius::codegen::decode_diag_enabled()) {
+    if (sirius::codegen::decompression_pushdown_diag_enabled()) {
       int n_a = 0, n_delta = 0, n_dict = 0, n_str_split = 0, n_b = 0;
       for (auto const t : result.routes) {
         n_a += t == sirius::codegen::decode_route::bitpack_mask;

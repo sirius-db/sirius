@@ -16,7 +16,7 @@
 
 #include "compressed_scan.hpp"
 
-#include "decode_filter_policy.hpp"
+#include "decompression_pushdown_policy.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
@@ -154,7 +154,7 @@ chunk_decode_plan plan_decode(simpatico::compressed_table const& table,
                                      request.columns.end(),
                                      [](auto const& c) { return c.range.has_value(); });
   if (!any_range && !has_external_selection) {
-    SIRIUS_DECODE_DIAG(
+    SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
       "[decode-filter] plan: {} column entr(ies), no ranges, no in-place/membership "
       "sources — plain decode",
       request.columns.size());
@@ -180,7 +180,7 @@ chunk_decode_plan plan_decode(simpatico::compressed_table const& table,
   for (std::size_t i = 0; i < count; ++i) {
     auto const capability = probe_column(table, selected_columns[i]);
     auto const physical   = selected_columns[i];
-    SIRIUS_DECODE_DIAG(
+    SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
       "[decode-filter] plan col[{}] physical={} dtype={} route={} comparable_lane={} "
       "range_requested={} range=[{}, {}]",
       i,
@@ -196,7 +196,7 @@ chunk_decode_plan plan_decode(simpatico::compressed_table const& table,
     if (capability.decode.compact_route != sirius::codegen::decode_route::full) { ++compactable; }
     if (!plan.ranges[i].requested) { continue; }
     if (!capability.can_select_rows()) {
-      SIRIUS_DECODE_DIAG(
+      SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
         "[decode-filter] plan: DROPPING range conjunct on selected pos {} (physical {}) — the "
         "column cannot evaluate it while decoding (route={} comparable_lane={})",
         i,
@@ -212,13 +212,14 @@ chunk_decode_plan plan_decode(simpatico::compressed_table const& table,
   }
 
   if (selecting_columns == 0 && !has_external_selection) {
-    SIRIUS_DECODE_DIAG("[decode-filter] plan: no row-selecting source survived — plain decode");
+    SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
+      "[decode-filter] plan: no row-selecting source survived — plain decode");
     return {};
   }
   plan.enabled             = true;
   plan.covers_whole_filter = request.ranges_cover_whole_filter && !dropped_conjunct &&
                              selecting_columns > 0 && !has_external_selection;
-  SIRIUS_DECODE_DIAG(
+  SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
     "[decode-filter] plan ENABLED: {} row-selecting range column(s), "
     "external_sources={}, {}/{} column(s) decode compacted, covers_whole_filter={}",
     selecting_columns,
@@ -325,7 +326,7 @@ std::unique_ptr<cudf::table> decode_with_filters(simpatico::compressed_table con
 
   if (sources.size() > kMaxSelectionSources ||
       chunk.num_rows() > std::numeric_limits<std::int32_t>::max()) {
-    SIRIUS_DECODE_DIAG(
+    SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
       "[decode-filter] declined on shape ({} row-selecting sources, {} rows) — plain decode",
       sources.size(),
       chunk.num_rows());
@@ -364,7 +365,8 @@ std::unique_ptr<cudf::table> decode_with_filters(simpatico::compressed_table con
         break;
     }
   }
-  SIRIUS_DECODE_DIAG("[decode-filter] wave-1 sources, ascending expected keep:{}", order_echo);
+  SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG("[decode-filter] wave-1 sources, ascending expected keep:{}",
+                                     order_echo);
   wave_request.source_generation = request.membership_generation;
 
   sirius::codegen::scan_filter_result result;
@@ -375,7 +377,8 @@ std::unique_ptr<cudf::table> decode_with_filters(simpatico::compressed_table con
   // anyway so their teardown follows the batch's ordering.
   result.set_stream(stream);
   if (!error.empty()) {
-    SIRIUS_DECODE_DIAG("[decode-filter] assembly REFUSED ({}); the batch decoded plainly", error);
+    SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
+      "[decode-filter] assembly REFUSED ({}); the batch decoded plainly", error);
   }
   // row_filtered only when the decode carried EVERY restricting conjunct: a
   // partially applied request must leave the batch untagged so the scan
@@ -391,7 +394,7 @@ std::unique_ptr<cudf::table> decode_with_filters(simpatico::compressed_table con
   // them. On any other outcome the equality answers come from the plain
   // predicated rerun, which drops no rows.
   outcome.predicates_enforced = result.applied && !wave_request.bool8_filters.empty();
-  SIRIUS_DECODE_DIAG(
+  SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
     "[decode-filter] decode {} (status={} generation={}): ranges={} equalities={} "
     "join_filters={} survivors={}/{} column(s)={} covers_whole_filter={} row_filtered={} "
     "selection_unprofitable={}",
@@ -464,7 +467,7 @@ compressed_scan::compaction_forecast compressed_scan::forecast_compaction(
   simpatico::compressed_table const& chunk, std::span<const std::size_t> selected) const
 {
   compaction_forecast forecast{};
-  if (!decode_filtering_enabled()) { return forecast; }
+  if (!decompression_pushdown_enabled()) { return forecast; }
   if (!_request.ranges_cover_whole_filter) { return forecast; }
   bool const any_range = std::any_of(_request.columns.begin(),
                                      _request.columns.end(),
@@ -505,10 +508,11 @@ decode_result decode_compressed_chunk(simpatico::compressed_table const& chunk,
   auto const& request = scan != nullptr ? scan->request() : no_request;
 
   auto const predicates = to_decode_predicates(request, selected.size());
-  SIRIUS_DECODE_DIAG("[decode-filter] chunk: columns={} equalities={} request_empty={}",
-                     selected.size(),
-                     predicates.size(),
-                     request.empty());
+  SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
+    "[decode-filter] chunk: columns={} equalities={} request_empty={}",
+    selected.size(),
+    predicates.size(),
+    request.empty());
 
   if (!request.empty()) {
     out.table = decode_with_filters(chunk, selected, request, stream, mr, out.outcome);
