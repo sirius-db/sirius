@@ -1,0 +1,86 @@
+# =============================================================================
+# Copyright 2025, Sirius Contributors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+# in compliance with the License. You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software distributed under the License
+# is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied. See the License for the specific language governing permissions and limitations under
+# the License.
+# =============================================================================
+#
+# Source this file to route Sirius builds through the RAPIDS sccache
+# distributed build farm (see docs/sccache-dist.md):
+#
+#   source scripts/sccache_dist_env.sh
+#   pixi run make
+#
+# Run scripts/sccache_dist_setup.sh once first. Everything here is scoped to
+# the current shell — open a fresh shell to go back to normal local builds.
+
+if [[ "${BASH_SOURCE[0]:-}" == "$0" ]]; then
+  echo "this file must be sourced, not executed: source ${0}" >&2
+  exit 1
+fi
+
+_sirius_dist_home="${SIRIUS_SCCACHE_DIST_HOME:-$HOME/.local/share/sirius/sccache-dist}"
+_sirius_dist_bin="$_sirius_dist_home/bin/sccache"
+_sirius_dist_creds="$_sirius_dist_home/aws-credentials"
+
+if [[ ! -x "$_sirius_dist_bin" || ! -f "$_sirius_dist_creds" ]]; then
+  echo "sccache dist farm is not set up yet — run: scripts/sccache_dist_setup.sh" >&2
+  return 1
+fi
+
+if [[ -n "$(find "$_sirius_dist_creds" -mmin +720 2>/dev/null)" ]]; then
+  echo "WARNING: AWS credentials are older than 12h and have likely expired." >&2
+  echo "         Refresh with: scripts/sccache_dist_setup.sh --creds-only" >&2
+fi
+
+if ! _sirius_dist_token="$(gh auth token 2>/dev/null)"; then
+  echo "gh is not authenticated — run scripts/sccache_dist_setup.sh" >&2
+  return 1
+fi
+
+case "$(uname -m)" in
+  x86_64) _sirius_dist_arch=amd64 ;;
+  aarch64) _sirius_dist_arch=arm64 ;;
+  *)
+    echo "unsupported architecture for the sccache dist farm: $(uname -m)" >&2
+    return 1
+    ;;
+esac
+
+# Consumed by the Makefile: switches the CMake compiler launchers to the
+# RAPIDS sccache fork binary below.
+export SIRIUS_SCCACHE_DIST=1
+export SIRIUS_SCCACHE_DIST_BIN="$_sirius_dist_bin"
+
+# Dedicated server port so the fork's local server never collides with the
+# pixi-provided sccache 0.15.0 server (default port 4226) used by normal builds.
+export SCCACHE_SERVER_PORT="${SIRIUS_SCCACHE_DIST_PORT:-4227}"
+
+# Shared RAPIDS S3 compilation cache.
+export SCCACHE_BUCKET="rapids-sccache-devs"
+export SCCACHE_REGION="us-east-2"
+export SCCACHE_S3_KEY_PREFIX="sirius-${_sirius_dist_arch}"
+export SCCACHE_S3_USE_PREPROCESSOR_CACHE_MODE=true
+export SCCACHE_S3_PREPROCESSOR_CACHE_KEY_PREFIX="sirius-${_sirius_dist_arch}-preprocessor-cache"
+export AWS_SHARED_CREDENTIALS_FILE="$_sirius_dist_creds"
+export AWS_PROFILE=default
+
+# Distributed compilation cluster (arch-specific scheduler).
+export SCCACHE_DIST_SCHEDULER_URL="https://${_sirius_dist_arch}.linux.sccache.rapids.nvidia.com"
+export SCCACHE_DIST_AUTH_TYPE=token
+export SCCACHE_DIST_AUTH_TOKEN="$_sirius_dist_token"
+# Compile locally instead of failing when the farm is unreachable.
+export SCCACHE_DIST_FALLBACK_TO_LOCAL_COMPILE=true
+
+unset _sirius_dist_home _sirius_dist_creds _sirius_dist_token _sirius_dist_arch
+
+echo "RAPIDS sccache dist farm enabled for this shell (launcher: $_sirius_dist_bin)"
+echo "Build with: pixi run make    Check farm health with: pixi run make sccache-dist-status"
+unset _sirius_dist_bin
