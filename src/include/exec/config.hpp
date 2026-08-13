@@ -31,6 +31,11 @@ inline constexpr int default_downgrade_num_threads    = 1;
 struct thread_pool_config {
   int num_threads{0};
   std::string thread_name_prefix{"thread"};
+
+  /// Linux logical CPU IDs forming one shared eligibility mask for every worker in the pool.
+  /// An empty list inherits the constructing thread's allowed mask. Non-empty lists must be a
+  /// subset of that mask (including cgroup/cpuset constraints); IDs are not assigned one per
+  /// worker.
   std::vector<int> cpu_affinity_list;
 };
 

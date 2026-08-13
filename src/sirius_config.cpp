@@ -17,6 +17,7 @@
 #include "sirius_config.hpp"
 
 #include "exec/config.hpp"
+#include "exec/cpu_affinity.hpp"
 #include "log/logging.hpp"
 #include "yaml_reader.hpp"
 
@@ -157,7 +158,7 @@ static void from_yaml(const YAML::Node& node, creator::task_creator_config& opt)
       "and currently source-first; remove this key");
   }
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
-  r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
+  r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list, exec::valid_cpu_affinity{});
   r.reject_unknown();
 }
 
@@ -242,7 +243,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
 {
   yaml::reader r(node, "scan_manager");
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{2});
-  r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
+  r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list, exec::valid_cpu_affinity{});
   r.optional("use_sirius_datasource", opt.use_sirius_datasource);
   r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("rest_n_reactors", opt.rest_n_reactors, yaml::greater_than<std::size_t>{0});
@@ -349,7 +350,7 @@ static void from_yaml(const YAML::Node& node, exec::downgrade_executor_config& o
 {
   yaml::reader r(node, "downgrade");
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
-  r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
+  r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list, exec::valid_cpu_affinity{});
   r.optional("monitor_period", opt.monitor_period);
   r.reject_unknown();
 }
