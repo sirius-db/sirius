@@ -228,6 +228,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_filter_pushdown") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 0);
+    REQUIRE(setting_count(con, "pin_table_compression_min_batch_size_bytes") == 0);
+    REQUIRE(setting_count(con, "pin_table_compression_max_compressed_fraction") == 0);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
@@ -240,6 +242,12 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     result = con.Query("SET enable_dynamic_zone_map_filter = true");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
+    result = con.Query("SET pin_table_compression_min_batch_size_bytes = 0");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    result = con.Query("SET pin_table_compression_max_compressed_fraction = 0.9");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
   }
 
   setenv("SIRIUS_ENABLE_TEST_OPTIONS", "true", 1);
@@ -250,6 +258,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_filter_pushdown") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 0);
+    REQUIRE(setting_count(con, "pin_table_compression_min_batch_size_bytes") == 0);
+    REQUIRE(setting_count(con, "pin_table_compression_max_compressed_fraction") == 0);
   }
 
   setenv("SIRIUS_ENABLE_TEST_OPTIONS", "1", 1);
@@ -260,6 +270,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 1);
     REQUIRE(setting_count(con, "enable_dynamic_filter_pushdown") == 1);
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 1);
+    REQUIRE(setting_count(con, "pin_table_compression_min_batch_size_bytes") == 1);
+    REQUIRE(setting_count(con, "pin_table_compression_max_compressed_fraction") == 1);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
@@ -281,6 +293,25 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     result = con.Query("RESET enable_dynamic_zone_map_filter");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET pin_table_compression_min_batch_size_bytes = 0");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("RESET pin_table_compression_min_batch_size_bytes");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET pin_table_compression_max_compressed_fraction = 0.9");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("RESET pin_table_compression_max_compressed_fraction");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET pin_table_compression_max_compressed_fraction = -0.1");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    REQUIRE_THAT(
+      result->GetError(),
+      Catch::Contains(
+        "pin_table_compression_max_compressed_fraction must be finite and non-negative"));
   }
 }
 

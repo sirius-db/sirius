@@ -2258,6 +2258,18 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                               LogicalType::BOOLEAN,
                               Value::BOOLEAN(operator_defaults.enable_dynamic_zone_map_filter),
                               SetEnableDynamicZoneMapFilter);
+    config.AddExtensionOption(
+      "pin_table_compression_min_batch_size_bytes",
+      "TEST ONLY: override the minimum uncompressed batch size for pin_table compression",
+      LogicalType::UBIGINT,
+      Value::UBIGINT(compression_defaults.min_batch_size_bytes),
+      SetPinTableCompressionMinBatchSizeBytes);
+    config.AddExtensionOption(
+      "pin_table_compression_max_compressed_fraction",
+      "TEST ONLY: override the maximum retained compressed-to-original size fraction",
+      LogicalType::DOUBLE,
+      Value::DOUBLE(compression_defaults.max_compressed_fraction),
+      SetPinTableCompressionMaxCompressedFraction);
   }
 
   // Add in config options for special JIT implementation for regex
@@ -2403,23 +2415,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     LogicalType::VARCHAR,
     Value(compression_defaults.input_plan_dir),
     SetPinTableInputCompressionPlanDir);
-
-  config.AddExtensionOption(
-    "pin_table_compression_min_batch_size_bytes",
-    "Minimum uncompressed batch size in bytes below which active pin_table compression is skipped; "
-    "inert until compression is enabled and a matching plan resolves",
-    LogicalType::UBIGINT,
-    Value::UBIGINT(compression_defaults.min_batch_size_bytes),
-    SetPinTableCompressionMinBatchSizeBytes);
-
-  config.AddExtensionOption(
-    "pin_table_compression_max_compressed_fraction",
-    "Discard the compressed form and pin uncompressed when the compressed size exceeds this "
-    "finite, non-negative fraction of the batch's original size (values above 1 permit "
-    "expansion); inert until compression is enabled and a matching plan resolves",
-    LogicalType::DOUBLE,
-    Value::DOUBLE(compression_defaults.max_compressed_fraction),
-    SetPinTableCompressionMaxCompressedFraction);
 
   config.AddExtensionOption(
     "dynamic_filter_domain_coverage_threshold",

@@ -163,11 +163,15 @@ otherwise the table is pinned uncompressed.
 | Key | DuckDB setting | Type | Default | Description |
 |-----|----------------|------|---------|-------------|
 | `enable_pin_table_compression` | `pin_table_compression` | bool | false | Attempt planned compression while pinning input tables to host memory. |
-| `min_batch_size_bytes` | `pin_table_compression_min_batch_size_bytes` | bytes | 1Mi | Skip compression below this uncompressed batch size. `0` disables the size gate. |
-| `max_compressed_fraction` | `pin_table_compression_max_compressed_fraction` | finite double >= 0 | 0.75 | Keep a compressed representation only at or below this fraction of the original batch size. `0` retains none; values above `1` deliberately permit expansion, primarily for testing encodability. |
+| `min_batch_size_bytes` | test-only opt-in | bytes | 1Mi | Skip compression below this uncompressed batch size. `0` disables the size gate. |
+| `max_compressed_fraction` | test-only opt-in | finite double >= 0 | 0.75 | Keep a compressed representation only at or below this fraction of the original batch size. `0` retains none; values above `1` deliberately permit expansion, primarily for testing encodability. |
 | `input_plan_dir` | `pin_table_input_compression_plan_dir` | string | "" | Directory of per-table Simpatico plan files. An empty path leaves compression inactive. |
 
-The YAML loader and DuckDB `SET` surface reject negative, NaN, and infinite
+The two compression-policy values are configured through YAML rather than exposed as
+ordinary DuckDB settings. Test processes that set `SIRIUS_ENABLE_TEST_OPTIONS=1` before
+constructing a database can use the corresponding `pin_table_compression_*` settings for
+controlled mechanism tests. Other values, including `true`, do not enable that surface.
+The YAML loader and these test-only `SET` hooks reject negative, NaN, and infinite
 `max_compressed_fraction` values instead of silently changing retention behavior.
 
 ### How Downgrade Thresholds Work
