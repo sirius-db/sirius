@@ -39,6 +39,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>  // for setenv/putenv
 #include <filesystem>
@@ -616,6 +617,20 @@ TEST_CASE("Sirius configuration keeps task creation policy internal", "[sirius][
   }
 }
 
+TEST_CASE("Sirius configuration rejects negative memory prefetcher threads", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  fs::path cfg             = fs::path(loc.file_name()).parent_path() / "data" /
+                 "invalid_memory_prefetcher_num_threads_negative.yaml";
+
+  sirius::sirius_config config;
+  auto const before = config.get_scan_manager_config().memory_prefetcher.num_threads;
+  REQUIRE_THROWS_WITH(config.load_from_file(cfg),
+                      Catch::Contains("memory_prefetcher.num_threads") &&
+                        Catch::Contains("unsigned value must be non-negative"));
+  CHECK(config.get_scan_manager_config().memory_prefetcher.num_threads == before);
+}
+
 namespace {
 
 void require_shared_operator_defaults(const sirius::operator_params& params, uint64_t batch)
@@ -906,6 +921,45 @@ TEST_CASE("Sirius high-level GPU config keeps per-stream tracking internal", "[s
   REQUIRE_THROWS_WITH(
     config.load_from_file(config_fixture("invalid_memory_gpu_per_stream_reservation.yaml")),
     Catch::Contains("unknown config key: 'track_per_stream_reservation' in memory.gpu"));
+}
+
+TEST_CASE("Sirius downgrade monitor period rejects negatives and preserves zero disable",
+          "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+
+  for (auto const* fixture : {"invalid_downgrade_monitor_period_negative.yaml",
+                              "invalid_downgrade_monitor_period_negative_suffix.yaml",
+                              "invalid_downgrade_monitor_period_negative_submillisecond.yaml",
+                              "invalid_downgrade_monitor_period_negative_fractional.yaml"}) {
+    INFO("fixture=" << fixture);
+    auto const path = data_dir / fixture;
+    REQUIRE(fs::is_regular_file(path));
+
+    sirius::sirius_config config;
+    REQUIRE_THROWS_WITH(
+      config.load_from_file(path),
+      Catch::Contains("downgrade.monitor_period") && Catch::Contains("non-negative"));
+  }
+
+  struct valid_config {
+    const char* fixture;
+    std::chrono::milliseconds expected;
+  };
+  for (auto const& valid : {
+         valid_config{"valid_downgrade_monitor_period_zero.yaml", std::chrono::milliseconds{0}},
+         valid_config{"valid_downgrade_monitor_period_positive.yaml",
+                      std::chrono::milliseconds{25}},
+       }) {
+    INFO("fixture=" << valid.fixture);
+    auto const path = data_dir / valid.fixture;
+    REQUIRE(fs::is_regular_file(path));
+
+    sirius::sirius_config config;
+    REQUIRE_NOTHROW(config.load_from_file(path));
+    REQUIRE(config.get_downgrade_executor_config().monitor_period == valid.expected);
+  }
 }
 
 TEST_CASE("Sirius configuration rejects conflicting memory budget forms", "[sirius][config]")
