@@ -15,7 +15,9 @@
  */
 
 #include "catch.hpp"
+#include "log/level.hpp"
 #include "sirius_context.hpp"
+#include "utils/log_test_utils.hpp"
 
 #include <cudf/contiguous_split.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -677,6 +679,55 @@ TEST_CASE("DuckDB setting rejects negative byte values without mutation",
   REQUIRE(after != nullptr);
   REQUIRE_FALSE(after->HasError());
   REQUIRE(after->GetValue(0, 0).GetValue<uint64_t>() == expected);
+}
+
+TEST_CASE("DuckDB setting rejects unknown Sirius log levels without mutation",
+          "[sirius][context][config][isolated_context]")
+{
+  finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
+  setenv("SIRIUS_DISABLE", "1", 1);
+
+  sirius::test::scoped_recording_log_sink scoped_sink;
+  auto const previous_level = duckdb::Config::LOG_LEVEL;
+  finally restore_level{[&]() { duckdb::Config::LOG_LEVEL = previous_level; }};
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+
+  auto warn = con.Query("SET sirius_log_level = 'warn'");
+  REQUIRE(warn != nullptr);
+  REQUIRE_FALSE(warn->HasError());
+  REQUIRE(duckdb::Config::LOG_LEVEL == "warn");
+  REQUIRE_FALSE(scoped_sink.sink().should_log(sirius::log::level::info));
+  REQUIRE(scoped_sink.sink().should_log(sirius::log::level::warn));
+
+  auto invalid = con.Query("SET sirius_log_level = 'verbose'");
+  REQUIRE(invalid != nullptr);
+  REQUIRE(invalid->HasError());
+  REQUIRE_THAT(invalid->GetError(),
+               Catch::Contains(
+                 "sirius_log_level must be one of: trace, debug, info, warn, error, critical, off"));
+
+  auto after_invalid = con.Query("SELECT current_setting('sirius_log_level')::VARCHAR");
+  REQUIRE(after_invalid != nullptr);
+  REQUIRE_FALSE(after_invalid->HasError());
+  REQUIRE(after_invalid->GetValue(0, 0).GetValue<std::string>() == "warn");
+  REQUIRE(duckdb::Config::LOG_LEVEL == "warn");
+  REQUIRE_FALSE(scoped_sink.sink().should_log(sirius::log::level::info));
+  REQUIRE(scoped_sink.sink().should_log(sirius::log::level::warn));
+
+  auto critical = con.Query("SET sirius_log_level = 'critical'");
+  REQUIRE(critical != nullptr);
+  REQUIRE_FALSE(critical->HasError());
+  REQUIRE(duckdb::Config::LOG_LEVEL == "critical");
+  REQUIRE_FALSE(scoped_sink.sink().should_log(sirius::log::level::error));
+  REQUIRE(scoped_sink.sink().should_log(sirius::log::level::critical));
+
+  auto off = con.Query("SET sirius_log_level = 'off'");
+  REQUIRE(off != nullptr);
+  REQUIRE_FALSE(off->HasError());
+  REQUIRE(duckdb::Config::LOG_LEVEL == "off");
+  REQUIRE_FALSE(scoped_sink.sink().should_log(sirius::log::level::critical));
 }
 
 TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
