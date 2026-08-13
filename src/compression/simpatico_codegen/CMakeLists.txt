@@ -130,6 +130,7 @@ add_library(
   src/selection/selection_wave.cu
   src/selection/chunk_row_set_build.cu
   src/selection/row_id_space.cu
+  src/selection/chunk_row_set_convert.cu
   src/operators/alp_compressor.cu
   src/operators/alp_rd_compressor.cu
   src/operators/ans_compressor.cu
@@ -234,6 +235,7 @@ add_codegen_host_test(test_masked_decode_variants)
 add_codegen_host_test(test_selection_wave)
 add_codegen_host_test(test_chunk_row_set_build)
 add_codegen_host_test(test_row_id_space)
+add_codegen_host_test(test_chunk_row_set_convert)
 add_codegen_host_test(test_render_signature_contract)
 
 # Multi-mode CLI. Target is simpatico_cli to avoid clashing with the lib target;
@@ -272,4 +274,5 @@ add_test(NAME masked_decode_variants COMMAND test_masked_decode_variants)
 add_test(NAME selection_wave COMMAND test_selection_wave)
 add_test(NAME chunk_row_set_build COMMAND test_chunk_row_set_build)
 add_test(NAME row_id_space COMMAND test_row_id_space)
+add_test(NAME chunk_row_set_convert COMMAND test_chunk_row_set_convert)
 add_test(NAME render_signature_contract COMMAND test_render_signature_contract)
