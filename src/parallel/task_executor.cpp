@@ -63,19 +63,33 @@ void itask_executor::start()
 {
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
-  _bounded_pool = std::make_unique<exec::bounded_thread_pool>(_config.num_threads,
-                                                              _config.thread_name_prefix,
-                                                              _config.cpu_affinity_list,
-                                                              get_per_thread_init());
-  _task_queue.reactivate();
-  _manager_thread = std::thread([this] { manager_loop(); });
-  on_start();
+  try {
+    _bounded_pool = std::make_unique<exec::bounded_thread_pool>(_config.num_threads,
+                                                                _config.thread_name_prefix,
+                                                                _config.cpu_affinity_list,
+                                                                get_per_thread_init());
+    _task_queue.reactivate();
+    _manager_thread = std::thread([this] { manager_loop(); });
+    on_start();
+  } catch (...) {
+    _running = false;
+    if (_bounded_pool) { _bounded_pool->interrupt(); }
+    _task_queue.interrupt();
+    if (_manager_thread.joinable()) { _manager_thread.join(); }
+    if (_bounded_pool) {
+      _bounded_pool->wait_all();
+      _bounded_pool->stop();
+      _bounded_pool.reset();
+    }
+    throw;
+  }
 }
 
 void itask_executor::stop()
 {
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
+  if (!_bounded_pool) { return; }
   _bounded_pool->interrupt();
   _task_queue.interrupt();
   on_stop();

@@ -26,6 +26,7 @@
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <duckdb/main/connection.hpp>
 #include <duckdb/main/database.hpp>
+#include <sched.h>
 
 #include <algorithm>
 #include <atomic>
@@ -158,10 +159,12 @@ class testable_task_creator : public task_creator {
   testable_task_creator(int num_threads,
                         duckdb::ClientContext& client_context,
                         task_scheduler& task_sched,
-                        sirius::memory::sirius_memory_reservation_manager& mem_res_mgr)
+                        sirius::memory::sirius_memory_reservation_manager& mem_res_mgr,
+                        std::vector<int> cpu_affinity = {})
     : task_creator(
-        creator::task_creator_config{
-          .thread_pool = {.num_threads = num_threads, .thread_name_prefix = "task_creator"}},
+        creator::task_creator_config{.thread_pool = {.num_threads        = num_threads,
+                                                     .thread_name_prefix = "task_creator",
+                                                     .cpu_affinity_list = std::move(cpu_affinity)}},
         mem_res_mgr)
   {
     this->set_client_context(client_context);
@@ -342,6 +345,21 @@ TEST_CASE("task_creator thread pool is idempotent", "[task_creator]")
 
     creator.stop_thread_pool();
   }
+}
+
+TEST_CASE("task_creator affinity startup failure leaves stop destruction and retry safe",
+          "[task_creator][cpu_affinity]")
+{
+  test_fixture fixture;
+  testable_task_creator creator(
+    1, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager, {CPU_SETSIZE});
+
+  CHECK_THROWS_WITH(creator.start_thread_pool(), Catch::Contains("CPU_SETSIZE"));
+  CHECK_FALSE(creator.is_running());
+  CHECK_NOTHROW(creator.stop_thread_pool());
+  CHECK_THROWS_WITH(creator.start_thread_pool(), Catch::Contains("CPU_SETSIZE"));
+  CHECK_FALSE(creator.is_running());
+  CHECK_NOTHROW(creator.stop_thread_pool());
 }
 
 TEST_CASE("task_creator destructor stops thread pool", "[task_creator]")
