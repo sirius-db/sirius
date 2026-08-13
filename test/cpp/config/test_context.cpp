@@ -694,7 +694,6 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
 {
   finally cleanup_env{[]() {
     unsetenv("SIRIUS_CONFIG_FILE");
-    unsetenv("SIRIUS_ENABLE_TEST_OPTIONS");
     setenv("SIRIUS_DISABLE", "1", 1);
   }};
 
@@ -702,7 +701,6 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   fs::path cfg = fs::path(loc.file_name()).parent_path() / "data" / "setting_defaults.yaml";
 
   unsetenv("SIRIUS_DISABLE");
-  setenv("SIRIUS_ENABLE_TEST_OPTIONS", "1", 1);
   setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
 
   duckdb::DuckDB db(nullptr);
