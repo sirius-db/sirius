@@ -609,6 +609,44 @@ std::unique_ptr<cudf::column> decode_fused_subtree_impl(PlanTree const& tree,
     if (error_out) *error_out = "codegen decompress: output column alloc failed";
     return nullptr;
   }
+  if (masked && sel->rows != nullptr) {
+    // Row-set walk: a selection that arrived after the scan, so there is no
+    // mask to walk and no chunk_offsets to have been counted. The row set
+    // carries its own grid — one block per touched chunk — and its own output
+    // bases, so only the touched chunks are launched at all.
+    if (sel->rows->num_survivors != sel->survivor_count) {
+      if (error_out) {
+        *error_out = "codegen decompress: decode_selection and row set disagree on survivor_count";
+      }
+      return nullptr;
+    }
+    if (sel->rows->num_rows != static_cast<std::int64_t>(num_rows)) {
+      if (error_out) {
+        *error_out = "codegen decompress: row set was built for a different row count";
+      }
+      return nullptr;
+    }
+    if (!sel->rows->valid()) {
+      if (error_out) { *error_out = "codegen decompress: row set fails its own contract"; }
+      return nullptr;
+    }
+    // The mask is not read on this path; the launcher takes the row set's
+    // geometry instead. A hollow one keeps the signature honest about that.
+    sirius::codegen::selection_mask const hollow{
+      nullptr, static_cast<std::int64_t>(num_rows), sel->survivor_count, nullptr};
+    if (!launch_decode_fused_tree_compacted(*built.tree,
+                                            labeled,
+                                            dtype,
+                                            static_cast<std::int64_t>(num_rows),
+                                            sel->mask != nullptr ? *sel->mask : hollow,
+                                            row_enumeration{nullptr, sel->rows},
+                                            out_col->mutable_view().head<void>(),
+                                            stream)) {
+      if (error_out) { *error_out = "codegen decompress: compacted (row-set walk) decode failed"; }
+      return nullptr;
+    }
+    return out_col;
+  }
   if (masked) {
     // Mask walk: decode over all num_rows input rows with the mask
     // words + chunk offsets as kernel arguments, writing only survivor rows
@@ -1281,6 +1319,17 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
   if (selecting && sel->route != probe_column(tree).compact_route) {
     if (error_out) {
       *error_out = "decompress: requested decode route does not match the plan's shape";
+    }
+    return nullptr;
+  }
+  // A row set serves the compacted value decode and nothing else yet: the
+  // str_split reconstruct and the dictionary gather read mask words directly,
+  // and `full` compacts through the survivor index list, which a post-join
+  // selection does not carry. Refusing keeps the gap visible; decoding full
+  // width behind the caller's back would turn it into a silent cliff.
+  if (selecting && sel->rows != nullptr && sel->route != sc::decode_route::bitpack_mask) {
+    if (error_out) {
+      *error_out = "decompress: a chunk row set can only drive the bitpack compacted decode";
     }
     return nullptr;
   }

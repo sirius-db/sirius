@@ -1034,8 +1034,14 @@ bool launch_decode_fused_tree_compacted(codegen::jit::FusedTree const& tree,
     va, cdj::kShapeMaskConsume, cdj::kShapeIndexConsume, cdj::kShapeSparseConsume, mask, rows);
   auto const survivors = rows.by_row_set() ? rows.rows->num_survivors : mask.survivor_count;
   report_enumeration("value decode", va, num_rows, survivors);
+  // A row set carries its own geometry, so there is no mask to check it against
+  // — the same exemption the str_split metadata launch already makes.
   return check_and_launch(
-    {tree, labeled, dtype, num_rows, &mask, stream}, va, out, "compacted value decode", num_rows);
+    {tree, labeled, dtype, num_rows, rows.by_row_set() ? nullptr : &mask, stream},
+    va,
+    out,
+    "compacted value decode",
+    num_rows);
 }
 
 // str_split phase 1: survivor metadata (masked_launch.hpp). The kernel runs over
