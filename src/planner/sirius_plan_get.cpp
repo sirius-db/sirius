@@ -649,6 +649,11 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   return std::move(node);
 }
 
+/// There are two paths in knn join plan:
+///   - Fast path:    output column of the right table is the primary key column. This saves us a
+///                   gather at materialize stage.
+///   - Payload path: output column of the right table is explicitly passed and contains anything
+///                   other than the primary key column. This requires a gather at materialize.
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
 {
@@ -681,28 +686,56 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
     }
   }
 
-  // Three-stage pipeline: select (per-pair top-k) → reduce_local (per-left-batch
-  // reduction) → materialize (gather output columns + score into the TVF rows).
-  // The select/reduce stages carry a [neighbor_id BIGINT, distance FLOAT] schema;
-  // only materialize emits the TVF's declared columns.
-  auto intermediate_types = []() {
+  // First, the select stage does the per-row exact knn join
+  auto select_types = []() {
     duckdb::vector<sirius::logical_type> t;
+    // On the fast path, this is the right table's primary key value for the matched neighbor,
+    // on the payload path, this is the row number of the right table.
     t.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
+    // score
     t.push_back(sirius::logical_type::make(sirius::type_id::FLOAT));
     return t;
   };
 
+  // Declared output types are [left cols, right cols, score]
+  auto const returned_sirius_types = sirius::from_duckdb_vec(op.returned_types);
+  auto const n_left_cols           = req.left.output_columns.size();
+  auto reduce_local_types          = [&]() {
+    duckdb::vector<sirius::logical_type> t;
+    // left cols
+    for (std::size_t i = 0; i < n_left_cols; ++i) {
+      t.push_back(returned_sirius_types[i]);
+    }
+    // right col, for local reduce, on the fast path it's the id column of the right table,
+    // on the payload path, it's the row number.
+    t.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
+    // score
+    t.push_back(sirius::logical_type::make(sirius::type_id::FLOAT));
+    return t;
+  };
+
+  // Fast path: the right side emits exactly one integer column (its primary key column).
+  // Any other right output falls back to carrying the row number and gathering the requested
+  // columns at materialize.
+  // Note: currently it only checks for a single integer column
+  bool const is_fast_path =
+    req.right.output_columns.size() == 1 && op.returned_types[n_left_cols].IsIntegral();
+
   auto selection = duckdb::make_uniq<sirius::op::sirius_physical_vector_join_select>(
-    intermediate_types(), op.estimated_cardinality, req, &scan_manager);
+    select_types(), op.estimated_cardinality, req, &scan_manager, is_fast_path);
 
   auto reduce_local = duckdb::make_uniq<sirius::op::sirius_physical_vector_join_reduce_local>(
-    intermediate_types(), op.estimated_cardinality, req.k);
+    reduce_local_types(), op.estimated_cardinality, req.k, req, &scan_manager);
 
   reduce_local->children.push_back(std::move(selection));
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> node =
     duckdb::make_uniq<sirius::op::sirius_physical_vector_join_materialize>(
-      sirius::from_duckdb_vec(op.returned_types), op.estimated_cardinality, req, &scan_manager);
+      sirius::from_duckdb_vec(op.returned_types),
+      op.estimated_cardinality,
+      req,
+      &scan_manager,
+      is_fast_path);
   node->children.push_back(std::move(reduce_local));
 
   auto column_ids  = op.GetColumnIds();

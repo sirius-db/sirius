@@ -27,6 +27,7 @@
 
 #include <cuvs/distance/distance.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 
@@ -81,5 +82,34 @@ knn_result brute_force_knn(
   int64_t k,
   cuvs::distance::DistanceType metric = cuvs::distance::DistanceType::L2SqrtUnexpanded,
   rmm::device_async_resource_ref mr   = cudf::get_current_device_resource_ref());
+
+/**
+ * @brief Peak device scratch (bytes) one @ref brute_force_knn call allocates for an
+ * n_queries x n_dataset pair, excluding the output columns.
+ *
+ * Mirrors cuVS's own path selection and buffer sizing so a reservation can be sized
+ * before the search runs (cuVS scratch draws from rmm's current device resource, which
+ * Sirius reserves against). Two regimes matching brute_force_knn_impl:
+ *   - Fused (fusedL2Knn): taken when k <= 64 and @p metric is an L2 family; distances
+ *     stay on-chip, so scratch is just the norms.
+ *   - Tiled (tiled_brute_force_knn): everything else, including cosine and any k > 64. The
+ *     pairwise-distance tile (chooseTileSize) plus per-tile top-k buffers and norms
+ *     dominate; the tile is capped to a fixed budget, so this does not grow without bound.
+ *
+ * The tile arithmetic is exact against cuVS; the select-k workspace term is empirical
+ * (~1x the distance tile) and is the one figure to re-validate against a measured peak.
+ *
+ * @param n_queries Rows in the query (left) batch.
+ * @param n_dataset Rows in the dataset (right) batch.
+ * @param dim       Vector dimensionality.
+ * @param k         Neighbors requested.
+ * @param metric    Distance metric the search runs under.
+ * @return Estimated peak scratch bytes (always >= a small floor).
+ */
+std::size_t brute_force_peak_scratch_bytes(int64_t n_queries,
+                                           int64_t n_dataset,
+                                           int64_t dim,
+                                           int64_t k,
+                                           cuvs::distance::DistanceType metric);
 
 }  // namespace sirius::vss

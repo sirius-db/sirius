@@ -27,6 +27,10 @@
 
 #include <cuvs/neighbors/brute_force.hpp>
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+
 namespace sirius::vss {
 
 knn_result brute_force_knn(raft::device_resources const& res,
@@ -74,6 +78,53 @@ knn_result brute_force_knn(raft::device_resources const& res,
 
   // The search runs async on res's stream.
   return knn_result{std::move(neighbors_col), std::move(distances_col), n_queries, k};
+}
+
+std::size_t brute_force_peak_scratch_bytes(
+  int64_t n_queries, int64_t n_dataset, int64_t dim, int64_t k, cuvs::distance::DistanceType metric)
+{
+  using cuvs::distance::DistanceType;
+  constexpr std::size_t kFloat  = sizeof(float);
+  constexpr std::size_t kIndex  = sizeof(int64_t);
+  constexpr std::size_t kFloor  = std::size_t{1} << 20;  // 1 MiB
+  constexpr std::size_t k512MiB = std::size_t{512} << 20;
+  constexpr std::size_t k1GiB   = std::size_t{1} << 30;
+
+  auto const m = static_cast<std::size_t>(std::max<int64_t>(n_queries, 1));
+  auto const n = static_cast<std::size_t>(std::max<int64_t>(n_dataset, 1));
+
+  // Query + index norms; the expanded/cosine paths compute both, and it is a
+  // negligible upper bound for the unexpanded ones.
+  std::size_t const norms = (m + n) * kFloat;
+
+  bool const l2_family =
+    metric == DistanceType::L2Unexpanded || metric == DistanceType::L2SqrtUnexpanded ||
+    metric == DistanceType::L2Expanded || metric == DistanceType::L2SqrtExpanded;
+
+  // Fused path (fusedL2Knn): distances stay on-chip, so norms are the only scratch.
+  if (k <= 64 && l2_family) { return norms + kFloor; }
+
+  // Tiled path (tiled_brute_force_knn): mirror chooseTileSize, then size the
+  // pairwise-distance tile + per-tile top-k buffers.
+  std::size_t const tile_rows = std::min<std::size_t>(dim <= 32 ? 1024 : 512, m);
+  std::size_t tile_cols;
+  if (tile_rows * n * 2 * kFloat <= k512MiB) {
+    tile_cols = n;  // whole width fits the initial budget: no column tiling
+  } else {
+    // Assume the largest (>8 GB GPU) budget; under pressure cuVS tiles smaller,
+    // i.e. uses less, so this stays an upper bound.
+    tile_cols = std::min<std::size_t>(k1GiB / (2 * kFloat * tile_rows), n);
+  }
+
+  std::size_t const num_col_tiles = (n + tile_cols - 1) / tile_cols;
+  std::size_t const temp_out_cols =
+    static_cast<std::size_t>(std::max<int64_t>(k, 1)) * num_col_tiles;
+  std::size_t const temp_distances = tile_rows * tile_cols * kFloat;
+  std::size_t const temp_out       = tile_rows * temp_out_cols * (kFloat + kIndex);
+  // select_k workspace over [tile_rows x tile_cols]; empirical, ~1x the tile.
+  std::size_t const select_k_ws = temp_distances;
+
+  return temp_distances + temp_out + norms + select_k_ws + kFloor;
 }
 
 }  // namespace sirius::vss

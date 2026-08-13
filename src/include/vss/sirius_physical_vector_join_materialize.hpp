@@ -19,10 +19,13 @@
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "vss/vector_join.hpp"
 
-#include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/table/table.hpp>
+#include <cudf/types.hpp>
 
+#include <rmm/resource_ref.hpp>
+
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -38,18 +41,16 @@ namespace sirius::op {
  * @brief Materialize stage of the vector join: turns the merge's per-left-batch
  *        top-k id/distance lists into the output rows and streams them to DuckDB.
  *
- * The merge tags each per-row top-k result with its left batch index as the
- * partition. This drains one partition (left batch Ri) per task and builds the
- * TVF rows `[left_output_cols…, right_output_cols…, score]`:
- *   - left cols: `cudf::repeat` batch Ri's output columns k times (each left row
- *     is repeated for its k neighbors),
- *   - right cols: `cudf::gather` the (once-concatenated) right output columns by
- *     the global neighbor id,
- *   - score: the distance, mapped to similarity for cosine+similarity output.
+ * reduce_local already prepended this partition's repeated left output columns.
+ * This stage drains one partition (left batch) per task and finishes the TVF rows:
+ *   - left cols: passed through from the input,
+ *   - right cols: on the fast path, col0 is the right table's id value, no gather.
+ *                 On the payload path, gather right output columns by col0 (the right table's
+ *                 global row number).
+ *   - score: the distance/similarity.
  *
- * Output is a plain `pipelineable_operator_data` — the result collector streams
- * it to the host. Refinement (exact distances) happens upstream in the selection
- * stage, so materialize never touches the vectors. Per-row top-k only for now.
+ * Output is a plain pipelineable_operator_data, the result collector streams
+ * it to the host.
  */
 class sirius_physical_vector_join_materialize : public sirius_physical_partition_consumer_operator {
  public:
@@ -59,7 +60,8 @@ class sirius_physical_vector_join_materialize : public sirius_physical_partition
   sirius_physical_vector_join_materialize(duckdb::vector<sirius::logical_type> types,
                                           duckdb::idx_t estimated_cardinality,
                                           sirius::vss::vector_join_request request,
-                                          sirius::scan_manager::sirius_scan_manager* scan_manager);
+                                          sirius::scan_manager::sirius_scan_manager* scan_manager,
+                                          bool is_fast_path);
 
   bool is_source() const override { return true; }
   bool is_sink() const override { return true; }
@@ -78,23 +80,32 @@ class sirius_physical_vector_join_materialize : public sirius_physical_partition
   std::string params_to_string() const override;
 
  private:
-  /// Resolve both pinned tables, snapshot the left output columns per batch, and
-  /// concatenate the right output columns once (indexed by global right id).
-  /// Idempotent; needs a stream + memory space, so it runs on first execute().
-  void ensure_initialized(rmm::cuda_stream_view stream, ::cucascade::memory::memory_space& space);
+  /// Payload path only: snapshot the right output columns' per-batch views plus
+  /// each batch's global row offset, so a row can be gathered from the batch that
+  /// owns it. Idempotent. The fast path gathers nothing, so it skips this.
+  void ensure_initialized();
+
+  /// Payload path only: gather the right output columns for col0.
+  [[nodiscard]] std::unique_ptr<cudf::table> gather_right_by_batch(
+    cudf::column_view const& col0_partitioned,
+    std::vector<cudf::size_type> const& part_offsets,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const;
 
   sirius::vss::vector_join_request _request;
   sirius::scan_manager::sirius_scan_manager* _scan_manager;
+  bool _is_fast_path{false};
 
   std::mutex _drain_mutex;                  // guards get_next_task_input_data()
   std::size_t _current_partition_index{0};  // next partition (left batch) to drain
 
-  std::mutex _init_mutex;  // guards the one-time init below
+  std::mutex _init_mutex;  // guards the one-time snapshot below
   bool _initialized{false};
-  //! Left output columns as zero-copy views, indexed [output_col][batch].
-  std::vector<std::vector<cudf::column_view>> _left_output_cols;
-  //! Right output columns concatenated across batches; row i == global right id i.
-  std::unique_ptr<cudf::table> _right_output_concat;
+  //! Payload path only: right output columns as zero-copy per-batch views,
+  //  indexed [output_col][batch]. Unused on the fast path.
+  std::vector<std::vector<cudf::column_view>> _right_output_views;
+  //! Payload path only: global row offset (prefix sum) of each right batch.
+  std::vector<std::int64_t> _right_offsets;
 };
 
 }  // namespace sirius::op

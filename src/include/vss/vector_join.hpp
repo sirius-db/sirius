@@ -43,9 +43,9 @@ enum class vector_join_search_mode : std::uint8_t {
 /// The type of score to emit for each result pair, and which value space the join
 /// selects/thresholds in.
 /// - similarity: higher is closer. For cosine this is the inner product
-///   (1 - distance). Threshold semantics are score >= eps.
+///               (1 - distance). Threshold semantics are score >= eps.
 /// - distance:   lower is closer. The natural output for L2. Threshold semantics
-///   are score <= eps.
+///               are score <= eps.
 enum class vector_join_output_type : std::uint8_t {
   similarity,
   distance,

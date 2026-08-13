@@ -34,7 +34,7 @@ namespace sirius::op {
 /**
  * @brief The input handed to one sirius_physical_vector_join_select::execute() call.
  *
- * VECTOR_JOIN_SELECT (search stage) is a source: it Cartesian-walks the left×right
+ * VECTOR_JOIN_SELECT (search stage) is a source: it Cartesian-walks the left-right
  * pinned batch grid and emits one task per (left batch, right batch) pair. This
  * parcel names that pair by index into the operator's snapshotted batch views,
  * carries the estimated size (so the scheduler can reserve GPU memory), and once
@@ -87,16 +87,14 @@ class vector_join_input : public operator_data {
 /**
  * @brief GPU source operator for a k-nearest-neighbor vector join (search stage).
  *
- * Reads two pinned tables directly and emits one task per (left batch, right
- * batch) pair, self-sourced from the pinned cache rather than scan-fed ports.
- * Each task runs a brute-force knn of the left batch against one right batch
- * and emits that batch's partial top-k, with neighbor ids already shifted into
- * the global right-table row space.
+ * Reads two pinned tables directly and emits one task per (left batch, right batch) pair,
+ * self-sourced from the pinned cache. Each task runs a brute-force knn of the left batch
+ * against one right batch and emits that batch's partial top-k, with neighbor ids already
+ * shifted into the right-table global row number.
  *
  * This is the first of three stages: the partials still need a per-left-batch
  * merge (reduce across right batches) and output materialization downstream.
- * Dedup is the special case where left == right. Assumes both pinned tables fit
- * on the device for now.
+ * Assumes both pinned tables fit on the device for now.
  */
 class sirius_physical_vector_join_select : public sirius_physical_operator {
  public:
@@ -106,7 +104,8 @@ class sirius_physical_vector_join_select : public sirius_physical_operator {
   sirius_physical_vector_join_select(duckdb::vector<sirius::logical_type> types,
                                      duckdb::idx_t estimated_cardinality,
                                      sirius::vss::vector_join_request request,
-                                     sirius::scan_manager::sirius_scan_manager* scan_manager);
+                                     sirius::scan_manager::sirius_scan_manager* scan_manager,
+                                     bool is_fast_path);
 
   [[nodiscard]] const sirius::vss::vector_join_request& request() const { return _request; }
 
@@ -131,7 +130,7 @@ class sirius_physical_vector_join_select : public sirius_physical_operator {
                                          rmm::cuda_stream_view stream) override;
 
   /// Routes each partial to the merge stage's partition = its left batch index,
-  /// so a left batch's per-right-batch partials group together (mirrors PARTITION).
+  /// so a left batch's per-right-batch partials group together.
   void sink(const operator_data& output_data, rmm::cuda_stream_view stream) override;
 
   /// Peak GPU memory estimate for the reservation when there's no run history.
@@ -145,12 +144,12 @@ class sirius_physical_vector_join_select : public sirius_physical_operator {
   /// plus each right batch's global row offset. Idempotent and caller holds _op_mutex.
   void ensure_initialized_locked();
 
-  /// Rough peak-bytes for one pair's task (partial output + brute-force scratch).
-  [[nodiscard]] std::size_t per_pair_estimate(std::size_t left_idx) const;
+  /// Rough peak-bytes for one pair's task (partial output + brute-force search scratch).
+  [[nodiscard]] std::size_t per_pair_estimate(std::size_t left_idx, std::size_t right_idx) const;
 
   //! Resolved corpus/probe identity + tuning knobs, carried from SiriusVectorJoinBind.
   sirius::vss::vector_join_request _request;
-  //! Scan manager the pinned left/right tables are resolved against (query-lived).
+  //! Scan manager the pinned left/right tables are resolved against.
   sirius::scan_manager::sirius_scan_manager* _scan_manager;
 
   std::mutex _op_mutex;  // guards lazy init and the walk cursor
@@ -160,7 +159,14 @@ class sirius_physical_vector_join_select : public sirius_physical_operator {
   std::vector<cudf::column_view> _left_views;
   std::vector<cudf::column_view> _right_views;
   //! Global row offset of each right batch (prefix sum of right batch row counts).
+  //! Used only on the payload path.
   std::vector<std::int64_t> _right_offsets;
+  //! When true, the right output is a single integer id: carry the gathered id
+  //! value through the merge (fast path) instead of the global row position, so
+  //! materialize can emit it directly with no late gather.
+  bool _is_fast_path{false};
+  //! Per-batch views of the right id column (only populated when _is_fast_path).
+  std::vector<cudf::column_view> _right_id_views;
   std::size_t _num_pairs{0};
   std::size_t _next_pair{0};
 };

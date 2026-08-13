@@ -17,10 +17,13 @@
 #include "vss/sirius_physical_vector_join_reduce_local.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "scan_manager/sirius_scan_manager.hpp"
 #include "vss/knn_merge.hpp"
+#include "vss/pinned_column.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/concatenate.hpp>
+#include <cudf/filling.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
@@ -41,18 +44,51 @@
 namespace sirius::op {
 
 sirius_physical_vector_join_reduce_local::sirius_physical_vector_join_reduce_local(
-  duckdb::vector<sirius::logical_type> types, duckdb::idx_t estimated_cardinality, std::int64_t k)
+  duckdb::vector<sirius::logical_type> types,
+  duckdb::idx_t estimated_cardinality,
+  std::int64_t k,
+  sirius::vss::vector_join_request request,
+  sirius::scan_manager::sirius_scan_manager* scan_manager)
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::VECTOR_JOIN_REDUCE_LOCAL,
       std::move(types),
       estimated_cardinality),
-    _k(k)
+    _k(k),
+    _request(std::move(request)),
+    _scan_manager(scan_manager)
 {
+}
+
+void sirius_physical_vector_join_reduce_local::ensure_initialized()
+{
+  std::lock_guard<std::mutex> lg(_init_mutex);
+  if (_initialized) { return; }
+  if (_scan_manager == nullptr) {
+    throw std::runtime_error("[sirius_physical_vector_join_reduce_local] no scan manager set");
+  }
+
+  auto const& left = _request.left;
+  const auto* left_pin =
+    _scan_manager->find_pinned_entry_for_duckdb_table(left.catalog, left.schema, left.table);
+  if (left_pin == nullptr) {
+    throw std::runtime_error(
+      "[sirius_physical_vector_join_reduce_local] left table is no longer pinned");
+  }
+  auto& left_space = vss::pinned_entry_gpu_space(*left_pin);
+
+  // Left output columns as zero-copy per-batch views: _left_output_cols[col][batch].
+  _left_output_cols.resize(left.output_columns.size());
+  for (std::size_t c = 0; c < left.output_columns.size(); ++c) {
+    _left_output_cols[c] =
+      vss::pinned_column_chunk_views(*left_pin, left.output_columns[c], left_space);
+  }
+
+  _initialized = true;
 }
 
 std::unique_ptr<operator_data> sirius_physical_vector_join_reduce_local::get_next_task_input_data()
 {
-  // One merge task per partition (= one left batch): drain all its partials.
+  // One merge task per partition (one left batch): drain all its partials.
   std::lock_guard<std::mutex> lg(_drain_mutex);
 
   auto* repo = ports.begin()->second->repo;
@@ -87,10 +123,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_reduce_local::execute
       std::vector<std::shared_ptr<cucascade::data_batch>>{}, partition_idx);
   }
 
-  // Each partial is [neighbor_id INT64 (col 0), distance FLOAT32 (col 1)],
-  // flattened row-major [n_samples * k]. Collect the two columns from every
-  // partial; concatenating in order yields the part-major layout knn_merge_parts
-  // expects (part p's [n_samples, k] block at row p*n_samples).
+  ensure_initialized();
+
+  // Collect and concat the two columns from every partial in order to
+  // form part-major layout that knn_merge_parts expects.
   auto const part_rows =
     static_cast<std::int64_t>(sirius::get_cudf_table_view(input_batches[0]).num_rows());
   std::vector<cudf::column_view> neighbor_views;
@@ -99,11 +135,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_reduce_local::execute
   distance_views.reserve(input_batches.size());
   for (auto const& ro : input_batches) {
     auto const tv = sirius::get_cudf_table_view(ro);
-    // knn_merge needs the same per-batch k across every right batch. Unequal part
-    // sizes mean one right batch had fewer than k rows (an uneven multi-batch
-    // right table); reject it rather than merge mismatched blocks into wrong
-    // results. k is already lowered to the right-table row count at plan time, so
-    // a single right batch never trips this.
+    // knn_merge requires the same per-batch k across every right batch.
     if (static_cast<std::int64_t>(tv.num_rows()) != part_rows) {
       throw std::runtime_error(
         "[sirius_physical_vector_join_reduce_local] uneven right batches: a right batch "
@@ -114,7 +146,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_reduce_local::execute
   }
 
   auto const n_parts   = static_cast<std::int64_t>(input_batches.size());
-  auto const n_samples = part_rows / _k;  // uniform k (checked above); leaf re-checks total size
+  auto const n_samples = part_rows / _k;
 
   auto const mr = space->get_default_allocator();
 
@@ -125,10 +157,22 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_reduce_local::execute
   auto merged = vss::knn_merge_parts_topk(
     res, stacked_distances->view(), stacked_neighbors->view(), n_samples, n_parts, _k, stream, mr);
 
-  // Preserve the [neighbor_id, distance] layout and the partition (left batch)
-  // so the materialize stage can gather each left row's output columns.
+  // Repeat this left batch's output columns for their k neighbors.
+  std::vector<cudf::column_view> left_batch_cols;
+  left_batch_cols.reserve(_left_output_cols.size());
+  for (auto const& per_batch : _left_output_cols) {
+    left_batch_cols.push_back(per_batch[partition_idx]);
+  }
+  auto left_repeated =
+    cudf::repeat(cudf::table_view(left_batch_cols), static_cast<cudf::size_type>(_k), stream, mr);
+
+  // Emit and keep the partition (left batch) so materialize drains one batch per task.
   std::vector<std::unique_ptr<cudf::column>> out_cols;
-  out_cols.reserve(2);
+  auto left_cols = left_repeated->release();
+  out_cols.reserve(left_cols.size() + 2);
+  for (auto& c : left_cols) {
+    out_cols.push_back(std::move(c));
+  }
   out_cols.push_back(std::move(merged.neighbors));
   out_cols.push_back(std::move(merged.distances));
   auto out_table = std::make_unique<cudf::table>(std::move(out_cols));

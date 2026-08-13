@@ -39,25 +39,25 @@ namespace sirius::vss {
  * the global top-k per left row.
  *
  * Input layout is part-major and flat: @p stacked_distances / @p stacked_neighbors
- * are `[n_parts * n_samples * k]`, part `p`'s `[n_samples, k]` block at offset
- * `p * n_samples * k`, which is exactly what concatenating the per-part partials in
- * order yields. Neighbor ids are expected to be *already global* (the selection stage
+ * are [n_parts * n_samples * k], part p's [n_samples, k] block at offset
+ * p * n_samples * k, which is exactly what concatenating the per-part partials in
+ * order yields. Neighbor ids are expected to be already global (the selection stage
  * shifts them), so no per-part translation is applied here.
  *
  * Both parts must share @p n_samples and @p k (uniform k across right batches).
- * Results are nearest-first per query, flattened `[n_samples * k]`, matching
+ * Results are nearest-first per query, flattened [n_samples * k], matching
  * @ref brute_force_knn. Runs async on @p res's stream.
  *
- * @param res              Caller-owned RAFT resources; runs on its stream.
- * @param stacked_distances FLOAT32 `[n_parts*n_samples*k]`, part-major.
- * @param stacked_neighbors INT64 `[n_parts*n_samples*k]`, part-major, global ids.
- * @param n_samples        Rows per part (the left batch's row count).
- * @param n_parts          Number of parts (right batches merged).
- * @param k                Neighbors per query.
- * @param stream           Stream for scratch allocations.
- * @param mr               Device resource for the output columns.
- * @return Merged neighbor-index and distance columns `[n_samples*k]`, plus
- *         `n_samples` and `k`.
+ * @param res               Caller-owned RAFT resources; runs on its stream.
+ * @param stacked_distances FLOAT32 [n_parts*n_samples*k], part-major.
+ * @param stacked_neighbors INT64 [n_parts*n_samples*k], part-major, global ids.
+ * @param n_samples         Rows per part (the left batch's row count).
+ * @param n_parts           Number of parts (right batches merged).
+ * @param k                 Neighbors per query.
+ * @param stream            Stream for scratch allocations.
+ * @param mr                Device resource for the output columns.
+ * @return Merged neighbor-index and distance columns [n_samples*k], plus
+ *         n_samples and k.
  */
 knn_result knn_merge_parts_topk(
   raft::device_resources const& res,

@@ -64,8 +64,6 @@ knn_result knn_merge_parts_topk(raft::device_resources const& res,
   auto const out_idx = raft::make_device_matrix_view<int64_t, int64_t, raft::row_major>(
     out_neighbors->mutable_view().data<int64_t>(), n_samples, k);
 
-  // Neighbor ids are already global (shifted in the selection stage), so every
-  // part's translation is zero.
   rmm::device_uvector<int64_t> translations(static_cast<std::size_t>(n_parts), stream, mr);
   CUDF_CUDA_TRY(
     cudaMemsetAsync(translations.data(), 0, translations.size() * sizeof(int64_t), stream.value()));

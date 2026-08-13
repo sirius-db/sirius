@@ -26,9 +26,11 @@
 
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
+#include <cudf/unary.hpp>
 
 #include <raft/core/device_resources.hpp>
 
@@ -49,11 +51,13 @@ sirius_physical_vector_join_select::sirius_physical_vector_join_select(
   duckdb::vector<sirius::logical_type> types,
   duckdb::idx_t estimated_cardinality,
   sirius::vss::vector_join_request request,
-  sirius::scan_manager::sirius_scan_manager* scan_manager)
+  sirius::scan_manager::sirius_scan_manager* scan_manager,
+  bool is_fast_path)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::VECTOR_JOIN_SELECT, std::move(types), estimated_cardinality),
     _request(std::move(request)),
-    _scan_manager(scan_manager)
+    _scan_manager(scan_manager),
+    _is_fast_path(is_fast_path)
 {
 }
 
@@ -87,11 +91,25 @@ void sirius_physical_vector_join_select::ensure_initialized_locked()
 
   // Each right batch's neighbor ids are local (0..batch_rows); record the global
   // row offset so execute() can shift them into the whole-right-table id space.
+  // (Only the payload path uses these.)
   _right_offsets.resize(_right_views.size());
   std::int64_t acc = 0;
   for (std::size_t j = 0; j < _right_views.size(); ++j) {
     _right_offsets[j] = acc;
     acc += static_cast<std::int64_t>(_right_views[j].size());
+  }
+
+  // Fast path: snapshot the right id column's per-batch views so execute() can
+  // gather each pair's id values from local neighbor positions and carry them
+  // through the merge.
+  if (_is_fast_path) {
+    if (right.output_columns.size() != 1) {
+      throw std::runtime_error(
+        "[sirius_physical_vector_join_select] is_fast_path requires exactly one right output "
+        "column (the id)");
+    }
+    _right_id_views = vss::pinned_column_chunk_views(
+      *right_pin, right.output_columns.front(), vss::pinned_entry_gpu_space(*right_pin));
   }
 
   _num_pairs   = _left_views.size() * _right_views.size();
@@ -130,7 +148,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_select::get_next_task
   auto const left_idx   = pair_index / n_right;
   auto const right_idx  = pair_index % n_right;
 
-  return std::make_unique<vector_join_input>(left_idx, right_idx, per_pair_estimate(left_idx));
+  return std::make_unique<vector_join_input>(
+    left_idx, right_idx, per_pair_estimate(left_idx, right_idx));
 }
 
 //===----------------------------------------------------------------------===//
@@ -141,21 +160,21 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_select::execute(
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_vector_join_select::execute"};
 
-  auto const* join_in = dynamic_cast<const vector_join_input*>(&input_data);
-  if (join_in == nullptr) {
+  auto const* join_input = dynamic_cast<const vector_join_input*>(&input_data);
+  if (join_input == nullptr) {
     throw std::runtime_error(
       "[sirius_physical_vector_join_select::execute] expected vector_join_input; got " +
       std::string(typeid(input_data).name()));
   }
-  auto* mem_space = join_in->get_gpu_memory_space();
+  auto* mem_space = join_input->get_gpu_memory_space();
   if (mem_space == nullptr) {
     throw std::runtime_error(
       "[sirius_physical_vector_join_select::execute] no memory space set; prepare_for_processing "
       "was not called");
   }
 
-  auto const left_idx  = join_in->left_idx();
-  auto const right_idx = join_in->right_idx();
+  auto const left_idx  = join_input->left_idx();
+  auto const right_idx = join_input->right_idx();
   auto const dim       = _request.dim;
 
   // Zero-copy matrix views over this pair's pinned batches.
@@ -175,25 +194,37 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_select::execute(
     vss::join_selection_distance_type_from_metric(_request.metric, exact_unexpanded);
   auto knn = vss::brute_force_knn(res, dataset, queries, k_eff, metric, mr);
 
-  // Shift local neighbor ids into the global right-table row space so the
-  // downstream merge can combine batches without tracking per-batch offsets.
-  std::unique_ptr<cudf::column> neighbors = std::move(knn.neighbors);
-  auto const offset                       = _right_offsets[right_idx];
-  if (offset != 0) {
-    cudf::numeric_scalar<std::int64_t> const off_scalar(offset, true, stream);
-    neighbors = cudf::binary_operation(neighbors->view(),
-                                       off_scalar,
-                                       cudf::binary_operator::ADD,
-                                       cudf::data_type{cudf::type_id::INT64},
-                                       stream,
-                                       mr);
+  // On the fast path, the neighbor stores the actual right table's id values. It is widened
+  // to INT64 for downstream ops (reduce and materialize).
+  std::unique_ptr<cudf::column> neighbors;
+  if (_is_fast_path) {
+    auto const id_table = cudf::table_view{{_right_id_views[right_idx]}};
+    auto gathered       = cudf::gather(
+      id_table, knn.neighbors->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
+    auto gathered_cols = gathered->release();
+    neighbors          = std::move(gathered_cols.front());
+    if (neighbors->type().id() != cudf::type_id::INT64) {
+      neighbors = cudf::cast(neighbors->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
+    }
+  }
+  // On the payload path, the neighbor stores right table's row number. Materialize op uses the
+  // row number later to gather the requested output columns.
+  else {
+    neighbors         = std::move(knn.neighbors);
+    auto const offset = _right_offsets[right_idx];
+    if (offset != 0) {
+      cudf::numeric_scalar<std::int64_t> const off_scalar(offset, true, stream);
+      neighbors = cudf::binary_operation(neighbors->view(),
+                                         off_scalar,
+                                         cudf::binary_operator::ADD,
+                                         cudf::data_type{cudf::type_id::INT64},
+                                         stream,
+                                         mr);
+    }
   }
 
-  // Partial layout: [neighbor_global_id (INT64), distance (FLOAT32)], flattened
-  // row-major [n_left * k_eff]. The distance is the final value: L2 rides the
-  // expanded/GEMM path and cosine is intrinsically well-conditioned, so no
-  // downstream recompute is needed. Tag with the left batch index so all of a
-  // left batch's per-right-batch partials land in one partition for reduce.
+  // Tag with the left batch index so all of a left batch's per-right-batch partials
+  // land in one partition for reduce.
   std::vector<std::unique_ptr<cudf::column>> out_cols;
   out_cols.reserve(2);
   out_cols.push_back(std::move(neighbors));
@@ -231,25 +262,32 @@ void sirius_physical_vector_join_select::sink(const operator_data& output_data,
 //===----------------------------------------------------------------------===//
 // Memory estimation
 //===----------------------------------------------------------------------===//
-std::size_t sirius_physical_vector_join_select::per_pair_estimate(std::size_t left_idx) const
+std::size_t sirius_physical_vector_join_select::per_pair_estimate(std::size_t left_idx,
+                                                                  std::size_t right_idx) const
 {
-  // Output is [n_left * k] of (INT64 id + FLOAT32 distance) = n_left*k*12 bytes;
-  // add the same order again for brute-force scratch, plus a 1 MiB floor.
-  auto const n_left = static_cast<std::size_t>(_left_views[left_idx].size());
-  auto const k      = static_cast<std::size_t>(std::max<std::int64_t>(_request.k, 1));
-  auto const output = n_left * k * (sizeof(std::int64_t) + sizeof(float));
-  return (output * 3) + (std::size_t{1} << 20);
+  // Output is n_left * k (of INT64 id and FLOAT32 distance), so n_left * k * 12 bytes.
+  auto const n_left  = static_cast<std::int64_t>(_left_views[left_idx].size());
+  auto const n_right = static_cast<std::int64_t>(_right_views[right_idx].size());
+  auto const k       = std::max<std::int64_t>(_request.k, 1);
+  auto const output  = static_cast<std::size_t>(n_left) * static_cast<std::size_t>(k) *
+                      (sizeof(std::int64_t) + sizeof(float));
+
+  // brute_force_knn's scratch dominates and scales with the pairwise-distance tile (n_right, dim)
+  auto const exact_unexpanded = _request.search_mode == vss::vector_join_search_mode::exact;
+  auto const metric =
+    vss::join_selection_distance_type_from_metric(_request.metric, exact_unexpanded);
+  auto const scratch =
+    vss::brute_force_peak_scratch_bytes(n_left, n_right, _request.dim, k, metric);
+
+  return output + scratch;
 }
 
 std::size_t sirius_physical_vector_join_select::no_history_peak_memory_estimate(
   const input_stats& stats) const
 {
-  // The per-pair input already carries a sized estimate; floor it so the
-  // reservation request is always well-formed.
-  //
-  // Note: this ignores cuVS's on-demand search scratch, which is much larger and
-  // metric-dependent (~209 MB cosine vs ~35 MB L2 on a 50k x 50k pair), so the
-  // estimate could be improved.
+  // The per-pair input already carries a sized estimate (output + cuVS search
+  // scratch, from per_pair_estimate/brute_force_peak_scratch_bytes); floor it so
+  // the reservation request is always well-formed.
   return std::max<std::size_t>(stats.bytes, std::size_t{1} << 20);
 }
 

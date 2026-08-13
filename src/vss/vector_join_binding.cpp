@@ -19,6 +19,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/parser/qualified_name.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
@@ -84,10 +85,34 @@ std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
   };
 
   if (out_cols.empty()) {
-    // Default to all pinned columns in catalog schema order
-    for (auto const& name : schema_names) {
-      if (is_pinned(name)) { side.output_columns.push_back(name); }
+    // Default to the table's single-column integer primary key.
+    // Anything else must be named explicitly via output_columns.
+    auto const pk = entry.GetPrimaryKey();
+    if (!pk) {
+      throw duckdb::BinderException(
+        "sirius_knn_join: " + label + " table '" + side.table +
+        "' has no primary key; declaring an integer PRIMARY KEY id column gives the fast "
+        "id-only path, otherwise pass output_columns => [...] to name the columns to return");
     }
+    auto const& unique    = pk->Cast<duckdb::UniqueConstraint>();
+    auto const pk_logical = unique.GetLogicalIndexes(columns);
+    if (pk_logical.size() != 1) {
+      throw duckdb::BinderException(
+        "sirius_knn_join: " + label + " table '" + side.table +
+        "' has a composite primary key; pass output_columns => [...] to choose the id column");
+    }
+    auto const& pk_col = columns.GetColumn(pk_logical.front());
+    if (!pk_col.Type().IsIntegral()) {
+      throw duckdb::BinderException("sirius_knn_join: " + label + " table '" + side.table +
+                                    "' primary key '" + pk_col.Name() +
+                                    "' is not an integer column; pass output_columns => [...]");
+    }
+    if (!is_pinned(pk_col.Name())) {
+      throw duckdb::BinderException("sirius_knn_join: " + label + " primary key '" + pk_col.Name() +
+                                    "' is not pinned on table '" + side.table +
+                                    "'; pin it (pin_table cols => [...]) or pass output_columns");
+    }
+    side.output_columns.push_back(pk_col.Name());
   } else {
     for (auto const& col : out_cols) {
       bool const in_catalog =

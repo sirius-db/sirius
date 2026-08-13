@@ -74,11 +74,11 @@ TEST_CASE_METHOD(VectorJoinFixture,
                  "sirius_knn_join - exact L2 on large-magnitude vectors",
                  "[integration][gpu_execution][array][vss][vector_join]")
 {
-  run_ok("CREATE TABLE vj_corpus (id INTEGER, vec FLOAT[3]);");
+  run_ok("CREATE TABLE vj_corpus (id INTEGER PRIMARY KEY, vec FLOAT[3]);");
   run_ok(
     "INSERT INTO vj_corpus SELECT i, [i::float, (i+1)::float, (i+2)::float] FROM range(50000) "
     "t(i);");
-  run_ok("CREATE TABLE vj_probe (id INTEGER, vec FLOAT[3]);");
+  run_ok("CREATE TABLE vj_probe (id INTEGER PRIMARY KEY, vec FLOAT[3]);");
   run_ok(
     "INSERT INTO vj_probe VALUES "
     "(0, [49800.0, 49801.0, 49802.0]), "
@@ -121,11 +121,11 @@ TEST_CASE_METHOD(VectorJoinFixture,
                  "[integration][gpu_execution][array][vss][vector_join]")
 {
   // Magnitudes ~1, directions spread over the sphere -> GEMM is well-conditioned.
-  run_ok("CREATE TABLE gemm_corpus (id INTEGER, vec FLOAT[3]);");
+  run_ok("CREATE TABLE gemm_corpus (id INTEGER PRIMARY KEY, vec FLOAT[3]);");
   run_ok(
     "INSERT INTO gemm_corpus SELECT i, "
     "[sin(i)::float, cos(i*1.3)::float, sin(i*0.7)::float] FROM range(50000) t(i);");
-  run_ok("CREATE TABLE gemm_probe (id INTEGER, vec FLOAT[3]);");
+  run_ok("CREATE TABLE gemm_probe (id INTEGER PRIMARY KEY, vec FLOAT[3]);");
   run_ok(
     "INSERT INTO gemm_probe SELECT i, "
     "[sin(i)::float, cos(i*1.3)::float, sin(i*0.7)::float] FROM range(5) t(i);");
@@ -169,7 +169,7 @@ TEST_CASE_METHOD(VectorJoinFixture,
                  "sirius_knn_join - self-join with k larger than the table",
                  "[integration][gpu_execution][array][vss][vector_join]")
 {
-  run_ok("CREATE TABLE sj (id INTEGER, vec FLOAT[3]);");
+  run_ok("CREATE TABLE sj (id INTEGER PRIMARY KEY, vec FLOAT[3]);");
   run_ok(
     "INSERT INTO sj VALUES "
     "(0, [1.0, 0.0, 0.0]), (1, [0.0, 1.0, 0.0]), (2, [0.0, 0.0, 1.0]), "
@@ -202,7 +202,7 @@ TEST_CASE_METHOD(VectorJoinFixture,
                  "sirius_knn_join - self-join per-row top-k with k below the table size",
                  "[integration][gpu_execution][array][vss][vector_join]")
 {
-  run_ok("CREATE TABLE dedup (id INTEGER, vec FLOAT[3]);");
+  run_ok("CREATE TABLE dedup (id INTEGER PRIMARY KEY, vec FLOAT[3]);");
   run_ok(
     "INSERT INTO dedup VALUES "
     "(0, [1.0, 0.0, 0.0]), (1, [2.0, 0.0, 0.0]), (2, [4.0, 0.0, 0.0]), "
@@ -239,11 +239,11 @@ TEST_CASE_METHOD(VectorJoinFixture,
                  "sirius_knn_join - exact L2 across multiple right batches",
                  "[integration][gpu_execution][array][vss][vector_join]")
 {
-  run_ok("CREATE TABLE mb_corpus (id INTEGER, vec FLOAT[3]);");
+  run_ok("CREATE TABLE mb_corpus (id INTEGER PRIMARY KEY, vec FLOAT[3]);");
   run_ok(
     "INSERT INTO mb_corpus SELECT i, [i::float, (i+1)::float, (i+2)::float] "
     "FROM range(300000) t(i);");
-  run_ok("CREATE TABLE mb_probe (id INTEGER, vec FLOAT[3]);");
+  run_ok("CREATE TABLE mb_probe (id INTEGER PRIMARY KEY, vec FLOAT[3]);");
   // Probes spread across the corpus so the winning neighbors come from different
   // batches -- the merge has to pick each probe's near shell out of far partials
   // contributed by every other batch.
@@ -287,11 +287,11 @@ TEST_CASE_METHOD(VectorJoinFixture,
 {
   // Varied directions so cosine is discriminative (the [i,i+1,i+2] corpus is all
   // parallel -> every pair ~1, degenerate for cosine).
-  run_ok("CREATE TABLE cos_corpus (id INTEGER, vec FLOAT[3]);");
+  run_ok("CREATE TABLE cos_corpus (id INTEGER PRIMARY KEY, vec FLOAT[3]);");
   run_ok(
     "INSERT INTO cos_corpus SELECT i, "
     "[sin(i)::float, cos(i*1.3)::float, sin(i*0.7)::float] FROM range(50000) t(i);");
-  run_ok("CREATE TABLE cos_probe (id INTEGER, vec FLOAT[3]);");
+  run_ok("CREATE TABLE cos_probe (id INTEGER PRIMARY KEY, vec FLOAT[3]);");
   run_ok(
     "INSERT INTO cos_probe SELECT i, "
     "[sin(i)::float, cos(i*1.3)::float, sin(i*0.7)::float] FROM range(5) t(i);");
@@ -340,13 +340,65 @@ TEST_CASE_METHOD(VectorJoinFixture,
 }
 
 // -----------------------------------------------------------------------------
+// Payload path (route-once): a multi-column right output forces the non-fast path,
+// where materialize must gather the requested columns by global row number. The
+// corpus id starts at 10000 so id != row position -- a route-once bug that used the
+// position as the id, or mis-mapped rows across batches, would return wrong ids.
+// The corpus is large enough to span several pinned batches, so the per-batch
+// routing (partition + per-batch gather) is actually exercised.
+// -----------------------------------------------------------------------------
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - payload path gathers right columns across batches",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  run_ok("CREATE TABLE pay_corpus (id INTEGER PRIMARY KEY, val INTEGER, vec FLOAT[3]);");
+  // id = 10000 + row position, val = a second payload column; both must come back
+  // via the batch-routed gather, not from the row number.
+  run_ok(
+    "INSERT INTO pay_corpus SELECT 10000 + i, i * 2, [i::float, (i+1)::float, (i+2)::float] "
+    "FROM range(300000) t(i);");
+  run_ok("CREATE TABLE pay_probe (id INTEGER PRIMARY KEY, vec FLOAT[3]);");
+  run_ok(
+    "INSERT INTO pay_probe VALUES "
+    "(90000, [150000.0, 150001.0, 150002.0]), "
+    "(90001, [37000.0, 37001.0, 37002.0]), "
+    "(90002, [260000.0, 260001.0, 260002.0]), "
+    "(90003, [150090.0, 150091.0, 150092.0]), "
+    "(90004, [90000.0, 90001.0, 90002.0]);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'pay_corpus', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'pay_probe', tier => 'gpu', format => 'duckdb');");
+
+  // CPU reference: each probe's top-9 corpus neighbors, returning the corpus id +
+  // val (the payload columns) alongside the probe id.
+  con->Query("SET gpu_execution = false;");
+  auto reference = ok_rows(*con,
+                           "SELECT p.id, n.id, n.val FROM pay_probe p, LATERAL ("
+                           "  SELECT c.id, c.val, c.vec FROM pay_corpus c "
+                           "  ORDER BY array_distance(p.vec, c.vec) LIMIT 9) n;");
+  con->Query("SET gpu_execution = true;");
+
+  // right_output_columns has two columns, so the join takes the payload (gather)
+  // path rather than the id-only fast path. left defaults to the probe's PK.
+  auto joined = ok_rows(*con,
+                        "SELECT left_id, right_id, right_val FROM sirius_knn_join("
+                        "'pay_probe','vec','pay_corpus','vec', "
+                        "search_mode => 'exact', metric => 'l2', k => 9, "
+                        "right_output_columns => ['id', 'val']);");
+  REQUIRE(joined == reference);
+
+  run_ok("SELECT * FROM unpin_table('pay_probe');");
+  run_ok("SELECT * FROM unpin_table('pay_corpus');");
+}
+
+// -----------------------------------------------------------------------------
 // L2 has no natural similarity, so the combination is rejected at bind.
 // -----------------------------------------------------------------------------
 TEST_CASE_METHOD(VectorJoinFixture,
                  "sirius_knn_join - l2 with similarity output is rejected",
                  "[integration][gpu_execution][array][vss][vector_join]")
 {
-  run_ok("CREATE TABLE rej (id INTEGER, vec FLOAT[3]);");
+  run_ok("CREATE TABLE rej (id INTEGER PRIMARY KEY, vec FLOAT[3]);");
   run_ok("INSERT INTO rej VALUES (0, [1.0, 0.0, 0.0]), (1, [0.0, 1.0, 0.0]);");
   run_ok("CHECKPOINT;");
   run_ok("SELECT * FROM pin_table(name => 'rej', tier => 'gpu', format => 'duckdb');");
