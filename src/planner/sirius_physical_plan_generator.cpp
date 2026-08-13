@@ -921,9 +921,10 @@ bool merge_downstream_is_streaming_dead_end(const sirius::op::sirius_physical_op
 void sirius_physical_plan_generator::mark_fusable_merge_pipelines(
   duckdb::ClientContext& context, sirius::op::sirius_physical_operator& op)
 {
-  // Keep the fusion decision consistent throughout this plan traversal.
+  // Merge fusion is the engine-owned production policy. Unit tests can expose a guarded setting
+  // to exercise the unfused reference path without making that implementation detail a user knob.
   duckdb::Value setting;
-  bool fusion_enabled = true;  // matches the registered default
+  bool fusion_enabled = true;
   if (context.TryGetCurrentSetting("fuse_merge_pipelines", setting) && !setting.IsNull()) {
     fusion_enabled = setting.GetValue<bool>();
   }
