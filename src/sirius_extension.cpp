@@ -1318,6 +1318,12 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   // directory (if configured), then resolve it into a compression_pin_config. Both
   // the host and GPU pin paths compress with this when enabled.
   const auto& comp_cfg = sirius_ctx->get_config().get_compression_config();
+  if (comp_cfg.enable_pin_table_compression && comp_cfg.input_plan_dir.empty()) {
+    SIRIUS_LOG_WARN(
+      "[pin_table] '{}': pin_table_compression is enabled but "
+      "pin_table_input_compression_plan_dir is empty; pinning uncompressed",
+      data.args.name);
+  }
   const bool comp_globally_enabled =
     comp_cfg.enable_pin_table_compression && !comp_cfg.input_plan_dir.empty();
   if (comp_globally_enabled) {
@@ -2375,23 +2381,27 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     SetEnableGpuExecution);
 
   config.AddExtensionOption("pin_table_compression",
-                            "Enable Simpatico compression for pin_table(tier=>'host') chunks",
+                            "Request Simpatico compression for pin_table chunks. Takes effect only "
+                            "when pin_table_input_compression_plan_dir is non-empty and contains a "
+                            "matching table plan",
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(compression_defaults.enable_pin_table_compression),
                             SetEnablePinTableCompression);
 
   config.AddExtensionOption(
     "pin_table_input_compression_plan_dir",
-    "Directory containing per-table Simpatico plan files for pin_table(tier=>'host') compression. "
+    "Directory containing per-table Simpatico plan files for pin_table compression. "
     "Files are named '<table_name>.<ext>'; their contents are the multi-column plan DSL. "
-    "Tables with no matching file are pinned uncompressed. No effect on spill compression.",
+    "May be set before pin_table_compression is enabled. Tables with no matching file are pinned "
+    "uncompressed. No effect on spill compression.",
     LogicalType::VARCHAR,
     Value(compression_defaults.input_plan_dir),
     SetPinTableInputCompressionPlanDir);
 
   config.AddExtensionOption(
     "pin_table_compression_min_batch_size_bytes",
-    "Minimum uncompressed batch size in bytes below which pin_table compression is skipped",
+    "Minimum uncompressed batch size in bytes below which active pin_table compression is skipped; "
+    "inert until compression is enabled and a matching plan resolves",
     LogicalType::UBIGINT,
     Value::UBIGINT(compression_defaults.min_batch_size_bytes),
     SetPinTableCompressionMinBatchSizeBytes);
@@ -2399,7 +2409,8 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
   config.AddExtensionOption(
     "pin_table_compression_max_compressed_fraction",
     "Discard the compressed form and pin uncompressed when the compressed size exceeds this "
-    "fraction of the batch's original size (i.e. compression saved too little)",
+    "fraction of the batch's original size (i.e. compression saved too little); inert until "
+    "compression is enabled and a matching plan resolves",
     LogicalType::DOUBLE,
     Value::DOUBLE(compression_defaults.max_compressed_fraction),
     SetPinTableCompressionMaxCompressedFraction);

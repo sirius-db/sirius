@@ -15,6 +15,12 @@ at task-prepare time via the `compressed_host_representation` /
 `compressed_device_blob` → `gpu_table_representation` converters, column-parallel across
 4 fixed streams (measured strictly better than serial).
 
+The compression settings can be staged in either order before a table is pinned. They become
+active only when `pin_table_compression` is true, the plan-directory setting is non-empty, and a
+matching table plan exists. `pin_table` warns and pins uncompressed when the enable flag is true
+but the plan directory is empty; a missing table plan likewise warns and falls back. The batch-size
+and compressed-fraction settings are inert until a matching plan activates compression.
+
 ## Which tier to compress on (GB300, TPC-H SF1000, 22-query hot suite)
 
 The tier decides whether compression helps at all. Measured against a 20.74 s all-host
