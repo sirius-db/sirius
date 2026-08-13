@@ -369,6 +369,76 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
                 pred_names[p],
                 expect.size());
 
+    // The sparse walk must produce the same compacted output from a chunk-CSR
+    // row set — same survivors, expressed as touched chunks + uint16 positions,
+    // and launched over only those chunks.
+    {
+      std::vector<std::uint32_t> csr_chunks, csr_blocks;
+      std::vector<std::uint16_t> csr_rows;
+      csr_blocks.push_back(0);
+      for (std::int64_t c = 0; c < nc; ++c) {
+        std::vector<std::uint16_t> in_chunk;
+        for (std::int64_t r = c * kChunk; r < std::min<std::int64_t>((c + 1) * kChunk, n); ++r) {
+          if ((mask_ref[static_cast<std::size_t>(r) / 32] >> (r % 32)) & 1u) {
+            in_chunk.push_back(static_cast<std::uint16_t>(r - c * kChunk));
+          }
+        }
+        if (in_chunk.empty()) continue;  // untouched chunks are absent, not empty
+        csr_chunks.push_back(static_cast<std::uint32_t>(c));
+        csr_rows.insert(csr_rows.end(), in_chunk.begin(), in_chunk.end());
+        csr_blocks.push_back(static_cast<std::uint32_t>(csr_rows.size()));
+      }
+      REQUIRE_MSG(static_cast<std::int64_t>(csr_rows.size()) == survivors,
+                  "[%s/%s] CSR row count %zu != %lld survivors",
+                  dtype.c_str(),
+                  pred_names[p],
+                  csr_rows.size(),
+                  static_cast<long long>(survivors));
+      if (survivors > 0) {
+        sirius::codegen::chunk_row_set rs;
+        rs.chunk_ids = reinterpret_cast<const std::uint32_t*>(
+          enc.upload_bytes(csr_chunks.data(), csr_chunks.size() * 4));
+        rs.block_offsets = reinterpret_cast<const std::uint32_t*>(
+          enc.upload_bytes(csr_blocks.data(), csr_blocks.size() * 4));
+        rs.in_chunk_rows = reinterpret_cast<const std::uint16_t*>(
+          enc.upload_bytes(csr_rows.data(), csr_rows.size() * 2));
+        rs.num_touched   = static_cast<std::int64_t>(csr_chunks.size());
+        rs.num_survivors = survivors;
+        rs.num_rows      = n;
+        REQUIRE_MSG(rs.valid(), "[%s/%s] built an invalid row set", dtype.c_str(), pred_names[p]);
+
+        CUdeviceptr d_sparse = enc.alloc(static_cast<std::size_t>(survivors) * sizeof(Element));
+        cudaMemset(reinterpret_cast<void*>(d_sparse),
+                   0xEF,
+                   static_cast<std::size_t>(survivors) * sizeof(Element));
+        REQUIRE_MSG(
+          simpatico::launch_decode_fused_tree_compacted(*tree,
+                                                        enc.buffers,
+                                                        dtype.c_str(),
+                                                        n,
+                                                        sm,
+                                                        simpatico::row_enumeration{nullptr, &rs},
+                                                        reinterpret_cast<void*>(d_sparse),
+                                                        stream),
+          "[%s/%s] sparse (chunk_csr) launch failed",
+          dtype.c_str(),
+          pred_names[p]);
+        std::vector<Element> got_sparse(static_cast<std::size_t>(survivors));
+        cudaMemcpy(got_sparse.data(),
+                   reinterpret_cast<const void*>(d_sparse),
+                   got_sparse.size() * sizeof(Element),
+                   cudaMemcpyDeviceToHost);
+        REQUIRE_MSG(got_sparse == expect,
+                    "[%s/%s] sparse output != the mask-walk/host reference (%zu touched chunks of "
+                    "%lld, %lld survivors)",
+                    dtype.c_str(),
+                    pred_names[p],
+                    csr_chunks.size(),
+                    static_cast<long long>(nc),
+                    static_cast<long long>(survivors));
+      }
+    }
+
     std::printf("PASS: %s/%s k3+k4 (survivors=%lld of %lld)\n",
                 dtype.c_str(),
                 pred_names[p],
