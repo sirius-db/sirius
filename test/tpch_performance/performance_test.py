@@ -818,7 +818,9 @@ def print_runtime_summary(runtime_csv):
     print("=== Runtime Summary (seconds) ===")
     for eng in sorted(data):
         print(f"\n[{eng}]")
-        header = f"{'Query':<{q_w}}" + "".join(f"  {lbl:>{col_w}}" for lbl in iter_labels)
+        header = f"{'Query':<{q_w}}" + "".join(
+            f"  {lbl:>{col_w}}" for lbl in iter_labels
+        )
         sep = "-" * len(header)
         print(header)
         print(sep)
