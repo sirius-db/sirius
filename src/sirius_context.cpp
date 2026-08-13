@@ -1584,6 +1584,14 @@ void install_configured_log_sink(DatabaseInstance* db)
   }
 }
 
+bool sirius_disabled_from_environment()
+{
+  auto const* value = std::getenv("SIRIUS_DISABLE");
+  if (value == nullptr || std::string_view{value} == "0") { return false; }
+  if (std::string_view{value} == "1") { return true; }
+  throw InvalidInputException("Invalid SIRIUS_DISABLE '%s' (expected: 0 or 1)", value);
+}
+
 SiriusContextExtensionCallback::SiriusContextExtensionCallback()
 {
   if (auto* env = std::getenv("SIRIUS_LOG_BACKEND")) { Config::LOG_BACKEND = env; }
@@ -1636,7 +1644,7 @@ void SiriusContextExtensionCallback::OnExtensionLoadFail(DatabaseInstance& db,
 void SiriusContextExtensionCallback::read_config_file_if_exists()
 {
   // Check for explicit disable (used by benchmarks/tests that need pure CPU execution)
-  if (auto* val = std::getenv("SIRIUS_DISABLE"); val != nullptr && std::string(val) != "0") {
+  if (sirius_disabled_from_environment()) {
     SIRIUS_LOG_INFO("Sirius disabled via SIRIUS_DISABLE environment variable.");
     return;
   }
