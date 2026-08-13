@@ -2082,7 +2082,7 @@ static void SetDynamicFilterDomainCoverageThreshold(ClientContext& context,
   if (!params) { return; }
   auto slot              = lock_operator_params_slot(context);
   const double threshold = parameter.GetValue<double>();
-  if (threshold <= 0.0) {
+  if (!(threshold > 0.0)) {
     throw InvalidInputException("dynamic_filter_domain_coverage_threshold must be > 0.0, got %f",
                                 threshold);
   }
@@ -2097,7 +2097,7 @@ static void SetDynamicFilterKeepThreshold(ClientContext& context, SetScope scope
   if (!params) { return; }
   auto slot              = lock_operator_params_slot(context);
   const double threshold = parameter.GetValue<double>();
-  if (threshold < 0.0 || threshold > 1.0) {
+  if (!(threshold >= 0.0 && threshold <= 1.0)) {
     throw InvalidInputException("dynamic_filter_keep_threshold must be in [0.0, 1.0], got %f",
                                 threshold);
   }

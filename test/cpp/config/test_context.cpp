@@ -341,8 +341,11 @@ TEST_CASE("Sirius YAML rejects invalid dynamic-filter thresholds", "[sirius][con
   const invalid_config cases[] = {
     {"invalid_dynamic_filter_domain_coverage_threshold.yaml",
      "dynamic_filter_domain_coverage_threshold"},
+    {"invalid_dynamic_filter_domain_coverage_threshold_nan.yaml",
+     "dynamic_filter_domain_coverage_threshold"},
     {"invalid_dynamic_filter_keep_threshold_negative.yaml", "dynamic_filter_keep_threshold"},
     {"invalid_dynamic_filter_keep_threshold_above_one.yaml", "dynamic_filter_keep_threshold"},
+    {"invalid_dynamic_filter_keep_threshold_nan.yaml", "dynamic_filter_keep_threshold"},
   };
 
   for (auto const& invalid : cases) {
@@ -354,6 +357,12 @@ TEST_CASE("Sirius YAML rejects invalid dynamic-filter thresholds", "[sirius][con
     REQUIRE_THROWS_WITH(config.load_from_file(path),
                         Catch::Contains(invalid.setting) && Catch::Contains("value out of range"));
   }
+
+  sirius::sirius_config config;
+  REQUIRE_NOTHROW(
+    config.load_from_file(data_dir / "valid_dynamic_filter_threshold_boundaries.yaml"));
+  REQUIRE(config.get_operator_params().dynamic_filter_domain_coverage_threshold == Approx(1.5));
+  REQUIRE(config.get_operator_params().dynamic_filter_keep_threshold == Approx(0.0));
 }
 
 namespace {
@@ -787,6 +796,22 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(sirius_ctx->get_config().get_operator_params().mark_join_build_switch_ratio ==
           Approx(3.0));
 
+  auto invalid_domain_threshold = con.Query("SET dynamic_filter_domain_coverage_threshold = 'NaN'");
+  REQUIRE(invalid_domain_threshold != nullptr);
+  REQUIRE(invalid_domain_threshold->HasError());
+  REQUIRE_THAT(invalid_domain_threshold->GetError(),
+               Catch::Contains("dynamic_filter_domain_coverage_threshold must be > 0.0"));
+  REQUIRE(sirius_ctx->get_config().get_operator_params().dynamic_filter_domain_coverage_threshold ==
+          Approx(0.8));
+
+  auto invalid_keep_threshold = con.Query("SET dynamic_filter_keep_threshold = 'NaN'");
+  REQUIRE(invalid_keep_threshold != nullptr);
+  REQUIRE(invalid_keep_threshold->HasError());
+  REQUIRE_THAT(invalid_keep_threshold->GetError(),
+               Catch::Contains("dynamic_filter_keep_threshold must be in [0.0, 1.0]"));
+  REQUIRE(sirius_ctx->get_config().get_operator_params().dynamic_filter_keep_threshold ==
+          Approx(0.7));
+
   auto nan_mark_join_ratio = con.Query("SET mark_join_build_switch_ratio = 'NaN'");
   REQUIRE(nan_mark_join_ratio != nullptr);
   REQUIRE(nan_mark_join_ratio->HasError());
@@ -819,6 +844,11 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   require_ok("RESET max_sort_partition_memory_fraction");
   require_ok("SET enable_dynamic_filter_pushdown = true");
   require_ok("RESET enable_dynamic_filter_pushdown");
+  require_ok("SET dynamic_filter_domain_coverage_threshold = 1.5");
+  require_ok("RESET dynamic_filter_domain_coverage_threshold");
+  require_ok("SET dynamic_filter_keep_threshold = 0.0");
+  require_ok("SET dynamic_filter_keep_threshold = 1.0");
+  require_ok("RESET dynamic_filter_keep_threshold");
   require_ok("SET enable_runtime_distinct_build_probe = true");
   require_ok("RESET enable_runtime_distinct_build_probe");
   require_ok("SET pin_table_compression = false");
