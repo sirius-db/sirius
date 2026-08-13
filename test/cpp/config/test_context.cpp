@@ -391,6 +391,32 @@ TEST_CASE("operator batch defaults use an explicit high-level GPU usage fraction
   config.load_from_file(config_fixture("minimal.yaml"));
 
   require_shared_operator_defaults(config.get_operator_params(), expected_effective_batch(config));
+  REQUIRE(config.get_task_creator_config().thread_pool.thread_name_prefix == "task_creator");
+  REQUIRE(config.get_gpu_pipeline_executor_config().thread_name_prefix == "gpu_pipeline");
+  REQUIRE(config.get_downgrade_executor_config().thread_pool.thread_name_prefix == "downgrade");
+  REQUIRE(config.get_scan_manager_config().thread_pool.thread_name_prefix == "scan_manager");
+}
+
+TEST_CASE("Sirius keeps executor thread-name prefixes internal", "[sirius][config]")
+{
+  struct invalid_prefix {
+    const char* fixture;
+    const char* context;
+  };
+  constexpr std::array cases{
+    invalid_prefix{"invalid_task_creator_thread_name_prefix.yaml", "task_creator"},
+    invalid_prefix{"invalid_pipeline_thread_name_prefix.yaml", "thread_pool"},
+    invalid_prefix{"invalid_downgrade_thread_name_prefix.yaml", "downgrade"},
+    invalid_prefix{"invalid_scan_manager_thread_name_prefix.yaml", "scan_manager"},
+  };
+
+  for (auto const& test : cases) {
+    INFO("fixture=" << test.fixture);
+    sirius::sirius_config config;
+    REQUIRE_THROWS_WITH(
+      config.load_from_file(config_fixture(test.fixture)),
+      Catch::Contains("unknown config key: 'thread_name_prefix'") && Catch::Contains(test.context));
+  }
 }
 
 TEST_CASE("explicit operator batch values override effective-capacity defaults",

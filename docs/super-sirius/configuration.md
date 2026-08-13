@@ -243,17 +243,16 @@ per-pool sub-blocks: `task_creator`, `pipeline`, `downgrade`, and `scan_manager`
 `scan_manager` sub-block is large and is documented in
 [Scan Manager & IO Configuration](#scan-manager--io-configuration) below.
 
-Every thread-pool sub-block shares three keys:
+Every thread-pool sub-block shares two keys:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `num_threads` | int (**> 0**) | per pool (below) | Worker threads in the pool. |
-| `thread_name_prefix` | string | per pool | Thread name prefix for logs. |
 | `cpu_affinity` | list of int | — | Cores to pin the pool's threads to. |
 
 ### `sirius.executor.task_creator`
 
-Thread pool (default `num_threads: 1`, prefix `task_creator`) plus:
+Thread pool (default `num_threads: 1`) plus:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -262,11 +261,11 @@ Thread pool (default `num_threads: 1`, prefix `task_creator`) plus:
 
 ### `sirius.executor.pipeline`
 
-Thread pool only (default `num_threads: 4`, prefix `gpu_pipeline`). No extra keys.
+Thread pool only (default `num_threads: 4`). No extra keys.
 
 ### `sirius.executor.downgrade`
 
-Thread pool (default `num_threads: 1`, prefix `downgrade`) plus:
+Thread pool (default `num_threads: 1`) plus:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -281,7 +280,6 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 1 uring reactor), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
-| `thread_name_prefix` | string | `scan_manager` | Thread name prefix for logs. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `use_sirius_datasource` | bool | true | Route reads through the Sirius `io_uring` datasource. When false, the kvikio fallback is used (single-GPU only; multi-GPU requires the Sirius datasource). |
 | `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
