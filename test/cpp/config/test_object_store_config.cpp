@@ -257,8 +257,8 @@ TEST_CASE("sirius_config defaults chunk prewarm to enabled when YAML omits the k
 TEST_CASE("sirius_config rejects inactive prefetch cache settings",
           "[scan_manager][config][prefetching_cache]")
 {
-  for (auto const enable_line : {std::string{},
-                                 std::string{"      enable_prefetch_cache: false\n"}}) {
+  for (auto const enable_line :
+       {std::string{}, std::string{"      enable_prefetch_cache: false\n"}}) {
     auto const path = std::filesystem::temp_directory_path() /
                       (enable_line.empty() ? "sirius_cache_disabled_implicitly.yaml"
                                            : "sirius_cache_disabled_explicitly.yaml");
@@ -287,8 +287,7 @@ TEST_CASE("sirius_config treats null and empty prefetch cache blocks as absent",
                                 std::string{"      cache: {}\n"},
                                 std::string{"      cache:\n"
                                             "        inflight_io_chunk_budget: null\n"}}) {
-    auto const path =
-      std::filesystem::temp_directory_path() / "sirius_cache_inactive_absent.yaml";
+    auto const path = std::filesystem::temp_directory_path() / "sirius_cache_inactive_absent.yaml";
     write_yaml(path,
                "sirius:\n"
                "  executor:\n"
@@ -307,8 +306,7 @@ TEST_CASE("sirius_config treats null and empty prefetch cache blocks as absent",
 TEST_CASE("sirius_config accepts prefetch cache settings when enabled",
           "[scan_manager][config][prefetching_cache]")
 {
-  auto const path =
-    std::filesystem::temp_directory_path() / "sirius_cache_enabled_settings.yaml";
+  auto const path = std::filesystem::temp_directory_path() / "sirius_cache_enabled_settings.yaml";
   write_yaml(path,
              "sirius:\n"
              "  executor:\n"
