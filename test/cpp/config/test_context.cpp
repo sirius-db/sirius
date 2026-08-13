@@ -803,9 +803,8 @@ TEST_CASE("DuckDB setting rejects negative Sirius log flush intervals without mu
   auto negative = con.Query("SET sirius_log_flush_seconds = -1");
   REQUIRE(negative != nullptr);
   REQUIRE(negative->HasError());
-  REQUIRE_THAT(
-    negative->GetError(),
-    Catch::Contains("sirius_log_flush_seconds must be non-negative; zero disables"));
+  REQUIRE_THAT(negative->GetError(),
+               Catch::Contains("sirius_log_flush_seconds must be non-negative; zero disables"));
 
   auto after_negative = con.Query("SELECT current_setting('sirius_log_flush_seconds')::INTEGER");
   REQUIRE(after_negative != nullptr);
