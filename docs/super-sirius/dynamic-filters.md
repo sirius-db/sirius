@@ -374,10 +374,13 @@ That sweep and the SF50/SF300 measurements below predate the raw-needle represen
 
 #### Configuration
 
-- `enable_dynamic_filter_pushdown` (bool, default **true**) — master switch; when off, the router hands out no channels so neither side wires anything and there is zero overhead. Enabled by default to wire the membership (raw/hash IN-list or Bloom) filters.
-- `enable_dynamic_zone_map_filter` (bool, default **false**, requires the master) — additionally emit a zone map. Parquet scans use it for read-time row-group pruning; duckdb-native scans apply it row-wise post-decode. Off by default: static pushdown already handles range-derivable builds and scattered keys prune nothing, so it is reserved for clustered-keyset workloads whose narrow range is runtime-determined. The publication range-coverage gate skips obviously non-pruning numeric ranges.
-- `dynamic_filter_domain_coverage_threshold` (double, default **0.9**) — skip publishing a key's filters when the build covers at least this fraction of the key's domain (rows gate and zone-map range gate); ≥ 1.0 effectively disables the gate.
-- `dynamic_filter_keep_threshold` (double, default **0.9**) — consumer-side scan gate: disable a scan's post-decode filtering once a measured split keeps more than this fraction of its rows; in [0, 1], 1.0 keeps filtering always on.
+- Dynamic membership-filter pushdown is automatic and enabled by default. When disabled through the advanced YAML benchmark/diagnosis envelope, the router hands out no channels so neither side wires anything and there is zero overhead.
+- The clustered-keyset dynamic zone-map path is automatic-off by default and requires membership pushdown. Parquet scans use it for read-time row-group pruning; duckdb-native scans apply it row-wise post-decode. Static pushdown already handles range-derivable builds and scattered keys prune nothing, so the YAML expert envelope should enable it only for clustered-keyset workloads whose narrow range is runtime-determined. The publication range-coverage gate skips obviously non-pruning numeric ranges.
+- `dynamic_filter_domain_coverage_threshold` (positive finite double, default **0.9**) — skip publishing a key's filters when the build covers at least this fraction of the key's domain (rows gate and zone-map range gate); ≥ 1.0 effectively disables the gate.
+- `dynamic_filter_keep_threshold` (finite double in [0, 1], default **0.9**) — consumer-side scan gate: disable a scan's post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on.
+
+The two mode toggles remain accepted in YAML under `sirius.operator_params`.
+Their direct DuckDB session overrides are test-only.
 
 #### Ready replicas and per-split snapshots
 

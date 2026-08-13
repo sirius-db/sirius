@@ -412,6 +412,7 @@ chunk 0 is retained as a sentinel and emptied by the GPU filter so the pipeline 
 `src/scan_manager/pinned_chunk_stats.cpp` owns the statistics and safety checks; and
 `src/scan_manager/sirius_scan_manager.cpp` builds and serves the survivor plan.
 
-**Config:** `enable_pinned_zone_map_pruning` (default: `true`) is available through YAML and
-DuckDB `SET`. It gates both capture and pruning; entries pinned while it is disabled remain
-statless until re-pinned. See [Pinned-table zone maps](scan.md#zone-maps) for limitations.
+**Config:** zone-map capture and pruning are automatic and enabled by default. The advanced YAML
+escape hatch `sirius.operator_params.enable_pinned_zone_map_pruning` gates both capture and
+pruning; entries pinned while it is disabled remain statless until re-pinned. The direct DuckDB
+session override is test-only. See [Pinned-table zone maps](scan.md#zone-maps) for limitations.
