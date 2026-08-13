@@ -318,19 +318,20 @@ single-GPU configurations only (logs a warning and disables itself otherwise).
 TLS verification policy and the CA bundle are configured only under
 `scan_manager.object_store`. The REST reactor consumes those values so signing
 and transport use one trust policy; there are no separate REST YAML controls.
+The four count limits marked below must be greater than zero.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `request_timeout_s` | int (seconds) | 30 | Whole-request timeout and presigned-URL TTL (0 = no limit). |
-| `max_connections` | int | 16 | Max concurrent in-flight connections per reactor. |
+| `max_connections` | int (**> 0**) | 16 | Max concurrent in-flight connections per reactor. |
 | `chunk_size` | bytes | 8Mi | Target bytes per ranged GET (scatter/device-staging paths). |
 | `max_n_chunks` | int | 16 | Max file-adjacent segments fused into one scatter GET. |
-| `max_read_split` | int | 16 | Max parallel ranged GETs for one contiguous host read (reads < 2 MiB stay a single GET). |
+| `max_read_split` | int (**> 0**) | 16 | Max parallel ranged GETs for one contiguous host read (reads < 2 MiB stay a single GET). |
 | `upkeep_interval_ms` | int (ms) | 15000 | Idle-connection keepalive interval (`curl_easy_upkeep`; 0 disables). |
 | `conn_max_age_s` | int (seconds) | 20 | Max age curl may reuse a pooled connection (`CURLOPT_MAXAGE_CONN`; 0 = curl default). |
 | `retry_backoff_base_ms` | int (ms) | 50 | Base backoff between retries. |
 | `retry_jitter_ms` | int (ms) | 50 | Random jitter added to retry backoff. |
-| `max_retry_attempts` | int | 10 | Retry attempts for transient errors. |
+| `max_retry_attempts` | int (**> 0**) | 10 | Retry attempts for transient errors. |
 | `max_auth_retry_attempts` | int | 3 | Retry attempts for HTTP 403 (expired presigned URL). Kept low so a genuine AccessDenied fails fast. |
 | `honor_retry_after` | bool | true | Respect the server's `Retry-After` header. |
 | `perf_instrumentation` | bool | false | Record per-chunk micro-timings (chunk_get, queue_wait, ttfb, h2d) into perf counters. |

@@ -19,6 +19,7 @@
 #include "io/rest/config.hpp"
 #include "sirius_config.hpp"
 
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -280,6 +281,93 @@ TEST_CASE("sirius_config parses rest perf instrumentation flag",
   CHECK(cfg.get_scan_manager_config().rest.footer_probe_bytes == 256UL * 1024);
   CHECK(cfg.get_scan_manager_config().rest.list_max_matches == 5);
   CHECK(cfg.get_scan_manager_config().rest.list_max_scanned == 50);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("sirius_config validates positive REST counts", "[scan_manager][config][s3][rest]")
+{
+  using rest_config = sirius::io::rest::config;
+  struct count_field {
+    const char* name;
+    std::size_t rest_config::*member;
+  };
+  auto const fields = std::array{count_field{"max_connections", &rest_config::max_connections},
+                                 count_field{"max_read_split", &rest_config::max_read_split},
+                                 count_field{"max_retry_attempts",
+                                             &rest_config::max_retry_attempts}};
+  auto const path = std::filesystem::temp_directory_path() / "sirius_rest_positive_count.yaml";
+
+  for (auto const& field : fields) {
+    DYNAMIC_SECTION(field.name << " preserves its default when omitted")
+    {
+      write_yaml(path,
+                 "sirius:\n"
+                 "  executor:\n"
+                 "    scan_manager:\n"
+                 "      rest: {}\n");
+
+      sirius::sirius_config config;
+      auto const expected = rest_config{}.*field.member;
+      REQUIRE_NOTHROW(config.load_from_file(path));
+      CHECK(config.get_scan_manager_config().rest.*field.member == expected);
+    }
+
+    DYNAMIC_SECTION(field.name << " preserves its default when null")
+    {
+      write_yaml(path,
+                 "sirius:\n"
+                 "  executor:\n"
+                 "    scan_manager:\n"
+                 "      rest:\n"
+                 "        " +
+                   std::string(field.name) + ": null\n");
+
+      sirius::sirius_config config;
+      auto const expected = rest_config{}.*field.member;
+      REQUIRE_NOTHROW(config.load_from_file(path));
+      CHECK(config.get_scan_manager_config().rest.*field.member == expected);
+    }
+
+    DYNAMIC_SECTION(field.name << " accepts a positive override")
+    {
+      write_yaml(path,
+                 "sirius:\n"
+                 "  executor:\n"
+                 "    scan_manager:\n"
+                 "      rest:\n"
+                 "        " +
+                   std::string(field.name) + ": 7\n");
+
+      sirius::sirius_config config;
+      REQUIRE_NOTHROW(config.load_from_file(path));
+      CHECK(config.get_scan_manager_config().rest.*field.member == 7);
+    }
+
+    DYNAMIC_SECTION(field.name << " rejects invalid counts without mutation")
+    {
+      // The last value is one greater than LLONG_MAX. The signed reader must
+      // reject it rather than accepting a value that the validation temporary
+      // cannot represent.
+      for (auto const* invalid : {"0", "-1", "9223372036854775808"}) {
+        CAPTURE(invalid);
+        write_yaml(path,
+                   "sirius:\n"
+                   "  executor:\n"
+                   "    scan_manager:\n"
+                   "      rest:\n"
+                   "        " +
+                     std::string(field.name) + ": " + invalid + "\n");
+
+        sirius::sirius_config config;
+        auto const before = config.get_scan_manager_config().rest.*field.member;
+        REQUIRE_THROWS_WITH(config.load_from_file(path),
+                            Catch::Contains(std::string("rest.") + field.name));
+        CHECK(config.get_scan_manager_config().rest.*field.member == before);
+      }
+    }
+  }
 
   std::error_code ec;
   std::filesystem::remove(path, ec);
