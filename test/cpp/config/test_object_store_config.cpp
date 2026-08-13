@@ -376,22 +376,22 @@ TEST_CASE("sirius_config rejects zero fused-chunk limits", "[scan_manager][confi
     return surface == "rest" ? cfg.get_scan_manager_config().rest.max_n_chunks
                              : cfg.get_scan_manager_config().local.max_n_chunks;
   };
-  auto write_value = [](std::filesystem::path const& path,
-                        std::string const& surface,
-                        std::string const& value) {
-    auto const body = value == "<omitted>" ? "      " + surface + ": {}\n"
-                                            : "      " + surface + ":\n"
-                                                "        max_n_chunks: " +
-                                                value + "\n";
-    write_yaml(path,
-               "sirius:\n"
-               "  executor:\n"
-               "    scan_manager:\n" +
-                 body);
-  };
+  auto write_value =
+    [](std::filesystem::path const& path, std::string const& surface, std::string const& value) {
+      auto const body = value == "<omitted>" ? "      " + surface + ": {}\n"
+                                             : "      " + surface +
+                                                 ":\n"
+                                                 "        max_n_chunks: " +
+                                                 value + "\n";
+      write_yaml(path,
+                 "sirius:\n"
+                 "  executor:\n"
+                 "    scan_manager:\n" +
+                   body);
+    };
   auto check_surface = [&](std::string const& surface, std::size_t expected_default) {
-    auto const path = std::filesystem::temp_directory_path() /
-                      ("sirius_zero_" + surface + "_max_n_chunks.yaml");
+    auto const path =
+      std::filesystem::temp_directory_path() / ("sirius_zero_" + surface + "_max_n_chunks.yaml");
 
     for (auto const* value : {"<omitted>", "null"}) {
       write_value(path, surface, value);
@@ -415,8 +415,7 @@ TEST_CASE("sirius_config rejects zero fused-chunk limits", "[scan_manager][confi
       REQUIRE(read_value(cfg, surface) == 7);
 
       write_value(path, surface, invalid);
-      REQUIRE_THROWS_WITH(cfg.load_from_file(path),
-                          Catch::Contains(surface + ".max_n_chunks"));
+      REQUIRE_THROWS_WITH(cfg.load_from_file(path), Catch::Contains(surface + ".max_n_chunks"));
       CHECK(read_value(cfg, surface) == 7);
     }
 
