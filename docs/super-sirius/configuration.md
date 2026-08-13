@@ -377,7 +377,7 @@ individually.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `scan_task_batch_size` | Shared physical/effective GPU batch default described above | Target batch size for DuckDB scan tasks |
+| `scan_task_batch_size` | Shared physical/effective GPU batch default described above | Target batch size for DuckDB scan tasks; must be greater than zero |
 | `enable_compressed_materialization` | true | Store eligible integer and fixed-point DECIMAL values in value-preserving narrower carriers when exact pin-time bounds permit it; restore native carriers at type-sensitive boundaries. |
 | `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. Auto = 33% of GPU memory. |
 | `hash_partition_bytes` | Shared physical/effective GPU batch default described above | Target partition size for hash joins and group-bys; must be greater than zero |
@@ -537,7 +537,7 @@ These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, an
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `scan_task_batch_size` | Shared physical/effective GPU batch default | Target scan batch size |
+| `scan_task_batch_size` | Shared physical/effective GPU batch default | Target scan batch size; must be greater than zero |
 | `enable_compressed_materialization` | true | Keep eligible integer and fixed-point DECIMAL values in narrower physical carriers until a native semantic boundary. |
 
 `enable_compressed_materialization` is also accepted in YAML under `sirius.operator_params`.

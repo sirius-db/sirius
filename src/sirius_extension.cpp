@@ -1855,10 +1855,12 @@ static duckdb::unique_ptr<duckdb::SiriusContext::SlotGuard> lock_operator_params
 
 static void SetDefaultScanTaskBatchSize(ClientContext& context, SetScope scope, Value& parameter)
 {
+  auto const bytes = UBigIntValue::Get(parameter);
+  if (bytes == 0) { throw InvalidInputException("scan_task_batch_size must be greater than zero"); }
   auto* params = get_operator_params(context);
   if (!params) { return; }
   auto slot                    = lock_operator_params_slot(context);
-  params->scan_task_batch_size = UBigIntValue::Get(parameter);
+  params->scan_task_batch_size = bytes;
   SIRIUS_LOG_DEBUG("Updated config SCAN_TASK_BATCH_SIZE to {}", params->scan_task_batch_size);
 }
 
