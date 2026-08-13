@@ -43,22 +43,17 @@ namespace sirius::op {
 
 /**
  * @brief One scan's pushed-down filter, digested once into what a decompressor
- * can evaluate for itself.
+ * can evaluate for itself, keyed by column primary index.
  *
- * The scan hands over its whole filter and gets back the parts that survive as
- * decode-time work, keyed by column primary index. What any given chunk can
- * actually do with them is decided later and elsewhere (see
- * @c sirius::compressed_scan) — this speaks only for filter shapes and constant
- * types.
+ * This speaks only for filter shapes and constant types; what a given chunk can
+ * do with them is decided per chunk in @c sirius::compressed_scan.
  */
 struct scan_filter_analysis {
   /// Columns whose ENTIRE filter is an equality / IN over non-null string
   /// constants (an ANDed IS NOT NULL is absorbed — an equality already rejects
-  /// nulls), mapped to the value set they are tested against.
-  ///
-  /// Such a column can be answered off a dictionary's key set instead of being
-  /// decoded, which REPLACES its values with the boolean answer — so only
-  /// columns the query never projects are ever listed here.
+  /// nulls), mapped to the values tested against. Feeds
+  /// @c scan_decode_request::column_entry::equals_any, which states what the
+  /// decoder does with them and why only unprojected columns qualify.
   std::unordered_map<std::size_t, std::vector<std::string>> equality_sets;
 
   /// Inclusive bounds per filtered column. Always a sound conjunctive
@@ -66,34 +61,28 @@ struct scan_filter_analysis {
   /// a row the full filter rejects.
   std::unordered_map<std::size_t, sirius::decode_range> ranges;
 
-  /// True iff EVERY row-restricting conjunct of the filter became a range.
-  /// When false, @c ranges may still be non-empty and remains usable — the
-  /// decode then filters only partially and the scan must still evaluate its
-  /// own filter afterwards.
+  /// True iff EVERY row-restricting conjunct became a range; see
+  /// @c scan_decode_request::ranges_cover_whole_filter for what that buys. When
+  /// false, @c ranges is still usable — the decode then filters only partially.
   bool ranges_cover_whole_filter = false;
 };
 
 /**
  * @brief Digest @p filters into the decode-time work it can support.
  *
- * Ranges recognize constant comparisons (<, <=, >, >=, =) and AND-trees of
- * them, on DATE / DECIMAL(≤18) / signed- and small-unsigned-integer columns,
+ * Ranges recognize constant comparisons (<, <=, >, >=, =) and AND-trees of them
+ * on DATE / DECIMAL(≤18) / signed- and small-unsigned-integer columns,
  * intersecting all conjuncts into one inclusive range per column. Strict
- * inequalities tighten the bound by one; decimal constants are rescaled to the
- * column's scale exactly (floor/ceil on the correct side when the constant has
- * more fractional digits than the column can store).
+ * inequalities tighten by one; a decimal constant finer than the column's scale
+ * is floored or ceiled on the side that cannot drop a surviving row.
  *
- * Top-level OPTIONAL_FILTER and IS_NOT_NULL filters do not restrict the rows a
- * scan emits — @ref convert_table_filters_to_expression drops them — so they
- * are skipped without clearing coverage; likewise filters on
- * @p skip_primary_indices (hive partitions, enforced at file-list level). Any
- * other unconvertible conjunct clears only @c ranges_cover_whole_filter:
- * convertible conjuncts elsewhere in the set still yield ranges.
+ * Filters that do not restrict the emitted rows are skipped WITHOUT clearing
+ * coverage — OPTIONAL_FILTER and IS_NOT_NULL, which
+ * @ref convert_table_filters_to_expression also drops, and @p
+ * skip_primary_indices (hive partitions, enforced at file-list level). Any other
+ * unconvertible conjunct clears only @c ranges_cover_whole_filter.
  *
- * Equality sets are collected only for @p filter_only_primary_indices — the
- * columns the query never projects — because answering one in place replaces
- * its values.
- *
+ * Equality sets are collected only for @p filter_only_primary_indices.
  */
 scan_filter_analysis analyze_scan_filters(
   const duckdb::TableFilterSet& filters,
@@ -118,16 +107,13 @@ sirius::scan_decode_request build_scan_decode_request(
  * decode, as a predicate.
  *
  * Built once at bind from the filter's top-level conjuncts, each pre-lowered to
- * Sirius AST. A conjunct on a column the decoder can answer for itself also
- * records WHERE that answer lands, so per batch the residual is assembled by
- * choosing a form per conjunct — no DuckDB expression is rebuilt and no
- * conversion runs on the batch path.
+ * Sirius AST, so per batch the residual is assembled by choosing a form per
+ * conjunct — nothing is rebuilt or converted on the batch path.
  *
- * A column answered in place arrives as the BOOL8 answer rather than its
- * declared type, so its conjunct MUST become a bare reference to it; re-running
- * the comparison would compare a mask against a string constant. Which columns
- * that happened to is a per-batch fact the decoder reports
- * (@c sirius::decode_outcome::predicate_columns).
+ * A column answered in place arrives as BOOL8 rather than its declared type
+ * (@c sirius::decode_outcome::predicate_columns), so its conjunct MUST become a
+ * bare reference to that answer; re-running the comparison would test a mask
+ * against a string constant.
  */
 class residual_filter {
  public:
@@ -149,15 +135,11 @@ class residual_filter {
   [[nodiscard]] bool empty() const noexcept { return _conjuncts.empty(); }
 
   /// The predicate to evaluate over a batch in which @p answered_positions
-  /// arrived as BOOL8 answers.
+  /// arrived as BOOL8 answers. With @p answers_enforced the decode also APPLIED
+  /// them, so those conjuncts leave the residual entirely.
   ///
-  /// With @p answers_enforced, the decode did not merely answer those conjuncts
-  /// but applied them — the surviving rows already satisfy them — so they leave
-  /// the residual entirely rather than becoming a reference to the answer.
-  ///
-  /// Null when nothing is left to evaluate: either there was no filter, or the
-  /// decode enforced every conjunct. The caller must treat that as "these rows
-  /// are already filtered", NOT as "no filtering needed".
+  /// Null means nothing is left to evaluate — which the caller must read as
+  /// "these rows are already filtered", NOT as "no filtering needed".
   [[nodiscard]] std::unique_ptr<sirius::ast::node> against(
     std::vector<std::size_t> const& answered_positions, bool answers_enforced = false) const;
 

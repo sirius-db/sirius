@@ -56,18 +56,17 @@ struct membership_snapshot {
 
 /// Snapshot the channel's per-column probes over @p n_slots decoded slots.
 ///
-/// THE MAPPING INVARIANT (single source of truth — both the scan-manager
-/// drain attach and the decode-time refresh call this): slot order ==
-/// materialized_column_order == output columns FIRST, IN OUTPUT ORDER, then
-/// pure-filter columns, while the filter set keys by the consumer's
-/// OUTPUT-COLUMN position (parquet installs set_consumer_column_remap with
-/// scan_plan::output_position_by_column_id). Slot i therefore maps to output
-/// position i for every output column, so slot i's probes are exactly
-/// filters_for_column(i); trailing pure-filter slots query keys the set can
-/// never hold (push_filter rejects non-output columns) and come back empty by
-/// construction. generation is read BEFORE the walk so it never claims probes
-/// the walk did not capture (a racing publish only ADDS an uncounted probe —
-/// the safe direction for the converter's generation echo).
+/// THE MAPPING INVARIANT, stated once here because both callers (the
+/// scan-manager drain attach and the decode-time refresh) depend on it: slot
+/// order is output columns first, in output order, then pure-filter columns,
+/// while the filter set keys by OUTPUT-COLUMN position. Slot i therefore maps
+/// to output position i, so its probes are exactly filters_for_column(i);
+/// trailing pure-filter slots query keys the set can never hold (push_filter
+/// rejects non-output columns) and come back empty by construction.
+///
+/// `generation` is read BEFORE the walk, so it never claims probes the walk did
+/// not capture — a racing publish only ADDS an uncounted one, the safe
+/// direction for the converter's echo.
 [[nodiscard]] membership_snapshot snapshot_membership_probes(
   sirius::op::sirius_dynamic_filter_set const& set, std::size_t n_slots);
 
@@ -182,24 +181,17 @@ class scan_operator_input : public op::operator_data {
   /// copy). Stamped by drain_cached_provider on resident splits; scan_info
   /// splits fold filter costs into their own estimates instead.
   bool row_filter_pending{false};
-  /// True when prepare_for_processing's conversion came back as a
-  /// decode_outcome::row_filtered: the decode already applied the split's whole
-  /// table-filter conjunction and every column is compacted to the surviving
-  /// rows. materialize_table then returns filter_state::ROW_FILTERED so
-  /// post_filter_and_project skips filter evaluation and only projects. Never
-  /// set while the gate is off — the converters then always produce the plain
-  /// representation.
+  /// Mirrors decode_outcome::row_filtered, stamped by prepare_for_processing.
+  /// materialize_table then returns filter_state::ROW_FILTERED, so
+  /// post_filter_and_project only projects. Never set with the gate off.
   bool decode_row_filtered{false};
-  /// Positions in the decoded batch delivered as a BOOL8 predicate result
-  /// rather than values (decode_outcome::predicate_columns), stamped by
-  /// prepare_for_processing. materialize_table forwards it to
-  /// post_filter_and_project, which rewrites those columns' filter conjunct to
-  /// a bare boolean reference. Empty when nothing was substituted.
+  /// Mirrors decode_outcome::predicate_columns. Forwarded to
+  /// post_filter_and_project, which rewrites those columns' conjunct to a bare
+  /// boolean reference. Empty when nothing was substituted.
   std::vector<std::size_t> decode_predicate_columns;
-  /// The decode also applied those conjuncts to the rows
-  /// (decode_outcome::predicates_enforced), so they need not be evaluated
-  /// again. False whenever the answers came from the plain predicated decode,
-  /// which drops no rows.
+  /// Mirrors decode_outcome::predicates_enforced: those conjuncts need no
+  /// second evaluation. False when the answers came from the plain predicated
+  /// decode, which drops no rows.
   bool decode_predicates_enforced{false};
   /// The operator's dynamic-filter channel (may be null), stamped by
   /// sirius_gpu_scan_operator::get_next_task_input_data. prepare_for_processing
@@ -207,16 +199,13 @@ class scan_operator_input : public op::operator_data {
   /// prepare, before any join build has published, so only a decode-time
   /// snapshot can see any join filters at all.
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters;
-  /// Operator-shared latch for "compacting this scan's batches during decode
-  /// does not pay off", stamped by
-  /// sirius_gpu_scan_operator::get_next_task_input_data on every split it hands
-  /// out. Selectivity is uniform across a scan's batches (unclustered chunks),
-  /// so one such batch predicts the rest: prepare_for_processing latches it on
-  /// seeing decode_outcome::selection_unprofitable, and later splits drop the
-  /// row selection before conversion (and the working-set estimator keeps the
-  /// full-width envelope). Per-operator by construction — another query's scan
-  /// decides fresh. May be null (splits not routed through the operator, e.g.
-  /// tests): all reads null-check.
+  /// Operator-shared latch behind decode_outcome::selection_unprofitable, which
+  /// explains why one batch predicts the rest. Stamped on every split the
+  /// operator hands out; prepare_for_processing latches it, and later splits
+  /// then drop the row selection before conversion (the working-set estimator
+  /// keeping its full-width envelope). Per-operator, so another query decides
+  /// fresh. May be null when splits bypass the operator (tests): reads
+  /// null-check.
   std::shared_ptr<std::atomic<bool>> decode_selection_unprofitable;
   /// Per-query table taken out of the cached wrapper batch right after
   /// prepare_for_processing's conversion produced it (decompressed or
