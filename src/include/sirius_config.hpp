@@ -318,6 +318,40 @@ struct compression_config {
   /// Below this size the setup cost dominates so heavily that compressing is
   /// worse than spilling raw, however good the ratio.
   std::size_t spill_min_batch_bytes{64ULL * 1024 * 1024};
+  /// Device memory reserved exclusively for spill-compression transients.
+  /// 0 (the default) keeps the encoder allocating from the query's pool.
+  ///
+  /// Sharing that pool is circular: a downgrade happens *because* the pool is
+  /// full, so the encode that would relieve the pressure is the one allocation
+  /// certain to fail. Measured on q3/SF1000 with no arena, compression latched
+  /// off and on 11 times while the monitor issued 111,641 downgrade requests.
+  ///
+  /// This is a partition of the device, not extra memory: reserving N bytes
+  /// requires lowering `memory.gpu.usage_limit_fraction` by the same N. Undersizing
+  /// is a cliff rather than a gradient — at 1 GiB, too small for the concurrent
+  /// encodes, the same query failed outright. Size it for
+  /// `downgrade.num_threads` concurrent encodes of the largest spill batch.
+  std::size_t device_pool_bytes{0};
+
+  /// Free each uncompressed source column as soon as it has been encoded, instead
+  /// of holding the whole batch until the converter returns.
+  ///
+  /// This is the memory the spill exists to reclaim, and releasing it during the
+  /// encode rather than after is what lets the compression arena be small: per
+  /// encode the device carries one column's source instead of the batch's.
+  ///
+  /// Opt-in because it forfeits the fall-back. Once a column has been freed the
+  /// batch cannot be spilled uncompressed any more, so the encode must run to
+  /// completion — a column that cannot even be stored raw (identity, no codec
+  /// scratch) becomes fatal for the batch rather than a decline. Requires
+  /// ownership of the table; batches viewing externally-owned memory are skipped.
+  bool spill_release_columns_early{false};
+
+  /// Fraction of a batch's uncompressed size reserved on the device for encode
+  /// working memory when no compression arena is configured. See
+  /// spill_context.hpp::encode_reserve_fraction.
+  double spill_encode_reserve_fraction{0.5};
+
   /// When true, the downgrade executor may satisfy a request by compressing
   /// batches in place on the device, instead of spilling them to host/disk.
   ///

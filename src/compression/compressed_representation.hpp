@@ -23,6 +23,7 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -167,6 +168,34 @@ class compressed_host_representation : public cucascade::idata_representation {
   /// The structural header bytes (fed to read_compressed_table_from_memory).
   [[nodiscard]] std::span<const std::uint8_t> header() const noexcept { return _blob->header; }
 
+  /// Per-column artifacts, when the batch was spilled a column at a time.
+  ///
+  /// Empty for the ordinary whole-table spill, which keeps one .hpln in `_blob`.
+  /// The per-column form exists so a column can be made durable on the host
+  /// before its uncompressed source is freed: with a single table-wide artifact
+  /// nothing is durable until every column has been encoded, so freeing sources
+  /// during the encode leaves a window where a later failure loses the batch.
+  /// Each entry is a complete 1-column .hpln and decodes independently.
+  [[nodiscard]] const std::vector<std::shared_ptr<pinned_compressed_blob>>& column_blobs()
+    const noexcept
+  {
+    return _column_blobs;
+  }
+
+  /// Compressed bytes that decoding this batch stages on the device at once: the
+  /// whole chunk for the ordinary form, the largest single artifact for the
+  /// per-column form, which is reconstructed a column at a time. Feeds
+  /// estimated_materialization_bytes().
+  [[nodiscard]] std::size_t decode_transient_bytes() const noexcept
+  {
+    if (_column_blobs.empty()) { return _compressed_bytes; }
+    std::size_t largest = 0;
+    for (auto const& blob : _column_blobs) {
+      largest = std::max(largest, blob->header.size() + static_cast<std::size_t>(blob->payload_bytes));
+    }
+    return largest;
+  }
+
   /// The pinned payload holding every compressed leaf buffer, concatenated.
   [[nodiscard]] const cucascade::memory::fixed_size_host_memory_resource::
     multiple_blocks_allocation&
@@ -186,6 +215,13 @@ class compressed_host_representation : public cucascade::idata_representation {
   [[nodiscard]] std::int64_t num_rows() const noexcept { return _num_rows; }
 
   /// Column indices to project during decompression (nullopt = all columns).
+  /// Install the per-column artifacts. Called by the spill converter immediately
+  /// after construction; `_blob` then carries only the aggregate byte counts.
+  void set_column_blobs(std::vector<std::shared_ptr<pinned_compressed_blob>> blobs)
+  {
+    _column_blobs = std::move(blobs);
+  }
+
   [[nodiscard]] const std::optional<std::vector<std::size_t>>& selected_indices() const noexcept
   {
     return _selected_indices;
@@ -203,6 +239,8 @@ class compressed_host_representation : public cucascade::idata_representation {
                                  std::shared_ptr<const per_column_byte_sizes> column_sizes);
 
   std::shared_ptr<pinned_compressed_blob> _blob;
+  /// Non-empty only for the per-column spill form; see column_blobs().
+  std::vector<std::shared_ptr<pinned_compressed_blob>> _column_blobs;
   std::vector<std::string> _column_names;
   std::size_t _compressed_bytes;
   std::size_t _uncompressed_bytes;

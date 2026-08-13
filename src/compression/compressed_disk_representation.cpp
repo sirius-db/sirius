@@ -31,9 +31,10 @@ compressed_disk_representation::compressed_disk_representation(
   std::int64_t num_rows,
   std::vector<std::string> column_names)
   : cucascade::idata_representation(memory_space),
-    _path(std::make_shared<std::string>(std::move(path))),
+    _files(std::make_shared<std::vector<std::string>>(std::vector<std::string>{std::move(path)})),
     _owns_file(std::make_shared<bool>(true)),
     _compressed_bytes(compressed_bytes),
+    _max_artifact_bytes(compressed_bytes),
     _uncompressed_bytes(uncompressed_bytes),
     _num_rows(num_rows),
     _column_names(std::move(column_names))
@@ -42,17 +43,41 @@ compressed_disk_representation::compressed_disk_representation(
 
 compressed_disk_representation::compressed_disk_representation(
   cucascade::memory::memory_space& memory_space,
-  std::shared_ptr<std::string> path,
+  std::vector<std::string> column_paths,
+  std::size_t compressed_bytes,
+  std::size_t max_artifact_bytes,
+  std::size_t uncompressed_bytes,
+  std::int64_t num_rows,
+  std::vector<std::string> column_names)
+  : cucascade::idata_representation(memory_space),
+    _files(std::make_shared<std::vector<std::string>>(std::move(column_paths))),
+    _per_column(true),
+    _owns_file(std::make_shared<bool>(true)),
+    _compressed_bytes(compressed_bytes),
+    _max_artifact_bytes(max_artifact_bytes),
+    _uncompressed_bytes(uncompressed_bytes),
+    _num_rows(num_rows),
+    _column_names(std::move(column_names))
+{
+}
+
+compressed_disk_representation::compressed_disk_representation(
+  cucascade::memory::memory_space& memory_space,
+  std::shared_ptr<std::vector<std::string>> files,
+  bool per_column,
   std::shared_ptr<bool> owns_file,
   std::size_t compressed_bytes,
+  std::size_t max_artifact_bytes,
   std::size_t uncompressed_bytes,
   std::int64_t num_rows,
   std::vector<std::string> column_names,
   std::optional<std::vector<std::size_t>> selected_indices)
   : cucascade::idata_representation(memory_space),
-    _path(std::move(path)),
+    _files(std::move(files)),
+    _per_column(per_column),
     _owns_file(std::move(owns_file)),
     _compressed_bytes(compressed_bytes),
+    _max_artifact_bytes(max_artifact_bytes),
     _uncompressed_bytes(uncompressed_bytes),
     _num_rows(num_rows),
     _column_names(std::move(column_names)),
@@ -62,13 +87,16 @@ compressed_disk_representation::compressed_disk_representation(
 
 compressed_disk_representation::~compressed_disk_representation()
 {
-  // Unlink the file only when this is the last owner.
-  if (_owns_file && _owns_file.use_count() == 1 && _path && !_path->empty()) {
+  // Unlink the files only when this is the last owner. A projection does not
+  // narrow ownership: the unselected columns' artifacts still belong to the batch
+  // and only go when the batch does.
+  if (!_owns_file || _owns_file.use_count() != 1 || !_files) { return; }
+  for (const auto& file : *_files) {
+    if (file.empty()) { continue; }
     std::error_code ec;
-    std::filesystem::remove(*_path, ec);
+    std::filesystem::remove(file, ec);
     if (ec) {
-      SIRIUS_LOG_WARN(
-        "compressed_disk_representation: failed to remove {}: {}", *_path, ec.message());
+      SIRIUS_LOG_WARN("compressed_disk_representation: failed to remove {}: {}", file, ec.message());
     }
   }
 }
@@ -81,9 +109,11 @@ std::unique_ptr<cucascade::idata_representation> compressed_disk_representation:
   // make_unique cannot reach it.
   return std::unique_ptr<compressed_disk_representation>(
     new compressed_disk_representation(ms,
-                                       _path,
+                                       _files,
+                                       _per_column,
                                        _owns_file,
                                        _compressed_bytes,
+                                       _max_artifact_bytes,
                                        _uncompressed_bytes,
                                        _num_rows,
                                        _column_names,
@@ -96,9 +126,11 @@ std::unique_ptr<compressed_disk_representation> compressed_disk_representation::
   auto& ms = const_cast<cucascade::memory::memory_space&>(get_memory_space());
   return std::unique_ptr<compressed_disk_representation>(
     new compressed_disk_representation(ms,
-                                       _path,
+                                       _files,
+                                       _per_column,
                                        _owns_file,
                                        _compressed_bytes,
+                                       _max_artifact_bytes,
                                        _uncompressed_bytes,
                                        _num_rows,
                                        _column_names,

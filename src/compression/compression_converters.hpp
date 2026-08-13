@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <stdexcept>
+
 #include <cucascade/data/representation_converter.hpp>
 
 #include <cstddef>
@@ -25,6 +27,21 @@ class idata_representation;
 }  // namespace cucascade
 
 namespace sirius {
+
+/// Thrown when a compressed spill fails *after* it has taken ownership of the
+/// batch's columns.
+///
+/// The distinction matters because the caller's normal response to a failed
+/// compression is to spill the batch uncompressed instead. That is only valid
+/// while the source is intact: once ownership has moved, the representation is
+/// empty, and the uncompressed converter would happily produce a zero-column
+/// batch whose emptiness only surfaces much later, as an out-of-range access
+/// when something tries to materialize it. Callers must let this propagate.
+class spill_source_consumed : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
 
 /**
  * @brief Register Simpatico compression/decompression converters into @p registry.

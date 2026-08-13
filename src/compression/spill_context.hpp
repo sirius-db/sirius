@@ -77,6 +77,29 @@ struct spill_context {
   /// the ratio. Mirrors output_compression_context::min_batch_bytes; the spill
   /// path needs its own because it cannot choose its batch sizes.
   std::size_t min_batch_bytes{64ULL * 1024 * 1024};
+
+  /// Free each source column as it is encoded; see
+  /// sirius_config.hpp::spill_release_columns_early for the trade-off.
+  bool release_columns_early{false};
+
+  /// Fraction of a batch's uncompressed size to reserve on the device for the
+  /// encode's working memory, when there is no compression arena.
+  ///
+  /// With an arena the encode allocates from a pool carved off the device at
+  /// startup, outside cuCascade's accounting entirely. Without one it allocates
+  /// from the query's own pool — during a downgrade, i.e. exactly when that pool
+  /// is exhausted — and it does so *unreserved*, so it can push the pool past
+  /// what reservations promised and surface as an OOM in an unrelated operator.
+  /// Reserving first makes the demand visible and, when it cannot be met, lets
+  /// the batch decline to an uncompressed spill instead of destabilising the
+  /// query.
+  ///
+  /// A fraction rather than the full size because the encode's peak is the
+  /// compressed output (input/ratio, ~0.2 at the 5x this workload sees) plus
+  /// codec scratch of the same order — not another whole copy of the batch.
+  /// Reserving 1.0 would be safe but would almost never be grantable under the
+  /// pressure that triggered the spill, silently disabling compression.
+  double encode_reserve_fraction{0.5};
 };
 
 /// The calling thread's active spill context, or nullptr when none is installed.
@@ -166,7 +189,9 @@ void set_spill_compression_settings(bool enabled,
                                     std::uint32_t error_tolerance,
                                     double replan_change_threshold,
                                     std::size_t explore_sample_rows,
-                                    std::size_t min_batch_bytes) noexcept;
+                                    std::size_t min_batch_bytes,
+                                    bool release_columns_early,
+                                    double encode_reserve_fraction) noexcept;
 
 /// Whether spill compression is enabled process-wide *and* not currently
 /// suppressed. This is the predicate the spill path consults.
