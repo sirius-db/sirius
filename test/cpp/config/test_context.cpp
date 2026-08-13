@@ -399,6 +399,28 @@ TEST_CASE("Sirius YAML rejects invalid dynamic-filter thresholds", "[sirius][con
   REQUIRE(config.get_operator_params().dynamic_filter_keep_threshold == Approx(0.0));
 }
 
+TEST_CASE("Sirius configuration keeps task creation strategy internal", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+
+  SECTION("explicit strategy is rejected with removal guidance")
+  {
+    sirius::sirius_config config;
+    REQUIRE_THROWS_WITH(config.load_from_file(data_dir / "invalid_task_creator_strategy.yaml"),
+                        Catch::Contains("sirius.executor.task_creator.strategy") &&
+                          Catch::Contains("removed") && Catch::Contains("remove this key"));
+    CHECK(config.get_task_creator_config().strategy == sirius::creator::request_type::active);
+  }
+
+  SECTION("omitted strategy retains the active demand-driven default")
+  {
+    sirius::sirius_config config;
+    REQUIRE_NOTHROW(config.load_from_file(data_dir / "valid_task_creator_strategy_omitted.yaml"));
+    CHECK(config.get_task_creator_config().strategy == sirius::creator::request_type::active);
+  }
+}
+
 namespace {
 
 void require_shared_operator_defaults(const sirius::operator_params& params, uint64_t batch)

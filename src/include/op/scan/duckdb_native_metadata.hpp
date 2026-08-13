@@ -214,9 +214,9 @@ struct duckdb_native_row_group_range {
 duckdb_native_row_group_range walk_duckdb_native_row_group_range(
   const duckdb_native_walk_plan& plan, std::size_t rg_begin, std::size_t rg_end);
 
-/// @brief Row groups per parallel-walk task unit (env `SIRIUS_METADATA_PARSE_CHUNK`,
-/// default 8). Shared by the metadata parse fan-out and the MVCC mask job so both
-/// slice row-group work into the same task granularity.
+/// @brief Row groups per parallel-walk task unit (fixed internally at 8).
+/// Shared by the metadata parse fan-out and the MVCC mask job so both slice
+/// row-group work into the same task granularity.
 std::size_t metadata_parse_chunk();
 
 }  // namespace sirius::op::scan

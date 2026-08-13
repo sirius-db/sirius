@@ -91,14 +91,13 @@ inline bool enum_to_string(priority_order order, std::string& s)
 inline constexpr int default_task_creator_num_threads = 1;
 
 /// Configuration for the task creator.
-/// Embeds the thread pool config plus the task creation strategy.
+/// Embeds the thread pool config plus internal scheduling policy.
 struct task_creator_config {
   exec::thread_pool_config thread_pool{.num_threads        = default_task_creator_num_threads,
                                        .thread_name_prefix = "task_creator"};
 
-  /// The most speculative request type the task creator is allowed to use when
-  /// servicing scheduling requests: active (demand-driven only) or lookahead
-  /// (additionally warm up not-yet-activated scans one task at a time).
+  /// Internal policy for servicing scheduling requests. The current default is active
+  /// (demand-driven only); lookahead remains available to engine-controlled policy.
   request_type strategy{request_type::active};
 
   /// Within-branch scheduling priority direction, consumed by compute_pipeline_priorities.
