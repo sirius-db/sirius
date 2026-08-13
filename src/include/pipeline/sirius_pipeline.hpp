@@ -201,6 +201,15 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   //! from the point that establishes it, rather than relying on a later task to notice.
   void set_completion_handler(completion_handler* handler);
 
+  //! The task_creator this pipeline schedules through, or nullptr when none is wired (tests,
+  //! or a pipeline built before the executor attached). Used by streaming sources to re-arm a
+  //! starved head from a producer thread; schedule() only touches the thread-safe creation
+  //! queue, so calling it off-thread is safe.
+  [[nodiscard]] sirius::creator::task_creator* get_task_creator() const noexcept
+  {
+    return _task_creator;
+  }
+
   //! Returns a scoped lock on the pipeline status mutex.
   //! Callers must hold this lock across the operation that consumes pipeline state
   //! (port data pop, partition claim, etc.) and the task constructor that calls

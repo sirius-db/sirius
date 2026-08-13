@@ -53,6 +53,19 @@ filtered_table gpu_ingestible::materialize_table(const op::scan::scan_operator_i
     }
     return materialized;
   } else {
+    if (split.stolen_table) {
+      // prepare_for_processing took ownership of the wrapper batch's per-query
+      // table; move it straight into the scan output — the owned-table
+      // owning_table_view releases by moving columns, so no copy is made.
+      split.stolen_table_consumed = true;
+      return {.table = owning_table_view{std::move(split.stolen_table)},
+              .state = filter_state::UNFILTERED};
+    }
+    if (split.stolen_table_consumed) {
+      throw std::runtime_error(
+        "[gpu_ingestible::materialize_table] the split's stolen table was already consumed; "
+        "refusing to re-materialize from the emptied wrapper batch");
+    }
     auto batch  = split.get_cached_batch();
     auto rbatch = batch->to_read_only();
     auto view   = get_cudf_table_view(rbatch);

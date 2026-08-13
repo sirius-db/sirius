@@ -131,7 +131,7 @@ std::unique_ptr<cucascade::idata_representation> compressed_host_representation:
   rmm::cuda_stream_view /*stream*/)
 {
   // Share the same backing blob — no byte copy needed.
-  return std::unique_ptr<compressed_host_representation>(
+  auto copy = std::unique_ptr<compressed_host_representation>(
     new compressed_host_representation(get_memory_space(),
                                        _blob,
                                        _column_names,
@@ -140,6 +140,9 @@ std::unique_ptr<cucascade::idata_representation> compressed_host_representation:
                                        _num_rows,
                                        _selected_indices,
                                        _column_sizes));
+  // The pushdown is indexed by the selected column list, which the clone shares.
+  copy->set_equality_pushdown(_equality_pushdown);
+  return copy;
 }
 
 // ── Projection ───────────────────────────────────────────────────────────────
@@ -296,7 +299,7 @@ std::unique_ptr<cucascade::idata_representation> compressed_device_representatio
   rmm::cuda_stream_view /*stream*/)
 {
   // Share the same cached blob — no byte copy needed.
-  return std::unique_ptr<compressed_device_representation>(
+  auto copy = std::unique_ptr<compressed_device_representation>(
     new compressed_device_representation(get_memory_space(),
                                          _blob,
                                          _column_names,
@@ -305,6 +308,9 @@ std::unique_ptr<cucascade::idata_representation> compressed_device_representatio
                                          _num_rows,
                                          _selected_indices,
                                          _column_sizes));
+  // The pushdown is indexed by the selected column list, which the clone shares.
+  copy->set_equality_pushdown(_equality_pushdown);
+  return copy;
 }
 
 std::unique_ptr<compressed_device_representation> compressed_device_representation::select_columns(

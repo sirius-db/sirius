@@ -26,6 +26,7 @@
 #include "cudf/join/mixed_join.hpp"
 #include "cudf/null_mask.hpp"
 #include "cudf/reduction.hpp"
+#include "cudf/reduction/distinct_count.hpp"
 #include "cudf/table/table_view.hpp"
 #include "cudf/transform.hpp"
 #include "cudf/types.hpp"
@@ -37,7 +38,9 @@
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "expression/ast/node.hpp"
 #include "expression/ast/to_duckdb.hpp"
+#include "expression_evaluator/ast_supported_types.hpp"
 #include "expression_evaluator/gpu_expression_translator_internal.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
@@ -81,9 +84,59 @@ static void collect_bound_ref_indices(const duckdb::Expression& expr,
     expr, [&](const duckdb::Expression& child) { collect_bound_ref_indices(child, indices); });
 }
 
-static bool is_equality(sirius::comparison_type c)
+// Mixed plain/null-safe keys require different null policies, so route the null-safe keys
+// to the conditional predicate. MARK joins cannot use MIXED_JOIN.
+static bool wants_null_safe_routing(duckdb::vector<sirius::join_condition> const& conditions,
+                                    duckdb::JoinType join_type)
 {
-  return c == sirius::comparison_type::equal || c == sirius::comparison_type::not_distinct_from;
+  if (join_type == duckdb::JoinType::MARK) { return false; }
+  bool has_plain_equal = false;
+  bool has_null_safe   = false;
+  for (auto const& c : conditions) {
+    if (c.comparison == sirius::comparison_type::equal) {
+      has_plain_equal = true;
+    } else if (c.comparison == sirius::comparison_type::not_distinct_from) {
+      has_null_safe = true;
+    }
+  }
+  return has_plain_equal && has_null_safe;
+}
+
+// Whether a condition belongs in the hash key: a plain `=`, or a null-safe key when it
+// is not being routed to the conditional predicate (route_null_safe_to_conditional).
+static bool is_hash_equality_key(sirius::comparison_type c, bool route_null_safe_to_conditional)
+{
+  if (c == sirius::comparison_type::equal) { return true; }
+  if (c == sirius::comparison_type::not_distinct_from) { return !route_null_safe_to_conditional; }
+  return false;
+}
+
+// Routed keys must be references or use one of cuDF AST's three supported casts.
+// The planner materializes other expressions into referenced columns before this check.
+static bool is_ast_translatable_key_side(sirius::ast::node const& side)
+{
+  if (side.holds<sirius::ast::reference>()) { return true; }
+  if (side.holds<sirius::ast::cast>()) {
+    auto const& c         = side.get<sirius::ast::cast>();
+    auto const& supported = sirius::supported_ast_cast_types_native;
+    return std::find(supported.begin(), supported.end(), c.target_type.id()) != supported.end() &&
+           is_ast_translatable_key_side(*c.child);
+  }
+  return false;
+}
+
+// Reject routing unless every null-safe key can be represented by the cuDF AST.
+static bool null_safe_keys_are_ast_routable(
+  duckdb::vector<sirius::join_condition> const& conditions)
+{
+  for (auto const& c : conditions) {
+    if (c.comparison != sirius::comparison_type::not_distinct_from) { continue; }
+    if (!c.left || !c.right) { return false; }
+    if (!is_ast_translatable_key_side(*c.left) || !is_ast_translatable_key_side(*c.right)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 static cudf::filtered_join make_right_filtered_join(cudf::table_view const& right_keys,
@@ -123,12 +176,19 @@ static cudf::mark_join make_left_mark_join(cudf::table_view const& left_keys,
 }
 
 bool sirius_physical_hash_join::are_conditions_supported(
-  duckdb::vector<sirius::join_condition>& conditions)
+  duckdb::vector<sirius::join_condition>& conditions, duckdb::JoinType join_type)
 {
-  // Must have at least one equality condition for a hash-based join.
+  // Keep support validation and constructor key classification identical.
+  bool const route_null_safe = wants_null_safe_routing(conditions, join_type);
+
+  // Unsupported casts should normally have been materialized by the planner; reject any
+  // remaining untranslatable key rather than failing during execution.
+  if (route_null_safe && !null_safe_keys_are_ast_routable(conditions)) { return false; }
+
+  // Must have at least one hash-equality condition for a hash-based join.
   bool has_equality = false;
   for (auto const& cond : conditions) {
-    if (is_equality(cond.comparison)) {
+    if (is_hash_equality_key(cond.comparison, route_null_safe)) {
       has_equality = true;
       break;
     }
@@ -138,28 +198,28 @@ bool sirius_physical_hash_join::are_conditions_supported(
   // Pure equality join: always supported.
   bool has_inequality = false;
   for (auto const& cond : conditions) {
-    if (!is_equality(cond.comparison)) {
+    if (!is_hash_equality_key(cond.comparison, route_null_safe)) {
       has_inequality = true;
       break;
     }
   }
   if (!has_inequality) { return true; }
 
-  // Mixed join: collect the column indices used on each side of the equality conditions.
+  // Mixed join: collect the column indices used on each side of the hash-equality conditions.
   std::unordered_set<std::size_t> equality_left_cols, equality_right_cols;
   for (auto const& cond : conditions) {
-    if (!is_equality(cond.comparison)) { continue; }
+    if (!is_hash_equality_key(cond.comparison, route_null_safe)) { continue; }
     auto left_owned  = sirius::ast::to_duckdb(*cond.left);
     auto right_owned = sirius::ast::to_duckdb(*cond.right);
     collect_bound_ref_indices(*left_owned, equality_left_cols);
     collect_bound_ref_indices(*right_owned, equality_right_cols);
   }
 
-  // For each inequality condition, verify that its left/right column references don't overlap
-  // with the equality key columns on the same side. cuDF's mixed_join API requires the equality
-  // and conditional table columns to be disjoint.
+  // For each conditional condition (inequality or a routed null-safe key), verify its
+  // left/right column references don't overlap with the hash-key columns on the same side.
+  // cuDF's mixed_join API requires the equality and conditional table columns to be disjoint.
   for (auto const& cond : conditions) {
-    if (is_equality(cond.comparison)) { continue; }
+    if (is_hash_equality_key(cond.comparison, route_null_safe)) { continue; }
     std::unordered_set<std::size_t> ineq_left_cols, ineq_right_cols;
     auto left_owned  = sirius::ast::to_duckdb(*cond.left);
     auto right_owned = sirius::ast::to_duckdb(*cond.right);
@@ -176,12 +236,13 @@ bool sirius_physical_hash_join::are_conditions_supported(
   return true;
 }
 
-void reorder_join_conditions(duckdb::vector<sirius::join_condition>& conditions)
+void reorder_join_conditions(duckdb::vector<sirius::join_condition>& conditions,
+                             bool route_null_safe_to_conditional)
 {
   bool is_ordered     = true;
   bool seen_non_equal = false;
   for (auto& cond : conditions) {
-    if (is_equality(cond.comparison)) {
+    if (is_hash_equality_key(cond.comparison, route_null_safe_to_conditional)) {
       if (seen_non_equal) {
         is_ordered = false;
         break;
@@ -194,7 +255,7 @@ void reorder_join_conditions(duckdb::vector<sirius::join_condition>& conditions)
   duckdb::vector<sirius::join_condition> equal_conditions;
   duckdb::vector<sirius::join_condition> other_conditions;
   for (auto& cond : conditions) {
-    if (is_equality(cond.comparison)) {
+    if (is_hash_equality_key(cond.comparison, route_null_safe_to_conditional)) {
       equal_conditions.push_back(std::move(cond));
     } else {
       other_conditions.push_back(std::move(cond));
@@ -235,20 +296,23 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   _max_build_hash_table_bytes = max_build_hash_table_bytes;
   _hash_partition_bytes       = hash_partition_bytes;
   _max_broadcast_join_size    = max_broadcast_join_size;
-  reorder_join_conditions(conditions);
 
-  // Cache the null-matching flag for cuDF joins (conditions and join_type are fixed
-  // hereafter). cuDF applies one flag to all key columns, so EQUAL (null-safe) is
-  // used only when EVERY equi-key is IS NOT DISTINCT FROM; any plain `=` key
-  // (including mixed / delim joins) forces UNEQUAL.
-  //
-  // MARK joins are forced to UNEQUAL: their result logic (resolve_mark_join_result)
-  // implements IN/EXISTS three-valued semantics, which only holds under UNEQUAL. A
-  // MARK join CAN carry a null-safe key -- e.g. EXISTS(... WHERE r.k IS NOT DISTINCT
-  // FROM l.k) -- and that case is not correctly handled on the GPU today: EQUAL
-  // alone would not fix it, because the mark result would still nullify unmatched
-  // rows instead of returning them as false. This is a known limitation (same family
-  // as mixed-key null-safe joins); UNEQUAL preserves the pre-existing behavior.
+  // Route mixed null-safe keys to a NULL_EQUAL predicate; plain `=` remains a hash key.
+  bool const wants_routing   = wants_null_safe_routing(conditions, join_type);
+  bool const route_null_safe = wants_routing && null_safe_keys_are_ast_routable(conditions);
+
+  // Defensive backstop: never silently apply UNEQUAL semantics to a null-safe key.
+  if (wants_routing && !route_null_safe) {
+    throw std::runtime_error(
+      "sirius_physical_hash_join: a null-safe (IS NOT DISTINCT FROM) key mixed with a plain `=` "
+      "key carries an expression the cuDF AST cannot express (it only casts to INT64/UINT64/"
+      "FLOAT64), so it cannot be routed into the mixed-join predicate");
+  }
+  reorder_join_conditions(conditions, route_null_safe);
+
+  // Pure null-safe hash keys use EQUAL; any plain hash key requires UNEQUAL. Routed
+  // null-safe keys get their semantics from NULL_EQUAL instead. MARK remains UNEQUAL
+  // for three-valued IN/EXISTS semantics and does not yet support null-safe keys.
   compare_nulls_ = cudf::null_equality::UNEQUAL;
   if (join_type != duckdb::JoinType::MARK) {
     bool saw_null_safe   = false;
@@ -325,9 +389,9 @@ sirius_physical_hash_join::sirius_physical_hash_join(
     auto const* left_expr  = left_owned.get();
     auto const* right_expr = right_owned.get();
 
-    if (!is_equality(condition.comparison)) {
-      // Inequality conditions are handled at execute time via the cuDF mixed_join binary predicate.
-      // No key index extraction is needed here.
+    if (!is_hash_equality_key(condition.comparison, route_null_safe)) {
+      // Inequality (and routed null-safe) conditions are handled at execute time via the
+      // cuDF mixed_join binary predicate. No key index extraction is needed here.
       continue;
     }
 
@@ -681,40 +745,30 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
   bool const is_full_outer = join_type == duckdb::JoinType::OUTER;
   uint64_t const small     = partition_small_table_bytes(num_gpus);
 
-  // Phase 1 — broadcast candidacy and the partition count we propose to the eligibility check.
-  //   MARK multi-GPU: forced broadcast (build_has_null must be globally consistent).
-  //   MARK single-GPU: clamped to one partition (may still enter BUILD_PROBE below).
-  //   Otherwise: a build is a broadcast candidate when it is below the small-table threshold, OR
-  //   below max_broadcast_join_size while the probe side is large relative to the build (so
-  //   replicating the build avoids shuffling a much larger probe across GPUs).
-  bool broadcast_candidate = false;
-  int proposed             = natural;
-  if (is_mark && num_gpus > 1) {
-    broadcast_candidate = true;
-    proposed            = num_gpus;
-  } else if (is_mark) {
-    broadcast_candidate = false;
-    proposed            = 1;
-  } else {
-    broadcast_candidate = total_bytes < small ||
-                          (total_bytes < max_broadcast_join_size &&
-                           estimated_probe_to_build_ratio >= static_cast<double>(num_gpus) * 1.25);
-    proposed = broadcast_candidate ? num_gpus : natural;
-  }
+  // Broadcast candidacy. MARK multi-GPU is forced broadcast (build_has_null must be globally
+  // consistent); otherwise a build is a candidate when it is below the small-table threshold, OR
+  // below max_broadcast_join_size while the probe side is large relative to the build (replicating
+  // the build avoids shuffling a much larger probe across GPUs).
+  bool const broadcast_candidate =
+    is_mark ? num_gpus > 1
+            : (total_bytes < small ||
+               (total_bytes < max_broadcast_join_size &&
+                estimated_probe_to_build_ratio >= static_cast<double>(num_gpus) * 1.25));
 
-  // Phase 2 — BUILD_PROBE eligibility at `proposed`. MARK/SEMI/ANTI are eligible (persistent
-  // filtered_join built on the right, reused across streamed left probe batches). RIGHT_SEMI/
-  // RIGHT_ANTI/RIGHT and full OUTER emit build-side output and would need cross-batch (and, on
-  // multi-GPU, cross-partition/cross-GPU) accumulation of unmatched build rows, so they stay on the
-  // STANDARD path. A broadcast join charges the FULL build to every GPU; a hash-partitioned build
-  // charges the per-partition average.
-  bool build_probe = false;
-  if (proposed <= num_gpus) {
-    uint64_t const per_gpu_build_bytes =
-      broadcast_candidate ? total_bytes : total_bytes / static_cast<uint64_t>(proposed);
-    build_probe = per_gpu_build_bytes < max_build_hash_table_bytes && build_foldable &&
-                  !is_right_family && !is_mixed && !is_full_outer;
-  }
+  // BUILD_PROBE eligibility. MARK/SEMI/ANTI are eligible (persistent filtered_join built on the
+  // right, reused across streamed left probe batches); RIGHT_SEMI/RIGHT_ANTI/RIGHT and full OUTER
+  // emit build-side output and stay on the STANDARD path.
+  //
+  // Evaluated at the count BUILD_PROBE would run with — one build table per GPU, capped at
+  // `natural` — not at the natural count: `hash_partition_bytes` targets a streaming batch size
+  // and must not veto `max_build_hash_table_bytes`, which is what sizes the folded hash table.
+  // A broadcast join charges the FULL build to every GPU; a hash-partitioned build charges the
+  // per-GPU average.
+  int const build_probe_partitions = std::max(1, std::min(natural, num_gpus));
+  uint64_t const per_gpu_build_bytes =
+    broadcast_candidate ? total_bytes : total_bytes / static_cast<uint64_t>(build_probe_partitions);
+  bool build_probe = per_gpu_build_bytes < max_build_hash_table_bytes && build_foldable &&
+                     !is_right_family && !is_mixed && !is_full_outer;
 
   // A MARK join must always run in BUILD_PROBE mode. It needs the entire build side resident to
   // compute the global build_has_null sentinel and the per-probe-row marks, and on multi-GPU it is
@@ -725,9 +779,12 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
 
   bool const broadcast = broadcast_candidate && build_probe;
 
-  // MARK single-GPU is clamped to one partition regardless of the natural count; every other case
-  // takes num_gpus when broadcasting and the natural count otherwise.
-  int const num_partitions = broadcast ? num_gpus : ((is_mark && num_gpus <= 1) ? 1 : natural);
+  // BUILD_PROBE runs at the count its eligibility was measured at; MARK single-GPU is clamped to
+  // one partition; broadcast takes num_gpus; everything else the natural count.
+  int const num_partitions = broadcast                    ? num_gpus
+                             : build_probe                ? build_probe_partitions
+                             : (is_mark && num_gpus <= 1) ? 1
+                                                          : natural;
   return {num_partitions, broadcast, build_probe};
 }
 
@@ -1352,7 +1409,7 @@ static std::unique_ptr<operator_data> gather_join_output(
     }
   }
 
-  auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
+  auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols));
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{
       make_data_batch(std::move(output_cudf_table), memory_space, stream, telemetry_info)});
@@ -1394,7 +1451,7 @@ static std::unique_ptr<operator_data> gather_distinct_left_join_output(
     out_cols.push_back(std::move(col));
   }
 
-  auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
+  auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols));
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{
       make_data_batch(std::move(output_cudf_table), memory_space, stream, telemetry_info)});
@@ -1404,6 +1461,41 @@ static std::unique_ptr<operator_data> gather_distinct_left_join_output(
 static bool table_has_any_null(cudf::table_view const& keys)
 {
   return std::ranges::any_of(keys, [](auto const& col) { return col.null_count() > 0; });
+}
+
+/// @brief Largest build cudf::distinct_count can answer for. Hard limitation.
+static constexpr cudf::size_type k_max_distinct_count_rows =
+  std::numeric_limits<cudf::size_type>::max() / 2;
+
+/// @brief Largest build the runtime distinctness test is allowed to probe at all. Heuristic
+/// limitation.
+static constexpr cudf::size_type k_max_distinct_probe_rows = 128 * 1024 * 1024;
+static_assert(k_max_distinct_probe_rows <= k_max_distinct_count_rows);
+
+/// @brief Number of rows with which to sample the keys cheaply for a quick refutation of
+/// non-distinctness. The static set for the sample will fit in the L2 cache for recent
+/// architectures at 16MB.
+static constexpr cudf::size_type k_distinct_refute_sample_rows = 1024 * 1024;
+
+/// @brief Exact runtime test that the build keys hold no duplicate rows.
+/// @note Reads a count back to the host, so it synchronizes the stream.
+static bool build_keys_are_distinct(cudf::table_view const& build_keys,
+                                    cudf::null_equality nulls_equal,
+                                    rmm::cuda_stream_view stream)
+{
+  auto const num_rows = build_keys.num_rows();
+  if (num_rows == 1) { return true; }
+  if (build_keys.num_columns() == 0 || num_rows <= 0 || num_rows > k_max_distinct_probe_rows) {
+    return false;
+  }
+  // Guard the full uniqueness test on a sample.
+  if (num_rows > 4 * k_distinct_refute_sample_rows) {
+    auto const prefix = cudf::slice(build_keys, {0, k_distinct_refute_sample_rows}, stream).front();
+    if (cudf::distinct_count(prefix, nulls_equal, stream) != k_distinct_refute_sample_rows) {
+      return false;
+    }
+  }
+  return cudf::distinct_count(build_keys, nulls_equal, stream) == num_rows;
 }
 
 /// @brief Thread-safe check-and-set for the join-wide _build_has_null sentinel.
@@ -1518,7 +1610,7 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
   if (null_count > 0) { mark_column->set_null_mask(std::move(null_mask), null_count); }
 
   mark_out_cols.push_back(std::move(mark_column));
-  auto output_cudf_table = std::make_unique<cudf::table>(std::move(mark_out_cols), stream);
+  auto output_cudf_table = std::make_unique<cudf::table>(std::move(mark_out_cols));
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{make_data_batch(
       std::move(output_cudf_table), *left_batch.get_memory_space(), stream, telemetry_info)});
@@ -1605,17 +1697,17 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
           SIRIUS_LOG_DEBUG("sirius_physical_hash_join id {}: using filtered_join (BUILD_PROBE {})",
                            this->get_operator_id(),
                            duckdb::JoinTypeToString(join_type));
-        } else if (unique_build_keys &&
-                   (join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT)) {
-          // The planner only sets unique_build_keys for pure-equal joins (the
-          // build-uniqueness gate in sirius_plan_comparison_join excludes
-          // not_distinct_from), so compare_nulls() is UNEQUAL here -- the
-          // distinct_hash_join path is never asked to be null-safe.
+        } else if ((join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT) &&
+                   (unique_build_keys ||
+                    (runtime_distinct_build_probe &&
+                     compare_nulls() == cudf::null_equality::UNEQUAL &&
+                     build_keys_are_distinct(build_keys, compare_nulls(), stream)))) {
           slot.distinct_hash_table =
             std::make_unique<cudf::distinct_hash_join>(build_keys, compare_nulls(), 0.5, stream);
           SIRIUS_LOG_DEBUG(
-            "sirius_physical_hash_join id {}: using distinct_hash_join (BUILD_PROBE)",
-            this->get_operator_id());
+            "sirius_physical_hash_join id {}: using distinct_hash_join (BUILD_PROBE, {})",
+            this->get_operator_id(),
+            unique_build_keys ? "proven unique" : "runtime-distinct");
         } else {
           slot.hash_table = std::make_unique<cudf::hash_join>(build_keys, compare_nulls(), stream);
         }

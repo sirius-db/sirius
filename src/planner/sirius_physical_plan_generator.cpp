@@ -435,6 +435,23 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
   wrap_above(slot, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> hgb_op) {
     auto* hgb_ptr = hgb_op.get();
 
+    // Construct the merge while the child still carries the final SQL schema. COUNT(DISTINCT)
+    // emits LIST sets locally and only becomes BIGINT after merge post-processing.
+    auto merge = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(
+      &hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>(),
+      op_params.hash_partition_bytes);
+    if (hgb_ptr->has_physical_overrides()) {
+      merge->set_physical_types(hgb_ptr->get_physical_types());
+    }
+
+    auto& grouped = hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+    bool const has_supported_count_distinct_layout =
+      grouped.has_count_distinct && !grouped.has_avg && !hgb_ptr->has_physical_overrides() &&
+      hgb_ptr->types.size() == grouped.group_idx.size() + grouped.aggregate_slots.size();
+    if (has_supported_count_distinct_layout) {
+      hgb_ptr->types = grouped.get_count_distinct_local_output_types();
+    }
+
     auto partition =
       duckdb::make_uniq<sirius::op::sirius_physical_partition>(hgb_ptr->types,
                                                                hgb_ptr->estimated_cardinality,
@@ -447,12 +464,6 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
     }
     partition->children.push_back(std::move(hgb_op));
 
-    auto merge = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(
-      &hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>(),
-      op_params.hash_partition_bytes);
-    if (hgb_ptr->has_physical_overrides()) {
-      merge->set_physical_types(hgb_ptr->get_physical_types());
-    }
     // The partition's downstream sizing consumer is the merge (key_source hgb only supplies keys).
     partition_ptr->set_downstream_consumer_op(merge.get());
     merge->children.push_back(std::move(partition));
@@ -468,6 +479,11 @@ void wrap_ungrouped_aggregate(duckdb::unique_ptr<sirius::op::sirius_physical_ope
     auto* ungrouped_ptr = ungrouped_op.get();
     auto merge          = duckdb::make_uniq<sirius::op::sirius_physical_ungrouped_aggregate_merge>(
       &ungrouped_ptr->Cast<sirius::op::sirius_physical_ungrouped_aggregate>());
+    // MERGE_AGGREGATE keeps the final SQL schema copied above. The child emits per-task
+    // accumulator carriers instead: AVG is SUM + COUNT, so its runtime width is larger than the
+    // final width. Recording that schema on the child keeps task-level output validation exact.
+    ungrouped_ptr->types = ungrouped_ptr->Cast<sirius::op::sirius_physical_ungrouped_aggregate>()
+                             .get_local_output_types();
     merge->children.push_back(std::move(ungrouped_op));
     return merge;
   });

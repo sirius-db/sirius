@@ -326,6 +326,8 @@ struct plan_tree_shape_fixture {
       "(9,27),(10,30),(11,33),(12,36),(13,39),(14,42),(15,45),(16,48),(17,51),(18,54),(19,57)");
     con->Query("CREATE TABLE small_right (rid INTEGER, other INTEGER)");
     con->Query("INSERT INTO small_right VALUES (0, 0), (1, 1)");
+    con->Query("CREATE TABLE decimal_values (amount DECIMAL(15,2))");
+    con->Query("INSERT INTO decimal_values VALUES (1.00), (2.50), (3.75)");
 
     // parts/items reproduce TPC-H q17's RIGHT_DELIM_JOIN: the filter on the correlated
     // table keeps the deliminator from rewriting the correlated aggregate into a plain
@@ -361,6 +363,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   REQUIRE(!gpu_scans.empty());
   for (auto* scan : gpu_scans) {
     CHECK(scan->children.empty());
+    CHECK(scan->declared_output_schema_is_runtime_schema());
   }
 }
 
@@ -439,6 +442,30 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(partition->children[0]->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
   }
 
+  SECTION("COUNT(DISTINCT) records LIST locally and BIGINT after merge")
+  {
+    auto plan =
+      generate_sirius_plan(*con, "SELECT val, count(DISTINCT id) FROM big_left GROUP BY val");
+    INFO(tree_to_string(plan.get()));
+
+    auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+    REQUIRE(merge != nullptr);
+    REQUIRE(merge->get_types().size() == 2);
+    CHECK(merge->get_types()[1].id() == sirius::type_id::BIGINT);
+    REQUIRE(merge->children.size() == 1);
+
+    auto* partition = merge->children[0].get();
+    REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
+    REQUIRE(partition->get_types().size() == 2);
+    CHECK(partition->get_types()[1].id() == sirius::type_id::LIST);
+    REQUIRE(partition->children.size() == 1);
+
+    auto* local = partition->children[0].get();
+    REQUIRE(local->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
+    REQUIRE(local->get_types().size() == 2);
+    CHECK(local->get_types()[1].id() == sirius::type_id::LIST);
+  }
+
   SECTION("ungrouped aggregate gains MERGE_AGGREGATE with no PARTITION")
   {
     auto plan = generate_sirius_plan(*con, "SELECT sum(val) FROM big_left");
@@ -448,6 +475,41 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     REQUIRE(merge != nullptr);
     REQUIRE(merge->children.size() == 1);
     CHECK(merge->children[0]->type == SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE);
+  }
+
+  SECTION("AVG records its two-column local accumulator schema below MERGE_AGGREGATE")
+  {
+    auto plan = generate_sirius_plan(*con, "SELECT avg(val) FROM big_left");
+    INFO(tree_to_string(plan.get()));
+
+    auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_AGGREGATE);
+    REQUIRE(merge != nullptr);
+    REQUIRE(merge->get_types().size() == 1);
+    REQUIRE(merge->children.size() == 1);
+
+    auto* local = merge->children[0].get();
+    REQUIRE(local->type == SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE);
+    duckdb::vector<sirius::logical_type> const expected_local_types{
+      sirius::logical_type::make(sirius::type_id::BIGINT),
+      sirius::logical_type::make(sirius::type_id::BIGINT)};
+    CHECK(local->get_types() == expected_local_types);
+  }
+
+  SECTION("AVG preserves its DECIMAL local sum carrier below MERGE_AGGREGATE")
+  {
+    auto plan = generate_sirius_plan(*con, "SELECT avg(amount) FROM decimal_values");
+    INFO(tree_to_string(plan.get()));
+
+    auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_AGGREGATE);
+    REQUIRE(merge != nullptr);
+    REQUIRE(merge->get_types().size() == 1);
+    REQUIRE(merge->children.size() == 1);
+
+    auto* local = merge->children[0].get();
+    REQUIRE(local->type == SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE);
+    REQUIRE(local->get_types().size() == 2);
+    CHECK(local->get_types()[0] == sirius::logical_type::make_decimal(15, 2));
+    CHECK(local->get_types()[1].id() == sirius::type_id::BIGINT);
   }
 }
 
@@ -786,6 +848,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     gen.insert_gpu_pipeline_operators(plan);
 
     auto& delim_ref = plan->Cast<sirius::op::sirius_physical_delim_join>();
+    CHECK_FALSE(delim_ref.declared_output_schema_is_runtime_schema());
     REQUIRE(delim_ref.distinct_root);
     auto* merge = delim_ref.distinct_root.get();
     REQUIRE(merge->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);

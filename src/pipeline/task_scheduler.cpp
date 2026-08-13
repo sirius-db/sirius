@@ -449,41 +449,47 @@ void task_scheduler::management_eventloop()
   telemetry::TaskManagerLoopThreadHandleWrapper manager_thread_telemetry{
     *_telemetry_context, "task-scheduler-thread", _telemetry_context->shared_group_id()};
 
-  // Pull-signal scheduler. The loop blocks on _task_request_channel for two
-  // event kinds:
-  //   - device_ready  : a gpu_pipeline_executor has reserved a worker thread
-  //                     and is ready to accept a task.
-  //   - task_available: schedule() pushed a new task into _task_queue and is
-  //                     asking us to re-run the matcher in case a device was
-  //                     already waiting.
-  // Tasks remain in _task_queue (downgrade-visible) until we have a ready
-  // device to match them against — this is the property the push model in
-  // PR #732 lost and that this loop restores.
+  // Each pass tops up the two things the matcher needs — known ready devices
+  // and a non-empty queue — sleeping only for whichever is missing. The queue
+  // sleep (not the channel) is what hears the downgrade executor returning
+  // extracted tasks: that return is a direct _task_queue.push() with no
+  // task_available event, and blocking solely on the channel deadlocked once
+  // every executor had parked (#1467). Both sleeps are interrupted by stop().
   while (_running.load()) {
-    // Block for the next event.
-    auto evt = _task_request_channel.get();
-    if (evt == nullptr) {
-      SIRIUS_LOG_INFO("Task request channel closed, exiting management event loop.");
-      break;
-    }
-    if (evt->kind == task_request_kind::device_ready && !evt->is_scan) {
-      _ready_devices.emplace_back(evt->device_id);
-    }
-    // Drain any further events that are already queued, so a single matcher
-    // pass handles a burst of ready signals plus task pushes together.
-    while (auto more = _task_request_channel.try_get()) {
-      if (more->kind == task_request_kind::device_ready && !more->is_scan) {
-        _ready_devices.emplace_back(more->device_id);
+    // Devices: block only when none is parked (every executor is then busy
+    // and will post device_ready), then drain the pending burst.
+    auto evt = _task_request_channel.try_get();
+    if (!evt && _ready_devices.empty()) {
+      evt = _task_request_channel.get();
+      if (evt == nullptr) {
+        SIRIUS_LOG_INFO("Task request channel closed, exiting management event loop.");
+        break;
       }
     }
+    while (evt) {
+      if (evt->kind == task_request_kind::device_ready) {
+        _ready_devices.emplace_back(evt->device_id);
+      }
+      evt = _task_request_channel.try_get();
+    }
 
-    // Guard the deref: a task_available event can wake this loop with no device
-    // ready yet, and dereferencing begin() on an empty vector is UB. Reachable
-    // whenever a push happens while every executor is busy — which the queue's
-    // on_push callback now makes routine, since the downgrade path returning a
-    // borrowed task also publishes here.
-    if (_task_queue.empty() && !_ready_devices.empty()) {
-      if (_task_creator) { _task_creator->schedule_lookahead(*_ready_devices.begin()); }
+    // Work: let the creator pre-create for a waiting device (lookahead
+    // strategy only), then sleep until something is pushed.
+    //
+    // This second sleep site is what makes a bare `queue.push()` visible to the
+    // management loop, which otherwise only wakes on request-channel events. It
+    // supersedes the local on_push workaround (4b2fadda): the downgrade executor
+    // returning a borrowed task now wakes this loop through the queue's own CV.
+    // The empty-vector guard the workaround needed is folded in below — the
+    // creator is only asked to look ahead when a device is actually ready.
+    if (_task_queue.empty()) {
+      if (_task_creator && !_ready_devices.empty()) {
+        _task_creator->schedule_lookahead(*_ready_devices.begin());
+      }
+      if (!_task_queue.wait()) {
+        SIRIUS_LOG_INFO("Task queue interrupted, exiting management event loop.");
+        break;
+      }
     }
 
     // Matcher: for each ready device, try to find a dispatchable task.

@@ -108,9 +108,9 @@ struct build_probe_decision {
 /// consistent), so they are clamped to one partition on a single GPU and forced to broadcast on
 /// multi-GPU.
 ///
-/// BUILD_PROBE eligibility requires: at most one partition per GPU, the per-GPU hash table fits
-/// within `max_build_hash_table_bytes` (a broadcast join charges the FULL build to every GPU; a
-/// hash-partitioned build charges the per-partition average), the build folds to one batch, and the
+/// BUILD_PROBE eligibility requires: the build folds to one hash table per GPU within
+/// `max_build_hash_table_bytes` (a broadcast join charges the FULL build to every GPU; a
+/// hash-partitioned build charges the per-GPU average), the build folds to one batch, and the
 /// join is not right-family, mixed, or full-outer (those over-emit build rows on the streamed
 /// path). `join_mode` distinguishes MIXED_JOIN; `join_type` supplies the rest.
 ///
@@ -288,6 +288,13 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   mutable bool unique_probe_keys = false;
 
+  //! When the planner could not *prove* build-key uniqueness, test it at runtime instead (one hash
+  //! pass over the build keys) and, if the keys are in fact distinct, take the single-pass
+  //! cudf::distinct_hash_join path rather than the general two-pass multiset path. Proving
+  //! uniqueness statically needs a declared PRIMARY KEY on a catalog table. Set from
+  //! operator_params at planning time.
+  bool runtime_distinct_build_probe = config::DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE;
+
   //! Row-count ratio gate for switching STANDARD-mode MARK joins to cudf::mark_join (build on the
   //! left/output side) instead of filtered_join (build on the right side). Switch when
   //! right_rows >= ratio * left_rows; 0 disables. Set from operator_params at planning time.
@@ -307,8 +314,11 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
    * requires that no column referenced by an equality condition appears in any inequality
    * condition on the same side — cuDF's mixed_join API requires disjoint equality and
    * conditional table columns.
+   *
+   * @param join_type Used to exclude MARK joins from null-safe routing.
    */
-  static bool are_conditions_supported(duckdb::vector<sirius::join_condition>& conditions);
+  static bool are_conditions_supported(duckdb::vector<sirius::join_condition>& conditions,
+                                       duckdb::JoinType join_type);
 
   [[nodiscard]] bool is_right_family() const
   {
@@ -331,6 +341,13 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// targets). The upstream PARTITION folds a single-partition build to one batch for such a join
   /// so the one-shot publisher sees the whole key set.
   [[nodiscard]] bool publishes_dynamic_filters() const;
+
+  /// The per-GPU hash-table byte budget (also the upstream PARTITION's bound on folding a build
+  /// whole for dynamic-filter publication).
+  [[nodiscard]] uint64_t max_build_hash_table_bytes() const noexcept
+  {
+    return _max_build_hash_table_bytes;
+  }
 
   /// Reported by the upstream PARTITION at sizing time: the build port will deliver one
   /// concat-folded batch covering the entire build side (single-partition or broadcast build).

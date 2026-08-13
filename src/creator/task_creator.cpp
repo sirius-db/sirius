@@ -244,9 +244,11 @@ void task_creator::reset()
 }
 
 op::sirius_physical_operator* task_creator::get_operator_for_next_task(
-  op::sirius_physical_operator* node)
+  op::sirius_physical_operator* node,
+  std::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& visited_pipelines)
 {
   if (node == nullptr) { return nullptr; }
+  if (auto pipeline = node->get_pipeline()) { visited_pipelines.push_back(std::move(pipeline)); }
 
   auto hint = node->get_next_task_hint();
   if (!hint.has_value()) { return nullptr; }
@@ -259,7 +261,7 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
     // WSM TODO: how do we handle other ports that are not default?
     return hint.value().producer;
   } else if (hint.value().hint == op::TaskCreationHint::WAITING_FOR_INPUT_DATA) {
-    return get_operator_for_next_task(hint.value().producer);
+    return get_operator_for_next_task(hint.value().producer, visited_pipelines);
   }
   return nullptr;
 }
@@ -356,9 +358,24 @@ void task_creator::manager_loop()
     auto request_kind = request->type;
     if (node == nullptr) { continue; }
 
-    node = get_operator_for_next_task(node);
+    std::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> visited_pipelines;
 
-    if (node == nullptr) { continue; }
+    node = get_operator_for_next_task(node, visited_pipelines);
+
+    if (node == nullptr) {
+      // Same re-evaluation the creation path does on exit: get_next_task_hint()
+      // can have drained ports (hash join's discard sweep) in ANY pipeline the
+      // hint walk visited, making it finishable. A visited upstream pipeline
+      // whose tasks all completed earlier gets no later mark_task_completed(),
+      // so this is its only chance to be marked finished.
+      std::sort(visited_pipelines.begin(), visited_pipelines.end());
+      visited_pipelines.erase(std::unique(visited_pipelines.begin(), visited_pipelines.end()),
+                              visited_pipelines.end());
+      for (auto& visited : visited_pipelines) {
+        visited->update_pipeline_status(false);
+      }
+      continue;
+    }
 
     // Dispatch the task creation work to the pool
     _bounded_pool->dispatch(std::move(slot), [this, node, request_kind]() mutable {

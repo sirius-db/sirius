@@ -21,6 +21,7 @@
 // failure, distinct from a plan-time (create_plan) fallback.
 
 #include <catch.hpp>
+#include <config.hpp>
 #include <duckdb.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <fcntl.h>
@@ -29,6 +30,7 @@
 #include <unistd.h>  // getpid
 #include <util/duckdb_error_message.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/parquet_fixture_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
@@ -183,6 +185,105 @@ class RuntimeFallbackFixture {
 };
 
 }  // namespace
+
+TEST_CASE_METHOD(RuntimeFallbackFixture,
+                 "transparent execution: specialized regex matches generic implementation",
+                 "[transparent][integration][regex-jit-differential]")
+{
+  struct regex_jit_restore_guard {
+    bool original;
+    ~regex_jit_restore_guard() { duckdb::Config::ENABLE_REGEX_JIT_IMPL = original; }
+  } restore_regex_jit{duckdb::Config::ENABLE_REGEX_JIT_IMPL};
+
+  create_table(R"SQL(
+    CREATE TABLE test_regex_jit_equivalence AS
+    SELECT * FROM (VALUES
+      (1,  'http://www.example.com/a'),
+      (2,  'https://sub.example.org/a/b?x=1'),
+      (3,  'http://www.example.com/'),
+      (4,  'https://www.www.example.com/path'),
+      (5,  'https://münich.example/über'),
+      (6,  'https://example.com'),
+      (7,  'ftp://example.com/path'),
+      (8,  'HTTPS://example.com/path'),
+      (9,  'http:///missing-host'),
+      (10, ''),
+      (11, NULL),
+      (12, 'http://www./x'),
+      (13, 'http://www.//x'),
+      (14, 'https://newline.example/' || chr(10) || 'tail'),
+      (15, 'http://a' || chr(10) || 'b/x')
+    ) AS cases(id, url)
+  )SQL");
+
+  create_table(R"SQL(
+    CREATE TABLE test_regex_jit_final_newline_fallback AS
+    SELECT * FROM (VALUES
+      (1, 'http://a/x' || chr(10))
+    ) AS cases(id, url)
+  )SQL");
+
+  auto run_with_specialized_regex = [this](bool enabled, std::string const& table) {
+    auto setting =
+      con->Query(std::string{"SET enable_regex_jit_impl = "} + (enabled ? "true" : "false"));
+    REQUIRE(setting != nullptr);
+    REQUIRE_FALSE(setting->HasError());
+    REQUIRE(duckdb::Config::ENABLE_REGEX_JIT_IMPL == enabled);
+
+    auto const before = sirius::test::get_transparent_execution_stats(*con);
+    auto query        = std::string{R"SQL(
+      SELECT regexp_replace(url, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS domain
+      FROM )SQL"} +
+                 table + R"SQL(
+      ORDER BY id
+    )SQL";
+    auto result = con->Query(query);
+    REQUIRE(result != nullptr);
+    if (result->HasError()) {
+      UNSCOPED_INFO("regex differential query failed: " << result->GetError());
+    }
+    REQUIRE_FALSE(result->HasError());
+    auto const after = sirius::test::get_transparent_execution_stats(*con);
+    sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
+
+    std::vector<std::string> rows;
+    rows.reserve(result->RowCount());
+    for (duckdb::idx_t row = 0; row < result->RowCount(); ++row) {
+      rows.push_back(result->GetValue(0, row).ToString());
+    }
+    return rows;
+  };
+
+  auto const generic     = run_with_specialized_regex(false, "test_regex_jit_equivalence");
+  auto const specialized = run_with_specialized_regex(true, "test_regex_jit_equivalence");
+  REQUIRE(specialized == generic);
+
+  std::vector<std::string> const expected{
+    "example.com",
+    "sub.example.org",
+    "example.com",
+    "www.example.com",
+    "münich.example",
+    "https://example.com",
+    "ftp://example.com/path",
+    "HTTPS://example.com/path",
+    "http:///missing-host",
+    "",
+    "NULL",
+    "www.",
+    "www.",
+    "https://newline.example/\ntail",
+    "a\nb",
+  };
+  REQUIRE(specialized == expected);
+
+  auto const generic_final_newline =
+    run_with_specialized_regex(false, "test_regex_jit_final_newline_fallback");
+  auto const specialized_final_newline =
+    run_with_specialized_regex(true, "test_regex_jit_final_newline_fallback");
+  REQUIRE(specialized_final_newline == generic_final_newline);
+  REQUIRE(specialized_final_newline == std::vector<std::string>{"a\n"});
+}
 
 // A GPU failure at runtime completes the query on CPU and is counted as a runtime
 // fallback. Without injection the same query runs on the GPU.
@@ -349,30 +450,13 @@ constexpr char kS3MixChildCase[]        = "S3 mix fallback child runner";
 constexpr char kS3MixScenarioEnv[]      = "SIRIUS_S3MIX_CHILD_SCENARIO";
 constexpr char kRuntimeFallbackBanner[] = "Error in Sirius GPU execution, fallback to DuckDB";
 
-std::string sql_literal(std::string const& value)
-{
-  std::string out;
-  out.reserve(value.size() + 2);
-  out.push_back('\'');
-  for (auto const c : value) {
-    if (c == '\'') { out.push_back('\''); }
-    out.push_back(c);
-  }
-  out.push_back('\'');
-  return out;
-}
-
 class S3MixFixture : public sirius::test::GpuExecutionFixture {
  public:
   S3MixFixture()
+    : work_dir{"s3mix"},
+      parquet_path{work_dir.path() / "nested.parquet"},
+      empty_path{work_dir.path() / "empty.parquet"}
   {
-    static std::atomic<std::uint64_t> next_id{0};
-    work_dir = fs::temp_directory_path() / ("sirius_s3mix_" + std::to_string(::getpid()) + "_" +
-                                            std::to_string(next_id.fetch_add(1)));
-    fs::create_directories(work_dir);
-    parquet_path = work_dir / "nested.parquet";
-    empty_path   = work_dir / "empty.parquet";
-
     std::string const source =
       "SELECT CAST(i - 100 AS BIGINT) AS id, "
       "CAST(i - 100 AS BIGINT) AS a, CAST(i AS BIGINT) AS b, "
@@ -382,34 +466,34 @@ class S3MixFixture : public sirius::test::GpuExecutionFixture {
       "FROM range(300) t(i)";
 
     run_ok("SET gpu_execution = false;");
-    run_ok("COPY (" + source + ") TO " + sql_literal(parquet_path.string()) + " (FORMAT PARQUET);");
+    run_ok("COPY (" + source + ") TO " + sirius::test::sql_literal(parquet_path.string()) +
+           " (FORMAT PARQUET);");
     run_ok("COPY (SELECT * FROM (" + source + ") empty_source WHERE false) TO " +
-           sql_literal(empty_path.string()) + " (FORMAT PARQUET);");
+           sirius::test::sql_literal(empty_path.string()) + " (FORMAT PARQUET);");
     run_ok("CREATE TABLE mix_native AS " + source + ";");
     run_ok("CHECKPOINT;");
 
-    auto const partition_dir = work_dir / "hive" / "part=1";
+    auto const partition_dir = work_dir.path() / "hive" / "part=1";
     fs::create_directories(partition_dir);
     fs::copy_file(
       parquet_path, partition_dir / "data.parquet", fs::copy_options::overwrite_existing);
     run_ok("SET gpu_execution = true;");
   }
 
-  ~S3MixFixture() { fs::remove_all(work_dir); }
-
   std::string parquet_scan() const
   {
-    return "read_parquet(" + sql_literal(parquet_path.string()) + ")";
+    return "read_parquet(" + sirius::test::sql_literal(parquet_path.string()) + ")";
   }
 
   std::string empty_scan() const
   {
-    return "read_parquet(" + sql_literal(empty_path.string()) + ")";
+    return "read_parquet(" + sirius::test::sql_literal(empty_path.string()) + ")";
   }
 
   std::string hive_scan() const
   {
-    return "read_parquet(" + sql_literal((work_dir / "hive" / "*" / "*.parquet").string()) +
+    return "read_parquet(" +
+           sirius::test::sql_literal((work_dir.path() / "hive" / "*" / "*.parquet").string()) +
            ", hive_partitioning=true)";
   }
 
@@ -472,7 +556,7 @@ class S3MixFixture : public sirius::test::GpuExecutionFixture {
   }
 
  private:
-  fs::path work_dir;
+  sirius::test::scratch_dir work_dir;
   fs::path parquet_path;
   fs::path empty_path;
 };
@@ -764,7 +848,8 @@ TEST_CASE_METHOD(RuntimeFallbackFixture,
     csv << "id\n1\n";
   }
 
-  auto const inner = "SELECT * FROM read_csv_auto(" + sql_literal(csv_path.string()) + ")";
+  auto const inner =
+    "SELECT * FROM read_csv_auto(" + sirius::test::sql_literal(csv_path.string()) + ")";
   std::string escaped;
   escaped.reserve(inner.size());
   for (auto const c : inner) {

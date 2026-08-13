@@ -51,6 +51,7 @@ void validate_operator_output_types(const op::operator_data* data,
                                     const op::sirius_physical_operator& op)
 {
   if (data == nullptr) { return; }
+  if (!op.declared_output_schema_is_runtime_schema()) { return; }
   auto* pipelineable_data = dynamic_cast<const op::pipelineable_operator_data*>(data);
   if (pipelineable_data == nullptr) { return; }
   const auto& expected_types = op.get_types();
@@ -72,8 +73,6 @@ void validate_operator_output_types(const op::operator_data* data,
     if (!batch) { continue; }
     cudf::table_view tbl = get_cudf_table_view(*batch);
     if (static_cast<size_t>(tbl.num_columns()) != expected_types.size()) {
-      // bobbi (todo): delim join will return this warning for now, but there is no bug here, so we
-      // can ignore it. we can do something about this after gtc
       SIRIUS_LOG_WARN(
         "gpu_pipeline_task: operator '{}' (id={}) output batch {} column count mismatch: got "
         "{}, expected {}",
@@ -252,6 +251,9 @@ std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_in
   // size for a plain representation, plus the compressed payload for a compressed one,
   // since decode stages the payload on device alongside the table it builds. Column
   // projections scale both byte fields pro-rata, so the estimate follows them.
+  //
+  // A per-column compressed batch is charged its LARGEST artifact rather than the
+  // sum, since it stages one at a time; see decode_transient_bytes().
 
   if (auto* scan_input = dynamic_cast<const op::scan::scan_operator_input*>(_input_data.get());
       scan_input && scan_input->is_resident()) {
