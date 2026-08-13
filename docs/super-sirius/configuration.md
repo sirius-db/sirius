@@ -321,7 +321,7 @@ and transport use one trust policy; there are no separate REST YAML controls.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `request_timeout_s` | int (seconds) | 30 | Whole-request timeout and presigned-URL TTL (0 = no limit). |
+| `request_timeout_s` | int (seconds, **>= 0**) | 30 | Whole-request timeout and presigned-URL TTL (0 = no limit; negative values are rejected). |
 | `max_connections` | int | 16 | Max concurrent in-flight connections per reactor. |
 | `chunk_size` | bytes | 8Mi | Target bytes per ranged GET (scatter/device-staging paths). |
 | `max_n_chunks` | int | 16 | Max file-adjacent segments fused into one scatter GET. |
