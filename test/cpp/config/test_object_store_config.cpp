@@ -285,11 +285,9 @@ TEST_CASE("sirius_config parses rest perf instrumentation flag",
   std::filesystem::remove(path, ec);
 }
 
-TEST_CASE("sirius_config rejects negative REST request timeouts",
-          "[scan_manager][config][rest]")
+TEST_CASE("sirius_config rejects negative REST request timeouts", "[scan_manager][config][rest]")
 {
-  auto const path =
-    std::filesystem::temp_directory_path() / "sirius_rest_request_timeout.yaml";
+  auto const path = std::filesystem::temp_directory_path() / "sirius_rest_request_timeout.yaml";
 
   SECTION("zero keeps the documented unlimited timeout")
   {
