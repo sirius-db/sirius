@@ -348,17 +348,22 @@ TEST_CASE("Sirius YAML rejects invalid dynamic-filter thresholds", "[sirius][con
     {"invalid_dynamic_filter_keep_threshold_nan.yaml", "dynamic_filter_keep_threshold"},
   };
 
+  sirius::sirius_config config;
+  REQUIRE_NOTHROW(config.load_from_file(data_dir / "setting_defaults.yaml"));
+  REQUIRE(config.get_operator_params().dynamic_filter_domain_coverage_threshold == Approx(0.8));
+  REQUIRE(config.get_operator_params().dynamic_filter_keep_threshold == Approx(0.7));
+
   for (auto const& invalid : cases) {
     INFO("fixture=" << invalid.fixture << " setting=" << invalid.setting);
     auto const path = data_dir / invalid.fixture;
     REQUIRE(fs::is_regular_file(path));
 
-    sirius::sirius_config config;
     REQUIRE_THROWS_WITH(config.load_from_file(path),
                         Catch::Contains(invalid.setting) && Catch::Contains("value out of range"));
+    REQUIRE(config.get_operator_params().dynamic_filter_domain_coverage_threshold == Approx(0.8));
+    REQUIRE(config.get_operator_params().dynamic_filter_keep_threshold == Approx(0.7));
   }
 
-  sirius::sirius_config config;
   REQUIRE_NOTHROW(
     config.load_from_file(data_dir / "valid_dynamic_filter_threshold_boundaries.yaml"));
   REQUIRE(config.get_operator_params().dynamic_filter_domain_coverage_threshold == Approx(1.5));
