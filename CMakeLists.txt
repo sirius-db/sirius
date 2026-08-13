@@ -722,6 +722,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_tpcds_nulls.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
+    test/cpp/integration/test_gpu_execution_unique_join.cpp
     test/cpp/integration/test_gpu_execution_vector_search.cpp
     test/cpp/integration/test_pin_table_host_streaming.cpp
     test/cpp/integration/test_pin_table_merge_columns.cpp
