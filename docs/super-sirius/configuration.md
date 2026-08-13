@@ -325,10 +325,10 @@ and transport use one trust policy; there are no separate REST YAML controls.
 | `chunk_size` | bytes | 8Mi | Target bytes per ranged GET (scatter/device-staging paths). |
 | `max_n_chunks` | int | 16 | Max file-adjacent segments fused into one scatter GET. |
 | `max_read_split` | int | 16 | Max parallel ranged GETs for one contiguous host read (reads < 2 MiB stay a single GET). |
-| `upkeep_interval_ms` | int (ms) | 15000 | Idle-connection keepalive interval (`curl_easy_upkeep`; 0 disables). |
-| `conn_max_age_s` | int (seconds) | 20 | Max age curl may reuse a pooled connection (`CURLOPT_MAXAGE_CONN`; 0 = curl default). |
-| `retry_backoff_base_ms` | int (ms) | 50 | Base backoff between retries. |
-| `retry_jitter_ms` | int (ms) | 50 | Random jitter added to retry backoff. |
+| `upkeep_interval_ms` | duration (**>= 0**) | 15s | Idle-connection keepalive interval (`curl_easy_upkeep`; 0 disables). Bare numbers are milliseconds; duration suffixes are accepted. |
+| `conn_max_age_s` | duration (**>= 0**) | 20s | Max age curl may reuse a pooled connection (`CURLOPT_MAXAGE_CONN`; 0 = curl default). Bare numbers are seconds; duration suffixes are accepted. |
+| `retry_backoff_base_ms` | duration (**>= 0**) | 50ms | Base backoff between retries. Bare numbers are milliseconds; duration suffixes are accepted. |
+| `retry_jitter_ms` | duration (**>= 0**) | 50ms | Random jitter added to retry backoff. Bare numbers are milliseconds; duration suffixes are accepted. |
 | `max_retry_attempts` | int | 10 | Retry attempts for transient errors. |
 | `max_auth_retry_attempts` | int | 3 | Retry attempts for HTTP 403 (expired presigned URL). Kept low so a genuine AccessDenied fails fast. |
 | `honor_retry_after` | bool | true | Respect the server's `Retry-After` header. |

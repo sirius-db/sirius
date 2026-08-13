@@ -19,9 +19,13 @@
 #include "io/rest/config.hpp"
 #include "sirius_config.hpp"
 
+#include <array>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
+#include <utility>
 
 using sirius::io::enum_to_string;
 using sirius::io::object_store_config;
@@ -349,6 +353,96 @@ TEST_CASE("sirius_config still loads unrelated REST YAML fields",
 
   std::error_code ec;
   std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("sirius_config rejects negative REST durations and preserves zero",
+          "[scan_manager][config][rest]")
+{
+  using namespace std::chrono_literals;
+
+  struct duration_field {
+    const char* name;
+    std::chrono::milliseconds default_value;
+    std::chrono::milliseconds bare_seven;
+    const char* negative_native;
+    const char* negative_subresolution;
+  };
+  constexpr std::array fields{
+    duration_field{"upkeep_interval_ms", 15s, 7ms, "-1ms", "-1us"},
+    duration_field{"conn_max_age_s", 20s, 7s, "-1s", "-1ms"},
+    duration_field{"retry_backoff_base_ms", 50ms, 7ms, "-1ms", "-1us"},
+    duration_field{"retry_jitter_ms", 50ms, 7ms, "-1ms", "-1us"},
+  };
+
+  auto read_value = [](sirius::sirius_config const& cfg,
+                       std::string_view name) -> std::chrono::milliseconds {
+    auto const& rest = cfg.get_scan_manager_config().rest;
+    if (name == "upkeep_interval_ms") { return rest.upkeep_interval; }
+    if (name == "conn_max_age_s") {
+      return std::chrono::duration_cast<std::chrono::milliseconds>(rest.conn_max_age);
+    }
+    if (name == "retry_backoff_base_ms") { return rest.retry_backoff_base; }
+    return rest.retry_jitter;
+  };
+
+  auto write_value =
+    [](std::filesystem::path const& path, std::string_view name, std::string_view value) {
+      std::string body =
+        "sirius:\n"
+        "  executor:\n"
+        "    scan_manager:\n"
+        "      rest:";
+      if (value == "<omitted>") {
+        body += " {}\n";
+      } else {
+        body += "\n        " + std::string(name) + ": " + std::string(value) + "\n";
+      }
+      write_yaml(path, body);
+    };
+
+  for (auto const& field : fields) {
+    INFO("field=" << field.name);
+    auto const path = std::filesystem::temp_directory_path() /
+                      ("sirius_rest_duration_" + std::string(field.name) + ".yaml");
+
+    for (auto const* value : {"<omitted>", "null"}) {
+      INFO("value=" << value);
+      write_value(path, field.name, value);
+      sirius::sirius_config cfg;
+      REQUIRE_NOTHROW(cfg.load_from_file(path));
+      CHECK(read_value(cfg, field.name) == field.default_value);
+    }
+
+    for (auto const& [value, expected] :
+         std::array<std::pair<const char*, std::chrono::milliseconds>, 3>{
+           std::pair{"0", 0ms},
+           std::pair{"7", field.bare_seven},
+           std::pair{"\"2s\"", 2s},
+         }) {
+      INFO("value=" << value);
+      write_value(path, field.name, value);
+      sirius::sirius_config cfg;
+      REQUIRE_NOTHROW(cfg.load_from_file(path));
+      CHECK(read_value(cfg, field.name) == expected);
+    }
+
+    sirius::sirius_config cfg;
+    write_value(path, field.name, "7");
+    REQUIRE_NOTHROW(cfg.load_from_file(path));
+    REQUIRE(read_value(cfg, field.name) == field.bare_seven);
+
+    for (auto const* value : {"-1", field.negative_native, field.negative_subresolution}) {
+      INFO("value=" << value);
+      write_value(path, field.name, value);
+      REQUIRE_THROWS_WITH(cfg.load_from_file(path),
+                          Catch::Contains("rest." + std::string(field.name)) &&
+                            Catch::Contains("duration must be non-negative"));
+      CHECK(read_value(cfg, field.name) == field.bare_seven);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+  }
 }
 
 TEST_CASE("sirius_config keeps REST bounce sizing internal", "[scan_manager][config][rest]")
