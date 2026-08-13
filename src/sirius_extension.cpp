@@ -2230,6 +2230,12 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
       "TEST ONLY: force transparent GPU execution to fail at runtime with this message",
       LogicalType::VARCHAR,
       Value(""));
+    config.AddExtensionOption(
+      "max_sort_partition_memory_fraction",
+      "TEST ONLY: override the internal automatic sort-partition memory fraction",
+      LogicalType::DOUBLE,
+      Value::DOUBLE(operator_defaults.max_sort_partition_memory_fraction),
+      SetMaxSortPartitionMemoryFraction);
   }
 
   // Add in config options for special JIT implementation for regex
@@ -2270,13 +2276,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                             LogicalType::UBIGINT,
                             Value::UBIGINT(operator_defaults.max_sort_partition_bytes),
                             SetMaxSortPartitionBytes);
-  config.AddExtensionOption(
-    "max_sort_partition_memory_fraction",
-    "Fraction of available GPU memory per sort partition when max_sort_partition_bytes is 0",
-    LogicalType::DOUBLE,
-    Value::DOUBLE(operator_defaults.max_sort_partition_memory_fraction),
-    SetMaxSortPartitionMemoryFraction);
-
   // Logging configuration
   config.AddExtensionOption("sirius_log_backend",
                             "Logging backend for Sirius (duckdb, spdlog, noop)",

@@ -559,7 +559,6 @@ SET enable_compressed_materialization = false;
 |----------|---------|-------------|
 | `fuse_merge_pipelines` | true | Fuse eligible GROUP BY / TOP_N merges into their downstream pipeline instead of cutting a boundary (see [physical-plan-generation.md](physical-plan-generation.md) → Merge fusion) |
 | `max_sort_partition_bytes` | 0 (auto) | Max sort partition bytes |
-| `max_sort_partition_memory_fraction` | 0.33 | Auto sort-partition fraction when `max_sort_partition_bytes` is 0 |
 | `hash_partition_bytes` | Shared physical/effective GPU batch default | Hash partition target size; must be greater than zero |
 | `concat_batch_bytes` | Shared physical/effective GPU batch default | CONCAT output batch size |
 | `sort_sample_bytes` | Shared physical/effective GPU batch default | Bytes sampled before computing sort boundaries |
@@ -567,6 +566,11 @@ SET enable_compressed_materialization = false;
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
 | `enable_runtime_distinct_build_probe` | true | Runtime distinct-build test for `BUILD_PROBE` joins; promotes to the single-pass `cudf::distinct_hash_join` when the build keys prove distinct |
+
+When `max_sort_partition_bytes` is left at its automatic value, Sirius uses an
+internal 0.33 memory fraction. Advanced benchmark envelopes may override
+`max_sort_partition_memory_fraction` in YAML under `sirius.operator_params`,
+but it is not a normal session setting.
 
 ### Dynamic Filters
 
