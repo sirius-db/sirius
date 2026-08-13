@@ -259,24 +259,32 @@ TEST_CASE("sirius_config rejects inactive prefetch cache settings",
 {
   for (auto const enable_line :
        {std::string{}, std::string{"      enable_prefetch_cache: false\n"}}) {
-    auto const path = std::filesystem::temp_directory_path() /
-                      (enable_line.empty() ? "sirius_cache_disabled_implicitly.yaml"
-                                           : "sirius_cache_disabled_explicitly.yaml");
-    write_yaml(path,
-               "sirius:\n"
-               "  executor:\n"
-               "    scan_manager:\n" +
-                 enable_line +
-                 "      cache:\n"
-                 "        inflight_io_chunk_budget: 64\n");
+    for (auto const cache_setting : {std::string{"inflight_io_chunk_budget: 64"},
+                                     std::string{"dispose_after_use: true"},
+                                     std::string{"min_prefetching_budget_fraction: 0.1"},
+                                     std::string{"eviction_threshold_fraction: 0.7"}}) {
+      auto const path = std::filesystem::temp_directory_path() /
+                        (enable_line.empty() ? "sirius_cache_disabled_implicitly.yaml"
+                                             : "sirius_cache_disabled_explicitly.yaml");
+      write_yaml(path,
+                 "sirius:\n"
+                 "  executor:\n"
+                 "    scan_manager:\n" +
+                   enable_line + "      cache:\n        " + cache_setting + "\n");
 
-    sirius::sirius_config cfg;
-    CHECK_THROWS_WITH(cfg.load_from_file(path),
-                      Catch::Contains("scan_manager.cache") &&
-                        Catch::Contains("requires enable_prefetch_cache: true"));
+      sirius::sirius_config cfg;
+      CHECK_THROWS_WITH(cfg.load_from_file(path),
+                        Catch::Contains("scan_manager.cache") &&
+                          Catch::Contains("requires enable_prefetch_cache: true"));
+      auto const& cache = cfg.get_scan_manager_config().cache;
+      CHECK(cache.inflight_io_chunk_budget == 2048);
+      CHECK_FALSE(cache.dispose_after_use);
+      CHECK(cache.min_prefetching_budget_fraction == 0.05);
+      CHECK(cache.eviction_threshold_fraction == 0.6);
 
-    std::error_code ec;
-    std::filesystem::remove(path, ec);
+      std::error_code ec;
+      std::filesystem::remove(path, ec);
+    }
   }
 }
 

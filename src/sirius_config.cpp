@@ -249,10 +249,10 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
                                    cache_reader.has_value("dispose_after_use") ||
                                    cache_reader.has_value("min_prefetching_budget_fraction") ||
                                    cache_reader.has_value("eviction_threshold_fraction");
-    sirius::from_yaml(*n, opt.cache);
     if (!opt.enable_prefetch_cache && has_cache_setting) {
       throw std::runtime_error("scan_manager.cache: requires enable_prefetch_cache: true");
     }
+    sirius::from_yaml(*n, opt.cache);
   }
   if (auto n = r.optional_node("object_store")) sirius::from_yaml(*n, opt.object_store);
   if (auto n = r.optional_node("memory_prefetcher")) from_yaml(*n, opt.memory_prefetcher);
