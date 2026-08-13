@@ -26,6 +26,7 @@
 #include <api/compressed_table_io.hpp>
 #include <api/simpatico_codegen.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -117,6 +118,11 @@ struct compressed_device_blob {
   /// holding it costs no device memory.
   std::vector<std::uint8_t> header;
   std::once_flag table_built;
+  /// Set once `table` is usable. `once_flag` cannot be queried, and the pin path
+  /// needs to distinguish "already reconstructed" from "needs a stream and
+  /// scratch to build" without doing the build. See table() in
+  /// compressed_representation.hpp.
+  std::atomic<bool> table_ready{false};
 
   simpatico::compressed_table table;
 
@@ -133,6 +139,12 @@ struct compressed_device_blob {
   /// a half-built table.
   const simpatico::compressed_table& ensure_table(rmm::cuda_stream_view stream,
                                                   rmm::device_async_resource_ref scratch_mr);
+
+  /// Whether `table` has been reconstructed and can be read without a stream.
+  [[nodiscard]] bool has_table() const noexcept
+  {
+    return table_ready.load(std::memory_order_acquire);
+  }
 };
 
 /**

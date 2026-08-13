@@ -237,6 +237,7 @@ set(EXTENSION_SOURCES
     src/compression/compressed_disk_representation.cpp
     src/compression/compressed_representation.cpp
     src/compression/compression_converters.cpp
+    src/compression/compression_device_pool.cpp
     src/compression/device_compressed_blob.cpp
     src/compression/output_compression.cpp
     src/compression/plan_register.cpp

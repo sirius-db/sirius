@@ -178,7 +178,7 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   // threads are spawned. The H2D fetch above ran on `stream`; sync it first so
   // pool-stream reads are ordered after all fetched bytes are resident.
   stream.synchronize();
-  auto& pool    = decode_pool();
+  auto& pool    = column_pool();
   auto const mr = rmm::mr::get_current_device_resource_ref();
   // `subset` already holds only the projected columns, so the pushdown — which
   // is indexed by projected position — lines up with 0..num_columns.
@@ -305,7 +305,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
   // Reconstructs here for a blob staged by the output/downgrade tiers, which defer it;
   // for a pinned chunk the table is already built and this is a plain lookup.
   auto const& ct = rep.table(stream, mr);
-  auto& pool     = decode_pool();
+  auto& pool     = column_pool();
 
   // Projected column count — what the pushdown is indexed by.
   auto const n_selected =
