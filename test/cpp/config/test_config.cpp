@@ -24,6 +24,7 @@
 #include <exception>
 #include <optional>
 #include <stdexcept>
+#include <utility>
 #include <variant>
 
 using namespace sirius;
@@ -49,6 +50,58 @@ TEST_CASE("yaml reader basic types", "[config_opt][basic]")
   REQUIRE(int_value == 100);
   REQUIRE(double_value == Approx(6.28));
   REQUIRE(string_value == "config setter test");
+}
+
+TEST_CASE("yaml reader rejects negative unsigned values without mutation",
+          "[config_opt][basic][unsigned]")
+{
+  SECTION("unvalidated size_t accepts zero and one but rejects negative input")
+  {
+    for (auto const& [input, expected] :
+         {std::pair{"0", std::size_t{0}}, std::pair{"1", std::size_t{1}}}) {
+      CAPTURE(input);
+      auto node         = YAML::Load("value: " + std::string{input});
+      std::size_t value = 17;
+      yaml::reader r(node, "unsigned_test");
+      REQUIRE_NOTHROW(r.optional("value", value));
+      CHECK(value == expected);
+    }
+
+    auto node         = YAML::Load("value: -1");
+    std::size_t value = 17;
+    yaml::reader r(node, "unsigned_test");
+    REQUIRE_THROWS_WITH(r.optional("value", value),
+                        Catch::Contains("unsigned_test.value") &&
+                          Catch::Contains("unsigned value must be non-negative"));
+    CHECK(value == 17);
+  }
+
+  SECTION("validated size_t preserves its stricter positive policy")
+  {
+    auto const positive = yaml::greater_than<std::size_t>{0};
+
+    auto zero_node         = YAML::Load("value: 0");
+    std::size_t zero_value = 17;
+    yaml::reader zero_reader(zero_node, "unsigned_test");
+    REQUIRE_THROWS_WITH(
+      zero_reader.optional("value", zero_value, positive),
+      Catch::Contains("unsigned_test.value") && Catch::Contains("value out of range"));
+    CHECK(zero_value == 17);
+
+    auto one_node         = YAML::Load("value: 1");
+    std::size_t one_value = 17;
+    yaml::reader one_reader(one_node, "unsigned_test");
+    REQUIRE_NOTHROW(one_reader.optional("value", one_value, positive));
+    CHECK(one_value == 1);
+
+    auto negative_node         = YAML::Load("value: -1");
+    std::size_t negative_value = 17;
+    yaml::reader negative_reader(negative_node, "unsigned_test");
+    REQUIRE_THROWS_WITH(negative_reader.optional("value", negative_value, positive),
+                        Catch::Contains("unsigned_test.value") &&
+                          Catch::Contains("unsigned value must be non-negative"));
+    CHECK(negative_value == 17);
+  }
 }
 
 TEST_CASE("yaml reader optional missing field uses default", "[config_opt][optional]")

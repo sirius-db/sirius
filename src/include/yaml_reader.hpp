@@ -204,10 +204,12 @@ template <std::integral T>
   requires(!std::is_same_v<T, bool>)
 void read_yaml(const YAML::Node& node, T& out)
 {
-  if constexpr (sizeof(T) > 4)
-    out = static_cast<T>(node.as<long long>());
-  else
-    out = static_cast<T>(node.as<int>());
+  using parsed_type = std::conditional_t<(sizeof(T) > 4), long long, int>;
+  auto const parsed = node.as<parsed_type>();
+  if constexpr (std::is_unsigned_v<T>) {
+    if (parsed < 0) { throw std::runtime_error("unsigned value must be non-negative"); }
+  }
+  out = static_cast<T>(parsed);
 }
 
 /// Wrapper that marks an integral field as accepting byte suffixes (e.g. "8Gi", "512M").

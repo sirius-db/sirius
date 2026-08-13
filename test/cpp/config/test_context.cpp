@@ -329,6 +329,20 @@ TEST_CASE("Sirius configuration validates MARK join build switch ratio", "[siriu
   REQUIRE(config.get_operator_params().mark_join_build_switch_ratio == Approx(0.0));
 }
 
+TEST_CASE("Sirius configuration rejects negative memory prefetcher threads", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  fs::path cfg             = fs::path(loc.file_name()).parent_path() / "data" /
+                 "invalid_memory_prefetcher_num_threads_negative.yaml";
+
+  sirius::sirius_config config;
+  auto const before = config.get_scan_manager_config().memory_prefetcher.num_threads;
+  REQUIRE_THROWS_WITH(config.load_from_file(cfg),
+                      Catch::Contains("memory_prefetcher.num_threads") &&
+                        Catch::Contains("unsigned value must be non-negative"));
+  CHECK(config.get_scan_manager_config().memory_prefetcher.num_threads == before);
+}
+
 namespace {
 
 void require_shared_operator_defaults(const sirius::operator_params& params, uint64_t batch)
