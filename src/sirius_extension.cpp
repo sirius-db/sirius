@@ -2230,6 +2230,11 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
       "TEST ONLY: force transparent GPU execution to fail at runtime with this message",
       LogicalType::VARCHAR,
       Value(""));
+    config.AddExtensionOption("max_build_hash_table_bytes",
+                              "TEST ONLY: override the internally derived BUILD_PROBE threshold",
+                              LogicalType::UBIGINT,
+                              Value::UBIGINT(operator_defaults.max_build_hash_table_bytes),
+                              SetMaxBuildHashTableBytes);
   }
 
   // Add in config options for special JIT implementation for regex
@@ -2316,13 +2321,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                             LogicalType::UBIGINT,
                             Value::UBIGINT(operator_defaults.sort_sample_bytes),
                             SetSortSampleBytes);
-
-  config.AddExtensionOption("max_build_hash_table_bytes",
-                            "Maximum size a build-side table can be where it will create a "
-                            "reusable hash table for hash joins (i.e. BUILD_PROBE mode)",
-                            LogicalType::UBIGINT,
-                            Value::UBIGINT(operator_defaults.max_build_hash_table_bytes),
-                            SetMaxBuildHashTableBytes);
 
   config.AddExtensionOption("max_broadcast_join_size",
                             "Maximum build-side size in bytes for a broadcast join, where the "

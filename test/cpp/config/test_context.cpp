@@ -212,10 +212,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     setenv("SIRIUS_DISABLE", "1", 1);
   }};
 
-  auto setting_count = [](duckdb::Connection& con) {
-    auto result = con.Query(
-      "SELECT count(*) FROM duckdb_settings() "
-      "WHERE name = 'sirius_test_inject_transparent_gpu_error'");
+  auto setting_count = [](duckdb::Connection& con, std::string const& name) {
+    auto result = con.Query("SELECT count(*) FROM duckdb_settings() WHERE name = '" + name + "'");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     return result->GetValue(0, 0).GetValue<int64_t>();
@@ -226,8 +224,12 @@ TEST_CASE("Test-only settings require explicit process opt-in",
   {
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
-    REQUIRE(setting_count(con) == 0);
+    REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 0);
+    REQUIRE(setting_count(con, "max_build_hash_table_bytes") == 0);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    result = con.Query("SET max_build_hash_table_bytes = 1048576");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
   }
@@ -236,15 +238,23 @@ TEST_CASE("Test-only settings require explicit process opt-in",
   {
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
-    REQUIRE(setting_count(con) == 0);
+    REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 0);
+    REQUIRE(setting_count(con, "max_build_hash_table_bytes") == 0);
   }
 
   setenv("SIRIUS_ENABLE_TEST_OPTIONS", "1", 1);
   {
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
-    REQUIRE(setting_count(con) == 1);
+    REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 1);
+    REQUIRE(setting_count(con, "max_build_hash_table_bytes") == 1);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET max_build_hash_table_bytes = 1048576");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("RESET max_build_hash_table_bytes");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
   }
