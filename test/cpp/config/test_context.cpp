@@ -857,6 +857,18 @@ TEST_CASE("Sirius configuration loading from file with spaces",
   REQUIRE(manager.get_all_memory_spaces().size() == 4);
 }
 
+TEST_CASE("Sirius configuration rejects low-level GPU ids outside discovered topology",
+          "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const path =
+    fs::path(loc.file_name()).parent_path() / "data" / "invalid_space_gpu_unknown_device_id.yaml";
+  sirius::sirius_config config;
+  REQUIRE_THROWS_WITH(config.load_from_file(path),
+                      Catch::Contains("sirius.space.gpu") && Catch::Contains("device_id") &&
+                        Catch::Contains("not present in the discovered GPU topology"));
+}
+
 TEST_CASE("Sirius configuration rejects competing memory configuration paths", "[sirius][config]")
 {
   std::source_location loc = std::source_location::current();
