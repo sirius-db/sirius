@@ -304,6 +304,9 @@ single-GPU configurations only (logs a warning and disables itself otherwise).
 | `num_threads` | int (**> 0**) | 2 | Prefetch worker threads; each drives one in-flight batch conversion on its own stream. |
 | `min_free_fraction` | double [0,1] | 0.4 | Keep at least this fraction of the GPU space free after each prefetch; conversions (and their reservations) are only attempted above this floor. |
 
+`num_threads` and `min_free_fraction` are active only when `enable: true`; configuration loading
+rejects non-null overrides while the prefetcher is disabled.
+
 Worker polling and connector-drain timing are internal scheduling policy. The
 former `poll_interval_ms` and `drain_quiet_ms` keys have been removed;
 configurations that still contain either key must delete it.

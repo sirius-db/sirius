@@ -320,6 +320,67 @@ TEST_CASE("Sirius configuration keeps memory prefetcher timing internal", "[siri
   CHECK(prefetcher.drain_quiet_ms == 100);
 }
 
+TEST_CASE("Sirius configuration rejects inactive memory prefetcher settings", "[sirius][config]")
+{
+  struct inactive_setting {
+    const char* name;
+    const char* value;
+  };
+  const inactive_setting cases[] = {
+    {"num_threads", "3"},
+    {"min_free_fraction", "0.25"},
+  };
+
+  for (auto const enable : {"", "        enable: false\n"}) {
+    for (auto const& setting : cases) {
+      DYNAMIC_SECTION((enable[0] == '\0' ? "implicit" : "explicit") << "." << setting.name)
+      {
+        auto const path =
+          fs::temp_directory_path() /
+          (std::string("sirius_inactive_memory_prefetcher_") + setting.name + ".yaml");
+        finally cleanup{[path]() {
+          std::error_code ec;
+          fs::remove(path, ec);
+        }};
+        {
+          std::ofstream out(path);
+          REQUIRE(out);
+          out << "sirius:\n  executor:\n    scan_manager:\n      memory_prefetcher:\n"
+              << enable << "        " << setting.name << ": " << setting.value << "\n";
+        }
+
+        sirius::sirius_config config;
+        REQUIRE_THROWS_WITH(config.load_from_file(path),
+                            Catch::Contains("sirius.executor.scan_manager.memory_prefetcher") &&
+                              Catch::Contains("require enable: true"));
+      }
+    }
+  }
+}
+
+TEST_CASE("Sirius configuration accepts memory prefetcher settings when enabled",
+          "[sirius][config]")
+{
+  auto const path = fs::temp_directory_path() / "sirius_active_memory_prefetcher.yaml";
+  finally cleanup{[path]() {
+    std::error_code ec;
+    fs::remove(path, ec);
+  }};
+  {
+    std::ofstream out(path);
+    REQUIRE(out);
+    out << "sirius:\n  executor:\n    scan_manager:\n      memory_prefetcher:\n"
+           "        enable: true\n        num_threads: 3\n        min_free_fraction: 0.25\n";
+  }
+
+  sirius::sirius_config config;
+  REQUIRE_NOTHROW(config.load_from_file(path));
+  auto const& prefetcher = config.get_scan_manager_config().memory_prefetcher;
+  REQUIRE(prefetcher.enable);
+  REQUIRE(prefetcher.num_threads == 3);
+  REQUIRE(prefetcher.min_free_fraction == Approx(0.25));
+}
+
 TEST_CASE("Sirius configuration rejects negative host capacity bytes", "[sirius][config]")
 {
   std::source_location loc = std::source_location::current();

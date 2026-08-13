@@ -231,6 +231,12 @@ static void from_yaml(const YAML::Node& node, scan_manager::memory_prefetcher_co
       "policy is internal; remove these keys");
   }
   r.optional("enable", opt.enable);
+  bool const has_dependent_setting = r.has_value("num_threads") || r.has_value("min_free_fraction");
+  if (!opt.enable && has_dependent_setting) {
+    throw std::runtime_error(
+      "sirius.executor.scan_manager.memory_prefetcher: num_threads and min_free_fraction require "
+      "enable: true");
+  }
   r.optional("num_threads", opt.num_threads, yaml::greater_than<std::size_t>{0});
   r.optional("min_free_fraction", opt.min_free_fraction, yaml::fraction<double>{});
   r.reject_unknown();
