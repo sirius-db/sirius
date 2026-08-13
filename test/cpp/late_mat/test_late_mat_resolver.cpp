@@ -27,6 +27,8 @@
 // row id. A resolver that mis-orders the chunks, or reports a batch's rows
 // wrongly, produces a column that names the rows it actually read.
 
+#include "operator/operator_test_utils.hpp"
+
 #include <cudf/column/column_factories.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
@@ -36,6 +38,7 @@
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
+#include <compression/compressed_representation.hpp>
 #include <late_mat/materialize.hpp>
 #include <scan_manager/late_mat_resolver.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
@@ -188,6 +191,35 @@ TEST_CASE("a host-tier entry is not served", "[late_mat][resolver]")
   // Not an error — a reason not to defer. A host chunk would have to be staged
   // before any of this applies.
   REQUIRE_FALSE(resolve_pinned_layout(pin.origin()).has_value());
+  REQUIRE_FALSE(resolve_pinned_column(pin.origin()).has_value());
+}
+
+TEST_CASE("a compressed chunk with no readable table is not deferred", "[late_mat][resolver]")
+{
+  auto const stream = rmm::cuda_stream_view{};
+  auto mgr          = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space   = mgr->get_memory_space(cucascade::memory::Tier::GPU, 0);
+
+  // A compressed chunk may carry no blob: serving paths that need only its row
+  // count or a column projection never read one. Materializing does read it,
+  // and this is the first code that does, so nothing before it would have
+  // noticed the assumption.
+  fake_entry pin({16}, "l_shipdate", stream);
+  pin.entry.data_batches_by_column.clear();
+  sirius::device_pin_chunk chunk;
+  chunk.memory_space = gpu_space;
+  chunk.compressed   = std::make_shared<sirius::compressed_device_representation>(
+    *gpu_space,
+    /*blob=*/nullptr,
+    std::vector<std::string>{"l_shipdate"},
+    /*compressed_bytes=*/64,
+    /*uncompressed_bytes=*/256,
+    /*num_rows=*/16);
+  pin.entry.device_chunks.push_back(std::move(chunk));
+
+  // The layout half still resolves — a row count needs no blob — which is why
+  // the column half has to make the check itself.
+  REQUIRE(resolve_pinned_layout(pin.origin()).has_value());
   REQUIRE_FALSE(resolve_pinned_column(pin.origin()).has_value());
 }
 

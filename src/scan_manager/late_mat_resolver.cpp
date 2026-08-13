@@ -91,6 +91,7 @@ std::optional<late_mat::pinned_column_view> resolve_pinned_column(
       late_mat::batch_source source;
       source.num_rows = chunk_rows(chunk);
       if (chunk.compressed) {
+        if (!chunk.compressed->has_table()) { return std::nullopt; }
         source.compressed   = chunk.compressed.get();
         source.column_index = origin.column_pos;
         // The compressed table carries its own dtype per column, and it is the

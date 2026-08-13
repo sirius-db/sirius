@@ -279,6 +279,10 @@ class compressed_device_representation : public cucascade::idata_representation 
   [[nodiscard]] std::unique_ptr<compressed_device_representation> select_columns(
     std::span<const std::size_t> indices) const;
 
+  /// Whether @ref table is readable. A chunk may legitimately carry no blob —
+  /// serving paths that need only the row count or a column projection never
+  /// touch one — so anything that DOES read the table must ask first.
+  [[nodiscard]] bool has_table() const noexcept;
   /// The cached compressed_table (defined in device_compressed_blob.hpp).
   [[nodiscard]] const simpatico::compressed_table& table() const noexcept;
 
