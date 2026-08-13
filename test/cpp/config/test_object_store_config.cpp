@@ -285,6 +285,63 @@ TEST_CASE("sirius_config parses rest perf instrumentation flag",
   std::filesystem::remove(path, ec);
 }
 
+TEST_CASE("sirius_config requires a positive REST chunk size", "[scan_manager][config][s3][rest]")
+{
+  using rest_config = sirius::io::rest::config;
+  auto const path   = std::filesystem::temp_directory_path() / "sirius_rest_chunk_size.yaml";
+
+  for (auto const* yaml : {"      rest: {}\n", "      rest:\n        chunk_size: null\n"}) {
+    CAPTURE(yaml);
+    write_yaml(path,
+               "sirius:\n"
+               "  executor:\n"
+               "    scan_manager:\n" +
+                 std::string(yaml));
+
+    sirius::sirius_config config;
+    REQUIRE_NOTHROW(config.load_from_file(path));
+    CHECK(config.get_scan_manager_config().rest.chunk_size == rest_config{}.chunk_size);
+  }
+
+  struct valid_case {
+    const char* yaml;
+    std::size_t expected;
+  };
+  for (auto const& value : {valid_case{"1", 1}, valid_case{"1MiB", 1UL << 20}}) {
+    CAPTURE(value.yaml);
+    write_yaml(path,
+               "sirius:\n"
+               "  executor:\n"
+               "    scan_manager:\n"
+               "      rest:\n"
+               "        chunk_size: " +
+                 std::string(value.yaml) + "\n");
+
+    sirius::sirius_config config;
+    REQUIRE_NOTHROW(config.load_from_file(path));
+    CHECK(config.get_scan_manager_config().rest.chunk_size == value.expected);
+  }
+
+  for (auto const* invalid : {"0", "0MiB", "-1", "\"-1MiB\""}) {
+    CAPTURE(invalid);
+    write_yaml(path,
+               "sirius:\n"
+               "  executor:\n"
+               "    scan_manager:\n"
+               "      rest:\n"
+               "        chunk_size: " +
+                 std::string(invalid) + "\n");
+
+    sirius::sirius_config config;
+    auto const before = config.get_scan_manager_config().rest.chunk_size;
+    REQUIRE_THROWS_WITH(config.load_from_file(path), Catch::Contains("rest.chunk_size"));
+    CHECK(config.get_scan_manager_config().rest.chunk_size == before);
+  }
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
 TEST_CASE("sirius_config rejects unknown rest config keys", "[scan_manager][config][rest]")
 {
   auto const path = std::filesystem::temp_directory_path() / "sirius_rest_unknown_key.yaml";

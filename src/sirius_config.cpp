@@ -169,6 +169,17 @@ static void from_yaml(const YAML::Node& node, sirius::io::object_store_config& o
   r.reject_unknown();
 }
 
+static void read_positive_bytes(yaml::reader& reader, const char* key, std::size_t& out)
+{
+  auto const has_value = reader.has_value(key);
+  auto value           = out;
+  reader.optional(key, yaml::bytes(value));
+  if (has_value && value == 0) {
+    throw std::runtime_error("'rest." + std::string(key) + "': value must be greater than zero");
+  }
+  out = value;
+}
+
 static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
 {
   yaml::reader r(node, "rest");
@@ -181,7 +192,7 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
   }
   r.optional("request_timeout_s", opt.request_timeout_s);
   r.optional("max_connections", opt.max_connections);
-  r.optional("chunk_size", yaml::bytes(opt.chunk_size));
+  read_positive_bytes(r, "chunk_size", opt.chunk_size);
   r.optional("max_n_chunks", opt.max_n_chunks);
   r.optional("max_read_split", opt.max_read_split);
   r.optional("upkeep_interval_ms", opt.upkeep_interval);

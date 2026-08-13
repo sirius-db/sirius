@@ -323,7 +323,7 @@ and transport use one trust policy; there are no separate REST YAML controls.
 |-----|------|---------|-------------|
 | `request_timeout_s` | int (seconds) | 30 | Whole-request timeout and presigned-URL TTL (0 = no limit). |
 | `max_connections` | int | 16 | Max concurrent in-flight connections per reactor. |
-| `chunk_size` | bytes | 8Mi | Target bytes per ranged GET (scatter/device-staging paths). |
+| `chunk_size` | bytes (**> 0**) | 8Mi | Target bytes per ranged GET (scatter/device-staging paths). Zero is rejected because it degenerates split reads into one-byte ranged GETs. |
 | `max_n_chunks` | int | 16 | Max file-adjacent segments fused into one scatter GET. |
 | `max_read_split` | int | 16 | Max parallel ranged GETs for one contiguous host read (reads < 2 MiB stay a single GET). |
 | `upkeep_interval_ms` | int (ms) | 15000 | Idle-connection keepalive interval (`curl_easy_upkeep`; 0 disables). |

@@ -39,7 +39,8 @@ struct config {
   /// paths: file-adjacent segments are fused into one scatter GET up to this
   /// size, and an oversized segment is split into ceil(size / chunk_size)
   /// pieces.  A single contiguous host read instead splits by
-  /// @c max_read_split (see prep_host_rx_request).
+  /// @c max_read_split (see prep_host_rx_request). Must be greater than zero;
+  /// a zero YAML override is rejected during configuration loading.
   std::size_t chunk_size{8UL << 20};
 
   /// Cap on destination buffers fused into a single scatter GET (i.e. how
