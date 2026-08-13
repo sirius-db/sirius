@@ -1988,7 +1988,7 @@ static void SetMarkJoinBuildSwitchRatio(ClientContext& context, SetScope scope, 
   if (!params) { return; }
   auto slot          = lock_operator_params_slot(context);
   const double ratio = parameter.GetValue<double>();
-  if (ratio < 0.0) {
+  if (!(ratio >= 0.0)) {
     throw InvalidInputException("mark_join_build_switch_ratio must be >= 0.0, got %f", ratio);
   }
   params->mark_join_build_switch_ratio = ratio;

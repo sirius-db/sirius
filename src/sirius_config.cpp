@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <exception>
+#include <limits>
 #include <stdexcept>
 #include <string_view>
 #include <variant>
@@ -265,7 +266,9 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("sort_sample_bytes", yaml::bytes(opt.sort_sample_bytes));
   r.optional("max_build_hash_table_bytes", yaml::bytes(opt.max_build_hash_table_bytes));
   r.optional("max_broadcast_join_size", yaml::bytes(opt.max_broadcast_join_size));
-  r.optional("mark_join_build_switch_ratio", opt.mark_join_build_switch_ratio);
+  r.optional("mark_join_build_switch_ratio",
+             opt.mark_join_build_switch_ratio,
+             yaml::between<double>{0.0, std::numeric_limits<double>::infinity()});
   r.optional("enable_runtime_distinct_build_probe", opt.enable_runtime_distinct_build_probe);
   r.optional("enable_dynamic_filter_pushdown", opt.enable_dynamic_filter_pushdown);
   r.optional("enable_dynamic_zone_map_filter", opt.enable_dynamic_zone_map_filter);
