@@ -291,12 +291,12 @@ TEST_CASE("sirius_config validates positive REST counts", "[scan_manager][config
   using rest_config = sirius::io::rest::config;
   struct count_field {
     const char* name;
-    std::size_t rest_config::*member;
+    std::size_t rest_config::* member;
   };
-  auto const fields = std::array{count_field{"max_connections", &rest_config::max_connections},
-                                 count_field{"max_read_split", &rest_config::max_read_split},
-                                 count_field{"max_retry_attempts",
-                                             &rest_config::max_retry_attempts}};
+  auto const fields =
+    std::array{count_field{"max_connections", &rest_config::max_connections},
+               count_field{"max_read_split", &rest_config::max_read_split},
+               count_field{"max_retry_attempts", &rest_config::max_retry_attempts}};
   auto const path = std::filesystem::temp_directory_path() / "sirius_rest_positive_count.yaml";
 
   for (auto const& field : fields) {
