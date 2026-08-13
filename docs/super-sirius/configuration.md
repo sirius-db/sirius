@@ -219,7 +219,7 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `disk_id` | int | 0 | Identifier for the disk space. |
-| `mount_path` | string | "" | Spill directory. |
+| `mount_path` | string | required | Non-empty spill directory. |
 | `memory_capacity` | bytes | space default | Maximum disk space for spill files. |
 
 ```yaml

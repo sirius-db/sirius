@@ -128,11 +128,14 @@ static void from_yaml(const YAML::Node& node, cucascade::memory::host_memory_spa
 
 static void from_yaml(const YAML::Node& node, cucascade::memory::disk_memory_space_config& opt)
 {
-  yaml::reader r(node, "disk_memory_space");
+  yaml::reader r(node, "sirius.space.disk");
   r.optional("disk_id", opt.disk_id);
-  r.optional("mount_path", opt.mount_paths);
+  r.required("mount_path", opt.mount_paths);
   r.optional("memory_capacity", yaml::bytes(opt.memory_capacity));
   r.reject_unknown();
+  if (opt.mount_paths.empty()) {
+    throw std::runtime_error("sirius.space.disk: mount_path must not be empty");
+  }
 }
 
 static void from_yaml(const YAML::Node& node, exec::thread_pool_config& opt)
