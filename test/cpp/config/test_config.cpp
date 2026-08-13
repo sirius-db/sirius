@@ -568,6 +568,16 @@ TEST_CASE("yaml reader has_value distinguishes null from scalar values", "[confi
   }
 }
 
+TEST_CASE("yaml reader has distinguishes missing, null, and scalar keys", "[config_opt][has]")
+{
+  auto node = YAML::Load("null_key: null\nscalar_key: 0");
+  yaml::reader r(node);
+
+  CHECK_FALSE(r.has("missing_key"));
+  CHECK(r.has("null_key"));
+  CHECK(r.has("scalar_key"));
+}
+
 // ================ error context ================= //
 
 TEST_CASE("yaml reader error messages include context", "[config_opt][errors]")

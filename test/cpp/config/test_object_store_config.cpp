@@ -317,10 +317,10 @@ TEST_CASE("sirius_config rejects shadowed REST TLS YAML keys",
                  key + ": " + value + "\n");
 
     sirius::sirius_config cfg;
-    REQUIRE_THROWS_WITH(cfg.load_from_file(path),
-                        "'sirius.executor.scan_manager.rest." + key +
-                          "': removed; configure 'sirius.executor.scan_manager.object_store." +
-                          key + "' instead");
+    REQUIRE_THROWS_WITH(
+      cfg.load_from_file(path),
+      Catch::Contains("'sirius.executor.scan_manager.rest." + key + "': removed; configure '") &&
+        Catch::Contains("sirius.executor.scan_manager.object_store." + key + "' instead"));
 
     std::error_code ec;
     std::filesystem::remove(path, ec);
