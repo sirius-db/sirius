@@ -33,6 +33,10 @@
 #include "scan_manager/pinned_chunk_stats.hpp"
 #include "scan_manager/split_provider.hpp"
 
+namespace sirius::op {
+class sirius_dynamic_filter_set;  // membership pushdown channel (op/sirius_dynamic_filter.hpp)
+}
+
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
 
@@ -337,16 +341,27 @@ struct cached_scan_plan {
 /// compressed chunk answer an equality/IN filter *during* decompression — the
 /// column arrives as a BOOL8 mask instead of being reconstructed. See
 /// @c sirius::decode_equality_pushdown. Empty (the default) disables it.
+/// @p range_pushdown is the fused scan-filter analog (whole-filter numeric
+/// ranges, @c sirius::decode_range_pushdown): GPU-tier compressed chunks may
+/// evaluate it during decode and hand back already-filtered batches. Empty
+/// (the default) disables it.
+/// @p dynamic_filters is the operator's dynamic-filter channel (join builds
+/// publish into it mid-scan); the provider snapshots it PER BATCH and attaches
+/// membership probes to compressed chunks (@c sirius::decode_membership_pushdown),
+/// so later batches legitimately see more filters. Null (the default) disables it.
 std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   pinned_entry const& entry,
   std::span<std::size_t const> selected_columns,
   cached_scan_plan plan,
   const telemetry::batch_telemetry_info& telemetry_info,
-  mvcc_chunk_mask_set mvcc_masks                     = {},
-  std::vector<insert_delta_split> delta_splits       = {},
-  std::vector<cudf::data_type> normalization_targets = {},
-  bool has_physical_overrides                        = false,
-  sirius::decode_equality_pushdown equality_pushdown = {});
+  mvcc_chunk_mask_set mvcc_masks                                         = {},
+  std::vector<insert_delta_split> delta_splits                           = {},
+  std::vector<cudf::data_type> normalization_targets                     = {},
+  bool has_physical_overrides                                            = false,
+  sirius::decode_equality_pushdown equality_pushdown                     = {},
+  sirius::decode_range_pushdown range_pushdown                           = {},
+  bool range_covers_whole_filter                                         = false,
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters = nullptr);
 
 /**
  * @brief Build the survivor plan for serving @p entry to a scan into @p requiested_column_ids with

@@ -563,6 +563,27 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
         _decode_predicate_candidates.emplace(primary_idx, it->second);
       }
     }
+
+    // Decode-time predicate pushdown: a pure-filter string column whose whole
+    // filter is an equality / IN can be delivered as a BOOL8 mask instead of
+    // values, letting a dictionary-compressed pin answer it off its key set
+    // rather than gathering the decoded chars. Restricted to pure-filter columns
+    // because the mask *replaces* the column — a projected one could not survive
+    // it. This only records what the scan is *willing* to accept; whether any
+    // given batch actually carries masks is decided per batch in
+    // post_filter_and_project.
+    if (_duckdb_filter_expression) {
+      auto candidates = sirius::op::extract_string_equality_pushdown(
+        *bind.table_filters, bind.column_ids, bind.returned_types);
+      for (auto const batch_pos : _plan->pure_filter_batch_positions()) {
+        auto const primary_idx = _plan->data_columns.at(batch_pos).primary_idx;
+        if (_plan->partition_primary_indices.count(primary_idx)) { continue; }
+        auto const it = candidates.find(primary_idx);
+        if (it == candidates.end()) { continue; }
+        _pushdown_primary_by_batch_position.emplace_back(batch_pos, primary_idx);
+        _decode_predicate_candidates.emplace(primary_idx, it->second);
+      }
+    }
   }
 
   // Shared reader options — column projection only. set_filter is never applied

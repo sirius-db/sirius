@@ -32,8 +32,10 @@
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/parquet_metadata.hpp"
+#include "op/scan/scan_utils.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
+#include "op/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "planner/query.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
@@ -68,6 +70,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <iterator>
 #include <memory>
 #include <optional>
@@ -78,6 +81,29 @@
 namespace sirius::scan_manager {
 
 namespace {
+
+/// Env gate for the fused scan-filter pipeline (decode-time range masks +
+/// compacted payload decode). Read once; the orchestrator re-reads it too, so
+/// this only saves the extraction work when the feature is off.
+bool fused_scan_filter_enabled()
+{
+  static const bool enabled = []() {
+    char const* v = std::getenv("SIRIUS_EXP_FUSED_SCAN_FILTER");
+    return v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
+  }();
+  return enabled;
+}
+
+/// Deterministic tracing for the fused scan-filter pipeline (same env contract
+/// as the converter/orchestrator diag: set and != "0" = INFO tracing on).
+bool fused_scan_diag_enabled()
+{
+  static const bool enabled = []() {
+    char const* v = std::getenv("SIRIUS_EXP_FUSED_SCAN_DIAG");
+    return v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
+  }();
+  return enabled;
+}
 
 using sirius::pinned_column_storage_matrix;
 using sirius::pinned_column_storage_meta;
@@ -103,7 +129,10 @@ struct cached_databatch_provider : public databatch_provider {
                             std::vector<insert_delta_split> delta_splits,
                             std::vector<cudf::data_type> normalization_targets,
                             bool has_physical_overrides,
-                            sirius::decode_equality_pushdown equality_pushdown)
+                            sirius::decode_equality_pushdown equality_pushdown,
+                            sirius::decode_range_pushdown range_pushdown,
+                            bool range_covers_whole_filter,
+                            std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters)
     : _plan(std::move(plan)),
       _entry(entry),
       _telemetry_info(telemetry_info),
@@ -111,7 +140,10 @@ struct cached_databatch_provider : public databatch_provider {
       _delta_splits(std::move(delta_splits)),
       _normalization_targets(std::move(normalization_targets)),
       _has_physical_overrides(has_physical_overrides),
-      _equality_pushdown(std::move(equality_pushdown))
+      _equality_pushdown(std::move(equality_pushdown)),
+      _range_pushdown(std::move(range_pushdown)),
+      _range_covers_whole_filter(range_covers_whole_filter),
+      _dynamic_filters(std::move(dynamic_filters))
   {
     auto const& entry_column_names = _entry.cache_info.column_names();
     std::ranges::for_each(selected_columns, [this, &entry_column_names](size_t idx) {
@@ -198,6 +230,65 @@ struct cached_databatch_provider : public databatch_provider {
             any               = true;
           }
           if (any) { projected->set_equality_pushdown(std::move(chunk_pushdown)); }
+        }
+        // Fused scan-filter ranges: attach the whole-filter range pushdown so the
+        // converter can decide, per chunk, whether decode-side compaction applies
+        // (build_fused_scan_directives re-checks every plan there). Skipped when
+        // this operator carries mvcc keep-masks — decode-side row dropping cannot
+        // compose with deleted-row masks (iteration 1; TPC-H pins have no deltas).
+        if (!_range_pushdown.empty() && _mvcc_masks.empty()) {
+          projected->set_range_pushdown(_range_pushdown, _range_covers_whole_filter);
+        }
+        // Phase A membership pushdown: a PER-BATCH snapshot of the operator's
+        // dynamic-filter channel — join builds publish mid-scan, so later
+        // batches legitimately carry more probes; `generation` (the set's
+        // lock-free filter_count, read BEFORE the snapshot so it never claims
+        // probes the loop did not capture) tells the converter which snapshot
+        // this batch used.
+        //
+        // THE MAPPING INVARIANT: provider slot order == the ingestible's
+        // materialized_column_order == output columns FIRST, IN OUTPUT ORDER,
+        // then pure-filter columns (gather_by_primary_index at construction),
+        // while the filter set keys by the consumer's OUTPUT-COLUMN position
+        // (parquet installs set_consumer_column_remap with
+        // scan_plan::output_position_by_column_id). Slot i therefore maps to
+        // output position i for every output column, so slot i's probes are
+        // exactly filters_for_column(i); trailing pure-filter slots query
+        // keys the set can never hold (push_filter rejects non-output
+        // columns) and come back empty by construction — no output-arity
+        // knowledge is needed here. Same mvcc guard as the ranges:
+        // decode-side row dropping cannot compose with deleted-row masks.
+        // NOTE (iteration-7 root cause): this drain runs on the metadata
+        // thread at query PREPARE, before any join build has published, so
+        // this snapshot is almost always EMPTY. It is kept as a free early
+        // base; the authoritative snapshot is taken at DECODE time by
+        // scan_operator_input::prepare_for_processing (same shared builder,
+        // same mapping invariant — see snapshot_membership_pushdown), which
+        // replaces this one on the projected rep.
+        if (fused_scan_filter_enabled() && _dynamic_filters && _mvcc_masks.empty()) {
+          bool const has = _dynamic_filters->has_filters();
+          if (has) {
+            auto snap = sirius::op::scan::snapshot_membership_pushdown(*_dynamic_filters,
+                                                                       _column_indices.size());
+            if (fused_scan_diag_enabled()) {
+              SIRIUS_LOG_INFO(
+                "[fused-diag] membership attach (drain) channel={}: has_filters=true slots={} "
+                "attached_probes={} gen={} skipped_cast={}",
+                static_cast<void const*>(_dynamic_filters.get()),
+                _column_indices.size(),
+                snap.attached_probes,
+                snap.generation,
+                snap.skipped_non_mask);
+            }
+            if (snap.attached_probes > 0) {
+              projected->set_membership_pushdown(std::move(snap.pushdown), snap.generation);
+            }
+          } else if (fused_scan_diag_enabled()) {
+            SIRIUS_LOG_INFO(
+              "[fused-diag] membership attach (drain) channel={}: has_filters=false (expected — "
+              "drain precedes join publication; decode-time snapshot will retry)",
+              static_cast<void const*>(_dynamic_filters.get()));
+          }
         }
         return cucascade::data_batch::make(get_next_batch_id(), std::move(projected));
       }
@@ -354,6 +445,16 @@ struct cached_databatch_provider : public databatch_provider {
   /// chunk header to know whether the plan can exploit it, and that tier is not
   /// where the decode gather costs anything).
   sirius::decode_equality_pushdown _equality_pushdown;
+  /// The scan's whole-filter range pushdown (fused scan-filter pipeline);
+  /// non-empty only when every restricting conjunct converted to a range.
+  sirius::decode_range_pushdown _range_pushdown;
+  /// True iff the ranges cover the scan's WHOLE restricting filter (batches may
+  /// be tagged ROW_FILTERED); false = partial mask, post-filter must re-run.
+  bool _range_covers_whole_filter = false;
+  /// The operator's dynamic-filter channel (may be null). NOT a snapshot: the
+  /// per-batch attach in get_device_databatch snapshots it at serve time so
+  /// batches pick up join filters as they are published mid-scan.
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> _dynamic_filters;
   const pinned_entry& _entry;
   telemetry::batch_telemetry_info _telemetry_info;
   /// This provider's own copy of the entry's per-chunk keep-masks (empty for
@@ -395,6 +496,35 @@ sirius::decode_equality_pushdown build_equality_pushdown(
     any         = true;
   }
   return any ? pushdown : sirius::decode_equality_pushdown{};
+}
+
+/// Map the scan's extracted numeric ranges (keyed by column primary index) onto
+/// @p selected_columns — the range analog of build_equality_pushdown above.
+/// Ranges that map to no pinned column are dropped: partition filters are
+/// enforced at file-list level, so nothing is lost, and the extraction gate only
+/// vouches for filter *shapes* — build_fused_scan_directives makes the final
+/// per-chunk call.
+sirius::decode_range_pushdown build_range_pushdown(
+  pinned_entry const& entry,
+  std::span<std::size_t const> selected_columns,
+  std::unordered_map<std::size_t, sirius::codegen::range_predicate> const& ranges)
+{
+  if (ranges.empty()) { return {}; }
+  sirius::decode_range_pushdown pushdown(selected_columns.size());
+  bool any = false;
+  for (std::size_t i = 0; i < selected_columns.size(); ++i) {
+    auto const entry_pos = selected_columns[i];
+    if (entry_pos >= entry.cache_info.column_ids.size()) { continue; }
+    auto const primary_idx =
+      static_cast<std::size_t>(entry.cache_info.column_ids[entry_pos].GetPrimaryIndex());
+    auto const it = ranges.find(primary_idx);
+    if (it == ranges.end()) { continue; }
+    pushdown[i].active = true;
+    pushdown[i].lo     = it->second.lo;
+    pushdown[i].hi     = it->second.hi;
+    any                = true;
+  }
+  return any ? pushdown : sirius::decode_range_pushdown{};
 }
 
 /// Filter view extracted from the scan's ingestible info: the pushed-down TableFilterSet plus the
@@ -740,6 +870,61 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
       build_equality_pushdown(*assignment.entry,
                               assignment.columns,
                               assignment.op->get_ingestible().decode_predicate_candidates());
+    // Fused scan-filter (env-gated): when the scan's WHOLE restricting filter
+    // converts to numeric ranges, hand them to the provider so compressed chunks
+    // can filter (and compact) during decode instead of after it.
+    sirius::decode_range_pushdown range_pushdown;
+    bool range_covers_whole_filter = false;
+    // Phase A membership: the provider captures the operator's dynamic-filter
+    // CHANNEL (not a snapshot) so each compressed batch can pick up
+    // join-published filters at serve time.
+    std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters;
+    if (fused_scan_filter_enabled()) {
+      auto const* pq = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(
+        &assignment.op->get_ingestible().table_info());
+      if (pq != nullptr) { dynamic_filters = pq->sirius_dynamic_filters; }
+      if (fused_scan_diag_enabled()) {
+        // Channel-identity forensics: this pointer must match the one the
+        // hash join publishes into (both resolve through the generator's
+        // dynamic_filter_channels map, keyed by duckdb's DynamicTableFilterSet
+        // pointer) and the one the decode-time snapshot logs.
+        SIRIUS_LOG_INFO("[fused-diag] membership capture entry '{}': channel={} has_filters_now={}",
+                        assignment.entry_name,
+                        static_cast<void const*>(dynamic_filters.get()),
+                        dynamic_filters ? dynamic_filters->has_filters() : false);
+      }
+      if (fused_scan_diag_enabled()) {
+        SIRIUS_LOG_INFO("[fused-diag] scan-mgr entry '{}': cast={} filters={} n={}",
+                        assignment.entry_name,
+                        pq != nullptr,
+                        pq && pq->table_filters != nullptr,
+                        (pq && pq->table_filters) ? pq->table_filters->filters.size() : 0);
+      }
+      if (pq && pq->table_filters && !pq->table_filters->filters.empty()) {
+        auto extraction = sirius::op::extract_numeric_range_pushdown(
+          *pq->table_filters, pq->column_ids, pq->returned_types);
+        if (fused_scan_diag_enabled()) {
+          SIRIUS_LOG_INFO("[fused-diag] scan-mgr extraction '{}': gate={} ranges={}",
+                          assignment.entry_name,
+                          extraction.all_conjuncts_convertible,
+                          extraction.ranges.size());
+        }
+        // Iteration 4: partial coverage is sound — mask conjuncts are conjunctive
+        // over-approximations, and a batch whose mask does not cover the whole
+        // filter is left untagged so the post-filter re-evaluates everything.
+        if (!extraction.ranges.empty()) {
+          range_pushdown =
+            build_range_pushdown(*assignment.entry, assignment.columns, extraction.ranges);
+          range_covers_whole_filter = extraction.all_conjuncts_convertible;
+          SIRIUS_LOG_DEBUG(
+            "[sirius_scan_manager] fused scan-filter: {} range(s) extracted for entry '{}', "
+            "remap -> {} slot(s)",
+            extraction.ranges.size(),
+            assignment.entry_name,
+            range_pushdown.size());
+        }
+      }
+    }
     // The provider charges a served column only for the cast scan normalization will make, so
     // it needs the scan's carrier targets. They are passed in output order, which is also the
     // order the cached chunks are served in: assignment.columns follows the ingestible's
@@ -757,7 +942,10 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
                                                    std::move(delta_splits),
                                                    assignment.op->normalization_targets(),
                                                    assignment.op->has_physical_overrides(),
-                                                   std::move(equality_pushdown));
+                                                   std::move(equality_pushdown),
+                                                   std::move(range_pushdown),
+                                                   range_covers_whole_filter,
+                                                   std::move(dynamic_filters));
     _metadata_processor->use_cached_entries_for_pipeline(assignment.op, std::move(provider));
   }
   _pending_mvcc_mask_jobs.clear();
@@ -1667,7 +1855,10 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   std::vector<insert_delta_split> delta_splits,
   std::vector<cudf::data_type> normalization_targets,
   bool has_physical_overrides,
-  sirius::decode_equality_pushdown equality_pushdown)
+  sirius::decode_equality_pushdown equality_pushdown,
+  sirius::decode_range_pushdown range_pushdown,
+  bool range_covers_whole_filter,
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters)
 {
   return std::make_unique<cached_databatch_provider>(entry,
                                                      selected_columns,
@@ -1677,7 +1868,10 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
                                                      std::move(delta_splits),
                                                      std::move(normalization_targets),
                                                      has_physical_overrides,
-                                                     std::move(equality_pushdown));
+                                                     std::move(equality_pushdown),
+                                                     std::move(range_pushdown),
+                                                     range_covers_whole_filter,
+                                                     std::move(dynamic_filters));
 }
 
 cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
