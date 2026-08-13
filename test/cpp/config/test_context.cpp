@@ -352,8 +352,7 @@ TEST_CASE("Sirius YAML rejects invalid dynamic-filter thresholds", "[sirius][con
 
     sirius::sirius_config config;
     REQUIRE_THROWS_WITH(config.load_from_file(path),
-                        Catch::Contains(invalid.setting) &&
-                          Catch::Contains("value out of range"));
+                        Catch::Contains(invalid.setting) && Catch::Contains("value out of range"));
   }
 }
 
