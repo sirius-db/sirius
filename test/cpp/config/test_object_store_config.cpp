@@ -288,7 +288,7 @@ TEST_CASE("sirius_config parses rest perf instrumentation flag",
 TEST_CASE("sirius_config preserves the zero footer-probe opt-out",
           "[scan_manager][config][s3][rest][footerbind]")
 {
-  auto const path = std::filesystem::temp_directory_path() / "sirius_rest_footer_probe.yaml";
+  auto const path  = std::filesystem::temp_directory_path() / "sirius_rest_footer_probe.yaml";
   auto write_value = [&](std::string const& value) {
     write_yaml(path,
                "sirius:\n"
