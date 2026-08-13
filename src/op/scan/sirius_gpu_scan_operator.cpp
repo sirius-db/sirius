@@ -249,6 +249,16 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
   auto batch =
     sirius::make_data_batch(std::move(output_table), *mem_space, stream, batch_telemetry());
   std::vector<std::shared_ptr<::cucascade::data_batch>> batches{std::move(batch)};
+  // Quiesce BEFORE this function's locals are destroyed: `materialized_table`
+  // may still own the source view's owner (for a resident scan, the cached
+  // batch's read-lock accessor), and the ROW_FILTERED_AND_PROJECTED release
+  // above and the carrier-normalization casts are still enqueued on `stream`.
+  // Dropping the read lock while those kernels read the batch lets the
+  // downgrade executor evict it and free its device memory mid-read (the
+  // staged-refresh corruption).
+  // Nearly free: run_one_operator synchronizes this stream immediately after
+  // execute() returns anyway.
+  stream.synchronize();
   return std::make_unique<pipelineable_operator_data>(std::move(batches));
 }
 

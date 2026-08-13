@@ -1192,7 +1192,15 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
     auto const data_positions = output_data_positions(*_plan);
     auto filtered             = data_positions.empty() ? exec.select(input.table.view())
                                                        : exec.select(input.table.view(), data_positions);
+    // Keep the pre-filter view's owner (for a resident scan, the cached
+    // batch's read-lock accessor) alive until the filter gather completes:
+    // destroying it re-assigns `input` below, dropping the read lock while
+    // the gather still reads the batch — the downgrade executor can then
+    // evict the batch and free its device memory mid-read (the
+    // staged-refresh corruption).
+    auto previous = std::move(input.table);
     input = filtered_table{owning_table_view{std::move(filtered)}, filter_state::ROW_FILTERED};
+    stream.synchronize();
     SIRIUS_LOG_DEBUG(
       "[parquet_gpu_ingestible::post_filter_and_project] Applied duckdb filter expression "
       "post-decode.");
@@ -1206,7 +1214,15 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
     assemble_scan_output(*_plan, std::move(input.table), /*partition_values=*/{}, stream);
   SIRIUS_LOG_DEBUG(
     "[parquet_gpu_ingestible::post_filter_and_project] Assembled scan output to plan layout.");
-  return assembled.release(stream, mr_ref);
+  auto out = assembled.release(stream, mr_ref);
+  // Quiesce BEFORE `assembled` (owner of the moved-in input view — for a
+  // resident scan, the cached batch's read-lock accessor) is destroyed:
+  // release()'s view->table materialization is still enqueued on `stream`,
+  // and dropping the read lock mid-copy lets the downgrade executor free the
+  // source batch's device memory under the copy (the staged-refresh
+  // corruption).
+  stream.synchronize();
+  return out;
 }
 
 //===----------------------------------------------------------------------===//

@@ -381,7 +381,18 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
     final_table.select_columns(selected_cols);
   }
 
-  return final_table.release(stream, mr_ref);
+  auto out = final_table.release(stream, mr_ref);
+  // Quiesce BEFORE `final_table` (which may own the moved-in input view's
+  // owner — for a resident scan, the cached batch's read-lock accessor) is
+  // destroyed. release()'s view->table materialization and the filter gather
+  // above are still enqueued on `stream`; dropping the read lock while they
+  // run lets the downgrade executor evict the source batch and free its
+  // device memory mid-read, so the pool rebinds it to concurrent work — the
+  // staged-refresh corruption (garbage VARCHAR bytes / non-monotonic offsets
+  // / never-terminating kernels downstream). Same discipline as the
+  // keep-mask branches in gpu_ingestible::materialize_table.
+  stream.synchronize();
+  return out;
 }
 
 //===----------------------------------------------------------------------===//
