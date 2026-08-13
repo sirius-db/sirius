@@ -1955,37 +1955,58 @@ static void SetLogBackend(ClientContext& context, SetScope scope, Value& paramet
     throw InvalidInputException("Unknown sirius_log_backend '%s' (expected: duckdb, spdlog, noop)",
                                 backend);
   }
-  Config::LOG_BACKEND = std::move(backend);
-  install_configured_log_sink(context.db.get());
+  auto const previous_backend = Config::LOG_BACKEND;
+  Config::LOG_BACKEND         = std::move(backend);
+  try {
+    install_configured_log_sink(context.db.get());
+  } catch (...) {
+    Config::LOG_BACKEND = previous_backend;
+    throw;
+  }
   SIRIUS_LOG_DEBUG("Updated config LOG_BACKEND to {}", Config::LOG_BACKEND);
 }
 
 static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter)
 {
   throw_if_sirius_runtime_unavailable(context);
-  Config::LOG_LEVEL = StringValue::Get(parameter);
-  // Only re-targets the current sink; no rebuild (a no-op for the duckdb backend).
-  auto parsed_level = sirius::log::string_to_enum(Config::LOG_LEVEL);
-  sirius::log::get_sink()->set_level(parsed_level.value_or(sirius::log::level::info));
+  auto level_name   = StringValue::Get(parameter);
+  auto parsed_level = sirius::log::string_to_enum(level_name);
   if (!parsed_level) {
-    SIRIUS_LOG_WARN("Unknown log level '{}', defaulting to info", Config::LOG_LEVEL);
+    throw InvalidInputException(
+      "sirius_log_level must be one of: trace, debug, info, warn, error, critical, off; got '%s'",
+      level_name);
   }
+  Config::LOG_LEVEL = std::move(level_name);
+  // Only re-targets the current sink; no rebuild (a no-op for the duckdb backend).
+  sirius::log::get_sink()->set_level(*parsed_level);
   SIRIUS_LOG_DEBUG("Updated config LOG_LEVEL to {}", Config::LOG_LEVEL);
 }
 
 static void SetLogDir(ClientContext& context, SetScope scope, Value& parameter)
 {
   throw_if_sirius_runtime_unavailable(context);
-  Config::LOG_DIR = StringValue::Get(parameter);
+  auto const previous_log_dir = Config::LOG_DIR;
+  Config::LOG_DIR             = StringValue::Get(parameter);
   // log_dir only affects the spdlog backend; rebuild it when that one is active.
-  if (Config::LOG_BACKEND == "spdlog") { install_configured_log_sink(context.db.get()); }
+  try {
+    if (Config::LOG_BACKEND == "spdlog") { install_configured_log_sink(context.db.get()); }
+  } catch (...) {
+    Config::LOG_DIR = previous_log_dir;
+    throw;
+  }
   SIRIUS_LOG_DEBUG("Updated config LOG_DIR to {}", Config::LOG_DIR);
 }
 
 static void SetLogFlushSeconds(ClientContext& context, SetScope scope, Value& parameter)
 {
   throw_if_sirius_runtime_unavailable(context);
-  Config::LOG_FLUSH_SECONDS = IntegerValue::Get(parameter);
+  auto const seconds = IntegerValue::Get(parameter);
+  if (seconds < 0) {
+    throw InvalidInputException(
+      "sirius_log_flush_seconds must be non-negative; zero disables periodic flushing; got %d",
+      seconds);
+  }
+  Config::LOG_FLUSH_SECONDS = seconds;
   // The flush interval is fixed at spdlog-sink construction, so rebuild it (only
   // the spdlog backend uses it).
   if (Config::LOG_BACKEND == "spdlog") { install_configured_log_sink(context.db.get()); }
@@ -2407,7 +2428,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                             Value(Config::LOG_DIR),
                             SetLogDir);
   config.AddExtensionOption("sirius_log_flush_seconds",
-                            "Interval in seconds between automatic log flushes",
+                            "Interval in seconds between automatic log flushes (0 disables)",
                             LogicalType::INTEGER,
                             Value::INTEGER(Config::LOG_FLUSH_SECONDS),
                             SetLogFlushSeconds);
