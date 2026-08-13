@@ -16,6 +16,7 @@
 
 #include "late_mat/materialize.hpp"
 
+#include "compression/compressed_representation.hpp"
 #include "late_mat/multi_source_gather.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -28,6 +29,10 @@
 #include <rmm/device_buffer.hpp>
 
 #include <cuda_runtime.h>
+
+#include <api/simpatico_codegen.hpp>
+#include <codegen/selection/chunk_row_set.hpp>
+#include <codegen/selection/selection.hpp>
 
 #include <stdexcept>
 #include <string>
@@ -139,6 +144,90 @@ std::unique_ptr<cudf::column> materialize_raw(pinned_column_view const& column,
   return out;
 }
 
+/// Below this the mask route still beats decoding everything and gathering
+/// once; above it, it does not. Measured on the original campaign's crossover
+/// microbench.
+constexpr double kMaskRouteMaxDensity = 0.35;
+
+std::unique_ptr<cudf::column> require_non_null(std::unique_ptr<cudf::column> col)
+{
+  // None of these routes gathers a validity mask alongside the values, so a
+  // nullable column would come back with someone else's nulls.
+  if (col && col->null_count() != 0) {
+    throw std::runtime_error("late_mat::materialize: nullable origin columns are not supported");
+  }
+  return col;
+}
+
+/// One compressed batch, by the cheapest route its plan can take.
+///
+/// A route returning nothing means this plan cannot take it, and the next one
+/// is tried; the full decode ends every cascade. That is what lets the deferral
+/// decision stay ignorant of decode internals — any column may be deferred, and
+/// the worst case is the decode that would have happened anyway.
+std::unique_ptr<cudf::column> materialize_compressed(batch_source const& source,
+                                                     batch_selection const& selection,
+                                                     rmm::cuda_stream_view stream,
+                                                     rmm::device_async_resource_ref mr)
+{
+  auto const& table = source.compressed->table();
+  auto const idx    = source.column_index;
+
+  // Whole batch live: no selection to express, so this is an ordinary decode.
+  if (selection.dense) {
+    std::string err;
+    auto full = simpatico::decompress_column_full(table, idx, stream, mr, &err);
+    if (!full) { throw std::runtime_error("late_mat::materialize: full decode failed: " + err); }
+    return require_non_null(std::move(full));
+  }
+
+  auto const rows = selection.rows.view();
+
+  // (a) Sparse walk: one block per touched chunk. Tried at every density,
+  // because the mask route never won a density-based choice when it was
+  // measured — it is the capability fallback below, not the faster one.
+  {
+    std::string err;
+    auto sparse = simpatico::decompress_column_rows(table, idx, rows, stream, mr, &err);
+    if (sparse) { return require_non_null(std::move(sparse)); }
+  }
+
+  // (b) Mask route: the shipped kernels, for the shapes with no random access
+  // (dictionary, str_split, render rejections). The mask is derived from the
+  // row set rather than rebuilt from the ids.
+  if (selection.density < kMaskRouteMaxDensity) {
+    auto const num_rows = source.num_rows;
+    auto const chunks   = sirius::codegen::selection_mask::ChunksFor(num_rows);
+    rmm::device_buffer mask_words(
+      static_cast<std::size_t>(sirius::codegen::selection_mask::WordsFor(num_rows)) *
+        sizeof(std::uint32_t),
+      stream,
+      mr);
+    rmm::device_buffer chunk_offsets(
+      (static_cast<std::size_t>(chunks) + 1) * sizeof(std::uint32_t), stream, mr);
+    sirius::codegen::row_set_to_mask(rows,
+                                     static_cast<std::uint32_t*>(mask_words.data()),
+                                     static_cast<std::uint32_t*>(chunk_offsets.data()),
+                                     stream,
+                                     mr);
+    sirius::codegen::selection_mask mask{static_cast<std::uint32_t*>(mask_words.data()),
+                                         num_rows,
+                                         rows.num_survivors,
+                                         static_cast<std::uint32_t*>(chunk_offsets.data())};
+    std::string err;
+    auto compacted = simpatico::decompress_column_compacted(table, idx, mask, stream, mr, &err);
+    if (compacted) { return require_non_null(std::move(compacted)); }
+  }
+
+  // (c) The route that always works: decode everything, gather once.
+  std::string err;
+  auto full = simpatico::decompress_column_full(table, idx, stream, mr, &err);
+  if (!full) { throw std::runtime_error("late_mat::materialize: full decode failed: " + err); }
+  auto checked = require_non_null(std::move(full));
+  return gather_one(
+    checked->view(), int32_map(selection.local_indices, selection.survivors), stream, mr);
+}
+
 /// A batch's surviving rows, as a column of its own.
 ///
 /// Dense batches are copied rather than gathered: the gather map would be the
@@ -148,11 +237,7 @@ std::unique_ptr<cudf::column> materialize_batch(batch_source const& source,
                                                 rmm::cuda_stream_view stream,
                                                 rmm::device_async_resource_ref mr)
 {
-  if (source.is_compressed()) {
-    throw std::runtime_error(
-      "late_mat::materialize: a compressed origin needs a decompression entry point that takes a "
-      "selection; refusing rather than decoding the batch full width");
-  }
+  if (source.is_compressed()) { return materialize_compressed(source, selection, stream, mr); }
   if (selection.dense) {
     auto copied =
       std::make_unique<cudf::table>(cudf::table_view{{source.uncompressed}}, stream, mr);

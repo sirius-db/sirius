@@ -258,6 +258,50 @@ std::unique_ptr<cudf::table> decompress(
 ///
 /// Synchronizes @p stream before returning when the filtering applied, so the
 /// caller may free or rebind the inputs immediately.
+// ── Per-column decode, for a caller-supplied selection ──────────────────────
+//
+// Late materialization produces ONE deferred column at a time, and the route it
+// can take depends on that column's plan: a bitpack root takes the sparse walk,
+// a dictionary or str_split shape does not. So these are per column, and a
+// route that cannot serve returns nullptr with @p error_out set rather than
+// throwing — a REFUSAL, not a failure. The caller then picks the next route,
+// and the cascade ends at the full decode, which always works.
+//
+// All three re-tag the decode's storage type to the column's stored dtype. That
+// is not cosmetic: a DECIMAL64 returned as its INT64 storage silently drops its
+// scale, which is a wrong-results bug rather than a type complaint.
+
+/// One column decoded for a chunk-bucketed row set — the sparse walk, one block
+/// per touched chunk. Refuses any plan without random access (dictionary,
+/// str_split, delta roots).
+std::unique_ptr<cudf::column> decompress_column_rows(
+  const compressed_table& table,
+  std::size_t column_index,
+  sirius::codegen::chunk_row_set const& rows,
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
+  std::string* error_out            = nullptr);
+
+/// One column decoded compacted against a mask the caller already holds — the
+/// shipped mask route, reached as the capability fallback when the sparse walk
+/// refuses. The mask must have been counted (chunk_offsets present).
+std::unique_ptr<cudf::column> decompress_column_compacted(
+  const compressed_table& table,
+  std::size_t column_index,
+  sirius::codegen::selection_mask const& mask,
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
+  std::string* error_out            = nullptr);
+
+/// One column decoded full width — the end of every cascade, so it refuses only
+/// on a genuine decode failure.
+std::unique_ptr<cudf::column> decompress_column_full(
+  const compressed_table& table,
+  std::size_t column_index,
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
+  std::string* error_out            = nullptr);
+
 /// Decompress a column subset for a selection the CALLER supplies — post-join
 /// survivor rows, bucketed per 1024-row chunk
 /// (codegen/selection/chunk_row_set.hpp).

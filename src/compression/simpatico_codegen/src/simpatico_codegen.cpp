@@ -965,6 +965,105 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
   return std::make_unique<cudf::table>(std::move(cols));
 }
 
+namespace {
+
+// The plan tree of one column, or nullptr with `error_out` set.
+PlanTree const* column_plan(const compressed_table& table,
+                            std::size_t column_index,
+                            std::string* error_out,
+                            char const* what)
+{
+  if (column_index >= table.columns.size()) {
+    if (error_out) { *error_out = std::string(what) + ": column index out of range"; }
+    return nullptr;
+  }
+  auto const& col = table.columns[column_index];
+  if (!col.plan_tree) {
+    if (error_out) { *error_out = std::string(what) + ": column has no plan tree"; }
+    return nullptr;
+  }
+  return col.plan_tree.get();
+}
+
+}  // namespace
+
+std::unique_ptr<cudf::column> decompress_column_rows(const compressed_table& table,
+                                                     std::size_t column_index,
+                                                     sirius::codegen::chunk_row_set const& rows,
+                                                     rmm::cuda_stream_view stream,
+                                                     rmm::device_async_resource_ref mr,
+                                                     std::string* error_out)
+{
+  auto const* tree = column_plan(table, column_index, error_out, "decompress_column_rows");
+  if (tree == nullptr) { return nullptr; }
+  if (!rows.valid()) {
+    if (error_out) { *error_out = "decompress_column_rows: the row set is not valid"; }
+    return nullptr;
+  }
+  // Only the bitpack compacted decode reads a row set, and discovering that
+  // costs no device work.
+  if (probe_column(*tree).compact_route != sirius::codegen::decode_route::bitpack_mask) {
+    if (error_out) {
+      *error_out = "decompress_column_rows: this plan has no random-access decode for a row set";
+    }
+    return nullptr;
+  }
+
+  decode_selection sel;
+  sel.rows           = &rows;
+  sel.survivor_count = rows.num_survivors;
+  sel.route          = sirius::codegen::decode_route::bitpack_mask;
+
+  auto col = decompress_column(*tree, stream, mr, error_out, nullptr, &sel);
+  if (!col) { return nullptr; }
+  return apply_stored_dtype(std::move(col), table.columns[column_index].dtype);
+}
+
+std::unique_ptr<cudf::column> decompress_column_compacted(
+  const compressed_table& table,
+  std::size_t column_index,
+  sirius::codegen::selection_mask const& mask,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  std::string* error_out)
+{
+  auto const* tree = column_plan(table, column_index, error_out, "decompress_column_compacted");
+  if (tree == nullptr) { return nullptr; }
+  if (mask.words == nullptr || mask.chunk_offsets == nullptr || mask.survivor_count < 0) {
+    if (error_out) {
+      *error_out = "decompress_column_compacted: the mask has not been counted (no chunk_offsets)";
+    }
+    return nullptr;
+  }
+  auto const route = probe_column(*tree).compact_route;
+  if (route == sirius::codegen::decode_route::full) {
+    if (error_out) { *error_out = "decompress_column_compacted: this plan has no compacted route"; }
+    return nullptr;
+  }
+
+  decode_selection sel;
+  sel.mask           = &mask;
+  sel.survivor_count = mask.survivor_count;
+  sel.route          = route;
+
+  auto col = decompress_column(*tree, stream, mr, error_out, nullptr, &sel);
+  if (!col) { return nullptr; }
+  return apply_stored_dtype(std::move(col), table.columns[column_index].dtype);
+}
+
+std::unique_ptr<cudf::column> decompress_column_full(const compressed_table& table,
+                                                     std::size_t column_index,
+                                                     rmm::cuda_stream_view stream,
+                                                     rmm::device_async_resource_ref mr,
+                                                     std::string* error_out)
+{
+  auto const* tree = column_plan(table, column_index, error_out, "decompress_column_full");
+  if (tree == nullptr) { return nullptr; }
+  auto col = decompress_column(*tree, stream, mr, error_out);
+  if (!col) { return nullptr; }
+  return apply_stored_dtype(std::move(col), table.columns[column_index].dtype);
+}
+
 std::unique_ptr<cudf::table> decompress_selected_rows(const compressed_table& table,
                                                       std::span<const std::size_t> selected_columns,
                                                       sirius::codegen::chunk_row_set const& rows,
@@ -986,30 +1085,17 @@ std::unique_ptr<cudf::table> decompress_selected_rows(const compressed_table& ta
       throw plan_error("decompress_selected_rows: compressed_table column missing plan_tree");
     }
 
-    // The route is the plan's, not a preference: probe_column reports what this
-    // column can actually do, and only the bitpack compacted decode reads a row
-    // set. Asking for anything else here would be refused downstream anyway,
-    // and refusing at the top says which column could not be served.
-    auto const caps = probe_column(*col.plan_tree);
-    if (caps.compact_route != sirius::codegen::decode_route::bitpack_mask) {
-      auto const why = "decompress_selected_rows: column " + std::to_string(idx) +
-                       " has no random-access decode for a row set";
-      if (error_out) { *error_out = why; }
-      throw plan_error(why);
-    }
-
-    decode_selection sel;
-    sel.rows           = &rows;
-    sel.survivor_count = rows.num_survivors;
-    sel.route          = sirius::codegen::decode_route::bitpack_mask;
-
+    // All-or-nothing by design: this is the table-level convenience, so a
+    // column the sparse walk cannot serve is an error here. A caller that wants
+    // to fall back per column uses decompress_column_rows directly and picks
+    // the next route itself.
     std::string err;
-    auto c = decompress_column(*col.plan_tree, stream, mr, &err, nullptr, &sel);
+    auto c = decompress_column_rows(table, idx, rows, stream, mr, &err);
     if (!c) {
       if (error_out) { *error_out = err; }
       throw plan_error(err.empty() ? "decompress_selected_rows: decode failed" : err);
     }
-    cols.push_back(apply_stored_dtype(std::move(c), col.dtype));
+    cols.push_back(std::move(c));
   }
   return std::make_unique<cudf::table>(std::move(cols));
 }
