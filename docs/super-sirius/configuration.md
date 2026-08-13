@@ -390,8 +390,8 @@ individually.
 | `enable_runtime_distinct_build_probe` | true | For `BUILD_PROBE` INNER/LEFT equality joins whose build-key uniqueness the planner could not prove, test distinctness at runtime (one `cudf::distinct_count` pass over the cached build, dimension-scale builds only) and take the single-pass `cudf::distinct_hash_join` instead of the general two-pass join when the keys are distinct. |
 | `enable_dynamic_filter_pushdown` | true | Master switch for dynamic table-filter pushdown. An eligible `BUILD_PROBE` hash-join build selects a raw exact IN-list for 1–12 supported build rows, otherwise a hash IN-list if it fits the smallest probe-GPU L2 or a Bloom, for post-decode application by the probe scan. |
 | `enable_dynamic_zone_map_filter` | false | Additionally publish build-key min/max bounds. Parquet scans use them for read-time row-group pruning; duckdb-native scans apply them row-wise post-decode. Requires `enable_dynamic_filter_pushdown`; intended for clustered-keyset workloads. |
-| `dynamic_filter_domain_coverage_threshold` | 0.9 | Skip publishing a key's dynamic filters when the build covers at least this fraction of the key's domain; ≥ 1.0 effectively disables the gate. |
-| `dynamic_filter_keep_threshold` | 0.9 | Disable a probe scan's post-decode dynamic filtering once a measured split keeps more than this fraction of its rows; in [0, 1], 1.0 keeps filtering always on. |
+| `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold for skipping publication when the build covers at least this fraction of the key's domain; ≥ 1.0 effectively disables the gate. |
+| `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
 
 **Note:** `max_build_hash_table_bytes` can be larger than `concat_batch_bytes`. When it is, the partition operator configures CONCAT to concatenate all batches, enabling the more efficient BUILD_PROBE join mode for larger build sides. Other joins (STANDARD, MIXED) still use `concat_batch_bytes` as the batch size threshold.
@@ -570,37 +570,38 @@ SET enable_compressed_materialization = false;
 
 ### Dynamic Filters
 
-Both settings are also accepted in YAML under `sirius.operator_params`.
+Dynamic membership-filter pushdown is automatic and enabled by default. The
+clustered-keyset zone-map path is automatic-off by default because it does not
+repay its row-level cost on scattered keys. Advanced benchmark and diagnosis
+envelopes can override either behavior in YAML under `sirius.operator_params`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `enable_dynamic_filter_pushdown` | true | Master switch for dynamic table-filter pushdown. Wires eligible `BUILD_PROBE` hash-join-build membership filters into probe scans: raw exact IN-list for 1–12 supported build rows, then a hash IN-list if it fits the smallest probe-GPU L2 or a Bloom. |
 | `enable_dynamic_zone_map_filter` | false | Additionally publish build-key min/max bounds. Parquet scans use them for read-time row-group pruning; duckdb-native scans apply them row-wise post-decode. Has no effect unless `enable_dynamic_filter_pushdown` is enabled. |
-| `dynamic_filter_domain_coverage_threshold` | 0.9 | Skip publishing a key's dynamic filters when the build covers at least this fraction of the key's domain; ≥ 1.0 effectively disables the gate. |
-| `dynamic_filter_keep_threshold` | 0.9 | Disable a probe scan's post-decode dynamic filtering once a measured split keeps more than this fraction of its rows; in [0, 1], 1.0 keeps filtering always on. |
+| `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold for skipping publication when the build covers at least this fraction of the key's domain; ≥ 1.0 effectively disables the gate. |
+| `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 
-```sql
-SET enable_dynamic_filter_pushdown = true;
-SET enable_dynamic_zone_map_filter = false;
-```
+The direct DuckDB session overrides are registered only when the process
+explicitly enables Sirius test options; they are not part of the normal user
+surface.
 
 ### Pinned Tables
 
-This setting is accepted both as a DuckDB `SET` variable and in YAML under
-`sirius.operator_params`.
+Pinned-table zone-map capture and pruning are automatic. The advanced YAML escape hatch is under
+`sirius.operator_params` for benchmark and diagnosis envelopes; it is not a normal session choice.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `enable_pinned_zone_map_pruning` | true | Capture pinned-chunk zone maps at pin time and use them to prune cached scans. |
 
-Setting this to `false` before `pin_table` avoids the extra GPU reductions and creates a
+Setting the YAML value to `false` before startup avoids the extra GPU reductions and creates a
 statless entry. Enabling it later does not add statistics to that entry; re-pin the table with
-the setting enabled. Disabling it only for a query leaves existing statistics intact. See
+the setting enabled. See
 [Pinned-table zone maps](scan.md#zone-maps) for supported types, pruning, and re-pin behavior.
 
-```sql
-SET enable_pinned_zone_map_pruning = false;
-```
+The direct DuckDB `SET` override is registered only when the process explicitly enables Sirius
+test options; it is not part of the normal user surface.
 
 ### Transparent Execution
 
