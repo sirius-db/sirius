@@ -42,8 +42,7 @@ namespace sirius::op {
  * into the per-row top-k.
  *
  * Output preserves the partition (left batch index) so the materialize stage can
- * gather each left row's columns. Assumes right batches held >= k rows, so every
- * partial has k columns (the ragged-batch case is a TODO).
+ * gather each left row's columns. A right batch smaller than k is handled upstream (in select).
  */
 class sirius_physical_vector_join_reduce_local
   : public sirius_physical_partition_consumer_operator {

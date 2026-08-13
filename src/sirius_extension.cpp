@@ -2132,6 +2132,12 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
     }
   }
   if (req.k < 0) { throw BinderException("sirius_knn_join: k must be >= 0"); }
+  // cuVS's knn_merge_parts works for k<=1024
+  constexpr int64_t kMaxKnnJoinK = 1024;
+  if (req.k > kMaxKnnJoinK) {
+    throw BinderException("sirius_knn_join: k must be <= " + std::to_string(kMaxKnnJoinK) +
+                          " (the cross-batch merge limit), got " + std::to_string(req.k));
+  }
   if (req.n_clusters < 0) { throw BinderException("sirius_knn_join: n_clusters must be >= 0"); }
   if (req.n_probes < 1) { throw BinderException("sirius_knn_join: n_probes must be >= 1"); }
   if (req.eps < 0.0) { throw BinderException("sirius_knn_join: eps must be >= 0"); }

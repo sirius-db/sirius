@@ -115,6 +115,11 @@ class sirius_physical_vector_join_select : public sirius_physical_operator {
   /// Tells the pipeline this is a leaf that produces data.
   bool is_source() const override { return true; }
 
+  /// Leaf-sink, like a scan: this terminates its own one-operator pipeline and pushes each
+  /// partial into the reduce stage's partition repo (see sink()). The full barrier on this
+  /// edge lets reduce accumulate every partial before draining.
+  bool is_sink() const override { return true; }
+
   /// READY once (kicking off the drain of all pairs), nullopt after / when empty.
   std::optional<task_creation_hint> get_next_task_hint() override;
   /// True once every (left, right) pair has been handed out.

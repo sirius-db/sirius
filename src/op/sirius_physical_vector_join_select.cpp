@@ -26,19 +26,26 @@
 
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/filling.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/error.hpp>
+#include <cudf/utilities/traits.hpp>
 
 #include <raft/core/device_resources.hpp>
 
+#include <cuda_runtime.h>
 #include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <typeinfo>
@@ -46,6 +53,41 @@
 #include <vector>
 
 namespace sirius::op {
+
+namespace {
+
+// A right batch with fewer than k rows can only return k_eff (< k) neighbors per
+// left row. In this case we pad the right batch's result with dummy values
+// (distance = +inf, id = -1) so it still returns k.
+std::unique_ptr<cudf::column> pad_rows_to_k(cudf::column_view const& src,
+                                            std::int64_t n_rows,
+                                            std::int64_t k_eff,
+                                            std::int64_t k,
+                                            cudf::scalar const& filler,
+                                            rmm::cuda_stream_view stream,
+                                            rmm::device_async_resource_ref mr)
+{
+  // make n_rows rows filled with dummy values
+  auto const out_size = static_cast<cudf::size_type>(n_rows * k);
+  auto out =
+    cudf::make_numeric_column(src.type(), out_size, cudf::mask_state::UNALLOCATED, stream, mr);
+  auto out_view = out->mutable_view();
+  cudf::fill_in_place(out_view, 0, out_size, filler, stream);
+
+  // copy the actual result rows to top of the padding
+  auto const elem = cudf::size_of(src.type());
+  CUDF_CUDA_TRY(cudaMemcpy2DAsync(out_view.head<std::uint8_t>(),
+                                  static_cast<std::size_t>(k) * elem,  // dst row stride
+                                  src.head<std::uint8_t>(),
+                                  static_cast<std::size_t>(k_eff) * elem,  // src row stride
+                                  static_cast<std::size_t>(k_eff) * elem,  // bytes per row
+                                  static_cast<std::size_t>(n_rows),
+                                  cudaMemcpyDeviceToDevice,
+                                  stream.value()));
+  return out;
+}
+
+}  // namespace
 
 sirius_physical_vector_join_select::sirius_physical_vector_join_select(
   duckdb::vector<sirius::logical_type> types,
@@ -223,12 +265,23 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_select::execute(
     }
   }
 
-  // Tag with the left batch index so all of a left batch's per-right-batch partials
-  // land in one partition for reduce.
+  auto distances = std::move(knn.distances);
+
+  // If this right batch was too small to give k neighbors, pad the result before passing it
+  // down to the reduce op.
+  if (k_eff < _request.k) {
+    auto const n_left = static_cast<std::int64_t>(queries.extent(0));
+    cudf::numeric_scalar<std::int64_t> const id_filler(-1, true, stream);
+    cudf::numeric_scalar<float> const dist_filler(std::numeric_limits<float>::max(), true, stream);
+    neighbors = pad_rows_to_k(neighbors->view(), n_left, k_eff, _request.k, id_filler, stream, mr);
+    distances =
+      pad_rows_to_k(distances->view(), n_left, k_eff, _request.k, dist_filler, stream, mr);
+  }
+
   std::vector<std::unique_ptr<cudf::column>> out_cols;
   out_cols.reserve(2);
   out_cols.push_back(std::move(neighbors));
-  out_cols.push_back(std::move(knn.distances));
+  out_cols.push_back(std::move(distances));
   auto out_table = std::make_unique<cudf::table>(std::move(out_cols));
 
   auto batch = sirius::make_data_batch(std::move(out_table), *mem_space, stream, batch_telemetry());

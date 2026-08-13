@@ -54,6 +54,16 @@ float single_float(duckdb::Connection& con, const std::string& sql)
   return r->GetValue(0, 0).GetValue<float>();
 }
 
+// Single integer from a one-cell query that must succeed (e.g. count(*) checks).
+int64_t single_int(duckdb::Connection& con, const std::string& sql)
+{
+  auto r = con.Query(sql);
+  REQUIRE(r);
+  if (r->HasError()) { UNSCOPED_INFO("query error: " << r->GetError()); }
+  REQUIRE_FALSE(r->HasError());
+  return r->GetValue(0, 0).GetValue<int64_t>();
+}
+
 // Assert a query fails, and that its error mentions `needle`.
 void expect_error(duckdb::Connection& con, const std::string& sql, const std::string& needle)
 {
@@ -231,29 +241,30 @@ TEST_CASE_METHOD(VectorJoinFixture,
 }
 
 // -----------------------------------------------------------------------------
-// Multi-batch right table: under the test's 1 MB block size a ~300k-row corpus
-// spans several pinned batches, so reduce_local merges partials across batches
-// (n_parts > 1) -- the cross-batch path a single-batch corpus never runs.
+// Multi-batch right table: the corpus splits at DuckDB's row-group boundary
+// (DEFAULT_ROW_GROUP_SIZE = 122880 rows). One FLOAT[768] row group is ~377 MB,
+// far over the batch byte cap, so every row group pins as its own batch. 250000
+// rows therefore span three batches ([0,122880), [122880,245760), [245760,250000)),
+// so reduce_local merges partials across batches (n_parts > 1) -- the cross-batch
+// path a single-batch corpus never runs. The id lives in dim 0 (rest zero), so the
+// L2 distance between rows i and j is |i - j|.
 // -----------------------------------------------------------------------------
 TEST_CASE_METHOD(VectorJoinFixture,
                  "sirius_knn_join - exact L2 across multiple right batches",
                  "[integration][gpu_execution][array][vss][vector_join]")
 {
-  run_ok("CREATE TABLE mb_corpus (id INTEGER PRIMARY KEY, vec FLOAT[3]);");
+  run_ok("CREATE TABLE mb_corpus (id INTEGER PRIMARY KEY, vec FLOAT[768]);");
   run_ok(
-    "INSERT INTO mb_corpus SELECT i, [i::float, (i+1)::float, (i+2)::float] "
-    "FROM range(300000) t(i);");
-  run_ok("CREATE TABLE mb_probe (id INTEGER PRIMARY KEY, vec FLOAT[3]);");
-  // Probes spread across the corpus so the winning neighbors come from different
-  // batches -- the merge has to pick each probe's near shell out of far partials
-  // contributed by every other batch.
+    "INSERT INTO mb_corpus SELECT i, list_resize([i::FLOAT], 768, 0.0::FLOAT)::FLOAT[768] "
+    "FROM range(250000) t(i);");
+  run_ok("CREATE TABLE mb_probe (id INTEGER PRIMARY KEY, vec FLOAT[768]);");
+  // Probes 0 and 1 sit exactly on the two batch boundaries, so each probe's near
+  // shell straddles two batches and the merge has to stitch neighbors from both.
+  // Probes 2 and 3 sit deep inside a batch, where the winners all come from one
+  // batch and the others contribute only far partials that must lose.
   run_ok(
-    "INSERT INTO mb_probe VALUES "
-    "(0, [150000.0, 150001.0, 150002.0]), "
-    "(1, [37000.0, 37001.0, 37002.0]), "
-    "(2, [260000.0, 260001.0, 260002.0]), "
-    "(3, [150090.0, 150091.0, 150092.0]), "
-    "(4, [90000.0, 90001.0, 90002.0]);");
+    "INSERT INTO mb_probe SELECT id, list_resize([v::FLOAT], 768, 0.0::FLOAT)::FLOAT[768] "
+    "FROM (VALUES (0, 122880.0), (1, 245760.0), (2, 180000.0), (3, 40000.0)) t(id, v);");
   run_ok("CHECKPOINT;");
   run_ok("SELECT * FROM pin_table(name => 'mb_corpus', tier => 'gpu', format => 'duckdb');");
   run_ok("SELECT * FROM pin_table(name => 'mb_probe', tier => 'gpu', format => 'duckdb');");
@@ -275,6 +286,103 @@ TEST_CASE_METHOD(VectorJoinFixture,
 
   run_ok("SELECT * FROM unpin_table('mb_probe');");
   run_ok("SELECT * FROM unpin_table('mb_corpus');");
+}
+
+// -----------------------------------------------------------------------------
+// k above the cross-batch merge limit is rejected at bind. A multi-batch corpus
+// folds each batch's partial top-k through cuVS knn_merge_parts, which only supports
+// k <= 1024; a larger k throws mid-merge and the error surfaces as the misleading
+// "cannot run on the CPU", so bind rejects it up front with a clear message. (The
+// realistic short-batch padding path is covered by the 768-dim test above.)
+// -----------------------------------------------------------------------------
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - rejects k above the cross-batch merge limit",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  run_ok("CREATE TABLE kcap_corpus (id INTEGER PRIMARY KEY, vec FLOAT[3]);");
+  run_ok(
+    "INSERT INTO kcap_corpus SELECT i, [i::float, 0.0::float, 0.0::float] FROM range(2000) t(i);");
+  run_ok("CREATE TABLE kcap_probe (id INTEGER PRIMARY KEY, vec FLOAT[3]);");
+  run_ok("INSERT INTO kcap_probe VALUES (0, [1.0, 0.0, 0.0]);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'kcap_corpus', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'kcap_probe', tier => 'gpu', format => 'duckdb');");
+
+  // k = 1025 is one past the knn_merge_parts limit -> BinderException at bind.
+  expect_error(*con,
+               "SELECT * FROM sirius_knn_join('kcap_probe','vec','kcap_corpus','vec', "
+               "search_mode => 'exact', metric => 'l2', k => 1025);",
+               "k must be <= 1024");
+
+  // k = 1024 is exactly the limit and binds fine: the one probe gets 1024 neighbors.
+  REQUIRE(single_int(*con,
+                     "SELECT count(*) FROM sirius_knn_join('kcap_probe','vec','kcap_corpus','vec', "
+                     "search_mode => 'exact', metric => 'l2', k => 1024);") == 1024);
+
+  run_ok("SELECT * FROM unpin_table('kcap_probe');");
+  run_ok("SELECT * FROM unpin_table('kcap_corpus');");
+}
+
+// -----------------------------------------------------------------------------
+// Short last batch across real 768-dim batches. The pinned corpus splits at
+// DuckDB's row-group boundary (DEFAULT_ROW_GROUP_SIZE = 122880 rows): one
+// FLOAT[768] row group is ~377 MB, far over the batch byte cap, so every row
+// group pins as its own batch. A corpus of 122880 + 3 rows therefore lands as a
+// full first batch and a 3-row tail. With k = 9 the tail is smaller than k, so
+// select pads the tail's partial up to k with dummies (distance +inf, id -1)
+// before the merge, and reduce_local must drop every dummy when it merges the
+// tail against the full first batch.
+//
+// This split only happens because the vectors are wide enough for one row group
+// to exceed the batch cap. The narrow FLOAT[3] cases above keep the whole corpus
+// in a single batch under the same cap, so they never reach the padding path --
+// this test is the one that actually crosses a batch boundary.
+// -----------------------------------------------------------------------------
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - pads a short last batch across 768-dim batches",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  // The id lives in dim 0 and the other 767 dims are zero, so the L2 distance
+  // between rows i and j is just |i - j| -- distinct and easy to reason about.
+  // 122883 rows = one full 122880-row row group (batch) + a 3-row tail.
+  run_ok("CREATE TABLE lb_corpus (id INTEGER PRIMARY KEY, vec FLOAT[768]);");
+  run_ok(
+    "INSERT INTO lb_corpus SELECT i, list_resize([i::FLOAT], 768, 0.0::FLOAT)::FLOAT[768] "
+    "FROM range(122883) t(i);");
+  run_ok("CREATE TABLE lb_probe (id INTEGER PRIMARY KEY, vec FLOAT[768]);");
+  // Probe 0 sits on the last corpus row (122882): its 9 nearest are the 3-row tail
+  // (122880..122882) plus 6 rows from the full first batch, so the merge has to keep
+  // the tail's real rows and discard its 6 padded dummies. Probe 1 sits deep in the
+  // first batch, far from the tail, so the tail contributes only far rows and dummies
+  // that must not surface.
+  run_ok(
+    "INSERT INTO lb_probe SELECT id, list_resize([v::FLOAT], 768, 0.0::FLOAT)::FLOAT[768] "
+    "FROM (VALUES (0, 122882.0), (1, 60000.0)) t(id, v);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'lb_corpus', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'lb_probe', tier => 'gpu', format => 'duckdb');");
+
+  // CPU exact per-row top-9 (ids only; the sets are tie-free at both probes).
+  con->Query("SET gpu_execution = false;");
+  auto reference = ok_rows(*con,
+                           "SELECT p.id, n.id FROM lb_probe p, LATERAL ("
+                           "  SELECT c.id, c.vec FROM lb_corpus c "
+                           "  ORDER BY array_distance(p.vec, c.vec) LIMIT 9) n;");
+  con->Query("SET gpu_execution = true;");
+
+  const std::string q =
+    "sirius_knn_join('lb_probe','vec','lb_corpus','vec', "
+    "search_mode => 'exact', metric => 'l2', k => 9)";
+
+  auto joined = ok_rows(*con, "SELECT left_id, right_id FROM " + q + ";");
+
+  REQUIRE(joined == reference);  // exact neighbor set: padded dummies excluded
+  REQUIRE(joined.size() == 18);  // 2 probes x 9 neighbors, none lost
+  // No dummy filler (its id is -1) leaked through the merge.
+  REQUIRE(single_int(*con, "SELECT count(*) FROM " + q + " WHERE right_id = -1;") == 0);
+
+  run_ok("SELECT * FROM unpin_table('lb_probe');");
+  run_ok("SELECT * FROM unpin_table('lb_corpus');");
 }
 
 // -----------------------------------------------------------------------------

@@ -135,11 +135,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_reduce_local::execute
   distance_views.reserve(input_batches.size());
   for (auto const& ro : input_batches) {
     auto const tv = sirius::get_cudf_table_view(ro);
-    // knn_merge requires the same per-batch k across every right batch.
     if (static_cast<std::int64_t>(tv.num_rows()) != part_rows) {
       throw std::runtime_error(
-        "[sirius_physical_vector_join_reduce_local] uneven right batches: a right batch "
-        "has fewer than k rows; reduce k or repartition the right table");
+        "[sirius_physical_vector_join_reduce_local] uneven right batches: expected every "
+        "batch to report k rows per left row");
     }
     neighbor_views.push_back(tv.column(0));
     distance_views.push_back(tv.column(1));
