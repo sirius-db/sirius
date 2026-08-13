@@ -1926,8 +1926,14 @@ static void SetLogBackend(ClientContext& context, SetScope scope, Value& paramet
     throw InvalidInputException("Unknown sirius_log_backend '%s' (expected: duckdb, spdlog, noop)",
                                 backend);
   }
-  Config::LOG_BACKEND = std::move(backend);
-  install_configured_log_sink(context.db.get());
+  auto const previous_backend = Config::LOG_BACKEND;
+  Config::LOG_BACKEND         = std::move(backend);
+  try {
+    install_configured_log_sink(context.db.get());
+  } catch (...) {
+    Config::LOG_BACKEND = previous_backend;
+    throw;
+  }
   SIRIUS_LOG_DEBUG("Updated config LOG_BACKEND to {}", Config::LOG_BACKEND);
 }
 

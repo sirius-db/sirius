@@ -15,6 +15,7 @@
  */
 
 #include "catch.hpp"
+#include "log/sink.hpp"
 #include "sirius_context.hpp"
 
 #include <cudf/contiguous_split.hpp>
@@ -248,6 +249,63 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
   }
+}
+
+TEST_CASE("DuckDB setting preserves the Sirius log backend when sink construction fails",
+          "[sirius][context][config][isolated_context]")
+{
+  finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
+  setenv("SIRIUS_DISABLE", "1", 1);
+
+  auto const previous_backend = duckdb::Config::LOG_BACKEND;
+  auto const previous_log_dir = duckdb::Config::LOG_DIR;
+  auto const previous_sink    = sirius::log::get_sink();
+  auto const test_root        = fs::temp_directory_path() / "sirius-log-backend-rollback-test";
+  finally restore_logging{[&]() {
+    duckdb::Config::LOG_BACKEND = previous_backend;
+    duckdb::Config::LOG_DIR     = previous_log_dir;
+    sirius::log::set_sink(previous_sink);
+    fs::remove_all(test_root);
+  }};
+
+  fs::remove_all(test_root);
+  fs::create_directories(test_root);
+  auto const blocker = test_root / "not-a-directory";
+  std::ofstream(blocker) << "file";
+  auto const invalid_dir = blocker / "child";
+  auto const valid_dir   = test_root / "valid";
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+
+  auto noop = con.Query("SET sirius_log_backend = 'noop'");
+  REQUIRE(noop != nullptr);
+  REQUIRE_FALSE(noop->HasError());
+  auto const noop_sink = sirius::log::get_sink();
+
+  auto stage_invalid_dir = con.Query("SET sirius_log_dir = '" + invalid_dir.string() + "'");
+  REQUIRE(stage_invalid_dir != nullptr);
+  REQUIRE_FALSE(stage_invalid_dir->HasError());
+
+  auto invalid_spdlog = con.Query("SET sirius_log_backend = 'spdlog'");
+  REQUIRE(invalid_spdlog != nullptr);
+  REQUIRE(invalid_spdlog->HasError());
+
+  auto after_invalid = con.Query("SELECT current_setting('sirius_log_backend')::VARCHAR");
+  REQUIRE(after_invalid != nullptr);
+  REQUIRE_FALSE(after_invalid->HasError());
+  REQUIRE(after_invalid->GetValue(0, 0).GetValue<std::string>() == "noop");
+  REQUIRE(duckdb::Config::LOG_BACKEND == "noop");
+  REQUIRE(sirius::log::get_sink() == noop_sink);
+
+  auto repair_dir = con.Query("SET sirius_log_dir = '" + valid_dir.string() + "'");
+  REQUIRE(repair_dir != nullptr);
+  REQUIRE_FALSE(repair_dir->HasError());
+
+  auto valid_spdlog = con.Query("SET sirius_log_backend = 'spdlog'");
+  REQUIRE(valid_spdlog != nullptr);
+  REQUIRE_FALSE(valid_spdlog->HasError());
+  REQUIRE(duckdb::Config::LOG_BACKEND == "spdlog");
 }
 
 TEST_CASE("Sirius configuration loading from file with configurator",
