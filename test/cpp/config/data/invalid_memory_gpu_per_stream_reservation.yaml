@@ -1,0 +1,4 @@
+sirius:
+  memory:
+    gpu:
+      track_per_stream_reservation: true

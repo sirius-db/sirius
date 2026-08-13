@@ -314,6 +314,13 @@ TEST_CASE("Sirius configuration loading from file with configurator",
   REQUIRE(manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).size() == 1);
   REQUIRE(manager.get_memory_spaces_for_tier(cucascade::memory::Tier::DISK).size() == 1);
 
+  auto const& spaces = sirius_ctx->get_config().get_memory_space_configs();
+  auto const gpu     = std::ranges::find_if(spaces, [](auto const& space) {
+    return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space);
+  });
+  REQUIRE(gpu != spaces.end());
+  REQUIRE_FALSE(std::get<cucascade::memory::gpu_memory_space_config>(*gpu).per_stream_reservation);
+
   auto const& telemetry = sirius_ctx->get_config().get_telemetry_config();
   REQUIRE_FALSE(telemetry.enable_quent);
   REQUIRE(telemetry.output_directory == "/tmp/sirius_telemetry_config_test");
@@ -492,6 +499,32 @@ TEST_CASE("operator batch defaults use an explicit high-level GPU usage fraction
   config.load_from_file(config_fixture("minimal.yaml"));
 
   require_shared_operator_defaults(config.get_operator_params(), expected_effective_batch(config));
+  REQUIRE(config.get_task_creator_config().thread_pool.thread_name_prefix == "task_creator");
+  REQUIRE(config.get_gpu_pipeline_executor_config().thread_name_prefix == "gpu_pipeline");
+  REQUIRE(config.get_downgrade_executor_config().thread_pool.thread_name_prefix == "downgrade");
+  REQUIRE(config.get_scan_manager_config().thread_pool.thread_name_prefix == "scan_manager");
+}
+
+TEST_CASE("Sirius keeps executor thread-name prefixes internal", "[sirius][config]")
+{
+  struct invalid_prefix {
+    const char* fixture;
+    const char* context;
+  };
+  constexpr std::array cases{
+    invalid_prefix{"invalid_task_creator_thread_name_prefix.yaml", "task_creator"},
+    invalid_prefix{"invalid_pipeline_thread_name_prefix.yaml", "thread_pool"},
+    invalid_prefix{"invalid_downgrade_thread_name_prefix.yaml", "downgrade"},
+    invalid_prefix{"invalid_scan_manager_thread_name_prefix.yaml", "scan_manager"},
+  };
+
+  for (auto const& test : cases) {
+    INFO("fixture=" << test.fixture);
+    sirius::sirius_config config;
+    REQUIRE_THROWS_WITH(
+      config.load_from_file(config_fixture(test.fixture)),
+      Catch::Contains("unknown config key: 'thread_name_prefix'") && Catch::Contains(test.context));
+  }
 }
 
 TEST_CASE("explicit operator batch values override effective-capacity defaults",
@@ -679,6 +712,14 @@ TEST_CASE("Sirius downgrade hysteresis accepts omitted, null, and one-sided defa
     sirius::sirius_config config;
     REQUIRE_NOTHROW(config.load_from_file(path));
   }
+}
+
+TEST_CASE("Sirius high-level GPU config keeps per-stream tracking internal", "[sirius][config]")
+{
+  sirius::sirius_config config;
+  REQUIRE_THROWS_WITH(
+    config.load_from_file(config_fixture("invalid_memory_gpu_per_stream_reservation.yaml")),
+    Catch::Contains("unknown config key: 'track_per_stream_reservation' in memory.gpu"));
 }
 
 TEST_CASE("Sirius configuration rejects conflicting memory budget forms", "[sirius][config]")
@@ -977,6 +1018,13 @@ TEST_CASE("Sirius configuration loading from file with spaces",
   REQUIRE(manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).size() == 1);
   REQUIRE(manager.get_memory_spaces_for_tier(cucascade::memory::Tier::DISK).size() == 2);
   REQUIRE(manager.get_all_memory_spaces().size() == 4);
+
+  auto const& spaces = sirius_ctx->get_config().get_memory_space_configs();
+  auto const gpu     = std::ranges::find_if(spaces, [](auto const& space) {
+    return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space);
+  });
+  REQUIRE(gpu != spaces.end());
+  REQUIRE(std::get<cucascade::memory::gpu_memory_space_config>(*gpu).per_stream_reservation);
 }
 
 TEST_CASE("Sirius configuration rejects competing memory configuration paths", "[sirius][config]")
