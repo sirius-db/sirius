@@ -329,6 +329,34 @@ TEST_CASE("Sirius configuration validates MARK join build switch ratio", "[siriu
   REQUIRE(config.get_operator_params().mark_join_build_switch_ratio == Approx(0.0));
 }
 
+TEST_CASE("Sirius YAML rejects invalid dynamic-filter thresholds", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+
+  struct invalid_config {
+    const char* fixture;
+    const char* setting;
+  };
+  const invalid_config cases[] = {
+    {"invalid_dynamic_filter_domain_coverage_threshold.yaml",
+     "dynamic_filter_domain_coverage_threshold"},
+    {"invalid_dynamic_filter_keep_threshold_negative.yaml", "dynamic_filter_keep_threshold"},
+    {"invalid_dynamic_filter_keep_threshold_above_one.yaml", "dynamic_filter_keep_threshold"},
+  };
+
+  for (auto const& invalid : cases) {
+    INFO("fixture=" << invalid.fixture << " setting=" << invalid.setting);
+    auto const path = data_dir / invalid.fixture;
+    REQUIRE(fs::is_regular_file(path));
+
+    sirius::sirius_config config;
+    REQUIRE_THROWS_WITH(config.load_from_file(path),
+                        Catch::Contains(invalid.setting) &&
+                          Catch::Contains("value out of range"));
+  }
+}
+
 namespace {
 
 void require_shared_operator_defaults(const sirius::operator_params& params, uint64_t batch)

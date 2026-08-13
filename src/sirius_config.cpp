@@ -273,8 +273,11 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("enable_dynamic_filter_pushdown", opt.enable_dynamic_filter_pushdown);
   r.optional("enable_dynamic_zone_map_filter", opt.enable_dynamic_zone_map_filter);
   r.optional("dynamic_filter_domain_coverage_threshold",
-             opt.dynamic_filter_domain_coverage_threshold);
-  r.optional("dynamic_filter_keep_threshold", opt.dynamic_filter_keep_threshold);
+             opt.dynamic_filter_domain_coverage_threshold,
+             yaml::greater_than<double>{0.0});
+  r.optional("dynamic_filter_keep_threshold",
+             opt.dynamic_filter_keep_threshold,
+             yaml::fraction<double>{});
   r.optional("enable_pinned_zone_map_pruning", opt.enable_pinned_zone_map_pruning);
   r.optional("enable_compressed_materialization", opt.enable_compressed_materialization);
   r.reject_unknown();
