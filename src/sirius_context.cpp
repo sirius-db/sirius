@@ -1586,7 +1586,14 @@ void install_configured_log_sink(DatabaseInstance* db)
 
 SiriusContextExtensionCallback::SiriusContextExtensionCallback()
 {
-  if (auto* env = std::getenv("SIRIUS_LOG_BACKEND")) { Config::LOG_BACKEND = env; }
+  if (auto* env = std::getenv("SIRIUS_LOG_BACKEND")) {
+    std::string_view const backend{env};
+    if (backend != "duckdb" && backend != "spdlog" && backend != "noop") {
+      throw InvalidInputException(
+        "SIRIUS_LOG_BACKEND must be one of: duckdb, spdlog, noop; got '%s'", env);
+    }
+    Config::LOG_BACKEND = env;
+  }
   if (auto* env = std::getenv("SIRIUS_LOG_DIR")) { Config::LOG_DIR = env; }
   if (auto* env = std::getenv("SIRIUS_LOG_LEVEL")) { Config::LOG_LEVEL = env; }
   // Install now (no db yet) so spdlog/noop capture the logs emitted by

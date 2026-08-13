@@ -308,6 +308,38 @@ TEST_CASE("DuckDB setting preserves the Sirius log backend when sink constructio
   REQUIRE(duckdb::Config::LOG_BACKEND == "spdlog");
 }
 
+TEST_CASE("Sirius startup rejects unknown environment log backends before mutation",
+          "[sirius][context][config][isolated_context]")
+{
+  auto const previous_backend = duckdb::Config::LOG_BACKEND;
+  auto const previous_sink    = sirius::log::get_sink();
+  std::optional<std::string> previous_env_backend;
+  if (auto const* value = std::getenv("SIRIUS_LOG_BACKEND")) { previous_env_backend = value; }
+  finally restore_logging{[&]() {
+    duckdb::Config::LOG_BACKEND = previous_backend;
+    sirius::log::set_sink(previous_sink);
+    if (previous_env_backend) {
+      setenv("SIRIUS_LOG_BACKEND", previous_env_backend->c_str(), 1);
+    } else {
+      unsetenv("SIRIUS_LOG_BACKEND");
+    }
+    setenv("SIRIUS_DISABLE", "1", 1);
+  }};
+
+  setenv("SIRIUS_DISABLE", "1", 1);
+  duckdb::Config::LOG_BACKEND = "noop";
+  setenv("SIRIUS_LOG_BACKEND", "syslog", 1);
+
+  REQUIRE_THROWS_WITH(
+    duckdb::SiriusContextExtensionCallback{},
+    Catch::Contains("SIRIUS_LOG_BACKEND must be one of: duckdb, spdlog, noop; got 'syslog'"));
+  REQUIRE(duckdb::Config::LOG_BACKEND == "noop");
+
+  setenv("SIRIUS_LOG_BACKEND", "duckdb", 1);
+  duckdb::SiriusContextExtensionCallback valid_callback;
+  REQUIRE(duckdb::Config::LOG_BACKEND == "duckdb");
+}
+
 TEST_CASE("Sirius configuration loading from file with configurator",
           "[sirius][context][isolated_context]")
 {
