@@ -22,6 +22,7 @@
 #include "op/cudf_sort_order.hpp"
 #include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_top_n_merge.hpp"
+#include "op/sort_validation.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
@@ -78,8 +79,20 @@ std::unique_ptr<cudf::table> compute_top_n_table(
       // cudf::top_k_order takes no null_order, so it cannot honor SQL NULLS FIRST/LAST when
       // selecting which rows are in the top k (it treats NULLs as the largest value). For a
       // nullable key, fall back to a full sort that honors null placement, then slice the top k.
-      auto sorted = cudf::sort_by_key(
-        input, cudf::table_view({input.column(idx)}), {order}, {null_ord}, stream, memory_resource);
+      auto sorted = validated_sort(
+        [&]() {
+          return cudf::sort_by_key(input,
+                                   cudf::table_view({input.column(idx)}),
+                                   {order},
+                                   {null_ord},
+                                   stream,
+                                   memory_resource);
+        },
+        {idx},
+        {order},
+        {null_ord},
+        stream,
+        "top_n nullable single-key sort");
       if (keep_rows == sorted->num_rows()) {
         kept = std::move(sorted);
       } else {
@@ -87,17 +100,31 @@ std::unique_ptr<cudf::table> compute_top_n_table(
         kept        = std::make_unique<cudf::table>(slices.front(), stream, memory_resource);
       }
     } else {
-      auto indices =
-        cudf::top_k_order(input.column(idx), keep_rows, order, stream, memory_resource);
-      auto gathered = cudf::gather(
-        input, indices->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, memory_resource);
-      // top_k_order does not guarantee sorted output — sort the gathered rows
-      kept = cudf::sort_by_key(gathered->view(),
-                               cudf::table_view({gathered->view().column(idx)}),
-                               {order},
-                               {null_ord},
-                               stream,
-                               memory_resource);
+      // The whole select-then-sort path retries as one unit so a mis-executed top_k_order
+      // re-rolls the row selection too. Note the validation can only prove the kept rows are
+      // sorted, not that top_k_order selected the true top k (issue #1452 residual risk).
+      kept = validated_sort(
+        [&]() {
+          auto indices =
+            cudf::top_k_order(input.column(idx), keep_rows, order, stream, memory_resource);
+          auto gathered = cudf::gather(input,
+                                       indices->view(),
+                                       cudf::out_of_bounds_policy::DONT_CHECK,
+                                       stream,
+                                       memory_resource);
+          // top_k_order does not guarantee sorted output — sort the gathered rows
+          return cudf::sort_by_key(gathered->view(),
+                                   cudf::table_view({gathered->view().column(idx)}),
+                                   {order},
+                                   {null_ord},
+                                   stream,
+                                   memory_resource);
+        },
+        {idx},
+        {order},
+        {null_ord},
+        stream,
+        "top_n top_k_order path");
     }
   } else {
     // Multi-key: fall back to full sort_by_key
@@ -122,9 +149,23 @@ std::unique_ptr<cudf::table> compute_top_n_table(
       null_orders.push_back(to_cudf_null_order(ord.type, ord.null_order));
     }
 
+    std::vector<cudf::size_type> key_indices;
+    key_indices.reserve(orders.size());
+    for (auto const& ord : orders) {
+      key_indices.push_back(static_cast<cudf::size_type>(
+        ord.expression->Cast<duckdb::BoundReferenceExpression>().index));
+    }
     auto keys_table = cudf::table_view(key_views);
-    auto sorted =
-      cudf::sort_by_key(input, keys_table, key_orders, null_orders, stream, memory_resource);
+    auto sorted     = validated_sort(
+      [&]() {
+        return cudf::sort_by_key(
+          input, keys_table, key_orders, null_orders, stream, memory_resource);
+      },
+      key_indices,
+      key_orders,
+      null_orders,
+      stream,
+      "top_n multi-key sort");
 
     if (keep_rows == sorted->num_rows()) {
       kept = std::move(sorted);

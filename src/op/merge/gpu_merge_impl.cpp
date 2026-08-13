@@ -18,6 +18,7 @@
 
 #include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"
+#include "op/sort_validation.hpp"
 
 #include <cudf/aggregation.hpp>
 #include <cudf/concatenate.hpp>
@@ -325,12 +326,26 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_order_by(
   for (const auto& batch : input) {
     input_tables.push_back(get_cudf_table_view(batch));
   }
-  auto output_table = cudf::merge(input_tables,
-                                  order_key_idx,
-                                  column_order,
-                                  null_precedence,
-                                  stream,
-                                  memory_space.get_default_allocator());
+  // Defense-in-depth for issue #1452: the merged table is the terminal sorted artifact of the
+  // sort pipeline, so validate it before publishing. cudf::merge silently produces a wrong
+  // multiset when an input violates its sorted-input contract; the producers are guarded, but
+  // if an unsorted input ever slips through, the retry here cannot repair it and the guard
+  // fails loudly instead of returning corrupt rows.
+  std::vector<cudf::size_type> key_indices(order_key_idx.begin(), order_key_idx.end());
+  auto output_table = validated_sort(
+    [&]() {
+      return cudf::merge(input_tables,
+                         order_key_idx,
+                         column_order,
+                         null_precedence,
+                         stream,
+                         memory_space.get_default_allocator());
+    },
+    key_indices,
+    column_order,
+    null_precedence,
+    stream,
+    "merge_order_by");
 
   // Create the output data batch
   return make_data_batch(std::move(output_table), memory_space, stream, telemetry_info);

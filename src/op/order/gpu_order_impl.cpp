@@ -17,6 +17,9 @@
 #include "op/order/gpu_order_impl.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "op/sort_validation.hpp"
+
+#include <cudf/sorting.hpp>
 
 namespace sirius {
 namespace op {
@@ -38,28 +41,37 @@ std::shared_ptr<cucascade::data_batch> gpu_order_impl::local_order_by(
       "`null_precedence` in `local_order_by()`");
   }
 
-  // Get sorted order
   auto input_table = get_cudf_table_view(input);
   std::vector<cudf::column_view> sort_cols;
   for (int idx : order_key_idx) {
     sort_cols.push_back(input_table.column(idx));
   }
-  auto sorted_order = cudf::sorted_order(cudf::table_view(sort_cols),
-                                         column_order,
-                                         null_precedence,
-                                         stream,
-                                         memory_space.get_default_allocator());
-
-  // Do projection
   std::vector<cudf::column_view> project_input_cols;
   for (int idx : projections) {
     project_input_cols.push_back(input_table.column(idx));
   }
-  auto output_table = cudf::gather(cudf::table_view(project_input_cols),
-                                   sorted_order->view(),
-                                   cudf::out_of_bounds_policy::DONT_CHECK,
-                                   stream,
-                                   memory_space.get_default_allocator());
+  // Sort keys keep their input indices in the projected output on this path (the ORDER_BY
+  // operator projects all columns positionally), so the gathered output validates directly.
+  std::vector<cudf::size_type> out_key_indices(order_key_idx.begin(), order_key_idx.end());
+
+  auto output_table = validated_sort(
+    [&]() {
+      auto sorted_order = cudf::sorted_order(cudf::table_view(sort_cols),
+                                             column_order,
+                                             null_precedence,
+                                             stream,
+                                             memory_space.get_default_allocator());
+      return cudf::gather(cudf::table_view(project_input_cols),
+                          sorted_order->view(),
+                          cudf::out_of_bounds_policy::DONT_CHECK,
+                          stream,
+                          memory_space.get_default_allocator());
+    },
+    out_key_indices,
+    column_order,
+    null_precedence,
+    stream,
+    "local_order_by");
 
   // Create the output data batch
   return make_data_batch(std::move(output_table), memory_space, stream, telemetry_info);
