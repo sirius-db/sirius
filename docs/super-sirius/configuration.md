@@ -332,7 +332,7 @@ The four count limits marked below must be greater than zero.
 | `retry_backoff_base_ms` | int (ms) | 50 | Base backoff between retries. |
 | `retry_jitter_ms` | int (ms) | 50 | Random jitter added to retry backoff. |
 | `max_retry_attempts` | int (**> 0**) | 10 | Retry attempts for transient errors. |
-| `max_auth_retry_attempts` | int | 3 | Retry attempts for HTTP 403 (expired presigned URL). Kept low so a genuine AccessDenied fails fast. |
+| `max_auth_retry_attempts` | int (**> 0**) | 3 | Retry attempts for HTTP 403 (expired presigned URL). Kept low so a genuine AccessDenied fails fast. |
 | `honor_retry_after` | bool | true | Respect the server's `Retry-After` header. |
 | `perf_instrumentation` | bool | false | Record per-chunk micro-timings (chunk_get, queue_wait, ttfb, h2d) into perf counters. |
 | `footer_probe_bytes` | bytes | 512Ki | Suffix-range window for the parquet footer probe. Must cover the footer, so err large. |

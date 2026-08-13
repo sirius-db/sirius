@@ -296,7 +296,8 @@ TEST_CASE("sirius_config validates positive REST counts", "[scan_manager][config
   auto const fields =
     std::array{count_field{"max_connections", &rest_config::max_connections},
                count_field{"max_read_split", &rest_config::max_read_split},
-               count_field{"max_retry_attempts", &rest_config::max_retry_attempts}};
+               count_field{"max_retry_attempts", &rest_config::max_retry_attempts},
+               count_field{"max_auth_retry_attempts", &rest_config::max_auth_retry_attempts}};
   auto const path = std::filesystem::temp_directory_path() / "sirius_rest_positive_count.yaml";
 
   for (auto const& field : fields) {
@@ -330,19 +331,23 @@ TEST_CASE("sirius_config validates positive REST counts", "[scan_manager][config
       CHECK(config.get_scan_manager_config().rest.*field.member == expected);
     }
 
-    DYNAMIC_SECTION(field.name << " accepts a positive override")
+    DYNAMIC_SECTION(field.name << " accepts positive overrides")
     {
-      write_yaml(path,
-                 "sirius:\n"
-                 "  executor:\n"
-                 "    scan_manager:\n"
-                 "      rest:\n"
-                 "        " +
-                   std::string(field.name) + ": 7\n");
+      for (auto const* valid : {"1", "7"}) {
+        CAPTURE(valid);
+        write_yaml(path,
+                   "sirius:\n"
+                   "  executor:\n"
+                   "    scan_manager:\n"
+                   "      rest:\n"
+                   "        " +
+                     std::string(field.name) + ": " + valid + "\n");
 
-      sirius::sirius_config config;
-      REQUIRE_NOTHROW(config.load_from_file(path));
-      CHECK(config.get_scan_manager_config().rest.*field.member == 7);
+        sirius::sirius_config config;
+        REQUIRE_NOTHROW(config.load_from_file(path));
+        CHECK(config.get_scan_manager_config().rest.*field.member ==
+              static_cast<std::size_t>(std::stoull(valid)));
+      }
     }
 
     DYNAMIC_SECTION(field.name << " rejects invalid counts without mutation")
