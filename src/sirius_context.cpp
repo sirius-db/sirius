@@ -1586,9 +1586,17 @@ void install_configured_log_sink(DatabaseInstance* db)
 
 SiriusContextExtensionCallback::SiriusContextExtensionCallback()
 {
-  if (auto* env = std::getenv("SIRIUS_LOG_BACKEND")) { Config::LOG_BACKEND = env; }
-  if (auto* env = std::getenv("SIRIUS_LOG_DIR")) { Config::LOG_DIR = env; }
-  if (auto* env = std::getenv("SIRIUS_LOG_LEVEL")) { Config::LOG_LEVEL = env; }
+  auto* backend_env = std::getenv("SIRIUS_LOG_BACKEND");
+  auto* log_dir_env = std::getenv("SIRIUS_LOG_DIR");
+  auto* level_env   = std::getenv("SIRIUS_LOG_LEVEL");
+  if (level_env && !sirius::log::string_to_enum(level_env)) {
+    throw InvalidInputException(
+      "SIRIUS_LOG_LEVEL must be one of: trace, debug, info, warn, error, critical, off; got '%s'",
+      level_env);
+  }
+  if (backend_env) { Config::LOG_BACKEND = backend_env; }
+  if (log_dir_env) { Config::LOG_DIR = log_dir_env; }
+  if (level_env) { Config::LOG_LEVEL = level_env; }
   // Install now (no db yet) so spdlog/noop capture the logs emitted by
   // read_config_file_if_exists() below; the duckdb backend needs a db (installed
   // later).

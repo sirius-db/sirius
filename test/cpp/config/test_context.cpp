@@ -731,6 +731,53 @@ TEST_CASE("DuckDB setting rejects unknown Sirius log levels without mutation",
   REQUIRE_FALSE(sirius::log::get_sink()->should_log(sirius::log::level::critical));
 }
 
+TEST_CASE("Sirius startup rejects unknown environment log levels before mutation",
+          "[sirius][context][config][isolated_context]")
+{
+  auto const previous_level   = duckdb::Config::LOG_LEVEL;
+  auto const previous_backend = duckdb::Config::LOG_BACKEND;
+  auto const previous_sink    = sirius::log::get_sink();
+  std::optional<std::string> previous_env_level;
+  std::optional<std::string> previous_env_backend;
+  if (auto const* value = std::getenv("SIRIUS_LOG_LEVEL")) { previous_env_level = value; }
+  if (auto const* value = std::getenv("SIRIUS_LOG_BACKEND")) { previous_env_backend = value; }
+  finally restore_logging{[&]() {
+    duckdb::Config::LOG_LEVEL   = previous_level;
+    duckdb::Config::LOG_BACKEND = previous_backend;
+    sirius::log::set_sink(previous_sink);
+    if (previous_env_level) {
+      setenv("SIRIUS_LOG_LEVEL", previous_env_level->c_str(), 1);
+    } else {
+      unsetenv("SIRIUS_LOG_LEVEL");
+    }
+    if (previous_env_backend) {
+      setenv("SIRIUS_LOG_BACKEND", previous_env_backend->c_str(), 1);
+    } else {
+      unsetenv("SIRIUS_LOG_BACKEND");
+    }
+    setenv("SIRIUS_DISABLE", "1", 1);
+  }};
+
+  setenv("SIRIUS_DISABLE", "1", 1);
+  setenv("SIRIUS_LOG_BACKEND", "noop", 1);
+  duckdb::Config::LOG_LEVEL = "warn";
+  setenv("SIRIUS_LOG_LEVEL", "verbose", 1);
+
+  REQUIRE_THROWS_WITH(
+    duckdb::SiriusContextExtensionCallback{},
+    Catch::Contains(
+      "SIRIUS_LOG_LEVEL must be one of: trace, debug, info, warn, error, critical, off; got "
+      "'verbose'"));
+  REQUIRE(duckdb::Config::LOG_LEVEL == "warn");
+  REQUIRE(duckdb::Config::LOG_BACKEND == previous_backend);
+
+  setenv("SIRIUS_LOG_LEVEL", "critical", 1);
+  duckdb::SiriusContextExtensionCallback valid_callback;
+  REQUIRE(duckdb::Config::LOG_LEVEL == "critical");
+  REQUIRE(duckdb::Config::LOG_BACKEND == "noop");
+  REQUIRE_FALSE(sirius::log::get_sink()->should_log(sirius::log::level::critical));
+}
+
 TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
           "[sirius][context][config][isolated_context]")
 {
