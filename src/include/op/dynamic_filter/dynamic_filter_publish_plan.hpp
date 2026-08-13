@@ -179,9 +179,9 @@ class dynamic_filter_publish_plan final {
     /**
      * @brief Probe-side storage type at the bound coordinate
      *
-     * Zone-map filters are pushed to this binding only when this equals the build key's runtime
-     * type; `cudf::type_id::EMPTY` marks a probe type with no cudf representation and suppresses
-     * zone maps for this binding only.
+     * For scan bindings, zone-map filters are pushed only when this equals the build key's runtime
+     * type; `cudf::type_id::EMPTY` suppresses zone maps for that binding. Direct bindings require
+     * INT32 or INT64 storage matching the admitted build key.
      */
     cudf::data_type probe_storage_type{cudf::type_id::EMPTY};
 
@@ -245,6 +245,8 @@ class dynamic_filter_publish_plan final {
    * @throw std::invalid_argument if a probe target has a null channel, is a membership-only
    * (direct) target accepting zone maps, binds an admitted key that does not exist, or binds the
    * same admitted key more than once
+   * @throw std::invalid_argument if a direct binding's probe storage is not INT32 or INT64, or
+   * does not match the admitted build key's storage type
    *
    * @param[in] admitted_keys Statically admitted build keys, in admitted order
    * @param[in] probe_targets Endpoint channels with their sparse key bindings

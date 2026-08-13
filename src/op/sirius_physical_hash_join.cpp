@@ -2144,15 +2144,13 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
   }
 
   if (!claimed) {
-    // Every non-claiming delivery only routes the batch to the target port exactly as the base
-    // does.
     sirius_physical_partition_consumer_operator::push_data_batch_partitioned(
       port_id, batch, partition_idx);
     return;
   }
 
-  // A claimed window must end terminal; this guard covers a throw before the publisher's own
-  // PUBLISHING -> FINISHED/FAILED transition.
+  // Do not strand a claimed window in PUBLISHING if setup or routing throws before
+  // publish_dynamic_filters() owns the terminal transition.
   try {
     // The read-only accessor is acquired BEFORE routing: once deposited into a repository the
     // batch becomes a downgrade candidate, and the shared lock pins its GPU representation.
@@ -2169,14 +2167,11 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
         _dynamic_filter_stats->publications_skipped_source_not_resident.fetch_add(
           1, std::memory_order_relaxed);
       }
-      // Reopen the claimed window rather than ending terminal: on a multi-GPU broadcast build every
-      // GPU delivers the whole build side, so a sibling delivery with a GPU-resident replica may
-      // still claim and publish. on_finalize_operator may close the reopened window; if
-      // finalization already ran, the window stays OPEN with no further deliveries possible, which
-      // nothing reads (target channels close at drain). A plain store suffices because this
-      // delivery exclusively holds PUBLISHING and every transition into or out of OPEN stays
-      // guarded by op_state_mutex. Nothing between this store and the return can throw, so the
-      // enclosing catch cannot fail a window this delivery has already given up.
+      // Reopen so a GPU-resident sibling broadcast delivery can publish. Holding op_state_mutex
+      // serializes every transition into or out of OPEN; this delivery exclusively owns PUBLISHING,
+      // so a plain store suffices. If finalization already observed PUBLISHING, no deliveries remain
+      // and the reopened state is unobservable. Return immediately so the catch cannot mark the
+      // released claim FAILED.
       std::scoped_lock lg(op_state_mutex);
       _dynamic_filter_publication_state.store(dynamic_filter_publication_state::OPEN,
                                               std::memory_order_release);
@@ -2206,9 +2201,8 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
     }
     publish_dynamic_filters(sirius::get_cudf_table_view(build_ro), publish_stream);
   } catch (...) {
-    // The CAS no-ops when this delivery no longer holds PUBLISHING: the publisher terminal-izes
-    // (and counts) its own failure, and the not-GPU-resident skip reopens the window before
-    // returning.
+    // publish_dynamic_filters() records FAILED before rethrowing, so its failure makes this CAS a
+    // no-op. Failures earlier in the delivery hook are transitioned and counted here.
     auto expected = dynamic_filter_publication_state::PUBLISHING;
     if (_dynamic_filter_publication_state.compare_exchange_strong(
           expected,

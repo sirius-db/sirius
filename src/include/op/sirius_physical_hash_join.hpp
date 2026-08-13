@@ -465,9 +465,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //===----------------------------------------------------------------------===//
   /// @brief Perform this join's claimed dynamic-filter publication attempt.
   ///
-  /// The only publishing caller is @ref push_data_batch_partitioned: it claims @c OPEN to @c
-  /// PUBLISHING under @ref op_state_mutex at decision time and publishes as soon as the single,
-  /// concat-folded build batch reaches the build port, before any probe batch is required.
+  /// The only publishing caller is @ref push_data_batch_partitioned. It claims @c OPEN to @c
+  /// PUBLISHING under @ref op_state_mutex at decision time and publishes from an eligible,
+  /// concat-folded whole-build batch before any probe batch is required.
   ///
   /// This method requires @c PUBLISHING on entry and owns the terminal transition to @c FINISHED or
   /// @c FAILED. GPU work runs without holding @ref op_state_mutex. A successful attempt ends in @c
@@ -480,18 +480,18 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   void publish_dynamic_filters(cudf::table_view const& build_view, rmm::cuda_stream_view stream);
 
   enum class dynamic_filter_publication_state : std::uint8_t {
-    OPEN,        ///< The publication hook has not claimed the build table.
-    PUBLISHING,  ///< The claiming caller owns construction, replication, and fan-out.
-    FINISHED,    ///< The one publication attempt completed successfully (possibly emitting none).
+    OPEN,        ///< An eligible whole-build delivery may claim the publication window.
+    PUBLISHING,  ///< The claiming delivery owns construction, replication, and fan-out.
+    FINISHED,    ///< A claimed attempt completed successfully (possibly emitting none).
     FAILED,      ///< The claimed attempt threw; the uncertain state must not be retried.
-    CLOSED       ///< Finalization closed the window before the hook claimed it.
+    CLOSED       ///< Finalization closed an unclaimed publication window.
   };
 
   /// Plan-time routing, policy, and replica placement; not mutated after construction.
   dynamic_filter_publish_plan _dynamic_filter_plan;
   // Optional non-owning counter sink. SiriusContext owns it and outlives the plan.
   dynamic_filter_stats* _dynamic_filter_stats = nullptr;
-  /// Exactly-once arbitration between the publication hook and finalization.
+  /// Arbitrates publication claims against finalization.
   std::atomic<dynamic_filter_publication_state> _dynamic_filter_publication_state{
     dynamic_filter_publication_state::OPEN};
   //===----------------------------------------------------------------------===//
@@ -499,20 +499,21 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
  public:
   /// @brief Route a partitioned batch and publish dynamic filters from an eligible build batch.
   ///
-  /// For the @c build port of a wired @c BUILD_PROBE join, the single concat-folded batch is the
-  /// publication point. The publication window is claimed (@c OPEN to @c PUBLISHING) at decision
-  /// time, under @ref op_state_mutex and before the batch is routed; before control leaves this
-  /// method, a claimed window ends terminal (@c FINISHED or @c FAILED) or is reopened to @c OPEN by
-  /// the not-GPU-resident skip so a sibling (broadcast) delivery of the same whole build can claim
-  /// it. The batch's read-only accessor is likewise acquired BEFORE it is routed: once deposited
+  /// For an eligible delivery on the @c build port of a wired join, the concat-folded whole-build
+  /// batch is the publication point. The publication window is claimed (@c OPEN to @c PUBLISHING)
+  /// at decision time, under @ref op_state_mutex and before the batch is routed; before control
+  /// leaves this method, a claimed window ends terminal (@c FINISHED or @c FAILED) or is reopened
+  /// to @c OPEN by the not-GPU-resident skip so a sibling broadcast delivery can claim it.
+  /// The batch's read-only accessor is likewise acquired BEFORE it is routed: once deposited
   /// into a repository the batch becomes a downgrade candidate, and holding the shared lock across
   /// the deposit pins its GPU representation until publication completes. A stream borrowed from
   /// the build memory space then waits on the batch writer event and builds and replicates filters
   /// from the build keys without requiring a probe batch or a built hash table.
   ///
-  /// Other ports and join modes only route. This synchronous hook completes before this join's
-  /// immediate probe producer is scheduled. A scan target reached through an intervening join is
-  /// not gated by that edge.
+  /// Other ports and ineligible build deliveries are routed without publishing. For @c BUILD_PROBE,
+  /// this synchronous hook completes before the join's immediate probe producer is scheduled.
+  /// Other join modes and scan targets reached through an intervening join are not gated by that
+  /// edge.
   void push_data_batch_partitioned(std::string_view port_id,
                                    std::shared_ptr<::cucascade::data_batch> batch,
                                    std::size_t partition_idx) override;
