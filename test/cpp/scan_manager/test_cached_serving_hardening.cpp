@@ -1307,6 +1307,23 @@ TEST_CASE("prepare_for_processing skips the steal for masked or row-filtered spl
     REQUIRE(ro.get_current_tier() == cucascade::memory::Tier::GPU);
     REQUIRE(ro.get_data()->get_size_in_bytes() > 0);
   }
+
+  SECTION("carrier conversion pending")
+  {
+    // normalize_physical_schema allocates the cast output after materialize
+    // consumes a stolen table, so a conversion-pending split must keep the
+    // view path or an OOM in the cast could never re-enter materialize.
+    auto batch = make_host_batch(e, values);
+    sirius::op::scan::scan_operator_input split{batch};
+    split.needs_carrier_conversion = true;
+    split.prepare_for_processing(e.gpu_space, e.stream());
+    REQUIRE(split.stolen_table == nullptr);
+    // Converted in place but not stolen: materialize serves the batch's view,
+    // so a post-cast OOM retry finds the wrapper still populated.
+    auto ro = batch->to_read_only();
+    REQUIRE(ro.get_current_tier() == cucascade::memory::Tier::GPU);
+    REQUIRE(ro.get_data()->get_size_in_bytes() > 0);
+  }
 }
 
 // Compressed chunks are opaque blobs, but the carrier fold never needs to open them: the pin
