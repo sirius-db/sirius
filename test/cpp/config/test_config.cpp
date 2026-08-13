@@ -287,6 +287,34 @@ TEST_CASE("yaml reader duration parsing", "[config_opt][duration]")
   }
 }
 
+TEST_CASE("yaml reader non-negative duration parsing", "[config_opt][duration]")
+{
+  using namespace std::chrono_literals;
+
+  SECTION("rejects a negative value before target-resolution truncation")
+  {
+    auto node = YAML::Load(R"(period: "-1us")");
+    std::chrono::milliseconds period{10};
+    yaml::reader r(node);
+    REQUIRE_THROWS_WITH(r.optional("period", yaml::non_negative_duration(period)),
+                        Catch::Contains("duration must be non-negative"));
+    REQUIRE(period == 10ms);
+  }
+
+  SECTION("preserves zero and positive duration semantics")
+  {
+    auto node = YAML::Load(R"(zero: 0
+positive: "25ms")");
+    std::chrono::milliseconds zero{10};
+    std::chrono::milliseconds positive{0};
+    yaml::reader r(node);
+    r.optional("zero", yaml::non_negative_duration(zero));
+    r.optional("positive", yaml::non_negative_duration(positive));
+    REQUIRE(zero == 0ms);
+    REQUIRE(positive == 25ms);
+  }
+}
+
 TEST_CASE("yaml reader arrays", "[config_opt][array]")
 {
   auto node = YAML::Load(R"(

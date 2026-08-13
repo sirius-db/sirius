@@ -39,6 +39,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>  // for setenv/putenv
 #include <filesystem>
@@ -546,6 +547,45 @@ TEST_CASE("Sirius downgrade hysteresis accepts omitted, null, and one-sided defa
 
     sirius::sirius_config config;
     REQUIRE_NOTHROW(config.load_from_file(path));
+  }
+}
+
+TEST_CASE("Sirius downgrade monitor period rejects negatives and preserves zero disable",
+          "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+
+  for (auto const* fixture : {"invalid_downgrade_monitor_period_negative.yaml",
+                              "invalid_downgrade_monitor_period_negative_suffix.yaml",
+                              "invalid_downgrade_monitor_period_negative_submillisecond.yaml",
+                              "invalid_downgrade_monitor_period_negative_fractional.yaml"}) {
+    INFO("fixture=" << fixture);
+    auto const path = data_dir / fixture;
+    REQUIRE(fs::is_regular_file(path));
+
+    sirius::sirius_config config;
+    REQUIRE_THROWS_WITH(
+      config.load_from_file(path),
+      Catch::Contains("downgrade.monitor_period") && Catch::Contains("non-negative"));
+  }
+
+  struct valid_config {
+    const char* fixture;
+    std::chrono::milliseconds expected;
+  };
+  for (auto const& valid : {
+         valid_config{"valid_downgrade_monitor_period_zero.yaml", std::chrono::milliseconds{0}},
+         valid_config{"valid_downgrade_monitor_period_positive.yaml",
+                      std::chrono::milliseconds{25}},
+       }) {
+    INFO("fixture=" << valid.fixture);
+    auto const path = data_dir / valid.fixture;
+    REQUIRE(fs::is_regular_file(path));
+
+    sirius::sirius_config config;
+    REQUIRE_NOTHROW(config.load_from_file(path));
+    REQUIRE(config.get_downgrade_executor_config().monitor_period == valid.expected);
   }
 }
 

@@ -278,6 +278,38 @@ void read_yaml(const YAML::Node& node, std::chrono::duration<Rep, Period>& out)
   }
 }
 
+/// Wrapper that rejects negative durations before casting to the target resolution.
+/// This avoids a negative sub-unit value (for example, -1us into milliseconds)
+/// truncating to zero before validation.
+template <typename Duration>
+struct non_negative_duration_value {
+  Duration& ref;
+};
+
+template <typename Rep, typename Period>
+non_negative_duration_value<std::chrono::duration<Rep, Period>> non_negative_duration(
+  std::chrono::duration<Rep, Period>& value)
+{
+  return {value};
+}
+
+template <typename Rep, typename Period>
+void read_yaml(const YAML::Node& node,
+               non_negative_duration_value<std::chrono::duration<Rep, Period>>& out)
+{
+  using target = std::chrono::duration<Rep, Period>;
+  try {
+    auto const count = node.as<Rep>();
+    if (count < Rep{0}) { throw std::runtime_error("duration must be non-negative"); }
+    out.ref = target{count};
+  } catch (const YAML::BadConversion&) {
+    auto const scalar = node.as<std::string>();
+    auto const parsed = parse_duration(scalar);
+    if (std::stod(scalar) < 0.0) { throw std::runtime_error("duration must be non-negative"); }
+    out.ref = std::chrono::duration_cast<target>(parsed);
+  }
+}
+
 template <StringEnum T>
 void read_yaml(const YAML::Node& node, T& out)
 {

@@ -1,0 +1,4 @@
+sirius:
+  executor:
+    downgrade:
+      monitor_period: 0
