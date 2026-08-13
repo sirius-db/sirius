@@ -304,7 +304,13 @@ static void from_yaml(const YAML::Node& node, telemetry_config& opt)
     throw std::runtime_error("'telemetry.exporter': must be one of ndjson, msgpack, postcard");
   }
   r.optional("output_directory", opt.output_directory);
+  if (opt.output_directory.empty()) {
+    throw std::runtime_error("'telemetry.output_directory': must not be empty");
+  }
   r.optional("engine_name", opt.engine_name);
+  if (opt.engine_name.empty()) {
+    throw std::runtime_error("'telemetry.engine_name': must not be empty");
+  }
   r.reject_unknown();
 }
 

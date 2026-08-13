@@ -384,6 +384,23 @@ TEST_CASE("Sirius configuration validates telemetry exporters before initializat
   }
 }
 
+TEST_CASE("Sirius configuration rejects empty telemetry destination and identity",
+          "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+
+  for (auto const& [field, fixture] : std::array<std::pair<const char*, const char*>, 2>{{
+         {"output_directory", "invalid_telemetry_output_directory_empty.yaml"},
+         {"engine_name", "invalid_telemetry_engine_name_empty.yaml"},
+       }}) {
+    sirius::sirius_config config;
+    REQUIRE_THROWS_WITH(
+      config.load_from_file(data_dir / fixture),
+      Catch::Contains("telemetry." + std::string(field)) && Catch::Contains("must not be empty"));
+  }
+}
+
 TEST_CASE("Sirius configuration rejects negative host capacity bytes", "[sirius][config]")
 {
   std::source_location loc = std::source_location::current();

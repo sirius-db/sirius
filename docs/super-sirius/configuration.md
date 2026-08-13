@@ -435,8 +435,8 @@ sirius:
 |-----|------|---------|-------------|
 | `enable_quent` | bool | true | Emit Quent telemetry using the configured exporter. When false, telemetry uses the noop exporter. |
 | `exporter` | string | `ndjson` | Quent filesystem exporter: `ndjson`, `msgpack`, or `postcard`. |
-| `output_directory` | string | `telemetry_data` | Directory for Quent telemetry files. |
-| `engine_name` | string | `siriusDB` | Engine name reported in engine-level telemetry. |
+| `output_directory` | non-empty string | `telemetry_data` | Directory for Quent telemetry files. |
+| `engine_name` | non-empty string | `siriusDB` | Engine name reported in engine-level telemetry. |
 
 Per-query labels are configured separately from YAML. They can be set with the
 `sirius_set_query_label` SQL function or inline with the `query_label` named
