@@ -153,32 +153,4 @@ bool launch_masked_char_copy(void const* chars,
                              void* out_chars,
                              rmm::cuda_stream_view stream);
 
-/// Pair-ballot comparison op codes (kernel parameter, applied as `a OP b`).
-enum class pair_cmp : std::int32_t { lt = 0, le = 1, gt = 2, ge = 3 };
-
-/// Pair ballot: two-column fused pair-predicate mask for two Bitpack-leaf
-/// columns
-/// of the same table.  Decodes both columns in-chunk and ballots
-/// `a OP b [&& a in range_a && b in range_b]` into ``mask.words`` (same
-/// layout/contract as launch_decode_fused_tree_mask_out).  The columns
-/// MUST share chunk geometry — verified here via the two chunk_count
-/// channel lengths; mismatch returns false.  ``labeled_b`` is re-keyed
-/// internally to node 1; both maps get their transients synthesized.  Pass
-/// ``range_a``/``range_b`` = {INT64_MIN, INT64_MAX} when a column has no
-/// constant range (defaulted).  A multi-pair conjunction is one launch per
-/// pair term, AND-ed by the combine wave.
-bool launch_decode_fused_tree_pair_mask_out(
-  codegen::jit::FusedTree const& tree_a,
-  codegen::jit::LabeledBuffers& labeled_a,
-  char const* dtype_a,
-  codegen::jit::FusedTree const& tree_b,
-  codegen::jit::LabeledBuffers& labeled_b,
-  char const* dtype_b,
-  std::int64_t num_rows,
-  pair_cmp op,
-  ::sirius::codegen::selection_mask& mask,
-  rmm::cuda_stream_view stream,
-  ::sirius::codegen::range_predicate range_a = {INT64_MIN, INT64_MAX},
-  ::sirius::codegen::range_predicate range_b = {INT64_MIN, INT64_MAX});
-
 }  // namespace simpatico

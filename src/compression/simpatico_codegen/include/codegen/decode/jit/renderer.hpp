@@ -161,7 +161,6 @@ enum class Enumerator : std::uint8_t {
 enum class Consumer : std::uint8_t {
   write_column = 0,  ///< store the reconstructed value
   ballot_range,      ///< 1 tree: compare against [lo,hi], ballot to mask words
-  ballot_pair,       ///< 2 trees: `a OP b` + optional per-side ranges
   dict_gather,       ///< copy the code's fixed-width key bytes to compacted chars
   offsets_meta,      ///< emit survivor {source char offset, length}
 };
@@ -176,18 +175,16 @@ struct DecodeShape {
 // per point.
 inline constexpr DecodeShape kShapePlain{Enumerator::all_rows, Consumer::write_column};
 inline constexpr DecodeShape kShapeMaskOut{Enumerator::all_rows, Consumer::ballot_range};
-inline constexpr DecodeShape kShapePairMask{Enumerator::all_rows, Consumer::ballot_pair};
 inline constexpr DecodeShape kShapeMaskConsume{Enumerator::mask_bits, Consumer::write_column};
 inline constexpr DecodeShape kShapeIndexConsume{Enumerator::index_list, Consumer::write_column};
 inline constexpr DecodeShape kShapeDictGather{Enumerator::mask_bits, Consumer::dict_gather};
 inline constexpr DecodeShape kShapeStrSplitMeta{Enumerator::mask_bits, Consumer::offsets_meta};
 
 /// False for product points with no meaning or no renderer support — e.g.
-/// re-ballotting only the survivors of an existing mask, or a 2-tree predicate
-/// under a compacting enumerator.  Render rejects these rather than emitting
-/// something plausible; the combinations that ARE meaningful but unbuilt
-/// (index_list x dict_gather / offsets_meta) are listed as false here until
-/// their emitters land.
+/// re-ballotting only the survivors of an existing mask.  Render rejects these
+/// rather than emitting something plausible; the combinations that ARE
+/// meaningful but unbuilt (index_list x dict_gather / offsets_meta) are listed
+/// as false here until their emitters land.
 [[nodiscard]] bool shape_is_supported(DecodeShape shape);
 
 // One decode-input channel the rendered kernel reads.  `field` is the
@@ -221,12 +218,7 @@ enum class TrailingParam : std::uint8_t {
   key_width,      // mask_dict_gather: bytes per key
   row_indices,    // index_consume: ascending global int32 survivor row ids
   len_out,        // str_split_meta: per-survivor byte lengths (output)
-  cmp_op,         // pair mask: comparison op code (0 '<', 1 '<=', 2 '>', 3 '>=')
-  lo_a,           // pair mask: column A inclusive range
-  hi_a,
-  lo_b,  // pair mask: column B inclusive range
-  hi_b,
-  kCount  // sentinel: size of a tag-indexed table
+  kCount          // sentinel: size of a tag-indexed table
 };
 
 // Rendering result.  Move-only; cheap (no GPU resources).  Hand
@@ -273,23 +265,5 @@ DecodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
                         const std::string& element_dtype,
                         std::int32_t num_chunks,
                         DecodeShape shape = kShapePlain);
-
-// Pair ballot: two-column pair-predicate mask (`a OP b`, optionally AND-ed
-// with per-column constant ranges) for two Bitpack-LEAF columns of the SAME
-// table (identical chunk geometry — the launcher must verify chunk_count
-// match).  One kernel decodes both columns in-chunk and ballots the
-// combined predicate into selection-mask words (same layout as mask_out).
-// The comparison op ({<,<=,>,>=} as an int32 code) and all four range
-// bounds are KERNEL PARAMETERS — one compile per (dtype_a, dtype_b) covers
-// every op/literal (cache keyed by variant + arity, not constants).
-// Column A binds as node 0, column B as node 1 in `buffers` (the launcher
-// re-keys B's LabeledBuffers "0.*" -> "1.*").  Trailing params:
-// `uint32_t* sel_mask, int64_t n, int32_t cmp_op, int64_t lo_a, int64_t
-// hi_a, int64_t lo_b, int64_t hi_b`; cmp_op: 0 '<', 1 '<=', 2 '>', 3 '>='.
-DecodeKernelSpec render_pair_mask(const ::codegen::jit::FusedTree& tree_a,
-                                  const std::string& dtype_a,
-                                  const ::codegen::jit::FusedTree& tree_b,
-                                  const std::string& dtype_b,
-                                  std::int32_t num_chunks);
 
 }  // namespace codegen::decode::jit

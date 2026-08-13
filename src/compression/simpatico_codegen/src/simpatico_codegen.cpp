@@ -354,14 +354,6 @@ std::unique_ptr<cudf::table> decompress_columns_parallel(compressed_table const&
 // switch: set SIRIUS_EXP_FUSED_SCAN_K4_MAX_SEL to a tiny value (the parse
 // requires > 0).
 
-// Column-vs-column conjuncts enter wave 1 through the pair ballot render (one
-// kernel, two bitpack regions, comparison ballot plus each side's constant
-// range as kernel params) behind the binding wrapper
-// decompress_column_pair_selection_mask (plan_interpreter.hpp); the wrapper
-// re-verifies chunk geometry and refuses eq/ne (the render covers lt/le/gt/ge
-// only), mirrored in the preconditions below. Tested but unreached until a
-// caller harvests pair directives from its filter expression.
-
 // Wave 1 and the compact-capability probe come from the entry points published
 // in plan/decompress.cpp: probe_column + decompress_column_selection_mask. Wave 2 calls
 // decompress_column(..., decode_selection const* sel) — compact_capable decodes to survivor width,
@@ -430,12 +422,11 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
   };
   if (!sc::decode_filtering_enabled()) return refuse("env gate off");
   size_t const k_range = request.filters.size();
-  size_t const k_pair  = request.pair_filters.size();
   size_t const k_bool8 = request.bool8_filters.size();
   // Membership cap (drop-tail, sound — see max_membership_sources).
   size_t const k_member =
     std::min(request.membership_filters.size(), sc::decode_max_membership_sources());
-  size_t const k_total     = k_range + k_pair + k_bool8 + k_member;
+  size_t const k_total     = k_range + k_bool8 + k_member;
   result.source_generation = request.source_generation;  // echoed on every outcome
   if (k_member < request.membership_filters.size() && sc::decode_diag_enabled()) {
     std::fprintf(stderr,
@@ -444,8 +435,8 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
                  request.membership_filters.size(),
                  k_member);
   }
-  if (k_total == 0) return refuse("no mask directives (no range/pair/bool8/membership)");
-  if (k_total > 8) return refuse("more than 8 mask sources (a pair counts once)");
+  if (k_total == 0) return refuse("no mask directives (no range/bool8/membership)");
+  if (k_total > 8) return refuse("more than 8 mask sources");
   if (request.routes.size() != selected.size())
     return refuse("request.routes not parallel to selected");
   if (pool.streams.empty()) return refuse("stream pool empty");
@@ -467,24 +458,6 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     // a range source would be a latent wrong-mask gate.
     if (!probe_column(*table.columns[selected[f.column]].plan_tree).can_produce_mask())
       return refuse("filter column plan is not a bitpack-rooted range source");
-  }
-  for (auto const& p : request.pair_filters) {
-    if (p.column_a >= selected.size() || p.column_b >= selected.size())
-      return refuse("pair directive column out of range");
-    if (p.column_a == p.column_b) return refuse("pair directive compares a column to itself");
-    if (p.pred.op == sc::pair_compare_op::eq || p.pred.op == sc::pair_compare_op::ne)
-      return refuse("pair op eq/ne is not rendered (the caller must not emit them)");
-    if (p.pred.range_a.lo > p.pred.range_a.hi || p.pred.range_b.lo > p.pred.range_b.hi)
-      return refuse("pair directive with an empty range on one side");
-    // Both sides must be bitpack roots: over the batch's shared num_rows that
-    // fixes both to the identical 1024-row chunk geometry (the ONLY mismatch
-    // vector is a nested/parented bitpack, which probes as a different route).
-    // The
-    // caller should have dropped such a conjunct (clearing whole-filter
-    // coverage); if one leaks through, refusing the batch is never wrong.
-    if (!probe_column(*table.columns[selected[p.column_a]].plan_tree).can_produce_mask() ||
-        !probe_column(*table.columns[selected[p.column_b]].plan_tree).can_produce_mask())
-      return refuse("pair column not a bitpack root (chunk-geometry mismatch class)");
   }
   for (auto const& b : request.bool8_filters) {
     if (b.column >= selected.size()) return refuse("bool8 directive column out of range");
@@ -528,12 +501,6 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
   std::vector<sc::decode_route> routes(request.routes.begin(), request.routes.end());
   for (auto const& f : request.filters)
     routes[f.column] = sc::decode_route::bitpack_mask;
-  for (auto const& p : request.pair_filters) {
-    // Pair-source columns are probe-verified bitpack roots (above) — same
-    // exemption as range sources.
-    routes[p.column_a] = sc::decode_route::bitpack_mask;
-    routes[p.column_b] = sc::decode_route::bitpack_mask;
-  }
   for (size_t i = 0; i < selected.size(); ++i) {
     if (is_bool8_slot[i]) continue;  // the slot's output is the compacted BOOL8 answer
     // `full` is always available — every plan decodes full width, and the
@@ -548,8 +515,7 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
   }
 
   if (sc::decode_diag_enabled()) {
-    static constexpr char const* kOpNames[] = {"<", "<=", ">", ">=", "==", "!="};
-    std::string line                        = "simpatico: filtered decode wave-1 sources:";
+    std::string line = "simpatico: filtered decode wave-1 sources:";
     for (auto const& f : request.filters) {
       line += f.dynamic ? " range*(col " : " range(col ";
       line += std::to_string(f.column) + " [" + std::to_string(f.pred.lo) + "," +
@@ -557,11 +523,6 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     }
     for (size_t mi = 0; mi < k_member; ++mi) {
       line += " member(col " + std::to_string(request.membership_filters[mi].column) + ")";
-    }
-    for (auto const& p : request.pair_filters) {
-      line += " pair(col " + std::to_string(p.column_a) + " " +
-              kOpNames[static_cast<uint8_t>(p.pred.op) < 6 ? static_cast<uint8_t>(p.pred.op) : 0] +
-              " col " + std::to_string(p.column_b) + ")";
     }
     for (auto const& b : request.bool8_filters) {
       line += " bool8(col " + std::to_string(b.column) + " eq#" +
@@ -637,45 +598,32 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
         }
       });
     }
-    for (size_t p = 0; p < k_pair; ++p) {
-      submit_mask_source(k_range + p, [&](std::uint32_t* dst, rmm::cuda_stream_view stream) {
-        auto const& directive = request.pair_filters[p];
-        auto const& col_a     = table.columns[selected[directive.column_a]];
-        auto const& col_b     = table.columns[selected[directive.column_b]];
-        std::string err;
-        if (!decompress_column_pair_selection_mask(
-              *col_a.plan_tree, *col_b.plan_tree, directive.pred, dst, stream, mr, &err)) {
-          throw plan_error(err.empty() ? "filtered decode: pair ballot failed" : err);
-        }
-      });
-    }
     for (size_t b = 0; b < k_bool8; ++b) {
-      submit_mask_source(
-        k_range + k_pair + b, [&](std::uint32_t* dst, rmm::cuda_stream_view stream) {
-          auto const& directive = request.bool8_filters[b];
-          auto const& col       = table.columns[selected[directive.column]];
-          decode_predicate pred;
-          pred.equals_any = directive.equals_any;
-          std::string err;
-          auto flags = decompress_column(*col.plan_tree, stream, mr, &err, &pred);
-          if (!flags)
-            throw plan_error(err.empty() ? "filtered decode: bool8 predicate decode failed" : err);
-          if (flags->type().id() != cudf::type_id::BOOL8 || flags->size() != num_rows)
-            throw plan_error("filtered decode: bool8 predicate result shape mismatch");
-          if (flags->null_count() != 0)
-            throw plan_error("filtered decode: null-masked bool8 predicate result");
-          sc::mask_from_bool8(flags->view().data<std::uint8_t>(), num_rows, dst, stream);
-          // Keep the full-width BOOL8 alive — wave 2 gathers it at this
-          // directive's slot (compacted BOOL8, 1 B/row) instead of decoding the
-          // column's values. Contents are settled before wave-2
-          // submission (the adapter kernel follows the fill on this stream, and
-          // the CNT host sync transitively covers it via the join event).
-          bool8_full[b] = std::move(flags);
-        });
+      submit_mask_source(k_range + b, [&](std::uint32_t* dst, rmm::cuda_stream_view stream) {
+        auto const& directive = request.bool8_filters[b];
+        auto const& col       = table.columns[selected[directive.column]];
+        decode_predicate pred;
+        pred.equals_any = directive.equals_any;
+        std::string err;
+        auto flags = decompress_column(*col.plan_tree, stream, mr, &err, &pred);
+        if (!flags)
+          throw plan_error(err.empty() ? "filtered decode: bool8 predicate decode failed" : err);
+        if (flags->type().id() != cudf::type_id::BOOL8 || flags->size() != num_rows)
+          throw plan_error("filtered decode: bool8 predicate result shape mismatch");
+        if (flags->null_count() != 0)
+          throw plan_error("filtered decode: null-masked bool8 predicate result");
+        sc::mask_from_bool8(flags->view().data<std::uint8_t>(), num_rows, dst, stream);
+        // Keep the full-width BOOL8 alive — wave 2 gathers it at this
+        // directive's slot (compacted BOOL8, 1 B/row) instead of decoding the
+        // column's values. Contents are settled before wave-2
+        // submission (the adapter kernel follows the fill on this stream, and
+        // the CNT host sync transitively covers it via the join event).
+        bool8_full[b] = std::move(flags);
+      });
     }
     for (size_t m = 0; m < k_member; ++m) {
       submit_mask_source(
-        k_range + k_pair + k_bool8 + m, [&](std::uint32_t* dst, rmm::cuda_stream_view stream) {
+        k_range + k_bool8 + m, [&](std::uint32_t* dst, rmm::cuda_stream_view stream) {
           auto const& directive = request.membership_filters[m];
           auto const& col       = table.columns[selected[directive.column]];
           std::string err;
@@ -1074,18 +1022,17 @@ std::unique_ptr<cudf::table> decompress_scan_filter(
         n_str_split += t == sirius::codegen::decode_route::str_split;
         n_b += t == sirius::codegen::decode_route::full;
       }
-      std::fprintf(
-        stderr,
-        "simpatico: filtered decode applied: survivors=%lld/%lld "
-        "routes bitpack=%d delta=%d dict=%d str_split=%d full=%d sources=%zu\n",
-        static_cast<long long>(result.survivor_count),
-        static_cast<long long>(result.num_rows),
-        n_a,
-        n_delta,
-        n_dict,
-        n_str_split,
-        n_b,
-        request.filters.size() + request.pair_filters.size() + request.bool8_filters.size());
+      std::fprintf(stderr,
+                   "simpatico: filtered decode applied: survivors=%lld/%lld "
+                   "routes bitpack=%d delta=%d dict=%d str_split=%d full=%d sources=%zu\n",
+                   static_cast<long long>(result.survivor_count),
+                   static_cast<long long>(result.num_rows),
+                   n_a,
+                   n_delta,
+                   n_dict,
+                   n_str_split,
+                   n_b,
+                   request.filters.size() + request.bool8_filters.size());
     }
     // Reconcile the wave's ragged output into one uniformly survivor-sized
     // table before it leaves: the compacted routes came back survivor-sized and

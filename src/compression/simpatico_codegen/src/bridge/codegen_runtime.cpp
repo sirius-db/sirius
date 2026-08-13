@@ -466,11 +466,6 @@ struct VariantLaunchArgs {
   std::int32_t key_width    = 0;  // mask_dict_gather: bytes per key
   CUdeviceptr row_indices   = 0;  // index_consume: ascending global int32 row ids
   CUdeviceptr len_out       = 0;  // str_split_meta: per-survivor byte lengths (output)
-  std::int32_t cmp_op       = 0;  // pair mask: 0 '<', 1 '<=', 2 '>', 3 '>='
-  std::int64_t lo_a         = 0;  // pair mask: column A inclusive range
-  std::int64_t hi_a         = 0;
-  std::int64_t lo_b         = 0;  // pair mask: column B inclusive range
-  std::int64_t hi_b         = 0;
 };
 
 // Per-variant launch preconditions, checked in ONE place with ONE diagnostic.
@@ -504,7 +499,6 @@ VariantContract variant_contract(cdj::DecodeShape shape)
   switch (shape.consumer) {
     case cdj::Consumer::write_column: c.out = true; break;
     case cdj::Consumer::ballot_range:
-    case cdj::Consumer::ballot_pair:
       // The `out` slot carries the mask words, so it is checked as sel_mask.
       // Integer-domain compare only: floats decode bit-reinterpreted.
       c.sel_mask      = true;
@@ -579,24 +573,19 @@ bool check_variant_contract(const VariantLaunchArgs& va,
 // only has to say where each tag's value lives, and the two lists cannot
 // disagree.  Must outlive the cuLaunchKernel call (args holds pointers into it).
 struct TrailingArgStorage {
-  std::int64_t pred_lo, pred_hi, lo_a, hi_a, lo_b, hi_b;
+  std::int64_t pred_lo, pred_hi;
   CUdeviceptr sel_mask, chunk_offsets, keys_chars, row_indices, len_out;
-  std::int32_t key_width, cmp_op;
+  std::int32_t key_width;
 
   explicit TrailingArgStorage(const VariantLaunchArgs& va)
     : pred_lo(va.pred_lo),
       pred_hi(va.pred_hi),
-      lo_a(va.lo_a),
-      hi_a(va.hi_a),
-      lo_b(va.lo_b),
-      hi_b(va.hi_b),
       sel_mask(va.sel_mask),
       chunk_offsets(va.chunk_offsets),
       keys_chars(va.keys_chars),
       row_indices(va.row_indices),
       len_out(va.len_out),
-      key_width(va.key_width),
-      cmp_op(va.cmp_op)
+      key_width(va.key_width)
   {
   }
 
@@ -617,11 +606,6 @@ struct TrailingArgStorage {
     slot[static_cast<std::size_t>(TP::key_width)]                    = &key_width;
     slot[static_cast<std::size_t>(TP::row_indices)]                  = &row_indices;
     slot[static_cast<std::size_t>(TP::len_out)]                      = &len_out;
-    slot[static_cast<std::size_t>(TP::cmp_op)]                       = &cmp_op;
-    slot[static_cast<std::size_t>(TP::lo_a)]                         = &lo_a;
-    slot[static_cast<std::size_t>(TP::hi_a)]                         = &hi_a;
-    slot[static_cast<std::size_t>(TP::lo_b)]                         = &lo_b;
-    slot[static_cast<std::size_t>(TP::hi_b)]                         = &hi_b;
 
     for (const auto tag : trailing) {
       const auto idx = static_cast<std::size_t>(tag);
@@ -646,12 +630,10 @@ struct TrailingArgStorage {
 // variant's trailing params).  For mask_out, ``out_ptr`` carries the
 // selection-mask words pointer (no column output exists).
 // Bind a rendered spec's buffers, append (out, n) + the trailing args, and
-// launch.  Shared by the single-tree and pair paths so BOTH get the per-chunk
-// metadata bounds guard below — the pair path previously open-coded this
-// sequence and omitted the guard entirely.
+// launch, under the per-chunk metadata bounds guard below.
 //
-// `labeled` must already contain every channel the spec names (for the pair
-// path: the merged, re-keyed map).  `ctx` prefixes diagnostics.
+// `labeled` must already contain every channel the spec names.  `ctx` prefixes
+// diagnostics.
 int launch_rendered_spec(const cdj::DecodeKernelSpec& spec,
                          const jit::CompiledKernel& kernel,
                          const jit::LabeledBuffers& labeled,
@@ -1059,145 +1041,6 @@ bool launch_masked_char_copy(void const* chars,
   SIMPATICO_CUDA_CHECK(
     cudaStreamSynchronize(stream.value()), false, "masked char copy: stream sync failed");
   return true;
-}
-
-// Pair ballot: two-column pair-predicate mask (masked_launch.hpp).
-bool launch_decode_fused_tree_pair_mask_out(codegen::jit::FusedTree const& tree_a,
-                                            codegen::jit::LabeledBuffers& labeled_a,
-                                            char const* dtype_a,
-                                            codegen::jit::FusedTree const& tree_b,
-                                            codegen::jit::LabeledBuffers& labeled_b,
-                                            char const* dtype_b,
-                                            std::int64_t num_rows,
-                                            pair_cmp op,
-                                            ::sirius::codegen::selection_mask& mask,
-                                            rmm::cuda_stream_view stream,
-                                            ::sirius::codegen::range_predicate range_a,
-                                            ::sirius::codegen::range_predicate range_b)
-{
-  try {
-    if (mask.words == nullptr || mask.num_rows != num_rows) {
-      std::fprintf(stderr,
-                   "simpatico::codegen: pair_mask_out: selection_mask not allocated for "
-                   "num_rows=%lld (mask.num_rows=%lld, words=%p)\n",
-                   static_cast<long long>(num_rows),
-                   static_cast<long long>(mask.num_rows),
-                   static_cast<void*>(mask.words));
-      return false;
-    }
-    for (const char* dt : {dtype_a, dtype_b}) {
-      if (dt != nullptr && (std::strcmp(dt, "float32") == 0 || std::strcmp(dt, "float64") == 0)) {
-        std::fprintf(
-          stderr, "simpatico::codegen: pair_mask_out: float dtype '%s' not supported\n", dt);
-        return false;
-      }
-    }
-    const char* cxx_a = dtype_to_cxx(dtype_a);
-    const char* cxx_b = dtype_to_cxx(dtype_b);
-    if (cxx_a == nullptr || cxx_b == nullptr) {
-      std::fprintf(stderr,
-                   "simpatico::codegen: pair_mask_out: unsupported dtype '%s'/'%s'\n",
-                   dtype_a ? dtype_a : "(null)",
-                   dtype_b ? dtype_b : "(null)");
-      return false;
-    }
-
-    // Same-table guarantee check: identical chunk geometry (chunk_count
-    // channels must exist and agree in length).
-    auto cc_a = labeled_a.find(jit::buffer_key(0, "chunk_count"));
-    auto cc_b = labeled_b.find(jit::buffer_key(0, "chunk_count"));
-    if (cc_a == labeled_a.end() || cc_b == labeled_b.end() ||
-        cc_a->second.length != cc_b->second.length) {
-      std::fprintf(stderr,
-                   "simpatico::codegen: pair_mask_out: chunk geometry mismatch (a=%zu b=%zu "
-                   "chunks) — pair predicates need same-table columns\n",
-                   cc_a != labeled_a.end() ? cc_a->second.length : 0,
-                   cc_b != labeled_b.end() ? cc_b->second.length : 0);
-      return false;
-    }
-
-    const std::int32_t num_chunks = static_cast<std::int32_t>(
-      std::max<std::int64_t>(1, (num_rows + kChunkSize - 1) / kChunkSize));
-
-    // Transients (bp_offsets) for both columns, kept alive until launch.
-    rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref();
-    std::vector<rmm::device_buffer> transients;
-    transients.reserve(8);
-    auto alloc = [&](std::size_t bytes) -> CUdeviceptr {
-      transients.emplace_back(bytes, stream, mr);
-      return reinterpret_cast<CUdeviceptr>(transients.back().data());
-    };
-    auto elem_size_of = [](const char* cxx) -> std::size_t {
-      return (std::strcmp(cxx, "int64_t") == 0)   ? 8u
-             : (std::strcmp(cxx, "int16_t") == 0) ? 2u
-             : (std::strcmp(cxx, "int8_t") == 0)  ? 1u
-                                                  : 4u;
-    };
-    std::string err;
-    if (!synthesize_decode_transients(
-          tree_a, elem_size_of(cxx_a), alloc, stream.value(), labeled_a, &err) ||
-        !synthesize_decode_transients(
-          tree_b, elem_size_of(cxx_b), alloc, stream.value(), labeled_b, &err)) {
-      std::fprintf(
-        stderr, "simpatico::codegen: pair_mask_out: transient synth failed: %s\n", err.c_str());
-      return false;
-    }
-
-    // Merged binding map: column A stays node 0; column B re-keys "0.*" -> "1.*".
-    jit::LabeledBuffers merged = labeled_a;
-    for (const auto& [key, buf] : labeled_b) {
-      if (key.rfind("0.", 0) == 0) { merged["1." + key.substr(2)] = buf; }
-    }
-
-    cdj::DecodeKernelSpec spec;
-    try {
-      spec = cdj::render_pair_mask(tree_a, cxx_a, tree_b, cxx_b, num_chunks);
-    } catch (const cdj::RenderError& e) {
-      std::fprintf(
-        stderr, "simpatico::codegen: pair_mask_out: render rejected shape: %s\n", e.what());
-      return false;
-    }
-    const jit::CompiledKernel* kernel = compile_rendered(spec.source,
-                                                         spec.entry_symbol,
-                                                         /*default_device=*/true,
-                                                         "CODEGEN_JIT_DUMP_DECODE_SOURCE",
-                                                         "pair mask");
-    if (kernel == nullptr) { return false; }
-
-    // Same bind/guard/launch as the single-tree path — including the per-chunk
-    // metadata bounds guard this path previously lacked. `out` is the mask
-    // words; the predicate travels as tag-bound trailing args in the
-    // renderer's order.
-    VariantLaunchArgs va;
-    va.cmp_op = static_cast<std::int32_t>(op);
-    va.lo_a   = range_a.lo;
-    va.hi_a   = range_a.hi;
-    va.lo_b   = range_b.lo;
-    va.hi_b   = range_b.hi;
-    return launch_rendered_spec(
-             spec,
-             *kernel,
-             merged,
-             num_rows,
-             num_chunks,
-             reinterpret_cast<std::uintptr_t>(mask.words),
-             reinterpret_cast<std::uintptr_t>(stream.value()),
-             [](const char*) {},
-             va,
-             "pair mask") == 1;
-  } catch (const jit::CompileError& e) {
-    std::fprintf(stderr,
-                 "simpatico::codegen: pair_mask_out: CompileError: %s\n--- log ---\n%s\n",
-                 e.what(),
-                 e.log.c_str());
-    return false;
-  } catch (const std::exception& e) {
-    std::fprintf(stderr, "simpatico::codegen: pair_mask_out: %s\n", e.what());
-    return false;
-  } catch (...) {
-    std::fprintf(stderr, "simpatico::codegen: pair_mask_out: unknown exception\n");
-    return false;
-  }
 }
 
 // Dictionary gather: masked constant-width gather (masked_launch.hpp).

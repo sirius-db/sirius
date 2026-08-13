@@ -156,28 +156,6 @@ int main()
     }
   }
 
-  // The pair (K1m2) signature goes through its own finalize path; it must obey
-  // the same contract, with both columns' channels bound before (out, n).
-  {
-    auto a = jit::FusedTree::make(OpKind::Bitpack);
-    auto b = jit::FusedTree::make(OpKind::Bitpack);
-    try {
-      const cdj::DecodeKernelSpec spec =
-        cdj::render_pair_mask(*a, "int32_t", *b, "int32_t", /*num_chunks=*/7);
-      const std::size_t declared = count_declared_params(spec.source, spec.entry_symbol);
-      const std::size_t expected = spec.buffers.size() + 2 + spec.trailing.size();
-      CHECK(declared == expected,
-            "[pair] rendered signature declares %zu parameters but the spec describes %zu",
-            declared,
-            expected);
-      CHECK(spec.trailing.size() == 5,
-            "[pair] expected 5 trailing parameters (cmp_op + two ranges), got %zu",
-            spec.trailing.size());
-    } catch (const cdj::RenderError& e) {
-      CHECK(false, "[pair] render rejected two Bitpack leaves: %s", e.what());
-    }
-  }
-
   if (g_failures == 0) {
     std::printf(
       "PASS: rendered signature matches DecodeKernelSpec (params == buffers + 2 + "

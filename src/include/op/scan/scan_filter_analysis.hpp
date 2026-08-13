@@ -71,12 +71,6 @@ struct scan_filter_analysis {
   /// decode then filters only partially and the scan must still evaluate its
   /// own filter afterwards.
   bool ranges_cover_whole_filter = false;
-
-  /// Column-vs-column conjuncts harvested from a bound filter expression. The
-  /// indices are whatever that expression's bound references carry — for a
-  /// filter above a scan, positions in the scan's output layout — so the caller
-  /// owns mapping them onto decoded columns.
-  std::vector<sirius::column_pair_conjunct> pairs;
 };
 
 /**
@@ -100,18 +94,13 @@ struct scan_filter_analysis {
  * columns the query never projects — because answering one in place replaces
  * its values.
  *
- * @p bound_filter, when given, is additionally walked for `colA OP colB`
- * comparisons under AND, with OP in {<, <=, >, >=}. Anything else there is left
- * alone: the pairs are only ever ADDITIONAL restrictions, so under-harvesting
- * is always sound.
  */
 scan_filter_analysis analyze_scan_filters(
   const duckdb::TableFilterSet& filters,
   const duckdb::vector<duckdb::ColumnIndex>& column_ids,
   const duckdb::vector<sirius::logical_type>& returned_types,
   const std::unordered_set<std::size_t>& skip_primary_indices        = {},
-  const std::unordered_set<std::size_t>& filter_only_primary_indices = {},
-  duckdb::Expression const* bound_filter                             = nullptr);
+  const std::unordered_set<std::size_t>& filter_only_primary_indices = {});
 
 /**
  * @brief Turn @p analysis into the request one decoder can act on.
@@ -119,8 +108,7 @@ scan_filter_analysis analyze_scan_filters(
  * @p primary_index_by_slot maps each column the decode will produce onto the
  * scan's column primary index, so the request comes out parallel to that
  * column list. Analysis entries that map to no slot are dropped — a partition
- * filter, say, which is enforced elsewhere — and the pairs are carried over
- * only when both sides land on a slot.
+ * filter, say, which is enforced elsewhere.
  */
 sirius::scan_decode_request build_scan_decode_request(
   scan_filter_analysis const& analysis, std::span<const std::size_t> primary_index_by_slot);

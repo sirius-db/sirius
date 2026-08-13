@@ -533,6 +533,20 @@ silently keep the mask walk, and one batch mixes routes. Anyone measuring the en
 needs the per-column instrumentation described in §9.4 first; without it, a claim about which
 enumerator ran is an inference, and one such inference was wrong (§9.3).
 
+### Check what actually reaches the scan
+
+Three capabilities have now died to one mechanism: **DuckDB rewrites the predicate before the scan
+sees it.** A prefix LIKE arrives as two ConstantFilters (direction 3). A column-vs-column pair —
+q12's `l_commitdate < l_receiptdate` — is folded by the FilterCombiner into constant hulls, which
+is why the pair ballot was landed dark-but-tested and then DELETED here: the kernel, its launcher,
+the directives, the harvester and the plumbing were ~450 lines that no query could reach, and
+wiring the harvester up would have harvested nothing. (Recoverable from history if a workload
+turns up whose predicate the FilterCombiner cannot fold.)
+
+So before proposing anything predicate-shaped: EXPLAIN the query and look at what the scan is
+handed, not at what the SQL says. Two of these were proposed from query text and one from code
+structure; all three were dark.
+
 ### Open, cheapest first
 
 Each entry: where it lands in the code, and which TPC-H queries it touches.

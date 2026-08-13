@@ -37,13 +37,11 @@ namespace sirius {
 
 bool scan_decode_request::empty() const noexcept
 {
-  return pairs.empty() &&
-         std::all_of(columns.begin(), columns.end(), [](auto const& c) { return c.empty(); });
+  return std::all_of(columns.begin(), columns.end(), [](auto const& c) { return c.empty(); });
 }
 
 bool scan_decode_request::selects_rows() const noexcept
 {
-  if (!pairs.empty()) { return true; }
   return std::any_of(columns.begin(), columns.end(), [](auto const& c) {
     return c.range.has_value() || !c.membership.empty();
   });
@@ -77,8 +75,7 @@ struct column_capability {
   bool comparable_lane = false;
   simpatico::column_decode_caps decode;
 
-  /// True iff the column can evaluate a range or a column-vs-column comparison
-  /// while it decodes.
+  /// True iff the column can evaluate a range conjunct while it decodes.
   [[nodiscard]] bool can_select_rows() const noexcept
   {
     return comparable_lane && decode.can_produce_mask();
@@ -119,8 +116,8 @@ struct chunk_decode_plan {
     /// The scan asked for these bounds.
     bool requested = false;
     /// This chunk will evaluate them while decoding. False with @c requested
-    /// true means the conjunct was dropped from the decode (still sound — the
-    /// scan's own filter rejects those rows) or was folded into a pair.
+    /// true means the conjunct was dropped from the decode — still sound, the
+    /// scan's own filter rejects those rows.
     bool selects = false;
     decode_range bounds;
   };
@@ -132,10 +129,6 @@ struct chunk_decode_plan {
   bool covers_whole_filter = false;
   std::vector<range_slot> ranges;                     ///< parallel to selected columns
   std::vector<sirius::codegen::decode_route> routes;  ///< parallel to selected columns
-  /// Column-vs-column conjuncts both of whose sides can select rows. A kept
-  /// pair CONSUMES its sides' standalone range participation: the pair kernel
-  /// folds each side's bounds in, so one kernel does both.
-  std::vector<column_pair_conjunct> pairs;
 };
 
 /// Narrow @p request to what @p table can honour for @p selected_columns.
@@ -160,9 +153,9 @@ chunk_decode_plan plan_decode(simpatico::compressed_table const& table,
   bool const any_range = std::any_of(request.columns.begin(),
                                      request.columns.end(),
                                      [](auto const& c) { return c.range.has_value(); });
-  if (!any_range && !has_external_selection && request.pairs.empty()) {
+  if (!any_range && !has_external_selection) {
     SIRIUS_DECODE_DIAG(
-      "[decode-filter] plan: {} column entr(ies), no ranges, no in-place/pair/membership "
+      "[decode-filter] plan: {} column entr(ies), no ranges, no in-place/membership "
       "sources — plain decode",
       request.columns.size());
     return plan;
@@ -218,54 +211,17 @@ chunk_decode_plan plan_decode(simpatico::compressed_table const& table,
     ++selecting_columns;
   }
 
-  // Both sides of a pair must be able to select rows — same chunk geometry on
-  // each side. A pair that cannot be evaluated is DROPPED and clears coverage
-  // rather than being emitted wrong.
-  bool dropped_pair = false;
-  for (auto const& pair : request.pairs) {
-    bool ok = pair.column_a < count && pair.column_b < count && pair.column_a != pair.column_b;
-    if (ok) {
-      ok = probe_column(table, selected_columns[pair.column_a]).can_select_rows() &&
-           probe_column(table, selected_columns[pair.column_b]).can_select_rows();
-    }
-    if (!ok) {
-      SIRIUS_DECODE_DIAG(
-        "[decode-filter] plan: DROPPING pair conjunct (selected {} vs {}, op={}) — one side "
-        "cannot evaluate a comparison while decoding",
-        pair.column_a,
-        pair.column_b,
-        static_cast<int>(pair.op));
-      dropped_pair = true;
-      continue;
-    }
-    plan.pairs.push_back(pair);
-  }
-  for (auto const& pair : plan.pairs) {
-    for (auto const index : {pair.column_a, pair.column_b}) {
-      if (plan.ranges[index].selects) {
-        plan.ranges[index].selects = false;  // folded into the pair
-        --selecting_columns;
-      }
-    }
-  }
-
-  if (selecting_columns == 0 && plan.pairs.empty() && !has_external_selection) {
+  if (selecting_columns == 0 && !has_external_selection) {
     SIRIUS_DECODE_DIAG("[decode-filter] plan: no row-selecting source survived — plain decode");
     return {};
   }
-  plan.enabled = true;
-  // Kept pairs do not affect coverage either way: a column-vs-column conjunct
-  // lives in the FILTER operator above the scan, which runs regardless, so
-  // masking it is a pure bonus restriction. A DROPPED pair clears coverage
-  // (conservative — it costs only the ability to skip the residual filter).
+  plan.enabled             = true;
   plan.covers_whole_filter = request.ranges_cover_whole_filter && !dropped_conjunct &&
-                             !dropped_pair && (selecting_columns > 0 || !plan.pairs.empty()) &&
-                             !has_external_selection;
+                             selecting_columns > 0 && !has_external_selection;
   SIRIUS_DECODE_DIAG(
-    "[decode-filter] plan ENABLED: {} row-selecting range column(s), {} pair source(s), "
+    "[decode-filter] plan ENABLED: {} row-selecting range column(s), "
     "external_sources={}, {}/{} column(s) decode compacted, covers_whole_filter={}",
     selecting_columns,
-    plan.pairs.size(),
     has_external_selection,
     compactable,
     count,
@@ -302,19 +258,17 @@ std::vector<simpatico::decode_predicate> to_decode_predicates(scan_decode_reques
 /// list means the source count, the cap and the ordering are each computed
 /// once, rather than per kind with rules that can drift apart.
 struct selection_source {
-  enum class kind : std::uint8_t { range, pair, equality, membership };
+  enum class kind : std::uint8_t { range, equality, membership };
 
   kind what                     = kind::range;
-  std::size_t column            = 0;        ///< the source column; @c column_a for a pair
-  std::size_t column_b          = 0;        ///< pairs only
+  std::size_t column            = 0;        ///< the source column
   membership_probe const* probe = nullptr;  ///< membership only
-  column_compare_op op          = column_compare_op::lt;  ///< pairs only
 
   /// Ascending EXPECTED keep-rate: the scarce mask slots go to the strongest
   /// source first, regardless of kind.
   ///
   /// Only the join filters carry a real signal (their kind rank, then the
-  /// build-side key count). A range, pair or equality conjunct has no
+  /// build-side key count). A range or equality conjunct has no
   /// statistics behind it, but it is exact and costs no probe launch, so it
   /// sorts ahead of every join filter and otherwise keeps request order — the
   /// same order they were emitted in before this list existed.
@@ -357,21 +311,16 @@ std::unique_ptr<cudf::table> decode_with_filters(simpatico::compressed_table con
       sources.push_back({selection_source::kind::equality, i});
     }
     for (auto const& probe : request.columns[i].membership) {
-      sources.push_back({selection_source::kind::membership, i, 0, &probe});
+      sources.push_back({selection_source::kind::membership, i, &probe});
     }
   }
 
   auto const plan = plan_decode(chunk, selected, request, !sources.empty());
   if (!plan.enabled) { return nullptr; }
 
-  // Then the conjuncts planning just decided this chunk can evaluate. A pair
-  // counts once: one kernel, one mask buffer, both sides' bounds folded in.
+  // Then the conjuncts planning just decided this chunk can evaluate.
   for (std::size_t i = 0; i < plan.ranges.size(); ++i) {
     if (plan.ranges[i].selects) { sources.push_back({selection_source::kind::range, i}); }
-  }
-  for (auto const& pair : plan.pairs) {
-    sources.push_back(
-      {selection_source::kind::pair, pair.column_a, pair.column_b, nullptr, pair.op});
   }
 
   if (sources.size() > kMaxSelectionSources ||
@@ -401,21 +350,6 @@ std::unique_ptr<cudf::table> decode_with_filters(simpatico::compressed_table con
         auto const& slot = plan.ranges[source.column];
         wave_request.filters.push_back({source.column, {slot.bounds.lo, slot.bounds.hi}});
         order_echo += " range(c" + std::to_string(source.column) + ")";
-        break;
-      }
-      case selection_source::kind::pair: {
-        // Each side's own bounds are folded into the one kernel (a side without
-        // bounds stays full-domain); planning already cleared those sides'
-        // standalone participation.
-        sirius::codegen::pair_predicate predicate;
-        predicate.op      = static_cast<sirius::codegen::pair_compare_op>(source.op);
-        auto const& left  = plan.ranges[source.column];
-        auto const& right = plan.ranges[source.column_b];
-        if (left.requested) { predicate.range_a = {left.bounds.lo, left.bounds.hi}; }
-        if (right.requested) { predicate.range_b = {right.bounds.lo, right.bounds.hi}; }
-        wave_request.pair_filters.push_back({source.column, source.column_b, predicate});
-        order_echo +=
-          " pair(c" + std::to_string(source.column) + ",c" + std::to_string(source.column_b) + ")";
         break;
       }
       case selection_source::kind::equality:
@@ -458,14 +392,13 @@ std::unique_ptr<cudf::table> decode_with_filters(simpatico::compressed_table con
   // predicated rerun, which drops no rows.
   outcome.predicates_enforced = result.applied && !wave_request.bool8_filters.empty();
   SIRIUS_DECODE_DIAG(
-    "[decode-filter] decode {} (status={} generation={}): ranges={} pairs={} equalities={} "
+    "[decode-filter] decode {} (status={} generation={}): ranges={} equalities={} "
     "join_filters={} survivors={}/{} column(s)={} covers_whole_filter={} row_filtered={} "
     "selection_unprofitable={}",
     result.applied ? "APPLIED" : "NOT applied (plain output)",
     static_cast<int>(result.status),
     result.source_generation,
     wave_request.filters.size(),
-    wave_request.pair_filters.size(),
     wave_request.bool8_filters.size(),
     wave_request.membership_filters.size(),
     result.survivor_count,
@@ -514,7 +447,7 @@ std::shared_ptr<const compressed_scan> compressed_scan::for_chunk(
   // resolve the predicate without materialising the column (a dictionary root);
   // pushing it into any other plan is correct but only moves the comparison.
   auto narrowed  = _request;
-  bool any_asked = !narrowed.pairs.empty();
+  bool any_asked = false;
   for (std::size_t i = 0; i < narrowed.columns.size(); ++i) {
     auto& column = narrowed.columns[i];
     if (!column.equals_any.empty() &&

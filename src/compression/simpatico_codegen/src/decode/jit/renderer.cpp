@@ -170,13 +170,6 @@ const std::vector<TrailingParamDecl>& consumer_params(Consumer c)
     {TrailingParam::pred_lo, "int64_t pred_lo"},
     {TrailingParam::pred_hi, "int64_t pred_hi"},
   };
-  static const std::vector<TrailingParamDecl> kBallotPair{
-    {TrailingParam::cmp_op, "int32_t cmp_op"},
-    {TrailingParam::lo_a, "int64_t lo_a"},
-    {TrailingParam::hi_a, "int64_t hi_a"},
-    {TrailingParam::lo_b, "int64_t lo_b"},
-    {TrailingParam::hi_b, "int64_t hi_b"},
-  };
   static const std::vector<TrailingParamDecl> kDictGather{
     {TrailingParam::keys_chars, "const char* __restrict__ keys_chars"},
     {TrailingParam::key_width, "int32_t key_width"},
@@ -187,7 +180,6 @@ const std::vector<TrailingParamDecl>& consumer_params(Consumer c)
   switch (c) {
     case Consumer::write_column: return kNone;
     case Consumer::ballot_range: return kBallotRange;
-    case Consumer::ballot_pair: return kBallotPair;
     case Consumer::dict_gather: return kDictGather;
     case Consumer::offsets_meta: return kOffsetsMeta;
   }
@@ -203,7 +195,7 @@ std::string shape_symbol_suffix(DecodeShape shape)
   if (shape == kShapeDictGather) return "_mask_dict";
   if (shape == kShapeIndexConsume) return "_index_consume";
   if (shape == kShapeStrSplitMeta) return "_str_meta";
-  return "";  // kShapePlain (pair has its own symbol builder)
+  return "";  // kShapePlain
 }
 
 // The kernel's trailing parameter list: enumerator's, then consumer's.
@@ -222,8 +214,7 @@ std::string out_param_decl(Consumer c, const std::string& dtype)
 {
   switch (c) {
     // The ballot consumers write no column: the slot carries the mask words.
-    case Consumer::ballot_range:
-    case Consumer::ballot_pair: return "uint32_t* __restrict__ sel_mask";
+    case Consumer::ballot_range: return "uint32_t* __restrict__ sel_mask";
     case Consumer::dict_gather: return "char* __restrict__ out";
     case Consumer::offsets_meta: return "int64_t* __restrict__ out";
     case Consumer::write_column: break;
@@ -236,8 +227,7 @@ std::string out_param_decl(Consumer c, const std::string& dtype)
 // ---------------------------------------------------------------------
 class Walker {
  public:
-  explicit Walker(std::string root_dtype, DecodeShape shape = kShapePlain)
-    : dtype_(std::move(root_dtype)), shape_(shape)
+  Walker(std::string root_dtype, DecodeShape shape) : dtype_(std::move(root_dtype)), shape_(shape)
   {
   }
 
@@ -272,55 +262,8 @@ class Walker {
         break;
       case Consumer::dict_gather: emit_bitpack_mask_dict_gather(tree); break;
       case Consumer::offsets_meta: emit_str_split_meta(tree); break;
-      case Consumer::ballot_pair:
-        // Two-tree shape; rendered through build_pair, never here.
-        throw RenderError("decode render: ballot_pair requires the two-tree entry point");
     }
     return finalize(tree);
-  }
-
-  // Pair ballot: two-column pair-predicate mask (see render_pair_mask).
-  DecodeKernelSpec build_pair(const ::codegen::jit::FusedTree& tree_a,
-                              const ::codegen::jit::FusedTree& tree_b,
-                              const std::string& dtype_b)
-  {
-    if (&tree_a == &tree_b) {
-      throw RenderError("decode render: pair_mask requires two distinct column trees");
-    }
-    if (tree_a.op != ::codegen::OpKind::Bitpack || !tree_a.children.empty() ||
-        tree_b.op != ::codegen::OpKind::Bitpack || !tree_b.children.empty()) {
-      throw RenderError("decode render: pair_mask requires two Bitpack leaf columns");
-    }
-    assign_ids(tree_a);  // node 0 (column A)
-    assign_ids(tree_b);  // node 1 (column B)
-    ValueSource va = bitpack_value_source(tree_a, dtype_);
-    ValueSource vb = bitpack_value_source(tree_b, dtype_b);
-    // One ballot word per 32 consecutive rows, same layout as mask_out.
-    // cmp_op and all four bounds are kernel params — uniform branches, one
-    // compiled kernel per (dtype_a, dtype_b) for every op/literal.
-    body_ << "    // --- pair predicate: col0 OP col1 (+ optional ranges) -> selection mask "
-             "(pair ballot) ---\n"
-          << "    uint32_t* mask_words = sel_mask + (chunk_start >> 5);\n"
-          << "    #pragma unroll\n"
-          << "    for (int32_t j = 0; j < CHUNK / " << tbs_ << "; ++j) {\n"
-          << "        const int32_t i = j * " << tbs_ << " + tid;\n"
-          << "        bool pass = false;\n"
-          << "        if (i < len) {\n"
-          << "            const int64_t a_v = static_cast<int64_t>(" << at_pos(va.read_expr, "i")
-          << ");\n"
-          << "            const int64_t b_v = static_cast<int64_t>(" << at_pos(vb.read_expr, "i")
-          << ");\n"
-          << "            const bool cmp_ok = (cmp_op == 0)   ? (a_v < b_v)\n"
-          << "                                : (cmp_op == 1) ? (a_v <= b_v)\n"
-          << "                                : (cmp_op == 2) ? (a_v > b_v)\n"
-          << "                                                : (a_v >= b_v);\n"
-          << "            pass = cmp_ok && (a_v >= lo_a) && (a_v <= hi_a) && (b_v >= lo_b) && "
-             "(b_v <= hi_b);\n"
-          << "        }\n"
-          << "        const uint32_t ballot = __ballot_sync(0xFFFFFFFFu, pass);\n"
-          << "        if ((tid & 31) == 0) mask_words[i >> 5] = ballot;\n"
-          << "    }\n";
-    return finalize_pair(dtype_b);
   }
 
  private:
@@ -395,7 +338,6 @@ class Walker {
   void emit_generic_mask_consume(const ::codegen::jit::FusedTree& node);
   void emit_generic_mask_out(const ::codegen::jit::FusedTree& node);
   void emit_str_split_meta(const ::codegen::jit::FusedTree& node);
-  DecodeKernelSpec finalize_pair(const std::string& dtype_b);
   void emit_delta_producer(const ::codegen::jit::FusedTree& node,
                            const std::string& dst,
                            const std::string& len,
@@ -898,66 +840,6 @@ void Walker::emit_generic_mask_out(const ::codegen::jit::FusedTree& node)
         << "        if ((tid & 31) == 0) mask_words[i >> 5] = ballot;\n"
         << "    }\n";
   sm_.release_to(mark);
-}
-
-// =====================================================================
-// finalize_pair — pair-ballot signature: both columns' channels (A = node 0,
-// B = node 1, in buffers order), then the mask output and the runtime
-// predicate parameters.  Symbol carries both dtypes (arity+variant is the
-// cache axis; op/bounds are parameters).
-// =====================================================================
-DecodeKernelSpec Walker::finalize_pair(const std::string& dtype_b)
-{
-  DecodeKernelSpec spec;
-  std::string sym  = "simpatico_decode_pair_mask_";
-  auto append_sane = [&sym](const std::string& s) {
-    for (char c : s)
-      sym += (std::isalnum(static_cast<unsigned char>(c)) || c == '_') ? c : '_';
-  };
-  append_sane(dtype_);
-  sym += "_";
-  append_sane(dtype_b);
-  spec.entry_symbol = sym;
-
-  // Same single-table discipline as finalize(): declaration text and
-  // spec.trailing come from one list.
-  std::vector<std::string> decls;
-  decls.emplace_back("uint32_t* __restrict__ sel_mask");
-  decls.emplace_back("int64_t n");
-  for (const auto& tp : consumer_params(Consumer::ballot_pair)) {
-    spec.trailing.push_back(tp.tag);
-    decls.emplace_back(tp.decl);
-  }
-
-  std::ostringstream src;
-  src << kPrelude;
-  src << "\nextern \"C\" __global__\n"
-      << "void " << spec.entry_symbol << "(\n";
-  if (params_.tellp() > 0) src << params_.str() << ",\n";
-  for (std::size_t i = 0; i < decls.size(); ++i) {
-    src << "    " << decls[i] << (i + 1 < decls.size() ? ",\n" : ")\n");
-  }
-  src << "{\n"
-      << "    constexpr int32_t CHUNK = " << ::codegen::kChunkSize << ";\n"
-      << "    const int32_t chunk_id = static_cast<int32_t>(blockIdx.x);\n"
-      << "    const int32_t tid      = static_cast<int32_t>(threadIdx.x);\n"
-      << "    const int64_t chunk_start = static_cast<int64_t>(chunk_id) *\n"
-      << "                                static_cast<int64_t>(CHUNK);\n"
-      << "    const int32_t len = static_cast<int32_t>(\n"
-      << "        (n - chunk_start) < static_cast<int64_t>(CHUNK)\n"
-      << "            ? (n - chunk_start) : static_cast<int64_t>(CHUNK));\n"
-      << "    if (len <= 0) return;\n"
-      << "    extern __shared__ __align__(16) unsigned char workspace[];\n"
-      << "    (void)workspace;\n"
-      << "\n"
-      << body_.str() << "}\n";
-
-  spec.source       = src.str();
-  spec.buffers      = std::move(buffers_);
-  spec.block_x      = tbs_;
-  spec.shared_bytes = static_cast<int>(sm_.peak_bytes());
-  spec.note         = "decode-walker-rendered pair mask";
-  return spec;
 }
 
 // =====================================================================
@@ -1650,9 +1532,8 @@ bool shape_is_supported(DecodeShape shape)
   // index_list x dict_gather and index_list x offsets_meta, which would give
   // index-walk-speed dictionary and string decode below the crossover — belong here
   // the moment their emitters land; see DECODE_PUSHDOWN_PLAN.md section 7.
-  return shape == kShapePlain || shape == kShapeMaskOut || shape == kShapePairMask ||
-         shape == kShapeMaskConsume || shape == kShapeIndexConsume || shape == kShapeDictGather ||
-         shape == kShapeStrSplitMeta;
+  return shape == kShapePlain || shape == kShapeMaskOut || shape == kShapeMaskConsume ||
+         shape == kShapeIndexConsume || shape == kShapeDictGather || shape == kShapeStrSplitMeta;
 }
 
 DecodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
@@ -1673,24 +1554,6 @@ DecodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
   }
   Walker w(element_dtype, shape);
   return w.build(tree);
-}
-
-DecodeKernelSpec render_pair_mask(const ::codegen::jit::FusedTree& tree_a,
-                                  const std::string& dtype_a,
-                                  const ::codegen::jit::FusedTree& tree_b,
-                                  const std::string& dtype_b,
-                                  std::int32_t num_chunks)
-{
-  if (dtype_a.empty() || dtype_b.empty()) {
-    throw std::invalid_argument("decode render: pair_mask dtype is empty");
-  }
-  if (num_chunks < 1) { throw std::invalid_argument("decode render: num_chunks must be >= 1"); }
-  if (dtype_elem_size(dtype_a) == 0 || dtype_elem_size(dtype_b) == 0) {
-    throw RenderError("decode render: pair_mask unsupported dtype '" + dtype_a + "'/'" + dtype_b +
-                      "'");
-  }
-  Walker w(dtype_a);
-  return w.build_pair(tree_a, tree_b, dtype_b);
 }
 
 }  // namespace codegen::decode::jit

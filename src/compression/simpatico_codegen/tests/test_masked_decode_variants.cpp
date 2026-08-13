@@ -37,11 +37,8 @@
 
 #include <cuda_runtime.h>
 
-#include <algorithm>
-#include <chrono>
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <string>
 #include <vector>
 
@@ -767,270 +764,6 @@ bool run_str_split_masked(bool deep, int arch)
   return true;
 }
 
-// the pair ballot: two-column pair predicate truth table (diffs in {-1,0,+1} so the
-// equal-values boundary is dense), plus a constant-range AND and the
-// chunk-geometry-mismatch rejection.
-bool run_pair_mask(int arch)
-{
-  const std::int64_t n  = 3 * kChunk + 257;
-  const std::int64_t nc = codegen::num_chunks_for(n);
-  const rmm::cuda_stream_view stream{};
-
-  std::vector<std::int32_t> a(static_cast<std::size_t>(n));
-  std::vector<std::int32_t> b(static_cast<std::size_t>(n));
-  for (std::int64_t i = 0; i < n; ++i) {
-    std::uint64_t s = 0xAB12ull ^ (0x9E3779B97F4A7C15ull * static_cast<std::uint64_t>(i + 1));
-    a[static_cast<std::size_t>(i)] = 8035 + static_cast<std::int32_t>(splitmix64(s) % 2526ull);
-    b[static_cast<std::size_t>(i)] =
-      a[static_cast<std::size_t>(i)] + static_cast<std::int32_t>(splitmix64(s) % 3ull) - 1;
-  }
-
-  auto tree_a = jit::FusedTree::make(OpKind::Bitpack);
-  auto tree_b = jit::FusedTree::make(OpKind::Bitpack);
-  GpuEncoded enc_a =
-    codegen_test::gpu_encode_tree<std::int32_t>(*tree_a, "int32_t", a.data(), n, arch);
-  GpuEncoded enc_b =
-    codegen_test::gpu_encode_tree<std::int32_t>(*tree_b, "int32_t", b.data(), n, arch);
-  if (!compact_packed_on_host(enc_a, nc)) return false;
-  if (!compact_packed_on_host(enc_b, nc)) return false;
-
-  const std::size_t nwords = static_cast<std::size_t>(nc) * kWordsPerChunk;
-  const range_predicate no_range{INT64_MIN, INT64_MAX};
-  const range_predicate a_range{8035 + 100, 8035 + 1200};
-
-  struct Case {
-    simpatico::pair_cmp op;
-    const char* name;
-    bool ranged;
-  };
-  const Case cases[] = {
-    {simpatico::pair_cmp::lt, "lt", false},
-    {simpatico::pair_cmp::le, "le", false},
-    {simpatico::pair_cmp::gt, "gt", false},
-    {simpatico::pair_cmp::ge, "ge", false},
-    {simpatico::pair_cmp::lt, "lt+range_a", true},
-  };
-  for (const Case& c : cases) {
-    CUdeviceptr d_mask = enc_a.alloc(nwords * 4);
-    cudaMemset(reinterpret_cast<void*>(d_mask), 0xFF, nwords * 4);
-    selection_mask sm;
-    sm.words    = reinterpret_cast<std::uint32_t*>(d_mask);
-    sm.num_rows = n;
-    REQUIRE_MSG(simpatico::launch_decode_fused_tree_pair_mask_out(*tree_a,
-                                                                  enc_a.buffers,
-                                                                  "int32_t",
-                                                                  *tree_b,
-                                                                  enc_b.buffers,
-                                                                  "int32_t",
-                                                                  n,
-                                                                  c.op,
-                                                                  sm,
-                                                                  stream,
-                                                                  c.ranged ? a_range : no_range,
-                                                                  no_range),
-                "[pair/%s] launch failed",
-                c.name);
-    std::vector<std::uint32_t> got(nwords);
-    cudaMemcpy(
-      got.data(), reinterpret_cast<const void*>(d_mask), nwords * 4, cudaMemcpyDeviceToHost);
-
-    std::vector<std::uint32_t> ref(nwords, 0u);
-    for (std::int64_t r = 0; r < n; ++r) {
-      const std::int64_t av = a[static_cast<std::size_t>(r)];
-      const std::int64_t bv = b[static_cast<std::size_t>(r)];
-      bool pass             = (c.op == simpatico::pair_cmp::lt)   ? (av < bv)
-                              : (c.op == simpatico::pair_cmp::le) ? (av <= bv)
-                              : (c.op == simpatico::pair_cmp::gt) ? (av > bv)
-                                                                  : (av >= bv);
-      if (c.ranged) pass = pass && av >= a_range.lo && av <= a_range.hi;
-      if (pass) ref[static_cast<std::size_t>(r) / 32] |= (1u << (r % 32));
-    }
-    REQUIRE_MSG(got == ref, "[pair/%s] pair ballot mask != host truth table", c.name);
-    std::printf("PASS: pair/%s\n", c.name);
-  }
-
-  // Chunk-geometry mismatch must be rejected before any launch.
-  {
-    jit::LabeledBuffers bad = enc_b.buffers;
-    auto it                 = bad.find(jit::buffer_key(0, "chunk_count"));
-    REQUIRE_MSG(it != bad.end(), "[pair] missing chunk_count in copy");
-    it->second.length -= 1;
-    CUdeviceptr d_mask = enc_a.alloc(nwords * 4);
-    selection_mask sm;
-    sm.words    = reinterpret_cast<std::uint32_t*>(d_mask);
-    sm.num_rows = n;
-    REQUIRE_MSG(!simpatico::launch_decode_fused_tree_pair_mask_out(*tree_a,
-                                                                   enc_a.buffers,
-                                                                   "int32_t",
-                                                                   *tree_b,
-                                                                   bad,
-                                                                   "int32_t",
-                                                                   n,
-                                                                   simpatico::pair_cmp::lt,
-                                                                   sm,
-                                                                   stream),
-                "[pair] chunk-geometry mismatch must be rejected");
-    std::printf("PASS: pair/geometry-mismatch-rejected\n");
-  }
-  return true;
-}
-
-// ---------------------------------------------------------------------------
-// --bench mode: time the PLAIN decode launcher (the production path, not the
-// masked variants) per shape, against the memset write floor of the output
-// buffer.  Measurement only — separates launch/host overhead (call vs kernel
-// time) from kernel bandwidth so decode shapes can be classified as
-// write-floor-bound, launch-bound, or kernel-bound.
-// CSV: shape,n,kernel_ms,call_ms,memset_ms,kernel_GBps,call_GBps
-//   kernel_ms = median cudaEvent bracket around the launcher call (GPU work:
-//               bp_offsets transient scan + decode kernel),
-//   call_ms   = median chrono wall of the full call (adds render/cache hash,
-//               transient allocs, internal sync),
-//   memset_ms = median event-timed cudaMemsetAsync of the output bytes.
-// ---------------------------------------------------------------------------
-
-double median_of(std::vector<double> v)
-{
-  std::sort(v.begin(), v.end());
-  return v.empty() ? 0.0 : v[v.size() / 2];
-}
-
-// Per-chunk residual with exact bit width `b`: positions 0/1 of every chunk
-// pin the max/min so chunk_bits == b deterministically.
-std::int64_t bench_residual(std::int64_t i, int b)
-{
-  const std::uint64_t m = (std::uint64_t{1} << b) - 1;
-  const std::int64_t p  = i & (kChunk - 1);
-  if (p == 0) return static_cast<std::int64_t>(m);
-  if (p == 1) return 0;
-  return static_cast<std::int64_t>((static_cast<std::uint64_t>(i) * 0x9E3779B97F4A7C15ull >> 13) &
-                                   m);
-}
-
-template <typename Element>
-bool bench_one(const char* shape, std::int64_t n, int bits, bool delta_shape, int arch)
-{
-  const rmm::cuda_stream_view stream{};
-  const std::int64_t nc          = codegen::num_chunks_for(n);
-  const std::size_t output_bytes = static_cast<std::size_t>(n) * sizeof(Element);
-
-  std::vector<Element> data(static_cast<std::size_t>(n));
-  if (delta_shape) {
-    std::int64_t v = 1000;
-    for (std::int64_t i = 0; i < n; ++i) {
-      v += bench_residual(i, bits);
-      data[static_cast<std::size_t>(i)] = static_cast<Element>(v);
-    }
-  } else {
-    const std::int64_t base = (sizeof(Element) == 8) ? 3'000'000'000LL : 8035;
-    for (std::int64_t i = 0; i < n; ++i)
-      data[static_cast<std::size_t>(i)] = static_cast<Element>(base + bench_residual(i, bits));
-  }
-
-  auto tree               = delta_shape
-                              ? jit::FusedTree::make(OpKind::Delta,
-                                                     {{"differences", jit::FusedTree::make(OpKind::Bitpack)}})
-                              : jit::FusedTree::make(OpKind::Bitpack);
-  const std::string dtype = (sizeof(Element) == 8) ? "int64_t" : "int32_t";
-
-  GpuEncoded enc = codegen_test::gpu_encode_tree<Element>(*tree, dtype, data.data(), n, arch);
-  if (!compact_packed_on_host(enc, nc, /*node_id=*/delta_shape ? 1 : 0)) return false;
-
-  CUdeviceptr d_out = enc.alloc(output_bytes);
-
-  cudaEvent_t e0 = nullptr, e1 = nullptr;
-  cudaEventCreate(&e0);
-  cudaEventCreate(&e1);
-
-  // Warmups (first one pays any cold NVRTC compile) + a spot check that the
-  // bench measures a CORRECT decode.
-  for (int w = 0; w < 3; ++w) {
-    REQUIRE_MSG(simpatico::launch_decode_fused_tree(
-                  *tree, enc.buffers, dtype.c_str(), n, reinterpret_cast<void*>(d_out), stream),
-                "[bench %s n=%lld] warmup decode failed",
-                shape,
-                static_cast<long long>(n));
-  }
-  {
-    const std::int64_t checks[] = {0, (n / 2) & ~std::int64_t{1023}, n - 1024};
-    std::vector<Element> win(1024);
-    for (std::int64_t off : checks) {
-      cudaMemcpy(win.data(),
-                 reinterpret_cast<const Element*>(d_out) + off,
-                 win.size() * sizeof(Element),
-                 cudaMemcpyDeviceToHost);
-      for (std::size_t k = 0; k < win.size(); ++k) {
-        REQUIRE_MSG(win[k] == data[static_cast<std::size_t>(off) + k],
-                    "[bench %s n=%lld] spot check mismatch at row %lld",
-                    shape,
-                    static_cast<long long>(n),
-                    static_cast<long long>(off + static_cast<std::int64_t>(k)));
-      }
-    }
-  }
-
-  constexpr int kReps = 20;
-  std::vector<double> kernel_ms, call_ms, memset_ms;
-  kernel_ms.reserve(kReps);
-  call_ms.reserve(kReps);
-  memset_ms.reserve(kReps);
-  for (int r = 0; r < kReps; ++r) {
-    cudaEventRecord(e0, stream.value());
-    const auto t0 = std::chrono::steady_clock::now();
-    const bool ok = simpatico::launch_decode_fused_tree(
-      *tree, enc.buffers, dtype.c_str(), n, reinterpret_cast<void*>(d_out), stream);
-    const auto t1 = std::chrono::steady_clock::now();
-    cudaEventRecord(e1, stream.value());
-    cudaEventSynchronize(e1);
-    REQUIRE_MSG(ok, "[bench %s n=%lld] rep decode failed", shape, static_cast<long long>(n));
-    float ms = 0.0f;
-    cudaEventElapsedTime(&ms, e0, e1);
-    kernel_ms.push_back(ms);
-    call_ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
-  }
-  for (int r = 0; r < kReps; ++r) {
-    cudaEventRecord(e0, stream.value());
-    cudaMemsetAsync(reinterpret_cast<void*>(d_out), 0, output_bytes, stream.value());
-    cudaEventRecord(e1, stream.value());
-    cudaEventSynchronize(e1);
-    float ms = 0.0f;
-    cudaEventElapsedTime(&ms, e0, e1);
-    memset_ms.push_back(ms);
-  }
-  cudaEventDestroy(e0);
-  cudaEventDestroy(e1);
-
-  const double k_ms = median_of(kernel_ms);
-  const double c_ms = median_of(call_ms);
-  const double m_ms = median_of(memset_ms);
-  const double gb   = static_cast<double>(output_bytes) / 1e9;
-  std::printf("%s,%lld,%.4f,%.4f,%.4f,%.1f,%.1f\n",
-              shape,
-              static_cast<long long>(n),
-              k_ms,
-              c_ms,
-              m_ms,
-              k_ms > 0 ? gb / (k_ms * 1e-3) : 0.0,
-              c_ms > 0 ? gb / (c_ms * 1e-3) : 0.0);
-  std::fflush(stdout);
-  return true;
-}
-
-int run_bench(int arch)
-{
-  std::printf("shape,n,kernel_ms,call_ms,memset_ms,kernel_GBps,call_GBps\n");
-  const std::int64_t sizes[] = {170205184LL, std::int64_t{1} << 29};
-  for (std::int64_t n : sizes) {
-    bench_one<std::int64_t>("i64_13b", n, 13, /*delta=*/false, arch);
-    bench_one<std::int64_t>("i64_4b", n, 4, /*delta=*/false, arch);
-    bench_one<std::int64_t>("i64_24b", n, 24, /*delta=*/false, arch);
-    bench_one<std::int32_t>("i32_12b", n, 12, /*delta=*/false, arch);
-    bench_one<std::int32_t>("i32_2b", n, 2, /*delta=*/false, arch);
-    bench_one<std::int64_t>("i64_delta_13b", n, 13, /*delta=*/true, arch);
-  }
-  return g_failures > 0 ? 1 : 0;
-}
-
 // Render-level contract checks (no kernel launches).
 bool render_checks()
 {
@@ -1162,57 +895,19 @@ bool render_checks()
                 kfor.source.find("compacted output (generic)") != std::string::npos,
               "FOR-rooted mask_consume must render via the generic seam");
 
-  // 8. Pair ballot: combined symbol, params-not-constants, both columns'
-  //    channels distinct; self-pair and non-bitpack columns rejected.
-  const cdj::DecodeKernelSpec kp =
-    cdj::render_pair_mask(*bp, "int32_t", *for_tree->children.at("deltas"), "int32_t", 8);
-  REQUIRE_MSG(kp.entry_symbol == "simpatico_decode_pair_mask_int32_t_int32_t",
-              "pair mask entry symbol wrong: %s",
-              kp.entry_symbol.c_str());
-  REQUIRE_MSG(kp.source.find("cmp_op") != std::string::npos &&
-                kp.source.find("lo_a") != std::string::npos &&
-                kp.source.find("chunk_min_0") != std::string::npos &&
-                kp.source.find("chunk_min_1") != std::string::npos,
-              "pair mask must take op/bounds params and bind two node channels");
-  REQUIRE_MSG(kp.buffers.size() == 2 * p32.buffers.size(),
-              "pair mask manifest must carry both columns' channels");
-  rejected = false;
-  try {
-    (void)cdj::render_pair_mask(*bp, "int32_t", *bp, "int32_t", 8);
-  } catch (const cdj::RenderError&) {
-    rejected = true;
-  }
-  REQUIRE_MSG(rejected, "pair mask with the same tree object twice must throw");
-  rejected = false;
-  try {
-    (void)cdj::render_pair_mask(*delta, "int64_t", *bp, "int64_t", 8);
-  } catch (const cdj::RenderError&) {
-    rejected = true;
-  }
-  REQUIRE_MSG(rejected, "pair mask with a non-bitpack column must throw");
-
   std::printf("PASS: render contract checks\n");
   return true;
 }
 
 }  // namespace
 
-int main(int argc, char** argv)
+int main()
 {
   if (cudaSetDevice(0) != cudaSuccess) {
     std::fprintf(stderr, "FAIL: cudaSetDevice(0) failed\n");
     return 1;
   }
   const int arch = jit::arch_cc_for_current_device();
-
-  if (argc > 1 && std::string(argv[1]) == "--bench") {
-    try {
-      return run_bench(arch);
-    } catch (const std::exception& e) {
-      std::fprintf(stderr, "FAIL: bench: unhandled exception: %s\n", e.what());
-      return 1;
-    }
-  }
 
   try {
     render_checks();
@@ -1225,11 +920,9 @@ int main(int argc, char** argv)
     run_delta_masked<std::int32_t>("int32_t", arch);
     run_dict_gather(/*key_width=*/1, arch);  // l_returnflag / l_linestatus
     run_dict_gather(/*key_width=*/4, arch);  // constant-width generality
-    // The str_split gather (l_shipmode / c_phone shapes) and
-    // Pair predicates (q12 shape).
+    // The str_split gather (l_shipmode / c_phone shapes).
     run_str_split_masked(/*deep=*/false, arch);
     run_str_split_masked(/*deep=*/true, arch);
-    run_pair_mask(arch);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "FAIL: unhandled exception: %s\n", e.what());
     return 1;

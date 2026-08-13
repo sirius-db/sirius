@@ -164,40 +164,13 @@ struct bool8_filter_directive {
   std::vector<std::string> equals_any;  // decode_predicate payload (equality / IN)
 };
 
-// Column-vs-column comparison, e.g. `l_commitdate < l_receiptdate`.
-enum class pair_compare_op : uint8_t { lt = 0, le = 1, gt = 2, ge = 3, eq = 4, ne = 5 };
-
-// One scan conjunct comparing two bitpack columns row-wise, resolved by ONE
-// kernel reading both packed regions (a comparison ballot, with each side's
-// constant range folded in). Row passes iff
-//   decoded(a) OP decoded(b)  &&  decoded(a) in range_a  &&  decoded(b) in range_b
-// (full-domain range = inactive side). Both columns MUST be bitpack roots over
-// the batch's num_rows — that fixes both to the same 1024-row chunk geometry;
-// any other shape (nested bitpack, delta parent) is a geometry mismatch and
-// the caller must DROP the conjunct (clearing whole-filter coverage) rather
-// than emit the pair. The orchestrator re-checks and refuses the batch on a
-// bad pair — never a wrong mask.
-struct pair_predicate {
-  pair_compare_op op;
-  range_predicate range_a{INT64_MIN, INT64_MAX};  // inclusive; the side's own constants
-  range_predicate range_b{INT64_MIN, INT64_MAX};
-};
-
-struct pair_filter_directive {
-  std::size_t column_a;  // indexes into `selected`; bitpack-rooted
-  std::size_t column_b;
-  pair_predicate pred;
-};
-
 // The whole-batch request. The caller may build one that carries only PART of
 // the scan's conjunction, in which case it must leave the batch untagged so the
 // residual filter still runs; the orchestrator re-checks every per-plan
 // precondition and falls back to the unfiltered path when any fail.
-// Source-count cap: ranges + pairs + equalities + probes <= 8, a PAIR counting
-// as ONE source (one kernel, one mask buffer).
+// Source-count cap: ranges + equalities + probes <= 8, one source per kernel.
 struct scan_filter_request {
   std::vector<filter_column_directive> filters;                 // range conjuncts
-  std::vector<pair_filter_directive> pair_filters;              // column-vs-column conjuncts
   std::vector<bool8_filter_directive> bool8_filters;            // dictionary-answered equalities
   std::vector<membership_filter_directive> membership_filters;  // dynamic probes
   std::vector<decode_route> routes;                             // parallel to `selected`

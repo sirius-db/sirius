@@ -70,19 +70,6 @@ struct decode_range {
   std::int64_t hi = 0;
 };
 
-/// Comparison between two columns of the same chunk. Values match
-/// @c sirius::codegen::pair_compare_op; the decoder converts at its own
-/// boundary so this header stays free of the codegen include tree.
-enum class column_compare_op : std::uint8_t { lt = 0, le = 1, gt = 2, ge = 3, eq = 4, ne = 5 };
-
-/// One `column_a OP column_b` conjunct. Both positions index the selected
-/// column list the request is parallel to.
-struct column_pair_conjunct {
-  std::size_t column_a = 0;
-  std::size_t column_b = 0;
-  column_compare_op op = column_compare_op::lt;
-};
-
 /// Type-erased set-membership test for a dynamic join filter: evaluates the
 /// published device structure (small in-list / hash set / Bloom) over a decoded
 /// key column and returns a BOOL8 keep-mask. The closure co-owns the filter for
@@ -135,7 +122,6 @@ struct scan_decode_request {
   };
 
   std::vector<column_entry> columns;
-  std::vector<column_pair_conjunct> pairs;
 
   /// Version of the dynamic filter set the @c membership probes were taken
   /// from (0 = none). Echoed back on the outcome so a scan that stopped using

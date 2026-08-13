@@ -279,49 +279,6 @@ sirius::decode_range clamp_to_decode_range(sirius::numeric_range const& acc)
           static_cast<std::int64_t>(std::min<int128>(acc.maximum, kMax))};
 }
 
-//===----------------------------------------------------------------------===//
-// Column-vs-column comparisons
-//===----------------------------------------------------------------------===//
-
-void harvest_column_pairs(duckdb::Expression const& expr,
-                          std::vector<sirius::column_pair_conjunct>& out)
-{
-  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONJUNCTION &&
-      expr.type == duckdb::ExpressionType::CONJUNCTION_AND) {
-    auto const& conjunction = expr.Cast<duckdb::BoundConjunctionExpression>();
-    for (auto const& child : conjunction.children) {
-      harvest_column_pairs(*child, out);
-    }
-    return;
-  }
-  if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_COMPARISON) { return; }
-  auto const& cmp = expr.Cast<duckdb::BoundComparisonExpression>();
-  sirius::column_compare_op op;
-  switch (cmp.type) {
-    case duckdb::ExpressionType::COMPARE_LESSTHAN: op = sirius::column_compare_op::lt; break;
-    case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
-      op = sirius::column_compare_op::le;
-      break;
-    case duckdb::ExpressionType::COMPARE_GREATERTHAN: op = sirius::column_compare_op::gt; break;
-    case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO:
-      op = sirius::column_compare_op::ge;
-      break;
-    default: return;  // =, <>, DISTINCT — no kernel evaluates those in-decode
-  }
-  if (cmp.left->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF ||
-      cmp.right->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
-    return;  // casts/functions around a side ⇒ not a plain column pair
-  }
-  auto const& left  = cmp.left->Cast<duckdb::BoundReferenceExpression>();
-  auto const& right = cmp.right->Cast<duckdb::BoundReferenceExpression>();
-  out.push_back({left.index, right.index, op});
-  SIRIUS_LOG_DEBUG("TABLE_SCAN pair harvest: binding {} {} binding {} (op={})",
-                   left.index,
-                   duckdb::ExpressionTypeToString(cmp.type),
-                   right.index,
-                   static_cast<int>(op));
-}
-
 }  // namespace
 
 scan_filter_analysis analyze_scan_filters(
@@ -329,8 +286,7 @@ scan_filter_analysis analyze_scan_filters(
   const duckdb::vector<duckdb::ColumnIndex>& column_ids,
   const duckdb::vector<sirius::logical_type>& returned_types,
   const std::unordered_set<std::size_t>& skip_primary_indices,
-  const std::unordered_set<std::size_t>& filter_only_primary_indices,
-  duckdb::Expression const* bound_filter)
+  const std::unordered_set<std::size_t>& filter_only_primary_indices)
 {
   scan_filter_analysis result;
   result.ranges_cover_whole_filter = true;
@@ -412,14 +368,11 @@ scan_filter_analysis analyze_scan_filters(
       it->second.lo > it->second.hi ? " (provably empty)" : "");
   }
 
-  if (bound_filter != nullptr) { harvest_column_pairs(*bound_filter, result.pairs); }
-
   SIRIUS_LOG_DEBUG(
-    "TABLE_SCAN filter analysis: {} range(s), {} equality set(s), {} column pair(s), "
+    "TABLE_SCAN filter analysis: {} range(s), {} equality set(s), "
     "ranges_cover_whole_filter={}",
     result.ranges.size(),
     result.equality_sets.size(),
-    result.pairs.size(),
     result.ranges_cover_whole_filter);
   return result;
 }
@@ -453,9 +406,6 @@ sirius::scan_decode_request build_scan_decode_request(
       return std::find(primary_index_by_slot.begin(), primary_index_by_slot.end(), entry.first) !=
              primary_index_by_slot.end();
     });
-  // Column pairs are indexed in the bound filter expression's own binding
-  // space, not by primary index, so mapping them belongs with whoever supplies
-  // that expression; no caller wires them onto slots yet.
   return request;
 }
 
