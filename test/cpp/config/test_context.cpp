@@ -362,6 +362,28 @@ TEST_CASE("Sirius configuration rejects zero scan task batch bytes", "[sirius][c
                         Catch::Contains("greater than zero"));
 }
 
+TEST_CASE("Sirius configuration validates telemetry exporters before initialization",
+          "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+  auto const invalid       = data_dir / "invalid_telemetry_exporter.yaml";
+  sirius::sirius_config rejected;
+  REQUIRE_THROWS_WITH(
+    rejected.load_from_file(invalid),
+    Catch::Contains("telemetry.exporter") && Catch::Contains("ndjson, msgpack, postcard"));
+
+  for (auto const& [exporter, fixture] : std::array<std::pair<const char*, const char*>, 3>{{
+         {"ndjson", "valid_telemetry_exporter_ndjson.yaml"},
+         {"msgpack", "valid_telemetry_exporter_msgpack.yaml"},
+         {"postcard", "valid_telemetry_exporter_postcard.yaml"},
+       }}) {
+    sirius::sirius_config accepted;
+    REQUIRE_NOTHROW(accepted.load_from_file(data_dir / fixture));
+    REQUIRE(accepted.get_telemetry_config().exporter == exporter);
+  }
+}
+
 TEST_CASE("Sirius configuration rejects negative host capacity bytes", "[sirius][config]")
 {
   std::source_location loc = std::source_location::current();
