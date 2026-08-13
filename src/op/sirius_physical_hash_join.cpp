@@ -2169,9 +2169,9 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
       }
       // Reopen so a GPU-resident sibling broadcast delivery can publish. Holding op_state_mutex
       // serializes every transition into or out of OPEN; this delivery exclusively owns PUBLISHING,
-      // so a plain store suffices. If finalization already observed PUBLISHING, no deliveries remain
-      // and the reopened state is unobservable. Return immediately so the catch cannot mark the
-      // released claim FAILED.
+      // so a plain store suffices. If finalization already observed PUBLISHING, no deliveries
+      // remain and the reopened state is unobservable. Return immediately so the catch cannot mark
+      // the released claim FAILED.
       std::scoped_lock lg(op_state_mutex);
       _dynamic_filter_publication_state.store(dynamic_filter_publication_state::OPEN,
                                               std::memory_order_release);
