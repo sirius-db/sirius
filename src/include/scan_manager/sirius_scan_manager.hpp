@@ -22,6 +22,7 @@
 #include "io/datasource_factory.hpp"
 #include "io/s3/s3_list_parser.hpp"
 #include "io/sirius_datasource.hpp"
+#include "late_mat/column_origin.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "pin_table.hpp"
 #include "scan_manager/config.hpp"
@@ -221,6 +222,11 @@ struct pinned_entry {
   /// capture was statless or degraded; see @ref pinned_zone_maps for the
   /// invariant and merge semantics.
   pinned_zone_maps zone_maps;
+  /// Generation-checked handle for late materialization: what a deferred
+  /// column holds instead of a pointer to this entry, so an unpin or a
+  /// replacing re-pin makes every outstanding origin fail closed rather than
+  /// dangle. Null unless the late-mat gate is on.
+  std::shared_ptr<late_mat::pin_entry_handle> late_mat_handle;
   /// MVCC snapshot metadata for duckdb-native pins, attached by
   /// @ref sirius_scan_manager::attach_mvcc_metadata right after insert. nullptr
   /// for parquet pins (immutable sources need no visibility reconciliation).
@@ -682,6 +688,17 @@ class sirius_scan_manager {
   std::vector<op::scan::sirius_gpu_scan_operator*> _scan_op_order;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
   bool _pruning_enabled{true};
+  /// Source of pin generations. Never 0 — that value means "invalidated", so
+  /// an origin holding it can never resolve.
+  std::atomic<late_mat::pin_generation_t> _next_pin_generation{1};
+
+  /// Give the entry now living at @p name a fresh late-mat handle, and
+  /// invalidate whatever handle it is replacing. Called after every insert;
+  /// a no-op when the late-mat gate is off.
+  void publish_late_mat_handle(const std::string& name);
+  /// Invalidate the handle of the entry at @p name, if any — every outstanding
+  /// origin against it then fails closed. Called before it is erased.
+  void retire_late_mat_handle(const std::string& name);
 
   /// One mask computation per distinct pinned entry matched this query
   /// (recorded by try_match_cached_entry, deduped by entry name); executed

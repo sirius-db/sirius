@@ -99,6 +99,37 @@ cudf::data_type host_column_carrier(cucascade::memory::column_metadata const& me
   return is_decimal ? cudf::data_type{id, meta.scale} : cudf::data_type{id};
 }
 
+namespace {
+
+/// Chunks a GPU-tier entry holds, whichever storage form it uses.
+std::size_t pinned_chunk_count(pinned_entry const& entry)
+{
+  if (!entry.device_chunks.empty()) { return entry.device_chunks.size(); }
+  auto const& names = entry.cache_info.column_names();
+  if (names.empty()) { return 0; }
+  auto const it = entry.data_batches_by_column.find(names.front());
+  return it == entry.data_batches_by_column.end() ? 0 : it->second.size();
+}
+
+/// Rows in one chunk of a GPU-tier entry. Every column of a chunk shares its
+/// row count, so any present one answers.
+std::int64_t pinned_chunk_rows(pinned_entry const& entry, std::size_t index)
+{
+  if (!entry.device_chunks.empty()) {
+    if (index >= entry.device_chunks.size()) { return 0; }
+    auto const& chunk = entry.device_chunks[index];
+    if (chunk.compressed) { return chunk.compressed->num_rows(); }
+    return chunk.columns.empty() || !chunk.columns.front() ? 0 : chunk.columns.front()->size();
+  }
+  auto const& names = entry.cache_info.column_names();
+  if (names.empty()) { return 0; }
+  auto const it = entry.data_batches_by_column.find(names.front());
+  if (it == entry.data_batches_by_column.end() || index >= it->second.size()) { return 0; }
+  return it->second[index] ? it->second[index]->size() : 0;
+}
+
+}  // namespace
+
 struct cached_databatch_provider : public databatch_provider {
   cached_databatch_provider(pinned_entry const& entry,
                             std::span<std::size_t const> selected_columns,
@@ -125,6 +156,57 @@ struct cached_databatch_provider : public databatch_provider {
       _column_names.emplace_back(entry_column_names[idx]);
       _column_indices.push_back(idx);
     });
+    prepare_origin_annotation();
+  }
+
+  /// Precompute what every served batch's origin annotation shares: the column
+  /// origins, and where each chunk starts in pin order.
+  ///
+  /// Pin-order positions run over ALL the entry's chunks, not the ones this
+  /// scan happens to serve — zone-map pruning may skip chunks, and a row's
+  /// global id has to mean the same thing to a scan that read it and one that
+  /// did not.
+  ///
+  /// Refuses, leaving no annotation, whenever a served batch would not be one
+  /// pinned chunk's contiguous rows: an MVCC keep-mask drops rows after
+  /// serving, and an insert-delta split is not a pinned chunk at all. Deferred
+  /// ids would then address rows the batch no longer holds.
+  void prepare_origin_annotation()
+  {
+    if (!late_mat::late_mat_enabled()) { return; }
+    if (!_entry.late_mat_handle) { return; }
+    if (!_mvcc_masks.empty() || !_delta_splits.empty()) { return; }
+    if (_entry.tier != cucascade::memory::Tier::GPU) { return; }
+
+    auto columns = std::make_shared<std::vector<late_mat::column_origin>>();
+    columns->reserve(_column_indices.size());
+    for (auto const idx : _column_indices) {
+      late_mat::column_origin origin;
+      origin.handle     = _entry.late_mat_handle;
+      origin.column_pos = static_cast<std::uint32_t>(idx);
+      origin.generation = _entry.late_mat_handle->generation();
+      columns->push_back(std::move(origin));
+    }
+
+    auto const chunk_count = pinned_chunk_count(_entry);
+    _chunk_row_start.assign(chunk_count + 1, 0);
+    for (std::size_t c = 0; c < chunk_count; ++c) {
+      _chunk_row_start[c + 1] = _chunk_row_start[c] + pinned_chunk_rows(_entry, c);
+    }
+    _origin_columns = std::move(columns);
+  }
+
+  /// The annotation for chunk @p index, or null when this scan is not stamped.
+  [[nodiscard]] std::shared_ptr<late_mat::scan_batch_origin const> origin_for(
+    std::size_t index) const
+  {
+    if (!_origin_columns || index + 1 >= _chunk_row_start.size()) { return nullptr; }
+    auto stamped         = std::make_shared<late_mat::scan_batch_origin>();
+    stamped->columns     = _origin_columns;
+    stamped->chunk_index = index;
+    stamped->range       = late_mat::row_range{_chunk_row_start[index],
+                                         _chunk_row_start[index + 1] - _chunk_row_start[index]};
+    return stamped;
   }
 
   databatch_provider::batch get_next_batch() override
@@ -154,10 +236,19 @@ struct cached_databatch_provider : public databatch_provider {
     auto mask             = index < _mvcc_masks.size() ? _mvcc_masks[index] : mvcc_chunk_mask{};
     auto const converts   = chunk_needs_carrier_conversion(index);
     auto const dest_bytes = converts ? conversion_destination_bytes_for_chunk(index) : 0;
-    return {std::move(data), std::move(mask), converts, dest_bytes};
+    databatch_provider::batch out{std::move(data), std::move(mask), converts, dest_bytes};
+    out.origin = origin_for(index);
+    return out;
   }
 
  private:
+  /// Shared by every batch this provider serves — the content is identical, and
+  /// output column j is (*_origin_columns)[j]. Null when the scan is not
+  /// stamped, which is what every consumer checks.
+  std::shared_ptr<std::vector<late_mat::column_origin> const> _origin_columns;
+  /// Exclusive scan of per-chunk rows over ALL the entry's chunks.
+  std::vector<std::int64_t> _chunk_row_start;
+
   std::shared_ptr<cucascade::data_batch> get_host_databatch(std::size_t index)
   {
     if (index >= _entry.host_chunks.size()) { return nullptr; }
@@ -1373,9 +1464,16 @@ void sirius_scan_manager::insert_pinned_entry(
             pinned_zone_maps::remap(std::move(pin_zone_maps), incoming_pos_by_entry_pos);
         }
       }
+      // Columns were merged in place: the entry survives, but its column
+      // positions no longer mean what an origin captured before now assumed.
+      if (entry.late_mat_handle) {
+        entry.late_mat_handle->bump_generation(
+          _next_pin_generation.fetch_add(1, std::memory_order_relaxed));
+      }
       return;
     }
     // Row count or completeness contract differs → drop the stale entry and rebuild below.
+    retire_late_mat_handle(name);
     _pinned_entries.erase(existing_it);
   }
 
@@ -1401,6 +1499,7 @@ void sirius_scan_manager::insert_pinned_entry(
   }
 
   _pinned_entries[name] = std::move(entry);
+  publish_late_mat_handle(name);
 }
 
 namespace {
@@ -1498,6 +1597,7 @@ void sirius_scan_manager::insert_pinned_entry_host(
   entry.zone_maps      = std::move(pin_zone_maps);
 
   _pinned_entries[name] = std::move(entry);
+  publish_late_mat_handle(name);
 }
 
 void sirius_scan_manager::insert_pinned_entry_device(
@@ -1549,6 +1649,7 @@ void sirius_scan_manager::insert_pinned_entry_device(
                    new_num_rows);
 
   _pinned_entries[name] = std::move(entry);
+  publish_late_mat_handle(name);
 }
 
 void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
@@ -1563,7 +1664,30 @@ void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
 
 void sirius_scan_manager::remove_pinned_entry(const std::string& name)
 {
+  retire_late_mat_handle(name);
   _pinned_entries.erase(name);
+}
+
+void sirius_scan_manager::publish_late_mat_handle(const std::string& name)
+{
+  if (!late_mat::late_mat_enabled()) { return; }
+  auto it = _pinned_entries.find(name);
+  if (it == _pinned_entries.end()) { return; }
+  // Whatever handle this entry had described the pin it is replacing.
+  if (it->second.late_mat_handle) { it->second.late_mat_handle->invalidate(); }
+  auto handle = std::make_shared<late_mat::pin_entry_handle>(
+    name, _next_pin_generation.fetch_add(1, std::memory_order_relaxed));
+  // The map node is stable, so this pointer stays valid for as long as the
+  // entry lives — and the handle is invalidated before it stops living.
+  handle->set_entry(&it->second);
+  it->second.late_mat_handle = std::move(handle);
+}
+
+void sirius_scan_manager::retire_late_mat_handle(const std::string& name)
+{
+  auto it = _pinned_entries.find(name);
+  if (it == _pinned_entries.end() || !it->second.late_mat_handle) { return; }
+  it->second.late_mat_handle->invalidate();
 }
 
 void sirius_scan_manager::visit_pinned_entries(
