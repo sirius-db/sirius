@@ -131,7 +131,6 @@ constexpr bool route_decodes_compacted(decode_route r) { return r != decode_rout
 struct filter_column_directive {
   std::size_t column;    // index into the decompress call's `selected` span
   range_predicate pred;  // inclusive [lo,hi] in the decoded integer domain
-  bool dynamic = false;  // provenance: join-produced dynamic min-max (DIAG `range*`)
 };
 
 // One dynamic MEMBERSHIP conjunct (a join build's in_list / cuco set / Bloom

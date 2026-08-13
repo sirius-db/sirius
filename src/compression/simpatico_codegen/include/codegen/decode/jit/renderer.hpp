@@ -56,102 +56,34 @@
 
 namespace codegen::decode::jit {
 
-// Kernel variants that evaluate a scan's filter while decoding (experimental;
-// the engine gate SIRIUS_EXP_FUSED_SCAN_FILTER lives in the wave orchestrator,
-// not here).  The variant changes the rendered source AND the entry symbol, so
-// each variant gets its own JIT-cache entry automatically; predicate
-// constants and mask/offset pointers are KERNEL PARAMETERS (appended after
-// `out, n`), never baked into the source — one compile covers all literals.
+// Kernels that evaluate a scan's filter while decoding (experimental; the
+// engine gate SIRIUS_EXP_FUSED_SCAN_FILTER lives in the wave orchestrator, not
+// here).
 //
-//   * plain        — full-column decode, today's behaviour (byte-identical
-//                    source to the pre-variant renderer).
-//   * mask_out     — decode fused with an inclusive [lo,hi] range
-//                    predicate on the decoded integer domain, producing
-//                    selection-mask words (row r -> bit r%32 of word r/32;
-//                    32 words per 1024-row chunk, tail bits and tail words
-//                    written as zero).  NO column write; the `out`
-//                    parameter slot is `uint32_t* sel_mask`, which must
-//                    hold ceil(n/1024)*32 words.  Extra params: `int64_t
-//                    pred_lo, int64_t pred_hi` (values are widened to
-//                    int64 for the compare).  Supported roots: Bitpack
-//                    leaf (closed-form, skips nothing but stores nothing),
-//                    and — for delta->bitpack orderkey shapes, the
-//                    decode-evaluable form of min-max dynamic join
-//                    filters — any value_source-supported root (the delta
-//                    form:
-//                    the chunk is reconstructed IN FULL via the existing
-//                    emitters, then the predicate is balloted from the
-//                    staged values, keeping the mask-word alignment).
-//   * mask_consume — decode consuming a selection mask plus per-chunk
-//                    exclusive survivor offsets (`chunk_offsets[c]` =
-//                    compacted output base of chunk c, length
-//                    num_chunks+1), writing compacted output in row order.
-//                    Supported roots:
-//                      - Bitpack leaf: skipped rows are never unpacked;
-//                        zero-survivor chunks early-return.
-//                      - Delta root (any value_source-supported
-//                        `differences` child, e.g. o_orderkey's
-//                        delta->bitpack): the per-chunk prefix-sum
-//                        reconstruction still runs in full (deltas are
-//                        sequential within a chunk), but only survivor
-//                        rows are WRITTEN — saves the full-column store +
-//                        the downstream compaction pass, not the unpack.
-//                    Extra params: `const uint32_t* sel_mask, const
-//                    uint32_t* chunk_offsets`.
-//   * index_consume — Bitpack-LEAF-root decode consuming an int32 ROW-
-//                    INDEX LIST (global row ids, ascending — the
-//                    mask->indices wave output) plus the same per-chunk
-//                    exclusive survivor offsets as mask_consume.  Block c reads its
-//                    slice row_indices[chunk_offsets[c] ..
-//                    chunk_offsets[c+1]) and random-access decodes ONLY
-//                    those rows into compacted output — no mask-word
-//                    staging, per-block work scales with the chunk's
-//                    survivor count, so it beats the mask walk at low
-//                    selectivity (the runtime pick is the caller's).  Delta
-//                    roots are rejected (sequential reconstruction cannot
-//                    row-skip — callers fall back to the delta mask walk).  Extra
-//                    params: `const int32_t* row_indices, const uint32_t*
-//                    chunk_offsets`.
-//   * mask_dict_gather — Bitpack-LEAF-root decode of DICTIONARY CODES
-//                    consuming the selection mask like mask_consume, but instead of
-//                    storing the code it gathers the key's bytes from a
-//                    CONSTANT-WIDTH, null-free key pool straight into the
-//                    compacted chars output (survivor rank r of chunk c
-//                    lands at (chunk_offsets[c]+r)*key_width).  Offsets
-//                    are analytic (j*key_width) and built by the caller.
-//                    Extra params: `const uint32_t* sel_mask, const
-//                    uint32_t* chunk_offsets, const char* keys_chars,
-//                    int32_t key_width`.
-//
-// Unsupported (shape, variant) combinations are rejected with RenderError
-// (e.g. RLE cannot row-skip — run expansion; dict gather needs a bitpack
-// code leaf).
-//   * str_split_meta — for `input -> str_split -> {offsets
-//                    subtree, raw chars}` string columns, the tree passed
-//                    is the OFFSETS subtree (any value_source-decodable
-//                    cascade — bitpack, delta->rle->bitpack, ...; its ROOT
-//                    must be Bitpack or Delta so the next chunk's first
-//                    offset can be peeked from per-chunk scalars).  The
-//                    kernel is launched over the OFFSETS domain (n =
-//                    n_strings + 1): each block reconstructs its offsets
-//                    chunk IN FULL via the existing emitters, then for
-//                    survivor rows only emits the source char offset
-//                    (`out`, int64) and byte length (`len_out`, int32),
-//                    compacted by survivor rank.  Non-survivor chars are
-//                    never touched; the raw chars byte gather is phase 2
-//                    (a fixed kernel, see masked_launch.hpp
-//                    launch_masked_char_copy) after the caller scans the
-//                    lengths into output offsets.  Entropy-coded chars
-//                    are out of scope by construction (this never reads
-//                    chars).  Extra params: `const uint32_t* sel_mask,
-//                    const uint32_t* chunk_offsets` (both ROW-space),
-//                    `int32_t* len_out`.
 // A decode kernel is a point in a two-axis product, not a flat variant list.
 // The axes are independent: HOW rows are enumerated within a chunk, and WHAT
 // happens per enumerated row.  Everything a kernel needs — emitted body, `out`
 // slot type, trailing parameters, entry-symbol suffix, launcher preconditions —
 // derives from the pair, so adding a kernel shape is one descriptor rather than
 // edits to a variant enum, two parameter switches, a launcher and a probe.
+//
+// Two rules hold across every point:
+//
+//   * Predicate constants and mask/index pointers are KERNEL PARAMETERS
+//     (appended after `out, n`), never baked into the source, so one NVRTC
+//     compile per (shape, dtype, tree) serves every literal.  The shape changes
+//     the entry symbol, so each point gets its own cache entry automatically.
+//   * The selection mask layout is selection.hpp's (32 words per 1024-row
+//     chunk, tail bits and words zero); the ballot consumers produce it and the
+//     compacting enumerators consume it.
+//
+// Roots each point accepts, which is what the RenderError refusals enforce:
+// `ballot_range` and `write_column` take any value_source-supported root (a
+// staged root reconstructs the chunk, then ballots or stores survivors from
+// it), EXCEPT that `index_list` requires a Bitpack leaf — random access is the
+// point, and a prefix sum cannot row-skip.  `dict_gather` requires a Bitpack
+// code leaf; `offsets_meta` a Bitpack- or Delta-rooted offsets subtree, so the
+// next chunk's first offset can be peeked from per-chunk scalars.
 enum class Enumerator : std::uint8_t {
   all_rows = 0,  ///< every row of the chunk (full-width decode)
   mask_bits,     ///< survivors of a selection mask, compacted by rank

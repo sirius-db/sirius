@@ -95,10 +95,9 @@ struct membership_probe {
 
 /// What one scan asks the decoder to do to one chunk.
 ///
-/// Immutable once built and shared by every batch of the scan; the per-batch
-/// variations (a fresher set of join filters, or dropping the row selection
-/// once it has been measured unprofitable) are made by copy — see
-/// @ref compressed_scan.
+/// Immutable once built and shared by every batch; per-batch variations (a
+/// fresher join-filter set, or dropping the row selection once measured
+/// unprofitable) are made by copy — see @ref compressed_scan.
 struct scan_decode_request {
   /// One selected column's share of the filter. Entries are parallel to the
   /// column list the decode is asked for; a shorter vector leaves the tail

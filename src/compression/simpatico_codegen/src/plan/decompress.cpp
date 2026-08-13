@@ -1613,29 +1613,6 @@ bool decompress_column_selection_mask(PlanTree const& tree,
   return ok;
 }
 
-std::unique_ptr<cudf::column> decompress_column_compacted(
-  PlanTree const& tree,
-  sirius::codegen::selection_mask const& mask,
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr,
-  std::string* error_out)
-{
-  if (mask.survivor_count < 0 || mask.chunk_offsets == nullptr) {
-    if (error_out) {
-      *error_out = "decompress: compacted decode requires a counted mask (CNT wave first)";
-    }
-    return nullptr;
-  }
-  decode_selection sel{};
-  sel.mask           = &mask;
-  sel.survivor_count = mask.survivor_count;
-  // The plan's own shape decides the route; decompress_column refuses a route
-  // the plan cannot take, so an unsupported root errors rather than silently
-  // decoding full width.
-  sel.route = probe_column(tree).compact_route;
-  return decompress_column(tree, stream, mr, error_out, /*pred=*/nullptr, &sel);
-}
-
 std::unique_ptr<cudf::table> compact_scan_filter_output(
   std::vector<std::unique_ptr<cudf::column>>&& columns,
   sirius::codegen::scan_filter_result const& result,

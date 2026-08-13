@@ -211,21 +211,6 @@ bool decompress_column_selection_mask(PlanTree const& tree,
                                       rmm::device_async_resource_ref mr,
                                       std::string* error_out);
 
-/// Wave 2, compacted decode: dispatches on plan shape — a bitpack-rooted plan
-/// walks the mask (rows whose mask bit is 0 are never unpacked), a
-/// dictionary-rooted plan with bitpack codes decodes the codes under the mask
-/// and gathers only the surviving keys. Every output column is allocated
-/// count-first with ``mask.survivor_count`` rows. Requires the CNT wave to have
-/// run (``mask.survivor_count >= 0`` and ``mask.chunk_offsets != nullptr``) and
-/// a plan whose @c probe_column reports a compacted route. Returns nullptr +
-/// @p error_out otherwise — never a full-width column.
-std::unique_ptr<cudf::column> decompress_column_compacted(
-  PlanTree const& tree,
-  sirius::codegen::selection_mask const& mask,
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr,
-  std::string* error_out);
-
 /// Assemble one filtered decode's ragged output into a uniformly
 /// survivor-sized table: compacted-route columns pass through; ALL full-width
 /// columns are compacted with ONE ``cudf::gather`` over ``result.row_indices``.

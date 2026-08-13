@@ -319,35 +319,31 @@ std::unique_ptr<cudf::table> decompress_columns_parallel(compressed_table const&
 
 // ── Filtering while decoding (env gate SIRIUS_EXP_FUSED_SCAN_FILTER) ────────
 //
-// Two-wave schedule inside one converter call:
-//   wave 1: ballot the filter columns' rows into mask words, round-robin on the
-//           pool streams; stream 0 waits on the others (events, no host sync),
-//           AND-combines the masks, counts them (per-chunk popcount + CUB scan
-//           -> chunk_offsets) and D2H's the survivor count — the single added
-//           host sync, it gates wave-2 allocations.
-//   wave 2: the compactable columns decode straight to survivor width and the
-//           rest decode plainly, in parallel on the pool streams
-//           (run_column_workers, as today); the gather map for the full-width
-//           columns (mask -> int32 row indices) is built on stream 0
-//           concurrently.
-// Any missing precondition ⇒ std::nullopt, and the caller runs the unfiltered
-// path byte-identically (same kernels, same allocations, zero added syncs).
+// Two waves inside one converter call:
+//   wave 1: ballot the filter columns into mask words, round-robin on the pool
+//           streams; stream 0 waits on the others (events, no host sync),
+//           AND-combines, counts (per-chunk popcount + CUB scan -> chunk_offsets)
+//           and D2H's the survivor count — the one added host sync, and it
+//           gates wave-2 allocations.
+//   wave 2: compactable columns decode straight to survivor width, the rest
+//           decode plainly, in parallel; the full-width columns' gather map
+//           (mask -> int32 row indices) is built on stream 0 concurrently.
+// Any missing precondition => std::nullopt and the caller runs the unfiltered
+// path byte-identically.
 //
 // Enable policy, in two stages:
 //   Statically, before any device work: a column asking for a compacted route
-//           must be a plan probe_column reports that route for; `full` is
-//           ADMITTED for anything (full decode + survivor gather) with its
-//           economics deferred to the selectivity check below. Range-filter
-//           sources are exempt from the check and forced to bitpack_mask.
-//   Dynamically, once the survivor count is known, in two regimes — each
-//           reported as scan_filter_status::declined_unselective so the caller
-//           can remember it for the rest of the scan:
-//           - any `full` output: proceed iff survivors/rows <=
-//             SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL (default 0.10);
-//           - otherwise: give compaction up above SIRIUS_EXP_FUSED_SCAN_MAX_SEL
-//             (default 0.35) unless a dict_codes output is present (that
-//             gather wins at all selectivities).
-//           Giving up = masks dropped, ordinary decode, batch not ROW_FILTERED.
+//           must probe as that route; `full` is admitted for anything, with its
+//           economics deferred below. Range-filter sources are exempt and
+//           forced to bitpack_mask.
+//   Dynamically, once the survivor count is known — both regimes report
+//           declined_unselective, so the caller can remember it for the scan:
+//           - any `full` output: proceed iff survivors/rows <= TIERB_MAX_SEL
+//             (0.10);
+//           - otherwise: give compaction up above MAX_SEL (0.35), unless a
+//             dict_codes output is present (that gather wins at every
+//             selectivity).
+//           Giving up = masks dropped, ordinary decode, batch not row-filtered.
 
 // The index walk is reachable from here (its launcher and the
 // decode_selection.prefer_index_decode routing are both live). Effective kill
@@ -517,7 +513,7 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
   if (sc::decode_diag_enabled()) {
     std::string line = "simpatico: filtered decode wave-1 sources:";
     for (auto const& f : request.filters) {
-      line += f.dynamic ? " range*(col " : " range(col ";
+      line += " range(col ";
       line += std::to_string(f.column) + " [" + std::to_string(f.pred.lo) + "," +
               std::to_string(f.pred.hi) + "])";
     }
