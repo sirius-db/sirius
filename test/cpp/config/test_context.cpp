@@ -298,6 +298,28 @@ TEST_CASE("Sirius configuration rejects zero hash partition bytes", "[sirius][co
     Catch::Contains("hash_partition_bytes") && Catch::Contains("greater than zero"));
 }
 
+TEST_CASE("Sirius configuration keeps memory prefetcher timing internal", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+
+  for (auto const& [file, key] : std::initializer_list<std::pair<char const*, char const*>>{
+         {"invalid_memory_prefetcher_poll_interval.yaml", "poll_interval_ms"},
+         {"invalid_memory_prefetcher_drain_quiet.yaml", "drain_quiet_ms"}}) {
+    CAPTURE(file, key);
+    sirius::sirius_config rejected;
+    REQUIRE_THROWS_WITH(rejected.load_from_file(data_dir / file),
+                        Catch::Contains("scan_manager.memory_prefetcher") && Catch::Contains(key) &&
+                          Catch::Contains("removed") && Catch::Contains("remove these keys"));
+  }
+
+  sirius::sirius_config omitted;
+  REQUIRE_NOTHROW(omitted.load_from_file(data_dir / "valid_memory_prefetcher_timing_omitted.yaml"));
+  auto const& prefetcher = omitted.get_scan_manager_config().memory_prefetcher;
+  CHECK(prefetcher.poll_interval_ms == 2);
+  CHECK(prefetcher.drain_quiet_ms == 100);
+}
+
 TEST_CASE("Sirius configuration rejects negative host capacity bytes", "[sirius][config]")
 {
   std::source_location loc = std::source_location::current();

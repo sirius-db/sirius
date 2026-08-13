@@ -224,11 +224,15 @@ static void from_yaml(const YAML::Node& node, sirius::io::cache::config& opt)
 static void from_yaml(const YAML::Node& node, scan_manager::memory_prefetcher_config& opt)
 {
   yaml::reader r(node, "memory_prefetcher");
+  if (r.has("poll_interval_ms") || r.has("drain_quiet_ms")) {
+    throw std::runtime_error(
+      "'sirius.executor.scan_manager.memory_prefetcher.poll_interval_ms' and "
+      "'sirius.executor.scan_manager.memory_prefetcher.drain_quiet_ms': removed; worker timing "
+      "policy is internal; remove these keys");
+  }
   r.optional("enable", opt.enable);
   r.optional("num_threads", opt.num_threads, yaml::greater_than<std::size_t>{0});
   r.optional("min_free_fraction", opt.min_free_fraction, yaml::fraction<double>{});
-  r.optional("poll_interval_ms", opt.poll_interval_ms, yaml::greater_than<std::size_t>{0});
-  r.optional("drain_quiet_ms", opt.drain_quiet_ms);
   r.reject_unknown();
 }
 
