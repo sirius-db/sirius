@@ -24,13 +24,16 @@
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/encode.hpp>
 #include <cudf/reduction/approx_distinct_count.hpp>
+#include <cudf/stream_compaction.hpp>
 #include <cudf/strings/strings_column_view.hpp>
-#include <cudf/transform.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/traits.hpp>
 
+#include <rmm/device_uvector.hpp>
+
 #include <algorithm>
 #include <new>
+#include <numeric>
 
 namespace sirius {
 namespace op {
@@ -117,6 +120,70 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_ungrouped_aggre
   return make_data_batch(std::move(output_table), memory_space, stream, telemetry_info);
 }
 
+std::pair<std::unique_ptr<cudf::table>, std::unique_ptr<cudf::column>>
+gpu_aggregate_impl::hash_encode(const cudf::table_view& keys,
+                                rmm::cuda_stream_view stream,
+                                rmm::device_async_resource_ref mr)
+{
+  if (keys.num_columns() == 0) {
+    throw std::runtime_error("hash_encode: keys table must have at least one column");
+  }
+
+  // 1. Distinct rows via hash (unordered). Row identity: NULL == NULL, NaN == NaN --
+  //    identical to `cudf::encode` and to cudf's sorted groupby under
+  //    `null_policy::INCLUDE`.
+  std::vector<cudf::size_type> all_columns(keys.num_columns());
+  std::iota(all_columns.begin(), all_columns.end(), 0);
+  auto distinct_keys = cudf::distinct(keys,
+                                      all_columns,
+                                      cudf::duplicate_keep_option::KEEP_ANY,
+                                      cudf::null_equality::EQUAL,
+                                      cudf::nan_equality::ALL_EQUAL,
+                                      stream,
+                                      mr);
+
+  // 2. Sort the distinct rows -- this runs at *group* cardinality, not input rows.
+  //    Ascending with NULLs last matches `cudf::encode`'s output ordering exactly. No
+  //    stability concern: the rows are distinct, so there are no ties.
+  auto const sort_order =
+    cudf::sorted_order(distinct_keys->view(),
+                       /*column_order=*/{},
+                       std::vector<cudf::null_order>(keys.num_columns(), cudf::null_order::AFTER),
+                       stream,
+                       mr);
+  auto sorted_keys = cudf::gather(
+    distinct_keys->view(), sort_order->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
+  distinct_keys.reset();
+
+  // 3. Assign each input row its index into `sorted_keys` with one hash probe per row.
+  //    `left_join` on a distinct build table returns exactly one build index per probe row,
+  //    in probe-row order -- precisely the label column, no scatter needed.
+  cudf::distinct_hash_join key_to_label(
+    sorted_keys->view(), cudf::null_equality::EQUAL, /*load_factor=*/0.5, stream);
+  auto labels = key_to_label.left_join(keys, stream, mr);
+  auto label_col =
+    std::make_unique<cudf::column>(std::move(*labels), rmm::device_buffer{}, /*null_count=*/0);
+
+  // 4. Every probe row is present in the build table by construction (same rows, same
+  //    NULL/NaN equality), so every label must be a valid index. Verify with one cheap
+  //    min-reduce: an unmatched row would carry the negative `JoinNoMatch` sentinel and
+  //    silently corrupt the post-aggregate key gather.
+  if (keys.num_rows() > 0) {
+    auto min_label  = cudf::reduce(label_col->view(),
+                                  *cudf::make_min_aggregation<cudf::reduce_aggregation>(),
+                                  label_col->view().type(),
+                                  stream,
+                                  mr);
+    auto& typed_min = static_cast<cudf::numeric_scalar<cudf::size_type>&>(*min_label);
+    if (!typed_min.is_valid(stream) || typed_min.value(stream) < 0) {
+      throw std::runtime_error(
+        "hash_encode: probe row missing from its own distinct set (join sentinel in labels)");
+    }
+  }
+
+  return {std::move(sorted_keys), std::move(label_col)};
+}
+
 std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggregate(
   const cucascade::read_only_data_batch& input,
   const std::vector<int>& group_idx,
@@ -153,23 +220,32 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   // fixed-width, null-free column is dispatched to `sorted_order_radix`
   // (`cub::DeviceRadixSort`), which is a handful of fully coalesced passes.
   //
-  // So we collapse the whole key table into one dense INT32 label with `cudf::encode` and
-  // group by that instead. `cudf::encode` returns the distinct key rows in sorted order plus
-  // the per-row index into them, so the label ordering is exactly the lexicographic ordering
-  // of the original key tuples -- group identity and group ordering are both preserved. The
-  // original key columns are recovered after the aggregate with a gather at group cardinality.
+  // So we collapse the whole key table into one dense INT32 label with `hash_encode` (a
+  // hash-based drop-in for `cudf::encode` -- see below) and group by that instead. It returns
+  // the distinct key rows in sorted order plus the per-row index into them, so the label
+  // ordering is exactly the lexicographic ordering of the original key tuples -- group
+  // identity and group ordering are both preserved. The original key columns are recovered
+  // after the aggregate with a gather at group cardinality.
   //
-  // NULL semantics are preserved: `cudf::encode` builds the distinct set with
-  // `null_equality::EQUAL` / `nan_equality::ALL_EQUAL` and searches it with
-  // `null_order::AFTER`, which is precisely what the sorted groupby helper does for
+  // Why not `cudf::encode` itself: it assigns the per-row index with a `thrust::lower_bound`
+  // binary search over the sorted distinct rows, driven by a generic lexicographic row
+  // comparator -- O(N log G) comparator calls of *random* access over every key column. On
+  // TPC-H q16 (59.4M rows x [p_brand, p_type, p_size], G~18k) that single kernel is 118.8 ms,
+  // 41% of the query. `hash_encode` computes the same mapping with one hash-table probe per
+  // row (~10-25 ms at that scale): `cudf::distinct` (hash-based), a sort at *distinct*
+  // cardinality only, then `cudf::distinct_hash_join::left_join` to look up each row's index.
+  //
+  // NULL semantics are preserved: the distinct set is built with `null_equality::EQUAL` /
+  // `nan_equality::ALL_EQUAL` and sorted with `null_order::AFTER`, which is precisely what
+  // `cudf::encode` produces and what the sorted groupby helper does for
   // `null_policy::INCLUDE`. A key tuple containing NULL therefore gets its own label and
   // becomes its own group, exactly as before.
   //
   // Only worth it when the sort actually dominates, so gate on a large input; and pointless
   // when the key table is already a single radix-sortable column.
   //
-  // The gate on group cardinality matters most: `cudf::encode` is distinct + a sort of the
-  // *distinct* rows + a binary search per input row. That is a large win when the groups are
+  // The gate on group cardinality matters most: the encode is distinct + a sort of the
+  // *distinct* rows + a hash probe per input row. That is a large win when the groups are
   // few, but for a high-cardinality key (say COUNT(DISTINCT ...) grouped by an order key) the
   // distinct-key sort is as big as the sort we are trying to avoid, and we would come out
   // behind. An HLL estimate over the key rows is ~O(1) memory and one cheap pass, so use it to
@@ -215,7 +291,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
           input_table.num_rows(),
           ratio);
       } else {
-        auto encoded     = cudf::encode(keys_view, stream, mr);
+        auto encoded     = hash_encode(keys_view, stream, mr);
         label_key_values = std::move(encoded.first);
         label_col        = std::move(encoded.second);
         SIRIUS_LOG_DEBUG(

@@ -91,6 +91,33 @@ class gpu_aggregate_impl {
     rmm::cuda_stream_view stream,
     cucascade::memory::memory_space& memory_space,
     const telemetry::batch_telemetry_info& telemetry_info = {});
+
+  /**
+   * @brief Hash-based drop-in replacement for `cudf::encode`.
+   *
+   * Returns exactly what `cudf::encode(keys)` returns: the distinct rows of `keys` in
+   * ascending lexicographic order (NULLs last, per column), plus one INT32 index per input
+   * row into that distinct table (`distinct[indices[i]] == keys[i]`). Row identity follows
+   * `null_equality::EQUAL` / `nan_equality::ALL_EQUAL`, matching both `cudf::encode` and
+   * cudf's sorted groupby under `null_policy::INCLUDE`.
+   *
+   * The difference is the cost model: `cudf::encode` assigns indices with a per-row
+   * `lower_bound` binary search driven by a lexicographic row comparator
+   * (O(N log G) comparator calls of random access over every key column — 119 ms for
+   * 59M rows x 3 columns in TPC-H q16), whereas this implementation assigns them with one
+   * hash-table probe per row (`cudf::distinct` + a sort at *distinct* cardinality +
+   * `cudf::distinct_hash_join::left_join`), which is ~5-10x cheaper for string-heavy keys.
+   *
+   * @param keys Table of group key columns to encode. Nested (LIST/STRUCT) key columns are
+   *        not supported (the label-encode caller gates them off; cudf throws on the
+   *        unsupported ones).
+   * @param stream CUDA stream used for device memory operations and kernel launches.
+   * @param mr Device memory resource used to allocate the returned table/column.
+   *
+   * @return {distinct key rows in sorted order, per-row INT32 index into them}.
+   */
+  static std::pair<std::unique_ptr<cudf::table>, std::unique_ptr<cudf::column>> hash_encode(
+    const cudf::table_view& keys, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr);
 };
 
 }  // namespace op
