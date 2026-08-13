@@ -135,7 +135,9 @@ TEST_CASE("sirius_config loads object_store_config from YAML", "[object_store_co
            "        secret_key: minioadmin-secret\n"
            "        session_token: TESTSESSIONTOKEN\n"
            "        signing_mode: header\n"
-           "        s3_transport: rdma\n";
+           "        s3_transport: rdma\n"
+           "        ca_bundle_path: /tmp/test-ca.pem\n"
+           "        tls_verify: false\n";
     REQUIRE(out);
   }
 
@@ -150,6 +152,8 @@ TEST_CASE("sirius_config loads object_store_config from YAML", "[object_store_co
   CHECK(os.session_token == "TESTSESSIONTOKEN");
   CHECK(os.s3_signing_mode == object_store_config::signing_mode::header);
   CHECK(os.s3_transport == object_store_config::transport::RDMA);
+  CHECK(os.ca_bundle_path == "/tmp/test-ca.pem");
+  CHECK_FALSE(os.tls_verify);
 
   std::error_code ec;
   std::filesystem::remove(path, ec);
@@ -293,6 +297,55 @@ TEST_CASE("sirius_config rejects unknown rest config keys", "[scan_manager][conf
 
   sirius::sirius_config cfg;
   CHECK_THROWS(cfg.load_from_file(path));
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("sirius_config rejects shadowed REST TLS YAML keys",
+          "[scan_manager][config][s3][rest][tls]")
+{
+  auto check_rejected = [](std::string const& key, std::string const& value) {
+    auto const path =
+      std::filesystem::temp_directory_path() / ("sirius_shadowed_rest_" + key + ".yaml");
+    write_yaml(path,
+               "sirius:\n"
+               "  executor:\n"
+               "    scan_manager:\n"
+               "      rest:\n"
+               "        " +
+                 key + ": " + value + "\n");
+
+    sirius::sirius_config cfg;
+    REQUIRE_THROWS_WITH(cfg.load_from_file(path),
+                        "'sirius.executor.scan_manager.rest." + key +
+                          "': removed; configure 'sirius.executor.scan_manager.object_store." +
+                          key + "' instead");
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+  };
+
+  SECTION("CA bundle") { check_rejected("ca_bundle_path", "/tmp/shadowed-ca.pem"); }
+  SECTION("TLS verification") { check_rejected("tls_verify", "false"); }
+}
+
+TEST_CASE("sirius_config still loads unrelated REST YAML fields",
+          "[scan_manager][config][s3][rest]")
+{
+  auto const path = std::filesystem::temp_directory_path() / "sirius_rest_unrelated_fields.yaml";
+  write_yaml(path,
+             "sirius:\n"
+             "  executor:\n"
+             "    scan_manager:\n"
+             "      rest:\n"
+             "        request_timeout_s: 11\n"
+             "        max_connections: 7\n");
+
+  sirius::sirius_config cfg;
+  REQUIRE_NOTHROW(cfg.load_from_file(path));
+  CHECK(cfg.get_scan_manager_config().rest.request_timeout_s == 11);
+  CHECK(cfg.get_scan_manager_config().rest.max_connections == 7);
 
   std::error_code ec;
   std::filesystem::remove(path, ec);

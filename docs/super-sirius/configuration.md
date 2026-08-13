@@ -314,11 +314,13 @@ single-GPU configurations only (logs a warning and disables itself otherwise).
 
 ### `scan_manager.rest` — REST / S3 backend (`io/rest/config.hpp`)
 
+TLS verification policy and the CA bundle are configured only under
+`scan_manager.object_store`. The REST reactor consumes those values so signing
+and transport use one trust policy; there are no separate REST YAML controls.
+
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `request_timeout_s` | int (seconds) | 30 | Whole-request timeout and presigned-URL TTL (0 = no limit). |
-| `ca_bundle_path` | string | "" | PEM CA bundle for TLS verification. |
-| `tls_verify` | bool | true | Verify the endpoint's TLS certificate (peer + host). |
 | `max_connections` | int | 16 | Max concurrent in-flight connections per reactor. |
 | `chunk_size` | bytes | 8Mi | Target bytes per ranged GET (scatter/device-staging paths). |
 | `max_n_chunks` | int | 16 | Max file-adjacent segments fused into one scatter GET. |
@@ -355,8 +357,8 @@ single-GPU configurations only (logs a warning and disables itself otherwise).
 | `session_token` | string | "" | STS session token for temporary credentials. |
 | `signing_mode` | enum: `presigned`, `header` | `presigned` | SigV4 form: `presigned` (auth in the URL query string) or `header` (`Authorization` + `x-amz-*` headers). Values are lowercase. |
 | `s3_transport` | enum: `auto`, `http`, `https`, `rdma` | `auto` | Transport selection. Values are lowercase; `https` is an alias for `http`. `auto` lets the backend choose from the URI scheme and endpoint. |
-| `ca_bundle_path` | string | "" | PEM CA bundle for TLS verification. |
-| `tls_verify` | bool | true | Verify the endpoint's TLS certificate. |
+| `ca_bundle_path` | string | "" | Sole YAML source for the REST endpoint's PEM CA bundle. |
+| `tls_verify` | bool | true | Sole YAML source for REST endpoint certificate verification. |
 
 ## Operator Parameters
 
