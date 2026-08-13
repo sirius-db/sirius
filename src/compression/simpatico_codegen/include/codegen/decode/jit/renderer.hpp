@@ -84,10 +84,20 @@ namespace codegen::decode::jit {
 // point, and a prefix sum cannot row-skip.  `dict_gather` requires a Bitpack
 // code leaf; `offsets_meta` a Bitpack- or Delta-rooted offsets subtree, so the
 // next chunk's first offset can be peeked from per-chunk scalars.
+//
+// `chunk_csr` accepts what its consumer accepts: unlike `index_list` it does not
+// require random access, because a staged root still pays only for the chunks
+// the selection touches — which for a post-join selection is the saving that
+// matters.
 enum class Enumerator : std::uint8_t {
   all_rows = 0,  ///< every row of the chunk (full-width decode)
   mask_bits,     ///< survivors of a selection mask, compacted by rank
   index_list,    ///< an ascending survivor row-id list, compacted by slot
+  /// A chunk-bucketed CSR row set (codegen/selection/chunk_row_set.hpp): the
+  /// grid covers only TOUCHED chunks, and block b serves chunk_ids[b]. For a
+  /// selection that arrives after the scan and touches few chunks, this is the
+  /// difference between launching every chunk and launching the ones with work.
+  chunk_csr,
 };
 
 enum class Consumer : std::uint8_t {
@@ -111,6 +121,10 @@ inline constexpr DecodeShape kShapeMaskConsume{Enumerator::mask_bits, Consumer::
 inline constexpr DecodeShape kShapeIndexConsume{Enumerator::index_list, Consumer::write_column};
 inline constexpr DecodeShape kShapeDictGather{Enumerator::mask_bits, Consumer::dict_gather};
 inline constexpr DecodeShape kShapeStrSplitMeta{Enumerator::mask_bits, Consumer::offsets_meta};
+inline constexpr DecodeShape kShapeSparseConsume{Enumerator::chunk_csr, Consumer::write_column};
+inline constexpr DecodeShape kShapeSparseDictGather{Enumerator::chunk_csr, Consumer::dict_gather};
+inline constexpr DecodeShape kShapeSparseStrSplitMeta{Enumerator::chunk_csr,
+                                                      Consumer::offsets_meta};
 
 /// False for product points with no meaning or no renderer support — e.g.
 /// re-ballotting only the survivors of an existing mask.  Render rejects these
@@ -149,6 +163,9 @@ enum class TrailingParam : std::uint8_t {
   keys_chars,     // mask_dict_gather: constant-width key pool chars
   key_width,      // mask_dict_gather: bytes per key
   row_indices,    // index_consume: ascending global int32 survivor row ids
+  chunk_ids,      // chunk_csr: the chunk each block serves
+  block_offsets,  // chunk_csr: per-block output bases (indexed by block)
+  in_chunk_rows,  // chunk_csr: uint16 positions within the block's chunk
   len_out,        // str_split_meta: per-survivor byte lengths (output)
   kCount          // sentinel: size of a tag-indexed table
 };
