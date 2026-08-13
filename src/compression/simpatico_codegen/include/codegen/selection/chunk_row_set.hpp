@@ -30,12 +30,24 @@
 // 1023 makes the invariant structural.
 //
 // Size, for S survivors over T touched chunks: 2S + 8T bytes, against 4S + 4(C+1)
-// for the index list over C chunks. The crossover is clustering, not density —
-// scattered survivors touch every chunk and gain only the narrower ids.
+// for the index list over C chunks. The crossover is DENSITY, not clustering:
+// survivors falling at random still leave most chunks empty once density is low
+// (a chunk is touched with probability 1-(1-d)^1024), so T/C collapses on its
+// own. On TPC-H sf1000 q17 and q19 sit exactly on that random baseline — no
+// clustering at all — and still skip 5.4M of 5.86M empty blocks; q18 is the one
+// genuinely clustered case, at T/C 0.011 against a 0.073 baseline.
+//
+// So this form never launches more blocks than the index list and never occupies
+// more memory. What it costs instead is construction: the index list falls out
+// of the mask->indices wave, while the CSR has to be bucketed.
 
 #pragma once
 
 #include "codegen/jit/fused_tree.hpp"
+
+#include <rmm/cuda_stream_view.hpp>
+#include <rmm/device_buffer.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <cstdint>
 
@@ -65,5 +77,49 @@ struct chunk_row_set {
            num_touched <= (num_rows + ::codegen::kChunkSize - 1) / ::codegen::kChunkSize;
   }
 };
+
+/// Owning storage behind a chunk_row_set. The view is non-owning by design —
+/// the decode only reads — so this is what a builder returns and what the
+/// caller must keep alive for as long as any launch is still reading it.
+struct chunk_row_set_owner {
+  rmm::device_buffer chunk_ids;      // uint32 x num_touched
+  rmm::device_buffer block_offsets;  // uint32 x (num_touched + 1)
+  rmm::device_buffer in_chunk_rows;  // uint16 x num_survivors
+
+  std::int64_t num_touched   = 0;
+  std::int64_t num_survivors = 0;
+  std::int64_t num_rows      = 0;
+
+  [[nodiscard]] chunk_row_set view() const noexcept
+  {
+    return chunk_row_set{static_cast<std::uint32_t const*>(chunk_ids.data()),
+                         static_cast<std::uint32_t const*>(block_offsets.data()),
+                         static_cast<std::uint16_t const*>(in_chunk_rows.data()),
+                         num_touched,
+                         num_survivors,
+                         num_rows};
+  }
+};
+
+/// Bucket a selection that arrived after the scan into the CSR above.
+///
+/// ``row_ids`` are batch-local row ids on device, NON-DECREASING and each in
+/// [0, num_rows). Non-decreasing rather than strictly increasing because a
+/// many-to-many join legitimately hands the same row back more than once; a
+/// repeat costs one more entry and the decode emits that row again, which is
+/// what the join asked for.
+///
+/// Cost is O(num_ids) — no pass over the batch's chunks. That is the point: a
+/// selection touching 1% of chunks must not pay for the 99% it skips, which is
+/// exactly what a per-chunk counter array would charge. One host sync, for the
+/// touched-chunk count, because that count is the grid the launcher needs.
+///
+/// Throws if the ids are out of order or out of range, rather than building a
+/// row set that would decode the wrong rows.
+chunk_row_set_owner build_chunk_row_set(std::int32_t const* row_ids,
+                                        std::int64_t num_ids,
+                                        std::int64_t num_rows,
+                                        rmm::cuda_stream_view stream,
+                                        rmm::device_async_resource_ref mr);
 
 }  // namespace sirius::codegen
