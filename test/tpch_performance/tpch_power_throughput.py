@@ -98,6 +98,7 @@ def perf_stack_env():
     )
     return {k: os.environ[k] for k in keys if os.environ.get(k)}
 
+
 # Queries that touch neither lineitem nor orders are unchanged by RF1/RF2, so
 # refresh validation skips them.
 REFRESH_INVARIANT_QUERIES = frozenset(
@@ -282,9 +283,13 @@ def stream_queries(stream, args):
 
 
 # Ordered record of nsys capture ranges opened by this run (--nsys-per-query).
-# nsys `--capture-range=cudaProfilerApi --capture-range-end=repeat` emits one
-# numbered report per profiler_start/stop pair, in this same order; the
-# manifest written to the run dir maps report index -> (phase, query).
+# nsys `--capture-range=cudaProfilerApi --capture-range-end=repeat` numbers
+# its reports in this same order, but MERGES adjacent ranges when stop/start
+# pairs arrive faster than it can finalize a range (and can drop the last one
+# at exit), then renumbers the survivors compactly — so report index N does
+# NOT reliably equal manifest range N. Each entry therefore records the
+# wall-clock start/stop of its capture range; prep_analysis_bundles.py joins
+# surviving reports to manifest entries by these timestamps, never by index.
 # Appended only from sequential code (power passes + the main thread's
 # throughput interval), so no lock is needed.
 _NSYS_MANIFEST = []
@@ -294,12 +299,20 @@ def _nsys_range_start(cur, phase, qnum):
     """Open a per-query nsys capture range (cudaProfilerStart is process-global,
     so this is only safe where exactly one query runs at a time)."""
     cur.execute("CALL profiler_start()").fetchall()
+    # Stamped after start / before stop, so the recorded window is contained
+    # in the report's actual capture window — required by the timestamp join.
     _NSYS_MANIFEST.append(
-        {"range": len(_NSYS_MANIFEST) + 1, "phase": phase, "query": qnum}
+        {
+            "range": len(_NSYS_MANIFEST) + 1,
+            "phase": phase,
+            "query": qnum,
+            "start_epoch_ns": time.time_ns(),
+        }
     )
 
 
 def _nsys_range_stop(cur):
+    _NSYS_MANIFEST[-1]["stop_epoch_ns"] = time.time_ns()
     cur.execute("CALL profiler_stop()").fetchall()
 
 
@@ -559,7 +572,9 @@ def load_pin_layout(path):
         covered[table].update(cols)
         resolved.append({"name": name, "tier": tier, "cols": cols})
     missing = {
-        t: sorted(set(union[t]) - covered[t]) for t in union if set(union[t]) - covered[t]
+        t: sorted(set(union[t]) - covered[t])
+        for t in union
+        if set(union[t]) - covered[t]
     }
     if missing:
         raise SystemExit(
@@ -964,7 +979,9 @@ def throughput_run(con, args, run_dir, writer, streams):
     check_cur = con.cursor()
     sql(check_cur, "SET gpu_execution = false")
     try:
-        check_refresh_matches_base(check_cur, args.refresh_dir, args.update_set_offset + 2)
+        check_refresh_matches_base(
+            check_cur, args.refresh_dir, args.update_set_offset + 2
+        )
     finally:
         check_cur.close()
 
