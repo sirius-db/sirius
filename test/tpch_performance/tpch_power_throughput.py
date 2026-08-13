@@ -641,7 +641,7 @@ def open_benchmark_db(
     return con
 
 
-def close_benchmark_db(con, pin_tier, pin_layout=None):
+def close_benchmark_db(con, pin_tier, pin_layout=None, close=True):
     try:
         if pin_layout is not None:
             for e in pin_layout:
@@ -650,7 +650,8 @@ def close_benchmark_db(con, pin_tier, pin_layout=None):
             for t in TPCH_TABLES:
                 sql(con, f"CALL unpin_table('{t}')")
     finally:
-        con.close()
+        if close:
+            con.close()
 
 
 def compressed_pin_count(log_dir, timeout_s=10.0):
@@ -677,6 +678,31 @@ def compressed_pin_count(log_dir, timeout_s=10.0):
     return count
 
 
+# Connections deliberately kept open by --rollback-scratch (see benchmark_db);
+# _rollback_exit's os._exit prevents their destructors from checkpointing.
+_ROLLBACK_KEEPALIVE = []
+
+
+def _rollback_exit(args, code):
+    """End a --rollback-scratch run without a clean DuckDB shutdown.
+
+    A clean close (or interpreter teardown of the kept-alive connection)
+    force-checkpoints the WAL into the base file, consuming the scratch.
+    os._exit skips both; the caller then deletes <scratch>.wal and the scratch
+    is content-pristine for the next offset-0 run.
+    """
+    if not args.rollback_scratch:
+        return
+    scratch = os.path.abspath(args.scratch_db)
+    log(
+        f"rollback-scratch: exiting without close; delete {scratch}.wal "
+        "to finish the restore (run-power.sh ROLLBACK=1 does this)"
+    )
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
+
+
 @contextlib.contextmanager
 def benchmark_db(args, run_dir, filename):
     """Copy the base DB into run_dir, open it with the TPC-H tables pinned, and
@@ -689,10 +715,26 @@ def benchmark_db(args, run_dir, filename):
         # deleted at the end unless --keep-scratch-db.
         scratch = os.path.abspath(args.scratch_db)
         if os.path.getsize(scratch) != os.path.getsize(args.input):
-            raise SystemExit(
-                f"--scratch-db {scratch} differs in size from --input; it is "
-                "not a pristine copy (was it mutated by an earlier run?)"
-            )
+            if args.update_set_offset == 0 and not args.rollback_scratch:
+                raise SystemExit(
+                    f"--scratch-db {scratch} differs in size from --input; it is "
+                    "not a pristine copy (was it mutated by an earlier run?). "
+                    "An evolved database (clause 2.8) needs --update-set-offset, "
+                    "or use --rollback-scratch runs which keep it content-pristine."
+                )
+            drift = os.path.getsize(scratch) - os.path.getsize(args.input)
+            if args.rollback_scratch and args.update_set_offset == 0:
+                # Rolled-back runs leave the file content-pristine but a little
+                # larger each time: DuckDB's optimistic writer puts bulk row
+                # groups straight into base blocks, and discarding the WAL
+                # orphans them (never reclaimed, never read). Re-copy when the
+                # drift gets large.
+                log(f"Rollback scratch: {drift:+d} bytes of orphaned-block drift")
+            else:
+                log(
+                    f"Evolved scratch (clause 2.8): size differs from pristine input "
+                    f"by {drift:+d} bytes"
+                )
         log(f"Reusing scratch copy {scratch} (skipping copy; it will be mutated)")
         _evict_page_cache(scratch, dirty=False)
     else:
@@ -705,6 +747,21 @@ def benchmark_db(args, run_dir, filename):
         args.pin_layout_entries,
         args.duckdb_memory_limit,
     )
+    if args.rollback_scratch:
+        # Keep every refresh mutation out of the base file so deleting the .wal
+        # restores the scratch: no auto-checkpoint mid-run, and no WAL-bypass
+        # for large writes (below the skip threshold DuckDB checkpoints big
+        # transactions straight into the base on commit). Database-scoped, so
+        # the refresh stream's connections inherit them. The matching "no clean
+        # close" half lives in _rollback_exit — DuckDB force-checkpoints the
+        # WAL on shutdown and has no opt-out.
+        for stmt in (
+            "SET checkpoint_threshold='1TB'",
+            "SET wal_autocheckpoint='1TB'",
+            f"SET auto_checkpoint_skip_wal_threshold={1 << 40}",
+        ):
+            sql(con, stmt)
+        log("Rollback scratch armed: WAL-only mutations, restore = delete .wal")
     try:
         if args.pin_compression:
             compressed = compressed_pin_count(os.environ["SIRIUS_LOG_DIR"])
@@ -722,9 +779,16 @@ def benchmark_db(args, run_dir, filename):
         # exception escaping this finally would discard the power metrics and
         # skip validation. Log and continue instead.
         try:
-            close_benchmark_db(con, args.pin, args.pin_layout_entries)
+            close_benchmark_db(
+                con, args.pin, args.pin_layout_entries, close=not args.rollback_scratch
+            )
         except Exception as e:  # noqa: BLE001 - reported, run results still written
             log(f"WARNING: unpin/close failed (continuing to metrics/validation): {e}")
+        if args.rollback_scratch:
+            # The connection must never be closed (close force-checkpoints the
+            # WAL into the base); keep it alive until _rollback_exit's os._exit
+            # skips interpreter teardown and destructors.
+            _ROLLBACK_KEEPALIVE.append(con)
         if not args.keep_scratch_db:
             for f in (scratch, scratch + ".wal"):
                 if os.path.exists(f):
@@ -783,7 +847,8 @@ def power_run(con, args, run_dir, writer):
                 log(f"  q{q}: {elapsed:.4f}s ({len(rows)} rows)")
             return times, rows_by_q
 
-        check_refresh_matches_base(cpu, args.refresh_dir, 1)
+        power_set = args.update_set_offset + 1
+        check_refresh_matches_base(cpu, args.refresh_dir, power_set)
         counts_base = table_counts(cpu)
         log(f"Base counts: {counts_base}")
 
@@ -810,14 +875,16 @@ def power_run(con, args, run_dir, writer):
             t_clean, _ = timed_pass("power_clean", "result_clean.txt")
 
         log("=== Power: RF1 (insert update set 1) ===")
-        t_rf1 = run_refresh(rf, rf1_statements(args.refresh_dir, 1), "RF1")
+        t_rf1 = run_refresh(rf, rf1_statements(args.refresh_dir, power_set), "RF1")
         with _write_lock:
             writer.writerow(["power", 0, "rf1", f"{t_rf1:.6f}"])
 
         counts_rf1 = table_counts(cpu)
-        expected_orders = count_lines(refresh_file(args.refresh_dir, "orders.tbl.u1"))
+        expected_orders = count_lines(
+            refresh_file(args.refresh_dir, f"orders.tbl.u{power_set}")
+        )
         expected_lineitem = count_lines(
-            refresh_file(args.refresh_dir, "lineitem.tbl.u1")
+            refresh_file(args.refresh_dir, f"lineitem.tbl.u{power_set}")
         )
         counts_ok = (
             counts_rf1["orders"] == counts_base["orders"] + expected_orders
@@ -833,12 +900,14 @@ def power_run(con, args, run_dir, writer):
             stash_gpu_rows(run_dir, "after_rf1", rows_p0)
 
         log("=== Power: RF2 (delete update set 1) ===")
-        t_rf2 = run_refresh(rf, rf2_statements(args.refresh_dir, 1), "RF2")
+        t_rf2 = run_refresh(rf, rf2_statements(args.refresh_dir, power_set), "RF2")
         with _write_lock:
             writer.writerow(["power", 0, "rf2", f"{t_rf2:.6f}"])
 
         counts_rf2 = table_counts(cpu)
-        expected_deletes = count_lines(refresh_file(args.refresh_dir, "delete.1"))
+        expected_deletes = count_lines(
+            refresh_file(args.refresh_dir, f"delete.{power_set}")
+        )
         counts_ok = (
             counts_rf2["orders"] == counts_rf1["orders"] - expected_deletes
             and counts_rf2["lineitem"] < counts_rf1["lineitem"]
@@ -895,7 +964,7 @@ def throughput_run(con, args, run_dir, writer, streams):
     check_cur = con.cursor()
     sql(check_cur, "SET gpu_execution = false")
     try:
-        check_refresh_matches_base(check_cur, args.refresh_dir, 2)
+        check_refresh_matches_base(check_cur, args.refresh_dir, args.update_set_offset + 2)
     finally:
         check_cur.close()
 
@@ -950,7 +1019,8 @@ def throughput_run(con, args, run_dir, writer, streams):
             sql(cur, "SET gpu_execution = false")
             barrier.wait()
             for pair in range(1, streams + 1):
-                n = pair + 1  # set 1 belongs to the power run
+                # set offset+1 belongs to the power run
+                n = args.update_set_offset + pair + 1
                 t1 = run_refresh(
                     cur, rf1_statements(args.refresh_dir, n), f"RF1(set {n})"
                 )
@@ -1114,6 +1184,7 @@ def write_run_info(run_dir, args, streams):
         f"sf: {args.sf:g}",
         f"streams: {streams}",
         f"pin: {args.pin}",
+        f"update_set_offset: {args.update_set_offset}",
         f"pin_layout: {args.pin_layout or '(uniform)'}",
         f"pin_compression: {args.pin_compression}",
         f"compression_plan_dir: "
@@ -1255,6 +1326,17 @@ def parse_args():
         help="Keep the per-phase database copies instead of deleting them",
     )
     p.add_argument(
+        "--update-set-offset",
+        type=int,
+        default=0,
+        help="Skip the first N dbgen update sets (spec clause 2.8 database "
+        "evolution): the power run uses set N+1 and the throughput streams "
+        "N+2..N+streams+1. Lets one evolving database be reused across runs "
+        "(pass --scratch-db <shared> --keep-scratch-db) instead of copying a "
+        "pristine image per run. Requires --no-validation when non-zero (the "
+        "validation child replays set 1 on the pristine input).",
+    )
+    p.add_argument(
         "--nsys-per-query",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1282,6 +1364,19 @@ def parse_args():
         "scratch (skips the copy phase after a failed attempt). The file is "
         "mutated by the refresh functions and deleted at the end unless "
         "--keep-scratch-db.",
+    )
+    p.add_argument(
+        "--rollback-scratch",
+        action="store_true",
+        help="Roll the scratch back instead of consuming it: refresh mutations "
+        "are confined to the WAL (checkpoints suppressed), the process ends "
+        "without a clean close (DuckDB force-checkpoints on shutdown, no "
+        "opt-out), and deleting <scratch>.wal afterwards restores it — every "
+        "run reuses offset 0 with no 15-minute re-copy. Requires --scratch-db; "
+        "implies --keep-scratch-db. The base file keeps a little orphaned-"
+        "block drift per run (optimistic bulk writes); re-copy when it grows "
+        "large. Not for --nsys-per-query runs (os._exit can truncate the last "
+        "capture).",
     )
     return p.parse_args()
 
@@ -1311,11 +1406,22 @@ def main():
 
     streams = args.streams if args.streams is not None else default_streams(args.sf)
 
+    if args.rollback_scratch:
+        if not args.scratch_db:
+            raise SystemExit("--rollback-scratch requires --scratch-db")
+        # The rollback IS the cleanup: never delete the scratch we restore.
+        args.keep_scratch_db = True
+
     # Validation diffs GPU vs CPU rows, so it needs the fixed default predicates.
     if args.vary_predicates and args.validation:
         raise SystemExit("--vary-predicates does not support --validation")
+    # The validation child replays update set 1 on a copy of the pristine
+    # --input; an evolved database (non-zero offset) makes that comparison
+    # meaningless.
+    if args.update_set_offset and args.validation:
+        raise SystemExit("--update-set-offset requires --no-validation")
     if args.validation is None:
-        args.validation = not args.vary_predicates
+        args.validation = not args.vary_predicates and not args.update_set_offset
 
     # A mixed-tier layout replaces the uniform-tier pin placement; the layout
     # names its own tiers, so it only conflicts with an explicit --pin none.
@@ -1354,9 +1460,11 @@ def main():
     # Fail fast if any needed refresh set or query stream is missing.
     needed = []
     if args.mode in ("power", "both"):
-        needed.append(1)
+        needed.append(args.update_set_offset + 1)
     if args.mode in ("throughput", "both"):
-        needed.extend(range(2, streams + 2))
+        needed.extend(
+            range(args.update_set_offset + 2, args.update_set_offset + streams + 2)
+        )
     for n in needed:
         rf1_statements(args.refresh_dir, n)
         rf2_statements(args.refresh_dir, n)
@@ -1447,6 +1555,7 @@ def main():
         "sf": args.sf,
         "streams": streams,
         "pin": args.pin,
+        "update_set_offset": args.update_set_offset,
         "pin_layout": args.pin_layout,
         "pin_layout_entries": args.pin_layout_entries,
         "pin_compression": args.pin_compression,
@@ -1485,7 +1594,10 @@ def main():
             if val.get(label):
                 failures.append(f"validation {label}: {sorted(val[label])}")
     if failures:
+        log("FAILED: " + "; ".join(failures))
+        _rollback_exit(args, 1)
         raise SystemExit("FAILED: " + "; ".join(failures))
+    _rollback_exit(args, 0)
 
 
 if __name__ == "__main__":
