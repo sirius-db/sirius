@@ -172,9 +172,14 @@ static void from_yaml(const YAML::Node& node, sirius::io::object_store_config& o
 static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
 {
   yaml::reader r(node, "rest");
+  for (auto const* key : {"ca_bundle_path", "tls_verify"}) {
+    if (r.has(key)) {
+      throw std::runtime_error("'sirius.executor.scan_manager.rest." + std::string(key) +
+                               "': removed; configure 'sirius.executor.scan_manager.object_store." +
+                               key + "' instead");
+    }
+  }
   r.optional("request_timeout_s", opt.request_timeout_s);
-  r.optional("ca_bundle_path", opt.ca_bundle_path);
-  r.optional("tls_verify", opt.tls_verify);
   r.optional("max_connections", opt.max_connections);
   r.optional("chunk_size", yaml::bytes(opt.chunk_size));
   r.optional("max_n_chunks", opt.max_n_chunks);

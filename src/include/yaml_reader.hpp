@@ -401,7 +401,14 @@ class reader {
   }
 
   /// Check whether a key exists in the map.
-  [[nodiscard]] bool has(const std::string& key) const { return find(key).IsDefined(); }
+  [[nodiscard]] bool has(const std::string& key) const
+  {
+    if (!node_.IsMap()) return false;
+    for (auto it = node_.begin(); it != node_.end(); ++it) {
+      if (it->first.as<std::string>() == key) return true;
+    }
+    return false;
+  }
 
   /// Check whether a key exists in the map and has a non-null value.
   [[nodiscard]] bool has_value(const std::string& key) const
