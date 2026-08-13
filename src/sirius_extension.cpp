@@ -1905,14 +1905,16 @@ static void SetMaxSortPartitionMemoryFraction(ClientContext& context,
                                               SetScope scope,
                                               Value& parameter)
 {
+  const double fraction = parameter.GetValue<double>();
+  if (!std::isfinite(fraction) || fraction <= 0.0 || fraction > 1.0) {
+    throw InvalidInputException(
+      "max_sort_partition_memory_fraction must be finite, greater than 0.0, and at most 1.0, got "
+      "%f",
+      fraction);
+  }
   auto* params = get_operator_params(context);
   if (!params) { return; }
-  auto slot             = lock_operator_params_slot(context);
-  const double fraction = parameter.GetValue<double>();
-  if (fraction < 0.0 || fraction > 1.0) {
-    throw InvalidInputException(
-      "max_sort_partition_memory_fraction must be between 0.0 and 1.0, got %f", fraction);
-  }
+  auto slot                                  = lock_operator_params_slot(context);
   params->max_sort_partition_memory_fraction = fraction;
   SIRIUS_LOG_DEBUG("Updated config MAX_SORT_PARTITION_MEMORY_FRACTION to {}",
                    params->max_sort_partition_memory_fraction);
@@ -2357,6 +2359,27 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                     LogicalType::UBIGINT,
                     Value::UBIGINT(operator_defaults.concat_batch_bytes),
                     SetConcatBatchBytes);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "max_sort_partition_memory_fraction",
+                    "override the internal automatic sort-partition memory fraction",
+                    LogicalType::DOUBLE,
+                    Value::DOUBLE(operator_defaults.max_sort_partition_memory_fraction),
+                    SetMaxSortPartitionMemoryFraction);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sort_sample_bytes",
+                    "override the effective-capacity-derived sort sample",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(operator_defaults.sort_sample_bytes),
+                    SetSortSampleBytes);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "max_sort_partition_bytes",
+                    "override the automatic GPU-memory-derived sort partition size",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(operator_defaults.max_sort_partition_bytes),
+                    SetMaxSortPartitionBytes);
 
   // Add in config options for special JIT implementation for regex
   add_sirius_option(config,
@@ -2375,20 +2398,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                             Value::BOOLEAN(Config::MODIFIED_PIPELINE),
                             SetModifiedPipeline);
 #endif
-
-  // Add in config option for sort partition size
-  config.AddExtensionOption("max_sort_partition_bytes",
-                            "Maximum bytes per sort partition (0 = auto based on "
-                            "max_sort_partition_memory_fraction of GPU memory)",
-                            LogicalType::UBIGINT,
-                            Value::UBIGINT(operator_defaults.max_sort_partition_bytes),
-                            SetMaxSortPartitionBytes);
-  config.AddExtensionOption(
-    "max_sort_partition_memory_fraction",
-    "Fraction of available GPU memory per sort partition when max_sort_partition_bytes is 0",
-    LogicalType::DOUBLE,
-    Value::DOUBLE(operator_defaults.max_sort_partition_memory_fraction),
-    SetMaxSortPartitionMemoryFraction);
 
   // Logging configuration
   config.AddExtensionOption("sirius_log_backend",
@@ -2417,12 +2426,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                             LogicalType::UBIGINT,
                             Value::UBIGINT(operator_defaults.hash_partition_bytes),
                             SetHashPartitionBytes);
-
-  config.AddExtensionOption("sort_sample_bytes",
-                            "Target bytes to sample before computing sort partition boundaries",
-                            LogicalType::UBIGINT,
-                            Value::UBIGINT(operator_defaults.sort_sample_bytes),
-                            SetSortSampleBytes);
 
   config.AddExtensionOption("max_build_hash_table_bytes",
                             "Maximum size a build-side table can be where it will create a "
