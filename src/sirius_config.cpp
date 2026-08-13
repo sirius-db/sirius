@@ -94,8 +94,8 @@ static void validate_downgrade_fractions(std::string_view scope, double trigger,
 static void from_yaml(const YAML::Node& node, cucascade::memory::gpu_memory_space_config& opt)
 {
   opt.per_stream_reservation = false;  // default to false for sirius
-  yaml::reader r(node, "gpu_memory_space");
-  r.optional("device_id", opt.device_id);
+  yaml::reader r(node, "sirius.space.gpu");
+  r.required("device_id", opt.device_id);
   r.optional("per_stream_reservation", opt.per_stream_reservation);
   r.optional(
     "reservation_limit_fraction", opt.reservation_limit_fraction, yaml::fraction<double>{});
@@ -104,6 +104,9 @@ static void from_yaml(const YAML::Node& node, cucascade::memory::gpu_memory_spac
   r.optional("downgrade_stop_fraction", opt.downgrade_stop_fraction, yaml::fraction<double>{});
   r.optional("memory_capacity", yaml::bytes(opt.memory_capacity));
   r.reject_unknown();
+  if (opt.device_id < 0) {
+    throw std::runtime_error("sirius.space.gpu: device_id must be non-negative");
+  }
   validate_downgrade_fractions(
     "sirius.space.gpu", opt.downgrade_trigger_fraction, opt.downgrade_stop_fraction);
 }

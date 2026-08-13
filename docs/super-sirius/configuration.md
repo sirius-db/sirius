@@ -194,7 +194,7 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `device_id` | int | 0 | CUDA device the space lives on. |
+| `device_id` | non-negative int | required | CUDA device the space lives on. |
 | `per_stream_reservation` | bool | false | Track reservations per CUDA stream (forced false unless set). |
 | `reservation_limit_fraction` | double [0,1] | space default | Fraction of the space that may be reserved. |
 | `downgrade_trigger_fraction` | double (0,1] | space default | Start evicting above this fraction. Must be greater than `downgrade_stop_fraction`. |

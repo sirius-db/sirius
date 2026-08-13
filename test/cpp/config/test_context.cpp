@@ -560,6 +560,30 @@ TEST_CASE("Sirius configuration rejects invalid downgrade hysteresis", "[sirius]
   }
 }
 
+TEST_CASE("Sirius configuration requires a valid low-level GPU device id", "[sirius][config]")
+{
+  struct invalid_config {
+    const char* fixture;
+    const char* constraint;
+  };
+
+  const invalid_config cases[] = {
+    {"invalid_space_gpu_device_id_missing.yaml", "required but missing"},
+    {"invalid_space_gpu_device_id_null.yaml", "required but missing"},
+    {"invalid_space_gpu_device_id_negative.yaml", "must be non-negative"},
+  };
+
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+  for (auto const& invalid : cases) {
+    INFO("fixture=" << invalid.fixture << " constraint=" << invalid.constraint);
+    sirius::sirius_config config;
+    REQUIRE_THROWS_WITH(config.load_from_file(data_dir / invalid.fixture),
+                        Catch::Contains("sirius.space.gpu") && Catch::Contains("device_id") &&
+                          Catch::Contains(invalid.constraint));
+  }
+}
+
 TEST_CASE("Sirius downgrade hysteresis accepts omitted, null, and one-sided defaults",
           "[sirius][config]")
 {
