@@ -110,6 +110,31 @@ TEST_CASE("Task scheduler can start and stop gracefully", "[task_scheduler]")
   REQUIRE_NOTHROW(executor.stop());
 }
 
+TEST_CASE("Task scheduler derives GPU executor affinity from topology", "[task_scheduler][config]")
+{
+  auto manager = initialize_memory_manager(1);
+  sirius::exec::thread_pool_config gpu_config{2};
+  gpu_config.cpu_affinity_list = {999};
+
+  cucascade::memory::system_topology_info topology;
+  topology.num_gpus = 1;
+  cucascade::memory::gpu_topology_info gpu;
+  gpu.id        = 0;
+  gpu.cpu_cores = {3, 7};
+  topology.gpus.push_back(std::move(gpu));
+
+  task_scheduler executor(
+    gpu_config, *manager, sirius::test::make_test_telemetry_context(), &topology);
+
+  std::size_t visited = 0;
+  executor.visit_executors([&](int device_id, auto const& gpu_executor) {
+    REQUIRE(device_id == 0);
+    REQUIRE(gpu_executor.get_effective_config().cpu_affinity_list == std::vector<int>{3, 7});
+    ++visited;
+  });
+  REQUIRE(visited == 1);
+}
+
 TEST_CASE("Task scheduler executes tasks through pipeline_queue", "[task_scheduler]")
 {
   auto manager = initialize_memory_manager(1);

@@ -362,6 +362,13 @@ uint64_t expected_effective_batch(const sirius::sirius_config& config)
 
 }  // namespace
 
+TEST_CASE("Sirius derives GPU pipeline affinity from hardware topology", "[sirius][config]")
+{
+  sirius::sirius_config config;
+  REQUIRE_THROWS_WITH(config.load_from_file(config_fixture("invalid_pipeline_cpu_affinity.yaml")),
+                      Catch::Contains("unknown config key: 'cpu_affinity' in thread_pool"));
+}
+
 TEST_CASE("operator batch defaults use the smallest low-level GPU capacity",
           "[sirius][config][operator_defaults]")
 {

@@ -140,7 +140,6 @@ static void from_yaml(const YAML::Node& node, exec::thread_pool_config& opt)
   yaml::reader r(node, "thread_pool");
   r.optional("num_threads", opt.num_threads, yaml::greater_than<int>{0});
   r.optional("thread_name_prefix", opt.thread_name_prefix);
-  r.optional("cpu_affinity", opt.cpu_affinity_list);
   r.reject_unknown();
 }
 
