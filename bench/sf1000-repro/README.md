@@ -27,6 +27,18 @@ pixi run bash bench/sf1000-repro/build-libcudf.sh
 DATA=/path/to/tpch_parquet_sf1000 pixi run bash bench/sf1000-repro/run.sh
 ```
 
+For the TPC-H **official power/throughput run** (RF1/RF2 refresh functions, Power@Size /
+Throughput@Size / QphH@Size) with this same performance stack, use `run-power.sh` — it runs on a
+native `.duckdb` dataset (the MVCC refresh path needs it) with the mixed-tier pin layout in
+`pin-layout-sf1000.json`. Measured 2026-08-11 (SF1000, 7 streams, GPU-vs-CPU validation PASS
+after both refresh functions): **Power@Size 7,165,616 · Throughput@Size 4,951,261 ·
+QphH@Size 5,956,411**.
+
+```bash
+pixi run bash test/tpch_performance/generate_tpch_refresh.sh 1000 9   # one-time refresh sets
+DB=/path/to/tpch_sf1000.duckdb pixi run bash bench/sf1000-repro/run-power.sh
+```
+
 ---
 
 ## What produces the number
