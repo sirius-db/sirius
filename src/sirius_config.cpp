@@ -140,7 +140,6 @@ static void from_yaml(const YAML::Node& node, exec::thread_pool_config& opt)
   yaml::reader r(node, "thread_pool");
   r.optional("num_threads", opt.num_threads, yaml::greater_than<int>{0});
   r.optional("thread_name_prefix", opt.thread_name_prefix);
-  r.optional("cpu_affinity", opt.cpu_affinity_list);
   r.reject_unknown();
 }
 
@@ -325,15 +324,28 @@ struct topology {
   static void from_yaml(const YAML::Node& node, topology& opt)
   {
     yaml::reader r(node, "topology");
-    // gpu_ids and num_gpus are mutually exclusive; try gpu_ids first
-    std::vector<int> ids;
-    r.optional("gpu_ids", ids);
-    if (!ids.empty()) {
+    reject_mutually_exclusive(r, "topology", "gpu_ids", "num_gpus");
+
+    if (r.has_value("gpu_ids")) {
+      std::vector<int> ids;
+      r.optional("gpu_ids", ids);
+      if (ids.empty()) {
+        throw std::runtime_error("topology.gpu_ids must contain at least one device id");
+      }
+      if (std::ranges::any_of(ids, [](int id) { return id < 0; })) {
+        throw std::runtime_error("topology.gpu_ids must contain only non-negative device ids");
+      }
+      auto sorted_ids = ids;
+      std::ranges::sort(sorted_ids);
+      if (std::ranges::adjacent_find(sorted_ids) != sorted_ids.end()) {
+        throw std::runtime_error("topology.gpu_ids must not contain duplicate device ids");
+      }
       opt.num_gpus_or_gpu_ids = std::move(ids);
     } else {
-      size_t n = 0;
+      long long n = 0;
       r.optional("num_gpus", n);
-      opt.num_gpus_or_gpu_ids = n;
+      if (n < 0) { throw std::runtime_error("topology.num_gpus must be non-negative"); }
+      opt.num_gpus_or_gpu_ids = static_cast<size_t>(n);
     }
     // greater_than{-1} is >= 0: a negative count would otherwise silently read as "use all",
     // since the admission path treats any non-positive value as unset.
