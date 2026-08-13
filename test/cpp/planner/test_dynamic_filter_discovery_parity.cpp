@@ -19,7 +19,7 @@
  * @brief Compares Sirius scan-target discovery with DuckDB's join-filter pushdown walk.
  *
  * The DuckDB oracle uses a pre-binding-resolver plan copy; Sirius converts the original
- * optimized plan. Derived-build widening is covered by the evidence, plan-shape, and
+ * optimized plan. Opaque-build fallback is covered by the evidence, plan-shape, and
  * integration suites rather than this parity suite.
  */
 
@@ -800,9 +800,9 @@ TEST_CASE_METHOD(discovery_parity_fixture,
     REQUIRE_FALSE(physical_joins[0]->dynamic_filter_plan().enabled());
   }
 
-  SECTION("an ANTI producer with a derived build still refuses on both sides")
+  SECTION("an ANTI producer with an opaque build still refuses on both sides")
   {
-    // A materialized CTE build arms discovery with derived evidence, so this pins the refusal to
+    // A materialized CTE build arms discovery with opaque evidence, so this pins the refusal to
     // the join type rather than to missing evidence.
     auto c = plan_parity_case(*con,
                               "WITH c AS MATERIALIZED "
@@ -813,7 +813,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
     auto joins = comparison_joins_of(*c.oracle_plan);
     REQUIRE(joins.size() == 1);
     REQUIRE(joins[0]->join_type == duckdb::JoinType::ANTI);
-    REQUIRE(sirius::planner::build_relation_is_derived(*joins[0]->children[1]));
+    REQUIRE(sirius::planner::build_relation_is_opaque(*joins[0]->children[1]));
     REQUIRE_FALSE(sirius::planner::build_subtree_is_filtering(*joins[0]->children[1]));
 
     auto physical_joins = hash_joins_of(c.physical.get());

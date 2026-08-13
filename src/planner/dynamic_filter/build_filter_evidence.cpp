@@ -35,28 +35,16 @@ bool build_subtree_is_filtering(duckdb::LogicalOperator const& op)
   return false;
 }
 
-bool build_relation_is_derived(duckdb::LogicalOperator const& op)
+bool build_relation_is_opaque(duckdb::LogicalOperator const& op)
 {
   switch (op.type) {
-    // Childless derived leaves: the filtering walk bottoms out here, so its "unfiltered" verdict
-    // means "cannot see", not "whole key domain".
     case duckdb::LogicalOperatorType::LOGICAL_DELIM_GET:
-    case duckdb::LogicalOperatorType::LOGICAL_CTE_REF:
-    // Reducing operators: their output key set is a subset of the domain even when no predicate
-    // appears anywhere below them.
-    case duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
-    case duckdb::LogicalOperatorType::LOGICAL_ANY_JOIN:
-    case duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN:
-    case duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
-    case duckdb::LogicalOperatorType::LOGICAL_DISTINCT:
-    case duckdb::LogicalOperatorType::LOGICAL_INTERSECT:
-    case duckdb::LogicalOperatorType::LOGICAL_EXCEPT: return true;
-    default: break;
+    case duckdb::LogicalOperatorType::LOGICAL_CTE_REF: return true;
+    case duckdb::LogicalOperatorType::LOGICAL_PROJECTION:
+      return op.children.size() == 1 && op.children.front() != nullptr &&
+             build_relation_is_opaque(*op.children.front());
+    default: return false;
   }
-  for (auto const& child : op.children) {
-    if (child && build_relation_is_derived(*child)) { return true; }
-  }
-  return false;
 }
 
 }  // namespace sirius::planner

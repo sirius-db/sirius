@@ -126,7 +126,7 @@ switch_comparison require_switch_result_equivalence(duckdb::Connection& con,
 
 }  // namespace
 
-TEST_CASE("gpu_execution - derived-build and build-block routes preserve results",
+TEST_CASE("gpu_execution - opaque-build and build-block routes preserve results",
           "[integration][gpu_execution][dynamic_filter]")
 {
   REQUIRE(sirius::test::g_integration_env != nullptr);
@@ -252,10 +252,10 @@ TEST_CASE("gpu_execution - derived-build and build-block routes preserve results
     REQUIRE(deltas.on.publications_skipped_build_not_whole > 0);
   }
 
-  SECTION("an unfiltered aggregate build supplies derived evidence")
+  SECTION("an unfiltered aggregate build supplies no publication evidence")
   {
-    // No predicate appears anywhere in the build subtree, so only the derivation marker on the
-    // aggregate arms discovery. The join order is pinned so the aggregate stays the build side.
+    // The join order is pinned so the aggregate stays the build side. With no filter in that
+    // visible subtree and no opaque build root, enabling dynamic filters must arm no producer.
     sirius::test::disabled_optimizers_guard shape(con, "join_order,build_side_probe_side");
     sirius::test::coverage_gate_disable_guard gate_off(con);
     auto const deltas = require_switch_result_equivalence(
@@ -264,10 +264,11 @@ TEST_CASE("gpu_execution - derived-build and build-block routes preserve results
       "join (select l_orderkey from lineitem group by l_orderkey) g "
       "on l.l_orderkey = g.l_orderkey");
 
-    REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
+    REQUIRE(deltas.off.producers_enabled == 0);
+    REQUIRE(deltas.on.producers_enabled == deltas.off.producers_enabled);
   }
 
-  SECTION("TPC-H q17: a delim-scan build wires only through derived-build evidence")
+  SECTION("TPC-H q17: a delim-scan build wires only through opaque-build evidence")
   {
     auto const deltas =
       require_switch_result_equivalence(con,

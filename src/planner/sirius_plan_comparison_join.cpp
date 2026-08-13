@@ -415,10 +415,10 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   bool const dynamic_filter_enabled =
     sirius_context && sirius_context->get_config().get_operator_params().enable_dynamic_filter;
 
-  // Filter or derived-relation evidence enables discovery; tracked apart only for the wired log.
+  // Filter or opaque-build evidence enables discovery; tracked apart only for the wired log.
   bool const build_filtered = dynamic_filter_enabled && build_subtree_is_filtering(*op.children[1]);
-  bool const build_derived  = dynamic_filter_enabled && build_relation_is_derived(*op.children[1]);
-  bool const build_evidence = build_filtered || build_derived;
+  bool const build_opaque   = dynamic_filter_enabled && build_relation_is_opaque(*op.children[1]);
+  bool const build_evidence = build_filtered || build_opaque;
 
   // Gather domain evidence before create_plan() moves state out of the logical children.
   auto condition_domains =
@@ -606,7 +606,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
         targets.size(),
         scan_target_count,
         targets.size() - scan_target_count,
-        build_filtered ? (build_derived ? "filtered+derived" : "filtered") : "derived",
+        build_filtered ? (build_opaque ? "filtered+opaque" : "filtered") : "opaque",
         rhs_cardinality);
     } else if (build_evidence && op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
                !admitted_keys.empty() && (gpu_spaces.empty() || host_spaces.empty())) {
@@ -618,7 +618,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                !admitted_keys.empty()) {
       SIRIUS_LOG_INFO(
         "[sirius_plan_comparison_join] Not wiring dynamic filter(s): build side carries "
-        "neither filter nor derivation evidence (build est {} rows).",
+        "neither filter nor opaque-build evidence (build est {} rows).",
         rhs_cardinality);
     }
 

@@ -488,7 +488,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("filter on, unfiltered build: no endpoint wires anywhere")
   {
-    // An unfiltered base-table build supplies neither filter nor derivation evidence, and either
+    // An unfiltered base-table build supplies neither filter nor opaque-build evidence, and either
     // kind would arm discovery for both routes -- with neither, no route wires.
     dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
     auto plan = generate_sirius_plan(*con, query, keep_shape);
@@ -674,10 +674,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER).empty());
   }
 
-  SECTION("unfiltered aggregate build: derived evidence wires the scan route")
+  SECTION("unfiltered aggregate build: no DYNAMIC_FILTER anywhere")
   {
-    // No predicate appears anywhere in the build subtree, so the aggregate is the only derivation
-    // marker arming discovery.
     dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
     auto plan = generate_sirius_plan(*con,
                                      "SELECT * FROM big_left l JOIN "
@@ -686,22 +684,37 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                                      keep_shape);
     INFO(tree_to_string(plan.get()));
 
-    auto endpoints = collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER);
-    REQUIRE(endpoints.size() == 1);
-    REQUIRE(endpoints.front()->children.size() == 1);
-    CHECK(endpoints.front()->children[0]->type == SiriusPhysicalOperatorType::GPU_SCAN);
-
-    auto* hj = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
-    REQUIRE(hj != nullptr);
-    CHECK(contains(hj->children[0].get(), endpoints.front()));
-
+    CHECK(collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER).empty());
     require_parent_links(plan.get(), /*expected_parent=*/nullptr);
   }
 
-  SECTION("unfiltered join-output build: derived evidence wires the scan route")
+  SECTION("filtered aggregate build: filter evidence still wires the scan route")
   {
-    // The same rule through a different marker: the build is a join output with no predicate
-    // anywhere below it.
+    dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
+    auto plan = generate_sirius_plan(*con,
+                                     "SELECT * FROM big_left l JOIN "
+                                     "(SELECT rid, count(*) c FROM small_right "
+                                     " WHERE other % 2 = 0 GROUP BY rid) r "
+                                     "ON l.id = r.rid",
+                                     keep_shape);
+    INFO(tree_to_string(plan.get()));
+
+    auto* outer = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+    REQUIRE(outer != nullptr);
+    auto const& targets =
+      outer->Cast<sirius::op::sirius_physical_hash_join>().dynamic_filter_plan().probe_targets();
+    REQUIRE(targets.size() == 1);
+    CHECK(targets.front().route_class == sirius::op::dynamic_filter_route_class::scan);
+
+    auto endpoints = collect(outer->children[0].get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER);
+    REQUIRE(endpoints.size() == 1);
+    REQUIRE(endpoints.front()->children.size() == 1);
+    CHECK(endpoints.front()->children[0]->type == SiriusPhysicalOperatorType::GPU_SCAN);
+    require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+  }
+
+  SECTION("unfiltered join-output build: no outer dynamic filter is wired")
+  {
     dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
     auto plan = generate_sirius_plan(*con,
                                      "SELECT * FROM big_left l JOIN "
@@ -711,13 +724,36 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                                      keep_shape);
     INFO(tree_to_string(plan.get()));
 
-    auto* hj = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
-    REQUIRE(hj != nullptr);
-    auto endpoints = collect(hj->children[0].get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER);
+    auto* outer = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+    REQUIRE(outer != nullptr);
+    CHECK_FALSE(
+      outer->Cast<sirius::op::sirius_physical_hash_join>().dynamic_filter_plan().enabled());
+    CHECK(collect(outer->children[0].get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER).empty());
+    require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+  }
+
+  SECTION("filtered join-output build: filter evidence still wires the outer scan route")
+  {
+    dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
+    auto plan = generate_sirius_plan(*con,
+                                     "SELECT * FROM big_left l JOIN "
+                                     "(SELECT r.rid FROM small_right r JOIN small_c c "
+                                     " ON r.other = c.ckey WHERE c.cother % 2 = 0) j "
+                                     "ON l.id = j.rid",
+                                     keep_shape);
+    INFO(tree_to_string(plan.get()));
+
+    auto* outer = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+    REQUIRE(outer != nullptr);
+    auto const& targets =
+      outer->Cast<sirius::op::sirius_physical_hash_join>().dynamic_filter_plan().probe_targets();
+    REQUIRE(targets.size() == 1);
+    CHECK(targets.front().route_class == sirius::op::dynamic_filter_route_class::scan);
+
+    auto endpoints = collect(outer->children[0].get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER);
     REQUIRE(endpoints.size() == 1);
     REQUIRE(endpoints.front()->children.size() == 1);
     CHECK(endpoints.front()->children[0]->type == SiriusPhysicalOperatorType::GPU_SCAN);
-
     require_parent_links(plan.get(), /*expected_parent=*/nullptr);
   }
 
@@ -748,11 +784,11 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
-                 "plan tree shape - a derived build arms the scan route",
+                 "plan tree shape - an opaque build arms the scan route",
                  "[plan_tree_shape][isolated_context]")
 {
   // IsFiltering cannot inspect the CTE definition through its childless CTE_SCAN build, so
-  // derived-build evidence arms discovery.
+  // opaque-build evidence arms discovery.
   const std::string cte_query =
     "WITH r AS MATERIALIZED (SELECT rid FROM small_right WHERE other % 2 = 0) "
     "SELECT * FROM big_left l JOIN r ON l.id = r.rid";
@@ -795,7 +831,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   }
 
   // This reproduces q17's delim shape: the correlated side builds from a DELIM_GET and wires only
-  // through derived-build evidence, while the flat side wires an ordinary scan-route endpoint.
+  // through opaque-build evidence, while the flat side wires an ordinary scan-route endpoint.
   const std::string delim_query =
     "SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
     "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)";

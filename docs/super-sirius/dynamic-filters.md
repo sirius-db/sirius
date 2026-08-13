@@ -37,11 +37,11 @@ The framework has four pieces, all designed to be filter-kind, producer-kind, an
 ```mermaid
 flowchart LR
     subgraph PLAN["Plan construction"]
-        EVIDENCE["build_filter_evidence<br/>IsFiltering mirror + derived-build classifier"]
+        EVIDENCE["build_filter_evidence<br/>IsFiltering mirror + opaque-build classifier"]
         DISCOVERY["target discovery walk<br/>one trace per admitted key over the built probe subtree"]
         PUBPLAN["dynamic_filter_publish_plan<br/>target channels + key bindings<br/>GPU/HOST replica spaces + policy"]
 
-        EVIDENCE -->|"either evidence kind arms discovery"| DISCOVERY
+        EVIDENCE -->|"filter or opaque-root evidence arms discovery"| DISCOVERY
         DISCOVERY -->|"attach or mint"| CHANNEL
         DISCOVERY -->|"freeze producer configuration"| PUBPLAN
     end
@@ -115,7 +115,14 @@ Consumer access is via `filters_for_column(col_idx)` and `filtered_columns()`. T
 
 Before constructing the hash join, `sirius_physical_plan_generator::plan_comparison_join` owns the built probe subtree and discovers targets. For each admitted key, `trace_probe_key` follows the shared descent rules from the probe-child ordinal. A GPU table-scan terminal binds the key to that scan. Another terminal is a candidate join-edge site; `place_endpoint` handles it only after `direct_route_admissible` accepts the key. Scan nodes store their channels, allowing multiple producers that reach the same scan to share one. The walk also fans out through physical set operations, though no planner constructs one yet.
 
-Sirius does not consume DuckDB dynamic-filter metadata in production. DuckDB retains that metadata for CPU fallback; the test-only `duckdb_join_filter_candidate_adapter` compares the shared scan-walk cases with `GetPushdownFilterTargets`. Sirius discovery instead requires either `build_subtree_is_filtering` or `build_relation_is_derived`. Scan binding also requires `scan_route_join_type_admissible`; join-edge placement requires `direct_route_admissible`. A future Phase 3 producer that must pair with an operator it does not own would need new pairing machinery; nothing does today.
+Sirius does not consume DuckDB dynamic-filter metadata in production. DuckDB retains that metadata for CPU fallback; the test-only `duckdb_join_filter_candidate_adapter` compares the shared scan-walk cases with `GetPushdownFilterTargets`. Sirius runs discovery only when `build_subtree_is_filtering` or `build_relation_is_opaque` supplies build evidence. The first predicate recursively mirrors DuckDB's `JoinFilterPushdownOptimizer::IsFiltering`. The second is a narrow fallback for a `LOGICAL_DELIM_GET` or `LOGICAL_CTE_REF` build root whose defining subtree is unavailable at this join; it unwraps only valid single-child `LOGICAL_PROJECTION` roots. A visible aggregate, join, distinct, set operation, limit, order, or other non-projection root is never opaque merely because an opaque leaf exists below it. Scan binding also requires `scan_route_join_type_admissible`; join-edge placement requires `direct_route_admissible`. A future Phase 3 producer that must pair with an operator it does not own would need new pairing machinery; nothing does today.
+
+| Build evidence at the producing join | Discovery |
+|---|---|
+| Any visible build subtree containing a GET table filter, FILTER, or TOP_N | Armed by `build_subtree_is_filtering` |
+| DELIM_GET or CTE_REF root, optionally through projections | Armed by `build_relation_is_opaque` |
+| Unfiltered visible aggregate or join output | Not armed |
+| Opaque leaf below any non-projection wrapper | Not armed |
 
 ### Producer / consumer wiring
 
@@ -142,7 +149,7 @@ The planner-side components and the order they run in:
 ```mermaid
 flowchart TB
     LOGICAL["DuckDB optimized logical comparison join"]
-    EVIDENCE["build-filter evidence<br/>IsFiltering mirror + derived-build classifier"]
+    EVIDENCE["build-filter evidence<br/>IsFiltering mirror + opaque-build classifier"]
     DOMAIN["build-key domain walk<br/>native row upper bounds"]
     UNIQUE["build-subtree uniqueness proof"]
     ADMIT["key admission<br/>dense admitted keys"]
@@ -567,11 +574,13 @@ For both representations, the constructor enqueues creation of an owned source r
 
 **Producer:** hash-join build (unchanged).
 **Consumer (new placement):** `sirius_physical_dynamic_filter` in `membership_masks_only` mode, spliced into the producer's probe subtree — the same operator Phase 1 puts above a scan, in a new position. No new operator, no new filter kind, no new code path inside the hash-join probe.
-**Routing:** one trace serves both routes, and a scan bind wins. Either evidence predicate can arm discovery. A derived build supplies evidence even without a visible filter; an unfiltered base-table image supplies neither. A GPU-scan terminal binds to the scan. Any other terminal may receive a join-edge endpoint after direct-route admission.
+**Routing:** one trace serves both routes, and a scan bind wins. Discovery is armed by visible filter evidence or the narrow opaque-build fallback. A GPU-scan terminal binds to the scan. Any other terminal may receive a join-edge endpoint after direct-route admission.
 
-`build_relation_is_derived` calls a build derived when its subtree contains a **derivation marker** anywhere below the root, recursing through every other operator. A marker is either a childless derived leaf (`DELIM_GET`, `CTE_REF`) or a reducing operator (comparison / any / delim join, grouped aggregate, distinct, intersect, except). `UNION` is deliberately not a marker, because it does not reduce its inputs' key sets. The reason the rule is not "does a predicate appear below this build" is that "unfiltered" implies "whole key domain" only for a base-table image. A derived relation's key set is already a subset of the domain — a join output carries only the keys that survived, an aggregate collapses to its groups — so the plan cannot rule its filter out and the runtime decides its worth instead. Sirius can therefore admit `DELIM_GET` scan bindings when DuckDB's `build_side_has_filter` is false.
+`build_relation_is_opaque` returns true only when the build root is `LOGICAL_DELIM_GET` or `LOGICAL_CTE_REF`, optionally below a chain of valid single-child `LOGICAL_PROJECTION` roots. These childless roots hide the relation definition from `build_subtree_is_filtering`, so an "unfiltered" result means that the planner cannot inspect the definition rather than that the build covers its whole key domain. Projection is the only transparent wrapper because it does not establish a new relational boundary. A malformed projection returns false, and every other root is a hard false with no arbitrary descendant recursion.
 
-The classifier is structural, not a selectivity proof, and it has a known false-positive class: the **cardinality-preserving enrichment join**, a build that joins a table to a dimension on that dimension's key. It is structurally derived, yet it emits every key its larger input held. Two gates contain that case. The build-key domain-coverage gate skips such a key at publication time, before any membership structure is built — the domain walk descends through joins to the underlying scan, so the enrichment join's key still resolves to its base domain. The consumer-side keep-ratio gates then measure what an applied filter keeps and suppress its later mask work. The same containment covers an unfiltered correlation domain or a bare-copy `MATERIALIZED` CTE. In every case the authoritative join preserves results.
+Visible joins, aggregates, distincts, set operations, limits, and orders therefore need actual evidence from `build_subtree_is_filtering`; their structure alone does not establish selectivity. This prevents an unfiltered cardinality-preserving enrichment join from publishing a large no-op membership filter merely because it is a join output. A filtered join or aggregate remains eligible, as does a materialized CTE or DELIM_GET build whose definition is opaque at the producing join. The plan log reports the evidence as `filtered`, `opaque`, or `filtered+opaque`.
+
+The publication-time domain-coverage gate and consumer keep-ratio gate still suppress ineffective filters after discovery, but they are runtime defenses rather than substitutes for plan-time build evidence. The authoritative join preserves results in every case.
 
 **Flag:** the join-edge route uses `enable_dynamic_filter`; it has no separate switch.
 
@@ -630,7 +639,7 @@ An incrementally refined producer/consumer pair, or a consumer that requires a f
 - `src/include/op/dynamic_filter/sirius_dynamic_filter.hpp`, `src/op/dynamic_filter/sirius_dynamic_filter.cpp`, `test/cpp/operator/test_sirius_dynamic_filter.cpp` — framework API, zone-map implementation, channel, and focused tests
 - `src/cuda/sirius_dynamic_small_in_list_filter.cu`, `src/cuda/sirius_dynamic_in_list_filter.cu`, `src/cuda/sirius_dynamic_bloom_filter.cu` — raw-needle, hash-set, and Bloom membership filters plus replica construction
 - `src/include/op/scan/dynamic_filter_merge.hpp`, `src/op/scan/dynamic_filter_merge.cpp`, `test/cpp/scan/test_dynamic_filter_merge.cpp` — consumer-side merge/apply helpers (`merge_dynamic_filters_into_ast`, `apply_dynamic_filters_to_view`, `apply_dynamic_filters_gated_view`)
-- `src/planner/sirius_plan_comparison_join.cpp`, `src/planner/dynamic_filter/dynamic_filter_target_discovery.cpp`, `src/planner/dynamic_filter/build_filter_evidence.cpp` — producer plan-gen wiring, the discovery walk, and the build-route evidence predicates (the `IsFiltering` mirror and the derived-build classifier)
+- `src/planner/sirius_plan_comparison_join.cpp`, `src/planner/dynamic_filter/dynamic_filter_target_discovery.cpp`, `src/include/planner/dynamic_filter/build_filter_evidence.hpp`, `src/planner/dynamic_filter/build_filter_evidence.cpp` — producer plan-gen wiring, the discovery walk, and the build-route evidence predicates (the `IsFiltering` mirror and the opaque-build classifier)
 - `src/planner/dynamic_filter/duckdb_join_filter_candidate_adapter.cpp` — TEST-ONLY parity oracle over DuckDB's join-filter metadata (linked into the test target, not production)
 - `src/op/sirius_physical_concat.cpp`, `src/op/dynamic_filter/dynamic_filter_publisher.cpp`, `src/op/sirius_physical_hash_join.cpp` — synchronous build-port publication, filter selection/replication, and fan-out
 - `src/include/expression_evaluator/gpu_expression_translator_internal.hpp` — existing AST construction patterns (`cudf::ast::tree::emplace`, scalar lifetime)
@@ -643,14 +652,14 @@ Which test pins which contract, so a change to one knows where its guard lives:
 | Test | Contract it pins |
 |---|---|
 | `test/cpp/planner/test_build_key_domain.cpp` | The lineage walk admits only shapes whose rows are an injective image of the traced child's, and refuses everything else with domain 0 |
-| `test/cpp/planner/test_build_filter_evidence.cpp` | The filter-evidence predicate mirrors DuckDB's `IsFiltering` (GET-with-filters, FILTER, TOP_N, any-subtree); the derived-build classifier fires on a derivation marker anywhere in the subtree, admits neither `UNION` nor a row-preserving operator over a base table, and never calls a base-table image derived |
+| `test/cpp/planner/test_build_filter_evidence.cpp` | The filter-evidence predicate mirrors DuckDB's `IsFiltering` (GET-with-filters, FILTER, TOP_N, any-subtree); the opaque-build fallback accepts bare, projected, and stacked-projection DELIM_GET and CTE_REF roots, and rejects malformed projections, old reducing markers, base scans, and opaque leaves below non-projection wrappers |
 | `test/cpp/planner/test_dynamic_filter_key_admission.cpp` | Admission is Sirius-owned and reads the conditions alone; the coordinate spaces stay distinct; only `equal` with a probe-side reference is admitted |
 | `test/cpp/planner/test_dynamic_filter_target_discovery.cpp` | The discovery rules: which hop each operator kind accepts (FILTER and UNION fan-out included), how the traced ordinal is remapped, the SIP policy bit, the producer join-type gate, and that trace and splice agree |
 | `test/cpp/planner/test_dynamic_filter_discovery_parity.cpp` | Per-key parity with DuckDB's own `GetPushdownFilterTargets`, with every conservative divergence (LIMIT, TOP_N, cast crossing, joint-bail) asserted on BOTH sides |
 | `test/cpp/operator/test_dynamic_filter_source_policy.cpp` | Membership-representation selection and both publication gates, as pure functions with no device |
 | `test/cpp/operator/test_dynamic_filter_publisher.cpp` | Publication builds filters only for bound keys, fans out sparsely along bindings, and keeps zone maps out of membership-only targets |
 | `test/cpp/operator/test_dynamic_filter_publication_claim.cpp` | The build-port claim reads only `_build_arrives_whole`, not the join mode, and a wired join that can never claim is counted and logged once |
-| `test/cpp/planner/test_plan_tree_shape.cpp` | Where the endpoint sits in the finished plan tree, including on a join's build input, and that no endpoint appears when a guard rejects the key |
+| `test/cpp/planner/test_plan_tree_shape.cpp` | Where the endpoint sits in the finished plan tree, including on a join's build input; unfiltered visible aggregate and join-output builds do not wire, filtered equivalents still wire, and opaque CTE/DELIM roots retain their routes |
 | `test/cpp/pipeline/test_pipeline_dynamic_filter_native_shape.cpp` | Every endpoint is fed pipelineable data, never a PARTITION's output, on both routes |
 | `test/cpp/integration/test_gpu_execution_dynamic_filter_native.cpp` | Scan-route results match CPU exactly, and the coverage gate fires and stays quiet where it should |
-| `test/cpp/integration/test_gpu_execution_dynamic_filter_sip.cpp` | Derived-build and join-edge placements change no result row, and the publication counters show the routes are not inert; a single-partition `MIXED_JOIN` publishes through the partition fold, a multi-partition build publishes nothing and is counted as such, and an unfiltered aggregate build arms discovery |
+| `test/cpp/integration/test_gpu_execution_dynamic_filter_sip.cpp` | Opaque-build and join-edge placements change no result row; a single-partition `MIXED_JOIN` publishes through the partition fold, a multi-partition build publishes nothing and is counted as such, an unfiltered aggregate build arms no producer, and the q17 DELIM_GET route remains active |

@@ -18,10 +18,10 @@
  * @file build_filter_evidence.hpp
  * @brief Classifies logical join builds for dynamic-filter routing
  *
- * Either `build_subtree_is_filtering` or `build_relation_is_derived` can arm scan and join-edge
+ * Either `build_subtree_is_filtering` or `build_relation_is_opaque` can arm scan and join-edge
  * target discovery. Sirius owns both checks and does not consume DuckDB pushdown metadata:
  * `build_subtree_is_filtering` mirrors DuckDB's `JoinFilterPushdownOptimizer::IsFiltering`, while
- * `build_relation_is_derived` intentionally widens discovery for derived builds.
+ * `build_relation_is_opaque` covers build roots whose defining subtree is unavailable here.
  */
 
 #pragma once
@@ -42,19 +42,12 @@ namespace sirius::planner {
 [[nodiscard]] bool build_subtree_is_filtering(duckdb::LogicalOperator const& op);
 
 /**
- * @brief Reports whether a logical relation is derived rather than a base-table image
+ * @brief Reports whether a logical build root hides its defining subtree
  *
- * Returns true when the subtree contains a derivation marker anywhere below the root, recursing
- * through every other operator. A derivation marker is either a childless derived leaf
- * (`LOGICAL_DELIM_GET`, `LOGICAL_CTE_REF`) or a reducing operator (`LOGICAL_COMPARISON_JOIN`,
- * `LOGICAL_ANY_JOIN`, `LOGICAL_DELIM_JOIN`, `LOGICAL_AGGREGATE_AND_GROUP_BY`, `LOGICAL_DISTINCT`,
- * `LOGICAL_INTERSECT`, `LOGICAL_EXCEPT`). `LOGICAL_UNION` is deliberately not a marker, because a
- * union does not reduce its inputs' key sets.
- *
- * Structural evidence only — it does not imply that the relation filters any rows; the known
- * false-positive class (the cardinality-preserving enrichment join) is contained downstream by
- * the domain-coverage gate in `publish_dynamic_filters` and by `dynamic_filter_gate`.
+ * Returns true only for a `LOGICAL_DELIM_GET` or `LOGICAL_CTE_REF` root, optionally wrapped in one
+ * or more valid single-child `LOGICAL_PROJECTION` operators. Other roots return false even when
+ * they contain an opaque leaf below a non-projection operator.
  */
-[[nodiscard]] bool build_relation_is_derived(duckdb::LogicalOperator const& op);
+[[nodiscard]] bool build_relation_is_opaque(duckdb::LogicalOperator const& op);
 
 }  // namespace sirius::planner
