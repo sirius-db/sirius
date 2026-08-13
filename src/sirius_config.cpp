@@ -269,7 +269,11 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("mark_join_build_switch_ratio",
              opt.mark_join_build_switch_ratio,
              yaml::between<double>{0.0, std::numeric_limits<double>::infinity()});
-  r.optional("enable_runtime_distinct_build_probe", opt.enable_runtime_distinct_build_probe);
+  if (r.has("enable_runtime_distinct_build_probe")) {
+    throw std::runtime_error(
+      "'sirius.operator_params.enable_runtime_distinct_build_probe': removed; runtime distinct "
+      "build probing is an internal join policy and is enabled automatically; remove this key");
+  }
   r.optional("enable_dynamic_filter_pushdown", opt.enable_dynamic_filter_pushdown);
   r.optional("enable_dynamic_zone_map_filter", opt.enable_dynamic_zone_map_filter);
   r.optional("dynamic_filter_domain_coverage_threshold",

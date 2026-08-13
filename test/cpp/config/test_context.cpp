@@ -212,10 +212,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     setenv("SIRIUS_DISABLE", "1", 1);
   }};
 
-  auto setting_count = [](duckdb::Connection& con) {
-    auto result = con.Query(
-      "SELECT count(*) FROM duckdb_settings() "
-      "WHERE name = 'sirius_test_inject_transparent_gpu_error'");
+  auto setting_count = [](duckdb::Connection& con, std::string const& name) {
+    auto result = con.Query("SELECT count(*) FROM duckdb_settings() WHERE name = '" + name + "'");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     return result->GetValue(0, 0).GetValue<int64_t>();
@@ -226,8 +224,12 @@ TEST_CASE("Test-only settings require explicit process opt-in",
   {
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
-    REQUIRE(setting_count(con) == 0);
+    REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 0);
+    REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 0);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    result = con.Query("SET enable_runtime_distinct_build_probe = false");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
   }
@@ -236,18 +238,36 @@ TEST_CASE("Test-only settings require explicit process opt-in",
   {
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
-    REQUIRE(setting_count(con) == 0);
+    REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 0);
+    REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 0);
   }
 
   setenv("SIRIUS_ENABLE_TEST_OPTIONS", "1", 1);
   {
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
-    REQUIRE(setting_count(con) == 1);
+    REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 1);
+    REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 1);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET enable_runtime_distinct_build_probe = false");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
   }
+}
+
+TEST_CASE("Sirius configuration keeps runtime distinct-build probing internal", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+
+  sirius::sirius_config config;
+  REQUIRE_THROWS_WITH(
+    config.load_from_file(data_dir / "invalid_runtime_distinct_build_probe.yaml"),
+    Catch::Contains("sirius.operator_params.enable_runtime_distinct_build_probe") &&
+      Catch::Contains("removed") && Catch::Contains("remove this key"));
+  CHECK(config.get_operator_params().enable_runtime_distinct_build_probe);
 }
 
 TEST_CASE("Sirius configuration loading from file with configurator",
@@ -745,7 +765,7 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(settings->GetValue(16, 0).GetValue<std::string>() == "/tmp/sirius-compression-plans");
   REQUIRE(settings->GetValue(17, 0).GetValue<uint64_t>() == 8 * mib);
   REQUIRE(settings->GetValue(18, 0).GetValue<double>() == Approx(0.6));
-  REQUIRE_FALSE(settings->GetValue(19, 0).GetValue<bool>());
+  REQUIRE(settings->GetValue(19, 0).GetValue<bool>());
 
   auto zero_partition = con.Query("SET hash_partition_bytes = 0");
   REQUIRE(zero_partition != nullptr);
@@ -792,7 +812,7 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   require_ok("RESET max_sort_partition_memory_fraction");
   require_ok("SET enable_dynamic_filter_pushdown = true");
   require_ok("RESET enable_dynamic_filter_pushdown");
-  require_ok("SET enable_runtime_distinct_build_probe = true");
+  require_ok("SET enable_runtime_distinct_build_probe = false");
   require_ok("RESET enable_runtime_distinct_build_probe");
   require_ok("SET pin_table_compression = false");
   require_ok("RESET pin_table_compression");
@@ -815,13 +835,13 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE_FALSE(reset->GetValue(2, 0).GetValue<bool>());
   REQUIRE(reset->GetValue(3, 0).GetValue<bool>());
   REQUIRE(reset->GetValue(4, 0).GetValue<double>() == Approx(0.6));
-  REQUIRE_FALSE(reset->GetValue(5, 0).GetValue<bool>());
+  REQUIRE(reset->GetValue(5, 0).GetValue<bool>());
 
   auto const& params = sirius_ctx->get_config().get_operator_params();
   REQUIRE(params.scan_task_batch_size == 1 * mib);
   REQUIRE(params.max_sort_partition_memory_fraction == Approx(0.25));
   REQUIRE_FALSE(params.enable_dynamic_filter_pushdown);
-  REQUIRE_FALSE(params.enable_runtime_distinct_build_probe);
+  REQUIRE(params.enable_runtime_distinct_build_probe);
   auto const& compression = sirius_ctx->get_config().get_compression_config();
   REQUIRE(compression.enable_pin_table_compression);
   REQUIRE(compression.max_compressed_fraction == Approx(0.6));

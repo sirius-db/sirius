@@ -2230,6 +2230,11 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
       "TEST ONLY: force transparent GPU execution to fail at runtime with this message",
       LogicalType::VARCHAR,
       Value(""));
+    config.AddExtensionOption("enable_runtime_distinct_build_probe",
+                              "TEST ONLY: toggle the internal runtime distinct-build probe",
+                              LogicalType::BOOLEAN,
+                              Value::BOOLEAN(operator_defaults.enable_runtime_distinct_build_probe),
+                              SetEnableRuntimeDistinctBuildProbe);
   }
 
   // Add in config options for special JIT implementation for regex
@@ -2340,16 +2345,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     LogicalType::DOUBLE,
     Value::DOUBLE(operator_defaults.mark_join_build_switch_ratio),
     SetMarkJoinBuildSwitchRatio);
-
-  config.AddExtensionOption(
-    "enable_runtime_distinct_build_probe",
-    "For BUILD_PROBE hash joins whose build-key uniqueness the planner could not prove, test "
-    "distinctness at runtime (one cudf::distinct_count pass over the cached build) and take the "
-    "single-pass cudf::distinct_hash_join instead of the general two-pass join when the keys are "
-    "distinct (on by default)",
-    LogicalType::BOOLEAN,
-    Value::BOOLEAN(operator_defaults.enable_runtime_distinct_build_probe),
-    SetEnableRuntimeDistinctBuildProbe);
 
   config.AddExtensionOption(
     "gpu_execution",
