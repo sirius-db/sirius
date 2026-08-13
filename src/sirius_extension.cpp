@@ -119,6 +119,7 @@ extern "C" int cudaProfilerStop();
 #include "io/types.hpp"                // sirius::io::sirius_ioctx
 #include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
 
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <string_view>
@@ -1876,14 +1877,16 @@ static void SetMaxSortPartitionMemoryFraction(ClientContext& context,
                                               SetScope scope,
                                               Value& parameter)
 {
+  const double fraction = parameter.GetValue<double>();
+  if (!std::isfinite(fraction) || fraction <= 0.0 || fraction > 1.0) {
+    throw InvalidInputException(
+      "max_sort_partition_memory_fraction must be finite, greater than 0.0, and at most 1.0, got "
+      "%f",
+      fraction);
+  }
   auto* params = get_operator_params(context);
   if (!params) { return; }
-  auto slot             = lock_operator_params_slot(context);
-  const double fraction = parameter.GetValue<double>();
-  if (fraction < 0.0 || fraction > 1.0) {
-    throw InvalidInputException(
-      "max_sort_partition_memory_fraction must be between 0.0 and 1.0, got %f", fraction);
-  }
+  auto slot                                  = lock_operator_params_slot(context);
   params->max_sort_partition_memory_fraction = fraction;
   SIRIUS_LOG_DEBUG("Updated config MAX_SORT_PARTITION_MEMORY_FRACTION to {}",
                    params->max_sort_partition_memory_fraction);

@@ -329,6 +329,23 @@ TEST_CASE("Sirius configuration validates MARK join build switch ratio", "[siriu
   REQUIRE(config.get_operator_params().mark_join_build_switch_ratio == Approx(0.0));
 }
 
+TEST_CASE("Sirius configuration rejects a zero automatic sort partition fraction",
+          "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const cfg =
+    fs::path(loc.file_name()).parent_path() / "data" / "invalid_sort_partition_fraction_zero.yaml";
+
+  sirius::sirius_config config;
+  auto const default_fraction = config.get_operator_params().max_sort_partition_memory_fraction;
+  REQUIRE(default_fraction == Approx(sirius::config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION));
+  REQUIRE_THROWS_WITH(
+    config.load_from_file(cfg),
+    Catch::Contains("max_sort_partition_memory_fraction") && Catch::Contains("value out of range"));
+  REQUIRE(config.get_operator_params().max_sort_partition_memory_fraction ==
+          Approx(default_fraction));
+}
+
 namespace {
 
 void require_shared_operator_defaults(const sirius::operator_params& params, uint64_t batch)
@@ -679,6 +696,24 @@ TEST_CASE("DuckDB setting rejects negative byte values without mutation",
   REQUIRE(after->GetValue(0, 0).GetValue<uint64_t>() == expected);
 }
 
+TEST_CASE(
+  "DuckDB setting rejects a zero automatic sort partition fraction without a Sirius context",
+  "[sirius][context][config][isolated_context]")
+{
+  finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
+  setenv("SIRIUS_DISABLE", "1", 1);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+
+  auto result = con.Query("SET max_sort_partition_memory_fraction = 0");
+  REQUIRE(result != nullptr);
+  REQUIRE(result->HasError());
+  REQUIRE_THAT(result->GetError(),
+               Catch::Contains("max_sort_partition_memory_fraction must be finite") &&
+                 Catch::Contains("greater than 0.0"));
+}
+
 TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
           "[sirius][context][config][isolated_context]")
 {
@@ -780,6 +815,12 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(sirius_ctx->get_config().get_operator_params().mark_join_build_switch_ratio ==
           Approx(3.0));
 
+  auto zero_sort_fraction = con.Query("SET max_sort_partition_memory_fraction = 0");
+  REQUIRE(zero_sort_fraction != nullptr);
+  REQUIRE(zero_sort_fraction->HasError());
+  REQUIRE(sirius_ctx->get_config().get_operator_params().max_sort_partition_memory_fraction ==
+          Approx(0.25));
+
   auto const require_ok = [&con](std::string const& sql) {
     auto result = con.Query(sql);
     REQUIRE(result != nullptr);
@@ -788,7 +829,9 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
 
   require_ok("SET scan_task_batch_size = 99");
   require_ok("RESET scan_task_batch_size");
-  require_ok("SET max_sort_partition_memory_fraction = 0.9");
+  require_ok("SET max_sort_partition_memory_fraction = 1.0");
+  REQUIRE(sirius_ctx->get_config().get_operator_params().max_sort_partition_memory_fraction ==
+          Approx(1.0));
   require_ok("RESET max_sort_partition_memory_fraction");
   require_ok("SET enable_dynamic_filter_pushdown = true");
   require_ok("RESET enable_dynamic_filter_pushdown");
