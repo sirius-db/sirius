@@ -201,6 +201,8 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 | `downgrade_stop_fraction` | double (0,1] | space default | Stop evicting below this fraction. Must be less than `downgrade_trigger_fraction`. |
 | `memory_capacity` | bytes | space default | Absolute capacity of the space. |
 
+Every explicit `device_id` must be present in Sirius's discovered GPU topology.
+
 #### `sirius.space.host[]` — one entry per host (pinned) memory space
 
 | Key | Type | Default | Description |

@@ -27,6 +27,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <exception>
 #include <limits>
 #include <stdexcept>
@@ -670,6 +671,15 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
     if (high_level_memory_configured && explicit_space_configured) {
       throw std::runtime_error(
         "sirius.memory and non-empty sirius.space lists are mutually exclusive");
+    }
+    for (auto const& gpu : gpu_space_configs) {
+      auto const discovered = std::ranges::any_of(_hw_topology.gpus, [&](auto const& info) {
+        return static_cast<int64_t>(info.id) == static_cast<int64_t>(gpu.device_id);
+      });
+      if (!discovered) {
+        throw std::runtime_error("sirius.space.gpu: device_id " + std::to_string(gpu.device_id) +
+                                 " is not present in the discovered GPU topology");
+      }
     }
 
     r.reject_unknown();
