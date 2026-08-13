@@ -183,7 +183,10 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
   r.optional("request_timeout_s", opt.request_timeout_s);
   r.optional("max_connections", opt.max_connections);
   r.optional("chunk_size", yaml::bytes(opt.chunk_size));
-  r.optional("max_n_chunks", opt.max_n_chunks);
+  auto const has_max_n_chunks = r.has_value("max_n_chunks");
+  long long max_n_chunks      = 1;
+  r.optional("max_n_chunks", max_n_chunks, yaml::greater_than<long long>{0});
+  if (has_max_n_chunks) { opt.max_n_chunks = static_cast<std::size_t>(max_n_chunks); }
   r.optional("max_read_split", opt.max_read_split);
   r.optional("upkeep_interval_ms", opt.upkeep_interval);
   r.optional("conn_max_age_s", opt.conn_max_age);
@@ -203,7 +206,10 @@ static void from_yaml(const YAML::Node& node, sirius::io::uring::config& opt)
 {
   yaml::reader r(node, "local");
   r.optional("use_odirect", opt.use_odirect);
-  r.optional("max_n_chunks", opt.max_n_chunks);
+  auto const has_max_n_chunks = r.has_value("max_n_chunks");
+  long long max_n_chunks      = 1;
+  r.optional("max_n_chunks", max_n_chunks, yaml::greater_than<long long>{0});
+  if (has_max_n_chunks) { opt.max_n_chunks = static_cast<std::size_t>(max_n_chunks); }
   r.reject_unknown();
 }
 

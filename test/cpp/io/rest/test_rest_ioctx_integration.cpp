@@ -1548,6 +1548,32 @@ TEST_CASE("footer probe open uses the configured suffix window",
   auto const footer_len = static_cast<std::size_t>(parquet_footer_len(parquet));
   auto const footer_off = parquet.size() - 8 - footer_len;
 
+  SECTION("zero disables the suffix GET and keeps ordinary reads correct")
+  {
+    range_http_server server(parquet);
+    auto cfg               = direct_rest_test_config();
+    cfg.footer_probe_bytes = 0;
+    auto ioctx             = make_direct_rest_ioctx(server.endpoint(), cfg);
+    auto datasource        = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
+                                             sirius::io::open_hint::parquet_footer_probe);
+    auto const* rest_object =
+      dynamic_cast<sirius::io::rest::rest_io_object const*>(&datasource->io_object());
+
+    REQUIRE(rest_object != nullptr);
+    CHECK(datasource->size() == parquet.size());
+    CHECK(rest_object->stash() == nullptr);
+    CHECK(server.head_count() == 1);
+    CHECK(server.get_count() == 0);
+
+    std::array<std::uint8_t, 8> trailer{};
+    REQUIRE(datasource->host_read(
+              parquet.size() - trailer.size(), trailer.size(), trailer.data()) == trailer.size());
+    require_bytes_equal(trailer,
+                        std::span<std::uint8_t const>(parquet.data() + parquet.size() - 8, 8));
+    CHECK(server.head_count() == 1);
+    CHECK(server.get_count() == 1);
+  }
+
   SECTION("tiny configured window misses the footer body and re-GETs it")
   {
     std::size_t constexpr suffix_bytes = 8;

@@ -977,6 +977,8 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
                                                std::size_t n)
 {
   footer_probe probe;
+  // Zero is the explicit opt-out: issue no suffix GET and let the caller use
+  // the ordinary HEAD-plus-read path.
   if (n == 0) { return probe; }
 
   s3::s3_object_ref const obj{std::string(bucket), std::string(key)};

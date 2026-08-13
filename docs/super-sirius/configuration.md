@@ -328,8 +328,8 @@ single-GPU configurations only (logs a warning and disables itself otherwise).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `use_odirect` | bool | true | Use `O_DIRECT` for local-disk reads. |
-| `max_n_chunks` | int | 1 | Max contiguous file segments fused into one vectored read. |
+| `use_odirect` | bool | true | Prefer `O_DIRECT` for compatible local-disk reads; `false` forces buffered reads but does not waive the backend's `O_DIRECT` filesystem requirement because both handles are still opened. |
+| `max_n_chunks` | int (**> 0**) | 1 | Max contiguous file segments fused into one vectored read; zero is rejected because every request contains at least one segment. |
 
 ### `scan_manager.rest` — REST / S3 backend (`io/rest/config.hpp`)
 
@@ -342,7 +342,7 @@ and transport use one trust policy; there are no separate REST YAML controls.
 | `request_timeout_s` | int (seconds) | 30 | Whole-request timeout and presigned-URL TTL (0 = no limit). |
 | `max_connections` | int | 16 | Max concurrent in-flight connections per reactor. |
 | `chunk_size` | bytes | 8Mi | Target bytes per ranged GET (scatter/device-staging paths). |
-| `max_n_chunks` | int | 16 | Max file-adjacent segments fused into one scatter GET. |
+| `max_n_chunks` | int (**> 0**) | 16 | Max file-adjacent segments fused into one scatter GET; zero is rejected because every request contains at least one segment. |
 | `max_read_split` | int | 16 | Max parallel ranged GETs for one contiguous host read (reads < 2 MiB stay a single GET). |
 | `upkeep_interval_ms` | int (ms) | 15000 | Idle-connection keepalive interval (`curl_easy_upkeep`; 0 disables). |
 | `conn_max_age_s` | int (seconds) | 20 | Max age curl may reuse a pooled connection (`CURLOPT_MAXAGE_CONN`; 0 = curl default). |
@@ -352,7 +352,7 @@ and transport use one trust policy; there are no separate REST YAML controls.
 | `max_auth_retry_attempts` | int | 3 | Retry attempts for HTTP 403 (expired presigned URL). Kept low so a genuine AccessDenied fails fast. |
 | `honor_retry_after` | bool | true | Respect the server's `Retry-After` header. |
 | `perf_instrumentation` | bool | false | Record per-chunk micro-timings (chunk_get, queue_wait, ttfb, h2d) into perf counters. |
-| `footer_probe_bytes` | bytes | 512Ki | Suffix-range window for the parquet footer probe. Must cover the footer, so err large. |
+| `footer_probe_bytes` | bytes (**>= 0**) | 512Ki | Suffix-range window for the parquet footer probe. Zero disables the suffix GET and uses HEAD; positive values should cover the footer, so err large. |
 | `list_max_matches` | int | 100000 | Cap on files a glob/listing may accumulate (throws "narrow the glob prefix", never truncates). |
 | `list_max_scanned` | int | 1000000 | Cap on objects a LIST sweep may scan across pages (throws, never truncates). |
 

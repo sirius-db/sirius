@@ -285,6 +285,40 @@ TEST_CASE("sirius_config parses rest perf instrumentation flag",
   std::filesystem::remove(path, ec);
 }
 
+TEST_CASE("sirius_config preserves the zero footer-probe opt-out",
+          "[scan_manager][config][s3][rest][footerbind]")
+{
+  auto const path  = std::filesystem::temp_directory_path() / "sirius_rest_footer_probe.yaml";
+  auto write_value = [&](std::string const& value) {
+    write_yaml(path,
+               "sirius:\n"
+               "  executor:\n"
+               "    scan_manager:\n"
+               "      rest:\n"
+               "        footer_probe_bytes: " +
+                 value + "\n");
+  };
+
+  sirius::sirius_config cfg;
+  write_value("256KiB");
+  REQUIRE_NOTHROW(cfg.load_from_file(path));
+  REQUIRE(cfg.get_scan_manager_config().rest.footer_probe_bytes == 256UL * 1024);
+
+  write_value("0");
+  REQUIRE_NOTHROW(cfg.load_from_file(path));
+  CHECK(cfg.get_scan_manager_config().rest.footer_probe_bytes == 0);
+
+  for (auto const* invalid : {"-1", "-1KiB"}) {
+    CAPTURE(invalid);
+    write_value(invalid);
+    REQUIRE_THROWS_WITH(cfg.load_from_file(path), Catch::Contains("rest.footer_probe_bytes"));
+    CHECK(cfg.get_scan_manager_config().rest.footer_probe_bytes == 0);
+  }
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
 TEST_CASE("sirius_config rejects unknown rest config keys", "[scan_manager][config][rest]")
 {
   auto const path = std::filesystem::temp_directory_path() / "sirius_rest_unknown_key.yaml";
@@ -368,4 +402,61 @@ TEST_CASE("sirius_config keeps REST bounce sizing internal", "[scan_manager][con
 
   std::error_code ec;
   std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("sirius_config rejects zero fused-chunk limits", "[scan_manager][config]")
+{
+  auto read_value = [](sirius::sirius_config const& cfg, std::string const& surface) {
+    return surface == "rest" ? cfg.get_scan_manager_config().rest.max_n_chunks
+                             : cfg.get_scan_manager_config().local.max_n_chunks;
+  };
+  auto write_value =
+    [](std::filesystem::path const& path, std::string const& surface, std::string const& value) {
+      auto const body = value == "<omitted>" ? "      " + surface + ": {}\n"
+                                             : "      " + surface +
+                                                 ":\n"
+                                                 "        max_n_chunks: " +
+                                                 value + "\n";
+      write_yaml(path,
+                 "sirius:\n"
+                 "  executor:\n"
+                 "    scan_manager:\n" +
+                   body);
+    };
+  auto check_surface = [&](std::string const& surface, std::size_t expected_default) {
+    auto const path =
+      std::filesystem::temp_directory_path() / ("sirius_zero_" + surface + "_max_n_chunks.yaml");
+
+    for (auto const* value : {"<omitted>", "null"}) {
+      write_value(path, surface, value);
+      sirius::sirius_config cfg;
+      REQUIRE_NOTHROW(cfg.load_from_file(path));
+      CHECK(read_value(cfg, surface) == expected_default);
+    }
+
+    for (auto const* value : {"1", "7"}) {
+      write_value(path, surface, value);
+      sirius::sirius_config cfg;
+      REQUIRE_NOTHROW(cfg.load_from_file(path));
+      CHECK(read_value(cfg, surface) == static_cast<std::size_t>(std::stoull(value)));
+    }
+
+    for (auto const* invalid : {"0", "-1", "9223372036854775808"}) {
+      CAPTURE(surface, invalid);
+      sirius::sirius_config cfg;
+      write_value(path, surface, "7");
+      REQUIRE_NOTHROW(cfg.load_from_file(path));
+      REQUIRE(read_value(cfg, surface) == 7);
+
+      write_value(path, surface, invalid);
+      REQUIRE_THROWS_WITH(cfg.load_from_file(path), Catch::Contains(surface + ".max_n_chunks"));
+      CHECK(read_value(cfg, surface) == 7);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+  };
+
+  SECTION("REST scatter GET") { check_surface("rest", 16); }
+  SECTION("local vectored read") { check_surface("local", 1); }
 }
