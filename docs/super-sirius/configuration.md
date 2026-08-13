@@ -153,6 +153,23 @@ Controls the disk spill tier. Data evicted from host memory is written here. Dis
 | `capacity_bytes` | bytes | 1Ti | Maximum disk space for spill files. |
 | `downgrade_root_dirs` | string | "" | Directory path for spill files. **Must be set** to enable disk spilling. Use a fast local mount (NVMe preferred). |
 
+### Input-table compression (`sirius.compression`)
+
+These settings control optional Simpatico compression when
+`pin_table(tier=>'host')` caches input tables. Compression requires both
+`enable_pin_table_compression: true` and a matching plan in `input_plan_dir`;
+otherwise the table is pinned uncompressed.
+
+| Key | DuckDB setting | Type | Default | Description |
+|-----|----------------|------|---------|-------------|
+| `enable_pin_table_compression` | `pin_table_compression` | bool | false | Attempt planned compression while pinning input tables to host memory. |
+| `min_batch_size_bytes` | `pin_table_compression_min_batch_size_bytes` | bytes | 1Mi | Skip compression below this uncompressed batch size. `0` disables the size gate. |
+| `max_compressed_fraction` | `pin_table_compression_max_compressed_fraction` | finite double >= 0 | 0.75 | Keep a compressed representation only at or below this fraction of the original batch size. `0` retains none; values above `1` deliberately permit expansion, primarily for testing encodability. |
+| `input_plan_dir` | `pin_table_input_compression_plan_dir` | string | "" | Directory of per-table Simpatico plan files. An empty path leaves compression inactive. |
+
+The YAML loader and DuckDB `SET` surface reject negative, NaN, and infinite
+`max_compressed_fraction` values instead of silently changing retention behavior.
+
 ### How Downgrade Thresholds Work
 
 Each memory tier uses a trigger/stop threshold pair to control data eviction:

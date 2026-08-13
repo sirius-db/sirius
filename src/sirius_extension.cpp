@@ -119,6 +119,7 @@ extern "C" int cudaProfilerStop();
 #include "io/types.hpp"                // sirius::io::sirius_ioctx
 #include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
 
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <string_view>
@@ -2041,10 +2042,15 @@ static void SetPinTableCompressionMaxCompressedFraction(ClientContext& context,
                                                         SetScope scope,
                                                         Value& parameter)
 {
+  const double fraction = DoubleValue::Get(parameter);
+  if (!std::isfinite(fraction) || fraction < 0.0) {
+    throw InvalidInputException(
+      "pin_table_compression_max_compressed_fraction must be finite and non-negative, got %f",
+      fraction);
+  }
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) { return; }
-  sirius_ctx->get_config().get_compression_config().max_compressed_fraction =
-    DoubleValue::Get(parameter);
+  sirius_ctx->get_config().get_compression_config().max_compressed_fraction = fraction;
   SIRIUS_LOG_DEBUG("Updated pin_table_compression_max_compressed_fraction");
 }
 
@@ -2409,8 +2415,8 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
   config.AddExtensionOption(
     "pin_table_compression_max_compressed_fraction",
     "Discard the compressed form and pin uncompressed when the compressed size exceeds this "
-    "fraction of the batch's original size (i.e. compression saved too little); inert until "
-    "compression is enabled and a matching plan resolves",
+    "finite, non-negative fraction of the batch's original size (values above 1 permit "
+    "expansion); inert until compression is enabled and a matching plan resolves",
     LogicalType::DOUBLE,
     Value::DOUBLE(compression_defaults.max_compressed_fraction),
     SetPinTableCompressionMaxCompressedFraction);
