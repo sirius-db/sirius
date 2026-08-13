@@ -698,8 +698,8 @@ TEST_CASE("DuckDB setting rejects unknown Sirius log levels without mutation",
   REQUIRE(warn != nullptr);
   REQUIRE_FALSE(warn->HasError());
   REQUIRE(duckdb::Config::LOG_LEVEL == "warn");
-  REQUIRE_FALSE(scoped_sink.sink().should_log(sirius::log::level::info));
-  REQUIRE(scoped_sink.sink().should_log(sirius::log::level::warn));
+  REQUIRE_FALSE(sirius::log::get_sink()->should_log(sirius::log::level::info));
+  REQUIRE(sirius::log::get_sink()->should_log(sirius::log::level::warn));
 
   auto invalid = con.Query("SET sirius_log_level = 'verbose'");
   REQUIRE(invalid != nullptr);
@@ -714,21 +714,21 @@ TEST_CASE("DuckDB setting rejects unknown Sirius log levels without mutation",
   REQUIRE_FALSE(after_invalid->HasError());
   REQUIRE(after_invalid->GetValue(0, 0).GetValue<std::string>() == "warn");
   REQUIRE(duckdb::Config::LOG_LEVEL == "warn");
-  REQUIRE_FALSE(scoped_sink.sink().should_log(sirius::log::level::info));
-  REQUIRE(scoped_sink.sink().should_log(sirius::log::level::warn));
+  REQUIRE_FALSE(sirius::log::get_sink()->should_log(sirius::log::level::info));
+  REQUIRE(sirius::log::get_sink()->should_log(sirius::log::level::warn));
 
   auto critical = con.Query("SET sirius_log_level = 'critical'");
   REQUIRE(critical != nullptr);
   REQUIRE_FALSE(critical->HasError());
   REQUIRE(duckdb::Config::LOG_LEVEL == "critical");
-  REQUIRE_FALSE(scoped_sink.sink().should_log(sirius::log::level::error));
-  REQUIRE(scoped_sink.sink().should_log(sirius::log::level::critical));
+  REQUIRE_FALSE(sirius::log::get_sink()->should_log(sirius::log::level::error));
+  REQUIRE(sirius::log::get_sink()->should_log(sirius::log::level::critical));
 
   auto off = con.Query("SET sirius_log_level = 'off'");
   REQUIRE(off != nullptr);
   REQUIRE_FALSE(off->HasError());
   REQUIRE(duckdb::Config::LOG_LEVEL == "off");
-  REQUIRE_FALSE(scoped_sink.sink().should_log(sirius::log::level::critical));
+  REQUIRE_FALSE(sirius::log::get_sink()->should_log(sirius::log::level::critical));
 }
 
 TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
