@@ -360,6 +360,12 @@ and transport use one trust policy; there are no separate REST YAML controls.
 | `ca_bundle_path` | string | "" | Sole YAML source for the REST endpoint's PEM CA bundle. |
 | `tls_verify` | bool | true | Sole YAML source for REST endpoint certificate verification. |
 
+The endpoint, region, access key, and secret key form one activation unit. An
+empty quartet leaves the REST object-store backend disabled. If any member is
+configured, all four are required; partial configurations are rejected while
+loading the file instead of disabling REST later. The session token and TLS or
+signing choices do not activate the backend by themselves.
+
 ## Operator Parameters
 
 **File:** `src/include/sirius_config.hpp` — `operator_params` struct

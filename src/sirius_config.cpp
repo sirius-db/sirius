@@ -167,6 +167,23 @@ static void from_yaml(const YAML::Node& node, sirius::io::object_store_config& o
   r.optional("ca_bundle_path", opt.ca_bundle_path);
   r.optional("tls_verify", opt.tls_verify);
   r.reject_unknown();
+
+  auto const any_required = !opt.endpoint.empty() || !opt.region.empty() ||
+                            !opt.access_key.empty() || !opt.secret_key.empty();
+  if (!any_required) { return; }
+
+  std::vector<std::string_view> missing;
+  if (opt.endpoint.empty()) { missing.emplace_back("endpoint"); }
+  if (opt.region.empty()) { missing.emplace_back("region"); }
+  if (opt.access_key.empty()) { missing.emplace_back("access_key"); }
+  if (opt.secret_key.empty()) { missing.emplace_back("secret_key"); }
+  if (!missing.empty()) {
+    std::string message = "object_store: incomplete configuration; missing";
+    for (auto const field : missing) {
+      message += " " + std::string(field);
+    }
+    throw std::runtime_error(message);
+  }
 }
 
 static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)

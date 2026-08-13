@@ -187,6 +187,86 @@ TEST_CASE("sirius_config loads presigned object_store_config signing mode from Y
   std::filesystem::remove(path, ec);
 }
 
+TEST_CASE("sirius_config rejects incomplete object_store activation quartets",
+          "[object_store_config][s3][config]")
+{
+  struct invalid_config {
+    const char* name;
+    const char* fields;
+    const char* missing;
+  };
+  for (auto const& invalid : {
+         invalid_config{"endpoint_only", "        endpoint: https://s3.example.com\n", "region"},
+         invalid_config{"missing_endpoint",
+                        "        region: us-east-1\n"
+                        "        access_key: access\n"
+                        "        secret_key: secret\n",
+                        "endpoint"},
+         invalid_config{"missing_region",
+                        "        endpoint: https://s3.example.com\n"
+                        "        access_key: access\n"
+                        "        secret_key: secret\n",
+                        "region"},
+         invalid_config{"missing_access_key",
+                        "        endpoint: https://s3.example.com\n"
+                        "        region: us-east-1\n"
+                        "        secret_key: secret\n",
+                        "access_key"},
+         invalid_config{"missing_secret_key",
+                        "        endpoint: https://s3.example.com\n"
+                        "        region: us-east-1\n"
+                        "        access_key: access\n",
+                        "secret_key"},
+       }) {
+    INFO("case=" << invalid.name);
+    auto const path = std::filesystem::temp_directory_path() /
+                      ("sirius_object_store_" + std::string(invalid.name) + ".yaml");
+    write_yaml(path,
+               "sirius:\n"
+               "  executor:\n"
+               "    scan_manager:\n"
+               "      object_store:\n" +
+                 std::string(invalid.fields));
+
+    sirius::sirius_config cfg;
+    REQUIRE_THROWS_WITH(cfg.load_from_file(path),
+                        Catch::Contains("object_store: incomplete configuration") &&
+                          Catch::Contains(invalid.missing));
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+  }
+}
+
+TEST_CASE("sirius_config keeps an empty object_store quartet disabled",
+          "[object_store_config][s3][config]")
+{
+  auto const path =
+    std::filesystem::temp_directory_path() / "sirius_object_store_disabled_tls_policy.yaml";
+  write_yaml(path,
+             "sirius:\n"
+             "  executor:\n"
+             "    scan_manager:\n"
+             "      object_store:\n"
+             "        session_token: dormant-token\n"
+             "        ca_bundle_path: /tmp/dormant-ca.pem\n"
+             "        tls_verify: false\n");
+
+  sirius::sirius_config cfg;
+  REQUIRE_NOTHROW(cfg.load_from_file(path));
+  auto const& os = cfg.get_scan_manager_config().object_store;
+  CHECK(os.endpoint.empty());
+  CHECK(os.region.empty());
+  CHECK(os.access_key.empty());
+  CHECK(os.secret_key.empty());
+  CHECK(os.session_token == "dormant-token");
+  CHECK(os.ca_bundle_path == "/tmp/dormant-ca.pem");
+  CHECK_FALSE(os.tls_verify);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
 TEST_CASE("sirius_config rejects unknown object_store_config signing modes",
           "[object_store_config][s3][config]")
 {
