@@ -91,7 +91,7 @@ There is no factory class. Each implementation provides a free `make_ingestible(
 
 ### DuckDB-native ingestible
 
-`duckdb_native_gpu_ingestible` (`duckdb_native_gpu_ingestible.{hpp,cpp}`) prepares a serial walk plan in its constructor (`prepare_duckdb_native_walk`: partition statistics, projected-type viability gate, and filter-stat row-group pruning — a non-viable query throws to trigger CPU fallback before any per-segment IO). It slices the table's row groups into fixed-size parse ranges (`SIRIUS_METADATA_PARSE_CHUNK`, default 8). `next_split_provider` hands out one range per claim; each metadata task walks that range and emits a `duckdb_native_scan_info`. `materialize_metadata_to_table` decodes the range's storage segments into a `cudf::table` (always `UNFILTERED`); filter evaluation and projection to output arity happen in `post_filter_and_project`.
+`duckdb_native_gpu_ingestible` (`duckdb_native_gpu_ingestible.{hpp,cpp}`) prepares a serial walk plan in its constructor (`prepare_duckdb_native_walk`: partition statistics, projected-type viability gate, and filter-stat row-group pruning — a non-viable query throws to trigger CPU fallback before any per-segment IO). It slices the table's row groups into fixed internal ranges of eight groups. `next_split_provider` hands out one range per claim; each metadata task walks that range and emits a `duckdb_native_scan_info`. `materialize_metadata_to_table` decodes the range's storage segments into a `cudf::table` (always `UNFILTERED`); filter evaluation and projection to output arity happen in `post_filter_and_project`.
 
 ## owning_table_view
 
@@ -317,7 +317,7 @@ The result is a `duckdb_native_walk_plan` carrying per-row-group row starts/coun
 
 ### Phase 2 — `walk_duckdb_native_row_group_range()` (concurrent)
 
-The row-group range `[0, n_row_groups)` is sliced into fixed-size parse chunks (default 8 row groups, `SIRIUS_METADATA_PARSE_CHUNK`), and each chunk is walked independently on a scan-manager thread. For each surviving row group in its range, a range walk:
+The row-group range `[0, n_row_groups)` is sliced into fixed internal chunks of eight row groups, and each chunk is walked independently on a scan-manager thread. For each surviving row group in its range, a range walk:
 
 - Walks each projected column's **typed segment trees** directly — reading `block_id`, block offset, compression enum, per-segment row counts, the validity child's segments, and (for varchar) the per-segment max-string-length stat as typed fields. It does not build or re-parse the per-segment string blobs that DuckDB's generic `GetColumnSegmentInfo` would produce.
 - Refuses on the first unsupported segment codec or an absent/over-threshold varchar stat, partially filling the range (which the caller then discards in favor of CPU fallback).
