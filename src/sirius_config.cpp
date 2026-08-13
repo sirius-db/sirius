@@ -179,8 +179,7 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
                                key + "' instead");
     }
   }
-  r.optional(
-    "request_timeout_s", opt.request_timeout_s, [](long value) { return value >= 0; });
+  r.optional("request_timeout_s", opt.request_timeout_s, [](long value) { return value >= 0; });
   r.optional("max_connections", opt.max_connections);
   r.optional("chunk_size", yaml::bytes(opt.chunk_size));
   r.optional("max_n_chunks", opt.max_n_chunks);
