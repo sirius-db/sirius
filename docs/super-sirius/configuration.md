@@ -349,6 +349,12 @@ and transport use one trust policy; there are no separate REST YAML controls.
 
 ### `scan_manager.object_store` — S3 credentials & endpoint (`io/object_store_config.hpp`)
 
+The endpoint, region, access key, and secret key form one activation unit. An
+empty quartet leaves the REST object-store backend disabled. If any member is
+configured, all four are required; partial configurations are rejected while
+loading the file instead of disabling REST later. The session token and TLS,
+transport, or signing choices do not activate the backend by themselves.
+
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `endpoint` | string | "" | S3 endpoint URL. |

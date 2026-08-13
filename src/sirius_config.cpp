@@ -156,17 +156,37 @@ static void from_yaml(const YAML::Node& node, creator::task_creator_config& opt)
 
 static void from_yaml(const YAML::Node& node, sirius::io::object_store_config& opt)
 {
+  auto candidate = opt;
   yaml::reader r(node, "object_store");
-  r.optional("endpoint", opt.endpoint);
-  r.optional("region", opt.region);
-  r.optional("access_key", opt.access_key);
-  r.optional("secret_key", opt.secret_key);
-  r.optional("session_token", opt.session_token);
-  r.optional("s3_transport", opt.s3_transport);
-  r.optional("signing_mode", opt.s3_signing_mode);
-  r.optional("ca_bundle_path", opt.ca_bundle_path);
-  r.optional("tls_verify", opt.tls_verify);
+  r.optional("endpoint", candidate.endpoint);
+  r.optional("region", candidate.region);
+  r.optional("access_key", candidate.access_key);
+  r.optional("secret_key", candidate.secret_key);
+  r.optional("session_token", candidate.session_token);
+  r.optional("s3_transport", candidate.s3_transport);
+  r.optional("signing_mode", candidate.s3_signing_mode);
+  r.optional("ca_bundle_path", candidate.ca_bundle_path);
+  r.optional("tls_verify", candidate.tls_verify);
   r.reject_unknown();
+
+  auto const any_required = !candidate.endpoint.empty() || !candidate.region.empty() ||
+                            !candidate.access_key.empty() || !candidate.secret_key.empty();
+  if (any_required) {
+    std::vector<std::string_view> missing;
+    if (candidate.endpoint.empty()) { missing.emplace_back("endpoint"); }
+    if (candidate.region.empty()) { missing.emplace_back("region"); }
+    if (candidate.access_key.empty()) { missing.emplace_back("access_key"); }
+    if (candidate.secret_key.empty()) { missing.emplace_back("secret_key"); }
+    if (!missing.empty()) {
+      std::string message =
+        "'sirius.executor.scan_manager.object_store': incomplete activation; missing";
+      for (auto const field : missing) {
+        message += " " + std::string(field);
+      }
+      throw std::runtime_error(message);
+    }
+  }
+  opt = std::move(candidate);
 }
 
 static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)

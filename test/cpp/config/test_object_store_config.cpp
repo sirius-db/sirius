@@ -159,6 +159,147 @@ TEST_CASE("sirius_config loads object_store_config from YAML", "[object_store_co
   std::filesystem::remove(path, ec);
 }
 
+TEST_CASE("sirius_config accepts an empty object_store block", "[object_store_config][s3][config]")
+{
+  auto const path = std::filesystem::temp_directory_path() / "sirius_empty_object_store.yaml";
+  write_yaml(path,
+             "sirius:\n"
+             "  executor:\n"
+             "    scan_manager:\n"
+             "      object_store: {}\n");
+
+  sirius::sirius_config cfg;
+  REQUIRE_NOTHROW(cfg.load_from_file(path));
+
+  auto const& os = cfg.get_scan_manager_config().object_store;
+  CHECK(os.endpoint.empty());
+  CHECK(os.region.empty());
+  CHECK(os.access_key.empty());
+  CHECK(os.secret_key.empty());
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("sirius_config keeps ancillary object_store policy dormant",
+          "[object_store_config][s3][config]")
+{
+  auto const path =
+    std::filesystem::temp_directory_path() / "sirius_dormant_object_store_policy.yaml";
+  write_yaml(path,
+             "sirius:\n"
+             "  executor:\n"
+             "    scan_manager:\n"
+             "      object_store:\n"
+             "        session_token: dormant-session-token\n"
+             "        signing_mode: header\n"
+             "        s3_transport: rdma\n"
+             "        ca_bundle_path: /tmp/dormant-ca.pem\n"
+             "        tls_verify: false\n");
+
+  sirius::sirius_config cfg;
+  REQUIRE_NOTHROW(cfg.load_from_file(path));
+
+  auto const& os = cfg.get_scan_manager_config().object_store;
+  CHECK(os.endpoint.empty());
+  CHECK(os.region.empty());
+  CHECK(os.access_key.empty());
+  CHECK(os.secret_key.empty());
+  CHECK(os.session_token == "dormant-session-token");
+  CHECK(os.s3_signing_mode == object_store_config::signing_mode::header);
+  CHECK(os.s3_transport == object_store_config::transport::RDMA);
+  CHECK(os.ca_bundle_path == "/tmp/dormant-ca.pem");
+  CHECK_FALSE(os.tls_verify);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("sirius_config rejects partial object_store activation",
+          "[object_store_config][s3][config]")
+{
+  auto const check_rejected =
+    [](std::string const& name, std::string const& fields, std::string const& missing_fields) {
+      auto const path =
+        std::filesystem::temp_directory_path() / ("sirius_partial_object_store_" + name + ".yaml");
+      write_yaml(path,
+                 "sirius:\n"
+                 "  executor:\n"
+                 "    scan_manager:\n"
+                 "      object_store:\n" +
+                   fields);
+
+      sirius::sirius_config cfg;
+      REQUIRE_THROWS_WITH(
+        cfg.load_from_file(path),
+        Catch::Contains(
+          "'sirius.executor.scan_manager.object_store': incomplete activation; missing " +
+          missing_fields));
+      auto const& os = cfg.get_scan_manager_config().object_store;
+      CHECK(os.endpoint.empty());
+      CHECK(os.region.empty());
+      CHECK(os.access_key.empty());
+      CHECK(os.secret_key.empty());
+      CHECK(os.session_token.empty());
+
+      std::error_code ec;
+      std::filesystem::remove(path, ec);
+    };
+
+  SECTION("endpoint without the remaining required fields")
+  {
+    check_rejected("endpoint_only",
+                   "        endpoint: https://s3.example.com\n",
+                   "region access_key secret_key");
+  }
+  SECTION("region without the remaining required fields")
+  {
+    check_rejected("region_only", "        region: us-east-1\n", "endpoint access_key secret_key");
+  }
+  SECTION("access key without the remaining required fields")
+  {
+    check_rejected(
+      "access_key_only", "        access_key: example-access-key\n", "endpoint region secret_key");
+  }
+  SECTION("secret key without the remaining required fields")
+  {
+    check_rejected(
+      "secret_key_only", "        secret_key: example-secret-key\n", "endpoint region access_key");
+  }
+  SECTION("endpoint omitted from an otherwise complete activation")
+  {
+    check_rejected("missing_endpoint",
+                   "        region: us-east-1\n"
+                   "        access_key: example-access-key\n"
+                   "        secret_key: example-secret-key\n",
+                   "endpoint");
+  }
+  SECTION("region omitted from an otherwise complete activation")
+  {
+    check_rejected("missing_region",
+                   "        endpoint: https://s3.example.com\n"
+                   "        access_key: example-access-key\n"
+                   "        secret_key: example-secret-key\n",
+                   "region");
+  }
+  SECTION("access key omitted from an otherwise complete activation")
+  {
+    check_rejected("missing_access_key",
+                   "        endpoint: https://s3.example.com\n"
+                   "        region: us-east-1\n"
+                   "        secret_key: example-secret-key\n",
+                   "access_key");
+  }
+  SECTION("secret key omitted from an otherwise complete activation")
+  {
+    check_rejected("missing_secret_key",
+                   "        endpoint: https://s3.example.com\n"
+                   "        region: us-east-1\n"
+                   "        access_key: example-access-key\n",
+                   "secret_key");
+  }
+}
+
 TEST_CASE("sirius_config loads presigned object_store_config signing mode from YAML",
           "[object_store_config][s3][config]")
 {

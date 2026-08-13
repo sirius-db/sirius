@@ -22,10 +22,10 @@
 
 namespace sirius::io {
 
-/// Inert configuration carrier for remote object-store backends.
-/// PR1 only exposes the POD fields and enum/string helpers; runtime plumbing and
-/// backend consumption live in the integration/backend PRs.
-/// Empty strings are valid and mean "no value configured".
+/// Configuration carrier for remote object-store backends.
+/// An empty endpoint/region/static-key quartet means "no object store
+/// configured". Once any quartet member is supplied through YAML, all four
+/// members are required together; ancillary policy fields remain dormant.
 struct object_store_config {
   std::string endpoint;
   std::string region;
