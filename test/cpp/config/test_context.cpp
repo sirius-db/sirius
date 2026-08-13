@@ -329,6 +329,37 @@ TEST_CASE("Sirius configuration validates MARK join build switch ratio", "[siriu
   REQUIRE(config.get_operator_params().mark_join_build_switch_ratio == Approx(0.0));
 }
 
+TEST_CASE("Sirius configuration rejects invalid compression retention fractions",
+          "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+  sirius::sirius_config config;
+  for (auto const* fixture : {"invalid_compression_fraction_negative.yaml",
+                              "invalid_compression_fraction_nan.yaml",
+                              "invalid_compression_fraction_infinity.yaml"}) {
+    INFO("fixture=" << fixture);
+    REQUIRE_THROWS_WITH(config.load_from_file(data_dir / fixture),
+                        Catch::Contains("max_compressed_fraction"));
+  }
+}
+
+TEST_CASE("Sirius configuration accepts intentional compression retention fraction boundaries",
+          "[sirius][config]")
+{
+  std::source_location loc    = std::source_location::current();
+  auto const data_dir         = fs::path(loc.file_name()).parent_path() / "data";
+  auto const require_fraction = [&data_dir](char const* fixture, double expected) {
+    INFO("fixture=" << fixture);
+    sirius::sirius_config config;
+    REQUIRE_NOTHROW(config.load_from_file(data_dir / fixture));
+    REQUIRE(config.get_compression_config().max_compressed_fraction == Approx(expected));
+  };
+
+  require_fraction("valid_compression_fraction_zero.yaml", 0.0);
+  require_fraction("valid_compression_fraction_above_one.yaml", 1.5);
+}
+
 namespace {
 
 void require_shared_operator_defaults(const sirius::operator_params& params, uint64_t batch)
@@ -679,6 +710,36 @@ TEST_CASE("DuckDB setting rejects negative byte values without mutation",
   REQUIRE(after->GetValue(0, 0).GetValue<uint64_t>() == expected);
 }
 
+TEST_CASE("DuckDB setting rejects invalid compression retention fractions without a Sirius context",
+          "[sirius][context][config][isolated_context]")
+{
+  finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
+  setenv("SIRIUS_DISABLE", "1", 1);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+
+  for (auto const* value : {"-0.1", "'NaN'", "'Infinity'"}) {
+    INFO("value=" << value);
+    auto result =
+      con.Query("SET pin_table_compression_max_compressed_fraction = " + std::string(value));
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    REQUIRE_THAT(
+      result->GetError(),
+      Catch::Contains(
+        "pin_table_compression_max_compressed_fraction must be finite and non-negative"));
+  }
+
+  for (auto const* value : {"0", "1.5"}) {
+    INFO("value=" << value);
+    auto result =
+      con.Query("SET pin_table_compression_max_compressed_fraction = " + std::string(value));
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+  }
+}
+
 TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
           "[sirius][context][config][isolated_context]")
 {
@@ -779,6 +840,26 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE_FALSE(reset_mark_join_ratio->HasError());
   REQUIRE(sirius_ctx->get_config().get_operator_params().mark_join_build_switch_ratio ==
           Approx(3.0));
+
+  for (auto const* value : {"-0.1", "'NaN'", "'Infinity'"}) {
+    INFO("value=" << value);
+    auto invalid_fraction =
+      con.Query("SET pin_table_compression_max_compressed_fraction = " + std::string(value));
+    REQUIRE(invalid_fraction != nullptr);
+    REQUIRE(invalid_fraction->HasError());
+    REQUIRE_THAT(
+      invalid_fraction->GetError(),
+      Catch::Contains(
+        "pin_table_compression_max_compressed_fraction must be finite and non-negative"));
+
+    auto retained =
+      con.Query("SELECT current_setting('pin_table_compression_max_compressed_fraction')::DOUBLE");
+    REQUIRE(retained != nullptr);
+    REQUIRE_FALSE(retained->HasError());
+    REQUIRE(retained->GetValue(0, 0).GetValue<double>() == Approx(0.6));
+    REQUIRE(sirius_ctx->get_config().get_compression_config().max_compressed_fraction ==
+            Approx(0.6));
+  }
 
   auto const require_ok = [&con](std::string const& sql) {
     auto result = con.Query(sql);
