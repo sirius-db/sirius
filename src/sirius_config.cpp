@@ -27,6 +27,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
+#include <cmath>
 #include <exception>
 #include <limits>
 #include <stdexcept>
@@ -297,7 +298,9 @@ static void from_yaml(const YAML::Node& node, compression_config& opt)
   yaml::reader r(node, "compression");
   r.optional("enable_pin_table_compression", opt.enable_pin_table_compression);
   r.optional("min_batch_size_bytes", yaml::bytes(opt.min_batch_size_bytes));
-  r.optional("max_compressed_fraction", opt.max_compressed_fraction);
+  r.optional("max_compressed_fraction", opt.max_compressed_fraction, [](double value) {
+    return std::isfinite(value) && value >= 0.0;
+  });
   r.optional("input_plan_dir", opt.input_plan_dir);
   r.reject_unknown();
 }
