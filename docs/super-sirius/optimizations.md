@@ -363,13 +363,11 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 **Mechanism:** The walk is structured for minimal, parallel, typed metadata access with statistics pruning:
 1. **Projected-column-only, typed walk (#868, #936):** `walk_duckdb_native_row_group_range()` walks the DuckDB segment trees directly for only the projected columns, reading typed `block_id` / compression / row counts / validity-child / max-string-length per segment instead of calling `GetColumnSegmentInfo` and re-parsing strings.
 2. **Stats pruning (#900):** `prepare_duckdb_native_walk()` evaluates DuckDB's own `TableFilter::CheckStatistics` against each row group's per-column statistics and drops any row group a pushed-down filter proves `FILTER_ALWAYS_FALSE` before it is staged, copied to the GPU, or decoded; an all-pruned table routes to DuckDB CPU up front.
-3. **Parallel range walk + early decode (#895):** `prepare_duckdb_native_walk()` runs as a cheap serial pre-step (partition stats, type-viability gate, row-group count) with no per-segment I/O; the row groups are sliced into ranges of `SIRIUS_METADATA_PARSE_CHUNK` groups, and the scan-manager pool walks the ranges in parallel so cold segment reads for different ranges overlap. The batch coalescer packs parsed ranges into cap-sized batches that decode while later ranges are still being parsed.
+3. **Parallel range walk + early decode (#895):** `prepare_duckdb_native_walk()` runs as a cheap serial pre-step (partition stats, type-viability gate, row-group count) with no per-segment I/O; the row groups are sliced into fixed internal ranges of eight groups, and the scan-manager pool walks the ranges in parallel so cold segment reads for different ranges overlap. The batch coalescer packs parsed ranges into cap-sized batches that decode while later ranges are still being parsed.
 
 **Code path:**
 - `src/op/scan/duckdb_native_metadata.cpp` — `prepare_duckdb_native_walk()`, `walk_duckdb_native_row_group_range()`, `mark_row_groups_pruned_by_filter_stats()`
 - `src/op/scan/duckdb_native_gpu_ingestible.cpp` — parse-range slicing, per-range walk thunks, and the `duckdb_native_batch_coalescer`
-
-**Config:** `SIRIUS_METADATA_PARSE_CHUNK` (row groups per parallel parse range, default 8)
 
 ### DuckDB-Native Async Coalesced Reads (PR #849)
 

@@ -146,9 +146,13 @@ static void from_yaml(const YAML::Node& node, exec::thread_pool_config& opt)
 static void from_yaml(const YAML::Node& node, creator::task_creator_config& opt)
 {
   yaml::reader r(node, "task_creator");
+  if (r.has("strategy")) {
+    throw std::runtime_error(
+      "'sirius.executor.task_creator.strategy': removed; task creation policy is internal and "
+      "currently demand-driven; remove this key");
+  }
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
-  r.optional("strategy", opt.strategy);
   r.optional("priority_order", opt.priority);
   r.reject_unknown();
 }

@@ -278,8 +278,11 @@ Thread pool (default `num_threads: 1`) plus:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `strategy` | enum: `active`, `lookahead` | `active` | Most speculative request type the task creator may use. `active` is demand-driven only; `lookahead` additionally warms up not-yet-activated scans one task at a time. Values are lowercase. |
 | `priority_order` | enum: `source`, `sink` | `source` | Order in which the task creator prioritizes tasks within a duckdb pipeline. `source` closer to source has higher priority; `sink` closer to sink has higher priority. Values are lowercase. |
+
+Task creation policy is internal and currently demand-driven. The former
+`sirius.executor.task_creator.strategy` key has been removed; configurations that still contain it
+must delete the key.
 
 ### `sirius.executor.pipeline`
 
