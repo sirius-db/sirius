@@ -143,12 +143,11 @@ constexpr std::array<setting_assignment, 10> legacy_only_settings{{
   {"modified_pipeline", "true"},
 }};
 
-constexpr std::array<const char*, 5> super_sirius_settings{{
+constexpr std::array<const char*, 4> super_sirius_settings{{
   "expression_evaluator_strategy",
   "enable_regex_jit_impl",
   "enable_duckdb_fallback",
   "fuse_merge_pipelines",
-  "scan_task_batch_size",
 }};
 }  // namespace
 
@@ -228,6 +227,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_filter_pushdown") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 0);
+    REQUIRE(setting_count(con, "scan_task_batch_size") == 0);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
@@ -240,6 +240,9 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     result = con.Query("SET enable_dynamic_zone_map_filter = true");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
+    result = con.Query("SET scan_task_batch_size = 1048576");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
   }
 
   setenv("SIRIUS_ENABLE_TEST_OPTIONS", "true", 1);
@@ -250,6 +253,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_filter_pushdown") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 0);
+    REQUIRE(setting_count(con, "scan_task_batch_size") == 0);
   }
 
   setenv("SIRIUS_ENABLE_TEST_OPTIONS", "1", 1);
@@ -260,6 +264,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 1);
     REQUIRE(setting_count(con, "enable_dynamic_filter_pushdown") == 1);
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 1);
+    REQUIRE(setting_count(con, "scan_task_batch_size") == 1);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
@@ -279,6 +284,12 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     result = con.Query("RESET enable_dynamic_zone_map_filter");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET scan_task_batch_size = 1048576");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("RESET scan_task_batch_size");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
   }
@@ -330,6 +341,18 @@ TEST_CASE("Sirius configuration rejects zero hash partition bytes", "[sirius][co
   REQUIRE_THROWS_WITH(
     config.load_from_file(cfg),
     Catch::Contains("hash_partition_bytes") && Catch::Contains("greater than zero"));
+}
+
+TEST_CASE("Sirius configuration rejects zero scan task batch bytes", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  fs::path cfg =
+    fs::path(loc.file_name()).parent_path() / "data" / "invalid_scan_task_batch_zero.yaml";
+
+  sirius::sirius_config config;
+  REQUIRE_THROWS_WITH(config.load_from_file(cfg),
+                      Catch::Contains("operator_params.scan_task_batch_size") &&
+                        Catch::Contains("greater than zero"));
 }
 
 TEST_CASE("Sirius configuration rejects negative host capacity bytes", "[sirius][config]")
@@ -723,6 +746,30 @@ TEST_CASE("DuckDB setting rejects zero hash partition bytes without a Sirius con
   REQUIRE(result->HasError());
   REQUIRE_THAT(result->GetError(),
                Catch::Contains("hash_partition_bytes must be greater than zero"));
+}
+
+TEST_CASE("DuckDB setting rejects zero scan task batch bytes without a Sirius context",
+          "[sirius][context][config][isolated_context]")
+{
+  finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
+  setenv("SIRIUS_DISABLE", "1", 1);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto before = con.Query("SELECT current_setting('scan_task_batch_size')::UBIGINT");
+  REQUIRE(before != nullptr);
+  REQUIRE_FALSE(before->HasError());
+  auto const expected = before->GetValue(0, 0).GetValue<uint64_t>();
+
+  auto zero = con.Query("SET scan_task_batch_size = 0");
+  REQUIRE(zero != nullptr);
+  REQUIRE(zero->HasError());
+  REQUIRE_THAT(zero->GetError(), Catch::Contains("scan_task_batch_size must be greater than zero"));
+
+  auto after = con.Query("SELECT current_setting('scan_task_batch_size')::UBIGINT");
+  REQUIRE(after != nullptr);
+  REQUIRE_FALSE(after->HasError());
+  REQUIRE(after->GetValue(0, 0).GetValue<uint64_t>() == expected);
 }
 
 TEST_CASE("DuckDB setting rejects negative byte values without mutation",
