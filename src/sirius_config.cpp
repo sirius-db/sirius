@@ -110,7 +110,7 @@ static void from_yaml(const YAML::Node& node, cucascade::memory::gpu_memory_spac
 
 static void from_yaml(const YAML::Node& node, cucascade::memory::host_memory_space_config& opt)
 {
-  yaml::reader r(node, "host_memory_space");
+  yaml::reader r(node, "sirius.space.host");
   r.optional("numa_id", opt.numa_id);
   r.optional(
     "reservation_limit_fraction", opt.reservation_limit_fraction, yaml::fraction<double>{});
@@ -122,6 +122,9 @@ static void from_yaml(const YAML::Node& node, cucascade::memory::host_memory_spa
   r.optional("pool_size", opt.pool_size);
   r.optional("initial_number_pools", opt.initial_number_pools);
   r.reject_unknown();
+  if (opt.numa_id < -1) {
+    throw std::runtime_error("sirius.space.host: numa_id must be -1 or non-negative");
+  }
   validate_downgrade_fractions(
     "sirius.space.host", opt.downgrade_trigger_fraction, opt.downgrade_stop_fraction);
 }

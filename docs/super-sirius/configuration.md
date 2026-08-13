@@ -205,7 +205,7 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `numa_id` | int | 0 | NUMA node the pinned pool is bound to. |
+| `numa_id` | int (>= -1) | -1 | NUMA node the pinned pool is bound to; -1 leaves it unbound. |
 | `reservation_limit_fraction` | double [0,1] | space default | Fraction of the space that may be reserved. |
 | `downgrade_trigger_fraction` | double (0,1] | space default | Start evicting above this fraction. Must be greater than `downgrade_stop_fraction`. |
 | `downgrade_stop_fraction` | double (0,1] | space default | Stop evicting below this fraction. Must be less than `downgrade_trigger_fraction`. |

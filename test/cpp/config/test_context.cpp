@@ -560,6 +560,17 @@ TEST_CASE("Sirius configuration rejects invalid downgrade hysteresis", "[sirius]
   }
 }
 
+TEST_CASE("Sirius configuration rejects invalid low-level host NUMA ids", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const path =
+    fs::path(loc.file_name()).parent_path() / "data" / "invalid_space_host_numa_id.yaml";
+  sirius::sirius_config config;
+  REQUIRE_THROWS_WITH(config.load_from_file(path),
+                      Catch::Contains("sirius.space.host") && Catch::Contains("numa_id") &&
+                        Catch::Contains("-1 or non-negative"));
+}
+
 TEST_CASE("Sirius downgrade hysteresis accepts omitted, null, and one-sided defaults",
           "[sirius][config]")
 {
