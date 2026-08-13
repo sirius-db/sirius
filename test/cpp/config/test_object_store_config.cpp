@@ -285,6 +285,40 @@ TEST_CASE("sirius_config parses rest perf instrumentation flag",
   std::filesystem::remove(path, ec);
 }
 
+TEST_CASE("sirius_config preserves the zero footer-probe opt-out",
+          "[scan_manager][config][s3][rest][footerbind]")
+{
+  auto const path = std::filesystem::temp_directory_path() / "sirius_rest_footer_probe.yaml";
+  auto write_value = [&](std::string const& value) {
+    write_yaml(path,
+               "sirius:\n"
+               "  executor:\n"
+               "    scan_manager:\n"
+               "      rest:\n"
+               "        footer_probe_bytes: " +
+                 value + "\n");
+  };
+
+  sirius::sirius_config cfg;
+  write_value("256KiB");
+  REQUIRE_NOTHROW(cfg.load_from_file(path));
+  REQUIRE(cfg.get_scan_manager_config().rest.footer_probe_bytes == 256UL * 1024);
+
+  write_value("0");
+  REQUIRE_NOTHROW(cfg.load_from_file(path));
+  CHECK(cfg.get_scan_manager_config().rest.footer_probe_bytes == 0);
+
+  for (auto const* invalid : {"-1", "-1KiB"}) {
+    CAPTURE(invalid);
+    write_value(invalid);
+    REQUIRE_THROWS_WITH(cfg.load_from_file(path), Catch::Contains("rest.footer_probe_bytes"));
+    CHECK(cfg.get_scan_manager_config().rest.footer_probe_bytes == 0);
+  }
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
 TEST_CASE("sirius_config rejects unknown rest config keys", "[scan_manager][config][rest]")
 {
   auto const path = std::filesystem::temp_directory_path() / "sirius_rest_unknown_key.yaml";
