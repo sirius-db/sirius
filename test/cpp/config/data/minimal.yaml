@@ -7,7 +7,6 @@ sirius:
     host:
       capacity_bytes: 160000000
     disk:
-      disk_id: 0
       capacity_bytes: 1000000000
       downgrade_root_dirs: "/tmp/sirius_disk_memory"
   executor:

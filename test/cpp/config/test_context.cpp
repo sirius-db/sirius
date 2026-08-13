@@ -279,11 +279,42 @@ TEST_CASE("Sirius configuration loading from file with configurator",
   REQUIRE(manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU).size() == 1);
   REQUIRE(manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).size() == 1);
   REQUIRE(manager.get_memory_spaces_for_tier(cucascade::memory::Tier::DISK).size() == 1);
+  REQUIRE(
+    manager.get_memory_spaces_for_tier(cucascade::memory::Tier::DISK).front()->get_device_id() ==
+    0);
 
   auto const& telemetry = sirius_ctx->get_config().get_telemetry_config();
   REQUIRE_FALSE(telemetry.enable_quent);
   REQUIRE(telemetry.output_directory == "/tmp/sirius_telemetry_config_test");
   REQUIRE(telemetry.engine_name == "sirius_config_test");
+}
+
+TEST_CASE("Sirius keeps the high-level disk space id internal", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const path =
+    fs::path(loc.file_name()).parent_path() / "data" / "invalid_memory_disk_id.yaml";
+  sirius::sirius_config config;
+  REQUIRE_THROWS_WITH(config.load_from_file(path),
+                      Catch::Contains("sirius.memory.disk.disk_id") && Catch::Contains("removed") &&
+                        Catch::Contains("sirius.space.disk"));
+}
+
+TEST_CASE("Sirius rejects an inactive high-level disk capacity", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+  sirius::sirius_config config;
+  REQUIRE_THROWS_WITH(
+    config.load_from_file(data_dir / "invalid_memory_disk_capacity_without_root.yaml"),
+    Catch::Contains("sirius.memory.disk.capacity_bytes") && Catch::Contains("inactive") &&
+      Catch::Contains("downgrade_root_dirs"));
+
+  REQUIRE_NOTHROW(config.load_from_file(data_dir / "valid_memory_disk_zero_optout.yaml"));
+  auto const& spaces = config.get_memory_space_configs();
+  REQUIRE(std::ranges::none_of(spaces, [](auto const& space) {
+    return std::holds_alternative<cucascade::memory::disk_memory_space_config>(space);
+  }));
 }
 
 TEST_CASE("Sirius configuration rejects zero hash partition bytes", "[sirius][config]")

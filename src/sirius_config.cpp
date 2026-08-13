@@ -483,23 +483,33 @@ struct host_mem_config {
 };
 
 struct disk_mem_config {
-  int id{0};
   std::size_t capacity_bytes{1024UL << 30};  // 1TB
   std::string downgrade_root_dirs;
 
   static void from_yaml(const YAML::Node& node, disk_mem_config& opt)
   {
     yaml::reader r(node, "memory.disk");
-    r.optional("disk_id", opt.id);
+    if (r.has("disk_id")) {
+      throw std::runtime_error(
+        "'sirius.memory.disk.disk_id': removed; the single high-level disk space uses internal "
+        "ID 0; remove this key or use 'sirius.space.disk[]' for explicit multi-space IDs");
+    }
     r.optional("capacity_bytes", yaml::bytes(opt.capacity_bytes));
     r.optional("downgrade_root_dirs", opt.downgrade_root_dirs);
     r.reject_unknown();
+    if (r.has_value("capacity_bytes") && opt.capacity_bytes > 0 &&
+        opt.downgrade_root_dirs.empty()) {
+      throw std::runtime_error(
+        "sirius.memory.disk.capacity_bytes: inactive without a non-empty "
+        "sirius.memory.disk.downgrade_root_dirs; configure the spill directory or remove "
+        "capacity_bytes");
+    }
   }
 
   void setup_configurator(cucascade::memory::reservation_manager_configurator& builder) const
   {
     if (downgrade_root_dirs.empty() || capacity_bytes == 0) { return; }
-    builder.set_disk_mounting_point(id, capacity_bytes, downgrade_root_dirs);
+    builder.set_disk_mounting_point(0, capacity_bytes, downgrade_root_dirs);
   }
 };
 

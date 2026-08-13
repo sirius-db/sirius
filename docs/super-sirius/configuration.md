@@ -78,7 +78,7 @@ sirius:
       downgrade_trigger_fraction: 0.8
       downgrade_stop_fraction: 0.6
     host: { capacity_bytes: 25GB, initial_number_pools: 50, pool_size: 512, block_size: 1048576 }
-    disk: { disk_id: 0, capacity_bytes: 1000000000000, downgrade_root_dirs: "/tmp/sirius_disk_memory" }
+    disk: { capacity_bytes: 1000000000000, downgrade_root_dirs: "/tmp/sirius_disk_memory" }
   executor:
     scan_manager: { num_threads: 4, use_sirius_datasource: true, uring_n_reactors: 1, enable_prefetch_cache: false }
     pipeline:     { num_threads: 4 }
@@ -149,8 +149,7 @@ Controls the disk spill tier. Data evicted from host memory is written here. Dis
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `disk_id` | int | 0 | Identifier for the disk space. |
-| `capacity_bytes` | bytes | 1Ti | Maximum disk space for spill files. |
+| `capacity_bytes` | bytes | 1Ti | Maximum disk space for spill files. An explicitly positive capacity requires a non-empty `downgrade_root_dirs`; `0` remains an explicit spill-tier opt-out. |
 | `downgrade_root_dirs` | string | "" | Directory path for spill files. **Must be set** to enable disk spilling. Use a fast local mount (NVMe preferred). |
 
 ### How Downgrade Thresholds Work
