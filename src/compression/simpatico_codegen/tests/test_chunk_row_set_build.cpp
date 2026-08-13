@@ -16,8 +16,9 @@
 //   * SPARSE — a handful of chunks out of many, which is the shape the whole
 //     enumerator exists for, and the one where an O(C) construction would be
 //     the wrong answer even if correct.
-//   * DUPLICATES — a many-to-many join hands the same row back twice. A mask
-//     cannot express that, so nothing else exercises a repeat.
+//   * REPEATS — a join hands the same row back many times, and a repeat here
+//     would decode it once per reference. Deduplication is upstream's job, so
+//     a duplicate arriving is an upstream bug and must be caught as one.
 //   * REJECTION — ids out of order or out of range must throw rather than
 //     build. A post-join caller is precisely the one whose ordering the decode
 //     cannot verify for itself, so the check has to be here.
@@ -172,13 +173,13 @@ void test_one_per_chunk()
   check_against_reference("one per chunk", ids, num_rows);
 }
 
-// A many-to-many join hands the same row back more than once. Repeats are
-// legitimate and must survive as repeats, in place.
-void test_duplicates()
+// A selection with no repeats, spanning chunk boundaries in both directions:
+// last row of a chunk, first row of the next, and a chunk skipped entirely.
+void test_chunk_boundaries()
 {
   std::int64_t const num_rows = 8 * kChunk;
-  std::vector<std::int32_t> ids{0, 0, 0, 5, 5, 1023, 1024, 1024, 2047, 7 * 1024};
-  check_against_reference("duplicates", ids, num_rows);
+  std::vector<std::int32_t> ids{0, 5, 1023, 1024, 2047, 7 * 1024};
+  check_against_reference("chunk boundaries", ids, num_rows);
 }
 
 // Every row of every chunk: T == C, where the sparse grid has nothing to skip
@@ -241,6 +242,8 @@ void test_rejects()
   // Out of order ACROSS a chunk boundary: the boundary flag would still look
   // plausible, so only the ordering check catches it.
   expect_rejected("descending across chunks", {2048, 5}, 4 * kChunk);
+  expect_rejected("repeated id", {0, 5, 5, 9}, 4 * kChunk);
+  expect_rejected("repeat across the tile boundary", {1023, 1024, 1024}, 4 * kChunk);
 }
 
 }  // namespace
@@ -256,7 +259,7 @@ int main()
   try {
     test_sparse();
     test_one_per_chunk();
-    test_duplicates();
+    test_chunk_boundaries();
     test_all_rows();
     test_partial_tail();
     test_empty();

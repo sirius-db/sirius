@@ -87,7 +87,7 @@ __global__ void row_ids_scan_kernel(std::int32_t const* __restrict__ row_ids,
       boundary[i] = 1u;
     } else {
       std::int64_t const prev = row_ids[i - 1];
-      if (prev > id) { *bad = 1u; }
+      if (prev >= id) { *bad = 1u; }  // a repeat would decode the row twice
       boundary[i] = (prev / chunk_rows != chunk) ? 1u : 0u;
     }
   }
@@ -192,7 +192,7 @@ chunk_row_set_owner build_chunk_row_set(std::int32_t const* row_ids,
 
   if (invalid != 0u) {
     throw std::runtime_error(
-      "chunk_row_set_build: row ids must be non-decreasing and within the batch");
+      "chunk_row_set_build: row ids must be strictly increasing and within the batch");
   }
 
   out.num_touched = static_cast<std::int64_t>(touched);

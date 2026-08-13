@@ -103,11 +103,12 @@ struct chunk_row_set_owner {
 
 /// Bucket a selection that arrived after the scan into the CSR above.
 ///
-/// ``row_ids`` are batch-local row ids on device, NON-DECREASING and each in
-/// [0, num_rows). Non-decreasing rather than strictly increasing because a
-/// many-to-many join legitimately hands the same row back more than once; a
-/// repeat costs one more entry and the decode emits that row again, which is
-/// what the join asked for.
+/// ``row_ids`` are batch-local row ids on device, STRICTLY INCREASING and each
+/// in [0, num_rows). A join may well hand the same row back many times, but a
+/// repeat here would decode that row once per reference; deduplication belongs
+/// upstream, where sort_unique_global_ids drops the repeats and keeps the ranks
+/// that replay them from the compact output (row_id_space.hpp). So a duplicate
+/// reaching this point is an upstream bug, and is rejected as one.
 ///
 /// Cost is O(num_ids) — no pass over the batch's chunks. That is the point: a
 /// selection touching 1% of chunks must not pay for the 99% it skips, which is
