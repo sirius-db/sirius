@@ -2230,6 +2230,11 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
       "TEST ONLY: force transparent GPU execution to fail at runtime with this message",
       LogicalType::VARCHAR,
       Value(""));
+    config.AddExtensionOption("concat_batch_bytes",
+                              "TEST ONLY: override the internally derived CONCAT batch target",
+                              LogicalType::UBIGINT,
+                              Value::UBIGINT(operator_defaults.concat_batch_bytes),
+                              SetConcatBatchBytes);
   }
 
   // Add in config options for special JIT implementation for regex
@@ -2304,12 +2309,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                             LogicalType::UBIGINT,
                             Value::UBIGINT(operator_defaults.hash_partition_bytes),
                             SetHashPartitionBytes);
-
-  config.AddExtensionOption("concat_batch_bytes",
-                            "Target size for concat operator",
-                            LogicalType::UBIGINT,
-                            Value::UBIGINT(operator_defaults.concat_batch_bytes),
-                            SetConcatBatchBytes);
 
   config.AddExtensionOption("sort_sample_bytes",
                             "Target bytes to sample before computing sort partition boundaries",
