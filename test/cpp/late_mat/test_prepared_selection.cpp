@@ -40,8 +40,8 @@
 #include <set>
 #include <vector>
 
+using sirius::late_mat::canonical_selection;
 using sirius::late_mat::pinned_table_layout;
-using sirius::late_mat::prepare_selection;
 using sirius::late_mat::prepared_selection;
 using sirius::late_mat::row_id_list;
 
@@ -73,15 +73,16 @@ std::vector<T> download(void const* device, std::size_t count)
 }
 
 /// Every global id the prepared selection would materialize, in output order.
-std::vector<std::int64_t> rebuild_global_ids(prepared_selection const& prepared)
+std::vector<std::int64_t> rebuild_global_ids(canonical_selection const& canonical,
+                                             pinned_table_layout const& layout)
 {
   std::vector<std::int64_t> ids;
-  for (std::size_t b = 0; b < prepared.batches.size(); ++b) {
-    auto const& batch = prepared.batches[b];
-    auto const start  = prepared.layout.batch_row_start[b];
+  for (std::size_t b = 0; b < canonical.batches.size(); ++b) {
+    auto const& batch = canonical.batches[b];
+    auto const start  = layout.batch_row_start[b];
     if (batch.survivors == 0) { continue; }
     if (batch.dense) {
-      for (std::int64_t r = 0; r < prepared.layout.batch_rows[b]; ++r) {
+      for (std::int64_t r = 0; r < layout.batch_rows[b]; ++r) {
         ids.push_back(start + r);
       }
       continue;
@@ -130,30 +131,28 @@ TEST_CASE("an unordered selection with repeats prepares to its own id set", "[la
   }
   auto d_ids = upload(host_ids, stream);
 
-  auto const prepared =
-    prepare_selection(layout,
-                      row_id_list{static_cast<std::uint64_t const*>(d_ids.data()),
-                                  static_cast<std::int64_t>(host_ids.size()),
-                                  false},
-                      stream,
-                      mr);
+  prepared_selection const prepared(layout,
+                                    row_id_list{static_cast<std::uint64_t const*>(d_ids.data()),
+                                                static_cast<std::int64_t>(host_ids.size()),
+                                                false});
+  auto const& canonical = prepared.canonical(stream, mr);
   cudaStreamSynchronize(stream.value());
 
   std::set<std::uint64_t> const distinct(host_ids.begin(), host_ids.end());
-  REQUIRE(prepared.original_count == static_cast<std::int64_t>(host_ids.size()));
-  REQUIRE(prepared.total_survivors == static_cast<std::int64_t>(distinct.size()));
-  REQUIRE(prepared.out_base.back() == prepared.total_survivors);
-  REQUIRE(prepared.needs_restore());
+  REQUIRE(prepared.original_count() == static_cast<std::int64_t>(host_ids.size()));
+  REQUIRE(canonical.total_survivors == static_cast<std::int64_t>(distinct.size()));
+  REQUIRE(canonical.out_base.back() == canonical.total_survivors);
+  REQUIRE(canonical.needs_restore());
 
   std::vector<std::int64_t> const expect(distinct.begin(), distinct.end());
-  REQUIRE(rebuild_global_ids(prepared) == expect);
+  REQUIRE(rebuild_global_ids(canonical, layout) == expect);
 
   // Every caller id must point at its own row of the output — that is what
   // makes deduplicating invisible to the caller.
-  auto const ranks = download<std::int32_t>(prepared.restore_rank.data(), host_ids.size());
+  auto const ranks = download<std::int32_t>(canonical.restore_rank.data(), host_ids.size());
   for (std::size_t i = 0; i < host_ids.size(); ++i) {
     REQUIRE(ranks[i] >= 0);
-    REQUIRE(ranks[i] < prepared.total_survivors);
+    REQUIRE(ranks[i] < canonical.total_survivors);
     REQUIRE(expect[static_cast<std::size_t>(ranks[i])] == static_cast<std::int64_t>(host_ids[i]));
   }
 }
@@ -173,43 +172,42 @@ TEST_CASE("a batch whose rows all survive is marked dense and prepares nothing",
   host_ids.push_back(static_cast<std::uint64_t>(2 * kChunk + 5));
   auto d_ids = upload(host_ids, stream);
 
-  auto const prepared =
-    prepare_selection(layout,
-                      row_id_list{static_cast<std::uint64_t const*>(d_ids.data()),
-                                  static_cast<std::int64_t>(host_ids.size()),
-                                  true},
-                      stream,
-                      mr);
+  prepared_selection const prepared(layout,
+                                    row_id_list{static_cast<std::uint64_t const*>(d_ids.data()),
+                                                static_cast<std::int64_t>(host_ids.size()),
+                                                true});
+  auto const& canonical = prepared.canonical(stream, mr);
   cudaStreamSynchronize(stream.value());
 
-  REQUIRE(prepared.batches[0].dense);
-  REQUIRE(prepared.batches[0].survivors == 2 * kChunk);
-  REQUIRE(prepared.batches[0].rows.num_survivors == 0);  // no CSR built
-  REQUIRE(prepared.batches[0].local_indices.size() == 0);
-  REQUIRE(prepared.batches[0].density == Approx(1.0));
+  REQUIRE(canonical.batches[0].dense);
+  REQUIRE(canonical.batches[0].survivors == 2 * kChunk);
+  REQUIRE(canonical.batches[0].rows.num_survivors == 0);  // no CSR built
+  REQUIRE(canonical.batches[0].local_indices.size() == 0);
+  REQUIRE(canonical.batches[0].density == Approx(1.0));
 
-  REQUIRE_FALSE(prepared.batches[1].dense);
-  REQUIRE(prepared.batches[1].survivors == 1);
-  REQUIRE(prepared.batches[1].rows.num_touched == 1);
+  REQUIRE_FALSE(canonical.batches[1].dense);
+  REQUIRE(canonical.batches[1].survivors == 1);
+  REQUIRE(canonical.batches[1].rows.num_touched == 1);
 
-  REQUIRE_FALSE(prepared.needs_restore());  // the caller promised sorted + unique
-  REQUIRE(prepared.out_base == std::vector<std::int64_t>{0, 2 * kChunk, 2 * kChunk + 1});
+  REQUIRE_FALSE(canonical.needs_restore());  // the caller promised sorted + unique
+  REQUIRE(canonical.out_base == std::vector<std::int64_t>{0, 2 * kChunk, 2 * kChunk + 1});
 
   std::vector<std::int64_t> expect(host_ids.begin(), host_ids.end());
-  REQUIRE(rebuild_global_ids(prepared) == expect);
+  REQUIRE(rebuild_global_ids(canonical, layout) == expect);
 }
 
 TEST_CASE("an empty selection prepares to nothing, per batch", "[late_mat][prepare]")
 {
-  auto const stream   = rmm::cuda_stream_view{};
-  auto const mr       = rmm::mr::get_current_device_resource_ref();
-  auto const layout   = pinned_table_layout::from_batch_rows({kChunk, kChunk});
-  auto const prepared = prepare_selection(layout, row_id_list{}, stream, mr);
+  auto const stream = rmm::cuda_stream_view{};
+  auto const mr     = rmm::mr::get_current_device_resource_ref();
+  auto const layout = pinned_table_layout::from_batch_rows({kChunk, kChunk});
+  prepared_selection const prepared(layout, row_id_list{});
+  auto const& canonical = prepared.canonical(stream, mr);
 
-  REQUIRE(prepared.total_survivors == 0);
-  REQUIRE(prepared.batches.size() == 2);
-  REQUIRE(prepared.out_base == std::vector<std::int64_t>{0, 0, 0});
-  REQUIRE_FALSE(prepared.needs_restore());
+  REQUIRE(canonical.total_survivors == 0);
+  REQUIRE(canonical.batches.size() == 2);
+  REQUIRE(canonical.out_base == std::vector<std::int64_t>{0, 0, 0});
+  REQUIRE_FALSE(canonical.needs_restore());
 }
 
 TEST_CASE("a batch nothing selected still holds its place", "[late_mat][prepare]")
@@ -223,14 +221,36 @@ TEST_CASE("a batch nothing selected still holds its place", "[late_mat][prepare]
   std::vector<std::uint64_t> const host_ids{3, 7, 2 * kChunk + 1};
   auto d_ids = upload(host_ids, stream);
 
-  auto const prepared = prepare_selection(
-    layout, row_id_list{static_cast<std::uint64_t const*>(d_ids.data()), 3, true}, stream, mr);
+  prepared_selection const prepared(
+    layout, row_id_list{static_cast<std::uint64_t const*>(d_ids.data()), 3, true});
+  auto const& canonical = prepared.canonical(stream, mr);
   cudaStreamSynchronize(stream.value());
 
-  REQUIRE(prepared.batches[1].survivors == 0);
-  REQUIRE_FALSE(prepared.batches[1].dense);
-  REQUIRE(prepared.out_base == std::vector<std::int64_t>{0, 2, 2, 3});
-  REQUIRE(rebuild_global_ids(prepared) == std::vector<std::int64_t>{3, 7, 2 * kChunk + 1});
+  REQUIRE(canonical.batches[1].survivors == 0);
+  REQUIRE_FALSE(canonical.batches[1].dense);
+  REQUIRE(canonical.out_base == std::vector<std::int64_t>{0, 2, 2, 3});
+  REQUIRE(rebuild_global_ids(canonical, layout) == std::vector<std::int64_t>{3, 7, 2 * kChunk + 1});
+}
+
+TEST_CASE("constructing a prepared selection does no device work", "[late_mat][prepare]")
+{
+  auto const stream = rmm::cuda_stream_view{};
+  auto const mr     = rmm::mr::get_current_device_resource_ref();
+  auto const layout = pinned_table_layout::from_batch_rows({kChunk, kChunk});
+  std::vector<std::uint64_t> const host_ids{9, 3, 9, 1500};
+  auto d_ids = upload(host_ids, stream);
+
+  // The canonical form is what costs a sort and a host sync, so a consumer that
+  // does not need one must not have paid for it just by preparing.
+  prepared_selection const prepared(
+    layout, row_id_list{static_cast<std::uint64_t const*>(d_ids.data()), 4, false});
+  REQUIRE_FALSE(prepared.has_canonical());
+  REQUIRE(prepared.original_count() == 4);
+
+  auto const& first = prepared.canonical(stream, mr);
+  REQUIRE(prepared.has_canonical());
+  // Built once and shared: a second ask is the same object, not a second sort.
+  REQUIRE(&first == &prepared.canonical(stream, mr));
 }
 
 TEST_CASE("an id past the end of the pinned table is refused", "[late_mat][prepare]")
@@ -244,6 +264,7 @@ TEST_CASE("an id past the end of the pinned table is refused", "[late_mat][prepa
   std::vector<std::uint64_t> const host_ids{5, static_cast<std::uint64_t>(2 * kChunk)};
   auto d_ids = upload(host_ids, stream);
 
-  REQUIRE_THROWS(prepare_selection(
-    layout, row_id_list{static_cast<std::uint64_t const*>(d_ids.data()), 2, true}, stream, mr));
+  prepared_selection const prepared(
+    layout, row_id_list{static_cast<std::uint64_t const*>(d_ids.data()), 2, true});
+  REQUIRE_THROWS(prepared.canonical(stream, mr));
 }

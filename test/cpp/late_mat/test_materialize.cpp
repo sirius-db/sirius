@@ -29,6 +29,7 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
@@ -44,13 +45,14 @@
 #include <memory>
 #include <numeric>
 #include <set>
+#include <string>
 #include <vector>
 
 using sirius::late_mat::batch_source;
 using sirius::late_mat::materialize;
 using sirius::late_mat::pinned_column_view;
 using sirius::late_mat::pinned_table_layout;
-using sirius::late_mat::prepare_selection;
+using sirius::late_mat::prepared_selection;
 using sirius::late_mat::row_id_list;
 
 namespace {
@@ -92,6 +94,82 @@ struct fake_pin {
     }
   }
 };
+
+/// The same table, but as strings: row i holds the decimal text of i. Multi-batch
+/// variable-width columns are what still take the canonical path, since the
+/// one-pass raw gather copies a fixed element width.
+struct fake_string_pin {
+  std::vector<std::unique_ptr<cudf::column>> batches;
+  pinned_column_view view;
+
+  fake_string_pin(std::vector<std::int64_t> const& batch_rows, rmm::cuda_stream_view stream)
+  {
+    auto const mr     = rmm::mr::get_current_device_resource_ref();
+    std::int64_t next = 0;
+    for (auto const rows : batch_rows) {
+      std::vector<std::int32_t> offsets{0};
+      std::string chars;
+      for (std::int64_t r = 0; r < rows; ++r) {
+        chars += std::to_string(next + r);
+        offsets.push_back(static_cast<std::int32_t>(chars.size()));
+      }
+      next += rows;
+
+      auto offsets_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                                   static_cast<cudf::size_type>(offsets.size()),
+                                                   cudf::mask_state::UNALLOCATED,
+                                                   stream,
+                                                   mr);
+      cudaMemcpyAsync(offsets_col->mutable_view().data<std::int32_t>(),
+                      offsets.data(),
+                      offsets.size() * sizeof(std::int32_t),
+                      cudaMemcpyHostToDevice,
+                      stream.value());
+      rmm::device_buffer chars_buf(chars.size(), stream, mr);
+      cudaMemcpyAsync(
+        chars_buf.data(), chars.data(), chars.size(), cudaMemcpyHostToDevice, stream.value());
+      cudaStreamSynchronize(stream.value());
+
+      batches.push_back(cudf::make_strings_column(static_cast<cudf::size_type>(rows),
+                                                  std::move(offsets_col),
+                                                  std::move(chars_buf),
+                                                  0,
+                                                  rmm::device_buffer{0, stream, mr}));
+    }
+
+    view.dtype = cudf::data_type{cudf::type_id::STRING};
+    for (std::size_t b = 0; b < batches.size(); ++b) {
+      batch_source src;
+      src.uncompressed = batches[b]->view();
+      src.num_rows     = batch_rows[b];
+      view.batches.push_back(src);
+    }
+  }
+};
+
+std::vector<std::string> read_back_strings(cudf::column_view const& col)
+{
+  cudf::strings_column_view const scv(col);
+  std::vector<std::int32_t> offsets(static_cast<std::size_t>(scv.size()) + 1);
+  cudaMemcpy(offsets.data(),
+             scv.offsets().data<std::int32_t>() + scv.offset(),
+             offsets.size() * sizeof(std::int32_t),
+             cudaMemcpyDeviceToHost);
+  std::string chars(static_cast<std::size_t>(offsets.back() - offsets.front()), '\0');
+  if (!chars.empty()) {
+    cudaMemcpy(chars.data(),
+               scv.chars_begin(rmm::cuda_stream_default) + offsets.front(),
+               chars.size(),
+               cudaMemcpyDeviceToHost);
+  }
+  std::vector<std::string> out;
+  out.reserve(static_cast<std::size_t>(scv.size()));
+  for (std::size_t i = 0; i + 1 < offsets.size(); ++i) {
+    out.push_back(chars.substr(static_cast<std::size_t>(offsets[i] - offsets.front()),
+                               static_cast<std::size_t>(offsets[i + 1] - offsets[i])));
+  }
+  return out;
+}
 
 std::vector<std::int32_t> read_back(cudf::column_view const& col)
 {
@@ -135,12 +213,10 @@ TEST_CASE("a sorted selection materializes its rows in table order", "[late_mat]
     0, 7, 1023, 1024, 3 * kChunk, 3 * kChunk + 1, 5 * kChunk, 9 * kChunk - 1};
   auto d_ids = upload_ids(ids, stream);
 
-  auto const prepared = prepare_selection(
-    layout,
-    row_id_list{
-      static_cast<std::uint64_t const*>(d_ids.data()), static_cast<std::int64_t>(ids.size()), true},
-    stream,
-    mr);
+  prepared_selection const prepared(layout,
+                                    row_id_list{static_cast<std::uint64_t const*>(d_ids.data()),
+                                                static_cast<std::int64_t>(ids.size()),
+                                                true});
   auto const column = materialize(pin.view, prepared, stream, mr);
   cudaStreamSynchronize(stream.value());
 
@@ -150,6 +226,7 @@ TEST_CASE("a sorted selection materializes its rows in table order", "[late_mat]
   }
   REQUIRE(column->size() == static_cast<cudf::size_type>(ids.size()));
   REQUIRE(read_back(column->view()) == expect);
+  REQUIRE_FALSE(prepared.has_canonical());
 }
 
 TEST_CASE("an unordered selection with repeats comes back in the caller's order",
@@ -165,16 +242,10 @@ TEST_CASE("an unordered selection with repeats comes back in the caller's order"
   std::vector<std::uint64_t> const ids{8000, 3, 8000, 4096, 3, 12, 8999, 4096, 0, 8999, 8999, 5000};
   auto d_ids = upload_ids(ids, stream);
 
-  auto const prepared =
-    prepare_selection(layout,
-                      row_id_list{static_cast<std::uint64_t const*>(d_ids.data()),
-                                  static_cast<std::int64_t>(ids.size()),
-                                  false},
-                      stream,
-                      mr);
-  REQUIRE(prepared.needs_restore());
-  std::set<std::uint64_t> const distinct(ids.begin(), ids.end());
-  REQUIRE(prepared.total_survivors == static_cast<std::int64_t>(distinct.size()));
+  prepared_selection const prepared(layout,
+                                    row_id_list{static_cast<std::uint64_t const*>(d_ids.data()),
+                                                static_cast<std::int64_t>(ids.size()),
+                                                false});
 
   auto const column = materialize(pin.view, prepared, stream, mr);
   cudaStreamSynchronize(stream.value());
@@ -186,6 +257,40 @@ TEST_CASE("an unordered selection with repeats comes back in the caller's order"
   }
   REQUIRE(column->size() == static_cast<cudf::size_type>(ids.size()));
   REQUIRE(read_back(column->view()) == expect);
+
+  // THE regression this path exists for. A gather needs neither sorted nor
+  // unique ids, so canonicalizing an uncompressed column is a sort plus a
+  // second gather bought for nothing.
+  REQUIRE_FALSE(prepared.has_canonical());
+}
+
+TEST_CASE("a multi-batch string column takes the canonical path and still answers in order",
+          "[late_mat][materialize]")
+{
+  auto const stream = rmm::cuda_stream_view{};
+  auto const mr     = rmm::mr::get_current_device_resource_ref();
+  std::vector<std::int64_t> const batch_rows{1024, 512, 700};
+  auto const layout = pinned_table_layout::from_batch_rows(batch_rows);
+  fake_string_pin pin(batch_rows, stream);
+
+  // Unordered, repeated, spanning all three batches — and one batch taken whole
+  // so the dense copy is exercised too.
+  std::vector<std::uint64_t> ids{2000, 5, 2000, 1030, 5, 1536, 2235, 0};
+  auto d_ids = upload_ids(ids, stream);
+
+  prepared_selection const prepared(layout,
+                                    row_id_list{static_cast<std::uint64_t const*>(d_ids.data()),
+                                                static_cast<std::int64_t>(ids.size()),
+                                                false});
+  auto const column = materialize(pin.view, prepared, stream, mr);
+  cudaStreamSynchronize(stream.value());
+
+  REQUIRE(prepared.has_canonical());  // variable width, so no raw path
+  std::vector<std::string> expect;
+  for (auto id : ids) {
+    expect.push_back(std::to_string(id));
+  }
+  REQUIRE(read_back_strings(column->view()) == expect);
 }
 
 TEST_CASE("a dense batch is copied whole and still lands in order", "[late_mat][materialize]")
@@ -205,13 +310,10 @@ TEST_CASE("a dense batch is copied whole and still lands in order", "[late_mat][
   ids.push_back(static_cast<std::uint64_t>(4 * kChunk - 1));
   auto d_ids = upload_ids(ids, stream);
 
-  auto const prepared = prepare_selection(
-    layout,
-    row_id_list{
-      static_cast<std::uint64_t const*>(d_ids.data()), static_cast<std::int64_t>(ids.size()), true},
-    stream,
-    mr);
-  REQUIRE(prepared.batches[0].dense);
+  prepared_selection const prepared(layout,
+                                    row_id_list{static_cast<std::uint64_t const*>(d_ids.data()),
+                                                static_cast<std::int64_t>(ids.size()),
+                                                true});
 
   auto const column = materialize(pin.view, prepared, stream, mr);
   cudaStreamSynchronize(stream.value());
@@ -231,7 +333,7 @@ TEST_CASE("an empty selection materializes an empty column of the right type",
   std::vector<std::int64_t> const batch_rows{kChunk, kChunk};
   auto const layout = pinned_table_layout::from_batch_rows(batch_rows);
   fake_pin pin(batch_rows, stream);
-  auto const prepared = prepare_selection(layout, row_id_list{}, stream, mr);
+  prepared_selection const prepared(layout, row_id_list{});
 
   auto const column = materialize(pin.view, prepared, stream, mr);
   REQUIRE(column->size() == 0);
@@ -252,9 +354,9 @@ TEST_CASE("a column whose batches disagree with the prepared layout is refused",
   fake_pin pin({2 * kChunk / 3, 2 * kChunk - 2 * kChunk / 3}, stream);
 
   std::vector<std::uint64_t> const ids{1, 5};
-  auto d_ids          = upload_ids(ids, stream);
-  auto const prepared = prepare_selection(
-    layout, row_id_list{static_cast<std::uint64_t const*>(d_ids.data()), 2, true}, stream, mr);
+  auto d_ids = upload_ids(ids, stream);
+  prepared_selection const prepared(
+    layout, row_id_list{static_cast<std::uint64_t const*>(d_ids.data()), 2, true});
 
   REQUIRE_THROWS(materialize(pin.view, prepared, stream, mr));
 }

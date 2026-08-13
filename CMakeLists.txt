@@ -240,6 +240,7 @@ set(EXTENSION_SOURCES
     src/compression/plan_register.cpp
     src/late_mat/prepared_selection.cpp
     src/late_mat/materialize.cpp
+    src/late_mat/multi_source_gather.cu
     src/config.cpp
     src/helper/numeric_narrowing.cpp
     src/helper/type_conversions.cpp
