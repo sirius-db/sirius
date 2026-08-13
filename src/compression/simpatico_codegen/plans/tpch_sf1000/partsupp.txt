@@ -20,9 +20,5 @@ input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 # comp: 100.00 GB/s  decomp: 267.09 GB/s
 input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 ---
-# column: ps_comment  dtype: str  ratio: 1.019x  depth: 3
-# note: chars stay raw — its ~12GB buffer compresses to >INT32_MAX bytes, which
-# cannot be serialized as a single nvcomp leaf (.hpln header is a UINT8 column)
-input -> str_split -> offsets, chars
-str_split.offsets -> delta -> differences
-str_split.offsets.differences -> ans
+# column: ps_comment  dtype: str  ratio: 1.019x -> identity (incompressible)
+input -> identity

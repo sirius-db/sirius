@@ -63,4 +63,14 @@ dynamic_filter_publish_plan::dynamic_filter_publish_plan(
                         _replica_spaces.end());
 }
 
+void dynamic_filter_publish_plan::restrict_replicas_to(std::vector<int> const& admitted_gpu_ids)
+{
+  if (admitted_gpu_ids.empty()) { return; }
+  std::erase_if(_replica_spaces, [&](dynamic_filter_replica_space const& target) {
+    auto const gpu_id = target.get_gpu_space().get_device_id();
+    return std::find(admitted_gpu_ids.begin(), admitted_gpu_ids.end(), gpu_id) ==
+           admitted_gpu_ids.end();
+  });
+}
+
 }  // namespace sirius::op

@@ -143,6 +143,8 @@ def setup_benchmark_dir(
         "data_source": data_source,
         "queries": [f"q{q}" for q in queries],
         "pin": pin,
+        "pin_compression": PIN_COMPRESSION_PLAN_DIR is not None,
+        "compression_plan_dir": PIN_COMPRESSION_PLAN_DIR,
         "nsys_profile": nsys_profile,
         "runtime_file": os.path.relpath(runtime_csv, benchmark_dir),
     }
@@ -218,22 +220,36 @@ def resolve_engine_modes(engine):
 
 DEFAULT_OUTPUT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 
+# Set from --pin-compression/--compression-plan-dir in main(); when set, every
+# Sirius connection enables Simpatico compression for its pin_table calls.
+PIN_COMPRESSION_PLAN_DIR = None
 
-def drop_os_cache():
-    """Drop OS filesystem cache. Requires passwordless sudo per CLAUDE.md."""
-    proc = subprocess.run(
-        ["sudo", "-n", "/usr/bin/tee", "/proc/sys/vm/drop_caches"],
-        input="3\n",
-        text=True,
-        capture_output=True,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            "Failed to drop OS cache. Set up passwordless sudo as described "
-            f"in test/tpch_performance/CLAUDE.md (stderr: {proc.stderr.strip()})"
-        )
+
+def drop_os_cache(source, data_source="parquet"):
+    """Evict input dataset pages from the OS page cache via posix_fadvise(DONTNEED).
+
+    Unlike writing to /proc/sys/vm/drop_caches this requires no root/sudo — it
+    only evicts the pages belonging to the benchmark's own input files.
+    os.sync() is called first so any dirty pages are flushed before eviction.
+    """
+    if data_source == "duckdb":
+        files = [source]
     else:
-        log("OS cache dropped successfully")
+        files = []
+        for table in TPCH_TABLES:
+            files.extend(_resolve_parquet_files(source, table))
+
+    os.sync()
+    evicted = 0
+    for path in files:
+        try:
+            with open(path, "rb") as f:
+                size = os.fstat(f.fileno()).st_size
+                os.posix_fadvise(f.fileno(), 0, size, os.POSIX_FADV_DONTNEED)
+                evicted += 1
+        except OSError as e:
+            log(f"WARNING: fadvise({path}): {e}")
+    log(f"posix_fadvise(DONTNEED) applied to {evicted} file(s)")
 
 
 def _resolve_parquet_files(parquet_dir, table):
@@ -295,6 +311,19 @@ def open_connection(source, gpu_execution=False, data_source="parquet"):
         log(f"Loading Sirius extension from {EXTENSION_PATH}")
         con.execute(f"LOAD '{EXTENSION_PATH}'")
         log("Sirius extension loaded")
+        if PIN_COMPRESSION_PLAN_DIR:
+            log(
+                f"Enabling Simpatico pin compression (plans: {PIN_COMPRESSION_PLAN_DIR})"
+            )
+            con.execute("SET pin_table_compression = true;")
+            con.execute(
+                "SET pin_table_input_compression_plan_dir = "
+                f"'{PIN_COMPRESSION_PLAN_DIR}';"
+            )
+        pre_sql = os.environ.get("SIRIUS_PRE_SQL", "")
+        if pre_sql:
+            log(f"Executing SIRIUS_PRE_SQL: {pre_sql}")
+            _execute_multi(con, pre_sql)
     return con
 
 
@@ -390,6 +419,13 @@ def run_grouped(
                 try:
                     for it in range(iterations):
                         log(f"--- q{qnum} iter{it} engine={name} ---")
+                        if use_gpu:
+                            try:
+                                con.execute(
+                                    f"CALL sirius_set_query_label('q{qnum}_iter{it}')"
+                                ).fetchall()
+                            except Exception as e:
+                                log(f"  query label failed (non-fatal): {e}")
                         _run_one(
                             writer,
                             con,
@@ -476,7 +512,7 @@ def run_isolated(
                     source, gpu_execution=use_gpu, data_source=data_source
                 )
                 try:
-                    drop_os_cache()
+                    drop_os_cache(source, data_source)
                     if pin_enabled and use_gpu:
                         log(f"  Pinning tables for q{qnum}")
                         _execute_multi(con, emit_pin(qnum, source, data_source))
@@ -535,7 +571,17 @@ def _build_nsys_temp_sql(qnum, source, iterations, pin, qdir, data_source="parqu
         parts.append(_build_views_sql(source).rstrip("\n"))
     parts.append("INSERT INTO _timings VALUES (1, 'views', current_timestamp);")
 
+    pre_sql = os.environ.get("SIRIUS_PRE_SQL", "").strip()
+    if pre_sql:
+        parts.append(pre_sql.rstrip(";") + ";")
+
     if pin != "none":
+        if PIN_COMPRESSION_PLAN_DIR:
+            parts.append("SET pin_table_compression = true;")
+            parts.append(
+                "SET pin_table_input_compression_plan_dir = "
+                f"'{PIN_COMPRESSION_PLAN_DIR}';"
+            )
         parts.append(emit_pin(qnum, source, data_source))
 
     parts.append("SET gpu_execution = true;")
@@ -734,6 +780,65 @@ def run_nsys_profile(
             while it < iterations:
                 _record(writer, "sirius", qnum, it, float("nan"))
                 it += 1
+
+
+def print_runtime_summary(runtime_csv):
+    """Print a per-engine table of query runtimes with one column per iteration and a Total row."""
+    data = {}
+    iterations_seen = set()
+    with open(runtime_csv, newline="") as f:
+        for row in csv.DictReader(f):
+            eng = row["engine"]
+            qname = row["query"]
+            it = int(row["iteration"])
+            try:
+                rt = float(row["runtime_s"])
+            except (ValueError, KeyError):
+                rt = float("nan")
+            data.setdefault(eng, {}).setdefault(qname, {})[it] = rt
+            iterations_seen.add(it)
+
+    if not data:
+        return
+
+    n_iters = max(iterations_seen) + 1 if iterations_seen else 0
+    iter_labels = [f"iter{i}" for i in range(n_iters)]
+    q_w, col_w = 7, 10
+
+    def _fmt(v):
+        return f"{'nan':>{col_w}}" if math.isnan(v) else f"{v:{col_w}.4f}"
+
+    def _qnum(name):
+        try:
+            return int(name.lstrip("q"))
+        except ValueError:
+            return 0
+
+    print()
+    print("=== Runtime Summary (seconds) ===")
+    for eng in sorted(data):
+        print(f"\n[{eng}]")
+        header = f"{'Query':<{q_w}}" + "".join(
+            f"  {lbl:>{col_w}}" for lbl in iter_labels
+        )
+        sep = "-" * len(header)
+        print(header)
+        print(sep)
+
+        col_totals = [0.0] * n_iters
+        for qname in sorted(data[eng], key=_qnum):
+            cells = []
+            for i in range(n_iters):
+                rt = data[eng][qname].get(i, float("nan"))
+                cells.append(_fmt(rt))
+                if not math.isnan(rt):
+                    col_totals[i] += rt
+            print(f"{qname:<{q_w}}" + "".join(f"  {c}" for c in cells))
+
+        print(sep)
+        total_cells = [f"{t:{col_w}.4f}" for t in col_totals]
+        print(f"{'Total':<{q_w}}" + "".join(f"  {c}" for c in total_cells))
+    print()
 
 
 def split_sirius_log(log_dir, benchmark_dir, queries, iterations):
@@ -962,6 +1067,25 @@ def parse_args():
         ),
     )
     p.add_argument(
+        "--pin-compression",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Compress the pinned tables with Simpatico; needs --pin gpu|host "
+            "and per-table plan files (--compression-plan-dir)"
+        ),
+    )
+    p.add_argument(
+        "--compression-plan-dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory of per-table Simpatico plan files (<table>.<ext>) for "
+            "--pin-compression (default: the SF1000 plans under "
+            "src/compression/simpatico_codegen/plans)"
+        ),
+    )
+    p.add_argument(
         "--name",
         type=str,
         default=None,
@@ -1016,6 +1140,26 @@ def main():
     if args.pin != "none" and args.engine == "cpu":
         raise SystemExit("--pin is Sirius-only; cannot be combined with --engine cpu")
 
+    # Simpatico compression happens at pin time, so it only applies to pinned
+    # input, and it is a no-op without a plan file naming a TPC-H table.
+    if args.pin_compression:
+        if args.pin == "none":
+            raise SystemExit("--pin-compression needs a pinned tier (--pin gpu|host)")
+        plan_dir = args.compression_plan_dir or os.path.join(
+            REPO_ROOT, "src/compression/simpatico_codegen/plans/tpch_sf1000"
+        )
+        plan_dir = os.path.abspath(plan_dir)
+        if not os.path.isdir(plan_dir):
+            raise SystemExit(f"--compression-plan-dir not found: {plan_dir}")
+        plan_stems = {os.path.splitext(f)[0] for f in os.listdir(plan_dir)}
+        if not any(t in plan_stems for t in TPCH_TABLES):
+            raise SystemExit(
+                f"No plan file in {plan_dir} names a TPC-H table; plan files "
+                "are <table>.<ext>"
+            )
+        global PIN_COMPRESSION_PLAN_DIR
+        PIN_COMPRESSION_PLAN_DIR = plan_dir
+
     if args.validation and args.engine != "both":
         raise SystemExit(
             "--validation requires --engine both (needs both result sets to compare)"
@@ -1066,13 +1210,15 @@ def main():
     log(f"Queries:       {queries}")
     log(f"Config:        {config_path or '(default)'}")
     log(f"Pin:           {args.pin}")
+    if PIN_COMPRESSION_PLAN_DIR:
+        log(f"Compression:   simpatico ({PIN_COMPRESSION_PLAN_DIR})")
     log(f"DuckDB profiling: {args.duckdb_profiling}")
     log(f"nsys-profile:  {nsys_profile}")
     log(f"Benchmark dir: {benchmark_dir}")
     log(f"Runtime CSV:   {runtime_csv}")
     log(f"Log dir:       {log_dir}")
 
-    drop_os_cache()
+    drop_os_cache(source, args.data_source)
     with open(runtime_csv, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["engine", "query", "iteration", "runtime_s"])
@@ -1115,6 +1261,8 @@ def main():
         log("Starting validation")
         validate(benchmark_dir, queries)
         log("Validation complete")
+
+    print_runtime_summary(runtime_csv)
 
 
 if __name__ == "__main__":

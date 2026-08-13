@@ -51,12 +51,16 @@
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 #include <duckdb/common/allocator.hpp>
+#include <duckdb/execution/operator/persistent/physical_insert.hpp>
+#include <duckdb/execution/operator/persistent/physical_merge_into.hpp>
+#include <duckdb/execution/operator/persistent/physical_update.hpp>
 #include <duckdb/execution/physical_plan_generator.hpp>
 #include <io/types.hpp>
 #include <io/uring/uring_ioctx.hpp>
 #include <sys/resource.h>
 #include <unistd.h>  // for isatty/fileno
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstddef>
@@ -80,6 +84,89 @@ static constexpr std::string_view CONFIG_FILE_NAME        = "sirius.yaml";
 static constexpr std::string_view LEGACY_CONFIG_FILE_NAME = "sirius.cfg";
 static constexpr std::string_view CONFIG_FILE_DIR         = ".sirius";
 static constexpr std::string_view CONFIG_FILE_ENV_NAME    = "SIRIUS_CONFIG_FILE";
+
+optional_ptr<TableCatalogEntry const> find_update_target(PhysicalOperator const& op)
+{
+  switch (op.type) {
+    case PhysicalOperatorType::UPDATE: return &op.Cast<PhysicalUpdate>().tableref;
+    case PhysicalOperatorType::INSERT: {
+      auto const& insert = op.Cast<PhysicalInsert>();
+      if (insert.action_type == OnConflictAction::UPDATE && insert.insert_table) {
+        return &*insert.insert_table;
+      }
+      break;
+    }
+    case PhysicalOperatorType::MERGE_INTO: {
+      auto const& merge = op.Cast<PhysicalMergeInto>();
+      for (auto const& action : merge.actions) {
+        if (action->action_type == MergeActionType::MERGE_UPDATE && action->op) {
+          return find_update_target(*action->op);
+        }
+      }
+      break;
+    }
+    default: break;
+  }
+  for (auto const& child : op.GetChildren()) {
+    if (auto target = find_update_target(child.get())) { return target; }
+  }
+  return nullptr;
+}
+
+std::optional<std::string> pinned_name_for_table(
+  sirius::scan_manager::sirius_scan_manager const& scan_manager, TableCatalogEntry const& table)
+{
+  std::optional<std::string> result;
+  scan_manager.visit_pinned_entries([&](std::string_view name, auto const& entry) {
+    if (!entry.cache_info.matches_duckdb_table(
+          table.ParentCatalog().GetName(), table.ParentSchema().name, table.name)) {
+      return true;
+    }
+    result = name;
+    return false;
+  });
+  return result;
+}
+
+void reject_update_to_pinned_table(SiriusContext& sirius_context,
+                                   ClientContext& context,
+                                   PreparedStatementData& prepared)
+{
+  switch (prepared.statement_type) {
+    case StatementType::UPDATE_STATEMENT:
+    case StatementType::INSERT_STATEMENT:
+    case StatementType::MERGE_INTO_STATEMENT: break;
+    default: return;
+  }
+  if (!prepared.physical_plan) { return; }
+  auto target = find_update_target(prepared.physical_plan->Root());
+  if (!target) { return; }
+
+  auto connection_state = get_sirius_connection_state(context);
+  if (!connection_state) {
+    throw InternalException("Sirius connection state is unavailable while guarding UPDATE");
+  }
+
+  std::shared_lock<std::shared_mutex> update_guard;
+  if (!connection_state->has_pinned_update_guard()) {
+    update_guard = sirius_context.lock_pinned_table_updates();
+  }
+  {
+    SiriusContext::SlotGuard pin_registry_guard(sirius_context, context);
+    auto pinned_name = pinned_name_for_table(sirius_context.get_scan_manager(), *target);
+    if (pinned_name) {
+      throw InvalidInputException(
+        "Sirius does not support UPDATE on pinned DuckDB table '%s'. Run CALL "
+        "unpin_table('%s') before updating it",
+        target->name,
+        *pinned_name);
+    }
+  }
+
+  if (update_guard.owns_lock()) {
+    connection_state->set_pinned_update_guard(std::move(update_guard));
+  }
+}
 
 /// Resolve the config file path. Search order:
 ///   1. SIRIUS_CONFIG_FILE environment variable (explicit path)
@@ -290,6 +377,7 @@ void SiriusContext::begin_execution_window(ClientContext& context,
   data_repository_registry_.create_for_query(query_id);
   task_creator_->reset();
   task_creator_->set_client_context(context);
+  // GPU admission runs later, in sirius_engine::initialize_internal().
 }
 
 void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::string_view end_tag)
@@ -535,8 +623,9 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   config_ = config;
   // Validate the cached topology before any downstream construction so a stub
   // topology fails loudly rather than producing zero-GPU executors silently.
-  // get_hw_topology() is the only authorised source of GPU/NUMA counts —
-  // never call raw CUDA/NUMA device-enumeration APIs directly elsewhere.
+  // get_hw_topology() is the only authorised source of physical GPU/NUMA discovery — never call
+  // raw CUDA/NUMA device-enumeration APIs directly elsewhere. Configured execution GPU ids come
+  // from the memory manager built below.
   auto const& topo = config_.get_hw_topology();
   if (topo.num_gpus == 0) {
     throw std::runtime_error(
@@ -557,17 +646,18 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 
   // Declare one telemetry device group per GPU so thread/queue telemetry can
   // nest under its device instead of piling up flat under the engine. The GPU
-  // memory space configs already reflect the configured topology.num_gpus /
-  // topology.gpu_ids selection, unlike the raw hardware topology.
-  std::vector<int> telemetry_gpu_ids;
-  for (auto const& space_config : config_.get_memory_space_configs()) {
-    if (auto const* gpu_config =
-          std::get_if<cucascade::memory::gpu_memory_space_config>(&space_config)) {
-      telemetry_gpu_ids.push_back(gpu_config->device_id);
-    }
+  // memory manager already reflects the configured topology.num_gpus / topology.gpu_ids
+  // selection, unlike the raw hardware topology.
+  std::vector<int> active_gpu_ids;
+  for (auto const* gpu_space :
+       memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+    if (gpu_space != nullptr) { active_gpu_ids.push_back(gpu_space->get_device_id()); }
   }
+  std::sort(active_gpu_ids.begin(), active_gpu_ids.end());
+  active_gpu_ids.erase(std::unique(active_gpu_ids.begin(), active_gpu_ids.end()),
+                       active_gpu_ids.end());
   telemetry_context_ = sirius::telemetry::telemetry_context::create(
-    config_.get_telemetry_config(), memory_manager_.get(), telemetry_gpu_ids);
+    config_.get_telemetry_config(), memory_manager_.get(), active_gpu_ids);
 
   if (config_.get_telemetry_config().enable_quent &&
       config_.get_telemetry_config().enable_batch_events) {
@@ -612,49 +702,48 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   topology_index_ = std::make_shared<const sirius::memory::topology_index>(
     config_.get_hw_topology(), *memory_manager_);
 
-  // Enable P2P peer access for every available GPU pair.
+  // Enable P2P peer access for every configured GPU pair.
   // cucascade::convert_gpu_to_gpu calls cudaMemcpyPeerAsync on every GPU->GPU
   // conversion. For that call to bypass host staging, peer access must be
   // enabled ONCE at init for every (src, dst) pair the host supports.
   // Non-fatal failure mode: SIRIUS_LOG_ERROR and continue — host-staged fallback
   // in cucascade's converter is a correct alternate path.
   {
-    auto const& mgpu06_topo = config_.get_hw_topology();
-    if (mgpu06_topo.num_gpus >= 2) {
-      peer_access_enabled_pairs_.reserve(static_cast<size_t>(mgpu06_topo.num_gpus) *
-                                         (mgpu06_topo.num_gpus - 1));
-      for (unsigned i = 0; i < mgpu06_topo.num_gpus; ++i) {
-        rmm::cuda_set_device_raii guard_i{rmm::cuda_device_id{static_cast<int>(i)}};
-        for (unsigned j = 0; j < mgpu06_topo.num_gpus; ++j) {
-          if (i == j) continue;
+    if (active_gpu_ids.size() >= 2) {
+      peer_access_enabled_pairs_.reserve(active_gpu_ids.size() * (active_gpu_ids.size() - 1));
+      for (int source_device : active_gpu_ids) {
+        rmm::cuda_set_device_raii guard_i{rmm::cuda_device_id{source_device}};
+        for (int target_device : active_gpu_ids) {
+          if (source_device == target_device) continue;
           int can_access = 0;
           cudaError_t probe_err =
-            cudaDeviceCanAccessPeer(&can_access, static_cast<int>(i), static_cast<int>(j));
+            cudaDeviceCanAccessPeer(&can_access, source_device, target_device);
           if (probe_err != cudaSuccess) {
             SIRIUS_LOG_ERROR("SiriusContext: cudaDeviceCanAccessPeer({},{}) failed: {}",
-                             i,
-                             j,
+                             source_device,
+                             target_device,
                              cudaGetErrorString(probe_err));
             continue;
           }
           if (can_access == 0) {
-            SIRIUS_LOG_INFO(
-              "SiriusContext: no P2P access {} -> {} -- falling back to host staging", i, j);
+            SIRIUS_LOG_INFO("SiriusContext: no P2P access {} -> {} -- falling back to host staging",
+                            source_device,
+                            target_device);
             continue;
           }
-          cudaError_t enable_err = cudaDeviceEnablePeerAccess(static_cast<int>(j), 0);
+          cudaError_t enable_err = cudaDeviceEnablePeerAccess(target_device, 0);
           // Always consume sticky error state — cudaErrorPeerAccessAlreadyEnabled
           // (and any other non-fatal condition) persists in the runtime until
           // cudaGetLastError() is called, which would make the NEXT CUDA API
           // call fail spuriously in unrelated code (e.g., thrust::exclusive_scan).
           (void)cudaGetLastError();
           if (enable_err == cudaSuccess || enable_err == cudaErrorPeerAccessAlreadyEnabled) {
-            peer_access_enabled_pairs_.emplace(static_cast<int>(i), static_cast<int>(j));
-            SIRIUS_LOG_INFO("SiriusContext: P2P enabled {} -> {}", i, j);
+            peer_access_enabled_pairs_.emplace(source_device, target_device);
+            SIRIUS_LOG_INFO("SiriusContext: P2P enabled {} -> {}", source_device, target_device);
           } else {
             SIRIUS_LOG_ERROR("SiriusContext: cudaDeviceEnablePeerAccess({}) from ctx {} failed: {}",
-                             j,
-                             i,
+                             target_device,
+                             source_device,
                              cudaGetErrorString(enable_err));
           }
         }
@@ -662,8 +751,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     } else {
       SIRIUS_LOG_INFO(
         "SiriusContext: skipping peer-access enable loop (num_gpus={}); "
-        "single-GPU host has no pairs to enable",
-        mgpu06_topo.num_gpus);
+        "configured GPU set has no pairs to enable",
+        active_gpu_ids.size());
     }
   }
 
@@ -936,6 +1025,16 @@ const sirius::scan_manager::sirius_scan_manager& SiriusContext::get_scan_manager
   return *scan_manager_;
 }
 
+std::shared_lock<std::shared_mutex> SiriusContext::lock_pinned_table_updates()
+{
+  return std::shared_lock(pinned_table_update_mutex_);
+}
+
+std::unique_lock<std::shared_mutex> SiriusContext::lock_pinned_table_registry()
+{
+  return std::unique_lock(pinned_table_update_mutex_);
+}
+
 std::shared_ptr<const sirius::telemetry::telemetry_context> SiriusContext::get_telemetry_context()
   const
 {
@@ -953,8 +1052,11 @@ void SiriusContext::create_query(
     std::move(pipelines), telemetry_context_->context(), query_id, telemetry_info);
   task_scheduler_->prepare_for_query(query_);
   task_creator_->prepare_for_query(*query_);
+  // Reads the admitted subset back off task_creator, so this must run after
+  // initialize_internal has set it — otherwise scan_manager gets the full topology list.
   scan_manager_->prepare_for_query(*query_,
-                                   config_.get_operator_params().enable_pinned_zone_map_pruning);
+                                   config_.get_operator_params().enable_pinned_zone_map_pruning,
+                                   task_creator_->get_active_gpu_ids());
 }
 
 duckdb::shared_ptr<sirius::planner::query> SiriusContext::get_query()
@@ -1178,6 +1280,9 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
                                                  PreparedStatementData& prepared,
                                                  PreparedStatementMode mode)
 {
+  if (!is_internal_query_active(context)) {
+    reject_update_to_pinned_table(*this, context, prepared);
+  }
   if (is_internal_query_active(context)) { return RebindQueryInfo::DO_NOT_REBIND; }
   auto conn_state = get_sirius_connection_state(context);
   // Mirror the optimizer hook's gpu_execution gate: when transparent execution
@@ -1379,13 +1484,15 @@ RebindQueryInfo SiriusContext::OnExecutePrepared(ClientContext& context,
                                                  PreparedStatementCallbackInfo& info,
                                                  RebindQueryInfo current_rebind)
 {
+  auto& prepared = info.prepared_statement;
+  reject_update_to_pinned_table(*this, context, prepared);
+
   // GPU eligibility can drift with data alone (e.g. an insert pushes a varchar past
   // the overflow-string limit) and data changes never trigger DuckDB's own rebind.
   // By execute time the CPU plan has been discarded, so a stale
   // PhysicalSiriusExecution would error with no fallback. Rebind instead:
   // OnFinalizePrepare re-decides against current stats and keeps the fresh CPU plan
   // when create_plan now refuses.
-  auto& prepared = info.prepared_statement;
   if (!prepared.unbound_statement || !prepared.physical_plan) { return current_rebind; }
   auto& root = prepared.physical_plan->Root();
   if (root.type == sirius::transparent::PhysicalSiriusExecution::TYPE &&

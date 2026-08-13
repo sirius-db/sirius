@@ -23,9 +23,9 @@ Each tier has configurable thresholds:
 
 | Parameter | GPU | Host | Purpose |
 |-----------|-----|------|---------|
-| `reservation_limit_fraction` | 0.9 | 0.9 | Max fraction reservable |
-| `downgrade_trigger_fraction` | 1.0 | 0.8 | When to start downgrading |
-| `downgrade_stop_fraction` | 0.7 | 0.7 | When to stop downgrading |
+| `reservation_limit_fraction` | 1.0 | 1.0 | Max fraction reservable |
+| `downgrade_trigger_fraction` | 0.8 | 0.9 | When to start downgrading |
+| `downgrade_stop_fraction` | 0.6 | 0.8 | When to stop downgrading; configuration requires `0 < stop < trigger <= 1` |
 
 ## cuCascade Integration
 
@@ -45,19 +45,20 @@ From `sirius_config`:
 **GPU Memory Space:**
 ```cpp
 device_id;                      // GPU device number
-reservation_limit_fraction = 0.9;
-downgrade_trigger_fraction = 1.0;
-downgrade_stop_fraction = 0.7;
+reservation_limit_fraction = 1.0;
+downgrade_trigger_fraction = 0.8;
+downgrade_stop_fraction = 0.6;
 ```
 
 **Host Memory Space:**
 ```cpp
 numa_id;                        // NUMA node affinity
-reservation_limit_fraction = 0.9;
-downgrade_trigger_fraction = 0.8;
-downgrade_stop_fraction = 0.7;
-block_size = 64MB;              // cuCascade block size
-pool_size = 1024;               // blocks per pool
+reservation_limit_fraction = 1.0;
+downgrade_trigger_fraction = 0.9;
+downgrade_stop_fraction = 0.8;
+block_size = 1MiB;              // cuCascade block size
+pool_size = 128;                // blocks per pool
+initial_number_pools = 4;       // pools allocated at startup
 ```
 
 **Disk Memory Space:**
@@ -163,7 +164,7 @@ On allocation failure:
 
 `small_pinned_host_memory_resource` provides fast host memory allocation:
 
-- Fixed-size block pools: 64MB blocks, 1024 blocks per pool
+- Fixed-size block pools: 1 MiB blocks, 128 blocks per pool, with four pools initially
 - Automatic NUMA node affinity
 - Used for GPU↔CPU transfers and scan caching
 - Configured via `sirius.yaml` (see [Configuration](configuration.md))

@@ -26,9 +26,11 @@
 #include <cudf/reduction/approx_distinct_count.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/transform.hpp>
+#include <cudf/utilities/error.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <algorithm>
+#include <new>
 
 namespace sirius {
 namespace op {
@@ -224,8 +226,16 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
           ndv,
           label_key_values->num_rows());
       }
+    } catch (const std::bad_alloc&) {
+      // Out-of-memory (incl. rmm::out_of_memory) must reach the task retry /
+      // downgrade machinery.
+      throw;
+    } catch (const cudf::cuda_error&) {
+      // CUDA errors are sticky; falling back would compute on a broken context.
+      throw;
     } catch (const std::exception& e) {
-      // Non-fatal: fall back to grouping on the original key columns.
+      // Non-fatal (e.g. an unsupported key shape): fall back to grouping on
+      // the original key columns.
       label_key_values.reset();
       label_col.reset();
       SIRIUS_LOG_DEBUG(

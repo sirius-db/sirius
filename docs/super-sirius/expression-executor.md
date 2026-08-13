@@ -190,7 +190,7 @@ The translator provides specialized methods for join conditions:
 - `translate_join_condition(condition)` — translates a single equality or inequality condition
 - `translate_join_conditions(conditions, start, end, swap_sides)` — combines multiple conditions with AND, optionally swapping LEFT/RIGHT table references for RIGHT/OUTER joins
 
-This is used by `sirius_physical_hash_join` in MIXED_JOIN mode to pass inequality conditions to `cudf::mixed_join()` as a cuDF AST expression.
+This is used by `sirius_physical_hash_join` in MIXED_JOIN mode to pass the conditional predicates — inequality conditions, and null-safe `IS NOT DISTINCT FROM` keys (emitted as `NULL_EQUAL`) that were mixed with a plain `=` — to `cudf::mixed_join()` as a cuDF AST expression.
 
 ## Key Files
 

@@ -1,0 +1,7 @@
+sirius:
+  memory:
+    gpu: null
+  space:
+    gpu:
+      - device_id: 0
+        memory_capacity: 128MiB

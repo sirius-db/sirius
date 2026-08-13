@@ -31,16 +31,14 @@
 #include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/table_filter.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
-#include <unistd.h>
+#include <utils/parquet_fixture_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
-#include <system_error>
 #include <utility>
 
 namespace fs = std::filesystem;
@@ -65,31 +63,25 @@ void require_ok(duckdb::unique_ptr<duckdb::MaterializedQueryResult> const& r, ch
 
 void generate_parquet(fs::path const& path)
 {
-  setenv("SIRIUS_DISABLE", "1", 1);
-  {
-    duckdb::DuckDB gen_db(nullptr);
-    duckdb::Connection gen(gen_db);
-    auto r =
-      gen.Query("COPY (SELECT range AS k, range * 2 AS v FROM range(" + std::to_string(kRows) +
-                ") ORDER BY k) TO '" + path.string() + "' (FORMAT PARQUET);");
-    REQUIRE(r);
-    REQUIRE_FALSE(r->HasError());
-  }
-  unsetenv("SIRIUS_DISABLE");
+  sirius::test::scoped_sirius_disable disable_sirius;
+  duckdb::DuckDB gen_db(nullptr);
+  duckdb::Connection gen(gen_db);
+  auto r = gen.Query("COPY (SELECT range AS k, range * 2 AS v FROM range(" + std::to_string(kRows) +
+                     ") ORDER BY k) TO " + sirius::test::sql_literal(path.string()) +
+                     " (FORMAT PARQUET);");
+  REQUIRE(r);
+  REQUIRE_FALSE(r->HasError());
 }
 
 void generate_native_db(fs::path const& db_path)
 {
-  setenv("SIRIUS_DISABLE", "1", 1);
-  {
-    duckdb::DuckDB gen_db(db_path.string().c_str());
-    duckdb::Connection gen(gen_db);
-    auto r = gen.Query("CREATE TABLE zm_native_t AS SELECT range AS k, range * 2 AS v FROM range(" +
-                       std::to_string(kRows) + ");");
-    REQUIRE(r);
-    REQUIRE_FALSE(r->HasError());
-  }
-  unsetenv("SIRIUS_DISABLE");
+  sirius::test::scoped_sirius_disable disable_sirius;
+  duckdb::DuckDB gen_db(db_path.string().c_str());
+  duckdb::Connection gen(gen_db);
+  auto r = gen.Query("CREATE TABLE zm_native_t AS SELECT range AS k, range * 2 AS v FROM range(" +
+                     std::to_string(kRows) + ");");
+  REQUIRE(r);
+  REQUIRE_FALSE(r->HasError());
 }
 
 void write_config(fs::path const& yaml_path)
@@ -230,10 +222,8 @@ TEST_CASE("gpu_execution - pinned zone maps prune clustered parquet chunks end t
 {
   pause_shared_envs();
 
-  auto tmp = fs::temp_directory_path() / ("sirius-pin-zonemap-" + std::to_string(::getpid()));
-  std::error_code ec;
-  fs::remove_all(tmp, ec);
-  fs::create_directories(tmp);
+  sirius::test::scratch_dir scratch{"pin_zonemap"};
+  auto const& tmp = scratch.path();
 
   auto parquet_path = tmp / "clustered.parquet";
   generate_parquet(parquet_path);
@@ -247,9 +237,9 @@ TEST_CASE("gpu_execution - pinned zone maps prune clustered parquet chunks end t
     auto con = local_env.make_connection();
 
     require_ok(con.Query("SET enable_duckdb_fallback = false;"), "disable fallback");
-    require_ok(
-      con.Query("CREATE VIEW t AS SELECT * FROM read_parquet('" + parquet_path.string() + "');"),
-      "create view");
+    require_ok(con.Query("CREATE VIEW t AS SELECT * FROM read_parquet(" +
+                         sirius::test::sql_literal(parquet_path.string()) + ");"),
+               "create view");
 
     auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
     REQUIRE(sirius_ctx);
@@ -257,8 +247,8 @@ TEST_CASE("gpu_execution - pinned zone maps prune clustered parquet chunks end t
     for (auto const* tier : {"host", "gpu"}) {
       DYNAMIC_SECTION("tier = " << tier)
       {
-        auto pin = con.Query("CALL pin_table('" + parquet_path.string() + "', tier='" +
-                             std::string(tier) + "', name='t');");
+        auto pin = con.Query("CALL pin_table(" + sirius::test::sql_literal(parquet_path.string()) +
+                             ", tier='" + std::string(tier) + "', name='t');");
         require_ok(pin, "pin_table");
 
         run_pruning_assertions(con, *sirius_ctx, "t", "t");
@@ -270,8 +260,8 @@ TEST_CASE("gpu_execution - pinned zone maps prune clustered parquet chunks end t
     SECTION("capture disabled at pin time yields a statless entry")
     {
       require_ok(con.Query("SET enable_pinned_zone_map_pruning = false;"), "disable before pin");
-      auto pin =
-        con.Query("CALL pin_table('" + parquet_path.string() + "', tier='gpu', name='t');");
+      auto pin = con.Query("CALL pin_table(" + sirius::test::sql_literal(parquet_path.string()) +
+                           ", tier='gpu', name='t');");
       require_ok(pin, "pin with capture disabled");
       auto const* entry_ptr = find_entry(*sirius_ctx, "t");
       REQUIRE(entry_ptr != nullptr);
@@ -290,16 +280,14 @@ TEST_CASE("gpu_execution - pinned zone maps prune clustered parquet chunks end t
 
       // ...until a re-pin: the same-name GPU re-pin takes the equal-row-count
       // merge and the statless entry adopts the fresh capture.
-      auto repin =
-        con.Query("CALL pin_table('" + parquet_path.string() + "', tier='gpu', name='t');");
+      auto repin = con.Query("CALL pin_table(" + sirius::test::sql_literal(parquet_path.string()) +
+                             ", tier='gpu', name='t');");
       require_ok(repin, "re-pin with capture enabled");
       run_pruning_assertions(con, *sirius_ctx, "t", "t");
 
       require_ok(con.Query("CALL unpin_table('t');"), "unpin");
     }
   }
-
-  fs::remove_all(tmp, ec);
 }
 
 TEST_CASE("gpu_execution - pinned zone maps prune clustered duckdb-native chunks end to end",
@@ -307,10 +295,8 @@ TEST_CASE("gpu_execution - pinned zone maps prune clustered duckdb-native chunks
 {
   pause_shared_envs();
 
-  auto tmp = fs::temp_directory_path() / ("sirius-pin-zonemap-nat-" + std::to_string(::getpid()));
-  std::error_code ec;
-  fs::remove_all(tmp, ec);
-  fs::create_directories(tmp);
+  sirius::test::scratch_dir scratch{"pin_zonemap_native"};
+  auto const& tmp = scratch.path();
 
   auto yaml_path = tmp / "pin_zonemap_native.yaml";
   write_config(yaml_path);
@@ -324,7 +310,9 @@ TEST_CASE("gpu_execution - pinned zone maps prune clustered duckdb-native chunks
     auto con = local_env.make_connection();
 
     require_ok(con.Query("SET gpu_execution = false;"), "disable gpu for setup");
-    require_ok(con.Query("ATTACH '" + db_file.string() + "' AS zm_native;"), "attach");
+    require_ok(
+      con.Query("ATTACH " + sirius::test::sql_literal(db_file.string()) + " AS zm_native;"),
+      "attach");
     require_ok(con.Query("USE zm_native;"), "use attached db");
     require_ok(con.Query("SET gpu_execution = true;"), "enable gpu");
     require_ok(con.Query("SET enable_duckdb_fallback = false;"), "disable fallback");
@@ -345,6 +333,4 @@ TEST_CASE("gpu_execution - pinned zone maps prune clustered duckdb-native chunks
       }
     }
   }
-
-  fs::remove_all(tmp, ec);
 }

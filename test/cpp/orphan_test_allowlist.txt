@@ -16,7 +16,6 @@ test/cpp/scan/test_column_builder.cpp
 
 # -- Pre-existing orphans (out of the build since before the guard existed;
 #    dates are the last commit that touched each file).
-test/cpp/creator/test_task_creator.cpp # 2026-05-06
 test/cpp/debug/test_debug_utils.cpp # 2026-05-21
 test/cpp/integration/test_tpcds_plan_translation.cpp # 2026-03-05
 test/cpp/memory_management/test_cpu_cache.cpp # 2026-03-05

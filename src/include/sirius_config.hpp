@@ -39,7 +39,9 @@ constexpr uint64_t DEFAULT_BATCH_SIZE = 800ULL * 1024 * 1024;  // 800 MiB
 /// Shared operator batch default: 2.5% of the smallest visible GPU's total memory,
 /// clamped to [512 MiB, 5 GiB]; DEFAULT_BATCH_SIZE when no GPU is visible. Queried
 /// once per process (memoized). operator_params derives its batch members from this,
-/// so every default-constructed instance (config, SET registration) agrees.
+/// so every default-constructed instance agrees. When YAML explicitly configures an
+/// effective GPU capacity, sirius_config narrows the shared defaults from the resolved
+/// memory-space configs before applying explicit operator_params overrides.
 uint64_t derived_default_batch_size();
 
 constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE       = DEFAULT_BATCH_SIZE;
@@ -71,6 +73,15 @@ constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
 /// that the crossover is hardware- and workload-dependent. Recalibrate per GPU; set to 0 to
 /// disable (always use filtered_join).
 constexpr double DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO = 8.0;
+
+/// Test build-key uniqueness at runtime when the planner could not prove it statically.
+///
+/// cudf's general hash join probes twice — a count pass to size the output, then a retrieve pass —
+/// while cudf::distinct_hash_join probes once, because a distinct build bounds the output by the
+/// probe row count. Sirius already implements both, but the distinct path is gated on a *proof* of
+/// uniqueness, which only a declared PRIMARY KEY on a catalog table can supply. The runtime test is
+/// one cudf::distinct_count pass over the build keys, taken only in BUILD_PROBE mode.
+constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = true;
 
 }  // namespace config
 
@@ -113,6 +124,13 @@ struct operator_params {
   /// L4 in the issue #510 microbenchmark, defaulted higher to stay conservative). Set to 0 to
   /// disable (always use filtered_join).
   double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
+
+  /// When the planner could not prove build-key uniqueness, test it at runtime (one
+  /// cudf::distinct_count pass over the build keys) and take the single-pass
+  /// cudf::distinct_hash_join instead of the two-pass general path when the keys are in fact
+  /// distinct. BUILD_PROBE mode only, INNER/LEFT equality joins with null-unequal semantics. See
+  /// DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE.
+  bool enable_runtime_distinct_build_probe = config::DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE;
 
   /// Wire dynamic table-filter pushdown: an eligible BUILD_PROBE hash-join build publishes a raw
   /// exact IN-list for 1..12 supported build rows, otherwise a hash IN-list if it fits the smallest
@@ -240,6 +258,11 @@ struct sirius_config {
     return _compression_config;
   }
 
+  /// How many GPUs to allocate per query. 0 = use all active GPUs (default).
+  /// Limits each query to the first @c gpus_per_query entries of the sorted
+  /// active-GPU list; the rest are left available for future concurrent queries.
+  [[nodiscard]] int gpus_per_query() const noexcept { return _gpus_per_query; }
+
  private:
   /// When @c _memory_space_configs contains more than one GPU memory space,
   /// force @c _scan_manager_config.use_sirius_datasource to true (sirius
@@ -248,6 +271,7 @@ struct sirius_config {
   void enforce_sirius_datasource_for_multi_gpu();
 
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
+  int _gpus_per_query = 0;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   creator::task_creator_config _task_creator_config;
   scan_manager::scan_manager_config _scan_manager_config{};

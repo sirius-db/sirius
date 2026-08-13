@@ -87,6 +87,11 @@ class sirius_httpfs : public duckdb::FileSystem {
 
   int64_t GetFileSize(duckdb::FileHandle& handle) override;
   duckdb::timestamp_t GetLastModifiedTime(duckdb::FileHandle& handle) override;
+  /// The object's ETag captured by this handle's open (HEAD or footer-probe
+  /// GET), or empty when the backend sent none.  DuckDB's external file cache
+  /// reads it once per caching handle as the validation token; an empty tag
+  /// keeps the safe (uncached) bypass.
+  std::string GetVersionTag(duckdb::FileHandle& handle) override;
 
   /// Exact key: returns @c {path} when @ref CanHandleFile. A glob pattern
   /// expands via one paginated S3 LIST (see @ref expand_glob) under four
