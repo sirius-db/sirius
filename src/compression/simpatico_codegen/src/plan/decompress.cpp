@@ -624,39 +624,31 @@ std::unique_ptr<cudf::column> decode_fused_subtree_impl(PlanTree const& tree,
         *error_out = "codegen decompress: decode_selection and mask disagree on survivor_count";
       return nullptr;
     }
-    // Runtime pick: the index walk decodes only the
-    // listed survivor rows by random access into the packed bits — preferred
-    // by the orchestrator at low selectivity. Bitpack LEAF roots only: delta
-    // roots keep the delta mask walk (the index walk rejects them at render) and the dictionary
-    // codes region keeps the mask walk by contract. Any anomaly (indices absent or mismatched)
-    // silently keeps the mask walk — the pick is an optimization and the mask walk is always
-    // renderable here.
+    // Runtime pick: the index walk decodes only the listed survivor rows by
+    // random access into the packed bits — preferred by the orchestrator at low
+    // selectivity. Bitpack LEAF roots only: a delta root keeps the mask walk
+    // (the index walk rejects it at render), as does the dictionary codes
+    // region by contract. Any anomaly — indices absent, or a count that
+    // disagrees with the mask — silently keeps the mask walk, since the pick is
+    // an optimization and the mask walk is always renderable here.
     bool const use_index_decode =
       sel->enumerate_by_index && sel->route == sirius::codegen::decode_route::bitpack_mask &&
       sel->survivor_count > 0 && root_nid < tree.nodes.size() &&
       tree.nodes[root_nid].op == "bitpack" &&
       static_cast<std::int64_t>(sel->survivor_indices.size()) == sel->survivor_count;
-    bool const masked_ok =
-      use_index_decode
-        ? launch_decode_fused_tree_index_consume(*built.tree,
-                                                 labeled,
-                                                 dtype,
-                                                 static_cast<std::int64_t>(num_rows),
-                                                 *sel->mask,
-                                                 sel->survivor_indices.data<std::int32_t>(),
-                                                 out_col->mutable_view().head<void>(),
-                                                 stream)
-        : launch_decode_fused_tree_mask_consume(*built.tree,
-                                                labeled,
-                                                dtype,
-                                                static_cast<std::int64_t>(num_rows),
-                                                *sel->mask,
-                                                out_col->mutable_view().head<void>(),
-                                                stream);
+    bool const masked_ok = launch_decode_fused_tree_compacted(
+      *built.tree,
+      labeled,
+      dtype,
+      static_cast<std::int64_t>(num_rows),
+      *sel->mask,
+      use_index_decode ? sel->survivor_indices.data<std::int32_t>() : nullptr,
+      out_col->mutable_view().head<void>(),
+      stream);
     if (!masked_ok) {
       if (error_out) {
-        *error_out = use_index_decode ? "codegen decompress: masked (index-consume) decode failed"
-                                      : "codegen decompress: masked (mask-consume) decode failed";
+        *error_out = use_index_decode ? "codegen decompress: compacted (index walk) decode failed"
+                                      : "codegen decompress: compacted (mask walk) decode failed";
       }
       return nullptr;
     }
@@ -1005,7 +997,7 @@ NodeId root_value_producer(PlanTree const& tree);
 bool mask_consume_selection_root(PlanTree const& tree);
 
 // The specialized dictionary char-emit
-// (launch_decode_fused_tree_mask_dict_gather):
+// (launch_decode_fused_tree_dict_gather):
 // constant-width, null-free keys with IDENTITY-STORED key channels (q1's
 // l_returnflag / l_linestatus; dict->bp->bp keys and variable-width keys take
 // the general route). The caller owns key-width measurement, keys_chars
@@ -1091,15 +1083,15 @@ std::unique_ptr<cudf::column> try_dict_gather_fast_path(PlanTree const& tree,
   auto const survivors = sel.survivor_count;
   rmm::device_buffer out_chars(
     static_cast<std::size_t>(survivors) * static_cast<std::size_t>(width), stream, mr);
-  if (!launch_decode_fused_tree_mask_dict_gather(*region->built.tree,
-                                                 region->labeled,
-                                                 region->dtype,
-                                                 static_cast<std::int64_t>(region->num_rows),
-                                                 *sel.mask,
-                                                 keys_chars->view().head<void>(),
-                                                 width,
-                                                 out_chars.data(),
-                                                 stream)) {
+  if (!launch_decode_fused_tree_dict_gather(*region->built.tree,
+                                            region->labeled,
+                                            region->dtype,
+                                            static_cast<std::int64_t>(region->num_rows),
+                                            *sel.mask,
+                                            keys_chars->view().head<void>(),
+                                            width,
+                                            out_chars.data(),
+                                            stream)) {
     return nullptr;  // render/launch declined — general route still serves this batch
   }
 

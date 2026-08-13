@@ -898,42 +898,34 @@ bool launch_decode_fused_tree_mask_out(codegen::jit::FusedTree const& tree,
     tree, labeled, dtype, num_rows, /*out=*/mask.words, stream, va);
 }
 
-// Mask walk: masked decode -> compacted output (masked_launch.hpp).
-bool launch_decode_fused_tree_mask_consume(codegen::jit::FusedTree const& tree,
-                                           codegen::jit::LabeledBuffers& labeled,
-                                           char const* dtype,
-                                           std::int64_t num_rows,
-                                           ::sirius::codegen::selection_mask const& mask,
-                                           void* out,
-                                           rmm::cuda_stream_view stream)
+// Compacting value decode, either enumeration (masked_launch.hpp). The
+// enumerator is chosen by the caller's `row_indices`: the shape, the contract
+// and the trailing args all follow from it, so the two walks cannot drift.
+bool launch_decode_fused_tree_compacted(codegen::jit::FusedTree const& tree,
+                                        codegen::jit::LabeledBuffers& labeled,
+                                        char const* dtype,
+                                        std::int64_t num_rows,
+                                        ::sirius::codegen::selection_mask const& mask,
+                                        std::int32_t const* row_indices,
+                                        void* out,
+                                        rmm::cuda_stream_view stream)
 {
+  bool const by_index = row_indices != nullptr;
   VariantLaunchArgs va;
-  va.shape         = cdj::kShapeMaskConsume;
-  va.sel_mask      = reinterpret_cast<CUdeviceptr>(mask.words);
+  va.shape         = by_index ? cdj::kShapeIndexConsume : cdj::kShapeMaskConsume;
   va.chunk_offsets = reinterpret_cast<CUdeviceptr>(mask.chunk_offsets);
-  if (!check_variant_contract(
-        va, &mask, num_rows, out, dtype, "launch_decode_fused_tree_mask_consume")) {
-    return false;
+  if (by_index) {
+    va.row_indices = reinterpret_cast<CUdeviceptr>(const_cast<std::int32_t*>(row_indices));
+  } else {
+    va.sel_mask = reinterpret_cast<CUdeviceptr>(mask.words);
   }
-  return launch_decode_fused_tree_impl(tree, labeled, dtype, num_rows, out, stream, va);
-}
-
-// Index walk: index-list-consuming compacting decode (masked_launch.hpp).
-bool launch_decode_fused_tree_index_consume(codegen::jit::FusedTree const& tree,
-                                            codegen::jit::LabeledBuffers& labeled,
-                                            char const* dtype,
-                                            std::int64_t num_rows,
-                                            ::sirius::codegen::selection_mask const& mask,
-                                            std::int32_t const* row_indices,
-                                            void* out,
-                                            rmm::cuda_stream_view stream)
-{
-  VariantLaunchArgs va;
-  va.shape         = cdj::kShapeIndexConsume;
-  va.chunk_offsets = reinterpret_cast<CUdeviceptr>(mask.chunk_offsets);
-  va.row_indices   = reinterpret_cast<CUdeviceptr>(const_cast<std::int32_t*>(row_indices));
-  if (!check_variant_contract(
-        va, &mask, num_rows, out, dtype, "launch_decode_fused_tree_index_consume")) {
+  if (!check_variant_contract(va,
+                              &mask,
+                              num_rows,
+                              out,
+                              dtype,
+                              by_index ? "launch_decode_fused_tree_compacted (index walk)"
+                                       : "launch_decode_fused_tree_compacted (mask walk)")) {
     return false;
   }
   return launch_decode_fused_tree_impl(tree, labeled, dtype, num_rows, out, stream, va);
@@ -1043,16 +1035,16 @@ bool launch_masked_char_copy(void const* chars,
   return true;
 }
 
-// Dictionary gather: masked constant-width gather (masked_launch.hpp).
-bool launch_decode_fused_tree_mask_dict_gather(codegen::jit::FusedTree const& tree,
-                                               codegen::jit::LabeledBuffers& labeled,
-                                               char const* dtype,
-                                               std::int64_t num_rows,
-                                               ::sirius::codegen::selection_mask const& mask,
-                                               void const* keys_chars,
-                                               std::int32_t key_width,
-                                               void* out_chars,
-                                               rmm::cuda_stream_view stream)
+// Dictionary gather: constant-width key gather (masked_launch.hpp).
+bool launch_decode_fused_tree_dict_gather(codegen::jit::FusedTree const& tree,
+                                          codegen::jit::LabeledBuffers& labeled,
+                                          char const* dtype,
+                                          std::int64_t num_rows,
+                                          ::sirius::codegen::selection_mask const& mask,
+                                          void const* keys_chars,
+                                          std::int32_t key_width,
+                                          void* out_chars,
+                                          rmm::cuda_stream_view stream)
 {
   VariantLaunchArgs va;
   va.shape         = cdj::kShapeDictGather;
@@ -1061,7 +1053,7 @@ bool launch_decode_fused_tree_mask_dict_gather(codegen::jit::FusedTree const& tr
   va.keys_chars    = reinterpret_cast<CUdeviceptr>(const_cast<void*>(keys_chars));
   va.key_width     = key_width;
   if (!check_variant_contract(
-        va, &mask, num_rows, out_chars, dtype, "launch_decode_fused_tree_mask_dict_gather")) {
+        va, &mask, num_rows, out_chars, dtype, "launch_decode_fused_tree_dict_gather")) {
     return false;
   }
   return launch_decode_fused_tree_impl(tree, labeled, dtype, num_rows, out_chars, stream, va);

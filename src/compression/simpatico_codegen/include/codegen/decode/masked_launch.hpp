@@ -13,6 +13,13 @@
 // consuming launcher needs ``mask.chunk_offsets``, i.e. the CNT wave must have
 // run, and sizes its output from ``mask.survivor_count``.
 //
+// One entry point per CONSUMER, mirroring the renderer's axes (DecodeShape in
+// decode/jit/renderer.hpp).  The ENUMERATOR is a parameter, not a function:
+// pass ``row_indices`` to walk the survivor index list, or nullptr to walk the
+// mask bits.  It changes which rows a block visits, never the output or the
+// signature — so a consumer that gains the index walk costs no new name here,
+// and the two enumerations cannot drift apart in the contract check.
+//
 #pragma once
 
 #include "codegen/jit/fused_tree.hpp"
@@ -37,35 +44,29 @@ bool launch_decode_fused_tree_mask_out(codegen::jit::FusedTree const& tree,
                                        ::sirius::codegen::selection_mask& mask,
                                        rmm::cuda_stream_view stream);
 
-/// Mask walk: decode consuming the mask, writing compacted output in row
-/// order.  A Bitpack leaf never unpacks a rejected row; a Delta root still
-/// reconstructs the chunk (the prefix sum is sequential) and only the STORES
-/// are compacted — it saves the full-width write and the downstream gather,
-/// not the unpack.
-bool launch_decode_fused_tree_mask_consume(codegen::jit::FusedTree const& tree,
-                                           codegen::jit::LabeledBuffers& labeled,
-                                           char const* dtype,
-                                           std::int64_t num_rows,
-                                           ::sirius::codegen::selection_mask const& mask,
-                                           void* out,
-                                           rmm::cuda_stream_view stream);
-
-/// Index walk: the low-selectivity sibling of the mask walk (crossover ~15%
-/// by microbench; the pick is the caller's).  ``row_indices`` is the mask->
-/// indices wave's ascending global int32 list, consistent with
-/// ``mask.chunk_offsets``: chunk c's rows occupy
-/// row_indices[chunk_offsets[c] .. chunk_offsets[c+1]).  Only listed rows are
-/// decoded, by random access, so cost scales with survivors rather than chunk
-/// size.  Bitpack leaf roots only — a Delta root is refused; use the mask
-/// walk.
-bool launch_decode_fused_tree_index_consume(codegen::jit::FusedTree const& tree,
-                                            codegen::jit::LabeledBuffers& labeled,
-                                            char const* dtype,
-                                            std::int64_t num_rows,
-                                            ::sirius::codegen::selection_mask const& mask,
-                                            std::int32_t const* row_indices,
-                                            void* out,
-                                            rmm::cuda_stream_view stream);
+/// Compacting value decode: writes the survivors' values to ``out``, in row
+/// order, sized by ``mask.survivor_count``.
+///
+/// Mask walk (``row_indices == nullptr``): a Bitpack leaf never unpacks a
+/// rejected row; a Delta root still reconstructs the chunk (its prefix sum is
+/// sequential) and only the STORES are compacted, which saves the full-width
+/// write and the downstream gather, not the unpack.
+///
+/// Index walk (``row_indices`` given): the mask->indices wave's ascending
+/// global int32 list, consistent with ``mask.chunk_offsets`` — chunk c's rows
+/// occupy row_indices[chunk_offsets[c] .. chunk_offsets[c+1]).  Only listed
+/// rows are decoded, by random access, so cost scales with survivors rather
+/// than chunk size; the crossover is ~15% selectivity by microbench and the
+/// pick is the caller's.  Bitpack leaf roots only — a Delta root is refused
+/// (returns false), so fall back by passing nullptr.
+bool launch_decode_fused_tree_compacted(codegen::jit::FusedTree const& tree,
+                                        codegen::jit::LabeledBuffers& labeled,
+                                        char const* dtype,
+                                        std::int64_t num_rows,
+                                        ::sirius::codegen::selection_mask const& mask,
+                                        std::int32_t const* row_indices,
+                                        void* out,
+                                        rmm::cuda_stream_view stream);
 
 /// Dictionary gather: for dictionary->bitpack string columns with
 /// CONSTANT-WIDTH, null-free keys (q1's l_returnflag).  ``tree`` is the codes
@@ -74,15 +75,15 @@ bool launch_decode_fused_tree_index_consume(codegen::jit::FusedTree const& tree,
 /// the compacted ``out_chars``, preserving row order.  Skips both the
 /// full-width code column and a separate key gather.  The offsets column is
 /// analytic (j*key_width) and the caller assembles it.
-bool launch_decode_fused_tree_mask_dict_gather(codegen::jit::FusedTree const& tree,
-                                               codegen::jit::LabeledBuffers& labeled,
-                                               char const* dtype,
-                                               std::int64_t num_rows,
-                                               ::sirius::codegen::selection_mask const& mask,
-                                               void const* keys_chars,
-                                               std::int32_t key_width,
-                                               void* out_chars,
-                                               rmm::cuda_stream_view stream);
+bool launch_decode_fused_tree_dict_gather(codegen::jit::FusedTree const& tree,
+                                          codegen::jit::LabeledBuffers& labeled,
+                                          char const* dtype,
+                                          std::int64_t num_rows,
+                                          ::sirius::codegen::selection_mask const& mask,
+                                          void const* keys_chars,
+                                          std::int32_t key_width,
+                                          void* out_chars,
+                                          rmm::cuda_stream_view stream);
 
 /// str_split gather, phase 1: survivor metadata.  ``tree`` is the string
 /// column's OFFSETS subtree (Bitpack- or Delta-rooted, any depth below);

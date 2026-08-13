@@ -7,7 +7,7 @@
 //   ->  launch_decode_fused_tree           (plain reference)
 //   ->  launch_decode_fused_tree_mask_out  (the range ballot: decode+range-pred -> mask)
 //   ->  host CNT-equivalent (per-chunk popcount + exclusive scan)
-//   ->  launch_decode_fused_tree_mask_consume (the mask walk: masked compacting decode)
+//   ->  launch_decode_fused_tree_compacted (the mask walk / index walk)
 //
 // Verified properties:
 //   1. plain render is byte-identical with and without the variant argument,
@@ -243,11 +243,16 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
 
     // mask_consume before CNT ran (no chunk_offsets) must fail cleanly.
     if (p == 0) {
-      REQUIRE_MSG(
-        !simpatico::launch_decode_fused_tree_mask_consume(
-          *tree, enc.buffers, dtype.c_str(), n, sm, reinterpret_cast<void*>(d_plain), stream),
-        "[%s] mask_consume without chunk_offsets should fail",
-        dtype.c_str());
+      REQUIRE_MSG(!simpatico::launch_decode_fused_tree_compacted(*tree,
+                                                                 enc.buffers,
+                                                                 dtype.c_str(),
+                                                                 n,
+                                                                 sm,
+                                                                 nullptr,
+                                                                 reinterpret_cast<void*>(d_plain),
+                                                                 stream),
+                  "[%s] mask_consume without chunk_offsets should fail",
+                  dtype.c_str());
     }
 
     REQUIRE_MSG(simpatico::launch_decode_fused_tree_mask_out(
@@ -287,11 +292,12 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
                0xAB,
                static_cast<std::size_t>(survivors > 0 ? survivors : 1) * sizeof(Element));
 
-    REQUIRE_MSG(simpatico::launch_decode_fused_tree_mask_consume(
-                  *tree, enc.buffers, dtype.c_str(), n, sm, reinterpret_cast<void*>(d_out), stream),
-                "[%s/%s] launch_decode_fused_tree_mask_consume failed",
-                dtype.c_str(),
-                pred_names[p]);
+    REQUIRE_MSG(
+      simpatico::launch_decode_fused_tree_compacted(
+        *tree, enc.buffers, dtype.c_str(), n, sm, nullptr, reinterpret_cast<void*>(d_out), stream),
+      "[%s/%s] compacted (mask walk) launch failed",
+      dtype.c_str(),
+      pred_names[p]);
 
     // Reference: plain decode + host filter (row order preserved).
     std::vector<Element> expect;
@@ -333,18 +339,18 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
     cudaMemset(reinterpret_cast<void*>(d_out4),
                0xCD,
                static_cast<std::size_t>(survivors > 0 ? survivors : 1) * sizeof(Element));
-    REQUIRE_MSG(simpatico::launch_decode_fused_tree_index_consume(
-                  *tree,
-                  enc.buffers,
-                  dtype.c_str(),
-                  n,
-                  sm,
-                  reinterpret_cast<const std::int32_t*>(d_idx),
-                  reinterpret_cast<void*>(d_out4),
-                  stream),
-                "[%s/%s] launch_decode_fused_tree_index_consume failed",
-                dtype.c_str(),
-                pred_names[p]);
+    REQUIRE_MSG(
+      simpatico::launch_decode_fused_tree_compacted(*tree,
+                                                    enc.buffers,
+                                                    dtype.c_str(),
+                                                    n,
+                                                    sm,
+                                                    reinterpret_cast<const std::int32_t*>(d_idx),
+                                                    reinterpret_cast<void*>(d_out4),
+                                                    stream),
+      "[%s/%s] compacted (index walk) launch failed",
+      dtype.c_str(),
+      pred_names[p]);
     std::vector<Element> got4(static_cast<std::size_t>(survivors));
     if (survivors > 0) {
       cudaMemcpy(got4.data(),
@@ -383,17 +389,17 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
 
     CUdeviceptr d_idx1 = enc.upload_bytes(&idx_host, sizeof(idx_host));
     CUdeviceptr d_out1 = enc.alloc(sizeof(Element));
-    REQUIRE_MSG(simpatico::launch_decode_fused_tree_index_consume(
-                  *tree,
-                  enc.buffers,
-                  dtype.c_str(),
-                  n,
-                  sm1,
-                  reinterpret_cast<const std::int32_t*>(d_idx1),
-                  reinterpret_cast<void*>(d_out1),
-                  stream),
-                "[%s] index-walk singleton launch failed",
-                dtype.c_str());
+    REQUIRE_MSG(
+      simpatico::launch_decode_fused_tree_compacted(*tree,
+                                                    enc.buffers,
+                                                    dtype.c_str(),
+                                                    n,
+                                                    sm1,
+                                                    reinterpret_cast<const std::int32_t*>(d_idx1),
+                                                    reinterpret_cast<void*>(d_out1),
+                                                    stream),
+      "[%s] index-walk singleton launch failed",
+      dtype.c_str());
     Element got1{};
     cudaMemcpy(
       &got1, reinterpret_cast<const void*>(d_out1), sizeof(Element), cudaMemcpyDeviceToHost);
@@ -457,10 +463,11 @@ bool run_delta_masked(const std::string& dtype, int arch)
 
   CUdeviceptr d_out =
     enc.alloc(static_cast<std::size_t>(survivors > 0 ? survivors : 1) * sizeof(Element));
-  REQUIRE_MSG(simpatico::launch_decode_fused_tree_mask_consume(
-                *tree, enc.buffers, dtype.c_str(), n, sm, reinterpret_cast<void*>(d_out), stream),
-              "[delta/%s] mask_consume launch failed",
-              dtype.c_str());
+  REQUIRE_MSG(
+    simpatico::launch_decode_fused_tree_compacted(
+      *tree, enc.buffers, dtype.c_str(), n, sm, nullptr, reinterpret_cast<void*>(d_out), stream),
+    "[delta/%s] mask-walk decode launch failed",
+    dtype.c_str());
 
   std::vector<Element> expect;
   expect.reserve(static_cast<std::size_t>(survivors));
@@ -573,18 +580,17 @@ bool run_dict_gather(std::int32_t key_width, int arch)
   CUdeviceptr d_out           = enc.alloc(out_bytes);
   cudaMemset(reinterpret_cast<void*>(d_out), 0xEE, out_bytes);
 
-  REQUIRE_MSG(
-    simpatico::launch_decode_fused_tree_mask_dict_gather(*tree,
-                                                         enc.buffers,
-                                                         "int32_t",
-                                                         n,
-                                                         sm,
-                                                         reinterpret_cast<const void*>(d_keys),
-                                                         key_width,
-                                                         reinterpret_cast<void*>(d_out),
-                                                         stream),
-    "[dict/w%d] mask_dict_gather launch failed",
-    key_width);
+  REQUIRE_MSG(simpatico::launch_decode_fused_tree_dict_gather(*tree,
+                                                              enc.buffers,
+                                                              "int32_t",
+                                                              n,
+                                                              sm,
+                                                              reinterpret_cast<const void*>(d_keys),
+                                                              key_width,
+                                                              reinterpret_cast<void*>(d_out),
+                                                              stream),
+              "[dict/w%d] dict_gather launch failed",
+              key_width);
 
   std::vector<char> expect;
   expect.reserve(static_cast<std::size_t>(survivors) * key_width);
@@ -833,7 +839,7 @@ bool render_checks()
   } catch (const cdj::RenderError&) {
     rejected = true;
   }
-  REQUIRE_MSG(rejected, "mask_dict_gather on a Delta root must throw RenderError");
+  REQUIRE_MSG(rejected, "dict_gather on a Delta root must throw RenderError");
 
   // 5. Index walk (index_consume): bitpack leaf only; own symbol; index list + offsets
   //    are kernel params; delta roots rejected (fall back to the delta mask walk).
