@@ -298,6 +298,37 @@ TEST_CASE("Sirius configuration rejects zero hash partition bytes", "[sirius][co
     Catch::Contains("hash_partition_bytes") && Catch::Contains("greater than zero"));
 }
 
+TEST_CASE("Sirius configuration rejects negative host capacity bytes", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  fs::path cfg =
+    fs::path(loc.file_name()).parent_path() / "data" / "invalid_memory_host_capacity_negative.yaml";
+
+  sirius::sirius_config config;
+  REQUIRE_THROWS_WITH(config.load_from_file(cfg),
+                      Catch::Contains("memory.host.capacity_bytes") &&
+                        Catch::Contains("byte value must be non-negative"));
+}
+
+TEST_CASE("Sirius configuration validates MARK join build switch ratio", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+
+  sirius::sirius_config config;
+  auto const default_ratio = config.get_operator_params().mark_join_build_switch_ratio;
+  REQUIRE_THROWS_WITH(
+    config.load_from_file(data_dir / "invalid_mark_join_switch_negative.yaml"),
+    Catch::Contains("mark_join_build_switch_ratio") && Catch::Contains("value out of range"));
+  REQUIRE(config.get_operator_params().mark_join_build_switch_ratio == Approx(default_ratio));
+  REQUIRE_THROWS_WITH(
+    config.load_from_file(data_dir / "invalid_mark_join_switch_nan.yaml"),
+    Catch::Contains("mark_join_build_switch_ratio") && Catch::Contains("value out of range"));
+  REQUIRE(config.get_operator_params().mark_join_build_switch_ratio == Approx(default_ratio));
+  REQUIRE_NOTHROW(config.load_from_file(data_dir / "valid_mark_join_switch_zero.yaml"));
+  REQUIRE(config.get_operator_params().mark_join_build_switch_ratio == Approx(0.0));
+}
+
 namespace {
 
 void require_shared_operator_defaults(const sirius::operator_params& params, uint64_t batch)
@@ -624,6 +655,30 @@ TEST_CASE("DuckDB setting rejects zero hash partition bytes without a Sirius con
                Catch::Contains("hash_partition_bytes must be greater than zero"));
 }
 
+TEST_CASE("DuckDB setting rejects negative byte values without mutation",
+          "[sirius][context][config][isolated_context]")
+{
+  finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
+  setenv("SIRIUS_DISABLE", "1", 1);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+
+  auto before = con.Query("SELECT current_setting('scan_task_batch_size')::UBIGINT");
+  REQUIRE(before != nullptr);
+  REQUIRE_FALSE(before->HasError());
+  auto const expected = before->GetValue(0, 0).GetValue<uint64_t>();
+
+  auto negative = con.Query("SET scan_task_batch_size = -1");
+  REQUIRE(negative != nullptr);
+  REQUIRE(negative->HasError());
+
+  auto after = con.Query("SELECT current_setting('scan_task_batch_size')::UBIGINT");
+  REQUIRE(after != nullptr);
+  REQUIRE_FALSE(after->HasError());
+  REQUIRE(after->GetValue(0, 0).GetValue<uint64_t>() == expected);
+}
+
 TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
           "[sirius][context][config][isolated_context]")
 {
@@ -696,6 +751,34 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(zero_partition != nullptr);
   REQUIRE(zero_partition->HasError());
   REQUIRE(sirius_ctx->get_config().get_operator_params().hash_partition_bytes == 3 * mib);
+
+  auto negative_mark_join_ratio = con.Query("SET mark_join_build_switch_ratio = -1.0");
+  REQUIRE(negative_mark_join_ratio != nullptr);
+  REQUIRE(negative_mark_join_ratio->HasError());
+  REQUIRE_THAT(negative_mark_join_ratio->GetError(),
+               Catch::Contains("mark_join_build_switch_ratio must be >= 0.0"));
+  REQUIRE(sirius_ctx->get_config().get_operator_params().mark_join_build_switch_ratio ==
+          Approx(3.0));
+
+  auto nan_mark_join_ratio = con.Query("SET mark_join_build_switch_ratio = 'NaN'");
+  REQUIRE(nan_mark_join_ratio != nullptr);
+  REQUIRE(nan_mark_join_ratio->HasError());
+  REQUIRE_THAT(nan_mark_join_ratio->GetError(),
+               Catch::Contains("mark_join_build_switch_ratio must be >= 0.0"));
+  REQUIRE(sirius_ctx->get_config().get_operator_params().mark_join_build_switch_ratio ==
+          Approx(3.0));
+
+  auto zero_mark_join_ratio = con.Query("SET mark_join_build_switch_ratio = 0.0");
+  REQUIRE(zero_mark_join_ratio != nullptr);
+  REQUIRE_FALSE(zero_mark_join_ratio->HasError());
+  REQUIRE(sirius_ctx->get_config().get_operator_params().mark_join_build_switch_ratio ==
+          Approx(0.0));
+
+  auto reset_mark_join_ratio = con.Query("RESET mark_join_build_switch_ratio");
+  REQUIRE(reset_mark_join_ratio != nullptr);
+  REQUIRE_FALSE(reset_mark_join_ratio->HasError());
+  REQUIRE(sirius_ctx->get_config().get_operator_params().mark_join_build_switch_ratio ==
+          Approx(3.0));
 
   auto const require_ok = [&con](std::string const& sql) {
     auto result = con.Query(sql);

@@ -289,6 +289,13 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //! Join Keys statistics (optional)
   duckdb::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> join_stats;
 
+  /// \brief Drop dynamic-filter replica targets on GPUs outside @p admitted_gpu_ids. Called
+  /// by sirius_pipeline_converter once the admitted set is known.
+  void restrict_dynamic_filter_replicas(std::vector<int> const& admitted_gpu_ids)
+  {
+    _dynamic_filter_plan.restrict_replicas_to(admitted_gpu_ids);
+  }
+
   static void build_join_pipelines(pipeline::sirius_pipeline& current,
                                    pipeline::sirius_meta_pipeline& meta_pipeline,
                                    sirius_physical_operator& op);
@@ -487,7 +494,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     CLOSED       ///< Finalization closed an unclaimed publication window.
   };
 
-  /// Plan-time routing, policy, and replica placement; not mutated after construction.
+  /// Plan-time routing, policy, and replica placement; after construction only
+  /// restrict_dynamic_filter_replicas narrows the replica set, before execution begins.
   dynamic_filter_publish_plan _dynamic_filter_plan;
   // Optional non-owning counter sink. SiriusContext owns it and outlives the plan.
   dynamic_filter_stats* _dynamic_filter_stats = nullptr;

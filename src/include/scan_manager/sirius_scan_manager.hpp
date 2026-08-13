@@ -423,7 +423,12 @@ class sirius_scan_manager {
   ///                                        changes must be forwarded per query by the caller).
   ///                                        Consulted by try_assign_cached_entries when building
   ///                                        the survivor plan.
-  void prepare_for_query(const sirius::planner::query& query, bool enable_pinned_zone_map_pruning);
+  /// @param allocated_gpu_ids GPU IDs allocated to this query (from
+  ///        SiriusContext::compute_allocated_gpu_ids). Scan splits are
+  ///        distributed round-robin across this subset instead of all GPUs.
+  void prepare_for_query(const sirius::planner::query& query,
+                         bool enable_pinned_zone_map_pruning,
+                         const std::vector<int>& allocated_gpu_ids);
 
   /// \brief Clear the providers map and join the driver thread if it is
   ///        still running.

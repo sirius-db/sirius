@@ -603,8 +603,9 @@ class SiriusContext : public ClientContextState {
   void acquire_query_lifecycle_slot(ClientContext* context);
   void release_query_lifecycle_slot() noexcept;
   /// The begin-of-window shared mutations (repository-manager registration,
-  /// task_creator reset/bind) — runs INSIDE the held slot, per the frozen
+  /// task_creator reset) — runs INSIDE the held slot, per the frozen
   /// "after acquire + health check, before final create_plan" placement.
+  /// GPU admission happens later, in sirius_engine::initialize_internal().
   void begin_execution_window(ClientContext& context,
                               sirius::query_id_t query_id,
                               std::string_view window_label,

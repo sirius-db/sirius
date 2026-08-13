@@ -271,7 +271,8 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate resolves AVG in merge",
                    int32_t,
                    int64_t,
                    float,
-                   double)
+                   double,
+                   decimal64_tag)
 {
   using Traits = gpu_type_traits<TestType>;
 
@@ -289,21 +290,27 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate resolves AVG in merge",
   std::vector<typename Traits::type> batch2_vals(vals.begin() + 2, vals.begin() + 4);
 
   std::shared_ptr<data_batch> b1, b2;
-  b1 = make_numeric_batch<typename Traits::type>(*space, batch1_vals, Traits::cudf_type);
-  b2 = make_numeric_batch<typename Traits::type>(*space, batch2_vals, Traits::cudf_type);
+  if constexpr (Traits::is_decimal) {
+    b1 = make_decimal64_batch(*space, batch1_vals, Traits::scale);
+    b2 = make_decimal64_batch(*space, batch2_vals, Traits::scale);
+  } else {
+    b1 = make_numeric_batch<typename Traits::type>(*space, batch1_vals, Traits::cudf_type);
+    b2 = make_numeric_batch<typename Traits::type>(*space, batch2_vals, Traits::cudf_type);
+  }
 
   auto make_avg_aggregates = [&](duckdb::vector<duckdb::LogicalType>& ret_types) {
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> aggregates;
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;
     children.push_back(make_uniq<BoundReferenceExpression>(Traits::logical_type(), 0));
+    auto return_type =
+      Traits::is_decimal ? Traits::logical_type() : LogicalType(duckdb::LogicalTypeId::DOUBLE);
     aggregates.push_back(make_uniq<BoundAggregateExpression>(
-      MakeDummyAggregate(
-        "avg", {Traits::logical_type()}, LogicalType(duckdb::LogicalTypeId::DOUBLE)),
+      MakeDummyAggregate("avg", {Traits::logical_type()}, return_type),
       std::move(children),
       nullptr,
       nullptr,
       AggregateType::NON_DISTINCT));
-    ret_types.push_back(LogicalType(duckdb::LogicalTypeId::DOUBLE));
+    ret_types.push_back(return_type);
     return aggregates;
   };
 
@@ -346,11 +353,22 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate resolves AVG in merge",
   REQUIRE(view.num_columns() == 1);
   REQUIRE(view.num_rows() == 1);
 
-  auto avg_out        = copy_column_to_host<double>(view.column(0));
-  double expected_sum = 0.0;
-  for (auto v : vals) {
-    expected_sum += static_cast<double>(v);
+  if constexpr (Traits::is_decimal) {
+    REQUIRE(view.column(0).type() == cudf::data_type{cudf::type_id::DECIMAL64, Traits::scale});
+    auto avg_out                       = copy_column_to_host<typename Traits::type>(view.column(0));
+    typename Traits::type expected_sum = 0;
+    for (auto v : vals) {
+      expected_sum += v;
+    }
+    // The sample values divide exactly in their fixed-point representation.
+    REQUIRE(avg_out[0] == expected_sum / static_cast<typename Traits::type>(vals.size()));
+  } else {
+    auto avg_out        = copy_column_to_host<double>(view.column(0));
+    double expected_sum = 0.0;
+    for (auto v : vals) {
+      expected_sum += static_cast<double>(v);
+    }
+    double expected_avg = expected_sum / static_cast<double>(vals.size());
+    REQUIRE(avg_out[0] == Approx(expected_avg));
   }
-  double expected_avg = expected_sum / static_cast<double>(vals.size());
-  REQUIRE(avg_out[0] == Approx(expected_avg));
 }

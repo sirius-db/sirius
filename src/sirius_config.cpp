@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <exception>
+#include <limits>
 #include <stdexcept>
 #include <string_view>
 #include <variant>
@@ -172,14 +173,18 @@ static void from_yaml(const YAML::Node& node, sirius::io::object_store_config& o
 static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
 {
   yaml::reader r(node, "rest");
+  for (auto const* key : {"ca_bundle_path", "tls_verify"}) {
+    if (r.has(key)) {
+      throw std::runtime_error("'sirius.executor.scan_manager.rest." + std::string(key) +
+                               "': removed; configure 'sirius.executor.scan_manager.object_store." +
+                               key + "' instead");
+    }
+  }
   r.optional("request_timeout_s", opt.request_timeout_s);
-  r.optional("ca_bundle_path", opt.ca_bundle_path);
-  r.optional("tls_verify", opt.tls_verify);
   r.optional("max_connections", opt.max_connections);
   r.optional("chunk_size", yaml::bytes(opt.chunk_size));
   r.optional("max_n_chunks", opt.max_n_chunks);
   r.optional("max_read_split", opt.max_read_split);
-  r.optional("bounce_block_size", yaml::bytes(opt.bounce_block_size));
   r.optional("upkeep_interval_ms", opt.upkeep_interval);
   r.optional("conn_max_age_s", opt.conn_max_age);
   r.optional("retry_backoff_base_ms", opt.retry_backoff_base);
@@ -261,7 +266,9 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("sort_sample_bytes", yaml::bytes(opt.sort_sample_bytes));
   r.optional("max_build_hash_table_bytes", yaml::bytes(opt.max_build_hash_table_bytes));
   r.optional("max_broadcast_join_size", yaml::bytes(opt.max_broadcast_join_size));
-  r.optional("mark_join_build_switch_ratio", opt.mark_join_build_switch_ratio);
+  r.optional("mark_join_build_switch_ratio",
+             opt.mark_join_build_switch_ratio,
+             yaml::between<double>{0.0, std::numeric_limits<double>::infinity()});
   r.optional("enable_runtime_distinct_build_probe", opt.enable_runtime_distinct_build_probe);
   r.optional("enable_dynamic_filter", opt.enable_dynamic_filter);
   r.optional("enable_dynamic_zone_map_filter", opt.enable_dynamic_zone_map_filter);
@@ -310,6 +317,9 @@ namespace {
 struct topology {
   /// 0 = auto: use every GPU visible to topology discovery (CUDA_VISIBLE_DEVICES-aware).
   std::variant<size_t, std::vector<int>> num_gpus_or_gpu_ids{size_t{0}};
+  /// 0 = all active GPUs per query (default). Positive value limits each query to the first
+  /// N entries of the sorted active-GPU list, reserving the rest for future concurrent queries.
+  int gpus_per_query{0};
 
   static void from_yaml(const YAML::Node& node, topology& opt)
   {
@@ -324,6 +334,9 @@ struct topology {
       r.optional("num_gpus", n);
       opt.num_gpus_or_gpu_ids = n;
     }
+    // greater_than{-1} is >= 0: a negative count would otherwise silently read as "use all",
+    // since the admission path treats any non-positive value as unset.
+    r.optional("gpus_per_query", opt.gpus_per_query, yaml::greater_than<int>{-1});
     r.reject_unknown();
   }
 };
@@ -588,6 +601,7 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
     // Topology
     topology topo;
     r.optional("topology", topo);
+    _gpus_per_query = topo.gpus_per_query;
 
     // High-level memory config (mutually exclusive with space config)
     gpu_mem_config gpu_cfg;
