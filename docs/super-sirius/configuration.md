@@ -586,21 +586,20 @@ SET enable_dynamic_zone_map_filter = false;
 
 ### Pinned Tables
 
-This setting is accepted both as a DuckDB `SET` variable and in YAML under
-`sirius.operator_params`.
+Pinned-table zone-map capture and pruning are automatic. The advanced YAML escape hatch is under
+`sirius.operator_params` for benchmark and diagnosis envelopes; it is not a normal session choice.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `enable_pinned_zone_map_pruning` | true | Capture pinned-chunk zone maps at pin time and use them to prune cached scans. |
 
-Setting this to `false` before `pin_table` avoids the extra GPU reductions and creates a
+Setting the YAML value to `false` before startup avoids the extra GPU reductions and creates a
 statless entry. Enabling it later does not add statistics to that entry; re-pin the table with
-the setting enabled. Disabling it only for a query leaves existing statistics intact. See
+the setting enabled. See
 [Pinned-table zone maps](scan.md#zone-maps) for supported types, pruning, and re-pin behavior.
 
-```sql
-SET enable_pinned_zone_map_pruning = false;
-```
+The direct DuckDB `SET` override is registered only when the process explicitly enables Sirius
+test options; it is not part of the normal user surface.
 
 ### Transparent Execution
 

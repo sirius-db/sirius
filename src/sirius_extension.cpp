@@ -2230,6 +2230,12 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
       "TEST ONLY: force transparent GPU execution to fail at runtime with this message",
       LogicalType::VARCHAR,
       Value(""));
+    config.AddExtensionOption(
+      "enable_pinned_zone_map_pruning",
+      "TEST ONLY: disable automatic pinned-table zone-map capture and pruning",
+      LogicalType::BOOLEAN,
+      Value::BOOLEAN(operator_defaults.enable_pinned_zone_map_pruning),
+      SetEnablePinnedZoneMapPruning);
   }
 
   // Add in config options for special JIT implementation for regex
@@ -2423,15 +2429,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     LogicalType::DOUBLE,
     Value::DOUBLE(operator_defaults.dynamic_filter_keep_threshold),
     SetDynamicFilterKeepThreshold);
-
-  config.AddExtensionOption(
-    "enable_pinned_zone_map_pruning",
-    "Skip pinned-table chunks whose pin-time min/max statistics prove the scan's pushed-down "
-    "filter matches no rows; also gates the statistics capture during CALL pin_table, so a table "
-    "pinned while off carries no zone maps until re-pinned with the flag on",
-    LogicalType::BOOLEAN,
-    Value::BOOLEAN(operator_defaults.enable_pinned_zone_map_pruning),
-    SetEnablePinnedZoneMapPruning);
 
   // Default from the YAML-loaded params, so a sirius.yaml value is what connections inherit.
   config.AddExtensionOption(
