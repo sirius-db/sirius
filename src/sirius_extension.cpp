@@ -1956,7 +1956,13 @@ static void SetLogDir(ClientContext& context, SetScope scope, Value& parameter)
 static void SetLogFlushSeconds(ClientContext& context, SetScope scope, Value& parameter)
 {
   throw_if_sirius_runtime_unavailable(context);
-  Config::LOG_FLUSH_SECONDS = IntegerValue::Get(parameter);
+  auto const seconds = IntegerValue::Get(parameter);
+  if (seconds < 0) {
+    throw InvalidInputException(
+      "sirius_log_flush_seconds must be non-negative; zero disables periodic flushing; got %d",
+      seconds);
+  }
+  Config::LOG_FLUSH_SECONDS = seconds;
   // The flush interval is fixed at spdlog-sink construction, so rebuild it (only
   // the spdlog backend uses it).
   if (Config::LOG_BACKEND == "spdlog") { install_configured_log_sink(context.db.get()); }
@@ -2294,7 +2300,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                             Value(Config::LOG_DIR),
                             SetLogDir);
   config.AddExtensionOption("sirius_log_flush_seconds",
-                            "Interval in seconds between automatic log flushes",
+                            "Interval in seconds between automatic log flushes (0 disables)",
                             LogicalType::INTEGER,
                             Value::INTEGER(Config::LOG_FLUSH_SECONDS),
                             SetLogFlushSeconds);
