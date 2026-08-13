@@ -24,6 +24,9 @@
 
 #include <cucascade/memory/error.hpp>
 
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <cstdlib>
 
 namespace sirius {
@@ -50,6 +53,50 @@ double oom_trim_factor()
     return v;
   }();
   return factor;
+}
+
+/// Minimum wall-clock gap between two trims, process-wide.
+///
+/// Every trim costs a cudaMemPoolTrimTo plus a device-wide cudaDeviceSynchronize
+/// before the allocation is retried. Under sustained pressure the policy is
+/// entered thousands of times a second and almost none of those trims can
+/// succeed -- the pool has already released what it can, and nothing has freed
+/// since the previous attempt microseconds ago -- so the syncs become pure
+/// stall. Rate-limiting keeps the recovery available without letting it consume
+/// the device. Override with SIRIUS_OOM_TRIM_MIN_INTERVAL_MS (0 disables).
+std::chrono::nanoseconds oom_trim_min_interval()
+{
+  static const std::chrono::nanoseconds interval = [] {
+    long ms          = 2000;
+    const char* env  = std::getenv("SIRIUS_OOM_TRIM_MIN_INTERVAL_MS");
+    if (env != nullptr) {
+      char* end     = nullptr;
+      const long v  = std::strtol(env, &end, 10);
+      if (end != env && v >= 0) { ms = v; }
+    }
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::milliseconds(ms));
+  }();
+  return interval;
+}
+
+std::atomic<std::chrono::steady_clock::rep> g_last_trim{0};
+std::atomic<std::uint64_t> g_trims_skipped{0};
+
+/// Claim the right to trim, or report that one happened too recently.
+///
+/// A CAS rather than a plain load/store so concurrent OOM handlers cannot both
+/// decide to trim: exactly one wins the interval.
+bool claim_trim_slot()
+{
+  const auto interval = oom_trim_min_interval();
+  if (interval.count() == 0) { return true; }
+  const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+  auto last      = g_last_trim.load(std::memory_order_relaxed);
+  while (now - last >= interval.count()) {
+    if (g_last_trim.compare_exchange_weak(last, now, std::memory_order_relaxed)) { return true; }
+  }
+  g_trims_skipped.fetch_add(1, std::memory_order_relaxed);
+  return false;
 }
 
 /// Pool occupancy at the moment of an OOM, for the diagnostic below.
@@ -145,13 +192,20 @@ void* defragmenter_oom_policy::do_handle_oom(std::size_t bytes,
     std::rethrow_exception(eptr);
   }
 
+  // Rate-limited: a trim from microseconds ago has already released everything
+  // the pool can give up, so repeating it only pays the device sync again.
+  if (!claim_trim_slot()) { std::rethrow_exception(eptr); }
+
   // Release all free, fragmented blocks back to the driver so it can reassemble
   // them into larger contiguous regions for the retry.
-  SIRIUS_LOG_DEBUG("[oom_defrag] trimming for {}B: reserved={}B used={}B free_reserved={}B",
-                   bytes,
-                   state.reserved,
-                   state.used,
-                   state.free_reserved());
+  SIRIUS_LOG_DEBUG(
+    "[oom_defrag] trimming for {}B: reserved={}B used={}B free_reserved={}B (skipped {} since "
+    "last trim)",
+    bytes,
+    state.reserved,
+    state.used,
+    state.free_reserved(),
+    g_trims_skipped.exchange(0, std::memory_order_relaxed));
   cudaMemPoolTrimTo(oom_ex->pool_handle, /*minBytesToKeep=*/0);
   cudaDeviceSynchronize();  // Ensure that the trim operation is complete before retrying.
 
