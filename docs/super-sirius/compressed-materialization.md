@@ -392,7 +392,7 @@ of a fixed total width) on an integer column narrowed to a different width still
 batch's compression, which latches compression off for the remainder of the pin — the pin falls
 back to uncompressed narrow chunks from that batch onward, markers intact and results correct. The
 WARN names the columns this pin narrowed before compression and states that whole-pin blast
-radius. Shipped TPC-H plans use bitextract only for float columns, which never narrow.
+radius. No shipped TPC-H plan currently uses a width-explicit packed op (the plans are built on `bitpack`, including the decimal columns), so this risk is latent rather than active for the shipped plans.
 
 ### Stored-column metadata, not storage introspection
 
