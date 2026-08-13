@@ -282,14 +282,22 @@ def open_connection(source, gpu_execution=False, data_source="parquet"):
              Read-only avoids write locks / accidental WAL and is correct for a
              read-only benchmark; it mirrors how run_tpch_duckdb.sh opens the file.
     """
+    # DuckDB's CPU engine allocates outside Sirius's memory management, so at large
+    # scale factors an unbounded in-memory run exhausts host RAM and takes the
+    # machine down. Opt-in via env so existing callers are unaffected:
+    #   DUCKDB_MEMORY_LIMIT=40GB DUCKDB_TEMP_DIRECTORY=/mnt/nvme/duckdb_tmp
+    cfg = {"allow_unsigned_extensions": "true"}
+    if os.environ.get("DUCKDB_MEMORY_LIMIT"):
+        cfg["memory_limit"] = os.environ["DUCKDB_MEMORY_LIMIT"]
+    if os.environ.get("DUCKDB_TEMP_DIRECTORY"):
+        cfg["temp_directory"] = os.environ["DUCKDB_TEMP_DIRECTORY"]
+
     if data_source == "duckdb":
         log(f"Opening DuckDB database file {source} (read-only)")
-        con = duckdb.connect(
-            source, read_only=True, config={"allow_unsigned_extensions": "true"}
-        )
+        con = duckdb.connect(source, read_only=True, config=cfg)
     else:
         log(f"Opening DuckDB connection over parquet dir {source}")
-        con = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
+        con = duckdb.connect(":memory:", config=cfg)
         log("Registering TPC-H parquet views")
         for stmt in _build_views_sql(source).split(";"):
             stmt = stmt.strip()
@@ -301,6 +309,12 @@ def open_connection(source, gpu_execution=False, data_source="parquet"):
         log(f"Loading Sirius extension from {EXTENSION_PATH}")
         con.execute(f"LOAD '{EXTENSION_PATH}'")
         log("Sirius extension loaded")
+        # Spill, downgrade and compression statistics are logged at `debug`; at the
+        # default `info` a run produces timings with no way to explain them.
+        _level = os.environ.get("SIRIUS_LOG_LEVEL")
+        if _level:
+            con.execute(f"SET sirius_log_level='{_level}'")
+            log(f"Sirius log level set to {_level}")
         if PIN_COMPRESSION_PLAN_DIR:
             log(
                 f"Enabling Simpatico pin compression (plans: {PIN_COMPRESSION_PLAN_DIR})"
@@ -355,11 +369,21 @@ def _query_dir(benchmark_dir, engine_name, qnum):
     return qdir
 
 
-def _write_result(benchmark_dir, engine_name, qnum, rows):
-    path = os.path.join(_query_dir(benchmark_dir, engine_name, qnum), "result.txt")
-    with open(path, "w") as f:
-        for row in rows:
-            f.write(repr(row) + "\n")
+def _write_result(benchmark_dir, engine_name, qnum, rows, it=None):
+    """Write `result.txt` (last iteration wins) and, when `it` is given, a
+    per-iteration copy.
+
+    `result.txt` alone validates only the final iteration, so a run whose fast
+    iterations are fast *because* they lost batches would still pass.
+    """
+    qdir = _query_dir(benchmark_dir, engine_name, qnum)
+    paths = [os.path.join(qdir, "result.txt")]
+    if it is not None:
+        paths.append(os.path.join(qdir, f"result_iter{it}.txt"))
+    body = "".join(repr(row) + "\n" for row in rows)
+    for path in paths:
+        with open(path, "w") as f:
+            f.write(body)
 
 
 def _record(writer, name, qnum, it, runtime):
@@ -379,7 +403,7 @@ def _run_one(
         )
     elapsed, rows = time_query(con, qnum, use_gpu, profile_path=profile_path)
     _record(writer, name, qnum, it, elapsed)
-    _write_result(benchmark_dir, name, qnum, rows)
+    _write_result(benchmark_dir, name, qnum, rows, it=it)
 
 
 def run_grouped(
@@ -841,7 +865,43 @@ def split_sirius_log(log_dir, benchmark_dir, queries, iterations):
     log(f"Per-query Sirius logs written under {os.path.join(benchmark_dir, 'sirius')}/")
 
 
-def validate(benchmark_dir, queries):
+def _compare_result_files(duck_path, sir_path, label):
+    """Byte-exact first, then tolerance-aware. Returns True on match."""
+    if not os.path.exists(sir_path):
+        print(f"❌ {label}: missing {sir_path}")
+        return False
+    with open(duck_path, "rb") as fd, open(sir_path, "rb") as fs:
+        if fd.read() == fs.read():
+            print(f"✓ {label}: byte-exact match")
+            return True
+    try:
+        duck_rows = _load_result_file(duck_path)
+        sir_rows = _load_result_file(sir_path)
+    except Exception as e:
+        print(f"❌ {label}: parse error - {e}")
+        return False
+    if len(duck_rows) != len(sir_rows):
+        print(
+            f"❌ {label}: row count mismatch - "
+            f"duckdb={len(duck_rows)} sirius={len(sir_rows)}"
+        )
+        return False
+    for i, (d, sr) in enumerate(
+        zip(sorted(duck_rows, key=lambda x: str(x)), sorted(sir_rows, key=lambda x: str(x)))
+    ):
+        if not _rows_match(d, sr, VALIDATION_ABS_TOL):
+            print(f"❌ {label}: row {i} mismatch")
+            print(f"   duckdb: {d}")
+            print(f"   sirius: {sr}")
+            return False
+    print(
+        f"✓ {label}: within tolerance "
+        f"(abs_tol={VALIDATION_ABS_TOL}, {len(duck_rows)} rows)"
+    )
+    return True
+
+
+def validate(benchmark_dir, queries, reference_dir=None):
     """Compare saved DuckDB vs Sirius result.txt files.
 
     Mirrors compare_results.py: byte-exact match first, then a tolerance-aware
@@ -850,54 +910,38 @@ def validate(benchmark_dir, queries):
     connection — safe to run after the GPU pool from the timed pass is still
     resident.
     """
-    log(f"Validating saved results in {benchmark_dir}")
+    duck_root = reference_dir if reference_dir else benchmark_dir
+    if reference_dir:
+        log(f"Validating {benchmark_dir} against reference results in {reference_dir}")
+    else:
+        log(f"Validating saved results in {benchmark_dir}")
     results = {}
     for qnum in queries:
         qname = f"q{qnum}"
-        duck_path = os.path.join(benchmark_dir, "duckdb", qname, "result.txt")
-        sir_path = os.path.join(benchmark_dir, "sirius", qname, "result.txt")
-        if not os.path.exists(duck_path) or not os.path.exists(sir_path):
-            print(f"❌ {qname}: missing result.txt (duckdb or sirius)")
+        duck_path = os.path.join(duck_root, "duckdb", qname, "result.txt")
+        sir_dir = os.path.join(benchmark_dir, "sirius", qname)
+        if not os.path.exists(duck_path):
+            print(f"❌ {qname}: missing reference result.txt ({duck_path})")
             results[qnum] = False
             continue
-        with open(duck_path, "rb") as fd, open(sir_path, "rb") as fs:
-            if fd.read() == fs.read():
-                print(f"✓ {qname}: byte-exact match")
-                results[qnum] = True
-                continue
-        try:
-            duck_rows = _load_result_file(duck_path)
-            sir_rows = _load_result_file(sir_path)
-        except Exception as e:
-            print(f"❌ {qname}: parse error - {e}")
-            results[qnum] = False
-            continue
-        if len(duck_rows) != len(sir_rows):
-            print(
-                f"❌ {qname}: row count mismatch - "
-                f"duckdb={len(duck_rows)} sirius={len(sir_rows)}"
-            )
-            results[qnum] = False
-            continue
-        duck_sorted = sorted(duck_rows, key=lambda x: str(x))
-        sir_sorted = sorted(sir_rows, key=lambda x: str(x))
-        mismatch = None
-        for i, (d, s) in enumerate(zip(duck_sorted, sir_sorted)):
-            if not _rows_match(d, s, VALIDATION_ABS_TOL):
-                mismatch = (i, d, s)
-                break
-        if mismatch is None:
-            print(
-                f"✓ {qname}: within tolerance "
-                f"(abs_tol={VALIDATION_ABS_TOL}, {len(duck_rows)} rows)"
-            )
-            results[qnum] = True
-        else:
-            i, d, s = mismatch
-            print(f"❌ {qname}: row {i} mismatch")
-            print(f"   duckdb: {d}")
-            print(f"   sirius: {s}")
-            results[qnum] = False
+
+        # Every iteration, not just the last. Falls back to the single result.txt
+        # for benchmark dirs produced before per-iteration capture existed.
+        per_iter = []
+        for path in glob.glob(os.path.join(sir_dir, "result_iter*.txt")):
+            stem = os.path.basename(path)[len("result_iter") : -len(".txt")]
+            if stem.isdigit():
+                per_iter.append((int(stem), path))
+        per_iter.sort()
+        targets = per_iter or [(None, os.path.join(sir_dir, "result.txt"))]
+
+        ok = True
+        for it, sir_path in targets:
+            label = qname if it is None else f"{qname} iter{it}"
+            ok = _compare_result_files(duck_path, sir_path, label) and ok
+        results[qnum] = ok
+        if per_iter and ok:
+            print(f"✓ {qname}: all {len(per_iter)} iterations match")
 
     passed = sum(1 for v in results.values() if v)
     failed = [f"q{q}" for q, ok in results.items() if not ok]
@@ -972,6 +1016,16 @@ def parse_args():
             "by comparing the saved <engine>/q<N>/result.txt files. Byte-exact "
             f"match first, then abs_tol={VALIDATION_ABS_TOL} on float columns "
             "(strict equality elsewhere). Requires --engine both."
+        ),
+    )
+    p.add_argument(
+        "--reference-dir",
+        type=str,
+        default=None,
+        help=(
+            "Validate against the duckdb/q<N>/result.txt files of an earlier "
+            "benchmark directory instead of running the CPU engine again. Lets "
+            "--validation be used with --engine gpu."
         ),
     )
     p.add_argument(
@@ -1091,9 +1145,30 @@ def main():
         global PIN_COMPRESSION_PLAN_DIR
         PIN_COMPRESSION_PLAN_DIR = plan_dir
 
-    if args.validation and args.engine != "both":
+    if args.reference_dir:
+        if not args.validation:
+            raise SystemExit("--reference-dir only applies with --validation")
+        if args.engine == "cpu":
+            raise SystemExit(
+                "--reference-dir supplies the CPU side; --engine cpu has nothing to validate"
+            )
+        missing = [
+            q
+            for q in parse_query_spec(args.queries)
+            if not os.path.exists(
+                os.path.join(args.reference_dir, "duckdb", f"q{q}", "result.txt")
+            )
+        ]
+        if missing:
+            # Fail now rather than after a long GPU run that cannot be validated.
+            raise SystemExit(
+                f"--reference-dir {args.reference_dir} has no duckdb results for "
+                f"queries {','.join(str(q) for q in missing)}"
+            )
+    elif args.validation and args.engine != "both":
         raise SystemExit(
-            "--validation requires --engine both (needs both result sets to compare)"
+            "--validation requires --engine both (needs both result sets to compare), "
+            "or --reference-dir to supply the CPU side"
         )
 
     nsys_profile = args.mode == "nsys-profile"
@@ -1190,7 +1265,7 @@ def main():
 
     if args.validation:
         log("Starting validation")
-        validate(benchmark_dir, queries)
+        validate(benchmark_dir, queries, reference_dir=args.reference_dir)
         log("Validation complete")
 
 
