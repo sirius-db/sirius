@@ -590,7 +590,32 @@ void downgrade_executor::monitor_loop()
   // Monitor-thread-local; throttles the back-off warning to once per stall episode.
   bool backed_off = false;
 
+  // Periodic tier-occupancy sample. The eviction logs report how many bytes a
+  // downgrade moved, but not the level the tier was at when it moved them, so a
+  // tier that fills and drains within a query is indistinguishable from one that
+  // never gives memory back. Sampled on a wall-clock interval rather than per
+  // cycle because the monitor runs ~100x/s.
+  auto last_occupancy_log      = std::chrono::steady_clock::now();
+  constexpr auto kOccupancyLog = std::chrono::seconds(1);
+
   while (_running.load()) {
+    if (_memory_space) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now - last_occupancy_log >= kOccupancyLog) {
+        last_occupancy_log     = now;
+        const std::size_t cap  = _memory_space->get_max_memory();
+        const std::size_t free = _memory_space->get_available_memory();
+        const std::size_t used = cap > free ? cap - free : 0;
+        SIRIUS_LOG_DEBUG("[occupancy] [{}] used={}B free={}B capacity={}B ({:.1f}%)",
+                         _source_label,
+                         used,
+                         free,
+                         cap,
+                         cap > 0 ? 100.0 * static_cast<double>(used) / static_cast<double>(cap)
+                                 : 0.0);
+      }
+    }
+
     if (_memory_space && _memory_space->should_downgrade_memory() &&
         !_monitor_request_enqueued.load(std::memory_order_relaxed)) {
       // Stateless viability gate: only issue a downgrade request when one could plausibly free
