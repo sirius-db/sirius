@@ -158,6 +158,60 @@ bi: "1.5Gi")");
     REQUIRE(bi == static_cast<std::uint64_t>(1.5 * 1024 * 1024 * 1024));
   }
 
+  SECTION("required byte values reject negative integers without mutation")
+  {
+    auto node          = YAML::Load("size: -1");
+    std::uint64_t size = 4096;
+    yaml::reader r(node);
+    REQUIRE_THROWS_WITH(r.required("size", yaml::bytes(size)),
+                        Catch::Contains("byte value must be non-negative"));
+    REQUIRE(size == 4096);
+  }
+
+  SECTION("required byte values reject negative suffixed strings without mutation")
+  {
+    auto node          = YAML::Load(R"(size: "-1GiB")");
+    std::uint64_t size = 4096;
+    yaml::reader r(node);
+    REQUIRE_THROWS_WITH(r.required("size", yaml::bytes(size)),
+                        Catch::Contains("byte value must be non-negative"));
+    REQUIRE(size == 4096);
+  }
+
+  SECTION("optional byte values reject negative integers without mutation")
+  {
+    auto node                         = YAML::Load("size: -1");
+    std::optional<std::uint64_t> size = 4096;
+    yaml::reader r(node);
+    REQUIRE_THROWS_WITH(r.optional("size", yaml::bytes(size)),
+                        Catch::Contains("byte value must be non-negative"));
+    REQUIRE(size == 4096);
+  }
+
+  SECTION("optional byte values reject negative suffixed strings without mutation")
+  {
+    auto node                         = YAML::Load(R"(size: "-1GiB")");
+    std::optional<std::uint64_t> size = 4096;
+    yaml::reader r(node);
+    REQUIRE_THROWS_WITH(r.optional("size", yaml::bytes(size)),
+                        Catch::Contains("byte value must be non-negative"));
+    REQUIRE(size == 4096);
+  }
+
+  SECTION("zero byte values remain valid")
+  {
+    auto node                                  = YAML::Load("size: 0");
+    std::uint64_t size                         = 4096;
+    std::optional<std::uint64_t> optional_size = 4096;
+    yaml::reader r(node);
+    r.required("size", yaml::bytes(size));
+    REQUIRE(size == 0);
+
+    yaml::reader optional_reader(node);
+    optional_reader.optional("size", yaml::bytes(optional_size));
+    REQUIRE(optional_size == 0);
+  }
+
   SECTION("string suffix on plain integer field is rejected")
   {
     auto node = YAML::Load(R"(count: "4Ki")");
