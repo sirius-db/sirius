@@ -216,17 +216,32 @@ static void from_yaml(const YAML::Node& node, sirius::io::cache::config& opt)
              yaml::fraction<double>{});
   r.optional(
     "eviction_threshold_fraction", opt.eviction_threshold_fraction, yaml::fraction<double>{});
+  if (opt.min_prefetching_budget_fraction > opt.eviction_threshold_fraction) {
+    throw std::runtime_error(
+      "'sirius.executor.scan_manager.cache.min_prefetching_budget_fraction': must be less than "
+      "or equal to eviction_threshold_fraction");
+  }
   r.reject_unknown();
 }
 
 static void from_yaml(const YAML::Node& node, scan_manager::memory_prefetcher_config& opt)
 {
   yaml::reader r(node, "memory_prefetcher");
+  if (r.has("poll_interval_ms") || r.has("drain_quiet_ms")) {
+    throw std::runtime_error(
+      "'sirius.executor.scan_manager.memory_prefetcher.poll_interval_ms' and "
+      "'sirius.executor.scan_manager.memory_prefetcher.drain_quiet_ms': removed; worker timing "
+      "policy is internal; remove these keys");
+  }
   r.optional("enable", opt.enable);
+  bool const has_dependent_setting = r.has_value("num_threads") || r.has_value("min_free_fraction");
+  if (!opt.enable && has_dependent_setting) {
+    throw std::runtime_error(
+      "sirius.executor.scan_manager.memory_prefetcher: num_threads and min_free_fraction require "
+      "enable: true");
+  }
   r.optional("num_threads", opt.num_threads, yaml::greater_than<std::size_t>{0});
   r.optional("min_free_fraction", opt.min_free_fraction, yaml::fraction<double>{});
-  r.optional("poll_interval_ms", opt.poll_interval_ms, yaml::greater_than<std::size_t>{0});
-  r.optional("drain_quiet_ms", opt.drain_quiet_ms);
   r.reject_unknown();
 }
 
@@ -241,7 +256,17 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("enable_prefetch_cache", opt.enable_prefetch_cache);
   if (auto n = r.optional_node("local")) sirius::from_yaml(*n, opt.local);
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
-  if (auto n = r.optional_node("cache")) sirius::from_yaml(*n, opt.cache);
+  if (auto n = r.optional_node("cache")) {
+    yaml::reader cache_reader(*n, "cache");
+    bool const has_cache_setting = cache_reader.has_value("inflight_io_chunk_budget") ||
+                                   cache_reader.has_value("dispose_after_use") ||
+                                   cache_reader.has_value("min_prefetching_budget_fraction") ||
+                                   cache_reader.has_value("eviction_threshold_fraction");
+    if (!opt.enable_prefetch_cache && has_cache_setting) {
+      throw std::runtime_error("scan_manager.cache: requires enable_prefetch_cache: true");
+    }
+    sirius::from_yaml(*n, opt.cache);
+  }
   if (auto n = r.optional_node("object_store")) sirius::from_yaml(*n, opt.object_store);
   if (auto n = r.optional_node("memory_prefetcher")) from_yaml(*n, opt.memory_prefetcher);
   r.reject_unknown();

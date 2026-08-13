@@ -60,11 +60,11 @@ struct memory_prefetcher_config {
   /// the reservation for a batch is only attempted above this floor, so the
   /// prefetcher backs off well before competing with pipeline reservations.
   double min_free_fraction{0.4};
-  /// Worker sweep interval while waiting for headroom / new splits.
+  /// Internal worker sweep interval while waiting for headroom / new splits.
   std::size_t poll_interval_ms{2};
   /// A connector is considered actively draining (and skipped) until this
-  /// long has passed since its last pop. Must exceed the scan's inter-pop
-  /// interval (~10-40ms per 5GB batch) or sweeps race the scan.
+  /// long has passed since its last pop. This internal policy must exceed the
+  /// scan's inter-pop interval (~10-40ms per 5GB batch) or sweeps race the scan.
   std::size_t drain_quiet_ms{100};
 };
 

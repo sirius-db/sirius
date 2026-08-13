@@ -323,8 +323,13 @@ single-GPU configurations only (logs a warning and disables itself otherwise).
 | `enable` | bool | false | Master switch for the prefetcher. |
 | `num_threads` | int (**> 0**) | 2 | Prefetch worker threads; each drives one in-flight batch conversion on its own stream. |
 | `min_free_fraction` | double [0,1] | 0.4 | Keep at least this fraction of the GPU space free after each prefetch; conversions (and their reservations) are only attempted above this floor. |
-| `poll_interval_ms` | int (**> 0**) | 2 | Worker sweep interval while waiting for headroom / new splits. |
-| `drain_quiet_ms` | int (ms) | 100 | A connector counts as actively draining (and is skipped) until this long passes since its last pop. Must exceed the scan's inter-pop interval. |
+
+`num_threads` and `min_free_fraction` are active only when `enable: true`; configuration loading
+rejects non-null overrides while the prefetcher is disabled.
+
+Worker polling and connector-drain timing are internal scheduling policy. The
+former `poll_interval_ms` and `drain_quiet_ms` keys have been removed;
+configurations that still contain either key must delete it.
 
 ### `scan_manager.local` — io_uring backend (`io/uring/config.hpp`)
 
@@ -363,8 +368,8 @@ and transport use one trust policy; there are no separate REST YAML controls.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `inflight_io_chunk_budget` | int (**> 0**) | 2048 | Max in-flight IO chunks (enforced by admission control). |
-| `eviction_threshold_fraction` | double [0,1] | 0.6 | Start evicting when the pool fills to this fraction. |
-| `min_prefetching_budget_fraction` | double [0,1] | 0.05 | Floor of the budget reserved for prefetching. |
+| `eviction_threshold_fraction` | double [0,1] | 0.6 | Start evicting when the pool fills to this fraction. Must be at least `min_prefetching_budget_fraction`. |
+| `min_prefetching_budget_fraction` | double [0,1] | 0.05 | Floor of the budget reserved for prefetching. Must not exceed `eviction_threshold_fraction`. |
 | `dispose_after_use` | bool | false | Discard chunks immediately after use. |
 
 ### `scan_manager.object_store` — S3 credentials & endpoint (`io/object_store_config.hpp`)

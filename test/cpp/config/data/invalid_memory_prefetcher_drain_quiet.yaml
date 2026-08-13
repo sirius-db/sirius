@@ -1,0 +1,5 @@
+sirius:
+  executor:
+    scan_manager:
+      memory_prefetcher:
+        drain_quiet_ms: 200
