@@ -968,6 +968,19 @@ void report_enumeration(char const* what,
   if (!::sirius::codegen::decompression_pushdown_diag_enabled()) { return; }
   auto const chunks = (num_rows + ::codegen::kChunkSize - 1) / ::codegen::kChunkSize;
   char const* how   = va.grid_blocks > 0 ? "row_set" : (va.row_indices != 0 ? "index" : "mask");
+  auto const blocks = static_cast<long long>(va.grid_blocks > 0 ? va.grid_blocks : chunks);
+  if (survivors < 0) {
+    // Before the CNT wave the count is not known yet; printing the -1 sentinel
+    // as a survivor count (and dividing by it) is how a trace misleads.
+    std::fprintf(stderr,
+                 "simpatico: %s enumerated by %s: blocks=%lld/%lld chunks, survivors not yet "
+                 "counted\n",
+                 what,
+                 how,
+                 blocks,
+                 static_cast<long long>(chunks));
+    return;
+  }
   std::fprintf(
     stderr,
     "simpatico: %s enumerated by %s: blocks=%lld/%lld chunks survivors=%lld "
