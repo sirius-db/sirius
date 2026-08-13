@@ -146,6 +146,16 @@ if [ "$NSYS" = "1" ]; then
   echo "nsys      : $NSYS_DIR"
 fi
 
+# ROLLBACK=1: --rollback-scratch mode — the runner confines refresh mutations
+# to the WAL and exits without a clean close; deleting the .wal afterwards
+# (below) restores the scratch to content-pristine, so every run reuses the
+# same copy at offset 0 with no 15-minute re-copy. Incompatible with NSYS=1.
+if [ "${ROLLBACK:-0}" = "1" ]; then
+  [ "$NSYS" = "1" ] && { echo "ERROR: ROLLBACK=1 and NSYS=1 are incompatible"; exit 1; }
+  EXTRA_ARGS+=(--rollback-scratch)
+  echo "rollback  : scratch restored via WAL discard after the run"
+fi
+
 # --warmup-pass burns one discarded pass so JIT compilation and first-touch pin
 # costs land nowhere: the clean baseline stays honest and the post-RF1 stream
 # (the one Power@Size is computed from) is steady-state.
@@ -156,3 +166,16 @@ fi
   --pin-layout "$LAYOUT" \
   --config "$CFG" \
   --warmup-pass "${EXTRA_ARGS[@]}" "$@"
+RC=$?
+
+# Finish the rollback: the runner exited without closing (a clean close would
+# checkpoint the WAL into the base); dropping the WAL completes the restore.
+if [ "${ROLLBACK:-0}" = "1" ]; then
+  SCRATCH_PATH=""; prev=""
+  for a in "$@"; do [ "$prev" = "--scratch-db" ] && SCRATCH_PATH="$a"; prev="$a"; done
+  if [ -n "$SCRATCH_PATH" ] && [ -e "$SCRATCH_PATH.wal" ]; then
+    rm -f "$SCRATCH_PATH.wal"
+    echo "[rollback] deleted $SCRATCH_PATH.wal — scratch restored to content-pristine"
+  fi
+fi
+exit $RC
