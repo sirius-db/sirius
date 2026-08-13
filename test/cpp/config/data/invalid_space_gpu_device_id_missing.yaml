@@ -1,0 +1,4 @@
+sirius:
+  space:
+    gpu:
+      - memory_capacity: 1Gi

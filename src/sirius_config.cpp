@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <exception>
 #include <limits>
 #include <stdexcept>
@@ -95,8 +96,8 @@ static void validate_downgrade_fractions(std::string_view scope, double trigger,
 static void from_yaml(const YAML::Node& node, cucascade::memory::gpu_memory_space_config& opt)
 {
   opt.per_stream_reservation = false;  // default to false for sirius
-  yaml::reader r(node, "gpu_memory_space");
-  r.optional("device_id", opt.device_id);
+  yaml::reader r(node, "sirius.space.gpu");
+  r.required("device_id", opt.device_id);
   r.optional("per_stream_reservation", opt.per_stream_reservation);
   r.optional(
     "reservation_limit_fraction", opt.reservation_limit_fraction, yaml::fraction<double>{});
@@ -105,13 +106,16 @@ static void from_yaml(const YAML::Node& node, cucascade::memory::gpu_memory_spac
   r.optional("downgrade_stop_fraction", opt.downgrade_stop_fraction, yaml::fraction<double>{});
   r.optional("memory_capacity", yaml::bytes(opt.memory_capacity));
   r.reject_unknown();
+  if (opt.device_id < 0) {
+    throw std::runtime_error("sirius.space.gpu: device_id must be non-negative");
+  }
   validate_downgrade_fractions(
     "sirius.space.gpu", opt.downgrade_trigger_fraction, opt.downgrade_stop_fraction);
 }
 
 static void from_yaml(const YAML::Node& node, cucascade::memory::host_memory_space_config& opt)
 {
-  yaml::reader r(node, "host_memory_space");
+  yaml::reader r(node, "sirius.space.host");
   r.optional("numa_id", opt.numa_id);
   r.optional(
     "reservation_limit_fraction", opt.reservation_limit_fraction, yaml::fraction<double>{});
@@ -123,17 +127,39 @@ static void from_yaml(const YAML::Node& node, cucascade::memory::host_memory_spa
   r.optional("pool_size", opt.pool_size);
   r.optional("initial_number_pools", opt.initial_number_pools);
   r.reject_unknown();
+  if (opt.numa_id < -1) {
+    throw std::runtime_error("sirius.space.host: numa_id must be -1 or non-negative");
+  }
   validate_downgrade_fractions(
     "sirius.space.host", opt.downgrade_trigger_fraction, opt.downgrade_stop_fraction);
 }
 
 static void from_yaml(const YAML::Node& node, cucascade::memory::disk_memory_space_config& opt)
 {
-  yaml::reader r(node, "disk_memory_space");
+  yaml::reader r(node, "sirius.space.disk");
   r.optional("disk_id", opt.disk_id);
-  r.optional("mount_path", opt.mount_paths);
+  r.required("mount_path", opt.mount_paths);
   r.optional("memory_capacity", yaml::bytes(opt.memory_capacity));
   r.reject_unknown();
+  if (opt.mount_paths.empty()) {
+    throw std::runtime_error("sirius.space.disk: mount_path must not be empty");
+  }
+}
+
+template <typename Config, typename IdOf>
+static void reject_duplicate_space_ids(std::string_view scope,
+                                       std::string_view id_name,
+                                       const std::vector<Config>& configs,
+                                       IdOf id_of)
+{
+  for (auto current = configs.begin(); current != configs.end(); ++current) {
+    for (auto prior = configs.begin(); prior != current; ++prior) {
+      if (id_of(*prior) == id_of(*current)) {
+        throw std::runtime_error(std::string(scope) + ": duplicate " + std::string(id_name) + " " +
+                                 std::to_string(id_of(*current)));
+      }
+    }
+  }
 }
 
 static void from_yaml(const YAML::Node& node, exec::thread_pool_config& opt)
@@ -679,11 +705,33 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
       sr.reject_unknown();
     }
 
+    reject_duplicate_space_ids(
+      "sirius.space.gpu", "device_id", gpu_space_configs, [](auto const& cfg) {
+        return cfg.device_id;
+      });
+    reject_duplicate_space_ids(
+      "sirius.space.host", "numa_id", host_space_configs, [](auto const& cfg) {
+        return cfg.numa_id;
+      });
+    reject_duplicate_space_ids(
+      "sirius.space.disk", "disk_id", disk_space_configs, [](auto const& cfg) {
+        return cfg.disk_id;
+      });
+
     bool const explicit_space_configured =
       !gpu_space_configs.empty() || !host_space_configs.empty() || !disk_space_configs.empty();
     if (high_level_memory_configured && explicit_space_configured) {
       throw std::runtime_error(
         "sirius.memory and non-empty sirius.space lists are mutually exclusive");
+    }
+    for (auto const& gpu : gpu_space_configs) {
+      auto const discovered = std::ranges::any_of(_hw_topology.gpus, [&](auto const& info) {
+        return static_cast<int64_t>(info.id) == static_cast<int64_t>(gpu.device_id);
+      });
+      if (!discovered) {
+        throw std::runtime_error("sirius.space.gpu: device_id " + std::to_string(gpu.device_id) +
+                                 " is not present in the discovered GPU topology");
+      }
     }
 
     r.reject_unknown();

@@ -206,23 +206,26 @@ members retain their surface defaults before the pair is validated.
 > `capacity_bytes`), and the GPU/host tiers key on `device_id` / `numa_id`.
 
 Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; fractions are `[0,1]`.
+Within a tier, `device_id`, `numa_id`, and `disk_id` must identify each space uniquely.
 
 #### `sirius.space.gpu[]` — one entry per GPU memory space
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `device_id` | int | 0 | CUDA device the space lives on. |
+| `device_id` | non-negative int | required | CUDA device the space lives on. |
 | `per_stream_reservation` | bool | false | Track reservations per CUDA stream (forced false unless set). |
 | `reservation_limit_fraction` | double [0,1] | space default | Fraction of the space that may be reserved. |
 | `downgrade_trigger_fraction` | double (0,1] | space default | Start evicting above this fraction. Must be greater than `downgrade_stop_fraction`. |
 | `downgrade_stop_fraction` | double (0,1] | space default | Stop evicting below this fraction. Must be less than `downgrade_trigger_fraction`. |
 | `memory_capacity` | bytes | space default | Absolute capacity of the space. |
 
+Every explicit `device_id` must be present in Sirius's discovered GPU topology.
+
 #### `sirius.space.host[]` — one entry per host (pinned) memory space
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `numa_id` | int | 0 | NUMA node the pinned pool is bound to. |
+| `numa_id` | int (>= -1) | -1 | NUMA node the pinned pool is bound to; -1 leaves it unbound. |
 | `reservation_limit_fraction` | double [0,1] | space default | Fraction of the space that may be reserved. |
 | `downgrade_trigger_fraction` | double (0,1] | space default | Start evicting above this fraction. Must be greater than `downgrade_stop_fraction`. |
 | `downgrade_stop_fraction` | double (0,1] | space default | Stop evicting below this fraction. Must be less than `downgrade_trigger_fraction`. |
@@ -236,7 +239,7 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `disk_id` | int | 0 | Identifier for the disk space. |
-| `mount_path` | string | "" | Spill directory. |
+| `mount_path` | string | required | Non-empty spill directory. |
 | `memory_capacity` | bytes | space default | Maximum disk space for spill files. |
 
 ```yaml
