@@ -76,7 +76,8 @@ fi
 
 # ast_jit: -4.17% suite for zero code. Compression settings ride the runner's
 # own --pin-compression/--compression-plan-dir flags, not PRE_SQL.
-export SIRIUS_PRE_SQL="SET expression_evaluator_strategy = 'ast_jit'"
+# Overridable from the environment (diagnosis runs append e.g. a log-level SET).
+export SIRIUS_PRE_SQL="${SIRIUS_PRE_SQL:-SET expression_evaluator_strategy = 'ast_jit'}"
 
 # Experimental gates of the fused scan-filter / late-materialization engine
 # PRs (the PR #1409 stack). No-ops on an engine that does not read them —
