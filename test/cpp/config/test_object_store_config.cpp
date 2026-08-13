@@ -23,6 +23,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
 
 using sirius::io::enum_to_string;
 using sirius::io::object_store_config;
@@ -347,6 +348,34 @@ TEST_CASE("sirius_config validates positive REST counts", "[scan_manager][config
         REQUIRE_NOTHROW(config.load_from_file(path));
         CHECK(config.get_scan_manager_config().rest.*field.member ==
               static_cast<std::size_t>(std::stoull(valid)));
+      }
+    }
+
+    if (std::string_view{field.name} == "max_connections") {
+      DYNAMIC_SECTION(field.name << " enforces its allocation-safe upper bound")
+      {
+        for (auto const* value : {"1024", "1025"}) {
+          CAPTURE(value);
+          write_yaml(path,
+                     "sirius:\n"
+                     "  executor:\n"
+                     "    scan_manager:\n"
+                     "      rest:\n"
+                     "        max_connections: " +
+                       std::string{value} + "\n");
+
+          sirius::sirius_config config;
+          auto const before = config.get_scan_manager_config().rest.max_connections;
+          if (std::string_view{value} == "1024") {
+            REQUIRE_NOTHROW(config.load_from_file(path));
+            CHECK(config.get_scan_manager_config().rest.max_connections == 1024);
+          } else {
+            REQUIRE_THROWS_WITH(
+              config.load_from_file(path),
+              Catch::Contains("rest.max_connections") && Catch::Contains("value out of range"));
+            CHECK(config.get_scan_manager_config().rest.max_connections == before);
+          }
+        }
       }
     }
 

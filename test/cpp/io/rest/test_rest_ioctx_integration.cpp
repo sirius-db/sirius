@@ -57,6 +57,7 @@
 #include <fstream>
 #include <future>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -777,6 +778,28 @@ sirius::io::rest::config direct_rest_test_config()
   cfg.retry_jitter            = std::chrono::milliseconds{0};
   cfg.honor_retry_after       = false;
   return cfg;
+}
+
+TEST_CASE("rest reactor rejects connection counts above the supported limit",
+          "[s3][integration][rest][config]")
+{
+  auto cfg            = direct_rest_test_config();
+  cfg.max_connections = sirius::io::rest::max_connection_limit + 1;
+  auto authorizer     = std::make_shared<fixed_url_authorizer>("http://127.0.0.1:1");
+  auto ctx            = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
+    cfg, std::move(authorizer), nullptr);
+
+  CHECK_THROWS_WITH(sirius::io::rest::rest_reactor(ctx, "connection-limit-test"),
+                    Catch::Contains("max_connections exceeds supported limit"));
+}
+
+TEST_CASE("rest bounce-storage sizing rejects multiplication overflow",
+          "[s3][integration][rest][config]")
+{
+  using sirius::io::rest::checked_bounce_storage_bytes;
+  CHECK(checked_bounce_storage_bytes(16, 1UL << 20) == 16UL << 20);
+  CHECK_THROWS_WITH(checked_bounce_storage_bytes(2, std::numeric_limits<std::size_t>::max()),
+                    Catch::Contains("bounce allocation size overflow"));
 }
 
 std::shared_ptr<rest_ioctx> make_direct_rest_ioctx(std::string endpoint,

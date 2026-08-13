@@ -469,6 +469,9 @@ rest_reactor::rest_reactor(std::shared_ptr<reactor_context> ctx, std::string_vie
   if (_config.max_connections == 0) {
     throw std::invalid_argument("rest_reactor: max_connections must be > 0");
   }
+  if (_config.max_connections > max_connection_limit) {
+    throw std::invalid_argument("rest_reactor: max_connections exceeds supported limit");
+  }
   if (_config.max_retry_attempts == 0) { _config.max_retry_attempts = 1; }
   if (_config.max_read_split == 0) { _config.max_read_split = 1; }
 
@@ -495,7 +498,7 @@ void rest_reactor::start()
     // One pinned bounce buffer per slot (1:1 with the easy-handle pool), since a
     // slot stages at most one device read at a time.
     _bounce_storage = _ctx->host_memory_resource()->allocate_multiple_blocks(
-      _config.max_connections * _bounce_slot_size);
+      checked_bounce_storage_bytes(_config.max_connections, _bounce_slot_size));
   }
 
   _worker =

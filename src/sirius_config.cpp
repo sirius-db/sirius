@@ -170,14 +170,17 @@ static void from_yaml(const YAML::Node& node, sirius::io::object_store_config& o
   r.reject_unknown();
 }
 
-static void read_positive_count(yaml::reader& reader, const char* key, std::size_t& out)
+static void read_positive_count(yaml::reader& reader,
+                                const char* key,
+                                std::size_t& out,
+                                long long upper = std::numeric_limits<long long>::max())
 {
   // Parse through a signed temporary so a negative YAML scalar cannot wrap to
   // a large size_t before validation.  Missing and null values retain the
   // struct's explicit default.
   auto const has_value = reader.has_value(key);
   long long value      = 1;
-  reader.optional(key, value, yaml::greater_than<long long>{0});
+  reader.optional(key, value, yaml::between<long long>{1, upper});
   if (has_value) { out = static_cast<std::size_t>(value); }
 }
 
@@ -192,7 +195,10 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
     }
   }
   r.optional("request_timeout_s", opt.request_timeout_s);
-  read_positive_count(r, "max_connections", opt.max_connections);
+  read_positive_count(r,
+                      "max_connections",
+                      opt.max_connections,
+                      static_cast<long long>(sirius::io::rest::max_connection_limit));
   r.optional("chunk_size", yaml::bytes(opt.chunk_size));
   r.optional("max_n_chunks", opt.max_n_chunks);
   read_positive_count(r, "max_read_split", opt.max_read_split);

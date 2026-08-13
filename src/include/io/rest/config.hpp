@@ -20,8 +20,23 @@
 
 #include <chrono>
 #include <cstddef>
+#include <limits>
+#include <stdexcept>
 
 namespace sirius::io::rest {
+
+// 64x the production default and 32x the largest committed integration-test
+// value. This leaves ample tuning headroom while bounding per-reactor slot,
+// curl-handle, event, and pinned-bounce allocations.
+inline constexpr std::size_t max_connection_limit = 1024;
+
+inline std::size_t checked_bounce_storage_bytes(std::size_t connections, std::size_t bytes_per_slot)
+{
+  if (connections != 0 && bytes_per_slot > std::numeric_limits<std::size_t>::max() / connections) {
+    throw std::overflow_error("rest_reactor: bounce allocation size overflow");
+  }
+  return connections * bytes_per_slot;
+}
 
 struct config {
   /// Whole-request timeout (seconds, 0 = no limit) and presigned-URL TTL.
@@ -32,7 +47,9 @@ struct config {
   std::string ca_bundle_path;
   bool tls_verify{true};
 
-  /// Max concurrent in-flight easy handles per reactor.
+  /// Max concurrent in-flight easy handles per reactor. Bounded because the
+  /// reactor allocates one slot and, when staging is active, one bounce buffer
+  /// per connection.
   std::size_t max_connections{16};
 
   /// Target maximum bytes per ranged GET for the vector / device-staging

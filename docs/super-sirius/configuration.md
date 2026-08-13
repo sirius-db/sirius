@@ -323,7 +323,7 @@ The four count limits marked below must be greater than zero.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `request_timeout_s` | int (seconds) | 30 | Whole-request timeout and presigned-URL TTL (0 = no limit). |
-| `max_connections` | int (**> 0**) | 16 | Max concurrent in-flight connections per reactor. |
+| `max_connections` | int (**1–1024**) | 16 | Max concurrent in-flight connections per reactor. Each connection owns a slot and, when staging is active, a bounce buffer. |
 | `chunk_size` | bytes | 8Mi | Target bytes per ranged GET (scatter/device-staging paths). |
 | `max_n_chunks` | int | 16 | Max file-adjacent segments fused into one scatter GET. |
 | `max_read_split` | int (**> 0**) | 16 | Max parallel ranged GETs for one contiguous host read (reads < 2 MiB stay a single GET). |
