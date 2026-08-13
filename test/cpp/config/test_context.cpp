@@ -926,6 +926,50 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(compression.max_compressed_fraction == Approx(0.6));
 }
 
+TEST_CASE("DuckDB setting rejects negative Sirius log flush intervals without mutation",
+          "[sirius][context][config][isolated_context]")
+{
+  finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
+  setenv("SIRIUS_DISABLE", "1", 1);
+
+  auto const previous_seconds = duckdb::Config::LOG_FLUSH_SECONDS;
+  finally restore_seconds{[&]() {
+    duckdb::Config::LOG_FLUSH_SECONDS = previous_seconds;
+    duckdb::install_configured_log_sink(nullptr);
+  }};
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+
+  auto positive = con.Query("SET sirius_log_flush_seconds = 7");
+  REQUIRE(positive != nullptr);
+  REQUIRE_FALSE(positive->HasError());
+  REQUIRE(duckdb::Config::LOG_FLUSH_SECONDS == 7);
+
+  auto negative = con.Query("SET sirius_log_flush_seconds = -1");
+  REQUIRE(negative != nullptr);
+  REQUIRE(negative->HasError());
+  REQUIRE_THAT(
+    negative->GetError(),
+    Catch::Contains("sirius_log_flush_seconds must be non-negative; zero disables"));
+
+  auto after_negative = con.Query("SELECT current_setting('sirius_log_flush_seconds')::INTEGER");
+  REQUIRE(after_negative != nullptr);
+  REQUIRE_FALSE(after_negative->HasError());
+  REQUIRE(after_negative->GetValue(0, 0).GetValue<int32_t>() == 7);
+  REQUIRE(duckdb::Config::LOG_FLUSH_SECONDS == 7);
+
+  auto disabled = con.Query("SET sirius_log_flush_seconds = 0");
+  REQUIRE(disabled != nullptr);
+  REQUIRE_FALSE(disabled->HasError());
+  REQUIRE(duckdb::Config::LOG_FLUSH_SECONDS == 0);
+
+  auto after_disabled = con.Query("SELECT current_setting('sirius_log_flush_seconds')::INTEGER");
+  REQUIRE(after_disabled != nullptr);
+  REQUIRE_FALSE(after_disabled->HasError());
+  REQUIRE(after_disabled->GetValue(0, 0).GetValue<int32_t>() == 0);
+}
+
 TEST_CASE("Sirius configuration loading from file with spaces",
           "[sirius][context][isolated_context]")
 {
