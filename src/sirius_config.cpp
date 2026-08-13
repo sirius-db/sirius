@@ -75,6 +75,17 @@ static void reject_mutually_exclusive(yaml::reader& reader,
   }
 }
 
+static void read_nonnegative_count(yaml::reader& reader, const char* key, std::size_t& out)
+{
+  // Parse through a signed temporary so a negative YAML scalar cannot wrap to
+  // a large size_t before validation. Missing and null values retain the
+  // struct's explicit default.
+  auto const has_value = reader.has_value(key);
+  long long value      = 0;
+  reader.optional(key, value, yaml::greater_than<long long>{-1});
+  if (has_value) { out = static_cast<std::size_t>(value); }
+}
+
 // ================ from_yaml for external types ================= //
 
 static void validate_downgrade_fractions(std::string_view scope, double trigger, double stop)
@@ -189,8 +200,8 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
   r.optional("honor_retry_after", opt.honor_retry_after);
   r.optional("perf_instrumentation", opt.perf_instrumentation);
   r.optional("footer_probe_bytes", yaml::bytes(opt.footer_probe_bytes));
-  r.optional("list_max_matches", opt.list_max_matches);
-  r.optional("list_max_scanned", opt.list_max_scanned);
+  read_nonnegative_count(r, "list_max_matches", opt.list_max_matches);
+  read_nonnegative_count(r, "list_max_scanned", opt.list_max_scanned);
   r.reject_unknown();
 }
 

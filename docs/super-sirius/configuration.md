@@ -333,8 +333,8 @@ single-GPU configurations only (logs a warning and disables itself otherwise).
 | `honor_retry_after` | bool | true | Respect the server's `Retry-After` header. |
 | `perf_instrumentation` | bool | false | Record per-chunk micro-timings (chunk_get, queue_wait, ttfb, h2d) into perf counters. |
 | `footer_probe_bytes` | bytes | 512Ki | Suffix-range window for the parquet footer probe. Must cover the footer, so err large. |
-| `list_max_matches` | int | 100000 | Cap on files a glob/listing may accumulate (throws "narrow the glob prefix", never truncates). |
-| `list_max_scanned` | int | 1000000 | Cap on objects a LIST sweep may scan across pages (throws, never truncates). |
+| `list_max_matches` | int (**>= 0**) | 100000 | Cap on files a glob/listing may accumulate (throws "narrow the glob prefix", never truncates). Zero allows only an empty result. |
+| `list_max_scanned` | int (**>= 0**) | 1000000 | Cap on objects a LIST sweep may scan across pages (throws, never truncates). Zero allows only an empty listing. |
 
 ### `scan_manager.cache` — prefetching cache (`io/cache/config.hpp`)
 

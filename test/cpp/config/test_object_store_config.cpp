@@ -19,6 +19,7 @@
 #include "io/rest/config.hpp"
 #include "sirius_config.hpp"
 
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -245,6 +246,86 @@ TEST_CASE("sirius_config defaults chunk prewarm to enabled when YAML omits the k
 
   sirius::sirius_config cfg;
   cfg.load_from_file(path);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("sirius_config validates non-negative REST listing caps",
+          "[scan_manager][config][s3][rest]")
+{
+  using rest_config = sirius::io::rest::config;
+  struct cap_field {
+    const char* name;
+    std::size_t rest_config::* member;
+  };
+  auto const fields = std::array{cap_field{"list_max_matches", &rest_config::list_max_matches},
+                                 cap_field{"list_max_scanned", &rest_config::list_max_scanned}};
+  auto const path   = std::filesystem::temp_directory_path() / "sirius_rest_listing_caps.yaml";
+
+  for (auto const& field : fields) {
+    DYNAMIC_SECTION(field.name << " preserves its default when omitted or null")
+    {
+      for (auto const* yaml : {"      rest: {}\n", "      rest:\n        FIELD: null\n"}) {
+        auto text = std::string{yaml};
+        if (auto const pos = text.find("FIELD"); pos != std::string::npos) {
+          text.replace(pos, 5, field.name);
+        }
+        write_yaml(path,
+                   "sirius:\n"
+                   "  executor:\n"
+                   "    scan_manager:\n" +
+                     text);
+
+        sirius::sirius_config config;
+        auto const expected = rest_config{}.*field.member;
+        REQUIRE_NOTHROW(config.load_from_file(path));
+        CHECK(config.get_scan_manager_config().rest.*field.member == expected);
+      }
+    }
+
+    DYNAMIC_SECTION(field.name << " accepts zero and positive caps")
+    {
+      for (auto const* valid : {"0", "7"}) {
+        CAPTURE(valid);
+        write_yaml(path,
+                   "sirius:\n"
+                   "  executor:\n"
+                   "    scan_manager:\n"
+                   "      rest:\n"
+                   "        " +
+                     std::string(field.name) + ": " + valid + "\n");
+
+        sirius::sirius_config config;
+        REQUIRE_NOTHROW(config.load_from_file(path));
+        CHECK(config.get_scan_manager_config().rest.*field.member ==
+              static_cast<std::size_t>(std::stoull(valid)));
+      }
+    }
+
+    DYNAMIC_SECTION(field.name << " rejects signed underflow without mutation")
+    {
+      // The last value is one greater than LLONG_MAX. Parsing through a signed
+      // temporary must reject both directions rather than wrapping either into
+      // the size_t safety cap.
+      for (auto const* invalid : {"-1", "9223372036854775808"}) {
+        CAPTURE(invalid);
+        write_yaml(path,
+                   "sirius:\n"
+                   "  executor:\n"
+                   "    scan_manager:\n"
+                   "      rest:\n"
+                   "        " +
+                     std::string(field.name) + ": " + invalid + "\n");
+
+        sirius::sirius_config config;
+        auto const before = config.get_scan_manager_config().rest.*field.member;
+        REQUIRE_THROWS_WITH(config.load_from_file(path),
+                            Catch::Contains(std::string("rest.") + field.name));
+        CHECK(config.get_scan_manager_config().rest.*field.member == before);
+      }
+    }
+  }
 
   std::error_code ec;
   std::filesystem::remove(path, ec);
