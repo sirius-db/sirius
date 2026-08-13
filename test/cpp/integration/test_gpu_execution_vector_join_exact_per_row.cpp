@@ -386,6 +386,63 @@ TEST_CASE_METHOD(VectorJoinFixture,
 }
 
 // -----------------------------------------------------------------------------
+// Multi-batch LEFT (probe) side: the probe spans two pinned batches, so reduce_local
+// drains more than one partition (one per left batch) and materialize must keep each
+// left batch's rows attached to their own neighbors. Every other test uses a single
+// left batch (num_partitions=1); this is the only one that exercises the
+// multi-partition drain -- the symmetric twin of the cross-batch merge path. The
+// corpus stays a single batch (multi-right is covered by the tests above), so this
+// isolates the left-partitioning. id lives in dim 0, so L2 distance is |i - j|.
+// -----------------------------------------------------------------------------
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - exact L2 across multiple left batches",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  // 125000 probe rows split into a 122880-row batch and a 2120-row batch (left batch 1
+  // holds ids 122880..124999). The corpus is 2000 rows in one batch.
+  run_ok("CREATE TABLE mlb_corpus (id INTEGER PRIMARY KEY, vec FLOAT[768]);");
+  run_ok(
+    "INSERT INTO mlb_corpus SELECT i, list_resize([i::FLOAT], 768, 0.0::FLOAT)::FLOAT[768] "
+    "FROM range(2000) t(i);");
+  run_ok("CREATE TABLE mlb_probe (id INTEGER PRIMARY KEY, vec FLOAT[768]);");
+  run_ok(
+    "INSERT INTO mlb_probe SELECT i, list_resize([i::FLOAT], 768, 0.0::FLOAT)::FLOAT[768] "
+    "FROM range(125000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'mlb_corpus', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'mlb_probe', tier => 'gpu', format => 'duckdb');");
+
+  const std::string q =
+    "sirius_knn_join('mlb_probe','vec','mlb_corpus','vec', "
+    "search_mode => 'exact', metric => 'l2', k => 5)";
+
+  // The merge emits exactly k rows per probe, so a total of 125000 * k proves every one
+  // of the 125000 probes (both left batches) was materialized.
+  REQUIRE(single_int(*con, "SELECT count(*) FROM " + q + ";") == 125000 * 5);
+  // The last probe of left batch 1 (id 124999) is present with its full k neighbors.
+  REQUIRE(single_int(*con, "SELECT count(*) FROM " + q + " WHERE left_id = 124999;") == 5);
+  REQUIRE(single_int(*con, "SELECT count(*) FROM " + q + " WHERE right_id = -1;") == 0);
+
+  // Spot-check neighbor sets for probes in BOTH left batches (0, 5, 60000 in batch 0;
+  // 122880, 124999 in batch 1). If materialize mismatched a partition's rows with
+  // another's neighbors, the batch-1 probes' ids would not line up with the reference.
+  const std::string ids = "(0, 5, 60000, 122880, 124999)";
+  con->Query("SET gpu_execution = false;");
+  auto reference = ok_rows(*con,
+                           "SELECT p.id, n.id FROM (SELECT * FROM mlb_probe WHERE id IN " + ids +
+                             ") p, LATERAL ("
+                             "  SELECT c.id FROM mlb_corpus c "
+                             "  ORDER BY array_distance(p.vec, c.vec) LIMIT 5) n;");
+  con->Query("SET gpu_execution = true;");
+  auto joined =
+    ok_rows(*con, "SELECT left_id, right_id FROM " + q + " WHERE left_id IN " + ids + ";");
+  REQUIRE(joined == reference);
+
+  run_ok("SELECT * FROM unpin_table('mlb_probe');");
+  run_ok("SELECT * FROM unpin_table('mlb_corpus');");
+}
+
+// -----------------------------------------------------------------------------
 // Cosine: correctness on direction-varied vectors, both output types return the
 // same neighbor set, and the clamp keeps distance >= 0 and similarity <= 1.
 // -----------------------------------------------------------------------------
