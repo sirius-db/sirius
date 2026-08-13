@@ -305,10 +305,41 @@ void gpu_pipeline_executor::manager_loop()
        exc_stream = std::move(exc_stream),
        consumers  = std::move(output_consumers),
        pipeline]() mutable {
+        // Quiesce exc_stream on EVERY abnormal exit BEFORE any object that
+        // owns device memory (the task, a reschedule exception's intermediate
+        // data) is destroyed. execute()'s throw paths unwind with kernels /
+        // copies still enqueued on exc_stream; destroying those owners frees
+        // their buffers stream-ordered on OTHER (already idle) streams, so
+        // the async pool can rebind the memory to concurrent queries while
+        // this stream's orphaned kernels still read/write it. That was the
+        // staged-refresh throughput corruption: one aborted query's orphaned
+        // kernels scribbled pool memory reused by concurrent queries —
+        // surfacing as cudaErrorIllegalAddress at the victims' next sync,
+        // negative-size (2^64-N) allocations from non-monotonic string
+        // offsets, garbage VARCHAR bytes (client-side "Invalid unicode"),
+        // and never-terminating kernels.
+        auto quiesce_exc_stream = [&exc_stream](char const* why) noexcept {
+          try {
+            exc_stream->synchronize();
+          } catch (const std::exception& sync_err) {
+            SIRIUS_LOG_ERROR("GPU Pipeline Executor: exc_stream synchronize failed during {}: {}",
+                             why,
+                             sync_err.what());
+          } catch (...) {
+            SIRIUS_LOG_ERROR("GPU Pipeline Executor: exc_stream synchronize failed during {}", why);
+          }
+        };
         try {
           task->execute(exc_stream);
           _tasks_executed.fetch_add(1, std::memory_order_relaxed);
         } catch (task_reschedule_exception& ex) {
+          // Sync FIRST: `ex` owns the task's input batches, and every return
+          // below destroys `task` (and possibly `ex`) — no device buffer may
+          // be freed while this stream still has the throwing operator's work
+          // in flight. The error-state early return below previously skipped
+          // the sync entirely; that gap is what let an abandoned query leak
+          // running kernels into QueryEnd's memory teardown.
+          quiesce_exc_stream("reschedule handling");
           if (_completion_handler && _completion_handler->has_error()) {
             // If the completion handler is already in an error state, then we can just return and
             // not try to reschedule
@@ -324,8 +355,8 @@ void gpu_pipeline_executor::manager_loop()
             return;
           }
 
-          // Sync the stream to ensure all memory is released before the reschedule.
-          exc_stream->synchronize();
+          // (exc_stream already quiesced at the top of this handler, so all
+          // task memory is released before the reschedule.)
 
           // Determine retry count and original task ID for this rescheduled attempt.
           auto* cur_local = dynamic_cast<gpu_pipeline_task_local_state*>(gpu_task->local_state());
@@ -421,11 +452,16 @@ void gpu_pipeline_executor::manager_loop()
           return;
         } catch (const std::exception& e) {
           SIRIUS_LOG_ERROR("GPU Pipeline Executor: Exception during task execution: {}", e.what());
+          // Quiesce before `task` (destroyed at lambda exit) releases its
+          // device buffers — same freed-while-pending hazard as the
+          // reschedule path above.
+          quiesce_exc_stream("task-failure teardown");
           if (_task_creator) { _task_creator->stop(); }
           if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
           return;
         } catch (...) {
           SIRIUS_LOG_ERROR("GPU Pipeline Executor: unknown error during task execution");
+          quiesce_exc_stream("task-failure teardown");
           if (_task_creator) { _task_creator->stop(); }
           if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
           return;

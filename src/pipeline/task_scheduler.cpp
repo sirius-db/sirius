@@ -30,6 +30,10 @@
 #include "planner/query.hpp"
 #include "telemetry/telemetry_context.hpp"
 
+#include <rmm/cuda_device.hpp>
+
+#include <cuda_runtime_api.h>
+
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -254,6 +258,24 @@ void task_scheduler::drain_after_error()
   // tasks to finish, then restart the manager for the next query.
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->drain_and_wait();
+    // Belt-and-suspenders for the device-side teardown hazard: drain_and_wait
+    // only joins the HOST lambdas. A task that threw may have unwound with
+    // kernels still enqueued on its exc_stream (the executor's catch handlers
+    // quiesce that stream, but this guards any throw path they miss). The
+    // caller rethrows right after this drain and QueryEnd then frees every
+    // device buffer the query owned — if any of the query's kernels were
+    // still running, the async pool would rebind that memory to concurrent
+    // queries mid-kernel (the staged-refresh corruption). Quiesce the whole
+    // device before letting the teardown free anything. Error path only, so
+    // the (bounded) wait on unrelated streams is acceptable.
+    rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{device_id}};
+    if (auto const sync_err = cudaDeviceSynchronize(); sync_err != cudaSuccess) {
+      SIRIUS_LOG_ERROR(
+        "task_scheduler::drain_after_error: cudaDeviceSynchronize on GPU {} failed: [{}] {}",
+        device_id,
+        static_cast<int>(sync_err),
+        cudaGetErrorString(sync_err));
+    }
   }
 
   // Now that no executor can generate further task_creation_requests, discard
