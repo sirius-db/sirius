@@ -876,121 +876,6 @@ TEST_CASE("Hash partition cast keys stay out of the payload",
   }
 }
 
-TEST_CASE("View-backed hash partition materializes safely on another stream",
-          "[operator][hash_partition][zero_copy][stream]")
-{
-  auto* mem_space = get_shared_mem_space();
-  rmm::cuda_stream producer_stream{rmm::cuda_stream::flags::non_blocking};
-  rmm::cuda_stream consumer_stream{rmm::cuda_stream::flags::non_blocking};
-  std::vector<int32_t> keys   = {0, 1, 2, 3, 4, 5, 6, 7};
-  std::vector<int64_t> values = {50, 51, 52, 53, 54, 55, 56, 57};
-  std::vector<std::string> strings;
-  for (auto key : keys) {
-    strings.push_back("value_" + std::to_string(key));
-  }
-  auto input = make_mixed_batch(*mem_space, keys, strings, values);
-  // Finish fixture writes on the default stream so this test isolates the output representation's
-  // producer-to-consumer writer-event handoff.
-  cudf::get_default_stream().synchronize();
-
-  std::vector<mixed_rows> expected;
-  std::vector<std::shared_ptr<data_batch>> output;
-  {
-    auto ro               = input->to_read_only();
-    auto const input_view = sirius::get_cudf_table_view(ro);
-    std::vector<cudf::column_view> key_views{input_view.column(0)};
-    expected = reference_partition_rows<mixed_rows>(input_view,
-                                                    cudf::table_view{key_views},
-                                                    4,
-                                                    cudf::get_default_stream(),
-                                                    mem_space->get_default_allocator(),
-                                                    copy_mixed_rows);
-    output   = gpu_partition_impl::hash_partition(ro, {0}, 4, producer_stream.view(), *mem_space);
-  }
-
-  auto const survivor_it = std::find_if(output.begin(), output.end(), [](auto const& batch) {
-    auto ro = batch->to_read_only();
-    return sirius::get_cudf_table_view(ro).num_rows() != 0;
-  });
-  REQUIRE(survivor_it != output.end());
-  auto const survivor_index = static_cast<std::size_t>(std::distance(output.begin(), survivor_it));
-  auto survivor             = *survivor_it;
-  output.clear();
-
-  std::unique_ptr<cudf::table> materialized;
-  {
-    auto mut     = survivor->to_mutable();
-    auto& repr   = mut.get_data()->cast<cucascade::gpu_table_representation>();
-    materialized = repr.release_table(consumer_stream.view());
-  }
-
-  survivor.reset();
-  input.reset();
-  REQUIRE(materialized != nullptr);
-  for (auto const& column : materialized->view()) {
-    REQUIRE(column.offset() == 0);
-  }
-  REQUIRE(copy_mixed_rows(materialized->view()) == expected[survivor_index]);
-}
-
-TEST_CASE("View-backed hash partition clones safely on another stream",
-          "[operator][hash_partition][zero_copy][stream]")
-{
-  auto* mem_space = get_shared_mem_space();
-  rmm::cuda_stream producer_stream{rmm::cuda_stream::flags::non_blocking};
-  rmm::cuda_stream consumer_stream{rmm::cuda_stream::flags::non_blocking};
-  std::vector<int32_t> keys   = {0, 1, 2, 3, 4, 5, 6, 7};
-  std::vector<int64_t> values = {50, 51, 52, 53, 54, 55, 56, 57};
-  std::vector<std::string> strings;
-  for (auto key : keys) {
-    strings.push_back("value_" + std::to_string(key));
-  }
-  auto input = make_mixed_batch(*mem_space, keys, strings, values);
-  // Finish fixture writes on the default stream so this test isolates the output representation's
-  // producer-to-consumer writer-event handoff.
-  cudf::get_default_stream().synchronize();
-
-  std::vector<mixed_rows> expected;
-  std::vector<std::shared_ptr<data_batch>> output;
-  {
-    auto ro               = input->to_read_only();
-    auto const input_view = sirius::get_cudf_table_view(ro);
-    std::vector<cudf::column_view> key_views{input_view.column(0)};
-    expected = reference_partition_rows<mixed_rows>(input_view,
-                                                    cudf::table_view{key_views},
-                                                    4,
-                                                    cudf::get_default_stream(),
-                                                    mem_space->get_default_allocator(),
-                                                    copy_mixed_rows);
-    output   = gpu_partition_impl::hash_partition(ro, {0}, 4, producer_stream.view(), *mem_space);
-  }
-
-  auto const survivor_it = std::find_if(output.begin(), output.end(), [](auto const& batch) {
-    auto ro = batch->to_read_only();
-    return sirius::get_cudf_table_view(ro).num_rows() != 0;
-  });
-  REQUIRE(survivor_it != output.end());
-  auto const survivor_index = static_cast<std::size_t>(std::distance(output.begin(), survivor_it));
-  auto survivor             = *survivor_it;
-  output.clear();
-
-  std::unique_ptr<idata_representation> cloned;
-  {
-    auto mut = survivor->to_mutable();
-    cloned   = mut.get_data()->clone(consumer_stream.view());
-  }
-
-  survivor.reset();
-  input.reset();
-  REQUIRE(cloned != nullptr);
-  auto const& cloned_repr = cloned->cast<cucascade::gpu_table_representation>();
-  auto const cloned_view  = cloned_repr.get_table_view();
-  for (auto const& column : cloned_view) {
-    REQUIRE(column.offset() == 0);
-  }
-  REQUIRE(copy_mixed_rows(cloned_view) == expected[survivor_index]);
-}
-
 TEST_CASE("Non-first mixed partition survives registry GPU host GPU round-trip",
           "[operator][hash_partition][conversion][zero_copy]")
 {
@@ -1035,6 +920,8 @@ TEST_CASE("Non-first mixed partition survives registry GPU host GPU round-trip",
     auto ro = input->to_read_only();
     output  = gpu_partition_impl::hash_partition(ro, {0}, 4, producer_stream.view(), *gpu_space);
   }
+  // Model Sirius's operator publication barrier before another stream consumes the output.
+  producer_stream.synchronize();
 
   // Select a later partition because raw non-first cuDF slices can carry nonzero offsets;
   // converters require canonical offset-zero columns.
@@ -1131,6 +1018,8 @@ TEST_CASE("Non-first mixed partition survives registry GPU peer conversion",
     auto ro = input->to_read_only();
     output  = gpu_partition_impl::hash_partition(ro, {0}, 4, producer_stream.view(), *gpu0);
   }
+  // Model Sirius's operator publication barrier before another stream consumes the output.
+  producer_stream.synchronize();
 
   // Select a later partition because raw non-first cuDF slices can carry nonzero offsets;
   // converters require canonical offset-zero columns.

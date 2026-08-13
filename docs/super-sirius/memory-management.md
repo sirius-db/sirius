@@ -128,10 +128,6 @@ resident, and the periodic pressure monitor can stop one request early and retry
 Task-driven downgrade remains guarded by its attempt to obtain a real allocator reservation. This
 is a known limitation until allocation-family-aware accounting or family-level downgrade exists.
 
-View-backed batches materialize an owning cuDF table only when a consumer calls `release_table()`.
-Because that deep copy is asynchronous, the materialization stream is completed before the
-type-erased source owner is discarded; this prevents a cross-stream source-lifetime race.
-
 ### Candidate Selection Strategy
 
 Candidates are fetched lazily via `convertible_data_provider` implementations:

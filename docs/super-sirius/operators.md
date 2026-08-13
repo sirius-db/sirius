@@ -304,7 +304,8 @@ each payload column:
   allocation family.
 
 Consequently, one unsupported column does not disable zero-copy aliases for eligible siblings.
-Consumers that require an owning table materialize the view on demand through
+View batches retain type-erased owners, Sirius synchronizes the operator stream before publication,
+and consumers that require an owning table materialize the view on demand through
 `gpu_table_representation::release_table()`.
 
 ### `sirius_physical_concat` — `CONCAT`
