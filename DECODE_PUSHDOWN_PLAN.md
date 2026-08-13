@@ -379,11 +379,12 @@ delivered at all. The decode still gathers its BOOL8 to the slot (1 B/row); skip
 variable output arity, which every downstream position mapping would have to follow. The conjunct
 side of elision — the column being unreferenced by the residual — is what landed here.
 
-**No measurement.** Phase 2 and 3 were verified for correctness only — `[compression]` with the
-gate on and off, plus all 14 simpatico tests. This box has no GPU budget for the SF1000 run, so
-the "no measurable delta" clause on both phases is UNVERIFIED. Re-run before merging: the
-mechanism's whole justification is 8.180 s → 6.918 s, and every one of these commits sits on the
-per-batch path.
+**Measurement — DONE.** Re-run on GB300 after Phases 2 and 3 and the reuse review: the numbers
+match the original branch's. The refactor cost nothing, which is what "no measurable delta" asked
+for. The merge blocker is cleared.
+
+Still unverified on hardware: the multi-GPU stream-pool fix (`ed568684`) — that needs a
+two-GPU box to run `test_multi_gpu_stream_affinity`'s device-switching half.
 
 Phase 2 preceded Phase 3 for a reason: the facade is what buys freedom to change internals
 without touching the scan. That freedom now exists — `decode_compressed_chunk` has exactly one
@@ -401,13 +402,14 @@ up, the ordinary decode. Identifiers followed (`tier_dict_k5` → `tier_dict_gat
 
 Every problem in §1 is closed. What is left is not cleanup:
 
-1. **Measure.** Nothing since Phase D has been timed. This is the blocker for merging.
+1. ~~**Measure.**~~ DONE on GB300; the numbers match.
 2. **`unapplied` / `position`** (§2) — the residual as a predicate and column elision. Needs the
    analysis to produce `sirius::ast`; `src/include/op/scan/scan_filter_analysis.hpp` is where it
    would land.
 3. **§7's capability work**, now cheap: a new consumer (`ballot_membership` first — membership is
    expensive today *because* it cannot work on packed bits) or the two unbuilt points of the
-   enumerator × consumer product, each an emitter plus a `shape_is_supported` entry.
+   enumerator × consumer product — but see §9: both were built and measured off-branch, and the
+   axis turned out to be saturated.
 
 **Entry points, cold:** `src/compression/compressed_scan.hpp` is the whole scan↔decoder boundary;
 `compressed_scan.cpp` holds the per-chunk narrowing (`plan_decode`) and request assembly;
@@ -472,20 +474,190 @@ A sweep for functionality the branch reimplemented. Findings, and what was done:
   A zone-map filter could feed the range ballot instead of a full-width membership probe, which
   would use a kernel that already exists.
 
-## 7. Future directions this unlocks
+## 7. What is done, and what is open
 
-**Missing kernel combinations become constructible.** With the op expressed as the enumerator ×
-consumer product (§5), the 15-point space contains 7 implemented kernels; the buildable
-remainder needs an emitter and a `shape_is_supported` entry, not a new variant tag, launcher,
-capability probe and tier:
+### Done
 
-- **K4 × dict_gather**, **K4 × offsets_meta** (i.e. `index_list` × `dict_gather` / `offsets_meta`)
-  — below the ~15% K4 crossover, dictionary and `str_split` strings are stuck on the mask walk
-  purely because the emitter wasn't written. q12-class scans sit near 0.5% selectivity.
-- **mask_bits × delta for K5/K6** — dict codes or string offsets behind a delta are `tier_b`
-  today (`plan_supports_dict_selection_decode` requires bitpack codes;
-  `plan_supports_str_selection_decode` requires a plain bitpack offsets child). `l_comment`'s
-  `delta -> ans` offsets and `c_phone`'s `delta -> rle -> bitpack` are the concrete cases.
+| | |
+|---|---|
+| **Phase D** — codegen dedup | `enumerator × consumer` product; 7 of 15 points built |
+| **Phase 1** — value-carrying results | `decode_outcome` replaced two marker representation classes |
+| **Phase 2** — the facade | `compressed_scan` / `scan_decode_request` / `decode_compressed_chunk`; one carrier replaced five setter pairs; three `extract_*` merged into `analyze_scan_filters` |
+| **Phase 3** — internals | one `decode_route`, one `probe_column`, one source list, one finished table, one definition per policy knob |
+| **`unapplied`** | the residual is a Sirius AST predicate built once at bind; three outcomes per conjunct (keep / reference / drop) |
+| **Naming** | K#/RULE/W#/iteration-N shorthand replaced with what the code does |
+| **Reuse review** | §6c — one fold, one deferral, one evaluated-and-declined, one bug found |
+| **Measurement** | GB300, matches the original branch's numbers |
+
+P1–P8 are all closed. What is NOT done from §2's design is `position` — true column elision, where an
+answered filter-only column is never delivered. The conjunct side landed; skipping the 1 B/row
+gather needs a variable output arity that every downstream position mapping would have to follow.
+
+**Unverified:** the multi-GPU stream-pool fix (`ed568684`) needs a two-GPU box.
+
+**Testing note carried out of this work:** five of the six reuse tasks touched code with no
+coverage at all, found by checking rather than by a failure — the numeric-range lowering, the four
+selection-wave kernels (`combine_masks_and` was never executed anywhere), the residual decision,
+the filter-column resolution. Anything below that adds *policy* rather than a kernel lands where
+coverage is still thin; write the test first.
+
+### What the SF1000 diag log says
+
+One instrumented run (22 queries x 2 iterations, gate on) settled more than the code reading did.
+Anything proposed below should be checked against it first.
+
+| | |
+|---|---|
+| filtered decodes planned | 928 — of which **920 APPLIED**, 8 not |
+| given up as unselective | **6**. The selectivity ceilings are not a live constraint |
+| source cap reached | **0**. `kMaxSelectionSources` is not a live constraint either |
+| selectivity distribution | 0.004% – 15% for nearly every batch; one cluster at 52.6% (the q1 shape, which proceeds only because a dictionary output exempts it from the ceiling) |
+| row-filtered tag | 254 true / 674 false, and coverage was the sole gate |
+
+Two things follow directly. **Almost every batch runs below the 0.15 index-walk crossover**, so a
+dictionary or `str_split` column on the mask walk is on the wrong enumeration nearly always — that
+is direction 5's justification, and it is a measured one. And **the 674 untagged batches were
+untagged only because of `has_external_selection`** — `covers_whole_filter=false` never once
+occurred without an external source. That is a REAL DEFECT, still present on this branch: the
+tag is cleared by a term that has nothing to do with coverage. It was fixed and measured
+off-branch — see §9.1, which is where the fix should be re-applied from.
+
+Method note: three directions (1, 3, 4) were proposed from reading the code and all three turned
+out to have no reachable customer. The ones that survived came from a profile or from this log.
+Check first.
+
+**What this log CANNOT say.** It reports the orchestrator's per-batch enumeration REQUEST, and
+prints a column's route as a bare enum (`decode_route` has no name function), so no run of this
+branch can answer "did this column actually take the index walk" — every index-walking site may
+silently keep the mask walk, and one batch mixes routes. Anyone measuring the enumeration axis
+needs the per-column instrumentation described in §9.4 first; without it, a claim about which
+enumerator ran is an inference, and one such inference was wrong (§9.3).
+
+### Open, cheapest first
+
+Each entry: where it lands in the code, and which TPC-H queries it touches.
+
+**1. Zone-map join filters → the range ballot. TRIED, MEASURED, NOT KEPT** (§9.2).
+Measured on GB300: inert by default and a pessimization when forced on. Publication is off by
+default (`enable_dynamic_zone_map_filter`) because the filter only helps when build keys correlate
+with the filter column and TPC-H keys are scattered — 296 decode-time attaches across q3/4/5/9/12/21
+logged `ranges=0`. Forced on, consuming the bounds cost **+131 ms**, concentrated in the
+DYNAMIC_FILTER-heavy queries (q17 +30, q8 +29, q20 +27, q7 +17, q21 +13, q19 +9).
+
+Two mechanisms, and the obvious one is NOT among them. A range cannot displace a probe:
+`order_key()` sorts every non-membership source ahead of all probes, and the membership cap
+truncates only the membership vector. What actually happens is
+
+  (a) exceeding `kMaxSelectionSources` DECLINES the whole filtered decode rather than truncating,
+      so one added source can cost a batch its entire compaction — which fits the source-heavy
+      queries; and
+  (b) below the cap, a zone map over scattered keys spans nearly the whole used domain, so the
+      range costs a full-width ballot pass and rejects almost nothing.
+
+Admitting it profitably needs a selectivity signal the decode does not have. The one exact test —
+does the published `[min, max]` exclude any of THIS chunk's values — needs device-resident
+per-chunk metadata, and reading it to decide whether to launch a kernel is its own cost. **The
+publisher is better placed:** it already gates on coverage, and Sirius has probe-side statistics
+(`pinned_chunk_stats.hpp`), so it could publish an estimate of the fraction a zone map excludes and
+let the decode admit only ranges above a threshold. Revisit there, not here.
+
+**2. Disjunction → a range hull. TRIED, MEASURED FLAT, NOT KEPT** (§9.2). Analysis only.
+`fold_numeric_conjunct` returns no bounds for
+`CONJUNCTION_OR`; a hull (min of los, max of his) over-approximates and so cannot drop a surviving
+row. Coverage stays false.
+*TPC-H:* q19 — a three-way OR that today yields no range at all; a hull gives `l_quantity` 1..30 and
+`p_size` 1..15. Also q16.
+
+**3. `LIKE 'prefix%'` off dictionary keys. INVESTIGATED, NOT BUILT — no customer.**
+DuckDB already rewrites a prefix LIKE before the scan sees it: `p_type LIKE 'PROMO%'` arrives as
+`p_type >= 'PROMO' AND p_type < 'PROMP'`, two ordinary ConstantFilters (verified by EXPLAIN). So
+there is no LIKE shape to recognise, and the real design would be larger than described — let a
+dictionary answer a string RANGE rather than only an equality set, which means extending
+`simpatico::decode_predicate` and its key comparison, not just the analysis.
+
+The TPC-H customers claimed here were wrong, from reading query text rather than checking where the
+predicate sits:
+  - q14's `p_type like 'PROMO%'` is inside the SELECT's CASE, not the WHERE — never pushed.
+  - q16's `p_type not like 'MEDIUM PLATED%'` is negated, so not a range.
+  - q20's `p_name like 'antique%'` is genuine and is the ONLY one — on a high-cardinality column
+    that suits a dictionary poorly, in a table `bench/sf1000-repro/plans/` does not even carry a
+    plan for.
+
+Note the general fact for anything similar: a VARCHAR column's comparison filters DO reach the
+filter set, and nothing extracts them today. If a workload with real string-range predicates turns
+up, the dictionary can answer them the same way it answers equality.
+
+**4. Truncate at the source cap instead of declining. MEASURED, DARK.**
+`declined on shape` fired **0 times** across TPC-H SF1000 (22 queries x 2 iterations, gate on):
+928 filtered decodes were planned and none exceeded `kMaxSelectionSources`. The cap is not a live
+constraint on this workload, so keeping a prefix instead of giving up has nothing to improve.
+Justifying it needs a query shape with more concurrent row-selecting sources than TPC-H produces.
+
+It would start firing in a configuration with zone-map publication enabled, since those add
+sources — but that configuration is itself a pessimization (see 1), so this stays dark either way.
+Settled in one run by a decline line that reported the cap and the competing kinds — that
+instrumentation is not on this branch (§9.4); re-add it before re-opening this.
+
+**5. `index_list × dict_gather` and `index_list × offsets_meta`. BUILT, MEASURED, NOT KEPT** —
+and the measurement says **do not rebuild it for its own sake**. Full account in §9.3; the short
+version is that the axis was already saturated by `bitpack_mask`, these two points served 3.6% of
+column walks, and the largest remaining group (delta) cannot use them at all.
+
+**6. `ballot_membership`. NOT one direction — three, and only one of them is cheap.**
+Today `membership_probe_fn` is a `std::function` returning a full-width BOOL8 column, so a probe
+costs a full key decode + a full BOOL8 + the mask adapter. In-register testing needs the filter's
+device structure as kernel parameters, and what that means depends entirely on which filter kind
+published it — the rendered kernel is plain CUDA compiled by NVRTC against simpatico's own headers
+only:
+
+| kind | structure | renderable? |
+|---|---|---|
+| `sirius_dynamic_small_in_list_filter` (rank 0) | raw snapshot of **<= 12** INT32/INT64 needles | **Yes** — a pointer, a count and a branchless 12-iteration compare. No external header, no layout coupling. This is a contained emitter, direction-5 sized |
+| `sirius_dynamic_in_list_filter` (rank 1) | `cuco::static_set`, PIMPL'd into a `.cu` | Only by reimplementing cuco's bucket layout, probing scheme, hasher and sentinel in EMITTED source — coupling a rendered kernel to a dependency's internals |
+| `sirius_dynamic_bloom_filter` (rank 2) | `cuco::bloom_filter` + policy | Same, plus the policy must match the build side exactly — and `bench/sf1000-repro` documents that policy silently changing (the Arrow 128 MiB cap, the fast-range block index) |
+
+So the doc's old framing — "one new Consumer, emitter, launcher and a directive carrying the view"
+— holds for rank 0 and understates ranks 1-2 by a lot. `sirius_device_replicable` publishes
+replicas, but a replica is not a device VIEW; two of the three kinds keep their probe behind a
+PIMPL precisely so cuco device code stays in one `.cu`.
+
+**Check first, and it needs no new code:** the `[decode-filter] wave-1 sources` line already prints
+`join(cN, rank R)` for every membership source carried into a decode. Rank 0 dominant ⇒ build the
+small-in-list ballot and stop. Ranks 1-2 dominant ⇒ rank 0 is another direction-4 (measured dark),
+and the real work is a device-view abstraction over cuco structures, which is a project, not an
+emitter. Three directions have already died from being proposed on structure rather than counted.
+
+If it is built, `decode_max_membership_sources` (currently 1) should rise with it — that cap exists
+only because probes run full width.
+*TPC-H:* q8 (measured: 3 probes = +134 ms probe-side vs −48 ms compaction), q21 (the suppkey
+in-list vs orders Bloom cap-ordering case), q3, q5, q9, q10, q17, q20 — but which of those the
+rank-0 emitter can serve is exactly what the rank distribution decides.
+
+**7. Count-only / existence.** `compressed_scan::count()` is the easy half — wave 1 + CNT already
+computes the exact count. The hard half is upstream and is a PLAN-shape decision: something must
+recognise "this aggregate is COUNT(*) and no column's values are used" and push it to the scan
+(`sirius_plan_aggregate` / the physical plan generator, not `src/compression/`). Every soundness
+hatch inverts: no conjunct dropping, no cap truncation, and no inexact filters — a Bloom over-keeps
+by construction, which turns `bool exact` on the membership conjunct from a comment into a
+checkable field.
+*TPC-H:* weak — q4, q13, q21, q22 all still need other columns for their group-by. Do it for the
+capability, not for these numbers.
+
+**8. `transform_store`.** Highest ceiling, lowest readiness. Needs the projection expression to
+reach the scan (projections sit above it today) and a lowering from `sirius::ast` arithmetic into
+JIT CUDA source — a new path parallel to the cuDF-AST translator, since the renderer emits text and
+nothing turns a Sirius expression into a kernel body. Plus decimal overflow reasoning in-register.
+*TPC-H:* q6 is the clean case. q1 and q14 have the shape, but q1 needs both columns for other
+aggregates anyway, so nothing is saved there.
+
+**9. `run_list` enumerator.** A third `Enumerator` point plus a wave to build the run list. Drops
+into the product cleanly, unlike `gather_list` — see below for why that one is a separate project.
+*TPC-H:* clustered survivors — q3, q4, q5, q12, q21, where date filters correlate with orderkey
+order. Speculative until measured: run-length statistics over the existing mask are a diagnostic
+away.
+
+**Not worth it for TPC-H:** `IS NULL` masks (no nulls in the dataset), `ballot_expression` beyond
+the LIKE case, and `gather_list`.
 
 ### Can the axes grow?
 
@@ -563,25 +735,6 @@ one of:
 Neither is fatal, but it means `gather_list` is a new launch strategy, not just a new way to
 enumerate — the one candidate here that does not drop into the existing frame unchanged.
 
-**Count-only and existence.** Wave 1 + CNT already computes the exact survivor count and
-`run_selection_cnt` already returns it; everything after is waste for `COUNT(*)`. Reads
-compressed bytes, writes 1 bit/row, allocates no output column. Contract differs enough to
-justify a separate entry point (`compressed_scan::count`, `optional<int64_t>`), because every
-soundness escape hatch inverts:
-
-- no conjunct dropping (today a dropped conjunct just clears `covers_whole_filter`)
-- no membership cap truncation (`MAX_MEMBER` drops probes — sound for masking, fatal for counting)
-- RULE 2 does not apply (no decode to stop paying for)
-- **no inexact filters**: a Bloom probe over-keeps by construction. This argues for
-  `bool exact` on the membership conjunct, turning `kind_rank`'s comment ("the set forms are
-  exact; Bloom over-keeps") into a checkable field. Existence (`LIMIT 1`, anti-join probes) is
-  the same wave with an early exit.
-
-**Cross-kind conjunct ordering.** With one conjunct list and one `expected_keep` comparator, the
-scarce mask slots go to the most selective conjunct regardless of kind — today the ordering
-sort only runs *within* the membership vector, so a highly selective range cannot outrank a weak
-Bloom.
-
 **Selectivity feedback in the session.** `compressed_scan` sees every batch of a scan, so the
 RULE-2 decision can become measured rather than latched-on-first-bail, and the K3/K4 pick can
 adapt per scan instead of using a fixed 0.15.
@@ -618,3 +771,162 @@ per shape.
    could NOT catch:** the parquet ingestible's candidate-extraction block existed twice, so every
    candidate was appended to `_pushdown_primary_by_batch_position` twice. It compiled and behaved
    (the lookup breaks on the first match). Grep for repeated blocks, do not rely on the build.
+
+## 9. The follow-up campaign: what was tried after the refactor, and what it was worth
+
+Everything in this section was built on top of this branch, measured on TPC-H SF1000, and then
+**reset off it**. The branch is deliberately the refactor plus its measurement; these were
+optimization attempts on the open directions, and mixing them in was hiding what the refactor
+itself costs. Nothing here is in the tree — no commit ids, because the reset orphaned them.
+Re-apply from the descriptions, and re-measure: two of the six are worth taking, three are
+measured dead, and one is instrumentation you want before touching this area at all.
+
+### 9.0 The suite numbers everything below is measured against
+
+**Base caveat:** every number in this section was taken with the branch based on the dev commit it
+was developed against. The branch has since been rebuilt onto a later dev, so these describe the
+work, not this exact tree — re-measure before quoting them, especially the gate-off regression,
+which is the one number that could plausibly be dev's rather than ours.
+
+| arm | suite | vs dev |
+|---|---|---|
+| `dev` baseline | 8.704 s | — |
+| this branch, **gate off** | 8.900 / 8.911 s | **+2.2 / +2.4%** |
+| this branch, gate on | 7.626 s | −12.4% |
+| + coverage fix and index walk (§9.1, §9.3) | 7.610 / 7.615 s | −12.6% |
+| + the same with per-column diag enabled | 7.596 s | −12.7% |
+
+Two readings, and the second matters more than anything else in this section:
+
+- The gate-on win is real and reproducible, and the follow-ups added ~13-30 ms to it.
+- **Gate OFF, the branch is 2.2-2.4% SLOWER than `dev`** — ~200 ms, measured twice (8.911 before the
+  follow-ups, 8.900 after), so not noise. **EXPLAINED, and not a defect in the fused path**, which
+  is inert when the gate is off exactly as designed. The cause is a PLAN-SELECTION consequence:
+  this branch lifted the dictionary compressor's historic `1 << 28` row cap, replacing it with the
+  HyperLogLog distinct-fraction gate that addresses the real hazard. Columns in very wide pins
+  (q12's ~276M-row lineitem pin, the 600-900M-row orders pins) used to be forced to raw by that cap
+  and now dictionary-encode instead. With the gate ON that is a large win — the dictionary route is
+  2.1-2.6x at ALL selectivities, which is why it is exempt from the selectivity ceiling. With the
+  gate OFF nothing exploits the codes, so those columns just pay a dictionary decode where identity
+  would have passed the bytes through.
+
+  So the ~200 ms is the price of making the dictionary route available, charged on the arm that
+  cannot use it. Three ways to settle it, in increasing order of how much they claim to know:
+  ship with the gate on and the question disappears; teach plan selection that a dictionary's value
+  is conditional on a consumer, so a wide pin with no consumer keeps identity; or leave the cap
+  lifted and accept the default-path cost while the feature is experimental. What should NOT happen
+  is restoring `1 << 28` as a "sanity bound" — it never was one (see the comment in
+  `dictionary_compressor.cu`), and the cardinality hazard it was credited with is handled by the
+  HLL gate.
+
+### 9.1 Row-filtered tag cleared by an unrelated term — REAL FIX, RE-APPLY
+
+The defect is described in §8's log table: `row_filtered` was ANDed with `!has_external_selection`,
+so a batch whose decode carried the WHOLE filter was still tagged "needs post-decode filtering"
+merely because an extra mask source existed. An extra source only removes more rows; it cannot make
+a surviving row stop satisfying the filter. Coverage is the only correct gate.
+
+Measured: tagged batches **254 → 404** (+150 of 928), each of which then skips a post-decode filter
+evaluation and regains the zero-copy steal, at roughly 0.1 ms/batch. The corrected trace shows
+404 `coverage=true/tagged=true` and 524 `coverage=false/tagged=false`, with **no line where
+coverage is true and the tag is false** — the term is gone.
+
+Worth knowing before re-applying: the analysis that motivated it implied all 928 batches would
+become tagged. They do not. The remaining 524 are untagged for a legitimate and different reason —
+genuine partial coverage (a range that reaches no decoded slot, a dropped conjunct or pair) — so
+the fix is complete even though the number is not what the reasoning predicted.
+
+This is the single highest value/cost item recovered from the campaign: a few lines, and on its own
+arithmetic (150 × 0.1 ms) it accounts for essentially the whole 13 ms that §9.3 was measured
+alongside.
+
+### 9.2 Two analysis-side directions that measured flat or negative — DO NOT REBUILD
+
+**Zone-map join filters into the range ballot (direction 1).** Inert by default and a pessimization
+when forced on: **+131 ms**, concentrated in the DYNAMIC_FILTER-heavy queries (q17 +30, q8 +29,
+q20 +27, q7 +17, q21 +13, q19 +9). Publication is off by default because a zone map only helps when
+build keys correlate with the filter column, and TPC-H keys are scattered — 296 decode-time attaches
+logged `ranges=0`. Direction 1 above keeps the full mechanism analysis, including the correction
+that a range never displaces a probe and that the profitable version belongs on the PUBLISHER side.
+
+**Disjunction → a range hull (direction 2).** Built (a hull over `CONJUNCTION_OR` bounds, coverage
+left false, plus its own test) and measured **flat** — no query moved outside noise. The analysis
+is sound and cannot drop a surviving row; there is simply nothing to win, because the queries it
+targets (q19, q16) spend their time elsewhere. Rebuild only if a workload shows a disjunction over
+a column whose decode is the bottleneck.
+
+### 9.3 The index walk for the dictionary and string decodes — BUILT, SATURATED, LOW VALUE
+
+Both unbuilt points of the enumerator × consumer product were built: `index_list × dict_gather` and
+`index_list × offsets_meta`, taking the product to 9 of 15. The design held up well — the survivor
+walk splits into a prologue and a loop, so each consumer states its per-row sink ONCE and runs under
+either compacting enumerator, and the existing `index_consume` folded into the same seam (it had
+been a third hand-written copy of the walk). Both new points require a Bitpack leaf root; a staged
+root (Delta, RLE cascade) reconstructs the chunk regardless, so render rejects it, the launcher
+returns false and the caller retries the mask walk. That retry matters for `str_split`, whose
+decline path otherwise re-runs the whole batch unfiltered.
+
+Then the attribution, over 5,850 column walks, and it is the reason this is not worth rebuilding
+on its own:
+
+| route | enumerator | walks | why |
+|---|---|---|---|
+| `bitpack_mask` | index list | 4,053 | below the crossover; ALREADY SHIPPED before this work |
+| `delta_mask` | mask bits | 828 | **structural** — a prefix sum cannot row-skip, so `delta_mask × index_list` is not a gap in the product, it is impossible |
+| `bitpack_mask` | mask bits | 540 | above the crossover; the mask walk is the right pick |
+| `dict_codes` | mask bits | 216 | above the crossover — a dictionary output exempts its batch from the selectivity ceiling, so these are the high-selectivity q1-shaped batches |
+| `str_split` | index list | 186 | NEW |
+| `dict_codes` | index list | 27 | NEW |
+
+Zero decline lines, so no requested index walk was ever refused: every mask-bits row is either the
+crossover deciding correctly or delta's prefix sum. **The two new points serve 213 of 5,850 walks
+(3.6%)**, and they were measured together with §9.1, whose mechanism accounts for the delta on its
+own arithmetic — so this work's separate contribution was never isolated and sits inside noise.
+
+The general dictionary route was a genuine gap found while reading the trace, and is worth
+recovering independently of the two new kernels: dual delivery, variable-width and compressed keys
+all decode their CODES through the value path, where the enumeration pick was hard-coded to
+`bitpack_mask`. That region is a bitpack leaf (the site's own op check proves it), so it should
+consult a route predicate like every other pick. On SF1000 that is the path most dictionary columns
+take.
+
+Two lessons worth more than the code:
+
+- **NVRTC caught what review did not.** The index loop's variable collided with a local the
+  dictionary sink declares. A sink is written against `i`/`rank`/`out_base` and declares its own
+  names, so an enumerator's loop variable must stay out of the way — one-letter names in emitted
+  source are a hazard the C++ side never sees.
+- **The in-repo tests cannot cover either new point end to end.** The `[compression]` cases have one
+  dictionary batch and it ANSWERS A PREDICATE, so it never decodes codes compacted; no case produces
+  a `str_split` route at all. The kernels were covered by `test_masked_decode_variants` (index walk
+  vs the mask walk's own output, plus the staged-root rejection) and `render_signature_contract`.
+  Closing the gap needs a case that projects a dictionary or split-string column while filtering on
+  another — the KERNELS are testable in-repo, the PICK is not.
+
+### 9.4 The instrumentation — RE-APPLY FIRST, it is what made the rest checkable
+
+Three diagnostic gaps were closed off-branch. None is on this branch, and each one is the reason a
+question above could be answered at all:
+
+- **`decode_route` has no name function**, so the plan trace prints a column's route as a bare enum
+  — which reads as no information. A `decode_route_name` next to the enum, used by every line that
+  mentions a route, makes the logs greppable and joinable.
+- **No line reports the enumerator a column ACTUALLY used.** The batch line reports the
+  orchestrator's request; every index-walking site may silently keep the mask walk. A per-column
+  line (route, enumerator, and which of the three refusal reasons applied when a requested index
+  walk was declined) is what produced §9.3's table — and it immediately falsified a claim I had made
+  from the batch line, that the `[compression]` cases exercised the dictionary index walk end to
+  end. They do not.
+- **The source-cap decline line** (which cap, which competing source kinds) is what settled
+  direction 4 as dark in a single run.
+
+Cost is trivial and they pay for themselves the first time someone measures this area. The
+per-column line goes to stderr with the other simpatico diag; the route-name change touches the
+sirius-side log lines, which is where the coverage counts already live.
+
+### 9.5 Direction 6 was scoped but not started
+
+No code. The finding is in direction 6 above: `ballot_membership` is three problems wearing one
+name, only the small-in-list one (≤ 12 raw needles) is renderable in an NVRTC plain-CUDA kernel, and
+the rank distribution in an existing log line decides whether that one has a customer. Check before
+building.

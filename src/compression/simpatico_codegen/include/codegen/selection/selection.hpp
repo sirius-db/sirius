@@ -36,10 +36,10 @@ class column;
 
 namespace sirius::codegen {
 
-// Number of rows covered by one CNT chunk (one chunk_offsets entry). Matches
-// the simpatico bitpack chunk (codegen::kChunkSize) and the microbench
-// (scratchpad/fusebench/fusebench.cu): a mask-consuming decode uses
-// chunk_offsets[chunk] as the compacted output base for its chunk.
+// Number of rows covered by one CNT chunk (one chunk_offsets entry). MUST match
+// the simpatico bitpack chunk (codegen::kChunkSize): a mask-consuming decode
+// addresses its packed bits per chunk and uses chunk_offsets[chunk] as that
+// chunk's base in the compacted output, so the two chunkings are the same one.
 inline constexpr int64_t SELECTION_CHUNK_ROWS = 1024;
 
 // 1 bit per row, 1 = survivor. Words are uint32_t, row r -> word r/32, bit r%32.

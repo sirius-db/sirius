@@ -12,10 +12,10 @@
 //   * mask_to_row_indices : mask -> ascending int32 survivor rows (the TierB
 //                         cudf::gather map, built once per batch).
 //
-// Kernel logic is ported from the verified microbench
-// (scratchpad/fusebench/fusebench.cu: k1/cnt/k2a idioms), with CNT re-shaped
-// from its slow one-block-per-chunk form to word-per-thread grid-stride with a
-// warp reduce (a warp's 32 lanes cover exactly one chunk's 32 words).
+// CNT's shape is deliberate and was measured: one block per chunk is the
+// obvious form and the slow one; it is word-per-thread grid-stride with a warp
+// reduce instead, which works because a warp's 32 lanes cover exactly one
+// chunk's 32 mask words.
 //
 // WHY THESE ARE NOT cudf CALLS. cudf has an apparent equivalent for each
 // (bitmask_and, bools_to_mask, segmented_count_set_bits, stream compaction) and
