@@ -313,6 +313,9 @@ namespace {
 struct topology {
   /// 0 = auto: use every GPU visible to topology discovery (CUDA_VISIBLE_DEVICES-aware).
   std::variant<size_t, std::vector<int>> num_gpus_or_gpu_ids{size_t{0}};
+  /// 0 = all active GPUs per query (default). Positive value limits each query to the first
+  /// N entries of the sorted active-GPU list, reserving the rest for future concurrent queries.
+  int gpus_per_query{0};
 
   static void from_yaml(const YAML::Node& node, topology& opt)
   {
@@ -327,6 +330,9 @@ struct topology {
       r.optional("num_gpus", n);
       opt.num_gpus_or_gpu_ids = n;
     }
+    // greater_than{-1} is >= 0: a negative count would otherwise silently read as "use all",
+    // since the admission path treats any non-positive value as unset.
+    r.optional("gpus_per_query", opt.gpus_per_query, yaml::greater_than<int>{-1});
     r.reject_unknown();
   }
 };
@@ -591,6 +597,7 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
     // Topology
     topology topo;
     r.optional("topology", topo);
+    _gpus_per_query = topo.gpus_per_query;
 
     // High-level memory config (mutually exclusive with space config)
     gpu_mem_config gpu_cfg;

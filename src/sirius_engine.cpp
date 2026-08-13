@@ -32,6 +32,7 @@
 #include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"
 #include "pipeline/sirius_plan_printer.hpp"
+#include "planner/gpu_admission.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius/exception.hpp"
@@ -204,19 +205,32 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 
   sirius_physical_plan = &plan;
 
-  // Sorted, deduped active GPU device ids — built the same way task_creator builds its
-  // `_active_gpu_ids` (from the memory manager's GPU spaces) so partition→GPU routing and the
-  // broadcast probe device→slot mapping stay inverse to each other.
-  std::vector<int> active_gpu_ids;
+  std::vector<int> gpu_ids;
   for (auto const* space : sirius_ctx_ptr->get_memory_manager().get_memory_spaces_for_tier(
          cucascade::memory::Tier::GPU)) {
-    if (space != nullptr) { active_gpu_ids.push_back(space->get_device_id()); }
+    if (space != nullptr) { gpu_ids.push_back(space->get_device_id()); }
   }
-  std::sort(active_gpu_ids.begin(), active_gpu_ids.end());
-  active_gpu_ids.erase(std::unique(active_gpu_ids.begin(), active_gpu_ids.end()),
-                       active_gpu_ids.end());
+  std::sort(gpu_ids.begin(), gpu_ids.end());
+  gpu_ids.erase(std::unique(gpu_ids.begin(), gpu_ids.end()), gpu_ids.end());
 
-  // Create plan-time build context (decoupled from engine)
+  // Admit the query here, before anything downstream is built, so that the build context,
+  // partition->GPU routing and the scan round-robin all derive from this one list. Order
+  // matters: task_creator holds it, and create_query later reads it back for scan_manager.
+  auto const full_gpu_count = gpu_ids.size();
+  std::vector<int> active_gpu_ids =
+    planner::apply_gpu_cap(std::move(gpu_ids), sirius_ctx_ptr->get_config().gpus_per_query());
+  sirius_ctx_ptr->get_task_creator().set_active_gpu_ids(active_gpu_ids, full_gpu_count);
+  try {
+    std::string gpu_list;
+    for (auto id : active_gpu_ids) {
+      if (!gpu_list.empty()) { gpu_list += ", "; }
+      gpu_list += std::to_string(id);
+    }
+    SIRIUS_LOG_INFO("[gpu_alloc] query allocated {} GPU(s): [{}]", active_gpu_ids.size(), gpu_list);
+  } catch (...) {  // best-effort observability
+  }
+
+  // Create plan-time build context (decoupled from engine).
   const pipeline::pipeline_build_context build_ctx{
     sirius_ctx_ptr->get_telemetry_context(),
     duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context),
