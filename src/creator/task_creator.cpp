@@ -394,6 +394,13 @@ void task_creator::manager_loop()
           auto input_data = node->get_next_task_input_data();
           auto* pipelineable_input =
             dynamic_cast<op::pipelineable_operator_data*>(input_data.get());
+          // Late-mat (SIRIUS_EXP_LATE_MAT): hand the consuming operator's
+          // port-materialization directive to the task input so
+          // prepare_for_processing can materialize deferred batches. Only ever
+          // non-null when the defer policy installed it (gate on).
+          if (pipelineable_input && node->late_mat_port_directive) {
+            pipelineable_input->late_mat_directive = node->late_mat_port_directive;
+          }
           if (!input_data ||
               (pipelineable_input && pipelineable_input->get_data_batches().empty())) {
             // no data to create task for

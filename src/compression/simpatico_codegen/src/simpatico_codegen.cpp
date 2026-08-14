@@ -247,12 +247,20 @@ compressed_table compress_columns_parallel(cudf::table_view table,
   return out;
 }
 
+}  // namespace
+
 // Restore a decoded column's logical type when it differs from the stored column
 // dtype only in interpretation of identical bits (same physical width) — e.g. the
 // INT64 storage a codec produced for a DECIMAL64 column back to DECIMAL64 with its
 // scale. The codecs run on the underlying integer storage of fixed-point columns,
 // so the bytes are already correct; this only re-tags the column. A no-op when the
 // types already match.
+//
+// EXTERNAL linkage (declared in codegen/plan/row_decode.hpp): the late-mat
+// column-level materialize path must apply the same re-tag the table-level
+// decompress overloads apply internally — skipping it drops decimal scales
+// (values silently x10^-scale). Unqualified intra-file callers keep resolving
+// here via enclosing-namespace lookup.
 std::unique_ptr<cudf::column> apply_stored_dtype(std::unique_ptr<cudf::column> col,
                                                  cudf::data_type stored)
 {
@@ -269,6 +277,8 @@ std::unique_ptr<cudf::column> apply_stored_dtype(std::unique_ptr<cudf::column> c
   return std::make_unique<cudf::column>(
     stored, n, std::move(*contents.data), std::move(null_mask), nc, std::move(contents.children));
 }
+
+namespace {
 
 std::unique_ptr<cudf::table> decompress_columns_parallel(compressed_table const& table,
                                                          stream_pool& pool,

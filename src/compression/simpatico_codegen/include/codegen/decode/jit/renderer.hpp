@@ -84,10 +84,23 @@ namespace codegen::decode::jit {
 // point, and a prefix sum cannot row-skip.  `dict_gather` requires a Bitpack
 // code leaf; `offsets_meta` a Bitpack- or Delta-rooted offsets subtree, so the
 // next chunk's first offset can be peeked from per-chunk scalars.
+//
+// `chunk_csr` is the late-materialization (SIRIUS_EXP_LATE_MAT) K8-family
+// enumerator: the row selection arrives as a chunk-bucketed CSR
+// (codegen/selection/row_set.hpp) and the launch grid is the TOUCHED-chunk
+// list, not every chunk — block b serves chunk `chunk_list[b]`, its survivors
+// are the uint16 in-chunk positions at in_chunk_offsets[out_offsets[b] ..
+// out_offsets[b+1]) (out_offsets is indexed by BLOCK), and compacted output
+// starts at out_offsets[b].  With `write_column` it is COMPOSITIONAL (any
+// value_source-supported root; Bitpack closed-form = true random access,
+// Delta/RLE/FOR stage the chunk in-SM and store survivors only); with
+// `dict_gather` it requires a Bitpack code leaf; with `offsets_meta` a
+// Bitpack- or Delta-rooted offsets subtree (the next-chunk peek).
 enum class Enumerator : std::uint8_t {
   all_rows = 0,  ///< every row of the chunk (full-width decode)
   mask_bits,     ///< survivors of a selection mask, compacted by rank
   index_list,    ///< an ascending survivor row-id list, compacted by slot
+  chunk_csr,     ///< late-mat sparse grid: CSR survivors over touched chunks only
 };
 
 enum class Consumer : std::uint8_t {
@@ -111,6 +124,10 @@ inline constexpr DecodeShape kShapeMaskConsume{Enumerator::mask_bits, Consumer::
 inline constexpr DecodeShape kShapeIndexConsume{Enumerator::index_list, Consumer::write_column};
 inline constexpr DecodeShape kShapeDictGather{Enumerator::mask_bits, Consumer::dict_gather};
 inline constexpr DecodeShape kShapeStrSplitMeta{Enumerator::mask_bits, Consumer::offsets_meta};
+// Late-materialization sparse-grid points (K8 family; latemat_launch.hpp).
+inline constexpr DecodeShape kShapeSparseConsume{Enumerator::chunk_csr, Consumer::write_column};
+inline constexpr DecodeShape kShapeSparseDictGather{Enumerator::chunk_csr, Consumer::dict_gather};
+inline constexpr DecodeShape kShapeSparseStrMeta{Enumerator::chunk_csr, Consumer::offsets_meta};
 
 /// False for product points with no meaning or no renderer support — e.g.
 /// re-ballotting only the survivors of an existing mask.  Render rejects these
@@ -142,15 +159,18 @@ struct DecodeBufferSpec {
 // travel as kernel ARGUMENTS, never rendered into the source, so one compile
 // per (shape, dtype, variant) serves every literal).
 enum class TrailingParam : std::uint8_t {
-  pred_lo = 0,    // mask_out: inclusive range low, decoded integer domain
-  pred_hi,        // mask_out: inclusive range high
-  sel_mask,       // mask_consume / dict_gather / str_split_meta: mask words in
-  chunk_offsets,  // consuming variants: per-chunk exclusive survivor bases
-  keys_chars,     // mask_dict_gather: constant-width key pool chars
-  key_width,      // mask_dict_gather: bytes per key
-  row_indices,    // index_consume: ascending global int32 survivor row ids
-  len_out,        // str_split_meta: per-survivor byte lengths (output)
-  kCount          // sentinel: size of a tag-indexed table
+  pred_lo = 0,       // mask_out: inclusive range low, decoded integer domain
+  pred_hi,           // mask_out: inclusive range high
+  sel_mask,          // mask_consume / dict_gather / str_split_meta: mask words in
+  chunk_offsets,     // consuming variants: per-chunk exclusive survivor bases
+  keys_chars,        // mask_dict_gather: constant-width key pool chars
+  key_width,         // mask_dict_gather: bytes per key
+  row_indices,       // index_consume: ascending global int32 survivor row ids
+  len_out,           // str_split_meta: per-survivor byte lengths (output)
+  chunk_list,        // chunk_csr: touched batch-local chunk ids (one per BLOCK)
+  out_offsets,       // chunk_csr: per-touched-chunk exclusive survivor offsets (T+1)
+  in_chunk_offsets,  // chunk_csr: uint16 in-chunk positions grouped by touched chunk
+  kCount             // sentinel: size of a tag-indexed table
 };
 
 // Rendering result.  Move-only; cheap (no GPU resources).  Hand

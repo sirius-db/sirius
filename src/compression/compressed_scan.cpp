@@ -23,7 +23,9 @@
 
 #include <api/simpatico_codegen.hpp>
 #include <codegen/selection/selection.hpp>
+#include <codegen/selection/selection_capture.hpp>
 #include <codegen/util/stream_pool.hpp>
+#include <late_mat/column_origin.hpp>
 #include <log/logging.hpp>
 
 #include <algorithm>
@@ -394,6 +396,27 @@ std::unique_ptr<cudf::table> decode_with_filters(simpatico::compressed_table con
   // them. On any other outcome the equality answers come from the plain
   // predicated rerun, which drops no rows.
   outcome.predicates_enforced = result.applied && !wave_request.bool8_filters.empty();
+  // Late-mat wave-seam capture (SIRIUS_EXP_LATE_MAT; gated on status ==
+  // applied, NOT on the row_filtered outcome): `applied` is the decoder's
+  // promise that EVERY emitted column is compacted to exactly survivor_count
+  // rows, so the wave-1 selection still describes the batch as emitted —
+  // including membership-compacted and partial-coverage batches that stay
+  // un-row_filtered by design. A RULE-2 bail / refusal / failure never
+  // captures (their status is never `applied`; the helper re-checks).
+  // `range` is left zeroed — the scan side fills it from the split's origin
+  // at harvest. The helper set_stream-rebinds each moved buffer and leaves
+  // result's scalar fields intact (the DIAG line below stays valid).
+  if (request.capture_selection && result.status == sirius::codegen::scan_filter_status::applied) {
+    auto cap = sirius::codegen::capture_scan_filter_selection(std::move(result), stream);
+    if (cap) {
+      auto sel                   = std::make_shared<late_mat::row_selection>();
+      sel->kind                  = late_mat::row_selection_kind::mask;
+      sel->mask_words            = std::move(cap.mask_words);
+      sel->chunk_offsets         = std::move(cap.chunk_offsets);
+      sel->survivor_count        = cap.survivor_count;
+      outcome.captured_selection = std::move(sel);
+    }
+  }
   SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
     "[decode-filter] decode {} (status={} generation={}): ranges={} equalities={} "
     "join_filters={} survivors={}/{} column(s)={} covers_whole_filter={} row_filtered={} "
@@ -428,6 +451,13 @@ std::shared_ptr<const compressed_scan> compressed_scan::without_row_selection() 
   }
   if (narrowed.empty()) { return nullptr; }
   return std::make_shared<const compressed_scan>(std::move(narrowed));
+}
+
+std::shared_ptr<const compressed_scan> compressed_scan::with_selection_capture() const
+{
+  scan_decode_request copy = _request;
+  copy.capture_selection   = true;
+  return std::make_shared<const compressed_scan>(std::move(copy));
 }
 
 std::shared_ptr<const compressed_scan> compressed_scan::with_membership_probes(

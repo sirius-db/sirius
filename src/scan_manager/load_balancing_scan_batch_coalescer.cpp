@@ -182,6 +182,7 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(databatch_provid
         split->needs_carrier_conversion     = next.needs_carrier_conversion;
         split->conversion_destination_bytes = next.conversion_destination_bytes;
         split->row_filter_pending           = row_filter_pending;
+        split->late_mat_origin              = std::move(next.late_mat_origin);
         connector.push_split(std::move(split));
         continue;
       }

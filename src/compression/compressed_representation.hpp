@@ -206,6 +206,19 @@ class compressed_host_representation : public cucascade::idata_representation {
     return _decode_scan;
   }
 
+  /// Late-materialization capture request (SIRIUS_EXP_LATE_MAT, additive):
+  /// call on a freshly projected per-query representation (same ownership
+  /// rule as set_decode_scan — NEVER the shared pinned chunk). Installs a
+  /// capture-flagged copy of the decode scan, so an applied fused decode
+  /// moves its wave-1 selection buffers onto
+  /// decode_outcome::captured_selection instead of freeing them. No-op
+  /// without a decode scan: with no request there is no wave-1 selection to
+  /// capture.
+  void request_selection_capture() noexcept
+  {
+    if (_decode_scan) { _decode_scan = _decode_scan->with_selection_capture(); }
+  }
+
  private:
   /// Construct a projection sharing the same backing blob.
   compressed_host_representation(cucascade::memory::memory_space& memory_space,
@@ -308,6 +321,19 @@ class compressed_device_representation : public cucascade::idata_representation 
   [[nodiscard]] std::shared_ptr<const compressed_scan> const& decode_scan() const noexcept
   {
     return _decode_scan;
+  }
+
+  /// Late-materialization capture request (SIRIUS_EXP_LATE_MAT, additive):
+  /// call on a freshly projected per-query representation (same ownership
+  /// rule as set_decode_scan — NEVER the shared pinned chunk). Installs a
+  /// capture-flagged copy of the decode scan, so an applied fused decode
+  /// moves its wave-1 selection buffers onto
+  /// decode_outcome::captured_selection instead of freeing them. No-op
+  /// without a decode scan: with no request there is no wave-1 selection to
+  /// capture.
+  void request_selection_capture() noexcept
+  {
+    if (_decode_scan) { _decode_scan = _decode_scan->with_selection_capture(); }
   }
 
  private:

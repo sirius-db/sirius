@@ -59,6 +59,7 @@
 #include "op/sirius_physical_top_n_merge.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
+#include "planner/late_mat_plan_pass.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_config.hpp"
@@ -1059,6 +1060,11 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   // `_parent_op` from the final tree for the tree-parent-lookup wiring.
   insert_gpu_pipeline_operators(plan);
   set_parent_ops(*plan, /*parent=*/nullptr);
+
+  // Late-mat v2 (SIRIUS_EXP_LATE_MAT_V2, default off): column-lifetime pass
+  // over the finished tree; stamps planned_deferral annotations the lowering
+  // backend consumes at query prepare. Single gate check when off.
+  planner::run_late_mat_plan_pass(*plan);
 
   return plan;
 }

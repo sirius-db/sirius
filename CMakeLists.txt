@@ -238,6 +238,8 @@ set(EXTENSION_SOURCES
     src/compression/compressed_scan.cpp
     src/compression/compression_converters.cpp
     src/compression/plan_register.cpp
+    src/late_mat/late_materializer.cpp
+    src/late_mat/rowid_emission.cpp
     src/config.cpp
     src/helper/numeric_narrowing.cpp
     src/helper/type_conversions.cpp
@@ -296,6 +298,7 @@ set(EXTENSION_SOURCES
     src/log/noop_sink.cpp
     src/log/spdlog_owning_sink.cpp
     src/memory/defragmenter_oom_policy.cpp
+    src/memory/pinned_reservation_guard.cpp
     src/memory/sirius_memory_reservation_manager.cpp
     src/op/aggregate/aggregate_op_util.cpp
     src/op/aggregate/gpu_aggregate_impl.cpp
@@ -337,6 +340,7 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_grouped_aggregate_merge.cpp
     src/op/sirius_physical_hash_join.cpp
     src/op/sirius_physical_limit.cpp
+    src/op/late_mat_port_materialize.cpp
     src/op/sirius_physical_merge_sort.cpp
     src/op/sirius_physical_nested_loop_join.cpp
     src/op/sirius_physical_operator.cpp
@@ -365,6 +369,7 @@ set(EXTENSION_SOURCES
     src/planner/duckdb_join_filter_candidate_adapter.cpp
     src/planner/query.cpp
     src/planner/query_index.cpp
+    src/planner/late_mat_plan_pass.cpp
     src/planner/sirius_physical_plan_generator.cpp
     src/planner/sirius_plan_aggregate.cpp
     src/planner/sirius_plan_column_data_get.cpp
@@ -386,6 +391,8 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_recursive_cte.cpp
     src/planner/sirius_plan_top_n.cpp
     src/pin_table.cpp
+    src/scan_manager/late_mat_defer_policy.cpp
+    src/scan_manager/late_mat_resolver.cpp
     src/scan_manager/load_balancing_scan_batch_coalescer.cpp
     src/scan_manager/insert_delta_job.cpp
     src/scan_manager/mvcc_mask_job.cpp
@@ -691,6 +698,7 @@ set(TEST_SOURCES
     test/cpp/io/test_uri_parser.cpp
     test/cpp/io/uring/test_uring_readv.cpp
     test/cpp/io/rest/test_rest_reactor.cpp
+    test/cpp/late_mat/test_late_materializer.cpp
     test/cpp/log/test_duckdb_sink.cpp
     test/cpp/log/test_logging.cpp
     test/cpp/scan_manager/test_s3_routing_cutover.cpp
@@ -705,6 +713,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_mgpu_stress.cpp
     test/cpp/operator/test_partition_memspace_mgpu.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
+    test/cpp/memory/test_pinned_reservation_guard.cpp
     test/cpp/memory/test_topology_index.cpp
     test/cpp/operator/test_build_probe_scheduling.cpp
     test/cpp/operator/test_cross_schedule.cpp
@@ -831,6 +840,11 @@ target_include_directories(
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test/cpp>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+    # Fused scan-filter + late-mat: scan headers include
+    # codegen/selection/selection.hpp and the late_mat unit tests pull
+    # simpatico's codegen/selection/row_set.hpp, so every target compiling them
+    # needs the simpatico include root.
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/compression/simpatico_codegen/include>
     $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
 )
 

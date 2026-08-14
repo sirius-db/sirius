@@ -22,12 +22,17 @@
 #include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
 #include "io/io_context.hpp"
+#include "late_mat/column_origin.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
 
+#include <cudf/reduction.hpp>
+#include <cudf/reduction/unique_count.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/sorting.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/traits.hpp>
@@ -163,6 +168,121 @@ using pin_batch_sink =
                      std::vector<pinned_column_storage_meta> column_storage,
                      std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats)>;
 
+/// Opt-in pin-time exact uniqueness probe (SIRIUS_LATE_MAT_PIN_UNIQUE_COLS,
+/// late-mat group-by-rowid prerequisite). A column is proven unique iff every
+/// chunk is internally sorted-ascending with chunk-distinct == chunk-rows AND
+/// chunk boundaries are strictly increasing — which composes to a globally
+/// strictly-sorted (hence unique) column with only per-chunk GPU work at pin
+/// time. Restricted to non-null integer-typed columns; anything else simply
+/// records no fact (absence = unknown, never "not unique"). Approximate
+/// counting is deliberately not offered — the consumer is a correctness
+/// transform.
+class pin_unique_probe {
+ public:
+  explicit pin_unique_probe(std::span<std::string const> column_names)
+  {
+    // Column selection shared with the exact-count fallback
+    // (late_mat::pin_unique_probe_columns) so the two stages can never track
+    // different sets. Both env forms are accepted there ("c1,c2" or
+    // "1"/"all"/"*").
+    for (auto const col : late_mat::pin_unique_probe_columns(column_names)) {
+      _tracks.push_back({col});
+    }
+    char const* env    = std::getenv("SIRIUS_LATE_MAT_PIN_UNIQUE_COLS");
+    bool const env_set = env != nullptr && env[0] != '\0';
+    if (env_set && late_mat::late_mat_enabled() && _tracks.empty()) {
+      // A set-but-unmatched value must be VISIBLE — a silent miss here cost a
+      // whole measurement window once.
+      SIRIUS_LOG_WARN(
+        "[late_mat] SIRIUS_LATE_MAT_PIN_UNIQUE_COLS='{}' matched no pinned column of this "
+        "table (names are comma-separated, case-sensitive; '1'/'all' probes every column)",
+        env);
+    } else if (!_tracks.empty()) {
+      SIRIUS_LOG_INFO("[late_mat] pin uniqueness probe armed for {} pinned column(s)",
+                      _tracks.size());
+    }
+  }
+
+  void observe(cudf::table_view const& batch, rmm::cuda_stream_view stream)
+  {
+    for (auto& t : _tracks) {
+      if (!t.viable) { continue; }
+      if (t.col >= static_cast<std::uint32_t>(batch.num_columns())) {
+        t.viable = false;
+        continue;
+      }
+      auto const col = batch.column(static_cast<cudf::size_type>(t.col));
+      if (col.size() == 0) { continue; }
+      std::int64_t lo = 0;
+      std::int64_t hi = 0;
+      if (col.null_count() > 0 || !integer_minmax(col, stream, lo, hi)) {
+        t.viable = false;
+        continue;
+      }
+      bool const sorted =
+        cudf::is_sorted(cudf::table_view({col}), {cudf::order::ASCENDING}, {}, stream);
+      // unique_count counts CONSECUTIVE distinct runs — exact distinct count
+      // given the sortedness check above (the precondition this probe already
+      // requires), with no hash table.
+      auto const distinct =
+        cudf::unique_count(col, cudf::null_policy::EXCLUDE, cudf::nan_policy::NAN_IS_VALID);
+      if (!sorted || distinct != col.size() || (t.have_prev && lo <= t.prev_max)) {
+        t.viable = false;
+        continue;
+      }
+      t.prev_max  = hi;
+      t.have_prev = true;
+    }
+  }
+
+  [[nodiscard]] std::vector<std::uint32_t> finalize() const
+  {
+    std::vector<std::uint32_t> out;
+    for (auto const& t : _tracks) {
+      if (t.viable && t.have_prev) { out.push_back(t.col); }
+    }
+    return out;
+  }
+
+ private:
+  static bool integer_minmax(cudf::column_view const& col,
+                             rmm::cuda_stream_view stream,
+                             std::int64_t& lo,
+                             std::int64_t& hi)
+  {
+    auto const mm = cudf::minmax(col, stream, rmm::mr::get_current_device_resource_ref());
+    switch (col.type().id()) {
+      case cudf::type_id::INT32:
+        lo = static_cast<cudf::numeric_scalar<std::int32_t> const&>(*mm.first).value(stream);
+        hi = static_cast<cudf::numeric_scalar<std::int32_t> const&>(*mm.second).value(stream);
+        return true;
+      case cudf::type_id::INT64:
+        lo = static_cast<cudf::numeric_scalar<std::int64_t> const&>(*mm.first).value(stream);
+        hi = static_cast<cudf::numeric_scalar<std::int64_t> const&>(*mm.second).value(stream);
+        return true;
+      case cudf::type_id::UINT32:
+        lo = static_cast<cudf::numeric_scalar<std::uint32_t> const&>(*mm.first).value(stream);
+        hi = static_cast<cudf::numeric_scalar<std::uint32_t> const&>(*mm.second).value(stream);
+        return true;
+      case cudf::type_id::UINT64:
+        lo = static_cast<std::int64_t>(
+          static_cast<cudf::numeric_scalar<std::uint64_t> const&>(*mm.first).value(stream));
+        hi = static_cast<std::int64_t>(
+          static_cast<cudf::numeric_scalar<std::uint64_t> const&>(*mm.second).value(stream));
+        return true;
+      default: return false;
+    }
+  }
+
+  struct track {
+    std::uint32_t col;
+    bool viable{true};
+    bool have_prev{false};
+    std::int64_t prev_max{0};
+  };
+  std::vector<track> _tracks;
+};
+
 struct narrowed_pin_chunk {
   std::unique_ptr<cudf::table> table;
   std::vector<bool> columns;
@@ -205,12 +325,13 @@ narrowed_pin_chunk narrow_pin_chunk(std::unique_ptr<cudf::table> table,
 /// placement means re-pinning the same source yields identical placement (required by
 /// insert_pinned_entry's merge path on the GPU tier) and bounds peak GPU residency to ~one batch
 /// (the host tier frees each table in @p on_batch before the next is materialized).
-void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
-                             std::span<cucascade::memory::memory_space* const> gpu_spaces,
-                             io::sirius_ioctx& io_ctx,
-                             duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
-                             pin_materialization_options options,
-                             const pin_batch_sink& on_batch)
+std::vector<std::uint32_t> materialize_pin_batches(
+  op::scan::gpu_ingestible& ingestible,
+  std::span<cucascade::memory::memory_space* const> gpu_spaces,
+  io::sirius_ioctx& io_ctx,
+  duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
+  pin_materialization_options options,
+  const pin_batch_sink& on_batch)
 {
   if (gpu_spaces.empty()) {
     throw std::invalid_argument("[materialize_pin_batches] gpu_spaces must be non-empty");
@@ -236,6 +357,9 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
   auto io_ctx_sp = io_ctx.shared_from_this();
 
   auto coalescer = ingestible.create_batch_coalescer();
+
+  // Late-mat uniqueness probe (opt-in, no-op unless env-listed columns match).
+  pin_unique_probe unique_probe(ingestible.table_info().column_names());
 
   // Rows materialized so far, in emission order — feeds the chunk-contiguity
   // validation (duckdb-native pins only).
@@ -286,6 +410,11 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
       chunk_stats = scan_manager::compute_pinned_chunk_stats(
         tbl->view(), pinned_column_types, stream, target->get_default_allocator());
     }
+    // Late-mat uniqueness probe observes the NATIVE table, before any
+    // narrowing: the fact describes the column's values (invariant under
+    // the same-family narrowing below), and the probe's type dispatch
+    // reads the native carrier.
+    unique_probe.observe(tbl->view(), stream);
     if (options.enable_compressed_materialization) {
       auto narrowed = narrow_pin_chunk(
         std::move(tbl), pinned_column_types, stream, target->get_default_allocator());
@@ -317,6 +446,7 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
   for (auto& b : coalescer->flush()) {
     handle_batch(std::move(b));
   }
+  return unique_probe.finalize();
 }
 
 // Streams for cross-column encode parallelism, one pool per thread and device —
@@ -451,7 +581,7 @@ materialized_pin materialize_all_batches(
   pin_materialization_options options)
 {
   materialized_pin out;
-  materialize_pin_batches(
+  out.unique_columns = materialize_pin_batches(
     ingestible,
     gpu_spaces,
     io_ctx,
@@ -487,7 +617,7 @@ host_pin_result materialize_pin_to_host(
   host_pin_result out;
   bool compression_failed = false;
 
-  materialize_pin_batches(
+  out.unique_columns = materialize_pin_batches(
     ingestible,
     gpu_spaces,
     io_ctx,
@@ -599,7 +729,7 @@ device_pin_result materialize_all_batches_compressed(
   // capture would be computed and dropped — force it off.
   options.capture_chunk_stats = false;
 
-  materialize_pin_batches(
+  out.unique_columns = materialize_pin_batches(
     ingestible,
     gpu_spaces,
     io_ctx,

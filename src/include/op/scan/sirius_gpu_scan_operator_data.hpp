@@ -40,6 +40,11 @@ namespace sirius::op {
 class sirius_dynamic_filter_set;  // membership channel (op/sirius_dynamic_filter.hpp)
 }
 
+namespace sirius::late_mat {
+struct scan_batch_origin;  // late_mat/column_origin.hpp
+struct row_selection;      // late_mat/column_origin.hpp
+}  // namespace sirius::late_mat
+
 namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
@@ -234,6 +239,19 @@ class scan_operator_input : public op::operator_data {
   /// consumption (scan-internal OOM retry) must fail loudly rather than
   /// serve the emptied wrapper batch as zero rows.
   mutable bool stolen_table_consumed{false};
+  /// Late-mat origin stamp (SIRIUS_EXP_LATE_MAT), copied from the provider
+  /// batch by drain_cached_provider: the served pinned chunk's per-column
+  /// origins + its global row span in pin order. The scan's execute() attaches
+  /// it to the output batch (dense selection) when the output demonstrably
+  /// still covers the whole chunk (row-count guard). Always empty when the
+  /// gate is off — one inert shared_ptr, no behavior change.
+  std::shared_ptr<const late_mat::scan_batch_origin> late_mat_origin;
+  /// Late-mat wave-seam capture harvest (SIRIUS_EXP_LATE_MAT): the fused
+  /// decode's survivor selection (kind=mask, range filled from
+  /// late_mat_origin), moved off the row_filtered representation by
+  /// prepare_for_processing. Non-null only for decode_row_filtered splits of
+  /// an origin-stamped scan whose converter ran the capture.
+  std::shared_ptr<const late_mat::row_selection> late_mat_selection;
   /// True when scan normalization will cast at least one selected column of this resident cached
   /// split. Stamped by drain_cached_provider from databatch_provider::batch, which owns the
   /// definition.
