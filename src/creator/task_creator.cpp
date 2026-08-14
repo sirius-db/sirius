@@ -77,25 +77,35 @@ task_creator::task_creator(task_creator_config config,
   // manager order, not sorted order) so partition affinity below stays inverse
   // to sirius_physical_partition's device->slot mapping.
   if (_topology_index) {
-    auto ids        = _topology_index->gpu_ids();
-    _active_gpu_ids = std::vector<int>(ids.begin(), ids.end());
-    std::sort(_active_gpu_ids.begin(), _active_gpu_ids.end());
-    _active_gpu_ids.erase(std::unique(_active_gpu_ids.begin(), _active_gpu_ids.end()),
-                          _active_gpu_ids.end());
+    auto ids         = _topology_index->gpu_ids();
+    _default_gpu_ids = std::vector<int>(ids.begin(), ids.end());
+    std::sort(_default_gpu_ids.begin(), _default_gpu_ids.end());
+    _default_gpu_ids.erase(std::unique(_default_gpu_ids.begin(), _default_gpu_ids.end()),
+                           _default_gpu_ids.end());
   }
 }
 
 task_creator::~task_creator() { stop(); }
 
-void task_creator::set_active_gpu_ids(std::vector<int> ids, std::size_t full_count)
+void task_creator::set_active_gpu_ids(sirius::query_id_t query_id,
+                                      std::vector<int> ids,
+                                      std::size_t full_count)
 {
-  _active_gpu_ids = std::move(ids);
-  _full_gpu_count = full_count;
+  auto state = get_query_task_global_state(query_id);
+  if (!state) {
+    throw sirius::internal_exception(
+      "task_creator::set_active_gpu_ids: no state registered for query {}; "
+      "set_client_context must run first (execution-window begin)",
+      query_id);
+  }
+  state->active_gpu_ids = std::move(ids);
+  state->full_gpu_count = full_count;
 }
 
-const std::vector<int>& task_creator::get_active_gpu_ids() const noexcept
+std::vector<int> task_creator::get_active_gpu_ids(sirius::query_id_t query_id) const
 {
-  return _active_gpu_ids;
+  if (auto state = get_query_task_global_state(query_id)) { return state->active_gpu_ids; }
+  return _default_gpu_ids;
 }
 
 std::shared_ptr<task_creator::query_task_global_state> task_creator::get_query_task_global_state(
@@ -113,7 +123,14 @@ void task_creator::set_client_context(sirius::query_id_t query_id,
   // The window begins before the plan exists, so this is where the query's entry is created;
   // prepare_for_query then fills in the pipeline global states.
   auto& state = _query_task_global_states[query_id];
-  if (!state) { state = std::make_shared<query_task_global_state>(); }
+  if (!state) {
+    state = std::make_shared<query_task_global_state>();
+    // Seed the admission default: a query that never narrows (no
+    // set_active_gpu_ids call) runs on every executor, exactly as before
+    // per-query admission existed.
+    state->active_gpu_ids = _default_gpu_ids;
+    state->full_gpu_count = _default_gpu_ids.size();
+  }
   state->client_context = std::addressof(client_context);
 }
 
@@ -681,12 +698,13 @@ void task_creator::manager_loop()
               // partitions across GPUs.
               if (auto* partitioned =
                     dynamic_cast<op::partitioned_operator_data*>(pipelineable_input);
-                  !preferred_device_id.has_value() && partitioned && !_active_gpu_ids.empty()) {
+                  !preferred_device_id.has_value() && partitioned &&
+                  !query_state->active_gpu_ids.empty()) {
                 // Index the active executor set so every task of a partition lands
                 // on the same real GPU (required for cuco tables); the physical
                 // topology would yield phantom pins when num_gpus < physical count.
-                auto idx            = partitioned->get_partition_idx() % _active_gpu_ids.size();
-                preferred_device_id = _active_gpu_ids[idx];
+                auto idx = partitioned->get_partition_idx() % query_state->active_gpu_ids.size();
+                preferred_device_id = query_state->active_gpu_ids[idx];
               }
               if (!preferred_device_id.has_value() && pipelineable_input &&
                   !pipelineable_input->get_data_batches().empty()) {
@@ -790,16 +808,16 @@ void task_creator::manager_loop()
               // escapes too: the scheduler gives those to whichever executor asks first. Pin
               // those as well, but only on a real subset, since a pin costs the scheduler's
               // freedom to place them wherever frees up first.
-              if (!_active_gpu_ids.empty()) {
+              if (auto const& admitted = query_state->active_gpu_ids; !admitted.empty()) {
                 bool const names_excluded_device =
                   preferred_device_id.has_value() &&
-                  std::find(_active_gpu_ids.begin(), _active_gpu_ids.end(), *preferred_device_id) ==
-                    _active_gpu_ids.end();
+                  std::find(admitted.begin(), admitted.end(), *preferred_device_id) ==
+                    admitted.end();
                 bool const unpinned_on_a_subset =
-                  !preferred_device_id.has_value() && _active_gpu_ids.size() < _full_gpu_count;
+                  !preferred_device_id.has_value() && admitted.size() < query_state->full_gpu_count;
                 if (names_excluded_device || unpinned_on_a_subset) {
-                  auto const idx      = _admission_rr.fetch_add(1) % _active_gpu_ids.size();
-                  preferred_device_id = _active_gpu_ids[idx];
+                  auto const idx      = _admission_rr.fetch_add(1) % admitted.size();
+                  preferred_device_id = admitted[idx];
                 }
               }
               if (preferred_device_id.has_value()) {

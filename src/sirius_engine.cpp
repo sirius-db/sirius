@@ -227,7 +227,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   auto const full_gpu_count = gpu_ids.size();
   std::vector<int> active_gpu_ids =
     planner::apply_gpu_cap(std::move(gpu_ids), sirius_ctx_ptr->get_config().gpus_per_query());
-  sirius_ctx_ptr->get_task_creator().set_active_gpu_ids(active_gpu_ids, full_gpu_count);
+  sirius_ctx_ptr->get_task_creator().set_active_gpu_ids(query_id_, active_gpu_ids, full_gpu_count);
   try {
     std::string gpu_list;
     for (auto id : active_gpu_ids) {

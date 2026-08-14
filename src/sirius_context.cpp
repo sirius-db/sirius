@@ -1198,7 +1198,7 @@ duckdb::shared_ptr<sirius::planner::query> SiriusContext::create_query(
   // initialize_internal has set it — otherwise scan_manager gets the full topology list.
   scan_manager_->prepare_for_query(*query,
                                    config_.get_operator_params().enable_pinned_zone_map_pruning,
-                                   task_creator_->get_active_gpu_ids());
+                                   task_creator_->get_active_gpu_ids(query_id));
   return query;
 }
 

@@ -119,15 +119,21 @@ class task_creator {
   task_creator(task_creator&&)                 = delete;
   task_creator& operator=(task_creator&&)      = delete;
 
-  /// \brief Narrow this query to a GPU subset, replacing the constructor's topology-derived
-  /// list. Called once per query by sirius_engine::initialize_internal.
+  /// \brief Narrow @p query_id to a GPU subset, replacing the topology-derived
+  /// default its state was seeded with. Called once per query by
+  /// sirius_engine::initialize_internal, after set_client_context registered
+  /// the state and before the query's first schedule().
   ///
   /// @param full_count how many GPUs existed before narrowing. Passed in rather than inferred
   /// so it and @p ids are cut from the same list.
-  void set_active_gpu_ids(std::vector<int> ids, std::size_t full_count);
+  void set_active_gpu_ids(sirius::query_id_t query_id,
+                          std::vector<int> ids,
+                          std::size_t full_count);
 
-  /// \brief The GPU subset this query was admitted onto.
-  [[nodiscard]] const std::vector<int>& get_active_gpu_ids() const noexcept;
+  /// \brief The GPU subset @p query_id was admitted onto (by value: the state
+  /// entry can be reset concurrently by another connection's cleanup).
+  /// The topology-derived default when the query is unknown or un-narrowed.
+  [[nodiscard]] std::vector<int> get_active_gpu_ids(sirius::query_id_t query_id) const;
 
   /// \brief Bind @p query_id to the connection that is running it.
   /// Called at execution-window begin, before prepare_for_query.
@@ -339,6 +345,19 @@ class task_creator {
     std::size_t index_of_next_lookahead{0};
     std::vector<op::sirius_physical_operator*> lookahead_queue;
 
+    //! The GPU subset THIS query was admitted onto (sorted, deduped), seeded
+    //! from the creator's topology-derived default at registration and
+    //! narrowed by set_active_gpu_ids at admission. Per query: on a shared
+    //! creator, a member would let one query's narrowing clamp another
+    //! query's tasks onto GPUs it was never admitted to. Written before the
+    //! query's first schedule() and read-only afterwards, so the creation
+    //! workers read it with no lock, holding only their state shared_ptr.
+    std::vector<int> active_gpu_ids;
+    //! GPU count before this query was narrowed (from the same list the
+    //! admitted set was cut from); active_gpu_ids.size() < this means the
+    //! query runs on a strict subset.
+    std::size_t full_gpu_count{0};
+
     // (In-flight creation work is tracked by the pool itself, keyed by the query the slot is
     // attached to; see bounded_thread_pool::drain_and_wait. The bespoke counter that used to live
     // here duplicated that accounting and had to be kept in sync by hand across every exit path.)
@@ -388,14 +407,15 @@ class task_creator {
   /// sharing one counter advances it twice per task: against an even subset size the stride
   /// never changes parity and every clamped task lands on the same GPU.
   std::atomic<uint64_t> _admission_rr{0};
-  /// Sorted, deduped GPU device ids this query is admitted onto: every executor at
-  /// construction, narrowed per query by `set_active_gpu_ids()`. Partition affinity indexes
-  /// it (`_active_gpu_ids[partition_idx % size]`) and must stay in the same sorted order
-  /// sirius_physical_partition uses for its device->slot map, so the two stay inverse.
-  std::vector<int> _active_gpu_ids;
-  /// GPU count before this query was narrowed, from the same list the admitted set was cut
-  /// from; `_active_gpu_ids.size() < this` means the query is on a strict subset.
-  std::size_t _full_gpu_count{0};
+  /// Sorted, deduped GPU device ids of every executor, materialized from the
+  /// topology at construction. The DEFAULT each query's per-state
+  /// `active_gpu_ids` is seeded with at registration (set_client_context);
+  /// admission then narrows the query's own copy — never this list, which a
+  /// shared creator must keep stable across concurrent queries. Partition
+  /// affinity indexes the per-query copy (`active_gpu_ids[partition_idx %
+  /// size]`) and must stay in the same sorted order sirius_physical_partition
+  /// uses for its device->slot map, so the two stay inverse.
+  std::vector<int> _default_gpu_ids;
 };
 
 }  // namespace sirius::creator
