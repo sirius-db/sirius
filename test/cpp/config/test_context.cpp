@@ -44,10 +44,12 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <set>
 #include <source_location>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -613,6 +615,88 @@ TEST_CASE("Sirius configuration keeps task creation policy internal", "[sirius][
       Catch::Contains("sirius.executor.task_creator.priority_order") &&
         Catch::Contains("removed") && Catch::Contains("remove this key"));
     CHECK(config.get_task_creator_config().priority == sirius::creator::priority_order::source);
+  }
+}
+
+TEST_CASE("Sirius derives scan-manager threads from configured sibling pools", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+
+  CHECK(sirius::scan_manager::derived_scan_manager_num_threads(32, 1, 2, 1, 4, 1, 1) == 24);
+  CHECK(sirius::scan_manager::derived_scan_manager_num_threads(32, 2, 2, 4, 3, 1, 2) == 19);
+  CHECK(sirius::scan_manager::derived_scan_manager_num_threads(32, 2, 3, 4, 3, 2, 2) == 14);
+  CHECK(sirius::scan_manager::derived_scan_manager_num_threads(32, 2, 3, 4, 3, 1, 2) == 17);
+  CHECK(sirius::scan_manager::derived_scan_manager_num_threads(64, 1, 3, 1, 4, 2, 1) == 51);
+  CHECK(sirius::scan_manager::derived_scan_manager_num_threads(0, 2, 2, 4, 3, 1, 2) == 4);
+  CHECK(sirius::scan_manager::derived_scan_manager_num_threads(4, 2, 2, 4, 3, 1, 2) == 4);
+  CHECK(sirius::scan_manager::derived_scan_manager_num_threads(
+          32, 1, 2, 1, 4, 1, std::numeric_limits<std::size_t>::max()) == 4);
+  CHECK(sirius::scan_manager::derived_scan_manager_num_threads(
+          32, std::numeric_limits<std::size_t>::max(), 2, 1, 4, 1, 1) == 4);
+  CHECK(sirius::scan_manager::derived_scan_manager_num_threads(
+          32, 1, std::numeric_limits<std::size_t>::max(), 1, 4, 1, 1) == 4);
+  CHECK(sirius::scan_manager::derived_scan_manager_num_threads(
+          32, 1, 2, 1, std::numeric_limits<std::size_t>::max(), 2, 1) == 4);
+  CHECK(sirius::scan_manager::derived_scan_manager_num_threads(
+          32, 1, 2, 1, 4, std::numeric_limits<std::size_t>::max(), 1) == 4);
+  CHECK(sirius::scan_manager::derived_scan_manager_num_threads(
+          32, 1, 2, std::numeric_limits<std::size_t>::max(), 4, 1, 1) == 4);
+
+  SECTION("zero-configuration defaults use the resolved memory spaces")
+  {
+    sirius::sirius_config config;
+    config.apply_defaults();
+    auto const downgrade_executor_count =
+      std::ranges::count_if(config.get_memory_space_configs(), [](auto const& space) {
+        return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space) ||
+               std::holds_alternative<cucascade::memory::host_memory_space_config>(space);
+      });
+    auto const expected = sirius::scan_manager::derived_scan_manager_num_threads(
+      std::thread::hardware_concurrency(),
+      config.get_downgrade_executor_config().thread_pool.num_threads,
+      downgrade_executor_count,
+      config.get_task_creator_config().thread_pool.num_threads,
+      config.get_gpu_pipeline_executor_config().num_threads,
+      std::ranges::count_if(
+        config.get_memory_space_configs(),
+        [](auto const& space) {
+          return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space);
+        }),
+      config.get_scan_manager_config().uring_n_reactors);
+    CHECK(config.get_scan_manager_config().thread_pool.num_threads == expected);
+  }
+
+  SECTION("omitted scan-manager size uses the configured sibling sizes")
+  {
+    sirius::sirius_config config;
+    REQUIRE_NOTHROW(config.load_from_file(data_dir / "executor_scan_threads_derived.yaml"));
+    auto const downgrade_executor_count =
+      std::ranges::count_if(config.get_memory_space_configs(), [](auto const& space) {
+        return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space) ||
+               std::holds_alternative<cucascade::memory::host_memory_space_config>(space);
+      });
+    auto const expected = sirius::scan_manager::derived_scan_manager_num_threads(
+      std::thread::hardware_concurrency(), 2, downgrade_executor_count, 4, 3, 1, 2);
+    CHECK(downgrade_executor_count == 2);
+    CHECK(config.get_scan_manager_config().thread_pool.num_threads == expected);
+  }
+
+  SECTION("multi-GPU plus host counts every downgrade executor")
+  {
+    sirius::sirius_config config;
+    REQUIRE_NOTHROW(
+      config.load_from_file(data_dir / "executor_scan_threads_derived_multi_gpu.yaml"));
+    auto const expected = sirius::scan_manager::derived_scan_manager_num_threads(
+      std::thread::hardware_concurrency(), 2, 3, 4, 3, 2, 2);
+    CHECK(config.get_scan_manager_config().thread_pool.num_threads == expected);
+  }
+
+  SECTION("explicit scan-manager size remains authoritative")
+  {
+    sirius::sirius_config config;
+    REQUIRE_NOTHROW(config.load_from_file(data_dir / "executor_scan_threads_explicit.yaml"));
+    CHECK(config.get_scan_manager_config().thread_pool.num_threads == 7);
   }
 }
 

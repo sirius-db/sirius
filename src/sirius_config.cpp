@@ -600,6 +600,40 @@ operator_params operator_defaults_for(
   return params;
 }
 
+std::size_t downgrade_executor_count_for(
+  const std::vector<cucascade::memory::memory_space_config>& memory_space_configs)
+{
+  return std::ranges::count_if(memory_space_configs, [](auto const& space) {
+    return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space) ||
+           std::holds_alternative<cucascade::memory::host_memory_space_config>(space);
+  });
+}
+
+std::size_t pipeline_executor_count_for(
+  const std::vector<cucascade::memory::memory_space_config>& memory_space_configs)
+{
+  return std::ranges::count_if(memory_space_configs, [](auto const& space) {
+    return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space);
+  });
+}
+
+int derived_scan_manager_threads_for(
+  const std::vector<cucascade::memory::memory_space_config>& memory_space_configs,
+  const exec::downgrade_executor_config& downgrade,
+  const creator::task_creator_config& task_creator,
+  const exec::thread_pool_config& pipeline,
+  const scan_manager::scan_manager_config& scan_manager)
+{
+  return scan_manager::derived_scan_manager_num_threads(
+    std::thread::hardware_concurrency(),
+    downgrade.thread_pool.num_threads,
+    downgrade_executor_count_for(memory_space_configs),
+    task_creator.thread_pool.num_threads,
+    pipeline.num_threads,
+    pipeline_executor_count_for(memory_space_configs),
+    scan_manager.uring_n_reactors);
+}
+
 }  // namespace
 
 // ================ sirius_config ================= //
@@ -625,7 +659,13 @@ void sirius_config::apply_defaults()
   host_cfg.setup_configurator(builder);
   disk_cfg.setup_configurator(builder);
   _memory_space_configs = builder.build(_hw_topology);
-  _operator_params      = operator_params{};
+  _scan_manager_config.thread_pool.num_threads =
+    derived_scan_manager_threads_for(_memory_space_configs,
+                                     _downgrade_executor_config,
+                                     _task_creator_config,
+                                     _gpu_pipeline_executor_config,
+                                     _scan_manager_config);
+  _operator_params = operator_params{};
 }
 
 void sirius_config::load_from_file(const std::filesystem::path& config_path)
@@ -678,16 +718,21 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
       mr.reject_unknown();
     }
 
-    // Executors
+    // Executors. If scan_manager.num_threads is omitted, resolve it after all sibling pools so
+    // their explicit sizes reduce the same hardware concurrency budget instead of silently
+    // oversubscribing it.
+    bool scan_manager_num_threads_explicit = false;
     if (auto exec_node = r.optional_node("executor")) {
       yaml::reader er(*exec_node, "sirius.executor");
       if (auto n = er.optional_node("task_creator")) from_yaml(*n, _task_creator_config);
-      if (auto n = er.optional_node("scan_manager")) from_yaml(*n, _scan_manager_config);
+      if (auto n = er.optional_node("scan_manager")) {
+        scan_manager_num_threads_explicit = yaml::reader{*n}.has_value("num_threads");
+        from_yaml(*n, _scan_manager_config);
+      }
       if (auto n = er.optional_node("pipeline")) from_yaml(*n, _gpu_pipeline_executor_config);
       if (auto n = er.optional_node("downgrade")) from_yaml(*n, _downgrade_executor_config);
       er.reject_unknown();
     }
-
     // Preserve the node until memory-space capacities are resolved below. Explicit
     // values are applied after capacity-derived defaults so they always win.
     auto operator_node = r.optional_node("operator_params");
@@ -747,6 +792,15 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
       host_cfg.setup_configurator(builder);
       disk_cfg.setup_configurator(builder);
       _memory_space_configs = builder.build(_hw_topology);
+    }
+
+    if (!scan_manager_num_threads_explicit) {
+      _scan_manager_config.thread_pool.num_threads =
+        derived_scan_manager_threads_for(_memory_space_configs,
+                                         _downgrade_executor_config,
+                                         _task_creator_config,
+                                         _gpu_pipeline_executor_config,
+                                         _scan_manager_config);
     }
 
     bool const explicit_low_level_gpu_capacity =
