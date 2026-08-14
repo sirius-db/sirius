@@ -570,7 +570,8 @@ TEST_CASE("both halves install together, and only once", "[late_mat][lifetime]")
     origins.push_back(std::move(origin));
   }
 
-  REQUIRE(sirius::planner::install_deferral(scan, port, make_defer_pair(schema, {1, 2}, origins)));
+  REQUIRE(sirius::planner::install_deferral(
+    scan, port, make_defer_pair(schema, {1, 2}, schema, {1, 2}, origins)));
   REQUIRE(scan.deferred_output().output_positions == std::vector<std::size_t>{1, 2});
   REQUIRE(port.port_directive().output_positions == std::vector<std::size_t>{1, 2});
   REQUIRE(port.port_directive().valid());
@@ -578,12 +579,12 @@ TEST_CASE("both halves install together, and only once", "[late_mat][lifetime]")
   // A second install would substitute against a schema the first one already
   // rewrote, and an invalid pair must stamp neither half.
   opaque_op other_port(3);
-  REQUIRE_FALSE(
-    sirius::planner::install_deferral(scan, other_port, make_defer_pair(schema, {1, 2}, origins)));
+  REQUIRE_FALSE(sirius::planner::install_deferral(
+    scan, other_port, make_defer_pair(schema, {1, 2}, schema, {1, 2}, origins)));
   REQUIRE(other_port.port_directive().empty());
   wide_scan fresh(3);
   REQUIRE_FALSE(sirius::planner::install_deferral(
-    fresh, other_port, make_defer_pair(schema, {2, 1}, origins)));  // unordered
+    fresh, other_port, make_defer_pair(schema, {2, 1}, schema, {2, 1}, origins)));  // unordered
   REQUIRE(fresh.deferred_output().empty());
   REQUIRE(other_port.port_directive().empty());
 }

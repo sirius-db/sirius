@@ -68,8 +68,12 @@ struct column_lifetime {
   /// columns on without materializing them and costs nothing to ride past.
   int port_crossings = 0;
   /// The column's position in `first_reader`'s input, which is where a
-  /// materialization would have to put it back.
+  /// materialization would have to put it back. NOT the scan position: a join
+  /// on the ride widens the table and reorders it.
   std::size_t position_at_reader = 0;
+  /// The operator `first_reader` received this column from — the last step of
+  /// the ride, and the one whose output schema a batch at the port has.
+  op::sirius_physical_operator const* reader_input = nullptr;
   /// Whether some join on the ride could leave this column's row unmatched.
   /// The rowid is then null for those rows and the column materializes as
   /// null — so a deferral is still sound, but only for a consumer that accepts
@@ -149,6 +153,14 @@ struct planned_deferral {
   op::sirius_physical_operator* port = nullptr;
   /// Scan output positions to defer, ascending. The first carries the rowid.
   std::vector<std::size_t> positions;
+  /// Where each of those columns ARRIVES at the port, parallel to `positions`.
+  /// A join between the two ends widens and reorders the table, so these are
+  /// not the scan's positions and the port half is built from them.
+  std::vector<std::size_t> port_positions;
+  /// The operator whose output the port reads — the last step of the ride. Its
+  /// schema is the one a batch at the port has, which is what the port's
+  /// whole-schema match is built from.
+  op::sirius_physical_operator const* port_input = nullptr;
   /// The columns' types as the port must restore them, parallel to positions.
   std::vector<sirius::logical_type> restored_types;
   std::int64_t net_value_bytes = 0;

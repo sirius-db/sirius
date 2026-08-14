@@ -592,6 +592,21 @@ std::string normalize_path(std::string const& p)
   return p;
 }
 
+/// One operator's output schema as cuDF carriers, or empty when some column has
+/// no native carrier — which is a reason not to defer, not an error.
+std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator const& op)
+{
+  if (op.has_physical_overrides()) { return op.get_physical_types(); }
+  std::vector<cudf::data_type> schema;
+  schema.reserve(op.types.size());
+  for (auto const& type : op.types) {
+    auto const native = sirius::try_get_cudf_type(type);
+    if (!native) { return {}; }
+    schema.push_back(*native);
+  }
+  return schema;
+}
+
 /// Complete and install one pinned scan's deferral, or leave the plan alone and
 /// say why (env gate: SIRIUS_EXP_LATE_MAT).
 ///
@@ -672,8 +687,22 @@ void install_late_materialization(op::scan::sirius_gpu_scan_operator& scan_op,
     origins.push_back(std::move(origin));
   }
 
-  auto pair = late_mat::make_defer_pair(
-    scan_op.normalization_targets(), planned.positions, std::move(origins));
+  // The port sees the batch its INPUT produced, not the scan's output: a join
+  // on the ride widens the table and reorders it, so the two halves are built
+  // from two schemas. Getting this wrong does not refuse a deferral — it
+  // installs a port whose whole-schema match never fires, and the reader gets
+  // the rowid.
+  if (planned.port_input == nullptr) { return decline("the ride has no last step"); }
+  auto const port_schema = physical_schema_of(*planned.port_input);
+  if (port_schema.empty()) {
+    return decline("the operator feeding the port has no native cuDF schema");
+  }
+
+  auto pair = late_mat::make_defer_pair(scan_op.normalization_targets(),
+                                        planned.positions,
+                                        port_schema,
+                                        planned.port_positions,
+                                        std::move(origins));
   if (!sirius::planner::install_deferral(scan_op, *planned.port, std::move(pair))) {
     return decline("the pair would not install (the port already carries one, or it is malformed)");
   }

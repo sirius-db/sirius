@@ -164,7 +164,8 @@ TEST_CASE("a rowid becomes its columns again, in the batch's own order", "[late_
   std::vector<std::int32_t> payload(rowids.size());
   std::iota(payload.begin(), payload.end(), 1000);
 
-  auto const pair = make_defer_pair(riding_schema(), {1, 2}, {pin.origin(0), pin.origin(1)});
+  auto const pair = make_defer_pair(
+    riding_schema(), {1, 2}, riding_schema(), {1, 2}, {pin.origin(0), pin.origin(1)});
   REQUIRE(pair.valid());
 
   auto const batch = riding_batch(rowids, payload, stream);
@@ -191,7 +192,8 @@ TEST_CASE("a batch of another shape is declined, not materialized", "[late_mat][
   auto const stream = rmm::cuda_stream_view{};
   fake_entry pin({64}, stream);
 
-  auto const pair = make_defer_pair(riding_schema(), {1, 2}, {pin.origin(0), pin.origin(1)});
+  auto const pair = make_defer_pair(
+    riding_schema(), {1, 2}, riding_schema(), {1, 2}, {pin.origin(0), pin.origin(1)});
   REQUIRE(pair.valid());
 
   // A UINT64 in the right place is not enough: an operator can receive batches

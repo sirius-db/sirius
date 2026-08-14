@@ -79,19 +79,29 @@ inline constexpr cudf::type_id kPlaceholderType = cudf::type_id::INT8;
 /// unrelated batch that happens to have one, and materializing against the
 /// wrong batch reads arbitrary rows of the pinned table — so the check is the
 /// whole shape, and a mismatch declines rather than guesses.
+/// THE PORT'S POSITIONS ARE NOT THE SCAN'S. Between the two ends a join widens
+/// the table and reorders it, so a column deferred at scan position 1 may arrive
+/// at the port as column 7 of a table twice as wide. Both halves therefore carry
+/// their own schema and their own positions; only the origins are shared. Using
+/// the scan's schema at the port matches no batch at all if you are lucky, and
+/// matches the wrong one if you are not.
 struct port_materialize_directive {
-  /// The schema this directive expects, with the deferred positions already
-  /// swapped to rowid/placeholder types.
+  /// The schema this directive expects — the batch AT THE PORT, with the
+  /// deferred positions already swapped to rowid/placeholder types.
   std::vector<cudf::data_type> expected_schema;
-  /// Positions to restore, ascending and identical to the scan side's.
+  /// Positions to restore, ascending, in the PORT's coordinates.
   std::vector<std::size_t> output_positions;
+  /// Where the rowid rides at the port. One of output_positions, but not
+  /// necessarily the first: which column carries it is decided on the scan side,
+  /// and the ride may reorder the bundle before it arrives.
+  std::size_t rowid_at = 0;
   /// Where each restored column comes from, parallel to output_positions.
   std::vector<column_origin> origins;
   /// The dtype each restored column must come back as, parallel likewise.
   std::vector<cudf::data_type> restored_types;
 
   [[nodiscard]] bool empty() const noexcept { return output_positions.empty(); }
-  [[nodiscard]] std::size_t rowid_position() const { return output_positions.front(); }
+  [[nodiscard]] std::size_t rowid_position() const { return rowid_at; }
 
   /// Whether `schema` is the batch this directive was installed for.
   [[nodiscard]] bool matches(std::vector<cudf::data_type> const& schema) const;
@@ -103,6 +113,17 @@ struct port_materialize_directive {
   [[nodiscard]] bool valid() const;
 };
 
+/// How many deferrals have installed in this process, ever.
+///
+/// A query that ran with the gate on and deferred nothing looks exactly like one
+/// that deferred and gained nothing, and the difference is the whole question
+/// when a measurement disappoints — or when a test claims to exercise this path.
+/// Monotonic and process-wide; a test reads it before and after.
+[[nodiscard]] std::uint64_t deferrals_installed() noexcept;
+
+/// Called by planner::install_deferral, and by nothing else.
+void note_deferral_installed() noexcept;
+
 /// The two halves, which only mean anything together.
 struct defer_pair {
   deferred_scan_output scan;
@@ -111,14 +132,24 @@ struct defer_pair {
   [[nodiscard]] bool valid() const;
 };
 
-/// Build the pair for one bundle: `schema` is the producer's planned output
-/// types, `positions` the columns to defer, `origins` where each comes from.
+/// Build the pair for one bundle, from the two ends' own coordinates.
+///
+/// @p scan_schema / @p scan_positions describe the producing scan's output;
+/// @p port_schema / @p port_positions the batch as it arrives at the consumer,
+/// with `port_positions[i]` the place `scan_positions[i]` travelled to. The
+/// three per-column vectors (scan positions, port positions, origins) are
+/// parallel and in scan order; the port half is sorted into its own ascending
+/// order internally, so a ride that reorders the bundle is handled here rather
+/// than by every caller.
 ///
 /// Returns a pair whose valid() is false if the request is not installable —
-/// no positions, positions out of range or unordered, or a mismatched origin
-/// count. The caller installs both halves or neither.
-[[nodiscard]] defer_pair make_defer_pair(std::vector<cudf::data_type> const& schema,
-                                         std::vector<std::size_t> const& positions,
+/// no positions, positions out of range or repeated, mismatched counts, or a
+/// port column whose type disagrees with what the scan gave up. The caller
+/// installs both halves or neither.
+[[nodiscard]] defer_pair make_defer_pair(std::vector<cudf::data_type> const& scan_schema,
+                                         std::vector<std::size_t> const& scan_positions,
+                                         std::vector<cudf::data_type> const& port_schema,
+                                         std::vector<std::size_t> const& port_positions,
                                          std::vector<column_origin> const& origins);
 
 }  // namespace sirius::late_mat

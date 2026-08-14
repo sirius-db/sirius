@@ -299,6 +299,7 @@ std::vector<column_lifetime> analyze_column_lifetimes(sirius_physical_operator c
         life.first_reader       = node;
         life.port_crossings     = crossings;
         life.position_at_reader = col.position;
+        life.reader_input       = from;
         life.nullified_on_ride  = col.nullified;
         life.read_as_join_key   = moved.as_join_key;
         continue;
@@ -314,6 +315,7 @@ std::vector<column_lifetime> analyze_column_lifetimes(sirius_physical_operator c
     auto& life              = lifetimes[col.index];
     life.port_crossings     = crossings;
     life.position_at_reader = col.position;
+    life.reader_input       = from;
     life.nullified_on_ride  = col.nullified;
   }
   return lifetimes;
@@ -380,7 +382,9 @@ planned_deferral plan_deferral(sirius_physical_operator& scan, late_mat::defer_p
     auto const position = static_cast<std::size_t>(column.column_pos);
     planned.positions.push_back(position);
     planned.restored_types.push_back(scan.types[position]);
+    planned.port_positions.push_back(lifetimes[position].position_at_reader);
   }
+  planned.port_input = lifetimes[planned.positions.front()].reader_input;
   return planned;
 }
 
@@ -396,6 +400,7 @@ bool install_deferral(sirius_physical_operator& scan,
   if (!scan._deferred_output.empty() || !port._port_directive.empty()) { return false; }
   scan._deferred_output = std::move(pair.scan);
   port._port_directive  = std::move(pair.port);
+  late_mat::note_deferral_installed();
   return true;
 }
 
