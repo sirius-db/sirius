@@ -632,7 +632,15 @@ TEST_CASE("Sirius derives scan-manager threads from configured sibling pools", "
   CHECK(sirius::scan_manager::derived_scan_manager_num_threads(7, 1, 1, 1, 1, 1, 0) == 4);
   CHECK(sirius::scan_manager::derived_scan_manager_num_threads(
           std::numeric_limits<unsigned>::max(), 0, 0, 0, 0, 0, 0) ==
-        std::numeric_limits<int>::max());
+        sirius::scan_manager::max_scan_manager_num_threads);
+  STATIC_REQUIRE(sirius::scan_manager::max_scan_manager_num_threads +
+                   sirius::scan_manager::scan_manager_internal_worker_count ==
+                 std::numeric_limits<int>::max());
+  CHECK(sirius::scan_manager::scan_manager_pool_num_threads(
+          sirius::scan_manager::max_scan_manager_num_threads) == std::numeric_limits<int>::max());
+  CHECK_THROWS_AS(
+    sirius::scan_manager::scan_manager_pool_num_threads(std::numeric_limits<int>::max()),
+    std::out_of_range);
   CHECK(sirius::scan_manager::derived_scan_manager_num_threads(0, 2, 2, 4, 3, 1, 2) == 4);
   CHECK(sirius::scan_manager::derived_scan_manager_num_threads(4, 2, 2, 4, 3, 1, 2) == 4);
   CHECK(sirius::scan_manager::derived_scan_manager_num_threads(
@@ -728,6 +736,18 @@ TEST_CASE("Sirius derives scan-manager threads from configured sibling pools", "
     sirius::sirius_config config;
     REQUIRE_NOTHROW(config.load_from_file(data_dir / "executor_scan_threads_explicit.yaml"));
     CHECK(config.get_scan_manager_config().thread_pool.num_threads == 7);
+  }
+
+  SECTION("explicit scan-manager size preserves constructor addition")
+  {
+    sirius::sirius_config safe;
+    REQUIRE_NOTHROW(safe.load_from_file(data_dir / "executor_scan_threads_safe_max.yaml"));
+    CHECK(safe.get_scan_manager_config().thread_pool.num_threads ==
+          sirius::scan_manager::max_scan_manager_num_threads);
+
+    sirius::sirius_config unsafe;
+    REQUIRE_THROWS_WITH(unsafe.load_from_file(data_dir / "executor_scan_threads_unsafe_max.yaml"),
+                        Catch::Contains("num_threads") && Catch::Contains("value out of range"));
   }
 }
 

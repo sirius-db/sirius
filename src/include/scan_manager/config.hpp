@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <stdexcept>
 #include <thread>
 
 namespace sirius::scan_manager {
@@ -35,6 +36,20 @@ inline constexpr std::size_t default_uring_n_reactors = 1;
 
 /// Extra worker added by sirius_scan_manager beyond the configured scan-manager count.
 inline constexpr int scan_manager_internal_worker_count = 1;
+
+/// Largest configured count whose constructor-time internal-worker addition is representable.
+inline constexpr int max_scan_manager_num_threads =
+  std::numeric_limits<int>::max() - scan_manager_internal_worker_count;
+
+/// Total scan-manager pool size, checked here as well as at the YAML boundary because callers can
+/// install a scan_manager_config programmatically.
+[[nodiscard]] inline int scan_manager_pool_num_threads(int configured_threads)
+{
+  if (configured_threads > max_scan_manager_num_threads) {
+    throw std::out_of_range("scan-manager thread count exceeds the constructible maximum");
+  }
+  return configured_threads + scan_manager_internal_worker_count;
+}
 
 /// Scan-manager pool size from the live sibling-pool configuration: every core left after the
 /// internal scan-manager worker, per-space downgrade, task-creator, per-GPU pipeline, and io_uring
@@ -66,7 +81,7 @@ inline constexpr int scan_manager_internal_worker_count = 1;
   subtract_product(pipeline_threads, pipeline_executors);
   subtract(uring_reactors);
 
-  remaining = std::clamp<std::size_t>(remaining, 4, std::numeric_limits<int>::max());
+  remaining = std::clamp<std::size_t>(remaining, 4, max_scan_manager_num_threads);
   return static_cast<int>(remaining);
 }
 
