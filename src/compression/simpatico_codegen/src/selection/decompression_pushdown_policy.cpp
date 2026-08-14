@@ -41,6 +41,12 @@ bool decompression_pushdown_diag_enabled()
   return enabled;
 }
 
+bool decompression_pushdown_sparse_grid_enabled()
+{
+  static bool const enabled = env_flag("SIRIUS_EXP_FUSED_SCAN_SPARSE");
+  return enabled;
+}
+
 double decompression_pushdown_max_selectivity()
 {
   static double const value = env_fraction("SIRIUS_EXP_FUSED_SCAN_MAX_SEL", 0.35);
