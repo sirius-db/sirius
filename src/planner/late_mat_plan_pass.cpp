@@ -147,6 +147,21 @@ step trace_through(sirius_physical_operator const& node,
       return step::to(moved);
     }
 
+    // A dynamic filter drops rows a join build has already excluded. It reads
+    // only the key columns it probes, and rewrites no column layout, so a
+    // payload riding past it is positionally unchanged. Treating it as a reader
+    // instead ends the ride at the operator that sits directly above a pinned
+    // scan, which is where q10's customer payload was stopping: the bundle
+    // materialized one hop from the scan and paid the rowid for nothing.
+    //
+    // The probed columns are not enumerated here: the filter set is published
+    // mid-query and a column this walk decided was payload must not become a
+    // probe key afterwards. Deferring a probed key would hand the probe a rowid
+    // in place of the value it compares, so it is refused at the source instead
+    // -- the scan withholds any column a partition hashes, which is the same
+    // column set this operator probes.
+    case SiriusPhysicalOperatorType::DYNAMIC_FILTER: return step::to(in_pos);
+
     case SiriusPhysicalOperatorType::FILTER: {
       auto const& filter = static_cast<op::sirius_physical_filter const&>(node);
       // The predicate is the only thing a filter reads; it decides which ROWS
