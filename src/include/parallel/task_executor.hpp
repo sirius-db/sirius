@@ -18,8 +18,10 @@
 
 #include "exec/bounded_thread_pool.hpp"
 #include "exec/config.hpp"
-#include "exec/inspectable_mpsc.hpp"
+#include "exec/multi_index_priority_queue.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "parallel/task.hpp"
+#include "query_id.hpp"
 
 #include <absl/functional/any_invocable.h>
 
@@ -69,8 +71,22 @@ class itask_executor {
 
   /**
    * @brief Schedule a task for execution.
+   *
+   * A no-op when the lifecycle gate reports that the task's query is tearing down: the OOM
+   * reschedule path re-enters here from a worker thread long after a drain may have passed.
    */
   void schedule(std::unique_ptr<itask> task);
+
+  /**
+   * @brief Bind the per-query lifecycle gate consulted before enqueuing.
+   *
+   * Without one (the default, and what most unit tests use) every query is treated as accepting
+   * work, i.e. the pre-gate behaviour.
+   */
+  void set_query_lifecycle_registry(exec::query_lifecycle_registry* registry) noexcept
+  {
+    _query_lifecycle = registry;
+  }
 
   /**
    * @brief Start the executor: creates the thread pool and manager thread.
@@ -97,9 +113,18 @@ class itask_executor {
   void wait_all();
 
   /**
-   * @brief Drain any leftover tasks remaining in the queue.
+   * @brief Drain any leftover tasks remaining in the queue, for every query.
    */
   void drain_leftover_tasks();
+
+  /**
+   * @brief Drop the queued tasks belonging to one query.
+   *
+   * Tasks of other queries are left in place and the queue stays open, so unlike interrupt()
+   * this does not stall any other query's producers or consumers. Only queued work is affected;
+   * a task already dispatched to the thread pool runs to completion.
+   */
+  void drain_query_tasks(sirius::query_id_t query_id);
 
   /**
    * @brief Drain in-flight tasks and restart the manager, ready for the next query.
@@ -171,7 +196,12 @@ class itask_executor {
   std::atomic<bool> _running{false};
   exec::thread_pool_config _config;
   std::unique_ptr<exec::bounded_thread_pool> _bounded_pool;
-  exec::inspectable_mpsc<itask> _task_queue;
+  /// Ordered by task priority and indexed by query, so one query's queued work can be
+  /// dropped without touching another's. Keys come from pipeline::index_keys_for, the
+  /// same extractor the task_scheduler's queue uses.
+  exec::multi_index_priority_queue<itask> _task_queue;
+  /// Non-owning; owned by SiriusContext and outlives this executor. Null in unit tests.
+  exec::query_lifecycle_registry* _query_lifecycle{nullptr};
   std::thread _manager_thread;
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;

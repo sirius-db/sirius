@@ -111,6 +111,7 @@ Sirius uses cuCascade for tiered memory management across GPU, Host (pinned), an
 |-----|------|---------|-------------|
 | `num_gpus` | int | all visible GPUs | Number of GPUs to use. Defaults to every GPU visible to topology discovery (honors `CUDA_VISIBLE_DEVICES`); `0` also means auto. Mutually exclusive with `gpu_ids`. |
 | `gpu_ids` | list of int | — | Explicit GPU device IDs. Mutually exclusive with `num_gpus`. |
+| `gpus_per_query` | int | `0` (all) | How many GPUs each query is allocated at admission time. `0` uses all active GPUs. Values exceeding the active GPU count are clamped to the full set. |
 
 ### GPU Memory (`sirius.memory.gpu`)
 
@@ -314,16 +315,17 @@ single-GPU configurations only (logs a warning and disables itself otherwise).
 
 ### `scan_manager.rest` — REST / S3 backend (`io/rest/config.hpp`)
 
+TLS verification policy and the CA bundle are configured only under
+`scan_manager.object_store`. The REST reactor consumes those values so signing
+and transport use one trust policy; there are no separate REST YAML controls.
+
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `request_timeout_s` | int (seconds) | 30 | Whole-request timeout and presigned-URL TTL (0 = no limit). |
-| `ca_bundle_path` | string | "" | PEM CA bundle for TLS verification. |
-| `tls_verify` | bool | true | Verify the endpoint's TLS certificate (peer + host). |
 | `max_connections` | int | 16 | Max concurrent in-flight connections per reactor. |
 | `chunk_size` | bytes | 8Mi | Target bytes per ranged GET (scatter/device-staging paths). |
 | `max_n_chunks` | int | 16 | Max file-adjacent segments fused into one scatter GET. |
 | `max_read_split` | int | 16 | Max parallel ranged GETs for one contiguous host read (reads < 2 MiB stay a single GET). |
-| `bounce_block_size` | bytes | 0 | Bounce-slot size for the reactor-staged device path (0 disables that path; normally set from the staging resource at runtime). |
 | `upkeep_interval_ms` | int (ms) | 15000 | Idle-connection keepalive interval (`curl_easy_upkeep`; 0 disables). |
 | `conn_max_age_s` | int (seconds) | 20 | Max age curl may reuse a pooled connection (`CURLOPT_MAXAGE_CONN`; 0 = curl default). |
 | `retry_backoff_base_ms` | int (ms) | 50 | Base backoff between retries. |
@@ -355,8 +357,8 @@ single-GPU configurations only (logs a warning and disables itself otherwise).
 | `session_token` | string | "" | STS session token for temporary credentials. |
 | `signing_mode` | enum: `presigned`, `header` | `presigned` | SigV4 form: `presigned` (auth in the URL query string) or `header` (`Authorization` + `x-amz-*` headers). Values are lowercase. |
 | `s3_transport` | enum: `auto`, `http`, `https`, `rdma` | `auto` | Transport selection. Values are lowercase; `https` is an alias for `http`. `auto` lets the backend choose from the URI scheme and endpoint. |
-| `ca_bundle_path` | string | "" | PEM CA bundle for TLS verification. |
-| `tls_verify` | bool | true | Verify the endpoint's TLS certificate. |
+| `ca_bundle_path` | string | "" | Sole YAML source for the REST endpoint's PEM CA bundle. |
+| `tls_verify` | bool | true | Sole YAML source for REST endpoint certificate verification. |
 
 ## Operator Parameters
 

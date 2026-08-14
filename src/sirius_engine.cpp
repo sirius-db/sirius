@@ -32,6 +32,7 @@
 #include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"
 #include "pipeline/sirius_plan_printer.hpp"
+#include "planner/gpu_admission.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius/exception.hpp"
@@ -91,6 +92,8 @@ sirius_engine::~sirius_engine() { query_handle_->exit(); }
 
 void sirius_engine::reset()
 {
+  // Before the plan: the query indexes it, so it must not outlive a plan swap.
+  query_.reset();
   sirius_physical_plan = nullptr;
   sirius_owned_plan.reset();
   sirius_root_pipelines.clear();
@@ -150,36 +153,42 @@ void sirius_engine::execute()
                   telemetry_uuid.high_bits,
                   telemetry_uuid.low_bits);
 
-  // Create the query with the pipelines
-  sirius_ctx->create_query(std::move(new_scheduled),
-                           query_id_,
-                           telemetry::query_telemetry_info{
-                             .telemetry_query_id = telemetry_uuid,
-                             .worker_id          = telemetry_context_->worker_id(),
-                             .query_id           = query_id_,
-                           });
-  auto future = sirius_ctx->get_task_scheduler().start_query();
+  // This query's completion signal. Owned here, shared down to every task via its pipeline's
+  // global state, so no cross-query subsystem holds a "current query" handler.
+  completion_handler_ = std::make_shared<pipeline::completion_handler>();
+  auto future         = completion_handler_->get_awaitable();
+
+  // Create the query with the pipelines. It is owned here, alongside the plan it indexes.
+  query_ = sirius_ctx->create_query(std::move(new_scheduled),
+                                    query_id_,
+                                    completion_handler_,
+                                    telemetry::query_telemetry_info{
+                                      .telemetry_query_id = telemetry_uuid,
+                                      .worker_id          = telemetry_context_->worker_id(),
+                                      .query_id           = query_id_,
+                                    });
+  sirius_ctx->get_task_scheduler().start_query(*query_);
   try {
     future.get();
-    sirius_ctx->get_task_scheduler().wait_for_completion();
+    sirius_ctx->get_task_scheduler().wait_for_completion(query_id_);
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
     // Drain all in-flight GPU tasks before returning.  QueryEnd() will call
     // clear_all_repositories() immediately after execute() throws; without
     // this drain, tasks still running in the thread pool hold raw pointers to
     // those repositories and cause a use-after-free / heap corruption.
-    sirius_ctx->get_task_scheduler().drain_after_error();
+    sirius_ctx->get_task_scheduler().drain_after_error(query_id_);
     throw;
   } catch (...) {
     SIRIUS_LOG_ERROR("Unknown error executing query");
-    sirius_ctx->get_task_scheduler().drain_after_error();
+    sirius_ctx->get_task_scheduler().drain_after_error(query_id_);
     throw;
   }
 
   // All tasks completed — operators and pipelines are still alive here.
   // Warn about any intermediate operators that were never finalized.
-  if (auto query = sirius_ctx->get_query()) {
-    for (const auto& pipeline : query->get_pipelines()) {
+  if (query_) {
+    for (const auto& pipeline : query_->get_pipelines()) {
       for (const auto& op_ref : pipeline->get_operators()) {
         const auto& op = op_ref.get();
         if (!op.finalized.load()) {
@@ -204,19 +213,32 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 
   sirius_physical_plan = &plan;
 
-  // Sorted, deduped active GPU device ids — built the same way task_creator builds its
-  // `_active_gpu_ids` (from the memory manager's GPU spaces) so partition→GPU routing and the
-  // broadcast probe device→slot mapping stay inverse to each other.
-  std::vector<int> active_gpu_ids;
+  std::vector<int> gpu_ids;
   for (auto const* space : sirius_ctx_ptr->get_memory_manager().get_memory_spaces_for_tier(
          cucascade::memory::Tier::GPU)) {
-    if (space != nullptr) { active_gpu_ids.push_back(space->get_device_id()); }
+    if (space != nullptr) { gpu_ids.push_back(space->get_device_id()); }
   }
-  std::sort(active_gpu_ids.begin(), active_gpu_ids.end());
-  active_gpu_ids.erase(std::unique(active_gpu_ids.begin(), active_gpu_ids.end()),
-                       active_gpu_ids.end());
+  std::sort(gpu_ids.begin(), gpu_ids.end());
+  gpu_ids.erase(std::unique(gpu_ids.begin(), gpu_ids.end()), gpu_ids.end());
 
-  // Create plan-time build context (decoupled from engine)
+  // Admit the query here, before anything downstream is built, so that the build context,
+  // partition->GPU routing and the scan round-robin all derive from this one list. Order
+  // matters: task_creator holds it, and create_query later reads it back for scan_manager.
+  auto const full_gpu_count = gpu_ids.size();
+  std::vector<int> active_gpu_ids =
+    planner::apply_gpu_cap(std::move(gpu_ids), sirius_ctx_ptr->get_config().gpus_per_query());
+  sirius_ctx_ptr->get_task_creator().set_active_gpu_ids(active_gpu_ids, full_gpu_count);
+  try {
+    std::string gpu_list;
+    for (auto id : active_gpu_ids) {
+      if (!gpu_list.empty()) { gpu_list += ", "; }
+      gpu_list += std::to_string(id);
+    }
+    SIRIUS_LOG_INFO("[gpu_alloc] query allocated {} GPU(s): [{}]", active_gpu_ids.size(), gpu_list);
+  } catch (...) {  // best-effort observability
+  }
+
+  // Create plan-time build context (decoupled from engine).
   const pipeline::pipeline_build_context build_ctx{
     sirius_ctx_ptr->get_telemetry_context(),
     duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context),
