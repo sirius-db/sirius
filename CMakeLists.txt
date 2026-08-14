@@ -712,6 +712,7 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
     test/cpp/scan_manager/test_cached_serving_hardening.cpp
     test/cpp/scan_manager/test_insert_delta_job.cpp
+    test/cpp/scan_manager/test_memory_prefetcher_accounting.cpp
     test/cpp/scan_manager/test_mvcc_mask_job.cpp
     test/cpp/scan_manager/test_pinned_chunk_stats.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
