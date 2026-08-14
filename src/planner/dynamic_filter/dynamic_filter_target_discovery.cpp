@@ -336,12 +336,18 @@ std::vector<route_terminal> trace_probe_key(sirius::op::sirius_physical_operator
 
 bool hop_is_material(sirius::op::sirius_physical_operator const& node) noexcept
 {
-  // Only per-row work an endpoint below the node would save counts. A FILTER evaluates its
-  // predicate per row; projections that merely forward references, UNION fan-out, and existing
-  // endpoints move no work. (An accepted projection hop may still compute non-traced expressions
-  // per row -- counted immaterial today, an under-approximation that can only under-site; see the
-  // header contract.)
-  return node.type == sirius::op::SiriusPhysicalOperatorType::FILTER;
+  // The two-operator rule: a FILTER's predicate always runs per row, and a PROJECTION is material
+  // exactly when any select-list entry is a non-reference expression. Cost-blindness, the single
+  // definition of "reference", and why existing DYNAMIC_FILTER endpoints stay immaterial are the
+  // header contract's.
+  if (node.type == sirius::op::SiriusPhysicalOperatorType::FILTER) { return true; }
+  if (node.type == sirius::op::SiriusPhysicalOperatorType::PROJECTION) {
+    auto const& projection = node.Cast<sirius::op::sirius_physical_projection>();
+    for (auto const& entry : projection.select_list) {
+      if (!projection_reference_input(*entry).has_value()) { return true; }
+    }
+  }
+  return false;
 }
 
 namespace {
@@ -456,8 +462,8 @@ top_n_target_kind classify_top_n_terminal(route_terminal const& terminal,
   if (!consumer_skips_reads && material_hops_above == 0) {
     return top_n_target_kind::SKIPPED_NO_WORK_SAVED;
   }
-  if (terminal.node != nullptr &&
-      terminal.node->type == sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN) {
+  assert(terminal.node != nullptr);
+  if (terminal.node->type == sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN) {
     return top_n_target_kind::SCAN_BIND;
   }
   return top_n_target_kind::ENDPOINT_SITE;

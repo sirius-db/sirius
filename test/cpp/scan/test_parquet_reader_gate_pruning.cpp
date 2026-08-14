@@ -88,13 +88,10 @@ test_env& env()
   return e;
 }
 
-/// Write the banded fixture: 16 row groups of 2048 rows, disjoint ascending `v` bands.
+/// Write the banded fixture into an existing directory (a `scoped_fixture_dir` owns it): 16 row
+/// groups of 2048 rows, disjoint ascending `v` bands.
 std::filesystem::path write_banded_parquet(std::filesystem::path const& dir)
 {
-  std::error_code ec;
-  std::filesystem::remove_all(dir, ec);
-  std::filesystem::create_directories(dir);
-
   duckdb::DuckDB db(nullptr);
   duckdb::Connection con(db);
 
@@ -229,12 +226,38 @@ std::filesystem::path fixture_dir()
          ("pgi_reader_gate_pruning." + std::to_string(::getpid()));
 }
 
+/// Owns one test's fixture directory: cleared and created on construction, removed on
+/// destruction, so a failing REQUIRE cannot leak the directory past the test.
+class scoped_fixture_dir {
+ public:
+  explicit scoped_fixture_dir(std::filesystem::path dir) : _dir(std::move(dir))
+  {
+    std::error_code ec;
+    std::filesystem::remove_all(_dir, ec);
+    std::filesystem::create_directories(_dir);
+  }
+  ~scoped_fixture_dir()
+  {
+    std::error_code ec;
+    std::filesystem::remove_all(_dir, ec);
+  }
+
+  scoped_fixture_dir(scoped_fixture_dir const&)            = delete;
+  scoped_fixture_dir& operator=(scoped_fixture_dir const&) = delete;
+
+  [[nodiscard]] std::filesystem::path const& path() const noexcept { return _dir; }
+
+ private:
+  std::filesystem::path _dir;
+};
+
 }  // namespace
 
 TEST_CASE("reader gate premise: the reader's considered count equals the split's row groups",
           "[scan][parquet][dynamic_filter][reader_gate]")
 {
-  auto const path = write_banded_parquet(fixture_dir());
+  scoped_fixture_dir const dir(fixture_dir());
+  auto const path = write_banded_parquet(dir.path());
   gate_fixture f(path, /*static_filters=*/nullptr);
   REQUIRE(f.splits.size() == static_cast<std::size_t>(GROUP_COUNT));
 
@@ -250,14 +273,13 @@ TEST_CASE("reader gate premise: the reader's considered count equals the split's
   REQUIRE(after.reader_gate_row_groups_considered - before.reader_gate_row_groups_considered ==
           f.split_row_group_count(0));
   REQUIRE(rows == ROWS_PER_GROUP);
-
-  std::filesystem::remove_all(fixture_dir());
 }
 
 TEST_CASE("reader gate: a prunable split activates the gate",
           "[scan][parquet][dynamic_filter][reader_gate]")
 {
-  auto const path = write_banded_parquet(fixture_dir());
+  scoped_fixture_dir const dir(fixture_dir());
+  auto const path = write_banded_parquet(dir.path());
   gate_fixture f(path, /*static_filters=*/nullptr);
 
   // [0, 5000] keeps band 0 only; band 3 ([30000, 32047]) lies entirely above it.
@@ -277,14 +299,13 @@ TEST_CASE("reader gate: a prunable split activates the gate",
   REQUIRE(kept_rows == ROWS_PER_GROUP);
   REQUIRE(last.reader_gate_measurements - after.reader_gate_measurements == 1);
   REQUIRE(last.reader_gate_merges_skipped == 0);
-
-  std::filesystem::remove_all(fixture_dir());
 }
 
 TEST_CASE("reader gate: barren splits disable the merge and later splits skip it",
           "[scan][parquet][dynamic_filter][reader_gate]")
 {
-  auto const path = write_banded_parquet(fixture_dir());
+  scoped_fixture_dir const dir(fixture_dir());
+  auto const path = write_banded_parquet(dir.path());
   gate_fixture f(path, /*static_filters=*/nullptr);
 
   f.publish(1, LOOSE_LO, LOOSE_HI);
@@ -303,14 +324,13 @@ TEST_CASE("reader gate: barren splits disable the merge and later splits skip it
   auto const after = f.stats.snapshot();
   REQUIRE(after.reader_gate_merges_skipped - before.reader_gate_merges_skipped == 1);
   REQUIRE(after.reader_gate_measurements == before.reader_gate_measurements);
-
-  std::filesystem::remove_all(fixture_dir());
 }
 
 TEST_CASE("reader gate: tightened revisions re-arm on the 1, 2, 4 schedule",
           "[scan][parquet][dynamic_filter][reader_gate]")
 {
-  auto const path = write_banded_parquet(fixture_dir());
+  scoped_fixture_dir const dir(fixture_dir());
+  auto const path = write_banded_parquet(dir.path());
   gate_fixture f(path, /*static_filters=*/nullptr);
 
   // Disable at generation 1 (four barren merged splits), so the re-arm point is generation 2.
@@ -351,14 +371,13 @@ TEST_CASE("reader gate: tightened revisions re-arm on the 1, 2, 4 schedule",
   auto after_second = f.stats.snapshot();
   REQUIRE(after_second.reader_gate_rearmed - after_gen3.reader_gate_rearmed == 1);
   REQUIRE(after_second.reader_gate_rearmed == 2);
-
-  std::filesystem::remove_all(fixture_dir());
 }
 
 TEST_CASE("reader gate: a re-armed measurement that prunes re-activates",
           "[scan][parquet][dynamic_filter][reader_gate]")
 {
-  auto const path = write_banded_parquet(fixture_dir());
+  scoped_fixture_dir const dir(fixture_dir());
+  auto const path = write_banded_parquet(dir.path());
   gate_fixture f(path, /*static_filters=*/nullptr);
 
   f.publish(1, LOOSE_LO, LOOSE_HI);
@@ -381,14 +400,13 @@ TEST_CASE("reader gate: a re-armed measurement that prunes re-activates",
   auto const after = f.stats.snapshot();
   REQUIRE(after.reader_gate_measurements - before.reader_gate_measurements == 2);
   REQUIRE(after.reader_gate_merges_skipped == before.reader_gate_merges_skipped);
-
-  std::filesystem::remove_all(fixture_dir());
 }
 
 TEST_CASE("reader gate: static WHERE pruning does not train the gate",
           "[scan][parquet][dynamic_filter][reader_gate]")
 {
-  auto const path = write_banded_parquet(fixture_dir());
+  scoped_fixture_dir const dir(fixture_dir());
+  auto const path = write_banded_parquet(dir.path());
   // `v < 60000` stats-prunes bands 6..15 at metadata time, so only 6 splits survive to
   // materialize; the merged static+dynamic reader AST re-evaluates over exactly those.
   gate_fixture f(path, make_static_v_filter(6 * BAND_STRIDE));
@@ -409,14 +427,13 @@ TEST_CASE("reader gate: static WHERE pruning does not train the gate",
   REQUIRE(snap.reader_gate_row_groups_pruned == 0);
   REQUIRE(snap.reader_gate_disabled == 1);
   REQUIRE(f.gate_state() == reader_pruning_gate::state::disabled);
-
-  std::filesystem::remove_all(fixture_dir());
 }
 
 TEST_CASE("reader gate: the zero-row fallback split is not evidence and not a skip",
           "[scan][parquet][dynamic_filter][reader_gate]")
 {
-  auto const path = write_banded_parquet(fixture_dir());
+  scoped_fixture_dir const dir(fixture_dir());
+  auto const path = write_banded_parquet(dir.path());
   // `v < -1` prunes every row group at metadata time; the coalescer's flush fallback emits one
   // zero-row-group split so the scan still creates a task.
   gate_fixture f(path, make_static_v_filter(-1));
@@ -440,6 +457,4 @@ TEST_CASE("reader gate: the zero-row fallback split is not evidence and not a sk
   REQUIRE(after.reader_gate_rearmed == before.reader_gate_rearmed);
   REQUIRE(after.reader_gate_merges_skipped == before.reader_gate_merges_skipped);
   REQUIRE(f.gate_state() == reader_pruning_gate::state::measuring);
-
-  std::filesystem::remove_all(fixture_dir());
 }

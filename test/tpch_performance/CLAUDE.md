@@ -150,6 +150,11 @@ Key flags:
 - `--mode grouped|sequential|isolated|nsys-profile` — `grouped` (default, hot cache), `sequential` (round-robin), `isolated` (fresh connection + drop_os_cache per run; requires passwordless sudo), `nsys-profile` (see below).
 - `--queries 1,3,6-10` — subset selection.
 - `--pin gpu|host|none` — Sirius cache pre-load tier. Both `gpu` and `host` are supported; `host` converts the pinned table into NUMA-local pinned host memory. Any other tier throws `NotImplementedException` at bind time (`src/sirius_extension.cpp:811-813`).
+  - Dynamic-filter-relevant runs: measure `--pin gpu` and `--pin host` as separate cells
+    alongside the unpinned fresh-read cell. A pinned-cache-served scan consumes Top-N dynamic
+    filters post-decode instead of in the reader (see docs/super-sirius/dynamic-filters-top-n.md,
+    "Pinned-cache-served scans"), so the three cells answer different questions and none
+    substitutes for another.
 - `--validation` — byte-compare GPU vs CPU `result.txt` after timing (with `abs_tol=1e-10` on float columns). Requires `--engine both`.
 - `--mode nsys-profile` — wrap each query in `nsys profile` (one DuckDB CLI subprocess per query; the cudaProfilerApi capture range covers the cold + hot iterations). Requires `--engine gpu`; incompatible with `--validation` and `--duckdb-profiling`.
 - `--query-timeout N` — per-query subprocess timeout in nsys-profile mode (default 90s).

@@ -16,7 +16,6 @@
 
 #include "planner/sirius_physical_plan_generator.hpp"
 
-#include "config.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/common/type_visitor.hpp"

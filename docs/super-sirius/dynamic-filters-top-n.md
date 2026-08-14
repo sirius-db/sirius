@@ -1,18 +1,22 @@
 # Dynamic Filters — Top-N Threshold Refinement
 
-> **Status: Stages 1–4 implemented; Stages 5–7 proposed.** Implemented behind
-> `enable_top_n_dynamic_filter` (default false): the multi-key threshold coordinator and sink
-> self-consumption via the fused boundary kernel (Stage 1); channel refinement slots, coherent
-> snapshots, generations, and consumer migration (Stage 2); the `RANGE` and `LEX_RANGE` filter
-> classes with reader-AST lowering, the compaction capability, and all-or-nothing replication
-> (Stage 3); and publication itself (Stage 4) — the immutable publish plan, both discovery
-> traces, planner wiring, the publisher loop allocating real revisions, and the reader-AST and
-> sited-endpoint consumers. Producers publish to channels: scan binds and sited endpoints of both
-> layers are live (LEX endpoints splice at arrive-together points via multi-ordinal placement),
-> and a set operation is a terminal for the Top-N trace. The group-key producer (Stage 5) and
-> everything after it remain proposed. This document makes Top-N the first concrete Phase 4
-> dynamic-refinement producer while preserving the implemented, append-only hash-join
-> publication path. See [dynamic-filters.md](dynamic-filters.md) for the general framework,
+> **Status: Stages 1–5 implemented; Stage 6 in progress; Stage 7 partially landed.** Implemented
+> behind `enable_top_n_dynamic_filter` (default false): the multi-key threshold coordinator and
+> sink self-consumption via the fused boundary kernel (Stage 1); channel refinement slots,
+> coherent snapshots, generations, and consumer migration (Stage 2); the `RANGE` and `LEX_RANGE`
+> filter classes with reader-AST lowering, the compaction capability, and all-or-nothing
+> replication (Stage 3); publication itself (Stage 4) — the immutable publish plan, both
+> discovery traces, planner wiring, the publisher loop allocating real revisions, and the
+> reader-AST and sited-endpoint consumers; and the aggregate group-key producer (Stage 5).
+> Consumption has since been hardened: the siting rule (a target must save work it would not
+> otherwise save), pinned-cache-served consumption, the reader-path runtime pruning gate, and
+> multi-ordinal LEX endpoint placement (the Stage-7 bullet marked landed in the rollout plan).
+> Scan binds and sited endpoints of both layers are live, and a set operation is a terminal for
+> the Top-N trace. Stage 6 (performance validation) has its measurement harness in place with
+> the enable-by-default criteria unmeasured; Stage 7's remaining items — join-hop widening
+> first — stay proposed. This document makes Top-N the first concrete Phase 4 dynamic-refinement
+> producer while preserving the implemented, append-only hash-join publication path. See
+> [dynamic-filters.md](dynamic-filters.md) for the general framework,
 > [dynamic-filters-multi-gpu.md](dynamic-filters-multi-gpu.md) for current device-replica
 > ownership, and [dynamic-filters-top-n-api.md](dynamic-filters-top-n-api.md) for the
 > header-level API specification and the high-level test plan.
@@ -550,7 +554,8 @@ Not yet proved for decimals: the equivalence suite's fixture is non-null and non
 null and negative decimal keys are untested, and the assumption that a decoded GPU column's type
 matches the DuckDB catalog type is relied on without a direct check. The DuckDB→cuDF decimal
 mapping is also expressed in three places that agree only through shared precision constants;
-divergence fails safe — every decimal site is refused — but a single mapping would be better. Admission is asymmetric by layer: key zero admitted enables the
+divergence fails safe — every decimal site is refused — but a single mapping would be better.
+Admission is asymmetric by layer: key zero admitted enables the
 first-key layer and first-key self-consumption; all keys admitted additionally enables LEX_RANGE
 and the lexicographic prefilter. An unsupported tail type therefore degrades the producer to the
 first-key layer, never disables it. Timestamps, unsigned/huge integers, floats, `DECIMAL128`, and
@@ -1087,6 +1092,18 @@ of:
 2. **Material work lies between it and the sink.** The predicate costs one O(rows) compaction
    pass at the site and saves that per-row work on every rejected row.
 
+Material means the hop's operator evaluates expressions per row: a `FILTER`'s predicate, or a
+`PROJECTION` any of whose select-list entries is a non-reference expression — the traced entries
+are plain references by hop acceptance; the others need not be. Cost is not consulted: a cheap
+computed entry counts like an expensive one, exactly as a cheap `FILTER` predicate does, because
+the rule asks whether per-row work exists between site and sink, not how much — profitability
+under real data stays with the runtime gates. Reference-only projections and `UNION` fan-out
+move no work. An existing `DYNAMIC_FILTER` endpoint stays immaterial: its masking is conditional
+on an armed channel rather than structural, and under the minimal hop set no Top-N trace can
+reach one — join-edge and scan-route endpoints sit inside join subtrees behind refused join
+hops, a Top-N's own endpoints splice only after both its traces have run, and scan wrappers are
+installed by a later pass. That decision becomes live with Stage-7 join-hop widening.
+
 A target meeting neither is not sited. This is what the earlier rule got wrong: it used *"is it a
 scan?"* as a proxy for *"can it skip reads?"*, which holds for Parquet and fails for the
 DuckDB-native scan, whose only filter path is post-decode. A native scan-sited target meets
@@ -1441,7 +1458,7 @@ Telemetry must not extend filter or witness lifetime beyond query execution.
   endpoint at the arrive-together site, first-key terminal subsumed there.
 - The experimental flag continues to cover the whole feature.
 
-### Stage 5 — Aggregate group-key producer
+### Stage 5 — Aggregate group-key producer *(implemented)*
 
 - Eligibility (keys all grouping keys, no intervening filter, exact-count `LIMIT`) and the
   aggregate-input trace with the existing hop rules.

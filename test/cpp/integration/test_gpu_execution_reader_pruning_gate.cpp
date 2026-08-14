@@ -120,6 +120,31 @@ struct scoped_pin {
   std::string entry_name;
 };
 
+//! Owns the test's fixture directory: cleared and created on construction, removed on
+//! destruction, so a failing REQUIRE cannot leak the directory past the test.
+class scoped_fixture_dir {
+ public:
+  explicit scoped_fixture_dir(fs::path dir) : _dir(std::move(dir))
+  {
+    std::error_code ec;
+    fs::remove_all(_dir, ec);
+    fs::create_directories(_dir);
+  }
+  ~scoped_fixture_dir()
+  {
+    std::error_code ec;
+    fs::remove_all(_dir, ec);
+  }
+
+  scoped_fixture_dir(scoped_fixture_dir const&)            = delete;
+  scoped_fixture_dir& operator=(scoped_fixture_dir const&) = delete;
+
+  [[nodiscard]] fs::path const& path() const noexcept { return _dir; }
+
+ private:
+  fs::path _dir;
+};
+
 rows_t query_rows(duckdb::Connection& con, const std::string& query)
 {
   auto result = con.Query(query);
@@ -174,11 +199,9 @@ TEST_CASE("gpu_execution - reader pruning gate on a fresh-read parquet scan",
   auto con = sirius::test::g_integration_env->make_connection();
   con.Query("SET gpu_execution = true;");
 
-  auto tmp = fs::temp_directory_path() / ("sirius-reader-gate-" + std::to_string(::getpid()));
-  std::error_code ec;
-  fs::remove_all(tmp, ec);
-  fs::create_directories(tmp);
-  auto const parquet_path = (tmp / "gate_facts.parquet").string();
+  scoped_fixture_dir const tmp(fs::temp_directory_path() /
+                               ("sirius-reader-gate-" + std::to_string(::getpid())));
+  auto const parquet_path = (tmp.path() / "gate_facts.parquet").string();
   std::string const entry = "gate_facts_" + std::to_string(::getpid());
 
   // Clustered ascending on `v`, so an ascending Top-N boundary excludes every later row group
@@ -256,7 +279,11 @@ TEST_CASE("gpu_execution - reader pruning gate on a fresh-read parquet scan",
     auto const after = sirius::test::get_dynamic_filter_stats_snapshot(con);
     REQUIRE(after.reader_gate_disabled - before.reader_gate_disabled >= 1);
     REQUIRE(after.reader_gate_merges_skipped > before.reader_gate_merges_skipped);
-    // The boundary always trails the frontier on this shape: nothing was ever prunable.
+    // Exact by design, and the suite's only two-sided attribution pin: real static-stage
+    // pruning misattributed to the dynamic merge shows up only here. It rests on a scheduling
+    // property -- splits dispatch in order, so a boundary above an already-dispatched band's
+    // max requires an extreme out-of-order completion plus a sink pass in the gap. If this
+    // ever flakes, loosen or drop THIS assert; do not add machinery.
     REQUIRE(after.reader_gate_row_groups_pruned == before.reader_gate_row_groups_pruned);
   }
 
@@ -303,6 +330,4 @@ TEST_CASE("gpu_execution - reader pruning gate on a fresh-read parquet scan",
     REQUIRE(asc == asc_cpu);
     REQUIRE(desc == desc_cpu);
   }
-
-  fs::remove_all(tmp, ec);
 }

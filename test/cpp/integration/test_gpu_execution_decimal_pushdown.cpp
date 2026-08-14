@@ -125,6 +125,8 @@ TEST_CASE_METHOD(FlbaDecimalFixture,
       // and returns a wrong total; that defect is in the grouped aggregate rather than in the
       // scan, it reproduces on INT32-backed decimals that never went through this probe, and
       // widening here keeps this test measuring the scan instead of failing on it.
+      // Tracked: "Grouped SUM over DECIMAL32/64 accumulates at input width and wraps before
+      // widening" -- remove this CAST when the aggregate is fixed.
       compare_gpu_vs_cpu(
         "SELECT amount < 0 AS is_negative, count(*), min(amount), max(amount),"
         " sum(CAST(amount AS DECIMAL(38,4))) FROM " +

@@ -28,7 +28,7 @@
 
 namespace sirius::op::scan {
 
-/// @brief Why the planner installed this operator -- exposed for plan-shape tests and telemetry.
+/// @brief Why the planner installed this operator -- exposed for plan-shape tests.
 enum class dynamic_filter_endpoint_provenance { scan_route, join_edge, top_n_endpoint };
 
 //===----------------------------------------------------------------------===//
@@ -72,7 +72,8 @@ class sirius_physical_dynamic_filter : public sirius_physical_operator {
     sirius::op::dynamic_filter_stats* stats       = nullptr,
     std::shared_ptr<read_time_filter_bypass> read_bypass = nullptr);
 
-  /// Why the planner installed this operator; plan-shape tests and telemetry read it.
+  /// Why the planner installed this operator. A test-observability seam: plan-shape tests are
+  /// the only readers -- no runtime behavior consults it.
   [[nodiscard]] dynamic_filter_endpoint_provenance provenance() const noexcept
   {
     return _provenance;

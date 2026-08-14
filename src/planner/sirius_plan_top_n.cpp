@@ -38,7 +38,6 @@
 
 #include <algorithm>
 #include <cassert>
-#include <limits>
 #include <memory>
 #include <optional>
 #include <span>

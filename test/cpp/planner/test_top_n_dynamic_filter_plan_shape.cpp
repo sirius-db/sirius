@@ -39,12 +39,12 @@
  * that must still bind.
  */
 
-#include "expression/ast/node.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/dynamic_filter/top_n_group_key_producer.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
 #include "op/sirius_physical_delim_join.hpp"
+#include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_top_n.hpp"
 #include "planner/dynamic_filter/dynamic_filter_target_discovery.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -61,6 +61,7 @@
 #include <duckdb/planner/planner.hpp>
 #include <unistd.h>
 
+#include <array>
 #include <cstdio>
 #include <filesystem>
 #include <memory>
@@ -80,12 +81,13 @@ class scoped_temp_db_path {
  public:
   scoped_temp_db_path()
   {
-    char tmpl[] = "/tmp/sirius_top_n_plan_shape_XXXXXX";
-    int fd      = ::mkstemp(tmpl);
+    // std::to_array copies the literal (NUL included) into a mutable array mkstemp can edit.
+    auto tmpl = std::to_array("/tmp/sirius_top_n_plan_shape_XXXXXX");
+    int fd    = ::mkstemp(tmpl.data());
     REQUIRE(fd >= 0);
     ::close(fd);
-    ::unlink(tmpl);
-    _path = tmpl;
+    ::unlink(tmpl.data());
+    _path.assign(tmpl.data());
   }
   ~scoped_temp_db_path()
   {
@@ -410,6 +412,54 @@ TEST_CASE_METHOD(top_n_plan_shape_fixture,
   REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::FILTER) != nullptr);
   CHECK(after.top_n_first_key_scan_targets > before.top_n_first_key_scan_targets);
   CHECK(after.top_n_sites_skipped_no_work_saved == before.top_n_sites_skipped_no_work_saved);
+  auto slots = single_scan_slots(plan.get());
+  REQUIRE(slots.size() == 1);
+  CHECK(slots.front().referenced_ordinals.empty());
+}
+
+TEST_CASE_METHOD(top_n_plan_shape_fixture,
+                 "top-n plan shape - a computing projection above a native scan makes the site "
+                 "material",
+                 "[plan_tree_shape][isolated_context][top_n]")
+{
+  top_n_filter_switch_guard flag(*con, true);
+  auto* state = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
+  REQUIRE(state != nullptr);
+  auto const before = state->get_dynamic_filter_stats_snapshot();
+
+  // The projection counterpart of the FILTER case above: `v % 7` is a non-traced select-list
+  // entry the projection computes for every row, so the hop is material and the boundary applied
+  // at the scan prunes rows before the projection evaluates them. The pass-through variant
+  // (`SELECT v FROM facts ...`) is the skip case above.
+  auto plan = generate_sirius_plan(*con, "SELECT v % 7 AS w, v FROM facts ORDER BY v LIMIT 10");
+  auto const after = state->get_dynamic_filter_stats_snapshot();
+
+  // Premise: the plan really holds a computing PROJECTION between the TOP_N and the scan. If
+  // DuckDB ever hoists the projection above the TOP_N, this fails loudly instead of letting the
+  // assertions below pass vacuously.
+  auto* top_n = find_first(plan.get(), SiriusPhysicalOperatorType::TOP_N);
+  REQUIRE(top_n != nullptr);
+  bool computing_projection_below_top_n = false;
+  for_each_operator(top_n, [&](sirius_physical_operator* node) {
+    if (node->type != SiriusPhysicalOperatorType::PROJECTION) { return; }
+    auto const& projection = node->Cast<sirius::op::sirius_physical_projection>();
+    for (auto const& entry : projection.select_list) {
+      if (!sirius::planner::projection_reference_input(*entry).has_value()) {
+        computing_projection_below_top_n = true;
+      }
+    }
+  });
+  REQUIRE(computing_projection_below_top_n);
+
+  // The WI-0 flip, mirroring the shields-material-work case: the scan target binds, nothing is
+  // skipped, and the native wrapper applies AST row masks post-decode.
+  CHECK(after.top_n_first_key_scan_targets > before.top_n_first_key_scan_targets);
+  CHECK(after.top_n_sites_skipped_no_work_saved == before.top_n_sites_skipped_no_work_saved);
+  auto const filters = scan_route_filters(plan.get());
+  REQUIRE(filters.size() == 1);
+  CHECK(filters.front()->provenance() == dynamic_filter_endpoint_provenance::scan_route);
+  CHECK(filters.front()->effective_mode() ==
+        sirius::op::scan::dynamic_filter_apply_mode::include_ast_row_masks);
   auto slots = single_scan_slots(plan.get());
   REQUIRE(slots.size() == 1);
   CHECK(slots.front().referenced_ordinals.empty());

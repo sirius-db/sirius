@@ -752,6 +752,12 @@ detail::boundary_filter_result sirius_dynamic_range_filter::apply_compact(
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr) const
 {
+  // Consumer-leg type check: the fused kernel reads the key column at the boundary's width and
+  // scale, so a batch whose key column differs must never be compared, only passed through (see
+  // the header's apply_compact contract). data_type equality includes the scale.
+  if (key_columns.empty() || batch.column(key_columns.front()).type() != _bound.storage_type()) {
+    return detail::boundary_filter_result{.filtered = nullptr, .rows_kept = batch.num_rows()};
+  }
   // No replica lookup: the boundary travels in launch parameters, so this works on any device.
   return detail::apply_boundary_filter(batch, key_columns, _compaction_params, stream, mr);
 }
@@ -837,6 +843,19 @@ detail::boundary_filter_result sirius_dynamic_lex_range_filter::apply_compact(
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr) const
 {
+  // Consumer-leg type check, per component: an arity or type mismatch would make the kernel read
+  // a wrong column at a wrong width, so one bad component degrades the whole batch to all-pass
+  // (see the header's apply_compact contract). data_type equality includes the scale.
+  auto const cannot_apply = [&]() {
+    if (key_columns.size() != _key_semantics.size()) { return true; }
+    for (std::size_t i = 0; i < _key_semantics.size(); ++i) {
+      if (batch.column(key_columns[i]).type() != _key_semantics[i].storage_type) { return true; }
+    }
+    return false;
+  };
+  if (cannot_apply()) {
+    return detail::boundary_filter_result{.filtered = nullptr, .rows_kept = batch.num_rows()};
+  }
   return detail::apply_boundary_filter(batch, key_columns, _compaction_params, stream, mr);
 }
 

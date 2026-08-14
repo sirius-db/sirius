@@ -219,15 +219,24 @@ struct multi_key_route_terminal {
 /**
  * @brief Whether an accepted hop crosses per-row work a target below it would save
  *
- * Material today means `FILTER`: a target below it prunes rows the filter would otherwise
- * evaluate. Pass-through projections, `UNION` fan-out, and existing endpoints move no work, so a
- * site separated from the Top-N input by those alone saves nothing -- the sink prefilter already
- * applies the same predicate over the same rows.
+ * Material means the hop's operator evaluates expressions per row: a `FILTER` evaluates its
+ * predicate, and a `PROJECTION` whose select list holds any non-reference entry computes that
+ * expression for every row (the traced entries are plain references by hop acceptance -- @ref
+ * projection_reference_input decides "reference" for the trace and for this check alike; the
+ * other entries need not be references, and they are what this check sees). Cost is
+ * deliberately not consulted: a cheap expression counts exactly like an expensive one, as a
+ * cheap `FILTER` predicate already does, because materiality asks whether per-row work exists
+ * between the site and the sink, not how much -- profitability under real data belongs to the
+ * runtime gates (sink keep-ratio, reader pruning gate). Reference-only projections and `UNION`
+ * fan-out move no work.
  *
- * Deliberate under-approximation: an accepted PROJECTION hop may still compute non-traced
- * expressions per row, and an existing endpoint applies masks per row; both count as immaterial
- * today, so the rule can only under-site -- skipping is always sound. Treating computing
- * projections as material (with a plan-shape test to pin it) is recorded follow-up work.
+ * Remaining under-approximation, deliberate: an existing `DYNAMIC_FILTER` endpoint applies row
+ * masks only when its channel holds an armed filter -- work that is conditional rather than
+ * structural -- and under the minimal hop set no Top-N trace can reach one (join-edge and
+ * scan-route endpoints sit inside join subtrees behind refused join hops; a Top-N's own
+ * endpoints splice after its traces run; scan wrappers are installed by a later pass). It stays
+ * immaterial; the decision becomes live with Stage-7 join-hop widening and is revisited there.
+ * Skipping is always sound, so the residual error can only under-site.
  */
 [[nodiscard]] bool hop_is_material(sirius::op::sirius_physical_operator const& node) noexcept;
 

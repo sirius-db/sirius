@@ -1,14 +1,16 @@
 # Dynamic Filters — Top-N API and Test Specification
 
-> **Status: Stages 1–4 implemented; Stages 5–7 proposed.** Companion to
+> **Status: Stages 1–5 implemented; Stage 6 in progress; Stage 7 partially landed.** Companion to
 > [dynamic-filters-top-n.md](dynamic-filters-top-n.md), which owns the design narrative and the
 > normative contract. This document turns that contract into a header-level API surface and an
 > example-driven high-level test plan. Stage numbers refer to the main doc's seven-stage rollout.
-> The Stage 1–4 surfaces below are implemented and behind `enable_top_n_dynamic_filter` (default
-> false) — producers publish, with scan binds and sited endpoints of both layers live,
-> and set operations a trace terminal; the remaining Stage 5–7 surfaces stay
-> proposed. Declarations here stay the authority — where an
-> implemented signature differs, the doc is corrected, not the code.
+> The Stage 1–5 surfaces below are implemented and behind `enable_top_n_dynamic_filter` (default
+> false) — row and group-key producers publish, with scan binds and sited endpoints of both
+> layers live, set operations a trace terminal, and consumption hardened by the siting rule, the
+> pinned-serve flip, and the reader pruning gate (the Phase 1–2 sections below). Stage 6's
+> measurement harness is in place with acceptance criteria unmeasured; Stage 7's remaining
+> surfaces stay proposed. Declarations here stay the authority — where an implemented signature
+> differs, the doc is corrected, not the code.
 
 ## Scope and untouched surface
 
@@ -600,14 +602,12 @@ class sirius_dynamic_range_filter final : public sirius_dynamic_filter,
  * so compaction works on any device from host state alone. `is_available_on_device` therefore
  * gates only the AST path's literal scalars.
  *
- * **Known gap — the consumer leg of the type contract is open.** The caller must ensure the
- * batch's key columns carry the same storage types the filter's boundary was built from; the
- * gated-apply path currently checks only the ordinal range, so a mismatch reads the consumer's
- * columns at the producer's widths. This is reachable in principle because cuDF derives a
- * decimal's width from the parquet *physical* type rather than the logical precision: a file
- * storing `DECIMAL(9,2)` as physical INT64 — legal parquet, though not a DuckDB or Spark
- * default — decodes as `DECIMAL64` while the catalog maps `DECIMAL32`. The fix is to pass the
- * batch through unfiltered on any type mismatch, matching the producer-side guard.
+ * **Consumer leg of the type contract (closed).** `apply_compact` verifies the batch itself:
+ * a key column whose `cudf::data_type` (width and scale) differs from the component's admitted
+ * storage type — reachable in principle because cuDF derives a decimal's width from the parquet
+ * *physical* type rather than the logical precision — yields the all-pass result instead of a
+ * comparison at the producer's widths. This mirrors the producer-side guard: both legs degrade
+ * to "no pruning", never to a wrong verdict.
  */
 class sirius_compaction_applicable {
  public:
@@ -1332,7 +1332,8 @@ Installation site: plan-shape layer (`DYNAMIC_FILTER` node presence, position, `
 Pruning effect and lifecycle: stats deltas (`top_n_offers`, `top_n_prefilter_rows_*`,
 `top_n_revisions_published`, the per-layer `top_n_{first_key,lex}_*` counters,
 the endpoint-site pair `top_n_{first_key,lex}_endpoint_sites_placed`, the post-decode consumer pair
-`post_decode_apply_rows_in/out`, and the reader-gate family `reader_gate_*`). Batch arrival order is not deterministic,
+`post_decode_apply_rows_in/out`, and the reader-gate family `reader_gate_*`).
+Batch arrival order is not deterministic,
 so row-level pruning counters are asserted as directions (`rows_out <= rows_in`, deltas `> 0`
 only where a single-batch shape forces them), matching the sibling doc's counter-contract rules.
 
@@ -1367,6 +1368,7 @@ shape publishes its strict predicate as RANGE, and multi-key shapes publish per 
 | 18 | Boundary-tie preservation | Scenario 15 data with duplicated boundary `grp` values and a `sum` aggregate | Exact equivalence — tied rows provably kept; inclusive predicates asserted via results, not counters (S5) | integration, sqllogic |
 | 19 | Pinned-cache-served scan | Scenario 1's query after `CALL pin_table(...)`, GPU and HOST tiers, plus an unpinned rerun | Scan target sited exactly as in 1, but no reader runs: the prepare-time `read_time_filter_bypass` promotes the wrapper to `include_ast_row_masks`; boundary applies post-decode and `post_decode_apply_rows_in/out` move; the unpinned rerun keeps them at zero on a Top-N-only channel (both directions pinned — under-flip and over-flip each fail one leg) (Phase 1) | plan, operator, integration |
 | 20 | Reader pruning gate | One clustered parquet file (ascending key, many splits) queried ascending (gate stays on) and descending (the adversary: gate disables), plus a pinned rerun and a flag-off rerun | Ascending: `reader_gate_measurements` and `reader_gate_row_groups_pruned` move, `reader_gate_disabled` stays 0. Descending: `reader_gate_disabled` >= 1, then `reader_gate_merges_skipped` > 0. Pinned rerun: all `reader_gate_*` flat while `post_decode_apply_rows_in` moves (zero samples, not zero pruning). Flag off: all `reader_gate_*` flat (Phase 2) | scan, integration |
+| 21 | Computing projection over a native scan | `SELECT v % 7 AS w, v FROM t ORDER BY v LIMIT 10` over the native table | **Scan bind at the native scan**: the projection's non-traced entry computes per row, so the hop is material and the post-decode wrapper prunes rows before the projection evaluates them; the pass-through variant (`SELECT v FROM t ...`) stays skipped | plan |
 
 Negative sub-cases (14): a tie-preserving rank shape — pinned DuckDB v1.5.4 has no `WITH TIES`
 grammar, so the negative is expressed as `RANK() OVER (ORDER BY …) <= n`, asserting no producer

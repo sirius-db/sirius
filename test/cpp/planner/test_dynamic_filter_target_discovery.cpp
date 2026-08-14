@@ -51,6 +51,7 @@ namespace {
 using sirius::planner::descent_policy;
 using sirius::planner::descent_steps;
 using sirius::planner::group_by_key_input;
+using sirius::planner::hop_is_material;
 using sirius::planner::join_block_descent;
 using sirius::planner::place_endpoint;
 using sirius::planner::projection_reference_input;
@@ -588,6 +589,44 @@ TEST_CASE("trace_probe_key and place_endpoint agree on the site for a spliced ke
   REQUIRE(placed.site_ordinals == std::vector<std::size_t>{5});
   REQUIRE(endpoints.size() == 1);
   REQUIRE(endpoints[0]->children[0].get() == placed_scan);
+}
+
+// ---------------------------------------------------------------------------------------------
+// hop_is_material
+// ---------------------------------------------------------------------------------------------
+
+TEST_CASE("hop_is_material counts computing projections and nothing else new",
+          "[dynamic_filter][placement][discovery]")
+{
+  SECTION("a reference-only projection moves no work")
+  {
+    auto const projection = make_projection(make_select_list(make_reference(0), make_reference(3)));
+    REQUIRE_FALSE(hop_is_material(*projection));
+  }
+
+  SECTION("one non-reference entry among references makes the projection material")
+  {
+    // The traced-entry-is-reference shape: the trace descends through the references while the
+    // cast entry is the per-row work a target below would save.
+    auto const projection =
+      make_projection(make_select_list(make_reference(0), make_cast(1), make_reference(2)));
+    REQUIRE(hop_is_material(*projection));
+  }
+
+  SECTION("a FILTER stays material")
+  {
+    auto const filter = make_passthrough_filter(/*width=*/3);
+    REQUIRE(hop_is_material(*filter));
+  }
+
+  SECTION("an existing DYNAMIC_FILTER endpoint stays immaterial")
+  {
+    // Pins the header contract's Decision 2 at the only level a plan cannot reach: under the
+    // minimal hop set no Top-N trace encounters an endpoint, and its masking is conditional on
+    // an armed channel rather than structural.
+    auto const endpoint = make_endpoint_operator(/*width=*/3);
+    REQUIRE_FALSE(hop_is_material(*endpoint));
+  }
 }
 
 // ---------------------------------------------------------------------------------------------

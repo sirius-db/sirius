@@ -75,18 +75,37 @@ using host_value  = std::optional<std::int64_t>;
 using host_column = std::vector<host_value>;
 
 constexpr auto k_int32 = cudf::data_type{cudf::type_id::INT32};
+constexpr auto k_int64 = cudf::data_type{cudf::type_id::INT64};
 
 exact_host_scalar int32_bound(std::int32_t v) { return exact_host_scalar{v, k_int32}; }
 
-top_n_key_semantics int32_key(cudf::order order, cudf::null_order null_order)
+/// A boundary holding @p rep at @p type, with the variant alternative matching the type's width.
+/// For a decimal @p type the rep at the type's scale *is* its scaled integer.
+exact_host_scalar typed_bound(std::int64_t rep, cudf::data_type type)
 {
-  return {.storage_type = k_int32, .order = order, .null_order = null_order};
+  if (type.id() == cudf::type_id::INT32 || type.id() == cudf::type_id::DECIMAL32) {
+    return exact_host_scalar{static_cast<std::int32_t>(rep), type};
+  }
+  return exact_host_scalar{rep, type};
 }
 
-/// One nullable INT32 column; `std::nullopt` rows are null.
-std::unique_ptr<cudf::column> make_int32_column(host_column const& values,
-                                                rmm::cuda_stream_view stream,
-                                                rmm::device_async_resource_ref mr)
+top_n_key_semantics typed_key(cudf::data_type type, cudf::order order, cudf::null_order null_order)
+{
+  return {.storage_type = type, .order = order, .null_order = null_order};
+}
+
+top_n_key_semantics int32_key(cudf::order order, cudf::null_order null_order)
+{
+  return typed_key(k_int32, order, null_order);
+}
+
+/// One nullable column of @p type (INT32, INT64, DECIMAL32, or DECIMAL64); `std::nullopt` rows
+/// are null. Decimal reps come straight from the host ints -- a fixed-point value at the column's
+/// scale *is* its scaled integer -- so one host representation serves every admitted width.
+std::unique_ptr<cudf::column> make_column(host_column const& values,
+                                          cudf::data_type type,
+                                          rmm::cuda_stream_view stream,
+                                          rmm::device_async_resource_ref mr)
 {
   auto const size = static_cast<cudf::size_type>(values.size());
   auto null_mask  = cudf::create_null_mask(size, cudf::mask_state::ALL_VALID, stream, mr);
@@ -98,19 +117,39 @@ std::unique_ptr<cudf::column> make_int32_column(host_column const& values,
       ++null_count;
     }
   }
+  auto const fixed_point =
+    type.id() == cudf::type_id::DECIMAL32 || type.id() == cudf::type_id::DECIMAL64;
   auto column =
-    cudf::make_numeric_column(k_int32, size, std::move(null_mask), null_count, stream, mr);
-  std::vector<std::int32_t> host(values.size(), 0);
-  for (std::size_t i = 0; i < values.size(); ++i) {
-    if (values[i]) { host[i] = static_cast<std::int32_t>(*values[i]); }
-  }
-  if (!host.empty()) {
-    cudaMemcpy(column->mutable_view().data<std::int32_t>(),
-               host.data(),
-               host.size() * sizeof(std::int32_t),
-               cudaMemcpyHostToDevice);
+    fixed_point
+      ? cudf::make_fixed_point_column(type, size, std::move(null_mask), null_count, stream, mr)
+      : cudf::make_numeric_column(type, size, std::move(null_mask), null_count, stream, mr);
+  auto const copy_reps = [&](auto rep_tag) {
+    using rep_type = decltype(rep_tag);
+    std::vector<rep_type> host(values.size(), 0);
+    for (std::size_t i = 0; i < values.size(); ++i) {
+      if (values[i]) { host[i] = static_cast<rep_type>(*values[i]); }
+    }
+    if (!host.empty()) {
+      cudaMemcpy(column->mutable_view().head<rep_type>(),
+                 host.data(),
+                 host.size() * sizeof(rep_type),
+                 cudaMemcpyHostToDevice);
+    }
+  };
+  if (type.id() == cudf::type_id::INT32 || type.id() == cudf::type_id::DECIMAL32) {
+    copy_reps(std::int32_t{});
+  } else {
+    copy_reps(std::int64_t{});
   }
   return column;
+}
+
+/// One nullable INT32 column; `std::nullopt` rows are null.
+std::unique_ptr<cudf::column> make_int32_column(host_column const& values,
+                                                rmm::cuda_stream_view stream,
+                                                rmm::device_async_resource_ref mr)
+{
+  return make_column(values, k_int32, stream, mr);
 }
 
 /// Evaluate a lowered fragment and report which rows survive `apply_boolean_mask` semantics: a
@@ -190,7 +229,8 @@ bool lex_keeps(std::vector<host_column> const& columns,
       if (!value && !bound) { continue; }
       return !value.has_value() == nulls_first;
     }
-    auto const bound_value = std::get<std::int32_t>(bound->value());
+    auto const bound_value =
+      std::visit([](auto v) { return static_cast<std::int64_t>(v); }, bound->value());
     if (*value == bound_value) { continue; }
     bool const less = *value < bound_value;
     return components[i].key.order == cudf::order::DESCENDING ? !less : less;
@@ -198,16 +238,21 @@ bool lex_keeps(std::vector<host_column> const& columns,
   return inclusive;
 }
 
+/// @param key_types Per-key-column storage types; empty means all-INT32. The row-id witness
+/// column appended below stays INT32 regardless -- only key columns matter to the kernel.
 std::vector<bool> compaction_survivors(sirius_compaction_applicable const& filter,
                                        std::vector<host_column> const& columns,
                                        rmm::cuda_stream_view stream,
-                                       rmm::device_async_resource_ref mr)
+                                       rmm::device_async_resource_ref mr,
+                                       std::vector<cudf::data_type> const& key_types = {})
 {
+  REQUIRE((key_types.empty() || key_types.size() == columns.size()));
   std::vector<std::unique_ptr<cudf::column>> owned;
   std::vector<cudf::column_view> views;
   std::vector<cudf::size_type> key_columns;
   for (std::size_t i = 0; i < columns.size(); ++i) {
-    owned.push_back(make_int32_column(columns[i], stream, mr));
+    owned.push_back(
+      make_column(columns[i], key_types.empty() ? k_int32 : key_types[i], stream, mr));
     views.push_back(owned.back()->view());
     key_columns.push_back(static_cast<cudf::size_type>(i));
   }
@@ -379,6 +424,49 @@ TEST_CASE("RANGE lowers to the documented comparison under both null policies",
   REQUIRE(actual == expected);
 }
 
+TEST_CASE("RANGE decimal null policies match the SQL reference", "[dynamic_filter][top_n]")
+{
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = space->get_default_allocator();
+
+  auto const type      = GENERATE(cudf::data_type{cudf::type_id::DECIMAL32, -2},
+                             cudf::data_type{cudf::type_id::DECIMAL64, -3});
+  auto const side      = GENERATE(range_bound_side::LOWER, range_bound_side::UPPER);
+  bool const inclusive = GENERATE(false, true);
+  auto const policy =
+    GENERATE(dynamic_filter_null_policy::ADMIT, dynamic_filter_null_policy::REJECT);
+  CAPTURE(type.id() == cudf::type_id::DECIMAL64,
+          side == range_bound_side::LOWER,
+          inclusive,
+          policy == dynamic_filter_null_policy::ADMIT);
+
+  // At equal storage type (which apply_compact now enforces) decimal reps compare exactly as
+  // their scaled integers, so the INT32 oracle serves unchanged: the reference takes reps.
+  constexpr std::int64_t k_bound_rep = 4000;
+  host_column const reps{3999, 4000, 4001, std::nullopt, 0, 10000};
+
+  sirius_dynamic_range_filter const filter{typed_bound(k_bound_rep, type), side, inclusive, policy};
+  std::vector<bool> expected(reps.size());
+  for (std::size_t i = 0; i < reps.size(); ++i) {
+    expected[i] = range_keeps(reps[i], k_bound_rep, side, inclusive, policy);
+  }
+
+  // The fused compaction pass, null policy included (ADMIT keeps null reps, REJECT drops them).
+  REQUIRE(compaction_survivors(filter, {reps}, stream, mr, {type}) == expected);
+
+  // The reader AST path over the same rows: the ADMIT `IS_NULL OR cmp` wrap and the REJECT bare
+  // comparison's null-verdict drop, now with a fixed-point literal.
+  auto column      = make_column(reps, type, stream, mr);
+  auto const table = cudf::table_view{{column->view()}};
+  cudf::ast::tree tree;
+  auto const& column_ref = tree.emplace<cudf::ast::column_reference>(0);
+  auto const& root       = filter.to_ast(tree, column_ref);
+  REQUIRE(evaluate_keep(table, root, stream) == expected);
+}
+
 TEST_CASE("LEX_RANGE lowering matches the derivation table across directions and null orders",
           "[dynamic_filter][top_n]")
 {
@@ -435,6 +523,70 @@ TEST_CASE("LEX_RANGE lowering matches the derivation table across directions and
 
   // The same filter's compaction path must agree with its own AST lowering, row for row.
   REQUIRE(compaction_survivors(filter, columns, stream, mr) == expected);
+}
+
+TEST_CASE("LEX decimal null derivations match the reference", "[dynamic_filter][top_n]")
+{
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = space->get_default_allocator();
+
+  // Mixed widths are the sharper marshalling case: a DECIMAL32 head beside a DECIMAL64 tail means
+  // a per-component width error cannot cancel out across the tuple.
+  auto const k_dec32_s2 = cudf::data_type{cudf::type_id::DECIMAL32, -2};
+  auto const k_dec64_s2 = cudf::data_type{cudf::type_id::DECIMAL64, -2};
+
+  auto const head_order         = GENERATE(cudf::order::ASCENDING, cudf::order::DESCENDING);
+  auto const tail_order         = GENERATE(cudf::order::ASCENDING, cudf::order::DESCENDING);
+  auto const tail_nulls         = GENERATE(cudf::null_order::BEFORE, cudf::null_order::AFTER);
+  bool const inclusive          = GENERATE(false, true);
+  bool const null_tail_boundary = GENERATE(false, true);
+  CAPTURE(head_order == cudf::order::DESCENDING,
+          tail_order == cudf::order::DESCENDING,
+          tail_nulls == cudf::null_order::BEFORE,
+          inclusive,
+          null_tail_boundary);
+
+  std::vector<lex_component_semantics> const components{
+    {.consumer_ordinal = 0, .key = typed_key(k_dec32_s2, head_order, cudf::null_order::AFTER)},
+    {.consumer_ordinal = 1, .key = typed_key(k_dec64_s2, tail_order, tail_nulls)}};
+  // The null tail boundary variant runs the disengaged-component terms (`IS NULL` /
+  // `NOT IS_NULL` / dropped disjunct) on decimal columns.
+  std::vector<std::optional<exact_host_scalar>> boundary_components{
+    typed_bound(5, k_dec32_s2),
+    null_tail_boundary ? std::optional<exact_host_scalar>{} : typed_bound(7, k_dec64_s2)};
+  exact_host_key_tuple const boundary{boundary_components};
+
+  // Reps spanning both sides of the head, head ties decided by the tail, and nulls on both keys.
+  std::vector<host_column> const columns{{4, 6, 5, 5, 5, 5, std::nullopt, 5},
+                                         {9, 0, 6, 7, 8, std::nullopt, 3, std::nullopt}};
+  std::vector<cudf::data_type> const key_types{k_dec32_s2, k_dec64_s2};
+
+  sirius_dynamic_lex_range_filter const filter{boundary, components, inclusive};
+
+  std::vector<bool> expected(columns[0].size());
+  for (std::size_t row = 0; row < columns[0].size(); ++row) {
+    expected[row] = lex_keeps(columns, boundary, components, inclusive, row);
+  }
+
+  // Both production paths against the one reference: the reader AST lowering...
+  std::vector<std::unique_ptr<cudf::column>> owned;
+  std::vector<cudf::column_view> views;
+  for (std::size_t i = 0; i < columns.size(); ++i) {
+    owned.push_back(make_column(columns[i], key_types[i], stream, mr));
+    views.push_back(owned.back()->view());
+  }
+  cudf::ast::tree tree;
+  auto const resolver = [&tree](std::size_t ordinal) -> cudf::ast::expression const& {
+    return tree.emplace<cudf::ast::column_reference>(static_cast<cudf::size_type>(ordinal));
+  };
+  auto const& root = filter.to_ast(tree, resolver);
+  REQUIRE(evaluate_keep(cudf::table_view{views}, root, stream) == expected);
+
+  // ...and the fused compaction pass.
+  REQUIRE(compaction_survivors(filter, columns, stream, mr, key_types) == expected);
 }
 
 //===----------------------------------------------------------------------===//
@@ -502,6 +654,121 @@ TEST_CASE("a single-component LEX boundary agrees with the equivalent RANGE",
   auto const range_keep = compaction_survivors(range, {columns[0]}, stream, mr);
   REQUIRE(lex_keep == range_keep);
   REQUIRE(lex_keep == std::vector<bool>{true, false, false, true, false});
+}
+
+TEST_CASE("a mismatched consumer column type makes compaction all-pass", "[dynamic_filter][top_n]")
+{
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = space->get_default_allocator();
+
+  // The consumer leg of the type contract: the kernel's widths are the producer's, so a batch
+  // whose key columns differ in width or scale must pass through unfiltered rather than be
+  // compared. Each section chooses values a missing guard would deterministically drop, so this
+  // direct test is itself the guard's trigger.
+  auto const require_all_pass = [&](sirius_compaction_applicable const& filter,
+                                    std::vector<host_column> const& columns,
+                                    std::vector<cudf::data_type> const& types) {
+    std::vector<std::unique_ptr<cudf::column>> owned;
+    std::vector<cudf::column_view> views;
+    std::vector<cudf::size_type> key_columns;
+    for (std::size_t i = 0; i < columns.size(); ++i) {
+      owned.push_back(make_column(columns[i], types[i], stream, mr));
+      views.push_back(owned.back()->view());
+      key_columns.push_back(static_cast<cudf::size_type>(i));
+    }
+    auto const batch  = cudf::table_view{views};
+    auto const result = filter.apply_compact(batch, key_columns, -1, stream, mr);
+    REQUIRE(result.filtered == nullptr);
+    REQUIRE(result.rows_kept == batch.num_rows());
+  };
+
+  SECTION("RANGE: an INT64 column against an INT32 boundary")
+  {
+    // All values sit strictly above the positive strict LOWER bound. Without the guard the
+    // kernel reads the INT64 column at width 4: element 1's load lands on element 0's high half
+    // (zero, little-endian), fails the bound, and drops a row -- so `filtered` going non-null is
+    // the deterministic symptom.
+    sirius_dynamic_range_filter const filter{int32_bound(10),
+                                             range_bound_side::LOWER,
+                                             /*inclusive=*/false,
+                                             dynamic_filter_null_policy::REJECT};
+    require_all_pass(filter, {host_column{50, 60, 70}}, {k_int64});
+  }
+
+  SECTION("LEX: a mismatched tail column poisons the whole batch")
+  {
+    // Head correct (INT32), tail INT64 against an INT32 component: one bad component degrades
+    // the whole batch to all-pass, never partial application. Head values tie the boundary so
+    // every verdict falls to the tail, whose true values all order worse than its bound -- a
+    // missing guard therefore drops rows deterministically.
+    std::vector<lex_component_semantics> const components{
+      {.consumer_ordinal = 0, .key = int32_key(cudf::order::ASCENDING, cudf::null_order::AFTER)},
+      {.consumer_ordinal = 1, .key = int32_key(cudf::order::ASCENDING, cudf::null_order::AFTER)}};
+    std::vector<std::optional<exact_host_scalar>> boundary_components{int32_bound(5),
+                                                                      int32_bound(10)};
+    sirius_dynamic_lex_range_filter const filter{exact_host_key_tuple{boundary_components},
+                                                 components,
+                                                 /*inclusive=*/false};
+    require_all_pass(filter, {host_column{5, 5, 5}, host_column{50, 60, 70}}, {k_int32, k_int64});
+  }
+
+  SECTION("DECIMAL32: ids agree, scales differ")
+  {
+    // The exact Stage-7 N1 case: same type id and width, different scale -- reachable because
+    // cuDF derives a decimal's width from the parquet physical type. `cudf::data_type` equality
+    // includes the scale, so plain `!=` covers it. The reps all order worse than the raw bound,
+    // so a missing guard's raw comparison drops every row.
+    auto const k_dec32_s2 = cudf::data_type{cudf::type_id::DECIMAL32, -2};
+    auto const k_dec32_s4 = cudf::data_type{cudf::type_id::DECIMAL32, -4};
+    sirius_dynamic_range_filter const filter{typed_bound(4000, k_dec32_s2),
+                                             range_bound_side::LOWER,
+                                             /*inclusive=*/false,
+                                             dynamic_filter_null_policy::REJECT};
+    require_all_pass(filter, {host_column{100, 200, 300}}, {k_dec32_s4});
+  }
+
+  SECTION("RANGE: an empty key-column set passes through")
+  {
+    // The merge site always supplies the channel column, so an empty set is reachable only
+    // through the public apply_compact seam -- which is exactly where the contract must hold:
+    // nothing to compare means nothing to drop. Without the short-circuit, front() on an empty
+    // span has no defined behavior.
+    sirius_dynamic_range_filter const filter{int32_bound(10),
+                                             range_bound_side::LOWER,
+                                             /*inclusive=*/false,
+                                             dynamic_filter_null_policy::REJECT};
+    auto const column = make_column(host_column{1, 2, 3}, k_int32, stream, mr);
+    std::vector<cudf::column_view> const views{column->view()};
+    auto const batch  = cudf::table_view{views};
+    auto const result = filter.apply_compact(batch, {}, -1, stream, mr);
+    REQUIRE(result.filtered == nullptr);
+    REQUIRE(result.rows_kept == batch.num_rows());
+  }
+
+  SECTION("LEX: an arity mismatch passes through")
+  {
+    // Two components but one supplied key column of the correct type, so only the arity clause
+    // can refuse. Without it the kernel would read a second key column that was never supplied.
+    std::vector<lex_component_semantics> const components{
+      {.consumer_ordinal = 0, .key = int32_key(cudf::order::ASCENDING, cudf::null_order::AFTER)},
+      {.consumer_ordinal = 1, .key = int32_key(cudf::order::ASCENDING, cudf::null_order::AFTER)}};
+    std::vector<std::optional<exact_host_scalar>> boundary_components{int32_bound(5),
+                                                                      int32_bound(10)};
+    sirius_dynamic_lex_range_filter const filter{exact_host_key_tuple{boundary_components},
+                                                 components,
+                                                 /*inclusive=*/false};
+    auto const head = make_column(host_column{1, 2, 3}, k_int32, stream, mr);
+    auto const tail = make_column(host_column{1, 2, 3}, k_int32, stream, mr);
+    std::vector<cudf::column_view> const views{head->view(), tail->view()};
+    auto const batch = cudf::table_view{views};
+    std::vector<cudf::size_type> const key_columns{0};
+    auto const result = filter.apply_compact(batch, key_columns, -1, stream, mr);
+    REQUIRE(result.filtered == nullptr);
+    REQUIRE(result.rows_kept == batch.num_rows());
+  }
 }
 
 //===----------------------------------------------------------------------===//

@@ -583,7 +583,7 @@ and consumer capability model.
 
 This phase is opportunistic — its value depends on where bottlenecks land after Phases 1 and 2. It is in the design so the producer side is not silently locked to "hash-join only" by Phase 1's choices.
 
-## Phase 4 — Dynamic refinement (proposed)
+## Phase 4 — Dynamic refinement (first producer implemented)
 
 **Goal:** generalize the *coordination* axis — producers update filters incrementally as they observe more data; consumers wait for finalization or apply progressively-tightening filters as they arrive. Use cases: streaming refinement, cross-pipeline channels with no implicit edge, adaptive runtime predicates.
 
@@ -593,11 +593,12 @@ readiness/finalization). Nothing implemented needs one: publication is single-sh
 probes and join-edge endpoints under the default task strategy are externally ordered after it,
 and transitive scan targets treat whatever immutable filters are visible as optional pruning.
 
-Top-N threshold refinement is now the concrete proposed Phase 4 use case. It keeps consumers
+Top-N threshold refinement is the first implemented Phase 4 producer. It keeps consumers
 nonblocking while adding a stable replacement slot, producer revisions, coherent channel
 generations, and progressively tighter immutable range snapshots. The complete design and staged
-rollout are in [Dynamic Filters — Top-N Threshold Refinement](dynamic-filters-top-n.md); the feature
-remains unimplemented.
+rollout are in [Dynamic Filters — Top-N Threshold Refinement](dynamic-filters-top-n.md);
+implemented behind `enable_top_n_dynamic_filter` (default false) through the aggregate group-key
+producer, with performance validation and trace widening outstanding.
 
 ---
 

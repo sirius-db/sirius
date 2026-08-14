@@ -53,7 +53,6 @@
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/scan_plan.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
-
 #include <unistd.h>
 
 #include <cstdint>
@@ -120,8 +119,34 @@ std::filesystem::path fixture_path(char const* file_name)
   return project_root() / "test/cpp/scan/data" / file_name;
 }
 
+/// Owns one test's fixture directory: cleared and created on construction, removed on
+/// destruction, so a failing CHECK/REQUIRE cannot leak the directory past the test.
+class scoped_fixture_dir {
+ public:
+  explicit scoped_fixture_dir(std::filesystem::path dir) : _dir(std::move(dir))
+  {
+    std::error_code ec;
+    std::filesystem::remove_all(_dir, ec);
+    std::filesystem::create_directories(_dir);
+  }
+  ~scoped_fixture_dir()
+  {
+    std::error_code ec;
+    std::filesystem::remove_all(_dir, ec);
+  }
+
+  scoped_fixture_dir(scoped_fixture_dir const&)            = delete;
+  scoped_fixture_dir& operator=(scoped_fixture_dir const&) = delete;
+
+  [[nodiscard]] std::filesystem::path const& path() const noexcept { return _dir; }
+
+ private:
+  std::filesystem::path _dir;
+};
+
 /**
- * @brief Write a decimal parquet file whose row groups hold disjoint, mostly negative bands
+ * @brief Write a decimal parquet file whose row groups hold disjoint, mostly negative bands into
+ * an existing directory (a `scoped_fixture_dir` owns it)
  *
  * Row group `g` holds amounts in `[(g - 5) * 10000, (g - 5) * 10000 + 2047]`, so the bands never
  * overlap and the first five are entirely negative. Pruning a predicate that selects only negative
@@ -134,10 +159,6 @@ std::filesystem::path write_banded_decimal_parquet(std::filesystem::path const& 
                                                    int precision,
                                                    int scale)
 {
-  std::error_code ec;
-  std::filesystem::remove_all(dir, ec);
-  std::filesystem::create_directories(dir);
-
   duckdb::DuckDB db(nullptr);
   duckdb::Connection con(db);
 
@@ -245,18 +266,16 @@ TEST_CASE("parquet decimal pushdown - every DuckDB decimal encoding keeps pushdo
 {
   for (auto const& encoding : ENCODINGS) {
     CAPTURE(encoding.precision, encoding.scale, encoding.physical_type);
-    auto const dir = std::filesystem::temp_directory_path() /
-                     ("pgi_decimal_pushdown_p" + std::to_string(encoding.precision) + "." +
-                      std::to_string(::getpid()));
+    scoped_fixture_dir const dir(std::filesystem::temp_directory_path() /
+                                 ("pgi_decimal_pushdown_p" + std::to_string(encoding.precision) +
+                                  "." + std::to_string(::getpid())));
     auto const path =
-      write_banded_decimal_parquet(dir, "amounts", encoding.precision, encoding.scale);
+      write_banded_decimal_parquet(dir.path(), "amounts", encoding.precision, encoding.scale);
 
     auto const outcome = scan_file(path, encoding.precision, encoding.scale, /*with_filter=*/true);
 
     INFO("A decimal column must not disable reader-side filter pushdown for its whole file");
     CHECK_FALSE(outcome.disable_filter_pushdown);
-
-    std::filesystem::remove_all(dir);
   }
 }
 
@@ -265,11 +284,11 @@ TEST_CASE("parquet decimal pushdown - row groups holding only negative amounts s
 {
   for (auto const& encoding : ENCODINGS) {
     CAPTURE(encoding.precision, encoding.scale, encoding.physical_type);
-    auto const dir = std::filesystem::temp_directory_path() /
-                     ("pgi_decimal_prune_p" + std::to_string(encoding.precision) + "." +
-                      std::to_string(::getpid()));
+    scoped_fixture_dir const dir(std::filesystem::temp_directory_path() /
+                                 ("pgi_decimal_prune_p" + std::to_string(encoding.precision) + "." +
+                                  std::to_string(::getpid())));
     auto const path =
-      write_banded_decimal_parquet(dir, "amounts", encoding.precision, encoding.scale);
+      write_banded_decimal_parquet(dir.path(), "amounts", encoding.precision, encoding.scale);
 
     auto const unfiltered = scan_file(path, encoding.precision, encoding.scale, false);
     REQUIRE(unfiltered.surviving_row_groups.size() == static_cast<std::size_t>(GROUP_COUNT));
@@ -281,8 +300,6 @@ TEST_CASE("parquet decimal pushdown - row groups holding only negative amounts s
     INFO("Pruning must keep exactly the row groups whose amounts are negative");
     CHECK(filtered.surviving_row_groups == std::vector<cudf::size_type>{0, 1, 2, 3, 4});
     CHECK(filtered.surviving_rows == static_cast<int64_t>(NEGATIVE_GROUP_COUNT) * ROWS_PER_GROUP);
-
-    std::filesystem::remove_all(dir);
   }
 }
 

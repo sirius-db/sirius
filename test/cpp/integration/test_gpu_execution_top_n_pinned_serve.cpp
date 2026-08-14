@@ -152,11 +152,15 @@ std::size_t pinned_entry_chunk_count(duckdb::Connection& con, std::string const&
     [&](std::string_view name, sirius::scan_manager::pinned_entry const& e) {
       if (name != entry_name) { return false; }
       found = true;
-      chunks =
-        e.tier == cucascade::memory::Tier::HOST
-          ? e.host_chunks.size()
-          : (e.data_batches_by_column.empty() ? 0
-                                              : e.data_batches_by_column.begin()->second.size());
+      // Mirrors try_match_cached_entry's storage dispatch; device_chunks takes priority.
+      if (e.tier == cucascade::memory::Tier::HOST) {
+        chunks = e.host_chunks.size();
+      } else if (!e.device_chunks.empty()) {
+        chunks = e.device_chunks.size();
+      } else {
+        chunks =
+          e.data_batches_by_column.empty() ? 0 : e.data_batches_by_column.begin()->second.size();
+      }
       return true;
     });
   REQUIRE(found);

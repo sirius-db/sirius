@@ -78,7 +78,7 @@ top_n_threshold_witness witness(std::vector<std::int32_t> const& values)
   std::vector<std::optional<exact_host_scalar>> components;
   components.reserve(values.size());
   for (auto const v : values) {
-    components.push_back(exact_host_scalar{v, k_int32});
+    components.emplace_back(exact_host_scalar{v, k_int32});
   }
   return {exact_host_key_tuple{std::move(components)}, {}};
 }
@@ -103,7 +103,7 @@ top_n_distinct_key_witness distinct_witness(std::vector<std::vector<std::int32_t
     std::vector<std::optional<exact_host_scalar>> components;
     components.reserve(key.size());
     for (auto const v : key) {
-      components.push_back(exact_host_scalar{v, k_int32});
+      components.emplace_back(exact_host_scalar{v, k_int32});
     }
     witness.best_keys.emplace_back(std::move(components));
   }
@@ -133,7 +133,12 @@ sirius::op::sirius_physical_table_scan scan_over(std::string table_function)
 
 TEST_CASE("terminal classification follows the documented table", "[dynamic_filter][top_n]")
 {
-  route_terminal const non_scan{.node = nullptr, .ordinal = 0};
+  // Any operator that is not a TABLE_SCAN serves as the non-scan terminal; classification
+  // consults only the node's type. (A trace terminal always carries a real node -- the walk
+  // bottoms out at worst at the root -- and classify_top_n_terminal asserts that.)
+  sirius::op::sirius_physical_operator non_scan_node{
+    sirius::op::SiriusPhysicalOperatorType::PROJECTION, {}, /*estimated_cardinality=*/0};
+  route_terminal const non_scan{.node = &non_scan_node, .ordinal = 0};
   auto scan_node = scan_over("seq_scan");
   route_terminal const scan{.node = &scan_node, .ordinal = 0};
 

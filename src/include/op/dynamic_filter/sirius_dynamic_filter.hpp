@@ -567,7 +567,10 @@ class sirius_compaction_applicable {
    * caller passes its single channel column.
    * @param[in] device_id Device executing the pass, or -1 for the current device.
    * @return Null `filtered` when nothing was dropped or the filter cannot apply; `rows_kept`
-   * always valid.
+   * always valid. A batch whose key-column arity or types (width and scale) differ from the
+   * filter's admitted storage types cannot apply and yields the all-pass result -- the widths
+   * the fused kernel reads with are the producer's, so a mismatched column must never be
+   * compared, only passed through.
    */
   [[nodiscard]] virtual detail::boundary_filter_result apply_compact(
     cudf::table_view const& batch,
