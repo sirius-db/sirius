@@ -8,8 +8,10 @@ This document covers the task creation subsystem: how the system decides when an
 
 The `task_creator` is a multi-threaded component that converts operator scheduling requests into concrete scan or GPU pipeline tasks. It maintains global state maps for each operator type and uses a hint-chain recursion to find the deepest ready operator.
 
-Task creation policy is internal and currently demand-driven. The engine retains its lookahead
-primitive for policy-controlled use, but users do not select it through YAML.
+Task creation policy is internal and currently demand-driven, with source-side
+pipelines prioritized first within each branch. The engine retains its
+lookahead and reverse-priority primitives for policy-controlled use, but users
+do not select either through YAML.
 
 ## Core Flow
 
