@@ -27,6 +27,7 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <thread>
 
@@ -233,6 +234,13 @@ class itask_executor {
   exec::multi_index_priority_queue<itask> _task_queue;
   /// Non-owning; owned by SiriusContext and outlives this executor. Null in unit tests.
   exec::query_lifecycle_registry* _query_lifecycle{nullptr};
+  /// Serializes every stop-join-restart transition of _manager_thread (stop(), drain_and_wait(),
+  /// wait_and_drain_query()'s quiesce/resume bracket). Two queries failing concurrently reach
+  /// drain_after_error on the same executor; unserialized, the second resume_manager() assigns
+  /// onto the joinable thread the first just created — std::thread::operator= terminates. Same
+  /// bug class as downgrade_executor::_lifecycle_mutex. The success path
+  /// (wait_and_validate_empty) never touches _manager_thread and deliberately does not take this.
+  std::mutex _manager_lifecycle_mutex;
   std::thread _manager_thread;
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;

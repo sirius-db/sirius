@@ -91,7 +91,10 @@ void itask_executor::start()
                                                               _config.cpu_affinity_list,
                                                               get_per_thread_init());
   _task_queue.reactivate();
-  _manager_thread = std::thread([this] { manager_loop(); });
+  {
+    std::lock_guard<std::mutex> lifecycle_lock(_manager_lifecycle_mutex);
+    _manager_thread = std::thread([this] { manager_loop(); });
+  }
   on_start();
 }
 
@@ -99,6 +102,9 @@ void itask_executor::stop()
 {
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
+  // A drain bracket may be mid-quiesce; its interrupts are already in place, so waiting here
+  // cannot stall it — but joining/moving _manager_thread underneath it would be UB.
+  std::lock_guard<std::mutex> lifecycle_lock(_manager_lifecycle_mutex);
   _bounded_pool->interrupt();
   _task_queue.interrupt();
   on_stop();
@@ -123,6 +129,8 @@ void itask_executor::drain_query_tasks(sirius::query_id_t query_id)
 
 void itask_executor::drain_and_wait()
 {
+  std::lock_guard<std::mutex> lifecycle_lock(_manager_lifecycle_mutex);
+
   // Guard: if the executor has never been started (or has been stopped),
   // _bounded_pool is nullptr. drain_after_error may legitimately be called
   // before any work has been dispatched, in which case there is nothing to
@@ -238,6 +246,11 @@ void itask_executor::wait_and_drain_query(sirius::query_id_t query_id)
   // destroying every co-tenant's queued work and leaving those queries waiting on completions that
   // could never arrive. The residual cost is that co-tenant pushes are refused across the bracket
   // — on the error path only, not on every successful completion as before.
+  //
+  // The bracket must run to completion before another failing query's bracket may begin: an
+  // interleaved second quiesce no-ops on the already-joined manager, and its resume_manager()
+  // then assigns onto the joinable thread the first resume just created (std::terminate).
+  std::lock_guard<std::mutex> lifecycle_lock(_manager_lifecycle_mutex);
   if (!_bounded_pool) {
     drain_query_tasks(query_id);
     return;
