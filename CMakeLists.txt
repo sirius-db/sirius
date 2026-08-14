@@ -463,6 +463,12 @@ list(APPEND EXTENSION_SOURCES ${SIRIUS_SUBSTRAIT_SOURCES})
 build_static_extension(sirius ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 build_loadable_extension(sirius CPP ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 
+# The standalone FFI constructs an embedded DuckDB, which needs the no-op static
+# extension loader retained regardless of archive ordering.
+set_property(
+  TARGET sirius_loadable_extension
+  PROPERTY LINK_LIBRARY_OVERRIDE_dummy_static_extension_loader WHOLE_ARCHIVE)
+
 # rapidsai/rmm#826: DuckDB links the loadable extension with
 # -Wl,--exclude-libs,ALL, under which mold (but not bfd) hides RMM's GNU_UNIQUE
 # current-device-resource registry symbols, so cuDF's internal allocations
@@ -519,7 +525,9 @@ foreach(_target sirius_extension sirius_loadable_extension)
   # protobuf.
   target_include_directories(
     ${_target}
-    PRIVATE ${SIRIUS_SUBSTRAIT_DIR}/src/include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/extension/core_functions/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/extension/parquet/include
+            ${SIRIUS_SUBSTRAIT_DIR}/src/include
             ${SIRIUS_SUBSTRAIT_DIR}/third_party
             ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait)
 
@@ -542,6 +550,8 @@ foreach(_target sirius_extension sirius_loadable_extension)
     cuCascade::cucascade_cudf
     yaml-cpp::yaml-cpp
     telemetry_bridge
+    core_functions_extension
+    parquet_extension
     simpatico)
 
   add_dependencies(${_target} duckdb_static)

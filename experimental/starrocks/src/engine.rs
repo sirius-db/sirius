@@ -309,22 +309,10 @@ mod tests {
 
     /// End-to-end: drive a `local_files` parquet plan through the engine actor and read the rows
     /// back. Exercises the dedicated-thread bring-up, the channel round-trip, and GPU execution.
-    /// Requires a GPU and `LD_LIBRARY_PATH` to the built engine (like the `sirius` crate's context
-    /// test); the parquet extension path is set from `SIRIUS_BUILD_DIR` (default mirrors sirius-sys).
+    /// Requires a GPU and `LD_LIBRARY_PATH` to the built engine, like the `sirius` crate's context
+    /// test.
     #[test]
     fn engine_executes_local_files_plan() {
-        // Point the embedded DuckDB at the locally-built parquet extension so it can bind
-        // `parquet_scan`. This is the only context-constructing test in the crate, so no other
-        // thread reads the environment concurrently.
-        if std::env::var_os("SIRIUS_DUCKDB_PARQUET_EXTENSION").is_none() {
-            let manifest = env!("CARGO_MANIFEST_DIR");
-            let build_dir = std::env::var("SIRIUS_BUILD_DIR")
-                .unwrap_or_else(|_| format!("{manifest}/../../build/release"));
-            let parquet = format!("{build_dir}/extension/parquet/parquet.duckdb_extension");
-            // SAFETY: set before the engine thread brings up the context; no other thread reads it.
-            unsafe { std::env::set_var("SIRIUS_DUCKDB_PARQUET_EXTENSION", parquet) };
-        }
-
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rows.parquet");
         let schema = Arc::new(Schema::new(vec![
