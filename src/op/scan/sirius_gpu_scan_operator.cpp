@@ -30,6 +30,7 @@
 #include <sirius_context.hpp>
 
 // cudf
+#include <cudf/column/column_stream.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
@@ -130,7 +131,16 @@ std::unique_ptr<cudf::table> normalize_physical_schema(std::unique_ptr<cudf::tab
     auto const restoring = can_restore_to(actual, target);
     auto const narrowing = has_explicit_physical_schema && can_narrow_to(actual, target);
     if (actual == target || (!restoring && !narrowing)) { continue; }
-    columns[column_idx] = cast_through_rep(columns[column_idx]->view(), target, stream, mr);
+    // The assignment frees the source column. Its buffers may be stream-ordered
+    // on the stream that produced them (the pinned-cache upload), not on
+    // `stream`, so the free would be unordered against this still-running cast
+    // and the block could be handed to the next allocation mid-read. Rebind the
+    // source's deallocation onto `stream` so the free is enqueued behind the
+    // cast. No copy, no kernel, no host wait; the cast's column_view stays valid
+    // because rebinding relocates nothing.
+    auto casted         = cast_through_rep(columns[column_idx]->view(), target, stream, mr);
+    auto source         = cudf::rebind_stream(std::move(*columns[column_idx]), stream);
+    columns[column_idx] = std::move(casted);
     if (observer != nullptr) {
       if (narrowing) {
         observer->record_compressed_materialization_scan_columns_narrowed();
