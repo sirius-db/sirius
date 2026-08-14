@@ -643,7 +643,7 @@ bool run_raw_fastpath()
 // capture_scan_filter_selection must move+rebind the wave-1 buffers IFF
 // status == applied — including the untagged membership/partial-coverage
 // batches, which share the applied status — and must return empty WITHOUT
-// touching the result on bailed_high_selectivity / refused / failed.
+// touching the result on declined_unselective / refused / failed.
 bool run_capture_contract()
 {
   const rmm::cuda_stream_view stream{};
@@ -689,7 +689,7 @@ bool run_capture_contract()
     REQUIRE_MSG(static_cast<bool>(cap) && cap.row_indices == nullptr,
                 "mask-only applied capture must leave row_indices null");
   }
-  for (auto st : {scan_filter_status::bailed_high_selectivity,
+  for (auto st : {scan_filter_status::declined_unselective,
                   scan_filter_status::refused,
                   scan_filter_status::failed}) {
     auto r   = make_result(st, true);
