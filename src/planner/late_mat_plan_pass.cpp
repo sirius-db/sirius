@@ -251,6 +251,14 @@ std::vector<late_mat::defer_candidate> build_defer_candidates(
   for (auto const& life : lifetimes) {
     if (life.first_reader == nullptr) { continue; }
     if (life.scan_output_position >= scan.types.size()) { continue; }
+    // A join emits one scan row once per match, so materializing on its OUTPUT
+    // gathers a row set larger than the scan produced -- by the join's fan-out,
+    // which the per-row value model does not see. q20 rode 2 columns (40 B/row
+    // over 6 crossings, comfortably past both floors) into a hash join and cost
+    // 0.18 -> 3.33 s. A ride that ends where rows can multiply is refused until
+    // the policy can price that fan-out; ports that only ever reduce rows (an
+    // aggregate, a top-n) are unaffected, which is where q10's ride lands.
+    if (life.first_reader->type == SiriusPhysicalOperatorType::HASH_JOIN) { continue; }
 
     auto slot = std::find(readers.begin(), readers.end(), life.first_reader);
     if (slot == readers.end()) {
