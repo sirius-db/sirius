@@ -30,8 +30,10 @@
 #include <expression/ast/comparison.hpp>
 #include <expression/ast/node.hpp>
 #include <expression/ast/reference.hpp>
+#include <op/sirius_physical_concat.hpp>
 #include <op/sirius_physical_filter.hpp>
 #include <op/sirius_physical_hash_join.hpp>
+#include <op/sirius_physical_partition.hpp>
 #include <op/sirius_physical_projection.hpp>
 #include <planner/late_mat_plan_pass.hpp>
 
@@ -116,6 +118,31 @@ struct test_join : sirius::op::sirius_physical_hash_join {
   void link(sirius_physical_operator* parent) { _parent_op = parent; }
 };
 
+/// A key_source a partition can be built against that hashes on nothing: an
+/// NLJ reports a single partition, so the constructor records no keys. That is
+/// the payload-carrying partition — the one a ride must pass through.
+struct keyless_key_source : sirius::op::sirius_physical_operator {
+  keyless_key_source()
+    : sirius_physical_operator(
+        sirius::op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN, make_types(1), 0)
+  {
+  }
+};
+
+/// The plumbing a real plan puts around every join and aggregate. Both are
+/// pipeline sinks, so leaving one is the port crossing the policy weighs — and
+/// both are positionally transparent, which is what lets a payload reach a
+/// consumer several crossings up at all.
+struct test_partition : sirius::op::sirius_physical_partition {
+  using sirius_physical_partition::sirius_physical_partition;
+  void link(sirius_physical_operator* parent) { _parent_op = parent; }
+};
+
+struct test_concat : sirius::op::sirius_physical_concat {
+  using sirius_physical_concat::sirius_physical_concat;
+  void link(sirius_physical_operator* parent) { _parent_op = parent; }
+};
+
 }  // namespace
 
 TEST_CASE("a column nothing reads travels to the top of the plan", "[late_mat][lifetime]")
@@ -141,7 +168,9 @@ TEST_CASE("a column nothing reads travels to the top of the plan", "[late_mat][l
   REQUIRE(lives.size() == 3);
   for (auto const& life : lives) {
     REQUIRE(life.first_reader == nullptr);  // never read
-    REQUIRE(life.boundaries == 2);
+    // Two projections, and neither materializes: the payload rode past both
+    // inside one pipeline, which costs nothing and so counts as nothing.
+    REQUIRE(life.port_crossings == 0);
   }
   // Position is tracked, not assumed: scan col 0 sits at p1's output 1
   // (p1 slot 1 holds ref(0)), and p2's slot 0 holds ref(1), so it ends at 0.
@@ -159,7 +188,7 @@ TEST_CASE("a filter reads its predicate's columns and moves the rest", "[late_ma
 
   auto const lives = analyze_column_lifetimes(scan);
   REQUIRE(lives[0].first_reader == &filter);  // in the predicate: read
-  REQUIRE(lives[0].boundaries == 1);
+  REQUIRE(lives[0].port_crossings == 0);      // same pipeline as the scan
   REQUIRE(lives[1].first_reader == nullptr);  // merely carried past
   REQUIRE(lives[2].first_reader == nullptr);
 }
@@ -190,7 +219,6 @@ TEST_CASE("an unmodelled operator consumes everything", "[late_mat][lifetime]")
   auto const lives = analyze_column_lifetimes(scan);
   REQUIRE(lives[0].first_reader == &group_by);
   REQUIRE(lives[1].first_reader == &group_by);
-  REQUIRE(lives[0].boundaries == 1);
 }
 
 TEST_CASE("a column a projection drops stops there", "[late_mat][lifetime]")
@@ -261,7 +289,6 @@ TEST_CASE("columns that stop at the same operator bundle together", "[late_mat][
   auto const candidates = build_defer_candidates(scan, analyze_column_lifetimes(scan));
   REQUIRE(candidates.size() == 1);  // one reader, one slot
   REQUIRE(candidates[0].columns.size() == 3);
-  REQUIRE(candidates[0].boundaries == 1);
   // Four-byte integers: three of them, less the eight-byte rowid.
   REQUIRE(candidates[0].net_value_bytes(8) == 3 * 4 - 8);
 }
@@ -322,44 +349,162 @@ TEST_CASE("nothing is nullified on a ride with no outer join", "[late_mat][lifet
 
 namespace {
 
-/// A chain of pass-through projections, so a ride can be made long enough to
-/// clear the policy's boundary floor. Returned by value; the caller links them.
-std::vector<std::unique_ptr<test_projection>> pass_through_chain(std::size_t columns,
-                                                                 std::size_t links)
+/// A chain of partitions, which is what a ride long enough to clear the
+/// policy's floor actually looks like: each is a pipeline sink, so each costs
+/// one port crossing, and each is positionally transparent.
+std::vector<std::unique_ptr<test_partition>> partition_chain(std::size_t columns,
+                                                             std::size_t links,
+                                                             keyless_key_source& keys)
 {
-  std::vector<std::unique_ptr<test_projection>> chain;
+  std::vector<std::unique_ptr<test_partition>> chain;
   for (std::size_t i = 0; i < links; ++i) {
-    duckdb::vector<std::unique_ptr<sirius::ast::node>> list;
-    for (std::size_t c = 0; c < columns; ++c) {
-      list.push_back(ref(static_cast<std::uint32_t>(c)));
-    }
     chain.push_back(
-      std::make_unique<test_projection>(make_string_types(columns), std::move(list), 0));
+      std::make_unique<test_partition>(make_string_types(columns), 0, &keys, /*is_build=*/false));
   }
   return chain;
 }
 
-}  // namespace
-
-TEST_CASE("a wide bundle over a long ride plans a deferral at its reader", "[late_mat][lifetime]")
+/// Link `scan -> chain[0] -> ... -> chain.back() -> top`.
+template <typename Scan, typename Chain, typename Top>
+void link_chain(Scan& scan, Chain& chain, Top& top)
 {
-  // Five string columns carried past four projections into an aggregate that
-  // reads them: the q10 shape, and the one the measurements were taken on.
-  wide_scan scan(5);
-  opaque_op aggregate(5);
-  auto chain = pass_through_chain(5, 4);
   scan.link(chain.front().get());
   for (std::size_t i = 0; i + 1 < chain.size(); ++i) {
     chain[i]->link(chain[i + 1].get());
   }
-  chain.back()->link(&aggregate);
+  chain.back()->link(&top);
+}
+
+}  // namespace
+
+TEST_CASE("only a pipeline sink costs the ride anything", "[late_mat][lifetime]")
+{
+  // A projection and a filter hand their columns on inside one pipeline; a
+  // partition writes them to a repository for the next one to read. Only the
+  // second is what a deferral saves, so only the second is counted — otherwise
+  // a chain of projections would look like a ride worth paying to defer.
+  keyless_key_source keys;
+  opaque_op reader(2);
+
+  // scan -> partition -> reader
+  wide_scan bare(2);
+  test_partition bare_partition(make_string_types(2), 0, &keys, false);
+  bare.link(&bare_partition);
+  bare_partition.link(&reader);
+
+  // scan -> projection -> partition -> reader: one more operator, the same
+  // number of materializations.
+  wide_scan projected(2);
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> list;
+  list.push_back(ref(0));
+  list.push_back(ref(1));
+  test_projection projection(make_string_types(2), std::move(list), 0);
+  test_partition projected_partition(make_string_types(2), 0, &keys, false);
+  projected.link(&projection);
+  projection.link(&projected_partition);
+  projected_partition.link(&reader);
+
+  auto const plain   = analyze_column_lifetimes(bare);
+  auto const through = analyze_column_lifetimes(projected);
+  REQUIRE(plain[0].first_reader == &reader);
+  REQUIRE(through[0].first_reader == &reader);
+  // The projection cost the ride nothing, so it is worth nothing to defer past.
+  REQUIRE(through[0].port_crossings == plain[0].port_crossings);
+  // And the partition passed the column through rather than ending its life.
+  REQUIRE(through[0].position_at_reader == 0);
+}
+
+TEST_CASE("a join-child wrap concat carries the payload past", "[late_mat][lifetime]")
+{
+  // The concat gathers the partitions of ONE flow — the generator builds it at
+  // exactly one site, wrapping one child of one join — so a payload crossing it
+  // still comes from where the scan said it did, and the ride continues.
+  duckdb::LogicalDummyScan stub(0);
+  stub.types = duckdb::vector<duckdb::LogicalType>(2, duckdb::LogicalType::VARCHAR);
+  duckdb::vector<sirius::join_condition> conditions;
+  test_join downstream(stub,
+                       duckdb::make_uniq<wide_scan>(2),
+                       duckdb::make_uniq<wide_scan>(2),
+                       std::move(conditions),
+                       duckdb::JoinType::INNER,
+                       /*estimated_cardinality=*/1);
+  opaque_op reader(2);
+
+  wide_scan scan(2);
+  test_concat wrap(make_string_types(2), 0, &downstream, /*is_build=*/false);
+  wrap.children.push_back(duckdb::make_uniq<wide_scan>(2));
+  scan.link(&wrap);
+  wrap.link(&reader);
+
+  auto const lives = analyze_column_lifetimes(scan);
+  REQUIRE(lives[0].first_reader == &reader);
+  REQUIRE(lives[0].position_at_reader == 0);
+  // A concat is a pipeline sink, so crossing it is what the ride is paying for.
+  REQUIRE(lives[0].port_crossings == 1);
+}
+
+TEST_CASE("a join key may not be deferred, however far it rides", "[late_mat][lifetime]")
+{
+  // The danger is the PARTITION, not the join: it hashes the key to place a
+  // row, and a rowid hashes differently from the value it stands for, so equal
+  // keys would land in different partitions and the join would miss matches.
+  // Stopping the ride at the join would not help — the port materializes at the
+  // join's input, after the partition has already hashed. So the partition
+  // itself reports the key read, from the positions it resolved at plan time.
+  duckdb::LogicalDummyScan stub(0);
+  stub.types = duckdb::vector<duckdb::LogicalType>(6, duckdb::LogicalType::VARCHAR);
+  duckdb::vector<sirius::join_condition> conditions;
+  sirius::join_condition condition;
+  condition.left  = std::make_unique<sirius::ast::node>(sirius::ast::reference{0, string_type()});
+  condition.right = std::make_unique<sirius::ast::node>(sirius::ast::reference{0, string_type()});
+  conditions.push_back(std::move(condition));
+  test_join join(stub,
+                 duckdb::make_uniq<wide_scan>(3),
+                 duckdb::make_uniq<wide_scan>(3),
+                 std::move(conditions),
+                 duckdb::JoinType::INNER,
+                 /*estimated_cardinality=*/1);
+
+  // Insert the wrap a real plan builds between the join and its probe child:
+  // PARTITION(keys from the join) -> the scan.
+  auto wrap = duckdb::make_uniq<test_partition>(
+    make_string_types(3), 0, /*key_source=*/&join, /*is_build=*/false);
+  auto* partition = wrap.get();
+  REQUIRE(partition->partition_keys() == std::vector<int>{0});
+  wrap->children.push_back(std::move(join.children[0]));
+  auto* scan       = static_cast<wide_scan*>(wrap->children[0].get());
+  join.children[0] = std::move(wrap);
+  scan->link(partition);
+  partition->link(&join);
+
+  auto const lives = analyze_column_lifetimes(*scan);
+  // Column 0 is the key, and the partition is where that is recognised — one
+  // operator before the join could have told us.
+  REQUIRE(lives[0].first_reader == partition);
+  REQUIRE(lives[0].read_as_join_key);
+  REQUIRE_FALSE(lives[1].read_as_join_key);  // merely carried beside it
+
+  auto const planned = sirius::planner::plan_deferral(*scan);
+  REQUIRE(planned.join_keys_skipped == 1);
+}
+
+TEST_CASE("a wide bundle over a long ride plans a deferral at its reader", "[late_mat][lifetime]")
+{
+  // Five string columns carried across four port crossings into an aggregate
+  // that reads them: the q10 shape, and the one the measurements were taken on.
+  wide_scan scan(5);
+  opaque_op aggregate(5);
+  keyless_key_source keys;
+  auto chain = partition_chain(5, 3, keys);
+  link_chain(scan, chain, aggregate);
 
   auto const planned = sirius::planner::plan_deferral(scan);
   REQUIRE(planned.installable());
   REQUIRE(planned.port == &aggregate);
   REQUIRE(planned.positions == std::vector<std::size_t>{0, 1, 2, 3, 4});
   REQUIRE(planned.restored_types.size() == 5);
-  REQUIRE(planned.boundaries == 5);
+  // Leaving the scan and leaving each of the three partitions.
+  REQUIRE(planned.boundaries == 4);
   REQUIRE(planned.net_value_bytes == 5 * 24 - 8);
   REQUIRE(planned.census.size() == 1);
   REQUIRE(planned.census.front().installed());
@@ -367,7 +512,7 @@ TEST_CASE("a wide bundle over a long ride plans a deferral at its reader", "[lat
 
 TEST_CASE("a short ride plans nothing, and says so", "[late_mat][lifetime]")
 {
-  // Same wide bundle, read one boundary up. The ride does not repay the
+  // Same wide bundle, read one crossing up. The ride does not repay the
   // materialization, and the refusal is recorded rather than dropped — a
   // deferral that silently did not happen looks like one that did nothing.
   wide_scan scan(5);
@@ -394,18 +539,11 @@ TEST_CASE("one rowid rides, so the narrower of two bundles is refused", "[late_m
   test_filter filter(make_string_types(5), std::move(predicate), 0);
   opaque_op aggregate(5);
 
-  auto lower = pass_through_chain(5, 4);
-  auto upper = pass_through_chain(5, 4);
-  scan.link(lower.front().get());
-  for (std::size_t i = 0; i + 1 < lower.size(); ++i) {
-    lower[i]->link(lower[i + 1].get());
-  }
-  lower.back()->link(&filter);
-  filter.link(upper.front().get());
-  for (std::size_t i = 0; i + 1 < upper.size(); ++i) {
-    upper[i]->link(upper[i + 1].get());
-  }
-  upper.back()->link(&aggregate);
+  keyless_key_source keys;
+  auto lower = partition_chain(5, 3, keys);
+  auto upper = partition_chain(5, 3, keys);
+  link_chain(scan, lower, filter);
+  link_chain(filter, upper, aggregate);
 
   auto const planned = sirius::planner::plan_deferral(scan);
   REQUIRE(planned.census.size() == 2);

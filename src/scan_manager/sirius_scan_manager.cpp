@@ -648,6 +648,11 @@ void install_late_materialization(op::scan::sirius_gpu_scan_operator& scan_op,
                     scan_op.get_operator_id(),
                     planned.nullable_columns_skipped);
   }
+  if (planned.join_keys_skipped > 0) {
+    SIRIUS_LOG_INFO("[late-mat] operator {}: {} column(s) withheld — a partition hashes them",
+                    scan_op.get_operator_id(),
+                    planned.join_keys_skipped);
+  }
   if (!planned.installable()) { return; }
 
   // Output position p is served slot p is entry column selected_columns[p] —

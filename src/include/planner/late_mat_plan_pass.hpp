@@ -60,10 +60,13 @@ struct column_lifetime {
   /// nothing does — a column that reaches the plan's root unread is one the
   /// query only ever projects.
   op::sirius_physical_operator const* first_reader = nullptr;
-  /// Operator boundaries crossed before that reader. This is what the defer
-  /// policy weighs the ride against; a column read by the scan's own parent
-  /// crossed one.
-  int boundaries = 0;
+  /// PORT crossings before that reader — the times the column's bytes were
+  /// written to a repository and read back, which is the only carrying that
+  /// costs anything and so the only unit the defer policy's thresholds are
+  /// meaningful in. A crossing is counted when the operator being LEFT is a
+  /// pipeline sink; a filter or a projection in the same pipeline hands its
+  /// columns on without materializing them and costs nothing to ride past.
+  int port_crossings = 0;
   /// The column's position in `first_reader`'s input, which is where a
   /// materialization would have to put it back.
   std::size_t position_at_reader = 0;
@@ -73,6 +76,16 @@ struct column_lifetime {
   /// nulls. Refusing outer joins outright would be simpler and would cost
   /// every outer-shaped query.
   bool nullified_on_ride = false;
+  /// Whether something on the ride compares this column as a KEY — a join's
+  /// condition, or the partition that feeds one. Such a column may never be
+  /// deferred, and the binding reason is the partition rather than the join: it
+  /// hashes the key to place a row, and a rowid hashes differently from the
+  /// value it stands for, so equal keys would land in different partitions and
+  /// the join would simply miss matches. Stopping the ride at the join is not
+  /// enough — the port materializes at the join's input, which is after the
+  /// partition has already hashed. This is the walk's one silent-wrong-answer
+  /// shape; every other refusal merely costs a deferral.
+  bool read_as_join_key = false;
 };
 
 /// Where a column entering an INNER hash join from one side lands in its
@@ -147,6 +160,11 @@ struct planned_deferral {
   /// but the materializer does not produce nulls yet, so v1 refuses them here
   /// rather than at the far end where the answer would already be wrong.
   std::size_t nullable_columns_skipped = 0;
+  /// Columns excluded because something on the ride keys on them. Not an
+  /// economic refusal: a partition hashes its consumer's key to place rows, so
+  /// a key riding as a rowid would scatter equal values across partitions and
+  /// the join would miss matches. See column_lifetime::read_as_join_key.
+  std::size_t join_keys_skipped = 0;
 
   [[nodiscard]] bool installable() const noexcept { return port != nullptr && !positions.empty(); }
 };

@@ -18,9 +18,11 @@
 
 #include "expression/ast/node.hpp"
 #include "expression/ast/utils.hpp"
+#include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_projection.hpp"
 
 #include <algorithm>
@@ -47,15 +49,60 @@ bool reads_column(ast::node const& expr, std::size_t pos)
 
 /// What one operator does to a column arriving from `from` at input position
 /// `in_pos`.
-///
-/// `std::nullopt` means the operator reads it — the column's life ends here.
-/// A value is the output position it moves to, and the column lives on.
-std::optional<std::size_t> trace_through(sirius_physical_operator const& node,
-                                         sirius_physical_operator const& from,
-                                         std::size_t in_pos,
-                                         bool& nullified)
+struct step {
+  /// Where the column moves to, or nullopt when its life ends here — because
+  /// this operator reads it, or because it is not passed on.
+  std::optional<std::size_t> moved_to;
+  /// The life ended because a join compares this column. See
+  /// column_lifetime::read_as_join_key: such a column leaves candidacy
+  /// entirely, which is stronger than stopping here.
+  bool as_join_key = false;
+
+  static step reads() { return step{}; }
+  static step key() { return step{std::nullopt, true}; }
+  static step to(std::optional<std::size_t> position) { return step{position, false}; }
+};
+
+step trace_through(sirius_physical_operator const& node,
+                   sirius_physical_operator const& from,
+                   std::size_t in_pos,
+                   bool& nullified)
 {
   switch (node.type) {
+    // Positionally transparent plumbing. A partition rewrites which rows sit in
+    // which batch and a wrap concat glues those batches back together; neither
+    // touches the column layout.
+    case SiriusPhysicalOperatorType::PARTITION: {
+      auto const& partition = static_cast<op::sirius_physical_partition const&>(node);
+      // Except that a partition READS the columns it hashes to place a row —
+      // and it resolved those positions from its consumer at plan time, so they
+      // are known here rather than one hop up at the join. A rowid hashes
+      // differently from the value it stands for, so a key riding as one would
+      // scatter equal values across partitions and the join would simply miss
+      // matches. This is the walk's one silent-wrong-answer shape, and it is
+      // why a partition is not transparent by fiat.
+      auto const& keys = partition.partition_keys();
+      if (std::find(keys.begin(), keys.end(), static_cast<int>(in_pos)) != keys.end()) {
+        return step::key();
+      }
+      return step::to(in_pos);
+    }
+
+    case SiriusPhysicalOperatorType::CONCAT: {
+      // The generator builds a CONCAT at exactly one site — wrapping one child
+      // of one join — so every concat gathers the partitions of ONE flow and a
+      // payload crossing it still comes from where the scan said it did.
+      //
+      // That matters because fan-in at a concat is expressed through PORTS, not
+      // tree children: a concat merging two different producers into one
+      // repository could not be recognised from here, and if both producers had
+      // deferred with type-identical schemas the port's whole-schema match
+      // could not tell them apart either. No such concat exists today; the
+      // arity check is what would notice if one appeared.
+      if (node.children.size() != 1) { return step::reads(); }
+      return step::to(in_pos);
+    }
+
     case SiriusPhysicalOperatorType::HASH_JOIN: {
       auto const& join = static_cast<op::sirius_physical_hash_join const&>(node);
       // The types that pass a payload through at all. Semi, anti and mark
@@ -64,18 +111,18 @@ std::optional<std::size_t> trace_through(sirius_physical_operator const& node,
       auto const type    = join.join_type;
       bool const carries = type == duckdb::JoinType::INNER || type == duckdb::JoinType::LEFT ||
                            type == duckdb::JoinType::RIGHT || type == duckdb::JoinType::OUTER;
-      if (!carries) { return std::nullopt; }
-      if (node.children.size() != 2) { return std::nullopt; }
+      if (!carries) { return step::reads(); }
+      if (node.children.size() != 2) { return step::reads(); }
 
       bool const from_lhs = node.children[0].get() == &from;
-      if (!from_lhs && node.children[1].get() != &from) { return std::nullopt; }
+      if (!from_lhs && node.children[1].get() != &from) { return step::reads(); }
 
       // A key is read: the join compares its values. The conditions' left
       // nodes address the lhs and their right nodes the rhs, so only this
       // side's half is consulted.
       for (auto const& condition : join.conditions) {
         auto const& side = from_lhs ? condition.left : condition.right;
-        if (side && reads_column(*side, in_pos)) { return std::nullopt; }
+        if (side && reads_column(*side, in_pos)) { return step::key(); }
       }
 
       std::vector<int> const lhs(join.lhs_output_columns.col_idxs.begin(),
@@ -97,17 +144,17 @@ std::optional<std::size_t> trace_through(sirius_physical_operator const& node,
                     (from_lhs && type == duckdb::JoinType::RIGHT) ||
                     (!from_lhs && type == duckdb::JoinType::LEFT);
       }
-      return moved;
+      return step::to(moved);
     }
 
     case SiriusPhysicalOperatorType::FILTER: {
       auto const& filter = static_cast<op::sirius_physical_filter const&>(node);
       // The predicate is the only thing a filter reads; it decides which ROWS
       // survive, never what is in the columns it passes on.
-      if (filter.expression && reads_column(*filter.expression, in_pos)) { return std::nullopt; }
+      if (filter.expression && reads_column(*filter.expression, in_pos)) { return step::reads(); }
       // The output mask is an explicit positional map, so a filter that folds a
       // projection into its gather is still transparent to everything it keeps.
-      return std::visit(
+      return step::to(std::visit(
         [&](auto const& mask) -> std::optional<std::size_t> {
           using T = std::decay_t<decltype(mask)>;
           if constexpr (std::is_same_v<T, op::passthrough>) {
@@ -119,7 +166,7 @@ std::optional<std::size_t> trace_through(sirius_physical_operator const& node,
             return std::nullopt;  // dropped here; nothing downstream can want it
           }
         },
-        filter.output_columns);
+        filter.output_columns));
     }
 
     case SiriusPhysicalOperatorType::PROJECTION: {
@@ -134,16 +181,16 @@ std::optional<std::size_t> trace_through(sirius_physical_operator const& node,
           if (ref->column_index == in_pos && !moved_to.has_value()) { moved_to = out; }
           continue;
         }
-        if (reads_column(*expr, in_pos)) { return std::nullopt; }
+        if (reads_column(*expr, in_pos)) { return step::reads(); }
       }
-      return moved_to;  // nullopt when the projection simply drops it
+      return step::to(moved_to);  // nullopt when the projection simply drops it
     }
 
     default:
       // Fail closed: an unmodelled shape is assumed to read everything. This
       // can only shorten a lifetime, so an operator missing from this switch
       // costs a deferral rather than permitting a wrong one.
-      return std::nullopt;
+      return step::reads();
   }
 }
 
@@ -196,7 +243,7 @@ std::vector<late_mat::defer_candidate> build_defer_candidates(
       slot = std::prev(readers.end());
       late_mat::defer_candidate fresh;
       fresh.slot       = "slot" + std::to_string(readers.size() - 1);
-      fresh.boundaries = life.boundaries;
+      fresh.boundaries = life.port_crossings;
       candidates.push_back(std::move(fresh));
     }
     auto& candidate = candidates[static_cast<std::size_t>(slot - readers.begin())];
@@ -230,26 +277,33 @@ std::vector<column_lifetime> analyze_column_lifetimes(sirius_physical_operator c
     live.push_back(live_column{col, col, false});
   }
 
-  int boundaries   = 0;
+  int crossings    = 0;
   auto const* from = static_cast<sirius_physical_operator const*>(&scan);
   for (auto const* node = scan.get_parent_op(); node != nullptr && !live.empty();
        from = node, node = node->get_parent_op()) {
-    ++boundaries;
+    // Count what carrying actually COSTS. A pipeline sink writes its output to
+    // a repository for the next pipeline to read, so leaving one is where the
+    // deferred bytes would have been paid for; a filter or projection hands its
+    // columns straight on within the pipeline and a wide column rides past it
+    // for free. Counting operators instead would let a chain of projections
+    // look like a ride worth deferring.
+    if (from->is_sink()) { ++crossings; }
     std::vector<live_column> still_travelling;
     still_travelling.reserve(live.size());
     for (auto& col : live) {
       auto const moved = trace_through(*node, *from, col.position, col.nullified);
-      if (!moved.has_value()) {
+      if (!moved.moved_to.has_value()) {
         // Read here — or dropped here, which for a deferral is the same
         // answer: this is as far as the column travels.
         auto& life              = lifetimes[col.index];
         life.first_reader       = node;
-        life.boundaries         = boundaries;
+        life.port_crossings     = crossings;
         life.position_at_reader = col.position;
         life.nullified_on_ride  = col.nullified;
+        life.read_as_join_key   = moved.as_join_key;
         continue;
       }
-      col.position = *moved;
+      col.position = *moved.moved_to;
       still_travelling.push_back(col);
     }
     live = std::move(still_travelling);
@@ -258,7 +312,7 @@ std::vector<column_lifetime> analyze_column_lifetimes(sirius_physical_operator c
   // Whatever is still live reached the top of the plan unread.
   for (auto const& col : live) {
     auto& life              = lifetimes[col.index];
-    life.boundaries         = boundaries;
+    life.port_crossings     = crossings;
     life.position_at_reader = col.position;
     life.nullified_on_ride  = col.nullified;
   }
@@ -283,6 +337,13 @@ planned_deferral plan_deferral(sirius_physical_operator& scan, late_mat::defer_p
   for (auto const& life : lifetimes) {
     if (life.nullified_on_ride) {
       ++planned.nullable_columns_skipped;
+      continue;
+    }
+    // A join key leaves candidacy outright — see column_lifetime's note: the
+    // partition below the join has already hashed it by the time the port could
+    // put its value back.
+    if (life.read_as_join_key) {
+      ++planned.join_keys_skipped;
       continue;
     }
     weighable.push_back(life);
