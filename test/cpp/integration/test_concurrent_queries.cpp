@@ -66,15 +66,28 @@ int iters_per_worker() { return env_int("SIRIUS_TEST_CONCURRENCY_ITERS", 6); }
 int pipeline_threads() { return env_int("SIRIUS_TEST_PIPELINE_THREADS", 4); }
 int creator_threads() { return env_int("SIRIUS_TEST_CREATOR_THREADS", 2); }
 
-// integration.yaml (1 GPU, half the card) plus the concurrency knob under
-// test. Written fresh per run so the test owns its whole config.
+// Default absolute GPU pool. Small on purpose: the pool is allocated EAGERLY
+// at init, and these tests run on shared GPUs (parallel agent sessions, CI
+// neighbors). The old default — usage_limit_fraction 0.5, ~half the card —
+// flaked with bad_alloc whenever a co-tenant held memory at env-construction
+// time. Every scenario here was designed against a 3 GiB pool, so 4 GiB is
+// roomy; override via SIRIUS_TEST_CONCURRENCY_POOL_BYTES for bigger sweeps.
+std::uint64_t default_pool_bytes()
+{
+  if (const char* v = std::getenv("SIRIUS_TEST_CONCURRENCY_POOL_BYTES")) {
+    return std::strtoull(v, nullptr, 10);
+  }
+  return 4ULL << 30;
+}
+
+// integration.yaml (1 GPU, small absolute pool) plus the concurrency knob
+// under test. Written fresh per run so the test owns its whole config.
 std::string concurrent_config_yaml(std::uint64_t gpu_pool_bytes = 0)
 {
-  // gpu_pool_bytes == 0: half the card (the roomy default). Non-zero: an
+  // gpu_pool_bytes == 0: the shared-GPU-friendly default above. Non-zero: an
   // absolute cap, used by the memory-pressure scenario to force downgrades.
-  std::string gpu_mem = gpu_pool_bytes == 0
-                          ? std::string("      usage_limit_fraction: 0.5")
-                          : "      usage_limit_bytes: " + std::to_string(gpu_pool_bytes);
+  if (gpu_pool_bytes == 0) { gpu_pool_bytes = default_pool_bytes(); }
+  std::string gpu_mem = "      usage_limit_bytes: " + std::to_string(gpu_pool_bytes);
   return R"(sirius:
   topology:
     num_gpus: 1
@@ -84,7 +97,7 @@ std::string concurrent_config_yaml(std::uint64_t gpu_pool_bytes = 0)
          R"(
       reservation_limit_fraction: 1.0
     host:
-      capacity_bytes: 32000000000
+      capacity_bytes: 8000000000
       initial_number_pools: 10
       pool_size: 512
       block_size: 1048576
