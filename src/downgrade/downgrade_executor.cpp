@@ -172,6 +172,15 @@ void downgrade_executor::drain(sirius::query_id_t query_id)
   _in_flight_cv.wait(lock, [&] { return !_in_flight_active || _in_flight_query != query_id; });
 }
 
+void downgrade_executor::wait_inflight_request()
+{
+  // See the header: any in-flight request's TIER-2 sweep may hold ANOTHER query's task in a
+  // convertible wrapper; the caller must not destroy that query's plan until the request (and
+  // with it every wrapper it created) has completed. Bounded: one request.
+  std::unique_lock<std::mutex> lock(_in_flight_mutex);
+  _in_flight_cv.wait(lock, [&] { return !_in_flight_active; });
+}
+
 void downgrade_executor::processing_loop()
 {
   while (_running.load()) {

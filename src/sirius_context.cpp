@@ -489,11 +489,20 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
     executor->drain(query_id);
   }
 
-  // The downgrade drains just joined every TIER-2 conversion in flight, and each wrapper's RAII
-  // re-push consults the (now quiescing) gate — but a wrapper that read the gate as open
-  // immediately before quiesce() landed can have pushed a task back behind the sweep above.
-  // With the wrappers all gone, one more sweep makes the queues definitively empty of this
-  // query's tasks; nothing can re-add them past this point.
+  // drain(query_id) waits only for THIS query's in-flight request — but a peer's (or the
+  // monitor's) request sweeps by memory space, so its TIER-2 pass may hold this query's task
+  // in a convertible wrapper across a blocking conversion, and that wrapper's RAII drop walks
+  // the plan. Wait out whatever request is in flight (bounded: one per executor) so every such
+  // wrapper is gone; requests that start later cannot extract this query's tasks (TIER-2
+  // extraction consults the lifecycle gate, quiescing since the top of this function).
+  for (auto& executor : downgrade_executors_) {
+    executor->wait_inflight_request();
+  }
+
+  // Wrappers that read the gate as open immediately before quiesce() landed may have pushed a
+  // task back behind the sweep above; every wrapper is gone now (previous wait), so one more
+  // sweep makes the queues definitively empty of this query's tasks. Nothing can re-add them
+  // past this point: producers are gate-refused and extraction skips quiescing queries.
   if (task_scheduler_) { task_scheduler_->drain_query_tasks(query_id); }
 
   // Every drain that can destroy one of this query's tasks has now run, so the plan is no
@@ -615,6 +624,20 @@ void SiriusContext::drop_query_runtime_state_best_effort(sirius::query_id_t quer
     for (auto& executor : downgrade_executors_) {
       executor->drain(query_id);
     }
+  } catch (...) {
+  }
+  // Same as the main path: a peer's in-flight sweep may hold this query's task in a wrapper
+  // whose RAII drop walks the plan destroyed below. One bounded wait per executor.
+  try {
+    for (auto& executor : downgrade_executors_) {
+      executor->wait_inflight_request();
+    }
+  } catch (...) {
+  }
+  // And the matching final sweep before the plan dies (the main path does this too): wrappers
+  // that raced the quiesce may have re-pushed this query's tasks behind the sweep above.
+  try {
+    if (task_scheduler_) { task_scheduler_->drain_query_tasks(query_id); }
   } catch (...) {
   }
   // The scan manager needs the same backstop. prepare_for_query no longer performs a global

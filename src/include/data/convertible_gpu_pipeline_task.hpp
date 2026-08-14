@@ -282,7 +282,7 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
                                                          bool front_to_back) override
   {
     auto task = _queue.mutable_pop_if(
-      [space](sirius::parallel::itask& t) { return has_matching_batches(t, space); },
+      [space, this](sirius::parallel::itask& t) { return extraction_allowed(t, space); },
       front_to_back);
     if (!task) { return nullptr; }
     // Resolve the keys NOW, while the task's plan is guaranteed alive (a task in the queue
@@ -317,7 +317,7 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
     std::vector<std::unique_ptr<convertible_data>> results;
     while (true) {
       auto task = _queue.mutable_pop_if(
-        [space](sirius::parallel::itask& t) { return has_matching_batches(t, space); },
+        [space, this](sirius::parallel::itask& t) { return extraction_allowed(t, space); },
         front_to_back);
       if (!task) { break; }
       // Keys resolved at extraction time; see get_next_convertible.
@@ -329,6 +329,26 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
   }
 
  private:
+  /**
+   * @brief Full extraction predicate: matching batches AND an accepting query.
+   *
+   * The lifecycle check is what lets a query's cleanup destroy its plan without waiting for
+   * downgrade quiescence beyond the single in-flight request: once the query is quiescing, no
+   * LATER downgrade request can extract its tasks, so after
+   * downgrade_executor::wait_inflight_request() plus one queue sweep the plan is unreachable
+   * from this path. The key derivation walks the task's plan, which is safe here: pred runs
+   * under the queue lock, a queued task's query has not passed the sweeps that would remove
+   * it, and every query destroys its plan only after those sweeps.
+   */
+  bool extraction_allowed(sirius::parallel::itask& task,
+                          cucascade::memory::memory_space* space) const
+  {
+    if (!has_matching_batches(task, space)) { return false; }
+    if (_query_lifecycle == nullptr) { return true; }
+    const auto keys = sirius::pipeline::index_keys_for(task);
+    return _query_lifecycle->accepts_work(sirius::make_query_id(keys.query_id));
+  }
+
   /**
    * @brief Predicate: does this task contain data_batches in the given space with
    *        batch_state::idle?

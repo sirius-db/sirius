@@ -135,6 +135,25 @@ class downgrade_executor {
   void drain(sirius::query_id_t query_id);
 
   /**
+   * @brief Wait until no downgrade request is being processed, regardless of owner.
+   *
+   * drain(query_id) deliberately waits only for the query's OWN in-flight request — but a
+   * PEER's (or the monitor's) request sweeps by memory space, not by query, so its TIER-2
+   * pass can hold the ending query's task inside a convertible wrapper across a blocking
+   * conversion. That wrapper's RAII drop walks the task's plan; the plan may only be
+   * destroyed after every such wrapper is gone. Query-end cleanup therefore calls this after
+   * the per-query drains and BEFORE destroying the parked plan: when it returns, every
+   * wrapper created by a request that was in flight has been destroyed (a request joins its
+   * wrappers before completing), so one final queue sweep leaves nothing of the query for a
+   * later request to find.
+   *
+   * A request popped but not yet published as in-flight can slip past this wait; that is
+   * closed from the other side — TIER-2 extraction consults the query-lifecycle gate, so a
+   * request starting after quiesce() never extracts the ending query's tasks.
+   */
+  void wait_inflight_request();
+
+  /**
    * @brief Get the memory space this executor is responsible for.
    */
   cucascade::memory::memory_space_id get_space_id() const { return _space_id; }
