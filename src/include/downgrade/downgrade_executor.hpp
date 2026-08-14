@@ -31,6 +31,7 @@
 #include <cucascade/memory/stream_pool.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <future>
@@ -171,6 +172,18 @@ class downgrade_executor {
     return _monitor_requests_issued.load(std::memory_order_relaxed);
   }
 
+  /// Completed downgrade passes that freed 0 bytes.
+  size_t no_progress_passes() const noexcept
+  {
+    return _no_progress_passes.load(std::memory_order_relaxed);
+  }
+
+  /// Requests short-circuited during a no-progress cooldown.
+  size_t coalesced_requests() const noexcept
+  {
+    return _coalesced_requests.load(std::memory_order_relaxed);
+  }
+
  private:
   void processing_loop();
   void monitor_loop();
@@ -195,6 +208,11 @@ class downgrade_executor {
   std::atomic<bool> _monitor_request_enqueued{false};
   std::atomic<bool> _running{false};
   std::atomic<size_t> _monitor_requests_issued{0};
+  std::atomic<size_t> _no_progress_passes{0};
+  std::atomic<size_t> _coalesced_requests{0};
+  /// Only touched by the processing thread, or while it is joined (start/drain).
+  bool _in_no_progress_cooldown{false};
+  std::chrono::steady_clock::time_point _no_progress_pass_end{};
   std::unique_ptr<cucascade::memory::exclusive_stream_pool> _stream_pool;
 
   std::mutex _monitor_cv_mutex;

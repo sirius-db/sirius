@@ -100,6 +100,8 @@ void downgrade_executor::start()
                                                       _config.thread_pool.cpu_affinity_list,
                                                       std::move(per_thread_init));
 
+  _in_no_progress_cooldown = false;
+
   _processing_thread = std::thread(&downgrade_executor::processing_loop, this);
 
   if (_memory_space && _config.monitor_period > std::chrono::milliseconds::zero()) {
@@ -138,6 +140,8 @@ void downgrade_executor::drain()
   _pool->resume();
   _request_queue.reactivate();
 
+  _in_no_progress_cooldown = false;
+
   _processing_thread = std::thread(&downgrade_executor::processing_loop, this);
 }
 
@@ -148,6 +152,25 @@ void downgrade_executor::processing_loop()
     if (!request) break;  // interrupted
 
     auto& req = request;
+
+    // If the last pass freed nothing, skip the rescan for requests arriving within
+    // the cooldown: evaluate the predicate once and resolve to 0 bytes.
+    if (_in_no_progress_cooldown) {
+      auto const cooldown = _config.no_progress_rescan_cooldown;
+      if (cooldown > std::chrono::milliseconds::zero() &&
+          std::chrono::steady_clock::now() - _no_progress_pass_end < cooldown) {
+        if (req->predicate && req->predicate()) {
+          req->satisfied.store(true, std::memory_order_release);
+        }
+        _coalesced_requests.fetch_add(1, std::memory_order_relaxed);
+        if (req->is_monitor_request) {
+          _monitor_request_enqueued.store(false, std::memory_order_relaxed);
+        }
+        req->result.set_value(0);
+        continue;
+      }
+      _in_no_progress_cooldown = false;
+    }
 
     auto t_start = std::chrono::steady_clock::now();
 
@@ -374,6 +397,24 @@ void downgrade_executor::processing_loop()
     std::string request_label = req->is_monitor_request ? "monitor " : "";
     if (req->is_monitor_request) {
       _monitor_request_enqueued.store(false, std::memory_order_relaxed);
+    }
+
+    // A completed pass that freed nothing arms the coalescing cooldown.
+    if (total_bytes == 0 && !pool_interrupted && !req->satisfied.load(std::memory_order_acquire)) {
+      auto const no_progress_total =
+        _no_progress_passes.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (_config.no_progress_rescan_cooldown > std::chrono::milliseconds::zero()) {
+        _in_no_progress_cooldown = true;
+        _no_progress_pass_end    = std::chrono::steady_clock::now();
+      }
+      SIRIUS_LOG_INFO(
+        "[downgrade] [{}] no-progress {}pass: 0 bytes freed in {:.2f} ms "
+        "(no-progress passes: {}, coalesced requests: {})",
+        _source_label,
+        request_label,
+        duration_ms,
+        no_progress_total,
+        _coalesced_requests.load(std::memory_order_relaxed));
     }
 
     SIRIUS_LOG_DEBUG(

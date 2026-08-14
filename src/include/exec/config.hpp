@@ -44,6 +44,10 @@ struct downgrade_executor_config {
   /// Set to 0 to disable the monitor loop entirely.
   std::chrono::milliseconds monitor_period{std::chrono::milliseconds{10}};
 
+  /// After a downgrade pass frees 0 bytes, requests within this window skip the rescan
+  /// (their predicate is still evaluated once) and resolve to 0 bytes. 0 disables.
+  std::chrono::milliseconds no_progress_rescan_cooldown{std::chrono::milliseconds{100}};
+
   /// Preferred HOST memory_space device_id (NUMA node) for the downgrade target.
   /// When set, the GPU->HOST downgrade dispatch uses
   /// cucascade::memory::any_memory_space_in_tier_with_preference{Tier::HOST, *preferred_numa_node}

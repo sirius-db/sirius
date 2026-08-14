@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <format>
@@ -261,15 +262,27 @@ void gpu_pipeline_executor::manager_loop()
         break;
       }
       if (reservation->size() < bytes_needs) {
+        // A 0-byte downgrade with a still-partial reservation is a starved admission:
+        // an OOM on this attempt will likely repeat, so the reschedule path backs off.
+        std::string starved_suffix;
+        if (freed == 0) {
+          auto const starved_total =
+            _starved_admissions_total.fetch_add(1, std::memory_order_relaxed) + 1;
+          if (auto* local = dynamic_cast<gpu_pipeline_task_local_state*>(gpu_task->local_state())) {
+            local->starved_admission = true;
+          }
+          starved_suffix = std::format(" (starved admission #{})", starved_total);
+        }
         SIRIUS_LOG_WARN(
           "GPU Pipeline Executor: after downgrade ({} bytes freed), reservation "
           "still partial ({}/{} bytes) for pipeline {} task {} -- proceeding "
-          "with partial reservation",
+          "with partial reservation{}",
           freed,
           reservation->size(),
           bytes_needs,
           gpu_task->get_pipeline_id(),
-          gpu_task->get_task_id());
+          gpu_task->get_task_id(),
+          starved_suffix);
       }
     } else if (reservation->size() < bytes_needs) {
       // No downgrade executor available -- warn and proceed (this should never happen)
@@ -366,6 +379,14 @@ void gpu_pipeline_executor::manager_loop()
             return;
           }
 
+          _oom_reschedules_total.fetch_add(1, std::memory_order_relaxed);
+
+          // A clean admission resets the streak, so contention OOMs keep the base retry.
+          uint32_t starved_streak = 0;
+          if (cur_local && cur_local->starved_admission) {
+            starved_streak = cur_local->starved_streak + 1;
+          }
+
           SIRIUS_LOG_WARN(
             "GPU Pipeline Executor: reschedule (retry {}/{}) for task {} (original task {}), "
             "resuming from operator index {}: {}",
@@ -390,6 +411,7 @@ void gpu_pipeline_executor::manager_loop()
           new_local_state->retry_count      = next_retry_count;
           new_local_state->original_task_id = orig_task_id;
           if (cur_local) { new_local_state->inherit_retry_reservation_floor(*cur_local); }
+          new_local_state->starved_streak = starved_streak;
 
           // Preserve the per-task device pin across reschedule. Dropping it lets
           // an OOM'd partition task scatter to the wrong GPU and touch a cuco
@@ -406,10 +428,72 @@ void gpu_pipeline_executor::manager_loop()
 
           // Backoff before rescheduling to allow other tasks to complete and
           // free memory (true OOM case) or release a contended batch
-          // (cross-GPU processing contention, follow-up #17). 50 ms gives
-          // typical SF100 probe tasks time to finish their current work
-          // without putting the rescheduled task into a tight busy-spin.
-          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          // (cross-GPU processing contention, follow-up #17). A starved streak
+          // escalates the interval; the sleep is sliced so it wakes early on
+          // executor stop, query error, or freed memory.
+          auto backoff                     = compute_oom_backoff(starved_streak);
+          constexpr auto kBackoffBase      = std::chrono::milliseconds{50};
+          constexpr auto kBackoffSlice     = std::chrono::milliseconds{25};
+          constexpr size_t kEarlyWakeBytes = 128ull << 20;  // 128 MB freed => retry now
+          bool escalated                   = backoff > kBackoffBase;
+          bool holds_sleeper_slot          = false;
+          if (escalated) {
+            // Keep one worker free for dispatch; a single-thread pool never escalates.
+            const uint32_t max_sleepers =
+              _config.num_threads > 1 ? static_cast<uint32_t>(_config.num_threads - 1) : 0u;
+            if (_backoff_sleepers.fetch_add(1, std::memory_order_acq_rel) < max_sleepers) {
+              holds_sleeper_slot = true;
+            } else {
+              _backoff_sleepers.fetch_sub(1, std::memory_order_acq_rel);
+              backoff   = kBackoffBase;
+              escalated = false;
+            }
+          }
+          if (escalated) {
+            auto const backoff_events =
+              _backoff_events_total.fetch_add(1, std::memory_order_relaxed) + 1;
+            SIRIUS_LOG_INFO(
+              "[oom-pacing] GPU {}: task {} (original {}) backing off {} ms after starved "
+              "admission (streak {}, retry {}/{}); totals: oom_reschedules={} "
+              "starved_admissions={} backoff_events={} backoff_ms={}",
+              _memory_space->get_device_id(),
+              gpu_task->get_task_id(),
+              orig_task_id,
+              backoff.count(),
+              starved_streak,
+              next_retry_count,
+              MAX_RETRIES,
+              _oom_reschedules_total.load(std::memory_order_relaxed),
+              _starved_admissions_total.load(std::memory_order_relaxed),
+              backoff_events,
+              _backoff_ms_total.load(std::memory_order_relaxed));
+          }
+          {
+            auto const sleep_start     = std::chrono::steady_clock::now();
+            auto const available_start = _memory_space->get_available_memory();
+            auto const deadline        = sleep_start + backoff;
+            while (true) {
+              auto const now = std::chrono::steady_clock::now();
+              if (now >= deadline) { break; }
+              if (!_running.load(std::memory_order_acquire)) { break; }
+              if (completion && completion->has_error()) { break; }
+              if (_memory_space->get_available_memory() >= available_start + kEarlyWakeBytes) {
+                SIRIUS_LOG_DEBUG(
+                  "[oom-pacing] GPU {}: task {} woke early from backoff — memory freed",
+                  _memory_space->get_device_id(),
+                  gpu_task->get_task_id());
+                break;
+              }
+              std::this_thread::sleep_for(
+                std::min<std::chrono::steady_clock::duration>(kBackoffSlice, deadline - now));
+            }
+            _backoff_ms_total.fetch_add(
+              static_cast<size_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - sleep_start)
+                                    .count()),
+              std::memory_order_relaxed);
+          }
+          if (holds_sleeper_slot) { _backoff_sleepers.fetch_sub(1, std::memory_order_acq_rel); }
 
           // Schedule the rescheduled task. It goes back through manager_loop()
           // to acquire a fresh reservation before execution.
@@ -501,6 +585,16 @@ bool gpu_pipeline_executor::is_task_queue_empty() const noexcept { return _task_
 executor_metrics gpu_pipeline_executor::get_metrics() const noexcept
 {
   return {_tasks_executed.load(std::memory_order_relaxed)};
+}
+
+oom_pacing_stats gpu_pipeline_executor::get_oom_pacing_stats() const noexcept
+{
+  return {
+    _oom_reschedules_total.load(std::memory_order_relaxed),
+    _starved_admissions_total.load(std::memory_order_relaxed),
+    _backoff_events_total.load(std::memory_order_relaxed),
+    _backoff_ms_total.load(std::memory_order_relaxed),
+  };
 }
 
 }  // namespace pipeline

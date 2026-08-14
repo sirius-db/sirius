@@ -26,7 +26,10 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/stream_pool.hpp>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <memory>
 #include <thread>
 
@@ -52,6 +55,16 @@ namespace pipeline {
 
 struct executor_metrics {
   size_t tasks_executed{0};
+};
+
+/// Monotonic counters for the OOM-retry pacing path.
+struct oom_pacing_stats {
+  size_t oom_reschedules{0};
+  /// Admissions that proceeded on a partial reservation after a 0-byte downgrade.
+  size_t starved_admissions{0};
+  /// Reschedules whose backoff was escalated beyond the base interval.
+  size_t backoff_events{0};
+  size_t backoff_ms{0};
 };
 
 /**
@@ -114,6 +127,24 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   [[nodiscard]] executor_metrics get_metrics() const noexcept;
 
   /**
+   * @brief Snapshot of the OOM-retry pacing counters.
+   */
+  [[nodiscard]] oom_pacing_stats get_oom_pacing_stats() const noexcept;
+
+  /**
+   * @brief Backoff before re-admitting an OOM-rescheduled task.
+   *
+   * A streak of 0 (OOM after a clean admission) keeps the base interval.
+   * Each consecutive OOM after a starved admission doubles it, capped at 800 ms.
+   */
+  [[nodiscard]] static std::chrono::milliseconds compute_oom_backoff(
+    uint32_t starved_streak) noexcept
+  {
+    constexpr uint32_t kMaxShift = 4;  // 50 << 4 = 800 ms
+    return std::chrono::milliseconds{50u << std::min(starved_streak, kMaxShift)};
+  }
+
+  /**
    * @brief Return the effective executor configuration after scheduler derivation.
    */
   [[nodiscard]] const exec::thread_pool_config& get_effective_config() const noexcept
@@ -142,6 +173,13 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   sirius::parallel::downgrade_executor* _downgrade_executor{nullptr};
   sirius::creator::task_creator* _task_creator{nullptr};
   std::atomic<size_t> _tasks_executed{0};
+
+  std::atomic<size_t> _oom_reschedules_total{0};
+  std::atomic<size_t> _starved_admissions_total{0};
+  std::atomic<size_t> _backoff_events_total{0};
+  std::atomic<size_t> _backoff_ms_total{0};
+  /// Workers in an escalated backoff sleep; capped at num_threads - 1.
+  std::atomic<uint32_t> _backoff_sleepers{0};
 };
 
 }  // namespace pipeline
