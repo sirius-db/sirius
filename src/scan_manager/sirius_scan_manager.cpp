@@ -1515,6 +1515,11 @@ void sirius_scan_manager::insert_pinned_entry(
     }
   }
 
+  // Assigning over an existing name destroys that entry in place, so its
+  // handle has to be invalidated FIRST — afterwards the entry is gone but the
+  // handle would still resolve, and its pointer would address the map node now
+  // holding different data.
+  retire_late_mat_handle(name);
   _pinned_entries[name] = std::move(entry);
   publish_late_mat_handle(name);
 }
@@ -1613,6 +1618,11 @@ void sirius_scan_manager::insert_pinned_entry_host(
   entry.column_storage = std::move(column_storage);
   entry.zone_maps      = std::move(pin_zone_maps);
 
+  // Assigning over an existing name destroys that entry in place, so its
+  // handle has to be invalidated FIRST — afterwards the entry is gone but the
+  // handle would still resolve, and its pointer would address the map node now
+  // holding different data.
+  retire_late_mat_handle(name);
   _pinned_entries[name] = std::move(entry);
   publish_late_mat_handle(name);
 }
@@ -1665,6 +1675,11 @@ void sirius_scan_manager::insert_pinned_entry_device(
                    entry.device_chunks.size(),
                    new_num_rows);
 
+  // Assigning over an existing name destroys that entry in place, so its
+  // handle has to be invalidated FIRST — afterwards the entry is gone but the
+  // handle would still resolve, and its pointer would address the map node now
+  // holding different data.
+  retire_late_mat_handle(name);
   _pinned_entries[name] = std::move(entry);
   publish_late_mat_handle(name);
 }
