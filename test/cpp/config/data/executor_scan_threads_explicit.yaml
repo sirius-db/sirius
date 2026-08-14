@@ -1,0 +1,18 @@
+sirius:
+  space:
+    gpu:
+      - device_id: 0
+        memory_capacity: 1GiB
+    host:
+      - numa_id: -1
+        memory_capacity: 1GiB
+  executor:
+    task_creator:
+      num_threads: 4
+    pipeline:
+      num_threads: 3
+    downgrade:
+      num_threads: 2
+    scan_manager:
+      num_threads: 7
+      uring_n_reactors: 2
