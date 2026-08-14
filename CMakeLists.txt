@@ -163,8 +163,9 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(ctrack)
 if(NOT TARGET ctrack::ctrack)
   add_library(ctrack::ctrack INTERFACE IMPORTED)
-  set_target_properties(ctrack::ctrack PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
-                                                  "${ctrack_SOURCE_DIR}/include")
+  set_target_properties(
+    ctrack::ctrack PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
+                              "${ctrack_SOURCE_DIR}/include")
 endif()
 
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
@@ -1089,12 +1090,14 @@ set_target_properties(
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
 
 # -----------------------------------------------------------------------------
-# test/io/s3_throughput_test — raw S3 read throughput via REST reactor, no parquet decoding
+# test/io/s3_throughput_test — raw S3 read throughput via REST reactor, no
+# parquet decoding
 # -----------------------------------------------------------------------------
 add_executable(s3_throughput_test test/io/s3_throughput_test.cpp)
 
 if(VCPKG_BUILD)
-  set_target_properties(s3_throughput_test PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+  set_target_properties(s3_throughput_test PROPERTIES NO_SYSTEM_FROM_IMPORTED
+                                                      ON)
   target_include_directories(s3_throughput_test BEFORE PRIVATE ${_VCPKG_INC})
 endif()
 
@@ -1120,6 +1123,46 @@ target_link_options(s3_throughput_test PRIVATE
 
 set_target_properties(
   s3_throughput_test
+  PROPERTIES CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+
+# -----------------------------------------------------------------------------
+# test/io/s3_autotune_throughput_bench — connection / GET sizing model vs.
+# measured S3 throughput
+# -----------------------------------------------------------------------------
+add_executable(s3_autotune_throughput_bench
+               test/io/s3_autotune_throughput_bench.cpp)
+
+if(VCPKG_BUILD)
+  set_target_properties(s3_autotune_throughput_bench
+                        PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+  target_include_directories(s3_autotune_throughput_bench BEFORE
+                             PRIVATE ${_VCPKG_INC})
+endif()
+
+target_include_directories(
+  s3_autotune_throughput_bench
+  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
+
+target_link_libraries(
+  s3_autotune_throughput_bench
+  sirius_extension
+  duckdb_static
+  cudf::cudf
+  rmm::rmm
+  spdlog::spdlog
+  cuCascade::cucascade
+  cuCascade::cucascade_cudf
+  PkgConfig::LIBURING
+  PkgConfig::NUMA)
+link_extension_libraries(s3_autotune_throughput_bench "")
+
+target_link_options(s3_autotune_throughput_bench PRIVATE
+                    "LINKER:--allow-multiple-definition")
+
+set_target_properties(
+  s3_autotune_throughput_bench
   PROPERTIES CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")

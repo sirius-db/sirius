@@ -95,6 +95,35 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// when the pool is empty (never in practice).
   [[nodiscard]] std::size_t list_max_matches() const;
 
+  /// The whole pool, rotated, so one request is spread over every reactor
+  /// instead of being driven by a single one.
+  ///
+  /// The base returns exactly one reactor, which makes @c rest_n_reactors a
+  /// knob on inter-request concurrency only: a caller that hands the backend a
+  /// single batched request — which is exactly what @c prefers_bulk_io asks it
+  /// to do — gets one reactor thread and one reactor's @c max_connections
+  /// handles no matter how many reactors are configured.  Since an object-store
+  /// read is a round trip rather than a syscall, that is the difference between
+  /// filling the link and filling 1/N of it.
+  ///
+  /// The dispatch layer then calls @c request_type::splits with this size, so
+  /// the split is by chunk and self-limiting: a request with fewer chunks than
+  /// reactors simply lands on a prefix of the vector, one chunk each, and never
+  /// wakes a reactor it has no work for.
+  ///
+  /// The rotation matters for both ends of that range.  @c host_read_io takes
+  /// only @c front(), so without it every blocking read would serve from
+  /// reactor 0; and a stream of small requests would pile onto the same prefix
+  /// of the pool rather than spreading across it.
+  ///
+  /// @p n_chunks, @p type and @p device_id are ignored — every reactor in the
+  /// pool is identical (same config, same shared context, no GPU affinity), so
+  /// there is nothing to select on yet.
+  [[nodiscard]] std::vector<rest_reactor*> next_reactor(const io_object_type& obj,
+                                                        std::size_t n_chunks,
+                                                        io_op_type type,
+                                                        int device_id = -1) noexcept override;
+
  protected:
   /// Backend hook invoked by @c ioctx::open_datasource: parse @p path
   /// (s3://bucket/key), HEAD it for the size, and build a @c rest_io_object.

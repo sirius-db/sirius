@@ -2363,6 +2363,56 @@ TEST_CASE("rest_ioctx honors max_connections under concurrent fake range reads",
   }
 }
 
+// One batched request must be driven by the whole reactor pool, not by whichever
+// reactor the round-robin happened to land on.  max_connections is per reactor,
+// so with a one-connection reactor the concurrency the server observes IS the
+// number of reactors the request reached: a single-reactor dispatch can never
+// exceed one in-flight GET no matter how many segments it was handed.
+TEST_CASE("rest_ioctx spreads one batched range read across the reactor pool",
+          "[s3][integration][rest]")
+{
+  auto payload = deterministic_payload(512 * 1024);
+  range_fault_policy fault{};
+  fault.response_delay = 50ms;
+  range_http_server server(payload, fault);
+  scan_manager_fixture fixture;
+  auto cfg                 = make_fake_rest_config(server.endpoint());
+  cfg.rest_n_reactors      = 4;
+  cfg.rest.max_connections = 1;
+  cfg.rest.chunk_size      = 1024;
+  cfg.rest.max_n_chunks    = 1;
+  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+
+  auto datasource = manager.create_datasource("s3://fanout-bucket/object.bin");
+  require_rest_ioctx(datasource);
+
+  // Two chunks per reactor, so the split is even and every reactor has work
+  // queued behind its single connection.
+  std::vector<std::vector<std::uint8_t>> buffers;
+  std::vector<sirius::io::io_object_segment> segments;
+  for (std::size_t i = 0; i < 8; ++i) {
+    std::size_t const offset = i * 4096 + 13;
+    std::size_t const size   = 512;
+    buffers.emplace_back(size);
+    segments.emplace_back(offset, size, buffers.back().data());
+  }
+
+  auto got =
+    std::move(datasource->io_ctx()->host_read_ranges_async_io(
+                datasource->get_io_object(), std::span<sirius::io::io_object_segment>(segments)))
+      .get(10s);
+  REQUIRE(got == 8 * 512);
+  // > 1 is the fan-out itself; <= n_reactors is max_connections still holding
+  // per reactor rather than the pool becoming unbounded.
+  CHECK(server.peak_active_gets() > 1);
+  CHECK(server.peak_active_gets() <= 4);
+  for (std::size_t i = 0; i < segments.size(); ++i) {
+    require_bytes_equal(
+      buffers[i],
+      std::span<std::uint8_t const>(payload.data() + segments[i].offset, segments[i].size));
+  }
+}
+
 TEST_CASE("rest_ioctx reads through the TLS MinIO endpoint with the harness CA bundle",
           "[s3][integration][rest]")
 {

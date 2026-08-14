@@ -259,6 +259,27 @@ std::size_t rest_ioctx::list_max_matches() const
                            : _reactors.front()->get_config().list_max_matches;
 }
 
+std::vector<rest_reactor*> rest_ioctx::next_reactor(const io_object_type& /*obj*/,
+                                                    std::size_t /*n_chunks*/,
+                                                    io_op_type /*type*/,
+                                                    int /*device_id*/) noexcept
+{
+  std::size_t const n = _reactors.size();
+  if (n == 0) { return {}; }
+
+  // Rotate the starting point per call, not just per reactor: the caller may
+  // use the whole vector (a batched request) or only its front (a blocking
+  // read), and both have to move across the pool between calls.
+  std::size_t const start = _next.fetch_add(1, std::memory_order_relaxed) % n;
+
+  std::vector<rest_reactor*> out;
+  out.reserve(n);
+  for (std::size_t k = 0; k < n; ++k) {
+    out.push_back(_reactors[(start + k) % n].get());
+  }
+  return out;
+}
+
 std::shared_ptr<io_object> rest_ioctx::create_io_object(std::string path)
 {
   auto parsed = sirius::io::parse(path);

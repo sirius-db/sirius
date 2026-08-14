@@ -68,20 +68,30 @@ inline double ms_since(clock_type::time_point t)
 // ---------------------------------------------------------------------------
 
 struct bench_options {
-  std::vector<std::string> buckets; ///< one or more s3:// prefixes (--bucket repeatable)
-  std::size_t n_files{12};          ///< total files across all prefixes (divided evenly)
-  std::size_t per_file_gib{1}; ///< GB of data to read per file (random segments)
+  std::vector<std::string> buckets;  ///< one or more s3:// prefixes (--bucket repeatable)
+  std::size_t n_files{12};           ///< total files across all prefixes (divided evenly)
+  std::size_t per_file_gib{1};       ///< GB of data to read per file (random segments)
   std::size_t repeat{3};
 
   /// Target GET size in MiB. Each aligned chunk of this size becomes one GET
   /// (rest.max_n_chunks is forced to 1 so no fusing occurs).
   std::size_t chunk_size_mib{1};
 
+  /// Exact GET size in bytes, overriding @c chunk_size_mib when non-zero.  For
+  /// a benchmark whose target GET size is not a whole number of MiB -- the
+  /// autotune one derives it from bandwidth x latency.
+  std::size_t chunk_size_bytes{0};
+
   /// Max concurrent in-flight easy handles per reactor (rest.max_connections).
   std::size_t max_nconnection{128};
 
   /// Number of REST reactor instances.
   std::size_t n_reactors{1};
+
+  /// Record the reactor's per-chunk micro timings (ttfb, queue wait, GET wall
+  /// time).  Costs a couple of atomics per GET; worth it for a benchmark that
+  /// feeds the measured latency back into its own model.
+  bool perf_instrumentation{false};
 
   /// Share of each GPU's memory the pool may use.  Only matters for benchmarks
   /// that allocate device memory; raw-throughput ones can leave it alone.
@@ -111,7 +121,10 @@ struct bench_options {
   std::string secret_key;
   std::string session_token;
 
-  [[nodiscard]] std::size_t chunk_bytes() const noexcept { return chunk_size_mib << 20; }
+  [[nodiscard]] std::size_t chunk_bytes() const noexcept
+  {
+    return chunk_size_bytes != 0 ? chunk_size_bytes : (chunk_size_mib << 20);
+  }
   [[nodiscard]] std::size_t host_block_bytes() const noexcept
   {
     return (host_chunk_mib == 0 ? chunk_size_mib : host_chunk_mib) << 20;
@@ -149,6 +162,23 @@ class arg_parser {
     return true;
   }
 
+  bool match(int& i, std::string_view flag, double& out) const
+  {
+    std::string s;
+    if (!match(i, flag, s)) { return false; }
+    out = std::stod(s);
+    return true;
+  }
+
+  /// Valueless switch: `--name` present sets @p out.  Not an overload of
+  /// @c match -- it consumes no value, so it must not take @c i by reference.
+  bool toggle(int i, std::string_view name, bool& out) const
+  {
+    if (std::string_view{_argv[i]} != name) { return false; }
+    out = true;
+    return true;
+  }
+
   /// Repeatable flag: appends each occurrence to a vector.
   bool match(int& i, std::string_view flag, std::vector<std::string>& out) const
   {
@@ -175,8 +205,7 @@ inline bool parse_common_arg(arg_parser const& p, int& i, bench_options& o)
          p.match(i, "--n-reactors", o.n_reactors) || p.match(i, "--n_reactors", o.n_reactors) ||
          p.match(i, "--config", o.config_path) || p.match(i, "--endpoint", o.endpoint) ||
          p.match(i, "--region", o.region) || p.match(i, "--access-key", o.access_key) ||
-         p.match(i, "--secret-key", o.secret_key) ||
-         p.match(i, "--session-token", o.session_token);
+         p.match(i, "--secret-key", o.secret_key) || p.match(i, "--session-token", o.session_token);
 }
 
 // ---------------------------------------------------------------------------
@@ -192,7 +221,8 @@ class engine {
     // granularity; host_chunk_mib decouples them when that is not wanted.
     const std::size_t block_size = opts.host_block_bytes();
     cucascade::memory::reservation_manager_configurator builder;
-    builder.set_number_of_gpus(1)
+    builder
+      .set_number_of_gpus(1)
       // Without an explicit limit the GPU pool is not sized for a benchmark that
       // allocates device buffers (a raw-throughput one never notices; one that
       // decodes into device memory OOMs immediately).
@@ -261,9 +291,10 @@ class engine {
     if (!opts.secret_key.empty()) { cfg.object_store.secret_key = opts.secret_key; }
     if (!opts.session_token.empty()) { cfg.object_store.session_token = opts.session_token; }
 
-    cfg.rest.max_connections = opts.max_nconnection;
-    cfg.rest.chunk_size      = opts.chunk_bytes();
-    cfg.rest_n_reactors      = opts.n_reactors;
+    cfg.rest.max_connections      = opts.max_nconnection;
+    cfg.rest.chunk_size           = opts.chunk_bytes();
+    cfg.rest_n_reactors           = opts.n_reactors;
+    cfg.rest.perf_instrumentation = opts.perf_instrumentation;
     // Default 1: each chunk_size-aligned segment becomes exactly one GET with
     // no fusing, so chunk_size == GET size == staging block size.
     cfg.rest.max_n_chunks = opts.max_n_chunks;
@@ -329,14 +360,14 @@ inline std::vector<s3_file> list_prefix(engine& eng,
 /// then interleave them in round-robin order so datasource opens and reads
 /// alternate between prefixes.
 inline std::vector<s3_file> get_files_from_prefixes(engine& eng,
-                                                     std::vector<std::string> const& prefixes,
-                                                     std::size_t n_files)
+                                                    std::vector<std::string> const& prefixes,
+                                                    std::size_t n_files)
 {
   if (prefixes.empty()) { throw std::runtime_error("no --bucket specified"); }
 
-  const std::size_t n          = prefixes.size();
-  const std::size_t base       = n_files / n;
-  const std::size_t remainder  = n_files % n;
+  const std::size_t n         = prefixes.size();
+  const std::size_t base      = n_files / n;
+  const std::size_t remainder = n_files % n;
 
   // Collect per-prefix file lists.
   std::vector<std::vector<s3_file>> per_prefix;
