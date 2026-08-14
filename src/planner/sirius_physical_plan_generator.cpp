@@ -306,8 +306,9 @@ void wrap_table_scan_source(
     // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
     replace_slot = true;
   } else if (sirius::planner::is_parquet_reader_function(fn)) {
-    leaf =
-      make_gpu_scan_leaf(build_parquet_table_info(scan, op_params), scan, op_params, mode, stats);
+    auto info   = build_parquet_table_info(scan, op_params);
+    info->stats = stats;  // WI-0b: reader-gate delivery counters sink into connection stats.
+    leaf        = make_gpu_scan_leaf(std::move(info), scan, op_params, mode, stats);
     // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
     replace_slot = true;
   } else {

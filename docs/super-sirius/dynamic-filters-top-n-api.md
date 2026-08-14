@@ -1179,8 +1179,80 @@ while the wrapper stays membership-only: the pinned-serve miss in miniature, per
 writer available to the tests can emit that encoding (the probe itself is the declared
 untested conservatism from Phase 0), and the per-scan latch deliberately does not express
 per-split facts; if the encoding ever becomes constructible, this needs batch-level
-signaling. **Known gap — WI-0b** (reader-path runtime gate) remains specified and
-unimplemented; the flip neither implements nor replaces it.
+signaling. **WI-0b** (reader-path runtime gate) is implemented — see the Phase 2 section below. The flip
+and the gate remain distinct: the latch records a prepare-time serve fact (no reader will
+run), the gate accumulates per-split runtime pruning evidence inside a running reader.
+
+### Phase 2 — Reader-path runtime gate, WI-0b *(implemented with this change)*
+
+Fresh-read parquet was the one ungated consumption path: merging dynamic filters into
+`reader_options::set_filter` is paid per split whether or not it prunes, and the measured
+adversary paid +8.4% for 2006 pushed filters that pruned nothing — the parquet half of
+criterion C2's known gap (WI-0 fixed the native half at plan time). The fix is a per-scan
+runtime gate on the reader's own row-group accounting (main doc, "The siting rule is necessary
+but not sufficient: the reader path needs a runtime gate"). Whether C2 now holds is Stage-6
+acceptance evidence: re-measure the adversary cell.
+
+#### New file: `src/include/op/scan/reader_pruning_gate.hpp` (+ `.cpp`)
+
+```cpp
+/// Per-scan runtime gate for the parquet reader's dynamic-filter merge. One instance per
+/// parquet ingestible; shared by that scan's concurrent split tasks; per-execution because
+/// plans are per-execution. measuring -> active (terminal: any pruned row group) or
+/// disabled (after k_disable_after_barren_splits barren samples); disabled re-arms one
+/// measurement on exponential backoff in channel generations (gaps 1, 2, 4, ...).
+/// applicable() is lock-free; record_sample() serializes the rare decision. A sample exists
+/// only when the merge added dynamic conjuncts and the reader reported accounting; pinned
+/// serves, replica-less devices, filterless and zero-row splits are no evidence — except
+/// that observed pruning activates from any sample (tightening is monotone).
+class reader_pruning_gate {
+ public:
+  enum class state : std::uint8_t { measuring, active, disabled };
+  static constexpr std::uint64_t k_disable_after_barren_splits  = 4;
+  static constexpr std::uint64_t k_initial_rearm_generation_gap = 1;
+  [[nodiscard]] bool applicable(std::uint64_t channel_generation) const noexcept;
+  void record_sample(std::size_t row_groups_considered,
+                     std::size_t row_groups_remaining,
+                     std::uint64_t observed_generation,
+                     sirius::op::dynamic_filter_stats* stats);
+  [[nodiscard]] state current_state() const noexcept;
+};
+```
+
+#### Modified: `src/include/op/scan/parquet_gpu_ingestible.hpp`
+
+`parquet_ingestible_table_info` gains `sirius::op::dynamic_filter_stats* stats = nullptr`
+(non-owning, `SiriusContext` lifetime — the hash-join contract; null on the pin path and in
+tests that pass a local instance). `parquet_gpu_ingestible` gains the gate member and a
+`reader_gate()` accessor for scan-level tests. The merge site consults
+`applicable(channel->generation())` before taking a snapshot — a gated-off split skips the
+snapshot, the AST fragments, and the scalar references entirely — and records a sample after
+the read from the returned `cudf::io::table_metadata` (`num_input_row_groups` versus the
+post-stats/post-bloom remainder), tagged with the snapshot generation the merge used.
+
+#### Modified: `src/include/op/dynamic_filter/dynamic_filter_stats.hpp`
+
+```cpp
+std::atomic<std::uint64_t> reader_gate_row_groups_considered{0};
+std::atomic<std::uint64_t> reader_gate_row_groups_pruned{0};
+std::atomic<std::uint64_t> reader_gate_measurements{0};
+std::atomic<std::uint64_t> reader_gate_disabled{0};
+std::atomic<std::uint64_t> reader_gate_rearmed{0};
+std::atomic<std::uint64_t> reader_gate_merges_skipped{0};
+```
+
+All delivery-time, recorded inside `materialize_metadata_to_table` — the transparent path's
+prepare-time plan owns a separate ingestible that never materializes, so these never double.
+Appended at the end of the struct and snapshot.
+
+**Attribution contract.** Stats-stage pruning observed in-read is attributable to the dynamic
+conjuncts because the split's row groups were already pruned against the static conjuncts at
+metadata time and statistics evaluation is deterministic; bloom-stage pruning can
+over-attribute and only ever keeps the gate on longer. The gate therefore never disables due
+to static-filter behavior, and a disable only ever forfeits pruning.
+
+**Known gap unchanged:** the per-split `disable_filter_pushdown` reader bypass (BYTE_ARRAY
+decimal probe) remains unconsumed post-decode, as recorded in the Phase 1 section.
 
 ---
 
@@ -1228,8 +1300,8 @@ it is deleting the guard's rationale; carry the test or delete the guard deliber
 Installation site: plan-shape layer (`DYNAMIC_FILTER` node presence, position, `provenance()`).
 Pruning effect and lifecycle: stats deltas (`top_n_offers`, `top_n_prefilter_rows_*`,
 `top_n_revisions_published`, the per-layer `top_n_{first_key,lex}_*` counters,
-`top_n_endpoint_sites_*`, and the post-decode consumer pair
-`post_decode_apply_rows_in/out`). Batch arrival order is not deterministic,
+`top_n_endpoint_sites_*`, the post-decode consumer pair
+`post_decode_apply_rows_in/out`, and the reader-gate family `reader_gate_*`). Batch arrival order is not deterministic,
 so row-level pruning counters are asserted as directions (`rows_out <= rows_in`, deltas `> 0`
 only where a single-batch shape forces them), matching the sibling doc's counter-contract rules.
 
@@ -1263,6 +1335,7 @@ shape publishes its strict predicate as RANGE, and multi-key shapes publish per 
 | 17 | Filter between aggregate and Top-N | Scenario 15 plus `HAVING min(v) > 0` | No group-key producer (S5) | plan, integration |
 | 18 | Boundary-tie preservation | Scenario 15 data with duplicated boundary `grp` values and a `sum` aggregate | Exact equivalence — tied rows provably kept; inclusive predicates asserted via results, not counters (S5) | integration, sqllogic |
 | 19 | Pinned-cache-served scan | Scenario 1's query after `CALL pin_table(...)`, GPU and HOST tiers, plus an unpinned rerun | Scan target sited exactly as in 1, but no reader runs: the prepare-time `read_time_filter_bypass` promotes the wrapper to `include_ast_row_masks`; boundary applies post-decode and `post_decode_apply_rows_in/out` move; the unpinned rerun keeps them at zero on a Top-N-only channel (both directions pinned — under-flip and over-flip each fail one leg) (Phase 1) | plan, operator, integration |
+| 20 | Reader pruning gate | One clustered parquet file (ascending key, many splits) queried ascending (gate stays on) and descending (the adversary: gate disables), plus a pinned rerun and a flag-off rerun | Ascending: `reader_gate_measurements` and `reader_gate_row_groups_pruned` move, `reader_gate_disabled` stays 0. Descending: `reader_gate_disabled` >= 1, then `reader_gate_merges_skipped` > 0. Pinned rerun: all `reader_gate_*` flat while `post_decode_apply_rows_in` moves (zero samples, not zero pruning). Flag off: all `reader_gate_*` flat (Phase 2) | scan, integration |
 
 Negative sub-cases (14): a tie-preserving rank shape — pinned DuckDB v1.5.4 has no `WITH TIES`
 grammar, so the negative is expressed as `RANK() OVER (ORDER BY …) <= n`, asserting no producer

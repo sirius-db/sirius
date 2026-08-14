@@ -79,6 +79,13 @@ struct dynamic_filter_stats_snapshot {
 
   std::uint64_t post_decode_apply_rows_in  = 0;
   std::uint64_t post_decode_apply_rows_out = 0;
+
+  std::uint64_t reader_gate_row_groups_considered = 0;
+  std::uint64_t reader_gate_row_groups_pruned     = 0;
+  std::uint64_t reader_gate_measurements          = 0;
+  std::uint64_t reader_gate_disabled              = 0;
+  std::uint64_t reader_gate_rearmed               = 0;
+  std::uint64_t reader_gate_merges_skipped        = 0;
 };
 
 /**
@@ -208,6 +215,24 @@ struct dynamic_filter_stats {
   std::atomic<std::uint64_t> post_decode_apply_rows_in{0};
   std::atomic<std::uint64_t> post_decode_apply_rows_out{0};
 
+  // --- Parquet reader pruning gate (WI-0b) ---
+  // All delivery-time: recorded inside parquet_gpu_ingestible::materialize_metadata_to_table,
+  // which runs only for the executing plan -- the transparent path's prepare-time plan owns a
+  // separate ingestible that never materializes, so unlike the plan-time top_n_* facts these
+  // never double. considered/pruned copy the reader's own accounting (cudf::io::table_metadata)
+  // for splits whose reader AST carried merged dynamic conjuncts; measurements counts those
+  // samples; disabled counts transitions into the disabled state (re-disables included); rearmed
+  // counts backoff-permitted re-measurements taken while disabled; merges_skipped counts splits
+  // whose dynamic merge the gate skipped. A pinned-cache-served scan runs no reader and moves
+  // none of these. Batch/publication timing is racy by design, so tests assert deltas or
+  // directions only.
+  std::atomic<std::uint64_t> reader_gate_row_groups_considered{0};
+  std::atomic<std::uint64_t> reader_gate_row_groups_pruned{0};
+  std::atomic<std::uint64_t> reader_gate_measurements{0};
+  std::atomic<std::uint64_t> reader_gate_disabled{0};
+  std::atomic<std::uint64_t> reader_gate_rearmed{0};
+  std::atomic<std::uint64_t> reader_gate_merges_skipped{0};
+
   /**
    * @brief Read every counter with relaxed ordering
    *
@@ -271,7 +296,15 @@ struct dynamic_filter_stats {
       .top_n_group_prefilter_rows_out =
         top_n_group_prefilter_rows_out.load(std::memory_order_relaxed),
       .post_decode_apply_rows_in  = post_decode_apply_rows_in.load(std::memory_order_relaxed),
-      .post_decode_apply_rows_out = post_decode_apply_rows_out.load(std::memory_order_relaxed)};
+      .post_decode_apply_rows_out = post_decode_apply_rows_out.load(std::memory_order_relaxed),
+      .reader_gate_row_groups_considered =
+        reader_gate_row_groups_considered.load(std::memory_order_relaxed),
+      .reader_gate_row_groups_pruned =
+        reader_gate_row_groups_pruned.load(std::memory_order_relaxed),
+      .reader_gate_measurements   = reader_gate_measurements.load(std::memory_order_relaxed),
+      .reader_gate_disabled       = reader_gate_disabled.load(std::memory_order_relaxed),
+      .reader_gate_rearmed        = reader_gate_rearmed.load(std::memory_order_relaxed),
+      .reader_gate_merges_skipped = reader_gate_merges_skipped.load(std::memory_order_relaxed)};
   }
 };
 

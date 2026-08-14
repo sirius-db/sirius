@@ -19,6 +19,7 @@
 // sirius
 #include <helper/logical_type.hpp>
 #include <op/scan/gpu_ingestible.hpp>
+#include <op/scan/reader_pruning_gate.hpp>
 #include <op/scan/row_group_metadata.hpp>  // row_group_slice + hybrid_scan_reader
 #include <op/scan/scan_plan.hpp>
 #include <sirius_config.hpp>
@@ -50,6 +51,7 @@ class sirius_scan_manager;
 
 namespace sirius::op {
 class sirius_dynamic_filter_set;
+struct dynamic_filter_stats;
 }  // namespace sirius::op
 
 namespace sirius::op::scan {
@@ -76,6 +78,10 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   /// wired. The ingestible uses AST-capable filters for row-group pruning; the downstream
   /// dynamic-filter operator applies membership filters post-decode.
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> sirius_dynamic_filters;
+  /// Connection-lifetime dynamic-filter counters (non-owning, `SiriusContext` lifetime -- the
+  /// hash-join contract). Consumed by the reader pruning gate's delivery-time counters. Null on
+  /// the pin path and in tests that pass a local stats instance or none.
+  sirius::op::dynamic_filter_stats* stats = nullptr;
 
   /// Target decoded column-buffer budget for one data-batch split. Consumed
   /// only by parquet_batch_coalescer when it bundles files / chunks row groups —
@@ -303,6 +309,9 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     return _duckdb_filter_expression != nullptr;
   }
 
+  /// The reader pruning gate, for scan-level tests.
+  [[nodiscard]] reader_pruning_gate const& reader_gate() const noexcept { return _reader_gate; }
+
  private:
   /// Read one file's footer, prune its row groups against the filter, and record
   /// per-row-group byte accounting. Returns a single @c parquet_file_scan_info.
@@ -333,6 +342,10 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   // AST-capable filters are ANDed into the parquet reader filter; membership filtering happens in
   // the downstream dynamic-filter operator.
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> _sirius_dynamic_filters;
+
+  /// WI-0b: gates this scan's reader-AST dynamic merge on observed row-group pruning.
+  /// Per-execution because the ingestible is per plan; shared by concurrent split tasks.
+  reader_pruning_gate _reader_gate;
 };
 
 std::shared_ptr<parquet_gpu_ingestible> make_ingestible(

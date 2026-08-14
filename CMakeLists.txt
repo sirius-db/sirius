@@ -291,6 +291,7 @@ set(EXTENSION_SOURCES
     src/op/scan/duckdb_native_metadata.cpp
     src/op/scan/duckdb_native_decoder.cpp
     src/op/scan/dynamic_filter_merge.cpp
+    src/op/scan/reader_pruning_gate.cpp
     src/op/scan/sirius_physical_dynamic_filter.cpp
     src/op/scan/host_keep_mask.cpp
     src/op/scan/owning_table_view.cpp
@@ -641,6 +642,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_top_n_dynamic_filter_measurement.cpp
     test/cpp/integration/test_gpu_execution_top_n_pinned_serve.cpp
     test/cpp/integration/test_gpu_execution_decimal_pushdown.cpp
+    test/cpp/integration/test_gpu_execution_reader_pruning_gate.cpp
     test/cpp/integration/test_gpu_execution_filter_nulls.cpp
     test/cpp/integration/test_gpu_execution_join_nulls.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp
@@ -772,7 +774,9 @@ set(TEST_SOURCES
     test/cpp/scan/test_owning_table_view.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_decimal_pushdown.cpp
+    test/cpp/scan/test_parquet_reader_gate_pruning.cpp
     test/cpp/scan/test_parquet_scan_sizing.cpp
+    test/cpp/scan/test_reader_pruning_gate.cpp
     test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp
     test/cpp/sql/test_sirius_sql_rewrite.cpp
     test/cpp/telemetry/test_telemetry_context.cpp

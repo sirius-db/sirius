@@ -24,6 +24,7 @@
 #include <io/io_context.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
+#include <op/dynamic_filter/dynamic_filter_stats.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
@@ -806,33 +807,64 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
     if (ast_expression) { reader_filter_root = &ast_expression->back(); }
   }
 
-  if (!split.disable_filter_pushdown && _sirius_dynamic_filters &&
+  bool dynamic_filters_merged    = false;
+  std::uint64_t merge_generation = 0;
+
+  if (!split.disable_filter_pushdown && !all_slices_pruned && _sirius_dynamic_filters &&
       _sirius_dynamic_filters->has_filters()) {
-    // One coherent snapshot per checkpoint: taken after the lock-free fast path, before any
-    // other lock, and used for every predicate built for this split.
-    filters_snapshot = _sirius_dynamic_filters->snapshot();
-    if (ast_expression) {
-      reader_filter_root = merge_dynamic_filters_into_ast(ast_expression->tree,
-                                                          reader_filter_root,
-                                                          filters_snapshot,
-                                                          *split.plan,
-                                                          mem_space.get_device_id());
-    } else {
-      dynamic_ast_expression.emplace();
-      reader_filter_root = merge_dynamic_filters_into_ast(dynamic_ast_expression->tree,
-                                                          /*existing_root=*/nullptr,
-                                                          filters_snapshot,
-                                                          *split.plan,
-                                                          mem_space.get_device_id());
-      if (!reader_filter_root) { dynamic_ast_expression.reset(); }
+    // WI-0b: the dynamic merge -- never the static predicate -- is gated per scan by the
+    // reader_pruning_gate on observed row-group pruning. The advisory generation() feeds only
+    // the gate check; the predicate is still built from one coherent snapshot, whose generation
+    // tags the sample.
+    if (_reader_gate.applicable(_sirius_dynamic_filters->generation())) {
+      // One coherent snapshot per checkpoint: taken after the lock-free fast path, before any
+      // other lock, and used for every predicate built for this split.
+      filters_snapshot           = _sirius_dynamic_filters->snapshot();
+      merge_generation           = filters_snapshot.generation;
+      auto const* pre_merge_root = reader_filter_root;
+      if (ast_expression) {
+        reader_filter_root = merge_dynamic_filters_into_ast(ast_expression->tree,
+                                                            reader_filter_root,
+                                                            filters_snapshot,
+                                                            *split.plan,
+                                                            mem_space.get_device_id());
+      } else {
+        dynamic_ast_expression.emplace();
+        reader_filter_root = merge_dynamic_filters_into_ast(dynamic_ast_expression->tree,
+                                                            /*existing_root=*/nullptr,
+                                                            filters_snapshot,
+                                                            *split.plan,
+                                                            mem_space.get_device_id());
+        if (!reader_filter_root) { dynamic_ast_expression.reset(); }
+      }
+      dynamic_filters_merged = reader_filter_root != pre_merge_root;
+    } else if (_info->stats != nullptr) {
+      _info->stats->reader_gate_merges_skipped.fetch_add(1, std::memory_order_relaxed);
     }
   }
 
   if (reader_filter_root) { opts.set_filter(*reader_filter_root); }
 
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
-  auto [table, _] =
+  auto [table, read_metadata] =
     cudf::io::read_parquet(std::move(sources), std::move(metadatas), opts, stream, mr_ref);
+
+  // WI-0b sample: only splits whose reader AST carried merged dynamic conjuncts are evidence,
+  // and only when the reader reported its row-group accounting. Attribution note: the split's
+  // row groups were already pruned against the static conjuncts at metadata time, so stats-stage
+  // pruning here is the dynamic filters'; bloom-stage over-attribution only keeps the gate on.
+  if (dynamic_filters_merged) {
+    auto const& m                                  = read_metadata;
+    std::optional<cudf::size_type> const remaining = m.num_row_groups_after_bloom_filter.has_value()
+                                                       ? m.num_row_groups_after_bloom_filter
+                                                       : m.num_row_groups_after_stats_filter;
+    if (remaining.has_value()) {
+      _reader_gate.record_sample(static_cast<std::size_t>(m.num_input_row_groups),
+                                 static_cast<std::size_t>(*remaining),
+                                 merge_generation,
+                                 _info->stats);
+    }
+  }
 
   // Hive-partition scans assemble inline here: partition_values are per-split
   // (carried on parquet_split_info) and do not travel to the pipeline-shared

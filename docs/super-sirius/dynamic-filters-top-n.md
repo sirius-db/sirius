@@ -954,6 +954,10 @@ reader AST and `cudf::io::read_parquet`.
 - `reader_options::set_filter` enables row-group and decode-time row filtering.
 - A split already past AST construction is not revisited.
 - If `disable_filter_pushdown` is set, the first release skips both layers for that split.
+- The dynamic merge — never the static predicate — is gated per scan by the reader pruning
+  gate ("The siting rule is necessary but not sufficient" below): a scan whose merged dynamic
+  filters demonstrably prune no row groups stops paying `set_filter` per split, and re-arms on
+  exponential backoff as boundaries tighten.
 
 **Resolved — the FLBA arm of the pushdown-safety probe is gone.** A split containing an
 FLBA-encoded decimal used to set `disable_filter_pushdown`, dropping every reader-side filter for
@@ -1115,27 +1119,60 @@ decode-time row filtering (which only duplicates the sink's own pass, per the ar
 When the data cannot be pruned, the first is zero and only the cost remains, paid on every split.
 
 So enable-by-default criterion C2 fails on **both** backends, for two different reasons, and the
-plan-time rule fixes only one of them. The reader path therefore gains a runtime gate:
+plan-time rule fixes only one of them. The reader path therefore carries a runtime gate — the
+**reader pruning gate** (`reader_pruning_gate`), one instance per parquet scan, owned by the
+ingestible whose `materialize_metadata_to_table` is the merge site. Whether the gate returns C2
+to within its bound is Stage-6 acceptance evidence (re-measure the adversary cell); the
+mechanism is:
 
 - **Signal — row groups pruned over row groups considered, per split**, taken from the reader's
-  own accounting rather than a measurement pass. Deliberately *not* the post-decode gate's mask
-  keep-ratio: that measures rows the predicate rejects, which the sink would reject anyway; only
-  unread row groups are work uniquely saved here. This is a distinct gate instance with a distinct
-  signal domain, consistent with the one-domain-per-instance rule.
-- **Decision** — after a small fixed number of splits, if the median pruned fraction is
-  negligible, stop merging the boundary into that scan's reader AST.
+  own accounting rather than a measurement pass: the `cudf::io::table_metadata` each split's
+  `read_parquet` already returns reports `num_input_row_groups` and the row groups remaining
+  after its statistics and bloom stages, so the signal is free. Deliberately *not* the
+  post-decode gate's mask keep-ratio: that measures rows the predicate rejects, which the sink
+  would reject anyway; only unread row groups are work uniquely saved here. This is a distinct
+  gate class with a distinct signal domain, consistent with the one-domain-per-instance rule. A
+  split is a sample only when the merge actually added dynamic conjuncts to the reader AST and
+  the reader reported accounting; a filterless split, a device without replicas, the zero-row
+  fallback split, and every split of a pinned-cache-served scan (no reader runs) contribute no
+  evidence — zero samples, never "zero pruning".
+- **Attribution.** The reader evaluates one merged AST, so dynamic-only pruning is not directly
+  separable — but the split's row groups were already pruned against exactly the static
+  conjuncts at metadata time (`build_file_scan_info`), and statistics evaluation is
+  deterministic over immutable footer metadata, so stats-stage pruning observed in-read is the
+  dynamic conjuncts'. The bloom stage can over-attribute (a static equality conjunct may
+  bloom-prune there for the first time), and over-attribution only inflates the pruned count:
+  the approximation can delay a disable, never cause one, so the gate cannot disable due to
+  static-filter behavior and only ever costs pruning, never correctness.
+- **Decision.** Any pruned row group is success: one skipped row group's I/O and decode dwarfs
+  the per-split merge cost, and monotone tightening means observed pruning only grows. Disable
+  requires `k_disable_after_barren_splits` (4) measured splits with zero pruning — with success
+  terminal on any pruning, all-barren is the only disable evidence, so the earlier "median
+  pruned fraction" phrasing collapses to this rule. Disabling stops merging dynamic filters
+  into that scan's reader AST — the whole dynamic merge and nothing else: static WHERE
+  pushdown, the wrapper's membership masks and effective mode, sited endpoints, and the sink
+  prefilter are untouched.
 - **Terminal on success** — a gate that has observed real pruning stays on. Boundaries only
   tighten, and a tighter boundary prunes at least as many row groups, so usefulness cannot
   regress.
-- **Re-arm on exponential backoff in revisions, not per generation.** Tightening genuinely can
-  flip a boundary from useless to useful — one at the 90th percentile prunes nothing where one at
-  the 1st prunes almost everything — so permanent disable is wrong. But re-arming per generation
-  would re-measure thousands of times on the adversarial shape. Doubling the revision gap between
-  measurements bounds this to O(log R) re-measurements while still catching a boundary that
-  eventually pays.
+- **Re-arm on exponential backoff in channel generations.** Tightening genuinely can flip a
+  boundary from useless to useful — one at the 90th percentile prunes nothing where one at the
+  1st prunes almost everything — so permanent disable is wrong. But re-arming on every accepted
+  publication would re-measure thousands of times on the adversarial shape. After a disable the
+  gate permits one re-measurement one generation later; each barren re-measurement doubles the
+  generation gap (1, 2, 4, 8, …), bounding re-measurement to O(log G). The counter is the
+  channel generation, not the producer revision: revisions are per-slot and not exposed to
+  consumers, a channel can carry several slots plus append-only join filters, and every
+  accepted publication — replacement or append — bumps the generation exactly once, so on the
+  motivating shape the two counters advance together and the intended O(log R) schedule is
+  preserved. A join append advancing the counter is correct, not slop: new AST content is
+  legitimately new evidence.
 
-The residual is bounded, not zero: the first few splits are paid before the gate can learn
-anything, and that is the honest floor for any runtime-adaptive scheme.
+The residual is bounded, not zero: `k_disable_after_barren_splits` measured splits plus
+O(log G) re-measurements are paid around the gate's learning, and that is the honest floor for
+any runtime-adaptive scheme. On the measured adversary that is ~15 of 2006 splits still paying
+the merge; on the clustered winner the first measured split prunes and the gate is active from
+sample one.
 
 ### Generation-aware gate
 
@@ -1150,12 +1187,12 @@ grow it, so decisions must record snapshot generation.
 - A device with no applicable filter does not train the gate.
 
 Layers published to a Parquet scan served fresh from disk execute inside the reader and
-remain outside this post-decode gate. They are not meant to stay ungated: the reader-side
-gate specified above (WI-0b — not yet implemented) will govern them on a different signal
-(row groups pruned, not mask keep-ratio). Until it lands, fresh-read reader-path
-publications are the one ungated consumption path. A pinned-cache-served scan is not on
-that path: its consumption flips post-decode at prepare time ("Pinned-cache-served scans")
-and sits behind this gate like every other post-decode consumer.
+remain outside this post-decode gate; they answer to the reader pruning gate instead (WI-0b,
+"The siting rule is necessary but not sufficient" above), on its own signal — row groups
+pruned, not mask keep-ratio. No consumption path is ungated. A pinned-cache-served scan is on
+neither reader path: its consumption flips post-decode at prepare time ("Pinned-cache-served
+scans"), sits behind this gate like every other post-decode consumer, and contributes no
+reader-gate evidence — the gate sees zero samples there, never "zero pruning".
 
 ## Scheduling and lifecycle
 
@@ -1242,6 +1279,9 @@ These must start empty for every execution:
 - Generation-based gate decisions.
 - The scan serve-path latch (`read_time_filter_bypass`): un-bypassed at plan construction,
   decided once per execution during `prepare_for_query`.
+- Reader-pruning-gate state (`reader_pruning_gate`): every execution starts measuring. The gate
+  lives on the per-plan parquet ingestible, and only the executing plan's ingestible ever
+  samples.
 
 The implementation must create per-execution state behind an immutable route plan or prove Sirius
 creates fresh plans and channels for every execution. Both engines make this explicit: DuckDB
@@ -1316,6 +1356,7 @@ quiesced through normal task teardown. No scan waits for cleanup.
 | AST/type mismatch | Skip at that checkpoint |
 | Consumer observes old generation | Apply it; only pruning is lost |
 | Parquet pushdown disabled | Pass through without either layer |
+| Reader pruning gate disabled for a scan | Skip the dynamic merge for later splits; static pushdown, membership masks, endpoints, and the sink prefilter unaffected; re-arm on generation backoff |
 | Authoritative Top-N/pipeline error | Fail through normal handling |
 | Cancellation | Abandon pending publication |
 
@@ -1337,7 +1378,9 @@ Recommended metrics:
 - Generation at each scan checkpoint.
 - Splits queued, started, and completed before first publication and per generation.
 - Replica bytes, latency, route, and failure per device.
-- Parquet files/row groups/rows pruned where cuDF exposes them.
+- Reader pruning gate: row groups considered/pruned per measured split, measurements, disables,
+  backoff re-measurements, and skipped merges (`reader_gate_*`), all delivery-time; files/rows
+  pruned stay unexposed where cuDF does not report them.
 - Native rows before and after the fused-kernel application.
 - Post-decode wrapper rows before/after (`post_decode_apply_rows_in/out`), covering native,
   endpoint, and pinned-cache-served consumption.
@@ -1502,6 +1545,7 @@ These affect eligibility and performance policy, not the replacement protocol.
 | Merge helpers | `src/op/scan/dynamic_filter_merge.cpp` | Consume coherent snapshot |
 | Gate | `src/include/op/scan/dynamic_filter_gate.hpp` | Invalidate by generation |
 | Scan wrapping | `src/planner/sirius_physical_plan_generator.cpp` | Reuse existing consumers |
+| Reader gate | `src/include/op/scan/reader_pruning_gate.hpp`, `src/op/scan/parquet_gpu_ingestible.cpp` | Gate the reader-AST dynamic merge on observed row-group pruning |
 | Serve-path flip | `src/include/op/scan/read_time_filter_bypass.hpp`, `src/scan_manager/sirius_scan_manager.cpp` | Latch pinned-serve at prepare; wrapper promotes to post-decode AST |
 
 DuckDB `DynamicFilterData` may remain for CPU fallback compatibility, but is not the GPU transport
