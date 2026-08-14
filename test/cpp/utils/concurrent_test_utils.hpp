@@ -271,6 +271,10 @@ struct env_options {
   int num_gpus                      = 1;
   int max_concurrent_queries        = slots();
   std::string monitor_period        = "10ms";
+  // One split per 100M rows = effectively one scan task per file. Scenarios
+  // that need a long-running query with a steady stream of dispatchable tasks
+  // (the fairness suite) lower this so the scan fans out.
+  std::int64_t scan_task_batch_size = 100'000'000;
 };
 
 inline std::string adversarial_config_yaml(const env_options& opt)
@@ -305,7 +309,8 @@ inline std::string adversarial_config_yaml(const env_options& opt)
       max_concurrent_queries: )" +
          std::to_string(opt.max_concurrent_queries) + R"(
   operator_params:
-    scan_task_batch_size: 100000000
+    scan_task_batch_size: )" +
+         std::to_string(opt.scan_task_batch_size) + R"(
     max_sort_partition_bytes: 0
     hash_partition_bytes: 100000000
     concat_batch_bytes: 100000000

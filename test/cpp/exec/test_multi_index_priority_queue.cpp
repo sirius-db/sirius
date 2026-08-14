@@ -603,3 +603,255 @@ TEST_CASE("multi_index survives concurrent producers and consumers", "[multi_ind
   REQUIRE(consumed.load() == kTotal);
   REQUIRE(q.empty());
 }
+
+// =============================================================================
+// Cross-query fairness (F1): pop() and try_pop_from(gpu_index) round-robin
+// across query bands so one query cannot starve another (the packing puts the
+// query id in the priority's high bits, so without rotation EVERY task of the
+// earliest query outranks every task of a later one).
+// =============================================================================
+
+namespace {
+
+/// Priorities exactly as production packs them (query_priority_bits): the query
+/// id in the high 32 bits, the within-query pipeline rank in the low 32.
+queue_priority banded(query_key query, queue_priority rank)
+{
+  return (static_cast<queue_priority>(query) << 32) | rank;
+}
+
+index_keys banded_keys(query_key query,
+                       queue_priority rank,
+                       device_key device = no_preferred_device)
+{
+  return keys_of(banded(query, rank), SiriusPhysicalOperatorType::FILTER, query, device);
+}
+
+template <typename Queue>
+std::vector<int> drain_pop(Queue& q)
+{
+  std::vector<int> ids;
+  while (!q.empty()) {
+    ids.push_back(q.pop()->id);
+  }
+  return ids;
+}
+
+}  // namespace
+
+TEST_CASE("multi_index pop round-robins across query bands", "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys());
+  // Query 1 and query 2, three pipeline ranks each. Without rotation the packed
+  // priorities make every query-1 task pop before any query-2 task.
+  q.push(task(10, banded_keys(1, 0)));
+  q.push(task(11, banded_keys(1, 1)));
+  q.push(task(12, banded_keys(1, 2)));
+  q.push(task(20, banded_keys(2, 0)));
+  q.push(task(21, banded_keys(2, 1)));
+  q.push(task(22, banded_keys(2, 2)));
+
+  // First pop has no rotation history and takes the globally-first task (query
+  // 1); after that the served query alternates while both have work.
+  REQUIRE(drain_pop(q) == std::vector<int>{10, 20, 11, 21, 12, 22});
+}
+
+TEST_CASE("multi_index pop rotation preserves within-query order and FIFO",
+          "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys());
+  // Query 1: rank 0 holds two FIFO tasks (10 then 11), rank 1 holds 12.
+  // Query 2: rank 0 holds 20 and 21 (FIFO).
+  q.push(task(10, banded_keys(1, 0)));
+  q.push(task(11, banded_keys(1, 0)));
+  q.push(task(12, banded_keys(1, 1)));
+  q.push(task(20, banded_keys(2, 0)));
+  q.push(task(21, banded_keys(2, 0)));
+
+  // Rotation only decides WHICH query is served; within a query the order is
+  // exactly the pre-fairness one (lowest rank first, FIFO within a rank).
+  REQUIRE(drain_pop(q) == std::vector<int>{10, 20, 11, 21, 12});
+}
+
+TEST_CASE("multi_index pop rotation skips exhausted queries", "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys());
+  q.push(task(10, banded_keys(1, 0)));
+  q.push(task(20, banded_keys(2, 0)));
+  q.push(task(21, banded_keys(2, 1)));
+  q.push(task(22, banded_keys(2, 2)));
+
+  // Query 1 runs dry after one pop; the rotation must keep serving query 2
+  // rather than stalling on the empty band.
+  REQUIRE(drain_pop(q) == std::vector<int>{10, 20, 21, 22});
+}
+
+TEST_CASE("multi_index single-query pop order is unchanged by fairness",
+          "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys());
+  // One query, several ranks, FIFO pairs — the exact shape the whole existing
+  // suite runs (max_concurrent_queries=1). Must be bit-identical to the
+  // pre-fairness queue: strictly ascending priority, FIFO within a level.
+  q.push(task(1, banded_keys(7, 3)));
+  q.push(task(2, banded_keys(7, 0)));
+  q.push(task(3, banded_keys(7, 0)));
+  q.push(task(4, banded_keys(7, 2)));
+  q.push(task(5, banded_keys(7, 1)));
+
+  REQUIRE(drain_pop(q) == std::vector<int>{2, 3, 5, 4, 1});
+}
+
+TEST_CASE("multi_index try_pop_from(gpu_index) rotates across queries per device",
+          "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys());
+  // Both queries stage two tasks for device 0.
+  q.push(task(10, banded_keys(1, 0, /*device=*/0)));
+  q.push(task(11, banded_keys(1, 1, /*device=*/0)));
+  q.push(task(20, banded_keys(2, 0, /*device=*/0)));
+  q.push(task(21, banded_keys(2, 1, /*device=*/0)));
+
+  REQUIRE(q.try_pop_from(gpu_index{0}).value()->id == 10);  // no history: global first
+  REQUIRE(q.try_pop_from(gpu_index{0}).value()->id == 20);  // rotate to query 2
+  REQUIRE(q.try_pop_from(gpu_index{0}).value()->id == 11);  // back to query 1
+  REQUIRE(q.try_pop_from(gpu_index{0}).value()->id == 21);
+  REQUIRE(q.empty());
+}
+
+TEST_CASE("multi_index device rotation covers the no-preference bucket",
+          "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys());
+  q.push(task(10, banded_keys(1, 0)));  // no preferred device
+  q.push(task(11, banded_keys(1, 1)));
+  q.push(task(20, banded_keys(2, 0)));
+  q.push(task(21, banded_keys(2, 1)));
+
+  const gpu_index no_pref{no_preferred_device};
+  REQUIRE(q.try_pop_from(no_pref).value()->id == 10);
+  REQUIRE(q.try_pop_from(no_pref).value()->id == 20);
+  REQUIRE(q.try_pop_from(no_pref).value()->id == 11);
+  REQUIRE(q.try_pop_from(no_pref).value()->id == 21);
+}
+
+TEST_CASE("multi_index device rotation skips queries with nothing for that device",
+          "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys());
+  // Query 1 prefers device 0; query 2 prefers device 1 only.
+  q.push(task(10, banded_keys(1, 0, /*device=*/0)));
+  q.push(task(11, banded_keys(1, 1, /*device=*/0)));
+  q.push(task(20, banded_keys(2, 0, /*device=*/1)));
+
+  // Device-0 pops must serve query 1 twice in priority order — never a spurious
+  // nullopt because the rotation looked at query 2 first.
+  REQUIRE(q.try_pop_from(gpu_index{0}).value()->id == 10);
+  REQUIRE(q.try_pop_from(gpu_index{0}).value()->id == 11);
+  REQUIRE_FALSE(q.try_pop_from(gpu_index{0}).has_value());
+  REQUIRE(q.size(gpu_index{1}) == 1);  // query 2 untouched
+  REQUIRE(q.try_pop_from(gpu_index{1}).value()->id == 20);
+}
+
+TEST_CASE("multi_index try_pop_back_from(gpu_index) keeps its globally-last semantics",
+          "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys());
+  q.push(task(10, banded_keys(1, 0, /*device=*/0)));
+  q.push(task(20, banded_keys(2, 0, /*device=*/0)));
+  q.push(task(21, banded_keys(2, 1, /*device=*/0)));
+
+  // Back pops are downgrade-victim selection, not dispatch: no rotation. The
+  // globally-highest device-0 priority is query 2's rank 1.
+  REQUIRE(q.try_pop_back_from(gpu_index{0}).value()->id == 21);
+  REQUIRE(q.try_pop_back_from(gpu_index{0}).value()->id == 20);
+  REQUIRE(q.try_pop_back_from(gpu_index{0}).value()->id == 10);
+}
+
+TEST_CASE("multi_index rotation survives draining the cursor query", "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys());
+  q.push(task(10, banded_keys(1, 0)));
+  q.push(task(11, banded_keys(1, 1)));
+  q.push(task(20, banded_keys(2, 0)));
+  q.push(task(30, banded_keys(3, 0)));
+
+  REQUIRE(q.pop()->id == 10);  // cursor now at query 1
+  q.drain(query_index{1});     // drop the cursor query entirely
+
+  // Rotation continues from the next live query id and wraps cleanly.
+  REQUIRE(q.pop()->id == 20);
+  REQUIRE(q.pop()->id == 30);
+  REQUIRE(q.empty());
+
+  // A cursor above every live id wraps to the lowest one.
+  q.push(task(40, banded_keys(2, 0)));
+  REQUIRE(q.pop()->id == 40);
+}
+
+TEST_CASE("multi_index rotation is safe against concurrent drain(query_index)",
+          "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys());
+  constexpr int kQueries            = 4;
+  constexpr int kPerQuery           = 300;
+  constexpr int kTotal              = kQueries * kPerQuery;
+  constexpr query_key kDrainedQuery = 2;
+
+  std::atomic<int> consumed{0};
+
+  std::vector<std::thread> consumers;
+  for (int c = 0; c < 2; ++c) {
+    consumers.emplace_back([&] {
+      // pop() blocks until interrupted at the end; rotation runs concurrently
+      // with the drainer below.
+      while (auto t = q.pop()) {
+        consumed.fetch_add(1);
+      }
+    });
+  }
+
+  std::atomic<bool> producers_done{false};
+  std::thread drainer([&] {
+    while (!producers_done.load()) {
+      q.drain(query_index{kDrainedQuery});
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+    q.drain(query_index{kDrainedQuery});
+  });
+
+  std::vector<std::thread> producers;
+  for (int p = 0; p < kQueries; ++p) {
+    producers.emplace_back([&, p] {
+      for (int i = 0; i < kPerQuery; ++i) {
+        const auto query = static_cast<query_key>(p + 1);
+        q.push(task(p * kPerQuery + i, banded_keys(query, i % 5)));
+      }
+    });
+  }
+
+  for (auto& t : producers) {
+    t.join();
+  }
+  producers_done.store(true);
+  drainer.join();
+
+  // Everything not consumed belongs to the drained query; sweep the leftovers
+  // and unblock the consumers.
+  q.drain(query_index{kDrainedQuery});
+  while (!q.empty()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  q.interrupt();
+  for (auto& t : consumers) {
+    t.join();
+  }
+
+  // Consumed plus drained must account for every push; the drained query's
+  // tasks may land on either side depending on timing.
+  REQUIRE(consumed.load() <= kTotal);
+  REQUIRE(consumed.load() >= kTotal - kPerQuery);
+  REQUIRE(q.empty());
+  REQUIRE(q.query_bucket_count() == 0);
+  REQUIRE(q.device_bucket_count() == 0);
+}
