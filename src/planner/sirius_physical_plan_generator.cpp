@@ -114,7 +114,9 @@ bool dynamic_filter_pushdown_enabled(duckdb::ClientContext& context)
 {
   auto state = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!state) { return false; }
-  return state->get_config().get_operator_params().enable_dynamic_filter_pushdown;
+  // Plan generation runs on the window-holding thread: this reads the query's
+  // admission-time snapshot (E1), never the live SET-mutable struct.
+  return state->query_operator_params().enable_dynamic_filter_pushdown;
 }
 
 //! Insert `factory(std::move(parent.children[i]))` between `parent` and its i-th child. The
@@ -969,7 +971,9 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
   auto sirius_ctx = context.registered_state
                       ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                       : nullptr;
-  if (sirius_ctx) { op_params = sirius_ctx->get_config().get_operator_params(); }
+  // query_operator_params(): the admission-time snapshot on the window-holding
+  // thread (E1) — one plan sees one coherent set of sizing params.
+  if (sirius_ctx) { op_params = sirius_ctx->query_operator_params(); }
   insert_gpu_pipeline_operators_recursive(plan, op_params, context, sirius_ctx.get());
 }
 

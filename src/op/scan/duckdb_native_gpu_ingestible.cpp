@@ -356,7 +356,10 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
   owning_table_view final_table;
   if (_filter_expression) {
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_filter_expression);
-    sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
+    // expression_strategy_: construction-time capture from the query's config
+    // snapshot (E2).
+    sirius::expression_evaluator exec(
+      sirius_filter_ast.get(), mr_ref, stream, expression_strategy_);
     if (projection_required) {
       // Fold the projection into the filter gather so pure-filter columns are never materialized.
       std::vector<cudf::size_type> output_indices(output_arity);

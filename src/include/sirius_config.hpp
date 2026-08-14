@@ -168,6 +168,46 @@ struct operator_params {
   bool enable_compressed_materialization = true;
 };
 
+/// Immutable per-query copy of the SET-mutable configuration (register E1/E2).
+///
+/// SNAPSHOT-AT-WINDOW-BEGIN: the execution window takes this copy ONCE when the
+/// query is admitted (slot acquired), and every plan-time / execution-time
+/// reader on the window's thread reads the snapshot — never the live structs.
+/// A query therefore sees the parameters as of its own admission, and one plan
+/// is internally consistent; a concurrent `SET` affects only queries admitted
+/// after it, never a query mid-plan or mid-execution.
+struct query_config_snapshot {
+  operator_params params;
+  /// duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY as of admission — carried
+  /// here so every expression evaluator of one plan uses one strategy (E2).
+  expression_evaluator_strategy expression_strategy;
+};
+
+/// The calling thread's active window snapshot, or nullptr when the thread
+/// holds no execution window. Execution windows are scope-bound to one thread
+/// (acquire and release in the same scope), so a thread-local pointer is the
+/// exact holder identity.
+[[nodiscard]] const query_config_snapshot* current_query_config_snapshot() noexcept;
+
+/// RAII installer for the thread-local snapshot; owned by the execution-window
+/// guards (SiriusContext::StandaloneQueryScope / SlotGuard). Restores the
+/// previous pointer on destruction so a nested guard (should one ever exist)
+/// unwinds correctly. Non-movable: the thread-local points at this object.
+class scoped_query_config_snapshot {
+ public:
+  explicit scoped_query_config_snapshot(query_config_snapshot snapshot) noexcept;
+  ~scoped_query_config_snapshot() noexcept;
+
+  scoped_query_config_snapshot(const scoped_query_config_snapshot&)            = delete;
+  scoped_query_config_snapshot& operator=(const scoped_query_config_snapshot&) = delete;
+  scoped_query_config_snapshot(scoped_query_config_snapshot&&)                 = delete;
+  scoped_query_config_snapshot& operator=(scoped_query_config_snapshot&&)      = delete;
+
+ private:
+  query_config_snapshot snapshot_;
+  const query_config_snapshot* previous_;
+};
+
 struct telemetry_config {
   bool enable_quent{true};
   /// Emit per-batch placement telemetry (Batch FSM + MemoryTier usages).

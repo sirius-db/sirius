@@ -674,7 +674,9 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
       expr_to_idx[cond_hash]           = join_input_index;
       cudf::size_type source_idx       = 0;
       if (!get_column_index(expr, source_idx)) {
-        sirius::expression_evaluator evaluator(&ast_expr, mr, stream);
+        // expression_strategy: plan-time capture from the query's config
+        // snapshot (E2).
+        sirius::expression_evaluator evaluator(&ast_expr, mr, stream, expression_strategy);
         auto expr_result_table = evaluator.evaluate(table);
         auto expr_view         = expr_result_table->view();
         if (expr_view.num_columns() != 1) {

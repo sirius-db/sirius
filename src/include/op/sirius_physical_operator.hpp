@@ -427,6 +427,16 @@ class sirius_physical_operator {
   //! Lock for concurrent access to operator state
   std::mutex lock;
 
+  //! The expression-evaluator strategy this operator uses at execute time.
+  //! Captured at CONSTRUCTION: plan generation runs on the query's
+  //! execution-window thread, so this reads the query's admission-time config
+  //! snapshot and every operator of one plan agrees — a concurrent
+  //! `SET expression_evaluator_strategy` can never flip the strategy between
+  //! two operators of a running plan (register E2). Execute-time evaluator
+  //! constructions must pass this instead of re-reading the global.
+  sirius::expression_evaluator_strategy expression_strategy =
+    sirius::current_expression_evaluator_strategy();
+
   //! Late-mat (SIRIUS_EXP_LATE_MAT): materialization directive for deferred
   //! columns arriving at this operator's input, installed by the defer policy
   //! at query prepare and stamped onto each task's pipelineable_operator_data

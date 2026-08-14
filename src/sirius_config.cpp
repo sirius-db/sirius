@@ -62,6 +62,35 @@ uint64_t derived_default_batch_size()
 
 }  // namespace config
 
+namespace {
+/// The calling thread's execution-window snapshot (see query_config_snapshot).
+/// Set only by scoped_query_config_snapshot, whose owners (the execution-window
+/// guards) are scope-bound to one thread.
+thread_local const query_config_snapshot* t_query_config_snapshot = nullptr;
+}  // namespace
+
+const query_config_snapshot* current_query_config_snapshot() noexcept
+{
+  return t_query_config_snapshot;
+}
+
+scoped_query_config_snapshot::scoped_query_config_snapshot(query_config_snapshot snapshot) noexcept
+  : snapshot_(snapshot), previous_(t_query_config_snapshot)
+{
+  t_query_config_snapshot = &snapshot_;
+}
+
+scoped_query_config_snapshot::~scoped_query_config_snapshot() noexcept
+{
+  t_query_config_snapshot = previous_;
+}
+
+expression_evaluator_strategy current_expression_evaluator_strategy() noexcept
+{
+  if (const auto* snapshot = t_query_config_snapshot) { return snapshot->expression_strategy; }
+  return duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY.load(std::memory_order_relaxed);
+}
+
 static void reject_mutually_exclusive(yaml::reader& reader,
                                       const char* context,
                                       const char* first,

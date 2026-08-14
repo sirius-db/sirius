@@ -1109,7 +1109,10 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
     owning_table_view view{std::move(table)};
     if (!reader_applied_full_filter && _duckdb_filter_expression) {
       auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
-      sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
+      // expression_strategy_: construction-time capture from the query's
+      // config snapshot (E2).
+      sirius::expression_evaluator exec(
+        sirius_filter_ast.get(), mr_ref, stream, expression_strategy_);
       auto const data_positions = output_data_positions(*_plan);
       view = data_positions.empty() ? owning_table_view{exec.select(view.view())}
                                     : owning_table_view{exec.select(view.view(), data_positions)};
@@ -1153,7 +1156,10 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
     // `exec`, which only borrows the AST.
     auto sirius_filter_ast = _residual.against(input.predicate_columns, input.predicates_enforced);
     if (sirius_filter_ast) {
-      sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
+      // expression_strategy_: construction-time capture from the query's
+      // config snapshot (E2).
+      sirius::expression_evaluator exec(
+        sirius_filter_ast.get(), mr_ref, stream, expression_strategy_);
       auto const data_positions = output_data_positions(*_plan);
       auto filtered             = data_positions.empty() ? exec.select(input.table.view())
                                                          : exec.select(input.table.view(), data_positions);

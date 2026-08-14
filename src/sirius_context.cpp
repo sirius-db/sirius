@@ -720,9 +720,41 @@ void SiriusContext::drop_query_runtime_state_best_effort(sirius::query_id_t quer
   }
 }
 
+sirius::query_config_snapshot SiriusContext::snapshot_query_config() const
+{
+  std::lock_guard<std::mutex> lock(operator_params_mutex_);
+  return sirius::query_config_snapshot{
+    .params              = config_.get_operator_params(),
+    .expression_strategy = Config::EXPRESSION_EVALUATOR_STRATEGY.load(std::memory_order_relaxed),
+  };
+}
+
+sirius::operator_params SiriusContext::query_operator_params() const
+{
+  if (const auto* snapshot = sirius::current_query_config_snapshot()) { return snapshot->params; }
+  return snapshot_query_config().params;
+}
+
+void SiriusContext::update_operator_params(
+  const std::function<void(sirius::operator_params&)>& mutate)
+{
+  std::lock_guard<std::mutex> lock(operator_params_mutex_);
+  mutate(config_.get_operator_params());
+}
+
 SiriusContext::SlotGuard::SlotGuard(SiriusContext& ctx, ClientContext& context) : ctx_(ctx)
 {
   ctx_.acquire_query_lifecycle_slot(&context);
+  // SNAPSHOT-AT-WINDOW-BEGIN (E1/E2): freeze the SET-mutable config for this
+  // window at admission. operator_params is all-scalar so the copy itself
+  // cannot throw; the defensive catch keeps the slot released even against a
+  // theoretical lock failure (a throwing ctor never runs this destructor).
+  try {
+    config_snapshot_.emplace(ctx_.snapshot_query_config());
+  } catch (...) {
+    ctx_.release_query_lifecycle_slot();
+    throw;
+  }
 }
 
 SiriusContext::SlotGuard::~SlotGuard() noexcept { ctx_.release_query_lifecycle_slot(); }
@@ -786,6 +818,12 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
   ctx_.acquire_query_lifecycle_slot(&context);
   log_window_event("begin", "-");
   try {
+    // SNAPSHOT-AT-WINDOW-BEGIN (E1/E2): this query sees the SET-mutable config
+    // as of its own admission — every plan-time and execution-time reader on
+    // this thread reads the snapshot, never the live struct, so one plan is
+    // internally consistent. A concurrent SET affects only queries admitted
+    // after it. Installed before the begin mutations so even they see it.
+    config_snapshot_.emplace(ctx_.snapshot_query_config());
     ctx_.begin_execution_window(context, window_id_, window_label, begin_tag_);
   } catch (std::exception& e) {
     // A failed begin may have left this query's runtime state part-registered.
@@ -1378,8 +1416,10 @@ duckdb::shared_ptr<sirius::planner::query> SiriusContext::create_query(
   task_creator_->prepare_for_query(*query, std::move(handler));
   // Reads the admitted subset back off task_creator, so this must run after
   // initialize_internal has set it — otherwise scan_manager gets the full topology list.
+  // query_operator_params(): the caller runs on the window-holding thread, so this
+  // reads the query's admission-time snapshot (E1), not the live SET-mutable struct.
   scan_manager_->prepare_for_query(*query,
-                                   config_.get_operator_params().enable_pinned_zone_map_pruning,
+                                   query_operator_params().enable_pinned_zone_map_pruning,
                                    task_creator_->get_active_gpu_ids(query_id));
   return query;
 }
@@ -1888,22 +1928,23 @@ void SiriusContext::release_query_lifecycle_slot() noexcept
 
 void install_configured_log_sink(DatabaseInstance* db)
 {
-  auto parsed_level = sirius::log::string_to_enum(Config::LOG_LEVEL);
-  auto lvl          = parsed_level.value_or(sirius::log::level::info);
+  // Copy-on-read snapshots (ConfigString): a concurrent `SET sirius_log_*`
+  // must never leave this function reading a torn/freed string buffer (E2).
+  const std::string log_level = Config::LOG_LEVEL.get();
+  auto parsed_level           = sirius::log::string_to_enum(log_level);
+  auto lvl                    = parsed_level.value_or(sirius::log::level::info);
 
-  const std::string& backend = Config::LOG_BACKEND;
+  const std::string backend = Config::LOG_BACKEND.get();
   if (backend == "spdlog") {
-    auto flush =
-      Config::LOG_FLUSH_SECONDS <= 0
-        ? std::nullopt
-        : std::optional<std::chrono::milliseconds>{std::chrono::seconds{Config::LOG_FLUSH_SECONDS}};
-    auto sink = sirius::log::make_spdlog_owning_sink({Config::LOG_DIR, flush});
+    const int flush_seconds = Config::LOG_FLUSH_SECONDS.load(std::memory_order_relaxed);
+    auto flush              = flush_seconds <= 0
+                                ? std::nullopt
+                                : std::optional<std::chrono::milliseconds>{std::chrono::seconds{flush_seconds}};
+    auto sink               = sirius::log::make_spdlog_owning_sink({Config::LOG_DIR.get(), flush});
     sink->set_level(lvl);
     sirius::log::set_sink(std::move(sink));
     // Warn only once the sink is installed, so the message actually reaches it.
-    if (!parsed_level) {
-      SIRIUS_LOG_WARN("Unknown log level '{}', defaulting to info", Config::LOG_LEVEL);
-    }
+    if (!parsed_level) { SIRIUS_LOG_WARN("Unknown log level '{}', defaulting to info", log_level); }
   } else if (backend == "noop") {
     sirius::log::set_sink(sirius::log::make_noop_sink());
   } else if (backend == "duckdb") {

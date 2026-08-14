@@ -63,8 +63,10 @@ std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_da
   const auto& input         = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
 
+  // expression_strategy: captured at plan time from the query's config
+  // snapshot (E2) — do not re-read the global here.
   sirius::expression_evaluator evaluator(
-    *expression, cudf::get_current_device_resource_ref(), stream);
+    *expression, cudf::get_current_device_resource_ref(), stream, expression_strategy);
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(input_batches.size());

@@ -40,6 +40,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -415,6 +416,10 @@ class SiriusContext : public ClientContextState {
 
    private:
     SiriusContext& ctx_;
+    /// SNAPSHOT-AT-WINDOW-BEGIN (E1/E2): installed right after the slot is
+    /// acquired so plan-time readers inside this window see one coherent copy
+    /// of the SET-mutable config, frozen at admission.
+    std::optional<sirius::scoped_query_config_snapshot> config_snapshot_;
   };
 
   /**
@@ -474,6 +479,13 @@ class SiriusContext : public ClientContextState {
     /// fails its mandatory cleanup deterministically, exercising the D5
     /// per-query containment path.
     bool inject_cleanup_failure_ = false;
+    /// SNAPSHOT-AT-WINDOW-BEGIN (E1/E2): installed right after the slot is
+    /// acquired — this query sees the SET-mutable config as of its own
+    /// admission for its whole plan+execution; a concurrent SET affects only
+    /// queries admitted after it. Emplaced after acquire in the ctor body;
+    /// destroyed (thread-local restored) on every exit path, including a
+    /// throwing constructor.
+    std::optional<sirius::scoped_query_config_snapshot> config_snapshot_;
   };
 
   /// \brief Terminate the Sirius context, releasing all resources.
@@ -597,6 +609,35 @@ class SiriusContext : public ClientContextState {
 
   /// \brief Get the current Sirius configuration (mutable, e.g. for SET command callbacks).
   [[nodiscard]] sirius::sirius_config& get_config() noexcept { return config_; }
+
+  /// \brief Coherent copy of the SET-mutable per-query config (register E1/E2).
+  ///
+  /// Taken under operator_params_mutex_ so it can never observe a torn write
+  /// from a concurrent SET. The execution-window guards call this ONCE at
+  /// admission (SNAPSHOT-AT-WINDOW-BEGIN) and install the copy thread-locally;
+  /// mid-query readers use query_operator_params() /
+  /// sirius::current_expression_evaluator_strategy() instead of re-reading the
+  /// live structs.
+  [[nodiscard]] sirius::query_config_snapshot snapshot_query_config() const;
+
+  /// \brief The operator_params the CURRENT query must use.
+  ///
+  /// Returns the calling thread's execution-window snapshot when one is
+  /// installed (every plan-time and execution-time reader runs on the
+  /// window-holding thread), else a fresh coherent copy of the live struct
+  /// (callers outside any window, e.g. tests). A query therefore sees the
+  /// params as of its own admission; a concurrent SET affects only queries
+  /// admitted after it — never a query mid-plan.
+  [[nodiscard]] sirius::operator_params query_operator_params() const;
+
+  /// \brief Apply one SET callback's mutation to the live operator_params.
+  ///
+  /// Serializes writers against each other and against snapshot_query_config()
+  /// via operator_params_mutex_. Deliberately does NOT hold an execution-window
+  /// slot: with the counted gate a single slot no longer excludes running
+  /// queries anyway — isolation comes from the per-query snapshot, not from
+  /// blocking the SET.
+  void update_operator_params(const std::function<void(sirius::operator_params&)>& mutate);
 
   /// \brief Whether the Sirius context has been initialized (config loaded, GPU ready).
   [[nodiscard]] bool is_initialized() const noexcept { return is_initialized_; }
@@ -737,6 +778,11 @@ class SiriusContext : public ClientContextState {
   std::atomic<std::uint32_t> next_window_id_{0};
   bool is_initialized_ = false;
   sirius::sirius_config config_;
+  /// Guards the SET-mutable parts of config_ (operator_params): SET callbacks
+  /// write under it (update_operator_params) and admission snapshots read
+  /// under it (snapshot_query_config), so neither can observe a torn value.
+  /// SETs are rare, so a plain mutex is enough.
+  mutable std::mutex operator_params_mutex_;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
   // Single source of truth for the GPU<->NUMA hardware topology, scoped to the
   // memory manager's reserved GPU/HOST spaces. Shared by shared_ptr copy with

@@ -43,12 +43,18 @@
 namespace sirius {
 
 /**
- * @brief Returns the current default expression_evaluator_strategy configured via
- * `duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY`.
+ * @brief Returns the default expression_evaluator_strategy: the active query's
+ * admission-time snapshot when the calling thread holds an execution window,
+ * else the live `duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY` (register E2).
+ *
+ * Operators capture this at construction (plan generation, on the window
+ * thread) and pass the captured value at execute time, so every evaluator of
+ * one plan uses one strategy even under a concurrent
+ * `SET expression_evaluator_strategy`.
  */
 inline expression_evaluator_strategy strategy_from_config()
 {
-  return duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY;
+  return sirius::current_expression_evaluator_strategy();
 }
 
 /**

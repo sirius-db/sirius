@@ -106,12 +106,13 @@ class scoped_recording_log_sink {
   ~scoped_recording_log_sink()
   {
     using duckdb::Config;
-    auto lvl = sirius::log::string_to_enum(Config::LOG_LEVEL).value_or(sirius::log::level::info);
-    auto flush =
-      Config::LOG_FLUSH_SECONDS <= 0
-        ? std::nullopt
-        : std::optional<std::chrono::milliseconds>{std::chrono::seconds{Config::LOG_FLUSH_SECONDS}};
-    auto sink = sirius::log::make_spdlog_owning_sink({Config::LOG_DIR, flush});
+    auto lvl =
+      sirius::log::string_to_enum(Config::LOG_LEVEL.get()).value_or(sirius::log::level::info);
+    const int flush_seconds = Config::LOG_FLUSH_SECONDS.load();
+    auto flush              = flush_seconds <= 0
+                                ? std::nullopt
+                                : std::optional<std::chrono::milliseconds>{std::chrono::seconds{flush_seconds}};
+    auto sink               = sirius::log::make_spdlog_owning_sink({Config::LOG_DIR.get(), flush});
     sink->set_level(lvl);
     sirius::log::set_sink(std::move(sink));
   }

@@ -209,7 +209,10 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
       "Sirius context is not initialized. Check that SIRIUS_DISABLE is not set "
       "and review extension loading logs for errors.");
   }
-  const sirius::operator_params& op_params = sirius_ctx_ptr->get_config().get_operator_params();
+  // SNAPSHOT-AT-WINDOW-BEGIN (E1): the engine runs on the window-holding
+  // thread, so this is the query's admission-time copy of operator_params —
+  // a concurrent SET cannot reshape this plan between two reads.
+  const sirius::operator_params op_params = sirius_ctx_ptr->query_operator_params();
 
   sirius_physical_plan = &plan;
 

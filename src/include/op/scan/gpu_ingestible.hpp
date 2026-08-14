@@ -20,6 +20,7 @@
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
+#include <config.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <op/scan/batch_coalescer.hpp>
 #include <op/scan/gpu_ingestible_types.hpp>
@@ -182,6 +183,16 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
 
  protected:
   gpu_ingestible() noexcept = default;
+
+  /// Expression-evaluator strategy for this scan's post-decode filter
+  /// evaluations. Captured at CONSTRUCTION: ingestibles are built on the
+  /// query's execution-window thread (plan generation / pin), so this reads
+  /// the query's admission-time config snapshot; the task-time filter
+  /// evaluations pass it instead of re-reading the mutable global, keeping one
+  /// scan internally consistent under a concurrent
+  /// `SET expression_evaluator_strategy` (register E2).
+  sirius::expression_evaluator_strategy expression_strategy_ =
+    sirius::current_expression_evaluator_strategy();
 };
 
 }  // namespace scan

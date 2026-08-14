@@ -569,8 +569,10 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   bool is_supported_by_hash_join =
     sirius::op::sirius_physical_hash_join::are_conditions_supported(conditions, op.join_type);
   if (is_supported_by_hash_join && !prefer_range_joins) {
-    auto sirius_context   = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-    const auto& op_params = sirius_context->get_config().get_operator_params();
+    auto sirius_context = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    // Admission-time snapshot (E1): join sizing must not shift mid-plan under
+    // a concurrent SET.
+    const auto op_params = sirius_context->query_operator_params();
 
     // Build the dynamic filter producer's immutable publication plan before moving DuckDB's
     // pushdown metadata into the physical join. Routing and device placement are plan-time
