@@ -38,7 +38,11 @@
 // late_mat/defer_directive.hpp. Keeping the analysis free of the economics is
 // what lets the thresholds move on a measurement without touching the walk.
 
+#include "helper/logical_type.hpp"
+#include "late_mat/defer_policy.hpp"
+
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <vector>
 
@@ -77,6 +81,27 @@ struct column_lifetime {
   std::vector<int> const& lhs_projection,
   std::vector<int> const& rhs_projection,
   std::size_t in_position);
+
+/// Per-row bytes a scanned column would stop carrying if it were deferred.
+///
+/// Variable-width columns have no width in their type, and the ride's value is
+/// exactly their width, so a fixed estimate stands in. It is deliberately
+/// conservative: understating a string's width can only refuse a bundle the
+/// policy would have taken, while overstating it would install one that never
+/// repays the rowid.
+[[nodiscard]] std::int64_t estimated_value_bytes(sirius::logical_type const& type);
+
+/// Bundle lifetimes into candidates, one per operator that first reads them.
+///
+/// Columns that stop at the same operator ride together and materialize
+/// together, so they compete for that slot as a unit — which is also why the
+/// policy arbitrates whole bundles rather than columns.
+///
+/// Columns nothing reads are excluded: with no consumer there is nowhere to
+/// install the materializing half of the pair, and half a deferral loses the
+/// data outright.
+[[nodiscard]] std::vector<late_mat::defer_candidate> build_defer_candidates(
+  op::sirius_physical_operator const& scan, std::vector<column_lifetime> const& lifetimes);
 
 /// Lifetimes of every output column of @p scan, in scan output order.
 ///

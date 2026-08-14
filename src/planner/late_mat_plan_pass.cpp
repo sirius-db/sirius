@@ -23,7 +23,9 @@
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_projection.hpp"
 
+#include <algorithm>
 #include <optional>
+#include <string>
 #include <variant>
 
 namespace sirius::planner {
@@ -144,6 +146,45 @@ std::optional<std::size_t> join_output_position(bool from_lhs,
     }
   }
   return std::nullopt;
+}
+
+std::int64_t estimated_value_bytes(sirius::logical_type const& type)
+{
+  if (type.is_fixed_width()) { return static_cast<std::int64_t>(type.fixed_width_byte_size()); }
+  // A variable-width column carries its bytes plus an offset. TPC-H's deferred
+  // string columns run 15-72 bytes; 24 sits below most of them, so a bundle
+  // that qualifies on this estimate would have qualified on the real widths.
+  return 24;
+}
+
+std::vector<late_mat::defer_candidate> build_defer_candidates(
+  sirius_physical_operator const& scan, std::vector<column_lifetime> const& lifetimes)
+{
+  std::vector<late_mat::defer_candidate> candidates;
+  // Slots are labelled by the order their reader is first seen, so a label is
+  // stable within one analysis and readable in the census — the identity that
+  // matters is "the same operator", not the operator's name.
+  std::vector<op::sirius_physical_operator const*> readers;
+
+  for (auto const& life : lifetimes) {
+    if (life.first_reader == nullptr) { continue; }
+    if (life.scan_output_position >= scan.types.size()) { continue; }
+
+    auto slot = std::find(readers.begin(), readers.end(), life.first_reader);
+    if (slot == readers.end()) {
+      readers.push_back(life.first_reader);
+      slot = std::prev(readers.end());
+      late_mat::defer_candidate fresh;
+      fresh.slot       = "slot" + std::to_string(readers.size() - 1);
+      fresh.boundaries = life.boundaries;
+      candidates.push_back(std::move(fresh));
+    }
+    auto& candidate = candidates[static_cast<std::size_t>(slot - readers.begin())];
+    candidate.columns.push_back(
+      late_mat::defer_column{static_cast<std::uint32_t>(life.scan_output_position),
+                             estimated_value_bytes(scan.types[life.scan_output_position])});
+  }
+  return candidates;
 }
 
 std::vector<column_lifetime> analyze_column_lifetimes(sirius_physical_operator const& scan)

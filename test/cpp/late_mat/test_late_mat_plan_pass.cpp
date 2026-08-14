@@ -216,3 +216,50 @@ TEST_CASE("a join that emits no lhs columns still places its rhs", "[late_mat][l
   REQUIRE(join_output_position(false, none, rhs, 4) == 0);
   REQUIRE(join_output_position(false, none, rhs, 9) == 1);
 }
+
+TEST_CASE("columns that stop at the same operator bundle together", "[late_mat][lifetime]")
+{
+  using sirius::planner::build_defer_candidates;
+
+  // Two columns read by a group-by, one carried past it — the q10 shape in
+  // miniature, where a bundle is what rides and what materializes.
+  fake_scan scan(3);
+  opaque_op group_by(3);
+  scan.link(&group_by);
+
+  auto const candidates = build_defer_candidates(scan, analyze_column_lifetimes(scan));
+  REQUIRE(candidates.size() == 1);  // one reader, one slot
+  REQUIRE(candidates[0].columns.size() == 3);
+  REQUIRE(candidates[0].boundaries == 1);
+  // Four-byte integers: three of them, less the eight-byte rowid.
+  REQUIRE(candidates[0].net_value_bytes(8) == 3 * 4 - 8);
+}
+
+TEST_CASE("a column nothing reads is not a candidate", "[late_mat][lifetime]")
+{
+  using sirius::planner::build_defer_candidates;
+
+  // No reader means nowhere to install the materializing half, and half a
+  // deferral loses the column outright.
+  fake_scan scan(2);
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> list;
+  list.push_back(ref(0));
+  list.push_back(ref(1));
+  test_projection projection(make_types(2), std::move(list), 0);
+  scan.link(&projection);
+
+  REQUIRE(build_defer_candidates(scan, analyze_column_lifetimes(scan)).empty());
+}
+
+TEST_CASE("a variable-width column is valued below its real width", "[late_mat][lifetime]")
+{
+  using sirius::planner::estimated_value_bytes;
+
+  // Understating can only refuse a bundle the policy would have taken;
+  // overstating would install one that never repays the rowid.
+  REQUIRE(estimated_value_bytes(sirius::logical_type::make(sirius::type_id::INTEGER)) == 4);
+  REQUIRE(estimated_value_bytes(sirius::logical_type::make(sirius::type_id::BIGINT)) == 8);
+  auto const varchar = estimated_value_bytes(sirius::logical_type::make(sirius::type_id::VARCHAR));
+  REQUIRE(varchar > 0);
+  REQUIRE(varchar < 72);  // below c_comment, the widest TPC-H string deferred
+}
