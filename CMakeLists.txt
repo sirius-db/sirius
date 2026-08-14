@@ -680,6 +680,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_order_nulls.cpp
     test/cpp/integration/test_gpu_execution_parquet_nulls.cpp
     test/cpp/integration/test_parquet_null_predicate_pushdown.cpp
+    test/cpp/integration/test_concurrent_queries.cpp
     test/cpp/integration/test_query_lifecycle_slot.cpp
     test/cpp/integration/test_gpu_execution_tpcds_nulls.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp

@@ -39,6 +39,7 @@
 #include <duckdb/planner/logical_operator.hpp>
 
 #include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -554,6 +555,9 @@ class SiriusContext : public ClientContextState {
   /// \brief Whether the shared query lifecycle slot is currently held by any connection.
   [[nodiscard]] bool is_query_lifecycle_active() const noexcept;
 
+  /// \brief High-water mark of concurrently held query-lifecycle slots.
+  [[nodiscard]] int query_lifecycle_peak() const noexcept;
+
   /// \brief Snapshot counters for transparent execution observability.
   [[nodiscard]] transparent_execution_stats get_transparent_execution_stats() const noexcept;
 
@@ -627,22 +631,30 @@ class SiriusContext : public ClientContextState {
   void drop_query_runtime_state_best_effort(sirius::query_id_t query_id) noexcept;
 
   mutable std::mutex mutex_;
-  // The Super Sirius runtime is shared across connections, so plan generation
-  // and engine execution must be serialized (single-flight). The slot is
-  // scope-bound: held only inside StandaloneQueryScope / SlotGuard windows
-  // (acquire and release in the same scope on the same thread), never across
-  // DuckDB's user-visible result lifetime, so an abandoned stream or pending
-  // result holds nothing.
+  // The Super Sirius runtime is shared across connections. Historically plan
+  // generation and engine execution were serialized outright (single-flight
+  // mutex); the gate is now a counted slot pool sized by
+  // scan_manager.max_concurrent_queries (default 1 = the historical
+  // single-flight behavior, so nothing changes until the config raises it).
+  // A slot is scope-bound: held only inside StandaloneQueryScope / SlotGuard
+  // windows (acquire and release in the same scope on the same thread), never
+  // across DuckDB's user-visible result lifetime, so an abandoned stream or
+  // pending result holds nothing.
   std::mutex query_lifecycle_mutex_;
+  std::condition_variable query_lifecycle_cv_;
+  /// Set once in initialize() from the scan-manager config; read under
+  /// query_lifecycle_mutex_ afterwards.
+  int query_lifecycle_slots_{1};
+  /// Live execution windows. Guarded by query_lifecycle_mutex_.
+  int query_lifecycle_active_{0};
+  /// High-water mark of concurrently live windows since initialize().
+  /// Diagnostic only (concurrency bring-up asserts overlap actually happened);
+  /// written under query_lifecycle_mutex_, read lock-free.
+  std::atomic<int> query_lifecycle_peak_{0};
   // Pin and unpin take this exclusively; updates hold it from validation
   // through QueryEnd so neither operation can pass the other between checks.
   std::shared_mutex pinned_table_update_mutex_;
   std::atomic<bool> query_lifecycle_held_{false};
-  // Hash of the holder's thread id, written under the gate while held, 0 when
-  // free. Read (relaxed) before acquiring ONLY to detect a same-thread
-  // reacquire, which is turned into a diagnosable fatal error instead of a
-  // silent permanent wait.
-  std::atomic<size_t> holder_thread_hash_{0};
   // See runtime_health: latched when a mandatory cleanup step fails.
   std::atomic<bool> runtime_unavailable_{false};
   // Monotonic execution-window id for window-keyed logging.

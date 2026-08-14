@@ -231,8 +231,8 @@ SiriusContext::~SiriusContext() noexcept
       terminate();
     } catch (const std::exception& e) {
       try {
-        SIRIUS_LOG_ERROR(
-          "SiriusContext teardown failed (ignored, process is exiting): {}", e.what());
+        SIRIUS_LOG_ERROR("SiriusContext teardown failed (ignored, process is exiting): {}",
+                         e.what());
       } catch (...) {
       }
     } catch (...) {
@@ -714,6 +714,11 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   if (is_initialized_) { throw std::runtime_error("Sirius context is already initialized."); }
 
   config_ = config;
+  // Execution-window concurrency = the same knob that sizes the scan pool
+  // (scan_manager.max_concurrent_queries): one number decides how many queries
+  // may hold runtime state at once. Default 1 = the historical single-flight
+  // behavior. Set before any query can reach acquire_query_lifecycle_slot.
+  query_lifecycle_slots_ = std::max(1, config_.get_scan_manager_config().max_concurrent_queries);
   // Validate the cached topology before any downstream construction so a stub
   // topology fails loudly rather than producing zero-GPU executors silently.
   // get_hw_topology() is the only authorised source of physical GPU/NUMA discovery — never call
@@ -1202,6 +1207,11 @@ bool SiriusContext::is_query_lifecycle_active() const noexcept
   return query_lifecycle_held_.load(std::memory_order_acquire);
 }
 
+int SiriusContext::query_lifecycle_peak() const noexcept
+{
+  return query_lifecycle_peak_.load(std::memory_order_relaxed);
+}
+
 SiriusConnectionState::SiriusConnectionState()
 {
   static std::atomic<uint64_t> next_connection_id{0};
@@ -1633,17 +1643,20 @@ void SiriusContext::throw_if_not_initialized() const
   if (!is_initialized_) { throw std::runtime_error("Sirius context is not initialized."); }
 }
 
+namespace {
+// The slot is scope-bound (acquire and release in the same scope on the same
+// thread — see the member doc), so a thread-local flag is exactly the holder
+// identity the old thread-id hash approximated, without the hash-collision
+// caveat, and it stays correct with more than one slot.
+thread_local bool t_holds_query_lifecycle_slot = false;
+}  // namespace
+
 void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
 {
-  // `| 1` keeps the sentinel (0 = free) unreachable; a cross-thread hash
-  // collision could only cause a spurious diagnosable error, never a missed
-  // release (the check is advisory — correctness rests on the scope-bound
-  // release).
-  auto const my_hash = std::hash<std::thread::id>{}(std::this_thread::get_id()) | 1;
-  // Same-thread reacquire would be a silent permanent wait (plain std::mutex).
-  // Only the CURRENT holder can observe its own hash here, so a match is a
-  // definite programming error — surface it as a diagnosable error instead.
-  if (holder_thread_hash_.load(std::memory_order_relaxed) == my_hash) {
+  // Same-thread reacquire would be a silent self-deadlock at slots=1 (and a
+  // silently double-counted window above it) — a definite programming error;
+  // surface it as a diagnosable error instead.
+  if (t_holds_query_lifecycle_slot) {
     throw std::runtime_error(
       "Sirius internal error: query-lifecycle slot re-acquired on the holding thread "
       "(nested execution window)");
@@ -1653,11 +1666,19 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
   if (runtime_unavailable_.load(std::memory_order_acquire)) { throw_runtime_unavailable(); }
   if (context && context->IsInterrupted()) { throw InterruptException(); }
 
-  query_lifecycle_mutex_.lock();
-  holder_thread_hash_.store(my_hash, std::memory_order_relaxed);
-  query_lifecycle_held_.store(true, std::memory_order_release);
+  {
+    std::unique_lock<std::mutex> lock(query_lifecycle_mutex_);
+    query_lifecycle_cv_.wait(lock,
+                             [this] { return query_lifecycle_active_ < query_lifecycle_slots_; });
+    ++query_lifecycle_active_;
+    if (query_lifecycle_active_ > query_lifecycle_peak_.load(std::memory_order_relaxed)) {
+      query_lifecycle_peak_.store(query_lifecycle_active_, std::memory_order_relaxed);
+    }
+    query_lifecycle_held_.store(true, std::memory_order_release);
+  }
+  t_holds_query_lifecycle_slot = true;
 
-  // Re-check AFTER acquiring, BEFORE any shared mutation: the previous holder
+  // Re-check AFTER acquiring, BEFORE any shared mutation: a previous holder
   // may have latched unavailability, and this waiter may have been cancelled,
   // while it was blocked. A cancelled waiter must never late-enter the window.
   if (runtime_unavailable_.load(std::memory_order_acquire)) {
@@ -1672,9 +1693,13 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
 
 void SiriusContext::release_query_lifecycle_slot() noexcept
 {
-  holder_thread_hash_.store(0, std::memory_order_relaxed);
-  query_lifecycle_held_.store(false, std::memory_order_release);
-  query_lifecycle_mutex_.unlock();
+  {
+    std::lock_guard<std::mutex> lock(query_lifecycle_mutex_);
+    --query_lifecycle_active_;
+    query_lifecycle_held_.store(query_lifecycle_active_ > 0, std::memory_order_release);
+  }
+  t_holds_query_lifecycle_slot = false;
+  query_lifecycle_cv_.notify_one();
 }
 
 // ================= Free Functions ================= //
