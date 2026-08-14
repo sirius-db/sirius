@@ -52,20 +52,30 @@ bool reads_column(ast::node const& expr, std::size_t pos)
 /// A value is the output position it moves to, and the column lives on.
 std::optional<std::size_t> trace_through(sirius_physical_operator const& node,
                                          sirius_physical_operator const& from,
-                                         std::size_t in_pos)
+                                         std::size_t in_pos,
+                                         bool& nullified)
 {
   switch (node.type) {
     case SiriusPhysicalOperatorType::HASH_JOIN: {
       auto const& join = static_cast<op::sirius_physical_hash_join const&>(node);
-      // INNER only. Every other join type either emits NULLs for an unmatched
-      // side — and a deferred column would have to produce a null value from a
-      // null rowid — or collects just one side's columns, so a payload riding
-      // on the other is not in the output at all.
-      if (join.join_type != duckdb::JoinType::INNER) { return std::nullopt; }
+      // The types that pass a payload through at all. Semi, anti and mark
+      // joins collect a single side's columns, so a payload riding the other
+      // is not in the output to be deferred.
+      auto const type    = join.join_type;
+      bool const carries = type == duckdb::JoinType::INNER || type == duckdb::JoinType::LEFT ||
+                           type == duckdb::JoinType::RIGHT || type == duckdb::JoinType::OUTER;
+      if (!carries) { return std::nullopt; }
       if (node.children.size() != 2) { return std::nullopt; }
 
       bool const from_lhs = node.children[0].get() == &from;
       if (!from_lhs && node.children[1].get() != &from) { return std::nullopt; }
+
+      // An outer join can emit a row this side never matched. The rowid is
+      // null there and the column materializes null, which is sound — so the
+      // ride continues and the fact is recorded rather than refused.
+      nullified = nullified || type == duckdb::JoinType::OUTER ||
+                  (from_lhs && type == duckdb::JoinType::RIGHT) ||
+                  (!from_lhs && type == duckdb::JoinType::LEFT);
 
       // A key is read: the join compares its values. The conditions' left
       // nodes address the lhs and their right nodes the rhs, so only this
@@ -189,40 +199,57 @@ std::vector<late_mat::defer_candidate> build_defer_candidates(
 
 std::vector<column_lifetime> analyze_column_lifetimes(sirius_physical_operator const& scan)
 {
-  std::vector<column_lifetime> lifetimes;
-  lifetimes.reserve(scan.types.size());
+  std::vector<column_lifetime> lifetimes(scan.types.size());
+  for (std::size_t col = 0; col < lifetimes.size(); ++col) {
+    lifetimes[col].scan_output_position = col;
+    lifetimes[col].position_at_reader   = col;
+  }
 
-  for (std::size_t col = 0; col < scan.types.size(); ++col) {
-    column_lifetime life;
-    life.scan_output_position = col;
-    life.position_at_reader   = col;
+  /// A column still travelling: where it sits now, and what the ride has done
+  /// to it. Carrying the set through one walk — rather than walking the chain
+  /// once per column — is what gives per-column state somewhere to live.
+  struct live_column {
+    std::size_t index;
+    std::size_t position;
+    bool nullified = false;
+  };
+  std::vector<live_column> live;
+  live.reserve(lifetimes.size());
+  for (std::size_t col = 0; col < lifetimes.size(); ++col) {
+    live.push_back(live_column{col, col, false});
+  }
 
-    std::size_t position = col;
-    int boundaries       = 0;
-    // `from` is which child the column arrives through, which a join needs in
-    // order to know whether it is looking at its lhs or its rhs.
-    auto const* from = static_cast<sirius_physical_operator const*>(&scan);
-    for (auto const* node = scan.get_parent_op(); node != nullptr;
-         from = node, node = node->get_parent_op()) {
-      ++boundaries;
-      auto const moved = trace_through(*node, *from, position);
+  int boundaries   = 0;
+  auto const* from = static_cast<sirius_physical_operator const*>(&scan);
+  for (auto const* node = scan.get_parent_op(); node != nullptr && !live.empty();
+       from = node, node = node->get_parent_op()) {
+    ++boundaries;
+    std::vector<live_column> still_travelling;
+    still_travelling.reserve(live.size());
+    for (auto& col : live) {
+      auto const moved = trace_through(*node, *from, col.position, col.nullified);
       if (!moved.has_value()) {
         // Read here — or dropped here, which for a deferral is the same
         // answer: this is as far as the column travels.
+        auto& life              = lifetimes[col.index];
         life.first_reader       = node;
         life.boundaries         = boundaries;
-        life.position_at_reader = position;
-        break;
+        life.position_at_reader = col.position;
+        life.nullified_on_ride  = col.nullified;
+        continue;
       }
-      position = *moved;
+      col.position = *moved;
+      still_travelling.push_back(col);
     }
-    if (life.first_reader == nullptr) {
-      // Nothing ever read it: the query carries this column to its output
-      // untouched, which is the longest ride there is.
-      life.boundaries         = boundaries;
-      life.position_at_reader = position;
-    }
-    lifetimes.push_back(life);
+    live = std::move(still_travelling);
+  }
+
+  // Whatever is still live reached the top of the plan unread.
+  for (auto const& col : live) {
+    auto& life              = lifetimes[col.index];
+    life.boundaries         = boundaries;
+    life.position_at_reader = col.position;
+    life.nullified_on_ride  = col.nullified;
   }
   return lifetimes;
 }

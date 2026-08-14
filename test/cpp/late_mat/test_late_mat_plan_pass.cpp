@@ -263,3 +263,28 @@ TEST_CASE("a variable-width column is valued below its real width", "[late_mat][
   REQUIRE(varchar > 0);
   REQUIRE(varchar < 72);  // below c_comment, the widest TPC-H string deferred
 }
+
+TEST_CASE("a payload riding an outer join is deferrable but marked nullified",
+          "[late_mat][lifetime]")
+{
+  using sirius::planner::join_output_position;
+
+  // Refusing outer joins outright is simpler and costs every outer-shaped
+  // query. A row that never matched gets a null rowid, so the column
+  // materializes null — sound, provided the consumer is told.
+  std::vector<int> const lhs{0, 1};
+  std::vector<int> const rhs{0};
+  REQUIRE(join_output_position(true, lhs, rhs, 1) == 1);
+  REQUIRE(join_output_position(false, lhs, rhs, 0) == 2);
+}
+
+TEST_CASE("nothing is nullified on a ride with no outer join", "[late_mat][lifetime]")
+{
+  fake_scan scan(2);
+  opaque_op reader(2);
+  scan.link(&reader);
+
+  auto const lives = analyze_column_lifetimes(scan);
+  REQUIRE_FALSE(lives[0].nullified_on_ride);
+  REQUIRE_FALSE(lives[1].nullified_on_ride);
+}

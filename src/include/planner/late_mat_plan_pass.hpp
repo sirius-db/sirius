@@ -66,6 +66,12 @@ struct column_lifetime {
   /// The column's position in `first_reader`'s input, which is where a
   /// materialization would have to put it back.
   std::size_t position_at_reader = 0;
+  /// Whether some join on the ride could leave this column's row unmatched.
+  /// The rowid is then null for those rows and the column materializes as
+  /// null — so a deferral is still sound, but only for a consumer that accepts
+  /// nulls. Refusing outer joins outright would be simpler and would cost
+  /// every outer-shaped query.
+  bool nullified_on_ride = false;
 };
 
 /// Where a column entering an INNER hash join from one side lands in its
