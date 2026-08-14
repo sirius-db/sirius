@@ -6,9 +6,8 @@
 //! invariants over breadth: it translates one fragment at a time, and everything
 //! outside the supported surface returns a structured [`TranslateError`] that
 //! names the offending node/type — so the next contributor knows exactly what to
-//! implement next. In particular `EXCHANGE_NODE` is rejected: a fragment is
-//! translated in isolation, and multi-fragment plans (every exchange is a
-//! fragment boundary) are a later milestone.
+//! implement next. `EXCHANGE_NODE` requires an explicit, materialized same-node
+//! input supplied by the compute-node wrapper.
 //!
 //! # Wire format: flat preorder
 //!
@@ -31,6 +30,17 @@
 //! | `HDFS_SCAN_NODE`     | `ReadRel` (named table) |
 //! | `SELECT_NODE`        | `FilterRel`        |
 //! | `PROJECT_NODE`       | `ProjectRel`       |
+//! | `AGGREGATION_NODE`   | `AggregateRel` (finalized one-phase only, `new_planner_agg_stage=1`) |
+//! | `SORT_NODE`          | `ProjectRel` (sort tuple) + `SortRel` (global row-number top-N only) |
+//! | `HASH_JOIN_NODE`     | `JoinRel` (inner/outer/left-semi; anti joins are rejected) |
+//! | `NESTLOOP_JOIN_NODE` | `CrossRel` (+ `FilterRel`), inner/cross only |
+//! | `EXCHANGE_NODE`      | `ReadRel` (`local_files`, with an explicit materialized input) |
+//!
+//! Node-level `conjuncts` (scan/filter predicates, HAVING, post-join filters) become a
+//! `FilterRel` over the node's output on every supported node.
+//!
+//! Any node's non-negative `limit` (plus a sort offset) becomes a `FetchRel` on top of its
+//! relation.
 //!
 //! | Expression node   | Substrait expression |
 //! |-------------------|----------------------|
@@ -44,6 +54,10 @@
 //! | `IN_PRED`         | singular-or-list (wrapped in `not` for `NOT IN`) |
 //! | `CASE_EXPR`       | if-then chain (no leading case operand) |
 //! | `FUNCTION_CALL`   | allowlisted scalar functions (`like`, `if`, `substring`, `year`, ...) |
+//!
+//! Aggregate functions (`sum`, `count`, `min`, `max`, `avg`, and the
+//! `multi_distinct_*` distinct forms) are decomposed by `expr_translator::aggregate_call` for
+//! `AggregateRel` measures; only non-merge (one-phase) aggregates are accepted.
 //!
 //! Type mapping lives in `type_mapper`. Intentional v1 omissions return
 //! [`TranslateError::UnsupportedType`]: `LARGEINT` (128-bit), `DECIMAL256` and
@@ -99,6 +113,8 @@ pub const URN_ARITHMETIC: &str = "extension:io.substrait:functions_arithmetic";
 pub const URN_STRING: &str = "extension:io.substrait:functions_string";
 /// Substrait datetime function extension URN.
 pub const URN_DATETIME: &str = "extension:io.substrait:functions_datetime";
+/// Substrait aggregate function extension URN.
+pub const URN_AGGREGATE: &str = "extension:io.substrait:functions_aggregate_generic";
 
 /// Result of translating one StarRocks plan fragment.
 pub struct TranslatedPlan {
@@ -106,6 +122,17 @@ pub struct TranslatedPlan {
     pub plan: Plan,
     /// Root output names as emitted in the Substrait plan.
     pub output_names: Vec<String>,
+}
+
+/// A fully materialized same-node input for one StarRocks exchange node.
+#[derive(Clone, Debug)]
+pub struct ExchangeInput {
+    /// Receiver `EXCHANGE_NODE` id.
+    pub node_id: i32,
+    /// Local parquet files containing the sender fragment output.
+    pub paths: Vec<String>,
+    /// Sender output names as written to those parquet files.
+    pub names: Vec<String>,
 }
 
 impl TranslatedPlan {
@@ -179,6 +206,15 @@ impl PlanTranslator {
 
     /// Translates a StarRocks execution fragment into a Substrait plan.
     pub fn translate_fragment(&self, params: &TExecPlanFragmentParams) -> Result<TranslatedPlan> {
+        self.translate_fragment_with_exchange_inputs(params, &[])
+    }
+
+    /// Translates a fragment with fully materialized inputs for its same-node exchange nodes.
+    pub fn translate_fragment_with_exchange_inputs(
+        &self,
+        params: &TExecPlanFragmentParams,
+        exchange_inputs: &[ExchangeInput],
+    ) -> Result<TranslatedPlan> {
         let fragment = params
             .fragment
             .as_ref()
@@ -200,9 +236,18 @@ impl PlanTranslator {
 
         let desc = DescriptorTable::try_from(desc_tbl)?;
         let scan_paths = ScanFilePaths::from_fragment(params, &desc)?;
+        let exchange_inputs = exchange_inputs
+            .iter()
+            .map(|input| (input.node_id, input))
+            .collect::<HashMap<_, _>>();
         let mut registry = ExtensionRegistry::new();
-        let mut translated =
-            node_translator::translate_plan(plan, &desc, &scan_paths, &mut registry)?;
+        let mut translated = node_translator::translate_plan(
+            plan,
+            &desc,
+            &scan_paths,
+            &exchange_inputs,
+            &mut registry,
+        )?;
 
         let output_names = if let Some(output_exprs) = fragment
             .output_exprs

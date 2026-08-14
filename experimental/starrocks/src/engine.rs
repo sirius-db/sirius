@@ -3,21 +3,22 @@
 //! [`sirius::SiriusContext`] is `!Send`/`!Sync` and the engine serializes queries through a single
 //! process-global context, so the context is created, used, and dropped on one dedicated thread.
 //! [`SiriusEngine`] talks to that thread over channels — which are `Send`/`Sync` and carry only
-//! owned data (`Vec<u8>` in, `Vec<RecordBatch>` out) — so it satisfies `dyn FragmentExecutor:
+//! owned data (`Vec<u8>` in, `FragmentResult` out) — so it satisfies `dyn FragmentExecutor:
 //! Send + Sync` without ever moving the context across threads.
 //!
 //! The seam is synchronous (see [`FragmentExecutor`]): `execute()` blocks the caller until the
 //! engine thread returns the result. `exec_plan_fragment` runs it on a `spawn_blocking` worker, so
 //! the BRPC current-thread runtime stays free to serve `fetch_data`, connection cleanup, and
-//! shutdown cancellation while a query runs. The single-fragment limitations are elsewhere: the
-//! whole result is materialized before dispatch returns, and the single process-global context
-//! serializes queries — both lifted by the streaming evolution.
+//! shutdown cancellation while a query runs. Each fragment result is fully materialized, and the
+//! single process-global context serializes fragment execution — both lifted by the streaming
+//! evolution.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 
+#[cfg(test)]
 use arrow_array::RecordBatch;
 use sirius::SiriusContext;
 use starrocks_plan_translator::TranslatedPlan;
@@ -30,7 +31,7 @@ struct ExecuteRequest {
     /// Serialized Substrait plan bytes.
     plan: Vec<u8>,
     /// Channel the engine thread sends the result (or a flattened error) back on.
-    respond: Sender<Result<Vec<RecordBatch>, String>>,
+    respond: Sender<Result<FragmentResult, String>>,
 }
 
 /// GPU-backed [`FragmentExecutor`] running plans on an embedded Sirius engine.
@@ -99,7 +100,8 @@ fn engine_thread(
         // own Arrow C release callbacks — independent of the context. So the batches are safe to
         // send to, and drop on, the caller's thread.
         let result = context
-            .execute_substrait(&request.plan)
+            .execute_substrait_result(&request.plan)
+            .map(|result| FragmentResult::with_schema(result.schema, result.batches))
             .map_err(|err| err.to_string());
         // Ignore a send error: the waiting fragment may have been dropped/cancelled.
         let _ = request.respond.send(result);
@@ -132,10 +134,9 @@ impl FragmentExecutor for SiriusEngine {
             .ok_or_else(|| "sirius-engine is shutting down".to_string())?
             .send(request)
             .map_err(|_| "sirius-engine thread is not running".to_string())?;
-        let batches = respond_rx
+        respond_rx
             .recv()
-            .map_err(|_| "sirius-engine thread dropped the response".to_string())??;
-        Ok(FragmentResult::new(batches))
+            .map_err(|_| "sirius-engine thread dropped the response".to_string())?
     }
 }
 
@@ -168,6 +169,7 @@ mod tests {
     use parquet::arrow::ArrowWriter;
 
     use super::*;
+    use crate::local_exchange::{ExchangeFile, ExchangeOutput};
 
     /// Builds a single-file `local_files` parquet read plan with `names` as the root output
     /// names — the shape DuckDB's Substrait reader resolves to `parquet_scan(<path>)`.
@@ -275,12 +277,44 @@ mod tests {
         }
     }
 
+    /// Replays a Substrait plan dumped via `SIRIUS_CN_DUMP_FRAGMENTS` (path in
+    /// `SIRIUS_SUBSTRAIT_PLAN`) against the engine — a debug harness for diagnosing a captured
+    /// plan in isolation, outside the FE/CN loop.
+    #[test]
+    #[ignore = "debug harness: set SIRIUS_SUBSTRAIT_PLAN to a dumped plan and run with a GPU"]
+    fn engine_replays_dumped_substrait_plan() {
+        let path = std::env::var("SIRIUS_SUBSTRAIT_PLAN").expect("SIRIUS_SUBSTRAIT_PLAN not set");
+        let plan = std::fs::read(&path).expect("read dumped substrait plan");
+        let engine = SiriusEngine::start(None).expect("bring up sirius engine");
+        let (respond_tx, respond_rx) = channel();
+        engine
+            .requests
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .send(ExecuteRequest {
+                plan,
+                respond: respond_tx,
+            })
+            .unwrap();
+        let result = respond_rx
+            .recv()
+            .expect("engine response")
+            .expect("execute");
+        let rows: usize = result.batches.iter().map(RecordBatch::num_rows).sum();
+        eprintln!("plan {path} returned {rows} row(s)");
+        for batch in &result.batches {
+            eprintln!("{batch:?}");
+        }
+    }
+
     /// End-to-end: drive a `local_files` parquet plan through the engine actor and read the rows
     /// back. Exercises the dedicated-thread bring-up, the channel round-trip, and GPU execution.
     /// Requires a GPU and `LD_LIBRARY_PATH` to the built engine (like the `sirius` crate's context
     /// test); the parquet extension path is set from `SIRIUS_BUILD_DIR` (default mirrors sirius-sys).
     #[test]
-    fn engine_executes_local_files_plan() {
+    fn engine_executes_local_files_and_sequential_exchange() {
         // Point the embedded DuckDB at the locally-built parquet extension so it can bind
         // `parquet_scan`. This is the only context-constructing test in the crate, so no other
         // thread reads the environment concurrently.
@@ -318,6 +352,28 @@ mod tests {
         let result = engine.execute(&plan).expect("execute fragment on GPU");
         let total_rows: usize = result.batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 3, "expected 3 rows from the parquet fixture");
+
+        // Run the same rows through the sequential exchange path: fragment one completed above,
+        // its Arrow result is materialized, and fragment two reads that file in a new single-shot
+        // GPU execution.
+        let exchange = ExchangeFile::materialize(&[ExchangeOutput {
+            names: plan.output_names.clone(),
+            result,
+        }])
+        .expect("materialize local exchange");
+        let exchanged = local_files_plan_with_base_schema(
+            exchange.path().to_str().unwrap(),
+            &[("id", false), ("name", true)],
+        );
+        let exchanged_result = engine
+            .execute(&exchanged)
+            .expect("execute exchange receiver on GPU");
+        let exchanged_rows: usize = exchanged_result
+            .batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(exchanged_rows, 3, "exchange preserved all fragment rows");
 
         // A `base_schema` that prunes and reorders the file's columns must bind by name, not by
         // file position (exercises the Substrait reader's `local_files` projection). The fixture

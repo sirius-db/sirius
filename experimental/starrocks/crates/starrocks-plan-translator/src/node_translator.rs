@@ -1,19 +1,24 @@
 use starrocks_thrift::exprs::TExpr;
-use starrocks_thrift::plan_nodes::{TPlan, TPlanNode, TPlanNodeType};
+use starrocks_thrift::opcodes::TExprOpcode;
+use starrocks_thrift::plan_nodes::{TJoinOp, TPlan, TPlanNode, TPlanNodeType, TSortInfo};
 use substrait::proto::read_rel::local_files::FileOrFiles;
 use substrait::proto::read_rel::local_files::file_or_files::{
     FileFormat, ParquetReadOptions, PathType,
 };
 use substrait::proto::read_rel::{LocalFiles, NamedTable, ReadType};
 use substrait::proto::{
-    Expression, FilterRel, ProjectRel, ReadRel, Rel, RelCommon, rel, rel_common,
+    AggregateFunction, AggregateRel, CrossRel, Expression, FetchRel, FilterRel, JoinRel,
+    ProjectRel, ReadRel, Rel, RelCommon, SortField, SortRel, aggregate_rel, fetch_rel,
+    function_argument, join_rel, rel, rel_common, sort_field,
 };
 
 use crate::descriptor_table::DescriptorTable;
 use crate::error::{Result, TranslateError};
 use crate::expr_translator::{self, ExprContext, TranslateExpr};
 use crate::scan_paths::ScanFilePaths;
-use crate::{ExtensionRegistry, URN_BOOLEAN};
+use crate::{
+    ExchangeInput, ExtensionRegistry, URN_AGGREGATE, URN_ARITHMETIC, URN_BOOLEAN, URN_COMPARISON,
+};
 
 /// Partially translated relation plus the StarRocks row layout it emits.
 pub(crate) struct TranslatedRel {
@@ -44,6 +49,8 @@ struct PlanContext<'a> {
     /// scan ranges. Scans with paths emit a `local_files` read; path-less scans
     /// fall back to a named-table read.
     scan_paths: &'a ScanFilePaths,
+    /// Materialized same-node inputs keyed by receiver exchange node id.
+    exchange_inputs: &'a std::collections::HashMap<i32, &'a ExchangeInput>,
     /// Substrait extension registry shared across the whole plan.
     registry: &'a mut ExtensionRegistry,
 }
@@ -53,11 +60,13 @@ impl<'a> PlanContext<'a> {
     fn new(
         desc: &'a DescriptorTable,
         scan_paths: &'a ScanFilePaths,
+        exchange_inputs: &'a std::collections::HashMap<i32, &'a ExchangeInput>,
         registry: &'a mut ExtensionRegistry,
     ) -> Self {
         Self {
             desc,
             scan_paths,
+            exchange_inputs,
             registry,
         }
     }
@@ -142,16 +151,67 @@ fn translate_plan_node(
     children: Vec<TranslatedRel>,
     ctx: &mut PlanContext<'_>,
 ) -> Result<TranslatedRel> {
-    match node.node_type {
+    let translated = match node.node_type {
         TPlanNodeType::FILE_SCAN_NODE => translate_file_scan(node, children, ctx),
         TPlanNodeType::HDFS_SCAN_NODE => translate_hdfs_scan(node, children, ctx),
         TPlanNodeType::SELECT_NODE => translate_select(node, children, ctx),
         TPlanNodeType::PROJECT_NODE => translate_project(node, children, ctx),
+        TPlanNodeType::AGGREGATION_NODE => translate_aggregation(node, children, ctx),
+        TPlanNodeType::SORT_NODE => translate_sort(node, children, ctx),
+        TPlanNodeType::HASH_JOIN_NODE => translate_hash_join(node, children, ctx),
+        TPlanNodeType::NESTLOOP_JOIN_NODE => translate_nestloop_join(node, children, ctx),
+        TPlanNodeType::EXCHANGE_NODE => translate_exchange(node, children, ctx),
         _ => Err(TranslateError::UnsupportedPlanNode {
             node_id: node.node_id,
             node_type: node.node_type,
             reason: "plan node is outside the v1 StarRocks slice",
         }),
+    }?;
+    Ok(apply_fetch(translated, node))
+}
+
+/// Wraps a relation in a Substrait fetch when the StarRocks node carries a limit or offset.
+///
+/// `TPlanNode::limit` applies to any node type; a skip offset only appears on sort and exchange
+/// payloads.
+// The deprecated plain offset/count oneof variants share wire tags with their expression
+// counterparts and are the fields DuckDB's Substrait consumer reads.
+#[allow(deprecated)]
+fn apply_fetch(input: TranslatedRel, node: &TPlanNode) -> TranslatedRel {
+    let offset = node
+        .sort_node
+        .as_ref()
+        .and_then(|sort| sort.offset)
+        .or_else(|| {
+            node.exchange_node
+                .as_ref()
+                .and_then(|exchange| exchange.offset)
+        })
+        .unwrap_or(0);
+    if node.limit < 0 && offset == 0 {
+        return input;
+    }
+    let TranslatedRel {
+        rel,
+        row_tuples,
+        output_width,
+    } = input;
+    // For an offset-only fetch, emit an explicit unlimited count: the consumer reads the plain
+    // count field without checking the oneof, and an unset count would decode as `LIMIT 0`.
+    let count = if node.limit >= 0 { node.limit } else { -1 };
+    let count_mode = Some(fetch_rel::CountMode::Count(count));
+    let offset_mode = (offset != 0).then_some(fetch_rel::OffsetMode::Offset(offset));
+    TranslatedRel {
+        rel: Rel {
+            rel_type: Some(rel::RelType::Fetch(Box::new(FetchRel {
+                input: Some(Box::new(rel)),
+                offset_mode,
+                count_mode,
+                ..Default::default()
+            }))),
+        },
+        row_tuples,
+        output_width,
     }
 }
 
@@ -246,10 +306,529 @@ pub(crate) fn translate_plan(
     plan: &TPlan,
     desc: &DescriptorTable,
     scan_paths: &ScanFilePaths,
+    exchange_inputs: &std::collections::HashMap<i32, &ExchangeInput>,
     registry: &mut ExtensionRegistry,
 ) -> Result<TranslatedRel> {
-    let mut ctx = PlanContext::new(desc, scan_paths, registry);
+    let mut ctx = PlanContext::new(desc, scan_paths, exchange_inputs, registry);
     plan.translate(&mut ctx)
+}
+
+/// Replaces a receiver exchange boundary with a read of its fully materialized sender output.
+fn translate_exchange(
+    node: &TPlanNode,
+    children: Vec<TranslatedRel>,
+    ctx: &mut PlanContext<'_>,
+) -> Result<TranslatedRel> {
+    expect_children(node, &children, 0)?;
+    let exchange = node
+        .exchange_node
+        .as_ref()
+        .ok_or(TranslateError::MissingField {
+            context: "EXCHANGE_NODE",
+            field: "exchange_node",
+        })?;
+    if exchange.input_row_tuples.is_empty() {
+        return Err(TranslateError::MissingField {
+            context: "TExchangeNode",
+            field: "input_row_tuples",
+        });
+    }
+    let input =
+        ctx.exchange_inputs
+            .get(&node.node_id)
+            .ok_or(TranslateError::UnsupportedPlanNode {
+                node_id: node.node_id,
+                node_type: node.node_type,
+                reason: "exchange node requires a materialized same-node input",
+            })?;
+    if input.paths.is_empty() {
+        return Err(TranslateError::malformed(format!(
+            "exchange node {} has no materialized input files",
+            node.node_id
+        )));
+    }
+    let schema = ctx
+        .desc
+        .named_struct_for_tuples(&exchange.input_row_tuples, Some(&input.names))?;
+    let output_width = schema
+        .r#struct
+        .as_ref()
+        .map(|structure| structure.types.len())
+        .unwrap_or(0);
+    let mut translated = TranslatedRel {
+        rel: local_files_rel(schema, &input.paths),
+        row_tuples: exchange.input_row_tuples.clone(),
+        output_width,
+    };
+    if let Some(sort_info) = &exchange.sort_info {
+        let sorts = sort_fields(sort_info, &translated, ctx)?;
+        let row_tuples = translated.row_tuples.clone();
+        translated = TranslatedRel {
+            rel: Rel {
+                rel_type: Some(rel::RelType::Sort(Box::new(SortRel {
+                    input: Some(Box::new(translated.rel)),
+                    sorts,
+                    ..Default::default()
+                }))),
+            },
+            row_tuples,
+            output_width,
+        };
+    }
+    apply_conjuncts(translated, node, ctx)
+}
+
+/// Translates a one-phase `AGGREGATION_NODE` into a Substrait aggregate relation.
+///
+/// Only finalized single-phase aggregation is supported (run StarRocks with
+/// `new_planner_agg_stage = 1`); merge/update phases would require modeling partial aggregate
+/// states. The output row layout is the aggregation output tuple, whose materialized slots are
+/// the grouping keys followed by the aggregate results (StarRocks allocates them in that order).
+fn translate_aggregation(
+    node: &TPlanNode,
+    children: Vec<TranslatedRel>,
+    ctx: &mut PlanContext<'_>,
+) -> Result<TranslatedRel> {
+    expect_children(node, &children, 1)?;
+    let child = children.into_iter().next().unwrap();
+    let agg = node.agg_node.as_ref().ok_or(TranslateError::MissingField {
+        context: "AGGREGATION_NODE",
+        field: "agg_node",
+    })?;
+    if !agg.need_finalize || agg.intermediate_tuple_id != agg.output_tuple_id {
+        return Err(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "only finalized one-phase aggregation is supported (new_planner_agg_stage=1)",
+        });
+    }
+    let output_tuple = agg.output_tuple_id;
+
+    let grouping_exprs = agg.grouping_exprs.as_deref().unwrap_or_default();
+    let mut grouping_expressions = Vec::with_capacity(grouping_exprs.len());
+    for expr in grouping_exprs {
+        let mut expr_ctx = ctx.expr_context(&child.row_tuples);
+        grouping_expressions.push(expr.translate(&mut expr_ctx)?);
+    }
+
+    // Aggregate output types come from the output tuple's slots, which carry the grouping keys
+    // first and then one slot per aggregate function.
+    let output_slots = ctx.desc.materialized_slot_ids(output_tuple)?;
+    let output_width = output_slots.len();
+    if output_width != grouping_expressions.len() + agg.aggregate_functions.len() {
+        return Err(TranslateError::descriptor(format!(
+            "AGGREGATION_NODE {} output tuple {} has {} slots for {} keys + {} aggregates",
+            node.node_id,
+            output_tuple,
+            output_width,
+            grouping_expressions.len(),
+            agg.aggregate_functions.len()
+        )));
+    }
+
+    let mut measures = Vec::with_capacity(agg.aggregate_functions.len());
+    for (expr, slot_id) in agg
+        .aggregate_functions
+        .iter()
+        .zip(&output_slots[grouping_expressions.len()..])
+    {
+        let mut expr_ctx = ctx.expr_context(&child.row_tuples);
+        let call = expr_translator::aggregate_call(expr, &mut expr_ctx)?;
+        // The GPU ungrouped-aggregate operator rejects every distinct aggregate, so a
+        // grouping-free DISTINCT measure would translate fine and then fail at execution.
+        if call.distinct && grouping_expressions.is_empty() {
+            return Err(TranslateError::UnsupportedPlanNode {
+                node_id: node.node_id,
+                node_type: node.node_type,
+                reason: "distinct aggregates without grouping keys are not supported",
+            });
+        }
+        let output_type = ctx
+            .desc
+            .slot(output_tuple, *slot_id)?
+            .substrait_type
+            .clone()
+            .ok_or(TranslateError::MissingField {
+                context: "aggregate output slot",
+                field: "slotType",
+            })?;
+        // `count` lives in the generic aggregate extension; sum/avg/min/max are declared by
+        // the arithmetic extension.
+        let urn = if call.name == "count" {
+            URN_AGGREGATE
+        } else {
+            URN_ARITHMETIC
+        };
+        let anchor = ctx.registry.register_function(urn, &call.name);
+        measures.push(aggregate_rel::Measure {
+            measure: Some(AggregateFunction {
+                function_reference: anchor,
+                arguments: call
+                    .arguments
+                    .into_iter()
+                    .map(|expr| substrait::proto::FunctionArgument {
+                        arg_type: Some(function_argument::ArgType::Value(expr)),
+                    })
+                    .collect(),
+                output_type: Some(output_type),
+                invocation: if call.distinct {
+                    substrait::proto::aggregate_function::AggregationInvocation::Distinct as i32
+                } else {
+                    substrait::proto::aggregate_function::AggregationInvocation::All as i32
+                },
+                ..Default::default()
+            }),
+            filter: None,
+        });
+    }
+
+    let groupings = if grouping_expressions.is_empty() {
+        Vec::new()
+    } else {
+        #[allow(deprecated)]
+        let grouping = aggregate_rel::Grouping {
+            grouping_expressions: Vec::new(),
+            expression_references: (0..grouping_expressions.len() as u32).collect(),
+        };
+        vec![grouping]
+    };
+
+    let aggregated = TranslatedRel {
+        rel: Rel {
+            rel_type: Some(rel::RelType::Aggregate(Box::new(AggregateRel {
+                input: Some(Box::new(child.rel)),
+                groupings,
+                measures,
+                grouping_expressions,
+                ..Default::default()
+            }))),
+        },
+        row_tuples: vec![output_tuple],
+        output_width,
+    };
+    // Node conjuncts evaluate over the aggregation output (HAVING predicates).
+    apply_conjuncts(aggregated, node, ctx)
+}
+
+/// Translates a `SORT_NODE` into a Substrait sort (plus the fetch added by `apply_fetch` for
+/// top-N limits).
+///
+/// StarRocks sorts materialize a dedicated sort tuple first (`sort_tuple_slot_exprs`, one
+/// expression per materialized slot); the ordering expressions then reference that tuple.
+fn translate_sort(
+    node: &TPlanNode,
+    children: Vec<TranslatedRel>,
+    ctx: &mut PlanContext<'_>,
+) -> Result<TranslatedRel> {
+    expect_children(node, &children, 1)?;
+    let child = children.into_iter().next().unwrap();
+    let sort = node
+        .sort_node
+        .as_ref()
+        .ok_or(TranslateError::MissingField {
+            context: "SORT_NODE",
+            field: "sort_node",
+        })?;
+    let sort_tuple = node
+        .row_tuples
+        .first()
+        .copied()
+        .ok_or(TranslateError::MissingField {
+            context: "SORT_NODE",
+            field: "row_tuples",
+        })?;
+    // Partitioned top-N (per-partition limits) and rank-based top-N have no Substrait
+    // representation here; a global sort would silently return the wrong row set.
+    if sort
+        .partition_exprs
+        .as_ref()
+        .is_some_and(|exprs| !exprs.is_empty())
+        || sort
+            .topn_type
+            .is_some_and(|topn| topn != starrocks_thrift::plan_nodes::TTopNType::ROW_NUMBER)
+    {
+        return Err(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "partitioned or rank-based top-N sorts are not supported",
+        });
+    }
+
+    // The resolved materialization expressions live in `TSortInfo`; the node-level field is a
+    // deprecated duplicate some senders omit.
+    let sort_tuple_slot_exprs = sort
+        .sort_info
+        .sort_tuple_slot_exprs
+        .as_ref()
+        .or(sort.sort_tuple_slot_exprs.as_ref());
+    let input = if let Some(slot_exprs) = sort_tuple_slot_exprs.filter(|exprs| !exprs.is_empty()) {
+        let expected = ctx.desc.materialized_slot_ids(sort_tuple)?.len();
+        if slot_exprs.len() != expected {
+            return Err(TranslateError::descriptor(format!(
+                "SORT_NODE {} materializes {} exprs for sort tuple {} with {} slots",
+                node.node_id,
+                slot_exprs.len(),
+                sort_tuple,
+                expected
+            )));
+        }
+        let mut expressions = Vec::with_capacity(slot_exprs.len());
+        for expr in slot_exprs {
+            let mut expr_ctx = ctx.expr_context(&child.row_tuples);
+            expressions.push(expr.translate(&mut expr_ctx)?);
+        }
+        project_rel(child, expressions, vec![sort_tuple])
+    } else {
+        child
+    };
+
+    let sorts = sort_fields(&sort.sort_info, &input, ctx)?;
+    let row_tuples = input.row_tuples.clone();
+    let output_width = input.output_width;
+    let sorted = TranslatedRel {
+        rel: Rel {
+            rel_type: Some(rel::RelType::Sort(Box::new(SortRel {
+                input: Some(Box::new(input.rel)),
+                sorts,
+                ..Default::default()
+            }))),
+        },
+        row_tuples,
+        output_width,
+    };
+    apply_conjuncts(sorted, node, ctx)
+}
+
+/// Builds Substrait sort fields from a StarRocks sort-info payload against `input`'s row layout.
+fn sort_fields(
+    sort_info: &TSortInfo,
+    input: &TranslatedRel,
+    ctx: &mut PlanContext<'_>,
+) -> Result<Vec<SortField>> {
+    let ordering = &sort_info.ordering_exprs;
+    if sort_info.is_asc_order.len() != ordering.len()
+        || sort_info.nulls_first.len() != ordering.len()
+    {
+        return Err(TranslateError::malformed(
+            "sort info direction lists do not match ordering expressions",
+        ));
+    }
+    ordering
+        .iter()
+        .zip(sort_info.is_asc_order.iter().zip(&sort_info.nulls_first))
+        .map(|(expr, (asc, nulls_first))| {
+            let mut expr_ctx = ctx.expr_context(&input.row_tuples);
+            let expr = expr.translate(&mut expr_ctx)?;
+            let direction = match (asc, nulls_first) {
+                (true, true) => sort_field::SortDirection::AscNullsFirst,
+                (true, false) => sort_field::SortDirection::AscNullsLast,
+                (false, true) => sort_field::SortDirection::DescNullsFirst,
+                (false, false) => sort_field::SortDirection::DescNullsLast,
+            };
+            Ok(SortField {
+                expr: Some(expr),
+                sort_kind: Some(sort_field::SortKind::Direction(direction as i32)),
+            })
+        })
+        .collect()
+}
+
+/// Translates a `HASH_JOIN_NODE` into a Substrait join relation.
+///
+/// StarRocks children are `[probe (left), build (right)]`; the Substrait join condition is
+/// evaluated over the concatenated left-then-right row, which is exactly how
+/// `slot_global_index` resolves slots against the combined layout.
+fn translate_hash_join(
+    node: &TPlanNode,
+    children: Vec<TranslatedRel>,
+    ctx: &mut PlanContext<'_>,
+) -> Result<TranslatedRel> {
+    expect_children(node, &children, 2)?;
+    let join = node
+        .hash_join_node
+        .as_ref()
+        .ok_or(TranslateError::MissingField {
+            context: "HASH_JOIN_NODE",
+            field: "hash_join_node",
+        })?;
+    let mut children = children.into_iter();
+    let left = children.next().unwrap();
+    let right = children.next().unwrap();
+
+    let combined_tuples = [left.row_tuples.as_slice(), right.row_tuples.as_slice()].concat();
+    let mut conditions = Vec::new();
+    for eq in &join.eq_join_conjuncts {
+        if let Some(opcode) = eq.opcode
+            && opcode != TExprOpcode::EQ
+        {
+            return Err(TranslateError::UnsupportedPlanNode {
+                node_id: node.node_id,
+                node_type: node.node_type,
+                reason: "only plain equality join conjuncts are supported",
+            });
+        }
+        let mut expr_ctx = ctx.expr_context(&combined_tuples);
+        let left_expr = eq.left.translate(&mut expr_ctx)?;
+        let mut expr_ctx = ctx.expr_context(&combined_tuples);
+        let right_expr = eq.right.translate(&mut expr_ctx)?;
+        let anchor = ctx.registry.register_function(URN_COMPARISON, "equal");
+        conditions.push(expr_translator::scalar_function(
+            anchor,
+            vec![left_expr, right_expr],
+            crate::type_mapper::bool_type(),
+        ));
+    }
+    for expr in join.other_join_conjuncts.as_deref().unwrap_or_default() {
+        let mut expr_ctx = ctx.expr_context(&combined_tuples);
+        conditions.push(expr.translate(&mut expr_ctx)?);
+    }
+    if conditions.is_empty() {
+        return Err(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "hash join without join conjuncts",
+        });
+    }
+    let condition = and_conditions(conditions, ctx);
+
+    // Anti joins (from NOT IN / NOT EXISTS rewrites) are not translated: DuckDB's Substrait
+    // consumer has no left-anti conversion, so an emitted plan would fail downstream anyway.
+    let (join_type, semi) = match join.join_op {
+        TJoinOp::INNER_JOIN => (join_rel::JoinType::Inner, false),
+        TJoinOp::LEFT_OUTER_JOIN => (join_rel::JoinType::Left, false),
+        TJoinOp::RIGHT_OUTER_JOIN => (join_rel::JoinType::Right, false),
+        TJoinOp::FULL_OUTER_JOIN => (join_rel::JoinType::Outer, false),
+        TJoinOp::LEFT_SEMI_JOIN => (join_rel::JoinType::LeftSemi, true),
+        _ => {
+            return Err(TranslateError::UnsupportedPlanNode {
+                node_id: node.node_id,
+                node_type: node.node_type,
+                reason: "hash join type is unsupported",
+            });
+        }
+    };
+
+    // Semi joins emit only the probe-side row; other joins emit probe then build columns.
+    let (row_tuples, output_width) = if semi {
+        (left.row_tuples.clone(), left.output_width)
+    } else {
+        (combined_tuples, left.output_width + right.output_width)
+    };
+
+    let joined = TranslatedRel {
+        rel: Rel {
+            rel_type: Some(rel::RelType::Join(Box::new(JoinRel {
+                left: Some(Box::new(left.rel)),
+                right: Some(Box::new(right.rel)),
+                expression: Some(Box::new(condition)),
+                r#type: join_type as i32,
+                ..Default::default()
+            }))),
+        },
+        row_tuples,
+        output_width,
+    };
+    // Node conjuncts are post-join predicates over the join's output row.
+    apply_conjuncts(joined, node, ctx)
+}
+
+/// Translates a `NESTLOOP_JOIN_NODE` into a Substrait cross product (plus a filter when the
+/// join carries conjuncts). Only inner/cross nested-loop joins are supported.
+fn translate_nestloop_join(
+    node: &TPlanNode,
+    children: Vec<TranslatedRel>,
+    ctx: &mut PlanContext<'_>,
+) -> Result<TranslatedRel> {
+    expect_children(node, &children, 2)?;
+    let join = node
+        .nestloop_join_node
+        .as_ref()
+        .ok_or(TranslateError::MissingField {
+            context: "NESTLOOP_JOIN_NODE",
+            field: "nestloop_join_node",
+        })?;
+    match join.join_op {
+        None | Some(TJoinOp::CROSS_JOIN) | Some(TJoinOp::INNER_JOIN) => {}
+        Some(_) => {
+            return Err(TranslateError::UnsupportedPlanNode {
+                node_id: node.node_id,
+                node_type: node.node_type,
+                reason: "only inner/cross nested-loop joins are supported",
+            });
+        }
+    }
+    let mut children = children.into_iter();
+    let left = children.next().unwrap();
+    let right = children.next().unwrap();
+    let row_tuples = [left.row_tuples.as_slice(), right.row_tuples.as_slice()].concat();
+    let output_width = left.output_width + right.output_width;
+
+    let cross = TranslatedRel {
+        rel: Rel {
+            rel_type: Some(rel::RelType::Cross(Box::new(CrossRel {
+                left: Some(Box::new(left.rel)),
+                right: Some(Box::new(right.rel)),
+                ..Default::default()
+            }))),
+        },
+        row_tuples,
+        output_width,
+    };
+
+    // A conjunct-free cross product is rejected: the GPU physical planner has no cross-product
+    // operator, so the plan would translate and then fail at execution.
+    if join
+        .join_conjuncts
+        .as_ref()
+        .is_none_or(|conjuncts| conjuncts.is_empty())
+    {
+        return Err(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "cross joins without join conjuncts are not supported",
+        });
+    }
+    let filtered = if let Some(conjuncts) = join
+        .join_conjuncts
+        .as_ref()
+        .filter(|conjuncts| !conjuncts.is_empty())
+    {
+        let mut conditions = Vec::with_capacity(conjuncts.len());
+        for expr in conjuncts {
+            let mut expr_ctx = ctx.expr_context(&cross.row_tuples);
+            conditions.push(expr.translate(&mut expr_ctx)?);
+        }
+        let condition = and_conditions(conditions, ctx);
+        let TranslatedRel {
+            rel,
+            row_tuples,
+            output_width,
+        } = cross;
+        TranslatedRel {
+            rel: Rel {
+                rel_type: Some(rel::RelType::Filter(Box::new(FilterRel {
+                    input: Some(Box::new(rel)),
+                    condition: Some(Box::new(condition)),
+                    ..Default::default()
+                }))),
+            },
+            row_tuples,
+            output_width,
+        }
+    } else {
+        cross
+    };
+    // Node conjuncts are post-join predicates over the join's output row.
+    apply_conjuncts(filtered, node, ctx)
+}
+
+/// Combines one or more boolean conditions with `and`.
+fn and_conditions(mut conditions: Vec<Expression>, ctx: &mut PlanContext<'_>) -> Expression {
+    if conditions.len() == 1 {
+        return conditions.pop().unwrap();
+    }
+    let anchor = ctx.registry.register_function(URN_BOOLEAN, "and");
+    expr_translator::scalar_function(anchor, conditions, crate::type_mapper::bool_type())
 }
 
 /// Builds a Substrait read for a StarRocks scan tuple.
@@ -266,17 +845,7 @@ fn scan_rel(desc: &DescriptorTable, tuple_id: i32, file_paths: &[String]) -> Res
             ..Default::default()
         })
     } else {
-        ReadType::LocalFiles(LocalFiles {
-            items: file_paths
-                .iter()
-                .map(|path| FileOrFiles {
-                    path_type: Some(PathType::UriFile(path.clone())),
-                    file_format: Some(FileFormat::Parquet(ParquetReadOptions {})),
-                    ..Default::default()
-                })
-                .collect(),
-            ..Default::default()
-        })
+        return Ok(local_files_rel(desc.named_struct(tuple_id)?, file_paths));
     };
     Ok(Rel {
         rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
@@ -285,6 +854,27 @@ fn scan_rel(desc: &DescriptorTable, tuple_id: i32, file_paths: &[String]) -> Res
             ..Default::default()
         }))),
     })
+}
+
+/// Builds a local parquet read with an explicit schema.
+fn local_files_rel(schema: substrait::proto::NamedStruct, file_paths: &[String]) -> Rel {
+    Rel {
+        rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
+            base_schema: Some(schema),
+            read_type: Some(ReadType::LocalFiles(LocalFiles {
+                items: file_paths
+                    .iter()
+                    .map(|path| FileOrFiles {
+                        path_type: Some(PathType::UriFile(path.clone())),
+                        file_format: Some(FileFormat::Parquet(ParquetReadOptions {})),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }))),
+    }
 }
 
 /// Translates a StarRocks project node while preserving descriptor output order.
@@ -344,7 +934,8 @@ pub(crate) fn project_exprs(
     // Root projections evaluate over already-translated inputs, so there are no
     // scan nodes to resolve file paths for.
     let scan_paths = ScanFilePaths::default();
-    let mut ctx = PlanContext::new(desc, &scan_paths, registry);
+    let exchange_inputs = std::collections::HashMap::new();
+    let mut ctx = PlanContext::new(desc, &scan_paths, &exchange_inputs, registry);
     project_exprs_with_context(input, exprs, &mut ctx)
 }
 
