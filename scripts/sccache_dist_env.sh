@@ -59,6 +59,23 @@ esac
 export SIRIUS_SCCACHE_DIST=1
 export SIRIUS_SCCACHE_DIST_BIN="$_sirius_dist_bin"
 
+# Canonical pixi env (see setup script): compiling through compilers at this
+# fixed path — instead of the checkout-local .pixi env — is what makes cache
+# keys match across checkouts, worktrees, and machines.
+_sirius_canon_env="$_sirius_dist_home/pixi/.pixi/envs/default"
+_sirius_repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -x "$_sirius_canon_env/bin/nvcc" ]]; then
+  export SIRIUS_SCCACHE_DIST_CANON_ENV="$_sirius_canon_env"
+  if ! cmp -s "$_sirius_dist_home/pixi/pixi.lock" "$_sirius_repo_root/pixi.lock"; then
+    echo "WARNING: canonical env's pixi.lock differs from this checkout's — builds may use" >&2
+    echo "         stale toolchains. Refresh with: scripts/sccache_dist_setup.sh" >&2
+  fi
+else
+  echo "WARNING: canonical pixi env not found — cache keys will be checkout-specific and" >&2
+  echo "         cross-machine cache hits will not occur. Fix with: scripts/sccache_dist_setup.sh" >&2
+fi
+unset _sirius_canon_env _sirius_repo_root
+
 # Dedicated server port so the fork's local server never collides with the
 # pixi-provided sccache 0.15.0 server (default port 4226) used by normal builds.
 export SCCACHE_SERVER_PORT="${SIRIUS_SCCACHE_DIST_PORT:-4227}"

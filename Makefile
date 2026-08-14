@@ -48,16 +48,28 @@ SCCACHE_DIST_CMAKE_FLAGS := \
 	-DCMAKE_C_COMPILER_LAUNCHER=$(SIRIUS_SCCACHE_DIST_BIN) \
 	-DCMAKE_CXX_COMPILER_LAUNCHER=$(SIRIUS_SCCACHE_DIST_BIN) \
 	-DCMAKE_CUDA_COMPILER_LAUNCHER=$(SIRIUS_SCCACHE_DIST_BIN)
+# Compile through the canonical pixi env's compilers (same absolute path on
+# every machine/checkout) so cache keys match across checkouts: conda's gcc
+# embeds its env path in the specs file, which sccache hashes into every key.
+ifneq ($(wildcard $(SIRIUS_SCCACHE_DIST_CANON_ENV)/bin/nvcc),)
+SCCACHE_DIST_ARCH_PREFIX := $(shell uname -m)-conda-linux-gnu
+SCCACHE_DIST_CMAKE_FLAGS += \
+	-DCMAKE_C_COMPILER=$(SIRIUS_SCCACHE_DIST_CANON_ENV)/bin/$(SCCACHE_DIST_ARCH_PREFIX)-cc \
+	-DCMAKE_CXX_COMPILER=$(SIRIUS_SCCACHE_DIST_CANON_ENV)/bin/$(SCCACHE_DIST_ARCH_PREFIX)-c++ \
+	-DCMAKE_CUDA_COMPILER=$(SIRIUS_SCCACHE_DIST_CANON_ENV)/bin/nvcc \
+	-DCMAKE_CUDA_HOST_COMPILER=$(SIRIUS_SCCACHE_DIST_CANON_ENV)/bin/$(SCCACHE_DIST_ARCH_PREFIX)-c++
+endif
 # Configure-time compiler checks should not go through the farm (rmm#2101).
 SCCACHE_DIST_CONFIGURE_ENV := SCCACHE_NO_DIST_COMPILE=1
 endif
 
-# Stamp the current dist mode so toggling it re-runs the CMake configure step
-# (which rewrites the launcher into the ninja files).
+# Stamp the current dist mode (and canonical env, which changes the compiler
+# -D flags) so toggling either re-runs the CMake configure step.
 SCCACHE_DIST_STAMP := build/.sccache_dist_mode
+SCCACHE_DIST_MODE_ID := $(SIRIUS_SCCACHE_DIST)$(if $(SIRIUS_SCCACHE_DIST_CANON_ENV),-canon)
 $(shell mkdir -p build && \
-	{ [ -f $(SCCACHE_DIST_STAMP) ] && [ "$$(cat $(SCCACHE_DIST_STAMP))" = "$(SIRIUS_SCCACHE_DIST)" ]; } \
-	|| echo $(SIRIUS_SCCACHE_DIST) > $(SCCACHE_DIST_STAMP))
+	{ [ -f $(SCCACHE_DIST_STAMP) ] && [ "$$(cat $(SCCACHE_DIST_STAMP))" = "$(SCCACHE_DIST_MODE_ID)" ]; } \
+	|| echo $(SCCACHE_DIST_MODE_ID) > $(SCCACHE_DIST_STAMP))
 CMAKE_INPUTS += $(SCCACHE_DIST_STAMP)
 
 all: release

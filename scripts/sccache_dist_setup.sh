@@ -127,6 +127,30 @@ chmod 600 "$CREDS_FILE.tmp"
 mv "$CREDS_FILE.tmp" "$CREDS_FILE"
 echo "==> Wrote $CREDS_FILE"
 
+# -----------------------------------------------------------------------------
+# 5) Canonical pixi env. Cache keys include a digest of the compiler *and its
+#    specs file*; conda's gcc embeds the env's absolute path in the specs file
+#    (a link-time -rpath), so compilers from a checkout-local .pixi env poison
+#    every key. Installing one env at this fixed per-user path — identical on
+#    every machine with the same username — makes keys match across checkouts,
+#    worktrees, and machines. The Makefile points CMake at these compilers when
+#    dist mode is on.
+# -----------------------------------------------------------------------------
+if [[ "$CREDS_ONLY" == 0 ]]; then
+  command -v pixi >/dev/null || die "'pixi' is required but not on PATH"
+  REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+  CANON="$DIST_HOME/pixi"
+  mkdir -p "$CANON/scripts"
+  cp "$REPO_ROOT/pixi.toml" "$CANON/pixi.toml"
+  cp "$REPO_ROOT/pixi.lock" "$CANON/pixi.lock"
+  # Activation scripts referenced by pixi.toml (not needed for install, but
+  # keep the manifest self-consistent).
+  cp "$REPO_ROOT/scripts/pixi_activate.sh" "$REPO_ROOT/scripts/vcpkg.sh" "$CANON/scripts/" 2>/dev/null || true
+  echo "==> Installing canonical pixi env (hardlinked from the shared package cache)"
+  (cd "$CANON" && pixi install)
+  echo "==> Canonical build env ready: $CANON/.pixi/envs/default"
+fi
+
 # Stop any running dist-mode sccache server so the next build picks up the
 # fresh credentials. Normal builds use a different port (4226) and are
 # unaffected.

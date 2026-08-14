@@ -43,7 +43,11 @@ This is idempotent and:
    pixi-provided sccache used by normal builds;
 2. checks `gh` auth and installs the `gh-nv-gha-aws` extension;
 3. mints temporary AWS credentials (12h) for the shared S3 cache into a **dedicated**
-   credentials file — your `~/.aws/credentials` and `~/.config/sccache` are never touched.
+   credentials file — your `~/.aws/credentials` and `~/.config/sccache` are never touched;
+4. installs a **canonical pixi env** under `~/.local/share/sirius/sccache-dist/pixi/`
+   (hardlinked from the shared pixi package cache, so it is cheap). Dist-mode builds compile
+   through this env's compilers instead of the checkout-local `.pixi` env — see
+   [Why cache keys need the canonical env](#why-cache-keys-need-the-canonical-env).
 
 The AWS credentials expire after 12 hours. Refresh them with:
 
@@ -72,6 +76,36 @@ still succeeds by compiling locally (the shared S3 cache is still used).
 
 To go back to normal local builds, open a fresh shell (the mode is scoped to the shell that
 sourced the env file).
+
+## Why cache keys need the canonical env
+
+sccache's cache key includes a digest of the compiler binary *and its extra files* — for
+conda/pixi gcc that includes the `specs` file, into which conda writes the env's **absolute
+path** at install time (a link-stage `-rpath <env>/lib`). Since every checkout carries its own
+`.pixi` env, compiling with the checkout-local compilers gives every checkout (and every
+worktree, and every machine with a different checkout path) disjoint cache keys — 0% sharing,
+even for identical sources.
+
+Everything else is already path-independent: source paths, include paths, and the working
+directory are normalized out of the key (`SCCACHE_BASEDIRS` is exported by pixi activation),
+and keys are stable across sccache fork versions and dist/local compilation.
+
+The canonical env fixes the one remaining input: all dist-mode builds use compilers at the same
+absolute path (`~/.local/share/sirius/sccache-dist/pixi/.pixi/envs/default`), so the specs file
+content — and therefore the key — is identical across checkouts, worktrees, and machines
+(usernames must match for `~` to expand identically). The Makefile passes the canonical
+compilers via `-DCMAKE_{C,CXX,CUDA}_COMPILER` / `-DCMAKE_CUDA_HOST_COMPILER` only when dist
+mode is on; normal builds keep using the checkout's own env.
+
+Two things must still match for cache hits — both legitimate key inputs:
+
+- the **sources** (same commit / same file contents; unchanged files like the DuckDB submodule
+  hit regardless), and
+- the **toolchain** (same `pixi.lock`; the env script warns when the canonical env's lock has
+  drifted from the checkout's — re-run `scripts/sccache_dist_setup.sh` after lock bumps).
+
+Note: binaries built in dist mode embed an rpath to the canonical env, so keep
+`~/.local/share/sirius/sccache-dist/` around while using them.
 
 ## Health checks
 
