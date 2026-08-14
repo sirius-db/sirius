@@ -278,7 +278,7 @@ TEST_CASE("lock_or_prepare_batch cross-GPU returns a clone and leaves the source
       column_values_to_host<int64_t>(sirius::get_cudf_table_view(ro).column(0), stream.view());
   }
 
-  auto prepared = sirius::pipeline::lock_or_prepare_batch(batch, f.gpu1, stream.view());
+  auto prepared = sirius::pipeline::lock_and_prepare_batch(batch, f.gpu1, stream.view());
   REQUIRE(prepared.has_value());
 
   // The returned accessor references a NEW batch in the target space.
@@ -317,7 +317,7 @@ TEST_CASE("lock_or_prepare_batch cross-GPU does not block on concurrent readers"
   auto reader = std::make_optional(batch->to_read_only());
 
   auto fut                               = std::async(std::launch::async, [&]() {
-    return sirius::pipeline::lock_or_prepare_batch(batch, f.gpu1, stream.view());
+    return sirius::pipeline::lock_and_prepare_batch(batch, f.gpu1, stream.view());
   });
   const auto status                      = fut.wait_for(std::chrono::seconds(120));
   const bool completed_while_reader_held = (status == std::future_status::ready);
@@ -354,7 +354,7 @@ TEST_CASE("lock_or_prepare_batch host to GPU keeps move semantics", "[batch_lock
   }
   stream.synchronize();
 
-  auto prepared = sirius::pipeline::lock_or_prepare_batch(batch, f.gpu0, stream.view());
+  auto prepared = sirius::pipeline::lock_and_prepare_batch(batch, f.gpu0, stream.view());
   REQUIRE(prepared.has_value());
 
   // Same batch object, converted in place: identical id, source object now GPU-resident and
@@ -384,7 +384,7 @@ TEST_CASE("concurrent same-GPU upgrades of a shared spilled batch race safely",
   // post-readonly_to_mutable re-dispatch: the exclusive-lock winner converts in place, the
   // loser observes the batch already in the target space and skips the redundant copy.
   auto worker = [&](rmm::cuda_stream_view sv) {
-    return sirius::pipeline::lock_or_prepare_batch(batch, f.gpu0, sv);
+    return sirius::pipeline::lock_and_prepare_batch(batch, f.gpu0, sv);
   };
   auto fut1 = std::async(std::launch::async, worker, stream1.view());
   auto fut2 = std::async(std::launch::async, worker, stream2.view());
@@ -460,7 +460,7 @@ std::shared_ptr<cucascade::data_batch> make_normalized_gpu_list_batch(batch_lock
   }
   stream.synchronize();
   {
-    auto upgraded = sirius::pipeline::lock_or_prepare_batch(batch, f.gpu0, stream);
+    auto upgraded = sirius::pipeline::lock_and_prepare_batch(batch, f.gpu0, stream);
     REQUIRE(upgraded.has_value());
   }
   return batch;
@@ -501,7 +501,7 @@ TEST_CASE("LIST columns survive a cross-GPU clone with INT32 offsets", "[batch_l
   // Cross-GPU clone of the (normalized) GPU-resident source: the peer copy preserves the
   // source's column types exactly, so the clone's LIST offsets stay INT32 with no fixup on
   // the clone path.
-  auto prepared = sirius::pipeline::lock_or_prepare_batch(batch, f.gpu1, stream.view());
+  auto prepared = sirius::pipeline::lock_and_prepare_batch(batch, f.gpu1, stream.view());
   REQUIRE(prepared.has_value());
   REQUIRE(prepared->get_memory_space()->get_id() == f.gpu1->get_id());
   cudf::lists_column_view clone_lcv(sirius::get_cudf_table_view(*prepared).column(0));

@@ -34,6 +34,14 @@
 namespace sirius {
 namespace pipeline {
 
+struct lock_and_prepare_batch_result {
+  // A new batch that may have been created to appropriately prepare the batch.
+  // If set, the ro_lock is a lock on this new batch which may be stored for
+  // future reference.
+  std::optional<std::shared_ptr<cucascade::data_batch>> new_batch;
+  cucascade::read_only_data_batch ro_lock;
+};
+
 /**
  * @brief Lock or prepare a single data batch for processing in the requested memory space.
  *
@@ -64,7 +72,7 @@ namespace pipeline {
  *         or std::nullopt on failure.
  * @throws rmm::out_of_memory  If a GPU memory allocation fails during the conversion or clone.
  */
-inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
+inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
   const std::shared_ptr<cucascade::data_batch>& batch,
   const cucascade::memory::memory_space* requested_memory_space,
   rmm::cuda_stream_view stream)
@@ -80,7 +88,7 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
   // space match guarantees the stream and the data live on the same device (important for
   // multi-GPU). The mismatch case below converts via `stream`, which already allocates the new
   // table on it, so no rebind is needed there.
-  if (auto mut = batch->try_to_mutable()) {
+  if (std::optional<cucascade::mutable_data_batch> mut = batch->try_to_mutable()) {
     const auto* current_space = mut->get_memory_space();
     const auto* rebind_target =
       requested_memory_space != nullptr ? requested_memory_space : current_space;
@@ -92,7 +100,7 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
   }
 
   // Acquire a read-only lock
-  auto read_accessor = batch->to_read_only();
+  cucascade::read_only_data_batch read_accessor = batch->to_read_only();
 
   // Determine the target memory space
   const auto* target_space =
@@ -102,7 +110,10 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
   // Memory space matches — return the read-only accessor directly
   if (read_accessor.get_memory_space() != nullptr &&
       read_accessor.get_memory_space()->get_id() == target_space->get_id()) {
-    return std::move(read_accessor);
+    return lock_and_prepare_batch_result{
+      .new_batch = std::nullopt,
+      .ro_lock   = std::move(read_accessor),
+    };
   }
 
   // Memory space mismatch — clone or move depending on where the data lives.
@@ -119,64 +130,99 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
         // INT64 offsets promotion of host->GPU reconstruction, and a GPU->GPU copy preserves the
         // source's column types (a GPU-resident source is already normalized — the same-space
         // fast path above depends on that invariant).
+        // TODO(dhruv9vats): thread operator batch telemetry to cloned batch
         auto clone = read_accessor.clone_to<cucascade::gpu_table_representation>(
-          registry, sirius::get_next_batch_id(), target_space, stream);
-        return clone->to_read_only();
+          registry, get_next_batch_id(), target_space, stream);
+        return lock_and_prepare_batch_result{
+          .new_batch = clone,
+          .ro_lock   = clone->to_read_only(),
+        };
+        // read_accessor dropped.
       }
-      // HOST/DISK -> GPU upgrade/readback: convert in place (move), freeing the spilled copy.
-      auto mut_accessor = cucascade::data_batch::readonly_to_mutable(std::move(read_accessor));
-      // readonly_to_mutable is not atomic (shared released, then exclusive acquired): a
-      // concurrent consumer of a shared spilled batch may have converted it in the gap.
-      // Re-dispatch on the state observed under the exclusive lock:
-      const auto* current_space = mut_accessor.get_memory_space();
-      if (current_space != nullptr && current_space->get_id() == target_space->get_id()) {
-        // Already in the target space — skip the wasteful same-space deep copy.
-        return cucascade::data_batch::mutable_to_readonly(std::move(mut_accessor));
-      }
-      if (mut_accessor.get_current_tier() == cucascade::memory::Tier::GPU) {
-        // Upgraded to a DIFFERENT GPU in the gap: never move a GPU-resident batch cross-device
-        // (that would steal it from the device that just materialized it) — clone instead. The
-        // clone happens under the exclusive lock we already hold; pinning the state here avoids
-        // yet another non-atomic lock transition.
-        auto clone = mut_accessor.clone_to<cucascade::gpu_table_representation>(
-          registry, sirius::get_next_batch_id(), target_space, stream);
-        return clone->to_read_only();
-      }
-      mut_accessor.convert_to<cucascade::gpu_table_representation>(registry, target_space, stream);
-      telemetry::batch_telemetry_registry::instance().on_tier_change(
-        mut_accessor.get_batch_id(),
-        target_space->get_tier(),
-        target_space->get_id().device_id,
-        mut_accessor.get_data()->get_size_in_bytes());
-      return cucascade::data_batch::mutable_to_readonly(std::move(mut_accessor));
-    }
-    case cucascade::memory::Tier::HOST: {
-      auto mut_accessor = cucascade::data_batch::readonly_to_mutable(std::move(read_accessor));
-      // Same non-atomic-upgrade race as the GPU arm: skip if already in the target space.
-      if (mut_accessor.get_memory_space() == nullptr ||
-          mut_accessor.get_memory_space()->get_id() != target_space->get_id()) {
-        auto host_reservation =
-          const_cast<cucascade::memory::memory_space*>(target_space)
-            ->make_reservation_or_null(mut_accessor.get_data()->get_size_in_bytes());
-        if (host_reservation != nullptr) {
-          mut_accessor.convert_to<cucascade::host_data_representation>(
-            registry, *host_reservation, stream);
-        } else {
-          SIRIUS_LOG_WARN(
-            "lock_or_prepare_batch: host reservation failed for batch {} ({} bytes) — "
-            "proceeding without reservation, converter may OOM",
-            mut_accessor.get_batch_id(),
-            mut_accessor.get_data()->get_size_in_bytes());
-          mut_accessor.convert_to<cucascade::host_data_representation>(
-            registry, target_space, stream);
+
+      // HOST/DISK -> GPU upgrade/readback: convert in place (move), freeing the spilled copy
+      {
+        cucascade::data_batch::to_idle(std::move(read_accessor));  // release the read lock
+        cucascade::mutable_data_batch mut_accessor = batch->to_mutable();
+
+        // this upgrade to mutable is not atomic (shared released, then exclusive acquired): a
+        // concurrent consumer of a shared spilled batch may have converted it in the gap.
+        // Re-dispatch on the state observed under the exclusive lock:
+        const auto* current_space = mut_accessor.get_memory_space();
+        if (current_space != nullptr && current_space->get_id() == target_space->get_id()) {
+          // Already in the target space — skip the wasteful same-space deep copy.
+          cucascade::data_batch::to_idle(
+            std::move(mut_accessor));  // release the exclusive write lock
+          return lock_and_prepare_batch_result{
+            .new_batch = std::nullopt,
+            .ro_lock   = batch->to_read_only(),
+          };
         }
+
+        if (mut_accessor.get_current_tier() == cucascade::memory::Tier::GPU) {
+          // Upgraded to a DIFFERENT GPU in the gap: never move a GPU-resident batch cross-device
+          // (that would steal it from the device that just materialized it) — clone instead. The
+          // clone happens under the exclusive lock we already hold; pinning the state here avoids
+          // yet another non-atomic lock transition.
+          // TODO(dhruv9vats): thread operator batch telemetry to cloned batch
+          auto clone = mut_accessor.clone_to<cucascade::gpu_table_representation>(
+            registry, sirius::get_next_batch_id(), target_space, stream);
+          return lock_and_prepare_batch_result{
+            .new_batch = clone,
+            .ro_lock   = clone->to_read_only(),
+          };
+        }
+        mut_accessor.convert_to<cucascade::gpu_table_representation>(
+          registry, target_space, stream);
         telemetry::batch_telemetry_registry::instance().on_tier_change(
           mut_accessor.get_batch_id(),
           target_space->get_tier(),
           target_space->get_id().device_id,
           mut_accessor.get_data()->get_size_in_bytes());
+
+        // exclusive mutable access dropped.
       }
-      return cucascade::data_batch::mutable_to_readonly(std::move(mut_accessor));
+
+      return lock_and_prepare_batch_result{
+        .new_batch = std::nullopt,
+        .ro_lock   = batch->to_read_only(),
+      };
+    }
+    case cucascade::memory::Tier::HOST: {
+      {
+        // release the read lock to get mutable access
+        cucascade::data_batch::to_idle(std::move(read_accessor));
+        cucascade::mutable_data_batch mut_accessor = batch->to_mutable();
+        // Same non-atomic-upgrade race as the GPU arm: skip if already in the target space.
+        if (mut_accessor.get_memory_space() == nullptr ||
+            mut_accessor.get_memory_space()->get_id() != target_space->get_id()) {
+          auto host_reservation =
+            const_cast<cucascade::memory::memory_space*>(target_space)
+              ->make_reservation_or_null(mut_accessor.get_data()->get_size_in_bytes());
+          if (host_reservation != nullptr) {
+            mut_accessor.convert_to<cucascade::host_data_representation>(
+              registry, *host_reservation, stream);
+          } else {
+            SIRIUS_LOG_WARN(
+              "lock_or_prepare_batch: host reservation failed for batch {} ({} bytes) — "
+              "proceeding without reservation, converter may OOM",
+              mut_accessor.get_batch_id(),
+              mut_accessor.get_data()->get_size_in_bytes());
+            mut_accessor.convert_to<cucascade::host_data_representation>(
+              registry, target_space, stream);
+          }
+          telemetry::batch_telemetry_registry::instance().on_tier_change(
+            mut_accessor.get_batch_id(),
+            target_space->get_tier(),
+            target_space->get_id().device_id,
+            mut_accessor.get_data()->get_size_in_bytes());
+        }
+        // exclusive mutable access dropped.
+      }
+      return lock_and_prepare_batch_result{
+        .new_batch = std::nullopt,
+        .ro_lock   = batch->to_read_only(),
+      };
     }
     default:
       SIRIUS_LOG_ERROR("lock_or_prepare_batch: unsupported target tier for batch {}",

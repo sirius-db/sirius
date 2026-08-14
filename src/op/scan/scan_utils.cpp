@@ -26,6 +26,7 @@
 #include <op/scan/scan_utils.hpp>
 
 // standard library
+#include <algorithm>
 #include <format>
 #include <stdexcept>
 #include <utility>
@@ -54,6 +55,11 @@ std::vector<std::optional<std::size_t>> build_batch_column_map(
   for (std::size_t batch_pos = 0; batch_pos < sorted.size(); batch_pos++) {
     if (sorted[batch_pos] < column_ids_count) { map[sorted[batch_pos]] = batch_pos; }
   }
+  assert(std::ranges::adjacent_find(sorted) == sorted.end() &&
+         "projection_ids must contain no duplicates");
+  assert((sorted.empty() || sorted.back() < column_ids_count) &&
+         "projection_ids values must be < column_ids_count");
+
   return map;
 }
 
