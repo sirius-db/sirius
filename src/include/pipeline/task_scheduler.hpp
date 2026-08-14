@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "exec/query_stage_manager.hpp"
 #include "exec/channel.hpp"
 #include "exec/config.hpp"
 #include "exec/multi_index_priority_queue.hpp"
@@ -121,6 +122,12 @@ class task_scheduler {
    * @param task_creator Reference to the task creator
    */
   void set_task_creator(sirius::creator::task_creator& task_creator);
+
+  /// Attach the query-stage observer.  Optional: null means nothing observes.
+  void set_query_stage_manager(sirius::exec::query_stage_manager* manager) noexcept
+  {
+    _query_stage_manager = manager;
+  }
 
   /**
    * @brief Get a pointer to the pipeline-level task queue.
@@ -244,6 +251,8 @@ class task_scheduler {
   std::atomic<size_t> _no_pref_rr_counter{0};
 
   sirius::creator::task_creator* _task_creator{nullptr};
+  /// Optional observer of query stage transitions; null when unobserved.
+  sirius::exec::query_stage_manager* _query_stage_manager{nullptr};
   std::unique_ptr<completion_handler> _completion_handler;
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;

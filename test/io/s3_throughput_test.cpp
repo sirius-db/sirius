@@ -14,34 +14,34 @@
  * limitations under the License.
  */
 
-// s3_throughput_test — raw read throughput from S3 through sirius_datasource.
+// s3_throughput_test — raw S3 read throughput via the Sirius REST reactor.
 //
-// No parquet decoding: a hybrid_scan_reader is used only to learn WHICH bytes a
-// real scan would read (every column chunk of every row group), and then those
-// byte ranges are pulled into pinned host memory as fast as the REST reactor
-// manages.  What is measured is the object store, the reactor and the link.
+// For each selected file the benchmark picks random non-overlapping aligned
+// segments of --chunk-size to satisfy the --per-file read budget. Each segment
+// becomes exactly one GET (rest.max_n_chunks is forced to 1, no fusing). All
+// reads are issued as individual host_read_async_io calls from the main thread;
+// each future has an inline callback that counts down a latch, so no extra
+// thread pool is required.
 //
-//   ./s3_throughput_test --bucket s3://bucket/prefix --n-files 12 --repeat 1 \
-//       --n_threads 2 --max_segment 32 --max_nconnection 128 --chunk_size 1 \
-//       --mode [grouped|chunked] --config sirius.yml
-//
-// Modes:
-//   grouped   one vectored read per file: every segment handed to
-//             host_read_ranges_async_io in a single dispatch, which is what
-//             lets the reactor fuse file-adjacent segments into scatter GETs.
-//   chunked   one host_read_async per segment, so each is its own request.
-//
-// The two differ only in how the SAME segments are submitted, so the delta is
-// the value of batching at the reactor boundary.
+//   ./s3_throughput_test \
+//       --bucket       s3://bucket/prefix   \
+//       --n-files      4                    \
+//       --per-file     1                    \  # GB per file
+//       --chunk-size   1                    \  # MiB per GET
+//       --max-connection 128                \
+//       --n-reactors   1                    \
+//       --repeat       3                    \
+//       --config       sirius_s3.yml
 
 #include "s3_bench_common.hpp"
 
-#include "exec/scoped_dispatcher.hpp"
+#include "exec/semi_future.hpp"
 #include "io/types.hpp"
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -49,7 +49,8 @@
 #include <iostream>
 #include <latch>
 #include <memory>
-#include <span>
+#include <numeric>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -58,29 +59,19 @@ namespace {
 
 using namespace sirius::bench;
 
-enum class read_mode { grouped, chunked };
-
-read_mode parse_mode(std::string const& s)
-{
-  if (s == "grouped") { return read_mode::grouped; }
-  if (s == "chunked") { return read_mode::chunked; }
-  throw std::runtime_error("--mode must be grouped or chunked, got: " + s);
-}
-
 // ---------------------------------------------------------------------------
-// staging
+// pinned staging
 // ---------------------------------------------------------------------------
 
-/// One pinned allocation covering every chunk of every file, carved into
-/// chunk_size blocks.  Allocated once and reused across iterations so the
-/// measurement is the read, not the allocator.
+/// One pinned allocation carved into chunk_size blocks — one block per segment.
+/// Allocated once before the timed loop and reused across iterations.
 class pinned_staging {
  public:
   pinned_staging(std::size_t n_chunks, std::size_t chunk_bytes) : _chunk_bytes(chunk_bytes)
   {
     constexpr std::size_t blocks_per_slab = 128;
-    const std::size_t slabs     = (n_chunks + blocks_per_slab - 1) / blocks_per_slab;
-    const std::size_t capacity  = slabs * blocks_per_slab * chunk_bytes;
+    const std::size_t slabs    = (n_chunks + blocks_per_slab - 1) / blocks_per_slab;
+    const std::size_t capacity = slabs * blocks_per_slab * chunk_bytes;
 
     _upstream =
       std::make_unique<cucascade::memory::numa_region_pinned_host_memory_resource>(0, true);
@@ -110,105 +101,132 @@ class pinned_staging {
   std::vector<std::byte*> _blocks;
 };
 
-/// A file's worth of IO: its io_object plus every segment to read, each already
-/// pointing at its own pinned destination.
-struct io_work {
-  const sirius::io::io_object* obj{nullptr};
+// ---------------------------------------------------------------------------
+// segment selection
+// ---------------------------------------------------------------------------
+
+/// Pick @p n_chunks random non-overlapping chunk_bytes-aligned offsets from a
+/// file of @p file_size bytes. Returns sorted offsets (better IO locality).
+std::vector<std::size_t> pick_offsets(std::size_t file_size,
+                                      std::size_t chunk_bytes,
+                                      std::size_t n_chunks,
+                                      std::mt19937& rng)
+{
+  const std::size_t available = file_size / chunk_bytes;
+  n_chunks                    = std::min(n_chunks, available);
+  if (n_chunks == 0) { return {}; }
+
+  std::vector<std::size_t> indices(available);
+  std::iota(indices.begin(), indices.end(), 0);
+  std::shuffle(indices.begin(), indices.end(), rng);
+  indices.resize(n_chunks);
+  std::sort(indices.begin(), indices.end());
+
+  std::vector<std::size_t> offsets;
+  offsets.reserve(n_chunks);
+  for (auto idx : indices) {
+    offsets.push_back(idx * chunk_bytes);
+  }
+  return offsets;
+}
+
+// ---------------------------------------------------------------------------
+// work list
+// ---------------------------------------------------------------------------
+
+struct file_work {
+  std::unique_ptr<sirius::io::sirius_datasource> ds;
   std::vector<sirius::io::io_object_segment> segments;
-  std::size_t bytes{0};
+  std::size_t total_bytes{0};
 };
 
-/// Split each column-chunk range into chunk_size pieces and bind every piece to
-/// a pinned block.  Done once, outside the timed region.
-std::vector<io_work> prepare_for_benchmark(std::vector<file_ranges> const& files,
-                                           pinned_staging& staging)
+/// Open datasources and assign pinned staging blocks to each segment.
+/// Fixed RNG seed so repeated runs read the same byte ranges.
+std::vector<file_work> prepare_work(engine& eng,
+                                    std::vector<s3_file> const& files,
+                                    std::size_t per_file_bytes,
+                                    pinned_staging& staging)
 {
-  std::vector<io_work> work;
+  std::mt19937 rng{42};
+  const std::size_t chunk_bytes = staging.chunk_bytes();
+
+  std::vector<file_work> work;
   work.reserve(files.size());
 
   std::size_t next_block = 0;
   for (auto const& f : files) {
-    io_work w;
-    w.obj = &f.ds->get_io_object();
-    for (auto const& r : f.ranges) {
-      const auto offset = static_cast<std::size_t>(r.offset());
-      const auto size   = static_cast<std::size_t>(r.size());
-      for (std::size_t done = 0; done < size; done += staging.chunk_bytes()) {
-        const std::size_t piece = std::min(staging.chunk_bytes(), size - done);
-        w.segments.emplace_back(offset + done, piece, staging.block(next_block++));
-        w.bytes += piece;
-      }
+    file_work w;
+    w.ds = eng.io_ctx().open_datasource(f.path);
+
+    const std::size_t n_chunks = per_file_bytes / chunk_bytes;
+    auto offsets               = pick_offsets(f.size_bytes, chunk_bytes, n_chunks, rng);
+
+    for (auto offset : offsets) {
+      const std::size_t sz = std::min(chunk_bytes, f.size_bytes - offset);
+      w.segments.emplace_back(offset, sz, staging.block(next_block++));
+      w.total_bytes += sz;
     }
     work.push_back(std::move(w));
   }
   return work;
 }
 
-/// Total number of chunk_size pieces the ranges split into.
-std::size_t count_chunks(std::vector<file_ranges> const& files, std::size_t chunk_bytes)
+std::size_t count_segments(std::vector<file_work> const& work)
 {
   std::size_t n = 0;
-  for (auto const& f : files) {
-    for (auto const& r : f.ranges) {
-      const auto size = static_cast<std::size_t>(r.size());
-      n += (size + chunk_bytes - 1) / chunk_bytes;
-    }
-  }
+  for (auto const& w : work) { n += w.segments.size(); }
   return n;
 }
 
 // ---------------------------------------------------------------------------
-// the timed loop
+// timed loop
 // ---------------------------------------------------------------------------
 
-iteration_result run_once(engine& eng, std::vector<io_work>& work, read_mode mode)
+/// Issue every segment as an individual host_read_async_io call, attach an
+/// inline callback to each semi_future that counts down a latch, then wait.
+/// Reads are submitted from the main thread; callbacks fire on reactor threads.
+iteration_result run_once(engine& eng, std::vector<file_work>& work)
 {
-  sirius::exec::scoped_dispatcher disp(eng.pool());
+  const std::size_t n_segs = count_segments(work);
 
   std::atomic<std::size_t> bytes_read{0};
   std::atomic<std::size_t> failures{0};
-  std::latch done{static_cast<std::ptrdiff_t>(work.size())};
+  std::latch done{static_cast<std::ptrdiff_t>(n_segs)};
 
   const auto start = clock_type::now();
 
   for (auto& w : work) {
-    disp.enqueue([&eng, &w, &bytes_read, &failures, &done, mode]() {
-      try {
-        if (mode == read_mode::grouped) {
-          // One dispatch for the whole file: the reactor fuses file-adjacent
-          // segments into scatter GETs up to rest.chunk_size / max_n_chunks.
-          auto fut = eng.io_ctx().host_read_ranges_async_io(*w.obj, w.segments);
-          bytes_read.fetch_add(std::move(fut).get(), std::memory_order_relaxed);
-        } else {
-          // One request per segment.  Issued up front, then joined, so the
-          // difference from `grouped` is batching and not concurrency.
-          std::vector<sirius::exec::semi_future<std::size_t>> futs;
-          futs.reserve(w.segments.size());
-          for (auto const& seg : w.segments) {
-            futs.push_back(eng.io_ctx().host_read_async_io(
-              *w.obj, seg.offset, seg.size, seg.data()));
+    for (auto const& seg : w.segments) {
+      auto fut =
+        eng.io_ctx().host_read_async_io(w.ds->get_io_object(), seg.offset, seg.size, seg.data());
+
+      std::move(fut).install_callback(
+        [&bytes_read, &failures, &done](sirius::exec::try_t<std::size_t>&& t) mutable {
+          if (t.has_exception()) {
+            failures.fetch_add(1, std::memory_order_relaxed);
+            try {
+              std::rethrow_exception(t.exception());
+            } catch (std::exception const& e) {
+              std::cerr << "read failed: " << e.what() << "\n";
+            } catch (...) {
+              std::cerr << "read failed: unknown exception\n";
+            }
+          } else {
+            bytes_read.fetch_add(std::move(t).get(), std::memory_order_relaxed);
           }
-          for (auto& f : futs) {
-            bytes_read.fetch_add(std::move(f).get(), std::memory_order_relaxed);
-          }
-        }
-      } catch (std::exception const& e) {
-        failures.fetch_add(1, std::memory_order_relaxed);
-        std::cerr << "read failed: " << e.what() << "\n";
-      }
-      done.count_down();
-    });
+          done.count_down();
+        });
+    }
   }
 
   done.wait();
-  disp.wait_for_all();
 
   iteration_result r;
   r.duration_ms = ms_since(start);
   r.bytes       = bytes_read.load();
 
   if (failures.load() != 0) {
-    std::cerr << failures.load() << " file(s) failed -- throughput below is not meaningful\n";
+    std::cerr << failures.load() << " segment(s) failed — throughput is not meaningful\n";
   }
   return r;
 }
@@ -218,7 +236,6 @@ iteration_result run_once(engine& eng, std::vector<io_work>& work, read_mode mod
 int main(int argc, char** argv)
 {
   bench_options opts;
-  opts.mode = "grouped";
 
   try {
     arg_parser p{argc, argv};
@@ -226,40 +243,49 @@ int main(int argc, char** argv)
       if (parse_common_arg(p, i, opts)) { continue; }
       throw std::runtime_error(std::string{"unknown flag: "} + argv[i]);
     }
-    if (opts.bucket.empty()) { throw std::runtime_error("--bucket is required"); }
-    const auto mode = parse_mode(opts.mode);
+    if (opts.buckets.empty()) { throw std::runtime_error("--bucket is required"); }
 
     engine eng{opts};
 
-    auto const paths = get_files_from_bucket(eng, opts.bucket, opts.n_files);
-    auto const files = use_hybrid_scan_to_get_column_chunks(eng, paths);
+    const auto files = get_files_from_prefixes(eng, opts.buckets, opts.n_files);
 
-    const std::size_t n_chunks = count_chunks(files, opts.chunk_bytes());
-    std::size_t total_bytes    = 0;
+    const std::size_t per_file_bytes = opts.per_file_bytes();
+    const std::size_t chunk_bytes    = opts.chunk_bytes();
+
+    std::size_t total_chunks = 0;
     for (auto const& f : files) {
-      total_bytes += f.total_bytes();
+      total_chunks += std::min(per_file_bytes / chunk_bytes, f.size_bytes / chunk_bytes);
+    }
+    if (total_chunks == 0) {
+      throw std::runtime_error(
+        "no chunks to read: files are smaller than --chunk-size or --per-file is 0");
     }
 
-    std::cout << "s3_throughput_test\n"
-              << "  bucket          : " << opts.bucket << "\n"
-              << "  files           : " << files.size() << "\n"
-              << "  mode            : " << opts.mode << "\n"
-              << "  threads         : " << opts.n_threads << "\n"
-              << "  max_segment     : " << opts.max_segment << " (rest.max_n_chunks)\n"
-              << "  max_nconnection : " << opts.max_nconnection << " (rest.max_connections)\n"
-              << "  chunk_size      : " << opts.chunk_size_mib << " MiB\n"
-              << "  column chunks   : " << n_chunks << " pieces, "
-              << static_cast<double>(total_bytes) / 1e9 << " GB\n\n";
+    pinned_staging staging{total_chunks, chunk_bytes};
+    auto work = prepare_work(eng, files, per_file_bytes, staging);
 
-    pinned_staging staging{n_chunks, opts.chunk_bytes()};
-    auto work = prepare_for_benchmark(files, staging);
+    std::size_t total_bytes = 0;
+    for (auto const& w : work) { total_bytes += w.total_bytes; }
+
+    std::cout << "s3_throughput_test\n";
+    for (std::size_t i = 0; i < opts.buckets.size(); ++i) {
+      std::cout << "  bucket[" << i << "]     : " << opts.buckets[i] << "\n";
+    }
+    std::cout
+              << "  files         : " << files.size() << "\n"
+              << "  per-file      : " << opts.per_file_gib << " GB\n"
+              << "  chunk-size    : " << opts.chunk_size_mib << " MiB (1 chunk = 1 GET)\n"
+              << "  max-connection: " << opts.max_nconnection << "\n"
+              << "  n-reactors    : " << opts.n_reactors << "\n"
+              << "  total chunks  : " << count_segments(work) << "\n"
+              << "  total data    : " << static_cast<double>(total_bytes) / 1e9 << " GB\n\n";
 
     std::vector<iteration_result> runs;
     runs.reserve(opts.repeat);
     for (std::size_t r = 0; r < opts.repeat; ++r) {
-      runs.push_back(run_once(eng, work, mode));
+      runs.push_back(run_once(eng, work));
     }
-    report(opts.mode, runs);
+    report("s3", runs);
     return 0;
 
   } catch (std::exception const& e) {

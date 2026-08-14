@@ -30,6 +30,7 @@
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
 #include "scan_manager/mvcc_mask_job.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
+#include "exec/query_stage_manager.hpp"
 #include "scan_manager/readahead_scan_manager.hpp"
 #include "scan_manager/split_provider.hpp"
 
@@ -586,6 +587,20 @@ class sirius_scan_manager {
   ///        was configured with @c backend=kvikio.
   [[nodiscard]] sirius::io::ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
 
+  /// \brief Concatenated @c perf_report_and_reset() of every live ioctx (the
+  ///        default one plus any path-routed backend), for the per-query
+  ///        observability dump.  Backends with no counters contribute nothing,
+  ///        so this is empty unless something instrumented actually ran.
+  [[nodiscard]] std::string io_perf_report_and_reset() noexcept;
+
+  /// Where the readahead subscribes for execution events.  Set once at startup;
+  /// the readahead itself is per-query, so it registers and unregisters around
+  /// its own lifetime rather than this one.
+  void set_query_stage_manager(sirius::exec::query_stage_manager* manager) noexcept
+  {
+    _query_stage_manager = manager;
+  }
+
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
     std::string_view path, sirius::io::open_hint hint = sirius::io::open_hint::generic);
 
@@ -608,6 +623,22 @@ class sirius_scan_manager {
   [[nodiscard]] std::size_t s3_list_max_matches(std::string const& s3_uri);
 
  private:
+  /// Fetch and park every scan's file metadata before any scan task can run.
+  ///
+  /// Metadata reads and data reads share one request queue per backend. Left to
+  /// itself the manager parses one pipeline's metadata while that pipeline's
+  /// scans are already issuing data GETs, so the next pipeline's footer reads
+  /// land behind a queue of them and cannot complete until the first pipeline's
+  /// scans do -- the pipelines serialise on the queue rather than overlapping.
+  ///
+  /// Doing every file's footer first, concurrently, costs one small read per
+  /// file at a point when the queue is empty, and leaves split production with
+  /// no IO to do at all. Files already in the metadata store are skipped, so a
+  /// warm re-bind pays nothing. Parquet only: a duckdb database is one file and
+  /// has no per-file footer to gather.
+  void prepare_scans_for_processing(
+    std::span<op::scan::sirius_gpu_scan_operator* const> scans) noexcept;
+
   /// \brief Run providers sequentially: start each, wait on its future, advance.
   void start_metadata_processing();
 
@@ -699,6 +730,8 @@ class sirius_scan_manager {
   /// Per-query readahead bookkeeping, seeded from the query's prefetching
   /// order and shared with every scan split this query emits.
   std::shared_ptr<readahead_scan_manager> _readahead;
+  /// Non-owning; outlives every readahead registered with it.
+  sirius::exec::query_stage_manager* _query_stage_manager{nullptr};
   io::io_context_registry _ioctx_registry;
 };
 

@@ -22,6 +22,7 @@
 #include "io/uri_parser.hpp"
 #include "log/logging.hpp"
 
+#include <ctrack.hpp>
 #include <rmm/cuda_device.hpp>
 
 #include <sys/epoll.h>
@@ -67,6 +68,10 @@ void atomic_max_relaxed(std::atomic<std::uint64_t>& a, std::uint64_t v) noexcept
 /// header can be detected after the fact.
 size_t write_to_sink(char* ptr, size_t size, size_t nmemb, void* userdata)
 {
+  // Deliberately not ctracked: curl invokes this once per socket read, so at
+  // scan fan-out it runs tens of millions of times per query and any probe here
+  // costs more than it measures.  The enclosing curl_multi_socket_action is
+  // ctracked instead.
   auto* sink         = static_cast<buf_sink*>(userdata);
   size_t const bytes = size * nmemb;
   sink->total_received += bytes;
@@ -1060,11 +1065,75 @@ rest_perf_snapshot rest_reactor::perf_snapshot() const noexcept
     _perf.blocking_host_get_wall_ns_total.load(std::memory_order_relaxed);
   s.blocking_host_get_wall_ns_max =
     _perf.blocking_host_get_wall_ns_max.load(std::memory_order_relaxed);
+  s.submit_slot_starved_total = _perf.submit_slot_starved_total.load(std::memory_order_relaxed);
+  s.submit_work_starved_total = _perf.submit_work_starved_total.load(std::memory_order_relaxed);
+  s.submit_added_total        = _perf.submit_added_total.load(std::memory_order_relaxed);
+  s.inflight_sum              = _perf.inflight_sum.load(std::memory_order_relaxed);
+  s.inflight_samples          = _perf.inflight_samples.load(std::memory_order_relaxed);
+  s.inflight_max              = _perf.inflight_max.load(std::memory_order_relaxed);
+  s.loop_idle_ns_total        = _perf.loop_idle_ns_total.load(std::memory_order_relaxed);
+  s.loop_wall_ns_total        = _perf.loop_wall_ns_total.load(std::memory_order_relaxed);
+  s.conn_opened_total         = _perf.conn_opened_total.load(std::memory_order_relaxed);
+  s.retry_slowdown_total      = _perf.retry_slowdown_total.load(std::memory_order_relaxed);
+  s.retry_server_err_total    = _perf.retry_server_err_total.load(std::memory_order_relaxed);
+  s.retry_transport_total     = _perf.retry_transport_total.load(std::memory_order_relaxed);
+  s.retry_short_read_total    = _perf.retry_short_read_total.load(std::memory_order_relaxed);
+  s.retry_auth_total          = _perf.retry_auth_total.load(std::memory_order_relaxed);
+  s.retry_delay_ns_total      = _perf.retry_delay_ns_total.load(std::memory_order_relaxed);
+  s.curl_dns_ns_total         = _perf.curl_dns_ns_total.load(std::memory_order_relaxed);
+  s.curl_connect_ns_total     = _perf.curl_connect_ns_total.load(std::memory_order_relaxed);
+  s.curl_tls_ns_total         = _perf.curl_tls_ns_total.load(std::memory_order_relaxed);
+  s.curl_ttfb_ns_total        = _perf.curl_ttfb_ns_total.load(std::memory_order_relaxed);
+  s.curl_total_ns_total       = _perf.curl_total_ns_total.load(std::memory_order_relaxed);
+  s.curl_timed_count          = _perf.curl_timed_count.load(std::memory_order_relaxed);
   return s;
+}
+
+void rest_reactor::reset_perf() noexcept
+{
+  auto z = [](std::atomic<std::uint64_t>& a) { a.store(0, std::memory_order_relaxed); };
+  z(_perf.chunk_get_ns_total);
+  z(_perf.chunk_get_count);
+  z(_perf.chunk_get_ns_max);
+  z(_perf.queue_wait_ns_total);
+  z(_perf.queue_wait_count);
+  z(_perf.ttfb_ns);
+  z(_perf.h2d_observed_ns_total);
+  z(_perf.h2d_observed_count);
+  z(_perf.h2d_observed_ns_max);
+  z(_perf.retries_total);
+  z(_perf.terminal_failures_total);
+  z(_perf.device_stream_sync_total);
+  z(_perf.payload_bytes_read_total);
+  z(_perf.blocking_host_get_count);
+  z(_perf.blocking_host_get_wall_ns_total);
+  z(_perf.blocking_host_get_wall_ns_max);
+  z(_perf.submit_slot_starved_total);
+  z(_perf.submit_work_starved_total);
+  z(_perf.submit_added_total);
+  z(_perf.inflight_sum);
+  z(_perf.inflight_samples);
+  z(_perf.inflight_max);
+  z(_perf.loop_idle_ns_total);
+  z(_perf.loop_wall_ns_total);
+  z(_perf.conn_opened_total);
+  z(_perf.retry_slowdown_total);
+  z(_perf.retry_server_err_total);
+  z(_perf.retry_transport_total);
+  z(_perf.retry_short_read_total);
+  z(_perf.retry_auth_total);
+  z(_perf.retry_delay_ns_total);
+  z(_perf.curl_dns_ns_total);
+  z(_perf.curl_connect_ns_total);
+  z(_perf.curl_tls_ns_total);
+  z(_perf.curl_ttfb_ns_total);
+  z(_perf.curl_total_ns_total);
+  z(_perf.curl_timed_count);
 }
 
 head_object_result rest_reactor::head_object(std::string_view bucket, std::string_view key)
 {
+  CTRACK_NAME("rest::head_object(blocking)");
   object_ref const obj{std::string(bucket), std::string(key)};
   std::string last_error;
   for (std::size_t attempt = 0; attempt < _config.max_retry_attempts; ++attempt) {
@@ -1134,6 +1203,7 @@ std::string rest_reactor::list_page(std::string_view bucket,
                                     std::string_view prefix,
                                     std::string_view canonical_query)
 {
+  CTRACK_NAME("rest::list_page(blocking)");
   std::string const bucket_s{bucket};
   std::string const prefix_s{prefix};
   std::string last_error;
@@ -1194,6 +1264,10 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
                                                std::string_view key,
                                                std::size_t n)
 {
+  // Bind-time, blocking, and off the reactor's pooled connections: each call
+  // opens a fresh TCP+TLS connection and every file's probe runs on one reactor.
+  // Tracked because a wide scan pays this serially before any data moves.
+  CTRACK_NAME("rest::fetch_footer_suffix(blocking)");
   footer_probe probe;
   if (n == 0) { return probe; }
 
@@ -1460,8 +1534,6 @@ void drain_fd(int fd) noexcept
 
 void rest_reactor::worker_loop(const std::stop_token& stop_token)
 {
-  constexpr int MAX_EVENTS = 64;
-
   // Wake the loop out of epoll_wait when shutdown is requested.
   std::stop_callback const stop_cb(stop_token, [this] { interrupt(); });
 
@@ -1659,6 +1731,10 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       // and reuses the current step without inflating it.
       auto const delay = compute_backoff(req->attempt, retry_after, _config);
       _perf.retries_total.fetch_add(1, std::memory_order_relaxed);
+      _perf.retry_delay_ns_total.fetch_add(
+        static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(delay).count()),
+        std::memory_order_relaxed);
       SIRIUS_LOG_WARN("rest_reactor: retrying {}/{} after {} (attempt {}/{})",
                       req->object.bucket,
                       req->object.key,
@@ -1672,9 +1748,17 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     };
 
     auto setup_easy = [&](io_slot& s) {
+      CTRACK_NAME("rest::setup_easy");
       CURL* const h = s.easy.get();
-      auto authd =
-        _ctx->authorizer()->authorize(s.req->object, request_method::GET, presign_ttl(_config));
+      // SigV4 presign: 2x SHA256 + 5x HMAC-SHA256 per attempt, on this worker
+      // thread.  Tracked separately because it is pure CPU inside the event
+      // loop — if it shows up, every reactor is signing instead of polling.
+      authorized_request authd;
+      {
+        CTRACK_NAME("rest::presign");
+        authd =
+          _ctx->authorizer()->authorize(s.req->object, request_method::GET, presign_ttl(_config));
+      }
       s.url           = std::move(authd.url);
       s.sink.buffers  = std::span<iovec>(s.req->chunk.buffers);
       s.sink.capacity = s.req->chunk.size;
@@ -1691,12 +1775,29 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
     };
 
     auto submit = [&]() {
+      CTRACK_NAME("rest::submit");
+      // Sample the multi handle's occupancy once per pass, before we top it up:
+      // the mean of this series is the connection concurrency the link actually
+      // sees, which is what "are we driving S3 hard enough?" reduces to.
+      {
+        auto const now = static_cast<std::uint64_t>(inflight);
+        _perf.inflight_sum.fetch_add(now, std::memory_order_relaxed);
+        _perf.inflight_samples.fetch_add(1, std::memory_order_relaxed);
+        auto prev = _perf.inflight_max.load(std::memory_order_relaxed);
+        while (now > prev && !_perf.inflight_max.compare_exchange_weak(
+                               prev, now, std::memory_order_relaxed)) {}
+      }
       // Acquire a slot (and thus a bounce buffer) up front; an invalid token
       // means all slots are busy.  A token taken for a skipped/empty dequeue is
       // released by its RAII destructor at continue/break.
       while (true) {
         slot_pool::token tok = pool.try_acquire_token();
-        if (!tok) { break; }
+        if (!tok) {
+          // Every connection is busy: the reactor is saturated and the queue
+          // (if non-empty) is waiting on S3, not on us.
+          _perf.submit_slot_starved_total.fetch_add(1, std::memory_order_relaxed);
+          break;
+        }
 
         // Submission priority: due retries (ready) ahead of fresh inbound work
         // so a backed-off request is not starved by new ones.
@@ -1705,6 +1806,8 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
           dr = std::move(ready.front());
           ready.pop_front();
         } else if (!_requests.try_dequeue(dr)) {
+          // Slots to spare but nothing to run: the producer is the bottleneck.
+          _perf.submit_work_starved_total.fetch_add(1, std::memory_order_relaxed);
           break;
         }
         if (!dr) { continue; }
@@ -1755,6 +1858,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
         setup_easy(s);
         curl_multi_add_handle(multi.get(), s.easy.get());
         ++inflight;
+        _perf.submit_added_total.fetch_add(1, std::memory_order_relaxed);
       }
     };
 
@@ -1877,6 +1981,20 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       // with a fresh signature a bounded number of times before giving up.
       bool const auth_retriable = rc == CURLE_OK && status == 403;
       if (retriable || auth_retriable) {
+        // Attribute the cause before scheduling: "throttled by S3" and "the
+        // link dropped a connection" call for opposite reactions, and the
+        // aggregate retries_total cannot tell them apart.
+        if (short_read) {
+          _perf.retry_short_read_total.fetch_add(1, std::memory_order_relaxed);
+        } else if (rc != CURLE_OK) {
+          _perf.retry_transport_total.fetch_add(1, std::memory_order_relaxed);
+        } else if (status == 429 || status == 503) {
+          _perf.retry_slowdown_total.fetch_add(1, std::memory_order_relaxed);
+        } else if (auth_retriable && !retriable) {
+          _perf.retry_auth_total.fetch_add(1, std::memory_order_relaxed);
+        } else {
+          _perf.retry_server_err_total.fetch_add(1, std::memory_order_relaxed);
+        }
         std::string const reason =
           rc != CURLE_OK ? std::string(curl_easy_strerror(rc))
                          : (short_read ? "short read" : "HTTP " + std::to_string(status));
@@ -1900,10 +2018,44 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       int in_queue = 0;
       while ((msg = curl_multi_info_read(multi.get(), &in_queue)) != nullptr) {
         if (msg->msg != CURLMSG_DONE) { continue; }
+        CTRACK_NAME("rest::completion");
         CURL* const h     = msg->easy_handle;
         CURLcode const rc = msg->data.result;
         long status       = 0;
         curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);
+        // Connection churn: >0 means this transfer could not reuse a pooled
+        // connection and paid a fresh TCP (+TLS) handshake.  Always on — it is
+        // one getinfo and it is the difference between "S3 is slow" and "we
+        // keep reconnecting".
+        {
+          long num_connects = 0;
+          if (curl_easy_getinfo(h, CURLINFO_NUM_CONNECTS, &num_connects) == CURLE_OK &&
+              num_connects > 0) {
+            _perf.conn_opened_total.fetch_add(static_cast<std::uint64_t>(num_connects),
+                                              std::memory_order_relaxed);
+          }
+        }
+        if (_config.perf_instrumentation) {
+          // libcurl's phase timings are cumulative from transfer start, so the
+          // per-phase cost is each successive difference.
+          curl_off_t dns = 0, conn = 0, tls = 0, start = 0, total = 0;
+          curl_easy_getinfo(h, CURLINFO_NAMELOOKUP_TIME_T, &dns);
+          curl_easy_getinfo(h, CURLINFO_CONNECT_TIME_T, &conn);
+          curl_easy_getinfo(h, CURLINFO_APPCONNECT_TIME_T, &tls);
+          curl_easy_getinfo(h, CURLINFO_STARTTRANSFER_TIME_T, &start);
+          curl_easy_getinfo(h, CURLINFO_TOTAL_TIME_T, &total);
+          auto const us_to_ns = [](curl_off_t v) {
+            return v > 0 ? static_cast<std::uint64_t>(v) * 1000U : std::uint64_t{0};
+          };
+          _perf.curl_dns_ns_total.fetch_add(us_to_ns(dns), std::memory_order_relaxed);
+          _perf.curl_connect_ns_total.fetch_add(us_to_ns(conn > dns ? conn - dns : 0),
+                                                std::memory_order_relaxed);
+          _perf.curl_tls_ns_total.fetch_add(us_to_ns(tls > conn ? tls - conn : 0),
+                                            std::memory_order_relaxed);
+          _perf.curl_ttfb_ns_total.fetch_add(us_to_ns(start), std::memory_order_relaxed);
+          _perf.curl_total_ns_total.fetch_add(us_to_ns(total), std::memory_order_relaxed);
+          _perf.curl_timed_count.fetch_add(1, std::memory_order_relaxed);
+        }
         // Recover the slot index stashed in CURLOPT_PRIVATE at pool creation.
         char* priv = nullptr;
         curl_easy_getinfo(h, CURLINFO_PRIVATE, &priv);
@@ -1917,13 +2069,27 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       }
     };
 
-    std::array<epoll_event, MAX_EVENTS> events{};
+    std::vector<epoll_event> events{};
+    events.resize(_config.max_connections);
     submit();  // kickstart anything already queued
+    // Duty-cycle accounting: charge each loop iteration's wall time to "idle" or
+    // "busy" by whether anything was on the wire when the iteration began.  One
+    // clock read per iteration, and epoll_wait is the only blocking point, so
+    // this attributes the whole loop without sampling error worth caring about.
+    auto loop_mark     = std::chrono::steady_clock::now();
+    bool span_was_idle = inflight == 0;
     while (!stop_token.stop_requested()) {
       // Block indefinitely when idle; while H2D copies are outstanding, poll on
       // a short timeout so completed copies release their bounce slots promptly.
       int const timeout_ms = copying.empty() ? -1 : 1;
-      int const n          = ::epoll_wait(epoll_fd.get(), events.data(), MAX_EVENTS, timeout_ms);
+      int n                = 0;
+      {
+        // Time parked here is the reactor having nothing to do.  Compare
+        // against rest::submit + rest::write_to_sink: a reactor that is mostly
+        // in epoll_wait while queries stall is starved of work, not of link.
+        CTRACK_NAME("rest::epoll_wait(idle)");
+        n = ::epoll_wait(epoll_fd.get(), events.data(), _config.max_connections, timeout_ms);
+      }
       if (n < 0) {
         if (errno == EINTR) { continue; }
         throw std::runtime_error(std::string("rest_reactor: epoll_wait failed: ") +
@@ -1935,6 +2101,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
           drain_fd(_wakeup_fd.get());
         } else if (fd == curl_timer_fd.get()) {
           drain_fd(curl_timer_fd.get());
+          CTRACK_NAME("rest::curl_action(timeout)");
           curl_multi_socket_action(multi.get(), CURL_SOCKET_TIMEOUT, 0, &running);
         } else if (fd == retry_timer_fd.get()) {
           drain_fd(retry_timer_fd.get());
@@ -1957,12 +2124,30 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
           if (events[i].events & EPOLLIN) { ev_bitmask |= CURL_CSELECT_IN; }
           if (events[i].events & EPOLLOUT) { ev_bitmask |= CURL_CSELECT_OUT; }
           if (events[i].events & (EPOLLERR | EPOLLHUP)) { ev_bitmask |= CURL_CSELECT_ERR; }
+          // Everything expensive about a transfer happens inside here: TLS
+          // record decryption and the write_to_sink memcpy both run on this
+          // thread, under this call.  It is per socket-event, not per byte, so
+          // the probe is cheap — unlike one inside write_to_sink itself.
+          CTRACK_NAME("rest::curl_action(socket)");
           curl_multi_socket_action(multi.get(), fd, ev_bitmask, &running);
         }
       }
       process_completions();
       poll_copy_completions();
       submit();
+      {
+        // Close the span that began after the previous submit() — that is the
+        // window whose emptiness `span_was_idle` describes — then open the next.
+        auto const now     = std::chrono::steady_clock::now();
+        auto const elapsed = static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(now - loop_mark).count());
+        loop_mark = now;
+        _perf.loop_wall_ns_total.fetch_add(elapsed, std::memory_order_relaxed);
+        if (span_was_idle) {
+          _perf.loop_idle_ns_total.fetch_add(elapsed, std::memory_order_relaxed);
+        }
+        span_was_idle = inflight == 0;
+      }
     }
 
     // Drain on shutdown.  First wait for in-flight H2D copies to finish so the

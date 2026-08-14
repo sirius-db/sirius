@@ -59,8 +59,115 @@ rest_perf_snapshot rest_ioctx::perf_snapshot() const noexcept
     agg.blocking_host_get_wall_ns_total += s.blocking_host_get_wall_ns_total;
     agg.blocking_host_get_wall_ns_max =
       std::max(agg.blocking_host_get_wall_ns_max, s.blocking_host_get_wall_ns_max);
+    agg.submit_slot_starved_total += s.submit_slot_starved_total;
+    agg.submit_work_starved_total += s.submit_work_starved_total;
+    agg.submit_added_total += s.submit_added_total;
+    agg.inflight_sum += s.inflight_sum;
+    agg.inflight_samples += s.inflight_samples;
+    agg.inflight_max = std::max(agg.inflight_max, s.inflight_max);
+    agg.loop_idle_ns_total += s.loop_idle_ns_total;
+    agg.loop_wall_ns_total += s.loop_wall_ns_total;
+    agg.conn_opened_total += s.conn_opened_total;
+    agg.retry_slowdown_total += s.retry_slowdown_total;
+    agg.retry_server_err_total += s.retry_server_err_total;
+    agg.retry_transport_total += s.retry_transport_total;
+    agg.retry_short_read_total += s.retry_short_read_total;
+    agg.retry_auth_total += s.retry_auth_total;
+    agg.retry_delay_ns_total += s.retry_delay_ns_total;
+    agg.curl_dns_ns_total += s.curl_dns_ns_total;
+    agg.curl_connect_ns_total += s.curl_connect_ns_total;
+    agg.curl_tls_ns_total += s.curl_tls_ns_total;
+    agg.curl_ttfb_ns_total += s.curl_ttfb_ns_total;
+    agg.curl_total_ns_total += s.curl_total_ns_total;
+    agg.curl_timed_count += s.curl_timed_count;
   }
   return agg;
+}
+
+std::string rest_ioctx::perf_report_and_reset() noexcept
+{
+  try {
+    auto const s = perf_snapshot();
+    for (auto const& r : _reactors) {
+      r->reset_perf();
+    }
+    if (s.submit_added_total == 0 && s.payload_bytes_read_total == 0) { return {}; }
+
+    auto const mean_ms = [](std::uint64_t ns_total, std::uint64_t count) {
+      return count == 0 ? 0.0 : static_cast<double>(ns_total) / static_cast<double>(count) / 1e6;
+    };
+    double const mib      = static_cast<double>(s.payload_bytes_read_total) / (1024.0 * 1024.0);
+    double const mean_inf = s.inflight_samples == 0
+                              ? 0.0
+                              : static_cast<double>(s.inflight_sum) /
+                                  static_cast<double>(s.inflight_samples);
+    // The two submit()-exit reasons are the saturation verdict: slot-starved
+    // means we filled every connection and are waiting on S3; work-starved
+    // means we had spare connections and nothing to put on them.
+    std::uint64_t const starve_total = s.submit_slot_starved_total + s.submit_work_starved_total;
+    double const slot_starved_pct =
+      starve_total == 0
+        ? 0.0
+        : 100.0 * static_cast<double>(s.submit_slot_starved_total) /
+            static_cast<double>(starve_total);
+
+    std::string out = "=== rest perf (query) ===\n";
+    out += std::format("  payload            : {:.1f} MiB in {} GETs ({:.2f} MiB/GET)\n",
+                       mib,
+                       s.submit_added_total,
+                       s.submit_added_total == 0
+                         ? 0.0
+                         : mib / static_cast<double>(s.submit_added_total));
+    out += std::format("  concurrency        : mean {:.1f} / max {} in-flight GETs\n",
+                       mean_inf,
+                       s.inflight_max);
+    if (s.loop_wall_ns_total != 0) {
+      out += std::format("  reactor duty cycle : {:.1f}% of reactor wall time had nothing on the "
+                         "wire\n",
+                         100.0 * static_cast<double>(s.loop_idle_ns_total) /
+                           static_cast<double>(s.loop_wall_ns_total));
+    }
+    out += std::format("  submit stalls      : slot-starved {} ({:.1f}%), work-starved {}\n",
+                       s.submit_slot_starved_total,
+                       slot_starved_pct,
+                       s.submit_work_starved_total);
+    out += std::format("  connections opened : {}\n", s.conn_opened_total);
+    out += std::format(
+      "  retries            : {} total = slowdown {} / server {} / transport {} / short {} / "
+      "auth {}; backoff {:.1f} ms\n",
+      s.retries_total,
+      s.retry_slowdown_total,
+      s.retry_server_err_total,
+      s.retry_transport_total,
+      s.retry_short_read_total,
+      s.retry_auth_total,
+      static_cast<double>(s.retry_delay_ns_total) / 1e6);
+    out += std::format("  terminal failures  : {}\n", s.terminal_failures_total);
+    if (s.chunk_get_count != 0) {
+      out += std::format("  GET latency        : mean {:.2f} ms, max {:.2f} ms over {} GETs\n",
+                         mean_ms(s.chunk_get_ns_total, s.chunk_get_count),
+                         static_cast<double>(s.chunk_get_ns_max) / 1e6,
+                         s.chunk_get_count);
+    }
+    if (s.queue_wait_count != 0) {
+      out += std::format("  queue wait         : mean {:.2f} ms over {} chunks\n",
+                         mean_ms(s.queue_wait_ns_total, s.queue_wait_count),
+                         s.queue_wait_count);
+    }
+    if (s.curl_timed_count != 0) {
+      out += std::format(
+        "  curl phases (mean) : dns {:.2f} / connect {:.2f} / tls {:.2f} / ttfb {:.2f} / total "
+        "{:.2f} ms\n",
+        mean_ms(s.curl_dns_ns_total, s.curl_timed_count),
+        mean_ms(s.curl_connect_ns_total, s.curl_timed_count),
+        mean_ms(s.curl_tls_ns_total, s.curl_timed_count),
+        mean_ms(s.curl_ttfb_ns_total, s.curl_timed_count),
+        mean_ms(s.curl_total_ns_total, s.curl_timed_count));
+    }
+    return out;
+  } catch (...) {
+    return {};
+  }
 }
 
 void rest_ioctx::list_objects_paged(

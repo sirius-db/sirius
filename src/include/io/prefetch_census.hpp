@@ -25,7 +25,9 @@
 // moment.  A scan therefore lands in exactly one of the read-side buckets.
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -38,11 +40,90 @@ struct prefetch_census {
   std::atomic<std::uint64_t> prefetch_issued{0};    ///< splits the worker issued IO for
   std::atomic<std::uint64_t> skipped_no_ranges{0};  ///< nothing to read (host-backed / cached)
   std::atomic<std::uint64_t> declined_reading{0};   ///< refused: the reader had already started
+  /// Issued before prepare_loop attached buffers: every chunk was still
+  /// empty/queued, so the claim loop found nothing to read and the request was
+  /// retired `ready` having done NO IO.  A reader then sees a "ready" prefetch
+  /// that never fetched anything, and pays for the whole split itself.
+  std::atomic<std::uint64_t> prefetch_unprepared{0};
+
+  /// Prefetch requests with IO currently in flight.  Live gauge, not a total:
+  /// the read side consults it to tell "nothing was prefetched for me" from
+  /// "nothing was prefetched for me WHILE the link was busy with someone else".
+  std::atomic<std::int64_t> inflight_prefetches{0};
+
+  // ---- scan occupancy -----------------------------------------------------
+  // Time-weighted account of how many scans were doing IO at once, against the
+  // budget the backend published.  A scan counts while its prefetch is in
+  // flight, or while it is being read having never been prefetched -- a
+  // prefetched split already in the executor is reading from cache and is doing
+  // no IO, so it does not count.
+  //
+  // A mean well below the budget means the readahead is not saturated, and
+  // reordering which splits it picks cannot help until that is fixed.
+  std::atomic<std::uint64_t> active_weighted_ns{0};  ///< sum of count * duration
+  std::atomic<std::uint64_t> active_total_ns{0};     ///< duration observed
+  std::atomic<std::uint64_t> active_at_max_ns{0};    ///< duration spent at >= budget
+  std::atomic<std::uint64_t> active_budget{0};       ///< the budget in force
+
+  // ---- prefetch order vs execution order ----------------------------------
+  // Splits are ranked in the order the readahead issues their prefetch, and
+  // again in the order the executor first reads them.  If the two agree, every
+  // read finds either a finished prefetch or one already running.  Where they
+  // disagree, a prefetch for a split the executor did not want yet is sitting
+  // in front of the split it did -- the single request queue turns that
+  // disagreement directly into wait.
+  std::atomic<std::uint64_t> order_reads{0};          ///< reads with both ranks known
+  std::atomic<std::uint64_t> order_inversions{0};     ///< read out of prefetch order
+  std::atomic<std::uint64_t> order_displacement{0};   ///< sum |read_rank - prefetch_rank|
+  std::atomic<std::uint64_t> read_before_prefetch{0};  ///< read before its prefetch was issued
+  /// Sum over reads of how many prefetches had been issued after this split's
+  /// own -- how far ahead of the read cursor the readahead was running.
+  std::atomic<std::uint64_t> order_lead{0};
+
+  // ---- ordering failures --------------------------------------------------
+  // The IO stack has one global request queue, so a prefetch issued for a split
+  // the executor is not about to run puts its requests ahead of the split the
+  // executor IS about to run.  These count the three ways that goes wrong; all
+  // of them mean the readahead's order and the executor's order disagreed.
+
+  /// A scan began reading with nothing prefetched for it while OTHER prefetches
+  /// were in flight -- its reads queued behind work for a split nobody wanted yet.
+  std::atomic<std::uint64_t> read_cold_while_prefetching{0};
+  /// A scan waited on its own in-flight prefetch while an already-ready split of
+  /// the same operator was sitting there -- the ready one should have gone first.
+  std::atomic<std::uint64_t> read_loading_while_ready_available{0};
+  /// The worker was asked to prefetch, could not, and still had unprefetched
+  /// splits to work on -- capacity went unused with work available.
+  std::atomic<std::uint64_t> prefetch_declined_with_work{0};
+
+  /// When splits reached the readahead, measured from the census reset at the
+  /// start of the query.  A readahead that reports "nothing to prefetch" is
+  /// either genuinely out of work or waiting on a producer that trickles; the
+  /// spread between the first and last registration is what tells them apart.
+  std::chrono::steady_clock::time_point window_start{std::chrono::steady_clock::now()};
+  std::atomic<std::uint64_t> first_registration_ms{0};
+  std::atomic<std::uint64_t> last_registration_ms{0};
+
+  void note_registration() noexcept
+  {
+    auto const ms = static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                                            window_start)
+        .count());
+    std::uint64_t expected = 0;
+    first_registration_ms.compare_exchange_strong(expected, ms, std::memory_order_relaxed);
+    auto prev = last_registration_ms.load(std::memory_order_relaxed);
+    while (ms > prev &&
+           !last_registration_ms.compare_exchange_weak(prev, ms, std::memory_order_relaxed)) {}
+  }
 
   // ---- read side (one classification per scan, on its first read) ---------
   std::atomic<std::uint64_t> read_no_handle{0};   ///< scan never entered the cache at all
   std::atomic<std::uint64_t> read_ready{0};       ///< prefetch finished before the read: a win
   std::atomic<std::uint64_t> read_waited{0};      ///< prefetch in flight; the read blocked on it
+  /// Prefetch was submitted but had not reached the wire: parked behind other
+  /// splits' requests.  Picked in time, delivered late.
+  std::atomic<std::uint64_t> read_queued_behind{0};
   std::atomic<std::uint64_t> read_not_started{0};  ///< prefetch had not begun; read did its own IO
 
   // ---- why the worker stopped collecting ----------------------------------
@@ -100,10 +181,22 @@ struct prefetch_census {
            "  scans registered          : " + std::to_string(reg) +
            "\n  prefetch issued           : " + std::to_string(issued) +
            "\n  skipped (no ranges)       : " + std::to_string(skipped) +
+           "\n  issued before prepared    : " + std::to_string(prefetch_unprepared.load()) +
+           "\n  -- ordering failures --" +
+           "\n  cold read while prefetching: " + std::to_string(read_cold_while_prefetching.load()) +
+           "\n  waited while ready avail   : " +
+           std::to_string(read_loading_while_ready_available.load()) +
+           "\n  prefetch declined w/ work  : " +
+           std::to_string(prefetch_declined_with_work.load()) +
+           "\n  -- scan occupancy --" + occupancy_line() + order_line() +
+           "\n  splits registered over    : " + std::to_string(first_registration_ms.load()) +
+           " ms .. " + std::to_string(last_registration_ms.load()) + " ms" +
            "\n  declined (already reading): " + std::to_string(decl) +
            "\n  -- at first read --" +
            "\n  prefetched, ready in time : " + std::to_string(ready) +
            "\n  prefetched, had to wait   : " + std::to_string(waited) +
+           "\n  prefetched, queued behind : " +
+           std::to_string(read_queued_behind.load()) +
            "\n  prefetch not started yet  : " + std::to_string(late) +
            "\n  no prefetch handle        : " + std::to_string(nh) +
            "\n  -- why the worker stopped collecting --" +
@@ -116,6 +209,46 @@ struct prefetch_census {
            "\n  scheduler order : " + join(prefetch_order) +
            "\n  issued order    : " + join(issue_order) +
            "\n  first-read order: " + join(read_order) + "\n";
+  }
+
+  /// Mean concurrent scans doing IO, and the share of time spent at the budget.
+  [[nodiscard]] std::string occupancy_line() const
+  {
+    auto const total = active_total_ns.load();
+    auto const budget = active_budget.load();
+    if (total == 0) { return "\n  active scans              : (not observed)"; }
+    double const mean = static_cast<double>(active_weighted_ns.load()) / static_cast<double>(total);
+    double const at_max_pct =
+      100.0 * static_cast<double>(active_at_max_ns.load()) / static_cast<double>(total);
+    char buf[160];
+    std::snprintf(buf,
+                  sizeof(buf),
+                  "\n  active scans              : mean %.2f of budget %llu, at budget %.1f%% of "
+                  "the time",
+                  mean,
+                  static_cast<unsigned long long>(budget),
+                  at_max_pct);
+    return buf;
+  }
+
+  /// How far the order splits were prefetched in drifted from the order they
+  /// were read in.
+  [[nodiscard]] std::string order_line() const
+  {
+    auto const n = order_reads.load();
+    if (n == 0) { return "\n  prefetch vs read order    : (not observed)"; }
+    char buf[200];
+    std::snprintf(buf,
+                  sizeof(buf),
+                  "\n  prefetch vs read order    : %llu/%llu inverted (%.0f%%), mean displacement "
+                  "%.1f, mean lead %.1f, %llu read before prefetch",
+                  static_cast<unsigned long long>(order_inversions.load()),
+                  static_cast<unsigned long long>(n),
+                  100.0 * static_cast<double>(order_inversions.load()) / static_cast<double>(n),
+                  static_cast<double>(order_displacement.load()) / static_cast<double>(n),
+                  static_cast<double>(order_lead.load()) / static_cast<double>(n),
+                  static_cast<unsigned long long>(read_before_prefetch.load()));
+    return buf;
   }
 
   static std::string join(std::vector<std::size_t> const& v)
@@ -133,10 +266,30 @@ struct prefetch_census {
     prefetch_issued   = 0;
     skipped_no_ranges = 0;
     declined_reading  = 0;
-    read_no_handle    = 0;
-    read_ready        = 0;
-    read_waited       = 0;
-    read_not_started  = 0;
+    prefetch_unprepared = 0;
+
+    read_cold_while_prefetching        = 0;
+    read_loading_while_ready_available = 0;
+    prefetch_declined_with_work        = 0;
+    inflight_prefetches                = 0;
+    active_weighted_ns                 = 0;
+    active_total_ns                    = 0;
+    active_at_max_ns                   = 0;
+    active_budget                      = 0;
+    order_reads                        = 0;
+    order_inversions                   = 0;
+    order_displacement                 = 0;
+    read_before_prefetch               = 0;
+    order_lead                         = 0;
+
+    window_start          = std::chrono::steady_clock::now();
+    first_registration_ms = 0;
+    last_registration_ms  = 0;
+    read_no_handle     = 0;
+    read_ready         = 0;
+    read_waited        = 0;
+    read_queued_behind = 0;
+    read_not_started   = 0;
 
     collect_passes        = 0;
     stop_budget_full      = 0;

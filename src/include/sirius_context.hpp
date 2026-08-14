@@ -17,6 +17,7 @@
 #pragma once
 
 #include "creator/task_creator.hpp"
+#include "exec/query_stage_manager.hpp"
 #include "data/data_repository_manager_registry.hpp"
 #include "downgrade/downgrade_executor.hpp"
 #include "memory/resource_ref_utils.hpp"
@@ -656,6 +657,9 @@ class SiriusContext : public ClientContextState {
   std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context_;
   /// One data repository manager per in-flight query, keyed by query_id.
   sirius::data::data_repository_manager_registry data_repository_registry_;
+  /// Observes where a query is in its execution.  Declared before the creator
+  /// and scheduler that report into it so it outlives them on teardown.
+  std::unique_ptr<sirius::exec::query_stage_manager> query_stage_manager_;
   std::unique_ptr<sirius::pipeline::task_scheduler> task_scheduler_;
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;

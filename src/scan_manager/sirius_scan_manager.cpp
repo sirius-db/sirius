@@ -67,6 +67,10 @@
 #include <cstdint>
 #include <iterator>
 #include <memory>
+#include <ctrack.hpp>
+
+#include <latch>
+#include <unordered_set>
 #include <optional>
 #include <stdexcept>
 #include <unordered_map>
@@ -546,11 +550,28 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   _readahead          = std::make_shared<readahead_scan_manager>();
   _readahead->prepare_for_query(query);
 
+  // Subscribe for the query's lifetime; unregistered before the readahead dies.
+  if (_query_stage_manager != nullptr) { _query_stage_manager->add_listener(_readahead.get()); }
+
   // Any cache mode but `none` wants scans ordered ahead of demand.  The budget
   // is the backend's own: a backend publishing zero (kvikIO by default) opts
   // out, and start() then does nothing.
-  if (_config.enable_readahead && _io_ctx != nullptr) {
-    _readahead->start(_io_ctx->n_max_concurrent_scans());
+  //
+  // The budget spans every live backend, not just the default `_io_ctx`: a
+  // path-routed backend serves its own scans (an `s3://` query reads through the
+  // REST ioctx while `_io_ctx` is the local uring one) and one readahead manager
+  // covers them all.  Take the widest, since object-store reads are
+  // latency-bound rather than bandwidth-bound and need the deeper queue to keep
+  // the link busy — clamping them to the local disk's depth starves the link.
+  if (_config.enable_readahead) {
+    std::size_t budget = _io_ctx != nullptr ? _io_ctx->n_max_concurrent_scans() : 0;
+    {
+      std::lock_guard lk{_routed_io_ctxs_mtx};
+      for (auto const& [_, ctx] : _routed_io_ctxs) {
+        if (ctx) { budget = std::max(budget, ctx->n_max_concurrent_scans()); }
+      }
+    }
+    _readahead->start(budget);
   }
 
   std::vector<cached_assignment> cached_assignments;
@@ -688,7 +709,85 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   _pending_mvcc_mask_jobs.clear();
   _pending_insert_delta_jobs.clear();
 
+  prepare_scans_for_processing(_scan_op_order);
+
   start_metadata_processing();
+}
+
+void sirius_scan_manager::prepare_scans_for_processing(
+  std::span<op::scan::sirius_gpu_scan_operator* const> scans) noexcept
+{
+  CTRACK_NAME("warmup::prepare_scans");
+  // Gather every distinct file across every scan, skipping the ones already
+  // parsed.  Distinct matters: two scans of the same table would otherwise each
+  // fetch the same footers.
+  std::vector<std::string> to_warm;
+  std::unordered_set<std::string> seen;
+  for (auto* op : scans) {
+    if (op == nullptr) { continue; }
+    try {
+      for (auto const& path : op->get_ingestible().table_info().file_paths()) {
+        auto key = normalize_path(path);
+        if (!seen.insert(key).second) { continue; }
+        auto io_ctx = ioctx_for_path(key);
+        if (!io_ctx) { continue; }  // no backend: leave it to the normal path
+        if (io_ctx->metadata_store().get_metadata(key) != nullptr) { continue; }
+        to_warm.push_back(std::move(key));
+      }
+    } catch (const std::exception& e) {
+      // Best effort: a scan we cannot enumerate simply warms nothing.
+      SIRIUS_LOG_DEBUG("prepare_scans_for_processing: cannot enumerate a scan's files: {}",
+                       e.what());
+    }
+  }
+  if (to_warm.empty()) { return; }
+
+  // Issued together so the reads overlap each other rather than a pipeline's
+  // data traffic.
+  CTRACK_NAME("warmup::fanout(blocked)");
+  std::latch done(static_cast<std::ptrdiff_t>(to_warm.size()));
+  for (auto& key : to_warm) {
+    _dispatcher->enqueue([this, path = std::move(key), &done]() mutable {
+      try {
+        CTRACK_NAME("warmup::file");
+        std::shared_ptr<sirius::io::sirius_datasource> datasource;
+        {
+          // The suffix-range probe: one blocking GET per file, and the part
+          // most likely to dominate.
+          CTRACK_NAME("warmup::file::open_probe");
+          datasource = create_datasource(path, sirius::io::open_hint::parquet_footer_probe);
+        }
+        if (datasource) {
+          std::unique_ptr<cudf::io::datasource::buffer> footer;
+          {
+            // Served from the probe's stash when it landed; a real read if not.
+            CTRACK_NAME("warmup::file::fetch_footer");
+            footer = cudf::io::parquet::fetch_footer_to_host(*datasource);
+          }
+          auto const bytes = footer->size();
+          auto opts        = cudf::io::parquet_reader_options::builder().build();
+          std::shared_ptr<cudf::io::parquet::FileMetaData const> meta;
+          {
+            CTRACK_NAME("warmup::file::thrift_parse");
+            cudf::io::parquet::experimental::hybrid_scan_reader reader{
+              cudf::host_span<std::uint8_t const>(footer->data(), footer->size()), opts};
+            meta = std::make_shared<cudf::io::parquet::FileMetaData const>(
+              reader.parquet_metadata());
+          }
+          std::ignore = datasource->store_metadata(
+            std::make_shared<op::scan::parquet_metadata>(std::move(meta), bytes));
+        }
+      } catch (const std::exception& e) {
+        // A file that cannot be warmed is not an error: split production will
+        // fetch its footer the old way, and report the failure properly there.
+        SIRIUS_LOG_DEBUG("prepare_scans_for_processing: {} not warmed: {}", path, e.what());
+      } catch (...) {
+        SIRIUS_LOG_DEBUG("prepare_scans_for_processing: {} not warmed: unknown error", path);
+      }
+      done.count_down();
+    });
+  }
+  done.wait();
 }
 
 void sirius_scan_manager::start_metadata_processing()
@@ -710,6 +809,20 @@ std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datas
   // Real I/O / HEAD / auth / missing-object errors propagate as exceptions;
   // only "no backend" is reported as nullptr (callers map it to that message).
   return io_ctx->open_datasource(file_path, hint);
+}
+
+std::string sirius_scan_manager::io_perf_report_and_reset() noexcept
+{
+  std::string out;
+  try {
+    if (_io_ctx) { out += _io_ctx->perf_report_and_reset(); }
+    std::lock_guard lock{_routed_io_ctxs_mtx};
+    for (auto const& [_, ctx] : _routed_io_ctxs) {
+      if (ctx) { out += ctx->perf_report_and_reset(); }
+    }
+  } catch (...) {  // observability only — never poison the query teardown
+  }
+  return out;
 }
 
 void sirius_scan_manager::list_objects_paged(
@@ -819,6 +932,10 @@ void sirius_scan_manager::reset()
   // Stop explicitly rather than relying on the destructor: other holders (the
   // coalescer's slots, in-flight splits) may still own a shared_ptr copy, so
   // dropping ours would otherwise leave the worker running past query teardown.
+  if (_query_stage_manager != nullptr && _readahead) {
+    // Unsubscribe before the readahead dies: the manager holds raw pointers.
+    _query_stage_manager->remove_listener(_readahead.get());
+  }
   if (_readahead) { _readahead->stop(); }
   _readahead.reset();
   _dispatcher = std::make_unique<exec::scoped_dispatcher>(_thread_pool, _thread_pool.num_threads());

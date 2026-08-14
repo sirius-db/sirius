@@ -214,6 +214,43 @@ struct rest_perf_snapshot {
   std::uint64_t blocking_host_get_count{0};
   std::uint64_t blocking_host_get_wall_ns_total{0};
   std::uint64_t blocking_host_get_wall_ns_max{0};
+
+  // -- always-on saturation / failure attribution --------------------------
+  // Why each submit() pass stopped feeding the multi handle.  `slot_starved`
+  // means every connection was busy (the reactor is the bottleneck);
+  // `work_starved` means the inbound queue ran dry (the *producer* is the
+  // bottleneck).  Their ratio is the primary "are we I/O bound?" signal.
+  std::uint64_t submit_slot_starved_total{0};
+  std::uint64_t submit_work_starved_total{0};
+  std::uint64_t submit_added_total{0};
+  // In-flight GETs sampled once per submit() pass -> mean concurrency =
+  // inflight_sum / inflight_samples.
+  std::uint64_t inflight_sum{0};
+  std::uint64_t inflight_samples{0};
+  std::uint64_t inflight_max{0};
+  // Wall time the reactor spent with nothing at all on the wire, against the
+  // total time its loop was running.  This is the duty cycle: a reactor that is
+  // idle half the query is not slow, it is unfed.
+  std::uint64_t loop_idle_ns_total{0};
+  std::uint64_t loop_wall_ns_total{0};
+  // Connections libcurl had to open for a transfer (CURLINFO_NUM_CONNECTS).
+  // Non-zero means the pooled connection was unusable -> TCP+TLS on the hot path.
+  std::uint64_t conn_opened_total{0};
+  // Retry attribution, by cause.
+  std::uint64_t retry_slowdown_total{0};   // 429 / 503
+  std::uint64_t retry_server_err_total{0};  // 500 / 502 / 504 / 408
+  std::uint64_t retry_transport_total{0};   // curl transport error
+  std::uint64_t retry_short_read_total{0};  // 206 with a truncated body
+  std::uint64_t retry_auth_total{0};        // 403, presigned URL expired
+  std::uint64_t retry_delay_ns_total{0};    // summed backoff actually scheduled
+  // libcurl's own phase timings, summed over completed transfers
+  // (perf_instrumentation-gated; needs one getinfo call per completion).
+  std::uint64_t curl_dns_ns_total{0};
+  std::uint64_t curl_connect_ns_total{0};
+  std::uint64_t curl_tls_ns_total{0};
+  std::uint64_t curl_ttfb_ns_total{0};
+  std::uint64_t curl_total_ns_total{0};
+  std::uint64_t curl_timed_count{0};
 };
 
 /// How @c prep_host_rx_request attributes the resulting GETs in the perf
@@ -237,6 +274,12 @@ enum class host_read_attribution : std::uint8_t { async_chunk, blocking };
  */
 class rest_reactor {
  public:
+  /// Every read is an HTTP round trip, so what a request costs is dominated by
+  /// the fact that it IS a request.  Given the whole range set at once the
+  /// reactor can fuse adjacent ranges and keep every connection busy, which it
+  /// cannot do when ranges arrive one at a time as a reader walks the file.
+  static constexpr bool prefers_bulk_io = true;
+
   /// Shared, immutable services for a pool of reactors.  One instance is built
   /// by @c rest_ioctx and shared (via shared_ptr) across every reactor in the
   /// pool, so it is the natural home for things that are shared rather than
@@ -387,6 +430,11 @@ class rest_reactor {
   /// loads); safe to call while the reactor is running.
   [[nodiscard]] rest_perf_snapshot perf_snapshot() const noexcept;
 
+  /// Zero every perf counter.  Racy by construction (the worker keeps counting
+  /// while this runs), so it is only for per-query deltas in observability
+  /// dumps — never for anything correctness-bearing.
+  void reset_perf() noexcept;
+
   // -- capabilities / factory ----------------------------------------------
 
   /// True iff @p path is an s3:// URL this reactor can serve.
@@ -450,6 +498,27 @@ class rest_reactor {
     std::atomic<std::uint64_t> blocking_host_get_count{0};
     std::atomic<std::uint64_t> blocking_host_get_wall_ns_total{0};
     std::atomic<std::uint64_t> blocking_host_get_wall_ns_max{0};
+    std::atomic<std::uint64_t> submit_slot_starved_total{0};
+    std::atomic<std::uint64_t> submit_work_starved_total{0};
+    std::atomic<std::uint64_t> submit_added_total{0};
+    std::atomic<std::uint64_t> inflight_sum{0};
+    std::atomic<std::uint64_t> inflight_samples{0};
+    std::atomic<std::uint64_t> inflight_max{0};
+    std::atomic<std::uint64_t> loop_idle_ns_total{0};
+    std::atomic<std::uint64_t> loop_wall_ns_total{0};
+    std::atomic<std::uint64_t> conn_opened_total{0};
+    std::atomic<std::uint64_t> retry_slowdown_total{0};
+    std::atomic<std::uint64_t> retry_server_err_total{0};
+    std::atomic<std::uint64_t> retry_transport_total{0};
+    std::atomic<std::uint64_t> retry_short_read_total{0};
+    std::atomic<std::uint64_t> retry_auth_total{0};
+    std::atomic<std::uint64_t> retry_delay_ns_total{0};
+    std::atomic<std::uint64_t> curl_dns_ns_total{0};
+    std::atomic<std::uint64_t> curl_connect_ns_total{0};
+    std::atomic<std::uint64_t> curl_tls_ns_total{0};
+    std::atomic<std::uint64_t> curl_ttfb_ns_total{0};
+    std::atomic<std::uint64_t> curl_total_ns_total{0};
+    std::atomic<std::uint64_t> curl_timed_count{0};
   };
   perf_counters _perf;
 

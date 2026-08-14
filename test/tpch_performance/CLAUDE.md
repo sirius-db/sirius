@@ -140,7 +140,31 @@ pixi run python test/tpch_performance/performance_test.py \
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
     --engine gpu --iterations 2 --mode nsys-profile --queries 1,3,6
+
+# S3 prefix instead of a local directory (--engine gpu only; see below)
+pixi run python test/tpch_performance/performance_test.py \
+    --input s3://<bucket>/datasets/tpch_sf1 \
+    --engine gpu --iterations 2 --config /path/to/sirius_s3.yaml
 ```
+
+#### Benchmarking over S3
+
+`--input` accepts an `s3://` prefix holding one `<table>/` subdirectory per TPC-H
+table; the views become `read_parquet('s3://…/<table>/*.parquet')` and Sirius's
+`sirius_httpfs` expands the glob with `ListObjectsV2` at bind time.
+
+- **GPU only.** S3 has no CPU fallback (`src/sirius_context.cpp`,
+  `throw_if_s3_no_cpu_fallback`), so `--engine cpu|both`, `--validation`, and
+  `--pin` are rejected for an `s3://` input. Validate against a local copy of the
+  same data instead.
+- **Credentials must be in the Sirius YAML.** Sirius does not read the
+  environment, AWS profiles, or IMDS (`docs/super-sirius/scan.md`,
+  "Configuration") — put `endpoint` / `region` / `access_key` / `secret_key`
+  (plus `session_token` for temporary credentials) under
+  `sirius.executor.scan_manager.object_store` and pass the file via `--config`.
+  Endpoint must be the regional form `https://s3.<region>.amazonaws.com`.
+- The harness disables DuckDB's extension autoloading for `s3://` inputs so
+  DuckDB's own `httpfs` cannot claim the scheme ahead of `sirius_httpfs`.
 
 Key flags:
 - `--data-source parquet|duckdb` — input source/format (default `parquet`). `parquet`: `--input` is a directory of TPC-H parquet files (scanned via `read_parquet` → `GPU_PARQUET_SCAN`). `duckdb`: `--input` is a single `.duckdb` file whose native tables are scanned via the GPU-native `seq_scan` → `GPU_DUCKDB_NATIVE_SCAN`. Works in all modes (incl. `nsys-profile`), and `--pin` works for both. (This is the harness's own 2-value flag — see the disambiguation note below, distinct from the legacy shell `--data-source`.)

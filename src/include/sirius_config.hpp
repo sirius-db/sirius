@@ -254,6 +254,13 @@ struct sirius_config {
   /// @ref load_from_file; an explicit config value is left alone.
   void derive_uring_scan_budget();
 
+  /// Re-default @c _scan_manager_config.rest.n_max_concurrent_scans to a
+  /// multiple of the configured pipeline pool size. Object-store reads are
+  /// latency-bound, so the readahead needs several splits in flight per pipeline
+  /// thread to stay ahead of demand. Called from the end of @ref load_from_file;
+  /// an explicit config value is left alone.
+  void derive_rest_scan_budget();
+
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   creator::task_creator_config _task_creator_config;

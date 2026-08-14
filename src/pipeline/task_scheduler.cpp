@@ -348,7 +348,10 @@ void task_scheduler::management_eventloop()
     }
 
     if (_task_queue.empty()) {
-      if (_task_creator) { _task_creator->schedule_lookahead(*_ready_devices.begin()); }
+      if (_query_stage_manager != nullptr) { _query_stage_manager->on_task_queue_empty(); }
+      if (_task_creator && !_ready_devices.empty()) {
+        _task_creator->schedule_lookahead(_ready_devices.front());
+      }
     }
 
     // Matcher: for each ready device, try to find a dispatchable task.
@@ -375,12 +378,33 @@ void task_scheduler::management_eventloop()
       if (!task) {
         // No dispatchable task for this device. Leave device in _ready_devices
         // and move on — it will match when an appropriate task arrives.
+        // Only interesting while the queue is NOT empty: work exists but cannot
+        // be placed here, which is a preference mismatch rather than starvation.
+        if (_query_stage_manager != nullptr && !_task_queue.empty()) {
+          _query_stage_manager->on_executor_awaiting_task(device_id);
+        }
         ++it;
         continue;
       }
       uint64_t task_id = 0;
       if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
         task_id = gpu_task->get_task_id();
+        if (_query_stage_manager != nullptr) {
+          // Priority packs query_id in its high 32 bits (see task_creator); the
+          // queue's key extractor unpacks it the same way.
+          auto const query_id = make_query_id(
+            static_cast<std::uint32_t>(static_cast<std::uint64_t>(gpu_task->get_priority()) >> 32));
+          std::size_t operator_id                     = 0;
+          op::SiriusPhysicalOperatorType operator_type = op::SiriusPhysicalOperatorType::INVALID;
+          if (auto const* pipe = gpu_task->get_pipeline()) {
+            if (auto src = pipe->get_source()) {
+              operator_id   = src->get_operator_id();
+              operator_type = src->type;
+            }
+          }
+          _query_stage_manager->on_task_deployed(
+            query_id, operator_id, operator_type, device_id);
+        }
       }
 
       if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {

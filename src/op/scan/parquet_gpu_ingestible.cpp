@@ -57,6 +57,8 @@
 // BLOCK_SIZE static member in <blockingconcurrentqueue.h>.
 #include <io/uring/uring_reactor.hpp>
 
+#include <ctrack.hpp>
+
 // standard library
 #include <algorithm>
 #include <cctype>
@@ -569,8 +571,16 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // cuDF's footer reads are served locally (no HEAD, no separate trailer/body
   // GETs). Fall back to a plain cudf datasource only for local paths no sirius
   // backend claims.
-  std::shared_ptr<io::sirius_datasource> sirius_ds =
-    io_ctx->open_datasource(file_path, io::open_hint::parquet_footer_probe);
+  // Probe only when the footer will actually be read: once the metadata store
+  // holds this file's parsed footer, a suffix GET would download bytes nothing
+  // consumes, and the open only needs the size. Mirrors describe_parquet.
+  bool const footer_cached = io_ctx->metadata_store().get_metadata(file_path) != nullptr;
+  std::shared_ptr<io::sirius_datasource> sirius_ds;
+  {
+    CTRACK_NAME(footer_cached ? "split::open(warm)" : "split::open(cold_probe)");
+    sirius_ds = io_ctx->open_datasource(
+      file_path, footer_cached ? io::open_hint::generic : io::open_hint::parquet_footer_probe);
+  }
   if (!sirius_ds && has_uri_scheme(file_path)) {
     throw std::runtime_error("[parquet_gpu_ingestible] no backend supports path: " + file_path);
   }
@@ -590,6 +600,9 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
     }
   }
   if (!file_metadata) {
+    // Reached only when warming missed this file; the fetch+parse it does here
+    // is exactly the work prepare_scans_for_processing exists to have already done.
+    CTRACK_NAME("split::footer_fetch_parse(missed_warm)");
     auto footer           = cudf::io::parquet::fetch_footer_to_host(*sirius_ds);
     auto const footer_len = footer->size();
     hybrid_scan_reader footer_reader(cudf::host_span<uint8_t const>(footer->data(), footer->size()),

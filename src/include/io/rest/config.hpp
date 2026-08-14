@@ -28,11 +28,19 @@ struct config {
   /// How many scan tasks the readahead manager may keep in flight against this
   /// backend at once.  Zero disables readahead for it entirely.
   ///
-  /// Twice the uring budget: object-store reads are latency-bound rather than
-  /// bandwidth-bound, so more concurrency is needed to cover the round trips
-  /// before the link itself is the limit.
-  std::size_t n_max_concurrent_scans{
-    2 * static_cast<std::size_t>(exec::default_gpu_pipeline_num_threads)};
+  /// Object-store reads are latency-bound rather than bandwidth-bound, so more
+  /// concurrency is needed to cover the round trips before the link itself is
+  /// the limit.  This struct default can only name the compile-time pipeline
+  /// width; @c sirius_config::derive_rest_scan_budget scales it to the
+  /// configured pipeline pool size unless the config sets it explicitly.
+  std::size_t n_max_concurrent_scans{8};
+
+  /// Whether the config named @c n_max_concurrent_scans explicitly.  Needed
+  /// because the derived default is computed from the pipeline width and can
+  /// legitimately land on the struct default -- without this flag, a config that
+  /// sets the value to exactly the struct default is indistinguishable from one
+  /// that says nothing, and gets silently overridden.
+  bool n_max_concurrent_scans_explicit{false};
 
   /// Whole-request timeout (seconds, 0 = no limit) and presigned-URL TTL.
   long request_timeout_s{30};
@@ -42,8 +50,17 @@ struct config {
   std::string ca_bundle_path;
   bool tls_verify{true};
 
-  /// Max concurrent in-flight easy handles per reactor.
-  std::size_t max_connections{16};
+  /// Max concurrent in-flight easy handles per reactor, i.e. the ceiling on
+  /// simultaneous ranged GETs this reactor drives.
+  ///
+  /// More is not better, and past the point where the link is full it is
+  /// actively worse: extra connections only split the same bandwidth into
+  /// thinner streams.  Each socket then delivers a few KiB per read, so the
+  /// reactor thread spends its time in per-read callback and TLS-record overhead
+  /// rather than moving bytes, and time-to-first-byte climbs because it cannot
+  /// service that many sockets promptly.  Raising this past the point where the
+  /// reactor thread saturates costs latency without buying throughput.
+  std::size_t max_connections{64};
 
   /// Target maximum bytes per ranged GET for the vector / device-staging
   /// paths: file-adjacent segments are fused into one scatter GET up to this
@@ -54,6 +71,13 @@ struct config {
 
   /// Cap on destination buffers fused into a single scatter GET (i.e. how
   /// many file-adjacent segments may merge into one request).
+  ///
+  /// This bounds fusion, so raising it makes requests FEWER and fatter, never
+  /// more numerous.  The prefetching cache hands the reactor one segment per
+  /// cache chunk (1 MiB by default), so a low cap chops an otherwise contiguous
+  /// read into that many-MiB pieces regardless of @c chunk_size.  Against an
+  /// object store each piece costs a full round trip, so the cap wants to be
+  /// high enough that @c chunk_size is what actually limits a fused GET.
   std::size_t max_n_chunks{16};
 
   /// How many parallel ranged GETs a single contiguous host read is broken

@@ -144,6 +144,21 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// @c device_read_async_io per range instead.
   [[nodiscard]] virtual bool supports_device_range_read() const noexcept = 0;
 
+  /// Whether this backend would rather be handed one batched request covering
+  /// everything a reader needs than a stream of small reads as the reader walks
+  /// the file.
+  ///
+  /// Unlike the supports_* flags this is a preference, not a capability: a
+  /// backend that says no can still serve a batch, and one that says yes can
+  /// still serve small reads.  It reflects what the request itself costs.  For
+  /// an object store a read is a round trip, so the shape of the request set
+  /// dominates and knowing all of it up front is worth a great deal; for a local
+  /// file a read is a syscall against page cache or NVMe, and batching buys
+  /// little while forcing the caller to materialise ranges it may not need.
+  ///
+  /// Conservatively false: a backend opts in.
+  [[nodiscard]] virtual bool prefers_bulk_io() const noexcept { return false; }
+
   /// How many scan tasks the readahead manager may keep in flight against this
   /// backend at once, as configured on its reactors.  Zero means this backend
   /// opts out of readahead scheduling entirely.
@@ -153,6 +168,13 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// on each reactor config).  The base returns 0 so a backend that has not
   /// opted in is never scheduled against.
   [[nodiscard]] virtual std::size_t n_max_concurrent_scans() const noexcept { return 0; }
+
+  /// Backend-specific perf counters, formatted for a log/stderr dump, with the
+  /// counters zeroed on the way out so successive calls report per-window
+  /// deltas.  Empty when the backend keeps no counters.  Best-effort
+  /// observability: implementations read racy relaxed atomics and must not
+  /// throw.
+  [[nodiscard]] virtual std::string perf_report_and_reset() noexcept { return {}; }
 
   /// Build the prefetching cache.  One-shot — calling twice is a no-op
   /// after the first successful build.  The cache holds a raw

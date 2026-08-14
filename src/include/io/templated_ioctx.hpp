@@ -187,6 +187,15 @@ concept reactor_has_vector_host_rx =
     } -> std::same_as<std::vector<cudf::io::text::byte_range_info>>;
   };
 
+/// Unlike the supports_* paths, a bulk-IO preference cannot be probed from the
+/// reactor's method set -- a reactor that serves batches may still prefer not to
+/// be given them.  It is therefore declared, and reactors that say nothing get
+/// the conservative answer.
+template <class R>
+concept reactor_declares_bulk_io_preference = requires {
+  { R::prefers_bulk_io } -> std::convertible_to<bool>;
+};
+
 template <class R>
 struct reactor_traits {
   /// BYO-device-buffer reads: caller supplies the device destination and the
@@ -205,6 +214,16 @@ struct reactor_traits {
   /// Batched device reads staged through caller-supplied pinned host buffers.
   static constexpr bool supports_host_to_device_range_read =
     reactor_has_host_to_device_ranges_rx<R>;
+
+  /// Whether the reactor would rather receive one batched request than a stream
+  /// of small ones.  See ioctx::prefers_bulk_io.
+  static constexpr bool prefers_bulk_io = [] {
+    if constexpr (reactor_declares_bulk_io_preference<R>) {
+      return static_cast<bool>(R::prefers_bulk_io);
+    } else {
+      return false;
+    }
+  }();
 };
 
 // ---------------------------------------------------------------------------
@@ -313,6 +332,11 @@ class templated_ioctx : public ioctx {
   [[nodiscard]] bool supports_device_range_read() const noexcept final
   {
     return reactor_traits_t::supports_device_range_read;
+  }
+
+  [[nodiscard]] bool prefers_bulk_io() const noexcept final
+  {
+    return reactor_traits_t::prefers_bulk_io;
   }
 
   /// Every reactor in the pool is built from the same config, so the pool's

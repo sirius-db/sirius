@@ -140,7 +140,16 @@ static void from_yaml(const YAML::Node& node, sirius::io::object_store_config& o
 static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
 {
   yaml::reader r(node, "rest");
-  r.optional("n_max_concurrent_scans", opt.n_max_concurrent_scans);
+  {
+    // Read through an optional so "set to the struct default" is distinguishable
+    // from "not set" -- see config::n_max_concurrent_scans_explicit.
+    std::optional<std::size_t> n_max;
+    r.optional("n_max_concurrent_scans", n_max);
+    if (n_max.has_value()) {
+      opt.n_max_concurrent_scans          = *n_max;
+      opt.n_max_concurrent_scans_explicit = true;
+    }
+  }
   r.optional("request_timeout_s", opt.request_timeout_s);
   r.optional("ca_bundle_path", opt.ca_bundle_path);
   r.optional("tls_verify", opt.tls_verify);
@@ -600,6 +609,7 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
     }
 
     derive_uring_scan_budget();
+    derive_rest_scan_budget();
     enforce_sirius_backend_for_multi_gpu();
 
   } catch (const std::exception& e) {
@@ -630,6 +640,34 @@ void sirius_config::derive_uring_scan_budget()
     pipeline_threads,
     struct_default);
   _scan_manager_config.uring.n_max_concurrent_scans = pipeline_threads;
+}
+
+void sirius_config::derive_rest_scan_budget()
+{
+  // An object-store read is latency-bound, not bandwidth-bound: a ranged GET
+  // spends most of its life waiting for the first byte.  At one outstanding scan
+  // per pipeline thread the readahead has no lead — every split a thread picks
+  // up is the split whose prefetch only just started, so the read blocks on it.
+  // Several splits per thread give the prefetch time to land.  Local disk has no
+  // such round trip to hide, so uring stays at one per thread.
+  //
+  // Only the untouched default is replaced, so an explicit
+  // rest.n_max_concurrent_scans in the config still wins.
+  constexpr std::size_t scans_per_thread = 4;
+  if (_scan_manager_config.rest.n_max_concurrent_scans_explicit) { return; }
+
+  auto const derived = static_cast<std::size_t>(
+                         std::max(1, _gpu_pipeline_executor_config.num_threads)) *
+                       scans_per_thread;
+  if (derived == _scan_manager_config.rest.n_max_concurrent_scans) { return; }
+
+  SIRIUS_LOG_INFO(
+    "sirius_config: rest.n_max_concurrent_scans defaulted to {}x the configured pipeline pool size "
+    "({}), replacing the built-in default of {}",
+    scans_per_thread,
+    derived,
+    _scan_manager_config.rest.n_max_concurrent_scans);
+  _scan_manager_config.rest.n_max_concurrent_scans = derived;
 }
 
 void sirius_config::enforce_sirius_backend_for_multi_gpu()

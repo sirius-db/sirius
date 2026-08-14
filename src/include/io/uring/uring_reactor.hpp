@@ -131,6 +131,11 @@ class local_io_object : public io_object {
  */
 class uring_reactor {
  public:
+  /// A read here is a syscall against page cache or NVMe, cheap enough that
+  /// batching buys little -- and demanding the whole range set up front forces
+  /// the caller to materialise ranges it might never read.
+  static constexpr bool prefers_bulk_io = false;
+
   /// Shared, immutable services for a pool of reactors.  One instance is built
   /// by @c uring_ioctx and shared (via shared_ptr) across every reactor in the
   /// pool — the natural home for things shared rather than per-reactor: the

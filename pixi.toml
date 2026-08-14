@@ -38,6 +38,7 @@ mold = "*"
 libprotobuf = "*"
 rust = "*"
 cuda-nvrtc-dev = "*"
+boto3 = ">=1.43.68,<2"
 
 [pypi-dependencies]
 rumdl = "==0.2.44"

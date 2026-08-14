@@ -108,6 +108,24 @@ class prefetching_scheduler {
   /// when the order is exhausted.  Does not consume a quantum.
   [[nodiscard]] std::optional<std::size_t> peek_next_operator_id() const;
 
+  /// The live members of the current rotation group, in rotation order starting
+  /// at the cursor.  Members of one group are concurrently schedulable peers, so
+  /// a caller whose head member has nothing ready to prefetch may serve a later
+  /// peer without breaking the order — only crossing into the NEXT group would
+  /// do that, and this never reports one.  Empty once the order is exhausted.
+  [[nodiscard]] std::vector<std::size_t> peek_group_operator_ids() const;
+
+  /// Live members of every group AFTER the current one, in order.  Offered so a
+  /// caller with capacity the current group cannot use can look ahead instead of
+  /// idling; never to be served ahead of the current group.
+  [[nodiscard]] std::vector<std::size_t> peek_lookahead_operator_ids() const;
+
+  /// Park the cursor on @p operator_id when it is a live member of the current
+  /// group, so the next @ref get_next_prefetching_operator serves it.  Returns
+  /// false (leaving the cursor alone) for any other operator.  Moving the cursor
+  /// restarts that member's quantum, exactly as the rotation itself does.
+  bool focus_member(std::size_t operator_id);
+
   [[nodiscard]] bool empty() const noexcept { return _entries.empty(); }
 
   /// Number of round-robin groups the order was cut into.  Exposed for tests.

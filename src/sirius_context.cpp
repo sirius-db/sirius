@@ -20,6 +20,8 @@
 #include "cucascade/memory/memory_reservation_manager.hpp"
 
 #include <ctrack.hpp>
+
+#include <algorithm>
 #include <io/prefetch_census.hpp>
 
 #include <iostream>
@@ -80,6 +82,42 @@
 namespace duckdb {
 
 namespace {
+
+/// One line per ctrack probe, widest exclusive time first: the aggregate columns
+/// only (calls, threads, accumulated, exclusive, inclusive).  The full ctrack
+/// tables run to several hundred lines per query, which is unreadable in a log;
+/// these are the columns that actually get used when reading one.
+///
+/// Reading the tables CLEARS ctrack's accumulated samples, so this must be the
+/// only reader per query -- hence one report, used for both the log and the
+/// benchmark dump.
+std::string ctrack_aggregate_report()
+{
+  auto tables = ctrack::result_get_tables();
+  auto& rows  = tables.details.rows;
+  if (rows.empty()) { return {}; }
+
+  std::ranges::sort(rows, std::ranges::greater{}, &ctrack::detail_stats::time_ae_all);
+
+  auto const ms = [](std::chrono::nanoseconds ns) {
+    return std::chrono::duration<double, std::milli>(ns).count();
+  };
+
+  std::string out = std::format("ctrack aggregate: window {:.0f} ms, tracked {:.0f} ms",
+                                ms(tables.time_total),
+                                ms(tables.time_ctracked));
+  for (auto const& r : rows) {
+    out += std::format("\n  {:<44} calls {:>7} thr {:>3} acc {:>10.1f} ms  excl {:>9.1f} ms"
+                       "  incl {:>9.1f} ms",
+                       r.function_name,
+                       r.calls,
+                       r.threads,
+                       ms(r.time_acc),
+                       ms(r.time_ae_all),
+                       ms(r.time_a_all));
+  }
+  return out;
+}
 
 static constexpr std::string_view CONFIG_FILE_NAME        = "sirius.yaml";
 static constexpr std::string_view LEGACY_CONFIG_FILE_NAME = "sirius.cfg";
@@ -307,11 +345,23 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   } catch (...) {
   }
 
+  // The ctrack aggregate goes to the log every query -- a couple of dozen lines,
+  // and what makes a slow query readable after the fact.  The census and reactor
+  // counters stay on stderr behind SIRIUS_IO_PROFILE: they are benchmark
+  // instruments, and reading them resets them.
   try {
-    std::cerr << "\n" << sirius::io::prefetch_census::instance().to_string() << "\n=== ctrack "
-              << "(query end) ===\n"
-              << ctrack::result_as_string() << std::endl;
-    sirius::io::prefetch_census::instance().reset();
+    auto const ctrack_report = ctrack_aggregate_report();
+    if (!ctrack_report.empty()) { SIRIUS_LOG_INFO("{}", ctrack_report); }
+
+    static bool const io_profile = std::getenv("SIRIUS_IO_PROFILE") != nullptr;
+    if (io_profile) {
+      std::cerr << "\n"
+                << sirius::io::prefetch_census::instance().to_string() << "\n"
+                << (scan_manager_ ? scan_manager_->io_perf_report_and_reset() : std::string{})
+                << "\n=== ctrack (query end) ===\n"
+                << ctrack_report << std::endl;
+      sirius::io::prefetch_census::instance().reset();
+    }
   } catch (...) {
   }
 
@@ -777,8 +827,13 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   task_creator_->set_task_scheduler(*task_scheduler_);
   task_scheduler_->set_task_creator(*task_creator_);
 
+  query_stage_manager_ = std::make_unique<sirius::exec::fan_out_query_stage_manager>();
+  task_creator_->set_query_stage_manager(query_stage_manager_.get());
+  task_scheduler_->set_query_stage_manager(query_stage_manager_.get());
+
   scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
     config_.get_scan_manager_config(), *memory_manager_, topology_index_);
+  scan_manager_->set_query_stage_manager(query_stage_manager_.get());
 
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
   // has been constructed.

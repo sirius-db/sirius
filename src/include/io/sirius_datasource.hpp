@@ -151,6 +151,10 @@ class sirius_datasource : public cudf::io::datasource {
 
   [[nodiscard]] bool uses_prefetching_cache() const noexcept;
 
+  /// Whether the backend serving this datasource would rather be handed one
+  /// batched request than a stream of small reads.  See @c ioctx::prefers_bulk_io.
+  [[nodiscard]] bool prefers_bulk_io() const noexcept;
+
  private:
   /// Wait out a prefetch that is already reading this split's bytes, so the
   /// read below serves from cache instead of issuing the same IO again.

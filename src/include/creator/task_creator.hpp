@@ -21,6 +21,7 @@
 #include "exec/bounded_thread_pool.hpp"
 #include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
+#include "exec/query_stage_manager.hpp"
 #include "exec/queue_priority.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
@@ -101,6 +102,18 @@ class task_creator {
 
   /// \brief sets pipeline executor reference
   void set_task_scheduler(sirius::pipeline::task_scheduler& task_scheduler);
+
+  /// Attach the query-stage observer.  Optional: null means nothing observes,
+  /// which is the default and costs a null check on the reporting paths.
+  void set_query_stage_manager(sirius::exec::query_stage_manager* manager) noexcept
+  {
+    _query_stage_manager = manager;
+  }
+
+  /// Report that @p pipeline_id has closed, so its source will produce no more
+  /// tasks.  Called by sirius_pipeline; this supplies the query id, which the
+  /// pipeline cannot see.
+  void notify_pipeline_closure(std::size_t pipeline_id, std::size_t source_operator_id) noexcept;
 
   /// \brief prepare global states for all pipelines in the query
   void prepare_for_query(const sirius::planner::query& query);
@@ -202,6 +215,10 @@ class task_creator {
   std::thread _manager_thread;
   ::duckdb::ClientContext* _client_context;
   sirius::pipeline::task_scheduler* _task_scheduler{nullptr};
+  /// Optional observer of query stage transitions; null when unobserved.
+  sirius::exec::query_stage_manager* _query_stage_manager{nullptr};
+  /// Stamped by prepare_for_query; the manager loop has no other handle on it.
+  sirius::query_id_t _query_id{};
   sirius::memory::sirius_memory_reservation_manager& _mem_res_mgr;
   std::atomic<uint64_t> _task_id{0};
 

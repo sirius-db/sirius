@@ -334,6 +334,7 @@ set(EXTENSION_SOURCES
     src/op/partition/gpu_partition_impl.cpp
     src/op/result/host_table_chunk_reader.cpp
     src/op/scan/cached_ranges.cpp
+    src/op/scan/parquet_materialize.cpp
     src/op/scan/duckdb_insert_delta.cpp
     src/op/scan/duckdb_mvcc_visibility.cpp
     src/op/scan/duckdb_native_metadata.cpp
@@ -1083,6 +1084,42 @@ target_link_options(retirer_benchmark PRIVATE
 
 set_target_properties(
   retirer_benchmark
+  PROPERTIES CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+
+# -----------------------------------------------------------------------------
+# test/io/s3_throughput_test — raw S3 read throughput via REST reactor, no parquet decoding
+# -----------------------------------------------------------------------------
+add_executable(s3_throughput_test test/io/s3_throughput_test.cpp)
+
+if(VCPKG_BUILD)
+  set_target_properties(s3_throughput_test PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+  target_include_directories(s3_throughput_test BEFORE PRIVATE ${_VCPKG_INC})
+endif()
+
+target_include_directories(
+  s3_throughput_test
+  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
+
+target_link_libraries(
+  s3_throughput_test
+  sirius_extension
+  duckdb_static
+  cudf::cudf
+  rmm::rmm
+  spdlog::spdlog
+  cuCascade::cucascade
+  cuCascade::cucascade_cudf
+  PkgConfig::LIBURING
+  PkgConfig::NUMA)
+link_extension_libraries(s3_throughput_test "")
+
+target_link_options(s3_throughput_test PRIVATE
+                    "LINKER:--allow-multiple-definition")
+
+set_target_properties(
+  s3_throughput_test
   PROPERTIES CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")

@@ -69,6 +69,13 @@ EXTENSION_PATH = os.path.join(
 
 DUCKDB_BIN = os.path.join(REPO_ROOT, BUILD_PATH, "duckdb")
 
+S3_URI_PREFIX = "s3://"
+
+
+def is_s3_source(source):
+    """True when --input names an S3 prefix instead of a local directory."""
+    return str(source).lower().startswith(S3_URI_PREFIX)
+
 
 def _git_capture(args):
     try:
@@ -252,7 +259,23 @@ def _build_views_sql(parquet_dir):
 
     Each statement is terminated with `;\n`. Raises FileNotFoundError if any
     table has no parquet files in `parquet_dir`.
+
+    For an `s3://` prefix the files are not enumerated here: the view body keeps
+    the glob and Sirius's `sirius_httpfs` expands it with ListObjectsV2 at bind
+    time. Only the GPU path can serve `s3://` (no CPU fallback exists), which
+    main() enforces.
     """
+    if is_s3_source(parquet_dir):
+        root = str(parquet_dir).rstrip("/")
+        return (
+            "\n".join(
+                f"CREATE OR REPLACE VIEW {table} AS SELECT * FROM "
+                f"read_parquet('{root}/{table}/*.parquet');"
+                for table in TPCH_TABLES
+            )
+            + "\n"
+        )
+
     parts = []
     for table in TPCH_TABLES:
         files = _resolve_parquet_files(parquet_dir, table)
@@ -276,14 +299,32 @@ def open_connection(source, gpu_execution=False, data_source="parquet"):
              Read-only avoids write locks / accidental WAL and is correct for a
              read-only benchmark; it mirrors how run_tpch_duckdb.sh opens the file.
     """
+    config = {"allow_unsigned_extensions": "true"}
+    s3_source = data_source != "duckdb" and is_s3_source(source)
+    if s3_source:
+        # s3:// must resolve through Sirius's own sirius_httpfs, not DuckDB's
+        # httpfs (which would autoload on the first s3:// bind and then serve the
+        # scan on the CPU with its own credential chain, bypassing Sirius).
+        config["autoinstall_known_extensions"] = "false"
+        config["autoload_known_extensions"] = "false"
+
     if data_source == "duckdb":
         log(f"Opening DuckDB database file {source} (read-only)")
-        con = duckdb.connect(
-            source, read_only=True, config={"allow_unsigned_extensions": "true"}
-        )
+        con = duckdb.connect(source, read_only=True, config=config)
     else:
         log(f"Opening DuckDB connection over parquet dir {source}")
-        con = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
+        con = duckdb.connect(":memory:", config=config)
+
+    # Sirius must be loaded before the views are registered for an s3:// source:
+    # registering sirius_httpfs is what makes the s3:// glob in the view body
+    # bind at all. Load it first unconditionally -- for local sources the order
+    # is immaterial.
+    if gpu_execution:
+        log(f"Loading Sirius extension from {EXTENSION_PATH}")
+        con.execute(f"LOAD '{EXTENSION_PATH}'")
+        log("Sirius extension loaded")
+
+    if data_source != "duckdb":
         log("Registering TPC-H parquet views")
         for stmt in _build_views_sql(source).split(";"):
             stmt = stmt.strip()
@@ -291,10 +332,6 @@ def open_connection(source, gpu_execution=False, data_source="parquet"):
                 continue
             con.execute(stmt)
         log("All TPC-H views registered")
-    if gpu_execution:
-        log(f"Loading Sirius extension from {EXTENSION_PATH}")
-        con.execute(f"LOAD '{EXTENSION_PATH}'")
-        log("Sirius extension loaded")
     return con
 
 
@@ -880,7 +917,9 @@ def parse_args():
         type=str,
         required=True,
         help="TPC-H input: a parquet directory (--data-source parquet; one .parquet "
-        "file or subdir per table) or a single .duckdb file (--data-source duckdb)",
+        "file or subdir per table), an s3:// prefix holding one <table>/ subdir "
+        "per table (--engine gpu only), or a single .duckdb file "
+        "(--data-source duckdb)",
     )
     p.add_argument(
         "--data-source",
@@ -1004,10 +1043,24 @@ def main():
                 f"--data-source duckdb requires --input to be a .duckdb file; "
                 f"got {source!r}"
             )
+    elif is_s3_source(source):
+        # S3 is GPU-only: DuckDB's CPU read_parquet has no S3 filesystem, and
+        # Sirius deliberately refuses to serve s3:// to a CPU plan
+        # (src/sirius_context.cpp, throw_if_s3_no_cpu_fallback). So there is no
+        # CPU baseline to time against or validate with.
+        if args.engine != "gpu":
+            raise SystemExit(
+                "an s3:// --input requires --engine gpu; S3 has no CPU fallback"
+            )
+        if args.pin != "none":
+            raise SystemExit(
+                "--pin is not supported for an s3:// --input; pin_table globs "
+                "local files"
+            )
     elif not os.path.isdir(source):
         raise SystemExit(
-            f"--data-source parquet requires --input to be a parquet directory; "
-            f"got {source!r}"
+            f"--data-source parquet requires --input to be a parquet directory "
+            f"or an s3:// prefix; got {source!r}"
         )
     queries = parse_query_spec(args.queries)
     engine_modes = resolve_engine_modes(args.engine)

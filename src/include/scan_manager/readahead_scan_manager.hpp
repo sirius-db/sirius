@@ -18,6 +18,7 @@
 
 #include "io/cache/types.hpp"
 #include "planner/query_index.hpp"
+#include "exec/query_stage_manager.hpp"
 #include "scan_manager/prefetching_scheduler.hpp"
 
 #include <condition_variable>
@@ -51,7 +52,8 @@ namespace sirius::scan_manager {
 /// Held by @c shared_ptr (splits report into it from their own threads) and
 /// inherits @c enable_shared_from_this so an in-flight prefetch completion can
 /// find the manager again without keeping it alive.
-class readahead_scan_manager : public std::enable_shared_from_this<readahead_scan_manager> {
+class readahead_scan_manager : public std::enable_shared_from_this<readahead_scan_manager>,
+                               public exec::query_stage_manager {
  public:
   readahead_scan_manager() = default;
   /// Stops and joins the worker.
@@ -110,6 +112,11 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   /// for tests and diagnostics; see @ref is_ongoing for what counts.
   [[nodiscard]] std::size_t ongoing_scans() const;
 
+  /// Whether any registered split is still waiting to be prefetched.  Used to
+  /// tell "declined because there was nothing to do" from "declined while work
+  /// was sitting there".
+  [[nodiscard]] bool has_unprefetched_work() const;
+
   void reset();
 
  private:
@@ -117,6 +124,10 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   struct task_entry {
     std::weak_ptr<op::scan::scan_info> task;
     io::cache::scan_stage stage{io::cache::scan_stage::none};
+    /// Position in the order the readahead issued prefetches, and in the order
+    /// the executor first read them.  0 means unset.  Comparing the two is how
+    /// prefetch order is checked against execution order.
+    std::uint64_t prefetch_rank{0};
     /// The worker issued prefetch IO for this split.
     bool prefetched{false};
     /// That IO has completed, so the split is cache-resident and its read costs
@@ -201,6 +212,21 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   std::condition_variable_any _cv;
   std::stop_source _stop_source;
   std::jthread _worker;
+
+  /// Fold the interval since the last call into the occupancy account, using the
+  /// scan count as it was over that interval.  Called under @c _mutex at every
+  /// point the count can change, so the account is exact rather than sampled.
+  void note_active_locked();
+
+  std::chrono::steady_clock::time_point _active_mark{};
+  std::size_t _active_count{0};
+
+  /// Monotonic rank sources for the two orders; see task_entry::prefetch_rank.
+  std::uint64_t _next_prefetch_rank{0};
+  std::uint64_t _next_read_rank{0};
+  /// Prefetch rank of the split read most recently -- an inversion is a read
+  /// whose prefetch came earlier than that.
+  std::uint64_t _last_read_prefetch_rank{0};
 };
 
 }  // namespace sirius::scan_manager

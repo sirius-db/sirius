@@ -20,6 +20,7 @@
 #include "exec/try.hpp"
 #include "io/cache/types.hpp"
 #include "io/io_context.hpp"
+#include "io/prefetch_census.hpp"
 #include "io/types.hpp"
 #include "log/logging.hpp"
 #include "memory/topology_index.hpp"
@@ -1068,6 +1069,10 @@ bool prefetching_cache::prefetch(prefetching_handle& handle,
 
   if (!req || req.is_cancelled() || !req.chunks) { return settle(false); }
   if (!_io_ctx->supports_vector_host_read()) { return settle(false); }
+  // Read the stage before mark_loading advances it: a request that has not
+  // reached `prepared` has no buffers attached yet, so the claim loop below
+  // will find every chunk in empty/queued and read nothing.
+  bool const was_prepared = req.producer->get() >= producer_stage::prepared;
   if (!req.producer->mark_loading()) { return settle(false); }
 
   std::vector<io::io_object_segment> segments;
@@ -1086,14 +1091,23 @@ bool prefetching_cache::prefetch(prefetching_handle& handle,
     }
   }
   if (segments.empty()) {
+    // Nothing was claimable.  Either the request genuinely had no IO left to do
+    // (already cached / host-backed), or we beat prepare_loop to it and no chunk
+    // had a buffer yet — in which case this `ready` is a lie the reader will pay
+    // for, so the two are counted apart.
+    auto& census = prefetch_census::instance();
+    (was_prepared ? census.skipped_no_ranges : census.prefetch_unprepared)
+      .fetch_add(1, std::memory_order_relaxed);
     std::ignore = req.producer->mark_ready();
     return settle(true);
   }
+  prefetch_census::instance().prefetch_issued.fetch_add(1, std::memory_order_relaxed);
+  prefetch_census::instance().inflight_prefetches.fetch_add(1, std::memory_order_relaxed);
 
   exec::admission_control::slot token;
   {
     CTRACK_NAME("cache::prefetch::rate_limit_wait");
-    token = _rate_limiter.acquire(segments.size());
+    token = _rate_limiter.acquire(1);
   }
 
   if (req.is_cancelled()) {
@@ -1114,6 +1128,7 @@ bool prefetching_cache::prefetch(prefetching_handle& handle,
       std::ignore = res.has_value() ? req.producer->mark_ready() : req.producer->mark_load_failed();
       std::ranges::for_each(
         chunks, [transition](cached_chunk* c) { std::ignore = (c->state.*transition)(); });
+      prefetch_census::instance().inflight_prefetches.fetch_sub(1, std::memory_order_relaxed);
       done(res.has_value());
     });
   return true;

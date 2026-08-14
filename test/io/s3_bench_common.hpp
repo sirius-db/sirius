@@ -16,10 +16,8 @@
 
 #pragma once
 
-// Shared harness for the two S3 benchmarks (s3_throughput_test, s3_parquet_test):
-// CLI parsing, engine construction, bucket listing, parquet chunk discovery and
-// reporting.  Everything here is backend-agnostic in principle but is only
-// exercised against the REST reactor.
+// Shared harness for S3 benchmarks (s3_throughput_test):
+// CLI parsing, engine construction, bucket listing and reporting.
 //
 // AUTHENTICATION
 //   Credentials come from a Sirius config YAML via --config, parsed by
@@ -30,11 +28,7 @@
 //
 //   NOTE: there is no IMDS / instance-profile credential chain in the REST
 //   backend -- only static credentials, with session_token for temporary ones.
-//   Running on an EC2 instance role therefore still needs the keys supplied
-//   explicitly (e.g. exported from `aws sts assume-role` or the IMDS endpoint).
 
-#include "exec/scoped_dispatcher.hpp"
-#include "exec/thread_pool.hpp"
 #include "io/datasource_factory.hpp"
 #include "io/rest/rest_ioctx.hpp"
 #include "io/sirius_datasource.hpp"
@@ -42,23 +36,14 @@
 #include "scan_manager/config.hpp"
 #include "sirius_config.hpp"
 
-#include <cudf/io/experimental/hybrid_scan.hpp>
-#include <cudf/io/parquet.hpp>
-#include <cudf/io/parquet_io_utils.hpp>
-#include <cudf/io/text/byte_range_info.hpp>
-
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 
-#include <algorithm>
 #include <chrono>
 #include <cstddef>
-#include <cstdint>
 #include <iomanip>
 #include <iostream>
 #include <memory>
 #include <numeric>
-#include <optional>
-#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -66,14 +51,11 @@
 
 namespace sirius::bench {
 
-using clock_type         = std::chrono::steady_clock;
-using hybrid_scan_reader = cudf::io::parquet::experimental::hybrid_scan_reader;
+using clock_type = std::chrono::steady_clock;
 
-/// Host pinned pool geometry for the REST reactors' bounce staging.  Sized like
-/// range_prefetch_benchmark's: 1 MiB blocks, 128 to a slab.
-inline constexpr std::size_t host_block_size_v      = 1UL << 20;
+/// Host pinned pool geometry for the REST reactors' bounce staging.
 inline constexpr std::size_t host_pool_size_v       = 128;
-inline constexpr std::size_t host_initial_pools_v   = 64;  // 8 GiB of staging
+inline constexpr std::size_t host_initial_pools_v   = 64;
 inline constexpr std::size_t host_region_capacity_v = 32UL << 30;
 
 inline double ms_since(clock_type::time_point t)
@@ -86,25 +68,38 @@ inline double ms_since(clock_type::time_point t)
 // ---------------------------------------------------------------------------
 
 struct bench_options {
-  std::string bucket;   ///< s3://bucket/optional-prefix
-  std::size_t n_files{12};
-  std::size_t repeat{1};
-  std::size_t n_threads{2};
+  std::vector<std::string> buckets; ///< one or more s3:// prefixes (--bucket repeatable)
+  std::size_t n_files{12};          ///< total files across all prefixes (divided evenly)
+  std::size_t per_file_gib{1}; ///< GB of data to read per file (random segments)
+  std::size_t repeat{3};
 
-  /// Cap on destination buffers fused into one scatter GET
-  /// (io::rest::config::max_n_chunks).
-  std::size_t max_segment{32};
-  /// Max concurrent in-flight easy handles per reactor
-  /// (io::rest::config::max_connections).
-  std::size_t max_nconnection{128};
-  /// Target maximum bytes per ranged GET, in MiB
-  /// (io::rest::config::chunk_size).  Also the unit a byte range is split into
-  /// when building the benchmark's own IO segments.
+  /// Target GET size in MiB. Each aligned chunk of this size becomes one GET
+  /// (rest.max_n_chunks is forced to 1 so no fusing occurs).
   std::size_t chunk_size_mib{1};
 
-  /// Benchmark-specific selector: "grouped"/"chunked" for the throughput test,
-  /// "pipelined"/"host_staged"/"gpu_staged" for the parquet test.
-  std::string mode;
+  /// Max concurrent in-flight easy handles per reactor (rest.max_connections).
+  std::size_t max_nconnection{128};
+
+  /// Number of REST reactor instances.
+  std::size_t n_reactors{1};
+
+  /// Share of each GPU's memory the pool may use.  Only matters for benchmarks
+  /// that allocate device memory; raw-throughput ones can leave it alone.
+  double gpu_usage_ratio{0.5};
+
+  /// How many chunk_size-aligned segments may fuse into one GET.  The default of
+  /// 1 disables fusing, which is what a throughput benchmark wants (GET size
+  /// then equals chunk_size); a benchmark measuring a real scan wants it higher.
+  std::size_t max_n_chunks{1};
+
+  /// Host pinned pool slabs allocated up front.  host_pool_size_v blocks each,
+  /// so initial bytes = host_initial_pools * host_pool_size_v * host_block_bytes().
+  std::size_t host_initial_pools{host_initial_pools_v};
+
+  /// Host memory pool block size in MiB.  Zero means "same as chunk_size_mib",
+  /// which is what a throughput benchmark wants (staging block == GET size); a
+  /// benchmark that stages differently from how it reads sets it explicitly.
+  std::size_t host_chunk_mib{0};
 
   /// Sirius config YAML supplying object_store credentials.
   std::string config_path;
@@ -116,18 +111,21 @@ struct bench_options {
   std::string secret_key;
   std::string session_token;
 
-  std::size_t n_reactors{1};
-
   [[nodiscard]] std::size_t chunk_bytes() const noexcept { return chunk_size_mib << 20; }
+  [[nodiscard]] std::size_t host_block_bytes() const noexcept
+  {
+    return (host_chunk_mib == 0 ? chunk_size_mib : host_chunk_mib) << 20;
+  }
+  [[nodiscard]] std::size_t per_file_bytes() const noexcept
+  {
+    return per_file_gib * 1'000'000'000ULL;
+  }
 };
 
-/// Returns false when @p arg is not a recognised common flag, so the caller can
-/// try its own.  Accepts both `--flag value` and `--flag=value`.
 class arg_parser {
  public:
   arg_parser(int argc, char** argv) : _argc(argc), _argv(argv) {}
 
-  /// Advances past the value when the flag matched.  @p i is the current index.
   bool match(int& i, std::string_view flag, std::string& out) const
   {
     const std::string_view arg = _argv[i];
@@ -151,51 +149,59 @@ class arg_parser {
     return true;
   }
 
+  /// Repeatable flag: appends each occurrence to a vector.
+  bool match(int& i, std::string_view flag, std::vector<std::string>& out) const
+  {
+    std::string s;
+    if (!match(i, flag, s)) { return false; }
+    out.push_back(std::move(s));
+    return true;
+  }
+
  private:
   int _argc;
   char** _argv;
 };
 
-/// Flags shared by both benchmarks.  Underscore and dash spellings are both
-/// accepted, because the two specs use both.
 inline bool parse_common_arg(arg_parser const& p, int& i, bench_options& o)
 {
-  return p.match(i, "--bucket", o.bucket) || p.match(i, "--n-files", o.n_files) ||
-         p.match(i, "--n_files", o.n_files) || p.match(i, "--repeat", o.repeat) ||
-         p.match(i, "--n-threads", o.n_threads) || p.match(i, "--n_threads", o.n_threads) ||
-         p.match(i, "--max-segment", o.max_segment) || p.match(i, "--max_segment", o.max_segment) ||
-         p.match(i, "--max-nconnection", o.max_nconnection) ||
-         p.match(i, "--max_nconnection", o.max_nconnection) ||
+  return p.match(i, "--bucket", o.buckets) || p.match(i, "--n-files", o.n_files) ||
+         p.match(i, "--n_files", o.n_files) || p.match(i, "--per-file", o.per_file_gib) ||
+         p.match(i, "--per_file", o.per_file_gib) || p.match(i, "--repeat", o.repeat) ||
          p.match(i, "--chunk-size", o.chunk_size_mib) ||
-         p.match(i, "--chunk_size", o.chunk_size_mib) || p.match(i, "--mode", o.mode) ||
-         p.match(i, "--strategy", o.mode) || p.match(i, "--config", o.config_path) ||
-         p.match(i, "--endpoint", o.endpoint) || p.match(i, "--region", o.region) ||
-         p.match(i, "--access-key", o.access_key) || p.match(i, "--secret-key", o.secret_key) ||
-         p.match(i, "--session-token", o.session_token) ||
-         p.match(i, "--n-reactors", o.n_reactors);
+         p.match(i, "--chunk_size", o.chunk_size_mib) ||
+         p.match(i, "--max-connection", o.max_nconnection) ||
+         p.match(i, "--max_connection", o.max_nconnection) ||
+         p.match(i, "--n-reactors", o.n_reactors) || p.match(i, "--n_reactors", o.n_reactors) ||
+         p.match(i, "--config", o.config_path) || p.match(i, "--endpoint", o.endpoint) ||
+         p.match(i, "--region", o.region) || p.match(i, "--access-key", o.access_key) ||
+         p.match(i, "--secret-key", o.secret_key) ||
+         p.match(i, "--session-token", o.session_token);
 }
 
 // ---------------------------------------------------------------------------
 // engine
 // ---------------------------------------------------------------------------
 
-/// Reservation manager + REST ioctx + thread pool, torn down in the right
-/// order.  Mirrors the setup in prefetch_hybrid_scan_benchmark: the
-/// sirius_memory_reservation_manager installs the cucascade GPU allocator, and
-/// the REST reactors take their pinned staging resource from its HOST tier.
 class engine {
  public:
   explicit engine(bench_options const& opts)
   {
-    // GPU + host tiers.  The host tier is what the REST reactors bounce
-    // through, so it must exist even for the pure-host throughput arms.
+    // Defaults to chunk_bytes so the fixed-size host pool, the REST reactor's
+    // chunk_size and the benchmark's pinned_staging are carved at the same
+    // granularity; host_chunk_mib decouples them when that is not wanted.
+    const std::size_t block_size = opts.host_block_bytes();
     cucascade::memory::reservation_manager_configurator builder;
     builder.set_number_of_gpus(1)
+      // Without an explicit limit the GPU pool is not sized for a benchmark that
+      // allocates device buffers (a raw-throughput one never notices; one that
+      // decodes into device memory OOMs immediately).
+      .set_usage_limit_ratio_per_gpu(opts.gpu_usage_ratio)
       .set_reservation_fraction_per_gpu(0.9)
       .use_gpu_id_as_host_id()
       .set_per_numa_region_capacity(host_region_capacity_v)
       .set_reservation_fraction_per_numa_region(0.9)
-      .set_host_pool_features(host_block_size_v, host_pool_size_v, host_initial_pools_v);
+      .set_host_pool_features(block_size, host_pool_size_v, opts.host_initial_pools);
     _mgr = std::make_unique<memory::sirius_memory_reservation_manager>(builder.build());
 
     _cfg = build_scan_manager_config(opts);
@@ -214,9 +220,6 @@ class engine {
         "--access-key/--secret-key.");
     }
     _io_ctx->start();
-
-    _pool = std::make_unique<exec::static_thread_pool>(static_cast<int>(opts.n_threads),
-                                                       "s3_bench");
   }
 
   ~engine()
@@ -229,10 +232,12 @@ class engine {
 
   [[nodiscard]] io::ioctx& io_ctx() const noexcept { return *_io_ctx; }
   [[nodiscard]] std::shared_ptr<io::ioctx> io_ctx_ptr() const noexcept { return _io_ctx; }
-  [[nodiscard]] exec::static_thread_pool& pool() const noexcept { return *_pool; }
+
+  /// The reservation manager backing the ioctx — a benchmark that stages reads
+  /// through the prefetching cache needs it to build one.
+  [[nodiscard]] memory::sirius_memory_reservation_manager& mgr() const noexcept { return *_mgr; }
   [[nodiscard]] scan_manager::scan_manager_config const& config() const noexcept { return _cfg; }
 
-  /// The REST ioctx as its concrete type, for LIST (not on the ioctx interface).
   [[nodiscard]] io::rest::rest_ioctx& rest() const
   {
     auto* r = dynamic_cast<io::rest::rest_ioctx*>(_io_ctx.get());
@@ -245,8 +250,6 @@ class engine {
   {
     scan_manager::scan_manager_config cfg;
 
-    // Credentials: let sirius_config do the YAML parsing so the benchmark reads
-    // the same object_store block the engine does.
     if (!opts.config_path.empty()) {
       sirius_config file_cfg;
       file_cfg.load_from_file(opts.config_path);
@@ -258,13 +261,13 @@ class engine {
     if (!opts.secret_key.empty()) { cfg.object_store.secret_key = opts.secret_key; }
     if (!opts.session_token.empty()) { cfg.object_store.session_token = opts.session_token; }
 
-    // The knobs under test.
     cfg.rest.max_connections = opts.max_nconnection;
-    cfg.rest.max_n_chunks    = opts.max_segment;
     cfg.rest.chunk_size      = opts.chunk_bytes();
+    cfg.rest_n_reactors      = opts.n_reactors;
+    // Default 1: each chunk_size-aligned segment becomes exactly one GET with
+    // no fusing, so chunk_size == GET size == staging block size.
+    cfg.rest.max_n_chunks = opts.max_n_chunks;
 
-    // No prefetching cache: these benchmarks measure the reactor, and a cache
-    // in front of it would serve the repeat iterations from memory.
     cfg.cache = scan_manager::cache_mode::none;
     cfg.apply_cache_mode();
     return cfg;
@@ -274,14 +277,12 @@ class engine {
   scan_manager::scan_manager_config _cfg;
   std::unique_ptr<io::io_context_registry> _registry;
   std::shared_ptr<io::ioctx> _io_ctx;
-  std::unique_ptr<exec::static_thread_pool> _pool;
 };
 
 // ---------------------------------------------------------------------------
 // bucket listing
 // ---------------------------------------------------------------------------
 
-/// Split `s3://bucket/prefix` into its bucket and prefix parts.
 inline std::pair<std::string, std::string> split_s3_uri(std::string_view uri)
 {
   constexpr std::string_view scheme = "s3://";
@@ -294,82 +295,72 @@ inline std::pair<std::string, std::string> split_s3_uri(std::string_view uri)
   return {std::string{rest.substr(0, slash)}, std::string{rest.substr(slash + 1)}};
 }
 
-/// The first @p n_files parquet objects under the bucket/prefix, as s3:// URIs.
-inline std::vector<std::string> get_files_from_bucket(engine& eng,
-                                                      std::string_view bucket_uri,
-                                                      std::size_t n_files)
+struct s3_file {
+  std::string path;
+  std::size_t size_bytes{0};
+};
+
+/// List up to @p n_files parquet objects under a single s3:// prefix.
+inline std::vector<s3_file> list_prefix(engine& eng,
+                                        std::string_view bucket_uri,
+                                        std::size_t n_files)
 {
   auto const [bucket, prefix] = split_s3_uri(bucket_uri);
 
-  std::vector<std::string> paths;
-  // Paged rather than list_objects(): stop as soon as enough parquet keys have
-  // been seen instead of accumulating a whole bucket listing first.
+  std::vector<s3_file> files;
   eng.rest().list_objects_paged(
     bucket, prefix, 1000, [&](io::rest::s3::list_objects_v2_page const& page) {
       for (auto const& e : page.entries) {
-        if (e.size == 0) { continue; }  // directory marker
+        if (e.size == 0) { continue; }
         if (!std::string_view{e.key}.ends_with(".parquet")) { continue; }
-        paths.push_back("s3://" + bucket + "/" + e.key);
-        if (paths.size() >= n_files) { return false; }
+        files.push_back({"s3://" + bucket + "/" + e.key, static_cast<std::size_t>(e.size)});
+        if (files.size() >= n_files) { return false; }
       }
       return true;
     });
 
-  if (paths.empty()) {
+  if (files.empty()) {
     throw std::runtime_error("no .parquet objects found under " + std::string{bucket_uri});
   }
-  return paths;
+  return files;
 }
 
-// ---------------------------------------------------------------------------
-// parquet chunk discovery
-// ---------------------------------------------------------------------------
-
-/// One file: its datasource, its row groups, its parsed footer, and the byte
-/// ranges of every column chunk it will read.
-struct file_ranges {
-  std::string path;
-  std::unique_ptr<io::sirius_datasource> ds;
-  std::vector<cudf::size_type> row_groups;
-  cudf::io::parquet::FileMetaData metadata;
-  std::vector<cudf::io::text::byte_range_info> ranges;
-
-  [[nodiscard]] std::size_t total_bytes() const
-  {
-    return std::accumulate(ranges.begin(), ranges.end(), std::size_t{0}, [](std::size_t a, auto& r) {
-      return a + static_cast<std::size_t>(r.size());
-    });
-  }
-};
-
-/// Fetch each file's footer and ask a hybrid_scan_reader for every column
-/// chunk's byte range.  All columns, since the benchmarks measure whole-file
-/// throughput.
-inline std::vector<file_ranges> use_hybrid_scan_to_get_column_chunks(
-  engine& eng, std::vector<std::string> const& paths)
+/// Collect @p n_files total across all @p prefixes (divided as evenly as possible),
+/// then interleave them in round-robin order so datasource opens and reads
+/// alternate between prefixes.
+inline std::vector<s3_file> get_files_from_prefixes(engine& eng,
+                                                     std::vector<std::string> const& prefixes,
+                                                     std::size_t n_files)
 {
-  auto const opts = cudf::io::parquet_reader_options::builder().build();
+  if (prefixes.empty()) { throw std::runtime_error("no --bucket specified"); }
 
-  std::vector<file_ranges> out;
-  out.reserve(paths.size());
-  for (auto const& path : paths) {
-    file_ranges fr;
-    fr.path = path;
-    fr.ds   = eng.io_ctx().open_datasource(path);
+  const std::size_t n          = prefixes.size();
+  const std::size_t base       = n_files / n;
+  const std::size_t remainder  = n_files % n;
 
-    auto footer = cudf::io::parquet::fetch_footer_to_host(*fr.ds);
-    hybrid_scan_reader reader(cudf::host_span<uint8_t const>(footer->data(), footer->size()),
-                              opts);
-    fr.row_groups = reader.all_row_groups(opts);
-    fr.metadata   = reader.parquet_metadata();
-
-    auto const rg_span =
-      cudf::host_span<cudf::size_type const>(fr.row_groups.data(), fr.row_groups.size());
-    fr.ranges = reader.all_column_chunks_byte_ranges(rg_span, opts);
-
-    out.push_back(std::move(fr));
+  // Collect per-prefix file lists.
+  std::vector<std::vector<s3_file>> per_prefix;
+  per_prefix.reserve(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    std::size_t want = base + (i < remainder ? 1 : 0);
+    per_prefix.push_back(list_prefix(eng, prefixes[i], want));
   }
-  return out;
+
+  // Round-robin interleave: round 0 takes index 0 from each prefix,
+  // round 1 takes index 1, etc.
+  std::vector<s3_file> result;
+  result.reserve(n_files);
+  for (std::size_t round = 0;; ++round) {
+    bool any = false;
+    for (auto const& files : per_prefix) {
+      if (round < files.size()) {
+        result.push_back(files[round]);
+        any = true;
+      }
+    }
+    if (!any) { break; }
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------

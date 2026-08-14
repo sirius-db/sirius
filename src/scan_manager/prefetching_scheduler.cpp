@@ -164,6 +164,47 @@ std::optional<std::size_t> prefetching_scheduler::peek_next_operator_id() const
   return e.operator_id;
 }
 
+std::vector<std::size_t> prefetching_scheduler::peek_group_operator_ids() const
+{
+  std::vector<std::size_t> ids;
+  if (_group >= _groups.size()) { return ids; }
+  auto const& g = _groups[_group];
+  ids.reserve(g.size());
+  for (std::size_t i = 0; i < g.size(); ++i) {
+    auto const& e = _entries[g[(_member + i) % g.size()]];
+    if (!e.depleted) { ids.push_back(e.operator_id); }
+  }
+  return ids;
+}
+
+std::vector<std::size_t> prefetching_scheduler::peek_lookahead_operator_ids() const
+{
+  std::vector<std::size_t> ids;
+  for (std::size_t g = _group + 1; g < _groups.size(); ++g) {
+    for (auto const idx : _groups[g]) {
+      auto const& e = _entries[idx];
+      if (!e.depleted) { ids.push_back(e.operator_id); }
+    }
+  }
+  return ids;
+}
+
+bool prefetching_scheduler::focus_member(std::size_t operator_id)
+{
+  if (_group >= _groups.size()) { return false; }
+  auto const& g = _groups[_group];
+  for (std::size_t i = 0; i < g.size(); ++i) {
+    auto const& e = _entries[g[i]];
+    if (e.operator_id != operator_id || e.depleted) { continue; }
+    if (_member != i) {
+      _member  = i;
+      _emitted = 0;
+    }
+    return true;
+  }
+  return false;
+}
+
 io::cache::scan_stage prefetching_scheduler::stage_of(std::size_t operator_id) const
 {
   auto it = _by_operator.find(operator_id);

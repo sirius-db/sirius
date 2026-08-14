@@ -88,9 +88,22 @@ void task_creator::set_task_scheduler(sirius::pipeline::task_scheduler& task_sch
   _task_scheduler = &task_scheduler;
 }
 
+void task_creator::notify_pipeline_closure(std::size_t pipeline_id,
+                                           std::size_t source_operator_id) noexcept
+{
+  if (_query_stage_manager != nullptr) {
+    _query_stage_manager->on_pipeline_closed(_query_id, pipeline_id, source_operator_id);
+  }
+}
+
 void task_creator::prepare_for_query(const sirius::planner::query& query)
 {
   std::lock_guard<std::mutex> lock(_global_state_mutex);
+
+  // Stashed for the stage hooks: task creation happens deep in the manager loop
+  // where the query is no longer in scope, and recovering it by unpacking the
+  // priority's high bits would tie the hooks to that encoding.
+  _query_id = query.query_id();
 
   _gpu_operator_global_state_map.clear();
 
@@ -147,7 +160,7 @@ task_creator::compute_pipeline_priorities(const sirius::planner::query& query) c
   //     the branches that reach it, so it runs as soon as its earliest-needed branch wants it.
   std::unordered_map<const pipeline::sirius_pipeline*, exec::queue_priority> priorities;
 
-  auto options  = planner::build_index_options{.branch_order = planner::build_probe{}};
+  auto options  = planner::build_index_options{.branch_order = planner::barrier_order{}};
   auto index    = planner::query_index::build_index(query, options);
   auto branches = index->get_branches();
   if (branches.empty()) { return priorities; }
@@ -356,9 +369,17 @@ void task_creator::manager_loop()
     auto request_kind = request->type;
     if (node == nullptr) { continue; }
 
-    node = get_operator_for_next_task(node);
+    // get_operator_for_next_task overwrites `node`.
+    auto* requested_node = node;
+    node                 = get_operator_for_next_task(node);
 
-    if (node == nullptr) { continue; }
+    if (node == nullptr) {
+      if (_query_stage_manager != nullptr) {
+        _query_stage_manager->on_failed_to_create_task(_query_id,
+                                                       requested_node->get_operator_id());
+      }
+      continue;
+    }
 
     // Dispatch the task creation work to the pool
     _bounded_pool->dispatch(std::move(slot), [this, node, request_kind]() mutable {
@@ -522,6 +543,12 @@ void task_creator::manager_loop()
                                                                     std::move(local_state),
                                                                     gpu_pipeline_task_global_state);
           task_lock.unlock();
+          if (_query_stage_manager != nullptr) {
+            _query_stage_manager->on_task_created(_query_id,
+                                                  operator_id,
+                                                  node->type,
+                                                  gpu_pipeline_task_global_state->get_priority());
+          }
           _task_scheduler->schedule(std::move(task));
 
           if (request_kind == request_type::lookahead) { break; }
