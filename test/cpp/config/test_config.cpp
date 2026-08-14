@@ -15,15 +15,18 @@
  */
 
 #include "catch.hpp"
+#include "sirius_config.hpp"
 #include "yaml_reader.hpp"
 
 #include <yaml-cpp/yaml.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <exception>
 #include <optional>
 #include <stdexcept>
+#include <thread>
 #include <variant>
 
 using namespace sirius;
@@ -647,4 +650,69 @@ TEST_CASE("yaml reader error messages include context", "[config_opt][errors]")
     std::string msg = e.what();
     REQUIRE(msg.find("test.section.value") != std::string::npos);
   }
+}
+
+// ================ query config snapshot (register E1/E2) ================= //
+
+TEST_CASE("query config snapshot: thread-local install, nesting and isolation",
+          "[config][concurrency]")
+{
+  // Outside any execution window there is no snapshot; strategy reads fall
+  // back to the process-global atomic.
+  REQUIRE(sirius::current_query_config_snapshot() == nullptr);
+  const auto saved_strategy = duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY.load();
+  struct strategy_restore {
+    sirius::expression_evaluator_strategy saved;
+    ~strategy_restore() { duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY = saved; }
+  } restore{saved_strategy};
+
+  duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY = sirius::expression_evaluator_strategy::AST_JIT;
+  REQUIRE(sirius::current_expression_evaluator_strategy() ==
+          sirius::expression_evaluator_strategy::AST_JIT);
+
+  sirius::query_config_snapshot snap{};
+  snap.params.scan_task_batch_size = 12345;
+  snap.expression_strategy         = sirius::expression_evaluator_strategy::MATERIALIZE;
+  {
+    sirius::scoped_query_config_snapshot install(snap);
+    const auto* current = sirius::current_query_config_snapshot();
+    REQUIRE(current != nullptr);
+    CHECK(current->params.scan_task_batch_size == 12345);
+    // The snapshot wins over the (different) global while installed: this is
+    // the E2 guarantee that one plan reads one strategy.
+    CHECK(sirius::current_expression_evaluator_strategy() ==
+          sirius::expression_evaluator_strategy::MATERIALIZE);
+
+    // A SET landing after this window's admission mutates only the LIVE
+    // globals, never the installed snapshot.
+    duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY =
+      sirius::expression_evaluator_strategy::AST_INTERPRET;
+    CHECK(sirius::current_expression_evaluator_strategy() ==
+          sirius::expression_evaluator_strategy::MATERIALIZE);
+
+    // Thread-local: another thread (e.g. a GPU pipeline worker of a DIFFERENT
+    // query) must not see this window's snapshot. Catch2 assertions are not
+    // thread-safe, so collect and check on this thread.
+    std::atomic<bool> other_thread_sees_no_snapshot{false};
+    std::thread([&] {
+      other_thread_sees_no_snapshot = sirius::current_query_config_snapshot() == nullptr;
+    }).join();
+    CHECK(other_thread_sees_no_snapshot);
+
+    // Nesting restores the previous pointer (defensive: windows do not nest
+    // today, the slot guard errors on same-thread reacquire).
+    {
+      sirius::query_config_snapshot inner = snap;
+      inner.params.scan_task_batch_size   = 999;
+      sirius::scoped_query_config_snapshot install_inner(inner);
+      REQUIRE(sirius::current_query_config_snapshot() != nullptr);
+      CHECK(sirius::current_query_config_snapshot()->params.scan_task_batch_size == 999);
+    }
+    REQUIRE(sirius::current_query_config_snapshot() == current);
+    CHECK(current->params.scan_task_batch_size == 12345);
+  }
+  REQUIRE(sirius::current_query_config_snapshot() == nullptr);
+  // Back outside a window, the (mutated) global shows through again.
+  CHECK(sirius::current_expression_evaluator_strategy() ==
+        sirius::expression_evaluator_strategy::AST_INTERPRET);
 }
