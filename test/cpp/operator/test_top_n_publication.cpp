@@ -33,6 +33,7 @@
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/dynamic_filter/top_n_dynamic_filter_publish_plan.hpp>
 #include <op/dynamic_filter/top_n_threshold_coordinator.hpp>
+#include <op/scan/dynamic_filter_merge.hpp>
 #include <op/sirius_physical_table_scan.hpp>
 #include <planner/dynamic_filter/dynamic_filter_target_discovery.hpp>
 
@@ -156,19 +157,19 @@ TEST_CASE("terminal classification follows the documented table", "[dynamic_filt
   REQUIRE(classify_top_n_terminal(scan, top_n_filter_layer::FIRST_KEY, 1, false) ==
           top_n_target_kind::SCAN_BIND);
   // Material work in between makes an endpoint worth its cost even where no read can be skipped --
-  // the rule refuses sites that duplicate the sink's pass, not a backend. A single-ordinal
-  // first-key site is spliceable today; a LEX site needs multi-ordinal placement, so it is
-  // reported as deferred -- a staged gap, deliberately distinct from the siting rule declining.
+  // the rule refuses sites that duplicate the sink's pass, not a backend. The verdict is
+  // layer-independent: a LEX endpoint splices through place_endpoint_all_keys, carrying every
+  // component ordinal.
   REQUIRE(classify_top_n_terminal(non_scan, top_n_filter_layer::FIRST_KEY, 1, false) ==
           top_n_target_kind::ENDPOINT_SITE);
   REQUIRE(classify_top_n_terminal(non_scan, top_n_filter_layer::LEX, 1, false) ==
-          top_n_target_kind::LEX_ENDPOINT_DEFERRED);
+          top_n_target_kind::ENDPOINT_SITE);
   // A LEX site already carries the stronger predicate, so the first-key bound is redundant there.
   REQUIRE(classify_top_n_terminal(non_scan, top_n_filter_layer::FIRST_KEY, 3, false, true) ==
           top_n_target_kind::SUBSUMED_BY_LEX);
   // Subsumption applies only to the first-key layer.
   REQUIRE(classify_top_n_terminal(non_scan, top_n_filter_layer::LEX, 3, false, true) ==
-          top_n_target_kind::LEX_ENDPOINT_DEFERRED);
+          top_n_target_kind::ENDPOINT_SITE);
 }
 
 TEST_CASE("only a reader with a read-time filter path skips reads", "[dynamic_filter][top_n]")
@@ -606,6 +607,101 @@ TEST_CASE("a GROUP_KEY producer's published LEX predicate keeps rows tying the w
   // Strict, unchanged: a row producer's full-tuple peers are interchangeable once K witnesses
   // exist, so only the strictly better row survives.
   REQUIRE(survivors(visible_filter(*row_channel, 0)) == 1);
+}
+
+TEST_CASE("a LEX endpoint slot applies the published predicate at its declared ordinals",
+          "[dynamic_filter][top_n]")
+{
+  // The endpoint's consumption plumbing -- snapshot, the compaction block's multi-column
+  // resolution through referenced_ordinals(), apply_compact -- at deliberately non-identity
+  // ordinals: component 0 lives in column 1 and component 1 in column 0, with column 2 as
+  // payload. A resolver that read components at their component index instead of their declared
+  // ordinal would compare the wrong columns and pass or prune the wrong rows here. Strictness at
+  // the endpoint rides the same triple: a strict ROW boundary drops the full-tuple tie that an
+  // inclusive GROUP_KEY boundary must keep.
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = space->get_default_allocator();
+
+  auto const publish_lex_endpoint = [&](sirius::op::top_n_producer_kind kind) {
+    auto channel = std::make_shared<sirius_dynamic_filter_set>();
+    auto coordinator =
+      std::make_shared<top_n_threshold_coordinator>(2, ascending_keys(2), true, nullptr, kind);
+    top_n_dynamic_filter_publish_plan plan;
+    plan.k    = 2;
+    plan.kind = kind;
+    plan.keys = {
+      {.child_ordinal = 0, .semantics = ascending_keys(1).front(), .type_admitted = true},
+      {.child_ordinal = 1, .semantics = ascending_keys(1).front(), .type_admitted = true}};
+    plan.targets.push_back({.publisher          = channel->register_refinement_slot(1, {0}),
+                            .layer              = top_n_filter_layer::LEX,
+                            .component_ordinals = {1, 0}});
+    coordinator->set_publish_plan(std::move(plan));
+    if (kind == sirius::op::top_n_producer_kind::GROUP_KEY) {
+      REQUIRE(coordinator->offer(distinct_witness({{5, 5}, {7, 7}})) ==
+              threshold_offer_result::ACCEPTED_FOR_PUBLICATION);
+    } else {
+      REQUIRE(coordinator->offer(witness({7, 7})) ==
+              threshold_offer_result::ACCEPTED_FOR_PUBLICATION);
+    }
+    return std::pair{channel, coordinator};
+  };
+
+  // The boundary tuple is (7, 7). Column 1 carries component 0 and column 0 carries component 1,
+  // so by (component 0, component 1) the rows read: (7,6) strictly better, (7,7) the exact
+  // full-tuple tie, (7,8) strictly worse. Column 2 is payload no component references.
+  auto const column0_values = std::vector<std::int32_t>{6, 7, 8};     // component 1
+  auto const column1_values = std::vector<std::int32_t>{7, 7, 7};     // component 0
+  auto const column2_values = std::vector<std::int32_t>{10, 20, 30};  // payload
+  auto const make_column    = [&](std::vector<std::int32_t> const& values) {
+    auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                            static_cast<cudf::size_type>(values.size()),
+                                            cudf::mask_state::UNALLOCATED,
+                                            stream,
+                                            mr);
+    cudaMemcpy(column->mutable_view().data<std::int32_t>(),
+               values.data(),
+               values.size() * sizeof(std::int32_t),
+               cudaMemcpyHostToDevice);
+    return column;
+  };
+  auto const column0 = make_column(column0_values);
+  auto const column1 = make_column(column1_values);
+  auto const column2 = make_column(column2_values);
+  auto const batch   = cudf::table_view{{column0->view(), column1->view(), column2->view()}};
+
+  auto const survivors = [&](sirius_dynamic_filter_set const& channel) {
+    auto const filtered = sirius::op::scan::apply_dynamic_filters_to_view(
+      batch,
+      channel.snapshot(),
+      stream,
+      sirius::op::scan::dynamic_filter_apply_mode::include_ast_row_masks,
+      nullptr,
+      -1);
+    return filtered == nullptr ? static_cast<cudf::size_type>(column0_values.size())
+                               : filtered->num_rows();
+  };
+
+  auto const [row_channel, row_coordinator] =
+    publish_lex_endpoint(sirius::op::top_n_producer_kind::ROW);
+  auto const installed = visible_filter(*row_channel, 1);
+  REQUIRE(installed != nullptr);
+  REQUIRE(installed->kind() == sirius_dynamic_filter_kind::LEX_RANGE);
+  // The installed filter carries the slot's declared ordinals, primary first.
+  auto const& lex     = static_cast<sirius::op::sirius_dynamic_lex_range_filter const&>(*installed);
+  auto const declared = lex.referenced_ordinals();
+  REQUIRE(declared.size() == 2);
+  REQUIRE(declared[0] == 1);
+  REQUIRE(declared[1] == 0);
+  // Strict: only the strictly better row survives.
+  REQUIRE(survivors(*row_channel) == 1);
+
+  auto const [group_channel, group_coordinator] =
+    publish_lex_endpoint(sirius::op::top_n_producer_kind::GROUP_KEY);
+  // Inclusive: the strictly better row and the exact full-tuple tie survive.
+  REQUIRE(survivors(*group_channel) == 2);
 }
 
 TEST_CASE("a decimal boundary publishes a fixed-point literal at its own scale",

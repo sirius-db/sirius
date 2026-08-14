@@ -20,7 +20,8 @@
  *
  * `trace_probe_key()` follows one admitted probe key through the physical probe subtree.
  * `TABLE_SCAN` terminals are scan-binding sites; other terminals can be wrapped by
- * `place_endpoint()`. Both operations use @ref descent_steps. Each accepted step remaps the key
+ * `place_endpoint()`, or by `place_endpoint_all_keys()` when the site must carry every ordinal of
+ * an all-keys trace. All operations use @ref descent_steps. Each accepted step remaps the key
  * ordinal into its child's output space.
  */
 
@@ -102,13 +103,26 @@ struct route_terminal {
  * `subtree` owns the complete rewrapped subtree. `site_ordinals` holds one entry per spliced site,
  * in the same deterministic pre-order (ascending child index) the walk visits terminals, so a
  * caller minting one channel per `endpoint_factory` invocation can zip its mints with these
- * ordinals. Every plan without a physical set operation has exactly one site.
+ * ordinals. Every plan without a physical set operation has exactly one site. The multi-ordinal
+ * counterpart is @ref multi_key_endpoint_placement.
  */
 struct endpoint_placement {
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>
     subtree;  ///< Rewrapped subtree containing the endpoint(s)
   std::vector<std::size_t>
     site_ordinals;  ///< Traced ordinal per site, in the sited operator's output space
+};
+
+/**
+ * @brief Result of splicing all-keys endpoints into a subtree
+ *
+ * The multi-ordinal counterpart of @ref endpoint_placement: one ordinal vector per spliced site,
+ * primary (key zero) first, in the sited operator's output space -- which is also the spliced
+ * endpoint's input and output space, because the endpoint passes columns through unchanged.
+ */
+struct multi_key_endpoint_placement {
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> subtree;
+  std::vector<std::vector<std::size_t>> site_ordinals;  ///< Per site, primary first
 };
 
 /**
@@ -277,8 +291,7 @@ enum class top_n_target_kind {
   SCAN_BIND,              ///< Bind into the scan's reader AST
   ENDPOINT_SITE,          ///< Splice a sited endpoint above the terminal
   SKIPPED_NO_WORK_SAVED,  ///< Saves no work the sink prefilter does not already save
-  SUBSUMED_BY_LEX,        ///< A LEX target already covers this site, which implies this bound
-  LEX_ENDPOINT_DEFERRED   ///< Worth siting, but multi-ordinal placement lands in Stage 7
+  SUBSUMED_BY_LEX         ///< A LEX target already covers this site, which implies this bound
 };
 
 /**
@@ -305,10 +318,9 @@ enum class top_n_target_kind {
  * `LEX` target's site is marked subsumed by the caller, which alone knows the LEX sites; pass
  * @p coincides_with_lex_site to have it reported here.
  *
- * A `LEX` terminal that is not a scan reports @c LEX_ENDPOINT_DEFERRED rather than
- * @c ENDPOINT_SITE: siting it needs multi-ordinal placement, which lands in Stage 7. Keeping it
- * distinct from @c SKIPPED_NO_WORK_SAVED is deliberate -- the skip counter must mean "the cost
- * gate said no", never "this stage cannot express it".
+ * Layer does not change the verdict: a material non-scan terminal is an @c ENDPOINT_SITE for
+ * FIRST_KEY and LEX alike -- the LEX splice carries every component ordinal
+ * (@ref place_endpoint_all_keys), so no capability gap remains for classification to report.
  *
  * @param[in] terminal Where the trace bottomed out
  * @param[in] layer Which layer this terminal would carry
@@ -380,6 +392,9 @@ using endpoint_factory = std::function<duckdb::unique_ptr<sirius::op::sirius_phy
  * Existing `sirius_physical_dynamic_filter` operators are transparent to the trace, so placing one
  * key does not prevent later keys from reaching the same depth.
  *
+ * Delegates to @ref place_endpoint_all_keys with a one-element ordinal set, which reduces the
+ * all-keys hop rules to exactly this walk -- one shared recursion, so the two forms cannot drift.
+ *
  * @pre The producing join compares the key with `sirius::comparison_type::equal`;
  * `direct_route_admissible()` enforces this before placement.
  * @pre @p subtree is not null.
@@ -393,6 +408,31 @@ using endpoint_factory = std::function<duckdb::unique_ptr<sirius::op::sirius_phy
 [[nodiscard]] endpoint_placement place_endpoint(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> subtree,
   std::size_t a0,
+  descent_policy policy,
+  endpoint_factory const& make_endpoint);
+
+/**
+ * @brief Place an endpoint at the deepest site every traced ordinal reaches together
+ *
+ * The all-keys counterpart of @ref place_endpoint, and the splice for LEX endpoint targets. The
+ * walk is driven by the same hop rules as @ref trace_top_n_all_keys -- a hop is taken only when
+ * every ordinal survives it into the same child, each remapped independently -- so a splice
+ * performed after a trace over an unchanged subtree lands exactly at the trace's terminal, with
+ * the same remapped ordinals. Callers zipping mints with sites should assert that equality.
+ * A fan-out step splices one endpoint per reached branch. If the root refuses, the endpoint
+ * wraps the root.
+ *
+ * @pre @p subtree is not null; @p ordinals is not empty.
+ *
+ * @param[in] subtree Subtree whose ownership transfers to the result
+ * @param[in] ordinals Every traced ordinal in @p subtree's output space, key zero first
+ * @param[in] policy Which hops this producer may take
+ * @param[in] make_endpoint Factory for the endpoint operator(s)
+ * @return The rewrapped subtree and the full remapped ordinal vector at each spliced site
+ */
+[[nodiscard]] multi_key_endpoint_placement place_endpoint_all_keys(
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> subtree,
+  std::span<std::size_t const> ordinals,
   descent_policy policy,
   endpoint_factory const& make_endpoint);
 

@@ -61,7 +61,6 @@
 #include <duckdb/planner/planner.hpp>
 #include <unistd.h>
 
-#include <algorithm>
 #include <cstdio>
 #include <filesystem>
 #include <memory>
@@ -198,6 +197,28 @@ std::vector<sirius_physical_dynamic_filter*> scan_route_filters(sirius_physical_
     }
   }
   return out;
+}
+
+/// Every sited Top-N endpoint (`DYNAMIC_FILTER` with `top_n_endpoint` provenance) in the plan.
+std::vector<sirius_physical_dynamic_filter*> top_n_endpoint_filters(sirius_physical_operator* root)
+{
+  std::vector<sirius_physical_dynamic_filter*> out;
+  for (auto* node : collect(root, SiriusPhysicalOperatorType::DYNAMIC_FILTER)) {
+    auto* filter = static_cast<sirius_physical_dynamic_filter*>(node);
+    if (filter->provenance() == dynamic_filter_endpoint_provenance::top_n_endpoint) {
+      out.push_back(filter);
+    }
+  }
+  return out;
+}
+
+/// Slots registered on @p filter's channel.
+std::vector<sirius::op::sirius_dynamic_filter_set::refinement_slot_view> endpoint_slots(
+  sirius_physical_dynamic_filter& filter)
+{
+  auto const channel = filter.filters();
+  REQUIRE(channel != nullptr);
+  return channel->refinement_slots();
 }
 
 /// Refinement slots registered on every scan-route channel in the plan.
@@ -358,7 +379,9 @@ TEST_CASE_METHOD(top_n_plan_shape_fixture,
   CHECK(after.top_n_sites_skipped_no_work_saved > before.top_n_sites_skipped_no_work_saved);
   CHECK(after.top_n_first_key_scan_targets == before.top_n_first_key_scan_targets);
   CHECK(after.top_n_lex_scan_targets == before.top_n_lex_scan_targets);
-  CHECK(after.top_n_endpoint_sites_placed == before.top_n_endpoint_sites_placed);
+  CHECK(after.top_n_first_key_endpoint_sites_placed ==
+        before.top_n_first_key_endpoint_sites_placed);
+  CHECK(after.top_n_lex_endpoint_sites_placed == before.top_n_lex_endpoint_sites_placed);
   CHECK(registered_slots(plan.get()).empty());
   CHECK(scan_route_filters(plan.get()).empty());
 }
@@ -767,8 +790,8 @@ TEST_CASE_METHOD(top_n_plan_shape_fixture,
 }
 
 TEST_CASE_METHOD(top_n_plan_shape_fixture,
-                 "top-n plan shape - split keys across a join defer the LEX site and endpoint the "
-                 "first-key bound",
+                 "top-n plan shape - split keys across a join site the LEX endpoint and subsume "
+                 "the first-key bound",
                  "[plan_tree_shape][isolated_context][top_n]")
 {
   top_n_filter_switch_guard flag(*con, true);
@@ -776,46 +799,163 @@ TEST_CASE_METHOD(top_n_plan_shape_fixture,
   REQUIRE(state != nullptr);
   auto const before = state->get_dynamic_filter_stats_snapshot();
 
-  // Scenario 10: the keys come from opposite sides of a join, so the all-keys trace stops at the
-  // join output while key zero continues into its own scan. A residual FILTER above the join
-  // makes that stop point material, so the LEX site is worth having -- and is deferred, not
-  // cost-gate skipped, because splicing it needs multi-ordinal placement (Stage 7).
+  // Scenario 10: the keys come from opposite sides of a join, so both traces stop at the join
+  // output under the minimal hop set. The residual FILTER above the join makes that
+  // arrive-together stop point material, so the full strict predicate is spliced there as a LEX
+  // endpoint and the coinciding first-key terminal is subsumed.
   auto plan        = generate_sirius_plan(*con,
                                    "SELECT f.v, d.dv FROM facts f JOIN dim d ON f.id = d.dk "
                                           "WHERE f.v + d.dv <> 12345 ORDER BY f.v, d.dv LIMIT 10");
   auto const after = state->get_dynamic_filter_stats_snapshot();
 
-  // The staged gap is reported as itself, never folded into the cost-gate skip counter.
-  CHECK(after.top_n_lex_endpoint_sites_deferred > before.top_n_lex_endpoint_sites_deferred);
-  CHECK(after.top_n_lex_scan_targets == before.top_n_lex_scan_targets);
+  // The shape is genuinely the intended one: a residual FILTER survived above the join.
+  REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::FILTER) != nullptr);
 
-  // The minimal hop set refuses join hops for *both* traces, so key zero also stops at the join
-  // rather than continuing into its own scan (that widening is Stage 7). Its stop point is
-  // material, and a single-ordinal endpoint is exactly what `place_endpoint` can splice -- so the
-  // inclusive first-key bound is applied at a sited endpoint above the join.
-  auto const endpoints = collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER);
-  auto const top_n_endpoints =
-    std::count_if(endpoints.begin(), endpoints.end(), [](sirius_physical_operator* node) {
-      return static_cast<sirius_physical_dynamic_filter*>(node)->provenance() ==
-             dynamic_filter_endpoint_provenance::top_n_endpoint;
-    });
-  CHECK(top_n_endpoints == 1);
-  CHECK(after.top_n_endpoint_sites_placed > before.top_n_endpoint_sites_placed);
+  CHECK(after.top_n_lex_endpoint_sites_placed - before.top_n_lex_endpoint_sites_placed == 1);
+  CHECK(after.top_n_first_key_subsumed_by_lex - before.top_n_first_key_subsumed_by_lex == 1);
+  CHECK(after.top_n_first_key_endpoint_sites_placed ==
+        before.top_n_first_key_endpoint_sites_placed);
+  CHECK(after.top_n_sites_skipped_no_work_saved == before.top_n_sites_skipped_no_work_saved);
 
-  // That endpoint carries the first-key layer alone: one slot, no referenced ordinal.
-  for (auto* node : endpoints) {
-    auto* filter = static_cast<sirius_physical_dynamic_filter*>(node);
-    if (filter->provenance() != dynamic_filter_endpoint_provenance::top_n_endpoint) { continue; }
-    auto const channel = filter->filters();
-    REQUIRE(channel != nullptr);
-    auto const slots = channel->refinement_slots();
-    REQUIRE(slots.size() == 1);
-    CHECK(slots.front().referenced_ordinals.empty());
-  }
+  // Exactly one sited endpoint, and it sits above the join: its subtree contains the plan's
+  // HASH_JOIN (containment, not direct-child type -- the join planner may itself wrap the join).
+  auto const endpoints = top_n_endpoint_filters(plan.get());
+  REQUIRE(endpoints.size() == 1);
+  auto* join = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+  REQUIRE(join != nullptr);
+  CHECK(contains_operator(endpoints.front(), join));
+
+  // The endpoint carries the full tuple: one slot declaring both ordinals, primary first.
+  auto const slots = endpoint_slots(*endpoints.front());
+  REQUIRE(slots.size() == 1);
+  REQUIRE(slots.front().referenced_ordinals.size() == 1);
+  CHECK(slots.front().referenced_ordinals.front() != slots.front().primary_ordinal);
 
   // No scan was bound: neither trace got past the join.
   CHECK(registered_slots(plan.get()).empty());
   CHECK(after.top_n_first_key_scan_targets == before.top_n_first_key_scan_targets);
+  CHECK(after.top_n_lex_scan_targets == before.top_n_lex_scan_targets);
+}
+
+TEST_CASE_METHOD(top_n_plan_shape_fixture,
+                 "top-n plan shape - three split keys carry three ordinals to one LEX endpoint",
+                 "[plan_tree_shape][isolated_context][top_n]")
+{
+  top_n_filter_switch_guard flag(*con, true);
+  auto* state = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
+  REQUIRE(state != nullptr);
+  auto const before = state->get_dynamic_filter_stats_snapshot();
+
+  // The split shape with a three-key ORDER BY: the ordinal vector the splice carries is genuinely
+  // N-ary, not a pair special case.
+  auto plan        = generate_sirius_plan(*con,
+                                   "SELECT f.v, f.w, d.dv FROM facts f JOIN dim d ON f.id = d.dk "
+                                          "WHERE f.v + d.dv <> 12345 ORDER BY f.v, f.w, d.dv LIMIT 10");
+  auto const after = state->get_dynamic_filter_stats_snapshot();
+
+  REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::FILTER) != nullptr);
+  CHECK(after.top_n_lex_endpoint_sites_placed - before.top_n_lex_endpoint_sites_placed == 1);
+  CHECK(after.top_n_first_key_subsumed_by_lex - before.top_n_first_key_subsumed_by_lex == 1);
+
+  auto const endpoints = top_n_endpoint_filters(plan.get());
+  REQUIRE(endpoints.size() == 1);
+  auto const slots = endpoint_slots(*endpoints.front());
+  REQUIRE(slots.size() == 1);
+  REQUIRE(slots.front().referenced_ordinals.size() == 2);
+  CHECK(slots.front().referenced_ordinals[0] != slots.front().primary_ordinal);
+  CHECK(slots.front().referenced_ordinals[1] != slots.front().primary_ordinal);
+  CHECK(slots.front().referenced_ordinals[0] != slots.front().referenced_ordinals[1]);
+}
+
+TEST_CASE_METHOD(top_n_plan_shape_fixture,
+                 "top-n plan shape - an unadmitted tail degrades the split shape to a first-key "
+                 "endpoint",
+                 "[plan_tree_shape][isolated_context][top_n]")
+{
+  top_n_filter_switch_guard flag(*con, true);
+  auto* state = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
+  REQUIRE(state != nullptr);
+  auto const before = state->get_dynamic_filter_stats_snapshot();
+
+  // The endpoint counterpart of the scan degrade case: a VARCHAR tail disables the LEX layer, so
+  // no LEX endpoint exists and the first-key endpoint appears exactly as before the LEX splice
+  // landed.
+  auto plan        = generate_sirius_plan(*con,
+                                   "SELECT f.v, d.dv, f.pay FROM facts f JOIN dim d ON f.id = d.dk "
+                                          "WHERE f.v + d.dv <> 12345 ORDER BY f.v, d.dv, f.pay LIMIT 10");
+  auto const after = state->get_dynamic_filter_stats_snapshot();
+
+  REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::FILTER) != nullptr);
+  CHECK(after.top_n_producers_first_key_only - before.top_n_producers_first_key_only == 1);
+  CHECK(after.top_n_lex_endpoint_sites_placed == before.top_n_lex_endpoint_sites_placed);
+  CHECK(after.top_n_first_key_endpoint_sites_placed -
+          before.top_n_first_key_endpoint_sites_placed ==
+        1);
+  CHECK(after.top_n_first_key_subsumed_by_lex == before.top_n_first_key_subsumed_by_lex);
+
+  auto const endpoints = top_n_endpoint_filters(plan.get());
+  REQUIRE(endpoints.size() == 1);
+  auto const slots = endpoint_slots(*endpoints.front());
+  REQUIRE(slots.size() == 1);
+  REQUIRE(slots.front().referenced_ordinals.empty());
+}
+
+TEST_CASE_METHOD(top_n_plan_shape_fixture,
+                 "top-n plan shape - a group-key producer splices an inclusive LEX endpoint below "
+                 "the aggregate",
+                 "[plan_tree_shape][isolated_context][top_n]")
+{
+  top_n_filter_switch_guard flag(*con, true);
+  auto* state = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
+  REQUIRE(state != nullptr);
+  auto const before = state->get_dynamic_filter_stats_snapshot();
+
+  // The group-key path's split shape: both grouping keys come from opposite join sides, and the
+  // cross-side WHERE lowers to a FILTER above that join, below the aggregate. The group-key
+  // producer roots at the aggregate's input, where its all-keys trace stops at the join with
+  // material work above it -- so the LEX endpoint splices below the aggregate, and the group
+  // producer's own key-zero terminal coincides there and is subsumed.
+  auto plan =
+    generate_sirius_plan(*con,
+                         "SELECT f.w, d.dv, sum(f.v) AS s FROM facts f JOIN dim d ON f.id = d.dk "
+                         "WHERE f.w + d.dv <> 12345 GROUP BY f.w, d.dv ORDER BY f.w, d.dv LIMIT 5");
+  auto const after = state->get_dynamic_filter_stats_snapshot();
+
+  REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::FILTER) != nullptr);
+  auto* aggregate = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_GROUP_BY);
+  REQUIRE(aggregate != nullptr);
+  REQUIRE(aggregate->children.size() == 1);
+
+  CHECK(after.top_n_group_producers_eligible - before.top_n_group_producers_eligible == 1);
+  CHECK(after.top_n_lex_endpoint_sites_placed - before.top_n_lex_endpoint_sites_placed == 1);
+  CHECK(after.top_n_first_key_subsumed_by_lex >= before.top_n_first_key_subsumed_by_lex + 1);
+
+  auto const endpoints = top_n_endpoint_filters(plan.get());
+  REQUIRE(endpoints.size() == 1);
+  CHECK(contains_operator(aggregate->children[0].get(), endpoints.front()));
+
+  auto const slots = endpoint_slots(*endpoints.front());
+  REQUIRE(slots.size() == 1);
+  REQUIRE(slots.front().referenced_ordinals.size() == 1);
+}
+
+TEST_CASE_METHOD(top_n_plan_shape_fixture,
+                 "top-n plan shape - flag off splices no LEX endpoint",
+                 "[plan_tree_shape][isolated_context][top_n]")
+{
+  top_n_filter_switch_guard flag(*con, false);
+  auto* state = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state").get();
+  REQUIRE(state != nullptr);
+  auto const before = state->get_dynamic_filter_stats_snapshot();
+
+  auto plan        = generate_sirius_plan(*con,
+                                   "SELECT f.v, d.dv FROM facts f JOIN dim d ON f.id = d.dk "
+                                          "WHERE f.v + d.dv <> 12345 ORDER BY f.v, d.dv LIMIT 10");
+  auto const after = state->get_dynamic_filter_stats_snapshot();
+
+  CHECK(top_n_endpoint_filters(plan.get()).empty());
+  CHECK(after.top_n_lex_endpoint_sites_placed == before.top_n_lex_endpoint_sites_placed);
+  CHECK(registered_slots(plan.get()).empty());
 }
 
 TEST_CASE_METHOD(top_n_plan_shape_fixture,
@@ -860,7 +1000,7 @@ TEST_CASE_METHOD(top_n_plan_shape_fixture,
 
   SECTION("a sited top-n endpoint")
   {
-    // The split-keys shape from the deferral case above: key zero endpoints above the join.
+    // The split-keys shape from the sited case above: the LEX endpoint above the join.
     auto plan     = generate_sirius_plan(*con,
                                      "SELECT f.v, d.dv FROM facts f JOIN dim d ON f.id = d.dk "
                                          "WHERE f.v + d.dv <> 12345 ORDER BY f.v, d.dv LIMIT 10");

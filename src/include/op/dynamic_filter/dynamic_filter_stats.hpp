@@ -57,18 +57,18 @@ struct dynamic_filter_stats_snapshot {
   std::uint64_t top_n_prefilter_rows_out       = 0;
   std::uint64_t top_n_prefilter_disabled       = 0;
 
-  std::uint64_t top_n_first_key_scan_targets      = 0;
-  std::uint64_t top_n_lex_scan_targets            = 0;
-  std::uint64_t top_n_endpoint_sites_placed       = 0;
-  std::uint64_t top_n_sites_skipped_no_work_saved = 0;
-  std::uint64_t top_n_lex_endpoint_sites_deferred = 0;
-  std::uint64_t top_n_first_key_subsumed_by_lex   = 0;
-  std::uint64_t top_n_revisions_published         = 0;
-  std::uint64_t top_n_lex_filters_pushed          = 0;
-  std::uint64_t top_n_first_key_filters_pushed    = 0;
-  std::uint64_t top_n_revisions_failed            = 0;
-  std::uint64_t top_n_revisions_stale             = 0;
-  std::uint64_t top_n_revisions_ignored           = 0;
+  std::uint64_t top_n_first_key_scan_targets          = 0;
+  std::uint64_t top_n_lex_scan_targets                = 0;
+  std::uint64_t top_n_first_key_endpoint_sites_placed = 0;
+  std::uint64_t top_n_lex_endpoint_sites_placed       = 0;
+  std::uint64_t top_n_sites_skipped_no_work_saved     = 0;
+  std::uint64_t top_n_first_key_subsumed_by_lex       = 0;
+  std::uint64_t top_n_revisions_published             = 0;
+  std::uint64_t top_n_lex_filters_pushed              = 0;
+  std::uint64_t top_n_first_key_filters_pushed        = 0;
+  std::uint64_t top_n_revisions_failed                = 0;
+  std::uint64_t top_n_revisions_stale                 = 0;
+  std::uint64_t top_n_revisions_ignored               = 0;
 
   std::uint64_t top_n_group_producers_eligible = 0;
   std::uint64_t top_n_group_producers_rejected = 0;
@@ -172,9 +172,12 @@ struct dynamic_filter_stats {
   // The scan-target, endpoint-site, and subsumption counters are plan-time facts like
   // producers_enabled; the revision and push counters are delivery-time and race scan starts by
   // design, so tests assert them as deltas or directions only.
-  std::atomic<std::uint64_t> top_n_first_key_scan_targets{0};  ///< Plan-time
-  std::atomic<std::uint64_t> top_n_lex_scan_targets{0};        ///< Plan-time; all keys one scan
-  std::atomic<std::uint64_t> top_n_endpoint_sites_placed{0};   ///< Plan-time; either layer
+  std::atomic<std::uint64_t> top_n_first_key_scan_targets{0};           ///< Plan-time
+  std::atomic<std::uint64_t> top_n_lex_scan_targets{0};                 ///< Plan-time; all keys
+                                                                        ///< one scan
+  std::atomic<std::uint64_t> top_n_first_key_endpoint_sites_placed{0};  ///< Plan-time
+  /// Plan-time; a sited endpoint carrying the full-tuple predicate, one per arrive-together site
+  std::atomic<std::uint64_t> top_n_lex_endpoint_sites_placed{0};
   /// Plan-time; the siting rule declined -- the target neither reads less because of the predicate
   /// nor shields per-row work from it, so it would only repeat the sink prefilter's own pass.
   /// Covers endpoints and post-decode-only scan binds alike. Also counts the type-admission
@@ -182,9 +185,6 @@ struct dynamic_filter_stats {
   /// hops make that refusal unconstructible through a built plan, so it is pinned at the
   /// pure-function level rather than given a counter no plan can move.
   std::atomic<std::uint64_t> top_n_sites_skipped_no_work_saved{0};
-  /// Plan-time; a material LEX site this stage cannot splice (multi-ordinal placement is Stage 7).
-  /// Kept apart from the skip counter so a staged gap never reads as a cost-gate decision.
-  std::atomic<std::uint64_t> top_n_lex_endpoint_sites_deferred{0};
   std::atomic<std::uint64_t> top_n_first_key_subsumed_by_lex{0};  ///< Plan-time; dedup fired
   std::atomic<std::uint64_t> top_n_revisions_published{0};        ///< Boundary updates fanned out
   std::atomic<std::uint64_t> top_n_lex_filters_pushed{0};
@@ -271,11 +271,12 @@ struct dynamic_filter_stats {
       .top_n_prefilter_disabled     = top_n_prefilter_disabled.load(std::memory_order_relaxed),
       .top_n_first_key_scan_targets = top_n_first_key_scan_targets.load(std::memory_order_relaxed),
       .top_n_lex_scan_targets       = top_n_lex_scan_targets.load(std::memory_order_relaxed),
-      .top_n_endpoint_sites_placed  = top_n_endpoint_sites_placed.load(std::memory_order_relaxed),
+      .top_n_first_key_endpoint_sites_placed =
+        top_n_first_key_endpoint_sites_placed.load(std::memory_order_relaxed),
+      .top_n_lex_endpoint_sites_placed =
+        top_n_lex_endpoint_sites_placed.load(std::memory_order_relaxed),
       .top_n_sites_skipped_no_work_saved =
         top_n_sites_skipped_no_work_saved.load(std::memory_order_relaxed),
-      .top_n_lex_endpoint_sites_deferred =
-        top_n_lex_endpoint_sites_deferred.load(std::memory_order_relaxed),
       .top_n_first_key_subsumed_by_lex =
         top_n_first_key_subsumed_by_lex.load(std::memory_order_relaxed),
       .top_n_revisions_published = top_n_revisions_published.load(std::memory_order_relaxed),

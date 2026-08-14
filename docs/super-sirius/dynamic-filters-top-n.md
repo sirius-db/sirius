@@ -7,12 +7,12 @@
 > classes with reader-AST lowering, the compaction capability, and all-or-nothing replication
 > (Stage 3); and publication itself (Stage 4) — the immutable publish plan, both discovery
 > traces, planner wiring, the publisher loop allocating real revisions, and the reader-AST and
-> sited-endpoint consumers. Producers publish to channels: scan binds and first-key endpoints are
-> live, LEX endpoints are deferred to Stage 7, and a set operation is a terminal for the Top-N
-> trace. The group-key producer (Stage 5) and everything after it remain proposed. This document
-> makes Top-N the first concrete Phase 4 dynamic-refinement producer while preserving the
-> implemented, append-only hash-join publication path. See
-> [dynamic-filters.md](dynamic-filters.md) for the general framework,
+> sited-endpoint consumers. Producers publish to channels: scan binds and sited endpoints of both
+> layers are live (LEX endpoints splice at arrive-together points via multi-ordinal placement),
+> and a set operation is a terminal for the Top-N trace. The group-key producer (Stage 5) and
+> everything after it remain proposed. This document makes Top-N the first concrete Phase 4
+> dynamic-refinement producer while preserving the implemented, append-only hash-join
+> publication path. See [dynamic-filters.md](dynamic-filters.md) for the general framework,
 > [dynamic-filters-multi-gpu.md](dynamic-filters-multi-gpu.md) for current device-replica
 > ownership, and [dynamic-filters-top-n-api.md](dynamic-filters-top-n-api.md) for the
 > header-level API specification and the high-level test plan.
@@ -724,10 +724,12 @@ test.
 
 A first-key target whose site coincides with a LEX target is dropped: the LEX predicate implies
 the first-key bound, and at the pinned cuDF the subsumption holds for statistics pruning too (see
-the Parquet notes) — one site never carries both layers. Endpoint sites of either layer use the
-same splice `place_endpoint` uses for join-edge endpoints; they satisfy the K-witness rule's site
-condition because only value-preserving hops lie between a site and the Top-N
-input. The planner skips a site whose gap to the sink holds no material operator; the cost model
+the Parquet notes) — one site never carries both layers. First-key endpoint sites use the
+same `place_endpoint` splice as join-edge endpoints; LEX endpoint sites use its all-keys
+counterpart (`place_endpoint_all_keys`), which carries every component ordinal to the spliced
+site. Both satisfy the K-witness rule's site condition because only value-preserving hops lie
+between a site and the Top-N input. The planner skips a site whose gap to the sink holds no
+material operator; the cost model
 lives with the sited-endpoint consumer below.
 
 An expression key needs no special rule: the operator itself accepts only bound-reference keys,
@@ -735,10 +737,11 @@ so `ORDER BY a + b` reaches the producer as a reference into the child projectio
 materializes the expression; the affected trace stops there. An aggregate key (`ORDER BY sum(x)`)
 stops at the aggregate slot; after pipeline wrapping that endpoint site sits directly above the
 merge read-out, whose per-partition tasks run concurrently with the Top-N sink. When keys
-originate on both sides of a join — `ORDER BY l.v, o.w` — the all-keys trace stops at the join
-output while the key-zero trace continues to `l`'s scan: the first-key bound prunes the scan,
-while the strict predicate falls to the sink prefilter unless material accepted-hop work (an
-expensive `FILTER`) separates the stop point from the sink. Because a trace stops at the first
+originate on both sides of a join — `ORDER BY l.v, o.w` — both traces stop at the join output
+under the minimal hop set. When material accepted-hop work (an expensive `FILTER`) separates that
+stop point from the sink, the full strict predicate is spliced there as a LEX endpoint and the
+coinciding first-key terminal is subsumed; with only pass-through hops in between, both layers
+fall to the sink prefilter instead. Because a trace stops at the first
 refused operator, only Stage 7 hop widening can move a site below an intervening join and make
 that join's probe work the saving.
 
@@ -1051,12 +1054,20 @@ its channel's predicate through the fused-kernel capability — one predicate+co
 mask column — training its own generation-aware gate. A LEX filter carries its component
 ordinals, so the endpoint needs no per-column resolver at apply time.
 
-**First-key endpoints only, for now.** The splice addresses one traced ordinal, which is
-sufficient for the first-key layer but not for an all-keys stop point whose components sit at
-different ordinals. Until the splice takes an ordinal set, a non-scan LEX terminal is recorded as
-a deferred site and nothing is spliced; the sink prefilter applies the identical predicate, so
-only pruning is lost. The deferral is counted separately from cost-gate skips so a staged gap
-never reads as a tuning decision.
+**Both layers splice.** A first-key endpoint addresses one traced ordinal through
+`place_endpoint`. A LEX endpoint is spliced by the all-keys form of the same walk
+(`place_endpoint_all_keys`): a hop is taken only when every component ordinal survives it into
+the same child, each ordinal is remapped independently, and the spliced site's slot declares the
+full remapped set — primary first — in the sited operator's own schema, which is both its input
+and output space because the endpoint passes columns through unchanged. The splice re-walks the
+trace's own hop rules over an unchanged subtree, so trace and splice cannot land on different
+nodes; the planner asserts the spliced ordinals equal the traced terminal's.
+
+Channel lifetime is safe by construction (see "Reach ceiling"): the arrive-together site sits at
+or above the refused operator — for split keys, at the join output — inside the pipeline that
+also contains the producer's sink, so the endpoint's channel is still open when the first offer
+arrives. That is the same placement argument first-key endpoints already relied on; a LEX
+endpoint changes which predicate the site carries, never which pipeline it lives in.
 
 Its cost model is the streaming work between the site and the sink on rejected rows. The sink's
 prefilter already covers the local sort, so an endpoint separated from the sink only by
@@ -1340,7 +1351,7 @@ quiesced through normal task teardown. No scan waits for cleanup.
 | Non-bound-reference key, unsupported key-zero type, or rank/ties semantics | Create no producer at all; keep the otherwise-supported GPU Top-N |
 | ORDER BY key is an aggregate output | No group-key producer; the row producer still self-consumes above the barrier |
 | Any filter between the aggregate and Top-N | No group-key producer |
-| LEX terminal that is not a scan | Record a deferred site; publish no LEX there — the sink prefilter covers it |
+| LEX terminal that is not a scan | Cost-gate it like any terminal: splice a LEX endpoint when the site saves work, otherwise skip it — the sink prefilter covers the predicate either way |
 | Boundary-tied input row at a group-key consumer | Always kept; group-key predicates are inclusive-only |
 | Unsupported tail key type | Degrade to the first-key layer; plan no LEX targets |
 | No scan target and no material endpoint site | Sink self-consumption only; create no channel or filter |
@@ -1424,9 +1435,10 @@ Telemetry must not extend filter or witness lifetime beyond query execution.
 
 - Key-zero and all-keys traces with cost-gated endpoint siting and LEX-subsumption dedup.
 - Immutable plan (keys, layered targets), slots, and local witness offers feeding publication.
-- Parquet reader, native post-decode, and first-key endpoint consumers; LEX reaches scan binds,
-  and a non-scan LEX terminal is a recorded deferred site (multi-ordinal siting is Stage 7).
-  Split-keys shape: first-key bound at key zero's scan, strict predicate at the sink prefilter.
+- Parquet reader, native post-decode, and first-key endpoint consumers. LEX initially reached
+  scan binds only, with non-scan LEX terminals recorded as deferred sites; multi-ordinal
+  placement has since landed and closed that gap (see Stage 7). Split-keys shape today: LEX
+  endpoint at the arrive-together site, first-key terminal subsumed there.
 - The experimental flag continues to cover the whole feature.
 
 ### Stage 5 — Aggregate group-key producer
@@ -1453,9 +1465,11 @@ Telemetry must not extend filter or witness lifetime beyond query execution.
 
 - Widen the traces through proven hops — join probe blocks first — so endpoint sites land below
   material operators and the first-key bound reaches more scans.
-- Multi-ordinal endpoint siting, unlocking LEX endpoints at arrive-together points: the splice
+- ~~Multi-ordinal endpoint siting, unlocking LEX endpoints at arrive-together points: the splice
   must accept an ordinal set, admit a hop only when every component survives it into the same
-  child, remap each independently, and address them all in the sited operator's input schema.
+  child, remap each independently, and address them all in the sited operator's input schema.~~
+  **Landed:** `place_endpoint_all_keys` delivers exactly this; LEX endpoints splice wherever the
+  siting rule admits them.
 - Head-component null derivations (`k0 IS NULL` under `NULLS FIRST`, exclusion under
   `NULLS LAST`).
 - More exact types per key — `DECIMAL(5–18)` landed, unlocking TPC-H Q18's head; `DECIMAL128`
@@ -1484,9 +1498,9 @@ should cover:
 - Sink-prefilter equivalence (lexicographic and degraded first-key), boundary-staleness safety,
   and keep-ratio disable.
 - Endpoint siting above an aggregate read-out and an expression projection; the split-keys join
-  shape (first-key bound at key zero's scan, strict predicate at the sink prefilter); planner
-  skip when only pass-through hops separate site and sink; results bit-identical with the
-  feature off.
+  shape (LEX endpoint at the arrive-together site above the join, first-key terminal subsumed
+  there); planner skip when only pass-through hops separate site and sink; results bit-identical
+  with the feature off.
 - Concurrent producers, snapshot/close races, cancellation, and repeated execution.
 - Multi-GPU readiness, endpoint-device replica coverage, and retain-old-on-failure.
 - End-to-end equivalence with filtering disabled for Parquet and native scans.

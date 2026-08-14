@@ -219,8 +219,10 @@ bool site_admits_keys(sirius::op::sirius_physical_operator const& site,
  * The all-keys trace carries the strict full-tuple predicate to sites where every key coexists;
  * the key-zero trace carries the inclusive first-key bound further upstream (a single-key
  * producer's key-zero target carries its whole strict predicate instead, since `LEX_RANGE`
- * requires two components). A first-key site coinciding with a LEX site is dropped as subsumed.
- * Returns the child, rewrapped when an endpoint was spliced.
+ * requires two components). A material non-scan LEX terminal is spliced as a LEX endpoint via
+ * `place_endpoint_all_keys`, carrying every component ordinal to one arrive-together site. A
+ * first-key site coinciding with a LEX site is dropped as subsumed. Returns the child, rewrapped
+ * when an endpoint was spliced.
  */
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> discover_top_n_targets(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> child,
@@ -256,13 +258,14 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> discover_top_n_targets(
 
   // --- All-keys trace: the LEX layer ---
   std::unordered_set<sirius::op::sirius_physical_operator const*> lex_sites;
+  std::optional<multi_key_route_terminal> lex_endpoint_terminal;
   if (multi_key) {
     for (auto const& terminal : trace_top_n_all_keys(*child, key_ordinals, policy)) {
       auto const kind = classify_top_n_terminal({.node = terminal.node, .ordinal = 0},
                                                 top_n_filter_layer::LEX,
                                                 terminal.material_hops,
                                                 target_skips_reads(*terminal.node));
-      if (kind == top_n_target_kind::SCAN_BIND &&
+      if ((kind == top_n_target_kind::SCAN_BIND || kind == top_n_target_kind::ENDPOINT_SITE) &&
           !site_admits_keys(*terminal.node, terminal.ordinals, coordinator.keys())) {
         // The site's columns do not carry the keys' exact types; publishing there could compare
         // differently scaled fixed-point values. Skip the target, keep the producer. This shares
@@ -275,12 +278,11 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> discover_top_n_targets(
                                         .component_ordinals = terminal.ordinals});
         lex_sites.insert(terminal.node);
         stats.top_n_lex_scan_targets.fetch_add(1, std::memory_order_relaxed);
-      } else if (kind == top_n_target_kind::LEX_ENDPOINT_DEFERRED) {
-        // Worth siting, but splicing it needs placement addressing every component ordinal, which
-        // lands in Stage 7. Counted apart from the cost-gate skips so the staged gap stays
-        // visible; the sink prefilter applies the same predicate meanwhile, so only pruning is
-        // lost, never correctness.
-        stats.top_n_lex_endpoint_sites_deferred.fetch_add(1, std::memory_order_relaxed);
+      } else if (kind == top_n_target_kind::ENDPOINT_SITE) {
+        // The splice runs after the key-zero classification below, so the site enters `lex_sites`
+        // now: the coinciding first-key terminal must classify as subsumed.
+        lex_endpoint_terminal = terminal;
+        lex_sites.insert(terminal.node);
       } else {
         stats.top_n_sites_skipped_no_work_saved.fetch_add(1, std::memory_order_relaxed);
       }
@@ -339,6 +341,47 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> discover_top_n_targets(
     }
   }
 
+  // --- LEX endpoint splice ---
+  // Runs before the first-key splice: a deeper first-key endpoint descends through the fresh LEX
+  // endpoint transparently (DYNAMIC_FILTER is a pass-through hop) and still lands below it. In
+  // the coinciding case the first-key splice never runs at all -- SUBSUMED_BY_LEX above.
+  if (lex_endpoint_terminal.has_value()) {
+    std::vector<std::shared_ptr<sirius::op::sirius_dynamic_filter_set>> site_channels;
+    auto placed = place_endpoint_all_keys(
+      std::move(child),
+      key_ordinals,
+      policy,
+      [&site_channels, &stats, gate_keep_threshold](
+        sirius::op::sirius_physical_operator const& site)
+        -> duckdb::unique_ptr<sirius::op::sirius_physical_operator> {
+        auto channel  = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+        auto endpoint = duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
+          site.types,
+          site.estimated_cardinality,
+          channel,
+          gate_keep_threshold,
+          sirius::op::scan::dynamic_filter_apply_mode::include_ast_row_masks,
+          sirius::op::scan::dynamic_filter_endpoint_provenance::top_n_endpoint,
+          &stats);
+        site_channels.push_back(std::move(channel));
+        return endpoint;
+      });
+    child = std::move(placed.subtree);
+    // Trace and splice are two runs of one pure hop function over a subtree nothing mutated in
+    // between, so they cannot land apart; assert that loudly rather than assuming it.
+    assert(placed.site_ordinals.size() == 1);
+    assert(placed.site_ordinals.front() == lex_endpoint_terminal->ordinals);
+    for (std::size_t site = 0; site < site_channels.size(); ++site) {
+      auto const& ordinals = placed.site_ordinals[site];
+      std::vector<std::size_t> referenced{ordinals.begin() + 1, ordinals.end()};
+      publish_plan.targets.push_back({.publisher = site_channels[site]->register_refinement_slot(
+                                        ordinals.front(), std::move(referenced)),
+                                      .layer              = top_n_filter_layer::LEX,
+                                      .component_ordinals = ordinals});
+      stats.top_n_lex_endpoint_sites_placed.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
   // Endpoint siting for the first-key layer. `place_endpoint` splices every reached branch, so it
   // runs only when no branch bound key zero at a scan.
   auto const wants_endpoint =
@@ -374,7 +417,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> discover_top_n_targets(
         {.publisher          = site_channels[site]->register_refinement_slot(ordinals.front()),
          .layer              = top_n_filter_layer::FIRST_KEY,
          .component_ordinals = ordinals});
-      stats.top_n_endpoint_sites_placed.fetch_add(1, std::memory_order_relaxed);
+      stats.top_n_first_key_endpoint_sites_placed.fetch_add(1, std::memory_order_relaxed);
     }
   }
 

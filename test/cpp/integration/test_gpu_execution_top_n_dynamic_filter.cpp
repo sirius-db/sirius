@@ -227,6 +227,16 @@ void create_test_tables(duckdb::Connection& con)
   REQUIRE(r);
   REQUIRE_FALSE(r->HasError());
 
+  // Dimension side for the grouped split-keys shape: `gk` joins one-to-one with `topn_groups.id`,
+  // and `gdv` cycles through seven values, so the joined (grp, gdv) tuples form 91 groups whose
+  // boundary tuple recurs in every batch the scan produces.
+  r = con.Query(
+    "CREATE OR REPLACE TABLE topn_gdim AS "
+    "SELECT CAST(i AS INTEGER) AS gk, CAST((i * 3) % 7 AS INTEGER) AS gdv "
+    "FROM range(200000) t(i);");
+  REQUIRE(r);
+  REQUIRE_FALSE(r->HasError());
+
   // Flush the fresh tables out of the WAL: the native decoder reads checkpointed segments.
   r = con.Query("CHECKPOINT;");
   REQUIRE(r);
@@ -282,13 +292,17 @@ TEST_CASE("gpu_execution - top-n dynamic filter sink self-consumption",
     REQUIRE(after.top_n_first_key_scan_targets == before.top_n_first_key_scan_targets);
   }
 
-  SECTION("split keys across a join: sited endpoint publishes and results stay exact")
+  SECTION(
+    "split keys across a join: the LEX endpoint publishes the full tuple and results stay "
+    "exact")
   {
     // Scenario 10, executed rather than only planned. Keys come from opposite sides of a join, so
-    // both traces stop at the join output; the residual filter makes that site material, so the
-    // inclusive first-key bound is published through a *sited Top-N endpoint above a HASH_JOIN* --
-    // a placement the join path never produces, and the only runtime shape that exercises the
-    // endpoint's execute path, its generation-domain gate, and a multi-key FIRST_KEY filter.
+    // both traces stop at the join output; the residual filter makes that arrive-together site
+    // material, so the full strict predicate is published through a *sited LEX endpoint above a
+    // HASH_JOIN* -- a placement the join path never produces. The endpoint lives in the same
+    // pipeline as the Top-N sink, so `lex_filters_pushed` moving is the runtime proof its channel
+    // is still open when offers begin. The coinciding first-key terminal is subsumed, so no
+    // FIRST_KEY target exists anywhere in this plan.
     std::string const query =
       "SELECT f.v, d.dv FROM topn_facts f JOIN topn_dim d ON f.id = d.dk "
       "WHERE f.v + d.dv <> 1234567 ORDER BY f.v, d.dv LIMIT 10";
@@ -306,10 +320,12 @@ TEST_CASE("gpu_execution - top-n dynamic filter sink self-consumption",
     sirius::test::require_transparent_execution_delta(tbefore, tafter, 1, 0, 1);
     REQUIRE(rows.size() == 10);
 
-    // An endpoint was sited and it published; the LEX site was deferred, not cost-gate skipped.
-    REQUIRE(after.top_n_endpoint_sites_placed > before.top_n_endpoint_sites_placed);
-    REQUIRE(after.top_n_lex_endpoint_sites_deferred > before.top_n_lex_endpoint_sites_deferred);
-    REQUIRE(after.top_n_first_key_filters_pushed > before.top_n_first_key_filters_pushed);
+    // The LEX endpoint was sited and it published; the first-key layer is subsumed at the same
+    // site, so its push counter stays flat.
+    REQUIRE(after.top_n_lex_endpoint_sites_placed > before.top_n_lex_endpoint_sites_placed);
+    REQUIRE(after.top_n_first_key_subsumed_by_lex > before.top_n_first_key_subsumed_by_lex);
+    REQUIRE(after.top_n_lex_filters_pushed > before.top_n_lex_filters_pushed);
+    REQUIRE(after.top_n_first_key_filters_pushed == before.top_n_first_key_filters_pushed);
     REQUIRE(after.top_n_revisions_published > before.top_n_revisions_published);
     REQUIRE(after.top_n_revisions_failed == before.top_n_revisions_failed);
     REQUIRE(after.top_n_revisions_ignored == before.top_n_revisions_ignored);
@@ -319,6 +335,32 @@ TEST_CASE("gpu_execution - top-n dynamic filter sink self-consumption",
     // Pruning is direction-only: the endpoint races the sink by design (R2).
     REQUIRE(after.top_n_prefilter_rows_out - before.top_n_prefilter_rows_out <=
             after.top_n_prefilter_rows_in - before.top_n_prefilter_rows_in);
+  }
+
+  SECTION("an unadmitted tail publishes the first-key bound through the endpoint")
+  {
+    // The degrade path at endpoints, end to end: a VARCHAR tail disables the LEX layer, so the
+    // split shape falls back to the single-ordinal first-key endpoint and publishes through it.
+    std::string const query =
+      "SELECT f.v, d.dv FROM topn_facts f JOIN topn_dim d ON f.id = d.dk "
+      "WHERE f.v + d.dv <> 1234567 ORDER BY f.v, d.dv, f.pay LIMIT 10";
+    require_flag_equivalence(con, query);
+
+    top_n_flag_guard flag(con, true);
+    con.Query("SET gpu_execution = true;");
+    auto const tbefore = sirius::test::get_transparent_execution_stats(con);
+    auto const before  = sirius::test::get_dynamic_filter_stats_snapshot(con);
+    auto const rows    = query_rows(con, query);
+    auto const after   = sirius::test::get_dynamic_filter_stats_snapshot(con);
+    auto const tafter  = sirius::test::get_transparent_execution_stats(con);
+    sirius::test::require_transparent_execution_delta(tbefore, tafter, 1, 0, 1);
+    REQUIRE(rows.size() == 10);
+
+    REQUIRE(after.top_n_first_key_endpoint_sites_placed >
+            before.top_n_first_key_endpoint_sites_placed);
+    REQUIRE(after.top_n_first_key_filters_pushed > before.top_n_first_key_filters_pushed);
+    REQUIRE(after.top_n_lex_endpoint_sites_placed == before.top_n_lex_endpoint_sites_placed);
+    REQUIRE(after.top_n_lex_filters_pushed == before.top_n_lex_filters_pushed);
   }
 
   SECTION("flag off moves no Top-N counter")
@@ -445,6 +487,35 @@ TEST_CASE("gpu_execution - top-n dynamic filter group-key producer",
     REQUIRE(after.top_n_lex_scan_targets > before.top_n_lex_scan_targets);
     REQUIRE(after.top_n_lex_filters_pushed > before.top_n_lex_filters_pushed);
     REQUIRE(after.top_n_first_key_subsumed_by_lex > before.top_n_first_key_subsumed_by_lex);
+    REQUIRE(after.top_n_revisions_published > before.top_n_revisions_published);
+    REQUIRE(after.top_n_revisions_failed == before.top_n_revisions_failed);
+  }
+
+  SECTION("grouped split keys stay exact through an inclusive LEX endpoint")
+  {
+    // Q4 end to end: grouping keys from opposite join sides with a cross-side WHERE, so the
+    // group-key producer's all-keys trace stops at the join below the aggregate and the residual
+    // FILTER makes that site material -- the inclusive LEX endpoint splices there. Equivalence
+    // leads: a wrong-strictness endpoint drops rows of the boundary group and corrupts its `sum`
+    // while the query still returns five rows and no error.
+    scan_batch_size_guard batches(con, 65536);
+    std::string const query = "SELECT f.grp, d.gdv, sum(f.v) AS s FROM " + groups_pq.scan() +
+                              " f JOIN topn_gdim d ON f.id = d.gk "
+                              "WHERE f.grp + d.gdv <> 1234567 "
+                              "GROUP BY f.grp, d.gdv ORDER BY f.grp, d.gdv LIMIT 5";
+    require_flag_equivalence(con, query);
+
+    top_n_flag_guard flag(con, true);
+    con.Query("SET gpu_execution = true;");
+    auto const before = sirius::test::get_dynamic_filter_stats_snapshot(con);
+    auto const rows   = query_rows(con, query);
+    auto const after  = sirius::test::get_dynamic_filter_stats_snapshot(con);
+    REQUIRE(rows.size() == 5);
+
+    REQUIRE(after.top_n_group_offers > before.top_n_group_offers);
+    REQUIRE(after.top_n_group_witness_set_full > before.top_n_group_witness_set_full);
+    REQUIRE(after.top_n_lex_endpoint_sites_placed > before.top_n_lex_endpoint_sites_placed);
+    REQUIRE(after.top_n_lex_filters_pushed > before.top_n_lex_filters_pushed);
     REQUIRE(after.top_n_revisions_published > before.top_n_revisions_published);
     REQUIRE(after.top_n_revisions_failed == before.top_n_revisions_failed);
   }

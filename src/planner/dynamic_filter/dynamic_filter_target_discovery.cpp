@@ -29,6 +29,8 @@
 
 // stdlib
 #include <cassert>
+#include <iterator>
+#include <span>
 #include <variant>
 
 namespace sirius::planner {
@@ -358,7 +360,7 @@ struct all_keys_step {
  * single site could carry the full tuple.
  */
 std::vector<all_keys_step> all_keys_steps(sirius::op::sirius_physical_operator const& node,
-                                          std::vector<std::size_t> const& ordinals,
+                                          std::span<std::size_t const> ordinals,
                                           descent_policy policy)
 {
   std::vector<std::vector<descent_step>> per_ordinal;
@@ -458,12 +460,6 @@ top_n_target_kind classify_top_n_terminal(route_terminal const& terminal,
       terminal.node->type == sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN) {
     return top_n_target_kind::SCAN_BIND;
   }
-  // A LEX site is worth having, but splicing it needs placement addressing every component
-  // ordinal; that generalization lands in Stage 7. Reported distinctly so a staged gap is never
-  // mistaken for the cost gate declining.
-  if (layer == sirius::op::top_n_filter_layer::LEX) {
-    return top_n_target_kind::LEX_ENDPOINT_DEFERRED;
-  }
   return top_n_target_kind::ENDPOINT_SITE;
 }
 
@@ -472,26 +468,51 @@ endpoint_placement place_endpoint(duckdb::unique_ptr<sirius::op::sirius_physical
                                   descent_policy policy,
                                   endpoint_factory const& make_endpoint)
 {
+  // A singleton ordinal set reduces all_keys_steps to descent_steps plus followability, so the
+  // delegation keeps this signature's behavior exactly, UNION fan-out included.
+  auto placed = place_endpoint_all_keys(
+    std::move(subtree), std::span<std::size_t const>{&a0, 1}, policy, make_endpoint);
+  endpoint_placement result;
+  result.subtree = std::move(placed.subtree);
+  result.site_ordinals.reserve(placed.site_ordinals.size());
+  for (auto const& site : placed.site_ordinals) {
+    assert(site.size() == 1);
+    result.site_ordinals.push_back(site.front());
+  }
+  return result;
+}
+
+multi_key_endpoint_placement place_endpoint_all_keys(
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> subtree,
+  std::span<std::size_t const> ordinals,
+  descent_policy policy,
+  endpoint_factory const& make_endpoint)
+{
   assert(subtree != nullptr);
-  auto const steps = descent_steps(*subtree, a0, policy);
-  if (steps_are_followable(*subtree, steps)) {
-    // Ascending child order keeps site ordinals aligned with trace_probe_key() terminals.
-    endpoint_placement result;
+  assert(!ordinals.empty());
+  auto const steps = all_keys_steps(*subtree, ordinals, policy);
+  if (!steps.empty()) {
+    // Ascending child order keeps site ordinals aligned with the order both traces report
+    // terminals in.
+    multi_key_endpoint_placement result;
     for (auto const& step : steps) {
       auto& child_slot = subtree->children[step.child_index];
       auto placed =
-        place_endpoint(std::move(child_slot), step.child_ordinal, policy, make_endpoint);
+        place_endpoint_all_keys(std::move(child_slot), step.child_ordinals, policy, make_endpoint);
       child_slot = std::move(placed.subtree);
-      result.site_ordinals.insert(
-        result.site_ordinals.end(), placed.site_ordinals.begin(), placed.site_ordinals.end());
+      result.site_ordinals.insert(result.site_ordinals.end(),
+                                  std::make_move_iterator(placed.site_ordinals.begin()),
+                                  std::make_move_iterator(placed.site_ordinals.end()));
     }
     result.subtree = std::move(subtree);
     return result;
   }
-  // Deepest safe site: the endpoint becomes this operator's new parent.
+  // Deepest site every ordinal reaches together: the endpoint becomes this operator's new parent.
   auto endpoint = make_endpoint(*subtree);
   endpoint->children.push_back(std::move(subtree));
-  return endpoint_placement{.subtree = std::move(endpoint), .site_ordinals = {a0}};
+  return multi_key_endpoint_placement{
+    .subtree       = std::move(endpoint),
+    .site_ordinals = {std::vector<std::size_t>{ordinals.begin(), ordinals.end()}}};
 }
 
 }  // namespace sirius::planner

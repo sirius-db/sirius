@@ -5,8 +5,8 @@
 > normative contract. This document turns that contract into a header-level API surface and an
 > example-driven high-level test plan. Stage numbers refer to the main doc's seven-stage rollout.
 > The Stage 1–4 surfaces below are implemented and behind `enable_top_n_dynamic_filter` (default
-> false) — producers publish, with scan binds and first-key endpoints live, LEX endpoints
-> deferred to Stage 7, and set operations a trace terminal; the Stage 5–7 surfaces remain
+> false) — producers publish, with scan binds and sited endpoints of both layers live,
+> and set operations a trace terminal; the remaining Stage 5–7 surfaces stay
 > proposed. Declarations here stay the authority — where an
 > implemented signature differs, the doc is corrected, not the code.
 
@@ -335,10 +335,10 @@ the existing `SiriusContext::get_dynamic_filter_stats_snapshot()`; no new access
   // --- Top-N publication and endpoints (Stage 4); per layer where meaningful ---
   std::atomic<std::uint64_t> top_n_first_key_scan_targets{0};     ///< Plan-time
   std::atomic<std::uint64_t> top_n_lex_scan_targets{0};           ///< Plan-time; all keys one scan
-  std::atomic<std::uint64_t> top_n_endpoint_sites_placed{0};      ///< Plan-time; either layer
+  std::atomic<std::uint64_t> top_n_first_key_endpoint_sites_placed{0};  ///< Plan-time
+  std::atomic<std::uint64_t> top_n_lex_endpoint_sites_placed{0};  ///< Plan-time; arrive-together sites
   /// Plan-time; endpoints and post-decode-only scan binds
   std::atomic<std::uint64_t> top_n_sites_skipped_no_work_saved{0};
-  std::atomic<std::uint64_t> top_n_lex_endpoint_sites_deferred{0};///< Plan-time; staged gap, not a cost decision
   std::atomic<std::uint64_t> top_n_first_key_subsumed_by_lex{0};  ///< Plan-time; dedup fired
   std::atomic<std::uint64_t> top_n_revisions_published{0};        ///< Boundary updates fanned out
   std::atomic<std::uint64_t> top_n_lex_filters_pushed{0};
@@ -804,24 +804,19 @@ is supported — each branch binds its own scan at its own ordinals. The design 
 site-specific LEX filters; what was under-specified is that this makes construction per-target,
 and that only ordinal-free layers literally "fan the same object".
 
-**LEX endpoints are deferred.** `place_endpoint` traces one ordinal, so it cannot address an
-all-keys stop point that differs from key zero's. Stage 4 therefore delivers LEX **only at scan
-binds**; a non-scan LEX terminal is classified `LEX_ENDPOINT_DEFERRED`, counted separately, and
-nothing is spliced. This is always sound — the sink prefilter applies the identical predicate, so
-only pruning is lost — and it is a staged gap, not a cost decision, which is why it does not fold
-into the skipped-site counter.
-
-Siting one needs a multi-ordinal `place_endpoint` that guarantees three things the single-ordinal
-form never had to: every component ordinal survives the *same* hop into the *same* child (a set
-that splits across a join's two blocks stops at the join output — exactly the arrive-together
-semantics), each ordinal is remapped independently at the splice, and the sited operator's input
-schema addresses all of them. A span-taking form with the current signature as a delegating
-wrapper would keep the join path byte-equivalent, but it generalizes a routine on the join's
-critical path for a narrow near-term win: with the minimal hop set almost everything between an
-all-keys stop point and the sink is pass-through, so the cost gate would skip most such sites
-anyway. The exception is real but uncommon — a residual `FILTER` above the arrive-together point,
-which DuckDB usually pushes below the join. The work therefore belongs with the trace widening
-that makes endpoints broadly material (Stage 7), not with Stage 4.
+**LEX endpoints.** `place_endpoint_all_keys` — one recursive walk shared with the single-ordinal
+`place_endpoint`, which delegates to it — splices a LEX endpoint at a material all-keys stop
+point. It guarantees the three things the single-ordinal form never had to: every component
+ordinal survives the *same* hop into the *same* child (a set that splits across a join's two
+blocks stops at the join output — exactly the arrive-together semantics), each ordinal is
+remapped independently at the splice, and the spliced site's slot declares the full remapped set
+in the sited operator's schema. The splice re-walks the trace's own hop rules over an unchanged
+subtree, so it cannot land anywhere classification did not; the planner asserts the spliced
+ordinals equal the traced terminal's. A non-scan LEX terminal is therefore classified by the same
+siting rule as every other terminal — `ENDPOINT_SITE` when material, `SKIPPED_NO_WORK_SAVED`
+otherwise. The deferred classification and its counter were removed rather than kept as
+unreachable machinery: the staged gap they kept visible is closed, and an enumerator no plan can
+produce is untestable.
 
 Cost: N accepting LEX targets means N filters and N replica sets per revision. Each carries one
 host boundary tuple and at most one device scalar per non-null component per device — realistic N
@@ -896,18 +891,53 @@ enum class top_n_target_kind {
   /// Neither read-skipping nor material downstream work: the site would duplicate the sink's own
   /// pass. Replaces `ENDPOINT_SKIPPED_IMMATERIAL` and now also covers post-decode-only scans.
   SKIPPED_NO_WORK_SAVED,
-  SUBSUMED_BY_LEX,
-  /// A LEX terminal that is not a scan. Siting one requires addressing every component ordinal
-  /// at the splice, which the single-ordinal `place_endpoint` cannot express; deferred to the
-  /// trace-widening stage (see "LEX endpoints are deferred"). Distinct from
-  /// `SKIPPED_NO_WORK_SAVED` so a staged gap never hides inside a cost-gate decision.
-  LEX_ENDPOINT_DEFERRED
+  SUBSUMED_BY_LEX
 };
 
 [[nodiscard]] top_n_target_kind classify_top_n_terminal(route_terminal const& terminal,
                                                         top_n_filter_layer layer,
                                                         std::size_t material_hops_above,
-                                                        bool consumer_skips_reads);
+                                                        bool consumer_skips_reads,
+                                                        bool coincides_with_lex_site = false);
+```
+
+```cpp
+/**
+ * @brief Result of splicing all-keys endpoints into a subtree
+ *
+ * The multi-ordinal counterpart of @ref endpoint_placement: one ordinal vector per spliced site,
+ * primary (key zero) first, in the sited operator's output space -- which is also the spliced
+ * endpoint's input and output space, because the endpoint passes columns through unchanged.
+ */
+struct multi_key_endpoint_placement {
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> subtree;
+  std::vector<std::vector<std::size_t>> site_ordinals;  ///< Per site, primary first
+};
+
+/**
+ * @brief Place an endpoint at the deepest site every traced ordinal reaches together
+ *
+ * The all-keys counterpart of @ref place_endpoint, and the splice for LEX endpoint targets. The
+ * walk is driven by the same hop rules as @ref trace_top_n_all_keys -- a hop is taken only when
+ * every ordinal survives it into the same child, each remapped independently -- so a splice
+ * performed after a trace over an unchanged subtree lands exactly at the trace's terminal, with
+ * the same remapped ordinals. Callers zipping mints with sites should assert that equality.
+ * A fan-out step splices one endpoint per reached branch. If the root refuses, the endpoint
+ * wraps the root.
+ *
+ * @pre @p subtree is not null; @p ordinals is not empty.
+ *
+ * @param[in] subtree Subtree whose ownership transfers to the result
+ * @param[in] ordinals Every traced ordinal in @p subtree's output space, key zero first
+ * @param[in] policy Which hops this producer may take
+ * @param[in] make_endpoint Factory for the endpoint operator(s)
+ * @return The rewrapped subtree and the full remapped ordinal vector at each spliced site
+ */
+[[nodiscard]] multi_key_endpoint_placement place_endpoint_all_keys(
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> subtree,
+  std::span<std::size_t const> ordinals,
+  descent_policy policy,
+  endpoint_factory const& make_endpoint);
 ```
 
 Endpoint splicing itself is the existing `place_endpoint` with an `endpoint_factory` that
@@ -1004,9 +1034,10 @@ the cap the producer buys almost nothing, so refusing beats optimizing. The row 
 cap: it extracts one row's key tuple per batch regardless of K. A refusal increments
 `top_n_group_producers_rejected` alongside the other eligibility refusals rather than earning its
 own counter — these are mutually exclusive plan-time verdicts of one kind, and K is visible in
-the query, so a separate name would add no diagnostic power. (Contrast `LEX_ENDPOINT_DEFERRED`,
-which does have its own counter because a *staged capability gap* must not hide inside a
-*tuning decision*; two eligibility refusals are the same kind.)
+the query, so a separate name would add no diagnostic power. (Contrast the
+deferred-LEX-endpoint counter that existed while multi-ordinal placement was
+staged out: a *staged capability gap* must not hide inside a *tuning decision*; two eligibility
+refusals are the same kind.)
 
 ```cpp
 /**
@@ -1300,7 +1331,7 @@ it is deleting the guard's rationale; carry the test or delete the guard deliber
 Installation site: plan-shape layer (`DYNAMIC_FILTER` node presence, position, `provenance()`).
 Pruning effect and lifecycle: stats deltas (`top_n_offers`, `top_n_prefilter_rows_*`,
 `top_n_revisions_published`, the per-layer `top_n_{first_key,lex}_*` counters,
-`top_n_endpoint_sites_*`, the post-decode consumer pair
+the endpoint-site pair `top_n_{first_key,lex}_endpoint_sites_placed`, the post-decode consumer pair
 `post_decode_apply_rows_in/out`, and the reader-gate family `reader_gate_*`). Batch arrival order is not deterministic,
 so row-level pruning counters are asserted as directions (`rows_out <= rows_in`, deltas `> 0`
 only where a single-batch shape forces them), matching the sibling doc's counter-contract rules.
@@ -1325,7 +1356,7 @@ shape publishes its strict predicate as RANGE, and multi-key shapes publish per 
 | 7 | Pass-through hops | `SELECT v FROM t WHERE grp <> 3 ORDER BY v LIMIT 10` (filter + plain projection) | Still the scan (S4) | plan, sqllogic |
 | 8 | Self-consumption only | Any eligible shape with the channel stages disabled or no target | No `DYNAMIC_FILTER` node; `top_n_offers` delta > 0, prefilter direction asserts, results unchanged (S1) | integration, sqllogic |
 | 9 | All keys, one scan | `SELECT * FROM topn_parquet ORDER BY v, w LIMIT 10` | LEX in the scan's reader AST; `top_n_first_key_subsumed_by_lex` delta > 0, no separate first-key filter on that channel (S4) | plan, integration, sqllogic |
-| 10 | **Split keys across a join** | `SELECT l.v, o.w FROM t l JOIN dim o ON l.id = o.id ORDER BY l.v, o.w LIMIT 10` | Both traces stop at the join with the minimal hop set, so **neither layer reaches `l`'s scan**; the strict predicate is applied by the sink prefilter and the all-keys terminal is `LEX_ENDPOINT_DEFERRED` (assert the deferral counter, not an endpoint). Reaching `l`'s scan needs a hop through the join's probe block, which is provable but publishes to a channel already closed — see the main doc's reach ceiling | plan, integration, sqllogic |
+| 10 | **Split keys across a join** | `SELECT l.v, o.w FROM t l JOIN dim o ON l.id = o.id ORDER BY l.v, o.w LIMIT 10` | Both traces stop at the join with the minimal hop set, so **neither layer reaches `l`'s scan**. With a residual `FILTER` above the join the stop point is material: the full strict predicate is spliced there as a **LEX endpoint** (`top_n_lex_endpoint_sites_placed`) and the coinciding first-key terminal is subsumed (`top_n_first_key_subsumed_by_lex`); without material work both layers are skipped and the sink prefilter covers them. Reaching `l`'s scan needs a hop through the join's probe block, which is provable but publishes to a channel already closed — see the main doc's reach ceiling | plan, integration, sqllogic |
 | 11 | Mixed directions and null orders | `ORDER BY v DESC, w ASC NULLS FIRST LIMIT 10` and the transposed combos | Same sites as 9; per-component `T_i`/`E_i` derivations pinned by equivalence sweep (S4) | sqllogic, integration |
 | 12 | Null tail boundary | Data forcing row K−1's `w` to null under both null orders | Publication proceeds through the derivation table; equivalence exact; `top_n_offers_unsupported` unchanged (S4) | integration, sqllogic |
 | 13 | Unsupported tail type | `ORDER BY v, pay LIMIT 10` (VARCHAR tail) | First-key layer only: `top_n_producers_first_key_only` delta > 0, no LEX target, RANGE still reaches `v`'s scan (S4) | plan, integration |
@@ -1362,11 +1393,13 @@ Pruning  : direction-only — parquet rows-decoded telemetry where cuDF exposes 
 Stage    : equivalence rows runnable from S1 (filter inert), site/publication asserts from S4.
 ```
 
-Scenarios 3–5 and 10 assert the *skip* explicitly at Stage 4 — the skipped-site counter
-delta and absence of a `top_n_endpoint` node — so the cost-gate behavior is pinned, not
-accidental. Their Stage 7 variants (join between aggregate and Top-N; probe-block descent) flip
-the same assertions to `top_n_endpoint_sites_placed`/scan-bind and are written up front but
-tagged `[!mayfail]` until Stage 7 lands.
+Scenarios 3–5 assert the *skip* explicitly at Stage 4 — the skipped-site counter delta and
+absence of a `top_n_endpoint` node — so the cost-gate behavior is pinned, not accidental.
+Scenario 10's material variant asserts the flip itself: a LEX endpoint placed
+(`top_n_lex_endpoint_sites_placed`) with the first-key terminal subsumed. The remaining Stage 7
+variants (join between aggregate and Top-N; probe-block descent) flip the same assertions to
+endpoint placement/scan-bind and are written up front but tagged `[!mayfail]` until Stage 7
+lands.
 
 ### Multi-GPU shape
 
