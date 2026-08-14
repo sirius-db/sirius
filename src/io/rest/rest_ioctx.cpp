@@ -63,6 +63,16 @@ rest_perf_snapshot rest_ioctx::perf_snapshot() const noexcept
   return agg;
 }
 
+std::vector<rest_perf_snapshot> rest_ioctx::reactor_perf_snapshots() const
+{
+  std::vector<rest_perf_snapshot> snapshots;
+  snapshots.reserve(_reactors.size());
+  for (auto const& reactor : _reactors) {
+    snapshots.push_back(reactor->perf_snapshot());
+  }
+  return snapshots;
+}
+
 void rest_ioctx::list_objects_paged(
   std::string_view bucket,
   std::string_view prefix,

@@ -60,6 +60,10 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// non-zero reactor value.  Lock-free; drives the s3-bench JSON baseline.
   [[nodiscard]] rest_perf_snapshot perf_snapshot() const noexcept;
 
+  /// Per-reactor perf snapshots in stable pool order.  Lock-free; retained by
+  /// the hidden REST benchmark to prove that a configured pool was exercised.
+  [[nodiscard]] std::vector<rest_perf_snapshot> reactor_perf_snapshots() const;
+
   /// Stream a bucket's ListObjectsV2 pages under @p prefix to @p sink, one call
   /// per page (a page holds at most 1000 entries, so peak memory is one page
   /// regardless of bucket population).  @p sink returns false to stop early —

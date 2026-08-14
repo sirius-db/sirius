@@ -44,6 +44,7 @@
 #include <fstream>
 #include <functional>
 #include <iomanip>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -915,6 +916,7 @@ struct rest_bench_measurement {
   duckdb::idx_t rows{0};
   sirius::io::rest::rest_perf_snapshot bind_micro;
   sirius::io::rest::rest_perf_snapshot micro;
+  std::vector<std::uint64_t> reactor_scan_chunk_get_counts;
 };
 
 std::unique_ptr<cudf::io::datasource::buffer> read_parquet_footer_for_bench(
@@ -947,8 +949,10 @@ sirius::io::rest::rest_ioctx& ensure_rest_ioctx_for_bench(
 rest_bench_measurement run_rest_parquet_scan(s3_sql_fixture& fixture,
                                              std::string const& uri,
                                              std::vector<std::string> const& columns,
-                                             bool use_footer_probe = false)
+                                             bool use_footer_probe = false,
+                                             std::size_t source_copies = 1)
 {
+  REQUIRE(source_copies > 0);
   auto& manager = require_sirius_context(fixture).get_scan_manager();
   // Snapshotting the routed REST ioctx before the measured open requires one
   // unmeasured datasource lookup.  That may warm the backend's connection path,
@@ -974,6 +978,7 @@ rest_bench_measurement run_rest_parquet_scan(s3_sql_fixture& fixture,
   auto footer_buffer      = read_parquet_footer_for_bench(*datasource);
   auto const footer_stop  = bench_clock::now();
   auto const after_footer = rest.perf_snapshot();
+  auto const reactors_after_footer = rest.reactor_perf_snapshots();
 
   auto opts = cudf::io::parquet_reader_options::builder().column_names(columns).build();
 
@@ -985,7 +990,14 @@ rest_bench_measurement run_rest_parquet_scan(s3_sql_fixture& fixture,
   auto const parse_stop = bench_clock::now();
 
   std::vector<std::unique_ptr<cudf::io::datasource>> sources;
-  sources.push_back(datasource->duplicate());
+  sources.reserve(source_copies);
+  metadatas.reserve(source_copies);
+  for (std::size_t i = 1; i < source_copies; ++i) {
+    metadatas.push_back(reader.parquet_metadata());
+  }
+  for (std::size_t i = 0; i < source_copies; ++i) {
+    sources.push_back(datasource->duplicate());
+  }
 
   auto const scan_start  = bench_clock::now();
   auto [table, metadata] = cudf::io::read_parquet(std::move(sources), std::move(metadatas), opts);
@@ -993,8 +1005,17 @@ rest_bench_measurement run_rest_parquet_scan(s3_sql_fixture& fixture,
   auto const scan_stop  = bench_clock::now();
   auto const wall_stop  = bench_clock::now();
   auto const after      = rest.perf_snapshot();
+  auto const reactors_after = rest.reactor_perf_snapshots();
   auto const bind_micro = delta_snapshot(after_footer, before);
   auto const micro      = delta_snapshot(after, before);
+
+  REQUIRE(reactors_after.size() == reactors_after_footer.size());
+  std::vector<std::uint64_t> reactor_scan_chunk_get_counts;
+  reactor_scan_chunk_get_counts.reserve(reactors_after.size());
+  for (std::size_t i = 0; i < reactors_after.size(); ++i) {
+    reactor_scan_chunk_get_counts.push_back(sat_sub(reactors_after[i].chunk_get_count,
+                                                    reactors_after_footer[i].chunk_get_count));
+  }
 
   return rest_bench_measurement{elapsed_ms(wall_start, wall_stop),
                                 elapsed_ms(open_start, open_stop),
@@ -1004,7 +1025,8 @@ rest_bench_measurement run_rest_parquet_scan(s3_sql_fixture& fixture,
                                 micro.payload_bytes_read_total,
                                 static_cast<duckdb::idx_t>(table->num_rows()),
                                 bind_micro,
-                                micro};
+                                micro,
+                                std::move(reactor_scan_chunk_get_counts)};
 }
 
 struct metric_delta {
@@ -1020,6 +1042,7 @@ struct bench_record {
   std::string projection;
   std::size_t max_connections{0};
   std::size_t rest_n_reactors{0};
+  std::size_t source_copies{1};
   std::string prefetch_cache_mode;
   double wall_clock_ms{0.0};
   double open_ms{0.0};
@@ -1046,6 +1069,7 @@ struct bench_record {
   std::uint64_t retries_total{0};
   std::uint64_t terminal_failures_total{0};
   std::uint64_t device_stream_sync_total{0};
+  std::vector<std::uint64_t> reactor_scan_chunk_get_counts;
   std::vector<metric_delta> comparisons;
 };
 
@@ -1062,6 +1086,7 @@ bench_record make_record(std::string scenario,
                          std::string projection,
                          std::size_t max_connections,
                          std::size_t rest_n_reactors,
+                         std::size_t source_copies,
                          std::string prefetch_cache_mode,
                          rest_bench_measurement measurement,
                          std::uint64_t dataset_bytes)
@@ -1076,6 +1101,7 @@ bench_record make_record(std::string scenario,
                       std::move(projection),
                       max_connections,
                       rest_n_reactors,
+                      source_copies,
                       std::move(prefetch_cache_mode),
                       measurement.wall_clock_ms,
                       measurement.open_ms,
@@ -1102,6 +1128,7 @@ bench_record make_record(std::string scenario,
                       micro.retries_total,
                       micro.terminal_failures_total,
                       micro.device_stream_sync_total,
+                      std::move(measurement.reactor_scan_chunk_get_counts),
                       {}};
 }
 
@@ -1373,6 +1400,7 @@ void write_perf_json(fs::path const& path,
         << "\"projection\": \"" << json_escape(r.projection) << "\", "
         << "\"max_connections\": " << r.max_connections << ", "
         << "\"rest_n_reactors\": " << r.rest_n_reactors << ", "
+        << "\"source_copies\": " << r.source_copies << ", "
         << "\"prefetch_cache_mode\": \"" << json_escape(r.prefetch_cache_mode) << "\", "
         << "\"wall_clock_ms\": " << std::fixed << std::setprecision(3) << r.wall_clock_ms << ", "
         << "\"open_ms\": " << r.open_ms << ", "
@@ -1399,6 +1427,12 @@ void write_perf_json(fs::path const& path,
         << "\"retries_total\": " << r.retries_total << ", "
         << "\"terminal_failures_total\": " << r.terminal_failures_total << ", "
         << "\"device_stream_sync_total\": " << r.device_stream_sync_total;
+    out << ", \"reactor_scan_chunk_get_counts\": [";
+    for (std::size_t reactor = 0; reactor < r.reactor_scan_chunk_get_counts.size(); ++reactor) {
+      if (reactor != 0) { out << ", "; }
+      out << r.reactor_scan_chunk_get_counts[reactor];
+    }
+    out << "]";
     if (!r.comparisons.empty()) {
       out << ", \"comparison\": {";
       for (std::size_t c = 0; c < r.comparisons.size(); ++c) {
@@ -1474,6 +1508,7 @@ void append_perf_history_jsonl(fs::path const& path,
         << json_escape(r.transport) << "\",\"projection\":\"" << json_escape(r.projection)
         << "\",\"max_connections\":" << r.max_connections
         << ",\"rest_n_reactors\":" << r.rest_n_reactors
+        << ",\"source_copies\":" << r.source_copies
         << ",\"payload_bytes_read\":" << r.payload_bytes_read << ",\"row_count\":" << r.row_count
         << ",\"bind_chunk_get_count\":" << r.bind_chunk_get_count
         << ",\"wall_clock_ms\":" << std::fixed << std::setprecision(3) << r.wall_clock_ms
@@ -1498,6 +1533,7 @@ void require_perf_json_schema(fs::path const& path, std::vector<std::string> exp
                    "\"projection\"",
                    "\"max_connections\"",
                    "\"rest_n_reactors\"",
+                   "\"source_copies\"",
                    "\"prefetch_cache_mode\"",
                    "\"wall_clock_ms\"",
                    "\"open_ms\"",
@@ -1524,6 +1560,7 @@ void require_perf_json_schema(fs::path const& path, std::vector<std::string> exp
                    "\"device_stream_sync_total\"",
                    "\"retries_total\"",
                    "\"terminal_failures_total\"",
+                   "\"reactor_scan_chunk_get_counts\"",
                    "\"config\""}) {
     CHECK(json.find(key) != std::string::npos);
   }
@@ -1659,6 +1696,7 @@ bench_record run_rest_minio_bench_scenario(
                      projection_signature(columns),
                      rest_max_connections.value_or(std::size_t{8}),
                      rest_n_reactors.value_or(std::size_t{2}),
+                     std::size_t{1},
                      prefetch_cache_signature(enable_prefetch_cache),
                      measurement,
                      measurement.payload_bytes_read);
@@ -1670,15 +1708,19 @@ bench_record run_rest_aws_bench_scenario(s3_test_env const& env,
                                          std::vector<std::string> columns,
                                          std::size_t rest_max_connections,
                                          std::optional<duckdb::idx_t> expected_rows,
-                                         bool use_footer_probe = false)
+                                         bool use_footer_probe = false,
+                                         std::size_t rest_n_reactors = 2,
+                                         std::size_t source_copies = 1)
 {
   INFO("scenario=" << scenario << " key=" << aws_bench_lineitem_key()
                    << " columns=" << columns.size() << " max_connections=" << rest_max_connections
+                   << " rest_n_reactors=" << rest_n_reactors
+                   << " source_copies=" << source_copies
                    << " use_footer_probe=" << use_footer_probe);
   auto limits                      = large_sirius_memory_limits(/*enable_prefetch_cache=*/true);
   limits.rest_perf_instrumentation = true;
   limits.rest_max_connections      = rest_max_connections;
-  limits.rest_n_reactors           = std::size_t{2};
+  limits.rest_n_reactors           = rest_n_reactors;
   limits.gpu_usage                 = "8 GiB";
   limits.gpu_reservation           = "3 GiB";
   limits.host_capacity             = "12 GiB";
@@ -1689,7 +1731,8 @@ bench_record run_rest_aws_bench_scenario(s3_test_env const& env,
                          env.endpoint,
                          std::nullopt,
                          /*tls_verify=*/true);
-  auto measurement = run_rest_parquet_scan(fixture, uri, columns, use_footer_probe);
+  auto measurement =
+    run_rest_parquet_scan(fixture, uri, columns, use_footer_probe, source_copies);
   CHECK(measurement.rows > 0);
   if (expected_rows.has_value()) { CHECK(measurement.rows == *expected_rows); }
   CHECK(measurement.payload_bytes_read > 0);
@@ -1705,9 +1748,38 @@ bench_record run_rest_aws_bench_scenario(s3_test_env const& env,
                      projection_signature(columns),
                      rest_max_connections,
                      limits.rest_n_reactors.value(),
+                     source_copies,
                      prefetch_cache_signature(true),
                      measurement,
                      measurement.payload_bytes_read);
+}
+
+std::optional<std::size_t> rest_reactor_screen_env(std::string_view name,
+                                                   std::initializer_list<std::size_t> allowed)
+{
+  auto const raw = env_or(name);
+  if (raw.empty()) { return std::nullopt; }
+  for (auto const candidate : allowed) {
+    if (raw == std::to_string(candidate)) { return candidate; }
+  }
+  FAIL(std::string{name} + " must be one of the predeclared values");
+  return std::nullopt;
+}
+
+TEST_CASE("REST reactor-count screen accepts only its predeclared cell values",
+          "[s3][bench][rest-reactor-screen]")
+{
+  auto const name = std::string{"SIRIUS_TEST_REST_REACTOR_SCREEN_VALUE"};
+  scoped_env_vars restore{{name}};
+
+  unsetenv(name.c_str());
+  CHECK_FALSE(rest_reactor_screen_env(name, {1, 2, 4, 8}).has_value());
+
+  setenv(name.c_str(), "4", 1);
+  REQUIRE(rest_reactor_screen_env(name, {1, 2, 4, 8}) == std::size_t{4});
+
+  setenv(name.c_str(), "3", 1);
+  CHECK_THROWS(rest_reactor_screen_env(name, {1, 2, 4, 8}));
 }
 
 std::string explain_text(duckdb::Connection& con, std::string const& sql)
@@ -2340,6 +2412,53 @@ TEST_CASE("S3 TPC-H benchmark records SF1 S3 and local wall-clock arms", "[.][s3
           std::string::npos);
   }
   WARN("Wrote S3 TPC-H perf JSON to " << path.string());
+}
+
+TEST_CASE("S3 REST AWS reactor-count screen records one bound cell",
+          "[.][s3][bench][aws][live][rest-reactor-screen]")
+{
+  auto env = read_aws_live_env();
+  if (!env) { return; }
+
+  auto const rest_n_reactors =
+    rest_reactor_screen_env("SIRIUS_BENCH_REST_N_REACTORS", {1, 2, 4, 8});
+  if (!rest_n_reactors.has_value()) {
+    SUCCEED("SIRIUS_BENCH_REST_N_REACTORS not set; skipping reactor-count screen cell");
+    return;
+  }
+  auto const source_copies = rest_reactor_screen_env("SIRIUS_BENCH_REST_SOURCE_COPIES", {1, 8});
+  REQUIRE(source_copies.has_value());
+
+  auto const object_key = aws_bench_lineitem_key();
+  auto const uri        = aws_bench_lineitem_uri(*env);
+  auto record           = run_rest_aws_bench_scenario(*env,
+                                            uri,
+                                            "aws_https_rest_reactor_screen",
+                                            bench_full_lineitem_projection(),
+                                            /*rest_max_connections=*/16,
+                                            std::nullopt,
+                                            /*use_footer_probe=*/false,
+                                            *rest_n_reactors,
+                                            *source_copies);
+  REQUIRE(record.rest_n_reactors == *rest_n_reactors);
+  REQUIRE(record.source_copies == *source_copies);
+  REQUIRE(record.reactor_scan_chunk_get_counts.size() == *rest_n_reactors);
+
+  auto const path = perf_json_path();
+  write_perf_json(path,
+                  *env,
+                  "rest_aws_reactor_screen",
+                  object_key,
+                  record.payload_bytes_read,
+                  std::vector<bench_record>{record});
+  require_perf_json_schema(path, {"aws_https_rest_reactor_screen"});
+
+  for (std::size_t reactor = 0; reactor < record.reactor_scan_chunk_get_counts.size(); ++reactor) {
+    INFO("reactor=" << reactor
+                    << " scan_chunk_get_count=" << record.reactor_scan_chunk_get_counts[reactor]);
+    CHECK(record.reactor_scan_chunk_get_counts[reactor] > 0);
+  }
+  WARN("Wrote S3 REST reactor-count screen cell to " << path.string());
 }
 
 TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
