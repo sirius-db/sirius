@@ -11,6 +11,7 @@ target_sources(
           scan/duckdb_insert_delta.cpp
           scan/duckdb_mvcc_visibility.cpp
           scan/duckdb_native_metadata.cpp
+          scan/duckdb_native_metadata_cache.cpp
           scan/duckdb_native_decoder.cpp
           scan/dynamic_filter_merge.cpp
           scan/sirius_physical_dynamic_filter.cpp
