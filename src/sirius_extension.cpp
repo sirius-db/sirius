@@ -2272,6 +2272,12 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
       "TEST ONLY: force transparent GPU execution to fail at runtime with this message",
       LogicalType::VARCHAR,
       Value(""));
+    config.AddExtensionOption(
+      "sirius_test_inject_cleanup_error",
+      "TEST ONLY: force the execution window's mandatory per-query cleanup to fail "
+      "(D5 containment: the query errors, other queries keep running)",
+      LogicalType::VARCHAR,
+      Value(""));
   }
 
   // Add in config options for special JIT implementation for regex

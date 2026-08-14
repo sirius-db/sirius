@@ -207,11 +207,13 @@ class SiriusRuntimeUnavailableException : public ExecutorException {
   explicit SiriusRuntimeUnavailableException(const string& msg) : ExecutorException(msg) {}
 };
 
-/// \brief Thrown when the execution-window BEGIN mutations failed: the shared
-/// runtime was possibly part-mutated by THIS query and has been latched
-/// unavailable. Entry points must rethrow it as-is — never CPU-fall-back
-/// (unlike SiriusRuntimeUnavailableException above). Typed, so detection never
-/// depends on message text.
+/// \brief Thrown when the execution-window BEGIN mutations failed: this
+/// query's runtime entries were possibly part-registered, so the failure is
+/// unwound by the backstop cleanup and contained to this query (the runtime
+/// is latched unavailable only if shared corruption was detected — see
+/// SiriusContext::classify_query_failure). Entry points must rethrow it as-is
+/// — never CPU-fall-back (unlike SiriusRuntimeUnavailableException above).
+/// Typed, so detection never depends on message text.
 class SiriusBeginWindowFailureException : public ExecutorException {
  public:
   explicit SiriusBeginWindowFailureException(const string& msg) : ExecutorException(msg) {}
@@ -357,25 +359,42 @@ class SiriusContext : public ClientContextState {
     shared_ptr<SiriusConnectionState> state_;
   };
 
-  /// \brief Health of the shared Sirius runtime. Set to UNAVAILABLE when a
-  /// mandatory per-query cleanup step fails: the shared scan/task/repository
-  /// state can no longer be trusted, so every later attempt to enter a Sirius
-  /// execution or plan-generation window gets a stable, session-preserving
-  /// error (never INTERNAL/FATAL — those would invalidate the whole
-  /// DatabaseInstance and defeat "CPU queries continue"). CPU / non-Sirius
-  /// paths never consult this.
+  /// \brief Health of the shared Sirius runtime. Set to UNAVAILABLE only for
+  /// GENUINELY SHARED corruption — today that means a sticky CUDA error (the
+  /// device context is lost for the whole process, see
+  /// classify_query_failure()) or an explicit mark by a caller that knows a
+  /// shared structure is broken. Once set, every later attempt to enter a
+  /// Sirius execution or plan-generation window gets a stable,
+  /// session-preserving error (never INTERNAL/FATAL — those would invalidate
+  /// the whole DatabaseInstance and defeat "CPU queries continue"). CPU /
+  /// non-Sirius paths never consult this.
+  ///
+  /// A mandatory per-query cleanup failure is NOT latched here anymore: it
+  /// poisons only the failing query (which errors; its per-query state is
+  /// dropped best-effort), while healthy in-flight queries keep running and
+  /// new queries keep admitting. See per_query_cleanup_failures().
   enum class runtime_health : uint8_t { OK, UNAVAILABLE };
   [[nodiscard]] runtime_health get_runtime_health() const noexcept
   {
     return runtime_unavailable_.load(std::memory_order_acquire) ? runtime_health::UNAVAILABLE
                                                                 : runtime_health::OK;
   }
+  /// \brief Latch the process-wide unavailability. Call ONLY for shared
+  /// corruption (CUDA context lost, a shared invariant broken) — a per-query
+  /// failure must use classify_query_failure() instead, so one unlucky query
+  /// cannot poison its healthy co-tenants.
   void mark_runtime_unavailable() noexcept
   {
     runtime_unavailable_.store(true, std::memory_order_release);
   }
   /// \brief Throw the stable runtime-unavailable error (non-invalidating).
   [[noreturn]] void throw_runtime_unavailable() const;
+  /// \brief Count of per-query cleanup/begin failures that were contained to
+  /// their own query (runtime NOT latched). Diagnostic / test observability.
+  [[nodiscard]] std::uint64_t per_query_cleanup_failures() const noexcept
+  {
+    return per_query_cleanup_failures_.load(std::memory_order_relaxed);
+  }
 
   /**
    * @brief Lock-only RAII over the query-lifecycle slot, for plan-generation
@@ -402,8 +421,9 @@ class SiriusContext : public ClientContextState {
    * @brief Full execution-window RAII: begin mutations + slot acquire in the
    * constructor; an explicit finish() runs the mandatory per-query cleanup
    * (and may throw); the destructor is a noexcept backstop that runs only when
-   * finish() did not complete — it attempts the cleanup once, marks the
-   * runtime UNAVAILABLE if that fails, and always releases the slot.
+   * finish() did not complete — it attempts the cleanup once, contains a
+   * failure to this query (latching the runtime only for shared corruption,
+   * see classify_query_failure), and always releases the slot.
    *
    * Every acquire/release pair lives in one C++ scope on one thread, so
    * release is exactly-once by construction and DuckDB's QueryEnd delivery
@@ -418,11 +438,13 @@ class SiriusContext : public ClientContextState {
 
     /// \brief Run the mandatory per-query cleanup and release the slot. May
     /// throw (the query then errors); the destructor will not run the cleanup
-    /// again after a finish() attempt — a mandatory-cleanup failure marks the
-    /// runtime UNAVAILABLE instead of risking a second pass over half-cleaned
-    /// state. Slot release is guaranteed on every path by a non-throwing
-    /// releaser; all window logging is best-effort and can neither retain the
-    /// slot nor poison the runtime.
+    /// again after a finish() attempt — a mandatory-cleanup failure drops this
+    /// query's state best-effort instead of risking a second pass over
+    /// half-cleaned state, and poisons ONLY this query (the runtime is latched
+    /// UNAVAILABLE only for shared corruption; see classify_query_failure).
+    /// Slot release is guaranteed on every path by a non-throwing releaser;
+    /// all window logging is best-effort and can neither retain the slot nor
+    /// poison the runtime.
     void finish();
 
     /// \brief This window's query id — the key its data repositories are registered under.
@@ -447,6 +469,11 @@ class SiriusContext : public ClientContextState {
     char begin_tag_[192] = {};
     char end_tag_[192]   = {};
     scope_state state_   = scope_state::ACTIVE;
+    /// TEST ONLY (see the sirius_test_inject_cleanup_error setting): read from
+    /// the constructing connection before the slot is acquired; finish() then
+    /// fails its mandatory cleanup deterministically, exercising the D5
+    /// per-query containment path.
+    bool inject_cleanup_failure_ = false;
   };
 
   /// \brief Terminate the Sirius context, releasing all resources.
@@ -643,9 +670,24 @@ class SiriusContext : public ClientContextState {
   /// @p end_tag keys the pool-stats log line to the window.
   void run_mandatory_cleanup(sirius::query_id_t query_id, std::string_view end_tag);
   /// noexcept variant for the StandaloneQueryScope destructor backstop: one
-  /// attempt; on failure marks the runtime UNAVAILABLE.
+  /// attempt; on failure classifies via classify_query_failure() (latching the
+  /// runtime only for shared corruption) and drops the query's state
+  /// best-effort.
   void run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
                                       std::string_view end_tag) noexcept;
+
+  /// \brief D5 containment: classify a begin-window or mandatory-cleanup
+  /// failure at its catch site. Latches the process-wide runtime_health ONLY
+  /// when genuinely shared corruption is detected — currently a sticky CUDA
+  /// error (one that survives a cudaGetLastError() clear, i.e. the device
+  /// context is lost for the whole process). Any other failure is contained
+  /// to the failing query: it errors, its per-query state is torn down
+  /// best-effort, healthy in-flight queries keep running, and new queries
+  /// keep admitting. Returns true when the runtime was latched (shared
+  /// verdict). noexcept: runs during unwind.
+  bool classify_query_failure(sirius::query_id_t query_id,
+                              const char* site,
+                              const char* what) noexcept;
 
   /// \brief Best-effort per-query teardown for latched-unavailable paths, where no later
   /// window will ever run the in-cleanup reset: drops @p query_id's task_creator state and its
@@ -683,8 +725,12 @@ class SiriusContext : public ClientContextState {
   // through QueryEnd so neither operation can pass the other between checks.
   std::shared_mutex pinned_table_update_mutex_;
   std::atomic<bool> query_lifecycle_held_{false};
-  // See runtime_health: latched when a mandatory cleanup step fails.
+  // See runtime_health: latched ONLY for shared corruption (sticky CUDA
+  // error / explicit mark), never for a single query's cleanup failure.
   std::atomic<bool> runtime_unavailable_{false};
+  // Count of query failures contained per-query by classify_query_failure()
+  // (runtime NOT latched). Diagnostic / test observability.
+  std::atomic<std::uint64_t> per_query_cleanup_failures_{0};
   // Monotonic execution-window id for window-keyed logging.
   /// 32-bit to match sirius::query_id_t, which task_creator packs into the scheduling
   /// priority. The first window gets id 1, so 0 is never a live query id.

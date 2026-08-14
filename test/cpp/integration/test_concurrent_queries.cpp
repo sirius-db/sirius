@@ -398,6 +398,135 @@ TEST_CASE("a runtime-failing query beside healthy concurrent queries",
   REQUIRE(stats.executions - stats_before.executions >= healthy);
 }
 
+TEST_CASE("a cleanup-poisoned query does not latch the runtime for healthy queries",
+          "[concurrency][isolated_context]")
+{
+  // D5 containment. Worker 0's FIRST iteration arms the test-only
+  // sirius_test_inject_cleanup_error setting, so its execution window's
+  // MANDATORY CLEANUP fails deterministically (the query itself executed
+  // fine — the failure is in run_mandatory_cleanup, the historical latch
+  // site). Pre-fix, that one failure latched the process-wide
+  // runtime_unavailable_: every healthy in-flight worker and every future
+  // query was pushed off the GPU (health UNAVAILABLE, runtime fallbacks
+  // for the rest of the process). Post-fix the failure is contained:
+  //   1. the poisoned query errors cleanly (the injected error, no fallback),
+  //   2. healthy workers keep executing ON THE GPU (zero runtime fallbacks),
+  //   3. NEW queries — the poisoned worker's own next iteration AND a fresh
+  //      connection — still admit and run on the GPU, and
+  //   4. runtime health stays OK; the containment is observable via
+  //      per_query_cleanup_failures().
+  concurrent_env env;
+
+  const auto stats_before    = env.sirius_ctx->get_transparent_execution_stats();
+  const auto failures_before = env.sirius_ctx->per_query_cleanup_failures();
+
+  std::mutex failures_mutex;
+  std::vector<std::string> failures;
+  std::atomic<int> ready{0};
+  std::mutex start_mutex;
+  std::condition_variable start_cv;
+  bool go = false;
+
+  auto record_failure = [&](std::string message) {
+    std::lock_guard<std::mutex> lock(failures_mutex);
+    failures.push_back(std::move(message));
+  };
+
+  auto worker = [&](int wid) {
+    duckdb::Connection con(*env.db);
+    {
+      std::unique_lock<std::mutex> lock(start_mutex);
+      ++ready;
+      start_cv.wait(lock, [&] { return go; });
+    }
+    for (int i = 0; i < iters_per_worker(); ++i) {
+      const bool poisoned_iteration = (wid == 0 && i == 0);
+      if (poisoned_iteration) {
+        auto s = con.Query("SET sirius_test_inject_cleanup_error = 'd5-containment';");
+        if (s->HasError()) {
+          record_failure("worker 0 failed to arm cleanup injection: " + s->GetError());
+          continue;
+        }
+      }
+      const auto shape = (wid + i) % query_shapes().size();
+      auto r           = con.Query(query_shapes()[shape]);
+      if (poisoned_iteration) {
+        // Disarm FIRST so a failure below cannot poison the remaining
+        // iterations of this worker.
+        auto s = con.Query("SET sirius_test_inject_cleanup_error = '';");
+        if (s->HasError()) {
+          record_failure("worker 0 failed to disarm cleanup injection: " + s->GetError());
+        }
+        if (!r->HasError()) {
+          record_failure("worker 0 iter 0: expected the cleanup-poisoned query to error");
+        } else if (r->GetError().find("injected mandatory-cleanup failure") == std::string::npos) {
+          record_failure(
+            "worker 0 iter 0: unexpected error (wanted the injected cleanup "
+            "failure): " +
+            r->GetError());
+        }
+        continue;
+      }
+      if (r->HasError()) {
+        record_failure("worker " + std::to_string(wid) + " iter " + std::to_string(i) +
+                       " ERROR: " + r->GetError());
+        continue;
+      }
+      auto got = materialize(*r);
+      if (got != env.reference[shape]) {
+        record_failure("worker " + std::to_string(wid) + " iter " + std::to_string(i) +
+                       " WRONG RESULT:\n--- got ---\n" + got + "\n--- expected ---\n" +
+                       env.reference[shape]);
+      }
+    }
+  };
+
+  std::vector<std::thread> threads;
+  threads.reserve(static_cast<std::size_t>(workers()));
+  for (int w = 0; w < workers(); ++w) {
+    threads.emplace_back(worker, w);
+  }
+  while (ready.load() < workers()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  {
+    std::lock_guard<std::mutex> lock(start_mutex);
+    go = true;
+  }
+  start_cv.notify_all();
+  for (auto& t : threads) {
+    t.join();
+  }
+  require_no_failures(failures);
+
+  // The injected failure actually took the containment path exactly once.
+  REQUIRE(env.sirius_ctx->per_query_cleanup_failures() - failures_before == 1);
+
+  // The runtime was NOT latched: health stays OK...
+  REQUIRE(env.sirius_ctx->get_runtime_health() == duckdb::SiriusContext::runtime_health::OK);
+
+  // ...and a brand-new connection (a NEW query after the poisoned one ended)
+  // still admits and returns correct results.
+  {
+    duckdb::Connection fresh(*env.db);
+    auto r = fresh.Query(query_shapes()[0]);
+    REQUIRE_FALSE(r->HasError());
+    REQUIRE(materialize(*r) == env.reference[0]);
+  }
+
+  // Healthy queries kept executing ON THE GPU: nobody was pushed onto the
+  // CPU-fallback path by the poisoned query (pre-fix, the latch made every
+  // subsequent query a runtime fallback).
+  const auto stats = env.sirius_ctx->get_transparent_execution_stats();
+  INFO("executions=" << stats.executions << " fallbacks=" << stats.fallbacks
+                     << " runtime_fallbacks=" << stats.runtime_fallbacks);
+  REQUIRE(stats.runtime_fallbacks == stats_before.runtime_fallbacks);
+  const auto healthy =
+    static_cast<std::size_t>(workers()) * iters_per_worker() - 1 /*poisoned iteration*/ + 1
+    /*fresh connection*/;
+  REQUIRE(stats.executions - stats_before.executions >= healthy);
+}
+
 TEST_CASE("concurrent queries stay correct under GPU memory pressure",
           "[concurrency][memory_pressure][isolated_context]")
 {

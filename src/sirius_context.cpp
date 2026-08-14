@@ -377,8 +377,60 @@ void SiriusContext::throw_runtime_unavailable() const
   // would invalidate the whole DatabaseInstance and defeat "CPU queries
   // continue"). Typed so entry points can classify it without text matching.
   throw SiriusRuntimeUnavailableException(
-    "Sirius GPU runtime is unavailable after a mandatory cleanup failure; "
+    "Sirius GPU runtime is unavailable after unrecoverable shared-runtime corruption; "
     "CPU execution continues. Restart the process to restore GPU execution.");
+}
+
+namespace {
+// D5 shared-corruption probe: a sticky CUDA error (illegal address, ECC
+// failure, context lost, ...) is returned by EVERY subsequent CUDA call on
+// the process and cannot be cleared — the device context is gone for
+// everyone, not just the failing query. cudaGetLastError() clears a
+// NON-sticky error, so an error that survives a second read is sticky.
+bool cuda_context_is_poisoned() noexcept
+{
+  (void)cudaGetLastError();
+  return cudaGetLastError() != cudaSuccess;
+}
+}  // namespace
+
+bool SiriusContext::classify_query_failure(sirius::query_id_t query_id,
+                                           const char* site,
+                                           const char* what) noexcept
+{
+  if (cuda_context_is_poisoned()) {
+    // SHARED verdict: the CUDA context is lost for the whole process. Every
+    // in-flight and future GPU query would touch the same dead context, so the
+    // process-wide latch is the correct (and only safe) response. This log is
+    // deliberately loud: it is the one condition that turns a single query's
+    // failure into a process-fatal-for-GPU event.
+    mark_runtime_unavailable();
+    try {
+      SIRIUS_LOG_ERROR(
+        "SiriusContext::{}: query {} failed AND a sticky CUDA error is latched on the device "
+        "context — the shared GPU runtime is corrupt for the whole process, marking it "
+        "UNAVAILABLE (all Sirius queries will now error; CPU execution continues): {}",
+        site,
+        sirius::value_of(query_id),
+        what);
+    } catch (...) {  // best-effort observability
+    }
+    return true;
+  }
+  // PER-QUERY verdict: the failure is contained to this query. Its state is
+  // dropped best-effort by the caller and the query errors; healthy in-flight
+  // queries keep running and new queries keep admitting.
+  per_query_cleanup_failures_.fetch_add(1, std::memory_order_relaxed);
+  try {
+    SIRIUS_LOG_ERROR(
+      "SiriusContext::{}: query {} failed its begin/cleanup; containing the failure to this "
+      "query (its state is dropped best-effort; other queries are unaffected): {}",
+      site,
+      sirius::value_of(query_id),
+      what);
+  } catch (...) {  // best-effort observability
+  }
+  return false;
 }
 
 void SiriusContext::begin_execution_window(ClientContext& context,
@@ -574,24 +626,13 @@ void SiriusContext::run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
   try {
     run_mandatory_cleanup(query_id, end_tag);
   } catch (std::exception& e) {
-    mark_runtime_unavailable();
+    // D5: contained to this query unless the classifier finds shared (CUDA)
+    // corruption. Either way the query's own state is dropped best-effort.
+    classify_query_failure(query_id, "run_mandatory_cleanup_backstop", e.what());
     drop_query_runtime_state_best_effort(query_id);
-    try {
-      SIRIUS_LOG_ERROR(
-        "Mandatory per-query cleanup failed during unwind; marking the Sirius runtime "
-        "unavailable: {}",
-        e.what());
-    } catch (...) {
-    }
   } catch (...) {
-    mark_runtime_unavailable();
+    classify_query_failure(query_id, "run_mandatory_cleanup_backstop", "unknown exception");
     drop_query_runtime_state_best_effort(query_id);
-    try {
-      SIRIUS_LOG_ERROR(
-        "Mandatory per-query cleanup failed during unwind (unknown exception); marking the "
-        "Sirius runtime unavailable");
-    } catch (...) {
-    }
   }
 }
 
@@ -730,33 +771,45 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
                 static_cast<unsigned long long>(sirius::value_of(window_id_)),
                 static_cast<unsigned long long>(query_ordinal_));
 
+  // TEST ONLY: arm the deterministic mandatory-cleanup failure BEFORE the
+  // slot is acquired (no allocation between acquire and release). The setting
+  // exists only when the harness registered it (SIRIUS_ENABLE_TEST_OPTIONS);
+  // in production TryGetCurrentSetting is a cheap miss.
+  {
+    Value inject;
+    if (context.TryGetCurrentSetting("sirius_test_inject_cleanup_error", inject) &&
+        !inject.IsNull() && !inject.ToString().empty()) {
+      inject_cleanup_failure_ = true;
+    }
+  }
+
   ctx_.acquire_query_lifecycle_slot(&context);
   log_window_event("begin", "-");
   try {
     ctx_.begin_execution_window(context, window_id_, window_label, begin_tag_);
   } catch (std::exception& e) {
-    // A failed begin may have left the shared runtime part-mutated. This must
-    // NEVER be classified as an ordinary GPU failure (which entry points would
-    // CPU-fall-back on): latch unavailability, attempt the backstop cleanup,
-    // release, and throw the distinguishable begin-failure error. Entry-point
-    // catch blocks rethrow it as-is instead of falling back.
+    // A failed begin may have left this query's runtime state part-registered.
+    // This must NEVER be classified as an ordinary GPU failure (which entry
+    // points would CPU-fall-back on): classify (D5 — the runtime is latched
+    // only for shared corruption; the begin mutations are per-query entries
+    // the backstop unwinds by id), attempt the backstop cleanup, release, and
+    // throw the distinguishable begin-failure error. Entry-point catch blocks
+    // rethrow it as-is instead of falling back.
     state_ = scope_state::FAILED;
-    ctx_.mark_runtime_unavailable();
+    ctx_.classify_query_failure(window_id_, "begin_execution_window", e.what());
     ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
     log_window_event("end", "begin_failed");
     ctx_.release_query_lifecycle_slot();
     throw SiriusBeginWindowFailureException(
-      string("Sirius execution-window initialization failed (runtime marked unavailable): ") +
-      e.what());
+      string("Sirius execution-window initialization failed: ") + e.what());
   } catch (...) {
     state_ = scope_state::FAILED;
-    ctx_.mark_runtime_unavailable();
+    ctx_.classify_query_failure(window_id_, "begin_execution_window", "unknown exception");
     ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
     log_window_event("end", "begin_failed");
     ctx_.release_query_lifecycle_slot();
     throw SiriusBeginWindowFailureException(
-      "Sirius execution-window initialization failed (runtime marked unavailable): "
-      "unknown exception");
+      "Sirius execution-window initialization failed: unknown exception");
   }
 }
 
@@ -772,17 +825,32 @@ void SiriusContext::StandaloneQueryScope::finish()
   } releaser{ctx_};
 
   try {
+    // TEST ONLY: deterministic mandatory-cleanup failure, armed by the
+    // sirius_test_inject_cleanup_error setting at window construction.
+    // Throwing here models a cleanup that failed at its first mandatory step;
+    // the catch below then exercises the exact D5 containment path
+    // (classification + best-effort per-query drop).
+    if (inject_cleanup_failure_) {
+      throw std::runtime_error(
+        "injected mandatory-cleanup failure (sirius_test_inject_cleanup_error)");
+    }
     ctx_.run_mandatory_cleanup(window_id_, end_tag_);
-  } catch (...) {
-    // A mandatory-cleanup failure means the shared runtime can no longer be
-    // trusted; the destructor must NOT run a second pass over half-cleaned
-    // state. Latch unavailability, drop task_creator's per-query state (the
-    // failed cleanup may have thrown before that step, and no later window
-    // will run it once the latch is set — retained buffer handles must not
-    // survive to DB teardown), release (via the releaser), and let the query
-    // error.
+  } catch (std::exception& e) {
+    // D5: a mandatory-cleanup failure poisons THIS query, not the runtime.
+    // The destructor must NOT run a second pass over half-cleaned state:
+    // classify (the runtime is latched only for shared CUDA corruption), drop
+    // this query's state best-effort (the failed cleanup may have thrown
+    // before its own reset/drain steps, and no later window will ever clean
+    // another query's id — retained buffer handles must not survive to DB
+    // teardown), release (via the releaser), and let the query error.
     state_ = scope_state::FAILED;
-    ctx_.mark_runtime_unavailable();
+    ctx_.classify_query_failure(window_id_, "run_mandatory_cleanup", e.what());
+    ctx_.drop_query_runtime_state_best_effort(window_id_);
+    log_window_event("end", "cleanup_failed");
+    throw;
+  } catch (...) {
+    state_ = scope_state::FAILED;
+    ctx_.classify_query_failure(window_id_, "run_mandatory_cleanup", "unknown exception");
     ctx_.drop_query_runtime_state_best_effort(window_id_);
     log_window_event("end", "cleanup_failed");
     throw;

@@ -245,8 +245,9 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
         gpu_failed = true;
       }
     } catch (duckdb::SiriusBeginWindowFailureException&) {
-      // The BEGIN mutations failed after possibly part-mutating the shared
-      // runtime (now latched unavailable): typed, never a fallback candidate.
+      // The BEGIN mutations failed after possibly part-registering this
+      // query's runtime entries (unwound by the backstop; contained to this
+      // query): typed, never a fallback candidate.
       throw;
     } catch (duckdb::SiriusRuntimeUnavailableException& e) {
       // Pre-existing unavailability (this query never touched the runtime):
@@ -265,10 +266,10 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
     // gpu_failed exit (interrupt rethrow, unavailable-s3 rethrow, s3
     // no-fallback, sanitized INTERNAL/FATAL, generic no-fallback Throw) —
     // none may skip cleanup — and moves the CPU fallback outside the held
-    // slot. finish() may itself throw
-    // (mandatory-cleanup failure ⇒ runtime latched unavailable); a non-std
-    // exception escaping the try above is handled by the window's destructor
-    // backstop instead.
+    // slot. finish() may itself throw (mandatory-cleanup failure ⇒ THIS query
+    // errors; the runtime is latched unavailable only for shared corruption);
+    // a non-std exception escaping the try above is handled by the window's
+    // destructor backstop instead.
     if (window) {
       window->finish();
       window.reset();
