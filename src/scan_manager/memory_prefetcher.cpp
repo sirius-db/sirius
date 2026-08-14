@@ -21,10 +21,13 @@
 #include "log/logging.hpp"
 
 #include <rmm/cuda_device.hpp>
+#include <rmm/cuda_stream.hpp>
 #include <rmm/error.hpp>
 
+#include <absl/cleanup/cleanup.h>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -45,8 +48,6 @@ memory_prefetcher::memory_prefetcher(memory_prefetcher_config cfg,
   for (std::size_t i = 0; i < _connectors.size(); ++i) {
     _drain_claims[i].store(false, std::memory_order_relaxed);
   }
-  _stream_pool = std::make_unique<cucascade::memory::exclusive_stream_pool>(
-    rmm::cuda_device_id{_gpu_space->get_device_id()}, _config.num_threads);
   _workers.reserve(_config.num_threads);
   for (std::size_t i = 0; i < _config.num_threads; ++i) {
     _workers.emplace_back([this] { worker_loop(); });
@@ -87,11 +88,17 @@ void memory_prefetcher::worker_loop()
   // 0, and the compression converters allocate from the CURRENT device's
   // resource rather than the target space's.
   rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{_gpu_space->get_device_id()}};
-  auto stream = _stream_pool->acquire_stream();
+  // Private per-worker stream. No copy traffic ever runs on it: the converter
+  // only synchronize()s it on entry (a no-op — this worker never enqueues work
+  // on it) and does all device allocation + H2D on a stream it acquires from
+  // the GPU space's shared round-robin pool. It exists as a stable per-worker
+  // key for attaching the admission reservation to the allocation tracker in
+  // sweep() (and keeps the entry sync off any pipeline stream).
+  rmm::cuda_stream stream{rmm::cuda_stream::flags::non_blocking};
   while (_running.load(std::memory_order_relaxed)) {
     std::size_t converted = 0;
     try {
-      converted = sweep(stream.get());
+      converted = sweep(stream.view());
     } catch (const std::exception& e) {
       SIRIUS_LOG_WARN("[memory_prefetcher] sweep error (backing off): {}", e.what());
     }
@@ -191,18 +198,6 @@ std::size_t memory_prefetcher::sweep(rmm::cuda_stream_view stream)
         peak_bytes = sirius::peak_materialization_bytes(ro->get_data());
       }
 
-      // Headroom gate: never let prefetched (unreclaimable) bytes push the
-      // space below the free floor. This also keeps the reservation below out
-      // of the executors' way: it is only attempted while the space has at
-      // least min_free_fraction headroom to spare.
-      if (_gpu_space->get_available_memory() < peak_bytes + min_free_bytes) {
-        // No room for this batch now; later batches are at least as far from
-        // being consumed, so stop the whole sweep and retry after tasks free
-        // memory.
-        _stops_headroom.fetch_add(1, std::memory_order_relaxed);
-        return converted;
-      }
-
       // Exclusive lock, skip on contention (a task is consuming this batch —
       // its own prepare_for_processing does the upload).
       auto mut = batch->try_to_mutable();
@@ -214,16 +209,60 @@ std::size_t memory_prefetcher::sweep(rmm::cuda_stream_view stream)
         continue;
       }
 
+      // Reserve FIRST, then gate: the reservation charges the space's
+      // availability immediately, so the floor check below already sees every
+      // concurrent worker's in-flight admission. (Gate-first would let
+      // num_threads workers pass the same headroom concurrently and overshoot
+      // the admission budget.)
       auto reservation = _gpu_space->make_reservation_or_null(peak_bytes);
       if (!reservation) {
         _stops_reservation.fetch_add(1, std::memory_order_relaxed);
         return converted;
       }
 
+      // Headroom floor: never let prefetched (unreclaimable) bytes push the
+      // space below min_free_fraction of max memory. With our reservation
+      // already charged above, admitting this batch is safe iff the space
+      // still clears the floor now; otherwise back the reservation out. No
+      // room for this batch means none for the later ones either (they are at
+      // least as far from being consumed), so stop the whole sweep and retry
+      // after tasks free memory.
+      if (_gpu_space->get_available_memory() < min_free_bytes) {
+        reservation.reset();
+        _stops_headroom.fetch_add(1, std::memory_order_relaxed);
+        return converted;
+      }
+
+      // Attach the reservation to this thread's allocation tracker (Sirius
+      // defaults to per-thread tracking; `stream` is only the API key) so the
+      // conversion's device allocations genuinely draw down the arena reserved
+      // above instead of being counted a second time on top of it — the same
+      // pattern gpu_pipeline_task::execute uses for task work. Policies stay
+      // the cucascade defaults: allocations beyond the reserved peak are
+      // tracked but not failed (the peak is an estimate), and OOM throws so we
+      // back off below — the prefetcher is opportunistic and must never
+      // trigger defragmentation or downgrades to make room for itself.
+      auto* allocator = reservation->get_memory_resource_of<cucascade::memory::Tier::GPU>();
+      if (allocator == nullptr ||
+          !allocator->attach_reservation_to_tracker(stream, std::move(reservation))) {
+        // No reservation-aware GPU allocator, or this thread already tracks a
+        // reservation — both unexpected for a prefetch worker (we always
+        // detach below). A rejected reservation is released with its
+        // unique_ptr; skip the batch, the scan task's own conversion is the
+        // authoritative path.
+        _errors_conversion.fetch_add(1, std::memory_order_relaxed);
+        SIRIUS_LOG_WARN(
+          "[memory_prefetcher] could not attach reservation to allocation tracker for "
+          "batch {} (skipping)",
+          mut->get_batch_id());
+        continue;
+      }
+      absl::Cleanup reservation_detacher = [allocator, stream] {
+        allocator->reset_stream_reservation(stream);
+      };
+
       try {
-        // Convert against the reservation so the conversion's device
-        // allocations draw from the arena reserved above.
-        mut->convert_to<cucascade::gpu_table_representation>(registry, *reservation, stream);
+        mut->convert_to<cucascade::gpu_table_representation>(registry, _gpu_space, stream);
       } catch (const rmm::out_of_memory&) {
         SIRIUS_LOG_DEBUG("[memory_prefetcher] OOM converting batch {}; backing off",
                          mut->get_batch_id());
