@@ -32,6 +32,7 @@
 #include "codegen/jit/kernel_cache.hpp"
 #include "codegen/jit/nvrtc_compiler.hpp"
 #include "codegen/selection/decompression_pushdown_policy.hpp"
+#include "codegen/selection/selection.hpp"
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -979,6 +980,29 @@ void report_enumeration(char const* what,
                  how,
                  blocks,
                  static_cast<long long>(chunks));
+    return;
+  }
+  // On the mask and index walks every chunk gets a block, so `blocks` says
+  // nothing about how many did work — the touched count is what would have
+  // been launched instead, and the difference is the empty-block tax.
+  auto const touched = va.grid_blocks > 0
+                         ? static_cast<std::int64_t>(va.grid_blocks)
+                         : ::sirius::codegen::count_touched_chunks(
+                             reinterpret_cast<std::uint32_t const*>(va.chunk_offsets), chunks);
+  if (touched >= 0 && va.grid_blocks == 0) {
+    std::fprintf(
+      stderr,
+      "simpatico: %s enumerated by %s: blocks=%lld/%lld chunks touched=%lld "
+      "(%.3f of chunks) survivors=%lld (%.4f of rows, %.1f per block)\n",
+      what,
+      how,
+      blocks,
+      static_cast<long long>(chunks),
+      static_cast<long long>(touched),
+      chunks > 0 ? static_cast<double>(touched) / static_cast<double>(chunks) : 0.0,
+      static_cast<long long>(survivors),
+      num_rows > 0 ? static_cast<double>(survivors) / static_cast<double>(num_rows) : 0.0,
+      touched > 0 ? static_cast<double>(survivors) / static_cast<double>(touched) : 0.0);
     return;
   }
   std::fprintf(

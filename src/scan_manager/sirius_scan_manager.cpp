@@ -174,9 +174,19 @@ struct cached_databatch_provider : public databatch_provider {
   void prepare_origin_annotation()
   {
     if (!late_mat::late_mat_enabled()) { return; }
-    if (!_entry.late_mat_handle) { return; }
-    if (!_mvcc_masks.empty() || !_delta_splits.empty()) { return; }
-    if (_entry.tier != cucascade::memory::Tier::GPU) { return; }
+    // A scan that is not stamped looks exactly like one that is stamped and
+    // never used, so each refusal says which one it was.
+    auto const decline = [](char const* why) {
+      if (sirius::codegen::decompression_pushdown_diag_enabled()) {
+        std::fprintf(stderr, "sirius: late-mat origin not stamped: %s\n", why);
+      }
+    };
+    if (!_entry.late_mat_handle) { return decline("the pinned entry has no late-mat handle"); }
+    if (!_mvcc_masks.empty()) { return decline("the scan carries MVCC keep-masks"); }
+    if (!_delta_splits.empty()) { return decline("the scan carries insert-delta splits"); }
+    if (_entry.tier != cucascade::memory::Tier::GPU) {
+      return decline("the pinned entry is not device-resident");
+    }
 
     auto columns = std::make_shared<std::vector<late_mat::column_origin>>();
     columns->reserve(_column_indices.size());
@@ -194,6 +204,13 @@ struct cached_databatch_provider : public databatch_provider {
       _chunk_row_start[c + 1] = _chunk_row_start[c] + pinned_chunk_rows(_entry, c);
     }
     _origin_columns = std::move(columns);
+    if (sirius::codegen::decompression_pushdown_diag_enabled()) {
+      std::fprintf(stderr,
+                   "sirius: late-mat origin stamped: chunks=%zu rows=%lld columns=%zu\n",
+                   chunk_count,
+                   static_cast<long long>(_chunk_row_start.back()),
+                   _origin_columns->size());
+    }
   }
 
   /// The annotation for chunk @p index, or null when this scan is not stamped.
