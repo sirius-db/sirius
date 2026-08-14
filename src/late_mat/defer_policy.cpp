@@ -28,6 +28,7 @@ char const* describe(defer_refusal r) noexcept
     case defer_refusal::too_short_a_ride: return "too few port crossings";
     case defer_refusal::no_columns: return "no columns to defer";
     case defer_refusal::evicted: return "evicted by a wider bundle";
+    case defer_refusal::second_bundle: return "a wider bundle already rides this scan";
   }
   return "unknown";
 }

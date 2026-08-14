@@ -56,6 +56,11 @@ enum class defer_refusal : std::uint8_t {
   too_short_a_ride,  ///< too few port crossings to repay materializing
   no_columns,        ///< nothing to defer
   evicted,           ///< a wider bundle took the slot
+  /// A bundle from the same scan already rides. The substituted scan output
+  /// carries ONE rowid, so a second bundle — landing at a different consumer,
+  /// and therefore needing its own — is not representable. A representational
+  /// limit, not an economic one, and the widest bundle is the one kept.
+  second_bundle,
 };
 
 [[nodiscard]] char const* describe(defer_refusal r) noexcept;

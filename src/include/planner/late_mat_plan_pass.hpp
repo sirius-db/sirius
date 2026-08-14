@@ -39,6 +39,7 @@
 // what lets the thresholds move on a measurement without touching the walk.
 
 #include "helper/logical_type.hpp"
+#include "late_mat/defer_directive.hpp"
 #include "late_mat/defer_policy.hpp"
 
 #include <cstddef>
@@ -106,8 +107,15 @@ struct column_lifetime {
 /// Columns nothing reads are excluded: with no consumer there is nowhere to
 /// install the materializing half of the pair, and half a deferral loses the
 /// data outright.
+///
+/// @p readers, when given, comes back parallel to the returned candidates: entry
+/// i is the operator candidate i would materialize at. The slot labels encode
+/// the same order, but a label is a string for the census and an installer needs
+/// the operator itself.
 [[nodiscard]] std::vector<late_mat::defer_candidate> build_defer_candidates(
-  op::sirius_physical_operator const& scan, std::vector<column_lifetime> const& lifetimes);
+  op::sirius_physical_operator const& scan,
+  std::vector<column_lifetime> const& lifetimes,
+  std::vector<op::sirius_physical_operator const*>* readers = nullptr);
 
 /// Lifetimes of every output column of @p scan, in scan output order.
 ///
@@ -115,5 +123,49 @@ struct column_lifetime {
 /// set_parent_ops; the walk goes upward from it.
 [[nodiscard]] std::vector<column_lifetime> analyze_column_lifetimes(
   op::sirius_physical_operator const& scan);
+
+/// The one deferral a scan would install, and the census of everything weighed.
+///
+/// ONE BUNDLE PER SCAN. The substituted output carries a single rowid, so two
+/// bundles landing at two different consumers are not representable; the widest
+/// wins and the rest are refused as @ref late_mat::defer_refusal::second_bundle
+/// rather than dropped, because a bundle that quietly vanished looks exactly
+/// like one that never qualified.
+struct planned_deferral {
+  /// The operator that would materialize, or nullptr when nothing installs.
+  op::sirius_physical_operator* port = nullptr;
+  /// Scan output positions to defer, ascending. The first carries the rowid.
+  std::vector<std::size_t> positions;
+  /// The columns' types as the port must restore them, parallel to positions.
+  std::vector<sirius::logical_type> restored_types;
+  std::int64_t net_value_bytes = 0;
+  int boundaries               = 0;
+  /// Every candidate weighed, in the order the walk found them.
+  std::vector<late_mat::defer_outcome> census;
+  /// Columns excluded before the weighing because an outer join on their ride
+  /// could null them. Sound to defer — a null rowid must materialize a null —
+  /// but the materializer does not produce nulls yet, so v1 refuses them here
+  /// rather than at the far end where the answer would already be wrong.
+  std::size_t nullable_columns_skipped = 0;
+
+  [[nodiscard]] bool installable() const noexcept { return port != nullptr && !positions.empty(); }
+};
+
+/// Weigh @p scan's columns and report the deferral to install, if any.
+///
+/// Decides nothing about origins or execution: the result says WHICH positions
+/// and WHERE they land, and the caller — which is the only code that knows
+/// whether this scan's rows are addressable at all — completes the pair.
+[[nodiscard]] planned_deferral plan_deferral(op::sirius_physical_operator& scan,
+                                             late_mat::defer_policy const& policy = {});
+
+/// Stamp both halves of @p pair, or neither.
+///
+/// Fails (changing nothing) on an invalid pair, or when either operator already
+/// carries a half — a second deferral through the same port would materialize
+/// against a schema the first one has already rewritten.
+bool install_deferral(op::sirius_physical_operator& scan,
+                      op::sirius_physical_operator& port,
+                      late_mat::defer_pair pair);
 
 }  // namespace sirius::planner

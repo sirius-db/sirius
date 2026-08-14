@@ -23,11 +23,15 @@
 // The second is the dangerous one, so the analysis fails closed: a shape it
 // does not model reads everything, which can only end a ride early.
 
+#include <cudf/types.hpp>
+
 #include <catch.hpp>
+#include <duckdb/planner/operator/logical_dummy_scan.hpp>
 #include <expression/ast/comparison.hpp>
 #include <expression/ast/node.hpp>
 #include <expression/ast/reference.hpp>
 #include <op/sirius_physical_filter.hpp>
+#include <op/sirius_physical_hash_join.hpp>
 #include <op/sirius_physical_projection.hpp>
 #include <planner/late_mat_plan_pass.hpp>
 
@@ -39,12 +43,24 @@ using sirius::planner::analyze_column_lifetimes;
 namespace {
 
 sirius::logical_type int32_type() { return sirius::logical_type::make(sirius::type_id::INTEGER); }
+sirius::logical_type string_type() { return sirius::logical_type::make(sirius::type_id::VARCHAR); }
 
 duckdb::vector<sirius::logical_type> make_types(std::size_t n)
 {
   duckdb::vector<sirius::logical_type> out;
   for (std::size_t i = 0; i < n; ++i) {
     out.push_back(int32_type());
+  }
+  return out;
+}
+
+/// Wide enough that a bundle of two clears the policy's value floor — the
+/// dimension columns a deferral is actually for.
+duckdb::vector<sirius::logical_type> make_string_types(std::size_t n)
+{
+  duckdb::vector<sirius::logical_type> out;
+  for (std::size_t i = 0; i < n; ++i) {
+    out.push_back(string_type());
   }
   return out;
 }
@@ -60,6 +76,16 @@ struct fake_scan : sirius::op::sirius_physical_operator {
   explicit fake_scan(std::size_t columns)
     : sirius_physical_operator(
         sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN, make_types(columns), 0)
+  {
+  }
+  void link(sirius_physical_operator* parent) { _parent_op = parent; }
+};
+
+/// The same, with columns wide enough for a bundle to clear the value floor.
+struct wide_scan : sirius::op::sirius_physical_operator {
+  explicit wide_scan(std::size_t columns)
+    : sirius_physical_operator(
+        sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN, make_string_types(columns), 0)
   {
   }
   void link(sirius_physical_operator* parent) { _parent_op = parent; }
@@ -82,6 +108,11 @@ struct test_filter : sirius::op::sirius_physical_filter {
 
 struct test_projection : sirius::op::sirius_physical_projection {
   using sirius_physical_projection::sirius_physical_projection;
+  void link(sirius_physical_operator* parent) { _parent_op = parent; }
+};
+
+struct test_join : sirius::op::sirius_physical_hash_join {
+  using sirius_physical_hash_join::sirius_physical_hash_join;
   void link(sirius_physical_operator* parent) { _parent_op = parent; }
 };
 
@@ -287,4 +318,175 @@ TEST_CASE("nothing is nullified on a ride with no outer join", "[late_mat][lifet
   auto const lives = analyze_column_lifetimes(scan);
   REQUIRE_FALSE(lives[0].nullified_on_ride);
   REQUIRE_FALSE(lives[1].nullified_on_ride);
+}
+
+namespace {
+
+/// A chain of pass-through projections, so a ride can be made long enough to
+/// clear the policy's boundary floor. Returned by value; the caller links them.
+std::vector<std::unique_ptr<test_projection>> pass_through_chain(std::size_t columns,
+                                                                 std::size_t links)
+{
+  std::vector<std::unique_ptr<test_projection>> chain;
+  for (std::size_t i = 0; i < links; ++i) {
+    duckdb::vector<std::unique_ptr<sirius::ast::node>> list;
+    for (std::size_t c = 0; c < columns; ++c) {
+      list.push_back(ref(static_cast<std::uint32_t>(c)));
+    }
+    chain.push_back(
+      std::make_unique<test_projection>(make_string_types(columns), std::move(list), 0));
+  }
+  return chain;
+}
+
+}  // namespace
+
+TEST_CASE("a wide bundle over a long ride plans a deferral at its reader", "[late_mat][lifetime]")
+{
+  // Five string columns carried past four projections into an aggregate that
+  // reads them: the q10 shape, and the one the measurements were taken on.
+  wide_scan scan(5);
+  opaque_op aggregate(5);
+  auto chain = pass_through_chain(5, 4);
+  scan.link(chain.front().get());
+  for (std::size_t i = 0; i + 1 < chain.size(); ++i) {
+    chain[i]->link(chain[i + 1].get());
+  }
+  chain.back()->link(&aggregate);
+
+  auto const planned = sirius::planner::plan_deferral(scan);
+  REQUIRE(planned.installable());
+  REQUIRE(planned.port == &aggregate);
+  REQUIRE(planned.positions == std::vector<std::size_t>{0, 1, 2, 3, 4});
+  REQUIRE(planned.restored_types.size() == 5);
+  REQUIRE(planned.boundaries == 5);
+  REQUIRE(planned.net_value_bytes == 5 * 24 - 8);
+  REQUIRE(planned.census.size() == 1);
+  REQUIRE(planned.census.front().installed());
+}
+
+TEST_CASE("a short ride plans nothing, and says so", "[late_mat][lifetime]")
+{
+  // Same wide bundle, read one boundary up. The ride does not repay the
+  // materialization, and the refusal is recorded rather than dropped — a
+  // deferral that silently did not happen looks like one that did nothing.
+  wide_scan scan(5);
+  opaque_op aggregate(5);
+  scan.link(&aggregate);
+
+  auto const planned = sirius::planner::plan_deferral(scan);
+  REQUIRE_FALSE(planned.installable());
+  REQUIRE(planned.port == nullptr);
+  REQUIRE(planned.census.size() == 1);
+  REQUIRE(planned.census.front().refusal == sirius::late_mat::defer_refusal::too_short_a_ride);
+}
+
+TEST_CASE("one rowid rides, so the narrower of two bundles is refused", "[late_mat][lifetime]")
+{
+  // Two readers, both far enough away and both wide enough. The substituted
+  // output carries ONE rowid, so only one bundle is representable; the loser is
+  // refused rather than dropped.
+  wide_scan scan(5);
+  // A filter over five columns whose predicate reads columns 0 and 1: they stop
+  // there, the other three ride on to the aggregate.
+  auto predicate = std::make_unique<sirius::ast::node>(
+    sirius::ast::comparison{sirius::comparison_type::equal, ref(0), ref(1)});
+  test_filter filter(make_string_types(5), std::move(predicate), 0);
+  opaque_op aggregate(5);
+
+  auto lower = pass_through_chain(5, 4);
+  auto upper = pass_through_chain(5, 4);
+  scan.link(lower.front().get());
+  for (std::size_t i = 0; i + 1 < lower.size(); ++i) {
+    lower[i]->link(lower[i + 1].get());
+  }
+  lower.back()->link(&filter);
+  filter.link(upper.front().get());
+  for (std::size_t i = 0; i + 1 < upper.size(); ++i) {
+    upper[i]->link(upper[i + 1].get());
+  }
+  upper.back()->link(&aggregate);
+
+  auto const planned = sirius::planner::plan_deferral(scan);
+  REQUIRE(planned.census.size() == 2);
+  REQUIRE(planned.installable());
+  // Three columns beat two, whichever slot was found first.
+  REQUIRE(planned.port == &aggregate);
+  REQUIRE(planned.positions == std::vector<std::size_t>{2, 3, 4});
+  auto const refused = planned.census[0].installed() ? planned.census[1] : planned.census[0];
+  REQUIRE(refused.refusal == sirius::late_mat::defer_refusal::second_bundle);
+}
+
+TEST_CASE("both halves install together, and only once", "[late_mat][lifetime]")
+{
+  using sirius::late_mat::make_defer_pair;
+
+  wide_scan scan(3);
+  opaque_op port(3);
+  std::vector<cudf::data_type> const schema(3, cudf::data_type{cudf::type_id::STRING});
+  std::vector<sirius::late_mat::column_origin> origins;
+  for (int i = 0; i < 2; ++i) {
+    sirius::late_mat::column_origin origin;
+    origin.handle     = std::make_shared<sirius::late_mat::pin_entry_handle>("t", 1);
+    origin.generation = 1;
+    origins.push_back(std::move(origin));
+  }
+
+  REQUIRE(sirius::planner::install_deferral(scan, port, make_defer_pair(schema, {1, 2}, origins)));
+  REQUIRE(scan.deferred_output().output_positions == std::vector<std::size_t>{1, 2});
+  REQUIRE(port.port_directive().output_positions == std::vector<std::size_t>{1, 2});
+  REQUIRE(port.port_directive().valid());
+
+  // A second install would substitute against a schema the first one already
+  // rewrote, and an invalid pair must stamp neither half.
+  opaque_op other_port(3);
+  REQUIRE_FALSE(
+    sirius::planner::install_deferral(scan, other_port, make_defer_pair(schema, {1, 2}, origins)));
+  REQUIRE(other_port.port_directive().empty());
+  wide_scan fresh(3);
+  REQUIRE_FALSE(sirius::planner::install_deferral(
+    fresh, other_port, make_defer_pair(schema, {2, 1}, origins)));  // unordered
+  REQUIRE(fresh.deferred_output().empty());
+  REQUIRE(other_port.port_directive().empty());
+}
+
+TEST_CASE("a column an outer join could null is withheld from the weighing", "[late_mat][lifetime]")
+{
+  // Deferring it is sound — a null rowid must materialize a null — but the
+  // materializer produces no nulls yet, so it is refused here, where it costs a
+  // deferral, rather than at the far end where it would already be an answer.
+  auto scan      = duckdb::make_uniq<wide_scan>(3);
+  auto* scan_ptr = scan.get();
+  auto build     = duckdb::make_uniq<wide_scan>(3);
+
+  duckdb::LogicalDummyScan stub(0);
+  stub.types = {duckdb::LogicalType::VARCHAR,
+                duckdb::LogicalType::VARCHAR,
+                duckdb::LogicalType::VARCHAR,
+                duckdb::LogicalType::VARCHAR,
+                duckdb::LogicalType::VARCHAR,
+                duckdb::LogicalType::VARCHAR};
+  duckdb::vector<sirius::join_condition> conditions;
+  sirius::join_condition condition;
+  condition.left  = std::make_unique<sirius::ast::node>(sirius::ast::reference{0, string_type()});
+  condition.right = std::make_unique<sirius::ast::node>(sirius::ast::reference{0, string_type()});
+  conditions.push_back(std::move(condition));
+  // The scan is the RIGHT side of a LEFT join: an unmatched left row emits its
+  // columns as null, so the payload riding from the right is nullified.
+  test_join join(stub,
+                 std::move(build),
+                 std::move(scan),
+                 std::move(conditions),
+                 duckdb::JoinType::LEFT,
+                 /*estimated_cardinality=*/1);
+  opaque_op reader(6);
+  scan_ptr->link(&join);
+  join.link(&reader);
+
+  auto const lives = analyze_column_lifetimes(*scan_ptr);
+  REQUIRE(lives[1].nullified_on_ride);
+
+  auto const planned = sirius::planner::plan_deferral(*scan_ptr);
+  REQUIRE(planned.nullable_columns_skipped == 2);  // columns 1 and 2; 0 is the key
+  REQUIRE_FALSE(planned.installable());
 }

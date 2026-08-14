@@ -39,6 +39,7 @@
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_operator_type.hpp"
+#include "planner/late_mat_plan_pass.hpp"
 #include "planner/query.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
 
@@ -591,6 +592,96 @@ std::string normalize_path(std::string const& p)
   return p;
 }
 
+/// Complete and install one pinned scan's deferral, or leave the plan alone and
+/// say why (env gate: SIRIUS_EXP_LATE_MAT).
+///
+/// The plan side weighs the ride; only here is it known whether this scan's rows
+/// are ADDRESSABLE — a pin-order id means something exactly when a served batch
+/// is one pinned chunk's whole row span, which is also the condition
+/// `cached_databatch_provider::prepare_origin_annotation` stamps origins under.
+/// The two must agree: a scan that substitutes with no origin stamped on its
+/// batches has thrown the values away with no way to get them back.
+///
+/// v1 additionally refuses any scan that RESTRICTS ROWS. Substitution runs on
+/// the finished scan output, whose rows are then the chunk's rows in order, so
+/// the rowid is a sequence over the origin's span and costs nothing. Admitting a
+/// filter means moving the substitution ahead of the filter's gather, which
+/// carries the rowid through it — worth doing, and not what makes q10 fast.
+void install_late_materialization(op::scan::sirius_gpu_scan_operator& scan_op,
+                                  pinned_entry const& entry,
+                                  std::span<std::size_t const> selected_columns,
+                                  bool serves_whole_chunks,
+                                  bool has_dynamic_filters)
+{
+  if (!late_mat::late_mat_enabled()) { return; }
+  // An uninstalled deferral looks exactly like one that installed and did
+  // nothing, so every refusal says which it was.
+  auto const decline = [&scan_op](std::string_view why) {
+    SIRIUS_LOG_INFO("[late-mat] operator {}: not deferring — {}", scan_op.get_operator_id(), why);
+  };
+
+  if (!entry.late_mat_handle) { return decline("the pinned entry has no late-mat handle"); }
+  if (entry.tier != cucascade::memory::Tier::GPU) {
+    return decline("the pinned entry is not device-resident");
+  }
+  if (!serves_whole_chunks) {
+    return decline("a served batch is not one pinned chunk's whole row span");
+  }
+  if (scan_op.get_ingestible().has_row_filter()) {
+    return decline("the scan restricts rows, so its output is not the chunk's rows in order");
+  }
+  if (has_dynamic_filters) {
+    return decline("a join may publish a filter into this scan mid-query");
+  }
+
+  auto const planned = sirius::planner::plan_deferral(scan_op);
+  for (auto const& outcome : planned.census) {
+    SIRIUS_LOG_INFO("[late-mat] operator {}: {} — {} ({} B/row over {} boundaries)",
+                    scan_op.get_operator_id(),
+                    outcome.slot,
+                    sirius::late_mat::describe(outcome.refusal),
+                    outcome.net_value_bytes,
+                    outcome.boundaries);
+  }
+  if (planned.nullable_columns_skipped > 0) {
+    SIRIUS_LOG_INFO("[late-mat] operator {}: {} column(s) withheld — an outer join could null them",
+                    scan_op.get_operator_id(),
+                    planned.nullable_columns_skipped);
+  }
+  if (!planned.installable()) { return; }
+
+  // Output position p is served slot p is entry column selected_columns[p] —
+  // the same mapping prepare_origin_annotation stamps its shared origins by,
+  // and the one materialized_column_order guarantees (output columns first, in
+  // output order).
+  std::vector<late_mat::column_origin> origins;
+  origins.reserve(planned.positions.size());
+  for (auto const position : planned.positions) {
+    if (position >= selected_columns.size()) {
+      return decline("a deferred output position has no served column");
+    }
+    late_mat::column_origin origin;
+    origin.handle     = entry.late_mat_handle;
+    origin.column_pos = static_cast<std::uint32_t>(selected_columns[position]);
+    origin.generation = entry.late_mat_handle->generation();
+    origins.push_back(std::move(origin));
+  }
+
+  auto pair = late_mat::make_defer_pair(
+    scan_op.normalization_targets(), planned.positions, std::move(origins));
+  if (!sirius::planner::install_deferral(scan_op, *planned.port, std::move(pair))) {
+    return decline("the pair would not install (the port already carries one, or it is malformed)");
+  }
+  SIRIUS_LOG_INFO(
+    "[late-mat] operator {}: deferring {} column(s) to {} (id={}) — {} B/row over {} boundaries",
+    scan_op.get_operator_id(),
+    planned.positions.size(),
+    planned.port->get_name(),
+    planned.port->get_operator_id(),
+    planned.net_value_bytes,
+    planned.boundaries);
+}
+
 }  // namespace
 
 sirius_scan_manager::sirius_scan_manager(
@@ -936,6 +1027,14 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     // two -- it occupies an output position with no materialized column -- and such a scan
     // cannot serve from a pin, since a pin never captures a partition column and a scan
     // requesting one therefore misses the cache.
+    // Both halves of the deferral, installed before a single task runs. Read
+    // the eligibility conditions here against prepare_origin_annotation's: the
+    // scan side must substitute only for batches the provider stamps.
+    install_late_materialization(*assignment.op,
+                                 *assignment.entry,
+                                 assignment.columns,
+                                 /*serves_whole_chunks=*/masks.empty() && delta_splits.empty(),
+                                 /*has_dynamic_filters=*/dynamic_filters != nullptr);
     auto provider = make_provider_for_pinned_entry(*assignment.entry,
                                                    assignment.columns,
                                                    std::move(assignment.plan),

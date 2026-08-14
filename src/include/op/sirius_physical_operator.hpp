@@ -20,6 +20,7 @@
 #include "duckdb/common/common.hpp"
 #include "helper/logical_type.hpp"
 #include "helper/types.hpp"
+#include "late_mat/defer_directive.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "sirius/exception.hpp"
 #include "telemetry-bridge/gen/uuid.rs.h"
@@ -57,6 +58,10 @@ class sirius_meta_pipeline;
 }  // namespace pipeline
 namespace planner {
 class sirius_physical_plan_generator;
+//! The only writer of the two late-materialization halves; see `deferred_output()`.
+bool install_deferral(op::sirius_physical_operator& scan,
+                      op::sirius_physical_operator& port,
+                      late_mat::defer_pair pair);
 }  // namespace planner
 namespace op {
 
@@ -482,6 +487,23 @@ class sirius_physical_operator {
   //! operator has no pipeline set.
   [[nodiscard]] telemetry::batch_telemetry_info batch_telemetry() const;
 
+  //! The late-materialization half this operator carries, if any. Both are empty on every
+  //! operator unless `SIRIUS_EXP_LATE_MAT` is on AND the pair installed; they are written once,
+  //! at query prepare, before any task runs, and only read from then on.
+  //!
+  //! A scan carries the producing half (stop emitting these positions' values) and its port
+  //! carries the consuming half (put them back). Stamped only by
+  //! `planner::install_deferral`, which writes both or neither — an operator holding one half
+  //! alone either loses the data or corrupts a batch that was already correct.
+  [[nodiscard]] late_mat::deferred_scan_output const& deferred_output() const noexcept
+  {
+    return _deferred_output;
+  }
+  [[nodiscard]] late_mat::port_materialize_directive const& port_directive() const noexcept
+  {
+    return _port_directive;
+  }
+
   //! This operator's parent in the physical plan tree, or nullptr at the root. Stamped by
   //! `sirius_physical_plan_generator::set_parent_ops` after plan generation completes.
   [[nodiscard]] sirius_physical_operator* get_parent_op() const noexcept { return _parent_op; }
@@ -714,10 +736,18 @@ class sirius_physical_operator {
   //! set_physical_types() cannot be bypassed by direct assignment.
   std::vector<cudf::data_type> _physical_types;
 
+  //! See `deferred_output()` / `port_directive()`. Private and written through one friend, so
+  //! the two halves cannot be installed apart.
+  late_mat::deferred_scan_output _deferred_output;
+  late_mat::port_materialize_directive _port_directive;
+
   //! Restricted to the plan generator so parent pointers stay immutable post-plan-gen.
   void set_parent_op(sirius_physical_operator* parent_op) noexcept { _parent_op = parent_op; }
 
   friend class ::sirius::planner::sirius_physical_plan_generator;
+  friend bool ::sirius::planner::install_deferral(sirius_physical_operator&,
+                                                  sirius_physical_operator&,
+                                                  late_mat::defer_pair);
 };
 
 }  // namespace op

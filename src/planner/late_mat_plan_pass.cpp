@@ -70,13 +70,6 @@ std::optional<std::size_t> trace_through(sirius_physical_operator const& node,
       bool const from_lhs = node.children[0].get() == &from;
       if (!from_lhs && node.children[1].get() != &from) { return std::nullopt; }
 
-      // An outer join can emit a row this side never matched. The rowid is
-      // null there and the column materializes null, which is sound — so the
-      // ride continues and the fact is recorded rather than refused.
-      nullified = nullified || type == duckdb::JoinType::OUTER ||
-                  (from_lhs && type == duckdb::JoinType::RIGHT) ||
-                  (!from_lhs && type == duckdb::JoinType::LEFT);
-
       // A key is read: the join compares its values. The conditions' left
       // nodes address the lhs and their right nodes the rhs, so only this
       // side's half is consulted.
@@ -89,7 +82,22 @@ std::optional<std::size_t> trace_through(sirius_physical_operator const& node,
                                  join.lhs_output_columns.col_idxs.end());
       std::vector<int> const rhs(join.rhs_output_columns.col_idxs.begin(),
                                  join.rhs_output_columns.col_idxs.end());
-      return join_output_position(from_lhs, lhs, rhs, in_pos);
+      auto const moved = join_output_position(from_lhs, lhs, rhs, in_pos);
+
+      // An outer join can emit a row this side never matched. The rowid is
+      // null there and the column materializes null, which is sound — so the
+      // ride continues and the fact is recorded rather than refused.
+      //
+      // Recorded only for a column that actually RIDES. A column read here as a
+      // key, or not projected out, arrives with its own values and stops; the
+      // join nullifies its OUTPUT, which that column never reaches. Marking it
+      // anyway would cost the key substitution a deferral it is entitled to.
+      if (moved.has_value()) {
+        nullified = nullified || type == duckdb::JoinType::OUTER ||
+                    (from_lhs && type == duckdb::JoinType::RIGHT) ||
+                    (!from_lhs && type == duckdb::JoinType::LEFT);
+      }
+      return moved;
     }
 
     case SiriusPhysicalOperatorType::FILTER: {
@@ -168,7 +176,9 @@ std::int64_t estimated_value_bytes(sirius::logical_type const& type)
 }
 
 std::vector<late_mat::defer_candidate> build_defer_candidates(
-  sirius_physical_operator const& scan, std::vector<column_lifetime> const& lifetimes)
+  sirius_physical_operator const& scan,
+  std::vector<column_lifetime> const& lifetimes,
+  std::vector<op::sirius_physical_operator const*>* out_readers)
 {
   std::vector<late_mat::defer_candidate> candidates;
   // Slots are labelled by the order their reader is first seen, so a label is
@@ -194,6 +204,7 @@ std::vector<late_mat::defer_candidate> build_defer_candidates(
       late_mat::defer_column{static_cast<std::uint32_t>(life.scan_output_position),
                              estimated_value_bytes(scan.types[life.scan_output_position])});
   }
+  if (out_readers != nullptr) { *out_readers = std::move(readers); }
   return candidates;
 }
 
@@ -252,6 +263,79 @@ std::vector<column_lifetime> analyze_column_lifetimes(sirius_physical_operator c
     life.nullified_on_ride  = col.nullified;
   }
   return lifetimes;
+}
+
+planned_deferral plan_deferral(sirius_physical_operator& scan, late_mat::defer_policy const& policy)
+{
+  // No env gate here: like the rest of the pass this only reports, and the one
+  // caller that acts on it is gated. Keeping the analysis ungated is also what
+  // lets it be tested without the gate set in the test binary's environment.
+  planned_deferral planned;
+  auto const lifetimes = analyze_column_lifetimes(scan);
+
+  // Withdraw the columns an outer join could null BEFORE anything weighs them.
+  // Deferring one is sound — a null rowid must materialize a null — but the
+  // materializer produces no nulls yet, so the refusal belongs here, where it
+  // costs a deferral, rather than at the far end where it would already be an
+  // answer.
+  std::vector<column_lifetime> weighable;
+  weighable.reserve(lifetimes.size());
+  for (auto const& life : lifetimes) {
+    if (life.nullified_on_ride) {
+      ++planned.nullable_columns_skipped;
+      continue;
+    }
+    weighable.push_back(life);
+  }
+
+  std::vector<sirius_physical_operator const*> readers;
+  auto const candidates = build_defer_candidates(scan, weighable, &readers);
+  planned.census        = late_mat::choose_deferrals(candidates, policy);
+
+  // One rowid rides, so one bundle installs. Widest wins, same rule the policy
+  // arbitrates a shared slot by, and the losers are recorded rather than
+  // dropped.
+  std::optional<std::size_t> best;
+  for (std::size_t i = 0; i < planned.census.size(); ++i) {
+    if (!planned.census[i].installed()) { continue; }
+    if (!best) {
+      best = i;
+      continue;
+    }
+    auto const loser = planned.census[i].net_value_bytes > planned.census[*best].net_value_bytes
+                         ? std::exchange(*best, i)
+                         : i;
+    planned.census[loser].refusal = late_mat::defer_refusal::second_bundle;
+  }
+  if (!best || *best >= readers.size() || readers[*best] == nullptr) { return planned; }
+
+  // The walk reads the plan, which is why it holds const pointers; installing
+  // writes to it, and the caller handed us the mutable tree those pointers
+  // address.
+  planned.port            = const_cast<sirius_physical_operator*>(readers[*best]);
+  planned.net_value_bytes = planned.census[*best].net_value_bytes;
+  planned.boundaries      = planned.census[*best].boundaries;
+  for (auto const& column : candidates[*best].columns) {
+    auto const position = static_cast<std::size_t>(column.column_pos);
+    planned.positions.push_back(position);
+    planned.restored_types.push_back(scan.types[position]);
+  }
+  return planned;
+}
+
+bool install_deferral(sirius_physical_operator& scan,
+                      sirius_physical_operator& port,
+                      late_mat::defer_pair pair)
+{
+  if (!pair.valid()) { return false; }
+  // A scan materializing its own deferral would defer nothing across nothing.
+  if (&scan == &port) { return false; }
+  // Neither half may be overwritten: the second install would substitute
+  // against a schema the first one already rewrote.
+  if (!scan._deferred_output.empty() || !port._port_directive.empty()) { return false; }
+  scan._deferred_output = std::move(pair.scan);
+  port._port_directive  = std::move(pair.port);
+  return true;
 }
 
 }  // namespace sirius::planner
