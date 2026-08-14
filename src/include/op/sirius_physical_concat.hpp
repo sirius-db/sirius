@@ -28,12 +28,13 @@
 namespace sirius {
 namespace op {
 
-//! Buffers the per-partition data batches produced upstream and releases them in groups sized to
-//! `_concat_batch_bytes` for the downstream hash or nested-loop join, so the join consumes a few
-//! large inputs instead of many small ones. Group formation follows a single policy implemented in
-//! `plan_pull_for_partition`: `get_next_task_hint` reports READY exactly when that policy would
-//! release a group, and `get_next_task_input_data` pops exactly the batches the policy selects, so
-//! task scheduling and data pulls cannot disagree.
+/**
+ * @brief Groups partitioned input batches before a downstream join
+ *
+ * Buffers batches in arrival order for each partition and releases groups based on
+ * `_concat_batch_bytes`. `get_next_task_hint` and `get_next_task_input_data` use the same grouping
+ * policy so a ready hint always corresponds to data that can be pulled.
+ */
 class sirius_physical_concat : public sirius_physical_partition_consumer_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::CONCAT;
@@ -79,23 +80,23 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
     const op::input_stats& stats) const override;
 
  private:
-  //! Decides which batches a pull from partition `partition_idx` of `repo` would take, without
-  //! removing anything. The policy: batches accumulate in arrival order until their cumulative size
-  //! first exceeds `_concat_batch_bytes`; the accumulated group is then released and the
-  //! overflowing batch stays behind to seed the next group. A batch that exceeds the threshold on
-  //! its own is released as a single-batch group once another batch sits behind it or
-  //! `pipeline_finished` is true. A group that never reaches the threshold is released only when
-  //! `pipeline_finished` is true (tail flush). When `_concat_all` is set the whole partition forms
-  //! one group, released only when `pipeline_finished` is true.
-  //!
-  //! Must be called with the operator mutex `lock` held. The returned plan stays valid while the
-  //! lock is held: only `get_next_task_input_data` removes batches (also under `lock`), and
-  //! concurrent producers can only append.
-  //!
-  //! @param repo The single input port's data repository
-  //! @param partition_idx The partition to plan a pull for
-  //! @param pipeline_finished Whether the source pipeline can produce no more batches
-  //! @return The batch ids to pop, in pull order, or std::nullopt if no group should form yet
+  /**
+   * @brief Plans the next batch group for one partition without removing data
+   *
+   * A group contains the batches before the first batch that would make its cumulative size exceed
+   * `_concat_batch_bytes`; the overflowing batch remains for the next group. A batch that exceeds
+   * the threshold by itself becomes a single-batch group after another batch arrives or the source
+   * pipeline finishes. Finishing the pipeline also releases an under-threshold tail. When
+   * `_concat_all` is set, the complete partition becomes one group after the pipeline finishes.
+   *
+   * The caller must hold the operator mutex `lock`. The plan remains valid while the lock is held
+   * because consumers remove batches under the same lock and producers only append batches.
+   *
+   * @param[in] repo Repository for the operator's input port
+   * @param[in] partition_idx Partition to inspect
+   * @param[in] pipeline_finished Whether the source pipeline has finished
+   * @return Batch identifiers in pull order, or `std::nullopt` when no group is ready
+   */
   [[nodiscard]] std::optional<std::vector<uint64_t>> plan_pull_for_partition(
     ::cucascade::shared_data_repository& repo,
     std::size_t partition_idx,
