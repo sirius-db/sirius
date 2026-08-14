@@ -111,9 +111,13 @@ export SCCACHE_BASEDIRS="$_sirius_repo_root:$_sirius_repo_root/.pixi/envs/defaul
 unset _sirius_repo_root
 
 # The dist-mode server (port 4227) caches its config at startup; restart it so
-# the exports above (basedirs, S3 creds) apply to the next build. The normal
-# build's sccache server (port 4226) is unaffected.
+# the exports above (basedirs, S3 creds) apply to the next build. Start it here
+# rather than letting ninja's first parallel compile wave race to autostart it
+# (the stampede can fail with EMFILE). The normal build's sccache server
+# (port 4226) is unaffected.
+ulimit -n 4096 2>/dev/null || true
 "$_sirius_dist_bin" --stop-server >/dev/null 2>&1 || true
+"$_sirius_dist_bin" --start-server >/dev/null 2>&1 || true
 
 unset _sirius_dist_home _sirius_dist_creds _sirius_dist_token _sirius_dist_arch
 
