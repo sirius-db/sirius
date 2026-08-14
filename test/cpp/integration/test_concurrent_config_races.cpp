@@ -24,9 +24,9 @@
 //   - E1: operator_params is one plain non-atomic struct per
 //     DatabaseInstance, written by `SET` callbacks and read mid-plan and
 //     mid-execution — the removed lifecycle slot was the only serialization.
-//   - E2: duckdb::Config process-wide statics (EXPRESSION_EVALUATOR_STRATEGY
-//     is read as a default argument on every expression_evaluator
-//     construction) written by `SET` with no guard at all.
+//   - E2: duckdb::Config process-wide static variables
+//     (EXPRESSION_EVALUATOR_STRATEGY is read as a default argument on every
+//     expression_evaluator construction) written by `SET` with no guard.
 //
 // A failing assertion here is a deliverable: scenarios that fail on current
 // code are tagged [!mayfail] with the failure signature documented at the
