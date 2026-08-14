@@ -176,3 +176,43 @@ TEST_CASE("a column a projection drops stops there", "[late_mat][lifetime]")
   // travels no further, so there is nothing downstream to defer it to.
   REQUIRE(lives[1].first_reader == &projection);
 }
+
+TEST_CASE("an rhs column is offset by the lhs's EMITTED width", "[late_mat][lifetime]")
+{
+  using sirius::planner::join_output_position;
+
+  // The lhs has four input columns but emits only two. An rhs column must be
+  // offset by the two it emits, not the four it received — getting this wrong
+  // does not refuse a deferral, it materializes into a position holding
+  // something else.
+  std::vector<int> const lhs{0, 3};
+  std::vector<int> const rhs{1, 2, 5};
+
+  REQUIRE(join_output_position(true, lhs, rhs, 0) == 0);
+  REQUIRE(join_output_position(true, lhs, rhs, 3) == 1);
+  REQUIRE(join_output_position(false, lhs, rhs, 1) == 2);  // 2 emitted lhs + slot 0
+  REQUIRE(join_output_position(false, lhs, rhs, 2) == 3);
+  REQUIRE(join_output_position(false, lhs, rhs, 5) == 4);
+}
+
+TEST_CASE("a column a join does not project out stops there", "[late_mat][lifetime]")
+{
+  using sirius::planner::join_output_position;
+  std::vector<int> const lhs{0, 3};
+  std::vector<int> const rhs{1};
+
+  // Present on the other side's list, but not on its own: a column is only
+  // carried by the side it actually arrived through.
+  REQUIRE_FALSE(join_output_position(true, lhs, rhs, 1).has_value());
+  REQUIRE_FALSE(join_output_position(false, lhs, rhs, 3).has_value());
+  REQUIRE_FALSE(join_output_position(true, lhs, rhs, 7).has_value());
+}
+
+TEST_CASE("a join that emits no lhs columns still places its rhs", "[late_mat][lifetime]")
+{
+  using sirius::planner::join_output_position;
+  std::vector<int> const none{};
+  std::vector<int> const rhs{4, 9};
+  REQUIRE(join_output_position(false, none, rhs, 4) == 0);
+  REQUIRE(join_output_position(false, none, rhs, 9) == 1);
+}

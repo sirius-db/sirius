@@ -19,6 +19,7 @@
 #include "expression/ast/node.hpp"
 #include "expression/ast/utils.hpp"
 #include "op/sirius_physical_filter.hpp"
+#include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_projection.hpp"
 
@@ -42,13 +43,43 @@ bool reads_column(ast::node const& expr, std::size_t pos)
   return found;
 }
 
-/// What one operator does to a column arriving at input position `in_pos`.
+/// What one operator does to a column arriving from `from` at input position
+/// `in_pos`.
 ///
 /// `std::nullopt` means the operator reads it — the column's life ends here.
 /// A value is the output position it moves to, and the column lives on.
-std::optional<std::size_t> trace_through(sirius_physical_operator const& node, std::size_t in_pos)
+std::optional<std::size_t> trace_through(sirius_physical_operator const& node,
+                                         sirius_physical_operator const& from,
+                                         std::size_t in_pos)
 {
   switch (node.type) {
+    case SiriusPhysicalOperatorType::HASH_JOIN: {
+      auto const& join = static_cast<op::sirius_physical_hash_join const&>(node);
+      // INNER only. Every other join type either emits NULLs for an unmatched
+      // side — and a deferred column would have to produce a null value from a
+      // null rowid — or collects just one side's columns, so a payload riding
+      // on the other is not in the output at all.
+      if (join.join_type != duckdb::JoinType::INNER) { return std::nullopt; }
+      if (node.children.size() != 2) { return std::nullopt; }
+
+      bool const from_lhs = node.children[0].get() == &from;
+      if (!from_lhs && node.children[1].get() != &from) { return std::nullopt; }
+
+      // A key is read: the join compares its values. The conditions' left
+      // nodes address the lhs and their right nodes the rhs, so only this
+      // side's half is consulted.
+      for (auto const& condition : join.conditions) {
+        auto const& side = from_lhs ? condition.left : condition.right;
+        if (side && reads_column(*side, in_pos)) { return std::nullopt; }
+      }
+
+      std::vector<int> const lhs(join.lhs_output_columns.col_idxs.begin(),
+                                 join.lhs_output_columns.col_idxs.end());
+      std::vector<int> const rhs(join.rhs_output_columns.col_idxs.begin(),
+                                 join.rhs_output_columns.col_idxs.end());
+      return join_output_position(from_lhs, lhs, rhs, in_pos);
+    }
+
     case SiriusPhysicalOperatorType::FILTER: {
       auto const& filter = static_cast<op::sirius_physical_filter const&>(node);
       // The predicate is the only thing a filter reads; it decides which ROWS
@@ -98,6 +129,23 @@ std::optional<std::size_t> trace_through(sirius_physical_operator const& node, s
 
 }  // namespace
 
+std::optional<std::size_t> join_output_position(bool from_lhs,
+                                                std::vector<int> const& lhs_projection,
+                                                std::vector<int> const& rhs_projection,
+                                                std::size_t in_position)
+{
+  auto const& own = from_lhs ? lhs_projection : rhs_projection;
+  for (std::size_t i = 0; i < own.size(); ++i) {
+    if (static_cast<std::size_t>(own[i]) == in_position) {
+      // The output is lhs-then-rhs, so an rhs column carries the lhs's emitted
+      // width as an offset — not the lhs's INPUT width, which is larger
+      // whenever the join projects only part of its left side.
+      return from_lhs ? i : lhs_projection.size() + i;
+    }
+  }
+  return std::nullopt;
+}
+
 std::vector<column_lifetime> analyze_column_lifetimes(sirius_physical_operator const& scan)
 {
   std::vector<column_lifetime> lifetimes;
@@ -110,9 +158,13 @@ std::vector<column_lifetime> analyze_column_lifetimes(sirius_physical_operator c
 
     std::size_t position = col;
     int boundaries       = 0;
-    for (auto const* node = scan.get_parent_op(); node != nullptr; node = node->get_parent_op()) {
+    // `from` is which child the column arrives through, which a join needs in
+    // order to know whether it is looking at its lhs or its rhs.
+    auto const* from = static_cast<sirius_physical_operator const*>(&scan);
+    for (auto const* node = scan.get_parent_op(); node != nullptr;
+         from = node, node = node->get_parent_op()) {
       ++boundaries;
-      auto const moved = trace_through(*node, position);
+      auto const moved = trace_through(*node, *from, position);
       if (!moved.has_value()) {
         // Read here — or dropped here, which for a deferral is the same
         // answer: this is as far as the column travels.

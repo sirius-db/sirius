@@ -39,6 +39,7 @@
 // what lets the thresholds move on a measurement without touching the walk.
 
 #include <cstddef>
+#include <optional>
 #include <vector>
 
 namespace sirius::op {
@@ -62,6 +63,20 @@ struct column_lifetime {
   /// materialization would have to put it back.
   std::size_t position_at_reader = 0;
 };
+
+/// Where a column entering an INNER hash join from one side lands in its
+/// output, or nullopt when that side does not project it out.
+///
+/// Exposed because this is the one piece of the walk whose failure is silent:
+/// a wrong offset here does not refuse a deferral, it materializes a column
+/// into a position holding something else. The join's output is its lhs
+/// projection followed by its rhs projection, so an rhs column carries the
+/// lhs's emitted width as an offset.
+[[nodiscard]] std::optional<std::size_t> join_output_position(
+  bool from_lhs,
+  std::vector<int> const& lhs_projection,
+  std::vector<int> const& rhs_projection,
+  std::size_t in_position);
 
 /// Lifetimes of every output column of @p scan, in scan output order.
 ///
