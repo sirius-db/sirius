@@ -53,13 +53,11 @@ sirius_physical_vector_join_materialize::sirius_physical_vector_join_materialize
   duckdb::vector<sirius::logical_type> types,
   duckdb::idx_t estimated_cardinality,
   sirius::vss::vector_join_request request,
-  sirius::scan_manager::sirius_scan_manager* scan_manager,
-  bool is_fast_path)
+  sirius::scan_manager::sirius_scan_manager* scan_manager)
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::VECTOR_JOIN_MATERIALIZE, std::move(types), estimated_cardinality),
     _request(std::move(request)),
-    _scan_manager(scan_manager),
-    _is_fast_path(is_fast_path)
+    _scan_manager(scan_manager)
 {
 }
 
@@ -226,7 +224,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::execute(
   std::vector<std::unique_ptr<cudf::column>> out_cols;
   out_cols.reserve(n_left_cols + _request.right.output_columns.size() + 1);
 
-  if (_is_fast_path) {
+  if (_request.right.is_fast_path) {
     for (std::size_t c = 0; c < n_left_cols; ++c) {
       out_cols.push_back(copy_col(in_tv.column(static_cast<cudf::size_type>(c))));
     }

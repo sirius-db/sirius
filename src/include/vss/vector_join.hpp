@@ -57,6 +57,7 @@ struct vector_join_side {
   std::string table;                        ///< base table
   std::string column;                       ///< vector column
   std::vector<std::string> output_columns;  ///< base-table columns to emit in order
+  bool is_fast_path{false};
 };
 
 struct vector_join_request {

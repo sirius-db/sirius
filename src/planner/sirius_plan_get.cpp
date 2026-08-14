@@ -652,10 +652,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
 }
 
 /// There are two paths in knn join plan:
-///   - Fast path:    output column of the right table is the primary key column. This saves us a
-///                   gather at materialize stage.
-///   - Payload path: output column of the right table is explicitly passed and contains anything
-///                   other than the primary key column. This requires a gather at materialize.
+/// - Fast path:    output column of the right table is the primary key column. This saves us a
+///                 gather at materialize stage.
+/// - Payload path: output column of the right table is explicitly passed and contains anything
+///                 other than the primary key column. This requires a gather at materialize.
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
 {
@@ -717,15 +717,8 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
     return t;
   };
 
-  // Fast path: the right side emits exactly one integer column (its primary key column).
-  // Any other right output falls back to carrying the row number and gathering the requested
-  // columns at materialize.
-  // Note: currently it only checks for a single integer column
-  bool const is_fast_path =
-    req.right.output_columns.size() == 1 && op.returned_types[n_left_cols].IsIntegral();
-
   auto selection = duckdb::make_uniq<sirius::op::sirius_physical_vector_join_select>(
-    select_types(), op.estimated_cardinality, req, &scan_manager, is_fast_path);
+    select_types(), op.estimated_cardinality, req, &scan_manager);
 
   auto reduce_local = duckdb::make_uniq<sirius::op::sirius_physical_vector_join_reduce_local>(
     reduce_local_types(), op.estimated_cardinality, req.k, req, &scan_manager);
@@ -761,8 +754,7 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
       sirius::from_duckdb_vec(op.returned_types),
       op.estimated_cardinality,
       req,
-      &scan_manager,
-      is_fast_path);
+      &scan_manager);
   node->children.push_back(std::move(reduced));
 
   auto column_ids  = op.GetColumnIds();

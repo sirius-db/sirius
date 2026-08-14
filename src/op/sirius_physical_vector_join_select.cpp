@@ -93,13 +93,11 @@ sirius_physical_vector_join_select::sirius_physical_vector_join_select(
   duckdb::vector<sirius::logical_type> types,
   duckdb::idx_t estimated_cardinality,
   sirius::vss::vector_join_request request,
-  sirius::scan_manager::sirius_scan_manager* scan_manager,
-  bool is_fast_path)
+  sirius::scan_manager::sirius_scan_manager* scan_manager)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::VECTOR_JOIN_SELECT, std::move(types), estimated_cardinality),
     _request(std::move(request)),
-    _scan_manager(scan_manager),
-    _is_fast_path(is_fast_path)
+    _scan_manager(scan_manager)
 {
 }
 
@@ -144,7 +142,7 @@ void sirius_physical_vector_join_select::ensure_initialized_locked()
   // Fast path: snapshot the right id column's per-batch views so execute() can
   // gather each pair's id values from local neighbor positions and carry them
   // through the merge.
-  if (_is_fast_path) {
+  if (_request.right.is_fast_path) {
     if (right.output_columns.size() != 1) {
       throw std::runtime_error(
         "[sirius_physical_vector_join_select] is_fast_path requires exactly one right output "
@@ -239,7 +237,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_select::execute(
   // On the fast path, the neighbor stores the actual right table's id values. It is widened
   // to INT64 for downstream ops (reduce and materialize).
   std::unique_ptr<cudf::column> neighbors;
-  if (_is_fast_path) {
+  if (_request.right.is_fast_path) {
     auto const id_table = cudf::table_view{{_right_id_views[right_idx]}};
     auto gathered       = cudf::gather(
       id_table, knn.neighbors->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);

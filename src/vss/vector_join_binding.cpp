@@ -130,6 +130,11 @@ std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
     }
   }
 
+  // Fast path when the side emits one integer column where its id value can be
+  // carried through instead of gathering payload by row position later.
+  side.is_fast_path =
+    side.output_columns.size() == 1 && type_of(side.output_columns.front()).IsIntegral();
+
   for (auto const& col : side.output_columns) {
     out_types.push_back(type_of(col));
     out_names.push_back(label + "_" + col);

@@ -104,8 +104,7 @@ class sirius_physical_vector_join_select : public sirius_physical_operator {
   sirius_physical_vector_join_select(duckdb::vector<sirius::logical_type> types,
                                      duckdb::idx_t estimated_cardinality,
                                      sirius::vss::vector_join_request request,
-                                     sirius::scan_manager::sirius_scan_manager* scan_manager,
-                                     bool is_fast_path);
+                                     sirius::scan_manager::sirius_scan_manager* scan_manager);
 
   [[nodiscard]] const sirius::vss::vector_join_request& request() const { return _request; }
 
@@ -166,11 +165,7 @@ class sirius_physical_vector_join_select : public sirius_physical_operator {
   //! Global row offset of each right batch (prefix sum of right batch row counts).
   //! Used only on the payload path.
   std::vector<std::int64_t> _right_offsets;
-  //! When true, the right output is a single integer id: carry the gathered id
-  //! value through the merge (fast path) instead of the global row position, so
-  //! materialize can emit it directly with no late gather.
-  bool _is_fast_path{false};
-  //! Per-batch views of the right id column (only populated when _is_fast_path).
+  //! Per-batch views of the right id column (only populated on the fast path).
   std::vector<cudf::column_view> _right_id_views;
   std::size_t _num_pairs{0};
   std::size_t _next_pair{0};

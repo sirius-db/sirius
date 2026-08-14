@@ -60,8 +60,7 @@ class sirius_physical_vector_join_materialize : public sirius_physical_partition
   sirius_physical_vector_join_materialize(duckdb::vector<sirius::logical_type> types,
                                           duckdb::idx_t estimated_cardinality,
                                           sirius::vss::vector_join_request request,
-                                          sirius::scan_manager::sirius_scan_manager* scan_manager,
-                                          bool is_fast_path);
+                                          sirius::scan_manager::sirius_scan_manager* scan_manager);
 
   bool is_source() const override { return true; }
   bool is_sink() const override { return true; }
@@ -94,7 +93,6 @@ class sirius_physical_vector_join_materialize : public sirius_physical_partition
 
   sirius::vss::vector_join_request _request;
   sirius::scan_manager::sirius_scan_manager* _scan_manager;
-  bool _is_fast_path{false};
 
   std::mutex _drain_mutex;                  // guards get_next_task_input_data()
   std::size_t _current_partition_index{0};  // next partition (left batch) to drain
