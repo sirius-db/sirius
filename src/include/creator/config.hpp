@@ -100,8 +100,9 @@ struct task_creator_config {
   /// (demand-driven only); lookahead remains available to engine-controlled policy.
   request_type strategy{request_type::active};
 
-  /// Within-branch scheduling priority direction, consumed by compute_pipeline_priorities.
-  /// source keeps plan order (head/scan first); sink reverses it.
+  /// Internal within-branch scheduling priority, consumed by compute_pipeline_priorities.
+  /// The current engine policy keeps plan order (head/scan first); sink remains available to a
+  /// future engine-controlled policy.
   priority_order priority{priority_order::source};
 };
 

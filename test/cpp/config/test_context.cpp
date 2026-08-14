@@ -468,7 +468,7 @@ TEST_CASE("Sirius configuration accepts intentional compression retention fracti
   require_fraction("valid_compression_fraction_above_one.yaml", 1.5);
 }
 
-TEST_CASE("Sirius configuration keeps task creation strategy internal", "[sirius][config]")
+TEST_CASE("Sirius configuration keeps task creation policy internal", "[sirius][config]")
 {
   std::source_location loc = std::source_location::current();
   auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
@@ -487,6 +487,17 @@ TEST_CASE("Sirius configuration keeps task creation strategy internal", "[sirius
     sirius::sirius_config config;
     REQUIRE_NOTHROW(config.load_from_file(data_dir / "valid_task_creator_strategy_omitted.yaml"));
     CHECK(config.get_task_creator_config().strategy == sirius::creator::request_type::active);
+    CHECK(config.get_task_creator_config().priority == sirius::creator::priority_order::source);
+  }
+
+  SECTION("explicit priority order is rejected with removal guidance")
+  {
+    sirius::sirius_config config;
+    REQUIRE_THROWS_WITH(
+      config.load_from_file(data_dir / "invalid_task_creator_priority_order.yaml"),
+      Catch::Contains("sirius.executor.task_creator.priority_order") &&
+        Catch::Contains("removed") && Catch::Contains("remove this key"));
+    CHECK(config.get_task_creator_config().priority == sirius::creator::priority_order::source);
   }
 }
 

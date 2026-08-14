@@ -151,9 +151,13 @@ static void from_yaml(const YAML::Node& node, creator::task_creator_config& opt)
       "'sirius.executor.task_creator.strategy': removed; task creation policy is internal and "
       "currently demand-driven; remove this key");
   }
+  if (r.has("priority_order")) {
+    throw std::runtime_error(
+      "'sirius.executor.task_creator.priority_order': removed; scheduling priority is internal "
+      "and currently source-first; remove this key");
+  }
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
-  r.optional("priority_order", opt.priority);
   r.reject_unknown();
 }
 

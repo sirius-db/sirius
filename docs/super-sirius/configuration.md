@@ -274,15 +274,12 @@ hardware-derived exception described below:
 
 ### `sirius.executor.task_creator`
 
-Thread pool (default `num_threads: 1`) plus:
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `priority_order` | enum: `source`, `sink` | `source` | Order in which the task creator prioritizes tasks within a duckdb pipeline. `source` closer to source has higher priority; `sink` closer to sink has higher priority. Values are lowercase. |
-
-Task creation policy is internal and currently demand-driven. The former
-`sirius.executor.task_creator.strategy` key has been removed; configurations that still contain it
-must delete the key.
+Thread pool (default `num_threads: 1`). Task creation
+policy and within-branch priority are internal: Sirius currently creates tasks
+on demand and prioritizes source-side pipelines first. The former
+`sirius.executor.task_creator.strategy` and
+`sirius.executor.task_creator.priority_order` keys have been removed;
+configurations that still contain either key must delete it.
 
 ### `sirius.executor.pipeline`
 
