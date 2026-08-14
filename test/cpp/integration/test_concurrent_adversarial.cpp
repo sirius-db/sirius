@@ -158,7 +158,7 @@ TEST_CASE("adversarial: spill storm with constant query-end churn",
 }
 
 TEST_CASE("adversarial: mixed failure storm keeps healthy executions flowing",
-          "[.][concurrency][adversarial][crash_repro][isolated_context][!mayfail]")
+          "[concurrency][adversarial][isolated_context]")
 {
   // Every worker ALTERNATES between a runtime-failing shape (DISTINCT
   // aggregates throw mid-GPU-execution and complete via CPU fallback) and
@@ -168,25 +168,16 @@ TEST_CASE("adversarial: mixed failure storm keeps healthy executions flowing",
   // EVERY connection interleaved with its own healthy queries, so a
   // containment bug poisons the very next iteration of the same worker.
   //
-  // HIDDEN ([.]) — RELIABLE PROCESS ABORT on integration/concurrency-full
-  // (2026-08-14), reproduced 2/2. Run explicitly:
-  //   sirius_unittest "adversarial: mixed failure storm keeps healthy executions flowing"
-  // Signature (std::terminate -> abort):
-  //   sirius::parallel::itask_executor::resume_manager() [clone .cold]
-  //   <- task_scheduler::drain_after_error(query_id)
-  //   <- sirius_interface::sirius_execute_pending_query_result
-  //   <- PhysicalSiriusExecution::GetDataInternal
-  // Root cause (by inspection of src/parallel/task_executor.cpp): with >= 2
-  // queries failing concurrently, two drain_after_error calls run
-  // wait_and_drain_query() on the SAME executor with no serialization. Both
-  // pass quiesce_manager() (the second join is a no-op on the already-joined
-  // thread), then the second resume_manager() assigns onto the joinable
-  // _manager_thread the first just created -> std::thread::operator=
-  // terminates. Same class of bug the branch already fixed for
-  // downgrade_executor::drain() with _lifecycle_mutex (01-bringup-triage.md,
-  // "Fixed during bring-up" row 1); the task_executor quiesce/resume bracket
-  // needs the same treatment. Register: unlisted A6-family (error-path
-  // teardown unserialized across concurrently-failing queries).
+  // REGRESSION HISTORY: before the _manager_lifecycle_mutex fix
+  // (fix(concurrency): serialize task_executor manager-thread lifecycle
+  // transitions) this scenario reliably ABORTED the process (2/2):
+  // std::terminate in itask_executor::resume_manager() <-
+  // task_scheduler::drain_after_error. With >= 2 queries failing
+  // concurrently, two unserialized wait_and_drain_query() brackets
+  // interleaved on the same executor and the second resume_manager()
+  // assigned onto a joinable _manager_thread. Unlisted A6-family; same class
+  // as the downgrade_executor drain race fixed by _lifecycle_mutex. This
+  // test is the live regression guard for that fix.
   scoped_watchdog dog("mixed failure storm", scenario_timeout(900));
 
   env_options opt;
