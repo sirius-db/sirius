@@ -625,6 +625,28 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
   }
 
   /**
+   * @brief `iceberg_scan(path, snapshot_from_id = <current>)` — the explicitly pinned spelling.
+   *
+   * Every other case uses the plain form, because that is what users write and the scan resolves
+   * its own snapshot. This exists so the pinned form keeps its own coverage: it takes a different
+   * branch in build_iceberg_table_info, which trusts the given id instead of proving one.
+   *
+   * Resolved from the table rather than hardcoded, so a regenerated fixture cannot leave a stale
+   * id behind that silently reads an older snapshot.
+   */
+  std::string pinned_scan(const std::string& table_path)
+  {
+    auto result = con->Query("SELECT snapshot_id FROM iceberg_snapshots('" + table_path +
+                             "') ORDER BY sequence_number DESC LIMIT 1;");
+    REQUIRE(result);
+    if (result->HasError()) { UNSCOPED_INFO("iceberg_snapshots error: " << result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 1);
+    return "iceberg_scan('" + table_path +
+           "', snapshot_from_id = " + result->GetValue(0, 0).ToString() + ")";
+  }
+
+  /**
    * @brief Canary: prove the table really carries delete files before asserting deletes work.
    *
    * The engine once fabricated empty delete data, and the delete tests still looked correct —
@@ -760,6 +782,20 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - an explicitly pinned scan reaches the GPU",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // Every other delete case uses the plain form, where build_iceberg_table_info() resolves the
+  // snapshot itself and proves it against the bound file list. This is the other branch: the user
+  // named the snapshot, so it is taken as given and no proof is attempted. Both must reach the GPU
+  // and agree, or the delete read is keyed differently depending on how the scan was spelled.
+  require_delete_files(v2_path, 1);
+  expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(v2_path) + " ORDER BY count;",
+                      kPositionalDeleteRoute,
+                      {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - conformance append-only matches pyiceberg",
                  "[integration][gpu_execution][iceberg]")
 {
@@ -786,6 +822,18 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 // a GPU scan that had silently read the dropped column and happened to agree, so this pins
 // that the table was REFUSED at plan time and DuckDB answered. When field-ID resolution
 // lands, the expected route flips back to `gpu` and the rows stay exactly as written.
+//
+// This table is also why the GPU path resolves its own snapshot instead of requiring the user to
+// name one. Its single snapshot carries schema-id 0, in which `y` is still field id 3; the drop and
+// re-add that made it field id 4 came later, as metadata with no new snapshot. `snapshot_from_id`
+// is Iceberg's TIME-TRAVEL selector, so it also selects that snapshot's schema:
+//
+//     iceberg_scan(path)                        current schema (2) -> y is field 4 -> NULL
+//     iceberg_scan(path, snapshot_from_id = S)  snapshot schema (0) -> y is field 3 -> 111, 222
+//
+// Both answers are correct for the question asked, and DuckDB with Sirius unloaded returns 111/222
+// for the pinned form too. Had the GPU required a pin, a user chasing performance would have been
+// told to write the second line and would have silently got the first line's table back.
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - conformance dropped-and-re-added column reads NULL",
                  "[integration][gpu_execution][iceberg]")
@@ -1122,6 +1170,54 @@ TEST_CASE_METHOD(GPUExecutionIcebergDVReplacedFixture,
     "SELECT fruit, count FROM iceberg_scan('" + dv_replaced_path + "') ORDER BY count;",
     kDeletionVectorRoute,
     {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+}
+
+//===----------------------------------------------------------------------===//
+// A manifest entry that points at ANOTHER data file's deletion vector.
+//
+// Hand-forged; see data/iceberg_v3_dv_misbound/generate.py.
+//===----------------------------------------------------------------------===//
+
+class GPUExecutionIcebergDVMisboundFixture : public GPUExecutionIcebergFixture {
+ public:
+  GPUExecutionIcebergDVMisboundFixture()
+  {
+    dv_misbound_path =
+      (get_project_root() / "test/cpp/integration/data/iceberg_v3_dv_misbound").string();
+  }
+
+  std::string dv_misbound_path;
+};
+
+TEST_CASE_METHOD(
+  GPUExecutionIcebergDVMisboundFixture,
+  "gpu_execution iceberg - a deletion vector bound to the wrong data file is refused",
+  "[integration][gpu_execution][iceberg]")
+{
+  // One Puffin holds a vector for each of two data files, and the two manifest entries carry each
+  // other's offsets. Both blobs are well formed, so magic and CRC pass; both delete exactly one
+  // position, so record_count passes as well. Only the footer descriptor's `referenced-data-file`
+  // disagrees, which is why the spec requires content_offset/content_size_in_bytes to match it.
+  //
+  // The route IS the assertion. Delete files are read while the physical plan is built, so the
+  // refusal lands at plan time and no GPU work begins. DuckDB's own reader does not check the
+  // descriptor, so the rows below are the misbound answer it produces once Sirius hands the query
+  // back: each file loses the position the OTHER file's vector names, so 'elderberry' and 'grape'
+  // go instead of the 'banana' and 'jackfruit' the footer actually pairs. Eight rows either way —
+  // the corruption never shows up in a count. Sirius declining is what keeps that answer from
+  // being produced on the GPU and reported as ours.
+  REQUIRE(delete_file_count(dv_misbound_path) == 2);
+  expect_iceberg_rows(
+    "SELECT fruit, count FROM iceberg_scan('" + dv_misbound_path + "') ORDER BY count;",
+    gpu_route::plan_fallback,
+    {{"apple", "1"},
+     {"banana", "2"},
+     {"cherry", "3"},
+     {"date", "4"},
+     {"fig", "6"},
+     {"honeydew", "8"},
+     {"indian fig", "9"},
+     {"jackfruit", "10"}});
 }
 
 //===----------------------------------------------------------------------===//

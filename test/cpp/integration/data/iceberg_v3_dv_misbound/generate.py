@@ -159,7 +159,9 @@ def verify():
     raw = puffins[0].read_bytes()
     blobs = PuffinFile(raw).footer.blobs
     if len(blobs) != 2:
-        print(f"  expected 2 blobs in the container, found {len(blobs)}", file=sys.stderr)
+        print(
+            f"  expected 2 blobs in the container, found {len(blobs)}", file=sys.stderr
+        )
         return False
     print(f"  pyiceberg: OK - {puffins[0].name}: 2 blob(s), type={blobs[0].type}")
 
@@ -167,7 +169,10 @@ def verify():
     # correct pairing, which is what the manifest is supposed to agree with and does not.
     decoded = {k: sorted(v) for k, v in PuffinFile(raw).to_vector().items()}
     if len(decoded) != 2:
-        print(f"  the two vectors must name different data files; got {decoded.keys()}", file=sys.stderr)
+        print(
+            f"  the two vectors must name different data files; got {decoded.keys()}",
+            file=sys.stderr,
+        )
         return False
 
     manifest = next((HERE / "metadata").glob("*-m1.avro"))
@@ -178,15 +183,23 @@ def verify():
             if (r["data_file"].get("file_format") or "").upper() == "PUFFIN"
         ]
     if len(entries) != 2:
-        print(f"  expected 2 PUFFIN manifest entries, found {len(entries)}", file=sys.stderr)
+        print(
+            f"  expected 2 PUFFIN manifest entries, found {len(entries)}",
+            file=sys.stderr,
+        )
         return False
 
     counts = {e["data_file"]["record_count"] for e in entries}
     if counts != {1}:
-        print(f"  cardinalities must be EQUAL or record_count catches the swap; got {counts}", file=sys.stderr)
+        print(
+            f"  cardinalities must be EQUAL or record_count catches the swap; got {counts}",
+            file=sys.stderr,
+        )
         ok = False
     else:
-        print("  record_count: OK - both entries claim 1, so the count check cannot fire")
+        print(
+            "  record_count: OK - both entries claim 1, so the count check cannot fire"
+        )
 
     # The swap itself: each entry's (offset, length) must be the OTHER blob's.
     by_offset = {b.offset: b for b in blobs}
@@ -194,7 +207,10 @@ def verify():
         df = entry["data_file"]
         blob = by_offset.get(df["content_offset"])
         if blob is None:
-            print(f"  entry offset {df['content_offset']} matches no blob", file=sys.stderr)
+            print(
+                f"  entry offset {df['content_offset']} matches no blob",
+                file=sys.stderr,
+            )
             ok = False
             continue
         pointed_at = blob.properties["referenced-data-file"]
@@ -211,7 +227,10 @@ def verify():
                 f"points at the vector for .../{pathlib.Path(pointed_at).name}"
             )
         if blob.length != df["content_size_in_bytes"]:
-            print("  lengths must match the blob they point at, or the size check fires first", file=sys.stderr)
+            print(
+                "  lengths must match the blob they point at, or the size check fires first",
+                file=sys.stderr,
+            )
             ok = False
 
     return ok
@@ -219,7 +238,9 @@ def verify():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--verify", action="store_true", help="validate only, write nothing")
+    ap.add_argument(
+        "--verify", action="store_true", help="validate only, write nothing"
+    )
     args = ap.parse_args()
 
     if args.verify:
@@ -240,9 +261,13 @@ def main():
             shutil.rmtree(child) if child.is_dir() else child.unlink()
     for sub in ("data", "metadata"):
         shutil.copytree(SRC / sub, HERE / sub)
-    for stray in list((HERE / "data").glob("*.bak")) + list((HERE / "metadata").glob("*.bak")):
+    for stray in list((HERE / "data").glob("*.bak")) + list(
+        (HERE / "metadata").glob("*.bak")
+    ):
         stray.unlink()
-    for stray in list((HERE / "data").glob("*.py")) + list((HERE / "metadata").glob("*.py")):
+    for stray in list((HERE / "data").glob("*.py")) + list(
+        (HERE / "metadata").glob("*.py")
+    ):
         stray.unlink()
 
     meta_path = HERE / "metadata" / "v1.metadata.json"
@@ -269,7 +294,9 @@ def main():
         file_b,
     )
 
-    rel = lambda p: f"{HERE.relative_to(pathlib.Path.cwd())}/data/{p.name}"  # noqa: E731
+    rel = (
+        lambda p: f"{HERE.relative_to(pathlib.Path.cwd())}/data/{p.name}"
+    )  # noqa: E731
 
     # --- the data manifest gains an entry for the second file --------------------------------
     data_manifest = next((HERE / "metadata").glob("*-m0.avro"))
@@ -302,7 +329,9 @@ def main():
         reader = fastavro.reader(fh)
         m1_schema, m1_records = reader.writer_schema, list(reader)
     template = next(
-        r for r in m1_records if (r["data_file"].get("file_format") or "").upper() == "PUFFIN"
+        r
+        for r in m1_records
+        if (r["data_file"].get("file_format") or "").upper() == "PUFFIN"
     )
 
     def dv_entry(referenced, descriptor):
@@ -313,12 +342,16 @@ def main():
         entry["data_file"]["referenced_data_file"] = referenced
         entry["data_file"]["content_offset"] = descriptor["offset"]
         entry["data_file"]["content_size_in_bytes"] = descriptor["length"]
-        entry["data_file"]["record_count"] = int(descriptor["properties"]["cardinality"])
+        entry["data_file"]["record_count"] = int(
+            descriptor["properties"]["cardinality"]
+        )
         return entry
 
     # Each entry gets the OTHER descriptor. Same length, same cardinality, wrong vector.
     m1_records = [
-        r for r in m1_records if (r["data_file"].get("file_format") or "").upper() != "PUFFIN"
+        r
+        for r in m1_records
+        if (r["data_file"].get("file_format") or "").upper() != "PUFFIN"
     ] + [dv_entry(rel(file_a), desc_b), dv_entry(rel(file_b), desc_a)]
     with delete_manifest.open("wb") as fh:
         fastavro.writer(fh, m1_schema, m1_records, codec="null")
