@@ -363,6 +363,7 @@ set(EXTENSION_SOURCES
     src/planner/duckdb_join_filter_candidate_adapter.cpp
     src/planner/query.cpp
     src/planner/query_index.cpp
+    src/planner/eager_agg_pushdown_plan_pass.cpp
     src/planner/sirius_physical_plan_generator.cpp
     src/planner/sirius_plan_aggregate.cpp
     src/planner/sirius_plan_column_data_get.cpp
@@ -670,6 +671,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_allnull_scan.cpp
     test/cpp/integration/test_gpu_execution_array.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_native.cpp
+    test/cpp/integration/test_gpu_execution_eager_agg.cpp
     test/cpp/integration/test_gpu_execution_filter_nulls.cpp
     test/cpp/integration/test_gpu_execution_join_nulls.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp
@@ -748,6 +750,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
     test/cpp/planner/test_dynamic_filter_router.cpp
+    test/cpp/planner/test_eager_agg_pushdown.cpp
     test/cpp/planner/test_join_expression_key.cpp
     test/cpp/planner/test_plan_tree_shape.cpp
     test/cpp/planner/test_projection_fold.cpp
