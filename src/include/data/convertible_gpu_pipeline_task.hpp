@@ -63,12 +63,18 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * @brief Construct from a task extracted from the queue.
    * @param task The task to wrap (exclusive ownership taken).
    * @param queue The originating task queue (task is returned here on destruction).
+   * @param keys The task's index keys, resolved by the CALLER at extraction time — while the
+   *             task was still in the queue, where its plan is guaranteed alive. The destructor
+   *             uses them verbatim (gate lookup and re-push) instead of re-deriving them:
+   *             index_keys_for dereferences the pipeline's source operator, which lives in the
+   *             plan, and by re-push time the owning query may have destroyed it.
    */
   convertible_gpu_pipeline_task(
     std::unique_ptr<sirius::parallel::itask> task,
     sirius::exec::multi_index_priority_queue<sirius::parallel::itask>& queue,
+    sirius::exec::index_keys keys,
     sirius::exec::query_lifecycle_registry* query_lifecycle = nullptr)
-    : _task(std::move(task)), _queue(queue), _query_lifecycle(query_lifecycle)
+    : _task(std::move(task)), _queue(queue), _keys(keys), _query_lifecycle(query_lifecycle)
   {
   }
 
@@ -89,18 +95,23 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * downgrade pops a task off the shared scheduler queue into a processing-thread local, carries
    * it across a *blocking* pool reserve() and a full host/device conversion, and only then gets
    * here. That window easily outlives the owning query's drain, so an ungated push resurrects a
-   * task after its query was cleaned up: the push itself runs the key extractor over a plan that
-   * has already been destroyed, and the resurrected task holds raw repository pointers into a
-   * manager that is about to be erased.
+   * task after its query was cleaned up, and the resurrected task holds raw repository pointers
+   * into a manager that is about to be erased.
+   *
+   * Both the gate lookup and the re-push use the keys captured at EXTRACTION time (while the
+   * task was in the queue and its plan therefore alive) — running index_keys_for here would
+   * dereference the plan's source operator, which a tearing-down query has already destroyed.
+   * This mirrors task_creation_request, which carries its own pre-resolved keys for the same
+   * reason.
    */
   ~convertible_gpu_pipeline_task() override
   {
     if (!_task) { return; }
-    if (_query_lifecycle != nullptr && !_query_lifecycle->accepts_work(sirius::make_query_id(
-                                         sirius::pipeline::index_keys_for(*_task).query_id))) {
+    if (_query_lifecycle != nullptr &&
+        !_query_lifecycle->accepts_work(sirius::make_query_id(_keys.query_id))) {
       return;  // query is tearing down; drop instead of resurrecting
     }
-    (void)_queue.push(std::move(_task));
+    (void)_queue.push(std::move(_task), _keys);
   }
 
   /**
@@ -225,6 +236,8 @@ class convertible_gpu_pipeline_task : public convertible_data {
 
   std::unique_ptr<sirius::parallel::itask> _task;
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>& _queue;
+  /// The task's index keys as resolved at extraction time; see the constructor.
+  sirius::exec::index_keys _keys;
   /// Non-owning; owned by SiriusContext. Null in unit tests, which restores the ungated push.
   sirius::exec::query_lifecycle_registry* _query_lifecycle{nullptr};
 };
@@ -272,8 +285,13 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
       [space](sirius::parallel::itask& t) { return has_matching_batches(t, space); },
       front_to_back);
     if (!task) { return nullptr; }
+    // Resolve the keys NOW, while the task's plan is guaranteed alive (a task in the queue
+    // belongs to a query whose cleanup has not passed its drains, and the plan outlives them).
+    // The wrapper's RAII re-push happens after a blocking conversion window and must not
+    // re-derive them; see ~convertible_gpu_pipeline_task.
+    const auto keys = sirius::pipeline::index_keys_for(**task);
     return std::make_unique<convertible_gpu_pipeline_task>(
-      std::move(*task), _queue, _query_lifecycle);
+      std::move(*task), _queue, keys, _query_lifecycle);
   }
 
   /**
@@ -302,8 +320,10 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
         [space](sirius::parallel::itask& t) { return has_matching_batches(t, space); },
         front_to_back);
       if (!task) { break; }
+      // Keys resolved at extraction time; see get_next_convertible.
+      const auto keys = sirius::pipeline::index_keys_for(**task);
       results.push_back(std::make_unique<convertible_gpu_pipeline_task>(
-        std::move(*task), _queue, _query_lifecycle));
+        std::move(*task), _queue, keys, _query_lifecycle));
     }
     return results;
   }

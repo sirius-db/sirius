@@ -354,8 +354,10 @@ TEST_CASE("Tasks extracted and RAII-returned while executors are parked still ru
   std::vector<std::unique_ptr<sirius::convertible_gpu_pipeline_task>> extracted;
   while (auto t = queue->mutable_pop_if([](sirius::parallel::itask&) { return true; },
                                         /*front_to_back=*/false)) {
+    // Keys are resolved at extraction time, exactly as the TIER-2 provider does.
+    const auto keys = sirius::pipeline::index_keys_for(**t);
     extracted.push_back(
-      std::make_unique<sirius::convertible_gpu_pipeline_task>(std::move(*t), *queue));
+      std::make_unique<sirius::convertible_gpu_pipeline_task>(std::move(*t), *queue, keys));
   }
   REQUIRE(extracted.size() == num_tasks);
 

@@ -24,10 +24,14 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <data/convertible_gpu_pipeline_task.hpp>
 #include <exec/multi_index_priority_queue.hpp>
+#include <exec/query_lifecycle_registry.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <parallel/task.hpp>
 #include <pipeline/gpu_pipeline_task.hpp>
+#include <pipeline/pipeline_build_context.hpp>
+#include <pipeline/sirius_pipeline.hpp>
 #include <pipeline/sirius_pipeline_task_states.hpp>
+#include <query_id.hpp>
 #include <utils/telemetry_utils.hpp>
 
 #include <cstdint>
@@ -100,6 +104,52 @@ std::unique_ptr<sirius::pipeline::gpu_pipeline_task> make_test_gpu_task(
     std::move(local),
     std::move(global));
 }
+
+/// Fixture for tasks that carry a REAL pipeline, so the production
+/// pipeline::index_keys_for extractor resolves a real query id from them (the plain
+/// make_test_gpu_task above has no pipeline and always extracts sentinel keys).
+/// Operators outlive every pipeline/task built from the fixture: ~gpu_pipeline_task
+/// calls mark_task_completed(), which walks the pipeline's operators.
+struct pipeline_task_fixture {
+  duckdb::shared_ptr<sirius::pipeline::sirius_pipeline> make_pipeline(
+    sirius::query_id_t query_id, sirius::exec::queue_priority priority)
+  {
+    auto pipeline  = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(build_ctx);
+    auto& op       = *operators.emplace_back(std::make_unique<sirius::op::sirius_physical_operator>(
+      sirius::op::SiriusPhysicalOperatorType::FILTER,
+      duckdb::vector<sirius::logical_type>{},
+      /*estimated_cardinality=*/0));
+    op.operator_id = operators.size() - 1;
+
+    sirius::pipeline::sirius_pipeline_build_state build_state;
+    build_state.set_pipeline_source(*pipeline, op);
+    build_state.set_pipeline_sink(*pipeline, &op, /*sink_pipeline_count=*/1);
+
+    pipeline->set_query_id(query_id);
+    pipeline->set_priority(priority);
+    return pipeline;
+  }
+
+  std::unique_ptr<sirius::pipeline::gpu_pipeline_task> make_task(
+    const duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>& pipeline,
+    sirius::exec::queue_priority priority,
+    std::vector<std::shared_ptr<cucascade::data_batch>> batches)
+  {
+    auto global_state = std::make_shared<sirius::pipeline::gpu_pipeline_task_global_state>(
+      pipeline, sirius::test::make_test_telemetry_context());
+    global_state->set_priority(priority);
+
+    auto op_data = std::make_unique<sirius::op::pipelineable_operator_data>(std::move(batches));
+    return std::make_unique<sirius::pipeline::gpu_pipeline_task>(
+      /*task_id=*/1,
+      std::vector<cucascade::shared_data_repository*>{},
+      std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(op_data)),
+      std::move(global_state));
+  }
+
+  sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
+  std::vector<std::unique_ptr<sirius::op::sirius_physical_operator>> operators;
+};
 
 /// Helper: get the tier of a data_batch using a temporary read-only lock.
 inline cucascade::memory::Tier get_batch_tier(cucascade::data_batch& batch)
@@ -365,4 +415,96 @@ TEST_CASE("RAII on interrupted queue does not crash", "[convertible_gpu_pipeline
 
   // Queue is interrupted and empty — task was destroyed, not pushed
   REQUIRE(queue.empty());
+}
+
+// --- B1: the RAII re-push must use the keys resolved at EXTRACTION time -------------------
+//
+// TIER-2 downgrade removes a task from the shared scheduler queue, carries it across a
+// blocking pool reserve() and a full H2D/D2H conversion, and only then re-pushes it. In that
+// window the owning query can be drained and its plan destroyed — and pipeline::index_keys_for
+// dereferences the plan (pipe->get_source()->type). The wrapper therefore captures the keys
+// while the task is still in the queue (plan guaranteed alive) and must use THOSE, both for
+// the lifecycle-gate lookup and for the re-push itself.
+//
+// The tests below make extraction-time and re-push-time key derivation OBSERVABLY different by
+// mutating the pipeline's query id in the conversion window. In production the difference is
+// not a changed answer but a use-after-free; a changed answer is the testable stand-in.
+
+TEST_CASE("RAII re-push consults the lifecycle gate with extraction-time keys",
+          "[convertible_gpu_pipeline_task][query_lifecycle]")
+{
+  auto& e = env();
+  pipeline_task_fixture f;
+
+  const auto dying_query = sirius::make_query_id(7);
+  const auto other_query = sirius::make_query_id(8);
+
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(dying_query);
+  lifecycle.open_query(other_query);
+
+  // The REAL extractor, so the queue and the wrapper derive keys exactly as production does.
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(
+    &sirius::pipeline::index_keys_for);
+
+  auto pipeline = f.make_pipeline(dying_query, /*priority=*/42);
+  auto batch    = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
+  queue.push(f.make_task(pipeline, /*priority=*/42, {batch}));
+  REQUIRE(queue.size() == 1);
+
+  {
+    sirius::convertible_gpu_pipeline_task_provider provider(queue, &lifecycle);
+    auto cd = provider.get_next_convertible(e.gpu_space, false);
+    REQUIRE(cd != nullptr);
+    REQUIRE(queue.empty());
+
+    // The conversion window: the owning query's teardown runs. Re-deriving the keys after this
+    // point gives a different answer than extraction time (in production it dereferences a
+    // destroyed plan; here it reports a different, still-open query).
+    pipeline->set_query_id(other_query);
+    lifecycle.quiesce(dying_query);
+    // cd destroyed here — the gate must be consulted with the EXTRACTION-time query id (7,
+    // quiescing => drop). A re-derived id (8, open) would resurrect the task past its drain.
+  }
+
+  REQUIRE(queue.empty());
+}
+
+TEST_CASE("RAII re-push lands the task under its extraction-time query bucket",
+          "[convertible_gpu_pipeline_task][query_lifecycle]")
+{
+  auto& e = env();
+  pipeline_task_fixture f;
+
+  const auto extraction_query = sirius::make_query_id(7);
+  const auto mutated_query    = sirius::make_query_id(9);
+
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(
+    &sirius::pipeline::index_keys_for);
+
+  auto pipeline = f.make_pipeline(extraction_query, /*priority=*/42);
+  auto batch    = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{4, 5, 6}, cudf::type_id::INT32);
+  queue.push(f.make_task(pipeline, /*priority=*/42, {batch}));
+
+  {
+    // No gate: the query stays live, so this is the legitimate-return path.
+    sirius::convertible_gpu_pipeline_task_provider provider(queue);
+    auto cd = provider.get_next_convertible(e.gpu_space, false);
+    REQUIRE(cd != nullptr);
+
+    // Key re-derivation would now give a different query id.
+    pipeline->set_query_id(mutated_query);
+    // cd destroyed here — re-push must use the extraction-time keys.
+  }
+
+  REQUIRE(queue.size() == 1);
+  // The task must be reachable under the query it was extracted from: a later
+  // drain(query_index{7}) has to find it, or that query's teardown leaves it behind.
+  REQUIRE(queue.size(sirius::exec::query_index{sirius::value_of(extraction_query)}) == 1);
+  REQUIRE(queue.size(sirius::exec::query_index{sirius::value_of(mutated_query)}) == 0);
+
+  // Restore the id so teardown bookkeeping (task dtor walks the pipeline) stays coherent.
+  pipeline->set_query_id(extraction_query);
 }

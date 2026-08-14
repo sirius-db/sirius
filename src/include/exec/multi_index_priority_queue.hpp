@@ -181,6 +181,16 @@ class multi_index_priority_queue {
   ///         work (itask_executor::schedule) rely on it.
   bool push(task_ptr task) { return push_or_bounce(std::move(task)) == nullptr; }
 
+  /// Like push(), but with caller-supplied keys: the extractor is NOT invoked. For callers
+  /// that resolved the task's keys while they were unambiguously valid and must not re-derive
+  /// them at push time — the TIER-2 downgrade re-push runs after an arbitrarily long
+  /// conversion window, and re-running the extractor there would dereference a plan the
+  /// task's query may already have destroyed.
+  bool push(task_ptr task, const index_keys& keys)
+  {
+    return push_or_bounce(std::move(task), keys) == nullptr;
+  }
+
   /// Like push(), but a refusal HANDS THE TASK BACK instead of destroying it:
   /// returns nullptr on success, the task on an interrupted queue. Callers on
   /// paths where a drop means a silently hung query (itask_executor::schedule
@@ -190,6 +200,13 @@ class multi_index_priority_queue {
   {
     assert(task && "cannot push a null task");
     const index_keys keys = _extract(*task);
+    return push_or_bounce(std::move(task), keys);
+  }
+
+  /// push_or_bounce() with caller-supplied keys; see push(task_ptr, const index_keys&).
+  [[nodiscard]] task_ptr push_or_bounce(task_ptr task, const index_keys& keys)
+  {
+    assert(task && "cannot push a null task");
     {
       std::lock_guard<std::mutex> lock(_mutex);
       // Interrupted: bounce the task back instead of enqueuing it.
