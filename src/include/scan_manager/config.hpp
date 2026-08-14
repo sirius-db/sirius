@@ -33,8 +33,12 @@ namespace sirius::scan_manager {
 /// Default uring reactor count; counted in the scan-manager sizing budget below.
 inline constexpr std::size_t default_uring_n_reactors = 1;
 
+/// Extra worker added by sirius_scan_manager beyond the configured scan-manager count.
+inline constexpr int scan_manager_internal_worker_count = 1;
+
 /// Scan-manager pool size from the live sibling-pool configuration: every core left after the
-/// per-space downgrade, task-creator, per-GPU pipeline, and io_uring pools, never below 4.
+/// internal scan-manager worker, per-space downgrade, task-creator, per-GPU pipeline, and io_uring
+/// pools, never below 4.
 [[nodiscard]] inline int derived_scan_manager_num_threads(unsigned hardware_threads,
                                                           std::size_t downgrade_threads,
                                                           std::size_t downgrade_executors,
@@ -56,6 +60,7 @@ inline constexpr std::size_t default_uring_n_reactors = 1;
     remaining = reserved >= remaining ? 0 : remaining - reserved;
   };
 
+  subtract(scan_manager_internal_worker_count);
   subtract_product(downgrade_threads, downgrade_executors);
   subtract(task_creator_threads);
   subtract_product(pipeline_threads, pipeline_executors);

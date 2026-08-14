@@ -623,11 +623,16 @@ TEST_CASE("Sirius derives scan-manager threads from configured sibling pools", "
   std::source_location loc = std::source_location::current();
   auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
 
-  CHECK(sirius::scan_manager::derived_scan_manager_num_threads(32, 1, 2, 1, 4, 1, 1) == 24);
-  CHECK(sirius::scan_manager::derived_scan_manager_num_threads(32, 2, 2, 4, 3, 1, 2) == 19);
-  CHECK(sirius::scan_manager::derived_scan_manager_num_threads(32, 2, 3, 4, 3, 2, 2) == 14);
-  CHECK(sirius::scan_manager::derived_scan_manager_num_threads(32, 2, 3, 4, 3, 1, 2) == 17);
-  CHECK(sirius::scan_manager::derived_scan_manager_num_threads(64, 1, 3, 1, 4, 2, 1) == 51);
+  CHECK(sirius::scan_manager::derived_scan_manager_num_threads(32, 1, 2, 1, 4, 1, 1) == 23);
+  CHECK(sirius::scan_manager::derived_scan_manager_num_threads(32, 2, 2, 4, 3, 1, 2) == 18);
+  CHECK(sirius::scan_manager::derived_scan_manager_num_threads(32, 2, 3, 4, 3, 2, 2) == 13);
+  CHECK(sirius::scan_manager::derived_scan_manager_num_threads(32, 2, 3, 4, 3, 1, 2) == 16);
+  CHECK(sirius::scan_manager::derived_scan_manager_num_threads(64, 1, 3, 1, 4, 2, 1) == 50);
+  CHECK(sirius::scan_manager::derived_scan_manager_num_threads(8, 1, 1, 1, 1, 1, 0) == 4);
+  CHECK(sirius::scan_manager::derived_scan_manager_num_threads(7, 1, 1, 1, 1, 1, 0) == 4);
+  CHECK(sirius::scan_manager::derived_scan_manager_num_threads(
+          std::numeric_limits<unsigned>::max(), 0, 0, 0, 0, 0, 0) ==
+        std::numeric_limits<int>::max());
   CHECK(sirius::scan_manager::derived_scan_manager_num_threads(0, 2, 2, 4, 3, 1, 2) == 4);
   CHECK(sirius::scan_manager::derived_scan_manager_num_threads(4, 2, 2, 4, 3, 1, 2) == 4);
   CHECK(sirius::scan_manager::derived_scan_manager_num_threads(
@@ -642,6 +647,32 @@ TEST_CASE("Sirius derives scan-manager threads from configured sibling pools", "
           32, 1, 2, 1, 4, std::numeric_limits<std::size_t>::max(), 1) == 4);
   CHECK(sirius::scan_manager::derived_scan_manager_num_threads(
           32, 1, 2, std::numeric_limits<std::size_t>::max(), 4, 1, 1) == 4);
+
+  auto check_exact_cpu_envelope = [](unsigned hardware_threads,
+                                     std::size_t downgrade_threads,
+                                     std::size_t downgrade_executors,
+                                     std::size_t task_creator_threads,
+                                     std::size_t pipeline_threads,
+                                     std::size_t pipeline_executors,
+                                     std::size_t uring_reactors) {
+    auto const scan_threads =
+      sirius::scan_manager::derived_scan_manager_num_threads(hardware_threads,
+                                                             downgrade_threads,
+                                                             downgrade_executors,
+                                                             task_creator_threads,
+                                                             pipeline_threads,
+                                                             pipeline_executors,
+                                                             uring_reactors);
+    auto const total_workers = static_cast<std::size_t>(scan_threads) +
+                               sirius::scan_manager::scan_manager_internal_worker_count +
+                               downgrade_threads * downgrade_executors + task_creator_threads +
+                               pipeline_threads * pipeline_executors + uring_reactors;
+    CHECK(total_workers == hardware_threads);
+  };
+  check_exact_cpu_envelope(32, 1, 2, 1, 4, 1, 1);
+  check_exact_cpu_envelope(32, 2, 2, 4, 3, 1, 2);
+  check_exact_cpu_envelope(32, 2, 3, 4, 3, 2, 2);
+  check_exact_cpu_envelope(64, 1, 3, 1, 4, 2, 1);
 
   SECTION("zero-configuration defaults use the resolved memory spaces")
   {

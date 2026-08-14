@@ -493,7 +493,7 @@ sirius_scan_manager::sirius_scan_manager(
   : _config(config),
     _reservation_manager(reservation_manager),
     _topology_index(std::move(topology_index)),
-    _thread_pool(_config.thread_pool.num_threads + 1,
+    _thread_pool(_config.thread_pool.num_threads + scan_manager_internal_worker_count,
                  _config.thread_pool.thread_name_prefix,
                  _config.thread_pool.cpu_affinity_list),
     _dispatcher(
