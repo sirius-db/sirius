@@ -617,16 +617,19 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
 /// The two must agree: a scan that substitutes with no origin stamped on its
 /// batches has thrown the values away with no way to get them back.
 ///
-/// v1 additionally refuses any scan that RESTRICTS ROWS. Substitution runs on
-/// the finished scan output, whose rows are then the chunk's rows in order, so
-/// the rowid is a sequence over the origin's span and costs nothing. Admitting a
-/// filter means moving the substitution ahead of the filter's gather, which
-/// carries the rowid through it — worth doing, and not what makes q10 fast.
+/// A scan that RESTRICTS ROWS is refused: substitution runs on the finished scan
+/// output, so admitting one means moving the substitution ahead of the filter's
+/// gather and carrying the rowid through it.
+///
+/// A scan a join may publish a filter into is admitted. What the rowid needs is
+/// that a served batch still be the chunk's rows in order, and a published
+/// filter breaks that only by compacting the batch during the decode --
+/// substitute_deferred_columns checks the row count and fails rather than
+/// addressing rows the batch no longer holds.
 void install_late_materialization(op::scan::sirius_gpu_scan_operator& scan_op,
                                   pinned_entry const& entry,
                                   std::span<std::size_t const> selected_columns,
-                                  bool serves_whole_chunks,
-                                  bool has_dynamic_filters)
+                                  bool serves_whole_chunks)
 {
   if (!late_mat::late_mat_enabled()) { return; }
   // An uninstalled deferral looks exactly like one that installed and did
@@ -644,9 +647,6 @@ void install_late_materialization(op::scan::sirius_gpu_scan_operator& scan_op,
   }
   if (scan_op.get_ingestible().has_row_filter()) {
     return decline("the scan restricts rows, so its output is not the chunk's rows in order");
-  }
-  if (has_dynamic_filters) {
-    return decline("a join may publish a filter into this scan mid-query");
   }
 
   auto const planned = sirius::planner::plan_deferral(scan_op);
@@ -1067,8 +1067,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     install_late_materialization(*assignment.op,
                                  *assignment.entry,
                                  assignment.columns,
-                                 /*serves_whole_chunks=*/masks.empty() && delta_splits.empty(),
-                                 /*has_dynamic_filters=*/dynamic_filters != nullptr);
+                                 /*serves_whole_chunks=*/masks.empty() && delta_splits.empty());
     auto provider = make_provider_for_pinned_entry(*assignment.entry,
                                                    assignment.columns,
                                                    std::move(assignment.plan),

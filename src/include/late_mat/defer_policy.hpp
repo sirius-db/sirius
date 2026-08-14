@@ -43,8 +43,12 @@
 // not happen looks exactly like one that did nothing, and the difference is
 // the whole question when a measurement disappoints.
 
+#include <charconv>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace sirius::late_mat {
@@ -86,12 +90,28 @@ struct defer_candidate {
   [[nodiscard]] std::int64_t net_value_bytes(std::int64_t rowid_bytes) const noexcept;
 };
 
+/// Port-crossing floor, env-overridable for measurement (default 4).
+inline int default_min_boundaries()
+{
+  static int const value = [] {
+    char const* v = std::getenv("SIRIUS_LATE_MAT_MIN_BOUNDARIES");
+    if (v == nullptr || v[0] == '\0') { return 4; }
+    int parsed      = 0;
+    auto const* end = v + std::strlen(v);
+    auto const rc   = std::from_chars(v, end, parsed);
+    return (rc.ec == std::errc{} && rc.ptr == end && parsed >= 0) ? parsed : 4;
+  }();
+  return value;
+}
+
 /// The thresholds, in one place so a measurement can move them together.
 struct defer_policy {
   /// Deferred value must exceed this, per row, after the rowid is paid for.
   std::int64_t min_value_bytes = 32;
-  /// Port crossings the ride must save.
-  int min_boundaries = 4;
+  /// Port crossings the ride must save. Overridable with
+  /// SIRIUS_LATE_MAT_MIN_BOUNDARIES so a measurement can separate "the ride is
+  /// not worth taking" from "the crossing count under-reports it".
+  int min_boundaries = default_min_boundaries();
   /// What riding costs per row.
   std::int64_t rowid_bytes = 8;
 };
