@@ -32,7 +32,6 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <duckdb/main/client_context.hpp>
-
 #include <sirius_context.hpp>
 
 #include <atomic>
@@ -50,11 +49,22 @@ namespace {
 
 namespace fs = std::filesystem;
 
-constexpr int kSlots            = 4;
-constexpr int kWorkers          = 4;
-constexpr int kItersPerWorker   = 6;
 constexpr std::int64_t kRows    = 2'000'000;
 constexpr std::int64_t kDimRows = 97;
+
+// Bisection knobs (deadlock triage runs the same binary at several points of
+// the slots x workers grid without rebuilding). Defaults are the shipped
+// test shape.
+int env_int(const char* name, int fallback)
+{
+  if (const char* v = std::getenv(name); v != nullptr) { return std::atoi(v); }
+  return fallback;
+}
+int slots() { return env_int("SIRIUS_TEST_CONCURRENCY_SLOTS", 4); }
+int workers() { return env_int("SIRIUS_TEST_CONCURRENCY_WORKERS", 4); }
+int iters_per_worker() { return env_int("SIRIUS_TEST_CONCURRENCY_ITERS", 6); }
+int pipeline_threads() { return env_int("SIRIUS_TEST_PIPELINE_THREADS", 4); }
+int creator_threads() { return env_int("SIRIUS_TEST_CREATOR_THREADS", 2); }
 
 // integration.yaml (1 GPU, half the card) plus the concurrency knob under
 // test. Written fresh per run so the test owns its whole config.
@@ -74,15 +84,17 @@ std::string concurrent_config_yaml()
       block_size: 1048576
   executor:
     pipeline:
-      num_threads: 4
+      num_threads: )" +
+         std::to_string(pipeline_threads()) + R"(
     task_creator:
-      num_threads: 2
+      num_threads: )" +
+         std::to_string(creator_threads()) + R"(
     downgrade:
       num_threads: 1
       monitor_period: 10ms
     scan_manager:
       max_concurrent_queries: )" +
-         std::to_string(kSlots) + R"(
+         std::to_string(slots()) + R"(
   operator_params:
     scan_task_batch_size: 100000000
     max_sort_partition_bytes: 0
@@ -100,6 +112,11 @@ class scoped_config_env {
       original_     = current;
       had_original_ = true;
     }
+    // The shared env sets SIRIUS_DISABLE=1 after creating its DB so stray
+    // DuckDB instances in other tests skip SiriusContext creation. This test
+    // WANTS its own SiriusContext, so lift the kill switch for its window.
+    had_disable_ = std::getenv("SIRIUS_DISABLE") != nullptr;
+    unsetenv("SIRIUS_DISABLE");
     setenv("SIRIUS_CONFIG_FILE", config_path.string().c_str(), 1);
   }
   ~scoped_config_env()
@@ -109,11 +126,13 @@ class scoped_config_env {
     } else {
       unsetenv("SIRIUS_CONFIG_FILE");
     }
+    if (had_disable_) { setenv("SIRIUS_DISABLE", "1", 1); }
   }
 
  private:
   std::string original_;
   bool had_original_ = false;
+  bool had_disable_  = false;
 };
 
 std::string materialize(duckdb::QueryResult& result) { return result.ToString(); }
@@ -129,8 +148,9 @@ const std::vector<std::string>& query_shapes()
     "WHERE d.w > 250 GROUP BY d.bucket ORDER BY d.bucket",
     // selective filter + global aggregate
     "SELECT count(*) AS c, sum(v) AS s, min(id) AS lo, max(id) AS hi FROM fact WHERE k < 13",
-    // distinct-count reaching the aggregate paths
-    "SELECT count(DISTINCT k) AS dk, count(DISTINCT v % 101) AS dv FROM fact",
+    // two-key grouped aggregate with a projection expression
+    "SELECT k % 10 AS kb, v % 7 AS vb, count(*) AS c, sum(id) AS s FROM fact "
+    "GROUP BY kb, vb ORDER BY kb, vb",
   };
   return queries;
 }
@@ -150,24 +170,38 @@ TEST_CASE("concurrent transparent GPU queries overlap and stay correct",
   scoped_config_env env_guard(config_path);
   duckdb::DuckDB db(nullptr);
 
-  // Seed data once, single-connection (DDL is CPU-side; the concurrent phase
-  // below is read-only, so connections never contend on catalog writes).
+  // Seed data once as PARQUET, then expose it through views: the GPU scan
+  // serves parquet (and file-backed duckdb) sources; an in-memory CREATE
+  // TABLE would plan-time-fall-back every query to CPU and reduce this test
+  // to concurrent DuckDB. The COPY itself is CPU-side setup.
+  auto const fact_path = fs::temp_directory_path() / "sirius_concurrent_fact.parquet";
+  auto const dim_path  = fs::temp_directory_path() / "sirius_concurrent_dim.parquet";
   {
     duckdb::Connection con(db);
-    auto r1 = con.Query(
-      "CREATE TABLE fact AS SELECT range AS id, range % " + std::to_string(kDimRows) +
-      " AS k, (range * 13) % 1000 AS v FROM range(" + std::to_string(kRows) + ")");
+    auto r1 = con.Query("COPY (SELECT range AS id, range % " + std::to_string(kDimRows) +
+                        " AS k, (range * 13) % 1000 AS v FROM range(" + std::to_string(kRows) +
+                        ")) TO '" + fact_path.string() + "' (FORMAT parquet)");
     REQUIRE_FALSE(r1->HasError());
-    auto r2 = con.Query("CREATE TABLE dim AS SELECT range AS k, (range * 7) % 500 AS w, range % 5 "
-                        "AS bucket FROM range(" +
-                        std::to_string(kDimRows) + ")");
+    auto r2 = con.Query(
+      "COPY (SELECT range AS k, (range * 7) % 500 AS w, range % 5 AS bucket "
+      "FROM range(" +
+      std::to_string(kDimRows) + ")) TO '" + dim_path.string() + "' (FORMAT parquet)");
     REQUIRE_FALSE(r2->HasError());
+    auto r3 =
+      con.Query("CREATE VIEW fact AS SELECT * FROM read_parquet('" + fact_path.string() + "')");
+    REQUIRE_FALSE(r3->HasError());
+    auto r4 =
+      con.Query("CREATE VIEW dim AS SELECT * FROM read_parquet('" + dim_path.string() + "')");
+    REQUIRE_FALSE(r4->HasError());
   }
 
   // Single-threaded reference pass (still transparently GPU-executed; the
   // point of the test is overlap-correctness, not GPU-vs-CPU — the rest of
-  // the suite covers that).
+  // the suite covers that). The SiriusContext handle is captured here, from a
+  // connection that has executed: registered_state gains "sirius_state"
+  // lazily on first execution, so a fresh connection would hand back null.
   std::vector<std::string> reference;
+  duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx;
   {
     duckdb::Connection con(db);
     for (const auto& q : query_shapes()) {
@@ -175,6 +209,8 @@ TEST_CASE("concurrent transparent GPU queries overlap and stay correct",
       REQUIRE_FALSE(r->HasError());
       reference.push_back(materialize(*r));
     }
+    sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(sirius_ctx != nullptr);
   }
 
   // Concurrent phase: kWorkers threads, own connection each, barrier-synced
@@ -194,7 +230,7 @@ TEST_CASE("concurrent transparent GPU queries overlap and stay correct",
       ++ready;
       start_cv.wait(lock, [&] { return go; });
     }
-    for (int i = 0; i < kItersPerWorker; ++i) {
+    for (int i = 0; i < iters_per_worker(); ++i) {
       const auto qi   = (wid + i) % query_shapes().size();
       const auto& sql = query_shapes()[qi];
       auto r          = con.Query(sql);
@@ -215,11 +251,11 @@ TEST_CASE("concurrent transparent GPU queries overlap and stay correct",
   };
 
   std::vector<std::thread> threads;
-  threads.reserve(kWorkers);
-  for (int w = 0; w < kWorkers; ++w) {
+  threads.reserve(workers());
+  for (int w = 0; w < workers(); ++w) {
     threads.emplace_back(worker, w);
   }
-  while (ready.load() < kWorkers) {
+  while (ready.load() < workers()) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   {
@@ -239,9 +275,17 @@ TEST_CASE("concurrent transparent GPU queries overlap and stay correct",
   // Prove the gate actually admitted overlapping windows: a silent
   // re-serialization (or a config knob that stopped reaching the gate) would
   // otherwise pass on correctness alone.
-  duckdb::Connection con(db);
-  auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  REQUIRE(sirius_ctx != nullptr);
   INFO("query_lifecycle_peak = " << sirius_ctx->query_lifecycle_peak());
-  REQUIRE(sirius_ctx->query_lifecycle_peak() > 1);
+  if (slots() > 1 && workers() > 1) { REQUIRE(sirius_ctx->query_lifecycle_peak() > 1); }
+
+  // And prove the overlapping queries actually EXECUTED on the GPU: a
+  // plan-time fallback regression would otherwise reduce this test to
+  // concurrent DuckDB CPU execution, which proves nothing about Sirius.
+  const auto stats = sirius_ctx->get_transparent_execution_stats();
+  INFO("executions=" << stats.executions << " fallbacks=" << stats.fallbacks
+                     << " runtime_fallbacks=" << stats.runtime_fallbacks);
+  const auto total_queries =
+    query_shapes().size() + static_cast<std::size_t>(workers()) * iters_per_worker();
+  REQUIRE(stats.executions >= total_queries);
+  REQUIRE(stats.runtime_fallbacks == 0);
 }

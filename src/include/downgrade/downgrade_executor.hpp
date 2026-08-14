@@ -205,6 +205,13 @@ class downgrade_executor {
   exec::interruptible_mpmc<std::unique_ptr<downgrade_request>> _request_queue;
   std::thread _processing_thread;
   std::thread _monitor_thread;
+  /// Serializes drain()/stop()'s stop-join-restart of _processing_thread.
+  /// With max_concurrent_queries > 1, two queries' mandatory cleanups can
+  /// drain the same executor simultaneously; an unsynchronized second join()
+  /// (or reassigning a joinable std::thread) throws std::system_error through
+  /// the caller's noexcept cleanup — i.e. std::terminate. One drain at a
+  /// time; a second entrant repeats the idempotent stop/cancel/restart.
+  std::mutex _lifecycle_mutex;
   std::atomic<bool> _monitor_request_enqueued{false};
   std::atomic<bool> _running{false};
   std::atomic<size_t> _monitor_requests_issued{0};

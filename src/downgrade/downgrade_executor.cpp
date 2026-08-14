@@ -111,6 +111,7 @@ void downgrade_executor::stop()
 {
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
+  std::lock_guard<std::mutex> lifecycle_lock(_lifecycle_mutex);
 
   _pool->interrupt();
   _request_queue.interrupt();
@@ -128,6 +129,10 @@ void downgrade_executor::stop()
 
 void downgrade_executor::drain()
 {
+  // See _lifecycle_mutex: concurrent per-query cleanups both reach this
+  // global drain; the stop-join-restart below must not interleave.
+  std::lock_guard<std::mutex> lifecycle_lock(_lifecycle_mutex);
+  if (!_running.load()) { return; }  // racing terminate: stop() already owns teardown
   _pool->interrupt();
   _request_queue.interrupt();
 
