@@ -43,8 +43,8 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
-#include <iomanip>
 #include <initializer_list>
+#include <iomanip>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -950,7 +950,7 @@ sirius::io::rest::rest_ioctx& ensure_rest_ioctx_for_bench(
 rest_bench_measurement run_rest_parquet_scan(s3_sql_fixture& fixture,
                                              std::string const& uri,
                                              std::vector<std::string> const& columns,
-                                             bool use_footer_probe = false,
+                                             bool use_footer_probe     = false,
                                              std::size_t source_copies = 1)
 {
   REQUIRE(source_copies > 0);
@@ -975,10 +975,10 @@ rest_bench_measurement run_rest_parquet_scan(s3_sql_fixture& fixture,
   auto io_ctx = datasource->io_ctx();
   REQUIRE(io_ctx.get() == &rest);
 
-  auto const footer_start = bench_clock::now();
-  auto footer_buffer      = read_parquet_footer_for_bench(*datasource);
-  auto const footer_stop  = bench_clock::now();
-  auto const after_footer = rest.perf_snapshot();
+  auto const footer_start          = bench_clock::now();
+  auto footer_buffer               = read_parquet_footer_for_bench(*datasource);
+  auto const footer_stop           = bench_clock::now();
+  auto const after_footer          = rest.perf_snapshot();
   auto const reactors_after_footer = rest.reactor_perf_snapshots();
 
   auto opts = cudf::io::parquet_reader_options::builder().column_names(columns).build();
@@ -1003,19 +1003,19 @@ rest_bench_measurement run_rest_parquet_scan(s3_sql_fixture& fixture,
   auto const scan_start  = bench_clock::now();
   auto [table, metadata] = cudf::io::read_parquet(std::move(sources), std::move(metadatas), opts);
   (void)metadata;
-  auto const scan_stop  = bench_clock::now();
-  auto const wall_stop  = bench_clock::now();
-  auto const after      = rest.perf_snapshot();
+  auto const scan_stop      = bench_clock::now();
+  auto const wall_stop      = bench_clock::now();
+  auto const after          = rest.perf_snapshot();
   auto const reactors_after = rest.reactor_perf_snapshots();
-  auto const bind_micro = delta_snapshot(after_footer, before);
-  auto const micro      = delta_snapshot(after, before);
+  auto const bind_micro     = delta_snapshot(after_footer, before);
+  auto const micro          = delta_snapshot(after, before);
 
   REQUIRE(reactors_after.size() == reactors_after_footer.size());
   std::vector<std::uint64_t> reactor_scan_chunk_get_counts;
   reactor_scan_chunk_get_counts.reserve(reactors_after.size());
   for (std::size_t i = 0; i < reactors_after.size(); ++i) {
-    reactor_scan_chunk_get_counts.push_back(sat_sub(reactors_after[i].chunk_get_count,
-                                                    reactors_after_footer[i].chunk_get_count));
+    reactor_scan_chunk_get_counts.push_back(
+      sat_sub(reactors_after[i].chunk_get_count, reactors_after_footer[i].chunk_get_count));
   }
 
   return rest_bench_measurement{elapsed_ms(wall_start, wall_stop),
@@ -1508,8 +1508,7 @@ void append_perf_history_jsonl(fs::path const& path,
     out << "{\"scenario\":\"" << json_escape(r.scenario) << "\",\"transport\":\""
         << json_escape(r.transport) << "\",\"projection\":\"" << json_escape(r.projection)
         << "\",\"max_connections\":" << r.max_connections
-        << ",\"rest_n_reactors\":" << r.rest_n_reactors
-        << ",\"source_copies\":" << r.source_copies
+        << ",\"rest_n_reactors\":" << r.rest_n_reactors << ",\"source_copies\":" << r.source_copies
         << ",\"payload_bytes_read\":" << r.payload_bytes_read << ",\"row_count\":" << r.row_count
         << ",\"bind_chunk_get_count\":" << r.bind_chunk_get_count
         << ",\"wall_clock_ms\":" << std::fixed << std::setprecision(3) << r.wall_clock_ms
@@ -1709,14 +1708,13 @@ bench_record run_rest_aws_bench_scenario(s3_test_env const& env,
                                          std::vector<std::string> columns,
                                          std::size_t rest_max_connections,
                                          std::optional<duckdb::idx_t> expected_rows,
-                                         bool use_footer_probe = false,
+                                         bool use_footer_probe       = false,
                                          std::size_t rest_n_reactors = 2,
-                                         std::size_t source_copies = 1)
+                                         std::size_t source_copies   = 1)
 {
   INFO("scenario=" << scenario << " key=" << aws_bench_lineitem_key()
                    << " columns=" << columns.size() << " max_connections=" << rest_max_connections
-                   << " rest_n_reactors=" << rest_n_reactors
-                   << " source_copies=" << source_copies
+                   << " rest_n_reactors=" << rest_n_reactors << " source_copies=" << source_copies
                    << " use_footer_probe=" << use_footer_probe);
   auto limits                      = large_sirius_memory_limits(/*enable_prefetch_cache=*/true);
   limits.rest_perf_instrumentation = true;
@@ -1732,8 +1730,7 @@ bench_record run_rest_aws_bench_scenario(s3_test_env const& env,
                          env.endpoint,
                          std::nullopt,
                          /*tls_verify=*/true);
-  auto measurement =
-    run_rest_parquet_scan(fixture, uri, columns, use_footer_probe, source_copies);
+  auto measurement = run_rest_parquet_scan(fixture, uri, columns, use_footer_probe, source_copies);
   CHECK(measurement.rows > 0);
   if (expected_rows.has_value()) { CHECK(measurement.rows == *expected_rows); }
   CHECK(measurement.payload_bytes_read > 0);
