@@ -89,11 +89,14 @@ void memory_prefetcher::worker_loop()
   // resource rather than the target space's.
   rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{_gpu_space->get_device_id()}};
   // Private per-worker stream. No copy traffic ever runs on it: the converter
-  // only synchronize()s it on entry (a no-op — this worker never enqueues work
-  // on it) and does all device allocation + H2D on a stream it acquires from
-  // the GPU space's shared round-robin pool. It exists as a stable per-worker
-  // key for attaching the admission reservation to the allocation tracker in
-  // sweep() (and keeps the entry sync off any pipeline stream).
+  // only synchronize()s it on entry and does all device allocation + H2D on a
+  // stream it acquires from the GPU space's shared round-robin pool. The only
+  // ops this stream ever carries are the consumer-event waits that
+  // install_converted_representation enqueues on it, and that same call's tail
+  // sync drains them before returning — so the entry sync always sees an empty
+  // stream (a no-op). It exists as a stable per-worker key for attaching the
+  // admission reservation to the allocation tracker in sweep() (and keeps the
+  // entry sync off any pipeline stream).
   rmm::cuda_stream stream{rmm::cuda_stream::flags::non_blocking};
   while (_running.load(std::memory_order_relaxed)) {
     std::size_t converted = 0;
