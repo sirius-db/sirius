@@ -29,9 +29,10 @@
 #include <cudf/transform.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/traits.hpp>
-#include <thrust/system/system_error.h>
 
 #include <rmm/error.hpp>
+
+#include <thrust/system/system_error.h>
 
 #include <algorithm>
 #include <new>
@@ -364,7 +365,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
       throw;
     }
   }();
-  auto output_cols    = groupby_result.first->release();
+  auto output_cols = groupby_result.first->release();
 
   // Expand the single label key back into the original group key columns. The groupby emits
   // one row per distinct label, so this gather runs at group cardinality, not input rows.
