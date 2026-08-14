@@ -31,33 +31,45 @@ This file records where each register group stands NOW, with bring-up evidence.
 | B1 | The TIER-2 RAII re-push no longer re-derives the task's queue keys through the plan (`index_keys_for` → `pipe->get_source()->type`, freed once teardown destroyed the plan). `convertible_gpu_pipeline_task` captures `exec::index_keys` at extraction time (task still in the queue ⇒ plan alive) and uses them verbatim for both the lifecycle-gate lookup and a new key-supplied `multi_index_priority_queue::push` overload — mirroring `task_creation_request`'s pre-resolved keys. `run_mandatory_cleanup` also re-sweeps the query's queues once after the downgrade drains join every wrapper, closing the check-then-push race against `quiesce()`. Deterministic unit tests in `test_convertible_gpu_pipeline_task.cpp` fail pre-fix. |
 | B5 | The plan now dies AFTER the drains. `sirius_interface::end_query_internal` parks the engine + `sirius_prepared_statement_data` (which owns the plan tree the collector references) on `SiriusContext` via `retire_query_plan()`; `run_mandatory_cleanup` destroys them once every drain for the query has run, still before the repository erase (operators die while their wired repositories exist). Backstop paths (`drop_query_runtime_state_best_effort`, `terminate()`) clear parked state too. `[teardown_races]` harness scenario exercises the B1/B5 interlock. |
 | F1 | The queues' dispatch pops now round-robin across query bands instead of following the packed priority order: `multi_index_priority_queue::pop()` and the front `try_pop_from(gpu_index)` remember the last query served and serve the next live query id (wrapping) its best-priority task, under the queue's existing mutex. Within a query the order is untouched; single-query behavior is bit-identical (whole legacy suite). Covers the task_creator queue, the task_scheduler dispatch, and the GPU executors' staging queues in one change; back/predicate pops (downgrade-victim selection) keep strict order. `query_priority_bits()` packing stays — it now provides band separation for the per-query indexes, not cross-query precedence. Evidence: `test_concurrent_fairness.cpp` — heavy query admitted first beside 16 shorts, 1 GiB pool: before 0/16 shorts completed while it ran (first-short latency ~2.1 s vs 3.5 ms baseline); after 16/16 (median 13 ms), heavy elapsed unchanged within noise. |
+| E1 | SNAPSHOT-AT-WINDOW-BEGIN: `sirius::query_config_snapshot` is copied ONCE per query at admission (installed thread-locally by `StandaloneQueryScope`/`SlotGuard`); every plan-time/execution-time reader uses `SiriusContext::query_operator_params()`, never the live struct. SET callbacks write via `update_operator_params` under `operator_params_mutex_` (the snapshot's lock) and no longer occupy a window slot. Semantics: a SET takes effect for queries ADMITTED after it — never mid-plan. |
+| E2 | `duckdb::Config` scalars → `std::atomic` (source-compatible); `LOG_*` strings → copy-on-read `ConfigString` (shared_ptr swap under mutex). The expression strategy rides the E1 snapshot: operators and scan ingestibles capture it at construction (window thread) and pass it to every evaluator at execute time, so one plan uses one strategy. |
+| E4 | `PhysicalSiriusExecution` is immutable across executions: `logical_plan_` lost `mutable` and is never `reset()` (a monotonic atomic `plan_copy_unsupported_` latches the non-copyable case); the shared CPU-fallback stash gets `FORCE_MATERIALIZED`/`IN_MEMORY` fixed at `OnFinalizePrepare` instead of being written per-execution. DIAGNOSIS CORRECTION: the documented "streaming EXECUTEs silently skip Sirius" signature was misattributed — instrumented runs show streaming engages on EVERY iteration (the GPU run completes inside `Execute()`'s single ClientContext lock hold), while SQL-level `PREPARE`/`EXECUTE` never engages at all: a pre-existing single-threaded transparency gap (`PREPARE` is not a SELECT; `Binder::Bind(ExecuteStatement)` re-plans via `Planner::PrepareSQLStatement`, which has no finalize hook), not a race. The prepared-statement scenario dropped `[!mayfail]` and asserts per-phase engagement equalities, including phase C == 0 so a future PREPARE/EXECUTE interception flips it consciously. |
+| E7 | `gpu_execution`'s ClientConfig save/restore moved off the shared bind data onto the executing stack (RAII in `ExtractPlan`); concurrent executions of one prepared statement can no longer clobber each other's saved copy. New `[config_race]` scenario asserts the connection's `enable_optimizer` survives concurrent executions. |
 
 ## MUST FIX — live now, with bring-up evidence
 
 Ranked; the first cluster currently hangs a test.
 
-1. **Failure containment cluster — A7, B2, D6 (B1 and A6's live half now
-   fixed, see above).** The error-path test passes, but the remaining three
-   interlock under memory pressure and heavier churn: query-end
-   `drain()` cancels PEERS' downgrade promises (A7), `drain()` restarts the
-   processing thread before quiescence is used (B2), and a
-   drain racing the monitor can permanently latch `_monitor_request_enqueued`
-   (D6 — kills automatic spilling for the process). William's backed-out
-   steps 6+7 (shared-ownership repositories, delete the global drain) are the
-   structural fix; the interim path is per-query attribution on downgrade
-   requests + scoping `drain_after_error` to the failing query.
+1. ~~**Failure containment cluster — A7, B2, D6.**~~ FIXED. `downgrade_request`
+   carries its query id; `drain(query_id)` fails only that query's promises
+   with no thread stop/restart (A7+B2), every request-destruction path routes
+   through `fail_request()` which re-arms `_monitor_request_enqueued` (D6), and
+   the registry's sweep gate fences repository teardown against in-progress
+   sweeps. INTERLOCK with B5 (coordinator): a PEER's in-flight sweep can hold
+   the ending query's task across a blocking conversion, so cleanup calls
+   `wait_inflight_request()` per executor before the final sweep + plan
+   destruction, and TIER-2 extraction consults the lifecycle gate so later
+   requests never extract a quiescing query's tasks. William's steps 6+7
+   (shared-ownership repositories) remain the structural end-state.
 2. ~~**B5 — plan destroyed before the drains.**~~ FIXED, see above.
-3. **E1/E2/E4/E7 — shared mutable config.** The slot no longer serializes
-   SET-vs-execution. E4 (transparent prepared statement `mutable
-   logical_plan_`) is the sharpest: two concurrent EXECUTEs of one prepared
-   statement is an ordinary workload. E1/E2 need at least torn-read safety
-   (atomics / snapshot-at-window-begin); E2's `std::string` static variables can UAF.
-4. **D5 — `runtime_unavailable_` process-wide latch.** With N queries, one
-   unlucky cleanup poisons N−1 healthy queries and every future one. Needs a
-   per-query verdict plus a separate genuinely-shared-corruption latch.
-5. **B9 — `get_repository()` unlocked map reference.** Trivial to hit with
-   two queries creating/clearing repositories; trivial to fix (take `_mutex`,
-   return by value/shared_ptr — cucascade change).
+3. ~~**E1/E2/E4/E7 — shared mutable config.**~~ FIXED, see above. Remaining
+   E-batch: E3 (compression-config setters, unguarded), E5 (plan_register
+   check-then-act keyed by bare table name), E6 (`get_target_ctas()` mutable
+   function-local static). Also surfaced: SQL-level `PREPARE`/`EXECUTE` never
+   runs transparently (single-threaded gap, documented in
+   `test_transparent_runtime_fallback.cpp` and now asserted in the prepared
+   scenario), and `gpu_execution`'s `enable_optimizer` named parameter is
+   parsed but ignored (`GPUExecutionBind` hard-codes `true`).
+4. ~~**D5 — `runtime_unavailable_` process-wide latch.**~~ FIXED.
+   `classify_query_failure()` at every former latch site: default verdict is
+   per-query (query errors, state dropped best-effort, healthy queries and new
+   admissions unaffected, counted by `per_query_cleanup_failures()`); the
+   process-wide latch fires only when a sticky CUDA error survives a
+   `cudaGetLastError()` clear. Follow-up: step-level classification inside
+   `run_mandatory_cleanup` once steps 6+7 land; multi-device sticky probe.
+5. ~~**B9 — `get_repository()` unlocked map reference.**~~ FIXED (cucascade):
+   map stores `shared_ptr`, new locked `get_repository_shared()`; old accessor
+   kept deprecated until downstreams migrate.
 6. ~~**F1 — absolute cross-query priority.**~~ FIXED (round-robin across query
    bands in the queue pops), see above.
 

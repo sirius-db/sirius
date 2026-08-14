@@ -26,7 +26,7 @@
 
 namespace duckdb {
 
-/// Copy-on-read string for the process-wide mutable Config statics below.
+/// Copy-on-read string for the process-wide mutable Config members below.
 ///
 /// `SET` callbacks reassign these strings while other connections' queries read
 /// them concurrently (register E2): a plain `std::string` reassign/read race is
@@ -80,7 +80,8 @@ class ConfigString {
 // * Add a configuration field associated with Sirius (see InitialGPUConfigs in sirius_extension.cpp
 // for examples)
 //
-// CONCURRENCY (register E2): these statics are written by `SET` callbacks while
+// CONCURRENCY (register E2): these static members are written by `SET` callbacks
+// while
 // queries on other connections read them, with no other serialization — the
 // query-lifecycle gate admits several queries and never covered SETs anyway.
 // Scalars are therefore std::atomic (reads/writes stay source-compatible via
