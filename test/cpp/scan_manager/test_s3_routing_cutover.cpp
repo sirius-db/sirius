@@ -256,11 +256,13 @@ sirius::io::ioctx_resolver make_datasource_resolver(sirius_scan_manager& manager
 
 sirius::planner::query make_empty_query()
 {
-  auto tctx = sirius::test::make_test_telemetry_context();
-  sirius::telemetry::query_telemetry_info tinfo{tctx->engine_id(), tctx->worker_id()};
+  auto tctx           = sirius::test::make_test_telemetry_context();
+  const auto query_id = sirius::make_query_id(1);
+  sirius::telemetry::query_telemetry_info tinfo{tctx->engine_id(), tctx->worker_id(), query_id};
   return sirius::planner::query(
     duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
     tctx->context(),
+    query_id,
     tinfo);
 }
 
@@ -646,11 +648,11 @@ TEST_CASE("scan_manager re-primes routed S3 cache on every query",
   auto q = make_empty_query();
   // The query intentionally has no scan operators: routed caches must still
   // advance once per query, matching the default ioctx's query-wide refresh.
-  manager.prepare_for_query(q, true);
+  manager.prepare_for_query(q, true, {});
   REQUIRE(routed_cache->query_epoch() == 1);
   REQUIRE(default_cache->query_epoch() == 1);
 
-  manager.prepare_for_query(q, true);
+  manager.prepare_for_query(q, true, {});
   REQUIRE(routed_cache->query_epoch() == 2);
   REQUIRE(default_cache->query_epoch() == 2);
 }
@@ -670,7 +672,7 @@ TEST_CASE("scan_manager tolerates routed S3 ioctx without a prefetch cache",
   REQUIRE(datasource->io_ctx()->cache() == nullptr);
 
   auto q = make_empty_query();
-  REQUIRE_NOTHROW(manager.prepare_for_query(q, true));
+  REQUIRE_NOTHROW(manager.prepare_for_query(q, true, {}));
 }
 
 TEST_CASE("rest perf instrumentation flag gates micro counters", "[s3][rest][perf]")

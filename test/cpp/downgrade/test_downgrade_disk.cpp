@@ -18,6 +18,7 @@
 
 // sirius
 #include "data/convertible_data_batch.hpp"
+#include "data/data_repository_manager_registry.hpp"
 #include "downgrade/downgrade_executor.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 
@@ -114,6 +115,10 @@ std::vector<std::unique_ptr<cucascade::memory::reservation>> exhaust_host_capaci
 
 const auto GPU_SPACE_ID = cucascade::memory::memory_space_id(cucascade::memory::Tier::GPU, 0);
 
+// These tests exercise a single query's repositories; the executor sweeps the registry,
+// so each test registers its manager under one fixed query id.
+const sirius::query_id_t kTestQueryId = sirius::make_query_id(1);
+
 // Build a manager with a small HOST tier and NO disk, with a low GPU downgrade trigger so that
 // modest GPU pressure is enough to keep should_downgrade_memory() true. Used to reproduce the
 // "monitor spins because nothing can be downgraded" scenario.
@@ -129,10 +134,10 @@ std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> make_no_disk_
     .set_gpu_usage_limit(gpu_capacity)
     .set_reservation_fraction_per_gpu(0.9)
     .set_downgrade_fractions_per_gpu(0.1, 0.05)  // trigger GPU downgrade under modest pressure
-    .set_per_host_capacity(host_capacity)
-    .use_host_per_gpu()
-    .set_reservation_fraction_per_host(0.75)
-    .set_downgrade_fractions_per_host(0.1, 0.05);  // also let a HOST monitor reach pressure
+    .set_per_numa_region_capacity(host_capacity)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(0.75)
+    .set_downgrade_fractions_per_numa_region(0.1, 0.05);  // also let a HOST monitor reach pressure
   // No set_disk_mounting_point — DISK tier is absent.
 
   auto space_configs = builder.build();
@@ -142,14 +147,15 @@ std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> make_no_disk_
   return manager;
 }
 
-downgrade_executor make_monitoring_executor(cucascade::shared_data_repository_manager& repo_mgr,
-                                            cucascade::memory::memory_space* gpu_space,
-                                            sirius::memory::sirius_memory_reservation_manager& mgr)
+downgrade_executor make_monitoring_executor(
+  sirius::data::data_repository_manager_registry& repo_registry,
+  cucascade::memory::memory_space* gpu_space,
+  sirius::memory::sirius_memory_reservation_manager& mgr)
 {
   sirius::exec::downgrade_executor_config config{
     .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade"},
     .monitor_period = std::chrono::milliseconds{10}};
-  return downgrade_executor(config, repo_mgr, GPU_SPACE_ID, gpu_space, mgr);
+  return downgrade_executor(config, repo_registry, GPU_SPACE_ID, gpu_space, mgr);
 }
 
 }  // namespace
@@ -176,9 +182,9 @@ TEST_CASE("Downgrade task falls back to DISK when HOST is full", "[downgrade_dis
   builder.set_number_of_gpus(1)
     .set_gpu_usage_limit(gpu_capacity)
     .set_reservation_fraction_per_gpu(limit_ratio)
-    .set_per_host_capacity(host_capacity)
-    .use_host_per_gpu()
-    .set_reservation_fraction_per_host(limit_ratio)
+    .set_per_numa_region_capacity(host_capacity)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(limit_ratio)
     .set_disk_mounting_point(0, 4ull << 30, tmp_dir.string());
 
   auto space_configs = builder.build();
@@ -229,9 +235,9 @@ TEST_CASE("Downgrade task uses HOST when HOST has capacity", "[downgrade_disk]")
   builder.set_number_of_gpus(1)
     .set_gpu_usage_limit(gpu_capacity)
     .set_reservation_fraction_per_gpu(limit_ratio)
-    .set_per_host_capacity(4ull << 30)
-    .use_host_per_gpu()
-    .set_reservation_fraction_per_host(limit_ratio)
+    .set_per_numa_region_capacity(4ull << 30)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(limit_ratio)
     .set_disk_mounting_point(0, 4ull << 30, tmp_dir.string());
 
   auto space_configs = builder.build();
@@ -277,9 +283,9 @@ TEST_CASE("Downgrade task returns false when HOST full and no DISK tier", "[down
   builder.set_number_of_gpus(1)
     .set_gpu_usage_limit(gpu_capacity)
     .set_reservation_fraction_per_gpu(limit_ratio)
-    .set_per_host_capacity(host_capacity)
-    .use_host_per_gpu()
-    .set_reservation_fraction_per_host(limit_ratio);
+    .set_per_numa_region_capacity(host_capacity)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(limit_ratio);
   // No set_disk_mounting_point — DISK tier is absent
 
   auto space_configs = builder.build();
@@ -333,8 +339,9 @@ TEST_CASE("monitor backs off when no downgrade target is viable (no disk)", "[do
   REQUIRE(gpu_hold);
   REQUIRE(gpu_space->should_downgrade_memory());
 
-  cucascade::shared_data_repository_manager repo_mgr;
-  auto executor = make_monitoring_executor(repo_mgr, gpu_space, *mem_mgr);
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  auto executor  = make_monitoring_executor(repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   using namespace std::chrono_literals;
@@ -366,8 +373,9 @@ TEST_CASE("monitor resumes after a downgrade target frees up (no disk)", "[downg
   REQUIRE(gpu_hold);
   REQUIRE(gpu_space->should_downgrade_memory());
 
-  cucascade::shared_data_repository_manager repo_mgr;
-  auto executor = make_monitoring_executor(repo_mgr, gpu_space, *mem_mgr);
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  auto executor  = make_monitoring_executor(repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   using namespace std::chrono_literals;
@@ -430,8 +438,9 @@ TEST_CASE("monitor backs off when HOST is full of stored downgraded data (no dis
   REQUIRE(gpu_hold);
   REQUIRE(gpu_space->should_downgrade_memory());
 
-  cucascade::shared_data_repository_manager repo_mgr;
-  auto executor = make_monitoring_executor(repo_mgr, gpu_space, *mem_mgr);
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  auto executor  = make_monitoring_executor(repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   using namespace std::chrono_literals;
@@ -470,8 +479,9 @@ TEST_CASE("HOST-source monitor backs off when no disk is configured", "[downgrad
   sirius::exec::downgrade_executor_config config{
     .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade-host"},
     .monitor_period = std::chrono::milliseconds{10}};
-  cucascade::shared_data_repository_manager repo_mgr;
-  downgrade_executor executor(config, repo_mgr, host_space->get_id(), host_space, *mem_mgr);
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  downgrade_executor executor(config, repo_registry, host_space->get_id(), host_space, *mem_mgr);
   executor.start();
 
   using namespace std::chrono_literals;

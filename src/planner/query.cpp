@@ -24,8 +24,9 @@ namespace sirius::planner {
 
 query::query(duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> pipelines,
              const quent::Context& context,
+             sirius::query_id_t query_id,
              telemetry::query_telemetry_info telemetry_info)
-  : _plan_id(uuid::now_v7()), _pipelines(std::move(pipelines))
+  : _query_id(query_id), _plan_id(uuid::now_v7()), _pipelines(std::move(pipelines))
 {
   build_indices();
   telemetry::emit_plan_telemetry(context, _pipelines, _plan_id, telemetry_info);
@@ -46,8 +47,12 @@ void query::build_indices()
       // If it's a scan-like source, add to scan operators vector. GPU_VALUES
       // must be included: task_scheduler::start_query() schedules the first
       // scan operator, which is the only kickoff a VALUES-only plan gets.
+      // STREAMING_SOURCE is also included: a receiver fragment has no table to scan.
+      // It may return WAITING on that first hint (no batch has arrived yet); the
+      // on_data hook wired in set_pipeline() re-schedules it when the first push lands.
       if (source->type == op::SiriusPhysicalOperatorType::GPU_SCAN ||
-          source->type == op::SiriusPhysicalOperatorType::GPU_VALUES) {
+          source->type == op::SiriusPhysicalOperatorType::GPU_VALUES ||
+          source->type == op::SiriusPhysicalOperatorType::STREAMING_SOURCE) {
         _scan_operators.push_back(source.get());
       }
     }

@@ -73,9 +73,9 @@ std::unique_ptr<memory_mgr> initialize_memory_manager()
   builder.set_number_of_gpus(1)
     .set_gpu_usage_limit(gpu_capacity)
     .set_reservation_fraction_per_gpu(limit_ratio)
-    .set_per_host_capacity(host_capacity)
-    .use_host_per_gpu()
-    .set_reservation_fraction_per_host(limit_ratio);
+    .set_per_numa_region_capacity(host_capacity)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(limit_ratio);
   auto configs = builder.build();
   auto manager = std::make_unique<memory_mgr>(std::move(configs));
   ::sirius::converter_registry::initialize();
@@ -381,6 +381,269 @@ std::vector<std::unique_ptr<ast_node>> one(std::unique_ptr<ast_node> n)
   return v;
 }
 }  // namespace
+
+TEST_CASE("restored numeric references are memoized per evaluate call",
+          "[expression_evaluator][compressed_materialization]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  // Both constants sit outside the INT32 carrier so the narrow-domain comparison path declines
+  // and both comparisons consume the restored (INT64) reference — exercising the memo.
+  constexpr int64_t below_int32 = -5'000'000'000;
+  constexpr int64_t above_int32 = 5'000'000'000;
+  auto const bigint_type        = logical_type::make(type_id::BIGINT);
+  std::vector<std::unique_ptr<ast_node>> comparisons;
+  comparisons.push_back(make_cmp(
+    sirius::comparison_type::gt, make_ref_typed(0, bigint_type), make_bigint_const(below_int32)));
+  comparisons.push_back(make_cmp(
+    sirius::comparison_type::lt, make_ref_typed(0, bigint_type), make_bigint_const(above_int32)));
+  auto predicate = make_conj(sirius::ast::conjunction::kind::op_and, std::move(comparisons));
+
+  // Deliberately use the active default strategy: the cache must work whether the configured
+  // executor is materializing operators or building a cuDF AST.
+  exp_executor executor(*predicate, get_resource_ref(*space));
+
+  auto evaluate_and_check = [&](std::pair<int, int> range) {
+    auto input = make_input_batch(
+      *space, {cudf::data_type{cudf::type_id::INT32}}, {std::optional<std::pair<int, int>>{range}});
+    auto input_ro   = input->to_read_only();
+    auto input_view = input_ro.get_data()->cast<gpu_table_representation>().get_table_view();
+
+    auto output = executor.evaluate(input_view);
+    REQUIRE(output != nullptr);
+    REQUIRE(output->num_columns() == 1);
+    REQUIRE(executor.restored_reference_cast_count_for_testing() == 1);
+    REQUIRE(executor.narrow_domain_comparison_count_for_testing() == 0);
+
+    auto const input_values  = copy_column_to_host<int32_t>(input_view.column(0));
+    auto const output_values = copy_bool_column_to_host(output->view().column(0));
+    REQUIRE(output_values.size() == input_values.size());
+    for (std::size_t i = 0; i < input_values.size(); ++i) {
+      auto const value = static_cast<int64_t>(input_values[i]);
+      REQUIRE(output_values[i] == ((value > below_int32 && value < above_int32) ? 1U : 0U));
+    }
+  };
+
+  evaluate_and_check({-10, 30});
+  // A second input must trigger one fresh restoration, not reuse a view into the first input.
+  evaluate_and_check({10, 50});
+}
+
+TEST_CASE("narrow-domain comparisons evaluate on the narrowed carrier without restoration",
+          "[expression_evaluator][compressed_materialization][narrow_domain]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  auto const bigint_type = logical_type::make(type_id::BIGINT);
+  std::vector<std::unique_ptr<ast_node>> comparisons;
+  comparisons.push_back(
+    make_cmp(sirius::comparison_type::gt, make_ref_typed(0, bigint_type), make_bigint_const(5)));
+  comparisons.push_back(
+    make_cmp(sirius::comparison_type::lt, make_ref_typed(0, bigint_type), make_bigint_const(20)));
+  auto predicate = make_conj(sirius::ast::conjunction::kind::op_and, std::move(comparisons));
+
+  exp_executor executor(*predicate, get_resource_ref(*space));
+
+  auto evaluate_and_check = [&](std::pair<int, int> range) {
+    auto input = make_input_batch(
+      *space, {cudf::data_type{cudf::type_id::INT32}}, {std::optional<std::pair<int, int>>{range}});
+    auto input_ro   = input->to_read_only();
+    auto input_view = input_ro.get_data()->cast<gpu_table_representation>().get_table_view();
+
+    auto output = executor.evaluate(input_view);
+    REQUIRE(output != nullptr);
+    REQUIRE(output->num_columns() == 1);
+    // Both constants fit the INT32 carrier: no restoration cast, both comparisons narrow.
+    REQUIRE(executor.restored_reference_cast_count_for_testing() == 0);
+    REQUIRE(executor.narrow_domain_comparison_count_for_testing() == 2);
+
+    auto const input_values  = copy_column_to_host<int32_t>(input_view.column(0));
+    auto const output_values = copy_bool_column_to_host(output->view().column(0));
+    REQUIRE(output_values.size() == input_values.size());
+    for (std::size_t i = 0; i < input_values.size(); ++i) {
+      auto const value = static_cast<int64_t>(input_values[i]);
+      REQUIRE(output_values[i] == ((value > 5 && value < 20) ? 1U : 0U));
+    }
+  };
+
+  evaluate_and_check({-10, 30});
+  evaluate_and_check({10, 50});
+}
+
+TEST_CASE("narrow-domain comparison engages on the MATERIALIZE binary-op path",
+          "[expression_evaluator][compressed_materialization][narrow_domain]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  // A lone comparison lowers to one cuDF AST op, below the default min_ast_size of two, so the
+  // executor takes the binary-op path even under an AST strategy.
+  auto const bigint_type = logical_type::make(type_id::BIGINT);
+  auto predicate =
+    make_cmp(sirius::comparison_type::lt, make_ref_typed(0, bigint_type), make_bigint_const(15));
+
+  exp_executor executor(*predicate, get_resource_ref(*space));
+
+  auto input      = make_input_batch(*space,
+                                     {cudf::data_type{cudf::type_id::INT32}},
+                                     {std::optional<std::pair<int, int>>{{-10, 30}}});
+  auto input_ro   = input->to_read_only();
+  auto input_view = input_ro.get_data()->cast<gpu_table_representation>().get_table_view();
+
+  auto output = executor.evaluate(input_view);
+  REQUIRE(output != nullptr);
+  REQUIRE(executor.restored_reference_cast_count_for_testing() == 0);
+  REQUIRE(executor.narrow_domain_comparison_count_for_testing() == 1);
+
+  auto const input_values  = copy_column_to_host<int32_t>(input_view.column(0));
+  auto const output_values = copy_bool_column_to_host(output->view().column(0));
+  for (std::size_t i = 0; i < input_values.size(); ++i) {
+    REQUIRE(output_values[i] == ((static_cast<int64_t>(input_values[i]) < 15) ? 1U : 0U));
+  }
+}
+
+TEST_CASE("narrow-domain comparison falls back when the constant does not fit the carrier",
+          "[expression_evaluator][compressed_materialization][narrow_domain]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  // INT16 carrier, BIGINT declared type, constant beyond int16 range: restore path required.
+  auto const bigint_type = logical_type::make(type_id::BIGINT);
+  auto predicate         = make_cmp(
+    sirius::comparison_type::lt, make_ref_typed(0, bigint_type), make_bigint_const(100'000));
+
+  exp_executor executor(*predicate, get_resource_ref(*space));
+
+  std::vector<int16_t> const values{-100, -1, 0, 1, 100, 32'000};
+  auto mr  = get_resource_ref(*space);
+  auto col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT16},
+                                       static_cast<cudf::size_type>(values.size()),
+                                       cudf::mask_state::UNALLOCATED,
+                                       cudf::get_default_stream(),
+                                       mr);
+  cudaMemcpy(col->mutable_view().data<int16_t>(),
+             values.data(),
+             sizeof(int16_t) * values.size(),
+             cudaMemcpyHostToDevice);
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  auto table    = std::make_unique<cudf::table>(std::move(cols));
+  auto gpu_repr = std::make_unique<gpu_table_representation>(
+    std::move(table), *space, cudf::get_default_stream());
+  auto input      = data_batch::make(::sirius::get_next_batch_id(), std::move(gpu_repr));
+  auto input_ro   = input->to_read_only();
+  auto input_view = input_ro.get_data()->cast<gpu_table_representation>().get_table_view();
+
+  auto output = executor.evaluate(input_view);
+  REQUIRE(output != nullptr);
+  REQUIRE(executor.restored_reference_cast_count_for_testing() == 1);
+  REQUIRE(executor.narrow_domain_comparison_count_for_testing() == 0);
+
+  auto const output_values = copy_bool_column_to_host(output->view().column(0));
+  for (auto const value : output_values) {
+    REQUIRE(value == 1U);  // every int16 value is < 100'000
+  }
+}
+
+TEST_CASE("narrow-domain DECIMAL comparison requires a matching scale",
+          "[expression_evaluator][compressed_materialization][narrow_domain]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  auto const decimal_type = logical_type::make_decimal(15, 2);
+  std::vector<int32_t> const raw{100, 2399, 2400, 2401, 90'000};
+
+  auto evaluate_with_constant = [&](std::unique_ptr<ast_node> constant) {
+    auto predicate =
+      make_cmp(sirius::comparison_type::lt, make_ref_typed(0, decimal_type), std::move(constant));
+    exp_executor executor(*predicate, get_resource_ref(*space));
+    auto input      = make_decimal32_batch(*space, /*scale=*/2, raw);
+    auto input_ro   = input->to_read_only();
+    auto input_view = input_ro.get_data()->cast<gpu_table_representation>().get_table_view();
+    auto output     = executor.evaluate(input_view);
+    REQUIRE(output != nullptr);
+    return std::pair{executor.restored_reference_cast_count_for_testing(),
+                     executor.narrow_domain_comparison_count_for_testing()};
+  };
+
+  // Same scale, unscaled value fits the DECIMAL32 carrier: narrow path, no restoration.
+  {
+    auto const [restored, narrow] = evaluate_with_constant(make_dec64_const(2400, 15, 2));
+    REQUIRE(restored == 0);
+    REQUIRE(narrow == 1);
+  }
+  // Different scale: numerically comparable only after restoration — narrow path must decline.
+  {
+    auto const [restored, narrow] = evaluate_with_constant(make_dec64_const(24000, 15, 3));
+    REQUIRE(restored == 1);
+    REQUIRE(narrow == 0);
+  }
+}
+
+TEST_CASE("narrow-domain DECIMAL comparison matches restored results",
+          "[expression_evaluator][compressed_materialization][narrow_domain]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  auto const decimal_type = logical_type::make_decimal(15, 2);
+  std::vector<int32_t> const raw{100, 2399, 2400, 2401, 90'000};
+
+  auto predicate = make_cmp(
+    sirius::comparison_type::lt, make_ref_typed(0, decimal_type), make_dec64_const(2400, 15, 2));
+  exp_executor executor(*predicate, get_resource_ref(*space));
+
+  auto input      = make_decimal32_batch(*space, /*scale=*/2, raw);
+  auto input_ro   = input->to_read_only();
+  auto input_view = input_ro.get_data()->cast<gpu_table_representation>().get_table_view();
+  auto output     = executor.evaluate(input_view);
+  REQUIRE(output != nullptr);
+  REQUIRE(executor.narrow_domain_comparison_count_for_testing() == 1);
+
+  auto const output_values = copy_bool_column_to_host(output->view().column(0));
+  REQUIRE(output_values.size() == raw.size());
+  for (std::size_t i = 0; i < raw.size(); ++i) {
+    REQUIRE(output_values[i] == ((raw[i] < 2400) ? 1U : 0U));
+  }
+}
+
+TEST_CASE("narrow-domain BETWEEN evaluates on the narrowed carrier",
+          "[expression_evaluator][compressed_materialization][narrow_domain]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  auto const bigint_type = logical_type::make(type_id::BIGINT);
+  auto predicate = std::make_unique<ast_node>(sirius::ast::between{make_ref_typed(0, bigint_type),
+                                                                   make_bigint_const(5),
+                                                                   make_bigint_const(20),
+                                                                   /*lower_inclusive=*/true,
+                                                                   /*upper_inclusive=*/false});
+
+  exp_executor executor(*predicate, get_resource_ref(*space));
+
+  auto input      = make_input_batch(*space,
+                                     {cudf::data_type{cudf::type_id::INT32}},
+                                     {std::optional<std::pair<int, int>>{{-10, 30}}});
+  auto input_ro   = input->to_read_only();
+  auto input_view = input_ro.get_data()->cast<gpu_table_representation>().get_table_view();
+
+  auto output = executor.evaluate(input_view);
+  REQUIRE(output != nullptr);
+  REQUIRE(executor.restored_reference_cast_count_for_testing() == 0);
+  REQUIRE(executor.narrow_domain_comparison_count_for_testing() == 1);
+
+  auto const input_values  = copy_column_to_host<int32_t>(input_view.column(0));
+  auto const output_values = copy_bool_column_to_host(output->view().column(0));
+  for (std::size_t i = 0; i < input_values.size(); ++i) {
+    auto const value = static_cast<int64_t>(input_values[i]);
+    REQUIRE(output_values[i] == ((value >= 5 && value < 20) ? 1U : 0U));
+  }
+}
 
 // ---------------------------------------------------------------------------
 // evaluate() — reference, constant, comparison (basic smoke test per type)

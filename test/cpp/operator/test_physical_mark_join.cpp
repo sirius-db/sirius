@@ -48,6 +48,16 @@ struct mark_join_fixture {
   duckdb::unique_ptr<sirius_physical_hash_join> hash_join;
 };
 
+//! Depth-first, root-first numbering of a bare operator tree, standing in for
+//! pipeline::assign_operator_ids in fixtures that never build pipelines.
+void number_operator_tree(sirius::op::sirius_physical_operator& op, size_t& next_id)
+{
+  op.operator_id = next_id++;
+  for (auto& child : op.children) {
+    if (child) { number_operator_tree(*child, next_id); }
+  }
+}
+
 struct nlj_projection_fixture {
   duckdb::unique_ptr<duckdb::LogicalComparisonJoin> logical_join;
   duckdb::unique_ptr<sirius_physical_nested_loop_join> nlj;
@@ -98,6 +108,11 @@ mark_join_fixture create_mark_join()
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),  // delim_types
     1000,
     nullptr);
+
+  // No pipelines exist in this fixture, so the converter's assign_operator_ids never runs.
+  // Number the tree here — operator code reads get_operator_id(), which rejects the sentinel.
+  size_t next_id = 0;
+  number_operator_tree(*f.hash_join, next_id);
 
   return f;
 }
@@ -509,6 +524,54 @@ TEST_CASE("sirius_physical_hash_join mark join - right NULL key on build-on-left
   auto mark = out_view.column(2);
   REQUIRE(mark.null_count() == 2);
   REQUIRE(copy_validity_to_host(mark) == std::vector<bool>{false, true, false, true});
+}
+
+// A MARK join must run in BUILD_PROBE mode, which is mutually exclusive with MIXED_JOIN. A MARK
+// join carrying both an equality and an inequality condition (the shape that would otherwise select
+// MIXED_JOIN) is therefore rejected at construction rather than silently mis-executed. No GPU is
+// needed: the constructor makes the mode decision from the conditions alone.
+TEST_CASE("sirius_physical_hash_join mark join - mixed conditions are unsupported",
+          "[physical_mark_join]")
+{
+  auto logical_join   = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(duckdb::JoinType::MARK);
+  logical_join->types = {
+    duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER, duckdb::LogicalType::BOOLEAN};
+
+  auto left_child = duckdb::make_uniq<sirius_physical_operator>(
+    SiriusPhysicalOperatorType::PROJECTION,
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER,
+                                                                duckdb::LogicalType::INTEGER}),
+    0);
+  auto right_child = duckdb::make_uniq<sirius_physical_operator>(
+    SiriusPhysicalOperatorType::PROJECTION,
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    0);
+
+  // Equality (left.col0 = right.col0) + inequality (left.col1 < right.col0) => mixed shape.
+  duckdb::vector<duckdb::JoinCondition> conditions;
+  duckdb::JoinCondition eq;
+  eq.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
+  eq.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
+  eq.comparison = duckdb::ExpressionType::COMPARE_EQUAL;
+  conditions.push_back(std::move(eq));
+  duckdb::JoinCondition lt;
+  lt.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 1);
+  lt.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
+  lt.comparison = duckdb::ExpressionType::COMPARE_LESSTHAN;
+  conditions.push_back(std::move(lt));
+
+  REQUIRE_THROWS_AS(duckdb::make_uniq<sirius_physical_hash_join>(
+                      *logical_join,
+                      std::move(left_child),
+                      std::move(right_child),
+                      sirius::wrap_join_conditions(std::move(conditions)),
+                      duckdb::JoinType::MARK,
+                      duckdb::vector<duckdb::idx_t>{},
+                      duckdb::vector<duckdb::idx_t>{},
+                      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),
+                      1000,
+                      nullptr),
+                    std::runtime_error);
 }
 
 //===----------------------------------------------------------------------===//

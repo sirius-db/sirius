@@ -349,8 +349,9 @@ TEST_CASE("pin_table - PIN-MGPU-01 host-tier multi-GPU pin", "[pin_mgpu][scan_ma
   // landed.
   for (auto const& chunk : entry.host_chunks) {
     REQUIRE(chunk != nullptr);
-    REQUIRE(chunk->get_host_table() != nullptr);
-    REQUIRE_FALSE(chunk->get_host_table()->columns.empty());
+    auto const& host = chunk->cast<cucascade::host_data_representation>();
+    REQUIRE(host.get_host_table() != nullptr);
+    REQUIRE_FALSE(host.get_host_table()->columns.empty());
   }
 
   // A subsequent SELECT through the cached host-pin should produce the SAME

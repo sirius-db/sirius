@@ -15,7 +15,7 @@
 # Global exclusions, csv are excluded because they are often test answers, and experimental is out of lint scope.
 # .patch files are verbatim diffs: formatters (trailing-whitespace, end-of-file-fixer)
 # strip the leading context space on blank lines and corrupt `git apply`.
-exclude: \.csv$|\.patch$|^legacy/queries/.*|^experimental/.*
+exclude: \.csv$|\.patch$|^legacy/queries/.*|^experimental/.*|^src/include/third_party/.*
 
 repos:
   # Standard hooks
@@ -23,7 +23,8 @@ repos:
     rev: v6.0.0
     hooks:
       - id: check-added-large-files
-        exclude: 'test/cpp/integration/integration\.duckdb'
+        # Vendored TPC-H / TPC-DS test databases live here and are intentionally large.
+        exclude: 'test/cpp/integration/data/duckdb/.*\.duckdb'
       - id: check-case-conflict
       - id: check-json
       - id: check-merge-conflict
@@ -81,6 +82,12 @@ repos:
           [--line-width  220, --disabled-codes=C0307, --suppress-decorations]
   - repo: local
     hooks:
+      - id: rumdl
+        name: rumdl check --fix
+        entry: pixi run --locked rumdl check --fix
+        language: system
+        types: [markdown]
+        require_serial: true
       - id: check-orphan-tests
         name: check for orphaned test files
         entry: python3 scripts/check_orphan_tests.py

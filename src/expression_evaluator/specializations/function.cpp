@@ -96,16 +96,12 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
 
     if (mode == evaluation_mode::AST) {
       //===----------1: AST Mode----------===//
-      return evaluate_result(
-        ast_result(func_expr,
-                   {left.get_temp_scalar_indices(), right.get_temp_scalar_indices()},
-                   {left.get_temp_column_indices(), right.get_temp_column_indices()}));
+      return evaluate_result(compose(func_expr, {&left, &right}));
     }
 
     //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
     auto result_column = evaluate_ast(func_expr);
-    release_temporaries({left.get_temp_scalar_indices(), right.get_temp_scalar_indices()},
-                        {left.get_temp_column_indices(), right.get_temp_column_indices()});
+    release_temporaries({&left, &right});
     return evaluate_result(std::move(result_column));
   }
 
@@ -300,7 +296,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   }
 
   //----------String Concatenation----------//
-  if (resolved_id == function_id::concat) {
+  if (resolved_id == function_id::concat || resolved_id == function_id::concat_operator) {
     // Evaluate every argument to a materialized column or scalar.
     std::vector<evaluate_result> arg_results;
     arg_results.reserve(args.size());
@@ -324,15 +320,18 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
       }
     }
 
-    // SQL concat: any NULL input produces NULL output.  cuDF achieves this with
-    // an invalid (null) narep scalar.
+    // DuckDB's concat() ignores NULL arguments (concat(NULL, 'x') = 'x'), whereas
+    // the || operator propagates NULL ('a' || NULL = NULL). The narep scalar
+    // selects the behaviour: a valid empty string replaces NULLs with "" (ignore),
+    // an invalid narep short-circuits the whole row to NULL (propagate).
+    bool const propagate_nulls = (resolved_id == function_id::concat_operator);
+    cudf::string_scalar narep("", /*is_valid=*/!propagate_nulls, _stream, _mr);
     cudf::table_view concat_table(col_views);
     auto result_column = cudf::strings::concatenate(
       concat_table,
-      cudf::string_scalar("", true, _stream, _mr),   // empty separator between parts
-      cudf::string_scalar("", false, _stream, _mr),  // null narep → null propagation
-      cudf::strings::separator_on_nulls::YES,        // no-op: invalid narep short-circuits before
-                                                     // separator logic runs
+      cudf::string_scalar("", true, _stream, _mr),  // empty separator between parts
+      narep,
+      cudf::strings::separator_on_nulls::NO,
       _stream,
       _mr);
     return evaluate_result(std::move(result_column));
@@ -364,16 +363,15 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
 
     auto const& pattern_str = std::get<std::string>(args[1]->get<sirius::ast::constant>().payload);
     auto const& replace_str = std::get<std::string>(args[2]->get<sirius::ast::constant>().payload);
-    auto regex_prog         = cudf::strings::regex_program::create(std::string_view(pattern_str));
-
     auto const has_backrefs = std::regex_search(replace_str, std::regex(R"(\\[0-9])"));
     if (has_backrefs) {
       if (duckdb::Config::ENABLE_REGEX_JIT_IMPL) {
         if (pattern_str == R"(^https?://(?:www\.)?([^/]+)/.*$)" && replace_str == R"(\1)") {
           return ::sirius::regex::regex_playground::jit_transform_clickbench_q28_regex(
-            input.get_column_view());
+            input.get_column_view(), _stream, _mr);
         }
       }
+      auto regex_prog = cudf::strings::regex_program::create(std::string_view(pattern_str));
       return cudf::strings::replace_with_backrefs(
         cudf::strings_column_view(input.get_column_view()),
         *regex_prog,
@@ -381,6 +379,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
         _stream,
         _mr);
     } else {
+      auto regex_prog = cudf::strings::regex_program::create(std::string_view(pattern_str));
       return cudf::strings::replace_re(cudf::strings_column_view(input.get_column_view()),
                                        *regex_prog,
                                        cudf::string_scalar(replace_str, true, _stream, _mr),

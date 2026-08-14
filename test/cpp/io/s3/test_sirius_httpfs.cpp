@@ -14,18 +14,29 @@
 #include "sirius_extension.hpp"
 #include "utils/s3_container.hpp"
 
+#include <arpa/inet.h>
 #include <duckdb.hpp>
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/common/open_file_info.hpp>
+#include <duckdb/storage/buffer/buffer_handle.hpp>
+#include <duckdb/storage/caching_file_system.hpp>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -114,6 +125,116 @@ std::string thrown_message(Fn&& fn)
   return {};
 }
 
+class head_http_server {
+ public:
+  explicit head_http_server(std::size_t object_size, std::string etag = {})
+    : object_size_(object_size), etag_(std::move(etag))
+  {
+    listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd_ < 0) { throw std::runtime_error("socket failed: " + errno_message()); }
+    int one = 1;
+    if (::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0) {
+      throw std::runtime_error("setsockopt failed: " + errno_message());
+    }
+
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port        = 0;
+    if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+      throw std::runtime_error("bind failed: " + errno_message());
+    }
+    if (::listen(listen_fd_, 4) != 0) {
+      throw std::runtime_error("listen failed: " + errno_message());
+    }
+    socklen_t len = sizeof(addr);
+    if (::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+      throw std::runtime_error("getsockname failed: " + errno_message());
+    }
+    port_   = ntohs(addr.sin_port);
+    thread_ = std::thread([this] { accept_loop(); });
+  }
+
+  ~head_http_server()
+  {
+    stop_.store(true);
+    if (listen_fd_ >= 0) {
+      ::shutdown(listen_fd_, SHUT_RDWR);
+      ::close(listen_fd_);
+    }
+    if (thread_.joinable()) { thread_.join(); }
+  }
+
+  head_http_server(head_http_server const&)            = delete;
+  head_http_server& operator=(head_http_server const&) = delete;
+
+  [[nodiscard]] std::string endpoint() const { return "http://127.0.0.1:" + std::to_string(port_); }
+  [[nodiscard]] std::size_t head_count() const { return head_count_.load(); }
+
+ private:
+  static std::string errno_message() { return std::strerror(errno); }
+
+  static void send_all(int fd, std::string_view response)
+  {
+    std::size_t sent = 0;
+    while (sent < response.size()) {
+      auto const n = ::send(fd, response.data() + sent, response.size() - sent, MSG_NOSIGNAL);
+      if (n <= 0) { return; }
+      sent += static_cast<std::size_t>(n);
+    }
+  }
+
+  void accept_loop()
+  {
+    while (!stop_.load()) {
+      sockaddr_in client{};
+      socklen_t len = sizeof(client);
+      auto const fd = ::accept(listen_fd_, reinterpret_cast<sockaddr*>(&client), &len);
+      if (fd < 0) {
+        if (stop_.load()) { return; }
+        continue;
+      }
+      handle_client(fd);
+      ::close(fd);
+    }
+  }
+
+  void handle_client(int fd)
+  {
+    std::string request(4096, '\0');
+    auto const n = ::recv(fd, request.data(), request.size(), 0);
+    if (n <= 0) { return; }
+    request.resize(static_cast<std::size_t>(n));
+    if (request.rfind("HEAD ", 0) != 0) {
+      send_all(fd,
+               "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: "
+               "close\r\n\r\n");
+      return;
+    }
+
+    head_count_.fetch_add(1);
+    auto response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(object_size_);
+    if (!etag_.empty()) { response += "\r\nETag: " + etag_; }
+    response += "\r\nConnection: close\r\n\r\n";
+    send_all(fd, response);
+  }
+
+  std::size_t object_size_;
+  std::string etag_;
+  int listen_fd_{-1};
+  std::uint16_t port_{0};
+  std::atomic<bool> stop_{false};
+  std::atomic<std::size_t> head_count_{0};
+  std::thread thread_;
+};
+
+std::string read_text_file(fs::path const& path)
+{
+  std::ifstream in(path);
+  if (!in) { throw std::runtime_error("cannot open source file: " + path.string()); }
+  return {std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+}
+
 void load_sirius_extension(duckdb::DuckDB& db)
 {
   try {
@@ -129,7 +250,7 @@ void load_sirius_extension(duckdb::DuckDB& db)
 
 class sirius_httpfs_config_env_guard {
  public:
-  explicit sirius_httpfs_config_env_guard(s3_test_env const& env)
+  explicit sirius_httpfs_config_env_guard(s3_test_env const& env, bool perf_instrumentation = false)
   {
     if (auto* current = std::getenv("SIRIUS_CONFIG_FILE"); current != nullptr) {
       had_original_config_env_ = true;
@@ -164,6 +285,7 @@ class sirius_httpfs_config_env_guard {
            "        block_size: 1 MiB\n"
            "  executor:\n"
            "    scan_manager:\n"
+           "      enable_prefetch_cache: false\n"
            "      object_store:\n"
            "        endpoint: "
         << yaml_quote(env.endpoint)
@@ -181,6 +303,7 @@ class sirius_httpfs_config_env_guard {
            "      rest:\n"
            "        max_connections: 8\n"
            "        request_timeout_s: 30\n";
+    if (perf_instrumentation) { out << "        perf_instrumentation: true\n"; }
     out.close();
     REQUIRE(out);
 
@@ -215,7 +338,8 @@ class sirius_httpfs_config_env_guard {
 
 class sirius_httpfs_fixture {
  public:
-  explicit sirius_httpfs_fixture(s3_test_env const& env) : config_env(env), db(nullptr), con(db)
+  explicit sirius_httpfs_fixture(s3_test_env const& env, bool perf_instrumentation = false)
+    : config_env(env, perf_instrumentation), db(nullptr), con(db)
   {
     load_sirius_extension(db);
     REQUIRE(con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state"));
@@ -290,17 +414,17 @@ class exposed_sirius_httpfs final : public sirius::io::s3::sirius_httpfs {
 
 }  // namespace
 
-TEST_CASE("S3 LIST keys survive the URI embedding escape seam", "[s3][filesystem][glob]")
+TEST_CASE("S3 LIST keys retain literal identity when embedded in object URIs",
+          "[s3][filesystem][glob]")
 {
   for (auto const key : {std::string_view{"a%2Fb.p"},
-                         std::string_view{"x#1.p"},
-                         std::string_view{"y?v.p"},
-                         std::string_view{"100%.p"},
-                         std::string_view{"col=a%20b/p0.p"}}) {
+                         std::string_view{"a%20b.p"},
+                         std::string_view{"a#b.p"},
+                         std::string_view{"a?b.p"},
+                         std::string_view{"100%x.p"}}) {
     DYNAMIC_SECTION("key=" << key)
     {
-      auto const escaped = sirius::io::s3::escape_s3_key_for_uri(key);
-      auto const parsed  = sirius::io::parse("s3://bkt/" + escaped);
+      auto const parsed = sirius::io::parse("s3://bkt/" + std::string{key});
 
       CHECK(parsed.host == "bkt");
       CHECK(parsed.path == key);
@@ -308,14 +432,33 @@ TEST_CASE("S3 LIST keys survive the URI embedding escape seam", "[s3][filesystem
   }
 }
 
-TEST_CASE("S3 LIST key URI escaping preserves ordinary keys byte for byte",
-          "[s3][filesystem][glob]")
+TEST_CASE("S3 object URI parsing preserves ordinary keys byte for byte", "[s3][filesystem][glob]")
 {
   for (auto const key : {std::string_view{"plain.parquet"},
                          std::string_view{"year=2026/part 0.parquet"},
                          std::string_view{"nested/path/file.parquet"}}) {
-    DYNAMIC_SECTION("key=" << key) { CHECK(sirius::io::s3::escape_s3_key_for_uri(key) == key); }
+    DYNAMIC_SECTION("key=" << key)
+    {
+      CHECK(sirius::io::parse("s3://bkt/" + std::string{key}).path == key);
+    }
   }
+}
+
+TEST_CASE("S3 literal-key implementation contains no retired URI escape or percent guard",
+          "[s3][filesystem][glob]")
+{
+  auto const root   = fs::path{SIRIUS_PROJECT_ROOT};
+  auto const source = read_text_file(root / "src" / "io" / "s3" / "sirius_httpfs.cpp");
+  auto const header = read_text_file(root / "src" / "include" / "io" / "s3" / "sirius_httpfs.hpp");
+  auto const implementation = source + header;
+
+  auto const retired_escape  = std::string{"escape_s3_key_"} + "for_uri";
+  auto const retired_guard   = std::string{"key_has_percent_encoded_"} + "sequence";
+  auto const retired_wording = std::string{"containing a percent-"} + "encoded sequence";
+
+  CHECK(implementation.find(retired_escape) == std::string::npos);
+  CHECK(implementation.find(retired_guard) == std::string::npos);
+  CHECK(implementation.find(retired_wording) == std::string::npos);
 }
 
 TEST_CASE("sirius_httpfs claims only valid S3 object paths", "[s3][filesystem]")
@@ -441,6 +584,116 @@ TEST_CASE("sirius_httpfs positional reads fail on short reads and negative sizes
 
   std::vector<std::uint8_t> whole_object(static_cast<std::size_t>(size));
   CHECK_THROWS_AS(fs.Read(*handle, whole_object.data(), -1, 0), duckdb::IOException);
+}
+
+TEST_CASE("sirius_httpfs exposes S3 ETags as DuckDB version tags",
+          "[.][s3][integration][filesystem][efc]")
+{
+  SECTION("plain and glob opens preserve the quoted MinIO ETag")
+  {
+    auto env = read_s3_test_env();
+    if (skip_if_no_s3_env(env)) { return; }
+
+    sirius_httpfs_fixture fixture(*env);
+    set_gpu_execution(fixture.con, true);
+    auto& fs       = duckdb::FileSystem::GetFileSystem(*fixture.con.context);
+    auto const uri = s3_uri(env->bucket, "parquet/nation.parquet");
+
+    auto plain = fs.OpenFile(uri, duckdb::FileFlags::FILE_FLAGS_READ);
+    REQUIRE(plain != nullptr);
+    auto const plain_tag = plain->file_system.GetVersionTag(*plain);
+    REQUIRE(plain_tag.size() >= 2);
+    CHECK(plain_tag.front() == '"');
+    CHECK(plain_tag.back() == '"');
+
+    auto matches = fs.Glob(s3_uri(env->bucket, "parquet/nation*.parquet"));
+    REQUIRE(matches.size() == 1);
+    REQUIRE(matches[0].extended_info != nullptr);
+    auto glob = fs.OpenFile(matches[0], duckdb::FileFlags::FILE_FLAGS_READ);
+    REQUIRE(glob != nullptr);
+    auto const glob_tag = glob->file_system.GetVersionTag(*glob);
+    REQUIRE(glob_tag.size() >= 2);
+    CHECK(glob_tag.front() == '"');
+    CHECK(glob_tag.back() == '"');
+    CHECK(glob_tag == plain_tag);
+  }
+
+  SECTION("an ETag-free backend keeps the version tag empty")
+  {
+    head_http_server server(4096);
+    s3_test_env env{server.endpoint(), "us-east-1", "access", "secret", "bucket"};
+    sirius_httpfs_fixture fixture(env);
+    set_gpu_execution(fixture.con, true);
+    auto& fs = duckdb::FileSystem::GetFileSystem(*fixture.con.context);
+
+    auto handle = fs.OpenFile("s3://bucket/no-etag.bin", duckdb::FileFlags::FILE_FLAGS_READ);
+
+    REQUIRE(handle != nullptr);
+    CHECK(handle->GetFileSize() == 4096);
+    CHECK(handle->file_system.GetVersionTag(*handle).empty());
+    CHECK(server.head_count() == 1);
+  }
+}
+
+TEST_CASE("DuckDB external file cache invalidates an overwritten S3 range by ETag",
+          "[.][s3][integration][filesystem][efc]")
+{
+  auto env = read_s3_test_env();
+  if (skip_if_no_s3_env(env)) { return; }
+
+  constexpr std::size_t object_size = 4096;
+  constexpr std::size_t read_offset = 128;
+  constexpr std::size_t read_size   = 512;
+  std::vector<std::uint8_t> first(object_size);
+  std::vector<std::uint8_t> second(object_size);
+  for (std::size_t i = 0; i < object_size; ++i) {
+    first[i]  = static_cast<std::uint8_t>((i * 17U + 3U) & 0xffU);
+    second[i] = static_cast<std::uint8_t>((i * 29U + 11U) & 0xffU);
+  }
+
+  std::string const key = "efc/overwrite-invalidation.bin";
+  if (!sirius::test::put_s3_container_object(key, first)) {
+    SUCCEED("managed MinIO is required for the overwrite invalidation test");
+    return;
+  }
+
+  sirius_httpfs_fixture fixture(*env, /*perf_instrumentation=*/true);
+  set_gpu_execution(fixture.con, true);
+  require_query_ok(fixture.con, "SET enable_external_file_cache = true");
+  auto const uri = s3_uri(env->bucket, key);
+
+  auto routed_datasource = require_rest_datasource(fixture, uri);
+  auto* rest = dynamic_cast<sirius::io::rest::rest_ioctx*>(routed_datasource->io_ctx().get());
+  REQUIRE(rest != nullptr);
+
+  auto caching_fs        = duckdb::CachingFileSystem::Get(*fixture.con.context);
+  auto read_cached_range = [&] {
+    auto handle =
+      caching_fs.OpenFile(duckdb::OpenFileInfo{uri}, duckdb::FileFlags::FILE_FLAGS_READ);
+    duckdb::data_ptr_t data = nullptr;
+    auto pin                = handle->Read(data, read_size, read_offset);
+    REQUIRE(data != nullptr);
+    return std::vector<std::uint8_t>(data, data + read_size);
+  };
+
+  auto first_read = read_cached_range();
+  CHECK(std::equal(first_read.begin(), first_read.end(), first.begin() + read_offset));
+
+  auto cache_rows = require_query_ok(
+    fixture.con,
+    "SELECT count(*) FROM duckdb_external_file_cache() WHERE path = " + sql_quote(uri) +
+      " AND loaded AND location <= " + std::to_string(read_offset) +
+      " AND location + nr_bytes >= " + std::to_string(read_offset + read_size));
+  REQUIRE(cache_rows->RowCount() == 1);
+  CHECK(cache_rows->GetValue(0, 0).GetValue<std::int64_t>() >= 1);
+
+  REQUIRE(sirius::test::put_s3_container_object(key, second));
+  auto const before_second = rest->perf_snapshot();
+  auto second_read         = read_cached_range();
+  auto const after_second  = rest->perf_snapshot();
+
+  CHECK(after_second.chunk_get_count > before_second.chunk_get_count);
+  CHECK(std::equal(second_read.begin(), second_read.end(), second.begin() + read_offset));
 }
 
 TEST_CASE("transparent read_parquet over S3 routes through Sirius without httpfs",

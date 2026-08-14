@@ -5,16 +5,16 @@ edition.workspace = true
 
 [dependencies]
 instrumentation-model = { path = "../model" }
-quent-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "5ec56ccb4163810ad42aa0a57559f4d20ddc3aee" }
-quent-simulator-ui = { git = "https://github.com/rapidsai/quent.git", rev = "5ec56ccb4163810ad42aa0a57559f4d20ddc3aee" }
-quent-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "5ec56ccb4163810ad42aa0a57559f4d20ddc3aee" }
-quent-events = { git = "https://github.com/rapidsai/quent.git", rev = "5ec56ccb4163810ad42aa0a57559f4d20ddc3aee" }
-quent-model = { git = "https://github.com/rapidsai/quent.git", rev = "5ec56ccb4163810ad42aa0a57559f4d20ddc3aee" }
-quent-query-engine-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "5ec56ccb4163810ad42aa0a57559f4d20ddc3aee" }
-quent-query-engine-model = { git = "https://github.com/rapidsai/quent.git", rev = "5ec56ccb4163810ad42aa0a57559f4d20ddc3aee" }
-quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "5ec56ccb4163810ad42aa0a57559f4d20ddc3aee" }
-quent-time = { git = "https://github.com/rapidsai/quent.git", rev = "5ec56ccb4163810ad42aa0a57559f4d20ddc3aee" }
-quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "5ec56ccb4163810ad42aa0a57559f4d20ddc3aee" }
+quent-dynamic-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
+quent-simulator-ui = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
+quent-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
+quent-events = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
+quent-model = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
+quent-query-engine-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
+quent-query-engine-model = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
+quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
+quent-time = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
+quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
 rustc-hash = "2"
 tracing = "0.1"
 uuid = { version = "1", features = ["serde"] }

@@ -21,14 +21,22 @@
 #include <op/sirius_physical_operator.hpp>
 #include <op/sirius_physical_operator_type.hpp>
 
+// cudf
+#include <cudf/types.hpp>
+
 // standard library
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace sirius::scan_manager {
 class split_connector;
 class sirius_scan_manager;
 }  // namespace sirius::scan_manager
+
+namespace duckdb {
+class SiriusContext;
+}  // namespace duckdb
 
 namespace sirius::op::scan {
 
@@ -46,36 +54,35 @@ namespace sirius::op::scan {
  * downstream pipeline.
  *
  * Lifecycle:
- *   1. Pipeline converter constructs the operator with the per-table
- *      @c ingestible_table_info (parquet or duckdb-native today).
- *   2. @c sirius_scan_manager::prepare_for_query peeks the table_info to
- *      match pinned-cache entries. On match: builds the cached ingestible
- *      from the stolen table_info. On miss: calls
- *      @c make_gpu_ingestible(take_table_info(), mgr, gpu_ioctxs).
- *      Either way, scan_manager calls @ref install_ingestible to hand
- *      the operator its source.
- *   3. The scan_manager also installs a fresh @c split_connector and
- *      drives a @c scan_manager::split_provider that composes the same
- *      ingestible — the provider populates the connector with splits
- *      that the operator pulls via @ref get_next_task_input_data.
- *   4. @ref execute dispatches each split through the installed
- *      ingestible's @c materialize_table and (conditionally)
- *      @c post_filter_and_project.
+ * 1. The plan generator creates the ingestible and the scan operator.
+ * 2. prepare_for_query checks whether a pinned entry can serve the scan.
+ * 3. A cache miss uses split_provider. A cache hit uses cached_databatch_provider.
+ * 4. Both providers send inputs through the operator's split connector.
+ * 5. execute() runs each split through materialize_table, then
+ *    post_filter_and_project unless the result is already
+ *    row-filtered and projected.
+ *
+ * The operator retains the ingestible created by the plan generator.
  */
 class sirius_gpu_scan_operator : public sirius_physical_operator {
  public:
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::GPU_SCAN;
 
-  /**gp
+  /**
+   * @brief Constructs a GPU scan source
+   *
+   * @throw sirius::internal_exception if an output type has no native cuDF carrier
+   *
    * @param types                  Output column types in plan order.
    * @param estimated_cardinality  Planner-estimated row count.
-   * @param table_info             Per-table bind data; consumed by
-   *                               @c sirius_scan_manager during
-   *                               @c prepare_for_query.
+   * @param ingestible             Per-table source built by the plan generator.
+   * @param compressed_materialization_observer  Plan-time counter sink for
+   *                               narrowing observability; may be null.
    */
   sirius_gpu_scan_operator(duckdb::vector<sirius::logical_type> types,
                            duckdb::idx_t estimated_cardinality,
-                           std::shared_ptr<gpu_ingestible> ingestible);
+                           std::shared_ptr<gpu_ingestible> ingestible,
+                           duckdb::SiriusContext* compressed_materialization_observer = nullptr);
 
   ~sirius_gpu_scan_operator() override;
 
@@ -94,17 +101,14 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   /**
    * @brief Produce a data batch for one split.
    *
-   * Two input shapes are supported:
-   *   - @c scan_operator_input — fresh read; calls
-   *     @c gpu_ingestible::materialize_table and (when filter info is
-   *     present) @c gpu_ingestible::post_filter_and_project.
-   *   - @c scan_operator_with_pinned_table_input — pinned-cache hit;
-   *     forwards the batch when no filter info is set, otherwise calls
-   *     @c gpu_ingestible::post_filter_and_project on the cached view.
+   * The input is a @c scan_operator_input holding either scan metadata
+   * (fresh read) or a resident batch (pinned-cache hit). Both go through
+   * @c gpu_ingestible::materialize_table; @c post_filter_and_project runs
+   * afterwards unless materialize returned
+   * @c filter_state::ROW_FILTERED_AND_PROJECTED.
    *
-   * Throws when the input is neither type (programmer error: the only
-   * operator_data types pushed into the operator's connector are the two
-   * above).
+   * Throws on any other operator_data type (programmer error: the connector
+   * carries only @c scan_operator_input).
    */
   std::unique_ptr<op::operator_data> execute(const op::operator_data& input_data,
                                              rmm::cuda_stream_view stream) override;
@@ -113,21 +117,51 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
     const op::input_stats& stats) const override;
 
   /**
-   * @brief Const accessor for the parked table_info. Used by
-   *        @c sirius_scan_manager::try_make_cached_ingestible to match
-   *        the operator's file paths against pinned entries.
+   * @brief Estimate the peak required by a resident scan carrier conversion.
    *
-   * @pre @c take_table_info has not been called yet.
+   * The conversion destination coexists with the resident split's working set. Uses the exact
+   * destination size when the scan manager supplied one, otherwise the conservative maximum
+   * numeric-carrier expansion.
+   *
+   * @pre @p stats describes a resident scan input with @c needs_carrier_conversion set.
    */
-  [[nodiscard]] const ingestible_table_info& peek_table_info() const;
+  [[nodiscard]] static std::size_t resident_carrier_conversion_peak_memory_estimate(
+    const op::input_stats& stats) noexcept;
+
+  /**
+   * @brief Returns the complete carrier schema used to normalize scan output
+   *
+   * Selects the explicit physical schema when present and the native cuDF schema otherwise.
+   * `execute()` uses these targets when normalization is required, while
+   * `sirius_scan_manager::prepare_for_query()` uses them to account for resident conversions.
+   *
+   * @return One carrier target per logical output column, in output order
+   */
+  [[nodiscard]] std::vector<cudf::data_type> const& normalization_targets() const noexcept
+  {
+    return has_physical_overrides() ? get_physical_types() : _native_physical_types;
+  }
 
   [[nodiscard]] gpu_ingestible& get_ingestible() const;
 
   scan_manager::split_connector& get_split_connector();
 
+  /// Shared handle to the connector, for components (e.g. the memory
+  /// prefetcher) that must outlive-safely reference it from a background
+  /// thread.
+  [[nodiscard]] std::shared_ptr<scan_manager::split_connector> get_shared_split_connector() const
+  {
+    return _split_connector;
+  }
+
  private:
   std::shared_ptr<gpu_ingestible> _ingestible;
   std::shared_ptr<scan_manager::split_connector> _split_connector;
+  /// Non-owning observer. The registered-state shared_ptr owns the context for
+  /// at least as long as the query plan; unit-test operators may leave it null.
+  duckdb::SiriusContext* _compressed_materialization_observer;
+  /// Native cuDF carrier for each logical output column, in output order.
+  std::vector<cudf::data_type> _native_physical_types;
 };
 
 }  // namespace sirius::op::scan

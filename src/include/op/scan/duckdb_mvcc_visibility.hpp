@@ -88,9 +88,10 @@ struct mvcc_visibility_plan {
  *
  * Throws std::runtime_error on invariants validated at pin time
  * (validate_duckdb_pin_chunk): start_time < v_base (a re-pin raced
- * plan->prepare), non-contiguous or short row-group coverage, a chunk
- * boundary off a row-group start, or a slice offset not 32-row aligned (the
- * lock-free bit fill requires task ranges to never share a mask word).
+ * plan->prepare), non-contiguous or short row-group coverage, or a chunk
+ * boundary off a row-group start. Slice offsets may be unaligned
+ * (checkpoint-grown tables have row groups of arbitrary sizes); the mask job
+ * fills such chunks through a single task.
  */
 mvcc_visibility_plan capture_mvcc_visibility_plan(
   duckdb::DataTable& storage,
@@ -100,14 +101,14 @@ mvcc_visibility_plan capture_mvcc_visibility_plan(
 /**
  * @brief Fill the keep-mask bits for @p slices (all belonging to ONE chunk).
  *
- * Worker-safe with plain stores: concurrent calls over disjoint slice lists
- * write disjoint words (slice offsets are 32-row aligned, asserted at
- * capture). Writes exactly bits [chunk_offset, chunk_offset + row_count) per
- * slice, 1 = keep; a slice without version state bulk-sets ones with no MVCC
- * calls or locks, otherwise each 2048-row vector goes through
- * RowGroup::GetSelVector. Whole-word writes never collide with a later
- * writer (a partial vector ends its slice; a partial slice ends the table),
- * and padding bits past the covered range are don't-care.
+ * Worker-safe with plain stores as long as concurrent callers never share a
+ * mask word: the mask job slices parallel tasks only on word-aligned slice
+ * offsets and fills unaligned chunks through a single task. Writes exactly
+ * bits [chunk_offset, chunk_offset + row_count) per slice, 1 = keep;
+ * read-modify-write at word edges preserves neighbouring slices' bits (the
+ * words start zeroed). A slice without version state bulk-sets ones with no
+ * MVCC calls or locks; otherwise each 2048-row vector goes through
+ * RowGroup::GetSelVector.
  *
  * @return true when any row in the covered range was dropped.
  */
@@ -127,6 +128,19 @@ bool fill_keep_mask_for_row_groups(std::span<mvcc_row_group_slice const> slices,
 bool any_update_chains(duckdb::DataTable& storage,
                        std::span<duckdb::storage_t const> storage_column_indices,
                        std::size_t row_prefix);
+
+/**
+ * True when any row group carries TRANSIENT (in-memory, uncheckpointed)
+ * segments on any of @p storage_column_indices.
+ *
+ * Small committed appends land as transient segments the pin's disk-image
+ * walk cannot stage, so pin_table refuses such tables; CHECKPOINT folds them
+ * into the persistent image. Bulk-flushed appends (MergeStorage after a
+ * row-group-sized insert) are persistent and checkpoint-shaped, so they are
+ * not detected here. SERIAL — may lazily load column data.
+ */
+bool any_uncheckpointed_appends(duckdb::DataTable& storage,
+                                std::span<duckdb::storage_t const> storage_column_indices);
 
 /// Whether the MVCC-blind disk-native read of a table is exact for a given
 /// snapshot, and if not, why.

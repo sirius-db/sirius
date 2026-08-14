@@ -22,6 +22,7 @@
 #include <concepts>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -96,7 +97,8 @@ inline std::uint64_t parse_bytes(std::string_view sv)
   if (pos == 0) { throw std::runtime_error("invalid byte value: '" + std::string(sv) + "'"); }
 
   double number = std::stod(std::string(sv.substr(0, pos)));
-  auto suffix   = sv.substr(pos);
+  if (number < 0) { throw std::runtime_error("byte value must be non-negative"); }
+  auto suffix = sv.substr(pos);
 
   // Strip leading whitespace from suffix
   while (!suffix.empty() && suffix[0] == ' ') {
@@ -224,14 +226,21 @@ bytes_value<T> bytes(T& v)
 template <std::integral T>
 void read_yaml(const YAML::Node& node, bytes_value<T>& out)
 {
+  T val{};
   try {
-    if constexpr (sizeof(T) > 4)
-      out.ref = static_cast<T>(node.as<long long>());
-    else
-      out.ref = static_cast<T>(node.as<int>());
+    if constexpr (sizeof(T) > 4) {
+      auto const parsed = node.as<long long>();
+      if (parsed < 0) { throw std::runtime_error("byte value must be non-negative"); }
+      val = static_cast<T>(parsed);
+    } else {
+      auto const parsed = node.as<int>();
+      if (parsed < 0) { throw std::runtime_error("byte value must be non-negative"); }
+      val = static_cast<T>(parsed);
+    }
   } catch (const YAML::BadConversion&) {
-    out.ref = static_cast<T>(parse_bytes(node.as<std::string>()));
+    val = static_cast<T>(parse_bytes(node.as<std::string>()));
   }
+  out.ref = val;
 }
 
 /// Wrapper for optional byte values.
@@ -251,10 +260,15 @@ void read_yaml(const YAML::Node& node, optional_bytes_value<T>& out)
 {
   T val{};
   try {
-    if constexpr (sizeof(T) > 4)
-      val = static_cast<T>(node.as<long long>());
-    else
-      val = static_cast<T>(node.as<int>());
+    if constexpr (sizeof(T) > 4) {
+      auto const parsed = node.as<long long>();
+      if (parsed < 0) { throw std::runtime_error("byte value must be non-negative"); }
+      val = static_cast<T>(parsed);
+    } else {
+      auto const parsed = node.as<int>();
+      if (parsed < 0) { throw std::runtime_error("byte value must be non-negative"); }
+      val = static_cast<T>(parsed);
+    }
   } catch (const YAML::BadConversion&) {
     val = static_cast<T>(parse_bytes(node.as<std::string>()));
   }
@@ -401,7 +415,21 @@ class reader {
   }
 
   /// Check whether a key exists in the map.
-  [[nodiscard]] bool has(const std::string& key) const { return find(key).IsDefined(); }
+  [[nodiscard]] bool has(const std::string& key) const
+  {
+    if (!node_.IsMap()) return false;
+    for (auto it = node_.begin(); it != node_.end(); ++it) {
+      if (it->first.as<std::string>() == key) return true;
+    }
+    return false;
+  }
+
+  /// Check whether a key exists in the map and has a non-null value.
+  [[nodiscard]] bool has_value(const std::string& key) const
+  {
+    auto child = find(key);
+    return child.IsDefined() && !child.IsNull();
+  }
 
   /// Throw if the map contains keys that were not consumed by optional/required calls.
   void reject_unknown() const

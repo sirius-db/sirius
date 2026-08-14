@@ -133,7 +133,7 @@ SET expression_evaluator_strategy = 'ast_jit';   -- or 'ast_interpret', 'materia
 
 ### String concatenation
 
-String concatenation — both the `||` operator (`col || ' suffix'`) and the `concat(a, b, …)` function — resolves to `function_id::concat` (DuckDB lowers `||` to a function named `"||"`, which maps to the same id as `"concat"`). It is dispatched as a materialize-only function in `src/expression_evaluator/specializations/function.cpp`: every argument is materialized, any scalar argument is broadcast to a full-length column via `cudf::make_column_from_scalar`, and the columns are joined with `cudf::strings::concatenate` using an empty separator. The narep scalar is invalid (null), giving standard SQL null propagation — any NULL input produces a NULL output.
+String concatenation covers the `concat(a, b, …)` function and the `||` operator, which have **different** NULL semantics and therefore resolve to **distinct** ids: `concat()` ignores NULL arguments (`concat(NULL, 'x') = 'x'`) and maps to `function_id::concat`; the `||` operator propagates NULL (`'a' || NULL = NULL`) and maps to `function_id::concat_operator` (DuckDB lowers `||` to a function named `"||"`). Both are dispatched as a materialize-only function in `src/expression_evaluator/specializations/function.cpp`: every argument is materialized, any scalar argument is broadcast to a full-length column via `cudf::make_column_from_scalar`, and the columns are joined with `cudf::strings::concatenate` using an empty separator. The two semantics are selected by the narep scalar: a valid empty string for `concat()` (NULL → `""`, ignored) and an invalid narep for `||` (NULL → NULL, propagated).
 
 Per-expression-type dispatch lives in `src/expression_evaluator/specializations/` (one file per Sirius AST alternative: `comparison.cpp`, `case.cpp`, etc.). Each specialization decides how to emit cuDF AST nodes, materialize, or fall back based on the effective evaluation mode.
 
@@ -190,7 +190,7 @@ The translator provides specialized methods for join conditions:
 - `translate_join_condition(condition)` — translates a single equality or inequality condition
 - `translate_join_conditions(conditions, start, end, swap_sides)` — combines multiple conditions with AND, optionally swapping LEFT/RIGHT table references for RIGHT/OUTER joins
 
-This is used by `sirius_physical_hash_join` in MIXED_JOIN mode to pass inequality conditions to `cudf::mixed_join()` as a cuDF AST expression.
+This is used by `sirius_physical_hash_join` in MIXED_JOIN mode to pass the conditional predicates — inequality conditions, and null-safe `IS NOT DISTINCT FROM` keys (emitted as `NULL_EQUAL`) that were mixed with a plain `=` — to `cudf::mixed_join()` as a cuDF AST expression.
 
 ## Key Files
 

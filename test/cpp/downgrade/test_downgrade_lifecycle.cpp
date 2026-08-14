@@ -17,6 +17,7 @@
 #include "catch.hpp"
 
 // sirius
+#include "data/data_repository_manager_registry.hpp"
 #include "downgrade/downgrade_executor.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 
@@ -53,6 +54,10 @@ namespace {
 
 const auto GPU_SPACE_ID = cucascade::memory::memory_space_id(cucascade::memory::Tier::GPU, 0);
 
+// These tests exercise a single query's repositories; the executor sweeps the registry,
+// so each test registers its manager under one fixed query id.
+const sirius::query_id_t kTestQueryId = sirius::make_query_id(1);
+
 /// Helper: get the tier of a data_batch using a temporary read-only lock.
 inline cucascade::memory::Tier get_batch_tier(cucascade::data_batch& batch)
 {
@@ -72,9 +77,9 @@ std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> make_test_mem
   builder.set_number_of_gpus(1)
     .set_gpu_usage_limit(gpu_capacity)
     .set_reservation_fraction_per_gpu(limit_ratio)
-    .set_per_host_capacity(host_capacity)
-    .use_host_per_gpu()
-    .set_reservation_fraction_per_host(limit_ratio);
+    .set_per_numa_region_capacity(host_capacity)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(limit_ratio);
 
   auto space_configs = builder.build();
   auto manager =
@@ -109,7 +114,7 @@ std::shared_ptr<cucascade::data_batch> make_gpu_batch(cucascade::memory::memory_
     std::move(table), gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
 }
 
-downgrade_executor make_test_executor(cucascade::shared_data_repository_manager& repo_mgr,
+downgrade_executor make_test_executor(sirius::data::data_repository_manager_registry& repo_registry,
                                       cucascade::memory::memory_space* gpu_space,
                                       sirius::memory::sirius_memory_reservation_manager& mem_mgr,
                                       std::chrono::milliseconds monitor_period = {})
@@ -117,7 +122,7 @@ downgrade_executor make_test_executor(cucascade::shared_data_repository_manager&
   sirius::exec::downgrade_executor_config config{
     .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade"},
     .monitor_period = monitor_period};
-  return downgrade_executor(config, repo_mgr, GPU_SPACE_ID, gpu_space, mem_mgr);
+  return downgrade_executor(config, repo_registry, GPU_SPACE_ID, gpu_space, mem_mgr);
 }
 
 }  // namespace
@@ -130,10 +135,11 @@ TEST_CASE("start_stop_cycle", "[downgrade_lifecycle]")
 {
   auto mem_mgr    = make_test_memory_manager();
   auto* gpu_space = get_gpu_space(*mem_mgr);
-  cucascade::shared_data_repository_manager repo_mgr;
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
 
   // nullptr memory_space -- monitor loop won't trigger
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
 
   // First start/stop cycle
   REQUIRE_NOTHROW(executor.start());
@@ -159,7 +165,8 @@ TEST_CASE("drain_clears_pending_requests", "[downgrade_lifecycle]")
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
-  cucascade::shared_data_repository_manager repo_mgr;
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
 
   // Create a repo with some batches and register with manager
   auto repo   = std::make_unique<cucascade::shared_data_repository>();
@@ -171,7 +178,7 @@ TEST_CASE("drain_clears_pending_requests", "[downgrade_lifecycle]")
   repo->add_data_batch(batch3);
   repo_mgr.add_new_repository(1, "out", std::move(repo));
 
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   // Request downgrade of all GPU data
@@ -216,7 +223,8 @@ TEST_CASE("drain_releases_batch_references", "[downgrade_lifecycle]")
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
-  cucascade::shared_data_repository_manager repo_mgr;
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
 
   // Create a repo with GPU data and register with manager
   auto repo  = std::make_unique<cucascade::shared_data_repository>();
@@ -226,7 +234,7 @@ TEST_CASE("drain_releases_batch_references", "[downgrade_lifecycle]")
 
   REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::GPU);
 
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   // Record the use_count before scheduling -- the test holds a reference
@@ -261,7 +269,8 @@ TEST_CASE("monitor_loop_triggers_downgrade", "[downgrade_lifecycle]")
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
-  cucascade::shared_data_repository_manager repo_mgr;
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
 
   // Create a repo with GPU data and register it with the manager
   auto repo   = std::make_unique<cucascade::shared_data_repository>();
@@ -279,7 +288,7 @@ TEST_CASE("monitor_loop_triggers_downgrade", "[downgrade_lifecycle]")
 
   // Start executor with monitor enabled (non-zero period)
   auto executor = make_test_executor(
-    repo_mgr, gpu_space, *mem_mgr, /*monitor_period=*/std::chrono::milliseconds{10});
+    repo_registry, gpu_space, *mem_mgr, /*monitor_period=*/std::chrono::milliseconds{10});
   executor.start();
 
   // Wait up to 2s for the monitor to detect pressure and trigger downgrade.
@@ -321,9 +330,10 @@ TEST_CASE("concurrent_api_safety", "[downgrade_lifecycle]")
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
-  cucascade::shared_data_repository_manager repo_mgr;
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
 
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   // Launch 4 threads, each requesting memory reclamation concurrently.
@@ -389,9 +399,10 @@ TEST_CASE("stop_cancels_pending_requests", "[downgrade_lifecycle]")
 {
   auto mem_mgr    = make_test_memory_manager();
   auto* gpu_space = get_gpu_space(*mem_mgr);
-  cucascade::shared_data_repository_manager repo_mgr;
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
 
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   // Enqueue several requests then immediately stop.
@@ -421,9 +432,10 @@ TEST_CASE("drain_cancels_pending_requests_with_exception", "[downgrade_lifecycle
 {
   auto mem_mgr    = make_test_memory_manager();
   auto* gpu_space = get_gpu_space(*mem_mgr);
-  cucascade::shared_data_repository_manager repo_mgr;
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
 
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   std::vector<std::future<size_t>> futures;
@@ -456,9 +468,10 @@ TEST_CASE("cuda_stream_lifecycle", "[downgrade_lifecycle]")
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
-  cucascade::shared_data_repository_manager repo_mgr;
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
 
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
 
   // First start -- stream should be created
   executor.start();

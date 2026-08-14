@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "memory/topology_index.hpp"
+
 #include <cuda/memory_resource>
 #include <cuda/stream_ref>
 #include <cuda_runtime_api.h>
@@ -40,7 +42,8 @@ namespace sirius::memory {
 ///
 /// This wrapper owns one @c small_pinned_host_memory_resource per NUMA
 /// node and dispatches each allocate/deallocate by reading
-/// @c cudaGetDevice() and looking it up in a device-id -> NUMA node map.
+/// @c cudaGetDevice() and resolving its NUMA node through the shared
+/// @c topology_index (the single source of truth for GPU<->NUMA mapping).
 /// A small ptr -> NUMA-node table is kept under a mutex so that
 /// @c deallocate can return blocks to the originating per-node pool when
 /// @c cudaGetDevice() at free-time disagrees with @c cudaGetDevice() at
@@ -54,18 +57,21 @@ namespace sirius::memory {
 class numa_small_pinned_mr {
  public:
   /// @brief Build the dispatcher.
-  /// @param per_node_pools   slab MRs keyed by NUMA node id (normalized; -1 -> 0)
-  /// @param device_to_numa   map from CUDA device id to normalized NUMA node id
-  /// @param fallback_node    NUMA node used when @c cudaGetDevice() returns a
-  ///                         device not present in @c device_to_numa (e.g.
-  ///                         host-only threads). Must be present in @c per_node_pools.
+  /// @param per_node_pools   slab MRs keyed by NUMA node id (verbatim from the
+  ///                         host memory-space device ids; -1 is the "unknown"
+  ///                         sentinel, matching @c topology_index).
+  /// @param topology         shared GPU<->NUMA index used to resolve the current
+  ///                         CUDA device's NUMA node at allocate/deallocate time.
+  /// @param fallback_node    NUMA node used when the current device's NUMA node
+  ///                         has no matching pool (e.g. host-only threads). Must
+  ///                         be present in @c per_node_pools.
   numa_small_pinned_mr(
     std::unordered_map<int, std::unique_ptr<cucascade::memory::small_pinned_host_memory_resource>>
       per_node_pools,
-    std::unordered_map<int, int> device_to_numa,
+    std::shared_ptr<const topology_index> topology,
     int fallback_node)
     : pools_(std::move(per_node_pools)),
-      device_to_numa_(std::move(device_to_numa)),
+      topology_(std::move(topology)),
       fallback_node_(fallback_node)
   {
   }
@@ -133,8 +139,10 @@ class numa_small_pinned_mr {
   {
     int dev = -1;
     cudaGetDevice(&dev);  // best-effort; failures imply we should use fallback
-    if (auto it = device_to_numa_.find(dev); it != device_to_numa_.end()) { return it->second; }
-    return fallback_node_;
+    // numa_node_of() returns -1 for a device outside the index, which is also a
+    // legitimate pool key on single-NUMA hosts; pool_for_current_device() and
+    // deallocate() fall back when the resolved node has no matching pool.
+    return topology_ ? topology_->numa_node_of(dev) : fallback_node_;
   }
 
   cucascade::memory::small_pinned_host_memory_resource& pool_for_current_device()
@@ -147,7 +155,7 @@ class numa_small_pinned_mr {
 
   std::unordered_map<int, std::unique_ptr<cucascade::memory::small_pinned_host_memory_resource>>
     pools_;
-  std::unordered_map<int, int> device_to_numa_;
+  std::shared_ptr<const topology_index> topology_;
   int fallback_node_;
   // Allocate-time -> deallocate-time NUMA-node lookup. The cuDF pinned MR
   // is shared across worker threads that may be bound to different GPUs;

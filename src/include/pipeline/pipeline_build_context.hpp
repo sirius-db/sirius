@@ -17,7 +17,9 @@
 #pragma once
 
 #include <memory>
+#include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace sirius {
 
@@ -38,7 +40,8 @@ class pipeline_build_context {
   //!        probes.
   //! @param preserve_insertion_order Whether query results must preserve
   //!        insertion order (from DuckDB's PreserveInsertionOrderSetting).
-  //! @param num_gpus Number of GPUs available for partition-floor heuristics.
+  //! @param num_gpus Number of GPUs available for partition-floor heuristics when constructing a
+  //!        context without an engine (primarily unit tests).
   //!        Enables sirius_pipeline_converter::configure_partition_min_partitions
   //!        to ensure big partition-consuming operators (hash_join,
   //!        merge_group_by) get at least num_gpus partitions to spread work.
@@ -52,9 +55,31 @@ class pipeline_build_context {
   {
   }
 
+  //! Construct an engine-backed context from the configured GPU set. The GPU count is derived
+  //! from the same ids used for execution routing, so planning cannot accidentally use the raw
+  //! hardware count when the Sirius config selected a subset of visible GPUs.
+  pipeline_build_context(std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
+                         bool preserve_insertion_order,
+                         std::vector<int> active_gpu_ids)
+    : _telemetry_context(std::move(telemetry_context)),
+      _preserve_insertion_order(preserve_insertion_order),
+      _active_gpu_ids(std::move(active_gpu_ids))
+  {
+    if (_active_gpu_ids.empty()) {
+      throw std::invalid_argument(
+        "pipeline_build_context requires at least one configured GPU device id");
+    }
+    _num_gpus = static_cast<int>(_active_gpu_ids.size());
+  }
+
   [[nodiscard]] bool preserve_insertion_order() const { return _preserve_insertion_order; }
 
   [[nodiscard]] int num_gpus() const { return _num_gpus; }
+
+  //! Sorted, deduped device ids of the GPUs the query runs on — the same list task_creator routes
+  //! partitions across. Used by broadcast join partitioning to map a probe batch's residence GPU
+  //! back to its partition slot. Empty only when built through the engine-free test constructor.
+  [[nodiscard]] const std::vector<int>& active_gpu_ids() const { return _active_gpu_ids; }
 
   [[nodiscard]] const std::shared_ptr<const telemetry::telemetry_context>& telemetry_context() const
   {
@@ -65,6 +90,7 @@ class pipeline_build_context {
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   bool _preserve_insertion_order = true;
   int _num_gpus                  = 1;
+  std::vector<int> _active_gpu_ids;
 };
 
 }  // namespace pipeline

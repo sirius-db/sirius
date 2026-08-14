@@ -19,8 +19,12 @@
 #include "duckdb/common/unordered_map.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "query_id.hpp"
 #include "telemetry-bridge/gen/uuid.rs.h"
 #include "telemetry/telemetry_context.hpp"
+
+#include <atomic>
+#include <cstdint>
 
 namespace sirius {
 class sirius_engine;
@@ -41,10 +45,12 @@ class query {
    * @brief Construct a new query object.
    *
    * @param pipelines The ordered pipelines required to execute this query.
+   * @param query_id The engine-wide query identity.
    * @param telemetry_info Info useful for emitting identifiable telemetry.
    */
   query(duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> pipelines,
         const quent::Context& context,
+        sirius::query_id_t query_id,
         telemetry::query_telemetry_info telemetry_info);
 
   ~query() = default;
@@ -81,10 +87,23 @@ class query {
   [[nodiscard]] const duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& get_pipelines()
     const;
 
+  /**
+   * @brief This query's engine-wide id, assigned when its execution window opened.
+   *
+   * Earlier queries get a lower id, so it doubles as the high bits of a task's scheduling
+   * priority: all tasks of an earlier query are dispatched before those of a later one (the
+   * priority queue picks the lowest value first). The same id keys this query's data repository
+   * manager and its window log lines.
+   */
+  [[nodiscard]] sirius::query_id_t query_id() const noexcept { return _query_id; }
+
  private:
   //! Builds the internal data structures from the pipelines
   void build_indices();
 
+  //! This query's id (lower = created earlier = scheduled first), supplied by the execution
+  //! window rather than minted here — see sirius::query_id_t.
+  sirius::query_id_t _query_id;
   //! Unique ID for this plan
   uuid::UUID _plan_id;
   //! Pipelines and the order in which they must be executed in order to successfully complete the

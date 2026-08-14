@@ -30,14 +30,17 @@ namespace sirius::io {
  *   - @c host is the authority verbatim (no percent-decoding); may contain
  *     @c ":port" (e.g. `bucket:9000`). Empty for schemes without an authority
  *     (the `file` scheme and bare absolute paths).
- *   - @c path is percent-decoded. For object-store schemes (s3/gs/azure) it
- *     is the object key after stripping exactly one bucket/key separator
- *     slash; further leading slashes are part of the key per S3 REST
- *     semantics (e.g. `s3://b/k` -> `k`, `s3://b//k` -> `/k`,
- *     `s3://b///k` -> `//k`). For the `file` scheme it keeps its leading
- *     `/`.
+ *   - @c path is percent-decoded EXCEPT for the `s3` scheme, whose key is taken
+ *     literally (AWS-CLI semantics): `s3://b/a%20b` -> `a%20b`, and `?`/`#` are
+ *     ordinary key bytes, not delimiters. For the other object-store schemes
+ *     (gs/azure/http/https/rdma_s3) @c path is the percent-decoded object key.
+ *     All object-store schemes strip exactly one bucket/key separator slash;
+ *     further leading slashes are part of the key per S3 REST semantics (e.g.
+ *     `s3://b/k` -> `k`, `s3://b//k` -> `/k`, `s3://b///k` -> `//k`). For the
+ *     `file` scheme @c path keeps its leading `/`.
  *   - @c query holds percent-decoded values. Duplicate keys are last-wins
  *     (unordered_map cannot represent multi-values; matches AWS SDK behavior).
+ *     The `s3` scheme never populates @c query (its `?...` is literal key bytes).
  */
 struct parsed_uri {
   std::string scheme;
@@ -50,11 +53,13 @@ struct parsed_uri {
  * @brief Parse @p uri into a @c parsed_uri.
  *
  * Supported shapes:
- *   - `s3://bucket/key`, `s3://bucket/key?region=us-west-2`
- *   - `gs://bucket/key`, `azure://container/blob`
+ *   - `s3://bucket/key` — key taken LITERALLY (no percent-decode, no `?`/`#`
+ *     split): `s3://b/a%20b` opens the object whose key is `a%20b`
+ *   - `gs://bucket/key`, `azure://container/blob` (percent-decoded key + query)
  *   - `file:///abs/path`, bare absolute `/abs/path`
- *   - Uppercase schemes (normalized to lowercase)
- *   - Fragments (`#...`) are silently stripped
+ *   - Uppercase schemes (normalized to lowercase; `S3://` takes the literal path)
+ *   - Fragments (`#...`) are silently stripped for non-s3 schemes; for s3 a `#`
+ *     is a literal key byte
  *   - Exactly one bucket/key separator slash is consumed; any further
  *     leading slashes survive into the key (`s3://b/k` -> `k`;
  *     `s3://b//k` -> `/k`; `s3://b///k` -> `//k`)
@@ -64,8 +69,9 @@ struct parsed_uri {
  *   - empty scheme (`://foo`)
  *   - relative bare path (`relative/x`, `./x`)
  *   - empty object key (`s3://bucket`, `s3://bucket/`)
- *   - empty query key (`?=val`)
- *   - malformed percent-encoding (`%ZZ`, truncated `%A`)
+ *   - empty query key (`?=val`) — non-s3 schemes only
+ *   - malformed percent-encoding (`%ZZ`, truncated `%A`) — non-s3 schemes only
+ *     (for s3 these are valid literal key bytes)
  */
 parsed_uri parse(std::string_view uri);
 

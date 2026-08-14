@@ -23,9 +23,9 @@
 // results, never the MVCC-blind disk-native read. Cache-served queries keep
 // the {1, 0, 1} signature compare_gpu_vs_cpu asserts.
 //
-// Walk-based guards (post-pin UPDATE chains on pinned tables; scans of
-// unpinned tables, #1143) are disabled in the planner — #1160 tracks the
-// execution-time replacement; their coverage lands with that work.
+// Walk-based guards for unpinned tables (#1143) remain disabled in the
+// planner. UPDATE statements on pinned tables are rejected before execution
+// (partial #1160).
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -269,7 +269,7 @@ TEST_CASE_METHOD(PinMvccDeleteFixture,
 }
 
 TEST_CASE_METHOD(PinMvccDeleteFixture,
-                 "mvcc guards: committed post-pin inserts decline to CPU with correct rows",
+                 "mvcc insert: committed post-pin inserts serve from the cache plus the delta",
                  "[integration][gpu_execution][pin_table_mvcc_delete]")
 {
   run_ok("CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(50000);");
@@ -277,12 +277,12 @@ TEST_CASE_METHOD(PinMvccDeleteFixture,
   run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
 
   run_ok("INSERT INTO t SELECT range::INTEGER + 50000 FROM range(100);");
-  expect_fallback_matches_cpu(*this, "SELECT count(*), max(k) FROM t;");
+  compare_gpu_vs_cpu("SELECT count(*), max(k), sum(k) FROM t;");
   run_ok("CALL unpin_table('t');");
 }
 
 TEST_CASE_METHOD(PinMvccDeleteFixture,
-                 "mvcc guards: own-transaction inserts decline, rollback resumes GPU serving",
+                 "mvcc guards: own-transaction inserts decline; commit serves, rollback resumes",
                  "[integration][gpu_execution][pin_table_mvcc_delete]")
 {
   run_ok("CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(50000);");
@@ -295,6 +295,11 @@ TEST_CASE_METHOD(PinMvccDeleteFixture,
   run_ok("ROLLBACK;");
 
   compare_gpu_vs_cpu("SELECT count(*), max(k) FROM t;");  // cache serving resumes
+
+  run_ok("BEGIN TRANSACTION;");
+  run_ok("INSERT INTO t VALUES (900001), (900002);");
+  run_ok("COMMIT;");
+  compare_gpu_vs_cpu("SELECT count(*), max(k) FROM t;");  // committed rows ride the delta
   run_ok("CALL unpin_table('t');");
 }
 
@@ -341,6 +346,28 @@ TEST_CASE_METHOD(PinMvccDeleteFixture,
   run_ok("CHECKPOINT;");  // folds the chains into the base data
   run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
   compare_gpu_vs_cpu("SELECT sum(v) FROM t;");
+  run_ok("CALL unpin_table('t');");
+}
+
+TEST_CASE_METHOD(PinMvccDeleteFixture,
+                 "mvcc guards: pinning a table with uncheckpointed appends is refused until "
+                 "CHECKPOINT",
+                 "[integration][gpu_execution][pin_table_mvcc_delete]")
+{
+  run_ok(
+    "CREATE TABLE t AS SELECT range::INTEGER AS k, (range * 2)::INTEGER AS v "
+    "FROM range(50000);");
+  run_ok("CHECKPOINT;");
+  run_ok("INSERT INTO t VALUES (50000, 100000);");  // small append -> transient segments
+
+  auto refused = con->Query("CALL pin_table(format='duckdb', name='t', tier='gpu');");
+  REQUIRE(refused);
+  REQUIRE(refused->HasError());
+  REQUIRE_THAT(refused->GetError(), Catch::Contains("uncheckpointed rows"));
+
+  run_ok("CHECKPOINT;");  // flushes the append into the persistent image
+  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
+  compare_gpu_vs_cpu("SELECT count(*), sum(v) FROM t;");
   run_ok("CALL unpin_table('t');");
 }
 

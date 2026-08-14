@@ -17,25 +17,31 @@
 #include "utils/pipeline_conversion_test_utils.hpp"
 
 #include "op/sirius_physical_operator.hpp"
+#include "op/sirius_physical_result_collector.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_context.hpp"
+#include "sirius_engine.hpp"
+#include "sirius_interface.hpp"
 
 #include <duckdb.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/main/database.hpp>
+#include <duckdb/main/prepared_statement_data.hpp>
 #include <duckdb/main/settings.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/planner.hpp>
 
+#include <algorithm>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <vector>
 
 namespace sirius::test {
 
@@ -77,19 +83,30 @@ class optimizer_disable_guard {
   std::set<duckdb::OptimizerType> original_disabled_optimizers_;
 };
 
+struct extracted_plan {
+  duckdb::unique_ptr<duckdb::LogicalOperator> logical_plan;
+  duckdb::shared_ptr<duckdb::PreparedStatementData> prepared;
+};
+
 //! Parse + plan + optimize + resolve a SQL query, mirroring the sirius-specific order of
 //! `SiriusTableFunctionData::ExtractPlan`: `ResolveOperatorTypes` BEFORE `ColumnBindingResolver`.
 //! DuckDB's `Connection::ExtractPlan` uses the reverse order, which trips sirius plan
 //! generation with an "inequal types" binder error on some queries.
-duckdb::unique_ptr<duckdb::LogicalOperator> extract_logical_plan_sirius_order(
-  duckdb::ClientContext& context, const std::string& query)
+extracted_plan extract_logical_plan_sirius_order(duckdb::ClientContext& context,
+                                                 const std::string& query)
 {
   duckdb::Parser parser(context.GetParserOptions());
   parser.ParseQuery(query);
+  auto statement_type = parser.statements[0]->type;
 
   duckdb::Planner planner(context);
   planner.CreatePlan(std::move(parser.statements[0]));
   D_ASSERT(planner.plan);
+
+  auto prepared       = duckdb::make_shared_ptr<duckdb::PreparedStatementData>(statement_type);
+  prepared->names     = planner.names;
+  prepared->types     = planner.types;
+  prepared->value_map = std::move(planner.value_map);
 
   duckdb::unique_ptr<duckdb::LogicalOperator> plan = std::move(planner.plan);
   if (context.config.enable_optimizer) {
@@ -100,10 +117,36 @@ duckdb::unique_ptr<duckdb::LogicalOperator> extract_logical_plan_sirius_order(
   duckdb::ColumnBindingResolver resolver;
   duckdb::ColumnBindingResolver::Verify(*plan);
   resolver.VisitOperator(*plan);
-  return plan;
+  return {std::move(plan), std::move(prepared)};
+}
+
+//! Starts far above any window id a test process will reach, so a synthetic query can never
+//! collide with a genuine execution window's registration (the registry rejects duplicates).
+sirius::query_id_t next_test_query_id()
+{
+  static std::atomic<std::uint32_t> counter{1'000'000};
+  return sirius::make_query_id(counter.fetch_add(1, std::memory_order_relaxed));
 }
 
 }  // namespace
+
+scoped_test_query::scoped_test_query(duckdb::ClientContext& context)
+  : ctx_(context.registered_state->Get<duckdb::SiriusContext>("sirius_state")),
+    query_id_(next_test_query_id())
+{
+  if (usable()) { ctx_->get_data_repository_registry().create_for_query(query_id_); }
+}
+
+scoped_test_query::~scoped_test_query()
+{
+  if (!usable()) { return; }
+  try {
+    ctx_->get_data_repository_registry().erase(query_id_);
+  } catch (...) {  // best-effort: never throw out of a test-scaffolding destructor
+  }
+}
+
+bool scoped_test_query::usable() const noexcept { return ctx_ && ctx_->is_initialized(); }
 
 void with_conversion_result(
   duckdb::Connection& con,
@@ -121,11 +164,15 @@ void with_conversion_result(
     duckdb::unique_ptr<duckdb::LogicalOperator> logical_plan;
     {
       optimizer_disable_guard guard(context);
-      logical_plan = extract_logical_plan_sirius_order(context, query);
+      logical_plan = extract_logical_plan_sirius_order(context, query).logical_plan;
     }
 
     sirius::planner::sirius_physical_plan_generator physical_planner(context);
     auto sirius_plan = physical_planner.create_plan(std::move(logical_plan));
+
+    // Apply fusion before conversion; this path has no RESULT_COLLECTOR wrapper.
+    sirius::planner::sirius_physical_plan_generator::mark_fusable_merge_pipelines(context,
+                                                                                  *sirius_plan);
 
     auto sirius_ctx_ptr = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
     if (!sirius_ctx_ptr) {
@@ -134,11 +181,21 @@ void with_conversion_result(
     }
     const auto& op_params = sirius_ctx_ptr->get_config().get_operator_params();
 
-    // Null telemetry context: no engine, per the pipeline_build_context ctor contract.
+    std::vector<int> active_gpu_ids;
+    for (auto const* space : sirius_ctx_ptr->get_memory_manager().get_memory_spaces_for_tier(
+           cucascade::memory::Tier::GPU)) {
+      if (space != nullptr) { active_gpu_ids.push_back(space->get_device_id()); }
+    }
+    std::sort(active_gpu_ids.begin(), active_gpu_ids.end());
+    active_gpu_ids.erase(std::unique(active_gpu_ids.begin(), active_gpu_ids.end()),
+                         active_gpu_ids.end());
+
+    // Null telemetry context: no engine, but derive planning width from the same configured GPU
+    // spaces as production so multi-visible-GPU hosts do not inflate single-GPU test plans.
     pipeline::pipeline_build_context build_ctx(
       /*telemetry_context=*/nullptr,
       duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context),
-      static_cast<int>(sirius_ctx_ptr->get_config().get_hw_topology().gpus.size()));
+      std::move(active_gpu_ids));
 
     pipeline::sirius_pipeline_build_state state;
     auto root_pipeline =
@@ -153,6 +210,44 @@ void with_conversion_result(
     // reference operators owned by the plan tree, so a result that escaped to the caller
     // would read dangling pointers.
     consume(result);
+    con.Rollback();
+  } catch (...) {
+    con.Rollback();
+    throw;
+  }
+}
+
+void with_initialized_engine(duckdb::Connection& con,
+                             const std::string& query,
+                             const std::function<void(sirius_engine&)>& consume)
+{
+  auto& context = *con.context;
+
+  // Stands in for the execution window this helper never opens: registers this plan's
+  // repository manager and drops it (with its repositories) on the way out.
+  scoped_test_query test_query(context);
+
+  con.BeginTransaction();
+  try {
+    extracted_plan extracted;
+    {
+      optimizer_disable_guard guard(context);
+      extracted = extract_logical_plan_sirius_order(context, query);
+    }
+
+    sirius::planner::sirius_physical_plan_generator physical_planner(context);
+    auto sirius_plan = physical_planner.create_plan(std::move(extracted.logical_plan));
+    auto prepared    = duckdb::make_shared_ptr<sirius_prepared_statement_data>(
+      std::move(extracted.prepared), std::move(sirius_plan));
+    auto collector =
+      duckdb::make_uniq_base<op::sirius_physical_result_collector,
+                             op::sirius_physical_materialized_collector>(*prepared, context);
+
+    sirius_interface iface(context);
+    sirius_engine engine(context, iface, test_query.query_id());
+    engine.initialize(std::move(collector));
+    consume(engine);
+
     con.Rollback();
   } catch (...) {
     con.Rollback();

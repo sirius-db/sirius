@@ -18,6 +18,7 @@
 
 #include "duckdb/common/common.hpp"
 #include "log/logging.hpp"
+#include "query_id.hpp"
 #include "telemetry-bridge/gen/context.rs.h"
 #include "telemetry-bridge/gen/engine.rs.h"
 #include "telemetry-bridge/gen/executor_thread.rs.h"
@@ -112,8 +113,11 @@ class telemetry_context {
 
 // A POD to hold common identifiers for useful telemetry.
 struct query_telemetry_info {
-  uuid::UUID query_id;
+  /// Quent's own UUID for this query (`QueryHandle::uuid()`), authoritative within telemetry.
+  uuid::UUID telemetry_query_id;
   uuid::UUID worker_id;
+  /// The engine-wide numeric query id (the execution window's id).
+  sirius::query_id_t query_id;
 };
 
 /// Emit plan-level telemetry (operator declarations, port declarations, edges)

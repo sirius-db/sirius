@@ -43,6 +43,7 @@
 //   3. Repeated back-to-back invocations of BUILD_PROBE don't wedge on the
 //      leftover hash table state from the prior query (DESTROYED → NOT_BUILT).
 
+#include "log/logging.hpp"
 #include "mgpu_test_utils.hpp"
 
 #include <cuda_runtime.h>
@@ -53,7 +54,9 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <map>
+#include <sstream>
 #include <string>
 
 namespace fs = std::filesystem;
@@ -65,6 +68,7 @@ using sirius::test::mgpu::mgpu_env_params;
 using sirius::test::mgpu::parquet_glob;
 using sirius::test::mgpu::require_gpu_matches_cpu;
 using sirius::test::mgpu::require_two_gpus;
+using sirius::test::mgpu::scoped_log_dir;
 using sirius::test::mgpu::scoped_mgpu_env;
 using sirius::test::mgpu::write_mgpu_yaml;
 
@@ -103,6 +107,28 @@ void generate_large_probe_side(fs::path const& dir)
   // (src/pipeline/sirius_pipeline_converter.cpp:782).
   generate_parquet_surface(
     dir, "SELECT range AS k, range * 7 AS v FROM range(500000)", /*num_files=*/8);
+}
+
+/**
+ * @brief Scan every file under @p log_dir for @p needle. Used to assert that a
+ * runtime code path actually engaged: correctness alone cannot distinguish
+ * "broadcast replicated the build" from "fell back to single-GPU routing", nor
+ * "dynamic filter published" from "no filter published" — both fall back to a
+ * correct (but slower) result. The distinguishing signal is the log marker.
+ * Requires the log level to include the marker (broadcast markers are DEBUG).
+ */
+bool log_dir_contains(fs::path const& log_dir, std::string const& needle)
+{
+  (void)sirius::log::get_sink()->flush();
+  std::error_code ec;
+  for (auto const& entry : fs::recursive_directory_iterator(log_dir, ec)) {
+    if (!entry.is_regular_file()) { continue; }
+    std::ifstream in(entry.path());
+    std::stringstream ss;
+    ss << in.rdbuf();
+    if (ss.str().find(needle) != std::string::npos) { return true; }
+  }
+  return false;
 }
 
 }  // namespace
@@ -630,6 +656,132 @@ TEST_CASE("physical_hash_join - follow-up #17 scale-up: Q11-like BUILD_PROBE wit
   REQUIRE(tasks_per_gpu.count(1));
   REQUIRE(tasks_per_gpu.at(0) >= 1);
   REQUIRE(tasks_per_gpu.at(1) >= 1);
+
+  fs::remove_all(tmp, ec);
+}
+
+//===----------------------------------------------------------------------===//
+// Broadcast small-build BUILD_PROBE. When the build side is small
+// (< small_table_bytes == num_gpus * 16 MiB), the PARTITION operator replicates
+// it to every GPU (one hash table per GPU) instead of funneling the whole build
+// to a single GPU. Correctness alone cannot prove the broadcast path engaged —
+// a single-GPU fallback also returns the right rows — so these tests also assert
+// the runtime log markers ("[broadcast]" from the partition decision; "Pushed
+// ... dynamic filter(s)" from the publisher). They are 2-GPU-gated.
+//===----------------------------------------------------------------------===//
+TEST_CASE("physical_hash_join - broadcast small-build BUILD_PROBE replicates across two GPUs",
+          "[mgpu][operator-mgpu][hash_join][build_probe][broadcast][gpu_execution]")
+{
+  if (!require_two_gpus()) return;
+
+  auto tmp = make_tmp("broadcast-replicate");
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp);
+
+  auto build_dir = tmp / "build";
+  auto probe_dir = tmp / "probe";
+  generate_small_build_side(build_dir);  // ~80 KiB << small_table_bytes (2 * 16 MiB)
+  generate_large_probe_side(probe_dir);
+
+  // DEBUG level so the partition "[broadcast]" decision marker is emitted.
+  scoped_log_dir log_dir(tmp / "logs", "debug");
+
+  mgpu_env_params params{};
+  params.cache   = "none";
+  auto yaml_path = tmp / "broadcast-replicate.yaml";
+  write_mgpu_yaml(yaml_path, params);
+  scoped_mgpu_env env(yaml_path);
+
+  auto inner_query =
+    "SELECT probe.k, probe.v, build.v AS build_v "
+    "FROM read_parquet('" +
+    parquet_glob(probe_dir) +
+    "') AS probe "
+    "JOIN read_parquet('" +
+    parquet_glob(build_dir) +
+    "') AS build "
+    "  ON probe.k = build.k "
+    "ORDER BY probe.k, probe.v "
+    "LIMIT 100";
+
+  std::map<int, size_t> tasks_per_gpu;
+  {
+    auto con = env.make_connection();
+    require_gpu_matches_cpu(con, inner_query, /*force_cpu_reference=*/true);
+    auto& scheduler = env.get_task_scheduler(con);
+    scheduler.visit_executors(
+      [&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
+        tasks_per_gpu[device_id] = exec.get_metrics().tasks_executed;
+      });
+  }
+
+  // The broadcast path engaged: the small build was replicated, not funneled to one GPU.
+  INFO("log dir: " << log_dir.path());
+  REQUIRE(log_dir_contains(log_dir.path(), "[broadcast]"));
+
+  // Both GPUs built their own hash table from the replicated build and did probe work.
+  REQUIRE(tasks_per_gpu.count(0));
+  REQUIRE(tasks_per_gpu.count(1));
+  REQUIRE(tasks_per_gpu.at(0) >= 1);
+  REQUIRE(tasks_per_gpu.at(1) >= 1);
+
+  fs::remove_all(tmp, ec);
+}
+
+//===----------------------------------------------------------------------===//
+// A broadcast join publishes dynamic filters: every partition holds the full
+// replicated build, so the first GPU to arrive wins the OPEN->PUBLISHING race
+// and publishes the membership filter (exactly once). Before the broadcast
+// fix, >1 partition disabled publication entirely. The selective build (5000
+// keys) vs the large probe domain (500000 keys) guarantees a membership filter
+// is emitted. 2-GPU-gated.
+//===----------------------------------------------------------------------===//
+TEST_CASE("physical_hash_join - broadcast BUILD_PROBE publishes dynamic filters across two GPUs",
+          "[mgpu][operator-mgpu][hash_join][build_probe][broadcast][dynamic_filter][gpu_execution]")
+{
+  if (!require_two_gpus()) return;
+
+  auto tmp = make_tmp("broadcast-dynfilter");
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp);
+
+  auto build_dir = tmp / "build";
+  auto probe_dir = tmp / "probe";
+  generate_small_build_side(build_dir);
+  generate_large_probe_side(probe_dir);
+
+  scoped_log_dir log_dir(tmp / "logs", "debug");
+
+  mgpu_env_params params{};
+  params.cache   = "none";
+  auto yaml_path = tmp / "broadcast-dynfilter.yaml";
+  write_mgpu_yaml(yaml_path, params);
+  scoped_mgpu_env env(yaml_path);
+
+  auto inner_query =
+    "SELECT probe.k, probe.v, build.v AS build_v "
+    "FROM read_parquet('" +
+    parquet_glob(probe_dir) +
+    "') AS probe "
+    "JOIN read_parquet('" +
+    parquet_glob(build_dir) +
+    "') AS build "
+    "  ON probe.k = build.k "
+    "ORDER BY probe.k, probe.v "
+    "LIMIT 100";
+
+  {
+    auto con = env.make_connection();
+    // Dynamic-filter pushdown is on by default; keep the result a correctness oracle.
+    require_gpu_matches_cpu(con, inner_query, /*force_cpu_reference=*/true);
+  }
+
+  INFO("log dir: " << log_dir.path());
+  // Broadcast engaged AND the publisher ran (exactly one GPU won the publication race).
+  REQUIRE(log_dir_contains(log_dir.path(), "[broadcast]"));
+  REQUIRE(log_dir_contains(log_dir.path(), "dynamic filter"));
 
   fs::remove_all(tmp, ec);
 }

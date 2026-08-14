@@ -37,11 +37,22 @@
 namespace sirius::scan_manager {
 
 struct databatch_provider {
-  /// One cached chunk plus its (optional) per-query MVCC keep-mask.
-  /// A default-constructed batch (null @ref data) means end-of-stream.
+  /// One cached chunk or one insert-delta split, plus its (optional)
+  /// per-query MVCC keep-mask. A batch carries either @ref data (resident
+  /// cached chunk) or @ref scan_info (delta split, yielded after the
+  /// resident chunks); both null means end-of-stream.
   struct batch {
     std::shared_ptr<cucascade::data_batch> data;
     mvcc_chunk_mask mvcc_keep_mask;  ///< default = all rows visible
+    /// True when scan normalization will cast at least one selected column of this cached chunk:
+    /// its recorded carrier differs from the carrier the scan plans for that column.
+    bool needs_carrier_conversion{false};
+    /// Exact bytes of the destination columns (data plus validity mask) those casts allocate.
+    /// Zero when nothing converts or when a converting chunk's row count is unreadable; the scan
+    /// memory estimate then falls back to its conservative maximum-expansion bound.
+    std::size_t conversion_destination_bytes{0};
+    std::unique_ptr<op::scan::scan_info> scan_info;
+    int preferred_device{-1};  ///< placement for scan_info splits (-1 = none)
   };
 
   virtual ~databatch_provider()  = default;

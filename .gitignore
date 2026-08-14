@@ -12,6 +12,7 @@ tpch-data/dbgen
 .vscode/
 *.duckdb
 !test/cpp/integration/integration.duckdb
+!test/cpp/integration/data/duckdb/tpcds.duckdb
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
@@ -19,7 +20,6 @@ dbgen/
 test_datasets/tpch-dbgen/
 test_datasets/tpch-mod-dbgen/
 test_datasets/hits_0.parquet
-.claude/*
 .codex/
 runs/
 .venv
@@ -35,6 +35,7 @@ cufile.log
 envs/
 compile_commands.json
 .cache
+.rumdl_cache/
 
 # Zed editor settings
 .zed
@@ -44,6 +45,8 @@ AGENTS.override.md
 CLAUDE.local.md
 newplan.md
 telemetry_data/
+log_analysis/
+nsys_profiles/
 /log/
 .ai-helper/
 
@@ -61,4 +64,8 @@ telemetry_data/
 /doc/s3support/perf-baseline-*.json
 /doc/s3support/perf-history-*.jsonl
 *.local.md
+tools/log_analyzer/__pycache__/
+tools/log_analyzer/metrics/__pycache__/
 test/tpch_performance/__pycache__/
+test/tpch_performance/output/
+test/tpch_performance/log/

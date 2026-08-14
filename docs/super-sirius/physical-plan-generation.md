@@ -43,10 +43,12 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 
 The `plan_comparison_join()` method selects the join implementation:
 
-1. **Hash Join** — chosen when at least one equality condition exists. Checks `are_conditions_supported()` for mixed joins (equality + inequality on disjoint columns). Created with `max_build_hash_table_bytes` limit.
+1. **Hash Join** — chosen when at least one equality condition exists. Checks `are_conditions_supported()` for mixed joins (equality plus an inequality, or a null-safe `IS NOT DISTINCT FROM` key mixed with a plain `=`, on disjoint columns). Created with `max_build_hash_table_bytes` limit.
 2. **Nested Loop Join** — fallback for pure inequality joins where `PhysicalNestedLoopJoin::IsSupported()` returns true.
 
 Left side = probe (streamed), right side = build (materialized).
+
+Before either is chosen, `materialize_expression_join_keys()` pushes a projection below the join that turns complex equality-key expressions into real columns, rewriting the condition side to a plain reference so `PARTITION` (which hashes by column index) can consume it. It also materializes the *cast* on a null-safe key that will be routed to the mixed join's cuDF AST predicate: a routed key skips the hash-key path's `cudf::cast`, and a cuDF AST can only cast to INT64 / UINT64 / FLOAT64, so e.g. the INTEGER cast DuckDB inserts for a SMALLINT/INTEGER `IS NOT DISTINCT FROM` has to become a column. `are_conditions_supported()` rejects any routed null-safe key still carrying an untranslatable expression, so the join lands on the nested loop join (or CPU) instead of throwing mid-query.
 
 ### Aggregate Planning
 
@@ -203,7 +205,7 @@ In the diagrams below, `[A, B, C]` denotes a pipeline where A is `operators[0]` 
 
 ### TABLE_SCAN Rewrite
 
-During plan generation, a `TABLE_SCAN` whose source is a supported format is rewritten in place into a single `GPU_SCAN` operator (`sirius_gpu_scan_operator`) that inherits the TABLE_SCAN's tree position and stays the source-leaf of the same pipeline — no separate scan pipeline is created. `GPU_SCAN` is format-agnostic: it owns a pluggable `io::gpu_ingestible` that knows how to enumerate splits and materialize each split into a `cudf::table`. `wrap_table_scan_source()` (`src/planner/sirius_physical_plan_generator.cpp`) dispatches on the bound table function name:
+During plan generation, a `TABLE_SCAN` whose source is a supported format is rewritten in place into a single `GPU_SCAN` operator (`sirius_gpu_scan_operator`) that inherits the TABLE_SCAN's tree position and stays the source-leaf of the same pipeline — no separate scan pipeline is created. `GPU_SCAN` is format-agnostic: it owns a pluggable `gpu_ingestible` that knows how to enumerate splits and materialize each split into a `cudf::table`. `wrap_table_scan_source()` (`src/planner/sirius_physical_plan_generator.cpp`) dispatches on the bound table function name:
 
 **Parquet (`parquet_scan` / `read_parquet` / `sirius_read_parquet`, including `s3://` paths):** `build_parquet_table_info()` captures the DuckDB bind data (resolved file paths, hive-partition indices, returned/column/projection ids, table filters) into a `parquet_ingestible_table_info`, builds a parquet ingestible via `make_ingestible()`, and constructs the `GPU_SCAN` operator around it.
 
@@ -211,7 +213,7 @@ During plan generation, a `TABLE_SCAN` whose source is a supported format is rew
 
 Any other scan function falls back to CPU: `create_plan(LogicalGet&)` declines it before plan generation reaches the wrap.
 
-During `prepare_for_query`, `sirius_scan_manager` takes the ingestible off each `GPU_SCAN` operator, peeks its file paths for a pinned-cache match (substituting a cached ingestible on a hit), and binds a `split_connector` to the operator. The operator pulls splits from the connector inside `get_next_task_input_data()` (see [Scan — Scan Manager](scan.md#scan-manager)).
+During `prepare_for_query`, `sirius_scan_manager` inspects each `GPU_SCAN` operator's ingestible for a pinned-cache match. A cache miss uses `split_provider`; a cache hit uses `cached_databatch_provider`. The operator keeps its ingestible in both cases. Providers push splits into the connector the operator created at plan time. The operator pulls splits from the connector inside `get_next_task_input_data()` (see [Scan — Scan Manager](scan.md#scan-manager)).
 
 ### HASH_JOIN Probe Side
 
@@ -272,8 +274,11 @@ graph LR
 For a dynamic-filter-producing `BUILD_PROBE` join, the build CONCAT switches to `concat_all` and
 its synchronous `"build"`-port push completes filter construction, multi-GPU replication, and
 channel publication before downstream task creation follows that join into its **immediate** probe
-producer. This edge ordering does not gate a base scan reached transitively through an intervening
-join; such a scan samples the channel opportunistically under normal scheduler order. See
+producer. In a **broadcast** join there are `num_gpus` build CONCATs (one per replicated slot), each
+doing a `concat_all` push of the full build; the first to arrive publishes (exactly-once via the
+`OPEN -> PUBLISHING` compare-exchange). This edge ordering does not gate a base scan reached
+transitively through an intervening join; such a scan samples the channel opportunistically under
+normal scheduler order. See
 [Immediate-probe ordering](dynamic-filters.md#immediate-probe-ordering) and
 [Transitive scan targets and publication timing](dynamic-filters.md#transitive-scan-targets-and-publication-timing).
 
@@ -303,6 +308,8 @@ graph LR
 2. **Pipeline 2**: PARTITION. Repository to MERGE_GROUP_BY uses `FULL` barrier (downstream is not CONCAT — `PARTIAL` is only used when PARTITION feeds directly into CONCAT)
 3. **Pipeline 3**: MERGE_GROUP_BY. Downstream pipelines updated to use MERGE_GROUP_BY as source
 
+> With `fuse_merge_pipelines` (default on), Pipeline 3 is usually not a standalone pipeline: MERGE_GROUP_BY folds into the downstream sink's pipeline as an intermediate. See [Merge fusion](#merge-fusion) below.
+
 ### UNGROUPED_AGGREGATE
 
 ```mermaid
@@ -322,6 +329,27 @@ graph LR
 ```
 
 MERGE_TOP_N merges local top-N results.
+
+> With `fuse_merge_pipelines` (default on), Pipeline 2 usually folds MERGE_TOP_N into the downstream sink's pipeline rather than forming its own. See [Merge fusion](#merge-fusion) below.
+
+### Merge fusion
+
+By default (`fuse_merge_pipelines = true`) an eligible `MERGE_GROUP_BY` or `MERGE_TOP_N` does **not** open its own terminal pipeline. Instead it joins its downstream sink's pipeline as an intermediate operator, removing one task launch and one repository round-trip (typically `merge → RESULT_COLLECTOR` at the query tail):
+
+```mermaid
+graph LR
+    P1["Pipeline 1<br/>[scan, ..., HASH_GROUP_BY]"] -->|"FULL"| P2["Pipeline 2<br/>[PARTITION]"]
+    P2 -->|"FULL"| P3["Pipeline 3<br/>[MERGE_GROUP_BY -> sink]"]
+```
+
+Eligibility is decided at plan time by `mark_fusable_merge_pipelines` (`sirius_physical_plan_generator.cpp`), which walks parent pointers from each merge to the first downstream sink. Fusion applies when that path is unary and streaming and the sink accepts a fused input; the merge's own `build_pipelines` override then adds itself to the current pipeline and recurses into its child (which still cuts the upstream boundary). The following are **excluded** and keep the standalone merge boundary:
+
+- **Join / CTE / delim terminals** (`HASH_JOIN`, `NESTED_LOOP_JOIN`, `CTE`, `LEFT/RIGHT_DELIM_JOIN`) — multiple inputs or bespoke sink wiring.
+- **Partition sinks** (`PARTITION`, `SORT_PARTITION`) — require complete upstream input in one task.
+- **Delim-owned merges** — the distinct-root merge inside a delim join needs its dedicated sink wiring.
+- **`MERGE_AGGREGATE`** (ungrouped aggregate) — uses a different partial-result handoff.
+
+Total-input structural sinks such as `ORDER_BY`, `TOP_N`, and an outer `GROUP BY` **are** fusable: they already buffer their full input, so folding the merge in does not change when they observe complete data.
 
 ### DELIM_JOIN
 

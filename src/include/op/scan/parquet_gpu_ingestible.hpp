@@ -93,6 +93,19 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   }
 };
 
+/// Canonical identity form for a parquet file path so pinned-cache matching
+/// (@ref cache_entry_info::can_serve_with_columns, a raw set-equality on
+/// resolved_file_paths) is independent of spelling: relative vs absolute,
+/// redundant '/', './..', 'file://', and symlinks all collapse. Remote URIs
+/// (scheme://) pass through. Apply ONLY at the cache-identity boundary
+/// (cache_entry_info): resolved_file_paths on the bind info stay as bound, so
+/// Hive partition parsing reads the original path and is not confused by a
+/// symlink-resolved 'key=value' directory segment.
+[[nodiscard]] std::string canonical_scan_file_path(std::string const& raw);
+
+/// In-place @ref canonical_scan_file_path over a resolved-file-path vector.
+void canonicalize_scan_file_paths(std::vector<std::string>& paths);
+
 //===----------------------------------------------------------------------===//
 // parquet_split_info
 //===----------------------------------------------------------------------===//
@@ -124,8 +137,7 @@ class parquet_split_info : public scan_info {
   /// filter still applies post-decode via @c expression_evaluator.
   bool disable_filter_pushdown = false;
   /// Hive partition values for this split, in @c scan_plan::partition_columns
-  /// order. Empty when the plan has no partition columns. Duplicated here
-  /// (also lives on @c parquet_post_filter_and_projection_info) so
+  /// order. Empty when the plan has no partition columns. Kept on the split so
   /// @ref materialize_table can call @c assemble_scan_output inline on the
   /// reader-side pushdown path and emit @c filter_state::ROW_FILTERED_AND_PROJECTED.
   std::vector<std::string> partition_values;
@@ -238,11 +250,19 @@ class parquet_file_scan_info : public scan_info {
   [[nodiscard]] std::vector<fadvise_entry> fadvise_entries() const override;
 };
 
+/// A top-level `<col> IS [NOT] NULL` conjunct, recorded so the row groups it
+/// excludes can still be pruned from the parquet null_count statistic even
+/// though cuDF's stats filter cannot evaluate the predicate itself.
+struct null_prune_predicate {
+  duckdb::idx_t batch_index;  ///< index into the scan's batch column order
+  bool expects_null;          ///< true for IS NULL, false for IS NOT NULL
+};
+
 //===----------------------------------------------------------------------===//
 // parquet_gpu_ingestible
 //===----------------------------------------------------------------------===//
 /**
- * @brief Concrete @c io::gpu_ingestible for parquet sources.
+ * @brief Concrete @c gpu_ingestible for parquet sources.
  *
  * Owns the shared scan plan, reader options, and coalesced filter expression.
  * @ref next_split_provider hands out one file at a time: each metadata-scan task
@@ -289,7 +309,21 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     return _duckdb_filter_expression != nullptr;
   }
 
+  [[nodiscard]] std::unordered_map<std::size_t, std::vector<std::string>>
+  decode_predicate_candidates() const override
+  {
+    return _decode_predicate_candidates;
+  }
+
  private:
+  /// The filter form matching @p batch when one or more candidate columns
+  /// arrived as a decode-time BOOL8 mask: those contribute a bare boolean
+  /// reference instead of a comparison. Returns null when nothing was
+  /// substituted, meaning the caller should use @c _duckdb_filter_expression.
+  /// Never called without @c _duckdb_filter_expression.
+  [[nodiscard]] duckdb::unique_ptr<duckdb::Expression> build_filter_expression_for(
+    cudf::table_view const& batch) const;
+
   /// Read one file's footer, prune its row groups against the filter, and record
   /// per-row-group byte accounting. Returns a single @c parquet_file_scan_info.
   /// Runs on a scan-manager dispatcher thread (the task returned by
@@ -309,6 +343,40 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   // Coalesced DuckDB filter expression. Empty when no filters survived the
   // partition-column drop pass.
   std::shared_ptr<duckdb::Expression> _duckdb_filter_expression;
+
+  // Pure-filter string columns this scan is willing to receive as a decode-time
+  // BOOL8 mask instead of values, as (batch D-space position, primary index)
+  // pairs. Empty when none qualify.
+  //
+  // Only the position list is precomputed: whether a column *was* substituted is
+  // a per-batch, per-column fact (a pinned compressed chunk supplies masks only
+  // for plans that can produce them; the same scan's disk splits supply raw
+  // strings), so build_filter_expression_for reads it off each batch's column
+  // types.
+  std::vector<std::pair<std::size_t, std::size_t>> _pushdown_primary_by_batch_position;
+  // What decode_predicate_candidates() advertises: primary index → constant set.
+  std::unordered_map<std::size_t, std::vector<std::string>> _decode_predicate_candidates;
+
+  // The part of _duckdb_filter_expression safe to push into the reader: the
+  // full predicate minus any top-level AND conjunct that cuDF's row-group
+  // stats filter cannot handle (a null test, or a bare column reference used
+  // as the predicate). Surviving conjuncts still prune, so
+  // `v IS NULL AND id > 3000` keeps pruning on `id`. Shares the full
+  // expression when nothing needs stripping; null when none survive.
+  //
+  // Separate from disable_filter_pushdown, which also suppresses dynamic join
+  // filters — those carry no null predicate and stay safe to push down.
+  std::shared_ptr<duckdb::Expression> _static_pushdown_expression;
+  // False when the above is a strict subset: the reader has then only
+  // partially filtered, so the scan must NOT be reported ROW_FILTERED or the
+  // dropped conjuncts would never be applied.
+  bool _static_pushdown_is_complete = true;
+
+  // Only the simple `IS [NOT] NULL` over a bare column reference shape is
+  // recorded; anything compound is left to the post-decode filter. Empty when
+  // the predicate has no such conjunct.
+  std::vector<null_prune_predicate> _null_prune_predicates;
+
   std::vector<std::string> _file_paths;
 
   // Per-file metadata-scan cursor. next_split_provider hands out one file index

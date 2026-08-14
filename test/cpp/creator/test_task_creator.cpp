@@ -20,11 +20,14 @@
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_scheduler.hpp"
+#include "utils/telemetry_utils.hpp"
 
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <duckdb/main/connection.hpp>
+#include <duckdb/main/database.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <memory>
@@ -157,7 +160,8 @@ class testable_task_creator : public task_creator {
                         task_scheduler& task_sched,
                         sirius::memory::sirius_memory_reservation_manager& mem_res_mgr)
     : task_creator(
-        exec::thread_pool_config{.num_threads = num_threads, .thread_name_prefix = "task_creator"},
+        creator::task_creator_config{
+          .thread_pool = {.num_threads = num_threads, .thread_name_prefix = "task_creator"}},
         mem_res_mgr)
   {
     this->set_client_context(client_context);
@@ -229,9 +233,9 @@ class test_fixture {
         builder.set_number_of_gpus(1)
           .set_gpu_usage_limit(gpu_capacity)
           .set_reservation_fraction_per_gpu(limit_ratio)
-          .set_per_host_capacity(host_capacity)
-          .use_host_per_gpu()
-          .set_reservation_fraction_per_host(limit_ratio);
+          .set_per_numa_region_capacity(host_capacity)
+          .use_gpu_id_as_host_id()
+          .set_reservation_fraction_per_numa_region(limit_ratio);
 
         // Build configuration with topology detection
         auto space_configs = builder.build();
@@ -239,8 +243,8 @@ class test_fixture {
           std::move(space_configs));
       }()),
       pipeline_exec(exec::thread_pool_config{.num_threads = 1},
-                    exec::thread_pool_config{.num_threads = 2},
-                    *memory_manager),
+                    *memory_manager,
+                    sirius::test::make_test_telemetry_context()),
       empty_pipelines()
   {
   }
@@ -359,6 +363,41 @@ TEST_CASE("task_creator destructor stops thread pool", "[task_creator]")
 // get_operator_for_next_task Tests
 //===----------------------------------------------------------------------===//
 
+TEST_CASE("get_operator_for_next_task records every pipeline the hint walk visits",
+          "[task_creator]")
+{
+  test_fixture fixture;
+
+  testable_task_creator creator(
+    2, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+
+  auto pipeline_a = duckdb::make_shared_ptr<mock_gpu_pipeline>(fixture.build_ctx);
+  auto pipeline_b = duckdb::make_shared_ptr<mock_gpu_pipeline>(fixture.build_ctx);
+
+  // Upstream operator whose hint sweep finds nothing to do — the case where
+  // get_next_task_hint() may have just drained its ports.
+  auto op_b = std::make_unique<mock_sirius_physical_operator>();
+  op_b->set_pipeline(pipeline_b);
+  op_b->set_custom_hint(std::nullopt);
+
+  auto op_a = std::make_unique<mock_sirius_physical_operator>();
+  op_a->set_pipeline(pipeline_a);
+  op_a->set_custom_hint(
+    task_creation_hint{.hint = TaskCreationHint::WAITING_FOR_INPUT_DATA, .producer = op_b.get()});
+
+  std::vector<duckdb::shared_ptr<sirius_pipeline>> visited;
+  auto* next = creator.get_operator_for_next_task(op_a.get(), visited);
+
+  REQUIRE(next == nullptr);
+  // The caller re-evaluates every visited pipeline on the nullptr path. If the
+  // walk reported only the requesting pipeline, an upstream pipeline whose
+  // tasks all completed earlier would never be marked finished — no later
+  // mark_task_completed() exists to re-evaluate it — and its consumers would
+  // wait forever.
+  REQUIRE(std::find(visited.begin(), visited.end(), pipeline_a) != visited.end());
+  REQUIRE(std::find(visited.begin(), visited.end(), pipeline_b) != visited.end());
+}
+
 TEST_CASE("get_operator_for_next_task with monostate hint and empty priority_scans",
           "[task_creator]")
 {
@@ -372,7 +411,8 @@ TEST_CASE("get_operator_for_next_task with monostate hint and empty priority_sca
 
   // process_next_task should just return nullptr because there its not really connected to anything
   // and has no data
-  auto next_op = creator.get_operator_for_next_task(mock_op.get());
+  std::vector<duckdb::shared_ptr<sirius_pipeline>> visited;
+  auto next_op = creator.get_operator_for_next_task(mock_op.get(), visited);
 
   // Nothing should be scheduled
   REQUIRE(next_op == nullptr);
@@ -411,10 +451,9 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
   source_op->set_custom_hint(
     task_creation_hint{.hint = TaskCreationHint::READY, .producer = hint_op.get()});
 
-  // Call process_next_task - this should attempt to schedule with hint_op
-  // Note: This will try to access hint_op->get_port("default")->dest_pipeline
-  // which we've set up above
-  auto next_op = creator.get_operator_for_next_task(hint_op.get());
+  // Following source_op's READY hint must land on hint_op.
+  std::vector<duckdb::shared_ptr<sirius_pipeline>> visited;
+  auto next_op = creator.get_operator_for_next_task(source_op.get(), visited);
 
   REQUIRE(next_op == hint_op.get());
 

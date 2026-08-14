@@ -19,7 +19,9 @@
 #include "config.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "exec/bounded_thread_pool.hpp"
+#include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
+#include "exec/queue_priority.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -28,13 +30,13 @@
 #include <blockingconcurrentqueue.h>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
-#include <cucascade/memory/topology_discovery.hpp>
 
 #include <atomic>
 #include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace sirius::pipeline {
 class task_scheduler;
@@ -44,6 +46,10 @@ class sirius_pipeline_task_global_state;
 namespace sirius::planner {
 class query;
 }  // namespace sirius::planner
+
+namespace sirius::memory {
+class topology_index;
+}  // namespace sirius::memory
 
 namespace sirius::creator {
 
@@ -74,11 +80,11 @@ class task_creator {
    *
    * @param config Configuration for the thread pool (thread count, name prefix, CPU affinity).
    * @param mem_res_mgr Reference to the memory reservation manager.
-   * @param sys_topology Optional system topology info for NUMA-aware GPU routing.
+   * @param topology_index Optional shared GPU<->NUMA index for NUMA-aware GPU routing.
    */
   task_creator(task_creator_config config,
                sirius::memory::sirius_memory_reservation_manager& mem_res_mgr,
-               const cucascade::memory::system_topology_info* sys_topology = nullptr);
+               std::shared_ptr<const sirius::memory::topology_index> topology_index = nullptr);
 
   /**
    * @brief Destructor that ensures the thread pool is stopped.
@@ -90,6 +96,16 @@ class task_creator {
   task_creator& operator=(const task_creator&) = delete;
   task_creator(task_creator&&)                 = delete;
   task_creator& operator=(task_creator&&)      = delete;
+
+  /// \brief Narrow this query to a GPU subset, replacing the constructor's topology-derived
+  /// list. Called once per query by sirius_engine::initialize_internal.
+  ///
+  /// @param full_count how many GPUs existed before narrowing. Passed in rather than inferred
+  /// so it and @p ids are cut from the same list.
+  void set_active_gpu_ids(std::vector<int> ids, std::size_t full_count);
+
+  /// \brief The GPU subset this query was admitted onto.
+  [[nodiscard]] const std::vector<int>& get_active_gpu_ids() const noexcept;
 
   /// \brief sets client context needed for task creation
   void set_client_context(::duckdb::ClientContext& client_context);
@@ -148,6 +164,21 @@ class task_creator {
    */
   uint64_t get_next_task_id();
 
+  /**
+   * @brief Compute a scheduling priority for every pipeline in the query.
+   *
+   * Partitions the pipeline DAG into branches (via query_index) and assigns each pipeline a
+   * priority so that earlier (closer-to-scan) branches get lower values and run first (priority
+   * ascends with execution order), honoring the configured priority_order within each branch.
+   * Exposed for unit testing.
+   *
+   * @param query The query whose pipelines are prioritized.
+   * @return Map from pipeline to its scheduling priority (pipelines absent from the map keep the
+   *         default priority of 0).
+   */
+  [[nodiscard]] std::unordered_map<const pipeline::sirius_pipeline*, exec::queue_priority>
+  compute_pipeline_priorities(const sirius::planner::query& query) const;
+
  protected:
   /**
    * @brief Stop the worker thread pool.
@@ -166,7 +197,15 @@ class task_creator {
    * @return The operator node that should be scheduled next, or nullptr if no task should be
    * scheduled.
    */
-  op::sirius_physical_operator* get_operator_for_next_task(op::sirius_physical_operator* node);
+  /// Follows WAITING_FOR_INPUT_DATA hints upstream to the operator that can
+  /// produce next. get_next_task_hint() is side-effecting at every level (it
+  /// can drain ports and make that pipeline finishable), so every pipeline the
+  /// walk visits is appended to @p visited_pipelines for the caller to
+  /// re-evaluate — a pipeline whose tasks all completed earlier gets no later
+  /// mark_task_completed() to do it.
+  op::sirius_physical_operator* get_operator_for_next_task(
+    op::sirius_physical_operator* node,
+    std::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& visited_pipelines);
 
   /**
    * @brief Manager loop to consume task creation requests and dispatch to the thread pool.
@@ -201,22 +240,29 @@ class task_creator {
   std::unique_ptr<duckdb::ExecutionContext> _execution_context;
   std::mutex _global_state_mutex;  // Protect concurrent access to the map
 
-  /// System topology for NUMA-aware GPU routing (non-owning, may be null)
-  const cucascade::memory::system_topology_info* _sys_topology{nullptr};
-  /// Maps NUMA node ID -> all GPU device_ids on that NUMA node (for HOST data
-  /// locality). A NUMA node can host multiple GPUs; the NUMA-affinity rule
-  /// round-robins across the vector so work spreads instead of pinning to the
-  /// first GPU.
-  /// GPUs that report numa_node=-1 (non-NUMA / single-NUMA hosts, per the
-  /// Linux /sys/bus/pci/devices/*/numa_node convention) are normalized to
-  /// NUMA 0 so they match the host memory space built for the single node.
-  std::unordered_map<int, std::vector<int>> _numa_to_gpu;
+  /// Shared GPU<->NUMA topology index for NUMA-aware GPU routing (may be null).
+  /// Scoped to the memory manager's reserved GPU/HOST spaces:
+  ///  - gpus_of(numa) drives HOST-data locality (a NUMA node can host multiple
+  ///    GPUs; the round-robin below spreads work across them). NUMA node -1 is
+  ///    the "unknown" key (non-NUMA / single-NUMA hosts) and is queried
+  ///    verbatim from the host memory space's device id.
+  ///  - gpu_ids() is the active executor set that partition affinity indexes,
+  ///    so the pin resolves to a real executor when num_gpus < physical count.
+  std::shared_ptr<const sirius::memory::topology_index> _topology_index;
   /// Round-robin counter for NUMA-affinity routing when multiple GPUs share a NUMA node.
-  std::atomic<uint64_t> _numa_to_gpu_rr{0};
-  /// Sorted device ids that actually have a GPU executor (memory-manager GPU
-  /// spaces). Partition affinity indexes this, not the physical topology, so the
-  /// pin resolves to a real executor when num_gpus < physical GPU count.
+  std::atomic<uint64_t> _numa_affinity_rr{0};
+  /// Separate from _numa_affinity_rr. A task can take a NUMA pick and then be clamped, so
+  /// sharing one counter advances it twice per task: against an even subset size the stride
+  /// never changes parity and every clamped task lands on the same GPU.
+  std::atomic<uint64_t> _admission_rr{0};
+  /// Sorted, deduped GPU device ids this query is admitted onto: every executor at
+  /// construction, narrowed per query by `set_active_gpu_ids()`. Partition affinity indexes
+  /// it (`_active_gpu_ids[partition_idx % size]`) and must stay in the same sorted order
+  /// sirius_physical_partition uses for its device->slot map, so the two stay inverse.
   std::vector<int> _active_gpu_ids;
+  /// GPU count before this query was narrowed, from the same list the admitted set was cut
+  /// from; `_active_gpu_ids.size() < this` means the query is on a strict subset.
+  std::size_t _full_gpu_count{0};
 };
 
 }  // namespace sirius::creator

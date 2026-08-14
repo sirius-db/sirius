@@ -24,6 +24,10 @@
 #include <string>
 #include <utility>
 
+namespace sirius {
+struct sirius_config;
+}  // namespace sirius
+
 namespace duckdb {
 class GPUBufferManager;
 struct DBConfig;
@@ -66,7 +70,10 @@ class SiriusExtension : public Extension {
   void Load(ExtensionLoader& loader) override;
   std::string Name() override;
   std::string Version() const override;
-  static void InitialGPUConfigs(DBConfig& db);
+  /// Register Sirius's extension options. @p defaults supplies the registered default for every
+  /// option DuckDB stores per connection, so a sirius.yaml value reaches those connections as
+  /// their inherited starting point instead of being shadowed by the compiled default.
+  static void InitialGPUConfigs(DBConfig& db, const sirius::sirius_config& defaults);
   static void RegisterGPUFunctions(DatabaseInstance& catalog);
 #ifdef SIRIUS_ENABLE_LEGACY
   static void GPUProcessingSubstraitFunction(ClientContext& context,
@@ -100,6 +107,11 @@ class SiriusExtension : public Extension {
                                                    TableFunctionBindInput& input,
                                                    vector<LogicalType>& return_types,
                                                    vector<string>& names);
+  /// Per-execution state factory for gpu_execution(): a reusable prepared
+  /// statement gets fresh execution state (result/connection/interface) on
+  /// every execute instead of reusing bind-held state.
+  static unique_ptr<GlobalTableFunctionState> GPUExecutionInitGlobal(ClientContext& context,
+                                                                     TableFunctionInitInput& input);
 
   static void PinTableFunction(ClientContext& context,
                                TableFunctionInput& data_p,

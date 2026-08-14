@@ -25,6 +25,10 @@
 #include "op/sirius_physical_top_n.hpp"
 #include "sirius_config.hpp"
 
+namespace duckdb {
+class SiriusContext;
+}  // namespace duckdb
+
 namespace sirius {
 namespace op {
 
@@ -54,8 +58,8 @@ class sirius_physical_partition : public sirius_physical_operator {
     duckdb::vector<sirius::logical_type> types,
     std::size_t estimated_cardinality,
     sirius_physical_operator* key_source,
-    bool is_build                 = false,
-    uint64_t hash_partition_bytes = sirius::config::DEFAULT_HASH_PARTITION_BYTES);
+    bool is_build                                              = false,
+    duckdb::SiriusContext* compressed_materialization_observer = nullptr);
 
   std::string get_name() const override;
 
@@ -96,15 +100,26 @@ class sirius_physical_partition : public sirius_physical_operator {
 
   void set_num_partitions(int num_partitions);
 
-  /// Set a floor for num_partitions. The partition-consumer downstream (hash
-  /// join, merge_group_by) pins each partition to partition_idx % num_gpus,
-  /// so we need at least num_gpus partitions for all GPUs to see work on big
-  /// inputs. Small inputs fall below `small_table_bytes` and stay at one
-  /// partition (runs on a single GPU).
-  void set_min_num_partitions(int min_num_partitions, uint64_t small_table_bytes)
+  /// The downstream consumer that decides this partition's count / broadcast strategy (the
+  /// HASH_JOIN / NESTED_LOOP_JOIN this partition feeds, or the MERGE_GROUP_BY above a group-by
+  /// partition). Distinct from `key_source` (which only supplies partition keys) and from the batch
+  /// receiver in `next_port_after_sink` (a CONCAT, for joins). Set at plan time.
+  void set_downstream_consumer_op(sirius_physical_operator* consumer)
   {
-    _min_num_partitions = min_num_partitions;
-    _small_table_bytes  = small_table_bytes;
+    _downstream_consumer_op = consumer;
+  }
+
+  [[nodiscard]] sirius_physical_operator* get_downstream_consumer_op() const
+  {
+    return _downstream_consumer_op;
+  }
+
+  /// The sorted, deduped device ids of the GPUs the query runs on — identical to the list
+  /// task_creator routes partitions across (`_active_gpu_ids[partition_idx % size]`). Used by
+  /// broadcast mode to map a probe batch's residence GPU back to its partition slot.
+  void set_active_gpu_ids(std::vector<int> active_gpu_ids)
+  {
+    _active_gpu_ids = std::move(active_gpu_ids);
   }
 
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
@@ -113,13 +128,19 @@ class sirius_physical_partition : public sirius_physical_operator {
  private:
   void get_partition_keys_and_type(sirius_physical_operator* op, bool is_build = false);
 
-  /// Looks at the amount of data waiting on the input port and determines the number of partitions
-  /// to create. Returns a pair of (num_partitions, total_bytes).
-  std::pair<int, uint64_t> determine_num_partitions();
+  /// Sum the bytes of all batches waiting on this partition's input port. Fed to the downstream
+  /// consumer's get_partition_strategy, which turns it into a partition count.
+  uint64_t compute_total_bytes();
+
+  /// The partition slot for a batch residing on `device_id`: its index in `_active_gpu_ids`
+  /// (so task_creator routes that slot back to the same GPU). Returns 0 if not found (a
+  /// safe fallback that keeps the batch on some valid slot).
+  [[nodiscard]] std::size_t slot_for_device(int device_id) const;
   sirius_physical_operator* _sibling_partition_op = nullptr;
-  sirius_physical_operator* _hash_join_op =
-    nullptr;  // hash join operator that this partition operator feeds into (optional: for
-              // hash_joins only)
+  //! The downstream consumer that decides this partition's count / broadcast (see
+  //! set_downstream_consumer_op). Always a partition-sizing consumer (HASH_JOIN / NESTED_LOOP_JOIN
+  //! / MERGE_GROUP_BY).
+  sirius_physical_operator* _downstream_consumer_op = nullptr;
   std::vector<int> _partition_keys;
   /// One entry per partition key. type_id::EMPTY means "hash as-is"; any other id means
   /// cast the key column to this type before hashing.  Used to align hash values when the
@@ -130,9 +151,16 @@ class sirius_physical_partition : public sirius_physical_operator {
   bool _drives_partition_count{false};
   bool _has_sibling_partition_op;
   PartitionType _partition_type;
-  uint64_t s_partition_size;
-  int _min_num_partitions{1};
-  uint64_t _small_table_bytes{0};
+  /// Sorted, deduped active GPU device ids (see set_active_gpu_ids). Empty when unset / single-GPU.
+  std::vector<int> _active_gpu_ids;
+  /// Broadcast mode: the build table is small enough to replicate to every GPU instead of
+  /// hash-partitioning. Set on BOTH sibling partition ops when the join accepts BUILD_PROBE at
+  /// num_gpus partitions. Build side deposits its batch into every slot; probe side deposits each
+  /// batch into the slot matching its current GPU. See get_next_task_input_data / sink.
+  bool _broadcast{false};
+  /// Non-owning observer for the narrow-passthrough counter. The registered-state shared_ptr owns
+  /// the context for at least as long as the query plan; unit-test operators may leave it null.
+  duckdb::SiriusContext* _compressed_materialization_observer = nullptr;
 };
 
 }  // namespace op

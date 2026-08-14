@@ -15,7 +15,7 @@ use quent_analyzer::{
         events::{FsmEvents, FsmEventsBuilder},
     },
 };
-use quent_attributes::Attribute;
+use quent_dynamic_attributes::DynamicAttribute;
 use quent_query_engine_ui::OperatorFilter;
 use quent_time::{TimeUnixNanoSec, Timestamp, span::SpanUnixNanoSec, to_secs_relative};
 use quent_ui::{FiniteStateMachine, FsmTransition, FsmUsage};
@@ -59,9 +59,10 @@ impl TaskExt for Task {
     }
 
     fn matches_filter(&self, filter: &OperatorFilter) -> bool {
-        filter
-            .operator_id
-            .is_none_or(|pipeline_uuid| self.pipeline_uuid() == Some(pipeline_uuid))
+        filter.operator_ids.is_empty()
+            || self
+                .pipeline_uuid()
+                .is_some_and(|pipeline_uuid| filter.operator_ids.contains(&pipeline_uuid))
     }
 
     fn active_span(&self) -> Option<SpanUnixNanoSec> {
@@ -92,7 +93,7 @@ impl TaskExt for Task {
                 {
                     let span_secs = (next.timestamp() - transition.timestamp()) as f64 / 1e9;
                     if span_secs > 0.0 {
-                        derived_attributes.push(Attribute::f64(
+                        derived_attributes.push(DynamicAttribute::f64(
                             "bytes_per_sec",
                             input_bytes as f64 / span_secs,
                         ));
@@ -101,7 +102,7 @@ impl TaskExt for Task {
                 // Stamped on every transition — created, which carries
                 // pipeline_uuid, is filtered off resource lanes.
                 if let Some(name) = pipeline_name {
-                    derived_attributes.push(Attribute::string("pipeline", name));
+                    derived_attributes.push(DynamicAttribute::string("pipeline", name));
                 }
                 Ok(FsmTransition {
                     name: transition.name().to_string(),

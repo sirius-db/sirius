@@ -35,8 +35,10 @@
 #include "memory/topology_index.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_sql_rewrite.hpp"
+#include "telemetry/batch_telemetry.hpp"
 #include "transparent/physical_sirius_execution.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
+#include "util/duckdb_error_message.hpp"
 
 #include <cudf/utilities/pinned_memory.hpp>
 
@@ -49,13 +51,18 @@
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 #include <duckdb/common/allocator.hpp>
+#include <duckdb/execution/operator/persistent/physical_insert.hpp>
+#include <duckdb/execution/operator/persistent/physical_merge_into.hpp>
+#include <duckdb/execution/operator/persistent/physical_update.hpp>
 #include <duckdb/execution/physical_plan_generator.hpp>
 #include <io/types.hpp>
 #include <io/uring/uring_ioctx.hpp>
 #include <sys/resource.h>
 #include <unistd.h>  // for isatty/fileno
 
+#include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>   // for fprintf/fileno (fallback banner)
 #include <cstdlib>  // for std::getenv
@@ -65,6 +72,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <variant>
 
@@ -76,6 +84,89 @@ static constexpr std::string_view CONFIG_FILE_NAME        = "sirius.yaml";
 static constexpr std::string_view LEGACY_CONFIG_FILE_NAME = "sirius.cfg";
 static constexpr std::string_view CONFIG_FILE_DIR         = ".sirius";
 static constexpr std::string_view CONFIG_FILE_ENV_NAME    = "SIRIUS_CONFIG_FILE";
+
+optional_ptr<TableCatalogEntry const> find_update_target(PhysicalOperator const& op)
+{
+  switch (op.type) {
+    case PhysicalOperatorType::UPDATE: return &op.Cast<PhysicalUpdate>().tableref;
+    case PhysicalOperatorType::INSERT: {
+      auto const& insert = op.Cast<PhysicalInsert>();
+      if (insert.action_type == OnConflictAction::UPDATE && insert.insert_table) {
+        return &*insert.insert_table;
+      }
+      break;
+    }
+    case PhysicalOperatorType::MERGE_INTO: {
+      auto const& merge = op.Cast<PhysicalMergeInto>();
+      for (auto const& action : merge.actions) {
+        if (action->action_type == MergeActionType::MERGE_UPDATE && action->op) {
+          return find_update_target(*action->op);
+        }
+      }
+      break;
+    }
+    default: break;
+  }
+  for (auto const& child : op.GetChildren()) {
+    if (auto target = find_update_target(child.get())) { return target; }
+  }
+  return nullptr;
+}
+
+std::optional<std::string> pinned_name_for_table(
+  sirius::scan_manager::sirius_scan_manager const& scan_manager, TableCatalogEntry const& table)
+{
+  std::optional<std::string> result;
+  scan_manager.visit_pinned_entries([&](std::string_view name, auto const& entry) {
+    if (!entry.cache_info.matches_duckdb_table(
+          table.ParentCatalog().GetName(), table.ParentSchema().name, table.name)) {
+      return true;
+    }
+    result = name;
+    return false;
+  });
+  return result;
+}
+
+void reject_update_to_pinned_table(SiriusContext& sirius_context,
+                                   ClientContext& context,
+                                   PreparedStatementData& prepared)
+{
+  switch (prepared.statement_type) {
+    case StatementType::UPDATE_STATEMENT:
+    case StatementType::INSERT_STATEMENT:
+    case StatementType::MERGE_INTO_STATEMENT: break;
+    default: return;
+  }
+  if (!prepared.physical_plan) { return; }
+  auto target = find_update_target(prepared.physical_plan->Root());
+  if (!target) { return; }
+
+  auto connection_state = get_sirius_connection_state(context);
+  if (!connection_state) {
+    throw InternalException("Sirius connection state is unavailable while guarding UPDATE");
+  }
+
+  std::shared_lock<std::shared_mutex> update_guard;
+  if (!connection_state->has_pinned_update_guard()) {
+    update_guard = sirius_context.lock_pinned_table_updates();
+  }
+  {
+    SiriusContext::SlotGuard pin_registry_guard(sirius_context, context);
+    auto pinned_name = pinned_name_for_table(sirius_context.get_scan_manager(), *target);
+    if (pinned_name) {
+      throw InvalidInputException(
+        "Sirius does not support UPDATE on pinned DuckDB table '%s'. Run CALL "
+        "unpin_table('%s') before updating it",
+        target->name,
+        *pinned_name);
+    }
+  }
+
+  if (update_guard.owns_lock()) {
+    connection_state->set_pinned_update_guard(std::move(update_guard));
+  }
+}
 
 /// Resolve the config file path. Search order:
 ///   1. SIRIUS_CONFIG_FILE environment variable (explicit path)
@@ -172,20 +263,28 @@ void SiriusContext::log_pool_stats(std::string_view tag) const
 
 void SiriusContext::QueryBegin(ClientContext& context)
 {
-  // Suppress all state mutations for internal connections (e.g. internal metadata lookups).
-  if (is_internal_query_active()) { return; }
+  // Suppress logging for internal connections (e.g. internal metadata lookups).
+  if (is_internal_query_active(context)) { return; }
 
-  acquire_query_lifecycle_slot();
-
+  // Advance the per-connection query ordinal FIRST, before any best-effort
+  // observation: even if the SQL capture or logging below fails, the next
+  // execution window must see a FRESH ordinal — a stale one would correlate
+  // that window to the PREVIOUS query's SQL line instead of standing alone as
+  // a window without SQL. next_query_ordinal() is noexcept.
+  shared_ptr<SiriusConnectionState> conn_state;
+  uint64_t query_ordinal = 0;
   try {
-    log_pool_stats("QueryBegin");
+    conn_state = get_sirius_connection_state(context);
+  } catch (...) {  // resolution failure: fall through to keyless logging
+  }
+  if (conn_state) { query_ordinal = conn_state->next_query_ordinal(); }
 
-    // Clear any stale captured plan from a previous query.
-    captured_logical_plan_.reset();
-
-    // Reset operator ID counter so each query starts from 0
-    sirius::op::sirius_physical_operator::next_operator_id.store(0);
-
+  // QueryBegin holds no lock and mutates no shared state: slot ownership is
+  // scope-bound (StandaloneQueryScope/SlotGuard) and the begin mutations run
+  // inside the execution window. Everything below is observation only and
+  // best-effort; a logging or allocation failure must not fail the query it
+  // decorates.
+  try {
     auto query = context.GetCurrentQuery();
     // Collapse every run of whitespace (incl. newlines/tabs) to a single space,
     // trim leading/trailing whitespace, and log the full normalized query so
@@ -206,82 +305,315 @@ void SiriusContext::QueryBegin(ClientContext& context)
     if (!normalized_query.empty() && normalized_query.back() == ' ') {
       normalized_query.pop_back();
     }
-    SIRIUS_LOG_INFO("QueryBegin: SQL: {}", normalized_query);
-
-    task_creator_->reset();
-    task_creator_->set_client_context(context);
-  } catch (...) {
-    release_query_lifecycle_slot();
-    throw;
+    // ONE line carrying both the correlation key and the SQL (two separate lines
+    // could interleave with another connection's logging); execution windows and
+    // pool lines carry the same instance/connection key. The trailing
+    // "SQL: <sql>" form is preserved for log-analyzer text correlation.
+    if (conn_state) {
+      SIRIUS_LOG_INFO("QueryBegin: instance={} connection={} query={} SQL: {}",
+                      static_cast<const void*>(this),
+                      conn_state->connection_id(),
+                      query_ordinal,
+                      normalized_query);
+    } else {
+      SIRIUS_LOG_INFO("QueryBegin: SQL: {}", normalized_query);
+    }
+  } catch (...) {  // best-effort observability
   }
 }
 
 void SiriusContext::QueryEnd()
 {
-  // Suppress state mutations triggered by internal connections (e.g. internal metadata lookups).
-  if (is_internal_query_active()) { return; }
-
-  try {
-    SIRIUS_LOG_INFO("QueryEnd");
-    captured_logical_plan_.reset();
-
-    query_.reset();
-
-    // Drain all downgrade executors before clearing repositories — ensures no downgrade
-    // tasks hold shared_ptr<data_batch> references to batches we're about to destroy.
-    for (auto& executor : downgrade_executors_) {
-      executor->drain();
-    }
-
-    // Clear all data repositories between queries.
-    // Any batches still present are leaked — operators should have popped everything.
-    if (data_repository_manager_) {
-      auto leaked = data_repository_manager_->clear_all_repositories();
-      for (auto const& info : leaked) {
-        SIRIUS_LOG_WARN(
-          "SiriusContext::QueryEnd: operator {} port '{}' still had {} un-consumed "
-          "data batch(es) (memory leak).",
-          info.operator_id,
-          info.port_id,
-          info.count);
-      }
-    }
-
-    // Drop scan-manager providers for this query. Each cached_split_provider
-    // holds shared_ptr copies of the pinned entry's host_chunks; if kept past
-    // the query, those refs prevent fixed_size_host_memory_resource blocks from
-    // returning to the pool even after unpin_table runs. Repositories are
-    // already cleared above, so downstream data_batches that referenced
-    // sliced host_data_representation are gone before we drop the providers.
-    if (scan_manager_) { scan_manager_->reset(); }
-
-    log_pool_stats("QueryEnd");
-  } catch (...) {
-    release_query_lifecycle_slot();
-    throw;
-  }
-
-  // Drop per-query global states held by task_creator. These include
-  // duckdb_scan_task_global_state, which transitively owns a
-  // duckdb::DuckTableScanState referencing BufferManager-owned BlockHandles.
-  // If we leave this state alive past QueryEnd, ~task_creator at SiriusContext
-  // teardown ends up releasing those BlockHandles after parts of DuckDB's
-  // DatabaseInstance have already been torn down (~DBConfig fires ~SiriusContext
-  // mid-DB destruction), which SIGSEGVs in ~BlockMemory.
-  if (task_creator_) { task_creator_->reset(); }
-  release_query_lifecycle_slot();
+  // The DuckDB query-end callback releases nothing: slot ownership is
+  // scope-bound and the mandatory cleanup runs inside the execution window
+  // (StandaloneQueryScope::finish), before the result is exposed. Kept as the
+  // ClientContextState interface hook.
 }
 
 void SiriusContext::QueryEnd(ClientContext& context)
 {
-  if (is_internal_query_active()) { return; }
-  restore_transparent_disabled_optimizers(context);
+  if (is_internal_query_active(context)) { return; }
   QueryEnd();
 }
 
 void SiriusContext::QueryEnd(ClientContext& context, optional_ptr<ErrorData> error)
 {
   QueryEnd(context);
+}
+
+bool SiriusContext::is_internal_query_active(ClientContext& context) noexcept
+{
+  auto conn_state = get_sirius_connection_state(context);
+  return conn_state && conn_state->is_internal_query_active();
+}
+
+void SiriusContext::throw_runtime_unavailable() const
+{
+  // IS-A ExecutorException: deliberately non-invalidating (INTERNAL/FATAL
+  // would invalidate the whole DatabaseInstance and defeat "CPU queries
+  // continue"). Typed so entry points can classify it without text matching.
+  throw SiriusRuntimeUnavailableException(
+    "Sirius GPU runtime is unavailable after a mandatory cleanup failure; "
+    "CPU execution continues. Restart the process to restore GPU execution.");
+}
+
+void SiriusContext::begin_execution_window(ClientContext& context,
+                                           sirius::query_id_t query_id,
+                                           std::string_view window_label,
+                                           std::string_view pool_tag)
+{
+  // Runs inside the held slot, after acquire and the health check and before
+  // the final create_plan.
+  // Logging around the mutations is best-effort: a logging failure must never
+  // leave the runtime half-begun (the mutations themselves are the only
+  // throwing steps that matter; a throw here is handled by the scope ctor's
+  // backstop-then-release path).
+  try {
+    log_pool_stats(pool_tag);
+    SIRIUS_LOG_INFO("QueryBegin: {}", window_label);
+  } catch (...) {  // best-effort observability
+  }
+  // Register this query's repository manager up front
+  data_repository_registry_.create_for_query(query_id);
+  task_creator_->reset();
+  task_creator_->set_client_context(context);
+  // GPU admission runs later, in sirius_engine::initialize_internal().
+}
+
+void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::string_view end_tag)
+{
+  // Observability inside the cleanup is best-effort: only the mandatory steps
+  // (query/drain/repository/scan/task resets) may throw out of this function
+  // and thereby poison the runtime — a logging or telemetry failure must not.
+  try {
+    SIRIUS_LOG_INFO("QueryEnd");
+  } catch (...) {
+  }
+
+  query_.reset();
+
+  // Drain all downgrade executors before clearing repositories — ensures no downgrade
+  // tasks hold shared_ptr<data_batch> references to batches we're about to destroy.
+  for (auto& executor : downgrade_executors_) {
+    executor->drain();
+  }
+
+  // Close out batch placements still alive (un-consumed repo contents,
+  // result-collector outputs) before their repositories are cleared.
+  // Best-effort: telemetry failure must not abort the remaining mandatory
+  // steps or poison the runtime.
+  try {
+    sirius::telemetry::batch_telemetry_registry::instance().on_query_end();
+  } catch (std::exception& e) {
+    try {
+      SIRIUS_LOG_WARN("batch telemetry on_query_end failed (ignored): {}", e.what());
+    } catch (...) {
+    }
+  } catch (...) {
+  }
+
+  // Drop THIS query's data repositories, leaving any other in-flight query's untouched.
+  // Any batches still present are leaked — operators should have popped everything.
+  // Safe to clear here because the downgrade executors were drained above, so nothing still
+  // holds a raw data_repository* borrowed from this query's manager.
+  {
+    auto leaked = data_repository_registry_.erase(query_id);
+    try {
+      for (auto const& info : leaked) {
+        SIRIUS_LOG_WARN(
+          "SiriusContext::run_mandatory_cleanup: query {} operator {} port '{}' still had {} "
+          "un-consumed data batch(es) (memory leak).",
+          query_id,
+          info.operator_id,
+          info.port_id,
+          info.count);
+      }
+    } catch (...) {  // best-effort observability
+    }
+  }
+
+  // Drop scan-manager providers for this query. Repositories are already
+  // cleared above, so downstream data_batches that referenced sliced
+  // host_data_representation are gone before the providers go away.
+  if (scan_manager_) { scan_manager_->reset(); }
+
+  // Drop per-query global states held by task_creator. These include
+  // duckdb_scan_task_global_state, which transitively owns a
+  // duckdb::DuckTableScanState referencing BufferManager-owned BlockHandles.
+  // If we leave this state alive past the window, ~task_creator at
+  // SiriusContext teardown ends up releasing those BlockHandles after parts of
+  // DuckDB's DatabaseInstance have already been torn down (~DBConfig fires
+  // ~SiriusContext mid-DB destruction), which SIGSEGVs in ~BlockMemory.
+  if (task_creator_) { task_creator_->reset(); }
+
+  try {
+    log_pool_stats(end_tag);
+  } catch (...) {  // best-effort observability
+  }
+}
+
+void SiriusContext::run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
+                                                   std::string_view end_tag) noexcept
+{
+  try {
+    run_mandatory_cleanup(query_id, end_tag);
+  } catch (std::exception& e) {
+    mark_runtime_unavailable();
+    drop_task_creator_state_best_effort();
+    try {
+      SIRIUS_LOG_ERROR(
+        "Mandatory per-query cleanup failed during unwind; marking the Sirius runtime "
+        "unavailable: {}",
+        e.what());
+    } catch (...) {
+    }
+  } catch (...) {
+    mark_runtime_unavailable();
+    drop_task_creator_state_best_effort();
+    try {
+      SIRIUS_LOG_ERROR(
+        "Mandatory per-query cleanup failed during unwind (unknown exception); marking the "
+        "Sirius runtime unavailable");
+    } catch (...) {
+    }
+  }
+}
+
+void SiriusContext::drop_task_creator_state_best_effort() noexcept
+{
+  // Once the runtime is latched unavailable no later window will run the
+  // task_creator reset, so the failed query's per-query global state (and the
+  // buffer handles it retains) would survive until ~task_creator during DB
+  // teardown — the exact shutdown-order crash the in-window reset prevents.
+  try {
+    if (task_creator_) { task_creator_->reset(); }
+  } catch (...) {
+  }
+}
+
+SiriusContext::SlotGuard::SlotGuard(SiriusContext& ctx, ClientContext& context) : ctx_(ctx)
+{
+  ctx_.acquire_query_lifecycle_slot(&context);
+}
+
+SiriusContext::SlotGuard::~SlotGuard() noexcept { ctx_.release_query_lifecycle_slot(); }
+
+void SiriusContext::StandaloneQueryScope::log_window_event(char const* event,
+                                                           char const* outcome) const noexcept
+{
+  try {
+    SIRIUS_LOG_INFO("[window] {} instance={} connection={} window={} query={} outcome={}",
+                    event,
+                    static_cast<const void*>(&ctx_),
+                    connection_id_,
+                    window_id_,
+                    query_ordinal_,
+                    outcome);
+  } catch (...) {  // logging is best-effort and must never retain the slot
+  }
+}
+
+SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
+                                                          ClientContext& context,
+                                                          std::string_view window_label)
+  : ctx_(ctx), window_id_(sirius::make_query_id(0)), connection_id_(0), query_ordinal_(0)
+{
+  if (auto conn_state = get_sirius_connection_state(context)) {
+    connection_id_ = conn_state->connection_id();
+    query_ordinal_ = conn_state->current_query_ordinal();
+  }
+  // Window id + keyed tags are prepared BEFORE the slot is acquired: after
+  // acquire, no statement on any path allocates, so release cannot be skipped
+  // (and the noexcept destructor cannot terminate) for an allocation reason.
+  window_id_ =
+    sirius::make_query_id(ctx_.next_window_id_.fetch_add(1, std::memory_order_relaxed) + 1);
+  std::snprintf(begin_tag_,
+                sizeof(begin_tag_),
+                "QueryBegin instance=%p connection=%llu window=%llu query=%llu",
+                static_cast<const void*>(&ctx_),
+                static_cast<unsigned long long>(connection_id_),
+                static_cast<unsigned long long>(sirius::value_of(window_id_)),
+                static_cast<unsigned long long>(query_ordinal_));
+  std::snprintf(end_tag_,
+                sizeof(end_tag_),
+                "QueryEnd instance=%p connection=%llu window=%llu query=%llu",
+                static_cast<const void*>(&ctx_),
+                static_cast<unsigned long long>(connection_id_),
+                static_cast<unsigned long long>(sirius::value_of(window_id_)),
+                static_cast<unsigned long long>(query_ordinal_));
+
+  ctx_.acquire_query_lifecycle_slot(&context);
+  log_window_event("begin", "-");
+  try {
+    ctx_.begin_execution_window(context, window_id_, window_label, begin_tag_);
+  } catch (std::exception& e) {
+    // A failed begin may have left the shared runtime part-mutated. This must
+    // NEVER be classified as an ordinary GPU failure (which entry points would
+    // CPU-fall-back on): latch unavailability, attempt the backstop cleanup,
+    // release, and throw the distinguishable begin-failure error. Entry-point
+    // catch blocks rethrow it as-is instead of falling back.
+    state_ = scope_state::FAILED;
+    ctx_.mark_runtime_unavailable();
+    ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
+    log_window_event("end", "begin_failed");
+    ctx_.release_query_lifecycle_slot();
+    throw SiriusBeginWindowFailureException(
+      string("Sirius execution-window initialization failed (runtime marked unavailable): ") +
+      e.what());
+  } catch (...) {
+    state_ = scope_state::FAILED;
+    ctx_.mark_runtime_unavailable();
+    ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
+    log_window_event("end", "begin_failed");
+    ctx_.release_query_lifecycle_slot();
+    throw SiriusBeginWindowFailureException(
+      "Sirius execution-window initialization failed (runtime marked unavailable): "
+      "unknown exception");
+  }
+}
+
+void SiriusContext::StandaloneQueryScope::finish()
+{
+  if (state_ != scope_state::ACTIVE) { return; }
+  // Release is guaranteed on EVERY path out of this function — including a
+  // logging throw — by this non-throwing releaser; nothing below can retain
+  // the slot.
+  struct slot_releaser {
+    SiriusContext& ctx;
+    ~slot_releaser() noexcept { ctx.release_query_lifecycle_slot(); }
+  } releaser{ctx_};
+
+  try {
+    ctx_.run_mandatory_cleanup(window_id_, end_tag_);
+  } catch (...) {
+    // A mandatory-cleanup failure means the shared runtime can no longer be
+    // trusted; the destructor must NOT run a second pass over half-cleaned
+    // state. Latch unavailability, drop task_creator's per-query state (the
+    // failed cleanup may have thrown before that step, and no later window
+    // will run it once the latch is set — retained buffer handles must not
+    // survive to DB teardown), release (via the releaser), and let the query
+    // error.
+    state_ = scope_state::FAILED;
+    ctx_.mark_runtime_unavailable();
+    ctx_.drop_task_creator_state_best_effort();
+    log_window_event("end", "cleanup_failed");
+    throw;
+  }
+  state_ = scope_state::FINISHED;
+  log_window_event("end", "ok");
+}
+
+SiriusContext::StandaloneQueryScope::~StandaloneQueryScope() noexcept
+{
+  if (state_ != scope_state::ACTIVE) { return; }
+  // Unwind path: finish() never ran (an exception escaped the window body).
+  // One backstop cleanup attempt; on failure the runtime is latched
+  // unavailable. The slot is released exactly once either way; logging is
+  // noexcept-wrapped so the destructor can never terminate.
+  ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
+  log_window_event("end", "unwind");
+  ctx_.release_query_lifecycle_slot();
+  state_ = scope_state::FAILED;
 }
 
 void SiriusContext::initialize(const sirius::sirius_config& config)
@@ -291,8 +623,9 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   config_ = config;
   // Validate the cached topology before any downstream construction so a stub
   // topology fails loudly rather than producing zero-GPU executors silently.
-  // get_hw_topology() is the only authorised source of GPU/NUMA counts —
-  // never call raw CUDA/NUMA device-enumeration APIs directly elsewhere.
+  // get_hw_topology() is the only authorised source of physical GPU/NUMA discovery — never call
+  // raw CUDA/NUMA device-enumeration APIs directly elsewhere. Configured execution GPU ids come
+  // from the memory manager built below.
   auto const& topo = config_.get_hw_topology();
   if (topo.num_gpus == 0) {
     throw std::runtime_error(
@@ -313,17 +646,24 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 
   // Declare one telemetry device group per GPU so thread/queue telemetry can
   // nest under its device instead of piling up flat under the engine. The GPU
-  // memory space configs already reflect the configured topology.num_gpus /
-  // topology.gpu_ids selection, unlike the raw hardware topology.
-  std::vector<int> telemetry_gpu_ids;
-  for (auto const& space_config : config_.get_memory_space_configs()) {
-    if (auto const* gpu_config =
-          std::get_if<cucascade::memory::gpu_memory_space_config>(&space_config)) {
-      telemetry_gpu_ids.push_back(gpu_config->device_id);
-    }
+  // memory manager already reflects the configured topology.num_gpus / topology.gpu_ids
+  // selection, unlike the raw hardware topology.
+  std::vector<int> active_gpu_ids;
+  for (auto const* gpu_space :
+       memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+    if (gpu_space != nullptr) { active_gpu_ids.push_back(gpu_space->get_device_id()); }
   }
+  std::sort(active_gpu_ids.begin(), active_gpu_ids.end());
+  active_gpu_ids.erase(std::unique(active_gpu_ids.begin(), active_gpu_ids.end()),
+                       active_gpu_ids.end());
   telemetry_context_ = sirius::telemetry::telemetry_context::create(
-    config_.get_telemetry_config(), memory_manager_.get(), telemetry_gpu_ids);
+    config_.get_telemetry_config(), memory_manager_.get(), active_gpu_ids);
+
+  if (config_.get_telemetry_config().enable_quent &&
+      config_.get_telemetry_config().enable_batch_events) {
+    sirius::telemetry::batch_telemetry_registry::instance().install(telemetry_context_,
+                                                                    *memory_manager_);
+  }
 
   {
     auto disk_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::DISK);
@@ -348,56 +688,62 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
       SIRIUS_LOG_WARN(
         "SiriusContext: host space count ({}) != NUMA node count ({}) — "
         "expected one host space per NUMA domain. Check "
-        "sirius_config apply_defaults (.use_host_per_numa()) or YAML host "
+        "sirius_config apply_defaults (.use_numa_id_as_host_id()) or YAML host "
         "configuration.",
         mgpu05_host_spaces.size(),
         topo.num_numa_nodes);
     }
   }
 
-  // Enable P2P peer access for every available GPU pair.
+  // Build the single GPU<->NUMA topology index now that the memory manager's
+  // GPU/HOST spaces exist. Every NUMA-aware component below (small-pinned
+  // allocator, downgrade executors, task_creator, scan_manager) shares this one
+  // index by shared_ptr copy instead of rebuilding its own device<->NUMA map.
+  topology_index_ = std::make_shared<const sirius::memory::topology_index>(
+    config_.get_hw_topology(), *memory_manager_);
+
+  // Enable P2P peer access for every configured GPU pair.
   // cucascade::convert_gpu_to_gpu calls cudaMemcpyPeerAsync on every GPU->GPU
   // conversion. For that call to bypass host staging, peer access must be
   // enabled ONCE at init for every (src, dst) pair the host supports.
   // Non-fatal failure mode: SIRIUS_LOG_ERROR and continue — host-staged fallback
   // in cucascade's converter is a correct alternate path.
   {
-    auto const& mgpu06_topo = config_.get_hw_topology();
-    if (mgpu06_topo.num_gpus >= 2) {
-      peer_access_enabled_pairs_.reserve(static_cast<size_t>(mgpu06_topo.num_gpus) *
-                                         (mgpu06_topo.num_gpus - 1));
-      for (unsigned i = 0; i < mgpu06_topo.num_gpus; ++i) {
-        rmm::cuda_set_device_raii guard_i{rmm::cuda_device_id{static_cast<int>(i)}};
-        for (unsigned j = 0; j < mgpu06_topo.num_gpus; ++j) {
-          if (i == j) continue;
+    if (active_gpu_ids.size() >= 2) {
+      peer_access_enabled_pairs_.reserve(active_gpu_ids.size() * (active_gpu_ids.size() - 1));
+      for (int source_device : active_gpu_ids) {
+        rmm::cuda_set_device_raii guard_i{rmm::cuda_device_id{source_device}};
+        for (int target_device : active_gpu_ids) {
+          if (source_device == target_device) continue;
           int can_access = 0;
           cudaError_t probe_err =
-            cudaDeviceCanAccessPeer(&can_access, static_cast<int>(i), static_cast<int>(j));
+            cudaDeviceCanAccessPeer(&can_access, source_device, target_device);
           if (probe_err != cudaSuccess) {
             SIRIUS_LOG_ERROR("SiriusContext: cudaDeviceCanAccessPeer({},{}) failed: {}",
-                             i,
-                             j,
+                             source_device,
+                             target_device,
                              cudaGetErrorString(probe_err));
             continue;
           }
           if (can_access == 0) {
-            SIRIUS_LOG_INFO(
-              "SiriusContext: no P2P access {} -> {} -- falling back to host staging", i, j);
+            SIRIUS_LOG_INFO("SiriusContext: no P2P access {} -> {} -- falling back to host staging",
+                            source_device,
+                            target_device);
             continue;
           }
-          cudaError_t enable_err = cudaDeviceEnablePeerAccess(static_cast<int>(j), 0);
+          cudaError_t enable_err = cudaDeviceEnablePeerAccess(target_device, 0);
           // Always consume sticky error state — cudaErrorPeerAccessAlreadyEnabled
           // (and any other non-fatal condition) persists in the runtime until
           // cudaGetLastError() is called, which would make the NEXT CUDA API
           // call fail spuriously in unrelated code (e.g., thrust::exclusive_scan).
           (void)cudaGetLastError();
           if (enable_err == cudaSuccess || enable_err == cudaErrorPeerAccessAlreadyEnabled) {
-            peer_access_enabled_pairs_.emplace(static_cast<int>(i), static_cast<int>(j));
-            SIRIUS_LOG_INFO("SiriusContext: P2P enabled {} -> {}", i, j);
+            peer_access_enabled_pairs_.emplace(source_device, target_device);
+            SIRIUS_LOG_INFO("SiriusContext: P2P enabled {} -> {}", source_device, target_device);
           } else {
             SIRIUS_LOG_ERROR("SiriusContext: cudaDeviceEnablePeerAccess({}) from ctx {} failed: {}",
-                             j,
-                             i,
+                             target_device,
+                             source_device,
                              cudaGetErrorString(enable_err));
           }
         }
@@ -405,8 +751,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     } else {
       SIRIUS_LOG_INFO(
         "SiriusContext: skipping peer-access enable loop (num_gpus={}); "
-        "single-GPU host has no pairs to enable",
-        mgpu06_topo.num_gpus);
+        "configured GPU set has no pairs to enable",
+        active_gpu_ids.size());
     }
   }
 
@@ -423,26 +769,18 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
         auto* fsmr =
           host_space->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
         if (fsmr == nullptr) { continue; }
-        int raw_numa = host_space->get_device_id();
-        int node     = (raw_numa < 0) ? 0 : raw_numa;
+        // Key each pool by the host space's NUMA node verbatim (-1 is the
+        // "unknown" sentinel), matching topology_index::numa_node_of() so the
+        // allocator's device->node lookups resolve to the right pool.
+        int node = host_space->get_device_id();
         if (fallback_node < 0) { fallback_node = node; }
         per_node_pools.emplace(
           node, std::make_unique<cucascade::memory::small_pinned_host_memory_resource>(*fsmr));
       }
       if (!per_node_pools.empty()) {
         if (fallback_node < 0) { fallback_node = per_node_pools.begin()->first; }
-        std::unordered_map<int, int> device_to_numa_copy;
-        for (auto const* gpu_space :
-             memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
-          int const dev = gpu_space->get_device_id();
-          int raw_numa  = -1;
-          if (dev >= 0 && static_cast<unsigned>(dev) < topo.gpus.size()) {
-            raw_numa = topo.gpus[dev].numa_node;
-          }
-          device_to_numa_copy[dev] = (raw_numa < 0) ? 0 : raw_numa;
-        }
         small_pinned_allocator_ = std::make_unique<sirius::memory::numa_small_pinned_mr>(
-          std::move(per_node_pools), std::move(device_to_numa_copy), fallback_node);
+          std::move(per_node_pools), topology_index_, fallback_node);
         small_pinned_allocator_view_.emplace(
           sirius::memory::make_host_device_resource_view_checked(small_pinned_allocator_.get()));
         prev_pinned_threshold_ = cudf::get_allocate_host_as_pinned_threshold();
@@ -464,7 +802,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     }
   }
 
-  data_repository_manager_ = std::make_unique<cucascade::shared_data_repository_manager>();
+  // Managers are created per execution window (begin_execution_window), not here; the registry
+  // starts empty and only ever holds entries for in-flight queries.
 
   // Create one downgrade executor per GPU memory space BEFORE task_scheduler,
   // so pointers are available for injection into gpu_pipeline_executors.
@@ -479,20 +818,18 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   auto create_executors_for_tier = [&](cucascade::memory::Tier tier) {
     auto spaces          = memory_manager_->get_memory_spaces_for_tier(tier);
     auto const& base_cfg = config_.get_downgrade_executor_config();
-    auto const& topo     = config_.get_hw_topology();
     for (auto* space : spaces) {
       // Copy the base downgrade_executor_config so we can attach a per-GPU NUMA preference
       // without mutating the shared config owned by sirius_config.
       sirius::exec::downgrade_executor_config dg_cfg = base_cfg;
       if (tier == cucascade::memory::Tier::GPU) {
-        auto dev_id = space->get_device_id();
-        if (dev_id >= 0 && static_cast<unsigned>(dev_id) < topo.gpus.size()) {
-          dg_cfg.preferred_numa_node = topo.gpus[dev_id].numa_node;
-        }
+        // NUMA-local host space to prefer for GPU->HOST downgrade. -1 ("unknown",
+        // e.g. single-NUMA hosts) selects the host space with device_id -1.
+        dg_cfg.preferred_numa_node = topology_index_->numa_node_of(space->get_device_id());
       }
       auto executor = std::make_unique<sirius::parallel::downgrade_executor>(
         dg_cfg,
-        *data_repository_manager_,
+        data_repository_registry_,
         space->get_id(),
         const_cast<cucascade::memory::memory_space*>(space),
         *memory_manager_);
@@ -512,14 +849,12 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
                                                        &downgrade_executors_);
 
   task_creator_ = std::make_unique<sirius::creator::task_creator>(
-    config_.get_task_creator_config(), *memory_manager_, &config_.get_hw_topology());
+    config_.get_task_creator_config(), *memory_manager_, topology_index_);
   task_creator_->set_task_scheduler(*task_scheduler_);
   task_scheduler_->set_task_creator(*task_creator_);
 
-  auto hw_topology_index = std::make_shared<const sirius::memory::topology_index>(
-    config_.get_hw_topology(), *memory_manager_);
   scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
-    config_.get_scan_manager_config(), *memory_manager_, std::move(hw_topology_index));
+    config_.get_scan_manager_config(), *memory_manager_, topology_index_);
 
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
   // has been constructed.
@@ -551,6 +886,7 @@ void SiriusContext::terminate()
     executor->stop();
   }
   downgrade_executors_.clear();
+  sirius::telemetry::batch_telemetry_registry::instance().uninstall();
   telemetry_context_.reset();
 
   peer_access_enabled_pairs_.clear();
@@ -566,8 +902,10 @@ void SiriusContext::terminate()
 
   scan_manager_.reset();
 
-  // Drop any remaining repositories while the memory manager is still alive.
-  data_repository_manager_.reset();
+  // Drop any remaining per-query repositories while the memory manager is still alive. The
+  // downgrade executors (the only other holders of a manager reference) were stopped above, so
+  // no borrower can outlive this.
+  data_repository_registry_.clear();
 
   // Restore the previous cuDF pinned memory resource and threshold before destroying the
   // slab allocator — cuDF holds a non-owning reference and would dangle after reset().
@@ -585,6 +923,10 @@ void SiriusContext::terminate()
   memory_manager_->shutdown();
   memory_manager_.reset();
 
+  // Owns only a topology copy (no device resources); drop after the components
+  // that held shared_ptr copies of it are gone.
+  topology_index_.reset();
+
   is_initialized_ = false;
 }
 
@@ -600,16 +942,24 @@ const sirius::memory::sirius_memory_reservation_manager& SiriusContext::get_memo
   return *memory_manager_;
 }
 
-cucascade::shared_data_repository_manager& SiriusContext::get_data_repository_manager()
+sirius::data::data_repository_manager_registry::manager_ptr
+SiriusContext::get_data_repository_manager(sirius::query_id_t query_id) const
 {
   throw_if_not_initialized();
-  return *data_repository_manager_;
+  return data_repository_registry_.get(query_id);
 }
 
-const cucascade::shared_data_repository_manager& SiriusContext::get_data_repository_manager() const
+std::vector<sirius::data::data_repository_manager_registry::manager_ptr>
+SiriusContext::get_data_repository_managers() const
 {
   throw_if_not_initialized();
-  return *data_repository_manager_;
+  return data_repository_registry_.get_all();
+}
+
+sirius::data::data_repository_manager_registry& SiriusContext::get_data_repository_registry()
+{
+  throw_if_not_initialized();
+  return data_repository_registry_;
 }
 
 sirius::pipeline::task_scheduler& SiriusContext::get_task_scheduler()
@@ -675,6 +1025,16 @@ const sirius::scan_manager::sirius_scan_manager& SiriusContext::get_scan_manager
   return *scan_manager_;
 }
 
+std::shared_lock<std::shared_mutex> SiriusContext::lock_pinned_table_updates()
+{
+  return std::shared_lock(pinned_table_update_mutex_);
+}
+
+std::unique_lock<std::shared_mutex> SiriusContext::lock_pinned_table_registry()
+{
+  return std::unique_lock(pinned_table_update_mutex_);
+}
+
 std::shared_ptr<const sirius::telemetry::telemetry_context> SiriusContext::get_telemetry_context()
   const
 {
@@ -684,15 +1044,19 @@ std::shared_ptr<const sirius::telemetry::telemetry_context> SiriusContext::get_t
 
 void SiriusContext::create_query(
   duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
+  sirius::query_id_t query_id,
   sirius::telemetry::query_telemetry_info telemetry_info)
 {
   throw_if_not_initialized();
   query_ = duckdb::make_shared_ptr<sirius::planner::query>(
-    std::move(pipelines), telemetry_context_->context(), telemetry_info);
+    std::move(pipelines), telemetry_context_->context(), query_id, telemetry_info);
   task_scheduler_->prepare_for_query(query_);
   task_creator_->prepare_for_query(*query_);
+  // Reads the admitted subset back off task_creator, so this must run after
+  // initialize_internal has set it — otherwise scan_manager gets the full topology list.
   scan_manager_->prepare_for_query(*query_,
-                                   config_.get_operator_params().enable_pinned_zone_map_pruning);
+                                   config_.get_operator_params().enable_pinned_zone_map_pruning,
+                                   task_creator_->get_active_gpu_ids());
 }
 
 duckdb::shared_ptr<sirius::planner::query> SiriusContext::get_query()
@@ -712,46 +1076,22 @@ bool SiriusContext::is_query_lifecycle_active() const noexcept
   return query_lifecycle_held_.load(std::memory_order_acquire);
 }
 
-void SiriusContext::set_captured_logical_plan(unique_ptr<LogicalOperator> plan)
+SiriusConnectionState::SiriusConnectionState()
 {
-  captured_logical_plan_ = std::move(plan);
+  static std::atomic<uint64_t> next_connection_id{0};
+  connection_id_ = next_connection_id.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
-unique_ptr<LogicalOperator> SiriusContext::take_captured_logical_plan()
+shared_ptr<SiriusConnectionState> get_sirius_connection_state(ClientContext& context)
 {
-  return std::move(captured_logical_plan_);
-}
-
-void SiriusContext::set_pending_query_label(std::string label)
-{
-  pending_query_label_ = std::move(label);
-}
-
-std::optional<std::string> SiriusContext::take_pending_query_label()
-{
-  std::optional<std::string> out;
-  out.swap(pending_query_label_);
-  return out;
-}
-
-void SiriusContext::set_transparent_original_disabled_optimizers(std::set<OptimizerType> disabled)
-{
-  std::lock_guard lock(mutex_);
-  transparent_original_disabled_optimizers_ = std::move(disabled);
-}
-
-void SiriusContext::restore_transparent_disabled_optimizers(ClientContext& context)
-{
-  std::optional<std::set<OptimizerType>> original_disabled_optimizers;
-  {
-    std::lock_guard lock(mutex_);
-    original_disabled_optimizers = std::move(transparent_original_disabled_optimizers_);
-    transparent_original_disabled_optimizers_.reset();
-  }
-
-  if (original_disabled_optimizers) {
-    DBConfig::GetConfig(context).options.disabled_optimizers =
-      std::move(*original_disabled_optimizers);
+  // Callers include noexcept per-query paths (QueryBegin/QueryEnd, the guard
+  // constructors); a lookup failure must degrade to "no per-connection state"
+  // (plain CPU behavior), never escape into a noexcept frame.
+  try {
+    static const string key = "sirius_connection_state";
+    return context.registered_state->Get<SiriusConnectionState>(key);
+  } catch (...) {
+    return nullptr;
   }
 }
 
@@ -784,6 +1124,63 @@ void SiriusContext::record_transparent_execution() noexcept
 void SiriusContext::record_transparent_runtime_fallback() noexcept
 {
   transparent_runtime_fallback_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+SiriusContext::compressed_materialization_stats
+SiriusContext::get_compressed_materialization_stats() const noexcept
+{
+  return compressed_materialization_stats{
+    .scan_columns_narrowed =
+      compressed_materialization_scan_columns_narrowed_count_.load(std::memory_order_relaxed),
+    .scan_columns_restored =
+      compressed_materialization_scan_columns_restored_count_.load(std::memory_order_relaxed),
+    .pin_columns_narrowed =
+      compressed_materialization_pin_columns_narrowed_count_.load(std::memory_order_relaxed),
+    .scan_sidecars_installed =
+      compressed_materialization_scan_sidecars_installed_count_.load(std::memory_order_relaxed),
+    .partition_narrow_columns =
+      compressed_materialization_partition_narrow_columns_count_.load(std::memory_order_relaxed),
+    .scan_narrow_targets_retracted =
+      compressed_materialization_scan_narrow_targets_retracted_count_.load(
+        std::memory_order_relaxed),
+  };
+}
+
+void SiriusContext::record_compressed_materialization_scan_columns_narrowed(uint64_t count) noexcept
+{
+  compressed_materialization_scan_columns_narrowed_count_.fetch_add(count,
+                                                                    std::memory_order_relaxed);
+}
+
+void SiriusContext::record_compressed_materialization_scan_columns_restored(uint64_t count) noexcept
+{
+  compressed_materialization_scan_columns_restored_count_.fetch_add(count,
+                                                                    std::memory_order_relaxed);
+}
+
+void SiriusContext::record_compressed_materialization_pin_columns_narrowed(uint64_t count) noexcept
+{
+  compressed_materialization_pin_columns_narrowed_count_.fetch_add(count,
+                                                                   std::memory_order_relaxed);
+}
+
+void SiriusContext::record_compressed_materialization_scan_sidecar_installed() noexcept
+{
+  compressed_materialization_scan_sidecars_installed_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SiriusContext::record_compressed_materialization_partition_narrow_columns(
+  uint64_t count) noexcept
+{
+  compressed_materialization_partition_narrow_columns_count_.fetch_add(count,
+                                                                       std::memory_order_relaxed);
+}
+
+void SiriusContext::record_compressed_materialization_scan_narrow_targets_retracted(
+  uint64_t count) noexcept
+{
+  compressed_materialization_scan_narrow_targets_retracted_count_.fetch_add(
+    count, std::memory_order_relaxed);
 }
 
 namespace {
@@ -853,6 +1250,18 @@ bool duckdb_fallback_enabled(ClientContext& context)
   return true;
 }
 
+bool compressed_materialization_enabled(ClientContext& context)
+{
+  Value setting;
+  if (context.TryGetCurrentSetting("enable_compressed_materialization", setting) &&
+      !setting.IsNull()) {
+    return setting.GetValue<bool>();
+  }
+  // Reached only when the extension option is not registered, which is every caller that runs
+  // without a loaded Sirius extension.
+  return sirius::operator_params{}.enable_compressed_materialization;
+}
+
 void print_cpu_fallback_banner()
 {
   const bool tty  = ::isatty(::fileno(stdout)) != 0;
@@ -871,7 +1280,11 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
                                                  PreparedStatementData& prepared,
                                                  PreparedStatementMode mode)
 {
-  if (is_internal_query_active()) { return RebindQueryInfo::DO_NOT_REBIND; }
+  if (!is_internal_query_active(context)) {
+    reject_update_to_pinned_table(*this, context, prepared);
+  }
+  if (is_internal_query_active(context)) { return RebindQueryInfo::DO_NOT_REBIND; }
+  auto conn_state = get_sirius_connection_state(context);
   // Mirror the optimizer hook's gpu_execution gate: when transparent execution
   // is disabled (e.g. compare_gpu_vs_cpu's CPU run after SET gpu_execution=false),
   // never rewrite the physical plan even if we could.
@@ -879,26 +1292,31 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     duckdb::Value setting;
     auto have_setting = context.TryGetCurrentSetting("gpu_execution", setting);
     if (!have_setting || setting.IsNull() || !setting.GetValue<bool>()) {
-      captured_logical_plan_.reset();
+      if (conn_state) { conn_state->clear_captured_plan(); }
       return RebindQueryInfo::DO_NOT_REBIND;
     }
   }
   if (!is_initialized_) {
-    captured_logical_plan_.reset();
+    if (conn_state) { conn_state->clear_captured_plan(); }
     return RebindQueryInfo::DO_NOT_REBIND;
   }
 
   // Only intercept SELECT statements.
   if (prepared.statement_type != StatementType::SELECT_STATEMENT) {
-    captured_logical_plan_.reset();
+    if (conn_state) { conn_state->clear_captured_plan(); }
     return RebindQueryInfo::DO_NOT_REBIND;
   }
 
-  // If the optimizer hook captured a plan, use it. Otherwise (a LogicalGet whose
-  // bind_data isn't serializable, so plan->Copy() failed), re-plan from the
-  // unbound SQL statement — this is what gpu_execution(...) does internally and
-  // it works even when LogicalGet::Copy can't.
-  unique_ptr<LogicalOperator> logical_plan = take_captured_logical_plan();
+  // If the optimizer hook captured a plan FOR THIS planning attempt, use it.
+  // A generation mismatch (e.g. a leftover from Connection::ExtractPlan, which
+  // never reaches finalize) is dropped rather than consumed — a stale plan can
+  // bind different objects than the current statement (search path / catalog
+  // drift) and must never be executed. Otherwise (no capture, or a LogicalGet
+  // whose bind_data isn't serializable so plan->Copy() failed), re-plan from
+  // the unbound SQL statement — this is what gpu_execution(...) does
+  // internally and it works even when LogicalGet::Copy can't.
+  unique_ptr<LogicalOperator> logical_plan;
+  if (conn_state) { logical_plan = conn_state->take_captured_plan_if_current(); }
   // Try to capture the SQL string while the active query context is alive —
   // PreparedStatementData::unbound_statement isn't populated until *after*
   // OnFinalizePrepare returns (see ClientContext::PrepareInternal in DuckDB).
@@ -915,7 +1333,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   if (!logical_plan) {
     if (current_query_sql.empty()) { return RebindQueryInfo::DO_NOT_REBIND; }
     try {
-      InternalQueryGuard guard(*this);  // suppress recursive optimizer hooks
+      InternalQueryGuard guard(context);  // suppress recursive optimizer hooks
       Parser parser(context.GetParserOptions());
       parser.ParseQuery(current_query_sql);
       if (parser.statements.size() != 1) { return RebindQueryInfo::DO_NOT_REBIND; }
@@ -923,23 +1341,37 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       planner.CreatePlan(std::move(parser.statements[0]));
       Optimizer optimizer(*planner.binder, context);
       logical_plan = optimizer.Optimize(std::move(planner.plan));
+    } catch (InterruptException&) {
+      // Cancellation is never a fallback candidate — propagate as-is.
+      throw;
+    } catch (SiriusRuntimeUnavailableException& e) {
+      // Stable typed unavailable error: S3 keeps it as-is (no rewrite); a
+      // LOCAL query falls back to the retained CPU plan when allowed.
+      if (sirius::references_sirius_owned_s3_parquet(current_query_sql)) { throw; }
+      if (!duckdb_fallback_enabled(context)) { throw; }
+      record_transparent_fallback();
+      SIRIUS_LOG_INFO("Transparent execution fallback (runtime unavailable): {}",
+                      sirius::sanitized_message(e));
+      return RebindQueryInfo::DO_NOT_REBIND;
     } catch (NotImplementedException& e) {
       // No captured plan to inspect on the replan path; guard on the SQL text so
       // a direct read_parquet('s3://') that fails to re-plan does not CPU-fall-back.
-      throw_if_s3_no_cpu_fallback(false, current_query_sql, e.what());
+      throw_if_s3_no_cpu_fallback(false, current_query_sql, sirius::sanitized_message(e));
       if (!duckdb_fallback_enabled(context)) {
         rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
       }
       record_transparent_fallback();
-      SIRIUS_LOG_INFO("Transparent execution fallback (replan unsupported): {}", e.what());
+      SIRIUS_LOG_INFO("Transparent execution fallback (replan unsupported): {}",
+                      sirius::sanitized_message(e));
       return RebindQueryInfo::DO_NOT_REBIND;
     } catch (std::exception& e) {
-      throw_if_s3_no_cpu_fallback(false, current_query_sql, e.what());
+      throw_if_s3_no_cpu_fallback(false, current_query_sql, sirius::sanitized_message(e));
       if (!duckdb_fallback_enabled(context)) {
         rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
       }
       record_transparent_fallback();
-      SIRIUS_LOG_INFO("Transparent execution fallback (replan failed): {}", e.what());
+      SIRIUS_LOG_INFO("Transparent execution fallback (replan failed): {}",
+                      sirius::sanitized_message(e));
       return RebindQueryInfo::DO_NOT_REBIND;
     }
     if (!logical_plan) { return RebindQueryInfo::DO_NOT_REBIND; }
@@ -951,6 +1383,12 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   bool const plan_reads_s3 = logical_plan_reads_s3(*logical_plan);
 
   try {
+    // Plan-generation window: create_plan below reads the scan manager's pin
+    // registry, which requires single-flight discipline, so the validation is
+    // serialized against execution windows. Placed after the replan block so
+    // its nested bind never re-enters the slot, and inside this try so a
+    // runtime-unavailable error takes the existing fallback split below.
+    SlotGuard plan_window(*this, context);
     // Validate that the captured logical plan is GPU-translatable before we
     // install a reusable transparent execution operator for prepared statements.
     //
@@ -1010,20 +1448,33 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     record_transparent_rebind_success();
 
     SIRIUS_LOG_INFO("Transparent execution: physical plan replaced with GPU operator");
+  } catch (InterruptException&) {
+    // Cancellation is never a fallback candidate — propagate as-is.
+    throw;
+  } catch (SiriusRuntimeUnavailableException& e) {
+    // Stable typed unavailable error: S3 keeps it as-is; LOCAL falls back to
+    // the retained CPU plan when allowed.
+    if (plan_reads_s3) { throw; }
+    if (!duckdb_fallback_enabled(context)) { throw; }
+    record_transparent_fallback();
+    SIRIUS_LOG_INFO("Transparent execution fallback (runtime unavailable): {}",
+                    sirius::sanitized_message(e));
+    return RebindQueryInfo::DO_NOT_REBIND;
   } catch (NotImplementedException& e) {
-    throw_if_s3_no_cpu_fallback(plan_reads_s3, current_query_sql, e.what());
+    throw_if_s3_no_cpu_fallback(plan_reads_s3, current_query_sql, sirius::sanitized_message(e));
     if (!duckdb_fallback_enabled(context)) {
       rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
     }
     record_transparent_fallback();
-    SIRIUS_LOG_INFO("Transparent execution fallback (unsupported): {}", e.what());
+    SIRIUS_LOG_INFO("Transparent execution fallback (unsupported): {}",
+                    sirius::sanitized_message(e));
   } catch (std::exception& e) {
-    throw_if_s3_no_cpu_fallback(plan_reads_s3, current_query_sql, e.what());
+    throw_if_s3_no_cpu_fallback(plan_reads_s3, current_query_sql, sirius::sanitized_message(e));
     if (!duckdb_fallback_enabled(context)) {
       rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
     }
     record_transparent_fallback();
-    SIRIUS_LOG_INFO("Transparent execution fallback: {}", e.what());
+    SIRIUS_LOG_INFO("Transparent execution fallback: {}", sirius::sanitized_message(e));
   }
 
   return RebindQueryInfo::DO_NOT_REBIND;
@@ -1033,13 +1484,15 @@ RebindQueryInfo SiriusContext::OnExecutePrepared(ClientContext& context,
                                                  PreparedStatementCallbackInfo& info,
                                                  RebindQueryInfo current_rebind)
 {
+  auto& prepared = info.prepared_statement;
+  reject_update_to_pinned_table(*this, context, prepared);
+
   // GPU eligibility can drift with data alone (e.g. an insert pushes a varchar past
   // the overflow-string limit) and data changes never trigger DuckDB's own rebind.
   // By execute time the CPU plan has been discarded, so a stale
   // PhysicalSiriusExecution would error with no fallback. Rebind instead:
   // OnFinalizePrepare re-decides against current stats and keeps the fresh CPU plan
   // when create_plan now refuses.
-  auto& prepared = info.prepared_statement;
   if (!prepared.unbound_statement || !prepared.physical_plan) { return current_rebind; }
   auto& root = prepared.physical_plan->Root();
   if (root.type == sirius::transparent::PhysicalSiriusExecution::TYPE &&
@@ -1054,14 +1507,46 @@ void SiriusContext::throw_if_not_initialized() const
   if (!is_initialized_) { throw std::runtime_error("Sirius context is not initialized."); }
 }
 
-void SiriusContext::acquire_query_lifecycle_slot()
+void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
 {
+  // `| 1` keeps the sentinel (0 = free) unreachable; a cross-thread hash
+  // collision could only cause a spurious diagnosable error, never a missed
+  // release (the check is advisory — correctness rests on the scope-bound
+  // release).
+  auto const my_hash = std::hash<std::thread::id>{}(std::this_thread::get_id()) | 1;
+  // Same-thread reacquire would be a silent permanent wait (plain std::mutex).
+  // Only the CURRENT holder can observe its own hash here, so a match is a
+  // definite programming error — surface it as a diagnosable error instead.
+  if (holder_thread_hash_.load(std::memory_order_relaxed) == my_hash) {
+    throw std::runtime_error(
+      "Sirius internal error: query-lifecycle slot re-acquired on the holding thread "
+      "(nested execution window)");
+  }
+  // Fast-fail before waiting: no point queuing on an unavailable runtime or
+  // for an already-cancelled query.
+  if (runtime_unavailable_.load(std::memory_order_acquire)) { throw_runtime_unavailable(); }
+  if (context && context->IsInterrupted()) { throw InterruptException(); }
+
   query_lifecycle_mutex_.lock();
+  holder_thread_hash_.store(my_hash, std::memory_order_relaxed);
   query_lifecycle_held_.store(true, std::memory_order_release);
+
+  // Re-check AFTER acquiring, BEFORE any shared mutation: the previous holder
+  // may have latched unavailability, and this waiter may have been cancelled,
+  // while it was blocked. A cancelled waiter must never late-enter the window.
+  if (runtime_unavailable_.load(std::memory_order_acquire)) {
+    release_query_lifecycle_slot();
+    throw_runtime_unavailable();
+  }
+  if (context && context->IsInterrupted()) {
+    release_query_lifecycle_slot();
+    throw InterruptException();
+  }
 }
 
-void SiriusContext::release_query_lifecycle_slot()
+void SiriusContext::release_query_lifecycle_slot() noexcept
 {
+  holder_thread_hash_.store(0, std::memory_order_relaxed);
   query_lifecycle_held_.store(false, std::memory_order_release);
   query_lifecycle_mutex_.unlock();
 }
@@ -1114,7 +1599,13 @@ SiriusContextExtensionCallback::SiriusContextExtensionCallback()
 void SiriusContextExtensionCallback::OnConnectionOpened(ClientContext& context)
 {
   SIRIUS_LOG_INFO("Connection opened.");
-  if (context_) { context.registered_state->Insert("sirius_state", context_); }
+  if (context_) {
+    context.registered_state->Insert("sirius_state", context_);
+    // Each connection gets its OWN per-connection state (planning generation,
+    // capture, label, guard depths) — unlike the shared SiriusContext above.
+    context.registered_state->Insert("sirius_connection_state",
+                                     duckdb::make_shared_ptr<SiriusConnectionState>());
+  }
 }
 
 void SiriusContextExtensionCallback::OnConnectionClosed(ClientContext& context)
@@ -1122,6 +1613,7 @@ void SiriusContextExtensionCallback::OnConnectionClosed(ClientContext& context)
   SIRIUS_LOG_INFO("Connection closed.");
   // remove the context from the registered state
   context.registered_state->Remove("sirius_state");
+  context.registered_state->Remove("sirius_connection_state");
 }
 
 void SiriusContextExtensionCallback::OnExtensionLoaded(DatabaseInstance& db, const string& name)

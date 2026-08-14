@@ -9,7 +9,9 @@ use substrait::proto::{Expression, FunctionArgument, Type, function_argument};
 use crate::descriptor_table::DescriptorTable;
 use crate::error::{Result, TranslateError};
 use crate::type_mapper;
-use crate::{ExtensionRegistry, URN_BOOLEAN, URN_COMPARISON};
+use crate::{
+    ExtensionRegistry, URN_ARITHMETIC, URN_BOOLEAN, URN_COMPARISON, URN_DATETIME, URN_STRING,
+};
 
 /// Mutable state needed while translating one StarRocks expression tree.
 pub(crate) struct ExprContext<'a> {
@@ -118,10 +120,15 @@ fn translate_expr_node(
         TExprNodeType::STRING_LITERAL => translate_string_literal(node, children),
         TExprNodeType::NULL_LITERAL => translate_null_literal(node, children),
         TExprNodeType::DECIMAL_LITERAL => translate_decimal_literal(node, children),
+        TExprNodeType::DATE_LITERAL => translate_date_literal(node, children),
         TExprNodeType::BINARY_PRED => translate_binary_pred(node, children, ctx),
         TExprNodeType::COMPOUND_PRED => translate_compound_pred(node, children, ctx),
         TExprNodeType::CAST_EXPR => translate_cast(node, children),
         TExprNodeType::IS_NULL_PRED => translate_is_null(node, children, ctx),
+        TExprNodeType::ARITHMETIC_EXPR => translate_arithmetic(node, children, ctx),
+        TExprNodeType::IN_PRED => translate_in_pred(node, children, ctx),
+        TExprNodeType::CASE_EXPR => translate_case(node, children),
+        TExprNodeType::FUNCTION_CALL => translate_function_call(node, children, ctx),
         _ => Err(TranslateError::UnsupportedExpression {
             node_type: node.node_type,
             reason: "expression node is outside the v1 StarRocks slice",
@@ -261,6 +268,327 @@ fn translate_decimal_literal(node: &TExprNode, children: Vec<Expression>) -> Res
             scale: decimal.scale,
         },
     )))
+}
+
+/// Converts a StarRocks `DATE_LITERAL` into a Substrait date literal.
+///
+/// StarRocks carries the literal as a `YYYY-MM-DD[ HH:MM:SS]` string; Substrait dates are days
+/// since the UNIX epoch. Only DATE-typed literals are supported — DATETIME literals would need a
+/// precision-timestamp literal the consumer side has not been exercised with.
+fn translate_date_literal(node: &TExprNode, children: Vec<Expression>) -> Result<Expression> {
+    expect_child_count(node, &children, 0)?;
+    let lit = node
+        .date_literal
+        .as_ref()
+        .ok_or(TranslateError::MissingField {
+            context: "DATE_LITERAL",
+            field: "date_literal",
+        })?;
+    match type_mapper::scalar_primitive(&node.type_)? {
+        TPrimitiveType::DATE => Ok(literal(expression::literal::LiteralType::Date(
+            epoch_days_from_date_str(&lit.value)?,
+        ))),
+        primitive => Err(TranslateError::UnsupportedType {
+            primitive: Some(primitive),
+            node_type: Some(starrocks_thrift::types::TTypeNodeType::SCALAR),
+            reason: "only DATE-typed date literals are supported",
+        }),
+    }
+}
+
+/// Parses `YYYY-MM-DD` (ignoring any time suffix) into days since the UNIX epoch.
+fn epoch_days_from_date_str(value: &str) -> Result<i32> {
+    let invalid = || TranslateError::malformed(format!("invalid date literal {value:?}"));
+    let date_part = value.split_whitespace().next().ok_or_else(invalid)?;
+    let mut parts = date_part.split('-');
+    let mut next = || -> Result<i64> {
+        parts
+            .next()
+            .and_then(|part| part.parse::<i64>().ok())
+            .ok_or_else(invalid)
+    };
+    let (year, month, day) = (next()?, next()?, next()?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return Err(invalid());
+    }
+    // Howard Hinnant's civil-days algorithm; no chrono dependency needed for whole dates.
+    let year_adjusted = if month <= 2 { year - 1 } else { year };
+    let era = year_adjusted.div_euclid(400);
+    let year_of_era = year_adjusted - era * 400;
+    let month_shifted = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * month_shifted + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146097 + day_of_era - 719468;
+    i32::try_from(days).map_err(|_| invalid())
+}
+
+/// Converts a StarRocks `ARITHMETIC_EXPR` into a Substrait arithmetic function.
+fn translate_arithmetic(
+    node: &TExprNode,
+    children: Vec<Expression>,
+    ctx: &mut ExprContext<'_>,
+) -> Result<Expression> {
+    let opcode = node.opcode.ok_or(TranslateError::MissingField {
+        context: "ARITHMETIC_EXPR",
+        field: "opcode",
+    })?;
+    let name = match opcode {
+        TExprOpcode::ADD => "add",
+        TExprOpcode::SUBTRACT => "subtract",
+        TExprOpcode::MULTIPLY => "multiply",
+        TExprOpcode::DIVIDE => "divide",
+        TExprOpcode::MOD => "modulus",
+        _ => {
+            return Err(TranslateError::UnsupportedExpression {
+                node_type: node.node_type,
+                reason: "arithmetic opcode is unsupported",
+            });
+        }
+    };
+    expect_child_count(node, &children, 2)?;
+    // Decimal-typed arithmetic is rejected for now: the StarRocks-shaped cast/width combination
+    // reliably segfaults the engine's GPU projection (see the starrocks tpch crash repro);
+    // fail with a structured error instead of taking down the compute node.
+    if is_decimal(&node.type_)? {
+        return Err(TranslateError::UnsupportedExpression {
+            node_type: node.node_type,
+            reason: "decimal arithmetic is not supported yet (crashes the engine projection)",
+        });
+    }
+    let output_type = type_mapper::map_type_desc(&node.type_, node.is_nullable.unwrap_or(true))?;
+    let anchor = ctx.registry.register_function(URN_ARITHMETIC, name);
+    Ok(scalar_function(anchor, children, output_type))
+}
+
+/// Returns whether a StarRocks type descriptor is any decimal flavour.
+fn is_decimal(type_desc: &starrocks_thrift::types::TTypeDesc) -> Result<bool> {
+    Ok(matches!(
+        type_mapper::scalar_primitive(type_desc)?,
+        TPrimitiveType::DECIMAL
+            | TPrimitiveType::DECIMALV2
+            | TPrimitiveType::DECIMAL32
+            | TPrimitiveType::DECIMAL64
+            | TPrimitiveType::DECIMAL128
+            | TPrimitiveType::DECIMAL256
+    ))
+}
+
+/// Converts a StarRocks `IN_PRED` into a Substrait singular-or-list expression.
+fn translate_in_pred(
+    node: &TExprNode,
+    children: Vec<Expression>,
+    ctx: &mut ExprContext<'_>,
+) -> Result<Expression> {
+    let in_pred = node
+        .in_predicate
+        .as_ref()
+        .ok_or(TranslateError::MissingField {
+            context: "IN_PRED",
+            field: "in_predicate",
+        })?;
+    if children.len() < 2 {
+        return Err(TranslateError::malformed(
+            "IN_PRED expected a value and at least one list entry",
+        ));
+    }
+    let mut children = children.into_iter();
+    let value = children.next().unwrap();
+    let in_list = Expression {
+        rex_type: Some(expression::RexType::SingularOrList(Box::new(
+            expression::SingularOrList {
+                value: Some(Box::new(value)),
+                options: children.collect(),
+            },
+        ))),
+    };
+    if in_pred.is_not_in {
+        let anchor = ctx.registry.register_function(URN_BOOLEAN, "not");
+        Ok(scalar_function(
+            anchor,
+            vec![in_list],
+            type_mapper::bool_type(),
+        ))
+    } else {
+        Ok(in_list)
+    }
+}
+
+/// Converts a StarRocks `CASE_EXPR` into a Substrait if-then expression chain.
+///
+/// StarRocks children are `[case?] (when then)* [else?]`, flagged by
+/// `TCaseExpr::has_case_expr`/`has_else_expr`. A leading case operand is not supported yet — the
+/// frontend normally rewrites `CASE x WHEN ...` into comparisons already.
+fn translate_case(node: &TExprNode, children: Vec<Expression>) -> Result<Expression> {
+    let case = node
+        .case_expr
+        .as_ref()
+        .ok_or(TranslateError::MissingField {
+            context: "CASE_EXPR",
+            field: "case_expr",
+        })?;
+    if case.has_case_expr {
+        return Err(TranslateError::UnsupportedExpression {
+            node_type: node.node_type,
+            reason: "CASE with a leading case operand is not supported",
+        });
+    }
+    let mut children = children.into_iter();
+    let mut r#else = if case.has_else_expr {
+        Some(Box::new(children.next_back().ok_or_else(|| {
+            TranslateError::malformed("CASE_EXPR missing else child")
+        })?))
+    } else {
+        None
+    };
+    let mut ifs = Vec::new();
+    loop {
+        let Some(condition) = children.next() else {
+            break;
+        };
+        let then = children
+            .next()
+            .ok_or_else(|| TranslateError::malformed("CASE_EXPR when without then"))?;
+        ifs.push(expression::if_then::IfClause {
+            r#if: Some(condition),
+            then: Some(then),
+        });
+    }
+    if ifs.is_empty() {
+        return Err(TranslateError::malformed("CASE_EXPR has no when/then arms"));
+    }
+    if r#else.is_none() {
+        // Substrait if-then requires an else branch; SQL CASE defaults to NULL.
+        r#else = Some(Box::new(literal(expression::literal::LiteralType::Null(
+            type_mapper::map_type_desc(&node.type_, true)?,
+        ))));
+    }
+    Ok(Expression {
+        rex_type: Some(expression::RexType::IfThen(Box::new(expression::IfThen {
+            ifs,
+            r#else,
+        }))),
+    })
+}
+
+/// Converts a StarRocks `FUNCTION_CALL` into a Substrait expression.
+///
+/// Functions are allowlisted so an unknown StarRocks builtin fails loudly instead of silently
+/// binding to a DuckDB function with different semantics.
+fn translate_function_call(
+    node: &TExprNode,
+    children: Vec<Expression>,
+    ctx: &mut ExprContext<'_>,
+) -> Result<Expression> {
+    let function = node.fn_.as_ref().ok_or(TranslateError::MissingField {
+        context: "FUNCTION_CALL",
+        field: "fn",
+    })?;
+    let name = function.name.function_name.as_str();
+    let output_type = type_mapper::map_type_desc(&node.type_, node.is_nullable.unwrap_or(true))?;
+
+    // Null checks the frontend planned as builtin calls rather than IS_NULL_PRED nodes.
+    let (urn, mapped) = match name {
+        "is_null_pred" => {
+            expect_child_count(node, &children, 1)?;
+            (URN_COMPARISON, "is_null")
+        }
+        "is_not_null_pred" => {
+            expect_child_count(node, &children, 1)?;
+            (URN_COMPARISON, "is_not_null")
+        }
+        "if" => {
+            expect_child_count(node, &children, 3)?;
+            let mut children = children.into_iter();
+            let condition = children.next().unwrap();
+            let then = children.next().unwrap();
+            let otherwise = children.next().unwrap();
+            return Ok(Expression {
+                rex_type: Some(expression::RexType::IfThen(Box::new(expression::IfThen {
+                    ifs: vec![expression::if_then::IfClause {
+                        r#if: Some(condition),
+                        then: Some(then),
+                    }],
+                    r#else: Some(Box::new(otherwise)),
+                }))),
+            });
+        }
+        "like" => {
+            // The GPU evaluator needs a constant pattern and applies no escape character,
+            // while StarRocks treats backslash as the default escape.
+            expect_child_count(node, &children, 2)?;
+            match string_literal_value(&children[1]) {
+                Some(pattern) if !pattern.contains('\\') => {}
+                _ => {
+                    return Err(TranslateError::UnsupportedExpression {
+                        node_type: node.node_type,
+                        reason: "LIKE requires a constant pattern without escapes",
+                    });
+                }
+            }
+            (URN_STRING, "like")
+        }
+        "substring" | "substr" => {
+            // The GPU evaluator supports exactly `substring(col, start, length)` with constant,
+            // positive bounds; two-argument or from-the-end forms would misexecute.
+            expect_child_count(node, &children, 3)?;
+            let constant_positive = |expr: &Expression| {
+                matches!(
+                    integer_literal_value(expr),
+                    Some(value) if value > 0
+                )
+            };
+            if !constant_positive(&children[1]) || !constant_positive(&children[2]) {
+                return Err(TranslateError::UnsupportedExpression {
+                    node_type: node.node_type,
+                    reason: "substring requires constant positive start and length",
+                });
+            }
+            (URN_STRING, "substring")
+        }
+        // StarRocks `length` counts bytes; `octet_length` remaps to DuckDB's byte-length
+        // (`strlen`), while `char_length` keeps codepoint semantics on both sides.
+        "length" => (URN_STRING, "octet_length"),
+        "char_length" => (URN_STRING, "char_length"),
+        // `concat` is intentionally absent: StarRocks concat is NULL-strict while DuckDB's
+        // ignores NULL arguments, so a name-level mapping would change results. Other string
+        // and math builtins (upper/lower/trim/abs/floor/...) are absent because the GPU
+        // expression evaluator has no implementations for them yet.
+        "year" | "month" | "day" => (URN_DATETIME, name),
+        _ => {
+            return Err(TranslateError::malformed(format!(
+                "unsupported StarRocks function call {name:?}"
+            )));
+        }
+    };
+    let anchor = ctx.registry.register_function(urn, mapped);
+    Ok(scalar_function(anchor, children, output_type))
+}
+
+/// Returns a Substrait expression's string-literal payload, if it is one.
+fn string_literal_value(expr: &Expression) -> Option<&str> {
+    match expr.rex_type.as_ref()? {
+        expression::RexType::Literal(literal) => match literal.literal_type.as_ref()? {
+            expression::literal::LiteralType::String(value) => Some(value),
+            expression::literal::LiteralType::FixedChar(value) => Some(value),
+            expression::literal::LiteralType::VarChar(varchar) => Some(&varchar.value),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Returns a Substrait expression's integer-literal payload, if it is one.
+fn integer_literal_value(expr: &Expression) -> Option<i64> {
+    match expr.rex_type.as_ref()? {
+        expression::RexType::Literal(literal) => match literal.literal_type.as_ref()? {
+            expression::literal::LiteralType::I8(value) => Some(i64::from(*value)),
+            expression::literal::LiteralType::I16(value) => Some(i64::from(*value)),
+            expression::literal::LiteralType::I32(value) => Some(i64::from(*value)),
+            expression::literal::LiteralType::I64(value) => Some(*value),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Converts supported comparison opcodes into Substrait comparison functions.

@@ -193,6 +193,16 @@ TEST_CASE("parquet batches are capped by decode working set", "[scan][parquet][s
   scan::scan_operator_input input{std::move(first.front())};
   CHECK(input.get_estimated_size_in_bytes() == 20);
   CHECK(input.get_estimated_working_set_size_in_bytes() == 60);
+
+  // A keep-masked metadata split adds the filter-by-copy envelope on top of
+  // the decode working set: compacted output (input-bounded) + the BOOL8
+  // expansion (1 B/row) + the uploaded mask words.
+  scan::scan_operator_input masked{std::move(tail.front())};
+  constexpr std::size_t rows = 40;
+  auto words = std::make_shared<std::vector<std::uint32_t>>((rows + 31) / 32, 0xFFFFFFFFu);
+  masked.mvcc_keep_mask = sirius::scan_manager::mvcc_chunk_mask{{words, words->data()}, rows};
+  CHECK(masked.get_estimated_working_set_size_in_bytes() ==
+        2 * 60 + rows + masked.mvcc_keep_mask.view().size_bytes());
 }
 
 TEST_CASE("parquet synthetic filter-only columns only increase the decode working set",

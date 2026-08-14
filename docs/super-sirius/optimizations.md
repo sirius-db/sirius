@@ -53,6 +53,19 @@ num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 
 **Config:** `sort_sample_bytes` (default: 512 MB), settable via YAML and the `sort_sample_bytes` SET option
 
+### Merge Pipeline Fusion (PR #1190)
+
+**Motivation:** A `MERGE_GROUP_BY` / `MERGE_TOP_N` operator normally forms its own terminal pipeline whose only downstream is a streaming chain ending at the sink (typically `RESULT_COLLECTOR`). That standalone pipeline costs an extra task launch and a repository round-trip for no additional parallelism.
+
+**Mechanism:** At plan time `mark_fusable_merge_pipelines()` walks parent pointers from each merge to the first downstream sink. When that path is unary and streaming and the sink accepts a fused input, the merge is marked to fuse. The merge's `build_pipelines()` override then adds itself as an intermediate operator to the downstream pipeline and recurses into its child (which still cuts the upstream boundary), instead of opening a new terminal pipeline. Total-input structural sinks (`ORDER_BY`, `TOP_N`, an outer `GROUP BY`) are fusable because they already buffer their full input. Excluded: join/CTE/delim terminals, partition sinks, delim-owned distinct merges, and `MERGE_AGGREGATE` (ungrouped aggregate).
+
+**Code path:**
+- `src/planner/sirius_physical_plan_generator.cpp` — `mark_fusable_merge_pipelines()`, `terminal_sink_supports_fusion()`
+- `src/op/sirius_physical_grouped_aggregate_merge.cpp`, `src/op/sirius_physical_top_n.cpp` — `build_pipelines()` overrides
+- `src/sirius_engine.cpp` — invokes marking after parent pointers are refreshed
+
+**Config:** `fuse_merge_pipelines` (default: true). See [physical-plan-generation.md](physical-plan-generation.md) → Merge fusion for pipeline-shape details.
+
 ## Operator-Level Optimizations
 
 ### Adaptive Join BUILD_PROBE Mode (PR #423)
@@ -60,12 +73,15 @@ num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 **Motivation:** For small build-side datasets, building the hash table once and probing many times is more efficient than the standard multi-partition Cartesian product approach.
 
 **Mechanism:** `update_join_exec_mode()` switches to BUILD_PROBE mode when:
-- Only 1 partition
-- Build-side data < `max_build_hash_table_bytes`
+- `num_partitions <= num_gpus` (one hash table per partition, at most one partition per GPU; reduces to a single partition when `num_gpus == 1`)
+- per-partition average build side < `max_build_hash_table_bytes`, foldable to a single batch per partition
+- the join is neither RIGHT-family nor `MIXED_JOIN`
 
-In BUILD_PROBE mode, the first task builds a `cudf::hash_join` hash table and caches it. Subsequent tasks only probe.
+In BUILD_PROBE mode, each partition's first task builds a `cudf::hash_join` hash table and caches it; subsequent tasks for that partition only probe.
 
-**Code path:** `src/op/sirius_physical_hash_join.cpp` — `update_join_exec_mode()`
+**Broadcast small build tables (multi-GPU):** when the build side is small (`< small_table_bytes`), the PARTITION operator replicates it to every GPU (proposes `num_gpus` partitions, `_broadcast` flag) instead of funneling the build to one GPU, so every GPU builds its own hash table and probes locally. Build-only slots are discarded once the probe side finishes. Pure decision: `make_broadcast_partition_decision()`.
+
+**Code path:** `src/op/sirius_physical_hash_join.cpp` — `update_join_exec_mode()`, `build_probe_mode_eligible()`; `src/op/sirius_physical_partition.cpp` — `make_broadcast_partition_decision()`
 
 **Config:** `max_build_hash_table_bytes` (default: 500 MB)
 
@@ -157,7 +173,7 @@ Data is moved from GPU to HOST tier via converter registry.
 
 **Code path:** `src/downgrade/downgrade_executor.cpp` — `monitor_loop()`, `run_downgrade_pass()`
 
-**Config:** `downgrade_trigger_fraction` (default: 1.0 for GPU, 0.8 for Host), `downgrade_stop_fraction` (default: 0.7)
+**Config:** `downgrade_trigger_fraction` (default: 0.8 for GPU, 0.9 for host), `downgrade_stop_fraction` (default: 0.6 for GPU, 0.8 for host). Configuration requires `0 < stop < trigger <= 1`.
 
 ### OOM Retry Mechanism (PR #364)
 
@@ -213,6 +229,35 @@ Data is moved from GPU to HOST tier via converter registry.
 **Config:** Memory manager settings in `sirius.yaml` (see [Configuration](configuration.md))
 
 ## Scan Optimizations
+
+### Compressed Materialization (unreleased)
+
+**Motivation:** Integer and fixed-point DECIMAL columns often use only a fraction of their declared
+range. Carrying their native width through every GPU batch increases memory traffic and cache
+pressure even when the SQL type must remain unchanged.
+
+**Mechanism:** A complete physical-type sidecar records narrower signed, unsigned, or same-scale
+decimal cuDF carriers without changing the logical schema. `pin_table` computes exact bounds for
+each materialized cache chunk and records the chosen carriers, so different chunks may use different
+widths. At plan time, a scan derives its targets from that recorded metadata only when the pinned
+cache can serve all requested columns; unpinned scans stay native. Exact per-batch bounds guard any
+runtime wider-to-narrower cast. Pure-reference payloads and eligible grouped-aggregate keys can
+remain narrow, and comparisons against representable constants can execute in the narrow domain.
+Arithmetic, hash-join keys, value-sensitive aggregate inputs, ordering, unsupported boundaries, and
+result materialization restore native carriers.
+
+**Code path:**
+- `src/helper/numeric_narrowing.cpp` — exact range extraction and carrier selection
+- `src/planner/sirius_plan_get.cpp` — pinned-residency gate and metadata-derived scan sidecars
+- `src/planner/sirius_plan_narrowing_policy.cpp` — tier-aware keep-or-retract policy
+- `src/planner/sirius_plan_compressed_schema.cpp` — sidecar propagation, restore projections, and pruning
+- `src/op/scan/sirius_gpu_scan_operator.cpp` — runtime verification and schema normalization
+- `src/pin_table.cpp` — exact batch-granular pin narrowing
+- `src/expression_evaluator/specializations/reference.cpp` and `narrow_domain.cpp` — reference restoration and narrow-domain constants
+
+**Config:** `enable_compressed_materialization` (default: `true`), settable through YAML under
+`sirius.operator_params` and the DuckDB SET option. See
+[Compressed Materialization](compressed-materialization.md).
 
 ### Row Group Pruning with Filter Pushdown (PR #363)
 
@@ -367,6 +412,7 @@ chunk 0 is retained as a sentinel and emptied by the GPU filter so the pipeline 
 `src/scan_manager/pinned_chunk_stats.cpp` owns the statistics and safety checks; and
 `src/scan_manager/sirius_scan_manager.cpp` builds and serves the survivor plan.
 
-**Config:** `enable_pinned_zone_map_pruning` (default: `true`) is available through YAML and
-DuckDB `SET`. It gates both capture and pruning; entries pinned while it is disabled remain
-statless until re-pinned. See [Pinned-table zone maps](scan.md#zone-maps) for limitations.
+**Config:** zone-map capture and pruning are automatic and enabled by default. The advanced YAML
+escape hatch `sirius.operator_params.enable_pinned_zone_map_pruning` gates both capture and
+pruning; entries pinned while it is disabled remain statless until re-pinned. The direct DuckDB
+session override is test-only. See [Pinned-table zone maps](scan.md#zone-maps) for limitations.

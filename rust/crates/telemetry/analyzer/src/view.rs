@@ -11,21 +11,18 @@ use quent_analyzer::{
 };
 use quent_query_engine_analyzer::{
     QueryEngineModel,
-    engine::Engine,
-    model::QueryEngineEntityId as QeEntityRef,
-    operator::Operator,
-    plan::{Plan, tree::PlanTree},
-    port::Port,
-    query::Query,
-    query_group::QueryGroup,
-    view::InMemoryQueryEngineModelView,
-    worker::Worker,
+    plain::legacy::{
+        Engine, InMemoryQueryEngineModelView, Operator, Plan, Port, Query,
+        QueryEngineEntityId as QeEntityRef, QueryGroup, Worker,
+    },
+    plan_tree::PlanTree,
 };
 use quent_simulator_ui::EntityRef;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use uuid::Uuid;
 
 use crate::{
+    batch_placement::{BatchPlacement, BatchPlacementExt},
     data_batch::{DataBatch, DataBatchExt},
     model::SiriusModel,
     task::{Task, TaskExt},
@@ -44,6 +41,7 @@ pub(crate) struct SiriusModelQueryView<'a> {
     resource_groups: HashMap<Uuid, &'a RtResourceGroup>,
     tasks: HashMap<Uuid, &'a Task>,
     data_batches: HashMap<Uuid, &'a DataBatch>,
+    batch_placements: HashMap<Uuid, &'a BatchPlacement>,
 }
 
 impl<'a> SiriusModelQueryView<'a> {
@@ -88,6 +86,7 @@ impl<'a> SiriusModelQueryView<'a> {
             resources,
             tasks: HashMap::default(),
             data_batches: HashMap::default(),
+            batch_placements: HashMap::default(),
         };
 
         let pipeline_ids = result
@@ -114,6 +113,17 @@ impl<'a> SiriusModelQueryView<'a> {
                     .is_some_and(|pipeline_uuid| pipeline_ids.contains(&pipeline_uuid))
             })
             .map(|data_batch| (data_batch.id(), data_batch))
+            .collect();
+
+        result.batch_placements = model
+            .batch_placements
+            .values()
+            .filter(|batch| {
+                batch
+                    .pipeline_uuid()
+                    .is_some_and(|pipeline_uuid| pipeline_ids.contains(&pipeline_uuid))
+            })
+            .map(|batch| (batch.id(), batch))
             .collect();
         Ok(result)
     }
@@ -163,6 +173,10 @@ impl<'a> SiriusModelQueryView<'a> {
         self.data_batches.values().copied()
     }
 
+    pub(crate) fn batch_placements(&self) -> impl Iterator<Item = &'a BatchPlacement> + '_ {
+        self.batch_placements.values().copied()
+    }
+
     pub(crate) fn runtime_resources(&self) -> impl Iterator<Item = &'a RtResource> + '_ {
         self.resources.values().copied()
     }
@@ -189,6 +203,14 @@ impl<'a> SiriusModelQueryView<'a> {
 }
 
 impl<'a> QueryEngineModel for SiriusModelQueryView<'a> {
+    type Engine = Engine;
+    type Query = Query;
+    type QueryGroup = QueryGroup;
+    type Worker = Worker;
+    type Plan = Plan;
+    type Operator = Operator;
+    type Port = Port;
+
     fn engine(&self) -> AnalyzerResult<&Engine> {
         self.query_engine.engine()
     }

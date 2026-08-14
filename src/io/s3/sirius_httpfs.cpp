@@ -57,13 +57,16 @@ class sirius_httpfs_file_handle : public duckdb::FileHandle {
                             std::string path,
                             duckdb::FileOpenFlags flags,
                             std::shared_ptr<sirius::io::sirius_datasource> datasource)
-    : duckdb::FileHandle(fs, std::move(path), flags), datasource_(std::move(datasource))
+    : duckdb::FileHandle(fs, std::move(path), flags),
+      datasource_(std::move(datasource)),
+      version_tag_(datasource_->io_object().validation_etag())
   {
   }
 
   void Close() override {}
 
   std::shared_ptr<sirius::io::sirius_datasource> datasource_;
+  std::string version_tag_;
   duckdb::idx_t cursor_{0};
 };
 
@@ -86,6 +89,19 @@ duckdb::shared_ptr<duckdb::SiriusContext> resolve_gated_sirius_context(
     throw std::runtime_error(std::string("[sirius_httpfs] no ClientContext while ") + verb + " '" +
                              path + "'; S3 reads require a Sirius-enabled connection");
   }
+  auto sirius_ctx = client->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw std::runtime_error(std::string("[sirius_httpfs] Sirius is not initialized on this "
+                                         "connection while ") +
+                             verb + " '" + path + "'");
+  }
+  // Health is checked first so an unavailable runtime always surfaces the
+  // stable unavailable error (a gpu_execution=false session must not mask it
+  // with the gpu-off message), and the untrusted scan manager is never
+  // consulted.
+  if (sirius_ctx->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE) {
+    sirius_ctx->throw_runtime_unavailable();
+  }
   // Transparent S3 is GPU-only. If gpu_execution is off there is no GPU
   // consumer, so serving here would be a CPU read of s3:// — which Sirius does
   // not support. Refuse with a clear message instead of silently serving a CPU
@@ -101,19 +117,16 @@ duckdb::shared_ptr<duckdb::SiriusContext> resolve_gated_sirius_context(
                                 "fallback; SET gpu_execution=true");
     }
   }
-  auto sirius_ctx = client->registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!sirius_ctx) {
-    throw std::runtime_error(std::string("[sirius_httpfs] Sirius is not initialized on this "
-                                         "connection while ") +
-                             verb + " '" + path + "'");
-  }
   // No S3 CPU fallback. A CPU-fallback replay active here means the GPU plan
-  // failed and we are replaying on CPU (run_internal_cpu_fallback_query wraps
-  // the replay in a CpuFallbackGuard). Refuse so s3:// data is never served to
-  // a CPU plan, even when reached indirectly through a view. Uses the narrow
+  // failed and we are replaying on CPU (the replay is wrapped in a
+  // CpuFallbackGuard). Refuse so s3:// data is never served to a CPU plan,
+  // even when reached indirectly through a view. Uses the narrow
   // CpuFallbackGuard flag (not the broad is_internal_query_active), so a
-  // legitimate internal s3:// read is not blocked.
-  if (sirius_ctx->is_cpu_fallback_active()) {
+  // legitimate internal s3:// read is not blocked. The flag is per-connection
+  // (this connection's replay), so an unrelated connection's fallback does
+  // not block this one's S3 access.
+  auto conn_state = duckdb::get_sirius_connection_state(*client);
+  if (conn_state && conn_state->is_cpu_fallback_active()) {
     throw duckdb::IOException(std::string("[sirius_httpfs] ") + verb + " '" + path +
                               "' on a CPU execution path: S3 CPU fallback is not supported (S3 is "
                               "GPU-only); Sirius has no CPU fallback for S3 data sources");
@@ -315,6 +328,11 @@ duckdb::timestamp_t sirius_httpfs::GetLastModifiedTime(duckdb::FileHandle& /*han
   return duckdb::timestamp_t(0);
 }
 
+std::string sirius_httpfs::GetVersionTag(duckdb::FileHandle& handle)
+{
+  return as_httpfs_handle(handle).version_tag_;
+}
+
 duckdb::vector<duckdb::OpenFileInfo> sirius_httpfs::Glob(const std::string& path,
                                                          duckdb::FileOpener* opener)
 {
@@ -333,37 +351,26 @@ duckdb::vector<duckdb::OpenFileInfo> sirius_httpfs::Glob(const std::string& path
 
 namespace {
 
-// True when @p key contains '%' followed by two hex digits. DuckDB decodes hive
-// partition values from the path, so a literal %HH key cannot currently preserve
-// both object identity and partition values; expand_glob rejects it. ('#', '?'
-// and bare-'%' keys round-trip exactly and stay supported.)
-bool key_has_percent_encoded_sequence(std::string_view key)
+// True when @p key has a directory segment (not the final filename) that is a Hive
+// partition (has '=') and also contains a literal '?'. DuckDB's Parse cancels
+// partition candidacy on any '?' in a segment, so such a directory would be
+// silently dropped from partitioning. An escaped '%3F' is safe.
+bool key_has_literal_question_in_hive_segment(std::string_view key)
 {
-  auto const is_hex = [](char c) {
-    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-  };
-  for (std::size_t i = 0; i + 2 < key.size(); ++i) {
-    if (key[i] == '%' && is_hex(key[i + 1]) && is_hex(key[i + 2])) { return true; }
+  std::size_t seg_start = 0;
+  for (std::size_t i = 0; i < key.size(); ++i) {
+    if (key[i] == '/') {  // close a directory segment; the trailing filename is skipped
+      auto const seg = key.substr(seg_start, i - seg_start);
+      if (seg.find('=') != std::string_view::npos && seg.find('?') != std::string_view::npos) {
+        return true;
+      }
+      seg_start = i + 1;
+    }
   }
   return false;
 }
 
 }  // namespace
-
-std::string escape_s3_key_for_uri(std::string_view key)
-{
-  std::string out;
-  out.reserve(key.size());
-  for (char const c : key) {
-    switch (c) {
-      case '%': out += "%25"; break;
-      case '#': out += "%23"; break;
-      case '?': out += "%3F"; break;
-      default: out += c;
-    }
-  }
-  return out;
-}
 
 duckdb::vector<duckdb::OpenFileInfo> expand_glob(
   std::string const& pattern,
@@ -422,24 +429,22 @@ duckdb::vector<duckdb::OpenFileInfo> expand_glob(
           matched = match_glob_no_crawl(key_segments, pattern_segments);
         }
         if (!matched) { continue; }
-        // Match-scoped fail-loud guard (see key_has_percent_encoded_sequence):
-        // unmatched keys under the same prefix stay harmless.
-        if (key_has_percent_encoded_sequence(entry.key)) {
+        // Fail loud on a literal '?' in a Hive partition segment (see above);
+        // match-scoped, so unmatched keys under the prefix are unaffected.
+        if (key_has_literal_question_in_hive_segment(entry.key)) {
           throw duckdb::IOException(
             "[sirius_httpfs] glob '" + pattern + "' matched S3 key '" + entry.key +
-            "' containing a percent-encoded sequence; hive/filename semantics for such keys are "
-            "not preserved over s3:// yet — rename the object or exclude it from the glob");
+            "' with a literal '?' in a Hive partition segment; percent-encode it (%3F) or exclude "
+            "it from the glob");
         }
         if (matches.size() >= match_cap) {
           throw duckdb::IOException("[sirius_httpfs] glob '" + pattern + "' matched more than " +
                                     std::to_string(match_cap) +
                                     " objects — narrow the glob prefix");
         }
-        // Matching runs on the literal key bytes above; only the URI embedding
-        // escapes them, so the later parse() of this path restores the exact
-        // key (see escape_s3_key_for_uri).
-        duckdb::OpenFileInfo info("s3://" + std::string{bucket} + "/" +
-                                  escape_s3_key_for_uri(entry.key));
+        // Embed the raw LIST key verbatim: the signing layer RFC3986-encodes it and
+        // uri_parser does not decode the s3 key, so the LIST key == the opened key.
+        duckdb::OpenFileInfo info("s3://" + std::string{bucket} + "/" + std::string{entry.key});
         if (entry.size <= static_cast<std::uint64_t>(std::numeric_limits<int64_t>::max())) {
           info.extended_info = duckdb::make_shared_ptr<duckdb::ExtendedOpenFileInfo>();
           info.extended_info->options["file_size"] =

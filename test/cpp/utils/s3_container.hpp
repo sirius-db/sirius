@@ -16,6 +16,10 @@
 
 #pragma once
 
+#include <cstdint>
+#include <span>
+#include <string_view>
+
 namespace sirius::test {
 
 /**
@@ -48,6 +52,14 @@ namespace sirius::test {
  * @return true if the [s3] tests should run (env is ready), false to skip.
  */
 bool ensure_s3_container_env();
+
+/**
+ * @brief PUT a small object into the managed HTTP MinIO instance.
+ *
+ * @return false when the S3 environment is externally managed; throws on an
+ * upload failure.
+ */
+bool put_s3_container_object(std::string_view key, std::span<std::uint8_t const> bytes);
 
 /**
  * @brief Terminate the MinIO containers started by @ref ensure_s3_container_env.

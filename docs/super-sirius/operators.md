@@ -46,7 +46,7 @@ Base scan operator wrapping a DuckDB table function. Stores column IDs, projecti
 ### `sirius_gpu_scan_operator` — `GPU_SCAN`
 **File:** `src/include/op/scan/sirius_gpu_scan_operator.hpp`
 
-Unified GPU scan source operator for reading table data from storage. It carries no format-specific code: it pulls pre-built splits off a `split_connector` and delegates per-split materialization to an installed `gpu_ingestible`, one implementation per source format (`parquet_gpu_ingestible` for Parquet, `duckdb_native_gpu_ingestible` for DuckDB-native `.duckdb` tables, `cached_parquet_gpu_ingestible` for pinned-cache hits).
+Unified GPU scan source operator for reading table data from storage. It carries no format-specific code: it pulls pre-built splits off a `split_connector` and delegates per-split materialization to an installed `gpu_ingestible`, one implementation per source format (`parquet_gpu_ingestible` for Parquet, `duckdb_native_gpu_ingestible` for DuckDB-native `.duckdb` tables); pinned-cache hits are served by the scan manager's `cached_databatch_provider`.
 
 The pipeline converter rewrites a DuckDB parquet or DuckDB-native table scan into a `GPU_SCAN` source: it lowers the bind data into the appropriate `ingestible_table_info`, builds the `gpu_ingestible`, and inserts the operator at `operators[0]` of the pipeline. Before a query runs, `sirius_scan_manager` prepares scan-side state — matching pinned-cache entries or building a `split_provider` over each operator's ingestible — and drives metadata production, split coalescing, and per-GPU balancing, pushing splits onto each operator's `split_connector`. `execute()` calls `gpu_ingestible::materialize_table` and, when a split carries filter/projection info, `gpu_ingestible::post_filter_and_project`.
 
@@ -55,46 +55,56 @@ See [Scan](scan.md) for the full scan subsystem (scan manager, `gpu_ingestible`,
 ### `sirius_physical_streaming_source` — `STREAMING_SOURCE`
 **File:** `src/include/op/sirius_physical_streaming_source.hpp`
 
-Source operator that marks the bottom boundary of an intermediate pipeline fragment. It pulls
-`exchange_batch_handle` records (batch-id + size) from a bounded `exec::exchange_channel`, resolves
-each handle via a `cucascade::shared_data_repository`, and publishes the batch into the pipeline
-as a `pipelineable_operator_data`. Used only when a fragment's input arrives from another node
-over exchange; a leaf fragment keeps its normal `GPU_SCAN` source.
+Source operator that marks the bottom boundary of an intermediate pipeline fragment. Producers
+call `push(batch)` / `close_input(sender_id)`; the operator publishes each queued
+`cucascade::data_batch` into the pipeline as a `pipelineable_operator_data`, one per task. Used
+only when a fragment's input arrives from another node over exchange; a leaf fragment keeps its
+normal `GPU_SCAN` source.
 
-Key design invariants:
-- The channel carries **handles**, not `shared_ptr`s — the repository owns the batch so queued
-  items remain spill-visible to the downgrade executor.
-- Engine workers use `try_pop` only (non-blocking); `push`/`pop` are provided for the wrapper/test side.
-- EOS is **close-then-drain**: `close()` forbids new pushes; queued handles stay poppable;
-  `drained()` (= `closed() && empty()`) is the terminal predicate.
+Unlike a `GPU_SCAN` it does not own its input — batches arrive at runtime — so an empty queue means
+*wait*, not *exhausted*. It holds one `exec::batch_stream`: a borrowed
+`cucascade::shared_data_repository` (**the queue** — batches sit there until a task claims one,
+spill-visible to the downgrade executor when the caller registered that repository with the memory
+manager) bound to the stream state (sender-aware end-of-stream, the availability classification,
+the `on_data` notification, and the producer-error plane).
+
+Key design invariants (S1–S5 are the named stream contracts defined in `exec/batch_stream.hpp`):
+- Batches cross natively, in their current tier — no Arrow, no forced GPU upgrade.
+- EOS is **sender-aware**: `close_input(sender)` is idempotent per sender, and the stream ends
+  only once every *expected* sender has closed. An unexpected sender id is a defined error.
+- **S1** — every batch lands in the repository before `on_data` announces it; `push()` returns
+  false once the stream is terminal, so no batch can arrive after a consumer has seen EOS.
+- **S2–S3** — a producer failure (`fail_input(error)`) fires `on_data` so a parked consumer
+  wakes to collect the rethrow; the stream never reports `END_OF_STREAM` or `drained()` while an
+  error is pending (the only exit is the rethrow).
 - `execute()` is a pure pass-through (COLUMN_DATA_SCAN shape — no GPU work).
 - `no_history_peak_memory_estimate()` returns `stats.bytes` (no extra allocation).
 
 Hint table:
 
-| Channel state | `get_next_task_hint()` |
+| Stream state | `get_next_task_hint()` |
 |---|---|
-| non-empty (open or closed) | `READY{this}` |
-| open, empty | `WAITING{nullptr}` — re-armable by the session on push (#839) |
-| closed && drained | `std::nullopt` — EOS |
+| `HAS_DATA` (queued or errored, open or ended) | `READY{this}` |
+| `WAITING` (open, empty) | `WAITING{nullptr}` — the next `push()` re-nominates the head |
+| `END_OF_STREAM` | `std::nullopt` |
 
-`all_ports_empty()` is overridden to `_input_channel->drained()`, driving both the task-creation
-loop guard and the port-less source pipeline-finish predicate.
+`all_ports_empty()` is `stream.drained()` — a clean end only: every sender closed, queue empty, no
+pending error. It drives both the task-creation loop guard and the port-less source
+pipeline-finish predicate. Emptiness is evaluated under the stream's own lock — otherwise a batch
+admitted between the check and the lock could be reported as end-of-stream and dropped.
 
-Channel close notifies the pipeline (`update_pipeline_status(false)`, via a weak pipeline
-reference wired in `set_pipeline`), so an empty or late-closed stream still finishes its
+**The live wake-up.** The head is scheduled once by `start_query()` and task completion only
+nominates downstream consumers, so `on_data` — fired by every successful `push()` — is the only
+thing that brings a dropped source back. It is deliberately not one-shot; the header explains why.
+
+End-of-stream separately notifies the pipeline (`update_pipeline_status(false)`, via a weak
+pipeline reference wired in `set_pipeline`), so an empty or late-closed stream still finishes its
 pipeline — and re-arms downstream consumers — even when no task is left in flight.
 
-**Producer contract**: register the incoming batch in the input repository (`add_data_batch`) *first*,
-then push the handle. The session (#839) owns edge-triggered re-scheduling; the plan generator (#838)
-owns channel wiring.
-
-**Backpressure (open integration requirement for #839)**: `try_pop()` frees channel item/byte
-capacity at task-creation time, but the popped batches move into the unbounded task-scheduler
-queue — the channel bound therefore does not bound total outstanding data. When #839 wires the
-session, task creation must be gated on in-flight work (e.g. counting via the channel's `on_pop`
-hook and the task-completion path) so a fast producer cannot accumulate an arbitrarily large GPU
-backlog behind a nominally bounded channel.
+**No channel-level backpressure.** Producers push into the repository and the downgrade executor
+relieves memory pressure. Sirius has no upward "stop producing" signal today (hints are only
+`READY` / `WAITING` / nothing), so the intended lever is per-fragment priority, not a bounded
+queue.
 
 ### `sirius_physical_dummy_scan` — `DUMMY_SCAN`
 **File:** `src/include/op/sirius_physical_dummy_scan.hpp`
@@ -151,10 +161,37 @@ Three execution modes:
 | Mode | When Used | cuDF API |
 |------|-----------|----------|
 | `STANDARD` | Default, multi-partition Cartesian product | `cudf::inner_join()`, `cudf::left_join()`, etc. |
-| `BUILD_PROBE` | Single partition, small build side (< `max_build_hash_table_bytes`) foldable to one batch | `cudf::hash_join`, `cudf::distinct_hash_join`, or `cudf::filtered_join` — built once, probed many times |
-| `MIXED_JOIN` | Equality + inequality conditions on disjoint columns | `cudf::mixed_join()` with cuDF AST |
+| `BUILD_PROBE` | Up to one partition per GPU, per-partition build side (< `max_build_hash_table_bytes`) foldable to one batch | `cudf::hash_join`, `cudf::distinct_hash_join`, or `cudf::filtered_join` — built once per partition, probed many times |
+| `MIXED_JOIN` | Equality plus either inequality conditions or a null-safe `IS NOT DISTINCT FROM` key (mixed with a plain `=`), on disjoint columns | `cudf::mixed_join()` with cuDF AST |
 
-`update_join_exec_mode()` selects BUILD_PROBE when there is one partition, the build side fits and folds to a single batch, and the join type is not SEMI, ANTI, or RIGHT (these stay in STANDARD mode). INNER, LEFT, OUTER, and MARK joins are all eligible.
+`update_join_exec_mode()` selects BUILD_PROBE when `num_partitions <= num_gpus` (one hash table per partition, at most one partition per GPU — this reduces to the historical single-partition rule when `num_gpus == 1`), the per-GPU build side fits `max_build_hash_table_bytes` and folds to a single batch, and the join is not RIGHT-family (`RIGHT`, `RIGHT_SEMI`, `RIGHT_ANTI`), `MIXED_JOIN`, or full `OUTER`. INNER, LEFT, MARK, SEMI, and ANTI joins are eligible (SEMI/ANTI/MARK build a persistent `cudf::filtered_join` on the right and stream left probe batches). Full outer is excluded because BUILD_PROBE streams probe batches and calls `full_join` per batch, which would re-emit unmatched build rows on every batch (and, under broadcast/partitioning, on every GPU) with no global accumulation — full outer joins use the STANDARD path. The pure eligibility gate is `build_probe_mode_eligible()`. For a broadcast join the **full** replicated build size is charged against `max_build_hash_table_bytes` (each GPU builds the entire table); a hash-partitioned build charges the per-partition average.
+
+**Broadcast small build tables.** On multi-GPU, when the build side is small (`< small_table_bytes`), instead of routing the whole build to one GPU the PARTITION operator proposes `num_gpus` partitions and *replicates* the small build table to every GPU (the `_broadcast` flag), so each GPU builds its own hash table and joins its local probe rows. The build sink deposits the build batch into every slot; the probe sink routes each batch to the slot for its current GPU (`slot_for_device`). Once the probe side finishes, any slot that received replicated build data but no probe rows is discarded (`discard_build_only_slots_if_probe_complete`). The pure candidate decision is `make_broadcast_partition_decision()`; right-family / mixed joins reject BUILD_PROBE and fall back to the normal partition count.
+
+#### Partial-barrier scheduling (STANDARD / MIXED_JOIN)
+
+The join's own `build` and `default`/probe input ports are **PARTIAL** barriers (stamped in `resolve_barrier` for the `CONCAT → HASH_JOIN` edge). Batches arrive progressively on each side, and `get_next_task_hint` / `get_next_task_input_data` schedule per-partition **build × probe** cross-product pairs as they become available (state tracked in `partition_cross_schedule`, guarded by `op_state_mutex`), freeing each batch once it has been paired with every batch of a finished opposite side. This mirrors how BUILD_PROBE already streams its probe side; BUILD_PROBE is unaffected by the port barrier because it overrides its hint regardless.
+
+Joining each build batch against each probe batch and unioning the results is only *inherently* correct for INNER. For every other join type, `sirius_physical_concat` folds the side that must be seen whole into a **single batch** (an implicit full barrier), so the streamed side is joined against that one folded batch — correct for all types. `refresh_cross_schedule` asserts this "whole side stays one batch" invariant and throws if a concat regression ever violates it.
+
+**Empty-opposite side (orphan tasks).** When one side is a genuinely empty table, its concat emits *zero* batches. The surviving side's batches then have nothing to pair with, so once both producers finish, `next_cross_schedule_orphan` claims each survivor and `get_next_task_input_data` **synthesizes an empty opposite batch** for it (`make_empty_join_side_table` from the absent child's output types, built on the survivor's device) and returns an ordinary two-batch task. `execute()` then runs the normal join dispatch unchanged, so cuDF NULL-pads the survivor for LEFT/RIGHT/OUTER/ANTI and yields zero rows for INNER/SEMI. Popping the survivor also drains the repository, so the pipeline completes instead of hanging. FULL OUTER and RIGHT-family joins are the reachable cases (they always run STANDARD); small-build INNER/LEFT/SEMI/ANTI take BUILD_PROBE, which handles an empty side separately.
+
+The following table summarizes, per join type, what concat folds, which side streams under this scheme, and the partition / broadcast / mode support:
+
+| JoinType | concat fold (whole side) | Streams multi-batch | batch×batch + union | Multi-partition | Broadcast | Supported modes |
+|---|---|---|---|---|---|---|
+| INNER | neither | both sides | ✅ inherent | ✅ natural count | ✅ (small build) | STANDARD, BUILD_PROBE, MIXED_JOIN† |
+| LEFT | build → 1 | probe | ✅ | ✅ | ✅ (small build) | STANDARD, BUILD_PROBE, MIXED_JOIN† |
+| SEMI | build → 1 | probe | ✅ | ✅ | ✅ (small build) | STANDARD, BUILD_PROBE, MIXED_JOIN† |
+| ANTI | build → 1 | probe | ✅ | ✅ | ✅ (small build) | STANDARD, BUILD_PROBE, MIXED_JOIN† |
+| MARK | build resident (via BUILD_PROBE; `_concat_all = false`) | probe (BUILD_PROBE) | n/a — forced BUILD_PROBE | ❌ clamped to 1 (single-GPU) | ✅ forced on multi-GPU | BUILD_PROBE only |
+| OUTER (FULL) | both → 1 | neither (stays 1×1) | ✅ degenerate | ✅ natural count | ❌ | STANDARD, MIXED_JOIN† |
+| RIGHT | probe → 1 | build | ✅ | ✅ (probe-driven) | ❌ | STANDARD, MIXED_JOIN† |
+| RIGHT_SEMI | probe → 1 | build | ✅ | ✅ | ❌ | STANDARD, MIXED_JOIN† |
+| RIGHT_ANTI | probe → 1 | build | ✅ | ✅ | ❌ | STANDARD, MIXED_JOIN† |
+| SINGLE | — | — | — | — | — | unsupported (throws) |
+
+† MIXED_JOIN applies to any of these types when the join carries equality conditions **plus** either an inequality condition or a null-safe `IS NOT DISTINCT FROM` key mixed with a plain `=` (the null-safe key is routed to the AST predicate as `NULL_EQUAL`, since cuDF's single `null_equality` flag can't give `=` and null-safe keys opposite semantics). MARK is never routed to MIXED_JOIN: MARK + inequality is rejected at construction, and a MARK + null-safe key stays a `UNEQUAL` hash key (a known null-safe limitation). "Streams multi-batch" describes the STANDARD/MIXED partial-barrier behavior; BUILD_PROBE already streamed its probe side. The whole-side fold is chosen in the `sirius_physical_concat` constructor from the downstream join type (`_concat_all`); partition / broadcast / mode eligibility is decided in `compute_hash_join_partition_strategy`.
 
 #### MARK joins
 A MARK join emits every left row plus a `BOOL8` mark column indicating whether each left row had a match. Both build strategies funnel through `resolve_mark_join_result`, which scatters left-row match indices into the mark column.
@@ -344,7 +381,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | Operator | Category | GPU Method |
 |----------|----------|-----------|
 | GPU_SCAN | Scan | Unified GPU scan source served by `sirius_scan_manager` via a per-format `gpu_ingestible` |
-| STREAMING_SOURCE | Scan | Exchange-input source; pulls batch handles from `exchange_channel`, resolves via `shared_data_repository` |
+| STREAMING_SOURCE | Scan | Exchange-input source; drains an `exec::batch_stream` (repository fed by `push()`, sender-aware EOS, producer-error plane) |
 | DUMMY_SCAN | Scan | Generates 1 row |
 | COLUMN_DATA_SCAN | Scan | Reads ColumnDataCollection |
 | FILTER | Relational | `expression_evaluator::select()` |

@@ -158,6 +158,60 @@ bi: "1.5Gi")");
     REQUIRE(bi == static_cast<std::uint64_t>(1.5 * 1024 * 1024 * 1024));
   }
 
+  SECTION("required byte values reject negative integers without mutation")
+  {
+    auto node          = YAML::Load("size: -1");
+    std::uint64_t size = 4096;
+    yaml::reader r(node);
+    REQUIRE_THROWS_WITH(r.required("size", yaml::bytes(size)),
+                        Catch::Contains("byte value must be non-negative"));
+    REQUIRE(size == 4096);
+  }
+
+  SECTION("required byte values reject negative suffixed strings without mutation")
+  {
+    auto node          = YAML::Load(R"(size: "-1GiB")");
+    std::uint64_t size = 4096;
+    yaml::reader r(node);
+    REQUIRE_THROWS_WITH(r.required("size", yaml::bytes(size)),
+                        Catch::Contains("byte value must be non-negative"));
+    REQUIRE(size == 4096);
+  }
+
+  SECTION("optional byte values reject negative integers without mutation")
+  {
+    auto node                         = YAML::Load("size: -1");
+    std::optional<std::uint64_t> size = 4096;
+    yaml::reader r(node);
+    REQUIRE_THROWS_WITH(r.optional("size", yaml::bytes(size)),
+                        Catch::Contains("byte value must be non-negative"));
+    REQUIRE(size == 4096);
+  }
+
+  SECTION("optional byte values reject negative suffixed strings without mutation")
+  {
+    auto node                         = YAML::Load(R"(size: "-1GiB")");
+    std::optional<std::uint64_t> size = 4096;
+    yaml::reader r(node);
+    REQUIRE_THROWS_WITH(r.optional("size", yaml::bytes(size)),
+                        Catch::Contains("byte value must be non-negative"));
+    REQUIRE(size == 4096);
+  }
+
+  SECTION("zero byte values remain valid")
+  {
+    auto node                                  = YAML::Load("size: 0");
+    std::uint64_t size                         = 4096;
+    std::optional<std::uint64_t> optional_size = 4096;
+    yaml::reader r(node);
+    r.required("size", yaml::bytes(size));
+    REQUIRE(size == 0);
+
+    yaml::reader optional_reader(node);
+    optional_reader.optional("size", yaml::bytes(optional_size));
+    REQUIRE(optional_size == 0);
+  }
+
   SECTION("string suffix on plain integer field is rejected")
   {
     auto node = YAML::Load(R"(count: "4Ki")");
@@ -538,6 +592,44 @@ TEST_CASE("yaml reader optional_node", "[config_opt][optional_node]")
   REQUIRE(present.has_value());
   REQUIRE(present->as<int>() == 42);
   REQUIRE_FALSE(missing.has_value());
+}
+
+TEST_CASE("yaml reader has_value distinguishes null from scalar values", "[config_opt][has_value]")
+{
+  struct test_case {
+    const char* yaml;
+    bool expected;
+  };
+
+  const test_case cases[] = {
+    {"{}", false},
+    {"usage_limit_bytes: null", false},
+    {"usage_limit_fraction: null", false},
+    {"usage_limit_bytes: null\nusage_limit_fraction: null", false},
+    {"usage_limit_bytes: 0", true},
+    {"usage_limit_fraction: 0.5", true},
+    {"usage_limit_bytes: 0\nusage_limit_fraction: null", true},
+    {"usage_limit_bytes: null\nusage_limit_fraction: 0.5", true},
+  };
+
+  for (auto const& test : cases) {
+    INFO("yaml=" << test.yaml);
+    auto node = YAML::Load(test.yaml);
+    yaml::reader r(node);
+    auto const has_explicit_gpu_limit =
+      r.has_value("usage_limit_bytes") || r.has_value("usage_limit_fraction");
+    REQUIRE(has_explicit_gpu_limit == test.expected);
+  }
+}
+
+TEST_CASE("yaml reader has distinguishes missing, null, and scalar keys", "[config_opt][has]")
+{
+  auto node = YAML::Load("null_key: null\nscalar_key: 0");
+  yaml::reader r(node);
+
+  CHECK_FALSE(r.has("missing_key"));
+  CHECK(r.has("null_key"));
+  CHECK(r.has("scalar_key"));
 }
 
 // ================ error context ================= //

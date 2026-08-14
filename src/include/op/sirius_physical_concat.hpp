@@ -65,7 +65,7 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
 
   void sink(const operator_data& output_data, rmm::cuda_stream_view stream) override;
 
-  //! Used when PARTITION + `update_join_exec_mode` selects BUILD_PROBE: merge all build batches
+  //! Used when PARTITION + `get_partition_strategy` selects BUILD_PROBE: merge all build batches
   //! before the join so the hash join sees a single build batch.
   void set_concat_all(bool concat_all);
 

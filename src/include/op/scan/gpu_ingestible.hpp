@@ -33,7 +33,9 @@
 #include <concepts>
 #include <functional>
 #include <memory>
+#include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 // cucascade (forward-declare to keep this header light; full include in .cpp)
@@ -68,7 +70,7 @@ class scan_operator_input;
  * on each split it pulls off its connector.
  *
  * Implementations today: @c parquet_gpu_ingestible,
- * @c duckdb_native_gpu_ingestible, @c cached_parquet_gpu_ingestible.
+ * @c duckdb_native_gpu_ingestible.
  */
 class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
  public:
@@ -111,10 +113,11 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    * @brief Materialize the cudf table for one split. Called by
    *        @c sirius_gpu_scan_operator::execute on the task-local stream.
    *
-   * @p mem_space carries both the allocator (via
-   * @c get_default_allocator) and the device_id used to select a per-GPU
-   * sirius_ioctx for the read — implementations route the read through
-   * that ioctx so per-GPU CUDA contexts bind correctly.
+   * @param mem_space Destination memory space for decoded columns.
+   *
+   * Implementations allocate through this space's allocator. The caller must
+   * make its device current before calling this method. I/O uses the datasource
+   * attached to the scan metadata.
    */
   virtual filtered_table materialize_metadata_to_table(
     const scan_info& info,
@@ -123,9 +126,9 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
 
   /**
    * @brief Apply post-decode filter and/or projection to the materialized
-   *        table. Called by @c sirius_gpu_scan_operator::execute when the
-   *        split carries a non-null @ref post_filter_and_projection_info,
-   *        or when a pinned-cache batch needs filter/assembly.
+   *        table. Called by @c sirius_gpu_scan_operator::execute whenever
+   *        @ref materialize_metadata_to_table did not return
+   *        @c filter_state::ROW_FILTERED_AND_PROJECTED.
    *
    * Takes the input by owning unique_ptr so implementations that call
    * @c assemble_scan_output (which consumes its input by rvalue) can
@@ -156,6 +159,28 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
   /// column_ids order — so a cached batch is laid out identically to a fresh disk read and
   /// @ref post_filter_and_project resolves the same columns on both paths.
   [[nodiscard]] virtual std::vector<std::size_t> materialized_column_order() const = 0;
+
+  /// Columns this scan can consume as a decode-time BOOL8 predicate mask rather
+  /// than as values, keyed by column primary (storage) index; the mapped value is
+  /// the constant set to test against.
+  ///
+  /// A column qualifies when its whole pushed-down filter is an equality / IN
+  /// over string constants *and* it is never projected — the mask replaces the
+  /// column's values, so a projected column could not survive the substitution.
+  ///
+  /// A source that can exploit this (a Simpatico-compressed pin, whose dictionary
+  /// answers the predicate off its key set without gathering the decoded chars)
+  /// attaches it via @c sirius::decode_equality_pushdown; every other source
+  /// supplies the column normally. @ref post_filter_and_project copes with either
+  /// by inspecting the batch it is handed, so the two need not agree.
+  ///
+  /// Empty by default: an ingestible whose filter path does not implement the
+  /// substitution must not advertise candidates.
+  [[nodiscard]] virtual std::unordered_map<std::size_t, std::vector<std::string>>
+  decode_predicate_candidates() const
+  {
+    return {};
+  }
 
  protected:
   gpu_ingestible() noexcept = default;
