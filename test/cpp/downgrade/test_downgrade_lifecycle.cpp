@@ -125,6 +125,34 @@ downgrade_executor make_test_executor(sirius::data::data_repository_manager_regi
   return downgrade_executor(config, repo_registry, GPU_SPACE_ID, gpu_space, mem_mgr);
 }
 
+/// Like make_test_memory_manager, but with the GPU downgrade trigger pulled down to 25% of
+/// capacity (default 85% sits ABOVE the 75% reservation limit, so the default fixture can
+/// never see should_downgrade_memory()). A held 1 GiB reservation is then enough sustained
+/// pressure to keep the monitor firing.
+std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> make_pressure_memory_manager()
+{
+  sirius::converter_registry::reset_for_testing();
+
+  cucascade::memory::reservation_manager_configurator builder;
+  const size_t gpu_capacity  = 2ull << 30;  // 2GB
+  const size_t host_capacity = 4ull << 30;  // 4GB
+
+  builder.set_number_of_gpus(1)
+    .set_gpu_usage_limit(gpu_capacity)
+    .set_reservation_fraction_per_gpu(0.75)
+    .set_downgrade_fractions_per_gpu(/*start=*/0.25, /*end=*/0.10)
+    .set_per_numa_region_capacity(host_capacity)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(0.75);
+
+  auto space_configs = builder.build();
+  auto manager =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(std::move(space_configs));
+
+  sirius::converter_registry::initialize();
+  return manager;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -514,5 +542,163 @@ TEST_CASE("cuda_stream_lifecycle", "[downgrade_lifecycle]")
   }
   REQUIRE(get_batch_tier(*batch2) == cucascade::memory::Tier::HOST);
 
+  executor.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Per-query drain (A7/B2) and monitor re-arm (D6)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("per_query_drain_cancels_only_that_querys_requests", "[downgrade_lifecycle]")
+{
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+
+  // One convertible batch so query A's request dispatches a worker that parks in its
+  // predicate, deterministically wedging the processing loop in wait_all with A IN FLIGHT.
+  auto repo  = std::make_unique<cucascade::shared_data_repository>();
+  auto batch = make_gpu_batch(*gpu_space);
+  repo->add_data_batch(batch);
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  executor.start();
+
+  std::promise<void> release_blocker;
+  std::shared_future<void> gate(release_blocker.get_future());
+  std::atomic<bool> blocker_entered{false};
+
+  const auto query_a = sirius::make_query_id(101);
+  const auto query_b = sirius::make_query_id(202);
+  const auto query_c = sirius::make_query_id(303);
+
+  auto fut_a = executor.request_downgrade(query_a, [&blocker_entered, gate]() {
+    blocker_entered.store(true);
+    gate.wait();
+    return false;
+  });
+
+  // Wait until A is genuinely in flight (its worker is inside the predicate).
+  auto deadline = std::chrono::steady_clock::now() + 10s;
+  while (!blocker_entered.load() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  REQUIRE(blocker_entered.load());
+
+  // B and C queue behind A (the processing loop handles one request at a time).
+  auto fut_b = executor.request_downgrade(query_b, []() { return false; });
+  auto fut_c = executor.request_downgrade(query_c, []() { return false; });
+
+  // Drain B: only B's promise fails. A stays in flight, C stays queued, and the drain does
+  // not block (the in-flight request is A's, not B's).
+  executor.drain(query_b);
+  REQUIRE(fut_b.wait_for(0s) == std::future_status::ready);
+  REQUIRE_THROWS_AS(fut_b.get(), std::exception);
+  REQUIRE(fut_a.wait_for(0s) == std::future_status::timeout);
+  REQUIRE(fut_c.wait_for(0s) == std::future_status::timeout);
+
+  // Drain A from another thread: must BLOCK until A's in-flight request completes.
+  std::atomic<bool> drain_a_returned{false};
+  std::thread drain_a_thread([&executor, &drain_a_returned, query_a]() {
+    executor.drain(query_a);
+    drain_a_returned.store(true);
+  });
+  std::this_thread::sleep_for(100ms);
+  REQUIRE_FALSE(drain_a_returned.load());
+
+  release_blocker.set_value();
+  drain_a_thread.join();
+  REQUIRE(drain_a_returned.load());
+
+  // A completed normally: promise fulfilled with the converted bytes, not an exception.
+  REQUIRE(fut_a.wait_for(10s) == std::future_status::ready);
+  size_t freed_a = 0;
+  REQUIRE_NOTHROW(freed_a = fut_a.get());
+  REQUIRE(freed_a > 0);
+
+  // C was never disturbed: it processes after A and resolves normally (0 bytes -- A's
+  // worker already converted the only candidate).
+  REQUIRE(fut_c.wait_for(10s) == std::future_status::ready);
+  REQUIRE_NOTHROW(fut_c.get());
+
+  executor.stop();
+}
+
+TEST_CASE("monitor_rearms_after_drain_cancels_queued_monitor_request", "[downgrade_lifecycle]")
+{
+  // D6 regression: cancel_pending_requests() used to eat a queued monitor request without
+  // resetting _monitor_request_enqueued, permanently disabling memory-pressure downgrade
+  // for the space. Recipe: wedge the processing loop, create sustained pressure so the
+  // monitor enqueues (and latches), then drain() -- the queue interrupt guarantees the
+  // monitor request is cancelled, never processed. Afterwards the monitor must fire again.
+  auto mem_mgr    = make_pressure_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+
+  auto repo  = std::make_unique<cucascade::shared_data_repository>();
+  auto batch = make_gpu_batch(*gpu_space);
+  repo->add_data_batch(batch);
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr, /*monitor_period=*/5ms);
+  executor.start();
+
+  // No pressure yet (trigger is 512 MiB consumed), so the monitor idles. Wedge the
+  // processing loop first: a blocker request whose worker parks in its predicate.
+  std::promise<void> release_blocker;
+  std::shared_future<void> gate(release_blocker.get_future());
+  std::atomic<bool> blocker_entered{false};
+  auto blocker_future =
+    executor.request_downgrade(sirius::make_query_id(7), [&blocker_entered, gate]() {
+      blocker_entered.store(true);
+      gate.wait();
+      return false;
+    });
+  auto deadline = std::chrono::steady_clock::now() + 10s;
+  while (!blocker_entered.load() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  REQUIRE(blocker_entered.load());
+
+  // NOW create sustained pressure: hold a 1 GiB reservation. The monitor sees
+  // should_downgrade_memory(), enqueues one request behind the wedged blocker, and latches
+  // _monitor_request_enqueued so it enqueues exactly one.
+  auto pressure = gpu_space->make_reservation_or_null(1ull << 30);
+  REQUIRE(pressure != nullptr);
+  deadline = std::chrono::steady_clock::now() + 10s;
+  while (executor.monitor_requests_issued_for_testing() == 0 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  const auto issued_before_drain = executor.monitor_requests_issued_for_testing();
+  REQUIRE(issued_before_drain >= 1);
+
+  // Global drain. It interrupts the request queue FIRST, so the processing thread (once
+  // unwedged) exits without ever popping the queued monitor request -- the drain's cancel
+  // is guaranteed to be what destroys it. drain() blocks joining the wedged thread, so
+  // run it from a helper and release the blocker underneath it.
+  std::thread drainer([&executor]() { executor.drain(); });
+  std::this_thread::sleep_for(50ms);
+  release_blocker.set_value();
+  drainer.join();
+
+  // Pressure is still on (the reservation is still held) and the queued monitor request
+  // was cancelled, not processed. The monitor must re-arm and fire again; before the fix
+  // _monitor_request_enqueued stayed latched true and this poll times out.
+  deadline = std::chrono::steady_clock::now() + 5s;
+  while (executor.monitor_requests_issued_for_testing() <= issued_before_drain &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(5ms);
+  }
+  REQUIRE(executor.monitor_requests_issued_for_testing() > issued_before_drain);
+
+  pressure.reset();
   executor.stop();
 }

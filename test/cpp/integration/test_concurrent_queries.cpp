@@ -236,11 +236,17 @@ struct concurrent_env {
 // Run @p n_workers threads (own connection each, barrier-synced start), each
 // executing @p per_worker(worker_id, iteration) -> SQL, checking against
 // @p expected(worker_id, iteration) (empty string = only require no error).
+// @p session_setup_sql, when non-null, runs once on every worker connection
+// before the start barrier (e.g. per-session SETs).
 // Returns the failure descriptions (Catch2 v2 assertions are not thread-safe,
 // so workers only collect).
 template <typename SqlFn, typename ExpectFn>
-std::vector<std::string> run_workers(
-  duckdb::DuckDB& db, int n_workers, int n_iters, SqlFn per_worker, ExpectFn expected)
+std::vector<std::string> run_workers(duckdb::DuckDB& db,
+                                     int n_workers,
+                                     int n_iters,
+                                     SqlFn per_worker,
+                                     ExpectFn expected,
+                                     const char* session_setup_sql = nullptr)
 {
   std::mutex failures_mutex;
   std::vector<std::string> failures;
@@ -251,6 +257,13 @@ std::vector<std::string> run_workers(
 
   auto worker = [&](int wid) {
     duckdb::Connection con(db);
+    if (session_setup_sql != nullptr) {
+      auto setup = con.Query(session_setup_sql);
+      if (setup->HasError()) {
+        std::lock_guard<std::mutex> lock(failures_mutex);
+        failures.push_back("worker " + std::to_string(wid) + " SETUP ERROR: " + setup->GetError());
+      }
+    }
     {
       std::unique_lock<std::mutex> lock(start_mutex);
       ++ready;
@@ -477,6 +490,132 @@ TEST_CASE(
   // query's mandatory cleanup — a leftover means a cleanup never destroyed its plan
   // (it would then survive, holding GPU memory, until process teardown).
   REQUIRE(env.sirius_ctx->retired_query_plan_count() == 0);
+}
+
+TEST_CASE("query end does not disrupt peer queries' pending spills",
+          "[concurrency][memory_pressure][isolated_context]")
+{
+  // A7/B2/D6 regression. Workers alternate SHORT queries -- every completion runs
+  // run_mandatory_cleanup, i.e. the downgrade-executor drain -- with self-join shapes whose
+  // builds saturate a tiny pool, parking their GPU manager threads in
+  // request_downgrade(...).get(). With the old global drain, each query end cancelled every
+  // peer's pending spill promise, failing the peer's query; a drain racing the monitor could
+  // also latch _monitor_request_enqueued forever, killing pressure-driven downgrade for the
+  // rest of the process.
+  //
+  // Workers run with enable_duckdb_fallback = false so a GPU runtime failure surfaces its
+  // error STRING instead of silently completing on the CPU. That makes the assertion
+  // mechanism-exact: a cancelled pending downgrade produces "downgrade request cancelled for
+  // task" (gpu_pipeline_executor's .get() catch path), which the per-query drain makes
+  // structurally impossible for a healthy peer -- while a genuine OOM under this
+  // deliberately brutal load (retry-cap trip) is a different string and is tolerated, since
+  // in-use build tables cannot be spilled at any drain design.
+  constexpr std::uint64_t kTinyPool = 1'500'000'000ULL;  // 1.5 GiB GPU
+  concurrent_env env(kTinyPool, /*rows=*/25'000'000);
+
+  // Fact-fact self-joins whose un-partitioned builds are pool-sized. Local to this test so
+  // the other tests keep their cheap shapes.
+  const std::vector<std::string> heavy_shapes = {
+    "SELECT f.k AS k, count(*) AS c, sum(g.v) AS s FROM fact f JOIN fact g ON f.id = g.id "
+    "GROUP BY f.k ORDER BY f.k",
+    "SELECT f.v AS v, count(*) AS c, min(g.id) AS lo FROM fact f JOIN fact g ON f.id = g.id "
+    "GROUP BY f.v ORDER BY f.v",
+    "SELECT f.k % 10 AS kb, g.v % 7 AS vb, count(*) AS c, sum(g.id) AS s "
+    "FROM fact f JOIN fact g ON f.id = g.id GROUP BY kb, vb ORDER BY kb, vb",
+  };
+  const std::string short_sql = "SELECT count(*) AS c, sum(w) AS s FROM dim";
+  // Big-RESULT scan: its output batches sit idle in the result collector's repositories,
+  // giving memory-pressure sweeps a deep candidate list. Long sweeps keep the downgrade
+  // processing thread busy, so peers' shortfall requests spend real time QUEUED -- the
+  // only state the old global drain could cancel them in. Result is not compared (multi-
+  // million-row string materialization); no-error suffices.
+  const std::string big_result_sql = "SELECT id, v FROM fact WHERE k % 7 = 3";
+  std::vector<std::string> heavy_refs;
+  std::string short_ref;
+  {
+    duckdb::Connection con(*env.db);
+    // Un-partition the joins: the whole build side must be resident at once, so each join
+    // task's reservation demand approaches the pool size and concurrent joins overcommit
+    // it -- exactly the condition that produces partial grants and sends a GPU manager
+    // thread into request_downgrade(...).get(). Instance-wide, set before any worker runs.
+    for (const auto* knob :
+         {"SET max_build_hash_table_bytes = 1200000000", "SET hash_partition_bytes = 1200000000"}) {
+      auto s = con.Query(knob);
+      REQUIRE_FALSE(s->HasError());
+    }
+    // Reference pass keeps the fallback default, so even a reference retry-cap trip still
+    // yields a correct reference string.
+    for (const auto& q : heavy_shapes) {
+      auto r = con.Query(q);
+      REQUIRE_FALSE(r->HasError());
+      heavy_refs.push_back(materialize(*r));
+    }
+    auto r = con.Query(short_sql);
+    REQUIRE_FALSE(r->HasError());
+    short_ref = materialize(*r);
+  }
+
+  // Staggered mix: even workers alternate self-join / short, odd workers alternate
+  // big-result / short. At any moment some workers are mid-heavy (parked in the downgrade
+  // path), some are seeding idle spill candidates, and some are completing short queries,
+  // so query-end cleanup fires throughout the run rather than only in an initial burst.
+  // -1 = short, -2 = big-result, >=0 = heavy shape index.
+  auto pick = [&](int wid, int i) -> int {
+    if ((wid + i) % 2 != 0) { return -1; }
+    if (wid % 2 != 0) { return -2; }
+    return (wid + i / 2) % static_cast<int>(heavy_shapes.size());
+  };
+  auto failures = run_workers(
+    *env.db,
+    workers(),
+    iters_per_worker() * 2,  // longer window so query-end churn lands mid-spill
+    [&](int wid, int i) {
+      const int shape = pick(wid, i);
+      if (shape == -1) { return short_sql; }
+      if (shape == -2) { return big_result_sql; }
+      return heavy_shapes[shape];
+    },
+    [&](int wid, int i) -> std::string {
+      const int shape = pick(wid, i);
+      if (shape == -1) { return short_ref; }
+      if (shape == -2) { return std::string(); }  // no-error only
+      return heavy_refs[shape];
+    },
+    /*session_setup_sql=*/"SET enable_duckdb_fallback = false");
+
+  // Classify: wrong results and cancelled-downgrade errors are the bug; other errors under
+  // this deliberately over-committed load are genuine memory exhaustion and tolerated.
+  std::vector<std::string> hard_failures;
+  std::size_t tolerated_oom = 0;
+  for (const auto& f : failures) {
+    const bool cancelled    = f.find("downgrade request cancelled for task") != std::string::npos;
+    const bool wrong_result = f.find("WRONG RESULT") != std::string::npos;
+    if (cancelled || wrong_result) {
+      hard_failures.push_back(f);
+    } else {
+      ++tolerated_oom;
+      UNSCOPED_INFO("tolerated (memory exhaustion under over-commit): " << f);
+    }
+  }
+  INFO("tolerated_oom=" << tolerated_oom << " peak=" << env.sirius_ctx->query_lifecycle_peak());
+  // (a) no wrong results; (b) no peer's pending downgrade was cancelled by a query end.
+  require_no_failures(hard_failures);
+  // The churn only proves anything if windows actually overlapped.
+  if (slots() > 1 && workers() > 1) { REQUIRE(env.sirius_ctx->query_lifecycle_peak() > 1); }
+
+  // (c) after all that query-end churn, the downgrade path must still be alive: the same
+  // pool-sized self-join, running ALONE with fallback disabled, must succeed on the GPU
+  // with a correct result. It cannot without working spills -- a latched monitor flag or a
+  // wedged downgrade executor fails it (and no peer exists to blame).
+  {
+    duckdb::Connection con(*env.db);
+    auto off = con.Query("SET enable_duckdb_fallback = false");
+    REQUIRE_FALSE(off->HasError());
+    auto r = con.Query(heavy_shapes[0]);
+    if (r->HasError()) { UNSCOPED_INFO("post-churn heavy query error: " << r->GetError()); }
+    REQUIRE_FALSE(r->HasError());
+    REQUIRE(materialize(*r) == heavy_refs[0]);
+  }
 }
 
 TEST_CASE("concurrent queries serve from a pinned table across unpin/re-pin churn",
