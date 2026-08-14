@@ -31,7 +31,10 @@
 #include <sirius_context.hpp>
 
 // cudf
+#include <cudf/column/column_factories.hpp>
 #include <cudf/cudf_utils.hpp>
+#include <cudf/filling.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/unary.hpp>
@@ -53,6 +56,57 @@
 namespace sirius::op::scan {
 namespace {
 constexpr std::size_t kMaxNumericCarrierExpansion = 8;
+
+/// Emit the deferred positions as a rowid and placeholders instead of values.
+///
+/// The ids are a SEQUENCE over the origin's span, which is what makes this
+/// cheap: a served batch is one pinned chunk's rows, in order, so row i of the
+/// output is global row `range.start + i`. That equality is checked rather than
+/// assumed — a batch whose rows were dropped somewhere would still produce a
+/// column of the right length, holding ids for rows it no longer contains, and
+/// the wrongness would only surface as plausible values at the far end.
+///
+/// This runs on the FINISHED scan output, which is why v1 refuses any scan that
+/// restricts rows (see install_late_materialization). Admitting one means
+/// substituting ahead of the filter's gather so the rowid is carried through it.
+std::unique_ptr<cudf::table> substitute_deferred_columns(
+  std::unique_ptr<cudf::table> output,
+  late_mat::deferred_scan_output const& deferred,
+  late_mat::scan_batch_origin const& origin,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  auto const rows = output->num_rows();
+  if (static_cast<std::int64_t>(rows) != origin.range.rows) {
+    throw std::runtime_error("[sirius_gpu_scan_operator] a deferred scan emitted " +
+                             std::to_string(rows) + " rows for a pinned chunk of " +
+                             std::to_string(origin.range.rows) +
+                             "; the rowid would address rows this batch no longer holds");
+  }
+
+  auto columns = output->release();
+  for (std::size_t i = 0; i < deferred.output_positions.size(); ++i) {
+    auto const position = deferred.output_positions[i];
+    if (position >= columns.size()) {
+      throw std::runtime_error("[sirius_gpu_scan_operator] deferred position " +
+                               std::to_string(position) + " is outside the scan's output");
+    }
+    if (i == 0) {
+      auto const init = cudf::numeric_scalar<std::uint64_t>(
+        static_cast<std::uint64_t>(origin.range.start), true, stream, mr);
+      auto const step   = cudf::numeric_scalar<std::uint64_t>(1, true, stream, mr);
+      columns[position] = cudf::sequence(rows, init, step, stream, mr);
+      continue;
+    }
+    // A placeholder only has to keep the position occupied and the arity
+    // unchanged. Zeroed rather than left uninitialized: nothing between the two
+    // halves reads it, but a byte nobody defines is a byte that makes an
+    // otherwise deterministic run differ.
+    auto const zero   = cudf::numeric_scalar<std::int8_t>(0, true, stream, mr);
+    columns[position] = cudf::make_column_from_scalar(zero, rows, stream, mr);
+  }
+  return std::make_unique<cudf::table>(std::move(columns));
+}
 
 constexpr std::size_t saturating_add(std::size_t lhs, std::size_t rhs) noexcept
 {
@@ -264,6 +318,24 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
                                              stream,
                                              mem_space->get_default_allocator());
   }
+  // Late materialization, producing half. Installed only where a served batch is
+  // one pinned chunk's whole row span, so a batch arriving here without an
+  // origin means the install-time conditions and the serve-time stamping have
+  // drifted apart — and emitting values for one batch and rowids for the next
+  // hands downstream two different schemas.
+  if (!deferred_output().empty()) {
+    if (!scan_input->origin) {
+      throw std::runtime_error(
+        "[sirius_gpu_scan_operator::execute] a deferral is installed but this split carries no "
+        "origin; the scan cannot say where its rows came from");
+    }
+    output_table = substitute_deferred_columns(std::move(output_table),
+                                               deferred_output(),
+                                               *scan_input->origin,
+                                               stream,
+                                               mem_space->get_default_allocator());
+  }
+
   auto batch =
     sirius::make_data_batch(std::move(output_table), *mem_space, stream, batch_telemetry());
   std::vector<std::shared_ptr<::cucascade::data_batch>> batches{std::move(batch)};

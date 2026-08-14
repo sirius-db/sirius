@@ -18,6 +18,7 @@
 
 // sirius
 #include <compression/compressed_scan.hpp>
+#include <late_mat/column_origin.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <scan_manager/mvcc_chunk_mask.hpp>
@@ -223,6 +224,11 @@ class scan_operator_input : public op::operator_data {
   /// consumption (scan-internal OOM retry) must fail loudly rather than
   /// serve the emptied wrapper batch as zero rows.
   mutable bool stolen_table_consumed{false};
+  /// Where this split's rows came from, for late materialization: the pinned entry's column
+  /// origins and the contiguous pin-order span this chunk covers. Stamped by
+  /// drain_cached_provider from databatch_provider::batch, which owns the definition; null
+  /// unless the gate is on and the scan is one whose batches are a pinned chunk each.
+  std::shared_ptr<late_mat::scan_batch_origin const> origin;
   /// True when scan normalization will cast at least one selected column of this resident cached
   /// split. Stamped by drain_cached_provider from databatch_provider::batch, which owns the
   /// definition.
