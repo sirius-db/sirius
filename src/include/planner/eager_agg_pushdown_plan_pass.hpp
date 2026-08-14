@@ -41,6 +41,10 @@ namespace sirius::planner {
 ///
 /// Correctness gates (all provable at plan time, fail closed — see the .cpp
 /// header comment for the full soundness argument):
+///   - the aggregate sits on the join directly or through ONE pure
+///     pass-through projection (every slot a plain column ref — DuckDB's
+///     column pruning inserts one on some shapes); references are traced
+///     through it;
 ///   - single grouping set, no GROUPING() calls, groups are plain column refs
 ///     that do not touch the pushed side;
 ///   - every aggregate is a single-column-ref COUNT / SUM / SUM_NO_OVERFLOW /

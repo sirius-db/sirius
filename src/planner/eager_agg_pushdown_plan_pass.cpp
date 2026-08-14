@@ -83,6 +83,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -164,14 +165,39 @@ bool non_pushed_side_is_bare_scan(const duckdb::LogicalOperator& side)
 struct match_info {
   duckdb::LogicalAggregate* aggregate = nullptr;
   duckdb::LogicalComparisonJoin* join = nullptr;
+  /// Pure pass-through projection between aggregate and join, when present
+  /// (DuckDB's column pruning inserts one on some shapes, e.g. INNER joins).
+  duckdb::LogicalProjection* projection = nullptr;
   /// Which join child is the pushed (pre-aggregated) side.
   duckdb::idx_t pushed_slot = 0;
+  /// Table indexes produced by the pushed side.
+  std::unordered_set<duckdb::idx_t> pushed_tables;
   /// Per upper aggregate: combine function name ("sum"/"min"/"max").
   std::vector<const char*> combine_names;
   /// Per upper aggregate: repair 0-vs-NULL for unmatched preserved rows
   /// (COUNT under an outer join).
   std::vector<bool> needs_zero_fill;
 };
+
+/// Resolve @p expr (a reference in the aggregate) through the optional
+/// pass-through projection to the column ref the JOIN emits. Returns nullptr
+/// when the shape is out of contract (not a plain column ref at either level).
+const duckdb::BoundColumnRefExpression* trace_to_join_output(
+  const duckdb::Expression& expr, const duckdb::LogicalProjection* projection)
+{
+  if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_COLUMN_REF) { return nullptr; }
+  auto& colref = expr.Cast<duckdb::BoundColumnRefExpression>();
+  if (projection == nullptr) { return &colref; }
+  // With a projection in between, every aggregate-level reference must be one
+  // of its outputs.
+  if (colref.binding.table_index != projection->table_index ||
+      colref.binding.column_index >= projection->expressions.size()) {
+    return nullptr;
+  }
+  auto& below = *projection->expressions[colref.binding.column_index];
+  if (below.GetExpressionClass() != duckdb::ExpressionClass::BOUND_COLUMN_REF) { return nullptr; }
+  return &below.Cast<duckdb::BoundColumnRefExpression>();
+}
 
 /// Match @p op against the pushdown pattern. Purely read-only; returns
 /// std::nullopt (refusal) unless every correctness gate and the benefit gate
@@ -192,12 +218,22 @@ std::optional<match_info> match_candidate(duckdb::LogicalOperator& op)
     return std::nullopt;
   }
 
-  // --- child must be a plain comparison join ---
-  if (aggregate.children.size() != 1 ||
-      aggregate.children[0]->type != duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-    return std::nullopt;
+  // --- child must be a plain comparison join, optionally through ONE pure
+  // pass-through projection (every slot a plain column ref) ---
+  if (aggregate.children.size() != 1) { return std::nullopt; }
+  match_info info;
+  duckdb::LogicalOperator* below = aggregate.children[0].get();
+  if (below->type == duckdb::LogicalOperatorType::LOGICAL_PROJECTION) {
+    info.projection = &below->Cast<duckdb::LogicalProjection>();
+    for (auto& slot : info.projection->expressions) {
+      if (slot->GetExpressionClass() != duckdb::ExpressionClass::BOUND_COLUMN_REF) {
+        return std::nullopt;
+      }
+    }
+    below = info.projection->children[0].get();
   }
-  auto& join = aggregate.children[0]->Cast<duckdb::LogicalComparisonJoin>();
+  if (below->type != duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) { return std::nullopt; }
+  auto& join = below->Cast<duckdb::LogicalComparisonJoin>();
   if (join.join_type != duckdb::JoinType::INNER && join.join_type != duckdb::JoinType::LEFT &&
       join.join_type != duckdb::JoinType::RIGHT) {
     return std::nullopt;
@@ -212,7 +248,6 @@ std::optional<match_info> match_candidate(duckdb::LogicalOperator& op)
   // --- every aggregate is a decomposable single-column-ref over ONE side ---
   bool args_in_left  = false;
   bool args_in_right = false;
-  match_info info;
   for (auto& expr : aggregate.expressions) {
     if (expr->GetExpressionClass() != duckdb::ExpressionClass::BOUND_AGGREGATE) {
       return std::nullopt;
@@ -223,12 +258,10 @@ std::optional<match_info> match_candidate(duckdb::LogicalOperator& op)
     }
     const char* combine = combine_function_name(aggr.function.name);
     if (combine == nullptr) { return std::nullopt; }
-    if (aggr.children.size() != 1 ||
-        aggr.children[0]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_COLUMN_REF) {
-      return std::nullopt;
-    }
-    auto table_index =
-      aggr.children[0]->Cast<duckdb::BoundColumnRefExpression>().binding.table_index;
+    if (aggr.children.size() != 1) { return std::nullopt; }
+    auto* traced = trace_to_join_output(*aggr.children[0], info.projection);
+    if (traced == nullptr) { return std::nullopt; }
+    auto table_index = traced->binding.table_index;
     if (left_tables.count(table_index) != 0) {
       args_in_left = true;
     } else if (right_tables.count(table_index) != 0) {
@@ -248,15 +281,14 @@ std::optional<match_info> match_candidate(duckdb::LogicalOperator& op)
   if (join.join_type == duckdb::JoinType::LEFT && info.pushed_slot != 1) { return std::nullopt; }
   if (join.join_type == duckdb::JoinType::RIGHT && info.pushed_slot != 0) { return std::nullopt; }
 
-  const auto& pushed_tables = info.pushed_slot == 0 ? left_tables : right_tables;
+  info.pushed_tables        = info.pushed_slot == 0 ? left_tables : right_tables;
+  const auto& pushed_tables = info.pushed_tables;
 
   // --- group keys must not touch the pushed side ---
   for (auto& group : aggregate.groups) {
-    if (group->GetExpressionClass() != duckdb::ExpressionClass::BOUND_COLUMN_REF) {
-      return std::nullopt;
-    }
-    auto table_index = group->Cast<duckdb::BoundColumnRefExpression>().binding.table_index;
-    if (pushed_tables.count(table_index) != 0) { return std::nullopt; }
+    auto* traced = trace_to_join_output(*group, info.projection);
+    if (traced == nullptr) { return std::nullopt; }
+    if (pushed_tables.count(traced->binding.table_index) != 0) { return std::nullopt; }
   }
 
   // --- join conditions: all `=`, pushed side is a plain column ref ---
@@ -348,10 +380,16 @@ void apply_rewrite(duckdb::unique_ptr<duckdb::LogicalOperator>& op_ref,
   auto const num_aggregates    = aggregate.expressions.size();
 
   // --- lower aggregate: GROUP BY the pushed side's join keys, computing the
-  // original aggregates (their column refs already bind below the join) ---
+  // original aggregates with their inputs re-traced to below-join bindings
+  // (identical bindings when no pass-through projection sits in between) ---
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> lower_aggregates;
   for (auto& expr : aggregate.expressions) {
-    lower_aggregates.push_back(expr->Copy());
+    auto lower_expr        = expr->Copy();
+    auto& lower_aggr       = lower_expr->Cast<duckdb::BoundAggregateExpression>();
+    auto* traced           = trace_to_join_output(*lower_aggr.children[0], info.projection);
+    lower_aggr.children[0] = make_column_ref(
+      traced->return_type, traced->binding.table_index, traced->binding.column_index);
+    lower_aggregates.push_back(std::move(lower_expr));
   }
   auto lower = duckdb::make_uniq<duckdb::LogicalAggregate>(
     lower_group_index, lower_aggr_index, std::move(lower_aggregates));
@@ -386,11 +424,44 @@ void apply_rewrite(duckdb::unique_ptr<duckdb::LogicalOperator>& op_ref,
 
   // --- upper aggregate combines the partials ---
   std::vector<duckdb::LogicalType> original_types;
+  original_types.reserve(num_aggregates);
+  for (auto& expr : aggregate.expressions) {
+    original_types.push_back(expr->return_type);
+  }
+
+  // With a pass-through projection in between, route the partials through it:
+  // keep its non-pushed-side slots (remapping the group keys that use them),
+  // drop the pushed-side slots (their join columns no longer exist — every one
+  // of them was only consumed as an aggregate input), and append one slot per
+  // partial for the upper aggregate to combine.
+  auto partial_table         = lower_aggr_index;
+  duckdb::idx_t partial_base = 0;
+  if (info.projection != nullptr) {
+    auto& projection = *info.projection;
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> kept_slots;
+    std::unordered_map<duckdb::idx_t, duckdb::idx_t> slot_remap;
+    for (duckdb::idx_t s = 0; s < projection.expressions.size(); s++) {
+      auto& slot_ref = projection.expressions[s]->Cast<duckdb::BoundColumnRefExpression>();
+      if (info.pushed_tables.count(slot_ref.binding.table_index) != 0) { continue; }
+      slot_remap[s] = kept_slots.size();
+      kept_slots.push_back(std::move(projection.expressions[s]));
+    }
+    partial_base = kept_slots.size();
+    for (duckdb::idx_t i = 0; i < num_aggregates; i++) {
+      kept_slots.push_back(make_column_ref(original_types[i], lower_aggr_index, i));
+    }
+    projection.expressions = std::move(kept_slots);
+    partial_table          = projection.table_index;
+    for (auto& group : aggregate.groups) {
+      auto& group_ref                = group->Cast<duckdb::BoundColumnRefExpression>();
+      group_ref.binding.column_index = slot_remap.at(group_ref.binding.column_index);
+    }
+  }
+
   bool needs_projection = false;
   for (duckdb::idx_t i = 0; i < num_aggregates; i++) {
-    auto& expr = aggregate.expressions[i];
-    original_types.push_back(expr->return_type);
-    auto partial_ref = make_column_ref(expr->return_type, lower_aggr_index, i);
+    auto& expr       = aggregate.expressions[i];
+    auto partial_ref = make_column_ref(original_types[i], partial_table, partial_base + i);
     auto combined = bind_combine_aggregate(context, info.combine_names[i], std::move(partial_ref));
     combined->SetAlias(expr->GetAlias());
     needs_projection =
