@@ -112,6 +112,12 @@ Two things must still match for cache hits — both legitimate key inputs:
 Note: binaries built in dist mode embed an rpath to the canonical env, so keep
 `~/.local/share/sirius/sccache-dist/` around while using them.
 
+Measured cross-checkout sharing (same machine, same commit, different checkout paths):
+**~85% of C/C++ compiles hit**; whole-`nvcc` CUDA jobs and a small C/C++ tail still key
+checkout-specifically (their preprocessed output is byte-identical across checkouts, so the
+residual leak is in the sccache fork's key construction — an upstream rapidsai/sccache issue,
+not something this repo can normalize away). Same-checkout rebuilds hit ~99.8%.
+
 ## Health checks
 
 ```bash
