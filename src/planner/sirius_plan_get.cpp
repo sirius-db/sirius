@@ -274,6 +274,13 @@ std::optional<std::string> iceberg_gpu_scan_decline_reason(duckdb::LogicalGet& o
     }
   }
 
+  // An unpinned scan is NOT refused here. Each planning pass resolves "current" separately, so
+  // the two can disagree if a commit lands between them — but the fix belongs where the deletes
+  // are actually read: build_iceberg_table_info() resolves the snapshot and proves it against the
+  // files that pass bound, then keys the delete read on it. Refusing here instead would force
+  // users onto `snapshot_from_id`, which is the time-travel selector and answers a different
+  // question for any table whose schema moved after its last data commit.
+
   if (auto reason = iceberg_retired_field_id_decline_reason(op)) { return reason; }
 
   std::string escaped;
