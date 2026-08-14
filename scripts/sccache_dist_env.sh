@@ -96,6 +96,25 @@ export SCCACHE_DIST_AUTH_TOKEN="$_sirius_dist_token"
 # Compile locally instead of failing when the farm is unreachable.
 export SCCACHE_DIST_FALLBACK_TO_LOCAL_COMPILE=true
 
+# Make __DATE__/__TIME__ expand deterministically (they otherwise bake the
+# preprocessing wall-clock second into cache keys via headers like duckdb's
+# pcg_extras.hpp, permanently missing across machines). Built binaries report
+# a 1970 build date in dist mode.
+export SOURCE_DATE_EPOCH=0
+
+# Strip checkout-local prefixes (sources, .pixi env) from hashed paths and
+# preprocessor output. pixi activation exports the same value inside
+# `pixi run`, but sccache reads it in the *server* process at startup — so
+# export it here too and restart the server below to make it stick.
+_sirius_repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export SCCACHE_BASEDIRS="$_sirius_repo_root:$_sirius_repo_root/.pixi/envs/default"
+unset _sirius_repo_root
+
+# The dist-mode server (port 4227) caches its config at startup; restart it so
+# the exports above (basedirs, S3 creds) apply to the next build. The normal
+# build's sccache server (port 4226) is unaffected.
+"$_sirius_dist_bin" --stop-server >/dev/null 2>&1 || true
+
 unset _sirius_dist_home _sirius_dist_creds _sirius_dist_token _sirius_dist_arch
 
 echo "RAPIDS sccache dist farm enabled for this shell (launcher: $_sirius_dist_bin)"

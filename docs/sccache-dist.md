@@ -87,8 +87,13 @@ worktree, and every machine with a different checkout path) disjoint cache keys 
 even for identical sources.
 
 Everything else is already path-independent: source paths, include paths, and the working
-directory are normalized out of the key (`SCCACHE_BASEDIRS` is exported by pixi activation),
-and keys are stable across sccache fork versions and dist/local compilation.
+directory are normalized out of the key (`SCCACHE_BASEDIRS`, which the env script exports and
+which requires the dist server restart the env script performs — sccache reads it in the
+server process at startup), and keys are stable across sccache fork versions and dist/local
+compilation. The env script also sets `SOURCE_DATE_EPOCH=0` so `__DATE__`/`__TIME__` expand
+deterministically instead of baking the preprocessing wall-clock second into the key (duckdb's
+`pcg_extras.hpp` expands them in every TU that includes it); dist-mode binaries therefore
+report a 1970 build date.
 
 The canonical env fixes the one remaining input: all dist-mode builds use compilers at the same
 absolute path (`~/.local/share/sirius/sccache-dist/pixi/.pixi/envs/default`), so the specs file
