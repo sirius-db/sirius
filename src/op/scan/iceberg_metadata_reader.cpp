@@ -393,13 +393,15 @@ void materialize_positional_deletes(duckdb::DatabaseInstance& db,
           "'); which one applies would depend on manifest order, which Iceberg does not define");
       }
 
-      auto positions = read_deletion_vector(
-        dv_entry.file_path, dv_entry.content_offset, dv_entry.content_size_in_bytes);
+      auto positions =
+        read_deletion_vector({.puffin_path           = dv_entry.file_path,
+                              .content_offset        = dv_entry.content_offset,
+                              .content_size_in_bytes = dv_entry.content_size_in_bytes,
+                              .referenced_data_file  = dv_entry.referenced_data_file,
+                              .record_count          = dv_entry.record_count});
 
-      // The manifest states how many positions this vector holds. The blob's magic and CRC prove
-      // it is *a* well-formed deletion vector, not that it is *this* entry's -- a wrong
-      // offset/length that happens to land on another valid vector passes both. Comparing against
-      // the count the manifest independently recorded is what ties the blob to this entry.
+      // The footer check above ties the blob to this entry; this ties the decoded bitmap to the
+      // count both of them declare, which is the one thing the footer cannot vouch for.
       if (dv_entry.record_count >= 0 &&
           dv_entry.record_count != static_cast<int64_t>(positions.size())) {
         throw std::runtime_error(

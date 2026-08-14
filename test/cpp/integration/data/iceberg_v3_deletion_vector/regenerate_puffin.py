@@ -58,7 +58,10 @@ def extract_blob(raw: bytes) -> bytes:
     return raw
 
 
-def build_puffin(blob: bytes, snapshot_id: int, sequence_number: int) -> bytes:
+def build_puffin(blob: bytes, cardinality: int) -> bytes:
+    """`snapshot-id` and `sequence-number` are -1 because the Puffin spec fixes them there for
+    `deletion-vector-v1`: the file is written before a snapshot id exists to record. `cardinality`
+    is required, and is a string because Puffin properties are a string->string map."""
     offset = len(MAGIC)
     footer_payload = json.dumps(
         {
@@ -66,11 +69,14 @@ def build_puffin(blob: bytes, snapshot_id: int, sequence_number: int) -> bytes:
                 {
                     "type": "deletion-vector-v1",
                     "fields": [],
-                    "snapshot-id": snapshot_id,
-                    "sequence-number": sequence_number,
+                    "snapshot-id": -1,
+                    "sequence-number": -1,
                     "offset": offset,
                     "length": len(blob),
-                    "properties": {"referenced-data-file": REFERENCED_DATA_FILE},
+                    "properties": {
+                        "referenced-data-file": REFERENCED_DATA_FILE,
+                        "cardinality": str(cardinality),
+                    },
                 }
             ],
             "properties": {},
@@ -148,11 +154,12 @@ def main() -> int:
         return 1
     entry = dv_entries[0]
 
-    snapshot_id = entry.get("snapshot_id") or 7000000000000000001
-    sequence_number = entry.get("sequence_number") or 2
-
     blob = extract_blob(PUFFIN.read_bytes())
-    puffin = build_puffin(blob, snapshot_id, sequence_number)
+    # Counted with pyiceberg rather than by us, and pyiceberg needs a whole container to read. The
+    # placeholder pass exists only to give it one; `cardinality` sits in the footer, so replacing
+    # it moves neither the blob's offset nor its length.
+    cardinality = dv_cardinality(build_puffin(blob, 0))
+    puffin = build_puffin(blob, cardinality)
 
     shutil.copy2(PUFFIN, PUFFIN.with_suffix(".puffin.bak"))
     PUFFIN.write_bytes(puffin)
@@ -161,7 +168,7 @@ def main() -> int:
     # The blob no longer starts at 0, so the manifest has to agree.
     entry["data_file"]["content_offset"] = len(MAGIC)
     entry["data_file"]["content_size_in_bytes"] = len(blob)
-    entry["data_file"]["record_count"] = dv_cardinality(puffin)
+    entry["data_file"]["record_count"] = cardinality
 
     shutil.copy2(MANIFEST, MANIFEST.with_suffix(".avro.bak"))
     with MANIFEST.open("wb") as fh:

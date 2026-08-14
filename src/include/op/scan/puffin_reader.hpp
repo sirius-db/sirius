@@ -22,21 +22,28 @@
 
 namespace sirius::op::scan {
 
+/// What a manifest entry claims about the deletion vector it points at. The reader checks every
+/// field against the Puffin footer, so a wrong pointer is caught rather than silently followed.
+struct DeletionVectorRef {
+  std::string puffin_path;            ///< Path to the Puffin file.
+  int64_t content_offset{-1};         ///< Byte offset of the DV blob within the file.
+  int64_t content_size_in_bytes{-1};  ///< Byte length of the DV blob.
+  std::string referenced_data_file;   ///< Data file the entry says this vector deletes from.
+  int64_t record_count{-1};           ///< Deleted positions the entry claims; -1 if absent.
+};
+
 /**
  * @brief Read a V3 deletion vector from a Puffin sidecar file.
  *
- * Reads the blob at the given offset/length from the Puffin file, verifies
- * the deletion-vector-v1 magic and CRC-32, deserializes the 64-bit Roaring
- * bitmap, and returns the deleted row positions as a sorted vector.
+ * Validates the Puffin footer's blob descriptor against @p ref before decoding: the spec requires
+ * `content_offset`/`content_size_in_bytes` to match the descriptor's `offset`/`length` exactly, so
+ * an entry pointing at another entry's vector is rejected instead of deleting the wrong rows. Then
+ * verifies the deletion-vector-v1 magic and CRC-32 and deserializes the 64-bit Roaring bitmap.
  *
- * @param puffin_path          Path to the Puffin file.
- * @param content_offset       Byte offset of the DV blob within the file.
- * @param content_size_in_bytes Byte length of the DV blob.
  * @return Sorted vector of deleted row positions (int64_t).
- * @throws std::runtime_error on I/O errors, magic mismatch, or CRC failure.
+ * @throws std::runtime_error on I/O errors, a descriptor that contradicts @p ref, magic mismatch,
+ *         or CRC failure.
  */
-std::vector<int64_t> read_deletion_vector(std::string const& puffin_path,
-                                          int64_t content_offset,
-                                          int64_t content_size_in_bytes);
+std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref);
 
 }  // namespace sirius::op::scan

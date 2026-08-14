@@ -101,7 +101,7 @@ def dv_blob(positions):
     )
 
 
-def build_puffin(blob, referenced_data_file, snapshot_id, sequence_number):
+def build_puffin(blob, referenced_data_file, cardinality):
     """Wrap ONE vector in its own Puffin container.
 
     One file per vector, because that is what a rewrite actually produces: compaction writes a
@@ -109,15 +109,22 @@ def build_puffin(blob, referenced_data_file, snapshot_id, sequence_number):
     container instead makes the fixture untestable -- readers that key decoded vectors by
     `referenced-data-file` (pyiceberg does) collide on the shared key and pick one by position,
     so the answer stops depending on the manifest status this fixture exists to exercise.
+
+    `snapshot-id` and `sequence-number` are -1 because the Puffin spec fixes them there for
+    `deletion-vector-v1`: the file is written before a snapshot id exists to record. `cardinality`
+    is required, and is a string because Puffin properties are a string->string map.
     """
     descriptor = {
         "type": "deletion-vector-v1",
         "fields": [],
-        "snapshot-id": snapshot_id,
-        "sequence-number": sequence_number,
+        "snapshot-id": -1,
+        "sequence-number": -1,
         "offset": len(PUFFIN_MAGIC),
         "length": len(blob),
-        "properties": {"referenced-data-file": referenced_data_file},
+        "properties": {
+            "referenced-data-file": referenced_data_file,
+            "cardinality": str(cardinality),
+        },
     }
     footer = json.dumps(
         {"blobs": [descriptor], "properties": {}}, separators=(",", ":")
@@ -271,9 +278,6 @@ def main():
     meta = rewrite_paths(json.loads(meta_path.read_text()))
     meta_path.write_text(json.dumps(meta, indent=2))
 
-    snapshot_id = meta["current-snapshot-id"]
-    sequence_number = meta["snapshots"][-1]["sequence-number"]
-
     # EVERY avro carries paths rooted at the repo, the DATA manifest included. Missing one leaves
     # the vectors pointing at the source fixture's parquet, so referenced_data_file matches no
     # file this scan reads and the deletes are silently skipped -- a 5-row answer that reads as a
@@ -304,7 +308,7 @@ def main():
         ("retired", RETIRED_POSITIONS),
     ):
         container, descriptor = build_puffin(
-            dv_blob(positions), data_file, snapshot_id, sequence_number
+            dv_blob(positions), data_file, len(positions)
         )
         path = (
             data_dir / f"dv-{label}-00000-0-d7e8f9a0-0007-0007-0007-000000000002.puffin"

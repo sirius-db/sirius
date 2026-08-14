@@ -18,10 +18,15 @@
 #include <log/logging.hpp>
 #include <op/scan/puffin_reader.hpp>
 
+// Vendored by DuckDB core and already on this target's include path; duckdb_static bundles its
+// objects, so reading the Puffin footer costs no new dependency.
+#include "yyjson.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -247,12 +252,177 @@ size_t deserialize_roaring32(const uint8_t* data, size_t data_len, std::vector<u
   return static_cast<size_t>(p - data);
 }
 
+using YyjsonDoc =
+  std::unique_ptr<duckdb_yyjson::yyjson_doc, decltype(&duckdb_yyjson::yyjson_doc_free)>;
+
+/// Puffin properties are a string->string map, so numbers arrive quoted.
+std::string property_or_empty(duckdb_yyjson::yyjson_val* properties, char const* key)
+{
+  if (properties == nullptr) { return {}; }
+  auto* val       = duckdb_yyjson::yyjson_obj_get(properties, key);
+  auto const* str = duckdb_yyjson::yyjson_get_str(val);
+  return str == nullptr ? std::string{} : std::string{str};
+}
+
+/// Reads the footer and returns the blob descriptor whose `offset` equals @p content_offset,
+/// checking every property the spec fixes for `deletion-vector-v1`.
+///
+/// The manifest and the footer are written by the same commit but are separate structures, so
+/// agreement between them is what proves the entry points at *its own* vector. The blob's magic
+/// and CRC only prove it is a well-formed vector — a wrong offset landing on a different valid
+/// vector passes both, and passes the cardinality check too whenever the two happen to be the
+/// same size.
+void validate_footer_descriptor(std::ifstream& f,
+                                std::streamoff file_size,
+                                DeletionVectorRef const& ref,
+                                char const (&puffin_magic)[4])
+{
+  // Footer = Magic | Payload | PayloadSize(4, LE) | Flags(4) | Magic
+  static constexpr std::streamoff kFooterTail = 12;  // PayloadSize + Flags + trailing Magic
+  if (file_size < kFooterTail + 8) {
+    throw std::runtime_error("[puffin] File too small to hold a footer: " + ref.puffin_path);
+  }
+
+  f.seekg(file_size - kFooterTail);
+  uint8_t tail[kFooterTail];
+  f.read(reinterpret_cast<char*>(tail), kFooterTail);
+  if (!f) { throw std::runtime_error("[puffin] Cannot read footer tail of " + ref.puffin_path); }
+
+  auto const payload_size = static_cast<int32_t>(read_u32_le(tail));
+  if (payload_size < 0 || static_cast<std::streamoff>(payload_size) + kFooterTail + 4 > file_size) {
+    throw std::runtime_error("[puffin] Footer payload size " + std::to_string(payload_size) +
+                             " does not fit in " + ref.puffin_path);
+  }
+
+  // Bit 0 of the flags means the payload is LZ4-compressed. Nothing here can decompress it, and
+  // guessing would be worse than declining.
+  if ((tail[4] & 0x01u) != 0) {
+    throw std::runtime_error("[puffin] Footer of " + ref.puffin_path +
+                             " is compressed, so its blob descriptors cannot be checked");
+  }
+
+  f.seekg(file_size - kFooterTail - payload_size - 4);
+  char magic[4];
+  f.read(magic, 4);
+  if (!f || std::memcmp(magic, puffin_magic, 4) != 0) {
+    throw std::runtime_error("[puffin] Missing footer magic in " + ref.puffin_path);
+  }
+
+  std::string payload(static_cast<size_t>(payload_size), '\0');
+  f.read(payload.data(), payload_size);
+  if (!f) { throw std::runtime_error("[puffin] Cannot read footer payload of " + ref.puffin_path); }
+
+  YyjsonDoc doc(duckdb_yyjson::yyjson_read(payload.data(), payload.size(), 0),
+                &duckdb_yyjson::yyjson_doc_free);
+  if (!doc) {
+    throw std::runtime_error("[puffin] Footer of " + ref.puffin_path + " is not valid JSON");
+  }
+
+  auto* blobs =
+    duckdb_yyjson::yyjson_obj_get(duckdb_yyjson::yyjson_doc_get_root(doc.get()), "blobs");
+  if (blobs == nullptr || !duckdb_yyjson::yyjson_is_arr(blobs)) {
+    throw std::runtime_error("[puffin] Footer of " + ref.puffin_path + " has no 'blobs' array");
+  }
+
+  duckdb_yyjson::yyjson_val* descriptor = nullptr;
+  size_t idx                            = 0;
+  size_t max                            = 0;
+  duckdb_yyjson::yyjson_val* blob       = nullptr;
+  yyjson_arr_foreach(blobs, idx, max, blob)
+  {
+    auto* offset = duckdb_yyjson::yyjson_obj_get(blob, "offset");
+    if (offset != nullptr && duckdb_yyjson::yyjson_get_sint(offset) == ref.content_offset) {
+      descriptor = blob;
+      break;
+    }
+  }
+  if (descriptor == nullptr) {
+    throw std::runtime_error("[puffin] No blob at offset " + std::to_string(ref.content_offset) +
+                             " in the footer of " + ref.puffin_path +
+                             "; the manifest entry points into the middle of the file");
+  }
+
+  auto const require = [&ref](char const* what, std::string const& got, std::string const& want) {
+    if (got != want) {
+      throw std::runtime_error("[puffin] Blob at offset " + std::to_string(ref.content_offset) +
+                               " in " + ref.puffin_path + " has " + what + " '" + got +
+                               "', but its manifest entry requires '" + want + "'");
+    }
+  };
+
+  auto const* type =
+    duckdb_yyjson::yyjson_get_str(duckdb_yyjson::yyjson_obj_get(descriptor, "type"));
+  require("type", type == nullptr ? std::string{} : std::string{type}, "deletion-vector-v1");
+
+  auto const length =
+    duckdb_yyjson::yyjson_get_sint(duckdb_yyjson::yyjson_obj_get(descriptor, "length"));
+  if (length != ref.content_size_in_bytes) {
+    throw std::runtime_error("[puffin] Blob at offset " + std::to_string(ref.content_offset) +
+                             " in " + ref.puffin_path + " is " + std::to_string(length) +
+                             " bytes, but its manifest entry records " +
+                             std::to_string(ref.content_size_in_bytes));
+  }
+
+  // "Snapshot ID and sequence number are not known at the time the Puffin file is created", so the
+  // spec fixes both at -1. A real value means the file was not written as a deletion vector.
+  for (auto const* field : {"snapshot-id", "sequence-number"}) {
+    auto* val = duckdb_yyjson::yyjson_obj_get(descriptor, field);
+    if (val == nullptr) {
+      throw std::runtime_error("[puffin] Blob descriptor in " + ref.puffin_path + " has no '" +
+                               field + "'");
+    }
+    if (duckdb_yyjson::yyjson_get_sint(val) != -1) {
+      throw std::runtime_error("[puffin] Blob descriptor in " + ref.puffin_path + " has " + field +
+                               "=" + std::to_string(duckdb_yyjson::yyjson_get_sint(val)) +
+                               ", but deletion-vector-v1 fixes it at -1");
+    }
+  }
+
+  // Required for every blob, but its contents are unconstrained for a deletion vector.
+  if (duckdb_yyjson::yyjson_obj_get(descriptor, "fields") == nullptr) {
+    throw std::runtime_error("[puffin] Blob descriptor in " + ref.puffin_path + " has no 'fields'");
+  }
+
+  // An explicit JSON null is how some writers spell "absent", so only a real codec is a problem.
+  auto* codec = duckdb_yyjson::yyjson_obj_get(descriptor, "compression-codec");
+  if (codec != nullptr && !duckdb_yyjson::yyjson_is_null(codec)) {
+    throw std::runtime_error("[puffin] Blob descriptor in " + ref.puffin_path +
+                             " sets compression-codec, but deletion-vector-v1 is never compressed");
+  }
+
+  auto* properties      = duckdb_yyjson::yyjson_obj_get(descriptor, "properties");
+  auto const referenced = property_or_empty(properties, "referenced-data-file");
+  if (referenced.empty()) {
+    throw std::runtime_error("[puffin] Blob descriptor in " + ref.puffin_path +
+                             " has no referenced-data-file property");
+  }
+  // Compare on the bare path: the manifest and the footer are free to disagree about the URI
+  // scheme, and rejecting on `file://` alone would refuse tables that are entirely well formed.
+  require("referenced-data-file",
+          sirius::io::strip_file_scheme(referenced),
+          sirius::io::strip_file_scheme(ref.referenced_data_file));
+
+  auto const cardinality = property_or_empty(properties, "cardinality");
+  if (cardinality.empty()) {
+    throw std::runtime_error("[puffin] Blob descriptor in " + ref.puffin_path +
+                             " has no cardinality property");
+  }
+  if (ref.record_count >= 0 && cardinality != std::to_string(ref.record_count)) {
+    throw std::runtime_error("[puffin] Blob at offset " + std::to_string(ref.content_offset) +
+                             " in " + ref.puffin_path + " declares cardinality " + cardinality +
+                             ", but its manifest entry records " +
+                             std::to_string(ref.record_count));
+  }
+}
+
 }  // anonymous namespace
 
-std::vector<int64_t> read_deletion_vector(std::string const& puffin_path,
-                                          int64_t content_offset,
-                                          int64_t content_size_in_bytes)
+std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref)
 {
+  auto const& puffin_path          = ref.puffin_path;
+  auto const content_offset        = ref.content_offset;
+  auto const content_size_in_bytes = ref.content_size_in_bytes;
+
   if (content_offset < 0 || content_size_in_bytes <= 0) {
     throw std::runtime_error(
       "[puffin] Invalid offset/size: offset=" + std::to_string(content_offset) +
@@ -276,11 +446,15 @@ std::vector<int64_t> read_deletion_vector(std::string const& puffin_path,
   if (!f || std::memcmp(magic, kPuffinMagic, 4) != 0) {
     throw std::runtime_error("[puffin] Not a Puffin file (bad leading magic): " + puffin_path);
   }
-  f.seekg(-4, std::ios::end);
+  f.seekg(0, std::ios::end);
+  auto const file_size = static_cast<std::streamoff>(f.tellg());
+  f.seekg(file_size - 4);
   f.read(magic, 4);
   if (!f || std::memcmp(magic, kPuffinMagic, 4) != 0) {
     throw std::runtime_error("[puffin] Not a Puffin file (bad trailing magic): " + puffin_path);
   }
+
+  validate_footer_descriptor(f, file_size, ref, kPuffinMagic);
 
   f.seekg(content_offset);
   if (!f) {
