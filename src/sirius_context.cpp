@@ -1788,6 +1788,12 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     cpu_fallback->names = prepared.names;
     cpu_fallback->properties    = prepared.properties;
     cpu_fallback->physical_plan = std::move(prepared.physical_plan);
+    // Fixed HERE, not per-execution: the stash is shared across (possibly
+    // concurrent) executions of one prepared statement, and the fallback path
+    // must not write shared state (E4). FORCE_MATERIALIZED so the whole CPU
+    // plan runs before any row is streamed out of the transparent operator.
+    cpu_fallback->output_type = QueryResultOutputType::FORCE_MATERIALIZED;
+    cpu_fallback->memory_type = QueryResultMemoryType::IN_MEMORY;
 
     // Create a new DuckDB PhysicalPlan containing our custom operator.
     auto new_physical_plan = make_uniq<PhysicalPlan>(Allocator::Get(context));

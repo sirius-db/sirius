@@ -22,6 +22,8 @@
 #include <duckdb/execution/physical_operator.hpp>
 #include <duckdb/planner/logical_operator.hpp>
 
+#include <atomic>
+
 namespace duckdb {
 class PreparedStatementData;
 }  // namespace duckdb
@@ -63,15 +65,22 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
 
  private:
   /// A reusable copy of the optimized logical plan.
-  /// DuckDB can execute the same prepared physical operator multiple times, so
-  /// we rebuild a fresh Sirius physical plan from this template for each run.
-  /// May be null when the plan contains a non-Copy()-able LogicalGet (a table
-  /// function whose bind_data has no serializer) — in that case we fall back to
-  /// re-planning from `unbound_statement_`.
-  /// Mutable: GetDataInternal is `const` per the DuckDB interface, but on the
-  /// first execute we may discover Copy() throws and need to clear this so
-  /// future executes skip straight to the replan path.
-  mutable duckdb::unique_ptr<duckdb::LogicalOperator> logical_plan_;
+  /// DuckDB can execute the same prepared physical operator multiple times —
+  /// and, with streaming results, from more than one thread of one connection
+  /// — so this member is IMMUTABLE after construction (register E4): every
+  /// execution takes its own copy_logical_plan() into per-execution state and
+  /// nothing ever resets the shared template (a reset would destroy the plan
+  /// under a concurrent execution's copy). May be null when the plan contains
+  /// a non-Copy()-able LogicalGet (a table function whose bind_data has no
+  /// serializer) — then every execution re-plans from `query_sql_`.
+  duckdb::unique_ptr<duckdb::LogicalOperator> logical_plan_;
+
+  /// Set (never cleared) when an execution discovers Copy() throws
+  /// NotImplementedException, so later executions skip straight to the SQL
+  /// replan path. A monotonic atomic flag: concurrent executions may race to
+  /// set it, both write `true`, and a stale `false` read only costs one more
+  /// failed Copy() attempt — never a use-after-free.
+  mutable std::atomic<bool> plan_copy_unsupported_{false};
 
   /// Original SQL string used to re-plan when `logical_plan_` cannot be
   /// copied (e.g. queries against table functions whose bind_data does not

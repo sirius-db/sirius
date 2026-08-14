@@ -62,11 +62,11 @@ duckdb::unique_ptr<duckdb::QueryResult> run_cpu_fallback_plan(
   duckdb::PreparedStatementData& cpu_prepared,
   duckdb::unique_ptr<duckdb::Executor>& out_executor)
 {
-  // Force a materialized (non-streaming) result so the whole plan runs before any
-  // row is streamed out of the operator.
-  cpu_prepared.output_type = duckdb::QueryResultOutputType::FORCE_MATERIALIZED;
-  cpu_prepared.memory_type = duckdb::QueryResultMemoryType::IN_MEMORY;
-
+  // cpu_prepared is SHARED across executions of one prepared statement, so this
+  // function must not write it (register E4): output_type/memory_type are fixed
+  // to FORCE_MATERIALIZED/IN_MEMORY where the stash is built
+  // (SiriusContext::OnFinalizePrepare), so the whole plan runs before any row
+  // is streamed out of the operator.
   auto collector = duckdb::PhysicalResultCollector::GetResultCollector(client, cpu_prepared);
   D_ASSERT(collector->type == duckdb::PhysicalOperatorType::RESULT_COLLECTOR);
 
@@ -182,14 +182,16 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       prepared->names = result_names_;
 
       // Rebuild a fresh Sirius physical plan for this execution. DuckDB may reuse
-      // the same prepared physical operator across multiple EXECUTE calls.
+      // the same prepared physical operator across multiple EXECUTE calls — and
+      // concurrently, so all per-execution state lives in the source state and
+      // the shared operator is never mutated (register E4).
       //
       // Prefer LogicalOperator::Copy when the plan supports it (cheap deep clone
       // via serialization). When the plan contains a non-serializable LogicalGet,
       // fall back to re-parsing + re-binding the unbound SQL statement, which
       // exercises the same bind path the very first run did.
       duckdb::unique_ptr<duckdb::LogicalOperator> fresh_plan;
-      if (logical_plan_) {
+      if (logical_plan_ && !plan_copy_unsupported_.load(std::memory_order_acquire)) {
         try {
           // Use the dynamic-filter-aware copy so LogicalComparisonJoin::filter_pushdown and
           // LogicalGet::dynamic_filters survive the serialize/deserialize round-trip — they are
@@ -197,9 +199,11 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
           // making downstream Sirius wiring silently miss runtime-computed dynamic filters.
           fresh_plan = sirius::transparent::copy_logical_plan(*logical_plan_, context.client);
         } catch (duckdb::NotImplementedException&) {
-          // Drop logical_plan_ — we know it can't be copied, so future executes
-          // will skip straight to the replan path.
-          logical_plan_.reset();
+          // The template can't be copied. Do NOT reset logical_plan_ — a
+          // concurrent execution may be inside its own copy_logical_plan()
+          // of the same tree. Latch the monotonic flag instead so future
+          // executes skip straight to the replan path.
+          plan_copy_unsupported_.store(true, std::memory_order_release);
         }
       }
       if (!fresh_plan) {
