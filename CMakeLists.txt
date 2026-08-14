@@ -831,9 +831,6 @@ target_include_directories(
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test/cpp>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
-    # Fused scan-filter: scan headers include codegen/selection/selection.hpp,
-    # so every target compiling them needs the simpatico include root.
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/compression/simpatico_codegen/include>
     $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
 )
 
