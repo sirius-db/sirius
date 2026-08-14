@@ -179,14 +179,21 @@ class multi_index_priority_queue {
   /// \return true if the task was enqueued, false if it was dropped because the queue is
   ///         interrupted. Callers that only enqueue may ignore it; those that report dropped
   ///         work (itask_executor::schedule) rely on it.
-  bool push(task_ptr task)
+  bool push(task_ptr task) { return push_or_bounce(std::move(task)) == nullptr; }
+
+  /// Like push(), but a refusal HANDS THE TASK BACK instead of destroying it:
+  /// returns nullptr on success, the task on an interrupted queue. Callers on
+  /// paths where a drop means a silently hung query (itask_executor::schedule
+  /// racing another query's quiesce bracket) retry with the returned task once
+  /// the bracket reactivates the queue.
+  [[nodiscard]] task_ptr push_or_bounce(task_ptr task)
   {
     assert(task && "cannot push a null task");
     const index_keys keys = _extract(*task);
     {
       std::lock_guard<std::mutex> lock(_mutex);
-      // Interrupted (shutdown): drop the task instead of enqueuing it.
-      if (!_active) { return false; }
+      // Interrupted: bounce the task back instead of enqueuing it.
+      if (!_active) { return task; }
 
       auto lit             = _levels.find(keys.priority);
       const bool new_level = (lit == _levels.end());
@@ -234,7 +241,7 @@ class multi_index_priority_queue {
       }
     }
     _cv.notify_all();
-    return true;
+    return nullptr;
   }
 
   /// Blocks until the globally-first (lowest-priority-value) task is available and

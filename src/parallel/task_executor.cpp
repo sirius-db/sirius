@@ -64,8 +64,21 @@ void itask_executor::schedule(std::unique_ptr<itask> task)
       });
     }
   }
-  if (!_task_queue.push(std::move(task))) {
-    SIRIUS_LOG_WARN("Task queue interrupted, dropping task");
+  auto bounced = _task_queue.push_or_bounce(std::move(task));
+  while (bounced) {
+    if (!_running.load()) {
+      // Real shutdown: dropping is the teardown contract, and it stays loud.
+      SIRIUS_LOG_WARN("Task queue interrupted at shutdown, dropping task");
+      return;
+    }
+    // Transient quiesce bracket (another query's error-path drain joining the
+    // manager): the queue reactivates as soon as the join lands, so wait it
+    // out instead of dropping — a dropped successor silently hangs this
+    // task's query. The bracket cannot deadlock on this retry: quiesce
+    // reactivates the queue BEFORE wait_all(), so a retrying pool worker
+    // always gets through.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    bounced = _task_queue.push_or_bounce(std::move(bounced));
   }
 }
 
@@ -153,6 +166,16 @@ void itask_executor::quiesce_manager()
   _bounded_pool->interrupt();
   _task_queue.interrupt();
   if (_manager_thread.joinable()) { _manager_thread.join(); }
+  // Reactivate the queue the moment the join lands: the interrupt exists only
+  // to pop the (single) manager out of its blocking pop(). Staying interrupted
+  // until resume_manager() bounced every CO-TENANT push in the window — and a
+  // bounced successor is a pipeline that never finishes, i.e. that query hangs
+  // (observed: a repeatedly-failing query starving 3 healthy ones). Reopening
+  // here also lets a pool worker parked in schedule()'s bounce-retry proceed,
+  // which wait_all() below depends on (that worker holds an active slot).
+  // The failing query's own pushes stay refused by the lifecycle gate, and its
+  // queued tasks are swept by the drain_query_tasks() that follows.
+  _task_queue.reactivate();
   _bounded_pool->wait_all();
 }
 
