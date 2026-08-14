@@ -508,9 +508,10 @@ TEST_CASE_METHOD(VectorJoinFixture,
 // Payload path (route-once): a multi-column right output forces the non-fast path,
 // where materialize must gather the requested columns by global row number. The
 // corpus id starts at 10000 so id != row position -- a route-once bug that used the
-// position as the id, or mis-mapped rows across batches, would return wrong ids.
-// The corpus is large enough to span several pinned batches, so the per-batch
-// routing (partition + per-batch gather) is actually exercised.
+// position as the id would return wrong ids. Note this FLOAT[3] corpus stays in one
+// pinned batch (small rows never reach the byte cap), so it does NOT exercise the
+// per-batch routing across multiple batches; the FLOAT[768] test in the global suite
+// ("payload path gathers across real multi-batch corpus") covers that.
 // -----------------------------------------------------------------------------
 TEST_CASE_METHOD(VectorJoinFixture,
                  "sirius_knn_join - payload path gathers right columns across batches",

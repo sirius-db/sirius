@@ -149,14 +149,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_reduce_local::execute
 
   auto const mr = space->get_default_allocator();
 
-  auto const stacked_neighbors = cudf::concatenate(neighbor_views, stream, mr);
-  auto const stacked_distances = cudf::concatenate(distance_views, stream, mr);
+  auto stacked_neighbors = cudf::concatenate(neighbor_views, stream, mr);
+  auto stacked_distances = cudf::concatenate(distance_views, stream, mr);
 
-  raft::device_resources res{stream};
-  auto merged = vss::knn_merge_parts_topk(
-    res, stacked_distances->view(), stacked_neighbors->view(), n_samples, n_parts, _k, stream, mr);
-
-  // Repeat this left batch's output columns for their k neighbors.
+  // Repeat this left batch's output columns so each left row lines up with its k neighbors.
   std::vector<cudf::column_view> left_batch_cols;
   left_batch_cols.reserve(_left_output_cols.size());
   for (auto const& per_batch : _left_output_cols) {
@@ -165,15 +161,37 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_reduce_local::execute
   auto left_repeated =
     cudf::repeat(cudf::table_view(left_batch_cols), static_cast<cudf::size_type>(_k), stream, mr);
 
-  // Emit and keep the partition (left batch) so materialize drains one batch per task.
+  std::unique_ptr<cudf::table> out_left;
+  std::unique_ptr<cudf::column> out_neighbors;
+  std::unique_ptr<cudf::column> out_distances;
+
+  if (_request.mode == vss::vector_join_mode::global_top_k) {
+    // Global top-k does no per-left-row reduction.
+    std::vector<cudf::table_view> left_tiles(static_cast<std::size_t>(n_parts),
+                                             left_repeated->view());
+    out_left      = cudf::concatenate(left_tiles, stream, mr);
+    out_neighbors = std::move(stacked_neighbors);
+    out_distances = std::move(stacked_distances);
+  } else {
+    // Per-row top-k merges each left row's per-batch neighbors into its overall top-k
+    // across right batches.
+    raft::device_resources res{stream};
+    auto merged = vss::knn_merge_parts_topk(
+      res, stacked_distances->view(), stacked_neighbors->view(), n_samples, n_parts, _k, stream, mr);
+    out_left      = std::move(left_repeated);
+    out_neighbors = std::move(merged.neighbors);
+    out_distances = std::move(merged.distances);
+  }
+
+  // Emit and keep the partition (left batch) so materialize / TOP_N drains one batch per task.
   std::vector<std::unique_ptr<cudf::column>> out_cols;
-  auto left_cols = left_repeated->release();
+  auto left_cols = out_left->release();
   out_cols.reserve(left_cols.size() + 2);
   for (auto& c : left_cols) {
     out_cols.push_back(std::move(c));
   }
-  out_cols.push_back(std::move(merged.neighbors));
-  out_cols.push_back(std::move(merged.distances));
+  out_cols.push_back(std::move(out_neighbors));
+  out_cols.push_back(std::move(out_distances));
   auto out_table = std::make_unique<cudf::table>(std::move(out_cols));
 
   auto batch = sirius::make_data_batch(std::move(out_table), *space, stream, batch_telemetry());

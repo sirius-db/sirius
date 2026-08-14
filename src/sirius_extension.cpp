@@ -2132,12 +2132,6 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
     }
   }
   if (req.k < 0) { throw BinderException("sirius_knn_join: k must be >= 0"); }
-  // cuVS's knn_merge_parts works for k<=1024
-  constexpr int64_t kMaxKnnJoinK = 1024;
-  if (req.k > kMaxKnnJoinK) {
-    throw BinderException("sirius_knn_join: k must be <= " + std::to_string(kMaxKnnJoinK) +
-                          " (the cross-batch merge limit), got " + std::to_string(req.k));
-  }
   if (req.n_clusters < 0) { throw BinderException("sirius_knn_join: n_clusters must be >= 0"); }
   if (req.n_probes < 1) { throw BinderException("sirius_knn_join: n_probes must be >= 1"); }
   if (req.eps < 0.0) { throw BinderException("sirius_knn_join: eps must be >= 0"); }
@@ -2147,6 +2141,12 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
   }
   if (!join_mode_is_set) {
     req.mode = req.eps > 0.0 ? vector_join_mode::threshold : vector_join_mode::per_row_top_k;
+  }
+  // Per-row top-k calls cuVS's knn_merge_parts, which only works for k<=1024
+  constexpr int64_t kMaxKnnJoinK = 1024;
+  if (req.mode == vector_join_mode::per_row_top_k && req.k > kMaxKnnJoinK) {
+    throw BinderException("sirius_knn_join: k must be <= " + std::to_string(kMaxKnnJoinK) +
+                          " for join_mode => 'per-row', got " + std::to_string(req.k));
   }
   if (!output_type_is_set) {
     req.output_type = req.metric == "cosine" ? vector_join_output_type::similarity

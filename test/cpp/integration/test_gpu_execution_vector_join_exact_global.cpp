@@ -498,14 +498,16 @@ TEST_CASE_METHOD(VectorJoinGlobalFixture,
 }
 
 // -----------------------------------------------------------------------------
-// Global top-k payload path. A multi-column right output (id + val) forces the
-// non-fast path, where materialize gathers the requested columns by global row
-// number. Global mode runs the TOP_N before materialize, so the gather happens on
-// just the k winners -- this test proves that reordering still resolves the right
-// columns correctly. The corpus id starts at 10000 so id != row position; a bug that
-// used the position as the id, or mis-mapped rows across batches, would return wrong
-// values. With the [i,i+1,i+2] corpus the distance is |P - C| * sqrt3, so k=15 lands
-// on a tie-free boundary: the 5 self-matches (0) plus all 10 neighbors (sqrt3).
+// Global top-k payload path, single pinned batch. A multi-column right output
+// (id + val) forces the non-fast path, where materialize gathers the requested
+// columns by global row number. Global mode runs the TOP_N before materialize, so
+// the gather happens on just the k winners -- this test proves that reordering still
+// resolves the right columns correctly. The corpus id starts at 10000 so id != row
+// position; a bug that used the position as the id would return wrong values. The
+// FLOAT[3] corpus never hits the batch byte cap, so it stays one batch -- the
+// multi-batch route-once gather is covered by the FLOAT[768] test below. With the
+// [i,i+1,i+2] corpus the distance is |P - C| * sqrt3, so k=15 lands on a tie-free
+// boundary: the 5 self-matches (0) plus all 10 neighbors (sqrt3).
 // -----------------------------------------------------------------------------
 TEST_CASE_METHOD(VectorJoinGlobalFixture,
                  "sirius_knn_join global - payload path gathers right columns across batches",
@@ -553,13 +555,72 @@ TEST_CASE_METHOD(VectorJoinGlobalFixture,
 }
 
 // -----------------------------------------------------------------------------
-// k above the cross-batch merge limit is rejected at bind, independent of join_mode.
-// A larger k would throw mid-merge inside cuVS knn_merge_parts (k <= 1024) and surface
-// as the misleading "cannot run on the CPU", so bind rejects it up front. k = 1024
-// binds fine even in global mode.
+// Global payload path across GENUINELY multiple pinned batches. The FLOAT[3] gpay
+// test above stays in one batch (small rows never reach the byte cap), so it never
+// runs the per-batch route-once gather -- the same blind spot that once hid a
+// multi-batch merge bug. Here the corpus is FLOAT[768] with 250000 rows: each row
+// group (~360 MB) exceeds the batch byte cap and pins on its own, so the corpus
+// spans three batches. id = 10000 + row position (so id != position) and val is a
+// second payload column, forcing the gather (non-fast) path. id lives in dim 0 (rest
+// zero), so the L2 distance between a probe at value P and corpus row j is |P - j|.
+// Three probes sit exactly on distinct corpus rows -- one per batch (positions 1000,
+// 200000, 249000) -- so the k=9 global winners (each probe's self at distance 0 plus
+// its two neighbors at distance 1; the 10th pair is at distance 2, a tie-free
+// boundary) draw their payload from all three batches. A route-once bug that
+// mis-mapped a batch offset would return the wrong id/val for the batch-1 or batch-2
+// winners.
 // -----------------------------------------------------------------------------
 TEST_CASE_METHOD(VectorJoinGlobalFixture,
-                 "sirius_knn_join global - rejects k above the cross-batch merge limit",
+                 "sirius_knn_join global - payload path gathers across real multi-batch corpus",
+                 "[integration][gpu_execution][array][vss][vector_join][global]")
+{
+  run_ok("CREATE TABLE mbpay_corpus (id INTEGER PRIMARY KEY, val INTEGER, vec FLOAT[768]);");
+  // id = 10000 + row position, val = a second payload column; both must come back via
+  // the per-batch gather, not from the row number. dim 0 = row position so L2 = |P - j|.
+  run_ok(
+    "INSERT INTO mbpay_corpus SELECT 10000 + i, i * 2, "
+    "list_resize([i::FLOAT], 768, 0.0::FLOAT)::FLOAT[768] FROM range(250000) t(i);");
+  run_ok("CREATE TABLE mbpay_probe (id INTEGER PRIMARY KEY, vec FLOAT[768]);");
+  // One probe per corpus batch: positions 1000 (batch 0), 200000 (batch 1),
+  // 249000 (batch 2). Each lands exactly on a corpus row.
+  run_ok(
+    "INSERT INTO mbpay_probe SELECT id, list_resize([v::FLOAT], 768, 0.0::FLOAT)::FLOAT[768] "
+    "FROM (VALUES (90000, 1000.0), (90001, 200000.0), (90002, 249000.0)) t(id, v);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'mbpay_corpus', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'mbpay_probe', tier => 'gpu', format => 'duckdb');");
+
+  // CPU global reference: the 9 smallest (probe, corpus) pairs over the full cross
+  // product, returning the corpus id + val (the payload columns) with the probe id.
+  con->Query("SET gpu_execution = false;");
+  auto reference = ok_rows(*con,
+                           "SELECT p.id, c.id, c.val FROM mbpay_probe p, mbpay_corpus c "
+                           "ORDER BY array_distance(p.vec, c.vec) LIMIT 9;");
+  con->Query("SET gpu_execution = true;");
+
+  // right_output_columns has two columns, so the join takes the payload (gather) path.
+  auto joined = ok_rows(*con,
+                        "SELECT left_id, right_id, right_val FROM sirius_knn_join("
+                        "'mbpay_probe','vec','mbpay_corpus','vec', "
+                        "search_mode => 'exact', metric => 'l2', k => 9, join_mode => 'global', "
+                        "right_output_columns => ['id', 'val']);");
+
+  REQUIRE(joined.size() == 9);  // global k pairs total: 3 probes x (self + 2 neighbors)
+  REQUIRE(joined == reference);
+
+  run_ok("SELECT * FROM unpin_table('mbpay_probe');");
+  run_ok("SELECT * FROM unpin_table('mbpay_corpus');");
+}
+
+// -----------------------------------------------------------------------------
+// The k <= 1024 cross-batch merge limit is a PER-ROW constraint, not a global one.
+// Global top-k skips knn_merge_parts (its 1024 cap) and reduces brute_force's
+// candidates with a plain TOP_N, so it accepts k > 1024; only per-row still rejects
+// it at bind. The 2000-row single-batch corpus lets a single probe produce up to 2000
+// global pairs, so k = 1025 is a valid, tie-free ask.
+// -----------------------------------------------------------------------------
+TEST_CASE_METHOD(VectorJoinGlobalFixture,
+                 "sirius_knn_join global - accepts k above the per-row merge limit",
                  "[integration][gpu_execution][array][vss][vector_join][global]")
 {
   run_ok("CREATE TABLE gkcap_corpus (id INTEGER PRIMARY KEY, vec FLOAT[3]);");
@@ -572,18 +633,18 @@ TEST_CASE_METHOD(VectorJoinGlobalFixture,
   run_ok("SELECT * FROM pin_table(name => 'gkcap_corpus', tier => 'gpu', format => 'duckdb');");
   run_ok("SELECT * FROM pin_table(name => 'gkcap_probe', tier => 'gpu', format => 'duckdb');");
 
-  // k = 1025 is one past the knn_merge_parts limit -> BinderException at bind.
-  expect_error(*con,
-               "SELECT * FROM sirius_knn_join('gkcap_probe','vec','gkcap_corpus','vec', "
-               "search_mode => 'exact', metric => 'l2', k => 1025, join_mode => 'global');",
-               "k must be <= 1024");
-
-  // k = 1024 is exactly the limit and binds fine: the one probe yields 1024 global pairs.
+  // Global mode accepts k > 1024 (no knn_merge_parts): the one probe yields 1025 global pairs.
   REQUIRE(single_int(*con,
                      "SELECT count(*) FROM sirius_knn_join("
                      "'gkcap_probe','vec','gkcap_corpus','vec', "
-                     "search_mode => 'exact', metric => 'l2', k => 1024, join_mode => 'global');") ==
-          1024);
+                     "search_mode => 'exact', metric => 'l2', k => 1025, join_mode => 'global');") ==
+          1025);
+
+  // Per-row still rejects k > 1024 at bind, since it does go through knn_merge_parts.
+  expect_error(*con,
+               "SELECT * FROM sirius_knn_join('gkcap_probe','vec','gkcap_corpus','vec', "
+               "search_mode => 'exact', metric => 'l2', k => 1025, join_mode => 'per-row');",
+               "k must be <= 1024");
 
   run_ok("SELECT * FROM unpin_table('gkcap_probe');");
   run_ok("SELECT * FROM unpin_table('gkcap_corpus');");
