@@ -82,7 +82,7 @@ void expect_error(duckdb::Connection& con, const std::string& sql, const std::st
 // -----------------------------------------------------------------------------
 TEST_CASE_METHOD(VectorJoinFixture,
                  "sirius_knn_join - exact L2 on large-magnitude vectors",
-                 "[integration][gpu_execution][array][vss][vector_join]")
+                 "[integration][gpu_execution][array][vss][vector_join][per_row]")
 {
   run_ok("CREATE TABLE vj_corpus (id INTEGER PRIMARY KEY, vec FLOAT[3]);");
   run_ok(
@@ -128,7 +128,7 @@ TEST_CASE_METHOD(VectorJoinFixture,
 // -----------------------------------------------------------------------------
 TEST_CASE_METHOD(VectorJoinFixture,
                  "sirius_knn_join - exact and exact-gemm agree on well-conditioned L2",
-                 "[integration][gpu_execution][array][vss][vector_join]")
+                 "[integration][gpu_execution][array][vss][vector_join][per_row]")
 {
   // Magnitudes ~1, directions spread over the sphere -> GEMM is well-conditioned.
   run_ok("CREATE TABLE gemm_corpus (id INTEGER PRIMARY KEY, vec FLOAT[3]);");
@@ -177,7 +177,7 @@ TEST_CASE_METHOD(VectorJoinFixture,
 // -----------------------------------------------------------------------------
 TEST_CASE_METHOD(VectorJoinFixture,
                  "sirius_knn_join - self-join with k larger than the table",
-                 "[integration][gpu_execution][array][vss][vector_join]")
+                 "[integration][gpu_execution][array][vss][vector_join][per_row]")
 {
   run_ok("CREATE TABLE sj (id INTEGER PRIMARY KEY, vec FLOAT[3]);");
   run_ok(
@@ -210,7 +210,7 @@ TEST_CASE_METHOD(VectorJoinFixture,
 // -----------------------------------------------------------------------------
 TEST_CASE_METHOD(VectorJoinFixture,
                  "sirius_knn_join - self-join per-row top-k with k below the table size",
-                 "[integration][gpu_execution][array][vss][vector_join]")
+                 "[integration][gpu_execution][array][vss][vector_join][per_row]")
 {
   run_ok("CREATE TABLE dedup (id INTEGER PRIMARY KEY, vec FLOAT[3]);");
   run_ok(
@@ -251,7 +251,7 @@ TEST_CASE_METHOD(VectorJoinFixture,
 // -----------------------------------------------------------------------------
 TEST_CASE_METHOD(VectorJoinFixture,
                  "sirius_knn_join - exact L2 across multiple right batches",
-                 "[integration][gpu_execution][array][vss][vector_join]")
+                 "[integration][gpu_execution][array][vss][vector_join][per_row]")
 {
   run_ok("CREATE TABLE mb_corpus (id INTEGER PRIMARY KEY, vec FLOAT[768]);");
   run_ok(
@@ -297,7 +297,7 @@ TEST_CASE_METHOD(VectorJoinFixture,
 // -----------------------------------------------------------------------------
 TEST_CASE_METHOD(VectorJoinFixture,
                  "sirius_knn_join - rejects k above the cross-batch merge limit",
-                 "[integration][gpu_execution][array][vss][vector_join]")
+                 "[integration][gpu_execution][array][vss][vector_join][per_row]")
 {
   run_ok("CREATE TABLE kcap_corpus (id INTEGER PRIMARY KEY, vec FLOAT[3]);");
   run_ok(
@@ -340,7 +340,7 @@ TEST_CASE_METHOD(VectorJoinFixture,
 // -----------------------------------------------------------------------------
 TEST_CASE_METHOD(VectorJoinFixture,
                  "sirius_knn_join - pads a short last batch across 768-dim batches",
-                 "[integration][gpu_execution][array][vss][vector_join]")
+                 "[integration][gpu_execution][array][vss][vector_join][per_row]")
 {
   // The id lives in dim 0 and the other 767 dims are zero, so the L2 distance
   // between rows i and j is just |i - j| -- distinct and easy to reason about.
@@ -396,7 +396,7 @@ TEST_CASE_METHOD(VectorJoinFixture,
 // -----------------------------------------------------------------------------
 TEST_CASE_METHOD(VectorJoinFixture,
                  "sirius_knn_join - exact L2 across multiple left batches",
-                 "[integration][gpu_execution][array][vss][vector_join]")
+                 "[integration][gpu_execution][array][vss][vector_join][per_row]")
 {
   // 125000 probe rows split into a 122880-row batch and a 2120-row batch (left batch 1
   // holds ids 122880..124999). The corpus is 2000 rows in one batch.
@@ -448,7 +448,7 @@ TEST_CASE_METHOD(VectorJoinFixture,
 // -----------------------------------------------------------------------------
 TEST_CASE_METHOD(VectorJoinFixture,
                  "sirius_knn_join - exact cosine matches CPU and both outputs stay in range",
-                 "[integration][gpu_execution][array][vss][vector_join]")
+                 "[integration][gpu_execution][array][vss][vector_join][per_row]")
 {
   // Varied directions so cosine is discriminative (the [i,i+1,i+2] corpus is all
   // parallel -> every pair ~1, degenerate for cosine).
@@ -514,7 +514,7 @@ TEST_CASE_METHOD(VectorJoinFixture,
 // -----------------------------------------------------------------------------
 TEST_CASE_METHOD(VectorJoinFixture,
                  "sirius_knn_join - payload path gathers right columns across batches",
-                 "[integration][gpu_execution][array][vss][vector_join]")
+                 "[integration][gpu_execution][array][vss][vector_join][per_row]")
 {
   run_ok("CREATE TABLE pay_corpus (id INTEGER PRIMARY KEY, val INTEGER, vec FLOAT[3]);");
   // id = 10000 + row position, val = a second payload column; both must come back
@@ -561,7 +561,7 @@ TEST_CASE_METHOD(VectorJoinFixture,
 // -----------------------------------------------------------------------------
 TEST_CASE_METHOD(VectorJoinFixture,
                  "sirius_knn_join - l2 with similarity output is rejected",
-                 "[integration][gpu_execution][array][vss][vector_join]")
+                 "[integration][gpu_execution][array][vss][vector_join][per_row]")
 {
   run_ok("CREATE TABLE rej (id INTEGER PRIMARY KEY, vec FLOAT[3]);");
   run_ok("INSERT INTO rej VALUES (0, [1.0, 0.0, 0.0]), (1, [0.0, 1.0, 0.0]);");

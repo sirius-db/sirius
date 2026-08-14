@@ -189,15 +189,20 @@ void sirius_physical_vector_join_reduce_local::sink(const operator_data& output_
   auto const partition_idx = part.get_partition_idx();
   for (auto& batch : part.get_data_batches()) {
     for (auto& next_port_info : next_port_after_sink) {
+      // Per-row top-k routes to the materialize partition consumer, keeping each left
+      // batch in its own partition so the materialize op processes one batch per task.
       auto* consumer =
         dynamic_cast<sirius_physical_partition_consumer_operator*>(next_port_info.next_operator);
-      if (consumer == nullptr) {
-        throw std::runtime_error(
-          "[sirius_physical_vector_join_reduce_local::sink] next operator is not a partition "
-          "consumer");
+      if (consumer != nullptr) {
+        consumer->push_data_batch_partitioned(
+          next_port_info.next_operator_port_name, batch, partition_idx);
       }
-      consumer->push_data_batch_partitioned(
-        next_port_info.next_operator_port_name, batch, partition_idx);
+      // Global top-k feeds a plain TOP_N reduction, which is not a partition consumer,
+      // so push without a partition and let all candidates land together.
+      else {
+        next_port_info.next_operator->push_data_batch(next_port_info.next_operator_port_name,
+                                                      batch);
+      }
     }
   }
 }

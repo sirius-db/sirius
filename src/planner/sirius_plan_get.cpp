@@ -18,6 +18,7 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include "duckdb/planner/bound_result_modifier.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -37,6 +38,7 @@
 #include "op/scan/duckdb_mvcc_visibility.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_table_scan.hpp"
+#include "op/sirius_physical_top_n.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
@@ -675,8 +677,9 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
   }
   auto& scan_manager = sirius_state->get_scan_manager();
 
+  auto req                   = bind_data.req;
+  auto const global_output_k = req.k;
   // If k is larger than the number of rows in the right table, lower it to that row count.
-  auto req = bind_data.req;
   {
     const auto* right_pin = scan_manager.find_pinned_entry_for_duckdb_table(
       req.right.catalog, req.right.schema, req.right.table);
@@ -729,6 +732,30 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
 
   reduce_local->children.push_back(std::move(selection));
 
+  // Global mode inserts a TOP_N to keep the k smallest-distance pairs overall (ordered on
+  // raw distance, before the materialize op) so materialize gathers payload for k winners,
+  // not every candidate.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> reduced = std::move(reduce_local);
+  if (req.mode == sirius::vss::vector_join_mode::global_top_k) {
+    auto const reduce_types = reduce_local_types();
+    auto const distance_idx = reduce_types.size() - 1;  // last col: FLOAT distance
+    duckdb::vector<duckdb::BoundOrderByNode> orders;
+    orders.emplace_back(duckdb::OrderType::ASCENDING,
+                        duckdb::OrderByNullType::NULLS_LAST,
+                        duckdb::make_uniq<duckdb::BoundReferenceExpression>(
+                          duckdb::LogicalType::FLOAT, static_cast<duckdb::idx_t>(distance_idx)));
+
+    auto top_n = duckdb::make_uniq<sirius::op::sirius_physical_top_n>(
+      reduce_types,
+      std::move(orders),
+      static_cast<std::size_t>(global_output_k),
+      std::size_t{0},
+      nullptr,
+      op.estimated_cardinality);
+    top_n->children.push_back(std::move(reduced));
+    reduced = std::move(top_n);
+  }
+
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> node =
     duckdb::make_uniq<sirius::op::sirius_physical_vector_join_materialize>(
       sirius::from_duckdb_vec(op.returned_types),
@@ -736,7 +763,7 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
       req,
       &scan_manager,
       is_fast_path);
-  node->children.push_back(std::move(reduce_local));
+  node->children.push_back(std::move(reduced));
 
   auto column_ids  = op.GetColumnIds();
   bool is_identity = column_ids.size() == op.returned_types.size();
