@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// decompress_selected_rows: decoding only the rows a join left behind.
+// decompress_column_rows: decoding only the rows a join left behind.
 //
 // The reference is the decode this one is supposed to replace — a full
 // decompress, gathered on the host by the same rows. Differential rather than
@@ -113,14 +113,13 @@ void check_against_full_decode(char const* label,
   device_row_set rs(selected, num_rows, stream);
   expect(rs.view.valid(), (std::string(label) + ": built an invalid row set").c_str());
 
-  std::vector<std::size_t> const columns{0};
   std::string err;
-  auto got = simpatico::decompress_selected_rows(ct, columns, rs.view, stream, mr, &err);
+  auto got = simpatico::decompress_column_rows(ct, 0, rs.view, stream, mr, &err);
   expect(got != nullptr, (std::string(label) + ": sparse decode returned null: " + err).c_str());
-  expect(got->num_rows() == static_cast<cudf::size_type>(selected.size()),
+  expect(got->size() == static_cast<cudf::size_type>(selected.size()),
          (std::string(label) + ": sparse decode row count").c_str());
 
-  auto const sparse = read_int32(got->view().column(0), stream);
+  auto const sparse = read_int32(got->view(), stream);
   for (std::size_t i = 0; i < selected.size(); ++i) {
     auto const want = all_rows[static_cast<std::size_t>(selected[i])];
     if (sparse[i] != want) {

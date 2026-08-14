@@ -1082,42 +1082,6 @@ std::unique_ptr<cudf::column> decompress_column_full(const compressed_table& tab
   return apply_stored_dtype(std::move(col), table.columns[column_index].dtype);
 }
 
-std::unique_ptr<cudf::table> decompress_selected_rows(const compressed_table& table,
-                                                      std::span<const std::size_t> selected_columns,
-                                                      sirius::codegen::chunk_row_set const& rows,
-                                                      rmm::cuda_stream_view stream,
-                                                      rmm::device_async_resource_ref mr,
-                                                      std::string* error_out)
-{
-  nvtx3::scoped_range nvtx_range{"simpatico::decompress_selected_rows"};
-  if (!rows.valid()) { throw plan_error("decompress_selected_rows: the row set is not valid"); }
-
-  std::vector<std::unique_ptr<cudf::column>> cols;
-  cols.reserve(selected_columns.size());
-  for (auto const idx : selected_columns) {
-    if (idx >= table.columns.size()) {
-      throw plan_error("decompress_selected_rows: selected column index out of range");
-    }
-    auto const& col = table.columns[idx];
-    if (!col.plan_tree) {
-      throw plan_error("decompress_selected_rows: compressed_table column missing plan_tree");
-    }
-
-    // All-or-nothing by design: this is the table-level convenience, so a
-    // column the sparse walk cannot serve is an error here. A caller that wants
-    // to fall back per column uses decompress_column_rows directly and picks
-    // the next route itself.
-    std::string err;
-    auto c = decompress_column_rows(table, idx, rows, stream, mr, &err);
-    if (!c) {
-      if (error_out) { *error_out = err; }
-      throw plan_error(err.empty() ? "decompress_selected_rows: decode failed" : err);
-    }
-    cols.push_back(std::move(c));
-  }
-  return std::make_unique<cudf::table>(std::move(cols));
-}
-
 std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         std::span<const std::size_t> selected_columns,
                                         int column_threads,

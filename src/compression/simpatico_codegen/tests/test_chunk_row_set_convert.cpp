@@ -1,18 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// The CSR is canonical, checked against the wave it claims to replace.
+// The derived mask, checked against the wave it has to match.
 //
-// row_set_to_local_indices and row_set_to_mask exist so that one construction
-// path can serve every consumer: a post-join selection can only be built as a
-// CSR, and the mask and index forms are derived from it rather than built by a
-// second path. That claim is only worth anything if the derived forms are
-// EXACTLY what the shipped selection wave produces from the same selection —
-// bit for bit, offset for offset — so that is what is tested here.
+// row_set_to_mask exists so one construction path can serve every consumer: a
+// post-join selection can only be built as a CSR, and a plan with no
+// random-access decode still needs a mask. That is only worth anything if the
+// derived mask is EXACTLY what the shipped selection wave produces from the
+// same selection — bit for bit, offset for offset — so that is what is tested.
 //
 // The loop is: a mask -> the wave's own CNT and index list -> a CSR built from
-// that list -> back to indices and mask. Both ends must agree with the wave.
-// Building the reference on the host instead would test the converters against
-// my reading of the format; testing against the wave tests them against the
+// that list -> back to a mask, which must equal the one the wave counted.
+// Building the reference on the host instead would test the converter against
+// my reading of the format; testing against the wave tests it against the
 // thing that actually consumes it.
 //
 // The untouched chunks are the part worth stating. A mask consumer reads every
@@ -36,7 +35,6 @@
 #include <vector>
 
 using sirius::codegen::build_chunk_row_set;
-using sirius::codegen::row_set_to_local_indices;
 using sirius::codegen::row_set_to_mask;
 using sirius::codegen::selection_mask;
 
@@ -112,11 +110,6 @@ void check_round_trip(char const* what,
     static_cast<std::int32_t const*>(wave_indices.data()), counted, num_rows, stream, mr);
   auto const rows = built.view();
 
-  // Back to an index list.
-  rmm::device_buffer derived_indices(
-    static_cast<std::size_t>(counted == 0 ? 1 : counted) * sizeof(std::int32_t), stream, mr);
-  row_set_to_local_indices(rows, static_cast<std::int32_t*>(derived_indices.data()), stream);
-
   // Back to a mask. Both buffers are pre-dirtied, so anything the conversion
   // fails to write shows up as a difference rather than as a lucky zero.
   rmm::device_buffer derived_words(host_words.size() * sizeof(std::uint32_t), stream, mr);
@@ -130,12 +123,6 @@ void check_round_trip(char const* what,
                   stream,
                   mr);
   cudaStreamSynchronize(stream.value());
-
-  auto const got_indices =
-    download<std::int32_t>(derived_indices.data(), static_cast<std::size_t>(counted));
-  auto const want_indices =
-    download<std::int32_t>(wave_indices.data(), static_cast<std::size_t>(counted));
-  REQUIRE_MSG(got_indices == want_indices, "[%s] derived index list != the wave's own", what);
 
   auto const got_words = download<std::uint32_t>(derived_words.data(), host_words.size());
   REQUIRE_MSG(got_words == host_words, "[%s] derived mask != the mask the wave counted", what);

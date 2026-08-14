@@ -1,19 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// chunk_row_set_convert.cu — deriving the mask and index-list enumerations
-// from a chunk CSR (codegen/selection/chunk_row_set.hpp).
+// chunk_row_set_convert.cu — deriving the mask enumeration from a chunk CSR
+// (codegen/selection/chunk_row_set.hpp).
 //
-// One selection, three shapes. The decode's consumers each take whichever they
-// are handed, so nothing forces a choice — but a selection arriving after the
-// scan can only be BUILT as a CSR, since the other two are by-products of a
-// mask that a post-join selection does not have. Deriving them here is what
-// lets that be the only construction path, rather than keeping a second one
-// alive for the selections that happen to come with a mask.
+// A selection arriving after the scan can only be BUILT as a CSR, since the
+// mask form is a by-product of a mask such a selection does not have. Deriving
+// the mask here is what lets the CSR be the only construction path, and it is
+// how a plan with no random-access decode is served at all.
 //
-// Both directions launch one block per touched chunk, matching the grid the
-// sparse decode itself uses: a block already owns a contiguous slice of the
-// CSR, so it can write that slice's indices or set that chunk's mask bits with
-// no cross-block coordination.
+// One block per touched chunk, matching the grid the sparse decode itself
+// uses: a block already owns a contiguous slice of the CSR, so it sets that
+// chunk's mask bits with no cross-block coordination.
 
 #include "codegen/selection/chunk_row_set.hpp"
 #include "codegen/selection/selection.hpp"
@@ -36,22 +33,6 @@ inline void throw_on_cuda(cudaError_t err, char const* what)
   if (err != cudaSuccess) {
     throw std::runtime_error(std::string("chunk_row_set_convert: ") + what + ": " +
                              cudaGetErrorString(err));
-  }
-}
-
-// Block b owns chunk chunk_ids[b] and the CSR slice
-// [block_offsets[b], block_offsets[b+1]) — the same division of labour the
-// sparse decode makes, so the output slot is the CSR position itself.
-__global__ void to_indices_kernel(std::uint32_t const* __restrict__ chunk_ids,
-                                  std::uint32_t const* __restrict__ block_offsets,
-                                  std::uint16_t const* __restrict__ in_chunk_rows,
-                                  std::int32_t* __restrict__ out)
-{
-  auto const b     = static_cast<std::int64_t>(blockIdx.x);
-  auto const chunk = static_cast<std::int64_t>(chunk_ids[b]) * ::codegen::kChunkSize;
-  for (std::uint32_t k = block_offsets[b] + threadIdx.x; k < block_offsets[b + 1];
-       k += blockDim.x) {
-    out[k] = static_cast<std::int32_t>(chunk + in_chunk_rows[k]);
   }
 }
 
@@ -86,19 +67,6 @@ __global__ void offsets_tail_kernel(std::uint32_t const* __restrict__ counts,
 }
 
 }  // namespace
-
-void row_set_to_local_indices(chunk_row_set const& rows,
-                              std::int32_t* out,
-                              rmm::cuda_stream_view stream)
-{
-  if (rows.num_survivors == 0) { return; }
-  if (!rows.valid() || out == nullptr) {
-    throw std::runtime_error("chunk_row_set_convert: expand from an invalid row set");
-  }
-  to_indices_kernel<<<static_cast<unsigned>(rows.num_touched), kBlock, 0, stream.value()>>>(
-    rows.chunk_ids, rows.block_offsets, rows.in_chunk_rows, out);
-  throw_on_cuda(cudaPeekAtLastError(), "to_indices launch");
-}
 
 void row_set_to_mask(chunk_row_set const& rows,
                      std::uint32_t* mask_words,
