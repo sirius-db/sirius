@@ -266,13 +266,27 @@ struct SiriusTableFunctionData : public TableFunctionData {
   vector<string> bind_names;
   vector<LogicalType> bind_types;
   std::optional<std::string> query_label;
-  //! Original options from the connection
-  ClientConfig original_config;
 
-  void PrepareConnection(ClientContext& context)
+  unique_ptr<LogicalOperator> ExtractPlan(ClientContext& context) const
   {
-    // First collect original options
-    original_config = context.config;
+    // PER-EXECUTION config save/restore (register E7): this bind data is
+    // SHARED across (possibly concurrent) executions of one prepared
+    // statement, so the saved ClientConfig must live on this execution's
+    // stack — a bind-data member let two executions clobber each other's
+    // saved copy and leave the connection with enable_optimizer permanently
+    // flipped. RAII so every exit path (including throws) restores.
+    struct scoped_client_config {
+      ClientContext& context;
+      ClientConfig saved;
+      explicit scoped_client_config(ClientContext& context_p)
+        : context(context_p), saved(context_p.config)
+      {
+      }
+      ~scoped_client_config() { context.config = saved; }
+      scoped_client_config(const scoped_client_config&)            = delete;
+      scoped_client_config& operator=(const scoped_client_config&) = delete;
+    } config_guard(context);
+
     // The user might want to disable the optimizer of the new connection.
     // (connection-local ClientConfig — safe to toggle per execution)
     context.config.enable_optimizer = enable_optimizer;
@@ -283,43 +297,29 @@ struct SiriusTableFunctionData : public TableFunctionData {
     // (publish_transparent_optimizer_mask); shapes previously avoided by the
     // DEBUG-only COLUMN_LIFETIME disable fall back to CPU via create_plan
     // rejection instead.
-  }
 
-  // Reset configuration
-  void CleanupConnection(ClientContext& context) const { context.config = original_config; }
+    Parser parser(context.GetParserOptions());
+    parser.ParseQuery(query);
 
-  unique_ptr<LogicalOperator> ExtractPlan(ClientContext& context)
-  {
-    PrepareConnection(context);
-    unique_ptr<LogicalOperator> plan;
-    try {
-      Parser parser(context.GetParserOptions());
-      parser.ParseQuery(query);
+    Planner planner(context);
+    planner.CreatePlan(std::move(parser.statements[0]));
+    D_ASSERT(planner.plan);
 
-      Planner planner(context);
-      planner.CreatePlan(std::move(parser.statements[0]));
-      D_ASSERT(planner.plan);
+    unique_ptr<LogicalOperator> plan = std::move(planner.plan);
 
-      plan = std::move(planner.plan);
-
-      if (context.config.enable_optimizer) {
-        Optimizer optimizer(*planner.binder, context);
-        plan = optimizer.Optimize(std::move(plan));
-      }
-
-      // After optimization, refresh types before column binding resolution
-      // to ensure types are consistent (some optimizers may have set stale types)
-      plan->ResolveOperatorTypes();
-
-      ColumnBindingResolver resolver;
-      ColumnBindingResolver::Verify(*plan);
-      resolver.VisitOperator(*plan);
-    } catch (...) {
-      CleanupConnection(context);
-      throw;
+    if (context.config.enable_optimizer) {
+      Optimizer optimizer(*planner.binder, context);
+      plan = optimizer.Optimize(std::move(plan));
     }
 
-    CleanupConnection(context);
+    // After optimization, refresh types before column binding resolution
+    // to ensure types are consistent (some optimizers may have set stale types)
+    plan->ResolveOperatorTypes();
+
+    ColumnBindingResolver resolver;
+    ColumnBindingResolver::Verify(*plan);
+    resolver.VisitOperator(*plan);
+
     return plan;
   }
 };
