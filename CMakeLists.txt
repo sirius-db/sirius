@@ -693,6 +693,7 @@ set(TEST_SOURCES
     test/cpp/late_mat/test_materialize.cpp
     test/cpp/late_mat/test_defer_policy.cpp
     test/cpp/late_mat/test_late_mat_resolver.cpp
+    test/cpp/late_mat/test_pin_handle_lifecycle.cpp
     test/cpp/io/s3/test_sigv4.cpp
     test/cpp/io/s3/test_s3_default_visibility_guard.cpp
     test/cpp/io/s3/test_sirius_sigv4_authorizer.cpp
