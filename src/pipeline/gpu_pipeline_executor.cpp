@@ -216,11 +216,16 @@ void gpu_pipeline_executor::process_task(
       return;
     }
     iteration_completion = gpu_task->get_completion_handler();
-    // Attribute the reserved slot now that the task's query is known, so
-    // drain_and_wait(query_id) covers this execution. Not done at reserve() time: the manager
-    // parks in pop() holding the slot before any task exists, and counting that against a query
-    // would make its drain wait for work that may never arrive.
-    if (auto const* pipe = gpu_task->get_pipeline()) { slot.attach(pipe->get_query_id()); }
+    // Resolve the task's query once it is known: it attributes the reserved slot (so
+    // drain_and_wait(query_id) covers this execution) and any downgrade request issued below
+    // (so the query's own cleanup — and only its own — can cancel it). Not done at reserve()
+    // time: the manager parks in pop() holding the slot before any task exists, and counting
+    // that against a query would make its drain wait for work that may never arrive.
+    auto task_query_id = sirius::make_query_id(0);
+    if (auto const* pipe = gpu_task->get_pipeline()) {
+      task_query_id = pipe->get_query_id();
+      slot.attach(task_query_id);
+    }
     // Pass this executor's memory space so cross-space inputs (host/disk tiers and GPU data on
     // another device, which prepare clones into this space) are counted in the reservation.
     auto reservation_info = gpu_task->get_estimated_reservation_size_info(_memory_space);
@@ -321,13 +326,16 @@ void gpu_pipeline_executor::process_task(
       try {
         freed =
           _downgrade_executor
-            ->request_downgrade([mem_space, bytes_needs, &new_reservation, &reservation_mutex]() {
-              std::lock_guard<std::mutex> lock(reservation_mutex);
-              if (new_reservation) { return true; }
-              auto res = mem_space->make_reservation_or_null(bytes_needs);
-              if (res && res->size() >= bytes_needs) { new_reservation = std::move(res); }
-              return new_reservation != nullptr;
-            })
+            ->request_downgrade(task_query_id,
+                                [mem_space, bytes_needs, &new_reservation, &reservation_mutex]() {
+                                  std::lock_guard<std::mutex> lock(reservation_mutex);
+                                  if (new_reservation) { return true; }
+                                  auto res = mem_space->make_reservation_or_null(bytes_needs);
+                                  if (res && res->size() >= bytes_needs) {
+                                    new_reservation = std::move(res);
+                                  }
+                                  return new_reservation != nullptr;
+                                })
             .get();
       } catch (const std::exception& e) {
         // The downgrade executor cancelled this request (its queue was drained). This task cannot

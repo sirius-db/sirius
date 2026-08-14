@@ -477,10 +477,16 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // reason. Other in-flight queries keep their queued work.
   if (task_scheduler_) { task_scheduler_->drain_query_tasks(query_id); }
 
-  // Drain all downgrade executors before clearing repositories — ensures no downgrade
-  // tasks hold shared_ptr<data_batch> references to batches we're about to destroy.
+  // Cancel THIS query's pending downgrade requests and wait out any in-flight request it
+  // issued, unblocking its own waiters (GPU manager threads parked in
+  // request_downgrade(...).get()), which are being torn down anyway. Peer queries' pending
+  // spills and the monitor's pressure response are left alone — the global drain() that used
+  // to run here failed every queued promise (killing healthy peers' downgrades) and
+  // stop-join-restarted each executor's processing thread on every query end, leaving a
+  // window where the monitor refilled the queue before the repository erase below. The erase
+  // is now fenced against in-progress sweeps by the registry's sweep gate, not by this drain.
   for (auto& executor : downgrade_executors_) {
-    executor->drain();
+    executor->drain(query_id);
   }
 
   // The downgrade drains just joined every TIER-2 conversion in flight, and each wrapper's RAII
@@ -513,8 +519,9 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
 
   // Drop THIS query's data repositories, leaving any other in-flight query's untouched.
   // Any batches still present are leaked — operators should have popped everything.
-  // Safe to clear here because the downgrade executors were drained above, so nothing still
-  // holds a raw data_repository* borrowed from this query's manager.
+  // erase() itself waits out any downgrade sweep still borrowing raw data_repository*
+  // pointers (the registry's sweep gate), so a peer's or the monitor's in-progress sweep
+  // cannot dangle when this clears the repositories.
   {
     auto leaked = data_repository_registry_.erase(query_id);
     try {
@@ -599,6 +606,15 @@ void SiriusContext::drop_query_runtime_state_best_effort(sirius::query_id_t quer
   }
   try {
     if (task_scheduler_) { task_scheduler_->drain_query_tasks(query_id); }
+  } catch (...) {
+  }
+  // Same as the main path: fail this query's pending downgrade requests so no waiter of the
+  // failed query stays parked in a .get(), and wait out an in-flight request of its own.
+  // Peer queries' requests are untouched.
+  try {
+    for (auto& executor : downgrade_executors_) {
+      executor->drain(query_id);
+    }
   } catch (...) {
   }
   // The scan manager needs the same backstop. prepare_for_query no longer performs a global

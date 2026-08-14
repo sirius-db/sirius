@@ -79,6 +79,9 @@ void downgrade_executor::start()
   }
 
   _request_queue.reactivate();
+  // A monitor request eaten by a previous stop() must not keep the monitor dead across a
+  // restart. cancel_pending_requests() re-arms too; this is the belt to that suspender.
+  _monitor_request_enqueued.store(false, std::memory_order_relaxed);
 
   absl::AnyInvocable<void() noexcept> per_thread_init = nullptr;
   if (_memory_space && _space_id.tier == cucascade::memory::Tier::GPU) {
@@ -129,8 +132,11 @@ void downgrade_executor::stop()
 
 void downgrade_executor::drain()
 {
-  // See _lifecycle_mutex: concurrent per-query cleanups both reach this
-  // global drain; the stop-join-restart below must not interleave.
+  // Global stop-the-world drain: terminate/stop-adjacent and test use only. Per-query
+  // cleanup uses drain(query_id) — this one cancels EVERY queued promise (failing healthy
+  // peers' waiters) and restarts the processing thread as its last act, so its quiescence
+  // has expired by the time it returns. _lifecycle_mutex keeps concurrent drain()/stop()
+  // callers from interleaving the stop-join-restart below.
   std::lock_guard<std::mutex> lifecycle_lock(_lifecycle_mutex);
   if (!_running.load()) { return; }  // racing terminate: stop() already owns teardown
   _pool->interrupt();
@@ -146,6 +152,26 @@ void downgrade_executor::drain()
   _processing_thread = std::thread(&downgrade_executor::processing_loop, this);
 }
 
+void downgrade_executor::drain(sirius::query_id_t query_id)
+{
+  // Fail only THIS query's queued promises. Its waiters (GPU manager threads blocked in
+  // request_downgrade(...).get() on the query's behalf) unblock into the caller's
+  // cancelled-downgrade handling; every other query's requests stay queued and the
+  // processing/monitor threads keep running.
+  cancel_pending_requests_for_query(query_id);
+
+  // The processing loop executes one request at a time; if the request in flight is this
+  // query's, wait it out — its promise is fulfilled before the flag clears, so returning
+  // implies this query has no waiter left inside this executor.
+  //
+  // A request popped but not yet marked in flight can slip past this wait. That is benign:
+  // the caller has already quiesced the query (no new waiters can appear), the slipped
+  // request still fulfils its promise normally, and repository teardown is fenced against
+  // its sweep by the registry's sweep gate rather than by this wait.
+  std::unique_lock<std::mutex> lock(_in_flight_mutex);
+  _in_flight_cv.wait(lock, [&] { return !_in_flight_active || _in_flight_query != query_id; });
+}
+
 void downgrade_executor::processing_loop()
 {
   while (_running.load()) {
@@ -153,6 +179,26 @@ void downgrade_executor::processing_loop()
     if (!request) break;  // interrupted
 
     auto& req = request;
+
+    // Publish whose request is in flight before doing any work, and clear it on every exit
+    // path (RAII below): drain(query_id) waits on this so a query's cleanup only proceeds
+    // once the request its waiter blocks on has fulfilled its promise.
+    {
+      std::lock_guard<std::mutex> in_flight_lock(_in_flight_mutex);
+      _in_flight_active = true;
+      _in_flight_query  = req->query_id;
+    }
+    struct in_flight_reset {
+      downgrade_executor* self;
+      ~in_flight_reset()
+      {
+        {
+          std::lock_guard<std::mutex> in_flight_lock(self->_in_flight_mutex);
+          self->_in_flight_active = false;
+        }
+        self->_in_flight_cv.notify_all();
+      }
+    } in_flight_reset_guard{this};
 
     auto t_start = std::chrono::steady_clock::now();
 
@@ -224,6 +270,12 @@ void downgrade_executor::processing_loop()
     // get_all_convertible() snapshots eligible batches once per repo so a batch isn't
     // re-scanned before leaving idle. Managers are held by shared_ptr for the duration of the
     // sweep, so a query ending concurrently cannot pull one out from under this loop.
+    //
+    // The sweep token fences the raw data_repository* borrowed below (and captured by the
+    // worker lambdas) against data_repository_manager_registry::erase(): per-query cleanup no
+    // longer quiesces this executor, so a query can tear down while this sweep is mid-flight.
+    // Iteration-scoped, so it is released before the next blocking pop().
+    auto sweep_token      = _data_repo_registry.begin_sweep();
     bool pool_interrupted = false;
     auto const managers   = _data_repo_registry.get_all();
     for (auto const& manager : std::views::reverse(managers)) {
@@ -479,8 +531,13 @@ void downgrade_executor::monitor_loop()
           };
           _monitor_requests_issued.fetch_add(1, std::memory_order_relaxed);
           _monitor_request_enqueued.store(true, std::memory_order_relaxed);
-          // Fire-and-forget: monitor does not wait for the result
-          _request_queue.push(std::move(req));
+          // Fire-and-forget: monitor does not wait for the result. A refused push (queue
+          // interrupted by a racing drain()/stop()) must re-arm immediately — otherwise the
+          // flag latches true with no request in flight and pressure-driven downgrade for
+          // this space is dead for the rest of the process.
+          if (!_request_queue.push(std::move(req))) {
+            _monitor_request_enqueued.store(false, std::memory_order_relaxed);
+          }
         }
       } else if (!backed_off) {
         SIRIUS_LOG_WARN(
@@ -504,12 +561,51 @@ void downgrade_executor::monitor_loop()
 void downgrade_executor::cancel_pending_requests()
 {
   while (auto req = _request_queue.try_pop()) {
-    try {
-      req->result.set_exception(
-        std::make_exception_ptr(std::runtime_error("downgrade executor shutting down")));
-    } catch (...) {
-      // Promise may already be fulfilled — safe to ignore
+    fail_request(std::move(req));
+  }
+}
+
+void downgrade_executor::cancel_pending_requests_for_query(sirius::query_id_t query_id)
+{
+  // Selective cancel: pop everything reachable, fail the ending query's requests, put the
+  // rest back. The processing thread may pop concurrently; anything it takes is covered by
+  // drain(query_id)'s in-flight wait. Bounded even against concurrent producers: the only
+  // repeating unattributed producer (the monitor) keeps at most one request outstanding.
+  std::vector<std::unique_ptr<downgrade_request>> kept;
+  while (auto req = _request_queue.try_pop()) {
+    if (req->query_id == query_id) {
+      fail_request(std::move(req));
+    } else {
+      kept.push_back(std::move(req));
     }
+  }
+  for (auto& req : kept) {
+    if (!_request_queue.is_open()) {
+      // Racing global drain()/stop(): a push would be refused and silently destroy the
+      // promise. Fail it loudly instead — the waiter unblocks and, for a monitor request,
+      // the re-arm flag is reset. This is exactly what the racing global cancel would do.
+      fail_request(std::move(req));
+      continue;
+    }
+    // A refusal here means the interrupt landed between the check above and the push; the
+    // destroyed promise still unblocks its waiter via std::future_error(broken_promise).
+    (void)_request_queue.push(std::move(req));
+  }
+}
+
+void downgrade_executor::fail_request(std::unique_ptr<downgrade_request> request)
+{
+  // This request dies without reaching the processing loop — the only other place that
+  // clears _monitor_request_enqueued. Re-arm here or the monitor latches enqueued-forever
+  // and memory-pressure downgrade for this space is dead for the rest of the process.
+  if (request->is_monitor_request) {
+    _monitor_request_enqueued.store(false, std::memory_order_relaxed);
+  }
+  try {
+    request->result.set_exception(
+      std::make_exception_ptr(std::runtime_error("downgrade request cancelled")));
+  } catch (...) {
+    // Promise may already be fulfilled — safe to ignore
   }
 }
 
@@ -542,11 +638,19 @@ size_t downgrade_executor::request_free_memory_and_wait(size_t bytes)
 
 std::future<size_t> downgrade_executor::request_downgrade(std::function<bool()> predicate)
 {
+  return request_downgrade(sirius::make_query_id(0), std::move(predicate));
+}
+
+std::future<size_t> downgrade_executor::request_downgrade(sirius::query_id_t query_id,
+                                                          std::function<bool()> predicate)
+{
   auto req       = std::make_unique<downgrade_request>();
+  req->query_id  = query_id;
   req->predicate = std::move(predicate);
   auto future    = req->result.get_future();
   if (!_request_queue.push(std::move(req))) {
-    SIRIUS_LOG_WARN("[downgrade] request_downgrade: queue inactive, dropping request");
+    SIRIUS_LOG_WARN("[downgrade] request_downgrade: queue inactive, dropping request for query {}",
+                    query_id);
     return future;
   }
   return future;

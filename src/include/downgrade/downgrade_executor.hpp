@@ -24,6 +24,7 @@
 #include "exec/query_lifecycle_registry.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "parallel/task.hpp"
+#include "query_id.hpp"
 
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/data/data_repository_manager.hpp>
@@ -59,6 +60,11 @@ struct downgrade_request {
   std::atomic<size_t> batches_downgraded{0};
   std::atomic<bool> satisfied{false};
   bool is_monitor_request{false};
+  /// The query this request works FOR (its waiter), so the per-query drain can fail exactly
+  /// the ending query's promises and no one else's. `make_query_id(0)` — a value execution
+  /// windows never mint (window ids start at 1) — marks unattributed requests: the monitor's
+  /// own pressure requests and external byte-target requests.
+  sirius::query_id_t query_id{sirius::make_query_id(0)};
 };
 
 /**
@@ -103,7 +109,30 @@ class downgrade_executor {
 
   void start();
   void stop();
+
+  /**
+   * @brief Global quiesce-and-restart. Terminate/stop-adjacent and test use ONLY.
+   *
+   * Cancels EVERY queued request (failing every waiter's promise, including healthy peer
+   * queries') and stop-join-restarts the processing thread, so quiescence expires the moment
+   * it returns. Per-query cleanup must use drain(query_id) instead.
+   */
   void drain();
+
+  /**
+   * @brief Per-query drain, for one query's end-of-window cleanup.
+   *
+   * Fails ONLY @p query_id's queued promises (unblocking that query's own waiters, which are
+   * being torn down anyway) and waits for an in-flight request of that query to complete. It
+   * never interrupts the request queue, the pool, or the processing/monitor threads, so peer
+   * queries' pending spills and the monitor's pressure response proceed unaffected — and it
+   * needs no _lifecycle_mutex because it never touches thread lifetimes.
+   *
+   * Precondition: the query is quiesced (no producer can enqueue new requests for it), which
+   * run_mandatory_cleanup guarantees before calling this. Repository teardown is fenced
+   * separately by data_repository_manager_registry's sweep gate.
+   */
+  void drain(sirius::query_id_t query_id);
 
   /**
    * @brief Get the memory space this executor is responsible for.
@@ -155,15 +184,31 @@ class downgrade_executor {
   }
 
   /**
-   * @brief Asynchronously request a predicate-driven downgrade.
+   * @brief Asynchronously request a predicate-driven downgrade, unattributed.
    *
-   * Dispatches batch downgrades until the predicate returns true or candidates
-   * are exhausted. In-flight batches finish naturally.
+   * Equivalent to request_downgrade(make_query_id(0), predicate): the request belongs to no
+   * query and is only ever cancelled by the global drain()/stop(). Callers whose waiter
+   * belongs to a query (the GPU pipeline executor's reservation paths) must use the
+   * attributed overload so a per-query drain can find their request.
    *
    * @param predicate Callable returning true when the caller's condition is met
    * @return std::future<size_t> Resolves to total bytes freed
    */
   std::future<size_t> request_downgrade(std::function<bool()> predicate);
+
+  /**
+   * @brief Asynchronously request a predicate-driven downgrade on behalf of @p query_id.
+   *
+   * Dispatches batch downgrades until the predicate returns true or candidates
+   * are exhausted. In-flight batches finish naturally. If @p query_id's cleanup runs while
+   * the request is still queued, drain(query_id) fails the returned future's promise.
+   *
+   * @param query_id  The query whose waiter blocks on the returned future
+   * @param predicate Callable returning true when the caller's condition is met
+   * @return std::future<size_t> Resolves to total bytes freed
+   */
+  std::future<size_t> request_downgrade(sirius::query_id_t query_id,
+                                        std::function<bool()> predicate);
 
   /**
    * @brief Whether a DISK tier is configured (an effectively unbounded spill sink).
@@ -190,6 +235,26 @@ class downgrade_executor {
   void cancel_pending_requests();
 
   /**
+   * @brief Fail every queued request belonging to @p query_id; leave the rest queued.
+   *
+   * Pops the whole queue and re-pushes the survivors. Safe against the concurrently popping
+   * processing thread (anything it takes is covered by drain(query_id)'s in-flight wait) and
+   * bounded: the only unattributed repeating producer, the monitor, keeps at most one request
+   * outstanding.
+   */
+  void cancel_pending_requests_for_query(sirius::query_id_t query_id);
+
+  /**
+   * @brief Fail one request's promise and, for a monitor request, re-arm the monitor.
+   *
+   * Every path that destroys a request without the processing loop seeing it MUST go through
+   * here: the processing loop is the only other place that clears _monitor_request_enqueued,
+   * so silently eating a monitor request would leave the flag latched true and
+   * memory-pressure downgrade for this space dead for the rest of the process.
+   */
+  void fail_request(std::unique_ptr<downgrade_request> request);
+
+  /**
    * @brief Whether a downgrade from this executor's source tier could plausibly free memory.
    *
    * DISK is an effectively unbounded sink, so if it is configured a downgrade can always make
@@ -212,6 +277,14 @@ class downgrade_executor {
   /// the caller's noexcept cleanup — i.e. std::terminate. One drain at a
   /// time; a second entrant repeats the idempotent stop/cancel/restart.
   std::mutex _lifecycle_mutex;
+  /// Which request the processing loop is currently executing (it handles one at a time).
+  /// drain(query_id) waits on this so a query's cleanup proceeds only once the request its
+  /// waiter is blocked on has fulfilled its promise. Guarded by _in_flight_mutex; the cv is
+  /// notified on every clear.
+  std::mutex _in_flight_mutex;
+  std::condition_variable _in_flight_cv;
+  bool _in_flight_active{false};
+  sirius::query_id_t _in_flight_query{sirius::make_query_id(0)};
   std::atomic<bool> _monitor_request_enqueued{false};
   std::atomic<bool> _running{false};
   std::atomic<size_t> _monitor_requests_issued{0};
