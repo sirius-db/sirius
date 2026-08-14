@@ -288,6 +288,13 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   mutable bool unique_probe_keys = false;
 
+  //! When the planner could not *prove* build-key uniqueness, test it at runtime instead (one hash
+  //! pass over the build keys) and, if the keys are in fact distinct, take the single-pass
+  //! cudf::distinct_hash_join path rather than the general two-pass multiset path. Proving
+  //! uniqueness statically needs a declared PRIMARY KEY on a catalog table. Set from
+  //! operator_params at planning time.
+  bool runtime_distinct_build_probe = config::DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE;
+
   //! Row-count ratio gate for switching STANDARD-mode MARK joins to cudf::mark_join (build on the
   //! left/output side) instead of filtered_join (build on the right side). Switch when
   //! right_rows >= ratio * left_rows; 0 disables. Set from operator_params at planning time.
@@ -295,6 +302,13 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   //! Join Keys statistics (optional)
   duckdb::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> join_stats;
+
+  /// \brief Drop dynamic-filter replica targets on GPUs outside @p admitted_gpu_ids. Called
+  /// by sirius_pipeline_converter once the admitted set is known.
+  void restrict_dynamic_filter_replicas(std::vector<int> const& admitted_gpu_ids)
+  {
+    _dynamic_filter_plan.restrict_replicas_to(admitted_gpu_ids);
+  }
 
   static void build_join_pipelines(pipeline::sirius_pipeline& current,
                                    pipeline::sirius_meta_pipeline& meta_pipeline,
@@ -490,7 +504,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   };
 
   /// Complete plan-time routing, policy, and replica-space description; immutable at runtime.
-  dynamic_filter_publish_plan const _dynamic_filter_plan;
+  dynamic_filter_publish_plan _dynamic_filter_plan;
   /// Exactly-once arbitration between the publication hook and finalization.
   std::atomic<dynamic_filter_publication_state> _dynamic_filter_publication_state{
     dynamic_filter_publication_state::OPEN};

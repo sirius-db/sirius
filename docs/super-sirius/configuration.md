@@ -111,6 +111,7 @@ Sirius uses cuCascade for tiered memory management across GPU, Host (pinned), an
 |-----|------|---------|-------------|
 | `num_gpus` | int | all visible GPUs | Number of GPUs to use. Defaults to every GPU visible to topology discovery (honors `CUDA_VISIBLE_DEVICES`); `0` also means auto. Mutually exclusive with `gpu_ids`. |
 | `gpu_ids` | list of int | — | Explicit GPU device IDs. Mutually exclusive with `num_gpus`. |
+| `gpus_per_query` | int | `0` (all) | How many GPUs each query is allocated at admission time. `0` uses all active GPUs. Values exceeding the active GPU count are clamped to the full set. |
 
 ### GPU Memory (`sirius.memory.gpu`)
 
@@ -314,16 +315,17 @@ single-GPU configurations only (logs a warning and disables itself otherwise).
 
 ### `scan_manager.rest` — REST / S3 backend (`io/rest/config.hpp`)
 
+TLS verification policy and the CA bundle are configured only under
+`scan_manager.object_store`. The REST reactor consumes those values so signing
+and transport use one trust policy; there are no separate REST YAML controls.
+
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `request_timeout_s` | int (seconds) | 30 | Whole-request timeout and presigned-URL TTL (0 = no limit). |
-| `ca_bundle_path` | string | "" | PEM CA bundle for TLS verification. |
-| `tls_verify` | bool | true | Verify the endpoint's TLS certificate (peer + host). |
 | `max_connections` | int | 16 | Max concurrent in-flight connections per reactor. |
 | `chunk_size` | bytes | 8Mi | Target bytes per ranged GET (scatter/device-staging paths). |
 | `max_n_chunks` | int | 16 | Max file-adjacent segments fused into one scatter GET. |
 | `max_read_split` | int | 16 | Max parallel ranged GETs for one contiguous host read (reads < 2 MiB stay a single GET). |
-| `bounce_block_size` | bytes | 0 | Bounce-slot size for the reactor-staged device path (0 disables that path; normally set from the staging resource at runtime). |
 | `upkeep_interval_ms` | int (ms) | 15000 | Idle-connection keepalive interval (`curl_easy_upkeep`; 0 disables). |
 | `conn_max_age_s` | int (seconds) | 20 | Max age curl may reuse a pooled connection (`CURLOPT_MAXAGE_CONN`; 0 = curl default). |
 | `retry_backoff_base_ms` | int (ms) | 50 | Base backoff between retries. |
@@ -355,8 +357,8 @@ single-GPU configurations only (logs a warning and disables itself otherwise).
 | `session_token` | string | "" | STS session token for temporary credentials. |
 | `signing_mode` | enum: `presigned`, `header` | `presigned` | SigV4 form: `presigned` (auth in the URL query string) or `header` (`Authorization` + `x-amz-*` headers). Values are lowercase. |
 | `s3_transport` | enum: `auto`, `http`, `https`, `rdma` | `auto` | Transport selection. Values are lowercase; `https` is an alias for `http`. `auto` lets the backend choose from the URI scheme and endpoint. |
-| `ca_bundle_path` | string | "" | PEM CA bundle for TLS verification. |
-| `tls_verify` | bool | true | Verify the endpoint's TLS certificate. |
+| `ca_bundle_path` | string | "" | Sole YAML source for the REST endpoint's PEM CA bundle. |
+| `tls_verify` | bool | true | Sole YAML source for REST endpoint certificate verification. |
 
 ## Operator Parameters
 
@@ -385,10 +387,11 @@ individually.
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join. A build below this size is replicated to every GPU (instead of hash-partitioned) when it is tiny, or when the DuckDB-estimated probe-to-build row ratio is at least `num_gpus * 1.25`. |
 | `max_sort_partition_memory_fraction` | 0.33 | Fraction of GPU memory per sort partition when `max_sort_partition_bytes` is 0 |
 | `mark_join_build_switch_ratio` | 8.0 | For STANDARD MARK joins, build on the smaller (left) side when `right_rows >= ratio * left_rows` (0 disables) |
+| `enable_runtime_distinct_build_probe` | true | For `BUILD_PROBE` INNER/LEFT equality joins whose build-key uniqueness the planner could not prove, test distinctness at runtime (one `cudf::distinct_count` pass over the cached build, dimension-scale builds only) and take the single-pass `cudf::distinct_hash_join` instead of the general two-pass join when the keys are distinct. |
 | `enable_dynamic_filter_pushdown` | true | Master switch for dynamic table-filter pushdown. An eligible `BUILD_PROBE` hash-join build selects a raw exact IN-list for 1–12 supported build rows, otherwise a hash IN-list if it fits the smallest probe-GPU L2 or a Bloom, for post-decode application by the probe scan. |
 | `enable_dynamic_zone_map_filter` | false | Additionally publish build-key min/max bounds. Parquet scans use them for read-time row-group pruning; duckdb-native scans apply them row-wise post-decode. Requires `enable_dynamic_filter_pushdown`; intended for clustered-keyset workloads. |
-| `dynamic_filter_domain_coverage_threshold` | 0.9 | Skip publishing a key's dynamic filters when the build covers at least this fraction of the key's domain; ≥ 1.0 effectively disables the gate. |
-| `dynamic_filter_keep_threshold` | 0.9 | Disable a probe scan's post-decode dynamic filtering once a measured split keeps more than this fraction of its rows; in [0, 1], 1.0 keeps filtering always on. |
+| `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold for skipping publication when the build covers at least this fraction of the key's domain; ≥ 1.0 effectively disables the gate. |
+| `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
 
 **Note:** `max_build_hash_table_bytes` can be larger than `concat_batch_bytes`. When it is, the partition operator configures CONCAT to concatenate all batches, enabling the more efficient BUILD_PROBE join mode for larger build sides. Other joins (STANDARD, MIXED) still use `concat_batch_bytes` as the batch size threshold.
@@ -563,40 +566,42 @@ SET enable_compressed_materialization = false;
 | `max_build_hash_table_bytes` | 2× batch default | Max build-side hash table bytes |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
+| `enable_runtime_distinct_build_probe` | true | Runtime distinct-build test for `BUILD_PROBE` joins; promotes to the single-pass `cudf::distinct_hash_join` when the build keys prove distinct |
 
 ### Dynamic Filters
 
-Both settings are also accepted in YAML under `sirius.operator_params`.
+Dynamic membership-filter pushdown is automatic and enabled by default. The
+clustered-keyset zone-map path is automatic-off by default because it does not
+repay its row-level cost on scattered keys. Advanced benchmark and diagnosis
+envelopes can override either behavior in YAML under `sirius.operator_params`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `enable_dynamic_filter_pushdown` | true | Master switch for dynamic table-filter pushdown. Wires eligible `BUILD_PROBE` hash-join-build membership filters into probe scans: raw exact IN-list for 1–12 supported build rows, then a hash IN-list if it fits the smallest probe-GPU L2 or a Bloom. |
 | `enable_dynamic_zone_map_filter` | false | Additionally publish build-key min/max bounds. Parquet scans use them for read-time row-group pruning; duckdb-native scans apply them row-wise post-decode. Has no effect unless `enable_dynamic_filter_pushdown` is enabled. |
-| `dynamic_filter_domain_coverage_threshold` | 0.9 | Skip publishing a key's dynamic filters when the build covers at least this fraction of the key's domain; ≥ 1.0 effectively disables the gate. |
-| `dynamic_filter_keep_threshold` | 0.9 | Disable a probe scan's post-decode dynamic filtering once a measured split keeps more than this fraction of its rows; in [0, 1], 1.0 keeps filtering always on. |
+| `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold for skipping publication when the build covers at least this fraction of the key's domain; ≥ 1.0 effectively disables the gate. |
+| `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 
-```sql
-SET enable_dynamic_filter_pushdown = true;
-SET enable_dynamic_zone_map_filter = false;
-```
+The direct DuckDB session overrides are registered only when the process
+explicitly enables Sirius test options; they are not part of the normal user
+surface.
 
 ### Pinned Tables
 
-This setting is accepted both as a DuckDB `SET` variable and in YAML under
-`sirius.operator_params`.
+Pinned-table zone-map capture and pruning are automatic. The advanced YAML escape hatch is under
+`sirius.operator_params` for benchmark and diagnosis envelopes; it is not a normal session choice.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `enable_pinned_zone_map_pruning` | true | Capture pinned-chunk zone maps at pin time and use them to prune cached scans. |
 
-Setting this to `false` before `pin_table` avoids the extra GPU reductions and creates a
+Setting the YAML value to `false` before startup avoids the extra GPU reductions and creates a
 statless entry. Enabling it later does not add statistics to that entry; re-pin the table with
-the setting enabled. Disabling it only for a query leaves existing statistics intact. See
+the setting enabled. See
 [Pinned-table zone maps](scan.md#zone-maps) for supported types, pruning, and re-pin behavior.
 
-```sql
-SET enable_pinned_zone_map_pruning = false;
-```
+The direct DuckDB `SET` override is registered only when the process explicitly enables Sirius
+test options; it is not part of the normal user surface.
 
 ### Transparent Execution
 

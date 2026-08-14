@@ -623,6 +623,7 @@ set(TEST_SOURCES
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
     test/cpp/config/test_object_store_config.cpp
+    test/cpp/config/test_topology_config.cpp
     test/cpp/data/test_convertible_data_batch.cpp
     test/cpp/data/test_data_repository_manager_registry.cpp
     test/cpp/data/test_convertible_gpu_pipeline_task.cpp
@@ -733,6 +734,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_sirius_dynamic_filter_mgpu.cpp
     test/cpp/parallel/test_task_executor.cpp
     test/cpp/planner/test_compressed_schema_propagation.cpp
+    test/cpp/planner/test_gpu_admission.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
     test/cpp/planner/test_dynamic_filter_router.cpp
@@ -752,6 +754,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_get_next_ports_after_sink.cpp
     test/cpp/pipeline/test_merge_pipeline_fusion.cpp
     test/cpp/pipeline/test_partition_build_pipelines.cpp
+    test/cpp/pipeline/test_pipeline_build_context.cpp
     test/cpp/pipeline/test_pipeline_dynamic_filter_native_shape.cpp
     test/cpp/pipeline/test_pipeline_schedule_canonical.cpp
     test/cpp/pipeline/test_plan_printer.cpp

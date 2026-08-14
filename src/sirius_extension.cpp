@@ -1988,7 +1988,7 @@ static void SetMarkJoinBuildSwitchRatio(ClientContext& context, SetScope scope, 
   if (!params) { return; }
   auto slot          = lock_operator_params_slot(context);
   const double ratio = parameter.GetValue<double>();
-  if (ratio < 0.0) {
+  if (!(ratio >= 0.0)) {
     throw InvalidInputException("mark_join_build_switch_ratio must be >= 0.0, got %f", ratio);
   }
   params->mark_join_build_switch_ratio = ratio;
@@ -2042,6 +2042,18 @@ static void SetPinTableCompressionMaxCompressedFraction(ClientContext& context,
   SIRIUS_LOG_DEBUG("Updated pin_table_compression_max_compressed_fraction");
 }
 
+static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
+                                               SetScope scope,
+                                               Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                                   = lock_operator_params_slot(context);
+  params->enable_runtime_distinct_build_probe = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_RUNTIME_DISTINCT_BUILD_PROBE to {}",
+                   params->enable_runtime_distinct_build_probe);
+}
+
 static void SetEnableDynamicFilterPushdown(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2070,7 +2082,7 @@ static void SetDynamicFilterDomainCoverageThreshold(ClientContext& context,
   if (!params) { return; }
   auto slot              = lock_operator_params_slot(context);
   const double threshold = parameter.GetValue<double>();
-  if (threshold <= 0.0) {
+  if (!(threshold > 0.0)) {
     throw InvalidInputException("dynamic_filter_domain_coverage_threshold must be > 0.0, got %f",
                                 threshold);
   }
@@ -2085,7 +2097,7 @@ static void SetDynamicFilterKeepThreshold(ClientContext& context, SetScope scope
   if (!params) { return; }
   auto slot              = lock_operator_params_slot(context);
   const double threshold = parameter.GetValue<double>();
-  if (threshold < 0.0 || threshold > 1.0) {
+  if (!(threshold >= 0.0 && threshold <= 1.0)) {
     throw InvalidInputException("dynamic_filter_keep_threshold must be in [0.0, 1.0], got %f",
                                 threshold);
   }
@@ -2218,6 +2230,22 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
       "TEST ONLY: force transparent GPU execution to fail at runtime with this message",
       LogicalType::VARCHAR,
       Value(""));
+    config.AddExtensionOption(
+      "enable_pinned_zone_map_pruning",
+      "TEST ONLY: disable automatic pinned-table zone-map capture and pruning",
+      LogicalType::BOOLEAN,
+      Value::BOOLEAN(operator_defaults.enable_pinned_zone_map_pruning),
+      SetEnablePinnedZoneMapPruning);
+    config.AddExtensionOption("enable_dynamic_filter_pushdown",
+                              "TEST ONLY: disable automatic dynamic membership-filter pushdown",
+                              LogicalType::BOOLEAN,
+                              Value::BOOLEAN(operator_defaults.enable_dynamic_filter_pushdown),
+                              SetEnableDynamicFilterPushdown);
+    config.AddExtensionOption("enable_dynamic_zone_map_filter",
+                              "TEST ONLY: enable the clustered-keyset dynamic zone-map path",
+                              LogicalType::BOOLEAN,
+                              Value::BOOLEAN(operator_defaults.enable_dynamic_zone_map_filter),
+                              SetEnableDynamicZoneMapFilter);
   }
 
   // Add in config options for special JIT implementation for regex
@@ -2330,6 +2358,16 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     SetMarkJoinBuildSwitchRatio);
 
   config.AddExtensionOption(
+    "enable_runtime_distinct_build_probe",
+    "For BUILD_PROBE hash joins whose build-key uniqueness the planner could not prove, test "
+    "distinctness at runtime (one cudf::distinct_count pass over the cached build) and take the "
+    "single-pass cudf::distinct_hash_join instead of the general two-pass join when the keys are "
+    "distinct (on by default)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.enable_runtime_distinct_build_probe),
+    SetEnableRuntimeDistinctBuildProbe);
+
+  config.AddExtensionOption(
     "gpu_execution",
     "Whether to transparently intercept SQL queries and execute them on GPU",
     LogicalType::BOOLEAN,
@@ -2367,25 +2405,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     SetPinTableCompressionMaxCompressedFraction);
 
   config.AddExtensionOption(
-    "enable_dynamic_filter_pushdown",
-    "Wire dynamic table-filter pushdown: an eligible BUILD_PROBE hash-join build publishes a "
-    "runtime membership filter (raw IN-list for 1-12 supported build rows; otherwise a hash "
-    "IN-list if it fits the smallest probe-GPU L2, or a Bloom) into the probe-side scan to drop "
-    "non-matching rows before the join (on by default)",
-    LogicalType::BOOLEAN,
-    Value::BOOLEAN(operator_defaults.enable_dynamic_filter_pushdown),
-    SetEnableDynamicFilterPushdown);
-
-  config.AddExtensionOption(
-    "enable_dynamic_zone_map_filter",
-    "Additionally emit a runtime zone-map (build-key min/max) at the probe scan: parquet scans use "
-    "it for read-time row-group pruning, while duckdb-native scans apply it row-wise post-decode; "
-    "requires enable_dynamic_filter_pushdown (off by default)",
-    LogicalType::BOOLEAN,
-    Value::BOOLEAN(operator_defaults.enable_dynamic_zone_map_filter),
-    SetEnableDynamicZoneMapFilter);
-
-  config.AddExtensionOption(
     "dynamic_filter_domain_coverage_threshold",
     "Skip publishing a key's dynamic filters when the hash-join build covers at least this "
     "fraction of the key's domain; >= 1.0 effectively disables the gate",
@@ -2401,15 +2420,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     LogicalType::DOUBLE,
     Value::DOUBLE(operator_defaults.dynamic_filter_keep_threshold),
     SetDynamicFilterKeepThreshold);
-
-  config.AddExtensionOption(
-    "enable_pinned_zone_map_pruning",
-    "Skip pinned-table chunks whose pin-time min/max statistics prove the scan's pushed-down "
-    "filter matches no rows; also gates the statistics capture during CALL pin_table, so a table "
-    "pinned while off carries no zone maps until re-pinned with the flag on",
-    LogicalType::BOOLEAN,
-    Value::BOOLEAN(operator_defaults.enable_pinned_zone_map_pruning),
-    SetEnablePinnedZoneMapPruning);
 
   // Default from the YAML-loaded params, so a sirius.yaml value is what connections inherit.
   config.AddExtensionOption(
