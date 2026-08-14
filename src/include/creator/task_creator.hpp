@@ -367,6 +367,13 @@ class task_creator {
   std::shared_ptr<query_task_global_state> get_query_task_global_state(
     sirius::query_id_t query_id) const;
 
+  //! Resolve a query's state, registering (and admission-seeding) a fresh
+  //! entry when none exists. Both registration entry points funnel here:
+  //! set_client_context (window begin) and set_active_gpu_ids (admission —
+  //! first touch in window-less unit-test drives).
+  std::shared_ptr<query_task_global_state> get_or_create_query_task_global_state(
+    sirius::query_id_t query_id);
+
   // Queue for creating tasks based on operators. The operator is the starting point to start
   // looking which task should be created, not necessarily the operator for whose pipeline the task
   // will be created.

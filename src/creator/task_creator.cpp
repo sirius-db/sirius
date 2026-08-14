@@ -91,13 +91,12 @@ void task_creator::set_active_gpu_ids(sirius::query_id_t query_id,
                                       std::vector<int> ids,
                                       std::size_t full_count)
 {
-  auto state = get_query_task_global_state(query_id);
-  if (!state) {
-    throw sirius::internal_exception(
-      "task_creator::set_active_gpu_ids: no state registered for query {}; "
-      "set_client_context must run first (execution-window begin)",
-      query_id);
-  }
+  // get-or-create rather than get-or-throw: in production set_client_context
+  // (execution-window begin) has already registered the entry, but unit tests
+  // drive sirius_engine::initialize_internal directly with no window, and
+  // admission is a valid first touch — the entry is completed by whichever
+  // registration call runs next on the same id.
+  auto state            = get_or_create_query_task_global_state(query_id);
   state->active_gpu_ids = std::move(ids);
   state->full_gpu_count = full_count;
 }
@@ -116,12 +115,10 @@ std::shared_ptr<task_creator::query_task_global_state> task_creator::get_query_t
   return it == _query_task_global_states.end() ? nullptr : it->second;
 }
 
-void task_creator::set_client_context(sirius::query_id_t query_id,
-                                      ::duckdb::ClientContext& client_context)
+std::shared_ptr<task_creator::query_task_global_state>
+task_creator::get_or_create_query_task_global_state(sirius::query_id_t query_id)
 {
   std::lock_guard<std::mutex> lock(_global_state_mutex);
-  // The window begins before the plan exists, so this is where the query's entry is created;
-  // prepare_for_query then fills in the pipeline global states.
   auto& state = _query_task_global_states[query_id];
   if (!state) {
     state = std::make_shared<query_task_global_state>();
@@ -131,6 +128,15 @@ void task_creator::set_client_context(sirius::query_id_t query_id,
     state->active_gpu_ids = _default_gpu_ids;
     state->full_gpu_count = _default_gpu_ids.size();
   }
+  return state;
+}
+
+void task_creator::set_client_context(sirius::query_id_t query_id,
+                                      ::duckdb::ClientContext& client_context)
+{
+  // The window begins before the plan exists, so this is where the query's entry is normally
+  // created; prepare_for_query then fills in the pipeline global states.
+  auto state            = get_or_create_query_task_global_state(query_id);
   state->client_context = std::addressof(client_context);
 }
 
