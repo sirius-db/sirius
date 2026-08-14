@@ -18,7 +18,11 @@
 #include <cucascade/data/data_repository.hpp>
 #include <data/data_repository_manager_registry.hpp>
 
+#include <atomic>
+#include <cstdint>
 #include <memory>
+#include <stdexcept>
+#include <thread>
 #include <vector>
 
 using sirius::query_id_t;
@@ -75,8 +79,8 @@ TEST_CASE("registry: queries own independent managers", "[repository_registry]")
   CHECK_NOTHROW(
     manager_b->add_new_repository(0, "default", std::make_unique<cucascade::data_repository>()));
 
-  CHECK(manager_a->get_repository(0, "default").get() !=
-        manager_b->get_repository(0, "default").get());
+  CHECK(manager_a->get_repository_shared(0, "default").get() !=
+        manager_b->get_repository_shared(0, "default").get());
 }
 
 TEST_CASE("registry: erase drops only the named query", "[repository_registry]")
@@ -94,7 +98,7 @@ TEST_CASE("registry: erase drops only the named query", "[repository_registry]")
   CHECK(registry.size() == 1);
   // The surviving query's repositories are untouched — the property the wholesale
   // clear_all_repositories() teardown could not provide.
-  CHECK_NOTHROW(manager_b->get_repository(0, "default"));
+  CHECK_NOTHROW(manager_b->get_repository_shared(0, "default"));
 }
 
 TEST_CASE("registry: erasing an unknown query is a no-op", "[repository_registry]")
@@ -168,4 +172,86 @@ TEST_CASE("registry: clear drops every manager", "[repository_registry]")
   CHECK(registry.get_all().empty());
   // After clear the ids are free again, so teardown followed by reuse is legal.
   CHECK_NOTHROW(registry.create_for_query(kQueryA));
+}
+
+// B9 regression: cucascade's data_repository_manager::get_repository used to
+// return a reference into the map WITHOUT taking _mutex, so a concurrent
+// add_new_repository / clear_all_repositories raced both the lookup and the
+// returned reference (a silent use-after-free in release builds). The locked
+// shared_ptr accessor closes both: the lookup holds the mutex and the returned
+// shared_ptr keeps the repository alive across a concurrent clear.
+TEST_CASE("manager: get_repository_shared survives concurrent add/clear churn",
+          "[repository_registry]")
+{
+  cucascade::shared_data_repository_manager manager;
+  constexpr std::size_t kOperators = 8;
+  constexpr int kIterations        = 2000;
+  constexpr int kReaders           = 4;
+
+  std::atomic<bool> stop{false};
+  std::atomic<std::uint64_t> successful_gets{0};
+  std::atomic<std::uint64_t> null_hits{0};
+
+  // Writer: churn the map — register every operator, then clear them all.
+  std::thread writer([&] {
+    for (int iter = 0; iter < kIterations; ++iter) {
+      for (std::size_t op = 0; op < kOperators; ++op) {
+        manager.add_new_repository(op, "default", std::make_unique<cucascade::data_repository>());
+      }
+      manager.clear_all_repositories();
+    }
+    stop.store(true);
+  });
+
+  // Readers: race lookups against the churn and dereference every hit.
+  // (Catch2 v2 assertion macros are not thread-safe — workers only count.)
+  std::vector<std::thread> readers;
+  for (int r = 0; r < kReaders; ++r) {
+    readers.emplace_back([&] {
+      while (!stop.load()) {
+        for (std::size_t op = 0; op < kOperators; ++op) {
+          try {
+            auto repo = manager.get_repository_shared(op, "default");
+            if (!repo) {
+              null_hits.fetch_add(1);
+              continue;
+            }
+            // Pre-fix this dereferenced a freed map node whenever the writer's
+            // clear ran between lookup and use.
+            (void)repo->total_size();
+            successful_gets.fetch_add(1);
+          } catch (const std::out_of_range&) {
+            // The operator was between clear and re-add — expected.
+          }
+        }
+      }
+    });
+  }
+
+  writer.join();
+  for (auto& t : readers) {
+    t.join();
+  }
+
+  CHECK(null_hits.load() == 0);
+  // The interleave actually exercised the racy window.
+  REQUIRE(successful_gets.load() > 0);
+}
+
+// B9 lifetime guarantee, deterministically: a repository obtained just before
+// clear_all_repositories remains usable through the returned shared_ptr.
+TEST_CASE("manager: repository obtained before clear_all remains usable", "[repository_registry]")
+{
+  cucascade::shared_data_repository_manager manager;
+  manager.add_new_repository(3, "build", std::make_unique<cucascade::data_repository>());
+
+  auto repo = manager.get_repository_shared(3, "build");
+  REQUIRE(repo != nullptr);
+
+  manager.clear_all_repositories();
+  CHECK_THROWS_AS(manager.get_repository_shared(3, "build"), std::out_of_range);
+
+  // The detached repository is still fully usable.
+  CHECK(repo->total_size() == 0);
+  CHECK(repo->pop_next_data_batch() == nullptr);
 }

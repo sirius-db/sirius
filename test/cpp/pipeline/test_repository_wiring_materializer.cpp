@@ -125,7 +125,7 @@ TEST_CASE("materialize: basic 4-arg-style wiring attaches port and records sink 
   CHECK(next_ports[0].next_operator_port_name == "default");
 
   // Repository was registered under the destination operator's id.
-  CHECK(mgr.get_repository(dest_first_op.operator_id, "default").get() == port->repo);
+  CHECK(mgr.get_repository_shared(dest_first_op.operator_id, "default").get() == port->repo);
 }
 
 TEST_CASE("materialize: empty operators routes port onto destination sink",
