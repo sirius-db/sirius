@@ -26,6 +26,7 @@
 #include "duckdb/parser/group_by_node.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "expression/ast/node.hpp"
+#include "op/groupby_surrogate_deferral.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/sirius_physical_operator.hpp"
 
@@ -86,9 +87,19 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   bool has_avg            = false;
   bool has_count_distinct = false;
 
+  //! Surrogate-key group-by deferral (see op/groupby_surrogate_deferral.hpp). Set by the
+  //! planner pass; wrap_hash_group_by copies it onto the MERGE_GROUP_BY wrapper, which
+  //! performs the string materialization / schema restoration.
+  std::shared_ptr<surrogate_groupby_spec> surrogate_spec;
+
  public:
   std::vector<int> get_output_grouping_indices() const
   {
+    // Under surrogate-key deferral, hash-partition only the real (non-deferred, non-dummy) key
+    // slots: rows whose real keys are equal — a superset of rows with equal full tuples — must
+    // meet in one merge task for the merge's uniqueness check / conservative re-group to be
+    // globally sound.
+    if (surrogate_spec) { return surrogate_spec->real_key_slots; }
     std::vector<int> indices(group_idx.size());
     std::iota(indices.begin(), indices.end(), 0);
     return indices;

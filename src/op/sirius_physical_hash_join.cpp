@@ -18,6 +18,8 @@
 
 #include "config.hpp"
 #include "cudf/aggregation.hpp"
+#include "cudf/binaryop.hpp"
+#include "cudf/column/column_factories.hpp"
 #include "cudf/copying.hpp"
 #include "cudf/join/distinct_hash_join.hpp"
 #include "cudf/join/filtered_join.hpp"
@@ -1347,12 +1349,67 @@ static join_side_keys_result prepare_join_keys(
   return result;
 }
 
+/// Gather one join side's output columns under a surrogate-key deferral spec: non-deferred
+/// columns are gathered normally, the deferred rowid slot is synthesized as
+/// BIGINT(gather_map + base), and the deferred dummy slots become constant TINYINT zeros. Only
+/// reachable for INNER joins (planner gate), so the map is dense and never out of bounds.
+static std::vector<std::unique_ptr<cudf::column>> gather_side_with_deferral(
+  const cudf::table_view& side_full,
+  std::vector<cudf::size_type> const& col_idxs,
+  const surrogate_join_emit::side& emit,
+  int64_t base,
+  const cudf::column_view& map_view,
+  cudf::out_of_bounds_policy oob,
+  rmm::cuda_stream_view stream)
+{
+  std::vector<bool> is_deferred(col_idxs.size(), false);
+  is_deferred.at(static_cast<std::size_t>(emit.rowid_out_pos)) = true;
+  for (auto pos : emit.dummy_out_pos) {
+    is_deferred.at(static_cast<std::size_t>(pos)) = true;
+  }
+
+  std::vector<cudf::size_type> keep;
+  keep.reserve(col_idxs.size());
+  for (std::size_t i = 0; i < col_idxs.size(); i++) {
+    if (!is_deferred[i]) { keep.push_back(col_idxs[i]); }
+  }
+  std::vector<std::unique_ptr<cudf::column>> gathered_cols;
+  if (!keep.empty()) {
+    auto gathered = cudf::gather(side_full.select(keep), map_view, oob, stream);
+    gathered_cols = gathered->release();
+  }
+
+  cudf::numeric_scalar<int64_t> base_scalar(base, true, stream);
+  auto rowid_col = cudf::binary_operation(map_view,
+                                          base_scalar,
+                                          cudf::binary_operator::ADD,
+                                          cudf::data_type{cudf::type_id::INT64},
+                                          stream);
+
+  cudf::numeric_scalar<int8_t> dummy_scalar(0, true, stream);
+
+  std::vector<std::unique_ptr<cudf::column>> out(col_idxs.size());
+  std::size_t gathered_at = 0;
+  for (std::size_t i = 0; i < col_idxs.size(); i++) {
+    if (!is_deferred[i]) {
+      out[i] = std::move(gathered_cols[gathered_at++]);
+    } else if (static_cast<cudf::size_type>(i) == emit.rowid_out_pos) {
+      out[i] = std::move(rowid_col);
+    } else {
+      out[i] = cudf::make_column_from_scalar(dummy_scalar, map_view.size(), stream);
+    }
+  }
+  return out;
+}
+
 /// Gather output columns from both sides of a join using row index vectors, then assemble the
 /// result into an operator_data. Handles collect/oob policy selection based on join type.
 /// @param left_indices   Row indices into left_full; may be null if the left side is not collected.
 /// @param right_indices  Row indices into right_full; may be null if the right side is not
 ///                       collected.
 /// @param memory_space   Memory space of the input batch used to tag the output data batch.
+/// @param surrogate      Surrogate-key deferral spec (INNER joins only) plus the per-side base
+///                       offsets already registered for this call's retained source batches.
 static std::unique_ptr<operator_data> gather_join_output(
   duckdb::JoinType join_type,
   const cudf::table_view& left_full,
@@ -1363,7 +1420,10 @@ static std::unique_ptr<operator_data> gather_join_output(
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> right_indices,
   cucascade::memory::memory_space& memory_space,
   rmm::cuda_stream_view stream,
-  const telemetry::batch_telemetry_info& telemetry_info = {})
+  const telemetry::batch_telemetry_info& telemetry_info = {},
+  const surrogate_join_emit* surrogate                  = nullptr,
+  int64_t left_base                                     = 0,
+  int64_t right_base                                    = 0)
 {
   bool collect_left =
     (join_type != duckdb::JoinType::RIGHT_SEMI && join_type != duckdb::JoinType::RIGHT_ANTI);
@@ -1382,7 +1442,6 @@ static std::unique_ptr<operator_data> gather_join_output(
 
   std::vector<std::unique_ptr<cudf::column>> out_cols;
   if (collect_left) {
-    cudf::table_view left_cols_to_gather = left_full.select(lhs_col_idxs);
     cudf::column_view left_map_view(cudf::data_type(cudf::type_id::INT32),
                                     left_indices->size(),
                                     left_indices->data(),
@@ -1390,11 +1449,16 @@ static std::unique_ptr<operator_data> gather_join_output(
                                     0,
                                     0,
                                     {});
-    auto left_result = cudf::gather(left_cols_to_gather, left_map_view, left_oob, stream);
-    out_cols         = left_result->release();
+    if (surrogate && surrogate->left) {
+      out_cols = gather_side_with_deferral(
+        left_full, lhs_col_idxs, *surrogate->left, left_base, left_map_view, left_oob, stream);
+    } else {
+      cudf::table_view left_cols_to_gather = left_full.select(lhs_col_idxs);
+      auto left_result = cudf::gather(left_cols_to_gather, left_map_view, left_oob, stream);
+      out_cols         = left_result->release();
+    }
   }
   if (collect_right) {
-    cudf::table_view right_cols_to_gather = right_full.select(rhs_col_idxs);
     cudf::column_view right_map_view(cudf::data_type(cudf::type_id::INT32),
                                      right_indices->size(),
                                      right_indices->data(),
@@ -1402,8 +1466,15 @@ static std::unique_ptr<operator_data> gather_join_output(
                                      0,
                                      0,
                                      {});
-    auto right_result   = cudf::gather(right_cols_to_gather, right_map_view, right_oob, stream);
-    auto right_out_cols = right_result->release();
+    std::vector<std::unique_ptr<cudf::column>> right_out_cols;
+    if (surrogate && surrogate->right) {
+      right_out_cols = gather_side_with_deferral(
+        right_full, rhs_col_idxs, *surrogate->right, right_base, right_map_view, right_oob, stream);
+    } else {
+      cudf::table_view right_cols_to_gather = right_full.select(rhs_col_idxs);
+      auto right_result = cudf::gather(right_cols_to_gather, right_map_view, right_oob, stream);
+      right_out_cols    = right_result->release();
+    }
     for (auto& col : right_out_cols) {
       out_cols.push_back(std::move(col));
     }
@@ -1632,6 +1703,16 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
   cudf::table_view left_full, right_full;
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices, right_indices;
 
+  // Surrogate-key deferral: the batch whose rows the emitted right-side rowids address. The
+  // left/probe source is always input_batches[0]; the right source depends on the join mode
+  // (BUILD_PROBE keeps the per-partition build table, STANDARD/MIXED get it per call).
+  std::optional<::cucascade::read_only_data_batch> surrogate_right_source;
+  if (surrogate_emit && join_type != duckdb::JoinType::INNER) {
+    throw std::runtime_error(
+      "sirius_physical_hash_join: surrogate-key group-by deferral requires an INNER join "
+      "(planner invariant violated)");
+  }
+
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
     // Each partition owns one hash table. The incoming batch is tagged with its partition index
     // (get_next_task_input_data_for_build_probe), which selects the per-partition slot; the
@@ -1756,6 +1837,9 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                        .get_data()
                        ->cast<cucascade::gpu_table_representation>()
                        .get_table_view();
+        if (surrogate_emit && surrogate_emit->right) {
+          surrogate_right_source = slot.build_table.value();
+        }
 
         if (slot.distinct_hash_table) {
           // Distinct hash join path (unique build keys, INNER or LEFT only).
@@ -1811,6 +1895,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
     }
     left_full  = get_cudf_table_view(input_batches[0]);
     right_full = get_cudf_table_view(input_batches[1]);
+    if (surrogate_emit && surrogate_emit->right) { surrogate_right_source = input_batches[1]; }
     // Mixed join: equality conditions drive the hash table; inequality conditions are evaluated
     // via a cuDF AST binary predicate on the full input tables.
     auto left_keys_result     = prepare_join_keys(input_batches[0],
@@ -1919,8 +2004,9 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       throw std::runtime_error("Expected 2 input batches for hash join, got " +
                                std::to_string(input_batches.size()) + " input batches");
     }
-    left_full                   = get_cudf_table_view(input_batches[0]);
-    right_full                  = get_cudf_table_view(input_batches[1]);
+    left_full  = get_cudf_table_view(input_batches[0]);
+    right_full = get_cudf_table_view(input_batches[1]);
+    if (surrogate_emit && surrogate_emit->right) { surrogate_right_source = input_batches[1]; }
     auto left_keys_result       = prepare_join_keys(input_batches[0],
                                               left_key_col_indices,
                                               cast_necessary,
@@ -2034,6 +2120,28 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
     }
   }
 
+  // Surrogate-key deferral: retain this call's source batches in the shared store and get the
+  // base offsets that make the emitted rowids globally unique across calls/partitions. The
+  // store holds read-only accessors, so the sources stay resident until the query completes.
+  int64_t surrogate_left_base  = 0;
+  int64_t surrogate_right_base = 0;
+  if (surrogate_emit) {
+    auto& store = *surrogate_emit->store;
+    if (surrogate_emit->left) {
+      surrogate_left_base =
+        store.register_source(/*is_left=*/true, input_batches[0], left_full.num_rows());
+    }
+    if (surrogate_emit->right) {
+      if (!surrogate_right_source) {
+        throw std::runtime_error(
+          "sirius_physical_hash_join: surrogate-key deferral right-side source batch was not "
+          "captured for this join mode");
+      }
+      surrogate_right_base = store.register_source(
+        /*is_left=*/false, *surrogate_right_source, right_full.num_rows());
+    }
+  }
+
   return gather_join_output(join_type,
                             left_full,
                             right_full,
@@ -2043,7 +2151,10 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                             std::move(right_indices),
                             *input_batches[0].get_memory_space(),
                             stream,
-                            batch_telemetry());
+                            batch_telemetry(),
+                            surrogate_emit ? &*surrogate_emit : nullptr,
+                            surrogate_left_base,
+                            surrogate_right_base);
 }
 
 //===----------------------------------------------------------------------===//

@@ -61,6 +61,7 @@
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
+#include "planner/sirius_plan_surrogate_groupby.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 
@@ -435,6 +436,21 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
       op_params.hash_partition_bytes);
     if (hgb_ptr->has_physical_overrides()) {
       merge->set_physical_types(hgb_ptr->get_physical_types());
+      // Surrogate-key deferral: the aggregate's sidecar carries the rowid/dummy carrier types
+      // at the deferred key slots, but the merge finalizes back to the original schema — its
+      // sidecar must declare the restored native carriers.
+      if (auto const& spec = merge->surrogate_spec) {
+        auto phys = merge->get_physical_types();
+        for (auto const& group : spec->groups) {
+          for (std::size_t i = 0; i < group.restore_key_slots.size(); ++i) {
+            auto const slot = static_cast<std::size_t>(group.restore_key_slots[i]);
+            if (slot < phys.size()) {
+              phys[slot] = sirius::get_cudf_type(group.restored_types[i]);
+            }
+          }
+        }
+        merge->set_physical_types(std::move(phys));
+      }
     }
 
     auto& grouped = hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>();
@@ -1052,6 +1068,10 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
       }
     }
   }
+  // Surrogate-key group-by (late string materialization): runs after the compressed-schema
+  // passes (rewritten slots patch the physical sidecars) and before the pipeline-operator
+  // wraps (which copy the rewritten schemas onto CONCAT/PARTITION/MERGE).
+  apply_groupby_surrogate_keys(plan, context);
   plan->verify();
 
   // Rewrite the plan tree to contain the GPU pipeline operators so the converter becomes a

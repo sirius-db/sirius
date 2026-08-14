@@ -29,6 +29,7 @@
 #include "expression/ast/node.hpp"  // complete sirius::ast::node for join_condition's destructor
 #include "expression/join_condition.hpp"
 #include "op/dynamic_filter_publish_plan.hpp"
+#include "op/groupby_surrogate_deferral.hpp"
 #include "op/dynamic_filter_replica_space.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "sirius_config.hpp"
@@ -288,6 +289,13 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   mutable bool unique_probe_keys = false;
 
+  //! Surrogate-key group-by deferral (see op/groupby_surrogate_deferral.hpp). When set by the
+  //! planner pass (INNER joins only), execute() emits a BIGINT rowid / TINYINT dummies at the
+  //! flagged output slots instead of gathering the deferred string columns, and retains
+  //! read-only handles on the deferred-side input batches in the shared store so the
+  //! downstream MERGE_GROUP_BY can materialize the strings after aggregation.
+  std::optional<surrogate_join_emit> surrogate_emit;
+
   //! When the planner could not *prove* build-key uniqueness, test it at runtime instead (one hash
   //! pass over the build keys) and, if the keys are in fact distinct, take the single-pass
   //! cudf::distinct_hash_join path rather than the general two-pass multiset path. Proving
@@ -363,6 +371,22 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   /// @brief True when this join runs in build-then-probe mode (see `get_partition_strategy`).
   [[nodiscard]] bool is_build_probe_mode();
+
+  //! Plan-time inspection for the surrogate-key group-by pass: which input columns each side's
+  //! equality keys read, and whether every condition is a plain hash-equality key (no
+  //! mixed-join AST predicate that could reference arbitrary input columns).
+  [[nodiscard]] std::vector<cudf::size_type> const& get_left_key_col_indices() const
+  {
+    return left_key_col_indices;
+  }
+  [[nodiscard]] std::vector<cudf::size_type> const& get_right_key_col_indices() const
+  {
+    return right_key_col_indices;
+  }
+  [[nodiscard]] bool all_conditions_are_equality_keys() const
+  {
+    return num_equality_conditions == conditions.size();
+  }
 
   std::unique_ptr<operator_data> get_next_task_input_data_for_build_probe();
   std::unique_ptr<operator_data> get_next_task_input_data() override;

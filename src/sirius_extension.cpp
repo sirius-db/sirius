@@ -2116,6 +2116,49 @@ static void SetEnablePinnedZoneMapPruning(ClientContext& context, SetScope scope
                    params->enable_pinned_zone_map_pruning);
 }
 
+static void SetGroupbySurrogateKeys(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                      = lock_operator_params_slot(context);
+  params->groupby_surrogate_keys = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config GROUPBY_SURROGATE_KEYS to {}", params->groupby_surrogate_keys);
+}
+
+static void SetGroupbySurrogateUniqueFastpath(ClientContext& context,
+                                              SetScope scope,
+                                              Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                                 = lock_operator_params_slot(context);
+  params->groupby_surrogate_unique_fastpath = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config GROUPBY_SURROGATE_UNIQUE_FASTPATH to {}",
+                   params->groupby_surrogate_unique_fastpath);
+}
+
+static void SetGroupbySurrogateMinStringKeys(ClientContext& context,
+                                             SetScope scope,
+                                             Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                                = lock_operator_params_slot(context);
+  params->groupby_surrogate_min_string_keys = parameter.GetValue<uint64_t>();
+  SIRIUS_LOG_DEBUG("Updated config GROUPBY_SURROGATE_MIN_STRING_KEYS to {}",
+                   params->groupby_surrogate_min_string_keys);
+}
+
+static void SetGroupbySurrogateMinRows(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                          = lock_operator_params_slot(context);
+  params->groupby_surrogate_min_rows = parameter.GetValue<uint64_t>();
+  SIRIUS_LOG_DEBUG("Updated config GROUPBY_SURROGATE_MIN_ROWS to {}",
+                   params->groupby_surrogate_min_rows);
+}
+
 static void SetEnableCompressedMaterialization(ClientContext& /*context*/,
                                                SetScope /*scope*/,
                                                Value& /*parameter*/)
@@ -2430,6 +2473,41 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.enable_compressed_materialization),
     SetEnableCompressedMaterialization);
+
+  config.AddExtensionOption(
+    "groupby_surrogate_keys",
+    "Surrogate-key group-by: when every STRING group key passes through from one side of a "
+    "single upstream INNER hash join, carry a compact BIGINT rowid instead of the strings, "
+    "aggregate on numeric keys, and materialize the strings only after the group-by merge "
+    "(on by default; always-correct via an exact distinct check with a full-tuple re-group "
+    "fallback)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.groupby_surrogate_keys),
+    SetGroupbySurrogateKeys);
+
+  config.AddExtensionOption(
+    "groupby_surrogate_unique_fastpath",
+    "Take the surrogate group-by's no-re-group fast path when the exact distinct check over the "
+    "non-deferred key columns proves the merged tuples distinct; off = always re-group by the "
+    "full restored tuple (slower, same results)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.groupby_surrogate_unique_fastpath),
+    SetGroupbySurrogateUniqueFastpath);
+
+  config.AddExtensionOption(
+    "groupby_surrogate_min_string_keys",
+    "Minimum number of STRING group keys before the surrogate group-by rewrite is applied",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.groupby_surrogate_min_string_keys),
+    SetGroupbySurrogateMinStringKeys);
+
+  config.AddExtensionOption(
+    "groupby_surrogate_min_rows",
+    "Minimum estimated group-by input cardinality before the surrogate group-by rewrite is "
+    "applied",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.groupby_surrogate_min_rows),
+    SetGroupbySurrogateMinRows);
 }
 
 // Publish the transparent optimizer mask once at extension load, unioned

@@ -382,6 +382,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_projection.cpp
     src/planner/sirius_plan_projection_utils.cpp
     src/planner/sirius_plan_recursive_cte.cpp
+    src/planner/sirius_plan_surrogate_groupby.cpp
     src/planner/sirius_plan_top_n.cpp
     src/pin_table.cpp
     src/scan_manager/load_balancing_scan_batch_coalescer.cpp
