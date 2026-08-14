@@ -49,6 +49,7 @@
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -1762,8 +1763,7 @@ std::optional<std::size_t> rest_reactor_screen_env(std::string_view name,
   for (auto const candidate : allowed) {
     if (raw == std::to_string(candidate)) { return candidate; }
   }
-  FAIL(std::string{name} + " must be one of the predeclared values");
-  return std::nullopt;
+  throw std::invalid_argument(std::string{name} + " must be one of the predeclared values");
 }
 
 TEST_CASE("REST reactor-count screen accepts only its predeclared cell values",
@@ -1779,7 +1779,7 @@ TEST_CASE("REST reactor-count screen accepts only its predeclared cell values",
   REQUIRE(rest_reactor_screen_env(name, {1, 2, 4, 8}) == std::size_t{4});
 
   setenv(name.c_str(), "3", 1);
-  CHECK_THROWS(rest_reactor_screen_env(name, {1, 2, 4, 8}));
+  CHECK_THROWS_AS(rest_reactor_screen_env(name, {1, 2, 4, 8}), std::invalid_argument);
 }
 
 std::string explain_text(duckdb::Connection& con, std::string const& sql)
