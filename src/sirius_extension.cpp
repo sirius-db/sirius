@@ -2148,6 +2148,9 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
     throw BinderException("sirius_knn_join: k must be <= " + std::to_string(kMaxKnnJoinK) +
                           " for join_mode => 'per-row', got " + std::to_string(req.k));
   }
+  if (req.mode == vector_join_mode::threshold && req.eps <= 0.0) {
+    throw BinderException("sirius_knn_join: join_mode => 'threshold' requires eps > 0");
+  }
   if (!output_type_is_set) {
     req.output_type = req.metric == "cosine" ? vector_join_output_type::similarity
                                              : vector_join_output_type::distance;

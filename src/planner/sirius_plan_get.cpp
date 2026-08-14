@@ -690,8 +690,12 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
   }
 
   // First, the select stage does the per-row exact knn join
-  auto select_types = []() {
+  auto select_types = [&]() {
     duckdb::vector<sirius::logical_type> t;
+    // Threshold mode is ragged, so it also carries the local left-row index of each edge
+    if (req.mode == sirius::vss::vector_join_mode::threshold) {
+      t.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
+    }
     // On the fast path, this is the right table's primary key value for the matched neighbor,
     // on the payload path, this is the row number of the right table.
     t.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));

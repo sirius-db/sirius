@@ -23,6 +23,7 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/concatenate.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
@@ -125,6 +126,56 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_reduce_local::execute
 
   ensure_initialized();
 
+  auto const mr = space->get_default_allocator();
+
+  // Threshold mode reduces across right batches by UNION, not a per-row top-k: every
+  // partial is a ragged [query_row, col0, distance] edge list, so we concat them and
+  // gather this left batch's output columns by the per-edge query-row index.
+  if (_request.mode == vss::vector_join_mode::threshold) {
+    std::vector<cudf::column_view> qrow_views;
+    std::vector<cudf::column_view> col0_views;
+    std::vector<cudf::column_view> distance_views;
+    qrow_views.reserve(input_batches.size());
+    col0_views.reserve(input_batches.size());
+    distance_views.reserve(input_batches.size());
+    for (auto const& ro : input_batches) {
+      auto const tv = sirius::get_cudf_table_view(ro);
+      qrow_views.push_back(tv.column(0));
+      col0_views.push_back(tv.column(1));
+      distance_views.push_back(tv.column(2));
+    }
+    auto query_rows = cudf::concatenate(qrow_views, stream, mr);
+    auto neighbors  = cudf::concatenate(col0_views, stream, mr);
+    auto distances  = cudf::concatenate(distance_views, stream, mr);
+
+    std::vector<std::unique_ptr<cudf::column>> threshold_cols;
+    // Gather the left batch's output columns by the per-edge query row (batch-local, so
+    // the row index maps straight into this left batch). No left-table concat.
+    if (!_left_output_cols.empty()) {
+      std::vector<cudf::column_view> left_batch_cols;
+      left_batch_cols.reserve(_left_output_cols.size());
+      for (auto const& per_batch : _left_output_cols) {
+        left_batch_cols.push_back(per_batch[partition_idx]);
+      }
+      auto left_gathered = cudf::gather(cudf::table_view(left_batch_cols),
+                                        query_rows->view(),
+                                        cudf::out_of_bounds_policy::DONT_CHECK,
+                                        stream,
+                                        mr);
+      for (auto& c : left_gathered->release()) {
+        threshold_cols.push_back(std::move(c));
+      }
+    }
+    threshold_cols.push_back(std::move(neighbors));
+    threshold_cols.push_back(std::move(distances));
+    auto out_table = std::make_unique<cudf::table>(std::move(threshold_cols));
+
+    auto batch = sirius::make_data_batch(std::move(out_table), *space, stream, batch_telemetry());
+    std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+    batches.push_back(std::move(batch));
+    return std::make_unique<partitioned_operator_data>(std::move(batches), partition_idx);
+  }
+
   // Collect and concat the two columns from every partial in order to
   // form part-major layout that knn_merge_parts expects.
   auto const part_rows =
@@ -146,8 +197,6 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_reduce_local::execute
 
   auto const n_parts   = static_cast<std::int64_t>(input_batches.size());
   auto const n_samples = part_rows / _k;
-
-  auto const mr = space->get_default_allocator();
 
   auto stacked_neighbors = cudf::concatenate(neighbor_views, stream, mr);
   auto stacked_distances = cudf::concatenate(distance_views, stream, mr);

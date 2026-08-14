@@ -20,6 +20,7 @@
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "vss/brute_force_search.hpp"
+#include "vss/brute_force_threshold.hpp"
 #include "vss/cudf_raft_interop.hpp"
 #include "vss/distance_metric.hpp"
 #include "vss/pinned_column.hpp"
@@ -232,6 +233,60 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_select::execute(
   auto const exact_unexpanded = _request.search_mode == vss::vector_join_search_mode::exact;
   auto const metric =
     vss::join_selection_distance_type_from_metric(_request.metric, exact_unexpanded);
+
+  // Threshold mode: emit every pair within eps for this batch pair. Same downstream schema
+  // as the top-k path except it also carries the local left-row index so reduce_local can
+  // gather left columns per edge.
+  if (_request.mode == vss::vector_join_mode::threshold) {
+    // brute_force_threshold always keeps pairs by distance (dist <= cutoff), so translate
+    // the user's eps into a distance cutoff. Only cosine + similarity needs the 1 - s flip;
+    // cosine + distance and l2 are already distance cutoffs.
+    auto const cutoff = static_cast<float>(
+      (_request.metric == "cosine" &&
+       _request.output_type == vss::vector_join_output_type::similarity)
+        ? 1.0 - _request.eps
+        : _request.eps);
+    auto tj = vss::brute_force_threshold(res, dataset, queries, cutoff, metric, mr);
+
+    // col0 carries the right identity, exactly like the top-k path: the id value on the
+    // fast path (gathered from the local neighbor position), or the global row number on
+    // the payload path (local position shifted by this right batch's offset).
+    std::unique_ptr<cudf::column> col0;
+    if (_request.right.is_fast_path) {
+      auto const id_table = cudf::table_view{{_right_id_views[right_idx]}};
+      auto gathered       = cudf::gather(
+        id_table, tj.neighbors->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
+      col0 = std::move(gathered->release().front());
+      if (col0->type().id() != cudf::type_id::INT64) {
+        col0 = cudf::cast(col0->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
+      }
+    } else {
+      col0              = std::move(tj.neighbors);
+      auto const offset = _right_offsets[right_idx];
+      if (offset != 0) {
+        cudf::numeric_scalar<std::int64_t> const off_scalar(offset, true, stream);
+        col0 = cudf::binary_operation(col0->view(),
+                                      off_scalar,
+                                      cudf::binary_operator::ADD,
+                                      cudf::data_type{cudf::type_id::INT64},
+                                      stream,
+                                      mr);
+      }
+    }
+
+    std::vector<std::unique_ptr<cudf::column>> out_cols;
+    out_cols.reserve(3);
+    out_cols.push_back(std::move(tj.query_rows));  // local left-row index for each edge
+    out_cols.push_back(std::move(col0));
+    out_cols.push_back(std::move(tj.distances));
+    auto out_table = std::make_unique<cudf::table>(std::move(out_cols));
+
+    auto batch = sirius::make_data_batch(std::move(out_table), *mem_space, stream, batch_telemetry());
+    std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
+    batches.push_back(std::move(batch));
+    return std::make_unique<partitioned_operator_data>(std::move(batches), left_idx);
+  }
+
   auto knn = vss::brute_force_knn(res, dataset, queries, k_eff, metric, mr);
 
   // On the fast path, the neighbor stores the actual right table's id values. It is widened
