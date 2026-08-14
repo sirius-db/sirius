@@ -30,6 +30,7 @@ This file records where each register group stands NOW, with bring-up evidence.
 | new (unlisted) | Concurrent `drain_after_error` from two failing queries hit `std::terminate` in `itask_executor::resume_manager` (`std::thread` assigned over a joinable manager thread). `_manager_lifecycle_mutex` now serializes `stop()`/`drain_and_wait()`/`wait_and_drain_query()`. |
 | B1 | The TIER-2 RAII re-push no longer re-derives the task's queue keys through the plan (`index_keys_for` → `pipe->get_source()->type`, freed once teardown destroyed the plan). `convertible_gpu_pipeline_task` captures `exec::index_keys` at extraction time (task still in the queue ⇒ plan alive) and uses them verbatim for both the lifecycle-gate lookup and a new key-supplied `multi_index_priority_queue::push` overload — mirroring `task_creation_request`'s pre-resolved keys. `run_mandatory_cleanup` also re-sweeps the query's queues once after the downgrade drains join every wrapper, closing the check-then-push race against `quiesce()`. Deterministic unit tests in `test_convertible_gpu_pipeline_task.cpp` fail pre-fix. |
 | B5 | The plan now dies AFTER the drains. `sirius_interface::end_query_internal` parks the engine + `sirius_prepared_statement_data` (which owns the plan tree the collector references) on `SiriusContext` via `retire_query_plan()`; `run_mandatory_cleanup` destroys them once every drain for the query has run, still before the repository erase (operators die while their wired repositories exist). Backstop paths (`drop_query_runtime_state_best_effort`, `terminate()`) clear parked state too. `[teardown_races]` harness scenario exercises the B1/B5 interlock. |
+| F1 | The queues' dispatch pops now round-robin across query bands instead of following the packed priority order: `multi_index_priority_queue::pop()` and the front `try_pop_from(gpu_index)` remember the last query served and serve the next live query id (wrapping) its best-priority task, under the queue's existing mutex. Within a query the order is untouched; single-query behavior is bit-identical (whole legacy suite). Covers the task_creator queue, the task_scheduler dispatch, and the GPU executors' staging queues in one change; back/predicate pops (downgrade-victim selection) keep strict order. `query_priority_bits()` packing stays — it now provides band separation for the per-query indexes, not cross-query precedence. Evidence: `test_concurrent_fairness.cpp` — heavy query admitted first beside 16 shorts, 1 GiB pool: before 0/16 shorts completed while it ran (first-short latency ~2.1 s vs 3.5 ms baseline); after 16/16 (median 13 ms), heavy elapsed unchanged within noise. |
 
 ## MUST FIX — live now, with bring-up evidence
 
@@ -50,18 +51,15 @@ Ranked; the first cluster currently hangs a test.
    SET-vs-execution. E4 (transparent prepared statement `mutable
    logical_plan_`) is the sharpest: two concurrent EXECUTEs of one prepared
    statement is an ordinary workload. E1/E2 need at least torn-read safety
-   (atomics / snapshot-at-window-begin); E2's `std::string` statics can UAF.
+   (atomics / snapshot-at-window-begin); E2's `std::string` static variables can UAF.
 4. **D5 — `runtime_unavailable_` process-wide latch.** With N queries, one
    unlucky cleanup poisons N−1 healthy queries and every future one. Needs a
    per-query verdict plus a separate genuinely-shared-corruption latch.
 5. **B9 — `get_repository()` unlocked map reference.** Trivial to hit with
    two queries creating/clearing repositories; trivial to fix (take `_mutex`,
    return by value/shared_ptr — cucascade change).
-6. **F1 — absolute cross-query priority.** Query 1 starves query 2 by
-   construction; under memory pressure it can livelock (1 waits on memory only
-   2 can release, 2 never dispatches). Becomes visible the moment workloads
-   are heavier than the bring-up shapes. Needs round-robin/aging across query
-   bands in the queue pop.
+6. ~~**F1 — absolute cross-query priority.**~~ FIXED (round-robin across query
+   bands in the queue pops), see above.
 
 ## DEFER — real but not blocking correctness bring-up
 
