@@ -54,14 +54,18 @@ enum class query_id_t : std::uint32_t {};
 /**
  * @brief The task-scheduling priority contribution of a query: its id in the high 32 bits.
  *
- * The task priority queue pops the LOWEST value first, so packing the id above the
- * within-query pipeline rank makes every task of an earlier query dispatch before any task of
- * a later one, while the low 32 bits preserve pipeline order within a query.
+ * Packing the id above the within-query pipeline rank gives every query a contiguous,
+ * NON-OVERLAPPING band of priorities: the low 32 bits preserve pipeline order within a query,
+ * and the queues' per-query indexes rely on the banding to group one query's levels together.
+ * Cross-query dispatch order is NOT the raw value order — the queues' fair pops rotate
+ * round-robin across query bands (see multi_index_priority_queue), because popping strictly
+ * lowest-first would let every task of an earlier query outrank every task of a later one and
+ * starve it (issue F1 in the concurrency register).
  *
  * Masked to 31 bits because the priority is a SIGNED 64-bit value: an id with bit 31 set would
- * shift into the sign bit and invert the ordering. Scheduling order therefore wraps every 2^31
- * queries in a single process — at that point a fresh query sorts ahead of older in-flight
- * ones. That is a known limitation of packing the id into the priority at all.
+ * shift into the sign bit and break the banding. Band VALUES therefore wrap every 2^31 queries
+ * in a single process; since the fair pops rotate over live queries by id rather than trusting
+ * the value order, a wrapped id only shifts the rotation's starting point.
  */
 [[nodiscard]] constexpr std::int64_t query_priority_bits(query_id_t id) noexcept
 {

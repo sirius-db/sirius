@@ -62,8 +62,10 @@ TEST_CASE("query_id: priority bits place the id above the pipeline rank", "[quer
 
 TEST_CASE("query_id: an earlier query always sorts before a later one", "[query_id]")
 {
-  // The priority queue pops the lowest value first, so every task of query N (even its last
-  // pipeline) must sort ahead of query N+1's first pipeline.
+  // Value-order band separation: every task of query N (even its last pipeline) must sort
+  // ahead of query N+1's first pipeline, so the queries' priority bands never interleave.
+  // The queues' per-query indexes rely on this; cross-query DISPATCH order does not follow
+  // the raw values — the fair pops rotate across bands (multi_index_priority_queue).
   constexpr std::int64_t max_rank = 0xFFFF'FFFF;
   const auto earlier_last         = query_priority_bits(make_query_id(5)) | max_rank;
   const auto later_first          = query_priority_bits(make_query_id(6));

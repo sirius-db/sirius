@@ -104,6 +104,21 @@ struct index_keys {
  * number of in-flight pipelines) plus O(1) list work — never O(log N) in the task
  * count.
  *
+ * Cross-query fairness (register issue F1): the dispatch-order pops — pop() and
+ * the front try_pop_from(gpu_index) — round-robin across queries instead of
+ * strictly following the global priority order. The queue remembers the last
+ * query it served and serves the next live query (ascending query id, wrapping)
+ * that has eligible work, taking that query's best-priority task; WITHIN a query
+ * the relative order is exactly the strict one. With a single live query this
+ * degenerates to the strict-priority order, bit-identical to the pre-fairness
+ * queue. Without the rotation, the scheduler's priority encoding (query id in
+ * the high bits) would let every task of an earlier query outrank every task of
+ * a later one — the later query starves, and under memory pressure the pair can
+ * livelock (the early query waiting on memory only the starved one's completion
+ * could release). Back pops (pop_back, try_pop_back, try_pop_back_from) and the
+ * predicate pops (try_pop_if, mutable_pop_if — downgrade-victim selection) keep
+ * strict global order: they are not dispatch.
+ *
  * The queue is thread-safe: every operation takes an internal mutex, so any mix of
  * producers and consumers may call it concurrently. pop() / pop_back() block until
  * a task is available (or the queue is interrupted, returning nullptr). The
@@ -140,6 +155,10 @@ class multi_index_priority_queue {
     std::list<node> tasks;
   };
   using level_map = std::map<queue_priority, level>;
+
+  /// query -> the set of its live levels. Ordered by query id so the fair pops
+  /// can rotate deterministically (upper_bound on the last-served id, wrapping).
+  using query_level_map = std::map<query_key, std::set<queue_priority>>;
 
   /// The per-task record. Lives inside its level's list; caches its own position
   /// in that list and in its device bucket so removal is O(1) on both.
@@ -261,14 +280,22 @@ class multi_index_priority_queue {
     return nullptr;
   }
 
-  /// Blocks until the globally-first (lowest-priority-value) task is available and
-  /// returns it, or returns nullptr if the queue is interrupted while empty.
+  /// Blocks until a task is available and returns the round-robin fair pick: the
+  /// best-priority (lowest-value) task of the next live query after the last one
+  /// a fair pop served, wrapping (see the class doc). With one live query this is
+  /// exactly the globally-first task. Returns nullptr if the queue is interrupted
+  /// while empty.
   [[nodiscard]] task_ptr pop()
   {
     std::unique_lock<std::mutex> lock(_mutex);
     _cv.wait(lock, [this] { return !_levels.empty() || !_active; });
     if (_levels.empty()) { return nullptr; }
-    return extract_node(&_levels.begin()->second.tasks.front());
+    // Read the pick out of the band iterator BEFORE extracting: extraction can
+    // empty the level and erase the query's _query_levels entry.
+    const auto qit            = next_query_band();
+    const queue_priority prio = *qit->second.begin();
+    mark_served(qit->first);
+    return extract_node(&_levels.at(prio).tasks.front());
   }
 
   /// Blocks until the queue is non-empty, without extracting — the caller
@@ -320,10 +347,12 @@ class multi_index_priority_queue {
     return pop_from_levels(_query_levels, idx.value, /*front=*/true);
   }
   /// gpu_index{no_preferred_device} (-1) selects tasks with no preferred device.
+  /// Round-robin fair across the queries with work staged for this device; within
+  /// the chosen query, its lowest-priority task for the device (FIFO in a level).
   [[nodiscard]] std::optional<task_ptr> try_pop_from(const gpu_index& idx)
   {
     std::lock_guard<std::mutex> lock(_mutex);
-    return pop_from_device(idx.id, /*front=*/true);
+    return pop_from_device_fair(idx.id);
   }
 
   /// Removes and returns the last (highest-priority, then most-recent) task with
@@ -339,10 +368,12 @@ class multi_index_priority_queue {
     return pop_from_levels(_query_levels, idx.value, /*front=*/false);
   }
   /// gpu_index{no_preferred_device} (-1) selects tasks with no preferred device.
+  /// Strict global order (highest priority, most recent) — back pops are
+  /// downgrade-victim selection, not dispatch, so no fairness rotation.
   [[nodiscard]] std::optional<task_ptr> try_pop_back_from(const gpu_index& idx)
   {
     std::lock_guard<std::mutex> lock(_mutex);
-    return pop_from_device(idx.id, /*front=*/false);
+    return pop_back_from_device(idx.id);
   }
 
   /// Removes and returns the first task -- in pop order (lowest priority, then
@@ -611,14 +642,62 @@ class multi_index_priority_queue {
     return std::nullopt;
   }
 
-  /// Pops the front (lowest-priority bucket) or back task preferring a device.
-  std::optional<task_ptr> pop_from_device(device_key dev, bool front)
+  /// The query band the next fair pop serves: the first live query with an id
+  /// strictly greater than the last-served one, wrapping to the lowest.
+  /// Precondition: _query_levels is non-empty. Callers must finish reading
+  /// through the returned iterator before any extraction that could empty the
+  /// band and erase its entry.
+  typename query_level_map::iterator next_query_band()
+  {
+    auto it =
+      _has_last_served ? _query_levels.upper_bound(_last_served_query) : _query_levels.begin();
+    if (it == _query_levels.end()) { it = _query_levels.begin(); }
+    return it;
+  }
+
+  /// Records the query a fair pop served, advancing the round-robin rotation.
+  void mark_served(query_key query)
+  {
+    _last_served_query = query;
+    _has_last_served   = true;
+  }
+
+  /// Fair front pop for one device: visits queries in rotation order and serves
+  /// the first one with work staged for @p dev, taking its lowest-priority task
+  /// (FIFO within the level). A query's levels occupy a contiguous priority band
+  /// (see index_keys), so its lowest bucket for this device — if any — is the
+  /// first device bucket at or above the band's minimum; the level's qid check
+  /// keeps the match exact instead of trusting the encoding. With one live query
+  /// this is exactly the pre-fairness front pop.
+  std::optional<task_ptr> pop_from_device_fair(device_key dev)
+  {
+    const auto dit = _by_device.find(dev);
+    if (dit == _by_device.end() || dit->second.empty()) { return std::nullopt; }
+    auto& buckets = dit->second;
+    auto qit      = next_query_band();
+    for (std::size_t remaining = _query_levels.size(); remaining > 0; --remaining) {
+      const auto& band = qit->second;  // never empty: emptied bands are pruned
+      for (auto bit = buckets.lower_bound(*band.begin());
+           bit != buckets.end() && bit->first <= *band.rbegin();
+           ++bit) {
+        if (_levels.at(bit->first).qid == qit->first) {
+          mark_served(qit->first);
+          return extract_node(bit->second.front());
+        }
+      }
+      if (++qit == _query_levels.end()) { qit = _query_levels.begin(); }
+    }
+    return std::nullopt;
+  }
+
+  /// Pops the back task (highest-priority bucket, most recent) preferring a
+  /// device. Strict global order: back pops select downgrade victims, and the
+  /// least-urgent task overall is the right victim regardless of fairness.
+  std::optional<task_ptr> pop_back_from_device(device_key dev)
   {
     const auto it = _by_device.find(dev);
     if (it == _by_device.end() || it->second.empty()) { return std::nullopt; }
-    const auto pit = front ? it->second.begin() : std::prev(it->second.end());
-    node* n        = front ? pit->second.front() : pit->second.back();
-    return extract_node(n);
+    return extract_node(std::prev(it->second.end())->second.back());
   }
 
   /// Front or back task of the level at `prio`. The level is never empty here.
@@ -700,13 +779,20 @@ class multi_index_priority_queue {
   mutable std::condition_variable _cv;  ///< mutable so const wait() can block on it
   bool _active{true};                   ///< false after interrupt(): blocked pops stop waiting.
 
-  level_map _levels;  ///< Spine: priority -> level.
-  std::unordered_map<query_key, std::set<queue_priority>> _query_levels;  ///< query -> its levels.
+  level_map _levels;              ///< Spine: priority -> level.
+  query_level_map _query_levels;  ///< query -> its levels, ordered for the fair pops.
   std::unordered_map<operator_key, std::set<queue_priority>>
     _operator_levels;           ///< operator -> its levels.
   device_index_map _by_device;  ///< device -> prio -> tasks.
   key_extractor _extract;
   std::size_t _size{0};
+
+  /// Round-robin cursor of the fair pops (pop() / front try_pop_from(gpu_index)):
+  /// the query served most recently. Guarded by _mutex like everything else. A
+  /// drained or finished cursor query is harmless — next_query_band() selects by
+  /// upper_bound, so a stale id just means "start from the next higher one".
+  query_key _last_served_query{};
+  bool _has_last_served{false};
 };
 
 }  // namespace sirius::exec
