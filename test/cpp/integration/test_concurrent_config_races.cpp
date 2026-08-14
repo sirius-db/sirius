@@ -85,33 +85,29 @@ void run_racers(int n_threads, const std::function<void(int)>& body)
 }  // namespace
 
 TEST_CASE("adversarial: one prepared statement EXECUTEd concurrently and repeatedly",
-          "[concurrency][adversarial][prepared][isolated_context][!mayfail]")
+          "[concurrency][adversarial][prepared][isolated_context]")
 {
-  // E4's workload: PREPARE once, EXECUTE many times from several threads.
-  // DuckDB's ClientContext lock serializes the executions internally, so the
-  // sharp UAF window (copy_logical_plan vs logical_plan_.reset()) needs the
-  // reset path (non-serializable plan) to open fully — but the repeated-reuse
-  // path (fresh Sirius physical plan per EXECUTE off one shared mutable
-  // logical_plan_) is exercised on every iteration, from alternating threads,
-  // in all three DuckDB entry forms: C++ materialized, C++ streaming, and SQL
-  // PREPARE/EXECUTE.
+  // E4's workload: PREPARE once, EXECUTE many times from several threads, in
+  // all three DuckDB entry forms: C++ materialized, C++ streaming, and SQL
+  // PREPARE/EXECUTE. The shared PhysicalSiriusExecution is immutable across
+  // executions since the E4 fix (per-execution plan capture; no
+  // logical_plan_.reset() from the const source path), so every EXECUTE must
+  // rebuild its own Sirius plan and ENGAGE the GPU — correctness alone would
+  // also pass on a silently retained CPU plan, hence the per-phase
+  // executions-delta equalities below.
   //
-  // KNOWN FAILURE on integration/concurrency-full (2026-08-14), hence
-  // [!mayfail]: the final GPU-engagement REQUIRE fails. Signature:
-  //   phase 0 (single streaming EXECUTE): executions delta=1  -> streaming
-  //     alone transparently executes on the GPU;
-  //   phase A (3 threads, materialized): 45/45 executions+rebinds;
-  //   phase C (2 threads, SQL EXECUTE):  30/30 executions+rebinds;
-  //   phase B (2 threads, STREAMING):    ok=16 correct results but
-  //     executions delta = 0, successful_rebinds = 2/30,
-  //     plan_time_fallbacks = 0, runtime_fallbacks = 0.
-  // I.e. when a streaming EXECUTE's bind overlaps a sibling's still-draining
-  // transparent execution window on the SAME connection, the bind silently
-  // skips Sirius (no capture, no rebind, no fallback accounting) and the
-  // query runs DuckDB's retained CPU plan. Results stay correct; GPU
-  // engagement and observability are silently lost. Register: E4-family
-  // (shared prepared-statement state; per-connection capture/guard state
-  // raced by concurrent EXECUTEs).
+  // The register's earlier failure signature for this scenario ("streaming
+  // EXECUTEs silently skip Sirius") was misattributed: instrumenting every
+  // decline path shows streaming EXECUTEs engage on every iteration (the GPU
+  // run completes inside Execute()'s single ClientContext lock hold, before
+  // any sibling can invalidate the stream), while SQL-level EXECUTE never
+  // engages — PREPARE/EXECUTE bypasses OnFinalizePrepare entirely (the PREPARE
+  // statement itself is not a SELECT, and Binder::Bind(ExecuteStatement)
+  // re-plans via Planner::PrepareSQLStatement, which has no finalize hook).
+  // That is a pre-existing, single-threaded transparency limitation, not a
+  // race — see the note in test_transparent_runtime_fallback.cpp. Phase C
+  // therefore asserts correctness under contention plus ZERO transparent
+  // engagement, so a future PREPARE/EXECUTE interception flips it consciously.
   scoped_watchdog dog("prepared double-EXECUTE", scenario_timeout(600));
 
   adversarial_env env;
@@ -181,6 +177,11 @@ TEST_CASE("adversarial: one prepared statement EXECUTEd concurrently and repeate
     });
     phase_a_execs = static_cast<std::uint64_t>(3) * iters;
   }
+  const auto stats_after_phase_a = env.sirius_ctx->get_transparent_execution_stats();
+  INFO("phase A: executions delta="
+       << (stats_after_phase_a.executions - stats_after_phase0.executions));
+  // Every materialized EXECUTE ran through the Sirius operator exactly once.
+  REQUIRE(stats_after_phase_a.executions - stats_after_phase0.executions == phase_a_execs);
 
   // Phase B — C++ API, STREAMING results, 2 threads on one PreparedStatement.
   // DuckDB invalidates an open stream when the next query starts on the same
@@ -247,8 +248,18 @@ TEST_CASE("adversarial: one prepared statement EXECUTEd concurrently and repeate
   for (const auto& s : invalidated_samples) {
     UNSCOPED_INFO("phase B tolerated error sample: " << s);
   }
-  INFO("phase B: ok=" << phase_b_ok.load() << " invalidated=" << phase_b_invalidated.load());
+  const auto stats_after_phase_b = env.sirius_ctx->get_transparent_execution_stats();
+  INFO("phase B: ok=" << phase_b_ok.load() << " invalidated=" << phase_b_invalidated.load()
+                      << " executions delta="
+                      << (stats_after_phase_b.executions - stats_after_phase_a.executions));
   REQUIRE(phase_b_ok.load() >= 1);
+  // THE E4 assertion: every streaming EXECUTE engaged the GPU — including the
+  // ones whose stream a sibling later invalidated (the transparent execution
+  // completes inside Execute()'s lock hold, before the stream is exposed).
+  // Equality keeps this a live tripwire in both directions: a silent CPU
+  // degrade AND a double-execution both trip it.
+  REQUIRE(stats_after_phase_b.executions - stats_after_phase_a.executions ==
+          static_cast<std::uint64_t>(2) * iters);
 
   // Phase C — SQL PREPARE / EXECUTE, 2 threads sharing the SAME connection.
   std::uint64_t phase_c_execs = 0;
@@ -281,24 +292,34 @@ TEST_CASE("adversarial: one prepared statement EXECUTEd concurrently and repeate
                      << " plan_time_fallbacks=" << (stats.fallbacks - stats_after_phase0.fallbacks)
                      << " successful_rebinds="
                      << (stats.successful_rebinds - stats_after_phase0.successful_rebinds));
-  // Every successful iteration must have gone through the Sirius operator —
-  // a prepared statement that silently degraded to a CPU plan would pass on
-  // correctness alone.
-  REQUIRE(stats.executions - stats_after_phase0.executions >=
-          phase_a_execs + static_cast<std::uint64_t>(phase_b_ok.load()) + phase_c_execs);
+  // SQL-level PREPARE/EXECUTE is NOT intercepted by Sirius (pre-existing
+  // single-threaded limitation, see the test header): phase C's value here is
+  // correctness under contention (checked per-iteration above). Assert the
+  // zero engagement so a future PREPARE/EXECUTE interception — or a regression
+  // that starts double-counting — flips this consciously.
+  (void)phase_c_execs;
+  REQUIRE(stats.executions - stats_after_phase_b.executions == 0);
+  // No mid-flight plan was corrupted into the runtime-fallback path anywhere.
   REQUIRE(stats.runtime_fallbacks - stats_after_phase0.runtime_fallbacks == 0);
+  REQUIRE(stats.fallbacks - stats_after_phase0.fallbacks == 0);
 }
 
-TEST_CASE("adversarial: SET on operator params races concurrent executions",
+TEST_CASE("adversarial: SET storm on operator params races concurrent executions",
           "[concurrency][adversarial][config_race][isolated_context]")
 {
-  // One worker hammers `SET scan_task_batch_size` (E1: plain struct written
-  // mid-flight, also reshapes scan batching under everyone's feet) and
-  // `SET expression_evaluator_strategy` (E2: process-wide static read as a
-  // default argument between two operators of a peer's plan) while the other
-  // workers run verified queries. Results must stay correct under every
-  // torn/interleaved combination; a runtime fallback here means a strategy
-  // switch corrupted a mid-flight plan.
+  // E1/E2 torn-read regression: one worker hammers a rotation across the FULL
+  // SET-mutable surface — operator_params sizing knobs (E1: one shared struct,
+  // previously written mid-flight under everyone's plans), plan-shape toggles
+  // (dynamic filter pushdown, runtime distinct build-probe) and the
+  // process-global expression_evaluator_strategy (E2: previously re-read as a
+  // default argument BETWEEN two operators of a peer's plan) — while the other
+  // workers run verified queries.
+  //
+  // With SNAPSHOT-AT-WINDOW-BEGIN, each query freezes the whole config at
+  // admission: results must stay correct under every interleaving, no query
+  // may fall back at runtime (a runtime fallback here means a mid-flight plan
+  // was corrupted), and every query must still engage the GPU (a torn sizing
+  // read that poisons plan generation would surface as a plan-time fallback).
   scoped_watchdog dog("SET-vs-execution race", scenario_timeout(600));
 
   adversarial_env env;
@@ -310,12 +331,36 @@ TEST_CASE("adversarial: SET on operator params races concurrent executions",
   const int set_iters     = env_int("SIRIUS_TEST_SET_RACE_SET_ITERS", 60);
 
   auto set_sql = [](int i) -> std::string {
-    switch (i % 4) {
-      case 0: return "SET scan_task_batch_size = 262144";
-      case 1: return "SET expression_evaluator_strategy = 'materialize'";
-      case 2: return "SET scan_task_batch_size = 100000000";
-      default: return "SET expression_evaluator_strategy = 'ast_interpret'";
-    }
+    // Alternate every knob between a small/perturbing value and its
+    // config-default-ish value so mid-storm admissions see wildly different
+    // — but each internally consistent — snapshots.
+    static const std::vector<std::string> statements = {
+      "SET scan_task_batch_size = 262144",
+      "SET expression_evaluator_strategy = 'materialize'",
+      "SET hash_partition_bytes = 4194304",
+      "SET max_build_hash_table_bytes = 1048576",
+      "SET enable_dynamic_filter_pushdown = false",
+      "SET concat_batch_bytes = 4194304",
+      "SET max_sort_partition_bytes = 8388608",
+      "SET sort_sample_bytes = 1048576",
+      "SET enable_runtime_distinct_build_probe = false",
+      "SET mark_join_build_switch_ratio = 1.0",
+      "SET dynamic_filter_keep_threshold = 0.1",
+      "SET max_broadcast_join_size = 1048576",
+      "SET scan_task_batch_size = 100000000",
+      "SET expression_evaluator_strategy = 'ast_interpret'",
+      "SET hash_partition_bytes = 100000000",
+      "SET max_build_hash_table_bytes = 90000000",
+      "SET enable_dynamic_filter_pushdown = true",
+      "SET concat_batch_bytes = 100000000",
+      "SET max_sort_partition_bytes = 0",
+      "SET sort_sample_bytes = 100000000",
+      "SET enable_runtime_distinct_build_probe = true",
+      "SET mark_join_build_switch_ratio = 8.0",
+      "SET dynamic_filter_keep_threshold = 0.9",
+      "SET max_broadcast_join_size = 268435456",
+    };
+    return statements[static_cast<std::size_t>(i) % statements.size()];
   };
 
   auto failures = run_workers(
@@ -335,9 +380,71 @@ TEST_CASE("adversarial: SET on operator params races concurrent executions",
   const auto stats = env.sirius_ctx->get_transparent_execution_stats();
   INFO("executions=" << (stats.executions - stats_before.executions) << " runtime_fallbacks="
                      << (stats.runtime_fallbacks - stats_before.runtime_fallbacks)
+                     << " plan_time_fallbacks=" << (stats.fallbacks - stats_before.fallbacks)
                      << " peak=" << env.sirius_ctx->query_lifecycle_peak());
   REQUIRE(stats.executions - stats_before.executions >=
           static_cast<std::uint64_t>(query_workers) * query_iters);
   REQUIRE(stats.runtime_fallbacks - stats_before.runtime_fallbacks == 0);
+  // A torn sizing read poisoning plan generation would surface here: all four
+  // shapes are GPU-supported under every value in the storm rotation.
+  REQUIRE(stats.fallbacks - stats_before.fallbacks == 0);
   if (slots() > 1) { REQUIRE(env.sirius_ctx->query_lifecycle_peak() > 1); }
+}
+
+TEST_CASE("adversarial: concurrent gpu_execution() executions restore the connection config",
+          "[concurrency][adversarial][config_race][isolated_context]")
+{
+  // E7: SiriusTableFunctionData used to save/restore ClientConfig on SHARED
+  // bind data — two executions of one gpu_execution(...) prepared statement
+  // could clobber each other's saved copy, leaving the connection with
+  // enable_optimizer permanently flipped. The save/restore is per-execution
+  // (RAII on the executing stack) now; this scenario runs many overlapping
+  // executions of ONE prepared statement on a connection whose
+  // enable_optimizer differs from the value gpu_execution installs while
+  // planning, then asserts the connection got its own value back.
+  scoped_watchdog dog("gpu_execution config restore", scenario_timeout(600));
+
+  adversarial_env env;
+  duckdb::Connection con(*env.db);
+
+  // gpu_execution's ExtractPlan installs enable_optimizer = true while it
+  // plans; start from FALSE so a clobbered restore is observable.
+  con.context->config.enable_optimizer = false;
+
+  const std::string& sql = env.shapes[2];  // scalar aggregate: order-stable
+  const std::string& ref = env.reference[2];
+  auto stmt              = con.Prepare("SELECT * FROM gpu_execution('" + sql + "')");
+  REQUIRE_FALSE(stmt->HasError());
+
+  const int iters = env_int("SIRIUS_TEST_GPU_EXECUTION_ITERS", 10);
+  std::mutex failures_mutex;
+  std::vector<std::string> failures;
+
+  run_racers(2, [&](int tid) {
+    for (int i = 0; i < iters; ++i) {
+      duckdb::vector<duckdb::Value> values;
+      auto r = stmt->Execute(values, /*allow_stream_result=*/false);
+      if (r->HasError()) {
+        std::lock_guard<std::mutex> lock(failures_mutex);
+        failures.push_back("thread " + std::to_string(tid) + " iter " + std::to_string(i) +
+                           " ERROR: " + r->GetError());
+        continue;
+      }
+      if (auto got = materialize(*r); got != ref) {
+        std::lock_guard<std::mutex> lock(failures_mutex);
+        failures.push_back("thread " + std::to_string(tid) + " iter " + std::to_string(i) +
+                           " WRONG RESULT:\n--- got ---\n" + got + "\n--- expected ---\n" + ref);
+      }
+    }
+  });
+  require_no_failures(failures);
+
+  // The E7 assertion: after every execution's save/restore has unwound, the
+  // connection still has ITS configuration — not a value some overlapping
+  // execution saved mid-plan and wrote back last.
+  REQUIRE(con.context->config.enable_optimizer == false);
+
+  // And the mid-plan flip never leaked to a peer connection's config either.
+  duckdb::Connection peer(*env.db);
+  REQUIRE(peer.context->config.enable_optimizer == true);
 }
