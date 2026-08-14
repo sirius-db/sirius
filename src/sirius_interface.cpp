@@ -121,6 +121,32 @@ duckdb::ErrorData sirius_interface::end_query_internal(bool success, bool invali
 {
   sirius_active_query->progress_bar.reset();
   D_ASSERT(sirius_active_query.get());
+  // Do NOT destroy the engine (and with it sirius_owned_plan) here. This runs BEFORE the
+  // execution window's finish() drains the query's queues, and sirius_pipeline::source/
+  // operators/sink are non-owning pointers into that plan: any task destroyed by those drains
+  // (a straggler in a queue, a TIER-2 downgrade returning or dropping an extracted task) walks
+  // them in ~gpu_pipeline_task -> mark_task_completed -> notify_downstream_pipelines. Park the
+  // plan's owners — the engine and the prepared-statement data whose sirius_physical_plan the
+  // result collector references — on the SiriusContext; run_mandatory_cleanup destroys them
+  // once every drain for this query has completed.
+  if (sirius_active_query->engine && sirius_active_query->engine->context.registered_state) {
+    auto sirius_ctx =
+      sirius_active_query->engine->context.registered_state->Get<duckdb::SiriusContext>(
+        "sirius_state");
+    if (sirius_ctx) {
+      // Members are destroyed in reverse declaration order: the engine (whose pipelines and
+      // collector reference the plan tree) goes first, the prepared data owning the tree last.
+      struct retired_query_state {
+        duckdb::shared_ptr<sirius_prepared_statement_data> prepared;
+        duckdb::unique_ptr<sirius_engine> engine;
+      };
+      const auto query_id = sirius_active_query->engine->query_id();
+      auto retired        = std::make_shared<retired_query_state>();
+      retired->prepared   = std::move(sirius_active_query->sirius_prepared);
+      retired->engine     = std::move(sirius_active_query->engine);
+      sirius_ctx->retire_query_plan(query_id, std::move(retired));
+    }
+  }
   sirius_active_query.reset();
   duckdb::ErrorData error;
   return error;

@@ -146,9 +146,9 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
   /**
    * @brief The completion handler to report this query's completion or failure to.
    *
-   * Held by shared_ptr, not by raw pointer, because the owning sirius_engine is destroyed while
-   * the query is being torn down (fetch_result_internal runs before run_mandatory_cleanup drains
-   * the queues). A task still unwinding after that point must be able to report safely, so the
+   * Held by shared_ptr, not by raw pointer, so a task still unwinding during teardown can
+   * report safely no matter where the owning sirius_engine's destruction lands (it is parked by
+   * end_query_internal and destroyed inside run_mandatory_cleanup, after the drains): the
    * handler stays alive as long as any task referencing this state does.
    *
    * Null only for states built outside a query (tests).

@@ -40,6 +40,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -484,6 +485,27 @@ class SiriusContext : public ClientContextState {
     return query_lifecycle_;
   }
 
+  /**
+   * @brief Keep @p query_id's plan owners alive until that query's mandatory cleanup.
+   *
+   * sirius_interface::end_query_internal calls this instead of destroying the sirius_engine
+   * (and the sirius_prepared_statement_data that owns the plan tree) inline. Pipelines and
+   * tasks hold NON-OWNING operator pointers into that plan, and tasks can outlive execute():
+   * stragglers are destroyed by run_mandatory_cleanup's drains, and ~gpu_pipeline_task walks
+   * those pointers (mark_task_completed -> notify_downstream_pipelines). Parking the owners
+   * here inverts the old order — the drains now run BEFORE the plan dies.
+   * run_mandatory_cleanup (or the best-effort backstop) destroys the parked state once every
+   * drain for @p query_id has completed.
+   *
+   * Type-erased so this header does not depend on sirius_engine. Thread-safe. Entries left
+   * behind by a query that never reaches its cleanup are dropped in terminate().
+   */
+  void retire_query_plan(sirius::query_id_t query_id, std::shared_ptr<void> plan_keepalive);
+
+  /// \brief Number of parked plan-keepalive entries (diagnostic; used by tests to prove the
+  /// parked state does not outlive the cleanup).
+  [[nodiscard]] std::size_t retired_query_plan_count() const;
+
   [[nodiscard]] sirius::pipeline::task_scheduler& get_task_scheduler();
   [[nodiscard]] const sirius::pipeline::task_scheduler& get_task_scheduler() const;
 
@@ -630,6 +652,12 @@ class SiriusContext : public ClientContextState {
   /// queued tasks. Each step is separately guarded; neither can throw.
   void drop_query_runtime_state_best_effort(sirius::query_id_t query_id) noexcept;
 
+  /// \brief Destroy any plan state parked by retire_query_plan() for @p query_id. Runs inside
+  /// run_mandatory_cleanup once every drain for the query has completed (and in the
+  /// best-effort teardown); noexcept because the backstop path must not throw and operator
+  /// destructors are not throwing.
+  void destroy_retired_query_plan(sirius::query_id_t query_id) noexcept;
+
   mutable std::mutex mutex_;
   // The Super Sirius runtime is shared across connections. Historically plan
   // generation and engine execution were serialized outright (single-flight
@@ -702,6 +730,13 @@ class SiriusContext : public ClientContextState {
   std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context_;
   /// One data repository manager per in-flight query, keyed by query_id.
   sirius::data::data_repository_manager_registry data_repository_registry_;
+  /// Type-erased plan keepalives parked by retire_query_plan(), destroyed per query inside
+  /// run_mandatory_cleanup after its drains (see destroy_retired_query_plan). A vector per id
+  /// out of caution — production has exactly one engine per window. Guarded by
+  /// retired_query_plans_mutex_. Cleared (with a warning) in terminate() as a backstop for a
+  /// query that never reached its cleanup.
+  mutable std::mutex retired_query_plans_mutex_;
+  std::map<sirius::query_id_t, std::vector<std::shared_ptr<void>>> retired_query_plans_;
   /// Per-query "may work still be enqueued?" gate, consulted by every enqueue point in the
   /// engine. Opened at window begin, quiesced at the top of the query's cleanup so the drains
   /// below it cannot be outrun by a completion callback, and closed once they finish. Declared

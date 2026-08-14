@@ -408,6 +408,41 @@ void SiriusContext::begin_execution_window(ClientContext& context,
   // GPU admission runs later, in sirius_engine::initialize_internal().
 }
 
+void SiriusContext::retire_query_plan(sirius::query_id_t query_id,
+                                      std::shared_ptr<void> plan_keepalive)
+{
+  if (!plan_keepalive) { return; }
+  std::lock_guard<std::mutex> lock(retired_query_plans_mutex_);
+  retired_query_plans_[query_id].push_back(std::move(plan_keepalive));
+}
+
+std::size_t SiriusContext::retired_query_plan_count() const
+{
+  std::lock_guard<std::mutex> lock(retired_query_plans_mutex_);
+  std::size_t count = 0;
+  for (auto const& [id, keepalives] : retired_query_plans_) {
+    count += keepalives.size();
+  }
+  return count;
+}
+
+void SiriusContext::destroy_retired_query_plan(sirius::query_id_t query_id) noexcept
+{
+  // Move the keepalives out under the lock, destroy them outside it: an engine destructor runs
+  // operator/pipeline destructors, and nothing that heavy belongs under a map mutex.
+  std::vector<std::shared_ptr<void>> retired;
+  try {
+    std::lock_guard<std::mutex> lock(retired_query_plans_mutex_);
+    auto it = retired_query_plans_.find(query_id);
+    if (it == retired_query_plans_.end()) { return; }
+    retired = std::move(it->second);
+    retired_query_plans_.erase(it);
+  } catch (...) {  // lock/alloc failure: leave the entry parked; terminate() clears leftovers
+    return;
+  }
+  retired.clear();  // ~sirius_engine -> ~plan; operator destructors are non-throwing
+}
+
 void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::string_view end_tag)
 {
   // Observability inside the cleanup is best-effort: only the mandatory steps
@@ -430,10 +465,12 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // joins that work before returning. Only this query's is touched; other in-flight queries keep
   // creating tasks.
   //
-  // Note the plan those pointers target is ALREADY gone by the time this runs: sirius_engine
-  // owns sirius_owned_plan and is destroyed in sirius_interface::cleanup_internal, which runs
-  // before this window's finish(). So this is not "clean up before the plan dies" — it is
-  // "stop touching a plan that has died".
+  // The plan those pointers target is STILL ALIVE here: sirius_interface::end_query_internal
+  // parks the engine (and the prepared-statement data owning the plan tree) on this context via
+  // retire_query_plan() instead of destroying them, precisely so these drains — each of which
+  // destroys tasks whose destructors walk raw operator pointers
+  // (~gpu_pipeline_task -> mark_task_completed -> notify_downstream_pipelines) — run before the
+  // plan dies. The parked state is destroyed below, after the last drain.
   if (task_creator_) { task_creator_->reset(query_id); }
 
   // With the producer stopped, drop whatever it already queued for this query, for the same
@@ -445,6 +482,20 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   for (auto& executor : downgrade_executors_) {
     executor->drain();
   }
+
+  // The downgrade drains just joined every TIER-2 conversion in flight, and each wrapper's RAII
+  // re-push consults the (now quiescing) gate — but a wrapper that read the gate as open
+  // immediately before quiesce() landed can have pushed a task back behind the sweep above.
+  // With the wrappers all gone, one more sweep makes the queues definitively empty of this
+  // query's tasks; nothing can re-add them past this point.
+  if (task_scheduler_) { task_scheduler_->drain_query_tasks(query_id); }
+
+  // Every drain that can destroy one of this query's tasks has now run, so the plan is no
+  // longer reachable from any task — destroy the parked engine/plan (see retire_query_plan).
+  // This must stay BEFORE the repository erase below so that operators are destroyed while the
+  // repositories they were wired to still exist, matching the order the engine's inline
+  // destruction used to provide.
+  destroy_retired_query_plan(query_id);
 
   // Close out batch placements still alive (un-consumed repo contents,
   // result-collector outputs) before their repositories are cleared.
@@ -558,6 +609,11 @@ void SiriusContext::drop_query_runtime_state_best_effort(sirius::query_id_t quer
     if (scan_manager_) { scan_manager_->reset(query_id); }
   } catch (...) {
   }
+  // Same placement as the main path: after the drain attempts, before the repository erase. The
+  // failed cleanup may have parked the engine and then thrown before destroying it; once the
+  // runtime is latched unavailable no later window would ever drop it, and the engine holds a
+  // ClientContext reference that must not outlive the connection. noexcept.
+  destroy_retired_query_plan(query_id);
   // Drop this query's repositories. run_mandatory_cleanup does this on the normal path, but this
   // function runs precisely when that threw part-way — and once the runtime is latched
   // unavailable no later window will ever run it. Without this the failed query's manager, and
@@ -1013,6 +1069,25 @@ void SiriusContext::terminate()
   task_creator_->stop_thread_pool();
   for (auto& executor : downgrade_executors_) {
     executor->stop();
+  }
+  // Backstop for parked plans whose query never reached its cleanup (a window that vanished
+  // without finish() or the destructor backstop — should be impossible by construction).
+  // Destroyed here, after every worker that could hold a task is stopped and while the
+  // repositories and memory manager are still alive, mirroring the per-query order.
+  {
+    std::map<sirius::query_id_t, std::vector<std::shared_ptr<void>>> leftovers;
+    {
+      std::lock_guard<std::mutex> lock(retired_query_plans_mutex_);
+      leftovers.swap(retired_query_plans_);
+    }
+    for (auto const& [query_id, keepalives] : leftovers) {
+      SIRIUS_LOG_WARN(
+        "SiriusContext::terminate: query {} still had {} parked plan keepalive(s); its cleanup "
+        "never ran",
+        query_id,
+        keepalives.size());
+    }
+    leftovers.clear();
   }
   // Only now is nothing left holding a pointer into the scheduler.
   task_scheduler_.reset();
