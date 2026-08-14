@@ -85,7 +85,7 @@ std::uint64_t default_pool_bytes()
 std::string concurrent_config_yaml(std::uint64_t gpu_pool_bytes = 0)
 {
   // gpu_pool_bytes == 0: the shared-GPU-friendly default above. Non-zero: an
-  // absolute cap, used by the memory-pressure scenario to force downgrades.
+  // absolute cap, used by the memory-pressure scenarios to force downgrades.
   if (gpu_pool_bytes == 0) { gpu_pool_bytes = default_pool_bytes(); }
   std::string gpu_mem = "      usage_limit_bytes: " + std::to_string(gpu_pool_bytes);
   return R"(sirius:
@@ -410,6 +410,73 @@ TEST_CASE("concurrent queries stay correct under GPU memory pressure",
                      << " runtime_fallbacks=" << stats.runtime_fallbacks
                      << " peak=" << env.sirius_ctx->query_lifecycle_peak());
   REQUIRE(stats.executions >= query_shapes().size());
+}
+
+TEST_CASE(
+  "query teardown races in-flight downgrades without resurrecting or dereferencing "
+  "a dead plan",
+  "[concurrency][memory_pressure][teardown_races][isolated_context]")
+{
+  // The B1/B5 interlock. A tiny GPU pool keeps the downgrade monitor firing
+  // (10ms period), so TIER-2 sweeps repeatedly extract queued tasks from the
+  // shared scheduler queue and carry them across blocking conversion windows.
+  // Meanwhile worker 0 runs a shape that FAILS on the GPU at runtime every
+  // iteration, so error-path teardowns (quiesce -> drains -> plan destruction)
+  // land continuously while peers' tasks are mid-extraction. Pre-fix, two
+  // things could go wrong in that window:
+  //   - B1: the TIER-2 RAII re-push re-derived the task's queue keys through
+  //     the plan (pipe->get_source()->type) after the owning query destroyed
+  //     it, and could resurrect the task behind its own drain;
+  //   - B5: the engine (and with it the plan) was destroyed BEFORE the
+  //     window's mandatory cleanup drained the queues, so every task the
+  //     drains destroyed walked freed operator pointers in
+  //     ~gpu_pipeline_task -> mark_task_completed -> notify_downstream_pipelines.
+  // Post-fix the plan is parked until the drains complete and the re-push
+  // uses extraction-time keys, so this must survive with correct results.
+  //
+  // The GPU pool is deliberately tiny (1.5 GB, vs the harness's 4 GiB shared
+  // default; the host pool is the harness default 8 GB) so several test runs
+  // can coexist on a shared box and pressure stays high.
+  constexpr std::uint64_t kTinyPool = 1'500'000'000ULL;  // 1.5 GB
+  concurrent_env env(kTinyPool, /*rows=*/20'000'000);
+
+  const std::string distinct_sql =
+    "SELECT count(DISTINCT k) AS dk, count(DISTINCT v % 101) AS dv FROM fact ORDER BY 1";
+  std::string distinct_ref;
+  {
+    duckdb::Connection con(*env.db);
+    auto r = con.Query(distinct_sql);
+    REQUIRE_FALSE(r->HasError());
+    distinct_ref = materialize(*r);
+  }
+  const auto stats_before = env.sirius_ctx->get_transparent_execution_stats();
+
+  auto failures = run_workers(
+    *env.db,
+    workers(),
+    iters_per_worker(),
+    [&](int wid, int i) {
+      if (wid == 0) { return distinct_sql; }
+      return query_shapes()[(wid + i) % query_shapes().size()];
+    },
+    [&](int wid, int i) {
+      if (wid == 0) { return distinct_ref; }
+      return env.reference[(wid + i) % query_shapes().size()];
+    });
+  require_no_failures(failures);
+
+  const auto stats = env.sirius_ctx->get_transparent_execution_stats();
+  INFO("executions=" << stats.executions << " fallbacks=" << stats.fallbacks
+                     << " runtime_fallbacks=" << stats.runtime_fallbacks
+                     << " peak=" << env.sirius_ctx->query_lifecycle_peak());
+  // The failing worker must actually have exercised the error-path teardown.
+  REQUIRE(stats.runtime_fallbacks - stats_before.runtime_fallbacks >=
+          static_cast<std::uint64_t>(iters_per_worker()));
+
+  // B5 bookkeeping: every parked engine/plan must have been destroyed by its own
+  // query's mandatory cleanup — a leftover means a cleanup never destroyed its plan
+  // (it would then survive, holding GPU memory, until process teardown).
+  REQUIRE(env.sirius_ctx->retired_query_plan_count() == 0);
 }
 
 TEST_CASE("concurrent queries serve from a pinned table across unpin/re-pin churn",
