@@ -27,25 +27,25 @@ This file records where each register group stands NOW, with bring-up evidence.
 | A6 (the live half) | The error-path quiesce bracket (`wait_and_drain_query`) kept the device queue interrupted until `resume_manager()`, BOUNCING co-tenant pushes — a bounced successor = that query hangs (observed: repeatedly-failing query starved 3 healthy ones). Fixed: the queue reactivates the moment the manager join lands, and `itask_executor::schedule` bounce-retries via the new `push_or_bounce` instead of dropping (drop — still loud — only at real shutdown). |
 | C3 | `max_concurrent_queries` is real config (step 12) and the gate reads the same knob, so pool sizing and admission can no longer drift. |
 | G1/G2 (start) | `test_concurrent_queries.cpp`: reusable multi-connection barrier harness (`concurrent_env` + `run_workers`), GPU-engagement assertions (`executions >= N`, `runtime_fallbacks == 0`), `query_lifecycle_peak()` overlap proof, env-tunable slots/workers/pools grid. |
+| new (unlisted) | Concurrent `drain_after_error` from two failing queries hit `std::terminate` in `itask_executor::resume_manager` (`std::thread` assigned over a joinable manager thread). `_manager_lifecycle_mutex` now serializes `stop()`/`drain_and_wait()`/`wait_and_drain_query()`. |
+| B1 | The TIER-2 RAII re-push no longer re-derives the task's queue keys through the plan (`index_keys_for` → `pipe->get_source()->type`, freed once teardown destroyed the plan). `convertible_gpu_pipeline_task` captures `exec::index_keys` at extraction time (task still in the queue ⇒ plan alive) and uses them verbatim for both the lifecycle-gate lookup and a new key-supplied `multi_index_priority_queue::push` overload — mirroring `task_creation_request`'s pre-resolved keys. `run_mandatory_cleanup` also re-sweeps the query's queues once after the downgrade drains join every wrapper, closing the check-then-push race against `quiesce()`. Deterministic unit tests in `test_convertible_gpu_pipeline_task.cpp` fail pre-fix. |
+| B5 | The plan now dies AFTER the drains. `sirius_interface::end_query_internal` parks the engine + `sirius_prepared_statement_data` (which owns the plan tree the collector references) on `SiriusContext` via `retire_query_plan()`; `run_mandatory_cleanup` destroys them once every drain for the query has run, still before the repository erase (operators die while their wired repositories exist). Backstop paths (`drop_query_runtime_state_best_effort`, `terminate()`) clear parked state too. `[teardown_races]` harness scenario exercises the B1/B5 interlock. |
 
 ## MUST FIX — live now, with bring-up evidence
 
 Ranked; the first cluster currently hangs a test.
 
-1. **Failure containment cluster — A7, B1, B2, D6 (A6's live half now fixed,
-   see above).** The error-path test passes, but the remaining four interlock
-   under memory pressure and heavier churn: query-end
+1. **Failure containment cluster — A7, B2, D6 (B1 and A6's live half now
+   fixed, see above).** The error-path test passes, but the remaining three
+   interlock under memory pressure and heavier churn: query-end
    `drain()` cancels PEERS' downgrade promises (A7), `drain()` restarts the
-   processing thread before quiescence is used (B2), the TIER-2 re-push can
-   resurrect a drained task across the blocking conversion window (B1), and a
+   processing thread before quiescence is used (B2), and a
    drain racing the monitor can permanently latch `_monitor_request_enqueued`
    (D6 — kills automatic spilling for the process). William's backed-out
    steps 6+7 (shared-ownership repositories, delete the global drain) are the
    structural fix; the interim path is per-query attribution on downgrade
    requests + scoping `drain_after_error` to the failing query.
-2. **B5 — plan destroyed before the drains.** Upstream of B1's second fault;
-   any resurrected/straggler task dereferences a freed plan on its completion
-   path. Must land with or before the cluster above.
+2. ~~**B5 — plan destroyed before the drains.**~~ FIXED, see above.
 3. **E1/E2/E4/E7 — shared mutable config.** The slot no longer serializes
    SET-vs-execution. E4 (transparent prepared statement `mutable
    logical_plan_`) is the sharpest: two concurrent EXECUTEs of one prepared
