@@ -498,3 +498,140 @@ TEST_CASE("request_free_memory partial fulfillment returns actual bytes freed",
 
   executor.stop();
 }
+
+// ---------------------------------------------------------------------------
+// No-progress coalescing (OOM-retry storm pacing)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Like make_test_executor but with an explicit no-progress cooldown.
+downgrade_executor make_test_executor_with_cooldown(
+  sirius::data::data_repository_manager_registry& repo_registry,
+  cucascade::memory::memory_space* gpu_space,
+  sirius::memory::sirius_memory_reservation_manager& mem_mgr,
+  std::chrono::milliseconds cooldown)
+{
+  sirius::exec::downgrade_executor_config config{
+    .thread_pool                 = {.num_threads = 1, .thread_name_prefix = "downgrade"},
+    .monitor_period              = std::chrono::milliseconds{0},
+    .no_progress_rescan_cooldown = cooldown};
+  return downgrade_executor(config, repo_registry, GPU_SPACE_ID, gpu_space, mem_mgr);
+}
+
+}  // namespace
+
+TEST_CASE("no-progress pass coalesces immediately-following requests", "[downgrade_executor]")
+{
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+
+  auto executor = make_test_executor_with_cooldown(repo_registry, gpu_space, *mem_mgr, 200ms);
+  executor.start();
+
+  // Empty registry: the first request runs a full pass and frees nothing.
+  REQUIRE(executor.request_free_memory_and_wait(1024) == 0);
+  REQUIRE(executor.no_progress_passes() == 1);
+  REQUIRE(executor.coalesced_requests() == 0);
+
+  // A storm of requests inside the cooldown window must NOT rescan: each is
+  // short-circuited to 0 without incrementing no_progress_passes.
+  for (int i = 0; i < 5; ++i) {
+    REQUIRE(executor.request_free_memory_and_wait(1024) == 0);
+  }
+  REQUIRE(executor.no_progress_passes() == 1);
+  REQUIRE(executor.coalesced_requests() == 5);
+
+  // After the cooldown expires the next request runs a full pass again.
+  std::this_thread::sleep_for(250ms);
+  REQUIRE(executor.request_free_memory_and_wait(1024) == 0);
+  REQUIRE(executor.no_progress_passes() == 2);
+  REQUIRE(executor.coalesced_requests() == 5);
+
+  executor.stop();
+}
+
+TEST_CASE("coalesced request still evaluates its predicate (wake path)", "[downgrade_executor]")
+{
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+
+  auto executor = make_test_executor_with_cooldown(repo_registry, gpu_space, *mem_mgr, 500ms);
+  executor.start();
+
+  // Arm the cooldown with a no-progress pass.
+  REQUIRE(executor.request_free_memory_and_wait(1024) == 0);
+  REQUIRE(executor.no_progress_passes() == 1);
+
+  // A coalesced request's predicate is evaluated exactly once — this is how a
+  // caller whose reservation has become grantable during the cooldown takes it
+  // (the gpu_pipeline_executor's predicate performs the reservation attempt).
+  std::atomic<int> predicate_calls{0};
+  auto future = executor.request_downgrade([&predicate_calls]() {
+    predicate_calls.fetch_add(1);
+    return true;
+  });
+  REQUIRE(future.get() == 0);
+  REQUIRE(predicate_calls.load() == 1);
+  REQUIRE(executor.coalesced_requests() == 1);
+  REQUIRE(executor.no_progress_passes() == 1);  // no rescan happened
+
+  executor.stop();
+}
+
+TEST_CASE("cooldown of zero disables coalescing", "[downgrade_executor]")
+{
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+
+  auto executor = make_test_executor_with_cooldown(repo_registry, gpu_space, *mem_mgr, 0ms);
+  executor.start();
+
+  REQUIRE(executor.request_free_memory_and_wait(1024) == 0);
+  REQUIRE(executor.request_free_memory_and_wait(1024) == 0);
+  REQUIRE(executor.no_progress_passes() == 2);
+  REQUIRE(executor.coalesced_requests() == 0);
+
+  executor.stop();
+}
+
+TEST_CASE("progress pass does not arm the coalescing cooldown", "[downgrade_executor]")
+{
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+  auto batch1    = make_gpu_batch(*gpu_space);
+  auto batch2    = make_gpu_batch(*gpu_space);
+  repo->add_data_batch(batch1);
+  repo->add_data_batch(batch2);
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+
+  auto executor = make_test_executor_with_cooldown(repo_registry, gpu_space, *mem_mgr, 60000ms);
+  executor.start();
+
+  size_t one_batch = get_batch_size(*batch1);
+
+  // First request downgrades one batch (progress) — must not arm the cooldown.
+  REQUIRE(executor.request_free_memory_and_wait(one_batch) >= one_batch);
+  REQUIRE(executor.no_progress_passes() == 0);
+
+  // Second request immediately after must run a full pass and find the second
+  // batch (it would find nothing if it had been coalesced).
+  REQUIRE(executor.request_free_memory_and_wait(one_batch) >= one_batch);
+  REQUIRE(executor.coalesced_requests() == 0);
+
+  REQUIRE(get_batch_tier(*batch1) == cucascade::memory::Tier::HOST);
+  REQUIRE(get_batch_tier(*batch2) == cucascade::memory::Tier::HOST);
+
+  executor.stop();
+}

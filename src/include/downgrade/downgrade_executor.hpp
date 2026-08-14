@@ -31,6 +31,7 @@
 #include <cucascade/memory/stream_pool.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <future>
@@ -171,6 +172,22 @@ class downgrade_executor {
     return _monitor_requests_issued.load(std::memory_order_relaxed);
   }
 
+  /**
+   * @brief Number of completed downgrade passes that freed 0 bytes (storm counter).
+   */
+  size_t no_progress_passes() const noexcept
+  {
+    return _no_progress_passes.load(std::memory_order_relaxed);
+  }
+
+  /**
+   * @brief Number of requests short-circuited during a no-progress cooldown (storm counter).
+   */
+  size_t coalesced_requests() const noexcept
+  {
+    return _coalesced_requests.load(std::memory_order_relaxed);
+  }
+
  private:
   void processing_loop();
   void monitor_loop();
@@ -195,6 +212,16 @@ class downgrade_executor {
   std::atomic<bool> _monitor_request_enqueued{false};
   std::atomic<bool> _running{false};
   std::atomic<size_t> _monitor_requests_issued{0};
+  /// Storm counters: completed passes that freed 0 bytes, and requests short-circuited
+  /// during the post-no-progress cooldown (see downgrade_executor_config::
+  /// no_progress_rescan_cooldown). Atomics only for cross-thread reads (tests, logging);
+  /// they are written from the processing thread.
+  std::atomic<size_t> _no_progress_passes{0};
+  std::atomic<size_t> _coalesced_requests{0};
+  /// Cooldown state. Touched only by the processing thread (and by drain()/start(),
+  /// which run while the processing thread is joined), so no synchronization needed.
+  bool _in_no_progress_cooldown{false};
+  std::chrono::steady_clock::time_point _no_progress_pass_end{};
   std::unique_ptr<cucascade::memory::exclusive_stream_pool> _stream_pool;
 
   std::mutex _monitor_cv_mutex;

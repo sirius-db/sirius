@@ -26,7 +26,10 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/stream_pool.hpp>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <memory>
 #include <thread>
 
@@ -52,6 +55,24 @@ namespace pipeline {
 
 struct executor_metrics {
   size_t tasks_executed{0};
+};
+
+/**
+ * @brief Storm-observability counters for the OOM-retry pacing path.
+ *
+ * All monotonically increasing over the executor's lifetime; readable from any
+ * thread. See gpu_pipeline_executor::get_oom_pacing_stats().
+ */
+struct oom_pacing_stats {
+  /// Total OOM/contention reschedules (every task_reschedule_exception retried).
+  size_t oom_reschedules{0};
+  /// Admissions that went through a no-progress downgrade (0 bytes freed) and
+  /// proceeded on a partial reservation — the storm signature.
+  size_t starved_admissions{0};
+  /// Reschedules whose backoff was escalated beyond the base interval.
+  size_t backoff_events{0};
+  /// Total milliseconds actually spent in reschedule backoff sleeps.
+  size_t backoff_ms{0};
 };
 
 /**
@@ -114,6 +135,35 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   [[nodiscard]] executor_metrics get_metrics() const noexcept;
 
   /**
+   * @brief Snapshot of the OOM-retry pacing counters (storm observability).
+   */
+  [[nodiscard]] oom_pacing_stats get_oom_pacing_stats() const noexcept;
+
+  /**
+   * @brief Backoff before re-admitting an OOM-rescheduled task.
+   *
+   * @p starved_streak counts consecutive attempts that OOM'd after a "starved"
+   * admission (no-progress downgrade + partial reservation; see
+   * gpu_pipeline_task_local_state::starved_admission). A streak of 0 — the
+   * clean-admission OOM or cross-GPU batch-contention case (follow-up #17) —
+   * keeps the historical base interval so transient contention still clears
+   * fast. Under starvation only other work freeing memory can help, so the
+   * interval doubles per consecutive failure up to a cap: 50, 100, 200, 400,
+   * 800, 800... ms. This collapses the retry-storm duty cycle (observed ~11
+   * attempts/s/task, each dragging a futile downgrade pass) roughly 10x and
+   * stretches the MAX_RETRIES budget from ~9 s of pressure to >70 s, so
+   * transient multi-second memory cliffs no longer terminate queries at the
+   * retry cap. The sleep itself polls a wake source (memory release / query
+   * error / executor stop) — see the reschedule path.
+   */
+  [[nodiscard]] static std::chrono::milliseconds compute_oom_backoff(
+    uint32_t starved_streak) noexcept
+  {
+    constexpr uint32_t kMaxShift = 4;  // cap at 50 << 4 = 800 ms
+    return std::chrono::milliseconds{50u << std::min(starved_streak, kMaxShift)};
+  }
+
+  /**
    * @brief Set the completion handler for query completion signaling
    *
    * @param handler Pointer to the completion handler
@@ -142,6 +192,17 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   sirius::creator::task_creator* _task_creator{nullptr};
   completion_handler* _completion_handler{nullptr};
   std::atomic<size_t> _tasks_executed{0};
+
+  /// OOM-retry pacing counters (see oom_pacing_stats).
+  std::atomic<size_t> _oom_reschedules_total{0};
+  std::atomic<size_t> _starved_admissions_total{0};
+  std::atomic<size_t> _backoff_events_total{0};
+  std::atomic<size_t> _backoff_ms_total{0};
+  /// Workers currently in an escalated backoff sleep. Escalated sleeps are
+  /// capped at (num_threads - 1) concurrent sleepers so the bounded pool always
+  /// keeps at least one slot free for dispatching runnable tasks; a retryer
+  /// over the cap falls back to the base interval.
+  std::atomic<uint32_t> _backoff_sleepers{0};
 };
 
 }  // namespace pipeline

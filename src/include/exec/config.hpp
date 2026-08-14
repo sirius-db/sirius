@@ -44,6 +44,17 @@ struct downgrade_executor_config {
   /// Set to 0 to disable the monitor loop entirely.
   std::chrono::milliseconds monitor_period{std::chrono::milliseconds{10}};
 
+  /// Cooldown after a downgrade pass that freed 0 bytes (a "no-progress" pass). Requests
+  /// popped within this window skip the full repository/task-queue rescan: their predicate
+  /// is evaluated once (so a caller whose reservation has since become grantable takes it
+  /// immediately) and otherwise they resolve to 0 bytes right away. This coalesces the
+  /// thundering-herd rescans of an OOM-retry storm — when many starved tasks re-request
+  /// downgrades the pool cannot satisfy, only one full scan runs per cooldown window
+  /// instead of one per request. Progress passes (freed > 0) never arm the cooldown, and
+  /// it expires by time alone, so at most one window of candidate-arrival latency is
+  /// added under pressure. 0 disables coalescing (every request runs a full pass).
+  std::chrono::milliseconds no_progress_rescan_cooldown{std::chrono::milliseconds{100}};
+
   /// Preferred HOST memory_space device_id (NUMA node) for the downgrade target.
   /// When set, the GPU->HOST downgrade dispatch uses
   /// cucascade::memory::any_memory_space_in_tier_with_preference{Tier::HOST, *preferred_numa_node}
