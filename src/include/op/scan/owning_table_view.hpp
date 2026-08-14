@@ -27,6 +27,8 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <algorithm>
 #include <cassert>
 #include <concepts>
@@ -59,6 +61,39 @@ template <typename Owner>
 concept no_alloc_materializable = requires(Owner& owner) {
   { (*owner).release() } -> std::same_as<std::vector<std::unique_ptr<cudf::column>>>;
 };
+
+/**
+ * @brief Await every operation enqueued on @p stream up to this call.
+ *
+ * Records a throwaway event and waits on it rather than calling
+ * @c cudaStreamSynchronize, so the wait covers exactly the work enqueued so far
+ * and not work another thread appends to the same stream afterwards.
+ *
+ * Used by the copying materialization path to close the window in which a
+ * type-erased owner — typically a @c read_only_data_batch lock on a pinned-cache
+ * chunk — is destroyed while the copy reading its memory is still in flight.
+ */
+inline void await_stream_work(rmm::cuda_stream_view stream)
+{
+  cudaEvent_t event{};
+  if (auto const status = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+      status != cudaSuccess) {
+    throw std::runtime_error(std::string("owning_table_view: cudaEventCreateWithFlags failed: ") +
+                             cudaGetErrorString(status));
+  }
+  auto const record = cudaEventRecord(event, stream.value());
+  if (record != cudaSuccess) {
+    cudaEventDestroy(event);
+    throw std::runtime_error(std::string("owning_table_view: cudaEventRecord failed: ") +
+                             cudaGetErrorString(record));
+  }
+  auto const wait = cudaEventSynchronize(event);
+  cudaEventDestroy(event);
+  if (wait != cudaSuccess) {
+    throw std::runtime_error(std::string("owning_table_view: cudaEventSynchronize failed: ") +
+                             cudaGetErrorString(wait));
+  }
+}
 
 //===----------------------------------------------------------------------===//
 // my_view
@@ -194,7 +229,11 @@ class my_view {
       } else {
         // Generic owner: copy the selected view into a fresh table.
         std::vector<cudf::size_type> sel(selection.begin(), selection.end());
-        return std::make_unique<cudf::table>(_base_view.select(sel), stream, mr);
+        auto out = std::make_unique<cudf::table>(_base_view.select(sel), stream, mr);
+        // The caller destroys `_owner` as soon as this returns, so the copy must be
+        // complete first: `_owner` is what keeps the source memory alive.
+        await_stream_work(stream);
+        return out;
       }
     }
 
