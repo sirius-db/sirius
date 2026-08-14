@@ -723,26 +723,12 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     // index-list decodes (the same int32 buffer).
     result.routes        = routes;
     bool const any_bool8 = k_bool8 > 0;  // dual-delivery gathers need the indices too
-    // Chunk-bucketed form of the same survivors, built ONCE per batch like the
-    // index list and shared by every bitpack column, so its host sync is paid
-    // per batch rather than per column.
-    sc::chunk_row_set_owner sparse_rows;
-    sc::chunk_row_set sparse_view{};
     cudf::column_view survivor_indices{
       cudf::data_type{cudf::type_id::INT32}, 0, nullptr, nullptr, 0};
     if ((any_full || index_walk_pick || any_bool8) && sel.survivor_count > 0) {
       result.row_indices = rmm::device_buffer(
         static_cast<std::size_t>(sel.survivor_count) * sizeof(std::int32_t), s0, mr);
       sc::mask_to_row_indices(sel, static_cast<std::int32_t*>(result.row_indices.data()), s0);
-      if (sc::decompression_pushdown_sparse_grid_enabled() && index_walk_pick) {
-        sparse_rows =
-          sc::build_chunk_row_set(static_cast<std::int32_t const*>(result.row_indices.data()),
-                                  sel.survivor_count,
-                                  sel.num_rows,
-                                  s0,
-                                  mr);
-        sparse_view = sparse_rows.view();
-      }
       survivor_indices = cudf::column_view{cudf::data_type{cudf::type_id::INT32},
                                            static_cast<cudf::size_type>(sel.survivor_count),
                                            result.row_indices.data(),
@@ -807,10 +793,6 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
       dsel.enumerate_by_index = index_walk_pick &&
                                 result.routes[i] == sc::decode_route::bitpack_mask &&
                                 sel.survivor_count > 0;
-      // The sparse grid covers the same rows with only the touched chunks
-      // launched. Same admissibility as the index walk, since both need a
-      // bitpack root.
-      if (dsel.enumerate_by_index && sparse_view.num_survivors > 0) { dsel.rows = &sparse_view; }
       std::string err;
       auto out = decompress_column(*col.plan_tree, stream, mr, &err, nullptr, &dsel);
       if (!out) throw plan_error(err.empty() ? "filtered decode: decompress failed" : err);
@@ -1080,42 +1062,6 @@ std::unique_ptr<cudf::column> decompress_column_full(const compressed_table& tab
   auto col = decompress_column(*tree, stream, mr, error_out);
   if (!col) { return nullptr; }
   return apply_stored_dtype(std::move(col), table.columns[column_index].dtype);
-}
-
-std::unique_ptr<cudf::table> decompress_selected_rows(const compressed_table& table,
-                                                      std::span<const std::size_t> selected_columns,
-                                                      sirius::codegen::chunk_row_set const& rows,
-                                                      rmm::cuda_stream_view stream,
-                                                      rmm::device_async_resource_ref mr,
-                                                      std::string* error_out)
-{
-  nvtx3::scoped_range nvtx_range{"simpatico::decompress_selected_rows"};
-  if (!rows.valid()) { throw plan_error("decompress_selected_rows: the row set is not valid"); }
-
-  std::vector<std::unique_ptr<cudf::column>> cols;
-  cols.reserve(selected_columns.size());
-  for (auto const idx : selected_columns) {
-    if (idx >= table.columns.size()) {
-      throw plan_error("decompress_selected_rows: selected column index out of range");
-    }
-    auto const& col = table.columns[idx];
-    if (!col.plan_tree) {
-      throw plan_error("decompress_selected_rows: compressed_table column missing plan_tree");
-    }
-
-    // All-or-nothing by design: this is the table-level convenience, so a
-    // column the sparse walk cannot serve is an error here. A caller that wants
-    // to fall back per column uses decompress_column_rows directly and picks
-    // the next route itself.
-    std::string err;
-    auto c = decompress_column_rows(table, idx, rows, stream, mr, &err);
-    if (!c) {
-      if (error_out) { *error_out = err; }
-      throw plan_error(err.empty() ? "decompress_selected_rows: decode failed" : err);
-    }
-    cols.push_back(std::move(c));
-  }
-  return std::make_unique<cudf::table>(std::move(cols));
 }
 
 std::unique_ptr<cudf::table> decompress(const compressed_table& table,

@@ -123,20 +123,12 @@ chunk_row_set_owner build_chunk_row_set(std::int32_t const* row_ids,
                                         rmm::cuda_stream_view stream,
                                         rmm::device_async_resource_ref mr);
 
-// ── Deriving the other enumerations ─────────────────────────────────────────
+// ── Deriving the mask form ──────────────────────────────────────────────────
 //
-// These make this form the canonical one. The three enumerations describe the
-// same selection and every consumer already accepts whichever it is handed, so
-// the question was never which to keep but which to build FROM — and only this
-// one can be built from a selection that arrives without a mask. The mask and
-// the index list are then derived on demand, which is cheaper than carrying a
-// second construction path for selections that do have a mask.
-
-/// Expand into ascending batch-local int32 row indices — the shape the index
-/// walk and cudf::gather consume. ``out`` must hold ``num_survivors``.
-void row_set_to_local_indices(chunk_row_set const& rows,
-                              std::int32_t* out,
-                              rmm::cuda_stream_view stream);
+// Only this form can be built from a selection that arrives without a mask, so
+// it is what gets built, and the mask is derived when a consumer needs one —
+// cheaper than a second construction path for the selections that do come with
+// one, and how a plan with no random-access decode is still served.
 
 /// Expand into the fused wave-1 shape: selection-mask words plus per-chunk
 /// exclusive survivor offsets over ALL chunks, so the shipped mask route runs

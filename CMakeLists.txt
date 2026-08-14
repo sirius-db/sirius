@@ -241,6 +241,9 @@ set(EXTENSION_SOURCES
     src/late_mat/prepared_selection.cpp
     src/late_mat/materialize.cpp
     src/late_mat/defer_policy.cpp
+    src/late_mat/defer_directive.cpp
+    src/late_mat/port_materialize.cpp
+    src/planner/late_mat_plan_pass.cpp
     src/scan_manager/late_mat_resolver.cpp
     src/late_mat/multi_source_gather.cu
     src/config.cpp
@@ -691,7 +694,11 @@ set(TEST_SOURCES
     test/cpp/late_mat/test_column_origin.cpp
     test/cpp/late_mat/test_prepared_selection.cpp
     test/cpp/late_mat/test_materialize.cpp
+    test/cpp/late_mat/test_port_materialize.cpp
+    test/cpp/integration/test_late_mat_deferred_query.cpp
     test/cpp/late_mat/test_defer_policy.cpp
+    test/cpp/late_mat/test_defer_directive.cpp
+    test/cpp/late_mat/test_late_mat_plan_pass.cpp
     test/cpp/late_mat/test_late_mat_resolver.cpp
     test/cpp/late_mat/test_pin_handle_lifecycle.cpp
     test/cpp/io/s3/test_sigv4.cpp

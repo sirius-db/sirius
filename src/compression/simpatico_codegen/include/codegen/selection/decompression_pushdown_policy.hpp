@@ -61,17 +61,6 @@ double decompression_pushdown_full_route_max_selectivity();
 /// for the index walk (the parse requires > 0).
 double decompression_pushdown_index_walk_max_selectivity();
 
-/// Serve the index walk from a chunk-bucketed row set instead of the flat index
-/// list, so the grid covers only the chunks that hold a survivor
-/// (SIRIUS_EXP_FUSED_SCAN_SPARSE, default off).
-///
-/// Experimental, and the measurement it exists for: a diag run over sf1000
-/// q17/q18/q19 launches 76.2M blocks of which 43.6M (57.2%) hold no survivor at
-/// all, and the ones that do average 1.5 survivors per 1024-row chunk. This
-/// skips the empty ones. Whether that converts to wall-clock is the open
-/// question — an empty block is cheap — so the two forms stay switchable.
-bool decompression_pushdown_sparse_grid_enabled();
-
 /// How many join-filter probes one decode carries
 /// (SIRIUS_EXP_FUSED_SCAN_MAX_MEMBER, default 1).
 ///

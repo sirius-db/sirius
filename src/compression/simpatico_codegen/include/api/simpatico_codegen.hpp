@@ -302,38 +302,6 @@ std::unique_ptr<cudf::column> decompress_column_full(
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
   std::string* error_out            = nullptr);
 
-/// Decompress a column subset for a selection the CALLER supplies — post-join
-/// survivor rows, bucketed per 1024-row chunk
-/// (codegen/selection/chunk_row_set.hpp).
-///
-/// This is the late-materialization counterpart to @c decompress_scan_filter.
-/// That one derives its own selection while decoding and can only be handed a
-/// predicate; this one is handed the rows themselves, decided long after the
-/// scan by a join. The returned table has @c rows.num_survivors rows in
-/// ascending row order, one column per entry of @p selected_columns.
-///
-/// Only the sparse grid runs: one block per TOUCHED chunk, so a selection that
-/// leaves most chunks empty does not launch them. That is the whole economics
-/// of the form — at sf1000 densities a post-join selection touches 1-10% of a
-/// batch's chunks, and the index list would launch all of them.
-///
-/// Serves BITPACK-rooted fixed-width columns, i.e. exactly those whose
-/// @c probe_column reports @c decode_route::bitpack_mask. Anything else — a
-/// dictionary or str_split column, or a plan with no random access — is
-/// refused with @p error_out set, never decoded full width behind the caller:
-/// the fallback is the caller's to choose, and a silent one would be a
-/// performance cliff with no signal.
-///
-/// @throws std::runtime_error on a column index out of range, a row set that
-///         disagrees with the table's row count, or the usual decode failures.
-std::unique_ptr<cudf::table> decompress_selected_rows(
-  const compressed_table& table,
-  std::span<const std::size_t> selected_columns,
-  sirius::codegen::chunk_row_set const& rows,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
-  std::string* error_out            = nullptr);
-
 std::unique_ptr<cudf::table> decompress_scan_filter(
   const compressed_table& table,
   std::span<const std::size_t> selected_columns,

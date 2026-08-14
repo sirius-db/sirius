@@ -17,6 +17,7 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include "cudf/cudf_utils.hpp"
+#include "late_mat/port_materialize.hpp"
 #include "log/logging.hpp"
 #include "memory/defragmenter_oom_policy.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
@@ -165,6 +166,55 @@ void log_operator_data(const op::sirius_physical_operator& op,
     extra_info);
 }
 
+/// Put a deferred bundle's values back, just before the operator that reads
+/// them runs (env gate: SIRIUS_EXP_LATE_MAT, via the directive being installed).
+///
+/// Null means "use the input as it is": this operator carries no consuming half,
+/// or the batches are not the ones the directive was installed for. A port can
+/// receive batches from more than one producer, so a decline is ordinary — and
+/// declining is the only safe answer, since materializing against a stranger's
+/// batch reads arbitrary rows of the pinned table.
+std::unique_ptr<op::operator_data> materialize_deferred_input(
+  op::sirius_physical_operator const& op,
+  op::operator_data const& input_data,
+  rmm::cuda_stream_view stream)
+{
+  auto const& directive = op.port_directive();
+  if (directive.empty()) { return nullptr; }
+  auto const* input = dynamic_cast<op::pipelineable_operator_data const*>(&input_data);
+  if (input == nullptr) { return nullptr; }
+  auto const& batches = input->get_read_only_batches();
+  if (batches.empty()) { return nullptr; }
+
+  std::vector<cudf::table_view> views;
+  views.reserve(batches.size());
+  std::size_t matching = 0;
+  for (auto const& batch : batches) {
+    views.push_back(batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
+    matching += late_mat::port_directive_matches(directive, views.back()) ? 1 : 0;
+  }
+  if (matching == 0) { return nullptr; }
+  if (matching != batches.size()) {
+    // Some batches carry a rowid and some carry values: the operator was already
+    // being handed two different schemas, and materializing part of them would
+    // hide that rather than fix it.
+    throw std::runtime_error(
+      "[gpu_pipeline_task] operator " + std::to_string(op.get_operator_id()) +
+      " received a mix of deferred and materialized batches for one deferral");
+  }
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> output;
+  output.reserve(batches.size());
+  for (std::size_t i = 0; i < batches.size(); ++i) {
+    auto* space = batches[i].get_memory_space();
+    auto restored =
+      late_mat::materialize_at_port(directive, views[i], stream, space->get_default_allocator());
+    output.push_back(
+      sirius::make_data_batch(std::move(restored), *space, stream, op.batch_telemetry()));
+  }
+  return std::make_unique<op::pipelineable_operator_data>(std::move(output));
+}
+
 std::unique_ptr<op::operator_data> run_one_operator(
   op::sirius_physical_operator& op,
   const op::operator_data& operator_input_data,
@@ -176,13 +226,18 @@ std::unique_ptr<op::operator_data> run_one_operator(
 {
   log_operator_data(op, operator_input_data, pipeline, task_id, "executing on");
 
+  // The far end of a deferral, if this operator is one. Held for the duration of
+  // execute(): the restored columns are what the operator reads.
+  auto const materialized     = materialize_deferred_input(op, operator_input_data, stream);
+  auto const& effective_input = materialized ? *materialized : operator_input_data;
+
   auto nvtx_label = std::format(
     "Pipeline {}: {} (id={})", pipeline->get_pipeline_id(), op.get_name(), op.get_operator_id());
   nvtx3::scoped_range nvtx_range{nvtx_label.c_str()};
   auto start = std::chrono::high_resolution_clock::now();
   std::unique_ptr<op::operator_data> operator_output_data;
   try {
-    operator_output_data = op.execute(operator_input_data, stream);
+    operator_output_data = op.execute(effective_input, stream);
   } catch (const std::exception& ex) {
     auto sticky_err = cudaGetLastError();
     if (sticky_err != cudaSuccess) {
@@ -469,7 +524,10 @@ void gpu_pipeline_task::publish_output(op::operator_data& output_data, rmm::cuda
                                   sink_operators->get_operator_id());
     nvtx3::scoped_range nvtx_range{nvtx_label.c_str()};
     auto const sink_start = std::chrono::high_resolution_clock::now();
-    sink_operators.get()->sink(output_data, stream);
+    // A port can be a sink as easily as a mid-pipeline operator — q10's is a
+    // HASH_GROUP_BY — so the far end of a deferral is restored on both paths.
+    auto const materialized = materialize_deferred_input(*sink_operators, output_data, stream);
+    sink_operators.get()->sink(materialized ? *materialized : output_data, stream);
     auto const sink_end = std::chrono::high_resolution_clock::now();
     auto const sink_duration =
       std::chrono::duration_cast<std::chrono::microseconds>(sink_end - sink_start);
