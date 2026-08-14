@@ -47,13 +47,16 @@ namespace sirius::op::scan {
 //===----------------------------------------------------------------------===//
 // sirius_gpu_scan_operator
 //===----------------------------------------------------------------------===//
-sirius_gpu_scan_operator::sirius_gpu_scan_operator(duckdb::vector<sirius::logical_type> types,
-                                                   duckdb::idx_t estimated_cardinality,
-                                                   std::shared_ptr<gpu_ingestible> ingestible)
+sirius_gpu_scan_operator::sirius_gpu_scan_operator(
+  duckdb::vector<sirius::logical_type> types,
+  duckdb::idx_t estimated_cardinality,
+  std::shared_ptr<gpu_ingestible> ingestible,
+  std::shared_ptr<read_time_filter_bypass> read_bypass)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::GPU_SCAN, std::move(types), estimated_cardinality),
     _ingestible(std::move(ingestible)),
-    _split_connector(std::make_shared<scan_manager::split_connector>())
+    _split_connector(std::make_shared<scan_manager::split_connector>()),
+    _read_bypass(std::move(read_bypass))
 {
 }
 
@@ -93,6 +96,17 @@ gpu_ingestible& sirius_gpu_scan_operator::get_ingestible() const { return *_inge
 scan_manager::split_connector& sirius_gpu_scan_operator::get_split_connector()
 {
   return *_split_connector;
+}
+
+void sirius_gpu_scan_operator::mark_served_from_pinned_cache() noexcept
+{
+  if (_read_bypass) { _read_bypass->mark_bypassed(); }
+}
+
+std::shared_ptr<read_time_filter_bypass const> sirius_gpu_scan_operator::read_bypass()
+  const noexcept
+{
+  return _read_bypass;
 }
 
 //===----------------------------------------------------------------------===//

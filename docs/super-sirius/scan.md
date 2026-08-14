@@ -156,7 +156,7 @@ For nested types (`STRUCT`, `LIST`), one DuckDB column maps to multiple parquet 
 
 1. **Plan stage.** During pipeline conversion the bind data is lowered into an `ingestible_table_info`, `make_ingestible(...)` builds the `gpu_ingestible`, and a `sirius_gpu_scan_operator` carrying it is inserted as the pipeline source. The operator constructs its own (empty) `split_connector`.
 2. **Per-query preparation.** `prepare_for_query(query)` resets prior state, builds a `round_robin_strategy` over the topology's GPU ids and a fresh `load_balancing_scan_batch_coalescer`, then walks the query's `GPU_SCAN` operators in order. For each it `register_pipeline`s a sequencer slot (which builds the ingestible's `batch_coalescer` and captures the operator's connector). Then either:
-   - **Cache hit** — `try_assign_cached_entries` finds a pinned entry whose identity and columns can serve the scan; it attaches a `databatch_provider` to the slot and skips disk reading entirely; or
+   - **Cache hit** — `try_match_cached_entry` finds a pinned entry whose identity and columns can serve the scan; it attaches a `databatch_provider` to the slot and skips disk reading entirely; or
    - **Cache miss** — a `split_provider` is built over the operator's ingestible and stored in `_providers_by_op`.
 3. **Execution.** `start_metadata_processing` spawns the single sequencer worker on the dispatcher, then calls `split_provider::run` for each non-cached operator. `run` iterates `has_more_splits` / `next_split_provider` and hands each claimed metadata task to the dispatcher; each task enqueues its `scan_info` onto the operator's sequencer slot queue. The sequencer worker walks slots in registration order, coalescing each slot's metadata into data-batch splits, balancing each onto a GPU, firing `fadvise`/`opportunistic` prefetch, and pushing a `scan_operator_input` onto the operator's connector. Consumers (the scan operators) block in `split_connector::get_next_split` until splits arrive.
 4. **Teardown.** The sequencer closes each connector when its slot is drained (forwarding any worker-captured exception, first-writer-wins). Once closed and drained, the operator's `all_ports_empty()` returns true and `get_next_task_hint()` returns `nullopt`. `reset()` requests the dispatcher stop and rebuilds it for the next query.
@@ -218,7 +218,7 @@ Each pinned table is a `pinned_entry` keyed by name in the scan manager. It hold
 
 `cache_entry_info` captures format identity — the resolved parquet **file set**, or the duckdb **catalog.schema.table** — plus the cached columns (by storage index) and their names. `can_serve_with_columns(other)` returns a gather projection when this entry can serve a scan: same format, same identity, and a **column superset** of the scan's request. A parquet pin never serves a duckdb scan or vice-versa.
 
-During `prepare_for_query`, `try_assign_cached_entries` matches each `GPU_SCAN` operator's `table_info` against the pinned entries. On a hit it builds a `cached_databatch_provider` over the matched entry, ordering columns by the ingestible's `materialized_column_order()` so a cached batch is laid out identically to a fresh disk read and `post_filter_and_project` resolves the same columns on both paths. The scan operator's `execute()` is unchanged; resident cached batches with an identity layout flow through untouched.
+During `prepare_for_query`, `try_match_cached_entry` matches each `GPU_SCAN` operator's `table_info` against the pinned entries. On a hit it builds a `cached_databatch_provider` over the matched entry, ordering columns by the ingestible's `materialized_column_order()` so a cached batch is laid out identically to a fresh disk read and `post_filter_and_project` resolves the same columns on both paths. The scan operator's `execute()` is unchanged; resident cached batches with an identity layout flow through untouched. A hit also marks the scan's `read_time_filter_bypass`: no reader runs for a cache-served scan, so the scan's dynamic-filter wrapper promotes itself from `membership_masks_only` to `include_ast_row_masks` and applies AST-capable dynamic filters (Top-N boundaries, join zone maps) post-decode — see "Pinned-cache-served scans" in [dynamic-filters-top-n.md](dynamic-filters-top-n.md).
 
 ### Re-pin semantics
 
@@ -249,7 +249,9 @@ abort the pin.
 **Pruning.** During query preparation, static pushed-down table filters are checked against the
 statistics with DuckDB's `CheckStatistics`. Supported filters include typed comparisons, `IN`,
 `IS NULL`, `IS NOT NULL`, and safe `AND`/`OR` combinations. Missing statistics, unsupported
-filters, type mismatches, and runtime dynamic filters keep the chunk. Surviving chunks still pass
+filters, type mismatches, and runtime dynamic filters keep the chunk (dynamic filters instead
+apply post-serve in the scan's dynamic-filter wrapper — "Pinned-cache-served scans" in
+[dynamic-filters-top-n.md](dynamic-filters-top-n.md)). Surviving chunks still pass
 through the normal GPU filter; pruning a HOST-tier chunk also avoids its H2D copy.
 
 **Sentinel chunk.** If every chunk is proven empty, chunk 0 is still served so the scan can signal
@@ -336,6 +338,12 @@ When filter pushdown is enabled and the `gpu_expression_translator` successfully
 2. **Reader-level filter pushdown:** the cuDF AST is set on `parquet_reader_options` via `set_filter()`, so cuDF applies the filter inside `read_parquet`. When the reader applies the row filter, `materialize_table` reports `ROW_FILTERED` (or `ROW_FILTERED_AND_PROJECTED` once hive partitions are assembled), so the scan operator skips a redundant post-decode filter.
 
 Reader-side pushdown is a per-split decision: a safety probe can disable it for a file, in which case the cached DuckDB filter expression is evaluated through `expression_evaluator` on the decoded batch in `post_filter_and_project`. The probe now covers only `BYTE_ARRAY`-encoded decimals, kept as untested conservatism because no writer available here (DuckDB, pyarrow) emits that encoding. The FLBA arm was removed: it was added against a real cuDF stats-filter throw, but that failure no longer reproduces at the pinned version — checked across FLBA widths 4/8/16 with correct pruning on negative values — and it was suppressing pushdown on the decimal layout DuckDB itself writes.
+
+Neither mechanism runs for a pinned-cache-served scan — resident chunks bypass the reader
+entirely. Static filters still apply post-decode (`post_filter_and_project`), pinned zone
+maps prune whole chunks at serve time (see [Zone maps](#zone-maps)), and dynamic-filter
+consumption flips to the scan's post-decode wrapper at prepare time ("Pinned-cache-served
+scans" in [dynamic-filters-top-n.md](dynamic-filters-top-n.md)).
 
 **Filter translation path:** `TableFilterSet` -> `convert_table_filters_to_expression()` (skips `OPTIONAL_FILTER`, `IS_NOT_NULL`, and partition-column filters) -> `gpu_expression_translator` -> cuDF AST tree.
 

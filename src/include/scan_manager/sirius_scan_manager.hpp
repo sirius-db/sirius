@@ -316,7 +316,7 @@ class sirius_scan_manager {
   /// @param enable_pinned_zone_map_pruning  Per-query snapshot of the serve-side pruning flag (the
   ///                                        manager's _config is a construction-time copy, so SET
   ///                                        changes must be forwarded per query by the caller).
-  ///                                        Consulted by try_assign_cached_entries when building
+  ///                                        Consulted by try_match_cached_entry when building
   ///                                        the survivor plan.
   void prepare_for_query(const sirius::planner::query& query, bool enable_pinned_zone_map_pruning);
 

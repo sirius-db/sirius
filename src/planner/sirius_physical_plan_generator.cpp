@@ -226,24 +226,31 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
 //! reading has already applied them, so it wraps in `membership_masks_only`; one with no
 //! read-time filter path wraps in `include_ast_row_masks` to also evaluate zone maps row-wise.
 //! Callers derive it from `sirius::planner::target_skips_reads`, which is the same question the
-//! Top-N siting rule asks, so the two answers cannot drift apart. Channels without registered
-//! producers are elided. Registration finishes after the whole tree is built, so
-//! `has_producers()` is settled.
+//! Top-N siting rule asks, so the two answers cannot drift apart. The derived mode is the
+//! fresh-read premise; a pinned-cache serve falsifies it at prepare time, which the shared
+//! `read_time_filter_bypass` (created here, marked by the scan manager) reports to the wrapper.
+//! Channels without registered producers are elided. Registration finishes after the whole tree
+//! is built, so `has_producers()` is settled.
 template <typename InfoT>
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
   std::unique_ptr<InfoT> info,
   const sirius::op::sirius_physical_table_scan& scan,
   const sirius::operator_params& op_params,
-  sirius::op::scan::dynamic_filter_apply_mode mode)
+  sirius::op::scan::dynamic_filter_apply_mode mode,
+  sirius::op::dynamic_filter_stats* stats)
 {
   auto dynamic_filters = scan.sirius_dynamic_filters;
   if (dynamic_filters && !dynamic_filters->has_producers()) { dynamic_filters.reset(); }
   info->sirius_dynamic_filters = dynamic_filters;
 
+  // The latch exists only when a wrapper will consume it; a bare scan gets none.
+  auto read_bypass =
+    dynamic_filters ? std::make_shared<sirius::op::scan::read_time_filter_bypass>() : nullptr;
+
   auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf =
     duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(
-      scan.types, scan.estimated_cardinality, std::move(ingestible));
+      scan.types, scan.estimated_cardinality, std::move(ingestible), read_bypass);
 
   if (dynamic_filters) {
     // Under a PARTITION parent this emits the [GPU_SCAN, DYNAMIC_FILTER] pipeline (filter as
@@ -253,7 +260,10 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
       scan.estimated_cardinality,
       std::move(dynamic_filters),
       op_params.dynamic_filter_keep_threshold,
-      mode);
+      mode,
+      sirius::op::scan::dynamic_filter_endpoint_provenance::scan_route,
+      stats,
+      std::move(read_bypass));
     dynamic_filter_op->children.push_back(std::move(leaf));
     leaf = std::move(dynamic_filter_op);
   }
@@ -284,15 +294,20 @@ void wrap_table_scan_source(
                       ? sirius::op::scan::dynamic_filter_apply_mode::membership_masks_only
                       : sirius::op::scan::dynamic_filter_apply_mode::include_ast_row_masks;
 
+  // The wrapper's delivery counters sink into the connection-lifetime stats, resolved once here.
+  auto sirius_context = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  auto* stats         = sirius_context ? &sirius_context->get_dynamic_filter_stats() : nullptr;
+
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf;
   bool replace_slot = false;
   if (fn == "seq_scan") {
     leaf = make_gpu_scan_leaf(
-      build_duckdb_native_table_info(scan, op_params, context), scan, op_params, mode);
+      build_duckdb_native_table_info(scan, op_params, context), scan, op_params, mode, stats);
     // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
     replace_slot = true;
   } else if (sirius::planner::is_parquet_reader_function(fn)) {
-    leaf = make_gpu_scan_leaf(build_parquet_table_info(scan, op_params), scan, op_params, mode);
+    leaf =
+      make_gpu_scan_leaf(build_parquet_table_info(scan, op_params), scan, op_params, mode, stats);
     // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
     replace_slot = true;
   } else {

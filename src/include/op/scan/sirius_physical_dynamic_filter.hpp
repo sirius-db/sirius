@@ -16,9 +16,11 @@
 
 #pragma once
 
+#include <op/dynamic_filter/dynamic_filter_stats.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/dynamic_filter_gate.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
+#include <op/scan/read_time_filter_bypass.hpp>
 #include <op/sirius_physical_operator.hpp>
 
 #include <cstddef>
@@ -38,7 +40,11 @@ enum class dynamic_filter_endpoint_provenance { scan_route, join_edge, top_n_end
 ///
 /// On a scan route it sits directly above `sirius_gpu_scan_operator`. Parquet has already applied
 /// AST-capable filters through the reader, so the endpoint uses @c membership_masks_only. A
-/// DuckDB-native scan has no reader filter and uses @c include_ast_row_masks.
+/// DuckDB-native scan has no reader filter and uses @c include_ast_row_masks. The mode chosen at
+/// plan time is a premise about the serve path; when `prepare_for_query` serves the scan from the
+/// pinned cache no reader runs, the shared `read_time_filter_bypass` is marked before execution,
+/// and `effective_mode()` promotes membership_masks_only to include_ast_row_masks for the whole
+/// execution.
 ///
 /// On a direct route, `planner::place_endpoint()` inserts it in the producing join's probe
 /// subtree. A @c dynamic_filter_route_class::direct target accepts membership filters, and the
@@ -62,12 +68,26 @@ class sirius_physical_dynamic_filter : public sirius_physical_operator {
     std::shared_ptr<sirius::op::sirius_dynamic_filter_set> filters,
     double gate_keep_threshold     = dynamic_filter_gate::k_default_keep_threshold,
     dynamic_filter_apply_mode mode = dynamic_filter_apply_mode::membership_masks_only,
-    dynamic_filter_endpoint_provenance provenance = dynamic_filter_endpoint_provenance::scan_route);
+    dynamic_filter_endpoint_provenance provenance = dynamic_filter_endpoint_provenance::scan_route,
+    sirius::op::dynamic_filter_stats* stats       = nullptr,
+    std::shared_ptr<read_time_filter_bypass> read_bypass = nullptr);
 
   /// Why the planner installed this operator; plan-shape tests and telemetry read it.
   [[nodiscard]] dynamic_filter_endpoint_provenance provenance() const noexcept
   {
     return _provenance;
+  }
+
+  /// The mode this execution actually applies: the plan-time mode, promoted to
+  /// include_ast_row_masks when the scan's serve path bypassed read-time filtering. Promotion is
+  /// monotone (never demotes) and settled before the first batch.
+  [[nodiscard]] dynamic_filter_apply_mode effective_mode() const noexcept;
+
+  /// The serve-path latch shared with the wrapped scan; null for join_edge / top_n_endpoint
+  /// provenance. Exposed for plan-shape tests.
+  [[nodiscard]] std::shared_ptr<read_time_filter_bypass const> read_bypass() const noexcept
+  {
+    return _read_bypass;
   }
 
   /// The channel this operator consumes, for plan-shape assertions on registered routing.
@@ -100,6 +120,10 @@ class sirius_physical_dynamic_filter : public sirius_physical_operator {
   dynamic_filter_apply_mode _mode;
   /// Which planner role installed this operator.
   dynamic_filter_endpoint_provenance _provenance;
+  /// Non-owning counter sink with `SiriusContext` lifetime -- the hash join's stats contract.
+  sirius::op::dynamic_filter_stats* _stats;
+  /// Serve-path latch shared with the wrapped scan operator; null off the scan route.
+  std::shared_ptr<read_time_filter_bypass> _read_bypass;
 };
 
 }  // namespace sirius::op::scan

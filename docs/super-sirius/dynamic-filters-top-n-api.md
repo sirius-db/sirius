@@ -873,7 +873,8 @@ struct descent_policy {
  *
  *  - `consumer_skips_reads` — the consumer turns the predicate into data never read (Parquet's
  *    reader `set_filter` prunes row groups by statistics). Sited unconditionally; the saving is
- *    upstream of any pass.
+ *    upstream of any pass. This is a plan-time answer a pinned-cache serve can falsify at
+ *    runtime; siting stands, and consumption flips post-decode at prepare (Phase 1 section).
  *  - `material_hops_above > 0` — real per-row work sits between the site and the sink, so the
  *    site's compaction pass buys more than it costs.
  *
@@ -1107,6 +1108,80 @@ group-key query as shared accounting, not as a mislabelled bug.
 | `prefilter_gate` / endpoint gate | Mutable | Gate's existing internal locks | Execution-scoped |
 | `dynamic_filter_stats` additions | Atomics | Per-field relaxed | Connection lifetime |
 
+### Phase 1 — Pinned-serve consumption flip *(implemented with this change)*
+
+A pinned-cache-served parquet scan runs no reader, so the Stage-4 assumption "AST filters
+already ran as scan-time row-group pruning" fails at runtime and `membership_masks_only`
+left Top-N boundaries and join zone maps unapplied. The fix is a prepare-time latch plus a
+monotone mode promotion in the wrapper (main doc, "Pinned-cache-served scans").
+
+#### New file: `src/include/op/scan/read_time_filter_bypass.hpp`
+
+```cpp
+/// One-way, per-execution latch: this scan's batches will not pass through a read-time
+/// dynamic-filter phase in this execution. Created by the plan generator when it wraps a
+/// scan; co-owned by the scan operator and its wrapper. Single writer:
+/// sirius_scan_manager::prepare_for_query marks it strictly before pipeline execution, so
+/// consumers never observe a mid-query change and the keep-ratio gate trains under one
+/// mode. Plans are per-execution, so the latch needs no reset.
+class read_time_filter_bypass {
+ public:
+  void mark_bypassed() noexcept;
+  [[nodiscard]] bool bypassed() const noexcept;
+};
+```
+
+#### Modified: `src/include/op/scan/sirius_physical_dynamic_filter.hpp`
+
+Two appended, defaulted constructor parameters — `sirius::op::dynamic_filter_stats* stats`
+(non-owning, `SiriusContext` lifetime, the hash-join contract) and
+`std::shared_ptr<read_time_filter_bypass> read_bypass` (null for `join_edge` /
+`top_n_endpoint` provenance) — plus:
+
+```cpp
+[[nodiscard]] dynamic_filter_apply_mode effective_mode() const noexcept;
+[[nodiscard]] std::shared_ptr<read_time_filter_bypass const> read_bypass() const noexcept;
+```
+
+`effective_mode()` returns the plan-time mode, promoted to `include_ast_row_masks` when the
+latch is bypassed; promotion is monotone and settled before the first batch. (The Stage-4
+snippet above that says "Existing constructor unchanged" is superseded by this appendix.)
+
+#### Modified: `src/include/op/scan/sirius_gpu_scan_operator.hpp`
+
+Appended defaulted `read_bypass` constructor parameter,
+`void mark_served_from_pinned_cache() noexcept` (called by `prepare_for_query` at the
+cache-hit commit point, after `validate_pinned_entry_for_serving` — a validation fallback to
+disk is never marked), and a `read_bypass()` accessor for plan-shape tests.
+
+#### Modified: `src/include/op/dynamic_filter/dynamic_filter_stats.hpp`
+
+```cpp
+std::atomic<std::uint64_t> post_decode_apply_rows_in{0};
+std::atomic<std::uint64_t> post_decode_apply_rows_out{0};
+```
+
+Delivery-time; incremented by the wrapper only when a gated apply produced a result table.
+They cover every provenance and capability, so a test isolating one capability uses a
+channel carrying only that capability (a Top-N-only channel has no membership filters, so on
+a pinned scan these counters move only if the flip engaged — the discriminator the
+integration mutation check relies on). Appended at the end of the struct and snapshot.
+
+**Serve-path invariant the flip rests on:** one scan operator in one execution is served
+either entirely from resident pinned chunks or entirely through the reader
+(`worker_loop` runs `process_cached_entries` XOR `process_provider_inputs`); parquet pins
+carry no MVCC/delta side channel. Only duckdb-native pins append insert-delta splits, and
+the native wrapper already runs `include_ast_row_masks`.
+
+**Known gap — per-split reader bypass is still unconsumed.** On the fresh-read path a
+`disable_filter_pushdown` split (BYTE_ARRAY-decimal probe) skips reader-side dynamic AST
+while the wrapper stays membership-only: the pinned-serve miss in miniature, per split. No
+writer available to the tests can emit that encoding (the probe itself is the declared
+untested conservatism from Phase 0), and the per-scan latch deliberately does not express
+per-split facts; if the encoding ever becomes constructible, this needs batch-level
+signaling. **Known gap — WI-0b** (reader-path runtime gate) remains specified and
+unimplemented; the flip neither implements nor replaces it.
+
 ---
 
 ## Part 2 — High-level test shape
@@ -1152,8 +1227,9 @@ it is deleting the guard's rationale; carry the test or delete the guard deliber
 
 Installation site: plan-shape layer (`DYNAMIC_FILTER` node presence, position, `provenance()`).
 Pruning effect and lifecycle: stats deltas (`top_n_offers`, `top_n_prefilter_rows_*`,
-`top_n_revisions_published`, the per-layer `top_n_{first_key,lex}_*` counters, and
-`top_n_endpoint_sites_*`). Batch arrival order is not deterministic,
+`top_n_revisions_published`, the per-layer `top_n_{first_key,lex}_*` counters,
+`top_n_endpoint_sites_*`, and the post-decode consumer pair
+`post_decode_apply_rows_in/out`). Batch arrival order is not deterministic,
 so row-level pruning counters are asserted as directions (`rows_out <= rows_in`, deltas `> 0`
 only where a single-batch shape forces them), matching the sibling doc's counter-contract rules.
 
@@ -1186,6 +1262,7 @@ shape publishes its strict predicate as RANGE, and multi-key shapes publish per 
 | 16 | Aggregate-output key (Q3 shape) | `SELECT grp, sum(v) s FROM t GROUP BY grp ORDER BY s LIMIT 5` | No group-key producer: `top_n_group_producers_rejected` delta; scenario 3's skip asserts unchanged (S5) | plan, integration |
 | 17 | Filter between aggregate and Top-N | Scenario 15 plus `HAVING min(v) > 0` | No group-key producer (S5) | plan, integration |
 | 18 | Boundary-tie preservation | Scenario 15 data with duplicated boundary `grp` values and a `sum` aggregate | Exact equivalence — tied rows provably kept; inclusive predicates asserted via results, not counters (S5) | integration, sqllogic |
+| 19 | Pinned-cache-served scan | Scenario 1's query after `CALL pin_table(...)`, GPU and HOST tiers, plus an unpinned rerun | Scan target sited exactly as in 1, but no reader runs: the prepare-time `read_time_filter_bypass` promotes the wrapper to `include_ast_row_masks`; boundary applies post-decode and `post_decode_apply_rows_in/out` move; the unpinned rerun keeps them at zero on a Top-N-only channel (both directions pinned — under-flip and over-flip each fail one leg) (Phase 1) | plan, operator, integration |
 
 Negative sub-cases (14): a tie-preserving rank shape — pinned DuckDB v1.5.4 has no `WITH TIES`
 grammar, so the negative is expressed as `RANK() OVER (ORDER BY …) <= n`, asserting no producer

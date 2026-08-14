@@ -18,6 +18,7 @@
 
 // sirius
 #include <op/scan/gpu_ingestible.hpp>
+#include <op/scan/read_time_filter_bypass.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <op/sirius_physical_operator_type.hpp>
 
@@ -48,7 +49,9 @@ namespace sirius::op::scan {
  * Lifecycle:
  * 1. The plan generator creates the ingestible and the scan operator.
  * 2. prepare_for_query checks whether a pinned entry can serve the scan.
- * 3. A cache miss uses split_provider. A cache hit uses cached_databatch_provider.
+ * 3. A cache miss uses split_provider. A cache hit uses cached_databatch_provider. On a cache
+ *    hit, prepare_for_query also marks the scan's read_time_filter_bypass so the wrapper flips
+ *    to post-decode AST application.
  * 4. Both providers send inputs through the operator's split connector.
  * 5. execute() runs each split through materialize_table, then
  *    post_filter_and_project unless the result is already
@@ -64,10 +67,13 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
    * @param types                  Output column types in plan order.
    * @param estimated_cardinality  Planner-estimated row count.
    * @param ingestible             Per-table source built by the plan generator.
+   * @param read_bypass            Serve-path latch shared with the scan's dynamic-filter
+   *                               wrapper; null when the plan installs no wrapper.
    */
   sirius_gpu_scan_operator(duckdb::vector<sirius::logical_type> types,
                            duckdb::idx_t estimated_cardinality,
-                           std::shared_ptr<gpu_ingestible> ingestible);
+                           std::shared_ptr<gpu_ingestible> ingestible,
+                           std::shared_ptr<read_time_filter_bypass> read_bypass = nullptr);
 
   ~sirius_gpu_scan_operator() override;
 
@@ -111,9 +117,23 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
 
   scan_manager::split_connector& get_split_connector();
 
+  /**
+   * @brief Called by sirius_scan_manager::prepare_for_query when a pinned entry will serve this
+   * scan: no read-time dynamic-filter phase will run this execution. Forwards to the shared
+   * read_time_filter_bypass; no-op when the plan installed no dynamic-filter wrapper.
+   */
+  void mark_served_from_pinned_cache() noexcept;
+
+  /**
+   * @brief The serve-path latch shared with this scan's dynamic-filter wrapper; null when the
+   * plan installed no wrapper. Exposed for plan-shape tests.
+   */
+  [[nodiscard]] std::shared_ptr<read_time_filter_bypass const> read_bypass() const noexcept;
+
  private:
   std::shared_ptr<gpu_ingestible> _ingestible;
   std::shared_ptr<scan_manager::split_connector> _split_connector;
+  std::shared_ptr<read_time_filter_bypass> _read_bypass;
 };
 
 }  // namespace sirius::op::scan

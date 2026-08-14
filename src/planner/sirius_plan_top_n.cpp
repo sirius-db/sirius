@@ -352,7 +352,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> discover_top_n_targets(
       std::move(child),
       key_ordinals.front(),
       policy,
-      [&site_channels, gate_keep_threshold](sirius::op::sirius_physical_operator const& site)
+      [&site_channels, &stats, gate_keep_threshold](
+        sirius::op::sirius_physical_operator const& site)
         -> duckdb::unique_ptr<sirius::op::sirius_physical_operator> {
         auto channel  = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
         auto endpoint = duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
@@ -361,7 +362,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> discover_top_n_targets(
           channel,
           gate_keep_threshold,
           sirius::op::scan::dynamic_filter_apply_mode::include_ast_row_masks,
-          sirius::op::scan::dynamic_filter_endpoint_provenance::top_n_endpoint);
+          sirius::op::scan::dynamic_filter_endpoint_provenance::top_n_endpoint,
+          &stats);
         site_channels.push_back(std::move(channel));
         return endpoint;
       });

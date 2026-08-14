@@ -566,7 +566,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           std::move(left),
           static_cast<std::size_t>(key.probe_key_ordinal),
           policy,
-          [&site_channels, &op_params](sirius::op::sirius_physical_operator const& site)
+          [&site_channels, &op_params, &sirius_context](
+            sirius::op::sirius_physical_operator const& site)
             -> duckdb::unique_ptr<sirius::op::sirius_physical_operator> {
             auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
             channel->register_producer();
@@ -575,7 +576,9 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
               site.estimated_cardinality,
               channel,
               op_params.dynamic_filter_keep_threshold,
-              sirius::op::scan::dynamic_filter_apply_mode::membership_masks_only);
+              sirius::op::scan::dynamic_filter_apply_mode::membership_masks_only,
+              sirius::op::scan::dynamic_filter_endpoint_provenance::join_edge,
+              &sirius_context->get_dynamic_filter_stats());
             site_channels.push_back(std::move(channel));
             return endpoint;
           });

@@ -42,6 +42,7 @@
 #include "expression/ast/node.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/dynamic_filter/top_n_group_key_producer.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_top_n.hpp"
@@ -815,4 +816,80 @@ TEST_CASE_METHOD(top_n_plan_shape_fixture,
   // No scan was bound: neither trace got past the join.
   CHECK(registered_slots(plan.get()).empty());
   CHECK(after.top_n_first_key_scan_targets == before.top_n_first_key_scan_targets);
+}
+
+TEST_CASE_METHOD(top_n_plan_shape_fixture,
+                 "top-n plan shape - a wrapped parquet scan shares one read-bypass latch with its "
+                 "wrapper",
+                 "[plan_tree_shape][isolated_context][top_n]")
+{
+  top_n_filter_switch_guard flag(*con, true);
+  // The wiring the pinned-serve runtime flip depends on: `make_gpu_scan_leaf` mints exactly one
+  // `read_time_filter_bypass` per wrapped scan and hands the same object to both the scan
+  // operator (which the scan manager marks at prepare) and its wrapper (which reads it at
+  // execute). Pointer identity is the whole contract -- two latches would make the mark
+  // unobservable.
+  auto plan =
+    generate_sirius_plan(*con, "SELECT id, v FROM " + facts_scan() + " ORDER BY v LIMIT 10");
+
+  auto const filters = scan_route_filters(plan.get());
+  REQUIRE(filters.size() == 1);
+  auto* scan_node = find_first(plan.get(), SiriusPhysicalOperatorType::GPU_SCAN);
+  REQUIRE(scan_node != nullptr);
+  auto const& scan = scan_node->Cast<sirius::op::scan::sirius_gpu_scan_operator>();
+
+  auto const scan_latch    = scan.read_bypass();
+  auto const wrapper_latch = filters.front()->read_bypass();
+  REQUIRE(scan_latch != nullptr);
+  REQUIRE(wrapper_latch != nullptr);
+  CHECK(scan_latch.get() == wrapper_latch.get());
+  // At plan time nothing has served, so the wrapper still answers with the fresh-read mode.
+  CHECK_FALSE(wrapper_latch->bypassed());
+  CHECK(filters.front()->effective_mode() ==
+        sirius::op::scan::dynamic_filter_apply_mode::membership_masks_only);
+}
+
+TEST_CASE_METHOD(top_n_plan_shape_fixture,
+                 "top-n plan shape - endpoint provenances carry no read-bypass latch",
+                 "[plan_tree_shape][isolated_context][top_n]")
+{
+  top_n_filter_switch_guard flag(*con, true);
+  // The latch is a scan-route concept -- an endpoint wraps no scan, so a serve-path fact has
+  // nothing to say to it. Both endpoint provenances must stay latch-free so a future refactor
+  // cannot accidentally give them one.
+
+  SECTION("a sited top-n endpoint")
+  {
+    // The split-keys shape from the deferral case above: key zero endpoints above the join.
+    auto plan     = generate_sirius_plan(*con,
+                                     "SELECT f.v, d.dv FROM facts f JOIN dim d ON f.id = d.dk "
+                                         "WHERE f.v + d.dv <> 12345 ORDER BY f.v, d.dv LIMIT 10");
+    bool observed = false;
+    for (auto* node : collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER)) {
+      auto* filter = static_cast<sirius_physical_dynamic_filter*>(node);
+      if (filter->provenance() != dynamic_filter_endpoint_provenance::top_n_endpoint) { continue; }
+      observed = true;
+      CHECK(filter->read_bypass() == nullptr);
+    }
+    REQUIRE(observed);
+  }
+
+  SECTION("a join-edge endpoint")
+  {
+    // A direct-route shape: the probe key is a plain reference whose trace stops at the
+    // subquery's TOP_N (not a scan), and the filtered build side supplies the evidence, so the
+    // join splices a membership endpoint above the stop point.
+    auto plan     = generate_sirius_plan(*con,
+                                     "SELECT j.id FROM (SELECT id, v FROM " + facts_scan() +
+                                       " ORDER BY v LIMIT 150) j "
+                                           "JOIN (SELECT dk FROM dim WHERE dk < 10) d ON j.id = d.dk");
+    bool observed = false;
+    for (auto* node : collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER)) {
+      auto* filter = static_cast<sirius_physical_dynamic_filter*>(node);
+      if (filter->provenance() != dynamic_filter_endpoint_provenance::join_edge) { continue; }
+      observed = true;
+      CHECK(filter->read_bypass() == nullptr);
+    }
+    REQUIRE(observed);
+  }
 }

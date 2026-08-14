@@ -34,14 +34,26 @@ sirius_physical_dynamic_filter::sirius_physical_dynamic_filter(
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> filters,
   double gate_keep_threshold,
   dynamic_filter_apply_mode mode,
-  dynamic_filter_endpoint_provenance provenance)
+  dynamic_filter_endpoint_provenance provenance,
+  sirius::op::dynamic_filter_stats* stats,
+  std::shared_ptr<read_time_filter_bypass> read_bypass)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::DYNAMIC_FILTER, std::move(types), estimated_cardinality),
     _filters(std::move(filters)),
     _gate(gate_keep_threshold),
     _mode(mode),
-    _provenance(provenance)
+    _provenance(provenance),
+    _stats(stats),
+    _read_bypass(std::move(read_bypass))
 {
+}
+
+dynamic_filter_apply_mode sirius_physical_dynamic_filter::effective_mode() const noexcept
+{
+  if (_read_bypass && _read_bypass->bypassed()) {
+    return dynamic_filter_apply_mode::include_ast_row_masks;
+  }
+  return _mode;
 }
 
 void sirius_physical_dynamic_filter::on_finalize_operator()
@@ -71,20 +83,27 @@ std::unique_ptr<operator_data> sirius_physical_dynamic_filter::execute(
   auto const& idle_batches = input.get_data_batches();
   auto const ro_batches    = input.get_read_only_batches();
 
+  // The serve-path latch is settled before the first batch, but read it once anyway so every
+  // batch of this call applies one mode.
+  auto const effective = effective_mode();
+
   std::vector<std::shared_ptr<::cucascade::data_batch>> output_batches;
   output_batches.reserve(ro_batches.size());
 
   for (std::size_t i = 0; i < ro_batches.size(); ++i) {
-    auto const& ro = ro_batches[i];
+    auto const& ro  = ro_batches[i];
+    auto const view = sirius::get_cudf_table_view(ro);
     // A null result means nothing was dropped — the gate declined, or no published filter matched.
     // Forward the batch unchanged (zero-copy; its columns stay co-owned via the idle shared_ptr).
-    auto filtered = apply_dynamic_filters_gated_view(sirius::get_cudf_table_view(ro),
-                                                     filters_snapshot,
-                                                     _gate,
-                                                     stream,
-                                                     _mode,
-                                                     ro.get_memory_space()->get_device_id());
+    auto filtered = apply_dynamic_filters_gated_view(
+      view, filters_snapshot, _gate, stream, effective, ro.get_memory_space()->get_device_id());
     if (filtered) {
+      if (_stats != nullptr) {
+        _stats->post_decode_apply_rows_in.fetch_add(static_cast<std::uint64_t>(view.num_rows()),
+                                                    std::memory_order_relaxed);
+        _stats->post_decode_apply_rows_out.fetch_add(
+          static_cast<std::uint64_t>(filtered->num_rows()), std::memory_order_relaxed);
+      }
       output_batches.push_back(sirius::make_data_batch(
         std::move(filtered), *ro.get_memory_space(), stream, batch_telemetry()));
     } else {

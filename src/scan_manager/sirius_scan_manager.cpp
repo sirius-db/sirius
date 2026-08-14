@@ -421,6 +421,11 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     // provider itself is built after the mask jobs run (below), so it can
     // take a copy of the entry's finished mask set.
     if (auto assignment = try_match_cached_entry(op)) {
+      // The wrapper's plan-time membership_masks_only mode rests on the premise that the
+      // parquet reader consumes AST-capable dynamic filters; a cache-served scan runs no
+      // reader, so latch the serve-path fact before execution starts and the wrapper
+      // promotes to post-decode AST application (main doc, "Pinned-cache-served scans").
+      op->mark_served_from_pinned_cache();
       cached_assignments.push_back(std::move(*assignment));
       _scan_op_order.push_back(op);
       continue;

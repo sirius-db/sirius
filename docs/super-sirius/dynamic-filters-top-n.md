@@ -905,7 +905,10 @@ Range filters follow [dynamic-filters-multi-gpu.md](dynamic-filters-multi-gpu.md
 references a scalar owned on the consumer's device. Sited endpoints execute on whichever devices
 run their pipeline tasks, so the planned replica set includes every endpoint consumer device and
 all-or-nothing replacement covers them unchanged. Sink self-consumption sits outside this
-contract: nothing is published, and its comparison scalar is task-local.
+contract: nothing is published, and its comparison scalar is task-local. A pinned-serve
+consumption flip ("Pinned-cache-served scans") changes where a scan target consumes, not its
+planned replica set: the post-decode AST path reads the same per-device replicas the reader
+path was planned for, and the fused compaction path is replica-free.
 
 Refinement replacement is all-or-nothing across planned consumer devices and across both layers:
 
@@ -987,8 +990,45 @@ default to statistics-only pruning here; Stage 6 must confirm the decode-time ro
 pays, or add the row-group-only path tracked for zone maps in
 [dynamic-filters.md](dynamic-filters.md).
 
-The following `sirius_physical_dynamic_filter` stays in `membership_masks_only` mode and does not
-reapply either layer.
+On the fresh-read path the following `sirius_physical_dynamic_filter` stays in
+`membership_masks_only` mode and does not reapply either layer. That mode is a plan-time
+answer to a runtime question, and a pinned-cache-served scan falsifies it — see
+"Pinned-cache-served scans" below.
+
+### Pinned-cache-served scans
+
+A pinned table (`CALL pin_table`, GPU or HOST tier) is served from resident chunks: the
+cached provider replaces the disk-reading split provider wholesale, so no parquet reader —
+and no reader-AST dynamic-filter consumption — runs for any split of that scan. For a
+parquet pin the replacement is all-or-nothing per scan per execution (parquet pins carry no
+MVCC or insert-delta side channel); only duckdb-native pins append delta splits, and the
+native wrapper already runs `include_ast_row_masks`.
+
+`prepare_for_query` is the single place that learns the serve path, and it completes before
+any pipeline task executes. On a cache-hit assignment it marks the scan's
+`read_time_filter_bypass` — a one-way latch the plan generator creates whenever it wraps a
+scan, co-owned by the scan operator and its wrapper. The wrapper derives its effective mode
+from the latch: a plan-time `membership_masks_only` wrapper is promoted to
+`include_ast_row_masks`, treating the pinned-served scan as what it effectively is — a
+native-style resident read with no read-time filter hook. Zone maps then apply through the
+combined AST row mask and Top-N boundaries through the fused compaction kernel, behind the
+same generation-aware keep-ratio gate as every post-decode consumer. Replica coverage is
+unchanged: the post-decode AST path consumes the same per-device replicas the reader path
+was planned for, and the compaction path needs none.
+
+The wash case is accepted and bounded. A bare Top-N over a pinned scan gains nothing from
+post-decode application (the sink prefilter would reject the same rows), which is the shape
+the siting rule refuses at plan time — but here the target is already sited and published
+(parquet is `SCAN_BIND` unconditionally), the wrapper already runs for membership filters,
+and the marginal cost is one gated pass per batch that the keep-ratio gate switches off when
+it prunes too little. The residual before the gate decides is the same honest floor the
+reader-path gate (WI-0b) accepts. When real per-row work sits between the pinned scan and
+the sink — the case that motivated siting in the first place — the flip is what makes the
+published filters actually consumable.
+
+HOST-tier chunks are staged host-to-device before the wrapper sees them, so the flip prunes
+after the copy; evaluating the boundary host-side, or pruning chunks against dynamic filters
+at serve time, could shrink the copy and is recorded under Open questions.
 
 ### DuckDB-native
 
@@ -1052,6 +1092,15 @@ because joins, unnests, and expensive projections between it and the sink do rea
 rows it rejects. The rule refuses sites that duplicate the sink's own pass; it does not refuse a
 backend.
 
+**Runtime falsification.** Condition 1 is answered at plan time from the reader a scan
+*would* be given; serving can falsify it afterwards. A pinned-cache hit runs no reader, so a
+parquet `SCAN_BIND`'s read-skipping premise is false for that execution even though the
+siting was correct when made. Siting is not revisited — publication is already justified and
+paid — but consumption moves to the post-decode path at prepare time ("Pinned-cache-served
+scans"). This is deliberately not WI-0b: the reader gate governs whether merging into a
+*running* reader pays, on a row-groups-pruned signal; the serve-path latch records that no
+reader will run at all, and the flipped path answers to the post-decode keep-ratio gate.
+
 ### The siting rule is necessary but not sufficient: the reader path needs a runtime gate
 
 Condition 1 asks whether the consumer *can* convert the predicate into avoided reads. That is a
@@ -1100,10 +1149,13 @@ grow it, so decisions must record snapshot generation.
 - An older completing measurement cannot overwrite a newer-generation decision.
 - A device with no applicable filter does not train the gate.
 
-Layers published to a Parquet scan execute inside the reader and remain outside this post-decode
-gate. They are not meant to stay ungated: the reader-side gate specified above (WI-0b — not yet
-implemented) will govern them on a different signal (row groups pruned, not mask keep-ratio).
-Until it lands, reader-path publications are the one ungated consumption path.
+Layers published to a Parquet scan served fresh from disk execute inside the reader and
+remain outside this post-decode gate. They are not meant to stay ungated: the reader-side
+gate specified above (WI-0b — not yet implemented) will govern them on a different signal
+(row groups pruned, not mask keep-ratio). Until it lands, fresh-read reader-path
+publications are the one ungated consumption path. A pinned-cache-served scan is not on
+that path: its consumption flips post-decode at prepare time ("Pinned-cache-served scans")
+and sits behind this gate like every other post-decode consumer.
 
 ## Scheduling and lifecycle
 
@@ -1188,6 +1240,8 @@ These must start empty for every execution:
 - Channel generation and populated-slot count.
 - Coordinator boundary, pending candidate, revision, and metrics.
 - Generation-based gate decisions.
+- The scan serve-path latch (`read_time_filter_bypass`): un-bypassed at plan construction,
+  decided once per execution during `prepare_for_query`.
 
 The implementation must create per-execution state behind an immutable route plan or prove Sirius
 creates fresh plans and channels for every execution. Both engines make this explicit: DuckDB
@@ -1285,6 +1339,8 @@ Recommended metrics:
 - Replica bytes, latency, route, and failure per device.
 - Parquet files/row groups/rows pruned where cuDF exposes them.
 - Native rows before and after the fused-kernel application.
+- Post-decode wrapper rows before/after (`post_decode_apply_rows_in/out`), covering native,
+  endpoint, and pinned-cache-served consumption.
 - Fused-kernel time per batch versus the AST mask-then-apply path it replaces, until the
   expected win is validated by measurement rather than assumed.
 - Gate decisions and generation-triggered remeasurements.
@@ -1402,6 +1458,11 @@ should cover:
    All three engines already make peer survival arrival-order dependent.
 5. Which timestamp/timezone and decimal representations have identical ordering?
 6. Should Parquet apply AST filters post-decode when reader pushdown is disabled?
+   **Answered for the whole-scan case:** a pinned-cache-served scan flips to post-decode
+   application at prepare ("Pinned-cache-served scans"). Still open per split: a
+   `disable_filter_pushdown` split (BYTE_ARRAY-decimal probe) skips reader-side dynamic AST
+   under a membership-only wrapper — unreachable by any supported writer today, and a
+   per-split flip would need batch-level signaling the per-scan latch deliberately avoids.
 7. Can native metadata refresh generations before decode without new coupling?
 8. What update cadence best amortizes multi-GPU scalar construction? Neither reference engine
    throttles beyond monotonic checks, but their update cost is one host value, not replicas.
@@ -1415,6 +1476,10 @@ should cover:
     per task?
 11. Should grouping-key-only `HAVING` be admitted by witnessing through the same predicate in
     the aggregate sink?
+12. Should HOST-tier pinned chunks evaluate dynamic filters host-side (or before the H2D
+    copy) so pruned rows are never staged?
+13. Should serve-time chunk pruning consult dynamic filters against the pinned zone-map
+    sidecar as boundaries tighten, the way static pushed-down filters already prune chunks?
 
 These affect eligibility and performance policy, not the replacement protocol.
 
@@ -1437,6 +1502,7 @@ These affect eligibility and performance policy, not the replacement protocol.
 | Merge helpers | `src/op/scan/dynamic_filter_merge.cpp` | Consume coherent snapshot |
 | Gate | `src/include/op/scan/dynamic_filter_gate.hpp` | Invalidate by generation |
 | Scan wrapping | `src/planner/sirius_physical_plan_generator.cpp` | Reuse existing consumers |
+| Serve-path flip | `src/include/op/scan/read_time_filter_bypass.hpp`, `src/scan_manager/sirius_scan_manager.cpp` | Latch pinned-serve at prepare; wrapper promotes to post-decode AST |
 
 DuckDB `DynamicFilterData` may remain for CPU fallback compatibility, but is not the GPU transport
 or synchronization primitive.

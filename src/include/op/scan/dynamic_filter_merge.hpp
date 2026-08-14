@@ -31,7 +31,9 @@ namespace sirius::op::scan {
 
 /// Controls post-decode row-mask application.
 /// - membership_masks_only applies only mask-applicable membership filters (IN-list / Bloom); use
-///   it when AST filters already ran as scan-time row-group pruning.
+///   it when AST filters already ran as scan-time row-group pruning. A pinned-cache-served scan
+///   has no scan-time pruning phase; its wrapper promotes to include_ast_row_masks via
+///   `read_time_filter_bypass`.
 /// - include_ast_row_masks also evaluates AST-capable filters row-wise with cudf::compute_column,
 ///   for materialized inputs that had no scan-time pruning phase.
 enum class dynamic_filter_apply_mode { membership_masks_only, include_ast_row_masks };

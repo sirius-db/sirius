@@ -262,6 +262,11 @@ struct multi_key_route_terminal {
  * filters after decode, so the two decisions cannot drift apart. When a backend gains a read-time
  * filter path, this function is the only place that changes -- neither the siting rule nor its
  * callers mention a format.
+ *
+ * The answer is a plan-time property of the reader the scan would be given; serving can falsify
+ * it at runtime -- a pinned-cache hit runs no reader -- in which case consumption flips to the
+ * post-decode wrapper at prepare time via `read_time_filter_bypass` while the siting decision
+ * stands (main doc, "Pinned-cache-served scans").
  */
 [[nodiscard]] bool target_skips_reads(sirius::op::sirius_physical_operator const& node) noexcept;
 

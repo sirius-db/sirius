@@ -76,6 +76,9 @@ struct dynamic_filter_stats_snapshot {
   std::uint64_t top_n_group_witness_set_full   = 0;
   std::uint64_t top_n_group_prefilter_rows_in  = 0;
   std::uint64_t top_n_group_prefilter_rows_out = 0;
+
+  std::uint64_t post_decode_apply_rows_in  = 0;
+  std::uint64_t post_decode_apply_rows_out = 0;
 };
 
 /**
@@ -195,6 +198,16 @@ struct dynamic_filter_stats {
   std::atomic<std::uint64_t> top_n_group_prefilter_rows_in{0};
   std::atomic<std::uint64_t> top_n_group_prefilter_rows_out{0};
 
+  // --- Post-decode consumer (pinned-serve flip) ---
+  // Delivery-time: sirius_physical_dynamic_filter adds one batch's rows when its gated apply
+  // produced a result table (at least one filter computed a mask or compaction dropped rows;
+  // gate-declined and no-applicable-filter batches count nowhere). Covers every provenance
+  // (scan_route, join_edge, top_n_endpoint), every capability, and both modes -- a test that
+  // must isolate one capability uses a channel carrying only that capability. Batch arrival
+  // races publication by design, so tests assert deltas or directions only.
+  std::atomic<std::uint64_t> post_decode_apply_rows_in{0};
+  std::atomic<std::uint64_t> post_decode_apply_rows_out{0};
+
   /**
    * @brief Read every counter with relaxed ordering
    *
@@ -256,7 +269,9 @@ struct dynamic_filter_stats {
       .top_n_group_prefilter_rows_in =
         top_n_group_prefilter_rows_in.load(std::memory_order_relaxed),
       .top_n_group_prefilter_rows_out =
-        top_n_group_prefilter_rows_out.load(std::memory_order_relaxed)};
+        top_n_group_prefilter_rows_out.load(std::memory_order_relaxed),
+      .post_decode_apply_rows_in  = post_decode_apply_rows_in.load(std::memory_order_relaxed),
+      .post_decode_apply_rows_out = post_decode_apply_rows_out.load(std::memory_order_relaxed)};
   }
 };
 

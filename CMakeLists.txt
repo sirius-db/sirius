@@ -639,6 +639,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_dynamic_filter_sip.cpp
     test/cpp/integration/test_gpu_execution_top_n_dynamic_filter.cpp
     test/cpp/integration/test_gpu_execution_top_n_dynamic_filter_measurement.cpp
+    test/cpp/integration/test_gpu_execution_top_n_pinned_serve.cpp
     test/cpp/integration/test_gpu_execution_decimal_pushdown.cpp
     test/cpp/integration/test_gpu_execution_filter_nulls.cpp
     test/cpp/integration/test_gpu_execution_join_nulls.cpp
@@ -710,6 +711,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_top_n_prefilter.cpp
     test/cpp/operator/test_physical_ungrouped_aggregate.cpp
     test/cpp/operator/test_dynamic_filter_refinement_slots.cpp
+    test/cpp/operator/test_physical_dynamic_filter_mode.cpp
     test/cpp/operator/test_sirius_dynamic_filter.cpp
     test/cpp/operator/test_sirius_dynamic_range_filters.cpp
     test/cpp/operator/test_top_n_boundary_filter.cpp
