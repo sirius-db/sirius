@@ -128,6 +128,7 @@ add_library(
   # CUDA kernels: operators + offsets
   src/bridge/offsets_cumsum.cu
   src/selection/selection_wave.cu
+  src/selection/latemat_rowset.cu
   src/operators/alp_compressor.cu
   src/operators/alp_rd_compressor.cu
   src/operators/ans_compressor.cu
@@ -231,6 +232,17 @@ add_codegen_host_test(test_multi_gpu_stream_affinity)
 add_codegen_host_test(test_masked_decode_variants)
 add_codegen_host_test(test_selection_wave)
 add_codegen_host_test(test_render_signature_contract)
+add_codegen_host_test(test_late_mat_row_decode)
+# Fast-path coverage: compile the extension-side late materializer into the
+# row-decode test (its headers need only src/include + src + this include dir).
+target_sources(
+  test_late_mat_row_decode
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../late_mat/late_materializer.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/../../late_mat/rowid_emission.cpp)
+target_include_directories(
+  test_late_mat_row_decode PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+                                   ${CMAKE_CURRENT_SOURCE_DIR}/../..)
+add_codegen_host_test(test_late_mat_edge_geometry)
 
 # Multi-mode CLI. Target is simpatico_cli to avoid clashing with the lib target;
 # the installed binary is named 'simpatico'.
@@ -267,3 +279,5 @@ add_test(NAME multi_gpu_stream_affinity COMMAND test_multi_gpu_stream_affinity)
 add_test(NAME masked_decode_variants COMMAND test_masked_decode_variants)
 add_test(NAME selection_wave COMMAND test_selection_wave)
 add_test(NAME render_signature_contract COMMAND test_render_signature_contract)
+add_test(NAME late_mat_row_decode COMMAND test_late_mat_row_decode)
+add_test(NAME late_mat_edge_geometry COMMAND test_late_mat_edge_geometry)

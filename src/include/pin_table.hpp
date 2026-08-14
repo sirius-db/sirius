@@ -124,6 +124,9 @@ struct materialized_pin {
   /// capture was skipped (no pinned column types). Fed together with the
   /// pin-time column types into @c sirius_scan_manager::insert_pinned_entry.
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats;
+  /// Late-mat uniqueness facts captured by the opt-in pin-time exact check
+  /// (SIRIUS_LATE_MAT_PIN_UNIQUE_COLS): batch-column indices proven unique.
+  std::vector<std::uint32_t> unique_columns;
 };
 
 /// Pin-time validation of the coalescer invariant the MVCC delta merge relies on
@@ -190,6 +193,9 @@ struct host_pin_result {
   /// (no pinned column types). Fed with the pin-time column types into
   /// @c sirius_scan_manager::insert_pinned_entry_host to drive zone-map pruning.
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats;
+  /// Late-mat uniqueness facts captured by the opt-in pin-time exact check
+  /// (SIRIUS_LATE_MAT_PIN_UNIQUE_COLS): batch-column indices proven unique.
+  std::vector<std::uint32_t> unique_columns;
 };
 
 /// Optional compression settings for @ref materialize_pin_to_host
@@ -231,6 +237,9 @@ struct device_pin_result {
   /// and uncompressed chunks alike); becomes duckdb_mvcc_metadata::
   /// base_row_count_per_chunk for duckdb-format pins.
   std::vector<std::size_t> base_row_count_per_chunk;
+  /// Late-mat uniqueness facts captured by the opt-in pin-time exact check
+  /// (SIRIUS_LATE_MAT_PIN_UNIQUE_COLS): batch-column indices proven unique.
+  std::vector<std::uint32_t> unique_columns;
 };
 
 /// Drive @p ingestible to completion, streaming each emitted batch to pinned host memory

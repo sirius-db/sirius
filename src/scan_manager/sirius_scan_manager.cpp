@@ -27,6 +27,7 @@
 #include "io/parquet_helpers.hpp"
 #include "io/rest/rest_ioctx.hpp"
 #include "io/sirius_datasource.hpp"
+#include "late_mat/column_origin.hpp"
 #include "log/logging.hpp"
 #include "memory/topology_index.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
@@ -40,15 +41,19 @@
 #include "op/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "planner/query.hpp"
+#include "scan_manager/late_mat_defer_policy.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
 
 #include <cudf/column/column_view.hpp>
+#include <cudf/concatenate.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/reduction/unique_count.hpp>
+#include <cudf/sorting.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
@@ -71,9 +76,11 @@
 #include <duckdb/transaction/duck_transaction_manager.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -97,6 +104,162 @@ cudf::data_type host_column_carrier(cucascade::memory::column_metadata const& me
   auto const is_decimal = id == cudf::type_id::DECIMAL32 || id == cudf::type_id::DECIMAL64 ||
                           id == cudf::type_id::DECIMAL128;
   return is_decimal ? cudf::data_type{id, meta.scale} : cudf::data_type{id};
+}
+
+/// Defined below, next to insert_pinned_entry_host (same anonymous namespace).
+std::size_t pinned_host_chunk_rows(cucascade::idata_representation const& chunk);
+
+/// Late-mat handle lifecycle (SIRIUS_EXP_LATE_MAT). The
+/// insert/remove paths call these so an origin can never dangle: any entry
+/// death or replacement invalidates the old handle first (outstanding origins
+/// fail closed), and a fresh entry gets a fresh handle only when the gate is
+/// on (gate off ⇒ no handle is ever created and the field stays empty).
+void invalidate_late_mat_handle(pinned_entry& entry)
+{
+  if (entry.late_mat_handle) { entry.late_mat_handle->invalidate(); }
+}
+
+/// Record pin-time uniqueness facts on the freshly installed entry (census
+/// proof line per fact — the group-by-rowid admission cites these). Facts are
+/// only attached on fresh installs/replacements; the GPU-tier merge path
+/// keeps the existing entry's facts (positions stay valid, append-only).
+void attach_unique_column_facts(std::string const& name,
+                                pinned_entry& slot,
+                                std::vector<std::uint32_t> unique_columns)
+{
+  slot.unique_columns = std::move(unique_columns);
+  for (auto const pos : slot.unique_columns) {
+    if (pos < slot.cache_info.names.size()) {
+      SIRIUS_LOG_INFO(
+        "[late_mat] pin uniqueness fact: entry '{}' column '{}' proven unique (pin-exact)",
+        name,
+        slot.cache_info.names[pos]);
+    }
+  }
+  // EXACT-COUNT FALLBACK: the cheap per-chunk composition (sorted + strict
+  // boundaries) fails whenever the pin's chunk order is not key-ordered (e.g.
+  // multi-file parquet pins), even for a globally-unique column. For every
+  // tracked-but-unproven column that is still device-resident and small
+  // enough to assemble, run a full EXACT check: concatenate -> sort ->
+  // unique_count == rows (unique_count over sorted data IS the exact distinct
+  // count; nothing approximate is ever recorded). Pin-time-only cost, logged
+  // per column. Skips (each logged): compressed chunks, non-GPU tiers,
+  // cross-device pins, > INT32_MAX rows (cudf column bound).
+  auto const tracked = late_mat::pin_unique_probe_columns(slot.cache_info.names);
+  for (auto const pos : tracked) {
+    if (std::ranges::find(slot.unique_columns, pos) != slot.unique_columns.end()) {
+      continue;  // already proven by the cheap pass
+    }
+    if (pos >= slot.cache_info.names.size()) { continue; }
+    auto const& col_name = slot.cache_info.names[pos];
+    if (slot.num_rows == 0 ||
+        slot.num_rows > static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max())) {
+      SIRIUS_LOG_INFO(
+        "[late_mat] pin exact-uniqueness check skipped: entry '{}' column '{}' ({} rows exceed "
+        "the single-column bound)",
+        name,
+        col_name,
+        slot.num_rows);
+      continue;
+    }
+    // Gather the column's chunk views (device-resident forms only).
+    std::vector<cudf::column_view> views;
+    int device_id  = -1;
+    bool supported = slot.tier == cucascade::memory::Tier::GPU;
+    if (supported && !slot.device_chunks.empty()) {
+      for (auto const& chunk : slot.device_chunks) {
+        if (chunk.compressed || pos >= chunk.columns.size() || !chunk.columns[pos]) {
+          supported = false;
+          break;
+        }
+        views.push_back(chunk.columns[pos]->view());
+        int const dev = chunk.memory_space ? chunk.memory_space->get_device_id() : -1;
+        if (device_id == -1) { device_id = dev; }
+        if (dev != device_id) {
+          supported = false;
+          break;
+        }
+      }
+    } else if (supported && !slot.data_batches_by_column.empty()) {
+      auto const it = slot.data_batches_by_column.find(col_name);
+      supported     = it != slot.data_batches_by_column.end();
+      if (supported) {
+        for (std::size_t c = 0; c < it->second.size(); ++c) {
+          auto const& chunk = it->second[c];
+          if (!chunk) {
+            supported = false;
+            break;
+          }
+          views.push_back(chunk->view());
+          int const dev = c < slot.chunk_memory_spaces.size() && slot.chunk_memory_spaces[c]
+                            ? slot.chunk_memory_spaces[c]->get_device_id()
+                            : -1;
+          if (device_id == -1) { device_id = dev; }
+          if (dev != device_id) {
+            supported = false;
+            break;
+          }
+        }
+      }
+    } else {
+      supported = false;
+    }
+    if (!supported || views.empty() || views.front().null_count() > 0) {
+      SIRIUS_LOG_INFO(
+        "[late_mat] pin exact-uniqueness check skipped: entry '{}' column '{}' (storage form "
+        "not device-assemblable)",
+        name,
+        col_name);
+      continue;
+    }
+    try {
+      auto const t0 = std::chrono::steady_clock::now();
+      rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{device_id}};
+      auto assembled = cudf::concatenate(views);
+      if (assembled->view().null_count() > 0) { continue; }
+      auto sorted = cudf::sort(cudf::table_view({assembled->view()}), {cudf::order::ASCENDING}, {});
+      assembled.reset();
+      auto const distinct = cudf::unique_count(
+        sorted->view().column(0), cudf::null_policy::EXCLUDE, cudf::nan_policy::NAN_IS_VALID);
+      sorted.reset();
+      auto const ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
+          .count();
+      if (static_cast<std::size_t>(distinct) == slot.num_rows) {
+        slot.unique_columns.push_back(pos);
+        SIRIUS_LOG_INFO(
+          "[late_mat] pin uniqueness fact: entry '{}' column '{}' proven unique "
+          "(pin-exact-count, {} rows, {} ms)",
+          name,
+          col_name,
+          slot.num_rows,
+          ms);
+      } else {
+        SIRIUS_LOG_INFO(
+          "[late_mat] pin exact-uniqueness check: entry '{}' column '{}' NOT unique "
+          "({} distinct of {} rows, {} ms)",
+          name,
+          col_name,
+          distinct,
+          slot.num_rows,
+          ms);
+      }
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_WARN(
+        "[late_mat] pin exact-uniqueness check failed for entry '{}' column '{}': {} — no "
+        "fact recorded",
+        name,
+        col_name,
+        e.what());
+    }
+  }
+}
+
+void attach_late_mat_handle(std::string const& name, pinned_entry& slot)
+{
+  if (!late_mat::late_mat_enabled()) { return; }
+  slot.late_mat_handle = std::make_shared<late_mat::pin_entry_handle>(name, /*generation=*/1);
+  slot.late_mat_handle->set_entry(&slot);
 }
 
 struct cached_databatch_provider : public databatch_provider {
@@ -125,6 +288,31 @@ struct cached_databatch_provider : public databatch_provider {
       _column_names.emplace_back(entry_column_names[idx]);
       _column_indices.push_back(idx);
     });
+    // Late-mat origin stamping (SIRIUS_EXP_LATE_MAT): precompute the shared
+    // per-column origins and the chunk row-starts prefix so each served batch
+    // knows its global row span. Same invariants as the fused attaches — no
+    // MVCC keep-masks and no insert-delta splits (origins under MVCC would
+    // resurrect masked rows; delta rows lie beyond the pinned prefix). Gate
+    // off ⇒ this whole block is a null-handle check.
+    if (late_mat::late_mat_enabled() && _entry.late_mat_handle && _mvcc_masks.empty() &&
+        _delta_splits.empty()) {
+      auto const& handle = _entry.late_mat_handle;
+      auto origins       = std::make_shared<std::vector<late_mat::column_origin>>();
+      origins->reserve(_column_indices.size());
+      for (auto const idx : _column_indices) {
+        origins->push_back(
+          late_mat::column_origin{handle, static_cast<std::uint32_t>(idx), handle->generation()});
+      }
+      _origin_columns       = std::move(origins);
+      auto const chunk_rows = pinned_chunk_row_counts(_entry);
+      _chunk_row_counts     = chunk_rows;
+      _chunk_row_starts.resize(chunk_rows.size());
+      std::int64_t running = 0;
+      for (std::size_t i = 0; i < chunk_rows.size(); ++i) {
+        _chunk_row_starts[i] = running;
+        running += chunk_rows[i];
+      }
+    }
   }
 
   databatch_provider::batch get_next_batch() override
@@ -154,7 +342,20 @@ struct cached_databatch_provider : public databatch_provider {
     auto mask             = index < _mvcc_masks.size() ? _mvcc_masks[index] : mvcc_chunk_mask{};
     auto const converts   = chunk_needs_carrier_conversion(index);
     auto const dest_bytes = converts ? conversion_destination_bytes_for_chunk(index) : 0;
-    return {std::move(data), std::move(mask), converts, dest_bytes};
+    databatch_provider::batch out{std::move(data), std::move(mask)};
+    out.needs_carrier_conversion     = converts;
+    out.conversion_destination_bytes = dest_bytes;
+    // Late-mat: stamp this chunk's global row span (origins were only built
+    // when the invariants held — see the constructor — so the mask above is
+    // necessarily default here).
+    if (_origin_columns && index < _chunk_row_starts.size()) {
+      auto origin         = std::make_shared<late_mat::scan_batch_origin>();
+      origin->columns     = _origin_columns;
+      origin->range       = {_chunk_row_starts[index], _chunk_row_counts[index]};
+      origin->chunk_index = index;
+      out.late_mat_origin = std::move(origin);
+    }
+    return out;
   }
 
  private:
@@ -420,6 +621,13 @@ struct cached_databatch_provider : public databatch_provider {
   /// This operator's insert-delta splits, yielded after the resident chunks
   /// (staging and mask words shared with sibling operators' cuts).
   std::vector<insert_delta_split> _delta_splits;
+  /// Late-mat origin state (SIRIUS_EXP_LATE_MAT; empty when the gate is off or
+  /// the invariants failed): the shared per-column origins, and per-chunk
+  /// row starts/counts in pin order indexed by CHUNK INDEX (zone-map pruning
+  /// skips chunks, so the prefix covers all of them).
+  std::shared_ptr<const std::vector<late_mat::column_origin>> _origin_columns;
+  std::vector<std::int64_t> _chunk_row_starts;
+  std::vector<std::int64_t> _chunk_row_counts;
   // The scan's carrier targets in output order, which is also the order the served columns
   // arrive in (see the note at the make_provider_for_pinned_entry call site). Shorter than the
   // served column list exactly when the scan materializes trailing pure-filter columns.
@@ -484,6 +692,42 @@ std::string normalize_path(std::string const& p)
 }
 
 }  // namespace
+
+// Public (declared in scan_manager/sirius_scan_manager.hpp): the late-mat
+// layout source of truth. The cached provider's origin stamping above and
+// the late materializer both derive per-chunk global row starts from this —
+// keep the storage-form dispatch priority identical to the provider's
+// (device_chunks > data_batches_by_column > host_chunks).
+std::vector<std::int64_t> pinned_chunk_row_counts(pinned_entry const& entry)
+{
+  std::vector<std::int64_t> counts;
+  if (!entry.device_chunks.empty()) {
+    counts.reserve(entry.device_chunks.size());
+    for (auto const& chunk : entry.device_chunks) {
+      if (chunk.compressed) {
+        counts.push_back(chunk.compressed->num_rows());
+      } else if (!chunk.columns.empty() && chunk.columns.front()) {
+        counts.push_back(static_cast<std::int64_t>(chunk.columns.front()->size()));
+      } else {
+        counts.push_back(0);
+      }
+    }
+    return counts;
+  }
+  if (!entry.data_batches_by_column.empty()) {
+    auto const& first_column_chunks = entry.data_batches_by_column.begin()->second;
+    counts.reserve(first_column_chunks.size());
+    for (auto const& chunk : first_column_chunks) {
+      counts.push_back(chunk ? static_cast<std::int64_t>(chunk->size()) : 0);
+    }
+    return counts;
+  }
+  counts.reserve(entry.host_chunks.size());
+  for (auto const& chunk : entry.host_chunks) {
+    counts.push_back(chunk ? static_cast<std::int64_t>(pinned_host_chunk_rows(*chunk)) : 0);
+  }
+  return counts;
+}
 
 sirius_scan_manager::sirius_scan_manager(
   const scan_manager_config& config,
@@ -734,6 +978,18 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   // shared through the masks' owning pointers), then the requests release
   // theirs. The sequencer only spawns in start_metadata_processing, so
   // serving still starts with finished masks.
+  // Late-mat v3: per-query origin registry, built COMPLETE before any install
+  // so rider origins resolve regardless of assignment order. Parquet-pin
+  // entries only (MVCC-carrying duckdb pins are excluded — rider
+  // materialization by rowid cannot compose with visibility masks).
+  late_mat_defer_context late_mat_ctx;
+  if (late_mat::late_mat_enabled()) {
+    for (auto const& assignment : cached_assignments) {
+      if (assignment.entry->late_mat_handle && assignment.entry->mvcc == nullptr) {
+        late_mat_ctx.by_scan[assignment.op] = {assignment.entry, assignment.columns};
+      }
+    }
+  }
   for (auto& assignment : cached_assignments) {
     mvcc_chunk_mask_set masks;  // stays empty for parquet pins
     std::vector<insert_delta_split> delta_splits;
@@ -783,6 +1039,15 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
           assignment.entry_name,
           delta_request->plan.delta_rows());
       }
+    }
+    // Late-mat deferral (SIRIUS_EXP_LATE_MAT): plan-time walk + directive pair
+    // install. Same invariants as the origin stamping (no MVCC masks, no
+    // insert-delta splits), plus single-GPU (cross-device pin gathers are not
+    // in v1). Bails internally on any shape it cannot prove transparent.
+    if (late_mat::late_mat_enabled() && masks.empty() && delta_splits.empty() && _topology_index &&
+        _topology_index->gpu_ids().size() == 1) {
+      try_install_late_mat_deferral(
+        assignment.op, *assignment.entry, assignment.columns, &late_mat_ctx);
     }
     // The scan's filter as the decompressor can use it: columns the query only
     // ever tests for equality and never projects can come back as the boolean
@@ -1167,7 +1432,8 @@ void sirius_scan_manager::insert_pinned_entry(
   std::vector<cucascade::memory::memory_space*> chunk_memory_spaces,
   duckdb::vector<duckdb::LogicalType> column_types,
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
-  sirius::pinned_column_storage_matrix column_storage)
+  sirius::pinned_column_storage_matrix column_storage,
+  std::vector<std::uint32_t> unique_columns)
 {
   // chunk_memory_spaces is parallel to data_tables — the caller
   // (PinTableFunction) emits one memory_space* per coalesced batch, and
@@ -1246,6 +1512,10 @@ void sirius_scan_manager::insert_pinned_entry(
       // the same files differently. Reject any mismatch loudly rather than
       // silently aliasing.
       auto& entry = existing_it->second;
+      // Late-mat: the merge mutates the entry in place (append-only columns).
+      // Bump BEFORE any mutation so origins captured against the pre-merge
+      // state fail closed even if a later check throws mid-merge.
+      if (entry.late_mat_handle) { entry.late_mat_handle->bump_generation(); }
       if (entry.chunk_memory_spaces.size() != chunk_memory_spaces.size()) {
         throw std::runtime_error(
           "[sirius_scan_manager::insert_pinned_entry] merge mismatch — "
@@ -1376,6 +1646,7 @@ void sirius_scan_manager::insert_pinned_entry(
       return;
     }
     // Row count or completeness contract differs → drop the stale entry and rebuild below.
+    invalidate_late_mat_handle(existing_it->second);
     _pinned_entries.erase(existing_it);
   }
 
@@ -1400,7 +1671,9 @@ void sirius_scan_manager::insert_pinned_entry(
     }
   }
 
-  _pinned_entries[name] = std::move(entry);
+  auto& slot = _pinned_entries[name] = std::move(entry);
+  attach_late_mat_handle(name, slot);
+  attach_unique_column_facts(name, slot, std::move(unique_columns));
 }
 
 namespace {
@@ -1429,7 +1702,8 @@ void sirius_scan_manager::insert_pinned_entry_host(
   cucascade::memory::memory_space& memory_space,
   duckdb::vector<duckdb::LogicalType> column_types,
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
-  sirius::pinned_column_storage_matrix column_storage)
+  sirius::pinned_column_storage_matrix column_storage,
+  std::vector<std::uint32_t> unique_columns)
 {
   // The host-tier path captures one chunk per emitted batch; each chunk holds every
   // pinned column (compressed or uncompressed). Re-insert always replaces — there is
@@ -1497,7 +1771,14 @@ void sirius_scan_manager::insert_pinned_entry_host(
   entry.column_storage = std::move(column_storage);
   entry.zone_maps      = std::move(pin_zone_maps);
 
-  _pinned_entries[name] = std::move(entry);
+  // Host re-pin always REPLACES: fail any origins minted against the old
+  // entry before its content is overwritten in place.
+  if (auto it = _pinned_entries.find(name); it != _pinned_entries.end()) {
+    invalidate_late_mat_handle(it->second);
+  }
+  auto& slot = _pinned_entries[name] = std::move(entry);
+  attach_late_mat_handle(name, slot);
+  attach_unique_column_facts(name, slot, std::move(unique_columns));
 }
 
 void sirius_scan_manager::insert_pinned_entry_device(
@@ -1505,7 +1786,8 @@ void sirius_scan_manager::insert_pinned_entry_device(
   cache_entry_info cache_info,
   std::vector<sirius::device_pin_chunk> chunks,
   cucascade::memory::memory_space& memory_space,
-  sirius::pinned_column_storage_matrix column_storage)
+  sirius::pinned_column_storage_matrix column_storage,
+  std::vector<std::uint32_t> unique_columns)
 {
   std::size_t new_num_rows = 0;
   for (auto const& chunk : chunks) {
@@ -1548,7 +1830,14 @@ void sirius_scan_manager::insert_pinned_entry_device(
                    entry.device_chunks.size(),
                    new_num_rows);
 
-  _pinned_entries[name] = std::move(entry);
+  // Device re-pin always REPLACES: fail any origins minted against the old
+  // entry before its content is overwritten in place.
+  if (auto it = _pinned_entries.find(name); it != _pinned_entries.end()) {
+    invalidate_late_mat_handle(it->second);
+  }
+  auto& slot = _pinned_entries[name] = std::move(entry);
+  attach_late_mat_handle(name, slot);
+  attach_unique_column_facts(name, slot, std::move(unique_columns));
 }
 
 void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
@@ -1563,6 +1852,9 @@ void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
 
 void sirius_scan_manager::remove_pinned_entry(const std::string& name)
 {
+  if (auto it = _pinned_entries.find(name); it != _pinned_entries.end()) {
+    invalidate_late_mat_handle(it->second);
+  }
   _pinned_entries.erase(name);
 }
 

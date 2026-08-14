@@ -18,6 +18,7 @@
 
 #include "config.hpp"
 #include "log/logging.hpp"
+#include "op/late_mat_port_materialize.hpp"
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -116,6 +117,15 @@ void pipelineable_operator_data::prepare_for_processing(
         "pipelineable_operator_data: failed to lock batch {} for processing, state: {}",
         batch->get_batch_id(),
         static_cast<int>(batch->get_state()));
+    }
+    // Late-mat (SIRIUS_EXP_LATE_MAT): materialize deferred columns at the
+    // consuming port's prepare — the Pk-finish/Pm-prepare scheduling boundary.
+    // Signature-gated per batch inside the helper, so non-deferred batches of
+    // the same task (e.g. the other join port's) pass through untouched. The
+    // directive is only ever stamped when the gate is on.
+    if (late_mat_directive) {
+      ro_batch =
+        op::late_mat_apply_port_directive(std::move(*ro_batch), *late_mat_directive, stream);
     }
     ro_batches.emplace_back(std::move(*ro_batch));
   }

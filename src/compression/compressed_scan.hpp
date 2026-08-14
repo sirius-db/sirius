@@ -38,6 +38,10 @@ namespace simpatico {
 class compressed_table;
 }  // namespace simpatico
 
+namespace sirius::late_mat {
+struct row_selection;  // late_mat/column_origin.hpp (held by shared_ptr only)
+}  // namespace sirius::late_mat
+
 namespace sirius {
 
 //===----------------------------------------------------------------------===//
@@ -132,6 +136,13 @@ struct scan_decode_request {
   /// partial request always leaves a residual for the scan to evaluate.
   bool ranges_cover_whole_filter = false;
 
+  /// Late-mat capture request (SIRIUS_EXP_LATE_MAT, additive): when true, a
+  /// decode that applies a row selection it can describe moves its wave-1
+  /// selection buffers onto @ref decode_outcome::captured_selection instead
+  /// of freeing them. Default false; adds no behavior until the converter
+  /// reads it.
+  bool capture_selection = false;
+
   [[nodiscard]] bool empty() const noexcept;
   /// True iff any entry asks for rows to be DROPPED (as opposed to a column
   /// being answered in place, which changes no row count).
@@ -185,9 +196,21 @@ struct decode_outcome {
   /// dropped for them, so the scan must still evaluate them.
   bool predicates_enforced = false;
 
+  /// Late-mat wave-seam capture (SIRIUS_EXP_LATE_MAT): the wave-1 selection
+  /// buffers, moved out of the fused decode instead of freed, when the request
+  /// asked for capture (scan_decode_request::capture_selection) AND the decode
+  /// applied a row selection it can describe (whole conjunction, or a
+  /// membership-compacted / partial-coverage selection whose mask still
+  /// describes the output rows — never a RULE-2 bail). kind=mask, geometry
+  /// over the chunk's FULL row count; `range` is left zeroed by the converter —
+  /// scan_operator_input::prepare_for_processing fills it from the split's
+  /// origin when it harvests (and then clears) this field. Default empty.
+  std::shared_ptr<const late_mat::row_selection> captured_selection;
+
   [[nodiscard]] bool any() const noexcept
   {
-    return row_filtered || selection_unprofitable || !predicate_columns.empty();
+    return row_filtered || selection_unprofitable || !predicate_columns.empty() ||
+           captured_selection != nullptr;
   }
 };
 
@@ -217,6 +240,12 @@ class compressed_scan {
   /// working; only the attempt to compact is given up. Null if nothing is left
   /// to ask for.
   [[nodiscard]] std::shared_ptr<const compressed_scan> without_row_selection() const;
+
+  /// A copy whose decode also captures its wave-1 row selection onto
+  /// @ref decode_outcome::captured_selection (late-mat, SIRIUS_EXP_LATE_MAT).
+  /// Per-batch modifier like the others: the representation's
+  /// request_selection_capture() installs it on the projected clone only.
+  [[nodiscard]] std::shared_ptr<const compressed_scan> with_selection_capture() const;
 
   /// This scan with its join filters replaced by a fresher snapshot. @p probes
   /// is parallel to the selected column list.

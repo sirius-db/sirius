@@ -22,6 +22,7 @@
 #include <compression/decompression_pushdown_policy.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <late_mat/column_origin.hpp>
 #include <log/logging.hpp>
 #include <op/scan/decoded_batch_representation.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
@@ -195,6 +196,21 @@ void scan_operator_input::prepare_for_processing(
           snapshot_onto(host_rep);
         }
       }
+      // Late-mat wave-seam capture request (SIRIUS_EXP_LATE_MAT): this split's
+      // scan defers columns (origin stamped), so ask the fused decode to hand
+      // back its wave-1 survivor selection instead of freeing it. Set only on
+      // the per-query projected clone (this batch's rep), never the shared
+      // pin; only meaningful when the converter takes the row_filtered path —
+      // RULE-2 bails and partial coverage never capture (the converter enforces).
+      if (late_mat::late_mat_enabled() && late_mat_origin && !mvcc_keep_mask.has_mask()) {
+        if (auto* device_rep =
+              dynamic_cast<::sirius::compressed_device_representation*>(mut.get_data())) {
+          device_rep->request_selection_capture();
+        } else if (auto* host_rep =
+                     dynamic_cast<::sirius::compressed_host_representation*>(mut.get_data())) {
+          host_rep->request_selection_capture();
+        }
+      }
       mut.convert_to<::cucascade::gpu_table_representation>(
         registry, requested_memory_space, stream);
       // The converter reports what the decode did as a value on the
@@ -204,14 +220,26 @@ void scan_operator_input::prepare_for_processing(
       // is not re-evaluated. selection_unprofitable means the attempt did not
       // pay off, so the scan's remaining splits skip it. Off-gate the
       // converters install the plain representation and both stay false.
-      if (auto const* decoded =
-            dynamic_cast<::sirius::decoded_batch_representation const*>(mut.get_data())) {
+      if (auto* decoded = dynamic_cast<::sirius::decoded_batch_representation*>(mut.get_data())) {
         auto const& outcome        = decoded->outcome();
         decode_row_filtered        = outcome.row_filtered;
         decode_predicate_columns   = outcome.predicate_columns;
         decode_predicates_enforced = outcome.predicates_enforced;
         if (decode_selection_unprofitable && outcome.selection_unprofitable) {
           decode_selection_unprofitable->store(true, std::memory_order_relaxed);
+        }
+        // Late-mat: harvest the captured wave-1 selection (filled by the fused
+        // decode converter): copy the light struct, fill the global range from
+        // the split's origin (the converter cannot know it), and take it off
+        // the outcome so the selection buffers release with the harvest rather
+        // than living as long as the batch. Captured for whole-conjunction AND
+        // membership-compacted / partial-coverage batches alike;
+        // decode_row_filtered above still reflects only the former.
+        if (outcome.captured_selection && late_mat_origin) {
+          auto harvested   = std::make_shared<late_mat::row_selection>(*outcome.captured_selection);
+          harvested->range = late_mat_origin->range;
+          late_mat_selection = std::move(harvested);
+          decoded->mutable_outcome().captured_selection.reset();
         }
       }
       if (decode_row_filtered && mvcc_keep_mask.has_mask()) {

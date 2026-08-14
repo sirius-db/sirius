@@ -21,6 +21,7 @@
 #include "cuda_runtime_api.h"
 #include "downgrade/downgrade_executor.hpp"
 #include "log/logging.hpp"
+#include "memory/pinned_reservation_guard.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/completion_handler.hpp"
@@ -43,6 +44,66 @@
 #include <utility>
 namespace sirius {
 namespace pipeline {
+
+namespace {
+
+/**
+ * Blocking reservation acquisition with the unsatisfiable-reservation
+ * livelock guard.
+ *
+ * cucascade's memory_space::make_reservation waits on the space's notification
+ * channel with no timeout and no logging. gpu-tier pinned tables permanently
+ * occupy the space's allocated-bytes budget and are invisible to the downgrade
+ * executor, so a demand larger than (reservation limit − pinned bytes) can
+ * NEVER be granted in full — the wait livelocks forever (observed: 113 min,
+ * zero log output, TPC-H q5 with all tables pinned into a shrunken pool).
+ *
+ * Happy path is byte-identical to make_reservation(): the same non-blocking
+ * first attempt, nothing else. Only when that attempt fails (a would-block
+ * situation that debug-audited healthy runs never reach) do we:
+ *   1. fail fast when the demand is provably unsatisfiable (conservative
+ *      check: demand > limit − unevictable pinned bytes; transient pressure
+ *      can never trigger it) — returns nullptr with *fail_fast_reason set;
+ *   2. otherwise block exactly as before, wrapped in a reservation_wait_scope
+ *      so an INFO line reports the outstanding wait every ~10 s.
+ *
+ * nullptr with an EMPTY *fail_fast_reason preserves the pre-existing meaning:
+ * the space is shutting down.
+ */
+std::unique_ptr<cucascade::memory::reservation> acquire_reservation_blocking_with_guard(
+  cucascade::memory::memory_space* space,
+  std::size_t bytes_needs,
+  std::size_t pipeline_id,
+  uint64_t task_id,
+  std::string* fail_fast_reason)
+{
+  if (auto reservation = space->make_reservation_or_null(bytes_needs)) { return reservation; }
+
+  const std::size_t limit  = space->get_max_memory();
+  const std::size_t pinned = sirius::memory::unevictable_pinned_bytes(space);
+  if (pinned > 0 && sirius::memory::reservation_is_unsatisfiable(bytes_needs, limit, pinned)) {
+    *fail_fast_reason = std::format(
+      "GPU Pipeline Executor: unsatisfiable memory reservation for pipeline {} task {} on GPU "
+      "{}: demand {} bytes > reservation limit {} bytes - unevictable gpu-tier pinned {} bytes "
+      "(max satisfiable {} bytes; currently available {} bytes). Pinned tables cannot be "
+      "evicted by the downgrade executor, so this wait would never complete. Unpin tables, pin "
+      "to tier='host', or raise the GPU pool limit.",
+      pipeline_id,
+      task_id,
+      space->get_device_id(),
+      bytes_needs,
+      limit,
+      pinned,
+      sirius::memory::max_satisfiable_reservation(limit, pinned),
+      space->get_available_memory());
+    return nullptr;
+  }
+
+  sirius::memory::reservation_wait_scope wait_scope(space, bytes_needs, pipeline_id, task_id);
+  return space->make_reservation(bytes_needs);
+}
+
+}  // namespace
 
 gpu_pipeline_executor::gpu_pipeline_executor(
   exec::thread_pool_config config,
@@ -183,7 +244,22 @@ void gpu_pipeline_executor::manager_loop()
       _memory_space->get_available_memory(),
       _memory_space->get_total_reserved_memory(),
       _memory_space->get_max_memory());
-    auto reservation = _memory_space->make_reservation(bytes_needs);
+    std::string fail_fast_reason;
+    auto reservation = acquire_reservation_blocking_with_guard(_memory_space,
+                                                               bytes_needs,
+                                                               gpu_task->get_pipeline_id(),
+                                                               gpu_task->get_task_id(),
+                                                               &fail_fast_reason);
+    if (!reservation && !fail_fast_reason.empty()) {
+      // Provably-unsatisfiable demand: fail the QUERY, not the
+      // executor — drop the task (slot RAII returns it to the pool) and keep
+      // serving subsequent work, mirroring the retry-cap terminate-query path.
+      SIRIUS_LOG_ERROR("{}", fail_fast_reason);
+      if (_completion_handler && !_completion_handler->has_error()) {
+        _completion_handler->report_error(fail_fast_reason);
+      }
+      continue;
+    }
     if (!reservation) {
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to acquire memory reservation for task {}",
                        gpu_task->get_task_id());
@@ -241,8 +317,22 @@ void gpu_pipeline_executor::manager_loop()
       if (new_reservation) {
         reservation = std::move(new_reservation);
       } else {
-        // Predicate never succeeded — try one final reservation attempt
-        reservation = _memory_space->make_reservation(bytes_needs);
+        // Predicate never succeeded — try one final reservation attempt. This
+        // call blocks indefinitely too, so it takes the same guard as the
+        // first acquisition (fail-fast on unsatisfiable demand + periodic
+        // wait visibility).
+        reservation = acquire_reservation_blocking_with_guard(_memory_space,
+                                                              bytes_needs,
+                                                              gpu_task->get_pipeline_id(),
+                                                              gpu_task->get_task_id(),
+                                                              &fail_fast_reason);
+        if (!reservation && !fail_fast_reason.empty()) {
+          SIRIUS_LOG_ERROR("{}", fail_fast_reason);
+          if (_completion_handler && !_completion_handler->has_error()) {
+            _completion_handler->report_error(fail_fast_reason);
+          }
+          continue;
+        }
       }
 
       if (!reservation) {

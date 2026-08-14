@@ -70,5 +70,7 @@ test/tpch_performance/__pycache__/
 test/tpch_performance/output/
 test/tpch_performance/log/
 
-# local debug log
+# local benchmark inputs and debug logs
 rmm_log.txt
+bench/sf1000-repro/plans-gb300-lo/
+test_datasets/

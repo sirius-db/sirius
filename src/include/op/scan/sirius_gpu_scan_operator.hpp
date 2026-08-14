@@ -35,6 +35,12 @@ class split_connector;
 class sirius_scan_manager;
 }  // namespace sirius::scan_manager
 
+namespace sirius::late_mat {
+struct deferred_scan_output;  // late_mat/defer_directive.hpp
+struct planned_deferral;      // late_mat/plan_deferral.hpp
+struct planned_fd_graph;      // late_mat/plan_deferral.hpp
+}  // namespace sirius::late_mat
+
 namespace sirius::op {
 class sirius_dynamic_filter_set;  // membership channel (op/sirius_dynamic_filter.hpp)
 }
@@ -158,6 +164,24 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   {
     return _split_connector;
   }
+
+  /// Late-mat deferral directive (SIRIUS_EXP_LATE_MAT): installed by the
+  /// defer policy at query prepare, always in a pair with the consuming
+  /// operator's late_mat_port_directive. execute() substitutes the listed
+  /// output positions with a UINT64 pin-order rowid column (first position)
+  /// and INT8 placeholders (the rest). Empty when the gate is off.
+  std::shared_ptr<const late_mat::deferred_scan_output> late_mat_defer;
+
+  /// v2 planner annotation (SIRIUS_EXP_LATE_MAT_V2): per-output-column
+  /// lifetime facts from the plan-time pass. Read by the lowering backend at
+  /// query prepare; empty when the sub-gate is off.
+  std::shared_ptr<const late_mat::planned_deferral> late_mat_plan;
+
+  /// v3 raw FD graph (SIRIUS_EXP_LATE_MAT_V3): ONE query-wide graph shared by
+  /// every scan (equality edges + aggregate key provenances). The lowering
+  /// runs the determination closure against the pinned entries' uniqueness
+  /// facts. Empty below the v3 gate.
+  std::shared_ptr<const late_mat::planned_fd_graph> late_mat_fd_graph;
 
  private:
   std::shared_ptr<gpu_ingestible> _ingestible;

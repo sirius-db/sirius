@@ -57,6 +57,12 @@ class decoded_batch_representation final : public ::cucascade::gpu_table_represe
 
   [[nodiscard]] const decode_outcome& outcome() const noexcept { return _outcome; }
 
+  /// Non-const view for the late-mat harvest: prepare_for_processing moves the
+  /// captured selection off the outcome after stamping the split, so the
+  /// selection buffers release with the harvest rather than living as long as
+  /// the batch. Nothing else mutates an outcome after construction.
+  [[nodiscard]] decode_outcome& mutable_outcome() noexcept { return _outcome; }
+
  private:
   decode_outcome _outcome;
 };

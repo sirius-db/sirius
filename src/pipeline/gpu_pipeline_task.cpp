@@ -17,6 +17,7 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include "cudf/cudf_utils.hpp"
+#include "late_mat/column_origin.hpp"
 #include "log/logging.hpp"
 #include "memory/defragmenter_oom_policy.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
@@ -88,6 +89,16 @@ void validate_operator_output_types(const op::operator_data* data,
                                         : physical_types[static_cast<std::size_t>(c)];
       cudf::data_type actual        = tbl.column(c).type();
       if (actual != expected_cudf) {
+        // Late-mat placeholder whitelist (SIRIUS_EXP_LATE_MAT):
+        // deferred columns legitimately ride as UINT64 pin-order rowids / INT8
+        // placeholders at positions the plan types differently, until the consuming
+        // port's prepare restores the real columns. Suppress exactly that shape —
+        // gate off, nothing changes.
+        if (late_mat::late_mat_enabled() &&
+            (actual.id() == cudf::type_id::UINT64 || actual.id() == cudf::type_id::UINT32 ||
+             actual.id() == cudf::type_id::INT8)) {
+          continue;
+        }
         SIRIUS_LOG_WARN(
           "gpu_pipeline_task: operator '{}' (id={}) output batch {} column {} datatype "
           "mismatch: got {}, expected {}",
