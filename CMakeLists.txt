@@ -783,6 +783,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_task_scheduler.cpp
     test/cpp/scan/bench_decode_codecs.cpp
     test/cpp/scan/test_can_serve_with_columns.cpp
+    test/cpp/scan/test_decode_target_ctas.cpp
     test/cpp/scan/test_duckdb_block_layout.cpp
     test/cpp/scan/test_duckdb_insert_delta.cpp
     test/cpp/scan/test_duckdb_mvcc_visibility.cpp

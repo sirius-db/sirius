@@ -673,11 +673,17 @@ TEST_CASE("query config snapshot: thread-local install, nesting and isolation",
   sirius::query_config_snapshot snap{};
   snap.params.scan_task_batch_size = 12345;
   snap.expression_strategy         = sirius::expression_evaluator_strategy::MATERIALIZE;
+  snap.compression.enable_pin_table_compression = true;
+  snap.compression.input_plan_dir               = "/tmp/snapshot_plan_dir";
   {
     sirius::scoped_query_config_snapshot install(snap);
     const auto* current = sirius::current_query_config_snapshot();
     REQUIRE(current != nullptr);
     CHECK(current->params.scan_task_batch_size == 12345);
+    // The compression config (register E3) rides the same snapshot: the pin's
+    // window sees the frozen copy, including the plan-dir string.
+    CHECK(current->compression.enable_pin_table_compression);
+    CHECK(current->compression.input_plan_dir == "/tmp/snapshot_plan_dir");
     // The snapshot wins over the (different) global while installed: this is
     // the E2 guarantee that one plan reads one strategy.
     CHECK(sirius::current_expression_evaluator_strategy() ==

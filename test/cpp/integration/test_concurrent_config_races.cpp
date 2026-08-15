@@ -27,20 +27,32 @@
 //   - E2: duckdb::Config process-wide static variables
 //     (EXPRESSION_EVALUATOR_STRATEGY is read as a default argument on every
 //     expression_evaluator construction) written by `SET` with no guard.
+//   - E3: the compression-config setters wrote the live struct with no guard
+//     while PinTableFunction handed its input_plan_dir string to
+//     fs::directory_iterator — a concurrent SET was a torn read / UAF.
+//   - E5: plan_register::global() check-then-act across three critical
+//     sections, keyed by BARE table name — same-named tables in different
+//     ATTACHed databases collided on one plan entry.
 //
 // A failing assertion here is a deliverable: scenarios that fail on current
 // code are tagged [!mayfail] with the failure signature documented at the
 // assertion site, so the suite stays green while the repro ships.
 
 #include <catch.hpp>
+#include <compression/plan_register.hpp>
 #include <duckdb.hpp>
 #include <duckdb/main/stream_query_result.hpp>
+#include <op/scan/parquet_gpu_ingestible.hpp>
+#include <scan_manager/sirius_scan_manager.hpp>
 #include <utils/concurrent_test_utils.hpp>
 
 #include <atomic>
+#include <fstream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -346,7 +358,11 @@ TEST_CASE("adversarial: SET storm on operator params races concurrent executions
                                               "enable_runtime_distinct_build_probe",
                                               "mark_join_build_switch_ratio",
                                               "dynamic_filter_keep_threshold",
-                                              "max_broadcast_join_size"};
+                                              "max_broadcast_join_size",
+                                              "pin_table_compression",
+                                              "pin_table_input_compression_plan_dir",
+                                              "pin_table_compression_min_batch_size_bytes",
+                                              "pin_table_compression_max_compressed_fraction"};
       try {
         duckdb::Connection con(db);
         for (const char* knob : knobs) {
@@ -380,6 +396,14 @@ TEST_CASE("adversarial: SET storm on operator params races concurrent executions
       "SET mark_join_build_switch_ratio = 1.0",
       "SET dynamic_filter_keep_threshold = 0.1",
       "SET max_broadcast_join_size = 1048576",
+      // Compression knobs (E3): same mutex + snapshot discipline as the
+      // operator params; the plan-dir STRING is the knob a torn read/UAF
+      // would hit, so alternate it between a long value and empty.
+      "SET pin_table_compression = true",
+      "SET pin_table_input_compression_plan_dir = "
+      "'/tmp/sirius_storm_compression_plan_dir_perturbed_by_the_set_storm'",
+      "SET pin_table_compression_min_batch_size_bytes = 4096",
+      "SET pin_table_compression_max_compressed_fraction = 0.1",
       "SET scan_task_batch_size = 100000000",
       "SET expression_evaluator_strategy = 'ast_interpret'",
       "SET hash_partition_bytes = 100000000",
@@ -392,6 +416,10 @@ TEST_CASE("adversarial: SET storm on operator params races concurrent executions
       "SET mark_join_build_switch_ratio = 8.0",
       "SET dynamic_filter_keep_threshold = 0.9",
       "SET max_broadcast_join_size = 268435456",
+      "SET pin_table_compression = false",
+      "SET pin_table_input_compression_plan_dir = ''",
+      "SET pin_table_compression_min_batch_size_bytes = 1048576",
+      "SET pin_table_compression_max_compressed_fraction = 0.75",
     };
     return statements[static_cast<std::size_t>(i) % statements.size()];
   };
@@ -480,4 +508,239 @@ TEST_CASE("adversarial: concurrent gpu_execution() executions restore the connec
   // And the mid-plan flip never leaked to a peer connection's config either.
   duckdb::Connection peer(*env.db);
   REQUIRE(peer.context->config.enable_optimizer == true);
+}
+
+TEST_CASE("adversarial: pin_table races SET of the compression config",
+          "[concurrency][adversarial][config_race][pin_table][isolated_context]")
+{
+  // E3 torn-read/UAF regression: PinTableFunction used to read the live
+  // compression_config by reference and hand the input_plan_dir std::string
+  // straight to fs::directory_iterator — a concurrent SET reassigning that
+  // string could free its buffer mid-walk. The pin now freezes a snapshot
+  // copy at window admission (SNAPSHOT-AT-WINDOW-BEGIN, same as E1), and the
+  // SET writes under the snapshot mutex, so this scenario must be boring:
+  // pins keep succeeding while a SET worker reassigns the plan-dir string and
+  // flips every compression knob as fast as it can.
+  scoped_watchdog dog("pin vs compression SET race", scenario_timeout(600));
+
+  adversarial_env env;
+
+  const std::string pid = std::to_string(::getpid());
+  const fs::path dir_a  = fs::temp_directory_path() / ("sirius_e3_plans_a_" + pid);
+  const fs::path dir_b  = fs::temp_directory_path() / ("sirius_e3_plans_b_" + pid);
+  // One block only: `fact` pins 3 columns, so select_plan_blocks() never
+  // covers them and every pin proceeds UNCOMPRESSED — this scenario exercises
+  // the config snapshot and the registry, not Simpatico itself. Different
+  // lengths so a SET-storm reassignment reallocates the string buffer.
+  const std::string dsl_a = "scheme: uncompressed # plan A ..............................";
+  const std::string dsl_b =
+    "scheme: uncompressed # plan B (the other directory's DSL) "
+    "..........................................................";
+  fs::create_directories(dir_a);
+  fs::create_directories(dir_b);
+  {
+    std::ofstream(dir_a / "fact_pin.plan") << dsl_a;
+    std::ofstream(dir_b / "fact_pin.plan") << dsl_b;
+  }
+
+  // The registry key the pin uses: its resolved parquet identity (E5).
+  std::vector<std::string> files{env.fact_path.string()};
+  sirius::op::scan::canonicalize_scan_file_paths(files);
+  sirius::scan_manager::cache_entry_info identity;
+  identity.resolved_file_paths = files;
+  const std::string plan_key   = identity.compression_plan_key();
+
+  // plan_register is PROCESS-GLOBAL: drop this test's key on every exit path
+  // (test-hygiene: what a test perturbs, it restores), and the temp dirs too.
+  struct e3_cleanup {
+    std::string key;
+    fs::path a, b;
+    ~e3_cleanup()
+    {
+      sirius::compression::plan_register::global().clear_table_plan(key);
+      std::error_code ec;
+      fs::remove_all(a, ec);
+      fs::remove_all(b, ec);
+    }
+  } cleanup{plan_key, dir_a, dir_b};
+
+  const int pin_cycles    = env_int("SIRIUS_TEST_PIN_SET_RACE_CYCLES", 8);
+  const int max_set_iters = env_int("SIRIUS_TEST_PIN_SET_RACE_SET_ITERS", 100000);
+
+  std::mutex failures_mutex;
+  std::vector<std::string> failures;
+  auto add_failure = [&](const std::string& f) {
+    std::lock_guard<std::mutex> lock(failures_mutex);
+    failures.push_back(f);
+  };
+  std::atomic<bool> pins_done{false};
+  std::atomic<int> sets_run{0};
+
+  run_racers(2, [&](int tid) {
+    duckdb::Connection con(*env.db);
+    if (tid == 0) {
+      // Pin worker: every cycle re-arms the registry miss so the pin walks the
+      // plan directory (the exact E3 window) under the SET storm.
+      for (int i = 0; i < pin_cycles; ++i) {
+        sirius::compression::plan_register::global().clear_table_plan(plan_key);
+        auto pin = con.Query("CALL pin_table('" + env.fact_path.string() +
+                             "', tier='gpu', name='fact_pin')");
+        if (pin->HasError()) {
+          add_failure("pin cycle " + std::to_string(i) + " ERROR: " + pin->GetError());
+          break;
+        }
+        auto unpin = con.Query("CALL unpin_table('fact_pin')");
+        if (unpin->HasError()) {
+          add_failure("unpin cycle " + std::to_string(i) + " ERROR: " + unpin->GetError());
+          break;
+        }
+      }
+      pins_done.store(true);
+    } else {
+      // SET worker: reassign the plan-dir string (alternating lengths force
+      // buffer reallocation — the pre-fix UAF window) and flip every other
+      // compression knob until the pins finish.
+      const std::string dirs[2] = {dir_a.string(), dir_b.string()};
+      for (int i = 0; !pins_done.load() && i < max_set_iters; ++i) {
+        (void)con.Query("SET pin_table_input_compression_plan_dir = '" + dirs[i % 2] + "'");
+        (void)con.Query(i % 2 == 0 ? "SET pin_table_compression = true"
+                                   : "SET pin_table_compression = false");
+        (void)con.Query("SET pin_table_compression_min_batch_size_bytes = " +
+                        std::to_string(1024 + (i % 7) * 4096));
+        (void)con.Query("SET pin_table_compression_max_compressed_fraction = 0." +
+                        std::to_string(1 + (i % 8)));
+        sets_run.fetch_add(1);
+      }
+    }
+  });
+  INFO("compression SETs run during the pin churn: " << sets_run.load());
+  require_no_failures(failures);
+  REQUIRE(sets_run.load() > 0);
+
+  // Deterministic tail: with the knobs stable, one more pin must load the
+  // configured directory's DSL and key it by the pin's resolved identity —
+  // never by the bare pin name.
+  {
+    duckdb::Connection con(*env.db);
+    REQUIRE_FALSE(con.Query("SET pin_table_compression = true")->HasError());
+    REQUIRE_FALSE(
+      con.Query("SET pin_table_input_compression_plan_dir = '" + dir_a.string() + "'")->HasError());
+    sirius::compression::plan_register::global().clear_table_plan(plan_key);
+    auto pin =
+      con.Query("CALL pin_table('" + env.fact_path.string() + "', tier='gpu', name='fact_pin')");
+    REQUIRE_FALSE(pin->HasError());
+    auto plan = sirius::compression::plan_register::global().resolve_table_plan(plan_key);
+    REQUIRE(plan.has_value());
+    CHECK(*plan == dsl_a);
+    CHECK_FALSE(
+      sirius::compression::plan_register::global().resolve_table_plan("fact_pin").has_value());
+    REQUIRE_FALSE(con.Query("CALL unpin_table('fact_pin')")->HasError());
+  }
+}
+
+TEST_CASE("pin_table keys compression plans by resolved identity, not bare table name",
+          "[concurrency][pin_table][config_race][isolated_context]")
+{
+  // E5: plan_register::global() is process-global and used to be keyed by the
+  // BARE user-supplied pin name across three separate critical sections. Two
+  // ATTACHed databases with same-named tables collided — the second pin hit
+  // the first pin's bare-name entry and pinned with the OTHER database's plan
+  // DSL. The key is now the pin's resolved cache identity (the same
+  // catalog.schema.table the pinned-entry serving matchers use), and the
+  // lookup-miss-then-populate runs as ONE atomic registry operation
+  // (get_or_load_table_plan).
+  scoped_watchdog dog("per-identity compression plans", scenario_timeout(600));
+
+  adversarial_env env;
+  duckdb::Connection con(*env.db);
+
+  const std::string pid = std::to_string(::getpid());
+  const fs::path db1    = fs::temp_directory_path() / ("sirius_e5_db1_" + pid + ".db");
+  const fs::path db2    = fs::temp_directory_path() / ("sirius_e5_db2_" + pid + ".db");
+  const fs::path dir_a  = fs::temp_directory_path() / ("sirius_e5_plans_a_" + pid);
+  const fs::path dir_b  = fs::temp_directory_path() / ("sirius_e5_plans_b_" + pid);
+  // Single-block plans (table t has 2 columns), so the pins proceed
+  // uncompressed and only the registry behavior is under test.
+  const std::string dsl_a = "scheme: uncompressed # database one's plan";
+  const std::string dsl_b = "scheme: uncompressed # database two's plan";
+  fs::create_directories(dir_a);
+  fs::create_directories(dir_b);
+  {
+    std::ofstream(dir_a / "t.plan") << dsl_a;
+    std::ofstream(dir_b / "t.plan") << dsl_b;
+  }
+
+  // Expected registry keys, built from the same identity derivation the pin
+  // uses (cache_entry_info::compression_plan_key on the resolved
+  // catalog.schema.table).
+  sirius::scan_manager::cache_entry_info id1;
+  id1.catalog_name                           = "e5_db1";
+  id1.schema_name                            = "main";
+  id1.table_name                             = "t";
+  sirius::scan_manager::cache_entry_info id2 = id1;
+  id2.catalog_name                           = "e5_db2";
+  const std::string key1                     = id1.compression_plan_key();
+  const std::string key2                     = id2.compression_plan_key();
+  REQUIRE(key1 != key2);
+
+  struct e5_cleanup {
+    std::string k1, k2;
+    fs::path a, b, f1, f2;
+    ~e5_cleanup()
+    {
+      auto& reg = sirius::compression::plan_register::global();
+      reg.clear_table_plan(k1);
+      reg.clear_table_plan(k2);
+      reg.clear_table_plan("t");  // pre-fix code would have left the bare-name entry
+      std::error_code ec;
+      fs::remove_all(a, ec);
+      fs::remove_all(b, ec);
+      fs::remove(f1, ec);
+      fs::remove(f2, ec);
+    }
+  } cleanup{key1, key2, dir_a, dir_b, db1, db2};
+
+  auto run_ok = [&](const std::string& sql) {
+    auto r = con.Query(sql);
+    INFO(sql);
+    if (r->HasError()) { UNSCOPED_INFO("ERROR: " << r->GetError()); }
+    REQUIRE_FALSE(r->HasError());
+  };
+
+  run_ok("ATTACH '" + db1.string() + "' AS e5_db1");
+  run_ok("ATTACH '" + db2.string() + "' AS e5_db2");
+  run_ok("CREATE TABLE e5_db1.main.t AS SELECT range AS a, range * 2 AS b FROM range(1000)");
+  run_ok("CREATE TABLE e5_db2.main.t AS SELECT range AS a, range * 3 AS b FROM range(1000)");
+  run_ok("CHECKPOINT e5_db1");
+  run_ok("CHECKPOINT e5_db2");
+  run_ok("SET pin_table_compression = true");
+
+  // Pin the SAME bare name 't' from each database (catalog resolved via the
+  // search path), each with its own plan directory configured.
+  run_ok("USE e5_db1");
+  run_ok("SET pin_table_input_compression_plan_dir = '" + dir_a.string() + "'");
+  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu')");
+  run_ok("CALL unpin_table('t')");  // the pinned-entry map is name-keyed; free the slot
+
+  run_ok("USE e5_db2");
+  run_ok("SET pin_table_input_compression_plan_dir = '" + dir_b.string() + "'");
+  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu')");
+  run_ok("CALL unpin_table('t')");
+
+  auto& reg  = sirius::compression::plan_register::global();
+  auto plan1 = reg.resolve_table_plan(key1);
+  auto plan2 = reg.resolve_table_plan(key2);
+  REQUIRE(plan1.has_value());
+  REQUIRE(plan2.has_value());
+  CHECK(*plan1 == dsl_a);
+  // THE E5 assertion: the second database's pin loaded ITS OWN plan. Before
+  // the identity-keyed registry, the bare-name hit made it silently reuse
+  // database one's DSL (*plan2 == dsl_a).
+  CHECK(*plan2 == dsl_b);
+  // And nothing keys by the bare table name anymore.
+  CHECK_FALSE(reg.resolve_table_plan("t").has_value());
+
+  run_ok("USE memory");
+  run_ok("DETACH e5_db1");
+  run_ok("DETACH e5_db2");
 }

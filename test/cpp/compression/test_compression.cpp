@@ -27,7 +27,11 @@
 #include <compression/plan_register.hpp>
 
 // standard library
+#include <atomic>
+#include <chrono>
+#include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 // ─── plan_register unit tests (no GPU required) ─────────────────────────────
@@ -101,6 +105,95 @@ TEST_CASE("plan_register - per-column plans are independent from table plans",
 
   reg.clear_plan("t", "col_a");
   reg.clear_all();
+}
+
+TEST_CASE("plan_register - get_or_load_table_plan loads exactly once per key",
+          "[compression][plan_register][concurrency]")
+{
+  // Register E5: the pin path's resolve-miss-load-set-resolve was a
+  // check-then-act across three critical sections; two concurrent callers
+  // could both miss and overwrite each other. get_or_load_table_plan runs the
+  // whole lookup-miss-then-populate under ONE exclusive critical section:
+  // exactly one loader runs per key, and every caller returns the value that
+  // actually ended up registered.
+  auto& reg             = sirius::compression::plan_register::global();
+  const std::string key = "e5_get_or_load_once";
+  struct key_cleanup {
+    std::string k;
+    ~key_cleanup() { sirius::compression::plan_register::global().clear_table_plan(k); }
+  } cleanup{key};
+  reg.clear_table_plan(key);
+
+  constexpr int n_threads = 8;
+  std::atomic<int> loads{0};
+  std::vector<std::string> results(n_threads);
+  std::vector<std::thread> threads;
+  threads.reserve(n_threads);
+  for (int t = 0; t < n_threads; ++t) {
+    threads.emplace_back([&, t] {
+      auto value = reg.get_or_load_table_plan(key, [&]() -> std::optional<std::string> {
+        loads.fetch_add(1);
+        // Widen the pre-fix both-miss window; under the single critical
+        // section this only delays the losers, it cannot double-load.
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        return "loaded-by-thread-" + std::to_string(t);
+      });
+      // Catch2 assertions are not thread-safe: collect, assert on the main
+      // thread below.
+      results[static_cast<std::size_t>(t)] = value.value_or("");
+    });
+  }
+  for (auto& th : threads) {
+    th.join();
+  }
+
+  CHECK(loads.load() == 1);
+  for (int t = 0; t < n_threads; ++t) {
+    CHECK(results[static_cast<std::size_t>(t)] == results[0]);
+  }
+  CHECK(results[0].rfind("loaded-by-thread-", 0) == 0);
+  REQUIRE(reg.resolve_table_plan(key) == results[0]);
+}
+
+TEST_CASE("plan_register - get_or_load_table_plan stores nothing on a loader miss",
+          "[compression][plan_register]")
+{
+  auto& reg             = sirius::compression::plan_register::global();
+  const std::string key = "e5_get_or_load_miss";
+  struct key_cleanup {
+    std::string k;
+    ~key_cleanup() { sirius::compression::plan_register::global().clear_table_plan(k); }
+  } cleanup{key};
+  reg.clear_table_plan(key);
+
+  int loads = 0;
+  // A nullopt loader result registers nothing (matching the old semantics:
+  // no plan file found => no entry, a later pin rescans the directory).
+  auto miss = reg.get_or_load_table_plan(key, [&]() -> std::optional<std::string> {
+    ++loads;
+    return std::nullopt;
+  });
+  CHECK_FALSE(miss.has_value());
+  CHECK_FALSE(reg.resolve_table_plan(key).has_value());
+  CHECK(loads == 1);
+
+  // The next call therefore loads again; a real value now sticks.
+  auto hit = reg.get_or_load_table_plan(key, [&]() -> std::optional<std::string> {
+    ++loads;
+    return "the real plan";
+  });
+  REQUIRE(hit.has_value());
+  CHECK(*hit == "the real plan");
+  CHECK(loads == 2);
+
+  // And a third call is a pure hit: the loader must not run.
+  auto cached = reg.get_or_load_table_plan(key, [&]() -> std::optional<std::string> {
+    FAIL("loader ran on a registered key");
+    return std::nullopt;
+  });
+  REQUIRE(cached.has_value());
+  CHECK(*cached == "the real plan");
+  CHECK(loads == 2);
 }
 
 TEST_CASE("select_plan_blocks - picks blocks by full-table index in pinned order",
