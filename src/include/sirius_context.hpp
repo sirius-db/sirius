@@ -667,6 +667,39 @@ class SiriusContext : public ClientContextState {
   /// \brief High-water mark of concurrently held query-lifecycle slots.
   [[nodiscard]] int query_lifecycle_peak() const noexcept;
 
+  /// \brief TEST ONLY: force the raw window-id counter (e.g. just below the
+  /// 2^32 wrap) so allocate_window_id()'s wrap guard can be exercised without
+  /// minting four billion windows first.
+  void set_next_window_id_for_test(std::uint32_t value) noexcept
+  {
+    next_window_id_.store(value, std::memory_order_relaxed);
+  }
+
+  /// \brief TEST ONLY: the raw window-id counter — the last raw value consumed
+  /// by allocate_window_id() (which mints counter+1 per attempt, skipping 0
+  /// and live ids).
+  [[nodiscard]] std::uint32_t next_window_id_for_test() const noexcept
+  {
+    return next_window_id_.load(std::memory_order_relaxed);
+  }
+
+  /// \brief Mint the next window id (register H8: the counter is 32-bit and
+  /// wraps after 2^32 windows).
+  ///
+  /// Two values must never come out of the wrap: raw 0 — make_query_id(0) is
+  /// the "no query" sentinel (unattributed downgrade requests, pre-window
+  /// defaults) — and any id still live, or begin_execution_window's
+  /// create_for_query would throw "already registered" and kill an innocent
+  /// query ~4 billion windows in. Skips 0 and ids present in the lifecycle
+  /// registry or the repository registry; the lifecycle entry brackets the
+  /// task_creator state (open_query precedes set_client_context, close() is
+  /// the last mandatory-cleanup step), and the repository check covers the
+  /// call that actually throws. Cold: a retry requires the counter to lap a
+  /// query that is STILL running. Production allocation happens only in
+  /// StandaloneQueryScope; public so the wrap-guard unit test can drive it
+  /// deterministically.
+  [[nodiscard]] sirius::query_id_t allocate_window_id();
+
   /// \brief Snapshot counters for transparent execution observability.
   [[nodiscard]] transparent_execution_stats get_transparent_execution_stats() const noexcept;
 
@@ -823,7 +856,9 @@ class SiriusContext : public ClientContextState {
   std::atomic<std::uint64_t> per_query_cleanup_failures_{0};
   // Monotonic execution-window id for window-keyed logging.
   /// 32-bit to match sirius::query_id_t, which task_creator packs into the scheduling
-  /// priority. The first window gets id 1, so 0 is never a live query id.
+  /// priority. The first window gets id 1, so 0 is never a live query id — and
+  /// allocate_window_id() keeps that true across the 2^32 wrap (it also skips
+  /// ids still live in the registries; see its doc comment).
   std::atomic<std::uint32_t> next_window_id_{0};
   bool is_initialized_ = false;
   sirius::sirius_config config_;

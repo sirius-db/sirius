@@ -684,6 +684,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_concurrent_adversarial.cpp
     test/cpp/integration/test_concurrent_config_races.cpp
     test/cpp/integration/test_concurrent_fairness.cpp
+    test/cpp/integration/test_query_id_wrap.cpp
     test/cpp/integration/test_query_lifecycle_slot.cpp
     test/cpp/integration/test_gpu_execution_tpcds_nulls.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp

@@ -778,6 +778,34 @@ SiriusContext::SlotGuard::SlotGuard(SiriusContext& ctx, ClientContext& context) 
 
 SiriusContext::SlotGuard::~SlotGuard() noexcept { ctx_.release_query_lifecycle_slot(); }
 
+sirius::query_id_t SiriusContext::allocate_window_id()
+{
+  // Bounded rather than while(true): the loop iterates only when the wrapped
+  // counter lands on 0 or on a query that is STILL live, so exhausting the
+  // bound means ~thousands of consecutive live ids — impossible under the
+  // counted slot pool, hence corruption worth failing loudly on rather than
+  // spinning. Each attempt consumes a fresh raw value from the atomic counter,
+  // so two concurrent allocations can never mint the same id even mid-retry.
+  constexpr int max_attempts = 4096;
+  for (int attempt = 0; attempt < max_attempts; ++attempt) {
+    const auto raw = next_window_id_.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (raw == 0) { continue; }  // make_query_id(0) is the "no query" sentinel
+    const auto candidate = sirius::make_query_id(raw);
+    // Live in the lifecycle registry (open_query .. close, which brackets the
+    // task_creator state) or still holding a repository manager
+    // (create_for_query is the duplicate check that would otherwise throw):
+    // either way the id belongs to someone — skip it. An id that goes live
+    // AFTER this check would have to be minted by another allocator, which the
+    // per-attempt fetch_add rules out.
+    if (query_lifecycle_.state(candidate).has_value()) { continue; }
+    if (data_repository_registry_.get(candidate) != nullptr) { continue; }
+    return candidate;
+  }
+  throw std::runtime_error(
+    "SiriusContext::allocate_window_id: no free window id after 4096 attempts — "
+    "query-id space exhausted or a registry is leaking closed queries");
+}
+
 void SiriusContext::StandaloneQueryScope::log_window_event(char const* event,
                                                            char const* outcome) const noexcept
 {
@@ -805,8 +833,7 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
   // Window id + keyed tags are prepared BEFORE the slot is acquired: after
   // acquire, no statement on any path allocates, so release cannot be skipped
   // (and the noexcept destructor cannot terminate) for an allocation reason.
-  window_id_ =
-    sirius::make_query_id(ctx_.next_window_id_.fetch_add(1, std::memory_order_relaxed) + 1);
+  window_id_ = ctx_.allocate_window_id();
   std::snprintf(begin_tag_,
                 sizeof(begin_tag_),
                 "QueryBegin instance=%p connection=%llu window=%llu query=%llu",
