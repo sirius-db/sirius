@@ -1480,9 +1480,6 @@ void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
   it->second.mvcc = std::make_unique<duckdb_mvcc_metadata>(std::move(metadata));
 }
 
-// Callers must ensure no in-flight query is still scanning the entry: serving providers hold
-// references into this map, while per-query wrapper batches hold their own column ownership and
-// safely outlive the erased entry.
 void sirius_scan_manager::remove_pinned_entry(const std::string& name)
 {
   _pinned_entries.erase(name);

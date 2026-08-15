@@ -125,16 +125,17 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
     rmm::cuda_stream_view stream) = 0;
 
   /**
-   * @brief Apply post-decode filter and/or projection to the materialized
-   *        table. Called by @c sirius_gpu_scan_operator::execute whenever
-   *        @ref materialize_metadata_to_table did not return
-   *        @c filter_state::ROW_FILTERED_AND_PROJECTED.
+   * @brief Apply pending post-decode filtering and projection
    *
-   * Takes the input by rvalue so implementations can move it through their filter and assembly
-   * steps without an extra copy. The result is returned in the handle's natural state — an owned
-   * table when a row filter gathered fresh columns, a view selection otherwise — and
-   * @c sirius_gpu_scan_operator::execute decides whether to forward that view zero-copy or
-   * materialize it.
+   * Called by @c sirius_gpu_scan_operator::execute unless materialization already returned
+   * @c filter_state::ROW_FILTERED_AND_PROJECTED. Implementations preserve the ownership form
+   * naturally produced by their filtering and projection steps; the scan operator decides whether
+   * to forward a returned view or materialize it.
+   *
+   * @param input Materialized table and filter state to consume
+   * @param mem_space Memory space whose allocator is used for any new columns
+   * @param stream Stream used for filtering, projection, and allocation
+   * @return Filtered and projected table with the ownership needed to keep its view valid
    */
   virtual owning_table_view post_filter_and_project(
     filtered_table&& input,

@@ -14,16 +14,8 @@
  * limitations under the License.
  */
 
-// View-forward gate for GPU-pinned scan splits.
-//
-// A raw GPU pin serves each chunk as a wrapper batch viewing shared_ptr<cudf::column> cache
-// storage. When the split needs no row filter and no MVCC mask, the scan output IS that view, so
-// sirius_gpu_scan_operator::execute never deep-copies the chunk per query: it surrenders the view
-// (owning_table_view::release_view), casts only the columns whose stored carrier disagrees with
-// the plan target, and emits a pure view batch or a mixed batch of view-forwarded columns beside
-// casted ones (all-cast being the degenerate mix). These tests pin the emissions from the
-// operator's output — pointer identity for forwarded columns, fresh buffers for casted ones —
-// plus the owned-result disengage and the owner chains that keep pinned columns alive past unpin.
+// Verifies that unfiltered GPU-pinned scans forward matching columns without copying, cast only
+// mismatched carriers, and keep the pinned storage alive for the output batch's lifetime.
 
 #include "operator/operator_test_utils.hpp"
 
@@ -90,7 +82,7 @@ test_env& env()
 constexpr cudf::data_type kInt64{cudf::type_id::INT64};
 constexpr cudf::data_type kInt32{cudf::type_id::INT32};
 
-/// Owned device column of @p type filled with @p values.
+// Owned device column of `type` filled with `values`.
 template <typename T>
 std::unique_ptr<cudf::column> make_owned_column(cucascade::memory::memory_space& space,
                                                 cudf::data_type type,
@@ -107,7 +99,7 @@ std::unique_ptr<cudf::column> make_owned_column(cucascade::memory::memory_space&
   return col;
 }
 
-/// Shared device column, the storage form a pinned cache entry holds.
+// Shared device column, matching the storage form of a pinned cache entry.
 template <typename T>
 std::shared_ptr<cudf::column> make_pinned_column(cucascade::memory::memory_space& space,
                                                  cudf::data_type type,
@@ -116,8 +108,7 @@ std::shared_ptr<cudf::column> make_pinned_column(cucascade::memory::memory_space
   return std::shared_ptr<cudf::column>(make_owned_column(space, type, values));
 }
 
-/// Wrapper batch in the exact shape the scan manager serves a raw GPU pin: a view over
-/// shared_ptr<cudf::column> chunk storage the batch shares with the cache.
+// Wrapper batch in the shape used for a raw GPU pin: a view over shared column storage.
 std::shared_ptr<cucascade::data_batch> make_pin_shaped_batch(
   test_env& e, std::vector<std::shared_ptr<cudf::column>> columns)
 {
@@ -139,9 +130,8 @@ class stub_table_info final : public sirius::op::scan::ingestible_table_info {
   [[nodiscard]] std::span<std::string const> file_paths() const override { return {}; }
 };
 
-/// Resident-only ingestible whose post_filter_and_project by default forwards the materialized
-/// handle untouched — the production no-filter shape — or runs a caller-supplied hook. A resident
-/// split reads its data from the cached batch, so every metadata entry point stays unreachable.
+// Resident-only ingestible that forwards the materialized handle or runs a caller-supplied hook.
+// Metadata entry points are unreachable because resident splits read the cached batch.
 class stub_ingestible final : public sirius::op::scan::gpu_ingestible {
  public:
   using post_filter_hook =
@@ -188,8 +178,7 @@ class stub_ingestible final : public sirius::op::scan::gpu_ingestible {
   stub_table_info _info;
 };
 
-/// Scan declaring @p n_outputs BIGINT columns and no plan sidecar, so a resident INT64 column is
-/// already normal and any other carrier must cast.
+// Scan with `n_outputs` BIGINT columns and no sidecar; non-INT64 resident carriers must cast.
 sirius::op::scan::sirius_gpu_scan_operator make_bigint_scan(
   std::shared_ptr<sirius::op::scan::gpu_ingestible> ingestible, std::size_t n_outputs = 1)
 {
@@ -201,7 +190,7 @@ sirius::op::scan::sirius_gpu_scan_operator make_bigint_scan(
     sirius::from_duckdb_vec(types), /*estimated_cardinality=*/0, std::move(ingestible)};
 }
 
-/// Drive the real execute() over one resident split of @p batch and return its output batch.
+// Drive execute() over one resident split and return its output batch.
 std::shared_ptr<cucascade::data_batch> run_scan(test_env& e,
                                                 std::shared_ptr<stub_ingestible> ingestible,
                                                 std::shared_ptr<cucascade::data_batch> batch,
@@ -220,10 +209,8 @@ std::shared_ptr<cucascade::data_batch> run_scan(test_env& e,
   return batches[0];
 }
 
-/// Run a scan over pinned @p columns, then drop the split, wrapper handle, and operator data —
-/// the state unpin_table leaves behind, when only the output batch's owner still reaches the pin
-/// storage. Checks each output column reads back @p expected, that the columns stay shared while
-/// the output batch lives, and that dropping it releases the last wrapper reference.
+// Drop all input-side owners after the scan, then verify that the output batch alone keeps the
+// pinned columns alive and releases them when destroyed.
 void check_pinned_columns_survive_unpin(test_env& e,
                                         std::vector<std::shared_ptr<cudf::column>> columns,
                                         std::vector<std::vector<std::int64_t>> const& expected)

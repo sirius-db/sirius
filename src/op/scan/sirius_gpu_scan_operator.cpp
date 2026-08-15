@@ -70,11 +70,8 @@ constexpr std::size_t saturating_mul(std::size_t value, std::size_t factor) noex
   return value > max / factor ? max : value * factor;
 }
 
-/// The per-column casts schema normalization needs for @p view: one entry per column, null when
-/// the column already carries its planned target (the caller keeps its own column), the freshly
-/// casted replacement otherwise; empty when @p targets is empty. Throws for every shape
-/// normalization cannot handle — a width mismatch, or a carrier that is neither the target nor a
-/// valid restore/narrow source (validated before any cast is enqueued).
+// Build one optional replacement per column. Validate the complete source/target shape before
+// enqueuing any cast so an invalid schema cannot leave partially normalized output.
 std::vector<std::unique_ptr<cudf::column>> normalize_physical_schema_casts(
   cudf::table_view const& view,
   const std::vector<cudf::data_type>& targets,
@@ -158,8 +155,7 @@ std::vector<std::unique_ptr<cudf::column>> normalize_physical_schema_casts(
   return casts;
 }
 
-/// Cast each column of @p table to its planned carrier, returning the input unchanged when every
-/// column already matches.
+// Normalize an owned table in place, preserving it when no column needs a cast.
 std::unique_ptr<cudf::table> normalize_physical_schema(std::unique_ptr<cudf::table> table,
                                                        const std::vector<cudf::data_type>& targets,
                                                        bool has_explicit_physical_schema,
@@ -182,21 +178,16 @@ std::unique_ptr<cudf::table> normalize_physical_schema(std::unique_ptr<cudf::tab
   return std::make_unique<cudf::table>(std::move(columns));
 }
 
-/// Composite keep-alive for a mixed view-forward emission: @c pinned is the owner surrendered by
-/// owning_table_view::release_view, keeping the view-forwarded columns' device memory alive, and
-/// @c casted owns the freshly casted replacement columns. Copy-constructible, as
-/// make_data_batch_from_view's std::any owner storage requires.
+// Keeps both the surrendered pinned input and newly cast columns alive for a mixed output view.
+// This must remain copy-constructible because make_data_batch_from_view stores it in std::any.
 struct mixed_scan_owner {
   std::any pinned;
   std::shared_ptr<std::vector<std::unique_ptr<cudf::column>>> casted;
 };
 
-/// Emit the output batch for a surrendered view: a pure view batch when @p casts holds no
-/// replacement (every column forwards zero-copy under @p forwarded's owner), otherwise a mixed
-/// view batch of forwarded columns beside the casted replacements, kept alive by a composite
-/// owner (all-cast is the degenerate mix with nothing forwarded). Attributed bytes are the casted
-/// columns' exact allocations plus the @p total_input_bytes-based estimate for the forwarded
-/// columns only.
+// Emit a pure forwarded view when no cast is needed, or combine forwarded and cast columns under a
+// composite owner. Attribute cast allocations exactly and estimate only the referenced input
+// columns, avoiding a full-input charge after projection.
 std::shared_ptr<::cucascade::data_batch> emit_view_forward(
   owning_table_view::released_view forwarded,
   std::vector<std::unique_ptr<cudf::column>> casts,
@@ -334,10 +325,9 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
 
   std::shared_ptr<::cucascade::data_batch> batch;
   if (auto forwarded = result.release_view()) {
-    // An engaged surrender is a resident pinned split served as a view over its wrapper batch:
-    // cast only the columns whose stored carrier disagrees with the plan target, and let the
-    // surrendered owner keep the pinned columns alive for the output batch's lifetime, past
-    // unpin_table.
+    // A copy-requiring view can transfer its owner instead of materializing; raw GPU-pinned inputs
+    // are the production path that does so. Preserve that owner and cast only columns whose stored
+    // carriers disagree with the plan.
     auto casts = needs_normalization
                    ? normalize_physical_schema_casts(forwarded->view,
                                                      normalization_targets(),
