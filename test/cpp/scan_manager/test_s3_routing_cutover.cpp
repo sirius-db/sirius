@@ -660,6 +660,55 @@ TEST_CASE("scan_manager re-primes routed S3 cache on every query",
   REQUIRE(default_cache->query_epoch() == 2);
 }
 
+TEST_CASE("scan_manager retires a query's cache epoch on reset, keeping live peers' bar",
+          "[s3][routing][scan_manager][cache][prefetching_cache]")
+{
+  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
+  scan_manager_fixture fixture;
+  auto cfg = make_s3_scan_config(server.endpoint(), /*use_sirius_datasource=*/true);
+  cfg.enable_prefetch_cache = true;
+  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+
+  auto datasource = manager.create_datasource("s3://routing-bucket/data.parquet");
+  REQUIRE(datasource != nullptr);
+  auto* routed_cache = datasource->io_ctx()->cache();
+  REQUIRE(routed_cache != nullptr);
+  auto* default_cache = manager.io_ctx()->cache();
+  REQUIRE(default_cache != nullptr);
+
+  // Two live queries: the staleness bar (min live epoch) must stay at the
+  // OLDEST live query's epoch, not follow the newest prepare — that
+  // newest-wins scoring was concurrency issue F3.
+  auto q1 = make_empty_query(sirius::make_query_id(1));
+  manager.prepare_for_query(q1, true, {});
+  auto q2 = make_empty_query(sirius::make_query_id(2));
+  manager.prepare_for_query(q2, true, {});
+
+  for (auto* cache : {routed_cache, default_cache}) {
+    REQUIRE(cache->live_query_count() == 2);
+    REQUIRE(cache->query_epoch() == 2);
+    REQUIRE(cache->min_live_epoch() == 1);
+  }
+
+  // reset(q1) must retire q1's epoch on the default AND routed caches, even
+  // though these queries never registered scan state (no GPU scan operators)
+  // — the cache epoch is minted before that registration.
+  manager.reset(sirius::make_query_id(1));
+  for (auto* cache : {routed_cache, default_cache}) {
+    REQUIRE(cache->live_query_count() == 1);
+    REQUIRE(cache->min_live_epoch() == 2);
+  }
+
+  // Retiring the last query parks the bar at the newest epoch (the old
+  // between-queries behavior). A second reset of the same id is a no-op.
+  manager.reset(sirius::make_query_id(2));
+  manager.reset(sirius::make_query_id(2));
+  for (auto* cache : {routed_cache, default_cache}) {
+    REQUIRE(cache->live_query_count() == 0);
+    REQUIRE(cache->min_live_epoch() == cache->query_epoch());
+  }
+}
+
 TEST_CASE("scan_manager tolerates routed S3 ioctx without a prefetch cache",
           "[s3][routing][scan_manager][cache]")
 {
