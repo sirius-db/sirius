@@ -56,6 +56,27 @@ are forwarded to `tpch_power_throughput.py` verbatim (e.g. `--scratch-db`, `--up
 | `CUDF_SO`, `PLANS`, `LAYOUT`, `CFG` | repro-kit paths | Patched libcudf to `LD_PRELOAD`, compression-plan dir, pin-layout JSON, Sirius config YAML. |
 | `SIRIUS_PRE_SQL` | `ast_jit` SET | SQL run after `LOAD`, before any pin; override for diagnosis runs (e.g. append a log-level SET). |
 
+### Diagnostics: sanitizer sweeps and concurrency gates
+
+Two ready-made verification gates drive `run-power.sh` in diagnostic configurations. Both
+refuse to start while foreign GPU work is running (`nvidia-smi` check), serialize against each
+other via `flock` on a lease file, and append one PASS/FAIL line per run to `VERIFY-LEDGER.txt`.
+
+- **`verify-memcheck-sf1.sh [tool] [streams]`** — compute-sanitizer sweep on a small-scale
+  *concurrent* repro: SF1 data, `MODE=both`, 3 streams, and `sirius-sf1-memcheck.yaml`, whose
+  tiny GPU cap (`usage_limit_fraction: 0.010`) makes the SF1000 downgrade/eviction churn regime
+  fire at SF1 sizes. The sanitizer's 10–40× overhead is irrelevant at seconds scale, and every
+  invalid device access self-identifies with a device PC + host allocation/free backtraces —
+  this exact gate caught an out-of-bounds shared-memory read inside a vendored CCCL 3.4.0
+  `DeviceScan` kernel in a single pass.
+- **`verify-poison-concurrent.sh [tag] [streams]`** — full-scale SF1000 concurrent gate
+  (`sirius-sf1000-gate.yaml`: 0.80 usage cap, heavier downgrade churn than production) with
+  CUDA exception coredumps enabled (`CUDA_ENABLE_COREDUMP_ON_EXCEPTION` + friends), so the
+  first kernel to touch bad memory is captured red-handed rather than a downstream victim.
+  It exports `SIRIUS_POISON_FREES=1`, an env-gated engine debug mode that ships separately
+  (memory-hardening PR); without it the script degrades gracefully to a concurrent stress
+  gate with coredump capture.
+
 ---
 
 ## What produces the number
