@@ -32,6 +32,15 @@
 // allocation mid-read (use-after-free / corruption). The "sensitivity" test
 // re-creates the pre-fix binding deliberately and proves the harness detects the
 // corruption; the fixed paths must then be deterministically clean.
+//
+// Scope note: the per-buffer rebind assertions (data / null mask / nested
+// children bound to the release stream) and the set_data consumer-event sync
+// are pinned deterministically at the cucascade layer
+// (cucascade/test/cudf/test_release_table_stream.cpp and
+// cucascade/test/data/test_consumer_events.cpp). This suite keeps only what
+// the Sirius layer adds: the real converter registry + memory spaces behind
+// the steal-path stress, its matched sensitivity (non-vacuity) check, and the
+// production downgrade discipline through install_converted_representation.
 
 #include "catch.hpp"
 #include "data/data_batch_utils.hpp"
@@ -280,56 +289,7 @@ constexpr std::size_t kScratchMiB = 64;
 }  // namespace
 
 //===----------------------------------------------------------------------===//
-// 1. release_table must rebind converter-produced buffers to the caller's stream
-//===----------------------------------------------------------------------===//
-TEST_CASE("release_table rebinds converted buffers (data, null mask, nested) to caller stream",
-          "[stream_lineage]")
-{
-  stream_lineage_fixture f;
-  REQUIRE(f.setup());
-
-  rmm::cuda_stream setup_stream;
-  auto batch =
-    make_host_batch(f, 4096, /*seed=*/7, /*with_nulls=*/true, /*with_strings=*/true, setup_stream);
-  upload_to_gpu(f, batch, setup_stream);
-  setup_stream.synchronize();
-
-  // Created AFTER the conversion allocated the GPU buffers, so no buffer can be
-  // "accidentally" born bound to it: any binding observed below must come from
-  // release_table's rebind.
-  rmm::cuda_stream task_stream;
-  auto stolen = steal_table(batch, *f.gpu0, task_stream.view());
-  REQUIRE(stolen != nullptr);
-  REQUIRE(stolen->num_columns() == 2);
-
-  auto cols = stolen->release();
-
-  // INT64 column: data buffer and null mask must deallocate on task_stream.
-  {
-    auto contents = cols[0]->release();
-    REQUIRE(contents.data != nullptr);
-    CHECK(contents.data->stream().value() == task_stream.value());
-    REQUIRE(contents.null_mask != nullptr);
-    REQUIRE(contents.null_mask->size() > 0);
-    CHECK(contents.null_mask->stream().value() == task_stream.value());
-  }
-
-  // STRING column (nested): chars payload and the offsets child's data buffer
-  // must both deallocate on task_stream (cudf::rebind_stream recurses).
-  {
-    auto contents = cols[1]->release();
-    REQUIRE(contents.data != nullptr);
-    REQUIRE(contents.data->size() > 0);
-    CHECK(contents.data->stream().value() == task_stream.value());
-    REQUIRE(!contents.children.empty());
-    auto offsets_contents = contents.children[0]->release();
-    REQUIRE(offsets_contents.data != nullptr);
-    CHECK(offsets_contents.data->stream().value() == task_stream.value());
-  }
-}
-
-//===----------------------------------------------------------------------===//
-// 2. Steal-path UAF stress: mid-flight column destruction under pool churn
+// 1. Steal-path UAF stress: mid-flight column destruction under pool churn
 //===----------------------------------------------------------------------===//
 TEST_CASE("stolen table tolerates mid-flight column destruction under conversion pressure",
           "[stream_lineage]")
@@ -389,7 +349,7 @@ TEST_CASE("stolen table tolerates mid-flight column destruction under conversion
 }
 
 //===----------------------------------------------------------------------===//
-// 3. Sensitivity check: the pre-fix binding (free on an idle foreign stream)
+// 2. Sensitivity check: the pre-fix binding (free on an idle foreign stream)
 //    corrupts the very read the fixed path protects.
 //===----------------------------------------------------------------------===//
 TEST_CASE("rebinding a stolen column back to an idle foreign stream reproduces pre-fix corruption",
@@ -457,7 +417,7 @@ TEST_CASE("rebinding a stolen column back to an idle foreign stream reproduces p
 }
 
 //===----------------------------------------------------------------------===//
-// 4. Consumer events order a convert_to reclaim after in-flight reads
+// 3. Consumer events order a convert_to reclaim after in-flight reads
 //===----------------------------------------------------------------------===//
 TEST_CASE("consumer events order install_converted_representation after in-flight reads",
           "[stream_lineage]")
@@ -509,67 +469,6 @@ TEST_CASE("consumer events order install_converted_representation after in-fligh
   // Churn the pool: if the reclaim had freed the GPU buffers early these
   // allocations would recycle them under the (by then already finished) read.
   hammer_conversions(f, reclaim_stream.view(), 3, kRows / 4);
-
-  std::vector<std::int64_t> host_result(kRows);
-  cudaMemcpyAsync(
-    host_result.data(), result_dev, kBytes, cudaMemcpyDeviceToHost, reader_stream.value());
-  reader_stream.synchronize();
-
-  std::size_t mismatches = 0;
-  for (std::size_t i = 0; i < kRows; ++i) {
-    if (host_result[i] != seed + static_cast<std::int64_t>(i)) { ++mismatches; }
-  }
-  INFO("corrupted elements: " << mismatches << " of " << kRows);
-  REQUIRE(mismatches == 0);
-
-  cudaFree(scratch);
-  cudaFree(result_dev);
-}
-
-//===----------------------------------------------------------------------===//
-// 5. set_data blocks on recorded consumer events before dropping the old data
-//===----------------------------------------------------------------------===//
-TEST_CASE("set_data waits for recorded consumer reads before replacing the representation",
-          "[stream_lineage]")
-{
-  stream_lineage_fixture f;
-  REQUIRE(f.setup());
-
-  void* scratch    = nullptr;
-  void* result_dev = nullptr;
-  REQUIRE(cudaMalloc(&scratch, kScratchMiB << 20) == cudaSuccess);
-  REQUIRE(cudaMalloc(&result_dev, kBytes) == cudaSuccess);
-
-  std::int64_t const seed = 99;
-  rmm::cuda_stream setup_stream;
-  rmm::cuda_stream reader_stream;
-
-  auto batch = make_host_batch(f, kRows, seed, false, false, setup_stream.view());
-  upload_to_gpu(f, batch, setup_stream.view());
-  setup_stream.synchronize();
-
-  {
-    auto ro         = batch->to_read_only();
-    auto view       = sirius::get_cudf_table_view(ro);
-    void const* src = view.column(0).head();
-    enqueue_blockers(scratch, kScratchMiB << 20, reader_stream.view());
-    cudaMemcpyAsync(result_dev, src, kBytes, cudaMemcpyDeviceToDevice, reader_stream.value());
-    ro.record_consumer_event(reader_stream.view());
-    REQUIRE_FALSE(batch->consumers_done());
-  }
-
-  // set_data destroys the old GPU representation (buffers still bound to the
-  // conversion-pool stream — no rebind happens on this path). The consumer-event
-  // hook must host-block until the reader's recorded reads complete.
-  {
-    auto mut = batch->to_mutable();
-    mut.set_data(std::make_unique<cucascade::gpu_table_representation>(
-      std::make_unique<cudf::table>(), *f.gpu0, rmm::cuda_stream_view{}));
-    CHECK(cudaStreamQuery(reader_stream.value()) == cudaSuccess);
-    REQUIRE(batch->consumers_done());
-  }
-
-  hammer_conversions(f, setup_stream.view(), 3, kRows / 4);
 
   std::vector<std::int64_t> host_result(kRows);
   cudaMemcpyAsync(
