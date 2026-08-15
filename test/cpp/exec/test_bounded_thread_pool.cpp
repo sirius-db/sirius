@@ -424,6 +424,96 @@ TEST_CASE("an untagged reservation does not block a per-query wait",
   REQUIRE(pool.active_for_query(q) == 0);
 }
 
+TEST_CASE("wait_for_query_and_untagged waits out untagged slots but not co-tenants",
+          "[bounded_thread_pool][concurrency]")
+{
+  // The error bracket's wait. A task dispatched WITHOUT an attach (its query is unknowable)
+  // could belong to the failing query, so it must be waited for; a co-tenant's attributed task
+  // must not be — that is the whole point of replacing wait_all() in the bracket.
+  bounded_thread_pool pool(4, "test");
+  const auto qa = sirius::make_query_id(1);
+  const auto qb = sirius::make_query_id(2);
+
+  std::atomic<bool> release_b{false};
+  release_on_exit guard_b{release_b};
+  std::atomic<bool> release_untagged{false};
+  release_on_exit guard_u{release_untagged};
+
+  // Co-tenant B: parked indefinitely, attributed to B.
+  {
+    auto sb = pool.reserve();
+    sb.attach(qb);
+    pool.dispatch(std::move(sb), [&] {
+      while (!release_b.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    });
+  }
+
+  // An untagged task: dispatched without attach, blocked until released.
+  {
+    auto su = pool.reserve();
+    pool.dispatch(std::move(su), [&] {
+      while (!release_untagged.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    });
+  }
+
+  // A quick task of the waiting query.
+  std::atomic<int> a_done{0};
+  {
+    auto sa = pool.reserve();
+    sa.attach(qa);
+    pool.dispatch(std::move(sa), [&] { a_done.fetch_add(1, std::memory_order_relaxed); });
+  }
+
+  std::atomic<bool> wait_returned{false};
+  std::thread waiter([&] {
+    pool.wait_for_query_and_untagged(qa);
+    wait_returned.store(true, std::memory_order_release);
+  });
+
+  // Blocked by the untagged slot even after A's own work is long done.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  const bool blocked_on_untagged = !wait_returned.load(std::memory_order_acquire);
+
+  // Releasing the untagged task is enough — the co-tenant stays parked.
+  release_untagged.store(true, std::memory_order_release);
+  const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!wait_returned.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < give_up) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const bool returned_with_cotenant_parked =
+    wait_returned.load(std::memory_order_acquire) && pool.active_for_query(qb) == 1;
+
+  release_b.store(true, std::memory_order_release);
+  waiter.join();
+  pool.wait_all();
+
+  REQUIRE(a_done.load() == 1);
+  REQUIRE(blocked_on_untagged);
+  REQUIRE(returned_with_cotenant_parked);
+}
+
+TEST_CASE("active_untagged tracks the reserve-to-attach window", "[bounded_thread_pool]")
+{
+  bounded_thread_pool pool(2, "test");
+  REQUIRE(pool.active_untagged() == 0);
+
+  const auto q = sirius::make_query_id(9);
+  {
+    auto s = pool.reserve();
+    REQUIRE(pool.active_untagged() == 1);  // reserved but not yet attributed
+    s.attach(q);
+    REQUIRE(pool.active_untagged() == 0);  // attribution moved it into the query's count
+    REQUIRE(pool.active_for_query(q) == 1);
+  }
+  REQUIRE(pool.active_untagged() == 0);
+  REQUIRE(pool.active_for_query(q) == 0);
+}
+
 TEST_CASE("drain_and_wait discards the query's queued work", "[bounded_thread_pool][concurrency]")
 {
   // The error-path counterpart: queued work is dropped rather than run, because its query is

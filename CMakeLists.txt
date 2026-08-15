@@ -726,6 +726,8 @@ set(TEST_SOURCES
     test/cpp/operator/test_partition_memspace_mgpu.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/memory/test_pinned_reservation_guard.cpp
+    test/cpp/memory/test_reservation_fairness.cpp
+    test/cpp/memory/test_stream_pool_fifo.cpp
     test/cpp/memory/test_topology_index.cpp
     test/cpp/operator/test_build_probe_scheduling.cpp
     test/cpp/operator/test_cross_schedule.cpp
@@ -783,6 +785,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_per_query_completion_handler.cpp
     test/cpp/pipeline/test_plan_printer.cpp
     test/cpp/pipeline/test_repository_wiring_materializer.cpp
+    test/cpp/pipeline/test_task_executor_error_bracket.cpp
     test/cpp/pipeline/test_task_index_keys.cpp
     test/cpp/pipeline/test_task_scheduler.cpp
     test/cpp/scan/bench_decode_codecs.cpp
