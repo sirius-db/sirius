@@ -34,14 +34,20 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <future>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
 namespace sirius {
+
+class convertible_gpu_pipeline_task_provider;
+
 namespace parallel {
 
 /**
@@ -72,8 +78,11 @@ struct downgrade_request {
  *
  * Each downgrade_executor is bound to a specific memory space (e.g., GPU:0, HOST:0) and
  * monitors it for memory pressure. When `should_downgrade_memory()` triggers, it enqueues
- * a downgrade_request. The processing thread dequeues requests sequentially, collects
- * candidate batches, and dispatches downgrade tasks to the thread pool.
+ * a downgrade_request. The processing thread dequeues requests and dispatches per-candidate
+ * conversions to the thread pool; requests are processed CONCURRENTLY (F8) — the thread only
+ * serializes candidate COLLECTION, and each request completes (fulfils its promise, logs, and
+ * clears its in-flight entry) when its last dispatched conversion finishes, so one query's
+ * long spill no longer stalls every other query's pending requests behind it.
  *
  * This is a standalone class with its own thread pool and request queue.
  */
@@ -121,10 +130,11 @@ class downgrade_executor {
    * @brief Per-query drain, for one query's end-of-window cleanup.
    *
    * Fails ONLY @p query_id's queued promises (unblocking that query's own waiters, which are
-   * being torn down anyway) and waits for an in-flight request of that query to complete. It
-   * never interrupts the request queue, the pool, or the processing/monitor threads, so peer
-   * queries' pending spills and the monitor's pressure response proceed unaffected — and it
-   * needs no lifecycle serialization because it never touches thread lifetimes.
+   * being torn down anyway) and waits for the in-flight requests of that query — plural under
+   * F8's concurrent processing — to complete. It never interrupts the request queue, the pool,
+   * or the processing/monitor threads, so peer queries' pending spills and the monitor's
+   * pressure response proceed unaffected — and it needs no lifecycle serialization because it
+   * never touches thread lifetimes.
    *
    * Precondition: the query is quiesced (no producer can enqueue new requests for it), which
    * run_mandatory_cleanup guarantees before calling this. Repository teardown needs no fence
@@ -134,12 +144,12 @@ class downgrade_executor {
   void drain(sirius::query_id_t query_id);
 
   /**
-   * @brief Wait until no downgrade request is being processed, regardless of owner.
+   * @brief Wait for every downgrade request in flight AT ENTRY, regardless of owner.
    *
    * THE SURVIVING FENCE — this wait is about PLAN lifetime, not repository lifetime, and
    * shared-ownership repositories (step 6) deliberately did NOT subsume it:
    *
-   * drain(query_id) waits only for the query's OWN in-flight request — but a PEER's (or the
+   * drain(query_id) waits only for the query's OWN in-flight requests — but a PEER's (or the
    * monitor's) request sweeps by memory space, not by query, so its TIER-2 pass can hold the
    * ending query's task inside a convertible wrapper across a blocking conversion. When that
    * wrapper's RAII drop runs, the lifecycle gate (consulted with extraction-time keys) refuses
@@ -149,14 +159,16 @@ class downgrade_executor {
    * plan's death until cleanup; cleanup must still not destroy it while such a wrapper is
    * alive. Query-end cleanup therefore calls this after the per-query drains and BEFORE
    * destroying the parked plan: when it returns, every wrapper created by a request that was
-   * in flight has been destroyed (a request joins its wrappers before completing), so one
-   * final queue sweep leaves nothing of the query for a later request to find.
+   * in flight AT ENTRY has been destroyed (a request joins its wrappers before completing), so
+   * one final queue sweep leaves nothing of the query for a later request to find.
    *
-   * A request popped but not yet published as in-flight can slip past this wait; that is
-   * closed from the other side — TIER-2 extraction consults the query-lifecycle gate, so a
-   * request starting after quiesce() never extracts the ending query's tasks. Those two
-   * properties (extraction gate + this bounded wait) are exactly what makes destroying the
-   * plan safe; keep them together.
+   * BARRIER semantics under F8's concurrent processing: this waits for the requests published
+   * before the call (their seq is below the barrier), NOT for the executor to go idle — a
+   * steady stream of monitor/peer requests would otherwise starve it forever. Later requests
+   * are safe by the extraction gate: a request popped but not yet published can slip past this
+   * wait, and any request starting after quiesce() never extracts the ending query's tasks.
+   * Those two properties (extraction gate + this bounded barrier) are exactly what makes
+   * destroying the plan safe; keep them together.
    */
   void wait_inflight_request();
 
@@ -256,9 +268,37 @@ class downgrade_executor {
   }
 
  private:
+  /// Per-request processing state, shared between the processing thread and the request's
+  /// dispatched workers; the last releaser completes the request. Defined in the .cpp.
+  struct request_context;
+
   void processing_loop();
   void monitor_loop();
   void cancel_pending_requests();
+
+  /**
+   * @brief Finish one request: monitor re-arm, stats log, promise fulfilment, and clearing
+   *        the request's in-flight entry (in that order — the promise is fulfilled BEFORE the
+   *        entry clears, so a drain returning implies the query's waiters have unblocked).
+   *
+   * Runs on whichever thread drops the request's last outstanding token: the last conversion
+   * worker, or the processing thread itself when nothing was dispatched.
+   */
+  void complete_request(request_context& ctx);
+
+  /**
+   * @brief One TIER-2 extraction pass for @p ctx, optionally excluding a query's tasks.
+   *
+   * F8 victim preference: a request works FOR its query, so extracting that query's own queued
+   * tasks to satisfy it is self-defeating unless nothing else can free memory. The loop runs
+   * this once with the requester excluded, then — only if still unsatisfied — once more with
+   * no exclusion (own-query victims as the last resort). Budget: at most the queue's size at
+   * pass start, i.e. the candidates this pass could actually take.
+   */
+  void run_tier2_pass(const std::shared_ptr<request_context>& ctx,
+                      sirius::convertible_gpu_pipeline_task_provider& provider,
+                      cucascade::memory::memory_space* source_space,
+                      std::optional<sirius::query_id_t> exclude_query);
 
   /**
    * @brief Fail every queued request belonging to @p query_id; leave the rest queued.
@@ -296,14 +336,16 @@ class downgrade_executor {
   exec::interruptible_mpmc<std::unique_ptr<downgrade_request>> _request_queue;
   std::thread _processing_thread;
   std::thread _monitor_thread;
-  /// Which request the processing loop is currently executing (it handles one at a time).
-  /// drain(query_id) waits on this so a query's cleanup proceeds only once the request its
-  /// waiter is blocked on has fulfilled its promise. Guarded by _in_flight_mutex; the cv is
-  /// notified on every clear.
+  /// The requests currently being processed (F8: several at once), keyed by a monotonically
+  /// increasing sequence assigned at pop time, valued by the owning query. A request is
+  /// published here before any of its work starts and erased by complete_request() AFTER its
+  /// promise is fulfilled — so drain(query_id) (waits for this query's entries to clear) and
+  /// wait_inflight_request() (waits for every entry below an entry-time barrier) keep their
+  /// contracts. Guarded by _in_flight_mutex; the cv is notified on every erase.
   std::mutex _in_flight_mutex;
   std::condition_variable _in_flight_cv;
-  bool _in_flight_active{false};
-  sirius::query_id_t _in_flight_query{sirius::make_query_id(0)};
+  std::map<std::uint64_t, sirius::query_id_t> _in_flight_requests;
+  std::uint64_t _next_request_seq{0};
   std::atomic<bool> _monitor_request_enqueued{false};
   std::atomic<bool> _running{false};
   std::atomic<size_t> _monitor_requests_issued{0};

@@ -23,6 +23,8 @@
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <data/convertible_gpu_pipeline_task.hpp>
+#include <data/data_repository_manager_registry.hpp>
+#include <downgrade/downgrade_executor.hpp>
 #include <exec/multi_index_priority_queue.hpp>
 #include <exec/query_lifecycle_registry.hpp>
 #include <op/sirius_physical_operator.hpp>
@@ -507,4 +509,108 @@ TEST_CASE("RAII re-push lands the task under its extraction-time query bucket",
 
   // Restore the id so teardown bookkeeping (task dtor walks the pipeline) stays coherent.
   pipeline->set_query_id(extraction_query);
+}
+
+// --- F8: TIER-2 victim preference -----------------------------------------------------------
+//
+// A downgrade request works FOR a query; extracting that query's own queued tasks to satisfy
+// it is self-defeating unless nothing else can free memory. The provider exposes an exclusion
+// filter, and the executor sweeps peers-first, own-query last.
+
+TEST_CASE("provider exclusion filter skips the excluded query's tasks",
+          "[convertible_gpu_pipeline_task]")
+{
+  auto& e = env();
+  pipeline_task_fixture f;
+
+  const auto requester = sirius::make_query_id(7);
+  const auto peer      = sirius::make_query_id(9);
+
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(
+    &sirius::pipeline::index_keys_for);
+
+  auto requester_pipeline = f.make_pipeline(requester, /*priority=*/42);
+  auto peer_pipeline      = f.make_pipeline(peer, /*priority=*/43);
+  auto requester_batch    = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
+  auto peer_batch = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{4, 5, 6}, cudf::type_id::INT32);
+  queue.push(f.make_task(requester_pipeline, /*priority=*/42, {requester_batch}));
+  queue.push(f.make_task(peer_pipeline, /*priority=*/43, {peer_batch}));
+  REQUIRE(queue.size() == 2);
+
+  sirius::convertible_gpu_pipeline_task_provider provider(queue);
+
+  {
+    // Excluding the requester yields only the peer's task...
+    auto cd = provider.get_next_convertible(e.gpu_space, false, requester);
+    REQUIRE(cd != nullptr);
+    REQUIRE(cd->bytes_in_space(e.gpu_space) > 0);
+    // ...and with the peer's task extracted, nothing else passes the filter.
+    auto none = provider.get_next_convertible(e.gpu_space, false, requester);
+    REQUIRE(none == nullptr);
+    REQUIRE(queue.size(sirius::exec::query_index{sirius::value_of(requester)}) == 1);
+  }
+
+  // Wrappers returned everything; without the exclusion the requester's task is extractable.
+  REQUIRE(queue.size() == 2);
+  auto cd = provider.get_next_convertible(e.gpu_space, false, std::nullopt);
+  REQUIRE(cd != nullptr);
+}
+
+TEST_CASE("a request does not extract the requester's own task when a peer's suffices",
+          "[convertible_gpu_pipeline_task][downgrade_executor]")
+{
+  auto& e = env();
+  pipeline_task_fixture f;
+
+  const auto requester = sirius::make_query_id(7);
+  const auto peer      = sirius::make_query_id(9);
+
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(
+    &sirius::pipeline::index_keys_for);
+
+  auto requester_pipeline = f.make_pipeline(requester, /*priority=*/42);
+  auto peer_pipeline      = f.make_pipeline(peer, /*priority=*/43);
+  auto requester_batch    = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
+  auto peer_batch = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{4, 5, 6}, cudf::type_id::INT32);
+  queue.push(f.make_task(requester_pipeline, /*priority=*/42, {requester_batch}));
+  queue.push(f.make_task(peer_pipeline, /*priority=*/43, {peer_batch}));
+
+  // Empty repository registry: TIER-1 contributes nothing, isolating TIER-2 selection.
+  sirius::data::data_repository_manager_registry repo_registry;
+  sirius::exec::downgrade_executor_config config{
+    .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade"},
+    .monitor_period = std::chrono::milliseconds{0}};
+  sirius::parallel::downgrade_executor executor(
+    config,
+    repo_registry,
+    cucascade::memory::memory_space_id(cucascade::memory::Tier::GPU, 0),
+    e.gpu_space,
+    *e.mgr,
+    &queue);
+  executor.start();
+
+  // One converted batch satisfies the request. The peers-first pass must fulfil it from the
+  // peer's task; the requester's own task stays queued and resident.
+  auto fut     = executor.request_downgrade(requester, []() { return true; });
+  size_t freed = 0;
+  REQUIRE_NOTHROW(freed = fut.get());
+  REQUIRE(freed > 0);
+
+  REQUIRE(get_batch_tier(*peer_batch) == cucascade::memory::Tier::HOST);
+  REQUIRE(get_batch_tier(*requester_batch) == cucascade::memory::Tier::GPU);
+  // Both tasks are back in the queue (the peer's via the wrapper's RAII re-push).
+  REQUIRE(queue.size() == 2);
+
+  // LAST RESORT: with only the requester's own task available, its request may take it.
+  auto fut_own = executor.request_downgrade(requester, []() { return true; });
+  REQUIRE_NOTHROW(freed = fut_own.get());
+  REQUIRE(freed > 0);
+  REQUIRE(get_batch_tier(*requester_batch) == cucascade::memory::Tier::HOST);
+  REQUIRE(queue.size() == 2);
+
+  executor.stop();
 }

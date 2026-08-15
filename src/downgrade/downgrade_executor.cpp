@@ -141,25 +141,152 @@ void downgrade_executor::drain(sirius::query_id_t query_id)
   // processing/monitor threads keep running.
   cancel_pending_requests_for_query(query_id);
 
-  // The processing loop executes one request at a time; if the request in flight is this
-  // query's, wait it out — its promise is fulfilled before the flag clears, so returning
-  // implies this query has no waiter left inside this executor.
+  // Wait out THIS query's in-flight requests (plural — requests process concurrently). Each
+  // fulfils its promise before its entry clears, so returning implies this query has no
+  // waiter left inside this executor. Bounded: the caller has quiesced the query, so no new
+  // requests of this query can be published.
   //
-  // A request popped but not yet marked in flight can slip past this wait. That is benign:
-  // the caller has already quiesced the query (no new waiters can appear), the slipped
-  // request still fulfils its promise normally, and repository teardown needs no fence at
-  // all — its sweep co-owns whatever it borrows (step 6).
+  // A request popped but not yet published can slip past this wait. That is benign: the
+  // caller has already quiesced the query (no new waiters can appear), the slipped request
+  // still fulfils its promise normally, and repository teardown needs no fence at all — its
+  // sweep co-owns whatever it borrows (step 6).
   std::unique_lock<std::mutex> lock(_in_flight_mutex);
-  _in_flight_cv.wait(lock, [&] { return !_in_flight_active || _in_flight_query != query_id; });
+  _in_flight_cv.wait(lock, [&] {
+    for (auto const& [seq, query] : _in_flight_requests) {
+      if (query == query_id) { return false; }
+    }
+    return true;
+  });
 }
 
 void downgrade_executor::wait_inflight_request()
 {
-  // See the header: any in-flight request's TIER-2 sweep may hold ANOTHER query's task in a
+  // See the header: an in-flight request's TIER-2 sweep may hold ANOTHER query's task in a
   // convertible wrapper; the caller must not destroy that query's plan until the request (and
-  // with it every wrapper it created) has completed. Bounded: one request.
+  // with it every wrapper it created) has completed. BARRIER semantics: wait only for the
+  // requests published before entry — waiting for idleness would never return under a steady
+  // stream of monitor/peer requests, and later requests cannot extract the caller's tasks
+  // (TIER-2 extraction consults the lifecycle gate; the caller has already quiesced).
   std::unique_lock<std::mutex> lock(_in_flight_mutex);
-  _in_flight_cv.wait(lock, [&] { return !_in_flight_active; });
+  const std::uint64_t barrier = _next_request_seq;
+  _in_flight_cv.wait(lock, [&] {
+    return _in_flight_requests.empty() || _in_flight_requests.begin()->first >= barrier;
+  });
+}
+
+/// Per-request processing state, shared by the processing thread and the request's dispatched
+/// conversion workers. The processing thread holds one "dispatch token" while it collects and
+/// dispatches candidates; every dispatched worker holds one more. Whoever drops the count to
+/// zero runs complete_request() — that is what lets the processing thread move on to the NEXT
+/// request while this one's conversions are still running (F8).
+struct downgrade_executor::request_context {
+  request_context(downgrade_executor& owner, std::unique_ptr<downgrade_request> request)
+    : self(owner), req(std::move(request))
+  {
+  }
+
+  downgrade_executor& self;
+  std::unique_ptr<downgrade_request> req;
+  /// Key of this request's entry in the executor's in-flight map.
+  std::uint64_t seq{0};
+
+  struct running_stats {
+    std::atomic<size_t> batches{0};
+    std::atomic<size_t> bytes{0};
+  };
+  // Per-source tracking (repos vs pipeline_queue) and per-target-tier tracking (host vs
+  // disk). Owned here — not on the loop's stack — because workers update them after the
+  // processing thread has moved on.
+  running_stats repo_stats;
+  running_stats pipeline_queue_stats;
+  running_stats host_target_stats;
+  running_stats disk_target_stats;
+
+  /// Candidate conversion targets, in preference order; referenced by every worker.
+  std::vector<const cucascade::memory::memory_space*> target_spaces;
+  size_t host_end_idx{0};
+  bool disk_not_configured{false};
+  std::chrono::steady_clock::time_point t_start{};
+
+  std::atomic<size_t> outstanding{1};
+
+  void add_worker() { outstanding.fetch_add(1, std::memory_order_relaxed); }
+  void release()
+  {
+    const size_t remaining = outstanding.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    if (remaining == 0) { self.complete_request(*this); }
+    outstanding.notify_all();
+  }
+
+  /// Processing-thread only: block until every dispatched worker of THIS request has finished
+  /// (outstanding back to the loop's own token). Used between the TIER-2 victim-preference
+  /// passes — "own-query victims as the last resort" is only knowable once the peers-first
+  /// pass's conversions have actually landed, because `satisfied` lags the dispatches.
+  /// Bounded: waits only for this request's workers, never the pool or other requests.
+  void wait_for_dispatched_workers()
+  {
+    for (auto value = outstanding.load(std::memory_order_acquire); value > 1;
+         value      = outstanding.load(std::memory_order_acquire)) {
+      outstanding.wait(value, std::memory_order_acquire);
+    }
+  }
+};
+
+void downgrade_executor::complete_request(request_context& ctx)
+{
+  auto& req = *ctx.req;
+
+  // Monitor re-arm (D6): the completion side owns clearing the flag for requests the loop
+  // consumed; fail_request() owns it for requests destroyed unprocessed.
+  if (req.is_monitor_request) { _monitor_request_enqueued.store(false, std::memory_order_relaxed); }
+
+  // Monitor requests are gated by has_viable_downgrade_target() and warn once per stall
+  // episode in monitor_loop(); only warn here for one-shot (external) requests to avoid spam.
+  if (ctx.disk_not_configured && !req.satisfied.load() && !req.is_monitor_request) {
+    SIRIUS_LOG_WARN(
+      "[downgrade] [{}] downgrade request not satisfied and disk memory space is not configured; "
+      "data cannot be spilled to disk. Consider configuring a disk memory space to enable "
+      "spilling.",
+      _source_label);
+  }
+
+  auto total_bytes   = req.bytes_freed.load(std::memory_order_relaxed);
+  auto total_batches = req.batches_downgraded.load(std::memory_order_relaxed);
+  auto duration_ms =
+    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ctx.t_start)
+      .count();
+  double throughput_mbs =
+    (duration_ms > 0.0) ? (total_bytes / (1024.0 * 1024.0)) / (duration_ms / 1000.0) : 0.0;
+  std::string request_label = req.is_monitor_request ? "monitor " : "";
+
+  SIRIUS_LOG_DEBUG(
+    "[downgrade] [{}] request {}done: {} batches, {} bytes in {:.2f} ms ({:.1f} MB/s) | "
+    "repos: {}/{} batches/bytes, pipeline_queue: {}/{} | "
+    "to_host: {}/{} batches/bytes, to_disk: {}/{} batches/bytes",
+    _source_label,
+    request_label,
+    total_batches,
+    total_bytes,
+    duration_ms,
+    throughput_mbs,
+    ctx.repo_stats.batches.load(std::memory_order_relaxed),
+    ctx.repo_stats.bytes.load(std::memory_order_relaxed),
+    ctx.pipeline_queue_stats.batches.load(std::memory_order_relaxed),
+    ctx.pipeline_queue_stats.bytes.load(std::memory_order_relaxed),
+    ctx.host_target_stats.batches.load(std::memory_order_relaxed),
+    ctx.host_target_stats.bytes.load(std::memory_order_relaxed),
+    ctx.disk_target_stats.batches.load(std::memory_order_relaxed),
+    ctx.disk_target_stats.bytes.load(std::memory_order_relaxed));
+
+  // Fulfill the promise BEFORE clearing the in-flight entry: drain(query_id) returning must
+  // imply this query's waiters have unblocked.
+  req.result.set_value(total_bytes);
+
+  {
+    std::lock_guard<std::mutex> in_flight_lock(_in_flight_mutex);
+    _in_flight_requests.erase(ctx.seq);
+  }
+  _in_flight_cv.notify_all();
 }
 
 void downgrade_executor::processing_loop()
@@ -168,43 +295,19 @@ void downgrade_executor::processing_loop()
     auto request = _request_queue.pop();
     if (!request) break;  // interrupted
 
-    auto& req = request;
+    auto ctx = std::make_shared<request_context>(*this, std::move(request));
 
-    // Publish whose request is in flight before doing any work, and clear it on every exit
-    // path (RAII below): drain(query_id) waits on this so a query's cleanup only proceeds
-    // once the request its waiter blocks on has fulfilled its promise.
+    // Publish {seq -> query} before doing any work; complete_request() erases the entry after
+    // the promise is fulfilled. drain(query_id)/wait_inflight_request() wait on these entries.
+    // (A request popped but not yet published can slip past those waits — benign, closed from
+    // the other side by the TIER-2 extraction gate; see the header.)
     {
       std::lock_guard<std::mutex> in_flight_lock(_in_flight_mutex);
-      _in_flight_active = true;
-      _in_flight_query  = req->query_id;
+      ctx->seq = _next_request_seq++;
+      _in_flight_requests.emplace(ctx->seq, ctx->req->query_id);
     }
-    struct in_flight_reset {
-      downgrade_executor* self;
-      ~in_flight_reset()
-      {
-        {
-          std::lock_guard<std::mutex> in_flight_lock(self->_in_flight_mutex);
-          self->_in_flight_active = false;
-        }
-        self->_in_flight_cv.notify_all();
-      }
-    } in_flight_reset_guard{this};
 
-    auto t_start = std::chrono::steady_clock::now();
-
-    // Per-source tracking (repos vs pipeline_queue)
-    struct source_stats {
-      std::atomic<size_t> batches{0};
-      std::atomic<size_t> bytes{0};
-    };
-    source_stats repo_stats, pipeline_queue_stats;
-
-    // Per-target-tier tracking (host vs disk)
-    struct target_tier_stats {
-      std::atomic<size_t> batches{0};
-      std::atomic<size_t> bytes{0};
-    };
-    target_tier_stats host_target_stats, disk_target_stats;
+    ctx->t_start = std::chrono::steady_clock::now();
 
     // Resolve the source memory space for filtering candidates
     auto* source_space = _reservation_manager.get_memory_space(_space_id.tier, _space_id.device_id);
@@ -213,7 +316,7 @@ void downgrade_executor::processing_loop()
     // NUMA preference (from downgrade_executor_config, v1.0 dd86dd0 intent re-authored on the
     // post-#637 architecture): if preferred_numa_node is set, stable_partition the matching HOST
     // space(s) to the front of target_spaces so cand->convert() tries the NUMA-local space first.
-    std::vector<const cucascade::memory::memory_space*> target_spaces;
+    // Owned by the context: this request's workers read it after the loop moves on.
     if (_space_id.tier == cucascade::memory::Tier::GPU) {
       auto host_span =
         _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
@@ -230,15 +333,15 @@ void downgrade_executor::processing_loop()
                               });
       }
       for (auto* hs : host_spaces) {
-        target_spaces.push_back(hs);
+        ctx->target_spaces.push_back(hs);
       }
     }
-    size_t host_end_idx = target_spaces.size();
+    ctx->host_end_idx = ctx->target_spaces.size();
     auto disk_spaces =
       _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::DISK);
-    bool disk_not_configured = disk_spaces.empty();
+    ctx->disk_not_configured = disk_spaces.empty();
     for (auto* ds : disk_spaces) {
-      target_spaces.push_back(ds);
+      ctx->target_spaces.push_back(ds);
     }
 
     // === TIER 1: Data repositories ===
@@ -267,16 +370,16 @@ void downgrade_executor::processing_loop()
     bool pool_interrupted = false;
     auto const managers   = _data_repo_registry.get_all();
     for (auto const& manager : std::views::reverse(managers)) {
-      if (req->satisfied.load() || pool_interrupted) break;
+      if (ctx->req->satisfied.load() || pool_interrupted) break;
       auto repos = manager->get_repositories();
       for (auto const& repo : repos) {
-        if (req->satisfied.load()) break;
+        if (ctx->req->satisfied.load()) break;
 
         convertible_data_batch_provider provider(repo);
         auto candidates = provider.get_all_convertible(
           source_space, /*front_to_back=*/false, /*ignore_subscribed=*/true);
         for (auto& candidate : candidates) {
-          if (req->satisfied.load()) break;
+          if (ctx->req->satisfied.load()) break;
 
           auto candidate_bytes = candidate->bytes_in_space(source_space);
 
@@ -288,38 +391,37 @@ void downgrade_executor::processing_loop()
 
           // Re-check after reserve() returns -- the previous candidate's worker may
           // have set satisfied while we were blocked waiting for a thread slot.
-          if (req->satisfied.load()) break;
+          if (ctx->req->satisfied.load()) break;
 
           auto exc_stream = _stream_pool->acquire_stream(
             cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
 
+          ctx->add_worker();
           _pool->dispatch(
             std::move(slot),
-            [cand       = std::move(candidate),
-             req_ptr    = req.get(),
-             &res_mgr   = _reservation_manager,
-             &targets   = target_spaces,
+            [cand = std::move(candidate),
+             ctx,
              exc_stream = std::move(exc_stream),
-             candidate_bytes,
-             host_end_idx,
-             &repo_stats,
-             &host_target_stats,
-             &disk_target_stats]() mutable {
+             candidate_bytes]() mutable {
               try {
-                auto result = cand->convert(targets, exc_stream, res_mgr, false);
+                auto* req_ptr = ctx->req.get();
+                auto result   = cand->convert(
+                  ctx->target_spaces, exc_stream, ctx->self._reservation_manager, false);
                 if (result) {
                   req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
                   req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
-                  repo_stats.batches.fetch_add(1, std::memory_order_relaxed);
-                  repo_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
+                  ctx->repo_stats.batches.fetch_add(1, std::memory_order_relaxed);
+                  ctx->repo_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
                   for (size_t i = 0; i < result->size(); ++i) {
                     if ((*result)[i] == 0) continue;
-                    if (i < host_end_idx) {
-                      host_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
-                      host_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
+                    if (i < ctx->host_end_idx) {
+                      ctx->host_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
+                      ctx->host_target_stats.bytes.fetch_add((*result)[i],
+                                                             std::memory_order_relaxed);
                     } else {
-                      disk_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
-                      disk_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
+                      ctx->disk_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
+                      ctx->disk_target_stats.bytes.fetch_add((*result)[i],
+                                                             std::memory_order_relaxed);
                     }
                   }
                   if (req_ptr->predicate && req_ptr->predicate()) {
@@ -329,6 +431,11 @@ void downgrade_executor::processing_loop()
               } catch (const std::exception& e) {
                 SIRIUS_LOG_ERROR("[downgrade] convert failed from data repository: {}", e.what());
               }
+              // The candidate wrapper is destroyed before the token drops, so a request's
+              // completion implies every wrapper it created is gone (the plan-lifetime fence
+              // relies on this ordering).
+              cand.reset();
+              ctx->release();
             });
         }
         if (pool_interrupted) break;
@@ -336,113 +443,98 @@ void downgrade_executor::processing_loop()
     }
 
     // === TIER 2: task_scheduler task queue ===
-    if (!req->satisfied.load() && _pipeline_task_queue) {
-      size_t max_tasks_to_convert = _pipeline_task_queue->size();
-      size_t tasks_converted      = 0;
-      // The gate travels with the provider: each wrapper it hands out consults it before its RAII
-      // re-push, so a task extracted here cannot land back in the queue after its query's drain.
+    // Victim preference (F8): first take tasks that do NOT belong to the requesting query —
+    // extracting the requester's own queued work to satisfy its request is self-defeating —
+    // then, only if still unsatisfied, take own-query victims as the last resort.
+    // Unattributed requests (query 0: the monitor's, external byte targets) own nothing, so
+    // one unfiltered pass suffices.
+    if (!ctx->req->satisfied.load() && _pipeline_task_queue) {
       convertible_gpu_pipeline_task_provider pipeline_provider(*_pipeline_task_queue,
                                                                _query_lifecycle);
-      while (!req->satisfied.load() && tasks_converted < max_tasks_to_convert) {
-        auto candidate =
-          pipeline_provider.get_next_convertible(source_space, /*front_to_back=*/false);
-        if (!candidate) break;
-        tasks_converted++;
-
-        auto candidate_bytes = candidate->bytes_in_space(source_space);
-
-        auto slot = _pool->reserve();
-        if (!slot) break;  // interrupted
-
-        if (req->satisfied.load()) break;
-
-        auto exc_stream = _stream_pool->acquire_stream(
-          cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
-
-        _pool->dispatch(
-          std::move(slot),
-          [cand       = std::move(candidate),
-           req_ptr    = req.get(),
-           &res_mgr   = _reservation_manager,
-           &targets   = target_spaces,
-           exc_stream = std::move(exc_stream),
-           candidate_bytes,
-           host_end_idx,
-           &pipeline_queue_stats,
-           &host_target_stats,
-           &disk_target_stats]() mutable {
-            try {
-              auto result = cand->convert(targets, exc_stream, res_mgr, false);
-              if (result) {
-                req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
-                req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
-                pipeline_queue_stats.batches.fetch_add(1, std::memory_order_relaxed);
-                pipeline_queue_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
-                for (size_t i = 0; i < result->size(); ++i) {
-                  if ((*result)[i] == 0) continue;
-                  if (i < host_end_idx) {
-                    host_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
-                    host_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
-                  } else {
-                    disk_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
-                    disk_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
-                  }
-                }
-                if (req_ptr->predicate && req_ptr->predicate()) { req_ptr->satisfied.store(true); }
-              }
-            } catch (const std::exception& e) {
-              SIRIUS_LOG_ERROR("[downgrade] convert failed from task queue: {}", e.what());
-            }
-          });
+      const bool attributed = sirius::value_of(ctx->req->query_id) != 0;
+      if (attributed) {
+        run_tier2_pass(ctx, pipeline_provider, source_space, ctx->req->query_id);
+        // Let the peers-first pass's conversions LAND before deciding that the requester's
+        // own queued work is truly the last resort — `satisfied` lags the dispatches, and
+        // cannibalizing the requester because peers' results were still in flight would
+        // defeat the preference in the common case. Bounded: this request's workers only.
+        ctx->wait_for_dispatched_workers();
+      }
+      if (!ctx->req->satisfied.load()) {
+        run_tier2_pass(ctx, pipeline_provider, source_space, std::nullopt);
       }
     }
 
-    // Wait for all in-flight work to finish (predicate also checked in workers)
-    _pool->wait_all();
+    // Dispatch phase over: drop the loop's token. If no worker is still out, this completes
+    // the request right here; otherwise the LAST worker completes it — and either way the
+    // loop is already free to pop the next request, so requests process concurrently,
+    // bounded by the pool's capacity (F8).
+    ctx->release();
+  }
+}
 
-    // Monitor requests are gated by has_viable_downgrade_target() and warn once per stall episode
-    // in monitor_loop(); only warn here for one-shot (external) requests to avoid log spam.
-    if (disk_not_configured && !req->satisfied.load() && !req->is_monitor_request) {
-      SIRIUS_LOG_WARN(
-        "[downgrade] [{}] downgrade request not satisfied and disk memory space is not configured; "
-        "data cannot be spilled to disk. Consider configuring a disk memory space to enable "
-        "spilling.",
-        _source_label);
-    }
+void downgrade_executor::run_tier2_pass(const std::shared_ptr<request_context>& ctx,
+                                        sirius::convertible_gpu_pipeline_task_provider& provider,
+                                        cucascade::memory::memory_space* source_space,
+                                        std::optional<sirius::query_id_t> exclude_query)
+{
+  // Budget: the queue's size at pass start — the candidates this pass could actually take.
+  // Each wrapper the provider hands out consults the lifecycle gate before its RAII re-push,
+  // so a task extracted here cannot land back in the queue after its query's drain.
+  size_t max_tasks_to_convert = _pipeline_task_queue->size();
+  size_t tasks_converted      = 0;
+  while (!ctx->req->satisfied.load() && tasks_converted < max_tasks_to_convert) {
+    auto candidate =
+      provider.get_next_convertible(source_space, /*front_to_back=*/false, exclude_query);
+    if (!candidate) break;
+    tasks_converted++;
 
-    // === Logging ===
-    auto total_bytes   = req->bytes_freed.load(std::memory_order_relaxed);
-    auto total_batches = req->batches_downgraded.load(std::memory_order_relaxed);
-    auto duration_ms =
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
-    double throughput_mbs =
-      (duration_ms > 0.0) ? (total_bytes / (1024.0 * 1024.0)) / (duration_ms / 1000.0) : 0.0;
-    std::string request_label = req->is_monitor_request ? "monitor " : "";
-    if (req->is_monitor_request) {
-      _monitor_request_enqueued.store(false, std::memory_order_relaxed);
-    }
+    auto candidate_bytes = candidate->bytes_in_space(source_space);
 
-    SIRIUS_LOG_DEBUG(
-      "[downgrade] [{}] request {}done: {} batches, {} bytes in {:.2f} ms ({:.1f} MB/s) | "
-      "repos: {}/{} batches/bytes, pipeline_queue: {}/{} | "
-      "to_host: {}/{} batches/bytes, to_disk: {}/{} batches/bytes",
-      _source_label,
-      request_label,
-      total_batches,
-      total_bytes,
-      duration_ms,
-      throughput_mbs,
-      repo_stats.batches.load(std::memory_order_relaxed),
-      repo_stats.bytes.load(std::memory_order_relaxed),
-      pipeline_queue_stats.batches.load(std::memory_order_relaxed),
-      pipeline_queue_stats.bytes.load(std::memory_order_relaxed),
-      host_target_stats.batches.load(std::memory_order_relaxed),
-      host_target_stats.bytes.load(std::memory_order_relaxed),
-      disk_target_stats.batches.load(std::memory_order_relaxed),
-      disk_target_stats.bytes.load(std::memory_order_relaxed));
+    auto slot = _pool->reserve();
+    if (!slot) break;  // interrupted
 
-    // Fulfill the promise
-    req->result.set_value(total_bytes);
+    if (ctx->req->satisfied.load()) break;
+
+    auto exc_stream = _stream_pool->acquire_stream(
+      cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
+
+    ctx->add_worker();
+    _pool->dispatch(
+      std::move(slot),
+      [cand = std::move(candidate),
+       ctx,
+       exc_stream = std::move(exc_stream),
+       candidate_bytes]() mutable {
+        try {
+          auto* req_ptr = ctx->req.get();
+          auto result =
+            cand->convert(ctx->target_spaces, exc_stream, ctx->self._reservation_manager, false);
+          if (result) {
+            req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
+            req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
+            ctx->pipeline_queue_stats.batches.fetch_add(1, std::memory_order_relaxed);
+            ctx->pipeline_queue_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
+            for (size_t i = 0; i < result->size(); ++i) {
+              if ((*result)[i] == 0) continue;
+              if (i < ctx->host_end_idx) {
+                ctx->host_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
+                ctx->host_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
+              } else {
+                ctx->disk_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
+                ctx->disk_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
+              }
+            }
+            if (req_ptr->predicate && req_ptr->predicate()) { req_ptr->satisfied.store(true); }
+          }
+        } catch (const std::exception& e) {
+          SIRIUS_LOG_ERROR("[downgrade] convert failed from task queue: {}", e.what());
+        }
+        // Wrapper destroyed (task re-pushed or gate-dropped) BEFORE the token drops — a
+        // request's completion must imply its wrappers are gone (plan-lifetime fence).
+        cand.reset();
+        ctx->release();
+      });
   }
 }
 

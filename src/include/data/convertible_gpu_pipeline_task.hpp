@@ -281,8 +281,31 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
   std::unique_ptr<convertible_data> get_next_convertible(cucascade::memory::memory_space* space,
                                                          bool front_to_back) override
   {
+    return get_next_convertible(space, front_to_back, std::nullopt);
+  }
+
+  /**
+   * @brief Like the two-argument overload, but skipping @p exclude_query's tasks.
+   *
+   * F8 victim preference: a downgrade request works FOR a query, and extracting that query's
+   * own queued tasks to satisfy it is self-defeating — the executor first sweeps with the
+   * requester excluded, then (only if still unsatisfied) without the exclusion, taking
+   * own-query victims as the last resort.
+   *
+   * @param space           The memory space to filter by.
+   * @param front_to_back   Iteration direction.
+   * @param exclude_query   Tasks of this query are not extracted (nullopt disables).
+   * @return A convertible_gpu_pipeline_task wrapping the matching task, or nullptr.
+   */
+  std::unique_ptr<convertible_data> get_next_convertible(
+    cucascade::memory::memory_space* space,
+    bool front_to_back,
+    std::optional<sirius::query_id_t> exclude_query)
+  {
     auto task = _queue.mutable_pop_if(
-      [space, this](sirius::parallel::itask& t) { return extraction_allowed(t, space); },
+      [space, &exclude_query, this](sirius::parallel::itask& t) {
+        return extraction_allowed(t, space, exclude_query);
+      },
       front_to_back);
     if (!task) { return nullptr; }
     // Resolve the keys NOW, while the task's plan is guaranteed alive (a task in the queue
@@ -317,7 +340,9 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
     std::vector<std::unique_ptr<convertible_data>> results;
     while (true) {
       auto task = _queue.mutable_pop_if(
-        [space, this](sirius::parallel::itask& t) { return extraction_allowed(t, space); },
+        [space, this](sirius::parallel::itask& t) {
+          return extraction_allowed(t, space, std::nullopt);
+        },
         front_to_back);
       if (!task) { break; }
       // Keys resolved at extraction time; see get_next_convertible.
@@ -330,23 +355,27 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
 
  private:
   /**
-   * @brief Full extraction predicate: matching batches AND an accepting query.
+   * @brief Full extraction predicate: matching batches, not the excluded query, AND an
+   *        accepting query.
    *
    * The lifecycle check is what lets a query's cleanup destroy its plan without waiting for
-   * downgrade quiescence beyond the single in-flight request: once the query is quiescing, no
-   * LATER downgrade request can extract its tasks, so after
+   * downgrade quiescence beyond the requests in flight at that point: once the query is
+   * quiescing, no LATER downgrade request can extract its tasks, so after
    * downgrade_executor::wait_inflight_request() plus one queue sweep the plan is unreachable
    * from this path. The key derivation walks the task's plan, which is safe here: pred runs
    * under the queue lock, a queued task's query has not passed the sweeps that would remove
    * it, and every query destroys its plan only after those sweeps.
    */
   bool extraction_allowed(sirius::parallel::itask& task,
-                          cucascade::memory::memory_space* space) const
+                          cucascade::memory::memory_space* space,
+                          const std::optional<sirius::query_id_t>& exclude_query) const
   {
     if (!has_matching_batches(task, space)) { return false; }
-    if (_query_lifecycle == nullptr) { return true; }
-    const auto keys = sirius::pipeline::index_keys_for(task);
-    return _query_lifecycle->accepts_work(sirius::make_query_id(keys.query_id));
+    if (!exclude_query.has_value() && _query_lifecycle == nullptr) { return true; }
+    const auto keys     = sirius::pipeline::index_keys_for(task);
+    const auto query_id = sirius::make_query_id(keys.query_id);
+    if (exclude_query.has_value() && query_id == *exclude_query) { return false; }
+    return _query_lifecycle == nullptr || _query_lifecycle->accepts_work(query_id);
   }
 
   /**

@@ -760,6 +760,83 @@ TEST_CASE("per_query_drain_cancels_only_that_querys_requests", "[downgrade_lifec
   executor.stop();
 }
 
+TEST_CASE("requests_process_concurrently_and_drains_wait_per_query", "[downgrade_lifecycle]")
+{
+  // F8: the processing loop no longer serializes whole requests — a request completes when
+  // its last dispatched conversion finishes, and the loop moves on. Recipe: request A's one
+  // worker converts the only candidate and parks in A's predicate (A stays IN FLIGHT with the
+  // loop free); request B, from another query, then finds nothing to convert and must
+  // COMPLETE while A is still in flight — impossible under the old one-request-at-a-time
+  // loop, which sat in wait_all on A. Per-query drains and the in-flight barrier must wait
+  // for exactly the right requests.
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+
+  auto repo  = std::make_unique<cucascade::shared_data_repository>();
+  auto batch = make_gpu_batch(*gpu_space);
+  repo->add_data_batch(batch);
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  executor.start();
+
+  const auto query_a = sirius::make_query_id(101);
+  const auto query_b = sirius::make_query_id(202);
+
+  std::promise<void> release_blocker;
+  std::shared_future<void> gate(release_blocker.get_future());
+  std::atomic<bool> blocker_entered{false};
+  auto fut_a = executor.request_downgrade(query_a, [&blocker_entered, gate]() {
+    blocker_entered.store(true);
+    gate.wait();
+    return false;
+  });
+
+  auto deadline = std::chrono::steady_clock::now() + 10s;
+  while (!blocker_entered.load() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  REQUIRE(blocker_entered.load());
+
+  // B is processed WHILE A is in flight: the only candidate is already converted (A's worker
+  // did that before parking), so B finds nothing, dispatches nothing, and completes with 0.
+  auto fut_b = executor.request_downgrade(query_b, []() { return false; });
+  REQUIRE(fut_b.wait_for(10s) == std::future_status::ready);
+  size_t freed_b = 1;
+  REQUIRE_NOTHROW(freed_b = fut_b.get());
+  REQUIRE(freed_b == 0);
+  // ... and A is provably still in flight.
+  REQUIRE(fut_a.wait_for(0s) == std::future_status::timeout);
+
+  // Per-query drain of B: B has nothing queued or in flight, so this returns immediately
+  // even though A (another query) is mid-request.
+  executor.drain(query_b);
+
+  // The in-flight barrier covers A: it must not return while A is still in flight.
+  std::atomic<bool> barrier_returned{false};
+  std::thread barrier_thread([&executor, &barrier_returned]() {
+    executor.wait_inflight_request();
+    barrier_returned.store(true);
+  });
+  std::this_thread::sleep_for(100ms);
+  REQUIRE_FALSE(barrier_returned.load());
+
+  release_blocker.set_value();
+  barrier_thread.join();
+  REQUIRE(barrier_returned.load());
+
+  REQUIRE(fut_a.wait_for(10s) == std::future_status::ready);
+  size_t freed_a = 0;
+  REQUIRE_NOTHROW(freed_a = fut_a.get());
+  REQUIRE(freed_a > 0);
+
+  executor.stop();
+}
+
 TEST_CASE("monitor_rearms_after_drain_cancels_queued_monitor_request", "[downgrade_lifecycle]")
 {
   // D6 regression: a destroyed-but-never-processed monitor request used to leave
