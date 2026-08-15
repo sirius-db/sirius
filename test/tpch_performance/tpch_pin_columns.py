@@ -27,7 +27,7 @@ import sys
 # projection, group-by, aggregation). A missing column makes
 # create_provider_for throw and silently fall back to parquet_split_provider
 # (see sirius_scan_manager.cpp:138-178 — exception is caught and logged
-# as "not all the columns are pinned for this query").
+# by the absence of the scan manager's "scan served from pinned cache" INFO marker).
 QUERY_COLUMNS: dict[int, dict[str, list[str]]] = {
     1: {
         "lineitem": [

@@ -425,6 +425,9 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
       // parquet reader consumes AST-capable dynamic filters; a cache-served scan runs no
       // reader, so latch the serve-path fact before execution starts and the wrapper
       // promotes to post-decode AST application (main doc, "Pinned-cache-served scans").
+      // INFO on purpose: pinned-cell benchmark verification greps this exact line per query
+      // log, and the serve fires once per scan per query, so it cannot perturb timings.
+      SIRIUS_LOG_INFO("[sirius_scan_manager] scan served from pinned cache");
       op->mark_served_from_pinned_cache();
       cached_assignments.push_back(std::move(*assignment));
       _scan_op_order.push_back(op);

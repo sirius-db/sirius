@@ -1473,10 +1473,12 @@ def build_pilot_summary(
 
 
 def verify_pinned_cache_hits(cell_dir: str, queries: List[int]) -> Dict[str, str]:
-    """Pinned-cache-hit verification per cell: every per-query log must show
-    'using cached_split_provider' and never 'not all the columns are pinned' -- a silent
-    fall-through would contaminate the pinned cell with the from-disk path and voids the query.
+    """Pinned-cache-hit verification per cell: every per-query log must carry the scan
+    manager's INFO serve marker (emitted once per cache-served scan at the pin-hit commit,
+    beside the read_time_filter_bypass latch). Absence means the query read from disk and
+    the pinned cell is contaminated -- the run fails after artifacts are written.
     """
+    marker = "scan served from pinned cache"
     verdicts = {}
     for qnum in queries:
         log_path = os.path.join(cell_dir, f"q{qnum}", "sirius.log")
@@ -1485,12 +1487,7 @@ def verify_pinned_cache_hits(cell_dir: str, queries: List[int]) -> Dict[str, str
             continue
         with open(log_path, errors="replace") as f:
             text = f.read()
-        if "not all the columns are pinned" in text:
-            verdicts[f"q{qnum}"] = "fall-through"
-        elif "using cached_split_provider" in text:
-            verdicts[f"q{qnum}"] = "ok"
-        else:
-            verdicts[f"q{qnum}"] = "no-cache-hit"
+        verdicts[f"q{qnum}"] = "ok" if marker in text else "no-cache-hit"
     return verdicts
 
 

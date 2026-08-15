@@ -221,7 +221,7 @@ Output layout (under `--output` root, default `test/tpch_performance/output/`):
 ./test/tpch_performance/benchmark_and_validate.sh --pinning-mode pinned-hot --iterations 5 100
 ```
 
-To verify a query actually hit the cache, grep `runs/.../sirius/q<N>/sirius.log` for `using cached_split_provider`; the matching-fallback log line is `not all the columns are pinned for this query`.
+To verify a query actually hit the cache, grep `runs/.../sirius/q<N>/sirius.log` for the scan manager's INFO serve marker `scan served from pinned cache` (emitted once per cache-served scan at the pin-hit commit). Absence means the scan read from disk. (The older markers `using cached_split_provider` / `not all the columns are pinned` no longer exist in the code; `performance_test.py --mode ab` fails a pinned cell automatically when the marker is missing.)
 
 Tier override: the helper defaults to `tier='gpu'`. Both `gpu` and `host` are supported in `src/sirius_extension.cpp`; set `SIRIUS_PIN_TIER=host` to pin into NUMA-local pinned host memory instead. Any other tier throws `NotImplementedException` at bind time (`src/sirius_extension.cpp:811-813`).
 
