@@ -166,6 +166,13 @@ struct operator_params {
   /// metadata; other scans use native carriers. Logical types remain unchanged, and type-sensitive
   /// boundaries restore native carriers.
   bool enable_compressed_materialization = true;
+
+  /// Fuse near-duplicate probe-side scans of the same table into one fan-out twin-scan pipeline.
+  /// Off: the two scans decode and dynamic-filter the table independently. On: one shared decode
+  /// + membership probe feeds both consumers (one fewer pipeline), at the price of ~+1%-class
+  /// extra rows into the narrower consumer's authoritative join and one extra device gather for
+  /// the first output.
+  bool fuse_twin_scans = true;
 };
 
 struct telemetry_config {

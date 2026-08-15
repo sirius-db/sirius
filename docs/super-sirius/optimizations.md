@@ -66,6 +66,20 @@ num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 
 **Config:** `fuse_merge_pipelines` (default: true). See [physical-plan-generation.md](physical-plan-generation.md) → Merge fusion for pipeline-shape details.
 
+### Twin-Scan Fusion (PR #NNN)
+
+**Motivation:** DuckDB's delim decomposition of chained `EXISTS` / `NOT EXISTS` (TPC-H q21) leaves two near-duplicate full scans of the same table: nested column sets, one residual predicate, and dynamic membership filters (Blooms) over provably nested key sets. At SF1000 each scan decodes ~6.0B rows and probes a ~70M-key Bloom — near-identical work done twice.
+
+**Mechanism:** A planner pass (`fuse_twin_scans`) runs before `insert_gpu_pipeline_operators`, decomposed into match → prove → rewrite. *Match* checks the pair is mechanically well-formed: same table, the bare scan's columns / output layout / types / physical carriers a strict prefix of the filtered scan's (so no filter-index remapping is ever needed), identical static pushed filters. *Prove* checks that dropping the filtered scan's dynamic-filter channel is safe: B's delim join must directly consume A's delim join and A's join-back must be `RIGHT_SEMI`/`RIGHT_ANTI` — the only join types emitting a row-subset of A's delim input with schema preserved — so with identical distinct group references the delim key sets nest as tuple sets, and both producer joins keying on the same single delim column projects that containment onto the published membership filters. *Rewrite* fuses the pair into one `GPU_SCAN → DYNAMIC_FILTER → TWIN_SCAN_SPLIT` pipeline whose fan-out sink feeds both original consumers; a routing-only `TWIN_SCAN_REF` anchors the second consumer (DELIM_SCAN pattern). Every refused same-table pair is recorded with a typed `twin_scan_rejection_reason` in the generator's `twin_scan_report()`.
+
+**Code path:**
+- `src/planner/sirius_plan_twin_scan_fusion.cpp` (+ header) — the pass: collect / match / prove / rewrite, rejection taxonomy
+- `src/op/sirius_physical_twin_scan_split.cpp` — `TWIN_SCAN_SPLIT` / `TWIN_SCAN_REF` operators
+- `src/pipeline/sirius_pipeline_converter.cpp` — the two-consumer repository wiring
+- `src/planner/sirius_physical_plan_generator.cpp` — invokes the pass under the setting; stores the report
+
+**Config:** `fuse_twin_scans` (default: true; `SET` + `sirius.operator_params.fuse_twin_scans` in YAML). Measured on TPC-H SF1000 (kit regime): q21 802 → ~741-748 ms; the priced costs are ~+1% extra rows into the narrower consumer's authoritative join and one extra 2-column device gather for the first output. See [physical-plan-generation.md](physical-plan-generation.md) → Twin-scan fusion.
+
 ## Operator-Level Optimizations
 
 ### Adaptive Join BUILD_PROBE Mode (PR #423)

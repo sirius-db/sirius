@@ -349,6 +349,13 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// so the one-shot publisher sees the whole key set.
   [[nodiscard]] bool publishes_dynamic_filters() const;
 
+  /// The immutable dynamic-filter publish plan (empty when this join publishes nothing).
+  /// Read by the twin-scan fusion pass to identify the producer join of a scan's channel.
+  [[nodiscard]] const dynamic_filter_publish_plan& dynamic_filter_plan() const noexcept
+  {
+    return _dynamic_filter_plan;
+  }
+
   /// The per-GPU hash-table byte budget (also the upstream PARTITION's bound on folding a build
   /// whole for dynamic-filter publication).
   [[nodiscard]] uint64_t max_build_hash_table_bytes() const noexcept

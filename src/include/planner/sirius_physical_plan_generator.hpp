@@ -21,6 +21,7 @@
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "planner/sirius_plan_twin_scan_fusion.hpp"
 
 #include <memory>
 #include <string>
@@ -112,6 +113,15 @@ class sirius_physical_plan_generator {
   /// is null. Same pointer in repeated calls returns the same channel.
   [[nodiscard]] std::shared_ptr<sirius::op::sirius_dynamic_filter_set>
   get_or_create_dynamic_filter_channel(duckdb::DynamicTableFilterSet const* key);
+
+  /// @brief What the twin-scan fusion pass did to the last `create_plan` result: fused pair
+  /// count plus every rejected same-table candidate pair with its typed reason. Diagnostic
+  /// state in the same spirit as `dynamic_filter_channels`; the default report when the
+  /// `fuse_twin_scans` setting is off.
+  [[nodiscard]] const twin_scan_fusion_report& twin_scan_report() const noexcept
+  {
+    return _twin_scan_report;
+  }
 
   //! Creates a plan from the logical operator. This involves resolving column bindings and
   //! generating physical operator nodes.
@@ -247,6 +257,9 @@ class sirius_physical_plan_generator {
  private:
   static void mark_fusable_merge_pipelines(sirius::op::sirius_physical_operator& op,
                                            bool fusion_enabled);
+
+  //! Backing state for `twin_scan_report()`, written by `create_plan`.
+  twin_scan_fusion_report _twin_scan_report;
 
  public:
   //! Walk the plan tree and insert the GPU pipeline operators (PARTITION, CONCAT, sort chain,

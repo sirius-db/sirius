@@ -61,6 +61,7 @@
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
+#include "planner/sirius_plan_twin_scan_fusion.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 
@@ -1053,6 +1054,20 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
     }
   }
   plan->verify();
+
+  // Fuse near-duplicate same-table scans into one fan-out twin-scan pipeline. Must run while
+  // the scans are still TABLE_SCAN nodes (before the GPU pipeline operator rewrite below).
+  // Policy lives here: the pass itself reads no settings.
+  {
+    duckdb::Value setting;
+    // The fallback is only reachable when the option is unregistered (e.g. SIRIUS_DISABLE);
+    // it matches the registered default, `operator_params.fuse_twin_scans`.
+    bool twin_fusion_enabled = true;
+    if (context.TryGetCurrentSetting("fuse_twin_scans", setting) && !setting.IsNull()) {
+      twin_fusion_enabled = setting.GetValue<bool>();
+    }
+    _twin_scan_report = twin_fusion_enabled ? fuse_twin_scans(plan) : twin_scan_fusion_report{};
+  }
 
   // Rewrite the plan tree to contain the GPU pipeline operators so the converter becomes a
   // pure topology pass over `build_pipelines` virtuals; `set_parent_ops` then derives every

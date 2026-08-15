@@ -351,6 +351,27 @@ Eligibility is decided at plan time by `mark_fusable_merge_pipelines` (`sirius_p
 
 Total-input structural sinks such as `ORDER_BY`, `TOP_N`, and an outer `GROUP BY` **are** fusable: they already buffer their full input, so folding the merge in does not change when they observe complete data.
 
+### Twin-scan fusion
+
+By default (`fuse_twin_scans = true`) `create_plan` runs `sirius::planner::fuse_twin_scans` (`sirius_plan_twin_scan_fusion.cpp`) after `plan->verify()` and **before** `insert_gpu_pipeline_operators` — the candidate scans must still be `TABLE_SCAN` nodes carrying their `sirius_dynamic_filters` channels, and no pass runs between fusion and pipeline-operator insertion (the split holds a non-owning pointer to its `TWIN_SCAN_REF`, so the pair must reach the converter intact). When a bare probe-side scan and a residual-filtered probe-side scan of the same table pass the pass's match and subsumption checks, the pair is fused into one scan pipeline:
+
+```mermaid
+graph LR
+    F["Fused pipeline<br/>[GPU_SCAN(union columns), DYNAMIC_FILTER(shared channel), TWIN_SCAN_SPLIT]"] -->|"PARTIAL"| A["out-A consumer<br/>[PARTITION ...]"]
+    F -->|"PARTIAL"| B["out-B consumer<br/>[PARTITION ...]"]
+```
+
+The second consumer's tree slot holds the routing-only `TWIN_SCAN_REF`, which (like `DELIM_SCAN`) never lands in any pipeline's `operators[]` and appends nothing in `build_pipelines`; the converter's `compute_repository_wiring` emits the split's two PARTIAL-barrier edges by resolving the split's tree parent (out-A) and the ref's tree parent (out-B). The second consumer's feeder chain (PARTITION/CONCAT wraps, column bindings) is therefore planned completely unchanged.
+
+Two-consumer scheduling is settled, for these reasons:
+
+1. **Acyclicity.** The fused pipeline depends only on A's channel producers — exactly what A's scan depended on at baseline. Both consumers depend on the fused pipeline through buffered repository edges; their other dependencies (delim build partitions) are unchanged from baseline. Fusion strictly removes one dependency (B's scan on B's channel producer) and adds none, so the baseline-acyclic graph stays acyclic.
+2. **Bounded buffering.** The B-side probe PARTITION is a non-driver sibling that waits for its delim build partition to size it; out-B batches buffer in its repository meanwhile. Those batches existed at baseline too (B's own scan produced them) — they are merely held longer (~3.9 GB at SF1000, measured under the suite's pool peak; suite-wide peak delta +1.0 MB). No input-scaled new allocation.
+3. **PARTIAL barriers** on both edges are the engine's standard multi-consumer repository semantics; the split's `sink()` fails loudly on any edge-count mismatch, so wiring drift cannot silently mis-route.
+4. Empirically: GPU runs deadlock-free with one fewer pipeline than baseline; B's consumer starting earlier than baseline exercised no ordering assumption on the NOT-EXISTS side.
+
+See [optimizations.md](optimizations.md) → Twin-Scan Fusion for the match/prove conditions and the measured win, and [operators.md](operators.md) for the two operator contracts.
+
 ### DELIM_JOIN
 
 Decorrelated correlated-subquery join. Both variants hold two internal operators:
