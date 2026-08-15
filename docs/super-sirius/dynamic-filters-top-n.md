@@ -1581,3 +1581,51 @@ These affect eligibility and performance policy, not the replacement protocol.
 
 DuckDB `DynamicFilterData` may remain for CPU fallback compatibility, but is not the GPU transport
 or synchronization primitive.
+
+## Measured results — TPC-H SF1000 acceptance (2026-08-15)
+
+The acceptance bar was **zero regression flag-on vs flag-off across all 22 TPC-H queries at
+SF1000**, judged per query as the paired-geomean CI upper bound under the threshold (+2% for the
+LIMIT queries, +3% otherwise), measured by `performance_test.py --mode ab` (interleaved pairs,
+alternating lead arm, per-pair GPU-occupancy bracketing, arming assertions from
+`sirius_dynamic_filter_stats()` counter deltas, cross-arm byte-identity every pair). Host:
+single GB300, one GPU; unclustered tpchgen-rs parquet.
+
+**The bar is met in both configurations.**
+
+| Cell | Verdict | Suite geomean (on/off) |
+|---|---|---|
+| HOST-pinned | 22/22 pass (one q1 boundary graze confirmed as noise by a 31-pair rerun: 0.9941 [0.977, 1.012]) | 1.0003 [0.9977, 1.0030] |
+| From-disk, hot cache | 22/22 pass, no flags | 0.9996 [0.9979, 1.0013] |
+| Cold spot-check (Q1/Q2/Q6/Q18/Q21, `drop_caches` per pair, ±5%) | clean — no cold-path-only regression | — |
+
+Per-query detail lives in the benchmark artifacts (`cell_report.json` per cell); every cell ran
+with pin verification (the scan manager's serve marker), arming enforcement, and cross-arm
+byte-identity, and none aborted.
+
+**Hoped-for gains, honestly reported.** Q18 (the group-key producer's shape) showed 0.9897
+[0.982, 0.998] in a 10-pair pilot, but 0.9991 [0.993, 1.005] at 21 pairs and 1.0037 [0.9996,
+1.008] at 60 pairs: any end-to-end effect is within ±0.5% and below between-run host drift. The
+counters explain why mechanically: the witness machinery works (witness set full on every
+execution), but at SF1000 the producer has **no publishable targets** (every scan sits below the
+joins under the aggregate, and the siting rule correctly skipped all eight no-work sites) and the
+**aggregate-input prefilter never processes a row** — at ~5 GB scan batches, each task's
+prefilter calls precede the boundary's formation, so there is nothing to prune by the time a
+boundary exists. Q2 is flat in both cells (CIs straddle 1.0), consistent with its tiny pre-LIMIT
+cardinality. Q3/Q10 never arm at all: their first ORDER BY key (`revenue`, a DECIMAL(38,4)
+aggregate output) exceeds the precision-18 admission cap, so both producers reject at plan time
+and those queries run effectively flag-off. Q21 (the one armed self-consumption-only query) is
+flat: 1.0034 [0.9995, 1.0073] pinned, 0.9994 [0.9958, 1.0029] from disk.
+
+The unclustered dataset is the pruning-hostile case by construction: row-group statistics span
+the full key ranges, so the reader gate correctly observes zero pruning and the measured result
+is the mechanism's overhead floor, not its upside. The clustered dataset (the
+`--cluster-keys "orders:o_totalprice,supplier:s_acctbal"` stretch cell) remains the
+demonstrable-upside configuration and was not run for the bar.
+
+**Scope limits of this measurement.** Single host, single GPU (the multi-GPU path remains
+verification-blocked); between-run drift bounds any cross-run claim at roughly ±1%, which is why
+the verdict rule uses within-run paired intervals only; the flag-off-vs-DuckDB-CPU validation
+pass was deferred (cross-arm byte-identity guards the feature itself); the Quent off/on
+attribution extract has known defects against the live analyzer API (engine-list explosion,
+endpoint shape) and the attribution question was answered from counters instead.
