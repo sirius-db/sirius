@@ -35,6 +35,9 @@ This file records where each register group stands NOW, with bring-up evidence.
 | E2 | `duckdb::Config` scalars → `std::atomic` (source-compatible); `LOG_*` strings → copy-on-read `ConfigString` (shared_ptr swap under mutex). The expression strategy rides the E1 snapshot: operators and scan ingestibles capture it at construction (window thread) and pass it to every evaluator at execute time, so one plan uses one strategy. |
 | E4 | `PhysicalSiriusExecution` is immutable across executions: `logical_plan_` lost `mutable` and is never `reset()` (a monotonic atomic `plan_copy_unsupported_` latches the non-copyable case); the shared CPU-fallback stash gets `FORCE_MATERIALIZED`/`IN_MEMORY` fixed at `OnFinalizePrepare` instead of being written per-execution. DIAGNOSIS CORRECTION: the documented "streaming EXECUTEs silently skip Sirius" signature was misattributed — instrumented runs show streaming engages on EVERY iteration (the GPU run completes inside `Execute()`'s single ClientContext lock hold), while SQL-level `PREPARE`/`EXECUTE` never engages at all: a pre-existing single-threaded transparency gap (`PREPARE` is not a SELECT; `Binder::Bind(ExecuteStatement)` re-plans via `Planner::PrepareSQLStatement`, which has no finalize hook), not a race. The prepared-statement scenario dropped `[!mayfail]` and asserts per-phase engagement equalities, including phase C == 0 so a future PREPARE/EXECUTE interception flips it consciously. |
 | E7 | `gpu_execution`'s ClientConfig save/restore moved off the shared bind data onto the executing stack (RAII in `ExtractPlan`); concurrent executions of one prepared statement can no longer clobber each other's saved copy. New `[config_race]` scenario asserts the connection's `enable_optimizer` survives concurrent executions. |
+| E3 | `compression_config` joined the E1 snapshot: `query_config_snapshot` carries it, the pin (which runs inside a `StandaloneQueryScope` window) reads `SiriusContext::query_compression_config()` — a coherent copy frozen at admission, so the `input_plan_dir` string it hands to `fs::directory_iterator` can no longer be torn/freed by a concurrent SET — and the four `pin_table_compression*` setters route through `update_compression_config` under `operator_params_mutex_`, mirroring their operator_params neighbours. SET-storm rotation extended with the compression knobs (RESET guard included); dedicated pin-churn-vs-SET-storm scenario in `test_concurrent_config_races.cpp`. |
+| E5 | `plan_register` keys are the pin's RESOLVED cache identity — `cache_entry_info::compression_plan_key()`: duckdb `catalog.schema.table` or the canonicalized parquet file set, i.e. the same identity the pinned-entry serving matchers use — never the bare user-supplied pin name, so same-named tables in different ATTACHed databases keep separate plan entries (the plan FILE is still looked up by the pin name; that is the on-disk `<name>.<ext>` contract). The resolve-miss-load-set-resolve check-then-act collapsed into one atomic `get_or_load_table_plan(key, loader)` (loader runs under the registry's exclusive lock; a nullopt/empty result stores nothing, preserving the rescan-next-pin semantics). Two-ATTACHed-DBs scenario asserts each database's pin registers ITS OWN plan; threaded loads-exactly-once unit test in `test_compression.cpp`. |
+| E6 | `get_target_ctas()` (CUDA host-side, `common.cuh`): the `{device, value}` pair of mutable function-local static variables with a non-atomic check-then-use — tearable across two GPUs — replaced by a per-device array of `std::atomic<uint32_t>` slots (0 = unfilled; device ids beyond the 64-slot bound recompute uncached). A read is one word; concurrent first-computes store the same deterministic value. Threaded unit test `test_decode_target_ctas.cpp` asserts every call returns the CALLING device's value, alternating devices when ≥ 2 GPUs are visible (the tear is only OBSERVABLE on heterogeneous devices, documented in the test). |
 
 ## MUST FIX — live now, with bring-up evidence
 
@@ -52,14 +55,15 @@ Ranked; the first cluster currently hangs a test.
    requests never extract a quiescing query's tasks. William's steps 6+7
    (shared-ownership repositories) remain the structural end-state.
 2. ~~**B5 — plan destroyed before the drains.**~~ FIXED, see above.
-3. ~~**E1/E2/E4/E7 — shared mutable config.**~~ FIXED, see above. Remaining
-   E-batch: E3 (compression-config setters, unguarded), E5 (plan_register
-   check-then-act keyed by bare table name), E6 (`get_target_ctas()` mutable
-   function-local static). Also surfaced: SQL-level `PREPARE`/`EXECUTE` never
-   runs transparently (single-threaded gap, documented in
-   `test_transparent_runtime_fallback.cpp` and now asserted in the prepared
-   scenario), and `gpu_execution`'s `enable_optimizer` named parameter is
-   parsed but ignored (`GPUExecutionBind` hard-codes `true`).
+3. ~~**E1/E2/E4/E7 — shared mutable config.**~~ FIXED, see above. The
+   remaining E-batch — E3 (compression-config setters, unguarded), E5
+   (plan_register check-then-act keyed by bare table name), E6
+   (`get_target_ctas()` mutable function-local static) — is now ALSO FIXED,
+   see the table above; Group E is closed. Also surfaced: SQL-level
+   `PREPARE`/`EXECUTE` never runs transparently (single-threaded gap,
+   documented in `test_transparent_runtime_fallback.cpp` and now asserted in
+   the prepared scenario), and `gpu_execution`'s `enable_optimizer` named
+   parameter is parsed but ignored (`GPUExecutionBind` hard-codes `true`).
 4. ~~**D5 — `runtime_unavailable_` process-wide latch.**~~ FIXED.
    `classify_query_failure()` at every former latch site: default verdict is
    per-query (query errors, state dropped best-effort, healthy queries and new
@@ -81,7 +85,6 @@ Ranked; the first cluster currently hangs a test.
 - **F3–F9** — fairness/throughput; matter after correctness burn-in. F5
   (spurious PIN rejection from the all-entries snapshot) will surface in the
   pin-churn test and may get promoted.
-- **E3/E5/E6** — narrower config races; fix with the E batch.
 - **H group** — hygiene; H8 (query-id wrap at 2^31/2^32) deserves a guard
   before long-running deployments.
 
