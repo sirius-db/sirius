@@ -112,14 +112,14 @@ TEST_CASE("adversarial: one prepared statement EXECUTEd concurrently and repeate
   // EXECUTEs silently skip Sirius") was misattributed: instrumenting every
   // decline path shows streaming EXECUTEs engage on every iteration (the GPU
   // run completes inside Execute()'s single ClientContext lock hold, before
-  // any sibling can invalidate the stream), while SQL-level EXECUTE never
-  // engages — PREPARE/EXECUTE bypasses OnFinalizePrepare entirely (the PREPARE
-  // statement itself is not a SELECT, and Binder::Bind(ExecuteStatement)
-  // re-plans via Planner::PrepareSQLStatement, which has no finalize hook).
-  // That is a pre-existing, single-threaded transparency limitation, not a
-  // race — see the note in test_transparent_runtime_fallback.cpp. Phase C
-  // therefore asserts correctness under contention plus ZERO transparent
-  // engagement, so a future PREPARE/EXECUTE interception flips it consciously.
+  // any sibling can invalidate the stream). SQL-level EXECUTE historically
+  // never engaged (the PREPARE statement itself is not a SELECT, and the
+  // EXECUTE finalize pass was declined as a non-SELECT); since
+  // SiriusContext::try_intercept_execute_statement, the finalize hook — which
+  // DOES fire for the EXECUTE statement — re-plans the stored parameterless
+  // SELECT and installs the transparent operator per EXECUTE. Phase C
+  // therefore asserts correctness under contention plus FULL transparent
+  // engagement, same as phases A and B.
   scoped_watchdog dog("prepared double-EXECUTE", scenario_timeout(600));
 
   adversarial_env env;
@@ -304,13 +304,12 @@ TEST_CASE("adversarial: one prepared statement EXECUTEd concurrently and repeate
                      << " plan_time_fallbacks=" << (stats.fallbacks - stats_after_phase0.fallbacks)
                      << " successful_rebinds="
                      << (stats.successful_rebinds - stats_after_phase0.successful_rebinds));
-  // SQL-level PREPARE/EXECUTE is NOT intercepted by Sirius (pre-existing
-  // single-threaded limitation, see the test header): phase C's value here is
-  // correctness under contention (checked per-iteration above). Assert the
-  // zero engagement so a future PREPARE/EXECUTE interception — or a regression
-  // that starts double-counting — flips this consciously.
-  (void)phase_c_execs;
-  REQUIRE(stats.executions - stats_after_phase_b.executions == 0);
+  // SQL-level PREPARE/EXECUTE is intercepted per EXECUTE via
+  // try_intercept_execute_statement (the finalize hook fires for the EXECUTE
+  // statement; the stored parameterless SELECT is re-planned fresh). Equality
+  // keeps this a live tripwire in both directions: a silent CPU degrade AND a
+  // double-execution both trip it.
+  REQUIRE(stats.executions - stats_after_phase_b.executions == phase_c_execs);
   // No mid-flight plan was corrupted into the runtime-fallback path anywhere.
   REQUIRE(stats.runtime_fallbacks - stats_after_phase0.runtime_fallbacks == 0);
   REQUIRE(stats.fallbacks - stats_after_phase0.fallbacks == 0);

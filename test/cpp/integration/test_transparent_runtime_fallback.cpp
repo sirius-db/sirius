@@ -418,11 +418,73 @@ TEST_CASE_METHOD(RuntimeFallbackFixture,
   sirius::test::require_transparent_execution_delta(before, after, 0, 1, 0, 0);
 }
 
-// Note: SQL-level `PREPARE ... AS SELECT` / `EXECUTE` is not intercepted by Sirius
-// (transparent interception gates on statement_type == SELECT_STATEMENT, and those
-// carry PREPARE/EXECUTE statement types), so it runs on DuckDB CPU and the runtime
-// fallback path does not apply. Extending interception to prepared statements is a
-// separate concern, out of scope for runtime fallback.
+// SQL-level `PREPARE ... AS SELECT` / `EXECUTE` is intercepted per EXECUTE:
+// the finalize hook fires for the EXECUTE statement, and
+// SiriusContext::try_intercept_execute_statement re-plans the stored
+// parameterless SELECT and installs the transparent operator — so the runtime
+// fallback path applies to EXECUTE exactly like to a direct SELECT.
+// Parameterized prepared statements (EXECUTE-time values) remain on DuckDB's
+// CPU path: re-planning the unbound statement cannot bind those values.
+TEST_CASE_METHOD(RuntimeFallbackFixture,
+                 "runtime fallback: SQL PREPARE/EXECUTE engages the GPU and falls back",
+                 "[transparent][fallback][integration][prepared]")
+{
+  create_table("CREATE TABLE rf_exec AS SELECT range AS id, range % 5 AS grp FROM range(100);");
+
+  auto prep = con->Query(
+    "PREPARE rf_exec_stmt AS "
+    "SELECT grp, count(*) AS c FROM rf_exec GROUP BY grp ORDER BY grp;");
+  REQUIRE_FALSE(prep->HasError());
+
+  // The PREPARE itself never engages; each EXECUTE re-plans the stored SELECT
+  // and runs it through the transparent operator (rebind + execution per
+  // EXECUTE, eligibility re-decided against current stats every time).
+  for (int i = 0; i < 2; ++i) {
+    auto before = sirius::test::get_transparent_execution_stats(*con);
+    auto r      = con->Query("EXECUTE rf_exec_stmt;");
+    REQUIRE(r);
+    REQUIRE_FALSE(r->HasError());
+    REQUIRE(r->RowCount() == 5);
+    REQUIRE(r->GetValue(1, 0).ToString() == "20");
+    auto after = sirius::test::get_transparent_execution_stats(*con);
+    sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
+  }
+
+  // A runtime GPU failure inside an EXECUTE completes via the stashed CPU plan
+  // (the PhysicalExecute wrapper), same as a direct SELECT: the execution is
+  // counted (recorded before the attempt) plus one runtime fallback.
+  {
+    inject();
+    auto before = sirius::test::get_transparent_execution_stats(*con);
+    auto r      = con->Query("EXECUTE rf_exec_stmt;");
+    REQUIRE(r);
+    REQUIRE_FALSE(r->HasError());
+    REQUIRE(r->RowCount() == 5);
+    REQUIRE(r->GetValue(1, 0).ToString() == "20");
+    auto after = sirius::test::get_transparent_execution_stats(*con);
+    sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1, 1);
+    clear_injection();
+  }
+
+  // Parameterized prepared statements are NOT intercepted (documented
+  // limitation): correct results on DuckDB CPU, zero transparent engagement.
+  {
+    auto prep_param = con->Query(
+      "PREPARE rf_exec_param AS "
+      "SELECT count(*) AS c FROM rf_exec WHERE grp = ?;");
+    REQUIRE_FALSE(prep_param->HasError());
+    auto before = sirius::test::get_transparent_execution_stats(*con);
+    auto r      = con->Query("EXECUTE rf_exec_param(3);");
+    REQUIRE(r);
+    REQUIRE_FALSE(r->HasError());
+    REQUIRE(r->GetValue(0, 0).ToString() == "20");
+    auto after = sirius::test::get_transparent_execution_stats(*con);
+    REQUIRE(after.executions == before.executions);
+    con->Query("DEALLOCATE rf_exec_param;");
+  }
+
+  con->Query("DEALLOCATE rf_exec_stmt;");
+}
 
 // The enable_duckdb_fallback setting defaults to true and is overridable per session.
 TEST_CASE_METHOD(RuntimeFallbackFixture,

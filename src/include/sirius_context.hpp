@@ -707,6 +707,36 @@ class SiriusContext : public ClientContextState {
 
  private:
   void throw_if_not_initialized() const;
+
+  /// \brief Shared tail of OnFinalizePrepare: validate @p logical_plan for GPU
+  /// translation inside a plan window and, on success, replace @p prepared's
+  /// physical plan with a PhysicalSiriusExecution (stashing the CPU plan for
+  /// runtime fallback). Used by both the direct-SELECT path and the
+  /// EXECUTE-statement interception. @p query_sql is the re-plannable SELECT
+  /// text carried into the operator's SQL replan path — for an EXECUTE
+  /// interception this is the STORED statement's SQL, never the EXECUTE text
+  /// itself (planning "EXECUTE x" would yield a LogicalExecute the Sirius
+  /// planner cannot translate).
+  RebindQueryInfo install_transparent_execution(ClientContext& context,
+                                                PreparedStatementData& prepared,
+                                                unique_ptr<LogicalOperator> logical_plan,
+                                                const std::string& query_sql);
+
+  /// \brief Transparent interception of SQL-level `EXECUTE <name>`.
+  ///
+  /// DuckDB's finalize hook fires for the EXECUTE statement itself (its
+  /// physical plan is a PhysicalExecute wrapping the stored prepared
+  /// statement's CPU plan). Recover the stored prepared statement by name from
+  /// the connection's ClientData, re-plan its SELECT fresh (optimizer
+  /// included), and take the same install path as a direct SELECT — so every
+  /// EXECUTE re-decides GPU eligibility against current stats, exactly like
+  /// the C++ prepared-statement path after OnExecutePrepared's rebind.
+  /// Declines (CPU EXECUTE path retained) for: parameterized prepared
+  /// statements (re-planning the unbound statement cannot bind EXECUTE-time
+  /// values), non-SELECT inner statements, and any recovery failure.
+  RebindQueryInfo try_intercept_execute_statement(ClientContext& context,
+                                                  PreparedStatementData& prepared);
+
   /// Acquire the slot. Errors on same-thread reacquire — a nested acquire on
   /// one thread would otherwise be a silent permanent wait. After acquiring
   /// (and before returning) re-checks BOTH runtime health and the acquiring

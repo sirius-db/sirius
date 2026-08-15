@@ -21,8 +21,10 @@
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_data.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/execute_statement.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "log/duckdb_sink.hpp"
@@ -1676,9 +1678,17 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     return RebindQueryInfo::DO_NOT_REBIND;
   }
 
-  // Only intercept SELECT statements.
+  // Intercept SELECT statements directly; SQL-level `EXECUTE <name>` of a
+  // parameterless SELECT prepared statement is intercepted by re-planning the
+  // stored statement (see try_intercept_execute_statement). Everything else
+  // (including the PREPARE statement itself — interception happens per
+  // EXECUTE so eligibility is re-decided against current stats) stays on
+  // DuckDB's CPU path.
   if (prepared.statement_type != StatementType::SELECT_STATEMENT) {
     if (conn_state) { conn_state->clear_captured_plan(); }
+    if (prepared.statement_type == StatementType::EXECUTE_STATEMENT) {
+      return try_intercept_execute_statement(context, prepared);
+    }
     return RebindQueryInfo::DO_NOT_REBIND;
   }
 
@@ -1752,6 +1762,16 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     if (!logical_plan) { return RebindQueryInfo::DO_NOT_REBIND; }
   }
 
+  return install_transparent_execution(
+    context, prepared, std::move(logical_plan), current_query_sql);
+}
+
+RebindQueryInfo SiriusContext::install_transparent_execution(
+  ClientContext& context,
+  PreparedStatementData& prepared,
+  unique_ptr<LogicalOperator> logical_plan,
+  const std::string& query_sql)
+{
   // Detect an s3:// read from the plan now, while logical_plan is still intact
   // (create_plan below consumes it). S3 is GPU-only: if GPU translation fails we
   // must NOT fall back to CPU for s3:// (see throw_if_s3_no_cpu_fallback).
@@ -1816,7 +1836,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     auto new_physical_plan = make_uniq<PhysicalPlan>(Allocator::Get(context));
     auto& sirius_op =
       new_physical_plan->Make<sirius::transparent::PhysicalSiriusExecution>(std::move(logical_plan),
-                                                                            current_query_sql,
+                                                                            query_sql,
                                                                             prepared.types,
                                                                             prepared.names,
                                                                             std::move(cpu_fallback),
@@ -1842,7 +1862,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
                     sirius::sanitized_message(e));
     return RebindQueryInfo::DO_NOT_REBIND;
   } catch (NotImplementedException& e) {
-    throw_if_s3_no_cpu_fallback(plan_reads_s3, current_query_sql, sirius::sanitized_message(e));
+    throw_if_s3_no_cpu_fallback(plan_reads_s3, query_sql, sirius::sanitized_message(e));
     if (!duckdb_fallback_enabled(context)) {
       rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
     }
@@ -1850,7 +1870,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     SIRIUS_LOG_INFO("Transparent execution fallback (unsupported): {}",
                     sirius::sanitized_message(e));
   } catch (std::exception& e) {
-    throw_if_s3_no_cpu_fallback(plan_reads_s3, current_query_sql, sirius::sanitized_message(e));
+    throw_if_s3_no_cpu_fallback(plan_reads_s3, query_sql, sirius::sanitized_message(e));
     if (!duckdb_fallback_enabled(context)) {
       rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
     }
@@ -1859,6 +1879,106 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   }
 
   return RebindQueryInfo::DO_NOT_REBIND;
+}
+
+RebindQueryInfo SiriusContext::try_intercept_execute_statement(ClientContext& context,
+                                                               PreparedStatementData& prepared)
+{
+  // Nothing to replace without a full CPU plan (e.g. unbound parameters).
+  if (!prepared.physical_plan) { return RebindQueryInfo::DO_NOT_REBIND; }
+
+  // Recover the EXECUTE text. Outside a query lifecycle GetCurrentQuery()
+  // derefs a null active_query; guard exactly like the SELECT path does.
+  std::string execute_sql;
+  try {
+    execute_sql = context.GetCurrentQuery();
+  } catch (std::exception&) {
+    return RebindQueryInfo::DO_NOT_REBIND;
+  }
+  if (execute_sql.empty()) { return RebindQueryInfo::DO_NOT_REBIND; }
+
+  // Structural eligibility: exactly one EXECUTE statement with no
+  // EXECUTE-time values, naming a stored parameterless SELECT. Any mismatch
+  // is a silent decline (DuckDB's CPU EXECUTE path is kept), not a fallback:
+  // these queries were never GPU candidates on this path.
+  shared_ptr<PreparedStatementData> stored;
+  std::string inner_sql;
+  try {
+    Parser parser(context.GetParserOptions());
+    parser.ParseQuery(execute_sql);
+    if (parser.statements.size() != 1 ||
+        parser.statements[0]->type != StatementType::EXECUTE_STATEMENT) {
+      return RebindQueryInfo::DO_NOT_REBIND;
+    }
+    auto& execute_stmt = parser.statements[0]->Cast<ExecuteStatement>();
+    if (!execute_stmt.named_values.empty()) { return RebindQueryInfo::DO_NOT_REBIND; }
+    auto& client_data = ClientData::Get(context);
+    auto entry        = client_data.prepared_statements.find(execute_stmt.name);
+    if (entry == client_data.prepared_statements.end()) { return RebindQueryInfo::DO_NOT_REBIND; }
+    stored = entry->second;
+    if (!stored || !stored->unbound_statement ||
+        stored->unbound_statement->type != StatementType::SELECT_STATEMENT ||
+        stored->properties.parameter_count > 0) {
+      return RebindQueryInfo::DO_NOT_REBIND;
+    }
+    // The stored statement's own SQL, NOT the EXECUTE text: this string feeds
+    // the transparent operator's replan-from-SQL path, and planning
+    // "EXECUTE x" there would produce a LogicalExecute the Sirius planner
+    // cannot translate.
+    inner_sql = stored->unbound_statement->ToString();
+  } catch (InterruptException&) {
+    throw;
+  } catch (std::exception& e) {
+    SIRIUS_LOG_DEBUG("Transparent EXECUTE interception declined: {}", sirius::sanitized_message(e));
+    return RebindQueryInfo::DO_NOT_REBIND;
+  }
+
+  // Re-plan the stored SELECT fresh with the optimizer, mirroring the SELECT
+  // path's replan-from-SQL block (same guard, same fallback split). Planning
+  // from the unbound statement re-binds against the current catalog, exactly
+  // like DuckDB's own rebind of a stale prepared statement.
+  unique_ptr<LogicalOperator> logical_plan;
+  try {
+    InternalQueryGuard guard(context);  // suppress recursive optimizer hooks
+    Planner planner(context);
+    planner.CreatePlan(stored->unbound_statement->Copy());
+    Optimizer optimizer(*planner.binder, context);
+    logical_plan = optimizer.Optimize(std::move(planner.plan));
+  } catch (InterruptException&) {
+    // Cancellation is never a fallback candidate — propagate as-is.
+    throw;
+  } catch (SiriusRuntimeUnavailableException& e) {
+    if (sirius::references_sirius_owned_s3_parquet(inner_sql)) { throw; }
+    if (!duckdb_fallback_enabled(context)) { throw; }
+    record_transparent_fallback();
+    SIRIUS_LOG_INFO("Transparent EXECUTE fallback (runtime unavailable): {}",
+                    sirius::sanitized_message(e));
+    return RebindQueryInfo::DO_NOT_REBIND;
+  } catch (NotImplementedException& e) {
+    throw_if_s3_no_cpu_fallback(false, inner_sql, sirius::sanitized_message(e));
+    if (!duckdb_fallback_enabled(context)) {
+      rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
+    }
+    record_transparent_fallback();
+    SIRIUS_LOG_INFO("Transparent EXECUTE fallback (replan unsupported): {}",
+                    sirius::sanitized_message(e));
+    return RebindQueryInfo::DO_NOT_REBIND;
+  } catch (std::exception& e) {
+    throw_if_s3_no_cpu_fallback(false, inner_sql, sirius::sanitized_message(e));
+    if (!duckdb_fallback_enabled(context)) {
+      rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
+    }
+    record_transparent_fallback();
+    SIRIUS_LOG_INFO("Transparent EXECUTE fallback (replan failed): {}",
+                    sirius::sanitized_message(e));
+    return RebindQueryInfo::DO_NOT_REBIND;
+  }
+  if (!logical_plan) { return RebindQueryInfo::DO_NOT_REBIND; }
+
+  // Same install tail as a direct SELECT: validate GPU translation inside a
+  // plan window and swap the EXECUTE's physical plan (the PhysicalExecute
+  // wrapper is stashed as the runtime CPU fallback).
+  return install_transparent_execution(context, prepared, std::move(logical_plan), inner_sql);
 }
 
 RebindQueryInfo SiriusContext::OnExecutePrepared(ClientContext& context,
