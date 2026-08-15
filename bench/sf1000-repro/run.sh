@@ -34,6 +34,21 @@ for t in LINEITEM ORDERS PART CUSTOMER SUPPLIER NATION REGION PARTSUPP; do
   export "SIRIUS_PIN_TIER_$t=gpu"
 done
 
+# SANITIZER=memcheck|initcheck|racecheck|synccheck: run the workload under
+# compute-sanitizer (DIAGNOSTIC RUNS ONLY -- 10-40x kernel overhead; never quote
+# scores from a sanitized run). Reports land in $SANITIZER_LOG.
+LAUNCHER=()
+if [ -n "${SANITIZER:-}" ]; then
+  command -v compute-sanitizer >/dev/null || { echo "ERROR: compute-sanitizer not in PATH"; exit 1; }
+  SANITIZER_LOG="${SANITIZER_LOG:-$HERE/sanitizer_${SANITIZER}_$(date +%Y%m%d_%H%M%S).log}"
+  LAUNCHER=(compute-sanitizer --tool "$SANITIZER"
+            --target-processes all
+            --log-file "$SANITIZER_LOG"
+            --error-exitcode 99
+            --num-callers-host 12)
+  echo "sanitizer : $SANITIZER -> $SANITIZER_LOG"
+fi
+
 # The first run compiles JIT kernels (~19 s across the suite) into $HOME/.cudf/$VERSION/$ARCH.
 # That cache persists across processes, so run twice if you want warm numbers; steady-state
 # per-iteration timings are unaffected either way because we report best-of-3.
@@ -44,7 +59,7 @@ echo "config    : $CFG"
 echo
 
 cd "$REPO"
-python3 test/tpch_performance/performance_test.py \
+"${LAUNCHER[@]}" python3 test/tpch_performance/performance_test.py \
   --input "$DATA" \
   --mode grouped --iterations 3 --engine gpu --pin host \
   --queries 1-22 --config "$CFG" --name "$NAME"
