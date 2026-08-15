@@ -31,6 +31,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -145,21 +147,39 @@ struct prepared_dict_fsst {
 //! Mirror of DuckDB's AlignValue<idx_t> for 64-bit idx_t.
 constexpr uint32_t align_up8(uint32_t n) { return (n + 7u) & ~7u; }
 
+/// Upper bound on device ids served by the get_target_ctas per-device cache.
+/// Devices at or above this (never seen in practice) recompute uncached.
+constexpr int TARGET_CTAS_MAX_CACHED_DEVICES = 64;
+
 //! @brief Target CTA count for chunking segments: two full device waves at
 //! STRINGS_BLOCK_DIM threads. Cached per device.
+//!
+//! Concurrency (register E6): the former single {device, value} pair of
+//! mutable function-local static variables was a non-atomic check-then-use —
+//! two queries on different GPUs could tear the pair and read the other
+//! device's CTA count. Each device now owns one atomic slot, so a read is a
+//! single word and concurrent first-computes for the same device store the
+//! same value (the property query is deterministic per device).
 inline uint32_t get_target_ctas()
 {
   int device = 0;
   RMM_CUDA_TRY(cudaGetDevice(&device));
-  static int cached_device = -1;
-  static uint32_t cached   = 0;
-  if (cached_device == device) return cached;
-  cudaDeviceProp prop;
-  RMM_CUDA_TRY(cudaGetDeviceProperties(&prop, device));
-  int occupancy_blocks = prop.maxThreadsPerMultiProcessor / STRINGS_BLOCK_DIM;
-  cached_device        = device;
-  cached               = static_cast<uint32_t>(prop.multiProcessorCount * occupancy_blocks * 2);
-  return cached;
+  auto compute = [device] {
+    cudaDeviceProp prop;
+    RMM_CUDA_TRY(cudaGetDeviceProperties(&prop, device));
+    int const occupancy_blocks = prop.maxThreadsPerMultiProcessor / STRINGS_BLOCK_DIM;
+    return static_cast<uint32_t>(prop.multiProcessorCount * occupancy_blocks * 2);
+  };
+  // 0 = "not computed yet"; a real CTA count is always > 0. Static storage is
+  // zero-initialized, so every slot starts empty without dynamic init.
+  static std::array<std::atomic<uint32_t>, TARGET_CTAS_MAX_CACHED_DEVICES> cached_per_device;
+  if (device < 0 || device >= TARGET_CTAS_MAX_CACHED_DEVICES) { return compute(); }
+  uint32_t value = cached_per_device[static_cast<size_t>(device)].load(std::memory_order_relaxed);
+  if (value == 0) {
+    value = compute();
+    cached_per_device[static_cast<size_t>(device)].store(value, std::memory_order_relaxed);
+  }
+  return value;
 }
 
 //! @brief Expand segment descriptors into smaller chunks.
