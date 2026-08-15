@@ -2356,25 +2356,33 @@ std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_m
 {
   const auto& table_info = op->get_ingestible().table_info();
 
-  // Snapshot the pin table, then match outside the lock. Each snapshotted shared_ptr also
-  // pins the entry for the rest of this match, so a concurrent unpin cannot invalidate an
-  // entry mid-match — and the matching below (can_serve_with_columns, validate, zone-map plan
-  // building, the MVCC branch) is slow enough that holding _pinned_entries_mutex across it
-  // would serialize every concurrent query's prepare against every other's.
+  // Snapshot ONLY the entries that can serve this scan, then match outside the
+  // lock. Each snapshotted shared_ptr pins its entry for the rest of the match,
+  // so a concurrent unpin cannot invalidate it mid-match — and the heavy
+  // matching below (validate, zone-map plan building, the MVCC branch) is slow
+  // enough that holding _pinned_entries_mutex across it would serialize every
+  // concurrent query's prepare against every other's. The identity gate
+  // (can_serve_with_columns: format / file-set / table + column-superset
+  // compares) runs UNDER the lock precisely so no reference to a non-matching
+  // entry is ever taken: an all-entries snapshot made every in-flight match
+  // hold a use_count on EVERY pinned entry, so a concurrent PIN of a completely
+  // unrelated table spuriously failed its serving-refcount guard (register F5).
   std::vector<std::pair<std::string, std::shared_ptr<pinned_entry const>>> snapshot;
   {
     std::lock_guard pin_lk{_pinned_entries_mutex};
-    snapshot.reserve(_pinned_entries.size());
     for (auto const& [pinned_name, entry] : _pinned_entries) {
+      // Serviceability gate: empty when this cache cannot serve the scan
+      // (wrong format / file-set / table, or missing a requested column).
+      // Stable outside the lock too: the in-place mutators (the re-pin merge,
+      // attach_mvcc_metadata) run only at use_count()==1, which the reference
+      // taken here forbids for the snapshot's lifetime.
+      if (entry->cache_info.can_serve_with_columns(table_info).empty()) { continue; }
       snapshot.emplace_back(pinned_name, entry);
     }
   }
 
   for (auto const& [pinned_name, entry_ptr] : snapshot) {
     auto const& entry = *entry_ptr;
-    // Identity + serviceability gate: empty when this cache cannot serve the scan
-    // (wrong format / file-set / table, or missing a requested column).
-    if (entry.cache_info.can_serve_with_columns(table_info).empty()) { continue; }
     // Cache-or-CPU: for duckdb pins with MVCC metadata, the plan-time guards
     // promised this scan serves from the pin — the disk-native path is
     // MVCC-blind and increasingly stale under the pin's checkpoint
