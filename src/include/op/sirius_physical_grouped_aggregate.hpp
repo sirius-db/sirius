@@ -94,8 +94,9 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
    * @brief Top-N group-key producer seam, or null when this aggregate feeds no eligible Top-N
    *
    * Installed by `sirius::planner::sirius_physical_plan_generator` when a `LogicalTopN` above this
-   * aggregate orders only by grouping keys. @ref execute lets it prefilter and witness every input
-   * batch before the local aggregation, and @ref on_finalize_operator drains its coordinator. It
+   * aggregate orders only by grouping keys. @ref execute lets it witness and then prefilter every
+   * input batch before the local aggregation, and @ref on_finalize_operator drains its
+   * coordinator. It
    * changes no aggregate result: both operations are pure optimizations.
    */
   std::unique_ptr<top_n_group_key_producer> top_n_producer;

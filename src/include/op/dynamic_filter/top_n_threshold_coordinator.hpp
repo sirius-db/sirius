@@ -43,7 +43,9 @@ enum class threshold_offer_result {
   ACCEPTED_FOR_PUBLICATION,  ///< Tightest so far; this call owns the publisher loop (Stage 4)
   COALESCED,                 ///< Tightest so far; an active publisher will flush it (Stage 4)
   NOT_TIGHTER,           ///< Boundary does not lexicographically strengthen the tightest; ignored
-  NO_ACCEPTING_TARGET,   ///< Tightened `tightest_seen` only; no channel target exists/accepts
+  NO_ACCEPTING_TARGET,   ///< Tightened `tightest_seen` only -- or merely grew a GROUP_KEY witness
+                         ///< set still below K, which tightens nothing; no channel target
+                         ///< exists/accepts
   UNSUPPORTED_BOUNDARY,  ///< Null first component or otherwise unpublishable Kth-row tuple
   REJECTED_STATE         ///< Coordinator is FINISHING, FINISHED, or CANCELLED
 };
@@ -54,8 +56,11 @@ enum class threshold_offer_result {
  * Created only by the `sirius_physical_top_n::execute` seam after the stream-ordered
  * device-to-host copies of every key column of row `K - 1` have completed (see
  * `docs/super-sirius/dynamic-filters-top-n.md`, "Witness handoff"). The witness co-owns the
- * result batch so the K retained rows cannot be released while an asynchronous publication still
- * refers to them.
+ * result batch only for the duration of the offer call: `offer` consumes the host-resident
+ * boundary alone and drops the batch handle when it returns, so a coalesced candidate flushed
+ * later by another thread's publisher loop carries no batch reference. Host copies must
+ * therefore be complete before the offer; a future producer whose witness payload references
+ * device memory needs its own retention through publication.
  */
 struct top_n_threshold_witness {
   exact_host_key_tuple boundary;                     ///< Completed exact host Kth-row key tuple
@@ -68,9 +73,10 @@ struct top_n_threshold_witness {
  * Sorted best-first, deduplicated, at most K entries. Unlike @ref top_n_threshold_witness this
  * carries no batch handle and needs none: its producer completes every device-to-host copy before
  * constructing it, and those copies read the producer's own extraction table rather than the input
- * batch, so the witness holds completed host values and no device reference at all. The durability
- * rule that binds @ref top_n_threshold_witness is therefore moot here -- it still binds any future
- * producer whose witness does refer to device memory.
+ * batch, so the witness holds completed host values and no device reference at all. That is the
+ * property every producer must establish itself: the coordinator retains an offered witness only
+ * for the duration of the offer call, so a future producer whose witness payload references
+ * device memory needs its own retention through publication.
  */
 struct top_n_distinct_key_witness {
   std::vector<exact_host_key_tuple> best_keys;

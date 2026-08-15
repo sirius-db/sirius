@@ -45,6 +45,7 @@
 #include <filesystem>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -143,6 +144,32 @@ struct scoped_pin {
   std::string entry_name;
 };
 
+//! Owns the test's fixture directory: cleared and created on construction, removed on
+//! destruction, so a failing REQUIRE cannot leak the directory past the test (the
+//! scoped_fixture_dir precedent from test_gpu_execution_reader_pruning_gate.cpp).
+class scoped_fixture_dir {
+ public:
+  explicit scoped_fixture_dir(fs::path dir) : _dir(std::move(dir))
+  {
+    std::error_code ec;
+    fs::remove_all(_dir, ec);
+    fs::create_directories(_dir);
+  }
+  ~scoped_fixture_dir()
+  {
+    std::error_code ec;
+    fs::remove_all(_dir, ec);
+  }
+
+  scoped_fixture_dir(scoped_fixture_dir const&)            = delete;
+  scoped_fixture_dir& operator=(scoped_fixture_dir const&) = delete;
+
+  [[nodiscard]] fs::path const& path() const noexcept { return _dir; }
+
+ private:
+  fs::path _dir;
+};
+
 std::size_t pinned_entry_chunk_count(duckdb::Connection& con, std::string const& entry_name)
 {
   auto sirius_ctx    = sirius::test::get_registered_sirius_context(con);
@@ -209,10 +236,9 @@ TEST_CASE("gpu_execution - top-n dynamic filter on a pinned-cache-served scan",
   auto con = sirius::test::g_integration_env->make_connection();
   con.Query("SET gpu_execution = true;");
 
-  auto tmp = fs::temp_directory_path() / ("sirius-topn-pinned-serve-" + std::to_string(::getpid()));
-  std::error_code ec;
-  fs::remove_all(tmp, ec);
-  fs::create_directories(tmp);
+  scoped_fixture_dir fixture{fs::temp_directory_path() /
+                             ("sirius-topn-pinned-serve-" + std::to_string(::getpid()))};
+  auto const& tmp         = fixture.path();
   auto const parquet_path = (tmp / "pinned_facts.parquet").string();
   std::string const entry = "pinned_facts_" + std::to_string(::getpid());
 
@@ -361,6 +387,4 @@ TEST_CASE("gpu_execution - top-n dynamic filter on a pinned-cache-served scan",
       }
     }
   }
-
-  fs::remove_all(tmp, ec);
 }

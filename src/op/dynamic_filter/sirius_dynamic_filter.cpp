@@ -658,6 +658,17 @@ detail::boundary_filter_params sirius_dynamic_range_filter::make_boundary_filter
   bool inclusive,
   dynamic_filter_null_policy null_policy)
 {
+  // Validate before marshalling: every admitted type is fixed-width at 1/2/4/8 bytes, so the
+  // width below is always one the kernel's widened loads read. An unvetted type must throw here
+  // rather than marshal -- a non-fixed-width type would make cudf::size_of throw the wrong
+  // exception type, and DECIMAL128's width 16 would reach a kernel switch that returns 0 in
+  // release builds (the same gate detail::make_boundary_filter_params carries). Checking here
+  // also lets the constructor marshal in its member-init list while still honoring its documented
+  // std::invalid_argument contract.
+  if (!is_admitted_boundary_type(bound.storage_type())) {
+    throw std::invalid_argument(
+      "[sirius_dynamic_range_filter] boundary type is outside the admitted allowlist");
+  }
   // The kernel keeps rows that are strictly better in output order, so orienting the frame by the
   // bounded side makes "better" mean "on the kept side": LOWER keeps col > B / col >= B (better ==
   // larger, i.e. descending), UPPER keeps col < B / col <= B (better == smaller, ascending).
@@ -681,12 +692,10 @@ sirius_dynamic_range_filter::sirius_dynamic_range_filter(exact_host_scalar bound
     _side(side),
     _inclusive(inclusive),
     _null_policy(null_policy),
+    // The marshaller validates the allowlist before touching the type, so this init-list call is
+    // also the constructor's documented std::invalid_argument gate.
     _compaction_params(make_boundary_filter_params(bound, side, inclusive, null_policy))
 {
-  if (!is_admitted_boundary_type(_bound.storage_type())) {
-    throw std::invalid_argument(
-      "[sirius_dynamic_range_filter] boundary type is outside the admitted allowlist");
-  }
   int source_device = -1;
   if (cudaGetDevice(&source_device) != cudaSuccess) {
     throw std::runtime_error("[sirius_dynamic_range_filter] failed to identify source device.");

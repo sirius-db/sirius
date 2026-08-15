@@ -789,11 +789,15 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   // slot replaces its filter on every accepted revision, so releasing the snapshot before the
   // reader has finished walking the AST can drop the last owner of the filter whose scalars
   // `opts` still points at -- which cuDF then dereferences on the device. Append-only join
-  // filters never expose this, because the channel keeps its own reference forever.
+  // filters never expose this, because the channel keeps its own reference forever. The snapshot
+  // is declared before the two AST trees so reverse destruction order alone destroys every
+  // literal-bearing tree before the scalars' last owner: the outlives-referents property holds
+  // through destruction by construction, not by relying on the trees' destructors dereferencing
+  // nothing.
+  sirius::op::dynamic_filter_snapshot filters_snapshot;
   std::optional<gpu_expression_translator::translated_expression> ast_expression = std::nullopt;
   std::optional<gpu_expression_translator::translated_expression> dynamic_ast_expression =
     std::nullopt;
-  sirius::op::dynamic_filter_snapshot filters_snapshot;
   cudf::ast::expression const* reader_filter_root = nullptr;
 
   if (_duckdb_filter_expression && !split.disable_filter_pushdown && !all_slices_pruned) {

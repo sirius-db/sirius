@@ -119,8 +119,6 @@ std::shared_ptr<sirius::op::top_n_threshold_coordinator> make_threshold_coordina
     admitted->k, std::move(admitted->keys), admitted->lex_admitted, stats);
 }
 
-/// The ORDER BY keys' ordinals in the Top-N child's output space, key zero first. Every key is a
-/// bound reference by the time a coordinator exists (eligibility enforced it).
 /// Per-key allowlist verdict, in key order -- the field's documented meaning, as distinct from
 /// the global AND that gates the LEX layer.
 std::vector<bool> top_n_key_admissions(duckdb::LogicalTopN const& op)
@@ -133,6 +131,9 @@ std::vector<bool> top_n_key_admissions(duckdb::LogicalTopN const& op)
   return admitted;
 }
 
+/// The ORDER BY keys' ordinals in the Top-N child's output space, key zero first.
+/// @pre Every key is a bound reference -- eligibility enforced it before any caller runs, which
+/// is what makes the unchecked Cast below safe.
 std::vector<std::size_t> top_n_key_ordinals(duckdb::LogicalTopN const& op)
 {
   std::vector<std::size_t> ordinals;

@@ -25,8 +25,9 @@
  * change cannot silently turn a real assertion into a vacuous one.
  *
  * These also exercise `trace_top_n_all_keys` on real plans: the all-ordinals-survive rule shows
- * up as a two-ordinal slot (scenario 9), UNION fan-out as one slot per branch (scenario 6), and
- * hop refusal as no slot at all (scenario 5).
+ * up as a two-ordinal slot (scenario 9) and hop refusal as no slot at all (scenario 5). UNION
+ * (scenario 6) has no test: the Top-N trace refuses the hop today -- see the scenario-6 note
+ * below.
  *
  * **Why the scan-binding cases read Parquet.** The siting rule sites a target only where it saves
  * work nothing else saves: the consumer skips reads, or material work lies between the site and
@@ -517,8 +518,10 @@ TEST_CASE_METHOD(top_n_plan_shape_fixture,
 
 // Scenario 6 (UNION fan-out to both branches) has no plan-shape test: Sirius rejects set
 // operations during planning ("Set operation not supported"), so no physical plan containing a
-// UNION can be built today. `descent_steps` already fans the trace across a physical UNION's
-// children, and that path becomes testable when set operations are supported.
+// UNION can be built today. `descent_steps` refuses UNION under the Top-N trace policy for the
+// same reason (the join policy keeps its fan-out); restoring the hop is part of supporting set
+// operations, together with its multi-branch guards and a runnable test -- see the
+// `top_n_self_trace` policy note in dynamic_filter_target_discovery.hpp.
 
 TEST_CASE_METHOD(top_n_plan_shape_fixture,
                  "top-n plan shape - the row producer's trace still refuses aggregates",

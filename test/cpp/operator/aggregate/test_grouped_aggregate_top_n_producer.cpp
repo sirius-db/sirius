@@ -161,6 +161,53 @@ TEST_CASE("the group-key producer keeps boundary-tied rows so their group's sum 
   REQUIRE(stats.top_n_group_prefilter_rows_out.load() == 8);
 }
 
+TEST_CASE("group-key prefilter keep-ratio disable stops measuring while witnessing continues",
+          "[physical_grouped_aggregate][dynamic_filter][top_n]")
+{
+  // The group-path twin of the row producer's disable pin (test_physical_top_n_prefilter.cpp):
+  // deleting or mis-wiring the producer's record_keep_ratio/record_prefilter_disabled calls
+  // leaves the gate undecided forever, which no selective-workload test can see.
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+
+  dynamic_filter_stats stats;
+  auto coordinator = std::make_shared<top_n_threshold_coordinator>(
+    5, ascending_int64_key(), true, &stats, top_n_producer_kind::GROUP_KEY);
+  auto armed = make_sum_aggregate();
+  // keep_threshold 0.0: any measured batch that keeps a row disables the prefilter.
+  armed->top_n_producer = std::make_unique<top_n_group_key_producer>(
+    coordinator, std::vector<cudf::size_type>{0}, /*gate_keep_threshold=*/0.0);
+
+  auto const execute = [&](std::vector<std::int64_t> const& keys,
+                           std::vector<std::int64_t> const& values) {
+    std::vector<std::shared_ptr<data_batch>> batch;
+    batch.push_back(make_two_column_batch<std::int64_t, std::int64_t>(
+      *space, keys, values, cudf::type_id::INT64));
+    (void)run_and_merge(*armed, batch);
+  };
+
+  // Batch 1: witness-first fills the K = 5 set from thirteen distinct keys, so the boundary (4)
+  // exists when this same batch's prefilter runs -- the one measured batch. Keeping 5 of 13 rows
+  // exceeds threshold 0.0, so the gate disables and the shared disable counter fires.
+  execute({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12},
+          {10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22});
+  REQUIRE(stats.top_n_group_offers.load() == 1);
+  REQUIRE(stats.top_n_group_witness_set_full.load() == 1);
+  REQUIRE(stats.top_n_group_prefilter_rows_in.load() == 13);
+  REQUIRE(stats.top_n_group_prefilter_rows_out.load() == 5);
+  REQUIRE(stats.top_n_prefilter_disabled.load() == 1);
+
+  // Batch 2: keys no better than the boundary, so witnessing continues (the offer merges) but
+  // tightens nothing -- the boundary-update count is unchanged and the disabled prefilter
+  // declines. rows_in frozen is the disable made observable.
+  execute({5, 9, 11}, {100, 200, 300});
+  REQUIRE(stats.top_n_group_offers.load() == 2);
+  REQUIRE(stats.top_n_group_prefilter_rows_in.load() == 13);
+  REQUIRE(stats.top_n_group_prefilter_rows_out.load() == 5);
+  REQUIRE(stats.top_n_prefilter_disabled.load() == 1);
+}
+
 TEST_CASE("an unarmed grouped aggregate is untouched by the group-key seam",
           "[physical_grouped_aggregate][dynamic_filter][top_n]")
 {

@@ -8,9 +8,11 @@
 > false) — row and group-key producers publish, with scan binds and sited endpoints of both
 > layers live, set operations a trace terminal, and consumption hardened by the siting rule, the
 > pinned-serve flip, and the reader pruning gate (the Phase 1–2 sections below). Stage 6's
-> measurement harness is in place with acceptance criteria unmeasured; Stage 7's remaining
-> surfaces stay proposed. Declarations here stay the authority — where an implemented signature
-> differs, the doc is corrected, not the code.
+> SF1000 zero-regression acceptance bar is measured and met (main doc, "Measured results — TPC-H
+> SF1000 acceptance"), with the clustered upside cell and the decode-time comparison still open
+> and multi-GPU verification still blocked on hardware; Stage 7's remaining surfaces stay
+> proposed. Declarations here stay the authority — where an implemented signature differs, the
+> doc is corrected, not the code.
 
 ## Scope and untouched surface
 
@@ -975,7 +977,7 @@ buried in the planner:
  * (p ≤ 9 → `DECIMAL32`, p ≤ 18 → `DECIMAL64`). Refuses p ≤ 4 (INT16-backed, no cuDF counterpart)
  * and p ≥ 19 (`DECIMAL128`: the kernel's width switch handles 1/2/4/8 only).
  */
-[[nodiscard]] std::optional<cudf::data_type> admitted_key_storage_type(
+[[nodiscard]] std::optional<cudf::data_type> admitted_top_n_key_storage_type(
   duckdb::LogicalType const& type);
 ```
 
@@ -1024,9 +1026,10 @@ Distinct-key mode (main doc, "The group-key producer"): the mode is fixed at con
 everything downstream of the boundary — tightening, publisher loop, `finish`, `cancel` — is
 shared with row mode.
 
-**Admission cap.** A group-key producer is admitted only for `k <= k_max_group_key`, a structural
-constant of **1024** on the coordinator (a named constant, not a configuration option — the same
-treatment as `boundary_filter_params::k_max_components`). The justification is **collapsing
+**Admission cap.** A group-key producer is admitted only for `k <= k_max_admitted_k`, a
+structural constant of **1024** on `top_n_group_key_producer` (a named constant, not a
+configuration option — the same treatment as `boundary_filter_params::k_max_components`). The
+justification is **collapsing
 pruning value, not rising cost**: measured per-batch cost is nearly flat in K (≈16–21% from K=10
 to K=1000 — `distinct` and `sort` dominate and are K-independent), while rows kept climb from
 0.2% at K=10 to 20% at K=1000 for 5000 distinct groups, and to 83% when groups are scarce. Beyond
@@ -1132,7 +1135,7 @@ group-key query as shared accounting, not as a mislabelled bug.
 |---|---|---|---|
 | `exact_host_scalar` / `exact_host_key_tuple` | Immutable | None | Value types |
 | `top_n_key_semantics` / `lex_component_semantics` | Immutable | None | Value types, frozen at plan time |
-| `top_n_threshold_witness` / `top_n_distinct_key_witness` | Immutable after creation | None | Until offer/publication completes |
+| `top_n_threshold_witness` / `top_n_distinct_key_witness` | Immutable after creation | None | Consumed by `offer`, which keeps only the host boundary; a ROW witness's batch handle is held for the offer call alone (publication reads host values only) |
 | `top_n_threshold_coordinator` | Mutable | One internal mutex; single publisher loop | Execution-scoped, shared_ptr from both operators |
 | `top_n_dynamic_filter_publish_plan` | Immutable | None | Owned `const` by the plan |
 | Refinement slot / generation | Mutable | Channel mutex | Channel lifetime (co-owned) |
@@ -1409,8 +1412,9 @@ lands.
 
 Two layers, mirroring `test_sirius_dynamic_filter_mgpu.cpp`:
 
-- **Focused operator test** (`test/cpp/operator/test_sirius_dynamic_range_filter_mgpu.cpp`,
-  skips below two devices): construct `sirius_dynamic_range_filter` and a
+- **Focused operator test** (implemented as the `[mgpu]`-tagged cases in
+  `test/cpp/operator/test_sirius_dynamic_range_filters.cpp`, self-skipping below two devices):
+  construct `sirius_dynamic_range_filter` and a
   `sirius_dynamic_lex_range_filter` with a null tail component against a two-GPU memory manager;
   assert replicas ready on both devices after `replicate_to_devices` (the null component owns no
   scalar on either); induce a target reservation denial and assert the all-or-nothing contract —

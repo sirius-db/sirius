@@ -32,6 +32,7 @@
 #include <op/dynamic_filter/top_n_threshold_coordinator.hpp>
 #include <op/sirius_physical_top_n.hpp>
 #include <op/sirius_physical_top_n_merge.hpp>
+#include <sirius/exception.hpp>
 
 #include <array>
 #include <cstdint>
@@ -618,6 +619,31 @@ TEST_CASE("top_n prefilter keep-ratio disable stops measuring until re-armed",
   execute({500, 600});
   REQUIRE(stats.top_n_prefilter_rows_in.load() == 3);
   REQUIRE(stats.top_n_prefilter_disabled.load() == 1);
+}
+
+TEST_CASE("top_n refuses an out-of-range ORDER BY column index on the prefilter path",
+          "[physical_top_n][dynamic_filter][top_n]")
+{
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+
+  // A bound reference past the input's column count models a planner ordinal-remapping
+  // regression. key_column_indices consumes the indices before compute_top_n_table's own checks
+  // (the prefilter runs first), so the refusal must fire there rather than let the fused kernel
+  // read a nonexistent column.
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(order_on(5, duckdb::OrderType::ASCENDING, duckdb::OrderByNullType::NULLS_LAST));
+  std::size_t const limit = 3;
+
+  dynamic_filter_stats stats;
+  sirius_physical_top_n op(
+    sirius::from_duckdb_vec(bigint_types(1)), std::move(orders), limit, 0, nullptr, 0);
+  op.threshold_coordinator = make_test_coordinator(op.orders, {k_int64}, limit, true, &stats);
+
+  auto batch = make_numeric_batch<std::int64_t>(*space, {1, 2, 3, 4}, cudf::type_id::INT64);
+  REQUIRE_THROWS_AS(op.execute(pipelineable_operator_data({batch}), cudf::get_default_stream()),
+                    sirius::internal_exception);
 }
 
 TEST_CASE("top_n degraded first-key prefilter with an unsupported tail type",

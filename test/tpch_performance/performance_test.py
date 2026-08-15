@@ -1396,13 +1396,29 @@ def open_ab_connection(source: str, data_source: str):
         return open_connection(source, gpu_execution=True, data_source=data_source)
 
 
-def setup_ab_dirs(output_root: str, cell: str) -> Tuple[str, str, str]:
+def setup_ab_dirs(
+    output_root: str, cell: str, name: Optional[str] = None
+) -> Tuple[str, str, str]:
     """AB deliverables layout: <output_root>/phase5/<YYYYMMDD>_<short-commit>/ with one
-    subdirectory per cell. Returns (phase5_dir, cell_dir, log_dir)."""
+    subdirectory per cell; an explicit --name replaces the date+commit directory name.
+    Returns (phase5_dir, cell_dir, log_dir).
+
+    A cell directory that already holds a cell_report.json is refused unless --name was given:
+    the date+commit key makes a same-day subset rerun land in the same directory and silently
+    overwrite retained acceptance artifacts (this destroyed a full 22-query report once).
+    """
     commit, _ = get_git_info()
     short = (commit or "unknown")[:8]
-    phase5_dir = os.path.join(output_root, "phase5", f"{datetime.now():%Y%m%d}_{short}")
+    phase5_dir = os.path.join(
+        output_root, "phase5", name or f"{datetime.now():%Y%m%d}_{short}"
+    )
     cell_dir = os.path.join(phase5_dir, cell)
+    if name is None and os.path.isfile(os.path.join(cell_dir, "cell_report.json")):
+        raise SystemExit(
+            f"cell directory {cell_dir} already holds a cell_report.json; rerunning would "
+            "overwrite its retained artifacts in place. Pass --name to write a distinct run "
+            "directory, or remove the existing cell directory first."
+        )
     log_dir = os.path.join(cell_dir, "log_dir")
     os.makedirs(log_dir, exist_ok=True)
     return phase5_dir, cell_dir, log_dir
@@ -1496,7 +1512,7 @@ def run_ab(args, source: str, queries: List[int]) -> None:
     pairs -> unpin, then per-query outputs, log split, pin verification, and the cell report.
     """
     output_root = args.output or DEFAULT_OUTPUT_ROOT
-    phase5_dir, cell_dir, log_dir = setup_ab_dirs(output_root, args.cell)
+    phase5_dir, cell_dir, log_dir = setup_ab_dirs(output_root, args.cell, args.name)
     os.environ["SIRIUS_LOG_DIR"] = log_dir
 
     config_path = (args.config or "").strip()
@@ -2220,7 +2236,9 @@ def parse_args():
         default=None,
         help=(
             "Name for the benchmark output subdirectory under --output. "
-            "Overrides the default 'tpch_<ts>_<mode>_<engine>_iter<N>'. "
+            "Overrides the default 'tpch_<ts>_<mode>_<engine>_iter<N>' and, in --mode ab, "
+            "the date+commit run directory (the sanctioned way to rerun a cell whose "
+            "cell_report.json is already retained). "
             "Re-runs with the same name will overwrite per-iteration outputs."
         ),
     )

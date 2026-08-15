@@ -35,7 +35,10 @@ namespace sirius::op::scan {
 ///   has no scan-time pruning phase; its wrapper promotes to include_ast_row_masks via
 ///   `read_time_filter_bypass`.
 /// - include_ast_row_masks also evaluates AST-capable filters row-wise with cudf::compute_column,
-///   for materialized inputs that had no scan-time pruning phase.
+///   for materialized inputs that had no scan-time pruning phase. A filter that also implements
+///   `sirius_compaction_applicable` (a Top-N boundary) is excluded from the combined mask and
+///   applied through the fused predicate+compaction kernel instead, so each filter contributes
+///   exactly one post-decode pass per batch.
 enum class dynamic_filter_apply_mode { membership_masks_only, include_ast_row_masks };
 
 /// @brief AND-merge AST-capable filters from one coherent @p snapshot into @p tree, AND-ing with

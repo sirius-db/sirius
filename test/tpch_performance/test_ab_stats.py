@@ -406,6 +406,62 @@ def test_require_cell_nonzero_merges_into_expectations() -> None:
         os.unlink(path)
 
 
+def test_setup_ab_dirs_refuses_overwriting_a_completed_cell() -> None:
+    from performance_test import setup_ab_dirs
+
+    with tempfile.TemporaryDirectory() as root:
+        _, cell_dir, _ = setup_ab_dirs(root, "host_pinned")
+        # Rerunning before the report lands is fine (the abort/resume case).
+        setup_ab_dirs(root, "host_pinned")
+        with open(os.path.join(cell_dir, "cell_report.json"), "w") as f:
+            f.write("{}")
+        # A completed cell must not be overwritten in place: this destroyed the full HOST-pinned
+        # acceptance report once (subset reruns share the date+commit directory key).
+        try:
+            setup_ab_dirs(root, "host_pinned")
+            raise AssertionError("expected SystemExit for a completed cell directory")
+        except SystemExit as e:
+            assert "cell_report.json" in str(e)
+        # Sibling cells in the same run directory stay unaffected...
+        setup_ab_dirs(root, "disk_hot")
+        # ...and an explicit --name is the sanctioned rerun path.
+        _, named_cell, _ = setup_ab_dirs(root, "host_pinned", name="rerun_q18")
+        assert os.path.isdir(named_cell)
+        assert named_cell != cell_dir
+
+
+def test_verify_pinned_cache_hits_verdict_map() -> None:
+    from performance_test import verify_pinned_cache_hits
+
+    marker = "scan served from pinned cache"
+    with tempfile.TemporaryDirectory() as cell_dir:
+        os.makedirs(os.path.join(cell_dir, "q1"))
+        with open(os.path.join(cell_dir, "q1", "sirius.log"), "w") as f:
+            f.write(f"[info] [sirius_scan_manager] {marker} for entry lineitem\n")
+        os.makedirs(os.path.join(cell_dir, "q2"))
+        with open(os.path.join(cell_dir, "q2", "sirius.log"), "w") as f:
+            f.write("[info] a log with no serve marker\n")
+        # q3 has no log at all.
+        verdicts = verify_pinned_cache_hits(cell_dir, [1, 2, 3])
+        assert verdicts == {"q1": "ok", "q2": "no-cache-hit", "q3": "missing-log"}
+
+
+def test_pinned_serve_marker_matches_the_emitter() -> None:
+    # Two-sided string contract: the verifier greps for a literal the engine must emit. A rename
+    # on either side already voided one live SF1000 pilot cell as 'no-cache-hit'; this pins the
+    # matcher's literal against the scan manager's emitter so the drift fails here instead.
+    emitter = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        os.pardir,
+        os.pardir,
+        "src",
+        "scan_manager",
+        "sirius_scan_manager.cpp",
+    )
+    with open(emitter, errors="replace") as f:
+        assert "scan served from pinned cache" in f.read()
+
+
 def main() -> None:
     failures = 0
     for name, fn in sorted(globals().items()):

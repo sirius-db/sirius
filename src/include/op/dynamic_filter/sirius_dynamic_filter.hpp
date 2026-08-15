@@ -683,7 +683,10 @@ class sirius_dynamic_range_filter final : public sirius_dynamic_filter,
    * `descending = (side == LOWER)` makes "better" the kept side (LOWER keeps rows above the
    * bound, UPPER keeps rows below); `strict = !inclusive`; ADMIT orders nulls better (kept),
    * REJECT worse (dropped). Exposed for direct unit testing against the kernel's keep-semantics
-   * contract.
+   * contract. Validates before marshalling, so no launch parameters ever carry a width the
+   * kernel cannot read.
+   *
+   * @throw std::invalid_argument if @p bound's type is outside the admitted allowlist
    */
   [[nodiscard]] static detail::boundary_filter_params make_boundary_filter_params(
     exact_host_scalar const& bound,
@@ -907,7 +910,10 @@ class sirius_dynamic_filter_set : public std::enable_shared_from_this<sirius_dyn
   bool push_filter(std::size_t col_idx, std::shared_ptr<sirius_dynamic_filter const> f);
 
   /**
-   * @brief Snapshot of filters for @p col_idx, in insertion order
+   * @brief Snapshot of appended filters for @p col_idx, in insertion order
+   *
+   * Covers @ref push_filter appends only; a populated refinement slot's value is visible through
+   * @ref snapshot (and counted by @ref has_filters) but never through this accessor.
    *
    * The returned snapshots own a share of each filter; they remain valid even if the set itself is
    * later destroyed. Subsequent @ref push_filter calls do not invalidate previously-returned
@@ -917,14 +923,18 @@ class sirius_dynamic_filter_set : public std::enable_shared_from_this<sirius_dyn
     std::size_t col_idx) const;
 
   /**
-   * @brief Column indices with at least one registered filter
+   * @brief Column indices with at least one appended filter
    *
-   * Order is unspecified.
+   * Order is unspecified. Like @ref filters_for_column, refinement-slot values are excluded, so a
+   * channel holding only a slot publication reports no columns here.
    */
   [[nodiscard]] std::vector<std::size_t> filtered_columns() const;
 
   /**
    * @brief True iff no filters have been pushed for any column
+   *
+   * "Pushed" means appended via @ref push_filter: refinement-slot values are excluded, so a
+   * channel holding only a slot publication is empty() here while @ref has_filters is true.
    */
   [[nodiscard]] bool empty() const;
 

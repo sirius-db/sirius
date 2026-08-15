@@ -264,6 +264,9 @@ struct dynamic_filter_stats {
   std::atomic<std::uint64_t> top_n_lex_filters_pushed{0};
   std::atomic<std::uint64_t> top_n_first_key_filters_pushed{0};
   std::atomic<std::uint64_t> top_n_revisions_failed{0};  ///< Replica failure; old revision retained
+  /// Slot-level stale-write rejections. Expected zero by design: the single publisher loop
+  /// assigns and flushes revisions in increasing order, so a permanent zero means the sequencing
+  /// check ran and rejected nothing -- not that it never executed.
   std::atomic<std::uint64_t> top_n_revisions_stale{0};
   /// Publishes refused because the slot's primary or a referenced ordinal is ignored
   std::atomic<std::uint64_t> top_n_revisions_ignored{0};

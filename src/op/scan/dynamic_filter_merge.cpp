@@ -111,6 +111,9 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
 
   auto const include_ast_masks = mode == dynamic_filter_apply_mode::include_ast_row_masks;
 
+  // Scope every marginal ratio read and update to one channel-size snapshot.
+  auto const observed_filter_count = snapshot.logical_filter_count;
+
   // Conjoin AST-lowerable filters into one row mask when the scan reader did not apply them.
   if (include_ast_masks) {
     cudf::ast::tree tree;
@@ -122,6 +125,13 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
         if (!f->is_available_on_device(device_id)) { continue; }
         auto const* lowerable = dynamic_cast<sirius::op::sirius_ast_lowerable const*>(f.get());
         if (!lowerable) { continue; }
+        // A filter that also implements the fused compaction capability is applied by the
+        // compaction loop below -- the chosen post-decode path -- so lowering it here too would
+        // evaluate the same predicate twice per batch. Its AST capability remains for the parquet
+        // reader checkpoint, where lowering is the only mechanism.
+        if (dynamic_cast<sirius::op::sirius_compaction_applicable const*>(f.get()) != nullptr) {
+          continue;
+        }
         if (!col_ref) {
           col_ref =
             &tree.emplace<cudf::ast::column_reference>(static_cast<cudf::size_type>(column.column));
@@ -151,6 +161,14 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
           dynamic_cast<sirius::op::sirius_compaction_applicable const*>(f.get());
         if (compactable == nullptr) { continue; }
 
+        // Same per-filter usefulness discipline as the membership cascade below, so an
+        // unselective boundary filter stops paying its fused kernel pass: a skippable verdict
+        // omits the filter permanently, and a replacement revision installs a new filter object
+        // that gets its own measurement.
+        auto const recorded =
+          gate ? gate->filter_keep_ratio(f.get(), observed_filter_count) : std::nullopt;
+        if (recorded && dynamic_filter_gate::filter_skippable(*recorded)) { continue; }
+
         std::vector<cudf::size_type> key_columns;
         if (auto const* multi =
               dynamic_cast<sirius::op::sirius_multi_column_ast_lowerable const*>(f.get())) {
@@ -166,7 +184,16 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
           continue;
         }
 
+        auto const rows_before = current.num_rows();
         auto result = compactable->apply_compact(current, key_columns, device_id, stream, mr);
+        // rows_kept is valid on every path, so an all-pass (or cannot-apply) result records the
+        // keep ratio 1.0 -- the strongest disable signal, which a null-table no-op would hide.
+        if (gate && !recorded) {
+          gate->record_filter_keep_ratio(
+            f.get(),
+            static_cast<double>(result.rows_kept) / static_cast<double>(rows_before),
+            observed_filter_count);
+        }
         // A null table is the all-pass fast path: nothing was dropped, so the cascade is unchanged.
         if (!result.filtered) { continue; }
         owned   = std::move(result.filtered);
@@ -182,8 +209,6 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
     sirius::op::sirius_dynamic_filter const* identity;
     std::optional<double> recorded;
   };
-  // Scope every marginal ratio read and update to one channel-size snapshot.
-  auto const observed_filter_count = snapshot.logical_filter_count;
   std::vector<membership_entry> entries;
   for (auto const& column : snapshot.columns) {
     if (column.column >= num_cols) { continue; }

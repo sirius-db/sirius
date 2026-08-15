@@ -69,7 +69,8 @@ class top_n_dynamic_filter_publish_plan final {
    * @brief One ORDER BY key, in key order
    */
   struct key {
-    std::size_t child_ordinal;  ///< At the Top-N child; traces remap it per site
+    std::size_t child_ordinal;  ///< At the traced root -- the Top-N child for a ROW plan, the
+                                ///< aggregate input for a GROUP_KEY plan; traces remap it per site
     top_n_key_semantics semantics;
     bool type_admitted;  ///< Per-key allowlist verdict
   };

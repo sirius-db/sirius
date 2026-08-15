@@ -795,6 +795,30 @@ TEST_CASE("boundary filters reject inadmissible construction", "[dynamic_filter]
                         dynamic_filter_null_policy::ADMIT),
                       std::invalid_argument);
   }
+  SECTION("RANGE rejects a non-fixed-width type with the documented exception")
+  {
+    // Validate-then-marshal: the allowlist check must precede the width marshalling, or STRING
+    // would reach cudf::size_of in the member-init list and surface as cudf::logic_error instead
+    // of the constructor's documented std::invalid_argument.
+    REQUIRE_THROWS_AS(sirius_dynamic_range_filter(
+                        exact_host_scalar{std::int64_t{0}, cudf::data_type{cudf::type_id::STRING}},
+                        range_bound_side::LOWER,
+                        true,
+                        dynamic_filter_null_policy::ADMIT),
+                      std::invalid_argument);
+  }
+  SECTION("RANGE's public marshaller refuses a width the kernel cannot read")
+  {
+    // The DECIMAL128 gate on the direct-marshalling entry point, mirroring the detail
+    // marshaller's: width 16 would silently load as zero in a release-built kernel.
+    REQUIRE_THROWS_AS(
+      sirius_dynamic_range_filter::make_boundary_filter_params(
+        exact_host_scalar{std::int64_t{1}, cudf::data_type{cudf::type_id::DECIMAL128, -2}},
+        range_bound_side::LOWER,
+        true,
+        dynamic_filter_null_policy::ADMIT),
+      std::invalid_argument);
+  }
   SECTION("LEX requires at least two components")
   {
     std::vector<std::optional<exact_host_scalar>> single{int32_bound(1)};

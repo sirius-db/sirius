@@ -40,9 +40,11 @@
 
 #include <barrier>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <span>
 #include <thread>
 #include <vector>
 
@@ -1268,4 +1270,200 @@ TEST_CASE("per-filter gate stales a selective verdict when the channel grows",
   REQUIRE(out2 != nullptr);
   REQUIRE(out2->num_rows() == 2);
   REQUIRE(gate.filter_keep_ratio(selective.get(), filters.filter_count()).has_value());
+}
+
+//===----------------------------------------------------------------------===//
+// Top-N boundary dispatch — exactly one post-decode mechanism per filter per batch
+//===----------------------------------------------------------------------===//
+
+namespace {
+/// The Top-N boundary shape with call counters: both consumer capabilities, delegating to a real
+/// RANGE filter. Pins the include_ast_row_masks dispatch contract -- the fused compaction leg is
+/// the one post-decode mechanism for such a filter, so `to_ast` must never run there.
+class counting_boundary_filter final : public sirius_dynamic_filter,
+                                       public sirius::op::sirius_ast_lowerable,
+                                       public sirius::op::sirius_compaction_applicable {
+ public:
+  explicit counting_boundary_filter(std::shared_ptr<sirius::op::sirius_dynamic_range_filter> inner)
+    : _inner(std::move(inner))
+  {
+  }
+
+  [[nodiscard]] sirius_dynamic_filter_kind kind() const override { return _inner->kind(); }
+
+  [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override
+  {
+    return _inner->is_available_on_device(device_id);
+  }
+
+  [[nodiscard]] cudf::ast::expression const& to_ast(cudf::ast::tree& tree,
+                                                    cudf::ast::expression const& column_ref,
+                                                    int device_id) const override
+  {
+    ++_to_ast_calls;
+    return _inner->to_ast(tree, column_ref, device_id);
+  }
+
+  [[nodiscard]] sirius::op::detail::boundary_filter_result apply_compact(
+    cudf::table_view const& batch,
+    std::span<cudf::size_type const> key_columns,
+    int device_id,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const override
+  {
+    ++_apply_compact_calls;
+    return _inner->apply_compact(batch, key_columns, device_id, stream, mr);
+  }
+
+  [[nodiscard]] int to_ast_calls() const noexcept { return _to_ast_calls; }
+  [[nodiscard]] int apply_compact_calls() const noexcept { return _apply_compact_calls; }
+
+ private:
+  std::shared_ptr<sirius::op::sirius_dynamic_range_filter> _inner;
+  mutable int _to_ast_calls        = 0;
+  mutable int _apply_compact_calls = 0;
+};
+
+/// AST-only zone map with a `to_ast` counter: proves the compaction-capable exclusion does not
+/// leak onto plain zone maps, which must still lower into the combined row mask.
+class counting_zone_map_filter final : public sirius_dynamic_filter,
+                                       public sirius::op::sirius_ast_lowerable {
+ public:
+  explicit counting_zone_map_filter(std::shared_ptr<sirius_dynamic_zone_map_filter> inner)
+    : _inner(std::move(inner))
+  {
+  }
+
+  [[nodiscard]] sirius_dynamic_filter_kind kind() const override { return _inner->kind(); }
+
+  [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override
+  {
+    return _inner->is_available_on_device(device_id);
+  }
+
+  [[nodiscard]] cudf::ast::expression const& to_ast(cudf::ast::tree& tree,
+                                                    cudf::ast::expression const& column_ref,
+                                                    int device_id) const override
+  {
+    ++_to_ast_calls;
+    return _inner->to_ast(tree, column_ref, device_id);
+  }
+
+  [[nodiscard]] int to_ast_calls() const noexcept { return _to_ast_calls; }
+
+ private:
+  std::shared_ptr<sirius_dynamic_zone_map_filter> _inner;
+  mutable int _to_ast_calls = 0;
+};
+
+/// One-sided INT64 RANGE boundary keeping values <= @p bound (the ascending first-key form).
+std::shared_ptr<sirius::op::sirius_dynamic_range_filter> make_upper_bound_filter(int64_t bound)
+{
+  return std::make_shared<sirius::op::sirius_dynamic_range_filter>(
+    sirius::op::exact_host_scalar{bound, cudf::data_type{cudf::type_id::INT64}},
+    sirius::op::range_bound_side::UPPER,
+    /*inclusive=*/true,
+    sirius::op::dynamic_filter_null_policy::REJECT);
+}
+
+/// INT64 zone map keeping [lo, hi], matching make_int64_sequence_table's column type.
+std::shared_ptr<sirius_dynamic_zone_map_filter> make_int64_zone_map(int64_t lo,
+                                                                    int64_t hi,
+                                                                    rmm::cuda_stream_view stream)
+{
+  auto const mr = cudf::get_current_device_resource_ref();
+  std::vector<zone_map_entry> zones;
+  zones.push_back({std::make_unique<cudf::numeric_scalar<int64_t>>(lo, true, stream, mr),
+                   std::make_unique<cudf::numeric_scalar<int64_t>>(hi, true, stream, mr)});
+  return std::make_shared<sirius_dynamic_zone_map_filter>(std::move(zones));
+}
+}  // namespace
+
+TEST_CASE("include_ast_row_masks applies a compaction-capable filter through the fused leg only",
+          "[dynamic_filter][scan_merge][top_n]")
+{
+  auto stream = cudf::get_default_stream();
+
+  // The boundary keeps [0, 3]; the AST-only zone map on the same column keeps [0, 6].
+  auto boundary = std::make_shared<counting_boundary_filter>(make_upper_bound_filter(3));
+  auto zone     = std::make_shared<counting_zone_map_filter>(make_int64_zone_map(0, 6, stream));
+  sirius_dynamic_filter_set filters;
+  filters.push_filter(0, zone);
+  filters.push_filter(0, boundary);
+
+  auto table = make_int64_sequence_table(10, stream);
+  auto out   = sirius::op::scan::apply_dynamic_filters_to_view(
+    table->view(), filters.snapshot(), stream, dynamic_filter_apply_mode::include_ast_row_masks);
+  stream.synchronize();
+  REQUIRE(out != nullptr);
+  REQUIRE(out->num_rows() == 4);  // zone [0, 6] AND boundary <= 3
+
+  // Exactly one post-decode mechanism per filter per batch: the dual-capability boundary went
+  // through the fused kernel alone, while the zone map still lowered into the combined mask.
+  REQUIRE(boundary->to_ast_calls() == 0);
+  REQUIRE(boundary->apply_compact_calls() == 1);
+  REQUIRE(zone->to_ast_calls() == 1);
+
+  // Per batch, not per snapshot: a second batch pays one more of each.
+  auto out2 = sirius::op::scan::apply_dynamic_filters_to_view(
+    table->view(), filters.snapshot(), stream, dynamic_filter_apply_mode::include_ast_row_masks);
+  stream.synchronize();
+  REQUIRE(out2 != nullptr);
+  REQUIRE(out2->num_rows() == 4);
+  REQUIRE(boundary->to_ast_calls() == 0);
+  REQUIRE(boundary->apply_compact_calls() == 2);
+  REQUIRE(zone->to_ast_calls() == 2);
+}
+
+TEST_CASE("per-filter gate skips an unselective boundary filter's fused pass on later splits",
+          "[dynamic_filter][scan_merge][top_n]")
+{
+  auto stream = cudf::get_default_stream();
+  sirius::op::scan::dynamic_filter_gate gate;
+
+  // Keeps 19 of 20 rows: above both the per-filter skip threshold (0.5) and the scan-level
+  // disable threshold (0.9), so one measured split trains both gates.
+  auto boundary = std::make_shared<counting_boundary_filter>(make_upper_bound_filter(18));
+  sirius_dynamic_filter_set filters;
+  filters.push_filter(0, boundary);
+
+  auto table = make_int64_sequence_table(20, stream);
+  auto out   = sirius::op::scan::apply_dynamic_filters_gated_view(
+    table->view(),
+    filters.snapshot(),
+    gate,
+    stream,
+    dynamic_filter_apply_mode::include_ast_row_masks);
+  stream.synchronize();
+  REQUIRE(out != nullptr);
+  REQUIRE(out->num_rows() == 19);
+  REQUIRE(boundary->apply_compact_calls() == 1);
+
+  // The unselective pass trained the gate at both levels: a skippable per-filter verdict and a
+  // scan-level disable.
+  auto const measured = gate.filter_keep_ratio(boundary.get(), filters.filter_count());
+  REQUIRE(measured.has_value());
+  REQUIRE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*measured));
+  REQUIRE_FALSE(gate.applicable(filters.snapshot()));
+
+  // Channel growth re-arms the scan-level gate for one measurement; the dead boundary's fused
+  // kernel never runs again and the selective newcomer alone filters the re-armed split.
+  auto selective = make_in_list_prefix(2, stream);
+  filters.push_filter(0, selective);
+  REQUIRE(gate.applicable(filters.snapshot()));
+
+  auto out2 = sirius::op::scan::apply_dynamic_filters_gated_view(
+    table->view(),
+    filters.snapshot(),
+    gate,
+    stream,
+    dynamic_filter_apply_mode::include_ast_row_masks);
+  stream.synchronize();
+  REQUIRE(out2 != nullptr);
+  REQUIRE(out2->num_rows() == 2);
+  REQUIRE(boundary->apply_compact_calls() == 1);
+  REQUIRE(gate.applicable(filters.snapshot()));  // the re-arm measured 0.1 -> ACTIVE
+
+  // The AST leg never touched the boundary in either split.
+  REQUIRE(boundary->to_ast_calls() == 0);
 }

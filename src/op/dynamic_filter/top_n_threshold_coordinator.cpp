@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <cudf/utilities/default_stream.hpp>
+
 #include <log/logging.hpp>
 #include <op/dynamic_filter/dynamic_filter_stats.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
@@ -169,23 +171,39 @@ void top_n_threshold_coordinator::set_publish_plan(top_n_dynamic_filter_publish_
 
 void top_n_threshold_coordinator::publisher_loop()
 {
-  while (true) {
-    std::optional<exact_host_key_tuple> candidate;
-    std::uint64_t revision = 0;
+  try {
+    while (true) {
+      std::optional<exact_host_key_tuple> candidate;
+      std::uint64_t revision = 0;
+      {
+        std::scoped_lock lock{_mu};
+        if (!_pending) {
+          // The pending-empty check and the handoff share this critical section, so an offer that
+          // arrives after it sees no active publisher and takes ownership itself.
+          _publisher_active = false;
+          _publisher_idle.notify_all();
+          return;
+        }
+        candidate = std::move(_pending);
+        _pending.reset();
+        revision = _next_revision++;
+      }
+      publish_revision(*candidate, revision);
+    }
+  } catch (...) {
+    // Exception-only handoff: publish_revision catches std::exception, so only an exception not
+    // derived from it can reach here, and no dependency in the publish path throws such a type
+    // on purpose -- there is no deterministic trigger to test. It must still release ownership,
+    // or finish() would wait on _publisher_idle forever. A candidate that landed meanwhile stays
+    // pending for the next offer or finish() to claim, exactly as after a caught failure. This
+    // cannot be an unconditional scope guard: after the normal handoff above, another thread may
+    // already own the loop, and a late flag reset would mint a second publisher.
     {
       std::scoped_lock lock{_mu};
-      if (!_pending) {
-        // The pending-empty check and the handoff share this critical section, so an offer that
-        // arrives after it sees no active publisher and takes ownership itself.
-        _publisher_active = false;
-        _publisher_idle.notify_all();
-        return;
-      }
-      candidate = std::move(_pending);
-      _pending.reset();
-      revision = _next_revision++;
+      _publisher_active = false;
     }
-    publish_revision(*candidate, revision);
+    _publisher_idle.notify_all();
+    throw;
   }
 }
 
@@ -283,6 +301,18 @@ void top_n_threshold_coordinator::publish_revision(exact_host_key_tuple const& b
         dynamic_cast<sirius_device_replicable*>(const_cast<sirius_dynamic_filter*>(filter.get()));
       if (replicable != nullptr) { replicable->replicate_to_devices(_plan.replica_spaces); }
     }
+    // Publish is cross-stream: consumers read the filters' device-resident literal scalars from
+    // their own pooled non-blocking task streams the moment the install below lands, with no
+    // event ordering back to the constructing stream. Both filter constructors above enqueue
+    // their source-device scalar copies on the default stream without synchronizing, and
+    // replication skips the constructing device, so its per-target syncs never cover those
+    // copies. Completeness before visibility: this one synchronize per revision makes every
+    // scalar's device value and validity complete before any consumer can observe the filter,
+    // mirroring the join publisher's pre-fan-out synchronize in dynamic_filter_publisher.cpp.
+    // No deterministic race test is constructible for the missing sync (the window is a pending
+    // stream-0 copy racing another stream's read), the same status as the join path's; the
+    // Top-N suites pin only that this sync does not regress behavior.
+    cudf::get_default_stream().synchronize();
   } catch (std::exception const& e) {
     // Any construction or replica failure installs nothing; the previous revision stays visible
     // on every device and every target.

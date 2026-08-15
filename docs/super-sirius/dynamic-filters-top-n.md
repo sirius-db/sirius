@@ -12,10 +12,13 @@
 > otherwise save), pinned-cache-served consumption, the reader-path runtime pruning gate, and
 > multi-ordinal LEX endpoint placement (the Stage-7 bullet marked landed in the rollout plan).
 > Scan binds and sited endpoints of both layers are live, and a set operation is a terminal for
-> the Top-N trace. Stage 6 (performance validation) has its measurement harness in place with
-> the enable-by-default criteria unmeasured; Stage 7's remaining items — join-hop widening
-> first — stay proposed. This document makes Top-N the first concrete Phase 4 dynamic-refinement
-> producer while preserving the implemented, append-only hash-join publication path. See
+> the Top-N trace. Stage 6's SF1000 zero-regression bar — the enable-by-default overhead and
+> equivalence criteria — is measured and met (see "Measured results — TPC-H SF1000 acceptance");
+> the remaining Stage-6 items (the clustered upside cell and the decode-time vs row-group-only
+> comparison) stay open, and multi-GPU verification remains blocked on hardware. Stage 7's
+> remaining items — join-hop widening first — stay proposed. This document makes Top-N the
+> first concrete Phase 4 dynamic-refinement producer while preserving the implemented,
+> append-only hash-join publication path. See
 > [dynamic-filters.md](dynamic-filters.md) for the general framework,
 > [dynamic-filters-multi-gpu.md](dynamic-filters-multi-gpu.md) for current device-replica
 > ownership, and [dynamic-filters-top-n-api.md](dynamic-filters-top-n-api.md) for the
@@ -368,8 +371,8 @@ same sites would publish a strict row predicate against grouped input and silent
 aggregate values.
 
 TPC-H applicability at the pinned DuckDB: Q18 is the shape — both keys are grouping keys, the
-`o_orderdate` tail is admitted, and the `o_totalprice` DECIMAL head means Q18 unlocks when
-decimals gain their exactness proof. Q3, Q10, and Q21 order on aggregate outputs (`revenue`,
+`o_orderdate` tail is admitted, and the `o_totalprice` DECIMAL(15,2) head is admitted since exact
+`DECIMAL(5–18)` keys landed. Q3, Q10, and Q21 order on aggregate outputs (`revenue`,
 `numwait`) and can never qualify; Q2 has no aggregate below its Top-N and is the row producer's
 shape.
 
@@ -1115,8 +1118,8 @@ same rows: a wash in work, with publication and replication overhead on top.
 Measured, this is not marginal. Against an A/A control resolving ±2.3%: native adversary
 **+6.8%**, native `S-scan` **+11.5%** *while keeping only 0.52% of rows* — maximal selectivity and
 still a regression, which is the clearest evidence that selectivity is the wrong criterion — and
-Parquet-clustered **−57.4%**. Enable-by-default criterion C2 (≤+2% on the adversary) fails on
-native for exactly this reason.
+Parquet-clustered **−57.4%**. Enable-by-default criterion C2 (≤+2% on the adversary) failed on
+native for exactly this reason, before this siting rule landed.
 
 The asymmetry to preserve: this is about **read-unskippable scan-sited targets**, not about native
 consumers. A native *endpoint* sited deep in a probe pipeline can pay for itself under condition 2,
@@ -1146,8 +1149,9 @@ reader AST buys two things — row groups never read (statistics pruning, the re
 decode-time row filtering (which only duplicates the sink's own pass, per the argument above).
 When the data cannot be pruned, the first is zero and only the cost remains, paid on every split.
 
-So enable-by-default criterion C2 fails on **both** backends, for two different reasons, and the
-plan-time rule fixes only one of them. The reader path therefore carries a runtime gate — the
+So enable-by-default criterion C2 failed on **both** backends before the two remedies landed, for
+two different reasons, and the plan-time rule fixes only one of them. The reader path therefore
+carries a runtime gate — the
 **reader pruning gate** (`reader_pruning_gate`), one instance per parquet scan, owned by the
 ingestible whose `materialize_metadata_to_table` is the merge site. Whether the gate returns C2
 to within its bound is Stage-6 acceptance evidence (re-measure the adversary cell); the
@@ -1402,7 +1406,10 @@ Recommended metrics:
   before/after, and its eligibility rejections by reason.
 - Endpoint sites considered, sited, skipped as immaterial, and rows before/after.
 - Offers, not-tighter offers, coalesced offers, and final flushes.
-- Revisions attempted, accepted, stale, closed, and failed.
+- Revisions attempted, accepted, stale, closed, and failed. `top_n_revisions_stale` is
+  expected-zero by design: the single publisher loop assigns and flushes revisions in increasing
+  order, so a permanent zero means the slot's stale-write check ran and rejected nothing — not
+  that it never executed.
 - Generation at each scan checkpoint.
 - Splits queued, started, and completed before first publication and per generation.
 - Replica bytes, latency, route, and failure per device.
@@ -1600,8 +1607,11 @@ single GB300, one GPU; unclustered tpchgen-rs parquet.
 | Cold spot-check (Q1/Q2/Q6/Q18/Q21, `drop_caches` per pair, ±5%) | clean — no cold-path-only regression | — |
 
 Per-query detail lives in the benchmark artifacts (`cell_report.json` per cell); every cell ran
-with pin verification (the scan manager's serve marker), arming enforcement, and cross-arm
-byte-identity, and none aborted.
+with arming enforcement and cross-arm byte-identity, the pinned cell also with pin verification
+(the scan manager's serve marker — the from-disk and cold cells correctly record
+`pin_verification: null`, since nothing is pinned there), and none aborted. The retained 10-pair
+pilot cell predates the serve-marker fix and records a false `no-cache-hit` for every query: its
+timings were taken pinned; only the verifier's marker string was stale.
 
 **Hoped-for gains, honestly reported.** Q18 (the group-key producer's shape) showed 0.9897
 [0.982, 0.998] in a 10-pair pilot, but 0.9991 [0.993, 1.005] at 21 pairs and 1.0037 [0.9996,
@@ -1617,11 +1627,18 @@ aggregate output) exceeds the precision-18 admission cap, so both producers reje
 and those queries run effectively flag-off. Q21 (the one armed self-consumption-only query) is
 flat: 1.0034 [0.9995, 1.0073] pinned, 0.9994 [0.9958, 1.0029] from disk.
 
-The unclustered dataset is the pruning-hostile case by construction: row-group statistics span
-the full key ranges, so the reader gate correctly observes zero pruning and the measured result
-is the mechanism's overhead floor, not its upside. The clustered dataset (the
-`--cluster-keys "orders:o_totalprice,supplier:s_acctbal"` stretch cell) remains the
-demonstrable-upside configuration and was not run for the bar.
+The unclustered dataset is hostile for the campaign's ORDER BY keys: row-group statistics span
+the full key ranges, so reader-side pruning would have had nothing to remove. The bar cells could
+not measure that path either way — no suite query put a Top-N filter into a parquet scan channel
+at SF1000 (the retained counters show `reader_gate_measurements` zero in every cell: Q18's eight
+sites were all skipped as saving no work, Q2 placed endpoints only, and the rest published
+nothing), so the reader merge and its gate went unexercised by the bar and the measured result is
+the overhead floor of the paths that did run (sink and aggregate-input prefilters, publication,
+endpoint placement), not a reader-path verdict. The reader gate's evidence is the unit and
+scan-level tests plus the gain demonstration below, which drove the reader-merge path on this
+same dataset and pruned 98.3% of row groups through lineitem's natural `l_orderkey` ordering. The
+clustered dataset (the `--cluster-keys "orders:o_totalprice,supplier:s_acctbal"` stretch cell)
+remains the demonstrable-upside configuration and was not run for the bar.
 
 **Follow-up: the witness-first seam and the gain demonstration.** The group-key seam now
 witnesses before it prefilters, so the boundary a batch establishes can prune that same batch

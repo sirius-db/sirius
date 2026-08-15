@@ -110,8 +110,9 @@ class top_n_group_key_producer final {
    * group's aggregate values. Rows strictly worse than the boundary belong to a group strictly
    * worse than K proven groups and can never reach the final K.
    *
-   * Returns an empty result -- no filtering -- when no boundary exists yet or the keep-ratio gate
-   * has stopped paying for the pass. A stale boundary prunes less, never more.
+   * Returns the all-pass result (null `filtered`, `rows_kept` equal to the batch's row count)
+   * when no boundary exists yet or the keep-ratio gate has stopped paying for the pass. A stale
+   * boundary prunes less, never more.
    */
   [[nodiscard]] detail::boundary_filter_result prefilter(cudf::table_view const& batch,
                                                          rmm::cuda_stream_view stream,

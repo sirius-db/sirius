@@ -240,10 +240,15 @@ detail::boundary_filter_result top_n_group_key_producer::prefilter(
   cudf::table_view const& batch, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
 {
   if (batch.num_rows() == 0) { return {}; }
+  // Decline paths return the all-pass form {nullptr, batch rows}, honoring
+  // boundary_filter_result's "rows_kept always valid" invariant: a caller computing a keep ratio
+  // from a declined batch must see 1.0, never 0.
   auto const observed_updates = _coordinator->boundary_update_count();
-  if (!_prefilter_gate.applicable(observed_updates)) { return {}; }
+  if (!_prefilter_gate.applicable(observed_updates)) {
+    return {.filtered = nullptr, .rows_kept = batch.num_rows()};
+  }
   auto const boundary = _coordinator->tightest_boundary();
-  if (!boundary) { return {}; }
+  if (!boundary) { return {.filtered = nullptr, .rows_kept = batch.num_rows()}; }
 
   // Inclusive at every key count -- see the class documentation. The degraded form compares only
   // key zero when a tail type is outside the allowlist, exactly as the row producer's prefilter
