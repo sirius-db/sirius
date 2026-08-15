@@ -277,7 +277,7 @@ class downgrade_executor {
   void cancel_pending_requests();
 
   /**
-   * @brief Finish one request: monitor re-arm, stats log, promise fulfilment, and clearing
+   * @brief Finish one request: monitor re-arm, stats log, promise fulfillment, and clearing
    *        the request's in-flight entry (in that order — the promise is fulfilled BEFORE the
    *        entry clears, so a drain returning implies the query's waiters have unblocked).
    *
