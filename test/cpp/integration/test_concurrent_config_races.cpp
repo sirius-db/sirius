@@ -324,6 +324,39 @@ TEST_CASE("adversarial: SET storm on operator params races concurrent executions
 
   adversarial_env env;
 
+  // The rotation below perturbs settings, and expression_evaluator_strategy is
+  // PROCESS-GLOBAL (duckdb::Config static) — it outlives this test's isolated
+  // DB. A mid-rotation exit, including a REQUIRE throw, must not leak the
+  // perturbed half into the rest of the suite: under 'materialize', inequality
+  // nested-loop/mixed-join shapes runtime-fall-back, which failed 13 unrelated
+  // gpu_execution tests when the storm happened to end on that half. RESET
+  // every knob in the rotation on every exit path.
+  struct storm_reset_guard {
+    duckdb::DuckDB& db;
+    ~storm_reset_guard()
+    {
+      static constexpr const char* knobs[] = {"scan_task_batch_size",
+                                              "expression_evaluator_strategy",
+                                              "hash_partition_bytes",
+                                              "max_build_hash_table_bytes",
+                                              "enable_dynamic_filter_pushdown",
+                                              "concat_batch_bytes",
+                                              "max_sort_partition_bytes",
+                                              "sort_sample_bytes",
+                                              "enable_runtime_distinct_build_probe",
+                                              "mark_join_build_switch_ratio",
+                                              "dynamic_filter_keep_threshold",
+                                              "max_broadcast_join_size"};
+      try {
+        duckdb::Connection con(db);
+        for (const char* knob : knobs) {
+          (void)con.Query(std::string("RESET ") + knob);
+        }
+      } catch (...) {  // never mask the test's own failure
+      }
+    }
+  } reset_guard{*env.db};
+
   const auto stats_before = env.sirius_ctx->get_transparent_execution_stats();
 
   const int query_workers = std::max(2, workers() - 1);
