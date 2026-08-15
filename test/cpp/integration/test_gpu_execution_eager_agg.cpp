@@ -58,12 +58,16 @@ class EagerAggFixture : public sirius::test::GpuExecutionFixture {
   EagerAggFixture()
   {
     // cust: c_id 4 is duplicated (N:M multiplicity through the join); c_id 5
-    // and 6 have no orders (LEFT/RIGHT no-match rows -> COUNT 0 / SUM NULL).
+    // has no orders (LEFT/RIGHT no-match rows -> COUNT 0 / SUM NULL).
     run_ok("CREATE TABLE cust (c_id INTEGER, c_grp INTEGER);");
     run_ok("INSERT INTO cust VALUES (1, 1), (2, 0), (3, 1), (4, 0), (4, 0), (5, 1), (6, 0);");
     // ord: duplicate join keys (three rows for c_id 1), a NULL join key (never
     // matches), NULLs in o_val (COUNT counts non-NULLs only), negatives for
-    // MIN/MAX, and o_grp for multi-key joins.
+    // MIN/MAX, and o_grp for multi-key joins. o_cid spans cust's full c_id
+    // domain [1, 6] on purpose: a narrower domain would let DuckDB's
+    // statistics propagation derive a c_id range filter on the cust scan,
+    // and the benefit gate (correctly) refuses non-bare preserved sides —
+    // which would mask the organic INNER fire path this file exercises.
     run_ok("CREATE TABLE ord (o_cid INTEGER, o_grp INTEGER, o_key INTEGER, o_val INTEGER);");
     run_ok(
       "INSERT INTO ord VALUES "
@@ -71,6 +75,7 @@ class EagerAggFixture : public sirius::test::GpuExecutionFixture {
       "(2, 0, 103, 20), (2, 0, 104, 20), "
       "(3, 1, 105, NULL), "
       "(4, 0, 106, -1), (4, 1, 107, 42), "
+      "(6, 0, 109, NULL), (6, 1, 110, -3), "
       "(NULL, 1, 108, 99);");
     // ordempty: an empty pushed side.
     run_ok("CREATE TABLE ordempty (o_cid INTEGER, o_key INTEGER);");
@@ -107,7 +112,7 @@ TEST_CASE_METHOD(EagerAggFixture,
                  "gpu_execution eager agg pushdown - LEFT join grouped COUNT (q13 shape)",
                  "[integration][gpu_execution][eager_agg]")
 {
-  // Customers 5/6 have no orders: COUNT must be 0 (COALESCE repair), not NULL.
+  // Customer 5 has no orders: COUNT must be 0 (COALESCE repair), not NULL.
   // Customer 3's only order has o_val NULL: count(o_val) = 0 for a MATCHED row.
   compare_fired(
     "SELECT c_id, count(o_key), count(o_val) FROM cust LEFT JOIN ord ON c_id = o_cid "
@@ -125,8 +130,12 @@ TEST_CASE_METHOD(EagerAggFixture,
                  "gpu_execution eager agg pushdown - INNER join COUNT and SUM",
                  "[integration][gpu_execution][eager_agg]")
 {
+  // COUNT over o_val (nullable), not o_key: under an INNER join DuckDB's
+  // optimizer rewrites COUNT of a provably non-NULL column into count_star(),
+  // which the matcher refuses by design (no argument to push). A nullable
+  // argument keeps the plain count(col) shape this test exercises.
   compare_fired(
-    "SELECT c_id, count(o_key), sum(o_val) FROM cust JOIN ord ON c_id = o_cid GROUP BY c_id");
+    "SELECT c_id, count(o_val), sum(o_val) FROM cust JOIN ord ON c_id = o_cid GROUP BY c_id");
 }
 
 TEST_CASE_METHOD(EagerAggFixture,

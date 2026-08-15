@@ -186,11 +186,15 @@ struct eager_agg_pushdown_fixture {
 
     // cust is the preserved / non-pushed side (bare, unfiltered scan); ord is
     // the pushed side with duplicate keys so the pre-aggregation actually
-    // reduces rows.
+    // reduces rows. o_cid spans cust's full c_id domain [0, 19] on purpose: a
+    // narrower domain would let DuckDB's statistics propagation derive a c_id
+    // range filter on the cust scan, and the benefit gate (correctly) refuses
+    // non-bare preserved sides — which would mask the organic fire shapes
+    // this file asserts on.
     con->Query("CREATE TABLE cust (c_id INTEGER, c_grp INTEGER)");
     con->Query("INSERT INTO cust SELECT range, range % 2 FROM range(20)");
     con->Query("CREATE TABLE ord (o_cid INTEGER, o_grp INTEGER, o_key INTEGER, o_val INTEGER)");
-    con->Query("INSERT INTO ord SELECT range % 10, range % 2, range, range * 3 FROM range(200)");
+    con->Query("INSERT INTO ord SELECT range % 20, range % 2, range, range * 3 FROM range(200)");
   }
 
   ~eager_agg_pushdown_fixture() { unsetenv("SIRIUS_CONFIG_FILE"); }
