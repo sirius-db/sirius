@@ -503,7 +503,8 @@ void wrap_top_n(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
 //! restored on MERGE_SORT via `set_final_projections`. SORT_SAMPLE is a non-sink, so it lands
 //! in `operators[]` of the SORT_PARTITION pipeline (3-pipeline shape, matching legacy).
 void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
-                   const sirius::operator_params& op_params)
+                   const sirius::operator_params& op_params,
+                   duckdb::ClientContext& context)
 {
   wrap_above(slot, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> order_op) {
     auto* order_ptr = &order_op->Cast<sirius::op::sirius_physical_order>();
@@ -523,11 +524,22 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
     order_ptr->projections = std::move(identity_proj);
     order_ptr->types       = child_types;
 
+    // The live-query registry lets SORT_SAMPLE size its partitions against a per-query share of
+    // free GPU memory instead of the whole device (F6). SiriusContext owns the registry and
+    // outlives every plan (plans are parked on the context and destroyed by its cleanup paths),
+    // so the raw pointer cannot dangle.
+    auto sirius_ctx = context.registered_state
+                        ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                        : nullptr;
+    const sirius::exec::query_lifecycle_registry* lifecycle =
+      sirius_ctx ? &sirius_ctx->get_query_lifecycle_registry() : nullptr;
+
     auto sample = duckdb::make_uniq<sirius::op::sirius_physical_sort_sample>(
       order_ptr,
       op_params.sort_sample_bytes,
       op_params.max_sort_partition_bytes,
-      op_params.max_sort_partition_memory_fraction);
+      op_params.max_sort_partition_memory_fraction,
+      lifecycle);
     auto* sample_ptr = sample.get();
     sample->children.push_back(std::move(order_op));
 
@@ -753,7 +765,9 @@ void insert_gpu_pipeline_operators_recursive(
     case sirius::op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE:
       wrap_ungrouped_aggregate(slot);
       break;
-    case sirius::op::SiriusPhysicalOperatorType::ORDER_BY: wrap_order_by(slot, op_params); break;
+    case sirius::op::SiriusPhysicalOperatorType::ORDER_BY:
+      wrap_order_by(slot, op_params, context);
+      break;
     case sirius::op::SiriusPhysicalOperatorType::TOP_N: wrap_top_n(slot); break;
     case sirius::op::SiriusPhysicalOperatorType::HASH_JOIN:
     case sirius::op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN:

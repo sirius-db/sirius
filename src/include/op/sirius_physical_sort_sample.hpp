@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "exec/query_lifecycle_registry.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_order.hpp"
 #include "sirius_config.hpp"
@@ -37,7 +38,8 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
     sirius_physical_order* order_by,
     uint64_t sort_sample_bytes           = config::DEFAULT_SORT_SAMPLE_BYTES,
     uint64_t max_partition_bytes         = 0,
-    double max_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION);
+    double max_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION,
+    const sirius::exec::query_lifecycle_registry* lifecycle = nullptr);
 
   sirius_physical_sort_sample(
     duckdb::vector<sirius::logical_type> types,
@@ -45,7 +47,8 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
     std::size_t estimated_cardinality,
     uint64_t sort_sample_bytes           = config::DEFAULT_SORT_SAMPLE_BYTES,
     uint64_t max_partition_bytes         = 0,
-    double max_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION);
+    double max_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION,
+    const sirius::exec::query_lifecycle_registry* lifecycle = nullptr);
 
   //! Order specification (copied from ORDER_BY) — determines which columns to sample
   duckdb::vector<duckdb::BoundOrderByNode> orders;
@@ -107,6 +110,11 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
 
   //! Fraction of available GPU memory per partition (from sirius_config operator_params)
   double _max_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION;
+
+  //! Live-query registry (owned by SiriusContext, which outlives every plan). Used to divide the
+  //! whole-device free-memory read by the number of concurrently live queries when sizing
+  //! partitions (F6). nullptr (unit tests, no context) behaves as a single-query engine.
+  const sirius::exec::query_lifecycle_registry* _query_lifecycle = nullptr;
 };
 
 }  // namespace op

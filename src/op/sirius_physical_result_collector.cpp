@@ -44,6 +44,8 @@
 // standard library
 #include <algorithm>
 #include <cassert>
+#include <memory>
+#include <vector>
 
 namespace sirius {
 namespace op {
@@ -155,25 +157,43 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
           "[GPUPhysicalMaterializedCollector] No HOST memory space available for result "
           "collection");
       }
-      // Pick the host space with the most available memory.
+      // F6: reserve FIRST, then use whichever space granted the reservation. The previous shape
+      // (max_element over free bytes, then one make_reservation_or_null) let two concurrent
+      // collectors read the same free-byte snapshot, pick the same space, and race for it — the
+      // loser fell to the unreserved path even when another host space had room. Probing the
+      // candidates in most-free-first order means concurrent collectors spread across spaces,
+      // and the unreserved fallback below remains only for genuine exhaustion of EVERY space.
       /// TODO: prefer the NUMA-closest host space to the source GPU for locality.
-      auto const* mem_space =
-        *std::max_element(host_spaces.begin(), host_spaces.end(), [](auto const* a, auto const* b) {
-          return a->get_available_memory() < b->get_available_memory();
+      std::vector<cucascade::memory::memory_space const*> candidates(host_spaces.begin(),
+                                                                     host_spaces.end());
+      std::sort(
+        candidates.begin(),
+        candidates.end(),
+        [](cucascade::memory::memory_space const* a, cucascade::memory::memory_space const* b) {
+          return a->get_available_memory() > b->get_available_memory();
         });
 
       auto& registry     = sirius::converter_registry::get();
       auto next_batch_id = sirius::get_next_batch_id();
 
-      auto host_reservation =
-        const_cast<cucascade::memory::memory_space*>(mem_space)->make_reservation_or_null(
-          data->get_size_in_bytes());
+      cucascade::memory::memory_space const* mem_space = candidates.front();
+      std::unique_ptr<cucascade::memory::reservation> host_reservation;
+      for (auto const* candidate : candidates) {
+        host_reservation =
+          const_cast<cucascade::memory::memory_space*>(candidate)->make_reservation_or_null(
+            data->get_size_in_bytes());
+        if (host_reservation != nullptr) {
+          mem_space = candidate;
+          break;
+        }
+      }
 
       // clone_to: creates new batch with data converted to host_data_representation
       if (host_reservation == nullptr) {
         SIRIUS_LOG_WARN(
-          "sirius_physical_materialized_collector: host reservation failed for batch {} ({} "
-          "bytes) — proceeding without reservation, converter may OOM",
+          "sirius_physical_materialized_collector: host reservation failed on all {} host "
+          "space(s) for batch {} ({} bytes) — proceeding without reservation, converter may OOM",
+          candidates.size(),
           ro.get_batch_id(),
           data->get_size_in_bytes());
       }

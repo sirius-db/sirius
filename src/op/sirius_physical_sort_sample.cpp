@@ -66,16 +66,19 @@ bool repo_has_enough_sample_bytes(::cucascade::shared_data_repository* repo,
 
 }  // namespace
 
-sirius_physical_sort_sample::sirius_physical_sort_sample(sirius_physical_order* order_by,
-                                                         uint64_t sort_sample_bytes,
-                                                         uint64_t max_partition_bytes,
-                                                         double max_partition_memory_fraction)
+sirius_physical_sort_sample::sirius_physical_sort_sample(
+  sirius_physical_order* order_by,
+  uint64_t sort_sample_bytes,
+  uint64_t max_partition_bytes,
+  double max_partition_memory_fraction,
+  const sirius::exec::query_lifecycle_registry* lifecycle)
   : sirius_physical_sort_sample(order_by->types,
                                 copy_orders(order_by->orders),
                                 order_by->estimated_cardinality,
                                 sort_sample_bytes,
                                 max_partition_bytes,
-                                max_partition_memory_fraction)
+                                max_partition_memory_fraction,
+                                lifecycle)
 {
 }
 
@@ -85,13 +88,15 @@ sirius_physical_sort_sample::sirius_physical_sort_sample(
   std::size_t estimated_cardinality,
   uint64_t sort_sample_bytes,
   uint64_t max_partition_bytes,
-  double max_partition_memory_fraction)
+  double max_partition_memory_fraction,
+  const sirius::exec::query_lifecycle_registry* lifecycle)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::SORT_SAMPLE, std::move(types), estimated_cardinality),
     orders(std::move(orders)),
     _sort_sample_bytes(sort_sample_bytes),
     _max_partition_bytes_override(max_partition_bytes),
-    _max_partition_memory_fraction(max_partition_memory_fraction)
+    _max_partition_memory_fraction(max_partition_memory_fraction),
+    _query_lifecycle(lifecycle)
 {
 }
 
@@ -263,7 +268,17 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
         total_batch_count = (estimated_cardinality + avg_rows_per_batch - 1) / avg_rows_per_batch;
         bytes_for_sizing  = avg_batch_bytes * total_batch_count;
       }
-      size_t available_memory    = space->get_available_memory(stream);
+      // F6: get_available_memory() reads WHOLE-DEVICE free bytes. Two concurrent sorts would each
+      // budget a fraction of the SAME free memory and overshoot together. Divide by the number of
+      // live queries (query_lifecycle_registry: open + quiescing) as a conservative per-query
+      // bound: each sort sizes against at most its 1/N share, yielding more, smaller partitions
+      // under concurrency — slower, but every query completes instead of colliding in OOM.
+      // Single-query behavior (live_queries == 1, or no registry wired in unit tests) is
+      // unchanged. A reserved per-query budget would be tighter; no such budget exists yet at
+      // sizing time (reservations are per-task and made after sizing).
+      size_t const live_queries =
+        _query_lifecycle ? std::max<size_t>(size_t{1}, _query_lifecycle->size()) : size_t{1};
+      size_t available_memory    = space->get_available_memory(stream) / live_queries;
       size_t max_partition_bytes = _max_partition_bytes_override > 0
                                      ? _max_partition_bytes_override
                                      : static_cast<size_t>(static_cast<double>(available_memory) *
@@ -278,7 +293,8 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
         "Sort sample: complete_input={}, estimated_cardinality={}, total_rows={}, "
         "avg_rows_per_batch={}, "
         "avg_batch_bytes={}, total_batch_count={}, "
-        "bytes_for_sizing={}, available_memory={}, max_partition_bytes={}, num_partitions={}",
+        "bytes_for_sizing={}, live_queries={}, available_memory={} (per-query share), "
+        "max_partition_bytes={}, num_partitions={}",
         complete_input,
         estimated_cardinality,
         total_rows,
@@ -286,6 +302,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
         avg_batch_bytes,
         total_batch_count,
         bytes_for_sizing,
+        live_queries,
         available_memory,
         max_partition_bytes,
         num_parts);
