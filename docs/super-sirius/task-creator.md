@@ -6,17 +6,17 @@ This document covers the task creation subsystem: how the system decides when an
 
 **File:** `src/include/creator/task_creator.hpp`, `src/creator/task_creator.cpp`
 
-The `task_creator` is a multi-threaded component that converts operator scheduling requests into concrete scan or GPU pipeline tasks. It maintains global state maps for each operator type and uses a hint-chain recursion to find the deepest ready operator.
+The `task_creator` is a multi-threaded component, shared by every in-flight query, that converts operator scheduling requests into concrete GPU pipeline tasks. It holds an entry of per-query state per in-flight query and uses a hint-chain recursion to find the deepest ready operator.
 
 ## Core Flow
 
 ```
 schedule(operator*)
-    ↓
-_task_creation_queue.push(request)
-    ↓
-manager_loop() picks up request
-    ↓
+    ↓  (refused if the query is quiescing — query_lifecycle_registry gate)
+_task_creation_queue.push(request)     — a multi_index_priority_queue: ordered like the
+    ↓                                    execution queue, indexed by query id
+manager_loop() picks up request (fair pop across query bands)
+    ↓  resolves the query's state shared_ptr, attaches the pool slot to the query
 get_operator_for_next_task(operator) — follows hint chain
     ↓
 operator->get_next_task_hint() → READY or WAITING_FOR_INPUT_DATA
@@ -26,15 +26,25 @@ Create task (gpu_pipeline_task)
 Dispatch to executor (task_scheduler)
 ```
 
-## Global State Maps
+Each `task_creation_request` carries its `query_id`, its pipeline's `queue_priority`, and its
+operator type — all resolved at `schedule()` time so the queue's key extractor never dereferences
+an operator that a racing teardown may have freed.
 
-Initialized during `prepare_for_query()`, cleared during `reset()`:
+## Per-Query State
 
-| Map | Key | Value | Purpose |
-|-----|-----|-------|---------|
-| `_gpu_operator_global_state_map` | operator ID | `gpu_pipeline_task_global_state` | Shared per-operator pipeline state |
+`prepare_for_query(query, handler)` registers one `query_task_global_state` entry for the query
+(it does not touch other queries' entries); `reset(query_id)` drops exactly that entry. The
+entries live in `_query_task_global_states` (a map keyed by query id, guarded by
+`_global_state_mutex`) and are handed out as `shared_ptr`, so a worker's resolved copy stays
+alive even if the query is reset mid-flight. Each entry holds:
 
-All map access is protected by `_global_state_mutex`.
+| Member | Purpose |
+|--------|---------|
+| `global_states` | Source operator id → that pipeline's `gpu_pipeline_task_global_state`. Written once by `prepare_for_query`, read-only afterwards. Operator ids restart at 0 per query, so the map is only unique *within* an entry |
+| `client_context` | The connection running this query (bound by `set_client_context` at window begin) |
+| `completion_handler` | This query's completion signal, for the creation-failure path |
+| `lookahead_queue` / `lookahead_mutex` | Not-yet-activated scans for the lookahead rotation (see below) |
+| `active_gpu_ids` / `full_gpu_count` | The GPU subset THIS query was admitted onto (see Device Assignment) |
 
 ## `TaskCreationHint` Enum
 
@@ -188,16 +198,25 @@ Same pattern as MERGE_SORT: drains all batches from one partition per call.
 
 ### Scan Scheduling Strategy
 
-At query startup, at most 2 scans are scheduled initially. In the manager loop, scan exhaustion (continuous creation to deplete the source) only runs when `_num_scans_in_plan == 1` — to maximize I/O parallelism for single-table scans. For plans with 2+ scans, the `get_next_task_hint()` topology-driven mechanism controls task creation, avoiding excessive memory consumption from eagerly scanning all tables.
+At query startup, `task_scheduler::start_query()` schedules exactly the query's **first** scan
+operator. Further scans are activated by the `get_next_task_hint()` topology-driven mechanism
+(avoiding excessive memory consumption from eagerly scanning all tables) and by the lookahead
+warm-up below, which fires only when the scheduler queue is empty while devices are idle.
 
 ```
 while running:
-    1. thread_pool.reserve()              -- wait for thread availability (bounded_thread_pool slot)
-    2. _task_creation_queue.pop()         -- get next scheduling request
-    3. node = get_operator_for_next_task(request.node)  -- follow hint chain
-    4. if node is nullptr: continue
+    1. _bounded_pool.reserve()            -- wait for thread availability (bounded_thread_pool slot)
+    2. _task_creation_queue.pop()         -- next scheduling request (fair pop across query bands)
+    3. state = get_query_task_global_state(request.query_id)
+       -- nullptr means the query was reset while the request sat queued: drop it,
+          request.node may already dangle
+    4. slot.attach(request.query_id)      -- count the slot against this query BEFORE touching
+                                             the operator, so drain_pending_tasks(query_id)
+                                             cannot return while the walk is in progress
+    5. node = get_operator_for_next_task(request.node)  -- follow hint chain
+    6. if node is nullptr: re-evaluate visited pipelines' status; continue
 
-    5. Schedule work on the thread pool. Every source — a GPU_SCAN scan or any
+    7. Dispatch work to the pool. Every source — a GPU_SCAN scan or any
        GPU operator with buffered input — drives the same loop:
            - Loop while (!node.all_ports_empty()):
              - pipeline.mark_task_created()  // BEFORE popping data
@@ -207,6 +226,17 @@ while running:
 ```
 
 The `mark_task_created()` call before data popping prevents a race condition where the pipeline could appear finished between data check and task creation.
+
+### Lookahead scan warm-up
+
+`schedule_lookahead()` warms up one not-yet-activated scan of a live query when the scheduler's
+queue runs dry (called from `task_scheduler::management_eventloop`). It rotates round-robin
+across the queries that still accept work (register D3 — it used to hard-code the oldest entry,
+so every newer query started cold); a query with nothing warmable, or one quiescing per the
+lifecycle registry, does not pin the rotation. The walk-and-push for one query runs under that
+query's `lookahead_mutex`, which — together with `drain_pending_tasks()` clearing the lookahead
+queue under the same mutex *before* its request drain — makes the operator dereferences safe
+against the query's teardown.
 
 ## Device Assignment for GPU Tasks
 
@@ -219,18 +249,18 @@ When the manager loop builds a `gpu_pipeline_task`, it also chooses the task's `
 Partitioned operators — BUILD_PROBE hash join, `grouped_aggregate_merge`, and the other partition-keyed operators above — build a per-partition cuco hash table that is valid only on the GPU it was built on. Touching it from a stream bound to another device trips `cudaErrorInvalidValue`. So when a task's input is a `partitioned_operator_data`, the task creator pins it to a fixed device:
 
 ```
-preferred_device_id = _active_gpu_ids[ partition_idx % _active_gpu_ids.size() ]
+preferred_device_id = active_gpu_ids[ partition_idx % active_gpu_ids.size() ]
 ```
 
 This keeps every task of a given partition (build + all probes) on one GPU while spreading partitions across GPUs.
 
-`_active_gpu_ids` starts as every device with a GPU executor — the memory manager's `Tier::GPU` memory spaces, the same set `task_scheduler` keys executors on — and is then narrowed per query: `sirius_engine::initialize_internal` computes the admitted subset and installs it via `set_active_gpu_ids()` before any pipeline is built. The pin indexes this set rather than the physical hardware topology, for two reasons. A physical-topology modulo could name a device with no executor, which the scheduler treats as "no preference" and round-robins — scattering a partition across GPUs. And a query admitted onto a subset must not pin work to a device outside it.
+`active_gpu_ids` is **per query** — a member of the query's `query_task_global_state`, not of the shared creator (on a shared creator, a member would let one query's narrowing clamp another query's tasks onto GPUs it was never admitted to). It is seeded at registration from `_default_gpu_ids` — every device with a GPU executor, i.e. the memory manager's `Tier::GPU` memory spaces, the same set `task_scheduler` keys executors on — and is then narrowed per query: `sirius_engine::initialize_internal` computes the admitted subset and installs it via `set_active_gpu_ids(query_id, ids, full_count)` before any pipeline is built. The pin indexes this set rather than the physical hardware topology, for two reasons. A physical-topology modulo could name a device with no executor, which the scheduler treats as "no preference" and round-robins — scattering a partition across GPUs. And a query admitted onto a subset must not pin work to a device outside it.
 
 Because the same list is used to build `pipeline_build_context`, the partition floor and the broadcast-join device→slot map agree with what the pin routes across. See [configuration.md](configuration.md) for `topology.gpus_per_query`.
 
-The other device preferences the task creator computes — the operator's own hint, GPU-resident byte counts, NUMA locality via `gpus_of()`, and a cached chunk's home device — are all derived from where data already lives and can name a device outside the admitted subset. They are clamped back into `_active_gpu_ids` at the point the preference is written to the task's local state.
+The other device preferences the task creator computes — the operator's own hint, GPU-resident byte counts, NUMA locality via `gpus_of()`, and a cached chunk's home device — are all derived from where data already lives and can name a device outside the admitted subset. They are clamped back into the query's `active_gpu_ids` at the point the preference is written to the task's local state.
 
-A task with no preference at all is confined the same way, but only when the query was admitted onto a strict subset. The scheduler hands an unpreferred task to whichever executor asks first, excluded ones included (a GPU_VALUES task carries no device-bound state and so sets no preference), so on a subset those tasks are pinned round-robin over `_active_gpu_ids`. Pinning costs the scheduler's freedom to place the task on whatever device frees up first, so it is skipped when nothing was narrowed away and there is nothing to confine.
+A task with no preference at all is confined the same way, but only when the query was admitted onto a strict subset. The scheduler hands an unpreferred task to whichever executor asks first, excluded ones included (a GPU_VALUES task carries no device-bound state and so sets no preference), so on a subset those tasks are pinned round-robin over the query's `active_gpu_ids`. Pinning costs the scheduler's freedom to place the task on whatever device frees up first, so it is skipped when nothing was narrowed away and there is nothing to confine.
 
 The pin is reapplied on the OOM-reschedule path (`gpu_pipeline_executor`): when a task is rebuilt with a fresh local state, its per-task `preferred_device_id` is carried forward so a rescheduled probe doesn't lose its pin and scatter.
 
@@ -242,13 +272,26 @@ These methods signal task exhaustion:
 
 Both throw `not implemented` in the base class and must be overridden by operators that need them.
 
-## `drain_pending_tasks()`
+## `drain_pending_tasks(query_id)` and `reset(query_id)`
 
 **File:** `src/creator/task_creator.cpp`
 
-Called during `drain_after_error()` to cleanly shut down:
-1. `_task_creation_queue.drain()` — clears pending requests
-2. `_kiosk.wait_all()` — waits for in-flight task creation lambdas to complete
+`drain_pending_tasks(query_id)` is per query — other queries' pending requests and in-flight
+creation work are untouched. Called from both the success path
+(`task_scheduler::wait_for_completion`) and the error path (`drain_after_error`); `reset(query_id)`
+runs it and then drops the query's state entry. Order is load-bearing:
+
+1. Clear the query's **lookahead queue** under its `lookahead_mutex` — before the request drain,
+   so a racing `schedule_lookahead()` walk either lands its push ahead of the drain (dropped) or
+   finds the queue empty (register D3's teardown-safety half)
+2. `_task_creation_queue.drain(query_index{query_id})` — drops this query's pending requests
+3. `_bounded_pool->drain_and_wait(query_id)` — waits for this query's in-flight creation lambdas
+   (the pool tracks in-flight work per query via the slots attached in `manager_loop`)
+
+`reset(query_id)` must complete before the query's `planner::query`/plan is destroyed: queued
+requests hold raw operator pointers into the plan. `SiriusContext::run_mandatory_cleanup` calls it
+first, while the parked plan is still alive (see
+[Concurrency Model](concurrency-model.md#query-end-the-mandatory-cleanup)).
 
 ## Key Files
 

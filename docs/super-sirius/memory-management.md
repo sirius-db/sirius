@@ -105,21 +105,21 @@ The monitor is not on the correctness-critical path: the pipeline executor drive
 
 The downgrade executor uses a request-based model with tiered candidate fetching:
 
-1. Caller invokes `request_downgrade(predicate)` which constructs a `downgrade_request` and pushes it onto the MPMC queue. Returns `std::future<size_t>`.
+1. Caller invokes `request_downgrade(query_id, predicate)` which constructs a `downgrade_request` and pushes it onto the MPMC queue. Returns `std::future<size_t>`. The `query_id` attributes the request to the query whose waiter blocks on the future, so that query's end-of-window `drain(query_id)` can fail exactly its promises and no one else's; unattributed callers (the monitor, byte-target requests) use `make_query_id(0)`.
 2. The processing thread dequeues requests **sequentially** (to avoid contention between concurrent requests competing for the same batches).
 3. For each request, the processing loop fetches candidates lazily in tiered order:
-   - **Tier 1 (data repositories):** Creates a `convertible_data_batch_provider` per repository and fetches idle GPU-resident batches one at a time
-   - **Tier 2 (task_scheduler queue):** Creates a `convertible_gpu_pipeline_task_provider` to extract tasks with convertible data batches from the pipeline-level task queue
+   - **TIER 1 (data repositories):** sweeps every in-flight query's repository manager (registry snapshot, newest query first — see [Concurrency Model](concurrency-model.md#memory-pressure)), creating a `convertible_data_batch_provider` per repository and fetching idle GPU-resident batches one at a time. The sweep holds the registry's sweep token, fencing the borrowed raw repository pointers against a concurrent query teardown.
+   - **TIER 2 (task_scheduler queue):** Creates a `convertible_gpu_pipeline_task_provider` to extract tasks with convertible data batches from the pipeline-level task queue
 4. Each candidate is dispatched to the `bounded_thread_pool` and converted via `convertible_data::convert()`. After each conversion, the `predicate` is evaluated. If it returns `true`, no new candidates are dispatched (in-flight conversions finish naturally). The promise resolves with total bytes freed.
 
-**Pipeline integration:** When `gpu_pipeline_executor` gets a partial memory reservation (shortfall), it issues a single `request_downgrade(predicate)` where the predicate attempts `make_reservation_or_null(bytes_needed)`. The downgrade stops as soon as the reservation succeeds -- single request, no over-freeing.
+**Pipeline integration:** When `gpu_pipeline_executor` gets a partial memory reservation (shortfall), it issues a single `request_downgrade(query_id, predicate)` where the predicate attempts `make_reservation_or_null(bytes_needed)`. The downgrade stops as soon as the reservation succeeds -- single request, no over-freeing. The wait runs on a pool worker, never on the executor's manager thread (register C4).
 
 ### Candidate Selection Strategy
 
 Candidates are fetched lazily via `convertible_data_provider` implementations:
 
-1. **Data repositories** are iterated in repository manager order. Within each repository, `convertible_data_batch_provider` iterates partitions back-to-front, then batches back-to-front, filtering for idle batches in the source memory space.
-2. **Pipeline task queue** is inspected via `convertible_gpu_pipeline_task_provider`, which uses `mutable_pop_if` to temporarily extract tasks with matching data batches. Tasks are returned to the queue via RAII on all code paths.
+1. **Data repositories** are iterated newest-query-first across managers (see above). Within each repository, `convertible_data_batch_provider` iterates partitions back-to-front, then batches back-to-front, filtering for idle batches in the source memory space.
+2. **Pipeline task queue** is inspected via `convertible_gpu_pipeline_task_provider`, which uses `mutable_pop_if` to temporarily extract tasks with matching data batches. The wrapper captures the task's `exec::index_keys` at extraction time and, on RAII drop, consults the query-lifecycle gate: a still-live query's task is re-pushed with those keys verbatim; a quiescing query's task is destroyed instead of resurrected (register B1).
 
 Candidates are converted individually via `convertible_data::convert()`, which handles state locking, memory reservation, tier conversion, and failure rollback atomically.
 

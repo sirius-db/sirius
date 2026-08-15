@@ -53,19 +53,24 @@ Key methods on `data_batch`:
 
 ## Data Repositories
 
-Data repositories are thread-safe containers managed by the `shared_data_repository_manager`:
+Data repositories are thread-safe containers managed by a `shared_data_repository_manager`:
 
 - Keyed by `(operator_id, port_id)` pairs
 - Support partitioned storage (multiple partitions per repository)
 - Provide `add_data_batch()` for producers and `pop_next_data_batch()` for consumers (non-blocking; returns `nullptr` if empty)
 - Track total size and per-partition sizes
-- Registered centrally in `shared_data_repository_manager` for downgrade candidate selection
+- Registered in the query's `shared_data_repository_manager` for downgrade candidate selection
 
 ### `shared_data_repository_manager`
 
-Central registry of all repositories in query execution:
-- Provides `for_each_repository()` iterator for downgrade candidate selection
-- Thread-safe access to all active repositories
+Registry of one query's repositories. There is **one manager per in-flight query**, owned by
+`SiriusContext`'s `data_repository_manager_registry` and keyed by query id — operator ids restart
+at 0 for every query, so `(operator_id, port_id)` keys are only unique within a query (see
+[Concurrency Model](concurrency-model.md#per-query-state)). Key API:
+- `get_repositories()` — snapshot of raw repository pointers, used by the downgrade sweep for
+  candidate selection (valid only while the manager's repositories are fenced against teardown)
+- `get_repository_shared()` — locked, shared-ownership lookup of one repository
+- `clear_all_repositories()` — teardown, reporting repositories that still held batches
 
 ## Port System
 

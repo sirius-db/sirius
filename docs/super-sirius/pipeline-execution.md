@@ -293,10 +293,17 @@ sub-executor or scan-priority queue owned here.
 |--------|---------|
 | `start()` | Starts every GPU executor, then launches the management thread |
 | `stop()` | Interrupts/closes scheduler channels, joins the management thread, then stops GPU executors |
-| `prepare_for_query(query)` | Drains executor leftovers, installs query/completion state, and resets per-query scheduler state |
-| `start_query()` | Schedules `query.get_scan_operators().front()` through `task_creator` and returns the completion future |
-| `terminate_query(exception)` | Reports error to completion handler |
-| `drain_after_error()` | Multi-stage drain for clean shutdown |
+| `start_query(query)` | Schedules `query.get_scan_operators().front()` through `task_creator`; completion is signalled through the query's own `completion_handler`, which its `sirius_engine` owns |
+| `terminate_query(handler, error)` | Reports the error to that one query's completion handler; other in-flight queries keep running |
+| `drain_query_tasks(query_id)` | Drops one query's queued tasks from the scheduler queue and every GPU executor's queue, leaving other queries' work in place |
+| `wait_for_completion(query_id)` | Success path: quiesces the query in the lifecycle registry, validates its queues are empty (throws if not), waits out in-flight executor work |
+| `drain_after_error(query_id)` | Error path: per-query multi-stage drain (see below) |
+| `set_query_lifecycle_registry(registry)` | Binds the per-query enqueue gate, propagated to every GPU executor |
+
+Per-query state is no longer installed here: `task_creator::prepare_for_query(query, handler)`
+registers the query's task-creation state (see [Task Creator](task-creator.md)), and the
+scheduler is stateless across queries apart from its queue. The per-query lifecycle is
+documented in [Concurrency Model](concurrency-model.md).
 
 ### Management Event Loop
 
@@ -307,21 +314,31 @@ task. Ready devices remain recorded until a compatible task arrives:
 ```
 while running:
     1. Wait for device_ready or task_available; drain the current event burst
-    2. For each ready device, select a compatible queued task:
+    2. If the queue is empty and devices are idle: task_creator.schedule_lookahead()
+       (warm up one not-yet-activated scan, rotating across live queries)
+    3. For each ready device, select a compatible queued task:
        a. exact preferred-device match
        b. unpreferred task (or one with a stale preference)
-    3. Dispatch the selected task to that device's GPU executor
+    4. Dispatch the selected task to that device's GPU executor
 ```
 
 Tasks stay in the top-level queue until a ready device can accept them, preserving visibility to
 the downgrade machinery. A live preferred device is binding because the task may reference
 device-local data.
 
+The queue itself is an `exec::multi_index_priority_queue` whose dispatch pops round-robin across
+query bands (register F1) — within one query the strict priority order holds, but across queries
+the pop rotates over live query ids so an earlier-admitted query cannot starve a later one. See
+[Concurrency Model](concurrency-model.md#scheduling) for the fairness contract.
+
 ### Initial Scan Scheduling
 
 `start_query()` schedules exactly the first operator in `query.get_scan_operators()`. Subsequent
 work is exposed by task hints and completion-driven downstream scheduling; there is no
-`schedule_next_scan_tasks()` or `_priority_scans` walk.
+`schedule_next_scan_tasks()` or `_priority_scans` walk. When the scheduler queue runs empty while
+devices are idle, the event loop calls `task_creator::schedule_lookahead()`, which warms up one
+not-yet-activated scan of a live query, rotating round-robin across the queries that still accept
+work (see [Task Creator](task-creator.md#lookahead-scan-warm-up)).
 
 ### Dynamic-filter independence
 
@@ -345,43 +362,60 @@ One `gpu_pipeline_executor` exists per GPU device. It manages a thread pool for 
 
 ### Executor Class Hierarchy
 
-`gpu_pipeline_executor` inherits from `itask_executor`, which provides shared infrastructure: thread pool, task queue, `_running` flag, and `start/stop/schedule/drain_and_wait` lifecycle methods. Subclasses implement `manager_loop()` (required) and optional hooks `get_per_thread_init`, `on_start`, `on_stop`.
+`gpu_pipeline_executor` inherits from `itask_executor`, which provides shared infrastructure: thread pool, task queue, `_running` flag, and `start/stop/schedule/drain_and_wait` lifecycle methods, plus the per-query variants `drain_query_tasks(query_id)`, `wait_and_validate_empty(query_id)` (success path) and `wait_and_drain_query(query_id)` (error path). Subclasses implement `manager_loop()` (required) and optional hooks `get_per_thread_init`, `on_start`, `on_stop`. `itask_executor::schedule()` consults the query-lifecycle gate and silently refuses work for a quiescing query — the OOM reschedule path re-enters it from a worker thread long after a drain may have passed. A push bounced by a *transient* queue interruption (a peer query's error-path quiesce bracket) is retried via `push_or_bounce` rather than dropped; only a real shutdown drops it, loudly.
 
-Concurrency is managed via `exec::bounded_thread_pool`, which uses a two-phase `reserve() -> pool.dispatch(slot, fn)` model with RAII slot release.
+Concurrency is managed via `exec::bounded_thread_pool`, which uses a two-phase `reserve() -> pool.dispatch(slot, fn)` model with RAII slot release; slots are attributed to a query (`slot.attach(query_id)`) so per-query drains can wait on exactly that query's in-flight work.
 
 ### Components
 
 | Component | Type | Purpose |
 |-----------|------|---------|
-| `_thread_pool` | `exec::bounded_thread_pool` | Worker threads (default: 4), each pinned to GPU device, with slot-based concurrency control |
-| `_task_queue` | `interruptible_mpmc<itask>` | Thread-safe queue for incoming tasks |
+| `_bounded_pool` | `exec::bounded_thread_pool` | Worker threads (default: 4), each pinned to GPU device, with slot-based concurrency control and per-query slot attribution (`slot.attach(query_id)`) |
+| `_task_queue` | `exec::multi_index_priority_queue<itask>` | Priority queue for incoming tasks, indexed by query so one query's staged work can be dropped without touching another's |
 | `_manager_thread` | `std::thread` | Runs `manager_loop()` |
 | `_stream_pool` | `exclusive_stream_pool` | Pool of CUDA streams, one per worker |
 | `_memory_space` | `memory_space*` | GPU memory for making reservations |
 | `_task_request_publisher` | `publisher<task_request>` | Channel to signal pipeline executor |
 | `_task_creator` | `task_creator*` | For scheduling downstream consumer tasks |
-| `_completion_handler` | `completion_handler*` | For signaling query completion |
+| `_memory_waiter_parked` | `std::atomic<bool>` | The executor's single memory-wait slot (register C4, see below) |
+
+There is no per-executor completion handler: each task carries its own query's
+`completion_handler` in its global state (stamped by `task_creator::prepare_for_query`), and the
+executor resolves it per task (`gpu_pipeline_task::get_completion_handler()`).
 
 ### Manager Loop
 
+The manager thread never blocks on memory (register C4): it only pops, attributes, and
+dispatches. The reservation — and any downgrade round trip it triggers — runs inside the
+dispatched worker (`prepare_and_execute`), where the pool's per-query slot accounting covers it.
+
 ```
-while running:
-    1. thread_pool.reserve()              -- block until a worker slot is available (RAII)
-    2. task_request_publisher.send()      -- tell pipeline executor we can accept work
-    3. task_queue.pop()                   -- block until a task is available
-    4. clamp request to get_max_memory()  -- bound the history-based estimate by the space limit
-    5. memory_space.make_reservation()    -- reserve GPU memory for the task
-    6. task.set_reservation(reservation)  -- attach reservation to task
-    7. stream_pool.acquire_stream()       -- get a CUDA stream
-    8. thread_pool.dispatch(slot, lambda): -- dispatch to worker (slot released on completion)
-         a. task.execute(stream)
-         b. On OOM: retry (see below)
-         c. On success: check query completion
-         d. Schedule downstream consumers via task_creator
-         e. Or: completion_handler.mark_completed()
+manager_loop (manager thread):
+    1. bounded_pool.reserve()             -- block until a worker slot is available (RAII)
+    2. task_request_publisher.send()      -- publish device_ready to the task_scheduler
+    3. task_queue.pop()                   -- block until a task is available (fair pop, F1)
+    4. process_task():                    -- resolve the task's completion handler,
+                                             slot.attach(query_id), dispatch to a worker
+
+prepare_and_execute (pool worker):
+    5. clamp request to get_max_memory()  -- bound the history-based estimate by the space limit
+    6. memory_space.make_reservation()    -- reserve GPU memory (may block / trigger downgrade)
+    7. task.set_reservation(reservation)  -- attach reservation to task
+    8. stream_pool.acquire_stream()       -- get a CUDA stream
+    9. task.execute(stream)
+         a. On OOM: retry (see below)
+         b. On success: check query completion
+         c. Schedule downstream consumers via task_creator
+         d. Or: completion_handler.mark_completed()
 ```
 
-The reservation request size comes from the task's memory-history estimate (`peak_memory_estimate + bytes_to_materialize_input`). Before reserving, the manager loop clamps this request to the memory space's reservation limit (`memory_space::get_max_memory()`). The estimate can extrapolate far past GPU capacity — a small input that once drove a near-capacity peak yields a large `peak/estimated` ratio. An unclamped over-limit request would receive only a partial reservation from `make_reservation()`, while the predicate-based downgrade that follows requires reserving the **full** requested size, which the space can never grant — livelocking the task through the OOM-reschedule loop until the retry cap trips. Clamping to `get_max_memory()` loses no reservable memory (`make_reservation()` already caps there) and keeps both the reservation and the downgrade target achievable; per-batch overflow during execution is still handled by the OOM-reschedule + tiering path.
+At most **one** task per executor may park in a blocking memory wait (`_memory_waiter_parked` —
+the historical one-blocking-reservation-per-device arbitration). A task that needs to wait while
+the slot is taken is re-queued through the executor's own queue after a 10 ms worker-held backoff
+(`executor_metrics::tasks_requeued_on_memory_wait` counts these), so a memory-hungry query cannot
+fill every worker slot with parked waits either. Re-queues never consume the OOM retry budget.
+
+The reservation request size comes from the task's memory-history estimate (`peak_memory_estimate + bytes_to_materialize_input`). Before reserving, the worker clamps this request to the memory space's reservation limit (`memory_space::get_max_memory()`). The estimate can extrapolate far past GPU capacity — a small input that once drove a near-capacity peak yields a large `peak/estimated` ratio. An unclamped over-limit request would receive only a partial reservation from `make_reservation()`, while the predicate-based downgrade that follows requires reserving the **full** requested size, which the space can never grant — livelocking the task through the OOM-reschedule loop until the retry cap trips. Clamping to `get_max_memory()` loses no reservable memory (`make_reservation()` already caps there) and keeps both the reservation and the downgrade target achievable; per-batch overflow during execution is still handled by the OOM-reschedule + tiering path.
 
 ### Downstream Scheduling
 
@@ -429,29 +463,45 @@ When a GPU operator runs out of memory during execution, it throws `oom_reschedu
 The GPU executor catches this and:
 
 1. Checks if the completion handler already has an error (skip if so)
-2. Increments `retry_count` (max 10 retries, `MAX_OOM_RETRIES`)
+2. Increments `retry_count` and checks it against the per-query retry cap: the pipeline's
+   `reservation_max_retries()`, stamped onto `pipeline_build_context` from the admission-time
+   config snapshot (`operator_params.gpu_reservation_max_retries`, default 100 —
+   `exec::default_gpu_reservation_max_retries`; settable via YAML and
+   `SET gpu_reservation_max_retries`)
 3. Logs the retry attempt
 4. Marks the original task as rescheduled (skips pipeline completion tracking)
 5. Transitions intermediate data from idle to `task_created` state
-6. Creates a new rescheduled task via `create_rescheduled_task()` virtual factory
-7. Sleeps 5ms for backoff
+6. Creates a new rescheduled task via `create_rescheduled_task()` virtual factory, carrying the
+   per-task device pin forward (a rescheduled partition task must not scatter to another GPU)
+7. Sleeps 50 ms for backoff (rides out cross-GPU batch-lock contention as well as true OOM)
 8. Reschedules the new task back through the manager loop
 
-If max retries are exceeded, the error propagates and terminates the query.
+If the cap is exceeded, the error is reported to that query's own completion handler and
+terminates only that query. C4 memory-wait re-queues do not count against this budget.
 
 ## Error Handling and Draining
 
 **File:** `src/pipeline/task_scheduler.cpp`
 
-`drain_after_error()` performs a multi-stage clean shutdown:
+`drain_after_error(query_id)` performs a per-query multi-stage drain — other in-flight queries
+keep producing and executing throughout:
 
-1. **Stop task creator threads** — prevents new tasks from being created
-2. **Drain task queue** — clears pending pipeline tasks
-3. **Drain GPU executors** — `drain_and_wait()` stops kiosk, interrupts queue, joins manager, waits for all in-flight tasks
-4. **Drain scan executor** — same pattern
-5. **Restart task creator** — prepares for the next query
+1. **Quiesce the query** — `query_lifecycle_registry::quiesce(query_id)` makes every enqueue
+   point refuse this query's work, so a completion callback cannot add work behind a drain that
+   already passed (this replaced stopping the shared task creator, which halted every query)
+2. **Drain the scheduler queue** — `_task_queue.drain(query_index{...})` drops this query's
+   queued pipeline tasks only
+3. **Drain GPU executors** — `wait_and_drain_query(query_id)` on each: waits out in-flight pool
+   work, then drops this query's staged tasks
+4. **Drain task creation** — `task_creator::drain_pending_tasks(query_id)` discards this query's
+   pending creation requests (they hold raw operator pointers into the plan about to die)
+5. **Final sweep** — one more `_task_queue.drain(query_index{...})`: a task completing during
+   the drains can have handed one more task to the queue before the gate refused its successor
 
-This ensures that when `drain_after_error()` returns, no tasks are referencing operators or data repositories that are about to be destroyed.
+This ensures that when `drain_after_error()` returns, no tasks of this query reference operators
+or data repositories that are about to be destroyed. The plan itself is destroyed even later, by
+`SiriusContext::run_mandatory_cleanup` — see
+[Concurrency Model](concurrency-model.md#query-end-the-mandatory-cleanup).
 
 ## Key Files
 
@@ -468,5 +518,7 @@ This ensures that when `drain_after_error()` returns, no tasks are referencing o
 | `src/include/pipeline/sirius_pipeline.hpp` | Pipeline structure |
 | `src/include/pipeline/sirius_pipeline_itask.hpp` | Task interface |
 | `src/include/pipeline/task_request.hpp` | Executor↔pipeline request |
-| `src/include/exec/bounded_thread_pool.hpp` | Slot-based thread pool with RAII concurrency control |
+| `src/include/exec/bounded_thread_pool.hpp` | Slot-based thread pool with RAII concurrency control and per-query slot attribution |
+| `src/include/exec/multi_index_priority_queue.hpp` | Priority queue with query/operator/device indexes and fair (round-robin-across-queries) dispatch pops |
+| `src/include/exec/query_lifecycle_registry.hpp` | Per-query enqueue gate (open → quiescing → closed) |
 | `src/include/parallel/task_executor.hpp` | `itask_executor` base class for all executors |

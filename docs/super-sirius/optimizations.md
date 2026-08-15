@@ -18,13 +18,13 @@ num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 
 **Config:** `hash_partition_bytes` (default: 512 MB)
 
-### Drain and Restart Task Creator (PR #479)
+### Drain and Restart Task Creator (PR #479, per-query since the concurrency work)
 
 **Motivation:** During pipeline executor drain (e.g., for error recovery or pipeline transitions), in-flight task creation must be safely completed before operator destruction.
 
-**Mechanism:** `drain_pending_tasks()` drains the task creation queue via `_task_creation_queue.drain()` and waits for in-flight task creation lambdas via `_kiosk.wait_all()`.
+**Mechanism:** `drain_pending_tasks(query_id)` clears the query's lookahead queue (under its `lookahead_mutex`, before the request drain), drops that query's pending requests via `_task_creation_queue.drain(query_index{...})`, and waits for its in-flight creation lambdas via the bounded pool's per-query accounting (`_bounded_pool->drain_and_wait(query_id)`). Other queries' requests and in-flight work are untouched; the original whole-creator drain (queue drain + pool-wide wait) survives only in `stop()`/teardown.
 
-**Code path:** `src/creator/task_creator.cpp` — `drain_pending_tasks()`
+**Code path:** `src/creator/task_creator.cpp` — `drain_pending_tasks()`, `reset()`
 
 ### 3-Phase Sort Pipeline (PR #866)
 
@@ -108,15 +108,13 @@ Only applies to INNER and LEFT joins with pure equality conditions (excludes IS 
 
 **Code path:** `src/planner/sirius_plan_comparison_join.cpp` — `prove_unique_columns()`, `src/op/sirius_physical_hash_join.cpp` — distinct hash table construction
 
-### Scan Scheduling Tuning (PR #507)
+### Scan Scheduling Tuning (PR #507, since reshaped)
 
 **Motivation:** Eagerly depleting all scan sources at query startup wastes GPU memory on multi-scan plans (e.g., joins with two scanned tables).
 
-**Mechanism:** Two changes:
-1. At query startup, at most 2 scans are scheduled initially
-2. In `task_creator::manager_loop`, scan exhaustion (continuous creation) only runs when `_num_scans_in_plan == 1`. For 2+ scans, the `get_next_task_hint()` topology-driven mechanism controls task creation instead.
+**Mechanism (current form):** `task_scheduler::start_query()` schedules only the query's **first** scan; further scans are activated by the `get_next_task_hint()` topology-driven mechanism, plus the demand-driven lookahead warm-up — `task_creator::schedule_lookahead()` warms one not-yet-activated scan (rotating across live queries) only when the scheduler queue is empty while devices are idle. PR #507's original counters (`_num_scans_in_plan`, `schedule_next_scan_tasks()`) no longer exist.
 
-**Code path:** `src/creator/task_creator.cpp` — `manager_loop()`, `src/pipeline/task_scheduler.cpp` — `schedule_next_scan_tasks()`
+**Code path:** `src/pipeline/task_scheduler.cpp` — `start_query()`, `management_eventloop()`; `src/creator/task_creator.cpp` — `schedule_lookahead()`
 
 **Config:** `max_build_hash_table_bytes` (default: 500 MB) — now independent from `concat_batch_bytes`, enabling larger build sides in BUILD_PROBE mode without affecting other joins.
 
@@ -164,14 +162,13 @@ Both feed the same `resolve_mark_join_result()`, which scatters the match indice
 
 **Motivation:** GPU memory can be exhausted during complex queries with many concurrent pipelines.
 
-**Mechanism:** Downgrade executor monitors GPU memory space every ~10ms. When `downgrade_trigger_fraction` is exceeded, `run_downgrade_pass()` selects candidates:
-1. Partitioned repositories first, sorted by data size descending
-2. Non-active partitions before active ones
-3. Last-to-first partition iteration
+**Mechanism:** Each downgrade executor's monitor thread polls its memory space every `monitor_period` (~10ms). When `downgrade_trigger_fraction` is exceeded, it enqueues a `downgrade_request` (at most one monitor request outstanding per space); the processing thread then sweeps candidates in two tiers:
+1. **TIER 1 — data repositories**, across every in-flight query, newest query first (the query with the least progress pays for the memory; the oldest keeps its working set and finishes)
+2. **TIER 2 — queued pipeline tasks** extracted from the scheduler queue (see the Downgrade Request Pattern below)
 
 Data is moved from GPU to HOST tier via converter registry.
 
-**Code path:** `src/downgrade/downgrade_executor.cpp` — `monitor_loop()`, `run_downgrade_pass()`
+**Code path:** `src/downgrade/downgrade_executor.cpp` — `monitor_loop()`, `processing_loop()`
 
 **Config:** `downgrade_trigger_fraction` (default: 0.8 for GPU, 0.9 for host), `downgrade_stop_fraction` (default: 0.6 for GPU, 0.8 for host). Configuration requires `0 < stop < trigger <= 1`.
 
@@ -182,7 +179,7 @@ Data is moved from GPU to HOST tier via converter registry.
 **Mechanism:** Operators throw `oom_reschedule_exception` carrying intermediate results and resume index. The GPU executor catches this and:
 1. Preserves intermediate operator data
 2. Creates a rescheduled task starting from the failure point
-3. Retries up to 10 times with 5ms backoff
+3. Retries with a 50 ms backoff, up to the per-query cap `gpu_reservation_max_retries` (default 100), read from the admission-time config snapshot
 
 **Code path:**
 - `src/include/pipeline/oom_reschedule_exception.hpp` — exception class
