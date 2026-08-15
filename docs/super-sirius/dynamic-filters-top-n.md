@@ -1635,13 +1635,21 @@ prefilter calls precede the boundary's formation, so there is nothing to prune b
 boundary exists. Q2 is flat in both cells (CIs straddle 1.0), consistent with its tiny pre-LIMIT
 cardinality. Q3/Q10 armed once the DECIMAL128 admission landed (Phase 7): their first ORDER BY key
 (`revenue`, a DECIMAL(38,4) aggregate output) now admits, arming the row producer for sink
-self-consumption with zero external targets — the same profile as Q21. Their A/B cells have not
-yet been measured. The hypothesis recorded before that run: mechanism counters are guaranteed
-(sink-prefilter `rows_in` in the 10^8–10^9 range, the largest sink-floor numbers in the suite,
-since the aggregate output cannot arrive as one batch), while timing sits between flat and ~15%,
-bounded by the TOP_N stage's share — predicted at noise for Q10, whose single-key null-free
-batches already take the O(n) `top_k_order` selection path, with the upper half plausible only
-for Q3, whose two-key batches always full-sort. Q21 (the one armed self-consumption-only query) is
+self-consumption with zero external targets — the same profile as Q21. Measured: **zero
+regression, no gain, and the pre-registered hypothesis refuted on its central premise.** Timing
+is flat in every cell — Q3 0.9989 [0.9914, 1.0064] and Q10 0.9972 [0.9879, 1.0066] pinned;
+0.9963 [0.9849, 1.0079] and 1.0009 [0.9915, 1.0104] from disk at 40-pair confirmation power
+(both initial 21-pair disk cells grazed the +2% CI bound and dissolved under power, the same
+noise pattern as the campaign's q1); a Q18 guard cell re-ran flat (1.0009 [0.9951, 1.0069])
+since the kernel's inner loop changed for every width. The hypothesis predicted sink-prefilter
+`rows_in` in the 10^8–10^9 range on the premise that the aggregate output cannot arrive as one
+batch — the counters show it does: one offer per execution on Q3, two on Q10, and **zero
+prefilter rows on both**. The sink has the same single-batch blindness the aggregate-input seam
+had before the witness-first swap, and no analogous reordering exists for it: the sink's
+boundary is derived from the local top-K selection itself, so on a one-batch input the
+selection *is* the minimal work and there is nothing left to prune. The honest summary: the
+admission gap is closed — every TPC-H LIMIT query now arms or is refused only for soundness,
+never for type width — at measured-zero cost, and the flat result is structural, not a defect. Q21 (the one armed self-consumption-only query) is
 flat: 1.0034 [0.9995, 1.0073] pinned, 0.9994 [0.9958, 1.0029] from disk.
 
 The unclustered dataset is hostile for the campaign's ORDER BY keys: row-group statistics span

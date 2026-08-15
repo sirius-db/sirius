@@ -1,9 +1,9 @@
 {
-  "calibrated": "2026-08-15T00:54:00",
-  "commit": "544ab619d209344f372e9ecb867fd29589c485cf",
+  "calibrated": "2026-08-15T21:59:06",
+  "commit": "7be308cc94e0baddbdedbc18cac56ef0786476bd",
   "forecast_check": {
     "q1": "MATCH: expected untouched (no producers eligible); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
-    "q10": "MISMATCH: expected row producer eligible, self-consumption only (no external targets/sites); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
+    "q10": "MATCH: expected row producer eligible, self-consumption only (no external targets/sites); observed row_eligible=2, group_eligible=0, external_targets_sites=0",
     "q11": "MATCH: expected untouched (no producers eligible); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
     "q12": "MATCH: expected untouched (no producers eligible); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
     "q13": "MATCH: expected untouched (no producers eligible); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
@@ -17,7 +17,7 @@
     "q20": "MATCH: expected untouched (no producers eligible); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
     "q21": "MATCH: expected row producer eligible, self-consumption only (no external targets/sites); observed row_eligible=2, group_eligible=0, external_targets_sites=0",
     "q22": "MATCH: expected untouched (no producers eligible); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
-    "q3": "MISMATCH: expected row producer eligible, self-consumption only (no external targets/sites); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
+    "q3": "MATCH: expected row producer eligible, self-consumption only (no external targets/sites); observed row_eligible=2, group_eligible=0, external_targets_sites=0",
     "q4": "MATCH: expected untouched (no producers eligible); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
     "q5": "MATCH: expected untouched (no producers eligible); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
     "q6": "MATCH: expected untouched (no producers eligible); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
@@ -60,6 +60,12 @@
         ]
       },
       "on": {
+        "cell_nonzero": [
+          "top_n_offers"
+        ],
+        "direction_only": [
+          "top_n_offers"
+        ],
         "exact": {
           "top_n_first_key_endpoint_sites_placed": 0,
           "top_n_first_key_scan_targets": 0,
@@ -68,10 +74,10 @@
           "top_n_group_producers_rejected": 2,
           "top_n_lex_endpoint_sites_placed": 0,
           "top_n_lex_scan_targets": 0,
-          "top_n_producers_eligible": 0,
+          "top_n_producers_eligible": 2,
           "top_n_producers_first_key_only": 0,
-          "top_n_producers_rejected": 2,
-          "top_n_sites_skipped_no_work_saved": 0
+          "top_n_producers_rejected": 0,
+          "top_n_sites_skipped_no_work_saved": 2
         }
       }
     },
@@ -418,6 +424,12 @@
         ]
       },
       "on": {
+        "cell_nonzero": [
+          "top_n_offers"
+        ],
+        "direction_only": [
+          "top_n_offers"
+        ],
         "exact": {
           "top_n_first_key_endpoint_sites_placed": 0,
           "top_n_first_key_scan_targets": 0,
@@ -426,10 +438,10 @@
           "top_n_group_producers_rejected": 2,
           "top_n_lex_endpoint_sites_placed": 0,
           "top_n_lex_scan_targets": 0,
-          "top_n_producers_eligible": 0,
+          "top_n_producers_eligible": 2,
           "top_n_producers_first_key_only": 0,
-          "top_n_producers_rejected": 2,
-          "top_n_sites_skipped_no_work_saved": 0
+          "top_n_producers_rejected": 0,
+          "top_n_sites_skipped_no_work_saved": 4
         }
       }
     },
