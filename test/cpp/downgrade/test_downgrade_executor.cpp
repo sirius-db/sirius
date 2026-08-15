@@ -239,9 +239,9 @@ TEST_CASE("request_free_memory respects byte target via predicate", "[downgrade_
 }
 
 // NOTE: The old scored_repo sort prioritized partitioned repos over non-partitioned.
-// The new lazy tiered iteration processes repos in for_each_repository order, which
-// follows insertion order. This test verifies the lazy iteration works correctly
-// across multiple repos without asserting a specific priority ordering.
+// The new lazy tiered iteration processes repos in the manager's get_repositories()
+// snapshot order, which follows insertion order. This test verifies the lazy iteration
+// works correctly across multiple repos without asserting a specific priority ordering.
 TEST_CASE("request_free_memory downgrades across multiple repos", "[downgrade_executor]")
 {
   auto mem_mgr    = make_test_memory_manager();
