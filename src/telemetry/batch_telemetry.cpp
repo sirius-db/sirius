@@ -26,7 +26,9 @@
 
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <format>
+#include <iterator>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -90,6 +92,10 @@ struct batch_telemetry_registry::impl {
     // Last seen tier/bytes, re-emitted verbatim by tier-agnostic transitions.
     uuid::UUID tier_resource_id;
     uint64_t bytes;
+    /// The owning query (from the registering port, or the claiming pipeline
+    /// for lazily-registered placements): on_query_end(query_id) consumes
+    /// only matching placements.
+    sirius::query_id_t query_id;
   };
 
   struct shard {
@@ -100,6 +106,9 @@ struct batch_telemetry_registry::impl {
   struct port_info {
     uuid::UUID pipeline_uuid;
     uuid::UUID port_uuid;
+    /// The query owning the port's pipeline; on_query_end(query_id) erases
+    /// only matching ports.
+    sirius::query_id_t query_id;
   };
 
   std::atomic<bool> enabled{false};
@@ -172,6 +181,28 @@ struct batch_telemetry_registry::impl {
     });
     p.handle->exit();
   }
+
+  /// Consume every remaining placement (reason=query_end) and clear every
+  /// port, regardless of query. Shared by uninstall() and on_all_end().
+  std::size_t drain_all()
+  {
+    std::size_t drained = 0;
+    for (auto& shard : shards) {
+      std::lock_guard lock(shard.mutex);
+      for (auto& [batch_id, placements] : shard.placements) {
+        for (auto& p : placements) {
+          consume(p, batch_consumed_reason::query_end);
+          ++drained;
+        }
+      }
+      shard.placements.clear();
+    }
+    {
+      std::unique_lock lock(ports_mutex);
+      ports.clear();
+    }
+    return drained;
+  }
 };
 
 batch_telemetry_registry::batch_telemetry_registry() : impl_(std::make_unique<impl>()) {}
@@ -231,19 +262,7 @@ void batch_telemetry_registry::uninstall()
 {
   if (!impl_->enabled.exchange(false, std::memory_order_acq_rel)) { return; }
 
-  for (auto& shard : impl_->shards) {
-    std::lock_guard lock(shard.mutex);
-    for (auto& [batch_id, placements] : shard.placements) {
-      for (auto& p : placements) {
-        impl_->consume(p, batch_consumed_reason::query_end);
-      }
-    }
-    shard.placements.clear();
-  }
-  {
-    std::unique_lock lock(impl_->ports_mutex);
-    impl_->ports.clear();
-  }
+  impl_->drain_all();
   for (auto& handle : impl_->tier_handles) {
     handle->finalizing();
     handle->exit();
@@ -255,11 +274,12 @@ void batch_telemetry_registry::uninstall()
 
 void batch_telemetry_registry::register_consumer_port(const cucascade::shared_data_repository* repo,
                                                       uuid::UUID pipeline_uuid,
-                                                      uuid::UUID port_uuid)
+                                                      uuid::UUID port_uuid,
+                                                      sirius::query_id_t query_id)
 {
   if (!impl_->enabled.load(std::memory_order_acquire) || repo == nullptr) { return; }
   std::unique_lock lock(impl_->ports_mutex);
-  impl_->ports[repo] = {pipeline_uuid, port_uuid};
+  impl_->ports[repo] = {pipeline_uuid, port_uuid, query_id};
 }
 
 void batch_telemetry_registry::on_published(const std::shared_ptr<cucascade::data_batch>& batch,
@@ -304,12 +324,14 @@ void batch_telemetry_registry::on_published(const std::shared_ptr<cucascade::dat
     .state            = impl::placement_state::queued,
     .tier_resource_id = tier_resource_id,
     .bytes            = snap->bytes,
+    .query_id         = port.query_id,
   });
 }
 
 void batch_telemetry_registry::on_packaged(const std::shared_ptr<cucascade::data_batch>& batch,
                                            uuid::UUID consumer_pipeline_uuid,
-                                           uuid::UUID task_uuid)
+                                           uuid::UUID task_uuid,
+                                           sirius::query_id_t query_id)
 {
   if (!impl_->enabled.load(std::memory_order_acquire)) { return; }
   auto snap = snapshot(batch);
@@ -357,6 +379,7 @@ void batch_telemetry_registry::on_packaged(const std::shared_ptr<cucascade::data
       .state            = impl::placement_state::queued,
       .tier_resource_id = tier_resource_id,
       .bytes            = snap->bytes,
+      .query_id         = query_id,
     });
     target = &placements.back();
   }
@@ -472,28 +495,51 @@ uuid::UUID batch_telemetry_registry::tier_resource(cucascade::memory::Tier tier,
   return impl_->tier_resource_id(tier, device_id);
 }
 
-void batch_telemetry_registry::on_query_end()
+std::size_t batch_telemetry_registry::on_query_end(sirius::query_id_t query_id)
 {
-  if (!impl_->enabled.load(std::memory_order_acquire)) { return; }
+  if (!impl_->enabled.load(std::memory_order_acquire)) { return 0; }
 
-  size_t drained = 0;
+  // Consume ONLY this query's placements; a peer's live placements stay
+  // registered and keep transitioning (A8: the old all-shards drain silently
+  // truncated every concurrent query's telemetry on any query's end).
+  std::size_t drained = 0;
   for (auto& shard : impl_->shards) {
     std::lock_guard lock(shard.mutex);
-    for (auto& [batch_id, placements] : shard.placements) {
-      for (auto& p : placements) {
-        impl_->consume(p, batch_consumed_reason::query_end);
-        ++drained;
+    for (auto it = shard.placements.begin(); it != shard.placements.end();) {
+      auto& placements = it->second;
+      for (auto p = placements.begin(); p != placements.end();) {
+        if (p->query_id == query_id) {
+          impl_->consume(*p, batch_consumed_reason::query_end);
+          ++drained;
+          p = placements.erase(p);
+        } else {
+          ++p;
+        }
       }
+      it = placements.empty() ? shard.placements.erase(it) : std::next(it);
     }
-    shard.placements.clear();
   }
   {
     std::unique_lock lock(impl_->ports_mutex);
-    impl_->ports.clear();
+    std::erase_if(impl_->ports,
+                  [&](auto const& entry) { return entry.second.query_id == query_id; });
   }
   if (drained > 0) {
-    SIRIUS_LOG_DEBUG("Batch telemetry: drained {} placement(s) at query end.", drained);
+    SIRIUS_LOG_DEBUG(
+      "Batch telemetry: drained {} placement(s) at query {} end.", drained, query_id);
   }
+  return drained;
+}
+
+std::size_t batch_telemetry_registry::on_all_end()
+{
+  if (!impl_->enabled.load(std::memory_order_acquire)) { return 0; }
+
+  const std::size_t drained = impl_->drain_all();
+  if (drained > 0) {
+    SIRIUS_LOG_DEBUG("Batch telemetry: drained {} placement(s) at runtime teardown.", drained);
+  }
+  return drained;
 }
 
 }  // namespace sirius::telemetry

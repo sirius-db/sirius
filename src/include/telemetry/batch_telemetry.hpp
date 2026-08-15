@@ -16,10 +16,12 @@
 
 #pragma once
 
+#include "query_id.hpp"
 #include "telemetry-bridge/gen/uuid.rs.h"
 
 #include <cucascade/memory/common.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string_view>
@@ -92,9 +94,12 @@ class batch_telemetry_registry {
   void uninstall();
 
   /// Associate a consumer port's data repository with its pipeline and port.
+  /// @p query_id attributes every placement created through this port to its
+  /// owning query, so on_query_end(query_id) drains only that query's state.
   void register_consumer_port(const cucascade::shared_data_repository* repo,
                               uuid::UUID pipeline_uuid,
-                              uuid::UUID port_uuid);
+                              uuid::UUID port_uuid,
+                              sirius::query_id_t query_id);
 
   /// A producer published `batch` into `repo`: registered -> queued. Call
   /// before the batch is added to the repository.
@@ -103,10 +108,13 @@ class batch_telemetry_registry {
                     batch_origin origin);
 
   /// A task claimed `batch` as input: queued -> packaged (re-claims re-emit
-  /// packaged; unseen batches are lazily registered).
+  /// packaged; unseen batches are lazily registered). @p query_id stamps the
+  /// lazily-registered placement (the claiming pipeline's query); placements
+  /// that already exist keep the attribution from their registering port.
   void on_packaged(const std::shared_ptr<cucascade::data_batch>& batch,
                    uuid::UUID consumer_pipeline_uuid,
-                   uuid::UUID task_uuid);
+                   uuid::UUID task_uuid,
+                   sirius::query_id_t query_id);
 
   /// The claiming task started computing: packaged -> processing.
   void on_processing(const std::shared_ptr<cucascade::data_batch>& batch, uuid::UUID task_uuid);
@@ -125,8 +133,16 @@ class batch_telemetry_registry {
                       int32_t device_id,
                       uint64_t bytes);
 
-  /// Drain all remaining placements and clear the consumer-port mappings.
-  void on_query_end();
+  /// Drain the remaining placements of @p query_id (reason=query_end) and
+  /// clear only its consumer-port mappings. Peer queries' live placements and
+  /// ports are untouched — one query's end must not truncate another's
+  /// telemetry (register A8). Returns the number of placements drained.
+  std::size_t on_query_end(sirius::query_id_t query_id);
+
+  /// Drain ALL remaining placements and clear every consumer-port mapping,
+  /// regardless of query. For whole-runtime teardown (terminate/uninstall)
+  /// only — never for a single query's end. Returns the number drained.
+  std::size_t on_all_end();
 
   /// The MemoryTier resource for (tier, device); nil when not installed.
   [[nodiscard]] uuid::UUID tier_resource(cucascade::memory::Tier tier, int32_t device_id) const;

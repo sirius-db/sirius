@@ -566,12 +566,14 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // destruction used to provide.
   destroy_retired_query_plan(query_id);
 
-  // Close out batch placements still alive (un-consumed repo contents,
-  // result-collector outputs) before their repositories are cleared.
-  // Best-effort: telemetry failure must not abort the remaining mandatory
-  // steps or poison the runtime.
+  // Close out THIS query's batch placements still alive (un-consumed repo
+  // contents, result-collector outputs) before its repositories are cleared.
+  // Scoped by query id (A8): a peer query's live placements and ports keep
+  // emitting for the rest of that query's life. Best-effort: telemetry
+  // failure must not abort the remaining mandatory steps or poison the
+  // runtime.
   try {
-    sirius::telemetry::batch_telemetry_registry::instance().on_query_end();
+    sirius::telemetry::batch_telemetry_registry::instance().on_query_end(query_id);
   } catch (std::exception& e) {
     try {
       SIRIUS_LOG_WARN("batch telemetry on_query_end failed (ignored): {}", e.what());
@@ -1290,6 +1292,11 @@ void SiriusContext::terminate()
   // Already stopped above, before task_scheduler_ was destroyed; stop() is idempotent, so this is
   // only here to keep the destruction of the executors themselves adjacent to their clear().
   downgrade_executors_.clear();
+  // Whole-runtime teardown: every query is over, so the ALL-queries drain is
+  // correct here (per-query ends use on_query_end(query_id) instead — A8).
+  // uninstall() would drain leftovers too; the explicit call keeps the
+  // consumed-at-terminate placements distinct from the uninstall teardown.
+  sirius::telemetry::batch_telemetry_registry::instance().on_all_end();
   sirius::telemetry::batch_telemetry_registry::instance().uninstall();
   telemetry_context_.reset();
 

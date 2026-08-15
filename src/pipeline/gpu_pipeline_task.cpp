@@ -303,7 +303,8 @@ gpu_pipeline_task::gpu_pipeline_task(
     auto& registry = telemetry::batch_telemetry_registry::instance();
     for (const auto& weak_batch : _subscribed_batches) {
       if (auto batch = weak_batch.lock()) {
-        registry.on_packaged(batch, pipeline->pipeline_uuid(), telemetry_handle().uuid());
+        registry.on_packaged(
+          batch, pipeline->pipeline_uuid(), telemetry_handle().uuid(), pipeline->get_query_id());
         _claimed_batch_ids.push_back(batch->get_batch_id());
       }
     }

@@ -226,7 +226,7 @@ void emit_plan_telemetry(
                                   .instance_name = std::format("{}_receiver", port_id),
                                 });
           batch_telemetry_registry::instance().register_consumer_port(
-            port->repo, pipeline_uuid, port->source_port_uuid);
+            port->repo, pipeline_uuid, port->source_port_uuid, telemetry_info.query_id);
         }
       }
     }
