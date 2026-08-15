@@ -399,6 +399,30 @@ TEST_CASE("Sirius YAML rejects invalid dynamic-filter thresholds", "[sirius][con
   REQUIRE(config.get_operator_params().dynamic_filter_keep_threshold == Approx(0.0));
 }
 
+TEST_CASE("Sirius configuration rejects invalid GPU topology selections", "[sirius][config]")
+{
+  struct invalid_config {
+    const char* fixture;
+    const char* expected;
+  };
+  const invalid_config cases[] = {
+    {"invalid_topology_empty_gpu_ids.yaml", "at least one device id"},
+    {"invalid_topology_negative_gpu_id.yaml", "only non-negative device ids"},
+    {"invalid_topology_duplicate_gpu_ids.yaml", "duplicate device ids"},
+    {"invalid_topology_gpu_ids_and_num_gpus.yaml", "mutually exclusive"},
+    {"invalid_topology_negative_num_gpus.yaml", "num_gpus must be non-negative"},
+  };
+
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+  for (auto const& invalid : cases) {
+    INFO("fixture=" << invalid.fixture);
+    sirius::sirius_config config;
+    REQUIRE_THROWS_WITH(config.load_from_file(data_dir / invalid.fixture),
+                        Catch::Contains("topology") && Catch::Contains(invalid.expected));
+  }
+}
+
 namespace {
 
 void require_shared_operator_defaults(const sirius::operator_params& params, uint64_t batch)
@@ -431,6 +455,13 @@ uint64_t expected_effective_batch(const sirius::sirius_config& config)
 }
 
 }  // namespace
+
+TEST_CASE("Sirius derives GPU pipeline affinity from hardware topology", "[sirius][config]")
+{
+  sirius::sirius_config config;
+  REQUIRE_THROWS_WITH(config.load_from_file(config_fixture("invalid_pipeline_cpu_affinity.yaml")),
+                      Catch::Contains("unknown config key: 'cpu_affinity' in thread_pool"));
+}
 
 TEST_CASE("operator batch defaults use the smallest low-level GPU capacity",
           "[sirius][config][operator_defaults]")

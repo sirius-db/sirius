@@ -109,8 +109,8 @@ Sirius uses cuCascade for tiered memory management across GPU, Host (pinned), an
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_gpus` | int | all visible GPUs | Number of GPUs to use. Defaults to every GPU visible to topology discovery (honors `CUDA_VISIBLE_DEVICES`); `0` also means auto. Mutually exclusive with `gpu_ids`. |
-| `gpu_ids` | list of int | — | Explicit GPU device IDs. Mutually exclusive with `num_gpus`. |
+| `num_gpus` | int | all visible GPUs | Non-negative number of GPUs to use. Defaults to every GPU visible to topology discovery (honors `CUDA_VISIBLE_DEVICES`); `0` also means auto. Mutually exclusive with `gpu_ids`. |
+| `gpu_ids` | list of int | — | Non-empty list of unique, non-negative GPU device IDs. Mutually exclusive with `num_gpus`. |
 | `gpus_per_query` | int | `0` (all) | How many GPUs each query is allocated at admission time. `0` uses all active GPUs. Values exceeding the active GPU count are clamped to the full set. |
 
 ### GPU Memory (`sirius.memory.gpu`)
@@ -243,13 +243,14 @@ per-pool sub-blocks: `task_creator`, `pipeline`, `downgrade`, and `scan_manager`
 `scan_manager` sub-block is large and is documented in
 [Scan Manager & IO Configuration](#scan-manager--io-configuration) below.
 
-Every thread-pool sub-block shares three keys:
+The thread-pool sub-blocks use these common keys; pipeline affinity is the
+hardware-derived exception described below:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `num_threads` | int (**> 0**) | per pool (below) | Worker threads in the pool. |
 | `thread_name_prefix` | string | per pool | Thread name prefix for logs. |
-| `cpu_affinity` | list of int | — | Cores to pin the pool's threads to. |
+| `cpu_affinity` | list of int | — | Cores to pin task-creator and downgrade threads. GPU pipeline affinity is derived from the selected GPU's CPU topology. |
 
 ### `sirius.executor.task_creator`
 
@@ -496,8 +497,10 @@ per-pool extras.
 | `downgrade_executor` | `executor.downgrade` | 1 | `downgrade` | Data tier migration (GPU→Host) |
 | `scan_manager` | `executor.scan_manager` | remaining cores (min 4) | `scan_manager` | Scan metadata production + IO reactor management |
 
-Each pool supports optional CPU affinity lists (`cpu_affinity`) for core pinning. `num_threads`
-must be `> 0` for every pool except `scan_manager`, which requires `> 2`.
+The task-creator, downgrade, and scan-manager pools support optional CPU affinity lists
+(`cpu_affinity`) for core pinning. GPU pipeline affinity is derived per executor from the selected
+GPU's CPU topology. `num_threads` must be `> 0` for every pool except `scan_manager`, which requires
+`> 2`.
 
 ## DuckDB SET Variables
 
