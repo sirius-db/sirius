@@ -1089,11 +1089,13 @@ class top_n_threshold_coordinator final {
 
 The producer seam in the partial aggregate sink, mirroring the Top-N seam: a
 `threshold_coordinator` shared_ptr (set by the planner; null when ineligible) and a per-operator
-prefilter gate. Per input batch, `execute()`-internal helpers (not public API): gated inclusive
-prefilter against `tightest_boundary()` before hash insert, then bounded distinct-key extraction
-— sort/unique on the ORDER-BY key columns, truncate to K, host copies on the task stream with
-observed completion — and the distinct-key offer. The merge aggregate is untouched; only the
-Top-N's merge calls `finish()`.
+prefilter gate. Per input batch, `execute()`-internal helpers (not public API): bounded
+distinct-key extraction first — sort/unique on the ORDER-BY key columns, truncate to K, host
+copies on the task stream with observed completion — and the distinct-key offer, then the gated
+inclusive prefilter against `tightest_boundary()` before hash insert. Witness-first is
+load-bearing: the boundary a batch establishes prunes that same batch, which under coarse
+batching is the only batch there may be. The merge aggregate is untouched; only the Top-N's
+merge calls `finish()`.
 
 #### Modified file: `src/include/op/dynamic_filter/top_n_dynamic_filter_publish_plan.hpp`
 

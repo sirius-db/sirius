@@ -104,12 +104,28 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
       continue;
     }
 
-    // Top-N group-key producer seam. Rows the boundary excludes belong to groups that cannot reach
-    // the final K, so dropping them before the hash insert changes no surviving group's value; the
-    // survivors' best distinct grouping keys are then the evidence that tightens the boundary
-    // further. Both steps are optional work, so a failure degrades to a plain aggregation.
+    // Top-N group-key producer seam, witness-first: the batch's best distinct grouping keys are
+    // offered before the prefilter runs, so the boundary they establish or tighten can prune this
+    // very batch ahead of the hash insert. The order is load-bearing under coarse batching, where
+    // an aggregate's whole input can arrive as one batch -- a prefilter that ran first would never
+    // see a boundary at all (measured: TPC-H Q18 at SF1000 prefiltered zero rows under the old
+    // order). Witnessing the unpruned batch costs no evidence -- keys worse than the boundary can
+    // never displace the set's best K -- and rows the boundary excludes belong to groups that
+    // cannot reach the final K, so dropping them changes no surviving group's value regardless of
+    // when the boundary formed. Both steps are optional work, so a failure degrades to a plain
+    // aggregation.
     auto const memory_resource = space->get_default_allocator();
     auto input_table           = get_cudf_table_view(input_batch);
+    try {
+      top_n_producer->witness(input_table, stream, memory_resource);
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_WARN(
+        "[sirius_physical_grouped_aggregate] Top-N group-key witness skipped one batch: {}. "
+        "The boundary simply stops tightening from this batch.",
+        e.what());
+    }
+    // Prefiltering is a separate failure domain from witnessing: the offer above already banked
+    // this batch's evidence, so a failed prefilter costs pruning and nothing else.
     std::unique_ptr<cudf::table> prefiltered;  // backs input_table when rows were dropped
     try {
       auto result = top_n_producer->prefilter(input_table, stream, memory_resource);
@@ -125,17 +141,6 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
         e.what());
       prefiltered.reset();
       input_table = get_cudf_table_view(input_batch);
-    }
-    // Witnessing is a separate failure domain from prefiltering. A prefilter that already
-    // succeeded stays in force: its survivors are exactly the rows that can matter, and keeping
-    // them also keeps the row counters agreeing with what reached the hash table.
-    try {
-      top_n_producer->witness(input_table, stream, memory_resource);
-    } catch (std::exception const& e) {
-      SIRIUS_LOG_WARN(
-        "[sirius_physical_grouped_aggregate] Top-N group-key witness skipped one batch: {}. "
-        "The boundary simply stops tightening from this batch.",
-        e.what());
     }
 
     results.push_back(gpu_aggregate_impl::local_grouped_aggregate(input_table,

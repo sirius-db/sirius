@@ -1623,6 +1623,22 @@ is the mechanism's overhead floor, not its upside. The clustered dataset (the
 `--cluster-keys "orders:o_totalprice,supplier:s_acctbal"` stretch cell) remains the
 demonstrable-upside configuration and was not run for the bar.
 
+**Follow-up: the witness-first seam and the gain demonstration.** The group-key seam now
+witnesses before it prefilters, so the boundary a batch establishes can prune that same batch
+before its hash insert -- under coarse batching an aggregate's whole input can arrive as one
+batch, and the old order's prefilter then never saw a boundary at all (the Q18 zero above).
+Re-measured with the swap, Q18's prefilter processes ~444K rows per execution and drops 99.8% of
+them, and timing is 0.9965 [0.9915, 1.0014] -- the mechanism works, and the flat result is the
+computed ceiling, not a defect: Q18's outer aggregate is ~400K rows because the IN-subquery
+shrinks it first, while the query's weight (the subquery's own 6B-row aggregate and the joins)
+is structurally out of any Top-N's reach. The shape TPC-H's LIMIT queries lack was then
+demonstrated on TPC-H's own data: `SELECT l_orderkey, sum(l_quantity) FROM lineitem GROUP BY
+l_orderkey ORDER BY l_orderkey LIMIT 100` at SF1000 from disk runs **6.0x faster flag-on**
+(geomean 0.1659 [0.1598, 0.1721] over 12 byte-identical pairs): 2.8B rows prefiltered to 18K
+before the insert, 50 boundary revisions published to the scan, and the reader gate pruning
+65,041 of 66,192 row groups (98.3%) through lineitem's natural l_orderkey ordering
+(`test/tpch_performance/phase6_gain_demo.py`).
+
 **Scope limits of this measurement.** Single host, single GPU (the multi-GPU path remains
 verification-blocked); between-run drift bounds any cross-run claim at roughly ±1%, which is why
 the verdict rule uses within-run paired intervals only; the flag-off-vs-DuckDB-CPU validation

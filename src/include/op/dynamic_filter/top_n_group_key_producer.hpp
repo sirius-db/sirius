@@ -21,8 +21,11 @@
  * `sirius::planner::sirius_physical_plan_generator` installs one of these on a
  * `sirius_physical_grouped_aggregate` when a `LogicalTopN` above that aggregate orders only by
  * grouping keys. Per input batch, `sirius_physical_grouped_aggregate::execute` calls
- * @ref top_n_group_key_producer::prefilter and then @ref top_n_group_key_producer::witness before
- * `gpu_aggregate_impl::local_grouped_aggregate`; the policy itself -- the bounded distinct-key
+ * @ref top_n_group_key_producer::witness and then @ref top_n_group_key_producer::prefilter before
+ * `gpu_aggregate_impl::local_grouped_aggregate` -- witness-first, so the boundary a batch
+ * establishes can prune that same batch; under coarse batching the aggregate's whole input can
+ * arrive as one batch, and a prefilter that ran first would never see a boundary at all. The
+ * policy itself -- the bounded distinct-key
  * witness set, the boundary, and publication -- lives in the shared
  * @ref top_n_threshold_coordinator, which this class only feeds.
  *
@@ -117,10 +120,12 @@ class top_n_group_key_producer final {
   /**
    * @brief Offer this batch's best distinct grouping keys to the coordinator
    *
-   * @p batch is the prefiltered view: rows the prefilter dropped are strictly worse than the
-   * boundary and cannot be among the K best, so excluding them costs no evidence. The host copies
-   * complete before the offer, and the caller's read-only accessor keeps @p batch alive across
-   * both, which is the durability the offer requires.
+   * @p batch is the raw, unprefiltered batch: witnessing runs before the prefilter so the
+   * boundary it establishes can prune this same batch. Rows the boundary would exclude carry
+   * keys strictly worse than K proven distinct keys, so their presence here costs no evidence --
+   * they can never displace the set's best K. The host copies complete before the offer, and
+   * the caller's read-only accessor keeps @p batch alive across both, which is the durability
+   * the offer requires.
    */
   void witness(cudf::table_view const& batch,
                rmm::cuda_stream_view stream,

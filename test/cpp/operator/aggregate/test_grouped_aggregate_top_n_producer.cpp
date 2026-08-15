@@ -105,10 +105,12 @@ TEST_CASE("the group-key producer keeps boundary-tied rows so their group's sum 
   REQUIRE(space != nullptr);
 
   // Batch one carries thirteen distinct grouping keys, so a K = 5 witness set fills immediately
-  // and the boundary becomes the fifth-best key, 4. Batch two then meets that boundary holding
-  // rows *tied* with it. Inclusive keeps them and group 4's sum is exact; strict drops all three
-  // thousand of their contribution while still returning a row for group 4 -- the silent
-  // corruption. Group 9's rows are strictly worse and may legitimately be pruned.
+  // and the boundary becomes the fifth-best key, 4 -- and witness-first means batch one then
+  // prunes itself down to the five boundary-or-better rows before its own hash insert. Batch two
+  // then meets that boundary holding rows *tied* with it. Inclusive keeps them and group 4's sum
+  // is exact; strict drops all three thousand of their contribution while still returning a row
+  // for group 4 -- the silent corruption. Group 9's rows are strictly worse and may legitimately
+  // be pruned.
   std::vector<std::shared_ptr<data_batch>> batches;
   batches.push_back(make_two_column_batch<std::int64_t, std::int64_t>(
     *space,
@@ -151,10 +153,12 @@ TEST_CASE("the group-key producer keeps boundary-tied rows so their group's sum 
   REQUIRE(boundary.has_value());
   REQUIRE(std::get<std::int64_t>(boundary->component(0)->value()) == 4);
 
-  // The predicate really did face batch two and prune there, so the equality above is evidence
-  // about inclusivity rather than about an unexercised path.
-  REQUIRE(stats.top_n_group_prefilter_rows_in.load() == 5);
-  REQUIRE(stats.top_n_group_prefilter_rows_out.load() == 3);
+  // The predicate really did prune, in both places witness-first makes reachable: batch one
+  // self-prunes (13 in, 5 boundary-or-better out) and batch two prunes its two strictly-worse
+  // rows (5 in, 3 out) -- so the equality above is evidence about inclusivity rather than about
+  // an unexercised path.
+  REQUIRE(stats.top_n_group_prefilter_rows_in.load() == 18);
+  REQUIRE(stats.top_n_group_prefilter_rows_out.load() == 8);
 }
 
 TEST_CASE("an unarmed grouped aggregate is untouched by the group-key seam",
