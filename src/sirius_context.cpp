@@ -507,6 +507,17 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   } catch (...) {
   }
 
+  // D5 STEP-LEVEL CLASSIFICATION: steps below that touch only THIS query's state keep the
+  // default per-query verdict (a throw propagates as-is; the catch sites run
+  // classify_query_failure, which latches the runtime only for sticky CUDA corruption).
+  // Steps that exercise a SHARED subsystem — the downgrade executors' drains/barrier and the
+  // repository registry's erase — rethrow as SiriusSharedCleanupStepFailure: their failure
+  // means every co-tenant's cleanup hits the same wedged executor or broken registry next,
+  // so the catch sites latch the process-wide runtime_health instead.
+  const auto inject_step_fault = [this](std::string_view step) {
+    if (cleanup_step_fault_injector_) { cleanup_step_fault_injector_(step); }
+  };
+
   // Close the enqueue gate BEFORE any drain runs. Every producer consults it, so from here on a
   // completion callback for this query — notify_downstream_pipelines, the GPU executor scheduling
   // a finished task's consumers, an OOM reschedule, or a TIER-2 downgrade returning a task it
@@ -525,6 +536,7 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // destroys tasks whose destructors walk raw operator pointers
   // (~gpu_pipeline_task -> mark_task_completed -> notify_downstream_pipelines) — run before the
   // plan dies. The parked state is destroyed below, after the last drain.
+  inject_step_fault("task_creator_reset");
   if (task_creator_) { task_creator_->reset(query_id); }
 
   // With the producer stopped, drop whatever it already queued for this query, for the same
@@ -538,20 +550,33 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // to run here failed every queued promise (killing healthy peers' downgrades) and
   // stop-join-restarted each executor's processing thread on every query end. The repository
   // erase below needs no fence against sweeps at all: they co-own what they borrow (step 6).
-  for (auto& executor : downgrade_executors_) {
-    executor->drain(query_id);
-  }
-
-  // THE PLAN-LIFETIME FENCE (kept through step 7 on purpose — shared-ownership repositories
-  // do not subsume it): drain(query_id) waits only for THIS query's in-flight request, but a
-  // peer's (or the monitor's) request sweeps by memory space, so its TIER-2 pass may hold this
-  // query's task in a convertible wrapper across a blocking conversion — and the wrapper's
-  // RAII drop, gate-refused for a quiescing query, DESTROYS the task, whose destructor walks
-  // the plan destroyed a few lines below. Wait out whatever requests are in flight (bounded:
-  // requests already started; later ones cannot extract this query's tasks because TIER-2
-  // extraction consults the lifecycle gate, quiescing since the top of this function).
-  for (auto& executor : downgrade_executors_) {
-    executor->wait_inflight_request();
+  //
+  // The second loop is THE PLAN-LIFETIME FENCE (kept through step 7 on purpose —
+  // shared-ownership repositories do not subsume it): drain(query_id) waits only for THIS
+  // query's in-flight requests, but a peer's (or the monitor's) request sweeps by memory
+  // space, so its TIER-2 pass may hold this query's task in a convertible wrapper across a
+  // blocking conversion — and the wrapper's RAII drop, gate-refused for a quiescing query,
+  // DESTROYS the task, whose destructor walks the plan destroyed a few lines below. Wait out
+  // the requests in flight (a bounded barrier: requests already started; later ones cannot
+  // extract this query's tasks because TIER-2 extraction consults the lifecycle gate,
+  // quiescing since the top of this function).
+  //
+  // SHARED-verdict steps (D5): these drains touch the SHARED executors on every co-tenant's
+  // behalf — if one wedges or throws, the next query's cleanup hits the same wall.
+  try {
+    inject_step_fault("downgrade_drain");
+    for (auto& executor : downgrade_executors_) {
+      executor->drain(query_id);
+    }
+    for (auto& executor : downgrade_executors_) {
+      executor->wait_inflight_request();
+    }
+  } catch (const std::exception& e) {
+    throw SiriusSharedCleanupStepFailure(
+      std::string("shared downgrade executor drain/barrier failed: ") + e.what());
+  } catch (...) {
+    throw SiriusSharedCleanupStepFailure(
+      "shared downgrade executor drain/barrier failed: unknown exception");
   }
 
   // Wrappers that read the gate as open immediately before quiesce() landed may have pushed a
@@ -590,7 +615,18 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // nor dangles it. Batches still present are leaked — operators should have popped
   // everything — and are reported by the repository destructors, attributed to this query
   // (see data_repository_manager_registry::create_for_query).
-  data_repository_registry_.erase(query_id);
+  //
+  // SHARED-verdict step (D5): a throw here is a registry invariant break (the map every
+  // query's begin/end and every sweep goes through), not a this-query-only failure.
+  try {
+    inject_step_fault("repository_erase");
+    data_repository_registry_.erase(query_id);
+  } catch (const std::exception& e) {
+    throw SiriusSharedCleanupStepFailure(std::string("repository registry erase failed: ") +
+                                         e.what());
+  } catch (...) {
+    throw SiriusSharedCleanupStepFailure("repository registry erase failed: unknown exception");
+  }
 
   // Drop THIS query's scan-manager providers; any other in-flight query keeps scanning.
   // Repositories are already cleared above, so downstream data_batches that referenced
@@ -613,11 +649,38 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   }
 }
 
+void SiriusContext::mark_shared_cleanup_step_failure(sirius::query_id_t query_id,
+                                                     const char* site,
+                                                     const char* what) noexcept
+{
+  // SHARED verdict (D5, step-level): the failing step exercises a subsystem every co-tenant's
+  // cleanup goes through next (a shared downgrade executor, the repository registry). The
+  // process-wide latch is the correct response; the caller still drops the failing query's
+  // own state best-effort. Deliberately loud, like the CUDA-corruption path in
+  // classify_query_failure: this turns one query's failure into process-fatal-for-GPU.
+  mark_runtime_unavailable();
+  try {
+    SIRIUS_LOG_ERROR(
+      "SiriusContext::{}: query {} failed a SHARED cleanup step — the shared GPU runtime is "
+      "presumed corrupt for the whole process, marking it UNAVAILABLE (all Sirius queries will "
+      "now error; CPU execution continues): {}",
+      site,
+      sirius::value_of(query_id),
+      what);
+  } catch (...) {  // best-effort observability
+  }
+}
+
 void SiriusContext::run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
                                                    std::string_view end_tag) noexcept
 {
   try {
     run_mandatory_cleanup(query_id, end_tag);
+  } catch (SiriusSharedCleanupStepFailure& e) {
+    // D5, step-level: a SHARED subsystem failed mid-cleanup — latch the runtime, then drop
+    // this query's state best-effort like every other failure.
+    mark_shared_cleanup_step_failure(query_id, "run_mandatory_cleanup_backstop", e.what());
+    drop_query_runtime_state_best_effort(query_id);
   } catch (std::exception& e) {
     // D5: contained to this query unless the classifier finds shared (CUDA)
     // corruption. Either way the query's own state is dropped best-effort.
@@ -912,6 +975,15 @@ void SiriusContext::StandaloneQueryScope::finish()
         "injected mandatory-cleanup failure (sirius_test_inject_cleanup_error)");
     }
     ctx_.run_mandatory_cleanup(window_id_, end_tag_);
+  } catch (SiriusSharedCleanupStepFailure& e) {
+    // D5, step-level: a SHARED subsystem failed mid-cleanup (a shared downgrade executor's
+    // drain/barrier, or the repository registry) — latch the runtime, then contain this
+    // query's own state exactly like the per-query path below.
+    state_ = scope_state::FAILED;
+    ctx_.mark_shared_cleanup_step_failure(window_id_, "run_mandatory_cleanup", e.what());
+    ctx_.drop_query_runtime_state_best_effort(window_id_);
+    log_window_event("end", "cleanup_failed");
+    throw;
   } catch (std::exception& e) {
     // D5: a mandatory-cleanup failure poisons THIS query, not the runtime.
     // The destructor must NOT run a second pass over half-cleaned state:

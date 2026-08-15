@@ -220,6 +220,18 @@ class SiriusBeginWindowFailureException : public ExecutorException {
   explicit SiriusBeginWindowFailureException(const string& msg) : ExecutorException(msg) {}
 };
 
+/// \brief Internal to the mandatory cleanup (D5, step-level): a SHARED-subsystem cleanup step
+/// failed — a shared downgrade executor's per-query drain / in-flight barrier, or a
+/// repository-registry invariant break. Unlike a per-query step failure, this is direct
+/// evidence that the SHARED runtime is wedged or corrupt (every co-tenant's cleanup drains
+/// the same executors and registry next), so the catch sites latch the process-wide
+/// runtime_health instead of running the per-query classifier. Typed, so the dispatch never
+/// depends on message text; never escapes the cleanup call sites.
+class SiriusSharedCleanupStepFailure : public std::runtime_error {
+ public:
+  explicit SiriusSharedCleanupStepFailure(const std::string& msg) : std::runtime_error(msg) {}
+};
+
 /// \brief Manages the lifetime of the sirius_context within a DuckDB ClientContext.
 class SiriusContext : public ClientContextState {
  public:
@@ -390,6 +402,26 @@ class SiriusContext : public ClientContextState {
   }
   /// \brief Throw the stable runtime-unavailable error (non-invalidating).
   [[noreturn]] void throw_runtime_unavailable() const;
+
+  /// \brief TEST ONLY: step-scoped fault injection for run_mandatory_cleanup. The injector is
+  /// invoked at the head of each classified step group with that step's label
+  /// ("task_creator_reset", "downgrade_drain", "repository_erase"); a throw from it is
+  /// handled exactly like a failure of that step, which is how the step-level D5 dispatch
+  /// (shared latch vs per-query containment) is unit-tested without corrupting a real
+  /// subsystem. Empty (the default) is a no-op on every path.
+  void inject_cleanup_step_fault_for_testing(
+    std::function<void(std::string_view step)> injector) noexcept
+  {
+    cleanup_step_fault_injector_ = std::move(injector);
+  }
+
+  /// \brief TEST ONLY: drive the noexcept cleanup backstop directly (it is private —
+  /// production reaches it only through StandaloneQueryScope). Pairs with the injector above
+  /// to unit-test the step-level D5 dispatch on a bare context.
+  void run_mandatory_cleanup_backstop_for_testing(sirius::query_id_t query_id) noexcept
+  {
+    run_mandatory_cleanup_backstop(query_id, "test");
+  }
   /// \brief Count of per-query cleanup/begin failures that were contained to
   /// their own query (runtime NOT latched). Diagnostic / test observability.
   [[nodiscard]] std::uint64_t per_query_cleanup_failures() const noexcept
@@ -841,6 +873,14 @@ class SiriusContext : public ClientContextState {
                               const char* site,
                               const char* what) noexcept;
 
+  /// \brief D5 step-level SHARED verdict: a shared-subsystem cleanup step failed (see
+  /// SiriusSharedCleanupStepFailure). Latches the process-wide runtime_health and logs loudly;
+  /// the caller still drops the failing query's state best-effort. noexcept: runs at catch
+  /// sites, possibly during unwind.
+  void mark_shared_cleanup_step_failure(sirius::query_id_t query_id,
+                                        const char* site,
+                                        const char* what) noexcept;
+
   /// \brief Best-effort per-query teardown for latched-unavailable paths, where no later
   /// window will ever run the in-cleanup reset: drops @p query_id's task_creator state and its
   /// queued tasks. Each step is separately guarded; neither can throw.
@@ -882,6 +922,9 @@ class SiriusContext : public ClientContextState {
   // Count of query failures contained per-query by classify_query_failure()
   // (runtime NOT latched). Diagnostic / test observability.
   std::atomic<std::uint64_t> per_query_cleanup_failures_{0};
+  /// TEST ONLY; see inject_cleanup_step_fault_for_testing(). Read on the cleanup path only,
+  /// set before the window under test — no synchronization by design.
+  std::function<void(std::string_view)> cleanup_step_fault_injector_;
   // Monotonic execution-window id for window-keyed logging.
   /// 32-bit to match sirius::query_id_t, which task_creator packs into the scheduling
   /// priority. The first window gets id 1, so 0 is never a live query id — and

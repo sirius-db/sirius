@@ -371,15 +371,29 @@ completion handler and nothing else.
 
 ### Failure classification (D5)
 
-**File:** `src/sirius_context.cpp` — `classify_query_failure()`
+**File:** `src/sirius_context.cpp` — `classify_query_failure()`,
+`mark_shared_cleanup_step_failure()`
 
 A begin-window or mandatory-cleanup failure is classified at its catch site. The default verdict
 is **per-query**: the query errors, its state is dropped best-effort
 (`drop_query_runtime_state_best_effort`), healthy in-flight queries keep running, and new
 queries keep admitting (`per_query_cleanup_failures()` counts these). The process-wide
-`runtime_unavailable_` latch fires **only** for genuinely shared corruption — today, a sticky
-CUDA error that survives a `cudaGetLastError()` clear (the device context is lost for the whole
-process). Once latched, every later attempt to enter an execution or plan window gets a stable,
+`runtime_unavailable_` latch fires **only** for genuinely shared corruption:
+
+- a sticky CUDA error that survives a `cudaGetLastError()` clear (the device context is lost
+  for the whole process) — probed by `classify_query_failure()` on any failure; or
+- **step-level (D5 follow-up)**: a failure of a SHARED cleanup step inside
+  `run_mandatory_cleanup` — the shared downgrade executors' per-query drain / in-flight
+  barrier, or the repository registry's erase. These steps rethrow as the typed
+  `SiriusSharedCleanupStepFailure`, which the catch sites map straight to the latch
+  (`mark_shared_cleanup_step_failure`): every co-tenant's cleanup drains the same executors
+  and registry next, so a wedge or invariant break there is not a this-query-only event.
+  Failures of the query-scoped steps (its task_creator reset, queue sweeps, scan reset, plan
+  destruction) keep the per-query default. Unit-tested via
+  `inject_cleanup_step_fault_for_testing`
+  (`test/cpp/integration/test_cleanup_step_classification.cpp`).
+
+Once latched, every later attempt to enter an execution or plan window gets a stable,
 session-preserving `SiriusRuntimeUnavailableException` (never INTERNAL/FATAL — CPU queries must
 continue). A cleanup failure never runs a second pass over half-cleaned state: `finish()`'s
 catch classifies, drops best-effort, releases the slot, and lets the query error; the destructor
