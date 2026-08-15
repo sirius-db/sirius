@@ -60,6 +60,16 @@ concept no_alloc_materializable = requires(Owner& owner) {
   { (*owner).release() } -> std::same_as<std::vector<std::unique_ptr<cudf::column>>>;
 };
 
+/**
+ * @brief An owner that tracks consumer events on the storage behind the view
+ *        (canonically @c cucascade::read_only_data_batch, whose read lock is
+ *        what keeps a cached batch alive while the view is consumed).
+ */
+template <typename Owner>
+concept consumer_event_recording = requires(Owner const& owner, rmm::cuda_stream_view stream) {
+  owner.record_consumer_event(stream);
+};
+
 //===----------------------------------------------------------------------===//
 // my_view
 //===----------------------------------------------------------------------===//
@@ -150,6 +160,13 @@ class my_view {
     return _model->materialize(_selection, stream, mr);
   }
 
+  /// Forward a consumer-event record to the type-erased owner. No-op unless the
+  /// owner is @ref consumer_event_recording.
+  void record_consumer_event(rmm::cuda_stream_view stream)
+  {
+    _model->record_consumer_event(stream);
+  }
+
  private:
   struct owner_concept {
     virtual ~owner_concept() = default;
@@ -160,6 +177,9 @@ class my_view {
       std::span<const cudf::size_type> selection,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) = 0;
+
+    /// Default no-op for owners that do not track consumer events.
+    virtual void record_consumer_event(rmm::cuda_stream_view) {}
   };
 
   template <typename Owner>
@@ -203,6 +223,11 @@ class my_view {
         stream.synchronize();
         return out;
       }
+    }
+
+    void record_consumer_event([[maybe_unused]] rmm::cuda_stream_view stream) override
+    {
+      if constexpr (consumer_event_recording<Owner>) { _owner.record_consumer_event(stream); }
     }
 
     Owner _owner;
@@ -309,6 +334,15 @@ class owning_table_view {
   /// order (projection + reorder). Never allocates; demotes an owned table to a
   /// view first if necessary. Throws on out-of-range or duplicate positions.
   void select_columns(std::span<const std::size_t> positions) const;
+
+  /// Record on the data owner behind the view that reads of the exposed view
+  /// have been ENQUEUED on @p stream (see data_batch::record_consumer_event).
+  /// Call after enqueuing the reads and before this handle — whose owner may
+  /// hold the read lock keeping a cached batch alive — is dropped or
+  /// reassigned, so a later reclaim of the batch is ordered after the reads.
+  /// No-op for owned-table and empty states, and for owners that do not track
+  /// consumer events. Never allocates or syncs.
+  void record_consumer_event(rmm::cuda_stream_view stream) const;
 
   /// Realize a view state into an owned table. No-op if already materialized or
   /// empty. May allocate (copying path) depending on the underlying owner.

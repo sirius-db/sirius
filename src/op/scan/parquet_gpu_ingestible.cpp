@@ -1192,6 +1192,12 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
     auto const data_positions = output_data_positions(*_plan);
     auto filtered             = data_positions.empty() ? exec.select(input.table.view())
                                                        : exec.select(input.table.view(), data_positions);
+    // The select above only ENQUEUED its reads of input.table's view on `stream`. When
+    // that view is served from a cached batch, input.table's owner holds the batch's
+    // read lock and the reassignment below drops it immediately — the record must
+    // happen after the enqueue and before the drop so a reclaim of the batch is
+    // ordered after these in-flight reads.
+    input.table.record_consumer_event(stream);
     input = filtered_table{owning_table_view{std::move(filtered)}, filter_state::ROW_FILTERED};
     SIRIUS_LOG_DEBUG(
       "[parquet_gpu_ingestible::post_filter_and_project] Applied duckdb filter expression "

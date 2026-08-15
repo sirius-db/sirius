@@ -38,13 +38,16 @@
 // (cucascade/test/cudf/test_release_table_stream.cpp and
 // cucascade/test/data/test_consumer_events.cpp). This suite covers only what
 // the Sirius layer adds: the real converter registry + memory spaces behind
-// the steal-path stress, its matched sensitivity (non-vacuity) check, and the
-// production downgrade discipline through install_converted_representation.
+// the steal-path stress, its matched sensitivity (non-vacuity) check, the
+// production downgrade discipline through install_converted_representation,
+// and the filtered-serving record path through owning_table_view's
+// type-erased owner.
 
 #include "catch.hpp"
 #include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/scan/owning_table_view.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -474,6 +477,102 @@ TEST_CASE("consumer events order install_converted_representation after in-fligh
   cudaMemcpyAsync(
     host_result.data(), result_dev, kBytes, cudaMemcpyDeviceToHost, reader_stream.value());
   reader_stream.synchronize();
+
+  std::size_t mismatches = 0;
+  for (std::size_t i = 0; i < kRows; ++i) {
+    if (host_result[i] != seed + static_cast<std::int64_t>(i)) { ++mismatches; }
+  }
+  INFO("corrupted elements: " << mismatches << " of " << kRows);
+  REQUIRE(mismatches == 0);
+
+  cudaFree(scratch);
+  cudaFree(result_dev);
+}
+
+//===----------------------------------------------------------------------===//
+// 4. Filtered-serving path: the owning_table_view record reaches the batch and
+//    orders a convert reclaim after the enqueued select's reads
+//===----------------------------------------------------------------------===//
+// Replicates the exact filtered scan serving sequence — driving the real
+// ingestibles here would need full scan plans and bind data, so the test runs
+// the same steps against the same APIs the production code uses:
+//   1. gpu_ingestible::materialize_table (cached branch): the batch's view is
+//      served as an owning_table_view whose type-erased owner is the batch's
+//      read_only_data_batch (the read-lock holder).
+//   2. post_filter_and_project: a select-like read of that view is enqueued on
+//      the task stream, then owning_table_view::record_consumer_event(stream)
+//      — the call this test pins — records through the type erasure.
+//   3. The owner is dropped mid-flight (parquet reassigns `input` immediately
+//      after the select), releasing the read lock with the reads pending.
+//   4. A reclaim runs through the path that now awaits consumers
+//      (install_converted_representation via convert_to).
+TEST_CASE("filtered serving records consumer events through owning_table_view before owner drop",
+          "[stream_lineage]")
+{
+  stream_lineage_fixture f;
+  REQUIRE(f.setup());
+
+  void* scratch    = nullptr;
+  void* result_dev = nullptr;
+  REQUIRE(cudaMalloc(&scratch, kScratchMiB << 20) == cudaSuccess);
+  REQUIRE(cudaMalloc(&result_dev, kBytes) == cudaSuccess);
+
+  std::int64_t const seed = 91;
+  rmm::cuda_stream setup_stream;
+  rmm::cuda_stream task_stream;
+  rmm::cuda_stream reclaim_stream;
+
+  auto batch = make_host_batch(f, kRows, seed, false, false, setup_stream.view());
+  upload_to_gpu(f, batch, setup_stream.view());
+  setup_stream.synchronize();
+
+  {
+    // Step 1: serve the view under the read lock, owner type-erased into the
+    // owning_table_view — exactly gpu_ingestible::materialize_table.
+    auto rbatch = batch->to_read_only();
+    auto view   = sirius::get_cudf_table_view(rbatch);
+    sirius::op::scan::owning_table_view served{std::move(rbatch), view};
+
+    // Step 2: enqueue a slow select-like read of the served view on the task
+    // stream, then record — after the enqueue, while the owner still holds the
+    // read lock.
+    enqueue_blockers(scratch, kScratchMiB << 20, task_stream.view());
+    void const* src = served.view().column(0).head();
+    cudaMemcpyAsync(result_dev, src, kBytes, cudaMemcpyDeviceToDevice, task_stream.value());
+    served.record_consumer_event(task_stream.view());
+
+    // Non-vacuity: the record must reach the underlying batch through the
+    // type-erased owner. If the pass-through silently no-ops (e.g. the owner
+    // concept stops matching read_only_data_batch), this fails immediately.
+    REQUIRE_FALSE(batch->consumers_done());
+
+    // Step 3: drop the owner mid-flight, releasing the read lock — the
+    // parquet reassignment shape.
+    served.drop();
+  }
+
+  // Step 4: reclaim through the production downgrade discipline. With the
+  // record in place, install_converted_representation must not destroy the old
+  // GPU representation until the recorded reads have completed.
+  {
+    auto mut = batch->to_mutable();
+    mut.rebind_stream(reclaim_stream.view());
+    mut.convert_to<cucascade::host_data_representation>(
+      sirius::converter_registry::get(), f.host0, reclaim_stream.view());
+    // The reclaim host-synced behind await_consumers: the select-like read
+    // must be complete by now.
+    CHECK(cudaStreamQuery(task_stream.value()) == cudaSuccess);
+    REQUIRE(batch->consumers_done());
+  }
+
+  // Churn the pool: had the reclaim freed the GPU buffers early, these
+  // allocations would have recycled them under the still-pending read.
+  hammer_conversions(f, reclaim_stream.view(), 3, kRows / 4);
+
+  std::vector<std::int64_t> host_result(kRows);
+  cudaMemcpyAsync(
+    host_result.data(), result_dev, kBytes, cudaMemcpyDeviceToHost, task_stream.value());
+  task_stream.synchronize();
 
   std::size_t mismatches = 0;
   for (std::size_t i = 0; i < kRows; ++i) {

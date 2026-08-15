@@ -366,6 +366,12 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
       // Nothing to project away, or output_arity == 0 (count(*)) — keep all columns.
       final_table = owning_table_view{exec.select(input.table.view())};
     }
+    // The select above only ENQUEUED its reads of input.table's view on `stream`. When
+    // that view is served from a cached batch, input.table's owner holds the batch's
+    // read lock and is dropped with no stream sync of its own — the record must happen
+    // after the enqueue and before the drop so a reclaim of the batch is ordered after
+    // these in-flight reads.
+    input.table.record_consumer_event(stream);
   } else {
     final_table = std::move(input.table);
   }
