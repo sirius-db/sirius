@@ -1,5 +1,14 @@
 # Concurrent Query Execution — Execution Summary
 
+> **STATUS ADDENDUM (2026-08-15, not by the original author).** This summary describes the state
+> at the end of the `concurrency3` work and is preserved as written. Much of what it lists as
+> remaining has since been fixed on `integration/concurrency-full`: the single-flight mutex is
+> now a counted slot pool; the A7/B1/B2/B5/B9/C4/D3/D5/D6 items, the full E group, and F1/F3/F4
+> are closed; and the first G-group harness pieces (G1/G2) exist. See
+> [01-bringup-triage.md](01-bringup-triage.md) for the current
+> per-item status with evidence, and `docs/super-sirius/concurrency-model.md` for the
+> as-built architecture documentation. Nothing below this line has been edited.
+
 What was built, what was not, and what to do next.
 
 **Branch:** `concurrency3` (base `a35be838`) · **10 commits** · 32 files, +3142 / −239
