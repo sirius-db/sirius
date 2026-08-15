@@ -726,6 +726,7 @@ sirius::query_config_snapshot SiriusContext::snapshot_query_config() const
   return sirius::query_config_snapshot{
     .params              = config_.get_operator_params(),
     .expression_strategy = Config::EXPRESSION_EVALUATOR_STRATEGY.load(std::memory_order_relaxed),
+    .compression         = config_.get_compression_config(),
   };
 }
 
@@ -742,13 +743,29 @@ void SiriusContext::update_operator_params(
   mutate(config_.get_operator_params());
 }
 
+sirius::compression_config SiriusContext::query_compression_config() const
+{
+  if (const auto* snapshot = sirius::current_query_config_snapshot()) {
+    return snapshot->compression;
+  }
+  return snapshot_query_config().compression;
+}
+
+void SiriusContext::update_compression_config(
+  const std::function<void(sirius::compression_config&)>& mutate)
+{
+  std::lock_guard<std::mutex> lock(operator_params_mutex_);
+  mutate(config_.get_compression_config());
+}
+
 SiriusContext::SlotGuard::SlotGuard(SiriusContext& ctx, ClientContext& context) : ctx_(ctx)
 {
   ctx_.acquire_query_lifecycle_slot(&context);
-  // SNAPSHOT-AT-WINDOW-BEGIN (E1/E2): freeze the SET-mutable config for this
-  // window at admission. operator_params is all-scalar so the copy itself
-  // cannot throw; the defensive catch keeps the slot released even against a
-  // theoretical lock failure (a throwing ctor never runs this destructor).
+  // SNAPSHOT-AT-WINDOW-BEGIN (E1/E2/E3): freeze the SET-mutable config for
+  // this window at admission. The copy is small (scalars plus the compression
+  // plan-dir string) but can theoretically throw; the defensive catch keeps
+  // the slot released on any throw (a throwing ctor never runs this
+  // destructor).
   try {
     config_snapshot_.emplace(ctx_.snapshot_query_config());
   } catch (...) {

@@ -639,6 +639,25 @@ class SiriusContext : public ClientContextState {
   /// blocking the SET.
   void update_operator_params(const std::function<void(sirius::operator_params&)>& mutate);
 
+  /// \brief The pin_table compression config the CURRENT operation must use
+  /// (register E3).
+  ///
+  /// Same contract as query_operator_params(): the calling thread's
+  /// execution-window snapshot when one is installed (pin_table materializes
+  /// inside its own window), else a fresh coherent copy of the live struct. A
+  /// pin therefore reads the settings — including the input_plan_dir string it
+  /// walks with fs::directory_iterator — as of its own admission; a concurrent
+  /// SET affects only operations admitted after it.
+  [[nodiscard]] sirius::compression_config query_compression_config() const;
+
+  /// \brief Apply one SET callback's mutation to the live compression_config
+  /// (register E3).
+  ///
+  /// Mirror of update_operator_params: serialized against other writers and
+  /// against snapshot_query_config() via operator_params_mutex_, and does not
+  /// hold an execution-window slot.
+  void update_compression_config(const std::function<void(sirius::compression_config&)>& mutate);
+
   /// \brief Whether the Sirius context has been initialized (config loaded, GPU ready).
   [[nodiscard]] bool is_initialized() const noexcept { return is_initialized_; }
 
@@ -778,10 +797,11 @@ class SiriusContext : public ClientContextState {
   std::atomic<std::uint32_t> next_window_id_{0};
   bool is_initialized_ = false;
   sirius::sirius_config config_;
-  /// Guards the SET-mutable parts of config_ (operator_params): SET callbacks
-  /// write under it (update_operator_params) and admission snapshots read
-  /// under it (snapshot_query_config), so neither can observe a torn value.
-  /// SETs are rare, so a plain mutex is enough.
+  /// Guards the SET-mutable parts of config_ (operator_params and
+  /// compression_config): SET callbacks write under it
+  /// (update_operator_params / update_compression_config) and admission
+  /// snapshots read under it (snapshot_query_config), so neither can observe
+  /// a torn value. SETs are rare, so a plain mutex is enough.
   mutable std::mutex operator_params_mutex_;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
   // Single source of truth for the GPU<->NUMA hardware topology, scoped to the

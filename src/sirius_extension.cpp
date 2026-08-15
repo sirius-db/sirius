@@ -1317,12 +1317,19 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   // ingestible_table_info and drives later cache-hit matching + the gather.
   auto cache_info = sirius::scan_manager::cache_entry_info::from(ingestible->table_info());
 
-  // Compression config (tier-agnostic): load the per-table plan DSL from the plan
-  // directory (if configured), then resolve it into a compression_pin_config. Both
-  // the host and GPU pin paths compress with this when enabled.
-  const auto& comp_cfg = sirius_ctx->get_config().get_compression_config();
+  // Compression config (tier-agnostic), read from this pin's admission
+  // snapshot (register E3): the four pin_table_compression* settings —
+  // including the input_plan_dir string walked with fs::directory_iterator
+  // below — are SET-mutable on the shared SiriusContext, so the pin uses the
+  // coherent copy frozen when its window began; a concurrent SET can neither
+  // tear the string nor reshape this pin mid-run.
+  const auto comp_cfg = sirius_ctx->query_compression_config();
   const bool comp_globally_enabled =
     comp_cfg.enable_pin_table_compression && !comp_cfg.input_plan_dir.empty();
+
+  // Load the per-table plan DSL from the plan directory (if configured), then
+  // resolve it into a compression_pin_config. Both the host and GPU pin paths
+  // compress with this when enabled.
   if (comp_globally_enabled) {
     namespace fs     = std::filesystem;
     const auto& name = data.args.name;
@@ -2030,22 +2037,40 @@ static void SetEnableGpuExecution(ClientContext& context, SetScope scope, Value&
   SIRIUS_LOG_DEBUG("Updated gpu_execution to {}", BooleanValue::Get(parameter));
 }
 
-static void SetEnablePinTableCompression(ClientContext& context, SetScope scope, Value& parameter)
+// compression_config writes (register E3): same discipline as the
+// operator_params setters above — every SET routes through
+// SiriusContext::update_compression_config, which holds operator_params_mutex_
+// (the lock the execution windows take their admission snapshot under), so a
+// SET takes effect for pins ADMITTED after it and can never tear the
+// input_plan_dir string out from under a pin's directory walk.
+static void update_compression_config(
+  ClientContext& context, const std::function<void(sirius::compression_config&)>& mutate)
 {
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!sirius_ctx) { return; }
-  sirius_ctx->get_config().get_compression_config().enable_pin_table_compression =
-    BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated pin_table_compression to {}", BooleanValue::Get(parameter));
+  if (sirius_ctx == nullptr) {
+    SIRIUS_LOG_DEBUG("SiriusContext not available; compression_config SET ignored");
+    return;
+  }
+  sirius_ctx->update_compression_config(mutate);
+}
+
+static void SetEnablePinTableCompression(ClientContext& context, SetScope scope, Value& parameter)
+{
+  const bool enabled = BooleanValue::Get(parameter);
+  update_compression_config(context, [&](sirius::compression_config& compression) {
+    compression.enable_pin_table_compression = enabled;
+  });
+  SIRIUS_LOG_DEBUG("Updated pin_table_compression to {}", enabled);
 }
 
 static void SetPinTableInputCompressionPlanDir(ClientContext& context,
                                                SetScope scope,
                                                Value& parameter)
 {
-  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!sirius_ctx) { return; }
-  sirius_ctx->get_config().get_compression_config().input_plan_dir = StringValue::Get(parameter);
+  auto dir = StringValue::Get(parameter);
+  update_compression_config(context, [&](sirius::compression_config& compression) {
+    compression.input_plan_dir = std::move(dir);
+  });
   SIRIUS_LOG_DEBUG("Updated pin_table_input_compression_plan_dir");
 }
 
@@ -2053,10 +2078,10 @@ static void SetPinTableCompressionMinBatchSizeBytes(ClientContext& context,
                                                     SetScope scope,
                                                     Value& parameter)
 {
-  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!sirius_ctx) { return; }
-  sirius_ctx->get_config().get_compression_config().min_batch_size_bytes =
-    static_cast<std::size_t>(UBigIntValue::Get(parameter));
+  auto const bytes = static_cast<std::size_t>(UBigIntValue::Get(parameter));
+  update_compression_config(context, [&](sirius::compression_config& compression) {
+    compression.min_batch_size_bytes = bytes;
+  });
   SIRIUS_LOG_DEBUG("Updated pin_table_compression_min_batch_size_bytes");
 }
 
@@ -2064,10 +2089,10 @@ static void SetPinTableCompressionMaxCompressedFraction(ClientContext& context,
                                                         SetScope scope,
                                                         Value& parameter)
 {
-  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!sirius_ctx) { return; }
-  sirius_ctx->get_config().get_compression_config().max_compressed_fraction =
-    DoubleValue::Get(parameter);
+  const double fraction = DoubleValue::Get(parameter);
+  update_compression_config(context, [&](sirius::compression_config& compression) {
+    compression.max_compressed_fraction = fraction;
+  });
   SIRIUS_LOG_DEBUG("Updated pin_table_compression_max_compressed_fraction");
 }
 
