@@ -80,6 +80,13 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
   // space match guarantees the stream and the data live on the same device (important for
   // multi-GPU). The mismatch case below converts via `stream`, which already allocates the new
   // table on it, so no rebind is needed there.
+  //
+  // STREAM-LINEAGE (reader ordering): rebind_stream orders `stream` after the batch's
+  // previously-bound stream before adopting the deallocation binding, and this rebind enrolls
+  // THIS consumer's stream into that lineage. The chain producer -> consumer(s) -> downgrade
+  // is what makes the eventual free (wherever it lands) ordered after every enqueued reader;
+  // a downgrade rebind that breaks this chain frees under a consumer whose kernels are still
+  // in flight (its host-scoped read lock has already dropped).
   if (auto mut = batch->try_to_mutable()) {
     const auto* current_space = mut->get_memory_space();
     const auto* rebind_target =

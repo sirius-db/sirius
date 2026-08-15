@@ -225,3 +225,111 @@ TEST_CASE("builtin fast GPU->HOST conversion orders after the producer's writer 
   cucascade::register_builtin_converters(registry);
   run_ordering_scenario(registry);
 }
+
+// Regression guard for the reader-side seam of the freed-while-read class: a
+// downgrade grabs a parked batch whose consumer already ENQUEUED reads on the
+// producer stream and returned (read lock dropped, kernels in flight — the
+// writer event is long signaled, so the converter-side producer-ordering wait
+// does not block). rebind_stream() then moves the deallocation binding onto the
+// idle downgrade stream, and the conversion's free executes there while the
+// reader still runs: the async pool unmaps/rebinds the VA under the reader
+// (in production, a row-hash distinct sketch MMU-faulting on scribbled string
+// offsets). The fix (cucascade e19f5d3) makes rebind_stream() itself record an
+// event on the previously-bound stream and fence the adopting stream behind it.
+TEST_CASE("rebind_stream orders the adopting stream after a straggler reader",
+          "[spill_converter_ordering]")
+{
+  cucascade::representation_converter_registry registry;
+  cucascade::register_builtin_converters(registry);
+  warm_conversion_path(registry);
+
+  rmm::cuda_stream reader_stream;     // producer AND straggler-reader stream
+  rmm::cuda_stream downgrade_stream;  // the stream adopting the dealloc binding
+
+  // Build the column, settle the EXPECTED bytes, and record the writer event on
+  // the reader stream with NO work pending — the writer event must be signaled
+  // so this guard cannot be satisfied by the converter's writer-event wait.
+  auto col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                       static_cast<cudf::size_type>(kRows),
+                                       cudf::mask_state::UNALLOCATED,
+                                       reader_stream.view());
+  {
+    std::vector<std::int32_t> expected(kRows, kExpected);
+    REQUIRE(cudaMemcpyAsync(col->mutable_view().head<void>(),
+                            expected.data(),
+                            kRows * sizeof(std::int32_t),
+                            cudaMemcpyHostToDevice,
+                            reader_stream.value()) == cudaSuccess);
+    REQUIRE(cudaStreamSynchronize(reader_stream.value()) == cudaSuccess);
+  }
+  auto const* batch_bytes = col->view().head<std::int32_t>();
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  auto gpu_rep = std::make_unique<cucascade::gpu_table_representation>(
+    std::make_unique<cudf::table>(std::move(cols)), *env().gpu_space, reader_stream.view());
+
+  // Park the reader stream, then enqueue the straggler READ behind the park —
+  // exactly a consumer that enqueued its kernel and dropped its read lock.
+  delay_state gate;
+  std::vector<std::int32_t> reader_out(kRows, 0);
+  REQUIRE(cudaHostRegister(reader_out.data(), kRows * sizeof(std::int32_t), 0) == cudaSuccess);
+  REQUIRE(cudaLaunchHostFunc(reader_stream.value(), block_until_released, &gate) == cudaSuccess);
+  REQUIRE(cudaMemcpyAsync(reader_out.data(),
+                          batch_bytes,
+                          kRows * sizeof(std::int32_t),
+                          cudaMemcpyDeviceToHost,
+                          reader_stream.value()) == cudaSuccess);
+
+  // The downgrade-side rebind. FIXED: the adopting stream is fenced behind the
+  // parked reader stream — probe it directly. PRE-FIX: the probe event completes
+  // immediately (no edge), and the free below would land on the idle stream.
+  gpu_rep->rebind_stream(downgrade_stream.view());
+  cudaEvent_t probe{nullptr};
+  REQUIRE(cudaEventCreateWithFlags(&probe, cudaEventDisableTiming) == cudaSuccess);
+  REQUIRE(cudaEventRecord(probe, downgrade_stream.value()) == cudaSuccess);
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  CHECK(cudaEventQuery(probe) == cudaErrorNotReady);  // the reader-ordering edge
+
+  // Full downgrade shape end-to-end: convert on the adopting stream, free the
+  // source, and force VA reuse with a poison fill — all while the reader is
+  // parked (pre-fix this scribbles the reader's input; post-fix every step is
+  // ordered after the reader). The releaser opens the gate mid-flight because
+  // a FIXED convert host-blocks on its internal stream sync.
+  std::thread releaser([&gate] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(800));
+    gate.release.store(true, std::memory_order_release);
+  });
+  auto host_rep = registry.convert<cucascade::host_data_representation>(
+    *gpu_rep, env().host_space, downgrade_stream.view());
+  gpu_rep.reset();  // stream-ordered free on the rebound (downgrade) stream
+  {
+    rmm::device_buffer poison(kRows * sizeof(std::int32_t), downgrade_stream.view());
+    REQUIRE(cudaMemsetAsync(
+              poison.data(), 0xEE, kRows * sizeof(std::int32_t), downgrade_stream.value()) ==
+            cudaSuccess);
+    REQUIRE(cudaStreamSynchronize(downgrade_stream.value()) == cudaSuccess);
+  }
+  releaser.join();
+  REQUIRE(cudaStreamSynchronize(reader_stream.value()) == cudaSuccess);
+  REQUIRE(cudaStreamSynchronize(downgrade_stream.value()) == cudaSuccess);
+  REQUIRE(cudaEventDestroy(probe) == cudaSuccess);
+  REQUIRE(cudaHostUnregister(reader_out.data()) == cudaSuccess);
+
+  std::size_t scribbled = 0;
+  for (auto v : reader_out) {
+    if (v != kExpected) { ++scribbled; }
+  }
+  INFO("straggler reader observed " << scribbled << " scribbled values of " << kRows);
+  REQUIRE(scribbled == 0);
+
+  // The host image must also carry the expected bytes (the conversion read a
+  // fully-written, still-live source).
+  auto const out = read_back(registry, *host_rep, downgrade_stream.view());
+  REQUIRE(out.size() == kRows);
+  std::size_t torn = 0;
+  for (auto v : out) {
+    if (v != kExpected) { ++torn; }
+  }
+  INFO("host image carries " << torn << " torn values of " << kRows);
+  REQUIRE(torn == 0);
+}

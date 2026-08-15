@@ -118,6 +118,14 @@ class convertible_data_batch : public convertible_data {
       // originally produced on. We hold the exclusive (mutable) lock here, and convert_to()
       // synchronizes `stream` after the D2H copy and before destroying the source
       // representation, so the free is correctly ordered. No-op for non-GPU-table sources.
+      //
+      // STREAM-LINEAGE (reader ordering): rebind_stream itself orders `stream` after the
+      // batch's previously-bound stream — the stream whose enqueued kernels may still READ
+      // this memory. A consumer enqueues its reads on its task stream and returns; its read
+      // lock drops with device work in flight, so try_to_mutable() succeeding does NOT mean
+      // the batch is quiescent. Without that edge, this free lands on the idle downgrade
+      // stream while a straggler reader is still consuming the batch, and the async pool
+      // unmaps/rebinds the VA under the kernel.
       if (cur_space != nullptr && cur_space->get_tier() == cucascade::memory::Tier::GPU) {
         mut.rebind_stream(stream);
       }
