@@ -24,6 +24,19 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   message(STATUS "CMAKE_CUDA_ARCHITECTURES not defined. Setting to 'native'.")
 endif()
 
+# CCCL 3.4.0's new warp-specialized (TMA) Blackwell DeviceScan performs an
+# out-of-bounds __shared__ read (deterministic under compute-sanitizer memcheck
+# on GB300/sm_103: "Invalid __shared__ read of size 16", reproduced standalone
+# with this CCCL against sm_100 and sm_103a alike; clean under CCCL 3.2). Every
+# cub::DeviceScan in this codebase feeds GEOMETRY (string offsets, selection
+# offsets, memcpy tuple offsets), so a misbehaving scan scribbles exactly the
+# buffers the SF1000 concurrent-refresh corruption strikes showed as garbage.
+# CCCL left this macro in as the official kill-switch for the new
+# implementation; the classic decoupled-lookback path takes over. Full analysis
+# and a 22-line standalone reproducer: docs/cccl-3.4-warpspeed-devicescan.md.
+# TODO: drop once CCCL ships a fixed warpspeed scan (tracked upstream).
+add_compile_definitions(CCCL_DISABLE_WARPSPEED_SCAN)
+
 # Optional features
 option(ENABLE_STREAM_CHECK
        "Enable stream check library for debugging default stream usage" OFF)
