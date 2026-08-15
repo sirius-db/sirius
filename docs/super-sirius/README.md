@@ -63,4 +63,4 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 12. **Configuration** — tuning knobs and runtime settings
 13. **Optimizations** — performance improvements and their mechanisms
 
-<!-- last-updated-commit: 84543810a303c81c891b2adbae222157a4e17204 -->
+<!-- last-updated-commit: 9061821048e7d64ed9c905c30f6d49612b732337 -->
