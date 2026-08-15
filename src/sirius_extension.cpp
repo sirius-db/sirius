@@ -2143,7 +2143,7 @@ static void SetGroupbySurrogateMinStringKeys(ClientContext& context,
 {
   auto* params = get_operator_params(context);
   if (!params) { return; }
-  auto slot                                = lock_operator_params_slot(context);
+  auto slot                                 = lock_operator_params_slot(context);
   params->groupby_surrogate_min_string_keys = parameter.GetValue<uint64_t>();
   SIRIUS_LOG_DEBUG("Updated config GROUPBY_SURROGATE_MIN_STRING_KEYS to {}",
                    params->groupby_surrogate_min_string_keys);

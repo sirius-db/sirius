@@ -439,16 +439,9 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
       // Surrogate-key deferral: the aggregate's sidecar carries the rowid/dummy carrier types
       // at the deferred key slots, but the merge finalizes back to the original schema — its
       // sidecar must declare the restored native carriers.
-      if (auto const& spec = merge->surrogate_spec) {
+      if (auto const& plan = merge->surrogate_restore()) {
         auto phys = merge->get_physical_types();
-        for (auto const& group : spec->groups) {
-          for (std::size_t i = 0; i < group.restore_key_slots.size(); ++i) {
-            auto const slot = static_cast<std::size_t>(group.restore_key_slots[i]);
-            if (slot < phys.size()) {
-              phys[slot] = sirius::get_cudf_type(group.restored_types[i]);
-            }
-          }
-        }
+        sirius::op::restore_deferred_carriers(*plan, phys);
         merge->set_physical_types(std::move(phys));
       }
     }

@@ -299,6 +299,7 @@ set(EXTENSION_SOURCES
     src/op/aggregate/aggregate_op_util.cpp
     src/op/aggregate/gpu_aggregate_impl.cpp
     src/op/merge/gpu_merge_impl.cpp
+    src/op/merge/gpu_surrogate_restore_impl.cpp
     src/op/order/gpu_order_impl.cpp
     src/op/partition/gpu_partition_impl.cpp
     src/op/result/host_table_chunk_reader.cpp
@@ -321,6 +322,8 @@ set(EXTENSION_SOURCES
     src/op/scan/duckdb_native_gpu_ingestible.cpp
     src/op/dynamic_filter_publish_plan.cpp
     src/op/dynamic_filter_publisher.cpp
+    src/op/groupby_surrogate_deferral.cpp
+    src/op/groupby_surrogate_store.cpp
     src/op/sirius_dynamic_filter.cpp
     src/op/sirius_physical_column_data_scan.cpp
     src/op/sirius_physical_streaming_source.cpp
@@ -712,7 +715,8 @@ set(TEST_SOURCES
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_merge.cpp
-    test/cpp/operator/aggregate/test_surrogate_groupby.cpp
+    test/cpp/operator/aggregate/test_surrogate_merge_finalize.cpp
+    test/cpp/operator/aggregate/test_surrogate_store.cpp
     test/cpp/operator/test_crc32_partition_hash.cpp
     test/cpp/operator/test_gpu_partition_impl.cpp
     test/cpp/operator/test_host_table_chunk_reader.cpp
@@ -744,6 +748,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_plan_tree_shape.cpp
     test/cpp/planner/test_projection_fold.cpp
     test/cpp/planner/test_sirius_read_parquet_scan.cpp
+    test/cpp/planner/test_surrogate_groupby_pass.cpp
     test/cpp/planner/test_query_id.cpp
     test/cpp/planner/test_query_index.cpp
     test/cpp/planner/test_tier_narrowing_policy.cpp

@@ -20,20 +20,15 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
+#include "op/merge/gpu_surrogate_restore_impl.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <cudf/binaryop.hpp>
-#include <cudf/column/column_factories.hpp>
-#include <cudf/concatenate.hpp>
-#include <cudf/copying.hpp>
-#include <cudf/groupby.hpp>
 #include <cudf/lists/count_elements.hpp>
-#include <cudf/reduction/distinct_count.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/unary.hpp>
 
-#include <cuda_runtime_api.h>
 #include <nvtx3/nvtx3.hpp>
 
 namespace sirius {
@@ -87,12 +82,12 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
 {
   child_op              = grouped_aggregate;
   _hash_partition_bytes = hash_partition_bytes;
-  if (grouped_aggregate->surrogate_spec) {
+  if (auto const& plan = grouped_aggregate->surrogate_restore()) {
     // Surrogate-key deferral: the wrapped aggregate emits rowid/dummy key carriers, but this
     // merge finalizes them back to the original string keys, so it declares (and produces)
     // the original schema.
-    surrogate_spec = grouped_aggregate->surrogate_spec;
-    types          = surrogate_spec->original_output_types;
+    _surrogate_restore = plan;
+    types              = plan->original_output_types();
   }
 }
 
@@ -226,7 +221,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
 
   // Fast path: single batch with no post-processing needed (surrogate-key deferral always
   // needs the finalization below, so it never takes this exit).
-  if (input_batches.size() == 1 && !has_avg && !has_count_distinct && !surrogate_spec) {
+  if (input_batches.size() == 1 && !has_avg && !has_count_distinct && !_surrogate_restore) {
     return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
   }
 
@@ -250,7 +245,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   // Surrogate-key deferral: materialize the deferred string keys and restore the original
   // schema before any AVG / COUNT DISTINCT post-processing (which only touches aggregate
   // slots, never key slots).
-  if (surrogate_spec) { merged = finalize_surrogate_groupby(std::move(merged), stream); }
+  if (_surrogate_restore) { merged = finalize_surrogate_groupby(std::move(merged), stream); }
 
   // If no post-processing needed, return merged result directly
   if (!has_avg && !has_count_distinct) {
@@ -330,15 +325,14 @@ void sirius_physical_grouped_aggregate_merge::on_finalize_operator()
 {
   // All merge tasks are done: drop the surrogate store's retained source accessors so the
   // batches become downgradable/freeable for whatever remains of the query.
-  if (surrogate_spec && surrogate_spec->store) {
-    auto const [count, bytes] = surrogate_spec->store->release();
-    if (count > 0) {
-      SIRIUS_LOG_INFO(
-        "groupby_surrogate_keys: released {} retained source batch accessor(s) ({} bytes) after "
-        "merge finalization",
-        count,
-        bytes);
-    }
+  if (!_surrogate_restore) { return; }
+  auto const stats = _surrogate_restore->store()->release();
+  if (stats.sources > 0) {
+    SIRIUS_LOG_INFO(
+      "groupby_surrogate_keys: released {} retained source batch accessor(s) ({} bytes) after "
+      "merge finalization",
+      stats.sources,
+      stats.bytes);
   }
 }
 
@@ -347,7 +341,7 @@ sirius_physical_grouped_aggregate_merge::finalize_surrogate_groupby(
   std::shared_ptr<::cucascade::data_batch> merged, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"grouped_aggregate_merge::finalize_surrogate"};
-  auto const& spec = *surrogate_spec;
+  auto const& plan = *_surrogate_restore;
 
   auto merged_mut = merged->to_mutable();
   auto* space     = merged_mut.get_memory_space();
@@ -359,87 +353,24 @@ sirius_physical_grouped_aggregate_merge::finalize_surrogate_groupby(
 
   // Fast path proof: if the real (non-deferred) key columns are already distinct across the
   // merged rows, every full tuple is distinct, so grouping by surrogate produced exactly the
-  // tuple grouping and no re-group is needed. The check is EXACT (cudf::distinct_count with
-  // nulls equal, matching groupby null_policy::INCLUDE semantics), so the fast path is safe by
-  // construction; when the proof fails we fall through to the conservative full-tuple re-group.
-  //
-  // NaN parity guard: SQL GROUP BY treats all NaNs as one group, but distinct_count's row
-  // comparator's NaN semantics are not contractually documented, so the proof comparator might
-  // be FINER than the grouping's on floating-point keys (two NaN rows counted distinct would
-  // fake a proof and leak a duplicate group). Floating-point real keys therefore always take
-  // the conservative re-group.
+  // tuple grouping and no re-group is needed. The proof is exact and never consulted for
+  // floating-point keys (see gpu_surrogate_restore_impl::tuples_proven_distinct); when it fails
+  // we fall through to the conservative full-tuple re-group after restoring the strings.
   bool tuples_proven_distinct = (num_rows == 0);
-  if (!tuples_proven_distinct && spec.unique_fastpath && !spec.real_key_slots.empty()) {
-    bool has_floating_point_key = false;
-    std::vector<cudf::column_view> check_cols;
-    check_cols.reserve(spec.real_key_slots.size());
-    for (int slot : spec.real_key_slots) {
-      auto view = cols.at(static_cast<std::size_t>(slot))->view();
-      if (view.type().id() == cudf::type_id::FLOAT32 ||
-          view.type().id() == cudf::type_id::FLOAT64) {
-        has_floating_point_key = true;
-        break;
-      }
-      check_cols.push_back(view);
+  if (!tuples_proven_distinct && plan.allow_unique_fastpath() && !plan.real_key_slots().empty()) {
+    std::vector<cudf::column_view> real_key_views;
+    real_key_views.reserve(plan.real_key_slots().size());
+    for (int slot : plan.real_key_slots()) {
+      real_key_views.push_back(cols.at(static_cast<std::size_t>(slot))->view());
     }
-    if (!has_floating_point_key) {
-      auto const distinct =
-        cudf::distinct_count(cudf::table_view(check_cols), cudf::null_equality::EQUAL, stream);
-      tuples_proven_distinct = (distinct == num_rows);
-    }
+    tuples_proven_distinct =
+      gpu_surrogate_restore_impl::tuples_proven_distinct(real_key_views, num_rows, stream);
   }
 
   // Materialize the deferred string key columns: per deferral-join side, gather the retained
-  // source columns at the merged rowids. Sources are concatenated in base order, which
-  // reproduces the absolute rowid address space exactly (bases are contiguous by construction
-  // and reserve/commit is deduplicated per batch id).
-  for (auto const& group : spec.groups) {
-    if (num_rows == 0) {
-      for (std::size_t i = 0; i < group.restore_key_slots.size(); ++i) {
-        cols.at(static_cast<std::size_t>(group.restore_key_slots[i])) =
-          cudf::make_empty_column(sirius::get_cudf_type(group.restored_types[i]));
-      }
-      continue;
-    }
-
-    auto const sources = spec.store->snapshot(group.from_left);
-    std::vector<cudf::table_view> pieces;
-    pieces.reserve(sources.size());
-    for (auto const& src : sources) {
-      // STREAM-LINEAGE: the retained batches were written on the deferral join's streams; order
-      // this task's stream after each writer event before reading their memory.
-      if (auto const writer_event = src.batch.get_writer_event(); writer_event != nullptr) {
-        auto const status = cudaStreamWaitEvent(stream.value(), writer_event, 0);
-        if (status != cudaSuccess) {
-          throw std::runtime_error(
-            std::string("finalize_surrogate_groupby: writer-event wait failed: ") +
-            cudaGetErrorString(status));
-        }
-      }
-      pieces.push_back(sirius::get_cudf_table_view(src.batch).select(group.source_input_cols));
-    }
-    if (pieces.empty()) {
-      throw std::runtime_error(
-        "finalize_surrogate_groupby: merged rows reference deferred string sources but none "
-        "were registered by the deferral join");
-    }
-    std::unique_ptr<cudf::table> src_owned;
-    cudf::table_view src_view;
-    if (pieces.size() == 1) {
-      src_view = pieces[0];
-    } else {
-      src_owned = cudf::concatenate(pieces, stream, mr);
-      src_view  = src_owned->view();
-    }
-
-    auto const& rowid_col = cols.at(static_cast<std::size_t>(group.rowid_key_slot));
-    auto map32 = cudf::cast(rowid_col->view(), cudf::data_type{cudf::type_id::INT32}, stream, mr);
-    auto gathered =
-      cudf::gather(src_view, map32->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
-    auto gathered_cols = gathered->release();
-    for (std::size_t i = 0; i < group.restore_key_slots.size(); ++i) {
-      cols.at(static_cast<std::size_t>(group.restore_key_slots[i])) = std::move(gathered_cols[i]);
-    }
+  // source columns at the merged rowids.
+  for (auto const& group : plan.groups()) {
+    gpu_surrogate_restore_impl::restore_deferred_keys(cols, group, *plan.store(), stream, mr);
   }
 
   // Conservative path: re-group by the full restored tuple, re-combining the (composable)
@@ -450,43 +381,8 @@ sirius_physical_grouped_aggregate_merge::finalize_surrogate_groupby(
       "finalize_surrogate_groupby: distinct proof failed or fast path disabled; re-grouping {} "
       "rows by the full restored tuple",
       num_rows);
-    std::vector<cudf::column_view> key_views;
-    key_views.reserve(group_idx.size());
-    for (std::size_t i = 0; i < group_idx.size(); ++i) {
-      key_views.push_back(cols[i]->view());
-    }
-    cudf::groupby::groupby grpby_obj(cudf::table_view(key_views), cudf::null_policy::INCLUDE);
-    std::vector<cudf::groupby::aggregation_request> requests;
-    requests.reserve(cudf_aggregates.size());
-    for (std::size_t i = 0; i < cudf_aggregates.size(); ++i) {
-      cudf::groupby::aggregation_request request;
-      request.values = cols.at(group_idx.size() + i)->view();
-      switch (cudf_aggregates[i]) {
-        case cudf::aggregation::Kind::MIN:
-          request.aggregations.push_back(cudf::make_min_aggregation<cudf::groupby_aggregation>());
-          break;
-        case cudf::aggregation::Kind::MAX:
-          request.aggregations.push_back(cudf::make_max_aggregation<cudf::groupby_aggregation>());
-          break;
-        case cudf::aggregation::Kind::SUM:
-        case cudf::aggregation::Kind::COUNT_ALL:
-        case cudf::aggregation::Kind::COUNT_VALID:
-          request.aggregations.push_back(cudf::make_sum_aggregation<cudf::groupby_aggregation>());
-          break;
-        default:
-          throw std::runtime_error(
-            "finalize_surrogate_groupby: unsupported aggregate kind for re-group (planner "
-            "invariant violated): " +
-            std::to_string(static_cast<int>(cudf_aggregates[i])));
-      }
-      requests.push_back(std::move(request));
-    }
-    auto groupby_result = grpby_obj.aggregate(requests, stream, mr);
-    auto new_cols       = groupby_result.first->release();
-    for (auto& aggregation_result : groupby_result.second) {
-      new_cols.push_back(std::move(aggregation_result.results[0]));
-    }
-    cols = std::move(new_cols);
+    cols = gpu_surrogate_restore_impl::regroup_full_tuple(
+      std::move(cols), group_idx.size(), cudf_aggregates, stream, mr);
   }
 
   auto output_table = std::make_unique<cudf::table>(std::move(cols));

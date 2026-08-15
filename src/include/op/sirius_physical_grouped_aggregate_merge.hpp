@@ -105,13 +105,6 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   bool has_avg            = false;
   bool has_count_distinct = false;
 
-  //! Surrogate-key group-by deferral (see op/groupby_surrogate_deferral.hpp). When set (copied
-  //! from the wrapped HASH_GROUP_BY by wrap_hash_group_by), execute() materializes the deferred
-  //! string key columns from the retained join-side sources after aggregation — taking the
-  //! no-re-group fast path when the exact distinct check proves the key tuples distinct — and
-  //! restores this operator's declared (original) output schema.
-  std::shared_ptr<surrogate_groupby_spec> surrogate_spec;
-
   std::size_t current_partition_index = 0;
 
  public:
@@ -149,22 +142,38 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
-  //! Surrogate-key deferral finalization: materialize the deferred string key columns from the
-  //! retained join-side sources (rowid gather), taking the no-re-group fast path when the exact
-  //! distinct check over the real key slots proves the merged tuples distinct, and otherwise
-  //! re-grouping by the full restored tuple. Returns a batch in the original output schema.
-  std::shared_ptr<::cucascade::data_batch> finalize_surrogate_groupby(
-    std::shared_ptr<::cucascade::data_batch> merged, rmm::cuda_stream_view stream);
+  //! Surrogate-key group-by deferral (see op/groupby_surrogate_deferral.hpp). Acquired only via
+  //! the clone-from-aggregate constructor when the wrapped HASH_GROUP_BY carries a restore
+  //! plan; execute() then materializes the deferred string key columns from the retained
+  //! join-side sources after aggregation and restores this operator's declared (original)
+  //! output schema.
+  [[nodiscard]] std::shared_ptr<surrogate_restore_plan const> const& surrogate_restore()
+    const noexcept
+  {
+    return _surrogate_restore;
+  }
 
   //! Release the surrogate store's retained source accessors once every merge task has
-  //! finalized, so the sources become reclaimable for the rest of the query.
+  //! finalized, so the sources become reclaimable for the rest of the query. The store's
+  //! destruction at plan teardown is the RAII backstop; this hook is a deliberate early-release
+  //! policy.
   void on_finalize_operator() override;
 
  private:
+  //! Surrogate-key deferral finalization policy (frozen call order: distinct proof, then string
+  //! restore, then conservative full-tuple re-group), composing the mechanisms in
+  //! gpu_surrogate_restore_impl. Runs after merging and before AVG / COUNT DISTINCT
+  //! post-processing. Returns a batch in the original output schema.
+  std::shared_ptr<::cucascade::data_batch> finalize_surrogate_groupby(
+    std::shared_ptr<::cucascade::data_batch> merged, rmm::cuda_stream_view stream);
+
   friend class sirius::planner::sirius_physical_plan_generator;
   void set_fuse_into_parent(bool fuse) noexcept { _fuse_into_parent = fuse; }
 
   bool _fuse_into_parent = false;
+
+  //! See surrogate_restore(); set only by the clone-from-aggregate constructor.
+  std::shared_ptr<surrogate_restore_plan const> _surrogate_restore;
 };
 
 }  // namespace op
