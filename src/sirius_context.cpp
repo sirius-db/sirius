@@ -583,25 +583,13 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   }
 
   // Drop THIS query's data repositories, leaving any other in-flight query's untouched.
-  // Any batches still present are leaked — operators should have popped everything.
-  // erase() itself waits out any downgrade sweep still borrowing raw data_repository*
-  // pointers (the registry's sweep gate), so a peer's or the monitor's in-progress sweep
-  // cannot dangle when this clears the repositories.
-  {
-    auto leaked = data_repository_registry_.erase(query_id);
-    try {
-      for (auto const& info : leaked) {
-        SIRIUS_LOG_WARN(
-          "SiriusContext::run_mandatory_cleanup: query {} operator {} port '{}' still had {} "
-          "un-consumed data batch(es) (memory leak).",
-          query_id,
-          info.operator_id,
-          info.port_id,
-          info.count);
-      }
-    } catch (...) {  // best-effort observability
-    }
-  }
+  // erase() only drops the registry's map entry: a peer's or the monitor's in-progress
+  // sweep co-owns whatever it borrowed (manager, repositories, batches are all shared_ptr)
+  // and keeps it alive until it naturally finishes, so teardown neither waits for the sweep
+  // nor dangles it. Batches still present are leaked — operators should have popped
+  // everything — and are reported by the repository destructors, attributed to this query
+  // (see data_repository_manager_registry::create_for_query).
+  data_repository_registry_.erase(query_id);
 
   // Drop THIS query's scan-manager providers; any other in-flight query keeps scanning.
   // Repositories are already cleared above, so downstream data_batches that referenced
@@ -704,17 +692,9 @@ void SiriusContext::drop_query_runtime_state_best_effort(sirius::query_id_t quer
   // every batch still in it, survived until terminate(): its GPU/host memory was never returned,
   // and the downgrade executors kept sweeping it on every monitor cycle for the life of the
   // process. Guarded like every other step here so one failure cannot stop the others.
+  // Un-consumed batches are reported by the repository destructors, attributed to this query.
   try {
-    auto leaked = data_repository_registry_.erase(query_id);
-    for (auto const& info : leaked) {
-      SIRIUS_LOG_WARN(
-        "drop_query_runtime_state_best_effort: query {} operator {} port '{}' still had {} "
-        "un-consumed data batch(es) (memory leak).",
-        query_id,
-        info.operator_id,
-        info.port_id,
-        info.count);
-    }
+    data_repository_registry_.erase(query_id);
   } catch (...) {
   }
   // The window is over either way; drop the gate entry so it does not accumulate.

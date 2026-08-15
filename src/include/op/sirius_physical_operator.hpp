@@ -644,13 +644,28 @@ class sirius_physical_operator {
     /// May be NULL for dependency-only ports that carry no data flow (e.g., "dependency").
     /// Null repos are treated as "empty, not data-gating" by the base-class port handling methods
     /// (get_next_task_hint, get_next_task_input_data, all_ports_empty, push_data_batch).
+    /// A cached alias of repo_owner below (when set) — always prefer wiring through
+    /// set_repository() so the port CO-OWNS the repository it dereferences.
     ::cucascade::shared_data_repository* repo;
     duckdb::shared_ptr<pipeline::sirius_pipeline> src_pipeline;
     duckdb::shared_ptr<pipeline::sirius_pipeline> dest_pipeline;
+    /// Shared ownership of `repo` (step 6): the per-query repository manager only drops its
+    /// MAP ENTRY at teardown, so every dereference path must co-own what it dereferences.
+    /// The port is the plan-side owner — operators read `repo` freely for the plan's whole
+    /// life without ordering against the registry erase. Null only for dependency-only ports
+    /// and for tests that stub `repo` directly.
+    std::shared_ptr<::cucascade::shared_data_repository> repo_owner{};
     //! A UUID for a port on an operator at the beginning of a
     // pipeline. This port receives data from a prior pipeline,
     // forming an incoming edge from that pipeline.
     uuid::UUID source_port_uuid{uuid::now_v7()};
+
+    /// Wire this port to @p repository, keeping the raw alias and the owner in lockstep.
+    void set_repository(std::shared_ptr<::cucascade::shared_data_repository> repository)
+    {
+      repo_owner = std::move(repository);
+      repo       = repo_owner.get();
+    }
   };
 
   /// Describes a downstream operator's port to which data is pushed

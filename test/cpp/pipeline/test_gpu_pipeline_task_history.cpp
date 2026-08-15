@@ -322,7 +322,7 @@ std::unique_ptr<sirius::pipeline::gpu_pipeline_task> create_pipeline_task(
 
   auto task = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
     task_id,
-    std::vector<cucascade::shared_data_repository*>{},
+    std::vector<std::shared_ptr<cucascade::shared_data_repository>>{},
     std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(op_data)),
     std::move(global_state));
 
@@ -352,7 +352,7 @@ std::unique_ptr<sirius::pipeline::gpu_pipeline_task> create_cached_scan_task(
   op_data->conversion_destination_bytes = conversion_destination_bytes;
   return std::make_unique<sirius::pipeline::gpu_pipeline_task>(
     task_id,
-    std::vector<cucascade::shared_data_repository*>{},
+    std::vector<std::shared_ptr<cucascade::shared_data_repository>>{},
     std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(op_data)),
     std::move(global_state));
 }
@@ -506,7 +506,7 @@ TEST_CASE("scan working set is a lower bound for history-based reservations",
 
   auto task = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
     1,
-    std::vector<cucascade::shared_data_repository*>{},
+    std::vector<std::shared_ptr<cucascade::shared_data_repository>>{},
     std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(
       std::make_unique<scan_sizing_input>()),
     std::move(global_state));

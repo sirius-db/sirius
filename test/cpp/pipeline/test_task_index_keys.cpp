@@ -82,7 +82,7 @@ struct task_fixture {
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
     return std::make_unique<sirius::pipeline::gpu_pipeline_task>(
       /*task_id=*/1,
-      std::vector<cucascade::shared_data_repository*>{},
+      std::vector<std::shared_ptr<cucascade::shared_data_repository>>{},
       std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(op_data)),
       std::move(global_state));
   }

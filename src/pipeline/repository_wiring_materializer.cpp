@@ -68,13 +68,15 @@ void materialize_repository_wiring(const std::vector<repository_wiring>& wirings
     data_repo_manager.add_new_repository(
       op_id, wiring.port_id, std::make_unique<::cucascade::shared_data_repository>());
 
-    // Locked, lifetime-safe accessor (B9). The port stores a raw pointer as
-    // before: the per-query manager outlives the wiring it materializes.
-    auto* repo = data_repo_manager.get_repository_shared(op_id, wiring.port_id).get();
+    // Locked, lifetime-safe accessor (B9), and the port CO-OWNS the repository (step 6):
+    // the manager's teardown only drops its map entry, so the plan-side reader must hold
+    // shared ownership rather than borrow across the query's lifetime.
+    auto repo = data_repo_manager.get_repository_shared(op_id, wiring.port_id);
 
-    next_op->add_port(wiring.port_id,
-                      std::make_unique<op::sirius_physical_operator::port>(
-                        wiring.barrier_type, repo, wiring.source_pipeline, dest_pipeline));
+    auto port = std::make_unique<op::sirius_physical_operator::port>(
+      wiring.barrier_type, repo.get(), wiring.source_pipeline, dest_pipeline);
+    port->repo_owner = std::move(repo);
+    next_op->add_port(wiring.port_id, std::move(port));
     wiring.source_op->add_next_port_after_sink({next_op, wiring.port_id});
   }
 }

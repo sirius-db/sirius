@@ -100,7 +100,7 @@ std::unique_ptr<sirius::pipeline::gpu_pipeline_task> make_test_gpu_task(
 
   return std::make_unique<sirius::pipeline::gpu_pipeline_task>(
     task_id,
-    std::vector<cucascade::shared_data_repository*>{},
+    std::vector<std::shared_ptr<cucascade::shared_data_repository>>{},
     std::move(local),
     std::move(global));
 }
@@ -142,7 +142,7 @@ struct pipeline_task_fixture {
     auto op_data = std::make_unique<sirius::op::pipelineable_operator_data>(std::move(batches));
     return std::make_unique<sirius::pipeline::gpu_pipeline_task>(
       /*task_id=*/1,
-      std::vector<cucascade::shared_data_repository*>{},
+      std::vector<std::shared_ptr<cucascade::shared_data_repository>>{},
       std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(op_data)),
       std::move(global_state));
   }

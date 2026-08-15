@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "log/logging.hpp"
 #include "query_id.hpp"
 
 #include <cucascade/data/data_repository_manager.hpp>
@@ -50,9 +51,8 @@ namespace sirius::data {
  */
 class data_repository_manager_registry {
  public:
-  using manager_type           = cucascade::shared_data_repository_manager;
-  using manager_ptr            = std::shared_ptr<manager_type>;
-  using leaked_repository_info = manager_type::leaked_repository_info;
+  using manager_type = cucascade::shared_data_repository_manager;
+  using manager_ptr  = std::shared_ptr<manager_type>;
 
   data_repository_manager_registry()  = default;
   ~data_repository_manager_registry() = default;
@@ -129,12 +129,32 @@ class data_repository_manager_registry {
    * repositories (e.g. `pin_table`) simply end up with an empty manager, which keeps the
    * "inside a window implies a manager exists" invariant cheap to rely on.
    *
+   * The manager gets a leak handler attributing destructor-side reports to this query: under
+   * shared ownership, batches that die un-consumed are logged when their repository finally
+   * dies (usually inside erase(); later if a sweep still borrows it), not at erase time.
+   *
    * @throws std::runtime_error if @p query_id is already registered — window ids are
    *         monotonic, so a duplicate means a lifecycle bug rather than a recoverable state.
    */
   manager_ptr create_for_query(sirius::query_id_t query_id)
   {
     auto manager = std::make_shared<manager_type>();
+    manager->set_leak_handler(
+      [query_id](std::size_t operator_id, const std::string& port_id, std::size_t count) {
+        // Runs on whatever thread drops the last repository reference (the erasing
+        // cleanup thread, or a downgrade worker releasing its sweep snapshot); the
+        // manager already swallows a throwing handler, this is belt to that suspender.
+        try {
+          SIRIUS_LOG_WARN(
+            "data_repository_manager_registry: query {} operator {} port '{}' repository died "
+            "with {} un-consumed data batch(es) (memory leak).",
+            sirius::value_of(query_id),
+            operator_id,
+            port_id,
+            count);
+        } catch (...) {  // best-effort observability
+        }
+      });
     {
       std::lock_guard<std::mutex> lock(_mutex);
       auto [it, inserted] = _managers.emplace(query_id, std::move(manager));
@@ -176,32 +196,31 @@ class data_repository_manager_registry {
   }
 
   /**
-   * @brief Drop @p query_id's manager and report any repositories that still held batches.
+   * @brief Drop @p query_id's manager. Erasing an unknown id is a no-op.
    *
-   * Unregisters first, then clears the extracted manager so the report carries the same
-   * `{operator_id, port_id, count}` detail the single-manager path produced.
-   *
-   * Waits for every active sweep (see `begin_sweep()`) before touching anything: clearing
-   * while a sweep still holds a raw `data_repository*` obtained from this manager would
-   * dangle — shared ownership protects the manager object, not the repositories inside it.
-   * A sweep starting after this returns cannot see the erased manager (it is out of the map
-   * before the fence lifts).
-   *
-   * @return Per-repository info for each repository that still had un-consumed batches; empty
-   *         when @p query_id is not registered (erasing an unknown id is a no-op).
+   * Only the MAP ENTRY is dropped — the manager (and each repository inside it) dies when
+   * its last holder releases it. In the common case that is right here, synchronously; if a
+   * memory-pressure sweep still holds the manager or one of its repositories (both are
+   * handed out as shared_ptr), the sweep keeps them alive until it naturally finishes, and
+   * teardown never has to wait for it. Batches that die un-consumed are reported by the
+   * repository destructors through the leak handler installed in create_for_query(),
+   * attributed to this query — wherever and whenever they actually die.
    */
-  std::vector<leaked_repository_info> erase(sirius::query_id_t query_id)
+  void erase(sirius::query_id_t query_id)
   {
     teardown_scope fence(*this);
     manager_ptr manager;
     {
       std::lock_guard<std::mutex> lock(_mutex);
       auto it = _managers.find(query_id);
-      if (it == _managers.end()) { return {}; }
+      if (it == _managers.end()) { return; }
       manager = std::move(it->second);
       _managers.erase(it);
     }
-    return manager ? manager->clear_all_repositories() : std::vector<leaked_repository_info>{};
+    // Released outside the lock: if this is the last reference, manager destruction releases
+    // data batches, which can run arbitrary deallocation work that must not happen with the
+    // registry mutex held.
+    manager.reset();
   }
 
   /// \brief Drop every manager. For SiriusContext teardown, after all workers are stopped

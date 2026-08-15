@@ -670,11 +670,16 @@ void task_creator::manager_loop()
         try {
           // Get what we need to create the task
           auto pipeline = node->get_pipeline();
-          std::vector<cucascade::shared_data_repository*> destination_data_repositories;
+          // Shared ownership (step 6/B4): the task carries these across queue hops and
+          // blocking windows, so it co-owns them via the port's owning handle rather than
+          // borrowing the raw alias. Null for dependency-only ports and raw-stubbed test
+          // ports, exactly as the raw pointer could be.
+          std::vector<std::shared_ptr<cucascade::shared_data_repository>>
+            destination_data_repositories;
 
           for (const auto& port_info : pipeline->get_next_ports_after_sink()) {
             destination_data_repositories.push_back(
-              port_info.next_operator->get_port(port_info.next_operator_port_name)->repo);
+              port_info.next_operator->get_port(port_info.next_operator_port_name)->repo_owner);
           }
 
           while (!node->all_ports_empty()) {

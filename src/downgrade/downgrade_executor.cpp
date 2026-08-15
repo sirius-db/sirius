@@ -277,20 +277,21 @@ void downgrade_executor::processing_loop()
     //
     // get_all() returns ascending by query id, so this iterates the snapshot in reverse.
     // get_all_convertible() snapshots eligible batches once per repo so a batch isn't
-    // re-scanned before leaving idle. Managers are held by shared_ptr for the duration of the
-    // sweep, so a query ending concurrently cannot pull one out from under this loop.
+    // re-scanned before leaving idle. The sweep OWNS everything it borrows: managers and
+    // repositories are held by shared_ptr for the duration of the sweep (and batches by
+    // shared_ptr inside each candidate), so a query ending concurrently — its cleanup no
+    // longer quiesces this executor — cannot pull any of them out from under this loop; it
+    // just drops the registry's map entry and the last holder does the destruction.
     //
-    // The sweep token fences the raw data_repository* borrowed below (and captured by the
-    // worker lambdas) against data_repository_manager_registry::erase(): per-query cleanup no
-    // longer quiesces this executor, so a query can tear down while this sweep is mid-flight.
-    // Iteration-scoped, so it is released before the next blocking pop().
+    // The interim sweep token is kept while erase() still fences on it; with the snapshot
+    // self-owning it no longer protects anything here.
     auto sweep_token      = _data_repo_registry.begin_sweep();
     bool pool_interrupted = false;
     auto const managers   = _data_repo_registry.get_all();
     for (auto const& manager : std::views::reverse(managers)) {
       if (req->satisfied.load() || pool_interrupted) break;
       auto repos = manager->get_repositories();
-      for (auto* repo : repos) {
+      for (auto const& repo : repos) {
         if (req->satisfied.load()) break;
 
         convertible_data_batch_provider provider(repo);

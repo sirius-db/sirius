@@ -130,12 +130,15 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    * @brief Construct a new gpu_pipeline_task object
    *
    * @param task_id The unique identifier for this task
-   * @param data_repos The data repositories to push the output of this task to
+   * @param data_repos The data repositories to push the output of this task to. Co-owned
+   *                   (step 6): a task crosses queue hops, OOM reschedules and TIER-2
+   *                   downgrade extractions — all blocking windows — so it must keep its
+   *                   destination repositories alive rather than borrow them (B4).
    * @param local_state The local state specific to this task
    * @param global_state The global state shared across multiple tasks
    */
   gpu_pipeline_task(uint64_t task_id,
-                    std::vector<cucascade::shared_data_repository*> data_repos,
+                    std::vector<std::shared_ptr<cucascade::shared_data_repository>> data_repos,
                     std::unique_ptr<sirius_pipeline_task_local_state> local_state,
                     std::shared_ptr<sirius_pipeline_task_global_state> global_state);
 
@@ -243,8 +246,8 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    *
    * Used by the executor to create a rescheduled task with the same output destinations.
    */
-  [[nodiscard]] const std::vector<cucascade::shared_data_repository*>& get_data_repos()
-    const noexcept
+  [[nodiscard]] const std::vector<std::shared_ptr<cucascade::shared_data_repository>>&
+  get_data_repos() const noexcept
   {
     return _data_repos;
   }
@@ -273,7 +276,10 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
     uint64_t task_id, std::unique_ptr<sirius_pipeline_task_local_state> local_state);
 
  private:
-  std::vector<cucascade::shared_data_repository*> _data_repos;
+  /// Destination repositories, co-owned (step 6/B4): the task outlives blocking windows
+  /// (queue hops, OOM-reschedule sleeps, downgrade extractions) during which its query's
+  /// manager map entry may be erased; shared ownership keeps publish targets valid.
+  std::vector<std::shared_ptr<cucascade::shared_data_repository>> _data_repos;
   cucascade::memory::reservation_aware_resource_adaptor* _allocator = nullptr;
   /// Non-owning subscription ledger: the input data_batches this task subscribed to in its
   /// constructor so that the downgrade_executor can know that the data_baches are in a task.

@@ -106,22 +106,31 @@ TEST_CASE("registry: erasing an unknown query is a no-op", "[repository_registry
   data_repository_manager_registry registry;
   registry.create_for_query(kQueryA);
 
-  auto leaked = registry.erase(kQueryB);
+  REQUIRE_NOTHROW(registry.erase(kQueryB));
 
-  CHECK(leaked.empty());
   CHECK(registry.size() == 1);
   CHECK(registry.get(kQueryA) != nullptr);
 }
 
-TEST_CASE("registry: erase reports repositories that still held batches", "[repository_registry]")
+TEST_CASE("registry: erase destroys an unborrowed manager and its repositories",
+          "[repository_registry]")
 {
   data_repository_manager_registry registry;
-  auto manager = registry.create_for_query(kQueryA);
-  manager->add_new_repository(7, "build", std::make_unique<cucascade::data_repository>());
+  std::weak_ptr<cucascade::shared_data_repository_manager> manager_observer;
+  std::weak_ptr<cucascade::data_repository> repo_observer;
+  {
+    auto manager = registry.create_for_query(kQueryA);
+    manager->add_new_repository(7, "build", std::make_unique<cucascade::data_repository>());
+    manager_observer = manager;
+    repo_observer    = manager->get_repository_shared(7, "build");
+  }
 
-  // Nothing was pushed, so a clean query reports no leaks.
-  auto leaked = registry.erase(kQueryA);
-  CHECK(leaked.empty());
+  // No borrower left: erase() drops the map entry, which is the last reference, so the
+  // manager and repository die right here — the same promptness the old clearing erase had.
+  registry.erase(kQueryA);
+
+  CHECK(manager_observer.expired());
+  CHECK(repo_observer.expired());
 }
 
 TEST_CASE("registry: get_all returns every manager in ascending query order",

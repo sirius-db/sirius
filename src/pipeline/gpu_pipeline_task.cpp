@@ -278,7 +278,7 @@ std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_in
 
 gpu_pipeline_task::gpu_pipeline_task(
   uint64_t task_id,
-  std::vector<cucascade::shared_data_repository*> data_repos,
+  std::vector<std::shared_ptr<cucascade::shared_data_repository>> data_repos,
   std::unique_ptr<sirius_pipeline_task_local_state> local_state,
   std::shared_ptr<sirius_pipeline_task_global_state> global_state)
   : sirius_pipeline_itask(task_id, std::move(local_state), std::move(global_state)),

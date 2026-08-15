@@ -188,10 +188,16 @@ class convertible_data_batch : public convertible_data {
 class convertible_data_batch_provider : public convertible_data_provider {
  public:
   /**
-   * @brief Construct from a raw pointer to a shared_data_repository.
-   * @param repo The repository to iterate (non-owning; caller ensures lifetime).
+   * @brief Construct from shared ownership of a shared_data_repository.
+   * @param repo The repository to iterate. Co-owned: a downgrade sweep uses the provider
+   *             across blocking work (pool reserves, host/device copies) while the owning
+   *             query may erase its manager concurrently — shared ownership keeps the
+   *             repository alive until the provider is done with it.
    */
-  explicit convertible_data_batch_provider(cucascade::shared_data_repository* repo) : _repo(repo) {}
+  explicit convertible_data_batch_provider(std::shared_ptr<cucascade::shared_data_repository> repo)
+    : _repo(std::move(repo))
+  {
+  }
 
   /**
    * @brief Get the next convertible batch matching the given memory space.
@@ -339,7 +345,7 @@ class convertible_data_batch_provider : public convertible_data_provider {
     return nullptr;
   }
 
-  cucascade::shared_data_repository* _repo;
+  std::shared_ptr<cucascade::shared_data_repository> _repo;
 };
 
 }  // namespace sirius

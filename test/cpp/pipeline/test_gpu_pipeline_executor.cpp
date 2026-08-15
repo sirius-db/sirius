@@ -77,7 +77,7 @@ class sirius_pipeline_task : public sirius::pipeline::gpu_pipeline_task {
                        std::unique_ptr<test_gpu_pipeline_task_local_state> local_state,
                        std::shared_ptr<test_gpu_pipeline_task_global_state> global_state)
     : gpu_pipeline_task(task_id,
-                        std::vector<cucascade::shared_data_repository*>{},
+                        std::vector<std::shared_ptr<cucascade::shared_data_repository>>{},
                         std::move(local_state),
                         std::move(global_state))
   {

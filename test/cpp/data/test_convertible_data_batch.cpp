@@ -126,7 +126,7 @@ TEST_CASE("convertible_data_batch_provider get_next_convertible returns last idl
 {
   auto& e = env();
 
-  cucascade::shared_data_repository repo;
+  auto repo = std::make_shared<cucascade::shared_data_repository>();
 
   // Create 3 GPU batches with different sizes to distinguish them
   auto batch1 = sirius::test::operator_utils::make_numeric_batch(
@@ -141,11 +141,11 @@ TEST_CASE("convertible_data_batch_provider get_next_convertible returns last idl
   // Make batch3 non-idle by holding a read-only lock on it
   auto batch3_lock = batch3->to_read_only();
 
-  repo.add_data_batch(batch1);
-  repo.add_data_batch(batch2);
-  repo.add_data_batch(batch3);
+  repo->add_data_batch(batch1);
+  repo->add_data_batch(batch2);
+  repo->add_data_batch(batch3);
 
-  sirius::convertible_data_batch_provider provider(&repo);
+  sirius::convertible_data_batch_provider provider(repo);
   auto cd = provider.get_next_convertible(e.gpu_space, false);
 
   REQUIRE(cd != nullptr);
@@ -158,7 +158,7 @@ TEST_CASE("convertible_data_batch_provider get_all_convertible returns all idle 
 {
   auto& e = env();
 
-  cucascade::shared_data_repository repo;
+  auto repo = std::make_shared<cucascade::shared_data_repository>();
 
   auto batch1 = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{1, 2}, cudf::type_id::INT32);
@@ -170,11 +170,11 @@ TEST_CASE("convertible_data_batch_provider get_all_convertible returns all idle 
   // Make batch3 non-idle by holding a read-only lock on it
   auto batch3_lock = batch3->to_read_only();
 
-  repo.add_data_batch(batch1);
-  repo.add_data_batch(batch2);
-  repo.add_data_batch(batch3);
+  repo->add_data_batch(batch1);
+  repo->add_data_batch(batch2);
+  repo->add_data_batch(batch3);
 
-  sirius::convertible_data_batch_provider provider(&repo);
+  sirius::convertible_data_batch_provider provider(repo);
   auto all = provider.get_all_convertible(e.gpu_space, false);
 
   // batch1 and batch2 are idle, batch3 is locked -> only 2 returned
@@ -186,7 +186,7 @@ TEST_CASE("convertible_data_batch_provider get_all_convertible skips subscribed 
 {
   auto& e = env();
 
-  cucascade::shared_data_repository repo;
+  auto repo = std::make_shared<cucascade::shared_data_repository>();
 
   auto batch1 = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{1, 2}, cudf::type_id::INT32);
@@ -198,11 +198,11 @@ TEST_CASE("convertible_data_batch_provider get_all_convertible skips subscribed 
   // batch2 is subscribed: a task has declared interest in it and it must not be downgraded.
   batch2->subscribe();
 
-  repo.add_data_batch(batch1);
-  repo.add_data_batch(batch2);
-  repo.add_data_batch(batch3);
+  repo->add_data_batch(batch1);
+  repo->add_data_batch(batch2);
+  repo->add_data_batch(batch3);
 
-  sirius::convertible_data_batch_provider provider(&repo);
+  sirius::convertible_data_batch_provider provider(repo);
 
   SECTION("ignore_subscribed=true (default) skips the subscribed batch")
   {
@@ -226,7 +226,7 @@ TEST_CASE("convertible_data_batch_provider iterates multi-partition last-to-firs
 {
   auto& e = env();
 
-  cucascade::shared_data_repository repo;
+  auto repo = std::make_shared<cucascade::shared_data_repository>();
 
   // Create batches with different sizes to distinguish them
   auto batch_p0 = sirius::test::operator_utils::make_numeric_batch(
@@ -236,10 +236,10 @@ TEST_CASE("convertible_data_batch_provider iterates multi-partition last-to-firs
 
   auto batch_p1_size = get_batch_size(*batch_p1);
 
-  repo.add_data_batch(batch_p0, 0);
-  repo.add_data_batch(batch_p1, 1);
+  repo->add_data_batch(batch_p0, 0);
+  repo->add_data_batch(batch_p1, 1);
 
-  sirius::convertible_data_batch_provider provider(&repo);
+  sirius::convertible_data_batch_provider provider(repo);
   // front_to_back=false means last partition first -> partition 1 before partition 0
   auto cd = provider.get_next_convertible(e.gpu_space, false);
 
@@ -290,7 +290,7 @@ TEST_CASE("convertible_data_batch_provider get_bytes_in_space sums batch sizes",
 {
   auto& e = env();
 
-  cucascade::shared_data_repository repo;
+  auto repo = std::make_shared<cucascade::shared_data_repository>();
 
   auto batch1 = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
@@ -300,10 +300,10 @@ TEST_CASE("convertible_data_batch_provider get_bytes_in_space sums batch sizes",
   auto batch1_size = get_batch_size(*batch1);
   auto batch2_size = get_batch_size(*batch2);
 
-  repo.add_data_batch(batch1);
-  repo.add_data_batch(batch2);
+  repo->add_data_batch(batch1);
+  repo->add_data_batch(batch2);
 
-  sirius::convertible_data_batch_provider provider(&repo);
+  sirius::convertible_data_batch_provider provider(repo);
 
   auto total = provider.get_bytes_in_space(e.gpu_space);
   REQUIRE(total == batch1_size + batch2_size);

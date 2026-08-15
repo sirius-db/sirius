@@ -109,7 +109,7 @@ class bracket_task : public sirius::pipeline::gpu_pipeline_task {
                std::chrono::milliseconds execute_for,
                std::shared_ptr<bracket_global_state> global_state)
     : gpu_pipeline_task(task_id,
-                        std::vector<cucascade::shared_data_repository*>{},
+                        std::vector<std::shared_ptr<cucascade::shared_data_repository>>{},
                         std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(
                           std::make_unique<sirius::op::pipelineable_operator_data>(
                             std::vector<std::shared_ptr<cucascade::data_batch>>{})),
