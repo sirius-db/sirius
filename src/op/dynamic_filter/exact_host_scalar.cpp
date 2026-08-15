@@ -18,14 +18,15 @@
 
 namespace sirius::op {
 
+__int128_t exact_host_scalar::widened() const noexcept
+{
+  return std::visit([](auto value) { return static_cast<__int128_t>(value); }, _value);
+}
+
 int exact_host_scalar::compare(exact_host_scalar const& other, cudf::order order) const noexcept
 {
-  // Every admitted alternative fits std::int64_t exactly, so widening loses nothing.
-  auto const to_int64 = [](value_type const& v) {
-    return std::visit([](auto value) { return static_cast<std::int64_t>(value); }, v);
-  };
-  auto const lhs = to_int64(_value);
-  auto const rhs = to_int64(other._value);
+  auto const lhs = widened();
+  auto const rhs = other.widened();
   int const cmp  = lhs < rhs ? -1 : (lhs > rhs ? 1 : 0);
   return order == cudf::order::DESCENDING ? -cmp : cmp;
 }

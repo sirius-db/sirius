@@ -236,6 +236,13 @@ std::optional<exact_host_scalar> extract_boundary_component(cudf::column_view co
       if (!typed.is_valid(stream)) { return std::nullopt; }
       return exact_host_scalar{typed.value(stream), storage_type};
     }
+    case cudf::type_id::DECIMAL128: {
+      auto const element = cudf::get_element(col, row, stream, mr);
+      auto const& typed =
+        static_cast<cudf::fixed_point_scalar<numeric::decimal128> const&>(*element);
+      if (!typed.is_valid(stream)) { return std::nullopt; }
+      return exact_host_scalar{typed.value(stream), storage_type};
+    }
     default: return std::nullopt;
   }
 }

@@ -35,23 +35,23 @@ namespace sirius::op::detail {
 /**
  * @brief Launch-parameter form of one boundary: POD, passed by value, no device state
  *
- * Components hold the exact value widened to `std::int64_t` (sign-extension is exact for the
- * signed allowlist; `TIMESTAMP_DAYS` widens its int32 tick count), an engaged flag (a disengaged
+ * Components hold the exact value widened to `__int128_t` (sign-extension is exact for the signed
+ * allowlist; `TIMESTAMP_DAYS` widens its int32 tick count), an engaged flag (a disengaged
  * component is a null boundary value, ordered by the same null placement flag), and the key's
- * direction, output-order null placement, and physical width. `strict` selects the row producer's
- * predicate; inclusive covers the degraded first-key form and boundaries clamped to
- * `k_max_components` (an inclusive prefix predicate is sound standalone: prefix-worse rows are
- * worse, prefix-ties are kept).
+ * direction, output-order null placement, and physical width, now including width 16 for
+ * `DECIMAL128`. `strict` selects the row producer's predicate; inclusive covers the degraded
+ * first-key form and boundaries clamped to `k_max_components` (an inclusive prefix predicate is
+ * sound standalone: prefix-worse rows are worse, prefix-ties are kept).
  */
 struct boundary_filter_params {
   static constexpr std::size_t k_max_components = 8;
 
   struct component {
-    std::int64_t value = 0;      ///< Widened exact boundary value; meaningful only when engaged
+    __int128_t value   = 0;      ///< Widened exact boundary value; meaningful only when engaged
     bool engaged       = false;  ///< False: the boundary row's key is null here
     bool descending    = false;  ///< Key direction
     bool nulls_first   = false;  ///< Null placement in the final output order
-    std::uint8_t width = 0;      ///< Physical representation width in bytes (1/2/4/8)
+    std::uint8_t width = 0;      ///< Physical representation width in bytes (1/2/4/8/16)
   };
 
   component components[k_max_components]{};
@@ -83,6 +83,10 @@ struct boundary_filter_result {
  * @pre `key_columns.size() >= params.count`; each engaged component's width matches its column's
  * physical representation.
  *
+ * @throw std::invalid_argument when an engaged width-16 component's key column data is not
+ * 16-byte aligned -- the natural-load contract cuDF's own fixed-point access relies on, checked
+ * once per pass.
+ *
  * @param[in] batch The rows to filter; all columns survive into the gathered result
  * @param[in] key_columns The ORDER BY keys' column indices in @p batch, in key order
  * @param[in] params By-value boundary description; no device state
@@ -107,8 +111,8 @@ struct boundary_filter_result {
 /**
  * @brief Marshal the leading @p component_count components of a boundary into launch parameters
  *
- * Values widen exactly to `std::int64_t` through the variant; a disengaged component stays
- * disengaged; widths come from each key's storage type. A @p component_count beyond
+ * Values widen exactly to `__int128_t` through `exact_host_scalar::widened()`; a disengaged
+ * component stays disengaged; widths come from each key's storage type. A @p component_count beyond
  * `boundary_filter_params::k_max_components` is clamped and the marshal degrades to the
  * inclusive prefix form regardless of @p strict -- an inclusive prefix predicate is sound
  * standalone (prefix-worse rows are worse; prefix-ties are kept). Shared by the Top-N sink

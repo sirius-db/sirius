@@ -18,15 +18,22 @@
  * @file test_top_n_key_types.cpp
  * @brief The per-key type allowlist, asserted directly at every band boundary.
  *
- * Reachability differs by scan format, so plan-shape tests alone cannot pin every band: `p >= 19`
- * is refused by the duckdb-native scan but reaches producer admission through parquet (pinned
- * there by the plan-shape suite), while `p <= 4` is genuinely unreachable because
+ * Reachability differs by scan format, so plan-shape tests alone cannot pin every band: a
+ * `p >= 19` *column* is refused by the duckdb-native scan's decode gate but reaches producer
+ * admission through parquet (pinned there by the plan-shape suite), an aggregate-output
+ * DECIMAL128 key admits on every format, and `p <= 4` is genuinely unreachable because
  * `sirius::get_cudf_type` cannot map it at all. Asserting the rule directly covers every band
  * without depending on which scan a test builds.
  */
 
+#include <cudf/cudf_utils.hpp>
+
 #include <catch.hpp>
+#include <helper/logical_type.hpp>
 #include <planner/top_n_key_types.hpp>
+
+#include <algorithm>
+#include <cstdint>
 
 using sirius::planner::admitted_top_n_key_storage_type;
 
@@ -75,7 +82,8 @@ TEST_CASE("the top-n key allowlist admits exactly the exactly-representable type
   {
     // p=4 is INT16 in DuckDB, which cuDF fixed point has no counterpart for.
     REQUIRE(admitted_top_n_key_storage_type(duckdb::LogicalType::DECIMAL(4, 2)) == std::nullopt);
-    // p=5..9 is INT32, p=10..18 is INT64: the two bands the boundary path holds exactly.
+    // p=5..9 is INT32, p=10..18 is INT64, p=19..38 is INT128: the three bands the boundary path
+    // holds exactly since the __int128_t widening and the kernel's width-16 load landed.
     REQUIRE(admitted_top_n_key_storage_type(duckdb::LogicalType::DECIMAL(5, 2))->id() ==
             cudf::type_id::DECIMAL32);
     REQUIRE(admitted_top_n_key_storage_type(duckdb::LogicalType::DECIMAL(9, 2))->id() ==
@@ -84,10 +92,36 @@ TEST_CASE("the top-n key allowlist admits exactly the exactly-representable type
             cudf::type_id::DECIMAL64);
     REQUIRE(admitted_top_n_key_storage_type(duckdb::LogicalType::DECIMAL(18, 2))->id() ==
             cudf::type_id::DECIMAL64);
-    // p>=19 is INT128. The comparison kernel reads components by width 1/2/4/8 and the components
-    // themselves widen to int64, so a 16-byte scaled integer would be truncated, not rejected.
-    // Admitting it needs the params widened first; until then this refusal is the whole defense.
-    REQUIRE(admitted_top_n_key_storage_type(duckdb::LogicalType::DECIMAL(19, 2)) == std::nullopt);
-    REQUIRE(admitted_top_n_key_storage_type(duckdb::LogicalType::DECIMAL(38, 4)) == std::nullopt);
+    REQUIRE(admitted_top_n_key_storage_type(duckdb::LogicalType::DECIMAL(19, 2)) ==
+            cudf::data_type{cudf::type_id::DECIMAL128, -2});
+    REQUIRE(admitted_top_n_key_storage_type(duckdb::LogicalType::DECIMAL(38, 4)) ==
+            cudf::data_type{cudf::type_id::DECIMAL128, -4});
+  }
+}
+
+TEST_CASE("decimal admission delegates to the single cudf banding derivation",
+          "[dynamic_filter][top_n][placement]")
+{
+  // The single-source property: admission's decimal verdict is definitionally the banding
+  // `sirius::cudf_decimal_type` derives, and `sirius::get_cudf_type` executes with the same
+  // derivation -- so the planner cannot admit a mapping the engine does not use.
+  for (std::uint8_t p = 1; p <= 38; ++p) {
+    auto const s = std::min<std::uint8_t>(p, 4);
+    CAPTURE(static_cast<int>(p), static_cast<int>(s));
+
+    auto const admitted = admitted_top_n_key_storage_type(duckdb::LogicalType::DECIMAL(p, s));
+    auto const banded   = sirius::cudf_decimal_type(p, s);
+    REQUIRE(admitted.has_value() == (p > 4));
+    REQUIRE(admitted == banded);
+
+    auto const t = sirius::logical_type::make_decimal(p, s);
+    if (p <= 4) {
+      // The p <= 4 refusal keeps its byte-identical exception message.
+      REQUIRE_THROWS_WITH(
+        sirius::get_cudf_type(t),
+        Catch::Contains("stored as INT16 in DuckDB") && Catch::Contains("CPU fallback"));
+    } else {
+      REQUIRE(sirius::get_cudf_type(t) == *banded);
+    }
   }
 }

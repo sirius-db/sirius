@@ -42,7 +42,6 @@
 #include <cstdint>
 #include <stdexcept>
 #include <utility>
-#include <variant>
 #include <vector>
 
 namespace {
@@ -50,23 +49,26 @@ namespace {
 /// @brief Per-row three-way lexicographic compare against the by-value boundary. One untemplated
 /// functor: direction, null placement, strictness, and component count are uniform for the whole
 /// launch (predictable branches, no divergence), and the type dimension collapses to a width
-/// switch after int64 widening -- the type x direction x strictness template cross-product would
-/// be instantiation bloat for no measured gain.
+/// switch after `__int128_t` widening -- the type x direction x strictness template cross-product
+/// would be instantiation bloat for no measured gain.
 struct boundary_row_predicate {
   cudf::table_device_view keys;  ///< The key columns only, in component order
   sirius::op::detail::boundary_filter_params params;
 
-  __device__ __forceinline__ static std::int64_t load_widened(cudf::column_device_view const& col,
-                                                              cudf::size_type row,
-                                                              std::uint8_t width) noexcept
+  __device__ __forceinline__ static __int128_t load_widened(cudf::column_device_view const& col,
+                                                            cudf::size_type row,
+                                                            std::uint8_t width) noexcept
   {
     switch (width) {
-      case 1: return static_cast<std::int64_t>(col.data<std::int8_t>()[row]);
-      case 2: return static_cast<std::int64_t>(col.data<std::int16_t>()[row]);
-      case 4: return static_cast<std::int64_t>(col.data<std::int32_t>()[row]);
-      case 8: return col.data<std::int64_t>()[row];
+      case 1: return static_cast<__int128_t>(col.data<std::int8_t>()[row]);
+      case 2: return static_cast<__int128_t>(col.data<std::int16_t>()[row]);
+      case 4: return static_cast<__int128_t>(col.data<std::int32_t>()[row]);
+      case 8: return static_cast<__int128_t>(col.data<std::int64_t>()[row]);
+      // A single natural 16-byte load, the same access cuDF's own fixed-point device code
+      // performs; apply_boundary_filter refuses a misaligned buffer host-side, once per pass.
+      case 16: return col.data<__int128_t>()[row];
       default:
-        // Unreachable: the marshaller populates width 1/2/4/8 for every engaged component.
+        // Unreachable: the marshaller populates width 1/2/4/8/16 for every engaged component.
         assert(false);
         return 0;
     }
@@ -104,6 +106,20 @@ boundary_filter_result apply_boundary_filter(cudf::table_view const& batch,
 {
   auto const num_rows = batch.num_rows();
   if (num_rows == 0) { return {nullptr, 0}; }
+
+  // Width-16 components are read with a single natural 16-byte load, so the buffer must honor
+  // cuDF's own fixed-point alignment contract; a violating buffer fails loudly here, once per
+  // pass, instead of feeding misread comparisons.
+  for (std::uint32_t i = 0; i < params.count; ++i) {
+    auto const& component = params.components[i];
+    if (component.engaged && component.width == 16 &&
+        reinterpret_cast<std::uintptr_t>(batch.column(key_columns[i]).data<__int128_t>()) %
+            alignof(__int128_t) !=
+          0) {
+      throw std::invalid_argument(
+        "[top_n boundary filter] width-16 key column is not 16-byte aligned");
+    }
+  }
 
   std::vector<cudf::column_view> key_views;
   key_views.reserve(params.count);
@@ -170,21 +186,21 @@ boundary_filter_params make_boundary_filter_params(exact_host_key_tuple const& b
     component.descending  = key.order == cudf::order::DESCENDING;
     component.nulls_first = nulls_first_in_output(key);
     component.width       = static_cast<std::uint8_t>(cudf::size_of(key.storage_type));
-    // The kernel reads components by width 1/2/4/8 and its `default:` branch is an assert, which
-    // the release build compiles out into a silent zero. A width it cannot read must therefore
-    // fail here, once per publication, rather than per row on the device. Admission already
-    // refuses every such type; this is the second gate on the self-consumption path, which
-    // otherwise has only one.
+    // The kernel reads components by width 1/2/4/8/16 and its `default:` branch is an assert,
+    // which the release build compiles out into a silent zero. Every fixed-width cuDF type maps
+    // to one of those widths, so this gate is unreachable today; it is kept as the
+    // once-per-publication defence for the next widening -- the same explicitly-untestable-guard
+    // status as the publication sync's race window (top_n_threshold_coordinator.cpp,
+    // publish_revision).
     if (component.width != 1 && component.width != 2 && component.width != 4 &&
-        component.width != 8) {
+        component.width != 8 && component.width != 16) {
       throw std::invalid_argument(
         "[top_n boundary filter] boundary component width is outside the widths the comparison "
         "kernel can read");
     }
     if (auto const& bound = boundary.component(i)) {
       component.engaged = true;
-      component.value =
-        std::visit([](auto v) { return static_cast<std::int64_t>(v); }, bound->value());
+      component.value   = bound->widened();
     }
   }
   return params;

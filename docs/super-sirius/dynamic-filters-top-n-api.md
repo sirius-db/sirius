@@ -44,13 +44,15 @@ One exact typed host value. Introduced here for the coordinator's boundary; reus
 the Stage 3 RANGE filter. `std::variant` keeps exactness explicit — no value ever rounds through
 `double` (the same rule the zone-map replication follows).
 
-**Allowlist rule.** The variant covers the admitted types' **physical representations**, not their
-logical types; `storage_type` is what distinguishes `DECIMAL64` from `INT64` when both ride an
-`int64_t`. Admitting a logical type therefore widens the variant only when its physical
-representation is not already present — `DECIMAL(5–18)` needed no new alternative. The next
-widening, `DECIMAL128`, is not a variant edit alone: `component::value`, the kernel's width
-switch, and the variant must change **together**, because a value the variant can hold but the
-kernel cannot load is the silently-wrong case the allowlist exists to prevent.
+**Allowlist rule.** The variant covers the admitted types' **physical representations**, not
+their logical types; `storage_type` is what distinguishes `DECIMAL64` from `INT64` when both
+ride an `int64_t`. Admitting a logical type therefore widens the variant only when its physical
+representation is not already present — `DECIMAL(5–18)` needed no new alternative;
+`DECIMAL128` added `__int128_t`. That widening changed `component::value`, the kernel's width
+switch, and the variant **together**, and `exact_host_scalar::widened()` is the seam that keeps
+them together: every comparison, marshal, and scalar re-narrowing widens through that one
+member, so a future alternative `widened()` cannot hold exactly fails at a single point rather
+than at whichever consumer was overlooked.
 
 ```cpp
 namespace sirius::op {
@@ -63,13 +65,15 @@ namespace sirius::op {
  * representations**, not logical types, so admitting a new logical type widens it only when that
  * type's physical representation is not already present — `DECIMAL(5-18)` needed no new
  * alternative, because its scaled integer *is* an `int32_t`/`int64_t` and the scale rides in
- * `storage_type` (`fixed_point_scalar<T>::value()` returns `rep_type`). `DECIMAL128` would need
- * one, since no `int128` alternative exists. See the main doc, "Range and lexicographic filters".
+ * `storage_type` (`fixed_point_scalar<T>::value()` returns `rep_type`). `DECIMAL128` rides the `__int128_t`
+ * alternative (`fixed_point_scalar<numeric::decimal128>::value()` returns its `__int128_t` rep).
+ * See the main doc, "Range and lexicographic filters".
  * Immutable after construction; freely copyable; no device state.
  */
 class exact_host_scalar final {
  public:
-  using value_type = std::variant<std::int8_t, std::int16_t, std::int32_t, std::int64_t>;
+  using value_type =
+    std::variant<std::int8_t, std::int16_t, std::int32_t, std::int64_t, __int128_t>;
 
   exact_host_scalar(value_type value, cudf::data_type storage_type) noexcept;
 
@@ -956,9 +960,10 @@ constructs `sirius_physical_dynamic_filter`; Top-N layers apply through
  * needed it, and three assertions that had pinned the weaker behavior became `REQUIRE_FALSE`.
  *
  * This is what makes `exact_host_scalar::compare`'s "operands share one storage type"
- * precondition true in practice. That precondition is otherwise unenforced: the comparison widens
- * to `int64` and never consults the storage type, so two decimals of different scale would
- * compare as raw integers and prune wrongly with no error anywhere.
+ * precondition true in practice. That precondition is otherwise unenforced: the comparison
+ * widens both operands exactly to `__int128_t` through `widened()` and never consults the
+ * storage type, so two decimals of different scale would compare as raw integers and prune
+ * wrongly with no error anywhere — a real obligation on the caller.
  */
 [[nodiscard]] bool boundary_key_matches_site_type(cudf::data_type key_storage_type,
                                                   cudf::data_type site_column_type) noexcept;
@@ -973,19 +978,21 @@ buried in the planner:
 /**
  * @brief Exact cuDF storage type for an admitted ORDER BY key type, or empty when refused
  *
- * Admits `TINYINT`/`SMALLINT`/`INTEGER`/`BIGINT`/`DATE` and `DECIMAL` of precision 5–18
- * (p ≤ 9 → `DECIMAL32`, p ≤ 18 → `DECIMAL64`). Refuses p ≤ 4 (INT16-backed, no cuDF counterpart)
- * and p ≥ 19 (`DECIMAL128`: the kernel's width switch handles 1/2/4/8 only).
+ * Admits `TINYINT`/`SMALLINT`/`INTEGER`/`BIGINT`/`DATE` and `DECIMAL` of precision 5–38
+ * (p ≤ 9 → `DECIMAL32`, p ≤ 18 → `DECIMAL64`, p ≤ 38 → `DECIMAL128`), the banding delegated to
+ * `sirius::cudf_decimal_type`. Refuses p ≤ 4 (INT16-backed, no cuDF counterpart).
  */
 [[nodiscard]] std::optional<cudf::data_type> admitted_top_n_key_storage_type(
   duckdb::LogicalType const& type);
 ```
 
-It lives here so each rule is falsifiable in isolation. The p ≥ 19 refusal in particular is
-**reachable in production**: the native scan's precision gate does not cover parquet, so a Top-N
-over a parquet-backed `DECIMAL(38,4)` builds a plan, reaches admission, and is refused with no
-slot registered — pinned by test. Without that refusal a decimal128 key would reach a width
-switch that returns 0 in release rather than failing.
+It lives here so each rule is falsifiable in isolation, and the decimal banding is the same
+single derivation `get_cudf_type` executes with, so admission and execution cannot drift. The
+p 19–38 band is reachable on two routes: a parquet-backed `DECIMAL(38,4)` column binds its scan
+slot (DuckDB writes wide decimals as FLBA(16), which the pinned cuDF's stats filter prunes),
+and an aggregate-output key — TPC-H Q3/Q10's `revenue` — admits on every scan format and arms
+sink self-consumption; an aggregate output never traces to a scan, so the reader-side AST path
+for such a key is unreachable by construction, not unsupported.
 
 #### Modified file: `src/include/op/scan/sirius_physical_dynamic_filter.hpp`
 

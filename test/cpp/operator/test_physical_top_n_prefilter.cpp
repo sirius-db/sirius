@@ -75,12 +75,22 @@ std::shared_ptr<top_n_threshold_coordinator> make_test_coordinator(
   return std::make_shared<top_n_threshold_coordinator>(k, std::move(keys), lex_admitted, stats);
 }
 
-/// Host copy of an INT64 column honoring its null mask (columns here have zero offset).
-std::vector<std::optional<std::int64_t>> copy_int64_with_nulls(cudf::column_view const& col)
+/// Host copy of a fixed-width column honoring its null mask, widened to `__int128_t` so 16-byte
+/// reps read exactly (columns here have zero offset). Width dispatch mirrors the kernel's.
+std::vector<std::optional<__int128_t>> copy_widened_with_nulls(cudf::column_view const& col)
 {
   REQUIRE(col.offset() == 0);
-  auto const values = copy_column_to_host<std::int64_t>(col);
-  std::vector<std::optional<std::int64_t>> out(values.size());
+  auto const values = [&]() -> std::vector<__int128_t> {
+    auto const widen = [](auto host) { return std::vector<__int128_t>(host.begin(), host.end()); };
+    switch (cudf::size_of(col.type())) {
+      case 1: return widen(copy_column_to_host<std::int8_t>(col));
+      case 2: return widen(copy_column_to_host<std::int16_t>(col));
+      case 4: return widen(copy_column_to_host<std::int32_t>(col));
+      case 8: return widen(copy_column_to_host<std::int64_t>(col));
+      default: return copy_column_to_host<__int128_t>(col);
+    }
+  }();
+  std::vector<std::optional<__int128_t>> out(values.size());
   if (!col.nullable()) {
     for (std::size_t i = 0; i < values.size(); ++i) {
       out[i] = values[i];
@@ -114,7 +124,7 @@ std::vector<std::shared_ptr<data_batch>> run_local(
 }
 
 /// Full local-then-merge pipeline; returns every merged column as host values with validity.
-std::vector<std::vector<std::optional<std::int64_t>>> run_pipeline(
+std::vector<std::vector<std::optional<__int128_t>>> run_pipeline(
   sirius_physical_top_n& local,
   sirius_physical_top_n_merge& merge,
   std::vector<std::shared_ptr<data_batch>> const& batches)
@@ -124,9 +134,9 @@ std::vector<std::vector<std::optional<std::int64_t>>> run_pipeline(
   auto const& merged = dynamic_cast<pipelineable_operator_data const&>(*out).get_data_batches();
   REQUIRE(merged.size() == 1);
   auto const view = sirius::get_cudf_table_view(*merged[0]);
-  std::vector<std::vector<std::optional<std::int64_t>>> columns;
+  std::vector<std::vector<std::optional<__int128_t>>> columns;
   for (cudf::size_type c = 0; c < view.num_columns(); ++c) {
-    columns.push_back(copy_int64_with_nulls(view.column(c)));
+    columns.push_back(copy_widened_with_nulls(view.column(c)));
   }
   return columns;
 }
@@ -232,25 +242,27 @@ TEST_CASE("top_n prefilter equivalence per allowlisted key storage type",
   // One deterministic boundary -> prefilter -> equivalence round trip per allowlisted storage
   // type, so every literal-construction branch (including the DATE day-count round trip) is
   // known to evaluate the predicate on the second batch.
-  int const type_case = GENERATE(0, 1, 2, 3, 4, 5);
+  int const type_case = GENERATE(0, 1, 2, 3, 4, 5, 6);
   auto const type_id  = std::array{cudf::type_id::INT8,
                                   cudf::type_id::INT16,
                                   cudf::type_id::INT32,
                                   cudf::type_id::TIMESTAMP_DAYS,
                                   cudf::type_id::DECIMAL32,
-                                  cudf::type_id::DECIMAL64}[type_case];
-  auto const key_type = std::array<duckdb::LogicalType, 6>{
+                                  cudf::type_id::DECIMAL64,
+                                  cudf::type_id::DECIMAL128}[type_case];
+  auto const key_type = std::array<duckdb::LogicalType, 7>{
     duckdb::LogicalType::TINYINT,
     duckdb::LogicalType::SMALLINT,
     duckdb::LogicalType::INTEGER,
     duckdb::LogicalType::DATE,
     duckdb::LogicalType::DECIMAL(9, 2),
-    duckdb::LogicalType::DECIMAL(18, 4)}[static_cast<std::size_t>(type_case)];
+    duckdb::LogicalType::DECIMAL(18, 4),
+    duckdb::LogicalType::DECIMAL(38, 4)}[static_cast<std::size_t>(type_case)];
   // The fixed-point cases carry a non-zero scale deliberately: the values below are the *scaled*
   // integers, so a path that rescaled anywhere -- extraction, the device literal, or the kernel's
   // widening -- would order them differently and the equivalence below would fail.
   auto const key_scale =
-    std::array<std::int32_t, 6>{0, 0, 0, 0, -2, -4}[static_cast<std::size_t>(type_case)];
+    std::array<std::int32_t, 7>{0, 0, 0, 0, -2, -4, -4}[static_cast<std::size_t>(type_case)];
   auto const storage_type = cudf::is_fixed_point(cudf::data_type{type_id})
                               ? cudf::data_type{type_id, key_scale}
                               : cudf::data_type{type_id};
@@ -274,6 +286,26 @@ TEST_CASE("top_n prefilter equivalence per allowlisted key storage type",
     }
     return out;
   };
+  // The DECIMAL128 case replaces batch 2's sentinels with reps outside int64's range: -6 becomes
+  // -10^19 (still the best row, still dropped by the offset -- the sweep's negative convention at
+  // width 16) and 100 becomes 10^19 (still worse than every boundary). A kernel load that reads
+  // only the low 8 bytes flips both signs and drops -10^19 as worse-than-boundary, shifting the
+  // merged window and failing both result assertions below.
+  constexpr __int128_t k_ten_pow_19 = __int128_t{10} * 1'000'000'000'000'000'000LL;
+  auto const widened_reps           = [&](std::vector<std::int32_t> const& values) {
+    std::vector<__int128_t> out;
+    out.reserve(values.size());
+    for (auto const v : values) {
+      if (v == -6) {
+        out.push_back(-k_ten_pow_19);
+      } else if (v == 100) {
+        out.push_back(k_ten_pow_19);
+      } else {
+        out.push_back(v);
+      }
+    }
+    return out;
+  };
   auto const make_key_batch = [&](std::vector<std::int32_t> const& values) {
     switch (type_id) {
       case cudf::type_id::INT8:
@@ -288,20 +320,23 @@ TEST_CASE("top_n prefilter equivalence per allowlisted key storage type",
       case cudf::type_id::DECIMAL64:
         return make_decimal64_batch(
           *space, std::vector<std::int64_t>(values.begin(), values.end()), key_scale);
+      case cudf::type_id::DECIMAL128:
+        return make_decimal128_batch(*space, widened_reps(values), key_scale);
       default:
         return make_timestamp_batch<std::int32_t>(*space, values, cudf::type_id::TIMESTAMP_DAYS);
     }
   };
-  auto const read_key_column = [&](cudf::column_view const& col) -> std::vector<std::int64_t> {
+  auto const read_key_column = [&](cudf::column_view const& col) -> std::vector<__int128_t> {
     auto const widened = [](auto host) {
-      return std::vector<std::int64_t>(host.begin(), host.end());
+      return std::vector<__int128_t>(host.begin(), host.end());
     };
     switch (type_id) {
       case cudf::type_id::INT8: return widened(copy_column_to_host<std::int8_t>(col));
       case cudf::type_id::INT16: return widened(copy_column_to_host<std::int16_t>(col));
       // A fixed-point column's storage is its scaled integer, so reading the representation is
-      // reading the value; DECIMAL64 is eight bytes wide, unlike every other case here.
-      case cudf::type_id::DECIMAL64: return copy_column_to_host<std::int64_t>(col);
+      // reading the value; DECIMAL64 and DECIMAL128 are wider than every other case here.
+      case cudf::type_id::DECIMAL64: return widened(copy_column_to_host<std::int64_t>(col));
+      case cudf::type_id::DECIMAL128: return copy_column_to_host<__int128_t>(col);
       default: return widened(copy_column_to_host<std::int32_t>(col));
     }
   };
@@ -343,9 +378,10 @@ TEST_CASE("top_n prefilter equivalence per allowlisted key storage type",
   auto const expected = run(plain, plain_merge);
   auto const actual   = run(armed, armed_merge);
   REQUIRE(actual == expected);
-  // -6 is the best row overall and the offset drops it, so its presence is what makes the rest of
-  // the window shift down by one from {2,3,4,5}: the negative provably ordered correctly.
-  REQUIRE(actual == std::vector<std::int64_t>{1, 2, 3, 4});
+  // The negative (-6, or -10^19 at width 16) is the best row overall and the offset drops it, so
+  // its presence is what makes the rest of the window shift down by one from {2,3,4,5}: the
+  // negative provably ordered correctly.
+  REQUIRE(actual == std::vector<__int128_t>{1, 2, 3, 4});
 
   // Batch 2 was measured against boundary 33: the typed literal provably evaluated. It offers as
   // well as batch 1 -- its five survivors are exactly K, so its local result is itself a witness.

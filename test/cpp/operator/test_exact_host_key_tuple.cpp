@@ -21,6 +21,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <utility>
 #include <vector>
 
 using sirius::op::exact_host_key_tuple;
@@ -30,6 +31,9 @@ using sirius::op::top_n_key_semantics;
 namespace {
 
 constexpr auto k_int32 = cudf::data_type{cudf::type_id::INT32};
+
+// 10^19: one above std::int64_t's range, so truncation to int64 wraps it negative.
+constexpr __int128_t k_ten_pow_19 = __int128_t{10} * 1'000'000'000'000'000'000LL;
 
 exact_host_scalar int32_scalar(std::int32_t v) { return exact_host_scalar{v, k_int32}; }
 
@@ -65,6 +69,72 @@ TEST_CASE("exact_host_scalar::compare honors direction per storage type", "[dyna
   auto const big   = exact_host_scalar{std::int8_t{127}, cudf::data_type{cudf::type_id::INT8}};
   REQUIRE(small.compare(big, cudf::order::ASCENDING) < 0);
   REQUIRE(big.compare(small, cudf::order::DESCENDING) < 0);
+}
+
+TEST_CASE("exact_host_scalar compares the int128 alternative exactly", "[dynamic_filter][top_n]")
+{
+  // Every pair is chosen so that truncating either side to int64 *inverts* the comparison rather
+  // than merely perturbing it: 1<<64 and -(1<<64) have a zero low word (truncate to 0), and
+  // +/-10^19 wrap across int64's range and change sign.
+  auto const k_dec128 = cudf::data_type{cudf::type_id::DECIMAL128, -4};
+  auto const scalar   = [&](__int128_t rep) { return exact_host_scalar{rep, k_dec128}; };
+  constexpr __int128_t k_two_pow_64 = __int128_t{1} << 64;
+
+  SECTION("inversion pairs under both directions")
+  {
+    std::vector<std::pair<__int128_t, __int128_t>> const ordered_pairs{
+      {-k_two_pow_64, -1},
+      {-k_ten_pow_19, -1},
+      {-k_two_pow_64, 0},
+      {1, k_two_pow_64},
+      {1, k_ten_pow_19},
+      {-k_ten_pow_19, k_ten_pow_19},
+      {-k_two_pow_64, k_two_pow_64}};
+    for (auto const& [lo, hi] : ordered_pairs) {
+      REQUIRE(scalar(lo).compare(scalar(hi), cudf::order::ASCENDING) < 0);
+      REQUIRE(scalar(hi).compare(scalar(lo), cudf::order::ASCENDING) > 0);
+      // DESCENDING: the larger value orders first.
+      REQUIRE(scalar(hi).compare(scalar(lo), cudf::order::DESCENDING) < 0);
+      REQUIRE(scalar(lo).compare(scalar(hi), cudf::order::DESCENDING) > 0);
+    }
+    REQUIRE(scalar(k_two_pow_64).compare(scalar(k_two_pow_64), cudf::order::ASCENDING) == 0);
+  }
+
+  SECTION("widened() is exact beyond int64 and the storage type carries the scale")
+  {
+    REQUIRE(scalar(k_ten_pow_19).widened() == k_ten_pow_19);
+    REQUIRE(scalar(-k_ten_pow_19).widened() == -k_ten_pow_19);
+    REQUIRE(std::get<__int128_t>(scalar(k_ten_pow_19).value()) == k_ten_pow_19);
+    REQUIRE(scalar(0).storage_type() == k_dec128);
+    REQUIRE(scalar(0).storage_type().scale() == -4);
+  }
+
+  SECTION("lex_compare with an int128 head and a null tail under both null orders")
+  {
+    auto const tuple = [&](__int128_t head, std::optional<std::int32_t> tail) {
+      std::vector<std::optional<exact_host_scalar>> components{scalar(head)};
+      components.push_back(tail ? std::optional{int32_scalar(*tail)} : std::nullopt);
+      return exact_host_key_tuple{std::move(components)};
+    };
+    auto const keys = [&](cudf::null_order tail_nulls) {
+      return std::vector<top_n_key_semantics>{{.storage_type = k_dec128,
+                                               .order        = cudf::order::ASCENDING,
+                                               .null_order   = cudf::null_order::AFTER},
+                                              int32_key(cudf::order::ASCENDING, tail_nulls)};
+    };
+    // The wide head decides regardless of the tail; truncation would invert this verdict.
+    REQUIRE(
+      tuple(-k_two_pow_64, 9).lex_compare(tuple(-1, std::nullopt), keys(cudf::null_order::AFTER)) <
+      0);
+    REQUIRE(
+      tuple(k_ten_pow_19, std::nullopt).lex_compare(tuple(1, 0), keys(cudf::null_order::AFTER)) >
+      0);
+    // Equal wide heads fall through to the null tail's placement.
+    REQUIRE(tuple(k_two_pow_64, std::nullopt)
+              .lex_compare(tuple(k_two_pow_64, 3), keys(cudf::null_order::AFTER)) > 0);
+    REQUIRE(tuple(k_two_pow_64, std::nullopt)
+              .lex_compare(tuple(k_two_pow_64, 3), keys(cudf::null_order::BEFORE)) < 0);
+  }
 }
 
 TEST_CASE("exact_host_key_tuple::lex_compare single component", "[dynamic_filter][top_n]")

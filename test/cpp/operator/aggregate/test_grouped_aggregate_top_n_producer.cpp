@@ -30,6 +30,9 @@
 #include "aggregate_test_utils.hpp"
 #include "data/data_batch_utils.hpp"
 
+#include <cudf/column/column_factories.hpp>
+#include <cudf/null_mask.hpp>
+
 #include <catch.hpp>
 #include <op/cudf_sort_order.hpp>
 #include <op/dynamic_filter/dynamic_filter_stats.hpp>
@@ -40,6 +43,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -206,6 +210,84 @@ TEST_CASE("group-key prefilter keep-ratio disable stops measuring while witnessi
   REQUIRE(stats.top_n_group_prefilter_rows_in.load() == 13);
   REQUIRE(stats.top_n_group_prefilter_rows_out.load() == 5);
   REQUIRE(stats.top_n_prefilter_disabled.load() == 1);
+}
+
+TEST_CASE("the group-key producer witnesses DECIMAL128 keys exactly at width 16",
+          "[physical_grouped_aggregate][dynamic_filter][top_n]")
+{
+  // The cudf::distinct + cudf::sort at-DECIMAL128 verification, plus the 16-byte D2H staging and
+  // read_element arm: the producer's witness path computes the batch's K best *distinct* keys on
+  // device and reads them back as exact host values. Every discriminating rep sits outside
+  // int64's range, so a staging stride, load, or host comparison that touched only 8 of the 16
+  // bytes would misorder the set and land the wrong boundary.
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto const stream = sirius::test::operator_utils::default_stream();
+  auto const mr     = sirius::test::operator_utils::get_resource_ref(*space);
+
+  constexpr __int128_t k_ten_pow_19 = __int128_t{10} * 1'000'000'000'000'000'000LL;
+  constexpr __int128_t k_two_pow_64 = __int128_t{1} << 64;
+  auto const k_dec128               = cudf::data_type{cudf::type_id::DECIMAL128, -4};
+
+  auto const make_key_column = [&](std::vector<std::optional<__int128_t>> const& values) {
+    auto const size = static_cast<cudf::size_type>(values.size());
+    auto null_mask  = cudf::create_null_mask(size, cudf::mask_state::ALL_VALID, stream, mr);
+    auto* mask_ptr  = static_cast<cudf::bitmask_type*>(null_mask.data());
+    cudf::size_type null_count = 0;
+    std::vector<__int128_t> reps(values.size(), 0);
+    for (cudf::size_type i = 0; i < size; ++i) {
+      if (values[static_cast<std::size_t>(i)]) {
+        reps[static_cast<std::size_t>(i)] = *values[static_cast<std::size_t>(i)];
+      } else {
+        cudf::set_null_mask(mask_ptr, i, i + 1, false, stream);
+        ++null_count;
+      }
+    }
+    auto column =
+      cudf::make_fixed_point_column(k_dec128, size, std::move(null_mask), null_count, stream, mr);
+    cudaMemcpy(column->mutable_view().data<__int128_t>(),
+               reps.data(),
+               reps.size() * sizeof(__int128_t),
+               cudaMemcpyHostToDevice);
+    return column;
+  };
+
+  dynamic_filter_stats stats;
+  auto coordinator = std::make_shared<top_n_threshold_coordinator>(
+    2,
+    std::vector<top_n_key_semantics>{{.storage_type = k_dec128,
+                                      .order        = cudf::order::ASCENDING,
+                                      .null_order   = cudf::null_order::AFTER}},
+    true,
+    &stats,
+    top_n_producer_kind::GROUP_KEY);
+  top_n_group_key_producer producer{coordinator,
+                                    std::vector<cudf::size_type>{0},
+                                    scan::dynamic_filter_gate::k_default_keep_threshold};
+
+  // Batch one: duplicates, nulls, and a negative below -int64-max. The distinct keys sort to
+  // -10^19, -1, 3 ascending (nulls last), so the K = 2 witness set is {-10^19, -1} and the
+  // boundary is the second-best distinct key, -1. The pairing is truncation-inverting: -10^19's
+  // low 64 bits read as +8.4e18, which orders *after* -1 -- a host comparison that dropped the
+  // high 8 bytes would land -10^19 as the Kth-best instead.
+  auto const key1 = make_key_column({-k_ten_pow_19, -1, -k_ten_pow_19, std::nullopt, 3});
+  producer.witness(cudf::table_view{{key1->view()}}, stream, mr);
+  REQUIRE(stats.top_n_group_offers.load() == 1);
+  REQUIRE(stats.top_n_group_witness_set_full.load() == 1);
+  auto boundary = coordinator->tightest_boundary();
+  REQUIRE(boundary.has_value());
+  REQUIRE(std::get<__int128_t>(boundary->component(0)->value()) == -1);
+
+  // Batch two tightens the boundary with a still-better wide key: -(1<<64) < -10^19, so the
+  // union's best two are both below -int64-max and the boundary becomes the wide value -10^19 --
+  // the exact rep the assertion pins is a 16-byte D2H staging read.
+  auto const key2 = make_key_column({-k_two_pow_64, std::nullopt, -k_two_pow_64});
+  producer.witness(cudf::table_view{{key2->view()}}, stream, mr);
+  REQUIRE(stats.top_n_group_offers.load() == 2);
+  boundary = coordinator->tightest_boundary();
+  REQUIRE(boundary.has_value());
+  REQUIRE(std::get<__int128_t>(boundary->component(0)->value()) == -k_ten_pow_19);
 }
 
 TEST_CASE("an unarmed grouped aggregate is untouched by the group-key seam",

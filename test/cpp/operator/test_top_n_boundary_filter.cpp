@@ -24,14 +24,19 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/utilities/traits.hpp>
+
+#include <rmm/device_buffer.hpp>
 
 #include <catch.hpp>
 #include <op/dynamic_filter/top_n_boundary_filter.hpp>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <vector>
 
 using namespace cucascade;
@@ -40,11 +45,15 @@ using sirius::op::detail::boundary_filter_params;
 
 namespace {
 
-using host_value  = std::optional<std::int64_t>;
+using host_value  = std::optional<__int128_t>;
 using host_column = std::vector<host_value>;
 
+// 10^19: one above std::int64_t's range, so truncation to int64 wraps it negative.
+constexpr __int128_t k_ten_pow_19 = __int128_t{10} * 1'000'000'000'000'000'000LL;
+constexpr __int128_t k_two_pow_64 = __int128_t{1} << 64;
+
 struct component_spec {
-  cudf::type_id type;
+  cudf::data_type type;
   bool descending;
   bool nulls_first;  // placement in the final output order
   host_value bound;  // disengaged models a null boundary component
@@ -84,7 +93,7 @@ void fill_column_data(cudf::mutable_column_view view, host_column const& values)
 }
 
 std::unique_ptr<cudf::column> make_key_column(host_column const& values,
-                                              cudf::type_id type_id,
+                                              cudf::data_type dtype,
                                               rmm::cuda_stream_view stream,
                                               rmm::device_async_resource_ref mr)
 {
@@ -99,31 +108,43 @@ std::unique_ptr<cudf::column> make_key_column(host_column const& values,
     }
   }
 
-  auto const dtype = cudf::data_type{type_id};
   auto column =
-    type_id == cudf::type_id::TIMESTAMP_DAYS
+    cudf::is_fixed_point(dtype)
+      ? cudf::make_fixed_point_column(dtype, size, std::move(null_mask), null_count, stream, mr)
+    : dtype.id() == cudf::type_id::TIMESTAMP_DAYS
       ? cudf::make_timestamp_column(dtype, size, std::move(null_mask), null_count, stream, mr)
       : cudf::make_numeric_column(dtype, size, std::move(null_mask), null_count, stream, mr);
-  switch (type_id) {
+  switch (dtype.id()) {
     case cudf::type_id::INT8: fill_column_data<std::int8_t>(column->mutable_view(), values); break;
     case cudf::type_id::INT16:
       fill_column_data<std::int16_t>(column->mutable_view(), values);
       break;
     case cudf::type_id::INT64:
+    case cudf::type_id::DECIMAL64:
       fill_column_data<std::int64_t>(column->mutable_view(), values);
+      break;
+    case cudf::type_id::DECIMAL128:
+      fill_column_data<__int128_t>(column->mutable_view(), values);
       break;
     default: fill_column_data<std::int32_t>(column->mutable_view(), values); break;
   }
   return column;
 }
 
-std::uint8_t width_of(cudf::type_id type_id)
+std::uint8_t width_of(cudf::data_type dtype)
 {
-  switch (type_id) {
+  switch (dtype.id()) {
     case cudf::type_id::INT8: return 1;
     case cudf::type_id::INT16: return 2;
-    case cudf::type_id::INT64: return 8;
-    default: return 4;  // INT32 and TIMESTAMP_DAYS
+    case cudf::type_id::INT32:
+    case cudf::type_id::TIMESTAMP_DAYS:
+    case cudf::type_id::DECIMAL32: return 4;
+    case cudf::type_id::INT64:
+    case cudf::type_id::DECIMAL64: return 8;
+    case cudf::type_id::DECIMAL128: return 16;
+    default:
+      // A silent width-4 marshal for an unknown type is exactly the bug class under test.
+      throw std::logic_error("width_of: unmapped test key type");
   }
 }
 
@@ -150,7 +171,7 @@ void check_parity(cucascade::memory::memory_space& space,
   for (cudf::size_type i = 0; i < rows; ++i) {
     row_ids[static_cast<std::size_t>(i)] = i;
   }
-  owned.push_back(make_key_column(row_ids, cudf::type_id::INT32, stream, mr));
+  owned.push_back(make_key_column(row_ids, cudf::data_type{cudf::type_id::INT32}, stream, mr));
   views.push_back(owned.back()->view());
   auto const batch = cudf::table_view{views};
 
@@ -195,23 +216,25 @@ TEST_CASE("boundary filter kernel parity: single-component sweep", "[dynamic_fil
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space);
 
-  auto const type_id     = std::array{cudf::type_id::INT8,
-                                  cudf::type_id::INT16,
-                                  cudf::type_id::INT32,
-                                  cudf::type_id::INT64,
-                                  cudf::type_id::TIMESTAMP_DAYS}[GENERATE(0, 1, 2, 3, 4)];
+  auto const dtype =
+    std::array{cudf::data_type{cudf::type_id::INT8},
+               cudf::data_type{cudf::type_id::INT16},
+               cudf::data_type{cudf::type_id::INT32},
+               cudf::data_type{cudf::type_id::INT64},
+               cudf::data_type{cudf::type_id::TIMESTAMP_DAYS}}[GENERATE(0, 1, 2, 3, 4)];
   bool const descending  = GENERATE(false, true);
   bool const nulls_first = GENERATE(false, true);
   bool const strict      = GENERATE(false, true);
-  CAPTURE(static_cast<int>(type_id), descending, nulls_first, strict);
+  CAPTURE(static_cast<int>(dtype.id()), descending, nulls_first, strict);
 
-  // Ties, nulls, and both strict sides of the boundary; values fit every tested width.
-  host_column const values{40, std::nullopt, 38, 42, 40, std::nullopt, 39, 41};
-  check_parity(
-    *space,
-    {{.type = type_id, .descending = descending, .nulls_first = nulls_first, .bound = 40}},
-    {values},
-    strict);
+  // Ties, nulls, both strict sides of the boundary, and negatives; values fit every tested width.
+  // The negatives are the sign-extension discriminator: a load that zero-extends any width turns
+  // them into large positives and inverts their verdict against the bound.
+  host_column const values{40, std::nullopt, 38, 42, -40, std::nullopt, -39, 41, 40};
+  check_parity(*space,
+               {{.type = dtype, .descending = descending, .nulls_first = nulls_first, .bound = 40}},
+               {values},
+               strict);
 }
 
 TEST_CASE("boundary filter kernel parity: multi-component cascade with null tails",
@@ -227,10 +250,18 @@ TEST_CASE("boundary filter kernel parity: multi-component cascade with null tail
   // Component 1's boundary is disengaged (a null tail), so rows tying component 0 are decided by
   // null-vs-value placement there, and full-tuple ties (rows with a null component 1) fall to
   // component 2.
-  std::vector<component_spec> const components{
-    {.type = cudf::type_id::INT32, .descending = false, .nulls_first = false, .bound = 5},
-    {.type = cudf::type_id::INT64, .descending = true, .nulls_first = true, .bound = std::nullopt},
-    {.type = cudf::type_id::INT16, .descending = false, .nulls_first = true, .bound = 7}};
+  std::vector<component_spec> const components{{.type       = cudf::data_type{cudf::type_id::INT32},
+                                                .descending = false,
+                                                .nulls_first = false,
+                                                .bound       = 5},
+                                               {.type       = cudf::data_type{cudf::type_id::INT64},
+                                                .descending = true,
+                                                .nulls_first = true,
+                                                .bound       = std::nullopt},
+                                               {.type       = cudf::data_type{cudf::type_id::INT16},
+                                                .descending = false,
+                                                .nulls_first = true,
+                                                .bound       = 7}};
   std::vector<host_column> const columns{
     {4, 6, 5, 5, 5, 5, 5, std::nullopt},
     {9, std::nullopt, 3, std::nullopt, std::nullopt, std::nullopt, 3, 1},
@@ -238,26 +269,28 @@ TEST_CASE("boundary filter kernel parity: multi-component cascade with null tail
   check_parity(*space, components, columns, strict);
 }
 
-TEST_CASE("boundary marshalling refuses a component width the kernel cannot read",
+TEST_CASE("boundary marshalling emits width 16 and the exact widened DECIMAL128 value",
           "[dynamic_filter][top_n]")
 {
-  // The kernel reads components by width 1/2/4/8 and its `default:` branch is an assert, which the
-  // release build compiles out into a silent zero. Admission already refuses every type that would
-  // marshal wider -- DECIMAL128 is the live example -- but the sink self-consumption path has no
-  // second gate the way publication does, so the marshaller itself must refuse rather than emit a
-  // width the device will misread.
-  std::vector<sirius::op::top_n_key_semantics> const wide{
-    {.storage_type = cudf::data_type{cudf::type_id::DECIMAL128, -2},
-     .order        = cudf::order::ASCENDING,
-     .null_order   = cudf::null_order::AFTER}};
-  sirius::op::exact_host_key_tuple const boundary{{sirius::op::exact_host_scalar{
-    std::int64_t{1234}, cudf::data_type{cudf::type_id::DECIMAL128, -2}}}};
+  // The widened {1,2,4,8,16} width gate's trigger set is now empty by exhaustion: every cuDF
+  // fixed-width type maps to one of those widths. The gate is retained as defence for the next
+  // widening -- the same explicitly-untestable-guard status as the publication sync's race window
+  // (top_n_threshold_coordinator.cpp, publish_revision). What is testable is the positive form:
+  // width 16 marshals and the value round-trips a rep above int64's range exactly, so a widening
+  // that truncated anywhere between the variant and the launch parameters fails here.
+  auto const k_dec128        = cudf::data_type{cudf::type_id::DECIMAL128, -2};
+  constexpr __int128_t k_rep = k_ten_pow_19 + 7;
+  std::vector<sirius::op::top_n_key_semantics> const wide{{.storage_type = k_dec128,
+                                                           .order        = cudf::order::ASCENDING,
+                                                           .null_order = cudf::null_order::AFTER}};
+  sirius::op::exact_host_key_tuple const boundary{{sirius::op::exact_host_scalar{k_rep, k_dec128}}};
   REQUIRE(cudf::size_of(wide.front().storage_type) == 16);
-  REQUIRE_THROWS_AS(
-    sirius::op::detail::make_boundary_filter_params(boundary, wide, 1, /*strict=*/true),
-    std::invalid_argument);
+  auto const wide_params =
+    sirius::op::detail::make_boundary_filter_params(boundary, wide, 1, /*strict=*/true);
+  REQUIRE(wide_params.components[0].width == 16);
+  REQUIRE(wide_params.components[0].value == k_rep);
 
-  // The admitted widths still marshal.
+  // The DECIMAL64 control, mirroring the width-16 assertions one band down.
   std::vector<sirius::op::top_n_key_semantics> const narrow{
     {.storage_type = cudf::data_type{cudf::type_id::DECIMAL64, -2},
      .order        = cudf::order::ASCENDING,
@@ -277,27 +310,33 @@ TEST_CASE("boundary filter kernel parity: edge shapes", "[dynamic_filter][top_n]
 
   SECTION("empty batch")
   {
-    check_parity(
-      *space,
-      {{.type = cudf::type_id::INT32, .descending = false, .nulls_first = false, .bound = 1}},
-      {host_column{}},
-      true);
+    check_parity(*space,
+                 {{.type        = cudf::data_type{cudf::type_id::INT32},
+                   .descending  = false,
+                   .nulls_first = false,
+                   .bound       = 1}},
+                 {host_column{}},
+                 true);
   }
   SECTION("all rows pass: null result forwards the batch")
   {
-    check_parity(
-      *space,
-      {{.type = cudf::type_id::INT32, .descending = false, .nulls_first = false, .bound = 100}},
-      {host_column{1, 2, 3, 4}},
-      true);
+    check_parity(*space,
+                 {{.type        = cudf::data_type{cudf::type_id::INT32},
+                   .descending  = false,
+                   .nulls_first = false,
+                   .bound       = 100}},
+                 {host_column{1, 2, 3, 4}},
+                 true);
   }
   SECTION("no row passes: empty table, all columns preserved")
   {
-    check_parity(
-      *space,
-      {{.type = cudf::type_id::INT32, .descending = false, .nulls_first = false, .bound = 0}},
-      {host_column{1, 2, 3, 4}},
-      true);
+    check_parity(*space,
+                 {{.type        = cudf::data_type{cudf::type_id::INT32},
+                   .descending  = false,
+                   .nulls_first = false,
+                   .bound       = 0}},
+                 {host_column{1, 2, 3, 4}},
+                 true);
   }
   SECTION("full-tuple ties at the component limit: dropped when strict, kept when inclusive")
   {
@@ -306,11 +345,114 @@ TEST_CASE("boundary filter kernel parity: edge shapes", "[dynamic_filter][top_n]
     std::vector<component_spec> components;
     std::vector<host_column> columns;
     for (int i = 0; i < 8; ++i) {
-      components.push_back(
-        {.type = cudf::type_id::INT32, .descending = false, .nulls_first = false, .bound = 1});
+      components.push_back({.type        = cudf::data_type{cudf::type_id::INT32},
+                            .descending  = false,
+                            .nulls_first = false,
+                            .bound       = 1});
       columns.push_back(host_column{1, 1, 1});
     }
     check_parity(*space, components, columns, /*strict=*/true);
     check_parity(*space, components, columns, /*strict=*/false);
   }
+}
+
+TEST_CASE("boundary filter parity at width 16", "[dynamic_filter][top_n]")
+{
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+
+  auto const k_dec128 = cudf::data_type{cudf::type_id::DECIMAL128, -4};
+  // Each value makes int64 truncation *invert* an ordering, not just perturb it: +/-(1<<64) have
+  // a zero low word, and +/-10^19 wrap across int64's range and change sign.
+  host_column const wide_values{
+    0, 1, -1, k_two_pow_64, -k_two_pow_64, k_ten_pow_19, -k_ten_pow_19, std::nullopt};
+
+  SECTION("single-component sweep against the host reference")
+  {
+    bool const descending  = GENERATE(false, true);
+    bool const nulls_first = GENERATE(false, true);
+    bool const strict      = GENERATE(false, true);
+    // Bounds sit at a truncation-inverting value, at a narrow value the wide rows straddle, and
+    // at an exact-tie value, so every fixture row lands on each side of some bound.
+    auto const bound = std::array<__int128_t, 3>{1, k_two_pow_64, -k_ten_pow_19}[GENERATE(0, 1, 2)];
+    CAPTURE(descending, nulls_first, strict, static_cast<double>(bound));
+    check_parity(
+      *space,
+      {{.type = k_dec128, .descending = descending, .nulls_first = nulls_first, .bound = bound}},
+      {wide_values},
+      strict);
+  }
+
+  SECTION("multi-key: DECIMAL128 head with an INT32 tail")
+  {
+    // Head ties on the wide boundary value fall through to the narrow tail, and vice versa in
+    // the inverted case below -- a per-component width error cannot cancel out across the tuple.
+    std::vector<component_spec> const components{
+      {.type = k_dec128, .descending = false, .nulls_first = false, .bound = k_two_pow_64},
+      {.type        = cudf::data_type{cudf::type_id::INT32},
+       .descending  = true,
+       .nulls_first = true,
+       .bound       = 7}};
+    std::vector<host_column> const columns{
+      {k_two_pow_64, k_two_pow_64, k_two_pow_64, -k_two_pow_64, k_ten_pow_19, std::nullopt},
+      {9, 7, 3, 0, 0, 5}};
+    check_parity(*space, components, columns, /*strict=*/true);
+    check_parity(*space, components, columns, /*strict=*/false);
+  }
+
+  SECTION("multi-key: INT32 head with a DECIMAL128 tail")
+  {
+    std::vector<component_spec> const components{
+      {.type        = cudf::data_type{cudf::type_id::INT32},
+       .descending  = false,
+       .nulls_first = false,
+       .bound       = 5},
+      {.type = k_dec128, .descending = false, .nulls_first = false, .bound = -k_ten_pow_19}};
+    std::vector<host_column> const columns{
+      {4, 6, 5, 5, 5, 5}, {0, 0, -k_two_pow_64, -k_ten_pow_19, k_ten_pow_19, std::nullopt}};
+    check_parity(*space, components, columns, /*strict=*/true);
+    check_parity(*space, components, columns, /*strict=*/false);
+  }
+
+  SECTION("all-pass fast path with a boundary worse than every row")
+  {
+    check_parity(*space,
+                 {{.type        = k_dec128,
+                   .descending  = false,
+                   .nulls_first = false,
+                   .bound       = k_ten_pow_19 + k_two_pow_64}},
+                 {host_column{0, -k_two_pow_64, k_two_pow_64, k_ten_pow_19}},
+                 true);
+  }
+}
+
+TEST_CASE("boundary filter refuses a misaligned 16-byte key column", "[dynamic_filter][top_n]")
+{
+  // The kernel's width-16 path is a single natural load, adopting cuDF's fixed-point alignment
+  // contract; this is the host-side gate's triggering test. rmm allocations are 256-byte aligned,
+  // so a buffer offset by 8 bytes is misaligned for __int128_t while still device-valid.
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = space->get_default_allocator();
+
+  constexpr cudf::size_type k_rows = 4;
+  rmm::device_buffer backing{
+    (static_cast<std::size_t>(k_rows) + 1) * sizeof(__int128_t), stream, mr};
+  auto const* misaligned_base = static_cast<std::byte const*>(backing.data()) + 8;
+  cudf::column_view const misaligned{
+    cudf::data_type{cudf::type_id::DECIMAL128, -2}, k_rows, misaligned_base, nullptr, 0};
+  auto const batch = cudf::table_view{{misaligned}};
+
+  boundary_filter_params params{};
+  params.count                 = 1;
+  params.strict                = true;
+  params.components[0].engaged = true;
+  params.components[0].value   = 0;
+  params.components[0].width   = 16;
+  std::vector<cudf::size_type> const key_columns{0};
+  REQUIRE_THROWS_AS(apply_boundary_filter(batch, key_columns, params, stream, mr),
+                    std::invalid_argument);
 }

@@ -31,18 +31,17 @@ namespace sirius::op {
  *
  * Carries the value and its cuDF storage type together so comparison and device-scalar
  * construction cannot disagree about representation. The variant covers the admitted types'
- * *physical representations*, which is not the same as the allowlist: a fixed-point key is held as
- * its scaled integer in the matching integer alternative, and `storage_type` is what distinguishes
- * `DECIMAL64` from `INT64` and carries the scale. Widening the allowlist therefore widens the
- * variant only when the new type introduces a representation none of the alternatives already
- * holds -- `DECIMAL128` is the next such case, and it needs
- * `detail::boundary_filter_params::component::value` and the kernel's width switch widened in the
- * same change, not just this variant. Immutable after construction; freely copyable; no device
- * state.
+ * *physical representations*, which is not the same as the allowlist: a fixed-point key of any
+ * admitted precision is held as its scaled integer (`__int128_t` for `DECIMAL128`), and
+ * `storage_type` is what distinguishes `DECIMAL64` from `INT64` and carries the scale. Widening
+ * the allowlist widens the variant only when the new type introduces a representation none of the
+ * alternatives already holds, and any such widening starts at `widened()` -- the one member every
+ * consumer widens through. Immutable after construction; freely copyable; no device state.
  */
 class exact_host_scalar final {
  public:
-  using value_type = std::variant<std::int8_t, std::int16_t, std::int32_t, std::int64_t>;
+  using value_type =
+    std::variant<std::int8_t, std::int16_t, std::int32_t, std::int64_t, __int128_t>;
 
   exact_host_scalar(value_type value, cudf::data_type storage_type) noexcept
     : _value(value), _storage_type(storage_type)
@@ -51,6 +50,17 @@ class exact_host_scalar final {
 
   [[nodiscard]] value_type const& value() const noexcept { return _value; }
   [[nodiscard]] cudf::data_type storage_type() const noexcept { return _storage_type; }
+
+  /**
+   * @brief The value widened exactly to the widest alternative
+   *
+   * Every alternative is a signed integer `__int128_t` holds exactly, so widening loses nothing.
+   * Every consumer that compares, marshals, or re-narrows a boundary value widens through this
+   * one member -- the single point that must change if a wider alternative is ever added, so no
+   * site can keep a narrower widening by habit. That seam is what makes the variant, the kernel
+   * width switch, and `detail::boundary_filter_params::component::value` move together.
+   */
+  [[nodiscard]] __int128_t widened() const noexcept;
 
   /**
    * @brief Three-way comparison in the given SQL order

@@ -775,6 +775,73 @@ TEST_CASE("a decimal boundary publishes a fixed-point literal at its own scale",
     REQUIRE(std::get<std::int64_t>(range.bound().value()) == 987654);
     REQUIRE(range.bound().storage_type() == cudf::data_type{cudf::type_id::DECIMAL64, -4});
   }
+
+  SECTION("DECIMAL128 keeps its scale on the published bound")
+  {
+    // The rep sits one past int64's range, so the round trip through make_boundary_scalar and
+    // the compaction marshal proves the __int128_t widening carried the value exactly -- a
+    // truncation anywhere would wrap it negative and flip the compaction verdicts below.
+    auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+    auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+    REQUIRE(space);
+    auto const stream = cudf::get_default_stream();
+    auto const mr     = space->get_default_allocator();
+
+    auto const k_dec128        = cudf::data_type{cudf::type_id::DECIMAL128, -4};
+    constexpr __int128_t k_rep = __int128_t{10} * 1'000'000'000'000'000'000LL + 7;  // 10^19 + 7
+
+    auto channel    = std::make_shared<sirius_dynamic_filter_set>();
+    auto const keys = scaled_key(-4, cudf::type_id::DECIMAL128);
+    top_n_threshold_coordinator coordinator{3, keys, true, nullptr};
+    top_n_dynamic_filter_publish_plan plan;
+    plan.k    = 3;
+    plan.keys = {{.child_ordinal = 0, .semantics = keys.front(), .type_admitted = true}};
+    plan.targets.push_back({.publisher          = channel->register_refinement_slot(0),
+                            .layer              = top_n_filter_layer::FIRST_KEY,
+                            .component_ordinals = {0}});
+    coordinator.set_publish_plan(std::move(plan));
+
+    top_n_threshold_witness witness{exact_host_key_tuple{{exact_host_scalar{k_rep, k_dec128}}}, {}};
+    REQUIRE(coordinator.offer(std::move(witness)) ==
+            threshold_offer_result::ACCEPTED_FOR_PUBLICATION);
+    auto const published = visible_filter(*channel, 0);
+    REQUIRE(published != nullptr);
+    REQUIRE(published->kind() == sirius_dynamic_filter_kind::RANGE);
+    auto const& range = static_cast<sirius::op::sirius_dynamic_range_filter const&>(*published);
+    REQUIRE(std::get<__int128_t>(range.bound().value()) == k_rep);
+    REQUIRE(range.bound().storage_type() == k_dec128);
+
+    // Apply the published filter to reps straddling the boundary. The verdict pattern is
+    // computed from the filter's own published side/inclusive semantics, so this holds whichever
+    // strictness the layer chose -- what it cannot survive is a truncated bound.
+    std::vector<__int128_t> const reps{k_rep - 1, k_rep, k_rep + 1};
+    auto column = cudf::make_fixed_point_column(k_dec128,
+                                                static_cast<cudf::size_type>(reps.size()),
+                                                cudf::mask_state::UNALLOCATED,
+                                                stream,
+                                                mr);
+    cudaMemcpy(column->mutable_view().data<__int128_t>(),
+               reps.data(),
+               reps.size() * sizeof(__int128_t),
+               cudaMemcpyHostToDevice);
+    auto const batch = cudf::table_view{{column->view()}};
+    std::vector<cudf::size_type> const key_columns{0};
+    auto const* compactable =
+      dynamic_cast<sirius::op::sirius_compaction_applicable const*>(published.get());
+    REQUIRE(compactable != nullptr);
+    auto const result = compactable->apply_compact(batch, key_columns, -1, stream, mr);
+
+    auto const keeps = [&](__int128_t rep) {
+      bool const lower = range.side() == sirius::op::range_bound_side::LOWER;
+      if (rep == k_rep) { return range.inclusive(); }
+      return lower == (rep > k_rep);
+    };
+    cudf::size_type expected_kept = 0;
+    for (auto const rep : reps) {
+      if (keeps(rep)) { ++expected_kept; }
+    }
+    REQUIRE(result.rows_kept == expected_kept);
+  }
 }
 
 TEST_CASE("a null-headed distinct-key boundary publishes nothing", "[dynamic_filter][top_n]")

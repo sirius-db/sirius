@@ -297,10 +297,10 @@ struct top_n_plan_shape_fixture {
     facts_parquet = _db_path.path() + ".facts.parquet";
     con->Query("COPY facts TO '" + facts_parquet + "' (FORMAT PARQUET)");
     // One column per decimal admission band: DECIMAL32 (p<=9), DECIMAL64 (p<=18), and DECIMAL128
-    // (p>=19), which the boundary components cannot hold. The decimal cases scan the parquet
-    // copy (see the file comment). For `huge_dec` parquet is also the only reachable path: the
-    // duckdb-native scan refuses a DECIMAL128 column outright, while parquet has no precision
-    // gate and is where the p>=19 refusal is actually live.
+    // (p<=38). The decimal cases scan the parquet copy (see the file comment). For `huge_dec`
+    // parquet is also the only reachable column path: the duckdb-native scan refuses a DECIMAL128
+    // column at decode viability, while parquet has no precision gate and is where the p>=19
+    // admission binds a scan slot.
     con->Query(
       "CREATE TABLE money (id INTEGER, small_dec DECIMAL(9,2), big_dec DECIMAL(18,4), "
       "huge_dec DECIMAL(38,4))");
@@ -731,19 +731,16 @@ TEST_CASE_METHOD(top_n_plan_shape_fixture,
     REQUIRE(slots.size() == 1);
   }
 
-  SECTION("DECIMAL128 (p>=19) forms no producer on the path where it is reachable")
+  SECTION("DECIMAL128 (p<=38) binds its scan")
   {
-    // The duckdb-native scan refuses a DECIMAL128 column before planning gets this far, but the
-    // parquet path has no precision gate, so this is where the refusal is live in production.
-    // The components widen to int64 and the kernel reads by width 1/2/4/8: a 16-byte scaled
-    // integer has no case there and would be read as zero rather than rejected.
     auto const before = state->get_dynamic_filter_stats_snapshot();
     auto plan         = generate_sirius_plan(
       *con, "SELECT huge_dec FROM " + money_scan() + " ORDER BY huge_dec LIMIT 5");
     auto const after = state->get_dynamic_filter_stats_snapshot();
-    CHECK(after.top_n_producers_rejected > before.top_n_producers_rejected);
-    CHECK(after.top_n_producers_eligible == before.top_n_producers_eligible);
-    CHECK(registered_slots(plan.get()).empty());
+    CHECK(after.top_n_producers_eligible > before.top_n_producers_eligible);
+    CHECK(after.top_n_producers_rejected == before.top_n_producers_rejected);
+    auto slots = single_scan_slots(plan.get());
+    REQUIRE(slots.size() == 1);
   }
 
   SECTION("a decimal tail beside an integer head enables the LEX layer")
@@ -753,6 +750,18 @@ TEST_CASE_METHOD(top_n_plan_shape_fixture,
     auto slots = single_scan_slots(plan.get());
     REQUIRE(slots.size() == 1);
     // Both keys admitted, so the site carries the full tuple rather than degrading to first-key.
+    REQUIRE(slots.front().referenced_ordinals.size() == 1);
+    CHECK(slots.front().referenced_ordinals.front() != slots.front().primary_ordinal);
+  }
+
+  SECTION("a DECIMAL128 tail beside an integer head enables the LEX layer")
+  {
+    // Nothing else proves a wide-decimal *tail* enables LEX rather than degrading the producer
+    // to first-key: the slot must reference the tail's ordinal beyond its primary.
+    auto plan = generate_sirius_plan(
+      *con, "SELECT id, huge_dec FROM " + money_scan() + " ORDER BY id, huge_dec LIMIT 5");
+    auto slots = single_scan_slots(plan.get());
+    REQUIRE(slots.size() == 1);
     REQUIRE(slots.front().referenced_ordinals.size() == 1);
     CHECK(slots.front().referenced_ordinals.front() != slots.front().primary_ordinal);
   }

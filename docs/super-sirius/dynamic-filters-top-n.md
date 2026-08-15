@@ -89,7 +89,7 @@ K = limit + offset
 | Reach ceiling | The nearest upstream FULL-barrier port; PARTIAL and PIPELINE ports do not cap reach |
 | Device row filtering | One fused predicate+compaction kernel; cuDF AST only at the parquet reader |
 | First legal boundary | Kth row's key tuple of one retained local result containing K rows |
-| Admitted types | Per key: DuckDB `TINYINT`, `SMALLINT`, `INTEGER`, `BIGINT`, `DATE`, `DECIMAL(5–18)`; key zero admitted enables the first-key layer, all keys admitted adds the LEX layer |
+| Admitted types | Per key: DuckDB `TINYINT`, `SMALLINT`, `INTEGER`, `BIGINT`, `DATE`, `DECIMAL(5–38)`; key zero admitted enables the first-key layer, all keys admitted adds the LEX layer |
 | Null boundary | Null first component publishes nothing; null tail components use DataFusion's shipped derivations |
 | Replica readiness | All planned consumer-device replicas before replacement |
 | Scheduling | Nonblocking and opportunistic |
@@ -372,7 +372,7 @@ aggregate values.
 
 TPC-H applicability at the pinned DuckDB: Q18 is the shape — both keys are grouping keys, the
 `o_orderdate` tail is admitted, and the `o_totalprice` DECIMAL(15,2) head is admitted since exact
-`DECIMAL(5–18)` keys landed. Q3, Q10, and Q21 order on aggregate outputs (`revenue`,
+decimal keys landed. Q3, Q10, and Q21 order on aggregate outputs (`revenue`,
 `numwait`) and can never qualify; Q2 has no aggregate below its Top-N and is the row producer's
 shape.
 
@@ -523,46 +523,54 @@ observed closed ranges; Top-N has one meaningful side per component.
 A key type is admitted only if DuckDB SQL ordering, cuDF sorting/comparison, exact host
 extraction, device scalar construction, and Parquet statistics ordering agree. The per-key
 allowlist is DuckDB `TINYINT`, `SMALLINT`, `INTEGER`, `BIGINT`, `DATE`, and `DECIMAL` of
-precision **5–18**, mapped through exact cuDF physical representations.
+precision **5–38**, mapped through exact cuDF physical representations.
 
-**Decimals.** Precision 5–9 maps to cuDF `DECIMAL32`, 10–18 to `DECIMAL64`; the scaled integer
-*is* the exact host representation, so the boundary carries the raw `int32_t`/`int64_t` and the
-scale rides in the storage type — no rescale anywhere. Two ranges are refused:
+**Decimals.** Precision 5–9 maps to cuDF `DECIMAL32`, 10–18 to `DECIMAL64`, and 19–38 to
+`DECIMAL128`; the scaled integer *is* the exact host representation, so the boundary carries
+the raw `int32_t`/`int64_t`/`__int128_t` and the scale rides in the storage type — no rescale
+anywhere. One range is refused: **p ≤ 4** is INT16-backed and has no cuDF counterpart.
 
-- **p ≤ 4** is INT16-backed and has no cuDF counterpart.
-- **p ≥ 19** would be `DECIMAL128`, and the fused kernel's `load_widened` handles widths 1/2/4/8
-  only: width 16 reaches an `assert(false)` that compiles out in release and returns 0. A
-  decimal128 key would therefore have been *silently wrong* rather than rejected — precisely the
-  failure the allowlist exists to prevent, and the reason the refusal is stated as a type rule
-  rather than left to the kernel.
+`DECIMAL128` was refused until the width-16 widening landed: `load_widened` once read widths
+1/2/4/8 only, so a 16-byte component would have compared garbage in release builds rather than
+being rejected — the silent-wrongness the allowlist exists to prevent. The kernel now loads
+width 16 natively, and every boundary value widens through `exact_host_scalar::widened()` to
+`__int128_t`, which holds every alternative exactly — one widening point, so the variant, the
+kernel width switch, and `boundary_filter_params` cannot drift apart again.
 
 Comparing decimals as raw integers is only valid at **equal scale**, so scale equality is
 established at admission, at all three target sites. This is load-bearing: `exact_host_scalar`'s
-comparison widens to `int64` and never consults the storage type, so its "operands share one
-storage type" precondition is a real obligation on the caller, not something the type enforces.
+comparison widens exactly to `__int128_t` through `widened()` and never consults the storage
+type, so its "operands share one storage type" precondition is a real obligation on the caller,
+not something the type enforces.
 
-The allowlist lives in a pure function with its own unit test rather than only in the planner, so
-the rules are falsifiable in isolation. The p ≥ 19 refusal is **live, not theoretical**: the
-native scan's precision gate does not cover parquet, so a Top-N over a parquet-backed
-`DECIMAL(38,4)` builds a plan, reaches admission, and is refused there with no slot registered —
-confirmed by test. An earlier reading of this doc claimed the refusal was unreachable through any
-built plan; that was wrong, and the type rule is the only thing standing between a decimal128 key
-and a silently-zero comparison.
+The allowlist lives in a pure function with its own unit test rather than only in the planner,
+so the rules are falsifiable in isolation, and its decimal banding delegates to the single
+`cudf_decimal_type` derivation that `get_cudf_type` executes with — the planner cannot admit a
+mapping the engine does not use. The p 19–38 admission is **live on every scan format**: a
+Top-N over a parquet-backed `DECIMAL(38,4)` binds its scan slot (pinned by test), and an
+aggregate-output key such as TPC-H Q3/Q10's `revenue` admits regardless of scan format because
+the sink consumes its own boundary.
 
 Defence in depth behind it: `make_boundary_filter_params` throws on any component width outside
-{1, 2, 4, 8}, once per publication, rather than relying on `load_widened`'s assert, which
-compiles out in release.
+{1, 2, 4, 8, 16}, once per publication — unreachable today, since every fixed-width cuDF type
+maps to one of those widths, and kept for the next widening — and `apply_boundary_filter`
+refuses an engaged width-16 key column whose data pointer is not 16-byte aligned, once per
+pass, so a buffer violating cuDF's natural-alignment contract fails loudly instead of feeding
+misread comparisons.
 
-Not yet proved for decimals: the equivalence suite's fixture is non-null and non-negative, so
-null and negative decimal keys are untested, and the assumption that a decoded GPU column's type
-matches the DuckDB catalog type is relied on without a direct check. The DuckDB→cuDF decimal
-mapping is also expressed in three places that agree only through shared precision constants;
-divergence fails safe — every decimal site is refused — but a single mapping would be better.
+Null and negative decimal keys are now tested at every width including 16 (the equivalence
+suites and the FLBA pruning fixtures cover both — sign extension across the full 16 bytes is
+the discriminator), and the DuckDB→cuDF decimal *type* mapping has a single derivation,
+`cudf_decimal_type`, consulted by admission and execution alike; only the width banding in
+`logical_type::fixed_width_byte_size` remains separate, colocated with the constants it uses.
+Still relied on without a direct end-to-end check: that a decoded GPU column's type matches the
+DuckDB catalog type — the witness and consumer legs each refuse a mismatch, but no test
+manufactures one.
 Admission is asymmetric by layer: key zero admitted enables the
 first-key layer and first-key self-consumption; all keys admitted additionally enables LEX_RANGE
 and the lexicographic prefilter. An unsupported tail type therefore degrades the producer to the
-first-key layer, never disables it. Timestamps, unsigned/huge integers, floats, `DECIMAL128`, and
-strings need separate proofs. This is deliberately narrower than both references — DuckDB admits
+first-key layer, never disables it. Timestamps, unsigned/huge integers, floats, and strings need
+separate proofs. This is deliberately narrower than both references — DuckDB admits
 any physically integral type plus `VARCHAR`, and DataFusion has no producer-side gate at all —
 because their boundary stays host values with engine-uniform comparison, while a Sirius filter
 must agree across all the listed layers.
@@ -1496,9 +1504,10 @@ Telemetry must not extend filter or witness lifetime beyond query execution.
   siting rule admits them.
 - Head-component null derivations (`k0 IS NULL` under `NULLS FIRST`, exclusion under
   `NULLS LAST`).
-- More exact types per key — `DECIMAL(5–18)` landed, unlocking TPC-H Q18's head; `DECIMAL128`
-  awaits kernel width support — plus hive partitions, and native
-  metadata pruning.
+- ~~More exact types per key — `DECIMAL(5–18)` landed, unlocking TPC-H Q18's head; `DECIMAL128`
+  awaits kernel width support~~ **Landed:** `DECIMAL(5–38)`; the width-16 kernel load and the
+  `__int128_t` widening admit Q3/Q10's `revenue` DECIMAL(38,4) head for sink self-consumption.
+  Still open here: hive partitions and native metadata pruning.
 - Grouping-key-only `HAVING` admission by witnessing through the predicate.
 - MIN/MAX producers reusing RANGE and refinement slots.
 
@@ -1585,6 +1594,8 @@ These affect eligibility and performance policy, not the replacement protocol.
 | Scan wrapping | `src/planner/sirius_physical_plan_generator.cpp` | Reuse existing consumers |
 | Reader gate | `src/include/op/scan/reader_pruning_gate.hpp`, `src/op/scan/parquet_gpu_ingestible.cpp` | Gate the reader-AST dynamic merge on observed row-group pruning |
 | Serve-path flip | `src/include/op/scan/read_time_filter_bypass.hpp`, `src/scan_manager/sirius_scan_manager.cpp` | Latch pinned-serve at prepare; wrapper promotes to post-decode AST |
+| Key admission | `src/include/planner/top_n_key_types.hpp` | Per-key allowlist pure function; decimal banding via `cudf_decimal_type` |
+| Fused boundary kernel | `src/include/op/dynamic_filter/top_n_boundary_filter.hpp`, `src/cuda/top_n_boundary_filter.cu` | Launch params, widened loads (1/2/4/8/16), marshal + alignment gates |
 
 DuckDB `DynamicFilterData` may remain for CPU fallback compatibility, but is not the GPU transport
 or synchronization primitive.
@@ -1622,9 +1633,15 @@ joins under the aggregate, and the siting rule correctly skipped all eight no-wo
 **aggregate-input prefilter never processes a row** — at ~5 GB scan batches, each task's
 prefilter calls precede the boundary's formation, so there is nothing to prune by the time a
 boundary exists. Q2 is flat in both cells (CIs straddle 1.0), consistent with its tiny pre-LIMIT
-cardinality. Q3/Q10 never arm at all: their first ORDER BY key (`revenue`, a DECIMAL(38,4)
-aggregate output) exceeds the precision-18 admission cap, so both producers reject at plan time
-and those queries run effectively flag-off. Q21 (the one armed self-consumption-only query) is
+cardinality. Q3/Q10 armed once the DECIMAL128 admission landed (Phase 7): their first ORDER BY key
+(`revenue`, a DECIMAL(38,4) aggregate output) now admits, arming the row producer for sink
+self-consumption with zero external targets — the same profile as Q21. Their A/B cells have not
+yet been measured. The hypothesis recorded before that run: mechanism counters are guaranteed
+(sink-prefilter `rows_in` in the 10^8–10^9 range, the largest sink-floor numbers in the suite,
+since the aggregate output cannot arrive as one batch), while timing sits between flat and ~15%,
+bounded by the TOP_N stage's share — predicted at noise for Q10, whose single-key null-free
+batches already take the O(n) `top_k_order` selection path, with the upper half plausible only
+for Q3, whose two-key batches always full-sort. Q21 (the one armed self-consumption-only query) is
 flat: 1.0034 [0.9995, 1.0073] pinned, 0.9994 [0.9958, 1.0029] from disk.
 
 The unclustered dataset is hostile for the campaign's ORDER BY keys: row-group statistics span

@@ -751,3 +751,59 @@ TEST_CASE("gpu_execution - top-n dynamic filter negative shapes",
     require_flag_equivalence(con, query);
   }
 }
+
+TEST_CASE("gpu_execution - top-n dynamic filter admits a DECIMAL(38,4) key end to end",
+          "[integration][gpu_execution][dynamic_filter]")
+{
+  // A parquet-backed wide decimal: DuckDB writes every DECIMAL wider than 18 digits as a 16-byte
+  // FIXED_LEN_BYTE_ARRAY, and the flba16 fixture (DECIMAL(38,4), five all-negative row groups,
+  // every 97th amount NULL) is the checked-in instance. The queries select across the sign
+  // boundary, so a load or literal that mishandled the high 8 bytes or the sign would reorder
+  // the head rows and break the CPU equivalence.
+  REQUIRE(sirius::test::g_integration_env != nullptr);
+  if (!sirius::test::g_integration_env->is_active()) { sirius::test::g_integration_env->resume(); }
+  auto con = sirius::test::g_integration_env->make_connection();
+
+  auto const fixture =
+#ifdef SIRIUS_PROJECT_ROOT
+    std::filesystem::path{SIRIUS_PROJECT_ROOT} / "test/cpp/scan/data/flba16_decimal_bands.parquet";
+#else
+    std::filesystem::current_path() / "test/cpp/scan/data/flba16_decimal_bands.parquet";
+#endif
+  REQUIRE(std::filesystem::exists(fixture));
+  std::string const scan = "read_parquet('" + fixture.string() + "')";
+
+  SECTION("DESC head: equivalence, arming, and engaged witness extraction")
+  {
+    // Amounts are unique where non-null, so the single-key order is deterministic; the DESC head
+    // under the default null order keeps nulls out of the window, so every offered boundary head
+    // is a real DECIMAL128 value. `top_n_offers_unsupported` staying flat is what proves witness
+    // extraction actually engaged -- a scale or type mismatch at the decoded column would
+    // disengage component 0 and arm-but-idle.
+    std::string const query = "SELECT id, amount FROM " + scan + " ORDER BY amount DESC LIMIT 8";
+    require_flag_equivalence(con, query);
+
+    top_n_flag_guard flag(con, true);
+    con.Query("SET gpu_execution = true;");
+    auto const tbefore = sirius::test::get_transparent_execution_stats(con);
+    auto const before  = sirius::test::get_dynamic_filter_stats_snapshot(con);
+    auto const rows    = query_rows(con, query);
+    auto const after   = sirius::test::get_dynamic_filter_stats_snapshot(con);
+    auto const tafter  = sirius::test::get_transparent_execution_stats(con);
+    sirius::test::require_transparent_execution_delta(tbefore, tafter, 1, 0, 1);
+    REQUIRE(rows.size() == 8);
+    REQUIRE(after.top_n_producers_eligible > before.top_n_producers_eligible);
+    REQUIRE(after.top_n_producers_rejected == before.top_n_producers_rejected);
+    REQUIRE(after.top_n_offers - before.top_n_offers >= 1);
+    REQUIRE(after.top_n_offers_unsupported == before.top_n_offers_unsupported);
+  }
+
+  SECTION("ASC NULLS FIRST variant stays exact")
+  {
+    // More than K null amounts exist, so every boundary head is null (unsupported by design,
+    // pinned elsewhere); what this section pins is exactness. `id` breaks the null ties so the
+    // result is deterministic across engines.
+    require_flag_equivalence(
+      con, "SELECT id, amount FROM " + scan + " ORDER BY amount ASC NULLS FIRST, id LIMIT 8");
+  }
+}

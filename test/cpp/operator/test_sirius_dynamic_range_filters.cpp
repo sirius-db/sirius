@@ -71,22 +71,26 @@ using sirius::op::top_n_key_semantics;
 
 namespace {
 
-using host_value  = std::optional<std::int64_t>;
+using host_value  = std::optional<__int128_t>;
 using host_column = std::vector<host_value>;
 
 constexpr auto k_int32 = cudf::data_type{cudf::type_id::INT32};
 constexpr auto k_int64 = cudf::data_type{cudf::type_id::INT64};
 
+// 10^19: one above std::int64_t's range, so truncation to int64 wraps it negative.
+constexpr __int128_t k_ten_pow_19 = __int128_t{10} * 1'000'000'000'000'000'000LL;
+
 exact_host_scalar int32_bound(std::int32_t v) { return exact_host_scalar{v, k_int32}; }
 
 /// A boundary holding @p rep at @p type, with the variant alternative matching the type's width.
 /// For a decimal @p type the rep at the type's scale *is* its scaled integer.
-exact_host_scalar typed_bound(std::int64_t rep, cudf::data_type type)
+exact_host_scalar typed_bound(__int128_t rep, cudf::data_type type)
 {
   if (type.id() == cudf::type_id::INT32 || type.id() == cudf::type_id::DECIMAL32) {
     return exact_host_scalar{static_cast<std::int32_t>(rep), type};
   }
-  return exact_host_scalar{rep, type};
+  if (type.id() == cudf::type_id::DECIMAL128) { return exact_host_scalar{rep, type}; }
+  return exact_host_scalar{static_cast<std::int64_t>(rep), type};
 }
 
 top_n_key_semantics typed_key(cudf::data_type type, cudf::order order, cudf::null_order null_order)
@@ -99,9 +103,10 @@ top_n_key_semantics int32_key(cudf::order order, cudf::null_order null_order)
   return typed_key(k_int32, order, null_order);
 }
 
-/// One nullable column of @p type (INT32, INT64, DECIMAL32, or DECIMAL64); `std::nullopt` rows
-/// are null. Decimal reps come straight from the host ints -- a fixed-point value at the column's
-/// scale *is* its scaled integer -- so one host representation serves every admitted width.
+/// One nullable column of @p type (INT32, INT64, DECIMAL32, DECIMAL64, or DECIMAL128);
+/// `std::nullopt` rows are null. Decimal reps come straight from the host ints -- a fixed-point
+/// value at the column's scale *is* its scaled integer -- so one host representation serves every
+/// admitted width.
 std::unique_ptr<cudf::column> make_column(host_column const& values,
                                           cudf::data_type type,
                                           rmm::cuda_stream_view stream,
@@ -117,8 +122,9 @@ std::unique_ptr<cudf::column> make_column(host_column const& values,
       ++null_count;
     }
   }
-  auto const fixed_point =
-    type.id() == cudf::type_id::DECIMAL32 || type.id() == cudf::type_id::DECIMAL64;
+  auto const fixed_point = type.id() == cudf::type_id::DECIMAL32 ||
+                           type.id() == cudf::type_id::DECIMAL64 ||
+                           type.id() == cudf::type_id::DECIMAL128;
   auto column =
     fixed_point
       ? cudf::make_fixed_point_column(type, size, std::move(null_mask), null_count, stream, mr)
@@ -138,6 +144,8 @@ std::unique_ptr<cudf::column> make_column(host_column const& values,
   };
   if (type.id() == cudf::type_id::INT32 || type.id() == cudf::type_id::DECIMAL32) {
     copy_reps(std::int32_t{});
+  } else if (type.id() == cudf::type_id::DECIMAL128) {
+    copy_reps(__int128_t{});
   } else {
     copy_reps(std::int64_t{});
   }
@@ -191,7 +199,7 @@ std::vector<bool> evaluate_keep(cudf::table_view const& table,
 
 /// Host reference for the SQL meaning of a one-sided RANGE predicate.
 bool range_keeps(host_value value,
-                 std::int64_t bound,
+                 __int128_t bound,
                  range_bound_side side,
                  bool inclusive,
                  dynamic_filter_null_policy null_policy)
@@ -229,8 +237,10 @@ bool lex_keeps(std::vector<host_column> const& columns,
       if (!value && !bound) { continue; }
       return !value.has_value() == nulls_first;
     }
+    // The test mirror of production's single widening point: the oracle widens exactly as
+    // exact_host_scalar::widened() does, to __int128_t.
     auto const bound_value =
-      std::visit([](auto v) { return static_cast<std::int64_t>(v); }, bound->value());
+      std::visit([](auto v) { return static_cast<__int128_t>(v); }, bound->value());
     if (*value == bound_value) { continue; }
     bool const less = *value < bound_value;
     return components[i].key.order == cudf::order::DESCENDING ? !less : less;
@@ -433,20 +443,27 @@ TEST_CASE("RANGE decimal null policies match the SQL reference", "[dynamic_filte
   auto const mr     = space->get_default_allocator();
 
   auto const type      = GENERATE(cudf::data_type{cudf::type_id::DECIMAL32, -2},
-                             cudf::data_type{cudf::type_id::DECIMAL64, -3});
+                             cudf::data_type{cudf::type_id::DECIMAL64, -3},
+                             cudf::data_type{cudf::type_id::DECIMAL128, -4});
   auto const side      = GENERATE(range_bound_side::LOWER, range_bound_side::UPPER);
   bool const inclusive = GENERATE(false, true);
   auto const policy =
     GENERATE(dynamic_filter_null_policy::ADMIT, dynamic_filter_null_policy::REJECT);
-  CAPTURE(type.id() == cudf::type_id::DECIMAL64,
+  CAPTURE(static_cast<int>(type.id()),
           side == range_bound_side::LOWER,
           inclusive,
           policy == dynamic_filter_null_policy::ADMIT);
 
   // At equal storage type (which apply_compact now enforces) decimal reps compare exactly as
-  // their scaled integers, so the INT32 oracle serves unchanged: the reference takes reps.
+  // their scaled integers, so the INT32 oracle serves unchanged: the reference takes reps. The
+  // negative rep is the sign-extension discriminator at every width; the DECIMAL128 arm adds
+  // reps beyond int64's range, whose truncation would invert their verdicts.
   constexpr std::int64_t k_bound_rep = 4000;
-  host_column const reps{3999, 4000, 4001, std::nullopt, 0, 10000};
+  host_column reps{3999, 4000, 4001, std::nullopt, 0, 10000, -4000};
+  if (type.id() == cudf::type_id::DECIMAL128) {
+    reps.push_back(k_ten_pow_19);
+    reps.push_back(-k_ten_pow_19);
+  }
 
   sirius_dynamic_range_filter const filter{typed_bound(k_bound_rep, type), side, inclusive, policy};
   std::vector<bool> expected(reps.size());
@@ -533,36 +550,48 @@ TEST_CASE("LEX decimal null derivations match the reference", "[dynamic_filter][
   auto const stream = cudf::get_default_stream();
   auto const mr     = space->get_default_allocator();
 
-  // Mixed widths are the sharper marshalling case: a DECIMAL32 head beside a DECIMAL64 tail means
-  // a per-component width error cannot cancel out across the tuple.
-  auto const k_dec32_s2 = cudf::data_type{cudf::type_id::DECIMAL32, -2};
-  auto const k_dec64_s2 = cudf::data_type{cudf::type_id::DECIMAL64, -2};
+  // Mixed widths are the sharper marshalling case: a narrow head beside a different-width tail
+  // means a per-component width error cannot cancel out across the tuple. The DECIMAL128 head arm
+  // scales its reps past int64's range, so both the lowered AST literal (the on-device DECIMAL128
+  // AST proof at the pinned cuDF) and the fused kernel compare true 128-bit values.
+  auto const k_dec32_s2  = cudf::data_type{cudf::type_id::DECIMAL32, -2};
+  auto const k_dec64_s2  = cudf::data_type{cudf::type_id::DECIMAL64, -2};
+  auto const k_dec128_s2 = cudf::data_type{cudf::type_id::DECIMAL128, -2};
 
+  auto const head_type          = GENERATE_COPY(k_dec32_s2, k_dec128_s2);
   auto const head_order         = GENERATE(cudf::order::ASCENDING, cudf::order::DESCENDING);
   auto const tail_order         = GENERATE(cudf::order::ASCENDING, cudf::order::DESCENDING);
   auto const tail_nulls         = GENERATE(cudf::null_order::BEFORE, cudf::null_order::AFTER);
   bool const inclusive          = GENERATE(false, true);
   bool const null_tail_boundary = GENERATE(false, true);
-  CAPTURE(head_order == cudf::order::DESCENDING,
+  CAPTURE(head_type.id() == cudf::type_id::DECIMAL128,
+          head_order == cudf::order::DESCENDING,
           tail_order == cudf::order::DESCENDING,
           tail_nulls == cudf::null_order::BEFORE,
           inclusive,
           null_tail_boundary);
 
+  // 3 * 10^18 pushes the DECIMAL128 head reps {4..6} * multiplier beyond int64's range.
+  __int128_t const head_multiplier =
+    head_type.id() == cudf::type_id::DECIMAL128 ? __int128_t{3'000'000'000'000'000'000LL} : 1;
+
   std::vector<lex_component_semantics> const components{
-    {.consumer_ordinal = 0, .key = typed_key(k_dec32_s2, head_order, cudf::null_order::AFTER)},
+    {.consumer_ordinal = 0, .key = typed_key(head_type, head_order, cudf::null_order::AFTER)},
     {.consumer_ordinal = 1, .key = typed_key(k_dec64_s2, tail_order, tail_nulls)}};
   // The null tail boundary variant runs the disengaged-component terms (`IS NULL` /
   // `NOT IS_NULL` / dropped disjunct) on decimal columns.
   std::vector<std::optional<exact_host_scalar>> boundary_components{
-    typed_bound(5, k_dec32_s2),
+    typed_bound(5 * head_multiplier, head_type),
     null_tail_boundary ? std::optional<exact_host_scalar>{} : typed_bound(7, k_dec64_s2)};
   exact_host_key_tuple const boundary{boundary_components};
 
   // Reps spanning both sides of the head, head ties decided by the tail, and nulls on both keys.
-  std::vector<host_column> const columns{{4, 6, 5, 5, 5, 5, std::nullopt, 5},
-                                         {9, 0, 6, 7, 8, std::nullopt, 3, std::nullopt}};
-  std::vector<cudf::data_type> const key_types{k_dec32_s2, k_dec64_s2};
+  host_column head_reps{4, 6, 5, 5, 5, 5, std::nullopt, 5};
+  for (auto& rep : head_reps) {
+    if (rep) { *rep *= head_multiplier; }
+  }
+  std::vector<host_column> const columns{head_reps, {9, 0, 6, 7, 8, std::nullopt, 3, std::nullopt}};
+  std::vector<cudf::data_type> const key_types{head_type, k_dec64_s2};
 
   sirius_dynamic_lex_range_filter const filter{boundary, components, inclusive};
 
@@ -730,6 +759,19 @@ TEST_CASE("a mismatched consumer column type makes compaction all-pass", "[dynam
     require_all_pass(filter, {host_column{100, 200, 300}}, {k_dec32_s4});
   }
 
+  SECTION("DECIMAL128: ids agree, scales differ")
+  {
+    // The consumer-leg scale semantics at width 16: same shape as the DECIMAL32 section above,
+    // now over the widened representation.
+    auto const k_dec128_s2 = cudf::data_type{cudf::type_id::DECIMAL128, -2};
+    auto const k_dec128_s4 = cudf::data_type{cudf::type_id::DECIMAL128, -4};
+    sirius_dynamic_range_filter const filter{typed_bound(4000, k_dec128_s2),
+                                             range_bound_side::LOWER,
+                                             /*inclusive=*/false,
+                                             dynamic_filter_null_policy::REJECT};
+    require_all_pass(filter, {host_column{100, 200, 300}}, {k_dec128_s4});
+  }
+
   SECTION("RANGE: an empty key-column set passes through")
   {
     // The merge site always supplies the channel column, so an empty set is reachable only
@@ -807,17 +849,20 @@ TEST_CASE("boundary filters reject inadmissible construction", "[dynamic_filter]
                         dynamic_filter_null_policy::ADMIT),
                       std::invalid_argument);
   }
-  SECTION("RANGE's public marshaller refuses a width the kernel cannot read")
+  SECTION("RANGE's public marshaller emits width 16 with the exact DECIMAL128 value")
   {
-    // The DECIMAL128 gate on the direct-marshalling entry point, mirroring the detail
-    // marshaller's: width 16 would silently load as zero in a release-built kernel.
-    REQUIRE_THROWS_AS(
-      sirius_dynamic_range_filter::make_boundary_filter_params(
-        exact_host_scalar{std::int64_t{1}, cudf::data_type{cudf::type_id::DECIMAL128, -2}},
-        range_bound_side::LOWER,
-        true,
-        dynamic_filter_null_policy::ADMIT),
-      std::invalid_argument);
+    // DECIMAL128 is admitted, so the direct-marshalling entry point must emit width 16 with the
+    // rep intact past int64's range. Refusal coverage for genuinely inadmissible types lives in
+    // the FLOAT64, STRING exception-ordering, and LEX-FLOAT64 sections of this test case.
+    constexpr __int128_t k_rep = k_ten_pow_19 + 7;
+    auto const params          = sirius_dynamic_range_filter::make_boundary_filter_params(
+      exact_host_scalar{k_rep, cudf::data_type{cudf::type_id::DECIMAL128, -2}},
+      range_bound_side::LOWER,
+      true,
+      dynamic_filter_null_policy::ADMIT);
+    REQUIRE(params.components[0].engaged);
+    REQUIRE(params.components[0].width == 16);
+    REQUIRE(params.components[0].value == k_rep);
   }
   SECTION("LEX requires at least two components")
   {

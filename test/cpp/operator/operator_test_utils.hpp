@@ -362,6 +362,33 @@ inline std::shared_ptr<cucascade::data_batch> make_decimal64_batch(
   return cucascade::data_batch::make(batch_id, std::move(gpu_repr));
 }
 
+inline std::shared_ptr<cucascade::data_batch> make_decimal128_batch(
+  cucascade::memory::memory_space& space, const std::vector<__int128_t>& values, int32_t scale)
+{
+  auto mr     = get_resource_ref(space);
+  auto stream = default_stream();
+  auto size   = static_cast<cudf::size_type>(values.size());
+
+  auto col = cudf::make_fixed_point_column(cudf::data_type{cudf::type_id::DECIMAL128, scale},
+                                           size,
+                                           cudf::mask_state::UNALLOCATED,
+                                           stream,
+                                           mr);
+  cudaMemcpy(col->mutable_view().data<__int128_t>(),
+             values.data(),
+             sizeof(__int128_t) * values.size(),
+             cudaMemcpyHostToDevice);
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  auto table = std::make_unique<cudf::table>(std::move(cols));
+
+  auto gpu_repr =
+    std::make_unique<cucascade::gpu_table_representation>(std::move(table), space, stream);
+  auto batch_id = ::sirius::get_next_batch_id();
+  return cucascade::data_batch::make(batch_id, std::move(gpu_repr));
+}
+
 template <typename T>
 inline std::shared_ptr<cucascade::data_batch> make_timestamp_batch(
   cucascade::memory::memory_space& space, const std::vector<T>& values, cudf::type_id ts_type_id)

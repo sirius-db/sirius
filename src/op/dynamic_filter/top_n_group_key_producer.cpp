@@ -53,9 +53,10 @@ std::size_t admitted_element_width(cudf::data_type type) noexcept
     case cudf::type_id::INT32: return sizeof(std::int32_t);
     case cudf::type_id::INT64: return sizeof(std::int64_t);
     case cudf::type_id::TIMESTAMP_DAYS: return sizeof(std::int32_t);
-    // Fixed-point keys are their scaled integer; `decimal128` is outside the allowlist.
+    // Fixed-point keys are their scaled integer.
     case cudf::type_id::DECIMAL32: return sizeof(std::int32_t);
     case cudf::type_id::DECIMAL64: return sizeof(std::int64_t);
+    case cudf::type_id::DECIMAL128: return sizeof(__int128_t);
     default: return 0;
   }
 }
@@ -77,6 +78,11 @@ exact_host_scalar read_element(std::byte const* element, cudf::data_type type)
     case cudf::type_id::INT64:
     case cudf::type_id::DECIMAL64: {
       std::int64_t value{};
+      std::memcpy(&value, element, sizeof(value));
+      return exact_host_scalar{value, type};
+    }
+    case cudf::type_id::DECIMAL128: {
+      __int128_t value{};
       std::memcpy(&value, element, sizeof(value));
       return exact_host_scalar{value, type};
     }

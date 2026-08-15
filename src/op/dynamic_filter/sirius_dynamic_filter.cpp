@@ -284,10 +284,11 @@ bool is_admitted_boundary_type(cudf::data_type type) noexcept
     case cudf::type_id::INT32:
     case cudf::type_id::INT64:
     case cudf::type_id::TIMESTAMP_DAYS:
-    // Fixed-point keys are admitted as their scaled integer. `decimal128` is deliberately absent:
-    // its 16-byte representation does not fit the boundary components' `std::int64_t` widening.
+    // Fixed-point keys are admitted as their scaled integer; `DECIMAL128` rides the variant's
+    // `__int128_t` alternative and the kernel's width-16 load.
     case cudf::type_id::DECIMAL32:
-    case cudf::type_id::DECIMAL64: return true;
+    case cudf::type_id::DECIMAL64:
+    case cudf::type_id::DECIMAL128: return true;
     default: return false;
   }
 }
@@ -299,8 +300,7 @@ std::unique_ptr<cudf::scalar> make_boundary_scalar(sirius::op::exact_host_scalar
                                                    rmm::cuda_stream_view stream,
                                                    rmm::device_async_resource_ref mr)
 {
-  auto const widened =
-    std::visit([](auto v) { return static_cast<std::int64_t>(v); }, value.value());
+  auto const widened = value.widened();
   switch (value.storage_type().id()) {
     case cudf::type_id::INT8:
       return std::make_unique<cudf::numeric_scalar<std::int8_t>>(
@@ -312,7 +312,8 @@ std::unique_ptr<cudf::scalar> make_boundary_scalar(sirius::op::exact_host_scalar
       return std::make_unique<cudf::numeric_scalar<std::int32_t>>(
         static_cast<std::int32_t>(widened), true, stream, mr);
     case cudf::type_id::INT64:
-      return std::make_unique<cudf::numeric_scalar<std::int64_t>>(widened, true, stream, mr);
+      return std::make_unique<cudf::numeric_scalar<std::int64_t>>(
+        static_cast<std::int64_t>(widened), true, stream, mr);
     case cudf::type_id::TIMESTAMP_DAYS:
       return std::make_unique<cudf::timestamp_scalar<cudf::timestamp_D>>(
         cudf::timestamp_D{cudf::timestamp_D::duration{static_cast<std::int32_t>(widened)}},
@@ -330,6 +331,13 @@ std::unique_ptr<cudf::scalar> make_boundary_scalar(sirius::op::exact_host_scalar
         mr);
     case cudf::type_id::DECIMAL64:
       return std::make_unique<cudf::fixed_point_scalar<numeric::decimal64>>(
+        static_cast<std::int64_t>(widened),
+        numeric::scale_type{value.storage_type().scale()},
+        true,
+        stream,
+        mr);
+    case cudf::type_id::DECIMAL128:
+      return std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
         widened, numeric::scale_type{value.storage_type().scale()}, true, stream, mr);
     default:
       throw std::invalid_argument(
@@ -658,13 +666,11 @@ detail::boundary_filter_params sirius_dynamic_range_filter::make_boundary_filter
   bool inclusive,
   dynamic_filter_null_policy null_policy)
 {
-  // Validate before marshalling: every admitted type is fixed-width at 1/2/4/8 bytes, so the
-  // width below is always one the kernel's widened loads read. An unvetted type must throw here
-  // rather than marshal -- a non-fixed-width type would make cudf::size_of throw the wrong
-  // exception type, and DECIMAL128's width 16 would reach a kernel switch that returns 0 in
-  // release builds (the same gate detail::make_boundary_filter_params carries). Checking here
-  // also lets the constructor marshal in its member-init list while still honoring its documented
-  // std::invalid_argument contract.
+  // Validate before marshalling: every admitted type is fixed-width at 1/2/4/8/16 bytes, so the
+  // width below is always one the kernel's widened loads read. An unvetted type must still throw
+  // here rather than marshal -- a non-fixed-width type would make cudf::size_of throw the wrong
+  // exception type. Checking here also lets the constructor marshal in its member-init list while
+  // still honoring its documented std::invalid_argument contract.
   if (!is_admitted_boundary_type(bound.storage_type())) {
     throw std::invalid_argument(
       "[sirius_dynamic_range_filter] boundary type is outside the admitted allowlist");
@@ -673,11 +679,11 @@ detail::boundary_filter_params sirius_dynamic_range_filter::make_boundary_filter
   // bounded side makes "better" mean "on the kept side": LOWER keeps col > B / col >= B (better ==
   // larger, i.e. descending), UPPER keeps col < B / col <= B (better == smaller, ascending).
   detail::boundary_filter_params params{};
-  params.count      = 1;
-  params.strict     = !inclusive;
-  auto& component   = params.components[0];
-  component.engaged = true;
-  component.value = std::visit([](auto v) { return static_cast<std::int64_t>(v); }, bound.value());
+  params.count          = 1;
+  params.strict         = !inclusive;
+  auto& component       = params.components[0];
+  component.engaged     = true;
+  component.value       = bound.widened();
   component.descending  = side == range_bound_side::LOWER;
   component.nulls_first = null_policy == dynamic_filter_null_policy::ADMIT;
   component.width       = static_cast<std::uint8_t>(cudf::size_of(bound.storage_type()));

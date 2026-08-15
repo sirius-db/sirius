@@ -149,6 +149,29 @@ inline std::size_t estimate_referenced_column_bytes(
 }
 
 /**
+ * @brief The cuDF fixed-point type for a DuckDB DECIMAL(precision, scale), or empty for the
+ * INT16-backed band (p <= 4), which has no cuDF counterpart
+ *
+ * The single derivation of the precision -> fixed-point banding (p <= 9 DECIMAL32, p <= 18
+ * DECIMAL64, p <= 38 DECIMAL128, cuDF's negated-scale convention). `get_cudf_type`'s DECIMAL
+ * case and Top-N key admission both delegate here, so the mapping the planner admits is
+ * definitionally the mapping the engine executes with.
+ */
+[[nodiscard]] inline std::optional<cudf::data_type> cudf_decimal_type(uint8_t precision,
+                                                                      uint8_t scale) noexcept
+{
+  auto const neg_scale = -static_cast<int32_t>(scale);
+  if (precision <= logical_type::decimal_max_precision_int16) { return std::nullopt; }
+  if (precision <= logical_type::decimal_max_precision_int32) {
+    return cudf::data_type(cudf::type_id::DECIMAL32, neg_scale);
+  }
+  if (precision <= logical_type::decimal_max_precision_int64) {
+    return cudf::data_type(cudf::type_id::DECIMAL64, neg_scale);
+  }
+  return cudf::data_type(cudf::type_id::DECIMAL128, neg_scale);
+}
+
+/**
  * @brief Map a sirius::logical_type to its corresponding cudf::data_type.
  *
  * Mirrors duckdb::GetCudfType() but operates on the Sirius-native type system.
@@ -194,18 +217,14 @@ inline cudf::data_type get_cudf_type(const logical_type& t)
       throw duckdb::InvalidInputException("sirius::get_cudf_type: Type %s cannot be mapped to cuDF",
                                           t.to_string());
     case type_id::DECIMAL: {
-      // cuDF uses negative scale convention; precision determines the storage width.
-      auto const neg_scale = static_cast<int32_t>(-t.decimal_scale());
-      if (t.decimal_precision() <= logical_type::decimal_max_precision_int16)
+      // One banding derivation for admission and execution alike (see cudf_decimal_type).
+      auto const mapped = cudf_decimal_type(t.decimal_precision(), t.decimal_scale());
+      if (!mapped)
         throw duckdb::InvalidInputException(
           "sirius::get_cudf_type: DECIMAL with precision <= %d is stored as INT16 in DuckDB "
           "and has no direct cuDF equivalent — use DuckDB CPU fallback",
           logical_type::decimal_max_precision_int16);
-      if (t.decimal_precision() <= logical_type::decimal_max_precision_int32)
-        return cudf::data_type(cudf::type_id::DECIMAL32, neg_scale);
-      if (t.decimal_precision() <= logical_type::decimal_max_precision_int64)
-        return cudf::data_type(cudf::type_id::DECIMAL64, neg_scale);
-      return cudf::data_type(cudf::type_id::DECIMAL128, neg_scale);
+      return *mapped;
     }
     default:
       throw duckdb::InvalidInputException("sirius::get_cudf_type: Unsupported type: %s",
