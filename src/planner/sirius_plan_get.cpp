@@ -210,7 +210,11 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     auto const files =
       resolve_parquet_scan_file_paths(op.function.name, op.bind_data.get(), op.parameters);
     if (!files.empty()) {
-      pinned = sirius_state->get_scan_manager().find_pinned_entry_for_parquet_files(files);
+      // OWNING, like the duckdb probe above: plan generation runs outside any
+      // execution slot (F2), so this shared_ptr is what keeps the entry alive
+      // against a concurrent unpin for the rest of the plan build.
+      pinned_owner = sirius_state->get_scan_manager().find_pinned_entry_for_parquet_files(files);
+      pinned       = pinned_owner.get();
     }
   }
 

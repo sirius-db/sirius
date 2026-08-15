@@ -780,6 +780,16 @@ SiriusContext::SlotGuard::SlotGuard(SiriusContext& ctx, ClientContext& context) 
 
 SiriusContext::SlotGuard::~SlotGuard() noexcept { ctx_.release_query_lifecycle_slot(); }
 
+SiriusContext::PlanViewGuard::PlanViewGuard(SiriusContext& ctx, ClientContext& context)
+{
+  // Same fast-fail semantics as acquire_query_lifecycle_slot, without the
+  // slot: plan-time callers keep their runtime-unavailable / interrupt error
+  // split, but a peer's held execution window can no longer block them (F2).
+  if (ctx.runtime_unavailable_.load(std::memory_order_acquire)) { ctx.throw_runtime_unavailable(); }
+  if (context.IsInterrupted()) { throw InterruptException(); }
+  config_snapshot_.emplace(ctx.snapshot_query_config());
+}
+
 sirius::query_id_t SiriusContext::allocate_window_id()
 {
   // Bounded rather than while(true): the loop iterates only when the wrapped
@@ -1812,12 +1822,14 @@ RebindQueryInfo SiriusContext::install_transparent_execution(
   bool const plan_reads_s3 = logical_plan_reads_s3(*logical_plan);
 
   try {
-    // Plan-generation window: create_plan below reads the scan manager's pin
-    // registry, which requires single-flight discipline, so the validation is
-    // serialized against execution windows. Placed after the replan block so
-    // its nested bind never re-enters the slot, and inside this try so a
-    // runtime-unavailable error takes the existing fallback split below.
-    SlotGuard plan_window(*this, context);
+    // Plan-view scope (F2): create_plan below is CPU-only — its pin-registry
+    // probes are internally synchronized (owning shared_ptr under
+    // _pinned_entries_mutex) and its config reads use the snapshot this guard
+    // installs — so plan generation does NOT occupy an execution-window slot;
+    // a peer's long-running execution can no longer block a query from being
+    // PLANNED. Placed inside this try so a runtime-unavailable error takes
+    // the existing fallback split below.
+    PlanViewGuard plan_window(*this, context);
     // Validate that the captured logical plan is GPU-translatable before we
     // install a reusable transparent execution operator for prepared statements.
     //

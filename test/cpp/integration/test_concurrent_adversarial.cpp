@@ -358,6 +358,203 @@ TEST_CASE("adversarial: rapid pin/unpin churn under concurrent scans",
   REQUIRE_FALSE(un2->HasError());
 }
 
+TEST_CASE("adversarial: re-pinning one table is never rejected by queries on another",
+          "[concurrency][adversarial][pin_table][isolated_context]")
+{
+  // F5, the exact scenario: a churn worker RE-PINS table X (the merge path,
+  // whose use_count() > 1 guard protects in-place mutation of a live entry)
+  // while query workers run continuously against table Y only. The old
+  // try_match_cached_entry snapshot took a shared_ptr to EVERY pinned entry —
+  // including X's, which Y's queries can never serve from — so X's re-pin
+  // spuriously failed with "a query is currently reading the pinned entry"
+  // whenever any worker was mid-match. The snapshot now takes references only
+  // to entries that pass the identity gate, so Y-only queries hold no
+  // reference to X's entry and ZERO spurious rejections is structural, not
+  // statistical.
+  scoped_watchdog dog("pin isolation churn", scenario_timeout(600));
+
+  env_options opt;
+  // Small tables: the churn RE-materializes table X on every merge re-pin, and
+  // short Y queries maximize match-snapshot traffic.
+  opt.rows                              = env_i64("SIRIUS_TEST_PIN_ISOLATION_ROWS", 200'000);
+  opt.dim_rows                          = 200'000;
+  const std::vector<std::string> shapes = {
+    // Y-only shapes: no worker ever scans `fact`, so no worker can ever have a
+    // legitimate serving reference to fact_pin's entry.
+    "SELECT count(*) AS c, sum(w) AS s FROM dim WHERE w > 100",
+    "SELECT bucket, count(*) AS c, min(k) AS lo FROM dim GROUP BY bucket ORDER BY bucket",
+  };
+  adversarial_env env(opt, shapes);
+
+  {
+    duckdb::Connection con(*env.db);
+    // X: pinned with a column subset so later re-pins take the same-row-count
+    // MERGE path (the use_count-guarded one) instead of building a fresh entry.
+    auto pin = con.Query("CALL pin_table('" + env.fact_path.string() +
+                         "', tier='gpu', name='fact_pin', cols=['id', 'k'])");
+    REQUIRE_FALSE(pin->HasError());
+    // Y: pinned too, so the workers' matches do real serving work.
+    auto pin2 =
+      con.Query("CALL pin_table('" + env.dim_path.string() + "', tier='gpu', name='dim_pin')");
+    REQUIRE_FALSE(pin2->HasError());
+  }
+
+  const auto stats_before = env.sirius_ctx->get_transparent_execution_stats();
+
+  std::atomic<bool> churn_stop{false};
+  std::atomic<int> repin_ok{0};
+  std::atomic<int> repin_busy{0};   // F5 signature: "currently reading the pinned entry"
+  std::atomic<int> repin_other{0};  // anything else is a real bug
+  std::mutex sample_mutex;
+  std::vector<std::string> error_samples;
+
+  std::thread churn([&] {
+    duckdb::Connection con(*env.db);
+    bool flip = false;
+    while (!churn_stop.load()) {
+      // Alternating column subsets keep every iteration on the merge path of a
+      // LIVE entry (identical chunk boundaries: same file, all-BIGINT subsets).
+      const std::string cols = flip ? "cols=['id', 'v']" : "cols=['id', 'k']";
+      flip                   = !flip;
+      auto re                = con.Query("CALL pin_table('" + env.fact_path.string() +
+                          "', tier='gpu', name='fact_pin', " + cols + ")");
+      if (re->HasError()) {
+        const auto err = re->GetError();
+        if (err.find("currently reading the pinned entry") != std::string::npos) {
+          ++repin_busy;
+        } else {
+          ++repin_other;
+        }
+        std::lock_guard<std::mutex> lock(sample_mutex);
+        if (error_samples.size() < 10) { error_samples.push_back(err); }
+      } else {
+        ++repin_ok;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  });
+
+  auto failures = run_workers(
+    *env.db,
+    workers(),
+    iters_per_worker() * 20,
+    [&](int wid, int i) { return env.shapes[(wid + i) % env.shapes.size()]; },
+    [&](int wid, int i) { return env.reference[(wid + i) % env.shapes.size()]; });
+  churn_stop.store(true);
+  churn.join();
+  require_no_failures(failures);
+
+  for (const auto& s : error_samples) {
+    UNSCOPED_INFO("re-pin error sample — " << s);
+  }
+  const auto stats = env.sirius_ctx->get_transparent_execution_stats();
+  INFO("re-pins ok=" << repin_ok.load() << " busy(F5)=" << repin_busy.load()
+                     << " other=" << repin_other.load() << " executions="
+                     << (stats.executions - stats_before.executions) << " runtime_fallbacks="
+                     << (stats.runtime_fallbacks - stats_before.runtime_fallbacks));
+
+  // The churn must have exercised the merge path a meaningful number of times
+  // while queries flowed.
+  REQUIRE(repin_ok.load() >= 8);
+  REQUIRE(stats.executions - stats_before.executions >=
+          static_cast<std::uint64_t>(workers()) * (iters_per_worker() * 20));
+  // THE F5 assertion: queries on Y hold no reference to X's entry, so X's
+  // merge re-pin can never see a foreign use_count — zero spurious rejections.
+  REQUIRE(repin_busy.load() == 0);
+  REQUIRE(repin_other.load() == 0);
+
+  duckdb::Connection con(*env.db);
+  auto un1 = con.Query("CALL unpin_table('fact_pin')");
+  REQUIRE_FALSE(un1->HasError());
+  auto un2 = con.Query("CALL unpin_table('dim_pin')");
+  REQUIRE_FALSE(un2->HasError());
+}
+
+TEST_CASE("adversarial: plan generation is not blocked by a held execution slot",
+          "[concurrency][adversarial][plan_view][isolated_context]")
+{
+  // F2: the plan-time guard used to occupy a full execution-window slot, so a
+  // query A EXECUTING blocked query B from even being PLANNED. With ONE slot
+  // (the strictest shape), a heavy query holds it for seconds; the peer's
+  // Prepare (which runs the transparent OnFinalizePrepare rebind, i.e. full
+  // Sirius plan generation) must complete WHILE that slot is held. Before the
+  // fix the peer's Prepare parked in acquire_query_lifecycle_slot until the
+  // heavy query finished, so zero prepares could land inside the held window.
+  scoped_watchdog dog("plan view vs execution", scenario_timeout(600));
+
+  env_options opt;
+  opt.max_concurrent_queries = 1;
+  opt.gpu_pool_bytes =
+    static_cast<std::uint64_t>(env_i64("SIRIUS_TEST_SPILL_POOL_BYTES", 1'500'000'000));
+  opt.rows = env_i64("SIRIUS_TEST_PLAN_VIEW_ROWS", 8'000'000);
+  adversarial_env env(opt);
+
+  // Heavy: the fact-fact self join from the spill storm — several seconds of
+  // window hold on this pool. Its reference is computed up front.
+  const std::string heavy_sql =
+    "SELECT count(*) AS c, sum(a.v + b.v) AS s FROM fact a JOIN fact b ON a.id = b.id";
+  const std::string heavy_ref = env.reference_for(heavy_sql);
+
+  std::atomic<bool> heavy_done{false};
+  std::string heavy_error;
+  std::string heavy_result;
+  std::thread heavy([&] {
+    duckdb::Connection con(*env.db);
+    auto r = con.Query(heavy_sql);
+    if (r->HasError()) {
+      heavy_error = r->GetError();
+    } else {
+      heavy_result = materialize(*r);
+    }
+    heavy_done.store(true);
+  });
+
+  // Wait for the heavy query's execution window (the single slot) to be held.
+  while (!env.sirius_ctx->is_query_lifecycle_active() && !heavy_done.load()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  // Peer prepares while the slot is held. A prepare counts only when the slot
+  // was held BEFORE and AFTER it (the heavy window spanned it): with one slot
+  // and one peer connection, a slot-consuming plan guard can never satisfy
+  // that — the prepare would park until the heavy query released the slot.
+  const auto stats_before  = env.sirius_ctx->get_transparent_execution_stats();
+  int prepares_inside_hold = 0;
+  int prepares_total       = 0;
+  {
+    duckdb::Connection con(*env.db);
+    while (!heavy_done.load()) {
+      const bool held_before = env.sirius_ctx->is_query_lifecycle_active();
+      auto prepared          = con.Prepare(
+        "SELECT count(*) AS c, sum(v) AS s, min(id) AS lo, max(id) AS hi "
+                 "FROM fact WHERE k < 13");
+      REQUIRE_FALSE(prepared->HasError());
+      ++prepares_total;
+      if (held_before && env.sirius_ctx->is_query_lifecycle_active() && !heavy_done.load()) {
+        ++prepares_inside_hold;
+      }
+    }
+  }
+  heavy.join();
+  REQUIRE(heavy_error.empty());
+  REQUIRE(heavy_result == heavy_ref);
+
+  const auto stats = env.sirius_ctx->get_transparent_execution_stats();
+  INFO("prepares_total=" << prepares_total << " prepares_inside_hold=" << prepares_inside_hold
+                         << " rebinds="
+                         << (stats.successful_rebinds - stats_before.successful_rebinds)
+                         << " peak=" << env.sirius_ctx->query_lifecycle_peak());
+  // The prepares must be real Sirius plan generations (transparent rebinds),
+  // not plan-time CPU declines that never touched the Sirius planner.
+  REQUIRE(stats.successful_rebinds - stats_before.successful_rebinds >=
+          static_cast<std::uint64_t>(prepares_total));
+  // At least one full plan generation landed strictly inside the held window.
+  REQUIRE(prepares_inside_hold >= 1);
+  // Planning does not consume the execution window: the single-slot peak can
+  // never exceed 1 no matter how many prepares overlapped the execution.
+  REQUIRE(env.sirius_ctx->query_lifecycle_peak() == 1);
+}
+
 TEST_CASE("adversarial: concurrent queries across two GPUs",
           "[concurrency][adversarial][mgpu][isolated_context]")
 {

@@ -1571,8 +1571,11 @@ void SiriusExtension::UnpinTableFunction(ClientContext& context,
   }
   auto pin_registry_guard = sirius_ctx->lock_pinned_table_registry();
   {
-    // Registry removal must be serialized against execution windows (plan
-    // generation reads pinned entries); a lock-only guard suffices — unpin
+    // Conservative slot hold while the map slot is dropped. NOT what keeps
+    // readers safe: plan generation runs outside any slot (F2) and every
+    // pin-registry read is internally synchronized (_pinned_entries_mutex)
+    // and owning (shared_ptr<pinned_entry>), so an unpin mid-plan/mid-serve
+    // only drops the map's reference. A lock-only guard suffices — unpin
     // creates no per-query runtime state to clean.
     duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
     sirius_ctx->get_scan_manager().remove_pinned_entry(data.name);

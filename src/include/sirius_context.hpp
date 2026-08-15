@@ -423,6 +423,34 @@ class SiriusContext : public ClientContextState {
   };
 
   /**
+   * @brief Slot-FREE read view for plan generation (register F2). Planning is
+   * CPU-only: it needs the runtime-health/cancellation fast-fail, a coherent
+   * config snapshot (installed thread-locally, same E1 discipline as the
+   * windows), and a consistent view of the pin table — which the scan
+   * manager's `_pinned_entries_mutex` + owning `shared_ptr<pinned_entry>`
+   * probes already provide per call. It therefore does NOT occupy an
+   * execution-window slot: a peer's long execution can no longer block plan
+   * generation, and plan generation never counts toward query_lifecycle_peak
+   * or admission. Execution still acquires its slot when the execution window
+   * (StandaloneQueryScope) begins.
+   */
+  class PlanViewGuard {
+   public:
+    /// Fast-fails like the slot acquire (stable runtime-unavailable error,
+    /// InterruptException for a cancelled @p context) so plan-time callers
+    /// keep their existing error/fallback split.
+    PlanViewGuard(SiriusContext& ctx, ClientContext& context);
+    ~PlanViewGuard()                               = default;
+    PlanViewGuard(const PlanViewGuard&)            = delete;
+    PlanViewGuard& operator=(const PlanViewGuard&) = delete;
+
+   private:
+    /// SNAPSHOT-AT-PLAN-BEGIN (E1/E2/E3): one coherent copy of the
+    /// SET-mutable config for every reader inside this planning scope.
+    std::optional<sirius::scoped_query_config_snapshot> config_snapshot_;
+  };
+
+  /**
    * @brief Full execution-window RAII: begin mutations + slot acquire in the
    * constructor; an explicit finish() runs the mandatory per-query cleanup
    * (and may throw); the destructor is a noexcept backstop that runs only when

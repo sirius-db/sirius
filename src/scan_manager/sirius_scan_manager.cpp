@@ -2086,12 +2086,12 @@ std::shared_ptr<const pinned_entry> sirius_scan_manager::find_pinned_entry_for_d
   return nullptr;
 }
 
-pinned_entry const* sirius_scan_manager::find_pinned_entry_for_parquet_files(
+std::shared_ptr<const pinned_entry> sirius_scan_manager::find_pinned_entry_for_parquet_files(
   std::span<std::string const> resolved_file_paths) const
 {
   std::lock_guard pin_lk{_pinned_entries_mutex};
   for (auto const& [name, entry] : _pinned_entries) {
-    if (entry->cache_info.matches_parquet_files(resolved_file_paths)) { return entry.get(); }
+    if (entry->cache_info.matches_parquet_files(resolved_file_paths)) { return entry; }
   }
   return nullptr;
 }
