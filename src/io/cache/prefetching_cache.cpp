@@ -490,12 +490,18 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius
     }
   }
   if (chunks.empty()) {
-    std::shared_lock lk(_map_mtx);
-    auto it = _file_cache.find(obj.raw_file_cache_id());
-    if (it != _file_cache.end()) {
-      lk.unlock();
-      chunks = it->second->fetch_chunks(offset, size, policy, _chunk_size);
+    // Same rule as get_or_create_file_entry / host_read_from_cache_only (B11): carry the entry
+    // POINTER out of the lock, never the iterator — `it->second` was being dereferenced after
+    // lk.unlock(), so a concurrent insert of a different file rehashing _file_cache invalidated
+    // it. The pointed-to file_entry is heap-allocated and stable across a rehash.
+    file_entry* entry = nullptr;
+    {
+      std::shared_lock lk(_map_mtx);
+      if (auto it = _file_cache.find(obj.raw_file_cache_id()); it != _file_cache.end()) {
+        entry = it->second.get();
+      }
     }
+    if (entry != nullptr) { chunks = entry->fetch_chunks(offset, size, policy, _chunk_size); }
   }
 
   while (!chunks.empty()) {
