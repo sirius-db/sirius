@@ -14,6 +14,24 @@
  * limitations under the License.
  */
 
+/**
+ * @file test_dynamic_filter_publisher.cpp
+ * @brief Pins dynamic_filter_publisher::publish's per-key membership-representation choice
+ *
+ * Sections, in file order:
+ *  - Tier precedence: the raw small IN-list wins at <= k_max_keys build rows, and one row above
+ *    that gate falls through to the hash IN-list under the default L2 fraction.
+ *  - inlist_max_l2_fraction semantics: a vanishing fraction demotes the hash IN-list to the
+ *    Bloom filter; 1.0 reproduces the legacy L2-fit rule; 0 always publishes the Bloom for the
+ *    hash tier while leaving small-IN-list precedence untouched; and the
+ *    set_bytes <= fraction * l2_bytes comparison is inclusive, bracketed from the same
+ *    estimated_set_bytes / cudaDevAttrL2CacheSize inputs the publisher reads.
+ *  - Type-coverage canary: Bloom support covers every hash-IN-list key type, so the publisher's
+ *    "keep a fitting IN-list when the type lacks Bloom support" clause is unreachable today; the
+ *    comment prescribes the follow-up test should the type sets ever diverge.
+ *  - Key-ordinal safety: an inequality condition ordinal never receives a membership filter.
+ */
+
 #include "op/dynamic_filter_publisher.hpp"
 #include "op/sirius_dynamic_filter.hpp"
 #include "operator_test_utils.hpp"

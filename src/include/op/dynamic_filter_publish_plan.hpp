@@ -56,6 +56,8 @@ class dynamic_filter_publish_plan final {
   static constexpr double k_default_inlist_max_l2_fraction = 0.125;
 
   dynamic_filter_publish_plan() = default;
+  /// @brief Constructs the plan from the planner's routing, placement, and policy decisions.
+  ///
   /// The plan performs no domain validation on @p inlist_max_l2_fraction: both configuration
   /// surfaces already enforce the [0, 1] domain, and tests may legitimately construct out-of-domain
   /// plans.

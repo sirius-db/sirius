@@ -242,9 +242,12 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
     // (2) Membership filter — post-decode. Prefer, in order:
     //  - A. the exact IN-list with a brute-force scan for a very small key set (no hash build);
     //  - B. the hash-based IN-list when its cuco set fits the device L2 cache and stays within
-    //       the plan's inlist_max_l2_fraction of it (measured, the set's probe cost is flat
-    //       below that residency bound and degrades beyond it, while the smaller Bloom probes
-    //       faster at every hash-set size);
+    //       the plan's inlist_max_l2_fraction of it. The fraction bounds residency, not
+    //       capacity: competing with the streaming probe traffic, the set stops being
+    //       cache-resident well before it reaches L2 capacity (measured, its probe cost is flat
+    //       below the bound and degrades steadily beyond), while the smaller-but-inexact Bloom
+    //       probes >= 2.2x faster at every hash-set size — so the exact filter is kept only
+    //       where exactness costs the least;
     //  - C. otherwise the Bloom filter whenever the key type supports it;
     // `none` only when the key type has no membership support (anything other than INT32/INT64).
     auto const set_bytes =
