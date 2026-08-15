@@ -318,10 +318,17 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
   if (!needs_exact_total && cum_chars_upper <= HOST_UPPER_BOUND_LIMIT) {
     alloc_chars = cum_chars_upper;
   } else {
-    RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+    // F7: a blocking cudaMemcpy runs on the legacy default stream and implicitly synchronizes
+    // with every blocking stream on the device. Read the scan result back on the task's own
+    // stream instead: the exclusive-sum above ran on `stream`, so the async copy is ordered
+    // after it, and the stream sync makes the value host-visible before the read below.
     uint32_t total_chars_u = 0;
-    RMM_CUDA_TRY(cudaMemcpy(
-      &total_chars_u, d_offsets.data() + total_rows, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    RMM_CUDA_TRY(cudaMemcpyAsync(&total_chars_u,
+                                 d_offsets.data() + total_rows,
+                                 sizeof(uint32_t),
+                                 cudaMemcpyDeviceToHost,
+                                 stream.value()));
+    RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
     if (total_chars_u > static_cast<uint32_t>(INT32_MAX_SIZE)) {
       throw std::runtime_error("gpu_decode_strings_column: total_chars (" +
                                std::to_string(total_chars_u) + ") exceeds int32 max");

@@ -44,6 +44,9 @@
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
+// rmm
+#include <rmm/cuda_stream.hpp>
+
 // cucascade
 #include <cucascade/memory/memory_space.hpp>
 
@@ -662,7 +665,16 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
 std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   std::string const& file_path, std::shared_ptr<io::sirius_ioctx> const& io_ctx)
 {
-  auto stream = cudf::get_default_stream();
+  // F7: the footer read's GPU work (AST-literal device scalars, the row-group stats filter)
+  // used to run on the LEGACY default stream, which implicitly synchronizes with every blocking
+  // stream on the device — one query's footer probe stalled every co-resident query's kernels
+  // (this build does not enable per-thread default streams). A function-local non-blocking
+  // stream keeps producer/consumer ordering trivially (everything below runs on THIS stream,
+  // and filter_row_groups_with_stats returns host data, syncing before use) without touching
+  // anyone else. Declared before ast_expression so the stream outlives the stream-ordered
+  // frees of the translated expression's device scalars.
+  rmm::cuda_stream owned_stream;
+  rmm::cuda_stream_view const stream = owned_stream.view();
 
   // Resolve the file to a sirius_datasource (own io backend, prefetch cache and
   // cached metadata). The parquet_footer_probe hint collapses the S3 footer read

@@ -1254,8 +1254,14 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     auto empty_table = absent.has_physical_overrides()
                          ? sirius::make_empty_table(absent.get_physical_types())
                          : sirius::make_empty_table(absent.get_types());
+    // F7: writer_stream must not be the legacy default stream — recording the batch's writer
+    // event there would make every consumer's cudaStreamWaitEvent order behind ALL
+    // default-stream work on the device (this build does not enable per-thread default
+    // streams). A pool stream from the batch's own space is sufficient ordering: the empty
+    // table owns no device data (make_empty_column allocates nothing), so any event on a live
+    // stream of the right device correctly publishes it.
     auto empty_batch =
-      make_data_batch(std::move(empty_table), *ms, cudf::get_default_stream(), batch_telemetry());
+      make_data_batch(std::move(empty_table), *ms, ms->acquire_stream(), batch_telemetry());
 
     std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
     input_batch.reserve(2);
@@ -2148,14 +2154,17 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
         cudaGetErrorString(status));
     }
   } else {
-    // Defense-in-depth for older representations that predate mandatory writer events.
-    auto const status = cudaDeviceSynchronize();
-    if (status != cudaSuccess) {
-      throw std::runtime_error(
-        std::string("[sirius_physical_hash_join::push_data_batch_partitioned] dynamic-filter "
-                    "source synchronization failed: ") +
-        cudaGetErrorString(status));
-    }
+    // No writer event means the batch's producing stream is unknown (a representation that
+    // predates mandatory writer events). The old fallback was cudaDeviceSynchronize(), which
+    // stalls EVERY stream of every co-resident query on this device (F7). Publication is
+    // best-effort by contract (see the residency skip above): skipping is always correct —
+    // the probe side simply prunes nothing — while publishing UNORDERED could read
+    // half-written build keys. So skip, loudly.
+    SIRIUS_LOG_WARN(
+      "[sirius_physical_hash_join] dynamic filter NOT published (id={}): build batch carries no "
+      "writer event, so publication cannot be stream-ordered without a device-wide sync",
+      get_operator_id());
+    return;
   }
   publish_dynamic_filters(sirius::get_cudf_table_view(*build_ro), publish_stream);
 }
