@@ -251,3 +251,160 @@ TEST_CASE("pin_table - same-row-count merge extends cache_info to the column uni
 
   fs::remove_all(tmp, ec);
 }
+
+namespace {
+
+/// Copy of a pinned entry's cache_info column names + mvcc presence, taken
+/// inside the visitor so no reference escapes the pin-table lock.
+struct identity_probe {
+  bool found    = false;
+  bool has_mvcc = false;
+  std::set<std::string> column_names;
+  std::string table_name;
+};
+
+identity_probe probe_identity(duckdb::SiriusContext& ctx, std::string const& pin_name)
+{
+  identity_probe out;
+  ctx.get_scan_manager().visit_pinned_entries(
+    [&](std::string_view name, sirius::scan_manager::pinned_entry const& entry) {
+      if (name != pin_name) { return true; }  // keep scanning
+      out.found    = true;
+      out.has_mvcc = entry.mvcc != nullptr;
+      auto names   = entry.cache_info.column_names();
+      out.column_names.insert(names.begin(), names.end());
+      out.table_name = entry.cache_info.table_name;
+      return false;  // stop
+    });
+  return out;
+}
+
+}  // namespace
+
+// The pinned-entry map (and the MVCC metadata attach) is keyed by the bare
+// user-supplied pin name. Two live same-named pins that resolve to DIFFERENT
+// sources — bare-name duckdb pins from two ATTACHed databases, or two parquet
+// file sets pinned under one name — used to collide in the merge/replace path:
+// the second pin silently spliced its columns (and its MVCC metadata) into the
+// first source's entry, so a query on the first table could serve the second
+// table's data. The name stays the user-facing handle (unique per name); a
+// same-named pin of a different resolved identity is now rejected loudly.
+TEST_CASE("pin_table - same pin name refuses a different resolved identity",
+          "[pin_table][scan_manager]")
+{
+  if (sirius::test::g_shared_env && sirius::test::g_shared_env->is_active()) {
+    sirius::test::g_shared_env->pause();
+  }
+  if (sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()) {
+    sirius::test::g_integration_env->pause();
+  }
+  if (sirius::test::g_integration_env_2gpu && sirius::test::g_integration_env_2gpu->is_active()) {
+    sirius::test::g_integration_env_2gpu->pause();
+  }
+
+  auto tmp = fs::temp_directory_path() / ("sirius-pin-identity-" + std::to_string(::getpid()));
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp);
+
+  auto yaml_path = tmp / "pin_identity.yaml";
+  write_config(yaml_path);
+  REQUIRE(fs::exists(yaml_path));
+
+  constexpr std::int64_t kTableRows = 100'000;
+  // sum(range(N)) and the per-database b multipliers used below.
+  std::int64_t const range_sum = kTableRows * (kTableRows - 1) / 2;
+
+  {
+    sirius::test::shared_test_env local_env(yaml_path);
+    auto con = local_env.make_connection();
+
+    auto run_ok = [&](std::string const& sql) {
+      auto r = con.Query(sql);
+      REQUIRE(r);
+      if (r->HasError()) { UNSCOPED_INFO("SQL '" << sql << "' error: " << r->GetError()); }
+      REQUIRE_FALSE(r->HasError());
+      return r;
+    };
+
+    auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(sirius_ctx != nullptr);
+
+    // Two ATTACHed databases with a same-named table of the SAME shape and row
+    // count (the exact precondition under which the old merge path proceeded)
+    // but DIFFERENT values, so any cross-database serving is observable.
+    auto db1 = tmp / "identity_db1.db";
+    auto db2 = tmp / "identity_db2.db";
+    run_ok("ATTACH '" + db1.string() + "' AS identity_db1;");
+    run_ok("ATTACH '" + db2.string() + "' AS identity_db2;");
+    run_ok("CREATE TABLE identity_db1.main.t AS SELECT range AS a, range * 2 AS b FROM range(" +
+           std::to_string(kTableRows) + ");");
+    run_ok("CREATE TABLE identity_db2.main.t AS SELECT range AS a, range * 3 AS b FROM range(" +
+           std::to_string(kTableRows) + ");");
+    run_ok("CHECKPOINT identity_db1;");
+    run_ok("CHECKPOINT identity_db2;");
+
+    // Pin db1's table under the bare name 't' (resolved via the search path).
+    run_ok("USE identity_db1;");
+    run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu', cols=['a']);");
+
+    // Same bare pin name from db2 resolves to a DIFFERENT table: must be
+    // rejected loudly. Pre-fix this silently merged db2's column 'b' into
+    // db1's entry and re-bound the entry's MVCC metadata to db2's snapshot.
+    run_ok("USE identity_db2;");
+    auto collide = con.Query("CALL pin_table(format='duckdb', name='t', tier='gpu', cols=['b']);");
+    REQUIRE(collide);
+    REQUIRE(collide->HasError());
+    UNSCOPED_INFO("colliding pin error: " << collide->GetError());
+    REQUIRE(collide->GetError().find("already bound") != std::string::npos);
+    REQUIRE(collide->GetError().find("identity_db1") != std::string::npos);
+
+    // db1's entry is untouched: still exactly its own column, still its own
+    // MVCC metadata slot.
+    auto probe = probe_identity(*sirius_ctx, "t");
+    REQUIRE(probe.found);
+    REQUIRE(probe.column_names == std::set<std::string>{"a"});
+    REQUIRE(probe.has_mvcc);
+    REQUIRE(probe.table_name == "t");
+
+    // The supported shape: a distinct pin name for the second source. Both
+    // pins are then LIVE SIMULTANEOUSLY and each table serves its own values.
+    run_ok("CALL pin_table(format='duckdb', name='identity_db2.main.t', tier='gpu');");
+
+    auto sum_a1 = run_ok("SELECT sum(a) FROM identity_db1.main.t;");
+    REQUIRE(sum_a1->GetValue(0, 0).ToString() == std::to_string(range_sum));
+    auto sum_b1 = run_ok("SELECT sum(b) FROM identity_db1.main.t;");
+    REQUIRE(sum_b1->GetValue(0, 0).ToString() == std::to_string(2 * range_sum));
+    auto sum_b2 = run_ok("SELECT sum(b) FROM identity_db2.main.t;");
+    REQUIRE(sum_b2->GetValue(0, 0).ToString() == std::to_string(3 * range_sum));
+
+    run_ok("CALL unpin_table('identity_db2.main.t');");
+    run_ok("CALL unpin_table('t');");
+    run_ok("USE memory;");
+
+    // Parquet variant: one pin name over two different (same-shape) file sets
+    // trips the same guard; releasing the name frees it for the other set.
+    auto pq1 = tmp / "identity_one.parquet";
+    auto pq2 = tmp / "identity_two.parquet";
+    run_ok("COPY (SELECT range AS a FROM range(" + std::to_string(kTableRows) + ")) TO '" +
+           pq1.string() + "' (FORMAT PARQUET);");
+    run_ok("COPY (SELECT range * 5 AS a FROM range(" + std::to_string(kTableRows) + ")) TO '" +
+           pq2.string() + "' (FORMAT PARQUET);");
+    run_ok("CALL pin_table('" + pq1.string() + "', tier='gpu', name='pq_pin');");
+    auto pq_collide =
+      con.Query("CALL pin_table('" + pq2.string() + "', tier='gpu', name='pq_pin');");
+    REQUIRE(pq_collide);
+    REQUIRE(pq_collide->HasError());
+    UNSCOPED_INFO("parquet colliding pin error: " << pq_collide->GetError());
+    REQUIRE(pq_collide->GetError().find("already bound") != std::string::npos);
+
+    auto pq_sum = run_ok("SELECT sum(a) FROM read_parquet('" + pq2.string() + "');");
+    REQUIRE(pq_sum->GetValue(0, 0).ToString() == std::to_string(5 * range_sum));
+
+    run_ok("CALL unpin_table('pq_pin');");
+    run_ok("CALL pin_table('" + pq2.string() + "', tier='gpu', name='pq_pin');");
+    run_ok("CALL unpin_table('pq_pin');");
+  }
+
+  fs::remove_all(tmp, ec);
+}

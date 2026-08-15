@@ -1596,6 +1596,41 @@ std::vector<std::size_t> cache_entry_info::column_projection_for(
   return column_superset_projection(column_ids, requested_ids);
 }
 
+namespace {
+
+/// Human-readable form of a pin's resolved identity, for error messages.
+std::string pinned_identity_description(cache_entry_info const& info)
+{
+  if (!info.table_name.empty()) {
+    return "duckdb table " + info.catalog_name + "." + info.schema_name + "." + info.table_name;
+  }
+  std::string desc = "parquet file set {";
+  for (std::size_t i = 0; i < info.resolved_file_paths.size(); ++i) {
+    if (i > 0) { desc += ", "; }
+    desc += info.resolved_file_paths[i];
+  }
+  desc += "}";
+  return desc;
+}
+
+/// A pin name may only be reused for the SAME resolved identity (the key the
+/// serving matchers and the compression plan registry use). Two live sources
+/// under one name would collide in the name-keyed map — the merge/replace
+/// paths would splice or evict across sources silently.
+void throw_on_pinned_identity_mismatch(std::string const& name,
+                                       cache_entry_info const& existing,
+                                       cache_entry_info const& incoming)
+{
+  if (existing.compression_plan_key() == incoming.compression_plan_key()) { return; }
+  throw std::runtime_error("[sirius_scan_manager] pin name '" + name + "' is already bound to " +
+                           pinned_identity_description(existing) + "; refusing to pin " +
+                           pinned_identity_description(incoming) +
+                           " under the same name. Unpin it first (CALL unpin_table('" + name +
+                           "')) or choose a different pin name.");
+}
+
+}  // namespace
+
 void sirius_scan_manager::insert_pinned_entry(
   const std::string& name,
   cache_entry_info cache_info,
@@ -1673,6 +1708,15 @@ void sirius_scan_manager::insert_pinned_entry(
 
   auto existing_it = _pinned_entries.find(name);
   if (existing_it != _pinned_entries.end()) {
+    // The map is keyed by the user-supplied pin NAME, but a re-pin is only a
+    // re-pin when it resolves to the SAME identity (duckdb catalog.schema.table
+    // or canonicalized parquet file set). Same-named pins over DIFFERENT
+    // sources — e.g. bare-name duckdb pins from two ATTACHed databases — used
+    // to fall into the merge below, silently splicing the second database's
+    // columns (and later its MVCC metadata) into the first database's entry.
+    // Reject loudly instead; the name stays the user-facing handle, so the
+    // second source needs its own name (or an unpin first).
+    throw_on_pinned_identity_mismatch(name, existing_it->second->cache_info, cache_info);
     // Same-row-count merge only applies when the completeness contracts match.
     // Mixing a full pin with a partial pin produces an entry whose columns came
     // from different row coverage — drop and rebuild instead.
@@ -1965,8 +2009,11 @@ void sirius_scan_manager::insert_pinned_entry_host(
   // keeps reading it to completion. Only the map slot is swapped here.
   std::lock_guard pin_lk{_pinned_entries_mutex};
   // Host re-pin always REPLACES: fail any origins minted against the old
-  // entry before the map slot is swapped.
+  // entry before the map slot is swapped. Only a re-pin of the SAME resolved
+  // identity may replace — a same-named pin of a different source would
+  // silently evict this one (see throw_on_pinned_identity_mismatch).
   if (auto it = _pinned_entries.find(name); it != _pinned_entries.end()) {
+    throw_on_pinned_identity_mismatch(name, it->second->cache_info, entry.cache_info);
     invalidate_late_mat_handle(*it->second);
   }
   auto& slot = *(_pinned_entries[name] = std::make_shared<pinned_entry>(std::move(entry)));
@@ -2026,8 +2073,11 @@ void sirius_scan_manager::insert_pinned_entry_device(
   // Replace, never mutate — see insert_pinned_entry_host.
   std::lock_guard pin_lk{_pinned_entries_mutex};
   // Device re-pin always REPLACES: fail any origins minted against the old
-  // entry before the map slot is swapped.
+  // entry before the map slot is swapped. Only a re-pin of the SAME resolved
+  // identity may replace — a same-named pin of a different source would
+  // silently evict this one (see throw_on_pinned_identity_mismatch).
   if (auto it = _pinned_entries.find(name); it != _pinned_entries.end()) {
+    throw_on_pinned_identity_mismatch(name, it->second->cache_info, entry.cache_info);
     invalidate_late_mat_handle(*it->second);
   }
   auto& slot = *(_pinned_entries[name] = std::make_shared<pinned_entry>(std::move(entry)));
@@ -2036,12 +2086,23 @@ void sirius_scan_manager::insert_pinned_entry_device(
 }
 
 void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
-                                               duckdb_mvcc_metadata metadata)
+                                               duckdb_mvcc_metadata metadata,
+                                               const std::string& expected_identity_key)
 {
   std::lock_guard pin_lk{_pinned_entries_mutex};
   auto it = _pinned_entries.find(name);
   if (it == _pinned_entries.end()) {
     throw std::invalid_argument("[attach_mvcc_metadata] no pinned entry named '" + name + "'");
+  }
+  // The map is name-keyed; MVCC metadata bound to a same-named entry of a
+  // DIFFERENT source would mask the wrong rows. The insert-time identity guard
+  // plus the pin registry lock make this unreachable from the pin flow, but
+  // the invariant is cheap to enforce here too.
+  if (!expected_identity_key.empty() &&
+      it->second->cache_info.compression_plan_key() != expected_identity_key) {
+    throw std::runtime_error("[attach_mvcc_metadata] pinned entry '" + name + "' resolves to " +
+                             pinned_identity_description(it->second->cache_info) +
+                             ", not the table this metadata was captured from; refusing to attach");
   }
   // In-place mutation of a live entry, same hazard (and same guard) as the re-pin merge in
   // insert_pinned_entry. In practice this always fires on an entry the caller's own insert

@@ -1325,6 +1325,10 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   // ingestible; it is stored on the pinned entry in place of the heavyweight
   // ingestible_table_info and drives later cache-hit matching + the gather.
   auto cache_info = sirius::scan_manager::cache_entry_info::from(ingestible->table_info());
+  // The resolved identity key, captured before cache_info is moved into the
+  // insert below: the MVCC attach re-checks it so metadata can never bind to a
+  // same-named pin of a different source (the map is name-keyed).
+  const auto pin_identity_key = cache_info.compression_plan_key();
 
   // Compression config (tier-agnostic), read from this pin's admission
   // snapshot (register E3): the four pin_table_compression* settings —
@@ -1347,7 +1351,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   std::optional<std::string> table_plan_dsl;
   if (comp_globally_enabled) {
     table_plan_dsl = sirius::compression::plan_register::global().get_or_load_table_plan(
-      cache_info.compression_plan_key(), [&]() -> std::optional<std::string> {
+      pin_identity_key, [&]() -> std::optional<std::string> {
         namespace fs     = std::filesystem;
         const auto& name = data.args.name;
         std::error_code ec;
@@ -1412,7 +1416,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     mvcc.v_base                   = duckdb_pin_v_base;
     mvcc.base_row_count_per_chunk = std::move(base_row_count_per_chunk);
     mvcc.checkpoint_iteration     = duckdb_pin_checkpoint_iteration;
-    scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
+    scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc), pin_identity_key);
   };
 
   if (data.args.tier == "host") {

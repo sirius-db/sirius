@@ -659,7 +659,13 @@ class sirius_scan_manager {
   /// per-chunk counts stay valid for every column because the merge path rejects
   /// materializations whose per-chunk row counts differ from the existing
   /// chunks'. Throws std::invalid_argument when no entry exists for @p name.
-  void attach_mvcc_metadata(const std::string& name, duckdb_mvcc_metadata metadata);
+  /// @param expected_identity_key when non-empty, the caller's resolved cache
+  ///        identity (cache_entry_info::compression_plan_key()); the attach
+  ///        throws if the entry named @p name resolves to a different identity,
+  ///        so metadata can never bind to a same-named pin of another source.
+  void attach_mvcc_metadata(const std::string& name,
+                            duckdb_mvcc_metadata metadata,
+                            const std::string& expected_identity_key = {});
 
   /// \brief Remove the pinned entry for @p name. No-op if absent.
   void remove_pinned_entry(const std::string& name);
@@ -680,11 +686,12 @@ class sirius_scan_manager {
     std::string_view catalog_name, std::string_view schema_name, std::string_view table_name) const;
 
   /// The pinned entry whose parquet identity matches @p resolved_file_paths
-  /// (cache_entry_info::matches_parquet_files), or nullptr. Non-owning; obtain
-  /// and read it inside one slot-scoped window, and never hold it across a pin
-  /// or unpin. First match wins if one file set was pinned under two names.
-  /// Read by the plan-time compressed-materialization residency gate.
-  [[nodiscard]] pinned_entry const* find_pinned_entry_for_parquet_files(
+  /// (cache_entry_info::matches_parquet_files), or nullptr. OWNING, like the
+  /// duckdb probe above: plan generation runs outside any execution slot (F2),
+  /// so the returned shared_ptr is what keeps the entry alive against a
+  /// concurrent unpin. First match wins if one file set was pinned under two
+  /// names. Read by the plan-time compressed-materialization residency gate.
+  [[nodiscard]] std::shared_ptr<const pinned_entry> find_pinned_entry_for_parquet_files(
     std::span<std::string const> resolved_file_paths) const;
 
   parquet_bind_result describe_parquet(std::string const& uri);
