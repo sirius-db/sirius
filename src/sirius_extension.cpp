@@ -1327,38 +1327,42 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   const bool comp_globally_enabled =
     comp_cfg.enable_pin_table_compression && !comp_cfg.input_plan_dir.empty();
 
-  // Load the per-table plan DSL from the plan directory (if configured), then
-  // resolve it into a compression_pin_config. Both the host and GPU pin paths
-  // compress with this when enabled.
+  // Load the per-table plan DSL from the plan directory (if configured). The
+  // registry key is the pin's RESOLVED cache identity (register E5) — duckdb
+  // catalog.schema.table or the canonicalized parquet file set — so same-named
+  // tables in different ATTACHed databases keep separate plan entries; the
+  // plan FILE is still looked up by the user-facing pin name (the on-disk
+  // "<name>.<ext>" contract). get_or_load_table_plan runs the whole
+  // lookup-miss-then-populate as one atomic operation, so concurrent pins can
+  // never both miss and overwrite each other's entry.
+  std::optional<std::string> table_plan_dsl;
   if (comp_globally_enabled) {
-    namespace fs     = std::filesystem;
-    const auto& name = data.args.name;
-    if (!sirius::compression::plan_register::global().resolve_table_plan(name).has_value()) {
-      std::error_code ec;
-      for (auto const& entry : fs::directory_iterator(comp_cfg.input_plan_dir, ec)) {
-        if (!entry.is_regular_file()) { continue; }
-        if (entry.path().stem() == name) {
-          std::ifstream f(entry.path());
-          std::string dsl((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-          if (!dsl.empty()) {
-            sirius::compression::plan_register::global().set_table_plan(name, std::move(dsl));
+    table_plan_dsl = sirius::compression::plan_register::global().get_or_load_table_plan(
+      cache_info.compression_plan_key(), [&]() -> std::optional<std::string> {
+        namespace fs     = std::filesystem;
+        const auto& name = data.args.name;
+        std::error_code ec;
+        for (auto const& entry : fs::directory_iterator(comp_cfg.input_plan_dir, ec)) {
+          if (!entry.is_regular_file()) { continue; }
+          if (entry.path().stem() == name) {
+            std::ifstream f(entry.path());
+            std::string dsl((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            if (!dsl.empty()) { return dsl; }
+            break;
           }
-          break;
         }
-      }
-      if (ec) {
-        SIRIUS_LOG_WARN("[pin_table] cannot scan plan dir '{}': {}; skipping compression",
-                        comp_cfg.input_plan_dir,
-                        ec.message());
-      }
-    }
+        if (ec) {
+          SIRIUS_LOG_WARN("[pin_table] cannot scan plan dir '{}': {}; skipping compression",
+                          comp_cfg.input_plan_dir,
+                          ec.message());
+        }
+        return std::nullopt;
+      });
   }
 
   sirius::compression_pin_config pin_comp{};
   if (comp_globally_enabled) {
-    if (auto plan_dsl =
-          sirius::compression::plan_register::global().resolve_table_plan(data.args.name);
-        plan_dsl.has_value()) {
+    if (const auto& plan_dsl = table_plan_dsl; plan_dsl.has_value()) {
       // The plan file carries one block per full-table column (schema order). A pin
       // may cache only a subset, so select the blocks for the pinned columns by their
       // full-table index (cache_info.column_ids, in pinned order) — the result lines

@@ -157,6 +157,15 @@ class cache_entry_info {
 
   /// Column names in @c column_ids order — the keys @c data_batches_by_column uses.
   [[nodiscard]] const std::vector<std::string>& column_names() const { return names; }
+
+  /// Unique key for the process-global compression plan_register (register E5):
+  /// the same resolved identity the serving matchers use — duckdb
+  /// catalog.schema.table for duckdb entries, the canonicalized file set for
+  /// parquet entries — never the bare user-supplied pin name, so same-named
+  /// tables in different ATTACHed databases (or different parquet pins reusing
+  /// a name) can never collide on one plan entry. Components are joined with
+  /// a separator that cannot appear in identifiers or paths.
+  [[nodiscard]] std::string compression_plan_key() const;
 };
 
 /**

@@ -30,24 +30,36 @@ plan_register& plan_register::global()
   return instance;
 }
 
-void plan_register::set_table_plan(const std::string& table_name, std::string full_plan_dsl)
+void plan_register::set_table_plan(const std::string& table_key, std::string full_plan_dsl)
 {
   std::unique_lock lock(_mutex);
-  _table_plans[table_name] = std::move(full_plan_dsl);
+  _table_plans[table_key] = std::move(full_plan_dsl);
 }
 
-void plan_register::clear_table_plan(const std::string& table_name)
+void plan_register::clear_table_plan(const std::string& table_key)
 {
   std::unique_lock lock(_mutex);
-  _table_plans.erase(table_name);
+  _table_plans.erase(table_key);
 }
 
-std::optional<std::string> plan_register::resolve_table_plan(const std::string& table_name) const
+std::optional<std::string> plan_register::resolve_table_plan(const std::string& table_key) const
 {
   std::shared_lock lock(_mutex);
-  auto it = _table_plans.find(table_name);
+  auto it = _table_plans.find(table_key);
   if (it != _table_plans.end() && !it->second.empty()) { return it->second; }
   return std::nullopt;
+}
+
+std::optional<std::string> plan_register::get_or_load_table_plan(
+  const std::string& table_key, const std::function<std::optional<std::string>()>& loader)
+{
+  std::unique_lock lock(_mutex);
+  if (auto it = _table_plans.find(table_key); it != _table_plans.end() && !it->second.empty()) {
+    return it->second;
+  }
+  auto loaded = loader();
+  if (loaded.has_value() && !loaded->empty()) { _table_plans[table_key] = *loaded; }
+  return loaded;
 }
 
 void plan_register::set_plan(const std::string& table_name,

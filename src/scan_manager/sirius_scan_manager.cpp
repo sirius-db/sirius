@@ -1489,6 +1489,34 @@ cache_entry_info cache_entry_info::from(const op::scan::ingestible_table_info& i
   return ci;
 }
 
+std::string cache_entry_info::compression_plan_key() const
+{
+  // '\x1f' (ASCII unit separator) cannot appear in catalog/schema/table
+  // identifiers or file paths, so the join is unambiguous — "a.b"."c" and
+  // "a"."b.c" get distinct keys.
+  constexpr char sep = '\x1f';
+  if (!table_name.empty()) {
+    std::string key = "duckdb";
+    key += sep;
+    key += catalog_name;
+    key += sep;
+    key += schema_name;
+    key += sep;
+    key += table_name;
+    return key;
+  }
+  // Parquet identity: resolved_file_paths is already canonicalized by from().
+  // Sort a copy so the key is order-independent, matching matches_parquet_files.
+  auto sorted_files = resolved_file_paths;
+  std::sort(sorted_files.begin(), sorted_files.end());
+  std::string key = "parquet";
+  for (auto const& path : sorted_files) {
+    key += sep;
+    key += path;
+  }
+  return key;
+}
+
 std::vector<std::size_t> cache_entry_info::can_serve_with_columns(
   const op::scan::ingestible_table_info& other) const
 {
