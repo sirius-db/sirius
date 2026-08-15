@@ -59,10 +59,13 @@ task_creator::task_creator(task_creator_config config,
       // freed operator there would corrupt the index of a queue every query shares. The query key
       // is what makes drain(query_index{...}) able to drop one query's pending requests and leave
       // every other query's in place.
+      // No device key: creation requests are only ever pop()'ed in priority
+      // order, never popped per-device, so a real device key would only
+      // maintain a secondary index nothing reads.
       return exec::index_keys{request.priority,
                               request.operator_type,
                               static_cast<exec::query_key>(sirius::value_of(request.query_id)),
-                              request.device_id};
+                              exec::no_preferred_device};
     }),
     _mem_res_mgr(mem_res_mgr),
     _topology_index(std::move(topology_index))
@@ -460,18 +463,6 @@ void task_creator::schedule(op::sirius_physical_operator* node)
   report_if_dropped(_task_creation_queue.push(std::move(request)), query_id);
 }
 
-void task_creator::schedule(op::sirius_physical_operator* node, sirius::query_id_t query_id)
-{
-  if (!accepts_work(query_id)) { return; }
-  const auto [_, priority] = request_keys_for(node);
-  auto request             = std::make_unique<task_creation_request>();
-  request->node            = node;
-  request->query_id        = query_id;
-  request->priority        = priority;
-  request->operator_type   = node->type;
-  report_if_dropped(_task_creation_queue.push(std::move(request)), query_id);
-}
-
 void task_creator::report_if_dropped(bool pushed, sirius::query_id_t query_id) const
 {
   if (pushed) { return; }
@@ -517,7 +508,7 @@ void task_creator::report_fatal_error(sirius::query_id_t query_id, std::exceptio
   report_fatal_error(state ? state->completion_handler : nullptr, std::move(error));
 }
 
-void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
+void task_creator::schedule_lookahead()
 {
   if (_config.strategy != request_type::lookahead) { return; }
 
@@ -563,7 +554,6 @@ void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
       request->type            = request_type::lookahead;
       request->query_id        = query_id;
       request->priority        = priority;
-      request->device_id       = device_id_hint.value_or(exec::no_preferred_device);
       request->operator_type   = node->type;
       report_if_dropped(_task_creation_queue.push(std::move(request)), query_id);
       ++state->index_of_next_lookahead;

@@ -18,7 +18,6 @@
 
 #include "data/data_repository_manager_registry.hpp"
 #include "duckdb/common/common.hpp"
-#include "duckdb/common/mutex.hpp"
 #include "duckdb/common/pair.hpp"
 #include "duckdb/common/reference_map.hpp"
 #include "duckdb/execution/task_error_manager.hpp"
@@ -98,14 +97,6 @@ class sirius_engine {
   duckdb::shared_ptr<pipeline::sirius_pipeline> create_child_pipeline(
     pipeline::sirius_pipeline& current, op::sirius_physical_operator& op);
   duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> new_scheduled;
-  //! Wait for the query to finish
-  void wait_for_query_finish();
-  //! Mutex for thread-safe access to query finish
-  std::mutex query_finish_mutex;
-  //! Condition variable for thread-safe access to query finish
-  std::condition_variable query_finish_cv;
-  //! Whether the query has finished
-  bool query_finished;
 
  private:
   sirius::query_id_t query_id_;

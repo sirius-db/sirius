@@ -603,7 +603,6 @@ class SiriusContext : public ClientContextState {
     std::shared_ptr<sirius::pipeline::completion_handler> handler,
     sirius::telemetry::query_telemetry_info telemetry_info);
 
-  /// \brief Get the current query.
   /// \brief Get the current Sirius configuration (const).
   [[nodiscard]] const sirius::sirius_config& get_config() const noexcept { return config_; }
 
@@ -823,7 +822,6 @@ class SiriusContext : public ClientContextState {
   /// destructors are not throwing.
   void destroy_retired_query_plan(sirius::query_id_t query_id) noexcept;
 
-  mutable std::mutex mutex_;
   // The Super Sirius runtime is shared across connections. Historically plan
   // generation and engine execution were serialized outright (single-flight
   // mutex); the gate is now a counted slot pool sized by

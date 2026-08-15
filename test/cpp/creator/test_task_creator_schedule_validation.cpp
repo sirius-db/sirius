@@ -110,15 +110,3 @@ TEST_CASE("task_creator::schedule accepts a placed operator", "[task_creator][sc
   // Drop the queued request before `op` dies: it holds a raw pointer into the plan.
   f.creator.drain_pending_tasks(query_id);
 }
-
-TEST_CASE("task_creator::schedule with an explicit query id still requires a pipeline",
-          "[task_creator][schedule]")
-{
-  schedule_fixture f;
-  auto op = f.make_operator();
-
-  // The query id is supplied here, but the priority still comes from the pipeline, so the
-  // overload is no laxer than the one-argument form.
-  REQUIRE_THROWS_AS(f.creator.schedule(op.get(), sirius::make_query_id(11)),
-                    sirius::internal_exception);
-}

@@ -329,10 +329,9 @@ void task_scheduler::management_eventloop()
     // Dereferencing begin() on an empty vector is UB — it used to yield a garbage device id.
     if (_task_queue.empty() && !_ready_devices.empty()) {
       // No query id: the task_creator picks the oldest live query itself, since this loop has
-      // none to inherit.
-      if (_task_creator && !_ready_devices.empty()) {
-        _task_creator->schedule_lookahead(*_ready_devices.begin());
-      }
+      // none to inherit. No device either — the hint used to be stored on the creation request
+      // as a write-only field (register H7), so lookahead was never device-routed.
+      if (_task_creator && !_ready_devices.empty()) { _task_creator->schedule_lookahead(); }
       if (!_task_queue.wait()) {
         SIRIUS_LOG_INFO("Task queue interrupted, exiting management event loop.");
         break;

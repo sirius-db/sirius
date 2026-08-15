@@ -91,8 +91,6 @@ struct task_creation_request {
   //! teardown would otherwise read a freed operator while holding that mutex, and unlike the
   //! other keys this one had no reason to be resolved late.
   op::SiriusPhysicalOperatorType operator_type = op::SiriusPhysicalOperatorType::INVALID;
-  //! Preferred GPU, when the caller had a hint. Only a secondary index; does not bind the task.
-  int device_id = exec::no_preferred_device;
 };
 
 class task_creator {
@@ -211,12 +209,9 @@ class task_creator {
    */
   virtual void schedule(op::sirius_physical_operator* request);
 
-  /// \brief Overload for callers that already know the query; avoids re-deriving it.
-  void schedule(op::sirius_physical_operator* request, sirius::query_id_t query_id);
-
   /// \brief Warm up one not-yet-activated scan of the oldest live query.
   /// No-op when no query is registered.
-  void schedule_lookahead(std::optional<int> device_id_hint = std::nullopt);
+  void schedule_lookahead();
 
   /// \brief Fail @p query_id with @p error, touching no shared subsystem.
   ///
@@ -311,7 +306,6 @@ class task_creator {
   task_creator_config _config;
   std::unique_ptr<exec::bounded_thread_pool> _bounded_pool;
   std::thread _manager_thread;
-  ::duckdb::ClientContext* _client_context;
   sirius::pipeline::task_scheduler* _task_scheduler{nullptr};
   /// Non-owning; owned by SiriusContext and outlives this creator. Null in unit tests.
   sirius::exec::query_lifecycle_registry* _query_lifecycle{nullptr};

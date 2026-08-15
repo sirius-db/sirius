@@ -91,7 +91,7 @@ class convertible_data {
 /**
  * @brief Abstract interface for discovering convertible data units in a container.
  *
- * Providers iterate over a backing container (data_repository or inspectable_mpsc) and return
+ * Providers iterate over a backing container (e.g. a data_repository or a task queue) and return
  * wrapped convertible_data instances matching a target memory space filter.
  */
 class convertible_data_provider {

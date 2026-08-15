@@ -226,9 +226,11 @@ class task_scheduler {
   /// _task_request_channel and erases on dispatch), so no synchronization needed.
   std::vector<int> _ready_devices;
 
-  /// device_id -> GPU executor. std::map (not unordered_map) so iteration
-  /// order is deterministic (ascending by device_id) — keeps preference-less
-  /// task dispatch reproducible across runs.
+  /// device_id -> GPU executor. Dispatch never iterates this map — tasks are
+  /// dispatched by keyed lookup (`at(device_id)`) for a ready device, with the
+  /// device order coming from _ready_devices — so the unordered iteration
+  /// order (used only for start/stop/wiring propagation and per-query drains)
+  /// does not affect scheduling.
   std::unordered_map<int, std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;
   sirius::creator::task_creator* _task_creator{nullptr};
   /// Non-owning; owned by SiriusContext and outlives this scheduler. Null in unit tests.

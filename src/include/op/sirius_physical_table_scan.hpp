@@ -17,7 +17,6 @@
 #pragma once
 
 #include "duckdb/common/extra_operator_info.hpp"
-#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/data_table.hpp"
@@ -105,15 +104,7 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   //! Virtual columns
   duckdb::virtual_column_map_t virtual_columns;
 
-  duckdb::PhysicalTableScan* physical_table_scan;
-
   duckdb::unique_ptr<duckdb::ColumnDataCollection> collection;
-
-  uint64_t* column_size;
-
-  uint64_t* mask_size;
-
-  bool* already_cached;
 
   duckdb::vector<sirius::logical_type> scanned_types;
 
