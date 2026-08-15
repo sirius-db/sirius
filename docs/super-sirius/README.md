@@ -33,6 +33,7 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Operators](operators.md) | All physical operators: interface, GPU implementation, cuDF APIs |
 | [Expression Evaluator](expression-executor.md) | `expression_evaluator`, Sirius AST hierarchy, GPU expression translator, cuDF AST |
 | [Pipeline Execution](pipeline-execution.md) | GPU executor, task scheduling, completion, OOM handling, per-task-device contract under SCHED-RR |
+| [Concurrency Model](concurrency-model.md) | Per-query execution: admission gate, per-query state, config snapshots, fair scheduling, cross-query memory pressure, the mandatory cleanup, failure containment |
 | [Task Creator](task-creator.md) | Task creation: hint chain, per-operator scheduling behavior |
 | [Scan](scan.md) | Scan subsystem: unified GPU scan operator, `gpu_ingestible` (parquet + DuckDB-native), scan manager, pinned tables, DuckDB-native decode, row-group pruning, Sirius IO layer (uring/REST/kvikio + prefetching cache) |
 | [Memory Management](memory-management.md) | cuCascade tiers, reservations, downgrade executor |
@@ -54,11 +55,12 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 4. **Operators** — what each operator does on the GPU
 5. **Expression Evaluator** — how expressions are evaluated on GPU
 6. **Pipeline Execution** — how tasks are dispatched and executed
-7. **Task Creator** — how the system decides when to create tasks
-8. **Scan** — how data enters the system from storage
-9. **Memory Management** — GPU memory tiers, reservations, spilling
-10. **Data Management** — data batch lifecycle and port wiring
-11. **Configuration** — tuning knobs and runtime settings
-12. **Optimizations** — performance improvements and their mechanisms
+7. **Concurrency Model** — how multiple queries share the engine: admission, per-query state, cleanup
+8. **Task Creator** — how the system decides when to create tasks
+9. **Scan** — how data enters the system from storage
+10. **Memory Management** — GPU memory tiers, reservations, spilling
+11. **Data Management** — data batch lifecycle and port wiring
+12. **Configuration** — tuning knobs and runtime settings
+13. **Optimizations** — performance improvements and their mechanisms
 
 <!-- last-updated-commit: 84543810a303c81c891b2adbae222157a4e17204 -->
