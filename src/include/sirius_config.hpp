@@ -195,6 +195,8 @@ struct compression_config {
   /// size, for the compressed form to be kept.  When the compressed header +
   /// payload exceeds this fraction of the original (i.e. compression saved too
   /// little), the compressed data is discarded and the uncompressed batch is used.
+  /// Must be finite and non-negative. Values above 1 deliberately allow compressed
+  /// representations that expand relative to the original batch.
   //  Default 0.75 (that coincides with a 1.33x compression ratio).
   double max_compressed_fraction{0.75};
 
