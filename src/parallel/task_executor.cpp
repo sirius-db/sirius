@@ -75,8 +75,8 @@ void itask_executor::schedule(std::unique_ptr<itask> task)
     // manager): the queue reactivates as soon as the join lands, so wait it
     // out instead of dropping — a dropped successor silently hangs this
     // task's query. The bracket cannot deadlock on this retry: quiesce
-    // reactivates the queue BEFORE wait_all(), so a retrying pool worker
-    // always gets through.
+    // reactivates the queue BEFORE the bracket's in-flight wait, so a
+    // retrying pool worker always gets through.
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
     bounced = _task_queue.push_or_bounce(std::move(bounced));
   }
@@ -166,11 +166,12 @@ void itask_executor::drain_and_wait()
 
 void itask_executor::quiesce_manager()
 {
-  // Releasing the manager thread's pool slot is a PRECONDITION for wait_all(), not an
-  // optimization. manager_loop() calls reserve() and then blocks in _task_queue.pop(), so an idle
-  // manager permanently holds an active slot; wait_all() waits for active_ == 0 and would never
-  // return. interrupt() makes reserve() hand back an invalid slot and pop() return nullptr, which
-  // is what lets the loop exit and the join succeed.
+  // Releasing the manager thread's pool slot is a PRECONDITION for the caller's in-flight wait,
+  // not an optimization. manager_loop() calls reserve() and then blocks in _task_queue.pop(), so
+  // an idle manager permanently holds an active UNTAGGED slot; a wait that must see the untagged
+  // count reach zero (wait_for_query_and_untagged) — or active_ == 0 (wait_all) — would never
+  // return. interrupt() makes reserve() hand back an invalid slot and pop() return nullptr,
+  // which is what lets the loop exit and the join succeed.
   _bounded_pool->interrupt();
   _task_queue.interrupt();
   if (_manager_thread.joinable()) { _manager_thread.join(); }
@@ -180,11 +181,10 @@ void itask_executor::quiesce_manager()
   // bounced successor is a pipeline that never finishes, i.e. that query hangs
   // (observed: a repeatedly-failing query starving 3 healthy ones). Reopening
   // here also lets a pool worker parked in schedule()'s bounce-retry proceed,
-  // which wait_all() below depends on (that worker holds an active slot).
-  // The failing query's own pushes stay refused by the lifecycle gate, and its
-  // queued tasks are swept by the drain_query_tasks() that follows.
+  // which the caller's in-flight wait depends on (that worker holds an active
+  // slot). The failing query's own pushes stay refused by the lifecycle gate,
+  // and its queued tasks are swept by the drain_query_tasks() that follows.
   _task_queue.reactivate();
-  _bounded_pool->wait_all();
 }
 
 void itask_executor::resume_manager()
@@ -242,10 +242,9 @@ void itask_executor::wait_and_drain_query(sirius::query_id_t query_id)
   // in-hand. The caller's next act is to let the plan be destroyed, so "almost certainly quiesced"
   // is not good enough here.
   //
-  // What did change: the drain in the middle is per-query. The original cleared the ENTIRE queue,
-  // destroying every co-tenant's queued work and leaving those queries waiting on completions that
-  // could never arrive. The residual cost is that co-tenant pushes are refused across the bracket
-  // — on the error path only, not on every successful completion as before.
+  // The drain in the middle is per-query: co-tenants keep their queued work. The residual cost is
+  // that co-tenant pushes are refused across the bracket — on the error path only, not on every
+  // successful completion.
   //
   // The bracket must run to completion before another failing query's bracket may begin: an
   // interleaved second quiesce no-ops on the already-joined manager, and its resume_manager()
@@ -256,6 +255,18 @@ void itask_executor::wait_and_drain_query(sirius::query_id_t query_id)
     return;
   }
   quiesce_manager();
+  // The in-flight wait is per-query, not wait_all(): a CO-TENANT's task parked in a (possibly
+  // long) memory wait runs under a slot attached to the co-tenant's query and no longer extends
+  // this query's cleanup. The manager join above closed the pop-to-attach window, so every task
+  // of the failing query is now either (a) running under a slot attached to it — waited for
+  // here; (b) queued — swept by the drain below; or (c) dispatched UNTAGGED (a task with no
+  // pipeline, whose query cannot be determined) — waited for conservatively via the untagged
+  // count, which can only shrink while the manager (the sole reserve() caller) is down. The
+  // invariant is unchanged: when this returns, NO thread is still executing a task that
+  // references the failing query's plan. A task the wait window sees re-queue itself (the
+  // memory-wait overflow / OOM-reschedule paths push while their worker slot is still attached)
+  // lands back in the queue before its slot is released, so the drain below sweeps it.
+  _bounded_pool->wait_for_query_and_untagged(query_id);
   drain_query_tasks(query_id);
   resume_manager();
 }

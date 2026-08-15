@@ -37,8 +37,8 @@ namespace sirius::exec {
 /**
  * @brief A thread pool with bounded concurrency.
  *
- * Merges a fixed-size thread pool with a counting semaphore, eliminating the need for
- * a separate kiosk object. Usage:
+ * Merges a fixed-size thread pool with a counting semaphore, so admission and execution
+ * live in one object. Usage:
  *
  *  1. reserve() — blocks when at capacity, returns a slot (invalid if interrupted).
  *  2. dispatch(slot&&, fn) — consumes the slot and enqueues fn on a worker thread.
@@ -283,6 +283,38 @@ class bounded_thread_pool {
   }
 
   /**
+   * @brief Wait until @p query_id has no active slots AND no untagged slot remains active.
+   *
+   * The error-path bracket's wait. Attribution happens at attach() time — after a task is
+   * popped and its query is known — so a task dispatched WITHOUT an attach (one with no
+   * pipeline, whose query cannot be determined) runs under an untagged slot. Such a task could
+   * in principle belong to the failing query, so the bracket waits for it conservatively; a
+   * co-tenant's task, by contrast, runs under a slot attached to the CO-TENANT's query and is
+   * ignored — its (possibly long) memory wait no longer extends this query's cleanup the way
+   * wait_all() did.
+   *
+   * Callers must first ensure no new untagged slots can appear (the bracket joins the manager
+   * thread — the only reserve() caller — before waiting); otherwise a manager parked in pop()
+   * holds an untagged slot indefinitely and this never returns.
+   */
+  void wait_for_query_and_untagged(sirius::query_id_t query_id)
+  {
+    std::unique_lock lock(mu_);
+    cv_query_idle_.wait(lock, [&] {
+      if (active_ - attached_active_ > 0) { return false; }
+      auto it = active_by_query_.find(query_id);
+      return it == active_by_query_.end() || it->second == 0;
+    });
+  }
+
+  /// \brief Number of active slots not attributed to any query. Test/diagnostic aid.
+  [[nodiscard]] int active_untagged()
+  {
+    std::lock_guard lock(mu_);
+    return active_ - attached_active_;
+  }
+
+  /**
    * @brief Drop @p query_id's queued work and wait for its running work to finish.
    *
    * The per-query counterpart of wait_all(). Untagged slots — notably a manager thread parked in
@@ -332,30 +364,40 @@ class bounded_thread_pool {
     absl::AnyInvocable<void() noexcept> fn;
   };
 
-  // Called by slot::attach() once the query behind a reservation is known.
+  // Called by slot::attach() once the query behind a reservation is known. Converting an
+  // untagged slot to a tagged one can unblock wait_for_query_and_untagged (its untagged count
+  // just dropped), hence the notify.
   void attach_slot(sirius::query_id_t query_id)
   {
-    std::lock_guard lock(mu_);
-    ++active_by_query_[query_id];
+    {
+      std::lock_guard lock(mu_);
+      ++active_by_query_[query_id];
+      ++attached_active_;
+    }
+    cv_query_idle_.notify_all();
   }
 
   // Called exclusively by the slot destructor — covers both the drop-without-dispatch
   // and post-task-completion cases. @p query is the slot's attribution, if it had one.
   void release_slot(std::optional<sirius::query_id_t> query)
   {
-    bool query_idle = false;
+    bool query_idle        = false;
+    bool untagged_released = false;
     {
       std::lock_guard lock(mu_);
       --active_;
       if (query.has_value()) {
+        --attached_active_;
         auto it = active_by_query_.find(*query);
         if (it != active_by_query_.end() && --it->second <= 0) {
           active_by_query_.erase(it);
           query_idle = true;
         }
+      } else {
+        untagged_released = true;
       }
     }
-    if (query_idle) { cv_query_idle_.notify_all(); }
+    if (query_idle || untagged_released) { cv_query_idle_.notify_all(); }
     cv_capacity_.notify_one();
     cv_idle_.notify_all();
   }
@@ -383,6 +425,9 @@ class bounded_thread_pool {
   std::condition_variable cv_query_idle_;  // drain_and_wait(query_id) waits here
 
   int active_{0};
+  /// Active slots currently attributed to a query (== the sum of active_by_query_ values).
+  /// active_ - attached_active_ is the untagged count wait_for_query_and_untagged waits on.
+  int attached_active_{0};
   const int capacity_;
   bool interrupted_{false};
   bool stop_requested_{false};

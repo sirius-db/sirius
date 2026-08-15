@@ -101,10 +101,10 @@ class itask_executor {
   /**
    * @brief Stop the executor and wait for all in-flight work to finish.
    *
-   * Stops the kiosk, interrupts the task queue, calls on_stop() (so subclasses
-   * can join extra threads before the manager thread is joined), joins the
-   * manager thread, waits for all kiosk tickets to be released, stops the
-   * thread pool, then calls on_stopped() for any final cleanup.
+   * Interrupts the bounded pool and the task queue, calls on_stop() (so
+   * subclasses can join extra threads before the manager thread is joined),
+   * joins the manager thread, waits for all pool slots to be released, stops
+   * the thread pool, then calls on_stopped() for any final cleanup.
    */
   void stop();
 
@@ -130,7 +130,7 @@ class itask_executor {
   /**
    * @brief Drain in-flight tasks and restart the manager, ready for the next query.
    *
-   * Stops the kiosk and interrupts the queue so the manager exits, waits for
+   * Interrupts the bounded pool and the queue so the manager exits, waits for
    * all in-flight thread-pool tasks, drains the queue, then re-enables both
    * and restarts the manager thread.
    */
@@ -146,35 +146,35 @@ class itask_executor {
    * Unlike the whole-executor version it replaced, this neither interrupts the shared queue nor
    * stops and restarts the manager thread — both of which dropped co-tenant queries' queued work
    * and stalled their producers on every completion. It also no longer validates the *whole*
-   * queue, which made one query fail because another had work legitimately queued.
-   *
-   * The in-flight wait is still whole-pool; per-query in-flight accounting arrives with the
-   * query-aware bounded_thread_pool. Waiting on a co-tenant's task is a stall, not a correctness
-   * problem.
+   * queue, which made one query fail because another had work legitimately queued. The in-flight
+   * wait is per-query too (bounded_thread_pool::wait_for_query).
    */
   void wait_and_validate_empty(sirius::query_id_t query_id);
 
   /**
-   * @brief Wait for in-flight work, then drop @p query_id's queued tasks.
+   * @brief Wait for @p query_id's in-flight work, then drop its queued tasks.
    *
    * The error-path counterpart of wait_and_validate_empty(). Waiting first guarantees no thread is
    * still executing a task that references the failing query's plan before the caller lets that
-   * plan be destroyed.
+   * plan be destroyed. The wait covers this query's attributed slots plus any UNTAGGED slot (a
+   * task with no pipeline, whose query cannot be determined) — never a co-tenant's attributed
+   * work, so a peer's parked memory wait does not extend this query's cleanup.
    */
   void wait_and_drain_query(sirius::query_id_t query_id);
 
  protected:
   /**
-   * @brief Stop the manager thread and wait for all in-flight pool work.
+   * @brief Stop and join the manager thread, then reopen the queue.
    *
-   * Releasing the manager's pool slot is a PRECONDITION for wait_all(), not an optimization:
-   * manager_loop() reserves a slot and then blocks in pop(), so an idle manager holds an active
-   * slot forever and wait_all() (which waits for active_ == 0) would never return.
+   * Releasing the manager's pool slot is a PRECONDITION for the caller's in-flight wait, not an
+   * optimization: manager_loop() reserves a slot and then blocks in pop(), so an idle manager
+   * holds an active untagged slot forever and any wait that needs the untagged count (or
+   * active_) to reach zero would never return. The join also closes the pop-to-attach window: a
+   * popped task in the manager's hand belongs to neither the queue nor the per-query slot
+   * count, so per-query waits are only trustworthy once the manager is down.
    *
-   * Cost, and why it is temporary: interrupting the queue makes push() return false for the
-   * duration, so a co-tenant query's task in transit from the scheduler can be dropped here. The
-   * query-aware bounded_thread_pool removes the need for this bracket by making the in-flight
-   * wait per-query.
+   * Waiting for in-flight pool work is the CALLER's job (per-query in the error bracket,
+   * whole-pool in stop()/drain_and_wait()), after this returns.
    */
   void quiesce_manager();
 
@@ -184,9 +184,9 @@ class itask_executor {
   /**
    * @brief Main dispatch loop — must be implemented by each subclass.
    *
-   * Called on the dedicated manager thread. Responsible for acquiring kiosk
-   * tickets, popping tasks from _task_queue, and submitting them to
-   * _thread_pool.
+   * Called on the dedicated manager thread. Responsible for reserving pool
+   * slots, popping tasks from _task_queue, and dispatching them on
+   * _bounded_pool.
    */
   virtual void manager_loop() = 0;
 
