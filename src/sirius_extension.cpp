@@ -2091,6 +2091,23 @@ static void SetDynamicFilterDomainCoverageThreshold(ClientContext& context,
                    params->dynamic_filter_domain_coverage_threshold);
 }
 
+static void SetDynamicFilterInlistMaxL2Fraction(ClientContext& context,
+                                                SetScope scope,
+                                                Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot             = lock_operator_params_slot(context);
+  const double fraction = parameter.GetValue<double>();
+  if (!(fraction >= 0.0 && fraction <= 1.0)) {
+    throw InvalidInputException(
+      "dynamic_filter_inlist_max_l2_fraction must be in [0.0, 1.0], got %f", fraction);
+  }
+  params->dynamic_filter_inlist_max_l2_fraction = fraction;
+  SIRIUS_LOG_DEBUG("Updated config DYNAMIC_FILTER_INLIST_MAX_L2_FRACTION to {}",
+                   params->dynamic_filter_inlist_max_l2_fraction);
+}
+
 static void SetDynamicFilterKeepThreshold(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2411,6 +2428,15 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     LogicalType::DOUBLE,
     Value::DOUBLE(operator_defaults.dynamic_filter_domain_coverage_threshold),
     SetDynamicFilterDomainCoverageThreshold);
+
+  config.AddExtensionOption(
+    "dynamic_filter_inlist_max_l2_fraction",
+    "Maximum estimated cuco-set size for the exact hash IN-list dynamic filter, as a fraction of "
+    "the smallest probe-GPU L2 cache, in [0, 1]; larger sets publish a Bloom filter, 0 always "
+    "publishes the Bloom when supported, and 1.0 reproduces the legacy L2-fit rule",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(operator_defaults.dynamic_filter_inlist_max_l2_fraction),
+    SetDynamicFilterInlistMaxL2Fraction);
 
   config.AddExtensionOption(
     "dynamic_filter_keep_threshold",

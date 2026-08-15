@@ -275,6 +275,9 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("dynamic_filter_domain_coverage_threshold",
              opt.dynamic_filter_domain_coverage_threshold,
              yaml::greater_than<double>{0.0});
+  r.optional("dynamic_filter_inlist_max_l2_fraction",
+             opt.dynamic_filter_inlist_max_l2_fraction,
+             yaml::fraction<double>{});
   r.optional(
     "dynamic_filter_keep_threshold", opt.dynamic_filter_keep_threshold, yaml::fraction<double>{});
   r.optional("enable_pinned_zone_map_pruning", opt.enable_pinned_zone_map_pruning);

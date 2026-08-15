@@ -150,6 +150,15 @@ struct operator_params {
   /// key's domain (rows gate and zone-map range gate). Values >= 1.0 effectively disable the gate.
   double dynamic_filter_domain_coverage_threshold = 0.9;
 
+  /// Maximum estimated cuco-set size for the exact hash IN-list membership filter, as a fraction of
+  /// the smallest probe-GPU L2 cache, in [0, 1]. Larger sets publish a Bloom filter instead: a
+  /// streaming probe evicts a near-L2-sized set every pass, where the smaller Bloom bit array stays
+  /// cache-resident (measured on GB300: IN-list probe cost is flat below ~0.28 of L2 and degrades
+  /// steadily beyond, while the Bloom probes >= 2.2x faster at every size). 0 always publishes the
+  /// Bloom when the key type supports it; 1.0 reproduces the legacy L2-fit rule. Ignored when no
+  /// device L2 size is available (the legacy fit rule then applies unchanged).
+  double dynamic_filter_inlist_max_l2_fraction = 0.125;
+
   /// Consumer-side scan gate: disable a scan's post-decode dynamic filtering once a measured split
   /// keeps more than this fraction of its rows (too unselective to repay the mask kernel). In
   /// [0, 1]; 1.0 keeps filtering always on.
