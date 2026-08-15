@@ -633,6 +633,7 @@ set(TEST_SOURCES
     test/cpp/config/test_context.cpp
     test/cpp/config/test_object_store_config.cpp
     test/cpp/config/test_topology_config.cpp
+    test/cpp/creator/test_task_creator_lookahead.cpp
     test/cpp/creator/test_task_creator_query_state.cpp
     test/cpp/creator/test_task_creator_schedule_validation.cpp
     test/cpp/data/test_convertible_data_batch.cpp

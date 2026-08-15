@@ -209,8 +209,11 @@ class task_creator {
    */
   virtual void schedule(op::sirius_physical_operator* request);
 
-  /// \brief Warm up one not-yet-activated scan of the oldest live query.
-  /// No-op when no query is registered.
+  /// \brief Warm up one not-yet-activated scan of a live query, rotating round-robin across
+  /// the queries that still accept work (register D3 — this used to hard-code the OLDEST
+  /// entry, so every newer query started cold). At most one lookahead request is scheduled
+  /// per call: the rotation starts after the last query served and takes the first accepting
+  /// query that can actually be warmed. No-op when no query is registered.
   void schedule_lookahead();
 
   /// \brief Fail @p query_id with @p error, touching no shared subsystem.
@@ -361,6 +364,19 @@ class task_creator {
   std::shared_ptr<query_task_global_state> get_query_task_global_state(
     sirius::query_id_t query_id) const;
 
+  /// \brief Try to schedule ONE lookahead request for @p query_id.
+  ///
+  /// The whole walk-and-push runs under @p state's lookahead_mutex. That mutex — together with
+  /// drain_pending_tasks() clearing the lookahead queue under it BEFORE the request drain — is
+  /// what makes the operator dereferences here safe against the query's teardown: a walk in
+  /// progress blocks the clear (and the plan outlives drain_pending_tasks, so the operators are
+  /// alive), a walk starting after it finds the queue empty, and a request pushed by a racing
+  /// walk lands before the drain and is dropped by it.
+  ///
+  /// @return true when a request was pushed (the rotation cursor should record this query),
+  ///         false when this query has nothing warmable right now.
+  bool try_schedule_lookahead_for(sirius::query_id_t query_id, query_task_global_state& state);
+
   //! Resolve a query's state, registering (and admission-seeding) a fresh
   //! entry when none exists. Both registration entry points funnel here:
   //! set_client_context (window begin) and set_active_gpu_ids (admission —
@@ -381,6 +397,12 @@ class task_creator {
   //! One entry per in-flight query. Guarded by _global_state_mutex.
   std::map<sirius::query_id_t, std::shared_ptr<query_task_global_state>> _query_task_global_states;
   mutable std::mutex _global_state_mutex;  // Protect concurrent access to _query_task_global_states
+  /// Round-robin cursor of schedule_lookahead(): the query a lookahead was last scheduled for.
+  /// Guarded by _global_state_mutex like the map it indexes into. A finished/reset cursor query
+  /// is harmless — the rotation selects by upper_bound, so a stale id just means "start from the
+  /// next higher one" (same contract as multi_index_priority_queue's fair-pop cursor).
+  sirius::query_id_t _last_lookahead_query{};
+  bool _has_last_lookahead_query{false};
   /// Serializes pool/manager-thread lifecycle (start_thread_pool / stop_thread_pool / stop).
   ///
   /// Deliberately NOT _global_state_mutex. do_stop_thread_pool() joins _manager_thread, and

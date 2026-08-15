@@ -282,12 +282,29 @@ task_creator::compute_pipeline_priorities(const sirius::planner::query& query) c
 
 void task_creator::drain_pending_tasks(sirius::query_id_t query_id)
 {
+  auto state = get_query_task_global_state(query_id);
+
+  // Neutralize lookahead FIRST, before the request drain below. schedule_lookahead() runs on
+  // the task scheduler's management thread — a producer this drain does not otherwise own — and
+  // it dereferences this query's operators and pushes a creation request under only
+  // lookahead_mutex. Taking that mutex here, ahead of the drain, orders the race both ways: a
+  // walk already in progress blocks this clear, so its push lands BEFORE the drain and is
+  // dropped by it (and the plan is still alive during the walk — the caller destroys it only
+  // after this function returns); a walk starting after the clear finds the queue empty and is
+  // a no-op. With the old order (clear LAST) a racing lookahead could push AFTER the drain had
+  // passed: the stale request survived with a raw operator pointer into a plan about to die,
+  // and nothing waited for the worker that would eventually dereference it (register D3).
+  if (state) {
+    std::lock_guard<std::mutex> lookahead_lock(state->lookahead_mutex);
+    state->lookahead_queue.clear();
+    state->index_of_next_lookahead = 0;
+  }
+
   // Drop only THIS query's queued requests. No interrupt()/reactivate(): the queue stays open
   // the whole time, so other queries' producers and consumers are never stalled.
   _task_creation_queue.drain(
     exec::query_index{static_cast<exec::query_key>(sirius::value_of(query_id))});
 
-  auto state = get_query_task_global_state(query_id);
   if (!state) { return; }
 
   // Wait out this query's in-flight creation work. The pool tracks it per query via the slot
@@ -296,12 +313,6 @@ void task_creator::drain_pending_tasks(sirius::query_id_t query_id)
   // released by RAII on every exit path including an exception, so a throwing creation lambda
   // cannot strand this wait.
   if (_bounded_pool) { _bounded_pool->drain_and_wait(query_id); }
-
-  // Clear lookahead state so any schedule_lookahead() racing with query teardown finds an
-  // empty queue and exits cleanly instead of dereferencing operators that are about to die.
-  std::lock_guard<std::mutex> lookahead_lock(state->lookahead_mutex);
-  state->lookahead_queue.clear();
-  state->index_of_next_lookahead = 0;
 }
 
 void task_creator::reset(sirius::query_id_t query_id)
@@ -512,42 +523,64 @@ void task_creator::schedule_lookahead()
 {
   if (_config.strategy != request_type::lookahead) { return; }
 
-  // Select the first query, which is the implicit FIFO priority.
-  // TODO: Will want to revisit this, to have lookahead be able to schedule lookahead for the
-  // following query as well if needed.
-  sirius::query_id_t query_id{};
-  std::shared_ptr<query_task_global_state> state;
+  // Rotate across the ACCEPTING queries — the F1 round-robin idea applied to warm-up. This
+  // used to hard-code the oldest entry, so with two live queries only the first ever received
+  // lookahead and every newer query started cold (register D3). The scan starts after the last
+  // query a lookahead was scheduled for (wrapping) and, within one call, tries each live query
+  // once until one can actually be warmed — so a query with nothing warmable right now (or one
+  // that is quiescing/closed per the lifecycle registry, routinely the oldest entry mid-cleanup)
+  // cannot pin the rotation and starve the others.
+  std::vector<std::pair<sirius::query_id_t, std::shared_ptr<query_task_global_state>>> rotation;
   {
     std::lock_guard<std::mutex> lock(_global_state_mutex);
-    // Oldest-first, matching the FIFO scheduling policy — but SKIPPING queries that are no longer
-    // accepting work rather than giving up on the first one. The oldest entry is routinely a
-    // query that has finished and is mid-cleanup but whose state has not been dropped yet:
-    // warming it up would dereference operators of a plan that is already gone, and bailing out
-    // entirely would starve every younger query of lookahead for the whole cleanup window.
-    for (auto& [id, candidate] : _query_task_global_states) {
-      if (candidate && accepts_work(id)) {
-        query_id = id;
-        state    = candidate;
-        break;
-      }
+    if (_query_task_global_states.empty()) { return; }
+    rotation.reserve(_query_task_global_states.size());
+    auto start = _has_last_lookahead_query
+                   ? _query_task_global_states.upper_bound(_last_lookahead_query)
+                   : _query_task_global_states.begin();
+    if (start == _query_task_global_states.end()) { start = _query_task_global_states.begin(); }
+    for (auto it = start; it != _query_task_global_states.end(); ++it) {
+      rotation.emplace_back(it->first, it->second);
+    }
+    for (auto it = _query_task_global_states.begin(); it != start; ++it) {
+      rotation.emplace_back(it->first, it->second);
     }
   }
-  if (!state) { return; }
 
-  std::lock_guard lock(state->lookahead_mutex);
-  for (; state->index_of_next_lookahead < state->lookahead_queue.size();
-       ++state->index_of_next_lookahead) {
-    auto* node = state->lookahead_queue[state->index_of_next_lookahead];
+  for (auto& [query_id, state] : rotation) {
+    if (!state || !accepts_work(query_id)) { continue; }
+    if (try_schedule_lookahead_for(query_id, *state)) {
+      std::lock_guard<std::mutex> lock(_global_state_mutex);
+      _last_lookahead_query     = query_id;
+      _has_last_lookahead_query = true;
+      return;
+    }
+  }
+}
+
+bool task_creator::try_schedule_lookahead_for(sirius::query_id_t query_id,
+                                              query_task_global_state& state)
+{
+  // Teardown safety of the operator derefs below: see the declaration comment — the
+  // lookahead_mutex plus drain_pending_tasks() clearing the lookahead queue under it BEFORE its
+  // request drain make a lookahead racing this query's teardown a no-op, never a UAF.
+  std::lock_guard lock(state.lookahead_mutex);
+  for (; state.index_of_next_lookahead < state.lookahead_queue.size();
+       ++state.index_of_next_lookahead) {
+    auto* node = state.lookahead_queue[state.index_of_next_lookahead];
     if (node == nullptr) { continue; }
     auto hint = node->get_next_task_hint();
     if (!hint.has_value()) {
-      if (!node->get_pipeline()->is_pipeline_finished()) { return; }
+      // The next scan is not warmable yet and its pipeline is still live: this query has no
+      // lookahead to offer right now — the caller rotates on to the next query.
+      if (!node->get_pipeline()->is_pipeline_finished()) { return false; }
       continue;
     }
     if (hint.value().hint == op::TaskCreationHint::READY) {
-      SIRIUS_LOG_TRACE("Task Creator: scheduling lookahead for operator {} (id {})",
+      SIRIUS_LOG_TRACE("Task Creator: scheduling lookahead for operator {} (id {}) of query {}",
                        node->get_name(),
-                       node->get_operator_id());
+                       node->get_operator_id(),
+                       query_id);
       const auto [_, priority] = request_keys_for(node);
       auto request             = std::make_unique<task_creation_request>();
       request->node            = node;
@@ -556,10 +589,11 @@ void task_creator::schedule_lookahead()
       request->priority        = priority;
       request->operator_type   = node->type;
       report_if_dropped(_task_creation_queue.push(std::move(request)), query_id);
-      ++state->index_of_next_lookahead;
-      return;
+      ++state.index_of_next_lookahead;
+      return true;
     }
   }
+  return false;
 }
 
 void task_creator::manager_loop()
