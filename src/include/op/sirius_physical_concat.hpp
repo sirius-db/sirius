@@ -25,6 +25,8 @@
 #include "op/sirius_physical_top_n.hpp"
 #include "sirius_config.hpp"
 
+#include <unordered_map>
+
 namespace sirius {
 namespace op {
 
@@ -56,9 +58,24 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
     return _downstream_join;
   }
 
+  //! Answers READY/WAITING from the per-partition push-time totals (`_input_totals`), so the task
+  //! creator's manager thread never touches a buffered `data_batch` lock. Once the source pipeline
+  //! finishes, READY is decided from repository emptiness alone, independent of the totals.
   std::optional<task_creation_hint> get_next_task_hint() override;
 
+  //! Forms the next input group with the greedy size-threshold walk over partitions. A group of
+  //! exactly one batch is not wrapped in a task when sink wiring exists: since execute is an
+  //! identity for one batch, the batch is pushed directly to the downstream consumers via their
+  //! `push_data_batch_partitioned` (the same publication path `sink` uses) and the walk continues.
   std::unique_ptr<operator_data> get_next_task_input_data() override;
+
+  //! Measures the batch's size and records it in the per-partition totals before delegating to the
+  //! base implementation, which publishes the batch into the input repository. This override is
+  //! the accounting entry point: `get_next_task_hint` answers from the totals, so producers must
+  //! push through it (the upstream PARTITION sink dispatches here through the virtual).
+  void push_data_batch_partitioned(std::string_view port_id,
+                                   std::shared_ptr<::cucascade::data_batch> batch,
+                                   std::size_t partition_idx) override;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
@@ -73,11 +90,31 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
     const op::input_stats& stats) const override;
 
  private:
+  //! Running byte/batch totals over one input partition's currently buffered batches.
+  struct partition_totals {
+    uint64_t bytes    = 0;
+    std::size_t count = 0;
+  };
+
+  //! Pop `batch_id` from `repo` and subtract its ledgered push-time size from the partition's
+  //! totals. Requires `lock` to be held. Batches that entered the repository without going through
+  //! `push_data_batch_partitioned` have no ledger entry and leave the totals untouched.
+  std::shared_ptr<::cucascade::data_batch> pop_and_account(
+    ::cucascade::shared_data_repository& repo, uint64_t batch_id, std::size_t partition_idx);
+
   bool _is_build;
   bool _concat_all;
   uint64_t _concat_batch_bytes;
   //! Non-owning. Captured at construction from the `downstream_join` ctor argument.
   sirius_physical_operator* _downstream_join = nullptr;
+  //! Per-partition totals, indexed by partition and grown on push. Guarded by `lock`. Sizes are
+  //! snapshotted at push time, so they can drift from live sizes while a batch idles (downgrade
+  //! converts batches in place); the drift is bounded to the currently buffered batches and
+  //! self-heals on pop — acceptable for a batching heuristic.
+  std::vector<partition_totals> _input_totals;
+  //! Push-time size of every currently buffered batch, keyed by batch id, so pops subtract exactly
+  //! what the push added even when a batch's live size changed while idle. Guarded by `lock`.
+  std::unordered_map<uint64_t, uint64_t> _pushed_batch_bytes;
 };
 
 }  // namespace op
