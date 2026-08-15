@@ -16,8 +16,9 @@
 
 #pragma once
 
-// Request-shaping model for s3_autotune_throughput_bench, plus the synthetic
-// workload it is measured against.
+// Request-shaping model for s3_autotune_throughput_bench: how many connections
+// to open, and which of a file's wanted byte ranges are worth merging into one
+// GET.
 //
 // Two decisions, one model.  Both follow from the two numbers that describe an
 // object store across a network: R, the MB/s a single connection sustains, and
@@ -30,6 +31,11 @@
 //     measured in bytes.  That single quantity sets both the GET size that
 //     reaches a target efficiency and the gap that is cheaper to read through
 //     than to skip -- see @ref coalesce_and_chunk.
+//
+// The ranges @ref coalesce_and_chunk merges come from a real query: the
+// benchmark asks a @c hybrid_scan_reader for the column-chunk byte ranges a
+// TPC-H query's projected columns need from each file, and this model decides
+// how those get shaped into GETs -- it does not generate a workload itself.
 //
 // Sizes are bytes throughout; rates are decimal (MB = 10^6 B) so a Gbps line
 // rate converts exactly and the derived byte counts line up with the GB/s the
@@ -246,68 +252,6 @@ struct request_plan {
     }
   }
   return plan;
-}
-
-// ---------------------------------------------------------------------------
-// synthetic workload
-// ---------------------------------------------------------------------------
-//
-// A scan does not read an object end to end; it reads runs of pieces with small
-// holes between them, and those runs sit far apart.  The generator below
-// reproduces exactly that shape, because it is the shape the coalescer has
-// decisions to make about: a `gap` between two segments of the same group is
-// small enough to be worth arguing over, and the distance between groups never
-// is.
-
-/// File span covered by @p n segments laid @p gap apart.
-[[nodiscard]] inline std::size_t group_span(std::size_t n, std::size_t seg, std::size_t gap)
-{
-  return n == 0 ? 0 : n * seg + (n - 1) * gap;
-}
-
-/// Segments a file can hold at this geometry.  Whole groups only -- a group is
-/// the unit the coalescer reasons about, so a truncated one at the end of a
-/// file would quietly change the shape of the workload.
-[[nodiscard]] inline std::size_t capacity_segments(std::size_t file_size,
-                                                   std::size_t seg,
-                                                   std::size_t gap,
-                                                   std::size_t segs_per_group)
-{
-  std::size_t const span = group_span(segs_per_group, seg, gap);
-  return span == 0 ? 0 : (file_size / span) * segs_per_group;
-}
-
-/// Place @p n_segs segments in one file as groups of @p segs_per_group, the
-/// groups spread evenly over the whole object.  Inside a group segments are
-/// @p gap apart (a coalescing candidate); between groups they are a full stride
-/// apart, which is far more than any plausible L*R (not a coalescing candidate).
-///
-/// @p n_segs must not exceed @ref capacity_segments for the same geometry --
-/// that is what guarantees the stride holds a whole group and the last one ends
-/// inside the file.
-[[nodiscard]] inline std::vector<byte_span> layout_file(std::size_t file_size,
-                                                        std::size_t n_segs,
-                                                        std::size_t seg,
-                                                        std::size_t gap,
-                                                        std::size_t segs_per_group)
-{
-  std::vector<byte_span> out;
-  if (n_segs == 0 || segs_per_group == 0) { return out; }
-  out.reserve(n_segs);
-
-  std::size_t const n_groups = (n_segs + segs_per_group - 1) / segs_per_group;
-  std::size_t const stride   = file_size / n_groups;
-
-  for (std::size_t g = 0; g < n_groups; ++g) {
-    std::size_t const base = g * stride;
-    std::size_t const here = std::min(segs_per_group, n_segs - out.size());
-    for (std::size_t s = 0; s < here; ++s) {
-      std::size_t const offset = base + s * (seg + gap);
-      if (offset >= file_size) { break; }
-      out.push_back({offset, std::min(seg, file_size - offset)});
-    }
-  }
-  return out;
 }
 
 }  // namespace sirius::bench::autotune
