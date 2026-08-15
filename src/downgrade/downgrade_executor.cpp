@@ -100,6 +100,10 @@ void downgrade_executor::start()
                                                       _config.thread_pool.cpu_affinity_list,
                                                       std::move(per_thread_init));
 
+  // Safe: the processing thread is not running yet. A stale cooldown from a
+  // previous start/stop cycle must not coalesce this cycle's first request.
+  _in_no_progress_cooldown = false;
+
   _processing_thread = std::thread(&downgrade_executor::processing_loop, this);
 
   if (_memory_space && _config.monitor_period > std::chrono::milliseconds::zero()) {
@@ -138,6 +142,11 @@ void downgrade_executor::drain()
   _pool->resume();
   _request_queue.reactivate();
 
+  // The processing thread is joined here, so this plain write is safe. A drain
+  // marks a query boundary — don't let a stale cooldown coalesce the next
+  // query's first downgrade request.
+  _in_no_progress_cooldown = false;
+
   _processing_thread = std::thread(&downgrade_executor::processing_loop, this);
 }
 
@@ -148,6 +157,34 @@ void downgrade_executor::processing_loop()
     if (!request) break;  // interrupted
 
     auto& req = request;
+
+    // No-progress coalescing: if the previous pass completed recently and freed
+    // nothing, a full rescan now would (almost certainly) find nothing again —
+    // during an OOM-retry storm every starved task re-requests a downgrade the
+    // pool cannot satisfy, and these back-to-back scans are what burns the
+    // processing thread and serializes the storm. Instead of rescanning,
+    // evaluate the request's predicate once (a caller whose reservation has
+    // become grantable in the meantime takes it right here) and otherwise
+    // resolve immediately with 0 bytes — callers already treat downgrade
+    // results as best-effort. Candidates that appear during the window wait at
+    // most one cooldown before the next full scan; progress passes never arm
+    // the cooldown.
+    if (_in_no_progress_cooldown) {
+      auto const cooldown = _config.no_progress_rescan_cooldown;
+      if (cooldown > std::chrono::milliseconds::zero() &&
+          std::chrono::steady_clock::now() - _no_progress_pass_end < cooldown) {
+        if (req->predicate && req->predicate()) {
+          req->satisfied.store(true, std::memory_order_release);
+        }
+        _coalesced_requests.fetch_add(1, std::memory_order_relaxed);
+        if (req->is_monitor_request) {
+          _monitor_request_enqueued.store(false, std::memory_order_relaxed);
+        }
+        req->result.set_value(0);
+        continue;
+      }
+      _in_no_progress_cooldown = false;
+    }
 
     auto t_start = std::chrono::steady_clock::now();
 
@@ -372,6 +409,30 @@ void downgrade_executor::processing_loop()
     std::string request_label = req->is_monitor_request ? "monitor " : "";
     if (req->is_monitor_request) {
       _monitor_request_enqueued.store(false, std::memory_order_relaxed);
+    }
+
+    // Storm accounting: a completed, uninterrupted pass that freed nothing and
+    // whose request was not satisfied by other means is a no-progress pass.
+    // Arm the coalescing cooldown (when configured) so immediately-following
+    // requests don't repeat the futile scan, and surface the counters at INFO
+    // for storm diagnosis. Interrupted passes (shutdown/drain) and passes whose
+    // predicate was already satisfied are NOT no-progress — nothing was proven
+    // about candidate availability.
+    if (total_bytes == 0 && !pool_interrupted && !req->satisfied.load(std::memory_order_acquire)) {
+      auto const no_progress_total =
+        _no_progress_passes.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (_config.no_progress_rescan_cooldown > std::chrono::milliseconds::zero()) {
+        _in_no_progress_cooldown = true;
+        _no_progress_pass_end    = std::chrono::steady_clock::now();
+      }
+      SIRIUS_LOG_INFO(
+        "[downgrade] [{}] no-progress {}pass: 0 bytes freed in {:.2f} ms "
+        "(no-progress passes: {}, coalesced requests: {})",
+        _source_label,
+        request_label,
+        duration_ms,
+        no_progress_total,
+        _coalesced_requests.load(std::memory_order_relaxed));
     }
 
     SIRIUS_LOG_DEBUG(

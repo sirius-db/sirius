@@ -310,6 +310,7 @@ static void from_yaml(const YAML::Node& node, exec::downgrade_executor_config& o
   r.optional("thread_name_prefix", opt.thread_pool.thread_name_prefix);
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("monitor_period", opt.monitor_period);
+  r.optional("no_progress_rescan_cooldown", opt.no_progress_rescan_cooldown);
   r.reject_unknown();
 }
 

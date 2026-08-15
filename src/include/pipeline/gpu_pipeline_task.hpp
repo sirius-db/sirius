@@ -89,6 +89,17 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
   uint32_t retry_count = 0;
   /// Task ID of the original (non-retried) task; only meaningful when retry_count > 0.
   std::optional<uint64_t> original_task_id = std::nullopt;
+  /// Set by the executor at admission when the reservation shortfall triggered a
+  /// downgrade pass that freed 0 bytes and the task proceeded on a partial
+  /// reservation anyway. An OOM after such a "starved" admission is near-certain
+  /// to repeat until other work frees memory, so the reschedule path escalates
+  /// its retry backoff instead of spinning at the base interval (see
+  /// gpu_pipeline_executor::compute_oom_backoff).
+  bool starved_admission = false;
+  /// Number of consecutive attempts that ended in an OOM reschedule after a
+  /// starved admission. Carried across reschedules; resets to 0 whenever an
+  /// admission is clean (full reservation, or a downgrade made progress).
+  uint32_t starved_streak = 0;
 
   [[nodiscard]] std::size_t get_task_consumption_basis() const override
   {
