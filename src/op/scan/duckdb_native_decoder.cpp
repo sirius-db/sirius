@@ -977,17 +977,20 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
   rmm::cuda_stream_view stream)
 {
   if (row_groups.empty()) {
-    // Empty / fully-pruned split: emit a schema-correct 0-row table (one empty
-    // column per projected column) rather than a 0-column table, so it flows
-    // through post_filter_and_project and downstream concat like any decoded
-    // batch. Rowid columns decode as INT64 (see the fixed-width path below).
+    // Preserve the projected schema so an empty or fully pruned split follows
+    // the normal filter/project/concat path. ARRAY needs the LIST-specific
+    // factory because cudf::make_empty_column rejects nested types.
     std::vector<std::unique_ptr<cudf::column>> empty_cols;
     empty_cols.reserve(table_info.projected_cols.size());
     for (std::size_t ci = 0; ci < table_info.projected_cols.size(); ++ci) {
-      auto const dt = table_info.projected_cols[ci].is_rowid
-                        ? cudf::data_type{cudf::type_id::INT64}
-                        : sirius_to_cudf_type(table_info.projected_types[ci]);
-      empty_cols.push_back(cudf::make_empty_column(dt));
+      if (table_info.projected_cols[ci].is_rowid) {
+        empty_cols.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::INT64}));
+        continue;
+      }
+      auto const& type = table_info.projected_types[ci];
+      empty_cols.push_back(
+        type.is_array() ? cudf::make_empty_lists_column(sirius_to_cudf_type(type.array_child()))
+                        : cudf::make_empty_column(sirius_to_cudf_type(type)));
     }
     return std::make_unique<cudf::table>(std::move(empty_cols));
   }

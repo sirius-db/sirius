@@ -38,6 +38,8 @@ The single GPU scan source operator. It owns:
 
 The operator handles two split shapes transparently, both delivered as `scan_operator_input`: a **fresh read** (the input carries a `scan_info`, materialized via the ingestible) and a **pinned-cache hit** (the input carries a resident `data_batch`, filtered when required and normalized to the planned carrier schema). The operator never sees the source format directly.
 
+Before execution, a resident split is converted or decompressed to a plain GPU table when necessary. An unmasked, unfiltered split needing no carrier cast may detach that per-query table and transfer it directly to the output. Splits that still need a mask, row filter, or carrier cast retain the wrapper view; this both preserves the source for copy-based filtering and lets an OOM-rescheduled carrier cast rematerialize the split.
+
 `no_history_peak_memory_estimate()` uses the larger of stored and working-set bytes for resident inputs that need no carrier conversion. For a known conversion it adds the exact destination bytes to the working set. The named maximum carrier expansion (8) is used only when a converting destination cannot be sized. A resident input with a physical sidecar but no reported conversion reserves the working set plus stored bytes as a source-bounded floor. For fresh reads the estimate remains 8 times the projected-column estimate plus decoded filter-only column buffers. The projected-column estimate remains the execution-history basis, and history-based reservations are clamped to the known decoded column-buffer footprint.
 
 > `sirius_physical_table_scan` (`TABLE_SCAN`) remains only as the plan-time carrier that `wrap_table_scan_source` consumes; the read path for parquet and DuckDB-native tables runs entirely through `GPU_SCAN`.
@@ -281,6 +283,8 @@ The coalescer runs inside the per-query sequencer (`load_balancing_scan_batch_co
 
 The GPU DuckDB-native scan reads a table stored in DuckDB's own `.db` block format and decodes each projected column's on-disk segments directly on the GPU into a `cudf::table`, without going through Parquet. `decode_duckdb_native_split()` takes the row-group metadata for a split, stages the segment bytes on device, and dispatches per-column decode.
 
+Fixed-size DuckDB `ARRAY` columns with supported fixed-width children decode as cuDF `LIST` columns. An empty or fully pruned split preserves that nested schema with an empty `LIST` column; variable-length `LIST` and `STRUCT` remain unsupported.
+
 ### Segment runs and codec dispatch
 
 A DuckDB column inside a row group is a sequence of *segments*, each compressed with one codec. The decoder groups a column's segments into **codec runs** — maximal spans of segments sharing one codec — and a per-codec kernel consumes a whole run in one launch (the run is the batching unit). A column with mixed codecs produces multiple runs. Codec metadata (bitpacking width, dictionary references, FSST symbol tables, ALP parameters) lives inside the segment bytes; each codec kernel parses its own headers on device, so the dispatcher itself does no parsing and no I/O.
@@ -314,7 +318,7 @@ Runs once, single-threaded, because it touches `ClientContext`/`LocalStorage`, w
 - Gates the projected types: an exhaustive type switch refuses 128-bit and nested types up front so an unsupported projection becomes a clean CPU fallback before any per-segment IO.
 - Marks row groups that pushed-down filter statistics prove empty (see **Row Group Pruning**).
 
-The result is a `duckdb_native_walk_plan` carrying per-row-group row starts/counts, the block size, the pruned-row-group bitmap, and the inputs the range walks need. A non-viable plan (unsupported type, invalid partition `row_start`, or all row groups pruned) refuses the whole native-scan path.
+The result is a `duckdb_native_walk_plan` carrying per-row-group row starts/counts, the block size, the pruned-row-group bitmap, and the inputs the range walks need. A non-viable plan (unsupported type, invalid partition `row_start`, or the varchar overflow-block refusal) refuses the whole native-scan path.
 
 ### Phase 2 — `walk_duckdb_native_row_group_range()` (concurrent)
 
@@ -347,7 +351,7 @@ Reader-side pushdown is a per-split decision: an FLBA-decimal safety probe can d
 
 The DuckDB-native scan prunes row groups using DuckDB's own statistics machinery rather than Parquet footer stats. During the serial prepare phase of the metadata walk (`mark_row_groups_pruned_by_filter_stats`), for each row group and each pushed-down `TableFilter`, the scan calls DuckDB's `TableFilter::CheckStatistics` against that row group's per-column statistics (obtained from its `PartitionRowGroup` handle). A row group is pruned the moment any filter returns `FILTER_ALWAYS_FALSE`.
 
-This runs entirely from `PartitionRowGroup` statistics — no segment metadata is needed — so a pruned row group is skipped **before its segments are walked, staged, copied to the GPU, or decoded**. If every row group is pruned, the native path refuses up front and the query falls back to DuckDB CPU before the async scan starts.
+This runs entirely from `PartitionRowGroup` statistics — no segment metadata is needed — so a pruned row group is skipped **before its segments are walked, staged, copied to the GPU, or decoded**. If every row group is pruned, the scan stays on the GPU path: the coalescer emits one schema-correct 0-row split, so the pipeline completes with an empty result.
 
 Only statically-known DuckDB `TableFilter`s participate in this DuckDB-native metadata walk. DuckDB `DYNAMIC_FILTER` entries are excluded because Sirius runtime dynamic filters use a separate `sirius_dynamic_filter_set` channel and their own scan-consumer paths — the parquet reader's `set_filter` and the post-decode `DYNAMIC_FILTER` operator (the duckdb-native scan consumes post-decode only) — described in [Dynamic Filters](dynamic-filters.md); they are not translated through this static `TableFilterSet` path. This metadata separation does not imply one universal execution order: the producing join's immediate probe scan starts after build-port publication, while a base scan reached transitively through an intervening join may materialize early splits before publication and samples the channel at its per-split checkpoints. See [Transitive scan targets and publication timing](dynamic-filters.md#transitive-scan-targets-and-publication-timing). The payoff from the static statistics walk is data-clustering-dependent — it costs almost nothing when statistics cannot help and is multiplicative when the table is ordered such that a filter eliminates most row groups.
 
