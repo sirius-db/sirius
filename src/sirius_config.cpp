@@ -306,6 +306,11 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("dynamic_filter_keep_threshold", opt.dynamic_filter_keep_threshold);
   r.optional("enable_pinned_zone_map_pruning", opt.enable_pinned_zone_map_pruning);
   r.optional("enable_compressed_materialization", opt.enable_compressed_materialization);
+  r.optional("gpu_reservation_max_retries", opt.gpu_reservation_max_retries);
+  if (opt.gpu_reservation_max_retries == 0) {
+    throw std::runtime_error(
+      "'operator_params.gpu_reservation_max_retries': must be greater than zero");
+  }
   r.reject_unknown();
 }
 

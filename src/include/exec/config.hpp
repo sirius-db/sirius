@@ -17,6 +17,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
@@ -27,6 +28,17 @@ namespace sirius::exec {
 /// (see scan_manager::default_scan_manager_num_threads).
 inline constexpr int default_gpu_pipeline_num_threads = 4;
 inline constexpr int default_downgrade_num_threads    = 1;
+
+/// Default cap on OOM/contention reschedules of one GPU pipeline task before
+/// the query is failed with a classified retry-cap error. History: bumped from
+/// 10 to 100 as part of follow-up #17 — SF100 Q11 with cache=table_gpu +
+/// num_gpus=2 exhausted the old 10-retry budget against cross-GPU BUILD_PROBE
+/// batch-lock contention (each convert-release cycle is O(100ms) at SF100
+/// scale). 100 retries x 50 ms backoff (~5 s) clears the contention window
+/// while still bailing out on truly wedged queries. Overridable via the
+/// operator_params YAML section / `SET gpu_reservation_max_retries` (per-query
+/// snapshot semantics, register E1).
+inline constexpr uint32_t default_gpu_reservation_max_retries = 100;
 
 struct thread_pool_config {
   int num_threads{0};

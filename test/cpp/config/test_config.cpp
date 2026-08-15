@@ -671,8 +671,9 @@ TEST_CASE("query config snapshot: thread-local install, nesting and isolation",
           sirius::expression_evaluator_strategy::AST_JIT);
 
   sirius::query_config_snapshot snap{};
-  snap.params.scan_task_batch_size = 12345;
-  snap.expression_strategy         = sirius::expression_evaluator_strategy::MATERIALIZE;
+  snap.params.scan_task_batch_size        = 12345;
+  snap.params.gpu_reservation_max_retries = 3;
+  snap.expression_strategy                = sirius::expression_evaluator_strategy::MATERIALIZE;
   snap.compression.enable_pin_table_compression = true;
   snap.compression.input_plan_dir               = "/tmp/snapshot_plan_dir";
   {
@@ -684,6 +685,9 @@ TEST_CASE("query config snapshot: thread-local install, nesting and isolation",
     // window sees the frozen copy, including the plan-dir string.
     CHECK(current->compression.enable_pin_table_compression);
     CHECK(current->compression.input_plan_dir == "/tmp/snapshot_plan_dir");
+    // Every operator_params member rides the snapshot wholesale; spot-check the
+    // executor retry cap, which the GPU reschedule path reads per-query.
+    CHECK(current->params.gpu_reservation_max_retries == 3);
     // The snapshot wins over the (different) global while installed: this is
     // the E2 guarantee that one plan reads one strategy.
     CHECK(sirius::current_expression_evaluator_strategy() ==

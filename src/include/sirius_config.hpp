@@ -166,6 +166,14 @@ struct operator_params {
   /// metadata; other scans use native carriers. Logical types remain unchanged, and type-sensitive
   /// boundaries restore native carriers.
   bool enable_compressed_materialization = true;
+
+  /// Maximum OOM/contention reschedules of one GPU pipeline task before the query is failed
+  /// with a classified retry-cap error. Under heavy concurrency with tiny pools, fully-working
+  /// spills can still legitimately trip the cap (in-use hash tables cannot downgrade), so
+  /// stress tests lower it to surface the classified error quickly instead of waiting out the
+  /// full backoff budget. Must be greater than zero. Read per-query via the admission-time
+  /// snapshot (register E1): a SET affects only queries admitted after it.
+  uint32_t gpu_reservation_max_retries = exec::default_gpu_reservation_max_retries;
 };
 
 /// Parameters controlling Simpatico compression for pin_table(tier=>'host').

@@ -122,6 +122,7 @@ extern "C" int cudaProfilerStop();
 
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <string_view>
 #include <unordered_map>
 #include <variant>
@@ -2036,6 +2037,20 @@ static void SetMarkJoinBuildSwitchRatio(ClientContext& context, SetScope scope, 
   SIRIUS_LOG_DEBUG("Updated config MARK_JOIN_BUILD_SWITCH_RATIO to {}", ratio);
 }
 
+static void SetGpuReservationMaxRetries(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const retries = UBigIntValue::Get(parameter);
+  if (retries == 0 || retries > std::numeric_limits<uint32_t>::max()) {
+    throw InvalidInputException("gpu_reservation_max_retries must be between 1 and %u, got %llu",
+                                std::numeric_limits<uint32_t>::max(),
+                                static_cast<unsigned long long>(retries));
+  }
+  update_operator_params(context, [&](sirius::operator_params& params) {
+    params.gpu_reservation_max_retries = static_cast<uint32_t>(retries);
+  });
+  SIRIUS_LOG_DEBUG("Updated config GPU_RESERVATION_MAX_RETRIES to {}", retries);
+}
+
 static void SetEnableGpuExecution(ClientContext& context, SetScope scope, Value& parameter)
 {
   SIRIUS_LOG_DEBUG("Updated gpu_execution to {}", BooleanValue::Get(parameter));
@@ -2406,6 +2421,15 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.enable_runtime_distinct_build_probe),
     SetEnableRuntimeDistinctBuildProbe);
+
+  config.AddExtensionOption(
+    "gpu_reservation_max_retries",
+    "Maximum OOM/contention reschedules of one GPU pipeline task before the query is failed "
+    "with a classified retry-cap error (per-query snapshot semantics: a SET affects only "
+    "queries admitted after it)",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.gpu_reservation_max_retries),
+    SetGpuReservationMaxRetries);
 
   config.AddExtensionOption(
     "gpu_execution",

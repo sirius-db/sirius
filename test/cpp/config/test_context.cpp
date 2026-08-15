@@ -487,6 +487,81 @@ TEST_CASE("effective-capacity defaults seed DuckDB SET and RESET",
   REQUIRE(sirius_ctx->get_config().get_operator_params().scan_task_batch_size == expected_batch);
 }
 
+TEST_CASE("gpu_reservation_max_retries parses from YAML and defaults to 100", "[sirius][config]")
+{
+  sirius::sirius_config config;
+  REQUIRE(config.get_operator_params().gpu_reservation_max_retries ==
+          sirius::exec::default_gpu_reservation_max_retries);
+  REQUIRE(sirius::exec::default_gpu_reservation_max_retries == 100);
+
+  config.load_from_file(config_fixture("operator_reservation_max_retries.yaml"));
+  REQUIRE(config.get_operator_params().gpu_reservation_max_retries == 7);
+
+  // A reload without the key restores the default (repeated loads reset operator values).
+  config.load_from_file(config_fixture("effective_operator_defaults_high_level.yaml"));
+  REQUIRE(config.get_operator_params().gpu_reservation_max_retries ==
+          sirius::exec::default_gpu_reservation_max_retries);
+}
+
+TEST_CASE("Sirius configuration rejects zero gpu_reservation_max_retries", "[sirius][config]")
+{
+  sirius::sirius_config config;
+  REQUIRE_THROWS_WITH(
+    config.load_from_file(config_fixture("invalid_reservation_max_retries_zero.yaml")),
+    Catch::Contains("gpu_reservation_max_retries") && Catch::Contains("greater than zero"));
+}
+
+TEST_CASE("gpu_reservation_max_retries SET/RESET round-trip",
+          "[sirius][context][config][isolated_context]")
+{
+  finally cleanup_env{[]() {
+    unsetenv("SIRIUS_CONFIG_FILE");
+    setenv("SIRIUS_DISABLE", "1", 1);
+  }};
+
+  auto const cfg = config_fixture("operator_reservation_max_retries.yaml");
+  unsetenv("SIRIUS_DISABLE");
+  setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+
+  auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+  // The YAML value seeded both the Sirius config and the DuckDB setting default.
+  REQUIRE(sirius_ctx->get_config().get_operator_params().gpu_reservation_max_retries == 7);
+  auto seeded = con.Query("SELECT current_setting('gpu_reservation_max_retries')::UBIGINT");
+  REQUIRE(seeded != nullptr);
+  REQUIRE_FALSE(seeded->HasError());
+  REQUIRE(seeded->GetValue(0, 0).GetValue<uint64_t>() == 7);
+
+  // SET flows through update_operator_params (E1 mutex path) into the live config.
+  auto set = con.Query("SET gpu_reservation_max_retries = 3");
+  REQUIRE(set != nullptr);
+  REQUIRE_FALSE(set->HasError());
+  auto readback = con.Query("SELECT current_setting('gpu_reservation_max_retries')::UBIGINT");
+  REQUIRE(readback != nullptr);
+  REQUIRE_FALSE(readback->HasError());
+  REQUIRE(readback->GetValue(0, 0).GetValue<uint64_t>() == 3);
+  REQUIRE(sirius_ctx->get_config().get_operator_params().gpu_reservation_max_retries == 3);
+
+  // Zero is rejected at SET time and the previous value survives.
+  auto zero = con.Query("SET gpu_reservation_max_retries = 0");
+  REQUIRE(zero != nullptr);
+  REQUIRE(zero->HasError());
+  REQUIRE(sirius_ctx->get_config().get_operator_params().gpu_reservation_max_retries == 3);
+
+  // RESET restores the seeded default.
+  auto reset = con.Query("RESET gpu_reservation_max_retries");
+  REQUIRE(reset != nullptr);
+  REQUIRE_FALSE(reset->HasError());
+  auto reset_readback = con.Query("SELECT current_setting('gpu_reservation_max_retries')::UBIGINT");
+  REQUIRE(reset_readback != nullptr);
+  REQUIRE_FALSE(reset_readback->HasError());
+  REQUIRE(reset_readback->GetValue(0, 0).GetValue<uint64_t>() == 7);
+  REQUIRE(sirius_ctx->get_config().get_operator_params().gpu_reservation_max_retries == 7);
+}
+
 TEST_CASE("Sirius configuration rejects invalid downgrade hysteresis", "[sirius][config]")
 {
   struct invalid_config {

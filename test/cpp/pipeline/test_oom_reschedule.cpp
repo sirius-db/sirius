@@ -343,6 +343,26 @@ class xl_task : public oom_test_task_base {
 }  // namespace
 
 // ---------------------------------------------------------------------------
+// The executor's retry cap is per-query state: the engine stamps
+// operator_params.gpu_reservation_max_retries (admission-time snapshot,
+// register E1) onto the query's pipeline_build_context, every sirius_pipeline
+// copies that context, and the reschedule path reads it from the task's
+// pipeline (tasks without a pipeline — like the ones in this file — use
+// exec::default_gpu_reservation_max_retries). Verify the carrier end of that
+// chain deterministically, no GPU needed.
+// ---------------------------------------------------------------------------
+TEST_CASE("pipeline carries the per-query reservation retry cap from the build context",
+          "[gpu_pipeline_executor][oom][config]")
+{
+  sirius::pipeline::pipeline_build_context ctx{nullptr};
+  REQUIRE(ctx.reservation_max_retries() == sirius::exec::default_gpu_reservation_max_retries);
+
+  ctx.set_reservation_max_retries(3);
+  auto pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(ctx);
+  REQUIRE(pipeline->reservation_max_retries() == 3);
+}
+
+// ---------------------------------------------------------------------------
 // Memory layout for the reschedule test:
 //   Allocation    = 400 MB per task (much larger than the 50 MB reservation)
 //
@@ -432,7 +452,10 @@ TEST_CASE("GPU pipeline executor reschedules tasks on OOM", "[gpu_pipeline_execu
 }
 
 // ---------------------------------------------------------------------------
-// Test: tasks that can never succeed exhaust their retry budget (MAX_OOM_RETRIES=10)
+// Test: tasks that can never succeed exhaust their retry budget
+// (exec::default_gpu_reservation_max_retries — these tasks have no pipeline,
+// so the executor uses the process default; a query would use the per-query
+// operator_params.gpu_reservation_max_retries stamped on its pipelines)
 // and cause the query to fail, while small tasks that fit in memory still complete.
 //
 // Memory layout:
@@ -441,7 +464,7 @@ TEST_CASE("GPU pipeline executor reschedules tasks on OOM", "[gpu_pipeline_execu
 //   xl_task       = 2048 MB allocation  → always OOMs (exceeds capacity)
 //
 // We dispatch 5 small tasks + 3 XL tasks = 8 total.
-// The XL tasks will be rescheduled up to 10 times each before the executor
+// The XL tasks will be rescheduled up to the cap each before the executor
 // reports a max-retry error on the completion handler.
 // The 5 small tasks should all complete regardless.
 // After the error, drain_and_wait() should empty the task queue.

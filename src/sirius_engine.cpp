@@ -242,10 +242,14 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   }
 
   // Create plan-time build context (decoupled from engine).
-  const pipeline::pipeline_build_context build_ctx{
+  pipeline::pipeline_build_context build_ctx{
     sirius_ctx_ptr->get_telemetry_context(),
     duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context),
     std::move(active_gpu_ids)};
+  // Stamp the per-query OOM-retry cap from the admission-time snapshot (E1): every
+  // pipeline built below copies this context, so the GPU executor's reschedule path
+  // reads a per-query constant rather than the live operator_params struct.
+  build_ctx.set_reservation_max_retries(op_params.gpu_reservation_max_retries);
 
   // The collector is added after planning, so refresh parent pointers before marking fusion.
   sirius::planner::sirius_physical_plan_generator::set_parent_ops(*sirius_physical_plan,

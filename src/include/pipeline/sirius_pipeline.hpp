@@ -243,6 +243,15 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
     return build_ctx_.telemetry_context().get();
   }
 
+  //! Per-query OOM-retry cap for this pipeline's tasks, carried in the build context
+  //! from the query's admission-time operator_params snapshot (register E1). The GPU
+  //! executor's reschedule path reads this per-query constant — never the live config
+  //! struct — so a concurrent SET can never reshape a mid-flight query's retry budget.
+  [[nodiscard]] uint32_t reservation_max_retries() const noexcept
+  {
+    return build_ctx_.reservation_max_retries();
+  }
+
  private:
   //! Whether or not the pipeline has been readied
   bool ready;

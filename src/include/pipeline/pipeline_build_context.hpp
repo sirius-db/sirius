@@ -16,6 +16,9 @@
 
 #pragma once
 
+#include "exec/config.hpp"
+
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <utility>
@@ -86,11 +89,27 @@ class pipeline_build_context {
     return _telemetry_context;
   }
 
+  //! Per-query OOM-retry cap for this query's GPU pipeline tasks. Stamped by the engine
+  //! from the query's admission-time operator_params snapshot (register E1) before pipeline
+  //! construction; engine-free construction paths (tests, optimizer/bind) keep the process
+  //! default. Copied into every sirius_pipeline via this context, so the executor's retry
+  //! decision reads a per-query constant, never a live struct mid-execution.
+  void set_reservation_max_retries(uint32_t max_retries) noexcept
+  {
+    _reservation_max_retries = max_retries;
+  }
+
+  [[nodiscard]] uint32_t reservation_max_retries() const noexcept
+  {
+    return _reservation_max_retries;
+  }
+
  private:
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   bool _preserve_insertion_order = true;
   int _num_gpus                  = 1;
   std::vector<int> _active_gpu_ids;
+  uint32_t _reservation_max_retries = exec::default_gpu_reservation_max_retries;
 };
 
 }  // namespace pipeline

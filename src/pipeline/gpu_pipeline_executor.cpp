@@ -466,28 +466,29 @@ void gpu_pipeline_executor::process_task(
             orig_task_id     = cur_local->original_task_id.value();
           }
 
-          // Bumped from 10 to 100 as part of follow-up #17. SF100 Q11 with
-          // cache=table_gpu + num_gpus=2 exhausted the old 10-retry budget
-          // against cross-GPU BUILD_PROBE batch-lock contention: the batch
-          // was held in `processing` on one GPU while the probe task on the
-          // other GPU needed it. Each convert-release cycle is O(100ms) at
-          // SF100 scale, so 10 retries × 5ms backoff (50 ms total) was far
-          // too short. With 100 retries × 50 ms backoff (~5 s) the probe
-          // tasks get enough patience to clear the contention window while
-          // still bailing out on truly wedged queries.
-          static constexpr uint32_t MAX_RETRIES = 100;
-          if (next_retry_count > MAX_RETRIES) {
+          // The retry cap is per-query state stamped on the pipeline's build context
+          // from the admission-time operator_params snapshot (register E1) — one
+          // coherent read here, never the live config struct mid-execution. Configured
+          // via operator_params.gpu_reservation_max_retries (YAML) / SET
+          // gpu_reservation_max_retries; see exec::default_gpu_reservation_max_retries
+          // for the default's provenance (follow-up #17: 100 retries x 50 ms backoff
+          // rides out cross-GPU BUILD_PROBE batch-lock contention at SF100 while still
+          // bailing out on truly wedged queries). Tasks without a pipeline (tests) use
+          // the process default.
+          const uint32_t max_retries = pipeline ? pipeline->reservation_max_retries()
+                                                : exec::default_gpu_reservation_max_retries;
+          if (next_retry_count > max_retries) {
             SIRIUS_LOG_ERROR(
               "GPU Pipeline Executor: task {} (original task {}) exceeded {} retries at "
               "operator index {} — terminating query: {}",
               gpu_task->get_task_id(),
               orig_task_id,
-              MAX_RETRIES,
+              max_retries,
               ex.get_resume_operator_index(),
               ex.what());
             if (completion) {
               completion->report_error(std::make_exception_ptr(std::runtime_error(
-                "GPU pipeline task exceeded maximum retry limit (" + std::to_string(MAX_RETRIES) +
+                "GPU pipeline task exceeded maximum retry limit (" + std::to_string(max_retries) +
                 ") for original task " + std::to_string(orig_task_id) + ": " + ex.what())));
             }
             return;
@@ -497,7 +498,7 @@ void gpu_pipeline_executor::process_task(
             "GPU Pipeline Executor: reschedule (retry {}/{}) for task {} (original task {}), "
             "resuming from operator index {}: {}",
             next_retry_count,
-            MAX_RETRIES,
+            max_retries,
             gpu_task->get_task_id(),
             orig_task_id,
             ex.get_resume_operator_index(),

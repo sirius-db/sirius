@@ -1,0 +1,10 @@
+sirius:
+  topology:
+    num_gpus: 1
+  memory:
+    gpu:
+      usage_limit_bytes: 256MiB
+    host:
+      capacity_bytes: 256MiB
+  operator_params:
+    gpu_reservation_max_retries: 7
