@@ -17,6 +17,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 
 namespace sirius::op {
@@ -87,6 +88,79 @@ struct dynamic_filter_stats_snapshot {
   std::uint64_t reader_gate_rearmed               = 0;
   std::uint64_t reader_gate_merges_skipped        = 0;
 };
+
+/// Number of counters in @ref dynamic_filter_stats_snapshot. Every field is a `std::uint64_t`, so
+/// the size check below fails compilation when a counter is added to the snapshot without this
+/// constant -- and @ref for_each_field, which visits exactly this many fields -- being updated.
+inline constexpr std::size_t dynamic_filter_stats_field_count = 50;
+
+static_assert(sizeof(dynamic_filter_stats_snapshot) ==
+                dynamic_filter_stats_field_count * sizeof(std::uint64_t),
+              "dynamic_filter_stats_snapshot changed: update dynamic_filter_stats_field_count and "
+              "extend for_each_field to visit the new field");
+
+/**
+ * @brief Invokes `fn(name, value)` for every counter of @p snapshot, in declaration order
+ *
+ * The single name-to-value enumeration of the snapshot. The `sirius_dynamic_filter_stats()` table
+ * function in `sirius_extension.cpp` uses it to expose the counters to SQL as `(name, value)`
+ * rows, and tests use it to compare that SQL surface against an in-process snapshot without
+ * repeating the field list. The static_assert above keeps this enumeration complete.
+ */
+template <typename Fn>
+void for_each_field(const dynamic_filter_stats_snapshot& snapshot, Fn&& fn)
+{
+  fn("producers_enabled", snapshot.producers_enabled);
+  fn("keys_considered", snapshot.keys_considered);
+  fn("keys_with_known_domain", snapshot.keys_with_known_domain);
+  fn("keys_skipped_domain_gate", snapshot.keys_skipped_domain_gate);
+  fn("keys_skipped_type_mismatch", snapshot.keys_skipped_type_mismatch);
+  fn("keys_build_exceeded_domain", snapshot.keys_build_exceeded_domain);
+  fn("membership_filters_built", snapshot.membership_filters_built);
+  fn("zone_map_filters_built", snapshot.zone_map_filters_built);
+  fn("publication_attempts", snapshot.publication_attempts);
+  fn("publications_finished", snapshot.publications_finished);
+  fn("publications_failed", snapshot.publications_failed);
+  fn("publications_skipped_source_not_resident", snapshot.publications_skipped_source_not_resident);
+  fn("publications_skipped_build_not_whole", snapshot.publications_skipped_build_not_whole);
+  fn("publications_skipped_targets_drained", snapshot.publications_skipped_targets_drained);
+  fn("filters_pushed", snapshot.filters_pushed);
+  fn("top_n_producers_eligible", snapshot.top_n_producers_eligible);
+  fn("top_n_producers_rejected", snapshot.top_n_producers_rejected);
+  fn("top_n_producers_first_key_only", snapshot.top_n_producers_first_key_only);
+  fn("top_n_offers", snapshot.top_n_offers);
+  fn("top_n_offers_not_tighter", snapshot.top_n_offers_not_tighter);
+  fn("top_n_offers_unsupported", snapshot.top_n_offers_unsupported);
+  fn("top_n_prefilter_rows_in", snapshot.top_n_prefilter_rows_in);
+  fn("top_n_prefilter_rows_out", snapshot.top_n_prefilter_rows_out);
+  fn("top_n_prefilter_disabled", snapshot.top_n_prefilter_disabled);
+  fn("top_n_first_key_scan_targets", snapshot.top_n_first_key_scan_targets);
+  fn("top_n_lex_scan_targets", snapshot.top_n_lex_scan_targets);
+  fn("top_n_first_key_endpoint_sites_placed", snapshot.top_n_first_key_endpoint_sites_placed);
+  fn("top_n_lex_endpoint_sites_placed", snapshot.top_n_lex_endpoint_sites_placed);
+  fn("top_n_sites_skipped_no_work_saved", snapshot.top_n_sites_skipped_no_work_saved);
+  fn("top_n_first_key_subsumed_by_lex", snapshot.top_n_first_key_subsumed_by_lex);
+  fn("top_n_revisions_published", snapshot.top_n_revisions_published);
+  fn("top_n_lex_filters_pushed", snapshot.top_n_lex_filters_pushed);
+  fn("top_n_first_key_filters_pushed", snapshot.top_n_first_key_filters_pushed);
+  fn("top_n_revisions_failed", snapshot.top_n_revisions_failed);
+  fn("top_n_revisions_stale", snapshot.top_n_revisions_stale);
+  fn("top_n_revisions_ignored", snapshot.top_n_revisions_ignored);
+  fn("top_n_group_producers_eligible", snapshot.top_n_group_producers_eligible);
+  fn("top_n_group_producers_rejected", snapshot.top_n_group_producers_rejected);
+  fn("top_n_group_offers", snapshot.top_n_group_offers);
+  fn("top_n_group_witness_set_full", snapshot.top_n_group_witness_set_full);
+  fn("top_n_group_prefilter_rows_in", snapshot.top_n_group_prefilter_rows_in);
+  fn("top_n_group_prefilter_rows_out", snapshot.top_n_group_prefilter_rows_out);
+  fn("post_decode_apply_rows_in", snapshot.post_decode_apply_rows_in);
+  fn("post_decode_apply_rows_out", snapshot.post_decode_apply_rows_out);
+  fn("reader_gate_row_groups_considered", snapshot.reader_gate_row_groups_considered);
+  fn("reader_gate_row_groups_pruned", snapshot.reader_gate_row_groups_pruned);
+  fn("reader_gate_measurements", snapshot.reader_gate_measurements);
+  fn("reader_gate_disabled", snapshot.reader_gate_disabled);
+  fn("reader_gate_rearmed", snapshot.reader_gate_rearmed);
+  fn("reader_gate_merges_skipped", snapshot.reader_gate_merges_skipped);
+}
 
 /**
  * @brief Connection-lifetime dynamic-filter publication counters, owned by `SiriusContext`

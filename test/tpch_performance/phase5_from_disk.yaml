@@ -1,0 +1,59 @@
+# =============================================================================
+# Copyright 2026, Sirius Contributors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+# in compliance with the License. You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software distributed under the License
+# is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied. See the License for the specific language governing permissions and limitations under
+# the License.
+# =============================================================================
+#
+# Phase-5 from-disk bar cell (parquet, hot page cache, SF1000, GB300): the run.md GB300 example
+# with the host pool reduced and telemetry disabled (unmeasured write cost on the timed path).
+# Use with:
+#
+#   pixi run python test/tpch_performance/performance_test.py \
+#       --mode ab --cell disk_hot --pin none --config test/tpch_performance/phase5_from_disk.yaml ...
+#
+# Host-RAM arithmetic behind the reduced pool, verified against /proc/meminfo on pmgb300ws-0391
+# (2026-08-15): MemTotal 771,857,272 kB (~790 GB). The from-disk cell's hot-cache premise needs
+# the 265 GB SF1000 parquet page cache to stay resident for the whole cell, and pinned pool pages
+# are not evictable. With the host-pinned cell's pool (785 pools ~= 421 GB preallocated) the
+# residual would be 790 - 421 - 265 ~= 104 GB for OS, DuckDB, and cudf host allocations -- close
+# enough to eviction to silently convert "hot" into part-cold. This pool preallocates
+# 400 x 512 x 1 MiB = 204,800 MiB (~215 GB), leaving 790 - 215 - 265 ~= 310 GB of headroom. The
+# cell runs unpinned (--pin none), so the pool serves spill/CPU-side staging only and does not
+# need to hold table data. The AB runner's pre-flight records MemTotal/MemAvailable per cell so
+# this arithmetic is checked against the machine on every run.
+sirius:
+  topology:
+    num_gpus: 1
+  memory:
+    gpu:
+      usage_limit_fraction: 0.9
+      reservation_limit_fraction: 1.0
+      downgrade_trigger_fraction: 0.8
+      downgrade_stop_fraction: 0.6
+    host:
+      capacity_bytes: 300000000000       # ~300 GB
+      initial_number_pools: 400
+      pool_size: 512
+      block_size: 1048576                # 1 MB
+  executor:
+    pipeline:
+      num_threads: 4
+    downgrade:
+      num_threads: 1
+    task_creator:
+      num_threads: 6
+  operator_params:
+    scan_task_batch_size: 5368709120       # 5 GB
+    max_sort_partition_bytes: 0            # 0 = auto (33% GPU memory)
+    hash_partition_bytes: 5368709120       # 5 GB
+    concat_batch_bytes: 5368709120         # 5 GB
+  telemetry:
+    enable_quent: false

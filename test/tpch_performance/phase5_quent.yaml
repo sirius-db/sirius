@@ -1,0 +1,52 @@
+# =============================================================================
+# Copyright 2026, Sirius Contributors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+# in compliance with the License. You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software distributed under the License
+# is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied. See the License for the specific language governing permissions and limitations under
+# the License.
+# =============================================================================
+#
+# Phase-5 Quent attribution pass: phase5_host_pinned.yaml with telemetry enabled. NEVER used in a
+# timing cell -- Quent's per-event write cost on the timed path is unmeasured, so telemetry stays
+# off wherever a number will be quoted. This pass runs the LIMIT queries in both arms with labels
+# phase5_<cell>_<qN>_<arm>_<iter> (phase5_quent_attribution.sh) purely for operator-level triage
+# of any flagged regression and for the Q18/Q2 mechanism narrative. When triaging the from-disk
+# cell, replace the host-pool block with the one from phase5_from_disk.yaml so the attribution
+# pass sees the same memory conditions as the cell it explains.
+sirius:
+  topology:
+    num_gpus: 1
+  memory:
+    gpu:
+      usage_limit_fraction: 0.9
+      reservation_limit_fraction: 1.0
+      downgrade_trigger_fraction: 0.8
+      downgrade_stop_fraction: 0.6
+    host:
+      capacity_bytes: 471200000000       # ~471 GB
+      initial_number_pools: 785
+      pool_size: 512
+      block_size: 1048576                # 1 MB
+  executor:
+    pipeline:
+      num_threads: 4
+    downgrade:
+      num_threads: 1
+    task_creator:
+      num_threads: 6
+  operator_params:
+    scan_task_batch_size: 5368709120       # 5 GB
+    max_sort_partition_bytes: 0            # 0 = auto (33% GPU memory)
+    hash_partition_bytes: 5368709120       # 5 GB
+    concat_batch_bytes: 5368709120         # 5 GB
+  telemetry:
+    enable_quent: true
+    exporter: postcard
+    output_directory: telemetry_data
+    engine_name: siriusDB

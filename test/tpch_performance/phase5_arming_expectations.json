@@ -1,0 +1,591 @@
+{
+  "calibrated": "2026-08-15T00:54:00",
+  "commit": "544ab619d209344f372e9ecb867fd29589c485cf",
+  "forecast_check": {
+    "q1": "MATCH: expected untouched (no producers eligible); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
+    "q10": "MISMATCH: expected row producer eligible, self-consumption only (no external targets/sites); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
+    "q11": "MATCH: expected untouched (no producers eligible); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
+    "q12": "MATCH: expected untouched (no producers eligible); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
+    "q13": "MATCH: expected untouched (no producers eligible); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
+    "q14": "MATCH: expected untouched (no producers eligible); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
+    "q15": "MATCH: expected untouched (no producers eligible); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
+    "q16": "MATCH: expected untouched (no producers eligible); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
+    "q17": "MATCH: expected untouched (no producers eligible); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
+    "q18": "MATCH: expected group producer armed; observed row_eligible=2, group_eligible=2, external_targets_sites=0",
+    "q19": "MATCH: expected untouched (no producers eligible); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
+    "q2": "MATCH: expected row producer eligible; observed row_eligible=2, group_eligible=0, external_targets_sites=2",
+    "q20": "MATCH: expected untouched (no producers eligible); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
+    "q21": "MATCH: expected row producer eligible, self-consumption only (no external targets/sites); observed row_eligible=2, group_eligible=0, external_targets_sites=0",
+    "q22": "MATCH: expected untouched (no producers eligible); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
+    "q3": "MISMATCH: expected row producer eligible, self-consumption only (no external targets/sites); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
+    "q4": "MATCH: expected untouched (no producers eligible); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
+    "q5": "MATCH: expected untouched (no producers eligible); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
+    "q6": "MATCH: expected untouched (no producers eligible); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
+    "q7": "MATCH: expected untouched (no producers eligible); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
+    "q8": "MATCH: expected untouched (no producers eligible); observed row_eligible=0, group_eligible=0, external_targets_sites=0",
+    "q9": "MATCH: expected untouched (no producers eligible); observed row_eligible=0, group_eligible=0, external_targets_sites=0"
+  },
+  "input": "/localhome/local-kkristensen/code/sirius_2/test_datasets/tpch_parquet_sf1",
+  "option": "enable_top_n_dynamic_filter",
+  "queries": {
+    "q1": {
+      "off": {
+        "zero_prefix": [
+          "top_n_"
+        ]
+      },
+      "on": {
+        "exact": {
+          "top_n_first_key_endpoint_sites_placed": 0,
+          "top_n_first_key_scan_targets": 0,
+          "top_n_first_key_subsumed_by_lex": 0,
+          "top_n_group_producers_eligible": 0,
+          "top_n_group_producers_rejected": 0,
+          "top_n_lex_endpoint_sites_placed": 0,
+          "top_n_lex_scan_targets": 0,
+          "top_n_producers_eligible": 0,
+          "top_n_producers_first_key_only": 0,
+          "top_n_producers_rejected": 0,
+          "top_n_sites_skipped_no_work_saved": 0
+        },
+        "zero_prefix": [
+          "top_n_"
+        ]
+      }
+    },
+    "q10": {
+      "off": {
+        "zero_prefix": [
+          "top_n_"
+        ]
+      },
+      "on": {
+        "exact": {
+          "top_n_first_key_endpoint_sites_placed": 0,
+          "top_n_first_key_scan_targets": 0,
+          "top_n_first_key_subsumed_by_lex": 0,
+          "top_n_group_producers_eligible": 0,
+          "top_n_group_producers_rejected": 2,
+          "top_n_lex_endpoint_sites_placed": 0,
+          "top_n_lex_scan_targets": 0,
+          "top_n_producers_eligible": 0,
+          "top_n_producers_first_key_only": 0,
+          "top_n_producers_rejected": 2,
+          "top_n_sites_skipped_no_work_saved": 0
+        }
+      }
+    },
+    "q11": {
+      "off": {
+        "zero_prefix": [
+          "top_n_"
+        ]
+      },
+      "on": {
+        "exact": {
+          "top_n_first_key_endpoint_sites_placed": 0,
+          "top_n_first_key_scan_targets": 0,
+          "top_n_first_key_subsumed_by_lex": 0,
+          "top_n_group_producers_eligible": 0,
+          "top_n_group_producers_rejected": 0,
+          "top_n_lex_endpoint_sites_placed": 0,
+          "top_n_lex_scan_targets": 0,
+          "top_n_producers_eligible": 0,
+          "top_n_producers_first_key_only": 0,
+          "top_n_producers_rejected": 0,
+          "top_n_sites_skipped_no_work_saved": 0
+        },
+        "zero_prefix": [
+          "top_n_"
+        ]
+      }
+    },
+    "q12": {
+      "off": {
+        "zero_prefix": [
+          "top_n_"
+        ]
+      },
+      "on": {
+        "exact": {
+          "top_n_first_key_endpoint_sites_placed": 0,
+          "top_n_first_key_scan_targets": 0,
+          "top_n_first_key_subsumed_by_lex": 0,
+          "top_n_group_producers_eligible": 0,
+          "top_n_group_producers_rejected": 0,
+          "top_n_lex_endpoint_sites_placed": 0,
+          "top_n_lex_scan_targets": 0,
+          "top_n_producers_eligible": 0,
+          "top_n_producers_first_key_only": 0,
+          "top_n_producers_rejected": 0,
+          "top_n_sites_skipped_no_work_saved": 0
+        },
+        "zero_prefix": [
+          "top_n_"
+        ]
+      }
+    },
+    "q13": {
+      "off": {
+        "zero_prefix": [
+          "top_n_"
+        ]
+      },
+      "on": {
+        "exact": {
+          "top_n_first_key_endpoint_sites_placed": 0,
+          "top_n_first_key_scan_targets": 0,
+          "top_n_first_key_subsumed_by_lex": 0,
+          "top_n_group_producers_eligible": 0,
+          "top_n_group_producers_rejected": 0,
+          "top_n_lex_endpoint_sites_placed": 0,
+          "top_n_lex_scan_targets": 0,
+          "top_n_producers_eligible": 0,
+          "top_n_producers_first_key_only": 0,
+          "top_n_producers_rejected": 0,
+          "top_n_sites_skipped_no_work_saved": 0
+        },
+        "zero_prefix": [
+          "top_n_"
+        ]
+      }
+    },
+    "q14": {
+      "off": {
+        "zero_prefix": [
+          "top_n_"
+        ]
+      },
+      "on": {
+        "exact": {
+          "top_n_first_key_endpoint_sites_placed": 0,
+          "top_n_first_key_scan_targets": 0,
+          "top_n_first_key_subsumed_by_lex": 0,
+          "top_n_group_producers_eligible": 0,
+          "top_n_group_producers_rejected": 0,
+          "top_n_lex_endpoint_sites_placed": 0,
+          "top_n_lex_scan_targets": 0,
+          "top_n_producers_eligible": 0,
+          "top_n_producers_first_key_only": 0,
+          "top_n_producers_rejected": 0,
+          "top_n_sites_skipped_no_work_saved": 0
+        },
+        "zero_prefix": [
+          "top_n_"
+        ]
+      }
+    },
+    "q15": {
+      "off": {
+        "zero_prefix": [
+          "top_n_"
+        ]
+      },
+      "on": {
+        "exact": {
+          "top_n_first_key_endpoint_sites_placed": 0,
+          "top_n_first_key_scan_targets": 0,
+          "top_n_first_key_subsumed_by_lex": 0,
+          "top_n_group_producers_eligible": 0,
+          "top_n_group_producers_rejected": 0,
+          "top_n_lex_endpoint_sites_placed": 0,
+          "top_n_lex_scan_targets": 0,
+          "top_n_producers_eligible": 0,
+          "top_n_producers_first_key_only": 0,
+          "top_n_producers_rejected": 0,
+          "top_n_sites_skipped_no_work_saved": 0
+        },
+        "zero_prefix": [
+          "top_n_"
+        ]
+      }
+    },
+    "q16": {
+      "off": {
+        "zero_prefix": [
+          "top_n_"
+        ]
+      },
+      "on": {
+        "exact": {
+          "top_n_first_key_endpoint_sites_placed": 0,
+          "top_n_first_key_scan_targets": 0,
+          "top_n_first_key_subsumed_by_lex": 0,
+          "top_n_group_producers_eligible": 0,
+          "top_n_group_producers_rejected": 0,
+          "top_n_lex_endpoint_sites_placed": 0,
+          "top_n_lex_scan_targets": 0,
+          "top_n_producers_eligible": 0,
+          "top_n_producers_first_key_only": 0,
+          "top_n_producers_rejected": 0,
+          "top_n_sites_skipped_no_work_saved": 0
+        },
+        "zero_prefix": [
+          "top_n_"
+        ]
+      }
+    },
+    "q17": {
+      "off": {
+        "zero_prefix": [
+          "top_n_"
+        ]
+      },
+      "on": {
+        "exact": {
+          "top_n_first_key_endpoint_sites_placed": 0,
+          "top_n_first_key_scan_targets": 0,
+          "top_n_first_key_subsumed_by_lex": 0,
+          "top_n_group_producers_eligible": 0,
+          "top_n_group_producers_rejected": 0,
+          "top_n_lex_endpoint_sites_placed": 0,
+          "top_n_lex_scan_targets": 0,
+          "top_n_producers_eligible": 0,
+          "top_n_producers_first_key_only": 0,
+          "top_n_producers_rejected": 0,
+          "top_n_sites_skipped_no_work_saved": 0
+        },
+        "zero_prefix": [
+          "top_n_"
+        ]
+      }
+    },
+    "q18": {
+      "off": {
+        "zero_prefix": [
+          "top_n_"
+        ]
+      },
+      "on": {
+        "cell_nonzero": [
+          "top_n_group_offers"
+        ],
+        "direction_only": [
+          "top_n_group_offers"
+        ],
+        "exact": {
+          "top_n_first_key_endpoint_sites_placed": 0,
+          "top_n_first_key_scan_targets": 0,
+          "top_n_first_key_subsumed_by_lex": 0,
+          "top_n_group_producers_eligible": 2,
+          "top_n_group_producers_rejected": 0,
+          "top_n_lex_endpoint_sites_placed": 0,
+          "top_n_lex_scan_targets": 0,
+          "top_n_producers_eligible": 2,
+          "top_n_producers_first_key_only": 0,
+          "top_n_producers_rejected": 0,
+          "top_n_sites_skipped_no_work_saved": 8
+        }
+      }
+    },
+    "q19": {
+      "off": {
+        "zero_prefix": [
+          "top_n_"
+        ]
+      },
+      "on": {
+        "exact": {
+          "top_n_first_key_endpoint_sites_placed": 0,
+          "top_n_first_key_scan_targets": 0,
+          "top_n_first_key_subsumed_by_lex": 0,
+          "top_n_group_producers_eligible": 0,
+          "top_n_group_producers_rejected": 0,
+          "top_n_lex_endpoint_sites_placed": 0,
+          "top_n_lex_scan_targets": 0,
+          "top_n_producers_eligible": 0,
+          "top_n_producers_first_key_only": 0,
+          "top_n_producers_rejected": 0,
+          "top_n_sites_skipped_no_work_saved": 0
+        },
+        "zero_prefix": [
+          "top_n_"
+        ]
+      }
+    },
+    "q2": {
+      "off": {
+        "zero_prefix": [
+          "top_n_"
+        ]
+      },
+      "on": {
+        "cell_nonzero": [
+          "top_n_offers"
+        ],
+        "direction_only": [
+          "top_n_first_key_filters_pushed",
+          "top_n_offers",
+          "top_n_revisions_published"
+        ],
+        "exact": {
+          "top_n_first_key_endpoint_sites_placed": 2,
+          "top_n_first_key_scan_targets": 0,
+          "top_n_first_key_subsumed_by_lex": 0,
+          "top_n_group_producers_eligible": 0,
+          "top_n_group_producers_rejected": 0,
+          "top_n_lex_endpoint_sites_placed": 0,
+          "top_n_lex_scan_targets": 0,
+          "top_n_producers_eligible": 2,
+          "top_n_producers_first_key_only": 2,
+          "top_n_producers_rejected": 0,
+          "top_n_sites_skipped_no_work_saved": 0
+        }
+      }
+    },
+    "q20": {
+      "off": {
+        "zero_prefix": [
+          "top_n_"
+        ]
+      },
+      "on": {
+        "exact": {
+          "top_n_first_key_endpoint_sites_placed": 0,
+          "top_n_first_key_scan_targets": 0,
+          "top_n_first_key_subsumed_by_lex": 0,
+          "top_n_group_producers_eligible": 0,
+          "top_n_group_producers_rejected": 0,
+          "top_n_lex_endpoint_sites_placed": 0,
+          "top_n_lex_scan_targets": 0,
+          "top_n_producers_eligible": 0,
+          "top_n_producers_first_key_only": 0,
+          "top_n_producers_rejected": 0,
+          "top_n_sites_skipped_no_work_saved": 0
+        },
+        "zero_prefix": [
+          "top_n_"
+        ]
+      }
+    },
+    "q21": {
+      "off": {
+        "zero_prefix": [
+          "top_n_"
+        ]
+      },
+      "on": {
+        "cell_nonzero": [
+          "top_n_offers"
+        ],
+        "direction_only": [
+          "top_n_offers"
+        ],
+        "exact": {
+          "top_n_first_key_endpoint_sites_placed": 0,
+          "top_n_first_key_scan_targets": 0,
+          "top_n_first_key_subsumed_by_lex": 0,
+          "top_n_group_producers_eligible": 0,
+          "top_n_group_producers_rejected": 2,
+          "top_n_lex_endpoint_sites_placed": 0,
+          "top_n_lex_scan_targets": 0,
+          "top_n_producers_eligible": 2,
+          "top_n_producers_first_key_only": 2,
+          "top_n_producers_rejected": 0,
+          "top_n_sites_skipped_no_work_saved": 2
+        }
+      }
+    },
+    "q22": {
+      "off": {
+        "zero_prefix": [
+          "top_n_"
+        ]
+      },
+      "on": {
+        "exact": {
+          "top_n_first_key_endpoint_sites_placed": 0,
+          "top_n_first_key_scan_targets": 0,
+          "top_n_first_key_subsumed_by_lex": 0,
+          "top_n_group_producers_eligible": 0,
+          "top_n_group_producers_rejected": 0,
+          "top_n_lex_endpoint_sites_placed": 0,
+          "top_n_lex_scan_targets": 0,
+          "top_n_producers_eligible": 0,
+          "top_n_producers_first_key_only": 0,
+          "top_n_producers_rejected": 0,
+          "top_n_sites_skipped_no_work_saved": 0
+        },
+        "zero_prefix": [
+          "top_n_"
+        ]
+      }
+    },
+    "q3": {
+      "off": {
+        "zero_prefix": [
+          "top_n_"
+        ]
+      },
+      "on": {
+        "exact": {
+          "top_n_first_key_endpoint_sites_placed": 0,
+          "top_n_first_key_scan_targets": 0,
+          "top_n_first_key_subsumed_by_lex": 0,
+          "top_n_group_producers_eligible": 0,
+          "top_n_group_producers_rejected": 2,
+          "top_n_lex_endpoint_sites_placed": 0,
+          "top_n_lex_scan_targets": 0,
+          "top_n_producers_eligible": 0,
+          "top_n_producers_first_key_only": 0,
+          "top_n_producers_rejected": 2,
+          "top_n_sites_skipped_no_work_saved": 0
+        }
+      }
+    },
+    "q4": {
+      "off": {
+        "zero_prefix": [
+          "top_n_"
+        ]
+      },
+      "on": {
+        "exact": {
+          "top_n_first_key_endpoint_sites_placed": 0,
+          "top_n_first_key_scan_targets": 0,
+          "top_n_first_key_subsumed_by_lex": 0,
+          "top_n_group_producers_eligible": 0,
+          "top_n_group_producers_rejected": 0,
+          "top_n_lex_endpoint_sites_placed": 0,
+          "top_n_lex_scan_targets": 0,
+          "top_n_producers_eligible": 0,
+          "top_n_producers_first_key_only": 0,
+          "top_n_producers_rejected": 0,
+          "top_n_sites_skipped_no_work_saved": 0
+        },
+        "zero_prefix": [
+          "top_n_"
+        ]
+      }
+    },
+    "q5": {
+      "off": {
+        "zero_prefix": [
+          "top_n_"
+        ]
+      },
+      "on": {
+        "exact": {
+          "top_n_first_key_endpoint_sites_placed": 0,
+          "top_n_first_key_scan_targets": 0,
+          "top_n_first_key_subsumed_by_lex": 0,
+          "top_n_group_producers_eligible": 0,
+          "top_n_group_producers_rejected": 0,
+          "top_n_lex_endpoint_sites_placed": 0,
+          "top_n_lex_scan_targets": 0,
+          "top_n_producers_eligible": 0,
+          "top_n_producers_first_key_only": 0,
+          "top_n_producers_rejected": 0,
+          "top_n_sites_skipped_no_work_saved": 0
+        },
+        "zero_prefix": [
+          "top_n_"
+        ]
+      }
+    },
+    "q6": {
+      "off": {
+        "zero_prefix": [
+          "top_n_"
+        ]
+      },
+      "on": {
+        "exact": {
+          "top_n_first_key_endpoint_sites_placed": 0,
+          "top_n_first_key_scan_targets": 0,
+          "top_n_first_key_subsumed_by_lex": 0,
+          "top_n_group_producers_eligible": 0,
+          "top_n_group_producers_rejected": 0,
+          "top_n_lex_endpoint_sites_placed": 0,
+          "top_n_lex_scan_targets": 0,
+          "top_n_producers_eligible": 0,
+          "top_n_producers_first_key_only": 0,
+          "top_n_producers_rejected": 0,
+          "top_n_sites_skipped_no_work_saved": 0
+        },
+        "zero_prefix": [
+          "top_n_"
+        ]
+      }
+    },
+    "q7": {
+      "off": {
+        "zero_prefix": [
+          "top_n_"
+        ]
+      },
+      "on": {
+        "exact": {
+          "top_n_first_key_endpoint_sites_placed": 0,
+          "top_n_first_key_scan_targets": 0,
+          "top_n_first_key_subsumed_by_lex": 0,
+          "top_n_group_producers_eligible": 0,
+          "top_n_group_producers_rejected": 0,
+          "top_n_lex_endpoint_sites_placed": 0,
+          "top_n_lex_scan_targets": 0,
+          "top_n_producers_eligible": 0,
+          "top_n_producers_first_key_only": 0,
+          "top_n_producers_rejected": 0,
+          "top_n_sites_skipped_no_work_saved": 0
+        },
+        "zero_prefix": [
+          "top_n_"
+        ]
+      }
+    },
+    "q8": {
+      "off": {
+        "zero_prefix": [
+          "top_n_"
+        ]
+      },
+      "on": {
+        "exact": {
+          "top_n_first_key_endpoint_sites_placed": 0,
+          "top_n_first_key_scan_targets": 0,
+          "top_n_first_key_subsumed_by_lex": 0,
+          "top_n_group_producers_eligible": 0,
+          "top_n_group_producers_rejected": 0,
+          "top_n_lex_endpoint_sites_placed": 0,
+          "top_n_lex_scan_targets": 0,
+          "top_n_producers_eligible": 0,
+          "top_n_producers_first_key_only": 0,
+          "top_n_producers_rejected": 0,
+          "top_n_sites_skipped_no_work_saved": 0
+        },
+        "zero_prefix": [
+          "top_n_"
+        ]
+      }
+    },
+    "q9": {
+      "off": {
+        "zero_prefix": [
+          "top_n_"
+        ]
+      },
+      "on": {
+        "exact": {
+          "top_n_first_key_endpoint_sites_placed": 0,
+          "top_n_first_key_scan_targets": 0,
+          "top_n_first_key_subsumed_by_lex": 0,
+          "top_n_group_producers_eligible": 0,
+          "top_n_group_producers_rejected": 0,
+          "top_n_lex_endpoint_sites_placed": 0,
+          "top_n_lex_scan_targets": 0,
+          "top_n_producers_eligible": 0,
+          "top_n_producers_first_key_only": 0,
+          "top_n_producers_rejected": 0,
+          "top_n_sites_skipped_no_work_saved": 0
+        },
+        "zero_prefix": [
+          "top_n_"
+        ]
+      }
+    }
+  },
+  "reps": 3,
+  "scale_factor": 1.0,
+  "schema_version": 1,
+  "warnings": []
+}

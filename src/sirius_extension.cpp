@@ -90,6 +90,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/connection_manager.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "op/dynamic_filter/dynamic_filter_stats.hpp"
 #include "op/scan/duckdb_mvcc_visibility.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
@@ -1536,6 +1537,61 @@ static void SiriusSetQueryLabelFunction(ClientContext& context,
   data.finished = true;
 }
 
+// Per-execution cursor for sirius_dynamic_filter_stats(). Execution state lives in the global
+// state (not the bind data) so a reused prepared statement re-emits the rows on every execute.
+struct SiriusDynamicFilterStatsState : public GlobalTableFunctionState {
+  bool finished = false;
+};
+
+static unique_ptr<FunctionData> SiriusDynamicFilterStatsBind(ClientContext& context,
+                                                             TableFunctionBindInput& input,
+                                                             vector<LogicalType>& return_types,
+                                                             vector<string>& names)
+{
+  return_types.emplace_back(LogicalType::VARCHAR);
+  names.emplace_back("name");
+  return_types.emplace_back(LogicalType::UBIGINT);
+  names.emplace_back("value");
+  return make_uniq<TableFunctionData>();
+}
+
+static unique_ptr<GlobalTableFunctionState> SiriusDynamicFilterStatsInit(
+  ClientContext& context, TableFunctionInitInput& input)
+{
+  return make_uniq<SiriusDynamicFilterStatsState>();
+}
+
+// Read-only SQL surface over SiriusContext::get_dynamic_filter_stats_snapshot(): one
+// (name, value) row per dynamic_filter_stats_snapshot field, enumerated by
+// sirius::op::for_each_field so the row set tracks the snapshot definition. Benchmark runners
+// (test/tpch_performance/performance_test.py --mode ab) read counter deltas through this function
+// to assert per-query dynamic-filter arming without an in-process handle on the SiriusContext.
+static void SiriusDynamicFilterStatsFunction(ClientContext& context,
+                                             TableFunctionInput& data_p,
+                                             DataChunk& output)
+{
+  auto& state = data_p.global_state->Cast<SiriusDynamicFilterStatsState>();
+  if (state.finished) { return; }
+
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw InvalidInputException(
+      "sirius_dynamic_filter_stats requires the Sirius context to be initialized");
+  }
+  auto const snapshot = sirius_ctx->get_dynamic_filter_stats_snapshot();
+
+  static_assert(sirius::op::dynamic_filter_stats_field_count <= STANDARD_VECTOR_SIZE,
+                "snapshot no longer fits one DataChunk; emit it in slices");
+  idx_t row = 0;
+  sirius::op::for_each_field(snapshot, [&](const char* name, std::uint64_t value) {
+    output.SetValue(0, row, Value(name));
+    output.SetValue(1, row, Value::UBIGINT(value));
+    ++row;
+  });
+  output.SetCardinality(row);
+  state.finished = true;
+}
+
 void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 {
   auto transaction = CatalogTransaction::GetSystemTransaction(instance);
@@ -1585,6 +1641,14 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                                 SiriusSetQueryLabelBind);
   CreateTableFunctionInfo set_query_label_info(set_query_label);
   catalog.CreateTableFunction(transaction, set_query_label_info);
+
+  TableFunction dynamic_filter_stats("sirius_dynamic_filter_stats",
+                                     {},
+                                     SiriusDynamicFilterStatsFunction,
+                                     SiriusDynamicFilterStatsBind,
+                                     SiriusDynamicFilterStatsInit);
+  CreateTableFunctionInfo dynamic_filter_stats_info(dynamic_filter_stats);
+  catalog.CreateTableFunction(transaction, dynamic_filter_stats_info);
 
   // Profiler control functions for nsys --capture-range=cudaProfilerApi
   TableFunction profiler_start(
