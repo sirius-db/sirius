@@ -22,6 +22,7 @@
 #include "op/scan/batch_coalescer.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
+#include "query_id.hpp"
 #include "scan_manager/balancing_strategy.hpp"
 #include "scan_manager/mvcc_chunk_mask.hpp"
 #include "scan_manager/split_connector.hpp"
@@ -32,6 +33,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <stop_token>
 
 namespace sirius::late_mat {
@@ -136,7 +138,11 @@ class load_balancing_scan_batch_coalescer {
     bool row_filter_pending{false};
   };
 
-  load_balancing_scan_batch_coalescer()                                           = default;
+  load_balancing_scan_batch_coalescer() = default;
+  /// @p query_id is stamped onto every fadvise this sequencer issues, so the
+  /// prefetching cache can scope the requests to the owning query's live
+  /// epoch (F3) and interleave them fairly against other queries (F4).
+  explicit load_balancing_scan_batch_coalescer(sirius::query_id_t query_id) : _query_id(query_id) {}
   load_balancing_scan_batch_coalescer(load_balancing_scan_batch_coalescer const&) = delete;
   load_balancing_scan_batch_coalescer& operator=(load_balancing_scan_batch_coalescer const&) =
     delete;
@@ -163,10 +169,13 @@ class load_balancing_scan_batch_coalescer {
   /// an unclosed connector is a silent query hang). Static and public so the
   /// drain behavior is unit-testable against a fake provider; production use
   /// is the sequencer's cached-slot path.
+  /// @p query_id (when present) is forwarded to the insert-delta splits'
+  /// fadvise calls, scoping them to the owning query in the prefetch cache.
   static void drain_cached_provider(databatch_provider& provider,
                                     split_connector& connector,
                                     std::stop_token const& stop,
-                                    bool row_filter_pending);
+                                    bool row_filter_pending,
+                                    std::optional<sirius::query_id_t> query_id = {});
 
   /// Spawn the sequencer task on @p dispatcher.  The dispatcher must
   /// expose @c enqueue(callable) and inject a @c std::stop_token when
@@ -192,6 +201,10 @@ class load_balancing_scan_batch_coalescer {
   /// and the split-provider bridge lambda shares ownership of its slot.
   std::vector<std::size_t> _pipeline_order;
   std::unordered_map<std::size_t, std::shared_ptr<metadata_processing_state>> _slots;
+  /// The owning query, stamped onto every fadvise (empty for the
+  /// default-constructed test path — the cache falls back to its newest
+  /// epoch, the pre-concurrency behavior).
+  std::optional<sirius::query_id_t> _query_id;
 };
 
 }  // namespace sirius::scan_manager

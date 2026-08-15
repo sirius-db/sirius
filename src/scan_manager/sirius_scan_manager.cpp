@@ -903,16 +903,11 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     reset(query_id);
   }
 
-  // KNOWN GAP under concurrent queries: the prefetch cache's query epoch is a single GLOBAL
-  // generation counter (prefetching_cache::_ticker, bumped in
-  // prefetching_cache::prepare_for_query, src/io/cache/prefetching_cache.cpp).
-  // chunk_lifecycle::eviction_tier(query_tick) (src/include/io/cache/types.hpp) scores every
-  // chunk whose tick is older than the newest as tier 0 — evict first — so a second query
-  // starting here demotes all of the first query's prefetched-but-unconsumed chunks to the
-  // front of the eviction order. Performance only, never correctness: mark_evicting()
-  // succeeds only at pin == 0, so a chunk a live reader holds cannot be reclaimed; the query
-  // just re-reads on a miss. The fix belongs in prefetching_cache (track the set of live
-  // epochs rather than newest-wins), not here.
+  // The prefetch cache tracks the set of LIVE query epochs (F3): prepare_for_query mints this
+  // query's epoch, and the matching finish_query in reset(query_id) retires it. Chunk scoring
+  // uses the OLDEST live epoch as the staleness bar, so a second query starting here no longer
+  // demotes the first query's prefetched-but-unconsumed chunks (the old single-ticker
+  // newest-wins gap). See query_epoch_tracker in src/include/io/cache/query_epoch_tracker.hpp.
   if (_io_ctx && _io_ctx->cache()) {
     SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _io_ctx->cache()->summary());
     _io_ctx->cache()->prepare_for_query(query);
@@ -921,7 +916,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   // Routed ioctxs (e.g. the restful context serving s3://) are built lazily and
   // reused across queries; advance their caches to this query too, or a routed
   // cache's epoch freezes at build time and a later query serves the prior
-  // query's cached chunks as current. Same global-epoch caveat as above.
+  // query's cached chunks as current. Same live-epoch model as above.
   {
     std::lock_guard lk{_routed_io_ctxs_mtx};
     for (auto& [type, io_ctx] : _routed_io_ctxs) {
@@ -938,7 +933,10 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   // pending queue and the pool, not by a per-query cap.
   state->dispatcher =
     std::make_unique<exec::scoped_dispatcher>(_thread_pool, _thread_pool.num_threads());
-  state->metadata_processor = std::make_unique<load_balancing_scan_batch_coalescer>();
+  // The query id rides every fadvise the sequencer issues, so the prefetch cache can stamp the
+  // requests with THIS query's live epoch and round-robin them fairly against other queries.
+  state->metadata_processor =
+    std::make_unique<load_balancing_scan_batch_coalescer>(query.query_id());
 
   std::vector<cached_assignment> cached_assignments;
   for (auto const& scan_op : query.get_scan_operators()) {
@@ -1364,9 +1362,14 @@ void sirius_scan_manager::reset(sirius::query_id_t query_id)
   {
     std::lock_guard lk{_query_states_mutex};
     auto it = _query_states.find(query_id);
-    if (it == _query_states.end()) { return; }  // already reset, or never registered
-    state = std::move(it->second);
-    _query_states.erase(it);
+    if (it != _query_states.end()) {
+      state = std::move(it->second);
+      _query_states.erase(it);
+    }
+    // A missing entry means already reset, or never registered (a query with no GPU scans
+    // deliberately skips registration). The prefetch-cache epoch below is still retired
+    // either way: prepare_for_query mints it BEFORE the scan-state registration, so it can
+    // exist without a state.
   }
   // Outside the lock on purpose: draining waits out this query's in-flight reads, which can
   // take as long as the slowest outstanding IO. Holding _query_states_mutex across it would
@@ -1377,7 +1380,20 @@ void sirius_scan_manager::reset(sirius::query_id_t query_id)
   // a task still running is a use-after-free (scoped_dispatcher's dtor asserts on it).
   // ~query_scan_manager_state then runs: dispatcher (already idle) first, then the coalescer,
   // then the providers.
-  state->drain();
+  if (state) { state->drain(); }
+
+  // Retire the query's prefetch-cache epoch AFTER the drain (its in-flight reads are done), on
+  // the default cache and every routed one — mirroring the prepare_for_query priming. Chunks
+  // only this query wanted drop to eviction tier 0; chunks a live peer also requested stay
+  // protected (union semantics in chunk_lifecycle::on_request). Idempotent, so the
+  // stale-state replacement path (prepare_for_query calling reset on a duplicate id) is safe.
+  if (_io_ctx && _io_ctx->cache()) { _io_ctx->cache()->finish_query(query_id); }
+  {
+    std::lock_guard lk{_routed_io_ctxs_mtx};
+    for (auto& [type, io_ctx] : _routed_io_ctxs) {
+      if (io_ctx && io_ctx->cache()) { io_ctx->cache()->finish_query(query_id); }
+    }
+  }
 }
 
 void sirius_scan_manager::reset_all()

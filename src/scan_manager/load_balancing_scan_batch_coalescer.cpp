@@ -94,7 +94,7 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
   auto& batch_queue = state.queue;
 
   // Balance one coalesced batch onto a GPU and hand it to the connector.
-  auto emit = [&state](std::unique_ptr<op::scan::scan_info> batch) {
+  auto emit = [&state, this](std::unique_ptr<op::scan::scan_info> batch) {
     auto op_data = std::make_unique<op::scan::scan_operator_input>(std::move(batch));
     auto dev_id  = state.balancer->get_next_gpu(state.pipeline_id, op_data.get());
     if (dev_id.has_value() && *dev_id >= 0) { op_data->set_preferred_device_id(dev_id.value()); }
@@ -103,7 +103,7 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
     if (!fadvise_hints.empty()) {
       for (auto& hint : fadvise_hints) {
         if (hint.datasource && !hint.ranges.empty()) {
-          hint.datasource->fadvise(hint.ranges, dev_id);
+          hint.datasource->fadvise(hint.ranges, dev_id, _query_id);
         }
       }
     }
@@ -165,13 +165,16 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
 void load_balancing_scan_batch_coalescer::process_cached_entries(metadata_processing_state& state,
                                                                  std::stop_token const& stop)
 {
-  drain_cached_provider(*state.batch_provider, *state.connector, stop, state.row_filter_pending);
+  drain_cached_provider(
+    *state.batch_provider, *state.connector, stop, state.row_filter_pending, _query_id);
 }
 
-void load_balancing_scan_batch_coalescer::drain_cached_provider(databatch_provider& provider,
-                                                                split_connector& connector,
-                                                                std::stop_token const& stop,
-                                                                bool row_filter_pending)
+void load_balancing_scan_batch_coalescer::drain_cached_provider(
+  databatch_provider& provider,
+  split_connector& connector,
+  std::stop_token const& stop,
+  bool row_filter_pending,
+  std::optional<sirius::query_id_t> query_id)
 {
   try {
     while (!stop.stop_requested()) {
@@ -201,7 +204,7 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(databatch_provid
         auto fadvise_hints = split->get_fadvise_hints();
         for (auto& hint : fadvise_hints) {
           if (hint.datasource && !hint.ranges.empty()) {
-            hint.datasource->fadvise(hint.ranges, device);
+            hint.datasource->fadvise(hint.ranges, device, query_id);
           }
         }
         split->prefetch(io::cache::prefetching_stage::opportunistic);

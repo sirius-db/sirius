@@ -132,7 +132,15 @@ class sirius_datasource : public cudf::io::datasource {
   /// already stored emits a warning: the datasource lifecycle expects one
   /// speculative-or-immediate insert per scan, with a single
   /// @c disposable call at consume time.
-  void fadvise(std::span<const cudf::io::text::byte_range_info> ranges, std::optional<int> dev_id);
+  ///
+  /// @p query_id identifies the REQUESTING query so the prefetching cache can
+  /// stamp the request with that query's live epoch (its eviction-protection
+  /// scope, F3) and interleave it fairly against other queries' requests
+  /// (F4).  Callers with no query context may omit it — the cache then stamps
+  /// the newest epoch, the pre-concurrency behavior.
+  void fadvise(std::span<const cudf::io::text::byte_range_info> ranges,
+               std::optional<int> dev_id,
+               std::optional<sirius::query_id_t> query_id = {});
 
   void prefetch(cache::prefetching_stage site);
 

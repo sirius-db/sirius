@@ -356,7 +356,17 @@ struct alignas(64) chunk_lifecycle {
     return (uint64_t(tick) << TICK_SHIFT) | (uint64_t(reads) << READ_SHIFT) | uint64_t(inserts);
   }
 
-  void on_request(uint32_t query_tick) noexcept
+  /// Record one prefetch request for this chunk.
+  ///
+  /// @p query_tick is the requesting query's epoch; @p min_live_tick is the
+  /// staleness bar — the oldest LIVE query epoch (see query_epoch_tracker).
+  /// The counters are reset only when the chunk's stamped tick is older than
+  /// the bar, i.e. no live query can still be counting on them.  While ANY
+  /// live query wants the chunk the semantics are a union: the tick advances
+  /// to the newest requester and the insert count accumulates, so a second
+  /// query touching a shared chunk never erases the first query's outstanding
+  /// demand (concurrency issue F3's shared-chunk half).
+  void on_request(uint32_t query_tick, uint32_t min_live_tick) noexcept
   {
     uint64_t cur = packed.load(std::memory_order_relaxed);
     for (;;) {
@@ -365,14 +375,17 @@ struct alignas(64) chunk_lifecycle {
       auto cur_inserts = uint16_t(cur & INSERT_MASK);
 
       uint64_t next;
-      if (query_tick > cur_tick) {
-        // New query — reset counters to reflect just this insert.
+      if (cur_tick < min_live_tick && cur_tick < query_tick) {
+        // The recorded counters belong to retired epochs only — reset them
+        // to reflect just this insert.
         next = pack(query_tick, 0, 1);
       } else {
-        // Same tick (or stale tick — treat as same). Increment inserts,
-        // saturate at uint16 max to avoid wrap.
+        // A live query may still be counting on this chunk (or the request
+        // is from the same epoch): accumulate.  Advance the tick to the
+        // newest requester; increment inserts, saturating at uint16 max to
+        // avoid wrap.
         uint16_t new_inserts = cur_inserts == 0xFFFFu ? 0xFFFFu : cur_inserts + 1;
-        next                 = pack(cur_tick, cur_reads, new_inserts);
+        next                 = pack(std::max(cur_tick, query_tick), cur_reads, new_inserts);
       }
 
       if (packed.compare_exchange_weak(
@@ -380,6 +393,11 @@ struct alignas(64) chunk_lifecycle {
         return;
     }
   }
+
+  /// Single-epoch overload: the bar IS the requester's epoch.  Exactly the
+  /// historical newest-wins behavior (reset on a newer tick, accumulate on
+  /// the same tick) — kept for single-epoch callers and tests.
+  void on_request(uint32_t query_tick) noexcept { on_request(query_tick, query_tick); }
 
   void on_consume() noexcept
   {
@@ -404,9 +422,17 @@ struct alignas(64) chunk_lifecycle {
     uint16_t reads;
     uint16_t inserts;
 
-    [[nodiscard]] uint16_t eviction_tier(uint32_t query_tick) const noexcept
+    /// Demand tier for eviction ordering (higher = keep longer).
+    ///
+    /// @p min_live_tick is the staleness bar: pass query_epoch_tracker's
+    /// min_live_epoch(), NOT the newest epoch — a chunk is stale (tier 0,
+    /// evict first) only when its stamped tick is older than EVERY live
+    /// query's epoch.  Scoring against the newest epoch was concurrency
+    /// issue F3: a second query's prepare demoted every chunk the first
+    /// query had prefetched but not yet read.
+    [[nodiscard]] uint16_t eviction_tier(uint32_t min_live_tick) const noexcept
     {
-      return query_tick > tick
+      return min_live_tick > tick
                ? 0
                : (inserts > reads ? std::min<uint16_t>(inserts - reads, FRESH_SCORE) : 0);
     }

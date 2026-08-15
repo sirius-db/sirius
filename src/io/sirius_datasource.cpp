@@ -188,7 +188,8 @@ std::unique_ptr<sirius_datasource> sirius_datasource::duplicate() const
 }
 
 void sirius_datasource::fadvise(std::span<const cudf::io::text::byte_range_info> ranges,
-                                std::optional<int> dev_id)
+                                std::optional<int> dev_id,
+                                std::optional<sirius::query_id_t> query_id)
 {
   auto* cache = _io_ctx->cache();
   if (cache == nullptr || !_io_ctx->can_use_prefetching_cache()) { return; }
@@ -212,7 +213,7 @@ void sirius_datasource::fadvise(std::span<const cudf::io::text::byte_range_info>
   // Hand the ranges to the cache.  insert() returns an empty handle when
   // it didn't enqueue any new work (dormant cache, every range coalesced
   // with an existing entry); we only stash a real handle.
-  auto handle = cache->insert(*_io_object, ranges, dev_id);
+  auto handle = cache->insert(*_io_object, ranges, dev_id, query_id);
   if (handle) { _prefetch_handle = std::move(handle); }
 }
 

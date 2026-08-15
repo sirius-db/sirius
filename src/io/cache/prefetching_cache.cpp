@@ -173,7 +173,7 @@ prefetching_handle::prefetching_handle(std::unique_ptr<prefetch_lifecycle_manage
 prefetching_handle::operator bool() const noexcept { return _state != nullptr; }
 
 std::vector<cached_chunk*> prefetching_cache::file_entry::update_and_get_chunks(
-  std::span<size_t> incoming, uint32_t ticker)
+  std::span<size_t> incoming, uint32_t query_epoch, uint32_t min_live_epoch)
 {
   std::vector<cached_chunk*> result(incoming.size());
 
@@ -191,7 +191,7 @@ std::vector<cached_chunk*> prefetching_cache::file_entry::update_and_get_chunks(
       s                = gallop_lower_bound(s, s_end, off);
 
       if (s != s_end && (*s)->offset == off) {
-        s->get()->lifecycle.on_request(ticker);
+        s->get()->lifecycle.on_request(query_epoch, min_live_epoch);
         result[i] = s->get();  // existing
       } else {
         missing_indices.push_back(i);  // mark for insertion
@@ -223,7 +223,7 @@ std::vector<cached_chunk*> prefetching_cache::file_entry::update_and_get_chunks(
         result[idx] = s->get();  // someone else inserted it
       } else {
         auto chunk = std::make_unique<cached_chunk>(off);
-        chunk->lifecycle.on_request(ticker);
+        chunk->lifecycle.on_request(query_epoch, min_live_epoch);
         result[idx] = chunk.get();  // capture raw ptr before move
         to_insert.push_back(std::move(chunk));
       }
@@ -331,7 +331,8 @@ prefetching_cache::file_entry& prefetching_cache::get_or_create_file_entry(
 
 prefetching_handle prefetching_cache::insert(const sirius_io_object& obj,
                                              std::span<const byte_range> ranges,
-                                             std::optional<int> gpu_id)
+                                             std::optional<int> gpu_id,
+                                             std::optional<sirius::query_id_t> query_id)
 {
   if (!_armed) { return prefetching_handle(nullptr); }
 
@@ -358,10 +359,16 @@ prefetching_handle prefetching_cache::insert(const sirius_io_object& obj,
     }
   }
 
+  // Stamp the request with the REQUESTING query's epoch (falling back to the
+  // newest epoch when the caller carries no query identity), and score the
+  // chunk lifecycles against the oldest live epoch — never reset counters a
+  // live peer is still relying on.  The epoch also serves as the request's
+  // fairness band in the pipeline queues.
+  auto const query_epoch = query_id ? _epochs.epoch_of(*query_id) : _epochs.newest_epoch();
   auto chunks_to_fetch =
-    file.update_and_get_chunks(chunk_offsets, _ticker.load(std::memory_order_relaxed));
+    file.update_and_get_chunks(chunk_offsets, query_epoch, _epochs.min_live_epoch());
 
-  auto work    = std::make_shared<prefetch_request_context>(obj, _ticker.load());
+  auto work    = std::make_shared<prefetch_request_context>(obj, query_epoch);
   work->chunks = std::move(chunks_to_fetch);
   // Resolve the preferred NUMA node for staging buffers from the target GPU's
   // topology; -1 (no preference) when no GPU hint or the GPU is out of scope.
@@ -672,7 +679,10 @@ void prefetching_cache::prepare_for_query(const sirius::planner::query& query) n
 {
   SIRIUS_LOG_TRACE("prefetching_cache: summary of cache performance {}", summary());
 
-  _ticker.fetch_add(1, std::memory_order_relaxed);
+  // Mint the query's live epoch.  The epoch is retired by finish_query at
+  // window cleanup; until then the query's chunks keep their demand-based
+  // eviction tier no matter how many later queries prepare (F3).
+  _epochs.begin_query(query.query_id());
 
   // Snapshot the counters so the next summary() can report this cycle's deltas.
   _last_reported = {
@@ -682,6 +692,11 @@ void prefetching_cache::prepare_for_query(const sirius::planner::query& query) n
     _counters.misses.load(std::memory_order_relaxed),
     _counters.evictions.load(std::memory_order_relaxed),
   };
+}
+
+void prefetching_cache::finish_query(sirius::query_id_t query_id) noexcept
+{
+  _epochs.end_query(query_id);
 }
 
 // ===========================================================================
@@ -858,7 +873,10 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
     size_t const need = _cfg.dispose_after_use ? std::numeric_limits<size_t>::max()
                                                : _pool->total_allocated_chunks() * 0.25;
 
-    auto const query_tick = static_cast<uint32_t>(_ticker.load(std::memory_order_relaxed));
+    // Staleness bar for tiering: the OLDEST live query epoch, not the newest
+    // ticker (F3) — a chunk counts as stale only when no live query can still
+    // be waiting to consume it.
+    auto const query_tick = _epochs.min_live_epoch();
 
     // Pass 1: in a single sweep, histogram the currently-evictable chunks
     // (cached/allocated with pin == 0) by demand tier.  This lets us pick the

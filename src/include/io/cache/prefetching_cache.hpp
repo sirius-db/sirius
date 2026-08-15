@@ -16,16 +16,16 @@
 
 #pragma once
 
-#include "blockingconcurrentqueue.h"
 #include "exec/admission_control.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/semi_future.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/cache/config.hpp"
+#include "io/cache/fair_band_queue.hpp"
+#include "io/cache/query_epoch_tracker.hpp"
 #include "io/cache/types.hpp"
 #include "planner/query.hpp"
-
-#include <concurrentqueue.h>
+#include "query_id.hpp"
 
 #include <atomic>
 #include <cstddef>
@@ -54,8 +54,8 @@ namespace sirius::io::cache {
 enum class prefetching_handle_state { idle, active, cancelled };
 
 struct prefetch_request_context {
-  explicit prefetch_request_context(const sirius_io_object& file, std::uint32_t ts) noexcept
-    : timestamp(ts),
+  explicit prefetch_request_context(const sirius_io_object& file, std::uint32_t epoch) noexcept
+    : query_epoch(epoch),
       obj(file.shared_from_this()),
       state(std::make_shared<entry_state>()),
       user_state(
@@ -75,7 +75,11 @@ struct prefetch_request_context {
            user_state->load(std::memory_order_acquire) == prefetching_handle_state::cancelled;
   }
 
-  const std::uint32_t timestamp;
+  /// The requesting query's cache epoch (query_epoch_tracker::epoch_of at
+  /// insert time).  Doubles as the request's fairness band in the cache's
+  /// pipeline queues — one epoch per live query, so the queues can
+  /// round-robin across queries.
+  const std::uint32_t query_epoch;
   const std::shared_ptr<const sirius_io_object> obj;
   std::shared_ptr<entry_state> state;
   std::shared_ptr<std::atomic<prefetching_handle_state>> user_state;
@@ -83,6 +87,30 @@ struct prefetch_request_context {
   /// Preferred NUMA node for the staging buffers, derived from the requesting
   /// GPU's topology.  -1 means "no preference" (allocate from any arena).
   int preferred_numa{-1};
+};
+
+/// The request queue shared by the cache's preparation / prefetch / evictor
+/// threads.  FIFO within one query's requests, round-robin across queries
+/// (the band is the request's query_epoch), so one query flooding requests
+/// cannot starve another query's first prefetch — concurrency issue F4.
+/// nullptr wake-up sentinels ride @c fair_band_queue::no_band and take part
+/// in the rotation like any other band.
+class prefetch_request_queue {
+ public:
+  using request = std::shared_ptr<prefetch_request_context>;
+
+  void enqueue(request req)
+  {
+    auto const band = req ? req->query_epoch : fair_band_queue<request>::no_band;
+    _queue.enqueue(band, std::move(req));
+  }
+
+  void wait_dequeue(request& out) { _queue.wait_dequeue(out); }
+
+  bool try_dequeue(request& out) { return _queue.try_dequeue(out); }
+
+ private:
+  fair_band_queue<request> _queue;
 };
 
 class prefetching_handle {
@@ -137,7 +165,7 @@ class prefetching_cache {
  public:
   using byte_range         = cudf::io::text::byte_range_info;
   using prefetch_request   = std::shared_ptr<prefetch_request_context>;
-  using request_queue_type = duckdb_moodycamel::BlockingConcurrentQueue<prefetch_request>;
+  using request_queue_type = prefetch_request_queue;
 
   prefetching_cache(cucascade::memory::memory_reservation_manager& reservation_manager,
                     sirius_ioctx* io_ctx,
@@ -175,15 +203,27 @@ class prefetching_cache {
 
   void prepare_for_query(const sirius::planner::query& query) noexcept;
 
-  [[nodiscard]] uint32_t query_epoch() const noexcept
-  {
-    return _ticker.load(std::memory_order_relaxed);
-  }
+  /// Retire @p query_id's live cache epoch.  Called at window cleanup
+  /// (scan_manager::reset).  Once retired, the query's unconsumed chunks
+  /// fall to eviction tier 0 unless another live query also requested them
+  /// (union semantics — see chunk_lifecycle::on_request).  Idempotent.
+  void finish_query(sirius::query_id_t query_id) noexcept;
+
+  /// The most recently minted query epoch (0 before the first prepare).
+  [[nodiscard]] uint32_t query_epoch() const noexcept { return _epochs.newest_epoch(); }
+
+  /// The staleness bar chunk scoring uses: the oldest LIVE query epoch, or
+  /// the newest epoch when no query is live.
+  [[nodiscard]] uint32_t min_live_epoch() const noexcept { return _epochs.min_live_epoch(); }
+
+  /// Number of queries currently holding a live cache epoch.
+  [[nodiscard]] std::size_t live_query_count() const { return _epochs.live_count(); }
 
  private:
   [[nodiscard]] prefetching_handle insert(const sirius_io_object& obj,
                                           std::span<const byte_range> ranges,
-                                          std::optional<int> gpu_id = {});
+                                          std::optional<int> gpu_id                  = {},
+                                          std::optional<sirius::query_id_t> query_id = {});
 
   [[nodiscard]] bool host_read_from_cache_only(const sirius_io_object& obj,
                                                size_t offset,
@@ -192,7 +232,9 @@ class prefetching_cache {
                                                prefetching_handle* out_handle);
 
   struct file_entry {
-    std::vector<cached_chunk*> update_and_get_chunks(std::span<size_t> incoming, uint32_t ticker);
+    std::vector<cached_chunk*> update_and_get_chunks(std::span<size_t> incoming,
+                                                     uint32_t query_epoch,
+                                                     uint32_t min_live_epoch);
 
     std::vector<cached_chunk*> fetch_chunks(std::size_t offset,
                                             std::size_t size,
@@ -225,7 +267,11 @@ class prefetching_cache {
 
   std::atomic<bool> _shutting_down{false};
 
-  std::atomic<uint32_t> _ticker{0};  // see prefetch_stats::snapshot for layout
+  /// Live query epochs (F3): every live query keeps its own epoch, and chunk
+  /// scoring is measured against the OLDEST live epoch instead of a global
+  /// newest-wins ticker, so a new query's prepare no longer demotes its
+  /// peers' prefetched-but-unread chunks.
+  query_epoch_tracker _epochs;
 
   // ---- Telemetry counters --------------------------------------------------
   // Global cumulative counts.  @c _last_reported snapshots them on every cache
