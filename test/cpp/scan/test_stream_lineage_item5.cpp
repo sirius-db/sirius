@@ -14,30 +14,29 @@
  * limitations under the License.
  */
 
-// Stream-lineage validation for the integrated stream-safety fixes ("item 5 is
-// unnecessary" claim):
+// Stream-lineage validation of the stream-safety fixes at the Sirius layer:
 //
 //   - gpu_table_representation::release_table(stream) rebinds converter-produced
-//     buffers to the caller's stream (cucascade item 4), so the Sirius steal path
+//     buffers to the caller's stream, so the Sirius steal path
 //     (scan_operator_input::prepare_for_processing) frees them in the consumer
 //     stream's order instead of on the idle conversion-pool stream.
 //   - The data_batch consumer-event API (record_consumer_event / await_consumers /
 //     consumers_done) orders batch-managed reclaims (install_converted_representation,
 //     set_data) after cross-stream reads recorded by consumers.
 //
-// These tests exercise the exact hazard convert_host_fast_to_gpu used to expose:
-// converted GPU buffers are allocated on a memory-space pool stream; if their
-// eventual free retires on that idle foreign stream while a consumer stream still
-// has in-flight reads, the cudaMallocAsync pool can hand the block to the next
-// allocation mid-read (use-after-free / corruption). The "sensitivity" test
-// re-creates the pre-fix binding deliberately and proves the harness detects the
-// corruption; the fixed paths must then be deterministically clean.
+// The hazard, reached through convert_host_fast_to_gpu: converted GPU buffers
+// are allocated on a memory-space pool stream; if their eventual free retires on
+// that idle foreign stream while a consumer stream still has in-flight reads,
+// the cudaMallocAsync pool can hand the block to the next allocation mid-read
+// (use-after-free / corruption). The "sensitivity" test re-creates the pre-fix
+// binding deliberately and proves the harness detects the corruption; the fixed
+// paths must then be deterministically clean.
 //
-// Scope note: the per-buffer rebind assertions (data / null mask / nested
-// children bound to the release stream) and the set_data consumer-event sync
-// are pinned deterministically at the cucascade layer
+// The per-buffer rebind assertions (data / null mask / nested children bound to
+// the release stream) and the set_data consumer-event sync are pinned
+// deterministically at the cucascade layer
 // (cucascade/test/cudf/test_release_table_stream.cpp and
-// cucascade/test/data/test_consumer_events.cpp). This suite keeps only what
+// cucascade/test/data/test_consumer_events.cpp). This suite covers only what
 // the Sirius layer adds: the real converter registry + memory spaces behind
 // the steal-path stress, its matched sensitivity (non-vacuity) check, and the
 // production downgrade discipline through install_converted_representation.
@@ -166,8 +165,9 @@ std::unique_ptr<cudf::column> make_patterned_column(std::size_t num_rows,
 }
 
 /// STRING column of `num_rows` four-byte strings, allocated from `space` on `stream`.
-std::unique_ptr<cudf::column> make_strings_column_patterned(
-  std::size_t num_rows, cucascade::memory::memory_space& space, rmm::cuda_stream_view stream)
+std::unique_ptr<cudf::column> make_strings_column_patterned(std::size_t num_rows,
+                                                            cucascade::memory::memory_space& space,
+                                                            rmm::cuda_stream_view stream)
 {
   auto mr = space.get_default_allocator();
 
@@ -208,7 +208,7 @@ std::unique_ptr<cudf::column> make_strings_column_patterned(
 /// GPU batch spilled in place to host_data_representation (spilled-cache shape).
 /// Converting it back to gpu_table_representation goes through
 /// convert_host_fast_to_gpu, which allocates the reconstructed buffers on one of
-/// the GPU memory space's pool streams — the exact binding item 5 targeted.
+/// the GPU memory space's pool streams — the binding these tests exercise.
 std::shared_ptr<cucascade::data_batch> make_host_batch(stream_lineage_fixture& f,
                                                        std::size_t num_rows,
                                                        std::int64_t seed,
@@ -282,7 +282,7 @@ void hammer_conversions(stream_lineage_fixture& f,
   }
 }
 
-constexpr std::size_t kRows       = 1u << 20;               // 1M rows -> 8 MB INT64 payload
+constexpr std::size_t kRows       = 1u << 20;  // 1M rows -> 8 MB INT64 payload
 constexpr std::size_t kBytes      = kRows * sizeof(std::int64_t);
 constexpr std::size_t kScratchMiB = 64;
 
@@ -371,8 +371,8 @@ TEST_CASE("rebinding a stolen column back to an idle foreign stream reproduces p
   upload_to_gpu(f, batch, task_stream.view());
   auto stolen = steal_table(batch, *f.gpu0, task_stream.view());
 
-  // Undo item 4's rebind: bind the column's buffers back to an idle foreign
-  // stream, exactly the binding release_table produced before the fix.
+  // Undo release_table's rebind: bind the column's buffers back to an idle
+  // foreign stream, exactly the binding release_table produced pre-fix.
   auto cols = stolen->release();
   cols[0]   = cudf::rebind_stream(std::move(*cols[0]), foreign_stream.view());
 

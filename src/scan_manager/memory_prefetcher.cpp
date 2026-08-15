@@ -88,15 +88,10 @@ void memory_prefetcher::worker_loop()
   // 0, and the compression converters allocate from the CURRENT device's
   // resource rather than the target space's.
   rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{_gpu_space->get_device_id()}};
-  // Private per-worker stream. No copy traffic ever runs on it: the converter
-  // only synchronize()s it on entry and does all device allocation + H2D on a
-  // stream it acquires from the GPU space's shared round-robin pool. The only
-  // ops this stream ever carries are the consumer-event waits that
-  // install_converted_representation enqueues on it, and that same call's tail
-  // sync drains them before returning — so the entry sync always sees an empty
-  // stream (a no-op). It exists as a stable per-worker key for attaching the
-  // admission reservation to the allocation tracker in sweep() (and keeps the
-  // entry sync off any pipeline stream).
+  // Private per-worker stream: it carries no copy traffic and exists as a
+  // stable per-worker key for attaching the admission reservation to the
+  // allocation tracker in sweep() — see the class doc for why the converter
+  // leaves it empty.
   rmm::cuda_stream stream{rmm::cuda_stream::flags::non_blocking};
   while (_running.load(std::memory_order_relaxed)) {
     std::size_t converted = 0;
@@ -144,8 +139,7 @@ std::size_t memory_prefetcher::sweep(rmm::cuda_stream_view stream)
     // Collisions only happen at the head of the queue, though — so instead of
     // skipping the connector entirely, convert TAIL-FIRST and leave a head
     // margin for the batches the scan will pop imminently. At most ONE worker
-    // may do this per connector: stacking prefetch parallelism on top of the
-    // scan's own conversion threads regresses short scan-bound queries.
+    // may do this per connector (see _drain_claims).
     const bool draining = connector->is_draining(_config.drain_quiet_ms);
     bool claimed        = false;
     if (draining) {
@@ -214,9 +208,7 @@ std::size_t memory_prefetcher::sweep(rmm::cuda_stream_view stream)
 
       // Reserve FIRST, then gate: the reservation charges the space's
       // availability immediately, so the floor check below already sees every
-      // concurrent worker's in-flight admission. (Gate-first would let
-      // num_threads workers pass the same headroom concurrently and overshoot
-      // the admission budget.)
+      // concurrent worker's in-flight admission (see the class doc).
       auto reservation = _gpu_space->make_reservation_or_null(peak_bytes);
       if (!reservation) {
         _stops_reservation.fetch_add(1, std::memory_order_relaxed);
@@ -224,12 +216,10 @@ std::size_t memory_prefetcher::sweep(rmm::cuda_stream_view stream)
       }
 
       // Headroom floor: never let prefetched (unreclaimable) bytes push the
-      // space below min_free_fraction of max memory. With our reservation
-      // already charged above, admitting this batch is safe iff the space
-      // still clears the floor now; otherwise back the reservation out. No
-      // room for this batch means none for the later ones either (they are at
-      // least as far from being consumed), so stop the whole sweep and retry
-      // after tasks free memory.
+      // space below min_free_fraction of max memory. No room for this batch
+      // means none for the later ones either (they are at least as far from
+      // being consumed), so back the reservation out and stop the whole sweep
+      // until tasks free memory.
       if (_gpu_space->get_available_memory() < min_free_bytes) {
         reservation.reset();
         _stops_headroom.fetch_add(1, std::memory_order_relaxed);

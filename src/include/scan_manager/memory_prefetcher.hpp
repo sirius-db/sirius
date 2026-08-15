@@ -19,9 +19,9 @@
 #include "scan_manager/config.hpp"
 #include "scan_manager/split_connector.hpp"
 
-#include <cucascade/memory/memory_space.hpp>
-
 #include <rmm/cuda_stream_view.hpp>
+
+#include <cucascade/memory/memory_space.hpp>
 
 #include <atomic>
 #include <cstddef>

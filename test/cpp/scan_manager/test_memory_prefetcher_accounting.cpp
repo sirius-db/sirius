@@ -15,7 +15,7 @@
  */
 
 // Admission-accounting gates for the memory prefetcher's reserve-then-gate
-// admission path (fix 0727f820). Three defects used to be silent:
+// admission path. Two pre-fix defects were silent:
 //
 //   - gate-then-reserve overshoot: the min_free_fraction headroom gate ran
 //     BEFORE make_reservation_or_null, so num_threads workers could pass the
@@ -25,10 +25,7 @@
 //   - decorative reservation: the conversion allocated through the space's
 //     default allocator while the admission reservation sat unused, so the
 //     space was transiently charged reserved-peak + actual-allocation
-//     (double count) for every in-flight prefetch;
-//   - phantom exclusive stream pool: per-worker streams from a dedicated
-//     exclusive_stream_pool carried zero copy traffic (covered by review;
-//     the header no longer declares _stream_pool).
+//     (double count) for every in-flight prefetch.
 //
 // Gates here: admission keeps the floor including concurrent workers'
 // in-flight reservations; the attached reservation genuinely draws down
@@ -44,10 +41,6 @@
 // per thread — with the cucascade-default per-STREAM tracking the conversion's
 // allocations (made on a round-robin pool stream) would bypass the arena
 // entirely.
-//
-// The diagnostic gate counters (_stops_headroom / _stops_reservation) have no
-// accessors; they are logged once by stop(), so the tests parse them out of a
-// recording log sink.
 
 #include "utils/log_test_utils.hpp"
 
