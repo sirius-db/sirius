@@ -58,11 +58,11 @@ TEST_CASE("adversarial: spill storm with constant query-end churn",
 {
   // Long memory-hungry queries force downgrades on a tiny (1.5 GB) pool while
   // short queries END constantly — every query end runs run_mandatory_cleanup
-  // -> downgrade_executor::drain() on the shared executors, i.e. the exact
-  // A7/B1/B2/D6 window. After the churn a memory-heavy query with CPU
-  // fallback DISABLED must still succeed on the GPU: if a drain racing the
-  // monitor latched _monitor_request_enqueued (D6), automatic spilling for
-  // the space is dead and that query dies in OOM-retry instead.
+  // -> downgrade_executor::drain(query_id) on the shared executors, i.e. the
+  // exact A7/B1/B2/D6 window. After the churn a memory-heavy query with CPU
+  // fallback DISABLED must still succeed on the GPU: if a cancelled request
+  // racing the monitor latched _monitor_request_enqueued (D6), automatic
+  // spilling for the space is dead and that query dies in OOM-retry instead.
   scoped_watchdog dog("spill storm", scenario_timeout(900));
 
   const std::int64_t rows               = env_i64("SIRIUS_TEST_SPILL_ROWS", 8'000'000);

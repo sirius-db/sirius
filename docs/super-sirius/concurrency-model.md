@@ -255,8 +255,9 @@ pattern and candidate mechanics; what matters here is the cross-query contract:
   spills and the monitor's pressure response proceed unaffected (registers A7/B2). Every path
   that destroys a request routes through `fail_request()`, which re-arms the monitor's
   `_monitor_request_enqueued` flag (register D6). The global `drain()` (cancel everything,
-  stop-join-restart) survives for terminate/stop and tests only; `_lifecycle_mutex` serializes
-  it against concurrent cleanups.
+  stop-join-restart) is DELETED (step 7): `terminate()` stops executors outright via `stop()`,
+  and unattributed requests (the monitor's, external byte targets) can be cancelled with
+  `drain(make_query_id(0))`. `stop()` self-serializes through the `_running` CAS.
 
 ### Teardown fences (steps 6+7 end-state)
 

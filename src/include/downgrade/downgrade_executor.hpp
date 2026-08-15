@@ -110,14 +110,12 @@ class downgrade_executor {
   void start();
   void stop();
 
-  /**
-   * @brief Global quiesce-and-restart. Terminate/stop-adjacent and test use ONLY.
-   *
-   * Cancels EVERY queued request (failing every waiter's promise, including healthy peer
-   * queries') and stop-join-restarts the processing thread, so quiescence expires the moment
-   * it returns. Per-query cleanup must use drain(query_id) instead.
-   */
-  void drain();
+  // NOTE (step 7): the global drain() — cancel EVERY queued request and stop-join-restart the
+  // processing thread — is gone. Its last legitimate callers were terminate-adjacent paths and
+  // tests: terminate() stops executors outright via stop(), per-query cleanup uses
+  // drain(query_id), and tests use stop()/start() or drain(make_query_id(0)) (the id monitor
+  // and external byte-target requests carry). Nothing else needed a whole-executor quiesce
+  // whose quiescence expired the moment it returned.
 
   /**
    * @brief Per-query drain, for one query's end-of-window cleanup.
@@ -126,7 +124,7 @@ class downgrade_executor {
    * being torn down anyway) and waits for an in-flight request of that query to complete. It
    * never interrupts the request queue, the pool, or the processing/monitor threads, so peer
    * queries' pending spills and the monitor's pressure response proceed unaffected — and it
-   * needs no _lifecycle_mutex because it never touches thread lifetimes.
+   * needs no lifecycle serialization because it never touches thread lifetimes.
    *
    * Precondition: the query is quiesced (no producer can enqueue new requests for it), which
    * run_mandatory_cleanup guarantees before calling this. Repository teardown needs no fence
@@ -215,8 +213,8 @@ class downgrade_executor {
    * @brief Asynchronously request a predicate-driven downgrade, unattributed.
    *
    * Equivalent to request_downgrade(make_query_id(0), predicate): the request belongs to no
-   * query and is only ever cancelled by the global drain()/stop(). Callers whose waiter
-   * belongs to a query (the GPU pipeline executor's reservation paths) must use the
+   * query and is only ever cancelled by stop() or a drain(make_query_id(0)). Callers whose
+   * waiter belongs to a query (the GPU pipeline executor's reservation paths) must use the
    * attributed overload so a per-query drain can find their request.
    *
    * @param predicate Callable returning true when the caller's condition is met
@@ -298,13 +296,6 @@ class downgrade_executor {
   exec::interruptible_mpmc<std::unique_ptr<downgrade_request>> _request_queue;
   std::thread _processing_thread;
   std::thread _monitor_thread;
-  /// Serializes drain()/stop()'s stop-join-restart of _processing_thread.
-  /// With max_concurrent_queries > 1, two queries' mandatory cleanups can
-  /// drain the same executor simultaneously; an unsynchronized second join()
-  /// (or reassigning a joinable std::thread) throws std::system_error through
-  /// the caller's noexcept cleanup — i.e. std::terminate. One drain at a
-  /// time; a second entrant repeats the idempotent stop/cancel/restart.
-  std::mutex _lifecycle_mutex;
   /// Which request the processing loop is currently executing (it handles one at a time).
   /// drain(query_id) waits on this so a query's cleanup proceeds only once the request its
   /// waiter is blocked on has fulfilled its promise. Guarded by _in_flight_mutex; the cv is

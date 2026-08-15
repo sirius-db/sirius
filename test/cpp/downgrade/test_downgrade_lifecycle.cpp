@@ -188,7 +188,7 @@ TEST_CASE("start_stop_cycle", "[downgrade_lifecycle]")
   REQUIRE_NOTHROW(executor.stop());
 }
 
-TEST_CASE("drain_clears_pending_requests", "[downgrade_lifecycle]")
+TEST_CASE("stop_restart_cycle_processes_new_requests", "[downgrade_lifecycle]")
 {
   auto mem_mgr    = make_test_memory_manager();
   auto* gpu_space = get_gpu_space(*mem_mgr);
@@ -224,10 +224,12 @@ TEST_CASE("drain_clears_pending_requests", "[downgrade_lifecycle]")
     std::this_thread::sleep_for(50ms);
   }
 
-  // Call drain -- ensures all in-flight work is done and executor restarts cleanly
-  REQUIRE_NOTHROW(executor.drain());
+  // Full stop/start cycle -- stop joins all in-flight work; start must leave the executor
+  // fully operational again (the global drain() this test used to exercise is gone).
+  REQUIRE_NOTHROW(executor.stop());
+  REQUIRE_NOTHROW(executor.start());
 
-  // After drain, the executor should be operational for new requests
+  // After the restart, the executor should be operational for new requests
   auto repo2  = std::make_unique<cucascade::shared_data_repository>();
   auto batch4 = make_gpu_batch(*gpu_space);
   repo2->add_data_batch(batch4);
@@ -246,7 +248,7 @@ TEST_CASE("drain_clears_pending_requests", "[downgrade_lifecycle]")
   executor.stop();
 }
 
-TEST_CASE("drain_releases_batch_references", "[downgrade_lifecycle]")
+TEST_CASE("stop_releases_batch_references", "[downgrade_lifecycle]")
 {
   auto mem_mgr    = make_test_memory_manager();
   auto* gpu_space = get_gpu_space(*mem_mgr);
@@ -281,15 +283,12 @@ TEST_CASE("drain_releases_batch_references", "[downgrade_lifecycle]")
   }
   REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
 
-  // Call drain to ensure all internal references are released
-  // drain() calls stop() which waits for pool->wait_all(), releasing all shared_ptr captures
-  executor.drain();
+  // stop() waits for pool->wait_all(), releasing all shared_ptr captures.
+  executor.stop();
 
-  // After drain, the executor should not hold any extra shared_ptr<data_batch> references.
+  // After stop, the executor should not hold any extra shared_ptr<data_batch> references.
   // use_count should be back to what it was before scheduling.
   REQUIRE(batch.use_count() <= count_before);
-
-  executor.stop();
 }
 
 TEST_CASE("monitor_loop_triggers_downgrade", "[downgrade_lifecycle]")
@@ -366,7 +365,8 @@ TEST_CASE("concurrent_api_safety", "[downgrade_lifecycle]")
   executor.start();
 
   // Launch 4 threads, each requesting memory reclamation concurrently.
-  // During drain, pending requests are cancelled with an exception, so
+  // During the stop/start cycle, pending requests are cancelled with an exception (and
+  // requests landing in the stopped window are refused, breaking their promise), so
   // threads must tolerate both success and cancellation.
   std::atomic<int> completed{0};
   std::vector<std::thread> threads;
@@ -393,10 +393,11 @@ TEST_CASE("concurrent_api_safety", "[downgrade_lifecycle]")
     });
   }
 
-  // Call drain from a 5th thread while requests are in-flight
+  // Stop and restart from a 5th thread while requests are in-flight
   std::thread drain_thread([&executor]() {
     std::this_thread::sleep_for(100ms);
-    executor.drain();
+    executor.stop();
+    executor.start();
   });
 
   for (auto& t : threads) {
@@ -404,7 +405,7 @@ TEST_CASE("concurrent_api_safety", "[downgrade_lifecycle]")
   }
   drain_thread.join();
 
-  // Verify no crash and executor is still operational after drain
+  // Verify no crash and executor is still operational after the restart
   // Submit + complete another request
   auto repo_final  = std::make_unique<cucascade::shared_data_repository>();
   auto final_batch = make_gpu_batch(*gpu_space, 500);
@@ -457,7 +458,7 @@ TEST_CASE("stop_cancels_pending_requests", "[downgrade_lifecycle]")
   }
 }
 
-TEST_CASE("drain_cancels_pending_requests_with_exception", "[downgrade_lifecycle]")
+TEST_CASE("stop_resolves_pending_requests_and_restart_serves_new_ones", "[downgrade_lifecycle]")
 {
   auto mem_mgr    = make_test_memory_manager();
   auto* gpu_space = get_gpu_space(*mem_mgr);
@@ -472,9 +473,9 @@ TEST_CASE("drain_cancels_pending_requests_with_exception", "[downgrade_lifecycle
     futures.push_back(executor.request_free_memory(1024));
   }
 
-  executor.drain();
+  executor.stop();
 
-  // All futures must be resolved after drain
+  // All futures must be resolved after stop -- either processed (0 bytes) or cancelled.
   for (auto& f : futures) {
     REQUIRE(f.valid());
     try {
@@ -484,7 +485,8 @@ TEST_CASE("drain_cancels_pending_requests_with_exception", "[downgrade_lifecycle
     }
   }
 
-  // Executor should still be operational after drain
+  // A restarted executor serves new requests.
+  executor.start();
   auto f = executor.request_free_memory(1024);
   REQUIRE(f.get() == 0);  // no repos, 0 freed
 
@@ -683,11 +685,16 @@ TEST_CASE("per_query_drain_cancels_only_that_querys_requests", "[downgrade_lifec
   sirius::data::data_repository_manager_registry repo_registry;
   auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
 
-  // One convertible batch so query A's request dispatches a worker that parks in its
-  // predicate, deterministically wedging the processing loop in wait_all with A IN FLIGHT.
-  auto repo  = std::make_unique<cucascade::shared_data_repository>();
-  auto batch = make_gpu_batch(*gpu_space);
+  // TWO convertible batches against a 1-thread pool: query A's request dispatches a worker
+  // that converts batch 1 and parks in its predicate, and the processing loop then parks in
+  // reserve() for batch 2's candidate. That wedges the LOOP itself with A in flight — so B
+  // and C provably stay QUEUED — independent of whether the loop is serial (one request at a
+  // time) or dispatches requests concurrently.
+  auto repo   = std::make_unique<cucascade::shared_data_repository>();
+  auto batch  = make_gpu_batch(*gpu_space);
+  auto batch2 = make_gpu_batch(*gpu_space);
   repo->add_data_batch(batch);
+  repo->add_data_batch(batch2);
   repo_mgr.add_new_repository(1, "out", std::move(repo));
 
   auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
@@ -746,7 +753,7 @@ TEST_CASE("per_query_drain_cancels_only_that_querys_requests", "[downgrade_lifec
   REQUIRE(freed_a > 0);
 
   // C was never disturbed: it processes after A and resolves normally (0 bytes -- A's
-  // worker already converted the only candidate).
+  // workers already converted both candidates).
   REQUIRE(fut_c.wait_for(10s) == std::future_status::ready);
   REQUIRE_NOTHROW(fut_c.get());
 
@@ -755,11 +762,15 @@ TEST_CASE("per_query_drain_cancels_only_that_querys_requests", "[downgrade_lifec
 
 TEST_CASE("monitor_rearms_after_drain_cancels_queued_monitor_request", "[downgrade_lifecycle]")
 {
-  // D6 regression: cancel_pending_requests() used to eat a queued monitor request without
-  // resetting _monitor_request_enqueued, permanently disabling memory-pressure downgrade
-  // for the space. Recipe: wedge the processing loop, create sustained pressure so the
-  // monitor enqueues (and latches), then drain() -- the queue interrupt guarantees the
-  // monitor request is cancelled, never processed. Afterwards the monitor must fire again.
+  // D6 regression: a destroyed-but-never-processed monitor request used to leave
+  // _monitor_request_enqueued latched true, permanently disabling memory-pressure downgrade
+  // for the space. Recipe: wedge the processing LOOP (two candidates against a 1-thread
+  // pool: the worker parks in the predicate on candidate 1, the loop parks in reserve() for
+  // candidate 2 — so the loop cannot pop, under any dispatch model), create sustained
+  // pressure so the monitor enqueues (and latches), then cancel the queued monitor request
+  // with drain(make_query_id(0)) — monitor requests are unattributed, so the per-query
+  // drain's cancel is what destroys it, routing through fail_request()'s re-arm. Afterwards
+  // the monitor must fire again.
   auto mem_mgr    = make_pressure_memory_manager();
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
@@ -767,16 +778,19 @@ TEST_CASE("monitor_rearms_after_drain_cancels_queued_monitor_request", "[downgra
   sirius::data::data_repository_manager_registry repo_registry;
   auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
 
-  auto repo  = std::make_unique<cucascade::shared_data_repository>();
-  auto batch = make_gpu_batch(*gpu_space);
+  auto repo   = std::make_unique<cucascade::shared_data_repository>();
+  auto batch  = make_gpu_batch(*gpu_space);
+  auto batch2 = make_gpu_batch(*gpu_space);
   repo->add_data_batch(batch);
+  repo->add_data_batch(batch2);
   repo_mgr.add_new_repository(1, "out", std::move(repo));
 
   auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr, /*monitor_period=*/5ms);
   executor.start();
 
   // No pressure yet (trigger is 512 MiB consumed), so the monitor idles. Wedge the
-  // processing loop first: a blocker request whose worker parks in its predicate.
+  // processing loop first: a blocker request whose worker parks in its predicate while the
+  // loop parks reserving for the second candidate.
   std::promise<void> release_blocker;
   std::shared_future<void> gate(release_blocker.get_future());
   std::atomic<bool> blocker_entered{false};
@@ -805,25 +819,22 @@ TEST_CASE("monitor_rearms_after_drain_cancels_queued_monitor_request", "[downgra
   const auto issued_before_drain = executor.monitor_requests_issued_for_testing();
   REQUIRE(issued_before_drain >= 1);
 
-  // Global drain. It interrupts the request queue FIRST, so the processing thread (once
-  // unwedged) exits without ever popping the queued monitor request -- the drain's cancel
-  // is guaranteed to be what destroys it. drain() blocks joining the wedged thread, so
-  // run it from a helper and release the blocker underneath it.
-  std::thread drainer([&executor]() { executor.drain(); });
-  std::this_thread::sleep_for(50ms);
-  release_blocker.set_value();
-  drainer.join();
-
-  // Pressure is still on (the reservation is still held) and the queued monitor request
-  // was cancelled, not processed. The monitor must re-arm and fire again; before the fix
-  // _monitor_request_enqueued stayed latched true and this poll times out.
+  // Cancel the queued monitor request. The drain is retried in the poll below because the
+  // issued counter is incremented just BEFORE the push lands — a single drain could race the
+  // push and miss the request (which would then sit forever behind the wedged loop). Each
+  // retry is idempotent: it pops whatever unattributed requests are queued and fails them
+  // through fail_request(), which is the re-arm path under test. The wedged loop cannot pop
+  // the request first, and the drain does not block (the in-flight request is query 7's).
+  // Pressure stays on, so a re-armed monitor must enqueue again — issued strictly rises.
   deadline = std::chrono::steady_clock::now() + 5s;
   while (executor.monitor_requests_issued_for_testing() <= issued_before_drain &&
          std::chrono::steady_clock::now() < deadline) {
+    executor.drain(sirius::make_query_id(0));
     std::this_thread::sleep_for(5ms);
   }
   REQUIRE(executor.monitor_requests_issued_for_testing() > issued_before_drain);
 
+  release_blocker.set_value();
   pressure.reset();
   executor.stop();
 }

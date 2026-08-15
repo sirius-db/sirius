@@ -112,9 +112,12 @@ void downgrade_executor::start()
 
 void downgrade_executor::stop()
 {
+  // The _running CAS is the lifecycle serialization: exactly one caller wins the
+  // true->false transition and tears down; a concurrent second stop() returns immediately
+  // (as it always has). The mutex that used to sit here only ordered stop() against the
+  // deleted global drain()'s stop-join-restart.
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
-  std::lock_guard<std::mutex> lifecycle_lock(_lifecycle_mutex);
 
   _pool->interrupt();
   _request_queue.interrupt();
@@ -128,28 +131,6 @@ void downgrade_executor::stop()
   _pool->stop();
   _pool.reset();
   _stream_pool.reset();
-}
-
-void downgrade_executor::drain()
-{
-  // Global stop-the-world drain: terminate/stop-adjacent and test use only. Per-query
-  // cleanup uses drain(query_id) — this one cancels EVERY queued promise (failing healthy
-  // peers' waiters) and restarts the processing thread as its last act, so its quiescence
-  // has expired by the time it returns. _lifecycle_mutex keeps concurrent drain()/stop()
-  // callers from interleaving the stop-join-restart below.
-  std::lock_guard<std::mutex> lifecycle_lock(_lifecycle_mutex);
-  if (!_running.load()) { return; }  // racing terminate: stop() already owns teardown
-  _pool->interrupt();
-  _request_queue.interrupt();
-
-  if (_processing_thread.joinable()) { _processing_thread.join(); }
-
-  _pool->wait_all();
-  cancel_pending_requests();
-  _pool->resume();
-  _request_queue.reactivate();
-
-  _processing_thread = std::thread(&downgrade_executor::processing_loop, this);
 }
 
 void downgrade_executor::drain(sirius::query_id_t query_id)
@@ -166,8 +147,8 @@ void downgrade_executor::drain(sirius::query_id_t query_id)
   //
   // A request popped but not yet marked in flight can slip past this wait. That is benign:
   // the caller has already quiesced the query (no new waiters can appear), the slipped
-  // request still fulfils its promise normally, and repository teardown is fenced against
-  // its sweep by the registry's sweep gate rather than by this wait.
+  // request still fulfils its promise normally, and repository teardown needs no fence at
+  // all — its sweep co-owns whatever it borrows (step 6).
   std::unique_lock<std::mutex> lock(_in_flight_mutex);
   _in_flight_cv.wait(lock, [&] { return !_in_flight_active || _in_flight_query != query_id; });
 }
@@ -539,7 +520,7 @@ void downgrade_executor::monitor_loop()
           _monitor_requests_issued.fetch_add(1, std::memory_order_relaxed);
           _monitor_request_enqueued.store(true, std::memory_order_relaxed);
           // Fire-and-forget: monitor does not wait for the result. A refused push (queue
-          // interrupted by a racing drain()/stop()) must re-arm immediately — otherwise the
+          // interrupted by a racing stop()) must re-arm immediately — otherwise the
           // flag latches true with no request in flight and pressure-driven downgrade for
           // this space is dead for the rest of the process.
           if (!_request_queue.push(std::move(req))) {
@@ -588,7 +569,7 @@ void downgrade_executor::cancel_pending_requests_for_query(sirius::query_id_t qu
   }
   for (auto& req : kept) {
     if (!_request_queue.is_open()) {
-      // Racing global drain()/stop(): a push would be refused and silently destroy the
+      // Racing stop(): a push would be refused and silently destroy the
       // promise. Fail it loudly instead — the waiter unblocks and, for a monitor request,
       // the re-arm flag is reset. This is exactly what the racing global cancel would do.
       fail_request(std::move(req));
