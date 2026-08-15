@@ -55,13 +55,16 @@ void scan_operator_input::prepare_for_processing(
       mut.convert_to<::cucascade::gpu_table_representation>(
         registry, requested_memory_space, stream);
       // The conversion output is a fresh per-query table (raw GPU pins serve a
-      // plain gpu_table_representation and never reach this branch), so an
-      // unmasked, unfiltered scan may take ownership of it here instead of
-      // deep-copying it at materialize. Masked / row-filtered splits keep the
-      // view path: they filter by copy and need the source view alive — and
-      // skipping them means the scan allocates nothing after the take, so an
-      // OOM retry can never re-enter materialize on a consumed split.
-      if (!mvcc_keep_mask.has_mask() && !row_filter_pending) {
+      // plain gpu_table_representation and never reach this branch), so the
+      // scan may take ownership of it here instead of deep-copying it at
+      // materialize. Three exclusions keep the view path: masked and
+      // row-filtered splits filter by copy and need the source view alive;
+      // carrier-converting splits allocate cast destinations in scan
+      // normalization after materialize, so the retained wrapper table lets an
+      // OOM retry re-enter materialize and re-run the cast. Every split that
+      // steals therefore allocates nothing after the take, and a retry can
+      // never re-enter materialize on a consumed split.
+      if (!mvcc_keep_mask.has_mask() && !row_filter_pending && !needs_carrier_conversion) {
         if (auto* gpu_rep = dynamic_cast<::cucascade::gpu_table_representation*>(mut.get_data())) {
           auto& space        = gpu_rep->get_memory_space();
           stolen_table_bytes = gpu_rep->get_size_in_bytes();

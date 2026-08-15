@@ -39,17 +39,12 @@ namespace sirius::op::scan {
 // scan_operator_input
 //===----------------------------------------------------------------------===//
 /**
- * @brief Operator input for a fresh-read scan task (one emitted split from
- *        the unified gpu scan operator's connector).
+ * @brief Operator input for one fresh or resident scan split.
  *
- * Carries the per-split scan descriptor and (optional) post-decode
- * filter/projection description. The materialize step delegates to the
- * operator's installed @c gpu_ingestible — the operator does not see
+ * Carries either a per-split read descriptor or a cached resident batch, plus
+ * optional post-decode filtering and carrier-normalization state. Materialize
+ * delegates to the installed @c gpu_ingestible, so the operator does not see
  * the source format directly.
- *
- * Source operator data: holds no upstream batches that need locking, so
- * @ref prepare_for_processing only captures the requested memory space so
- * @c sirius_gpu_scan_operator::execute knows where to tag the output batch.
  */
 class scan_operator_input : public op::operator_data {
  public:
@@ -94,8 +89,21 @@ class scan_operator_input : public op::operator_data {
     }
   }
 
+  /**
+   * @brief Prepare this split for execution in the requested memory space.
+   *
+   * Fresh reads issue their just-in-time prefetch. Resident inputs are
+   * converted or decompressed to a plain GPU table when needed. An eligible
+   * per-query conversion result is detached for ownership transfer; inputs
+   * requiring a mask, row filter, or carrier cast retain the wrapper so
+   * materialization can be retried.
+   *
+   * @param requested_memory_space Preferred destination memory space; may be
+   *                               null when the caller has no preference.
+   * @param stream CUDA stream used for resident conversion.
+   */
   void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
-                              rmm::cuda_stream_view /*stream*/) override;
+                              rmm::cuda_stream_view stream) override;
 
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override;
 
@@ -146,13 +154,10 @@ class scan_operator_input : public op::operator_data {
   /// copy). Stamped by drain_cached_provider on resident splits; scan_info
   /// splits fold filter costs into their own estimates instead.
   bool row_filter_pending{false};
-  /// Per-query table taken out of the cached wrapper batch right after
-  /// prepare_for_processing's conversion produced it (decompressed or
-  /// uploaded fresh for this split) — never raw GPU pin storage, which is
-  /// served as a plain gpu_table_representation and never converted.
-  /// Consumed at most once by materialize_table, which moves it into the
-  /// scan output instead of deep-copying the batch. Mutable: the operator
-  /// only sees its input as const during execute.
+  /// Per-query table detached after the cached wrapper is converted or
+  /// decompressed. Raw GPU pins and splits requiring a mask, row filter, or
+  /// carrier cast remain view-backed. Consumed at most once by materialize_table.
+  /// Mutable because execute receives its operator input as const.
   mutable std::unique_ptr<cudf::table> stolen_table;
   /// Size of the stolen table, kept past consumption so OOM-retry size
   /// estimates stay accurate while the wrapper batch holds only an empty
@@ -162,9 +167,10 @@ class scan_operator_input : public op::operator_data {
   /// consumption (scan-internal OOM retry) must fail loudly rather than
   /// serve the emptied wrapper batch as zero rows.
   mutable bool stolen_table_consumed{false};
-  /// True when scan normalization will cast at least one selected column of this resident cached
-  /// split. Stamped by drain_cached_provider from databatch_provider::batch, which owns the
-  /// definition.
+  /// True when scan normalization will cast at least one selected column of
+  /// this resident cached split. Besides sizing the conversion reservation,
+  /// this prevents table detachment so an OOM retry can rematerialize the
+  /// retained view and rerun the cast.
   bool needs_carrier_conversion{false};
   /// Stamped by drain_cached_provider from databatch_provider::batch::conversion_destination_bytes,
   /// which owns the definition. Zero means unknown; the scan memory estimate then keeps its

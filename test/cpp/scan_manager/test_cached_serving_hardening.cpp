@@ -1241,7 +1241,7 @@ TEST_CASE("prepare_for_processing never steals from a GPU-resident (pin-shaped) 
   REQUIRE(ro.get_data()->get_size_in_bytes() == size_before);
 }
 
-TEST_CASE("prepare_for_processing skips the steal for masked or row-filtered splits",
+TEST_CASE("prepare_for_processing skips the steal for masked, row-filtered, or converting splits",
           "[cached_serving][scan_manager]")
 {
   auto& e = env();
@@ -1272,6 +1272,68 @@ TEST_CASE("prepare_for_processing skips the steal for masked or row-filtered spl
     REQUIRE(ro.get_current_tier() == cucascade::memory::Tier::GPU);
     REQUIRE(ro.get_data()->get_size_in_bytes() > 0);
   }
+
+  SECTION("carrier conversion pending")
+  {
+    auto batch = make_host_batch(e, values);
+    sirius::op::scan::scan_operator_input split{batch};
+    split.needs_carrier_conversion = true;
+    split.prepare_for_processing(e.gpu_space, e.stream());
+    REQUIRE(split.stolen_table == nullptr);
+    // Converted in place but not stolen: scan normalization allocates the cast
+    // destinations after materialize, so the split keeps the view path and an
+    // OOM retry can re-enter materialize.
+    auto ro = batch->to_read_only();
+    REQUIRE(ro.get_current_tier() == cucascade::memory::Tier::GPU);
+    REQUIRE(ro.get_data()->get_size_in_bytes() > 0);
+  }
+}
+
+TEST_CASE("a converting split serves the wrapper as a view and re-materializes",
+          "[cached_serving][scan_manager]")
+{
+  auto& e = env();
+  std::vector<int32_t> const values{30, 31, 32, 33};
+  auto batch = make_host_batch(e, values);
+
+  sirius::op::scan::scan_operator_input split{batch};
+  split.needs_carrier_conversion = true;
+  split.prepare_for_processing(e.gpu_space, e.stream());
+  REQUIRE(split.stolen_table == nullptr);
+  REQUIRE(split.stolen_table_bytes == 0);
+  // Size estimates answer from the converted batch, which retains the table.
+  REQUIRE(split.get_estimated_size_in_bytes() > 0);
+
+  stub_ingestible ingestible;
+  {
+    auto result = ingestible.materialize_table(split, e.stream());
+    REQUIRE(result.state == sirius::op::scan::filter_state::UNFILTERED);
+    auto out = result.table.release(e.stream(), e.gpu_space->get_default_allocator());
+    REQUIRE(out != nullptr);
+    e.stream().synchronize();
+    REQUIRE(to_host(out->view()) == values);
+  }
+
+  // The OOM retry re-runs prepare before re-materializing; on the already
+  // GPU-resident wrapper it neither converts again nor steals.
+  split.prepare_for_processing(e.gpu_space, e.stream());
+  REQUIRE(split.stolen_table == nullptr);
+  {
+    auto ro = batch->to_read_only();
+    REQUIRE(ro.get_current_tier() == cucascade::memory::Tier::GPU);
+    REQUIRE(ro.get_data()->get_size_in_bytes() > 0);
+  }
+
+  // Re-entry (scan-internal OOM retry after a failed normalization cast) is
+  // served again from the retained wrapper table with the same values.
+  REQUIRE_FALSE(split.stolen_table_consumed);
+  std::optional<sirius::op::scan::filtered_table> retried;
+  REQUIRE_NOTHROW(retried.emplace(ingestible.materialize_table(split, e.stream())));
+  REQUIRE(retried->state == sirius::op::scan::filter_state::UNFILTERED);
+  auto out = retried->table.release(e.stream(), e.gpu_space->get_default_allocator());
+  REQUIRE(out != nullptr);
+  e.stream().synchronize();
+  REQUIRE(to_host(out->view()) == values);
 }
 
 // Compressed chunks are opaque blobs, but the carrier fold never needs to open them: the pin
