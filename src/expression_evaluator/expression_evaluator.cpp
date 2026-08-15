@@ -36,6 +36,7 @@
 // standard library
 #include <memory>
 #include <numeric>
+#include <utility>
 #include <variant>
 
 namespace {
@@ -333,15 +334,23 @@ std::unique_ptr<cudf::table> expression_evaluator::select(
       "[expression_evaluator] select(): output_indices must be non-empty; use the "
       "all-columns select() overload for count(*)-style filters with no output columns");
   }
-  auto mask = compute_mask(input);
-  return cudf::apply_boolean_mask(
-    input.select(output_indices.begin(), output_indices.end()), mask->view(), _stream, _mr);
+  return select_impl(input, output_indices);
 }
 
 std::unique_ptr<cudf::table> expression_evaluator::select(cudf::table_view input)
 {
+  return select_impl(input, {});
+}
+
+std::unique_ptr<cudf::table> expression_evaluator::select_impl(
+  cudf::table_view input, std::span<cudf::size_type const> output_indices)
+{
+  _last_filter_cascade_decision = filter_cascade_decision::not_applicable;
+  if (auto cascaded = try_select_cascade(input, output_indices)) { return std::move(*cascaded); }
   auto mask = compute_mask(input);
-  return cudf::apply_boolean_mask(input, mask->view(), _stream, _mr);
+  auto const projected =
+    output_indices.empty() ? input : input.select(output_indices.begin(), output_indices.end());
+  return cudf::apply_boolean_mask(projected, mask->view(), _stream, _mr);
 }
 
 evaluate_result expression_evaluator::evaluate(sirius::ast::aggregate const& /*expr*/,

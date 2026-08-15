@@ -40,6 +40,18 @@ struct Config {
   static ::sirius::expression_evaluator_strategy
     EXPRESSION_EVALUATOR_STRATEGY;  // expression_evaluator_strategy
 
+  // Cheap-conjunct filter cascade in sirius::expression_evaluator::select(): split a filter's
+  // top-level AND into cheap fixed-width prefilter conjuncts and an expensive (string-carried /
+  // AST-breaker) residual, evaluate the cheap group first, and run the residual only on rows
+  // surviving the prefilter.
+  static bool FILTER_CASCADE_CHEAP_CONJUNCTS;  // filter_cascade_cheap_conjuncts
+  // Minimum input rows before the cascade engages; below this, kernel-launch latency dominates
+  // the possible saving and the monolithic single-kernel path wins.
+  static uint64_t FILTER_CASCADE_MIN_ROWS;  // filter_cascade_min_rows
+  // Highest cheap-prefilter pass rate at which survivors are gathered before the residual runs;
+  // above it the residual is evaluated in place and the two masks are ANDed (no gather).
+  static double FILTER_CASCADE_MAX_PASS_RATE;  // filter_cascade_max_pass_rate
+
   // For gpu physical top-N
   static bool USE_CUSTOM_TOP_N;  // use_custom_top_n
 

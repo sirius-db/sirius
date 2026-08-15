@@ -255,6 +255,7 @@ set(EXTENSION_SOURCES
     src/expression_evaluator/expression_evaluator_strategy.cpp
     src/expression_evaluator/ast_op_counter.cpp
     src/expression_evaluator/expression_evaluator.cpp
+    src/expression_evaluator/filter_cascade.cpp
     src/expression_evaluator/gpu_expression_translator.cpp
     src/expression_evaluator/regex/regex_playground.cpp
     src/expression_evaluator/specializations/between.cpp

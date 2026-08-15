@@ -529,9 +529,16 @@ These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, an
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `expression_evaluator_strategy` | `ast_interpret` | Expression evaluator strategy: `materialize`, `ast_interpret`, or `ast_jit` |
+| `filter_cascade_cheap_conjuncts` | `true` | Evaluate cheap fixed-width conjuncts of a filter's top-level AND first; run the expensive (string-carried) residual only on surviving rows |
+| `filter_cascade_min_rows` | `1048576` | Minimum batch rows before the filter cascade engages (below this, kernel-launch latency dominates any saving) |
+| `filter_cascade_max_pass_rate` | `0.75` | Highest cheap-prefilter pass rate at which survivors are gathered before the residual; above it the two masks are combined without a gather. Domain [0, 1] |
 
 `expression_executor_strategy` remains registered as a deprecated compatibility alias for
 `expression_evaluator_strategy`; new configuration should use the evaluator name.
+
+The three `filter_cascade_*` knobs govern the filter cascade in
+`expression_evaluator::select()`; see
+[expression-executor.md](expression-executor.md) → Filter cascade in select().
 
 ### Scan
 

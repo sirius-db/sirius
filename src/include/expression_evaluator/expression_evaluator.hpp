@@ -358,6 +358,32 @@ class expression_evaluator {
     return _narrow_domain_comparison_count;
   }
 
+  /**
+   * @brief Which path the most recent select() took through the cheap-conjunct filter cascade.
+   *
+   * The cascade (see Config::FILTER_CASCADE_CHEAP_CONJUNCTS) splits a top-level AND into cheap
+   * fixed-width prefilter conjuncts and an expensive residual: `cascaded` means the residual ran
+   * only on gathered prefilter survivors, `combined_masks` means the prefilter was too
+   * unselective to justify the gather so the residual ran in place and the masks were ANDed,
+   * `short_circuited` means the prefilter dropped every row and the residual never ran, and
+   * `not_applicable` means the cascade did not engage (disabled, below the row threshold, the
+   * predicate is not an AND mixing both conjunct classes, or the survivor gather is out of scope
+   * for the caller's projection).
+   */
+  enum class filter_cascade_decision : std::uint8_t {
+    not_applicable,
+    cascaded,
+    combined_masks,
+    short_circuited,
+  };
+
+  /// The filter-cascade path taken by the most recent select(). Exposed for
+  /// observability/testing.
+  [[nodiscard]] filter_cascade_decision last_filter_cascade_decision_for_testing() const noexcept
+  {
+    return _last_filter_cascade_decision;
+  }
+
  private:
   std::vector<sirius::ast::node const*> _ast_expressions;  ///< The AST expressions to evaluate
   expression_evaluator_strategy _strategy;  ///< The strategy to use for expression evaluation
@@ -391,10 +417,31 @@ class expression_evaluator {
   std::vector<restored_reference_cache_entry> _restored_reference_cache;
   std::size_t _restored_reference_cast_count{0};   ///< For observability/testing
   std::size_t _narrow_domain_comparison_count{0};  ///< For observability/testing
+  filter_cascade_decision _last_filter_cascade_decision{
+    filter_cascade_decision::not_applicable};  ///< For observability/testing
 
   // Evaluate the executor's single boolean predicate over @p input and return the resulting
   // mask column (the sole column of evaluate()'s output). Shared by both select() overloads.
   std::unique_ptr<cudf::column> compute_mask(cudf::table_view input);
+
+  // Shared body of both select() overloads; an empty @p output_indices means all columns.
+  std::unique_ptr<cudf::table> select_impl(cudf::table_view input,
+                                           std::span<cudf::size_type const> output_indices);
+
+  // Cheap-conjunct filter cascade (Config::FILTER_CASCADE_CHEAP_CONJUNCTS), defined in
+  // filter_cascade.cpp: when the predicate is a top-level AND mixing cheap fixed-width conjuncts
+  // with expensive (string-carried or AST-breaking) ones, the batch clears
+  // Config::FILTER_CASCADE_MIN_ROWS, and the survivor gather is in scope — every input column is
+  // projected or referenced by the expensive residual — evaluate the cheap conjuncts first and
+  // run the expensive residual only on surviving rows. The gather happens when the prefilter
+  // pass rate is at most Config::FILTER_CASCADE_MAX_PASS_RATE (see config.cpp for the break-even
+  // reasoning); above that the residual runs over all rows and the two masks are ANDed. Any
+  // split of a conjunction selects the same rows under Kleene AND, so this is purely a
+  // performance decision. Returns nullopt when the cascade does not apply (including an
+  // out-of-scope gather, where splitting could never beat the monolithic kernel); the caller
+  // then falls through to the monolithic single-mask path.
+  std::optional<std::unique_ptr<cudf::table>> try_select_cascade(
+    cudf::table_view input, std::span<cudf::size_type const> output_indices);
 
   // Execute the AST tree rooted at the given expression reference and return the result as a
   // column.

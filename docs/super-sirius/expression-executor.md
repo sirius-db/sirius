@@ -110,6 +110,35 @@ The strategy is a DuckDB SET variable registered in `src/sirius_extension.cpp`:
 SET expression_evaluator_strategy = 'ast_jit';   -- or 'ast_interpret', 'materialize'
 ```
 
+## Filter cascade in select()
+
+**Files:** `src/expression_evaluator/filter_cascade.cpp`, `src/include/expression_evaluator/filter_cascade_internal.hpp`
+
+`select()` — the universal filter route used by `sirius_physical_filter`, `sirius_physical_table_scan`, and the scan ingestibles' predicate pushdown — can split a filter whose predicate is a top-level AND mixing cheap fixed-width conjuncts with expensive (string-carried) ones: it evaluates the cheap group first and runs the expensive residual only on rows surviving that prefilter. On TPC-H q19's part scan this avoids most of a 116-register JIT string kernel's work. The cascade is an internal execution strategy: callers see the exact same signature, result contract, and byte-identical rows.
+
+Per `select()` call (one knob snapshot at entry):
+
+1. Refuse (`not_applicable`, monolithic path) unless `filter_cascade_cheap_conjuncts` is set, the batch has at least `filter_cascade_min_rows` rows, the single predicate's root is a top-level AND, the classifier splits its children into non-empty cheap and expensive groups, and the survivor gather is *in scope*: every input column is in the union of `output_indices` and the columns referenced by the expensive residual. An out-of-scope gather refuses outright — a cascade that may never gather only adds launches and a sync over the monolithic kernel.
+2. Evaluate the cheap group's mask; count survivors via `cudf::bools_to_mask` (one 4-byte device-to-host sync).
+3. Zero survivors → `short_circuited`: return `cudf::empty_like` of the projection without running the residual.
+4. Pass rate ≤ `filter_cascade_max_pass_rate` → `cascaded`: gather survivors with `cudf::apply_boolean_mask`, evaluate the residual on them, apply its mask.
+5. Otherwise → `combined_masks`: evaluate the residual over all rows and Kleene-AND the two masks (the cheap mask is a sunk cost at this point; ANDing beats recomputing the monolithic predicate).
+
+The classifier (`sirius::detail::is_cheap_prefilter_conjunct`) marks a conjunct cheap iff every node in its subtree is an elementwise, fixed-width-carried operation:
+
+| `ast::node` alternative | Cheap when |
+|---|---|
+| `reference` | column index in bounds and the *runtime carrier* satisfies `cudf::is_fixed_width` (a decode-time predicate substitution's BOOL8 mask reference classifies cheap) |
+| `constant` | not VARCHAR |
+| `comparison`, `between`, `in_list` | all operands cheap |
+| `conjunction` (AND or OR) | non-empty and all children cheap |
+| `unary_op` | NOT / IS NULL / IS NOT NULL over a cheap child |
+| `cast`, `case_expr`, `coalesce`, `function_call`, `aggregate`, any future alternative | never (deliberately conservative default arm) |
+
+Correctness is Kleene partition invariance: a top-level AND selects a row iff every partition of its conjuncts evaluates to TRUE for it, so any split — including the mask AND and the short-circuit — produces the identical row set, and misclassification can only move cost, never change results.
+
+The knobs are documented in [configuration.md](configuration.md) → Expression Evaluation; the break-even reasoning behind the defaults lives in `src/config.cpp`.
+
 ## Supported Expression Types
 
 | Expression Type | Sirius AST alternative | Example |
@@ -198,6 +227,8 @@ This is used by `sirius_physical_hash_join` in MIXED_JOIN mode to pass the condi
 |------|---------|
 | `src/include/expression_evaluator/expression_evaluator.hpp` | Main evaluator class |
 | `src/expression_evaluator/expression_evaluator.cpp` | Driver: strategy dispatch, AST tree management, temp lifetimes |
+| `src/expression_evaluator/filter_cascade.cpp` | Cheap-conjunct filter cascade policy for `select()` (classifier + `try_select_cascade`) |
+| `src/include/expression_evaluator/filter_cascade_internal.hpp` | `sirius::detail::is_cheap_prefilter_conjunct` classifier contract (exposed for tests) |
 | `src/expression_evaluator/specializations/*.cpp` | Per-Sirius-AST-alternative dispatch (comparison, case, function, …) |
 | `src/include/expression_evaluator/expression_evaluator_strategy.hpp` | `expression_evaluator_strategy` enum + string conversions |
 | `src/include/expression_evaluator/ast_supported_types.hpp` | AST-eligible cast targets and functions (`supported_ast_cast_types`, `supported_ast_functions`) |
