@@ -172,8 +172,8 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
  * Wraps the gpu_table_representation owning_table_view ctor: the batch holds a non-owning
  * @p view whose underlying device memory is kept alive by @p owner (e.g. a read_only_data_batch
  * lock on a source batch, and/or a shared_ptr<cudf::table> of freshly-evaluated columns). The
- * owner must be copy-constructible (std::any requirement). Used by the projection operator to
- * return columns without copying passthrough (BOUND_REF) inputs.
+ * owner must be copy-constructible (std::any requirement). Producers include the projection
+ * operator (passthrough BOUND_REF columns) and the scan operator (view-forwarded pinned columns).
  *
  * STREAM-LINEAGE: @p writer_stream must be a stream that is ordered after every write to the
  * memory referenced by @p view (the caller is responsible for inserting any cudaStreamWaitEvent

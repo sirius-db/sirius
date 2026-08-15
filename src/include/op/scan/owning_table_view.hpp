@@ -28,12 +28,14 @@
 #include <rmm/resource_ref.hpp>
 
 #include <algorithm>
+#include <any>
 #include <cassert>
 #include <concepts>
 #include <cstddef>
 #include <functional>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -150,6 +152,15 @@ class my_view {
     return _model->materialize(_selection, stream, mr);
   }
 
+  /// Move the type-erased owner out for zero-copy forwarding, or @c std::nullopt when this owner
+  /// keeps the materialize path (the engagement gate is documented on
+  /// @c owning_table_view::release_view). Engages at most once; afterwards only destruction is
+  /// valid.
+  [[nodiscard]] std::optional<std::any> try_surrender_owner()
+  {
+    return _model->try_surrender_owner();
+  }
+
  private:
   struct owner_concept {
     virtual ~owner_concept() = default;
@@ -160,6 +171,8 @@ class my_view {
       std::span<const cudf::size_type> selection,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) = 0;
+
+    [[nodiscard]] virtual std::optional<std::any> try_surrender_owner() = 0;
   };
 
   template <typename Owner>
@@ -195,6 +208,17 @@ class my_view {
         // Generic owner: copy the selected view into a fresh table.
         std::vector<cudf::size_type> sel(selection.begin(), selection.end());
         return std::make_unique<cudf::table>(_base_view.select(sel), stream, mr);
+      }
+    }
+
+    [[nodiscard]] std::optional<std::any> try_surrender_owner() override
+    {
+      // Surrender only the owners whose materialize would copy; a no_alloc owner keeps its
+      // move-out path, and std::any storage additionally needs a copy-constructible owner.
+      if constexpr (!no_alloc_materializable<Owner> && std::copy_constructible<Owner>) {
+        return std::make_any<Owner>(std::move(_owner));
+      } else {
+        return std::nullopt;
       }
     }
 
@@ -313,6 +337,27 @@ class owning_table_view {
   [[nodiscard]] std::unique_ptr<cudf::table> release(
     rmm::cuda_stream_view stream      = cudf::get_default_stream(),
     rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+  /// The currently-selected view together with the type-erased owner keeping its device memory
+  /// alive, as surrendered by @ref release_view.
+  struct released_view {
+    cudf::table_view view;
+    std::any owner;
+  };
+
+  /**
+   * @brief Surrender the current view and its owner without materializing, leaving the handle
+   *        empty.
+   *
+   * Engages precisely when @ref release would deep-copy: the handle is in a view state over an
+   * owner that is not @ref detail::no_alloc_materializable and is copy-constructible (a
+   * @c std::any storage requirement). Owned tables, views demoted from owned tables (whose
+   * @c std::unique_ptr<cudf::table> owner releases by moving), move-only owners, and the empty
+   * state all return @c std::nullopt and leave the handle untouched for @ref release. Moving the
+   * owner relocates neither the viewed device memory nor the stored base view, so the returned
+   * view stays valid for as long as the returned owner lives.
+   */
+  [[nodiscard]] std::optional<released_view> release_view();
 
   /// Release all held data, leaving the handle empty.
   void drop();

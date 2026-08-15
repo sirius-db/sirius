@@ -48,6 +48,7 @@
 #include <io/io_context.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/gpu_ingestible_types.hpp>
+#include <op/scan/owning_table_view.hpp>
 #include <op/scan/sirius_gpu_scan_operator.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <op/sirius_physical_operator.hpp>
@@ -123,11 +124,12 @@ class stub_ingestible final : public sirius::op::scan::gpu_ingestible {
 
   explicit stub_ingestible(table_factory produce) : _produce(std::move(produce)) {}
 
-  std::unique_ptr<cudf::table> post_filter_and_project(sirius::op::scan::filtered_table&&,
-                                                       const cucascade::memory::memory_space&,
-                                                       rmm::cuda_stream_view) override
+  sirius::op::scan::owning_table_view post_filter_and_project(
+    sirius::op::scan::filtered_table&&,
+    const cucascade::memory::memory_space&,
+    rmm::cuda_stream_view) override
   {
-    return _produce();
+    return sirius::op::scan::owning_table_view{_produce()};
   }
 
   std::unique_ptr<sirius::op::scan::batch_coalescer> create_batch_coalescer() const override

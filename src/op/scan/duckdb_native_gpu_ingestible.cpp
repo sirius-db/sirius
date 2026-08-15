@@ -340,7 +340,7 @@ std::unique_ptr<batch_coalescer> duckdb_native_gpu_ingestible::create_batch_coal
 //===----------------------------------------------------------------------===//
 // post_filter_and_project — filter eval + projection to output arity
 //===----------------------------------------------------------------------===//
-std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_project(
+owning_table_view duckdb_native_gpu_ingestible::post_filter_and_project(
   filtered_table&& input,
   ::cucascade::memory::memory_space const& mem_space,
   rmm::cuda_stream_view stream)
@@ -381,7 +381,7 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
     final_table.select_columns(selected_cols);
   }
 
-  return final_table.release(stream, mr_ref);
+  return final_table;
 }
 
 //===----------------------------------------------------------------------===//

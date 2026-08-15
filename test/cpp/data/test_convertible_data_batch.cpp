@@ -17,7 +17,13 @@
 #include "catch.hpp"
 #include "operator/operator_test_utils.hpp"
 
+#include <cudf/column/column.hpp>
+#include <cudf/column/column_factories.hpp>
+#include <cudf/table/table_view.hpp>
+
 #include <rmm/cuda_stream.hpp>
+
+#include <cuda_runtime_api.h>
 
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -26,6 +32,7 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <data/convertible_data_batch.hpp>
 #include <data/data_batch_utils.hpp>
+#include <telemetry/data_batch_probe.hpp>
 
 #include <memory>
 #include <vector>
@@ -100,6 +107,52 @@ TEST_CASE("convertible_data_batch converts GPU batch to HOST", "[convertible_dat
   REQUIRE((*result)[0] > 0);
   REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
   REQUIRE(batch->get_state() == cucascade::batch_state::idle);
+}
+
+TEST_CASE("convertible_data_batch downgrades a view-backed GPU batch by copy-out",
+          "[convertible_data_batch]")
+{
+  auto& e = env();
+
+  std::vector<int32_t> const values{1, 2, 3, 4, 5};
+  auto owned =
+    cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                              static_cast<cudf::size_type>(values.size()),
+                              cudf::mask_state::UNALLOCATED,
+                              sirius::test::operator_utils::default_stream(),
+                              sirius::test::operator_utils::get_resource_ref(*e.gpu_space));
+  cudaMemcpy(owned->mutable_view().head<int32_t>(),
+             values.data(),
+             sizeof(int32_t) * values.size(),
+             cudaMemcpyHostToDevice);
+  std::shared_ptr<cudf::column> column(std::move(owned));
+
+  // The scan's view-forward output shape: a batch viewing shared column storage it does not own.
+  std::vector<cudf::column_view> views{column->view()};
+  auto batch = sirius::make_data_batch_from_view(cudf::table_view{views},
+                                                 std::vector<std::shared_ptr<cudf::column>>{column},
+                                                 column->alloc_size(),
+                                                 *e.gpu_space,
+                                                 e.stream(),
+                                                 sirius::telemetry::batch_telemetry_info{});
+
+  sirius::convertible_data_batch wrapper(batch);
+  auto result = wrapper.convert({e.host_space}, e.stream(), *e.mgr, true);
+  REQUIRE(result.has_value());
+  REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
+
+  // The downgrade copied out of the view: the source column is intact and now solely ours.
+  REQUIRE(column.use_count() == 1);
+  REQUIRE(sirius::test::operator_utils::copy_column_to_host<int32_t>(column->view()) == values);
+
+  // Round-trip the host bytes back to the GPU to check them.
+  sirius::convertible_data_batch upgrade(batch);
+  auto restored = upgrade.convert({e.gpu_space}, e.stream(), *e.mgr, true);
+  REQUIRE(restored.has_value());
+  e.stream().synchronize();
+  auto ro   = batch->to_read_only();
+  auto view = sirius::get_cudf_table_view(ro);
+  REQUIRE(sirius::test::operator_utils::copy_column_to_host<int32_t>(view.column(0)) == values);
 }
 
 TEST_CASE("convertible_data_batch returns nullopt with empty target_spaces",

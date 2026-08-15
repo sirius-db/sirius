@@ -170,10 +170,9 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
     ::cucascade::memory::memory_space const& mem_space,
     rmm::cuda_stream_view stream) override;
 
-  std::unique_ptr<cudf::table> post_filter_and_project(
-    filtered_table&& input,
-    ::cucascade::memory::memory_space const& mem_space,
-    rmm::cuda_stream_view stream) override;
+  owning_table_view post_filter_and_project(filtered_table&& input,
+                                            ::cucascade::memory::memory_space const& mem_space,
+                                            rmm::cuda_stream_view stream) override;
 
   [[nodiscard]] const ingestible_table_info& table_info() const noexcept override { return *_info; }
 

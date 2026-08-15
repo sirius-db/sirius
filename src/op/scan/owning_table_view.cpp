@@ -16,6 +16,8 @@
 
 #include "op/scan/owning_table_view.hpp"
 
+#include <any>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -122,6 +124,19 @@ std::unique_ptr<cudf::table> owning_table_view::release(rmm::cuda_stream_view st
   if (auto* table = std::get_if<std::unique_ptr<cudf::table>>(&_state)) { out = std::move(*table); }
   _state = std::monostate{};
   return out;
+}
+
+std::optional<owning_table_view::released_view> owning_table_view::release_view()
+{
+  auto* view = std::get_if<std::unique_ptr<detail::my_view>>(&_state);
+  if (view == nullptr) { return std::nullopt; }
+  // Capture the selected view before surrendering: the surrender moves only the type-erased
+  // owner handle, never the device buffers or the base view the selection is applied to.
+  auto selected = (*view)->view();
+  auto owner    = (*view)->try_surrender_owner();
+  if (!owner.has_value()) { return std::nullopt; }
+  _state = std::monostate{};
+  return released_view{selected, std::move(*owner)};
 }
 
 void owning_table_view::drop() { _state = std::monostate{}; }

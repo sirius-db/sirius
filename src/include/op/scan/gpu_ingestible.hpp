@@ -130,12 +130,13 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    *        @ref materialize_metadata_to_table did not return
    *        @c filter_state::ROW_FILTERED_AND_PROJECTED.
    *
-   * Takes the input by owning unique_ptr so implementations that call
-   * @c assemble_scan_output (which consumes its input by rvalue) can
-   * move-forward without an extra view→owning copy on the dominant
-   * fresh-read + assembly path.
+   * Takes the input by rvalue so implementations can move it through their filter and assembly
+   * steps without an extra copy. The result is returned in the handle's natural state — an owned
+   * table when a row filter gathered fresh columns, a view selection otherwise — and
+   * @c sirius_gpu_scan_operator::execute decides whether to forward that view zero-copy or
+   * materialize it.
    */
-  virtual std::unique_ptr<cudf::table> post_filter_and_project(
+  virtual owning_table_view post_filter_and_project(
     filtered_table&& input,
     const cucascade::memory::memory_space& mem_space,
     rmm::cuda_stream_view stream) = 0;

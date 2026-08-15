@@ -22,6 +22,7 @@
 #include <helper/numeric_narrowing.hpp>
 #include <log/logging.hpp>
 #include <op/scan/gpu_ingestible.hpp>
+#include <op/scan/owning_table_view.hpp>
 #include <op/scan/sirius_gpu_scan_operator.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <op/sirius_physical_operator.hpp>
@@ -30,6 +31,7 @@
 #include <sirius_context.hpp>
 
 // cudf
+#include <cudf/column/column.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
@@ -43,8 +45,10 @@
 
 // standard library
 #include <algorithm>
+#include <any>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -66,16 +70,22 @@ constexpr std::size_t saturating_mul(std::size_t value, std::size_t factor) noex
   return value > max / factor ? max : value * factor;
 }
 
-std::unique_ptr<cudf::table> normalize_physical_schema(std::unique_ptr<cudf::table> table,
-                                                       const std::vector<cudf::data_type>& targets,
-                                                       bool has_explicit_physical_schema,
-                                                       duckdb::SiriusContext* observer,
-                                                       rmm::cuda_stream_view stream,
-                                                       rmm::device_async_resource_ref mr)
+/// The per-column casts schema normalization needs for @p view: one entry per column, null when
+/// the column already carries its planned target (the caller keeps its own column), the freshly
+/// casted replacement otherwise; empty when @p targets is empty. Throws for every shape
+/// normalization cannot handle — a width mismatch, or a carrier that is neither the target nor a
+/// valid restore/narrow source (validated before any cast is enqueued).
+std::vector<std::unique_ptr<cudf::column>> normalize_physical_schema_casts(
+  cudf::table_view const& view,
+  const std::vector<cudf::data_type>& targets,
+  bool has_explicit_physical_schema,
+  duckdb::SiriusContext* observer,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
 {
-  if (targets.empty()) { return table; }
+  if (targets.empty()) { return {}; }
 
-  auto const actual_width = static_cast<std::size_t>(table->num_columns());
+  auto const actual_width = static_cast<std::size_t>(view.num_columns());
   if (actual_width != targets.size()) {
     throw internal_exception(
       "[sirius_gpu_scan_operator] output schema width mismatch: materialized {} columns, expected "
@@ -84,13 +94,12 @@ std::unique_ptr<cudf::table> normalize_physical_schema(std::unique_ptr<cudf::tab
       targets.size());
   }
 
-  // Preflight while every source column remains owned. Without a sidecar, resident batches may
-  // only widen a narrow stored carrier to its native type. An explicit sidecar may also narrow a
-  // freshly decoded carrier, but only after exact materialized bounds confirm that its values fit
-  // the planned target.
-  auto const table_view = table->view();
+  // Preflight every column before casting any. Without a sidecar, resident batches may only widen
+  // a narrow stored carrier to its native type. An explicit sidecar may also narrow a freshly
+  // decoded carrier, but only after exact materialized bounds confirm that its values fit the
+  // planned target.
   for (std::size_t column_idx = 0; column_idx < targets.size(); column_idx++) {
-    auto const& column = table_view.column(column_idx);
+    auto const& column = view.column(static_cast<cudf::size_type>(column_idx));
     auto const actual  = column.type();
     auto const target  = targets[column_idx];
     if (actual == target || can_restore_to(actual, target)) { continue; }
@@ -124,14 +133,15 @@ std::unique_ptr<cudf::table> normalize_physical_schema(std::unique_ptr<cudf::tab
     }
   }
 
-  auto columns = table->release();
-  for (std::size_t column_idx = 0; column_idx < columns.size(); column_idx++) {
+  std::vector<std::unique_ptr<cudf::column>> casts(targets.size());
+  for (std::size_t column_idx = 0; column_idx < targets.size(); column_idx++) {
+    auto const& column   = view.column(static_cast<cudf::size_type>(column_idx));
     auto const target    = targets[column_idx];
-    auto const actual    = columns[column_idx]->type();
+    auto const actual    = column.type();
     auto const restoring = can_restore_to(actual, target);
     auto const narrowing = has_explicit_physical_schema && can_narrow_to(actual, target);
     if (actual == target || (!restoring && !narrowing)) { continue; }
-    columns[column_idx] = cudf::cast(columns[column_idx]->view(), target, stream, mr);
+    casts[column_idx] = cudf::cast(column, target, stream, mr);
     if (observer != nullptr) {
       if (narrowing) {
         observer->record_compressed_materialization_scan_columns_narrowed();
@@ -145,7 +155,95 @@ std::unique_ptr<cudf::table> normalize_physical_schema(std::unique_ptr<cudf::tab
                      cudf::type_to_name(actual),
                      cudf::type_to_name(target));
   }
+  return casts;
+}
+
+/// Cast each column of @p table to its planned carrier, returning the input unchanged when every
+/// column already matches.
+std::unique_ptr<cudf::table> normalize_physical_schema(std::unique_ptr<cudf::table> table,
+                                                       const std::vector<cudf::data_type>& targets,
+                                                       bool has_explicit_physical_schema,
+                                                       duckdb::SiriusContext* observer,
+                                                       rmm::cuda_stream_view stream,
+                                                       rmm::device_async_resource_ref mr)
+{
+  auto casts = normalize_physical_schema_casts(
+    table->view(), targets, has_explicit_physical_schema, observer, stream, mr);
+  if (std::all_of(casts.begin(), casts.end(), [](auto const& cast) { return cast == nullptr; })) {
+    return table;
+  }
+  // Swap the replacements in. The unique_ptr moves never relocate the columns the casts read
+  // from, and a replaced source column is destroyed only after its cast was enqueued on the same
+  // stream.
+  auto columns = table->release();
+  for (std::size_t column_idx = 0; column_idx < casts.size(); column_idx++) {
+    if (casts[column_idx]) { columns[column_idx] = std::move(casts[column_idx]); }
+  }
   return std::make_unique<cudf::table>(std::move(columns));
+}
+
+/// Composite keep-alive for a mixed view-forward emission: @c pinned is the owner surrendered by
+/// owning_table_view::release_view, keeping the view-forwarded columns' device memory alive, and
+/// @c casted owns the freshly casted replacement columns. Copy-constructible, as
+/// make_data_batch_from_view's std::any owner storage requires.
+struct mixed_scan_owner {
+  std::any pinned;
+  std::shared_ptr<std::vector<std::unique_ptr<cudf::column>>> casted;
+};
+
+/// Emit the output batch for a surrendered view: a pure view batch when @p casts holds no
+/// replacement (every column forwards zero-copy under @p forwarded's owner), otherwise a mixed
+/// view batch of forwarded columns beside the casted replacements, kept alive by a composite
+/// owner (all-cast is the degenerate mix with nothing forwarded). Attributed bytes are the casted
+/// columns' exact allocations plus the @p total_input_bytes-based estimate for the forwarded
+/// columns only.
+std::shared_ptr<::cucascade::data_batch> emit_view_forward(
+  owning_table_view::released_view forwarded,
+  std::vector<std::unique_ptr<cudf::column>> casts,
+  std::size_t total_input_bytes,
+  ::cucascade::memory::memory_space& mem_space,
+  rmm::cuda_stream_view stream,
+  const telemetry::batch_telemetry_info& telemetry)
+{
+  auto const num_casted = static_cast<std::size_t>(
+    std::count_if(casts.begin(), casts.end(), [](auto const& cast) { return cast != nullptr; }));
+
+  if (num_casted == 0) {
+    std::vector<cudf::size_type> all_columns(
+      static_cast<std::size_t>(forwarded.view.num_columns()));
+    std::iota(all_columns.begin(), all_columns.end(), 0);
+    auto const referenced_bytes =
+      sirius::estimate_referenced_column_bytes(forwarded.view, all_columns, total_input_bytes);
+    return sirius::make_data_batch_from_view(
+      forwarded.view, std::move(forwarded.owner), referenced_bytes, mem_space, stream, telemetry);
+  }
+
+  // Views are taken before the cast vector is moved (unique_ptr moves never relocate the
+  // columns).
+  std::vector<cudf::column_view> views;
+  views.reserve(casts.size());
+  std::vector<cudf::size_type> forwarded_columns;
+  forwarded_columns.reserve(casts.size() - num_casted);
+  std::size_t casted_bytes = 0;
+  for (std::size_t column_idx = 0; column_idx < casts.size(); column_idx++) {
+    if (casts[column_idx]) {
+      views.push_back(casts[column_idx]->view());
+      casted_bytes += casts[column_idx]->alloc_size();
+    } else {
+      views.push_back(forwarded.view.column(static_cast<cudf::size_type>(column_idx)));
+      forwarded_columns.push_back(static_cast<cudf::size_type>(column_idx));
+    }
+  }
+  auto const alloc_size = casted_bytes + sirius::estimate_referenced_column_bytes(
+                                           forwarded.view, forwarded_columns, total_input_bytes);
+  auto casted = std::make_shared<std::vector<std::unique_ptr<cudf::column>>>(std::move(casts));
+  return sirius::make_data_batch_from_view(
+    cudf::table_view{views},
+    mixed_scan_owner{std::move(forwarded.owner), std::move(casted)},
+    alloc_size,
+    mem_space,
+    stream,
+    telemetry);
 }
 
 }  // namespace
@@ -225,29 +323,50 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
   }
 
   ::cucascade::memory::memory_space* mem_space = scan_input->gpu_memory_space;
-  std::unique_ptr<cudf::table> output_table;
   auto materialized_table = _ingestible->materialize_table(*scan_input, stream);
-  if (materialized_table.state != filter_state::ROW_FILTERED_AND_PROJECTED) {
-    output_table =
-      _ingestible->post_filter_and_project(std::move(materialized_table), *mem_space, stream);
-  } else {
-    output_table = materialized_table.table.release(stream, mem_space->get_default_allocator());
-  }
+  owning_table_view result =
+    materialized_table.state != filter_state::ROW_FILTERED_AND_PROJECTED
+      ? _ingestible->post_filter_and_project(std::move(materialized_table), *mem_space, stream)
+      : std::move(materialized_table.table);
 
-  // Cast each batch column to its planned carrier. A resident chunk is normalized even without a
-  // sidecar: it may be stored narrow (pinned with the feature on, queried with it off) and must
-  // then restore to native.
   auto const has_explicit_physical_schema = has_physical_overrides();
-  if (has_explicit_physical_schema || scan_input->is_resident()) {
-    output_table = normalize_physical_schema(std::move(output_table),
-                                             normalization_targets(),
-                                             has_explicit_physical_schema,
-                                             _compressed_materialization_observer,
-                                             stream,
-                                             mem_space->get_default_allocator());
+  auto const needs_normalization = has_explicit_physical_schema || scan_input->is_resident();
+
+  std::shared_ptr<::cucascade::data_batch> batch;
+  if (auto forwarded = result.release_view()) {
+    // An engaged surrender is a resident pinned split served as a view over its wrapper batch:
+    // cast only the columns whose stored carrier disagrees with the plan target, and let the
+    // surrendered owner keep the pinned columns alive for the output batch's lifetime, past
+    // unpin_table.
+    auto casts = needs_normalization
+                   ? normalize_physical_schema_casts(forwarded->view,
+                                                     normalization_targets(),
+                                                     has_explicit_physical_schema,
+                                                     _compressed_materialization_observer,
+                                                     stream,
+                                                     mem_space->get_default_allocator())
+                   : std::vector<std::unique_ptr<cudf::column>>{};
+    batch      = emit_view_forward(std::move(*forwarded),
+                              std::move(casts),
+                              scan_input->get_estimated_size_in_bytes(),
+                              *mem_space,
+                              stream,
+                              batch_telemetry());
+  } else {
+    auto output_table = result.release(stream, mem_space->get_default_allocator());
+    // Cast each batch column to its planned carrier. A resident chunk is normalized even without
+    // a sidecar: it may be stored narrow (pinned with the feature on, queried with it off) and
+    // must then restore to native.
+    if (needs_normalization) {
+      output_table = normalize_physical_schema(std::move(output_table),
+                                               normalization_targets(),
+                                               has_explicit_physical_schema,
+                                               _compressed_materialization_observer,
+                                               stream,
+                                               mem_space->get_default_allocator());
+    }
+    batch = sirius::make_data_batch(std::move(output_table), *mem_space, stream, batch_telemetry());
   }
-  auto batch =
-    sirius::make_data_batch(std::move(output_table), *mem_space, stream, batch_telemetry());
   std::vector<std::shared_ptr<::cucascade::data_batch>> batches{std::move(batch)};
   return std::make_unique<pipelineable_operator_data>(std::move(batches));
 }

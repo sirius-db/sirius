@@ -28,6 +28,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -86,6 +87,12 @@ std::vector<void const*> data_ptrs(cudf::table_view view)
 // dereferenceable release()), forcing the copying materialization path.
 struct table_keepalive {
   std::unique_ptr<cudf::table> table;
+};
+
+// A copyable keep-alive owner that does NOT satisfy no_alloc_materializable — the shape a
+// resident pinned split's shared-column storage takes, and the one release_view surrenders.
+struct shared_column_keepalive {
+  std::shared_ptr<cudf::column> column;
 };
 
 }  // namespace
@@ -272,4 +279,78 @@ TEST_CASE("owning_table_view generic owner materializes by copy", "[owning_table
   auto result_ptrs = data_ptrs(result->view());
   REQUIRE(result_ptrs[0] != original_ptrs[0]);
   REQUIRE(result_ptrs[1] != original_ptrs[2]);
+}
+
+TEST_CASE("owning_table_view release_view disengages for an owned table", "[owning_table_view]")
+{
+  owning_table_view handle{tagged_table({10, 20, 30})};
+  REQUIRE_FALSE(handle.release_view().has_value());
+  REQUIRE(static_cast<bool>(handle));  // untouched
+
+  auto result = handle.release(test_stream(), test_mr());
+  REQUIRE(read_tags(result->view()) == std::vector<std::int32_t>{10, 20, 30});
+
+  // The empty state disengages too.
+  owning_table_view empty;
+  REQUIRE_FALSE(empty.release_view().has_value());
+}
+
+TEST_CASE("owning_table_view release_view disengages for a view demoted from an owned table",
+          "[owning_table_view]")
+{
+  auto table         = tagged_table({10, 20, 30});
+  auto original_ptrs = data_ptrs(table->view());
+
+  owning_table_view handle{std::move(table)};
+  std::array<std::size_t, 1> keep{2};
+  handle.select_columns(keep);  // demotes to a view over the (no_alloc) owned table
+  REQUIRE_FALSE(handle.release_view().has_value());
+  REQUIRE(static_cast<bool>(handle));
+
+  // release() still moves the surviving buffer out rather than copying.
+  auto result = handle.release(test_stream(), test_mr());
+  REQUIRE(read_tags(result->view()) == std::vector<std::int32_t>{30});
+  REQUIRE(data_ptrs(result->view())[0] == original_ptrs[2]);
+}
+
+TEST_CASE("owning_table_view release_view surrenders a copyable copy-requiring owner",
+          "[owning_table_view]")
+{
+  auto column = std::shared_ptr<cudf::column>(tagged_column(42));
+  std::vector<cudf::column_view> views{column->view()};
+  cudf::table_view base{views};
+
+  std::optional<owning_table_view::released_view> released;
+  {
+    owning_table_view handle{shared_column_keepalive{column}, base};
+    released = handle.release_view();
+    REQUIRE(released.has_value());
+    // An engaged surrender empties the handle.
+    REQUIRE_FALSE(static_cast<bool>(handle));
+    REQUIRE(handle.release(test_stream(), test_mr()) == nullptr);
+  }  // handle destroyed
+
+  // The surrendered owner keeps the data alive: same buffer, correct value.
+  REQUIRE(released->view.num_columns() == 1);
+  REQUIRE(released->view.column(0).head() == column->view().head());
+  REQUIRE(read_tags(released->view) == std::vector<std::int32_t>{42});
+  REQUIRE(column.use_count() == 2);  // this test + the surrendered owner
+  released.reset();
+  REQUIRE(column.use_count() == 1);
+}
+
+TEST_CASE("owning_table_view release_view disengages for a move-only owner", "[owning_table_view]")
+{
+  auto table         = tagged_table({10, 20});
+  auto base_view     = table->view();
+  auto original_ptrs = data_ptrs(base_view);
+
+  owning_table_view handle{table_keepalive{std::move(table)}, base_view};
+  REQUIRE_FALSE(handle.release_view().has_value());
+  REQUIRE(static_cast<bool>(handle));
+
+  // release() keeps its copying materialization for this owner.
+  auto result = handle.release(test_stream(), test_mr());
+  REQUIRE(read_tags(result->view()) == std::vector<std::int32_t>{10, 20});
+  REQUIRE(data_ptrs(result->view())[0] != original_ptrs[0]);
 }
