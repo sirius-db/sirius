@@ -712,6 +712,7 @@ set(TEST_SOURCES
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_merge.cpp
+    test/cpp/operator/aggregate/test_surrogate_groupby.cpp
     test/cpp/operator/test_crc32_partition_hash.cpp
     test/cpp/operator/test_gpu_partition_impl.cpp
     test/cpp/operator/test_host_table_chunk_reader.cpp

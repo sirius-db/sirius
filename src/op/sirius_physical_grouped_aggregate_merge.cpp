@@ -33,6 +33,7 @@
 #include <cudf/table/table.hpp>
 #include <cudf/unary.hpp>
 
+#include <cuda_runtime_api.h>
 #include <nvtx3/nvtx3.hpp>
 
 namespace sirius {
@@ -325,6 +326,22 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{result});
 }
 
+void sirius_physical_grouped_aggregate_merge::on_finalize_operator()
+{
+  // All merge tasks are done: drop the surrogate store's retained source accessors so the
+  // batches become downgradable/freeable for whatever remains of the query.
+  if (surrogate_spec && surrogate_spec->store) {
+    auto const [count, bytes] = surrogate_spec->store->release();
+    if (count > 0) {
+      SIRIUS_LOG_INFO(
+        "groupby_surrogate_keys: released {} retained source batch accessor(s) ({} bytes) after "
+        "merge finalization",
+        count,
+        bytes);
+    }
+  }
+}
+
 std::shared_ptr<::cucascade::data_batch>
 sirius_physical_grouped_aggregate_merge::finalize_surrogate_groupby(
   std::shared_ptr<::cucascade::data_batch> merged, rmm::cuda_stream_view stream)
@@ -345,22 +362,37 @@ sirius_physical_grouped_aggregate_merge::finalize_surrogate_groupby(
   // tuple grouping and no re-group is needed. The check is EXACT (cudf::distinct_count with
   // nulls equal, matching groupby null_policy::INCLUDE semantics), so the fast path is safe by
   // construction; when the proof fails we fall through to the conservative full-tuple re-group.
+  //
+  // NaN parity guard: SQL GROUP BY treats all NaNs as one group, but distinct_count's row
+  // comparator's NaN semantics are not contractually documented, so the proof comparator might
+  // be FINER than the grouping's on floating-point keys (two NaN rows counted distinct would
+  // fake a proof and leak a duplicate group). Floating-point real keys therefore always take
+  // the conservative re-group.
   bool tuples_proven_distinct = (num_rows == 0);
   if (!tuples_proven_distinct && spec.unique_fastpath && !spec.real_key_slots.empty()) {
+    bool has_floating_point_key = false;
     std::vector<cudf::column_view> check_cols;
     check_cols.reserve(spec.real_key_slots.size());
     for (int slot : spec.real_key_slots) {
-      check_cols.push_back(cols.at(static_cast<std::size_t>(slot))->view());
+      auto view = cols.at(static_cast<std::size_t>(slot))->view();
+      if (view.type().id() == cudf::type_id::FLOAT32 ||
+          view.type().id() == cudf::type_id::FLOAT64) {
+        has_floating_point_key = true;
+        break;
+      }
+      check_cols.push_back(view);
     }
-    auto const distinct =
-      cudf::distinct_count(cudf::table_view(check_cols), cudf::null_equality::EQUAL, stream);
-    tuples_proven_distinct = (distinct == num_rows);
+    if (!has_floating_point_key) {
+      auto const distinct =
+        cudf::distinct_count(cudf::table_view(check_cols), cudf::null_equality::EQUAL, stream);
+      tuples_proven_distinct = (distinct == num_rows);
+    }
   }
 
   // Materialize the deferred string key columns: per deferral-join side, gather the retained
   // source columns at the merged rowids. Sources are concatenated in base order, which
-  // reproduces the absolute rowid address space exactly (bases are contiguous by construction;
-  // stale registrations from retried tasks occupy address ranges no surviving rowid references).
+  // reproduces the absolute rowid address space exactly (bases are contiguous by construction
+  // and reserve/commit is deduplicated per batch id).
   for (auto const& group : spec.groups) {
     if (num_rows == 0) {
       for (std::size_t i = 0; i < group.restore_key_slots.size(); ++i) {
@@ -370,14 +402,21 @@ sirius_physical_grouped_aggregate_merge::finalize_surrogate_groupby(
       continue;
     }
 
+    auto const sources = spec.store->snapshot(group.from_left);
     std::vector<cudf::table_view> pieces;
-    {
-      std::lock_guard<std::mutex> lg(spec.store->mutex);
-      auto const& sources = spec.store->sources_for(group.from_left);
-      pieces.reserve(sources.size());
-      for (auto const& src : sources) {
-        pieces.push_back(sirius::get_cudf_table_view(src.batch).select(group.source_input_cols));
+    pieces.reserve(sources.size());
+    for (auto const& src : sources) {
+      // STREAM-LINEAGE: the retained batches were written on the deferral join's streams; order
+      // this task's stream after each writer event before reading their memory.
+      if (auto const writer_event = src.batch.get_writer_event(); writer_event != nullptr) {
+        auto const status = cudaStreamWaitEvent(stream.value(), writer_event, 0);
+        if (status != cudaSuccess) {
+          throw std::runtime_error(
+            std::string("finalize_surrogate_groupby: writer-event wait failed: ") +
+            cudaGetErrorString(status));
+        }
       }
+      pieces.push_back(sirius::get_cudf_table_view(src.batch).select(group.source_input_cols));
     }
     if (pieces.empty()) {
       throw std::runtime_error(
@@ -394,8 +433,7 @@ sirius_physical_grouped_aggregate_merge::finalize_surrogate_groupby(
     }
 
     auto const& rowid_col = cols.at(static_cast<std::size_t>(group.rowid_key_slot));
-    auto map32 =
-      cudf::cast(rowid_col->view(), cudf::data_type{cudf::type_id::INT32}, stream, mr);
+    auto map32 = cudf::cast(rowid_col->view(), cudf::data_type{cudf::type_id::INT32}, stream, mr);
     auto gathered =
       cudf::gather(src_view, map32->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
     auto gathered_cols = gathered->release();

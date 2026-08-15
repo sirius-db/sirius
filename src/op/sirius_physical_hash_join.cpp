@@ -2120,16 +2120,19 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
     }
   }
 
-  // Surrogate-key deferral: retain this call's source batches in the shared store and get the
-  // base offsets that make the emitted rowids globally unique across calls/partitions. The
-  // store holds read-only accessors, so the sources stay resident until the query completes.
+  // Surrogate-key deferral, two-phase per the store's retention protocol:
+  //  1. RESERVE this call's address ranges (idempotent per batch id, so a retried task or a
+  //     BUILD_PROBE build table shared by many probe tasks reuses ONE range and emits identical
+  //     rowids for the same source row). No accessor is taken yet, so a failure in the output
+  //     gather below leaves the sources downgradable for the OOM-retry machinery.
+  //  2. COMMIT the retaining read-only accessors only after the output was produced.
   int64_t surrogate_left_base  = 0;
   int64_t surrogate_right_base = 0;
   if (surrogate_emit) {
     auto& store = *surrogate_emit->store;
     if (surrogate_emit->left) {
-      surrogate_left_base =
-        store.register_source(/*is_left=*/true, input_batches[0], left_full.num_rows());
+      surrogate_left_base = store.reserve(
+        /*is_left=*/true, input_batches[0].get_batch_id(), left_full.num_rows());
     }
     if (surrogate_emit->right) {
       if (!surrogate_right_source) {
@@ -2137,24 +2140,36 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
           "sirius_physical_hash_join: surrogate-key deferral right-side source batch was not "
           "captured for this join mode");
       }
-      surrogate_right_base = store.register_source(
-        /*is_left=*/false, *surrogate_right_source, right_full.num_rows());
+      surrogate_right_base = store.reserve(
+        /*is_left=*/false, surrogate_right_source->get_batch_id(), right_full.num_rows());
     }
   }
 
-  return gather_join_output(join_type,
-                            left_full,
-                            right_full,
-                            lhs_output_columns.col_idxs,
-                            rhs_output_columns.col_idxs,
-                            std::move(left_indices),
-                            std::move(right_indices),
-                            *input_batches[0].get_memory_space(),
-                            stream,
-                            batch_telemetry(),
-                            surrogate_emit ? &*surrogate_emit : nullptr,
-                            surrogate_left_base,
-                            surrogate_right_base);
+  auto output = gather_join_output(join_type,
+                                   left_full,
+                                   right_full,
+                                   lhs_output_columns.col_idxs,
+                                   rhs_output_columns.col_idxs,
+                                   std::move(left_indices),
+                                   std::move(right_indices),
+                                   *input_batches[0].get_memory_space(),
+                                   stream,
+                                   batch_telemetry(),
+                                   surrogate_emit ? &*surrogate_emit : nullptr,
+                                   surrogate_left_base,
+                                   surrogate_right_base);
+
+  if (surrogate_emit) {
+    auto& store = *surrogate_emit->store;
+    if (surrogate_emit->left) {
+      store.commit(/*is_left=*/true, input_batches[0].get_batch_id(), input_batches[0]);
+    }
+    if (surrogate_emit->right) {
+      store.commit(
+        /*is_left=*/false, surrogate_right_source->get_batch_id(), *surrogate_right_source);
+    }
+  }
+  return output;
 }
 
 //===----------------------------------------------------------------------===//

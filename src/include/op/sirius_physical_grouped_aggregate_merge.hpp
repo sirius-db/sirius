@@ -156,6 +156,10 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   std::shared_ptr<::cucascade::data_batch> finalize_surrogate_groupby(
     std::shared_ptr<::cucascade::data_batch> merged, rmm::cuda_stream_view stream);
 
+  //! Release the surrogate store's retained source accessors once every merge task has
+  //! finalized, so the sources become reclaimable for the rest of the query.
+  void on_finalize_operator() override;
+
  private:
   friend class sirius::planner::sirius_physical_plan_generator;
   void set_fuse_into_parent(bool fuse) noexcept { _fuse_into_parent = fuse; }

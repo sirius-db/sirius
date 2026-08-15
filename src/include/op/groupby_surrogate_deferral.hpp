@@ -28,6 +28,8 @@
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace sirius {
@@ -39,12 +41,12 @@ namespace op {
  * When every STRING group key of a HASH_GROUP_BY is a pure pass-through of one side of a single
  * upstream INNER hash join ("the deferral join"), the planner replaces those keys in the join's
  * output with a compact numeric surrogate: the first deferred slot of each side carries a BIGINT
- * row id (the join gather-map value plus a per-registration base offset) and the remaining
- * deferred slots carry constant TINYINT dummies. Column COUNT and POSITIONS are unchanged
- * everywhere between the deferral join and the group-by, so intermediate operators only see a
- * type change at those slots. The deferral join retains read-only handles on its deferred-side
- * input batches; MERGE_GROUP_BY materializes the strings from them after aggregation and
- * restores the original output schema, so everything downstream of the merge is untouched.
+ * row id (the join gather-map value plus a per-source base offset) and the remaining deferred
+ * slots carry constant TINYINT dummies. Column COUNT and POSITIONS are unchanged everywhere
+ * between the deferral join and the group-by, so intermediate operators only see a type change
+ * at those slots. The deferral join retains read-only handles on its deferred-side input batches;
+ * MERGE_GROUP_BY materializes the strings from them after aggregation and restores the original
+ * output schema, so everything downstream of the merge is untouched.
  *
  * Correctness: the surrogate REFINES the original key tuple (each source row has exactly one
  * tuple), so partial sums compose. Grouping by surrogate can only differ from grouping by the
@@ -55,49 +57,135 @@ namespace op {
  * only the non-deferred key slots, so rows with equal real keys (a superset of equal-tuple rows)
  * always meet in the same merge task, making the per-task check and re-group globally sound.
  */
-struct surrogate_deferral_store {
-  /// One registered source: a read-only handle on a deferral-join input batch whose rows are
-  /// addressed by rowids in [base, base + rows). Bases are absolute and monotonically assigned,
-  /// so a stale registration (e.g. from a retried task whose output was discarded) wastes memory
-  /// but never corrupts addressing.
-  struct source {
+
+/// Retention store shared between the deferral join and the group-by merge.
+///
+/// Address-space invariants (relied on by the merge's finalize gather):
+///  - each SOURCE BATCH occupies exactly one contiguous range [base, base + rows), assigned once
+///    per batch id (`reserve` is idempotent per id, so task retries and BUILD_PROBE probe tasks
+///    sharing one build table reuse the same range and emit identical rowids for the same row);
+///  - ranges are contiguous and entries are kept in base order, so concatenating the committed
+///    sources in entry order reproduces the absolute rowid address space exactly.
+///
+/// Retention protocol (OOM-downgrade friendly): `reserve` takes NO accessor — a task that fails
+/// after reserving leaves the source batch downgradable and only names an address range (reused
+/// on retry via the id dedupe). The pinning `read_only_data_batch` accessor is attached by
+/// `commit` only after the task's output was produced successfully. `snapshot` therefore
+/// requires every reserved range to be committed: an uncommitted range can only belong to a
+/// batch whose task never succeeded, in which case the query has already failed before any
+/// merge finalize could run.
+class surrogate_deferral_store {
+ public:
+  struct source_view {
     int64_t base;
     cudf::size_type rows;
     ::cucascade::read_only_data_batch batch;
   };
 
-  std::mutex mutex;
-  std::vector<source> left_sources;
-  std::vector<source> right_sources;
-  int64_t left_next_base  = 0;
-  int64_t right_next_base = 0;
-
-  /// Register a source batch for one side; returns the assigned base offset.
-  int64_t register_source(bool is_left, ::cucascade::read_only_data_batch batch,
-                          cudf::size_type rows)
+  /// Reserve (or look up) the address range for `batch_id` on one side; returns its base.
+  /// Throws when the total address space would exceed int32 row addressing (checked before any
+  /// state is mutated), or when `rows` disagrees with an existing reservation for the same id.
+  int64_t reserve(bool is_left, uint64_t batch_id, cudf::size_type rows)
   {
-    std::lock_guard<std::mutex> lg(mutex);
-    auto& next    = is_left ? left_next_base : right_next_base;
-    auto& sources = is_left ? left_sources : right_sources;
-    int64_t base  = next;
-    next += rows;
-    // Finalization gathers with an INT32 cudf gather map; refuse address spaces that overflow it
-    // instead of computing garbage. (The planner gates on estimated cardinality; this is the
-    // hard runtime backstop.)
-    if (next > std::numeric_limits<cudf::size_type>::max()) {
+    std::lock_guard<std::mutex> lg(mutex_);
+    auto& side = is_left ? left_ : right_;
+    for (auto const& e : side.entries) {
+      if (e.batch_id == batch_id) {
+        if (e.rows != rows) {
+          throw std::runtime_error("surrogate_deferral_store::reserve: batch " +
+                                   std::to_string(batch_id) +
+                                   " re-reserved with a different row count (" +
+                                   std::to_string(e.rows) + " vs " + std::to_string(rows) + ")");
+        }
+        return e.base;
+      }
+    }
+    if (side.next_base > static_cast<int64_t>(std::numeric_limits<cudf::size_type>::max()) -
+                           static_cast<int64_t>(rows)) {
+      // Finalization gathers with an INT32 cudf gather map; refuse address spaces that overflow
+      // it instead of computing garbage. (The planner declines on estimated cardinality; this is
+      // the hard runtime backstop.)
       throw std::runtime_error(
         "groupby_surrogate_keys: deferred string source exceeds int32 row addressing; disable "
         "the groupby_surrogate_keys setting for this query");
     }
-    sources.push_back(source{base, rows, std::move(batch)});
+    int64_t const base = side.next_base;
+    side.next_base += rows;
+    side.entries.push_back(entry{batch_id, base, rows, std::nullopt});
     return base;
   }
 
-  /// Snapshot one side's sources ordered by base (they are appended in base order already).
-  std::vector<source> const& sources_for(bool is_left) const
+  /// Attach the retaining read-only accessor for a previously reserved batch. Idempotent; call
+  /// only after the task's output was produced successfully so failed tasks never pin sources.
+  void commit(bool is_left, uint64_t batch_id, ::cucascade::read_only_data_batch batch)
   {
-    return is_left ? left_sources : right_sources;
+    std::lock_guard<std::mutex> lg(mutex_);
+    auto& side = is_left ? left_ : right_;
+    for (auto& e : side.entries) {
+      if (e.batch_id == batch_id) {
+        if (!e.batch) { e.batch = std::move(batch); }
+        return;
+      }
+    }
+    throw std::runtime_error("surrogate_deferral_store::commit: batch " + std::to_string(batch_id) +
+                             " was never reserved");
   }
+
+  /// Snapshot one side's committed sources in base order. Throws if a reserved range was never
+  /// committed (see the retention protocol above — unreachable in a successfully-running query).
+  std::vector<source_view> snapshot(bool is_left) const
+  {
+    std::lock_guard<std::mutex> lg(mutex_);
+    auto const& side = is_left ? left_ : right_;
+    std::vector<source_view> out;
+    out.reserve(side.entries.size());
+    for (auto const& e : side.entries) {
+      if (!e.batch) {
+        throw std::runtime_error("surrogate_deferral_store::snapshot: reserved source batch " +
+                                 std::to_string(e.batch_id) +
+                                 " was never committed (its producing task cannot have succeeded)");
+      }
+      out.push_back(source_view{e.base, e.rows, *e.batch});
+    }
+    return out;
+  }
+
+  /// Drop every retained accessor (called once all merge finalizes are done, from the merge
+  /// operator's finalize hook). Returns {source count, retained bytes} for observability.
+  std::pair<std::size_t, std::size_t> release()
+  {
+    std::lock_guard<std::mutex> lg(mutex_);
+    std::size_t count = 0;
+    std::size_t bytes = 0;
+    for (auto* side : {&left_, &right_}) {
+      for (auto& e : side->entries) {
+        if (e.batch) {
+          ++count;
+          if (auto const* data = e.batch->get_data(); data != nullptr) {
+            bytes += data->get_size_in_bytes();
+          }
+          e.batch.reset();
+        }
+      }
+    }
+    return {count, bytes};
+  }
+
+ private:
+  struct entry {
+    uint64_t batch_id;
+    int64_t base;
+    cudf::size_type rows;
+    std::optional<::cucascade::read_only_data_batch> batch;  ///< set by commit only
+  };
+  struct side_state {
+    std::vector<entry> entries;  ///< base-ordered by construction
+    int64_t next_base = 0;
+  };
+
+  mutable std::mutex mutex_;
+  side_state left_;
+  side_state right_;
 };
 
 /// Plan-time instructions for the deferral join: which output slots of each side to synthesize
@@ -119,10 +207,10 @@ struct surrogate_join_emit {
 struct surrogate_groupby_spec {
   /// One group of deferred key slots sharing a single rowid (one per deferral-join side).
   struct restore_group {
-    bool from_left = true;             ///< which side of the store to gather from
-    int rowid_key_slot = -1;           ///< output key slot holding the BIGINT rowid
-    std::vector<int> restore_key_slots;             ///< key slots to restore (incl. rowid slot)
-    std::vector<cudf::size_type> source_input_cols; ///< parallel: column in the retained batches
+    bool from_left     = true;                         ///< which side of the store to gather from
+    int rowid_key_slot = -1;                           ///< output key slot holding the BIGINT rowid
+    std::vector<int> restore_key_slots;                ///< key slots to restore (incl. rowid slot)
+    std::vector<cudf::size_type> source_input_cols;    ///< parallel: column in the retained batches
     std::vector<sirius::logical_type> restored_types;  ///< parallel: original logical types
   };
 
@@ -131,7 +219,7 @@ struct surrogate_groupby_spec {
   /// Non-deferred, non-dummy key slots: partition hashing subset and uniqueness-check columns.
   std::vector<int> real_key_slots;
   /// The group-by's original output schema (keys with STRING types restored), which the merge
-  /// re-declares and reconstructs.
+  /// redeclares and reconstructs.
   duckdb::vector<sirius::logical_type> original_output_types;
   /// Take the no-re-group fast path when the exact distinct check proves tuple distinctness.
   bool unique_fastpath = true;

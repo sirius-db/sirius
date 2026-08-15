@@ -18,6 +18,7 @@
 
 #include "duckdb/main/client_context.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "sirius_config.hpp"
 
 namespace sirius::planner {
 
@@ -39,5 +40,10 @@ namespace sirius::planner {
  */
 void apply_groupby_surrogate_keys(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan,
                                   duckdb::ClientContext& context);
+
+/// Params-level entry (also the unit-test seam): applies the knob gate and the tree walk, but
+/// none of the context-derived gates (single-GPU). The context overload delegates here.
+void apply_groupby_surrogate_keys(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan,
+                                  const sirius::operator_params& op_params);
 
 }  // namespace sirius::planner

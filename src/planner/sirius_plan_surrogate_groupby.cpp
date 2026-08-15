@@ -31,6 +31,7 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <memory>
 #include <vector>
@@ -55,12 +56,12 @@ struct trace_hop {
 
 /// Where one string group key resolves to: the deepest INNER hash join it passes through.
 struct key_trace {
-  bool ok = false;
-  sirius_physical_hash_join* join = nullptr;
-  bool from_left                  = true;  ///< side of `join` the column comes from
-  cudf::size_type side_out_pos    = -1;    ///< position within that side's output column list
-  cudf::size_type join_out_pos    = -1;    ///< position within the join's full output
-  cudf::size_type source_input_col = -1;   ///< column index within the side's child schema
+  bool ok                          = false;
+  sirius_physical_hash_join* join  = nullptr;
+  bool from_left                   = true;  ///< side of `join` the column comes from
+  cudf::size_type side_out_pos     = -1;    ///< position within that side's output column list
+  cudf::size_type join_out_pos     = -1;    ///< position within the join's full output
+  cudf::size_type source_input_col = -1;    ///< column index within the side's child schema
   /// Operators strictly ABOVE the deferral join (deepest first excluded), each with the key's
   /// output position there. The deferral join itself is patched via side_out_pos/join_out_pos.
   std::vector<trace_hop> hops_above;
@@ -138,10 +139,10 @@ bool traced_column_is_sole_consumer(key_trace const& trace)
 {
   for (auto const& hop : trace.hops_above) {
     if (hop.op->type == SiriusPhysicalOperatorType::PROJECTION) {
-      auto& proj = hop.op->Cast<sirius_physical_projection>();
-      auto const traced_input =
-        proj.select_list[static_cast<std::size_t>(hop.out_col)]->get<sirius::ast::reference>()
-          .column_index;
+      auto& proj              = hop.op->Cast<sirius_physical_projection>();
+      auto const traced_input = proj.select_list[static_cast<std::size_t>(hop.out_col)]
+                                  ->get<sirius::ast::reference>()
+                                  .column_index;
       for (std::size_t o = 0; o < proj.select_list.size(); ++o) {
         if (static_cast<cudf::size_type>(o) == hop.out_col) { continue; }
         auto const* entry = proj.select_list[o].get();
@@ -153,8 +154,8 @@ bool traced_column_is_sole_consumer(key_trace const& trace)
         if (references_traced) { return false; }
       }
     } else if (hop.op->type == SiriusPhysicalOperatorType::HASH_JOIN) {
-      auto& hj           = hop.op->Cast<sirius_physical_hash_join>();
-      auto const num_lhs = static_cast<cudf::size_type>(hj.lhs_output_columns.col_idxs.size());
+      auto& hj             = hop.op->Cast<sirius_physical_hash_join>();
+      auto const num_lhs   = static_cast<cudf::size_type>(hj.lhs_output_columns.col_idxs.size());
       bool const from_left = hop.out_col < num_lhs;
       auto const side_pos  = from_left ? hop.out_col : hop.out_col - num_lhs;
       auto const& col_idxs =
@@ -168,7 +169,8 @@ bool traced_column_is_sole_consumer(key_trace const& trace)
 
 /// Patch one operator's declared schema (and projection reference node / physical sidecar) so
 /// position `pos` carries `new_type` instead of the original string type.
-void patch_slot_type(sirius_physical_operator& op, cudf::size_type pos,
+void patch_slot_type(sirius_physical_operator& op,
+                     cudf::size_type pos,
                      sirius::logical_type const& new_type)
 {
   auto const upos = static_cast<std::size_t>(pos);
@@ -210,7 +212,7 @@ bool try_rewrite_group_by(sirius_physical_grouped_aggregate& agg,
   // Operator ids are not assigned until pipeline conversion, so plan-time logs must not call
   // get_operator_id() (it throws on the unassigned sentinel).
   auto const decline = [&](std::string const& reason) {
-    SIRIUS_LOG_INFO("groupby_surrogate_keys: declined for a HASH_GROUP_BY: {}", reason);
+    SIRIUS_LOG_DEBUG("groupby_surrogate_keys: declined for a HASH_GROUP_BY: {}", reason);
     return false;
   };
 
@@ -274,8 +276,8 @@ bool try_rewrite_group_by(sirius_physical_grouped_aggregate& agg,
   traces.reserve(string_slots.size());
   sirius_physical_hash_join* deferral_join = nullptr;
   for (auto slot : string_slots) {
-    auto trace = trace_string_key(agg.children[0].get(),
-                                  static_cast<cudf::size_type>(agg.group_idx[slot]));
+    auto trace =
+      trace_string_key(agg.children[0].get(), static_cast<cudf::size_type>(agg.group_idx[slot]));
     if (!trace.ok) {
       return decline("key slot " + std::to_string(slot) + " (child col " +
                      std::to_string(agg.group_idx[slot]) +
@@ -289,9 +291,7 @@ bool try_rewrite_group_by(sirius_physical_grouped_aggregate& agg,
     traces.push_back(std::move(trace));
   }
   if (deferral_join == nullptr) { return decline("no deferral join found"); }
-  if (deferral_join->surrogate_emit) {
-    return decline("deferral join already carries a deferral");
-  }
+  if (deferral_join->surrogate_emit) { return decline("deferral join already carries a deferral"); }
   for (auto const& trace : traces) {
     if (!traced_column_is_sole_consumer(trace)) {
       return decline("a deferred column has another consumer above the deferral join");
@@ -305,6 +305,20 @@ bool try_rewrite_group_by(sirius_physical_grouped_aggregate& agg,
   std::map<cudf::size_type, bool> left_positions, right_positions;  // side_out_pos -> is_rowid
   for (auto const& t : traces) {
     (t.from_left ? left_positions : right_positions).emplace(t.side_out_pos, false);
+  }
+
+  // Rowid address-space gate: the merge's finalize gather addresses each deferral side with an
+  // INT32 cudf gather map, and reserve/commit dedupes by batch id, so total registered rows per
+  // side ≈ that side's input rows. Decline when the estimate approaches int32 addressing (the
+  // runtime reserve() throw remains as the hard backstop for estimate misses).
+  constexpr std::size_t max_side_rows = std::numeric_limits<cudf::size_type>::max() / 2;
+  if (!left_positions.empty() && deferral_join->children.size() >= 1 &&
+      deferral_join->children[0]->estimated_cardinality > max_side_rows) {
+    return decline("deferred probe side estimated cardinality exceeds int32 rowid addressing");
+  }
+  if (!right_positions.empty() && deferral_join->children.size() >= 2 &&
+      deferral_join->children[1]->estimated_cardinality > max_side_rows) {
+    return decline("deferred build side estimated cardinality exceeds int32 rowid addressing");
   }
   if (!left_positions.empty()) { left_positions.begin()->second = true; }
   if (!right_positions.empty()) { right_positions.begin()->second = true; }
@@ -345,8 +359,8 @@ bool try_rewrite_group_by(sirius_physical_grouped_aggregate& agg,
     emit.right = std::move(side);
   }
 
-  auto spec   = std::make_shared<sirius::op::surrogate_groupby_spec>();
-  spec->store = store;
+  auto spec                   = std::make_shared<sirius::op::surrogate_groupby_spec>();
+  spec->store                 = store;
   spec->unique_fastpath       = op_params.groupby_surrogate_unique_fastpath;
   spec->original_output_types = agg.types;
 
@@ -425,16 +439,22 @@ void walk(duckdb::unique_ptr<sirius_physical_operator>& slot,
 }  // namespace
 
 void apply_groupby_surrogate_keys(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan,
+                                  const sirius::operator_params& op_params)
+{
+  if (!plan) { return; }
+  if (!op_params.groupby_surrogate_keys) {
+    SIRIUS_LOG_DEBUG("groupby_surrogate_keys: disabled by setting");
+    return;
+  }
+  walk(plan, op_params);
+}
+
+void apply_groupby_surrogate_keys(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan,
                                   duckdb::ClientContext& context)
 {
   if (!plan || !context.registered_state) { return; }
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) { return; }
-  auto const& op_params = sirius_ctx->get_config().get_operator_params();
-  if (!op_params.groupby_surrogate_keys) {
-    SIRIUS_LOG_DEBUG("groupby_surrogate_keys: disabled by setting");
-    return;
-  }
   // The retained source batches live on the GPU that ran the deferral join; the merge-side
   // gather must run on the same device. Single-GPU only for now.
   std::vector<int> gpu_ids;
@@ -445,10 +465,10 @@ void apply_groupby_surrogate_keys(duckdb::unique_ptr<sirius::op::sirius_physical
   std::sort(gpu_ids.begin(), gpu_ids.end());
   gpu_ids.erase(std::unique(gpu_ids.begin(), gpu_ids.end()), gpu_ids.end());
   if (gpu_ids.size() != 1) {
-    SIRIUS_LOG_INFO("groupby_surrogate_keys: disabled ({} GPUs; single-GPU only)", gpu_ids.size());
+    SIRIUS_LOG_DEBUG("groupby_surrogate_keys: disabled ({} GPUs; single-GPU only)", gpu_ids.size());
     return;
   }
-  walk(plan, op_params);
+  apply_groupby_surrogate_keys(plan, sirius_ctx->get_config().get_operator_params());
 }
 
 }  // namespace sirius::planner
