@@ -35,12 +35,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <format>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 namespace sirius {
 namespace pipeline {
@@ -102,6 +104,52 @@ std::unique_ptr<cucascade::memory::reservation> acquire_reservation_blocking_wit
   sirius::memory::reservation_wait_scope wait_scope(space, bytes_needs, pipeline_id, task_id);
   return space->make_reservation(bytes_needs);
 }
+
+/**
+ * RAII claim on an executor's single memory-wait slot (register C4).
+ *
+ * At most one task per executor may park in a blocking reservation / downgrade round trip at a
+ * time — the historical arbitration, back when the manager thread was the only entity that could
+ * block on memory. A task that cannot take the slot is re-queued with a backoff instead, so
+ * hungry tasks cannot fill every pool worker with parked waits and starve co-tenant dispatch one
+ * level below the manager.
+ */
+class memory_wait_token {
+ public:
+  memory_wait_token() = default;
+  ~memory_wait_token() { release(); }
+
+  memory_wait_token(const memory_wait_token&)            = delete;
+  memory_wait_token& operator=(const memory_wait_token&) = delete;
+  memory_wait_token(memory_wait_token&&)                 = delete;
+  memory_wait_token& operator=(memory_wait_token&&)      = delete;
+
+  [[nodiscard]] bool try_acquire(std::atomic<bool>& parked_flag) noexcept
+  {
+    bool expected = false;
+    if (parked_flag.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+      _flag = &parked_flag;
+      return true;
+    }
+    return false;
+  }
+
+  void release() noexcept
+  {
+    if (auto* flag = std::exchange(_flag, nullptr)) {
+      flag->store(false, std::memory_order_release);
+    }
+  }
+
+ private:
+  std::atomic<bool>* _flag{nullptr};
+};
+
+/// Worker-held backoff before an overflow memory-waiter re-queues itself. Bounds the
+/// re-queue spin (a task cannot pop-fail-push in a tight loop) while keeping the waiter's
+/// effective poll latency small next to the OOM-reschedule backoff (50 ms). The slot is held
+/// during the sleep, but with the wait cap at one this leaves num_threads - 1 slots free.
+constexpr auto k_memory_wait_requeue_backoff = std::chrono::milliseconds(10);
 
 }  // namespace
 
@@ -216,28 +264,69 @@ void gpu_pipeline_executor::process_task(
       return;
     }
     iteration_completion = gpu_task->get_completion_handler();
-    // Resolve the task's query once it is known: it attributes the reserved slot (so
-    // drain_and_wait(query_id) covers this execution) and any downgrade request issued below
-    // (so the query's own cleanup — and only its own — can cancel it). Not done at reserve()
-    // time: the manager parks in pop() holding the slot before any task exists, and counting
-    // that against a query would make its drain wait for work that may never arrive.
-    auto task_query_id = sirius::make_query_id(0);
-    if (auto const* pipe = gpu_task->get_pipeline()) {
-      task_query_id = pipe->get_query_id();
-      slot.attach(task_query_id);
+    // Resolve the task's query once it is known: it attributes the reserved slot BEFORE the
+    // dispatch below, so from here on the pool's per-query accounting covers everything the
+    // worker does — the memory waits included — and drain_and_wait(query_id) waits for it.
+    // Not done at reserve() time: the manager parks in pop() holding the slot before any task
+    // exists, and counting that against a query would make its drain wait for work that may
+    // never arrive.
+    if (auto const* pipe = gpu_task->get_pipeline()) { slot.attach(pipe->get_query_id()); }
+
+    // Register C4: the manager thread NEVER touches the memory space. It used to perform the
+    // blocking reservation (and the downgrade .get()) right here while holding the reserved
+    // slot, so one query's memory-hungry task stalled every other query's dispatch to this
+    // device — a fair queue pop (F1) still stalled behind the blocked reserve. All potentially
+    // blocking work now runs inside the dispatched worker; the manager's only blocking points
+    // are reserve() and pop(), both interruptible.
+    //
+    // The manager telemetry uuid is captured BY VALUE: the wrapper lives on manager_loop()'s
+    // stack, and a quiesce/resume bracket (wait_and_drain_query) destroys that frame and
+    // starts a new manager while workers of other queries may still be running.
+    _bounded_pool->dispatch(
+      std::move(slot),
+      [this,
+       task              = std::move(pipeline_task),
+       completion        = iteration_completion,
+       manager_thread_id = manager_thread_telemetry.handle->uuid()]() mutable {
+        prepare_and_execute(std::move(task), std::move(completion), manager_thread_id);
+      });
+  } catch (const std::exception& e) {
+    SIRIUS_LOG_ERROR("GPU Pipeline Executor: Exception while preparing task for dispatch: {}",
+                     e.what());
+    try {
+      if (iteration_completion) { iteration_completion->report_error(std::current_exception()); }
+    } catch (...) {  // reporting must never take down the manager thread
     }
+  } catch (...) {
+    SIRIUS_LOG_ERROR("GPU Pipeline Executor: unknown error while preparing task for dispatch");
+    try {
+      if (iteration_completion) { iteration_completion->report_error(std::current_exception()); }
+    } catch (...) {
+    }
+  }
+}
+
+void gpu_pipeline_executor::prepare_and_execute(std::unique_ptr<parallel::itask> pipeline_task,
+                                                std::shared_ptr<completion_handler> completion,
+                                                uuid::UUID manager_thread_resource_id) noexcept
+{
+  // `completion` was resolved by process_task before dispatch, so every failure path below —
+  // including an unexpected throw — fails THIS task's query rather than the engine.
+  auto const& iteration_completion = completion;
+  try {
+    auto* gpu_task = cast_to_gpu_pipeline_task(pipeline_task.get());
+    if (!gpu_task) {  // checked before dispatch; defensive only
+      SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast pipeline task to gpu_pipeline_task");
+      return;
+    }
+    // The task's query, for the downgrade request below (so the query's own cleanup — and only
+    // its own — can cancel it). The slot this worker occupies was already attributed to it.
+    auto task_query_id = sirius::make_query_id(0);
+    if (auto const* pipe = gpu_task->get_pipeline()) { task_query_id = pipe->get_query_id(); }
     // Pass this executor's memory space so cross-space inputs (host/disk tiers and GPU data on
     // another device, which prepare clones into this space) are counted in the reservation.
     auto reservation_info = gpu_task->get_estimated_reservation_size_info(_memory_space);
     auto bytes_needs      = reservation_info.reservation_size;
-    gpu_task->telemetry_handle().reserving({
-      .instance_name              = "",
-      .requested_bytes            = reservation_info.reservation_size,
-      .input_basis                = reservation_info.input_basis,
-      .peak_estimate              = reservation_info.peak_memory_estimate,
-      .bytes_to_materialize       = reservation_info.bytes_to_materialize_input,
-      .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
-    });
     // Clamp the reservation request to what this memory space can actually
     // grant (its reservation limit). The history-based estimate can balloon far
     // past capacity — a small input that once drove a near-cap peak yields a
@@ -248,8 +337,9 @@ void gpu_pipeline_executor::process_task(
     // OOM-reschedule loop until the retry cap trips and the query fails. Capping
     // at get_max_memory() keeps both the reservation and the downgrade target
     // achievable; any per-batch overflow during execution is still handled by
-    // the OOM-reschedule + tiering path. (Telemetry above intentionally reports
-    // the pre-clamp estimate so the estimator can still be analyzed.)
+    // the OOM-reschedule + tiering path. (The reserving telemetry below
+    // intentionally reports the pre-clamp estimate so the estimator can still
+    // be analyzed.)
     if (auto const space_max = _memory_space->get_max_memory();
         space_max > 0 && bytes_needs > space_max) {
       SIRIUS_LOG_DEBUG(
@@ -271,12 +361,68 @@ void gpu_pipeline_executor::process_task(
       _memory_space->get_available_memory(),
       _memory_space->get_total_reserved_memory(),
       _memory_space->get_max_memory());
+
+    // Non-blocking first attempt, byte-identical to the old guard's happy path. No telemetry
+    // yet: on the re-queue path below the task returns to `queued`, and the task telemetry FSM
+    // has no reserving->queued edge — routing->queued is the legal loop (the same hop a
+    // scheduler-queue -> device-queue transfer takes).
+    auto reservation = _memory_space->make_reservation_or_null(bytes_needs);
+
+    memory_wait_token wait_token;
+    if (!reservation || reservation->size() < bytes_needs) {
+      // This task has to WAIT for memory: a blocking reservation, a downgrade round trip, or
+      // both. Cap the parked waits at one per executor. Without the cap, a hungry query with
+      // enough queued tasks parks a wait in EVERY worker slot and co-tenant dispatch stalls
+      // again — the same head-of-line blocking C4 removed from the manager, one level down.
+      // Overflow waiters go back to the queue after a short backoff; the fair pops (F1)
+      // interleave co-tenant tasks between their retries.
+      if (!wait_token.try_acquire(_memory_waiter_parked)) {
+        reservation.reset();
+        _memory_wait_requeues.fetch_add(1, std::memory_order_relaxed);
+        SIRIUS_LOG_DEBUG(
+          "[GPU:{}] GPU Pipeline Executor: memory-wait slot busy, re-queueing task {} "
+          "(pipeline {}, {} bytes wanted, {} available)",
+          _memory_space->get_device_id(),
+          gpu_task->get_task_id(),
+          gpu_task->get_pipeline_id(),
+          bytes_needs,
+          _memory_space->get_available_memory());
+        gpu_task->telemetry_handle().routing({
+          .instance_name              = "",
+          .preferred_device_id        = _memory_space->get_device_id(),
+          .manager_thread_resource_id = manager_thread_resource_id,
+        });
+        std::this_thread::sleep_for(k_memory_wait_requeue_backoff);
+        // Back through this executor's own queue (like the OOM reschedule): the lifecycle gate
+        // inside schedule() drops it if the query began tearing down meanwhile. The push
+        // happens while this worker's slot is still attributed to the query, so the drain
+        // accounting has no gap: the task is always visible to wait_for_query/drain — first
+        // via the slot, then via the queue.
+        this->schedule(std::move(pipeline_task));
+        return;
+      }
+    }
+
+    gpu_task->telemetry_handle().reserving({
+      .instance_name              = "",
+      .requested_bytes            = reservation_info.reservation_size,
+      .input_basis                = reservation_info.input_basis,
+      .peak_estimate              = reservation_info.peak_memory_estimate,
+      .bytes_to_materialize       = reservation_info.bytes_to_materialize_input,
+      .manager_thread_resource_id = manager_thread_resource_id,
+    });
+
     std::string fail_fast_reason;
-    auto reservation = acquire_reservation_blocking_with_guard(_memory_space,
-                                                               bytes_needs,
-                                                               gpu_task->get_pipeline_id(),
-                                                               gpu_task->get_task_id(),
-                                                               &fail_fast_reason);
+    if (!reservation) {
+      // Parked on this worker under the wait token — the manager keeps dispatching. Same
+      // unsatisfiable-demand fail-fast and periodic wait visibility as before (the guard's
+      // leading non-blocking retry is redundant but harmless).
+      reservation = acquire_reservation_blocking_with_guard(_memory_space,
+                                                            bytes_needs,
+                                                            gpu_task->get_pipeline_id(),
+                                                            gpu_task->get_task_id(),
+                                                            &fail_fast_reason);
+    }
     if (!reservation && !fail_fast_reason.empty()) {
       // Provably-unsatisfiable demand: fail the QUERY, not the
       // executor — drop the task (slot RAII returns it to the pool) and keep
@@ -304,7 +450,7 @@ void gpu_pipeline_executor::process_task(
         .instance_name              = "",
         .shortfall_bytes            = shortfall,
         .partial_bytes              = partial_size,
-        .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
+        .manager_thread_resource_id = manager_thread_resource_id,
       });
 
       SIRIUS_LOG_DEBUG(
@@ -408,6 +554,11 @@ void gpu_pipeline_executor::process_task(
         gpu_task->get_task_id(),
         reservation->size());
     }
+    // The memory wait — if there was one — is over. Free the executor's wait slot before the
+    // (potentially long) execution so the next waiter can park on the notification channel
+    // instead of polling through the re-queue path.
+    wait_token.release();
+
     if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
           gpu_task->local_state())) {
       local_state->set_reservation(std::move(reservation), reservation_info);
@@ -420,205 +571,197 @@ void gpu_pipeline_executor::process_task(
       }
       return;
     }
-    auto output_consumers = gpu_task->get_output_consumers();
-    auto* pipeline        = gpu_task->get_pipeline();
-    auto exc_stream       = _stream_pool.acquire_stream(
+    auto consumers  = gpu_task->get_output_consumers();
+    auto* pipeline  = gpu_task->get_pipeline();
+    auto exc_stream = _stream_pool.acquire_stream(
       cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
-    // Resolved once at the top of this function: every report below belongs to THIS task's query,
-    // so a failure or completion can never land on another in-flight query's promise. The
-    // shared_ptr also keeps the handler alive past the owning sirius_engine, which is destroyed
-    // before query cleanup drains the queues. Copied (not moved) into the lambda so the catch
-    // blocks below still have it if dispatch itself throws.
-    auto completion = iteration_completion;
-    _bounded_pool->dispatch(
-      std::move(slot),
-      [this,
-       task       = std::move(pipeline_task),
-       exc_stream = std::move(exc_stream),
-       consumers  = std::move(output_consumers),
-       completion = std::move(completion),
-       pipeline]() mutable {
-        try {
-          task->execute(exc_stream);
-          _tasks_executed.fetch_add(1, std::memory_order_relaxed);
-        } catch (task_reschedule_exception& ex) {
-          // Only THIS query's error state suppresses the reschedule. Previously one query's
-          // failure silently stopped every other query's tasks from rescheduling.
-          if (completion && completion->has_error()) { return; }
-          auto* gpu_task = cast_to_gpu_pipeline_task(task.get());
-          if (!gpu_task) {
-            SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast task for reschedule");
-            if (completion) {
-              completion->report_error("GPU Pipeline Executor: Failed to cast task for reschedule");
-            }
-            return;
+    // Execution proceeds inline on this worker (it already occupies the slot the manager
+    // reserved and attributed to this query). Every report below goes to `completion` — THIS
+    // task's query — so a failure or completion can never land on another in-flight query's
+    // promise. The shared_ptr also keeps the handler alive past the owning sirius_engine, which
+    // is destroyed before query cleanup drains the queues.
+    auto& task = pipeline_task;
+    {
+      try {
+        task->execute(exc_stream);
+        _tasks_executed.fetch_add(1, std::memory_order_relaxed);
+      } catch (task_reschedule_exception& ex) {
+        // Only THIS query's error state suppresses the reschedule. Previously one query's
+        // failure silently stopped every other query's tasks from rescheduling.
+        if (completion && completion->has_error()) { return; }
+        auto* gpu_task = cast_to_gpu_pipeline_task(task.get());
+        if (!gpu_task) {
+          SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast task for reschedule");
+          if (completion) {
+            completion->report_error("GPU Pipeline Executor: Failed to cast task for reschedule");
           }
+          return;
+        }
 
-          // Sync the stream to ensure all memory is released before the reschedule.
-          exc_stream->synchronize();
+        // Sync the stream to ensure all memory is released before the reschedule.
+        exc_stream->synchronize();
 
-          // Determine retry count and original task ID for this rescheduled attempt.
-          auto* cur_local = dynamic_cast<gpu_pipeline_task_local_state*>(gpu_task->local_state());
-          uint32_t next_retry_count = 1;
-          uint64_t orig_task_id     = gpu_task->get_task_id();
-          if (cur_local && cur_local->original_task_id.has_value()) {
-            next_retry_count = cur_local->retry_count + 1;
-            orig_task_id     = cur_local->original_task_id.value();
-          }
+        // Determine retry count and original task ID for this rescheduled attempt.
+        auto* cur_local = dynamic_cast<gpu_pipeline_task_local_state*>(gpu_task->local_state());
+        uint32_t next_retry_count = 1;
+        uint64_t orig_task_id     = gpu_task->get_task_id();
+        if (cur_local && cur_local->original_task_id.has_value()) {
+          next_retry_count = cur_local->retry_count + 1;
+          orig_task_id     = cur_local->original_task_id.value();
+        }
 
-          // The retry cap is per-query state stamped on the pipeline's build context
-          // from the admission-time operator_params snapshot (register E1) — one
-          // coherent read here, never the live config struct mid-execution. Configured
-          // via operator_params.gpu_reservation_max_retries (YAML) / SET
-          // gpu_reservation_max_retries; see exec::default_gpu_reservation_max_retries
-          // for the default's provenance (follow-up #17: 100 retries x 50 ms backoff
-          // rides out cross-GPU BUILD_PROBE batch-lock contention at SF100 while still
-          // bailing out on truly wedged queries). Tasks without a pipeline (tests) use
-          // the process default.
-          const uint32_t max_retries = pipeline ? pipeline->reservation_max_retries()
-                                                : exec::default_gpu_reservation_max_retries;
-          if (next_retry_count > max_retries) {
-            SIRIUS_LOG_ERROR(
-              "GPU Pipeline Executor: task {} (original task {}) exceeded {} retries at "
-              "operator index {} — terminating query: {}",
-              gpu_task->get_task_id(),
-              orig_task_id,
-              max_retries,
-              ex.get_resume_operator_index(),
-              ex.what());
-            if (completion) {
-              completion->report_error(std::make_exception_ptr(std::runtime_error(
-                "GPU pipeline task exceeded maximum retry limit (" + std::to_string(max_retries) +
-                ") for original task " + std::to_string(orig_task_id) + ": " + ex.what())));
-            }
-            return;
-          }
-
-          SIRIUS_LOG_WARN(
-            "GPU Pipeline Executor: reschedule (retry {}/{}) for task {} (original task {}), "
-            "resuming from operator index {}: {}",
-            next_retry_count,
-            max_retries,
+        // The retry cap is per-query state stamped on the pipeline's build context
+        // from the admission-time operator_params snapshot (register E1) — one
+        // coherent read here, never the live config struct mid-execution. Configured
+        // via operator_params.gpu_reservation_max_retries (YAML) / SET
+        // gpu_reservation_max_retries; see exec::default_gpu_reservation_max_retries
+        // for the default's provenance (follow-up #17: 100 retries x 50 ms backoff
+        // rides out cross-GPU BUILD_PROBE batch-lock contention at SF100 while still
+        // bailing out on truly wedged queries). Tasks without a pipeline (tests) use
+        // the process default.
+        const uint32_t max_retries = pipeline ? pipeline->reservation_max_retries()
+                                              : exec::default_gpu_reservation_max_retries;
+        if (next_retry_count > max_retries) {
+          SIRIUS_LOG_ERROR(
+            "GPU Pipeline Executor: task {} (original task {}) exceeded {} retries at "
+            "operator index {} — terminating query: {}",
             gpu_task->get_task_id(),
             orig_task_id,
+            max_retries,
             ex.get_resume_operator_index(),
             ex.what());
-
-          auto intermediate_data = ex.release_intermediate_data();
-          if (auto pipelineable_data =
-                dynamic_cast<op::pipelineable_operator_data*>(intermediate_data.get())) {
-            // We want to release the read-only lock on the data so that when its added back to the
-            // task queue it could be downgraded if needed.
-            pipelineable_data->remove_read_only_lock();
+          if (completion) {
+            completion->report_error(std::make_exception_ptr(std::runtime_error(
+              "GPU pipeline task exceeded maximum retry limit (" + std::to_string(max_retries) +
+              ") for original task " + std::to_string(orig_task_id) + ": " + ex.what())));
           }
-
-          // Build the rescheduled task via virtual factory (preserves derived type).
-          auto new_local_state = std::make_unique<gpu_pipeline_task_local_state>(
-            std::move(intermediate_data), ex.get_resume_operator_index());
-          new_local_state->retry_count      = next_retry_count;
-          new_local_state->original_task_id = orig_task_id;
-
-          // Preserve the per-task device pin across reschedule. Dropping it lets
-          // an OOM'd partition task scatter to the wrong GPU and touch a cuco
-          // table built on another device (cudaErrorInvalidValue). Only the
-          // local_state pin needs copying; a global-state pin already survives.
-          if (cur_local && cur_local->get_preferred_device_id().has_value()) {
-            new_local_state->set_preferred_device_id(cur_local->get_preferred_device_id().value());
-          }
-
-          auto new_task_id =
-            _task_creator ? _task_creator->get_next_task_id() : gpu_task->get_task_id();
-          auto new_task =
-            gpu_task->create_rescheduled_task(new_task_id, std::move(new_local_state));
-
-          // Backoff before rescheduling to allow other tasks to complete and
-          // free memory (true OOM case) or release a contended batch
-          // (cross-GPU processing contention, follow-up #17). 50 ms gives
-          // typical SF100 probe tasks time to finish their current work
-          // without putting the rescheduled task into a tight busy-spin.
-          std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-          // Schedule the rescheduled task. It goes back through manager_loop()
-          // to acquire a fresh reservation before execution.
-          if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
-            pipeline_task->telemetry_handle().finalizing({
-              .instance_name = "",
-              .success       = false,
-            });
-            pipeline_task->telemetry_handle().exit();
-            pipeline_task->set_telemetry_finalized();
-          }
-          this->schedule(std::move(new_task));
-          return;
-        } catch (const std::exception& e) {
-          SIRIUS_LOG_ERROR("GPU Pipeline Executor: Exception during task execution: {}", e.what());
-          if (completion) { completion->report_error(std::current_exception()); }
-          return;
-        } catch (...) {
-          SIRIUS_LOG_ERROR("GPU Pipeline Executor: unknown error during task execution");
-          if (completion) { completion->report_error(std::current_exception()); }
           return;
         }
-        if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
-          pipeline_task->telemetry_handle().finalizing({
+
+        SIRIUS_LOG_WARN(
+          "GPU Pipeline Executor: reschedule (retry {}/{}) for task {} (original task {}), "
+          "resuming from operator index {}: {}",
+          next_retry_count,
+          max_retries,
+          gpu_task->get_task_id(),
+          orig_task_id,
+          ex.get_resume_operator_index(),
+          ex.what());
+
+        auto intermediate_data = ex.release_intermediate_data();
+        if (auto pipelineable_data =
+              dynamic_cast<op::pipelineable_operator_data*>(intermediate_data.get())) {
+          // We want to release the read-only lock on the data so that when its added back to the
+          // task queue it could be downgraded if needed.
+          pipelineable_data->remove_read_only_lock();
+        }
+
+        // Build the rescheduled task via virtual factory (preserves derived type).
+        auto new_local_state = std::make_unique<gpu_pipeline_task_local_state>(
+          std::move(intermediate_data), ex.get_resume_operator_index());
+        new_local_state->retry_count      = next_retry_count;
+        new_local_state->original_task_id = orig_task_id;
+
+        // Preserve the per-task device pin across reschedule. Dropping it lets
+        // an OOM'd partition task scatter to the wrong GPU and touch a cuco
+        // table built on another device (cudaErrorInvalidValue). Only the
+        // local_state pin needs copying; a global-state pin already survives.
+        if (cur_local && cur_local->get_preferred_device_id().has_value()) {
+          new_local_state->set_preferred_device_id(cur_local->get_preferred_device_id().value());
+        }
+
+        auto new_task_id =
+          _task_creator ? _task_creator->get_next_task_id() : gpu_task->get_task_id();
+        auto new_task = gpu_task->create_rescheduled_task(new_task_id, std::move(new_local_state));
+
+        // Backoff before rescheduling to allow other tasks to complete and
+        // free memory (true OOM case) or release a contended batch
+        // (cross-GPU processing contention, follow-up #17). 50 ms gives
+        // typical SF100 probe tasks time to finish their current work
+        // without putting the rescheduled task into a tight busy-spin.
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        // Schedule the rescheduled task. It goes back through manager_loop()
+        // to acquire a fresh reservation before execution.
+        if (auto* telemetry_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
+          telemetry_task->telemetry_handle().finalizing({
             .instance_name = "",
-            .success       = true,
+            .success       = false,
           });
-          pipeline_task->telemetry_handle().exit();
-          pipeline_task->set_telemetry_finalized();
+          telemetry_task->telemetry_handle().exit();
+          telemetry_task->set_telemetry_finalized();
         }
-        task.reset();
+        this->schedule(std::move(new_task));
+        return;
+      } catch (const std::exception& e) {
+        SIRIUS_LOG_ERROR("GPU Pipeline Executor: Exception during task execution: {}", e.what());
+        if (completion) { completion->report_error(std::current_exception()); }
+        return;
+      } catch (...) {
+        SIRIUS_LOG_ERROR("GPU Pipeline Executor: unknown error during task execution");
+        if (completion) { completion->report_error(std::current_exception()); }
+        return;
+      }
+      if (auto* telemetry_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
+        telemetry_task->telemetry_handle().finalizing({
+          .instance_name = "",
+          .success       = true,
+        });
+        telemetry_task->telemetry_handle().exit();
+        telemetry_task->set_telemetry_finalized();
+      }
+      task.reset();
 
-        // Check if query is complete BEFORE scheduling downstream tasks.
-        // mark_completed() signals the future that engine.execute() is waiting on,
-        // which may destroy the engine and its operators. We must not schedule
-        // tasks that reference those operators after signaling completion.
-        bool query_complete = false;
-        if (completion && pipeline) {
-          auto sink = pipeline->get_sink();
-          if (sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
-            query_complete = pipeline->is_pipeline_finished();
+      // Check if query is complete BEFORE scheduling downstream tasks.
+      // mark_completed() signals the future that engine.execute() is waiting on,
+      // which may destroy the engine and its operators. We must not schedule
+      // tasks that reference those operators after signaling completion.
+      bool query_complete = false;
+      if (completion && pipeline) {
+        auto sink = pipeline->get_sink();
+        if (sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
+          query_complete = pipeline->is_pipeline_finished();
+        }
+      }
+
+      if (!query_complete && _task_creator) {
+        // Schedule consumers explicitly here to drive the scheduler's
+        // round-robin rotation per-batch. notify_downstream_pipelines() in
+        // the task destructor only fires once the pipeline drains —
+        // mid-pipeline batches need to start rotating before that point so
+        // they reach all GPUs.
+        // schedule() throws on a consumer with no pipeline; this runs outside the execute()
+        // try/catch above, so report it to this task's query rather than letting it escape the
+        // pool callable.
+        try {
+          for (auto* consumer : consumers) {
+            if (consumer) { _task_creator->schedule(consumer); }
           }
+        } catch (const std::exception& e) {
+          SIRIUS_LOG_ERROR("GPU Pipeline Executor: failed to schedule downstream consumers: {}",
+                           e.what());
+          if (completion) { completion->report_error(std::current_exception()); }
+          return;
         }
+      }
 
-        if (!query_complete && _task_creator) {
-          // Schedule consumers explicitly here to drive the scheduler's
-          // round-robin rotation per-batch. notify_downstream_pipelines() in
-          // the task destructor only fires once the pipeline drains —
-          // mid-pipeline batches need to start rotating before that point so
-          // they reach all GPUs.
-          // schedule() throws on a consumer with no pipeline; this runs outside the execute()
-          // try/catch above, so report it to this task's query rather than letting it escape the
-          // pool callable.
-          try {
-            for (auto* consumer : consumers) {
-              if (consumer) { _task_creator->schedule(consumer); }
-            }
-          } catch (const std::exception& e) {
-            SIRIUS_LOG_ERROR("GPU Pipeline Executor: failed to schedule downstream consumers: {}",
-                             e.what());
-            if (completion) { completion->report_error(std::current_exception()); }
-            return;
-          }
-        }
-
-        if (query_complete && completion) {
-          // Scoped to the finishing query: its pending creation requests point at operators
-          // that mark_completed() may let the engine destroy. Any other query's requests are
-          // left alone.
-          _task_creator->drain_pending_tasks(pipeline->get_query_id());
-          completion->mark_completed();
-        }
-      });
+      if (query_complete && completion) {
+        // Scoped to the finishing query: its pending creation requests point at operators
+        // that mark_completed() may let the engine destroy. Any other query's requests are
+        // left alone.
+        _task_creator->drain_pending_tasks(pipeline->get_query_id());
+        completion->mark_completed();
+      }
+    }
   } catch (const std::exception& e) {
-    SIRIUS_LOG_ERROR("GPU Pipeline Executor: Exception while preparing task for dispatch: {}",
+    SIRIUS_LOG_ERROR("GPU Pipeline Executor: Exception while preparing or finalizing task: {}",
                      e.what());
     try {
       if (iteration_completion) { iteration_completion->report_error(std::current_exception()); }
-    } catch (...) {  // reporting must never take down the manager thread
+    } catch (...) {  // reporting must never take down the worker thread
     }
   } catch (...) {
-    SIRIUS_LOG_ERROR("GPU Pipeline Executor: unknown error while preparing task for dispatch");
+    SIRIUS_LOG_ERROR("GPU Pipeline Executor: unknown error while preparing or finalizing task");
     try {
       if (iteration_completion) { iteration_completion->report_error(std::current_exception()); }
     } catch (...) {
@@ -641,7 +784,8 @@ bool gpu_pipeline_executor::is_task_queue_empty() const noexcept { return _task_
 
 executor_metrics gpu_pipeline_executor::get_metrics() const noexcept
 {
-  return {_tasks_executed.load(std::memory_order_relaxed)};
+  return {_tasks_executed.load(std::memory_order_relaxed),
+          _memory_wait_requeues.load(std::memory_order_relaxed)};
 }
 
 }  // namespace pipeline
