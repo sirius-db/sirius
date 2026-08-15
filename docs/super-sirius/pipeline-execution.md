@@ -141,7 +141,7 @@ This is a four-layer contract: the scheduler picks `target_space`, the task laye
 
 **Layer 1 — `gpu_pipeline_task::execute` captures `target_space` from the task's reservation.**
 
-`src/pipeline/gpu_pipeline_task.cpp:310-315`:
+`src/pipeline/gpu_pipeline_task.cpp` (`execute()`):
 
 ```cpp
 auto reservation         = local_state.release_reservation();
@@ -151,74 +151,65 @@ const auto* requested_memory_space =
   reservation != nullptr ? &reservation->get_memory_space() : nullptr;
 ```
 
-The reservation was attached by the GPU executor's manager loop (see [GPU Pipeline Executor](#gpu-pipeline-executor) above) on the SCHED-RR-chosen device. `requested_memory_space` is the authoritative target for every input batch this task will touch.
+The reservation was acquired by the GPU executor's worker (see [GPU Pipeline Executor](#gpu-pipeline-executor) above) on the SCHED-RR-chosen device. `requested_memory_space` is the authoritative target for every input batch this task will touch.
 
 **Layer 2 — `gpu_pipeline_task::execute` calls `prepare_for_processing` on the operator-data input.**
 
-`src/pipeline/gpu_pipeline_task.cpp:329-332`:
+`src/pipeline/gpu_pipeline_task.cpp` (`execute()`):
 
 ```cpp
-std::optional<std::vector<cucascade::data_batch_processing_handle>> handles_opt;
 try {
-  handles_opt =
-    local_state._input_data.get()->prepare_for_processing(requested_memory_space, stream);
-```
-
-This is the gate. `compute_task(stream)` (line 373) — which iterates the pipeline's operators and calls each one's `execute()` — does not run until `prepare_for_processing` has returned a non-empty `handles_opt`. Every batch in the input vector is colocated on `requested_memory_space` by the time any operator sees it.
-
-**Layer 3 — `pipelineable_operator_data::prepare_for_processing` walks each batch and locks-or-converts it.**
-
-`src/op/sirius_physical_operator.cpp:37-84`:
-
-```cpp
-std::optional<std::vector<::cucascade::data_batch_processing_handle>>
-pipelineable_operator_data::prepare_for_processing(
-  const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
-{
-  std::vector<::cucascade::data_batch_processing_handle> handles;
-  handles.reserve(_data_batches.size());
-
-  for (const auto& batch : _data_batches) {
-    ...
-    handle = pipeline::lock_or_prepare_batch(batch, requested_memory_space, stream);
-    ...
-    handles.emplace_back(std::move(*handle));
-  }
-
-  return handles;
+  local_state._input_data->prepare_for_processing(requested_memory_space, stream);
+  stream.synchronize();
+} catch (const rmm::out_of_memory& oom) {
+  ...
+  throw oom_reschedule_exception(std::move(local_state._input_data), 0, ...);
 }
 ```
 
-Every batch in `_data_batches` is fed through `lock_or_prepare_batch`. There is no early-exit short-circuit — partial colocation is not possible. Either every batch ends up on `requested_memory_space` or the function returns `std::nullopt` and the task is rescheduled (line 351-353 of `gpu_pipeline_task.cpp`).
+This is the gate. The operator loop — which iterates the pipeline's operators and calls each one's `execute()` — does not run until `prepare_for_processing` has returned. Every batch in the input vector is colocated on `requested_memory_space` by the time any operator sees it; an OOM during colocation reschedules the task from operator index 0.
+
+**Layer 3 — `pipelineable_operator_data::prepare_for_processing` walks each batch and locks-or-converts it.**
+
+`src/op/sirius_physical_operator.cpp` (`prepare_for_processing`):
+
+```cpp
+void pipelineable_operator_data::prepare_for_processing(
+  const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
+{
+  ...
+  for (const auto& batch : data_batches) {
+    ...
+    ro_batch = pipeline::lock_or_prepare_batch(batch, requested_memory_space, stream);
+    ...
+    ro_batches.emplace_back(std::move(*ro_batch));
+  }
+  _read_only_data_batches = std::move(ro_batches);
+  ...
+}
+```
+
+Every batch is fed through `lock_or_prepare_batch`, and the resulting `read_only_data_batch` accessors replace the idle batch vector (a cross-GPU input may have been cloned, so accessor *i* can reference a different batch object than the original `_data_batches[i]`). There is no early-exit short-circuit — partial colocation is not possible. Either every batch ends up on `requested_memory_space` or the function throws and the task is rescheduled (Layer 2's catch).
 
 **Layer 4 — `lock_or_prepare_batch` does the actual conversion.**
 
-`src/include/pipeline/batch_lock_utils.hpp:48-126`:
+`src/include/pipeline/batch_lock_utils.hpp`:
 
 ```cpp
-inline std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_batch(
+inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
   const std::shared_ptr<cucascade::data_batch>& batch,
   const cucascade::memory::memory_space* requested_memory_space,
   rmm::cuda_stream_view stream)
 {
   ...
-  while (!lock_result.success && lock_result.status == status::memory_space_mismatch) {
-    ...
-    case cucascade::memory::Tier::GPU: {
-      ...
-      batch->convert_to<cucascade::gpu_table_representation>(registry, target_space, stream);
-      ...
-    }
-    ...
-  }
+      mut_accessor.convert_to<cucascade::gpu_table_representation>(registry, target_space, stream);
   ...
-  return std::move(lock_result.handle);
 }
 ```
 
-If the batch is already on `target_space`, it is locked in place. If it is on a different GPU, `batch->convert_to<gpu_table_representation>(...)` invokes the cucascade converter registry, which routes the GPU↔GPU path through `cucascade::convert_gpu_to_gpu` (peer-DMA on server hardware, automatic host-staging on consumer hardware whose chipset misreports peer-access support).
+If the batch is already on `target_space`, it is locked in place. If it is on a different GPU, the `convert_to<gpu_table_representation>(...)` invokes the cucascade converter registry, which routes the GPU↔GPU path through `cucascade::convert_gpu_to_gpu` (peer-DMA on server hardware, automatic host-staging on consumer hardware whose chipset misreports peer-access support).
 
-**Postcondition.** When `prepare_for_processing` returns successfully, every batch in `_input_data->_data_batches` lives on `requested_memory_space`. Therefore the per-operator expression `batches[0]->get_memory_space() == target_space` holds at every audited read site. Operators that walk every batch and adopt the first non-null batch's space (e.g. `sirius_physical_sort_sample.cpp:112`, `sirius_physical_merge_sort.cpp:92`, `sirius_physical_table_scan.cpp:129`) are safe by the same postcondition.
+**Postcondition.** When `prepare_for_processing` returns successfully, every batch accessor the operator sees lives on `requested_memory_space`. Therefore the per-operator expression `batches[0]->get_memory_space() == target_space` holds at every audited read site. Operators that walk every batch and adopt the first non-null batch's space (e.g. `sirius_physical_sort_sample.cpp`, `sirius_physical_merge_sort.cpp`) are safe by the same postcondition.
 
 ### The SCHED-RR distribution policy
 
@@ -264,17 +255,20 @@ Three pieces of evidence corroborate that the contract holds for every currently
 
 ### For new operator authors
 
-When you write a new `sirius_physical_operator` subclass that calls `get_memory_space()` on any input batch your operator did not itself construct, add an `INVARIANT (SCHED-RR contract)` comment immediately above the call. The audited form (see `src/op/sirius_physical_concat.cpp:193`) is:
+When you write a new `sirius_physical_operator` subclass that calls `get_memory_space()` on any input batch your operator did not itself construct, add an `INVARIANT (SCHED-RR contract)` comment immediately above the call:
 
 ```cpp
 // INVARIANT (SCHED-RR contract): all input batches arrive on target_space
-// via gpu_pipeline_task::execute_pipeline_task_round ->
+// via gpu_pipeline_task::execute ->
 // pipelineable_operator_data::prepare_for_processing -> lock_or_prepare_batch.
 // See docs/super-sirius/pipeline-execution.md "Per-task-device contract under SCHED-RR".
-cucascade::memory::memory_space* space = valid_batches[0]->get_memory_space();
+cucascade::memory::memory_space* space = input_batches[0].get_memory_space();
 ```
 
-This makes the upstream-protection assumption explicit and reviewable. The comment is mandatory for any code touching `get_memory_space()` on a batch the operator did not itself construct. If your operator constructs an output batch (e.g. by calling `make_data_batch(table, mem_space, writer_stream)`), reads on *that* output are out of scope — the operator chose its own `mem_space` and is the authority for it.
+(The original Phase-15 comments were dropped from the existing read sites during later
+refactoring — e.g. `sirius_physical_concat.cpp` now reads `input_batches[0].get_memory_space()`
+bare — but the upstream enforcement chain is unchanged and the convention stands for new code.)
+This makes the upstream-protection assumption explicit and reviewable. If your operator constructs an output batch (e.g. by calling `make_data_batch(table, mem_space, writer_stream)`), reads on *that* output are out of scope — the operator chose its own `mem_space` and is the authority for it.
 
 If you cannot satisfy the contract — for example, your operator legitimately needs to consume input batches from multiple GPUs without going through `pipelineable_operator_data` — then you must explicitly call `lock_or_prepare_batch` per batch yourself, or use `cucascade::convert_gpu_to_gpu` to colocate before reading. Do not assume `batches[0]`'s space is authoritative.
 
