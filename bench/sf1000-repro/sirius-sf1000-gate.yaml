@@ -1,0 +1,50 @@
+# GATE VARIANT of sirius-sf1000.yaml: usage cap 0.80 so the pool probe fits
+# around driver-held residual memory after crashed runs, and the downgrade
+# trigger/stop pair sits higher than production so eviction churn is HEAVIER.
+# Verification gates only — never score with this.
+sirius:
+    topology:
+        num_gpus: 1
+    memory:
+        gpu:
+            usage_limit_fraction: 0.80
+            reservation_limit_fraction: 1.0
+            downgrade_trigger_fraction: 0.9
+            downgrade_stop_fraction: 0.85
+        host:
+            capacity_bytes: 471200000000
+            initial_number_pools: 392
+            pool_size: 8
+            block_size: 67108864
+        disk:
+            disk_id: 0
+            capacity_bytes: 1000000000000
+            downgrade_root_dirs: "/localhome/local-faramburu/sirius_disk_memory"
+    executor:
+        scan_manager:
+          memory_prefetcher:
+            enable: true
+            num_threads: 3
+          num_threads: 18
+          use_sirius_datasource: true
+          uring_n_reactors: 4
+          enable_prefetch_cache: false
+        pipeline:
+            num_threads: 8
+            thread_name_prefix: "sirius_pipeline_executor"
+        downgrade:
+            num_threads: 1
+            thread_name_prefix: "sirius_downgrade_executor"
+        task_creator:
+            num_threads: 4
+            thread_name_prefix: "sirius_task_creator"
+    operator_params:
+        scan_task_batch_size: 8GB
+        max_sort_partition_bytes: 0               # 0: auto (33% GPU memory)
+        hash_partition_bytes: 32GB
+        concat_batch_bytes: 5GB
+        max_build_hash_table_bytes: 32GB
+    telemetry:
+        enable_quent: false
+        output_directory: telemetry_data
+        engine_name: siriusDB
