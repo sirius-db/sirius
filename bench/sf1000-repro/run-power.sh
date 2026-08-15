@@ -147,6 +147,21 @@ if [ "$NSYS" = "1" ]; then
   echo "nsys      : $NSYS_DIR"
 fi
 
+# SANITIZER=memcheck|initcheck|racecheck|synccheck: run the workload under
+# compute-sanitizer (DIAGNOSTIC RUNS ONLY — 10-40x kernel overhead; never quote
+# scores). Reports land in $SANITIZER_LOG. Incompatible with NSYS=1.
+if [ -n "${SANITIZER:-}" ]; then
+  [ "$NSYS" = "1" ] && { echo "ERROR: SANITIZER and NSYS=1 are incompatible"; exit 1; }
+  command -v compute-sanitizer >/dev/null || { echo "ERROR: compute-sanitizer not in PATH"; exit 1; }
+  SANITIZER_LOG="${SANITIZER_LOG:-$HERE/sanitizer_${SANITIZER}_$(date +%Y%m%d_%H%M%S).log}"
+  LAUNCHER=(compute-sanitizer --tool "$SANITIZER"
+            --target-processes all
+            --log-file "$SANITIZER_LOG"
+            --error-exitcode 99
+            --num-callers-host 12)
+  echo "sanitizer : $SANITIZER -> $SANITIZER_LOG"
+fi
+
 # ROLLBACK=1: --rollback-scratch mode — the runner confines refresh mutations
 # to the WAL and exits without a clean close; deleting the .wal afterwards
 # (below) restores the scratch to content-pristine, so every run reuses the
