@@ -566,6 +566,14 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   auto result              = make_uniq<SiriusTableFunctionData>();
   result->query            = input.inputs[0].ToString();
   result->enable_optimizer = true;
+  // Honor the registered named parameter: gpu_execution('...', enable_optimizer=false)
+  // plans the query without DuckDB's optimizer (default stays true). Stored on the
+  // bind data; every execution's ExtractPlan installs it into that execution's
+  // connection-local ClientConfig under the per-execution RAII (register E7).
+  if (auto it = input.named_parameters.find("enable_optimizer");
+      it != input.named_parameters.end() && !it->second.IsNull()) {
+    result->enable_optimizer = BooleanValue::Get(it->second);
+  }
 
   std::optional<std::string> query_label = std::nullopt;
   // take any query_label that was set using sirius_set_query_label SQL call

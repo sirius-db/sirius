@@ -744,3 +744,59 @@ TEST_CASE("pin_table keys compression plans by resolved identity, not bare table
   run_ok("DETACH e5_db1");
   run_ok("DETACH e5_db2");
 }
+
+TEST_CASE(
+  "adversarial: gpu_execution honors enable_optimizer=false and restores the connection config",
+  "[concurrency][adversarial][config_race][isolated_context]")
+{
+  // Follow-up to E7: gpu_execution(...) registered the named parameter
+  // `enable_optimizer` but the bind ignored it (hard-coded true). It now
+  // reaches the bind data, so every execution's ExtractPlan installs the
+  // USER'S value while planning — under the same per-execution RAII — and the
+  // connection's own config still comes back. This scenario inverts the E7
+  // polarity: the connection keeps its default enable_optimizer=true while
+  // executions plan with false, so a clobbered restore is observable as a
+  // leftover false.
+  scoped_watchdog dog("gpu_execution enable_optimizer=false", scenario_timeout(600));
+
+  adversarial_env env;
+  duckdb::Connection con(*env.db);
+  REQUIRE(con.context->config.enable_optimizer == true);
+
+  const std::string& sql = env.shapes[2];  // scalar aggregate: order-stable
+  const std::string& ref = env.reference[2];
+  auto stmt = con.Prepare("SELECT * FROM gpu_execution('" + sql + "', enable_optimizer=false)");
+  REQUIRE_FALSE(stmt->HasError());
+
+  const int iters = env_int("SIRIUS_TEST_GPU_EXECUTION_ITERS", 10);
+  std::mutex failures_mutex;
+  std::vector<std::string> failures;
+
+  run_racers(2, [&](int tid) {
+    for (int i = 0; i < iters; ++i) {
+      duckdb::vector<duckdb::Value> values;
+      auto r = stmt->Execute(values, /*allow_stream_result=*/false);
+      if (r->HasError()) {
+        std::lock_guard<std::mutex> lock(failures_mutex);
+        failures.push_back("thread " + std::to_string(tid) + " iter " + std::to_string(i) +
+                           " ERROR: " + r->GetError());
+        continue;
+      }
+      if (auto got = materialize(*r); got != ref) {
+        std::lock_guard<std::mutex> lock(failures_mutex);
+        failures.push_back("thread " + std::to_string(tid) + " iter " + std::to_string(i) +
+                           " WRONG RESULT:\n--- got ---\n" + got + "\n--- expected ---\n" + ref);
+      }
+    }
+  });
+  require_no_failures(failures);
+
+  // The user's enable_optimizer=false planned without DuckDB's optimizer and
+  // still produced the reference result, and the connection's own config
+  // (true) survived every execution's temporary install of false.
+  REQUIRE(con.context->config.enable_optimizer == true);
+
+  // No leak to a peer connection's config either.
+  duckdb::Connection peer(*env.db);
+  REQUIRE(peer.context->config.enable_optimizer == true);
+}
