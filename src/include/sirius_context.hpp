@@ -398,10 +398,12 @@ class SiriusContext : public ClientContextState {
   }
 
   /**
-   * @brief Lock-only RAII over the query-lifecycle slot, for plan-generation
-   * windows (OnFinalizePrepare validation, explicit-path plan building,
-   * runtime-sensitive SET callbacks). Same-scope/same-thread by construction:
-   * the destructor releases what the constructor acquired, so no release path
+   * @brief Lock-only RAII over the query-lifecycle slot, for registry
+   * mutations that want conservative serialization against execution windows
+   * (unpin, the pinned-UPDATE guard) without creating per-query runtime
+   * state. Plan generation does NOT use this anymore — it is slot-free via
+   * PlanViewGuard below (F2). Same-scope/same-thread by construction: the
+   * destructor releases what the constructor acquired, so no release path
    * exists outside the acquiring scope.
    */
   class SlotGuard {
