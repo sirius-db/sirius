@@ -15,9 +15,8 @@
  */
 
 /*
- * Phase 15 stress test — varies the SCHED-RR counter starting offset
- * across 100 iterations and runs 5 pre-bound representative [mgpu]
- * test queries at each offset, asserting CPU baseline match.
+ * Phase 15 stress test — runs 5 pre-bound representative [mgpu] test queries
+ * across 100 iterations, asserting CPU baseline match on every run.
  *
  * SPEC DEVIATION (documented per 15-CONTEXT.md acceptance criterion 2):
  * CONTEXT calls for "100 iterations x all [mgpu] tests" (~1300 runs).
@@ -63,14 +62,13 @@
  *       Audit sites: end-to-end TPC-H plan (top_n via TopN, ungrouped_aggregate
  *       via aggregate). Uses /datasets/tpch_parquet_sf1/lineitem.parquet.
  *
- * Catches: hash-bucket-order dependent bugs, off-by-one drift in the
- * round-robin walk, latent assumptions that the counter always starts
- * at 0. See .planning/phases/15-mgpu-operator-colocation-audit/15-CONTEXT.md
- * acceptance criterion 2.
+ * Catches: hash-bucket-order dependent bugs and any latent assumption that
+ * preference-less tasks always land on the same GPU. Dispatch order is decided
+ * by whichever executor signals device_ready first, so repeating each query
+ * many times samples different orderings.
  */
 
 #include "mgpu_test_utils.hpp"
-#include "pipeline/task_scheduler.hpp"  // for set_no_pref_rr_counter_for_testing
 
 #include <cuda_runtime.h>
 
@@ -103,38 +101,17 @@ fs::path make_tmp_dir(std::string const& tag)
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// Stress test: 100 counter-offset iterations x 5 pre-bound [mgpu] queries.
-// Each query has its parquet surface generated ONCE before the iteration
-// loop (data doesn't change with the counter offset; only the SCHED-RR
-// dispatch order does). Inside each iteration we set the counter offset
-// AFTER prepare_for_query (which would reset to 0) but BEFORE the first
-// task dispatch. The current Connection-based approach achieves this by
-// setting the counter BEFORE the gpu_execution call: prepare_for_query
-// runs as part of gpu_execution and resets to 0, then management_eventloop
-// reads the counter on first dispatch — so we re-set the counter on every
-// inner-loop iteration via the test-only setter.
+// Stress test: 100 iterations x 5 pre-bound [mgpu] queries, each compared
+// against its CPU baseline. Each query's parquet surface is generated ONCE
+// before the iteration loop; only the dispatch order varies between runs.
 //
-// Audit observation: prepare_for_query resets _no_pref_rr_counter to 0
-// at the start of every query (verified in Phase 14-01 SUMMARY line 138:
-// "Per-query reset in prepare_for_query: Required for cache=table_gpu
-// correctness ... iteration N+1 must dispatch the same preference-less
-// task to the same GPU as iteration N"). This makes the canonical
-// counter-injection path the test-only setter — a no-op warm-up cannot
-// persist counter state across query iterations.
-//
-// To inject `iter` into the counter at the right moment, we call the
-// setter immediately before `require_gpu_matches_cpu`. The setter races
-// with the per-query reset inside prepare_for_query, but only if the
-// management thread reaches the round-robin block before our setter's
-// store; in practice prepare_for_query runs synchronously in the calling
-// thread before any task dispatch, so our setter (also called from the
-// test thread, AFTER gpu_execution returns the prepared query) lands
-// before management_eventloop fires. Even if a race did occur the test
-// would still exercise SCHED-RR correctness with whatever offset wins;
-// the goal is offset DIVERSITY across iterations, not exact `iter` match.
+// Preference-less tasks are distributed by whichever GPU executor signals
+// device_ready first, so the GPU that serves a given task is not fixed across
+// iterations. Repeating each query many times is what samples those orderings
+// and catches an operator that only happens to be correct on one assignment.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("mgpu_stress - SCHED-RR counter offset rotation",
+TEST_CASE("mgpu_stress - repeated multi-GPU dispatch matches CPU",
           "[mgpu_stress][mgpu][operator-mgpu][gpu_execution]")
 {
   if (!require_two_gpus()) return;
@@ -294,27 +271,19 @@ TEST_CASE("mgpu_stress - SCHED-RR counter offset rotation",
       "ORDER BY l_returnflag, l_linestatus");
   }
 
-  // 100 outer offsets — sweeps the counter through values that cover both
-  // even/odd, modulo-2 boundary, and large-modulo-N edge cases. With 2
-  // GPUs, offsets {0..99} mod 2 covers both GPUs as the "first preference-
-  // less task" device equally.
+  // 100 outer iterations. Which GPU serves the first preference-less task is
+  // decided by whichever executor signals device_ready first, so repeating the
+  // run this many times exercises both assignments rather than pinning one.
   static constexpr size_t kIterations = 100;
 
-  // Open the env + connection once. The connection persists across all
-  // iterations; only the counter offset changes. This mirrors the
-  // followup-17 stress TEST_CASE (kIterations=3 reusing one connection).
+  // Open the env + connection once; the connection persists across all
+  // iterations. This mirrors the followup-17 stress TEST_CASE (kIterations=3
+  // reusing one connection).
   scoped_mgpu_env env(yaml);
-  auto con    = env.make_connection();
-  auto& sched = env.get_task_scheduler(con);
+  auto con = env.make_connection();
 
   for (size_t iter = 0; iter < kIterations; ++iter) {
     for (size_t qi = 0; qi < kQueries.size(); ++qi) {
-      // Inject the iteration-specific offset. prepare_for_query resets
-      // the counter to 0 at the start of every gpu_execution; setting it
-      // here right before the call lands the test value before the first
-      // dispatch — see header comment for the race rationale.
-      sched.set_no_pref_rr_counter_for_testing(iter);
-
       INFO("iter=" << iter << " query=" << qi);
       require_gpu_matches_cpu(con, kQueries[qi]);
     }

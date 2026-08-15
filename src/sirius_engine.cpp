@@ -92,6 +92,8 @@ sirius_engine::~sirius_engine() { query_handle_->exit(); }
 
 void sirius_engine::reset()
 {
+  // Before the plan: the query indexes it, so it must not outlive a plan swap.
+  query_.reset();
   sirius_physical_plan = nullptr;
   sirius_owned_plan.reset();
   sirius_root_pipelines.clear();
@@ -151,36 +153,42 @@ void sirius_engine::execute()
                   telemetry_uuid.high_bits,
                   telemetry_uuid.low_bits);
 
-  // Create the query with the pipelines
-  sirius_ctx->create_query(std::move(new_scheduled),
-                           query_id_,
-                           telemetry::query_telemetry_info{
-                             .telemetry_query_id = telemetry_uuid,
-                             .worker_id          = telemetry_context_->worker_id(),
-                             .query_id           = query_id_,
-                           });
-  auto future = sirius_ctx->get_task_scheduler().start_query();
+  // This query's completion signal. Owned here, shared down to every task via its pipeline's
+  // global state, so no cross-query subsystem holds a "current query" handler.
+  completion_handler_ = std::make_shared<pipeline::completion_handler>();
+  auto future         = completion_handler_->get_awaitable();
+
+  // Create the query with the pipelines. It is owned here, alongside the plan it indexes.
+  query_ = sirius_ctx->create_query(std::move(new_scheduled),
+                                    query_id_,
+                                    completion_handler_,
+                                    telemetry::query_telemetry_info{
+                                      .telemetry_query_id = telemetry_uuid,
+                                      .worker_id          = telemetry_context_->worker_id(),
+                                      .query_id           = query_id_,
+                                    });
+  sirius_ctx->get_task_scheduler().start_query(*query_);
   try {
     future.get();
-    sirius_ctx->get_task_scheduler().wait_for_completion();
+    sirius_ctx->get_task_scheduler().wait_for_completion(query_id_);
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
     // Drain all in-flight GPU tasks before returning.  QueryEnd() will call
     // clear_all_repositories() immediately after execute() throws; without
     // this drain, tasks still running in the thread pool hold raw pointers to
     // those repositories and cause a use-after-free / heap corruption.
-    sirius_ctx->get_task_scheduler().drain_after_error();
+    sirius_ctx->get_task_scheduler().drain_after_error(query_id_);
     throw;
   } catch (...) {
     SIRIUS_LOG_ERROR("Unknown error executing query");
-    sirius_ctx->get_task_scheduler().drain_after_error();
+    sirius_ctx->get_task_scheduler().drain_after_error(query_id_);
     throw;
   }
 
   // All tasks completed — operators and pipelines are still alive here.
   // Warn about any intermediate operators that were never finalized.
-  if (auto query = sirius_ctx->get_query()) {
-    for (const auto& pipeline : query->get_pipelines()) {
+  if (query_) {
+    for (const auto& pipeline : query_->get_pipelines()) {
       for (const auto& op_ref : pipeline->get_operators()) {
         const auto& op = op_ref.get();
         if (!op.finalized.load()) {

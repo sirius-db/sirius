@@ -40,6 +40,7 @@ class downgrade_executor;
 
 namespace sirius::telemetry {
 class telemetry_context;
+struct TaskManagerLoopThreadHandleWrapper;
 }  // namespace sirius::telemetry
 
 namespace sirius {
@@ -113,13 +114,6 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
    */
   [[nodiscard]] executor_metrics get_metrics() const noexcept;
 
-  /**
-   * @brief Set the completion handler for query completion signaling
-   *
-   * @param handler Pointer to the completion handler
-   */
-  void set_completion_handler(completion_handler* handler) noexcept;
-
  protected:
   void manager_loop() override;
 
@@ -135,12 +129,31 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
    */
   gpu_pipeline_task* cast_to_gpu_pipeline_task(sirius::parallel::itask* task);
 
+  /**
+   * @brief Prepare and dispatch one popped task: reservation, downgrade-on-shortfall, local-state
+   *        wiring, then hand-off to the bounded pool.
+   *
+   * Split out of manager_loop() so a failure here is contained to @p pipeline_task's query. Every
+   * failure path reports to that task's own completion handler and returns; none of them may stop
+   * the manager thread, which serves every in-flight query on this device. noexcept because
+   * manager_loop() is a std::thread entry function — an escaping exception would be
+   * std::terminate, not a query failure.
+   *
+   * @param pipeline_task The task popped from this executor's queue. Consumed.
+   * @param slot The reserved pool slot. Consumed by dispatch, or released on any early return.
+   * @param manager_thread_telemetry This manager thread's telemetry handle, for resource
+   * attribution.
+   */
+  void process_task(
+    std::unique_ptr<sirius::parallel::itask> pipeline_task,
+    exec::bounded_thread_pool::slot slot,
+    telemetry::TaskManagerLoopThreadHandleWrapper& manager_thread_telemetry) noexcept;
+
   cucascade::memory::exclusive_stream_pool _stream_pool;
   exec::publisher<std::unique_ptr<task_request>> _task_request_publisher;
   cucascade::memory::memory_space* _memory_space;
   sirius::parallel::downgrade_executor* _downgrade_executor{nullptr};
   sirius::creator::task_creator* _task_creator{nullptr};
-  completion_handler* _completion_handler{nullptr};
   std::atomic<size_t> _tasks_executed{0};
 };
 

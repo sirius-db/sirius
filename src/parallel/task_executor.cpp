@@ -17,6 +17,7 @@
 #include "parallel/task_executor.hpp"
 
 #include "log/logging.hpp"
+#include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/sirius_pipeline_itask.hpp"
 #include "telemetry/telemetry_context.hpp"
 
@@ -33,6 +34,9 @@ itask_executor::itask_executor(
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
   std::optional<int> device_id)
   : _config(std::move(config)),
+    // Shared with the task_scheduler's queue so both derive a task's query the same way; see
+    // pipeline::index_keys_for.
+    _task_queue(&pipeline::index_keys_for),
     _telemetry_context(std::move(telemetry_context)),
     _task_queue_telemetry(std::make_unique<telemetry::TaskQueueHandleWrapper>(
       *_telemetry_context,
@@ -47,6 +51,12 @@ itask_executor::~itask_executor() { stop(); }
 void itask_executor::schedule(std::unique_ptr<itask> task)
 {
   if (task) {
+    // The OOM reschedule path re-enters here from a pool worker after a 50 ms backoff, so a
+    // drain for this query may already have passed. Refuse rather than re-arm work behind it.
+    if (_query_lifecycle != nullptr && !_query_lifecycle->accepts_work(sirius::make_query_id(
+                                         pipeline::index_keys_for(*task).query_id))) {
+      return;
+    }
     if (auto* pipeline_task = dynamic_cast<pipeline::sirius_pipeline_itask*>(task.get())) {
       pipeline_task->telemetry_handle().queued({
         .queue_resource_id      = _task_queue_telemetry->handle->uuid(),
@@ -92,6 +102,11 @@ void itask_executor::wait_all()
 }
 
 void itask_executor::drain_leftover_tasks() { _task_queue.drain(); }
+
+void itask_executor::drain_query_tasks(sirius::query_id_t query_id)
+{
+  _task_queue.drain(exec::query_index{static_cast<exec::query_key>(sirius::value_of(query_id))});
+}
 
 void itask_executor::drain_and_wait()
 {

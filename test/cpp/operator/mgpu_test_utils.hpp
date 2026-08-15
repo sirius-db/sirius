@@ -183,10 +183,9 @@ class scoped_mgpu_env {
    * @brief Test-only accessor for the underlying task_scheduler.
    *
    * Returns a non-owning reference to the task_scheduler instance owned
-   * by the SiriusContext that this fixture wraps. Intended for tests
-   * that need to call test-only mutators (e.g.,
-   * `set_no_pref_rr_counter_for_testing`) between query setup and
-   * execution. Lifetime: the returned reference is valid for the
+   * by the SiriusContext that this fixture wraps. Intended for tests that
+   * need to reach the scheduler between query setup and execution.
+   * Lifetime: the returned reference is valid for the
    * lifetime of the scoped_mgpu_env instance (the SiriusContext is
    * shared across every connection opened against this env via the
    * extension callback's `OnConnectionOpened`).
