@@ -20,9 +20,11 @@
 #include "common/reference_map.hpp"
 #include "duckdb/parallel/pipeline.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
+#include "exec/queue_priority.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/pipeline_build_context.hpp"
+#include "query_id.hpp"
 #include "telemetry-bridge/gen/uuid.rs.h"
 
 #include <nvtx3/nvtx3.hpp>
@@ -154,6 +156,25 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   void set_pipeline_id(size_t id) { pipeline_id = id; }
   //! Get the pipeline ID
   size_t get_pipeline_id() const { return pipeline_id; }
+
+  //! Set this pipeline's scheduling priority. Mirrors the value task_creator puts on the
+  //! pipeline's task global state, kept here so a task-creation request can be keyed without
+  //! taking the task_creator's per-query lock on the schedule() hot path.
+  void set_priority(exec::queue_priority priority) noexcept { priority_ = priority; }
+  //! This pipeline's scheduling priority (lower runs first).
+  [[nodiscard]] exec::queue_priority get_priority() const noexcept { return priority_; }
+
+  //! Set the id of the query this pipeline belongs to. Stamped by planner::query once the
+  //! pipeline set is final; see get_query_id().
+  void set_query_id(sirius::query_id_t id) noexcept { query_id_ = id; }
+  //! The query this pipeline belongs to.
+  //!
+  //! Queue index keys are derived from this (see the multi_index_priority_queue extractors in
+  //! task_scheduler and task_creator), so that per-query drains target the right tasks. Read it
+  //! from here rather than recovering it from the packed scheduling priority: the priority masks
+  //! the id to 31 bits (see sirius::query_priority_bits), so the recovered value diverges from
+  //! the real query id once bit 31 is set.
+  [[nodiscard]] sirius::query_id_t get_query_id() const noexcept { return query_id_; }
   //! Returns the parent pipelines (pipelines that depend on this pipeline)
   std::vector<sirius_pipeline*> get_parents() const;
 
@@ -259,6 +280,11 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   //! The unique ID of this pipeline (assigned based on new_scheduled order)
   size_t pipeline_id = 0;
+  //! The query this pipeline belongs to; stamped by planner::query. Defaults to 0, which is
+  //! never a live query id (window ids start at 1), so an unstamped pipeline is detectable.
+  sirius::query_id_t query_id_ = sirius::make_query_id(0);
+  //! Scheduling priority; stamped by task_creator::prepare_for_query.
+  exec::queue_priority priority_ = 0;
   //! Plan-time context (replaces sirius_engine& for plan-time needs)
   pipeline_build_context build_ctx_;
 
