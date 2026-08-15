@@ -17,6 +17,7 @@
 #include "catch.hpp"
 
 // sirius
+#include "data/convertible_data_batch.hpp"
 #include "data/data_repository_manager_registry.hpp"
 #include "downgrade/downgrade_executor.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
@@ -541,6 +542,130 @@ TEST_CASE("cuda_stream_lifecycle", "[downgrade_lifecycle]")
     std::this_thread::sleep_for(50ms);
   }
   REQUIRE(get_batch_tier(*batch2) == cucascade::memory::Tier::HOST);
+
+  executor.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Shared-ownership teardown (steps 6+7): erase never fences on a sweep
+// ---------------------------------------------------------------------------
+
+TEST_CASE("erase while a sweep holds shared repositories", "[downgrade_lifecycle]")
+{
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  sirius::data::data_repository_manager_registry repo_registry;
+
+  // Observable destructor-side accounting: replace the registry-installed logging handler
+  // with a counting one (the manager applies it to current and future repositories).
+  std::atomic<std::size_t> leak_reports{0};
+  std::atomic<std::size_t> leaked_batches{0};
+  std::atomic<std::size_t> leaked_operator_id{0};
+
+  std::weak_ptr<cucascade::data_repository> repo_observer;
+  std::shared_ptr<cucascade::data_repository> sweep_held_repo;
+  sirius::data::data_repository_manager_registry::manager_ptr sweep_held_manager;
+
+  {
+    auto manager = repo_registry.create_for_query(kTestQueryId);
+    manager->set_leak_handler(
+      [&](std::size_t operator_id, const std::string& /*port_id*/, std::size_t count) {
+        leaked_operator_id.store(operator_id);
+        leaked_batches.fetch_add(count);
+        leak_reports.fetch_add(1);
+      });
+
+    auto repo  = std::make_unique<cucascade::shared_data_repository>();
+    auto batch = make_gpu_batch(*gpu_space);
+    repo->add_data_batch(batch);
+    manager->add_new_repository(7, "out", std::move(repo));
+
+    // Simulate exactly what a TIER-1 sweep borrows before its blocking work: the manager
+    // snapshot and the per-manager repository snapshot, both shared.
+    auto managers = repo_registry.get_all();
+    REQUIRE(managers.size() == 1);
+    sweep_held_manager = managers.front();
+    auto repos         = sweep_held_manager->get_repositories();
+    REQUIRE(repos.size() == 1);
+    sweep_held_repo = repos.front();
+    repo_observer   = sweep_held_repo;
+  }
+
+  // The query ends mid-sweep. erase() must not block (no fence) and must not invalidate the
+  // sweep's borrow — only the map entry goes.
+  repo_registry.erase(kTestQueryId);
+  REQUIRE(repo_registry.get(kTestQueryId) == nullptr);
+  REQUIRE_FALSE(repo_observer.expired());
+  // Not accounted yet: the repository is still alive in the sweep's hands.
+  REQUIRE(leak_reports.load() == 0);
+
+  // The sweep keeps working against its borrow: candidate collection still functions.
+  // Scoped: the provider CO-OWNS the repository (that is the point of step 6), so it must be
+  // gone before the expiry check below.
+  {
+    sirius::convertible_data_batch_provider provider(sweep_held_repo);
+    auto candidates = provider.get_all_convertible(gpu_space, /*front_to_back=*/false);
+    REQUIRE(candidates.size() == 1);
+  }
+
+  // Sweep finishes: the last holders release, the repository dies, and the un-consumed batch
+  // is accounted in the DESTRUCTOR, attributed to the {operator, port} it was registered as.
+  sweep_held_repo.reset();
+  sweep_held_manager.reset();
+  REQUIRE(repo_observer.expired());
+  REQUIRE(leak_reports.load() == 1);
+  REQUIRE(leaked_batches.load() == 1);
+  REQUIRE(leaked_operator_id.load() == 7);
+}
+
+TEST_CASE("erase during an in-flight downgrade sweep leaves the sweep unharmed",
+          "[downgrade_lifecycle]")
+{
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+
+  auto repo  = std::make_unique<cucascade::shared_data_repository>();
+  auto batch = make_gpu_batch(*gpu_space);
+  repo->add_data_batch(batch);
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  executor.start();
+
+  // Wedge a request mid-sweep: its worker parks inside the predicate after converting the
+  // batch, so the sweep provably holds its borrows when the erase lands.
+  std::promise<void> release_blocker;
+  std::shared_future<void> gate(release_blocker.get_future());
+  std::atomic<bool> blocker_entered{false};
+  auto fut = executor.request_downgrade(sirius::make_query_id(55), [&blocker_entered, gate]() {
+    blocker_entered.store(true);
+    gate.wait();
+    return false;
+  });
+
+  auto deadline = std::chrono::steady_clock::now() + 10s;
+  while (!blocker_entered.load() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  REQUIRE(blocker_entered.load());
+
+  // The repositories' owning query ends while the sweep is in flight. Pre-step-6 this erase
+  // would have BLOCKED on the sweep gate until the request finished; now it returns at once.
+  repo_registry.erase(kTestQueryId);
+  REQUIRE(repo_registry.get(kTestQueryId) == nullptr);
+
+  release_blocker.set_value();
+  REQUIRE(fut.wait_for(10s) == std::future_status::ready);
+  size_t freed = 0;
+  REQUIRE_NOTHROW(freed = fut.get());
+  REQUIRE(freed > 0);
+  REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
 
   executor.stop();
 }

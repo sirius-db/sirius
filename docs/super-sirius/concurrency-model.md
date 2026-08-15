@@ -11,11 +11,12 @@ The prime directive throughout: **every piece of runtime state is either process
 immutable-per-query, or keyed by query id** — and every teardown step touches exactly one
 query's key.
 
-> **Volatility note.** Two areas are under active rework as this is written: the
-> repository-teardown fences (sweep gate + `wait_inflight_request`, marked *interim* below —
-> shared-ownership repositories are the planned end-state) and the executor blocking primitives
-> (the quiesce/resume bracket and `push_or_bounce`). Both sections describe the current tip;
-> re-verify them against the code before relying on the details.
+> **Volatility note.** The executor blocking primitives (the quiesce/resume bracket and
+> `push_or_bounce`) are under active rework as this is written; that section describes the
+> current tip — re-verify it against the code before relying on the details. The
+> repository-teardown fences reached their structural end-state (steps 6+7): repositories are
+> shared-ownership, the interim sweep gate is gone, and `wait_inflight_request` remains as the
+> plan-lifetime fence (see "Teardown fences").
 
 ## Query identity: `query_id_t`
 
@@ -257,23 +258,35 @@ pattern and candidate mechanics; what matters here is the cross-query contract:
   stop-join-restart) survives for terminate/stop and tests only; `_lifecycle_mutex` serializes
   it against concurrent cleanups.
 
-### Teardown fences (interim; see steps 6+7)
+### Teardown fences (steps 6+7 end-state)
 
-> **INTERIM MECHANISM** — these two fences close specific races with borrowed raw pointers.
-> William's steps 6+7 (shared-ownership repositories) are the structural end-state and are being
-> worked on in a sibling effort; when they land, the fences below should be re-verified/replaced.
+Steps 6+7 replaced the interim repository fences with ownership. The rule: **no raw
+`data_repository*` crosses a blocking call anywhere.**
 
-- **The sweep gate.** A TIER-1 sweep holds raw `data_repository*` borrowed from a manager across
-  blocking work; shared ownership protects the manager object, not the repositories inside it.
-  `data_repository_manager_registry::begin_sweep()` hands the sweep a token;
-  `erase()`/`clear()` register teardown intent first (so a stream of sweeps cannot starve a
-  teardown) and wait until every active sweep releases its token before clearing repositories.
-- **`wait_inflight_request()`.** `drain(query_id)` waits only for the query's *own* in-flight
-  request — but a peer's (or the monitor's) request sweeps by memory space, so its TIER-2 pass
-  may hold the ending query's task inside a convertible wrapper across a blocking conversion,
-  and that wrapper's RAII drop walks the task's plan. Query-end cleanup therefore waits out
-  whatever request is in flight on every executor (bounded: one per executor) before destroying
-  the parked plan.
+- **Shared-ownership repositories (step 6) — the retired sweep gate.** A TIER-1 sweep co-owns
+  everything it borrows: `registry::get_all()` hands out `shared_ptr` managers,
+  `data_repository_manager::get_repositories()` hands out `shared_ptr` repositories, and
+  batches were always `shared_ptr`. `erase(query_id)`/`clear()` therefore only drop the MAP
+  ENTRY — an in-flight sweep keeps its borrowed objects alive until it naturally finishes, and
+  teardown never waits for a sweep. The old `begin_sweep()` token that `erase()` fenced on is
+  deleted. Leaked-batch accounting moved with the ownership: batches that die un-consumed are
+  reported by the repository DESTRUCTOR (wherever and whenever the last holder releases it),
+  attributed to their query by the leak handler `create_for_query()` installs. Plan-side
+  readers co-own too: operator ports hold `port::repo_owner` (the raw `port::repo` is a cached
+  alias), and `gpu_pipeline_task::_data_repos` carries `shared_ptr` destinations across queue
+  hops and OOM reschedules (B4).
+- **`wait_inflight_request()` — the SURVIVING fence (plan lifetime, not repository lifetime).**
+  `drain(query_id)` waits only for the query's *own* in-flight requests — but a peer's (or the
+  monitor's) request sweeps by memory space, so its TIER-2 pass may hold the ending query's
+  task inside a convertible wrapper across a blocking conversion. The wrapper's RAII drop
+  consults the lifecycle gate with extraction-time keys and, for a quiescing query, DESTROYS
+  the task instead of re-pushing it — and `~gpu_pipeline_task` walks the task's plan
+  (`mark_task_completed` → `notify_downstream_pipelines`). Plan parking (B5) only defers the
+  plan's death until cleanup; cleanup must still not destroy it while such a wrapper is alive.
+  So query-end cleanup waits out the requests in flight on every executor before destroying
+  the parked plan. Bounded, because requests that start later never extract a quiescing
+  query's tasks (TIER-2 extraction consults the gate). Shared-ownership repositories
+  deliberately did NOT subsume this fence — it guards operator pointers, not repositories.
 
 ### Retry cap
 
@@ -309,7 +322,8 @@ The ordered steps:
 4. **Downgrade drain** — `downgrade_executor::drain(query_id)` on every executor: fails only
    this query's queued downgrade promises, unblocking its own (dying) waiters; peers untouched.
 5. **Inflight wait** — `wait_inflight_request()` on every executor: waits out any request whose
-   TIER-2 pass may hold this query's task in a convertible wrapper (interim fence; see above).
+   TIER-2 pass may hold this query's task in a convertible wrapper (the plan-lifetime fence;
+   see above).
 6. **Final sweep** — one more `drain_query_tasks(query_id)`: a wrapper that read the gate as
    open just before `quiesce()` landed may have re-pushed a task behind step 3's sweep; every
    wrapper is gone now, and nothing can re-add tasks (producers gate-refused, extraction skips
@@ -320,9 +334,10 @@ The ordered steps:
    still exist.
 8. **Telemetry close-out** — best-effort (`batch_telemetry_registry::on_query_end()`); a
    telemetry failure never aborts the remaining mandatory steps.
-9. **Repository erase** — `data_repository_registry_.erase(query_id)`: waits out any in-progress
-   downgrade sweep (the sweep gate), then clears this query's repositories, logging any
-   un-consumed batches as leaks.
+9. **Repository erase** — `data_repository_registry_.erase(query_id)`: drops only the registry's
+   map entry — an in-progress downgrade sweep co-owns whatever it borrowed and keeps it alive
+   until it finishes (step 6). Un-consumed batches are logged as leaks by the repository
+   destructors, attributed to this query.
 10. **Scan reset** — `scan_manager_->reset(query_id)`: after the repositories, so downstream
     batches referencing sliced host representations are gone before the providers die.
 11. **Close** — `query_lifecycle_.close(query_id)`: the window is over; the entry is erased
@@ -447,7 +462,7 @@ backstop runs the cleanup only when `finish()` never completed.
 | `src/include/query_id.hpp` | Window/query identity, priority-band packing |
 | `src/include/sirius_context.hpp` / `src/sirius_context.cpp` | Slot pool, execution windows, begin/cleanup, failure classification, snapshots |
 | `src/include/exec/query_lifecycle_registry.hpp` | The per-query enqueue gate |
-| `src/include/data/data_repository_manager_registry.hpp` | Per-query repository managers, sweep gate |
+| `src/include/data/data_repository_manager_registry.hpp` | Per-query repository managers (shared ownership; per-query leak attribution) |
 | `src/include/creator/task_creator.hpp` / `src/creator/task_creator.cpp` | Per-query creation state, lookahead rotation, per-query drains |
 | `src/include/pipeline/task_scheduler.hpp` / `src/pipeline/task_scheduler.cpp` | Per-query start/terminate/drain, fair dispatch |
 | `src/include/pipeline/gpu_pipeline_executor.hpp` / `src/pipeline/gpu_pipeline_executor.cpp` | C4 non-blocking manager, memory-wait slot, per-query OOM cap |

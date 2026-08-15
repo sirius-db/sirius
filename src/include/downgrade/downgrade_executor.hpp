@@ -129,27 +129,36 @@ class downgrade_executor {
    * needs no _lifecycle_mutex because it never touches thread lifetimes.
    *
    * Precondition: the query is quiesced (no producer can enqueue new requests for it), which
-   * run_mandatory_cleanup guarantees before calling this. Repository teardown is fenced
-   * separately by data_repository_manager_registry's sweep gate.
+   * run_mandatory_cleanup guarantees before calling this. Repository teardown needs no fence
+   * at all: sweeps co-own every manager/repository/batch they borrow (step 6), so the
+   * registry's erase() just drops its map entry.
    */
   void drain(sirius::query_id_t query_id);
 
   /**
    * @brief Wait until no downgrade request is being processed, regardless of owner.
    *
-   * drain(query_id) deliberately waits only for the query's OWN in-flight request — but a
-   * PEER's (or the monitor's) request sweeps by memory space, not by query, so its TIER-2
-   * pass can hold the ending query's task inside a convertible wrapper across a blocking
-   * conversion. That wrapper's RAII drop walks the task's plan; the plan may only be
-   * destroyed after every such wrapper is gone. Query-end cleanup therefore calls this after
-   * the per-query drains and BEFORE destroying the parked plan: when it returns, every
-   * wrapper created by a request that was in flight has been destroyed (a request joins its
-   * wrappers before completing), so one final queue sweep leaves nothing of the query for a
-   * later request to find.
+   * THE SURVIVING FENCE — this wait is about PLAN lifetime, not repository lifetime, and
+   * shared-ownership repositories (step 6) deliberately did NOT subsume it:
+   *
+   * drain(query_id) waits only for the query's OWN in-flight request — but a PEER's (or the
+   * monitor's) request sweeps by memory space, not by query, so its TIER-2 pass can hold the
+   * ending query's task inside a convertible wrapper across a blocking conversion. When that
+   * wrapper's RAII drop runs, the lifecycle gate (consulted with extraction-time keys) refuses
+   * the re-push for a quiescing query and the wrapper DESTROYS the task instead — and
+   * ~gpu_pipeline_task walks the task's plan (mark_task_completed ->
+   * notify_downstream_pipelines over raw operator pointers). Plan parking (B5) only defers the
+   * plan's death until cleanup; cleanup must still not destroy it while such a wrapper is
+   * alive. Query-end cleanup therefore calls this after the per-query drains and BEFORE
+   * destroying the parked plan: when it returns, every wrapper created by a request that was
+   * in flight has been destroyed (a request joins its wrappers before completing), so one
+   * final queue sweep leaves nothing of the query for a later request to find.
    *
    * A request popped but not yet published as in-flight can slip past this wait; that is
    * closed from the other side — TIER-2 extraction consults the query-lifecycle gate, so a
-   * request starting after quiesce() never extracts the ending query's tasks.
+   * request starting after quiesce() never extracts the ending query's tasks. Those two
+   * properties (extraction gate + this bounded wait) are exactly what makes destroying the
+   * plan safe; keep them together.
    */
   void wait_inflight_request();
 

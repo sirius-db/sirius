@@ -536,18 +536,19 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // request_downgrade(...).get()), which are being torn down anyway. Peer queries' pending
   // spills and the monitor's pressure response are left alone — the global drain() that used
   // to run here failed every queued promise (killing healthy peers' downgrades) and
-  // stop-join-restarted each executor's processing thread on every query end, leaving a
-  // window where the monitor refilled the queue before the repository erase below. The erase
-  // is now fenced against in-progress sweeps by the registry's sweep gate, not by this drain.
+  // stop-join-restarted each executor's processing thread on every query end. The repository
+  // erase below needs no fence against sweeps at all: they co-own what they borrow (step 6).
   for (auto& executor : downgrade_executors_) {
     executor->drain(query_id);
   }
 
-  // drain(query_id) waits only for THIS query's in-flight request — but a peer's (or the
-  // monitor's) request sweeps by memory space, so its TIER-2 pass may hold this query's task
-  // in a convertible wrapper across a blocking conversion, and that wrapper's RAII drop walks
-  // the plan. Wait out whatever request is in flight (bounded: one per executor) so every such
-  // wrapper is gone; requests that start later cannot extract this query's tasks (TIER-2
+  // THE PLAN-LIFETIME FENCE (kept through step 7 on purpose — shared-ownership repositories
+  // do not subsume it): drain(query_id) waits only for THIS query's in-flight request, but a
+  // peer's (or the monitor's) request sweeps by memory space, so its TIER-2 pass may hold this
+  // query's task in a convertible wrapper across a blocking conversion — and the wrapper's
+  // RAII drop, gate-refused for a quiescing query, DESTROYS the task, whose destructor walks
+  // the plan destroyed a few lines below. Wait out whatever requests are in flight (bounded:
+  // requests already started; later ones cannot extract this query's tasks because TIER-2
   // extraction consults the lifecycle gate, quiescing since the top of this function).
   for (auto& executor : downgrade_executors_) {
     executor->wait_inflight_request();

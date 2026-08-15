@@ -21,7 +21,6 @@
 
 #include <cucascade/data/data_repository_manager.hpp>
 
-#include <condition_variable>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -62,65 +61,12 @@ class data_repository_manager_registry {
   data_repository_manager_registry(data_repository_manager_registry&&)                 = delete;
   data_repository_manager_registry& operator=(data_repository_manager_registry&&)      = delete;
 
-  /**
-   * @brief RAII borrow token for a memory-pressure sweep over the registry's repositories.
-   *
-   * A downgrade sweep walks `get_all()` and then holds raw `data_repository*` obtained from
-   * each manager across blocking work (thread-pool reserve, host/device copies). Shared
-   * ownership protects the *manager* object, not the repositories inside it: `erase()` calls
-   * `clear_all_repositories()`, which destroys those repositories while a sweep may still be
-   * dereferencing them.
-   *
-   * The token turns that precondition into an enforced fence: `erase()`/`clear()` wait for
-   * every active sweep to finish (and block new sweeps from starting while they wait, so a
-   * steady stream of sweeps cannot starve a query's teardown). This became load-bearing when
-   * per-query cleanup stopped quiescing the downgrade executors globally — a peer query's or
-   * the monitor's sweep can now legitimately be mid-flight while a query tears down.
-   *
-   * Interim by design: shared-ownership repositories (planned) subsume it.
-   */
-  class sweep_guard {
-   public:
-    sweep_guard() = default;
-    explicit sweep_guard(data_repository_manager_registry* registry) : _registry(registry) {}
-    sweep_guard(sweep_guard&& other) noexcept : _registry(std::exchange(other._registry, nullptr))
-    {
-    }
-    sweep_guard(const sweep_guard&)            = delete;
-    sweep_guard& operator=(const sweep_guard&) = delete;
-    sweep_guard& operator=(sweep_guard&& other) noexcept
-    {
-      if (this != &other) {
-        if (_registry != nullptr) { _registry->end_sweep(); }
-        _registry = std::exchange(other._registry, nullptr);
-      }
-      return *this;
-    }
-    ~sweep_guard()
-    {
-      if (_registry != nullptr) { _registry->end_sweep(); }
-    }
-
-   private:
-    data_repository_manager_registry* _registry{nullptr};
-  };
-
-  /**
-   * @brief Register a sweep. Blocks while a teardown (`erase()`/`clear()`) is waiting or
-   *        running, then returns a token that must outlive every raw repository pointer the
-   *        sweep borrows (including pointers captured by worker lambdas — hold the token until
-   *        the workers are joined).
-   *
-   * Never called with the registry's map mutex held, and acquires no lock while held, so it
-   * cannot deadlock against `get_all()`/`get()`/`create_for_query()`.
-   */
-  [[nodiscard]] sweep_guard begin_sweep()
-  {
-    std::unique_lock<std::mutex> lock(_sweep_mutex);
-    _sweep_cv.wait(lock, [this] { return _pending_teardowns == 0; });
-    ++_active_sweeps;
-    return sweep_guard(this);
-  }
+  // NOTE (step 7 prep): this registry used to carry a sweep gate — begin_sweep() tokens that
+  // erase()/clear() waited on — because a downgrade sweep held raw data_repository* borrowed
+  // from a manager across blocking work. Shared ownership subsumed it: get_all() hands out
+  // shared_ptr managers, manager_type::get_repositories() hands out shared_ptr repositories,
+  // and batches were always shared_ptr, so a sweep OWNS everything it borrows and teardown
+  // never waits for (or dangles under) a sweep again.
 
   /**
    * @brief Create the manager for @p query_id.
@@ -208,7 +154,6 @@ class data_repository_manager_registry {
    */
   void erase(sirius::query_id_t query_id)
   {
-    teardown_scope fence(*this);
     manager_ptr manager;
     {
       std::lock_guard<std::mutex> lock(_mutex);
@@ -223,11 +168,9 @@ class data_repository_manager_registry {
     manager.reset();
   }
 
-  /// \brief Drop every manager. For SiriusContext teardown, after all workers are stopped
-  ///        (the sweep fence is then uncontended and acquired immediately).
+  /// \brief Drop every manager. For SiriusContext teardown, after all workers are stopped.
   void clear()
   {
-    teardown_scope fence(*this);
     std::map<query_id_t, manager_ptr> drained;
     {
       std::lock_guard<std::mutex> lock(_mutex);
@@ -245,52 +188,9 @@ class data_repository_manager_registry {
   }
 
  private:
-  /// Sweep-side release for sweep_guard.
-  void end_sweep()
-  {
-    {
-      std::lock_guard<std::mutex> lock(_sweep_mutex);
-      --_active_sweeps;
-    }
-    _sweep_cv.notify_all();
-  }
-
-  /// Teardown-side bracket: registers intent first (so no NEW sweep can start and starve the
-  /// wait), then waits until every active sweep has released its token. Multiple teardowns may
-  /// proceed concurrently — the map mutex covers the map, and each erases a distinct manager.
-  class teardown_scope {
-   public:
-    explicit teardown_scope(data_repository_manager_registry& registry) : _registry(registry)
-    {
-      std::unique_lock<std::mutex> lock(_registry._sweep_mutex);
-      ++_registry._pending_teardowns;
-      _registry._sweep_cv.wait(lock, [this] { return _registry._active_sweeps == 0; });
-    }
-    teardown_scope(const teardown_scope&)            = delete;
-    teardown_scope& operator=(const teardown_scope&) = delete;
-    ~teardown_scope()
-    {
-      {
-        std::lock_guard<std::mutex> lock(_registry._sweep_mutex);
-        --_registry._pending_teardowns;
-      }
-      _registry._sweep_cv.notify_all();
-    }
-
-   private:
-    data_repository_manager_registry& _registry;
-  };
-
   mutable std::mutex _mutex;
   /// std::map (not unordered_map) so get_all() iteration is ascending by query id.
   std::map<sirius::query_id_t, manager_ptr> _managers;
-
-  /// Sweep fence state (see begin_sweep()/teardown_scope). Separate from _mutex on purpose:
-  /// sweeps hold their token across long blocking work, and _mutex must stay cheap.
-  std::mutex _sweep_mutex;
-  std::condition_variable _sweep_cv;
-  int _active_sweeps{0};
-  int _pending_teardowns{0};
 };
 
 }  // namespace sirius::data
