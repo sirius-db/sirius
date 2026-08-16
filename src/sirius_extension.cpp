@@ -1836,6 +1836,11 @@ static void SetFuseMergePipelines(ClientContext& /*context*/,
   // DuckDB stores this setting in the client context.
 }
 
+static void SetFuseTwinScans(ClientContext& /*context*/, SetScope /*scope*/, Value& /*parameter*/)
+{
+  // DuckDB stores this setting in the client context.
+}
+
 static sirius::operator_params* get_operator_params(ClientContext& context)
 {
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -2282,6 +2287,13 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(true),
                             SetFuseMergePipelines);
+
+  // Default from the YAML-loaded params, so a sirius.yaml value is what connections inherit.
+  config.AddExtensionOption("fuse_twin_scans",
+                            "Fuse near-duplicate same-table scans into one fan-out scan pipeline",
+                            LogicalType::BOOLEAN,
+                            Value::BOOLEAN(operator_defaults.fuse_twin_scans),
+                            SetFuseTwinScans);
 
   // Add in config options for duckdb scan task
   // Default batch size

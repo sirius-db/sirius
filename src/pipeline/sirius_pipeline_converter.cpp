@@ -30,6 +30,7 @@
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "op/sirius_physical_partition.hpp"
+#include "op/sirius_physical_twin_scan_split.hpp"
 #include "pipeline/repository_wiring.hpp"
 
 #include <algorithm>
@@ -330,6 +331,24 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
              sink_op,
              pipeline,
              it->second);
+      }
+      continue;
+    }
+
+    // A twin-scan split is a two-output fan-out sink: out-A goes to its tree parent's
+    // pipeline (the consumer the fused pipeline replaced), out-B to the twin ref anchor's
+    // consumer pipeline (the TWIN_SCAN_REF itself is routing-only and never lands in any
+    // pipeline's operators[], like DELIM_SCAN). The split's sink() routes the two halves by
+    // matching each edge's destination operator against the twin ref's tree parent.
+    if (sink_op->type == T::TWIN_SCAN_SPLIT) {
+      auto& split = sink_op->Cast<op::sirius_physical_twin_scan_split>();
+      op::sirius_physical_operator* consumers[] = {sink_op->get_parent_op(),
+                                                   split.twin_ref()->get_parent_op()};
+      for (auto* consumer : consumers) {
+        if (!consumer) { continue; }
+        auto it = dest_for_op.find(consumer);
+        if (it == dest_for_op.end()) { continue; }
+        emit("default", resolve_barrier(*sink_op, *it->second), sink_op, pipeline, it->second);
       }
       continue;
     }

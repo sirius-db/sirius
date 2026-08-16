@@ -578,6 +578,7 @@ SET enable_compressed_materialization = false;
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `fuse_merge_pipelines` | true | Fuse eligible GROUP BY / TOP_N merges into their downstream pipeline instead of cutting a boundary (see [physical-plan-generation.md](physical-plan-generation.md) → Merge fusion) |
+| `fuse_twin_scans` | true | Fuse near-duplicate same-table probe scans into one fan-out twin-scan pipeline: one shared decode + Bloom probe feeds both consumers, at the price of extra rows (measured +1.1% on TPC-H q21) into the narrower consumer's authoritative join and one extra device gather for the first output (see [physical-plan-generation.md](physical-plan-generation.md) → Twin-scan fusion) |
 | `max_sort_partition_bytes` | 0 (auto) | Max sort partition bytes |
 | `max_sort_partition_memory_fraction` | 0.33 | Auto sort-partition fraction when `max_sort_partition_bytes` is 0 |
 | `hash_partition_bytes` | Shared physical/effective GPU batch default | Hash partition target size; must be greater than zero |

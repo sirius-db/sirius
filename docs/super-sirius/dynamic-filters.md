@@ -111,6 +111,8 @@ Properties:
 
 Consumer access is via `filters_for_column(col_idx)` and `filtered_columns()`. The free helper `merge_ast_dynamic_filters_into_tree(tree, existing_root, set, resolver)` walks the channel, lowers every AST-capable filter, AND-conjoins the per-column and cross-column fragments, and returns `AND(existing_root, dynamic_root)` — or `existing_root` unchanged if no filter contributed.
 
+One plan-time writer can rewire channels after construction: the twin-scan fusion pass (`sirius_plan_twin_scan_fusion.cpp`) may re-point a scan to a sibling scan's channel (after structurally proving the sibling's key set subsumes its own) and `close_for_new_filters()` the orphaned channel — the orphan's producer join then skips filter construction entirely. Channel-lifecycle readers must account for this writer: a channel created with a consumer can enter execution closed and consumerless.
+
 ### Filter router — plan-gen channel map (routing axis)
 
 *Introduced in Phase 1.1.* During plan construction, multiple operators must find each other and agree on a shared channel. The router lives on `sirius_physical_plan_generator` and maps a *route key* to a channel:

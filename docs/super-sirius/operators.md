@@ -338,6 +338,16 @@ Merges ungrouped aggregate results from multiple partitions.
 
 Merges local top-N results from multiple partitions.
 
+### `sirius_physical_twin_scan_split` — `TWIN_SCAN_SPLIT`
+**File:** `src/include/op/sirius_physical_twin_scan_split.hpp`
+
+Fan-out sink of a fused twin-scan pipeline (`GPU_SCAN → DYNAMIC_FILTER → TWIN_SCAN_SPLIT`), installed by the twin-scan fusion pass. Per input batch, `execute()` materializes out-A (the first scan's column projection, a fresh owned gather that never aliases the input) and out-B (the second scan's residual filter through an `expression_evaluator`, plus its output projection); `sink()` routes out-A to the tree parent's pipeline and out-B to the `TWIN_SCAN_REF`'s consumer pipeline over the converter's two PARTIAL-barrier edges, throwing on any edge-count mismatch. The declared `types` describe out-A only (`declared_output_schema_is_runtime_schema()` is false because the two halves carry different schemas), and `on_finalize_operator()` logs cumulative `rows_in` / `out_a` / `out_b` for validation against an unfused run.
+
+### `sirius_physical_twin_scan_ref` — `TWIN_SCAN_REF`
+**File:** `src/include/op/sirius_physical_twin_scan_split.hpp`
+
+Routing-only anchor occupying the tree slot of the fused-away second scan so its downstream feeder chain is planned unchanged. Like `DELIM_SCAN` it never lands in any pipeline's `operators[]`: `build_pipelines` appends nothing, and the converter wires the owning `TWIN_SCAN_SPLIT`'s second output edge to this node's tree parent.
+
 ## CTE / Delim Join Operators
 
 ### `sirius_physical_cte` — `CTE`
@@ -403,6 +413,8 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | PARTITION | Pipeline | Hash/range partitioning |
 | CONCAT | Pipeline | Partition reassembly |
 | MERGE_TOP_N | Pipeline | Merge per-partition top-N |
+| TWIN_SCAN_SPLIT | Pipeline | Fan-out sink of a fused twin-scan pipeline: residual filter (out-B) + column gather (out-A) |
+| TWIN_SCAN_REF | Pipeline | Routing-only anchor for the twin split's second consumer (never in `operators[]`) |
 | CTE | CTE | Materialize to ColumnDataCollection |
 | RESULT_COLLECTOR | Result | Final result materialization |
 | EMPTY_RESULT | Result | Empty result set |

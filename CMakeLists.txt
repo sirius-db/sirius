@@ -348,6 +348,7 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_sort_sample.cpp
     src/op/sirius_physical_table_scan.cpp
     src/op/sirius_physical_top_n.cpp
+    src/op/sirius_physical_twin_scan_split.cpp
     src/op/sirius_physical_ungrouped_aggregate.cpp
     src/parallel/task_executor.cpp
     src/pipeline/gpu_pipeline_executor.cpp
@@ -383,6 +384,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_projection_utils.cpp
     src/planner/sirius_plan_recursive_cte.cpp
     src/planner/sirius_plan_top_n.cpp
+    src/planner/sirius_plan_twin_scan_fusion.cpp
     src/pin_table.cpp
     src/scan_manager/load_balancing_scan_batch_coalescer.cpp
     src/scan_manager/insert_delta_job.cpp
@@ -751,6 +753,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_join_expression_key.cpp
     test/cpp/planner/test_plan_tree_shape.cpp
     test/cpp/planner/test_projection_fold.cpp
+    test/cpp/planner/test_twin_scan_fusion.cpp
     test/cpp/planner/test_sirius_read_parquet_scan.cpp
     test/cpp/planner/test_query_id.cpp
     test/cpp/planner/test_query_index.cpp
