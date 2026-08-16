@@ -2428,33 +2428,61 @@ TEST_CASE("S3 REST AWS reactor-count screen records one bound cell",
 
   auto const object_key = aws_bench_lineitem_key();
   auto const uri        = aws_bench_lineitem_uri(*env);
-  auto record           = run_rest_aws_bench_scenario(*env,
-                                            uri,
-                                            "aws_https_rest_reactor_screen",
-                                            bench_full_lineitem_projection(),
-                                            /*rest_max_connections=*/16,
-                                            std::nullopt,
-                                            /*use_footer_probe=*/false,
-                                            *rest_n_reactors,
-                                            *source_copies);
-  REQUIRE(record.rest_n_reactors == *rest_n_reactors);
-  REQUIRE(record.source_copies == *source_copies);
-  REQUIRE(record.reactor_scan_chunk_get_counts.size() == *rest_n_reactors);
+  auto run_screen_scan  = [&](std::string scenario) {
+    return run_rest_aws_bench_scenario(*env,
+                                       uri,
+                                       std::move(scenario),
+                                       bench_full_lineitem_projection(),
+                                       /*rest_max_connections=*/16,
+                                       std::nullopt,
+                                       /*use_footer_probe=*/false,
+                                       *rest_n_reactors,
+                                       *source_copies);
+  };
+  auto require_bound_scan = [&](bench_record const& record,
+                                std::optional<duckdb::idx_t> expected_rows,
+                                std::optional<std::uint64_t> expected_payload) {
+    REQUIRE(record.rest_n_reactors == *rest_n_reactors);
+    REQUIRE(record.source_copies == *source_copies);
+    REQUIRE(record.reactor_scan_chunk_get_counts.size() == *rest_n_reactors);
+    REQUIRE(record.row_count > 0);
+    REQUIRE(record.payload_bytes_read > 0);
+    if (expected_rows.has_value()) { REQUIRE(record.row_count == *expected_rows); }
+    if (expected_payload.has_value()) { REQUIRE(record.payload_bytes_read == *expected_payload); }
+    REQUIRE(record.retries_total == 0);
+    REQUIRE(record.terminal_failures_total == 0);
+    REQUIRE(record.device_stream_sync_total == 0);
+    for (std::size_t reactor = 0; reactor < record.reactor_scan_chunk_get_counts.size();
+         ++reactor) {
+      INFO("reactor=" << reactor
+                      << " scan_chunk_get_count=" << record.reactor_scan_chunk_get_counts[reactor]);
+      REQUIRE(record.reactor_scan_chunk_get_counts[reactor] > 0);
+    }
+  };
+
+  auto const warmup = run_screen_scan("aws_https_rest_reactor_screen_warmup");
+  require_bound_scan(warmup, std::nullopt, std::nullopt);
+
+  constexpr std::size_t measurement_count = 8;
+  std::vector<bench_record> records;
+  records.reserve(measurement_count);
+  for (std::size_t measurement = 1; measurement <= measurement_count; ++measurement) {
+    auto record =
+      run_screen_scan("aws_https_rest_reactor_screen_measurement_" + std::to_string(measurement));
+    require_bound_scan(record, warmup.row_count, warmup.payload_bytes_read);
+    records.push_back(std::move(record));
+  }
+  REQUIRE(records.size() == measurement_count);
 
   auto const path = perf_json_path();
-  write_perf_json(path,
-                  *env,
-                  "rest_aws_reactor_screen",
-                  object_key,
-                  record.payload_bytes_read,
-                  std::vector<bench_record>{record});
-  require_perf_json_schema(path, {"aws_https_rest_reactor_screen"});
-
-  for (std::size_t reactor = 0; reactor < record.reactor_scan_chunk_get_counts.size(); ++reactor) {
-    INFO("reactor=" << reactor
-                    << " scan_chunk_get_count=" << record.reactor_scan_chunk_get_counts[reactor]);
-    CHECK(record.reactor_scan_chunk_get_counts[reactor] > 0);
+  write_perf_json(
+    path, *env, "rest_aws_reactor_screen", object_key, warmup.payload_bytes_read, records);
+  std::vector<std::string> scenarios;
+  scenarios.reserve(measurement_count);
+  for (std::size_t measurement = 1; measurement <= measurement_count; ++measurement) {
+    scenarios.push_back("aws_https_rest_reactor_screen_measurement_" + std::to_string(measurement));
   }
+  require_perf_json_schema(path, std::move(scenarios));
   WARN("Wrote S3 REST reactor-count screen cell to " << path.string());
 }
 
