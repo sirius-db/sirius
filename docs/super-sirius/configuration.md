@@ -339,7 +339,7 @@ and transport use one trust policy; there are no separate REST YAML controls.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `request_timeout_s` | int (seconds) | 30 | Whole-request timeout and presigned-URL TTL (0 = no limit). |
+| `request_timeout_s` | int (seconds, **>= 0**) | 30 | Whole-request curl deadline (0 = no limit) and presigned-URL TTL input (60-second signing headroom, 300-second fallback at zero, capped at S3's seven-day maximum); negative values are rejected. |
 | `max_connections` | int | 16 | Max concurrent in-flight connections per reactor. |
 | `chunk_size` | bytes | 8Mi | Target bytes per ranged GET (scatter/device-staging paths). |
 | `max_n_chunks` | int (**> 0**) | 16 | Max file-adjacent segments fused into one scatter GET; zero is rejected because every request contains at least one segment. |

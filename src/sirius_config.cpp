@@ -180,7 +180,7 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
                                key + "' instead");
     }
   }
-  r.optional("request_timeout_s", opt.request_timeout_s);
+  r.optional("request_timeout_s", opt.request_timeout_s, yaml::greater_than<long>{-1});
   r.optional("max_connections", opt.max_connections);
   r.optional("chunk_size", yaml::bytes(opt.chunk_size));
   auto const has_max_n_chunks = r.has_value("max_n_chunks");

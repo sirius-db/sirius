@@ -285,6 +285,43 @@ TEST_CASE("sirius_config parses rest perf instrumentation flag",
   std::filesystem::remove(path, ec);
 }
 
+TEST_CASE("sirius_config rejects negative REST request timeouts", "[scan_manager][config][rest]")
+{
+  auto const path = std::filesystem::temp_directory_path() / "sirius_rest_request_timeout.yaml";
+
+  SECTION("zero keeps the documented unlimited timeout")
+  {
+    write_yaml(path,
+               "sirius:\n"
+               "  executor:\n"
+               "    scan_manager:\n"
+               "      rest:\n"
+               "        request_timeout_s: 0\n");
+
+    sirius::sirius_config cfg;
+    REQUIRE_NOTHROW(cfg.load_from_file(path));
+    CHECK(cfg.get_scan_manager_config().rest.request_timeout_s == 0);
+  }
+
+  SECTION("negative values do not silently disable the timeout")
+  {
+    write_yaml(path,
+               "sirius:\n"
+               "  executor:\n"
+               "    scan_manager:\n"
+               "      rest:\n"
+               "        request_timeout_s: -1\n");
+
+    sirius::sirius_config cfg;
+    REQUIRE_THROWS_WITH(cfg.load_from_file(path),
+                        Catch::Contains("'rest.request_timeout_s': value out of range"));
+    CHECK(cfg.get_scan_manager_config().rest.request_timeout_s == 30);
+  }
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
 TEST_CASE("sirius_config preserves the zero footer-probe opt-out",
           "[scan_manager][config][s3][rest][footerbind]")
 {

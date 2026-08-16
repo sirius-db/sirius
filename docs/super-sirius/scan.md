@@ -430,7 +430,7 @@ Both authorizers use path-style URLs and support temporary credentials. The sess
 
 **Configuration.** `object_store_config` supplies the endpoint, region, static credentials, optional session token, signing mode, and TLS settings. The built-in factory does not search environment variables, AWS profiles, or IMDS. A custom authorizer can implement those sources. If the endpoint, region, or static keys are missing, the factory returns no REST ioctx and the S3 read fails.
 
-Connection limits, request sizing, footer-probe size, retry budgets, keepalive, and LIST caps live in `rest::config`; the defaults are defined in `io/rest/config.hpp`. `request_timeout_s` is also used as the lifetime of a presigned URL. Async data requests retry transient curl and HTTP failures, with a separate bounded retry for HTTP 403. Control requests treat HTTP 403 as terminal.
+Connection limits, request sizing, footer-probe size, retry budgets, keepalive, and LIST caps live in `rest::config`; the defaults are defined in `io/rest/config.hpp`. `request_timeout_s` also informs the presigned-URL lifetime, with signing headroom and S3's seven-day cap applied separately. Async data requests retry transient curl and HTTP failures, with a separate bounded retry for HTTP 403. Control requests treat HTTP 403 as terminal.
 
 `rest_ioctx::perf_snapshot()` reports aggregate request, retry, byte, queue-wait, and H2D metrics across its reactors. Detailed timing is enabled with `perf_instrumentation`.
 

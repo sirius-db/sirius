@@ -24,7 +24,9 @@
 namespace sirius::io::rest {
 
 struct config {
-  /// Whole-request timeout (seconds, 0 = no limit) and presigned-URL TTL.
+  /// Whole-request curl deadline (seconds, 0 = no limit). Also informs the
+  /// presigned-URL TTL with 60 seconds of headroom; zero uses a 300-second
+  /// fallback and positive values are capped at S3's seven-day maximum.
   long request_timeout_s{30};
 
   /// TLS: optional CA bundle path; when @c tls_verify is false, peer/host
