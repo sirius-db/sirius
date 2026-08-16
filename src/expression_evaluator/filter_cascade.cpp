@@ -146,6 +146,10 @@ std::optional<std::unique_ptr<cudf::table>> expression_evaluator::try_select_cas
 
   std::vector<ast::node const*> cheap;
   std::vector<ast::node const*> expensive;
+  // This split cannot change three-valued outcomes: a Kleene conjunction is TRUE iff every
+  // operand is TRUE, so AND(cheap) then AND(expensive) keeps exactly the rows AND(all children)
+  // keeps (full argument in the file header). Classification only decides where each conjunct's
+  // cost lands.
   for (auto const& child : conj.children) {
     if (!child) { return std::nullopt; }  // malformed AST: let the ordinary path report it
     (detail::is_cheap_prefilter_conjunct(*child, input) ? cheap : expensive).push_back(child.get());

@@ -30,8 +30,8 @@
 namespace sirius::detail {
 
 /**
- * @brief Returns true when the conjunct rooted at @p n is cheap-prefilter material for the filter
- * cascade in sirius::expression_evaluator::select().
+ * @brief Classifies one conjunct of a filter's top-level AND as cheap-prefilter material for the
+ * filter cascade in sirius::expression_evaluator::select()
  *
  * A conjunct is cheap iff every node in its subtree is an elementwise, fixed-width-carried
  * operation: a reference whose column index is in bounds for @p input and whose *runtime carrier*
@@ -56,6 +56,12 @@ namespace sirius::detail {
  * there is a correctness bug — this classifier deliberately does not force handling of new
  * ast::node alternatives: they land in the residual automatically. Conservative arms (e.g. a
  * fixed-width cast is elementwise-cheap in principle) are only widened with measured evidence.
+ *
+ * @param n     Root of the conjunct's AST subtree
+ * @param input Table the filter runs over; supplies each ast::reference's bounds check and
+ *              runtime carrier type
+ * @return true when the conjunct belongs in the cheap prefilter group, false when it belongs in
+ * the expensive residual
  */
 [[nodiscard]] bool is_cheap_prefilter_conjunct(sirius::ast::node const& n,
                                                cudf::table_view const& input);

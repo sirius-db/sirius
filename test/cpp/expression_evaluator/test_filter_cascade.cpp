@@ -291,6 +291,10 @@ constexpr auto kInterpret = ::sirius::expression_evaluator_strategy::AST_INTERPR
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// Decision branches: each cascade route vs the monolithic baseline
+// ---------------------------------------------------------------------------
+
 TEMPLATE_TEST_CASE("filter cascade selects the same rows as the monolithic path",
                    "[expression_evaluator][filter_cascade]",
                    mat_strategy,
@@ -398,6 +402,10 @@ TEST_CASE("short-circuit under projection synthesizes a typed empty table",
   REQUIRE(run.result->num_columns() == 1);
   REQUIRE(run.result->view().column(0).type().id() == cudf::type_id::INT32);
 }
+
+// ---------------------------------------------------------------------------
+// Refusal guards and knob boundaries (min rows, pass rate, degenerate ends)
+// ---------------------------------------------------------------------------
 
 TEST_CASE("cascade does not engage without a mixed AND or above min rows",
           "[expression_evaluator][filter_cascade]")
@@ -560,6 +568,10 @@ TEST_CASE("all-pass prefilter and the pass-rate knob's degenerate ends",
   }
 }
 
+// ---------------------------------------------------------------------------
+// Correctness: the Kleene 3VL matrix and multi-conjunct grouping
+// ---------------------------------------------------------------------------
+
 TEST_CASE("Kleene partition invariance: the 3VL matrix selects identical rows on every route",
           "[expression_evaluator][filter_cascade]")
 {
@@ -653,6 +665,10 @@ TEST_CASE("cascade groups multiple cheap and expensive conjuncts",
     *space, *expr, input->view(), kInterpret, decision::cascaded);
 }
 
+// ---------------------------------------------------------------------------
+// Gather-scope refusal: needed set = output_indices union referenced(residual)
+// ---------------------------------------------------------------------------
+
 TEST_CASE("out-of-scope survivor gather refuses the cascade",
           "[expression_evaluator][filter_cascade]")
 {
@@ -723,6 +739,10 @@ TEST_CASE("out-of-scope survivor gather refuses the cascade",
                                           project_first_two);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Classifier arms (sirius::detail::is_cheap_prefilter_conjunct)
+// ---------------------------------------------------------------------------
 
 TEST_CASE("classifier arms: cheap means an elementwise fixed-width-carried subtree",
           "[expression_evaluator][filter_cascade]")

@@ -43,13 +43,22 @@ struct Config {
   // Cheap-conjunct filter cascade in sirius::expression_evaluator::select(): split a filter's
   // top-level AND into cheap fixed-width prefilter conjuncts and an expensive (string-carried /
   // AST-breaker) residual, evaluate the cheap group first, and run the residual only on rows
-  // surviving the prefilter.
+  // surviving the prefilter. Defaults to true. Results are identical either way (any split of a
+  // conjunction selects the same rows under Kleene AND), so enabling trades a few extra kernel
+  // launches plus one 4-byte device-to-host sync for skipping expensive residual work on
+  // filtered-out rows; false always takes the monolithic single-mask path.
   static bool FILTER_CASCADE_CHEAP_CONJUNCTS;  // filter_cascade_cheap_conjuncts
   // Minimum input rows before the cascade engages; below this, kernel-launch latency dominates
-  // the possible saving and the monolithic single-kernel path wins.
+  // the possible saving and the monolithic single-kernel path wins. Any uint64; defaults to
+  // 1 << 20 (~1M rows, the estimated crossover — see config.cpp). Raising it trades cascade wins
+  // on mid-size batches for immunity to the fixed per-call overhead; 0 engages on every
+  // non-empty batch.
   static uint64_t FILTER_CASCADE_MIN_ROWS;  // filter_cascade_min_rows
   // Highest cheap-prefilter pass rate at which survivors are gathered before the residual runs;
-  // above it the residual is evaluated in place and the two masks are ANDed (no gather).
+  // above it the residual is evaluated in place and the two masks are ANDed (no gather). Domain
+  // [0, 1], enforced by the SET handler; defaults to 0.75 (the gather-vs-residual break-even —
+  // see config.cpp). 0 never gathers (always combine masks), 1 always gathers; raising it trades
+  // gather bytes on unselective prefilters for residual work saved on the rows they do drop.
   static double FILTER_CASCADE_MAX_PASS_RATE;  // filter_cascade_max_pass_rate
 
   // For gpu physical top-N
