@@ -1057,7 +1057,9 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
 
   // Fuse near-duplicate same-table scans into one fan-out twin-scan pipeline. Must run while
   // the scans are still TABLE_SCAN nodes (before the GPU pipeline operator rewrite below).
-  // Policy lives here: the pass itself reads no settings.
+  // Policy lives here: the pass itself reads no settings. With the setting off the pass is
+  // not invoked at all, so the plan is exactly the unfused baseline (knob-off parity) and the
+  // report resets to the default.
   {
     duckdb::Value setting;
     // The fallback is only reachable when the option is unregistered (e.g. SIRIUS_DISABLE);

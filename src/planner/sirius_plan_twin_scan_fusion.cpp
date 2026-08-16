@@ -80,6 +80,17 @@
 //!    are installed atomically into the same plan tree and destroyed with it. No pass may detach
 //!    one without the other; today none runs between fusion and pipeline insertion, and the
 //!    converter / `sink()` consistency checks fail loudly if the pairing breaks.
+//!  - I7 -- Scheduling acyclicity, by construction. The fused pipeline waits only on A's channel
+//!    producers -- exactly what A's scan waited on at baseline -- and both consumers receive
+//!    their input over the converter's standard buffered PARTIAL-barrier repository edges
+//!    (`compute_repository_wiring`). The rewrite strictly removes one dependency edge (B's scan
+//!    on B's now-closed channel) and adds none, so a baseline-acyclic pipeline graph stays
+//!    acyclic. The full scheduling argument, including the bounded-buffering analysis, lives in
+//!    docs/super-sirius/physical-plan-generation.md ("Twin-scan fusion").
+//!
+//! Knob-off parity: the pass reads no settings; `create_plan` invokes it only when the
+//! `fuse_twin_scans` setting is on, so with the knob off the plan is exactly the unfused
+//! baseline.
 //!
 //! Rewrite: A's slot becomes TWIN_SCAN_SPLIT over B's scan (which keeps its own column set but
 //! now consumes A's dynamic-filter channel); B's slot becomes the routing-only TWIN_SCAN_REF.
@@ -484,8 +495,10 @@ void fuse_pair(twin_site& a, twin_site& b)
   auto& scan_b = fused_scan->Cast<sirius::op::sirius_physical_table_scan>();
   auto chan_b  = scan_b.sirius_dynamic_filters;
   // The fused scan consumes A's channel; A's producer indexes stay valid because A's
-  // column_ids are a prefix of B's (checked by match_scan_geometry). B's channel loses its
-  // only consumer -- close it so its producer join skips filter construction entirely.
+  // column_ids are a prefix of B's (checked by match_scan_geometry, I1). B's channel loses its
+  // only consumer -- close it so its producer join skips filter construction entirely. This
+  // dropped advisory channel is the only thing the pass ever drops (I3), legal because of the
+  // subsumption proof (I2) plus B's authoritative downstream join.
   scan_b.sirius_dynamic_filters = a.scan->sirius_dynamic_filters;
   scan_b.dynamic_filters        = a.scan->dynamic_filters;
   if (chan_b) { chan_b->close_for_new_filters(); }

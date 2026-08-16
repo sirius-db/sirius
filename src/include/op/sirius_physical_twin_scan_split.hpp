@@ -84,6 +84,8 @@ class sirius_physical_twin_scan_split : public sirius_physical_operator {
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::TWIN_SCAN_SPLIT;
 
+  //! @throw internal_exception if @p residual or @p twin_ref is null or @p output_indices_a is
+  //! empty -- the fusion pass only ever constructs a split with all three populated.
   sirius_physical_twin_scan_split(duckdb::vector<sirius::logical_type> types_a,
                                   std::vector<cudf::size_type> output_indices_a,
                                   std::unique_ptr<sirius::ast::node> residual,
@@ -108,6 +110,8 @@ class sirius_physical_twin_scan_split : public sirius_physical_operator {
   //! Route the two halves of the twin output to their consumer pipelines.
   void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
 
+  //! The routing-only anchor of the second output's consumer (non-owning; see `_twin_ref`).
+  //! Read by the pipeline converter to resolve the out-B consumer pipeline.
   [[nodiscard]] sirius_physical_twin_scan_ref* twin_ref() const noexcept { return _twin_ref; }
 
  protected:

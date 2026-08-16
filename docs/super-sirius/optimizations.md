@@ -66,7 +66,7 @@ num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 
 **Config:** `fuse_merge_pipelines` (default: true). See [physical-plan-generation.md](physical-plan-generation.md) → Merge fusion for pipeline-shape details.
 
-### Twin-Scan Fusion (PR #NNN)
+### Twin-Scan Fusion (unreleased)
 
 **Motivation:** DuckDB's delim decomposition of chained `EXISTS` / `NOT EXISTS` (TPC-H q21) leaves two near-duplicate full scans of the same table: nested column sets, one residual predicate, and dynamic membership filters (Blooms) over provably nested key sets. At SF1000 each scan decodes ~6.0B rows and probes a ~70M-key Bloom — near-identical work done twice.
 
