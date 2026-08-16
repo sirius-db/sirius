@@ -777,6 +777,7 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
     if (operator_node) { sirius::from_yaml(*operator_node, resolved_operator_params); }
     _operator_params = std::move(resolved_operator_params);
 
+    validate_prefetch_cache_for_gpu_count();
     enforce_sirius_datasource_for_multi_gpu();
 
   } catch (const std::exception& e) {
@@ -797,6 +798,19 @@ void sirius_config::enforce_sirius_datasource_for_multi_gpu()
       "use_sirius_datasource to true.",
       num_gpus);
     _scan_manager_config.use_sirius_datasource = true;
+  }
+}
+
+void sirius_config::validate_prefetch_cache_for_gpu_count() const
+{
+  size_t const num_gpus = std::ranges::count_if(_memory_space_configs, [](auto const& space) {
+    return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space);
+  });
+  if (num_gpus > 1 && _scan_manager_config.enable_prefetch_cache) {
+    throw std::runtime_error(
+      "sirius.executor.scan_manager.enable_prefetch_cache: true is not supported with multiple "
+      "configured GPUs because the cache can return incorrect results; disable the prefetch cache "
+      "or configure exactly one GPU");
   }
 }
 

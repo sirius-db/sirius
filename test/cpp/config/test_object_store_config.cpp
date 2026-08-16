@@ -317,6 +317,8 @@ TEST_CASE("sirius_config accepts prefetch cache settings when enabled",
   auto const path = std::filesystem::temp_directory_path() / "sirius_cache_enabled_settings.yaml";
   write_yaml(path,
              "sirius:\n"
+             "  topology:\n"
+             "    num_gpus: 1\n"
              "  executor:\n"
              "    scan_manager:\n"
              "      enable_prefetch_cache: true\n"
