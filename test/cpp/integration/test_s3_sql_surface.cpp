@@ -1702,20 +1702,9 @@ bench_record run_rest_minio_bench_scenario(
                      measurement.payload_bytes_read);
 }
 
-bench_record run_rest_aws_bench_scenario(s3_test_env const& env,
-                                         std::string const& uri,
-                                         std::string scenario,
-                                         std::vector<std::string> columns,
-                                         std::size_t rest_max_connections,
-                                         std::optional<duckdb::idx_t> expected_rows,
-                                         bool use_footer_probe       = false,
-                                         std::size_t rest_n_reactors = 2,
-                                         std::size_t source_copies   = 1)
+sirius_memory_limits rest_aws_bench_limits(std::size_t rest_max_connections,
+                                           std::size_t rest_n_reactors)
 {
-  INFO("scenario=" << scenario << " key=" << aws_bench_lineitem_key()
-                   << " columns=" << columns.size() << " max_connections=" << rest_max_connections
-                   << " rest_n_reactors=" << rest_n_reactors << " source_copies=" << source_copies
-                   << " use_footer_probe=" << use_footer_probe);
   auto limits                      = large_sirius_memory_limits(/*enable_prefetch_cache=*/true);
   limits.rest_perf_instrumentation = true;
   limits.rest_max_connections      = rest_max_connections;
@@ -1723,13 +1712,23 @@ bench_record run_rest_aws_bench_scenario(s3_test_env const& env,
   limits.gpu_usage                 = "8 GiB";
   limits.gpu_reservation           = "3 GiB";
   limits.host_capacity             = "12 GiB";
+  return limits;
+}
 
-  s3_sql_fixture fixture(env,
-                         limits,
-                         std::string{"presigned"},
-                         env.endpoint,
-                         std::nullopt,
-                         /*tls_verify=*/true);
+bench_record run_rest_aws_bench_scenario_on_fixture(s3_sql_fixture& fixture,
+                                                    std::string const& uri,
+                                                    std::string scenario,
+                                                    std::vector<std::string> columns,
+                                                    std::size_t rest_max_connections,
+                                                    std::optional<duckdb::idx_t> expected_rows,
+                                                    bool use_footer_probe,
+                                                    std::size_t rest_n_reactors,
+                                                    std::size_t source_copies)
+{
+  INFO("scenario=" << scenario << " key=" << aws_bench_lineitem_key()
+                   << " columns=" << columns.size() << " max_connections=" << rest_max_connections
+                   << " rest_n_reactors=" << rest_n_reactors << " source_copies=" << source_copies
+                   << " use_footer_probe=" << use_footer_probe);
   auto measurement = run_rest_parquet_scan(fixture, uri, columns, use_footer_probe, source_copies);
   CHECK(measurement.rows > 0);
   if (expected_rows.has_value()) { CHECK(measurement.rows == *expected_rows); }
@@ -1750,6 +1749,34 @@ bench_record run_rest_aws_bench_scenario(s3_test_env const& env,
                      prefetch_cache_signature(true),
                      measurement,
                      measurement.payload_bytes_read);
+}
+
+bench_record run_rest_aws_bench_scenario(s3_test_env const& env,
+                                         std::string const& uri,
+                                         std::string scenario,
+                                         std::vector<std::string> columns,
+                                         std::size_t rest_max_connections,
+                                         std::optional<duckdb::idx_t> expected_rows,
+                                         bool use_footer_probe       = false,
+                                         std::size_t rest_n_reactors = 2,
+                                         std::size_t source_copies   = 1)
+{
+  auto limits = rest_aws_bench_limits(rest_max_connections, rest_n_reactors);
+  s3_sql_fixture fixture(env,
+                         limits,
+                         std::string{"presigned"},
+                         env.endpoint,
+                         std::nullopt,
+                         /*tls_verify=*/true);
+  return run_rest_aws_bench_scenario_on_fixture(fixture,
+                                                uri,
+                                                std::move(scenario),
+                                                std::move(columns),
+                                                rest_max_connections,
+                                                expected_rows,
+                                                use_footer_probe,
+                                                rest_n_reactors,
+                                                source_copies);
 }
 
 std::optional<std::size_t> rest_reactor_screen_env(std::string_view name,
@@ -2428,16 +2455,23 @@ TEST_CASE("S3 REST AWS reactor-count screen records one bound cell",
 
   auto const object_key = aws_bench_lineitem_key();
   auto const uri        = aws_bench_lineitem_uri(*env);
-  auto run_screen_scan  = [&](std::string scenario) {
-    return run_rest_aws_bench_scenario(*env,
-                                       uri,
-                                       std::move(scenario),
-                                       bench_full_lineitem_projection(),
-                                       /*rest_max_connections=*/16,
-                                       std::nullopt,
-                                       /*use_footer_probe=*/false,
-                                       *rest_n_reactors,
-                                       *source_copies);
+  auto limits           = rest_aws_bench_limits(/*rest_max_connections=*/16, *rest_n_reactors);
+  s3_sql_fixture fixture(*env,
+                         limits,
+                         std::string{"presigned"},
+                         env->endpoint,
+                         std::nullopt,
+                         /*tls_verify=*/true);
+  auto run_screen_scan = [&](std::string scenario) {
+    return run_rest_aws_bench_scenario_on_fixture(fixture,
+                                                  uri,
+                                                  std::move(scenario),
+                                                  bench_full_lineitem_projection(),
+                                                  /*rest_max_connections=*/16,
+                                                  std::nullopt,
+                                                  /*use_footer_probe=*/false,
+                                                  *rest_n_reactors,
+                                                  *source_copies);
   };
   auto require_bound_scan = [&](bench_record const& record,
                                 std::optional<duckdb::idx_t> expected_rows,
