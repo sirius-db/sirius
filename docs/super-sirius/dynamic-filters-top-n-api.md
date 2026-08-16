@@ -353,6 +353,7 @@ the existing `SiriusContext::get_dynamic_filter_stats_snapshot()`; no new access
   std::atomic<std::uint64_t> top_n_first_key_filters_pushed{0};
   std::atomic<std::uint64_t> top_n_revisions_failed{0};           ///< Replica failure; old retained
   std::atomic<std::uint64_t> top_n_revisions_stale{0};
+  std::atomic<std::uint64_t> top_n_revisions_ignored{0};  ///< Slot ordinal ignored (hive partition)
 ```
 
 Delta/direction assertion rules from the sibling doc carry over: plan-time facts are exact per

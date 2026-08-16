@@ -75,6 +75,13 @@ std::unique_ptr<operator_data> sirius_physical_dynamic_filter::execute(
   if (!_filters || !_filters->has_filters()) {
     return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
+  // Superseded-filter lifetime: this snapshot may be the last co-owner of a replaced boundary
+  // filter, and it dies at execute() return while the mask kernels that read the filter's device
+  // scalars run on the task stream. That is safe only because apply_boolean_mask/copy_if
+  // synchronize the stream to obtain the output size, ordering every scalar-reading kernel before
+  // the host proceeds -- the same implicit-sync invariant the reader-site comment states in
+  // parquet_gpu_ingestible.cpp. A consumer that ever becomes fully stream-async must retain the
+  // snapshot (or its filters) across its enqueued reads instead.
   auto const filters_snapshot = _filters->snapshot();
   if (!_gate.applicable(filters_snapshot)) {
     return std::make_unique<pipelineable_operator_data>(input.get_data_batches());

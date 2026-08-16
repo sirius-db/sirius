@@ -54,7 +54,7 @@ namespace {
 using sirius::planner::admitted_top_n_key_storage_type;
 
 /// Checked K and the frozen per-key semantics of an admitted Top-N producer, shared by both
-/// admission paths (the row producer and the Stage-5 group-key producer) so they can never
+/// admission paths (the row producer and the group-key producer) so they can never
 /// disagree about which orders are admissible or about K.
 struct admitted_top_n_keys {
   std::size_t k = 0;
@@ -426,7 +426,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> discover_top_n_targets(
 }
 
 //===----------------------------------------------------------------------===//
-// Group-key producer admission (Stage 5)
+// Group-key producer admission
 //===----------------------------------------------------------------------===//
 // A separate admission path, never a relaxation of `descent_policy::top_n_self_trace`. That trace
 // refuses aggregates on the hop-set bit itself, independent of producer kind, and must keep doing
@@ -584,7 +584,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalTopN& op)
 
   auto plan = create_plan(*op.children[0]);
 
-  // Stage-1 Top-N threshold refinement: eligibility and the execution coordinator for sink
+  // Top-N threshold refinement: eligibility and the execution coordinator for sink
   // self-consumption. Gated on the experimental flag -- with it off nothing runs and no counter
   // moves.
   std::shared_ptr<sirius::op::top_n_threshold_coordinator> coordinator;
@@ -600,7 +600,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalTopN& op)
     }
   }
 
-  // Stage-4 target discovery: run both traces over the built physical child, apply the siting rule
+  // Target discovery: run both traces over the built physical child, apply the siting rule
   // to every terminal it reaches, and freeze the publication plan. Registration happens here,
   // during tree construction, so it precedes scan wrapping's has_producers() elision.
   if (coordinator) {
@@ -614,7 +614,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalTopN& op)
                                   stats);
   }
 
-  // Stage-5 group-key producer: its own admission path, over the same built child. It is
+  // Group-key producer: its own admission path, over the same built child. It is
   // independent of the row producer -- an aggregate shape that admits one usually rejects the
   // other -- and it installs itself inside the aggregate's subtree, so it can only add targets
   // below the aggregate and never moves the ones discovered above it.

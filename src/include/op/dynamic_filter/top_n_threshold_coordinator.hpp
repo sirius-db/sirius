@@ -40,8 +40,8 @@ struct dynamic_filter_stats;
  * @brief Result of offering one local Top-N boundary to the coordinator
  */
 enum class threshold_offer_result {
-  ACCEPTED_FOR_PUBLICATION,  ///< Tightest so far; this call owns the publisher loop (Stage 4)
-  COALESCED,                 ///< Tightest so far; an active publisher will flush it (Stage 4)
+  ACCEPTED_FOR_PUBLICATION,  ///< Tightest so far; this call owns the publisher loop
+  COALESCED,                 ///< Tightest so far; an active publisher will flush it
   NOT_TIGHTER,           ///< Boundary does not lexicographically strengthen the tightest; ignored
   NO_ACCEPTING_TARGET,   ///< Tightened `tightest_seen` only -- or merely grew a GROUP_KEY witness
                          ///< set still below K, which tightens nothing; no channel target
@@ -86,14 +86,14 @@ struct top_n_distinct_key_witness {
  * @brief Execution-owned Top-N threshold policy: monotonic boundary, revisions, publication
  *
  * One coordinator per Top-N producer per execution, shared by the local and merge operators via
- * `std::shared_ptr`. Holds checked K, per-key semantics, the tightest host boundary tuple, and
- * metrics; the pending-candidate, revision, and publisher-loop state arrive with Stage 4
- * publication. Tightness is `exact_host_key_tuple::lex_compare` over the full tuple. It does not
+ * `std::shared_ptr`. Holds checked K, per-key semantics, the tightest host boundary tuple, the
+ * metrics, and the pending-candidate, revision, and publisher-loop state behind publication.
+ * Tightness is `exact_host_key_tuple::lex_compare` over the full tuple. It does not
  * discover targets, inspect DuckDB metadata, schedule scans, or decide final output.
  *
  * Threading: `offer`, `tightest_boundary`, `finish`, and `cancel` are thread-safe. Host
- * comparison happens under one short internal mutex; filter construction and replication (Stage
- * 4) run outside it with at most one publisher loop active. All state is execution-scoped and
+ * comparison happens under one short internal mutex; filter construction and replication run
+ * outside it with at most one publisher loop active. All state is execution-scoped and
  * starts empty (main doc, "Execution-scoped state").
  */
 class top_n_threshold_coordinator final {
@@ -120,7 +120,7 @@ class top_n_threshold_coordinator final {
    *
    * Plan-time only, before any offer: the planner calls this once after discovery froze the
    * targets and replica spaces. Without it the coordinator stays target-free and every offer
-   * returns `NO_ACCEPTING_TARGET` (the Stage-1 self-consumption-only producer).
+   * returns `NO_ACCEPTING_TARGET` (the self-consumption-only producer).
    */
   void set_publish_plan(top_n_dynamic_filter_publish_plan plan);
 
@@ -130,8 +130,9 @@ class top_n_threshold_coordinator final {
   /**
    * @brief Offer a K-witness boundary; monotonically tightens `tightest_seen`
    *
-   * Stage 1 semantics: tighten the shared boundary for the sink prefilter and return
-   * `NO_ACCEPTING_TARGET`. Stage 4 adds the publisher loop and the remaining results.
+   * Without a publish plan this tightens the shared boundary for the sink prefilter and returns
+   * `NO_ACCEPTING_TARGET`; with targets installed, an accepted tightest offer drives the
+   * publisher loop and the remaining results apply as documented on @ref threshold_offer_result.
    */
   threshold_offer_result offer(top_n_threshold_witness witness);
 
@@ -212,7 +213,7 @@ class top_n_threshold_coordinator final {
    * @brief Synchronous producer-side drain called by merge/finalization
    *
    * Transitions OPEN -> FINISHING, rejects later offers, joins/starts the publisher until pending
-   * work is empty (Stage 4), then transitions to FINISHED. Idempotent and safe at any point after
+   * work is empty, then transitions to FINISHED. Idempotent and safe at any point after
    * construction. Never called or awaited by consumers.
    */
   void finish();

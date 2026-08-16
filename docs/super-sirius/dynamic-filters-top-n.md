@@ -1414,10 +1414,11 @@ Recommended metrics:
   before/after, and its eligibility rejections by reason.
 - Endpoint sites considered, sited, skipped as immaterial, and rows before/after.
 - Offers, not-tighter offers, coalesced offers, and final flushes.
-- Revisions attempted, accepted, stale, closed, and failed. `top_n_revisions_stale` is
+- Revisions attempted, accepted, stale, ignored, closed, and failed. `top_n_revisions_stale` is
   expected-zero by design: the single publisher loop assigns and flushes revisions in increasing
   order, so a permanent zero means the slot's stale-write check ran and rejected nothing — not
-  that it never executed.
+  that it never executed. `top_n_revisions_ignored` counts slot publications rejected because the
+  slot's primary or a referenced ordinal was ignored (hive-partition columns).
 - Generation at each scan checkpoint.
 - Splits queued, started, and completed before first publication and per generation.
 - Replica bytes, latency, route, and failure per device.
@@ -1639,7 +1640,8 @@ self-consumption with zero external targets — the same profile as Q21. Measure
 regression, no gain, and the pre-registered hypothesis refuted on its central premise.** Timing
 is flat in every cell — Q3 0.9989 [0.9914, 1.0064] and Q10 0.9972 [0.9879, 1.0066] pinned;
 0.9963 [0.9849, 1.0079] and 1.0009 [0.9915, 1.0104] from disk at 40-pair confirmation power
-(both initial 21-pair disk cells grazed the +2% CI bound and dissolved under power, the same
+(both initial disk cells — 28 pairs for Q3, 21 for Q10 — grazed the +2% CI bound and dissolved
+under power, the same
 noise pattern as the campaign's q1); a Q18 guard cell re-ran flat (1.0009 [0.9951, 1.0069])
 since the kernel's inner loop changed for every width. The hypothesis predicted sink-prefilter
 `rows_in` in the 10^8–10^9 range on the premise that the aggregate output cannot arrive as one

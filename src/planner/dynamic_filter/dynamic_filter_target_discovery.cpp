@@ -159,7 +159,7 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
       return {descent_step{.child_index = 0, .child_ordinal = *input}};
     }
     case SiriusPhysicalOperatorType::HASH_JOIN: {
-      // Join hops are the Stage-7 widening, not the minimal self-trace set.
+      // Join hops are a future per-proven-hop widening, not the minimal self-trace set.
       if (policy.top_n_self_trace) { return {}; }
       auto const& join = node.Cast<sirius::op::sirius_physical_hash_join>();
       return as_steps(join_block_descent(join.join_type,

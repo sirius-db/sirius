@@ -46,7 +46,7 @@ enum class top_n_filter_layer { FIRST_KEY, LEX };
  * @brief What kind of producer owns this plan
  *
  * `ROW` is the Top-N sink: the boundary is the Kth retained row's key tuple. `GROUP_KEY` is the
- * Stage-5 aggregate producer, which follows the distinct-key discipline instead.
+ * aggregate-input producer, which follows the distinct-key discipline instead.
  */
 enum class top_n_producer_kind { ROW, GROUP_KEY };
 

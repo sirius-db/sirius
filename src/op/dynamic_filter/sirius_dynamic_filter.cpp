@@ -938,10 +938,11 @@ cudf::ast::expression const& sirius_dynamic_lex_range_filter::to_ast(
   }
   if (root == nullptr) {
     // Unreachable while the constructor requires an engaged head: an engaged component always
-    // emits a comparison, so the first disjunct always exists. Reaching this means the head-null
-    // case arrived without its derivation -- the Stage 6 extension (`k0 IS NULL` under NULLS
-    // FIRST, exclusion under NULLS LAST). Fail loudly instead of lowering an always-false
-    // predicate, which a reader checkpoint would apply by dropping every row.
+    // emits a comparison, so the first disjunct always exists. Reaching this means a head-null
+    // boundary arrived without its derivation (`k0 IS NULL` under NULLS FIRST, exclusion under
+    // NULLS LAST) -- a case publication deliberately suppresses today. Fail loudly instead of
+    // lowering an always-false predicate, which a reader checkpoint would apply by dropping
+    // every row.
     throw std::logic_error(
       "[sirius_dynamic_lex_range_filter] no disjunct lowered: a null head component needs the "
       "head-null derivations, which this stage does not implement");

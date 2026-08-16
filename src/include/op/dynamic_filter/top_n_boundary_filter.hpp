@@ -116,7 +116,7 @@ struct boundary_filter_result {
  * `boundary_filter_params::k_max_components` is clamped and the marshal degrades to the
  * inclusive prefix form regardless of @p strict -- an inclusive prefix predicate is sound
  * standalone (prefix-worse rows are worse; prefix-ties are kept). Shared by the Top-N sink
- * prefilter and the Stage-3 boundary filter classes.
+ * prefilter and the boundary filter classes.
  *
  * @pre `boundary.size() >= component_count` and `keys.size() >= component_count`.
  */

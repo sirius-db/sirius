@@ -70,12 +70,12 @@ struct descent_policy {
    * yields exactly one terminal. Positional `UNION` stays a fan-out hop for the join policy but
    * is refused here: Sirius rejects set operations at planning, so the fan-out branch and the
    * multi-branch guards it needs are unreachable and untestable. Restoring it is part of
-   * supporting set operations, together with those guards and a runnable test. Stage 7 widens
-   * this set per proven hop, not by flipping the bit off. Default false, so join callers keep
+   * supporting set operations, together with those guards and a runnable test. This set widens
+   * only per proven hop, never by flipping the bit off. Default false, so join callers keep
    * their existing hop set exactly.
    *
-   * The aggregate refusal is keyed to this bit, not to the producer kind: the Stage-5 group-key
-   * producer needs its own admission path with inclusive-only predicates, not a relaxation of
+   * The aggregate refusal is keyed to this bit, not to the producer kind: the group-key
+   * producer has its own admission path with inclusive-only predicates, not a relaxation of
    * this one.
    */
   bool top_n_self_trace = false;
@@ -235,7 +235,8 @@ struct multi_key_route_terminal {
  * structural -- and under the minimal hop set no Top-N trace can reach one (join-edge and
  * scan-route endpoints sit inside join subtrees behind refused join hops; a Top-N's own
  * endpoints splice after its traces run; scan wrappers are installed by a later pass). It stays
- * immaterial; the decision becomes live with Stage-7 join-hop widening and is revisited there.
+ * immaterial; the decision becomes live only if join-hop widening ever lands, and is
+ * revisited there.
  * Skipping is always sound, so the residual error can only under-site.
  */
 [[nodiscard]] bool hop_is_material(sirius::op::sirius_physical_operator const& node) noexcept;

@@ -223,7 +223,7 @@ struct dynamic_filter_stats {
   std::atomic<std::uint64_t> publications_skipped_targets_drained{0};
   std::atomic<std::uint64_t> filters_pushed{0};  ///< Accepted pushes; drain-dependent
 
-  // --- Top-N refinement (Stage 1) ---
+  // --- Top-N refinement ---
   // The producer counters are plan-time facts like producers_enabled (the transparent path
   // constructs the plan twice per query); the offer and prefilter counters are delivery-time and
   // batch-arrival dependent, so tests assert them as deltas or directions only.
@@ -242,7 +242,7 @@ struct dynamic_filter_stats {
                                                            ///< concurrent measurements may record
                                                            ///< one decision more than once
 
-  // --- Top-N publication and endpoints (Stage 4); per layer where meaningful ---
+  // --- Top-N publication and endpoints; per layer where meaningful ---
   // The scan-target, endpoint-site, and subsumption counters are plan-time facts like
   // producers_enabled; the revision and push counters are delivery-time and race scan starts by
   // design, so tests assert them as deltas or directions only.
@@ -271,7 +271,7 @@ struct dynamic_filter_stats {
   /// Publishes refused because the slot's primary or a referenced ordinal is ignored
   std::atomic<std::uint64_t> top_n_revisions_ignored{0};
 
-  // --- Top-N group-key producer (Stage 5) ---
+  // --- Top-N group-key producer ---
   // The producer counters are plan-time facts; the offer, witness-set, and prefilter counters are
   // delivery-time and batch-arrival dependent, so tests assert them as deltas or directions only.
   std::atomic<std::uint64_t> top_n_group_producers_eligible{0};  ///< Plan-time fact
