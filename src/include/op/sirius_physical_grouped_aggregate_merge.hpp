@@ -46,6 +46,11 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
     SiriusPhysicalOperatorType::MERGE_GROUP_BY;
 
  public:
+  //! Clone-from-aggregate constructor (the physical plan generator's wrap path): copies the
+  //! wrapped HASH_GROUP_BY's cuDF aggregate definitions and output schema. When the aggregate
+  //! carries a surrogate restore plan (see op/groupby_surrogate_deferral.hpp), this merge
+  //! acquires it and redeclares the ORIGINAL output schema -- the aggregate emits rowid/dummy
+  //! key carriers, but this merge finalizes them back to the original string keys.
   sirius_physical_grouped_aggregate_merge(
     sirius_physical_grouped_aggregate* grouped_aggregate,
     uint64_t hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES);

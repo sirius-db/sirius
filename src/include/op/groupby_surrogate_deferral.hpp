@@ -32,6 +32,7 @@ namespace sirius::op {
 class surrogate_deferral_store;
 
 /**
+ * @file groupby_surrogate_deferral.hpp
  * @brief Surrogate-key group-by (late string materialization) -- the plan-time instruction
  * values shared between the deferral join and the group-by merge.
  *

@@ -130,6 +130,9 @@ void gpu_surrogate_restore_impl::restore_deferred_keys(
     src_view  = src_owned->view();
   }
 
+  // The BIGINT rowids are absolute addresses into the concatenated source view. The INT32
+  // narrowing cast is lossless (reserve() refuses address spaces beyond int32) and every rowid
+  // names a row an INNER-join gather actually produced, so DONT_CHECK is safe.
   auto const& rowid_col = cols.at(static_cast<std::size_t>(group.rowid_key_slot()));
   auto rowid_gather_map =
     cudf::cast(rowid_col->view(), cudf::data_type{cudf::type_id::INT32}, stream, mr);
@@ -153,6 +156,8 @@ std::vector<std::unique_ptr<cudf::column>> gpu_surrogate_restore_impl::regroup_f
   for (std::size_t i = 0; i < num_key_cols; ++i) {
     key_views.push_back(cols[i]->view());
   }
+  // null_policy::INCLUDE matches the main HASH_GROUP_BY and MERGE_GROUP_BY group-bys: SQL
+  // GROUP BY gives NULL keys their own group.
   cudf::groupby::groupby grpby_obj(cudf::table_view(key_views), cudf::null_policy::INCLUDE);
   std::vector<cudf::groupby::aggregation_request> requests;
   requests.reserve(kinds.size());
