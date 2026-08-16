@@ -2460,25 +2460,28 @@ TEST_CASE("S3 REST AWS reactor-count screen records one bound cell",
     }
   };
 
-  auto const warmup = run_screen_scan("aws_https_rest_reactor_screen_warmup");
+  auto warmup = run_screen_scan("aws_https_rest_reactor_screen_warmup");
   require_bound_scan(warmup, std::nullopt, std::nullopt);
+  auto const expected_rows    = warmup.row_count;
+  auto const expected_payload = warmup.payload_bytes_read;
 
   constexpr std::size_t measurement_count = 8;
   std::vector<bench_record> records;
-  records.reserve(measurement_count);
+  records.reserve(measurement_count + 1);
+  records.push_back(std::move(warmup));
   for (std::size_t measurement = 1; measurement <= measurement_count; ++measurement) {
     auto record =
       run_screen_scan("aws_https_rest_reactor_screen_measurement_" + std::to_string(measurement));
-    require_bound_scan(record, warmup.row_count, warmup.payload_bytes_read);
+    require_bound_scan(record, expected_rows, expected_payload);
     records.push_back(std::move(record));
   }
-  REQUIRE(records.size() == measurement_count);
+  REQUIRE(records.size() == measurement_count + 1);
 
   auto const path = perf_json_path();
-  write_perf_json(
-    path, *env, "rest_aws_reactor_screen", object_key, warmup.payload_bytes_read, records);
+  write_perf_json(path, *env, "rest_aws_reactor_screen", object_key, expected_payload, records);
   std::vector<std::string> scenarios;
-  scenarios.reserve(measurement_count);
+  scenarios.reserve(measurement_count + 1);
+  scenarios.push_back("aws_https_rest_reactor_screen_warmup");
   for (std::size_t measurement = 1; measurement <= measurement_count; ++measurement) {
     scenarios.push_back("aws_https_rest_reactor_screen_measurement_" + std::to_string(measurement));
   }
