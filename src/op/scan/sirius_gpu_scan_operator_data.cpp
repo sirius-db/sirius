@@ -23,8 +23,14 @@
 
 #include <algorithm>
 #include <memory>
+#include <stdexcept>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
 namespace sirius::op::scan {
+
+static_assert(std::is_nothrow_move_constructible_v<cudf::column>);
 
 void scan_operator_input::prepare_for_processing(
   const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
@@ -54,25 +60,24 @@ void scan_operator_input::prepare_for_processing(
       auto mut       = batch->to_mutable();
       mut.convert_to<::cucascade::gpu_table_representation>(
         registry, requested_memory_space, stream);
-      // The conversion output is a fresh per-query table (raw GPU pins serve a
-      // plain gpu_table_representation and never reach this branch), so the
-      // scan may take ownership of it here instead of deep-copying it at
-      // materialize. Three exclusions keep the view path: masked and
-      // row-filtered splits filter by copy and need the source view alive;
-      // carrier-converting splits allocate cast destinations in scan
-      // normalization after materialize, so the retained wrapper table lets an
-      // OOM retry re-enter materialize and re-run the cast. Every split that
-      // steals therefore allocates nothing after the take, and a retry can
-      // never re-enter materialize on a consumed split.
-      if (!mvcc_keep_mask.has_mask() && !row_filter_pending && !needs_carrier_conversion) {
+      // Conversion produces a fresh owned table for this split. Raw GPU pins already use a plain
+      // gpu_table_representation, so they never reach this branch. Filter-free conversions may
+      // therefore transfer their columns without touching shared pin storage. A carrier-converting
+      // split retains the whole source until all casts succeed; a non-converting split can detach
+      // immediately because no allocating GPU operation follows the take.
+      if (!mvcc_keep_mask.has_mask() && !row_filter_pending) {
         if (auto* gpu_rep = dynamic_cast<::cucascade::gpu_table_representation*>(mut.get_data())) {
           auto& space        = gpu_rep->get_memory_space();
           stolen_table_bytes = gpu_rep->get_size_in_bytes();
-          stolen_table       = gpu_rep->release_table(stream);
-          // The batch cannot hold null data and its size/view queries
-          // dereference the table, so leave a valid empty placeholder.
-          mut.set_data(std::make_unique<::cucascade::gpu_table_representation>(
-            std::make_unique<cudf::table>(), space, rmm::cuda_stream_view{}));
+          if (needs_carrier_conversion) {
+            converted_table_steal_pending = true;
+          } else {
+            stolen_table = gpu_rep->release_table(stream);
+            // The batch cannot hold null data and its size/view queries dereference the table, so
+            // leave a valid empty placeholder.
+            mut.set_data(std::make_unique<::cucascade::gpu_table_representation>(
+              std::make_unique<cudf::table>(), space, rmm::cuda_stream_view{}));
+          }
         }
       }
     }
@@ -82,6 +87,69 @@ void scan_operator_input::prepare_for_processing(
     auto ro          = batch->to_read_only();
     gpu_memory_space = ro.get_memory_space();
   }
+}
+
+std::unique_ptr<cudf::table> scan_operator_input::transactionally_steal_converted_table(
+  std::size_t output_width,
+  const converted_table_builder& builder,
+  rmm::cuda_stream_view stream) const
+{
+  // This gate is deliberately narrower than the generic resident path. Only prepare's own fresh
+  // conversion may set pending; raw GPU pins and any split that needs filtering stay view-backed.
+  if (!converted_table_steal_pending || !needs_carrier_conversion || stolen_table_consumed ||
+      stolen_table || !is_resident() || mvcc_keep_mask.has_mask() || row_filter_pending) {
+    return nullptr;
+  }
+
+  auto batch = get_cached_batch();
+  if (!batch) { return nullptr; }
+
+  // Keep the exclusive lock and the complete source table through every potentially allocating
+  // builder operation. In particular, rmm::out_of_memory unwinds only the replacement columns and
+  // this lock; the wrapper still owns every source column for the scheduler's retry.
+  auto mut = batch->to_mutable();
+  mut.rebind_stream(stream);
+  auto* gpu_rep = dynamic_cast<::cucascade::gpu_table_representation*>(mut.get_data());
+  if (gpu_rep == nullptr) { return nullptr; }
+
+  auto const source_view = gpu_rep->get_table_view();
+  if (static_cast<std::size_t>(source_view.num_columns()) != output_width) { return nullptr; }
+
+  auto& space    = gpu_rep->get_memory_space();
+  auto empty_rep = std::make_unique<::cucascade::gpu_table_representation>(
+    std::make_unique<cudf::table>(), space, rmm::cuda_stream_view{});
+  auto replacements = builder(source_view);
+  if (replacements.size() != output_width) {
+    throw std::runtime_error(
+      "[scan_operator_input::transactionally_steal_converted_table] builder returned the wrong "
+      "number of replacement columns");
+  }
+  for (auto const& replacement : replacements) {
+    if (replacement && replacement->size() != source_view.num_rows()) {
+      throw std::runtime_error(
+        "[scan_operator_input::transactionally_steal_converted_table] replacement column has the "
+        "wrong row count");
+    }
+  }
+
+  // Commit point: pending provenance guarantees this is the owned-table arm, so release_table
+  // moves rather than materializes. No allocating GPU operation follows this source surrender.
+  auto source_table = gpu_rep->release_table(stream);
+  if (!source_table) {
+    throw std::runtime_error(
+      "[scan_operator_input::transactionally_steal_converted_table] converted source table was "
+      "already released");
+  }
+  for (std::size_t column_idx = 0; column_idx < replacements.size(); ++column_idx) {
+    if (!replacements[column_idx]) { continue; }
+    auto& destination = source_table->get_column(static_cast<cudf::size_type>(column_idx));
+    std::destroy_at(std::addressof(destination));
+    std::construct_at(std::addressof(destination), std::move(*replacements[column_idx]));
+  }
+  mut.set_data(std::move(empty_rep));
+  converted_table_steal_pending = false;
+  stolen_table_consumed         = true;
+  return source_table;
 }
 
 std::size_t scan_operator_input::get_estimated_size_in_bytes() const

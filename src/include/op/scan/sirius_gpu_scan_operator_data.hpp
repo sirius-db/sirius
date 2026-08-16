@@ -25,13 +25,19 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+// cudf
+#include <cudf/column/column.hpp>
+#include <cudf/table/table_view.hpp>
+
 // rmm
 #include <rmm/cuda_stream_view.hpp>
 
 // standard library
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <variant>
+#include <vector>
 
 namespace sirius::op::scan {
 
@@ -105,6 +111,22 @@ class scan_operator_input : public op::operator_data {
   void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
                               rmm::cuda_stream_view stream) override;
 
+  using converted_column_replacements = std::vector<std::unique_ptr<cudf::column>>;
+  using converted_table_builder =
+    std::function<converted_column_replacements(cudf::table_view source)>;
+
+  /**
+   * @brief Build carrier replacements while retaining a freshly converted source, then commit.
+   *
+   * Returns null without mutation when this split is not an exact-width transactional candidate.
+   * A builder exception leaves the source table owned by the cached wrapper and retryable. Null
+   * replacement entries transfer the corresponding source columns without copying.
+   */
+  [[nodiscard]] std::unique_ptr<cudf::table> transactionally_steal_converted_table(
+    std::size_t output_width,
+    const converted_table_builder& builder,
+    rmm::cuda_stream_view stream) const;
+
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override;
 
   [[nodiscard]] std::size_t get_estimated_working_set_size_in_bytes() const override;
@@ -167,6 +189,10 @@ class scan_operator_input : public op::operator_data {
   /// consumption (scan-internal OOM retry) must fail loudly rather than
   /// serve the emptied wrapper batch as zero rows.
   mutable bool stolen_table_consumed{false};
+  /// A fresh owned conversion result that still needs carrier casts. The wrapper retains the
+  /// complete source until every replacement column has been built successfully, then the scan
+  /// commits by moving unchanged columns and installing the replacements.
+  mutable bool converted_table_steal_pending{false};
   /// True when scan normalization will cast at least one selected column of
   /// this resident cached split. Besides sizing the conversion reservation,
   /// this prevents table detachment so an OOM retry can rematerialize the
