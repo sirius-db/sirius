@@ -909,6 +909,11 @@ bool render_checks()
 
 int main()
 {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    std::printf("SKIP: no CUDA device\n");
+    return 0;
+  }
   if (cudaSetDevice(0) != cudaSuccess) {
     std::fprintf(stderr, "FAIL: cudaSetDevice(0) failed\n");
     return 1;
