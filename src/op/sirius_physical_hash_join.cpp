@@ -714,11 +714,13 @@ cross_schedule_kind peek_cross_schedule_kind(std::vector<partition_cross_schedul
 }
 
 partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
+                                                        std::optional<uint64_t> total_rows,
                                                         bool is_build_side,
                                                         bool build_foldable,
                                                         int num_gpus,
                                                         uint64_t hash_partition_bytes,
                                                         uint64_t max_build_hash_table_bytes,
+                                                        uint64_t max_build_probe_resident_bytes,
                                                         uint64_t max_broadcast_join_size,
                                                         duckdb::JoinType join_type,
                                                         HASH_JOIN_MODE join_mode,
@@ -759,22 +761,34 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
   // right, reused across streamed left probe batches); RIGHT_SEMI/RIGHT_ANTI/RIGHT and full OUTER
   // emit build-side output and stay on the STANDARD path.
   //
-  // Evaluated at the count BUILD_PROBE would run with — one build table per GPU, capped at
-  // `natural` — not at the natural count: `hash_partition_bytes` targets a streaming batch size
-  // and must not veto `max_build_hash_table_bytes`, which is what sizes the folded hash table.
-  // A broadcast join charges the FULL build to every GPU; a hash-partitioned build charges the
-  // per-GPU average.
+  // Two independent per-GPU bounds, both evaluated at the count BUILD_PROBE would run with — one
+  // build table per GPU, capped at `natural` (`hash_partition_bytes` targets a streaming batch
+  // size and must not veto the BUILD_PROBE budgets):
+  //   (1) max_build_hash_table_bytes bounds the estimated cuco table
+  //       (rows x BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW); the structure hashes only key views,
+  //       so payload width is irrelevant to it. When rows are unmeasurable (a sizing batch was
+  //       not GPU-resident), payload bytes stand in as a conservative surrogate.
+  //   (2) max_build_probe_resident_bytes bounds the folded build payload that stays GPU-resident
+  //       and read-only-locked (un-spillable) for the whole probe stream.
+  // A broadcast join charges the FULL build (rows and bytes) to every GPU; a hash-partitioned
+  // build charges the per-GPU average.
   int const build_probe_partitions = std::max(1, std::min(natural, num_gpus));
-  uint64_t const per_gpu_build_bytes =
-    broadcast_candidate ? total_bytes : total_bytes / static_cast<uint64_t>(build_probe_partitions);
-  bool build_probe = per_gpu_build_bytes < max_build_hash_table_bytes && build_foldable &&
+  auto const per_gpu               = [&](uint64_t total) {
+    return broadcast_candidate ? total : total / static_cast<uint64_t>(build_probe_partitions);
+  };
+  uint64_t const per_gpu_build_bytes = per_gpu(total_bytes);
+  uint64_t const per_gpu_table_bytes_est =
+    total_rows ? per_gpu(*total_rows) * config::BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW
+               : per_gpu_build_bytes;
+  bool build_probe = per_gpu_table_bytes_est < max_build_hash_table_bytes &&
+                     per_gpu_build_bytes < max_build_probe_resident_bytes && build_foldable &&
                      !is_right_family && !is_mixed && !is_full_outer;
 
   // A MARK join must always run in BUILD_PROBE mode. It needs the entire build side resident to
   // compute the global build_has_null sentinel and the per-probe-row marks, and on multi-GPU it is
   // always broadcast (build replicated to every GPU). Force BUILD_PROBE on even when the build
-  // exceeds the hash-table budget. MARK is never right-family/full-outer, and MARK + MIXED is
-  // rejected at construction.
+  // exceeds the hash-table or resident-payload budget. MARK is never right-family/full-outer, and
+  // MARK + MIXED is rejected at construction.
   if (is_mark) { build_probe = true; }
 
   bool const broadcast = broadcast_candidate && build_probe;
@@ -798,11 +812,13 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
   const double estimated_probe_to_build_ratio =
     static_cast<double>(probe_card_est) / build_card_est;
   auto const strategy = compute_hash_join_partition_strategy(in.total_bytes,
+                                                             in.total_rows,
                                                              in.is_build_side,
                                                              in.build_foldable,
                                                              _num_gpus,
                                                              _hash_partition_bytes,
                                                              _max_build_hash_table_bytes,
+                                                             max_build_probe_resident_bytes,
                                                              _max_broadcast_join_size,
                                                              join_type,
                                                              _join_mode,
@@ -844,13 +860,21 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
                               : _join_mode == HASH_JOIN_MODE::MIXED_JOIN ? "MIXED_JOIN"
                                                                          : "STANDARD";
 
+  // Estimated cuco table bytes at the full (undivided) build, mirroring the eligibility rule's
+  // payload surrogate when rows are unmeasurable.
+  uint64_t const est_table_bytes =
+    in.total_rows ? *in.total_rows * config::BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW : in.total_bytes;
   SIRIUS_LOG_DEBUG(
     "sirius_physical_hash_join id {} partition strategy: {} partitions ({} GPUs), build side {} "
-    "bytes. Join Type: {}. Join Mode: {} {}. build_card_est {} probe_card_est {}",
+    "bytes, {} rows{}, est hash table {} bytes. Join Type: {}. Join Mode: {} {}. build_card_est "
+    "{} probe_card_est {}",
     this->get_operator_id(),
     strategy.num_partitions,
     _num_gpus,
     in.total_bytes,
+    in.total_rows.value_or(0),
+    (in.total_rows ? "" : " (rows-unmeasured)"),
+    est_table_bytes,
     duckdb::JoinTypeToString(join_type),
     join_mode_str,
     (strategy.broadcast ? " [broadcast]" : ""),

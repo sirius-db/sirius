@@ -108,11 +108,15 @@ struct build_probe_decision {
 /// consistent), so they are clamped to one partition on a single GPU and forced to broadcast on
 /// multi-GPU.
 ///
-/// BUILD_PROBE eligibility requires: the build folds to one hash table per GPU within
-/// `max_build_hash_table_bytes` (a broadcast join charges the FULL build to every GPU; a
-/// hash-partitioned build charges the per-GPU average), the build folds to one batch, and the
-/// join is not right-family, mixed, or full-outer (those over-emit build rows on the streamed
-/// path). `join_mode` distinguishes MIXED_JOIN; `join_type` supplies the rest.
+/// BUILD_PROBE eligibility applies two independent per-GPU bounds: the estimated cuco hash-table
+/// bytes (measured build rows x config::BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW, with payload bytes
+/// as a conservative surrogate when `total_rows` is nullopt) must stay under
+/// `max_build_hash_table_bytes`, and the folded build payload that stays GPU-resident for the
+/// probe stream must stay under `max_build_probe_resident_bytes`. A broadcast join charges the
+/// FULL build (rows and bytes) to every GPU; a hash-partitioned build charges the per-GPU average.
+/// The build must also fold to one batch, and the join must not be right-family, mixed, or
+/// full-outer (those over-emit build rows on the streamed path). `join_mode` distinguishes
+/// MIXED_JOIN; `join_type` supplies the rest.
 ///
 /// Broadcast candidacy: a build is replicate-worthy when it is below the small-table threshold, OR
 /// when it is below `max_broadcast_join_size` AND the probe side is large relative to the build
@@ -120,11 +124,13 @@ struct build_probe_decision {
 /// shuffling a much larger probe across GPUs.
 [[nodiscard]] partition_strategy compute_hash_join_partition_strategy(
   uint64_t total_bytes,
+  std::optional<uint64_t> total_rows,
   bool is_build_side,
   bool build_foldable,
   int num_gpus,
   uint64_t hash_partition_bytes,
   uint64_t max_build_hash_table_bytes,
+  uint64_t max_build_probe_resident_bytes,
   uint64_t max_broadcast_join_size,
   duckdb::JoinType join_type,
   HASH_JOIN_MODE join_mode,
@@ -300,6 +306,11 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //! right_rows >= ratio * left_rows; 0 disables. Set from operator_params at planning time.
   double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
 
+  //! Per-GPU cap on the folded build payload a BUILD_PROBE join keeps GPU-resident and
+  //! read-only-locked for the lifetime of its probe stream. Set from operator_params at
+  //! planning time. 0 disables BUILD_PROBE for all joins except MARK.
+  uint64_t max_build_probe_resident_bytes = config::DEFAULT_MAX_BUILD_PROBE_RESIDENT_BYTES;
+
   //! Join Keys statistics (optional)
   duckdb::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> join_stats;
 
@@ -349,13 +360,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// so the one-shot publisher sees the whole key set.
   [[nodiscard]] bool publishes_dynamic_filters() const;
 
-  /// The per-GPU hash-table byte budget (also the upstream PARTITION's bound on folding a build
-  /// whole for dynamic-filter publication).
-  [[nodiscard]] uint64_t max_build_hash_table_bytes() const noexcept
-  {
-    return _max_build_hash_table_bytes;
-  }
-
   /// Reported by the upstream PARTITION at sizing time: the build port will deliver one
   /// concat-folded batch covering the entire build side (single-partition or broadcast build).
   /// Precondition for claiming a build batch for dynamic-filter publication, in any join mode.
@@ -403,7 +407,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   bool is_all_inequality_join = true;
 
-  HASH_JOIN_MODE _join_mode            = HASH_JOIN_MODE::STANDARD;
+  HASH_JOIN_MODE _join_mode = HASH_JOIN_MODE::STANDARD;
+  // Per-GPU budget for the estimated BUILD_PROBE cuco hash-table bytes (measured build rows x
+  // config::BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW). Set from operator_params at construction.
   uint64_t _max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
   // Maximum build-side bytes eligible for a broadcast join (see get_partition_strategy). Set from
   // operator_params at construction.

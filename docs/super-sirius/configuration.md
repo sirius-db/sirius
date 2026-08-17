@@ -90,6 +90,7 @@ sirius:
     hash_partition_bytes:       805306368   # 768 MiB
     concat_batch_bytes:         805306368   # 768 MiB
     max_build_hash_table_bytes: 805306368   # 768 MiB
+    max_build_probe_resident_bytes: 805306368  # 768 MiB
     enable_dynamic_filter_pushdown: true    # BUILD_PROBE raw/hash IN-list or Bloom filters
     enable_dynamic_zone_map_filter: false  # optional parquet-read/native-post-decode min/max
     dynamic_filter_domain_coverage_threshold: 0.9  # skip keys the build's domain coverage exceeds
@@ -389,9 +390,9 @@ explicit GPU capacity in YAML, it is computed at startup as
 GPU is visible). When the active YAML memory path explicitly caps GPU capacity, the
 default is narrowed to
 `min(physical-memory default, max(1 byte, smallest resolved GPU capacity / 40))`.
-`max_build_hash_table_bytes` defaults to **2× that batch default**. Explicit
-`operator_params` values are applied afterward and still override each value
-individually.
+`max_build_hash_table_bytes` and `max_build_probe_resident_bytes` each default to
+**8× that batch default**. Explicit `operator_params` values are applied afterward
+and still override each value individually.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -401,7 +402,8 @@ individually.
 | `hash_partition_bytes` | Shared physical/effective GPU batch default described above | Target partition size for hash joins and group-bys; must be greater than zero |
 | `concat_batch_bytes` | Shared physical/effective GPU batch default described above | Target output batch size for CONCAT operator |
 | `sort_sample_bytes` | Shared physical/effective GPU batch default described above | Bytes sampled before computing sort partition boundaries |
-| `max_build_hash_table_bytes` | 2× batch default | Max build-side size for BUILD_PROBE join mode |
+| `max_build_hash_table_bytes` | 8× batch default | Max per-GPU estimated BUILD_PROBE hash-table bytes (measured build rows × 16 B, payload bytes when rows are unmeasurable). 0 disables BUILD_PROBE except for MARK joins. |
+| `max_build_probe_resident_bytes` | 8× batch default | Max per-GPU folded build-side payload a BUILD_PROBE join may keep GPU-resident (un-spillable) for the whole probe stream. 0 disables BUILD_PROBE except for MARK joins. |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join. A build below this size is replicated to every GPU (instead of hash-partitioned) when it is tiny, or when the DuckDB-estimated probe-to-build row ratio is at least `num_gpus * 1.25`. |
 | `max_sort_partition_memory_fraction` | 0.33 | Fraction of GPU memory per sort partition when `max_sort_partition_bytes` is 0 |
 | `mark_join_build_switch_ratio` | 8.0 | For STANDARD MARK joins, build on the smaller (left) side when `right_rows >= ratio * left_rows` (0 disables) |
@@ -412,7 +414,7 @@ individually.
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
 
-**Note:** `max_build_hash_table_bytes` can be larger than `concat_batch_bytes`. When it is, the partition operator configures CONCAT to concatenate all batches, enabling the more efficient BUILD_PROBE join mode for larger build sides. Other joins (STANDARD, MIXED) still use `concat_batch_bytes` as the batch size threshold.
+**Note:** `max_build_probe_resident_bytes` can be larger than `concat_batch_bytes`. When the partition operator selects BUILD_PROBE, or folds a single-partition build whole for dynamic-filter publication (both admissions bounded by `max_build_probe_resident_bytes`), it configures CONCAT to concatenate all build batches into one. Other joins (STANDARD, MIXED) still use `concat_batch_bytes` as the batch size threshold.
 
 ## Telemetry
 
@@ -583,7 +585,8 @@ SET enable_compressed_materialization = false;
 | `hash_partition_bytes` | Shared physical/effective GPU batch default | Hash partition target size; must be greater than zero |
 | `concat_batch_bytes` | Shared physical/effective GPU batch default | CONCAT output batch size |
 | `sort_sample_bytes` | Shared physical/effective GPU batch default | Bytes sampled before computing sort boundaries |
-| `max_build_hash_table_bytes` | 2× batch default | Max build-side hash table bytes |
+| `max_build_hash_table_bytes` | 8× batch default | Max per-GPU estimated BUILD_PROBE hash-table bytes (measured build rows × 16 B) |
+| `max_build_probe_resident_bytes` | 8× batch default | Max per-GPU folded build payload kept GPU-resident by a BUILD_PROBE join |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
 | `enable_runtime_distinct_build_probe` | true | Runtime distinct-build test for `BUILD_PROBE` joins; promotes to the single-pass `cudf::distinct_hash_join` when the build keys prove distinct |

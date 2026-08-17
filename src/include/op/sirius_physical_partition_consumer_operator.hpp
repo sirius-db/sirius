@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 
 namespace sirius {
@@ -29,10 +30,12 @@ namespace op {
 /// What the upstream PARTITION operator measures/knows and forwards to its downstream consumer so
 /// the consumer can decide how many partitions to produce (and whether to broadcast).
 struct partition_sizing_input {
-  uint64_t total_bytes;  ///< Bytes waiting on the sizing partition's input port.
-  bool is_build_side;    ///< The sizing partition drives the build side (only the build side can
-                         ///< drive broadcast / build-probe).
-  bool build_foldable;   ///< A downstream build-side CONCAT can concat_all to a single batch.
+  uint64_t total_bytes;                ///< Bytes waiting on the sizing partition's input port.
+  std::optional<uint64_t> total_rows;  ///< Measured rows on the sizing port (full barrier), or
+                                       ///< nullopt when a batch's representation exposes no count.
+  bool is_build_side;   ///< The sizing partition drives the build side (only the build side can
+                        ///< drive broadcast / build-probe).
+  bool build_foldable;  ///< A downstream build-side CONCAT can concat_all to a single batch.
 };
 
 /// The partitioning decision returned by a consumer's get_partition_strategy. `num_partitions` is

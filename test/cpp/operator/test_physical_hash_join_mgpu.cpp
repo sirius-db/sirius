@@ -165,10 +165,10 @@ TEST_CASE("physical_hash_join - BUILD_PROBE probe-heavy join across two GPUs",
 
   scoped_mgpu_env env(yaml_path);
 
-  // BUILD_PROBE trigger: build side MUST be smaller than
-  // max_build_hash_table_bytes (configured 90 MiB above) so the planner
-  // chooses BUILD_PROBE rather than MIXED_JOIN. 5000-row × 16 B ≈ 80 KiB,
-  // well under the threshold.
+  // BUILD_PROBE trigger: the build's estimated hash table (5000 rows x 16 B
+  // = 80 KiB) MUST stay under max_build_hash_table_bytes (configured 90 MiB
+  // above) so the planner chooses BUILD_PROBE rather than MIXED_JOIN; the
+  // payload is equally tiny, so the resident bound never binds here.
   auto inner_query =
     "SELECT probe.k, probe.v, build.v AS build_v "
     "FROM read_parquet('" +
@@ -228,8 +228,9 @@ TEST_CASE("physical_hash_join - MIXED_JOIN large-vs-large join distributes parti
   mgpu_env_params params{};
   params.cache                = "none";
   params.hash_partition_bytes = 1'000'000;
-  // Force MIXED_JOIN by lowering max_build_hash_table_bytes below our
-  // 64 MiB per-side surface.
+  // Force MIXED_JOIN by lowering max_build_hash_table_bytes below the
+  // estimated hash table of our 64 MiB / ~2M-row per-side surface (2M rows
+  // x 16 B = 32 MiB, and >= 16 MiB per GPU when hash-partitioned).
   params.max_build_hash_table_bytes = 1'000'000;
   params.pipeline_num_threads       = 4;
   params.task_creator_num_threads   = 4;

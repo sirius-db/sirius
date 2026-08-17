@@ -21,6 +21,7 @@ sirius:
     concat_batch_bytes: 4MiB
     sort_sample_bytes: 5MiB
     max_build_hash_table_bytes: 6MiB
+    max_build_probe_resident_bytes: 9MiB
     max_broadcast_join_size: 7MiB
     mark_join_build_switch_ratio: 3.0
     enable_runtime_distinct_build_probe: false
