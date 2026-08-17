@@ -210,15 +210,32 @@ CALL unpin_table('lineitem');
 
 Pinning drives the source's `gpu_ingestible` to completion (`materialize_all_batches` / `materialize_pin_to_host` in `pin_table.cpp`):
 
-- **Shared numeric step:** zone-map statistics, when enabled, are captured from the native decoded table first. With `enable_compressed_materialization`, a separate exact min/max reduction then selects the narrowest signed, unsigned, or same-scale DECIMAL carrier independently for each eligible column in that batch. The logical column-type vector is retained whenever either zone-map capture or narrowing needs it; it is cleared only when both features are disabled.
+- **Shared range step:** zone-map statistics, when enabled, are captured from the unnarrowed decoded
+  table first. With `enable_compressed_materialization`, a separate exact min/max reduction then
+  selects the narrowest signed, unsigned, same-scale DECIMAL, or DATE epoch-day carrier
+  independently for each eligible column in that batch. The logical column-type vector is retained
+  whenever either zone-map capture or narrowing needs it; it is cleared only when both features are
+  disabled.
 - **GPU tier** (`materialize_all_batches`): each resulting batch is stored as a GPU-resident `cudf::table`, round-robining placement across the GPU memory spaces. Placement is deterministic so re-pinning the same source yields identical per-chunk placement (required by the merge path below).
 - **HOST tier** (`materialize_pin_to_host`): each resulting batch is converted on its round-robin GPU to a `host_data_representation` that preserves carrier type and decimal scale on that GPU's NUMA-local host space, then the GPU table is freed before the next batch. Peak GPU residency is therefore ~one batch, so a host pin never needs the whole table to fit in GPU memory.
 
 ### Storage and matching
 
-Each pinned table is a `pinned_entry` keyed by name in the scan manager. It holds a `cache_entry_info` (the cache identity + column layout) plus the cached batches: `data_batches_by_column` (one chunk vector per column) for the GPU tier, or `host_chunks` (one `host_data_representation` per batch, sliced by column at scan time) for the HOST tier. It also carries a `pinned_zone_maps` sidecar — the pin-time per-column, per-chunk min/max statistics, absent when capture was disabled (see [Zone maps](#zone-maps)).
+Each pinned table is a `pinned_entry` keyed by name in the scan manager. It holds a
+`cache_entry_info` (the cache identity + column layout) plus the cached batches:
+`data_batches_by_column` (one chunk vector per column) for the GPU tier, or `host_chunks` (one
+`host_data_representation` per batch, sliced by column at scan time) for the HOST tier. Its
+`column_storage` sidecar records each chunk-column's pin-time native mapping, stored carrier, and
+narrowing marker. It also carries a `pinned_zone_maps` sidecar — the pin-time per-column, per-chunk
+min/max statistics, absent when capture was disabled (see [Zone maps](#zone-maps)).
 
-`cache_entry_info` captures format identity — the resolved parquet **file set**, or the duckdb **catalog.schema.table** — plus the cached columns (by storage index) and their names. `can_serve_with_columns(other)` returns a gather projection when this entry can serve a scan: same format, same identity, and a **column superset** of the scan's request. A parquet pin never serves a duckdb scan or vice-versa.
+`cache_entry_info` captures format identity — the resolved parquet **file set**, or the DuckDB
+**catalog.schema.table** — plus the cached columns (by storage index) and their names.
+`can_serve_with_columns(other)` returns a gather projection when this entry can serve a scan: same
+format, same identity, and a **column superset** of the scan's request. A Parquet pin never serves a
+DuckDB scan or vice versa. DuckDB cache serving additionally requires every projected column's
+current native cuDF mapping to equal the mapping recorded at pin time; a mismatch is a clean cache
+miss rather than a conversion of stale data under a new type.
 
 During `prepare_for_query`, `try_assign_cached_entries` matches each `GPU_SCAN` operator's `table_info` against the pinned entries. On a hit it builds a `cached_databatch_provider` over the matched entry, ordering columns by the ingestible's `materialized_column_order()` so a cached batch is laid out identically to a fresh disk read and `post_filter_and_project` resolves the same columns on both paths. The provider emits one cached chunk as one resident split and bypasses the fresh-read coalescer. Each split carries whether its selected columns are actually narrow, and `GPU_SCAN` normalizes that chunk to the query's planned physical schema (or the native logical schema when there is no override) before downstream operators can combine batches.
 

@@ -192,11 +192,10 @@ struct pinned_entry {
   /// (the plain, non-compression GPU pin path) when non-empty.
   std::vector<sirius::device_pin_chunk> device_chunks;
   /// Chunk-major stored-column metadata, positional with the cached data:
-  /// column_storage[c][i] is the recorded carrier of cached column i in chunk c
-  /// (for a compressed chunk, the type its decompression reproduces) plus whether
-  /// that carrier is narrower than the pin-time native mapping. Recorded by the
-  /// pin driver at the moment of storage; insertion requires a matrix covering
-  /// every chunk and column and cross-checks recorded carriers against
+  /// column_storage[c][i] records the carrier, pin-time native mapping, and
+  /// narrowing marker for cached column i in chunk c. Recorded by the pin driver
+  /// at the moment of storage; insertion requires a matrix covering every chunk
+  /// and column and cross-checks recorded carriers against
   /// uncompressed storage. An empty matrix reads as all-native — a legitimate
   /// state for a zero-chunk or hand-built entry, which is why the serving
   /// validator still accepts it. The plan-time narrowing folds and the
@@ -298,15 +297,22 @@ void validate_recorded_column_storage(sirius::pinned_column_storage_matrix const
 [[nodiscard]] bool pinned_column_narrowed_in_all_chunks(pinned_entry const& entry,
                                                         std::size_t entry_position);
 
-/// The narrow plan-target carrier for the cached column at @p entry_position (a position into
-/// cache_info.column_ids): the widest recorded carrier across all chunks. A pure fold over the
-/// entry's @c column_storage metadata — compressed and uncompressed chunks, both tiers, answer
-/// identically and no storage is touched. Returns `std::nullopt` unless
-/// pinned_column_narrowed_in_all_chunks passes and every recorded carrier is a strict same-family
-/// narrowing of @p native_type (can_narrow_to, the defense against metadata that contradicts the
-/// pin-time logical type). Chunks narrower than the returned target widen at serve through the
-/// verified same-family restore. Non-owning read of @p entry: obtain and read it inside one
-/// slot-scoped window, and never hold it across a pin or unpin.
+/**
+ * @brief Derives the widest validated narrow carrier recorded for a cached column.
+ *
+ * Reads only @p entry's column-storage metadata. Returns no target unless @p entry_position is
+ * covered by the cached-column identity and every chunk marks the column narrowed, records
+ * @p native_type as its pin-time native type, and records a strict same-family narrowing of that
+ * type. Chunks narrower than the returned target widen when served.
+ *
+ * Call only while @p entry is protected from concurrent pin or unpin; this function does not
+ * retain it.
+ *
+ * @param entry Pinned entry to inspect.
+ * @param entry_position Position in `entry.cache_info.column_ids`.
+ * @param native_type Current scan's native cuDF type.
+ * @return Widest valid recorded carrier, or `std::nullopt`.
+ */
 [[nodiscard]] std::optional<cudf::data_type> pinned_column_narrow_carrier(
   pinned_entry const& entry, std::size_t entry_position, cudf::data_type native_type);
 

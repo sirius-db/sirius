@@ -33,7 +33,6 @@
 #include <cudf/cudf_utils.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
-#include <cudf/unary.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
 // cucascade
@@ -131,7 +130,7 @@ std::unique_ptr<cudf::table> normalize_physical_schema(std::unique_ptr<cudf::tab
     auto const restoring = can_restore_to(actual, target);
     auto const narrowing = has_explicit_physical_schema && can_narrow_to(actual, target);
     if (actual == target || (!restoring && !narrowing)) { continue; }
-    columns[column_idx] = cudf::cast(columns[column_idx]->view(), target, stream, mr);
+    columns[column_idx] = cast_through_rep(columns[column_idx]->view(), target, stream, mr);
     if (observer != nullptr) {
       if (narrowing) {
         observer->record_compressed_materialization_scan_columns_narrowed();

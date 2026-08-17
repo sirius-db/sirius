@@ -1,8 +1,8 @@
 # Compressed Materialization
 
-Compressed materialization keeps bounded numeric values in a narrower physical cuDF carrier while
-preserving the original SQL logical type. It applies to every eligible scan output, not only join
-or group keys, and includes fixed-point `DECIMAL` payloads.
+Compressed materialization keeps eligible bounded values in a narrower physical cuDF carrier while
+preserving the original SQL logical type. It applies to integer, fixed-point `DECIMAL`, and `DATE`
+scan outputs, not only join or group keys.
 
 The optimization is on by default. To turn it off:
 
@@ -28,7 +28,9 @@ remain those of `DECIMAL(18,2)`.
 
 ## Eligible carriers
 
-Narrowing is exact and preserves signedness and decimal scale.
+Narrowing is exact and preserves signedness, decimal scale, and the value's semantic domain:
+`DATE` narrows only among the signed-integer carriers that hold its epoch-day count, and restores
+only to `DATE`.
 
 | Logical/native family | Candidate physical carriers |
 |---|---|
@@ -36,13 +38,43 @@ Narrowing is exact and preserves signedness and decimal scale.
 | unsigned `USMALLINT`/`UINTEGER`/`UBIGINT` | narrowest fitting `UINT8`, `UINT16`, or `UINT32` |
 | `DECIMAL64(scale)` | `DECIMAL32` with the same scale |
 | `DECIMAL128(scale)` | narrowest fitting `DECIMAL32` or `DECIMAL64`, same scale |
+| `DATE` (cuDF `TIMESTAMP_DAYS`, int32 epoch days) | narrowest fitting `INT8` or `INT16` |
 
-Already-minimal types, booleans, floating-point values, temporal values, strings, and 128-bit
-integers are not candidates. Missing, all-null, malformed, or incompatible bounds leave the
-column native.
+`INT32` is deliberately absent from the `DATE` row: it is the same width as the native
+`TIMESTAMP_DAYS` storage, so it is not a strict reduction and never selected. The carrier-family
+relation enforces the same bound directly — a type reached through a representation is in a family
+only with carriers strictly narrower than that representation — so `INT64` and `TIMESTAMP_DAYS`
+share no family in either direction.
+
+Already-minimal types, booleans, floating-point values, temporal values other than `DATE`,
+strings, and 128-bit integers are not candidates. Missing, all-null, malformed, or incompatible
+bounds leave the column native.
 
 Decimal bounds are compared as raw unscaled signed integers. cuDF represents SQL scale `s` as
 `-s`; a narrowing conversion never changes it.
+
+### Storage type versus semantic domain
+
+Two different things decide a carrier conversion, and conflating them is the way to get one
+wrong. The **device storage type** is the cuDF type whose buffer layout a carrier shares:
+`TIMESTAMP_DAYS` stores `int32_t`, which is why a `DATE` can sit in an `INT16` carrier at all, and
+why every family, width, and fitting decision is taken against that representation rather than
+against the cuDF `type_id`. The **semantic domain** is what the bits mean; there are four disjoint
+domains — signed integers, unsigned integers, fixed-point at one scale, and `DATE` epoch days. A
+conversion never leaves its domain, and width is then chosen inside that domain's storage family.
+
+A carrier alone does not identify a domain: an `INT16` may carry an `INTEGER`, a `BIGINT`, or a
+`DATE`. Any predicate that pairs two carriers, or a carrier and a literal, therefore compares the
+logical types' domains as well as the carriers.
+
+cuDF refuses timestamp-to-numeric casts in either direction, so an internal `DATE` carrier
+conversion cannot call `cudf::cast` directly. It tunnels instead: a zero-copy `bit_cast` to the
+int32 representation, the cast at that representation, and a re-tag of the result buffers into the
+target type. The physical types alone do not prove that this is a carrier conversion, so callers
+must also establish provenance. Planner-inserted AST restores carry `cast_kind::carrier_restore`;
+translated semantic temporal-numeric casts are rejected during AST translation, after which the
+configured fallback policy applies. Other conversions, including `DATE` to `TIMESTAMP` in either
+direction, use `cudf::cast`.
 
 ### Alternatives considered: frame-of-reference
 
@@ -70,22 +102,27 @@ catalog.schema.table, through the same matchers) and able to serve every request
 narrowable column's plan target then comes from the entry's recorded stored-column metadata
 (`pinned_column_narrow_carrier`, a pure fold over the `column_storage` matrix the pin driver
 recorded at the moment of storage): the metadata must show the column narrowed in every chunk,
-every recorded carrier is defensively validated as a strict same-family narrowing of the native
-carrier, and the target is the widest carrier across the chunks — chunks stored narrower than the
-target widen at serve through the verified same-family restore. The fold never opens storage, so
-compressed and uncompressed chunks on either tier answer identically. Pin-time narrowing chose
-each carrier from exact per-chunk min/max over materialized data, so the recorded carriers are
-ground truth for the values the cache serves. Source statistics are not consulted at plan time,
-so sidecar availability does not depend on footer or catalog statistics: multi-file parquet scans
-gate identically to single-file scans. This yields three residency states:
+every recorded pin-time native must equal the scan's native mapping, every carrier must be a
+strict same-family narrowing of that native type, and the target is the widest carrier across the
+chunks. Chunks stored narrower than the target widen at serve through the verified same-family
+restore. The fold never opens storage, so compressed and uncompressed chunks on either tier answer
+identically. Pin-time narrowing chose each carrier from exact per-chunk min/max over materialized
+data, so the recorded carriers are ground truth for the values the cache serves. Source statistics
+are not consulted at plan time, so sidecar availability does not depend on footer or catalog
+statistics: multi-file parquet scans gate identically to single-file scans.
+
+For DuckDB-native scans, the recorded native mappings are also a cache-hit type guard. A qualified
+name that now resolves to different projected native types is treated as unpinned at plan time and
+as a clean cache miss at serve time. This yields three residency states:
 
 1. **Pinned-narrow** — the pinned entry matches the scan, serves its requested columns, and its
    narrowing markers show a column narrowed in every chunk: that column's sidecar target is the
    widest carrier across the entry's chunks. No serve-time downcast is needed: a chunk already at
    the target passes through, while a chunk stored at a narrower width widens to the target.
-2. **Unpinned** — no matching entry, or the entry cannot serve the requested columns: no sidecar.
-   The fresh scan follows the feature-off scan path — no exact-minmax verification, cast kernels,
-   or restore projections — after an additional plan-time cache probe.
+2. **Unpinned** — no matching entry, the entry cannot serve the requested columns, or a
+   DuckDB-native entry's projected native types have drifted: no sidecar. The fresh scan follows
+   the feature-off scan path — no exact-minmax verification, cast kernels, or restore projections —
+   after an additional plan-time cache probe.
 3. **Pinned-native** — the entry matches but the column was not narrowed in every chunk (for
    example, the table was pinned while the flag was off): that column's target stays native, and
    when no column survives the whole sidecar is dropped. A native resident chunk is never narrowed
@@ -145,9 +182,11 @@ carrier from its scan upward and accumulating four use flags:
   eligible grouped aggregate (the exact preconditions of the HASH_GROUP_BY propagation case, so
   the aggregate exchange moves narrow key bytes);
 - **narrow comparison** — a comparison or `BETWEEN` whose other operands are constants
-  representable in the planned carrier: the same eligibility the evaluator's narrow-domain path
-  applies, decided by the shared `constant_representable_in_carrier` predicate so the two cannot
-  drift;
+  representable in the planned carrier, or a comparison of two carried references that share one
+  planned carrier (which marks both columns): the same eligibility the evaluator's narrow-domain
+  path applies, decided by the two shared predicates `narrow_domain_carrier_eligible` (carrier
+  against literals) and `narrow_domain_reference_pair_eligible` (carrier against carrier) so the
+  two cannot drift;
 - **evaluator restore** — any other reference occurrence inside an evaluated expression, which
   the evaluator restores unconditionally;
 - **boundary restore** — the carrier dies where propagation inserts a restore projection: join
@@ -189,14 +228,34 @@ allocating a copy.
 
 Comparisons and `BETWEEN` skip restoration entirely when one operand is a narrowed reference and
 every other operand is a constant exactly representable in that reference's carrier (typed NULLs
-always are; decimal constants must also match the carrier's scale). Because narrowing preserves
-values, family, and decimal scale — there is no offset — every comparison outcome, including NULL
-handling, is identical at the narrow width. The evaluator emits the raw narrow column plus
-constants converted to the carrier type host-side, in both the cuDF-AST and binary-operator paths.
-Any ineligible shape (reference-versus-reference, non-representable constant, scale mismatch)
-falls back to the restore path. The main beneficiary is filtering over narrow resident chunks:
-masks are computed at the narrow width and survivors are gathered narrow, so restoration applies
-to survivors at their consumers instead of to the whole chunk before selection.
+always are; decimal constants must also match the carrier's scale, and the constant must come from
+the reference's own domain — a `DATE` column pairs only with a `DATE` literal, whose epoch-day
+value folds straight into the carrier). Because narrowing preserves values, family, and decimal
+scale — there is no offset — every comparison outcome, including NULL handling, is identical at the
+narrow width. The evaluator emits the raw narrow column plus constants converted to the carrier
+type host-side, in both the cuDF-AST and binary-operator paths. Any ineligible shape (a
+non-representable constant, a scale mismatch, a constant from another domain) falls back to the
+restore path. The main beneficiary is filtering over narrow resident chunks: masks are computed at
+the narrow width and survivors are gathered narrow, so restoration applies to survivors at their
+consumers instead of to the whole chunk before selection.
+
+A comparison of two references is eligible in exactly one shape: both sides are carried narrow and
+both landed on the *same* physical carrier. Neither side is then restored and the comparison
+evaluates at that shared width — the shape that pays off for column-versus-column date predicates
+such as `l_commitdate < l_receiptdate`, where restoring both sides would widen the pair for no
+gain. Carrier equality is what makes this safe without further checks: it settles signedness and
+decimal scale, and narrowing applies no offset, so an identical-carrier pair orders exactly as the
+native pair does. Different logical types at one carrier (an `INTEGER` and a `BIGINT` both at
+`INT16`) are fine for the same reason. The one thing carrier equality does not settle is domain,
+so `DATE` is admitted only against `DATE`.
+
+Requiring equality rather than widening the narrower side is deliberate. Widening would add a
+kernel the policy pass would have to model, and it would put plan-time and runtime carriers out of
+lockstep; as written both ask the same predicate, so a pair whose carriers diverge — one side
+retracted by a restore boundary on another branch — simply does not engage, and each side restores
+on its own. The residual is a mis-costed keep, never a wrong answer: a single-pass classifier can
+mark both columns a narrow comparison and only later see one of them retracted, leaving the
+survivor paying a restore the policy believed it had avoided.
 
 ### Zero-benefit pruning
 
@@ -275,12 +334,12 @@ the finished sidecars at wrap time rather than through a propagation case:
 
 `pin_table` performs batch-granular narrowing when the feature is enabled:
 
-1. Decode one cache chunk at the native type.
-2. Capture zone-map statistics from that native table when zone-map pruning is enabled.
-3. Compute exact numeric min/max for each eligible column.
+1. Decode one cache chunk at its unnarrowed reader type.
+2. Capture zone-map statistics from that unnarrowed table when zone-map pruning is enabled.
+3. Compute exact min/max in each eligible column's narrowing representation.
 4. Cast to the narrowest exact carrier.
-5. Record the chunk's stored-column metadata: each column's actual carrier plus whether it is
-   narrower than the native mapping (`pinned_column_storage_meta`).
+5. Record the chunk's stored-column metadata: its pin-time native mapping, actual carrier, and
+   whether that carrier is narrower (`pinned_column_storage_meta`).
 6. Hand the chunk to the tier sink, which compresses it with Simpatico when the pin resolved a
    compression plan and the batch qualifies, and otherwise stores the GPU table or converts it to
    pinned host memory.
@@ -304,7 +363,7 @@ it does not rewrite an existing cache entry:
 - pinning with the option off stores native carriers, and a later flag-on query installs no narrow
   targets for them — cached native columns are never narrowed at serve time; re-pin with the option
   on to obtain narrowing;
-- pinning with the option on and querying with it off restores cached numeric carriers to the native
+- pinning with the option on and querying with it off restores cached narrow carriers to the native
   logical schema;
 - a per-resident-input marker records whether scan normalization will actually cast the served
   columns. It survives setting changes and drives reservation independently of the current flag.
@@ -394,25 +453,33 @@ of a fixed total width) on an integer column narrowed to a different width still
 batch's compression, which latches compression off for the remainder of the pin — the pin falls
 back to uncompressed narrow chunks from that batch onward, markers intact and results correct. The
 WARN names the columns this pin narrowed before compression and states that whole-pin blast
-radius. Shipped TPC-H plans use bitextract only for float columns, which never narrow.
+radius.
+
+`DATE` widened the exposure here. Codegen carries `TIMESTAMP_DAYS` as a 4-byte element while a
+narrowed date column is 1 or 2 bytes; the shipped TPC-H dates select 2. A width-explicit op authored
+against a date column therefore latches compression off for the whole pin. The shipped TPC-H plans
+are safe — they use bitextract only on float columns, which never narrow, and give every date
+column plain `bitpack` — but an externally-authored plan no longer stays safe just by avoiding the
+float columns.
 
 ### Stored-column metadata, not storage introspection
 
-Every pin records a chunk-major `column_storage` matrix (`pinned_column_storage_meta` = carrier +
-narrowed flag) at the moment of storage: for an uncompressed chunk the carrier is the stored
-column's actual cuDF type, for a compressed chunk it is the type `compress_with_plan` received —
-by the round-trip contract also the type decompression reproduces. The plan-time folds
-(`pinned_column_narrowed_in_all_chunks`, `pinned_column_narrow_carrier`) and the serve-time
-restore sizing are pure reads of this matrix; no consumer opens storage, so compressed blobs need
-no introspection API and every storage form on both tiers answers identically. Insertion requires
-the matrix: every pin path is driven by the pin driver, which records the metadata as it stores
-each chunk, so a matrix that does not cover every chunk and column is a recorder bug and throws.
-One validator, `validate_recorded_column_storage`, serves all three inserts; each supplies a
-callable answering "the stored type at (chunk, column), or nothing when the form is opaque", which
-collapses the per-form differences to a single rule — a cell storage can report must equal the
-recorded carrier, a cell it cannot report is trusted. A matrix whose shape disagrees with the
-storage throws at serving validation, which still accepts the empty matrix because a zero-chunk
-entry legitimately records nothing.
+Every pin records a chunk-major `column_storage` matrix. Each `pinned_column_storage_meta` cell
+contains the pin-time native mapping, actual carrier, and narrowing marker. The native mapping is
+derived from the declared logical type before narrowing; the decoded type is the fallback when no
+declared mapping is available. For an uncompressed chunk the carrier is the stored column's actual
+cuDF type. For a compressed chunk it is the type `compress_with_plan` received and, by the
+round-trip contract, the type decompression reproduces.
+
+The plan-time folds (`pinned_column_narrowed_in_all_chunks`,
+`pinned_column_narrow_carrier`), DuckDB native-type cache guard, and serve-time restore sizing are
+pure reads of this matrix. No consumer opens storage, so compressed blobs need no introspection API
+and every storage form on both tiers answers identically. Insertion requires the matrix: a shape
+that does not cover every chunk and column is a recorder bug and throws. One validator,
+`validate_recorded_column_storage`, serves all three inserts; each supplies a callable answering
+"the stored type at (chunk, column), or nothing when the form is opaque". A reportable stored type
+must equal the recorded carrier; opaque storage is trusted. A matrix whose shape disagrees with
+storage throws at serving validation. The empty matrix remains valid for a zero-chunk entry.
 
 ### Trust boundary
 
@@ -426,7 +493,9 @@ the scan operator — which is exactly where `normalize_physical_schema` already
 cast. With a sidecar installed, a decompressed carrier that is neither a same-family widening of
 nor a verified narrowing to the plan target throws `internal_exception`, surfaced per engine
 policy as CPU fallback. A width surprise cannot slip through as a silent reinterpretation, because
-normalization compares `cudf::data_type`s and never reinterprets a buffer as another type.
+normalization compares `cudf::data_type`s and never re-tags an unexpected carrier. The sole
+intentional representation change is the provenance-validated DATE narrowing or restoration
+tunnel.
 
 ### Accounting per chunk form
 
@@ -464,7 +533,10 @@ basis unchanged.
 
 1. SQL logical types never change.
 2. DECIMAL scale never changes during a physical carrier conversion.
-3. Signed and unsigned integer families never cross.
+3. A carrier conversion never leaves the value's semantic domain. The four domains — signed
+   integers, unsigned integers, fixed-point at one scale, and `DATE` epoch days — are disjoint;
+   width is then chosen inside that domain's cuDF device storage family, which is why `DATE`
+   narrows to `INT16` and restores to `TIMESTAMP_DAYS`.
 4. A downcast is allowed only when the target is strictly narrower and every materialized value fits.
 5. A restore is allowed only when it is a same-family widening with matching DECIMAL scale.
 6. Plan targets derive from pin-time exact carriers; exact materialized min/max still verifies any
@@ -473,13 +545,35 @@ basis unchanged.
 8. Join keys, dynamic-filter keys, unsupported boundaries, and final results are native.
 9. A nonempty physical sidecar describes the complete output schema.
 10. Feature-off fresh scans without a sidecar retain their existing path.
+11. A carrier does not identify its domain. An `INT16` may carry an `INTEGER`, a `BIGINT`, or a
+    `DATE`. Any predicate that pairs two carriers, or a carrier and a literal, must also compare
+    the logical types' domains.
+12. The DATE representation tunnel is an internal physical carrier operation, not a logical cast.
+    Planner-inserted AST restores carry explicit provenance; translated semantic temporal-numeric
+    casts are rejected before GPU planning. Other conversions use cuDF semantics.
+13. A planned narrow target requires the recorded pin-time native mapping to match the scan's
+    current native mapping. DuckDB serving applies the same check to every projected cached column
+    and treats a mismatch as a clean cache miss.
 
 ## Validation and measurement
 
 Current boundary tests cover signed, unsigned, and decimal carrier selection, strict no-reduction
-cases, invalid ranges, family mismatches, and decimal scale mismatches. Integration tests compare
-GPU and CPU results for a non-key decimal payload used both as a direct projection and in
-arithmetic, and discriminate the residency-gate states through the observability counters: beside
+cases, invalid ranges, family mismatches, and decimal scale mismatches. The `DATE` arm adds three
+of its own: selection taken through the int32 representation, the `INT32` no-reduction case, and
+the domain guard that keeps epoch days from pairing with a plain integer sitting on the same
+carrier. Because the tunnel is the only path a `DATE` carrier conversion can take, its coverage
+must also pin the casts that must *not* tunnel — `DATE` → `TIMESTAMP` and `TIMESTAMP` → `DATE`
+round trips, which stay ordinary `cudf::cast` calls.
+
+Semantic-cast regressions verify that DATE/integer and other temporal-numeric casts are declined at
+GPU plan time, reproduce DuckDB results or errors through CPU fallback, and never enter the carrier
+tunnel. Pin-type regressions drop and recreate DuckDB tables under different projected native
+types and verify clean cache misses on both tiers, including a query-time feature-off path; a
+matching-type control verifies that an unchanged pin still serves.
+
+Integration tests compare GPU and CPU results for a non-key decimal payload used both as a direct
+projection and in arithmetic, and discriminate the residency-gate states through the
+observability counters: beside
 the serve-time scan-downcast and scan-restore counters there is a plan-time
 `scan_sidecars_installed` counter, counting table scans that received a narrow physical sidecar
 after the residency gate (a later pass may still clear or prune it), a plan-time
@@ -494,6 +588,17 @@ source-statistics availability: a two-part pinned-narrow table installs the side
 the assertions distinguish GPU-tier policy retraction and restoration from HOST-tier service with
 no normalization cast. Use unpinned feature-off and feature-on runs as a control: apart from the
 plan-time cache probe, both take the native scan path when no matching pinned narrow data exists.
+
+`DATE` gets its own gate fixture, because every restore boundary is a place a non-tunnelling
+conversion would throw rather than answer wrongly. It covers pin-time narrowing attributed to a
+single `DATE` column (the flag-off pin is the contrast); a narrow `DATE` group key that survives
+`GROUP BY` and is restored at the `ORDER BY` boundary, with the serve asserted cast-free so the
+restore provably happens above the scan; a column-versus-column `DATE` predicate over a shared
+carrier; a `DATE` equality join, whose keys restore below the join; and a restore-only `DATE`
+column, whose resident chunks widen inside scan normalization on both tiers — retracted by the
+tier policy on GPU tier, folded back into the scan by `prune_immediate_scan_restores` on host
+tier, which is why the retraction counter, not the restore counter, is what separates them.
+Nulls run through all of it, since the validity mask has to survive the buffer re-tag.
 
 Performance comparisons must use the same binary and otherwise identical configurations. Run the
 full TPC-H suite with the feature off and on for both unpinned and host-pinned modes; report warm
