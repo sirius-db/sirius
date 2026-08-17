@@ -317,7 +317,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         // disk-native path is MVCC-blind, and the pin's checkpoint suppression
         // makes its snapshot increasingly stale — so scans the pin cannot serve
         // never fall through to it.
-        auto const n_cache = pinned->mvcc->n_cache();
+
         // (a) snapshot-too-old: this transaction opened before the pin, so
         // the cache's base image is from its future.
         auto const start_time =
@@ -341,25 +341,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
             "transaction-local inserts are not served from the cache",
             table.name);
         }
-        // (b') the insert delta does not serve ARRAY columns, so decline
-        // while rows beyond the pinned prefix exist. Rows inserted after
-        // this check are caught by the capture's own ARRAY check.
-        if (static_cast<std::size_t>(storage.GetTotalRows()) > n_cache) {
-          for (auto const& col_idx : column_ids) {
-            if (!col_idx.HasPrimaryIndex() || col_idx.IsRowIdColumn() ||
-                col_idx.IsVirtualColumn() || col_idx.IsEmptyColumn()) {
-              continue;
-            }
-            auto const primary = col_idx.GetPrimaryIndex();
-            if (primary < op.returned_types.size() &&
-                op.returned_types[primary].id() == duckdb::LogicalTypeId::ARRAY) {
-              throw duckdb::NotImplementedException(
-                "duckdb-native scan: table '%s' has rows beyond the pinned prefix and an ARRAY "
-                "projection; the insert delta does not serve ARRAY columns",
-                table.name);
-            }
-          }
-        }
         bool pin_serves = !has_unservable_column;
         if (pin_serves && !column_ids.empty()) {
           pin_serves = !pinned->cache_info.column_projection_for(column_ids).empty();
@@ -380,6 +361,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         // relaxation. The update-chain branch is redundant because UPDATE
         // statements on pinned tables are rejected before execution; direct
         // UPDATE serving remains out of scope here (#1162).
+        auto const n_cache = pinned->mvcc->n_cache();
         std::vector<duckdb::storage_t> projected;
         for (auto const& col_idx : column_ids) {
           if (col_idx.HasPrimaryIndex() && !col_idx.IsRowIdColumn() &&

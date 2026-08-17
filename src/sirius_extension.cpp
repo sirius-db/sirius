@@ -1018,22 +1018,27 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
   auto schema_names   = columns.GetColumnNames();  // logical order
   auto schema_types   = columns.GetColumnTypes();  // logical order
 
-  auto keep = resolve_pin_kept_indices(schema_names, cols);
-  // ARRAY pins are unsupported: appended ARRAY rows live in the array-validity
-  // and child segment trees, which the uncheckpointed-append guard below does
-  // not walk, so a committed post-pin append would slip past the pin contract
-  // and only fail later, deep in metadata decoding. Refuse up front, before
-  // checkpoint suppression or any other pin side effect.
+  auto keep            = resolve_pin_kept_indices(schema_names, cols);
+  auto const canonical = storage.GetAttached().GetStorageManager().GetDBPath();
+
+  // Fixed-size ARRAY columns pin only when their child is a fixed-width scalar.
+  // DuckDB stores such a child as a flat StandardColumnData the delta and decoder
+  // paths can stage. A varchar or nested child (VARCHAR[N], ARRAY of ARRAY/STRUCT)
+  // has no such path, and a varchar child passes the StandardColumnData cast that
+  // would stage zero-byte descriptors. Decline it up front so the error names the
+  // column instead of surfacing deep in metadata decoding.
   for (auto col : keep) {
-    if (schema_types[col].id() == LogicalTypeId::ARRAY) {
+    auto const type = sirius::from_duckdb(schema_types[col]);
+    if (type.is_array() && !type.array_child().is_fixed_width()) {
       throw InvalidInputException(
-        "pin_table: column '%s' of table '%s' has ARRAY type, which duckdb-native pins do not "
-        "support; pin a column subset without it (cols=[...])",
+        "pin_table: column '%s' of table '%s' is an ARRAY with a %s child, which duckdb-native "
+        "pins do not support (only fixed-width scalar children); pin a column subset without it "
+        "(cols=[...])",
         schema_names[col],
-        table_ref);
+        table_ref,
+        type.array_child().to_string());
     }
   }
-  auto const canonical = storage.GetAttached().GetStorageManager().GetDBPath();
 
   // Update chains version values in place, invisibly to the DELETE
   // keep-masks — a pin would serve stale values to every query until the

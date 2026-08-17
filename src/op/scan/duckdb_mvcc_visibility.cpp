@@ -22,11 +22,13 @@
 #include <duckdb/common/vector_size.hpp>
 #include <duckdb/function/partition_stats.hpp>
 #include <duckdb/storage/data_table.hpp>
+#include <duckdb/storage/table/array_column_data.hpp>
 #include <duckdb/storage/table/column_data.hpp>
 #include <duckdb/storage/table/column_segment.hpp>
 #include <duckdb/storage/table/row_group.hpp>
 #include <duckdb/storage/table/row_group_collection.hpp>
 #include <duckdb/storage/table/row_group_segment_tree.hpp>
+#include <duckdb/storage/table/validity_column_data.hpp>
 #include <duckdb/transaction/duck_transaction.hpp>
 #include <op/scan/duckdb_mvcc_visibility.hpp>
 
@@ -243,6 +245,48 @@ bool any_update_chains(duckdb::DataTable& storage,
   return false;
 }
 
+namespace {
+
+// Grants access to ArrayColumnData's protected child/validity members.
+struct array_column_access : duckdb::ArrayColumnData {
+  static duckdb::ColumnData* get_child(duckdb::ArrayColumnData& a)
+  {
+    return static_cast<array_column_access&>(a).child_column.get();
+  }
+  static duckdb::ValidityColumnData* get_validity(duckdb::ArrayColumnData& a)
+  {
+    return static_cast<array_column_access&>(a).validity.get();
+  }
+};
+
+// True if any segment in the tree is a transient (uncheckpointed) append.
+bool tree_has_transient_segment(duckdb::ColumnSegmentTree& tree)
+{
+  for (auto& seg_node : tree.SegmentNodes()) {
+    if (seg_node.GetNode().segment_type == duckdb::ColumnSegmentType::TRANSIENT) { return true; }
+  }
+  return false;
+}
+
+// True if the column carries an uncheckpointed append. A fixed-size ARRAY keeps
+// appended rows in its array-level validity tree and its child column tree, not
+// the parent tree, so those two trees have to be checked as well.
+bool column_has_transient_append(duckdb::ColumnData& col_data)
+{
+  if (tree_has_transient_segment(col_data.GetSegmentTree())) { return true; }
+  auto* array_col = dynamic_cast<duckdb::ArrayColumnData*>(&col_data);
+  if (array_col == nullptr) { return false; }
+  if (auto* validity = array_column_access::get_validity(*array_col)) {
+    if (tree_has_transient_segment(validity->GetSegmentTree())) { return true; }
+  }
+  if (auto* child = array_column_access::get_child(*array_col)) {
+    if (tree_has_transient_segment(child->GetSegmentTree())) { return true; }
+  }
+  return false;
+}
+
+}  // namespace
+
 bool any_uncheckpointed_appends(duckdb::DataTable& storage,
                                 std::span<duckdb::storage_t const> storage_column_indices)
 {
@@ -253,11 +297,7 @@ bool any_uncheckpointed_appends(duckdb::DataTable& storage,
     if (!node) { return false; }
     auto& rg = node->GetNode();
     for (auto col : storage_column_indices) {
-      for (auto& seg_node : rg.GetRawColumnData(col).GetSegmentTree().SegmentNodes()) {
-        if (seg_node.GetNode().segment_type == duckdb::ColumnSegmentType::TRANSIENT) {
-          return true;
-        }
-      }
+      if (column_has_transient_append(rg.GetRawColumnData(col))) { return true; }
     }
   }
 }
