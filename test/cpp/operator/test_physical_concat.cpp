@@ -819,6 +819,120 @@ TEST_CASE("sirius_physical_concat with concat_all defers all batches until pipel
   REQUIRE(concat_op.get_next_task_input_data() == nullptr);
 }
 
+TEST_CASE("sirius_physical_concat pulls from a later partition when earlier ones are not ready",
+          "[physical_concat]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space != nullptr);
+
+  constexpr uint64_t threshold = 1024;  // 1 KB
+
+  auto fixture = create_test_hash_join(duckdb::JoinType::INNER, {duckdb::LogicalType::INTEGER});
+  sirius_physical_concat concat_op(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    1000,
+    fixture.hash_join.get(),
+    false,
+    threshold);
+
+  auto repo   = std::make_unique<cucascade::shared_data_repository>();
+  auto source = create_unfinished_source_pipeline();
+  attach_concat_port(concat_op, *repo, source.pipeline);
+
+  // Partition 0 holds a lone under-threshold batch: no group is ready there.
+  auto p0_batch    = make_int32_batch(*space, 100);
+  const auto p0_id = p0_batch->get_batch_id();
+  repo->add_data_batch(std::move(p0_batch), 0);
+
+  // Partition 1 holds three 400-byte batches: the third crosses the threshold, so the first two
+  // form a ready group.
+  std::vector<uint64_t> p1_ids;
+  for (int i = 0; i < 3; ++i) {
+    auto batch = make_int32_batch(*space, 100);
+    p1_ids.push_back(batch->get_batch_id());
+    repo->add_data_batch(std::move(batch), 1);
+  }
+
+  auto ready_hint = concat_op.get_next_task_hint();
+  REQUIRE(ready_hint.has_value());
+  REQUIRE(ready_hint->hint == TaskCreationHint::READY);
+  REQUIRE(ready_hint->producer == &concat_op);
+
+  // The pull must skip the not-ready partition 0 and release partition 1's group.
+  auto group = concat_op.get_next_task_input_data();
+  REQUIRE(group != nullptr);
+  const auto& group_data = dynamic_cast<const partitioned_operator_data&>(*group);
+  REQUIRE(group_data.get_partition_idx() == 1);
+  const auto& group_batches = group_data.get_data_batches();
+  REQUIRE(group_batches.size() == 2);
+  REQUIRE(group_batches[0]->get_batch_id() == p1_ids[0]);
+  REQUIRE(group_batches[1]->get_batch_id() == p1_ids[1]);
+
+  // Both partitions now hold under-threshold tails: nothing further until the source finishes.
+  REQUIRE(concat_op.get_next_task_input_data() == nullptr);
+  REQUIRE(repo->get_batch_ids(0) == std::vector<uint64_t>{p0_id});
+  REQUIRE(repo->get_batch_ids(1) == std::vector<uint64_t>{p1_ids[2]});
+
+  // Pipeline finish flushes the tails in partition order.
+  source.pipeline->set_finished(true);
+  auto tail0 = concat_op.get_next_task_input_data();
+  REQUIRE(tail0 != nullptr);
+  REQUIRE(dynamic_cast<const partitioned_operator_data&>(*tail0).get_partition_idx() == 0);
+  auto tail1 = concat_op.get_next_task_input_data();
+  REQUIRE(tail1 != nullptr);
+  REQUIRE(dynamic_cast<const partitioned_operator_data&>(*tail1).get_partition_idx() == 1);
+  REQUIRE(concat_op.get_next_task_input_data() == nullptr);
+}
+
+TEST_CASE("sirius_physical_concat keeps a batch exactly at the threshold in its group",
+          "[physical_concat]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space != nullptr);
+
+  // Size the threshold to exactly match one batch: the strict '>' comparison keeps that batch in
+  // the accumulating group instead of overflowing on its own.
+  auto exact_batch         = make_int32_batch(*space, 256);
+  const auto exact_id      = exact_batch->get_batch_id();
+  const uint64_t threshold = exact_batch->to_read_only().get_data()->get_size_in_bytes();
+
+  auto fixture = create_test_hash_join(duckdb::JoinType::INNER, {duckdb::LogicalType::INTEGER});
+  sirius_physical_concat concat_op(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    1000,
+    fixture.hash_join.get(),
+    false,
+    threshold);
+
+  auto repo   = std::make_unique<cucascade::shared_data_repository>();
+  auto source = create_unfinished_source_pipeline();
+  attach_concat_port(concat_op, *repo, source.pipeline);
+  repo->add_data_batch(std::move(exact_batch), 0);
+
+  // Exactly at the threshold is not over it: the batch keeps accumulating.
+  REQUIRE(concat_op.get_next_task_input_data() == nullptr);
+  auto waiting_hint = concat_op.get_next_task_hint();
+  REQUIRE(waiting_hint.has_value());
+  REQUIRE(waiting_hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+
+  // The next batch overflows the group, releasing the exact-threshold batch alone.
+  auto follower          = make_int32_batch(*space, 100);
+  const auto follower_id = follower->get_batch_id();
+  repo->add_data_batch(std::move(follower), 0);
+
+  auto ready_hint = concat_op.get_next_task_hint();
+  REQUIRE(ready_hint.has_value());
+  REQUIRE(ready_hint->hint == TaskCreationHint::READY);
+
+  auto group = concat_op.get_next_task_input_data();
+  REQUIRE(group != nullptr);
+  const auto& group_batches =
+    dynamic_cast<const pipelineable_operator_data&>(*group).get_data_batches();
+  REQUIRE(group_batches.size() == 1);
+  REQUIRE(group_batches[0]->get_batch_id() == exact_id);
+  REQUIRE(repo->get_batch_ids(0) == std::vector<uint64_t>{follower_id});
+}
+
 //===----------------------------------------------------------------------===//
 // 3. Constructor tests
 //===----------------------------------------------------------------------===//
