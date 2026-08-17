@@ -51,6 +51,17 @@
 
 namespace sirius::late_mat {
 
+/// The column type riding at each deferred position: pin-order ids are global,
+/// so they are 64-bit (lineitem at sf1000 is past 2^32 rows), and the
+/// placeholders are the narrowest thing that keeps a position occupied.
+inline constexpr cudf::type_id kRowidType = cudf::type_id::UINT64;
+/// The same id, half the ride, for a pinned table whose rows fit 32 bits — which
+/// is every TPC-H table but lineitem at SF1000. The width is decided per
+/// deferral (the pin's row count is known where a pair is built) and carried on
+/// BOTH halves, because the scan side writes it and the port side reads it, and
+/// a disagreement is a batch nobody materializes.
+inline constexpr cudf::type_id kNarrowRowidType = cudf::type_id::UINT32;
+
 /// Stamped on the producing scan: emit these output positions as a rowid and
 /// placeholders instead of their values.
 ///
@@ -59,6 +70,8 @@ namespace sirius::late_mat {
 /// positions after them do not move.
 struct deferred_scan_output {
   std::vector<std::size_t> output_positions;
+  /// What the rowid rides as; see kNarrowRowidType.
+  cudf::type_id rowid_type = kRowidType;
 
   [[nodiscard]] bool empty() const noexcept { return output_positions.empty(); }
   /// Where the rowid rides. Only meaningful when non-empty.
@@ -66,10 +79,6 @@ struct deferred_scan_output {
   [[nodiscard]] bool defers(std::size_t position) const noexcept;
 };
 
-/// The column type riding at each deferred position: pin-order ids are global,
-/// so they are 64-bit (lineitem at sf1000 is past 2^32 rows), and the
-/// placeholders are the narrowest thing that keeps a position occupied.
-inline constexpr cudf::type_id kRowidType       = cudf::type_id::UINT64;
 inline constexpr cudf::type_id kPlaceholderType = cudf::type_id::INT8;
 
 /// Stamped on the consuming operator: turn the rowid back into columns.
@@ -85,9 +94,36 @@ inline constexpr cudf::type_id kPlaceholderType = cudf::type_id::INT8;
 /// their own schema and their own positions; only the origins are shared. Using
 /// the scan's schema at the port matches no batch at all if you are lucky, and
 /// matches the wrong one if you are not.
+/// One additional pinned origin materializing at the same port as the primary
+/// bundle — a RIDER.
+///
+/// Two scans can ride to one consumer when the consumer is a group-by whose
+/// groups are already pinned down by a proven-unique key (see
+/// planner::group_key_extension). q10 is the shape: `customer`'s five wide
+/// columns ride as one rowid, and `nation`'s `n_name` — a group key of the same
+/// aggregates — rides as a second. Each rider carries its own rowid column at
+/// its own port position and its own origins, because the two bundles come from
+/// DIFFERENT pinned tables and a rowid means nothing outside the table it
+/// indexes.
+struct rider_bundle {
+  /// Positions to restore, ascending, in the PORT's coordinates.
+  std::vector<std::size_t> output_positions;
+  /// Where this rider's rowid rides at the port; one of output_positions.
+  std::size_t rowid_at = 0;
+  /// Where each restored column comes from, parallel to output_positions.
+  std::vector<column_origin> origins;
+  /// The dtype each restored column must come back as, parallel likewise.
+  std::vector<cudf::data_type> restored_types;
+  /// What this rider's rowid rides as — its own pinned table's row count
+  /// decides it, so it need not match the primary bundle's.
+  cudf::type_id rowid_type = kRowidType;
+};
+
 struct port_materialize_directive {
   /// The schema this directive expects — the batch AT THE PORT, with the
-  /// deferred positions already swapped to rowid/placeholder types.
+  /// deferred positions already swapped to rowid/placeholder types. Covers the
+  /// primary bundle AND every rider, since all of them are substituted in the
+  /// batch that arrives.
   std::vector<cudf::data_type> expected_schema;
   /// Positions to restore, ascending, in the PORT's coordinates.
   std::vector<std::size_t> output_positions;
@@ -99,6 +135,12 @@ struct port_materialize_directive {
   std::vector<column_origin> origins;
   /// The dtype each restored column must come back as, parallel likewise.
   std::vector<cudf::data_type> restored_types;
+  /// What the rowid rides as; see kNarrowRowidType. Must match what the scan
+  /// half writes — @ref valid checks the expected schema against it.
+  cudf::type_id rowid_type = kRowidType;
+  /// Bundles from OTHER pinned tables materializing at this same port; see
+  /// @ref rider_bundle. Empty in the ordinary single-origin case.
+  std::vector<rider_bundle> riders;
 
   [[nodiscard]] bool empty() const noexcept { return output_positions.empty(); }
   [[nodiscard]] std::size_t rowid_position() const { return rowid_at; }
@@ -150,6 +192,7 @@ struct defer_pair {
                                          std::vector<std::size_t> const& scan_positions,
                                          std::vector<cudf::data_type> const& port_schema,
                                          std::vector<std::size_t> const& port_positions,
-                                         std::vector<column_origin> const& origins);
+                                         std::vector<column_origin> const& origins,
+                                         cudf::type_id rowid_type = kRowidType);
 
 }  // namespace sirius::late_mat

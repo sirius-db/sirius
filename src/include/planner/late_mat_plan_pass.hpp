@@ -53,6 +53,37 @@ class sirius_physical_operator;
 
 namespace sirius::planner {
 
+/// The ride a column could take PAST the group-bys it is a key of.
+///
+/// A group-by reads its keys, so the sound stop for a deferred key is the
+/// aggregate's input — and that is what @ref column_lifetime still reports.
+/// But if the deferred keys are functionally determined by a key that is unique
+/// over the pinned table, grouping by the ROWID yields exactly the groups
+/// grouping by the values would: every row of a group carries one and the same
+/// rowid. The ride may then continue past the aggregate and materialize at its
+/// far end — one row per group instead of one per join match, which on q10 is
+/// ~150k rows instead of tens of millions.
+///
+/// THIS STRUCT ASSERTS NOTHING ABOUT THAT BIJECTION. The walk cannot see the
+/// pinned entry's uniqueness facts, so it only reports where the ride WOULD end
+/// and which aggregates it passed; whoever holds the facts admits or refuses it
+/// (and on a refusal the conservative stop is still there, unchanged).
+struct group_key_ride {
+  /// The group-bys ridden, in ride order. A ride is only admissible if the
+  /// proven-unique key is a planned group key at every one of them.
+  std::vector<op::sirius_physical_operator const*> group_bys;
+  /// Where the ride actually ends: the first operator to read the column's
+  /// content past the aggregates, or nullptr when it reaches the plan's top.
+  op::sirius_physical_operator const* reader       = nullptr;
+  std::size_t position_at_reader                   = 0;
+  op::sirius_physical_operator const* reader_input = nullptr;
+  int port_crossings                               = 0;
+  bool nullified_on_ride                           = false;
+  /// Something past the aggregates compares this column as a join key — the
+  /// extension is void (the conservative stop still stands).
+  bool read_as_join_key = false;
+};
+
 /// Where one scan output column stops being merely carried.
 struct column_lifetime {
   std::size_t scan_output_position = 0;
@@ -90,6 +121,17 @@ struct column_lifetime {
   /// partition has already hashed. This is the walk's one silent-wrong-answer
   /// shape; every other refusal merely costs a deferral.
   bool read_as_join_key = false;
+  /// Every group-by this column is a planned KEY of, in ride order — recorded
+  /// whatever else reads it, and so present even for a column that stopped long
+  /// before (a join key, say). That is the point: a column riding REAL is the
+  /// one whose pin-time uniqueness can admit ANOTHER column's ride, and the
+  /// proof has to hold at every aggregate that ride crosses.
+  std::vector<op::sirius_physical_operator const*> group_key_at;
+  /// Present when the column rode at least one group-by AS A KEY: the fields
+  /// above then describe the sound stop at the first such aggregate, and this
+  /// describes the longer ride that the pin-uniqueness bijection would unlock.
+  /// See @ref group_key_ride — reported, never assumed.
+  std::optional<group_key_ride> group_ride;
 };
 
 /// Where a column entering an INNER hash join from one side lands in its
@@ -141,6 +183,33 @@ struct column_lifetime {
 [[nodiscard]] std::vector<column_lifetime> analyze_column_lifetimes(
   op::sirius_physical_operator const& scan);
 
+/// The longer ride the installed bundle could take, past the group-bys it is a
+/// key of — reported alongside the sound plan, never in place of it.
+///
+/// Emitted only when EVERY column of the bundle rode as a group key through the
+/// SAME chain of aggregates to the SAME reader, none of them nullified and none
+/// read as a join key. Whoever holds the pin-time uniqueness facts then admits
+/// it (by proving one of @ref unique_key_candidates distinct over the pinned
+/// table) or refuses it — and on a refusal the bundle installs at
+/// @ref planned_deferral::port exactly as it would have.
+struct group_key_extension {
+  /// The aggregates ridden, in ride order. The proof has to hold at every one:
+  /// a key that stops being a group key half way up stops determining the rows.
+  std::vector<op::sirius_physical_operator const*> group_bys;
+  /// Where the bundle would materialize instead — one row per group.
+  op::sirius_physical_operator* port = nullptr;
+  /// Where each deferred column arrives there, parallel to
+  /// @ref planned_deferral::positions.
+  std::vector<std::size_t> port_positions;
+  op::sirius_physical_operator const* port_input = nullptr;
+  int boundaries                                 = 0;
+  /// Scan output positions that ride REAL (are not in the bundle) and are group
+  /// keys at every aggregate in @ref group_bys. One of these being unique over
+  /// the pinned table is what makes grouping by the rowid the same grouping —
+  /// the pass cannot know which, so it reports all of them.
+  std::vector<std::size_t> unique_key_candidates;
+};
+
 /// The one deferral a scan would install, and the census of everything weighed.
 ///
 /// ONE BUNDLE PER SCAN. The substituted output carries a single rowid, so two
@@ -177,6 +246,9 @@ struct planned_deferral {
   /// a key riding as a rowid would scatter equal values across partitions and
   /// the join would miss matches. See column_lifetime::read_as_join_key.
   std::size_t join_keys_skipped = 0;
+  /// The group-by-rowid extension of this bundle, when the walk found one. See
+  /// @ref group_key_extension: reported, not admitted.
+  std::optional<group_key_extension> group_extension;
 
   [[nodiscard]] bool installable() const noexcept { return port != nullptr && !positions.empty(); }
 };
@@ -194,6 +266,24 @@ struct planned_deferral {
 /// Fails (changing nothing) on an invalid pair, or when either operator already
 /// carries a half — a second deferral through the same port would materialize
 /// against a schema the first one has already rewritten.
+/// Attach a RIDER to a port that already carries a deferral.
+///
+/// The rider is a second pinned table's bundle materializing at the same
+/// consumer — q10's `nation` beside `customer`. Only the group-by-rowid ride
+/// makes this admissible, and only the caller can know that, so this checks
+/// only what it can see: the port must already hold a primary, the rider's
+/// positions must not collide with anything already claimed, and the merged
+/// directive must still be valid. On any of those it changes NOTHING — a
+/// half-attached rider is a scan that threw its values away with no consumer
+/// to put them back.
+///
+/// @p pair is built exactly as for a primary install (the rider's own scan
+/// schema, its own port positions), against a port schema that already carries
+/// the primary's substitutions.
+bool install_rider(op::sirius_physical_operator& scan,
+                   op::sirius_physical_operator& port,
+                   late_mat::defer_pair pair);
+
 bool install_deferral(op::sirius_physical_operator& scan,
                       op::sirius_physical_operator& port,
                       late_mat::defer_pair pair);

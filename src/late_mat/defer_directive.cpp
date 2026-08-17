@@ -60,6 +60,12 @@ bool port_materialize_directive::valid() const
     return false;
   }
 
+  // Every position any bundle claims, so no two bundles can restore the same
+  // column — the second write would silently win, with values from the wrong
+  // pinned table.
+  std::vector<std::size_t> claimed;
+  claimed.reserve(output_positions.size());
+
   for (std::size_t i = 0; i < output_positions.size(); ++i) {
     auto const pos = output_positions[i];
     if (pos >= expected_schema.size()) { return false; }
@@ -67,9 +73,30 @@ bool port_materialize_directive::valid() const
     if (i > 0 && pos <= output_positions[i - 1]) { return false; }
     // The schema has to carry what the scan side substituted, or the two halves
     // disagree about what is riding where.
-    auto const want = (pos == rowid_at) ? kRowidType : kPlaceholderType;
+    auto const want = (pos == rowid_at) ? rowid_type : kPlaceholderType;
     if (expected_schema[pos].id() != want) { return false; }
     if (!origins[i].has_origin()) { return false; }
+    claimed.push_back(pos);
+  }
+
+  for (auto const& rider : riders) {
+    if (rider.output_positions.empty()) { return false; }
+    if (rider.output_positions.size() != rider.origins.size()) { return false; }
+    if (rider.output_positions.size() != rider.restored_types.size()) { return false; }
+    if (std::find(rider.output_positions.begin(), rider.output_positions.end(), rider.rowid_at) ==
+        rider.output_positions.end()) {
+      return false;
+    }
+    for (std::size_t i = 0; i < rider.output_positions.size(); ++i) {
+      auto const pos = rider.output_positions[i];
+      if (pos >= expected_schema.size()) { return false; }
+      if (i > 0 && pos <= rider.output_positions[i - 1]) { return false; }
+      if (std::find(claimed.begin(), claimed.end(), pos) != claimed.end()) { return false; }
+      auto const want = (pos == rider.rowid_at) ? rider.rowid_type : kPlaceholderType;
+      if (expected_schema[pos].id() != want) { return false; }
+      if (!rider.origins[i].has_origin()) { return false; }
+      claimed.push_back(pos);
+    }
   }
   return true;
 }
@@ -86,9 +113,13 @@ defer_pair make_defer_pair(std::vector<cudf::data_type> const& scan_schema,
                            std::vector<std::size_t> const& scan_positions,
                            std::vector<cudf::data_type> const& port_schema,
                            std::vector<std::size_t> const& port_positions,
-                           std::vector<column_origin> const& origins)
+                           std::vector<column_origin> const& origins,
+                           cudf::type_id rowid_type)
 {
   defer_pair pair;
+  if (rowid_type != kRowidType && rowid_type != kNarrowRowidType) { return pair; }
+  pair.scan.rowid_type = rowid_type;
+  pair.port.rowid_type = rowid_type;
   if (scan_positions.empty() || scan_positions.size() != origins.size() ||
       scan_positions.size() != port_positions.size()) {
     return pair;
@@ -117,7 +148,7 @@ defer_pair make_defer_pair(std::vector<cudf::data_type> const& scan_schema,
     // The rowid rides at the FIRST deferred scan position; the rest become
     // placeholders, which exist only to keep the arity and the positions after
     // them where they were.
-    scan_substituted[scan_position] = cudf::data_type{(i == 0) ? kRowidType : kPlaceholderType};
+    scan_substituted[scan_position] = cudf::data_type{(i == 0) ? rowid_type : kPlaceholderType};
     columns.push_back(deferred_column{port_position, scan_schema[scan_position], origins[i]});
   }
 
@@ -127,7 +158,7 @@ defer_pair make_defer_pair(std::vector<cudf::data_type> const& scan_schema,
   auto port_substituted = port_schema;
   for (auto const& column : columns) {
     port_substituted[column.port_position] =
-      cudf::data_type{(column.port_position == pair.port.rowid_at) ? kRowidType : kPlaceholderType};
+      cudf::data_type{(column.port_position == pair.port.rowid_at) ? rowid_type : kPlaceholderType};
   }
 
   std::sort(columns.begin(), columns.end(), [](auto const& lhs, auto const& rhs) {

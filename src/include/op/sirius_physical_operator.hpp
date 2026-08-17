@@ -59,6 +59,10 @@ class sirius_meta_pipeline;
 namespace planner {
 class sirius_physical_plan_generator;
 //! The only writer of the two late-materialization halves; see `deferred_output()`.
+bool install_rider(op::sirius_physical_operator& scan,
+                   op::sirius_physical_operator& port,
+                   late_mat::defer_pair pair);
+
 bool install_deferral(op::sirius_physical_operator& scan,
                       op::sirius_physical_operator& port,
                       late_mat::defer_pair pair);
@@ -748,6 +752,12 @@ class sirius_physical_operator {
   friend bool ::sirius::planner::install_deferral(sirius_physical_operator&,
                                                   sirius_physical_operator&,
                                                   late_mat::defer_pair);
+  //! The same complete-or-absent contract for a rider joining an installed
+  //! ride: it writes the rider's scan half and the port's merged directive, or
+  //! neither.
+  friend bool ::sirius::planner::install_rider(sirius_physical_operator&,
+                                               sirius_physical_operator&,
+                                               late_mat::defer_pair);
 };
 
 }  // namespace op

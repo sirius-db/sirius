@@ -27,6 +27,7 @@
 #include "io/parquet_helpers.hpp"
 #include "io/rest/rest_ioctx.hpp"
 #include "io/sirius_datasource.hpp"
+#include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
 #include "memory/topology_index.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
@@ -72,9 +73,11 @@
 #include <duckdb/transaction/duck_transaction_manager.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -607,6 +610,117 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
   return schema;
 }
 
+/// Admit the plan's group-by-rowid extension, or refuse it with a reason.
+///
+/// The plan pass found a ride that continues past the aggregates and reported
+/// what it would take (@ref planner::group_key_extension). Everything checked
+/// here is what the pass could not see:
+///
+///  * THE PROOF. One of the candidate columns — riding real, a group key at
+///    every ridden aggregate — must be distinct across the whole pinned table.
+///    Then every row of a group carries one and the same rowid, so grouping by
+///    the rowid produces exactly the groups grouping by the values would.
+///    Without it the aggregate would group by a per-row id and every row would
+///    become its own group: wrong answers, not slow ones.
+///  * THE PIPELINES. The bundle materializes at a port, and a port is fed by a
+///    pipeline. Each hop from the aggregate's pipeline to the far consumer's
+///    must have exactly ONE next port, or a batch from some other producer
+///    could reach the port and be materialized against origins that do not
+///    describe it.
+///  * THE VOLUME. Optional floor on the first ridden aggregate's input; see
+///    late_mat::min_group_by_rowid_input_rows (inert by default).
+///
+/// @return the proving column's name when the ride is admitted.
+std::optional<std::string> admit_group_key_extension(
+  planner::planned_deferral const& planned,
+  pinned_entry const& entry,
+  std::span<std::size_t const> selected_columns,
+  std::function<void(std::string_view)> const& refuse)
+{
+  auto const& extension = *planned.group_extension;
+
+  auto const proven_name = [&](std::size_t position) -> std::optional<std::string> {
+    if (position >= selected_columns.size()) { return std::nullopt; }
+    auto const entry_position = selected_columns[position];
+    if (entry_position >= entry.proven_unique_columns.size() ||
+        !entry.proven_unique_columns[entry_position]) {
+      return std::nullopt;
+    }
+    return entry_position < entry.cache_info.names.size()
+             ? entry.cache_info.names[entry_position]
+             : ("entry column " + std::to_string(entry_position));
+  };
+
+  std::optional<std::string> proof;
+  for (auto const position : extension.unique_key_candidates) {
+    if ((proof = proven_name(position))) { break; }
+  }
+  // Failing that, a DEFERRED column can prove the ride itself. If one of the
+  // columns riding as a rowid is distinct over the pinned table, the rowid is a
+  // bijective relabelling of it — grouping by the id yields exactly the groups
+  // grouping by the value did — and the rest of the bundle comes from the same
+  // pinned row, so the id determines those too. q10's `nation` rides on this:
+  // `n_name` is unique across the 25 rows, and nothing else of `nation` is a
+  // group key that could carry the proof.
+  if (!proof.has_value()) {
+    for (auto const position : planned.positions) {
+      if ((proof = proven_name(position))) { break; }
+    }
+  }
+  if (!proof.has_value()) {
+    refuse(
+      "neither a group key riding real nor a deferred column is proven unique over the "
+      "pinned table");
+    return std::nullopt;
+  }
+
+  auto const floor = late_mat::min_group_by_rowid_input_rows();
+  if (floor > 0 && !extension.group_bys.empty()) {
+    auto const* first = extension.group_bys.front();
+    std::size_t const input_rows =
+      (first != nullptr && !first->children.empty() && first->children[0])
+        ? first->children[0]->estimated_cardinality
+        : 0;
+    if (input_rows > 0 && input_rows < floor) {
+      refuse("the first ridden aggregate reads fewer rows than the group-by-rowid floor");
+      return std::nullopt;
+    }
+  }
+
+  // Walk the pipelines from the sound port to the far one. The sound port is
+  // the first ridden aggregate's input, so its pipeline is where the bundle
+  // would otherwise have materialized.
+  if (planned.port == nullptr || extension.port == nullptr) {
+    refuse("the ride has no port to move");
+    return std::nullopt;
+  }
+  auto pipeline           = planned.port->get_pipeline();
+  auto const far_pipeline = extension.port->get_pipeline();
+  if (!pipeline || !far_pipeline) {
+    refuse("an operator on the ride has no pipeline");
+    return std::nullopt;
+  }
+  constexpr int kMaxHops = 16;
+  for (int hop = 0; hop < kMaxHops && pipeline.get() != far_pipeline.get(); ++hop) {
+    auto const next_ports = pipeline->get_next_ports_after_sink();
+    if (next_ports.size() != 1 || next_ports.front().next_operator == nullptr) {
+      refuse("a pipeline on the ride feeds more than one port");
+      return std::nullopt;
+    }
+    auto next = next_ports.front().next_operator->get_pipeline();
+    if (!next) {
+      refuse("an operator on the ride has no pipeline");
+      return std::nullopt;
+    }
+    pipeline = std::move(next);
+  }
+  if (pipeline.get() != far_pipeline.get()) {
+    refuse("the far consumer's pipeline is not reachable from the aggregate's");
+    return std::nullopt;
+  }
+  return proof;
+}
+
 /// Complete and install one pinned scan's deferral, or leave the plan alone and
 /// say why (env gate: SIRIUS_EXP_LATE_MAT).
 ///
@@ -626,16 +740,21 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
 /// filter breaks that only by compacting the batch during the decode --
 /// substitute_deferred_columns checks the row count and fails rather than
 /// addressing rows the batch no longer holds.
-void install_late_materialization(op::scan::sirius_gpu_scan_operator& scan_op,
+/// @return true when this scan is ADDRESSABLE (its batches carry pin-order
+///         origins) but installed no deferral of its own — the state in which
+///         it may still join somebody else's ride as a rider. False when it
+///         installed, or when the pin cannot be addressed at all.
+bool install_late_materialization(op::scan::sirius_gpu_scan_operator& scan_op,
                                   pinned_entry const& entry,
                                   std::span<std::size_t const> selected_columns,
                                   bool serves_whole_chunks)
 {
-  if (!late_mat::late_mat_enabled()) { return; }
+  if (!late_mat::late_mat_enabled()) { return false; }
   // An uninstalled deferral looks exactly like one that installed and did
   // nothing, so every refusal says which it was.
   auto const decline = [&scan_op](std::string_view why) {
     SIRIUS_LOG_INFO("[late-mat] operator {}: not deferring — {}", scan_op.get_operator_id(), why);
+    return false;
   };
 
   if (!entry.late_mat_handle) { return decline("the pinned entry has no late-mat handle"); }
@@ -668,7 +787,49 @@ void install_late_materialization(op::scan::sirius_gpu_scan_operator& scan_op,
                     scan_op.get_operator_id(),
                     planned.join_keys_skipped);
   }
-  if (!planned.installable()) { return; }
+  // Addressable, but nothing of its own to install: it can still ride along
+  // with another scan's bundle (see install_rider_deferrals).
+  if (!planned.installable()) { return true; }
+
+  // What the group-by-rowid extension would buy, and what it would need to be
+  // admitted. Reported before the install so a run that does NOT take the
+  // longer ride still says why — the alternative is a census that looks
+  // identical whether the extension was refused or never found.
+  // Where the bundle materializes: the aggregate's input, or — when the ride
+  // past the aggregates is admitted — the far consumer, one row per group
+  // instead of one per join match.
+  auto* port                                     = planned.port;
+  std::vector<std::size_t> const* port_positions = &planned.port_positions;
+  op::sirius_physical_operator const* port_input = planned.port_input;
+  int boundaries                                 = planned.boundaries;
+  if (planned.group_extension.has_value()) {
+    auto const& extension = *planned.group_extension;
+    auto const refuse     = [&](std::string_view why) {
+      SIRIUS_LOG_INFO(
+        "[late-mat] operator {}: group-by-rowid ride to {} (id={}) REFUSED — {}; materializing at "
+            "the aggregate instead",
+        scan_op.get_operator_id(),
+        extension.port->get_name(),
+        extension.port->get_operator_id(),
+        why);
+    };
+    if (auto const proof = admit_group_key_extension(planned, entry, selected_columns, refuse)) {
+      port           = extension.port;
+      port_positions = &extension.port_positions;
+      port_input     = extension.port_input;
+      boundaries     = extension.boundaries;
+      SIRIUS_LOG_INFO(
+        "[late-mat] operator {}: group-by-rowid ride to {} (id={}) through {} group-by stage(s) — "
+        "unique key '{}', {} boundaries instead of {}",
+        scan_op.get_operator_id(),
+        port->get_name(),
+        port->get_operator_id(),
+        extension.group_bys.size(),
+        *proof,
+        extension.boundaries,
+        planned.boundaries);
+    }
+  }
 
   // Output position p is served slot p is entry column selected_columns[p] —
   // the same mapping prepare_origin_annotation stamps its shared origins by,
@@ -692,28 +853,136 @@ void install_late_materialization(op::scan::sirius_gpu_scan_operator& scan_op,
   // from two schemas. Getting this wrong does not refuse a deferral — it
   // installs a port whose whole-schema match never fires, and the reader gets
   // the rowid.
-  if (planned.port_input == nullptr) { return decline("the ride has no last step"); }
-  auto const port_schema = physical_schema_of(*planned.port_input);
+  if (port_input == nullptr) { return decline("the ride has no last step"); }
+  auto const port_schema = physical_schema_of(*port_input);
   if (port_schema.empty()) {
     return decline("the operator feeding the port has no native cuDF schema");
   }
 
+  // Half the ride for a pinned table whose rows fit 32 bits — every TPC-H table
+  // but lineitem at SF1000. The id is a PIN-ORDER id, so the bound is the
+  // entry's own row count and nothing about the query can raise it.
+  auto const rowid_type =
+    entry.num_rows <= static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())
+      ? late_mat::kNarrowRowidType
+      : late_mat::kRowidType;
+
   auto pair = late_mat::make_defer_pair(scan_op.normalization_targets(),
                                         planned.positions,
                                         port_schema,
-                                        planned.port_positions,
-                                        std::move(origins));
-  if (!sirius::planner::install_deferral(scan_op, *planned.port, std::move(pair))) {
+                                        *port_positions,
+                                        std::move(origins),
+                                        rowid_type);
+  if (!sirius::planner::install_deferral(scan_op, *port, std::move(pair))) {
     return decline("the pair would not install (the port already carries one, or it is malformed)");
   }
   SIRIUS_LOG_INFO(
     "[late-mat] operator {}: deferring {} column(s) to {} (id={}) — {} B/row over {} boundaries",
     scan_op.get_operator_id(),
     planned.positions.size(),
-    planned.port->get_name(),
-    planned.port->get_operator_id(),
+    port->get_name(),
+    port->get_operator_id(),
     planned.net_value_bytes,
-    planned.boundaries);
+    boundaries);
+  return false;
+}
+
+/// One addressable scan that installed nothing of its own, kept for the rider
+/// pass. The columns are copied because the assignment they came from does not
+/// outlive the loop.
+struct rider_candidate {
+  op::scan::sirius_gpu_scan_operator* scan = nullptr;
+  pinned_entry const* entry                = nullptr;
+  std::vector<std::size_t> columns;
+};
+
+/// Second pass: let a scan that deferred nothing of its own join a ride that is
+/// already installed at the same port.
+///
+/// Two pinned tables can materialize at one consumer when that consumer sits
+/// past a group-by whose groups are already pinned down (see
+/// planner::group_key_extension). q10 is the shape — `customer` rides five wide
+/// columns, `nation` rides `n_name` — and the rider's own bundle would never
+/// install alone: it is too narrow to repay a ride of its own, and the ride it
+/// joins has already paid the fixed costs. So the value floor is dropped to
+/// "any saving at all" here, and everything else about the admission is the
+/// same as for a primary.
+///
+/// Runs after every assignment, because the primary may install after the rider
+/// was visited: q10 reaches `nation` (op 10) before `customer` (op 13).
+void install_rider_deferrals(std::vector<rider_candidate> const& candidates)
+{
+  if (!late_mat::late_mat_enabled() || candidates.empty()) { return; }
+
+  for (auto const& candidate : candidates) {
+    auto& scan_op      = *candidate.scan;
+    auto const& entry  = *candidate.entry;
+    auto const decline = [&scan_op](std::string_view why) {
+      SIRIUS_LOG_INFO(
+        "[late-mat] operator {}: not riding along — {}", scan_op.get_operator_id(), why);
+    };
+
+    // The ride it would join has paid the crossing already; what this bundle
+    // must still repay is its own rowid.
+    late_mat::defer_policy const rider_policy{.min_value_bytes = 1};
+    auto const planned = sirius::planner::plan_deferral(scan_op, rider_policy);
+    if (!planned.installable() || !planned.group_extension.has_value()) { continue; }
+    auto const& extension = *planned.group_extension;
+    auto* port            = extension.port;
+    if (port == nullptr || port->port_directive().empty()) {
+      continue;  // no ride at that port to join — silent, this is the common case
+    }
+
+    auto const proof = admit_group_key_extension(planned, entry, candidate.columns, decline);
+    if (!proof.has_value()) { continue; }
+
+    std::vector<late_mat::column_origin> origins;
+    origins.reserve(planned.positions.size());
+    for (auto const position : planned.positions) {
+      if (position >= candidate.columns.size()) {
+        origins.clear();
+        break;
+      }
+      late_mat::column_origin origin;
+      origin.handle     = entry.late_mat_handle;
+      origin.column_pos = static_cast<std::uint32_t>(candidate.columns[position]);
+      origin.generation = entry.late_mat_handle->generation();
+      origins.push_back(std::move(origin));
+    }
+    if (origins.empty()) {
+      decline("a deferred output position has no served column");
+      continue;
+    }
+
+    auto const rowid_type =
+      entry.num_rows <= static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())
+        ? late_mat::kNarrowRowidType
+        : late_mat::kRowidType;
+
+    // The batch at the port already carries the primary's substitutions, so the
+    // rider's half is built against THAT schema — not the port input's declared
+    // one, which no batch will look like any more.
+    auto pair = late_mat::make_defer_pair(scan_op.normalization_targets(),
+                                          planned.positions,
+                                          port->port_directive().expected_schema,
+                                          extension.port_positions,
+                                          std::move(origins),
+                                          rowid_type);
+    if (!sirius::planner::install_rider(scan_op, *port, std::move(pair))) {
+      decline("the rider would not attach (positions collide, or the schemas disagree)");
+      continue;
+    }
+    SIRIUS_LOG_INFO(
+      "[late-mat] operator {}: riding along with the bundle at {} (id={}) — {} column(s), {} B/row "
+      "over {} boundaries, unique key '{}'",
+      scan_op.get_operator_id(),
+      port->get_name(),
+      port->get_operator_id(),
+      planned.positions.size(),
+      planned.net_value_bytes,
+      extension.boundaries,
+      *proof);
+  }
 }
 
 }  // namespace
@@ -967,6 +1236,9 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   // shared through the masks' owning pointers), then the requests release
   // theirs. The sequencer only spawns in start_metadata_processing, so
   // serving still starts with finished masks.
+  // Scans that can be addressed but deferred nothing of their own; the rider
+  // pass below revisits them once every ride that exists has been installed.
+  std::vector<rider_candidate> rider_candidates;
   for (auto& assignment : cached_assignments) {
     mvcc_chunk_mask_set masks;  // stays empty for parquet pins
     std::vector<insert_delta_split> delta_splits;
@@ -1064,10 +1336,17 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     // Both halves of the deferral, installed before a single task runs. Read
     // the eligibility conditions here against prepare_origin_annotation's: the
     // scan side must substitute only for batches the provider stamps.
-    install_late_materialization(*assignment.op,
-                                 *assignment.entry,
-                                 assignment.columns,
-                                 /*serves_whole_chunks=*/masks.empty() && delta_splits.empty());
+    if (install_late_materialization(
+          *assignment.op,
+          *assignment.entry,
+          assignment.columns,
+          /*serves_whole_chunks=*/masks.empty() && delta_splits.empty())) {
+      // Addressable but deferring nothing of its own: it may still join another
+      // scan's ride, which can only be decided once every assignment has been
+      // visited (q10 reaches `nation` before the `customer` ride exists).
+      rider_candidates.push_back(
+        rider_candidate{assignment.op, assignment.entry, assignment.columns});
+    }
     auto provider = make_provider_for_pinned_entry(*assignment.entry,
                                                    assignment.columns,
                                                    std::move(assignment.plan),
@@ -1080,6 +1359,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
                                                    std::move(dynamic_filters));
     _metadata_processor->use_cached_entries_for_pipeline(assignment.op, std::move(provider));
   }
+  install_rider_deferrals(rider_candidates);
   _pending_mvcc_mask_jobs.clear();
   _pending_insert_delta_jobs.clear();
 
@@ -1824,6 +2104,135 @@ void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
     throw std::invalid_argument("[attach_mvcc_metadata] no pinned entry named '" + name + "'");
   }
   it->second.mvcc = std::make_unique<duckdb_mvcc_metadata>(std::move(metadata));
+}
+
+void sirius_scan_manager::attach_proven_unique_columns(
+  const std::string& name, std::span<std::string const> unique_column_names)
+{
+  auto it = _pinned_entries.find(name);
+  if (it == _pinned_entries.end()) {
+    throw std::invalid_argument("[attach_proven_unique_columns] no pinned entry named '" + name +
+                                "'");
+  }
+  auto& entry       = it->second;
+  auto const& names = entry.cache_info.names;
+  // The merge path appends columns after the previous attach sized this vector,
+  // so grow it (with "unknown") rather than assume it already covers the entry.
+  entry.proven_unique_columns.resize(names.size(), false);
+  for (auto const& unique_name : unique_column_names) {
+    for (std::size_t i = 0; i < names.size(); ++i) {
+      if (names[i] == unique_name) { entry.proven_unique_columns[i] = true; }
+    }
+  }
+}
+
+void sirius_scan_manager::prove_unique_columns_exactly(const std::string& name,
+                                                       std::span<std::string const> candidate_names)
+{
+  auto it = _pinned_entries.find(name);
+  if (it == _pinned_entries.end()) {
+    throw std::invalid_argument("[prove_unique_columns_exactly] no pinned entry named '" + name +
+                                "'");
+  }
+  auto& entry = it->second;
+  if (candidate_names.empty()) { return; }
+  entry.proven_unique_columns.resize(entry.cache_info.names.size(), false);
+
+  for (auto const& candidate : candidate_names) {
+    auto const pos =
+      std::find(entry.cache_info.names.begin(), entry.cache_info.names.end(), candidate) -
+      entry.cache_info.names.begin();
+    if (pos >= static_cast<std::ptrdiff_t>(entry.cache_info.names.size())) { continue; }
+    auto const column_pos = static_cast<std::size_t>(pos);
+    if (entry.proven_unique_columns[column_pos]) { continue; }  // the cheap pass already decided
+    if (entry.num_rows > late_mat::exact_uniqueness_row_cap()) {
+      SIRIUS_LOG_DEBUG(
+        "[late-mat] exact uniqueness check skipped: entry '{}' column '{}' has {} rows, past the "
+        "{}-row cap",
+        name,
+        candidate,
+        entry.num_rows,
+        late_mat::exact_uniqueness_row_cap());
+      continue;
+    }
+
+    // Collect the column's chunk views. Every assemblable form is GPU-tier and
+    // uncompressed; a compressed or host chunk would have to be decoded first,
+    // which is more pin-time work than the fact is worth.
+    std::vector<cudf::column_view> views;
+    int device_id       = -1;
+    bool assemblable    = entry.tier == cucascade::memory::Tier::GPU;
+    auto observe_device = [&](cucascade::memory::memory_space* space) {
+      int const dev = space != nullptr ? space->get_device_id() : -1;
+      if (device_id == -1) { device_id = dev; }
+      if (dev != device_id || dev == -1) { assemblable = false; }
+    };
+    if (assemblable && !entry.device_chunks.empty()) {
+      for (auto const& chunk : entry.device_chunks) {
+        if (chunk.compressed || column_pos >= chunk.columns.size() || !chunk.columns[column_pos]) {
+          assemblable = false;
+          break;
+        }
+        views.push_back(chunk.columns[column_pos]->view());
+        observe_device(chunk.memory_space);
+        if (!assemblable) { break; }
+      }
+    } else if (assemblable) {
+      auto const chunks_it = entry.data_batches_by_column.find(candidate);
+      assemblable          = chunks_it != entry.data_batches_by_column.end();
+      if (assemblable) {
+        for (std::size_t c = 0; c < chunks_it->second.size(); ++c) {
+          if (!chunks_it->second[c]) {
+            assemblable = false;
+            break;
+          }
+          views.push_back(chunks_it->second[c]->view());
+          observe_device(c < entry.chunk_memory_spaces.size() ? entry.chunk_memory_spaces[c]
+                                                              : nullptr);
+          if (!assemblable) { break; }
+        }
+      }
+    }
+    if (!assemblable || views.empty()) {
+      SIRIUS_LOG_DEBUG(
+        "[late-mat] exact uniqueness check skipped: entry '{}' column '{}' is not "
+        "device-assemblable (compressed, host-tier, or split across devices)",
+        name,
+        candidate);
+      continue;
+    }
+
+    try {
+      auto const started = std::chrono::steady_clock::now();
+      rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{device_id}};
+      auto const unique = late_mat::exact_distinct_over_chunks(views, rmm::cuda_stream_view{});
+      auto const ms     = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - started)
+                        .count();
+      if (!unique.has_value()) {
+        SIRIUS_LOG_DEBUG(
+          "[late-mat] exact uniqueness check: entry '{}' column '{}' undecidable (nullable, "
+          "non-integer, or too large to assemble)",
+          name,
+          candidate);
+        continue;
+      }
+      entry.proven_unique_columns[column_pos] = *unique;
+      SIRIUS_LOG_INFO(
+        "[late-mat] exact uniqueness check: entry '{}' column '{}' {} ({} rows, {} ms)",
+        name,
+        candidate,
+        *unique ? "proven distinct" : "NOT distinct",
+        entry.num_rows,
+        ms);
+    } catch (std::exception const& e) {
+      // A failed check must cost the optimization, never the pin.
+      SIRIUS_LOG_WARN("[late-mat] exact uniqueness check failed for entry '{}' column '{}': {}",
+                      name,
+                      candidate,
+                      e.what());
+    }
+  }
 }
 
 void sirius_scan_manager::remove_pinned_entry(const std::string& name)

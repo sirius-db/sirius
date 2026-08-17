@@ -92,6 +92,23 @@ std::unique_ptr<cudf::table> substitute_deferred_columns(
                                std::to_string(position) + " is outside the scan's output");
     }
     if (i == 0) {
+      // The width the pair agreed on: a pinned table whose rows fit 32 bits
+      // rides half the bytes. The range check is not a formality — a wrong
+      // width here wraps the id and materializes a plausible WRONG row.
+      if (deferred.rowid_type == late_mat::kNarrowRowidType) {
+        auto const last = origin.range.start + origin.range.rows;
+        if (last > static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
+          throw std::runtime_error(
+            "[sirius_gpu_scan_operator] a narrow rowid was installed for a pinned span reaching "
+            "row " +
+            std::to_string(last) + ", which does not fit 32 bits");
+        }
+        auto const init = cudf::numeric_scalar<std::uint32_t>(
+          static_cast<std::uint32_t>(origin.range.start), true, stream, mr);
+        auto const step   = cudf::numeric_scalar<std::uint32_t>(1, true, stream, mr);
+        columns[position] = cudf::sequence(rows, init, step, stream, mr);
+        continue;
+      }
       auto const init = cudf::numeric_scalar<std::uint64_t>(
         static_cast<std::uint64_t>(origin.range.start), true, stream, mr);
       auto const step   = cudf::numeric_scalar<std::uint64_t>(1, true, stream, mr);

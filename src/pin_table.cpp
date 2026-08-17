@@ -22,6 +22,7 @@
 #include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
 #include "io/io_context.hpp"
+#include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
@@ -205,12 +206,15 @@ narrowed_pin_chunk narrow_pin_chunk(std::unique_ptr<cudf::table> table,
 /// placement means re-pinning the same source yields identical placement (required by
 /// insert_pinned_entry's merge path on the GPU tier) and bounds peak GPU residency to ~one batch
 /// (the host tier frees each table in @p on_batch before the next is materialized).
-void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
-                             std::span<cucascade::memory::memory_space* const> gpu_spaces,
-                             io::sirius_ioctx& io_ctx,
-                             duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
-                             pin_materialization_options options,
-                             const pin_batch_sink& on_batch)
+/// @return the late-mat uniqueness verdicts, positional with the pinned columns
+///         (empty when the probe was not asked for).
+std::vector<late_mat::unique_verdict> materialize_pin_batches(
+  op::scan::gpu_ingestible& ingestible,
+  std::span<cucascade::memory::memory_space* const> gpu_spaces,
+  io::sirius_ioctx& io_ctx,
+  duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
+  pin_materialization_options options,
+  const pin_batch_sink& on_batch)
 {
   if (gpu_spaces.empty()) {
     throw std::invalid_argument("[materialize_pin_batches] gpu_spaces must be non-empty");
@@ -240,6 +244,10 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
   // Rows materialized so far, in emission order — feeds the chunk-contiguity
   // validation (duckdb-native pins only).
   std::size_t rows_materialized = 0;
+
+  // Whole-table distinctness proof, accumulated chunk by chunk. Inactive (and
+  // free) unless the caller selected columns to observe.
+  late_mat::unique_probe unique_probe{options.probe_unique_columns};
 
   // Materialize one coalesced batch into a GPU-resident cudf::table and hand it to on_batch
   // together with its GPU placement + the decode stream. Mirrors
@@ -286,6 +294,13 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
       chunk_stats = scan_manager::compute_pinned_chunk_stats(
         tbl->view(), pinned_column_types, stream, target->get_default_allocator());
     }
+    // Observe BEFORE narrowing: the proof is about values, and same-family
+    // narrowing preserves them, so the native carriers are both cheaper to
+    // reduce and equally conclusive.
+    if (unique_probe.active()) {
+      nvtx3::scoped_range probe_range{"sirius::pin::unique_probe"};
+      unique_probe.observe(tbl->view(), stream);
+    }
     if (options.enable_compressed_materialization) {
       auto narrowed = narrow_pin_chunk(
         std::move(tbl), pinned_column_types, stream, target->get_default_allocator());
@@ -317,6 +332,19 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
   for (auto& b : coalescer->flush()) {
     handle_batch(std::move(b));
   }
+
+  if (std::any_of(options.probe_unique_columns.begin(),
+                  options.probe_unique_columns.end(),
+                  [](bool selected) { return selected; })) {
+    auto verdicts = unique_probe.verdicts();
+    SIRIUS_LOG_DEBUG(
+      "[late-mat] pin uniqueness probe: {} proven, {} undecided (exact check pending), {} refused",
+      std::count(verdicts.begin(), verdicts.end(), late_mat::unique_verdict::proven),
+      std::count(verdicts.begin(), verdicts.end(), late_mat::unique_verdict::undecided),
+      std::count(verdicts.begin(), verdicts.end(), late_mat::unique_verdict::refused));
+    return verdicts;
+  }
+  return {};
 }
 
 // Streams for cross-column encode parallelism, one pool per thread and device —
@@ -451,7 +479,7 @@ materialized_pin materialize_all_batches(
   pin_materialization_options options)
 {
   materialized_pin out;
-  materialize_pin_batches(
+  out.unique_verdicts = materialize_pin_batches(
     ingestible,
     gpu_spaces,
     io_ctx,
@@ -487,7 +515,7 @@ host_pin_result materialize_pin_to_host(
   host_pin_result out;
   bool compression_failed = false;
 
-  materialize_pin_batches(
+  out.unique_verdicts = materialize_pin_batches(
     ingestible,
     gpu_spaces,
     io_ctx,

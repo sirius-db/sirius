@@ -32,6 +32,8 @@
 #include <expression/ast/reference.hpp>
 #include <op/sirius_physical_concat.hpp>
 #include <op/sirius_physical_filter.hpp>
+#include <op/sirius_physical_grouped_aggregate.hpp>
+#include <op/sirius_physical_grouped_aggregate_merge.hpp>
 #include <op/sirius_physical_hash_join.hpp>
 #include <op/sirius_physical_partition.hpp>
 #include <op/sirius_physical_projection.hpp>
@@ -142,6 +144,49 @@ struct test_concat : sirius::op::sirius_physical_concat {
   using sirius_physical_concat::sirius_physical_concat;
   void link(sirius_physical_operator* parent) { _parent_op = parent; }
 };
+
+struct test_aggregate : sirius::op::sirius_physical_grouped_aggregate {
+  using sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate;
+  void link(sirius_physical_operator* parent) { _parent_op = parent; }
+};
+
+struct test_aggregate_merge : sirius::op::sirius_physical_grouped_aggregate_merge {
+  using sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge;
+  void link(sirius_physical_operator* parent) { _parent_op = parent; }
+};
+
+/// A group-by over `columns` inputs, grouping on `groups` and aggregating each
+/// of `aggregate_inputs`. Built by hand rather than from expressions: what the
+/// walk reads is the resolved cudf metadata, which is what a test should pin.
+std::unique_ptr<test_aggregate> make_aggregate(std::size_t columns,
+                                               std::vector<int> groups,
+                                               std::vector<int> aggregate_inputs)
+{
+  auto agg       = std::make_unique<test_aggregate>(make_string_types(columns),
+                                              duckdb::vector<std::unique_ptr<sirius::ast::node>>{},
+                                              duckdb::vector<std::unique_ptr<sirius::ast::node>>{},
+                                              0);
+  agg->group_idx = std::move(groups);
+  agg->cudf_aggregates.assign(aggregate_inputs.size(), cudf::aggregation::Kind::SUM);
+  agg->cudf_aggregate_idx = std::move(aggregate_inputs);
+  return agg;
+}
+
+std::unique_ptr<test_aggregate_merge> make_merge(std::size_t columns,
+                                                 std::vector<int> groups,
+                                                 std::vector<int> aggregate_inputs)
+{
+  std::vector<cudf::aggregation::Kind> kinds(aggregate_inputs.size(), cudf::aggregation::Kind::SUM);
+  return std::make_unique<test_aggregate_merge>(make_string_types(columns),
+                                                std::move(groups),
+                                                std::move(kinds),
+                                                std::move(aggregate_inputs),
+                                                std::vector<std::vector<int>>{},
+                                                std::vector<sirius::op::AggregateSlot>{},
+                                                /*has_avg=*/false,
+                                                /*has_count_distinct=*/false,
+                                                /*estimated_cardinality=*/0);
+}
 
 }  // namespace
 
@@ -628,4 +673,205 @@ TEST_CASE("a column an outer join could null is withheld from the weighing", "[l
   auto const planned = sirius::planner::plan_deferral(*scan_ptr);
   REQUIRE(planned.nullable_columns_skipped == 2);  // columns 1 and 2; 0 is the key
   REQUIRE_FALSE(planned.installable());
+}
+
+TEST_CASE("a group key stops at the aggregate and reports the ride past it", "[late_mat][lifetime]")
+{
+  // scan(3) -> GROUP BY col1, col2 with SUM(col0) -> filter on the first group
+  // output. Two answers are wanted at once: the sound stop (the aggregate reads
+  // its keys) and how much further the ride would go if the pin-uniqueness
+  // bijection let the keys travel as rowids.
+  wide_scan scan(3);
+  auto aggregate = make_aggregate(3, /*groups=*/{1, 2}, /*aggregate_inputs=*/{0});
+  auto predicate = std::make_unique<sirius::ast::node>(
+    sirius::ast::comparison{sirius::comparison_type::equal, ref(0), ref(0)});
+  test_filter filter(make_string_types(3), std::move(predicate), 0);
+  scan.link(aggregate.get());
+  aggregate->link(&filter);
+
+  auto const lives = analyze_column_lifetimes(scan);
+
+  // The aggregate INPUT is read for its value; nothing rides past.
+  REQUIRE(lives[0].first_reader == aggregate.get());
+  REQUIRE_FALSE(lives[0].group_ride.has_value());
+
+  // Group key 1 lands at group output 0, which the filter reads.
+  REQUIRE(lives[1].first_reader == aggregate.get());  // the sound stop, unchanged
+  REQUIRE(lives[1].group_ride.has_value());
+  REQUIRE(lives[1].group_ride->group_bys ==
+          std::vector<sirius::op::sirius_physical_operator const*>{aggregate.get()});
+  REQUIRE(lives[1].group_ride->reader == &filter);
+  REQUIRE(lives[1].group_ride->position_at_reader == 0);
+
+  // Group key 2 lands at group output 1, which nothing reads: the ride reaches
+  // the top of the plan.
+  REQUIRE(lives[2].group_ride.has_value());
+  REQUIRE(lives[2].group_ride->reader == nullptr);
+  REQUIRE(lives[2].group_ride->position_at_reader == 1);
+}
+
+TEST_CASE("a column that is grouped AND aggregated is read", "[late_mat][lifetime]")
+{
+  // GROUP BY col0, SUM(col0): the value is needed whatever the keys do, so the
+  // aggregate-input test must win over the group-key test.
+  wide_scan scan(2);
+  auto aggregate = make_aggregate(2, /*groups=*/{0}, /*aggregate_inputs=*/{0});
+  scan.link(aggregate.get());
+
+  auto const lives = analyze_column_lifetimes(scan);
+  REQUIRE(lives[0].first_reader == aggregate.get());
+  REQUIRE_FALSE(lives[0].group_ride.has_value());
+}
+
+TEST_CASE("a column the aggregate does not emit stops there", "[late_mat][lifetime]")
+{
+  // Neither key nor aggregate input: the aggregate's output has no such column,
+  // so no ride is reported however the facts turn out.
+  wide_scan scan(2);
+  auto aggregate = make_aggregate(2, /*groups=*/{0}, /*aggregate_inputs=*/{});
+  scan.link(aggregate.get());
+
+  auto const lives = analyze_column_lifetimes(scan);
+  REQUIRE(lives[1].first_reader == aggregate.get());
+  REQUIRE_FALSE(lives[1].group_ride.has_value());
+}
+
+TEST_CASE("a two-stage aggregate is one ride through both halves", "[late_mat][lifetime]")
+{
+  // The shape a real plan builds: local GROUP BY -> PARTITION (hashing the
+  // local aggregate's group outputs) -> MERGE_GROUP_BY. The partition is the
+  // interesting hop — it hashes to place rows, and a rowid hashes differently
+  // from the value it stands for, so it is only passable BECAUSE the bijection
+  // gives every row of a group the same rowid.
+  wide_scan scan(3);
+  auto local = make_aggregate(3, /*groups=*/{1, 2}, /*aggregate_inputs=*/{0});
+  auto merge = make_merge(3, /*groups=*/{0, 1}, /*aggregate_inputs=*/{2});
+  test_partition partition(make_string_types(3), 0, /*key_source=*/local.get(), /*is_build=*/false);
+  REQUIRE(partition.partition_keys() == std::vector<int>{0, 1});
+
+  scan.link(local.get());
+  local->link(&partition);
+  partition.link(merge.get());
+
+  auto const lives = analyze_column_lifetimes(scan);
+  REQUIRE(lives[1].first_reader == local.get());  // still the sound stop
+  REQUIRE(lives[1].group_ride.has_value());
+  // The partition is part of the ride, not one of the aggregates the proof has
+  // to cover — both group-bys are, and in ride order.
+  REQUIRE(lives[1].group_ride->group_bys ==
+          std::vector<sirius::op::sirius_physical_operator const*>{local.get(), merge.get()});
+  REQUIRE_FALSE(lives[1].group_ride->read_as_join_key);
+  // Two sinks left on the way (the local aggregate and the partition), so the
+  // longer ride costs two port crossings the short one does not.
+  REQUIRE(lives[1].group_ride->port_crossings > lives[1].port_crossings);
+}
+
+TEST_CASE("a partition below a join still refuses a group key", "[late_mat][lifetime]")
+{
+  // Same partition hop, but feeding a JOIN: equal values must land in one
+  // partition and rowids do not preserve that, so the refusal stands. The
+  // exception is narrow on purpose — it is the difference between a fast query
+  // and a wrong one.
+  duckdb::LogicalDummyScan stub(0);
+  stub.types = duckdb::vector<duckdb::LogicalType>(6, duckdb::LogicalType::VARCHAR);
+  duckdb::vector<sirius::join_condition> conditions;
+  sirius::join_condition condition;
+  condition.left  = std::make_unique<sirius::ast::node>(sirius::ast::reference{0, string_type()});
+  condition.right = std::make_unique<sirius::ast::node>(sirius::ast::reference{0, string_type()});
+  conditions.push_back(std::move(condition));
+  test_join join(stub,
+                 duckdb::make_uniq<wide_scan>(3),
+                 duckdb::make_uniq<wide_scan>(3),
+                 std::move(conditions),
+                 duckdb::JoinType::INNER,
+                 /*estimated_cardinality=*/1);
+
+  wide_scan scan(3);
+  auto aggregate = make_aggregate(3, /*groups=*/{0, 1}, /*aggregate_inputs=*/{2});
+  test_partition partition(make_string_types(3), 0, /*key_source=*/&join, /*is_build=*/false);
+  scan.link(aggregate.get());
+  aggregate->link(&partition);
+  partition.link(&join);
+
+  auto const lives = analyze_column_lifetimes(scan);
+  REQUIRE(lives[0].group_ride.has_value());
+  REQUIRE(lives[0].group_ride->reader == &partition);
+  REQUIRE(lives[0].group_ride->read_as_join_key);
+}
+
+TEST_CASE("the q10 shape reports the ride past the aggregate", "[late_mat][lifetime]")
+{
+  // The whole point of modelling group-bys, end to end: a payload that stops at
+  // an aggregate because the aggregate groups on it, a key riding REAL beside
+  // it, and a consumer past the aggregate that reads the payload back. The pass
+  // plans the sound deferral at the aggregate AND reports what the pin-time
+  // uniqueness of the key would buy on top.
+  wide_scan scan(3);
+  // Column 0 rides real: something reads it early (a join does this in q10),
+  // which is exactly why it is not part of the bundle — and it is a group key
+  // all the same, so its uniqueness is what could admit the ride.
+  auto key_predicate = std::make_unique<sirius::ast::node>(
+    sirius::ast::comparison{sirius::comparison_type::equal, ref(0), ref(0)});
+  test_filter key_reader(make_string_types(3), std::move(key_predicate), 0);
+
+  keyless_key_source keys;
+  auto chain           = partition_chain(3, 3, keys);
+  auto aggregate       = make_aggregate(3, /*groups=*/{0, 1, 2}, /*aggregate_inputs=*/{});
+  auto final_predicate = std::make_unique<sirius::ast::node>(
+    sirius::ast::comparison{sirius::comparison_type::equal, ref(1), ref(2)});
+  test_filter consumer(make_string_types(3), std::move(final_predicate), 0);
+
+  scan.link(&key_reader);
+  key_reader.link(chain.front().get());
+  for (std::size_t i = 0; i + 1 < chain.size(); ++i) {
+    chain[i]->link(chain[i + 1].get());
+  }
+  chain.back()->link(aggregate.get());
+  aggregate->link(&consumer);
+
+  auto const lives = analyze_column_lifetimes(scan);
+  REQUIRE(lives[0].first_reader == &key_reader);  // read early, rides on regardless
+  REQUIRE(lives[0].group_key_at ==
+          std::vector<sirius::op::sirius_physical_operator const*>{aggregate.get()});
+  REQUIRE(lives[1].first_reader == aggregate.get());
+  REQUIRE(lives[2].first_reader == aggregate.get());
+
+  auto const planned = sirius::planner::plan_deferral(scan);
+  REQUIRE(planned.installable());
+  REQUIRE(planned.port == aggregate.get());  // the sound plan is unchanged
+  REQUIRE(planned.positions == std::vector<std::size_t>{1, 2});
+
+  REQUIRE(planned.group_extension.has_value());
+  REQUIRE(planned.group_extension->port == &consumer);
+  REQUIRE(planned.group_extension->group_bys ==
+          std::vector<sirius::op::sirius_physical_operator const*>{aggregate.get()});
+  // Group keys 1 and 2 land at group outputs 1 and 2.
+  REQUIRE(planned.group_extension->port_positions == std::vector<std::size_t>{1, 2});
+  // Only the real-riding key can carry the proof; the deferred columns cannot
+  // prove anything about themselves.
+  REQUIRE(planned.group_extension->unique_key_candidates == std::vector<std::size_t>{0});
+  // One more sink left behind (the aggregate), so the longer ride crosses more
+  // ports than the short one — which is what makes it worth admitting.
+  REQUIRE(planned.group_extension->boundaries > planned.boundaries);
+}
+
+TEST_CASE("no proof candidate means no extension is reported", "[late_mat][lifetime]")
+{
+  // Same shape, but the aggregate groups ONLY on the payload: there is no
+  // column riding real that could be proven unique, so there is nothing to
+  // admit and the pass says so rather than leaving the decision open.
+  wide_scan scan(3);
+  keyless_key_source keys;
+  auto chain     = partition_chain(3, 3, keys);
+  auto aggregate = make_aggregate(3, /*groups=*/{1, 2}, /*aggregate_inputs=*/{0});
+  auto predicate = std::make_unique<sirius::ast::node>(
+    sirius::ast::comparison{sirius::comparison_type::equal, ref(0), ref(1)});
+  test_filter consumer(make_string_types(3), std::move(predicate), 0);
+
+  link_chain(scan, chain, *aggregate);
+  aggregate->link(&consumer);
+
+  auto const planned = sirius::planner::plan_deferral(scan);
+  REQUIRE(planned.installable());
+  REQUIRE_FALSE(planned.group_extension.has_value());
 }

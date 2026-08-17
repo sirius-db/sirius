@@ -222,6 +222,15 @@ struct pinned_entry {
   /// capture was statless or degraded; see @ref pinned_zone_maps for the
   /// invariant and merge semantics.
   pinned_zone_maps zone_maps;
+  /// Late-mat uniqueness proof, positional with @c cache_info.column_ids: true =
+  /// the column's values were proven distinct across the whole pinned table at
+  /// pin time (see @c late_mat::unique_probe). A false — or an empty vector —
+  /// means UNKNOWN, never "known duplicated": the fact only ever unlocks an
+  /// optimization, so absence must cost speed, not correctness. Attached by
+  /// @ref attach_proven_unique_columns after insert, BY NAME, because the merge
+  /// path appends columns and a positional attach would then describe the wrong
+  /// ones.
+  std::vector<bool> proven_unique_columns;
   /// Generation-checked handle for late materialization: what a deferred
   /// column holds instead of a pointer to this entry, so an unpin or a
   /// replacing re-pin makes every outstanding origin fail closed rather than
@@ -577,6 +586,43 @@ class sirius_scan_manager {
   /// materializations whose per-chunk row counts differ from the existing
   /// chunks'. Throws std::invalid_argument when no entry exists for @p name.
   void attach_mvcc_metadata(const std::string& name, duckdb_mvcc_metadata metadata);
+
+  /// \brief Record which of @p name 's pinned columns were proven distinct at pin time.
+  ///
+  /// Called by every pin path right after its insert. Takes NAMES, not
+  /// positions: a re-pin that merges into an existing entry appends its new
+  /// columns to the entry's own order, which is not the incoming pin's order,
+  /// so a positional attach could mark the wrong column unique — and a false
+  /// positive here is wrong query results, not a slow query.
+  ///
+  /// Facts are OR-ed in and never cleared: a merge leaves the already-pinned
+  /// columns' data untouched (the merge path rejects any materialization whose
+  /// chunk boundaries differ), so a proof taken against them still holds, while
+  /// a replacing re-pin builds a fresh entry with no facts at all. Names absent
+  /// from @p unique_column_names are left as they were — absence is
+  /// "unknown", so nothing is asserted by omission. A name that matches no
+  /// pinned column is ignored. Throws std::invalid_argument when no entry
+  /// exists for @p name.
+  void attach_proven_unique_columns(const std::string& name,
+                                    std::span<std::string const> unique_column_names);
+
+  /// \brief Exact fallback for columns the pin-time per-chunk probe could not decide.
+  ///
+  /// The cheap probe concludes only when the chunks' value ranges are disjoint,
+  /// and a pin's chunks routinely interleave (the coalescer partitions by row
+  /// groups, not by key), so on real data almost every genuinely unique column
+  /// arrives here unproven. This assembles each named column from the pinned
+  /// chunks and counts its distinct values exactly (see
+  /// @c late_mat::exact_distinct_over_chunks), recording a fact only on a
+  /// clean proof. Runs at pin time only, once per named column.
+  ///
+  /// Only GPU-tier, uncompressed, single-device storage can be assembled;
+  /// anything else is logged and skipped (leaving the column "unknown"). A
+  /// column already proven is not re-checked, and a CUDA/cudf failure is caught
+  /// and reported rather than failing the pin. Throws std::invalid_argument
+  /// when no entry exists for @p name.
+  void prove_unique_columns_exactly(const std::string& name,
+                                    std::span<std::string const> candidate_names);
 
   /// \brief Remove the pinned entry for @p name. No-op if absent.
   void remove_pinned_entry(const std::string& name);
