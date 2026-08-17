@@ -255,9 +255,10 @@ States the delta cannot represent decline at plan time into the transparent CPU 
 
 ### Zone maps
 
-With `enable_pinned_zone_map_pruning` enabled (the default), `pin_table` captures per-chunk
-min/max statistics and cached scans use them to skip chunks that cannot match a pushed-down
-filter. The option is available through DuckDB `SET` and YAML under `sirius.operator_params`.
+By default, `pin_table` automatically captures per-chunk min/max statistics and cached scans use
+them to skip chunks that cannot match a pushed-down filter. An advanced YAML escape hatch,
+`sirius.operator_params.enable_pinned_zone_map_pruning`, can disable both capture and pruning for
+a benchmark or diagnosis envelope. The direct DuckDB session override is test-only.
 
 **Capture and types.** Both pin tiers run one `cudf::minmax` reduction per supported column and
 chunk before the data is stored on the GPU or converted to HOST memory. Supported types are

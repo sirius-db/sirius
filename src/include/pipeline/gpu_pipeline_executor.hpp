@@ -114,6 +114,14 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   [[nodiscard]] executor_metrics get_metrics() const noexcept;
 
   /**
+   * @brief Return the effective executor configuration after scheduler derivation.
+   */
+  [[nodiscard]] const exec::thread_pool_config& get_effective_config() const noexcept
+  {
+    return _config;
+  }
+
+  /**
    * @brief Set the completion handler for query completion signaling
    *
    * @param handler Pointer to the completion handler

@@ -323,6 +323,7 @@ set(EXTENSION_SOURCES
     src/op/dynamic_filter_publisher.cpp
     src/op/sirius_dynamic_filter.cpp
     src/op/sirius_physical_column_data_scan.cpp
+    src/op/sirius_physical_streaming_sink.cpp
     src/op/sirius_physical_streaming_source.cpp
     src/op/sirius_physical_concat.cpp
     src/op/sirius_physical_cte.cpp
@@ -463,6 +464,12 @@ list(APPEND EXTENSION_SOURCES ${SIRIUS_SUBSTRAIT_SOURCES})
 build_static_extension(sirius ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 build_loadable_extension(sirius CPP ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 
+# The standalone FFI constructs an embedded DuckDB, which needs the no-op static
+# extension loader retained regardless of archive ordering.
+set_property(
+  TARGET sirius_loadable_extension
+  PROPERTY LINK_LIBRARY_OVERRIDE_dummy_static_extension_loader WHOLE_ARCHIVE)
+
 # rapidsai/rmm#826: DuckDB links the loadable extension with
 # -Wl,--exclude-libs,ALL, under which mold (but not bfd) hides RMM's GNU_UNIQUE
 # current-device-resource registry symbols, so cuDF's internal allocations
@@ -519,7 +526,9 @@ foreach(_target sirius_extension sirius_loadable_extension)
   # protobuf.
   target_include_directories(
     ${_target}
-    PRIVATE ${SIRIUS_SUBSTRAIT_DIR}/src/include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/extension/core_functions/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/extension/parquet/include
+            ${SIRIUS_SUBSTRAIT_DIR}/src/include
             ${SIRIUS_SUBSTRAIT_DIR}/third_party
             ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait)
 
@@ -542,6 +551,8 @@ foreach(_target sirius_extension sirius_loadable_extension)
     cuCascade::cucascade_cudf
     yaml-cpp::yaml-cpp
     telemetry_bridge
+    core_functions_extension
+    parquet_extension
     simpatico)
 
   add_dependencies(${_target} duckdb_static)
@@ -726,6 +737,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_partition.cpp
     test/cpp/operator/test_physical_projection.cpp
     test/cpp/operator/test_physical_result_collector.cpp
+    test/cpp/operator/test_physical_streaming_sink.cpp
     test/cpp/operator/test_physical_streaming_source.cpp
     test/cpp/operator/test_physical_table_scan.cpp
     test/cpp/operator/test_no_history_peak_memory_estimate.cpp
@@ -761,6 +773,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_pipeline_schedule_canonical.cpp
     test/cpp/pipeline/test_plan_printer.cpp
     test/cpp/pipeline/test_repository_wiring_materializer.cpp
+    test/cpp/pipeline/test_streaming_sink_root.cpp
     test/cpp/pipeline/test_task_scheduler.cpp
     test/cpp/scan/bench_decode_codecs.cpp
     test/cpp/scan/test_can_serve_with_columns.cpp

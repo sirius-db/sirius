@@ -444,7 +444,9 @@ compression off for the rest of the pin.
 Both compression gates (`min_batch_size_bytes` and `max_compressed_fraction`) are evaluated on the
 already-narrowed table, so they measure the batch as it will be stored. A batch that falls out of a
 gate, or that arrives after a failure has latched compression off, is stored uncompressed at the
-carrier narrowing selected for it.
+carrier narrowing selected for it. `max_compressed_fraction` must be finite and non-negative;
+values above 1 intentionally permit a compressed representation that expands relative to its
+input, which is useful when testing encodability independently of compression ratio.
 
 Known residual: a plan block with a width-explicit packed op (a `bitextract`/`bitjoin` field spec
 of a fixed total width) on an integer column narrowed to a different width still fails that

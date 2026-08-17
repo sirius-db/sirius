@@ -79,6 +79,28 @@ When the C++ unit test job fails or times out, the workflow automatically upload
 
 ## Pull requests
 
+### Reviewer assignment
+
+Sirius uses [CODEOWNERS](.github/CODEOWNERS) to automatically route PRs to the right reviewers based on the files changed. Reviewers are assigned from component teams (e.g. `sirius-core`, `sirius-io`) — one member per team via load balancing. You do not need to manually request reviewers.
+
+Approval from any maintainer is sufficient to merge — it does not have to be the auto-assigned reviewer.
+
+The component teams can also be mentioned directly in PR comments and issues to bring the right people into a discussion without a Slack ping — useful when you need expert input on a specific area:
+
+| Team | Components |
+|------|------------|
+| `@sirius-db/sirius-core` | Planner, Executors, Operators & Expressions |
+| `@sirius-db/sirius-io` | Scan & I/O, Memory & Compression |
+| `@sirius-db/sirius-integrations` | Integrations |
+| `@sirius-db/sirius-telemetry` | Telemetry & Observability |
+| `@sirius-db/sirius-cmake` | CMake |
+| `@sirius-db/sirius-build` | CI & Build |
+| `@sirius-db/sirius-docs` | Documentation |
+| `@sirius-db/sirius-rust` | Rust |
+| `@sirius-db/sirius-python` | Python |
+
+When you open or update a PR, you will also be automatically assigned as the author. This helps maintainers track ownership and is not a request for you to review your own work.
+
 ### Commit and title convention
 
 Sirius squash-merges PRs, the PR titles become the commit message on merge. Commits and PR titles follow [Conventional Commits](https://www.conventionalcommits.org/) format for readability.

@@ -27,6 +27,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
+#include <cmath>
 #include <exception>
 #include <limits>
 #include <stdexcept>
@@ -140,7 +141,6 @@ static void from_yaml(const YAML::Node& node, exec::thread_pool_config& opt)
   yaml::reader r(node, "thread_pool");
   r.optional("num_threads", opt.num_threads, yaml::greater_than<int>{0});
   r.optional("thread_name_prefix", opt.thread_name_prefix);
-  r.optional("cpu_affinity", opt.cpu_affinity_list);
   r.reject_unknown();
 }
 
@@ -273,8 +273,10 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("enable_dynamic_filter_pushdown", opt.enable_dynamic_filter_pushdown);
   r.optional("enable_dynamic_zone_map_filter", opt.enable_dynamic_zone_map_filter);
   r.optional("dynamic_filter_domain_coverage_threshold",
-             opt.dynamic_filter_domain_coverage_threshold);
-  r.optional("dynamic_filter_keep_threshold", opt.dynamic_filter_keep_threshold);
+             opt.dynamic_filter_domain_coverage_threshold,
+             yaml::greater_than<double>{0.0});
+  r.optional(
+    "dynamic_filter_keep_threshold", opt.dynamic_filter_keep_threshold, yaml::fraction<double>{});
   r.optional("enable_pinned_zone_map_pruning", opt.enable_pinned_zone_map_pruning);
   r.optional("enable_compressed_materialization", opt.enable_compressed_materialization);
   r.reject_unknown();
@@ -296,7 +298,9 @@ static void from_yaml(const YAML::Node& node, compression_config& opt)
   yaml::reader r(node, "compression");
   r.optional("enable_pin_table_compression", opt.enable_pin_table_compression);
   r.optional("min_batch_size_bytes", yaml::bytes(opt.min_batch_size_bytes));
-  r.optional("max_compressed_fraction", opt.max_compressed_fraction);
+  r.optional("max_compressed_fraction", opt.max_compressed_fraction, [](double value) {
+    return std::isfinite(value) && value >= 0.0;
+  });
   r.optional("input_plan_dir", opt.input_plan_dir);
   r.reject_unknown();
 }
@@ -323,15 +327,28 @@ struct topology {
   static void from_yaml(const YAML::Node& node, topology& opt)
   {
     yaml::reader r(node, "topology");
-    // gpu_ids and num_gpus are mutually exclusive; try gpu_ids first
-    std::vector<int> ids;
-    r.optional("gpu_ids", ids);
-    if (!ids.empty()) {
+    reject_mutually_exclusive(r, "topology", "gpu_ids", "num_gpus");
+
+    if (r.has_value("gpu_ids")) {
+      std::vector<int> ids;
+      r.optional("gpu_ids", ids);
+      if (ids.empty()) {
+        throw std::runtime_error("topology.gpu_ids must contain at least one device id");
+      }
+      if (std::ranges::any_of(ids, [](int id) { return id < 0; })) {
+        throw std::runtime_error("topology.gpu_ids must contain only non-negative device ids");
+      }
+      auto sorted_ids = ids;
+      std::ranges::sort(sorted_ids);
+      if (std::ranges::adjacent_find(sorted_ids) != sorted_ids.end()) {
+        throw std::runtime_error("topology.gpu_ids must not contain duplicate device ids");
+      }
       opt.num_gpus_or_gpu_ids = std::move(ids);
     } else {
-      size_t n = 0;
+      long long n = 0;
       r.optional("num_gpus", n);
-      opt.num_gpus_or_gpu_ids = n;
+      if (n < 0) { throw std::runtime_error("topology.num_gpus must be non-negative"); }
+      opt.num_gpus_or_gpu_ids = static_cast<size_t>(n);
     }
     // greater_than{-1} is >= 0: a negative count would otherwise silently read as "use all",
     // since the admission path treats any non-positive value as unset.

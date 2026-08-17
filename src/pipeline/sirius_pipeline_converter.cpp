@@ -285,8 +285,8 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
 
     using T = op::SiriusPhysicalOperatorType;
 
-    // RESULT_COLLECTOR is a terminal sink — nothing to emit.
-    if (sink_op->type == T::RESULT_COLLECTOR) { continue; }
+    // Query-terminal: no wiring. is_query_terminal() shared with notify_downstream / executor.
+    if (pipeline->is_query_terminal()) { continue; }
 
     // CTE fans out to its sibling `cte_scans` (parent_op alone doesn't encode them).
     // CTE_SCAN never lands in any pipeline's operators[], so consumers resolve via
