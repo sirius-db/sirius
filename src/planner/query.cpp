@@ -47,8 +47,12 @@ void query::build_indices()
       // If it's a scan-like source, add to scan operators vector. GPU_VALUES
       // must be included: task_scheduler::start_query() schedules the first
       // scan operator, which is the only kickoff a VALUES-only plan gets.
+      // STREAMING_SOURCE is also included: a receiver fragment has no table to scan.
+      // It may return WAITING on that first hint (no batch has arrived yet); the
+      // on_data hook wired in set_pipeline() re-schedules it when the first push lands.
       if (source->type == op::SiriusPhysicalOperatorType::GPU_SCAN ||
-          source->type == op::SiriusPhysicalOperatorType::GPU_VALUES) {
+          source->type == op::SiriusPhysicalOperatorType::GPU_VALUES ||
+          source->type == op::SiriusPhysicalOperatorType::STREAMING_SOURCE) {
         _scan_operators.push_back(source.get());
       }
     }

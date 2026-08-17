@@ -232,7 +232,13 @@ preferred_device_id = _active_gpu_ids[ partition_idx % _active_gpu_ids.size() ]
 
 This keeps every task of a given partition (build + all probes) on one GPU while spreading partitions across GPUs.
 
-`_active_gpu_ids` is built once in the `task_creator` constructor from the memory manager's `Tier::GPU` memory spaces — i.e. the device ids that actually have a GPU executor, which is the same set `task_scheduler` keys executors on. The pin indexes this active set rather than the physical hardware topology: when the configured GPU count is smaller than the physical count, a physical-topology modulo could name a device with no executor, which the scheduler treats as "no preference" and round-robins — scattering a partition across GPUs.
+`_active_gpu_ids` starts as every device with a GPU executor — the memory manager's `Tier::GPU` memory spaces, the same set `task_scheduler` keys executors on — and is then narrowed per query: `sirius_engine::initialize_internal` computes the admitted subset and installs it via `set_active_gpu_ids()` before any pipeline is built. The pin indexes this set rather than the physical hardware topology, for two reasons. A physical-topology modulo could name a device with no executor, which the scheduler treats as "no preference" and round-robins — scattering a partition across GPUs. And a query admitted onto a subset must not pin work to a device outside it.
+
+Because the same list is used to build `pipeline_build_context`, the partition floor and the broadcast-join device→slot map agree with what the pin routes across. See [configuration.md](configuration.md) for `topology.gpus_per_query`.
+
+The other device preferences the task creator computes — the operator's own hint, GPU-resident byte counts, NUMA locality via `gpus_of()`, and a cached chunk's home device — are all derived from where data already lives and can name a device outside the admitted subset. They are clamped back into `_active_gpu_ids` at the point the preference is written to the task's local state.
+
+A task with no preference at all is confined the same way, but only when the query was admitted onto a strict subset. The scheduler hands an unpreferred task to whichever executor asks first, excluded ones included (a GPU_VALUES task carries no device-bound state and so sets no preference), so on a subset those tasks are pinned round-robin over `_active_gpu_ids`. Pinning costs the scheduler's freedom to place the task on whatever device frees up first, so it is skipped when nothing was narrowed away and there is nothing to confine.
 
 The pin is reapplied on the OOM-reschedule path (`gpu_pipeline_executor`): when a task is rebuilt with a fresh local state, its per-task `preferred_device_id` is carried forward so a rescheduled probe doesn't lose its pin and scatter.
 

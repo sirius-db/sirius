@@ -269,6 +269,7 @@ set(EXTENSION_SOURCES
     src/expression_evaluator/specializations/reference.cpp
     # Execution primitives (slot-based backpressure / completion tracking)
     src/exec/admission_control.cpp
+    src/exec/batch_stream.cpp
     # I/O adapters (Phase 19 — io_uring + sirius_datasource)
     src/io/datasource_factory.cpp
     src/io/io_context.cpp
@@ -322,6 +323,7 @@ set(EXTENSION_SOURCES
     src/op/dynamic_filter_publisher.cpp
     src/op/sirius_dynamic_filter.cpp
     src/op/sirius_physical_column_data_scan.cpp
+    src/op/sirius_physical_streaming_sink.cpp
     src/op/sirius_physical_streaming_source.cpp
     src/op/sirius_physical_concat.cpp
     src/op/sirius_physical_cte.cpp
@@ -462,6 +464,12 @@ list(APPEND EXTENSION_SOURCES ${SIRIUS_SUBSTRAIT_SOURCES})
 build_static_extension(sirius ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 build_loadable_extension(sirius CPP ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 
+# The standalone FFI constructs an embedded DuckDB, which needs the no-op static
+# extension loader retained regardless of archive ordering.
+set_property(
+  TARGET sirius_loadable_extension
+  PROPERTY LINK_LIBRARY_OVERRIDE_dummy_static_extension_loader WHOLE_ARCHIVE)
+
 # rapidsai/rmm#826: DuckDB links the loadable extension with
 # -Wl,--exclude-libs,ALL, under which mold (but not bfd) hides RMM's GNU_UNIQUE
 # current-device-resource registry symbols, so cuDF's internal allocations
@@ -518,7 +526,9 @@ foreach(_target sirius_extension sirius_loadable_extension)
   # protobuf.
   target_include_directories(
     ${_target}
-    PRIVATE ${SIRIUS_SUBSTRAIT_DIR}/src/include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/extension/core_functions/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/extension/parquet/include
+            ${SIRIUS_SUBSTRAIT_DIR}/src/include
             ${SIRIUS_SUBSTRAIT_DIR}/third_party
             ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait)
 
@@ -541,6 +551,8 @@ foreach(_target sirius_extension sirius_loadable_extension)
     cuCascade::cucascade_cudf
     yaml-cpp::yaml-cpp
     telemetry_bridge
+    core_functions_extension
+    parquet_extension
     simpatico)
 
   add_dependencies(${_target} duckdb_static)
@@ -622,6 +634,7 @@ set(TEST_SOURCES
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
     test/cpp/config/test_object_store_config.cpp
+    test/cpp/config/test_topology_config.cpp
     test/cpp/data/test_convertible_data_batch.cpp
     test/cpp/data/test_data_repository_manager_registry.cpp
     test/cpp/data/test_convertible_gpu_pipeline_task.cpp
@@ -629,8 +642,8 @@ set(TEST_SOURCES
     test/cpp/creator/test_task_creator.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
+    test/cpp/exec/test_batch_stream.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
-    test/cpp/exec/test_exchange_channel.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_multi_index_priority_queue.cpp
@@ -665,6 +678,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_null_safe_join.cpp
     test/cpp/integration/test_gpu_execution_order_nulls.cpp
     test/cpp/integration/test_gpu_execution_parquet_nulls.cpp
+    test/cpp/integration/test_gpu_execution_semantic_cast_fallback.cpp
     test/cpp/integration/test_parquet_null_predicate_pushdown.cpp
     test/cpp/integration/test_query_lifecycle_slot.cpp
     test/cpp/integration/test_gpu_execution_tpcds_nulls.cpp
@@ -677,6 +691,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_pin_table_mvcc_foundation.cpp
     test/cpp/integration/test_pin_table_mvcc_insert.cpp
     test/cpp/integration/test_pin_table_mvcc_update.cpp
+    test/cpp/integration/test_pin_table_type_drift.cpp
     test/cpp/integration/test_pin_table_zone_map_pruning.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/integration/test_transparent_runtime_fallback.cpp
@@ -722,6 +737,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_partition.cpp
     test/cpp/operator/test_physical_projection.cpp
     test/cpp/operator/test_physical_result_collector.cpp
+    test/cpp/operator/test_physical_streaming_sink.cpp
     test/cpp/operator/test_physical_streaming_source.cpp
     test/cpp/operator/test_physical_table_scan.cpp
     test/cpp/operator/test_no_history_peak_memory_estimate.cpp
@@ -732,6 +748,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_sirius_dynamic_filter_mgpu.cpp
     test/cpp/parallel/test_task_executor.cpp
     test/cpp/planner/test_compressed_schema_propagation.cpp
+    test/cpp/planner/test_gpu_admission.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
     test/cpp/planner/test_dynamic_filter_router.cpp
@@ -751,10 +768,12 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_get_next_ports_after_sink.cpp
     test/cpp/pipeline/test_merge_pipeline_fusion.cpp
     test/cpp/pipeline/test_partition_build_pipelines.cpp
+    test/cpp/pipeline/test_pipeline_build_context.cpp
     test/cpp/pipeline/test_pipeline_dynamic_filter_native_shape.cpp
     test/cpp/pipeline/test_pipeline_schedule_canonical.cpp
     test/cpp/pipeline/test_plan_printer.cpp
     test/cpp/pipeline/test_repository_wiring_materializer.cpp
+    test/cpp/pipeline/test_streaming_sink_root.cpp
     test/cpp/pipeline/test_task_scheduler.cpp
     test/cpp/scan/bench_decode_codecs.cpp
     test/cpp/scan/test_can_serve_with_columns.cpp

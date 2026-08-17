@@ -55,46 +55,120 @@ See [Scan](scan.md) for the full scan subsystem (scan manager, `gpu_ingestible`,
 ### `sirius_physical_streaming_source` — `STREAMING_SOURCE`
 **File:** `src/include/op/sirius_physical_streaming_source.hpp`
 
-Source operator that marks the bottom boundary of an intermediate pipeline fragment. It pulls
-`exchange_batch_handle` records (batch-id + size) from a bounded `exec::exchange_channel`, resolves
-each handle via a `cucascade::shared_data_repository`, and publishes the batch into the pipeline
-as a `pipelineable_operator_data`. Used only when a fragment's input arrives from another node
-over exchange; a leaf fragment keeps its normal `GPU_SCAN` source.
+Source operator that marks the bottom boundary of an intermediate pipeline fragment. Producers
+call `push(batch)` / `close_input(sender_id)`; the operator publishes each queued
+`cucascade::data_batch` into the pipeline as a `pipelineable_operator_data`, one per task. Used
+only when a fragment's input arrives from another node over exchange; a leaf fragment keeps its
+normal `GPU_SCAN` source.
 
-Key design invariants:
-- The channel carries **handles**, not `shared_ptr`s — the repository owns the batch so queued
-  items remain spill-visible to the downgrade executor.
-- Engine workers use `try_pop` only (non-blocking); `push`/`pop` are provided for the wrapper/test side.
-- EOS is **close-then-drain**: `close()` forbids new pushes; queued handles stay poppable;
-  `drained()` (= `closed() && empty()`) is the terminal predicate.
+Unlike a `GPU_SCAN` it does not own its input — batches arrive at runtime — so an empty queue means
+*wait*, not *exhausted*. It holds one `exec::batch_stream`: a borrowed
+`cucascade::shared_data_repository` (**the queue** — batches sit there until a task claims one,
+spill-visible to the downgrade executor when the caller registered that repository with the memory
+manager) bound to the stream state (sender-aware end-of-stream, the availability classification,
+the `on_data` notification, and the producer-error plane).
+
+Key design invariants (full S1–S5 / P1–P4 in [Streaming Sessions](streaming-sessions.md#contracts-s1-s5)):
+- Batches cross natively, in their current tier — no Arrow, no forced GPU upgrade.
+- EOS is **sender-aware**: `close_input(sender)` is idempotent per sender, and the stream ends
+  only once every *expected* sender has closed. An unexpected sender id is a defined error.
+- **S1** — every batch lands in the repository before `on_data` announces it; `push()` returns
+  false once the stream is terminal.
+- **S2** — `fail_input` wakes a parked consumer (on_data / P4 for the engine path) for the rethrow.
+- **S3** — an errored stream never reports `END_OF_STREAM` / `drained()`; exit is the rethrow.
+- **S4** — `try_pull` / task input rethrows before popping queued batches.
+- **S5** — `wait` then pull is not atomic; blocking loops must re-check.
 - `execute()` is a pure pass-through (COLUMN_DATA_SCAN shape — no GPU work).
 - `no_history_peak_memory_estimate()` returns `stats.bytes` (no extra allocation).
 
-Hint table:
+Hint state machine (contrast with `GPU_SCAN`: `READY{this} → drain blocking condvar → nullopt`):
 
-| Channel state | `get_next_task_hint()` |
+```
+WAITING{nullptr} ◄──── classify()=WAITING (open, empty)
+      │                      ▲
+      │ request dropped       │ try_pull() drains; stream still open
+      │                      │
+      └──► push() fires on_data ──► creator->schedule(head) ──► READY{this}
+                                                                      │
+                                              classify()=HAS_DATA ───┘
+                                              get_next_task_input_data() pops one batch
+                                              (or rethrows on error — S4)
+
+classify()=END_OF_STREAM ──► nullopt ──► on_end_of_stream ──► pipeline finishes
+```
+
+| Stream state | `get_next_task_hint()` |
 |---|---|
-| non-empty (open or closed) | `READY{this}` |
-| open, empty | `WAITING{nullptr}` — re-armable by the session on push (#839) |
-| closed && drained | `std::nullopt` — EOS |
+| `HAS_DATA` (queued or errored, open or ended) | `READY{this}` |
+| `WAITING` (open, empty) | `WAITING{nullptr}` — the next `push()` re-nominates the head |
+| `END_OF_STREAM` | `std::nullopt` |
 
-`all_ports_empty()` is overridden to `_input_channel->drained()`, driving both the task-creation
-loop guard and the port-less source pipeline-finish predicate.
+`all_ports_empty()` is `stream.drained()` — a clean end only: every sender closed, queue empty, no
+pending error. It drives both the task-creation loop guard and the port-less source
+pipeline-finish predicate. Emptiness is evaluated under the stream's own lock — otherwise a batch
+admitted between the check and the lock could be reported as end-of-stream and dropped.
 
-Channel close notifies the pipeline (`update_pipeline_status(false)`, via a weak pipeline
-reference wired in `set_pipeline`), so an empty or late-closed stream still finishes its
+**The live wake-up.** The head is scheduled once by `start_query()` and task completion only
+nominates downstream consumers, so `on_data` — fired by every successful `push()` — is the only
+thing that brings a dropped source back. It is deliberately not one-shot; `batch_stream::set_on_data`
+explains why.
+
+End-of-stream separately notifies the pipeline (`update_pipeline_status(false)`, via a weak
+pipeline reference wired in `set_pipeline`), so an empty or late-closed stream still finishes its
 pipeline — and re-arms downstream consumers — even when no task is left in flight.
 
-**Producer contract**: register the incoming batch in the input repository (`add_data_batch`) *first*,
-then push the handle. The session (#839) owns edge-triggered re-scheduling; the plan generator (#838)
-owns channel wiring.
+**No channel-level backpressure.** Producers push into the repository and the downgrade executor
+relieves memory pressure. Sirius has no upward "stop producing" signal today (hints are only
+`READY` / `WAITING` / nothing), so the intended lever is per-fragment priority, not a bounded
+queue.
 
-**Backpressure (open integration requirement for #839)**: `try_pop()` frees channel item/byte
-capacity at task-creation time, but the popped batches move into the unbounded task-scheduler
-queue — the channel bound therefore does not bound total outstanding data. When #839 wires the
-session, task creation must be gated on in-flight work (e.g. counting via the channel's `on_pop`
-hook and the task-completion path) so a fast producer cannot accumulate an arbitrarily large GPU
-backlog behind a nominally bounded channel.
+### `sirius_physical_streaming_sink` — `STREAMING_SINK`
+**File:** `src/include/op/sirius_physical_streaming_sink.hpp`
+
+Terminal operator of a streaming fragment: every batch the pipeline produces is pushed into one
+`exec::batch_stream` and exposed to an external consumer via `pull()` / `wait()` / `drained()`.
+
+Where the source stands where no table exists, the sink stands where no `RESULT_COLLECTOR` exists:
+the fragment's output travels through an `exec::batch_stream` over a caller-supplied output
+repository rather than into a query result. It is shaped
+like `RESULT_COLLECTOR` (appended to `current` in `build_pipelines`, set as the meta-pipeline sink)
+so the executor places it at `operators[last]` and drives its `on_finalize_operator()` — which is
+the only route to end-of-stream for the output stream.
+
+Lifecycle:
+
+```
+sink(batch) ──► batch_stream[i].push(batch)     (per task, per destination partition)
+      │
+on_finalize_operator()                           (pipeline finish — the only EOS path)
+      │
+batch_stream[i].close(PIPELINE_SENDER)           (for every output stream i)
+      │
+consumers see END_OF_STREAM via wait(i) / drained(i)
+```
+
+Key design facts:
+- **One sender, one finalize.** The pipeline feeding this sink is its single expected sender
+  (`PIPELINE_SENDER = 0`). `on_finalize_operator()` calls `close(PIPELINE_SENDER)` on the output
+  `exec::batch_stream`, which is what makes it terminal. Without `build_pipelines` placing the sink in
+  `operators`, `on_finalize_operator()` is never called and every consumer blocked in `wait()`
+  hangs forever with no error visible.
+- **No self-nomination.** Unlike the source, the sink does not wire an `on_data` hook: its consumer
+  is an external thread blocking in `wait()`, not an engine task needing re-nomination.
+- **Native tier.** Batches are pushed in whatever tier they arrived — no Arrow, no forced GPU
+  upgrade. A queued batch stays spillable in the repository until pulled.
+- **execute() is a pass-through** (same shape as `RESULT_COLLECTOR`): it hands the batches back so
+  `publish_output()` can deliver them to `sink()`. The base implementation drops them.
+- **Partitioned variant (N destinations).** The second constructor takes N repositories and a
+  `partition_spec` (`mode`, key columns + optional casts, validated at construction).
+  `partition_mode::hash` GPU-hash-partitions each input batch and routes slice *i* into
+  `_outputs[i]`, skipping empty slices. `partition_mode::broadcast` replicates every batch to all
+  N outputs: output 0 gets the original handle, outputs 1..N−1 get independent `clone()`s with
+  fresh `batch_id`s. Each destination has its own `exec::batch_stream` and EOS reaches all of them
+  on a single `on_finalize_operator()` call. When N = 1 the spec is ignored and a native push
+  bypasses routing entirely. `no_history_peak_memory_estimate()` stays 0 for N = 1 and becomes 2×
+  the input for N > 1: hash_partition holds a reordered copy + slices; broadcast holds the
+  original + N−1 clones simultaneously.
 
 ### `sirius_physical_dummy_scan` — `DUMMY_SCAN`
 **File:** `src/include/op/sirius_physical_dummy_scan.hpp`
@@ -376,7 +450,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | Operator | Category | GPU Method |
 |----------|----------|-----------|
 | GPU_SCAN | Scan | Unified GPU scan source served by `sirius_scan_manager` via a per-format `gpu_ingestible` |
-| STREAMING_SOURCE | Scan | Exchange-input source; pulls batch handles from `exchange_channel`, resolves via `shared_data_repository` |
+| STREAMING_SOURCE | Scan | Exchange-input source; drains an `exec::batch_stream` |
 | DUMMY_SCAN | Scan | Generates 1 row |
 | COLUMN_DATA_SCAN | Scan | Reads ColumnDataCollection |
 | FILTER | Relational | `expression_evaluator::select()` |
@@ -401,3 +475,4 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | CTE | CTE | Materialize to ColumnDataCollection |
 | RESULT_COLLECTOR | Result | Final result materialization |
 | EMPTY_RESULT | Result | Empty result set |
+| STREAMING_SINK | Result | Terminal operator of a streaming fragment |

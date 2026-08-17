@@ -70,6 +70,27 @@ std::optional<cudf::data_type> expression_evaluator::narrow_domain_carrier(
   return carrier;
 }
 
+std::optional<cudf::data_type> expression_evaluator::narrow_domain_reference_pair_carrier(
+  sirius::ast::node const& lhs, sirius::ast::node const& rhs) const
+{
+  if (!lhs.holds<sirius::ast::reference>() || !rhs.holds<sirius::ast::reference>()) {
+    return std::nullopt;
+  }
+  auto const& lhs_ref    = lhs.get<sirius::ast::reference>();
+  auto const& rhs_ref    = rhs.get<sirius::ast::reference>();
+  auto const num_columns = static_cast<std::uint32_t>(_input_table.num_columns());
+  if (lhs_ref.column_index >= num_columns || rhs_ref.column_index >= num_columns) {
+    return std::nullopt;
+  }
+  auto const lhs_carrier = _input_table.column(lhs_ref.column_index).type();
+  auto const rhs_carrier = _input_table.column(rhs_ref.column_index).type();
+  if (!sirius::ast::narrow_domain_reference_pair_eligible(
+        lhs_ref.return_type(), lhs_carrier, rhs_ref.return_type(), rhs_carrier)) {
+    return std::nullopt;
+  }
+  return lhs_carrier;
+}
+
 evaluate_result expression_evaluator::evaluate_narrow_domain_operand(
   sirius::ast::node const& operand,
   std::optional<cudf::data_type> narrow_carrier,

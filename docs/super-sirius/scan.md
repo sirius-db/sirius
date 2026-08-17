@@ -156,7 +156,7 @@ For nested types (`STRUCT`, `LIST`, `MAP`), one DuckDB column maps to multiple p
 ### Lifecycle
 
 1. **Plan stage.** During pipeline conversion the bind data is lowered into an `ingestible_table_info`, `make_ingestible(...)` builds the `gpu_ingestible`, and a `sirius_gpu_scan_operator` carrying it is inserted as the pipeline source. The operator constructs its own (empty) `split_connector`.
-2. **Per-query preparation.** `prepare_for_query(query)` resets prior state, builds a `round_robin_strategy` over the topology's GPU ids and a fresh `load_balancing_scan_batch_coalescer`, then walks the query's `GPU_SCAN` operators in order. For each it `register_pipeline`s a sequencer slot (which builds the ingestible's `batch_coalescer` and captures the operator's connector). Then either:
+2. **Per-query preparation.** `prepare_for_query(query, pruning, allocated_gpu_ids)` resets prior state, builds a `round_robin_strategy` over the query's admitted GPU ids and a fresh `load_balancing_scan_batch_coalescer`, then walks the query's `GPU_SCAN` operators in order. The admitted set is passed in by `SiriusContext::create_query`, which reads it back off `task_creator` after `sirius_engine::initialize_internal` installed it — so scan placement, partition pins and `pipeline_build_context` all draw on one list (see [configuration.md](configuration.md) for `topology.gpus_per_query`). For each it `register_pipeline`s a sequencer slot (which builds the ingestible's `batch_coalescer` and captures the operator's connector). Then either:
    - **Cache hit** — `try_assign_cached_entries` finds a pinned entry whose identity and columns can serve the scan; it attaches a `databatch_provider` to the slot and skips disk reading entirely; or
    - **Cache miss** — a `split_provider` is built over the operator's ingestible and stored in `_providers_by_op`.
 3. **Execution.** `start_metadata_processing` spawns the single sequencer worker on the dispatcher, then calls `split_provider::run` for each non-cached operator. `run` iterates `has_more_splits` / `next_split_provider` and hands each claimed metadata task to the dispatcher; each task enqueues its `scan_info` onto the operator's sequencer slot queue. The sequencer worker walks slots in registration order, coalescing each slot's metadata into data-batch splits, balancing each onto a GPU, firing `fadvise`/`opportunistic` prefetch, and pushing a `scan_operator_input` onto the operator's connector. Consumers (the scan operators) block in `split_connector::get_next_split` until splits arrive.
@@ -172,7 +172,7 @@ This is the per-query sequencer. Each `GPU_SCAN` operator gets a `metadata_proce
 
 ### Device balancing
 
-`balancing_strategy` decouples *which GPU a split runs on* from *how splits are produced*. `round_robin_strategy` hands out devices from the topology's GPU id set via a single shared atomic cursor, spreading splits evenly across GPUs and continuously across the whole scan stage. The chosen device is recorded on the split via `set_preferred_device_id`; the task creator reads it back when it builds the `gpu_pipeline_task` so the scheduler dispatches to that GPU. (Cached/resident inputs carry no balancer-assigned device; the task creator derives their device from the chunk's resident `memory_space` for NUMA/host-pin locality — see the memory-management doc.)
+`balancing_strategy` decouples *which GPU a split runs on* from *how splits are produced*. `round_robin_strategy` hands out devices from the query's admitted GPU id set via a single shared atomic cursor, spreading splits evenly across those GPUs and continuously across the whole scan stage. The chosen device is recorded on the split via `set_preferred_device_id`; the task creator reads it back when it builds the `gpu_pipeline_task` so the scheduler dispatches to that GPU. (Cached/resident inputs carry no balancer-assigned device; the task creator derives their device from the chunk's resident `memory_space` for NUMA/host-pin locality — see the memory-management doc.)
 
 ### split_connector
 
@@ -210,15 +210,32 @@ CALL unpin_table('lineitem');
 
 Pinning drives the source's `gpu_ingestible` to completion (`materialize_all_batches` / `materialize_pin_to_host` in `pin_table.cpp`):
 
-- **Shared numeric step:** zone-map statistics, when enabled, are captured from the native decoded table first. With `enable_compressed_materialization`, a separate exact min/max reduction then selects the narrowest signed, unsigned, or same-scale DECIMAL carrier independently for each eligible column in that batch. The logical column-type vector is retained whenever either zone-map capture or narrowing needs it; it is cleared only when both features are disabled.
+- **Shared range step:** zone-map statistics, when enabled, are captured from the unnarrowed decoded
+  table first. With `enable_compressed_materialization`, a separate exact min/max reduction then
+  selects the narrowest signed, unsigned, same-scale DECIMAL, or DATE epoch-day carrier
+  independently for each eligible column in that batch. The logical column-type vector is retained
+  whenever either zone-map capture or narrowing needs it; it is cleared only when both features are
+  disabled.
 - **GPU tier** (`materialize_all_batches`): each resulting batch is stored as a GPU-resident `cudf::table`, round-robining placement across the GPU memory spaces. Placement is deterministic so re-pinning the same source yields identical per-chunk placement (required by the merge path below).
 - **HOST tier** (`materialize_pin_to_host`): each resulting batch is converted on its round-robin GPU to a `host_data_representation` that preserves carrier type and decimal scale on that GPU's NUMA-local host space, then the GPU table is freed before the next batch. Peak GPU residency is therefore ~one batch, so a host pin never needs the whole table to fit in GPU memory.
 
 ### Storage and matching
 
-Each pinned table is a `pinned_entry` keyed by name in the scan manager. It holds a `cache_entry_info` (the cache identity + column layout) plus the cached batches: `data_batches_by_column` (one chunk vector per column) for the GPU tier, or `host_chunks` (one `host_data_representation` per batch, sliced by column at scan time) for the HOST tier. It also carries a `pinned_zone_maps` sidecar — the pin-time per-column, per-chunk min/max statistics, absent when capture was disabled (see [Zone maps](#zone-maps)).
+Each pinned table is a `pinned_entry` keyed by name in the scan manager. It holds a
+`cache_entry_info` (the cache identity + column layout) plus the cached batches:
+`data_batches_by_column` (one chunk vector per column) for the GPU tier, or `host_chunks` (one
+`host_data_representation` per batch, sliced by column at scan time) for the HOST tier. Its
+`column_storage` sidecar records each chunk-column's pin-time native mapping, stored carrier, and
+narrowing marker. It also carries a `pinned_zone_maps` sidecar — the pin-time per-column, per-chunk
+min/max statistics, absent when capture was disabled (see [Zone maps](#zone-maps)).
 
-`cache_entry_info` captures format identity — the resolved parquet **file set**, or the duckdb **catalog.schema.table** — plus the cached columns (by storage index) and their names. `can_serve_with_columns(other)` returns a gather projection when this entry can serve a scan: same format, same identity, and a **column superset** of the scan's request. A parquet pin never serves a duckdb scan or vice-versa.
+`cache_entry_info` captures format identity — the resolved parquet **file set**, or the DuckDB
+**catalog.schema.table** — plus the cached columns (by storage index) and their names.
+`can_serve_with_columns(other)` returns a gather projection when this entry can serve a scan: same
+format, same identity, and a **column superset** of the scan's request. A Parquet pin never serves a
+DuckDB scan or vice versa. DuckDB cache serving additionally requires every projected column's
+current native cuDF mapping to equal the mapping recorded at pin time; a mismatch is a clean cache
+miss rather than a conversion of stale data under a new type.
 
 During `prepare_for_query`, `try_assign_cached_entries` matches each `GPU_SCAN` operator's `table_info` against the pinned entries. On a hit it builds a `cached_databatch_provider` over the matched entry, ordering columns by the ingestible's `materialized_column_order()` so a cached batch is laid out identically to a fresh disk read and `post_filter_and_project` resolves the same columns on both paths. The provider emits one cached chunk as one resident split and bypasses the fresh-read coalescer. Each split carries whether its selected columns are actually narrow, and `GPU_SCAN` normalizes that chunk to the query's planned physical schema (or the native logical schema when there is no override) before downstream operators can combine batches.
 
@@ -238,9 +255,10 @@ States the delta cannot represent decline at plan time into the transparent CPU 
 
 ### Zone maps
 
-With `enable_pinned_zone_map_pruning` enabled (the default), `pin_table` captures per-chunk
-min/max statistics and cached scans use them to skip chunks that cannot match a pushed-down
-filter. The option is available through DuckDB `SET` and YAML under `sirius.operator_params`.
+By default, `pin_table` automatically captures per-chunk min/max statistics and cached scans use
+them to skip chunks that cannot match a pushed-down filter. An advanced YAML escape hatch,
+`sirius.operator_params.enable_pinned_zone_map_pruning`, can disable both capture and pruning for
+a benchmark or diagnosis envelope. The direct DuckDB session override is test-only.
 
 **Capture and types.** Both pin tiers run one `cudf::minmax` reduction per supported column and
 chunk before the data is stored on the GPU or converted to HOST memory. Supported types are

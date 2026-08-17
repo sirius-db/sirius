@@ -25,6 +25,7 @@
  */
 
 #include "expression/aggregate_id.hpp"
+#include "expression/ast/constant_range.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/function_id.hpp"
 #include "expression/join_condition.hpp"
@@ -63,6 +64,8 @@ constexpr cudf::data_type k_int32{cudf::type_id::INT32};
 
 sirius::logical_type integer_type() { return sirius::logical_type::make(sirius::type_id::INTEGER); }
 
+sirius::logical_type date_type() { return sirius::logical_type::make(sirius::type_id::DATE); }
+
 duckdb::vector<sirius::logical_type> integer_types(std::size_t count)
 {
   duckdb::vector<sirius::logical_type> types;
@@ -70,6 +73,14 @@ duckdb::vector<sirius::logical_type> integer_types(std::size_t count)
   for (std::size_t i = 0; i < count; i++) {
     types.push_back(integer_type());
   }
+  return types;
+}
+
+duckdb::vector<sirius::logical_type> type_pair(sirius::logical_type lhs, sirius::logical_type rhs)
+{
+  duckdb::vector<sirius::logical_type> types;
+  types.push_back(std::move(lhs));
+  types.push_back(std::move(rhs));
   return types;
 }
 
@@ -257,6 +268,26 @@ duckdb::unique_ptr<sirius::op::sirius_physical_grouped_aggregate> make_grouped_a
     duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES);
   aggregate->children.push_back(std::move(child));
   return aggregate;
+}
+
+// A two-column scan of `types` carried as `physical`, filtered by the column-versus-column
+// comparison `c0 < c1` and funnelled into a constant-only projection, so each column's verdict is
+// decided purely by how the filter classifies the reference pair.
+duckdb::unique_ptr<sirius_physical_operator> make_reference_pair_plan(
+  duckdb::vector<sirius::logical_type> types, std::vector<cudf::data_type> physical)
+{
+  auto predicate = make_comparison(make_reference(0, types[0]), make_reference(1, types[1]));
+  auto filter = make_filter(std::move(predicate), make_scan(std::move(types), std::move(physical)));
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> select_list;
+  select_list.push_back(make_integer_constant(1));
+  return make_projection(integer_types(1), std::move(select_list), std::move(filter));
+}
+
+sirius_physical_operator const& pair_plan_scan(sirius_physical_operator const& plan)
+{
+  auto const& scan = *plan.children[0]->children[0];
+  REQUIRE(scan.type == SiriusPhysicalOperatorType::TABLE_SCAN);
+  return scan;
 }
 
 // The Q1 shape: scan(c0..c2 narrow, c3 native) -> filter(constant comparison on the
@@ -545,17 +576,15 @@ TEST_CASE("tier_narrowing_policy - narrow-domain comparisons rescue, ineligible 
     REQUIRE(!mismatched->children[0]->children[0]->has_physical_overrides());
   }
 
-  SECTION("a reference-versus-reference comparison does not rescue")
+  SECTION("a reference-versus-reference comparison at different carriers does not rescue")
   {
-    auto filter = make_filter(make_comparison(make_reference(0), make_reference(1)),
-                              make_integer_scan(2, {k_int8, k_int8}));
-    duckdb::vector<std::unique_ptr<sirius::ast::node>> select_list;
-    select_list.push_back(make_integer_constant(1));
-    auto plan = make_projection(integer_types(1), std::move(select_list), std::move(filter));
+    // Only a shared carrier lets a pair evaluate narrow; at different widths each reference is an
+    // ordinary evaluator restore. The shared-carrier case is covered below.
+    auto plan = make_reference_pair_plan(integer_types(2), {k_int8, k_int16});
 
     sirius::planner::apply_tier_narrowing_policy(*plan);
 
-    REQUIRE(!plan->children[0]->children[0]->has_physical_overrides());
+    REQUIRE(!pair_plan_scan(*plan).has_physical_overrides());
   }
 
   SECTION("an IN list restores in the evaluator and does not rescue")
@@ -586,6 +615,137 @@ TEST_CASE("tier_narrowing_policy - narrow-domain comparisons rescue, ineligible 
 
     REQUIRE(plan->children[0]->children[0]->get_physical_types() ==
             std::vector<cudf::data_type>{k_int32, k_int8});
+  }
+}
+
+TEST_CASE("tier_narrowing_policy - a same-carrier reference pair rescues both columns",
+          "[tier_narrowing_policy]")
+{
+  SECTION("both integer columns keep narrow")
+  {
+    auto plan = make_reference_pair_plan(integer_types(2), {k_int8, k_int8});
+
+    auto const retracted = sirius::planner::apply_tier_narrowing_policy(*plan);
+
+    // Both sides are marked, not just the one the probe happened to reach first.
+    REQUIRE(retracted == 0);
+    REQUIRE(pair_plan_scan(*plan).get_physical_types() ==
+            std::vector<cudf::data_type>{k_int8, k_int8});
+  }
+
+  SECTION("both DATE columns keep narrow")
+  {
+    auto plan = make_reference_pair_plan(type_pair(date_type(), date_type()), {k_int16, k_int16});
+
+    auto const retracted = sirius::planner::apply_tier_narrowing_policy(*plan);
+
+    REQUIRE(retracted == 0);
+    REQUIRE(pair_plan_scan(*plan).get_physical_types() ==
+            std::vector<cudf::data_type>{k_int16, k_int16});
+  }
+
+  SECTION("a column the sidecar leaves native is no pair candidate")
+  {
+    // c1 is native in the sidecar, so no pair forms and c0 falls through to the ordinary
+    // evaluator-restore classification and retracts alone.
+    auto plan = make_reference_pair_plan(integer_types(2), {k_int8, k_int32});
+
+    auto const retracted = sirius::planner::apply_tier_narrowing_policy(*plan);
+
+    REQUIRE(retracted == 1);
+    REQUIRE(!pair_plan_scan(*plan).has_physical_overrides());
+  }
+
+  SECTION("comparing one column with itself marks its single origin")
+  {
+    auto filter = make_filter(make_comparison(make_reference(0), make_reference(0)),
+                              make_integer_scan(1, {k_int8}));
+    duckdb::vector<std::unique_ptr<sirius::ast::node>> select_list;
+    select_list.push_back(make_integer_constant(1));
+    auto plan = make_projection(integer_types(1), std::move(select_list), std::move(filter));
+
+    auto const retracted = sirius::planner::apply_tier_narrowing_policy(*plan);
+
+    REQUIRE(retracted == 0);
+    REQUIRE(plan->children[0]->children[0]->get_physical_types() ==
+            std::vector<cudf::data_type>{k_int8});
+  }
+
+  SECTION("a boundary restore still vetoes the pair rescue")
+  {
+    // Both columns engage the pair, but c0 is also a SUM input: the restore projection the
+    // aggregate forces below itself outweighs the rescue, while c1 keeps its group-key transport.
+    auto filter = make_filter(make_comparison(make_reference(0), make_reference(1)),
+                              make_integer_scan(2, {k_int8, k_int8}));
+    auto plan   = make_grouped_aggregate({1}, {0}, std::move(filter));
+
+    auto const retracted = sirius::planner::apply_tier_narrowing_policy(*plan);
+
+    REQUIRE(retracted == 1);
+    REQUIRE(plan->children[0]->children[0]->get_physical_types() ==
+            std::vector<cudf::data_type>{k_int32, k_int8});
+  }
+}
+
+TEST_CASE("tier_narrowing_policy - pair verdicts track the shared eligibility predicate",
+          "[tier_narrowing_policy]")
+{
+  // The policy's plan-time pair probe must accept exactly what the evaluator's
+  // `narrow_domain_reference_pair_eligible` accepts at runtime: a plan that keeps a pair narrow on
+  // a shape the evaluator then restores pays the restore the verdict assumed it had avoided. Each
+  // row states the predicate's answer for one (logical, carrier) quadruple and asserts the policy
+  // agrees -- kept at the planned carriers when eligible, retracted to native when not.
+  struct pair_case {
+    char const* description;
+    sirius::logical_type lhs;
+    cudf::data_type lhs_carrier;
+    sirius::logical_type rhs;
+    cudf::data_type rhs_carrier;
+    bool eligible;
+  };
+
+  auto const decimal_2 = sirius::logical_type::make_decimal(18, 2);
+  auto const decimal_3 = sirius::logical_type::make_decimal(18, 3);
+  cudf::data_type const decimal32_2{cudf::type_id::DECIMAL32, -2};
+  cudf::data_type const decimal32_3{cudf::type_id::DECIMAL32, -3};
+  auto const smallint = sirius::logical_type::make(sirius::type_id::SMALLINT);
+  auto const bigint   = sirius::logical_type::make(sirius::type_id::BIGINT);
+  auto const uinteger = sirius::logical_type::make(sirius::type_id::UINTEGER);
+  cudf::data_type const k_uint16{cudf::type_id::UINT16};
+
+  std::vector<pair_case> const cases{
+    {"integers at one carrier", integer_type(), k_int8, integer_type(), k_int8, true},
+    {"different logical widths at one carrier", bigint, k_int16, integer_type(), k_int16, true},
+    {"dates at one carrier", date_type(), k_int16, date_type(), k_int16, true},
+    {"decimals at one carrier and scale", decimal_2, decimal32_2, decimal_2, decimal32_2, true},
+    {"integers at different carriers", integer_type(), k_int8, integer_type(), k_int16, false},
+    {"epoch days against plain integers", date_type(), k_int16, integer_type(), k_int16, false},
+    {"plain integers against epoch days", integer_type(), k_int16, date_type(), k_int16, false},
+    {"an already-minimal type is not narrowed", smallint, k_int16, integer_type(), k_int16, false},
+    {"decimals at different scales", decimal_2, decimal32_2, decimal_3, decimal32_3, false},
+    {"unsigned against signed", uinteger, k_uint16, integer_type(), k_int16, false},
+  };
+
+  for (auto const& test_case : cases) {
+    DYNAMIC_SECTION(test_case.description)
+    {
+      REQUIRE(sirius::ast::narrow_domain_reference_pair_eligible(
+                test_case.lhs, test_case.lhs_carrier, test_case.rhs, test_case.rhs_carrier) ==
+              test_case.eligible);
+
+      std::vector<cudf::data_type> const physical{test_case.lhs_carrier, test_case.rhs_carrier};
+      auto plan = make_reference_pair_plan(type_pair(test_case.lhs, test_case.rhs), physical);
+
+      sirius::planner::apply_tier_narrowing_policy(*plan);
+
+      auto const& scan = pair_plan_scan(*plan);
+      if (test_case.eligible) {
+        REQUIRE(scan.get_physical_types() == physical);
+      } else {
+        // Every ineligible row retracts each carried column to native, which empties the sidecar.
+        REQUIRE(!scan.has_physical_overrides());
+      }
+    }
   }
 }
 

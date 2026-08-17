@@ -73,6 +73,17 @@ task_creator::task_creator(task_creator_config config,
 
 task_creator::~task_creator() { stop(); }
 
+void task_creator::set_active_gpu_ids(std::vector<int> ids, std::size_t full_count)
+{
+  _active_gpu_ids = std::move(ids);
+  _full_gpu_count = full_count;
+}
+
+const std::vector<int>& task_creator::get_active_gpu_ids() const noexcept
+{
+  return _active_gpu_ids;
+}
+
 void task_creator::set_client_context(::duckdb::ClientContext& client_context)
 {
   std::lock_guard<std::mutex> lock(_global_state_mutex);
@@ -526,6 +537,26 @@ void task_creator::manager_loop()
                       preferred_device_id.value_or(-1));
                   }
                 }
+              }
+            }
+            // Confine the task to the admitted subset. Every preference above except the
+            // partition pin comes from where data lives rather than from the subset, and the
+            // scheduler treats a preference as binding — so an excluded id would be honoured.
+            // Clamping a residency-derived one costs the locality it encoded, but honouring
+            // it would put the query on a GPU it was not admitted to. An unpreferred task
+            // escapes too: the scheduler gives those to whichever executor asks first. Pin
+            // those as well, but only on a real subset, since a pin costs the scheduler's
+            // freedom to place them wherever frees up first.
+            if (!_active_gpu_ids.empty()) {
+              bool const names_excluded_device =
+                preferred_device_id.has_value() &&
+                std::find(_active_gpu_ids.begin(), _active_gpu_ids.end(), *preferred_device_id) ==
+                  _active_gpu_ids.end();
+              bool const unpinned_on_a_subset =
+                !preferred_device_id.has_value() && _active_gpu_ids.size() < _full_gpu_count;
+              if (names_excluded_device || unpinned_on_a_subset) {
+                auto const idx      = _admission_rr.fetch_add(1) % _active_gpu_ids.size();
+                preferred_device_id = _active_gpu_ids[idx];
               }
             }
             if (preferred_device_id.has_value()) {

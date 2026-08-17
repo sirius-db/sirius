@@ -159,7 +159,10 @@ void restore_columns_matching(duckdb::unique_ptr<sirius::op::sirius_physical_ope
       auto reference = std::make_unique<sirius::ast::node>(
         sirius::ast::reference{static_cast<std::uint32_t>(column_idx)});
       expressions.push_back(std::make_unique<sirius::ast::node>(
-        sirius::ast::cast{std::move(reference), input->types[column_idx], /*try_cast=*/false}));
+        sirius::ast::cast{std::move(reference),
+                          input->types[column_idx],
+                          /*try_cast=*/false,
+                          sirius::ast::cast_kind::carrier_restore}));
       output_schema[column_idx] = native[column_idx];
     } else {
       expressions.push_back(std::make_unique<sirius::ast::node>(
@@ -543,8 +546,9 @@ void prune_immediate_scan_restores(duckdb::unique_ptr<sirius::op::sirius_physica
   for (auto& expression : projection.select_list) {
     if (!expression || !expression->holds<sirius::ast::cast>()) { continue; }
     auto const& cast_expr = expression->get<sirius::ast::cast>();
-    if (cast_expr.try_cast || !cast_expr.child ||
-        !cast_expr.child->holds<sirius::ast::reference>()) {
+    // Only pass-emitted restores may be pruned. A same-shaped semantic cast must survive.
+    if (cast_expr.kind != sirius::ast::cast_kind::carrier_restore || cast_expr.try_cast ||
+        !cast_expr.child || !cast_expr.child->holds<sirius::ast::reference>()) {
       continue;
     }
     auto const input_idx = cast_expr.child->get<sirius::ast::reference>().column_index;

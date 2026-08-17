@@ -37,6 +37,7 @@
 #include <memory/sirius_memory_reservation_manager.hpp>
 #include <utils/utils.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdlib>  // for setenv/putenv
@@ -211,10 +212,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     setenv("SIRIUS_DISABLE", "1", 1);
   }};
 
-  auto setting_count = [](duckdb::Connection& con) {
-    auto result = con.Query(
-      "SELECT count(*) FROM duckdb_settings() "
-      "WHERE name = 'sirius_test_inject_transparent_gpu_error'");
+  auto setting_count = [](duckdb::Connection& con, std::string const& name) {
+    auto result = con.Query("SELECT count(*) FROM duckdb_settings() WHERE name = '" + name + "'");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     return result->GetValue(0, 0).GetValue<int64_t>();
@@ -225,8 +224,20 @@ TEST_CASE("Test-only settings require explicit process opt-in",
   {
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
-    REQUIRE(setting_count(con) == 0);
+    REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 0);
+    REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 0);
+    REQUIRE(setting_count(con, "enable_dynamic_filter_pushdown") == 0);
+    REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 0);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    result = con.Query("SET enable_pinned_zone_map_pruning = false");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    result = con.Query("SET enable_dynamic_filter_pushdown = false");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    result = con.Query("SET enable_dynamic_zone_map_filter = true");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
   }
@@ -235,15 +246,39 @@ TEST_CASE("Test-only settings require explicit process opt-in",
   {
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
-    REQUIRE(setting_count(con) == 0);
+    REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 0);
+    REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 0);
+    REQUIRE(setting_count(con, "enable_dynamic_filter_pushdown") == 0);
+    REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 0);
   }
 
   setenv("SIRIUS_ENABLE_TEST_OPTIONS", "1", 1);
   {
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
-    REQUIRE(setting_count(con) == 1);
+    REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 1);
+    REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 1);
+    REQUIRE(setting_count(con, "enable_dynamic_filter_pushdown") == 1);
+    REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 1);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET enable_pinned_zone_map_pruning = false");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("RESET enable_pinned_zone_map_pruning");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET enable_dynamic_filter_pushdown = false");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("RESET enable_dynamic_filter_pushdown");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET enable_dynamic_zone_map_filter = true");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("RESET enable_dynamic_zone_map_filter");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
   }
@@ -295,6 +330,386 @@ TEST_CASE("Sirius configuration rejects zero hash partition bytes", "[sirius][co
   REQUIRE_THROWS_WITH(
     config.load_from_file(cfg),
     Catch::Contains("hash_partition_bytes") && Catch::Contains("greater than zero"));
+}
+
+TEST_CASE("Sirius configuration rejects negative host capacity bytes", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  fs::path cfg =
+    fs::path(loc.file_name()).parent_path() / "data" / "invalid_memory_host_capacity_negative.yaml";
+
+  sirius::sirius_config config;
+  REQUIRE_THROWS_WITH(config.load_from_file(cfg),
+                      Catch::Contains("memory.host.capacity_bytes") &&
+                        Catch::Contains("byte value must be non-negative"));
+}
+
+TEST_CASE("Sirius configuration validates MARK join build switch ratio", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+
+  sirius::sirius_config config;
+  auto const default_ratio = config.get_operator_params().mark_join_build_switch_ratio;
+  REQUIRE_THROWS_WITH(
+    config.load_from_file(data_dir / "invalid_mark_join_switch_negative.yaml"),
+    Catch::Contains("mark_join_build_switch_ratio") && Catch::Contains("value out of range"));
+  REQUIRE(config.get_operator_params().mark_join_build_switch_ratio == Approx(default_ratio));
+  REQUIRE_THROWS_WITH(
+    config.load_from_file(data_dir / "invalid_mark_join_switch_nan.yaml"),
+    Catch::Contains("mark_join_build_switch_ratio") && Catch::Contains("value out of range"));
+  REQUIRE(config.get_operator_params().mark_join_build_switch_ratio == Approx(default_ratio));
+  REQUIRE_NOTHROW(config.load_from_file(data_dir / "valid_mark_join_switch_zero.yaml"));
+  REQUIRE(config.get_operator_params().mark_join_build_switch_ratio == Approx(0.0));
+}
+
+TEST_CASE("Sirius YAML rejects invalid dynamic-filter thresholds", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+
+  struct invalid_config {
+    const char* fixture;
+    const char* setting;
+  };
+  const invalid_config cases[] = {
+    {"invalid_dynamic_filter_domain_coverage_threshold.yaml",
+     "dynamic_filter_domain_coverage_threshold"},
+    {"invalid_dynamic_filter_domain_coverage_threshold_nan.yaml",
+     "dynamic_filter_domain_coverage_threshold"},
+    {"invalid_dynamic_filter_keep_threshold_negative.yaml", "dynamic_filter_keep_threshold"},
+    {"invalid_dynamic_filter_keep_threshold_above_one.yaml", "dynamic_filter_keep_threshold"},
+    {"invalid_dynamic_filter_keep_threshold_nan.yaml", "dynamic_filter_keep_threshold"},
+  };
+
+  for (auto const& invalid : cases) {
+    INFO("fixture=" << invalid.fixture << " setting=" << invalid.setting);
+    auto const path = data_dir / invalid.fixture;
+    REQUIRE(fs::is_regular_file(path));
+
+    sirius::sirius_config config;
+    REQUIRE_THROWS_WITH(config.load_from_file(path),
+                        Catch::Contains(invalid.setting) && Catch::Contains("value out of range"));
+  }
+
+  sirius::sirius_config config;
+  REQUIRE_NOTHROW(
+    config.load_from_file(data_dir / "valid_dynamic_filter_threshold_boundaries.yaml"));
+  REQUIRE(config.get_operator_params().dynamic_filter_domain_coverage_threshold == Approx(1.5));
+  REQUIRE(config.get_operator_params().dynamic_filter_keep_threshold == Approx(0.0));
+}
+
+TEST_CASE("Sirius configuration rejects invalid GPU topology selections", "[sirius][config]")
+{
+  struct invalid_config {
+    const char* fixture;
+    const char* expected;
+  };
+  const invalid_config cases[] = {
+    {"invalid_topology_empty_gpu_ids.yaml", "at least one device id"},
+    {"invalid_topology_negative_gpu_id.yaml", "only non-negative device ids"},
+    {"invalid_topology_duplicate_gpu_ids.yaml", "duplicate device ids"},
+    {"invalid_topology_gpu_ids_and_num_gpus.yaml", "mutually exclusive"},
+    {"invalid_topology_negative_num_gpus.yaml", "num_gpus must be non-negative"},
+  };
+
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+  for (auto const& invalid : cases) {
+    INFO("fixture=" << invalid.fixture);
+    sirius::sirius_config config;
+    REQUIRE_THROWS_WITH(config.load_from_file(data_dir / invalid.fixture),
+                        Catch::Contains("topology") && Catch::Contains(invalid.expected));
+  }
+}
+
+TEST_CASE("Sirius configuration rejects invalid compression retention fractions",
+          "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+  sirius::sirius_config config;
+  for (auto const* fixture : {"invalid_compression_fraction_negative.yaml",
+                              "invalid_compression_fraction_nan.yaml",
+                              "invalid_compression_fraction_infinity.yaml"}) {
+    INFO("fixture=" << fixture);
+    REQUIRE_THROWS_WITH(config.load_from_file(data_dir / fixture),
+                        Catch::Contains("max_compressed_fraction"));
+  }
+}
+
+TEST_CASE("Sirius configuration accepts intentional compression retention fraction boundaries",
+          "[sirius][config]")
+{
+  std::source_location loc    = std::source_location::current();
+  auto const data_dir         = fs::path(loc.file_name()).parent_path() / "data";
+  auto const require_fraction = [&data_dir](char const* fixture, double expected) {
+    INFO("fixture=" << fixture);
+    sirius::sirius_config config;
+    REQUIRE_NOTHROW(config.load_from_file(data_dir / fixture));
+    REQUIRE(config.get_compression_config().max_compressed_fraction == Approx(expected));
+  };
+
+  require_fraction("valid_compression_fraction_zero.yaml", 0.0);
+  require_fraction("valid_compression_fraction_above_one.yaml", 1.5);
+}
+
+namespace {
+
+void require_shared_operator_defaults(const sirius::operator_params& params, uint64_t batch)
+{
+  REQUIRE(params.scan_task_batch_size == batch);
+  REQUIRE(params.hash_partition_bytes == batch);
+  REQUIRE(params.concat_batch_bytes == batch);
+  REQUIRE(params.sort_sample_bytes == batch);
+  REQUIRE(params.max_build_hash_table_bytes == 2 * batch);
+}
+
+fs::path config_fixture(std::string const& name)
+{
+  std::source_location loc = std::source_location::current();
+  return fs::path(loc.file_name()).parent_path() / "data" / name;
+}
+
+uint64_t expected_effective_batch(const sirius::sirius_config& config)
+{
+  std::optional<uint64_t> min_capacity;
+  for (auto const& space : config.get_memory_space_configs()) {
+    auto const* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
+    if (gpu == nullptr || gpu->memory_capacity == 0) { continue; }
+    auto const capacity = static_cast<uint64_t>(gpu->memory_capacity);
+    min_capacity        = min_capacity ? std::min(*min_capacity, capacity) : capacity;
+  }
+  REQUIRE(min_capacity.has_value());
+  return std::min(sirius::config::derived_default_batch_size(),
+                  std::max<uint64_t>(1, *min_capacity / 40));
+}
+
+}  // namespace
+
+TEST_CASE("Sirius derives GPU pipeline affinity from hardware topology", "[sirius][config]")
+{
+  sirius::sirius_config config;
+  REQUIRE_THROWS_WITH(config.load_from_file(config_fixture("invalid_pipeline_cpu_affinity.yaml")),
+                      Catch::Contains("unknown config key: 'cpu_affinity' in thread_pool"));
+}
+
+TEST_CASE("operator batch defaults use the smallest low-level GPU capacity",
+          "[sirius][config][operator_defaults]")
+{
+  sirius::sirius_config config;
+  config.load_from_file(config_fixture("effective_operator_defaults_low_level.yaml"));
+
+  constexpr uint64_t effective_capacity = 256ULL * 1024 * 1024;
+  constexpr uint64_t expected_batch     = effective_capacity / 40;
+  require_shared_operator_defaults(config.get_operator_params(), expected_batch);
+}
+
+TEST_CASE("operator batch defaults use the high-level GPU usage limit",
+          "[sirius][config][operator_defaults]")
+{
+  sirius::sirius_config config;
+  config.load_from_file(config_fixture("effective_operator_defaults_high_level.yaml"));
+
+  constexpr uint64_t effective_capacity = 256ULL * 1024 * 1024;
+  constexpr uint64_t expected_batch     = effective_capacity / 40;
+  require_shared_operator_defaults(config.get_operator_params(), expected_batch);
+}
+
+TEST_CASE("operator batch defaults use an explicit high-level GPU usage fraction",
+          "[sirius][config][operator_defaults]")
+{
+  sirius::sirius_config config;
+  config.load_from_file(config_fixture("minimal.yaml"));
+
+  require_shared_operator_defaults(config.get_operator_params(), expected_effective_batch(config));
+}
+
+TEST_CASE("explicit operator batch values override effective-capacity defaults",
+          "[sirius][config][operator_defaults]")
+{
+  sirius::sirius_config config;
+  config.load_from_file(config_fixture("effective_operator_defaults_explicit.yaml"));
+
+  constexpr uint64_t mib = 1024ULL * 1024;
+  auto const& params     = config.get_operator_params();
+  REQUIRE(params.scan_task_batch_size == 1 * mib);
+  REQUIRE(params.hash_partition_bytes == 2 * mib);
+  REQUIRE(params.concat_batch_bytes == 3 * mib);
+  REQUIRE(params.sort_sample_bytes == 4 * mib);
+  REQUIRE(params.max_build_hash_table_bytes == 5 * mib);
+}
+
+TEST_CASE("ordinary defaults stay physical-memory-derived without an explicit GPU cap",
+          "[sirius][config][operator_defaults]")
+{
+  sirius::sirius_config config;
+  auto const before = config.get_operator_params();
+  config.load_from_file(config_fixture("effective_operator_defaults_high_level.yaml"));
+  config.apply_defaults();
+
+  require_shared_operator_defaults(config.get_operator_params(), before.scan_task_batch_size);
+}
+
+TEST_CASE("null GPU usage limits do not enable effective-capacity defaults",
+          "[sirius][config][operator_defaults]")
+{
+  const char* fixtures[] = {"effective_operator_defaults_null_bytes.yaml",
+                            "effective_operator_defaults_null_fraction.yaml"};
+
+  for (auto const* fixture : fixtures) {
+    INFO("fixture=" << fixture);
+    sirius::sirius_config config;
+    auto const physical_default = config.get_operator_params().scan_task_batch_size;
+
+    config.load_from_file(config_fixture(fixture));
+    require_shared_operator_defaults(config.get_operator_params(), physical_default);
+  }
+}
+
+TEST_CASE("repeated loads clear explicit and cap-derived operator values",
+          "[sirius][config][operator_defaults]")
+{
+  sirius::sirius_config config;
+  auto const physical_default = config.get_operator_params().scan_task_batch_size;
+
+  config.load_from_file(config_fixture("effective_operator_defaults_explicit.yaml"));
+  REQUIRE(config.get_operator_params().scan_task_batch_size == 1ULL * 1024 * 1024);
+
+  config.load_from_file(config_fixture("effective_operator_defaults_high_level.yaml"));
+  constexpr uint64_t capped_default = (256ULL * 1024 * 1024) / 40;
+  require_shared_operator_defaults(config.get_operator_params(), capped_default);
+
+  config.load_from_file(config_fixture("effective_operator_defaults_uncapped.yaml"));
+  require_shared_operator_defaults(config.get_operator_params(), physical_default);
+}
+
+TEST_CASE("effective-capacity defaults seed DuckDB SET and RESET",
+          "[sirius][context][config][operator_defaults][isolated_context]")
+{
+  finally cleanup_env{[]() {
+    unsetenv("SIRIUS_CONFIG_FILE");
+    setenv("SIRIUS_DISABLE", "1", 1);
+  }};
+
+  auto const cfg = config_fixture("effective_operator_defaults_high_level.yaml");
+  unsetenv("SIRIUS_DISABLE");
+  setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  constexpr uint64_t expected_batch = (256ULL * 1024 * 1024) / 40;
+
+  auto settings = con.Query(R"(
+    SELECT current_setting('scan_task_batch_size')::UBIGINT,
+           current_setting('hash_partition_bytes')::UBIGINT,
+           current_setting('concat_batch_bytes')::UBIGINT,
+           current_setting('sort_sample_bytes')::UBIGINT,
+           current_setting('max_build_hash_table_bytes')::UBIGINT
+  )");
+  REQUIRE(settings != nullptr);
+  REQUIRE_FALSE(settings->HasError());
+  REQUIRE(settings->GetValue(0, 0).GetValue<uint64_t>() == expected_batch);
+  REQUIRE(settings->GetValue(1, 0).GetValue<uint64_t>() == expected_batch);
+  REQUIRE(settings->GetValue(2, 0).GetValue<uint64_t>() == expected_batch);
+  REQUIRE(settings->GetValue(3, 0).GetValue<uint64_t>() == expected_batch);
+  REQUIRE(settings->GetValue(4, 0).GetValue<uint64_t>() == 2 * expected_batch);
+
+  auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+  require_shared_operator_defaults(sirius_ctx->get_config().get_operator_params(), expected_batch);
+
+  auto set = con.Query("SET scan_task_batch_size = 99");
+  REQUIRE(set != nullptr);
+  REQUIRE_FALSE(set->HasError());
+  auto set_readback = con.Query("SELECT current_setting('scan_task_batch_size')::UBIGINT");
+  REQUIRE(set_readback != nullptr);
+  REQUIRE_FALSE(set_readback->HasError());
+  REQUIRE(set_readback->GetValue(0, 0).GetValue<uint64_t>() == 99);
+  REQUIRE(sirius_ctx->get_config().get_operator_params().scan_task_batch_size == 99);
+
+  auto reset_setting = con.Query("RESET scan_task_batch_size");
+  REQUIRE(reset_setting != nullptr);
+  REQUIRE_FALSE(reset_setting->HasError());
+  auto reset = con.Query("SELECT current_setting('scan_task_batch_size')::UBIGINT");
+  REQUIRE(reset != nullptr);
+  REQUIRE_FALSE(reset->HasError());
+  REQUIRE(reset->GetValue(0, 0).GetValue<uint64_t>() == expected_batch);
+  REQUIRE(sirius_ctx->get_config().get_operator_params().scan_task_batch_size == expected_batch);
+}
+
+TEST_CASE("Sirius configuration rejects invalid downgrade hysteresis", "[sirius][config]")
+{
+  struct invalid_config {
+    const char* fixture;
+    const char* scope;
+    const char* constraint;
+  };
+
+  const invalid_config cases[] = {
+    {"invalid_memory_gpu_downgrade_zero.yaml", "sirius.memory.gpu", "greater than zero"},
+    {"invalid_memory_gpu_downgrade_equal.yaml",
+     "sirius.memory.gpu",
+     "less than downgrade_trigger_fraction"},
+    {"invalid_memory_gpu_downgrade_reversed.yaml",
+     "sirius.memory.gpu",
+     "less than downgrade_trigger_fraction"},
+    {"invalid_memory_host_downgrade_zero.yaml", "sirius.memory.host", "greater than zero"},
+    {"invalid_memory_host_downgrade_equal.yaml",
+     "sirius.memory.host",
+     "less than downgrade_trigger_fraction"},
+    {"invalid_memory_host_downgrade_reversed.yaml",
+     "sirius.memory.host",
+     "less than downgrade_trigger_fraction"},
+    {"invalid_space_gpu_downgrade_zero.yaml", "sirius.space.gpu", "greater than zero"},
+    {"invalid_space_gpu_downgrade_equal.yaml",
+     "sirius.space.gpu",
+     "less than downgrade_trigger_fraction"},
+    {"invalid_space_gpu_downgrade_reversed.yaml",
+     "sirius.space.gpu",
+     "less than downgrade_trigger_fraction"},
+    {"invalid_space_host_downgrade_zero.yaml", "sirius.space.host", "greater than zero"},
+    {"invalid_space_host_downgrade_equal.yaml",
+     "sirius.space.host",
+     "less than downgrade_trigger_fraction"},
+    {"invalid_space_host_downgrade_reversed.yaml",
+     "sirius.space.host",
+     "less than downgrade_trigger_fraction"},
+  };
+
+  for (auto const& invalid : cases) {
+    INFO("fixture=" << invalid.fixture << " surface=" << invalid.scope
+                    << " constraint=" << invalid.constraint);
+    std::source_location loc = std::source_location::current();
+    auto const path          = fs::path(loc.file_name()).parent_path() / "data" / invalid.fixture;
+    REQUIRE(fs::is_regular_file(path));
+
+    sirius::sirius_config config;
+    REQUIRE_THROWS_WITH(config.load_from_file(path),
+                        Catch::Contains(invalid.scope) &&
+                          Catch::Contains("downgrade_stop_fraction") &&
+                          Catch::Contains(invalid.constraint));
+  }
+}
+
+TEST_CASE("Sirius downgrade hysteresis accepts omitted, null, and one-sided defaults",
+          "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+  const char* fixtures[]   = {"valid_memory_downgrade_omitted.yaml",
+                              "valid_memory_downgrade_partial_defaults.yaml",
+                              "valid_space_downgrade_omitted.yaml",
+                              "valid_space_downgrade_partial_defaults.yaml"};
+
+  for (auto const* fixture : fixtures) {
+    INFO("fixture=" << fixture);
+    auto const path = data_dir / fixture;
+    REQUIRE(fs::is_regular_file(path));
+
+    sirius::sirius_config config;
+    REQUIRE_NOTHROW(config.load_from_file(path));
+  }
 }
 
 TEST_CASE("Sirius configuration rejects conflicting memory budget forms", "[sirius][config]")
@@ -353,6 +768,7 @@ TEST_CASE("Sirius configuration treats null memory budget forms as absent", "[si
 
   sirius::sirius_config config;
   REQUIRE_NOTHROW(config.load_from_file(cfg));
+  require_shared_operator_defaults(config.get_operator_params(), expected_effective_batch(config));
 }
 
 TEST_CASE("DuckDB setting rejects zero hash partition bytes without a Sirius context",
@@ -369,6 +785,60 @@ TEST_CASE("DuckDB setting rejects zero hash partition bytes without a Sirius con
   REQUIRE(result->HasError());
   REQUIRE_THAT(result->GetError(),
                Catch::Contains("hash_partition_bytes must be greater than zero"));
+}
+
+TEST_CASE("DuckDB setting rejects negative byte values without mutation",
+          "[sirius][context][config][isolated_context]")
+{
+  finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
+  setenv("SIRIUS_DISABLE", "1", 1);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+
+  auto before = con.Query("SELECT current_setting('scan_task_batch_size')::UBIGINT");
+  REQUIRE(before != nullptr);
+  REQUIRE_FALSE(before->HasError());
+  auto const expected = before->GetValue(0, 0).GetValue<uint64_t>();
+
+  auto negative = con.Query("SET scan_task_batch_size = -1");
+  REQUIRE(negative != nullptr);
+  REQUIRE(negative->HasError());
+
+  auto after = con.Query("SELECT current_setting('scan_task_batch_size')::UBIGINT");
+  REQUIRE(after != nullptr);
+  REQUIRE_FALSE(after->HasError());
+  REQUIRE(after->GetValue(0, 0).GetValue<uint64_t>() == expected);
+}
+
+TEST_CASE("DuckDB setting rejects invalid compression retention fractions without a Sirius context",
+          "[sirius][context][config][isolated_context]")
+{
+  finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
+  setenv("SIRIUS_DISABLE", "1", 1);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+
+  for (auto const* value : {"-0.1", "'NaN'", "'Infinity'"}) {
+    INFO("value=" << value);
+    auto result =
+      con.Query("SET pin_table_compression_max_compressed_fraction = " + std::string(value));
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    REQUIRE_THAT(
+      result->GetError(),
+      Catch::Contains(
+        "pin_table_compression_max_compressed_fraction must be finite and non-negative"));
+  }
+
+  for (auto const* value : {"0", "1.5"}) {
+    INFO("value=" << value);
+    auto result =
+      con.Query("SET pin_table_compression_max_compressed_fraction = " + std::string(value));
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+  }
 }
 
 TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
@@ -411,7 +881,8 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
       current_setting('pin_table_compression')::BOOLEAN,
       current_setting('pin_table_input_compression_plan_dir')::VARCHAR,
       current_setting('pin_table_compression_min_batch_size_bytes')::UBIGINT,
-      current_setting('pin_table_compression_max_compressed_fraction')::DOUBLE
+      current_setting('pin_table_compression_max_compressed_fraction')::DOUBLE,
+      current_setting('enable_runtime_distinct_build_probe')::BOOLEAN
   )");
   REQUIRE(settings != nullptr);
   REQUIRE_FALSE(settings->HasError());
@@ -436,11 +907,76 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(settings->GetValue(16, 0).GetValue<std::string>() == "/tmp/sirius-compression-plans");
   REQUIRE(settings->GetValue(17, 0).GetValue<uint64_t>() == 8 * mib);
   REQUIRE(settings->GetValue(18, 0).GetValue<double>() == Approx(0.6));
+  REQUIRE_FALSE(settings->GetValue(19, 0).GetValue<bool>());
 
   auto zero_partition = con.Query("SET hash_partition_bytes = 0");
   REQUIRE(zero_partition != nullptr);
   REQUIRE(zero_partition->HasError());
   REQUIRE(sirius_ctx->get_config().get_operator_params().hash_partition_bytes == 3 * mib);
+
+  auto negative_mark_join_ratio = con.Query("SET mark_join_build_switch_ratio = -1.0");
+  REQUIRE(negative_mark_join_ratio != nullptr);
+  REQUIRE(negative_mark_join_ratio->HasError());
+  REQUIRE_THAT(negative_mark_join_ratio->GetError(),
+               Catch::Contains("mark_join_build_switch_ratio must be >= 0.0"));
+  REQUIRE(sirius_ctx->get_config().get_operator_params().mark_join_build_switch_ratio ==
+          Approx(3.0));
+
+  auto invalid_domain_threshold = con.Query("SET dynamic_filter_domain_coverage_threshold = 'NaN'");
+  REQUIRE(invalid_domain_threshold != nullptr);
+  REQUIRE(invalid_domain_threshold->HasError());
+  REQUIRE_THAT(invalid_domain_threshold->GetError(),
+               Catch::Contains("dynamic_filter_domain_coverage_threshold must be > 0.0"));
+  REQUIRE(sirius_ctx->get_config().get_operator_params().dynamic_filter_domain_coverage_threshold ==
+          Approx(0.8));
+
+  auto invalid_keep_threshold = con.Query("SET dynamic_filter_keep_threshold = 'NaN'");
+  REQUIRE(invalid_keep_threshold != nullptr);
+  REQUIRE(invalid_keep_threshold->HasError());
+  REQUIRE_THAT(invalid_keep_threshold->GetError(),
+               Catch::Contains("dynamic_filter_keep_threshold must be in [0.0, 1.0]"));
+  REQUIRE(sirius_ctx->get_config().get_operator_params().dynamic_filter_keep_threshold ==
+          Approx(0.7));
+
+  auto nan_mark_join_ratio = con.Query("SET mark_join_build_switch_ratio = 'NaN'");
+  REQUIRE(nan_mark_join_ratio != nullptr);
+  REQUIRE(nan_mark_join_ratio->HasError());
+  REQUIRE_THAT(nan_mark_join_ratio->GetError(),
+               Catch::Contains("mark_join_build_switch_ratio must be >= 0.0"));
+  REQUIRE(sirius_ctx->get_config().get_operator_params().mark_join_build_switch_ratio ==
+          Approx(3.0));
+
+  auto zero_mark_join_ratio = con.Query("SET mark_join_build_switch_ratio = 0.0");
+  REQUIRE(zero_mark_join_ratio != nullptr);
+  REQUIRE_FALSE(zero_mark_join_ratio->HasError());
+  REQUIRE(sirius_ctx->get_config().get_operator_params().mark_join_build_switch_ratio ==
+          Approx(0.0));
+
+  auto reset_mark_join_ratio = con.Query("RESET mark_join_build_switch_ratio");
+  REQUIRE(reset_mark_join_ratio != nullptr);
+  REQUIRE_FALSE(reset_mark_join_ratio->HasError());
+  REQUIRE(sirius_ctx->get_config().get_operator_params().mark_join_build_switch_ratio ==
+          Approx(3.0));
+
+  for (auto const* value : {"-0.1", "'NaN'", "'Infinity'"}) {
+    INFO("value=" << value);
+    auto invalid_fraction =
+      con.Query("SET pin_table_compression_max_compressed_fraction = " + std::string(value));
+    REQUIRE(invalid_fraction != nullptr);
+    REQUIRE(invalid_fraction->HasError());
+    REQUIRE_THAT(
+      invalid_fraction->GetError(),
+      Catch::Contains(
+        "pin_table_compression_max_compressed_fraction must be finite and non-negative"));
+
+    auto retained =
+      con.Query("SELECT current_setting('pin_table_compression_max_compressed_fraction')::DOUBLE");
+    REQUIRE(retained != nullptr);
+    REQUIRE_FALSE(retained->HasError());
+    REQUIRE(retained->GetValue(0, 0).GetValue<double>() == Approx(0.6));
+    REQUIRE(sirius_ctx->get_config().get_compression_config().max_compressed_fraction ==
+            Approx(0.6));
+  }
 
   auto const require_ok = [&con](std::string const& sql) {
     auto result = con.Query(sql);
@@ -454,6 +990,13 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   require_ok("RESET max_sort_partition_memory_fraction");
   require_ok("SET enable_dynamic_filter_pushdown = true");
   require_ok("RESET enable_dynamic_filter_pushdown");
+  require_ok("SET dynamic_filter_domain_coverage_threshold = 1.5");
+  require_ok("RESET dynamic_filter_domain_coverage_threshold");
+  require_ok("SET dynamic_filter_keep_threshold = 0.0");
+  require_ok("SET dynamic_filter_keep_threshold = 1.0");
+  require_ok("RESET dynamic_filter_keep_threshold");
+  require_ok("SET enable_runtime_distinct_build_probe = true");
+  require_ok("RESET enable_runtime_distinct_build_probe");
   require_ok("SET pin_table_compression = false");
   require_ok("RESET pin_table_compression");
   require_ok("SET pin_table_compression_max_compressed_fraction = 0.9");
@@ -465,7 +1008,8 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
       current_setting('max_sort_partition_memory_fraction')::DOUBLE,
       current_setting('enable_dynamic_filter_pushdown')::BOOLEAN,
       current_setting('pin_table_compression')::BOOLEAN,
-      current_setting('pin_table_compression_max_compressed_fraction')::DOUBLE
+      current_setting('pin_table_compression_max_compressed_fraction')::DOUBLE,
+      current_setting('enable_runtime_distinct_build_probe')::BOOLEAN
   )");
   REQUIRE(reset != nullptr);
   REQUIRE_FALSE(reset->HasError());
@@ -474,11 +1018,13 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE_FALSE(reset->GetValue(2, 0).GetValue<bool>());
   REQUIRE(reset->GetValue(3, 0).GetValue<bool>());
   REQUIRE(reset->GetValue(4, 0).GetValue<double>() == Approx(0.6));
+  REQUIRE_FALSE(reset->GetValue(5, 0).GetValue<bool>());
 
   auto const& params = sirius_ctx->get_config().get_operator_params();
   REQUIRE(params.scan_task_batch_size == 1 * mib);
   REQUIRE(params.max_sort_partition_memory_fraction == Approx(0.25));
   REQUIRE_FALSE(params.enable_dynamic_filter_pushdown);
+  REQUIRE_FALSE(params.enable_runtime_distinct_build_probe);
   auto const& compression = sirius_ctx->get_config().get_compression_config();
   REQUIRE(compression.enable_pin_table_compression);
   REQUIRE(compression.max_compressed_fraction == Approx(0.6));
@@ -512,6 +1058,49 @@ TEST_CASE("Sirius configuration loading from file with spaces",
   REQUIRE(manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).size() == 1);
   REQUIRE(manager.get_memory_spaces_for_tier(cucascade::memory::Tier::DISK).size() == 2);
   REQUIRE(manager.get_all_memory_spaces().size() == 4);
+}
+
+TEST_CASE("Sirius configuration rejects competing memory configuration paths", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+
+  const char* fixtures[] = {"invalid_memory_and_space.yaml",
+                            "invalid_memory_cross_tier_and_space.yaml",
+                            "invalid_memory_empty_subblock_and_space.yaml",
+                            "invalid_memory_null_leaf_and_space.yaml"};
+
+  for (auto const* fixture : fixtures) {
+    INFO("fixture=" << fixture);
+    sirius::sirius_config config;
+    REQUIRE_THROWS_WITH(config.load_from_file(data_dir / fixture),
+                        Catch::Contains("sirius.memory") && Catch::Contains("sirius.space") &&
+                          Catch::Contains("mutually exclusive"));
+  }
+}
+
+TEST_CASE("Sirius configuration keeps absent memory paths out of mutual-exclusion checks",
+          "[sirius][config]")
+{
+  std::source_location loc  = std::source_location::current();
+  auto const data_dir       = fs::path(loc.file_name()).parent_path() / "data";
+  constexpr std::size_t mib = 1024ULL * 1024;
+
+  for (auto const& [fixture, expected_capacity] : std::vector<std::pair<const char*, std::size_t>>{
+         {"valid_space_with_null_memory_subblock.yaml", 128 * mib},
+         {"valid_memory_with_empty_space.yaml", 256 * mib}}) {
+    INFO("fixture=" << fixture);
+    sirius::sirius_config config;
+    REQUIRE_NOTHROW(config.load_from_file(data_dir / fixture));
+
+    auto const& spaces = config.get_memory_space_configs();
+    auto const gpu     = std::ranges::find_if(spaces, [](auto const& space) {
+      return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space);
+    });
+    REQUIRE(gpu != spaces.end());
+    REQUIRE(std::get<cucascade::memory::gpu_memory_space_config>(*gpu).memory_capacity ==
+            expected_capacity);
+  }
 }
 
 // ============================================================================

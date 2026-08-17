@@ -192,7 +192,7 @@ Data is moved from GPU to HOST tier via converter registry.
 
 **Code path:** `src/downgrade/downgrade_executor.cpp` — `monitor_loop()`, `run_downgrade_pass()`
 
-**Config:** `downgrade_trigger_fraction` (default: 1.0 for GPU, 0.8 for Host), `downgrade_stop_fraction` (default: 0.7)
+**Config:** `downgrade_trigger_fraction` (default: 0.8 for GPU, 0.9 for host), `downgrade_stop_fraction` (default: 0.6 for GPU, 0.8 for host). Configuration requires `0 < stop < trigger <= 1`.
 
 ### OOM Retry Mechanism (PR #364)
 
@@ -461,6 +461,7 @@ chunk 0 is retained as a sentinel and emptied by the GPU filter so the pipeline 
 `src/scan_manager/pinned_chunk_stats.cpp` owns the statistics and safety checks; and
 `src/scan_manager/sirius_scan_manager.cpp` builds and serves the survivor plan.
 
-**Config:** `enable_pinned_zone_map_pruning` (default: `true`) is available through YAML and
-DuckDB `SET`. It gates both capture and pruning; entries pinned while it is disabled remain
-statless until re-pinned. See [Pinned-table zone maps](scan.md#zone-maps) for limitations.
+**Config:** zone-map capture and pruning are automatic and enabled by default. The advanced YAML
+escape hatch `sirius.operator_params.enable_pinned_zone_map_pruning` gates both capture and
+pruning; entries pinned while it is disabled remain statless until re-pinned. The direct DuckDB
+session override is test-only. See [Pinned-table zone maps](scan.md#zone-maps) for limitations.
