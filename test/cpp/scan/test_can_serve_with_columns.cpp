@@ -62,15 +62,22 @@ cache_entry_info parquet_cache(std::vector<std::string> files,
   return ci;
 }
 
+// `oid` is the table's catalog object id — the incarnation half of the duckdb
+// identity. Tests that don't care about incarnations leave it at the shared
+// default on both sides.
+constexpr duckdb::idx_t kDefaultOid = 42;
+
 cache_entry_info duckdb_cache(std::string catalog,
                               std::string schema,
                               std::string table,
-                              std::vector<duckdb::idx_t> storage_indices)
+                              std::vector<duckdb::idx_t> storage_indices,
+                              duckdb::idx_t oid = kDefaultOid)
 {
   cache_entry_info ci;
   ci.catalog_name = std::move(catalog);
   ci.schema_name  = std::move(schema);
   ci.table_name   = std::move(table);
+  ci.table_oid    = oid;
   ci.column_ids   = make_ids(storage_indices);
   return ci;
 }
@@ -89,11 +96,13 @@ void fill(duckdb_native_ingestible_table_info& info,
           std::string catalog,
           std::string schema,
           std::string table,
-          std::vector<duckdb::idx_t> storage_indices)
+          std::vector<duckdb::idx_t> storage_indices,
+          duckdb::idx_t oid = kDefaultOid)
 {
   info.catalog_name = std::move(catalog);
   info.schema_name  = std::move(schema);
   info.table_name   = std::move(table);
+  info.table_oid    = oid;
   info.column_ids   = make_ids(storage_indices);
 }
 
@@ -186,6 +195,24 @@ TEST_CASE("cache_entry_info: duckdb different name component or superset misses"
   REQUIRE(pinned.can_serve_with_columns(superset).empty());
 }
 
+TEST_CASE("cache_entry_info: duckdb identity distinguishes table incarnations", "[scan][can_serve]")
+{
+  // DROP TABLE tpch.main.lineitem; CREATE TABLE tpch.main.lineitem (...) leaves the
+  // qualified name and the column layout identical, but the pin still holds the
+  // DROPPED table's rows. DuckDB gives the recreated table a fresh catalog object
+  // id, which is what makes the two incarnations distinguishable — without it the
+  // scan below would be served stale rows.
+  auto pinned = duckdb_cache("tpch", "main", "lineitem", {0, 1}, /*oid=*/7);
+
+  duckdb_native_ingestible_table_info same_incarnation;
+  fill(same_incarnation, "tpch", "main", "lineitem", {0, 1}, /*oid=*/7);
+  REQUIRE(pinned.can_serve_with_columns(same_incarnation) == std::vector<std::size_t>{0, 1});
+
+  duckdb_native_ingestible_table_info recreated;
+  fill(recreated, "tpch", "main", "lineitem", {0, 1}, /*oid=*/8);
+  REQUIRE(pinned.can_serve_with_columns(recreated).empty());
+}
+
 TEST_CASE("cache_entry_info: a different ingestible format never matches", "[scan][can_serve]")
 {
   // Identity is format-specific (parquet file set vs duckdb catalog.schema.table): a
@@ -204,14 +231,22 @@ TEST_CASE("cache_entry_info: a different ingestible format never matches", "[sca
 TEST_CASE("cache_entry_info: matches_duckdb_table is the shared identity matcher",
           "[scan][can_serve]")
 {
-  auto cache = duckdb_cache("db", "main", "lineitem", {0, 1});
-  REQUIRE(cache.matches_duckdb_table("db", "main", "lineitem"));
-  REQUIRE_FALSE(cache.matches_duckdb_table("db2", "main", "lineitem"));
-  REQUIRE_FALSE(cache.matches_duckdb_table("db", "other", "lineitem"));
-  REQUIRE_FALSE(cache.matches_duckdb_table("db", "main", "orders"));
+  auto cache = duckdb_cache("db", "main", "lineitem", {0, 1}, /*oid=*/7);
+  REQUIRE(cache.matches_duckdb_table("db", "main", "lineitem", 7));
+  REQUIRE_FALSE(cache.matches_duckdb_table("db2", "main", "lineitem", 7));
+  REQUIRE_FALSE(cache.matches_duckdb_table("db", "other", "lineitem", 7));
+  REQUIRE_FALSE(cache.matches_duckdb_table("db", "main", "orders", 7));
+  // Same qualified name, different incarnation (dropped and recreated).
+  REQUIRE_FALSE(cache.matches_duckdb_table("db", "main", "lineitem", 8));
+
+  // The name-only half ignores the incarnation — it is how a superseded pin is
+  // reported, never how one is chosen to serve.
+  REQUIRE(cache.matches_duckdb_table_name("db", "main", "lineitem"));
+  REQUIRE_FALSE(cache.matches_duckdb_table_name("db", "main", "orders"));
 
   auto parquet = parquet_cache({"a.parquet"}, {0});
-  REQUIRE_FALSE(parquet.matches_duckdb_table("", "", ""));  // parquet identity never matches
+  REQUIRE_FALSE(parquet.matches_duckdb_table("", "", "", 0));  // parquet identity never matches
+  REQUIRE_FALSE(parquet.matches_duckdb_table_name("", "", ""));
 }
 
 TEST_CASE("cache_entry_info: matches_parquet_files is the shared parquet identity matcher",
