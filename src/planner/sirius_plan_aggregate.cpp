@@ -21,8 +21,11 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_case_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "expression/aggregate_id.hpp"
 #include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
@@ -63,11 +66,51 @@ duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
   return out;
 }
 
-// File-local helper (formerly sirius_physical_plan_generator::extract_aggregate_expressions).
-// Pulls aggregate child / filter sub-expressions out of the aggregate list and groups into a
-// projection fed upstream of the aggregate. Operates on raw DuckDB expressions so the hoist
-// is straightforward; the caller translates the resulting groups/aggregates into Sirius AST
-// nodes when constructing the aggregate operator.
+// Policy gate for the aggregate FILTER clause. Mask-to-null lowering is exact only for
+// NULL-skipping aggregates, so any other filtered shape is refused here and the query takes the
+// transparent CPU fallback.
+void throw_if_aggregate_filter_unsupported(duckdb::BoundAggregateExpression const& aggr)
+{
+  auto const id  = sirius::from_duckdb_aggregate_name(aggr.function.name);
+  bool supported = id.has_value() && !aggr.IsDistinct();
+  if (supported) {
+    switch (*id) {
+      case sirius::aggregate_id::count_star: supported = aggr.children.empty(); break;
+      case sirius::aggregate_id::count:
+      case sirius::aggregate_id::sum:
+      case sirius::aggregate_id::sum_no_overflow:
+      case sirius::aggregate_id::min:
+      case sirius::aggregate_id::max:
+      case sirius::aggregate_id::avg: supported = aggr.children.size() == 1; break;
+      default: supported = false; break;  // first, and any future id
+    }
+  }
+  if (!supported) {
+    throw duckdb::NotImplementedException(
+      "Aggregate FILTER not supported on GPU (falling back to CPU): " + aggr.ToString());
+  }
+}
+
+// CASE WHEN <filter> THEN <value> ELSE NULL END. SQL FILTER passes only TRUE; the CASE lowering
+// (cudf::copy_if_else) routes both FALSE and NULL mask entries to the ELSE branch, so
+// three-valued filters (e.g. mark-join columns) mask out correctly.
+duckdb::unique_ptr<duckdb::Expression> make_filter_mask(
+  duckdb::unique_ptr<duckdb::Expression> filter, duckdb::unique_ptr<duckdb::Expression> value)
+{
+  auto null_else =
+    duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value(value->return_type));
+  return duckdb::make_uniq<duckdb::BoundCaseExpression>(
+    std::move(filter), std::move(value), std::move(null_else));
+}
+
+// Pulls aggregate child sub-expressions out of the aggregate list and groups into a projection
+// fed upstream of the aggregate. An aggregate FILTER clause is absorbed into that projection:
+// each child of a filtered aggregate is hoisted as CASE WHEN <filter> THEN <child> ELSE NULL END
+// (exact for the NULL-skipping aggregate set the gate admits), and a filtered count_star hoists
+// a boolean mask column whose reference is parked on bound_aggr.filter for translate_aggregate
+// to lower to count(mask). Operates on raw DuckDB expressions so the hoist is straightforward;
+// the caller translates the resulting groups/aggregates into Sirius AST nodes when constructing
+// the aggregate operator.
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expressions(
   duckdb::ClientContext& context,
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> child,
@@ -94,19 +137,28 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
   }
   for (auto& aggr : aggregates) {
     auto& bound_aggr = aggr->Cast<duckdb::BoundAggregateExpression>();
+    if (bound_aggr.filter) { throw_if_aggregate_filter_unsupported(bound_aggr); }
+    auto filter = std::move(bound_aggr.filter);  // leaves bound_aggr.filter null
     for (auto& child_expr : bound_aggr.children) {
+      if (filter) { child_expr = make_filter_mask(filter->Copy(), std::move(child_expr)); }
       auto ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(child_expr->return_type,
                                                                      expressions.size());
       types.push_back(child_expr->return_type);
       expressions.push_back(std::move(child_expr));
       child_expr = std::move(ref);
     }
-    if (bound_aggr.filter) {
-      auto& filter = bound_aggr.filter;
-      auto ref     = duckdb::make_uniq<duckdb::BoundReferenceExpression>(filter->return_type,
-                                                                     expressions.size());
-      types.push_back(filter->return_type);
-      expressions.push_back(std::move(filter));
+    if (filter && bound_aggr.children.empty()) {
+      // count_star is the only zero-child aggregate the gate admits. Materialize the boolean
+      // mask column and park its reference on the filter slot: translate_aggregate lowers
+      // count_star-with-filter-reference to count(mask), i.e. COUNT_VALID of a column that is
+      // non-null exactly where the filter passes.
+      auto mask = make_filter_mask(
+        std::move(filter),
+        duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::BOOLEAN(true)));
+      auto ref =
+        duckdb::make_uniq<duckdb::BoundReferenceExpression>(mask->return_type, expressions.size());
+      types.push_back(mask->return_type);
+      expressions.push_back(std::move(mask));
       bound_aggr.filter = std::move(ref);
     }
   }

@@ -327,6 +327,7 @@ Aggregate without GROUP BY (e.g., `SELECT COUNT(*), SUM(x) FROM t`).
 
 - **GPU execution:** `gpu_aggregate_impl::local_ungrouped_aggregate()` using `cudf::reduce()`
 - **Supported:** SUM, MIN, MAX, COUNT (of valid values), COUNT(*), AVG, FIRST
+- **FILTER clause:** Handled entirely at plan time for SUM (incl. `sum_no_overflow`), MIN, MAX, COUNT, COUNT(*), and AVG — each filtered aggregate input is mask-wrapped to NULL in the projection below the operator, and `count(*) FILTER` is lowered to `count(mask)`; DISTINCT aggregates, FIRST, and any aggregate outside this set fall back to CPU when filtered. See [Aggregate Planning](physical-plan-generation.md).
 - **AVG handling:** Decomposed into SUM + COUNT and finalized on-device. `make_avg_column()` divides the single-row merged sum/count columns with `cudf::binary_operation` — DECIMAL output divides directly in fixed point to preserve precision, while non-DECIMAL output casts both operands to FLOAT64 and divides. This keeps AVG off the host `long double` path, avoiding both the device→host sync and the precision loss of decimal round-trips.
 - **DECIMAL overflow handling:** DECIMAL SUM casts to a wider type before reduction — DECIMAL32→DECIMAL64, DECIMAL64→DECIMAL128 — to prevent overflow
 - **BIGINT SUM fallback:** BIGINT (INT64) SUM falls back to CPU execution because GPU lacks INT128 accumulator support. Without this, silent overflow produces incorrect results. BIGINT arithmetic operations (ADD, SUB, MUL) also fall back to CPU for the same reason.
@@ -339,6 +340,7 @@ Hash-based GROUP BY.
 - **GPU execution:** `gpu_aggregate_impl::local_grouped_aggregate()` using `cudf::groupby()`
 - **AVG handling:** Decomposed into SUM + COUNT_VALID via `AggregateSlot`
 - **COUNT(DISTINCT):** Implemented via `COLLECT_SET` aggregation with struct column synthesis
+- **FILTER clause:** Same plan-time mask-to-null lowering and CPU-fallback rules as UNGROUPED_AGGREGATE above; group keys are never masked, so groups whose every row fails the filter still appear.
 - **Key members:** `group_idx`, `cudf_aggregates`, `cudf_aggregate_idx`, `aggregate_slots`, `has_avg`, `has_count_distinct`
 
 ## Pipeline Breakers (Sirius-Specific)
