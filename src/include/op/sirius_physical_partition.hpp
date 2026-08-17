@@ -25,6 +25,9 @@
 #include "op/sirius_physical_top_n.hpp"
 #include "sirius_config.hpp"
 
+#include <cstdint>
+#include <optional>
+
 namespace duckdb {
 class SiriusContext;
 }  // namespace duckdb
@@ -125,12 +128,22 @@ class sirius_physical_partition : public sirius_physical_operator {
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;
 
+  /// What compute_sizing_totals measures over the sizing port's batches.
+  struct sizing_totals {
+    uint64_t bytes = 0;
+    /// Sum of measured rows over the sizing port's batches; nullopt when any batch's
+    /// representation does not expose a row count. Starts engaged at zero so an empty port
+    /// yields {0, 0}.
+    std::optional<uint64_t> rows = 0;
+  };
+
+  /// Sum the bytes (and, when every batch exposes a row count, rows) of all batches waiting on
+  /// this partition's input port. Fed to the downstream consumer's get_partition_strategy, which
+  /// turns them into a partition count.
+  [[nodiscard]] sizing_totals compute_sizing_totals() const;
+
  private:
   void get_partition_keys_and_type(sirius_physical_operator* op, bool is_build = false);
-
-  /// Sum the bytes of all batches waiting on this partition's input port. Fed to the downstream
-  /// consumer's get_partition_strategy, which turns it into a partition count.
-  uint64_t compute_total_bytes();
 
   /// The partition slot for a batch residing on `device_id`: its index in `_active_gpu_ids`
   /// (so task_creator routes that slot back to the same GPU). Returns 0 if not found (a

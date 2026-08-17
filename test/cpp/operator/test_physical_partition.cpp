@@ -347,3 +347,49 @@ TEST_CASE(
             *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0])
             .num_rows() == num_values);
 }
+
+TEST_CASE("sirius_physical_partition compute_sizing_totals sums bytes and rows across batches",
+          "[physical_partition]")
+{
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+
+  constexpr std::size_t num_values_a = 1000;
+  constexpr std::size_t num_values_b = 500;
+  std::vector<int32_t> values_a(num_values_a);
+  std::iota(values_a.begin(), values_a.end(), 0);
+  std::vector<int32_t> values_b(num_values_b);
+  std::iota(values_b.begin(), values_b.end(), 0);
+
+  auto batch_a = make_numeric_batch<int32_t>(*space, values_a, cudf::type_id::INT32);
+  auto batch_b = make_numeric_batch<int32_t>(*space, values_b, cudf::type_id::INT32);
+  uint64_t const expected_bytes = batch_a->to_read_only().get_data()->get_size_in_bytes() +
+                                  batch_b->to_read_only().get_data()->get_size_in_bytes();
+
+  auto repo = std::make_unique<cucascade::shared_data_repository>();
+  repo->add_data_batch(batch_a, 0);
+  repo->add_data_batch(batch_b, 0);
+
+  auto agg_result =
+    sirius::test::create_aggregate_expressions<gpu_type_traits<int32_t>>({0}, {"sum"}, {0});
+  duckdb::vector<sirius::logical_type> partitioner_types = agg_result.output_types;
+  sirius_physical_grouped_aggregate_merge grouped_aggregator(std::move(agg_result.output_types),
+                                                             std::move(agg_result.aggregates),
+                                                             std::move(agg_result.groups),
+                                                             num_values_a + num_values_b);
+  sirius_physical_partition partitioner(
+    partitioner_types, num_values_a + num_values_b, &grouped_aggregator, false);
+
+  auto port           = std::make_unique<sirius_physical_operator::port>();
+  port->type          = MemoryBarrierType::FULL;
+  port->repo          = repo.get();
+  port->src_pipeline  = nullptr;
+  port->dest_pipeline = nullptr;
+  partitioner.add_port("default", std::move(port));
+
+  auto const totals = partitioner.compute_sizing_totals();
+  REQUIRE(totals.bytes == expected_bytes);
+  REQUIRE(totals.rows.has_value());
+  REQUIRE(*totals.rows == num_values_a + num_values_b);
+}

@@ -46,6 +46,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <regex>
 #include <set>
 #include <string>
@@ -66,7 +67,11 @@ struct mgpu_env_params {
   uint64_t hash_partition_bytes       = 10'000'000;
   uint64_t concat_batch_bytes         = 100'000'000;
   uint64_t max_build_hash_table_bytes = 90'000'000;
-  double usage_limit_fraction         = 0.4;
+  // Per-GPU BUILD_PROBE resident-payload budget (max_build_probe_resident_bytes). Omitted from
+  // the yaml when unset, leaving the engine default; set it (0 is a valid "disable BUILD_PROBE"
+  // value) to force payload-bound denial explicitly.
+  std::optional<uint64_t> max_build_probe_resident_bytes;
+  double usage_limit_fraction = 0.4;
   // Absolute per-GPU usage cap in bytes. When non-zero this is emitted as
   // `usage_limit_bytes` (mutually exclusive with usage_limit_fraction per
   // sirius_config.cpp:201) so a test can impose a small fixed budget that
@@ -131,6 +136,9 @@ inline void write_mgpu_yaml(std::filesystem::path const& yaml_path,
     << "\n"
        "    max_build_hash_table_bytes: "
     << params.max_build_hash_table_bytes << "\n";
+  if (params.max_build_probe_resident_bytes) {
+    f << "    max_build_probe_resident_bytes: " << *params.max_build_probe_resident_bytes << "\n";
+  }
 }
 
 /**

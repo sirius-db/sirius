@@ -33,6 +33,8 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <cucascade/cudf/gpu_data_representation.hpp>
+
 #include <algorithm>
 #include <mutex>
 
@@ -53,6 +55,19 @@ std::optional<std::size_t> extract_bound_ref_index(const duckdb::Expression& exp
     }
   }
   return std::nullopt;
+}
+
+/// Row count of a batch when its representation exposes one; nullopt otherwise. Sizing batches
+/// are GPU-resident in the normal case; a spilled (host/disk) build indicates memory pressure,
+/// where falling back to the conservative payload rule is the right posture, so only the GPU
+/// representation is measured.
+std::optional<uint64_t> batch_num_rows(const cucascade::read_only_data_batch& ro)
+{
+  const auto* data = ro.get_data();
+  if (data == nullptr) { return std::nullopt; }
+  const auto* gpu = dynamic_cast<const cucascade::gpu_table_representation*>(data);
+  if (gpu == nullptr) { return std::nullopt; }
+  return static_cast<uint64_t>(gpu->get_table_view().num_rows());
 }
 
 }  // namespace
@@ -295,24 +310,31 @@ void sirius_physical_partition::sink(const operator_data& input_data, rmm::cuda_
   }
 }
 
-uint64_t sirius_physical_partition::compute_total_bytes()
+sirius_physical_partition::sizing_totals sirius_physical_partition::compute_sizing_totals() const
 {
   if (ports.find("default") == ports.end()) {
     throw std::runtime_error(
-      "sirius_physical_partition::compute_total_bytes() did not find default repo for id " +
+      "sirius_physical_partition::compute_sizing_totals() did not find default repo for id " +
       std::to_string(this->get_operator_id()));
   }
-  auto& repo           = ports.at("default")->repo;
-  auto batch_ids       = repo->get_batch_ids(0);
-  uint64_t total_bytes = 0;
+  auto& repo     = ports.at("default")->repo;
+  auto batch_ids = repo->get_batch_ids(0);
+  sizing_totals totals;
   for (auto batch_id : batch_ids) {
     auto batch = repo->get_data_batch_by_id(batch_id, 0);
     if (batch) {
       auto ro = batch->to_read_only();
-      if (ro.get_data()) { total_bytes += ro.get_data()->get_size_in_bytes(); }
+      if (ro.get_data()) { totals.bytes += ro.get_data()->get_size_in_bytes(); }
+      if (totals.rows) {
+        if (auto const rows = batch_num_rows(ro)) {
+          *totals.rows += *rows;
+        } else {
+          totals.rows = std::nullopt;
+        }
+      }
     }
   }
-  return total_bytes;
+  return totals;
 }
 
 void sirius_physical_partition::set_num_partitions(int num_partitions)
@@ -422,9 +444,12 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
     std::scoped_lock guard(lock, sibling.lock);
     if (!_num_partitions.has_value()) {
       auto& sizing_partition = _drives_partition_count ? *this : sibling;
-      partition_sizing_input const in{sizing_partition.compute_total_bytes(),
-                                      sizing_partition._is_build,
-                                      has_build_concat(*this) || has_build_concat(sibling)};
+      auto const totals      = sizing_partition.compute_sizing_totals();
+      partition_sizing_input const in{
+        .total_bytes    = totals.bytes,
+        .total_rows     = totals.rows,
+        .is_build_side  = sizing_partition._is_build,
+        .build_foldable = has_build_concat(*this) || has_build_concat(sibling)};
       // The consumer owns the decision: it computes the count / broadcast flag, updates its own
       // execution state (e.g. hash-join BUILD_PROBE mode), and pre-sizes its own input repos.
       auto const strategy      = consumer->get_partition_strategy(in);
@@ -445,13 +470,13 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
         build_arrives_whole = strategy.num_partitions == 1 || strategy.broadcast;
       } else if (in.is_build_side && strategy.num_partitions == 1 && hash_join != nullptr &&
                  hash_join->publishes_dynamic_filters() &&
-                 in.total_bytes < hash_join->max_build_hash_table_bytes()) {
+                 in.total_bytes < hash_join->max_build_probe_resident_bytes) {
         // Not BUILD_PROBE, but the build lands in one partition and this join publishes a filter
         // from a single build batch, so folding it only moves a batch boundary. Best-effort: no
         // build-side CONCAT means no publication. Build-side sizing is required — right-family
         // joins size from the probe, where one partition says nothing about the build's size.
-        // The byte bound matters when hash_partition_bytes exceeds the build budget: a build
-        // refused BUILD_PROBE for being too large must not be folded whole for a filter either.
+        // The byte bound matters when hash_partition_bytes exceeds the resident budget: a build
+        // too large to hold folded and resident must not be folded whole for a filter either.
         bool const found_this    = enable_build_concat_all(*this);
         bool const found_sibling = enable_build_concat_all(sibling);
         build_arrives_whole      = found_this || found_sibling;
@@ -474,9 +499,11 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
   } else {
     std::lock_guard<std::mutex> guard(lock);
     if (!_num_partitions.has_value()) {
-      partition_sizing_input const in{compute_total_bytes(),
-                                      _is_build,
-                                      /*build_foldable=*/false};
+      auto const totals = compute_sizing_totals();
+      partition_sizing_input const in{.total_bytes    = totals.bytes,
+                                      .total_rows     = totals.rows,
+                                      .is_build_side  = _is_build,
+                                      .build_foldable = false};
       auto const strategy = consumer->get_partition_strategy(in);
       _num_partitions     = strategy.num_partitions;
       SIRIUS_LOG_DEBUG("sirius_physical_partition id {} sized {} partitions",

@@ -44,12 +44,26 @@ constexpr uint64_t DEFAULT_BATCH_SIZE = 800ULL * 1024 * 1024;  // 800 MiB
 /// memory-space configs before applying explicit operator_params overrides.
 uint64_t derived_default_batch_size();
 
-constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE       = DEFAULT_BATCH_SIZE;
-constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES       = DEFAULT_BATCH_SIZE;
-constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES         = DEFAULT_BATCH_SIZE;
-constexpr uint64_t DEFAULT_SORT_SAMPLE_BYTES          = DEFAULT_BATCH_SIZE;
-constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES = 2 * DEFAULT_BATCH_SIZE;
-constexpr uint64_t DEFAULT_MAX_BROADCAST_JOIN_SIZE    = 256ULL * 1024 * 1024;  // 256 MiB
+constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE = DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES = DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES   = DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_SORT_SAMPLE_BYTES    = DEFAULT_BATCH_SIZE;
+
+/// The two BUILD_PROBE admission budgets both default to 8x the batch default. At that ratio every
+/// build whose average row width is >= 4 B/row (any build with at least one INT32/DATE32-or-wider
+/// key column) that fits the payload-based rule at 2x batch also fits the estimated-table rule at
+/// 8x batch; only degenerate sub-4-B/row builds (a single BOOL8/INT8/INT16 column as the entire
+/// build side) can be denied on capacity, a deliberate, accepted exception.
+constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES     = 8 * DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_MAX_BUILD_PROBE_RESIDENT_BYTES = 8 * DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_MAX_BROADCAST_JOIN_SIZE        = 256ULL * 1024 * 1024;  // 256 MiB
+
+/// Estimated device bytes per build row for a BUILD_PROBE cuco hash structure. cudf::hash_join /
+/// distinct_hash_join store 8-byte (hash, row-index) slot pairs and Sirius builds them at cudf's
+/// default 0.5 desired occupancy (distinct_hash_join gets 0.5 explicitly), giving 8 B / 0.5 = 16 B
+/// per build row; filtered_join's cuco::static_set slots are no larger, so 16 B/row is a
+/// conservative single constant across all three structures.
+constexpr uint64_t BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW = 16;
 
 /// Multi-GPU small-table threshold, charged per GPU. A partition-sizing consumer (hash join,
 /// merge_group_by) keeps inputs below `num_gpus * this` on a single GPU (one partition) to avoid
@@ -107,10 +121,21 @@ struct operator_params {
   /// Target size (bytes) of data to sample before computing sort partition boundaries.
   uint64_t sort_sample_bytes = config::derived_default_batch_size();
 
-  /// Maximum build-side bytes for switching to BUILD_PROBE join mode: 2x the shared
-  /// batch default. May be larger than concat_batch_bytes; build-side batches will be
-  /// concatenated if needed.
-  uint64_t max_build_hash_table_bytes = 2 * config::derived_default_batch_size();
+  /// Maximum per-GPU bytes of the ESTIMATED cuco hash table a BUILD_PROBE join may build
+  /// (measured build rows x config::BUILD_PROBE_HASH_TABLE_BYTES_PER_ROW, with payload bytes as a
+  /// conservative surrogate when rows are unmeasurable) -- not the build payload bytes, which
+  /// max_build_probe_resident_bytes bounds. 0 disables BUILD_PROBE for all joins except MARK
+  /// (which is correctness-forced).
+  uint64_t max_build_hash_table_bytes = 8 * config::derived_default_batch_size();
+
+  /// Maximum per-GPU bytes of folded build payload a BUILD_PROBE join may keep GPU-resident (and
+  /// read-only-locked, hence un-spillable) for the lifetime of its probe stream. Also implicitly
+  /// bounds the build-side CONCAT concat_all fold, whose transient working set is ~2x this value.
+  /// An absolute bound (not a pool fraction) so several concurrent BUILD_PROBE joins in one plan
+  /// stay bounded and other operators' OOM retries can always make progress. May be larger than
+  /// concat_batch_bytes; build-side batches are concatenated as needed. 0 disables BUILD_PROBE for
+  /// all joins except MARK.
+  uint64_t max_build_probe_resident_bytes = 8 * config::derived_default_batch_size();
 
   /// Maximum build-side bytes for a broadcast join. A build below this size is eligible to be
   /// replicated to every GPU (instead of hash-partitioning across GPUs) when the probe side is

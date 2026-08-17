@@ -462,7 +462,8 @@ void require_shared_operator_defaults(const sirius::operator_params& params, uin
   REQUIRE(params.hash_partition_bytes == batch);
   REQUIRE(params.concat_batch_bytes == batch);
   REQUIRE(params.sort_sample_bytes == batch);
-  REQUIRE(params.max_build_hash_table_bytes == 2 * batch);
+  REQUIRE(params.max_build_hash_table_bytes == 8 * batch);
+  REQUIRE(params.max_build_probe_resident_bytes == 8 * batch);
 }
 
 fs::path config_fixture(std::string const& name)
@@ -538,6 +539,7 @@ TEST_CASE("explicit operator batch values override effective-capacity defaults",
   REQUIRE(params.concat_batch_bytes == 3 * mib);
   REQUIRE(params.sort_sample_bytes == 4 * mib);
   REQUIRE(params.max_build_hash_table_bytes == 5 * mib);
+  REQUIRE(params.max_build_probe_resident_bytes == 6 * mib);
 }
 
 TEST_CASE("ordinary defaults stay physical-memory-derived without an explicit GPU cap",
@@ -605,7 +607,8 @@ TEST_CASE("effective-capacity defaults seed DuckDB SET and RESET",
            current_setting('hash_partition_bytes')::UBIGINT,
            current_setting('concat_batch_bytes')::UBIGINT,
            current_setting('sort_sample_bytes')::UBIGINT,
-           current_setting('max_build_hash_table_bytes')::UBIGINT
+           current_setting('max_build_hash_table_bytes')::UBIGINT,
+           current_setting('max_build_probe_resident_bytes')::UBIGINT
   )");
   REQUIRE(settings != nullptr);
   REQUIRE_FALSE(settings->HasError());
@@ -613,7 +616,8 @@ TEST_CASE("effective-capacity defaults seed DuckDB SET and RESET",
   REQUIRE(settings->GetValue(1, 0).GetValue<uint64_t>() == expected_batch);
   REQUIRE(settings->GetValue(2, 0).GetValue<uint64_t>() == expected_batch);
   REQUIRE(settings->GetValue(3, 0).GetValue<uint64_t>() == expected_batch);
-  REQUIRE(settings->GetValue(4, 0).GetValue<uint64_t>() == 2 * expected_batch);
+  REQUIRE(settings->GetValue(4, 0).GetValue<uint64_t>() == 8 * expected_batch);
+  REQUIRE(settings->GetValue(5, 0).GetValue<uint64_t>() == 8 * expected_batch);
 
   auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
   REQUIRE(sirius_ctx != nullptr);
@@ -882,7 +886,8 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
       current_setting('pin_table_input_compression_plan_dir')::VARCHAR,
       current_setting('pin_table_compression_min_batch_size_bytes')::UBIGINT,
       current_setting('pin_table_compression_max_compressed_fraction')::DOUBLE,
-      current_setting('enable_runtime_distinct_build_probe')::BOOLEAN
+      current_setting('enable_runtime_distinct_build_probe')::BOOLEAN,
+      current_setting('max_build_probe_resident_bytes')::UBIGINT
   )");
   REQUIRE(settings != nullptr);
   REQUIRE_FALSE(settings->HasError());
@@ -908,6 +913,7 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(settings->GetValue(17, 0).GetValue<uint64_t>() == 8 * mib);
   REQUIRE(settings->GetValue(18, 0).GetValue<double>() == Approx(0.6));
   REQUIRE_FALSE(settings->GetValue(19, 0).GetValue<bool>());
+  REQUIRE(settings->GetValue(20, 0).GetValue<uint64_t>() == 9 * mib);
 
   auto zero_partition = con.Query("SET hash_partition_bytes = 0");
   REQUIRE(zero_partition != nullptr);
@@ -997,6 +1003,8 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   require_ok("RESET dynamic_filter_keep_threshold");
   require_ok("SET enable_runtime_distinct_build_probe = true");
   require_ok("RESET enable_runtime_distinct_build_probe");
+  require_ok("SET max_build_probe_resident_bytes = 42");
+  require_ok("RESET max_build_probe_resident_bytes");
   require_ok("SET pin_table_compression = false");
   require_ok("RESET pin_table_compression");
   require_ok("SET pin_table_compression_max_compressed_fraction = 0.9");
@@ -1022,6 +1030,7 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
 
   auto const& params = sirius_ctx->get_config().get_operator_params();
   REQUIRE(params.scan_task_batch_size == 1 * mib);
+  REQUIRE(params.max_build_probe_resident_bytes == 9 * mib);
   REQUIRE(params.max_sort_partition_memory_fraction == Approx(0.25));
   REQUIRE_FALSE(params.enable_dynamic_filter_pushdown);
   REQUIRE_FALSE(params.enable_runtime_distinct_build_probe);
