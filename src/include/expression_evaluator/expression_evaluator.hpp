@@ -318,6 +318,21 @@ class expression_evaluator {
                                       std::span<cudf::size_type const> output_indices);
 
   /**
+   * @brief select(), plus the positions of the rows that survived.
+   *
+   * @p survivors comes back as an INT32 column holding the input row index of
+   * each output row, ascending. Its purpose is late materialization: a scan
+   * that filters no longer emits its chunk's rows in order, so a pin-order
+   * rowid can only be reconstructed from where the survivors were. Costs one
+   * extra gather over a row-index sequence, so it is a separate entry point
+   * rather than a widening of select().
+   */
+  std::unique_ptr<cudf::table> select_with_survivors(
+    cudf::table_view input,
+    std::span<cudf::size_type const> output_indices,
+    std::unique_ptr<cudf::column>& survivors);
+
+  /**
    * @brief Selects rows from the input batch based on the executor's (singular) expression.
    *
    * @param input The read-only locked input batch from which to select rows.

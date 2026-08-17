@@ -75,13 +75,37 @@ struct step {
   /// aggregate input, which is a real read and not extendable.
   bool as_group_key = false;
 
-  static step reads() { return step{std::nullopt, true}; }
-  static step reads_and_moves(std::optional<std::size_t> position) { return step{position, true}; }
-  static step key(std::optional<std::size_t> position) { return step{position, true, true}; }
-  static step to(std::optional<std::size_t> position) { return step{position, false}; }
+  /// The join conditions that compared this column, when the reader is a join.
+  /// Empty at a partition, which hashes a key the join above it will compare —
+  /// the walk records the role where the comparison actually is.
+  std::vector<std::size_t> compared_in;
+  /// Which side of the join the column arrived on; only meaningful with
+  /// compared_in. Two scans meeting on opposite sides of ONE condition is what
+  /// determines a rider's row from the ride's.
+  bool from_lhs = false;
+
+  /// Every read of this column here is a COUNT: the reader needs the row, not
+  /// what is in it, so a rowid standing in counts identically. See
+  /// column_lifetime::consumed_as_count_only.
+  bool count_only = false;
+
+  // Designated rather than positional: these have grown a member at a time, and
+  // a positional initializer silently sets the wrong flag when one lands in the
+  // middle.
+  static step reads() { return step{.read_content = true}; }
+  static step reads_and_moves(std::optional<std::size_t> position)
+  {
+    return step{.moved_to = position, .read_content = true};
+  }
+  static step counts() { return step{.read_content = true, .count_only = true}; }
+  static step key(std::optional<std::size_t> position)
+  {
+    return step{.moved_to = position, .read_content = true, .as_join_key = true};
+  }
+  static step to(std::optional<std::size_t> position) { return step{.moved_to = position}; }
   static step group_key(std::optional<std::size_t> position, bool also_read = false)
   {
-    return step{position, also_read, false, true};
+    return step{.moved_to = position, .read_content = also_read, .as_group_key = true};
   }
 };
 
@@ -99,17 +123,24 @@ struct group_by_shape {
   std::vector<int> const* group_idx                         = nullptr;
   std::vector<int> const* aggregate_idx                     = nullptr;
   std::vector<std::vector<int>> const* aggregate_struct_idx = nullptr;
+  /// Parallel to aggregate_idx: what each aggregate DOES with its input. A
+  /// COUNT needs the row, not the value.
+  std::vector<cudf::aggregation::Kind> const* aggregate_kinds = nullptr;
 };
 
 std::optional<group_by_shape> read_group_by(sirius_physical_operator const& node)
 {
   if (auto const* agg = dynamic_cast<op::sirius_physical_grouped_aggregate const*>(&node)) {
-    return group_by_shape{
-      &agg->group_idx, &agg->cudf_aggregate_idx, &agg->cudf_aggregate_struct_col_indices};
+    return group_by_shape{&agg->group_idx,
+                          &agg->cudf_aggregate_idx,
+                          &agg->cudf_aggregate_struct_col_indices,
+                          &agg->cudf_aggregates};
   }
   if (auto const* merge = dynamic_cast<op::sirius_physical_grouped_aggregate_merge const*>(&node)) {
-    return group_by_shape{
-      &merge->group_idx, &merge->cudf_aggregate_idx, &merge->cudf_aggregate_struct_col_indices};
+    return group_by_shape{&merge->group_idx,
+                          &merge->cudf_aggregate_idx,
+                          &merge->cudf_aggregate_struct_col_indices,
+                          &merge->cudf_aggregates};
   }
   return std::nullopt;
 }
@@ -183,10 +214,10 @@ step trace_through(sirius_physical_operator const& node,
       // A key is read: the join compares its values. The conditions' left
       // nodes address the lhs and their right nodes the rhs, so only this
       // side's half is consulted.
-      bool compared = false;
-      for (auto const& condition : join.conditions) {
-        auto const& side = from_lhs ? condition.left : condition.right;
-        if (side && reads_column(*side, in_pos)) { compared = true; }
+      std::vector<std::size_t> compared_in;
+      for (std::size_t c = 0; c < join.conditions.size(); ++c) {
+        auto const& side = from_lhs ? join.conditions[c].left : join.conditions[c].right;
+        if (side && reads_column(*side, in_pos)) { compared_in.push_back(c); }
       }
 
       std::vector<int> const lhs(join.lhs_output_columns.col_idxs.begin(),
@@ -196,8 +227,13 @@ step trace_through(sirius_physical_operator const& node,
       auto const moved = join_output_position(from_lhs, lhs, rhs, in_pos);
       // A key is read: the join compares its values. It is usually projected
       // out as well, and the walk follows it there — its own ride is over, but
-      // its group-key roles further up are what admit another column's.
-      if (compared) { return step::key(moved); }
+      // its key and group-key roles further up are what admit another column's.
+      if (!compared_in.empty()) {
+        auto keyed        = step::key(moved);
+        keyed.compared_in = std::move(compared_in);
+        keyed.from_lhs    = from_lhs;
+        return keyed;
+      }
 
       // An outer join can emit a row this side never matched. The rowid is
       // null there and the column materializes null, which is sound — so the
@@ -241,11 +277,23 @@ step trace_through(sirius_physical_operator const& node,
       // SUM the query asked for. A column can be BOTH (GROUP BY x, SUM(x)); it
       // is then a group key for the purpose of proving somebody else's ride and
       // a genuine read for the purpose of its own.
-      auto const in = static_cast<int>(in_pos);
-      bool aggregate_input =
-        shape->aggregate_idx != nullptr &&
-        std::find(shape->aggregate_idx->begin(), shape->aggregate_idx->end(), in) !=
-          shape->aggregate_idx->end();
+      auto const in        = static_cast<int>(in_pos);
+      bool aggregate_input = false;
+      bool counted_only    = false;
+      if (shape->aggregate_idx != nullptr) {
+        bool any        = false;
+        bool all_counts = true;
+        for (std::size_t a = 0; a < shape->aggregate_idx->size(); ++a) {
+          if ((*shape->aggregate_idx)[a] != in) { continue; }
+          any               = true;
+          auto const counts = shape->aggregate_kinds != nullptr &&
+                              a < shape->aggregate_kinds->size() &&
+                              (*shape->aggregate_kinds)[a] == cudf::aggregation::Kind::COUNT_VALID;
+          all_counts = all_counts && counts;
+        }
+        aggregate_input = any;
+        counted_only    = any && all_counts;
+      }
       if (!aggregate_input && shape->aggregate_struct_idx != nullptr) {
         for (auto const& columns : *shape->aggregate_struct_idx) {
           if (std::find(columns.begin(), columns.end(), in) != columns.end()) {
@@ -261,6 +309,9 @@ step trace_through(sirius_physical_operator const& node,
       if (key == shape->group_idx->end()) {
         // Not a key: read if an aggregate consumes it, and either way the
         // aggregate's output carries no such column, so the ride ends here.
+        // A read that only COUNTS says so — the values are not needed, which is
+        // what count-on-deferred trades on.
+        if (counted_only) { return step::counts(); }
         return step::reads();
       }
       return step::group_key(
@@ -468,19 +519,23 @@ std::vector<column_lifetime> analyze_column_lifetimes(sirius_physical_operator c
       // local aggregate hashes the same keys, but it is plumbing on the ride,
       // not an aggregate a proof has to cover.
       if (moved.as_group_key && is_group_by(*node)) { life.group_key_at.push_back(node); }
+      for (auto const condition : moved.compared_in) {
+        life.join_key_at.push_back(join_key_role{node, condition, moved.from_lhs});
+      }
 
       // A group-by reads its keys, so a key read stops a plain ride exactly
       // like any other read — it is only the ONE stop the pin-uniqueness
       // bijection can move further up, which is what `extending` measures.
       bool const stops_here = moved.read_content || moved.as_group_key;
       if (stops_here && !col.stopped) {
-        life.first_reader       = node;
-        life.port_crossings     = crossings;
-        life.position_at_reader = col.position;
-        life.reader_input       = from;
-        life.nullified_on_ride  = col.nullified;
-        life.read_as_join_key   = moved.as_join_key;
-        col.stopped             = true;
+        life.first_reader           = node;
+        life.port_crossings         = crossings;
+        life.position_at_reader     = col.position;
+        life.reader_input           = from;
+        life.nullified_on_ride      = col.nullified;
+        life.read_as_join_key       = moved.as_join_key;
+        life.consumed_as_count_only = moved.count_only;
+        col.stopped                 = true;
         // Extendable only if the stop was a key role and nothing else about the
         // column's values was needed here.
         if (moved.as_group_key && !moved.read_content) {
@@ -506,13 +561,14 @@ std::vector<column_lifetime> analyze_column_lifetimes(sirius_physical_operator c
         // it as a proof either. Being DROPPED here ends the ride exactly like
         // being read here — there is nowhere downstream to materialize into.
         if (!col.stopped) {
-          life.first_reader       = node;
-          life.port_crossings     = crossings;
-          life.position_at_reader = col.position;
-          life.reader_input       = from;
-          life.nullified_on_ride  = col.nullified;
-          life.read_as_join_key   = moved.as_join_key;
-          col.stopped             = true;
+          life.first_reader           = node;
+          life.port_crossings         = crossings;
+          life.position_at_reader     = col.position;
+          life.reader_input           = from;
+          life.nullified_on_ride      = col.nullified;
+          life.read_as_join_key       = moved.as_join_key;
+          life.consumed_as_count_only = moved.count_only;
+          col.stopped                 = true;
         }
         if (col.extending) {
           life.group_ride->reader             = node;
@@ -706,6 +762,19 @@ bool install_deferral(sirius_physical_operator& scan,
   if (!scan._deferred_output.empty() || !port._port_directive.empty()) { return false; }
   scan._deferred_output = std::move(pair.scan);
   port._port_directive  = std::move(pair.port);
+  late_mat::note_deferral_installed();
+  return true;
+}
+
+bool install_count_deferral(sirius_physical_operator& scan, late_mat::deferred_scan_output output)
+{
+  if (output.empty()) { return false; }
+  if (!scan._deferred_output.empty()) { return false; }
+  // NO PORT, and that is the point: nothing downstream restores these columns
+  // because nothing downstream reads their values. The caller owes the proof —
+  // every read is a COUNT and the pinned values carry no nulls — because from
+  // here it is indistinguishable from throwing data away.
+  scan._deferred_output = std::move(output);
   late_mat::note_deferral_installed();
   return true;
 }

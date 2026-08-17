@@ -126,6 +126,42 @@ inline std::size_t min_group_by_rowid_input_rows()
   return value;
 }
 
+/// Count-on-deferred admit switch (SIRIUS_LATE_MAT_COUNT_DEFER, default OFF).
+///
+/// A column read only by COUNTs can ride and never come back: the aggregate
+/// needs the row, not the value. It is dark by default because the shapes that
+/// fire it on TPC-H save ~4 B/row, which no A/B run could separate from noise —
+/// and because a mis-marked column would lose values nothing restores. A
+/// workload that counts WIDE columns over long rides can turn it on.
+inline bool count_on_deferred_enabled()
+{
+  static bool const enabled = [] {
+    char const* v = std::getenv("SIRIUS_LATE_MAT_COUNT_DEFER");
+    return v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
+  }();
+  return enabled;
+}
+
+/// Deferred-value floor for a bundle whose origin is COMPRESSED in the pin
+/// (SIRIUS_LATE_MAT_MIN_VALUE_COMPRESSED, default: the ordinary floor).
+///
+/// Such a bundle saves more than the ride: the scan can skip decompressing what
+/// it is about to replace with a rowid. Until that decode-skip exists the two
+/// floors are the same number, and this knob is how the difference gets
+/// measured when it does.
+inline std::int64_t min_value_bytes_compressed(std::int64_t ordinary)
+{
+  static std::int64_t const value = []() -> std::int64_t {
+    char const* v = std::getenv("SIRIUS_LATE_MAT_MIN_VALUE_COMPRESSED");
+    if (v == nullptr || v[0] == '\0') { return -1; }
+    std::int64_t parsed = 0;
+    auto const* end     = v + std::strlen(v);
+    auto const rc       = std::from_chars(v, end, parsed);
+    return (rc.ec == std::errc{} && rc.ptr == end && parsed >= 0) ? parsed : -1;
+  }();
+  return value < 0 ? ordinary : value;
+}
+
 /// The thresholds, in one place so a measurement can move them together.
 struct defer_policy {
   /// Deferred value must exceed this, per row, after the rowid is paid for.

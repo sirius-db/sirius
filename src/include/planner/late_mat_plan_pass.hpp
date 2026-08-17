@@ -84,6 +84,19 @@ struct group_key_ride {
   bool read_as_join_key = false;
 };
 
+/// Where a column is compared as a join key: which join, which condition of it,
+/// and which side the column arrived on.
+///
+/// Recorded for EVERY join that compares the column, not just the first, and
+/// kept even for a column whose own ride ended long before. Two scans that meet
+/// on the two sides of one condition are how a rider's row is shown to be
+/// determined by the ride's row — see @ref group_key_extension.
+struct join_key_role {
+  op::sirius_physical_operator const* join = nullptr;
+  std::size_t condition                    = 0;
+  bool from_lhs                            = false;
+};
+
 /// Where one scan output column stops being merely carried.
 struct column_lifetime {
   std::size_t scan_output_position = 0;
@@ -121,6 +134,13 @@ struct column_lifetime {
   /// partition has already hashed. This is the walk's one silent-wrong-answer
   /// shape; every other refusal merely costs a deferral.
   bool read_as_join_key = false;
+  /// The reader needs to know the column's rows are THERE, not what is in them:
+  /// every read of it is a COUNT. A rowid counts identically to the values it
+  /// stands for — so long as those values carry no nulls, which only the pinned
+  /// entry can say, and which is why nothing acts on this flag alone.
+  bool consumed_as_count_only = false;
+  /// Every join condition this column is compared in; see @ref join_key_role.
+  std::vector<join_key_role> join_key_at;
   /// Every group-by this column is a planned KEY of, in ride order — recorded
   /// whatever else reads it, and so present even for a column that stopped long
   /// before (a join key, say). That is the point: a column riding REAL is the
@@ -249,6 +269,10 @@ struct planned_deferral {
   /// The group-by-rowid extension of this bundle, when the walk found one. See
   /// @ref group_key_extension: reported, not admitted.
   std::optional<group_key_extension> group_extension;
+  /// EVERY column of this bundle is read only by COUNTs. Such a bundle needs no
+  /// materialization at all — the rowid counts identically to the values —
+  /// provided those values carry no nulls, which only the pinned entry knows.
+  bool count_only_bundle = false;
 
   [[nodiscard]] bool installable() const noexcept { return port != nullptr && !positions.empty(); }
 };
@@ -266,6 +290,15 @@ struct planned_deferral {
 /// Fails (changing nothing) on an invalid pair, or when either operator already
 /// carries a half — a second deferral through the same port would materialize
 /// against a schema the first one has already rewritten.
+/// Install the producing half ALONE, for a bundle nothing reads the values of.
+///
+/// Only for a count-only bundle (@ref planned_deferral::count_only_bundle) over
+/// null-free pinned columns: the aggregate counts the rowid and gets the same
+/// answer, so there is no far end to restore at. Every other deferral must
+/// install as a pair — half a pair is data thrown away.
+bool install_count_deferral(op::sirius_physical_operator& scan,
+                            late_mat::deferred_scan_output output);
+
 /// Attach a RIDER to a port that already carries a deferral.
 ///
 /// The rider is a second pinned table's bundle materializing at the same

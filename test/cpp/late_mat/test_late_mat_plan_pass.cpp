@@ -158,16 +158,18 @@ struct test_aggregate_merge : sirius::op::sirius_physical_grouped_aggregate_merg
 /// A group-by over `columns` inputs, grouping on `groups` and aggregating each
 /// of `aggregate_inputs`. Built by hand rather than from expressions: what the
 /// walk reads is the resolved cudf metadata, which is what a test should pin.
-std::unique_ptr<test_aggregate> make_aggregate(std::size_t columns,
-                                               std::vector<int> groups,
-                                               std::vector<int> aggregate_inputs)
+std::unique_ptr<test_aggregate> make_aggregate(
+  std::size_t columns,
+  std::vector<int> groups,
+  std::vector<int> aggregate_inputs,
+  cudf::aggregation::Kind kind = cudf::aggregation::Kind::SUM)
 {
   auto agg       = std::make_unique<test_aggregate>(make_string_types(columns),
                                               duckdb::vector<std::unique_ptr<sirius::ast::node>>{},
                                               duckdb::vector<std::unique_ptr<sirius::ast::node>>{},
                                               0);
   agg->group_idx = std::move(groups);
-  agg->cudf_aggregates.assign(aggregate_inputs.size(), cudf::aggregation::Kind::SUM);
+  agg->cudf_aggregates.assign(aggregate_inputs.size(), kind);
   agg->cudf_aggregate_idx = std::move(aggregate_inputs);
   return agg;
 }
@@ -874,4 +876,62 @@ TEST_CASE("no proof candidate means no extension is reported", "[late_mat][lifet
   auto const planned = sirius::planner::plan_deferral(scan);
   REQUIRE(planned.installable());
   REQUIRE_FALSE(planned.group_extension.has_value());
+}
+
+TEST_CASE("a column only ever counted is marked as such", "[late_mat][lifetime]")
+{
+  // COUNT needs to know the row is THERE, not what is in it, so a rowid counts
+  // identically to the values it stands for. The pass only MARKS that; whether
+  // the values may be dropped depends on their nullability, which the pinned
+  // entry knows and the plan does not.
+  wide_scan scan(2);
+  auto counting = make_aggregate(
+    2, /*groups=*/{0}, /*aggregate_inputs=*/{1}, cudf::aggregation::Kind::COUNT_VALID);
+  scan.link(counting.get());
+
+  auto const counted = analyze_column_lifetimes(scan);
+  REQUIRE(counted[1].first_reader == counting.get());
+  REQUIRE(counted[1].consumed_as_count_only);
+  // The group key is not "counted" — it is read as a key, and its own ride ends
+  // for a different reason.
+  REQUIRE_FALSE(counted[0].consumed_as_count_only);
+
+  // The same shape with a SUM needs the values, and says so.
+  wide_scan summed_scan(2);
+  auto summing =
+    make_aggregate(2, /*groups=*/{0}, /*aggregate_inputs=*/{1}, cudf::aggregation::Kind::SUM);
+  summed_scan.link(summing.get());
+  auto const summed = analyze_column_lifetimes(summed_scan);
+  REQUIRE(summed[1].first_reader == summing.get());
+  REQUIRE_FALSE(summed[1].consumed_as_count_only);
+}
+
+TEST_CASE("a join key records which condition compared it", "[late_mat][lifetime]")
+{
+  // What a rider's functional-dependency proof reads: two scans meeting on the
+  // two sides of ONE condition. Recording only "was a key" would not tell the
+  // two sides of a multi-condition join apart.
+  duckdb::LogicalDummyScan stub(0);
+  stub.types = duckdb::vector<duckdb::LogicalType>(6, duckdb::LogicalType::VARCHAR);
+  duckdb::vector<sirius::join_condition> conditions;
+  sirius::join_condition condition;
+  condition.left  = std::make_unique<sirius::ast::node>(sirius::ast::reference{1, string_type()});
+  condition.right = std::make_unique<sirius::ast::node>(sirius::ast::reference{0, string_type()});
+  conditions.push_back(std::move(condition));
+  test_join join(stub,
+                 duckdb::make_uniq<wide_scan>(3),
+                 duckdb::make_uniq<wide_scan>(3),
+                 std::move(conditions),
+                 duckdb::JoinType::INNER,
+                 /*estimated_cardinality=*/1);
+
+  auto* lhs_scan = static_cast<wide_scan*>(join.children[0].get());
+  lhs_scan->link(&join);
+  auto const lives = analyze_column_lifetimes(*lhs_scan);
+
+  REQUIRE(lives[1].join_key_at.size() == 1);
+  REQUIRE(lives[1].join_key_at.front().join == &join);
+  REQUIRE(lives[1].join_key_at.front().condition == 0);
+  REQUIRE(lives[1].join_key_at.front().from_lhs);
+  REQUIRE(lives[0].join_key_at.empty());  // beside the key, never compared
 }

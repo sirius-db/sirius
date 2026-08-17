@@ -136,10 +136,18 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    * move-forward without an extra view→owning copy on the dominant
    * fresh-read + assembly path.
    */
+  /// \param survivors When non-null AND this call applies a row filter here,
+  ///        receives an INT32 column of the input row positions that survived,
+  ///        ascending. Late materialization needs it: a filtered batch is no
+  ///        longer the chunk's rows in order, so the pin-order rowid can only be
+  ///        rebuilt from where the survivors were. Left untouched when the rows
+  ///        were filtered somewhere this call cannot see (the decoder), which is
+  ///        exactly the case a deferral must refuse rather than guess at.
   virtual std::unique_ptr<cudf::table> post_filter_and_project(
     filtered_table&& input,
     const cucascade::memory::memory_space& mem_space,
-    rmm::cuda_stream_view stream) = 0;
+    rmm::cuda_stream_view stream,
+    std::unique_ptr<cudf::column>* survivors = nullptr) = 0;
 
   /**
    * @brief Whether this ingestible holds a row-filter expression that

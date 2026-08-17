@@ -31,6 +31,7 @@
 #include <sirius_context.hpp>
 
 // cudf
+#include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/filling.hpp>
@@ -73,11 +74,23 @@ std::unique_ptr<cudf::table> substitute_deferred_columns(
   std::unique_ptr<cudf::table> output,
   late_mat::deferred_scan_output const& deferred,
   late_mat::scan_batch_origin const& origin,
+  cudf::column_view const* survivors,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr)
 {
   auto const rows = output->num_rows();
-  if (static_cast<std::int64_t>(rows) != origin.range.rows) {
+  // Two shapes, and the check is what tells them apart. Unfiltered: the batch
+  // IS the chunk, so row k is global row start + k. Filtered: the batch holds
+  // the survivors, and row k is global row start + survivors[k] — which is why
+  // a filtered batch without survivors must fail here rather than emit ids for
+  // rows it no longer holds.
+  if (survivors != nullptr) {
+    if (survivors->size() != rows) {
+      throw std::runtime_error("[sirius_gpu_scan_operator] a deferred scan emitted " +
+                               std::to_string(rows) + " rows but captured " +
+                               std::to_string(survivors->size()) + " survivor positions");
+    }
+  } else if (static_cast<std::int64_t>(rows) != origin.range.rows) {
     throw std::runtime_error("[sirius_gpu_scan_operator] a deferred scan emitted " +
                              std::to_string(rows) + " rows for a pinned chunk of " +
                              std::to_string(origin.range.rows) +
@@ -92,6 +105,17 @@ std::unique_ptr<cudf::table> substitute_deferred_columns(
                                std::to_string(position) + " is outside the scan's output");
     }
     if (i == 0) {
+      if (survivors != nullptr) {
+        // start + survivor position, in the agreed width. cudf::binary_operation
+        // casts the INT32 positions into the output type, so the narrow case
+        // stays narrow.
+        auto const base = cudf::numeric_scalar<std::uint64_t>(
+          static_cast<std::uint64_t>(origin.range.start), true, stream, mr);
+        auto const type = cudf::data_type{deferred.rowid_type};
+        columns[position] =
+          cudf::binary_operation(base, *survivors, cudf::binary_operator::ADD, type, stream, mr);
+        continue;
+      }
       // The width the pair agreed on: a pinned table whose rows fit 32 bits
       // rides half the bytes. The range check is not a formality — a wrong
       // width here wraps the id and materializes a plausible WRONG row.
@@ -315,10 +339,15 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
 
   ::cucascade::memory::memory_space* mem_space = scan_input->gpu_memory_space;
   std::unique_ptr<cudf::table> output_table;
-  auto materialized_table = _ingestible->materialize_table(*scan_input, stream);
+  // A deferral needs to know which rows survived a filter applied here; asking
+  // for them costs one gather over a row-index sequence, so only a deferring
+  // scan asks.
+  std::unique_ptr<cudf::column> survivors;
+  auto const wants_survivors = !deferred_output().empty();
+  auto materialized_table    = _ingestible->materialize_table(*scan_input, stream);
   if (materialized_table.state != filter_state::ROW_FILTERED_AND_PROJECTED) {
-    output_table =
-      _ingestible->post_filter_and_project(std::move(materialized_table), *mem_space, stream);
+    output_table = _ingestible->post_filter_and_project(
+      std::move(materialized_table), *mem_space, stream, wants_survivors ? &survivors : nullptr);
   } else {
     output_table = materialized_table.table.release(stream, mem_space->get_default_allocator());
   }
@@ -346,9 +375,12 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
         "[sirius_gpu_scan_operator::execute] a deferral is installed but this split carries no "
         "origin; the scan cannot say where its rows came from");
     }
+    std::optional<cudf::column_view> const survivor_view =
+      survivors ? std::optional<cudf::column_view>{survivors->view()} : std::nullopt;
     output_table = substitute_deferred_columns(std::move(output_table),
                                                deferred_output(),
                                                *scan_input->origin,
+                                               survivor_view ? &*survivor_view : nullptr,
                                                stream,
                                                mem_space->get_default_allocator());
   }

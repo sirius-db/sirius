@@ -1134,7 +1134,8 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
 std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
   filtered_table&& input,
   ::cucascade::memory::memory_space const& mem_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  std::unique_ptr<cudf::column>* survivors)
 {
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
 
@@ -1155,8 +1156,16 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
     if (sirius_filter_ast) {
       sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
       auto const data_positions = output_data_positions(*_plan);
-      auto filtered             = data_positions.empty() ? exec.select(input.table.view())
-                                                         : exec.select(input.table.view(), data_positions);
+      std::unique_ptr<cudf::table> filtered;
+      if (survivors != nullptr && !data_positions.empty()) {
+        // A deferral rides on this batch: it needs to know WHICH rows survived,
+        // because its rowid addresses the pinned chunk and the batch no longer
+        // holds that chunk's rows in order.
+        filtered = exec.select_with_survivors(input.table.view(), data_positions, *survivors);
+      } else {
+        filtered = data_positions.empty() ? exec.select(input.table.view())
+                                          : exec.select(input.table.view(), data_positions);
+      }
       input = filtered_table{owning_table_view{std::move(filtered)}, filter_state::ROW_FILTERED};
       SIRIUS_LOG_DEBUG(
         "[parquet_gpu_ingestible::post_filter_and_project] Applied the residual filter "

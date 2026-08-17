@@ -125,7 +125,8 @@ class stub_ingestible final : public sirius::op::scan::gpu_ingestible {
 
   std::unique_ptr<cudf::table> post_filter_and_project(sirius::op::scan::filtered_table&&,
                                                        const cucascade::memory::memory_space&,
-                                                       rmm::cuda_stream_view) override
+                                                       rmm::cuda_stream_view,
+                                                       std::unique_ptr<cudf::column>*) override
   {
     return _produce();
   }

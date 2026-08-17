@@ -343,7 +343,8 @@ std::unique_ptr<batch_coalescer> duckdb_native_gpu_ingestible::create_batch_coal
 std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_project(
   filtered_table&& input,
   ::cucascade::memory::memory_space const& mem_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  std::unique_ptr<cudf::column>* /*survivors*/)
 {
   auto const output_arity = _info->output_types.size();
   auto const decoded_cols =
