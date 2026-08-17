@@ -70,8 +70,13 @@ simpatico::stream_pool& decode_pool()
 /// dtype is comparable at all.
 struct column_capability {
   /// The dtype decodes into a lane the row-selecting kernels can compare as a
-  /// signed 64-bit integer. uint64 is excluded: its upper half would misorder
-  /// under a signed compare.
+  /// signed 64-bit integer. Every unsigned width is excluded: the JIT decode
+  /// lane for an N-bit unsigned column is the same-width *signed* C++ type
+  /// (see `dtype_to_cxx`), and the range/pair ballot widens that lane to
+  /// int64 with a plain `static_cast`, which sign-extends. A stored value
+  /// whose top bit is set (e.g. a uint32 above INT32_MAX) would decode to a
+  /// negative int64 instead of its true unsigned value, silently corrupting
+  /// the ballot for any such row.
   bool comparable_lane = false;
   simpatico::column_decode_caps decode;
 
@@ -92,9 +97,6 @@ column_capability probe_column(simpatico::compressed_table const& table, std::si
     case cudf::type_id::INT16:
     case cudf::type_id::INT32:
     case cudf::type_id::INT64:
-    case cudf::type_id::UINT8:
-    case cudf::type_id::UINT16:
-    case cudf::type_id::UINT32:
     case cudf::type_id::TIMESTAMP_DAYS:
     case cudf::type_id::DECIMAL32:
     case cudf::type_id::DECIMAL64: capability.comparable_lane = true; break;
