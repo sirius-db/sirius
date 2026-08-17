@@ -623,6 +623,18 @@ the setting enabled. See
 The direct DuckDB `SET` override is registered only when the process explicitly enables Sirius
 test options; it is not part of the normal user surface.
 
+### Pinned-Table Compression (Simpatico)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `pin_table_compression` | false | Enable Simpatico compression for `pin_table(tier=>'host')` chunks. |
+| `pin_table_input_compression_plan_dir` | (empty) | Directory of per-table Simpatico plan files (`<table_name>.<ext>`, multi-column plan DSL). Tables with no matching file are pinned uncompressed. No effect on spill compression. |
+| `pin_table_compression_min_batch_size_bytes` | 1 MiB | Minimum uncompressed batch size below which pin-table compression is skipped. |
+| `pin_table_compression_max_compressed_fraction` | 0.75 | Discard the compressed form and pin uncompressed when the compressed size exceeds this fraction of the original (compression saved too little). |
+
+Both size gates are evaluated on the narrowed table when compressed materialization is active.
+See [Compressed Pinning](compressed-pinning.md) for tier selection, plan authoring, and results.
+
 ### Transparent Execution
 
 | Variable | Default | Description |
@@ -634,7 +646,7 @@ test options; it is not part of the normal user surface.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates both plan-time fallback (unsupported operator/type) and runtime fallback (GPU execution failure) on the transparent path, plus the legacy `CALL gpu_execution(...)` path. Set to `false` to surface Sirius errors instead of falling back. |
-| `enable_regex_jit_impl` | - | Use JIT regex implementation |
+| `enable_regex_jit_impl` | true | Use JIT regex implementation |
 
 
 ## Legacy Config Flags

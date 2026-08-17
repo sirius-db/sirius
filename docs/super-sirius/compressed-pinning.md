@@ -13,7 +13,19 @@ block per full-table column in schema order; a pin of a column subset selects th
 blocks (`select_plan_blocks`). Scans of a compressed entry decompress the projected columns
 at task-prepare time via the `compressed_host_representation` /
 `compressed_device_blob` → `gpu_table_representation` converters, column-parallel across
-4 fixed streams (measured strictly better than serial).
+4 fixed streams (measured strictly better than serial; the stream count is deliberately
+not configurable).
+
+## Decode-time equality pushdown
+
+A string equality filter over a compressed pinned column can be evaluated *inside* the
+decode instead of re-expressed as a post-decode comparison. At `prepare_for_query`, the
+scan manager derives a `sirius::decode_equality_pushdown` from the query's pushed-down
+filters and attaches it to the entry's scan (`set_equality_pushdown()`); the converter
+translates it into a `simpatico::decode_predicate`, so the decoder emits the match result
+directly. Interfaces: `src/compression/compressed_representation.hpp`
+(`decode_equality_pushdown`), `src/compression/compression_converters.cpp` (predicate
+translation), threaded through `sirius_scan_manager::prepare_for_query`.
 
 The compression settings can be staged in either order before a table is pinned. They become
 active only when `pin_table_compression` is true, the plan-directory setting is non-empty, and a
@@ -24,7 +36,9 @@ and compressed-fraction settings are inert until a matching plan activates compr
 ## Which tier to compress on (GB300, TPC-H SF1000, 22-query hot suite)
 
 The tier decides whether compression helps at all. Measured against a 20.74 s all-host
-uncompressed baseline (dev `c4e8a10b`, pipeline 4, host-pinned, hot = min of iters 1–2):
+uncompressed baseline (dev `c4e8a10b`, pipeline 4, host-pinned, hot = min of iters 1–2 —
+note the shipped TPC-H plans were rewritten onto `bitpack` after this measurement, so
+per-column throughput/ratio figures below predate the current plans):
 
 | Config | Hot total | vs baseline |
 |---|---|---|
