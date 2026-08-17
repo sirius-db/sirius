@@ -2128,6 +2128,30 @@ static void SetEnablePinnedZoneMapPruning(ClientContext& context, SetScope scope
                    params->enable_pinned_zone_map_pruning);
 }
 
+static void SetAdmissionBytesPerGpu(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const bytes = UBigIntValue::Get(parameter);
+  auto* params     = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                       = lock_operator_params_slot(context);
+  params->admission_bytes_per_gpu = bytes;
+  SIRIUS_LOG_DEBUG("Updated config ADMISSION_BYTES_PER_GPU to {}", params->admission_bytes_per_gpu);
+}
+
+static void SetAvgVariableColumnBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const bytes = UBigIntValue::Get(parameter);
+  if (bytes == 0) {
+    throw InvalidInputException("avg_variable_column_bytes must be greater than zero");
+  }
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                         = lock_operator_params_slot(context);
+  params->avg_variable_column_bytes = bytes;
+  SIRIUS_LOG_DEBUG("Updated config AVG_VARIABLE_COLUMN_BYTES to {}",
+                   params->avg_variable_column_bytes);
+}
+
 static void SetEnableCompressedMaterialization(ClientContext& /*context*/,
                                                SetScope /*scope*/,
                                                Value& /*parameter*/)
@@ -2447,6 +2471,22 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.enable_compressed_materialization),
     SetEnableCompressedMaterialization);
+
+  config.AddExtensionOption(
+    "admission_bytes_per_gpu",
+    "Target projected scan-output bytes per GPU at admission; 0 disables the estimate and "
+    "leaves the allocation to topology.gpus_per_query",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.admission_bytes_per_gpu),
+    SetAdmissionBytesPerGpu);
+
+  config.AddExtensionOption(
+    "avg_variable_column_bytes",
+    "Per-row width assumed for variable-width columns (VARCHAR, LIST, STRUCT, ARRAY) when "
+    "estimating scan output at admission; must be greater than zero",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.avg_variable_column_bytes),
+    SetAvgVariableColumnBytes);
 }
 
 // Publish the transparent optimizer mask once at extension load, unioned

@@ -37,6 +37,7 @@
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_projection.hpp"
+#include "planner/gpu_admission.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
 #include <cudf/types.hpp>
@@ -913,4 +914,53 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   sirius::planner::sirius_physical_plan_generator generator(*con->context);
   CHECK_THROWS_WITH(generator.create_plan(std::move(logical)),
                     Catch::Contains("Unsupported filter predicate on column 'id'"));
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - admission scan walk reaches delim join subtrees",
+                 "[plan_tree_shape][gpu_admission][isolated_context]")
+{
+  // GPU admission sizes a query from its scans' estimated_cardinality, so a scan it cannot
+  // see is a scan whose bytes are not counted — under-estimating the query and admitting it
+  // onto too few GPUs. DELIM JOIN owns `join`/`distinct_root` outside `children[]`, so a walk
+  // over `children` alone misses everything inside them.
+  //
+  // Cross-check planner::collect_gpu_scans against this suite's independently written
+  // for_each_operator: the two descend the tree separately and must agree.
+  auto plan = generate_sirius_plan(
+    *con,
+    "SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
+    "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)");
+  INFO(tree_to_string(plan.get()));
+
+  REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) != nullptr);
+
+  auto const expected = collect(plan.get(), SiriusPhysicalOperatorType::GPU_SCAN);
+  REQUIRE_FALSE(expected.empty());
+
+  std::vector<const sirius_physical_operator*> found;
+  sirius::planner::collect_gpu_scans(*plan, found);
+
+  CHECK(found.size() == expected.size());
+  for (auto const* op : expected) {
+    CHECK(std::find(found.begin(), found.end(), op) != found.end());
+  }
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - admission scan walk agrees on a plain join",
+                 "[plan_tree_shape][gpu_admission][isolated_context]")
+{
+  // Baseline: with no operator holding subtrees outside children[], both walks agree
+  // trivially. Guards against a descent that double-counts.
+  auto plan =
+    generate_sirius_plan(*con, "SELECT b.val FROM big_left b, small_right s WHERE b.id = s.rid");
+  INFO(tree_to_string(plan.get()));
+
+  auto const expected = collect(plan.get(), SiriusPhysicalOperatorType::GPU_SCAN);
+  REQUIRE(expected.size() == 2);
+
+  std::vector<const sirius_physical_operator*> found;
+  sirius::planner::collect_gpu_scans(*plan, found);
+  CHECK(found.size() == expected.size());
 }
