@@ -154,6 +154,16 @@ std::optional<sirius::numeric_range> to_decoded_bound(duckdb::Value const& value
       col_type.decimal_precision() > sirius::logical_type::decimal_max_precision_int64) {
     return std::nullopt;
   }
+  // UBIGINT/UHUGEINT are refused outright: the decoded domain is signed int64
+  // end to end (the decode ballot widens a decoded lane with a plain
+  // static_cast<int64_t>), so a value at or above 2^63 would decode to a
+  // negative int64 and never satisfy a range built from its true unsigned
+  // value here — that drops matching rows instead of merely under-filtering.
+  // is_integer() alone would let both through (they carry no width/signedness
+  // split), so they need their own check ahead of the general integer path.
+  if (col_type.id() == sirius::type_id::UBIGINT || col_type.id() == sirius::type_id::UHUGEINT) {
+    return std::nullopt;
+  }
   // A constant wider than 64 bits is refused outright: the decoded domain is
   // int64, and rescaling an int128 payload by a power of ten could overflow the
   // accumulator before the clamp ever sees it.
