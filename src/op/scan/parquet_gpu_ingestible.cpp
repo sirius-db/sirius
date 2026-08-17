@@ -55,9 +55,8 @@
 // uring_reactor MUST be included last among sirius headers: liburing.h,
 // pulled in transitively, defines a BLOCK_SIZE macro that collides with the
 // BLOCK_SIZE static member in <blockingconcurrentqueue.h>.
-#include <io/uring/uring_reactor.hpp>
-
 #include <ctrack.hpp>
+#include <io/uring/uring_reactor.hpp>
 
 // standard library
 #include <algorithm>
@@ -170,6 +169,9 @@ std::string strip_file_uri(std::string const& p)
   }
   return p;
 }
+
+std::vector<scan_info::fadvise_entry> parquet_fadvise_entries(
+  std::span<row_group_slice const> slices, cudf::io::parquet_reader_options const& reader_options);
 
 //===----------------------------------------------------------------------===//
 // parquet_batch_coalescer
@@ -306,7 +308,8 @@ class parquet_batch_coalescer : public batch_coalescer {
  private:
   std::unique_ptr<scan_info> emit_current()
   {
-    auto split                     = std::make_unique<parquet_split_info>();
+    auto hints                     = parquet_fadvise_entries(_slices, *_reader_options);
+    auto split                     = std::make_unique<parquet_split_info>(std::move(hints));
     split->rg_slices               = std::move(_slices);
     split->reader_options          = _reader_options;
     split->plan                    = _plan;
@@ -359,6 +362,21 @@ std::vector<cudf::io::text::byte_range_info> column_chunk_ranges(
     options);
 }
 
+std::vector<scan_info::fadvise_entry> parquet_fadvise_entries(
+  std::span<row_group_slice const> slices, cudf::io::parquet_reader_options const& reader_options)
+{
+  std::vector<scan_info::fadvise_entry> entries;
+  entries.reserve(slices.size());
+  for (auto const& slice : slices) {
+    if (!slice.datasource || !slice.file_metadata) { continue; }
+    auto ranges =
+      column_chunk_ranges(*slice.file_metadata, reader_options, slice.row_group_indices);
+    if (ranges.empty()) { continue; }
+    entries.push_back({slice.datasource, std::move(ranges)});
+  }
+  return entries;
+}
+
 }  // namespace
 
 std::string canonical_scan_file_path(std::string const& raw)
@@ -375,38 +393,6 @@ void canonicalize_scan_file_paths(std::vector<std::string>& paths)
   for (auto& p : paths) {
     p = canonical_scan_file_path(p);
   }
-}
-
-//===----------------------------------------------------------------------===//
-// scan_info fadvise_entries — prefetch byte ranges
-//===----------------------------------------------------------------------===//
-std::vector<scan_info::fadvise_entry> parquet_file_scan_info::build_fadvise_entries() const
-{
-  if (!file_metadata || !reader_options) { return {}; }
-  std::vector<fadvise_entry> entries;
-  append_fadvise_entry(entries, datasource, [this] {
-    std::vector<cudf::size_type> rg_indices;
-    rg_indices.reserve(row_groups.size());
-    for (auto const& rg : row_groups) {
-      rg_indices.push_back(rg.index);
-    }
-    return column_chunk_ranges(*file_metadata, *reader_options, rg_indices);
-  });
-  return entries;
-}
-
-std::vector<scan_info::fadvise_entry> parquet_split_info::build_fadvise_entries() const
-{
-  if (!reader_options) { return {}; }
-  std::vector<fadvise_entry> entries;
-  entries.reserve(rg_slices.size());
-  for (auto const& slice : rg_slices) {
-    if (!slice.file_metadata) { continue; }
-    append_fadvise_entry(entries, slice.datasource, [&slice, this] {
-      return column_chunk_ranges(*slice.file_metadata, *reader_options, slice.row_group_indices);
-    });
-  }
-  return entries;
 }
 
 //===----------------------------------------------------------------------===//
@@ -803,7 +789,6 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   out->file_metadata           = file_metadata;
   out->file_path               = file_path;
   out->datasource              = std::move(sirius_ds);
-  out->reader_options          = _reader_options;
   out->disable_filter_pushdown = disable_filter_pushdown;
   out->row_groups.reserve(row_group_indices.size());
   for (auto const rg_idx : row_group_indices) {
