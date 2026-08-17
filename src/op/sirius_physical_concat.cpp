@@ -17,7 +17,6 @@
 #include "op/sirius_physical_concat.hpp"
 
 #include "creator/task_creator.hpp"
-#include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_hash_join.hpp"
@@ -82,10 +81,7 @@ std::optional<task_creation_hint> sirius_physical_concat::get_next_task_hint()
 
   auto port_ptr = ports.begin()->second;
 
-  // If the source pipeline is done, we're ready to process whatever data remains. This check reads
-  // only the repository's own bookkeeping (never a batch lock), keeping the residual flush — and
-  // with it deadlock-freedom — independent of the totals. The base helper treats a port without a
-  // src_pipeline as finished, so unwired ports resolve here instead of dereferencing null below.
+  // If the source pipeline is done, we're ready to process whatever data remains.
   if (is_source_pipeline_finished()) {
     if (port_ptr->repo->total_size() > 0) {
       return task_creation_hint{TaskCreationHint::READY, this};
@@ -100,9 +96,7 @@ std::optional<task_creation_hint> sirius_physical_concat::get_next_task_hint()
 
   // Source pipeline still running — fire early once a partition has buffered more than the
   // batching threshold across at least two batches. A lone oversized batch keeps WAITING: it
-  // either gains a groupmate or is flushed once the source finishes. Answered from the push-time
-  // totals, so this runs without touching any data_batch lock (this is polled on the task
-  // creator's single manager thread, which must not block behind a downgrade's exclusive lock).
+  // either gains a groupmate or is flushed once the source finishes.
   for (const auto& totals : _input_totals) {
     if (totals.bytes > _concat_batch_bytes && totals.count >= 2) {
       return task_creation_hint{TaskCreationHint::READY, this};
@@ -120,20 +114,18 @@ void sirius_physical_concat::push_data_batch_partitioned(
   std::size_t partition_idx)
 {
   if (batch) {
-    // Measure outside `lock`: to_read_only can block behind a downgrade's exclusive lock, and a
-    // blocked push (a worker thread) must not hold the mutex the manager-thread hint needs.
-    const uint64_t batch_size = batch->to_read_only().get_data()->get_size_in_bytes();
+    // Measured before taking `lock`: to_read_only() can wait out a downgrade's exclusive batch
+    // lock, and the manager-thread hint blocks on `lock`.
+    auto const batch_size = batch->to_read_only().get_data()->get_size_in_bytes();
     std::lock_guard<std::mutex> lg(lock);
     if (_input_totals.size() <= partition_idx) { _input_totals.resize(partition_idx + 1); }
     _pushed_batch_bytes[batch->get_batch_id()] = batch_size;
     _input_totals[partition_idx].bytes += batch_size;
     _input_totals[partition_idx].count += 1;
   }
-  // Delegate outside `lock`: the base's telemetry publish also takes the batch's shared lock,
-  // which must never be acquired under the mutex the hint needs. Accounting before the repository
-  // insert guarantees every poppable batch already has its ledger entry; the transient window
-  // where the totals include a batch that is not yet poppable is within the documented drift
-  // heuristic (the pull remains authoritative for what is actually popped).
+  // Delegated after releasing `lock` for the same reason: the base's telemetry publish takes the
+  // batch's shared lock. Ledger-then-insert ordering keeps every poppable batch ledgered; the
+  // reverse window (counted but not yet poppable) only makes the hint transiently optimistic.
   sirius_physical_partition_consumer_operator::push_data_batch_partitioned(
     port_id, std::move(batch), partition_idx);
 }
@@ -149,12 +141,26 @@ std::shared_ptr<::cucascade::data_batch> sirius_physical_concat::pop_and_account
     totals.count -= 1;
     _pushed_batch_bytes.erase(ledger);
   } else {
-    // Production wiring always enters through push_data_batch_partitioned; an unledgered pop
-    // means something bypassed the accounting (tests that insert straight into the repository).
+    // Unledgered: tests that insert straight into the repository, or broadcast build slots (the
+    // sink deposits one id into every slot; the ledger keys by id). Broadcast implies concat_all,
+    // which consults neither the totals nor buffered_batch_size.
     SIRIUS_LOG_DEBUG("sirius_physical_concat: popped batch {} has no push-time ledger entry",
                      batch_id);
   }
   return popped;
+}
+
+uint64_t sirius_physical_concat::buffered_batch_size(::cucascade::shared_data_repository& repo,
+                                                     uint64_t batch_id,
+                                                     std::size_t partition_idx) const
+{
+  if (auto ledger = _pushed_batch_bytes.find(batch_id); ledger != _pushed_batch_bytes.end()) {
+    return ledger->second;
+  }
+  return repo.get_data_batch_by_id(batch_id, partition_idx)
+    ->to_read_only()
+    .get_data()
+    ->get_size_in_bytes();
 }
 
 std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data()
@@ -165,44 +171,36 @@ std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data(
   // Each pass forms one group; a single-batch group with sink wiring is forwarded downstream
   // without a task (execute is an identity for it) and the walk repeats. Every forward removes a
   // batch from the repository, so the loop terminates.
+  // Contract: pipeline-wired callers hold get_task_creation_lock() — the forward's in-flight batch
+  // is in no repository, and only that lock hides the gap from finish evaluation.
   while (true) {
     std::shared_ptr<::cucascade::data_batch> single_batch;
     std::size_t single_partition_idx = 0;
     {
-      // iterate through all the partition and pull
       std::lock_guard<std::mutex> lg(lock);
 
-      // assert that there is only one port
       if (ports.size() != 1) {
         throw std::runtime_error("sirius_physical_concat: there should be only one port");
       }
 
       auto port_ptr = ports.begin()->second;
-      for (size_t i = 0; i < port_ptr->repo->num_partitions(); i++) {
+      for (std::size_t i = 0; i < port_ptr->repo->num_partitions(); i++) {
         std::vector<std::shared_ptr<::cucascade::data_batch>> input_batch;
-        // get all the batch ids from the partition
-        auto batch_ids          = port_ptr->repo->get_batch_ids(i);
-        size_t total_batch_size = 0;
+        auto batch_ids               = port_ptr->repo->get_batch_ids(i);
+        std::size_t total_batch_size = 0;
         for (auto& batch_id : batch_ids) {
-          auto batch_idle = port_ptr->repo->get_data_batch_by_id(batch_id, i);
-          auto batch_ro   = batch_idle->to_read_only();
-          auto batch_size = batch_ro.get_data()->get_size_in_bytes();
-          total_batch_size += batch_size;
-          // Check if the batch size is already exceed the threshold
-          if (!_concat_all && total_batch_size > _concat_batch_bytes) {
-            // if the batch size is already exceed the threshold, then we need to return the batch
-            // right away
-            if (input_batch.size() == 0) {
-              // this mean that there is a batch that is bigger than the threshold, then we just
-              // output that batch right away
-              input_batch.push_back(pop_and_account(*port_ptr->repo, batch_id, i));
+          // Sizes are push-time snapshots; _concat_all needs none.
+          if (!_concat_all) {
+            total_batch_size += buffered_batch_size(*port_ptr->repo, batch_id, i);
+            if (total_batch_size > _concat_batch_bytes) {
+              // An oversized head goes alone; otherwise the group closes and `batch_id` stays.
+              if (input_batch.empty()) {
+                input_batch.push_back(pop_and_account(*port_ptr->repo, batch_id, i));
+              }
+              break;
             }
-            break;
-          } else {
-            // if the batch size does not exceed the threshold, then we need to add the batch to
-            // the input batch
-            input_batch.push_back(pop_and_account(*port_ptr->repo, batch_id, i));
           }
+          input_batch.push_back(pop_and_account(*port_ptr->repo, batch_id, i));
         }
         if (input_batch.size() != 0) {
           if (input_batch.size() == 1 && !next_port_after_sink.empty()) {
@@ -214,14 +212,10 @@ std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data(
           break;
         }
       }
-    }
+    }  // end lock
     if (!single_batch) { break; }
 
-    // Forward the single batch outside `lock`: it is exclusively ours (popped, in no repository),
-    // and the downstream push must not run under this operator's mutex. Pushing through
-    // push_data_batch_partitioned matches sink(): telemetry publish, partition tagging, and any
-    // consumer-side hooks (e.g. the hash join's build-port dynamic-filter publish) all fire.
-    for (auto& next_port_info : next_port_after_sink) {
+    for (auto const& next_port_info : next_port_after_sink) {
       auto partition_consumer_op =
         dynamic_cast<sirius_physical_partition_consumer_operator*>(next_port_info.next_operator);
       if (partition_consumer_op) {

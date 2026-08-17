@@ -210,6 +210,7 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   //! (port data pop, partition claim, etc.) and the task constructor that calls
   //! mark_task_created(), so that update_pipeline_status() cannot observe an
   //! empty-port / balanced-counter state while a task is mid-creation.
+  //! Also serializes concat's taskless forward (pop -> downstream push) against finish evaluation.
   [[nodiscard]] std::unique_lock<std::mutex> get_task_creation_lock();
 
   [[nodiscard]] uuid::UUID pipeline_uuid() const { return _pipeline_uuid; }

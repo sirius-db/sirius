@@ -67,6 +67,10 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   //! exactly one batch is not wrapped in a task when sink wiring exists: since execute is an
   //! identity for one batch, the batch is pushed directly to the downstream consumers via their
   //! `push_data_batch_partitioned` (the same publication path `sink` uses) and the walk continues.
+  //! Group sizes come from the push-time ledger, never a live batch lock. Contract: pipeline-wired
+  //! callers hold the pipeline's get_task_creation_lock() (see sirius_pipeline.hpp) across the
+  //! call — the forward's in-flight batch is in no repository, hidden from finish evaluation only
+  //! by that lock.
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   //! Measures the batch's size and records it in the per-partition totals before delegating to the
@@ -101,6 +105,14 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   //! `push_data_batch_partitioned` have no ledger entry and leave the totals untouched.
   std::shared_ptr<::cucascade::data_batch> pop_and_account(
     ::cucascade::shared_data_repository& repo, uint64_t batch_id, std::size_t partition_idx);
+
+  //! Requires `lock`. Push-time size from the ledger — the walk must never take a batch lock (a
+  //! downgrade conversion may hold it; see get_next_task_hint). Unledgered batches (direct
+  //! repository inserts in tests; broadcast's duplicate ids never reach sizing, as broadcast
+  //! implies concat_all) fall back to a live, possibly blocking, measurement.
+  [[nodiscard]] uint64_t buffered_batch_size(::cucascade::shared_data_repository& repo,
+                                             uint64_t batch_id,
+                                             std::size_t partition_idx) const;
 
   bool _is_build;
   bool _concat_all;

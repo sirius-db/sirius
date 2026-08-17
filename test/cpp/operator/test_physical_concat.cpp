@@ -1274,6 +1274,85 @@ TEST_CASE("sirius_physical_concat hint returns while a buffered batch is exclusi
   REQUIRE(hint->producer == rig.op.get());
 }
 
+TEST_CASE("sirius_physical_concat pull returns while a buffered batch is exclusively locked",
+          "[physical_concat]")
+{
+  REQUIRE(get_shared_mem_space() != nullptr);
+
+  auto small_0 = make_int_batch(64);
+  auto small_1 = make_int_batch(64);
+  auto big     = make_int_batch(1024);
+
+  // Threshold admits exactly the two smalls; the walk must then consult big's size — from the
+  // ledger, not the batch — and leave it buffered.
+  auto rig = make_concat_rig(batch_bytes(small_0) + batch_bytes(small_1));
+  rig.op->push_data_batch_partitioned("input", small_0, 0);
+  rig.op->push_data_batch_partitioned("input", small_1, 0);
+  rig.op->push_data_batch_partitioned("input", big, 0);
+
+  // A helper thread holds big's exclusive lock, standing in for the downgrade executor converting
+  // an idle buffered batch in place.
+  std::mutex sync_mutex;
+  std::condition_variable sync_cv;
+  bool lock_held         = false;
+  bool release_requested = false;
+  std::thread lock_holder([&] {
+    auto exclusive = big->to_mutable();
+    {
+      std::lock_guard<std::mutex> lg(sync_mutex);
+      lock_held = true;
+    }
+    sync_cv.notify_all();
+    {
+      std::unique_lock<std::mutex> ul(sync_mutex);
+      sync_cv.wait(ul, [&] { return release_requested; });
+    }
+    auto idle = cucascade::data_batch::to_idle(std::move(exclusive));
+  });
+  {
+    std::unique_lock<std::mutex> ul(sync_mutex);
+    sync_cv.wait(ul, [&] { return lock_held; });
+  }
+
+  // Watchdog: run the pull on its own thread and bound the wait, so a walk that blocks on the
+  // batch lock fails the test instead of hanging the suite.
+  std::unique_ptr<operator_data> pulled;
+  bool pull_done = false;
+  std::thread pull_runner([&] {
+    auto result = rig.op->get_next_task_input_data();
+    {
+      std::lock_guard<std::mutex> lg(sync_mutex);
+      pulled    = std::move(result);
+      pull_done = true;
+    }
+    sync_cv.notify_all();
+  });
+
+  bool completed_in_time = false;
+  {
+    std::unique_lock<std::mutex> ul(sync_mutex);
+    completed_in_time = sync_cv.wait_for(ul, std::chrono::seconds(10), [&] { return pull_done; });
+  }
+
+  // Release the exclusive lock before any assertion so a blocked pull unblocks and both threads
+  // join even when the test fails.
+  {
+    std::lock_guard<std::mutex> lg(sync_mutex);
+    release_requested = true;
+  }
+  sync_cv.notify_all();
+  lock_holder.join();
+  pull_runner.join();
+
+  REQUIRE(completed_in_time);
+  REQUIRE(pulled != nullptr);
+  REQUIRE(group_batch_ids(*pulled) ==
+          std::vector<uint64_t>{small_0->get_batch_id(), small_1->get_batch_id()});
+  REQUIRE(dynamic_cast<const partitioned_operator_data&>(*pulled).get_partition_idx() == 0);
+  // The locked batch stayed behind, untouched.
+  REQUIRE(rig.repo->get_batch_ids(0) == std::vector<uint64_t>{big->get_batch_id()});
+}
+
 //===----------------------------------------------------------------------===//
 // 6. Single-batch forward tests
 //===----------------------------------------------------------------------===//

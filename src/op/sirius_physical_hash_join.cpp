@@ -674,6 +674,8 @@ cross_schedule_orphan next_cross_schedule_orphan(std::vector<partition_cross_sch
                                                  bool probe_finished,
                                                  bool build_finished)
 {
+  // Flags were latched before the ids were snapshotted (refresh_cross_schedule); only that read
+  // order makes an empty opposite side final.
   if (!(probe_finished && build_finished)) { return {}; }
   for (std::size_t p = 0; p < cross.size(); ++p) {
     auto& c = cross[p];
@@ -922,6 +924,8 @@ void sirius_physical_hash_join::discard_build_only_slots_if_probe_complete()
   // Only once the probe upstream is finished do we know no further probe data can arrive for any
   // slot. Broadcast replicates the build table to every slot, but the probe side is unpartitioned,
   // so slots on GPUs that saw no probe rows get build data that will never be probed.
+  // Latch read before the slot snapshot below: pushes that preceded the finish latch (incl.
+  // concat's taskless forward) are then visible to it — reordering strands batches.
   bool const probe_finished =
     probe_port->src_pipeline && probe_port->src_pipeline->is_pipeline_finished();
 
@@ -1099,6 +1103,8 @@ std::pair<bool, bool> sirius_physical_hash_join::refresh_cross_schedule()
   std::size_t const num_partitions = probe_port->repo->num_partitions();
   if (_cross.size() < num_partitions) { _cross.resize(num_partitions); }
 
+  // Latch reads before the repo re-poll below: pushes that preceded a finish latch (incl.
+  // concat's taskless forward) are then visible, so an empty side is truly final.
   bool const probe_finished =
     probe_port->src_pipeline && probe_port->src_pipeline->is_pipeline_finished();
   bool const build_finished =
