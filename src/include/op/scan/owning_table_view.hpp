@@ -152,8 +152,8 @@ class my_view {
     return _model->materialize(_selection, stream, mr);
   }
 
-  // Move a copy-requiring, copy-constructible owner out for release_view(). An engaged result
-  // consumes the owner, so the caller must immediately discard this my_view.
+  /// Move a copy-requiring, copy-constructible owner out for release_view(). An engaged result
+  /// consumes the owner, so the caller must immediately discard this my_view.
   [[nodiscard]] std::optional<std::any> try_surrender_owner()
   {
     return _model->try_surrender_owner();
@@ -283,7 +283,10 @@ class owning_table_view {
    *        an explicit @p base_view naming its columns.
    *
    * If @p Owner is @ref detail::no_alloc_materializable, materialization will
-   * move column buffers out of the owner; otherwise it copies @p base_view.
+   * move column buffers out of the owner; otherwise it copies @p base_view. A
+   * copy-constructible @p Owner is additionally eligible for @ref release_view,
+   * which transfers the owner value out of the handle and requires that
+   * transfer to leave the viewed device memory alive and in place.
    */
   template <typename Owner>
     requires(!std::same_as<std::decay_t<Owner>, owning_table_view> &&
@@ -351,6 +354,13 @@ class owning_table_view {
    * moving columns. Success empties this handle. An owned table, an empty handle, a move-only
    * owner, or a @ref detail::no_alloc_materializable owner leaves this handle unchanged so the
    * caller can use @ref release instead.
+   *
+   * Surrendering transfers the owner value into the returned @c std::any — a move, or a copy when
+   * the owner has no move constructor — and then destroys the original owner along with this
+   * handle's state. The owner must keep the viewed device memory alive and in place across that
+   * transfer. Handle-like owners (e.g. @c std::shared_ptr, @c cucascade::read_only_data_batch)
+   * satisfy this; an owner whose transfer relocates or frees the viewed buffers would leave the
+   * returned view dangling.
    *
    * @return The selected view and its keep-alive owner on success, or @c std::nullopt when the
    *         handle retains its materialization path

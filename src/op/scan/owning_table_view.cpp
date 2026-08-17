@@ -130,8 +130,9 @@ std::optional<owning_table_view::released_view> owning_table_view::release_view(
 {
   auto* view = std::get_if<std::unique_ptr<detail::my_view>>(&_state);
   if (view == nullptr) { return std::nullopt; }
-  // Capture the selected view before surrendering: the surrender moves only the type-erased
-  // owner handle, never the device buffers or the base view the selection is applied to.
+  // Capture the selected view before surrendering. The surrender transfers the owner value, so
+  // the view stays valid through release_view's precondition that the transfer leaves the viewed
+  // device memory alive and in place.
   auto selected = (*view)->view();
   auto owner    = (*view)->try_surrender_owner();
   if (!owner.has_value()) { return std::nullopt; }
