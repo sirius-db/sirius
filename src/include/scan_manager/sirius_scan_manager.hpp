@@ -109,10 +109,16 @@ namespace sirius::scan_manager {
 /// owns the match logic that @ref sirius_scan_manager::try_match_cached_entry consults.
 class cache_entry_info {
  public:
-  std::vector<std::string> resolved_file_paths;    ///< parquet identity (file set)
-  std::string catalog_name;                        ///< duckdb identity: catalog (attach alias)
-  std::string schema_name;                         ///< duckdb identity: schema
-  std::string table_name;                          ///< duckdb identity: table
+  std::vector<std::string> resolved_file_paths;  ///< parquet identity (file set)
+  std::string catalog_name;                      ///< duckdb identity: catalog (attach alias)
+  std::string schema_name;                       ///< duckdb identity: schema
+  std::string table_name;                        ///< duckdb identity: table
+  /// duckdb identity: catalog object id of the pinned DuckTableEntry — the table's
+  /// *incarnation*. A qualified name is reused by a table that was dropped and
+  /// recreated (or altered); this id is not, so it is what keeps the previous
+  /// incarnation's cached rows from serving the new table. See
+  /// @c duckdb_native_ingestible_table_info::table_oid.
+  duckdb::idx_t table_oid{0};
   duckdb::vector<duckdb::ColumnIndex> column_ids;  ///< cached columns, by primary index
   std::vector<std::string> names;                  ///< aligned with column_ids; gather keys
 
@@ -131,10 +137,28 @@ class cache_entry_info {
 
   /// Duckdb-identity check shared by can_serve_with_columns and the plan-time
   /// MVCC guards — one matcher, so the probe and prepare can never drift.
-  /// False for parquet entries (empty table_name).
+  /// Qualified name AND incarnation (@p oid, see @c table_oid). False for parquet
+  /// entries (empty table_name).
   [[nodiscard]] bool matches_duckdb_table(std::string_view catalog,
                                           std::string_view schema,
-                                          std::string_view table) const;
+                                          std::string_view table,
+                                          duckdb::idx_t oid) const;
+
+  /// Qualified-name-only half of @ref matches_duckdb_table, ignoring the
+  /// incarnation. Only for reporting a pin of a *superseded* incarnation (same
+  /// name, different oid) — never for deciding that an entry may serve a scan.
+  /// False for parquet entries (empty table_name).
+  [[nodiscard]] bool matches_duckdb_table_name(std::string_view catalog,
+                                               std::string_view schema,
+                                               std::string_view table) const;
+
+  /// True when @p other describes the SAME source as this entry — same duckdb
+  /// table incarnation, or same parquet file set — irrespective of which columns
+  /// each caches. Read by @ref sirius_scan_manager::insert_pinned_entry to decide
+  /// whether a re-pin under an existing pin name may merge its columns into the
+  /// existing entry or must replace it. Two entries that are both identity-less
+  /// (no table name, no files) report false, so the caller replaces.
+  [[nodiscard]] bool same_source_as(const cache_entry_info& other) const;
 
   /// Parquet-identity check shared by can_serve_with_columns and the plan-time
   /// residency gate — one matcher, so the probe and prepare can never drift.
@@ -211,9 +235,10 @@ struct pinned_entry {
   /// Representative memory space of a HOST-tier entry; the MVCC path expands
   /// it into a per-chunk vector. GPU-tier entries leave it null.
   cucascade::memory::memory_space* memory_space{nullptr};
-  /// Total number of rows across all pinned chunks. Used by insert_pinned_entry
-  /// to decide whether a re-insert merges into the existing entry (same row
-  /// count → add unique columns) or replaces it (different row count).
+  /// Total number of rows across all pinned chunks. Used by insert_pinned_entry —
+  /// together with the cache identity — to decide whether a re-insert merges into
+  /// the existing entry (same source AND same row count → add unique columns) or
+  /// replaces it.
   std::size_t num_rows{0};
   /// Zone-map sidecar: pin-time DuckDB types + per-chunk min/max statistics,
   /// positional with cache_info.column_ids. Absent (never prunes) when the
@@ -466,13 +491,19 @@ class sirius_scan_manager {
   ///
   /// Re-insert semantics (keyed by @p name):
   ///   - If no entry exists for @p name, a fresh one is created.
-  ///   - If an entry exists and its @c num_rows equals the new total row count, the
+  ///   - If an entry exists that reads the SAME source (@c cache_entry_info::
+  ///     same_source_as) and whose @c num_rows equals the new total row count, the
   ///     incoming columns whose names are not already present are merged in
   ///     (duplicate columns are dropped), and the entry's @c cache_info is extended
   ///     to the union of pinned columns so later cache-hit matching can serve them.
   ///     The existing cache identity is preserved; the merge requires the incoming
   ///     @p chunk_memory_spaces to be identical to the existing entry's and rejects
   ///     any mismatch.
+  ///   - If the source differs — a different table/file set pinned under a reused
+  ///     pin name, or the same qualified name at a different table incarnation
+  ///     (dropped and recreated) — the existing entry is dropped and replaced. Only
+  ///     identity separates those cases: an unrelated table of the same shape passes
+  ///     every chunk-shape guard the merge applies.
   ///   - If row counts differ, the existing entry is dropped and replaced. (An
   ///     n_rows-capped "partial" pin therefore never merges with a full pin of the
   ///     same table, since their row counts differ.)
@@ -589,12 +620,29 @@ class sirius_scan_manager {
   void visit_pinned_entries(
     const std::function<bool(std::string_view, const pinned_entry&)>& visitor) const;
 
-  /// The pinned entry whose duckdb identity matches catalog.schema.table, or
+  /// The pinned entry whose duckdb identity matches catalog.schema.table at
+  /// incarnation @p table_oid (the scanned DuckTableEntry's catalog object id), or
   /// nullptr. Non-owning; obtain and read it inside one slot-scoped window, and
   /// never hold it across a pin or unpin. First match wins if one table was
   /// pinned under two names. Read by the plan-time MVCC guards.
   [[nodiscard]] pinned_entry const* find_pinned_entry_for_duckdb_table(
-    std::string_view catalog_name, std::string_view schema_name, std::string_view table_name) const;
+    std::string_view catalog_name,
+    std::string_view schema_name,
+    std::string_view table_name,
+    duckdb::idx_t table_oid) const;
+
+  /// Name of a pinned entry holding a *superseded* incarnation of
+  /// catalog.schema.table: same qualified name, different catalog object id — the
+  /// table was dropped and recreated (or altered) after it was pinned. std::nullopt
+  /// when none exists. The plan-time guard declines the GPU plan on a hit rather
+  /// than letting the scan fall through to the MVCC-blind disk-native read, whose
+  /// image still belongs to the dropped table under the pin's checkpoint
+  /// suppression.
+  [[nodiscard]] std::optional<std::string> pinned_entry_name_for_superseded_duckdb_table(
+    std::string_view catalog_name,
+    std::string_view schema_name,
+    std::string_view table_name,
+    duckdb::idx_t table_oid) const;
 
   /// The pinned entry whose parquet identity matches @p resolved_file_paths
   /// (cache_entry_info::matches_parquet_files), or nullptr. Non-owning; obtain

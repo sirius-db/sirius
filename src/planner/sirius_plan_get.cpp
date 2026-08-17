@@ -225,9 +225,32 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   if (sirius_state && op.function.name == "seq_scan") {
     auto* bind = dynamic_cast<duckdb::TableScanBindData*>(op.bind_data.get());
     if (bind != nullptr && bind->table.IsDuckTable()) {
-      auto& table = bind->table.Cast<duckdb::DuckTableEntry>();
-      pinned      = sirius_state->get_scan_manager().find_pinned_entry_for_duckdb_table(
-        table.ParentCatalog().GetName(), table.ParentSchema().name, table.name);
+      auto& table        = bind->table.Cast<duckdb::DuckTableEntry>();
+      auto& scan_manager = sirius_state->get_scan_manager();
+      auto const catalog = table.ParentCatalog().GetName();
+      auto const& schema = table.ParentSchema().name;
+      pinned =
+        scan_manager.find_pinned_entry_for_duckdb_table(catalog, schema, table.name, table.oid);
+      // A pin of a SUPERSEDED incarnation of this qualified name (the table was
+      // dropped and recreated, or altered, after pin_table) matches on name but not
+      // on oid, so it correctly does not serve. It must not fall through to the
+      // disk-native read either: that path is MVCC-blind, and the pin's checkpoint
+      // suppression is still in force for this database, so the on-disk image is
+      // the DROPPED table's. Refuse HERE, where the throw is still a clean CPU
+      // fallback — the same cache-or-CPU rule the guards below apply.
+      if (pinned == nullptr) {
+        auto const superseded = scan_manager.pinned_entry_name_for_superseded_duckdb_table(
+          catalog, schema, table.name, table.oid);
+        if (superseded) {
+          throw duckdb::NotImplementedException(
+            "duckdb-native scan: table '%s' was dropped and recreated (or altered) after "
+            "pin_table, so pinned entry '%s' holds a different table and cannot serve this scan. "
+            "Run CALL unpin_table('%s'), then pin_table again",
+            table.name,
+            *superseded,
+            *superseded);
+        }
+      }
       // Rows beyond the pinned prefix serve as insert-delta splits, decoded fresh at native
       // width. A narrow sidecar over them would pay per-batch exact-range verification and, on
       // an out-of-range inserted value, fail the query over to the CPU fallback — so the

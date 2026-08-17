@@ -572,7 +572,7 @@ void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_opera
   } else if (auto const* nat =
                dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&info)) {
     out << "      scan: duckdb table=" << nat->catalog_name << "." << nat->schema_name << "."
-        << nat->table_name << "\n";
+        << nat->table_name << " oid=" << nat->table_oid << "\n";
   }
 }
 
