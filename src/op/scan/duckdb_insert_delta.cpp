@@ -259,9 +259,10 @@ insert_delta_row_group complete_delta_row_group(
 
       // Only a fixed-width scalar child has a staging and decode path.
       if (!child_type.is_fixed_width()) {
-        throw_capture("ARRAY column " + std::to_string(col) + " row group " +
-                      std::to_string(rg_index) + ": child type " + child_type.to_string() +
-                      " is not a fixed-width scalar (only fixed-width ARRAY children are supported)");
+        throw_capture(
+          "ARRAY column " + std::to_string(col) + " row group " + std::to_string(rg_index) +
+          ": child type " + child_type.to_string() +
+          " is not a fixed-width scalar (only fixed-width ARRAY children are supported)");
       }
 
       insert_delta_column col_plan;
@@ -343,8 +344,8 @@ insert_delta_row_group complete_delta_row_group(
 
       // Decoded bytes: the child element payload plus the LIST offsets buffer.
       // Array-level validity is one bit per row and not counted, matching the fixed-width path.
-      budget += rc_child * child_type.fixed_width_byte_size() +
-                rg_plan.row_count * sizeof(std::int32_t);
+      budget +=
+        rc_child * child_type.fixed_width_byte_size() + rg_plan.row_count * sizeof(std::int32_t);
 
       rg_plan.columns.push_back(std::move(col_plan));
       continue;

@@ -263,9 +263,7 @@ struct array_column_access : duckdb::ArrayColumnData {
 bool tree_has_transient_segment(duckdb::ColumnSegmentTree& tree)
 {
   for (auto& seg_node : tree.SegmentNodes()) {
-    if (seg_node.GetNode().segment_type == duckdb::ColumnSegmentType::TRANSIENT) {
-      return true;
-    }
+    if (seg_node.GetNode().segment_type == duckdb::ColumnSegmentType::TRANSIENT) { return true; }
   }
   return false;
 }
