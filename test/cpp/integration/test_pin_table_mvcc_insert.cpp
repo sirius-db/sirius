@@ -662,7 +662,12 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
   // succeeds and serves from cache.
   run_ok("CHECKPOINT;");
   run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu', cols=['a']);");
-  compare_gpu_vs_cpu("SELECT a FROM t WHERE k >= 998 ORDER BY k;");
+  // Reference only the pinned ARRAY column with no predicate. A filter on the
+  // unpinned k breaks the partial pin's cache-or-CPU contract, and an array
+  // subscript filter (a[1]) is unsupported on the GPU scan; either forces a
+  // fallback. The unordered compare over all rows still covers the folded-in
+  // append row (k=1000).
+  compare_gpu_vs_cpu("SELECT a FROM t;");
   run_ok("CALL unpin_table('t');");
 }
 
