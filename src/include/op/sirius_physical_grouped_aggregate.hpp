@@ -27,6 +27,7 @@
 #include "duckdb/storage/data_table.hpp"
 #include "expression/ast/node.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
+#include "op/groupby_surrogate_deferral.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 #include <memory>
@@ -87,8 +88,24 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   bool has_count_distinct = false;
 
  public:
+  //! Install the planner's surrogate-key restore plan (see op/groupby_surrogate_deferral.hpp).
+  //! The merge wrapper acquires it through its clone-from-aggregate constructor and performs
+  //! the string materialization / schema restoration. Throws sirius::internal_exception when
+  //! `plan` is null or a plan is already installed.
+  void install_surrogate_restore(std::shared_ptr<surrogate_restore_plan const> plan);
+  [[nodiscard]] std::shared_ptr<surrogate_restore_plan const> const& surrogate_restore()
+    const noexcept
+  {
+    return _surrogate_restore;
+  }
+
   std::vector<int> get_output_grouping_indices() const
   {
+    // Under surrogate-key deferral, hash-partition only the real (non-deferred, non-dummy) key
+    // slots: rows whose real keys are equal — a superset of rows with equal full tuples — must
+    // meet in one merge task for the merge's uniqueness check / conservative re-group to be
+    // globally sound.
+    if (_surrogate_restore) { return _surrogate_restore->real_key_slots(); }
     std::vector<int> indices(group_idx.size());
     std::iota(indices.begin(), indices.end(), 0);
     return indices;
@@ -113,6 +130,9 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
+
+ private:
+  std::shared_ptr<surrogate_restore_plan const> _surrogate_restore;
 };
 
 }  // namespace op

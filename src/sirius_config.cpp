@@ -279,6 +279,10 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
     "dynamic_filter_keep_threshold", opt.dynamic_filter_keep_threshold, yaml::fraction<double>{});
   r.optional("enable_pinned_zone_map_pruning", opt.enable_pinned_zone_map_pruning);
   r.optional("enable_compressed_materialization", opt.enable_compressed_materialization);
+  r.optional("groupby_surrogate_keys", opt.groupby_surrogate_keys);
+  r.optional("groupby_surrogate_unique_fastpath", opt.groupby_surrogate_unique_fastpath);
+  r.optional("groupby_surrogate_min_string_keys", opt.groupby_surrogate_min_string_keys);
+  r.optional("groupby_surrogate_min_rows", opt.groupby_surrogate_min_rows);
   r.reject_unknown();
 }
 

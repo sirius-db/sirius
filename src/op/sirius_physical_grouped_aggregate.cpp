@@ -20,6 +20,7 @@
 #include "data/data_batch_utils.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
+#include "sirius/exception.hpp"
 
 #include <nvtx3/nvtx3.hpp>
 
@@ -70,6 +71,22 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   aggregate_slots                   = std::move(cudf_defs.aggregate_slots);
   has_avg                           = cudf_defs.has_avg;
   has_count_distinct                = cudf_defs.has_count_distinct;
+}
+
+void sirius_physical_grouped_aggregate::install_surrogate_restore(
+  std::shared_ptr<surrogate_restore_plan const> plan)
+{
+  if (plan == nullptr) {
+    throw sirius::internal_exception(
+      "sirius_physical_grouped_aggregate::install_surrogate_restore: the restore plan must not "
+      "be null");
+  }
+  if (_surrogate_restore) {
+    throw sirius::internal_exception(
+      "sirius_physical_grouped_aggregate::install_surrogate_restore: a surrogate restore plan is "
+      "already installed");
+  }
+  _surrogate_restore = std::move(plan);
 }
 
 duckdb::vector<sirius::logical_type>

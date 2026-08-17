@@ -411,6 +411,10 @@ individually.
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold for skipping publication when the build covers at least this fraction of the key's domain; ≥ 1.0 effectively disables the gate. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
+| `groupby_surrogate_keys` | true | Surrogate-key group-by (late string materialization): when every STRING group key passes through from one side of a single upstream INNER hash join, carry a compact BIGINT rowid instead of the strings, aggregate on numeric keys, and materialize the strings only after MERGE_GROUP_BY. Always-correct: an exact distinct check gates the no-re-group fast path, with a full-tuple re-group fallback. |
+| `groupby_surrogate_unique_fastpath` | true | Take the surrogate group-by's no-re-group fast path when the exact distinct check over the non-deferred key columns proves the merged tuples distinct; off = always re-group by the full restored tuple (slower, same results). |
+| `groupby_surrogate_min_string_keys` | 2 | Minimum number of STRING group keys before the surrogate rewrite is applied. |
+| `groupby_surrogate_min_rows` | 1048576 | Minimum estimated group-by input cardinality before the surrogate rewrite is applied. |
 
 **Note:** `max_build_hash_table_bytes` can be larger than `concat_batch_bytes`. When it is, the partition operator configures CONCAT to concatenate all batches, enabling the more efficient BUILD_PROBE join mode for larger build sides. Other joins (STANDARD, MIXED) still use `concat_batch_bytes` as the batch size threshold.
 
@@ -587,6 +591,10 @@ SET enable_compressed_materialization = false;
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
 | `enable_runtime_distinct_build_probe` | true | Runtime distinct-build test for `BUILD_PROBE` joins; promotes to the single-pass `cudf::distinct_hash_join` when the build keys prove distinct |
+| `groupby_surrogate_keys` | true | Surrogate-key group-by: defer STRING group keys sourced from one INNER join side to a BIGINT rowid; materialize the strings after MERGE_GROUP_BY |
+| `groupby_surrogate_unique_fastpath` | true | Skip the post-restore full-tuple re-group when the exact distinct check proves the merged tuples distinct |
+| `groupby_surrogate_min_string_keys` | 2 | Minimum STRING group keys before the surrogate rewrite is applied |
+| `groupby_surrogate_min_rows` | 1048576 | Minimum estimated group-by input cardinality before the surrogate rewrite is applied |
 
 ### Dynamic Filters
 

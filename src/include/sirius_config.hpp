@@ -166,6 +166,27 @@ struct operator_params {
   /// metadata; other scans use native carriers. Logical types remain unchanged, and type-sensitive
   /// boundaries restore native carriers.
   bool enable_compressed_materialization = true;
+
+  /// Surrogate-key group-by (late string materialization): when every STRING group key of a
+  /// HASH_GROUP_BY is a pure pass-through of one side of a single upstream INNER hash join,
+  /// carry a compact BIGINT rowid (plus constant dummies) through the pipeline instead of the
+  /// strings, aggregate on numeric keys, and materialize the strings only after MERGE_GROUP_BY.
+  /// Always-correct: an exact distinct check gates the no-re-group fast path and a full-tuple
+  /// re-group covers the rest. See op/groupby_surrogate_deferral.hpp.
+  bool groupby_surrogate_keys = true;
+
+  /// Take the surrogate group-by's no-re-group fast path when the exact distinct check over the
+  /// non-deferred key columns proves the merged tuples distinct. Off = always re-group by the
+  /// full restored tuple (slower, same results).
+  bool groupby_surrogate_unique_fastpath = true;
+
+  /// Minimum number of STRING group keys before the surrogate rewrite is worthwhile (the
+  /// machinery costs a distinct check plus a rowid gather at merge time).
+  uint64_t groupby_surrogate_min_string_keys = 2;
+
+  /// Minimum estimated input cardinality of the group-by before the surrogate rewrite is
+  /// applied (small inputs cannot repay the fixed finalization cost).
+  uint64_t groupby_surrogate_min_rows = 1ULL << 20;
 };
 
 struct telemetry_config {

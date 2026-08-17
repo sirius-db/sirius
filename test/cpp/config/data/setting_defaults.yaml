@@ -30,6 +30,10 @@ sirius:
     dynamic_filter_keep_threshold: 0.7
     enable_pinned_zone_map_pruning: false
     enable_compressed_materialization: false
+    groupby_surrogate_keys: false
+    groupby_surrogate_unique_fastpath: false
+    groupby_surrogate_min_string_keys: 3
+    groupby_surrogate_min_rows: 2097152
   compression:
     enable_pin_table_compression: true
     min_batch_size_bytes: 8MiB

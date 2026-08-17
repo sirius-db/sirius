@@ -46,6 +46,11 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
     SiriusPhysicalOperatorType::MERGE_GROUP_BY;
 
  public:
+  //! Clone-from-aggregate constructor (the physical plan generator's wrap path): copies the
+  //! wrapped HASH_GROUP_BY's cuDF aggregate definitions and output schema. When the aggregate
+  //! carries a surrogate restore plan (see op/groupby_surrogate_deferral.hpp), this merge
+  //! acquires it and redeclares the ORIGINAL output schema -- the aggregate emits rowid/dummy
+  //! key carriers, but this merge finalizes them back to the original string keys.
   sirius_physical_grouped_aggregate_merge(
     sirius_physical_grouped_aggregate* grouped_aggregate,
     uint64_t hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES);
@@ -142,11 +147,38 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
+  //! Surrogate-key group-by deferral (see op/groupby_surrogate_deferral.hpp). Acquired only via
+  //! the clone-from-aggregate constructor when the wrapped HASH_GROUP_BY carries a restore
+  //! plan; execute() then materializes the deferred string key columns from the retained
+  //! join-side sources after aggregation and restores this operator's declared (original)
+  //! output schema.
+  [[nodiscard]] std::shared_ptr<surrogate_restore_plan const> const& surrogate_restore()
+    const noexcept
+  {
+    return _surrogate_restore;
+  }
+
+  //! Release the surrogate store's retained source accessors once every merge task has
+  //! finalized, so the sources become reclaimable for the rest of the query. The store's
+  //! destruction at plan teardown is the RAII backstop; this hook is a deliberate early-release
+  //! policy.
+  void on_finalize_operator() override;
+
  private:
+  //! Surrogate-key deferral finalization policy (frozen call order: distinct proof, then string
+  //! restore, then conservative full-tuple re-group), composing the mechanisms in
+  //! gpu_surrogate_restore_impl. Runs after merging and before AVG / COUNT DISTINCT
+  //! post-processing. Returns a batch in the original output schema.
+  std::shared_ptr<::cucascade::data_batch> finalize_surrogate_groupby(
+    std::shared_ptr<::cucascade::data_batch> merged, rmm::cuda_stream_view stream);
+
   friend class sirius::planner::sirius_physical_plan_generator;
   void set_fuse_into_parent(bool fuse) noexcept { _fuse_into_parent = fuse; }
 
   bool _fuse_into_parent = false;
+
+  //! See surrogate_restore(); set only by the clone-from-aggregate constructor.
+  std::shared_ptr<surrogate_restore_plan const> _surrogate_restore;
 };
 
 }  // namespace op
