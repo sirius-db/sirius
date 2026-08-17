@@ -38,7 +38,7 @@ constexpr const char* kFragmentQueryLabel = "sirius_streaming_fragment";
 // INT64). cuDF's murmur3 hashes bytes, not values, so without normalization matching keys land in
 // different partitions and groups are silently split.
 //
-// Rules (mirror integration::streaming_fragment::build):
+// Rules:
 //   TINYINT / SMALLINT / INTEGER → INT64   (all sub-64-bit integers → canonical 64-bit)
 //   BIGINT / BOOLEAN / VARCHAR   → EMPTY   (already canonical; hash as-is)
 //   DECIMAL (any precision/scale) → FLOAT64 (normalized floating representation)
@@ -68,18 +68,15 @@ void normalize_key_cast_types(op::partition_spec& spec,
   if (!spec.key_cast_types.empty()) { return; }
   spec.key_cast_types.reserve(spec.key_columns.size());
   for (int key : spec.key_columns) {
+    // The sink validates key ranges too, but it is constructed after this runs — so an
+    // out-of-range or negative key would index output_types out of bounds first.
+    if (key < 0 || static_cast<std::size_t>(key) >= output_types.size()) {
+      throw sirius::invalid_input_exception("streaming_fragment: partition key column " +
+                                            std::to_string(key) + " is out of range for a " +
+                                            std::to_string(output_types.size()) + "-column output");
+    }
     spec.key_cast_types.push_back(derive_key_cast_type(output_types[key]));
   }
-}
-
-duckdb::shared_ptr<stream_bind_catalog> catalog_for(duckdb::ClientContext& context)
-{
-  auto catalog = context.registered_state->Get<stream_bind_catalog>(stream_bind_catalog::kStateKey);
-  if (!catalog) {
-    throw sirius::invalid_input_exception(
-      "streaming_fragment: no stream catalog on this connection");
-  }
-  return catalog;
 }
 
 }  // namespace
@@ -115,9 +112,13 @@ streaming_fragment::streaming_fragment(duckdb::ClientContext& context, fragment_
 
 streaming_fragment::~streaming_fragment()
 {
-  // Clear per-connection catalog; swallow in dtor.
+  // Drop only the ids this fragment declared. clear() would wipe the whole per-connection
+  // catalog, including a peer fragment's declarations; swallow in dtor.
   try {
-    catalog_for(_context)->clear();
+    auto catalog = catalog_for(_context);
+    for (const auto& [id, _] : _spec.inputs) {
+      catalog->erase(id);
+    }
   } catch (...) {  // NOLINT(bugprone-empty-catch)
   }
 }
@@ -127,7 +128,11 @@ void streaming_fragment::build(sirius::query_id_t query_id)
   if (_built) { throw sirius::invalid_input_exception("streaming_fragment: already built"); }
 
   auto catalog = catalog_for(_context);
-  catalog->clear();
+  // Same reason as the destructor: erase our own ids so a rebuild is idempotent without
+  // discarding declarations that belong to another fragment on this connection.
+  for (const auto& [id, _] : _spec.inputs) {
+    catalog->erase(id);
+  }
 
   // Declare before planning: bind resolves schema; create_plan reads repo + senders.
   for (const auto& [id, input] : _spec.inputs) {

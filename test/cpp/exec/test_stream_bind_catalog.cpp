@@ -138,6 +138,30 @@ TEST_CASE("stream_bind_catalog CAT-5: clear drops every declaration", "[stream_b
 }
 
 // ============================================================================
+// CAT-5b: erase is scoped to one id, so fragments sharing a connection don't
+// wipe each other's declarations
+// ============================================================================
+
+TEST_CASE("stream_bind_catalog CAT-5b: erase drops only the named stream", "[stream_bind_catalog]")
+{
+  stream_bind_catalog catalog;
+  catalog.declare(1, make_binding());
+  catalog.declare(2, make_binding());
+
+  catalog.erase(1);
+
+  // The catalog is one ClientContextState per connection. A fragment tearing down must remove
+  // only the ids it declared — clear() here would take a peer fragment's schema with it.
+  REQUIRE_FALSE(catalog.contains(1));
+  REQUIRE(catalog.contains(2));
+  REQUIRE(catalog.declared_streams() == std::vector<stream_id_t>{2});
+
+  // Idempotent: teardown paths call it unconditionally, including after a failed build.
+  catalog.erase(1);
+  REQUIRE(catalog.declared_streams() == std::vector<stream_id_t>{2});
+}
+
+// ============================================================================
 // CAT-6: redeclaring an id replaces it rather than keeping the old schema
 // ============================================================================
 

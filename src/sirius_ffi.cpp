@@ -344,8 +344,11 @@ struct Fragment::Impl {
     }
     if (transaction_open) {
       transaction_open = false;
+      // Reached only when the transaction is STILL open, which by construction means setup
+      // failed — build() clears the flag the moment its own Commit() succeeds. Committing here
+      // would persist a half-declared fragment (or throw again out of a noexcept path).
       try {
-        ctx.conn->Commit();
+        ctx.conn->Rollback();
       } catch (...) {  // NOLINT(bugprone-empty-catch)
       }
     }
@@ -454,6 +457,17 @@ void Fragment::build(const std::string& substrait_plan)
       spec.inputs  = std::move(resolved);
       spec.outputs = impl_->outputs;
 
+      // A routing mode on a single destination is a caller mistake, not a no-op: every row goes
+      // to output 0 either way, so silently dropping the spec hides a fan-out that never
+      // happened. The sink applies the same rule to its own spec.
+      if (impl_->outputs.size() <= 1 &&
+          (impl_->broadcast_outputs || !impl_->hash_key_columns.empty())) {
+        throw sirius::invalid_input_exception(
+          "Fragment: a partition mode was declared but the fragment has " +
+          std::to_string(impl_->outputs.size()) +
+          " output stream(s); routing needs at least two destinations");
+      }
+
       if (impl_->broadcast_outputs && impl_->outputs.size() > 1) {
         sirius::op::partition_spec broadcast;
         broadcast.mode    = sirius::op::partition_mode::broadcast;
@@ -485,25 +499,46 @@ std::size_t Fragment::relay_from(Fragment& source,
     throw sirius::invalid_input_exception("Fragment: build() must run before relay_from()");
   }
 
+  // The drain loop below stops at the first nullopt, which means "nothing right now" as well as
+  // "ended". Before the source has run, those are indistinguishable, so relaying early would
+  // close the input after zero batches and silently truncate the result.
+  if (!source.impl_->ran) {
+    throw sirius::invalid_input_exception(
+      "Fragment: relay_from() requires the source fragment to have run — call source.run() first, "
+      "otherwise an empty stream is indistinguishable from a finished one and the input would be "
+      "closed early");
+  }
+
+  // The docs promise this throws on an unknown stream id; it used to fall through both guards
+  // and move batches unchecked.
+  auto declared_it = impl_->resolved_inputs.find(input_stream_id);
+  if (declared_it == impl_->resolved_inputs.end()) {
+    throw sirius::invalid_input_exception("Fragment: relay target input stream " +
+                                          std::to_string(input_stream_id) +
+                                          " was never declared on this fragment");
+  }
+  if (source.impl_->fragment == nullptr) {
+    throw sirius::invalid_input_exception(
+      "Fragment: relay source has no output streams — a result fragment produces Arrow via "
+      "result_to_arrow(), not a relayable stream");
+  }
+
   // Schema check: fail before any data moves if column count or types disagree.
-  if (source.impl_->fragment != nullptr) {
-    if (auto it = impl_->resolved_inputs.find(input_stream_id);
-        it != impl_->resolved_inputs.end()) {
-      const auto& declared = it->second.types;
-      const auto& produced = source.impl_->fragment->sink_types();
-      if (produced.size() != declared.size()) {
+  {
+    const auto& declared = declared_it->second.types;
+    const auto& produced = source.impl_->fragment->sink_types();
+    if (produced.size() != declared.size()) {
+      throw sirius::invalid_input_exception(
+        "Fragment: relay into stream " + std::to_string(input_stream_id) + " expects " +
+        std::to_string(declared.size()) + " declared columns but the source sink produces " +
+        std::to_string(produced.size()));
+    }
+    for (std::size_t i = 0; i < declared.size(); ++i) {
+      if (produced[i] != declared[i]) {
         throw sirius::invalid_input_exception(
-          "Fragment: relay into stream " + std::to_string(input_stream_id) + " expects " +
-          std::to_string(declared.size()) + " declared columns but the source sink produces " +
-          std::to_string(produced.size()));
-      }
-      for (std::size_t i = 0; i < declared.size(); ++i) {
-        if (produced[i] != declared[i]) {
-          throw sirius::invalid_input_exception(
-            "Fragment: relay into stream " + std::to_string(input_stream_id) + " column " +
-            std::to_string(i) + " is declared " + declared[i].to_string() +
-            " but the source sink produces " + produced[i].to_string());
-        }
+          "Fragment: relay into stream " + std::to_string(input_stream_id) + " column " +
+          std::to_string(i) + " is declared " + declared[i].to_string() +
+          " but the source sink produces " + produced[i].to_string());
       }
     }
   }
@@ -550,6 +585,17 @@ void Fragment::run()
     }
     impl_->ran = true;
   } catch (...) {
+    // Poison every output before unwinding. Without this the streams are neither closed nor
+    // failed, so a peer parked in wait() blocks forever with no error anywhere — the S2/S3
+    // hazard the design doc calls out. First-failure-wins, so this cannot mask a real cause.
+    // A result fragment has no outputs, so this is a no-op there.
+    auto const cause = std::current_exception();
+    for (auto id : impl_->outputs) {
+      try {
+        impl_->session().fail_output(id, cause);
+      } catch (...) {  // NOLINT(bugprone-empty-catch)
+      }
+    }
     impl_->end_lifecycle();
     throw;
   }

@@ -20,24 +20,13 @@
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "helper/type_conversions.hpp"
+#include "sirius/exception.hpp"
 
-#include <stdexcept>
+#include <string>
 
 namespace sirius::exec {
 
 namespace {
-
-/// Resolve the per-connection stream_bind_catalog, or explain why the fragment is not set up.
-duckdb::shared_ptr<stream_bind_catalog> catalog_for(duckdb::ClientContext& context)
-{
-  auto catalog = context.registered_state->Get<stream_bind_catalog>(stream_bind_catalog::kStateKey);
-  if (!catalog) {
-    throw std::runtime_error(
-      "sirius_stream_source: no stream catalog on this connection — the fragment must declare its "
-      "input streams before the plan is bound");
-  }
-  return catalog;
-}
 
 duckdb::unique_ptr<duckdb::FunctionData> stream_source_bind(
   duckdb::ClientContext& context,
@@ -46,9 +35,18 @@ duckdb::unique_ptr<duckdb::FunctionData> stream_source_bind(
   duckdb::vector<std::string>& names)
 {
   if (input.inputs.size() != 1 || input.inputs[0].IsNull()) {
-    throw std::runtime_error("sirius_stream_source expects a single non-null stream id");
+    throw sirius::invalid_input_exception(
+      "sirius_stream_source expects a single non-null stream id");
   }
-  auto const stream_id = static_cast<stream_id_t>(input.inputs[0].GetValue<std::int64_t>());
+  // SQL hands this over as a signed INT64. Reject a negative before the cast, or it wraps to a
+  // huge unsigned id and the failure surfaces as a confusing "no input stream declared with id
+  // 18446744073709551615".
+  auto const signed_id = input.inputs[0].GetValue<std::int64_t>();
+  if (signed_id < 0) {
+    throw sirius::invalid_input_exception("sirius_stream_source: stream id must not be negative (" +
+                                          std::to_string(signed_id) + ")");
+  }
+  auto const stream_id = static_cast<stream_id_t>(signed_id);
 
   // Undeclared id = bind error (not a silent empty scan).
   auto const& binding = catalog_for(context)->get(stream_id);
@@ -61,7 +59,7 @@ duckdb::unique_ptr<duckdb::FunctionData> stream_source_bind(
 /// Never runs: plan generator replaces this scan with STREAMING_SOURCE.
 void stream_source_function(duckdb::ClientContext&, duckdb::TableFunctionInput&, duckdb::DataChunk&)
 {
-  throw std::runtime_error(
+  throw sirius::invalid_input_exception(
     "sirius_stream_source cannot be executed by DuckDB: it is an internal marker for a Sirius "
     "streaming input and is only valid inside a GPU-executed fragment plan");
 }

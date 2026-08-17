@@ -51,6 +51,12 @@ void stream_bind_catalog::clear()
   _entries.clear();
 }
 
+void stream_bind_catalog::erase(stream_id_t id)
+{
+  std::lock_guard<std::mutex> guard(_mutex);
+  _entries.erase(id);
+}
+
 bool stream_bind_catalog::contains(stream_id_t id) const
 {
   std::lock_guard<std::mutex> guard(_mutex);
@@ -92,6 +98,17 @@ std::vector<stream_id_t> stream_bind_catalog::declared_streams() const
     ids.push_back(id);
   }
   return ids;
+}
+
+duckdb::shared_ptr<stream_bind_catalog> catalog_for(duckdb::ClientContext& context)
+{
+  auto catalog = context.registered_state->Get<stream_bind_catalog>(stream_bind_catalog::kStateKey);
+  if (!catalog) {
+    throw sirius::invalid_input_exception(
+      "no stream catalog on this connection — the fragment must declare its input streams before "
+      "the plan is bound");
+  }
+  return catalog;
 }
 
 }  // namespace sirius::exec

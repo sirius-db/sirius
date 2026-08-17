@@ -52,7 +52,13 @@ class stream_bind_catalog : public duckdb::ClientContextState {
   ///         empty names.
   void declare(stream_id_t id, stream_input_binding binding);
 
+  /// Drop every declaration on this connection. Only safe when the caller owns the whole
+  /// catalog; a fragment sharing a connection must use erase() so it cannot wipe a peer's ids.
   void clear();
+
+  /// Drop one declaration. No-op when `id` was never declared, so teardown paths can call it
+  /// unconditionally.
+  void erase(stream_id_t id);
 
   [[nodiscard]] bool contains(stream_id_t id) const;
 
@@ -68,5 +74,11 @@ class stream_bind_catalog : public duckdb::ClientContextState {
   mutable std::mutex _mutex;
   std::map<stream_id_t, stream_input_binding> _entries;
 };
+
+/// The catalog registered on `context`, or an error explaining that the fragment never declared
+/// its inputs. Shared by the three places that need it — the bind function, the fragment, and the
+/// plan generator — so they cannot drift on the message or the exception type.
+/// @throws sirius::invalid_input_exception when no catalog is registered on the connection.
+duckdb::shared_ptr<stream_bind_catalog> catalog_for(duckdb::ClientContext& context);
 
 }  // namespace sirius::exec

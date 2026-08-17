@@ -205,12 +205,7 @@ sirius_physical_plan_generator::create_streaming_source_plan(duckdb::LogicalGet&
     throw duckdb::InternalException("sirius_stream_source is missing its stream bind data");
   }
 
-  auto catalog = context.registered_state->Get<sirius::exec::stream_bind_catalog>(
-    sirius::exec::stream_bind_catalog::kStateKey);
-  if (!catalog) {
-    throw duckdb::InternalException(
-      "sirius_stream_source bound without a stream catalog on this connection");
-  }
+  auto catalog        = sirius::exec::catalog_for(context);
   auto const& binding = catalog->get(bind->stream_id);
 
   // Projection pushdown is off; a narrowed column list here would disagree with the binder.
