@@ -28,6 +28,8 @@
 #include "expression/ast/from_duckdb.hpp"
 
 // sirius — node accessors and per-node struct types
+#include "expression/aggregate_id.hpp"
+#include "expression/ast/aggregate.hpp"
 #include "expression/ast/between.hpp"
 #include "expression/ast/case_expr.hpp"
 #include "expression/ast/cast.hpp"
@@ -46,11 +48,13 @@
 // duckdb — direct-ctor construction surface
 #include <duckdb/common/exception.hpp>
 #include <duckdb/common/types/value.hpp>
+#include <duckdb/function/aggregate_function.hpp>
 #include <duckdb/function/scalar_function.hpp>
 #include <duckdb/main/client_config.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/connection.hpp>
 #include <duckdb/main/database.hpp>
+#include <duckdb/planner/expression/bound_aggregate_expression.hpp>
 #include <duckdb/planner/expression/bound_between_expression.hpp>
 #include <duckdb/planner/expression/bound_case_expression.hpp>
 #include <duckdb/planner/expression/bound_cast_expression.hpp>
@@ -71,6 +75,9 @@
 #include <variant>
 #include <vector>
 
+using duckdb::AggregateFunction;
+using duckdb::AggregateType;
+using duckdb::BoundAggregateExpression;
 using duckdb::BoundBetweenExpression;
 using duckdb::BoundCaseCheck;
 using duckdb::BoundCaseExpression;
@@ -715,6 +722,81 @@ TEST_CASE("ast_from_duckdb - BOUND_PARAMETER returns nullptr", "[ast_from_duckdb
 {
   auto param_expr = duckdb::make_uniq<BoundParameterExpression>(std::string{"p1"});
   REQUIRE(sirius::ast::from_duckdb(*param_expr) == nullptr);
+}
+
+// ============================================================================
+// BOUND_AGGREGATE with a FILTER clause — the planner's mask rewrite consumes
+// aggregate filters before translation; the only filtered shape the translator
+// lowers itself is count_star carrying a bound reference to the materialized
+// mask column. Every other surviving filter declines to nullptr (CPU fallback)
+// so it can never be silently dropped.
+// ============================================================================
+
+namespace {
+
+// Minimal AggregateFunction stub: only `.name` is read by from_duckdb; the
+// callback function pointers are never invoked during translation.
+AggregateFunction make_dummy_aggregate(std::string const& name,
+                                       duckdb::vector<LogicalType> const& args,
+                                       LogicalType const& ret_type)
+{
+  return AggregateFunction(
+    name, args, ret_type, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+}
+
+}  // namespace
+
+TEST_CASE("ast_from_duckdb - count_star with a mask-reference filter lowers to count(mask)",
+          "[ast_from_duckdb][aggregate_filter]")
+{
+  auto fn   = make_dummy_aggregate("count_star", {}, LogicalType{LogicalTypeId::BIGINT});
+  auto expr = duckdb::make_uniq<BoundAggregateExpression>(
+    fn,
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
+    make_bound_ref(7, LogicalTypeId::BOOLEAN),
+    nullptr,
+    AggregateType::NON_DISTINCT);
+
+  auto out = sirius::ast::from_duckdb(*expr);
+  REQUIRE(out);
+  REQUIRE(out->holds<sirius::ast::aggregate>());
+  auto const& agg = out->get<sirius::ast::aggregate>();
+  REQUIRE(agg.function() == sirius::aggregate_id::count);
+  REQUIRE(agg.distinct() == false);
+  REQUIRE(agg.return_type().id() == sirius::type_id::BIGINT);
+  REQUIRE(agg.arguments().size() == 1);
+  REQUIRE(agg.arguments()[0]->holds<reference>());
+  REQUIRE(agg.arguments()[0]->get<reference>().column_index == 7);
+}
+
+TEST_CASE("ast_from_duckdb - child-bearing aggregate with an unconsumed filter declines",
+          "[ast_from_duckdb][aggregate_filter]")
+{
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;
+  children.push_back(make_bound_ref(0));
+  auto fn = make_dummy_aggregate(
+    "sum", {LogicalType{LogicalTypeId::INTEGER}}, LogicalType{LogicalTypeId::BIGINT});
+  auto expr = duckdb::make_uniq<BoundAggregateExpression>(fn,
+                                                          std::move(children),
+                                                          make_bound_ref(1, LogicalTypeId::BOOLEAN),
+                                                          nullptr,
+                                                          AggregateType::NON_DISTINCT);
+
+  REQUIRE(sirius::ast::from_duckdb(*expr) == nullptr);
+}
+
+TEST_CASE("ast_from_duckdb - count_star with a non-reference filter declines",
+          "[ast_from_duckdb][aggregate_filter]")
+{
+  auto fn   = make_dummy_aggregate("count_star", {}, LogicalType{LogicalTypeId::BIGINT});
+  auto expr = duckdb::make_uniq<BoundAggregateExpression>(
+    fn,
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
+    duckdb::make_uniq<BoundConstantExpression>(Value::BOOLEAN(true)),
+    nullptr,
+    AggregateType::NON_DISTINCT);
+
+  REQUIRE(sirius::ast::from_duckdb(*expr) == nullptr);
 }
 
 // ============================================================================

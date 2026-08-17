@@ -1,0 +1,161 @@
+# =============================================================================
+# Copyright 2026, Sirius Contributors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+# in compliance with the License. You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software distributed under the License
+# is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied. See the License for the specific language governing permissions and limitations under
+# the License.
+# =============================================================================
+
+# name: test/sql/aggregate-filter.test
+# description: Aggregate FILTER (WHERE ...) correctness. Supported shapes run on the GPU via the
+#              mask-to-null projection rewrite; DISTINCT and first() with FILTER fall back to CPU.
+# group: [sirius]
+
+# Load required extensions
+require sirius
+
+# NOTE: the SQLLogic runner uses an in-memory database, which the GPU-native scan rejects at
+# plan time, so every query here transparently falls back to DuckDB CPU execution -- this file
+# validates FILTER semantics, not GPU execution. GPU-executed FILTER coverage (with no-fallback
+# assertions) lives in test/cpp/integration/test_gpu_execution_aggregate_filter.cpp.
+
+# Dataset: each residue 0-999 appears exactly 100 times.
+statement ok
+CREATE TABLE t AS SELECT CAST((range*7)%1000 AS INTEGER) x FROM range(100000);
+
+# 1. Ungrouped, all supported functions.
+query IIIIIR
+SELECT count(*) FILTER (WHERE x<100), count(x) FILTER (WHERE x<100), sum(x) FILTER (WHERE x<100), min(x) FILTER (WHERE x<100), max(x) FILTER (WHERE x<100), avg(x) FILTER (WHERE x<100) FROM t;
+----
+10000	10000	495000	0	99	49.5
+
+# 2. Grouped, mixed filtered + unfiltered aggregates in one query.
+query IIII
+SELECT x%2 g, count(*) FILTER (WHERE x<100), sum(x) FILTER (WHERE x<100), count(*) FROM t GROUP BY g ORDER BY g;
+----
+0	5000	245000	50000
+1	5000	250000	50000
+
+# 3. Multiple different filters in one query.
+query III
+SELECT count(*) FILTER (WHERE x<100), count(*) FILTER (WHERE x>=900), sum(x) FILTER (WHERE x<10) FROM t;
+----
+10000	10000	4500
+
+# 4. Mark-join / three-valued filter: the NULL in t2 makes non-matching IN results NULL, and
+# those rows must mask out rather than count.
+statement ok
+CREATE TABLE t2(y INTEGER);
+
+statement ok
+INSERT INTO t2 VALUES (1),(2),(NULL);
+
+query II
+SELECT count(*) FILTER (WHERE x IN (SELECT y FROM t2)), sum(x) FILTER (WHERE x IN (SELECT y FROM t2)) FROM t;
+----
+200	300
+
+# 5. Nullable boolean filter column: NULL filter values mask out.
+statement ok
+CREATE TABLE t3(v INTEGER, b BOOLEAN);
+
+statement ok
+INSERT INTO t3 VALUES (1,true),(2,false),(3,NULL),(4,true);
+
+query II
+SELECT count(*) FILTER (WHERE b), sum(v) FILTER (WHERE b) FROM t3;
+----
+2	5
+
+query III
+SELECT v%2 g, count(*) FILTER (WHERE b), sum(v) FILTER (WHERE b) FROM t3 GROUP BY g ORDER BY g;
+----
+0	1	4
+1	1	1
+
+# 6. NULLs in the aggregate input among passing rows: count(v) skips them, count(*) does not.
+statement ok
+CREATE TABLE t4(v INTEGER, keep BOOLEAN);
+
+statement ok
+INSERT INTO t4 VALUES (1,true),(NULL,true),(2,true),(NULL,false),(5,false);
+
+query IIIR
+SELECT count(*) FILTER (WHERE keep), count(v) FILTER (WHERE keep), sum(v) FILTER (WHERE keep), avg(v) FILTER (WHERE keep) FROM t4;
+----
+3	2	3	1.5
+
+# 7. Empty qualifying set: count is 0, sum is NULL; groups with zero passing rows still emit.
+query II
+SELECT count(*) FILTER (WHERE x<0), sum(x) FILTER (WHERE x<0) FROM t;
+----
+0	NULL
+
+query III
+SELECT x%2 g, count(*) FILTER (WHERE x<0), sum(x) FILTER (WHERE x<0) FROM t GROUP BY g ORDER BY g;
+----
+0	0	NULL
+1	0	NULL
+
+# 8. VARCHAR and DECIMAL paths.
+statement ok
+CREATE TABLE t5(s VARCHAR, d DECIMAL(10,2), k INTEGER);
+
+statement ok
+INSERT INTO t5 VALUES ('apple',1.25,1),('banana',2.50,2),('cherry',3.75,1),('date',10.00,2);
+
+query TT
+SELECT min(s) FILTER (WHERE k=1), max(s) FILTER (WHERE k=1) FROM t5;
+----
+apple	cherry
+
+query RR
+SELECT sum(d) FILTER (WHERE k=2), avg(d) FILTER (WHERE k=2) FROM t5;
+----
+12.5	6.25
+
+# 9. Rejected shapes still produce correct results via transparent CPU fallback.
+query I
+SELECT count(DISTINCT x) FILTER (WHERE x<100) FROM t;
+----
+100
+
+# Deterministic because every qualifying value equals 42.
+query I
+SELECT first(x) FILTER (WHERE x=42) FROM t;
+----
+42
+
+statement ok
+CREATE TABLE t6(a INTEGER, b INTEGER);
+
+statement ok
+INSERT INTO t6 VALUES (1,1),(1,1),(1,2),(2,1),(2,1);
+
+query I
+SELECT count(DISTINCT (a,b)) FILTER (WHERE a<2) FROM t6;
+----
+2
+
+# 10. Cases 1-2 again with a nullable aggregate input: NULLIF sends x=500 (100 rows) to NULL,
+# crossing the filter mask with pre-existing validity.
+statement ok
+CREATE TABLE tn AS SELECT NULLIF(x, 500) x FROM t;
+
+query IIIIIR
+SELECT count(*) FILTER (WHERE x<100), count(x) FILTER (WHERE x<100), sum(x) FILTER (WHERE x<100), min(x) FILTER (WHERE x<100), max(x) FILTER (WHERE x<100), avg(x) FILTER (WHERE x<100) FROM tn;
+----
+10000	10000	495000	0	99	49.5
+
+query IIII
+SELECT x%2 g, count(*) FILTER (WHERE x<100), sum(x) FILTER (WHERE x<100), count(*) FROM tn GROUP BY g ORDER BY g;
+----
+0	5000	245000	49900
+1	5000	250000	50000
+NULL	0	NULL	100
