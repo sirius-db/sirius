@@ -2020,9 +2020,9 @@ dependencies = [
 
 [[package]]
 name = "substrait-explain"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d616d676fd0b4884b675bcfc7e3858500cedcbb988396afcdefa3735255659a"
+checksum = "9508a9e0ce7acd78a06614956120da46fcd2fa9a36e2431b909c095dd6ee7215"
 dependencies = [
  "anyhow",
  "chrono",
