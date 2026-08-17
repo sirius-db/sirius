@@ -634,3 +634,34 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
   compare_gpu_vs_cpu("SELECT k, a FROM t WHERE k >= 19999 ORDER BY k;");
   run_ok("CALL unpin_table('t');");
 }
+
+TEST_CASE_METHOD(PinMvccInsertFixture,
+                 "mvcc guards: an uncheckpointed append refuses an ARRAY-only pin",
+                 "[integration][gpu_execution][pin_table_mvcc_insert][array]")
+{
+  run_ok(
+    "CREATE TABLE t AS SELECT range::INTEGER AS k, "
+    "CAST([range::INTEGER, range::INTEGER + 1, range::INTEGER + 2] AS INTEGER[3]) AS a "
+    "FROM range(1000);");
+  run_ok("CHECKPOINT;");
+
+  // Commit one row without checkpointing. The appended ARRAY row lives only in
+  // the array-level validity and child segment trees as transient (in-memory)
+  // segments, not in the parent tree.
+  run_ok("INSERT INTO t VALUES (1000, CAST([1, 2, 3] AS INTEGER[3]));");
+
+  // Pin the ARRAY column ALONE. With no scalar column in the pin, the guard can
+  // only see the append by walking the array's validity and child trees; miss
+  // those and it slips through here and fails later in the decoder byte sizing.
+  auto refused = con->Query("CALL pin_table(format='duckdb', name='t', tier='gpu', cols=['a']);");
+  REQUIRE(refused);
+  REQUIRE(refused->HasError());
+  REQUIRE_THAT(refused->GetError(), Catch::Contains("CHECKPOINT"));
+
+  // Folding the append into the base clears the guard; the ARRAY-only pin then
+  // succeeds and serves from cache.
+  run_ok("CHECKPOINT;");
+  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu', cols=['a']);");
+  compare_gpu_vs_cpu("SELECT a FROM t WHERE k >= 998 ORDER BY k;");
+  run_ok("CALL unpin_table('t');");
+}
