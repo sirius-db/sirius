@@ -138,7 +138,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
   owned_cast_cols.reserve(partition_key_idx.size());
   effective_key_views.reserve(partition_key_idx.size());
   for (std::size_t i = 0; i < partition_key_idx.size(); ++i) {
-    auto const key = input_table.column(partition_key_idx[i]);
+    auto const& key = input_table.column(partition_key_idx[i]);
     if (i < partition_key_cast_types.size() &&
         partition_key_cast_types[i].id() != cudf::type_id::EMPTY) {
       auto cast_col =
@@ -258,7 +258,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
     std::size_t logical_size = 0;
     for (auto const& plan : column_plan) {
       if (plan.storage == partition_column_storage::shared_fixed_width) {
-        auto const combined = fixed_view.column(plan.compact_index);
+        auto const& combined = fixed_view.column(plan.compact_index);
         output_columns.push_back(make_offset_zero_fixed_width_alias(combined, begin, end));
         logical_size =
           checked_add(logical_size,

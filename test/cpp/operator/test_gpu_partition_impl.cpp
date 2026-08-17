@@ -176,12 +176,14 @@ void validate_hash_partition(data_batch& input_batch,
   std::multiset<std::vector<int64_t>> input_set(h_input_rows.begin(), h_input_rows.end());
   REQUIRE(input_set == output_set);
 }
-using mixed_row     = std::tuple<int32_t, std::string, int64_t>;
-using nullable_row  = std::tuple<bool, int32_t, int64_t>;
-using mixed_rows    = std::multiset<mixed_row>;
-using nullable_rows = std::multiset<nullable_row>;
-using numeric_rows  = std::multiset<std::vector<int64_t>>;
-using string_rows   = std::multiset<std::string>;
+using mixed_row         = std::tuple<int32_t, std::string, int64_t>;
+using nullable_row      = std::tuple<bool, int32_t, int64_t>;
+using multi_copied_row  = std::tuple<std::string, int32_t, std::string, int64_t, bool, int32_t>;
+using mixed_rows        = std::multiset<mixed_row>;
+using nullable_rows     = std::multiset<nullable_row>;
+using multi_copied_rows = std::multiset<multi_copied_row>;
+using numeric_rows      = std::multiset<std::vector<int64_t>>;
+using string_rows       = std::multiset<std::string>;
 
 std::shared_ptr<data_batch> make_mixed_batch(memory_space& space,
                                              const std::vector<int32_t>& keys,
@@ -287,6 +289,24 @@ nullable_rows copy_nullable_rows(cudf::table_view table)
   nullable_rows rows;
   for (std::size_t i = 0; i < keys.size(); ++i) {
     rows.emplace(validity[i], validity[i] ? nullable_values[i] : 0, keys[i]);
+  }
+  return rows;
+}
+
+multi_copied_rows copy_multi_copied_rows(cudf::table_view table)
+{
+  using sirius::test::operator_utils::copy_column_to_host;
+  using sirius::test::operator_utils::copy_validity_to_host;
+  auto const left     = copy_strings_to_host(table.column(0));
+  auto const keys     = copy_column_to_host<int32_t>(table.column(1));
+  auto const right    = copy_strings_to_host(table.column(2));
+  auto const payload  = copy_column_to_host<int64_t>(table.column(3));
+  auto const extras   = copy_column_to_host<int32_t>(table.column(4));
+  auto const validity = copy_validity_to_host(table.column(4));
+
+  multi_copied_rows rows;
+  for (std::size_t i = 0; i < keys.size(); ++i) {
+    rows.emplace(left[i], keys[i], right[i], payload[i], validity[i], validity[i] ? extras[i] : 0);
   }
   return rows;
 }
@@ -821,6 +841,67 @@ TEST_CASE("Hash partition copies nullable fixed columns but aliases eligible sib
     require_canonical_schema(view, input_view);
     REQUIRE(copy_nullable_rows(view) == expected[partition]);
   }
+}
+
+TEST_CASE("Hash partition reassembles multiple copied columns in original order",
+          "[operator][hash_partition][fallback][zero_copy]")
+{
+  using namespace sirius::test::operator_utils;
+  auto* mem_space                 = get_shared_mem_space();
+  constexpr int partitions        = 4;
+  constexpr std::size_t row_count = 24;
+
+  std::vector<int32_t> keys(row_count);
+  std::iota(keys.begin(), keys.end(), int32_t{0});
+  std::vector<int64_t> payload(row_count);
+  std::vector<int32_t> extras(row_count);
+  std::vector<bool> validity(row_count);
+  std::vector<std::string> left;
+  std::vector<std::string> right;
+  left.reserve(row_count);
+  right.reserve(row_count);
+  for (std::size_t i = 0; i < row_count; ++i) {
+    payload[i]  = 5'000 + static_cast<int64_t>(i);
+    extras[i]   = 900 + static_cast<int32_t>(i);
+    validity[i] = (i % 3) != 0;
+    left.push_back("left_" + std::to_string(i));
+    right.push_back("right_" + std::to_string(i));
+  }
+
+  auto left_batch    = make_string_batch(*mem_space, left);
+  auto key_batch     = make_numeric_batch(*mem_space, keys, cudf::type_id::INT32);
+  auto right_batch   = make_string_batch(*mem_space, right);
+  auto payload_batch = make_numeric_batch(*mem_space, payload, cudf::type_id::INT64);
+  auto extras_batch =
+    make_numeric_batch_with_nulls(*mem_space, extras, validity, cudf::type_id::INT32);
+  auto input = concatenate_batches_horizontal(
+    {left_batch, key_batch, right_batch, payload_batch, extras_batch}, *mem_space);
+
+  auto input_ro         = input->to_read_only();
+  auto const input_view = sirius::get_cudf_table_view(input_ro);
+  std::vector<cudf::column_view> key_views{input_view.column(1)};
+  auto expected = reference_partition_rows<multi_copied_rows>(input_view,
+                                                              cudf::table_view{key_views},
+                                                              partitions,
+                                                              cudf::get_default_stream(),
+                                                              mem_space->get_default_allocator(),
+                                                              copy_multi_copied_rows);
+
+  auto output = gpu_partition_impl::hash_partition(
+    input_ro, {1}, partitions, cudf::get_default_stream(), *mem_space);
+  REQUIRE(output.size() == static_cast<std::size_t>(partitions));
+  require_fixed_aliases_and_sizes(output, {1, 3}, false);
+
+  multi_copied_rows all_output;
+  for (std::size_t partition = 0; partition < output.size(); ++partition) {
+    auto ro         = output[partition]->to_read_only();
+    auto const view = sirius::get_cudf_table_view(ro);
+    require_canonical_schema(view, input_view);
+    auto const actual = copy_multi_copied_rows(view);
+    REQUIRE(actual == expected[partition]);
+    all_output.insert(actual.begin(), actual.end());
+  }
+  REQUIRE(all_output == copy_multi_copied_rows(input_view));
 }
 
 TEST_CASE("Hash partition cast keys stay out of the payload",
