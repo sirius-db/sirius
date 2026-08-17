@@ -314,6 +314,7 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
   }
 
   ::cucascade::memory::memory_space* mem_space = scan_input->gpu_memory_space;
+  auto const total_input_bytes                 = scan_input->get_estimated_size_in_bytes();
   auto materialized_table = _ingestible->materialize_table(*scan_input, stream);
   owning_table_view result =
     materialized_table.state != filter_state::ROW_FILTERED_AND_PROJECTED
@@ -338,7 +339,7 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
                    : std::vector<std::unique_ptr<cudf::column>>{};
     batch      = emit_view_forward(std::move(*forwarded),
                               std::move(casts),
-                              scan_input->get_estimated_size_in_bytes(),
+                              total_input_bytes,
                               *mem_space,
                               stream,
                               batch_telemetry());
