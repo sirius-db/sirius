@@ -140,16 +140,24 @@ struct chunk_decode_plan {
 /// still runs) and clears @c covers_whole_filter. The plan is disabled only
 /// when nothing survives.
 ///
-/// @p has_external_selection declares that the caller contributes row-selecting
-/// sources this narrowing does not see — an in-place equality answer folded
-/// into the selection, or a dynamic join filter. Either lets the plan enable
-/// with no range sources at all, and either forces @c covers_whole_filter
-/// false: the coverage claim speaks only for the static numeric view, and a
-/// dynamic filter is never the whole filter (the authoritative join still runs).
+/// into the selection, or a dynamic join filter. It lets the plan enable with
+/// no range sources at all.
+///
+/// @p has_dynamic_join_selection narrows that to just the join-filter half: a
+/// dictionary-answered equality is validated up front (simpatico_codegen.cpp's
+/// bool8_filters check) and any failure there refuses the WHOLE decode, so an
+/// equality source that reaches this point is guaranteed applied — it never
+/// affects coverage. A membership probe carries no such guarantee: its
+/// directive is only checked for a non-null probe here, and @c compute_mask
+/// can still decline per batch at decode time (a type mismatch), in which case
+/// that source silently contributes nothing. Coverage must not claim "every
+/// surviving row satisfies the scan's own filter" off a source that might not
+/// have run, so only a dynamic join filter clears it.
 chunk_decode_plan plan_decode(simpatico::compressed_table const& table,
                               std::span<const std::size_t> selected_columns,
                               scan_decode_request const& request,
-                              bool has_external_selection)
+                              bool has_external_selection,
+                              bool has_dynamic_join_selection)
 {
   chunk_decode_plan plan;
   bool const any_range = std::any_of(request.columns.begin(),
@@ -218,9 +226,19 @@ chunk_decode_plan plan_decode(simpatico::compressed_table const& table,
       "[decode-filter] plan: no row-selecting source survived — plain decode");
     return {};
   }
-  plan.enabled             = true;
+  plan.enabled = true;
+  // A dictionary-answered equality does NOT clear coverage: it is validated
+  // up front (simpatico_codegen.cpp's bool8_filters check) and any failure
+  // there refuses the whole decode, so one reaching this point is guaranteed
+  // applied — an extra guaranteed source only ever removes MORE rows, which
+  // cannot make a surviving row stop satisfying the scan's own filter.
+  //
+  // A dynamic join filter DOES clear coverage: its probe carries no such
+  // guarantee (compute_mask can decline per batch at decode time), so
+  // covers_whole_filter must not claim "every surviving row satisfies the
+  // scan's own filter" off a source that might not actually have run.
   plan.covers_whole_filter = request.ranges_cover_whole_filter && !dropped_conjunct &&
-                             selecting_columns > 0 && !has_external_selection;
+                             selecting_columns > 0 && !has_dynamic_join_selection;
   SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
     "[decode-filter] plan ENABLED: {} row-selecting range column(s), "
     "external_sources={}, {}/{} column(s) decode compacted, covers_whole_filter={}",
@@ -317,8 +335,13 @@ std::unique_ptr<cudf::table> decode_with_filters(simpatico::compressed_table con
       sources.push_back({selection_source::kind::membership, i, &probe});
     }
   }
+  bool const has_dynamic_join_selection =
+    std::any_of(sources.begin(), sources.end(), [](auto const& s) {
+      return s.what == selection_source::kind::membership;
+    });
 
-  auto const plan = plan_decode(chunk, selected, request, !sources.empty());
+  auto const plan =
+    plan_decode(chunk, selected, request, !sources.empty(), has_dynamic_join_selection);
   if (!plan.enabled) { return nullptr; }
 
   // Then the conjuncts planning just decided this chunk can evaluate.
