@@ -205,8 +205,15 @@ std::shared_ptr<::cucascade::data_batch> emit_view_forward(
     std::iota(all_columns.begin(), all_columns.end(), 0);
     auto const referenced_bytes =
       sirius::estimate_referenced_column_bytes(forwarded.view, all_columns, total_input_bytes);
-    return sirius::make_data_batch_from_view(
-      forwarded.view, std::move(forwarded.owner), referenced_bytes, mem_space, stream, telemetry);
+    // Conversion frees nothing while the entry stays pinned; post-unpin undercredit is the safe
+    // direction.
+    return sirius::make_data_batch_from_view(forwarded.view,
+                                             std::move(forwarded.owner),
+                                             referenced_bytes,
+                                             mem_space,
+                                             stream,
+                                             telemetry,
+                                             /*reclaimable_size=*/std::size_t{0});
   }
 
   // Views are taken before the cast vector is moved (unique_ptr moves never relocate the
@@ -228,13 +235,15 @@ std::shared_ptr<::cucascade::data_batch> emit_view_forward(
   auto const alloc_size = casted_bytes + sirius::estimate_referenced_column_bytes(
                                            forwarded.view, forwarded_columns, total_input_bytes);
   auto casted = std::make_shared<std::vector<std::unique_ptr<cudf::column>>>(std::move(casts));
+  // Only the exclusively owned cast columns are freed by converting this batch away.
   return sirius::make_data_batch_from_view(
     cudf::table_view{views},
     mixed_scan_owner{std::move(forwarded.owner), std::move(casted)},
     alloc_size,
     mem_space,
     stream,
-    telemetry);
+    telemetry,
+    /*reclaimable_size=*/casted_bytes);
 }
 
 }  // namespace

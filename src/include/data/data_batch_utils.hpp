@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "data/reclaim_ledger.hpp"
 #include "telemetry/data_batch_probe.hpp"
 
 #include <cudf/table/table_view.hpp>
@@ -29,6 +30,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace sirius {
@@ -189,6 +191,9 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
  *                       is linked into the query's telemetry lineage. Pass the producing
  *                       operator's batch_telemetry(); pass a default-constructed value only when
  *                       no lineage is available (e.g. tests).
+ * @param reclaimable_size Bytes a conversion away from GPU actually frees; when set, recorded in
+ *                         the reclaim ledger for the lifetime of this representation and must not
+ *                         exceed @p alloc_size. Defaults to full reclaimability.
  */
 template <typename Owner>
 inline std::shared_ptr<cucascade::data_batch> make_data_batch_from_view(
@@ -197,15 +202,26 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch_from_view(
   std::size_t alloc_size,
   cucascade::memory::memory_space& memory_space,
   rmm::cuda_stream_view writer_stream,
-  const telemetry::batch_telemetry_info& telemetry_info)
+  const telemetry::batch_telemetry_info& telemetry_info,
+  std::optional<std::size_t> reclaimable_size = std::nullopt)
 {
-  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
-    view, std::forward<Owner>(owner), alloc_size, memory_space, writer_stream);
-  const auto batch_id = get_next_batch_id();
-  return cucascade::data_batch::make(
-    batch_id,
-    std::move(gpu_repr),
-    telemetry::quent_data_batch_probe::create(telemetry_info, batch_id));
+  const auto batch_id = get_next_batch_id();  // hoisted: the ledger keys on it before make()
+  auto make           = [&](auto&& bound_owner) {
+    auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
+      view,
+      std::forward<decltype(bound_owner)>(bound_owner),
+      alloc_size,
+      memory_space,
+      writer_stream);
+    return cucascade::data_batch::make(
+      batch_id,
+      std::move(gpu_repr),
+      telemetry::quent_data_batch_probe::create(telemetry_info, batch_id));
+  };
+  if (!reclaimable_size) { return make(std::forward<Owner>(owner)); }
+  // The token rides in the owner so the ledger entry dies exactly with this representation.
+  auto token = reclaim_ledger::instance().declare(batch_id, *reclaimable_size);
+  return make(std::pair{std::forward<Owner>(owner), std::move(token)});
 }
 
 }  // namespace sirius

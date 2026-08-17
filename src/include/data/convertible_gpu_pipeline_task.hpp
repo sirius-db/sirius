@@ -18,6 +18,7 @@
 
 #include "data/convertible_data.hpp"
 #include "data/convertible_data_batch.hpp"
+#include "data/reclaim_ledger.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "exec/multi_index_priority_queue.hpp"
 #include "log/logging.hpp"
@@ -133,6 +134,8 @@ class convertible_gpu_pipeline_task : public convertible_data {
           }
         }
         if (at_target) { continue; }
+        // A zero-reclaimable alias frees nothing; converting it only burns the target tier.
+        if (sirius::reclaimable_size_in_bytes(ro) == 0) { continue; }
       }
 
       // Delegate to convertible_data_batch which handles to_mutable() internally
@@ -151,23 +154,23 @@ class convertible_gpu_pipeline_task : public convertible_data {
   }
 
   /**
-   * @brief Get the size in bytes of this task's data in the specified memory space.
+   * @brief Get the bytes actually freed in the specified memory space by converting this task's
+   * data away.
    *
-   * Sums bytes across all data_batches in the task's input that reside in the
-   * given memory space. Accesses memory space via to_read_only() as required by
-   * the new cucascade API.
+   * Sums reclaimable bytes across all data_batches in the task's input that reside in the given
+   * memory space. Accesses memory space via to_read_only() as required by the new cucascade API.
    *
    * @param space The memory space to query.
-   * @return Total size in bytes, or 0 if no data resides in that space.
+   * @return Total reclaimable bytes, or 0 if no data resides in that space.
    */
-  std::size_t bytes_in_space(cucascade::memory::memory_space* space) const override
+  std::size_t reclaimable_bytes_in_space(cucascade::memory::memory_space* space) const override
   {
     auto* operator_data = get_pipelineable_data();
     if (!operator_data) { return 0; }
 
     std::size_t total = 0;
     for (const auto& ro : operator_data->get_read_only_batches(false)) {
-      if (ro.get_memory_space() == space) { total += ro.get_data()->get_size_in_bytes(); }
+      if (ro.get_memory_space() == space) { total += sirius::reclaimable_size_in_bytes(ro); }
     }
     return total;
   }
@@ -298,7 +301,7 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
    *
    * @param task  The task to inspect.
    * @param space The memory space to match.
-   * @return true if the task has at least one matching batch in batch_state::idle.
+   * @return true if the task has at least one idle, reclaimable batch in the given space.
    */
   static bool has_matching_batches(sirius::parallel::itask& task,
                                    cucascade::memory::memory_space* space)
@@ -311,7 +314,10 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
       if (batch->get_state() != cucascade::batch_state::idle) { continue; }
       auto ro = batch->try_to_read_only();
       if (!ro) { continue; }
-      if (ro->get_memory_space() == space) { return true; }
+      // A zero-reclaimable alias frees nothing, so it never qualifies a task for extraction.
+      if (ro->get_memory_space() == space && sirius::reclaimable_size_in_bytes(*ro) > 0) {
+        return true;
+      }
     }
 
     return false;

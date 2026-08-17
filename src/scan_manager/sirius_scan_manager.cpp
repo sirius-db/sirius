@@ -214,13 +214,15 @@ struct cached_databatch_provider : public databatch_provider {
       }
       cudf::table_view view(column_views);
       auto* chunk_space = chunk.memory_space ? chunk.memory_space : _entry.memory_space;
-      auto gpu_repr     = std::make_unique<::cucascade::gpu_table_representation>(
-        view, std::move(columns), alloc_size, *chunk_space, rmm::cuda_stream_view{});
-      const auto batch_id = ::sirius::get_next_batch_id();
-      return ::cucascade::data_batch::make(
-        batch_id,
-        std::move(gpu_repr),
-        telemetry::quent_data_batch_probe::create(_telemetry_info, batch_id));
+      // The shared_ptr owners never release the pinned entry's storage, so converting this
+      // wrapper away frees nothing.
+      return ::sirius::make_data_batch_from_view(view,
+                                                 std::move(columns),
+                                                 alloc_size,
+                                                 *chunk_space,
+                                                 rmm::cuda_stream_view{},
+                                                 _telemetry_info,
+                                                 /*reclaimable_size=*/std::size_t{0});
     }
     if (index >= _entry.chunk_memory_spaces.size()) { return nullptr; }
     std::vector<std::shared_ptr<cudf::column>> columns;
@@ -236,13 +238,15 @@ struct cached_databatch_provider : public databatch_provider {
     cudf::table_view view(column_views);
     auto* chunk_space = !_entry.chunk_memory_spaces.empty() ? _entry.chunk_memory_spaces.at(index)
                                                             : _entry.memory_space;
-    auto gpu_repr     = std::make_unique<::cucascade::gpu_table_representation>(
-      view, std::move(columns), alloc_size, *chunk_space, rmm::cuda_stream_view{});
-    const auto batch_id = ::sirius::get_next_batch_id();
-    return ::cucascade::data_batch::make(
-      batch_id,
-      std::move(gpu_repr),
-      telemetry::quent_data_batch_probe::create(_telemetry_info, batch_id));
+    // The shared_ptr owners never release the pinned entry's storage, so converting this wrapper
+    // away frees nothing.
+    return ::sirius::make_data_batch_from_view(view,
+                                               std::move(columns),
+                                               alloc_size,
+                                               *chunk_space,
+                                               rmm::cuda_stream_view{},
+                                               _telemetry_info,
+                                               /*reclaimable_size=*/std::size_t{0});
   }
 
   // True when scan normalization will cast the recorded stored @p carrier to @p target: the same

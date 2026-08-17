@@ -34,6 +34,7 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <data/data_batch_utils.hpp>
+#include <data/reclaim_ledger.hpp>
 #include <helper/type_conversions.hpp>
 #include <io/io_context.hpp>
 #include <op/scan/gpu_ingestible.hpp>
@@ -48,6 +49,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -259,6 +261,7 @@ TEST_CASE("a pinned unfiltered split forwards as a zero-copy view",
   REQUIRE(view.num_columns() == 1);
   REQUIRE(view.column(0).head<std::int64_t>() == pinned_head);  // no D2D copy
   REQUIRE(rep.get_size_in_bytes() > 0);
+  REQUIRE(sirius::reclaimable_size_in_bytes(ro) == 0);  // pinned storage outlives the batch
   REQUIRE(rep.get_writer_event() != nullptr);
 
   e.stream().synchronize();
@@ -314,6 +317,8 @@ TEST_CASE("an owned post-filter result keeps the materializing path",
   auto view = sirius::get_cudf_table_view(ro);
   REQUIRE(view.num_columns() == 1);
   REQUIRE(view.column(0).head<std::int64_t>() != pinned_head);
+  // Owned output declares nothing: it defaults to full reclaimability.
+  REQUIRE(sirius::reclaim_ledger::instance().declared_bytes(ro.get_batch_id()) == std::nullopt);
 
   e.stream().synchronize();
   REQUIRE(copy_column_to_host<std::int64_t>(view.column(0)) == fresh_values);
@@ -334,6 +339,8 @@ TEST_CASE("a fully narrowed pinned split emits freshly restored columns",
   REQUIRE(view.num_columns() == 1);
   REQUIRE(view.column(0).type().id() == cudf::type_id::INT64);
   REQUIRE(static_cast<void const*>(view.column(0).head()) != static_cast<void const*>(pinned_head));
+  // Every byte of the output is a freshly cast column, so all of it is reclaimable.
+  REQUIRE(sirius::reclaimable_size_in_bytes(ro) == ro.get_data()->get_size_in_bytes());
 
   e.stream().synchronize();
   REQUIRE(copy_column_to_host<std::int64_t>(view.column(0)) ==
@@ -365,6 +372,9 @@ TEST_CASE("a mixed narrowed-carrier split casts only the mismatched column",
   REQUIRE(static_cast<void const*>(view.column(0).head()) != static_cast<void const*>(narrow_head));
   REQUIRE(view.column(1).head<std::int64_t>() == native_head);
   REQUIRE(rep.get_size_in_bytes() > 0);
+  // Only the freshly cast column is reclaimable; the forwarded column's storage stays pinned.
+  REQUIRE(sirius::reclaimable_size_in_bytes(ro) > 0);
+  REQUIRE(sirius::reclaimable_size_in_bytes(ro) < rep.get_size_in_bytes());
   REQUIRE(rep.get_writer_event() != nullptr);
 
   e.stream().synchronize();

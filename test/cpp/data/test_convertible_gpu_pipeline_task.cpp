@@ -17,12 +17,19 @@
 #include "catch.hpp"
 #include "operator/operator_test_utils.hpp"
 
+#include <cudf/column/column.hpp>
+#include <cudf/column/column_factories.hpp>
+#include <cudf/table/table_view.hpp>
+
 #include <rmm/cuda_stream.hpp>
+
+#include <cuda_runtime_api.h>
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <data/convertible_gpu_pipeline_task.hpp>
+#include <data/data_batch_utils.hpp>
 #include <exec/multi_index_priority_queue.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <parallel/task.hpp>
@@ -113,6 +120,34 @@ inline size_t get_batch_size(cucascade::data_batch& batch)
 {
   auto ro = batch.to_read_only();
   return ro.get_data()->get_size_in_bytes();
+}
+
+/// Helper: zero-reclaimable view batch over shared column storage, the scan's pinned view-forward
+/// output shape.
+std::shared_ptr<cucascade::data_batch> make_zero_reclaimable_alias_batch(
+  test_env& e, std::vector<int32_t> const& values)
+{
+  auto owned =
+    cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                              static_cast<cudf::size_type>(values.size()),
+                              cudf::mask_state::UNALLOCATED,
+                              sirius::test::operator_utils::default_stream(),
+                              sirius::test::operator_utils::get_resource_ref(*e.gpu_space));
+  cudaMemcpy(owned->mutable_view().head<int32_t>(),
+             values.data(),
+             sizeof(int32_t) * values.size(),
+             cudaMemcpyHostToDevice);
+  std::shared_ptr<cudf::column> column(std::move(owned));
+  std::vector<cudf::column_view> views{column->view()};
+  auto const alloc_size = column->alloc_size();
+  return sirius::make_data_batch_from_view(
+    cudf::table_view{views},
+    std::vector<std::shared_ptr<cudf::column>>{std::move(column)},
+    alloc_size,
+    *e.gpu_space,
+    e.stream(),
+    sirius::telemetry::batch_telemetry_info{},
+    /*reclaimable_size=*/std::size_t{0});
 }
 
 }  // anonymous namespace
@@ -294,7 +329,7 @@ TEST_CASE("convert GPU task to HOST", "[convertible_gpu_pipeline_task]")
   REQUIRE(batch->get_state() == cucascade::batch_state::idle);
 }
 
-TEST_CASE("bytes_in_space returns correct size", "[convertible_gpu_pipeline_task]")
+TEST_CASE("reclaimable_bytes_in_space returns correct size", "[convertible_gpu_pipeline_task]")
 {
   auto& e = env();
 
@@ -314,8 +349,52 @@ TEST_CASE("bytes_in_space returns correct size", "[convertible_gpu_pipeline_task
   auto cd = provider.get_next_convertible(e.gpu_space, false);
   REQUIRE(cd != nullptr);
 
-  REQUIRE(cd->bytes_in_space(e.gpu_space) == batch1_size + batch2_size);
-  REQUIRE(cd->bytes_in_space(e.host_space) == 0);
+  REQUIRE(cd->reclaimable_bytes_in_space(e.gpu_space) == batch1_size + batch2_size);
+  REQUIRE(cd->reclaimable_bytes_in_space(e.host_space) == 0);
+}
+
+TEST_CASE("task with a zero-reclaimable alias converts only the owning batch",
+          "[convertible_gpu_pipeline_task]")
+{
+  auto& e = env();
+
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
+  auto owning = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
+  auto alias = make_zero_reclaimable_alias_batch(e, {4, 5, 6, 7});
+
+  auto owning_size = get_batch_size(*owning);
+
+  auto task = make_test_gpu_task(1, {owning, alias});
+  queue.push(std::move(task));
+
+  sirius::convertible_gpu_pipeline_task_provider provider(queue);
+  auto cd = provider.get_next_convertible(e.gpu_space, false);
+  REQUIRE(cd != nullptr);
+  REQUIRE(cd->reclaimable_bytes_in_space(e.gpu_space) == owning_size);
+
+  auto result = cd->convert({e.host_space}, e.stream(), *e.mgr, true);
+  REQUIRE(result.has_value());
+  REQUIRE(get_batch_tier(*owning) == cucascade::memory::Tier::HOST);
+  // The alias stays GPU-resident and idle: converting it would free nothing.
+  REQUIRE(get_batch_tier(*alias) == cucascade::memory::Tier::GPU);
+  REQUIRE(alias->get_state() == cucascade::batch_state::idle);
+}
+
+TEST_CASE("task holding only zero-reclaimable aliases is never extracted",
+          "[convertible_gpu_pipeline_task]")
+{
+  auto& e = env();
+
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
+  auto alias = make_zero_reclaimable_alias_batch(e, {1, 2, 3, 4});
+  auto task  = make_test_gpu_task(1, {alias});
+  queue.push(std::move(task));
+
+  sirius::convertible_gpu_pipeline_task_provider provider(queue);
+  auto cd = provider.get_next_convertible(e.gpu_space, false);
+  REQUIRE(cd == nullptr);
+  REQUIRE(queue.size() == 1);
 }
 
 TEST_CASE("get_all_convertible extracts all matching tasks", "[convertible_gpu_pipeline_task]")
