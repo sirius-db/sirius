@@ -328,7 +328,7 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
   // (publication may race the estimate), so a wired channel gets the same
   // conservative envelope as a known static filter rather than falling
   // through to the zero-copy view estimate below.
-  bool const dynamic_filter_possible = sirius::decode_filtering_enabled() &&
+  bool const dynamic_filter_possible = sirius::decompression_pushdown_enabled() &&
                                        dynamic_filters != nullptr && !mvcc_keep_mask.has_mask();
   if (row_filter_pending || dynamic_filter_possible) {
     // Once compaction has been measured unprofitable, later batches drop the
