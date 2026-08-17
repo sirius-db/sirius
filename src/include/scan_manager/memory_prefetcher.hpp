@@ -55,33 +55,26 @@ namespace sirius::scan_manager {
  * reconstructs the cudf table from the host layout, and synchronizes its
  * stream before the batch's exclusive lock can be released, so each in-flight
  * conversion needs a thread to drive it. Concurrency across batches therefore
- * scales with num_threads. Each worker owns a private CUDA stream, but that
- * stream carries no copy traffic: the converter only synchronize()s it on
- * entry (a no-op — nothing is ever enqueued on it) and then runs all device
- * allocation + H2D on a stream it acquires internally from the target
- * space's shared round-robin pool, exactly like the scan task's own
- * conversion path. The private stream exists as a stable per-worker key for
- * attaching the admission reservation to the allocation tracker.
+ * scales with num_threads. Each worker's private CUDA stream carries no copy
+ * traffic (the converter allocates and copies on a pool stream it acquires
+ * internally); it exists only as a stable per-worker key for attaching the
+ * admission reservation to the allocation tracker.
  *
  * Races with a consumer are arbitrated by the data_batch state machine: the
  * conversion holds the exclusive (mutable) lock via try_to_mutable (skip on
- * contention, and — since the reader-event barrier — also while a recorded
- * asynchronous reader of the batch is still in flight), and
- * prepare_for_processing re-checks the tier under its own lock.
+ * contention), and prepare_for_processing re-checks the tier under its own
+ * lock.
  *
  * Memory safety: converted batches live in connector queues, which the
  * downgrade executor does NOT scan (it walks data repositories), so
  * prefetched-but-unconsumed bytes cannot be reclaimed under pressure.
- * Admission is therefore reserve-first: a worker takes a GPU reservation for
- * the conversion peak (charging the space's availability immediately), then
- * checks that post-reservation availability still clears the
- * min_free_fraction floor, releasing the reservation and backing off if it
- * does not. Because every worker reserves before it gates, the floor check
- * always sees all concurrent workers' in-flight admissions — the floor holds
- * regardless of num_threads. For the conversion itself the reservation is
- * attached to the worker thread's allocation tracker (as gpu_pipeline_task
- * does for task work), so the conversion's device allocations draw the
- * reservation down instead of being counted a second time on top of it.
+ * Admission must therefore reserve BEFORE gating: the worker reserves the
+ * conversion peak (charging availability immediately) and only then checks
+ * the min_free_fraction floor, so the check sees every concurrent worker's
+ * in-flight admission and the floor holds regardless of num_threads. The
+ * reservation is then attached to the worker thread's allocation tracker so
+ * the conversion's allocations draw it down instead of being counted a
+ * second time on top of it.
  */
 class memory_prefetcher {
  public:
@@ -127,10 +120,8 @@ class memory_prefetcher {
   std::atomic<std::size_t> _batches_prefetched{0};
   std::atomic<std::size_t> _bytes_prefetched{0};
   /// Diagnostic gate counters (logged at stop): why sweeps stopped early.
-  /// _stops_reservation: the peak-size GPU reservation could not be admitted;
-  /// _stops_headroom: the reservation was admitted but post-reservation
-  /// availability fell below the min_free_fraction floor (reservation
-  /// released and sweep stopped).
+  /// _stops_reservation: the peak reservation was refused; _stops_headroom:
+  /// the reservation was charged but the post-charge floor check failed.
   std::atomic<std::size_t> _stops_headroom{0};
   std::atomic<std::size_t> _stops_reservation{0};
   std::atomic<std::size_t> _skips_lock{0};

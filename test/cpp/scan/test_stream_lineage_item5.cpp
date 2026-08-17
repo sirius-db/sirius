@@ -14,37 +14,6 @@
  * limitations under the License.
  */
 
-// Stream-lineage validation of the stream-safety fixes at the Sirius layer:
-//
-//   - gpu_table_representation::release_table(stream) rebinds converter-produced
-//     buffers to the caller's stream, so the Sirius steal path
-//     (scan_operator_input::prepare_for_processing) frees them in the consumer
-//     stream's order instead of on the idle conversion-pool stream.
-//   - The data_batch reader-event API (read_only_data_batch::record_reader_event)
-//     orders reclaims after cross-stream reads: mutable acquisition (to_mutable /
-//     readonly_to_mutable) host-waits for every recorded reader event before
-//     exposing the representation, and try_to_mutable declines while one is
-//     still pending.
-//
-// The hazard, reached through convert_host_fast_to_gpu: converted GPU buffers
-// are allocated on a memory-space pool stream; if their eventual free retires on
-// that idle foreign stream while a consumer stream still has in-flight reads,
-// the cudaMallocAsync pool can hand the block to the next allocation mid-read
-// (use-after-free / corruption). The "sensitivity" test re-creates the pre-fix
-// binding deliberately and proves the harness detects the corruption; the fixed
-// paths must then be deterministically clean.
-//
-// The per-buffer rebind assertions (data / null mask / nested children bound to
-// the release stream) and the mutable-acquisition reader-event barrier are
-// pinned deterministically at the cucascade layer
-// (cucascade/test/cudf/test_release_table_stream.cpp and the reader-event
-// cases in cucascade/test/data/test_data_batch.cpp). This suite covers only
-// what the Sirius layer adds: the real converter registry + memory spaces
-// behind the steal-path stress, its matched sensitivity (non-vacuity) check,
-// the production downgrade discipline (to_mutable + rebind + convert_to), and
-// the filtered-serving record path through owning_table_view's type-erased
-// owner.
-
 #include "catch.hpp"
 #include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
@@ -77,10 +46,6 @@
 
 namespace {
 
-//===----------------------------------------------------------------------===//
-// Fixture: single-GPU memory manager + converter registry (modeled on
-// test/cpp/pipeline/test_batch_lock_utils.cpp's batch_lock_utils_fixture).
-//===----------------------------------------------------------------------===//
 struct stream_lineage_fixture {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
   cucascade::memory::memory_space* gpu0  = nullptr;
@@ -124,8 +89,6 @@ struct stream_lineage_fixture {
   }
 };
 
-/// INT64 column holding value(i) = seed + i, allocated from `space` on `stream`.
-/// When `with_nulls` is set, every 5th row is null (payload still written).
 std::unique_ptr<cudf::column> make_patterned_column(std::size_t num_rows,
                                                     std::int64_t seed,
                                                     bool with_nulls,
@@ -169,7 +132,6 @@ std::unique_ptr<cudf::column> make_patterned_column(std::size_t num_rows,
                                         null_count);
 }
 
-/// STRING column of `num_rows` four-byte strings, allocated from `space` on `stream`.
 std::unique_ptr<cudf::column> make_strings_column_patterned(std::size_t num_rows,
                                                             cucascade::memory::memory_space& space,
                                                             rmm::cuda_stream_view stream)
@@ -210,10 +172,8 @@ std::unique_ptr<cudf::column> make_strings_column_patterned(std::size_t num_rows
                                    rmm::device_buffer{});
 }
 
-/// GPU batch spilled in place to host_data_representation (spilled-cache shape).
-/// Converting it back to gpu_table_representation goes through
-/// convert_host_fast_to_gpu, which allocates the reconstructed buffers on one of
-/// the GPU memory space's pool streams — the binding these tests exercise.
+/// Host-resident batch; converting it back to GPU tier allocates the rebuilt
+/// buffers on a memory-space pool stream — the foreign-stream binding under test.
 std::shared_ptr<cucascade::data_batch> make_host_batch(stream_lineage_fixture& f,
                                                        std::size_t num_rows,
                                                        std::int64_t seed,
@@ -237,7 +197,6 @@ std::shared_ptr<cucascade::data_batch> make_host_batch(stream_lineage_fixture& f
   return batch;
 }
 
-/// Convert a host batch back to the GPU tier in place (convert_host_fast_to_gpu).
 void upload_to_gpu(stream_lineage_fixture& f,
                    const std::shared_ptr<cucascade::data_batch>& batch,
                    rmm::cuda_stream_view stream)
@@ -247,8 +206,7 @@ void upload_to_gpu(stream_lineage_fixture& f,
     sirius::converter_registry::get(), f.gpu0, stream);
 }
 
-/// Mirror of the Sirius steal (sirius_gpu_scan_operator_data.cpp): release the
-/// owned table to `stream` and leave a valid empty placeholder in the batch.
+/// Mirrors the production steal path (sirius_gpu_scan_operator_data.cpp).
 std::unique_ptr<cudf::table> steal_table(const std::shared_ptr<cucascade::data_batch>& batch,
                                          cucascade::memory::memory_space& space,
                                          rmm::cuda_stream_view stream)
@@ -262,8 +220,7 @@ std::unique_ptr<cudf::table> steal_table(const std::shared_ptr<cucascade::data_b
   return stolen;
 }
 
-/// Enqueue ~2 GB of memset traffic on `stream` so work enqueued after it is
-/// guaranteed to still be pending when the host regains control.
+/// Enough traffic that work enqueued after it is still pending when the host regains control.
 void enqueue_blockers(void* scratch, std::size_t scratch_bytes, rmm::cuda_stream_view stream)
 {
   for (int i = 0; i < 32; ++i) {
@@ -271,9 +228,8 @@ void enqueue_blockers(void* scratch, std::size_t scratch_bytes, rmm::cuda_stream
   }
 }
 
-/// Force conversion-pool churn: build small host batches and convert them to the
-/// GPU (each conversion acquires a pool stream and allocates from the async pool,
-/// grabbing any block whose free has already retired).
+/// Conversion-pool churn: each conversion allocates from the async pool,
+/// recycling any block whose free has already retired.
 void hammer_conversions(stream_lineage_fixture& f,
                         rmm::cuda_stream_view stream,
                         int count,
@@ -282,20 +238,15 @@ void hammer_conversions(stream_lineage_fixture& f,
   for (int i = 0; i < count; ++i) {
     auto hb = make_host_batch(f, rows, /*seed=*/0x5A5A5A5A + i, false, false, stream);
     upload_to_gpu(f, hb, stream);
-    // Dropping `hb` here destroys the freshly converted representation and
-    // returns its blocks to the pool, maximizing recycling pressure.
   }
 }
 
-constexpr std::size_t kRows       = 1u << 20;  // 1M rows -> 8 MB INT64 payload
+constexpr std::size_t kRows       = 1u << 20;
 constexpr std::size_t kBytes      = kRows * sizeof(std::int64_t);
 constexpr std::size_t kScratchMiB = 64;
 
 }  // namespace
 
-//===----------------------------------------------------------------------===//
-// 1. Steal-path UAF stress: mid-flight column destruction under pool churn
-//===----------------------------------------------------------------------===//
 TEST_CASE("stolen table tolerates mid-flight column destruction under conversion pressure",
           "[stream_lineage]")
 {
@@ -319,22 +270,17 @@ TEST_CASE("stolen table tolerates mid-flight column destruction under conversion
     auto stolen = steal_table(batch, *f.gpu0, task_stream.view());
     REQUIRE(stolen != nullptr);
 
-    // Enqueue a long blocker, then the read: the D2D copy of the stolen column
-    // is guaranteed to still be pending when the host destroys the column.
     enqueue_blockers(scratch, kScratchMiB << 20, task_stream.view());
     void const* src = stolen->view().column(0).head();
     cudaMemcpyAsync(result_dev, src, kBytes, cudaMemcpyDeviceToDevice, task_stream.value());
 
-    // Destroy the column mid-flight. With release_table's rebind the free is
-    // enqueued on task_stream BEHIND the read; without it (pre-fix) it would
-    // retire instantly on the idle conversion-pool stream and the block could
-    // be recycled by the conversions below while the read is still pending.
+    // Pre-fix, this free retired on the idle conversion-pool stream and the
+    // block could be recycled under the still-pending read.
     {
       auto cols = stolen->release();
       cols[0].reset();
     }
 
-    // Hammer the conversion pool while the read is still blocked.
     hammer_conversions(f, hammer_stream.view(), 3, kRows / 4);
 
     cudaMemcpyAsync(
@@ -353,10 +299,6 @@ TEST_CASE("stolen table tolerates mid-flight column destruction under conversion
   cudaFree(result_dev);
 }
 
-//===----------------------------------------------------------------------===//
-// 2. Sensitivity check: the pre-fix binding (free on an idle foreign stream)
-//    corrupts the very read the fixed path protects.
-//===----------------------------------------------------------------------===//
 TEST_CASE("rebinding a stolen column back to an idle foreign stream reproduces pre-fix corruption",
           "[stream_lineage]")
 {
@@ -370,14 +312,13 @@ TEST_CASE("rebinding a stolen column back to an idle foreign stream reproduces p
 
   std::int64_t const seed = 42;
   rmm::cuda_stream task_stream;
-  rmm::cuda_stream foreign_stream;  // stands in for the idle conversion-pool stream
+  rmm::cuda_stream foreign_stream;
 
   auto batch = make_host_batch(f, kRows, seed, false, false, task_stream.view());
   upload_to_gpu(f, batch, task_stream.view());
   auto stolen = steal_table(batch, *f.gpu0, task_stream.view());
 
-  // Undo release_table's rebind: bind the column's buffers back to an idle
-  // foreign stream, exactly the binding release_table produced pre-fix.
+  // Recreate the pre-fix binding: buffers bound back to an idle foreign stream.
   auto cols = stolen->release();
   cols[0]   = cudf::rebind_stream(std::move(*cols[0]), foreign_stream.view());
 
@@ -385,11 +326,10 @@ TEST_CASE("rebinding a stolen column back to an idle foreign stream reproduces p
   enqueue_blockers(scratch, kScratchMiB << 20, task_stream.view());
   cudaMemcpyAsync(result_dev, src, kBytes, cudaMemcpyDeviceToDevice, task_stream.value());
 
-  // Destroy mid-flight: the free retires immediately on the idle foreign stream.
   cols[0].reset();
 
-  // The next same-stream allocation of the same size grabs the freed block and
-  // poisons it while the read above is still stuck behind the blocker.
+  // A same-stream allocation of the same size recycles the freed block; poison
+  // it while the read above is still stuck behind the blocker.
   rmm::device_buffer reuse{kBytes, foreign_stream.view(), f.gpu0->get_default_allocator()};
   bool const block_reused = reuse.data() == src;
   if (block_reused) {
@@ -408,7 +348,7 @@ TEST_CASE("rebinding a stolen column back to an idle foreign stream reproduces p
   }
 
   if (block_reused) {
-    // The harness must be able to see the pre-fix failure mode, otherwise the
+    // Anti-vacuity: the harness must detect the pre-fix failure mode, or the
     // clean runs in the other tests prove nothing.
     INFO("corrupted elements with pre-fix binding: " << corrupted << " of " << kRows);
     REQUIRE(corrupted > 0);
@@ -421,10 +361,6 @@ TEST_CASE("rebinding a stolen column back to an idle foreign stream reproduces p
   cudaFree(result_dev);
 }
 
-//===----------------------------------------------------------------------===//
-// 3. Reader events make a convert reclaim's mutable acquisition wait for
-//    in-flight reads
-//===----------------------------------------------------------------------===//
 TEST_CASE("reader events order a convert reclaim's mutable acquisition after in-flight reads",
           "[stream_lineage]")
 {
@@ -445,8 +381,6 @@ TEST_CASE("reader events order a convert reclaim's mutable acquisition after in-
   upload_to_gpu(f, batch, setup_stream.view());
   setup_stream.synchronize();
 
-  // Reader: enqueue a slow read of the converted buffers on its own stream and
-  // record a reader event AFTER the reads are enqueued (the API contract).
   {
     auto ro         = batch->to_read_only();
     auto view       = sirius::get_cudf_table_view(ro);
@@ -454,22 +388,15 @@ TEST_CASE("reader events order a convert reclaim's mutable acquisition after in-
     enqueue_blockers(scratch, kScratchMiB << 20, reader_stream.view());
     cudaMemcpyAsync(result_dev, src, kBytes, cudaMemcpyDeviceToDevice, reader_stream.value());
     ro.record_reader_event(reader_stream.view());
-  }  // shared lock dropped with the read still in flight — the pre-fix hazard window
+  }  // read lock dropped with the read still in flight
 
-  // The recorded event must be visible as a pending reader: with the shared
-  // lock already released, only the reader-event barrier can make the
-  // non-blocking mutable path decline. This also pins that the record was not
-  // a silent no-op.
+  // Anti-vacuity: the lock is already gone, so only a pending reader event can
+  // make the non-blocking mutable path decline.
   REQUIRE_FALSE(batch->try_to_mutable().has_value());
 
-  // Reclaimer: mirror the Sirius downgrade discipline (convertible_data_batch.hpp):
-  // acquire mutable access, rebind to the reclaim stream, then convert GPU ->
-  // host in place. With the reader-event barrier, to_mutable must host-block
-  // until the recorded reader work has completed, so the conversion cannot
-  // destroy the old GPU representation under the in-flight read.
+  // The production downgrade discipline (convertible_data_batch.hpp).
   {
     auto mut = batch->to_mutable();
-    // to_mutable returned, so the reader's recorded reads must be complete.
     CHECK(cudaStreamQuery(reader_stream.value()) == cudaSuccess);
     mut.rebind_stream(reclaim_stream.view());
     mut.convert_to<cucascade::host_data_representation>(
@@ -477,8 +404,6 @@ TEST_CASE("reader events order a convert reclaim's mutable acquisition after in-
   }
   REQUIRE(batch->try_to_mutable().has_value());
 
-  // Churn the pool: if the reclaim had freed the GPU buffers early these
-  // allocations would recycle them under the (by then already finished) read.
   hammer_conversions(f, reclaim_stream.view(), 3, kRows / 4);
 
   std::vector<std::int64_t> host_result(kRows);
@@ -497,23 +422,8 @@ TEST_CASE("reader events order a convert reclaim's mutable acquisition after in-
   cudaFree(result_dev);
 }
 
-//===----------------------------------------------------------------------===//
-// 4. Filtered-serving path: the owning_table_view record reaches the batch and
-//    orders a convert reclaim after the enqueued select's reads
-//===----------------------------------------------------------------------===//
-// Replicates the exact filtered scan serving sequence — driving the real
-// ingestibles here would need full scan plans and bind data, so the test runs
-// the same steps against the same APIs the production code uses:
-//   1. gpu_ingestible::materialize_table (cached branch): the batch's view is
-//      served as an owning_table_view whose type-erased owner is the batch's
-//      read_only_data_batch (the read-lock holder).
-//   2. post_filter_and_project: a select-like read of that view is enqueued on
-//      the task stream, then owning_table_view::record_reader_event(stream)
-//      — the call this test pins — records through the type erasure.
-//   3. The owner is dropped mid-flight (parquet reassigns `input` immediately
-//      after the select), releasing the read lock with the reads pending.
-//   4. A reclaim acquires mutable access, whose reader-event barrier waits
-//      for the recorded reads, then converts in place.
+// Driving the real ingestibles would need full scan plans and bind data, so the
+// test replays the filtered serving sequence against the same APIs they use.
 TEST_CASE("filtered serving records reader events through owning_table_view before owner drop",
           "[stream_lineage]")
 {
@@ -535,39 +445,24 @@ TEST_CASE("filtered serving records reader events through owning_table_view befo
   setup_stream.synchronize();
 
   {
-    // Step 1: serve the view under the read lock, owner type-erased into the
-    // owning_table_view — exactly gpu_ingestible::materialize_table.
     auto rbatch = batch->to_read_only();
     auto view   = sirius::get_cudf_table_view(rbatch);
     sirius::op::scan::owning_table_view served{std::move(rbatch), view};
 
-    // Step 2: enqueue a slow select-like read of the served view on the task
-    // stream, then record — after the enqueue, while the owner still holds the
-    // read lock.
     enqueue_blockers(scratch, kScratchMiB << 20, task_stream.view());
     void const* src = served.view().column(0).head();
     cudaMemcpyAsync(result_dev, src, kBytes, cudaMemcpyDeviceToDevice, task_stream.value());
     served.record_reader_event(task_stream.view());
 
-    // Step 3: drop the owner mid-flight, releasing the read lock — the
-    // parquet reassignment shape.
     served.drop();
   }
 
-  // Non-vacuity: the record must reach the underlying batch through the
-  // type-erased owner. The read lock is gone, so only a pending reader event
-  // can make the non-blocking mutable path decline here. If the pass-through
-  // silently no-ops (e.g. the owner concept stops matching
-  // read_only_data_batch), this fails immediately.
+  // Anti-vacuity: the read lock is already gone, so only a reader event
+  // recorded through the type-erased owner can make this decline.
   REQUIRE_FALSE(batch->try_to_mutable().has_value());
 
-  // Step 4: reclaim through the production downgrade discipline. The
-  // reader-event barrier makes to_mutable host-block until the recorded reads
-  // have completed, so the conversion cannot destroy the old GPU
-  // representation under the still-pending select.
   {
     auto mut = batch->to_mutable();
-    // to_mutable returned, so the select-like read must be complete.
     CHECK(cudaStreamQuery(task_stream.value()) == cudaSuccess);
     mut.rebind_stream(reclaim_stream.view());
     mut.convert_to<cucascade::host_data_representation>(
@@ -575,8 +470,6 @@ TEST_CASE("filtered serving records reader events through owning_table_view befo
   }
   REQUIRE(batch->try_to_mutable().has_value());
 
-  // Churn the pool: had the reclaim freed the GPU buffers early, these
-  // allocations would have recycled them under the still-pending read.
   hammer_conversions(f, reclaim_stream.view(), 3, kRows / 4);
 
   std::vector<std::int64_t> host_result(kRows);

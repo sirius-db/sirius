@@ -60,11 +60,6 @@ concept no_alloc_materializable = requires(Owner& owner) {
   { (*owner).release() } -> std::same_as<std::vector<std::unique_ptr<cudf::column>>>;
 };
 
-/**
- * @brief An owner that tracks reader events on the storage behind the view
- *        (canonically @c cucascade::read_only_data_batch, whose read lock is
- *        what keeps a cached batch alive while the view is consumed).
- */
 template <typename Owner>
 concept reader_event_recording =
   requires(Owner const& owner, rmm::cuda_stream_view stream) { owner.record_reader_event(stream); };
@@ -159,8 +154,6 @@ class my_view {
     return _model->materialize(_selection, stream, mr);
   }
 
-  /// Forward a reader-event record to the type-erased owner. No-op unless the
-  /// owner is @ref reader_event_recording.
   void record_reader_event(rmm::cuda_stream_view stream) { _model->record_reader_event(stream); }
 
  private:
@@ -174,7 +167,6 @@ class my_view {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) = 0;
 
-    /// Default no-op for owners that do not track reader events.
     virtual void record_reader_event(rmm::cuda_stream_view) {}
   };
 
@@ -331,17 +323,11 @@ class owning_table_view {
   /// view first if necessary. Throws on out-of-range or duplicate positions.
   void select_columns(std::span<const std::size_t> positions) const;
 
-  /// Record on the data owner behind the view that reads of the exposed view
-  /// have been ENQUEUED on @p stream (see
-  /// cucascade::read_only_data_batch::record_reader_event). Call after
-  /// enqueuing the reads and before this handle — whose owner may hold the
-  /// read lock keeping a cached batch alive — is dropped or reassigned, so a
-  /// later reclaim of the batch (which must first acquire mutable access, and
-  /// therefore waits on every recorded reader event) is ordered after the
-  /// reads. No-op for owned-table and empty states, and for owners that do
-  /// not track reader events. Never syncs on success; if event registration
-  /// fails after the reads were enqueued, the owner synchronizes @p stream
-  /// before propagating the error.
+  /// Record that reads of the exposed view have been ENQUEUED on @p stream
+  /// (see cucascade::read_only_data_batch::record_reader_event). Must be
+  /// called after enqueuing the reads and before this handle is dropped or
+  /// reassigned, so a reclaim of the backing cached batch is ordered after
+  /// them. No-op unless the owner tracks reader events.
   void record_reader_event(rmm::cuda_stream_view stream) const;
 
   /// Realize a view state into an owned table. No-op if already materialized or

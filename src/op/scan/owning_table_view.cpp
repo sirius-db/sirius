@@ -109,8 +109,6 @@ void owning_table_view::select_columns(std::span<const std::size_t> positions) c
 
 void owning_table_view::record_reader_event(rmm::cuda_stream_view stream) const
 {
-  // Only the view state can be backed by an external owner (e.g. a cached
-  // batch's read-lock accessor); an owned table has no external reclaimer.
   if (auto* view = std::get_if<std::unique_ptr<detail::my_view>>(&_state)) {
     (*view)->record_reader_event(stream);
   }

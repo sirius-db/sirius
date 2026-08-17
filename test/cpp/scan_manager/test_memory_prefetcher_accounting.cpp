@@ -14,34 +14,6 @@
  * limitations under the License.
  */
 
-// Admission-accounting gates for the memory prefetcher's reserve-then-gate
-// admission path. Two pre-fix defects were silent:
-//
-//   - gate-then-reserve overshoot: the min_free_fraction headroom gate ran
-//     BEFORE make_reservation_or_null, so num_threads workers could pass the
-//     gate concurrently against the same headroom and overshoot the admission
-//     budget by up to num_threads x (breaching the free floor that protects
-//     pipeline task reservations from unreclaimable prefetched bytes);
-//   - decorative reservation: the conversion allocated through the space's
-//     default allocator while the admission reservation sat unused, so the
-//     space was transiently charged reserved-peak + actual-allocation
-//     (double count) for every in-flight prefetch.
-//
-// Gates here: admission keeps the floor including concurrent workers'
-// in-flight reservations; the attached reservation genuinely draws down
-// during conversion (space charged the peak ONCE, never peak + actual); the
-// converted table round-trips through the per-worker-stream + tracker-attach
-// path bit-exactly; and a non-admittable reservation backs the sweep off
-// cleanly (_stops_reservation) without leaking arenas.
-//
-// The environment mirrors production accounting: Sirius configures per-THREAD
-// allocation tracking (sirius_config.cpp: per_stream_reservation = false), so
-// the builder here calls track_reservation_per_stream(false). The prefetcher's
-// tracker attach keys on the worker's private stream but the tracker resolves
-// per thread — with the cucascade-default per-STREAM tracking the conversion's
-// allocations (made on a round-robin pool stream) would bypass the arena
-// entirely.
-
 #include "utils/log_test_utils.hpp"
 
 #include <cudf/column/column.hpp>
@@ -89,11 +61,6 @@ namespace {
 
 constexpr std::size_t MiB = 1ull << 20;
 
-/// Per-test environment: a fresh reservation manager over a 512MB GPU space
-/// (reservation limit 384MB = 0.75 x capacity) with per-THREAD allocation
-/// tracking, matching the production Sirius configuration the prefetcher's
-/// tracker attach relies on. Fresh per test case so every case starts from an
-/// empty space and exact availability arithmetic.
 struct prefetcher_env {
   static constexpr std::size_t gpu_capacity = 512 * MiB;
   static constexpr double limit_ratio       = 0.75;
@@ -114,7 +81,9 @@ struct prefetcher_env {
       .set_per_numa_region_capacity(1ull << 30)
       .use_gpu_id_as_host_id()
       .set_reservation_fraction_per_numa_region(limit_ratio)
-      .track_reservation_per_stream(false);  // production default: per-thread tracking
+      // Per-thread tracking, the production default: with per-stream tracking
+      // the conversion's allocations would bypass the attached reservation.
+      .track_reservation_per_stream(false);
 
     auto space_configs = builder.build();
     mgr =
@@ -128,11 +97,8 @@ struct prefetcher_env {
   rmm::cuda_stream_view stream() { return conv_stream.view(); }
 };
 
-/// HOST-resident single-INT32-column batch of @p n_rows rows with the
-/// deterministic per-row pattern seed + 7*i — the shape a pinned scan's
-/// per-query split arrives in, which the prefetcher upgrades to GPU tier.
-/// Built GPU-first then converted down, like the pin path; the GPU staging
-/// is fully released before returning so it does not perturb availability.
+/// Host-resident INT32 batch with pattern seed + 7*i. The GPU staging is fully
+/// released before returning so it does not perturb availability arithmetic.
 std::shared_ptr<cucascade::data_batch> make_host_batch(prefetcher_env& e,
                                                        std::size_t n_rows,
                                                        int32_t seed)
@@ -167,8 +133,6 @@ std::shared_ptr<cucascade::data_batch> make_host_batch(prefetcher_env& e,
   return cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(host_repr));
 }
 
-/// Serves its scripted batches in order, then ends the stream — the minimal
-/// provider drain_cached_provider needs to load a connector.
 struct scripted_provider final : databatch_provider {
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
   std::size_t served{0};
@@ -181,8 +145,8 @@ struct scripted_provider final : databatch_provider {
   }
 };
 
-/// Connector pre-loaded with resident splits over @p batches (and closed —
-/// still sweepable: the prefetcher only exits once closed AND drained).
+/// Pre-loaded and closed — still sweepable: the prefetcher only exits once a
+/// connector is closed AND drained.
 std::shared_ptr<split_connector> make_loaded_connector(
   const std::vector<std::shared_ptr<cucascade::data_batch>>& batches)
 {
@@ -221,8 +185,7 @@ bool wait_until(Pred&& pred, std::chrono::milliseconds timeout)
   return pred();
 }
 
-/// The gate counters logged once by memory_prefetcher::stop() — the only
-/// surface they are readable through (no accessors on the class).
+/// The stop() log line is the only surface the gate counters are readable through.
 struct stop_counters {
   bool found{false};
   std::size_t headroom{0};
@@ -248,29 +211,15 @@ stop_counters parse_stop_counters(const std::vector<sirius::test::recording_log_
 
 }  // namespace
 
-//===----------------------------------------------------------------------===//
-// 1. Admission floor invariant under concurrent workers
-//===----------------------------------------------------------------------===//
-
 TEST_CASE("prefetcher admission floor holds against concurrent workers",
           "[memory_prefetcher][scan_manager]")
 {
   prefetcher_env e;
   sirius::test::scoped_recording_log_sink log{"info"};
 
-  // Geometry: three 90MB host batches into a 512MB space with a 0.9 floor
-  // over the 384MB reservation limit (min_free_bytes = 345.6MB). ONE
-  // admission clears the floor (512-90 = 422 >= 345.6); TWO do not
-  // (512-180 = 332 < 345.6). The old gate-then-reserve order let all three
-  // workers pass the same headroom check concurrently (available 512 >=
-  // 90+345.6 for each of them) and convert up to 3 batches; reserve-first
-  // makes every worker's floor check see the others' in-flight reservations,
-  // so exactly one batch may ever be admitted, on every interleaving.
-  // (90MB, not more: the worst concurrent charge — one converted batch plus
-  // all three workers' probing reservations, 4 x 90 = 360MB — must stay
-  // clearly under the 384MB reservation limit so refusals are always the
-  // floor's, never the reservation's.)
-  constexpr std::size_t batch_rows = (90ull << 20) / sizeof(int32_t);  // 90MB of int32
+  // One 90MB admission clears the 0.9 floor, two do not. Pre-fix (gate before
+  // reserve) all three workers could pass the same headroom check and convert.
+  constexpr std::size_t batch_rows = (90ull << 20) / sizeof(int32_t);
   constexpr double min_free_fraction{0.9};
 
   std::vector<std::shared_ptr<cucascade::data_batch>> batches{make_host_batch(e, batch_rows, 1),
@@ -283,8 +232,7 @@ TEST_CASE("prefetcher admission floor holds against concurrent workers",
   auto const avail_before = e.gpu_space->get_available_memory();
   auto const batch_bytes  = batch_size_bytes(*batches[0]);
 
-  // Geometry sanity: this test only means something if exactly one admission
-  // fits above the floor.
+  // Anti-vacuity: the test only means something if exactly one admission fits.
   REQUIRE(avail_before - batch_bytes >= floor_bytes);
   REQUIRE(avail_before - 2 * batch_bytes < floor_bytes);
 
@@ -300,53 +248,38 @@ TEST_CASE("prefetcher admission floor holds against concurrent workers",
     memory_prefetcher prefetcher(cfg, {connector}, e.gpu_space);
     REQUIRE(
       wait_until([&] { return prefetcher.batches_prefetched() >= 1; }, std::chrono::seconds(60)));
-    // Grace period: give the other two workers every chance to (incorrectly)
-    // admit on the same headroom before we look.
+    // Give the other two workers every chance to (incorrectly) admit on the
+    // same headroom before looking.
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     prefetcher.stop();
 
-    // The floor admits exactly one batch, no matter how the workers interleave.
     REQUIRE(prefetcher.batches_prefetched() == 1);
     REQUIRE(prefetcher.bytes_prefetched() <= avail_before - floor_bytes);
     counters = parse_stop_counters(log.records());
   }
 
-  // Steady state: the floor held, nothing reserved is left behind.
   REQUIRE(e.gpu_space->get_available_memory() >= floor_bytes);
   REQUIRE(e.gpu_space->get_active_reservation_count() == 0);
 
-  // Exactly one batch reached GPU tier; the other two are still host-resident.
   std::size_t gpu_resident = 0;
   for (auto const& batch : batches) {
     if (batch_tier(*batch) == cucascade::memory::Tier::GPU) { ++gpu_resident; }
   }
   REQUIRE(gpu_resident == 1);
 
-  // Refusals took the headroom path: the peak reservation itself is always
-  // admittable in this geometry (worst concurrent charge 4x90 = 360MB, under
-  // the 384MB limit), so the workers that lost the race charged a
-  // reservation, saw the floor fail post-charge, and released it
-  // (_stops_headroom) rather than failing the reservation.
+  // The peak reservation is always admittable here (worst concurrent charge
+  // 4 x 90MB, under the 384MB limit), so losing workers must have stopped on
+  // the post-charge floor check, never on the reservation.
   REQUIRE(counters.found);
   REQUIRE(counters.headroom >= 1);
   REQUIRE(counters.reservation == 0);
 }
-
-//===----------------------------------------------------------------------===//
-// 2. Reservation draw-down: conversion is charged once, never peak + actual
-//===----------------------------------------------------------------------===//
 
 TEST_CASE("prefetcher conversion draws down its reservation instead of double-counting",
           "[memory_prefetcher][scan_manager]")
 {
   prefetcher_env e;
 
-  // One 128MB batch, floor low enough to never interfere. With the
-  // reservation attached to the worker's allocation tracker, the conversion's
-  // device allocations land inside the reserved arena: total charged stays at
-  // the 128MB peak throughout. The old decorative reservation charged
-  // peak + actual (~256MB) for the whole copy — far below the threshold the
-  // sampler enforces here.
   constexpr std::size_t batch_rows = 32ull << 20;  // 128MB of int32
   constexpr std::size_t slack      = 16 * MiB;     // alignment + converter temps
 
@@ -363,10 +296,8 @@ TEST_CASE("prefetcher conversion draws down its reservation instead of double-co
   cfg.poll_interval_ms  = 1;
   cfg.drain_quiet_ms    = 50;
 
-  // Availability sampler: runs for the entire prefetcher lifetime and records
-  // the minimum. The double-count window under the old code spanned the whole
-  // H2D copy (milliseconds), so a tight loop cannot miss it; under the fix the
-  // minimum provably never goes below avail_before - peak - slack.
+  // Availability sampler. The pre-fix double-count window spanned the whole
+  // H2D copy (milliseconds), so a tight sampling loop cannot miss it.
   std::atomic<bool> sampling{true};
   std::atomic<std::size_t> min_available{avail_before};
   std::thread sampler([&] {
@@ -389,23 +320,16 @@ TEST_CASE("prefetcher conversion draws down its reservation instead of double-co
   sampling.store(false, std::memory_order_relaxed);
   sampler.join();
 
-  // No transient double count: at no point was the space charged more than
-  // the admission peak (plus alignment/temp slack). Pre-fix this dipped to
-  // roughly avail_before - 2*batch_bytes for the whole conversion.
+  // Pre-fix (decorative reservation) this dipped to roughly
+  // avail_before - 2 * batch_bytes for the whole conversion.
   REQUIRE(min_available.load() + slack >= avail_before - batch_bytes);
 
-  // Steady state: the space is charged for the converted batch exactly once,
-  // and the reservation arena was fully detached and released.
   auto const avail_after = e.gpu_space->get_available_memory();
   REQUIRE(avail_before - avail_after <= batch_bytes + slack);
   REQUIRE(avail_before - avail_after + slack >= batch_bytes);
   REQUIRE(e.gpu_space->get_active_reservation_count() == 0);
   REQUIRE(e.gpu_space->get_total_reserved_memory() == 0);
 }
-
-//===----------------------------------------------------------------------===//
-// 3. Data-path correctness through the per-worker-stream + tracker-attach path
-//===----------------------------------------------------------------------===//
 
 TEST_CASE("prefetched batch converts to GPU tier bit-exactly and reads back on another stream",
           "[memory_prefetcher][scan_manager]")
@@ -433,15 +357,11 @@ TEST_CASE("prefetched batch converts to GPU tier bit-exactly and reads back on a
     REQUIRE(prefetcher.batches_prefetched() == 1);
   }
 
-  // The batch was upgraded in place: GPU tier, placed in the target space.
   auto ro = batches[0]->try_to_read_only();
   REQUIRE(ro);
   REQUIRE(ro->get_current_tier() == cucascade::memory::Tier::GPU);
   REQUIRE(ro->get_data() != nullptr);
 
-  // Read the converted table back on a stream the conversion never saw —
-  // the conversion synchronized before releasing the batch lock, so the
-  // contents must be stable and bit-exact from any stream.
   auto const view = ro->get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
   REQUIRE(view.num_columns() == 1);
   REQUIRE(static_cast<std::size_t>(view.num_rows()) == n_rows);
@@ -463,21 +383,15 @@ TEST_CASE("prefetched batch converts to GPU tier bit-exactly and reads back on a
   }
 }
 
-//===----------------------------------------------------------------------===//
-// 4. Reservation-refused back-off (_stops_reservation), no crash, no leak
-//===----------------------------------------------------------------------===//
-
 TEST_CASE("prefetcher backs off cleanly when the peak reservation cannot be admitted",
           "[memory_prefetcher][scan_manager]")
 {
   prefetcher_env e;
   sirius::test::scoped_recording_log_sink log{"info"};
 
-  // 360MB of ballast against the 384MB reservation limit: a 32MB peak
-  // reservation can never be admitted (360+32 > 384), so every sweep stops on
-  // the make_reservation_or_null path (_stops_reservation) before the floor
-  // is even consulted. The sweep must keep backing off without converting,
-  // crashing, or leaking a reservation arena.
+  // 360MB of ballast against the 384MB reservation limit: the 32MB peak
+  // reservation can never be admitted, so every sweep stops on the
+  // reservation path before the floor is even consulted.
   constexpr std::size_t batch_rows   = 8ull << 20;  // 32MB of int32
   constexpr std::size_t ballast_size = 360 * MiB;
 
@@ -506,12 +420,10 @@ TEST_CASE("prefetcher backs off cleanly when the peak reservation cannot be admi
     counters = parse_stop_counters(log.records());
   }
 
-  // Refusals took the reservation path, never the (post-charge) headroom path.
   REQUIRE(counters.found);
   REQUIRE(counters.reservation >= 1);
   REQUIRE(counters.headroom == 0);
 
-  // Nothing converted, nothing charged, nothing leaked.
   REQUIRE(batch_tier(*batches[0]) == cucascade::memory::Tier::HOST);
   REQUIRE(e.gpu_space->get_available_memory() == avail_before);
   REQUIRE(e.gpu_space->get_active_reservation_count() == 0);
