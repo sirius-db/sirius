@@ -257,6 +257,13 @@ insert_delta_row_group complete_delta_row_group(
       auto const array_size  = static_cast<std::size_t>(type.array_size());
       auto const& child_type = type.array_child();
 
+      // Only a fixed-width scalar child has a staging and decode path.
+      if (!child_type.is_fixed_width()) {
+        throw_capture("ARRAY column " + std::to_string(col) + " row group " +
+                      std::to_string(rg_index) + ": child type " + child_type.to_string() +
+                      " is not a fixed-width scalar (only fixed-width ARRAY children are supported)");
+      }
+
       insert_delta_column col_plan;
       col_plan.column_id = col;
       col_plan.is_array  = true;

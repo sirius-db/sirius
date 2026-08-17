@@ -665,3 +665,26 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
   compare_gpu_vs_cpu("SELECT a FROM t WHERE k >= 998 ORDER BY k;");
   run_ok("CALL unpin_table('t');");
 }
+
+TEST_CASE_METHOD(PinMvccInsertFixture,
+                 "mvcc guards: an ARRAY with a non-fixed-width child is refused",
+                 "[integration][gpu_execution][pin_table_mvcc_insert][array]")
+{
+  // A VARCHAR[N] child is stored as StandardColumnData too, so it passes the
+  // child cast and would silently stage zero-byte descriptors. Only fixed-width
+  // scalar children have a decoder path.
+  run_ok(
+    "CREATE TABLE t AS SELECT range::INTEGER AS k, "
+    "CAST([range::VARCHAR, 'x', 'y'] AS VARCHAR[3]) AS a FROM range(100);");
+  run_ok("CHECKPOINT;");
+
+  auto refused = con->Query("CALL pin_table(format='duckdb', name='t', tier='gpu');");
+  REQUIRE(refused);
+  REQUIRE(refused->HasError());
+  REQUIRE_THAT(refused->GetError(), Catch::Contains("fixed-width"));
+
+  // Pinning the scalar subset (leaving the ARRAY out) still works.
+  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu', cols=['k']);");
+  compare_gpu_vs_cpu("SELECT count(*), sum(k) FROM t;");
+  run_ok("CALL unpin_table('t');");
+}

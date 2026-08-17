@@ -1013,6 +1013,25 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
   auto keep            = resolve_pin_kept_indices(schema_names, cols);
   auto const canonical = storage.GetAttached().GetStorageManager().GetDBPath();
 
+  // Fixed-size ARRAY columns pin only when their child is a fixed-width scalar.
+  // DuckDB stores such a child as a flat StandardColumnData the delta and decoder
+  // paths can stage. A varchar or nested child (VARCHAR[N], ARRAY of ARRAY/STRUCT)
+  // has no such path, and a varchar child passes the StandardColumnData cast that
+  // would stage zero-byte descriptors. Decline it up front so the error names the
+  // column instead of surfacing deep in metadata decoding.
+  for (auto col : keep) {
+    auto const type = sirius::from_duckdb(schema_types[col]);
+    if (type.is_array() && !type.array_child().is_fixed_width()) {
+      throw InvalidInputException(
+        "pin_table: column '%s' of table '%s' is an ARRAY with a %s child, which duckdb-native "
+        "pins do not support (only fixed-width scalar children); pin a column subset without it "
+        "(cols=[...])",
+        schema_names[col],
+        table_ref,
+        type.array_child().to_string());
+    }
+  }
+
   // Update chains version values in place, invisibly to the DELETE
   // keep-masks — a pin would serve stale values to every query until the
   // chains are folded away. Refuse; CHECKPOINT folds the chains into the
