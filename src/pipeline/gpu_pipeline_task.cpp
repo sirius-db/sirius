@@ -640,6 +640,21 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
 
   if (output_data) { publish_output(*output_data, stream); }
 
+  // Quiesce the task stream on the SUCCESS path (freed-while-read corruption
+  // fix; the executor's abnormal exits get the symmetric quiesce in the
+  // error-path teardown fix, PR #1546). Everything that runs after this return
+  // — output_data and its read locks dying below, ~gpu_pipeline_task's
+  // unsubscribe chain, mark_task_completed -> update_pipeline_status ->
+  // finalize_operator (which frees cross-task device state: hash-table slots,
+  // build_table read locks, sort partition boundaries) — could otherwise
+  // destroy owners of device memory while sink-enqueued kernels/copies were
+  // still in flight on this stream. The freed VA rebinds to another stream's
+  // fresh allocation and the straggler scribbles it: torn string geometry,
+  // the RF2-window corruption class. Nearly free: the stream was synchronized
+  // after every operator execute; only the sink's enqueues (if any) are
+  // outstanding here.
+  stream.synchronize();
+
   // The input pipelineable_operator_data (with its _read_only_data_batches) was destroyed
   // when compute_task replaced operator_input_output_data, releasing all shared locks.
 }

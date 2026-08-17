@@ -30,6 +30,7 @@
 #include <sirius_context.hpp>
 
 // cudf
+#include <cudf/column/column_stream.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
@@ -131,7 +132,19 @@ std::unique_ptr<cudf::table> normalize_physical_schema(std::unique_ptr<cudf::tab
     auto const restoring = can_restore_to(actual, target);
     auto const narrowing = has_explicit_physical_schema && can_narrow_to(actual, target);
     if (actual == target || (!restoring && !narrowing)) { continue; }
-    columns[column_idx] = cudf::cast(columns[column_idx]->view(), target, stream, mr);
+    // The cast ENQUEUES its transform on `stream` and returns; assigning over
+    // the slot would destroy the source column immediately, freeing its
+    // buffers on THEIR dealloc stream. For a stolen per-query table (columns
+    // moved out of a wrapper batch another task produced) that stream is not
+    // `stream`, so the free executes mid-cast and the pool reuses the VA under
+    // the running transform (memcheck: 15 use-after-free hits, all at this
+    // site). Rebind the source's deallocation onto `stream` before dropping it
+    // so the free queues behind the cast; the handoff that delivered the batch
+    // already ordered `stream` after the producer's writes.
+    auto source         = std::move(columns[column_idx]);
+    columns[column_idx] = cudf::cast(source->view(), target, stream, mr);
+    source              = cudf::rebind_stream(std::move(*source), stream);
+    source.reset();
     if (observer != nullptr) {
       if (narrowing) {
         observer->record_compressed_materialization_scan_columns_narrowed();

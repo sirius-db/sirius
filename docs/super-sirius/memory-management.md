@@ -169,6 +169,85 @@ On allocation failure:
 - Used for GPU↔CPU transfers and scan caching
 - Configured via `sirius.yaml` (see [Configuration](configuration.md))
 
+## Stream-Ordering Discipline (Owner-Death Audit)
+
+Device memory in Sirius is freed **stream-ordered** (RMM async pool): a free enqueued on
+stream S executes when S reaches it, and the pool may rebind the virtual address to a new
+allocation immediately after. The invariant that keeps this safe:
+
+> **No owner of device memory may die (free / pool return / dealloc-stream rebind) until every
+> stream that may still read or write that memory is ordered before the free.**
+
+Batches are handed off *event-ordered, not host-synced* (writer events), and read locks are
+**host-scoped** — a consumer can enqueue kernels and drop its lock with device work still in
+flight. Violations of the invariant produce the "freed-while-read" corruption class: torn
+GPU→HOST conversions, scribbled string/selection geometry, wild-pointer MMU faults, and cuco
+livelocks — almost always under concurrency + memory pressure, because the freed VA must be
+rebound quickly for the stale access to observe garbage.
+
+Three ordering mechanisms carry the invariant:
+
+1. **Writer-event wait at conversion reads** (cucascade `ff9c5e5`): every GPU-reading
+   representation converter waits the source's writer event on the conversion stream before
+   reading a byte (device-sync fallback for event-less representations).
+2. **Reader-fencing `rebind_stream`** (cucascade `e19f5d3`): `gpu_table_representation` tracks
+   the stream its buffers are bound to; `rebind_stream(new_stream)` records an event on the
+   previously-bound stream and fences the adopting stream on it *before* moving the
+   deallocation binding. The engine's two rebind sites — `convertible_data_batch::convert`
+   (downgrade) and `lock_or_prepare_batch` (consumer acquire) — thereby chain a
+   producer → consumer(s) → downgrade lineage that orders the eventual free after every
+   enqueued reader. Event waits are recorded-in-the-past, so no cycles are possible; cost is
+   one event record+wait per batch handoff.
+3. **Quiesce before owner death** at task teardown: the pipeline task synchronizes its stream
+   after `publish_output` on the success path (this repo); the executor's abnormal exits get
+   the symmetric quiesce in PR #1546.
+
+### Site census
+
+Every site where a device-memory owner dies, and the guarantee that protects it:
+
+| # | Site | Ordering guarantee |
+|---|------|--------------------|
+| 1 | Reservation-adaptor `deallocate` → upstream `cudaFreeAsync` | Stream-ordered on the buffer's bound stream (RMM/cudaMallocAsync semantics); reader side covered by the rebind lineage (cucascade `e19f5d3`) |
+| 2 | Downgrade convert: `convertible_data_batch::convert` rebind + `convert_to` + free | `rebind_stream` reader fence + writer-event wait + cucascade `install_converted_representation`'s conversion-stream sync |
+| 3 | Consumer-side opportunistic rebind (`lock_or_prepare_batch`) | `rebind_stream` reader fence enrolls each consumer stream into the lineage |
+| 4 | Task success teardown (locks drop; `finalize_operator` frees cross-task state: hash-table slots, build-batch locks, sort partition boundaries) | Success-path `stream.synchronize()` after `publish_output` |
+| 5 | Task failure teardown (executor catch paths) | exc-stream quiesce on every abnormal exit (PR #1546) |
+| 6 | Scan locals destroyed at `execute` end (materialized tables, staging buffers) | Scan-stream syncs before every owner-death point (PR #1546) |
+| 7 | Scan narrow/restore cast (`normalize_physical_schema`) | Source column's dealloc rebound onto the cast stream before it drops (this repo) |
+| 8 | Mid-execute exception unwinds (aggregate catch resets, evaluator temporaries) | Same-stream discipline: buffers allocated + used + freed on one stream; async-pool frees are stream-ordered behind that stream's own kernels |
+| 9 | Compression (simpatico) pool-stream decode buffers | `sync_all()` before every unwind/return; column streams re-pointed only after the sync |
+| 10 | Dynamic-filter zone/replica teardown | Device guard + single-owner lifetime (error-path teardown: low-exposure watch item) |
+| 11 | Repository/registry teardown (`clear_all_repositories`, context terminate) | `cudaDeviceSynchronize()` per GPU before scan-manager reset + registry clear |
+| 12 | Memory manager / pool destruction | `cudaDeviceSynchronize` before restoring device MRs (manager dtor) |
+| 13 | `exclusive_stream_pool` stream recycling without sync | Safe by stream serialization: the next task's work on a stream queues after the old task's |
+| 14 | Host-pinned pool returns (`fixed_size_host_memory_resource`, NUMA `cudaFreeHost`) | Callers must quiesce before release; converter seams do; `small_pinned` MR has event-based reuse fencing — watch item (no in-pool fence in `fixed_size`) |
+| 15 | IO slot / bounce-buffer returns (uring detached H2D, REST reactor slots) | Event-synchronized on the event-based path and at shutdown; detached path pre-copy-complete by protocol — watch item |
+| 16 | Quarantine drain (diagnostics, cucascade `7beba59`) | `cudaEventSynchronize` on the free-stream event before the upstream release |
+
+Watch items (10/14/15) have no strike evidence; the class-level backstop below covers them in
+diagnostic runs.
+
+### Diagnosing freed-while-read suspects
+
+Two env-gated cucascade debug modes (zero cost when unset):
+
+- `SIRIUS_POISON_FREES=1` — fill freed device regions with `0xEE` (stream-ordered) before the
+  upstream free. The first actor to *read* freed memory then computes deterministic
+  `0xEE…`-derived addresses and faults immediately: with
+  `CUDA_ENABLE_COREDUMP_ON_EXCEPTION=1`, the coredump captures the offending kernel
+  red-handed instead of a downstream victim minutes later.
+- `SIRIUS_QUARANTINE_FREES=N` — defer each upstream free until N subsequent deallocations
+  have occurred **and** an event recorded on the freeing stream has completed. Strikes that
+  vanish under quarantine confirm the freed-while-in-use class; also usable as a safety
+  valve while a root cause is hunted.
+
+Gate scripts (see `bench/sf1000-repro/`): `verify-memcheck-sf1.sh` runs the whole concurrent
+workload under `compute-sanitizer` against an SF1-sized pressure config that reproduces the
+SF1000 churn regime in minutes; `verify-poison-concurrent.sh` runs a full-scale concurrent
+poison gate with coredumps armed. A **sequential** poison gate is insufficient — it passes on
+binaries that still strike under concurrency.
+
 ## Key Files
 
 | File | Purpose |
