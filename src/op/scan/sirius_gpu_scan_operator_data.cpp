@@ -316,7 +316,21 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
     bool const stolen = stolen_table != nullptr || stolen_table_consumed;
     return stolen ? batch_bytes : 2 * batch_bytes;
   }
-  if (row_filter_pending) {
+  // A dynamic-filter channel is wired to this operator whenever it sits
+  // downstream of a join build, regardless of whether that build has
+  // published yet — dynamic_filters is stamped at plan-conversion time, so
+  // it is a stable pre-decode fact, unlike has_filters(). prepare_for_processing
+  // attaches a fresh per-batch membership-probe snapshot for ANY published
+  // filter right before decode, whether or not the scan also carries a
+  // static row filter: each attached probe decodes its key column and
+  // allocates a BOOL8 result mask, on top of whatever compaction it drives.
+  // Reservation cannot know in advance whether a probe will actually attach
+  // (publication may race the estimate), so a wired channel gets the same
+  // conservative envelope as a known static filter rather than falling
+  // through to the zero-copy view estimate below.
+  bool const dynamic_filter_possible = sirius::decode_filtering_enabled() &&
+                                       dynamic_filters != nullptr && !mvcc_keep_mask.has_mask();
+  if (row_filter_pending || dynamic_filter_possible) {
     // Once compaction has been measured unprofitable, later batches drop the
     // row selection and decode full width — keep the full-width envelope.
     bool const unprofitable = decode_selection_unprofitable &&
