@@ -2260,6 +2260,7 @@ cache_entry_info cache_entry_info::from(const op::scan::ingestible_table_info& i
     ci.catalog_name = d->catalog_name;
     ci.schema_name  = d->schema_name;
     ci.table_name   = d->table_name;
+    ci.table_oid    = d->table_oid;
     ci.column_ids   = d->column_ids;
     ci.names        = aligned_column_names(d->names, d->column_ids);
   }
@@ -2288,15 +2289,17 @@ std::vector<std::size_t> cache_entry_info::can_serve_with_columns(
     return column_projection_for(p->column_ids);
   }
   if (auto const* d = dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&other)) {
-    if (!matches_duckdb_table(d->catalog_name, d->schema_name, d->table_name)) { return {}; }
+    if (!matches_duckdb_table(d->catalog_name, d->schema_name, d->table_name, d->table_oid)) {
+      return {};
+    }
     return column_projection_for(d->column_ids);
   }
   return {};
 }
 
-bool cache_entry_info::matches_duckdb_table(std::string_view catalog,
-                                            std::string_view schema,
-                                            std::string_view table) const
+bool cache_entry_info::matches_duckdb_table_name(std::string_view catalog,
+                                                 std::string_view schema,
+                                                 std::string_view table) const
 {
   // Same duckdb table by qualified name (catalog.schema.table), derived on both
   // pin and query sides from the resolved DuckTableEntry — so the stored casing is
@@ -2306,6 +2309,29 @@ bool cache_entry_info::matches_duckdb_table(std::string_view catalog,
   // A parquet cache has an empty table_name, so it never matches a duckdb scan.
   if (table_name.empty()) { return false; }
   return catalog_name == catalog && schema_name == schema && table_name == table;
+}
+
+bool cache_entry_info::matches_duckdb_table(std::string_view catalog,
+                                            std::string_view schema,
+                                            std::string_view table,
+                                            duckdb::idx_t oid) const
+{
+  return matches_duckdb_table_name(catalog, schema, table) && table_oid == oid;
+}
+
+bool cache_entry_info::same_source_as(const cache_entry_info& other) const
+{
+  // A duckdb identity on either side makes this a duckdb comparison: an entry with
+  // a table name never describes the same source as one carrying a file set.
+  if (!table_name.empty() || !other.table_name.empty()) {
+    return matches_duckdb_table(
+      other.catalog_name, other.schema_name, other.table_name, other.table_oid);
+  }
+  // Both sides are already canonical (cache_entry_info::from canonicalizes), and
+  // canonicalizing a canonical path is a no-op, so routing through the shared
+  // matcher keeps one definition of parquet identity. Two entries with no files at
+  // all report false — the caller then replaces, which is the safe direction.
+  return matches_parquet_files(other.resolved_file_paths);
 }
 
 bool cache_entry_info::matches_parquet_files(std::span<std::string const> files) const
@@ -2416,10 +2442,12 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
 
   auto existing_it = _pinned_entries.find(name);
   if (existing_it != _pinned_entries.end()) {
+    // Merge only pins that read the same source incarnation and row coverage.
     // Same-row-count merge only applies when the completeness contracts match.
     // Mixing a full pin with a partial pin produces an entry whose columns came
     // from different row coverage — drop and rebuild instead.
-    if (existing_it->second->num_rows == new_num_rows) {
+    if (existing_it->second->cache_info.same_source_as(cache_info) &&
+        existing_it->second->num_rows == new_num_rows) {
       // The merge below mutates the existing entry IN PLACE, and appending a column rehashes
       // data_batches_by_column while a cached provider may be calling .at() on it. Shared
       // ownership tells us whether that can happen: use_count() == 1 means only this map holds
@@ -2588,7 +2616,7 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
       }
       return stored;
     }
-    // Row count or completeness contract differs → remove registry visibility and rebuild
+    // Source, row count, or completeness contract differs → remove registry visibility and rebuild
     // below. Queries already serving the old entry retain it (and its handle) by shared ownership.
     _pinned_entries.erase(existing_it);
   }
@@ -3020,6 +3048,7 @@ std::shared_ptr<const pinned_entry> sirius_scan_manager::find_pinned_entry_for_d
   std::string_view catalog_name,
   std::string_view schema_name,
   std::string_view table_name,
+  duckdb::idx_t table_oid,
   duckdb::vector<duckdb::ColumnIndex> const* requested_ids,
   duckdb::vector<duckdb::LogicalType> const* returned_types) const
 {
@@ -3028,7 +3057,8 @@ std::shared_ptr<const pinned_entry> sirius_scan_manager::find_pinned_entry_for_d
   std::shared_ptr<const pinned_entry> covering_mismatch;
   std::lock_guard pin_lk{_pinned_entries_mutex};
   for (auto const& [name, entry] : _pinned_entries) {
-    if (!entry->cache_info.matches_duckdb_table(catalog_name, schema_name, table_name)) {
+    if (!entry->cache_info.matches_duckdb_table(
+          catalog_name, schema_name, table_name, table_oid)) {
       continue;
     }
     if (identity_match == nullptr) { identity_match = entry; }
@@ -3042,6 +3072,22 @@ std::shared_ptr<const pinned_entry> sirius_scan_manager::find_pinned_entry_for_d
     if (covering_mismatch == nullptr) { covering_mismatch = entry; }
   }
   return covering_mismatch != nullptr ? covering_mismatch : identity_match;
+}
+
+std::optional<std::string> sirius_scan_manager::pinned_entry_name_for_superseded_duckdb_table(
+  std::string_view catalog_name,
+  std::string_view schema_name,
+  std::string_view table_name,
+  duckdb::idx_t table_oid) const
+{
+  std::lock_guard pin_lk{_pinned_entries_mutex};
+  for (auto const& [name, entry] : _pinned_entries) {
+    if (entry->cache_info.matches_duckdb_table_name(catalog_name, schema_name, table_name) &&
+        entry->cache_info.table_oid != table_oid) {
+      return name;
+    }
+  }
+  return std::nullopt;
 }
 
 std::shared_ptr<const pinned_entry> sirius_scan_manager::find_pinned_entry_for_parquet_files(
