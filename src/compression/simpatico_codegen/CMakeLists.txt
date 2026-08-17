@@ -44,7 +44,11 @@ elseif(CONDA_PREFIX)
       CACHE FILEPATH "nvcc from prefix")
   set(CUDA_TOOLKIT_INCLUDE
       "${CONDA_PREFIX}/targets/${CUDA_TARGET_TRIPLE}/include")
-  set(CUDA_CCCL_INCLUDE "${CUDA_TOOLKIT_INCLUDE}/cccl")
+  if(EXISTS "${CUDA_TOOLKIT_INCLUDE}/cccl")
+    set(CUDA_CCCL_INCLUDE "${CUDA_TOOLKIT_INCLUDE}/cccl")
+  else()
+    set(CUDA_CCCL_INCLUDE "${CUDA_TOOLKIT_INCLUDE}")
+  endif()
   set(_SIMPATICO_INCLUDE_DIRS
       "${CONDA_PREFIX}/include" "${CONDA_PREFIX}/include/rapids"
       "${CUDA_TOOLKIT_INCLUDE}")
@@ -221,6 +225,7 @@ add_codegen_host_test(test_fused_operator_sweep)
 add_codegen_host_test(test_operator_sweep)
 add_codegen_host_test(test_representation_contract)
 add_codegen_host_test(test_bitpack_layout_contract)
+add_codegen_host_test(test_multi_gpu_stream_affinity)
 
 # Multi-mode CLI. Target is simpatico_cli to avoid clashing with the lib target;
 # the installed binary is named 'simpatico'.
@@ -253,3 +258,4 @@ add_test(NAME fused_operator_sweep COMMAND test_fused_operator_sweep)
 add_test(NAME operator_sweep COMMAND test_operator_sweep)
 add_test(NAME representation_contract COMMAND test_representation_contract)
 add_test(NAME bitpack_layout_contract COMMAND test_bitpack_layout_contract)
+add_test(NAME multi_gpu_stream_affinity COMMAND test_multi_gpu_stream_affinity)

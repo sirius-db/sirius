@@ -138,13 +138,4 @@ inline std::vector<Element> jit_decode_tree(const jit::FusedTree& tree,
   return out;
 }
 
-inline bool columns_equal(const std::vector<std::int32_t>& a, const std::vector<std::int32_t>& b)
-{
-  if (a.size() != b.size()) return false;
-  for (std::size_t i = 0; i < a.size(); ++i) {
-    if (a[i] != b[i]) return false;
-  }
-  return true;
-}
-
 }  // namespace codegen_test

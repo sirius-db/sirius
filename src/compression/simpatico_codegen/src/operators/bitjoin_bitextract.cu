@@ -105,24 +105,24 @@ void launch_bitextract_field(cudf::column_view const& input_col,
     // Dispatch on input type (reinterpret as unsigned)
     auto id = input_col.type().id();
     if (id == cudf::type_id::UINT8 || id == cudf::type_id::INT8) {
-      const uint8_t* in = input_col.head<uint8_t>();
+      const uint8_t* in = input_col.data<uint8_t>();
       bitextract_field_kernel<uint8_t, TOut><<<grid_size(n), kBlockSize, 0, stream>>>(
         in, out_ptr, lo_bit, static_cast<uint8_t>(mask), n);
       throw_if_cuda_error(cudaGetLastError(), "bitextract_field UINT8 launch");
     } else if (id == cudf::type_id::UINT16 || id == cudf::type_id::INT16) {
-      const uint16_t* in = input_col.head<uint16_t>();
+      const uint16_t* in = input_col.data<uint16_t>();
       bitextract_field_kernel<uint16_t, TOut><<<grid_size(n), kBlockSize, 0, stream>>>(
         in, out_ptr, lo_bit, static_cast<uint16_t>(mask), n);
       throw_if_cuda_error(cudaGetLastError(), "bitextract_field UINT16 launch");
     } else if (id == cudf::type_id::UINT32 || id == cudf::type_id::INT32 ||
                id == cudf::type_id::FLOAT32) {
-      const uint32_t* in = input_col.head<uint32_t>();
+      const uint32_t* in = input_col.data<uint32_t>();
       bitextract_field_kernel<uint32_t, TOut><<<grid_size(n), kBlockSize, 0, stream>>>(
         in, out_ptr, lo_bit, static_cast<uint32_t>(mask), n);
       throw_if_cuda_error(cudaGetLastError(), "bitextract_field UINT32 launch");
     } else if (id == cudf::type_id::UINT64 || id == cudf::type_id::INT64 ||
                id == cudf::type_id::FLOAT64) {
-      const uint64_t* in = input_col.head<uint64_t>();
+      const uint64_t* in = input_col.data<uint64_t>();
       bitextract_field_kernel<uint64_t, TOut><<<grid_size(n), kBlockSize, 0, stream>>>(
         in, out_ptr, lo_bit, static_cast<uint64_t>(mask), n);
       throw_if_cuda_error(cudaGetLastError(), "bitextract_field UINT64 launch");
@@ -173,24 +173,24 @@ void launch_bitjoin_field(cudf::mutable_column_view const& output_col,
 
     auto id = input_col.type().id();
     if (id == cudf::type_id::UINT8 || id == cudf::type_id::INT8) {
-      const uint8_t* in = input_col.head<uint8_t>();
+      const uint8_t* in = input_col.data<uint8_t>();
       bitjoin_field_kernel<TOut, uint8_t><<<grid_size(n), kBlockSize, 0, stream>>>(
         out_ptr, in, src_lo_bit, dst_lo_bit, field_mask, n);
       throw_if_cuda_error(cudaGetLastError(), "bitjoin_field UINT8 launch");
     } else if (id == cudf::type_id::UINT16 || id == cudf::type_id::INT16) {
-      const uint16_t* in = input_col.head<uint16_t>();
+      const uint16_t* in = input_col.data<uint16_t>();
       bitjoin_field_kernel<TOut, uint16_t><<<grid_size(n), kBlockSize, 0, stream>>>(
         out_ptr, in, src_lo_bit, dst_lo_bit, field_mask, n);
       throw_if_cuda_error(cudaGetLastError(), "bitjoin_field UINT16 launch");
     } else if (id == cudf::type_id::UINT32 || id == cudf::type_id::INT32 ||
                id == cudf::type_id::FLOAT32) {
-      const uint32_t* in = input_col.head<uint32_t>();
+      const uint32_t* in = input_col.data<uint32_t>();
       bitjoin_field_kernel<TOut, uint32_t><<<grid_size(n), kBlockSize, 0, stream>>>(
         out_ptr, in, src_lo_bit, dst_lo_bit, field_mask, n);
       throw_if_cuda_error(cudaGetLastError(), "bitjoin_field UINT32 launch");
     } else if (id == cudf::type_id::UINT64 || id == cudf::type_id::INT64 ||
                id == cudf::type_id::FLOAT64) {
-      const uint64_t* in = input_col.head<uint64_t>();
+      const uint64_t* in = input_col.data<uint64_t>();
       bitjoin_field_kernel<TOut, uint64_t><<<grid_size(n), kBlockSize, 0, stream>>>(
         out_ptr, in, src_lo_bit, dst_lo_bit, field_mask, n);
       throw_if_cuda_error(cudaGetLastError(), "bitjoin_field UINT64 launch");
@@ -226,18 +226,18 @@ void launch_check_truncation(cudf::column_view const& input_col,
   auto id = input_col.type().id();
   if (id == cudf::type_id::UINT8 || id == cudf::type_id::INT8) {
     check_truncation_kernel<uint8_t><<<grid_size(n), kBlockSize, 0, stream>>>(
-      input_col.head<uint8_t>(), static_cast<uint8_t>(selected_mask), d_flag, flag_bit, n);
+      input_col.data<uint8_t>(), static_cast<uint8_t>(selected_mask), d_flag, flag_bit, n);
   } else if (id == cudf::type_id::UINT16 || id == cudf::type_id::INT16) {
     check_truncation_kernel<uint16_t><<<grid_size(n), kBlockSize, 0, stream>>>(
-      input_col.head<uint16_t>(), static_cast<uint16_t>(selected_mask), d_flag, flag_bit, n);
+      input_col.data<uint16_t>(), static_cast<uint16_t>(selected_mask), d_flag, flag_bit, n);
   } else if (id == cudf::type_id::UINT32 || id == cudf::type_id::INT32 ||
              id == cudf::type_id::FLOAT32) {
     check_truncation_kernel<uint32_t><<<grid_size(n), kBlockSize, 0, stream>>>(
-      input_col.head<uint32_t>(), static_cast<uint32_t>(selected_mask), d_flag, flag_bit, n);
+      input_col.data<uint32_t>(), static_cast<uint32_t>(selected_mask), d_flag, flag_bit, n);
   } else if (id == cudf::type_id::UINT64 || id == cudf::type_id::INT64 ||
              id == cudf::type_id::FLOAT64) {
     check_truncation_kernel<uint64_t><<<grid_size(n), kBlockSize, 0, stream>>>(
-      input_col.head<uint64_t>(), static_cast<uint64_t>(selected_mask), d_flag, flag_bit, n);
+      input_col.data<uint64_t>(), static_cast<uint64_t>(selected_mask), d_flag, flag_bit, n);
   } else {
     throw std::invalid_argument("check_truncation: unsupported input type");
   }

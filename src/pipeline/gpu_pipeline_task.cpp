@@ -19,6 +19,7 @@
 #include "cudf/cudf_utils.hpp"
 #include "log/logging.hpp"
 #include "memory/defragmenter_oom_policy.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "telemetry/batch_telemetry.hpp"
@@ -49,17 +50,28 @@ void validate_operator_output_types(const op::operator_data* data,
                                     const op::sirius_physical_operator& op)
 {
   if (data == nullptr) { return; }
+  if (!op.declared_output_schema_is_runtime_schema()) { return; }
   auto* pipelineable_data = dynamic_cast<const op::pipelineable_operator_data*>(data);
   if (pipelineable_data == nullptr) { return; }
   const auto& expected_types = op.get_types();
-  const auto& batches        = pipelineable_data->get_data_batches();
+  const auto& physical_types = op.get_physical_types();
+  // A diagnostic must be robust against the invariant breach it detects: a malformed
+  // (partial) sidecar would otherwise be indexed out of bounds below.
+  if (!physical_types.empty() && physical_types.size() != expected_types.size()) {
+    SIRIUS_LOG_WARN(
+      "gpu_pipeline_task: operator '{}' (id={}) physical sidecar width {} != logical width {}",
+      op.get_name(),
+      op.get_operator_id(),
+      physical_types.size(),
+      expected_types.size());
+    return;
+  }
+  const auto& batches = pipelineable_data->get_data_batches();
   for (size_t batch_index = 0; batch_index < batches.size(); batch_index++) {
     const auto& batch = batches[batch_index];
     if (!batch) { continue; }
     cudf::table_view tbl = get_cudf_table_view(*batch);
     if (static_cast<size_t>(tbl.num_columns()) != expected_types.size()) {
-      // bobbi (todo): delim join will return this warning for now, but there is no bug here, so we
-      // can ignore it. we can do something about this after gtc
       SIRIUS_LOG_WARN(
         "gpu_pipeline_task: operator '{}' (id={}) output batch {} column count mismatch: got "
         "{}, expected {}",
@@ -71,7 +83,9 @@ void validate_operator_output_types(const op::operator_data* data,
       return;
     }
     for (cudf::size_type c = 0; c < tbl.num_columns(); c++) {
-      cudf::data_type expected_cudf = sirius::get_cudf_type(expected_types[c]);
+      cudf::data_type expected_cudf = physical_types.empty()
+                                        ? sirius::get_cudf_type(expected_types[c])
+                                        : physical_types[static_cast<std::size_t>(c)];
       cudf::data_type actual        = tbl.column(c).type();
       if (actual != expected_cudf) {
         SIRIUS_LOG_WARN(
@@ -219,6 +233,11 @@ std::unique_ptr<op::operator_data> run_one_operator(
 std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_input(
   const cucascade::memory::memory_space* target_space) const
 {
+  // Peak device memory while making one representation GPU-resident.
+  auto peak_materialization_bytes = [](const cucascade::idata_representation* data) {
+    return sirius::peak_materialization_bytes(data);
+  };
+
   if (auto* scan_input = dynamic_cast<const op::scan::scan_operator_input*>(_input_data.get());
       scan_input && scan_input->is_resident()) {
     // Cached scan inputs can still reside in HOST and require an upload before execution.
@@ -228,7 +247,7 @@ std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_in
     auto ro          = batch->to_read_only();
     auto const* data = ro.get_data();
     if (!data || ro.get_current_tier() == cucascade::memory::Tier::GPU) { return 0; }
-    return data->get_uncompressed_data_size_in_bytes();
+    return peak_materialization_bytes(data);
   }
 
   std::size_t input_size   = 0;
@@ -239,9 +258,7 @@ std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_in
       const bool non_gpu     = ro.get_current_tier() != cucascade::memory::Tier::GPU;
       const bool cross_space = target_space != nullptr && ro.get_memory_space() != nullptr &&
                                ro.get_memory_space()->get_id() != target_space->get_id();
-      if (non_gpu || cross_space) {
-        input_size += ro.get_data()->get_uncompressed_data_size_in_bytes();
-      }
+      if (non_gpu || cross_space) { input_size += peak_materialization_bytes(ro.get_data()); }
     }
   }
   return input_size;
@@ -652,13 +669,33 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
   const auto input_type =
     ls._input_data ? ls._input_data->get_type() : op::operator_data_type::BASE;
   const bool input_resident = ls._input_data && ls._input_data->is_resident();
-  auto working_set_bytes    = input_basis;
+  auto const* scan_input =
+    ls._input_data ? dynamic_cast<const op::scan::scan_operator_input*>(ls._input_data.get())
+                   : nullptr;
+  const bool input_needs_scan_carrier_conversion =
+    scan_input != nullptr && scan_input->needs_carrier_conversion;
+  const std::size_t input_scan_conversion_destination_bytes =
+    scan_input != nullptr ? scan_input->conversion_destination_bytes : 0;
+  auto working_set_bytes = input_basis;
   // Resident (cached) scan inputs report mask/filter copy peaks through their
   // working-set estimate too — it seeds the cold-start guess below via
   // input_stats, so do not gate this on residency.
   if (input_type == op::operator_data_type::GPU_SCAN && ls._input_data) {
     working_set_bytes = ls._input_data->get_estimated_working_set_size_in_bytes();
   }
+
+  std::size_t num_batches = 0;
+  if (auto* pd = dynamic_cast<const op::pipelineable_operator_data*>(ls._input_data.get())) {
+    num_batches = pd->get_data_batches().size();
+  }
+  const op::input_stats stats{
+    .num_batches                  = num_batches,
+    .bytes                        = input_basis,
+    .type                         = input_type,
+    .resident                     = input_resident,
+    .working_set_bytes            = working_set_bytes,
+    .needs_carrier_conversion     = input_needs_scan_carrier_conversion,
+    .conversion_destination_bytes = input_scan_conversion_destination_bytes};
 
   pipeline::reservation_size_info info;
   info.input_basis                = input_basis;
@@ -667,28 +704,26 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
 
   if (peak_opt.has_value()) {
     info.peak_memory_estimate = *peak_opt;
-    // Non-resident scans keep the per-split decode floor even with history;
-    // resident (cached) scans trust the learned peak — their mask/filter
-    // model only seeds the cold start, and a warm undershoot is repaired by
-    // record_on_failure + retry.
+    // pipeline_memory_history may estimate below the current fresh batch's known decode working
+    // set.
     if (input_type == op::operator_data_type::GPU_SCAN && !input_resident) {
       info.peak_memory_estimate = std::max(info.peak_memory_estimate, working_set_bytes);
     }
-  } else {
-    std::size_t num_batches = 0;
-    if (auto* pd = dynamic_cast<const op::pipelineable_operator_data*>(ls._input_data.get())) {
-      num_batches = pd->get_data_batches().size();
+    // pipeline_memory_history keys estimates by input bytes, not carrier layout, so batches with
+    // the same byte basis can require different normalization casts.
+    if (input_resident && input_needs_scan_carrier_conversion) {
+      auto const conversion_floor =
+        op::scan::sirius_gpu_scan_operator::resident_carrier_conversion_peak_memory_estimate(stats);
+      info.peak_memory_estimate = std::max(info.peak_memory_estimate, conversion_floor);
     }
-    const op::input_stats stats{
-      num_batches, input_basis, input_type, input_resident, working_set_bytes};
-
+  } else {
     std::size_t max_estimate = 0;
     if (auto* pipeline = gs.get_pipeline()) {
       for (auto& op_ref : pipeline->get_operators()) {
         max_estimate = std::max(max_estimate, op_ref.get().no_history_peak_memory_estimate(stats));
       }
     }
-    // If every operator returned 0 (all pass-throughs), fall back to the 2× default.
+    // Preserve the task-level 2× fallback when no operator supplies a positive estimate.
     info.peak_memory_estimate = (max_estimate > 0) ? max_estimate : (input_basis * 2);
   }
 

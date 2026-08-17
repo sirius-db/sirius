@@ -173,7 +173,7 @@ Data is moved from GPU to HOST tier via converter registry.
 
 **Code path:** `src/downgrade/downgrade_executor.cpp` — `monitor_loop()`, `run_downgrade_pass()`
 
-**Config:** `downgrade_trigger_fraction` (default: 1.0 for GPU, 0.8 for Host), `downgrade_stop_fraction` (default: 0.7)
+**Config:** `downgrade_trigger_fraction` (default: 0.8 for GPU, 0.9 for host), `downgrade_stop_fraction` (default: 0.6 for GPU, 0.8 for host). Configuration requires `0 < stop < trigger <= 1`.
 
 ### OOM Retry Mechanism (PR #364)
 
@@ -229,6 +229,35 @@ Data is moved from GPU to HOST tier via converter registry.
 **Config:** Memory manager settings in `sirius.yaml` (see [Configuration](configuration.md))
 
 ## Scan Optimizations
+
+### Compressed Materialization (unreleased)
+
+**Motivation:** Integer and fixed-point DECIMAL columns often use only a fraction of their declared
+range. Carrying their native width through every GPU batch increases memory traffic and cache
+pressure even when the SQL type must remain unchanged.
+
+**Mechanism:** A complete physical-type sidecar records narrower signed, unsigned, or same-scale
+decimal cuDF carriers without changing the logical schema. `pin_table` computes exact bounds for
+each materialized cache chunk and records the chosen carriers, so different chunks may use different
+widths. At plan time, a scan derives its targets from that recorded metadata only when the pinned
+cache can serve all requested columns; unpinned scans stay native. Exact per-batch bounds guard any
+runtime wider-to-narrower cast. Pure-reference payloads and eligible grouped-aggregate keys can
+remain narrow, and comparisons against representable constants can execute in the narrow domain.
+Arithmetic, hash-join keys, value-sensitive aggregate inputs, ordering, unsupported boundaries, and
+result materialization restore native carriers.
+
+**Code path:**
+- `src/helper/numeric_narrowing.cpp` — exact range extraction and carrier selection
+- `src/planner/sirius_plan_get.cpp` — pinned-residency gate and metadata-derived scan sidecars
+- `src/planner/sirius_plan_narrowing_policy.cpp` — tier-aware keep-or-retract policy
+- `src/planner/sirius_plan_compressed_schema.cpp` — sidecar propagation, restore projections, and pruning
+- `src/op/scan/sirius_gpu_scan_operator.cpp` — runtime verification and schema normalization
+- `src/pin_table.cpp` — exact batch-granular pin narrowing
+- `src/expression_evaluator/specializations/reference.cpp` and `narrow_domain.cpp` — reference restoration and narrow-domain constants
+
+**Config:** `enable_compressed_materialization` (default: `true`), settable through YAML under
+`sirius.operator_params` and the DuckDB SET option. See
+[Compressed Materialization](compressed-materialization.md).
 
 ### Row Group Pruning with Filter Pushdown (PR #363)
 

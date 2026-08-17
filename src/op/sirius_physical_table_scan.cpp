@@ -161,7 +161,14 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   if (table_filters) {
     auto duckdb_filter = convert_table_filters_to_expression(
       *table_filters, column_ids, returned_types, batch_column_map);
-    if (duckdb_filter) { local_filter_expr = sirius::ast::from_duckdb(*duckdb_filter); }
+    if (duckdb_filter) {
+      local_filter_expr = sirius::ast::from_duckdb(*duckdb_filter);
+      if (local_filter_expr == nullptr) {
+        throw duckdb::InvalidInputException(
+          "TABLE_SCAN filter: cannot evaluate pushed-down predicate on GPU: %s",
+          duckdb_filter->ToString());
+      }
+    }
   }
 
   if (local_filter_expr != nullptr) {

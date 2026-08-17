@@ -302,9 +302,10 @@ operator_trial try_operator(std::string const& name,
   // the CUDA context or produce a misleading "success" result.
   auto const tid      = col.type().id();
   bool const is_float = cudf::is_floating_point(col.type());
-  // Chrono columns compress as their integer storage (see encode_fused_subtree),
-  // so they take the integer op set.
-  bool const is_int = cudf::is_integral(col.type()) || cudf::is_chrono(col.type());
+  // Chrono and fixed-point (decimal) columns compress as their integer storage
+  // (see encode_fused_subtree), so they take the integer op set.
+  bool const is_int = cudf::is_integral(col.type()) || cudf::is_chrono(col.type()) ||
+                      cudf::is_fixed_point(col.type());
   bool const is_str = (tid == cudf::type_id::STRING);
 
   // bitextract is meaningful only on its native floating-point type; applying it

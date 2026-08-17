@@ -37,9 +37,11 @@
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/planner.hpp>
 
+#include <algorithm>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <vector>
 
 namespace sirius::test {
 
@@ -179,11 +181,21 @@ void with_conversion_result(
     }
     const auto& op_params = sirius_ctx_ptr->get_config().get_operator_params();
 
-    // Null telemetry context: no engine, per the pipeline_build_context ctor contract.
+    std::vector<int> active_gpu_ids;
+    for (auto const* space : sirius_ctx_ptr->get_memory_manager().get_memory_spaces_for_tier(
+           cucascade::memory::Tier::GPU)) {
+      if (space != nullptr) { active_gpu_ids.push_back(space->get_device_id()); }
+    }
+    std::sort(active_gpu_ids.begin(), active_gpu_ids.end());
+    active_gpu_ids.erase(std::unique(active_gpu_ids.begin(), active_gpu_ids.end()),
+                         active_gpu_ids.end());
+
+    // Null telemetry context: no engine, but derive planning width from the same configured GPU
+    // spaces as production so multi-visible-GPU hosts do not inflate single-GPU test plans.
     pipeline::pipeline_build_context build_ctx(
       /*telemetry_context=*/nullptr,
       duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context),
-      static_cast<int>(sirius_ctx_ptr->get_config().get_hw_topology().gpus.size()));
+      std::move(active_gpu_ids));
 
     pipeline::sirius_pipeline_build_state state;
     auto root_pipeline =

@@ -205,6 +205,19 @@ if(VCPKG_BUILD AND TARGET CUDA::cudart_static)
       sirius_prefer_static_cudart("${_target}")
     endif()
   endforeach()
+
+  # cucascade's topology discovery gained rmm includes (NUMA capacity
+  # detection), so it needs the same vcpkg-over-toolkit include priority as
+  # sirius's own rapids consumers: without it GCC drops the duplicated vcpkg -I
+  # in favor of the later -isystem, the CUDA toolkit's CCCL wins the search
+  # order, and CUDA 12's bundled CCCL (< 3.3) trips rmm's version check. Only
+  # the object target compiles TUs; the static wrapper just links the objects.
+  if(TARGET cucascade_topology_discovery_objects)
+    set_target_properties(cucascade_topology_discovery_objects
+                          PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+    target_include_directories(cucascade_topology_discovery_objects BEFORE
+                               PRIVATE ${_VCPKG_INC})
+  endif()
 endif()
 
 # Rust telemetry instrumentation (C++ FFI via Corrosion)
@@ -225,11 +238,13 @@ set(EXTENSION_SOURCES
     src/compression/compression_converters.cpp
     src/compression/plan_register.cpp
     src/config.cpp
+    src/helper/numeric_narrowing.cpp
     src/helper/type_conversions.cpp
     src/debug_utils.cpp
     src/creator/task_creator.cpp
     src/downgrade/downgrade_executor.cpp
     src/expression/aggregate_id.cpp
+    src/expression/ast/constant_range.cpp
     src/expression/ast/node.cpp
     src/expression/ast/utils.cpp
     src/expression/from_duckdb.cpp
@@ -249,10 +264,12 @@ set(EXTENSION_SOURCES
     src/expression_evaluator/specializations/conjunction.cpp
     src/expression_evaluator/specializations/constant.cpp
     src/expression_evaluator/specializations/function.cpp
+    src/expression_evaluator/specializations/narrow_domain.cpp
     src/expression_evaluator/specializations/operator.cpp
     src/expression_evaluator/specializations/reference.cpp
     # Execution primitives (slot-based backpressure / completion tracking)
     src/exec/admission_control.cpp
+    src/exec/batch_stream.cpp
     # I/O adapters (Phase 19 — io_uring + sirius_datasource)
     src/io/datasource_factory.cpp
     src/io/io_context.cpp
@@ -350,6 +367,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_aggregate.cpp
     src/planner/sirius_plan_column_data_get.cpp
     src/planner/sirius_plan_comparison_join.cpp
+    src/planner/sirius_plan_compressed_schema.cpp
     src/planner/sirius_plan_cte.cpp
     src/planner/sirius_plan_delim_get.cpp
     src/planner/sirius_plan_delim_join.cpp
@@ -359,6 +377,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_filter.cpp
     src/planner/sirius_plan_get.cpp
     src/planner/sirius_plan_limit.cpp
+    src/planner/sirius_plan_narrowing_policy.cpp
     src/planner/sirius_plan_order.cpp
     src/planner/sirius_plan_projection.cpp
     src/planner/sirius_plan_projection_utils.cpp
@@ -370,6 +389,7 @@ set(EXTENSION_SOURCES
     src/scan_manager/mvcc_mask_job.cpp
     src/scan_manager/pinned_chunk_stats.cpp
     src/scan_manager/round_robin_strategy.cpp
+    src/scan_manager/memory_prefetcher.cpp
     src/scan_manager/sirius_scan_manager.cpp
     src/scan_manager/split_connector.cpp
     src/scan_manager/split_provider.cpp
@@ -451,6 +471,9 @@ build_loadable_extension(sirius CPP ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 set_target_properties(sirius_loadable_extension PROPERTIES LINKER_TYPE BFD)
 
 # Shared configuration for both extension targets
+set(SIRIUS_CLANG_CXX_WARNING_OPTIONS -Wunreachable-code -Wimplicit-fallthrough
+                                     -Wrange-loop-analysis -Wnull-dereference)
+
 foreach(_target sirius_extension sirius_loadable_extension)
   set_target_properties(
     ${_target}
@@ -465,7 +488,10 @@ foreach(_target sirius_extension sirius_loadable_extension)
   # consumers (tests/benchmarks) with --expt-extended-lambda.
   target_compile_options(
     ${_target}
-    PRIVATE $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-extended-lambda>)
+    PRIVATE
+      $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-extended-lambda>
+      "$<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:${SIRIUS_CLANG_CXX_WARNING_OPTIONS}>"
+  )
 
   if(VCPKG_BUILD)
     set_target_properties(${_target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
@@ -601,10 +627,11 @@ set(TEST_SOURCES
     test/cpp/data/test_data_repository_manager_registry.cpp
     test/cpp/data/test_convertible_gpu_pipeline_task.cpp
     test/cpp/downgrade/test_downgrade_disk.cpp
+    test/cpp/creator/test_task_creator.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
+    test/cpp/exec/test_batch_stream.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
-    test/cpp/exec/test_exchange_channel.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_multi_index_priority_queue.cpp
@@ -624,7 +651,10 @@ set(TEST_SOURCES
     test/cpp/expression_evaluator/test_nonduckdb_frontend_proof.cpp
     test/cpp/helper/test_cudf_utils.cpp
     test/cpp/helper/test_logical_type.cpp
+    test/cpp/helper/test_numeric_narrowing.cpp
     test/cpp/helper/test_transaction_utils.cpp
+    test/cpp/integration/test_compressed_materialization_gate.cpp
+    test/cpp/integration/test_compressed_materialization_partition.cpp
     test/cpp/integration/test_gpu_execution_aggregate_nulls.cpp
     test/cpp/integration/test_gpu_execution_allnull_scan.cpp
     test/cpp/integration/test_gpu_execution_array.cpp
@@ -635,6 +665,8 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_null_safe_join.cpp
     test/cpp/integration/test_gpu_execution_order_nulls.cpp
+    test/cpp/integration/test_gpu_execution_parquet_nulls.cpp
+    test/cpp/integration/test_parquet_null_predicate_pushdown.cpp
     test/cpp/integration/test_query_lifecycle_slot.cpp
     test/cpp/integration/test_gpu_execution_tpcds_nulls.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
@@ -645,6 +677,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_pin_table_mvcc_delete.cpp
     test/cpp/integration/test_pin_table_mvcc_foundation.cpp
     test/cpp/integration/test_pin_table_mvcc_insert.cpp
+    test/cpp/integration/test_pin_table_mvcc_update.cpp
     test/cpp/integration/test_pin_table_zone_map_pruning.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/integration/test_transparent_runtime_fallback.cpp
@@ -699,6 +732,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_dynamic_filter_publisher.cpp
     test/cpp/operator/test_sirius_dynamic_filter_mgpu.cpp
     test/cpp/parallel/test_task_executor.cpp
+    test/cpp/planner/test_compressed_schema_propagation.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
     test/cpp/planner/test_dynamic_filter_router.cpp
@@ -708,6 +742,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_sirius_read_parquet_scan.cpp
     test/cpp/planner/test_query_id.cpp
     test/cpp/planner/test_query_index.cpp
+    test/cpp/planner/test_tier_narrowing_policy.cpp
     test/cpp/pipeline/test_batch_lock_utils.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
@@ -717,6 +752,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_get_next_ports_after_sink.cpp
     test/cpp/pipeline/test_merge_pipeline_fusion.cpp
     test/cpp/pipeline/test_partition_build_pipelines.cpp
+    test/cpp/pipeline/test_pipeline_build_context.cpp
     test/cpp/pipeline/test_pipeline_dynamic_filter_native_shape.cpp
     test/cpp/pipeline/test_pipeline_schedule_canonical.cpp
     test/cpp/pipeline/test_plan_printer.cpp
@@ -740,7 +776,9 @@ set(TEST_SOURCES
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_owning_table_view.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
+    test/cpp/scan/test_parquet_null_count_pruning.cpp
     test/cpp/scan/test_parquet_scan_sizing.cpp
+    test/cpp/scan/test_scan_schema_normalization.cpp
     test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp
     test/cpp/sql/test_sirius_sql_rewrite.cpp
     test/cpp/telemetry/test_telemetry_context.cpp

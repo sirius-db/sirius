@@ -19,6 +19,7 @@
 #include <duckdb/common/typedefs.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <numeric>
 #include <vector>
 
@@ -33,8 +34,9 @@ namespace sirius::scan_manager {
 /// uncheckpointed transient segments. Query-time delta merge reconciles that
 /// snapshot against DuckDB's live MVCC state; these fields are the pin-side facts
 /// it needs. Auto-checkpoint is suppressed while the pin exists so the disk image
-/// (and therefore the positional base) cannot change underneath the cache; a
-/// manual CHECKPOINT while pinned is outside the supported contract.
+/// (and therefore the positional base) cannot change underneath the cache. A
+/// changed checkpoint generation makes query preparation reject the pin before
+/// it can serve.
 struct duckdb_mvcc_metadata {
   /// The pin transaction's DuckTransaction::start_time on the pinned table's own
   /// AttachedDatabase (not the default database — each attached database has its
@@ -51,6 +53,12 @@ struct duckdb_mvcc_metadata {
   /// Each chunk is a contiguous run of whole row groups (validated at pin time),
   /// so per-chunk visibility masks can be assembled at row-group granularity.
   std::vector<std::size_t> base_row_count_per_chunk;
+
+  /// Single-file database checkpoint generation captured before materializing
+  /// the pin. Any change means the on-disk image backing the cache may have
+  /// changed, so the pin must not serve. Kept after the original metadata
+  /// members to preserve their layout.
+  std::uint64_t checkpoint_iteration{0};
 
   /// Number of cached base rows: the pin covers rowids [0, n_cache()). Rows at
   /// [n_cache(), live table rows) exist only in DuckDB's in-memory transient

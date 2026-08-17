@@ -31,12 +31,25 @@ namespace sirius {
 
 namespace config {
 
-constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE       = 512ULL * 1024 * 1024;  // 512 MB
-constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES       = 512ULL * 1024 * 1024;  // 512 MB
-constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES         = 512ULL * 1024 * 1024;  // 512 MB
-constexpr uint64_t DEFAULT_SORT_SAMPLE_BYTES          = 512ULL * 1024 * 1024;  // 512 MB
-constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES = 500ULL * 1024 * 1024;  // 500 MB
-constexpr uint64_t DEFAULT_MAX_BROADCAST_JOIN_SIZE    = 256ULL * 1024 * 1024;  // 256 MB
+/// Static fallback for operator batch/partition sizing, used when no GPU is
+/// visible; the per-operator alias constants below keep it as their last-resort
+/// value for unwired construction paths.
+constexpr uint64_t DEFAULT_BATCH_SIZE = 800ULL * 1024 * 1024;  // 800 MiB
+
+/// Shared operator batch default: 2.5% of the smallest visible GPU's total memory,
+/// clamped to [512 MiB, 5 GiB]; DEFAULT_BATCH_SIZE when no GPU is visible. Queried
+/// once per process (memoized). operator_params derives its batch members from this,
+/// so every default-constructed instance agrees. When YAML explicitly configures an
+/// effective GPU capacity, sirius_config narrows the shared defaults from the resolved
+/// memory-space configs before applying explicit operator_params overrides.
+uint64_t derived_default_batch_size();
+
+constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE       = DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES       = DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES         = DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_SORT_SAMPLE_BYTES          = DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES = 2 * DEFAULT_BATCH_SIZE;
+constexpr uint64_t DEFAULT_MAX_BROADCAST_JOIN_SIZE    = 256ULL * 1024 * 1024;  // 256 MiB
 
 /// Multi-GPU small-table threshold, charged per GPU. A partition-sizing consumer (hash join,
 /// merge_group_by) keeps inputs below `num_gpus * this` on a single GPU (one partition) to avoid
@@ -61,6 +74,15 @@ constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
 /// disable (always use filtered_join).
 constexpr double DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO = 8.0;
 
+/// Test build-key uniqueness at runtime when the planner could not prove it statically.
+///
+/// cudf's general hash join probes twice — a count pass to size the output, then a retrieve pass —
+/// while cudf::distinct_hash_join probes once, because a distinct build bounds the output by the
+/// probe row count. Sirius already implements both, but the distinct path is gated on a *proof* of
+/// uniqueness, which only a declared PRIMARY KEY on a catalog table can supply. The runtime test is
+/// one cudf::distinct_count pass over the build keys, taken only in BUILD_PROBE mode.
+constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = true;
+
 }  // namespace config
 
 /// Parameters controlling operator-level resource sizing.
@@ -68,7 +90,7 @@ constexpr double DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO = 8.0;
 /// or overridden at runtime using DuckDB SET commands.
 struct operator_params {
   /// Target batch size (bytes) for DuckDB scan tasks.
-  uint64_t scan_task_batch_size = config::DEFAULT_SCAN_TASK_BATCH_SIZE;
+  uint64_t scan_task_batch_size = config::derived_default_batch_size();
 
   /// Maximum bytes per sort partition (0 = auto based on max_sort_partition_memory_fraction).
   uint64_t max_sort_partition_bytes = 0;
@@ -77,17 +99,18 @@ struct operator_params {
   double max_sort_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION;
 
   /// Target size (bytes) per hash partition for joins and group-bys.
-  uint64_t hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES;
+  uint64_t hash_partition_bytes = config::derived_default_batch_size();
 
   /// Target size (bytes) for the concat operator output batch.
-  uint64_t concat_batch_bytes = config::DEFAULT_CONCAT_BATCH_BYTES;
+  uint64_t concat_batch_bytes = config::derived_default_batch_size();
 
   /// Target size (bytes) of data to sample before computing sort partition boundaries.
-  uint64_t sort_sample_bytes = config::DEFAULT_SORT_SAMPLE_BYTES;
+  uint64_t sort_sample_bytes = config::derived_default_batch_size();
 
-  /// Maximum build-side bytes for switching to BUILD_PROBE join mode.
-  /// May be larger than concat_batch_bytes; build-side batches will be concatenated if needed.
-  uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
+  /// Maximum build-side bytes for switching to BUILD_PROBE join mode: 2x the shared
+  /// batch default. May be larger than concat_batch_bytes; build-side batches will be
+  /// concatenated if needed.
+  uint64_t max_build_hash_table_bytes = 2 * config::derived_default_batch_size();
 
   /// Maximum build-side bytes for a broadcast join. A build below this size is eligible to be
   /// replicated to every GPU (instead of hash-partitioning across GPUs) when the probe side is
@@ -101,6 +124,13 @@ struct operator_params {
   /// L4 in the issue #510 microbenchmark, defaulted higher to stay conservative). Set to 0 to
   /// disable (always use filtered_join).
   double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
+
+  /// When the planner could not prove build-key uniqueness, test it at runtime (one
+  /// cudf::distinct_count pass over the build keys) and take the single-pass
+  /// cudf::distinct_hash_join instead of the two-pass general path when the keys are in fact
+  /// distinct. BUILD_PROBE mode only, INNER/LEFT equality joins with null-unequal semantics. See
+  /// DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE.
+  bool enable_runtime_distinct_build_probe = config::DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE;
 
   /// Wire dynamic table-filter pushdown: an eligible BUILD_PROBE hash-join build publishes a raw
   /// exact IN-list for 1..12 supported build rows, otherwise a hash IN-list if it fits the smallest
@@ -130,6 +160,12 @@ struct operator_params {
   /// pin-time statistics capture and the serve-side survivor plan: a table pinned while the flag is
   /// off carries no zone maps and cannot prune until re-pinned with the flag on.
   bool enable_pinned_zone_map_pruning = true;
+
+  /// Store eligible integer and fixed-point DECIMAL columns in carriers selected from exact
+  /// per-chunk bounds during pinning. Matching pinned scans derive targets from recorded storage
+  /// metadata; other scans use native carriers. Logical types remain unchanged, and type-sensitive
+  /// boundaries restore native carriers.
+  bool enable_compressed_materialization = true;
 };
 
 struct telemetry_config {
@@ -137,6 +173,7 @@ struct telemetry_config {
   /// Emit per-batch placement telemetry (Batch FSM + MemoryTier usages).
   /// Roughly doubles telemetry volume; no-op when enable_quent is false.
   bool enable_batch_events{true};
+  std::string exporter{"ndjson"};
   std::string output_directory{"telemetry_data"};
   std::string engine_name{"siriusDB"};
 };
@@ -168,13 +205,6 @@ struct compression_config {
   /// exists for a table, that table is pinned uncompressed regardless of the
   /// enable flag.  Empty string = feature disabled.
   std::string input_plan_dir{};
-
-  /// Degree of column-parallelism for Simpatico (de)compression: simpatico fans
-  /// a table's columns across this many worker threads/streams (one column per
-  /// stream). <=1 = sequential (single-stream). Capped at the column count per
-  /// call. Applies to both the pin-time compress path and the scan-time
-  /// decompress converters.
-  int column_threads{4};
 };
 
 struct sirius_config {
@@ -239,8 +269,8 @@ struct sirius_config {
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   creator::task_creator_config _task_creator_config;
   scan_manager::scan_manager_config _scan_manager_config{};
-  exec::thread_pool_config _gpu_pipeline_executor_config{.num_threads        = 4,
-                                                         .thread_name_prefix = "gpu_pipeline"};
+  exec::thread_pool_config _gpu_pipeline_executor_config{
+    .num_threads = exec::default_gpu_pipeline_num_threads, .thread_name_prefix = "gpu_pipeline"};
   exec::downgrade_executor_config _downgrade_executor_config;
   operator_params _operator_params;
   telemetry_config _telemetry_config;

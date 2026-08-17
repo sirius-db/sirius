@@ -26,16 +26,12 @@
 #include <duckdb/storage/storage_manager.hpp>
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
 #include <op/sirius_dynamic_filter.hpp>
-#include <unistd.h>
+#include <utils/parquet_fixture_utils.hpp>
 
-#include <cstdlib>
-#include <filesystem>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
-
-namespace fs = std::filesystem;
 
 using namespace sirius;
 using namespace sirius::op::scan;
@@ -67,13 +63,6 @@ duckdb::DataTable& get_storage(duckdb::Connection& con, const std::string& table
   REQUIRE(entry);
   return entry->Cast<duckdb::DuckTableEntry>().GetStorage();
 }
-
-// Keeps the throwaway DuckDB below on the CPU path; the ingestible ctor itself never
-// needs the extension. Restores on scope exit so later tests can build Sirius envs.
-struct sirius_disable_guard {
-  sirius_disable_guard() { setenv("SIRIUS_DISABLE", "1", 1); }
-  ~sirius_disable_guard() { unsetenv("SIRIUS_DISABLE"); }
-};
 
 // The remap is channel bookkeeping, so a host-only stand-in filter suffices —
 // push_filter accepts any non-null sirius_dynamic_filter.
@@ -150,15 +139,13 @@ std::unique_ptr<duckdb_native_ingestible_table_info> make_info(
 TEST_CASE("duckdb-native ingestible installs the dynamic-filter column remap",
           "[scan][duckdb_native][dynamic_filter]")
 {
-  sirius_disable_guard disable_sirius;
+  sirius::test::scoped_sirius_disable disable_sirius;
 
   // The ingestible ctor requires a single-file block manager, so the backing table
   // must live in a file-backed database (an in-memory one cannot serve it).
-  auto tmp = fs::temp_directory_path() / ("sirius-ddbnative-remap-" + std::to_string(::getpid()));
-  std::error_code ec;
-  fs::remove_all(tmp, ec);
-  fs::create_directories(tmp);
-  auto db_file = tmp / "remap.duckdb";
+  sirius::test::scratch_dir scratch{"ddbnative_remap"};
+  auto const& tmp = scratch.path();
+  auto db_file    = tmp / "remap.duckdb";
 
   duckdb::DuckDB db(db_file.string().c_str());
   duckdb::Connection con(db);
@@ -232,6 +219,4 @@ TEST_CASE("duckdb-native ingestible installs the dynamic-filter column remap",
       make_ingestible(make_info(storage, *con.context, all_cols, {2, 0}, 2, nullptr));
     REQUIRE(ingestible);
   }
-
-  fs::remove_all(tmp, ec);
 }

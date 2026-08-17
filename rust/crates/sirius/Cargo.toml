@@ -23,7 +23,7 @@ arrow-schema = "59"
 
 [dev-dependencies]
 # Building a `local_files` Substrait plan + a parquet fixture for the execute test.
-substrait = "0.63"
+substrait = "0.64"
 prost = "0.14"
 parquet = "59"
 tempfile = "3"

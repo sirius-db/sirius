@@ -288,6 +288,13 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   mutable bool unique_probe_keys = false;
 
+  //! When the planner could not *prove* build-key uniqueness, test it at runtime instead (one hash
+  //! pass over the build keys) and, if the keys are in fact distinct, take the single-pass
+  //! cudf::distinct_hash_join path rather than the general two-pass multiset path. Proving
+  //! uniqueness statically needs a declared PRIMARY KEY on a catalog table. Set from
+  //! operator_params at planning time.
+  bool runtime_distinct_build_probe = config::DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE;
+
   //! Row-count ratio gate for switching STANDARD-mode MARK joins to cudf::mark_join (build on the
   //! left/output side) instead of filtered_join (build on the right side). Switch when
   //! right_rows >= ratio * left_rows; 0 disables. Set from operator_params at planning time.
@@ -307,8 +314,11 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
    * requires that no column referenced by an equality condition appears in any inequality
    * condition on the same side — cuDF's mixed_join API requires disjoint equality and
    * conditional table columns.
+   *
+   * @param join_type Used to exclude MARK joins from null-safe routing.
    */
-  static bool are_conditions_supported(duckdb::vector<sirius::join_condition>& conditions);
+  static bool are_conditions_supported(duckdb::vector<sirius::join_condition>& conditions,
+                                       duckdb::JoinType join_type);
 
   [[nodiscard]] bool is_right_family() const
   {
@@ -326,6 +336,23 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// states), marking broadcast, and pre-sizing the build/probe input repositories. Returns the
   /// decision so the partition can finish its own wiring (e.g. enabling build-side concat_all).
   partition_strategy get_partition_strategy(const partition_sizing_input& in) override;
+
+  /// True when this join publishes dynamic filters (a filter-pushdown plan with wired probe
+  /// targets). The upstream PARTITION folds a single-partition build to one batch for such a join
+  /// so the one-shot publisher sees the whole key set.
+  [[nodiscard]] bool publishes_dynamic_filters() const;
+
+  /// The per-GPU hash-table byte budget (also the upstream PARTITION's bound on folding a build
+  /// whole for dynamic-filter publication).
+  [[nodiscard]] uint64_t max_build_hash_table_bytes() const noexcept
+  {
+    return _max_build_hash_table_bytes;
+  }
+
+  /// Reported by the upstream PARTITION at sizing time: the build port will deliver one
+  /// concat-folded batch covering the entire build side (single-partition or broadcast build).
+  /// Precondition for claiming a build batch for dynamic-filter publication, in any join mode.
+  void set_build_arrives_whole(bool arrives_whole);
 
   /// @brief True when this join runs in build-then-probe mode (see `get_partition_strategy`).
   [[nodiscard]] bool is_build_probe_mode();
@@ -379,6 +406,12 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   // Broadcast (small build table) BUILD_PROBE join: the build side is replicated to every slot and
   // the probe side is streamed unpartitioned.
   bool _broadcast = false;
+
+  // Whether the build port delivers one concat-folded batch covering the entire build side
+  // (single-partition or broadcast build with a concat_all'd build-side CONCAT). Set by the
+  // upstream PARTITION at sizing time; the one-shot dynamic-filter publisher only claims a build
+  // batch when this holds. Guarded by op_state_mutex.
+  bool _build_arrives_whole = false;
 
   // Whether any build-side join key column contains a NULL. Used exclusively for MARK join
   // three-valued logic. Sentinel -1 = unset, 0 = false, 1 = true. Join-wide (not per-partition)

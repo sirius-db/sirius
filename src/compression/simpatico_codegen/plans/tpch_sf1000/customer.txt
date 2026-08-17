@@ -41,10 +41,9 @@ str_split.chars -> ans
 str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 
 ---
-# column: c_acctbal  dtype: t26  ratio: 1.979x  depth: 1
-# comp: 370.85 GB/s  decomp: 565.41 GB/s
-input -> ans
-
+# column: c_acctbal  dtype: t26  ratio: 3.033x  depth: 1
+# comp: 123.36 GB/s  decomp: 279.02 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 ---
 # column: c_mktsegment  dtype: str  ratio: 33.873x  depth: 2
 # comp: 208.36 GB/s  decomp: 256.04 GB/s

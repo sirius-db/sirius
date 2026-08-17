@@ -480,7 +480,7 @@ void sirius_pipeline_converter::link_join_partition_siblings()
 
 void sirius_pipeline_converter::configure_partition_min_partitions()
 {
-  // Pull num_gpus from the build context (populated from sirius_engine's hardware topology at
+  // Pull num_gpus from the build context (derived from sirius_engine's configured GPU set at
   // convert time). Single-GPU runs keep the consumer default of 1 (no-op). For multi-GPU we hand
   // num_gpus to each partition's downstream sizing consumer, which derives the partition floor and
   // small-table threshold internally (see natural_num_partitions / partition_small_table_bytes) and
@@ -536,7 +536,7 @@ std::string dump_barrier_name(op::MemoryBarrierType b)
 void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_operator& op)
 {
   if (op.type != op::SiriusPhysicalOperatorType::GPU_SCAN) { return; }
-  auto const& info = op.Cast<op::scan::sirius_gpu_scan_operator>().peek_table_info();
+  auto const& info = op.Cast<op::scan::sirius_gpu_scan_operator>().get_ingestible().table_info();
   if (auto const* pq = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&info)) {
     out << "      scan: parquet files=[";
     for (std::size_t f = 0; f < pq->resolved_file_paths.size(); ++f) {

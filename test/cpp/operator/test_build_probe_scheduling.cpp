@@ -108,6 +108,19 @@ TEST_CASE("compute_hash_join_partition_strategy - single-GPU small foldable inne
   REQUIRE(s.build_probe);
 }
 
+TEST_CASE("compute_hash_join_partition_strategy rejects a zero partition target",
+          "[hash_join][build_probe][unit][config]")
+{
+  REQUIRE_THROWS_AS(strategy(k100MB,
+                             /*is_build_side=*/true,
+                             /*build_foldable=*/true,
+                             /*num_gpus=*/1,
+                             duckdb::JoinType::INNER,
+                             HASH_JOIN_MODE::STANDARD,
+                             /*hash_partition_bytes=*/0),
+                    std::invalid_argument);
+}
+
 TEST_CASE(
   "compute_hash_join_partition_strategy - single-GPU build over the batch target still "
   "BUILD_PROBEs within the hash-table budget",

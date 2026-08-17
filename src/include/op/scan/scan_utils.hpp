@@ -26,7 +26,10 @@
 
 // standard library
 #include <optional>
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace sirius::op {
 
@@ -60,6 +63,13 @@ std::vector<std::optional<std::size_t>> build_batch_column_map(
  * partition filters at the file-list level when hive_partitioning is enabled, so dropping them
  * here is safe.
  *
+ * @p boolean_substituted_primary_indices names columns that arrive already reduced to a BOOL8
+ * predicate result (see @ref extract_string_equality_pushdown and
+ * @c sirius::decode_equality_pushdown). Their filter is not re-expressed as a comparison; the
+ * batch column *is* the answer, so it contributes a bare boolean reference instead. Passing a
+ * column here whose batch column is not actually BOOL8 silently mis-types the expression, so
+ * callers must confirm the substitution happened for the batch in hand.
+ *
  * Returns nullptr if the filter set is empty or contains only unsupported/skipped filter types.
  */
 duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
@@ -67,7 +77,28 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
   const duckdb::vector<duckdb::ColumnIndex>& column_ids,
   const duckdb::vector<sirius::logical_type>& returned_types,
   const std::vector<std::optional<std::size_t>>& batch_position_by_column_id,
-  const std::unordered_set<std::size_t>& skip_primary_indices = {});
+  const std::unordered_set<std::size_t>& skip_primary_indices                = {},
+  const std::unordered_set<std::size_t>& boolean_substituted_primary_indices = {});
+
+/**
+ * @brief Per-column string constants for filters that are pure equality / IN tests.
+ *
+ * Returns, keyed by column primary index, the value set a column is compared
+ * against when its whole pushed-down filter is an equality, an @c IN, or an OR of
+ * those over non-null VARCHAR constants (an ANDed @c IS NOT NULL is absorbed —
+ * an equality already rejects nulls). Columns with any other filter shape, or a
+ * non-string constant, are absent.
+ *
+ * This is the decision input for pushing a predicate into decompression: such a
+ * column can be answered off a dictionary's key set instead of being decoded
+ * (@c simpatico::decode_predicate). The caller must additionally confirm the
+ * column is never projected — the pushdown replaces its values with a BOOL8
+ * mask — and that its compression plan can actually exploit it.
+ */
+std::unordered_map<std::size_t, std::vector<std::string>> extract_string_equality_pushdown(
+  const duckdb::TableFilterSet& filters,
+  const duckdb::vector<duckdb::ColumnIndex>& column_ids,
+  const duckdb::vector<sirius::logical_type>& returned_types);
 
 /**
  * @brief Bridge a DuckDB filter expression through sirius::ast::from_duckdb into the

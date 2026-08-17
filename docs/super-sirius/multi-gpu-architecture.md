@@ -18,7 +18,9 @@ LOAD 'sirius.duckdb_extension';
 SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 ```
 
-The engine assumes a single process pinning all visible GPUs (`CUDA_VISIBLE_DEVICES` controls which GPUs Sirius can use). There is no notion of distributed multi-node execution in this codebase.
+The engine assumes a single process pinning the configured subset of visible GPUs
+(`CUDA_VISIBLE_DEVICES` bounds which GPUs Sirius can use; `sirius.topology` selects from that
+set). There is no notion of distributed multi-node execution in this codebase.
 
 ## Tier Hierarchy
 
@@ -238,7 +240,9 @@ After a downgrade frees enough space, the rescheduled task retries. The reservat
 
 - **Consumer-grade GPUs (e.g., RTX 6000 Ada Generation)** may advertise P2P peer access via `cudaDeviceCanAccessPeer` but silently fail actual DMA transfers. The empirical probe (`probe_peer_dma_works`) catches this at startup and routes affected pairs through host-staging.
 - **NUMA topology discovery** runs at startup. The `topology_discovery` component reads `/sys/class/drm/card*/device/numa_node` (and equivalents) to determine each GPU's NUMA node, then pairs each GPU with its NUMA-local host region. Without this, host-tier downgrade traffic crosses the NUMA boundary, halving effective bandwidth.
-- **`CUDA_VISIBLE_DEVICES`** is the canonical way to scope which GPUs Sirius uses. Setting it to `0` runs the engine in single-GPU mode (no distribution, no cross-GPU transfers); setting it to `0,1` enables full multi-GPU.
+- **`CUDA_VISIBLE_DEVICES`** scopes which GPUs Sirius may use. With the automatic topology
+  default, `CUDA_VISIBLE_DEVICES=0,1` enables both visible GPUs. Set `sirius.topology.num_gpus` to
+  use only a prefix of that visible set, or use `gpu_ids` to select a non-prefix subset.
 - **Single-process scope.** Sirius runs as a single OS process. Multi-process / multi-node execution is out of scope; the user is responsible for partitioning at a higher layer if needed.
 
 ## Key Source Files

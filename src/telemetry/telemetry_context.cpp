@@ -31,6 +31,7 @@
 #include <format>
 #include <memory>
 #include <ranges>
+#include <stdexcept>
 #include <string>
 
 namespace sirius::telemetry {
@@ -50,8 +51,19 @@ telemetry_context::telemetry_context(const sirius::telemetry_config& config,
     worker_uuid_(uuid::now_v7()),
     query_group_uuid_(uuid::now_v7()),
     shared_group_uuid_(uuid::now_v7()),
-    context_(
-      quent::create_context(config.enable_quent ? "ndjson" : "noop", config.output_directory)),
+    context_(quent::create_context([&config] {
+      if (!config.enable_quent) { return quent::ExporterOptions::none(); }
+      if (config.exporter == "ndjson") {
+        return quent::ExporterOptions::ndjson(config.output_directory);
+      }
+      if (config.exporter == "msgpack") {
+        return quent::ExporterOptions::msgpack(config.output_directory);
+      }
+      if (config.exporter == "postcard") {
+        return quent::ExporterOptions::postcard(config.output_directory);
+      }
+      throw std::invalid_argument(std::format("unknown Quent exporter: {}", config.exporter));
+    }())),
     engine_observer_(quent::engine::create_observer(*context_)),
     worker_observer_(quent::worker::create_observer(*context_)),
     query_group_observer_(quent::query_group::create_observer(*context_))

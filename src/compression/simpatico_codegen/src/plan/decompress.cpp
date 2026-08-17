@@ -4,9 +4,11 @@
 #include "codegen/plan/bitjoin_layout.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
 
+#include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_factories.hpp>
+#include <cudf/scalar/scalar.hpp>
 
 #include <rmm/device_buffer.hpp>
 #include <rmm/resource_ref.hpp>
@@ -50,6 +52,8 @@ const char* codegen_dtype_str_for(cudf::data_type type)
   switch (type.id()) {
     case cudf::type_id::INT8: return "int8";
     case cudf::type_id::UINT8: return "uint8";
+    case cudf::type_id::INT16: return "int16";
+    case cudf::type_id::UINT16: return "uint16";
     case cudf::type_id::INT32: return "int32";
     case cudf::type_id::INT64: return "int64";
     case cudf::type_id::UINT32: return "uint32";
@@ -110,7 +114,8 @@ class DecodeWalk {
   DecodeWalk(PlanTree const& tree,
              rmm::cuda_stream_view stream,
              rmm::device_async_resource_ref const& mr,
-             std::string* error_out);
+             std::string* error_out,
+             decode_predicate const* pred);
 
   cudf::column const* materialize(NodeId nid);
   std::unique_ptr<cudf::column> run();
@@ -118,11 +123,19 @@ class DecodeWalk {
  private:
   std::unique_ptr<cudf::column> materialize_fused_node(NodeId nid);
 
+  /// True when @p nid produces the column's final value and a predicate is
+  /// pending — the one place a rep may answer the predicate instead of decoding.
+  [[nodiscard]] bool predicate_applies_to(NodeId nid) const;
+
   PlanTree const& tree;
   rmm::cuda_stream_view stream;
   rmm::device_async_resource_ref mr;
   std::string* error_out;
   DecodeMemo memo;
+  /// Borrowed; null when the caller wants the column itself.
+  decode_predicate const* pred = nullptr;
+  /// Set once a rep has answered `pred`, so run() knows not to compare again.
+  bool predicate_resolved = false;
 };
 
 std::string value_label(ValueId v)
@@ -725,7 +738,17 @@ cudf::column const* DecodeWalk::materialize(NodeId nid)
       if (error_out) *error_out = err;
       return nullptr;
     }
-    col = decompress_standalone_representation(rep.get(), stream, mr, error_out);
+    // The dictionary rep is fully formed here — keys and indices both — and its
+    // decompress() is the gather we want to skip. Answer the predicate straight
+    // off the keys instead; a nullptr means the rep declined (unexpected index
+    // type, null keys) and we fall through to the ordinary decode + compare.
+    if (predicate_applies_to(nid)) {
+      if (auto const* dict = dynamic_cast<dictionary_compressed_representation const*>(rep.get())) {
+        col = dict->decompress_predicate(*pred, stream, mr);
+        if (col) { predicate_resolved = true; }
+      }
+    }
+    if (!col) { col = decompress_standalone_representation(rep.get(), stream, mr, error_out); }
     memo.kept.push_back(std::move(rep));
   }
   if (!col) return nullptr;
@@ -737,14 +760,28 @@ cudf::column const* DecodeWalk::materialize(NodeId nid)
 DecodeWalk::DecodeWalk(PlanTree const& tree,
                        rmm::cuda_stream_view stream,
                        rmm::device_async_resource_ref const& mr,
-                       std::string* error_out)
-  : tree(tree), stream(stream), mr(mr), error_out(error_out)
+                       std::string* error_out,
+                       decode_predicate const* pred)
+  : tree(tree),
+    stream(stream),
+    mr(mr),
+    error_out(error_out),
+    pred(pred != nullptr && pred->active() ? pred : nullptr)
 {
   for (auto const& node : tree.nodes) {
     for (auto const& src : node.input_sources) {
       ++memo.remaining_consumers[value_id_key(src)];
     }
   }
+}
+
+bool DecodeWalk::predicate_applies_to(NodeId nid) const
+{
+  if (pred == nullptr || predicate_resolved) { return false; }
+  // Only the node that produces the column's final value (node 0, port 0) may
+  // answer the predicate; an inner node's output is an intermediate channel.
+  auto const& sources = tree.nodes[nid].input_sources;
+  return !sources.empty() && sources.front() == ValueId{0, 0};
 }
 
 std::unique_ptr<cudf::column> DecodeWalk::run()
@@ -773,6 +810,31 @@ std::unique_ptr<cudf::column> DecodeWalk::run()
   }
   cudaStreamSynchronize(stream.value());
   auto result = std::move(root_it->second);
+
+  // Generic fallback: a predicate was requested but no rep could answer it off
+  // its compressed form, so the column was decoded in full. Compare here so the
+  // "directive ⇒ BOOL8 result" contract holds for every plan shape — callers
+  // rewrite their filter expression on the strength of it.
+  if (pred != nullptr && !predicate_resolved && result) {
+    auto const bool_t = cudf::data_type{cudf::type_id::BOOL8};
+    std::unique_ptr<cudf::column> mask;
+    for (auto const& value : pred->equals_any) {
+      cudf::string_scalar const needle(value, true, stream);
+      auto hit = cudf::binary_operation(
+        result->view(), needle, cudf::binary_operator::EQUAL, bool_t, stream, mr);
+      mask = mask
+               ? cudf::binary_operation(
+                   mask->view(), hit->view(), cudf::binary_operator::LOGICAL_OR, bool_t, stream, mr)
+               : std::move(hit);
+    }
+    if (!mask) {
+      if (error_out) *error_out = "decompress: predicate directive carried no values";
+      return nullptr;
+    }
+    cudaStreamSynchronize(stream.value());
+    result = std::move(mask);
+  }
+
   if (error_out) error_out->clear();
   return result;
 }
@@ -792,7 +854,8 @@ std::unique_ptr<cudf::column> decode_fused_subtree(PlanTree const& tree,
 std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
                                                 rmm::cuda_stream_view stream,
                                                 rmm::device_async_resource_ref mr,
-                                                std::string* error_out)
+                                                std::string* error_out,
+                                                decode_predicate const* pred)
 {
   nvtx3::scoped_range nvtx_range{"simpatico::decompress_column"};
 
@@ -801,8 +864,22 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
     return nullptr;
   }
 
-  DecodeWalk walk{tree, stream, mr, error_out};
+  DecodeWalk walk{tree, stream, mr, error_out, pred};
   return walk.run();
+}
+
+bool plan_supports_predicate_decode(PlanTree const& tree)
+{
+  if (tree.nodes.empty() || tree.nodes[0].op != "input") { return false; }
+  // The producer of the column's final value is whichever node consumes (0,0).
+  // Only `dictionary` can answer a predicate off its compressed form.
+  for (NodeId nid = 1; nid < tree.nodes.size(); ++nid) {
+    auto const& sources = tree.nodes[nid].input_sources;
+    if (!sources.empty() && sources.front() == ValueId{0, 0}) {
+      return tree.nodes[nid].op == "dictionary";
+    }
+  }
+  return false;
 }
 
 }  // namespace simpatico

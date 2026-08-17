@@ -24,6 +24,7 @@
 #include <duckdb.hpp>
 #include <duckdb/common/enums/optimizer_type.hpp>
 #include <duckdb/main/config.hpp>
+#include <utils/log_test_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/tpch_queries.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
@@ -3989,11 +3990,16 @@ TEST_CASE("gpu_execution - empty parquet count identity",
                    "COPY (SELECT 1 AS i WHERE false) TO " +
                      sql_string_literal(parquet_path.string()) + " (FORMAT PARQUET);");
   require_query_ok(*fixture.con, "SET gpu_execution = true;");
-  auto result = compare_gpu_vs_cpu_with_watchdog(
+  require_query_ok(*fixture.con, "SET enable_compressed_materialization = false;");
+  auto const before_stats = sirius::test::get_compressed_materialization_stats(*fixture.con);
+  auto result             = compare_gpu_vs_cpu_with_watchdog(
     *fixture.con,
     "select count(*) as c from read_parquet(" + sql_string_literal(parquet_path.string()) + ");",
     std::chrono::seconds{30},
     [&fixture] { fixture.leak_after_timeout(); });
+  auto const after_stats = sirius::test::get_compressed_materialization_stats(*fixture.con);
+  REQUIRE(after_stats.scan_columns_narrowed == before_stats.scan_columns_narrowed);
+  REQUIRE(after_stats.scan_columns_restored == before_stats.scan_columns_restored);
   REQUIRE(result.row_count == 1);
   REQUIRE(result.column_count == 1);
   CHECK(result.rows == std::vector<std::vector<std::string>>{{"0"}});
@@ -4410,7 +4416,12 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 20 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q20]")
 {
+  sirius::test::scoped_recording_log_sink logs{"warn"};
   RUN_TPCH_MGPU(sirius::test::kTpchQ20);
+  for (auto const& record : logs.records()) {
+    CHECK(record.message.find("RIGHT_DELIM_JOIN") == std::string::npos);
+    CHECK(record.message.find("output batch") == std::string::npos);
+  }
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
