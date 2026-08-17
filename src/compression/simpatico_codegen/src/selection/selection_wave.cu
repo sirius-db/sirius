@@ -86,12 +86,19 @@ struct mask_src_ptrs {
 
 // dst = AND of n srcs, uint4-vectorized (num_words is a multiple of 4: masks
 // are 32 words per chunk). Grid-stride.
-__global__ void mask_and_combine_kernel(uint32_t* __restrict__ dst,
+//
+// dst is NOT __restrict__: combine_masks_and's caller aliases it against
+// srcs.p[0] by design (an in-place AND-into-the-first-source), so promising
+// no-alias here would be a lie the compiler is free to act on. Each thread
+// only ever reads then writes its own quad index, so the aliasing is benign
+// in practice, but the qualifier's absence keeps that true by construction
+// rather than by accident of today's codegen.
+__global__ void mask_and_combine_kernel(uint32_t* dst,
                                         mask_src_ptrs srcs,
                                         int num_srcs,
                                         int64_t num_quads)
 {
-  auto* __restrict__ d4 = reinterpret_cast<uint4*>(dst);
+  auto* d4 = reinterpret_cast<uint4*>(dst);
   int64_t const stride  = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t q = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; q < num_quads;
        q += stride) {
