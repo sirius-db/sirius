@@ -95,13 +95,16 @@ membership_snapshot snapshot_membership_probes(sirius::op::sirius_dynamic_filter
       } else if (filter->kind() == sirius::op::sirius_dynamic_filter_kind::BLOOM) {
         kind_rank = 2;
       }
-      // The closure co-owns the filter and binds device 0 (GPU-tier pinned
-      // decode; compute_mask re-validates the device itself).
+      // The closure co-owns the filter. It is snapshotted before the balancer
+      // assigns this split's chunk to a GPU, so the device isn't known yet
+      // here; pass -1 so compute_mask resolves it from the CURRENT CUDA
+      // device at probe time, which the task scheduler has already set to
+      // the chunk's assigned GPU by then.
       snap.probes[i].push_back(
         {[f = std::move(filter), applicable](cudf::column_view const& keys,
                                              rmm::cuda_stream_view s,
                                              rmm::device_async_resource_ref mr) {
-           return applicable->compute_mask(keys, /*device_id=*/0, s, mr);
+           return applicable->compute_mask(keys, /*device_id=*/-1, s, mr);
          },
          kind_rank,
          num_keys});
