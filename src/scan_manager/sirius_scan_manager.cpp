@@ -834,7 +834,7 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
   // A bundle whose pinned columns are COMPRESSED is worth more than its ride
   // alone once the scan can skip decoding what it replaces with a rowid, so it
   // gets its own floor. The two are the same number until someone measures the
-  // difference (SIRIUS_LATE_MAT_MIN_VALUE_COMPRESSED).
+  // difference (SIRIUS_EXP_LATE_MAT_MIN_VALUE_COMPRESSED).
   bool const compressed_origin =
     std::any_of(entry.device_chunks.begin(), entry.device_chunks.end(), [](auto const& chunk) {
       return chunk.compressed != nullptr;

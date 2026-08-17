@@ -125,23 +125,23 @@ std::vector<std::string> const kNames{"c_custkey", "c_name", "c_nationkey"};
 TEST_CASE("the probe selection reads the gate", "[late_mat][pin_uniqueness]")
 {
   {
-    scoped_env off{"SIRIUS_LATE_MAT_PIN_UNIQUE_COLS", nullptr};
+    scoped_env off{"SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", nullptr};
     auto const selected = pin_unique_probe_selection(kNames);
     REQUIRE(selected == std::vector<bool>{false, false, false});
   }
   {
-    scoped_env none{"SIRIUS_LATE_MAT_PIN_UNIQUE_COLS", "none"};
+    scoped_env none{"SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", "none"};
     REQUIRE(pin_unique_probe_selection(kNames) == std::vector<bool>{false, false, false});
   }
   {
-    scoped_env all{"SIRIUS_LATE_MAT_PIN_UNIQUE_COLS", "all"};
+    scoped_env all{"SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", "all"};
     REQUIRE(pin_unique_probe_selection(kNames) == std::vector<bool>{true, true, true});
   }
   {
     // A name list is the usual setting; spelling and spacing are forgiving, and
     // a name that matches nothing in THIS table is not an error, since one
     // setting covers a suite of pins over different tables.
-    scoped_env named{"SIRIUS_LATE_MAT_PIN_UNIQUE_COLS", " C_CustKey , o_orderkey,c_nationkey"};
+    scoped_env named{"SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", " C_CustKey , o_orderkey,c_nationkey"};
     REQUIRE(pin_unique_probe_selection(kNames) == std::vector<bool>{true, false, true});
   }
 }

@@ -86,7 +86,7 @@ std::vector<bool> pin_unique_probe_selection(std::span<std::string const> column
 {
   std::vector<bool> selected(column_names.size(), false);
 
-  char const* raw = std::getenv("SIRIUS_LATE_MAT_PIN_UNIQUE_COLS");
+  char const* raw = std::getenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS");
   if (raw == nullptr || raw[0] == '\0') { return selected; }
   std::string const spec = lowered(raw);
   if (spec == "0" || spec == "none" || spec == "off") { return selected; }
@@ -123,7 +123,7 @@ std::vector<bool> pin_unique_probe_selection(std::span<std::string const> column
 std::size_t exact_uniqueness_row_cap()
 {
   static std::size_t const value = []() -> std::size_t {
-    char const* v = std::getenv("SIRIUS_LATE_MAT_EXACT_MAX_ROWS");
+    char const* v = std::getenv("SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS");
     if (v == nullptr || v[0] == '\0') { return 300'000'000; }
     char* end         = nullptr;
     auto const parsed = std::strtoull(v, &end, 10);

@@ -1385,7 +1385,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   }
 
   // Late-mat uniqueness probe: which pinned columns to observe for whole-table
-  // distinctness (off unless SIRIUS_LATE_MAT_PIN_UNIQUE_COLS asks for it). The
+  // distinctness (off unless SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS asks for it). The
   // names outlive cache_info, which every insert path moves from.
   auto const pinned_column_names = cache_info.column_names();
   auto probe_unique_columns = sirius::late_mat::pin_unique_probe_selection(pinned_column_names);

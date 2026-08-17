@@ -17,7 +17,7 @@
 #pragma once
 
 // Pin-time proof that a column's values are distinct across a whole pinned
-// table (env gate: SIRIUS_LATE_MAT_PIN_UNIQUE_COLS).
+// table (env gate: SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS).
 //
 // This fact is what lets a ride survive a GROUP BY: if the deferred columns are
 // functionally determined by a key that is unique over the pinned table, the
@@ -78,7 +78,7 @@
 
 namespace sirius::late_mat {
 
-/// Which pinned columns to observe, from `SIRIUS_LATE_MAT_PIN_UNIQUE_COLS`,
+/// Which pinned columns to observe, from `SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS`,
 /// positional with @p column_names:
 ///
 ///   unset / "" / "0" / "none"  -> nothing observed (the probe is off)
@@ -92,7 +92,7 @@ namespace sirius::late_mat {
 [[nodiscard]] std::vector<bool> pin_unique_probe_selection(
   std::span<std::string const> column_names);
 
-/// Row cap for the exact stage (SIRIUS_LATE_MAT_EXACT_MAX_ROWS, default 300M).
+/// Row cap for the exact stage (SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS, default 300M).
 ///
 /// The exact check sorts the whole assembled column, so on a fact table it is
 /// pin-time work measured in seconds — for a fact nobody asked for, since the

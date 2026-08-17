@@ -259,6 +259,49 @@ result materialization restore native carriers.
 `sirius.operator_params` and the DuckDB SET option. See
 [Compressed Materialization](compressed-materialization.md).
 
+### Late Materialization (unreleased, experimental)
+
+**Motivation:** A query that selects wide columns carries them from the scan to whatever finally
+reads them — through joins that copy them beside their keys, partitions that write them to a
+repository and read them back, and aggregates that group on them. Nothing in that stretch reads
+what is IN them. On TPC-H q10 at SF1000 the five wide `customer` columns are 158 B/row and cross
+eleven port boundaries before anything needs their values.
+
+**Mechanism:** For a PINNED table, the scan emits a pin-order rowid (UINT32 where the table's rows
+fit 32 bits, UINT64 otherwise) in place of the deferred columns plus 1-byte placeholders, so arity
+and positions are unchanged and every operator in between is unaffected. A directive on the
+consuming operator gathers the values back out of the pinned chunks, matching its batch by whole
+schema. Both halves install together or not at all. A plan pass reports how far each column travels
+and how many port crossings it survives; a policy with measured floors decides whether the ride
+repays the rowid.
+
+Where the deferred columns are GROUP BY keys, the ride can continue PAST the aggregates and
+materialize at their far side — one row per group instead of one per join match — when a column
+that rides real (or one of the deferred columns itself) is proven distinct over the whole pinned
+table and is a group key at every ridden aggregate. That proof is established once at pin time:
+per chunk, sorted with distinct == rows and pairwise-disjoint value ranges; then, for what that
+leaves undecided, an exact concatenate-sort-count under a row cap. Absence of a fact reads as
+UNKNOWN, never as "not unique". A second pinned table may join the same ride as a rider, carrying
+its own rowid, when its own columns prove it or when it meets the ride's scan on the two sides of
+one join equality with its side proven distinct.
+
+**Code path:**
+- `src/planner/late_mat_plan_pass.cpp` — column lifetimes, group-by/top-n/join modelling
+- `src/include/late_mat/defer_directive.hpp` — the pair, the substituted schemas, rowid widths
+- `src/include/late_mat/defer_policy.hpp` — value/boundary floors and their measurements
+- `src/late_mat/pin_uniqueness.cpp` — the pin-time distinctness proof
+- `src/scan_manager/sirius_scan_manager.cpp` — admission, the port hop, riders
+- `src/late_mat/port_materialize.cpp`, `materialize.cpp` — putting the values back
+- `src/op/scan/sirius_gpu_scan_operator.cpp` — rowid emission, including for filtered scans
+
+**Config:** `SIRIUS_EXP_LATE_MAT=1` gates the feature (off by default, inert when off);
+`SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS` selects the columns the uniqueness probe observes, without
+which no group-by-rowid ride is admissible. Five further `SIRIUS_EXP_LATE_MAT_*` knobs tune the
+floors and the dark count-on-deferred path. Requires `enable_compressed_materialization = false`
+to engage fully — narrowing a deferred column suppresses the deferral. Measured GB300 SF1000
+(narrowing off): suite 7.1878 s → 6.8801 s, q10 0.5202 s → 0.2359 s. See
+[Late Materialization](late-materialization.md).
+
 ### Row Group Pruning with Filter Pushdown (PR #363)
 
 **Motivation:** Scanning all row groups wastes I/O bandwidth when filter predicates can eliminate entire groups.
