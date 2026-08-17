@@ -57,18 +57,17 @@ namespace sirius::scan_manager {
  * conversion needs a thread to drive it. Concurrency across batches therefore
  * scales with num_threads. Each worker owns a private CUDA stream, but that
  * stream carries no copy traffic: the converter only synchronize()s it on
- * entry (a no-op — the only ops ever enqueued on it are consumer-event waits
- * from install_converted_representation, drained by that same call's tail
- * sync) and then runs all device allocation + H2D on a stream it acquires
- * internally from the target space's shared round-robin pool, exactly like
- * the scan task's own conversion path. The private stream exists as a stable
- * per-worker key for attaching the admission reservation to the allocation
- * tracker.
+ * entry (a no-op — nothing is ever enqueued on it) and then runs all device
+ * allocation + H2D on a stream it acquires internally from the target
+ * space's shared round-robin pool, exactly like the scan task's own
+ * conversion path. The private stream exists as a stable per-worker key for
+ * attaching the admission reservation to the allocation tracker.
  *
  * Races with a consumer are arbitrated by the data_batch state machine: the
  * conversion holds the exclusive (mutable) lock via try_to_mutable (skip on
- * contention), and prepare_for_processing re-checks the tier under its own
- * lock.
+ * contention, and — since the reader-event barrier — also while a recorded
+ * asynchronous reader of the batch is still in flight), and
+ * prepare_for_processing re-checks the tier under its own lock.
  *
  * Memory safety: converted batches live in connector queues, which the
  * downgrade executor does NOT scan (it walks data repositories), so

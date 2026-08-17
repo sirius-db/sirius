@@ -371,7 +371,7 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
     // read lock and is dropped with no stream sync of its own — the record must happen
     // after the enqueue and before the drop so a reclaim of the batch is ordered after
     // these in-flight reads.
-    input.table.record_consumer_event(stream);
+    input.table.record_reader_event(stream);
   } else {
     final_table = std::move(input.table);
   }

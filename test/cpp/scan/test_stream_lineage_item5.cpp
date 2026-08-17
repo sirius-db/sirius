@@ -20,9 +20,11 @@
 //     buffers to the caller's stream, so the Sirius steal path
 //     (scan_operator_input::prepare_for_processing) frees them in the consumer
 //     stream's order instead of on the idle conversion-pool stream.
-//   - The data_batch consumer-event API (record_consumer_event / await_consumers /
-//     consumers_done) orders batch-managed reclaims (install_converted_representation,
-//     set_data) after cross-stream reads recorded by consumers.
+//   - The data_batch reader-event API (read_only_data_batch::record_reader_event)
+//     orders reclaims after cross-stream reads: mutable acquisition (to_mutable /
+//     readonly_to_mutable) host-waits for every recorded reader event before
+//     exposing the representation, and try_to_mutable declines while one is
+//     still pending.
 //
 // The hazard, reached through convert_host_fast_to_gpu: converted GPU buffers
 // are allocated on a memory-space pool stream; if their eventual free retires on
@@ -33,15 +35,15 @@
 // paths must then be deterministically clean.
 //
 // The per-buffer rebind assertions (data / null mask / nested children bound to
-// the release stream) and the set_data consumer-event sync are pinned
-// deterministically at the cucascade layer
-// (cucascade/test/cudf/test_release_table_stream.cpp and
-// cucascade/test/data/test_consumer_events.cpp). This suite covers only what
-// the Sirius layer adds: the real converter registry + memory spaces behind
-// the steal-path stress, its matched sensitivity (non-vacuity) check, the
-// production downgrade discipline through install_converted_representation,
-// and the filtered-serving record path through owning_table_view's
-// type-erased owner.
+// the release stream) and the mutable-acquisition reader-event barrier are
+// pinned deterministically at the cucascade layer
+// (cucascade/test/cudf/test_release_table_stream.cpp and the reader-event
+// cases in cucascade/test/data/test_data_batch.cpp). This suite covers only
+// what the Sirius layer adds: the real converter registry + memory spaces
+// behind the steal-path stress, its matched sensitivity (non-vacuity) check,
+// the production downgrade discipline (to_mutable + rebind + convert_to), and
+// the filtered-serving record path through owning_table_view's type-erased
+// owner.
 
 #include "catch.hpp"
 #include "data/data_batch_utils.hpp"
@@ -420,9 +422,10 @@ TEST_CASE("rebinding a stolen column back to an idle foreign stream reproduces p
 }
 
 //===----------------------------------------------------------------------===//
-// 3. Consumer events order a convert_to reclaim after in-flight reads
+// 3. Reader events make a convert reclaim's mutable acquisition wait for
+//    in-flight reads
 //===----------------------------------------------------------------------===//
-TEST_CASE("consumer events order install_converted_representation after in-flight reads",
+TEST_CASE("reader events order a convert reclaim's mutable acquisition after in-flight reads",
           "[stream_lineage]")
 {
   stream_lineage_fixture f;
@@ -443,31 +446,36 @@ TEST_CASE("consumer events order install_converted_representation after in-fligh
   setup_stream.synchronize();
 
   // Reader: enqueue a slow read of the converted buffers on its own stream and
-  // record a consumer event AFTER the reads are enqueued (the API contract).
+  // record a reader event AFTER the reads are enqueued (the API contract).
   {
     auto ro         = batch->to_read_only();
     auto view       = sirius::get_cudf_table_view(ro);
     void const* src = view.column(0).head();
     enqueue_blockers(scratch, kScratchMiB << 20, reader_stream.view());
     cudaMemcpyAsync(result_dev, src, kBytes, cudaMemcpyDeviceToDevice, reader_stream.value());
-    ro.record_consumer_event(reader_stream.view());
-    REQUIRE_FALSE(batch->consumers_done());
+    ro.record_reader_event(reader_stream.view());
   }  // shared lock dropped with the read still in flight — the pre-fix hazard window
 
+  // The recorded event must be visible as a pending reader: with the shared
+  // lock already released, only the reader-event barrier can make the
+  // non-blocking mutable path decline. This also pins that the record was not
+  // a silent no-op.
+  REQUIRE_FALSE(batch->try_to_mutable().has_value());
+
   // Reclaimer: mirror the Sirius downgrade discipline (convertible_data_batch.hpp):
-  // rebind to the reclaim stream, then convert GPU -> host in place. With the
-  // consumer-event hooks, install_converted_representation must not destroy the
-  // old GPU representation until the recorded reader work has completed.
+  // acquire mutable access, rebind to the reclaim stream, then convert GPU ->
+  // host in place. With the reader-event barrier, to_mutable must host-block
+  // until the recorded reader work has completed, so the conversion cannot
+  // destroy the old GPU representation under the in-flight read.
   {
     auto mut = batch->to_mutable();
+    // to_mutable returned, so the reader's recorded reads must be complete.
+    CHECK(cudaStreamQuery(reader_stream.value()) == cudaSuccess);
     mut.rebind_stream(reclaim_stream.view());
     mut.convert_to<cucascade::host_data_representation>(
       sirius::converter_registry::get(), f.host0, reclaim_stream.view());
-    // The reclaim host-synced behind await_consumers: the reader's recorded
-    // reads must be complete by now.
-    CHECK(cudaStreamQuery(reader_stream.value()) == cudaSuccess);
-    REQUIRE(batch->consumers_done());
   }
+  REQUIRE(batch->try_to_mutable().has_value());
 
   // Churn the pool: if the reclaim had freed the GPU buffers early these
   // allocations would recycle them under the (by then already finished) read.
@@ -500,13 +508,13 @@ TEST_CASE("consumer events order install_converted_representation after in-fligh
 //      served as an owning_table_view whose type-erased owner is the batch's
 //      read_only_data_batch (the read-lock holder).
 //   2. post_filter_and_project: a select-like read of that view is enqueued on
-//      the task stream, then owning_table_view::record_consumer_event(stream)
+//      the task stream, then owning_table_view::record_reader_event(stream)
 //      — the call this test pins — records through the type erasure.
 //   3. The owner is dropped mid-flight (parquet reassigns `input` immediately
 //      after the select), releasing the read lock with the reads pending.
-//   4. A reclaim runs through the path that now awaits consumers
-//      (install_converted_representation via convert_to).
-TEST_CASE("filtered serving records consumer events through owning_table_view before owner drop",
+//   4. A reclaim acquires mutable access, whose reader-event barrier waits
+//      for the recorded reads, then converts in place.
+TEST_CASE("filtered serving records reader events through owning_table_view before owner drop",
           "[stream_lineage]")
 {
   stream_lineage_fixture f;
@@ -539,31 +547,33 @@ TEST_CASE("filtered serving records consumer events through owning_table_view be
     enqueue_blockers(scratch, kScratchMiB << 20, task_stream.view());
     void const* src = served.view().column(0).head();
     cudaMemcpyAsync(result_dev, src, kBytes, cudaMemcpyDeviceToDevice, task_stream.value());
-    served.record_consumer_event(task_stream.view());
-
-    // Non-vacuity: the record must reach the underlying batch through the
-    // type-erased owner. If the pass-through silently no-ops (e.g. the owner
-    // concept stops matching read_only_data_batch), this fails immediately.
-    REQUIRE_FALSE(batch->consumers_done());
+    served.record_reader_event(task_stream.view());
 
     // Step 3: drop the owner mid-flight, releasing the read lock — the
     // parquet reassignment shape.
     served.drop();
   }
 
-  // Step 4: reclaim through the production downgrade discipline. With the
-  // record in place, install_converted_representation must not destroy the old
-  // GPU representation until the recorded reads have completed.
+  // Non-vacuity: the record must reach the underlying batch through the
+  // type-erased owner. The read lock is gone, so only a pending reader event
+  // can make the non-blocking mutable path decline here. If the pass-through
+  // silently no-ops (e.g. the owner concept stops matching
+  // read_only_data_batch), this fails immediately.
+  REQUIRE_FALSE(batch->try_to_mutable().has_value());
+
+  // Step 4: reclaim through the production downgrade discipline. The
+  // reader-event barrier makes to_mutable host-block until the recorded reads
+  // have completed, so the conversion cannot destroy the old GPU
+  // representation under the still-pending select.
   {
     auto mut = batch->to_mutable();
+    // to_mutable returned, so the select-like read must be complete.
+    CHECK(cudaStreamQuery(task_stream.value()) == cudaSuccess);
     mut.rebind_stream(reclaim_stream.view());
     mut.convert_to<cucascade::host_data_representation>(
       sirius::converter_registry::get(), f.host0, reclaim_stream.view());
-    // The reclaim host-synced behind await_consumers: the select-like read
-    // must be complete by now.
-    CHECK(cudaStreamQuery(task_stream.value()) == cudaSuccess);
-    REQUIRE(batch->consumers_done());
   }
+  REQUIRE(batch->try_to_mutable().has_value());
 
   // Churn the pool: had the reclaim freed the GPU buffers early, these
   // allocations would have recycled them under the still-pending read.
