@@ -527,6 +527,27 @@ std::string classify_name(LogicalComparisonJoin& delim)
 
 }  // namespace
 
+TEST_CASE("delim direct - build-driven sizing exception excludes plain RIGHT joins",
+          "[delim_direct]")
+{
+  // The converter's sizing exception must hold exactly for joins this pass produces
+  // (RIGHT_SEMI / RIGHT_ANTI with a published filter) and never for stock shapes: plain RIGHT
+  // joins DO receive join-filter pushdown from DuckDB and must stay probe-driven.
+  using sirius::op::sirius_physical_hash_join;
+  STATIC_REQUIRE(
+    sirius_physical_hash_join::right_family_join_sizes_build_driven(JoinType::RIGHT_SEMI, true));
+  STATIC_REQUIRE(
+    sirius_physical_hash_join::right_family_join_sizes_build_driven(JoinType::RIGHT_ANTI, true));
+  STATIC_REQUIRE_FALSE(
+    sirius_physical_hash_join::right_family_join_sizes_build_driven(JoinType::RIGHT, true));
+  STATIC_REQUIRE_FALSE(
+    sirius_physical_hash_join::right_family_join_sizes_build_driven(JoinType::RIGHT_SEMI, false));
+  STATIC_REQUIRE_FALSE(
+    sirius_physical_hash_join::right_family_join_sizes_build_driven(JoinType::RIGHT_ANTI, false));
+  STATIC_REQUIRE_FALSE(
+    sirius_physical_hash_join::right_family_join_sizes_build_driven(JoinType::SEMI, true));
+}
+
 TEST_CASE_METHOD(delim_classify_fixture,
                  "delim direct - structural refusals are pinned per mutated shape",
                  "[delim_direct][isolated_context]")

@@ -333,6 +333,29 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
            join_type == duckdb::JoinType::RIGHT_ANTI;
   }
 
+  /// Pure sizing-exception predicate: a right-family join takes BUILD-driven partition sizing
+  /// (instead of the probe-driven right-family default) exactly when it is RIGHT_SEMI or
+  /// RIGHT_ANTI AND publishes dynamic filters — the build must fold and publish before the
+  /// probe scan launches. Restricted to those two types because stock DuckDB never attaches
+  /// join-filter pushdown to them (JoinFilterPushdownOptimizer::GenerateJoinFilters refuses
+  /// MARK/SINGLE/LEFT/OUTER/ANTI/RIGHT_ANTI/RIGHT_SEMI), so a DF-publishing
+  /// RIGHT_SEMI/RIGHT_ANTI join arises only from the delim-direct lowering, whose build is the
+  /// filtered outer relation. Plain RIGHT joins are routine in stock plans (LEFT flipped by
+  /// BuildProbeSideOptimizer) and CAN carry pushdown — they must keep probe-driven sizing:
+  /// nothing bounds the probe-side working set that 1-partition build-driven sizing implies.
+  [[nodiscard]] static constexpr bool right_family_join_sizes_build_driven(duckdb::JoinType type,
+                                                                           bool publishes_filters)
+  {
+    return (type == duckdb::JoinType::RIGHT_SEMI || type == duckdb::JoinType::RIGHT_ANTI) &&
+           publishes_filters;
+  }
+
+  /// Member form of right_family_join_sizes_build_driven over this join's own state.
+  [[nodiscard]] bool sizes_build_driven_for_filter_publication() const
+  {
+    return right_family_join_sizes_build_driven(join_type, publishes_dynamic_filters());
+  }
+
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
