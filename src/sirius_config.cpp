@@ -315,6 +315,7 @@ static void from_yaml(const YAML::Node& node, compression_config& opt)
   r.optional("device_pool_bytes", yaml::bytes(opt.device_pool_bytes));
   r.optional("spill_release_columns_early", opt.spill_release_columns_early);
   r.optional("spill_encode_reserve_fraction", opt.spill_encode_reserve_fraction);
+  r.optional("spill_encode_min_headroom_fraction", opt.spill_encode_min_headroom_fraction);
   r.reject_unknown();
 }
 

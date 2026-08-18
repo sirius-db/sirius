@@ -675,7 +675,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
                                                         comp.spill_explore_sample_rows,
                                                         comp.spill_min_batch_bytes,
                                                         comp.spill_release_columns_early,
-                                                        comp.spill_encode_reserve_fraction);
+                                                        comp.spill_encode_reserve_fraction,
+                                                        comp.spill_encode_min_headroom_fraction);
     // Before any query runs, so the arena comes off the top of a device that is
     // still empty rather than being asked for once the query pool has grown.
     if (comp.enable_spill_compression && comp.device_pool_bytes > 0) {

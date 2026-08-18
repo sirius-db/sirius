@@ -370,6 +370,11 @@ struct compression_config {
   /// spill_context.hpp::encode_reserve_fraction.
   double spill_encode_reserve_fraction{0.5};
 
+  /// Decline spill compression when free device memory is below this fraction of
+  /// capacity and no arena is configured. See
+  /// spill_context.hpp::encode_min_headroom_fraction.
+  double spill_encode_min_headroom_fraction{0.10};
+
   /// When true, the downgrade executor may satisfy a request by compressing
   /// batches in place on the device, instead of spilling them to host/disk.
   ///

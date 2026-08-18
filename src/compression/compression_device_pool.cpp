@@ -16,6 +16,7 @@
 
 #include "compression_device_pool.hpp"
 
+#include "compression_alloc_stats.hpp"
 #include "log/logging.hpp"
 
 #include <rmm/mr/cuda_memory_resource.hpp>
@@ -77,8 +78,10 @@ bool init_compression_device_pool(std::size_t bytes)
 
 rmm::device_async_resource_ref compression_device_mr()
 {
-  if (g_pool != nullptr) { return *g_pool; }
-  return rmm::mr::get_current_device_resource_ref();
+  // Wrapped in the counting adaptor only when SIRIUS_COMPRESSION_ALLOC_STATS is
+  // set; otherwise this returns the underlying resource unchanged.
+  if (g_pool != nullptr) { return alloc_stats_wrap(*g_pool); }
+  return alloc_stats_wrap(rmm::mr::get_current_device_resource_ref());
 }
 
 bool compression_device_pool_enabled() noexcept { return g_pool != nullptr; }

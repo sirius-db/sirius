@@ -100,6 +100,22 @@ struct spill_context {
   /// Reserving 1.0 would be safe but would almost never be grantable under the
   /// pressure that triggered the spill, silently disabling compression.
   double encode_reserve_fraction{0.5};
+
+  /// Decline to compress a spill when the device's free memory has fallen below
+  /// this fraction of its capacity, when there is no compression arena.
+  ///
+  /// Reserving the encode's working set is not enough on its own: the reservation
+  /// asks for a fraction of one batch (~95 MB for a 190 MB batch), which is still
+  /// grantable when only 4% of the pool is free, so it succeeds and the encode
+  /// then fails in the allocator instead. Free bytes also do not imply free
+  /// *contiguous* bytes, and CUDA exposes no largest-free-block attribute for a
+  /// mempool, so no reservation size can predict that failure.
+  ///
+  /// Below this much headroom the question is not whether one encode fits but
+  /// whether compressing is sane at all: its allocations compete with the query
+  /// that is already out of memory, and a failed encode costs the spill it was
+  /// meant to make cheaper. Spilling uncompressed is the cheaper answer.
+  double encode_min_headroom_fraction{0.10};
 };
 
 /// The calling thread's active spill context, or nullptr when none is installed.
@@ -191,7 +207,8 @@ void set_spill_compression_settings(bool enabled,
                                     std::size_t explore_sample_rows,
                                     std::size_t min_batch_bytes,
                                     bool release_columns_early,
-                                    double encode_reserve_fraction) noexcept;
+                                    double encode_reserve_fraction,
+                                    double encode_min_headroom_fraction) noexcept;
 
 /// Whether spill compression is enabled process-wide *and* not currently
 /// suppressed. This is the predicate the spill path consults.

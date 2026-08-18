@@ -372,6 +372,24 @@ std::unique_ptr<operator_data> sirius_physical_operator::get_next_task_input_dat
   return data;
 }
 
+void sirius_physical_operator::record_source_repos_if_absent(operator_data& data) const
+{
+  auto* pipelineable = dynamic_cast<pipelineable_operator_data*>(&data);
+  if (pipelineable == nullptr || pipelineable->has_source_repos()) { return; }
+
+  const ::cucascade::shared_data_repository* only_repo = nullptr;
+  for (auto const& [port_name, port_ptr] : ports) {
+    if (port_ptr == nullptr || port_ptr->repo == nullptr) { continue; }
+    if (only_repo != nullptr && only_repo != port_ptr->repo) { return; }  // ambiguous
+    only_repo = port_ptr->repo;
+  }
+  if (only_repo == nullptr) { return; }
+
+  pipelineable->set_source_repos(
+    std::vector<const ::cucascade::shared_data_repository*>(
+      pipelineable->get_data_batches().size(), only_repo));
+}
+
 bool sirius_physical_operator::all_ports_empty()
 {
   for (auto& [port_name, port_ptr] : ports) {

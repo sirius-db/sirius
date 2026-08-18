@@ -234,6 +234,7 @@ endif()
 
 # cmake-format: off
 set(EXTENSION_SOURCES
+    src/compression/compression_alloc_stats.cpp
     src/compression/compressed_disk_representation.cpp
     src/compression/compressed_representation.cpp
     src/compression/compression_converters.cpp

@@ -234,7 +234,8 @@ void reset_spill_state(bool enabled = true, std::uint64_t replan_after_uses = 0)
                                                       /*explore_sample_rows=*/0,
                                                       /*min_batch_bytes=*/0,
                                                       /*release_columns_early=*/false,
-                                                      /*encode_reserve_fraction=*/0.5);
+                                                      /*encode_reserve_fraction=*/0.5,
+                                                      /*encode_min_headroom_fraction=*/0.0);
 }
 
 /// Create a 1-column INT32 GPU batch with a known pattern [0, 1, 2, ..., n-1].
@@ -394,7 +395,8 @@ TEST_CASE("spill compression: releasing columns early still round-trips",
                                                       /*explore_sample_rows=*/0,
                                                       /*min_batch_bytes=*/0,
                                                       /*release_columns_early=*/true,
-                                                      /*encode_reserve_fraction=*/0.5);
+                                                      /*encode_reserve_fraction=*/0.5,
+                                                      /*encode_min_headroom_fraction=*/0.0);
   set_plan_1col(&repo_a(), kOneColDsl);
 
   const std::size_t n = 5000;
@@ -525,7 +527,8 @@ TEST_CASE("spill compression: per-column host->disk flush writes one file per co
                                                       /*explore_sample_rows=*/0,
                                                       /*min_batch_bytes=*/0,
                                                       /*release_columns_early=*/true,
-                                                      /*encode_reserve_fraction=*/0.5);
+                                                      /*encode_reserve_fraction=*/0.5,
+                                                      /*encode_min_headroom_fraction=*/0.0);
   set_plans(&repo_a(), {kOneColDsl, kOneColDsl});
 
   const std::size_t n = 5000;
@@ -733,7 +736,8 @@ TEST_CASE("spill compression: a batch under min_batch_bytes spills uncompressed"
                                                       /*explore_sample_rows=*/0,
                                                       /*min_batch_bytes=*/1ull << 30,
                                                       /*release_columns_early=*/false,
-                                                      /*encode_reserve_fraction=*/0.5);
+                                                      /*encode_reserve_fraction=*/0.5,
+                                                      /*encode_min_headroom_fraction=*/0.0);
 
   auto batch = make_int32_gpu_batch(1000);  // ~4 KB, far under the 1 GiB gate
 
@@ -751,7 +755,7 @@ TEST_CASE("spill compression: a batch under min_batch_bytes spills uncompressed"
   reset_spill_state(false);
 }
 
-TEST_CASE("spill compression: batch with no source edge spills uncompressed",
+TEST_CASE("spill compression: batch with no source edge compresses with dtype defaults",
           "[compression][spill][isolated_context]")
 {
   if (!has_gpu()) {
@@ -764,13 +768,22 @@ TEST_CASE("spill compression: batch with no source edge spills uncompressed",
 
   auto batch = make_int32_gpu_batch(1000);
 
-  // No repo pointer (e.g. a batch not sourced from a repository): the spill path
-  // has no plan key, so it must fall through to uncompressed rather than throw.
+  // No repo pointer (a batch the downgrade executor reached without a producing
+  // repository). There is no plan key and no lineage, but compression needs only
+  // a carrier: each column falls back to default_plan_for its dtype — bitpack
+  // here, which shrinks an int32 column. These batches are the bulk of spill
+  // traffic on q5/SF1000, so skipping them outright left most of the win unused.
   sirius::convertible_data_batch w(batch, nullptr);
   REQUIRE(w.convert({e.host_space}, e.stream(), *e.mgr, true).has_value());
 
-  REQUIRE_FALSE(is_compressed_host(*batch));
+  REQUIRE(is_compressed_host(*batch));
   REQUIRE(get_tier(*batch) == cucascade::memory::Tier::HOST);
+  require_restores_to(batch, nullptr, expected_sum_of(1000));
+
+  // Nothing is recorded against the register: there is no edge to record it
+  // against, so an unkeyed batch neither consumes plan uses nor steers a verdict.
+  REQUIRE_FALSE(
+    sirius::compression::plan_register::global().resolve_spill_plan(nullptr).has_value());
 
   reset_spill_state(false);
 }
@@ -826,8 +839,15 @@ TEST_CASE("spill compression: a plan that fails to compress falls back without t
   sirius::convertible_data_batch w(batch, &repo_a());
   REQUIRE_NOTHROW(w.convert({e.host_space}, e.stream(), *e.mgr, true));
 
-  REQUIRE_FALSE(is_compressed_host(*batch));
+  // The batch reaches the host tier intact either way. Where the failed column
+  // lands depends on its dtype: the fallback is the dtype's default carrier
+  // (bitpack for INT32 here), not plain identity, because identity leaves are
+  // reconstructed with cudf::make_numeric_column and so cannot round-trip a
+  // decimal or timestamp. Bitpack does shrink an int32 column, so this batch
+  // legitimately ends up compressed; what matters is that nothing threw and the
+  // values survive.
   REQUIRE(get_tier(*batch) == cucascade::memory::Tier::HOST);
+  require_restores_to(batch, &repo_a(), expected_sum_of(1000));
 
   // With error_tolerance 1 the failure is durable, so the column is written off
   // and the next batch skips compression instead of failing again.
@@ -856,7 +876,8 @@ TEST_CASE("spill compression: poor compression ratio falls back to uncompressed"
                                                       /*explore_sample_rows=*/0,
                                                       /*min_batch_bytes=*/0,
                                                       /*release_columns_early=*/false,
-                                                      /*encode_reserve_fraction=*/0.5);
+                                                      /*encode_reserve_fraction=*/0.5,
+                                                      /*encode_min_headroom_fraction=*/0.0);
   // A plan whose output is the same width as its input cannot reach 0.75.
   set_plan_1col(&repo_a(), kNonCompressingDsl);
 
@@ -892,7 +913,8 @@ TEST_CASE("spill compression: one incompressible column does not disable its nei
                                                       /*explore_sample_rows=*/0,
                                                       /*min_batch_bytes=*/0,
                                                       /*release_columns_early=*/false,
-                                                      /*encode_reserve_fraction=*/0.5);
+                                                      /*encode_reserve_fraction=*/0.5,
+                                                      /*encode_min_headroom_fraction=*/0.0);
 
   // Two identical columns: one bitpacks well, the other is given a plan that
   // cannot shrink it. Same data, so the outcome difference is purely the plan.
@@ -947,7 +969,8 @@ TEST_CASE("spill compression: a rejected edge is marked and later batches skip c
                                                       /*explore_sample_rows=*/0,
                                                       /*min_batch_bytes=*/0,
                                                       /*release_columns_early=*/false,
-                                                      /*encode_reserve_fraction=*/0.5);  // never expire
+                                                      /*encode_reserve_fraction=*/0.5,
+                                                      /*encode_min_headroom_fraction=*/0.0);  // never expire
   set_plan_1col(&repo_a(), kNonCompressingDsl);
 
   // First batch: compression runs, misses the threshold, and the edge is marked.
@@ -993,7 +1016,8 @@ TEST_CASE("spill compression: an unviable edge is re-explored once its entry exp
                                                       /*explore_sample_rows=*/0,
                                                       /*min_batch_bytes=*/0,
                                                       /*release_columns_early=*/false,
-                                                      /*encode_reserve_fraction=*/0.5);
+                                                      /*encode_reserve_fraction=*/0.5,
+                                                      /*encode_min_headroom_fraction=*/0.0);
   set_plan_1col(&repo_a(), kNonCompressingDsl);
 
   // First batch: rejected, edge marked unviable, one use recorded.

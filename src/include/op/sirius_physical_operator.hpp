@@ -287,6 +287,10 @@ class pipelineable_operator_data : public operator_data {
     return index < _source_repos.size() ? _source_repos[index] : nullptr;
   }
 
+  /// Whether set_source_repos() has been called. Lets a caller fill the origins
+  /// in for data built by a get_next_task_input_data() override that did not.
+  [[nodiscard]] bool has_source_repos() const { return !_source_repos.empty(); }
+
   /**
    * @brief Get idle data batch pointers, lazily populating from read-only batches if needed.
    */
@@ -721,6 +725,24 @@ class sirius_physical_operator {
 
   //! Get the input batch
   virtual std::unique_ptr<operator_data> get_next_task_input_data();
+
+  /**
+   * @brief Fill in @p data's per-batch source repositories when whoever built it
+   *        did not, so the spill path can key its compression plans.
+   *
+   * The base `get_next_task_input_data` records the origin of every batch it pops
+   * (see set_source_repos), but the overrides — CONCAT, the merges, the joins —
+   * build their own operator_data and none of them do. A batch that reaches the
+   * downgrade executor without an origin is not compressed at all: on q5/SF1000
+   * that was 117,915 "no source edge" skips against 874 compressed spills, and
+   * CONCAT (an overriding operator) is the query's dominant pipeline.
+   *
+   * Only unambiguous cases are filled: with exactly one repository-bearing input
+   * port every batch must have come from it. A multi-port operator (a join's
+   * build and probe sides) keeps an empty origin rather than a guessed one — the
+   * dtype-default path in convertible_data_batch covers those.
+   */
+  void record_source_repos_if_absent(operator_data& data) const;
 
   //! Check if all ports are empty
   [[nodiscard]] virtual bool all_ports_empty();

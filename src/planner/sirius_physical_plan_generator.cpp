@@ -1107,6 +1107,15 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
   op.estimated_cardinality                                      = op.EstimateCardinality(context);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan = nullptr;
 
+  // Read the lineage BEFORE planning this operator. `origins_of` asks the logical
+  // operator for its column bindings, and several planners consume the operator
+  // they are given — plan_delim_join moves the join's children out — after which
+  // GetColumnBindings() indexes an empty `children` and throws
+  // "Attempted to access index 0 within vector of size 0". That aborted GPU plan
+  // generation for every query with a correlated subquery (q2, q17, q18, q20 at
+  // TPC-H), which then ran on DuckDB CPU without saying so.
+  auto origins = _column_origins.origins_of(op);
+
   // SQLNULL-typed columns (e.g. an uncast NULL in VALUES) have no cuDF
   // representation — get_cudf_type() / fixed_width_byte_size() reject them at
   // execution time, after the GPU plan is already running. Reject the plan
@@ -1316,7 +1325,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
   // Carry base-table lineage onto the physical operator. Done here, in the one
   // dispatcher that sees both the logical operator (which owns the bindings) and
   // the physical operator built from it, rather than in each per-type overload.
-  plan->column_origins = _column_origins.origins_of(op);
+  // The lineage itself was read above, before the planner could consume `op`.
+  plan->column_origins = std::move(origins);
 #ifdef DUCKDB_VERIFY_VECTOR_OPERATOR
   auto verify = duckdb::make_uniq<duckdb::PhysicalVerifyVector>(std::move(plan));
   plan        = std::move(verify);

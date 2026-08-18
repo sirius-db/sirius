@@ -16,6 +16,7 @@
 
 #include "downgrade/downgrade_executor.hpp"
 
+#include "compression/compression_alloc_stats.hpp"
 #include "compression/output_compression.hpp"
 #include "compression/spill_context.hpp"
 #include "data/convertible_data.hpp"
@@ -598,7 +599,22 @@ void downgrade_executor::monitor_loop()
   auto last_occupancy_log      = std::chrono::steady_clock::now();
   constexpr auto kOccupancyLog = std::chrono::seconds(1);
 
+  // Cycles observing pressure, split by whether the monitor could act on it. Only
+  // one monitor request may be outstanding at a time, and the flag clears when
+  // that request completes, so a slow request leaves the monitor unable to
+  // respond to pressure that develops while it runs. The suppressed count says
+  // how much of an episode was spent in that state.
+  std::uint64_t pressure_cycles   = 0;
+  std::uint64_t suppressed_cycles = 0;
+
   while (_running.load()) {
+    const bool pressure  = _memory_space && _memory_space->should_downgrade_memory();
+    const bool in_flight = _monitor_request_enqueued.load(std::memory_order_relaxed);
+    if (pressure) {
+      ++pressure_cycles;
+      if (in_flight) { ++suppressed_cycles; }
+    }
+
     if (_memory_space) {
       const auto now = std::chrono::steady_clock::now();
       if (now - last_occupancy_log >= kOccupancyLog) {
@@ -606,18 +622,30 @@ void downgrade_executor::monitor_loop()
         const std::size_t cap  = _memory_space->get_max_memory();
         const std::size_t free = _memory_space->get_available_memory();
         const std::size_t used = cap > free ? cap - free : 0;
-        SIRIUS_LOG_DEBUG("[occupancy] [{}] used={}B free={}B capacity={}B ({:.1f}%)",
-                         _source_label,
-                         used,
-                         free,
-                         cap,
-                         cap > 0 ? 100.0 * static_cast<double>(used) / static_cast<double>(cap)
-                                 : 0.0);
+        SIRIUS_LOG_DEBUG(
+          "[occupancy] [{}] used={}B free={}B capacity={}B ({:.1f}%) | pressure_cycles={} "
+          "suppressed={} ({:.0f}%)",
+          _source_label,
+          used,
+          free,
+          cap,
+          cap > 0 ? 100.0 * static_cast<double>(used) / static_cast<double>(cap) : 0.0,
+          pressure_cycles,
+          suppressed_cycles,
+          pressure_cycles > 0 ? 100.0 * static_cast<double>(suppressed_cycles) /
+                                  static_cast<double>(pressure_cycles)
+                              : 0.0);
+        // Same cadence as occupancy so the two can be read together: what the
+        // encode is asking the allocator for, against how much room there was.
+        if (compression::alloc_stats_enabled()) {
+          SIRIUS_LOG_DEBUG("[compression_alloc] [{}] {}",
+                           _source_label,
+                           compression::alloc_stats_format());
+        }
       }
     }
 
-    if (_memory_space && _memory_space->should_downgrade_memory() &&
-        !_monitor_request_enqueued.load(std::memory_order_relaxed)) {
+    if (pressure && !in_flight) {
       // Stateless viability gate: only issue a downgrade request when one could plausibly free
       // memory. When idle GPU batches' only lower tier is a full HOST and no DISK is configured,
       // re-firing would just re-scan every repository and the task queue, free nothing, and spam

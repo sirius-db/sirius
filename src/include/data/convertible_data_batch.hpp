@@ -262,9 +262,19 @@ class convertible_data_batch : public convertible_data {
       SIRIUS_LOG_DEBUG("[convertible_data_batch] spill compression skip: suppressed-or-disabled");
       return false;
     }
+    // No edge key: the batch reached the downgrade executor without a producing
+    // repository, so the plan register has nothing to look up and no lineage to
+    // resolve. That is not a reason to spill it raw — compression does not need a
+    // plan, only a carrier. The converter falls back to `default_plan_for` per
+    // column (bitpack for fixed-width numerics, passthrough for strings), and the
+    // usual whole-batch threshold still declines the result if it does not pay.
+    //
+    // Worth doing because unkeyed batches are the bulk of the traffic: on
+    // q5/SF1000, 117,915 spill attempts skipped for this reason against 874
+    // compressed spills.
     if (_source_repo == nullptr) {
-      SIRIUS_LOG_DEBUG("[convertible_data_batch] spill compression skip: no source edge");
-      return false;
+      SIRIUS_LOG_DEBUG(
+        "[convertible_data_batch] no source edge; compressing with dtype defaults");
     }
 
     auto& reg      = compression::plan_register::global();

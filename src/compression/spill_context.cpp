@@ -40,6 +40,7 @@ std::atomic<std::size_t> g_explore_sample_rows{65536};
 std::atomic<std::size_t> g_spill_min_batch_bytes{64ULL * 1024 * 1024};
 std::atomic<bool> g_spill_release_columns_early{false};
 std::atomic<double> g_encode_reserve_fraction{0.5};
+std::atomic<double> g_encode_min_headroom_fraction{0.10};
 }  // namespace
 
 const spill_context* current_spill_context() noexcept { return t_current_spill_context; }
@@ -54,7 +55,8 @@ void set_spill_compression_settings(bool enabled,
                                     std::size_t explore_sample_rows,
                                     std::size_t min_batch_bytes,
                                     bool release_columns_early,
-                                    double encode_reserve_fraction) noexcept
+                                    double encode_reserve_fraction,
+                                    double encode_min_headroom_fraction) noexcept
 {
   g_spill_enabled.store(enabled, std::memory_order_relaxed);
   g_explore_beam_width.store(explore_beam_width, std::memory_order_relaxed);
@@ -67,6 +69,7 @@ void set_spill_compression_settings(bool enabled,
   g_spill_min_batch_bytes.store(min_batch_bytes, std::memory_order_relaxed);
   g_spill_release_columns_early.store(release_columns_early, std::memory_order_relaxed);
   g_encode_reserve_fraction.store(encode_reserve_fraction, std::memory_order_relaxed);
+  g_encode_min_headroom_fraction.store(encode_min_headroom_fraction, std::memory_order_relaxed);
 }
 
 bool spill_compression_enabled() noexcept
@@ -99,6 +102,8 @@ spill_context make_spill_context(const cucascade::shared_data_repository* repo) 
     .min_batch_bytes         = g_spill_min_batch_bytes.load(std::memory_order_relaxed),
     .release_columns_early   = g_spill_release_columns_early.load(std::memory_order_relaxed),
     .encode_reserve_fraction = g_encode_reserve_fraction.load(std::memory_order_relaxed),
+    .encode_min_headroom_fraction =
+      g_encode_min_headroom_fraction.load(std::memory_order_relaxed),
   };
 }
 

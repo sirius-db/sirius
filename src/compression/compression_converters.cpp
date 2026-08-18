@@ -393,6 +393,29 @@ std::string default_plan_for(cudf::data_type type)
   return "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
 }
 
+/// Whether a column of @p type can be carried without a plan of its own.
+///
+/// Two carriers exist for a column the planner has nothing for: `identity`,
+/// which stores the values as a single leaf, and `bitpack`, which stores integral
+/// leaves. Neither covers every dtype:
+///
+///  * `identity` leaves are reconstructed with `cudf::make_numeric_column`
+///    (compressed_table_io.cpp), which accepts only cudf's *numeric* types —
+///    DECIMAL and TIMESTAMP fault with "Invalid, non-numeric type" on the way
+///    back in, long after the spill reported success;
+///  * `bitpack` refuses non-fusable dtypes, DECIMAL128 among them.
+///
+/// So a fixed-width non-numeric column (decimal, timestamp, duration) can only be
+/// spilled compressed when it has a real plan. Without one the batch must decline
+/// to an uncompressed spill — measured on TPC-H q18, where a DECIMAL128 column
+/// took the raw fallback and the query then died in cudf on restore.
+///
+/// STRING and nested types are safe: their passthrough leaves are INT32/INT8.
+bool can_carry_without_plan(cudf::data_type type)
+{
+  return !cudf::is_fixed_width(type) || cudf::is_numeric(type);
+}
+
 // Compress every column of `view` with its own plan, one column per pool stream.
 //
 // The pool streams do not observe `stream`, so work that produced `view` has to
@@ -425,6 +448,23 @@ std::vector<column_state> resolve_or_explore_spill_plan(cudf::table_view view,
                                                         rmm::cuda_stream_view stream)
 {
   using verdict = compression::plan_register::spill_plan_verdict;
+
+  // An unkeyed batch (no producing repository) has nothing to look up and no
+  // lineage to follow, but it can still be carried by its dtype's default plan.
+  // Nothing is recorded against the register — there is no edge to record it
+  // against — so these batches neither consume plan uses nor steer any verdict,
+  // and they never explore: the beam search is what the edge key exists to
+  // amortize. If the defaults do not pay, compress_for_spill's whole-batch
+  // threshold declines the batch to an uncompressed spill as usual.
+  if (ctx.repo == nullptr) {
+    std::vector<column_state> defaults;
+    defaults.reserve(static_cast<std::size_t>(view.num_columns()));
+    for (cudf::size_type i = 0; i < view.num_columns(); ++i) {
+      defaults.push_back(column_state{.dsl    = default_plan_for(view.column(i).type()),
+                                      .viable = true});
+    }
+    return defaults;
+  }
 
   auto& reg           = compression::plan_register::global();
   const auto decision = reg.decide_spill_plan(ctx.repo, ctx.replan_after_uses);
@@ -545,9 +585,11 @@ std::vector<column_state> resolve_or_explore_spill_plan(cudf::table_view view,
 const compression::spill_context& require_spill_context()
 {
   const auto* ctx = compression::current_spill_context();
-  if (ctx == nullptr || ctx->repo == nullptr) {
+  if (ctx == nullptr) {
     throw std::runtime_error("[compression_converters] no spill context installed");
   }
+  // A null repo is allowed: that is the unkeyed batch, compressed with dtype
+  // defaults rather than a looked-up plan (see resolve_or_explore_spill_plan).
   return *ctx;
 }
 
@@ -641,10 +683,20 @@ staged_compression compress_for_spill(
     std::vector<std::string> one_name{names[i]};
 
     auto encode = [&](const std::string& dsl) {
+      nvtx3::scoped_range encode_range{"sirius::compression::encode_column"};
       return compress_columns_with_plans(one_col, {dsl}, one_name, stream, mr);
     };
 
-    const std::string& plan = column_plans[i].viable ? column_plans[i].dsl : kPassthroughDsl;
+    // The carrier for a column with no plan of its own depends on its dtype:
+    // `identity` cannot round-trip a decimal or timestamp. default_plan_for picks
+    // the one that can, and can_carry_without_plan says when neither does.
+    const std::string fallback_plan = default_plan_for(col.type());
+    const std::string& plan = column_plans[i].viable ? column_plans[i].dsl : fallback_plan;
+    if (!column_plans[i].viable && !can_carry_without_plan(col.type())) {
+      throw std::runtime_error(
+        "[compression_converters] column " + std::to_string(i) +
+        " has no plan and no safe raw carrier for its dtype; spilling uncompressed");
+    }
     try {
       auto encoded = encode(plan);
       if (encoded.columns.empty()) {
@@ -653,16 +705,17 @@ staged_compression compress_for_spill(
       }
       out.table.columns.push_back(std::move(encoded.columns.front()));
     } catch (const std::exception& e) {
-      // Retry raw. `identity` needs no codec scratch, so it survives the memory
-      // pressure that sank the real plan; if even this throws the batch genuinely
-      // cannot be staged and the caller falls back to an uncompressed spill.
-      if (plan == kPassthroughDsl) { throw; }
+      // Retry with the dtype's default carrier: it needs far less codec scratch,
+      // so it survives the memory pressure that sank the real plan. If the dtype
+      // has no safe carrier, or even this throws, the batch genuinely cannot be
+      // staged and the caller falls back to an uncompressed spill.
+      if (plan == fallback_plan || !can_carry_without_plan(col.type())) { throw; }
       SIRIUS_LOG_DEBUG(
         "[compression_converters] repo={} column {} encode failed ({}); storing it raw",
         static_cast<const void*>(ctx.repo),
         i,
         e.what());
-      auto encoded = encode(kPassthroughDsl);
+      auto encoded = encode(fallback_plan);
       if (encoded.columns.empty()) {
         throw std::runtime_error(
           "[compression_converters] raw fallback produced no column for index " +
@@ -689,10 +742,13 @@ staged_compression compress_for_spill(
     // first moment nothing can fail.
   }
 
-  const std::string hdr_err = simpatico::build_compressed_table_header(
-    out.table, out.header, out.buffers, out.payload_bytes, stream);
-  if (!hdr_err.empty()) {
-    throw std::runtime_error("[compression_converters] build_compressed_table_header: " + hdr_err);
+  {
+    nvtx3::scoped_range header_range{"sirius::compression::build_header"};
+    const std::string hdr_err = simpatico::build_compressed_table_header(
+      out.table, out.header, out.buffers, out.payload_bytes, stream);
+    if (!hdr_err.empty()) {
+      throw std::runtime_error("[compression_converters] build_compressed_table_header: " + hdr_err);
+    }
   }
 
   // Judge each column on its own bytes. Compressibility is a per-column property,
@@ -788,12 +844,21 @@ class scoped_encode_reservation {
   ///         be granted; check `ok()` before proceeding.
   scoped_encode_reservation(cucascade::memory::memory_space* gpu_space,
                             std::size_t bytes,
+                            std::size_t min_headroom_bytes,
                             rmm::cuda_stream_view stream)
     : _stream(stream)
   {
     if (gpu_space == nullptr || bytes == 0) {
       _ok = true;  // nothing to reserve; not a failure
       return;
+    }
+    // Headroom first. A reservation for a fraction of one batch is grantable
+    // long after the device has run out of room to actually encode in, so
+    // asking only "does this reservation fit" lets compression keep starting
+    // work that the allocator then refuses.
+    if (min_headroom_bytes > 0 && gpu_space->get_available_memory() < min_headroom_bytes) {
+      _declined_for_headroom = true;
+      return;  // _ok stays false: caller declines to an uncompressed spill
     }
     auto reservation = gpu_space->make_reservation_or_null(bytes);
     if (!reservation) { return; }  // _ok stays false: caller declines
@@ -818,12 +883,29 @@ class scoped_encode_reservation {
 
   [[nodiscard]] bool ok() const noexcept { return _ok; }
 
+  /// True when the decline was for lack of device headroom rather than an
+  /// ungrantable reservation; distinguishes "too tight to compress at all" from
+  /// "this particular reservation did not fit".
+  [[nodiscard]] bool declined_for_headroom() const noexcept { return _declined_for_headroom; }
+
  private:
   rmm::cuda_stream_view _stream;
   cucascade::memory::reservation_aware_resource_adaptor* _allocator{nullptr};
   bool _attached{false};
   bool _ok{false};
+  bool _declined_for_headroom{false};
 };
+
+/// Free device bytes below which a spill declines to compress, or 0 when the
+/// check does not apply (an arena is installed, or the fraction is disabled).
+std::size_t encode_min_headroom_bytes(const compression::spill_context& ctx,
+                                      const cucascade::memory::memory_space* gpu_space)
+{
+  if (compression::compression_device_pool_enabled()) { return 0; }
+  if (gpu_space == nullptr || !(ctx.encode_min_headroom_fraction > 0.0)) { return 0; }
+  return static_cast<std::size_t>(static_cast<double>(gpu_space->get_max_memory()) *
+                                  ctx.encode_min_headroom_fraction);
+}
 
 /// Bytes to reserve for encoding a unit of @p uncompressed_bytes, or 0 when no
 /// reservation is wanted (an arena is installed, or the fraction is disabled).
@@ -967,16 +1049,23 @@ std::vector<std::shared_ptr<pinned_compressed_blob>> encode_and_stage_per_column
     std::vector<std::string> one_name{names[i]};
 
     auto encode = [&](const std::string& dsl) {
+      nvtx3::scoped_range encode_range{"sirius::compression::encode_column"};
       return compress_columns_with_plans(one_col, {dsl}, one_name, stream, mr);
     };
 
     simpatico::compressed_table encoded;
-    const std::string& plan = column_plans[i].viable ? column_plans[i].dsl : kPassthroughDsl;
+    // Same dtype-aware carrier as the whole-table path: `identity` cannot
+    // round-trip a decimal or timestamp. Callers check can_carry_without_plan for
+    // every column *before* releasing the source, so a column reaching here
+    // without a plan always has a usable fallback.
+    const std::string fallback_plan =
+      default_plan_for(view.column(static_cast<cudf::size_type>(i)).type());
+    const std::string& plan = column_plans[i].viable ? column_plans[i].dsl : fallback_plan;
     try {
       encoded = encode(plan);
     } catch (const std::exception& e) {
-      // Raw is the floor: identity needs no codec scratch, so it survives the
-      // pressure that sank the real plan. Only this column is affected.
+      // Raw is the floor: the default carrier needs no codec scratch, so it
+      // survives the pressure that sank the real plan. Only this column is affected.
       SIRIUS_LOG_DEBUG("[compression_converters] column {} encode failed ({}); storing it raw",
                        i,
                        e.what());
@@ -989,7 +1078,7 @@ std::vector<std::shared_ptr<pinned_compressed_blob>> encode_and_stage_per_column
       bool staged_raw = false;
       for (int attempt = 1; attempt <= 20 && !staged_raw; ++attempt) {
         try {
-          encoded    = encode(kPassthroughDsl);
+          encoded    = encode(fallback_plan);
           staged_raw = true;
         } catch (const std::exception& raw_err) {
           if (attempt == 20) {
@@ -1005,25 +1094,31 @@ std::vector<std::shared_ptr<pinned_compressed_blob>> encode_and_stage_per_column
     std::vector<std::uint8_t> header;
     std::vector<simpatico::payload_buffer_ref> buffers;
     std::uint64_t payload_bytes = 0;
-    const std::string hdr_err =
-      simpatico::build_compressed_table_header(encoded, header, buffers, payload_bytes, stream);
-    if (!hdr_err.empty()) {
-      throw std::runtime_error("[compression_converters] header for column " + std::to_string(i) +
-                               ": " + hdr_err);
+    {
+      nvtx3::scoped_range header_range{"sirius::compression::build_header"};
+      const std::string hdr_err =
+        simpatico::build_compressed_table_header(encoded, header, buffers, payload_bytes, stream);
+      if (!hdr_err.empty()) {
+        throw std::runtime_error("[compression_converters] header for column " + std::to_string(i) +
+                                 ": " + hdr_err);
+      }
     }
 
     auto blob           = std::make_shared<pinned_compressed_blob>();
     blob->header        = std::move(header);
     blob->payload       = host_mr->allocate_multiple_blocks(payload_bytes, reservation);
     blob->payload_bytes = payload_bytes;
-    for (auto const& b : buffers) {
-      if (b.size_bytes > 0 && b.device_ptr != nullptr) {
-        copy_device_to_pinned_blocks(
-          b.device_ptr, *blob->payload, b.offset, static_cast<std::size_t>(b.size_bytes), stream);
+    {
+      nvtx3::scoped_range stage_range{"sirius::compression::stage_column_to_host"};
+      for (auto const& b : buffers) {
+        if (b.size_bytes > 0 && b.device_ptr != nullptr) {
+          copy_device_to_pinned_blocks(
+            b.device_ptr, *blob->payload, b.offset, static_cast<std::size_t>(b.size_bytes), stream);
+        }
       }
+      // The copies read `encoded`'s device buffers, so they must land before it dies.
+      stream.synchronize();
     }
-    // The copies read `encoded`'s device buffers, so they must land before it dies.
-    stream.synchronize();
 
     out_compressed_bytes += blob->header.size() + payload_bytes;
     blobs.push_back(std::move(blob));
@@ -1056,16 +1151,22 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_host(
   // must still be a clean decline at this point and because a reservation is
   // cheap to fail and expensive to discover late.
   auto* gpu_space = const_cast<cucascade::memory::memory_space*>(&source.get_memory_space());
-  scoped_encode_reservation encode_reservation(
-    gpu_space, encode_reservation_bytes(ctx, uncompressed_bytes), stream);
+  scoped_encode_reservation encode_reservation(gpu_space,
+                                               encode_reservation_bytes(ctx, uncompressed_bytes),
+                                               encode_min_headroom_bytes(ctx, gpu_space),
+                                               stream);
   if (!encode_reservation.ok()) {
     SIRIUS_LOG_DEBUG(
-      "[compression_converters] repo={} declining: cannot reserve {}B on device for the encode; "
-      "spilling uncompressed",
+      "[compression_converters] repo={} declining ({}): free={}B, needed headroom {}B, "
+      "reserve {}B; spilling uncompressed",
       static_cast<const void*>(ctx.repo),
+      encode_reservation.declined_for_headroom() ? "device too tight to encode"
+                                                 : "reservation not grantable",
+      gpu_space != nullptr ? gpu_space->get_available_memory() : 0,
+      encode_min_headroom_bytes(ctx, gpu_space),
       encode_reservation_bytes(ctx, uncompressed_bytes));
     throw std::runtime_error(
-      "[compression_converters] no device reservation available for the encode");
+      "[compression_converters] insufficient device memory for the encode");
   }
 
   const auto* space = resolve_target_space(source, target_memory_space, reservation);
@@ -1091,7 +1192,21 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_host(
   std::vector<std::unique_ptr<cudf::column>> owned_columns;
   std::vector<cudf::column_view> owned_views;
   std::vector<column_state> column_plans;
-  if (ctx.release_columns_early && host_mr_early != nullptr) {
+  // Releasing early is only safe when *every* column could still be stored by its
+  // dtype's default carrier: after the release there is no uncompressed spill to
+  // fall back to, so a column whose planned encode fails must have somewhere to
+  // land. A DECIMAL128 column has nowhere — bitpack refuses it and identity cannot
+  // be read back — so on TPC-H q18 the retry loop exhausted its 20 attempts, took
+  // the batch down with it, and the empty batch resurfaced in PARTITION as an
+  // out-of-range access. Such batches take the whole-table path below instead,
+  // where any failure is still a clean decline.
+  const auto early_release_safe = [&] {
+    for (cudf::size_type i = 0; i < view.num_columns(); ++i) {
+      if (!can_carry_without_plan(view.column(i).type())) { return false; }
+    }
+    return true;
+  }();
+  if (ctx.release_columns_early && host_mr_early != nullptr && early_release_safe) {
     column_plans = resolve_or_explore_spill_plan(view, ctx, stream);
     owned        = rep.try_release_table(stream);
     if (owned) {
@@ -1197,16 +1312,19 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_host(
   // It becomes worth revisiting if the release can be made stream-ordered (freeing
   // on `stream` rather than syncing), or once arena capacity rather than query
   // memory is the binding constraint.
-  for (auto const& b : staged.buffers) {
-    if (b.size_bytes > 0 && b.device_ptr != nullptr) {
-      copy_device_to_pinned_blocks(
-        b.device_ptr, *blob->payload, b.offset, static_cast<std::size_t>(b.size_bytes), stream);
+  {
+    nvtx3::scoped_range stage_range{"sirius::compression::stage_table_to_host"};
+    for (auto const& b : staged.buffers) {
+      if (b.size_bytes > 0 && b.device_ptr != nullptr) {
+        copy_device_to_pinned_blocks(
+          b.device_ptr, *blob->payload, b.offset, static_cast<std::size_t>(b.size_bytes), stream);
+      }
     }
+    // `staged.table` owns the device buffers being read above; sync before it dies.
+    // Still required: the mapping may have been unusable, or a column may hold
+    // buffers past its recorded last one.
+    stream.synchronize();
   }
-  // `staged.table` owns the device buffers being read above; sync before it dies.
-  // Still required: the mapping may have been unusable, or a column may hold
-  // buffers past its recorded last one.
-  stream.synchronize();
 
   SIRIUS_LOG_DEBUG("[compression_converters] spilled {}B → {}B compressed host (cols={} rows={})",
                    uncompressed_bytes,
@@ -1495,15 +1613,18 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_disk(
   // See compress_gpu_to_host: without an arena the encode is otherwise
   // unreserved pressure on the query's own pool.
   auto* gpu_space = const_cast<cucascade::memory::memory_space*>(&source.get_memory_space());
-  scoped_encode_reservation encode_reservation(
-    gpu_space, encode_reservation_bytes(ctx, uncompressed_bytes), stream);
+  scoped_encode_reservation encode_reservation(gpu_space,
+                                               encode_reservation_bytes(ctx, uncompressed_bytes),
+                                               encode_min_headroom_bytes(ctx, gpu_space),
+                                               stream);
   if (!encode_reservation.ok()) {
     SIRIUS_LOG_DEBUG(
-      "[compression_converters] repo={} declining: cannot reserve device memory for the encode; "
-      "spilling uncompressed",
-      static_cast<const void*>(ctx.repo));
+      "[compression_converters] repo={} declining ({}); spilling uncompressed",
+      static_cast<const void*>(ctx.repo),
+      encode_reservation.declined_for_headroom() ? "device too tight to encode"
+                                                 : "reservation not grantable");
     throw std::runtime_error(
-      "[compression_converters] no device reservation available for the encode");
+      "[compression_converters] insufficient device memory for the encode");
   }
 
   auto staged = compress_for_spill(view, ctx, uncompressed_bytes, stream);
