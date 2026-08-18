@@ -131,13 +131,8 @@ std::unique_ptr<cudf::table> normalize_physical_schema(std::unique_ptr<cudf::tab
     auto const restoring = can_restore_to(actual, target);
     auto const narrowing = has_explicit_physical_schema && can_narrow_to(actual, target);
     if (actual == target || (!restoring && !narrowing)) { continue; }
-    // The assignment frees the source column. Its buffers may be stream-ordered
-    // on the stream that produced them (the pinned-cache upload), not on
-    // `stream`, so the free would be unordered against this still-running cast
-    // and the block could be handed to the next allocation mid-read. Rebind the
-    // source's deallocation onto `stream` so the free is enqueued behind the
-    // cast. No copy, no kernel, no host wait; the cast's column_view stays valid
-    // because rebinding relocates nothing.
+    // The source's buffers may be dealloc-bound to the pinned-cache upload stream; rebind them
+    // to `stream` so the free replacing the column queues behind the cast still reading them.
     auto casted         = cast_through_rep(columns[column_idx]->view(), target, stream, mr);
     auto source         = cudf::rebind_stream(std::move(*columns[column_idx]), stream);
     columns[column_idx] = std::move(casted);
