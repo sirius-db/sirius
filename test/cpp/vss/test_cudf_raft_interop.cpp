@@ -95,10 +95,8 @@ std::unique_ptr<cudf::column> make_list_with_null_child_element(std::vector<floa
   auto child    = std::move(contents.children[1]);
 
   auto child_mask = cudf::create_null_mask(child->size(), cudf::mask_state::ALL_VALID);
-  cudf::set_null_mask(static_cast<cudf::bitmask_type*>(child_mask.data()),
-                      null_element,
-                      null_element + 1,
-                      false);
+  cudf::set_null_mask(
+    static_cast<cudf::bitmask_type*>(child_mask.data()), null_element, null_element + 1, false);
   child->set_null_mask(std::move(child_mask), 1);
 
   // Parent rows all valid (null_count 0); the null lives in the values child.
