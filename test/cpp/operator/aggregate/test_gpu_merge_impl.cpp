@@ -565,8 +565,14 @@ batches_with_handles create_batches_with_local_grouped_agg_result(
   batches_with_handles result;
   for (int i = 0; i < num_batches; ++i) {
     auto ro_batch = base_input.batches[i]->to_read_only();
-    auto batch    = gpu_aggregate_impl::local_grouped_aggregate(
-      ro_batch, group_idx, aggregates, aggregate_idx, {}, cudf::get_default_stream(), mem_space);
+    auto batch    = gpu_aggregate_impl::local_grouped_aggregate(ro_batch,
+                                                             group_idx,
+                                                             aggregates,
+                                                             aggregate_idx,
+                                                                {},
+                                                             /*enable_label_remap=*/true,
+                                                             cudf::get_default_stream(),
+                                                             mem_space);
     result.batches.push_back(std::move(batch));
   }
 

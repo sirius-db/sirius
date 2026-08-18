@@ -28,6 +28,7 @@
 #include "expression/ast/node.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "sirius_config.hpp"
 
 #include <memory>
 #include <numeric>
@@ -85,6 +86,12 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   std::vector<AggregateSlot> aggregate_slots;
   bool has_avg            = false;
   bool has_count_distinct = false;
+
+  //! For the COLLECT_SET label path, produce the dense INT32 group labels with
+  //! cudf::distinct + cudf::key_remapping (hash probe) instead of cudf::encode (per-row
+  //! lexicographic binary search); labels are byte-identical either way. Set from
+  //! operator_params at planning time.
+  bool aggregate_label_remap = config::DEFAULT_ENABLE_AGGREGATE_LABEL_REMAP;
 
  public:
   std::vector<int> get_output_grouping_indices() const

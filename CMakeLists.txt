@@ -725,6 +725,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_build_probe_scheduling.cpp
     test/cpp/operator/test_cross_schedule.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
+    test/cpp/operator/aggregate/test_group_label_remap.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_merge.cpp

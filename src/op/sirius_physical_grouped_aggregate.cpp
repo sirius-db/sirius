@@ -105,6 +105,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                               cudf_aggregates,
                                                               cudf_aggregate_idx,
                                                               cudf_aggregate_struct_col_indices,
+                                                              aggregate_label_remap,
                                                               stream,
                                                               *space,
                                                               batch_telemetry());

@@ -2071,6 +2071,16 @@ static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
                    params->enable_runtime_distinct_build_probe);
 }
 
+static void SetEnableAggregateLabelRemap(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                            = lock_operator_params_slot(context);
+  params->enable_aggregate_label_remap = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_AGGREGATE_LABEL_REMAP to {}",
+                   params->enable_aggregate_label_remap);
+}
+
 static void SetEnableDynamicFilterPushdown(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2407,6 +2417,16 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.enable_runtime_distinct_build_probe),
     SetEnableRuntimeDistinctBuildProbe);
+
+  config.AddExtensionOption(
+    "enable_aggregate_label_remap",
+    "For grouped aggregates on the COLLECT_SET (COUNT DISTINCT) label path, compute the dense "
+    "INT32 group labels with cudf::distinct + cudf::key_remapping (hash probe) instead of "
+    "cudf::encode (per-row lexicographic binary search); labels are byte-identical, this is "
+    "the faster default (off = encode)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.enable_aggregate_label_remap),
+    SetEnableAggregateLabelRemap);
 
   config.AddExtensionOption(
     "gpu_execution",
