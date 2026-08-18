@@ -88,9 +88,8 @@ TEST_CASE("Fragment::build() failure during resolve_inputs() rolls back cleanly"
   require_build_fails_without_transaction_exception(*second);
 }
 
-TEST_CASE(
-  "Fragment destroyed between a failed build() and reuse also closes the lifecycle cleanly",
-  "[isolated_context][sirius_ffi]")
+TEST_CASE("Fragment destroyed between a failed build() and reuse also closes the lifecycle cleanly",
+          "[isolated_context][sirius_ffi]")
 {
   auto context = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
 

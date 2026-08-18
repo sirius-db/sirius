@@ -1609,9 +1609,8 @@ void SiriusContextExtensionCallback::OnConnectionOpened(ClientContext& context)
     // sirius_stream_source's bind, and any streaming_fragment built on this connection, resolve
     // declared-stream schemas through a per-connection catalog — without this, both fail
     // immediately on every normal (transparent) connection instead of just the FFI's own.
-    context.registered_state->Insert(
-      sirius::exec::stream_bind_catalog::kStateKey,
-      duckdb::make_shared_ptr<sirius::exec::stream_bind_catalog>());
+    context.registered_state->Insert(sirius::exec::stream_bind_catalog::kStateKey,
+                                     duckdb::make_shared_ptr<sirius::exec::stream_bind_catalog>());
   }
 }
 
