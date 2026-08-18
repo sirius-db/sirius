@@ -4,10 +4,16 @@
 //! This crate wraps the low-level [`sirius-sys`] cxx bindings in safe Rust types
 //! — the entry point for driving Sirius from Rust.
 //!
-//! Today it binds just enough to prove the toolchain links against the real
-//! Sirius library: constructing a [`SiriusContext`] from defaults or a YAML
-//! config file. More of the API surface is added in later PRs.
+//! Two entry points:
+//!
+//! * [`SiriusContext`] — an initialized engine, constructed from defaults or a
+//!   YAML config file, able to execute a whole Substrait plan in one call.
+//! * [`Fragment`] — one plan fragment of a multi-fragment query, for driving a
+//!   distributed plan a piece at a time and moving native GPU batches between
+//!   the pieces without going through Arrow.
 
+use std::cell::RefCell;
+use std::marker::PhantomData;
 use std::path::Path;
 
 use arrow_array::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
@@ -27,9 +33,28 @@ use cxx::{Exception, UniquePtr, let_cxx_string};
 /// The engine keeps process-global GPU state, so it currently supports a single
 /// live context per process; constructing or holding more than one concurrently
 /// is not yet supported (enforcement is a follow-up).
+///
+/// Neither `Send` nor `Sync` — drive one context from one thread. `!Send` comes from the cxx
+/// opaque `Context` itself; the `RefCell` adds `!Sync`, and buys
+/// [`fragment`](SiriusContext::fragment) a `&self` receiver so several fragments of one query
+/// can be alive at once.
 pub struct SiriusContext {
     // RAII handle owning the C++ engine context for its lifetime.
-    inner: UniquePtr<sirius_sys::Context>,
+    //
+    // Behind a `RefCell` because every call into C++ needs `Pin<&mut Context>` while a
+    // [`Fragment`] only borrows the context immutably. Several fragments of one query are alive
+    // at once — senders parked, waiting on their receiver — and a `&mut self` factory would allow
+    // exactly one.
+    //
+    // The borrow never outlives the call that takes it, so it cannot be observed by user code and
+    // the runtime check is unreachable without re-entering from a C++ callback. The context is
+    // neither `Send` nor `Sync`, so there is no cross-thread aliasing either.
+    //
+    // What this costs: a `&self` factory gives up compile-time enforcement of "exactly one
+    // fragment sits between its own build() and run()" — two can be mid-lifecycle at once and the
+    // engine rejects that at runtime. The whole-plan path is unaffected: it keeps `&mut self`, so
+    // running a standalone query while any fragment is alive stays a compile error.
+    inner: RefCell<UniquePtr<sirius_sys::Context>>,
 }
 
 /// Fully materialized output of one Substrait execution.
@@ -45,7 +70,7 @@ impl SiriusContext {
     /// built-in defaults.
     pub fn new() -> Result<Self, Exception> {
         Ok(Self {
-            inner: sirius_sys::make_context()?,
+            inner: RefCell::new(sirius_sys::make_context()?),
         })
     }
 
@@ -56,7 +81,20 @@ impl SiriusContext {
         // one from the (lossy) UTF-8 form of the platform path.
         let_cxx_string!(config_path = path.to_string_lossy().as_ref());
         Ok(Self {
-            inner: sirius_sys::make_context_from_config(&config_path)?,
+            inner: RefCell::new(sirius_sys::make_context_from_config(&config_path)?),
+        })
+    }
+
+    /// Create a [`Fragment`] on this context — one plan fragment of a multi-fragment query.
+    ///
+    /// Takes `&self`, not `&mut self`: a distributed plan keeps several fragments alive at once,
+    /// with senders parked until their receiver relays from them, so an exclusive borrow would
+    /// permit exactly one. The returned fragment borrows the context, so it cannot outlive it.
+    pub fn fragment(&self) -> Result<Fragment<'_>, Exception> {
+        let mut context = self.inner.borrow_mut();
+        Ok(Fragment {
+            inner: sirius_sys::make_fragment(context.pin_mut())?,
+            _context: PhantomData,
         })
     }
 
@@ -71,6 +109,10 @@ impl SiriusContext {
     /// Arrow stream converts each batch using this context's client state, so the
     /// stream is drained while the context is alive; the returned batches own
     /// their buffers and are independent of the context's lifetime.
+    ///
+    /// Takes `&mut self` where [`fragment`](SiriusContext::fragment) takes `&self`: the whole-plan
+    /// path has no reason to run while a fragment is alive, so the exclusive borrow turns that
+    /// into a compile error rather than a runtime one.
     pub fn execute_substrait(&mut self, plan: &[u8]) -> Result<Vec<RecordBatch>, SiriusError> {
         Ok(self.execute_substrait_result(plan)?.batches)
     }
@@ -82,28 +124,209 @@ impl SiriusContext {
     ) -> Result<SubstraitResult, SiriusError> {
         // The engine writes a self-owning Arrow C Data Interface stream into
         // `stream`; the FFI takes its address as an integer (a `uintptr_t`).
-        let mut stream = FFI_ArrowArrayStream::empty();
-        let out_stream_addr = std::ptr::addr_of_mut!(stream) as usize;
         let_cxx_string!(plan = plan);
-        // SAFETY: `out_stream_addr` is the address of `stream`, a live, writable
-        // `FFI_ArrowArrayStream` owned by this stack frame for the call's duration.
-        unsafe {
-            self.inner
-                .pin_mut()
-                .execute_substrait(&plan, out_stream_addr)
-                .map_err(SiriusError::Engine)?;
-        }
-        // Drain fully while `self` is alive (conversion dereferences the context).
-        let reader = ArrowArrayStreamReader::try_new(stream).map_err(SiriusError::Arrow)?;
-        let schema = reader.schema();
-        let batches = reader
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(SiriusError::Arrow)?;
-        Ok(SubstraitResult { schema, batches })
+        drain_arrow(|out_stream_addr| {
+            // SAFETY: `drain_arrow` passes the address of a live, writable
+            // `FFI_ArrowArrayStream` it owns for the closure's duration.
+            unsafe {
+                self.inner
+                    .borrow_mut()
+                    .pin_mut()
+                    .execute_substrait(&plan, out_stream_addr)
+            }
+        })
     }
 }
 
-/// Error returned by [`SiriusContext::execute_substrait`].
+/// Name of the DuckDB view a plan reads to consume input stream `stream_id`.
+///
+/// The single definition of the convention: a front end emitting the read and the engine creating
+/// the view resolve the same name, so they cannot drift apart.
+pub fn stream_view_name(stream_id: u64) -> String {
+    sirius_sys::stream_view_name(stream_id)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// One plan fragment of a multi-fragment query.
+///
+/// A fragment either declares output streams — an *intermediate* fragment, whose results park as
+/// native GPU batches that outlive its own query — or declares none, making it a *result*
+/// fragment that produces Arrow.
+///
+/// The usage order is fixed: declare inputs and outputs, [`build`](Fragment::build) the plan,
+/// [`relay_from`](Fragment::relay_from) every sender, [`run`](Fragment::run), then drain via
+/// `relay_from` (from downstream) or [`result_to_arrow`](Fragment::result_to_arrow). Exactly
+/// one fragment may sit between its own `build` and `run` — the engine serializes queries.
+///
+/// Borrows the [`SiriusContext`] that created it, so a fragment cannot outlive its engine.
+pub struct Fragment<'ctx> {
+    inner: UniquePtr<sirius_sys::Fragment>,
+    /// Ties the fragment's lifetime to the context that made it.
+    _context: PhantomData<&'ctx SiriusContext>,
+}
+
+impl Fragment<'_> {
+    /// Declare one column of input stream `stream_id`, in plan order. `ty` is a DuckDB type name
+    /// (`BIGINT`, `DECIMAL(15,2)`, `DATE`, …) — a stream has no file to probe, so the schema is
+    /// given rather than inferred.
+    pub fn declare_input_column(
+        &mut self,
+        stream_id: u64,
+        name: &str,
+        ty: &str,
+    ) -> Result<(), Exception> {
+        let_cxx_string!(name = name);
+        let_cxx_string!(ty = ty);
+        self.inner
+            .pin_mut()
+            .declare_input_column(stream_id, &name, &ty)
+    }
+
+    /// Declare a sender that must close input stream `stream_id` before it ends. With none
+    /// declared the stream expects the single sender `0`.
+    pub fn declare_input_sender(
+        &mut self,
+        stream_id: u64,
+        sender_id: u32,
+    ) -> Result<(), Exception> {
+        self.inner
+            .pin_mut()
+            .declare_input_sender(stream_id, sender_id)
+    }
+
+    /// Declare an output stream. A fragment with no output stream is a result fragment.
+    pub fn declare_output(&mut self, stream_id: u64) -> Result<(), Exception> {
+        self.inner.pin_mut().declare_output(stream_id)
+    }
+
+    /// Replicate every batch to all declared outputs.
+    ///
+    /// Returns `Err` if a hash key was already declared (the two modes are mutually exclusive) or
+    /// if the fragment is already built. Whether enough destinations exist to route between is not
+    /// known until [`build`](Fragment::build), which is where that is rejected.
+    pub fn declare_output_broadcast(&mut self) -> Result<(), Exception> {
+        self.inner.pin_mut().declare_output_broadcast()
+    }
+
+    /// Hash-partition across the declared outputs on `column_index`. Call once per key column, in
+    /// key order. Same exclusivity and ordering rules as
+    /// [`declare_output_broadcast`](Fragment::declare_output_broadcast).
+    pub fn declare_output_hash_key(&mut self, column_index: u32) -> Result<(), Exception> {
+        self.inner.pin_mut().declare_output_hash_key(column_index)
+    }
+
+    /// Plan `substrait_plan` against the declared streams and open the fragment's query lifecycle.
+    ///
+    /// The declaration-time rules that could not be checked earlier are checked here, so both
+    /// surface as `Err` from this call rather than from the `declare_*` that caused them:
+    ///
+    /// * a routing mode on a fragment with fewer than two outputs — every row would reach
+    ///   destination 0 regardless, so silently dropping the spec would look like it worked;
+    /// * a plan that reads the same declared input stream id more than once (a self-join over one
+    ///   stream, say) — the second read would overwrite the first's registration and strand its
+    ///   pipeline waiting for a push that never arrives.
+    pub fn build(&mut self, substrait_plan: &[u8]) -> Result<(), Exception> {
+        let_cxx_string!(plan = substrait_plan);
+        self.inner.pin_mut().build(&plan)
+    }
+
+    /// Move every batch parked on `source`'s output stream into this fragment's input stream — as
+    /// native GPU batch handles, with no Arrow and no file in between — then close `sender_id`.
+    /// Returns the number of batches moved.
+    ///
+    /// Returns `Err` unless `source` has already finished [`run`](Fragment::run): before that, an
+    /// empty stream is indistinguishable from a finished one, and the input would be closed after
+    /// zero batches, silently truncating the result. Also `Err` if `input_stream_id` was never
+    /// declared here, or if `source` is a result fragment and so has nothing to relay.
+    pub fn relay_from(
+        &mut self,
+        source: &mut Fragment<'_>,
+        source_stream_id: u64,
+        input_stream_id: u64,
+        sender_id: u32,
+    ) -> Result<usize, Exception> {
+        self.inner.pin_mut().relay_from(
+            source.inner.pin_mut(),
+            source_stream_id,
+            input_stream_id,
+            sender_id,
+        )
+    }
+
+    /// Close `sender_id` on input stream `stream_id`.
+    ///
+    /// The end-of-stream mirror for senders that are not local fragments — [`relay_from`] closes
+    /// its own sender. Idempotent per sender.
+    ///
+    /// [`relay_from`]: Fragment::relay_from
+    pub fn close_input(&mut self, stream_id: u64, sender_id: u32) -> Result<(), Exception> {
+        self.inner.pin_mut().close_input(stream_id, sender_id)
+    }
+
+    /// Execute the fragment and close its query lifecycle. Blocks until its pipelines finish.
+    pub fn run(&mut self) -> Result<(), Exception> {
+        self.inner.pin_mut().run()
+    }
+
+    /// Batches currently parked on output stream `stream_id` — the evidence that a fragment
+    /// boundary carried native batches rather than nothing.
+    pub fn output_batch_count(&self, stream_id: u64) -> Result<usize, Exception> {
+        self.inner.output_batch_count(stream_id)
+    }
+
+    /// DuckDB type names of this fragment's output columns, in plan order.
+    ///
+    /// Available after [`build`](Fragment::build). Returns `Err` for a result fragment, which has
+    /// no output streams to describe.
+    pub fn output_types(&self) -> Result<Vec<String>, Exception> {
+        Ok(self
+            .inner
+            .output_types()?
+            .iter()
+            .map(|ty| ty.to_string_lossy().into_owned())
+            .collect())
+    }
+
+    /// Collect a result fragment's rows over the Arrow C Data Interface.
+    ///
+    /// Named for the C++ verb it binds rather than `into_*`, which Rust reserves for by-value
+    /// conversions — this borrows and could in principle be called more than once.
+    ///
+    /// Returns `Err` on a fragment that declared output streams (it parks native batches for a
+    /// peer instead of producing Arrow) or before [`run`](Fragment::run).
+    pub fn result_to_arrow(&mut self) -> Result<SubstraitResult, SiriusError> {
+        drain_arrow(|out_stream_addr| {
+            // SAFETY: `drain_arrow` passes the address of a live, writable
+            // `FFI_ArrowArrayStream` it owns for the closure's duration.
+            unsafe { self.inner.pin_mut().result_to_arrow(out_stream_addr) }
+        })
+    }
+}
+
+/// Run `emit` against a freshly-created Arrow C Data Interface stream, then drain it fully.
+///
+/// Both Arrow-producing entry points — whole-plan execution and a result fragment — hand C++ the
+/// address of a stack-owned `FFI_ArrowArrayStream` and then collect it. Keeping that sequence in
+/// one place keeps the two from drifting: it is the only spot where a raw address crosses the FFI
+/// boundary, and the draining must happen while the producer is still alive, because the
+/// conversion dereferences the engine context.
+fn drain_arrow(
+    emit: impl FnOnce(usize) -> Result<(), Exception>,
+) -> Result<SubstraitResult, SiriusError> {
+    let mut stream = FFI_ArrowArrayStream::empty();
+    let out_stream_addr = std::ptr::addr_of_mut!(stream) as usize;
+    emit(out_stream_addr).map_err(SiriusError::Engine)?;
+    let reader = ArrowArrayStreamReader::try_new(stream).map_err(SiriusError::Arrow)?;
+    let schema = reader.schema();
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(SiriusError::Arrow)?;
+    Ok(SubstraitResult { schema, batches })
+}
+
+/// Error returned by the Arrow-producing entry points: [`SiriusContext::execute_substrait`],
+/// [`SiriusContext::execute_substrait_result`], and [`Fragment::result_to_arrow`].
 #[derive(Debug)]
 pub enum SiriusError {
     /// The engine failed to translate or execute the plan (a C++ exception).
@@ -242,6 +465,75 @@ mod tests {
             let total_rows: usize = result.batches.iter().map(RecordBatch::num_rows).sum();
             assert_eq!(total_rows, 3, "expected 3 rows from the parquet fixture");
         }
+    }
+
+    /// The view-name convention is shared with the engine, so a front end can emit a read for a
+    /// stream it has declared. Pure string formatting — no GPU, no context.
+    #[test]
+    fn stream_view_name_matches_the_engine_convention() {
+        assert_eq!(super::stream_view_name(0), "sirius_stream_0");
+        assert_eq!(super::stream_view_name(42), "sirius_stream_42");
+        assert_eq!(
+            super::stream_view_name(u64::MAX),
+            format!("sirius_stream_{}", u64::MAX)
+        );
+    }
+
+    /// The two routing modes are mutually exclusive, and that *is* enforced at declaration time —
+    /// unlike the "needs at least two destinations" rule, which cannot be known until `build()`
+    /// and is asserted there, not here. Requires a GPU only for context bring-up.
+    #[test]
+    fn routing_modes_are_mutually_exclusive() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let ctx = SiriusContext::new().expect("bring up sirius context");
+
+        let mut broadcast_first = ctx.fragment().expect("create fragment");
+        broadcast_first
+            .declare_output_broadcast()
+            .expect("broadcast alone is accepted at declare time");
+        assert!(
+            broadcast_first.declare_output_hash_key(0).is_err(),
+            "a hash key after broadcast must be rejected"
+        );
+
+        let mut hash_first = ctx.fragment().expect("create fragment");
+        hash_first
+            .declare_output_hash_key(0)
+            .expect("a hash key alone is accepted at declare time");
+        assert!(
+            hash_first.declare_output_broadcast().is_err(),
+            "broadcast after a hash key must be rejected"
+        );
+    }
+
+    /// Several fragments are alive at once in a distributed plan — senders parked until their
+    /// receiver relays from them. This is why `fragment()` takes `&self`; with a `&mut self`
+    /// factory the second `ctx.fragment()` below would not borrow-check.
+    #[test]
+    fn context_makes_several_fragments_at_once() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let ctx = SiriusContext::new().expect("bring up sirius context");
+
+        let mut sender = ctx.fragment().expect("create sender fragment");
+        let mut receiver = ctx.fragment().expect("create receiver fragment");
+
+        // Both are live here — the point of the test.
+        sender.declare_output(7).expect("declare output");
+        receiver
+            .declare_input_column(7, "id", "BIGINT")
+            .expect("declare input column");
+
+        // Neither has been built, so this trips the build-ordering guard. It does NOT reach the
+        // "source must have run" guard — that one needs two built fragments and a real plan, so
+        // it is covered by the C++ suite rather than pretended at here.
+        assert!(
+            receiver.relay_from(&mut sender, 7, 7, 0).is_err(),
+            "relay_from before build() must be rejected"
+        );
     }
 
     /// A missing config file is rejected before any GPU work (`load_from_file`
