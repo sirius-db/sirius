@@ -151,11 +151,11 @@ TEST_CASE_METHOD(VectorSearchFixture,
 
   const std::string origin = "[0.0, 0.0, 0.0]::FLOAT[3]";
 
-  auto empty_list = con->Query("SELECT * FROM sirius_knn_search('vs_empty_cols', 'vec', " +
-                               origin + ", k => 2, output_columns => []);");
+  auto empty_list = con->Query("SELECT * FROM sirius_knn_search('vs_empty_cols', 'vec', " + origin +
+                               ", k => 2, output_columns => []);");
   REQUIRE(empty_list);
-  UNSCOPED_INFO("empty output_columns error: "
-                << (empty_list->HasError() ? empty_list->GetError() : std::string("<none>")));
+  UNSCOPED_INFO("empty output_columns error: " << (empty_list->HasError() ? empty_list->GetError()
+                                                                          : std::string("<none>")));
   // An explicitly empty list is a user error, not a request for everything: rejected
   // at bind with a typed BinderException rather than silently expanding to all columns.
   REQUIRE(empty_list->HasError());
@@ -183,8 +183,8 @@ TEST_CASE_METHOD(VectorSearchFixture,
   auto r = con->Query("SELECT * FROM sirius_knn_search('vs_unpinned_col', 'vec', " + origin +
                       ", k => 5, output_columns => ['id', 'payload']);");
   REQUIRE(r);
-  UNSCOPED_INFO("unpinned output column error: "
-                << (r->HasError() ? r->GetError() : std::string("<none>")));
+  UNSCOPED_INFO(
+    "unpinned output column error: " << (r->HasError() ? r->GetError() : std::string("<none>")));
   REQUIRE(r->HasError());
 
   run_ok("SELECT * FROM unpin_table('vs_unpinned_col');");
