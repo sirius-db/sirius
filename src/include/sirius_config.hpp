@@ -81,7 +81,10 @@ constexpr double DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO = 8.0;
 /// probe row count. Sirius already implements both, but the distinct path is gated on a *proof* of
 /// uniqueness, which only a declared PRIMARY KEY on a catalog table can supply. The runtime test is
 /// one cudf::distinct_count pass over the build keys, taken only in BUILD_PROBE mode.
-constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = true;
+///
+/// Temporarily off by default (issue #1600): cudf::distinct_count can hit a cuCollections bug
+/// (NVIDIA/cuCollections#834) on some key distributions. Re-enable once the fix ships in libcudf.
+constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
 }  // namespace config
 
