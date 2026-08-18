@@ -114,8 +114,6 @@ extern "C" int cudaProfilerStop();
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
-#include <cmath>
-
 // PinTableFunction routes parquet reads through the scan manager's sirius_ioctx
 // instead of cudf's bundled file_source factory (which uses kvikio internally
 // and binds to a single CUDA context). This is mandatory in multi-GPU
