@@ -2081,6 +2081,16 @@ static void SetEnableDynamicFilterPushdown(ClientContext& context, SetScope scop
                    params->enable_dynamic_filter_pushdown);
 }
 
+static void SetEnableDelimDirectLowering(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                            = lock_operator_params_slot(context);
+  params->enable_delim_direct_lowering = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DELIM_DIRECT_LOWERING to {}",
+                   params->enable_delim_direct_lowering);
+}
+
 static void SetEnableDynamicZoneMapFilter(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2311,6 +2321,13 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(true),
                             SetFuseMergePipelines);
+
+  config.AddExtensionOption(
+    "enable_delim_direct_lowering",
+    "Lower eligible pure-equality EXISTS / NOT EXISTS DELIM joins to direct semi/anti hash joins",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.enable_delim_direct_lowering),
+    SetEnableDelimDirectLowering);
 
   // Add in config options for duckdb scan task
   // Default batch size

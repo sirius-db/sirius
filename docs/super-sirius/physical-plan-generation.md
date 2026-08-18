@@ -356,7 +356,27 @@ Total-input structural sinks such as `ORDER_BY`, `TOP_N`, and an outer `GROUP BY
 
 ### DELIM_JOIN
 
-Decorrelated correlated-subquery join. Both variants hold two internal operators:
+Decorrelated correlated-subquery join.
+
+**Delim-direct lowering** (`src/planner/sirius_plan_delim_direct.cpp`, knob
+`enable_delim_direct_lowering`, default on): before building any delim machinery,
+`plan_delim_join` classifies the logical DELIM join. A pure-equality EXISTS / NOT EXISTS —
+a SEMI/ANTI/RIGHT_SEMI/RIGHT_ANTI delim whose delim-scan side is exactly the dedup sandwich
+`[pure-reference PROJECTIONs →] INNER join(inner relation, bare DELIM_GET)` with every dedup
+key pinned by the join-back (null-safe, or plain `=` when the NULL-key pairing rules in
+`sirius_plan_delim_direct.hpp` prove equivalence) — collapses into a
+**single direct semi/anti hash join**
+between the outer and inner relations (TPC-H q4 → direct RIGHT_SEMI, q22 → direct RIGHT_ANTI),
+skipping the dedup group-by, the inner join, the join-back join, and their PARTITION/CONCAT
+plumbing. The sandwich INNER join's dynamic-filter pushdown metadata is re-homed onto the
+direct join when it still describes the probe side, so the probe scan keeps its membership
+filter (published from the outer build instead of the dedup keys — same key set, earlier).
+Ineligible shapes keep the lowering below, with a typed refusal reason logged
+(`unsupported_join_type` for the scalar-aggregate correlations of q2/q17/q20,
+`non_equality_correlation` for q21's `<>` correlations, etc. — see
+`sirius_plan_delim_direct.hpp`).
+
+Both remaining variants hold two internal operators:
 - `join` — the HASH_JOIN doing the join-back (one child replaced by a cached-data scan)
 - `distinct_root` — the `MERGE_GROUP_BY → PARTITION_DISTINCT → DISTINCT` chain that dedups the correlated key for the subquery's DELIM_SCANs (`distinct` is a non-owning borrow of the bottom DISTINCT)
 

@@ -276,6 +276,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
     "dynamic_filter_keep_threshold", opt.dynamic_filter_keep_threshold, yaml::fraction<double>{});
   r.optional("enable_pinned_zone_map_pruning", opt.enable_pinned_zone_map_pruning);
   r.optional("enable_compressed_materialization", opt.enable_compressed_materialization);
+  r.optional("enable_delim_direct_lowering", opt.enable_delim_direct_lowering);
   // 0 is meaningful here: it turns the estimate off and leaves sizing to gpus_per_query.
   r.optional("admission_bytes_per_gpu", yaml::bytes(opt.admission_bytes_per_gpu));
   r.optional("avg_variable_column_bytes", yaml::bytes(opt.avg_variable_column_bytes));

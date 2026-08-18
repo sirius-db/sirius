@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "duckdb/common/enum_util.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/node.hpp"
@@ -23,12 +25,23 @@
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "planner/sirius_plan_delim_direct.hpp"
+#include "sirius_context.hpp"
 
 #include <memory>
 
 namespace sirius::planner {
 
 namespace {
+
+/// Read the delim-direct-lowering enable flag from the active SiriusContext config. Defaults to
+/// enabled (the registered default) when the state is unavailable.
+bool delim_direct_lowering_enabled(duckdb::ClientContext& context)
+{
+  auto state = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!state) { return true; }
+  return state->get_config().get_operator_params().enable_delim_direct_lowering;
+}
 
 // Translate a vector of DuckDB expressions into Sirius AST nodes at the planner
 // boundary. The source vector is drained; size and order are preserved, with a
@@ -72,6 +85,24 @@ static void gather_delim_scans(
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::plan_delim_join(duckdb::LogicalComparisonJoin& op)
 {
+  // Pure-equality EXISTS / NOT EXISTS delims collapse into a single direct semi/anti hash join
+  // (sirius_plan_delim_direct.cpp). Ineligible shapes — with the typed reason logged — keep the
+  // regular delim lowering below.
+  if (delim_direct_lowering_enabled(context)) {
+    auto analysis = classify_delim_direct_lowering(op);
+    if (analysis.eligible()) {
+      apply_delim_direct_lowering(op, analysis);
+      SIRIUS_LOG_INFO(
+        "[delim_direct] Lowered a DELIM join to a direct {} hash join with {} condition(s).",
+        duckdb::EnumUtil::ToString(op.join_type),
+        op.conditions.size());
+      return plan_comparison_join(op);
+    }
+    SIRIUS_LOG_INFO("[delim_direct] Keeping the DELIM lowering for a {} delim join: {}.",
+                    duckdb::EnumUtil::ToString(op.join_type),
+                    to_string(analysis.refusal));
+  }
+
   // first create the underlying join
   auto plan = plan_comparison_join(op);
   // this should create a join, not a cross product

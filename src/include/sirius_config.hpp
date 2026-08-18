@@ -167,6 +167,12 @@ struct operator_params {
   /// boundaries restore native carriers.
   bool enable_compressed_materialization = true;
 
+  /// Collapse pure-equality EXISTS / NOT EXISTS DELIM joins into a single direct semi/anti hash
+  /// join at plan time (sirius_plan_delim_direct.cpp), skipping the dedup + join + join-back
+  /// sandwich. Ineligible shapes (scalar-aggregate correlations, non-equality correlations)
+  /// always keep the delim lowering. Off = always use the delim lowering.
+  bool enable_delim_direct_lowering = true;
+
   /// Admission-time GPU allocation: target bytes of projected scan output per GPU.
   /// At query start, the engine estimates total scan output bytes from the plan's
   /// estimated_cardinality × per-column width, then assigns

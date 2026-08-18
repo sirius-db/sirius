@@ -30,6 +30,7 @@ sirius:
     dynamic_filter_keep_threshold: 0.7
     enable_pinned_zone_map_pruning: false
     enable_compressed_materialization: false
+    enable_delim_direct_lowering: false
   compression:
     enable_pin_table_compression: true
     min_batch_size_bytes: 8MiB
