@@ -108,7 +108,7 @@ struct cached_databatch_provider : public databatch_provider {
                             std::vector<insert_delta_split> delta_splits,
                             std::vector<cudf::data_type> normalization_targets,
                             bool has_physical_overrides,
-                            sirius::scan_decode_request decode_request,
+                            sirius::pushdown_request pushdown_req,
                             std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters)
     : _plan(std::move(plan)),
       _entry(entry),
@@ -117,7 +117,7 @@ struct cached_databatch_provider : public databatch_provider {
       _delta_splits(std::move(delta_splits)),
       _normalization_targets(std::move(normalization_targets)),
       _has_physical_overrides(has_physical_overrides),
-      _decode_request(std::move(decode_request)),
+      _pushdown_req(std::move(pushdown_req)),
       _dynamic_filters(std::move(dynamic_filters))
   {
     auto const& entry_column_names = _entry.cache_info.column_names();
@@ -194,13 +194,13 @@ struct cached_databatch_provider : public databatch_provider {
         // worth asking; row dropping is additionally skipped when this operator
         // carries mvcc keep-masks, since a decode-compacted batch no longer
         // lines up with a positional deleted-row mask.
-        std::shared_ptr<const sirius::compressed_scan> decode_scan;
-        if (!_decode_request.empty()) {
-          auto scan = std::make_shared<const sirius::compressed_scan>(_decode_request);
+        std::shared_ptr<const sirius::decompression_pushdown_scan> pushdown_scan;
+        if (!_pushdown_req.empty()) {
+          auto scan = std::make_shared<const sirius::decompression_pushdown_scan>(_pushdown_req);
           // Row dropping cannot compose with a positional deleted-row mask: a
           // compacted batch no longer lines up with it.
           if (!_mvcc_masks.empty()) { scan = scan->without_row_selection(); }
-          if (scan) { decode_scan = scan->for_chunk(chunk.compressed->table(), _column_indices); }
+          if (scan) { pushdown_scan = scan->for_chunk(chunk.compressed->table(), _column_indices); }
         }
         // A PER-BATCH snapshot of the operator's dynamic-filter channel: join
         // builds publish mid-scan, so later batches legitimately carry more
@@ -230,7 +230,7 @@ struct cached_databatch_provider : public databatch_provider {
             auto snap = sirius::op::scan::snapshot_membership_probes(*_dynamic_filters,
                                                                      _column_indices.size());
             SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
-              "[decode-filter] join filter attach (drain) channel={}: slots={} attached={} "
+              "[decompression-pushdown] join filter attach (drain) channel={}: slots={} attached={} "
               "generation={} skipped_non_maskable={}",
               static_cast<void const*>(_dynamic_filters.get()),
               _column_indices.size(),
@@ -239,20 +239,20 @@ struct cached_databatch_provider : public databatch_provider {
               snap.skipped_non_mask);
             if (snap.attached_probes > 0) {
               auto const base =
-                decode_scan
-                  ? decode_scan
-                  : std::make_shared<const sirius::compressed_scan>(sirius::scan_decode_request{});
-              decode_scan = base->with_membership_probes(std::move(snap.probes), snap.generation);
+                pushdown_scan
+                  ? pushdown_scan
+                  : std::make_shared<const sirius::decompression_pushdown_scan>(sirius::pushdown_request{});
+              pushdown_scan = base->with_membership_probes(std::move(snap.probes), snap.generation);
             }
           } else {
             SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
-              "[decode-filter] join filter attach (drain) channel={}: none published yet "
+              "[decompression-pushdown] join filter attach (drain) channel={}: none published yet "
               "(expected — the drain precedes join publication; the decode-time snapshot "
               "retries)",
               static_cast<void const*>(_dynamic_filters.get()));
           }
         }
-        if (decode_scan) { projected->set_decode_scan(std::move(decode_scan)); }
+        if (pushdown_scan) { projected->set_pushdown_scan(std::move(pushdown_scan)); }
         return cucascade::data_batch::make(get_next_batch_id(), std::move(projected));
       }
       // Uncompressed chunk: project the requested columns (positions into the
@@ -407,7 +407,7 @@ struct cached_databatch_provider : public databatch_provider {
   /// @c _column_indices. Only the GPU-tier compressed path consumes it: the
   /// host path would have to parse the chunk header to know what its plans can
   /// exploit, and that tier is not where the decode costs anything.
-  sirius::scan_decode_request _decode_request;
+  sirius::pushdown_request _pushdown_req;
   /// The operator's dynamic-filter channel (may be null). NOT a snapshot: the
   /// per-batch attach in get_device_databatch snapshots it at serve time so
   /// batches pick up join filters as they are published mid-scan.
@@ -789,7 +789,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     // batch decodes rather than after it. The ingestible analysed its filter
     // once at bind; here it is only mapped onto the slots this entry serves.
     auto const slot_map = primary_index_by_slot(*assignment.entry, assignment.columns);
-    auto decode_request = sirius::op::build_scan_decode_request(
+    auto pushdown_req = sirius::op::build_pushdown_request(
       assignment.op->get_ingestible().filter_analysis(), slot_map);
     // The provider captures the operator's dynamic-filter CHANNEL (not a
     // snapshot) so each compressed batch can pick up join-published filters at
@@ -804,19 +804,19 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
       // by duckdb's DynamicTableFilterSet pointer) and the one the decode-time
       // snapshot logs.
       SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
-        "[decode-filter] entry '{}': join filter channel={} published_now={} decode request: "
+        "[decompression-pushdown] entry '{}': join filter channel={} published_now={} decode request: "
         "{} slot(s), covers_whole_filter={}",
         assignment.entry_name,
         static_cast<void const*>(dynamic_filters.get()),
         dynamic_filters ? dynamic_filters->has_filters() : false,
-        decode_request.columns.size(),
-        decode_request.ranges_cover_whole_filter);
+        pushdown_req.columns.size(),
+        pushdown_req.ranges_cover_whole_filter);
     } else {
       // Answering an equality off a dictionary is independent of the gate; row
       // dropping is not, so give it up when the gate is off.
       auto const unfiltered =
-        sirius::compressed_scan{std::move(decode_request)}.without_row_selection();
-      decode_request = unfiltered ? unfiltered->request() : sirius::scan_decode_request{};
+        sirius::decompression_pushdown_scan{std::move(pushdown_req)}.without_row_selection();
+      pushdown_req = unfiltered ? unfiltered->request() : sirius::pushdown_request{};
     }
     // The provider charges a served column only for the cast scan normalization will make, so
     // it needs the scan's carrier targets. They are passed in output order, which is also the
@@ -835,7 +835,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
                                                    std::move(delta_splits),
                                                    assignment.op->normalization_targets(),
                                                    assignment.op->has_physical_overrides(),
-                                                   std::move(decode_request),
+                                                   std::move(pushdown_req),
                                                    std::move(dynamic_filters));
     _metadata_processor->use_cached_entries_for_pipeline(assignment.op, std::move(provider));
   }
@@ -1746,7 +1746,7 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   std::vector<insert_delta_split> delta_splits,
   std::vector<cudf::data_type> normalization_targets,
   bool has_physical_overrides,
-  sirius::scan_decode_request decode_request,
+  sirius::pushdown_request pushdown_req,
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters)
 {
   return std::make_unique<cached_databatch_provider>(entry,
@@ -1757,7 +1757,7 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
                                                      std::move(delta_splits),
                                                      std::move(normalization_targets),
                                                      has_physical_overrides,
-                                                     std::move(decode_request),
+                                                     std::move(pushdown_req),
                                                      std::move(dynamic_filters));
 }
 

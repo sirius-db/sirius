@@ -85,7 +85,7 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   std::span<const std::uint8_t> header,
   simpatico::payload_fetch_fn const& fetch,
   const std::optional<std::vector<std::size_t>>& selected_indices,
-  compressed_scan const* scan,
+  decompression_pushdown_scan const* scan,
   cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
   rmm::cuda_stream_view stream)
@@ -120,7 +120,7 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   // which is indexed by projected position — lines up with 0..num_columns.
   std::vector<std::size_t> selection(subset.num_columns());
   std::iota(selection.begin(), selection.end(), std::size_t{0});
-  auto decoded      = decode_compressed_chunk(subset, selection, scan, stream, mr);
+  auto decoded      = decompress_chunk(subset, selection, scan, stream, mr);
   auto decompressed = std::move(decoded.table);
 
   // Re-point decoded buffers onto `stream` so pipeline teardown is ordered.
@@ -142,7 +142,7 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   // decode is byte-identical to what it always was.
   auto const& outcome = decoded.outcome;
   if (outcome.any()) {
-    return std::make_unique<decoded_batch_representation>(
+    return std::make_unique<decompression_pushdown_batch_representation>(
       std::move(decompressed),
       *const_cast<cucascade::memory::memory_space*>(space),
       stream,
@@ -173,7 +173,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
   return reconstruct_and_decompress_to_gpu(rep.header(),
                                            fetch,
                                            rep.selected_indices(),
-                                           rep.decode_scan().get(),
+                                           rep.pushdown_scan().get(),
                                            source,
                                            target_memory_space,
                                            stream);
@@ -207,7 +207,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
     selected = identity_selection;
   }
 
-  auto decoded      = decode_compressed_chunk(ct, selected, rep.decode_scan().get(), stream, mr);
+  auto decoded      = decompress_chunk(ct, selected, rep.pushdown_scan().get(), stream, mr);
   auto decompressed = std::move(decoded.table);
 
   auto cols = decompressed->release();
@@ -227,7 +227,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
   // anything to report; the plain type is used otherwise.
   auto const& outcome = decoded.outcome;
   if (outcome.any()) {
-    return std::make_unique<decoded_batch_representation>(
+    return std::make_unique<decompression_pushdown_batch_representation>(
       std::move(decompressed),
       *const_cast<cucascade::memory::memory_space*>(space),
       stream,

@@ -183,24 +183,24 @@ class scan_operator_input : public op::operator_data {
   /// splits fold filter costs into their own estimates instead.
   bool row_filter_pending{false};
   /// True when prepare_for_processing's conversion came back as a
-  /// decode_outcome::row_filtered: the decode already applied the split's whole
+  /// pushdown_outcome::row_filtered: the decode already applied the split's whole
   /// table-filter conjunction and every column is compacted to the surviving
   /// rows. materialize_table then returns filter_state::ROW_FILTERED so
   /// post_filter_and_project skips filter evaluation and only projects. Never
   /// set while the gate is off — the converters then always produce the plain
   /// representation.
-  bool decode_row_filtered{false};
+  bool pushdown_row_filtered{false};
   /// Positions in the decoded batch delivered as a BOOL8 predicate result
-  /// rather than values (decode_outcome::predicate_columns), stamped by
+  /// rather than values (pushdown_outcome::predicate_columns), stamped by
   /// prepare_for_processing. materialize_table forwards it to
   /// post_filter_and_project, which rewrites those columns' filter conjunct to
   /// a bare boolean reference. Empty when nothing was substituted.
-  std::vector<std::size_t> decode_predicate_columns;
+  std::vector<std::size_t> pushdown_predicate_columns;
   /// The decode also applied those conjuncts to the rows
-  /// (decode_outcome::predicates_enforced), so they need not be evaluated
+  /// (pushdown_outcome::predicates_enforced), so they need not be evaluated
   /// again. False whenever the answers came from the plain predicated decode,
   /// which drops no rows.
-  bool decode_predicates_enforced{false};
+  bool pushdown_predicates_enforced{false};
   /// The operator's dynamic-filter channel (may be null), stamped by
   /// sirius_gpu_scan_operator::get_next_task_input_data. prepare_for_processing
   /// snapshots it at DECODE time — the scan-manager drain runs at query
@@ -212,12 +212,12 @@ class scan_operator_input : public op::operator_data {
   /// sirius_gpu_scan_operator::get_next_task_input_data on every split it hands
   /// out. Selectivity is uniform across a scan's batches (unclustered chunks),
   /// so one such batch predicts the rest: prepare_for_processing latches it on
-  /// seeing decode_outcome::selection_unprofitable, and later splits drop the
+  /// seeing pushdown_outcome::selection_unprofitable, and later splits drop the
   /// row selection before conversion (and the working-set estimator keeps the
   /// full-width envelope). Per-operator by construction — another query's scan
   /// decides fresh. May be null (splits not routed through the operator, e.g.
   /// tests): all reads null-check.
-  std::shared_ptr<std::atomic<bool>> decode_selection_unprofitable;
+  std::shared_ptr<std::atomic<bool>> pushdown_selection_unprofitable;
   /// Per-query table taken out of the cached wrapper batch right after
   /// prepare_for_processing's conversion produced it (decompressed or
   /// uploaded fresh for this split) — never raw GPU pin storage, which is

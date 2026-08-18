@@ -35,12 +35,12 @@
 
 namespace sirius {
 
-bool scan_decode_request::empty() const noexcept
+bool pushdown_request::empty() const noexcept
 {
   return std::all_of(columns.begin(), columns.end(), [](auto const& c) { return c.empty(); });
 }
 
-bool scan_decode_request::selects_rows() const noexcept
+bool pushdown_request::selects_rows() const noexcept
 {
   return std::any_of(columns.begin(), columns.end(), [](auto const& c) {
     return c.range.has_value() || !c.membership.empty();
@@ -108,11 +108,11 @@ column_capability probe_column(simpatico::compressed_table const& table, std::si
 }
 
 //===----------------------------------------------------------------------===//
-// Per-chunk plan
+// Per-chunk pushdown config
 //===----------------------------------------------------------------------===//
 
 /// A request narrowed to what one chunk can actually do with it.
-struct chunk_decode_plan {
+struct chunk_pushdown_config {
   /// One selected column's row-restricting bounds after the narrowing.
   struct range_slot {
     /// The scan asked for these bounds.
@@ -137,10 +137,10 @@ struct chunk_decode_plan {
 ///
 /// A conjunct on a column that cannot evaluate it while decoding is DROPPED
 /// (sound: the decode then only under-filters, and the scan's residual filter
-/// still runs) and clears @c covers_whole_filter. The plan is disabled only
+/// still runs) and clears @c covers_whole_filter. The config is disabled only
 /// when nothing survives.
 ///
-/// into the selection, or a dynamic join filter. It lets the plan enable with
+/// into the selection, or a dynamic join filter. It lets the config enable with
 /// no range sources at all.
 ///
 /// @p has_dynamic_join_selection narrows that to just the join-filter half: a
@@ -153,34 +153,34 @@ struct chunk_decode_plan {
 /// that source silently contributes nothing. Coverage must not claim "every
 /// surviving row satisfies the scan's own filter" off a source that might not
 /// have run, so only a dynamic join filter clears it.
-chunk_decode_plan plan_decode(simpatico::compressed_table const& table,
-                              std::span<const std::size_t> selected_columns,
-                              scan_decode_request const& request,
-                              bool has_external_selection,
-                              bool has_dynamic_join_selection)
+chunk_pushdown_config build_chunk_pushdown_config(simpatico::compressed_table const& table,
+                                                  std::span<const std::size_t> selected_columns,
+                                                  pushdown_request const& request,
+                                                  bool has_external_selection,
+                                                  bool has_dynamic_join_selection)
 {
-  chunk_decode_plan plan;
+  chunk_pushdown_config config;
   bool const any_range = std::any_of(request.columns.begin(),
                                      request.columns.end(),
                                      [](auto const& c) { return c.range.has_value(); });
   if (!any_range && !has_external_selection) {
     SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
-      "[decode-filter] plan: {} column entr(ies), no ranges, no in-place/membership "
+      "[decompression-pushdown] config: {} column entr(ies), no ranges, no in-place/membership "
       "sources — plain decode",
       request.columns.size());
-    return plan;
+    return config;
   }
   if (request.columns.size() > selected_columns.size()) {
-    throw std::runtime_error("[compressed_scan] decode request wider than the projection");
+    throw std::runtime_error("[decompression_pushdown_scan] decode request wider than the projection");
   }
 
   auto const count = selected_columns.size();
-  plan.ranges.resize(count);
-  plan.routes.assign(count, sirius::codegen::decode_route::full);
+  config.ranges.resize(count);
+  config.routes.assign(count, sirius::codegen::decode_route::full);
   for (std::size_t i = 0; i < request.columns.size(); ++i) {
     if (auto const& range = request.columns[i].range) {
-      plan.ranges[i].requested = true;
-      plan.ranges[i].bounds    = *range;
+      config.ranges[i].requested = true;
+      config.ranges[i].bounds    = *range;
     }
   }
 
@@ -191,7 +191,7 @@ chunk_decode_plan plan_decode(simpatico::compressed_table const& table,
     auto const capability = probe_column(table, selected_columns[i]);
     auto const physical   = selected_columns[i];
     SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
-      "[decode-filter] plan col[{}] physical={} dtype={} route={} comparable_lane={} "
+      "[decompression-pushdown] config col[{}] physical={} dtype={} route={} comparable_lane={} "
       "range_requested={} range=[{}, {}]",
       i,
       physical,
@@ -199,34 +199,34 @@ chunk_decode_plan plan_decode(simpatico::compressed_table const& table,
                                       : "OUT-OF-RANGE",
       static_cast<int>(capability.decode.compact_route),
       capability.comparable_lane,
-      plan.ranges[i].requested,
-      plan.ranges[i].bounds.lo,
-      plan.ranges[i].bounds.hi);
-    plan.routes[i] = capability.decode.compact_route;
+      config.ranges[i].requested,
+      config.ranges[i].bounds.lo,
+      config.ranges[i].bounds.hi);
+    config.routes[i] = capability.decode.compact_route;
     if (capability.decode.compact_route != sirius::codegen::decode_route::full) { ++compactable; }
-    if (!plan.ranges[i].requested) { continue; }
+    if (!config.ranges[i].requested) { continue; }
     if (!capability.can_select_rows()) {
       SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
-        "[decode-filter] plan: DROPPING range conjunct on selected pos {} (physical {}) — the "
+        "[decompression-pushdown] config: DROPPING range conjunct on selected pos {} (physical {}) — the "
         "column cannot evaluate it while decoding (route={} comparable_lane={})",
         i,
         physical,
         static_cast<int>(capability.decode.compact_route),
         capability.comparable_lane);
-      plan.ranges[i].requested = false;
-      dropped_conjunct         = true;
+      config.ranges[i].requested = false;
+      dropped_conjunct          = true;
       continue;
     }
-    plan.ranges[i].selects = true;
+    config.ranges[i].selects = true;
     ++selecting_columns;
   }
 
   if (selecting_columns == 0 && !has_external_selection) {
     SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
-      "[decode-filter] plan: no row-selecting source survived — plain decode");
+      "[decompression-pushdown] config: no row-selecting source survived — plain decode");
     return {};
   }
-  plan.enabled = true;
+  config.enabled = true;
   // A dictionary-answered equality does NOT clear coverage: it is validated
   // up front (simpatico_codegen.cpp's bool8_filters check) and any failure
   // there refuses the whole decode, so one reaching this point is guaranteed
@@ -237,17 +237,17 @@ chunk_decode_plan plan_decode(simpatico::compressed_table const& table,
   // guarantee (compute_mask can decline per batch at decode time), so
   // covers_whole_filter must not claim "every surviving row satisfies the
   // scan's own filter" off a source that might not actually have run.
-  plan.covers_whole_filter = request.ranges_cover_whole_filter && !dropped_conjunct &&
-                             selecting_columns > 0 && !has_dynamic_join_selection;
+  config.covers_whole_filter = request.ranges_cover_whole_filter && !dropped_conjunct &&
+                               selecting_columns > 0 && !has_dynamic_join_selection;
   SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
-    "[decode-filter] plan ENABLED: {} row-selecting range column(s), "
+    "[decompression-pushdown] config ENABLED: {} row-selecting range column(s), "
     "external_sources={}, {}/{} column(s) decode compacted, covers_whole_filter={}",
     selecting_columns,
     has_external_selection,
     compactable,
     count,
-    plan.covers_whole_filter);
-  return plan;
+    config.covers_whole_filter);
+  return config;
 }
 
 //===----------------------------------------------------------------------===//
@@ -257,7 +257,7 @@ chunk_decode_plan plan_decode(simpatico::compressed_table const& table,
 /// The in-place equality answers of @p request, padded to @p count so they line
 /// up 1:1 with the columns being decoded. Empty when nothing is asked for,
 /// which lets callers stay on the plain decompress overload.
-std::vector<simpatico::decode_predicate> to_decode_predicates(scan_decode_request const& request,
+std::vector<simpatico::decode_predicate> to_decode_predicates(pushdown_request const& request,
                                                               std::size_t count)
 {
   bool const any = std::any_of(request.columns.begin(), request.columns.end(), [](auto const& c) {
@@ -265,7 +265,7 @@ std::vector<simpatico::decode_predicate> to_decode_predicates(scan_decode_reques
   });
   if (!any) { return {}; }
   if (request.columns.size() > count) {
-    throw std::runtime_error("[compressed_scan] decode request wider than the projection");
+    throw std::runtime_error("[decompression_pushdown_scan] decode request wider than the projection");
   }
   std::vector<simpatico::decode_predicate> predicates(count);
   for (std::size_t i = 0; i < request.columns.size(); ++i) {
@@ -306,21 +306,21 @@ struct selection_source {
 /// is structurally impossible and the round-trip is skipped.
 constexpr std::size_t kMaxSelectionSources = 8;
 
-/// Decode @p selected columns of @p chunk with @p request applied during the
-/// decode. Returns a null table when the attempt is declined here (nothing to
-/// plan, shape checks) or when the assembly refuses — the caller then decodes
-/// plainly. @p outcome reports what a non-null return did.
+/// Decompress @p selected columns of @p chunk with @p request applied during
+/// the decode. Returns a null table when the attempt is declined here
+/// (nothing to configure, shape checks) or when the assembly refuses — the
+/// caller then decodes plainly. @p outcome reports what a non-null return did.
 ///
-/// An in-place equality answer survives EVERY outcome: whether the filtered
+/// An in-place equality answer survives EVERY outcome: whether the pushdown
 /// decode applies or falls back internally, the column's slot carries the BOOL8
 /// answer (compacted to the surviving rows when the decode compacted), so the
 /// scan's residual filter reads a boolean instead of re-comparing strings.
-std::unique_ptr<cudf::table> decode_with_filters(simpatico::compressed_table const& chunk,
-                                                 std::span<const std::size_t> selected,
-                                                 scan_decode_request const& request,
-                                                 rmm::cuda_stream_view stream,
-                                                 rmm::device_async_resource_ref mr,
-                                                 decode_outcome& outcome)
+std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_table const& chunk,
+                                                      std::span<const std::size_t> selected,
+                                                      pushdown_request const& request,
+                                                      rmm::cuda_stream_view stream,
+                                                      rmm::device_async_resource_ref mr,
+                                                      pushdown_outcome& outcome)
 {
   // The conjuncts the chunk's compression plans cannot influence: an equality
   // answered off a dictionary, and the join filters. Collected first because
@@ -340,19 +340,19 @@ std::unique_ptr<cudf::table> decode_with_filters(simpatico::compressed_table con
       return s.what == selection_source::kind::membership;
     });
 
-  auto const plan =
-    plan_decode(chunk, selected, request, !sources.empty(), has_dynamic_join_selection);
-  if (!plan.enabled) { return nullptr; }
+  auto const config =
+    build_chunk_pushdown_config(chunk, selected, request, !sources.empty(), has_dynamic_join_selection);
+  if (!config.enabled) { return nullptr; }
 
   // Then the conjuncts planning just decided this chunk can evaluate.
-  for (std::size_t i = 0; i < plan.ranges.size(); ++i) {
-    if (plan.ranges[i].selects) { sources.push_back({selection_source::kind::range, i}); }
+  for (std::size_t i = 0; i < config.ranges.size(); ++i) {
+    if (config.ranges[i].selects) { sources.push_back({selection_source::kind::range, i}); }
   }
 
   if (sources.size() > kMaxSelectionSources ||
       chunk.num_rows() > std::numeric_limits<std::int32_t>::max()) {
     SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
-      "[decode-filter] declined on shape ({} row-selecting sources, {} rows) — plain decode",
+      "[decompression-pushdown] declined on shape ({} row-selecting sources, {} rows) — plain decode",
       sources.size(),
       chunk.num_rows());
     return nullptr;
@@ -367,13 +367,13 @@ std::unique_ptr<cudf::table> decode_with_filters(simpatico::compressed_table con
   sirius::codegen::scan_filter_request wave_request;
   wave_request.routes.reserve(selected.size());
   for (std::size_t i = 0; i < selected.size(); ++i) {
-    wave_request.routes.push_back(plan.routes[i]);
+    wave_request.routes.push_back(config.routes[i]);
   }
   std::string order_echo;
   for (auto const& source : sources) {
     switch (source.what) {
       case selection_source::kind::range: {
-        auto const& slot = plan.ranges[source.column];
+        auto const& slot = config.ranges[source.column];
         wave_request.filters.push_back({source.column, {slot.bounds.lo, slot.bounds.hi}});
         order_echo += " range(c" + std::to_string(source.column) + ")";
         break;
@@ -390,7 +390,7 @@ std::unique_ptr<cudf::table> decode_with_filters(simpatico::compressed_table con
         break;
     }
   }
-  SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG("[decode-filter] wave-1 sources, ascending expected keep:{}",
+  SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG("[decompression-pushdown] wave-1 sources, ascending expected keep:{}",
                                      order_echo);
   wave_request.source_generation = request.membership_generation;
 
@@ -403,7 +403,7 @@ std::unique_ptr<cudf::table> decode_with_filters(simpatico::compressed_table con
   result.set_stream(stream);
   if (!error.empty()) {
     SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
-      "[decode-filter] assembly REFUSED ({}); the batch decoded plainly", error);
+      "[decompression-pushdown] assembly REFUSED ({}); the batch decoded plainly", error);
   }
   // row_filtered only when the decode carried EVERY restricting conjunct: a
   // partially applied request must leave the batch untagged so the scan
@@ -411,7 +411,7 @@ std::unique_ptr<cudf::table> decode_with_filters(simpatico::compressed_table con
   // surviving rows is idempotent).
   if (result.status == sirius::codegen::scan_filter_status::declined_unselective) {
     outcome.selection_unprofitable = true;
-  } else if (result.applied && plan.covers_whole_filter) {
+  } else if (result.applied && config.covers_whole_filter) {
     outcome.row_filtered = true;
   }
   // Every equality the request carried was ANDed into the batch mask before
@@ -420,7 +420,7 @@ std::unique_ptr<cudf::table> decode_with_filters(simpatico::compressed_table con
   // predicated rerun, which drops no rows.
   outcome.predicates_enforced = result.applied && !wave_request.bool8_filters.empty();
   SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
-    "[decode-filter] decode {} (status={} generation={}): ranges={} equalities={} "
+    "[decompression-pushdown] decode {} (status={} generation={}): ranges={} equalities={} "
     "join_filters={} survivors={}/{} column(s)={} covers_whole_filter={} row_filtered={} "
     "selection_unprofitable={}",
     result.applied ? "APPLIED" : "NOT applied (plain output)",
@@ -432,7 +432,7 @@ std::unique_ptr<cudf::table> decode_with_filters(simpatico::compressed_table con
     result.survivor_count,
     result.num_rows,
     table->num_columns(),
-    plan.covers_whole_filter,
+    config.covers_whole_filter,
     outcome.row_filtered,
     outcome.selection_unprofitable);
   return table;
@@ -441,21 +441,21 @@ std::unique_ptr<cudf::table> decode_with_filters(simpatico::compressed_table con
 }  // namespace
 
 //===----------------------------------------------------------------------===//
-// compressed_scan
+// decompression_pushdown_scan
 //===----------------------------------------------------------------------===//
 
-std::shared_ptr<const compressed_scan> compressed_scan::without_row_selection() const
+std::shared_ptr<const decompression_pushdown_scan> decompression_pushdown_scan::without_row_selection() const
 {
-  scan_decode_request narrowed;
+  pushdown_request narrowed;
   narrowed.columns.reserve(_request.columns.size());
   for (auto const& column : _request.columns) {
     narrowed.columns.push_back({column.equals_any, std::nullopt, {}});
   }
   if (narrowed.empty()) { return nullptr; }
-  return std::make_shared<const compressed_scan>(std::move(narrowed));
+  return std::make_shared<const decompression_pushdown_scan>(std::move(narrowed));
 }
 
-std::shared_ptr<const compressed_scan> compressed_scan::with_membership_probes(
+std::shared_ptr<const decompression_pushdown_scan> decompression_pushdown_scan::with_membership_probes(
   std::vector<std::vector<membership_probe>> probes, std::uint64_t generation) const
 {
   auto refreshed = _request;
@@ -465,10 +465,10 @@ std::shared_ptr<const compressed_scan> compressed_scan::with_membership_probes(
       i < probes.size() ? std::move(probes[i]) : std::vector<membership_probe>{};
   }
   refreshed.membership_generation = generation;
-  return std::make_shared<const compressed_scan>(std::move(refreshed));
+  return std::make_shared<const decompression_pushdown_scan>(std::move(refreshed));
 }
 
-std::shared_ptr<const compressed_scan> compressed_scan::for_chunk(
+std::shared_ptr<const decompression_pushdown_scan> decompression_pushdown_scan::for_chunk(
   simpatico::compressed_table const& chunk, std::span<const std::size_t> selected) const
 {
   // An in-place equality answer is only worth asking for where the plan can
@@ -485,10 +485,10 @@ std::shared_ptr<const compressed_scan> compressed_scan::for_chunk(
     any_asked = any_asked || !column.empty();
   }
   if (!any_asked) { return nullptr; }
-  return std::make_shared<const compressed_scan>(std::move(narrowed));
+  return std::make_shared<const decompression_pushdown_scan>(std::move(narrowed));
 }
 
-compressed_scan::compaction_forecast compressed_scan::forecast_compaction(
+decompression_pushdown_scan::compaction_forecast decompression_pushdown_scan::forecast_compaction(
   simpatico::compressed_table const& chunk, std::span<const std::size_t> selected) const
 {
   compaction_forecast forecast{};
@@ -522,25 +522,25 @@ compressed_scan::compaction_forecast compressed_scan::forecast_compaction(
 // Entry point
 //===----------------------------------------------------------------------===//
 
-decode_result decode_compressed_chunk(simpatico::compressed_table const& chunk,
+decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
                                       std::span<const std::size_t> selected,
-                                      compressed_scan const* scan,
+                                      decompression_pushdown_scan const* scan,
                                       rmm::cuda_stream_view stream,
                                       rmm::device_async_resource_ref mr)
 {
-  decode_result out;
-  static scan_decode_request const no_request;
+  decompress_result out;
+  static pushdown_request const no_request;
   auto const& request = scan != nullptr ? scan->request() : no_request;
 
   auto const predicates = to_decode_predicates(request, selected.size());
   SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
-    "[decode-filter] chunk: columns={} equalities={} request_empty={}",
+    "[decompression-pushdown] chunk: columns={} equalities={} request_empty={}",
     selected.size(),
     predicates.size(),
     request.empty());
 
   if (!request.empty()) {
-    out.table = decode_with_filters(chunk, selected, request, stream, mr, out.outcome);
+    out.table = decompress_with_pushdown(chunk, selected, request, stream, mr, out.outcome);
   }
   if (!out.table) {
     out.table = predicates.empty()

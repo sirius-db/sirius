@@ -59,7 +59,7 @@ filtered_table gpu_ingestible::materialize_table(const op::scan::scan_operator_i
     // ROW_FILTERED makes post_filter_and_project skip filter evaluation while
     // still assembling the projection/output layout.
     auto const decoded_state =
-      split.decode_row_filtered ? filter_state::ROW_FILTERED : filter_state::UNFILTERED;
+      split.pushdown_row_filtered ? filter_state::ROW_FILTERED : filter_state::UNFILTERED;
     if (split.stolen_table) {
       // prepare_for_processing took ownership of the wrapper batch's per-query
       // table; move it straight into the scan output — the owned-table
@@ -67,8 +67,8 @@ filtered_table gpu_ingestible::materialize_table(const op::scan::scan_operator_i
       split.stolen_table_consumed = true;
       return {.table               = owning_table_view{std::move(split.stolen_table)},
               .state               = decoded_state,
-              .predicate_columns   = split.decode_predicate_columns,
-              .predicates_enforced = split.decode_predicates_enforced};
+              .predicate_columns   = split.pushdown_predicate_columns,
+              .predicates_enforced = split.pushdown_predicates_enforced};
     }
     if (split.stolen_table_consumed) {
       throw std::runtime_error(
@@ -102,8 +102,8 @@ filtered_table gpu_ingestible::materialize_table(const op::scan::scan_operator_i
     }
     return {.table               = owning_table_view{std::move(rbatch), view},
             .state               = decoded_state,
-            .predicate_columns   = split.decode_predicate_columns,
-            .predicates_enforced = split.decode_predicates_enforced};
+            .predicate_columns   = split.pushdown_predicate_columns,
+            .predicates_enforced = split.pushdown_predicates_enforced};
   }
 }
 

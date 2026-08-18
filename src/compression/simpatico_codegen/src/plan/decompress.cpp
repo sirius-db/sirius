@@ -996,15 +996,19 @@ namespace {
 NodeId root_value_producer(PlanTree const& tree);
 bool mask_consume_selection_root(PlanTree const& tree);
 
-// The specialized dictionary char-emit
-// (launch_decode_fused_tree_dict_gather):
-// constant-width, null-free keys with IDENTITY-STORED key channels (q1's
-// l_returnflag / l_linestatus; dict->bp->bp keys and variable-width keys take
-// the general route). The caller owns key-width measurement, keys_chars
-// extraction, the analytic offsets (j * width) and the strings assembly —
-// That kernel emits only the compacted chars. Returns nullptr when the fast
-// path does not apply OR the launch declines — nothing shared is mutated, so
-// the caller simply falls through to the general dict route.
+struct str_split_shape {
+  compressed_representation const* chars_rep = nullptr;
+  NodeId offsets_nid                         = 0;
+};
+std::optional<str_split_shape> locate_str_split_shape(PlanTree const& tree);
+
+// The specialized dictionary char-emit (launch_decode_fused_tree_dict_gather):
+// constant-width, null-free keys with identity-stored key channels; compressed
+// or variable-width keys take the general route. The caller owns key-width
+// measurement, keys_chars extraction, the analytic offsets (j * width), and
+// the strings assembly — the kernel itself emits only the compacted chars.
+// Returns nullptr when the fast path does not apply or the launch declines;
+// nothing shared is mutated, so the caller falls through to the general route.
 std::unique_ptr<cudf::column> try_dict_gather_fast_path(PlanTree const& tree,
                                                         decode_selection const& sel,
                                                         rmm::cuda_stream_view stream,
@@ -1042,11 +1046,11 @@ std::unique_ptr<cudf::column> try_dict_gather_fast_path(PlanTree const& tree,
     return nullptr;
   }
 
-  // Key-width measurement: D2H the K+1 offsets (K <= 150 for every TPC-H dict
-  // column — a few hundred bytes) on the decode stream, then require a
-  // constant width. The unfiltered path pays an equivalent lazy probe inside
-  // dictionary decompress (constant_key_width), so this adds no new sync
-  // class; a plan-side cache is a follow-up (needs a mutable PlanNode slot).
+  // Key-width measurement: D2H the K+1 offsets (small — a dictionary's key
+  // count) on the decode stream, then require a constant width. The
+  // unfiltered path pays an equivalent lazy probe inside dictionary decompress
+  // (constant_key_width), so this adds no new sync class; a plan-side cache is
+  // a follow-up (needs a mutable PlanNode slot).
   auto const n_offsets = static_cast<std::size_t>(keys_offsets->size());
   std::vector<std::int32_t> host_offsets(n_offsets);
   if (cudaMemcpyAsync(host_offsets.data(),
@@ -1111,8 +1115,8 @@ std::unique_ptr<cudf::column> try_dict_gather_fast_path(PlanTree const& tree,
 }
 
 // Masked str_split decode for `str_split -> {offsets: bitpack, chars: raw}`
-// plans (l_shipmode shape; deep offsets chains and entropy-coded chars stay
-// on the `full` route via the probe). Variable-width pattern:
+// plans (deep offsets chains and entropy-coded chars stay on the `full` route
+// via the probe). Variable-width pattern:
 //   phase 1 (launch_decode_fused_tree_str_split_meta): masked offsets-
 //     subtree decode emitting per-survivor byte lengths + int64 source char
 //     starts, compacted by rank;
@@ -1130,38 +1134,14 @@ std::unique_ptr<cudf::column> try_str_split_path(PlanTree const& tree,
                                                  rmm::device_async_resource_ref mr,
                                                  std::string* error_out)
 {
-  NodeId const str_nid = root_value_producer(tree);
-  if (str_nid >= tree.nodes.size() || tree.nodes[str_nid].op != "str_split") {
-    if (error_out) *error_out = "decompress: masked str_split requires a str_split-rooted plan";
+  auto const shape = locate_str_split_shape(tree);
+  if (!shape) {
+    if (error_out) *error_out = "decompress: str_split plan shape not supported for masked decode";
     return nullptr;
   }
-  PlanNode const& str_node = tree.nodes[str_nid];
-
-  // Locate the RAW chars channel (zero-copy view into the parked rep — a
-  // standalone decompress would materialize the full char width, the very
-  // cost the masked route exists to avoid) and the offsets child region.
-  compressed_representation const* chars_rep = nullptr;
-  NodeId offsets_nid                         = static_cast<NodeId>(tree.nodes.size());
-  for (std::size_t i = 0; i < str_node.output_names.size(); ++i) {
-    std::string const& name = str_node.output_names[i];
-    if (name == "chars") {
-      auto it = str_node.channels.find(str_node.output_paths[i]);
-      if (it != str_node.channels.end()) { chars_rep = it->second.get(); }
-    } else if (name == "offsets") {
-      for (auto const& e : str_node.children) {
-        if (e.channel == name) {
-          offsets_nid = e.child;
-          break;
-        }
-      }
-    }
-  }
-  if (chars_rep == nullptr || offsets_nid >= tree.nodes.size()) {
-    if (error_out)
-      *error_out = "decompress: str_split plan shape missing raw chars / offsets child";
-    return nullptr;
-  }
-  auto const chars_channels = chars_rep->named_channels(stream);
+  compressed_representation const* chars_rep = shape->chars_rep;
+  NodeId const offsets_nid                   = shape->offsets_nid;
+  auto const chars_channels                  = chars_rep->named_channels(stream);
   if (chars_channels.empty() || chars_channels.front().view.type().id() != cudf::type_id::UINT8) {
     if (error_out) *error_out = "decompress: str_split chars channel is not raw UINT8";
     return nullptr;
@@ -1434,10 +1414,9 @@ bool bitpack_selection_root(PlanTree const& tree)
   return nid < tree.nodes.size() && tree.nodes[nid].op == "bitpack";
 }
 
-// A delta root whose `differences` child is bitpack
-// (o_orderkey / l_orderkey shape). The mask_consume launcher renders this
-// shape too — the per-chunk prefix-sum reconstruction still runs, only the
-// stores are masked/compacted.
+// A delta root whose `differences` child is bitpack. The mask_consume
+// launcher renders this shape too — the per-chunk prefix-sum reconstruction
+// still runs, only the stores are masked/compacted.
 bool delta_selection_root(PlanTree const& tree)
 {
   NodeId const nid = root_value_producer(tree);
@@ -1456,22 +1435,18 @@ bool mask_consume_selection_root(PlanTree const& tree)
   return bitpack_selection_root(tree) || delta_selection_root(tree);
 }
 
-bool str_split_selection_root(PlanTree const& tree)
+std::optional<str_split_shape> locate_str_split_shape(PlanTree const& tree)
 {
   NodeId const nid = root_value_producer(tree);
-  if (nid >= tree.nodes.size() || tree.nodes[nid].op != "str_split") { return false; }
+  if (nid >= tree.nodes.size() || tree.nodes[nid].op != "str_split") { return std::nullopt; }
   PlanNode const& node = tree.nodes[nid];
-  // Nullable plans carry a trailing `null_mask` output channel; iteration-5
-  // selection has no null model — refuse (never corrupt).
   for (auto const& name : node.output_names) {
-    if (name == "null_mask") { return false; }
+    if (name == "null_mask") { return std::nullopt; }
   }
-  // `chars` must be TERMINAL raw UINT8 bytes: a child edge means
-  // entropy-coded chars (snappy/ans) — no byte gather without a full
-  // decompress — and widened (UINT32/UINT64, >2 GB) chars need addressing
-  // the masked gather does not model yet.
-  bool chars_ok   = false;
-  bool offsets_ok = false;
+  str_split_shape shape;
+  shape.offsets_nid = static_cast<NodeId>(tree.nodes.size());
+  bool chars_ok      = false;
+  bool offsets_ok    = false;
   for (std::size_t i = 0; i < node.output_names.size(); ++i) {
     std::string const& name = node.output_names[i];
     if (name == "chars") {
@@ -1482,25 +1457,31 @@ bool str_split_selection_root(PlanTree const& tree)
           break;
         }
       }
-      if (has_edge) { return false; }
-      auto it  = node.channels.find(node.output_paths[i]);
-      chars_ok = it != node.channels.end() && it->second &&
-                 it->second->decoded_type().id() == cudf::type_id::UINT8;
+      if (has_edge) { return std::nullopt; }
+      auto it = node.channels.find(node.output_paths[i]);
+      if (it != node.channels.end() && it->second &&
+          it->second->decoded_type().id() == cudf::type_id::UINT8) {
+        chars_ok        = true;
+        shape.chars_rep = it->second.get();
+      }
     } else if (name == "offsets") {
-      // Iteration 7 widening: the masked offsets reconstruction renders
-      // Bitpack- OR Delta-rooted subtrees at ANY depth below (str-deep
-      // GPU-proven), which admits c_phone's delta->rle->bitpack chain. Other
-      // roots return false at render, so the probe mirrors exactly that set.
       for (auto const& e : node.children) {
         if (e.channel == name) {
           offsets_ok = e.child < tree.nodes.size() &&
                        (tree.nodes[e.child].op == "bitpack" || tree.nodes[e.child].op == "delta");
+          shape.offsets_nid = e.child;
           break;
         }
       }
     }
   }
-  return chars_ok && offsets_ok;
+  if (!chars_ok || !offsets_ok) { return std::nullopt; }
+  return shape;
+}
+
+bool str_split_selection_root(PlanTree const& tree)
+{
+  return locate_str_split_shape(tree).has_value();
 }
 
 bool dict_codes_selection_root(PlanTree const& tree)

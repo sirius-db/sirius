@@ -33,7 +33,7 @@ namespace sirius {
  * decompress_device_to_gpu) in place of the plain gpu_table_representation
  * whenever the decode has something to report; the plain type is still used
  * when it does not, so nothing changes on the ordinary path and the feature
- * gate being off is byte-identical to before. @c sirius::decode_outcome is
+ * gate being off is byte-identical to before. @c sirius::pushdown_outcome is
  * declared with the decoder that fills it (compression/compressed_scan.hpp).
  *
  * scan_operator_input::prepare_for_processing reads @ref outcome right after
@@ -44,21 +44,21 @@ namespace sirius {
  * replaced, where clone() had to decide what the copy "is" and settled for
  * dropping the information.
  */
-class decoded_batch_representation final : public ::cucascade::gpu_table_representation {
+class decompression_pushdown_batch_representation final : public ::cucascade::gpu_table_representation {
  public:
-  decoded_batch_representation(std::unique_ptr<cudf::table> table,
+  decompression_pushdown_batch_representation(std::unique_ptr<cudf::table> table,
                                ::cucascade::memory::memory_space& memory_space,
                                rmm::cuda_stream_view writer_stream,
-                               decode_outcome outcome)
+                               pushdown_outcome outcome)
     : ::cucascade::gpu_table_representation(std::move(table), memory_space, writer_stream),
       _outcome(outcome)
   {
   }
 
-  [[nodiscard]] const decode_outcome& outcome() const noexcept { return _outcome; }
+  [[nodiscard]] const pushdown_outcome& outcome() const noexcept { return _outcome; }
 
  private:
-  decode_outcome _outcome;
+  pushdown_outcome _outcome;
 };
 
 }  // namespace sirius

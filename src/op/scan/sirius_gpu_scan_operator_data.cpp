@@ -40,21 +40,21 @@ namespace {
 // What a decode of this resident split's compressed batch is expected to do to
 // its size. All-false for anything else — including post-convert states, where
 // the data is no longer a compressed representation.
-sirius::compressed_scan::compaction_forecast decode_compaction_forecast(
+sirius::decompression_pushdown_scan::compaction_forecast pushdown_compaction_forecast(
   scan_operator_input const& split)
 {
   if (!split.is_resident()) { return {}; }
   auto batch      = split.get_cached_batch();
   auto ro         = batch->to_read_only();
   auto const* rep = dynamic_cast<sirius::compressed_device_representation const*>(ro.get_data());
-  if (rep == nullptr || !rep->decode_scan()) { return {}; }
+  if (rep == nullptr || !rep->pushdown_scan()) { return {}; }
   auto const& indices = rep->selected_indices();
   std::vector<std::size_t> identity;
   if (!indices.has_value()) {
     identity.resize(rep->column_names().size());
     std::iota(identity.begin(), identity.end(), std::size_t{0});
   }
-  return rep->decode_scan()->forecast_compaction(rep->table(),
+  return rep->pushdown_scan()->forecast_compaction(rep->table(),
                                                  indices.has_value() ? *indices : identity);
 }
 
@@ -140,16 +140,16 @@ void scan_operator_input::prepare_for_processing(
     if (needs_upload) {
       auto& registry = ::sirius::converter_registry::get();
       auto mut       = batch->to_mutable();
-      if (decode_selection_unprofitable &&
-          decode_selection_unprofitable->load(std::memory_order_relaxed)) {
+      if (pushdown_selection_unprofitable &&
+          pushdown_selection_unprofitable->load(std::memory_order_relaxed)) {
         // An earlier batch of this scan reported that compacting during decode
         // does not pay off; selectivity is uniform across batches, so drop the
         // row selection and stop paying for the attempt. Only the per-query
         // projected clone is touched — never the shared pin — and only this
         // operator's splits: another query's scan decides fresh.
         auto drop_row_selection = [](auto* rep) {
-          if (rep->decode_scan()) {
-            rep->set_decode_scan(rep->decode_scan()->without_row_selection());
+          if (rep->pushdown_scan()) {
+            rep->set_pushdown_scan(rep->pushdown_scan()->without_row_selection());
           }
         };
         if (auto* device_rep =
@@ -175,7 +175,7 @@ void scan_operator_input::prepare_for_processing(
                                         : rep->column_names().size();
           auto snap                 = snapshot_membership_probes(*dynamic_filters, n_slots);
           SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
-            "[decode-filter] join filter attach (decode time) channel={}: slots={} attached={} "
+            "[decompression-pushdown] join filter attach (decode time) channel={}: slots={} attached={} "
             "generation={} skipped_non_maskable={}",
             static_cast<void const*>(dynamic_filters.get()),
             n_slots,
@@ -184,10 +184,10 @@ void scan_operator_input::prepare_for_processing(
             snap.skipped_non_mask);
           if (snap.attached_probes == 0) { return; }
           auto const base =
-            rep->decode_scan()
-              ? rep->decode_scan()
-              : std::make_shared<const ::sirius::compressed_scan>(::sirius::scan_decode_request{});
-          rep->set_decode_scan(
+            rep->pushdown_scan()
+              ? rep->pushdown_scan()
+              : std::make_shared<const ::sirius::decompression_pushdown_scan>(::sirius::pushdown_request{});
+          rep->set_pushdown_scan(
             base->with_membership_probes(std::move(snap.probes), snap.generation));
         };
         if (auto* device_rep =
@@ -208,16 +208,16 @@ void scan_operator_input::prepare_for_processing(
       // pay off, so the scan's remaining splits skip it. Off-gate the
       // converters install the plain representation and both stay false.
       if (auto const* decoded =
-            dynamic_cast<::sirius::decoded_batch_representation const*>(mut.get_data())) {
+            dynamic_cast<::sirius::decompression_pushdown_batch_representation const*>(mut.get_data())) {
         auto const& outcome        = decoded->outcome();
-        decode_row_filtered        = outcome.row_filtered;
-        decode_predicate_columns   = outcome.predicate_columns;
-        decode_predicates_enforced = outcome.predicates_enforced;
-        if (decode_selection_unprofitable && outcome.selection_unprofitable) {
-          decode_selection_unprofitable->store(true, std::memory_order_relaxed);
+        pushdown_row_filtered        = outcome.row_filtered;
+        pushdown_predicate_columns   = outcome.predicate_columns;
+        pushdown_predicates_enforced = outcome.predicates_enforced;
+        if (pushdown_selection_unprofitable && outcome.selection_unprofitable) {
+          pushdown_selection_unprofitable->store(true, std::memory_order_relaxed);
         }
       }
-      if (decode_row_filtered && mvcc_keep_mask.has_mask()) {
+      if (pushdown_row_filtered && mvcc_keep_mask.has_mask()) {
         // The keep-mask is positional over the chunk's full row range; a
         // decode-compacted table no longer lines up with it. Row dropping must
         // never be requested for mvcc-masked chunks — fail loudly rather than
@@ -239,7 +239,7 @@ void scan_operator_input::prepare_for_processing(
       // steal regardless of row_filter_pending. Skipping the rest means the
       // scan allocates nothing after the take, so an OOM retry can never
       // re-enter materialize on a consumed split.
-      if (!mvcc_keep_mask.has_mask() && (!row_filter_pending || decode_row_filtered) &&
+      if (!mvcc_keep_mask.has_mask() && (!row_filter_pending || pushdown_row_filtered) &&
           !needs_carrier_conversion) {
         if (auto* gpu_rep = dynamic_cast<::cucascade::gpu_table_representation*>(mut.get_data())) {
           auto& space        = gpu_rep->get_memory_space();
@@ -311,7 +311,7 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
     // mask output + predicate + compacted output, inside the same envelope.
     return 2 * batch_bytes + mvcc_keep_mask.row_count + mvcc_keep_mask.view().size_bytes();
   }
-  if (decode_row_filtered) {
+  if (pushdown_row_filtered) {
     // The decode already compacted this split to its surviving rows, and batch_bytes reports that
     // compacted footprint (the conversion replaced the compressed representation; a stolen split
     // answers from stolen_table_bytes). A stolen table is moved into the scan
@@ -338,9 +338,9 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
   if (row_filter_pending || dynamic_filter_possible) {
     // Once compaction has been measured unprofitable, later batches drop the
     // row selection and decode full width — keep the full-width envelope.
-    bool const unprofitable = decode_selection_unprofitable &&
-                              decode_selection_unprofitable->load(std::memory_order_relaxed);
-    if (auto const forecast = decode_compaction_forecast(*this);
+    bool const unprofitable = pushdown_selection_unprofitable &&
+                              pushdown_selection_unprofitable->load(std::memory_order_relaxed);
+    if (auto const forecast = pushdown_compaction_forecast(*this);
         forecast.compacts && !unprofitable) {
       // Reservation for a compacting decode: the selection mask (1 bit/row per
       // filtered column — <= batch/4 across the source limit at >= 4 B/row

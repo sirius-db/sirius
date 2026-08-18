@@ -195,15 +195,15 @@ class compressed_host_representation : public cucascade::idata_representation {
   /// (as @ref select_columns returns): the scan's filter is a property of one
   /// query, never of the shared pinned chunk. One carrier for the whole
   /// request, so a clone copies a pointer and nothing can be forgotten.
-  void set_decode_scan(std::shared_ptr<const compressed_scan> scan)
+  void set_pushdown_scan(std::shared_ptr<const decompression_pushdown_scan> scan)
   {
-    _decode_scan = std::move(scan);
+    _pushdown_scan = std::move(scan);
   }
 
   /// The attached scan, or null when the columns decompress unfiltered.
-  [[nodiscard]] std::shared_ptr<const compressed_scan> const& decode_scan() const noexcept
+  [[nodiscard]] std::shared_ptr<const decompression_pushdown_scan> const& pushdown_scan() const noexcept
   {
-    return _decode_scan;
+    return _pushdown_scan;
   }
 
  private:
@@ -223,7 +223,7 @@ class compressed_host_representation : public cucascade::idata_representation {
   std::size_t _uncompressed_bytes;
   std::int64_t _num_rows;
   std::optional<std::vector<std::size_t>> _selected_indices;
-  std::shared_ptr<const compressed_scan> _decode_scan;
+  std::shared_ptr<const decompression_pushdown_scan> _pushdown_scan;
   std::shared_ptr<const per_column_byte_sizes> _column_sizes;
 };
 
@@ -299,15 +299,15 @@ class compressed_device_representation : public cucascade::idata_representation 
   /// (as @ref select_columns returns): the scan's filter is a property of one
   /// query, never of the shared pinned chunk. One carrier for the whole
   /// request, so a clone copies a pointer and nothing can be forgotten.
-  void set_decode_scan(std::shared_ptr<const compressed_scan> scan)
+  void set_pushdown_scan(std::shared_ptr<const decompression_pushdown_scan> scan)
   {
-    _decode_scan = std::move(scan);
+    _pushdown_scan = std::move(scan);
   }
 
   /// The attached scan, or null when the columns decompress unfiltered.
-  [[nodiscard]] std::shared_ptr<const compressed_scan> const& decode_scan() const noexcept
+  [[nodiscard]] std::shared_ptr<const decompression_pushdown_scan> const& pushdown_scan() const noexcept
   {
-    return _decode_scan;
+    return _pushdown_scan;
   }
 
  private:
@@ -326,7 +326,7 @@ class compressed_device_representation : public cucascade::idata_representation 
   std::size_t _uncompressed_bytes;
   std::int64_t _num_rows;
   std::optional<std::vector<std::size_t>> _selected_indices;
-  std::shared_ptr<const compressed_scan> _decode_scan;
+  std::shared_ptr<const decompression_pushdown_scan> _pushdown_scan;
   std::shared_ptr<const per_column_byte_sizes> _column_sizes;
 };
 

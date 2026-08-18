@@ -343,11 +343,11 @@ struct cached_scan_plan {
 /// conversion allocates. Declared here so the chunk↔mask pairing and the
 /// conversion sizing are unit-testable; the provider type itself stays internal
 /// to the scan manager.
-/// @p decode_request is the scan's filter as a decompressor can use it, parallel
+/// @p pushdown_req is the scan's filter as a decompressor can use it, parallel
 /// to @p selected_columns: a GPU-tier compressed chunk may answer an equality/IN
 /// filter off its dictionary (the column then arrives as the boolean answer) and
 /// may drop rows against the ranges while decoding, handing back an
-/// already-filtered batch. See @c sirius::scan_decode_request; an empty request
+/// already-filtered batch. See @c sirius::pushdown_request; an empty request
 /// (the default) leaves every chunk decoding unfiltered.
 /// @p dynamic_filters is the operator's dynamic-filter channel (join builds
 /// publish into it mid-scan); the provider snapshots it PER BATCH onto the
@@ -362,7 +362,7 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   std::vector<insert_delta_split> delta_splits                           = {},
   std::vector<cudf::data_type> normalization_targets                     = {},
   bool has_physical_overrides                                            = false,
-  sirius::scan_decode_request decode_request                             = {},
+  sirius::pushdown_request pushdown_req                             = {},
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters = nullptr);
 
 /**

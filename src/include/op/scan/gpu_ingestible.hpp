@@ -168,7 +168,7 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
   /// A source that can exploit this (a Simpatico-compressed pin, whose
   /// dictionary answers an equality off its key set without gathering the
   /// decoded chars) hands it to the decoder as a
-  /// @c sirius::scan_decode_request; every other source supplies the columns
+  /// @c sirius::pushdown_request; every other source supplies the columns
   /// normally. @ref post_filter_and_project copes with either by reading what
   /// the batch it is handed reports, so the two need not agree.
   ///

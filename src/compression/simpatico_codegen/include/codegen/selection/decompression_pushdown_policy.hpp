@@ -66,8 +66,8 @@ double decompression_pushdown_index_walk_max_selectivity();
 ///
 /// Wave-1 probes run at FULL width, so k probes cost k*N rows of probe+adapter
 /// work, while the downstream operator's cascade costs ~1*N (later probes see
-/// compacted survivors). Measured on q8 (3 probes): +134 ms/iter probe-side vs
-/// -48 ms/iter compaction win => +36%. One probe is always ~volume-neutral
+/// compacted survivors). Measured with 3 probes: the added probe-side cost
+/// outweighed the compaction win. One probe is always ~volume-neutral
 /// against the cascade's first probe, so the compaction win survives. Sources
 /// beyond the cap are DROPPED, which is sound — the mask is conjunctive and
 /// such batches are never tagged as fully filtered, so the downstream operator

@@ -69,7 +69,7 @@ bool launch_decode_fused_tree_compacted(codegen::jit::FusedTree const& tree,
                                         rmm::cuda_stream_view stream);
 
 /// Dictionary gather: for dictionary->bitpack string columns with
-/// CONSTANT-WIDTH, null-free keys (q1's l_returnflag).  ``tree`` is the codes
+/// CONSTANT-WIDTH, null-free keys.  ``tree`` is the codes
 /// bitpack leaf; for survivor rows only it decodes the code and copies that
 /// key's ``key_width`` bytes from ``keys_chars`` (key k at k*key_width) into
 /// the compacted ``out_chars``, preserving row order.  Skips both the

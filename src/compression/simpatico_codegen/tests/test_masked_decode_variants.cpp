@@ -411,10 +411,10 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
   return true;
 }
 
-// the delta mask walk: masked compacting decode of a delta->bitpack column
-// (o_orderkey shape).  The mask is host-generated (arbitrary — in
-// production it comes from other columns' ballot wave), CNT-equivalent on
-// host, then mask_consume must equal plain decode + host filter.
+// the delta mask walk: masked compacting decode of a delta->bitpack column.
+// The mask is host-generated (arbitrary — in production it comes from other
+// columns' ballot wave), CNT-equivalent on host, then mask_consume must equal
+// plain decode + host filter.
 template <typename Element>
 bool run_delta_masked(const std::string& dtype, int arch)
 {
@@ -534,9 +534,9 @@ bool run_delta_masked(const std::string& dtype, int arch)
   return true;
 }
 
-// the dictionary gather: masked constant-width dictionary gather.  Codes are bitpacked int32
-// (q1's l_returnflag/l_linestatus are width-1, 2-3 keys); the kernel must
-// copy exactly the survivors' key bytes, compacted, in row order.
+// the dictionary gather: masked constant-width dictionary gather.  Codes are
+// bitpacked int32 with small constant-width keys; the kernel must copy
+// exactly the survivors' key bytes, compacted, in row order.
 bool run_dict_gather(std::int32_t key_width, int arch)
 {
   const std::int64_t n        = 3 * kChunk + 511;
@@ -619,9 +619,9 @@ bool run_dict_gather(std::int32_t key_width, int arch)
   return true;
 }
 
-// the str_split gather: str_split masked survivor meta + fixed char copy.  `deep` = c_phone
-// shape (offsets->delta->rle->bitpack, constant length 15); shallow =
-// l_shipmode shape (offsets->bitpack, variable lengths 3..12).
+// the str_split gather: str_split masked survivor meta + fixed char copy.
+// `deep` = offsets->delta->rle->bitpack, constant length; shallow =
+// offsets->bitpack, variable lengths.
 bool run_str_split_masked(bool deep, int arch)
 {
   const std::int64_t n     = 4 * kChunk + 300;            // string rows
@@ -926,12 +926,12 @@ int main()
     // int64 compare path is exercised on genuinely 64-bit decoded values.
     run_roundtrip<std::int32_t>("int32_t", 8035, 2526, arch);
     run_roundtrip<std::int64_t>("int64_t", 3'000'000'000LL, 5052, arch);
-    // The delta mask walk (o_orderkey shape) and the dictionary gather (q1 shape).
+    // The delta mask walk and the dictionary gather.
     run_delta_masked<std::int64_t>("int64_t", arch);
     run_delta_masked<std::int32_t>("int32_t", arch);
-    run_dict_gather(/*key_width=*/1, arch);  // l_returnflag / l_linestatus
+    run_dict_gather(/*key_width=*/1, arch);
     run_dict_gather(/*key_width=*/4, arch);  // constant-width generality
-    // The str_split gather (l_shipmode / c_phone shapes).
+    // The str_split gather (shallow and deep offsets chains).
     run_str_split_masked(/*deep=*/false, arch);
     run_str_split_masked(/*deep=*/true, arch);
   } catch (const std::exception& e) {
