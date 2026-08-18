@@ -215,7 +215,7 @@ TEST_CASE_METHOD(VectorSearchFixture,
   // Baseline: naming only pinned columns works, so the pin itself is searchable.
   {
     auto r = con->Query("SELECT id FROM sirius_knn_search('vs_subset', 'vec', " + origin +
-                        ", k => 5, output_columns => ['id']);");
+                        ", k => 5, output_columns => ['id'], use_index => false);");
     REQUIRE(r);
     if (r->HasError()) { UNSCOPED_INFO("explicit output_columns error: " << r->GetError()); }
     REQUIRE_FALSE(r->HasError());
@@ -225,8 +225,8 @@ TEST_CASE_METHOD(VectorSearchFixture,
   // Same query with output_columns omitted: the default expands to the pinned
   // columns [id, vec] (not the catalog-wide [id, vec, payload]), so it succeeds.
   {
-    auto r =
-      con->Query("SELECT * FROM sirius_knn_search('vs_subset', 'vec', " + origin + ", k => 5);");
+    auto r = con->Query("SELECT * FROM sirius_knn_search('vs_subset', 'vec', " + origin +
+                        ", k => 5, use_index => false);");
     REQUIRE(r);
     if (r->HasError()) { UNSCOPED_INFO("default output_columns error: " << r->GetError()); }
     REQUIRE_FALSE(r->HasError());
@@ -415,6 +415,8 @@ TEST_CASE_METHOD(VectorSearchFixture,
 
   SECTION("bind errors (raised before execution)")
   {
+    run_ok("SELECT * FROM pin_table(name => 'vs_err', tier => 'gpu', format => 'duckdb');");
+
     // Dimensionality mismatch: query is FLOAT[2] but the column is FLOAT[3].
     expect_error(*con,
                  "SELECT * FROM sirius_knn_search('vs_err', 'vec', [0.0, 0.0]::FLOAT[2], "
@@ -445,6 +447,8 @@ TEST_CASE_METHOD(VectorSearchFixture,
                  "SELECT * FROM sirius_knn_search('vs_err', 'vec', " + origin +
                    ", output_columns => ['id'], metric => 'bogus');",
                  "metric must be");
+
+    run_ok("SELECT * FROM unpin_table('vs_err');");
   }
 
   SECTION("execution errors")
@@ -499,8 +503,16 @@ TEST_CASE_METHOD(VectorSearchFixture,
   {
     auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
     REQUIRE(sirius_ctx != nullptr);
-    auto const& mgr   = sirius_ctx->get_scan_manager();
-    const auto* entry = mgr.find_pinned_entry("vs_mc");
+    auto const& mgr                                 = sirius_ctx->get_scan_manager();
+    const sirius::scan_manager::pinned_entry* entry = nullptr;
+    mgr.visit_pinned_entries(
+      [&](std::string_view name, const sirius::scan_manager::pinned_entry& e) {
+        if (name == "vs_mc") {
+          entry = &e;
+          return false;  // found it, stop walking
+        }
+        return true;  // keep walking
+      });
     REQUIRE(entry != nullptr);
     auto it = entry->data_batches_by_column.find("vec");
     REQUIRE(it != entry->data_batches_by_column.end());
