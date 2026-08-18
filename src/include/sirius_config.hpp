@@ -166,6 +166,17 @@ struct operator_params {
   /// metadata; other scans use native carriers. Logical types remain unchanged, and type-sensitive
   /// boundaries restore native carriers.
   bool enable_compressed_materialization = true;
+
+  /// Admission-time GPU allocation: target bytes of projected scan output per GPU.
+  /// At query start, the engine estimates total scan output bytes from the plan's
+  /// estimated_cardinality × per-column width, then assigns
+  /// ceil(total_bytes / admission_bytes_per_gpu) GPUs, clamped to [1, active_gpu_count].
+  /// 0 disables dynamic estimation and falls back to topology.gpus_per_query.
+  uint64_t admission_bytes_per_gpu = 0;
+
+  /// Bytes assumed per variable-width column (VARCHAR, LIST, etc.) when computing
+  /// per-row byte estimates for admission. Only used when admission_bytes_per_gpu > 0.
+  uint64_t avg_variable_column_bytes = 32;
 };
 
 struct telemetry_config {
@@ -203,6 +214,8 @@ struct compression_config {
   /// size, for the compressed form to be kept.  When the compressed header +
   /// payload exceeds this fraction of the original (i.e. compression saved too
   /// little), the compressed data is discarded and the uncompressed batch is used.
+  /// Must be finite and non-negative. Values above 1 deliberately allow compressed
+  /// representations that expand relative to the original batch.
   //  Default 0.75 (that coincides with a 1.33x compression ratio).
   ///
   /// Applies to BOTH paths: a pin chunk is stored uncompressed, and a spilled
@@ -436,6 +449,11 @@ struct sirius_config {
     return _compression_config;
   }
 
+  /// How many GPUs to allocate per query. 0 = use all active GPUs (default).
+  /// Limits each query to the first @c gpus_per_query entries of the sorted
+  /// active-GPU list; the rest are left available for future concurrent queries.
+  [[nodiscard]] int gpus_per_query() const noexcept { return _gpus_per_query; }
+
  private:
   /// When @c _memory_space_configs contains more than one GPU memory space,
   /// force @c _scan_manager_config.use_sirius_datasource to true (sirius
@@ -444,6 +462,7 @@ struct sirius_config {
   void enforce_sirius_datasource_for_multi_gpu();
 
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
+  int _gpus_per_query = 0;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   creator::task_creator_config _task_creator_config;
   scan_manager::scan_manager_config _scan_manager_config{};

@@ -25,6 +25,7 @@
 
 #include <catch.hpp>
 #include <compression/plan_register.hpp>
+#include <utils/log_test_utils.hpp>
 
 // standard library
 #include <string>
@@ -1697,6 +1698,30 @@ TEST_CASE("pin_table compression - no plan file for the table pins uncompressed"
   run_ok(con, "SET pin_table_compression = true;", "set compression");
   run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
   run_ok(con, "SET enable_compressed_materialization = true;", "set narrowing");
+
+  // Runtime settings may be staged in either order, so setting the enable flag before the plan
+  // directory is valid. The final pin must nevertheless make the inactive state visible rather
+  // than silently accepting a compression request it cannot honor.
+  {
+    sirius::test::scoped_recording_log_sink logs{"warn"};
+    auto pin_without_plan_source =
+      con.Query("CALL pin_table('" + glob + "', tier='host', name='t_noplan');");
+    require_ok(pin_without_plan_source, "pin without plan source");
+
+    std::size_t missing_plan_source_warnings = 0;
+    for (auto const& record : logs.records()) {
+      if (record.message.find("pin_table_input_compression_plan_dir is empty") !=
+          std::string::npos) {
+        ++missing_plan_source_warnings;
+        REQUIRE(record.level == sirius::log::level::warn);
+        REQUIRE(record.message.find("pinning uncompressed") != std::string::npos);
+      }
+    }
+    REQUIRE(missing_plan_source_warnings == 1);
+  }
+  REQUIRE(sirius::test::census_entry(con, "t_noplan").compressed_chunks == 0);
+  run_ok(con, "CALL unpin_table('t_noplan');", "unpin without plan source");
+
   // A plan directory holding a plan for some OTHER table: the resolver finds no plan for this
   // one, so compression never engages.
   auto plan_dir = tmp / "plans";

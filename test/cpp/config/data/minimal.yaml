@@ -13,8 +13,6 @@ sirius:
   executor:
     pipeline:
       num_threads: 4
-      thread_name_prefix: "sirius_pipeline_executor"
     downgrade:
       num_threads: 1
-      thread_name_prefix: "sirius_downgrade_executor"
       monitor_period: 10ms

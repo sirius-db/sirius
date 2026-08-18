@@ -20,6 +20,7 @@
 #include "helper/logical_type.hpp"  // sirius::logical_type
 
 // standard library
+#include <cstdint>
 #include <memory>
 
 namespace sirius::ast {
@@ -27,15 +28,29 @@ namespace sirius::ast {
 struct node;
 
 /**
- * @brief Sirius-native mirror of duckdb::BoundCastExpression.
+ * @brief Distinguishes value-converting casts from physical carrier restores.
  *
- * `try_cast == true` corresponds to DuckDB's TRY_CAST (null on overflow/parse
- * failure instead of throwing).
+ * `semantic` denotes a logical value conversion, including casts translated from DuckDB.
+ * `carrier_restore` denotes a compressed-schema planner operation that restores a narrowed
+ * physical carrier to its native type. Only `carrier_restore` may use
+ * `sirius::cast_through_rep` during expression evaluation.
+ */
+enum class cast_kind : uint8_t {
+  semantic,        ///< Logical value-converting cast
+  carrier_restore  ///< Planner-inserted restoration of a narrowed physical carrier
+};
+
+/**
+ * @brief Sirius AST cast with explicit conversion provenance.
+ *
+ * `try_cast` mirrors DuckDB's flag for translated semantic casts. `kind` distinguishes logical
+ * value conversion from planner-inserted carrier restoration.
  */
 struct cast {
   std::unique_ptr<node> child;
   sirius::logical_type target_type;
   bool try_cast{false};
+  cast_kind kind{cast_kind::semantic};
 
   /// A cast's result type is its target type.
   [[nodiscard]] sirius::logical_type const& return_type() const noexcept { return target_type; }

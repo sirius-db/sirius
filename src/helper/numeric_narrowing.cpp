@@ -16,15 +16,21 @@
 #include "helper/numeric_narrowing.hpp"
 
 #include "cudf/cudf_utils.hpp"
+#include "sirius/exception.hpp"
 
+#include <cudf/column/column.hpp>
+#include <cudf/column/column_view.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/unary.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <array>
 #include <cstddef>
 #include <limits>
+#include <memory>
+#include <utility>
 
 namespace sirius {
 namespace {
@@ -36,16 +42,34 @@ bool fits(__int128_t minimum, __int128_t maximum)
          maximum <= static_cast<__int128_t>(std::numeric_limits<T>::max());
 }
 
-// True when @p source and @p target are supported numeric carriers in the same family: integral
-// carriers preserving signedness, or fixed-point carriers preserving their cuDF scale.
+// True when `source` and `target` are supported numeric carriers in the same family: integral
+// carriers preserving signedness, or fixed-point carriers preserving their cuDF scale. Both sides
+// are taken under narrowing_rep_type, so DATE participates as its int32 representation.
 bool same_numeric_carrier_family(cudf::data_type source, cudf::data_type target)
 {
-  if (cudf::is_integral_not_bool(source) && cudf::is_integral_not_bool(target)) {
-    return (cudf::is_signed(source) && cudf::is_signed(target)) ||
-           (cudf::is_unsigned(source) && cudf::is_unsigned(target));
-  }
-  return cudf::is_fixed_point(source) && cudf::is_fixed_point(target) &&
-         source.scale() == target.scale();
+  auto const source_rep = narrowing_rep_type(source);
+  auto const target_rep = narrowing_rep_type(target);
+
+  auto const same_family = [&] {
+    if (cudf::is_integral_not_bool(source_rep) && cudf::is_integral_not_bool(target_rep)) {
+      return (cudf::is_signed(source_rep) && cudf::is_signed(target_rep)) ||
+             (cudf::is_unsigned(source_rep) && cudf::is_unsigned(target_rep));
+    }
+    return cudf::is_fixed_point(source_rep) && cudf::is_fixed_point(target_rep) &&
+           source_rep.scale() == target_rep.scale();
+  }();
+  if (!same_family) { return false; }
+
+  // A representation only stands in for its type where that type is the one being narrowed or
+  // restored. So when exactly one side is representation-backed, the other side must be strictly
+  // narrower than the representation. Without that condition INT64 and TIMESTAMP_DAYS would be
+  // same-family, and a plain 64-bit integer would pass the validators that exist to reject a
+  // carrier contradicting the column's declared type.
+  auto const source_is_rep_backed = source_rep != source;
+  if (source_is_rep_backed == (target_rep != target)) { return true; }
+  auto const representation = source_is_rep_backed ? source_rep : target_rep;
+  auto const carrier        = source_is_rep_backed ? target_rep : source_rep;
+  return cudf::size_of(carrier) < cudf::size_of(representation);
 }
 
 template <typename T>
@@ -123,26 +147,92 @@ std::optional<numeric_range> range_from_scalars(cudf::scalar const& minimum,
 
 bool is_supported_numeric_carrier(cudf::data_type type)
 {
-  return cudf::is_integral_not_bool(type) || cudf::is_fixed_point(type);
+  auto const rep = narrowing_rep_type(type);
+  return cudf::is_integral_not_bool(rep) || cudf::is_fixed_point(rep);
 }
 
 }  // namespace
 
-bool is_narrowable_numeric_type(const logical_type& type) noexcept
+cudf::data_type narrowing_rep_type(cudf::data_type type) noexcept
+{
+  return type.id() == cudf::type_id::TIMESTAMP_DAYS ? cudf::data_type{cudf::type_id::INT32} : type;
+}
+
+cudf::column_view narrowing_rep_view(cudf::column_view const& column)
+{
+  auto const rep = narrowing_rep_type(column.type());
+  return rep == column.type() ? column : cudf::bit_cast(column, rep);
+}
+
+std::unique_ptr<cudf::column> cast_through_rep(cudf::column_view const& column,
+                                               cudf::data_type target,
+                                               rmm::cuda_stream_view stream,
+                                               rmm::device_async_resource_ref mr)
+{
+  // Given caller-established carrier provenance, tunnel only when exactly one side is a
+  // representation-backed DATE and the other is a strict narrow carrier. Every other pair,
+  // including DATE<->TIMESTAMP, follows cuDF's conversion rules.
+  auto const source     = column.type();
+  auto const rep_target = narrowing_rep_type(target);
+  auto const narrows_carrier =
+    narrowing_rep_type(source) != source && can_narrow_to(source, target);
+  auto const restores_carrier = rep_target != target && can_restore_to(source, target);
+  if (!narrows_carrier && !restores_carrier) { return cudf::cast(column, target, stream, mr); }
+
+  auto result = cudf::cast(narrowing_rep_view(column), rep_target, stream, mr);
+  if (rep_target == target) { return result; }
+
+  // Re-tag the int32 result as the temporal target. bit_cast only yields a view, and the caller
+  // needs ownership, so hand the buffers to a new column instead of copying them. Bit-castability
+  // is what makes the move sound, and it also rules out the compound types whose children
+  // `release` would drop.
+  if (!cudf::is_bit_castable(rep_target, target)) {
+    throw internal_exception("narrowing representation is not bit-castable to its carrier");
+  }
+  auto const size       = result->size();
+  auto const null_count = result->null_count();
+  auto contents         = result->release();
+  return std::make_unique<cudf::column>(
+    target, size, std::move(*contents.data), std::move(*contents.null_mask), null_count);
+}
+
+narrow_domain narrow_domain_of(const logical_type& type) noexcept
 {
   switch (type.id()) {
+    case type_id::TINYINT:
     case type_id::SMALLINT:
     case type_id::INTEGER:
-    case type_id::BIGINT:
+    case type_id::BIGINT: return narrow_domain::SIGNED_INTEGER;
+    case type_id::UTINYINT:
     case type_id::USMALLINT:
     case type_id::UINTEGER:
-    case type_id::UBIGINT: return true;
-    case type_id::DECIMAL:
-      // DuckDB's DECIMAL16 carrier has no cuDF equivalent; DECIMAL32 is already the narrowest
-      // fixed-point carrier supported by cuDF.
-      return type.decimal_precision() > logical_type::decimal_max_precision_int32;
-    default: return false;
+    case type_id::UBIGINT: return narrow_domain::UNSIGNED_INTEGER;
+    case type_id::DECIMAL: return narrow_domain::DECIMAL;
+    // DATE is int32 days from epoch, narrowed through narrowing_rep_type. Narrowing is absolute,
+    // with no frame of reference subtracted, so what has to fit is the distance from the 1970
+    // epoch: int16 days reach from 1880 to 2059. Other temporal types get no domain because their
+    // sub-day units provide no useful span in a 16-bit carrier.
+    case type_id::DATE: return narrow_domain::DATE;
+    default: return narrow_domain::NONE;
   }
+}
+
+bool is_narrowable_numeric_type(const logical_type& type) noexcept
+{
+  // Having a domain is necessary but not sufficient: the already-minimal carriers mean something
+  // narrowable and still have nowhere narrower to go. No `default`, so a new domain has to be
+  // ruled on here rather than silently inheriting one of these answers.
+  switch (narrow_domain_of(type)) {
+    case narrow_domain::NONE: return false;
+    case narrow_domain::SIGNED_INTEGER: return type.id() != type_id::TINYINT;
+    case narrow_domain::UNSIGNED_INTEGER: return type.id() != type_id::UTINYINT;
+    // DuckDB's DECIMAL16 carrier has no cuDF equivalent; DECIMAL32 is already the narrowest
+    // fixed-point carrier supported by cuDF.
+    case narrow_domain::DECIMAL:
+      return type.decimal_precision() > logical_type::decimal_max_precision_int32;
+    case narrow_domain::DATE: return true;
+  }
+  return false;
 }
 
 bool can_narrow_to(cudf::data_type source, cudf::data_type target)
@@ -205,18 +295,20 @@ std::optional<cudf::data_type> choose_narrow_physical_type(const logical_type& t
                                                            const numeric_range& range)
 {
   if (!is_narrowable_numeric_type(type)) { return std::nullopt; }
-  auto const native = try_get_cudf_type(type);
-  if (!native) { return std::nullopt; }
+  auto const declared = try_get_cudf_type(type);
+  if (!declared) { return std::nullopt; }
+  // Candidates are chosen against the representation, so DATE picks from the signed integer set.
+  auto const native = narrowing_rep_type(*declared);
 
   // Narrowest-first candidate carriers of the native carrier's family; `can_narrow_to` keeps only
   // the strictly narrower ones and `numeric_range_fits` picks the first that holds the bounds.
   std::array<cudf::data_type, 3> candidates;
   std::size_t candidate_count = 0;
-  if (cudf::is_fixed_point(*native)) {
-    candidates      = {cudf::data_type{cudf::type_id::DECIMAL32, native->scale()},
-                       cudf::data_type{cudf::type_id::DECIMAL64, native->scale()}};
+  if (cudf::is_fixed_point(native)) {
+    candidates      = {cudf::data_type{cudf::type_id::DECIMAL32, native.scale()},
+                       cudf::data_type{cudf::type_id::DECIMAL64, native.scale()}};
     candidate_count = 2;
-  } else if (cudf::is_signed(*native)) {
+  } else if (cudf::is_signed(native)) {
     candidates      = {cudf::data_type{cudf::type_id::INT8},
                        cudf::data_type{cudf::type_id::INT16},
                        cudf::data_type{cudf::type_id::INT32}};
@@ -229,7 +321,7 @@ std::optional<cudf::data_type> choose_narrow_physical_type(const logical_type& t
   }
 
   for (std::size_t i = 0; i < candidate_count; ++i) {
-    if (can_narrow_to(*native, candidates[i]) && numeric_range_fits(candidates[i], range)) {
+    if (can_narrow_to(native, candidates[i]) && numeric_range_fits(candidates[i], range)) {
       return candidates[i];
     }
   }
@@ -260,6 +352,10 @@ std::optional<numeric_range> compute_exact_numeric_range(cudf::column_view const
     return std::nullopt;
   }
 
+  // Reduce over the representation: cudf::minmax on a TIMESTAMP_DAYS column yields
+  // timestamp_scalars, which range_from_scalars has no arm for.
+  auto const rep_column = narrowing_rep_view(column);
+
   uint8_t decimal_scale = 0;
   if (cudf::is_fixed_point(column.type())) {
     auto const cudf_scale = column.type().scale();
@@ -269,7 +365,7 @@ std::optional<numeric_range> compute_exact_numeric_range(cudf::column_view const
     decimal_scale = static_cast<uint8_t>(-cudf_scale);
   }
 
-  auto [minimum, maximum] = cudf::minmax(column, stream, mr);
+  auto [minimum, maximum] = cudf::minmax(rep_column, stream, mr);
   if (!minimum || !maximum || minimum->type() != maximum->type()) { return std::nullopt; }
   if (!minimum->is_valid(stream) || !maximum->is_valid(stream)) { return std::nullopt; }
   return range_from_scalars(*minimum, *maximum, decimal_scale, stream);

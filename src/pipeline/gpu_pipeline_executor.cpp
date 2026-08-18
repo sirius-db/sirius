@@ -496,11 +496,8 @@ void gpu_pipeline_executor::manager_loop()
         // which may destroy the engine and its operators. We must not schedule
         // tasks that reference those operators after signaling completion.
         bool query_complete = false;
-        if (_completion_handler && pipeline) {
-          auto sink = pipeline->get_sink();
-          if (sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
-            query_complete = pipeline->is_pipeline_finished();
-          }
+        if (_completion_handler && pipeline && pipeline->is_query_terminal()) {
+          query_complete = pipeline->is_pipeline_finished();
         }
 
         if (!query_complete && _task_creator) {

@@ -121,6 +121,7 @@ extern "C" int cudaProfilerStop();
 #include "io/types.hpp"                // sirius::io::sirius_ioctx
 #include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
 
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <string_view>
@@ -1019,22 +1020,27 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
   auto schema_names   = columns.GetColumnNames();  // logical order
   auto schema_types   = columns.GetColumnTypes();  // logical order
 
-  auto keep = resolve_pin_kept_indices(schema_names, cols);
-  // ARRAY pins are unsupported: appended ARRAY rows live in the array-validity
-  // and child segment trees, which the uncheckpointed-append guard below does
-  // not walk, so a committed post-pin append would slip past the pin contract
-  // and only fail later, deep in metadata decoding. Refuse up front, before
-  // checkpoint suppression or any other pin side effect.
+  auto keep            = resolve_pin_kept_indices(schema_names, cols);
+  auto const canonical = storage.GetAttached().GetStorageManager().GetDBPath();
+
+  // Fixed-size ARRAY columns pin only when their child is a fixed-width scalar.
+  // DuckDB stores such a child as a flat StandardColumnData the delta and decoder
+  // paths can stage. A varchar or nested child (VARCHAR[N], ARRAY of ARRAY/STRUCT)
+  // has no such path, and a varchar child passes the StandardColumnData cast that
+  // would stage zero-byte descriptors. Decline it up front so the error names the
+  // column instead of surfacing deep in metadata decoding.
   for (auto col : keep) {
-    if (schema_types[col].id() == LogicalTypeId::ARRAY) {
+    auto const type = sirius::from_duckdb(schema_types[col]);
+    if (type.is_array() && !type.array_child().is_fixed_width()) {
       throw InvalidInputException(
-        "pin_table: column '%s' of table '%s' has ARRAY type, which duckdb-native pins do not "
-        "support; pin a column subset without it (cols=[...])",
+        "pin_table: column '%s' of table '%s' is an ARRAY with a %s child, which duckdb-native "
+        "pins do not support (only fixed-width scalar children); pin a column subset without it "
+        "(cols=[...])",
         schema_names[col],
-        table_ref);
+        table_ref,
+        type.array_child().to_string());
     }
   }
-  auto const canonical = storage.GetAttached().GetStorageManager().GetDBPath();
 
   // Update chains version values in place, invisibly to the DELETE
   // keep-masks — a pin would serve stale values to every query until the
@@ -1319,9 +1325,20 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   // Compression config (tier-agnostic): load the per-table plan DSL from the plan
   // directory (if configured), then resolve it into a compression_pin_config. Both
   // the host and GPU pin paths compress with this when enabled.
-  const auto& comp_cfg             = sirius_ctx->get_config().get_compression_config();
-  const bool comp_globally_enabled = !comp_cfg.input_plan_dir.empty();
-  if (comp_globally_enabled) {
+  const auto& comp_cfg = sirius_ctx->get_config().get_compression_config();
+  if (comp_cfg.enable_pin_table_compression && comp_cfg.input_plan_dir.empty()) {
+    SIRIUS_LOG_WARN(
+      "[pin_table] '{}': pin_table_compression is enabled but "
+      "pin_table_input_compression_plan_dir is empty; pinning uncompressed",
+      data.args.name);
+  }
+  // Two separate questions. The table plans are loaded into the register whenever
+  // a plan directory is configured, because the *spill* path seeds its per-column
+  // plans from them through column lineage and does not care whether pinning
+  // compresses. Compressing the pinned table itself stays gated on its own flag.
+  const bool plans_available   = !comp_cfg.input_plan_dir.empty();
+  const bool pin_compress_here = comp_cfg.enable_pin_table_compression && plans_available;
+  if (plans_available) {
     namespace fs     = std::filesystem;
     const auto& name = data.args.name;
     if (!sirius::compression::plan_register::global().resolve_table_plan(name).has_value()) {
@@ -1346,7 +1363,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   }
 
   sirius::compression_pin_config pin_comp{};
-  if (comp_globally_enabled) {
+  if (pin_compress_here) {
     if (auto plan_dsl =
           sirius::compression::plan_register::global().resolve_table_plan(data.args.name);
         plan_dsl.has_value()) {
@@ -1989,7 +2006,7 @@ static void SetMarkJoinBuildSwitchRatio(ClientContext& context, SetScope scope, 
   if (!params) { return; }
   auto slot          = lock_operator_params_slot(context);
   const double ratio = parameter.GetValue<double>();
-  if (ratio < 0.0) {
+  if (!(ratio >= 0.0)) {
     throw InvalidInputException("mark_join_build_switch_ratio must be >= 0.0, got %f", ratio);
   }
   params->mark_join_build_switch_ratio = ratio;
@@ -2055,10 +2072,16 @@ static void SetCompressionMaxCompressedFraction(ClientContext& context,
                                                 SetScope scope,
                                                 Value& parameter)
 {
+  const double fraction = DoubleValue::Get(parameter);
+  if (!std::isfinite(fraction) || fraction < 0.0) {
+    throw InvalidInputException(
+      "compression_max_compressed_fraction must be finite and non-negative, got %f",
+      fraction);
+  }
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) { return; }
   auto& cfg                   = sirius_ctx->get_config().get_compression_config();
-  cfg.max_compressed_fraction = DoubleValue::Get(parameter);
+  cfg.max_compressed_fraction = fraction;
   // Shared with the spill path, whose converters read a process global.
   PushSpillCompressionSettings(cfg);
   SIRIUS_LOG_DEBUG("Updated compression_max_compressed_fraction to {}",
@@ -2179,7 +2202,7 @@ static void SetDynamicFilterDomainCoverageThreshold(ClientContext& context,
   if (!params) { return; }
   auto slot              = lock_operator_params_slot(context);
   const double threshold = parameter.GetValue<double>();
-  if (threshold <= 0.0) {
+  if (!(threshold > 0.0)) {
     throw InvalidInputException("dynamic_filter_domain_coverage_threshold must be > 0.0, got %f",
                                 threshold);
   }
@@ -2194,7 +2217,7 @@ static void SetDynamicFilterKeepThreshold(ClientContext& context, SetScope scope
   if (!params) { return; }
   auto slot              = lock_operator_params_slot(context);
   const double threshold = parameter.GetValue<double>();
-  if (threshold < 0.0 || threshold > 1.0) {
+  if (!(threshold >= 0.0 && threshold <= 1.0)) {
     throw InvalidInputException("dynamic_filter_keep_threshold must be in [0.0, 1.0], got %f",
                                 threshold);
   }
@@ -2211,6 +2234,30 @@ static void SetEnablePinnedZoneMapPruning(ClientContext& context, SetScope scope
   params->enable_pinned_zone_map_pruning = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_PINNED_ZONE_MAP_PRUNING to {}",
                    params->enable_pinned_zone_map_pruning);
+}
+
+static void SetAdmissionBytesPerGpu(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const bytes = UBigIntValue::Get(parameter);
+  auto* params     = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                       = lock_operator_params_slot(context);
+  params->admission_bytes_per_gpu = bytes;
+  SIRIUS_LOG_DEBUG("Updated config ADMISSION_BYTES_PER_GPU to {}", params->admission_bytes_per_gpu);
+}
+
+static void SetAvgVariableColumnBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const bytes = UBigIntValue::Get(parameter);
+  if (bytes == 0) {
+    throw InvalidInputException("avg_variable_column_bytes must be greater than zero");
+  }
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                         = lock_operator_params_slot(context);
+  params->avg_variable_column_bytes = bytes;
+  SIRIUS_LOG_DEBUG("Updated config AVG_VARIABLE_COLUMN_BYTES to {}",
+                   params->avg_variable_column_bytes);
 }
 
 static void SetEnableCompressedMaterialization(ClientContext& /*context*/,
@@ -2327,6 +2374,22 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
       "TEST ONLY: force transparent GPU execution to fail at runtime with this message",
       LogicalType::VARCHAR,
       Value(""));
+    config.AddExtensionOption(
+      "enable_pinned_zone_map_pruning",
+      "TEST ONLY: disable automatic pinned-table zone-map capture and pruning",
+      LogicalType::BOOLEAN,
+      Value::BOOLEAN(operator_defaults.enable_pinned_zone_map_pruning),
+      SetEnablePinnedZoneMapPruning);
+    config.AddExtensionOption("enable_dynamic_filter_pushdown",
+                              "TEST ONLY: disable automatic dynamic membership-filter pushdown",
+                              LogicalType::BOOLEAN,
+                              Value::BOOLEAN(operator_defaults.enable_dynamic_filter_pushdown),
+                              SetEnableDynamicFilterPushdown);
+    config.AddExtensionOption("enable_dynamic_zone_map_filter",
+                              "TEST ONLY: enable the clustered-keyset dynamic zone-map path",
+                              LogicalType::BOOLEAN,
+                              Value::BOOLEAN(operator_defaults.enable_dynamic_zone_map_filter),
+                              SetEnableDynamicZoneMapFilter);
   }
 
   // Add in config options for special JIT implementation for regex
@@ -2456,23 +2519,27 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     SetEnableGpuExecution);
 
   config.AddExtensionOption("pin_table_compression",
-                            "Enable Simpatico compression for pin_table(tier=>'host') chunks",
+                            "Request Simpatico compression for pin_table chunks. Takes effect only "
+                            "when pin_table_input_compression_plan_dir is non-empty and contains a "
+                            "matching table plan",
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(compression_defaults.enable_pin_table_compression),
                             SetEnablePinTableCompression);
 
   config.AddExtensionOption(
     "pin_table_input_compression_plan_dir",
-    "Directory containing per-table Simpatico plan files for pin_table(tier=>'host') compression. "
+    "Directory containing per-table Simpatico plan files for pin_table compression. "
     "Files are named '<table_name>.<ext>'; their contents are the multi-column plan DSL. "
-    "Tables with no matching file are pinned uncompressed. No effect on spill compression.",
+    "May be set before pin_table_compression is enabled. Tables with no matching file are pinned "
+    "uncompressed. No effect on spill compression.",
     LogicalType::VARCHAR,
     Value(compression_defaults.input_plan_dir),
     SetPinTableInputCompressionPlanDir);
 
   config.AddExtensionOption(
     "pin_table_compression_min_batch_size_bytes",
-    "Minimum uncompressed batch size in bytes below which pin_table compression is skipped",
+    "Minimum uncompressed batch size in bytes below which active pin_table compression is skipped; "
+    "inert until compression is enabled and a matching plan resolves",
     LogicalType::UBIGINT,
     Value::UBIGINT(compression_defaults.min_batch_size_bytes),
     SetPinTableCompressionMinBatchSizeBytes);
@@ -2548,25 +2615,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     SetSpillCompressionExploreSampleRows);
 
   config.AddExtensionOption(
-    "enable_dynamic_filter_pushdown",
-    "Wire dynamic table-filter pushdown: an eligible BUILD_PROBE hash-join build publishes a "
-    "runtime membership filter (raw IN-list for 1-12 supported build rows; otherwise a hash "
-    "IN-list if it fits the smallest probe-GPU L2, or a Bloom) into the probe-side scan to drop "
-    "non-matching rows before the join (on by default)",
-    LogicalType::BOOLEAN,
-    Value::BOOLEAN(operator_defaults.enable_dynamic_filter_pushdown),
-    SetEnableDynamicFilterPushdown);
-
-  config.AddExtensionOption(
-    "enable_dynamic_zone_map_filter",
-    "Additionally emit a runtime zone-map (build-key min/max) at the probe scan: parquet scans use "
-    "it for read-time row-group pruning, while duckdb-native scans apply it row-wise post-decode; "
-    "requires enable_dynamic_filter_pushdown (off by default)",
-    LogicalType::BOOLEAN,
-    Value::BOOLEAN(operator_defaults.enable_dynamic_zone_map_filter),
-    SetEnableDynamicZoneMapFilter);
-
-  config.AddExtensionOption(
     "dynamic_filter_domain_coverage_threshold",
     "Skip publishing a key's dynamic filters when the hash-join build covers at least this "
     "fraction of the key's domain; >= 1.0 effectively disables the gate",
@@ -2583,15 +2631,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     Value::DOUBLE(operator_defaults.dynamic_filter_keep_threshold),
     SetDynamicFilterKeepThreshold);
 
-  config.AddExtensionOption(
-    "enable_pinned_zone_map_pruning",
-    "Skip pinned-table chunks whose pin-time min/max statistics prove the scan's pushed-down "
-    "filter matches no rows; also gates the statistics capture during CALL pin_table, so a table "
-    "pinned while off carries no zone maps until re-pinned with the flag on",
-    LogicalType::BOOLEAN,
-    Value::BOOLEAN(operator_defaults.enable_pinned_zone_map_pruning),
-    SetEnablePinnedZoneMapPruning);
-
   // Default from the YAML-loaded params, so a sirius.yaml value is what connections inherit.
   config.AddExtensionOption(
     "enable_compressed_materialization",
@@ -2601,6 +2640,22 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.enable_compressed_materialization),
     SetEnableCompressedMaterialization);
+
+  config.AddExtensionOption(
+    "admission_bytes_per_gpu",
+    "Target projected scan-output bytes per GPU at admission; 0 disables the estimate and "
+    "leaves the allocation to topology.gpus_per_query",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.admission_bytes_per_gpu),
+    SetAdmissionBytesPerGpu);
+
+  config.AddExtensionOption(
+    "avg_variable_column_bytes",
+    "Per-row width assumed for variable-width columns (VARCHAR, LIST, STRUCT, ARRAY) when "
+    "estimating scan output at admission; must be greater than zero",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.avg_variable_column_bytes),
+    SetAvgVariableColumnBytes);
 }
 
 // Publish the transparent optimizer mask once at extension load, unioned

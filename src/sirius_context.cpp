@@ -382,6 +382,7 @@ void SiriusContext::begin_execution_window(ClientContext& context,
   data_repository_registry_.create_for_query(query_id);
   task_creator_->reset();
   task_creator_->set_client_context(context);
+  // GPU admission runs later, in sirius_engine::initialize_internal().
 }
 
 void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::string_view end_tag)
@@ -1129,8 +1130,11 @@ void SiriusContext::create_query(
     std::move(pipelines), telemetry_context_->context(), query_id, telemetry_info);
   task_scheduler_->prepare_for_query(query_);
   task_creator_->prepare_for_query(*query_);
+  // Reads the admitted subset back off task_creator, so this must run after
+  // initialize_internal has set it — otherwise scan_manager gets the full topology list.
   scan_manager_->prepare_for_query(*query_,
-                                   config_.get_operator_params().enable_pinned_zone_map_pruning);
+                                   config_.get_operator_params().enable_pinned_zone_map_pruning,
+                                   task_creator_->get_active_gpu_ids());
 }
 
 duckdb::shared_ptr<sirius::planner::query> SiriusContext::get_query()

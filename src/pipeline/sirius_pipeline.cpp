@@ -337,17 +337,20 @@ bool sirius_pipeline::is_pipeline_finished() const
   return pipeline_finished.load();
 }
 
+bool sirius_pipeline::is_query_terminal() const
+{
+  auto s = get_sink();
+  if (!s) { return false; }
+  return s->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR ||
+         s->type == op::SiriusPhysicalOperatorType::STREAMING_SINK;
+}
+
 void sirius_pipeline::set_task_creator(sirius::creator::task_creator* tc) { _task_creator = tc; }
 
 void sirius_pipeline::notify_downstream_pipelines(bool original_pipeline)
 {
-  // If this pipeline's sink is the RESULT_COLLECTOR, it is the terminal
-  // pipeline of the query — there is no downstream consumer to schedule and
-  // no parent pipeline whose status needs updating. Returning early avoids
-  // racing with engine teardown after mark_completed() signals the future.
-  if (auto s = get_sink(); s && s->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
-    return;
-  }
+  // Query-terminal: no downstream; early return avoids teardown race after mark_completed().
+  if (is_query_terminal()) { return; }
 
   // Schedule output consumers via the task_creator so downstream pipelines
   // whose FULL-barrier ports are now unblocked will get tasks created.
