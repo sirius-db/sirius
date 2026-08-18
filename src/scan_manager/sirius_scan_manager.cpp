@@ -53,6 +53,7 @@
 
 #include <rmm/cuda_device.hpp>
 
+#include <ctrack.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/column_metadata.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -66,14 +67,12 @@
 #include <algorithm>
 #include <cstdint>
 #include <iterator>
-#include <memory>
-#include <ctrack.hpp>
-
 #include <latch>
-#include <unordered_set>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace sirius::scan_manager {
@@ -550,8 +549,8 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   _readahead          = std::make_shared<readahead_scan_manager>();
   _readahead->prepare_for_query(query);
 
-  // Subscribe for the query's lifetime; unregistered before the readahead dies.
-  if (_query_stage_manager != nullptr) { _query_stage_manager->add_listener(_readahead.get()); }
+  // Subscribe for the query's lifetime; unsubscribed in reset().
+  _query_stage_manager->subscribe(_readahead);
 
   // Any cache mode but `none` wants scans ordered ahead of demand.  The budget
   // is the backend's own: a backend publishing zero (kvikIO by default) opts
@@ -771,8 +770,8 @@ void sirius_scan_manager::prepare_scans_for_processing(
             CTRACK_NAME("warmup::file::thrift_parse");
             cudf::io::parquet::experimental::hybrid_scan_reader reader{
               cudf::host_span<std::uint8_t const>(footer->data(), footer->size()), opts};
-            meta = std::make_shared<cudf::io::parquet::FileMetaData const>(
-              reader.parquet_metadata());
+            meta =
+              std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata());
           }
           std::ignore = datasource->store_metadata(
             std::make_shared<op::scan::parquet_metadata>(std::move(meta), bytes));
@@ -932,11 +931,13 @@ void sirius_scan_manager::reset()
   // Stop explicitly rather than relying on the destructor: other holders (the
   // coalescer's slots, in-flight splits) may still own a shared_ptr copy, so
   // dropping ours would otherwise leave the worker running past query teardown.
-  if (_query_stage_manager != nullptr && _readahead) {
-    // Unsubscribe before the readahead dies: the manager holds raw pointers.
-    _query_stage_manager->remove_listener(_readahead.get());
+  if (_readahead) {
+    // Unsubscribe before dropping ours: the manager shares ownership, so a
+    // subscription left behind would keep this query's readahead alive for the
+    // rest of the context's life and let the next query's events reach it.
+    _query_stage_manager->unsubscribe(_readahead.get());
+    _readahead->stop();
   }
-  if (_readahead) { _readahead->stop(); }
   _readahead.reset();
   _dispatcher = std::make_unique<exec::scoped_dispatcher>(_thread_pool, _thread_pool.num_threads());
 }

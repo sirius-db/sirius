@@ -186,9 +186,10 @@ struct device_cpy_request {
 
 /// Per-reactor container of per-chunk requests for one split of a caller
 /// request.  @c Chunk is the backend-specific chunk type (it must expose a
-/// @c manager member of type @c std::shared_ptr<request_manager>).  The
-/// templated_ioctx dispatch layer builds one of these, retrieves its future,
-/// then @c splits it across the reactor pool and enqueues each split.
+/// @c manager member of type @c std::shared_ptr<request_manager> and a
+/// @c chunk member carrying the read's byte @c size).  The templated_ioctx
+/// dispatch layer builds one of these, retrieves its future, then @c splits it
+/// across the reactor pool and enqueues each split.
 template <class Chunk>
 struct rx_request_t {
   static std::unique_ptr<rx_request_t> create(std::vector<std::unique_ptr<Chunk>> reqs) noexcept
@@ -198,6 +199,20 @@ struct rx_request_t {
 
   [[nodiscard]] std::size_t size() const noexcept { return requests.size(); }
 
+  /// Divide this request's chunks into at most @p n_splits batches of roughly
+  /// equal BYTES, preserving file order.
+  ///
+  /// Balancing by chunk count instead would only be equivalent if every chunk
+  /// were the same size, which they are not: a coalesced request mixes a fused
+  /// multi-megabyte scatter GET with single small reads, so an even chunk count
+  /// can hand one reactor several times the bytes of another — undoing the
+  /// load-aware reactor choice the dispatch layer just made.
+  ///
+  /// Batch @c k closes once the running byte total crosses @c (k+1)/n_splits of
+  /// the whole, so batches land on chunk boundaries nearest the ideal cut.  A
+  /// batch is only ever closed right after a chunk joins it, so no empty batch
+  /// is produced and the result never exceeds @p n_splits entries — fewer when
+  /// there are fewer chunks than splits.
   static std::vector<std::unique_ptr<rx_request_t>> splits(std::unique_ptr<rx_request_t> req,
                                                            std::size_t n_splits) noexcept
   {
@@ -206,14 +221,32 @@ struct rx_request_t {
     req.reset(nullptr);
     if (n_splits == 0 || chunks.empty()) return result;
 
-    std::size_t chunks_per_split = (chunks.size() + n_splits - 1) / n_splits;
-    std::vector<std::unique_ptr<Chunk>> current_batch;
+    std::size_t total_bytes = 0;
+    for (auto const& c : chunks) {
+      if (c) { total_bytes += c->chunk.size; }
+    }
 
+    result.reserve(n_splits);
+    std::vector<std::unique_ptr<Chunk>> current_batch;
+    // Zero-byte work has no balance to strike; keep it as one batch rather than
+    // letting every boundary compare equal and split it per chunk.
+    if (total_bytes == 0 || n_splits == 1) {
+      result.push_back(create(std::move(chunks)));
+      return result;
+    }
+
+    std::size_t acc = 0;  // bytes placed so far, including the current batch
+    std::size_t k   = 0;  // index of the batch being filled
     for (auto& chunk : chunks) {
+      if (chunk) { acc += chunk->chunk.size; }
       current_batch.push_back(std::move(chunk));
-      if (current_batch.size() >= chunks_per_split) {
+      // Close on the ideal cut for batch k, computed from the running total to
+      // keep the rounding error from accumulating across batches.
+      std::size_t const boundary = total_bytes * (k + 1) / n_splits;
+      if (k + 1 < n_splits && acc >= boundary) {
         result.push_back(create(std::move(current_batch)));
         current_batch.clear();
+        ++k;
       }
     }
 

@@ -311,11 +311,8 @@ Five optional nested sub-configs tune the individual backends and caches:
 | `request_timeout_s` | int (seconds) | 30 | Whole-request timeout and presigned-URL TTL (0 = no limit). |
 | `ca_bundle_path` | string | "" | PEM CA bundle for TLS verification. |
 | `tls_verify` | bool | true | Verify the endpoint's TLS certificate (peer + host). |
-| `max_connections` | int | 16 | Max concurrent in-flight connections per reactor. |
-| `chunk_size` | bytes | 8Mi | Target bytes per ranged GET (scatter/device-staging paths). |
-| `max_n_chunks` | int | 16 | Max file-adjacent segments fused into one scatter GET. |
-| `max_read_split` | int | 16 | Max parallel ranged GETs for one contiguous host read (reads < 2 MiB stay a single GET). |
-| `bounce_block_size` | bytes | 0 | Bounce-slot size for the reactor-staged device path (0 disables that path; normally set from the staging resource at runtime). |
+| `max_chunk_size` | bytes | 16Mi | Chunk floor: a read span of S bytes becomes `max(1, S / max_chunk_size)` requests with S balanced across them, so every request carries at least this many bytes (31Mi stays one GET; 33Mi becomes two). |
+| `merge_max_gap` | bytes | 512Ki | Largest gap between two segments still fetched by a single GET. The bridged bytes are read and discarded, trading them for a saved round trip. 0 fuses only adjacent segments. |
 | `upkeep_interval_ms` | int (ms) | 15000 | Idle-connection keepalive interval (`curl_easy_upkeep`; 0 disables). |
 | `conn_max_age_s` | int (seconds) | 20 | Max age curl may reuse a pooled connection (`CURLOPT_MAXAGE_CONN`; 0 = curl default). |
 | `retry_backoff_base_ms` | int (ms) | 50 | Base backoff between retries. |
@@ -327,6 +324,24 @@ Five optional nested sub-configs tune the individual backends and caches:
 | `footer_probe_bytes` | bytes | 512Ki | Suffix-range window for the parquet footer probe. Must cover the footer, so err large. |
 | `list_max_matches` | int | 100000 | Cap on files a glob/listing may accumulate (throws "narrow the glob prefix", never truncates). |
 | `list_max_scanned` | int | 1000000 | Cap on objects a LIST sweep may scan across pages (throws, never truncates). |
+
+Two REST values are deliberately not YAML keys. **Connections per reactor** is
+fixed at 64 — the useful number is a property of one reactor thread, not of a
+deployment, and more concurrency comes from adding reactors (`rest_n_reactors`),
+each with its own thread to service them. **Bounce-slot size** is stamped from
+the host staging pool's `block_size` at startup, because a slot of any other size
+could not be served by that pool; set `scan_manager.memory.host.block_size` to
+change it. Note the two multiply: a reactor parks one pinned bounce slot per
+connection, so it reserves `64 x block_size` of host memory up front.
+
+Every REST read is planned in two steps. **Coalesce**: segments within
+`merge_max_gap` of each other are fused into one contiguous ranged GET, the
+bridged gap bytes being fetched and dropped on arrival (one round trip beats
+two). **Cut**: the fused span is divided into `max(1, span / max_chunk_size)`
+requests with the bytes balanced across them, so no request falls below the
+floor — 31 MiB stays a single GET rather than becoming two half-sized ones,
+while 33 MiB becomes two. The fan-out is not capped: a 1 GiB read is 64 requests
+of 16 MiB, not fewer and larger ones.
 
 ### `scan_manager.kvikio` — kvikIO local-file backend (`io/kvikio/config.hpp`)
 
@@ -356,7 +371,6 @@ constructor, so it scopes to files this backend opens.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `inflight_io_chunk_budget` | int (**> 0**) | 2048 | Max in-flight IO chunks (enforced by admission control). |
 | `eviction_threshold_fraction` | double [0,1] | 0.6 | Start evicting when the pool fills to this fraction. |
 | `min_prefetching_budget_fraction` | double [0,1] | 0.05 | Floor of the budget reserved for prefetching. |
 

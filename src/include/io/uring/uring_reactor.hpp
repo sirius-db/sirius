@@ -203,11 +203,11 @@ class uring_reactor {
   /// request, each into its own device destination.  Every range is clamped to
   /// the file, aligned outward for O_DIRECT, and split into @c cfg.bounce_size
   /// windows staged through the reactor's internal bounce slots.
-  static request_type_ptr prep_device_ranges_rx_request(const reactor_config_type& cfg,
-                                                        const io_object_type& file,
-                                                        std::span<const io_device_range> ranges,
-                                                        rmm::cuda_stream_view stream,
-                                                        int device_id);
+  static request_type_ptr prep_device_rxv_request(const reactor_config_type& cfg,
+                                                  const io_object_type& file,
+                                                  std::span<const io_device_range> ranges,
+                                                  rmm::cuda_stream_view stream,
+                                                  int device_id);
 
   static request_type_ptr prep_host_to_device_rx_request(const reactor_config_type& cfg,
                                                          const io_object_type& file,
@@ -222,7 +222,7 @@ class uring_reactor {
   /// buffer (null => an internal bounce slot) and only its copy window is
   /// H2D-copied to its own device destination.  Contiguous caller buffers fuse
   /// into readv groups that batch their copies.
-  static request_type_ptr prep_host_to_device_ranges_rx_request(
+  static request_type_ptr prep_host_to_device_rxv_request(
     const reactor_config_type& cfg,
     const io_object_type& file,
     std::span<const io_host_device_range> ranges,

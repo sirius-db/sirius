@@ -103,11 +103,13 @@ class task_creator {
   /// \brief sets pipeline executor reference
   void set_task_scheduler(sirius::pipeline::task_scheduler& task_scheduler);
 
-  /// Attach the query-stage observer.  Optional: null means nothing observes,
-  /// which is the default and costs a null check on the reporting paths.
-  void set_query_stage_manager(sirius::exec::query_stage_manager* manager) noexcept
+  /// Attach the query-stage observer, sharing ownership of it so the handle is
+  /// neither null nor dangling for as long as this creator can report.  Until
+  /// this is called the creator reports into its own private manager, which has
+  /// no listeners and so is a no-op.
+  void set_query_stage_manager(sirius::exec::query_stage_manager& manager)
   {
-    _query_stage_manager = manager;
+    _query_stage_manager = manager.shared_from_this();
   }
 
   /// Report that @p pipeline_id has closed, so its source will produce no more
@@ -215,8 +217,11 @@ class task_creator {
   std::thread _manager_thread;
   ::duckdb::ClientContext* _client_context;
   sirius::pipeline::task_scheduler* _task_scheduler{nullptr};
-  /// Optional observer of query stage transitions; null when unobserved.
-  sirius::exec::query_stage_manager* _query_stage_manager{nullptr};
+  /// Observer of query stage transitions.  Never null: seeded with an
+  /// unsubscribed manager so the reporting paths need no check, and replaced by
+  /// the context's own in set_query_stage_manager.
+  std::shared_ptr<sirius::exec::query_stage_manager> _query_stage_manager{
+    std::make_shared<sirius::exec::query_stage_manager>()};
   /// Stamped by prepare_for_query; the manager loop has no other handle on it.
   sirius::query_id_t _query_id{};
   sirius::memory::sirius_memory_reservation_manager& _mem_res_mgr;

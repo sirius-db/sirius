@@ -51,46 +51,58 @@ struct config {
   bool tls_verify{true};
 
   /// Max concurrent in-flight easy handles per reactor, i.e. the ceiling on
-  /// simultaneous ranged GETs this reactor drives.
+  /// simultaneous ranged GETs this reactor drives.  Fixed at 64, not exposed to
+  /// YAML: the useful value is a property of one reactor thread rather than of a
+  /// deployment.
   ///
   /// More is not better, and past the point where the link is full it is
   /// actively worse: extra connections only split the same bandwidth into
   /// thinner streams.  Each socket then delivers a few KiB per read, so the
   /// reactor thread spends its time in per-read callback and TLS-record overhead
   /// rather than moving bytes, and time-to-first-byte climbs because it cannot
-  /// service that many sockets promptly.  Raising this past the point where the
-  /// reactor thread saturates costs latency without buying throughput.
+  /// service that many sockets promptly.  To drive more concurrency, add
+  /// reactors (@c rest_n_reactors) rather than sockets per reactor — each
+  /// reactor brings its own thread to service them.
+  ///
+  /// Note this is also the reactor's host-staging footprint: one pinned bounce
+  /// slot is parked per connection, so a reactor reserves
+  /// 64 x @c bounce_block_size of host memory up front.
   std::size_t max_connections{64};
 
-  /// Target maximum bytes per ranged GET for the vector / device-staging
-  /// paths: file-adjacent segments are fused into one scatter GET up to this
-  /// size, and an oversized segment is split into ceil(size / chunk_size)
-  /// pieces.  A single contiguous host read instead splits by
-  /// @c max_read_split (see prep_host_rx_request).
-  std::size_t chunk_size{8UL << 20};
-
-  /// Cap on destination buffers fused into a single scatter GET (i.e. how
-  /// many file-adjacent segments may merge into one request).
+  /// Chunk floor (bytes) for every read the reactor splits: a coalesced read
+  /// span of S bytes becomes max(1, S / max_chunk_size) requests with S balanced
+  /// evenly across them, so each request carries AT LEAST this many bytes and at
+  /// most twice it.  Integer division is the point — 31 MiB stays a single
+  /// 31 MiB GET rather than becoming two half-sized ones, while 33 MiB splits
+  /// into 17 + 16.
   ///
-  /// This bounds fusion, so raising it makes requests FEWER and fatter, never
-  /// more numerous.  The prefetching cache hands the reactor one segment per
-  /// cache chunk (1 MiB by default), so a low cap chops an otherwise contiguous
-  /// read into that many-MiB pieces regardless of @c chunk_size.  Against an
-  /// object store each piece costs a full round trip, so the cap wants to be
-  /// high enough that @c chunk_size is what actually limits a fused GET.
-  std::size_t max_n_chunks{16};
+  /// Against an object store every extra request is a full round trip, so the
+  /// floor exists to stop a large read from being shredded into latency-bound
+  /// pieces; it is not a ceiling on request size.
+  std::size_t max_chunk_size{16UL << 20};  // 16 MiB
 
-  /// How many parallel ranged GETs a single contiguous host read is broken
-  /// into (@c prep_host_rx_request).  The split picks the largest chunk count
-  /// <= max_read_split that keeps every piece at least 1 MiB; a read smaller
-  /// than 2 MiB stays a single GET.
-  std::size_t max_read_split{16};
+  /// How far apart two segments may sit and still be fetched by one GET.  Reads
+  /// arrive as many small destination buffers (one per cache chunk, one per
+  /// storage block) that are near each other in the file but not adjacent —
+  /// separated by an already-cached chunk, a block header, a skipped column.
+  /// Bridging a gap up to this size costs the gap's bytes (fetched, then
+  /// discarded on arrival) and saves a round trip; leaving it costs a round
+  /// trip and saves the bytes.  On a high-bandwidth link to an object store the
+  /// round trip is the expensive half, so the default bridges generously.
+  ///
+  /// Zero fuses only genuinely adjacent segments.
+  std::size_t merge_max_gap{512UL << 10};  // 0.5 MiB
 
-  /// Bounce-slot size (bytes) for the reactor-staged device path, cached from
-  /// the staging resource's block size by @c rest_ioctx.  Zero disables the
-  /// reactor-staged device read (the static @c prep_device_rx_request needs
-  /// this size without access to the live resource, which lives on the
-  /// @c reactor_context).
+  /// Bounce-slot size (bytes) for the reactor-staged device path.  Not a YAML
+  /// key: it is stamped at construction from the host staging resource's block
+  /// size (@c make_rest_ioctx_factory), because a slot that did not match the
+  /// pool's block size could not be handed out by that pool at all.  Configure
+  /// it through @c scan_manager.memory.host.block_size.
+  ///
+  /// Zero means no host staging resource was configured, which disables the
+  /// reactor-staged device read (host reads still work).  The static
+  /// @c prep_device_rx_request needs this size without access to the live
+  /// resource, which lives on the @c reactor_context.
   std::size_t bounce_block_size{0};
 
   /// Idle-connection keepalive.  While the reactor is idle, every

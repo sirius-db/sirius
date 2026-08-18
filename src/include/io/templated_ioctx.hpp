@@ -151,27 +151,26 @@ concept reactor_has_host_to_device_rx = requires(R r,
 };
 
 template <class R>
-concept reactor_has_device_ranges_rx = requires(R r,
-                                                typename R::io_object_type file,
-                                                typename R::reactor_config_type cfg,
-                                                rmm::cuda_stream_view stream,
-                                                std::span<const io_device_range> ranges) {
+concept reactor_has_device_rxv = requires(R r,
+                                          typename R::io_object_type file,
+                                          typename R::reactor_config_type cfg,
+                                          rmm::cuda_stream_view stream,
+                                          std::span<const io_device_range> ranges) {
   {
-    r.prep_device_ranges_rx_request(cfg, file, ranges, stream, 1)
+    r.prep_device_rxv_request(cfg, file, ranges, stream, 1)
   } -> std::same_as<typename R::request_type_ptr>;
 };
 
 template <class R>
-concept reactor_has_host_to_device_ranges_rx =
-  requires(R r,
-           typename R::io_object_type file,
-           typename R::reactor_config_type cfg,
-           rmm::cuda_stream_view stream,
-           std::span<const io_host_device_range> ranges) {
-    {
-      r.prep_host_to_device_ranges_rx_request(cfg, file, ranges, stream, 1)
-    } -> std::same_as<typename R::request_type_ptr>;
-  };
+concept reactor_has_host_to_device_rxv = requires(R r,
+                                                  typename R::io_object_type file,
+                                                  typename R::reactor_config_type cfg,
+                                                  rmm::cuda_stream_view stream,
+                                                  std::span<const io_host_device_range> ranges) {
+  {
+    r.prep_host_to_device_rxv_request(cfg, file, ranges, stream, 1)
+  } -> std::same_as<typename R::request_type_ptr>;
+};
 
 template <class R>
 concept reactor_has_vector_host_rx =
@@ -209,11 +208,10 @@ struct reactor_traits {
   static constexpr bool supports_vector_host_read = reactor_has_vector_host_rx<R>;
 
   /// Batched device reads, each range to its own device destination.
-  static constexpr bool supports_device_range_read = reactor_has_device_ranges_rx<R>;
+  static constexpr bool supports_device_range_read = reactor_has_device_rxv<R>;
 
   /// Batched device reads staged through caller-supplied pinned host buffers.
-  static constexpr bool supports_host_to_device_range_read =
-    reactor_has_host_to_device_ranges_rx<R>;
+  static constexpr bool supports_host_to_device_range_read = reactor_has_host_to_device_rxv<R>;
 
   /// Whether the reactor would rather receive one batched request than a stream
   /// of small ones.  See ioctx::prefers_bulk_io.
@@ -499,7 +497,7 @@ class templated_ioctx : public ioctx {
             std::runtime_error("device_read_ranges_async_io: no available reactors")));
         }
         request_type_ptr req =
-          Reactor::prep_device_ranges_rx_request(_config, tobj, ranges, stream, device_id);
+          Reactor::prep_device_rxv_request(_config, tobj, ranges, stream, device_id);
         auto semi = req->get_future();
         auto reqs = request_type::splits(std::move(req), reactors.size());
         assert(reqs.size() <= reactors.size());
@@ -572,7 +570,7 @@ class templated_ioctx : public ioctx {
             std::runtime_error("host_to_device_read_ranges_async_io: no available reactors")));
         }
         request_type_ptr req =
-          Reactor::prep_host_to_device_ranges_rx_request(_config, tobj, ranges, stream, device_id);
+          Reactor::prep_host_to_device_rxv_request(_config, tobj, ranges, stream, device_id);
         auto semi = req->get_future();
         auto reqs = request_type::splits(std::move(req), reactors.size());
         assert(reqs.size() <= reactors.size());

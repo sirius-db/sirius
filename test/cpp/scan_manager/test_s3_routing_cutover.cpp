@@ -58,6 +58,7 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <set>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -72,6 +73,7 @@ namespace {
 using sirius::io::io_context_registry;
 using sirius::io::io_context_type;
 using sirius::io::rest::rest_ioctx;
+using sirius::io::rest::rest_reactor;
 using sirius::scan_manager::scan_manager_config;
 using sirius::scan_manager::sirius_scan_manager;
 
@@ -827,6 +829,42 @@ TEST_CASE("rest perf queue wait counts original requests rather than retry attem
   CHECK(snapshot.terminal_failures_total == 0);
   CHECK(snapshot.queue_wait_count == 1);
   CHECK(snapshot.chunk_get_count == 1);
+}
+
+TEST_CASE("rest dispatch spreads a request over two reactors and rotates when idle",
+          "[s3][rest][dispatch]")
+{
+  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{11}));
+  scan_manager_fixture fixture;
+  auto cfg            = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius);
+  cfg.rest_n_reactors = 4;
+  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+
+  auto datasource = manager.create_datasource("s3://routing-bucket/pool.parquet");
+  auto* rest_ctx  = require_rest_ioctx(datasource);
+  auto const& obj =
+    static_cast<sirius::io::rest::rest_io_object const&>(datasource->get_io_object());
+
+  using io_op_type = rest_ioctx::io_op_type;
+
+  // An idle pool has no backlog to rank on, so every reactor ties on depth and
+  // the rotation tie-break takes over: consecutive dispatches must land on
+  // different pairs rather than pinning reactor 0.
+  std::set<rest_reactor*> seen;
+  for (int i = 0; i < 4; ++i) {
+    auto picked = rest_ctx->next_reactor(obj, /*n_chunks=*/8, io_op_type::host_vector_async);
+    REQUIRE(picked.size() == 2);       // never the whole pool
+    CHECK(picked[0] != picked[1]);     // and never the same reactor twice
+    seen.insert(picked.begin(), picked.end());
+  }
+  CHECK(seen.size() == 4);  // four dispatches reach every reactor in the pool
+
+  // Queue depth is a backlog gauge, not a lifetime counter: it returns to zero
+  // once the work drains, so the next dispatch starts from an even field.
+  read_one_host_range(*datasource);
+  for (auto* r : seen) {
+    CHECK(r->queued_bytes() == 0);
+  }
 }
 
 TEST_CASE("rest perf snapshot aggregates counters across the reactor pool", "[s3][rest][perf]")

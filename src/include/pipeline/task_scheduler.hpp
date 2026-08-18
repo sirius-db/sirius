@@ -16,10 +16,10 @@
 
 #pragma once
 
-#include "exec/query_stage_manager.hpp"
 #include "exec/channel.hpp"
 #include "exec/config.hpp"
 #include "exec/multi_index_priority_queue.hpp"
+#include "exec/query_stage_manager.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/completion_handler.hpp"
@@ -123,10 +123,13 @@ class task_scheduler {
    */
   void set_task_creator(sirius::creator::task_creator& task_creator);
 
-  /// Attach the query-stage observer.  Optional: null means nothing observes.
-  void set_query_stage_manager(sirius::exec::query_stage_manager* manager) noexcept
+  /// Attach the query-stage observer, sharing ownership of it so the handle is
+  /// neither null nor dangling for as long as this scheduler can report.  Until
+  /// this is called the scheduler reports into its own private manager, which
+  /// has no listeners and so is a no-op.
+  void set_query_stage_manager(sirius::exec::query_stage_manager& manager)
   {
-    _query_stage_manager = manager;
+    _query_stage_manager = manager.shared_from_this();
   }
 
   /**
@@ -251,8 +254,10 @@ class task_scheduler {
   std::atomic<size_t> _no_pref_rr_counter{0};
 
   sirius::creator::task_creator* _task_creator{nullptr};
-  /// Optional observer of query stage transitions; null when unobserved.
-  sirius::exec::query_stage_manager* _query_stage_manager{nullptr};
+  /// Observer of query stage transitions.  Never null; see task_creator for
+  /// why it is seeded rather than left empty.
+  std::shared_ptr<sirius::exec::query_stage_manager> _query_stage_manager{
+    std::make_shared<sirius::exec::query_stage_manager>()};
   std::unique_ptr<completion_handler> _completion_handler;
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;

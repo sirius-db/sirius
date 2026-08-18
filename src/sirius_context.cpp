@@ -18,13 +18,6 @@
 
 #include "config.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
-
-#include <ctrack.hpp>
-
-#include <algorithm>
-#include <io/prefetch_census.hpp>
-
-#include <iostream>
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -53,23 +46,27 @@
 
 #include <cuda_runtime_api.h>
 
+#include <ctrack.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 #include <duckdb/common/allocator.hpp>
 #include <duckdb/execution/physical_plan_generator.hpp>
+#include <io/prefetch_census.hpp>
 #include <io/types.hpp>
 #include <io/uring/uring_ioctx.hpp>
 #include <sys/resource.h>
 #include <unistd.h>  // for isatty/fileno
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>   // for fprintf/fileno (fallback banner)
 #include <cstdlib>  // for std::getenv
 #include <filesystem>
+#include <iostream>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -107,14 +104,15 @@ std::string ctrack_aggregate_report()
                                 ms(tables.time_total),
                                 ms(tables.time_ctracked));
   for (auto const& r : rows) {
-    out += std::format("\n  {:<44} calls {:>7} thr {:>3} acc {:>10.1f} ms  excl {:>9.1f} ms"
-                       "  incl {:>9.1f} ms",
-                       r.function_name,
-                       r.calls,
-                       r.threads,
-                       ms(r.time_acc),
-                       ms(r.time_ae_all),
-                       ms(r.time_a_all));
+    out += std::format(
+      "\n  {:<44} calls {:>7} thr {:>3} acc {:>10.1f} ms  excl {:>9.1f} ms"
+      "  incl {:>9.1f} ms",
+      r.function_name,
+      r.calls,
+      r.threads,
+      ms(r.time_acc),
+      ms(r.time_ae_all),
+      ms(r.time_a_all));
   }
   return out;
 }
@@ -827,13 +825,13 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   task_creator_->set_task_scheduler(*task_scheduler_);
   task_scheduler_->set_task_creator(*task_creator_);
 
-  query_stage_manager_ = std::make_unique<sirius::exec::fan_out_query_stage_manager>();
-  task_creator_->set_query_stage_manager(query_stage_manager_.get());
-  task_scheduler_->set_query_stage_manager(query_stage_manager_.get());
+  query_stage_manager_ = std::make_shared<sirius::exec::query_stage_manager>();
+  task_creator_->set_query_stage_manager(*query_stage_manager_);
+  task_scheduler_->set_query_stage_manager(*query_stage_manager_);
 
   scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
     config_.get_scan_manager_config(), *memory_manager_, topology_index_);
-  scan_manager_->set_query_stage_manager(query_stage_manager_.get());
+  scan_manager_->set_query_stage_manager(*query_stage_manager_);
 
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
   // has been constructed.

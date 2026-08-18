@@ -41,7 +41,6 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <cucascade/memory/stream_pool.hpp>
-
 #include <glob.h>
 #include <log/logging.hpp>
 #include <log/spdlog_owning_sink.hpp>
@@ -85,8 +84,7 @@ struct file_info {
 
 std::vector<std::string> glob_parquet_files(std::string const& dir, std::size_t limit)
 {
-  static constexpr std::array<char const*, 2> kPatterns = {"part.*.parquet",
-                                                            "lineitem.*.parquet"};
+  static constexpr std::array<char const*, 2> kPatterns = {"part.*.parquet", "lineitem.*.parquet"};
   std::vector<std::string> paths;
   for (auto const* pat : kPatterns) {
     std::string const pattern = dir + "/" + pat;
@@ -161,7 +159,6 @@ void run_prefetch(std::vector<file_info>& files,
                   std::size_t total_bytes)
 {
   sirius::io::cache::config cache_cfg;
-  cache_cfg.inflight_io_chunk_budget        = 16384;
   cache_cfg.min_prefetching_budget_fraction = 0.9;
   cache_cfg.eviction_threshold_fraction     = 0.9;
   cache_cfg.dispose_on_idle                 = false;
@@ -171,15 +168,7 @@ void run_prefetch(std::vector<file_info>& files,
     fi.ds->fadvise(fi.ranges, 0);
   }
 
-  // Block until prepare_loop has allocated staging buffers for every chunk of
-  // every file (producer state >= prepared).  This ensures prefetch_async will
-  // find chunks in ALLOCATED state and actually issue IO rather than settling
-  // immediately with no data staged.
-  for (auto& fi : files) {
-    if (!fi.ds->wait_prefetch_prepared()) {
-      SIRIUS_LOG_WARN("prefetch preparation abandoned for {}", fi.path);
-    }
-  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
   std::atomic<std::size_t> total_rows{0};
   std::latch done(static_cast<std::ptrdiff_t>(files.size()));
@@ -219,8 +208,8 @@ void run_prefetch(std::vector<file_info>& files,
             << " IOs issued\n";
 
   done.wait();
-  std::cout << "  prefetch callbacks : ok=" << io_ok.load()
-            << " not_ok=" << io_not_ok.load() << "\n";
+  std::cout << "  prefetch callbacks : ok=" << io_ok.load() << " not_ok=" << io_not_ok.load()
+            << "\n";
   double const elapsed = ms_since(t0);
 
   std::cout << "\n=== prefetch results ===\n"
@@ -238,8 +227,8 @@ void run_prefetch(std::vector<file_info>& files,
 int main(int argc, char** argv)
 {
   std::string dir;
-  std::size_t n_files  = 0;
-  std::string mode;      // "b" or "p"
+  std::size_t n_files = 0;
+  std::string mode;  // "b" or "p"
   std::size_t nthreads = 4;
 
   for (int i = 1; i < argc; ++i) {
@@ -253,14 +242,12 @@ int main(int argc, char** argv)
     } else if (arg == "--nthreads" && i + 1 < argc) {
       nthreads = std::stoull(argv[++i]);
     } else {
-      std::cerr << "usage: " << argv[0]
-                << " --dir DIR [--n_files N] --mode <b|p> [--nthreads N]\n";
+      std::cerr << "usage: " << argv[0] << " --dir DIR [--n_files N] --mode <b|p> [--nthreads N]\n";
       return 1;
     }
   }
   if (dir.empty() || (mode != "b" && mode != "p")) {
-    std::cerr << "usage: " << argv[0]
-              << " --dir DIR [--n_files N] --mode <b|p> [--nthreads N]\n";
+    std::cerr << "usage: " << argv[0] << " --dir DIR [--n_files N] --mode <b|p> [--nthreads N]\n";
     return 1;
   }
 
@@ -275,17 +262,16 @@ int main(int argc, char** argv)
   // cudf's default device memory resource in its constructor.
   cucascade::memory::reservation_manager_configurator builder;
   builder.set_number_of_gpus(1)
-    .set_usage_limit_ratio_per_gpu(0.5)   // GPU pool: 50% of total memory
+    .set_usage_limit_ratio_per_gpu(0.5)  // GPU pool: 50% of total memory
     .set_reservation_fraction_per_gpu(0.9)
     .use_gpu_id_as_host_id()
     .set_per_numa_region_capacity(20ULL << 30)
     .set_reservation_fraction_per_numa_region(0.9)
     .set_host_pool_features(1ULL << 20,  // chunk_size  = 1 MiB
-                            1024,         // pool_size   = blocks per slab (1 GiB each)
-                            20);          // initial_pools (14 GiB, well above 4-col staging)
+                            1024,        // pool_size   = blocks per slab (1 GiB each)
+                            20);         // initial_pools (14 GiB, well above 4-col staging)
 
-  auto mgr =
-    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
+  auto mgr = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
 
   // Bounce pool comes from the manager — no separate allocation.
   auto* host_space = mgr->get_memory_space(cucascade::memory::Tier::HOST, 0);
@@ -294,8 +280,7 @@ int main(int argc, char** argv)
   // ---- io context ----------------------------------------------------------
   auto ctx = std::make_shared<sirius::io::uring::uring_reactor::reactor_context>(
     sirius::io::uring::uring_reactor::reactor_config_type{
-      .bounce_size  = bounce_mr->get_block_size(),
-      .max_n_chunks = 1},
+      .bounce_size = bounce_mr->get_block_size(), .max_n_chunks = 1},
     bounce_mr);
   auto io_ctx = std::make_shared<sirius::io::uring::uring_ioctx>(1, std::move(ctx));
   io_ctx->start();
@@ -317,8 +302,8 @@ int main(int argc, char** argv)
   using hybrid_scan_reader = cudf::io::parquet::experimental::hybrid_scan_reader;
 
   std::cout << "found " << paths.size() << " file(s) in " << dir << "\n"
-            << "mode=" << (mode == "b" ? "baseline" : "prefetch")
-            << "  nthreads=" << nthreads << "\n\n"
+            << "mode=" << (mode == "b" ? "baseline" : "prefetch") << "  nthreads=" << nthreads
+            << "\n\n"
             << "=== phase 1: column-chunk discovery ===\n";
 
   std::vector<file_info> files;
@@ -331,8 +316,8 @@ int main(int argc, char** argv)
     fi.ds   = io_ctx->open_datasource(path);
 
     auto footer = cudf::io::parquet::fetch_footer_to_host(*fi.ds);
-    hybrid_scan_reader reader(
-      cudf::host_span<uint8_t const>(footer->data(), footer->size()), disc_opts);
+    hybrid_scan_reader reader(cudf::host_span<uint8_t const>(footer->data(), footer->size()),
+                              disc_opts);
 
     auto rg   = reader.all_row_groups(disc_opts);
     fi.ranges = reader.all_column_chunks_byte_ranges(
@@ -344,8 +329,8 @@ int main(int argc, char** argv)
 
     std::cout << std::filesystem::path(path).filename().string()
               << " { n_ranges=" << fi.ranges.size() << ", total_size=" << std::fixed
-              << std::setprecision(2)
-              << static_cast<double>(fi.range_bytes) / (1024.0 * 1024.0) << " MiB }\n";
+              << std::setprecision(2) << static_cast<double>(fi.range_bytes) / (1024.0 * 1024.0)
+              << " MiB }\n";
 
     files.push_back(std::move(fi));
   }

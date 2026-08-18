@@ -18,7 +18,7 @@
 
 #include "blockingconcurrentqueue.h"
 #include "cuda/device_copy_batch.hpp"
-#include "exec/admission_control.hpp"
+#include "exec/completion_controller.hpp"
 #include "exec/invocable.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/semi_future.hpp"
@@ -90,9 +90,29 @@ struct prefetch_request {
   }
 
   /// True once the consumer is gone: no consumer machine, or it is disposed.
+  /// This is the disposal check, and it stays meaningful after the IO has been
+  /// issued -- which is what the evictor needs to hand a subscriber reference
+  /// back, and what a request re-checks once it clears the rate limiter.
   [[nodiscard]] bool is_cancelled() const noexcept
   {
     return !consumer || consumer->get() == consumer_stage::disposed;
+  }
+
+  /// True when the readahead lost the race: the consumer has reached
+  /// @c preparing or beyond -- so the executor is already pulling this split's
+  /// bytes through itself -- while this request's IO has not started.  Issuing
+  /// the prefetch now would only duplicate the read that is already happening,
+  /// so the gates that decide whether to begin one turn it away here.
+  ///
+  /// Deliberately false once the producer reaches @c loading: at that point the
+  /// IO is in flight and there is nothing left to call off, so the question
+  /// stops being "is this worth starting" and becomes "is the consumer still
+  /// there" -- which is @ref is_cancelled.
+  [[nodiscard]] bool has_fallen_behind() const noexcept
+  {
+    if (!consumer || !producer) { return true; }
+    return consumer->get() >= consumer_stage::preparing &&
+           producer->get() < producer_stage::loading;
   }
 };
 
@@ -377,7 +397,17 @@ class prefetching_cache {
   request_queue_type _preparation_queue;
   std::stop_source _preparation_stop_source;
 
-  exec::admission_control _rate_limiter;
+  /// One slot per issued prefetch IO, parked in that IO's completion so it
+  /// drops when the completion runs.  This is NOT a rate limit -- @c acquire
+  /// never blocks, and how much read-ahead is in flight is the readahead
+  /// manager's budget to set.  It exists because the completion writes through
+  /// raw @c cached_chunk pointers into file entries this cache owns, so the
+  /// destructor has to wait those completions out before letting them go.
+  exec::completion_controller _inflight_io;
+
+  /// Block until every issued prefetch IO has run its completion.  Closes
+  /// @ref _inflight_io, so it is a teardown step and not repeatable.
+  void drain_inflight_io() noexcept;
 
   std::jthread _evictor_thread;
   request_queue_type _eviction_queue;

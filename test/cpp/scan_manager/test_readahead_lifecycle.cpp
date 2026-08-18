@@ -142,9 +142,9 @@ TEST_CASE("update wakes the worker without deadlocking", "[scan_manager][readahe
   m.start(4);
 
   for (int i = 0; i < 200; ++i) {
-    m.update(1, nullptr, scan_stage::reading);
-    m.update(2, nullptr, scan_stage::queued);
-    m.update(1, nullptr, scan_stage::disposed);
+    m.update_scan_state(1, nullptr, scan_stage::reading);
+    m.update_scan_state(2, nullptr, scan_stage::queued);
+    m.update_scan_state(1, nullptr, scan_stage::disposed);
   }
 
   CHECK(m.is_running());
@@ -155,8 +155,8 @@ TEST_CASE("update wakes the worker without deadlocking", "[scan_manager][readahe
 TEST_CASE("update is safe on a manager that was never started", "[scan_manager][readahead]")
 {
   readahead_scan_manager m;
-  m.update(7, nullptr, scan_stage::reading);
-  m.update(7, nullptr, scan_stage::disposed);
+  m.update_scan_state(7, nullptr, scan_stage::reading);
+  m.update_scan_state(7, nullptr, scan_stage::disposed);
   CHECK_FALSE(m.is_running());
 }
 
@@ -186,15 +186,15 @@ TEST_CASE("an unprefetched split counts as ongoing only once it is reading",
   CHECK(m.ongoing_scans() == 0);
 
   for (auto stage : {scan_stage::initialized, scan_stage::queued, scan_stage::preparing}) {
-    m.update(OP, split.get(), stage);
+    m.update_scan_state(OP, split.get(), stage);
     // Nothing is doing IO yet -- the split has not been handed to a reader.
     CHECK(m.ongoing_scans() == 0);
   }
 
-  m.update(OP, split.get(), scan_stage::reading);
+  m.update_scan_state(OP, split.get(), scan_stage::reading);
   CHECK(m.ongoing_scans() == 1);
 
-  m.update(OP, split.get(), scan_stage::disposed);
+  m.update_scan_state(OP, split.get(), scan_stage::disposed);
   CHECK(m.ongoing_scans() == 0);
 }
 
@@ -206,15 +206,15 @@ TEST_CASE("splits are counted independently", "[scan_manager][readahead]")
   m.register_scan_task(a, OP);
   m.register_scan_task(b, OP);
 
-  m.update(OP, a.get(), scan_stage::reading);
+  m.update_scan_state(OP, a.get(), scan_stage::reading);
   CHECK(m.ongoing_scans() == 1);  // b is still only registered
 
-  m.update(OP, b.get(), scan_stage::reading);
+  m.update_scan_state(OP, b.get(), scan_stage::reading);
   CHECK(m.ongoing_scans() == 2);
 
   // One split disposing must not retire the other -- the whole reason update()
   // carries the split identity rather than just the operator id.
-  m.update(OP, a.get(), scan_stage::disposed);
+  m.update_scan_state(OP, a.get(), scan_stage::disposed);
   CHECK(m.ongoing_scans() == 1);
 }
 
@@ -223,7 +223,7 @@ TEST_CASE("a split that is destroyed stops counting", "[scan_manager][readahead]
   readahead_scan_manager m;
   auto split = std::make_shared<test_split>();
   m.register_scan_task(split, OP);
-  m.update(OP, split.get(), scan_stage::reading);
+  m.update_scan_state(OP, split.get(), scan_stage::reading);
   REQUIRE(m.ongoing_scans() == 1);
 
   // A split whose task went away without reporting disposed still frees its
@@ -239,7 +239,7 @@ TEST_CASE("registering the same split twice is idempotent", "[scan_manager][read
   m.register_scan_task(split, OP);
   m.register_scan_task(split, OP);
 
-  m.update(OP, split.get(), scan_stage::reading);
+  m.update_scan_state(OP, split.get(), scan_stage::reading);
   CHECK(m.ongoing_scans() == 1);  // not 2
 }
 
@@ -253,11 +253,11 @@ TEST_CASE("updates for an unknown split still record the operator stage",
 
   // A resident cached batch has no scan_info and reports a null task; it must
   // not be mistaken for one of the registered splits.
-  m.update(OP, nullptr, scan_stage::reading);
-  m.update(OP, unknown.get(), scan_stage::reading);
+  m.update_scan_state(OP, nullptr, scan_stage::reading);
+  m.update_scan_state(OP, unknown.get(), scan_stage::reading);
   CHECK(m.ongoing_scans() == 0);
 
-  m.update(OP, split.get(), scan_stage::reading);
+  m.update_scan_state(OP, split.get(), scan_stage::reading);
   CHECK(m.ongoing_scans() == 1);
 }
 
@@ -336,8 +336,8 @@ TEST_CASE("a lull between split waves does not retire the operator", "[scan_mana
 
   auto first = std::make_shared<test_split>();
   m.register_scan_task(first, OP);
-  m.update(OP, first.get(), scan_stage::reading);
-  m.update(OP, first.get(), scan_stage::disposed);
+  m.update_scan_state(OP, first.get(), scan_stage::reading);
+  m.update_scan_state(OP, first.get(), scan_stage::disposed);
 
   REQUIRE(m.get_next_prefetching_operator() != nullptr);
 
@@ -356,7 +356,7 @@ TEST_CASE("closing the producer retires an operator whose splits are done",
 
   auto split = std::make_shared<test_split>();
   m.register_scan_task(split, OP);
-  m.update(OP, split.get(), scan_stage::disposed);
+  m.update_scan_state(OP, split.get(), scan_stage::disposed);
   REQUIRE(m.get_next_prefetching_operator() != nullptr);
 
   // Close is itself a retirement edge: the last split disposed before the
@@ -374,12 +374,12 @@ TEST_CASE("a closed operator with live splits is not retired until they finish",
 
   auto split = std::make_shared<test_split>();
   m.register_scan_task(split, OP);
-  m.update(OP, split.get(), scan_stage::reading);
+  m.update_scan_state(OP, split.get(), scan_stage::reading);
 
   m.mark_operator_closed(OP);
   CHECK(m.get_next_prefetching_operator() != nullptr);
 
-  m.update(OP, split.get(), scan_stage::disposed);
+  m.update_scan_state(OP, split.get(), scan_stage::disposed);
   CHECK(m.get_next_prefetching_operator() == nullptr);
 }
 
@@ -407,7 +407,7 @@ TEST_CASE("a stopped manager can be restarted", "[scan_manager][readahead]")
   // already-stopped.
   m.start(4);
   CHECK(m.is_running());
-  m.update(1, nullptr, scan_stage::reading);
+  m.update_scan_state(1, nullptr, scan_stage::reading);
   m.stop();
   CHECK_FALSE(m.is_running());
 }

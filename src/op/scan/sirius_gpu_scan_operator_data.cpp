@@ -69,7 +69,7 @@ void scan_operator_input::update(io::cache::scan_stage site) const
   scan_info const* task = has_scan_metadata()
                             ? std::get<std::shared_ptr<scan_info>>(materialization_info).get()
                             : nullptr;
-  if (_readahead) { _readahead->update(_operator_id, task, site); }
+  if (_readahead) { _readahead->update_scan_state(_operator_id, task, site); }
   if (task == nullptr) { return; }
   // Datasources only, not the fadvise hints: this runs on every stage
   // transition of every split, and the hints carry the split's entire

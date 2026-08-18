@@ -237,7 +237,7 @@ struct rest_perf_snapshot {
   // Non-zero means the pooled connection was unusable -> TCP+TLS on the hot path.
   std::uint64_t conn_opened_total{0};
   // Retry attribution, by cause.
-  std::uint64_t retry_slowdown_total{0};   // 429 / 503
+  std::uint64_t retry_slowdown_total{0};    // 429 / 503
   std::uint64_t retry_server_err_total{0};  // 500 / 502 / 504 / 408
   std::uint64_t retry_transport_total{0};   // curl transport error
   std::uint64_t retry_short_read_total{0};  // 206 with a truncated body
@@ -367,17 +367,17 @@ class rest_reactor {
   /// file end, staged through reactor-owned pinned bounce slots and H2D-copied
   /// into its own device destination.  Ranges with a null destination (or no
   /// bytes left after clamping) are skipped.
-  static request_type_ptr prep_device_ranges_rx_request(const reactor_config_type& cfg,
-                                                        const io_object_type& file,
-                                                        std::span<const io_device_range> ranges,
-                                                        rmm::cuda_stream_view stream,
-                                                        int device_id);
+  static request_type_ptr prep_device_rxv_request(const reactor_config_type& cfg,
+                                                  const io_object_type& file,
+                                                  std::span<const io_device_range> ranges,
+                                                  rmm::cuda_stream_view stream,
+                                                  int device_id);
 
   /// Vectored host-to-device read: each range is read into its own caller
   /// buffer (null => an internal bounce slot) and only its copy window is
   /// H2D-copied to its own device destination.  File-adjacent buffers fuse into
   /// scatter GETs that batch their copies.
-  static request_type_ptr prep_host_to_device_ranges_rx_request(
+  static request_type_ptr prep_host_to_device_rxv_request(
     const reactor_config_type& cfg,
     const io_object_type& file,
     std::span<const io_host_device_range> ranges,
@@ -396,6 +396,21 @@ class rest_reactor {
   void enqueue(request_type_ptr req);
   void interrupt();
   void shutdown();
+
+  /// Bytes of queued-but-not-yet-submitted work — the reactor's backlog, and the
+  /// signal @c rest_ioctx::next_reactor balances dispatch against.  Counts only
+  /// what is waiting: a chunk stops counting the moment a connection picks it up,
+  /// because in-flight work is already bounded by @c max_connections and is
+  /// therefore the same ceiling on every reactor, while the queue is where an
+  /// unevenly-loaded pool actually diverges.
+  ///
+  /// A hint, not a synchronization point: it is read without ordering against
+  /// the queue itself, so a concurrent enqueue or dequeue may not be reflected
+  /// yet.  Dispatch only needs to be right on average.
+  [[nodiscard]] std::size_t queued_bytes() const noexcept
+  {
+    return _queued_bytes.load(std::memory_order_relaxed);
+  }
 
   /// Synchronous buffered host read (blocking ranged GET).  Blocks the caller.
   size_t host_read(const io_object_type& file, size_t offset, size_t size, uint8_t* dst);
@@ -476,6 +491,10 @@ class rest_reactor {
 
   std::stop_source _stop_source;
   duckdb_moodycamel::BlockingConcurrentQueue<std::unique_ptr<rest_chunked_rx_request>> _requests;
+
+  // Byte depth of _requests: added by the enqueuing thread, subtracted by the
+  // worker as it dequeues.  See queued_bytes().
+  std::atomic<std::size_t> _queued_bytes{0};
 
   // Instrumentation counters, owned by the reactor (not worker_loop locals) so
   // rest_ioctx can read them cross-thread.  Micro timings are stamped only under

@@ -211,36 +211,36 @@ TEST_CASE("producer_stage wait_for_prepared is released by mark_abandoned", "[st
   CHECK(stage->get() == producer_stage::abandoned);
 }
 
-TEST_CASE("producer_stage wait_for_ready is released by mark_ready", "[stage]")
+TEST_CASE("producer_stage wait_till_not_loading is released by mark_ready", "[stage]")
 {
   auto stage = std::make_shared<producer_stage>();
   advance_to(*stage, producer_stage::loading);
 
-  bool const reached = wait_is_released_by([stage] { return stage->wait_for_ready(); },
+  bool const reached = wait_is_released_by([stage] { return stage->wait_till_not_loading(); },
                                            [stage] { CHECK(stage->mark_ready()); });
 
   CHECK(reached);
   CHECK(stage->get() == producer_stage::ready);
 }
 
-TEST_CASE("producer_stage wait_for_ready is released by mark_load_failed", "[stage]")
+TEST_CASE("producer_stage wait_till_not_loading is released by mark_load_failed", "[stage]")
 {
   auto stage = std::make_shared<producer_stage>();
   advance_to(*stage, producer_stage::loading);
 
-  bool const reached = wait_is_released_by([stage] { return stage->wait_for_ready(); },
+  bool const reached = wait_is_released_by([stage] { return stage->wait_till_not_loading(); },
                                            [stage] { CHECK(stage->mark_load_failed()); });
 
   CHECK_FALSE(reached);
   CHECK(stage->get() == producer_stage::prepared);
 }
 
-TEST_CASE("producer_stage wait_for_ready is released by mark_abandoned", "[stage]")
+TEST_CASE("producer_stage wait_till_not_loading is released by mark_abandoned", "[stage]")
 {
   auto stage = std::make_shared<producer_stage>();
   advance_to(*stage, producer_stage::loading);
 
-  bool const reached = wait_is_released_by([stage] { return stage->wait_for_ready(); },
+  bool const reached = wait_is_released_by([stage] { return stage->wait_till_not_loading(); },
                                            [stage] { stage->mark_abandoned(); });
 
   CHECK_FALSE(reached);
@@ -257,13 +257,16 @@ TEST_CASE("producer_stage waits return immediately when the state already moved 
   producer_stage ready;
   advance_to(ready, producer_stage::ready);
   CHECK(ready.wait_for_prepared());
-  CHECK(ready.wait_for_ready());
+  // wait_till_not_loading reports on a load it witnessed finish; a request already
+  // past `loading` has nothing to wait out, so it declines rather than
+  // claiming credit for a load this call never saw.
+  CHECK_FALSE(ready.wait_till_not_loading());
   CHECK(ready.get() == producer_stage::ready);
 
   producer_stage abandoned;
   advance_to(abandoned, producer_stage::abandoned);
   CHECK_FALSE(abandoned.wait_for_prepared());
-  CHECK_FALSE(abandoned.wait_for_ready());
+  CHECK_FALSE(abandoned.wait_till_not_loading());
 }
 
 TEST_CASE("consumer_stage walks the full legal path", "[stage]")
@@ -384,6 +387,43 @@ TEST_CASE("prefetch_request predicates hold when stages are skipped", "[stage][c
   consumer->mark_disposed();
   CHECK_FALSE(req.is_active());
   CHECK(req.is_cancelled());
+}
+
+TEST_CASE("has_fallen_behind turns a prefetch away once the reader passed it", "[stage][cache]")
+{
+  auto obj      = std::make_shared<fake_io_object>();
+  auto consumer = std::make_shared<consumer_stage>();
+  auto req      = make_request(obj, consumer);
+
+  // Consumer still behind the readahead: the prefetch is worth starting.
+  CHECK_FALSE(req.has_fallen_behind());
+  REQUIRE(consumer->mark_queued());
+  CHECK_FALSE(req.has_fallen_behind());
+
+  // The executor reached `preparing` before any IO was issued -- it is pulling
+  // the bytes itself now, so starting a prefetch would duplicate that read.
+  REQUIRE(consumer->mark_preparing());
+  CHECK(req.has_fallen_behind());
+
+  // Once the IO is in flight there is nothing left to call off, so the answer
+  // flips back regardless of how far the consumer has run ahead.
+  REQUIRE(req.producer->mark_loading());
+  CHECK_FALSE(req.has_fallen_behind());
+  REQUIRE(consumer->mark_reading());
+  CHECK_FALSE(req.has_fallen_behind());
+
+  // ...and disposal is is_cancelled's question from here on, not this one.
+  consumer->mark_disposed();
+  CHECK_FALSE(req.has_fallen_behind());
+  CHECK(req.is_cancelled());
+}
+
+TEST_CASE("a prefetch_request with no consumer has nothing to run ahead of", "[stage][cache]")
+{
+  auto obj = std::make_shared<fake_io_object>();
+  auto req = make_request(obj, nullptr);
+
+  CHECK(req.has_fallen_behind());
 }
 
 TEST_CASE("prefetch_request without a consumer is cancelled", "[stage][cache]")

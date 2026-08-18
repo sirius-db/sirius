@@ -97,35 +97,32 @@ std::string rest_ioctx::perf_report_and_reset() noexcept
       return count == 0 ? 0.0 : static_cast<double>(ns_total) / static_cast<double>(count) / 1e6;
     };
     double const mib      = static_cast<double>(s.payload_bytes_read_total) / (1024.0 * 1024.0);
-    double const mean_inf = s.inflight_samples == 0
-                              ? 0.0
-                              : static_cast<double>(s.inflight_sum) /
-                                  static_cast<double>(s.inflight_samples);
+    double const mean_inf = s.inflight_samples == 0 ? 0.0
+                                                    : static_cast<double>(s.inflight_sum) /
+                                                        static_cast<double>(s.inflight_samples);
     // The two submit()-exit reasons are the saturation verdict: slot-starved
     // means we filled every connection and are waiting on S3; work-starved
     // means we had spare connections and nothing to put on them.
     std::uint64_t const starve_total = s.submit_slot_starved_total + s.submit_work_starved_total;
-    double const slot_starved_pct =
-      starve_total == 0
-        ? 0.0
-        : 100.0 * static_cast<double>(s.submit_slot_starved_total) /
-            static_cast<double>(starve_total);
+    double const slot_starved_pct    = starve_total == 0
+                                         ? 0.0
+                                         : 100.0 * static_cast<double>(s.submit_slot_starved_total) /
+                                          static_cast<double>(starve_total);
 
     std::string out = "=== rest perf (query) ===\n";
-    out += std::format("  payload            : {:.1f} MiB in {} GETs ({:.2f} MiB/GET)\n",
-                       mib,
-                       s.submit_added_total,
-                       s.submit_added_total == 0
-                         ? 0.0
-                         : mib / static_cast<double>(s.submit_added_total));
-    out += std::format("  concurrency        : mean {:.1f} / max {} in-flight GETs\n",
-                       mean_inf,
-                       s.inflight_max);
+    out += std::format(
+      "  payload            : {:.1f} MiB in {} GETs ({:.2f} MiB/GET)\n",
+      mib,
+      s.submit_added_total,
+      s.submit_added_total == 0 ? 0.0 : mib / static_cast<double>(s.submit_added_total));
+    out += std::format(
+      "  concurrency        : mean {:.1f} / max {} in-flight GETs\n", mean_inf, s.inflight_max);
     if (s.loop_wall_ns_total != 0) {
-      out += std::format("  reactor duty cycle : {:.1f}% of reactor wall time had nothing on the "
-                         "wire\n",
-                         100.0 * static_cast<double>(s.loop_idle_ns_total) /
-                           static_cast<double>(s.loop_wall_ns_total));
+      out += std::format(
+        "  reactor duty cycle : {:.1f}% of reactor wall time had nothing on the "
+        "wire\n",
+        100.0 * static_cast<double>(s.loop_idle_ns_total) /
+          static_cast<double>(s.loop_wall_ns_total));
     }
     out += std::format("  submit stalls      : slot-starved {} ({:.1f}%), work-starved {}\n",
                        s.submit_slot_starved_total,
@@ -259,6 +256,16 @@ std::size_t rest_ioctx::list_max_matches() const
                            : _reactors.front()->get_config().list_max_matches;
 }
 
+namespace {
+
+/// How many reactors one request is spread across.  Two, because a single
+/// reactor's queue is a serialization point for the dispatching thread while two
+/// already give the pool somewhere to shed load, and every reactor beyond that
+/// adds a wakeup and a queue to drain for no extra link utilization.
+constexpr std::size_t kDispatchFanout = 2;
+
+}  // namespace
+
 std::vector<rest_reactor*> rest_ioctx::next_reactor(const io_object_type& /*obj*/,
                                                     std::size_t /*n_chunks*/,
                                                     io_op_type /*type*/,
@@ -273,9 +280,24 @@ std::vector<rest_reactor*> rest_ioctx::next_reactor(const io_object_type& /*obj*
   std::size_t const start = _next.fetch_add(1, std::memory_order_relaxed) % n;
 
   std::vector<rest_reactor*> out;
-  out.reserve(n);
+  out.reserve(std::min(n, kDispatchFanout));
+  if (n <= kDispatchFanout) {
+    for (std::size_t k = 0; k < n; ++k) {
+      out.push_back(_reactors[(start + k) % n].get());
+    }
+    return out;
+  }
+
+  std::vector<std::pair<std::size_t, std::size_t>> ranked;  // (depth, rotation distance)
+  ranked.reserve(n);
   for (std::size_t k = 0; k < n; ++k) {
-    out.push_back(_reactors[(start + k) % n].get());
+    std::size_t const idx = (start + k) % n;
+    ranked.emplace_back(_reactors[idx]->queued_bytes(), k);
+  }
+  std::partial_sort(
+    ranked.begin(), ranked.begin() + static_cast<long>(kDispatchFanout), ranked.end());
+  for (std::size_t k = 0; k < kDispatchFanout; ++k) {
+    out.push_back(_reactors[(start + ranked[k].second) % n].get());
   }
   return out;
 }

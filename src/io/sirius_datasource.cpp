@@ -236,53 +236,8 @@ void sirius_datasource::update(cache::scan_stage site)
   _prefetch_handle.update(site);
 }
 
-void sirius_datasource::record_prefetch_outcome_once() noexcept
-{
-  if (_census_recorded) { return; }
-  _census_recorded = true;
-
-  auto& census = prefetch_census::instance();
-  // Reads that start with nothing of their own prefetched, while prefetches for
-  // other splits are in flight, queue behind those in the backend's single
-  // request queue -- the ordering failure worth counting.
-  auto const others_in_flight = census.inflight_prefetches.load(std::memory_order_relaxed) > 0;
-  if (!_prefetch_handle) {
-    census.read_no_handle.fetch_add(1, std::memory_order_relaxed);
-    if (others_in_flight) {
-      census.read_cold_while_prefetching.fetch_add(1, std::memory_order_relaxed);
-    }
-    return;
-  }
-  switch (_prefetch_handle.producer_state()) {
-    // The prefetch landed before anybody asked for the bytes -- the case the
-    // readahead exists to produce.
-    case cache::producer_stage::ready: census.read_ready.fetch_add(1); break;
-    // Half-covered: the IO is running but not done, so this read pays for it.
-    case cache::producer_stage::loading: census.read_waited.fetch_add(1); break;
-    // Submitted, but the bytes are not moving yet: the request is parked waiting
-    // for an admission slot behind prefetches for other splits.  The readahead
-    // DID pick this scan in time; the queue is what did not get to it.
-    case cache::producer_stage::queued:
-    case cache::producer_stage::preparing:
-    case cache::producer_stage::prepared:
-      census.read_queued_behind.fetch_add(1);
-      if (others_in_flight) {
-        census.read_cold_while_prefetching.fetch_add(1, std::memory_order_relaxed);
-      }
-      break;
-    // The worker never got to this scan before its reader did.
-    default:
-      census.read_not_started.fetch_add(1);
-      if (others_in_flight) {
-        census.read_cold_while_prefetching.fetch_add(1, std::memory_order_relaxed);
-      }
-      break;
-  }
-}
-
 void sirius_datasource::await_inflight_prefetch() noexcept
 {
-  record_prefetch_outcome_once();
   if (!_prefetch_handle || !_prefetch_handle.is_prefetch_in_flight()) { return; }
   CTRACK_NAME("ds::await_inflight_prefetch(blocked)");
   // The readahead already has this split's IO in flight.  Reading now would
@@ -308,12 +263,6 @@ bool sirius_datasource::prefetch_async(exec::invocable<void(bool) noexcept> on_d
     return false;
   }
   return _io_ctx->cache()->prefetch(_prefetch_handle, std::move(on_done));
-}
-
-bool sirius_datasource::wait_prefetch_prepared() noexcept
-{
-  if (!_prefetch_handle) { return false; }
-  return _prefetch_handle.wait_until_prepared();
 }
 
 bool sirius_datasource::uses_prefetching_cache() const noexcept

@@ -14,10 +14,13 @@
  * limitations under the License.
  */
 
+#include "io/cache/types.hpp"
 #include "op/scan/owning_table_view.hpp"
 
 #include <io/sirius_datasource.hpp>
 
+#include <atomic>
+#include <cstddef>
 #include <memory>
 #include <span>
 #include <utility>
@@ -98,6 +101,76 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     return _datasources;
   }
 
+  // ---- readahead -----------------------------------------------------------
+
+  /// Whether anybody managed to read this split ahead of demand.  Producer-side
+  /// and deliberately separate from @c io::cache::scan_stage, which tracks the
+  /// consumer's progress: the two advance independently.
+  enum class prefetch_state : int {
+    idle       = 0,  ///< no prefetch has been attempted
+    attempted  = 1,  ///< @ref prefetch ran but every datasource refused
+    prefetched = 2,  ///< at least one datasource started IO
+  };
+
+  /// Read without a lock -- the readahead worker writes this while the executor
+  /// may be reading it.
+  [[nodiscard]] prefetch_state get_prefetch_state() const noexcept
+  {
+    return _prefetch_state.load(std::memory_order_acquire);
+  }
+
+  /// How one @ref prefetch call resolved, once every datasource has settled.
+  /// A backend refusing the request is not an error -- it is busy -- but it is
+  /// worth counting, because a refusal while work is queued means capacity went
+  /// unused.
+  struct prefetch_outcome {
+    std::size_t issued{0};    ///< datasources that started IO
+    std::size_t declined{0};  ///< datasources that refused the request
+    bool ok{true};            ///< every datasource that started IO completed it
+  };
+
+  /// Issue prefetch IO for every datasource this split reads.  Reports through
+  /// @p on_done exactly once, when the last datasource has settled -- there is
+  /// no return value, because the answer is not known when this returns.
+  ///
+  /// The report is what frees the split's readahead slot, so it must reach the
+  /// readahead rather than be waited on here: the caller is the worker thread
+  /// that would otherwise be collecting the next batch.  A split with no
+  /// datasources reports inline.
+  ///
+  /// @p on_done may run on this thread (a datasource can complete inline) or on
+  /// an IO completion thread, so it must be safe on either and must not block.
+  void prefetch(sirius::exec::invocable<void(prefetch_outcome) noexcept> on_done)
+  {
+    if (_datasources.empty()) {
+      // Nothing to read ahead of: an attempt that could never have issued.
+      _prefetch_state.store(prefetch_state::attempted, std::memory_order_release);
+      on_done(prefetch_outcome{});
+      return;
+    }
+
+    // The +1 is a guard held across the loop: prefetch_async may invoke its
+    // completion inline, so without it the countdown could reach zero -- and
+    // report an outcome still missing its later datasources -- before every one
+    // had even been asked.
+    auto pending =
+      std::make_shared<prefetch_completion>(_datasources.size() + 1, std::move(on_done));
+    std::size_t issued = 0;
+    for (auto const& ds : _datasources) {
+      if (ds->prefetch_async([pending](bool ok) noexcept { pending->arrive(ok); })) {
+        ++issued;
+        pending->issued.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        pending->declined.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+    // Published before the guard drops, so anybody woken by the completion
+    // already sees which of the two outcomes this was.
+    _prefetch_state.store(issued > 0 ? prefetch_state::prefetched : prefetch_state::attempted,
+                          std::memory_order_release);
+    pending->release_guard();
+  }
+
   /**
    * @brief Estimated decoded bytes for projected data columns before row filtering.
    *
@@ -122,8 +195,43 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
   }
 
  private:
+  /// Fan-in for @ref prefetch: counts the per-datasource completions down to a
+  /// single report.  Shared by every callback, so it outlives the call that
+  /// created it.
+  struct prefetch_completion {
+    prefetch_completion(std::size_t n, sirius::exec::invocable<void(prefetch_outcome) noexcept> f)
+      : remaining(n), on_done(std::move(f))
+    {
+    }
+
+    void arrive(bool success) noexcept
+    {
+      if (!success) { ok.store(false, std::memory_order_relaxed); }
+      settle();
+    }
+
+    /// Drops the caller's guard once every datasource has been asked.
+    void release_guard() noexcept { settle(); }
+
+    std::atomic<std::size_t> remaining;
+    std::atomic<std::size_t> issued{0};
+    std::atomic<std::size_t> declined{0};
+    std::atomic<bool> ok{true};
+    sirius::exec::invocable<void(prefetch_outcome) noexcept> on_done;
+
+   private:
+    void settle() noexcept
+    {
+      if (remaining.fetch_sub(1, std::memory_order_acq_rel) != 1) { return; }
+      on_done(prefetch_outcome{.issued   = issued.load(std::memory_order_relaxed),
+                               .declined = declined.load(std::memory_order_relaxed),
+                               .ok       = ok.load(std::memory_order_relaxed)});
+    }
+  };
+
   std::vector<fadvise_entry> _hints;
   std::vector<std::shared_ptr<sirius::io::sirius_datasource>> _datasources;
+  std::atomic<prefetch_state> _prefetch_state{prefetch_state::idle};
 };
 
 //===----------------------------------------------------------------------===//

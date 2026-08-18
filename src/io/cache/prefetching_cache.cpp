@@ -26,12 +26,12 @@
 #include "memory/topology_index.hpp"
 #include "util/error_utils.hpp"
 
-#include <ctrack.hpp>
-
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cuda_runtime.h>
+
+#include <ctrack.hpp>
 
 #include <algorithm>
 #include <cassert>
@@ -39,6 +39,7 @@
 #include <cstddef>
 #include <exception>
 #include <format>
+#include <latch>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -100,7 +101,7 @@ bool prefetching_handle::has_started_reading() const noexcept
 bool prefetching_handle::wait_until_ready() noexcept
 {
   if (!_req.producer) { return false; }
-  return _req.producer->wait_for_ready();
+  return _req.producer->wait_till_not_loading();
 }
 
 bool prefetching_handle::wait_until_prepared() noexcept
@@ -202,8 +203,7 @@ prefetching_cache::prefetching_cache(
       reservation_manager, cfg.min_prefetching_budget_fraction, cfg.eviction_threshold_fraction)),
     _io_ctx(io_ctx),
     _topology_index(std::move(topology_index)),
-    _armed(_io_ctx->can_use_prefetching_cache()),
-    _rate_limiter(_cfg.inflight_io_chunk_budget)
+    _armed(_io_ctx->can_use_prefetching_cache())
 {
   _preparation_thread = std::jthread([this](const std::stop_token& st) { prepare_loop(st); },
                                      _preparation_stop_source.get_token());
@@ -222,13 +222,26 @@ prefetching_cache::prefetching_cache(
   }
 }
 
+void prefetching_cache::drain_inflight_io() noexcept
+{
+  std::latch drained{1};
+  // Armed before close(), so both orderings land exactly once: with no IO
+  // outstanding the callback runs inline on close(), otherwise the last slot to
+  // drop fires it from its IO thread.
+  auto subscription = _inflight_io.on_completion([&drained] { drained.count_down(); });
+  _inflight_io.close();
+  drained.wait();
+}
+
 prefetching_cache::~prefetching_cache()
 {
   _shutting_down.store(true, std::memory_order_release);
   _preparation_stop_source.request_stop();
   _evictor_stop_source.request_stop();
 
-  _rate_limiter.wait_for_all();
+  // The IO completions write into file entries this object owns, so they have
+  // to have run before any of it is torn down.
+  drain_inflight_io();
   _preparation_thread.join();
   _evictor_thread.join();
 
@@ -480,53 +493,53 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const io_obj
     {
       CTRACK_NAME("cache::dra::classify");
       for (size_t off = first_chunk_off; off <= last_chunk_off; off += chunk_bytes) {
-      while (ci < chunks.size() && chunks[ci]->offset < off) {
-        ++ci;
-      }
-      cached_chunk* c = (ci < chunks.size() && chunks[ci]->offset == off) ? chunks[ci] : nullptr;
+        while (ci < chunks.size() && chunks[ci]->offset < off) {
+          ++ci;
+        }
+        cached_chunk* c = (ci < chunks.size() && chunks[ci]->offset == off) ? chunks[ci] : nullptr;
 
-      // The portion of this chunk the request actually needs, clamped to both
-      // the request and the chunk.  Shared by the hit gate and the load span.
-      size_t const need_lo = std::max(off, offset);
-      size_t const need_hi = std::min(off + chunk_bytes, offset + size);
+        // The portion of this chunk the request actually needs, clamped to both
+        // the request and the chunk.  Shared by the hit gate and the load span.
+        size_t const need_lo = std::max(off, offset);
+        size_t const need_hi = std::min(off + chunk_bytes, offset + size);
 
-      // (1) Already populated over the bytes we need: pin it and copy.  The
-      // coverage test rides along in the pinning CAS, so a chunk that is
-      // resident but not populated far enough costs one load, not a pin/unpin.
-      if (c != nullptr && c->state.try_pin_covering(off, chunk_bytes, need_lo, need_hi)) {
-        cached_chunks.push_back(c);
-        hits++;
-        continue;
-      }
+        // (1) Already populated over the bytes we need: pin it and copy.  The
+        // coverage test rides along in the pinning CAS, so a chunk that is
+        // resident but not populated far enough costs one load, not a pin/unpin.
+        if (c != nullptr && c->state.try_pin_covering(off, chunk_bytes, need_lo, need_hi)) {
+          cached_chunks.push_back(c);
+          hits++;
+          continue;
+        }
 
-      if (!cache_while_reading_enabled) {
-        every_chunk_is_cached = false;
-        break;  // (3) miss, but we can't do H2D IO, so fall back to direct device read
-      }
+        if (!cache_while_reading_enabled) {
+          every_chunk_is_cached = false;
+          break;  // (3) miss, but we can't do H2D IO, so fall back to direct device read
+        }
 
-      // (2) Claim the chunk and stage the read through its own buffer.  The
-      // extent comes back out of the claiming CAS already widened by whatever a
-      // queued prefetch asked for, and the IO span is derived FROM that extent —
-      // so the bytes read are exactly the bytes the chunk will later advertise.
-      // Only the needed edge is read, so a chunk touched at its head or tail no
-      // longer costs a whole chunk of IO to cache.
-      chunk_fill fill;
-      if (c != nullptr &&
-          c->state.take_loading_merging(needed_fill(off, chunk_bytes, need_lo, need_hi), fill)) {
-        assert(c->data != nullptr);
-        auto const [seg_lo, seg_hi] = fill_span(fill, off, chunk_bytes);
-        io_chunks.push_back(c);  // host-to-device load into the cache buffer
-        io_segments.emplace_back(seg_lo, seg_hi - seg_lo, c->data + (seg_lo - off));
-        h2d++;
-        continue;
-      }
+        // (2) Claim the chunk and stage the read through its own buffer.  The
+        // extent comes back out of the claiming CAS already widened by whatever a
+        // queued prefetch asked for, and the IO span is derived FROM that extent —
+        // so the bytes read are exactly the bytes the chunk will later advertise.
+        // Only the needed edge is read, so a chunk touched at its head or tail no
+        // longer costs a whole chunk of IO to cache.
+        chunk_fill fill;
+        if (c != nullptr &&
+            c->state.take_loading_merging(needed_fill(off, chunk_bytes, need_lo, need_hi), fill)) {
+          assert(c->data != nullptr);
+          auto const [seg_lo, seg_hi] = fill_span(fill, off, chunk_bytes);
+          io_chunks.push_back(c);  // host-to-device load into the cache buffer
+          io_segments.emplace_back(seg_lo, seg_hi - seg_lo, c->data + (seg_lo - off));
+          h2d++;
+          continue;
+        }
 
-      // (3) busy or missing chunk: read just the needed, block-aligned span via
-      // an internal bounce slot (null host buffer); do not touch the cache.
-      size_t const seg_lo = align_down(need_lo, io::IO_BLOCK_SIZE);
-      size_t const seg_hi = std::min(off + chunk_bytes, align_up(need_hi, io::IO_BLOCK_SIZE));
-      io_segments.emplace_back(seg_lo, seg_hi - seg_lo, nullptr);
-      misses++;
+        // (3) busy or missing chunk: read just the needed, block-aligned span via
+        // an internal bounce slot (null host buffer); do not touch the cache.
+        size_t const seg_lo = align_down(need_lo, io::IO_BLOCK_SIZE);
+        size_t const seg_hi = std::min(off + chunk_bytes, align_up(need_hi, io::IO_BLOCK_SIZE));
+        io_segments.emplace_back(seg_lo, seg_hi - seg_lo, nullptr);
+        misses++;
       }
     }
 
@@ -980,7 +993,7 @@ void prefetching_cache::prepare_loop(const std::stop_token& st)
     _preparation_queue.wait_dequeue(req);
     if (!req) { continue; }  // spurious wakeup or shutdown
 
-    if (req.is_cancelled() || !req.chunks) {
+    if (req.has_fallen_behind() || !req.chunks) {
       req.producer->mark_abandoned();
       // Still route it to the evictor: insert() already counted this request as
       // a subscriber of every chunk it named, and only the evictor hands that
@@ -1067,7 +1080,7 @@ bool prefetching_cache::prefetch(prefetching_handle& handle,
     return false;
   };
 
-  if (!req || req.is_cancelled() || !req.chunks) { return settle(false); }
+  if (!req || req.has_fallen_behind() || !req.chunks) { return settle(false); }
   if (!_io_ctx->supports_vector_host_read()) { return settle(false); }
   // Read the stage before mark_loading advances it: a request that has not
   // reached `prepared` has no buffers attached yet, so the claim loop below
@@ -1102,13 +1115,6 @@ bool prefetching_cache::prefetch(prefetching_handle& handle,
     return settle(true);
   }
   prefetch_census::instance().prefetch_issued.fetch_add(1, std::memory_order_relaxed);
-  prefetch_census::instance().inflight_prefetches.fetch_add(1, std::memory_order_relaxed);
-
-  exec::admission_control::slot token;
-  {
-    CTRACK_NAME("cache::prefetch::rate_limit_wait");
-    token = _rate_limiter.acquire(1);
-  }
 
   if (req.is_cancelled()) {
     std::ranges::for_each(claimed_chunks,
@@ -1116,6 +1122,12 @@ bool prefetching_cache::prefetch(prefetching_handle& handle,
     std::ignore = req.producer->mark_load_failed();
     return settle(false);
   }
+
+  prefetch_census::instance().inflight_prefetches.fetch_add(1, std::memory_order_relaxed);
+  // Taken only once the IO is certain to be submitted, so every slot has a
+  // completion that will drop it.  Never blocks -- it only makes the teardown
+  // drain wait for this IO.
+  auto token = _inflight_io.acquire();
 
   _io_ctx->host_read_ranges_async_io(*req.obj, segments)
     .via(&_io_cb_dispatcher)

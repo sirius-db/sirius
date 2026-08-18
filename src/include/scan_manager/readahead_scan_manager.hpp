@@ -54,7 +54,7 @@ namespace sirius::scan_manager {
 /// inherits @c enable_shared_from_this so an in-flight prefetch completion can
 /// find the manager again without keeping it alive.
 class readahead_scan_manager : public std::enable_shared_from_this<readahead_scan_manager>,
-                               public exec::query_stage_manager {
+                               public exec::query_stage_listener {
  public:
   readahead_scan_manager() = default;
   /// Stops and joins the worker.
@@ -90,9 +90,9 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
 
   /// Report that @p task, emitted under @p operator_id, reached @p stage.
   /// Wakes the worker so a freed slot is refilled.
-  void update(std::size_t operator_id,
-              const op::scan::scan_info* task,
-              io::cache::scan_stage stage);
+  void update_scan_state(std::size_t operator_id,
+                         const op::scan::scan_info* task,
+                         io::cache::scan_stage stage);
 
   /// Report that @p operator_id's producer has finished: every split it will
   /// ever emit has been registered.  Until this arrives the operator cannot be
@@ -194,7 +194,7 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
 
   /// Waits for a scan to report progress, then tops the in-flight scan set back
   /// up from the scheduler.  Sleeps rather than polls: the only thing that can
-  /// change what should be prefetched next is an @ref update, so the loop is
+  /// change what should be prefetched next is an @ref update_scan_state, so the loop is
   /// driven by those instead of a timer.
   void worker_loop(const std::stop_token& st);
 
@@ -206,7 +206,7 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
 
   /// Scan tasks the worker tries to keep in flight; 0 means "backend opted out".
   std::size_t _budget{0};
-  /// Set by @ref update, cleared by the worker.  A flag rather than a counter:
+  /// Set by @ref update_scan_state, cleared by the worker.  A flag rather than a counter:
   /// several updates arriving while the worker is busy collapse into one pass,
   /// which is what we want — the pass reads the current cursor, not a backlog.
   bool _wake{false};

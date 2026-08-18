@@ -2197,8 +2197,7 @@ TEST_CASE("rest_ioctx fans out host_read_ranges against the MinIO medium fixture
   scan_manager_fixture fixture;
   auto cfg                 = make_minio_rest_config();
   cfg.rest.max_connections = 4;
-  cfg.rest.chunk_size      = 1UL << 20;
-  cfg.rest.max_n_chunks    = 1;
+  cfg.rest.merge_max_gap   = 0;  // one GET per range: no bridging across the gaps
   sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
   auto datasource = manager.create_datasource("s3://" + bucket + "/medium.bin");
   require_rest_ioctx(datasource);
@@ -2249,7 +2248,6 @@ TEST_CASE("rest_ioctx stages device reads through FSMR for single and multi chun
   scan_manager_fixture fixture;
   auto cfg                 = make_minio_rest_config();
   cfg.rest.max_connections = 4;
-  cfg.rest.chunk_size      = 1UL << 20;
   sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
 
   SECTION("single chunk")
@@ -2333,8 +2331,7 @@ TEST_CASE("rest_ioctx honors max_connections under concurrent fake range reads",
   scan_manager_fixture fixture;
   auto cfg                 = make_fake_rest_config(server.endpoint());
   cfg.rest.max_connections = 2;
-  cfg.rest.chunk_size      = 1024;
-  cfg.rest.max_n_chunks    = 1;
+  cfg.rest.merge_max_gap   = 0;  // keep the 8 segments as 8 separate GETs
   sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
 
   auto datasource = manager.create_datasource("s3://concurrency-bucket/object.bin");
@@ -2379,8 +2376,7 @@ TEST_CASE("rest_ioctx spreads one batched range read across the reactor pool",
   auto cfg                 = make_fake_rest_config(server.endpoint());
   cfg.rest_n_reactors      = 4;
   cfg.rest.max_connections = 1;
-  cfg.rest.chunk_size      = 1024;
-  cfg.rest.max_n_chunks    = 1;
+  cfg.rest.merge_max_gap   = 0;  // keep the 8 segments as 8 separate GETs
   sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
 
   auto datasource = manager.create_datasource("s3://fanout-bucket/object.bin");

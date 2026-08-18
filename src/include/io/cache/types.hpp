@@ -53,6 +53,12 @@ namespace sirius::io::cache {
  * - @c preparing: the IO for the ranges is being prepared.
  * - @c reading: the consumer is reading the ranges.
  * - @c disposed: the scan is cancelled or finished; its work can be dropped.
+ *
+ * Consumer-side only, and the order is load-bearing: callers ask questions like
+ * `stage >= reading` (is the executor pulling these bytes itself?) and
+ * `stage == disposed` (is this split finished?).  Read-ahead is not a stage
+ * here -- it is producer-side work that runs alongside this progression, and
+ * @c scan_info::prefetch_state tracks it separately.
  */
 enum class scan_stage { none, initialized, queued, preparing, reading, disposed };
 
@@ -633,8 +639,8 @@ static_assert(sizeof(chunk_state) == 8, "chunk_state must stay a single 64-bit w
 //   loading     ──mark_load_failed()──► prepared        (IO failure revert)
 //
 // `preparing` and `loading` are the two wait points: waiters park in
-// wait_for_prepared() / wait_for_ready() until the state moves on, and each
-// reports whether its target was actually reached.  `abandoned` is terminal and
+// wait_for_prepared() / wait_till_not_loading() until the state moves on, and
+// each reports whether its target was actually reached.  `abandoned` is terminal and
 // exists so that every path which drops a request can leave the producer in a
 // non-transient, notified state instead of stranding waiters.
 
@@ -671,13 +677,13 @@ class producer_stage {
   /// → loading.  Returns false if the state is already at or past @c loading.
   [[nodiscard]] bool mark_loading() noexcept { return advance(loading); }
 
-  /// → ready.  Wakes threads parked in @c wait_for_ready().  Returns false if
-  /// the state is already at or past @c ready.
+  /// → ready.  Wakes threads parked in @c wait_till_not_loading().  Returns
+  /// false if the state is already at or past @c ready.
   [[nodiscard]] bool mark_ready() noexcept { return advance_and_notify(ready); }
 
   /// loading → prepared (IO-failure revert).  The only backward transition, so
   /// it keeps an exact precondition CAS and returns false from any other state.
-  /// Wakes threads parked in @c wait_for_ready().
+  /// Wakes threads parked in @c wait_till_not_loading().
   [[nodiscard]] bool mark_load_failed() noexcept
   {
     auto expected = static_cast<uint32_t>(loading);
@@ -688,7 +694,7 @@ class producer_stage {
   }
 
   /// any → abandoned (the request was dropped).  Always succeeds and always
-  /// wakes threads parked in @c wait_for_prepared() / @c wait_for_ready().
+  /// wakes threads parked in @c wait_for_prepared() / @c wait_till_not_loading().
   void mark_abandoned() noexcept
   {
     _packed.exchange(static_cast<uint32_t>(abandoned), std::memory_order_acq_rel);
@@ -717,9 +723,24 @@ class producer_stage {
     return static_cast<value>(cur) != abandoned;
   }
 
-  /// Block while the state is @c loading.  Returns true iff the load succeeded
-  /// (@c ready), false if it failed back to @c prepared or was abandoned.
-  [[nodiscard]] bool wait_for_ready() noexcept { return wait_while(loading) == ready; }
+  /// Block until the state stops being @c loading.
+  ///
+  /// The wait is over the loading window, not over readiness: a load is not a
+  /// promise of success.  It can settle at @c ready, revert to @c prepared when
+  /// the IO fails, or be cut short by @c abandoned -- so the caller is told
+  /// which of those happened rather than just "done".
+  ///
+  /// @return true iff the load this call waited out reached @c ready.
+  ///
+  /// Only a load actually in flight is worth blocking on, so any other state
+  /// returns false immediately rather than parking.  That includes @c ready:
+  /// this reports on a load it witnessed finish, and a request already past
+  /// @c loading has nothing left for the caller to wait out.
+  [[nodiscard]] bool wait_till_not_loading() noexcept
+  {
+    if (get() != loading) { return false; }
+    return wait_while(loading) == ready;
+  }
 
  private:
   bool advance(value to) noexcept
@@ -860,9 +881,9 @@ struct cached_chunk {
   cached_chunk() noexcept = default;
   explicit cached_chunk(std::size_t off) noexcept : offset(off) {}
 
+  chunk_state state;
   std::size_t offset{0};
   std::uint8_t* data{nullptr};
-  chunk_state state;
   std::int32_t numa_node{-1};
 };
 

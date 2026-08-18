@@ -447,7 +447,6 @@ int main(int argc, char** argv)
   sirius::io::cache::config cache_cfg;
   cache_cfg.min_prefetching_budget_fraction = 0.9;
   cache_cfg.eviction_threshold_fraction     = 0.9;
-  cache_cfg.inflight_io_chunk_budget        = 100000;
   cache_cfg.dispose_on_idle                 = false;
 
   std::cout << "dir           : " << dir << "\n"

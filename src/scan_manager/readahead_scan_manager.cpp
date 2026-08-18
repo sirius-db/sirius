@@ -225,9 +225,9 @@ void readahead_scan_manager::mark_operator_closed(std::size_t operator_id)
   _cv.notify_one();
 }
 
-void readahead_scan_manager::update(std::size_t operator_id,
-                                    const op::scan::scan_info* task,
-                                    io::cache::scan_stage stage)
+void readahead_scan_manager::update_scan_state(std::size_t operator_id,
+                                               const op::scan::scan_info* task,
+                                               io::cache::scan_stage stage)
 {
   {
     std::lock_guard lock{_mutex};
@@ -420,33 +420,27 @@ void readahead_scan_manager::issue_prefetches(std::vector<pending_prefetch> batc
 {
   for (auto& p : batch) {
     io::prefetch_census::instance().note_issue(p.operator_id);
-    auto entries = p.task->fadvise_hints();
-    // One completion per datasource, but the split only frees its slot once all
-    // of them have landed -- so count them down and report once.
-    auto remaining  = std::make_shared<std::atomic<std::size_t>>(entries.size());
     auto const* key = p.task.get();
 
-    for (auto& hint : entries) {
-      if (!hint.datasource) {
-        if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
-          on_prefetch_complete(p.operator_id, key);
-        }
-        continue;
-      }
-      // weak_from_this, not shared: a completion firing after the query tore
-      // the manager down must not resurrect it.
-      bool const issued = hint.datasource->prefetch_async(
-        [weak = weak_from_this(), op_id = p.operator_id, key, remaining](bool) noexcept {
-          if (remaining->fetch_sub(1, std::memory_order_acq_rel) != 1) { return; }
-          if (auto self = weak.lock()) { self->on_prefetch_complete(op_id, key); }
-        });
+    // The split fans the request out over its own datasources and reports once
+    // they have all landed.  Nothing is waited on here: that single report is
+    // what frees the slot and wakes the worker to collect the next batch, so it
+    // has to come back as a callback rather than a return value.
+    //
+    // weak_from_this, not shared: a completion firing after the query tore the
+    // manager down must not resurrect it.
+    p.task->prefetch([weak = weak_from_this(), op_id = p.operator_id, key](
+                       op::scan::scan_info::prefetch_outcome out) noexcept {
+      auto self = weak.lock();
+      if (!self) { return; }
       // Refused while the manager still holds splits nobody has prefetched:
       // capacity went unused with work sitting right there.
-      if (!issued && has_unprefetched_work()) {
+      if (out.declined > 0 && self->has_unprefetched_work()) {
         io::prefetch_census::instance().prefetch_declined_with_work.fetch_add(
-          1, std::memory_order_relaxed);
+          out.declined, std::memory_order_relaxed);
       }
-    }
+      self->on_prefetch_complete(op_id, key);
+    });
   }
 }
 

@@ -21,7 +21,6 @@
 namespace sirius::io::cache {
 
 struct config {
-  size_t inflight_io_chunk_budget = 2048;
   double min_prefetching_budget_fraction{0.05};
   double eviction_threshold_fraction{0.8};
   bool dispose_on_idle = false;

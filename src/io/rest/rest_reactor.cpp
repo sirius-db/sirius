@@ -22,9 +22,9 @@
 #include "io/uri_parser.hpp"
 #include "log/logging.hpp"
 
-#include <ctrack.hpp>
 #include <rmm/cuda_device.hpp>
 
+#include <ctrack.hpp>
 #include <sys/epoll.h>
 #include <unistd.h>
 
@@ -38,6 +38,7 @@
 #include <cstring>
 #include <deque>
 #include <format>
+#include <limits>
 #include <optional>
 #include <random>
 #include <stdexcept>
@@ -79,16 +80,28 @@ size_t write_to_sink(char* ptr, size_t size, size_t nmemb, void* userdata)
   auto const* src  = reinterpret_cast<uint8_t const*>(ptr);
   // Scatter across the destination buffers in file order; a fused contiguous
   // GET spills from one buffer into the next as each fills.
+  //
+  // A null buffer inside a multi-buffer sink is a hole — the bytes bridging two
+  // fused segments — so its span is stepped over rather than stored, and counted
+  // in `written` because the read covered it.  A single-buffer sink is a
+  // different animal: null there means a bounce-staged device read whose slot
+  // submit() should already have bound (set_data), so a null that survives to
+  // here is a bug.  Stop rather than silently discard the body — the short read
+  // that follows fails the request instead of reporting success on bytes that
+  // went nowhere.
+  bool const holes_expected = sink->buffers.size() > 1;
   while (remaining > 0 && sink->active < sink->buffers.size()) {
     iovec& b = sink->buffers[sink->active];
-    if (b.iov_base == nullptr) { break; }
+    if (b.iov_base == nullptr && !holes_expected) { break; }
     if (sink->cursor >= b.iov_len) {
       ++sink->active;
       sink->cursor = 0;
       continue;
     }
     size_t const n = std::min(b.iov_len - sink->cursor, remaining);
-    std::memcpy(static_cast<uint8_t*>(b.iov_base) + sink->cursor, src, n);
+    if (b.iov_base != nullptr) {
+      std::memcpy(static_cast<uint8_t*>(b.iov_base) + sink->cursor, src, n);
+    }
     sink->cursor += n;
     sink->written += n;
     src += n;
@@ -376,73 +389,152 @@ std::chrono::milliseconds compute_backoff(std::size_t attempt,
   return base + jitter;
 }
 
-/// Group destination segments into ranged-GET chunks.  Fuses runs of
-/// file-adjacent segments into one contiguous scatter GET capped at
-/// @p chunk_size bytes and @p max_n_chunks buffers.  When @p allow_split is
-/// true, a single segment larger than @p chunk_size is also split into
-/// chunk_size single-buffer pieces (each a parallel GET) — used by the pure
-/// host paths; device staging passes false so each caller buffer stays one
-/// buffer (its H2D copy maps 1:1 to that allocation), an oversized one simply
-/// becoming a standalone single-buffer GET.  Input segments must be in file
-/// order; a null-buffer segment (bounce-staged device read) is kept as a
-/// standalone single-buffer output and never fused into a scatter group.  Each
-/// output segment's @c size is the contiguous file span its buffers cover.
-std::vector<io_object_segment> chunk_host_segments(std::span<const io_object_segment> segs,
-                                                   size_t chunk_size,
-                                                   size_t max_n_chunks,
-                                                   bool allow_split = true)
+/// Sentinel for a @c planned_buffer that belongs to no caller entry (a hole).
+constexpr size_t kNoTag = std::numeric_limits<size_t>::max();
+
+/// One destination buffer of a planned read: the absolute file offset its first
+/// byte carries, how many bytes it takes, where they land, and which caller-side
+/// entry it came from.
+///
+/// @c host is null for two unrelated reasons, told apart by @c hole.  A hole is
+/// a bridged gap — bytes the reactor fetches only to keep one GET contiguous and
+/// then drops on arrival — and only ever appears between two real buffers of a
+/// multi-buffer chunk.  A non-hole null is a bounce-staged read the reactor
+/// backs with one of its pinned slots at submit time, which is why such a buffer
+/// is never fused with anything: the slot is per chunk.
+struct planned_buffer {
+  size_t file_off{0};
+  size_t len{0};
+  uint8_t* host{nullptr};
+  size_t tag{kNoTag};
+  bool hole{false};
+};
+
+/// Cut one coalesced span into ranged-GET chunks and append them to @p out.
+///
+/// A span of S bytes becomes n = max(1, S / @p max_chunk_size) chunks — integer
+/// division, so @p max_chunk_size is the floor a chunk may not go below rather
+/// than a ceiling — with S balanced evenly across them (the first S % n chunks
+/// take one extra byte).  31 MiB against a 16 MiB floor is one 31 MiB GET;
+/// 33 MiB is 17 + 16.  A buffer straddling a cut is divided between the two
+/// chunks, each piece keeping the tag of the buffer it came from.
+void cut_span(std::span<const planned_buffer> span,
+              size_t max_chunk_size,
+              std::vector<std::vector<planned_buffer>>& out)
 {
-  size_t const cs       = std::max<size_t>(chunk_size, 1);
-  size_t const max_bufs = std::max<size_t>(max_n_chunks, 1);
-  std::vector<io_object_segment> out;
-  out.reserve(segs.size());
-  for (size_t i = 0; i < segs.size();) {
-    auto const& s = segs[i];
-    if (s.size == 0) {
-      ++i;
-      continue;
-    }
-    if (allow_split && s.size > cs) {
-      // Split an oversized contiguous segment into chunk_size pieces.  A null
-      // buffer (bounce-staged) stays null per piece — never `nullptr + pos`
-      // (UB): each piece is a standalone single-buffer chunk that submit() backs
-      // with its own bounce slot, honoring the standalone-null contract above.
-      uint8_t* base = s.data();
-      for (size_t pos = 0; pos < s.size; pos += cs) {
-        size_t const piece = std::min(cs, s.size - pos);
-        out.emplace_back(s.offset + pos, piece, base != nullptr ? base + pos : nullptr);
+  size_t total = 0;
+  for (auto const& b : span) {
+    total += b.len;
+  }
+  if (total == 0) { return; }
+
+  size_t const n    = std::max<size_t>(total / std::max<size_t>(max_chunk_size, 1), 1);
+  size_t const base = total / n;
+  size_t const rem  = total % n;
+
+  size_t bi       = 0;  // buffer being consumed
+  size_t consumed = 0;  // bytes already taken from span[bi]
+  for (size_t c = 0; c < n; ++c) {
+    size_t want = base + (c < rem ? 1 : 0);
+    std::vector<planned_buffer> chunk;
+    while (want > 0 && bi < span.size()) {
+      auto const& b     = span[bi];
+      size_t const take = std::min(want, b.len - consumed);
+      chunk.push_back(planned_buffer{b.file_off + consumed,
+                                     take,
+                                     b.host != nullptr ? b.host + consumed : nullptr,
+                                     b.tag,
+                                     b.hole});
+      consumed += take;
+      want -= take;
+      if (consumed == b.len) {
+        ++bi;
+        consumed = 0;
       }
+    }
+    out.push_back(std::move(chunk));
+  }
+}
+
+/// Plan the ranged GETs for a set of destination buffers: coalesce, then cut.
+///
+/// Coalesce — a run of buffers is fused into one contiguous span while the gap
+/// to the next is at most @p max_gap, each bridged gap becoming a hole buffer.
+/// Fusing costs the gap's bytes and saves a round trip, which is the trade an
+/// object store rewards.  A bounce-staged buffer (null @c host, not a hole)
+/// never fuses in either direction — submit() backs it with a single pinned slot
+/// and its H2D copy resolves against that slot.
+///
+/// Cut — see @c cut_span: each span is divided into chunks of at least
+/// @p max_chunk_size bytes, balanced.
+///
+/// Buffers are expected in file order and disjoint.  Neither is required for
+/// correctness — a buffer that starts before the running span's end (an overlap,
+/// or simply an out-of-order input) is left unfused and fetched by a GET of its
+/// own, so its bytes still land — but an overlap between two ascending buffers
+/// means the same bytes are paid for twice, which is a caller bug worth catching
+/// in debug.
+std::vector<std::vector<planned_buffer>> plan_chunks(std::span<const planned_buffer> bufs,
+                                                     size_t max_gap,
+                                                     size_t max_chunk_size)
+{
+#ifndef NDEBUG
+  for (size_t k = 1; k < bufs.size(); ++k) {
+    // Only ascending pairs are checked: a descending pair is an unsorted input,
+    // which costs fusion but nothing else.
+    assert((bufs[k].file_off < bufs[k - 1].file_off ||
+            bufs[k].file_off >= bufs[k - 1].file_off + bufs[k - 1].len) &&
+           "plan_chunks: destination buffers must not overlap");
+  }
+#endif
+  std::vector<std::vector<planned_buffer>> out;
+  out.reserve(bufs.size());
+  std::vector<planned_buffer> span;
+  for (size_t i = 0; i < bufs.size();) {
+    if (bufs[i].len == 0) {
       ++i;
       continue;
     }
-    // Greedily fuse following file-adjacent segments into one scatter GET while
-    // the fused span and buffer count stay within their caps.  Never fuse across
-    // a null buffer: a null-buffer segment (a reactor-bounce-staged device read,
-    // e.g. a prefetch-cache gap) must stay a standalone single-buffer chunk so
-    // submit() can back it with one pinned bounce slot and its H2D copy resolves
-    // to that slot — fusing it would either break the bounce (one slot per chunk)
-    // or leave a stale null-derived copy source.
-    io_object_segment group{s.offset, s.size, s.data()};
-    size_t j = i + 1;
-    while (j < segs.size() && group.n_chunks() < max_bufs && segs[j].size > 0 &&
-           group.buffers.back().iov_base != nullptr && segs[j].data() != nullptr &&
-           group.offset + group.size == segs[j].offset && group.size + segs[j].size <= cs) {
-      group.append(iovec{static_cast<void*>(segs[j].data()), segs[j].size});
-      ++j;
+    span.clear();
+    span.push_back(bufs[i]);
+    size_t span_end = bufs[i].file_off + bufs[i].len;
+    size_t j        = i + 1;
+    if (bufs[i].host != nullptr) {
+      while (j < bufs.size() && bufs[j].len > 0 && bufs[j].host != nullptr) {
+        if (bufs[j].file_off < span_end || bufs[j].file_off - span_end > max_gap) { break; }
+        if (size_t const gap = bufs[j].file_off - span_end; gap > 0) {
+          span.push_back(planned_buffer{span_end, gap, nullptr, kNoTag, /*hole=*/true});
+        }
+        span.push_back(bufs[j]);
+        span_end = bufs[j].file_off + bufs[j].len;
+        ++j;
+      }
     }
-    out.push_back(std::move(group));
+    cut_span(std::span<const planned_buffer>(span.data(), span.size()), max_chunk_size, out);
     i = j;
   }
   return out;
+}
+
+/// Fold a planned chunk into the segment the reactor submits: one contiguous
+/// file range whose response body is scattered across the chunk's buffers in
+/// file order (a hole's null buffer tells @c write_to_sink to drop those bytes).
+io_object_segment to_segment(std::span<const planned_buffer> chunk)
+{
+  io_object_segment seg{chunk.front().file_off, chunk.front().len, chunk.front().host};
+  for (auto const& b : chunk.subspan(1)) {
+    seg.append(iovec{static_cast<void*>(b.host), b.len});
+  }
+  return seg;
 }
 
 /// One flattened entry of a vectored host-to-device plan: the read span
 /// [offset, offset + size), where it lands (a null @c host_buffer means the
 /// reactor stages it through one of its pinned bounce slots), and the absolute
 /// file window [copy_lo, copy_hi) of that span which is H2D-copied to
-/// @c device_dst (which addresses copy_lo).  Never zero-sized —
-/// @c chunk_host_segments drops empty segments, which would desynchronize the
-/// plan from the buffers it produced.
+/// @c device_dst (which addresses copy_lo).  Entries are referenced by index
+/// from the @c planned_buffer tags the planner carries through coalescing and
+/// cutting, so a chunk's buffers resolve back to their entry positionally-free.
 struct planned_device_segment {
   size_t offset;
   size_t size;
@@ -505,7 +597,6 @@ rest_reactor::rest_reactor(std::shared_ptr<reactor_context> ctx, std::string_vie
     throw std::invalid_argument("rest_reactor: max_connections must be > 0");
   }
   if (_config.max_retry_attempts == 0) { _config.max_retry_attempts = 1; }
-  if (_config.max_read_split == 0) { _config.max_read_split = 1; }
 
   // Touch the process-wide curl context so global init + the shared cache are
   // ready before any handle is created — including the blocking HEAD that
@@ -569,14 +660,26 @@ void rest_reactor::enqueue(request_type_ptr req)
 void rest_reactor::enqueue_chunks(std::span<std::unique_ptr<rest_chunked_rx_request>> batch)
 {
   if (batch.empty()) { return; }
+  std::size_t bytes = 0;
   if (_config.perf_instrumentation) {
     auto const now = std::chrono::steady_clock::now();
     for (auto& c : batch) {
       if (c) { c->t_enqueue = now; }
     }
   }
+  for (auto const& c : batch) {
+    if (c) { bytes += c->chunk.size; }
+  }
+  // Publish the depth BEFORE the chunks become visible to the worker: the worker
+  // subtracts on dequeue, so incrementing after would let a fast worker drive the
+  // counter negative.  It is only ever read as a dispatch hint, so relaxed
+  // ordering is enough.
+  _queued_bytes.fetch_add(bytes, std::memory_order_relaxed);
   bool const ok = _requests.enqueue_bulk(std::make_move_iterator(batch.data()), batch.size());
-  if (!ok) { throw std::runtime_error("rest_reactor::enqueue_chunks: enqueue_bulk failed"); }
+  if (!ok) {
+    _queued_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+    throw std::runtime_error("rest_reactor::enqueue_chunks: enqueue_bulk failed");
+  }
   interrupt();
 }
 
@@ -591,10 +694,11 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(const reactor_
   return prep_host_rx_request(cfg, file, segment, host_read_attribution::async_chunk);
 }
 
-rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(const reactor_config_type& cfg,
-                                                                  const io_object_type& file,
-                                                                  const io_object_segment& segment,
-                                                                  host_read_attribution attribution)
+rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(
+  const reactor_config_type& cfg,
+  const io_object_type& file,
+  const io_object_segment& segment,
+  host_read_attribution attribution)
 {
   if (segment.size == 0) { return rest_rx_request::create({}); }
 
@@ -605,26 +709,13 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(const reactor_
   assert(segment.is_buffer_allocated() &&
          "rest_reactor::prep_host_rx_request: host read requires a non-null destination buffer");
 
-  // Break a contiguous host read into N parallel single-buffer ranged GETs so
-  // the connection pool fetches them concurrently.  N is the largest count
-  // <= max_read_split that keeps every piece at least min_chunk_size; a read
-  // below single_request_threshold stays a single GET (the extra round-trips
-  // would not pay off).  segment.size is distributed as evenly as possible,
-  // spreading the remainder over the leading pieces so every byte is covered
-  // exactly once.
-  constexpr size_t min_chunk_size           = 1UL << 20;  // 1 MiB
-  constexpr size_t single_request_threshold = 2UL << 20;  // 2 MiB
-
-  size_t n_chunks = 1;
-  if (segment.size >= single_request_threshold) {
-    n_chunks = std::min<size_t>(cfg.max_read_split, segment.size / min_chunk_size);
-    n_chunks = std::max<size_t>(n_chunks, 1);
-  }
-  // Keep every ranged GET piece under 4 GiB, matching the uring backend's
-  // 32-bit read-length bound, so a single very large object never produces an
-  // oversized read on either backend.
-  constexpr size_t max_piece_bytes = size_t{1} << 31;  // 2 GiB
-  n_chunks = std::max<size_t>(n_chunks, (segment.size + max_piece_bytes - 1) / max_piece_bytes);
+  // The same floor the planned paths use (see cut_span), applied directly since
+  // one contiguous segment needs no coalescing: as many requests as
+  // max_chunk_size fits into the read, then the bytes balanced evenly across
+  // them.  Every request therefore carries at least max_chunk_size bytes, and a
+  // read smaller than that stays a single GET.
+  size_t const n_chunks =
+    std::max<size_t>(segment.size / std::max<size_t>(cfg.max_chunk_size, 1), 1);
 
   auto manager       = std::make_shared<request_manager>(segment.size, n_chunks);
   auto const obj     = file.get_object_ref();
@@ -659,9 +750,10 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rxv_request(
   size_t const fsize = file.size();
 
   // Clamp each segment to the file end (dropping empties), preserving file
-  // order, and total the requested bytes (what the future reports).
-  std::vector<io_object_segment> clamped;
-  clamped.reserve(segments.size());
+  // order, and total the requested bytes (what the future reports — the bridged
+  // gap bytes below are read but never delivered, so they are not counted).
+  std::vector<planned_buffer> bufs;
+  bufs.reserve(segments.size());
   size_t bytes_requested = 0;
   for (auto const& s : segments) {
     // See prep_host_rx_request: host reads must carry caller buffers; a
@@ -672,27 +764,25 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rxv_request(
            "destination buffers");
     size_t const c = s.offset < fsize ? std::min(s.size, fsize - s.offset) : 0;
     if (c == 0) { continue; }
-    clamped.emplace_back(s.offset, c, s.data());
+    bufs.push_back(planned_buffer{s.offset, c, s.data(), bufs.size()});
     bytes_requested += c;
   }
-  if (clamped.empty()) { return rest_rx_request::create({}); }
+  if (bufs.empty()) { return rest_rx_request::create({}); }
 
-  // Fuse file-adjacent segments into scatter GETs and split oversized ones;
-  // grouping never changes the covered byte total.
-  auto groups =
-    chunk_host_segments(std::span<const io_object_segment>(clamped.data(), clamped.size()),
-                        cfg.chunk_size,
-                        cfg.max_n_chunks);
+  // Coalesce near neighbors into scatter GETs and cut the result at the chunk
+  // floor; neither step changes the byte total delivered to the caller.
+  auto groups = plan_chunks(
+    std::span<const planned_buffer>(bufs.data(), bufs.size()), cfg.merge_max_gap, cfg.max_chunk_size);
 
   auto manager   = std::make_shared<request_manager>(bytes_requested, groups.size());
   auto const obj = file.get_object_ref();
 
   std::vector<std::unique_ptr<rest_chunked_rx_request>> chunks;
   chunks.reserve(groups.size());
-  for (auto& g : groups) {
+  for (auto const& g : groups) {
     auto req       = std::make_unique<rest_chunked_rx_request>();
     req->object    = obj;
-    req->chunk     = std::move(g);
+    req->chunk     = to_segment(std::span<const planned_buffer>(g.data(), g.size()));
     req->file_size = fsize;
     req->manager   = manager;
     chunks.push_back(std::move(req));
@@ -761,11 +851,11 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_to_device_rx_request(
   rmm::cuda_stream_view stream,
   int device_id)
 {
-  // Device read staged through caller-supplied pinned host buffers.  File-
-  // adjacent segments are fused into one contiguous scatter GET (whose response
-  // lands across their buffers, like uring's readv); each fused buffer then
-  // H2D-copies only the part overlapping the device window [offset, req_end)
-  // into dst, as a batch of copies issued on one stream.
+  // Device read staged through caller-supplied pinned host buffers.  Near
+  // neighbors are coalesced into one contiguous scatter GET (whose response
+  // lands across their buffers, like uring's readv); each buffer then H2D-copies
+  // only the part overlapping the device window [offset, req_end) into dst, as a
+  // batch of copies issued on one stream.
   if (size == 0 || segments.empty()) { return rest_rx_request::create({}); }
 
   size_t const fsize   = file.size();
@@ -774,11 +864,11 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_to_device_rx_request(
 
   // Validate overlap, total the device-buffer bytes each segment fills (the
   // value reported to the caller — not the host read size, which over-reads to
-  // the file end), and clamp each segment's read to the file end (single-buffer,
-  // file order preserved for the merge).
+  // the file end), and clamp each segment's read to the file end (file order
+  // preserved for the coalescer).
   size_t bytes_covered = 0;
-  std::vector<io_object_segment> clamped;
-  clamped.reserve(segments.size());
+  std::vector<planned_buffer> bufs;
+  bufs.reserve(segments.size());
   for (auto const& s : segments) {
     size_t const lo = std::max(offset, s.offset);
     size_t const hi = std::min({req_end, s.offset + s.size, fsize});
@@ -789,56 +879,50 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_to_device_rx_request(
     }
     bytes_covered += hi - lo;
     // hi > lo implies s.offset < fsize, so the clamp is well-defined.
-    clamped.push_back(io_object_segment{s.offset, std::min(s.size, fsize - s.offset), s.data()});
+    bufs.push_back(
+      planned_buffer{s.offset, std::min(s.size, fsize - s.offset), s.data(), bufs.size()});
   }
 
-  // Fuse contiguous buffers into scatter groups (no sub-splitting: each caller
-  // buffer must stay one buffer so its H2D copy maps to that allocation).
-  auto groups =
-    chunk_host_segments(std::span<const io_object_segment>(clamped.data(), clamped.size()),
-                        cfg.chunk_size,
-                        cfg.max_n_chunks,
-                        /*allow_split=*/false);
+  auto groups = plan_chunks(
+    std::span<const planned_buffer>(bufs.data(), bufs.size()), cfg.merge_max_gap, cfg.max_chunk_size);
 
   auto manager = std::make_shared<request_manager>(bytes_covered, groups.size());
 
   std::vector<std::unique_ptr<rest_chunked_rx_request>> chunks;
   chunks.reserve(groups.size());
-  for (auto& g : groups) {
-    // One copy per buffer in the group, each clipped to the device window and
+  for (auto const& g : groups) {
+    // One copy per buffer in the chunk, each clipped to the device window and
     // carrying an absolute src (the buffers are separate host allocations).
+    // Holes are bridged gap bytes with nowhere to go, so they copy nothing.
     auto cpy       = std::make_unique<device_cpy_request>();
     cpy->stream    = stream;
     cpy->device_id = device_id;
-    cpy->copies.reserve(g.n_chunks());
-    size_t file_lo = g.offset;
-    for (auto const& b : g.buffers) {
-      size_t const file_hi = file_lo + b.iov_len;
-      size_t const data_lo = std::max(offset, file_lo);
-      size_t const data_hi = std::min(req_end, file_hi);
+    cpy->copies.reserve(g.size());
+    for (auto const& b : g) {
+      if (b.hole) { continue; }
+      size_t const data_lo = std::max(offset, b.file_off);
+      size_t const data_hi = std::min(req_end, b.file_off + b.len);
       if (data_lo < data_hi) {
-        // A null buffer is a bounce-staged sub-range: submit() backs the chunk
-        // with a pinned bounce slot (set_data) and the H2D copy must read from
-        // that slot, so leave src null and carry the intra-buffer offset in
+        // A non-hole null buffer is a bounce-staged sub-range: submit() backs the
+        // chunk with a pinned bounce slot (set_data) and the H2D copy must read
+        // from that slot, so leave src null and carry the intra-buffer offset in
         // src_off — copy_async then resolves src = bounce_buffer + src_off.
         // Encoding a null buffer as `nullptr + off` (a non-null near-null
         // pointer) instead would bypass that bounce fallback and fault the H2D.
-        // chunk_host_segments guarantees a null-buffer segment is standalone and
-        // single-buffer, so file_lo == g.offset and the bounce holds the whole
-        // segment from offset 0.
-        bool const bounce_staged = (b.iov_base == nullptr);
-        cpy->copies.push_back(device_cpy_request::copy{
-          /*dst=*/dst + (data_lo - offset),
-          /*src=*/bounce_staged ? nullptr : static_cast<uint8_t*>(b.iov_base) + (data_lo - file_lo),
-          /*src_off=*/bounce_staged ? (data_lo - file_lo) : size_t{0},
-          /*size=*/data_hi - data_lo});
+        // plan_chunks never fuses such a buffer, so it is alone in its chunk and
+        // the bounce holds its whole span from offset 0.
+        bool const bounce_staged = (b.host == nullptr);
+        cpy->copies.push_back(
+          device_cpy_request::copy{/*dst=*/dst + (data_lo - offset),
+                                   /*src=*/bounce_staged ? nullptr : b.host + (data_lo - b.file_off),
+                                   /*src_off=*/bounce_staged ? (data_lo - b.file_off) : size_t{0},
+                                   /*size=*/data_hi - data_lo});
       }
-      file_lo = file_hi;
     }
 
     auto req       = std::make_unique<rest_chunked_rx_request>();
     req->object    = obj;
-    req->chunk     = std::move(g);
+    req->chunk     = to_segment(std::span<const planned_buffer>(g.data(), g.size()));
     req->file_size = fsize;
     req->cpy_req   = std::move(cpy);
     req->manager   = manager;
@@ -847,7 +931,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_to_device_rx_request(
   return rest_rx_request::create(std::move(chunks));
 }
 
-rest_reactor::request_type_ptr rest_reactor::prep_device_ranges_rx_request(
+rest_reactor::request_type_ptr rest_reactor::prep_device_rxv_request(
   const reactor_config_type& cfg,
   const io_object_type& file,
   std::span<const io_device_range> ranges,
@@ -857,7 +941,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_device_ranges_rx_request(
   if (ranges.empty()) { return rest_rx_request::create({}); }
   if (cfg.bounce_block_size == 0) {
     throw std::runtime_error(
-      "rest_reactor::prep_device_ranges_rx_request: device reads require a host_memory_resource on "
+      "rest_reactor::prep_device_rxv_request: device reads require a host_memory_resource on "
       "the reactor_context for bounce staging");
   }
 
@@ -904,7 +988,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_device_ranges_rx_request(
   return rest_rx_request::create(std::move(chunks));
 }
 
-rest_reactor::request_type_ptr rest_reactor::prep_host_to_device_ranges_rx_request(
+rest_reactor::request_type_ptr rest_reactor::prep_host_to_device_rxv_request(
   const reactor_config_type& cfg,
   const io_object_type& file,
   std::span<const io_host_device_range> ranges,
@@ -923,18 +1007,18 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_to_device_ranges_rx_reque
     if (r.size == 0) { continue; }
     if (r.device_dst == nullptr) {
       throw std::runtime_error(
-        "rest_reactor::prep_host_to_device_ranges_rx_request: range has no device destination");
+        "rest_reactor::prep_host_to_device_rxv_request: range has no device destination");
     }
     if (!r.is_copy_window_valid()) {
       throw std::runtime_error(
-        "rest_reactor::prep_host_to_device_ranges_rx_request: copy window lies outside the read "
+        "rest_reactor::prep_host_to_device_rxv_request: copy window lies outside the read "
         "span");
     }
     size_t const copy_lo = r.copy_offset;
     size_t const copy_hi = std::min(r.copy_offset + r.copy_size, fsize);
     if (copy_lo >= copy_hi) {
       throw std::runtime_error(
-        "rest_reactor::prep_host_to_device_ranges_rx_request: range does not overlap the requested "
+        "rest_reactor::prep_host_to_device_rxv_request: range does not overlap the requested "
         "device range");
     }
     size_t const read_end = r.offset + std::min(r.size, fsize - r.offset);
@@ -945,7 +1029,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_to_device_ranges_rx_reque
     }
     if (bounce == 0) {
       throw std::runtime_error(
-        "rest_reactor::prep_host_to_device_ranges_rx_request: device reads require a "
+        "rest_reactor::prep_host_to_device_rxv_request: device reads require a "
         "host_memory_resource on the reactor_context for bounce staging");
     }
     for (size_t w = r.offset; w < read_end; w += bounce) {
@@ -959,49 +1043,48 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_to_device_ranges_rx_reque
   }
   if (plan.empty()) { return rest_rx_request::create({}); }
 
+  // Each planned read becomes one tagged buffer; the tag survives coalescing and
+  // cutting, so a buffer always knows the plan entry (and therefore the device
+  // destination and copy window) it belongs to — no positional lockstep between
+  // the plan and the chunks the planner hands back.
   size_t bytes_covered = 0;
-  std::vector<io_object_segment> reads;
-  reads.reserve(plan.size());
+  std::vector<planned_buffer> bufs;
+  bufs.reserve(plan.size());
   for (auto const& p : plan) {
     bytes_covered += p.copy_hi - p.copy_lo;
-    reads.emplace_back(p.offset, p.size, p.host_buffer);
+    bufs.push_back(planned_buffer{p.offset, p.size, p.host_buffer, bufs.size()});
   }
 
-  auto groups = chunk_host_segments(std::span<const io_object_segment>(reads.data(), reads.size()),
-                                    cfg.chunk_size,
-                                    cfg.max_n_chunks,
-                                    /*allow_split=*/false);
+  auto groups = plan_chunks(
+    std::span<const planned_buffer>(bufs.data(), bufs.size()), cfg.merge_max_gap, cfg.max_chunk_size);
 
   auto manager = std::make_shared<request_manager>(bytes_covered, groups.size());
 
   std::vector<std::unique_ptr<rest_chunked_rx_request>> chunks;
   chunks.reserve(groups.size());
-  size_t si = 0;
-  for (auto& g : groups) {
+  for (auto const& g : groups) {
     auto cpy       = std::make_unique<device_cpy_request>();
     cpy->stream    = stream;
     cpy->device_id = device_id;
-    cpy->copies.reserve(g.n_chunks());
-    for (auto const& b : g.buffers) {
-      assert(si < plan.size() && "merged groups cover more buffers than the plan produced");
-      auto const& p        = plan[si++];
-      size_t const file_lo = p.offset;
-      size_t const file_hi = p.offset + b.iov_len;
-      size_t const data_lo = std::max(p.copy_lo, file_lo);
-      size_t const data_hi = std::min(p.copy_hi, file_hi);
+    cpy->copies.reserve(g.size());
+    for (auto const& b : g) {
+      if (b.hole) { continue; }
+      assert(b.tag < plan.size() && "planned buffer carries a tag outside the plan");
+      auto const& p        = plan[b.tag];
+      size_t const data_lo = std::max(p.copy_lo, b.file_off);
+      size_t const data_hi = std::min(p.copy_hi, b.file_off + b.len);
       if (data_lo < data_hi) {
-        auto* const base = static_cast<uint8_t*>(b.iov_base);
-        cpy->copies.push_back(
-          device_cpy_request::copy{/*dst=*/p.device_dst + (data_lo - p.copy_lo),
-                                   /*src=*/base != nullptr ? base + (data_lo - file_lo) : nullptr,
-                                   /*src_off=*/base != nullptr ? size_t{0} : (data_lo - file_lo),
-                                   /*size=*/data_hi - data_lo});
+        cpy->copies.push_back(device_cpy_request::copy{
+          /*dst=*/p.device_dst + (data_lo - p.copy_lo),
+          /*src=*/b.host != nullptr ? b.host + (data_lo - b.file_off) : nullptr,
+          /*src_off=*/b.host != nullptr ? size_t{0} : (data_lo - b.file_off),
+          /*size=*/data_hi - data_lo});
       }
     }
 
     auto req       = std::make_unique<rest_chunked_rx_request>();
     req->object    = obj;
-    req->chunk     = std::move(g);
+    req->chunk     = to_segment(std::span<const planned_buffer>(g.data(), g.size()));
     req->file_size = fsize;
     req->cpy_req   = std::move(cpy);
     req->manager   = manager;
@@ -1784,8 +1867,8 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
         _perf.inflight_sum.fetch_add(now, std::memory_order_relaxed);
         _perf.inflight_samples.fetch_add(1, std::memory_order_relaxed);
         auto prev = _perf.inflight_max.load(std::memory_order_relaxed);
-        while (now > prev && !_perf.inflight_max.compare_exchange_weak(
-                               prev, now, std::memory_order_relaxed)) {}
+        while (now > prev &&
+               !_perf.inflight_max.compare_exchange_weak(prev, now, std::memory_order_relaxed)) {}
       }
       // Acquire a slot (and thus a bounce buffer) up front; an invalid token
       // means all slots are busy.  A token taken for a skipped/empty dequeue is
@@ -1805,7 +1888,11 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
         if (!ready.empty()) {
           dr = std::move(ready.front());
           ready.pop_front();
-        } else if (!_requests.try_dequeue(dr)) {
+        } else if (_requests.try_dequeue(dr)) {
+          // The chunk has left the queue; it is now this reactor's in-flight work
+          // and no longer counts toward the depth dispatch balances against.
+          if (dr) { _queued_bytes.fetch_sub(dr->chunk.size, std::memory_order_relaxed); }
+        } else {
           // Slots to spare but nothing to run: the producer is the bottleneck.
           _perf.submit_work_starved_total.fetch_add(1, std::memory_order_relaxed);
           break;
@@ -2193,7 +2280,10 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
 
   std::unique_ptr<rest_chunked_rx_request> dr;
   while (_requests.try_dequeue(dr)) {
-    if (dr) { dr->manager->report_error(std::make_error_code(std::errc::operation_canceled)); }
+    if (dr) {
+      _queued_bytes.fetch_sub(dr->chunk.size, std::memory_order_relaxed);
+      dr->manager->report_error(std::make_error_code(std::errc::operation_canceled));
+    }
     dr.reset();
   }
 }

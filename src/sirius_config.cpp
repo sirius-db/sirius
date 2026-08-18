@@ -153,11 +153,8 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
   r.optional("request_timeout_s", opt.request_timeout_s);
   r.optional("ca_bundle_path", opt.ca_bundle_path);
   r.optional("tls_verify", opt.tls_verify);
-  r.optional("max_connections", opt.max_connections);
-  r.optional("chunk_size", yaml::bytes(opt.chunk_size));
-  r.optional("max_n_chunks", opt.max_n_chunks);
-  r.optional("max_read_split", opt.max_read_split);
-  r.optional("bounce_block_size", yaml::bytes(opt.bounce_block_size));
+  r.optional("max_chunk_size", yaml::bytes(opt.max_chunk_size));
+  r.optional("merge_max_gap", yaml::bytes(opt.merge_max_gap));
   r.optional("upkeep_interval_ms", opt.upkeep_interval);
   r.optional("conn_max_age_s", opt.conn_max_age);
   r.optional("retry_backoff_base_ms", opt.retry_backoff_base);
@@ -211,8 +208,6 @@ static void from_yaml(const YAML::Node& node, sirius::io::kvikio_config& opt)
 static void from_yaml(const YAML::Node& node, sirius::io::cache::config& opt)
 {
   yaml::reader r(node, "prefetch_cache");
-  r.optional(
-    "inflight_io_chunk_budget", opt.inflight_io_chunk_budget, yaml::greater_than<std::size_t>{0});
   r.optional("min_prefetching_budget_fraction",
              opt.min_prefetching_budget_fraction,
              yaml::fraction<double>{});
@@ -656,9 +651,9 @@ void sirius_config::derive_rest_scan_budget()
   constexpr std::size_t scans_per_thread = 4;
   if (_scan_manager_config.rest.n_max_concurrent_scans_explicit) { return; }
 
-  auto const derived = static_cast<std::size_t>(
-                         std::max(1, _gpu_pipeline_executor_config.num_threads)) *
-                       scans_per_thread;
+  auto const derived =
+    static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads)) *
+    scans_per_thread;
   if (derived == _scan_manager_config.rest.n_max_concurrent_scans) { return; }
 
   SIRIUS_LOG_INFO(

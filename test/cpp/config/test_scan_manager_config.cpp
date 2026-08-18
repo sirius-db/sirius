@@ -218,11 +218,9 @@ TEST_CASE("sirius_config reads the prefetch_cache tunables", "[scan_manager][con
     load_scan_manager("sirius_prefetch_cache_tunables.yaml",
                       scan_manager_yaml("      cache: prefetch\n"
                                         "      prefetch_cache:\n"
-                                        "        inflight_io_chunk_budget: 64\n"
                                         "        eviction_threshold_fraction: 0.25\n"
                                         "        min_prefetching_budget_fraction: 0.5\n"));
 
-  CHECK(cfg.prefetch_cache.inflight_io_chunk_budget == 64);
   CHECK(cfg.prefetch_cache.eviction_threshold_fraction == Approx(0.25));
   CHECK(cfg.prefetch_cache.min_prefetching_budget_fraction == Approx(0.5));
   CHECK(cfg.prefetch_cache.dispose_on_idle);
@@ -255,7 +253,7 @@ TEST_CASE("sirius_config rejects the knobs superseded by the cache mode",
           "        dispose_on_idle: true\n");
   rejects("sirius_cache_mode_old_cache_map.yaml",
           "      cache:\n"
-          "        inflight_io_chunk_budget: 64\n");
+          "        eviction_threshold_fraction: 0.25\n");
 }
 
 TEST_CASE("backend string_to_enum accepts known backends", "[scan_manager][config][backend]")
@@ -337,6 +335,17 @@ TEST_CASE("sirius_config reads the uring sub-config", "[scan_manager][config][ba
                                                        "        max_n_chunks: 4\n"));
 
   CHECK(cfg.uring.max_n_chunks == 4);
+}
+
+TEST_CASE("sirius_config rejects the removed REST max_read_split key",
+          "[scan_manager][config][backend]")
+{
+  scoped_yaml yaml("sirius_rest_removed_key.yaml",
+                   scan_manager_yaml("      rest:\n"
+                                     "        max_read_split: 16\n"));
+
+  sirius::sirius_config cfg;
+  CHECK_THROWS(cfg.load_from_file(yaml.path()));
 }
 
 TEST_CASE("sirius_config rejects the renamed local sub-config", "[scan_manager][config][backend]")

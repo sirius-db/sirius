@@ -649,12 +649,11 @@ request_type_ptr uring_reactor::prep_device_rx_request(const reactor_config_type
   return rx_request::create(std::move(chunks));
 }
 
-request_type_ptr uring_reactor::prep_device_ranges_rx_request(
-  const reactor_config_type& cfg,
-  const io_object_type& file,
-  std::span<const io_device_range> ranges,
-  rmm::cuda_stream_view stream,
-  int device_id)
+request_type_ptr uring_reactor::prep_device_rxv_request(const reactor_config_type& cfg,
+                                                        const io_object_type& file,
+                                                        std::span<const io_device_range> ranges,
+                                                        rmm::cuda_stream_view stream,
+                                                        int device_id)
 {
   if (ranges.empty()) { return rx_request::create({}); }
 
@@ -773,7 +772,7 @@ request_type_ptr uring_reactor::prep_host_to_device_rx_request(
   return rx_request::create(std::move(chunks));
 }
 
-request_type_ptr uring_reactor::prep_host_to_device_ranges_rx_request(
+request_type_ptr uring_reactor::prep_host_to_device_rxv_request(
   const reactor_config_type& cfg,
   const io_object_type& file,
   std::span<const io_host_device_range> ranges,
@@ -792,21 +791,20 @@ request_type_ptr uring_reactor::prep_host_to_device_ranges_rx_request(
   for (auto const& r : ranges) {
     if (r.size == 0) { continue; }
     if (r.device_dst == nullptr) {
-      throw std::runtime_error("prep_host_to_device_ranges_rx_request: range [" +
+      throw std::runtime_error("prep_host_to_device_rxv_request: range [" +
                                std::to_string(r.offset) + ", " + std::to_string(r.offset + r.size) +
                                ") has no device destination");
     }
     if (!r.is_copy_window_valid()) {
-      throw std::runtime_error("prep_host_to_device_ranges_rx_request: copy window [" +
-                               std::to_string(r.copy_offset) + ", " +
-                               std::to_string(r.copy_offset + r.copy_size) +
-                               ") is not contained in the read range [" + std::to_string(r.offset) +
-                               ", " + std::to_string(r.offset + r.size) + ")");
+      throw std::runtime_error(
+        "prep_host_to_device_rxv_request: copy window [" + std::to_string(r.copy_offset) + ", " +
+        std::to_string(r.copy_offset + r.copy_size) + ") is not contained in the read range [" +
+        std::to_string(r.offset) + ", " + std::to_string(r.offset + r.size) + ")");
     }
     size_t const copy_lo = r.copy_offset;
     size_t const copy_hi = std::min(r.copy_offset + r.copy_size, fsize);
     if (copy_lo >= copy_hi) {
-      throw std::runtime_error("prep_host_to_device_ranges_rx_request: copy window [" +
+      throw std::runtime_error("prep_host_to_device_rxv_request: copy window [" +
                                std::to_string(r.copy_offset) + ", " +
                                std::to_string(r.copy_offset + r.copy_size) +
                                ") does not overlap the file [0, " + std::to_string(fsize) + ")");
@@ -860,7 +858,7 @@ request_type_ptr uring_reactor::prep_host_to_device_ranges_rx_request(
       size_t const data_lo = std::max(p.copy_lo, file_lo);
       size_t const data_hi = std::min(p.copy_hi, file_hi);
       assert(data_lo < data_hi &&
-             "prep_host_to_device_ranges_rx_request: buffer does not overlap its copy window");
+             "prep_host_to_device_rxv_request: buffer does not overlap its copy window");
       auto* const base = static_cast<uint8_t*>(b.iov_base);
       cpy->copies.push_back(
         device_cpy_request::copy{/*dst=*/p.device_dst + (data_lo - p.copy_lo),

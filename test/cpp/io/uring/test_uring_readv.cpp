@@ -546,7 +546,7 @@ TEST_CASE("prep_device_ranges builds one bounce chunk per small range", "[uring_
   std::vector<io_device_range> ranges{{0, 4096, dst0}, {8192, 4096, dst1}, {16384, 8192, dst2}};
 
   auto req =
-    uring_reactor::prep_device_ranges_rx_request(cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
+    uring_reactor::prep_device_rxv_request(cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
   auto fut    = req->get_future();
   auto chunks = req->get_all_chunks();
 
@@ -587,7 +587,7 @@ TEST_CASE("prep_device_ranges splits a range across bounce windows", "[uring_rea
   std::vector<io_device_range> ranges{{0, 3 * 4096, dst_big}, {32768, 1024, dst_small}};
 
   auto req =
-    uring_reactor::prep_device_ranges_rx_request(cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
+    uring_reactor::prep_device_rxv_request(cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
   auto fut    = req->get_future();
   auto chunks = req->get_all_chunks();
 
@@ -633,7 +633,7 @@ TEST_CASE("prep_device_ranges clamps a range at EOF and drops ranges past it", "
     {8192, 512, fake_ptr(0x60000000)}};     // starts past EOF
 
   auto req =
-    uring_reactor::prep_device_ranges_rx_request(cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
+    uring_reactor::prep_device_rxv_request(cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
   auto fut    = req->get_future();
   auto chunks = req->get_all_chunks();
 
@@ -666,8 +666,8 @@ TEST_CASE("prep_device_ranges skips zero-size ranges and null device destination
     std::vector<io_device_range> ranges{{0, 0, fake_ptr(0x50000000)},  // no bytes wanted
                                         {4096, 4096, nullptr},         // nowhere to put them
                                         {8192, 4096, dst}};
-    auto req = uring_reactor::prep_device_ranges_rx_request(
-      cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
+    auto req =
+      uring_reactor::prep_device_rxv_request(cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
     auto fut    = req->get_future();
     auto chunks = req->get_all_chunks();
 
@@ -684,8 +684,8 @@ TEST_CASE("prep_device_ranges skips zero-size ranges and null device destination
   SECTION("an all-skipped vector degrades to a ready zero-byte request")
   {
     std::vector<io_device_range> ranges{{0, 0, fake_ptr(0x50000000)}, {4096, 4096, nullptr}};
-    auto req = uring_reactor::prep_device_ranges_rx_request(
-      cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
+    auto req =
+      uring_reactor::prep_device_rxv_request(cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
     REQUIRE(req != nullptr);
     CHECK(req->size() == 0);
     auto fut = req->get_future();
@@ -700,7 +700,7 @@ TEST_CASE("prep_device_ranges on empty input yields a ready zero-byte request", 
   sirius::io::uring::config cfg;
   std::vector<io_device_range> ranges;
   auto req =
-    uring_reactor::prep_device_ranges_rx_request(cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
+    uring_reactor::prep_device_rxv_request(cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
   REQUIRE(req != nullptr);
   CHECK(req->size() == 0);
   auto fut = req->get_future();
@@ -723,7 +723,7 @@ TEST_CASE("prep_device_ranges block-aligns every read window for an unaligned ra
   std::vector<io_device_range> ranges{{5000, 9000, dst}};
 
   auto req =
-    uring_reactor::prep_device_ranges_rx_request(cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
+    uring_reactor::prep_device_rxv_request(cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
   auto fut    = req->get_future();
   auto chunks = req->get_all_chunks();
 
@@ -772,7 +772,7 @@ TEST_CASE("prep_device_ranges reports the clamped byte total through its future"
     {8192, 512, fake_ptr(0x60000000)}};  // past EOF      -> dropped
 
   auto req =
-    uring_reactor::prep_device_ranges_rx_request(cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
+    uring_reactor::prep_device_rxv_request(cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
   auto fut    = req->get_future();
   auto chunks = req->get_all_chunks();
 
@@ -797,8 +797,8 @@ TEST_CASE("prep_device_ranges submits on the fd selected by use_odirect", "[urin
   SECTION("use_odirect reads through the O_DIRECT handle")
   {
     cfg.use_odirect = true;
-    auto req        = uring_reactor::prep_device_ranges_rx_request(
-      cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
+    auto req =
+      uring_reactor::prep_device_rxv_request(cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
     auto fut    = req->get_future();
     auto chunks = req->get_all_chunks();
     REQUIRE(chunks.size() == 1);
@@ -809,8 +809,8 @@ TEST_CASE("prep_device_ranges submits on the fd selected by use_odirect", "[urin
   SECTION("without use_odirect it reads through the buffered handle")
   {
     cfg.use_odirect = false;
-    auto req        = uring_reactor::prep_device_ranges_rx_request(
-      cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
+    auto req =
+      uring_reactor::prep_device_rxv_request(cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
     auto fut    = req->get_future();
     auto chunks = req->get_all_chunks();
     REQUIRE(chunks.size() == 1);
@@ -834,7 +834,7 @@ TEST_CASE("prep_device_ranges never coalesces two ranges inside one block", "[ur
   std::vector<io_device_range> ranges{{100, 200, dst_a}, {3000, 500, dst_b}};
 
   auto req =
-    uring_reactor::prep_device_ranges_rx_request(cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
+    uring_reactor::prep_device_rxv_request(cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
   auto fut    = req->get_future();
   auto chunks = req->get_all_chunks();
 
@@ -881,7 +881,7 @@ TEST_CASE("prep_host_to_device_ranges clips the copy window inside an over-read 
     {/*offset=*/4096, /*size=*/4096, /*copy_offset=*/5000, /*copy_size=*/1000, hb0, dd0},
     {/*offset=*/16384, /*size=*/4096, /*copy_offset=*/16484, /*copy_size=*/116, hb1, dd1}};
 
-  auto req = uring_reactor::prep_host_to_device_ranges_rx_request(
+  auto req = uring_reactor::prep_host_to_device_rxv_request(
     cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
   auto fut    = req->get_future();
   auto chunks = req->get_all_chunks();
@@ -933,7 +933,7 @@ TEST_CASE("prep_host_to_device_ranges fuses contiguous caller buffers into one r
   std::vector<io_host_device_range> ranges{
     {0, 4096, hb0, dd0}, {4096, 4096, hb1, dd1}, {8192, 4096, hb2, dd2}};
 
-  auto req = uring_reactor::prep_host_to_device_ranges_rx_request(
+  auto req = uring_reactor::prep_host_to_device_rxv_request(
     cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
   auto fut    = req->get_future();
   auto chunks = req->get_all_chunks();
@@ -992,7 +992,7 @@ TEST_CASE("prep_host_to_device_ranges keeps a null-buffer range standalone betwe
     {12288, 4096, hb3, dd3},
     {16384, 4096, hb4, dd4}};
 
-  auto req = uring_reactor::prep_host_to_device_ranges_rx_request(
+  auto req = uring_reactor::prep_host_to_device_rxv_request(
     cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
   auto fut    = req->get_future();
   auto chunks = req->get_all_chunks();
@@ -1040,7 +1040,7 @@ TEST_CASE("prep_host_to_device_ranges splits an oversized null-buffer range acro
   std::vector<io_host_device_range> ranges{
     {0, 4 * 4096, /*copy_offset=*/5000, /*copy_size=*/8000, /*host_buffer=*/nullptr, dd}};
 
-  auto req = uring_reactor::prep_host_to_device_ranges_rx_request(
+  auto req = uring_reactor::prep_host_to_device_rxv_request(
     cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
   auto fut    = req->get_future();
   auto chunks = req->get_all_chunks();
@@ -1091,7 +1091,7 @@ TEST_CASE("prep_host_to_device_ranges rejects an invalid copy window", "[uring_r
   SECTION("copy window starting before the read span")
   {
     std::vector<io_host_device_range> ranges{{4096, 4096, /*copy_offset=*/4000, 100, hb, dd}};
-    CHECK_THROWS_AS(uring_reactor::prep_host_to_device_ranges_rx_request(
+    CHECK_THROWS_AS(uring_reactor::prep_host_to_device_rxv_request(
                       cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0),
                     std::runtime_error);
   }
@@ -1099,7 +1099,7 @@ TEST_CASE("prep_host_to_device_ranges rejects an invalid copy window", "[uring_r
   SECTION("copy window running past the read span")
   {
     std::vector<io_host_device_range> ranges{{4096, 4096, /*copy_offset=*/6000, 4096, hb, dd}};
-    CHECK_THROWS_AS(uring_reactor::prep_host_to_device_ranges_rx_request(
+    CHECK_THROWS_AS(uring_reactor::prep_host_to_device_rxv_request(
                       cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0),
                     std::runtime_error);
   }
@@ -1107,7 +1107,7 @@ TEST_CASE("prep_host_to_device_ranges rejects an invalid copy window", "[uring_r
   SECTION("copy window entirely past the end of the file")
   {
     std::vector<io_host_device_range> ranges{{8192, 4096, /*copy_offset=*/8192, 100, hb, dd}};
-    CHECK_THROWS_AS(uring_reactor::prep_host_to_device_ranges_rx_request(
+    CHECK_THROWS_AS(uring_reactor::prep_host_to_device_rxv_request(
                       cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0),
                     std::runtime_error);
   }
@@ -1122,7 +1122,7 @@ TEST_CASE("prep_host_to_device_ranges on empty input yields a ready zero-byte re
   SECTION("no ranges at all")
   {
     std::vector<io_host_device_range> ranges;
-    auto req = uring_reactor::prep_host_to_device_ranges_rx_request(
+    auto req = uring_reactor::prep_host_to_device_rxv_request(
       cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
     REQUIRE(req != nullptr);
     CHECK(req->size() == 0);
@@ -1134,7 +1134,7 @@ TEST_CASE("prep_host_to_device_ranges on empty input yields a ready zero-byte re
   SECTION("only zero-length read spans")
   {
     std::vector<io_host_device_range> ranges{{0, 0, fake_ptr(0x10000), fake_ptr(0x40000000)}};
-    auto req = uring_reactor::prep_host_to_device_ranges_rx_request(
+    auto req = uring_reactor::prep_host_to_device_rxv_request(
       cfg, *tf.obj, ranges, rmm::cuda_stream_view{}, 0);
     REQUIRE(req != nullptr);
     CHECK(req->size() == 0);

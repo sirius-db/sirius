@@ -17,6 +17,7 @@
 #pragma once
 
 #include "duckdb/planner/table_filter.hpp"
+#include "exec/query_stage_manager.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/datasource_factory.hpp"
@@ -30,7 +31,6 @@
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
 #include "scan_manager/mvcc_mask_job.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
-#include "exec/query_stage_manager.hpp"
 #include "scan_manager/readahead_scan_manager.hpp"
 #include "scan_manager/split_provider.hpp"
 
@@ -596,9 +596,9 @@ class sirius_scan_manager {
   /// Where the readahead subscribes for execution events.  Set once at startup;
   /// the readahead itself is per-query, so it registers and unregisters around
   /// its own lifetime rather than this one.
-  void set_query_stage_manager(sirius::exec::query_stage_manager* manager) noexcept
+  void set_query_stage_manager(sirius::exec::query_stage_manager& manager)
   {
-    _query_stage_manager = manager;
+    _query_stage_manager = manager.shared_from_this();
   }
 
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
@@ -730,8 +730,11 @@ class sirius_scan_manager {
   /// Per-query readahead bookkeeping, seeded from the query's prefetching
   /// order and shared with every scan split this query emits.
   std::shared_ptr<readahead_scan_manager> _readahead;
-  /// Non-owning; outlives every readahead registered with it.
-  sirius::exec::query_stage_manager* _query_stage_manager{nullptr};
+  /// Shared with the context, so it outlives every readahead registered with
+  /// it.  Never null: seeded with a listener-less manager until the context
+  /// hands over its own.
+  std::shared_ptr<sirius::exec::query_stage_manager> _query_stage_manager{
+    std::make_shared<sirius::exec::query_stage_manager>()};
   io::io_context_registry _ioctx_registry;
 };
 

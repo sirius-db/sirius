@@ -301,7 +301,6 @@ class sirius_httpfs_config_env_guard {
         << "\n"
            "        tls_verify: false\n"
            "      rest:\n"
-           "        max_connections: 8\n"
            "        request_timeout_s: 30\n";
     if (perf_instrumentation) { out << "        perf_instrumentation: true\n"; }
     out.close();

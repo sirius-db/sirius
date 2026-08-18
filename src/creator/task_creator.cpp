@@ -91,9 +91,7 @@ void task_creator::set_task_scheduler(sirius::pipeline::task_scheduler& task_sch
 void task_creator::notify_pipeline_closure(std::size_t pipeline_id,
                                            std::size_t source_operator_id) noexcept
 {
-  if (_query_stage_manager != nullptr) {
-    _query_stage_manager->on_pipeline_closed(_query_id, pipeline_id, source_operator_id);
-  }
+  _query_stage_manager->notify_pipeline_closed(_query_id, pipeline_id, source_operator_id);
 }
 
 void task_creator::prepare_for_query(const sirius::planner::query& query)
@@ -374,10 +372,12 @@ void task_creator::manager_loop()
     node                 = get_operator_for_next_task(node);
 
     if (node == nullptr) {
-      if (_query_stage_manager != nullptr) {
-        _query_stage_manager->on_failed_to_create_task(_query_id,
-                                                       requested_node->get_operator_id());
-      }
+      // Observation only, so an unnumbered operator is reported as the sentinel
+      // rather than throwing out of the manager loop.
+      _query_stage_manager->notify_failed_to_create_task(
+        _query_id,
+        requested_node->has_operator_id() ? requested_node->get_operator_id()
+                                          : op::sirius_physical_operator::invalid_operator_id);
       continue;
     }
 
@@ -543,12 +543,8 @@ void task_creator::manager_loop()
                                                                     std::move(local_state),
                                                                     gpu_pipeline_task_global_state);
           task_lock.unlock();
-          if (_query_stage_manager != nullptr) {
-            _query_stage_manager->on_task_created(_query_id,
-                                                  operator_id,
-                                                  node->type,
-                                                  gpu_pipeline_task_global_state->get_priority());
-          }
+          _query_stage_manager->notify_task_created(
+            _query_id, operator_id, node->type, gpu_pipeline_task_global_state->get_priority());
           _task_scheduler->schedule(std::move(task));
 
           if (request_kind == request_type::lookahead) { break; }

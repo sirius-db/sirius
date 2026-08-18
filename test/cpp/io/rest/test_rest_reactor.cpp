@@ -159,8 +159,24 @@ TEST_CASE("prep_host_rxv_request builds one chunk per non-empty segment", "[rest
   sirius::io::rest::config cfg;
   rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/10000);
 
-  SECTION("three in-range segments")
+  SECTION("three in-range segments, all within merge_max_gap of each other")
   {
+    std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(0x1)},
+                                        io_object_segment{500, 100, fake_ptr(0x2)},
+                                        io_object_segment{9000, 100, fake_ptr(0x3)}};
+    auto req = rest_reactor::prep_host_rxv_request(cfg, file, segs);
+    REQUIRE(req->size() == 1);  // the 400B and 8400B gaps are both bridged
+    auto chunks = req->get_all_chunks();
+    REQUIRE(chunks.size() == 1);
+    CHECK(chunks[0]->object.bucket == "bkt");
+    CHECK_FALSE(chunks[0]->is_device());
+    CHECK(chunks[0]->chunk.offset == 0);
+    CHECK(chunks[0]->chunk.size == 9100);
+    CHECK(chunks[0]->chunk.n_chunks() == 5);  // real, hole, real, hole, real
+  }
+  SECTION("three in-range segments with merging off")
+  {
+    cfg.merge_max_gap = 0;
     std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(0x1)},
                                         io_object_segment{500, 100, fake_ptr(0x2)},
                                         io_object_segment{9000, 100, fake_ptr(0x3)}};
@@ -198,65 +214,84 @@ TEST_CASE("prep_host_rxv_request builds one chunk per non-empty segment", "[rest
   }
 }
 
-TEST_CASE("prep_host_rx_request splits a contiguous read by max_read_split", "[rest]")
+TEST_CASE("prep_host_rx_request splits at the max_chunk_size floor", "[rest]")
 {
   constexpr size_t kMiB     = 1UL << 20;
   constexpr uintptr_t kBase = 0x10000;
-  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/256 * kMiB);
+  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/2UL << 30);
 
-  SECTION("a read below 2 MiB stays a single GET")
+  SECTION("a read below the floor stays a single GET")
   {
     sirius::io::rest::config cfg;
-    cfg.max_read_split = 16;
-    auto req           = rest_reactor::prep_host_rx_request(
-      cfg, file, io_object_segment{0, kMiB + kMiB / 2, fake_ptr(kBase)});  // 1.5 MiB
+    auto req = rest_reactor::prep_host_rx_request(
+      cfg, file, io_object_segment{0, 15 * kMiB, fake_ptr(kBase)});
     CHECK(req->size() == 1);
   }
 
-  SECTION("split count is capped by max_read_split")
+  SECTION("a read under twice the floor stays a single GET")
+  {
+    // The floor divides with truncation, so 31 MiB is one 31 MiB GET rather than
+    // two 15.5 MiB ones — splitting here would buy nothing but a second round
+    // trip.
+    sirius::io::rest::config cfg;
+    auto req = rest_reactor::prep_host_rx_request(
+      cfg, file, io_object_segment{0, 31 * kMiB, fake_ptr(kBase)});
+    REQUIRE(req->size() == 1);
+    CHECK(req->get_all_chunks().front()->chunk.size == 31 * kMiB);
+  }
+
+  SECTION("a read past twice the floor splits in two, balanced")
   {
     sirius::io::rest::config cfg;
-    cfg.max_read_split = 4;
-    // 8 MiB / 1 MiB = 8 candidate pieces, but max_read_split caps it at 4.
     auto req = rest_reactor::prep_host_rx_request(
-      cfg, file, io_object_segment{0, 8 * kMiB, fake_ptr(kBase)});
+      cfg, file, io_object_segment{0, 33 * kMiB, fake_ptr(kBase)});
+    REQUIRE(req->size() == 2);
+    auto chunks = req->get_all_chunks();
+    // 33 MiB over two requests: both above the 16 MiB floor, and the bytes are
+    // balanced rather than left as a full chunk plus a 1 MiB straggler.
+    CHECK(chunks.front()->chunk.size == 16 * kMiB + kMiB / 2);
+    CHECK(chunks.back()->chunk.size == 16 * kMiB + kMiB / 2);
+  }
+
+  SECTION("one request is created per floor-sized piece")
+  {
+    sirius::io::rest::config cfg;
+    auto req = rest_reactor::prep_host_rx_request(
+      cfg, file, io_object_segment{0, 64 * kMiB, fake_ptr(kBase)});
     REQUIRE(req->size() == 4);
     auto chunks  = req->get_all_chunks();
     size_t total = 0;
     size_t pos   = 0;
     for (auto const& c : chunks) {
       CHECK(c->chunk.offset == pos);
-      CHECK(c->chunk.size == 2 * kMiB);
+      CHECK(c->chunk.size == 16 * kMiB);
       CHECK(c->chunk.n_chunks() == 1);  // each piece is a plain single-buffer GET
       CHECK(reinterpret_cast<uintptr_t>(c->chunk.data()) == kBase + pos);
       pos += c->chunk.size;
       total += c->chunk.size;
     }
-    CHECK(total == 8 * kMiB);  // pieces cover the whole range, contiguously
+    CHECK(total == 64 * kMiB);  // pieces cover the whole range, contiguously
   }
 
-  SECTION("pieces stay at least 1 MiB when max_read_split exceeds size / 1 MiB")
+  SECTION("the fan-out is not capped: a large read keeps floor-sized chunks")
   {
     sirius::io::rest::config cfg;
-    cfg.max_read_split = 16;
-    // 5 MiB / 1 MiB = 5 pieces, fewer than the cap, so each piece is exactly 1 MiB.
     auto req = rest_reactor::prep_host_rx_request(
-      cfg, file, io_object_segment{0, 5 * kMiB, fake_ptr(kBase)});
-    REQUIRE(req->size() == 5);
+      cfg, file, io_object_segment{0, 1024 * kMiB, fake_ptr(kBase)});
+    REQUIRE(req->size() == 64);  // 1 GiB / 16 MiB — chunks stay at the floor
     auto chunks = req->get_all_chunks();
     for (auto const& c : chunks) {
-      CHECK(c->chunk.size == kMiB);
+      CHECK(c->chunk.size == 16 * kMiB);
     }
   }
 
-  SECTION("an uneven split spreads the remainder over the leading pieces")
+  SECTION("an uneven read spreads its remainder one byte at a time")
   {
     sirius::io::rest::config cfg;
-    cfg.max_read_split = 4;
-    size_t const size  = 8 * kMiB + 3;  // 3 leading pieces get one extra byte
+    size_t const size = 512 * kMiB + 3;
     auto req =
       rest_reactor::prep_host_rx_request(cfg, file, io_object_segment{1000, size, fake_ptr(kBase)});
-    REQUIRE(req->size() == 4);
+    REQUIRE(req->size() == 32);
     auto chunks  = req->get_all_chunks();
     size_t total = 0;
     size_t pos   = 0;
@@ -266,21 +301,29 @@ TEST_CASE("prep_host_rx_request splits a contiguous read by max_read_split", "[r
       pos += c->chunk.size;
       total += c->chunk.size;
     }
-    CHECK(total == size);                               // every byte covered exactly once
-    CHECK(chunks.front()->chunk.size == 2 * kMiB + 1);  // leading piece took a remainder byte
-    CHECK(chunks.back()->chunk.size == 2 * kMiB);       // trailing piece did not
+    CHECK(total == size);                                // every byte covered exactly once
+    CHECK(chunks.front()->chunk.size == 16 * kMiB + 1);  // leading remainder byte
+    CHECK(chunks.back()->chunk.size == 16 * kMiB);       // chunks differ by at most one byte
+  }
+
+  SECTION("max_chunk_size sets the floor")
+  {
+    sirius::io::rest::config cfg;
+    cfg.max_chunk_size = 4 * kMiB;
+    auto req = rest_reactor::prep_host_rx_request(
+      cfg, file, io_object_segment{0, 64 * kMiB, fake_ptr(kBase)});
+    REQUIRE(req->size() == 16);
+    CHECK(req->get_all_chunks().front()->chunk.size == 4 * kMiB);
   }
 }
 
-TEST_CASE("prep_host_rxv_request fuses file-adjacent segments into a scatter GET", "[rest]")
+TEST_CASE("prep_host_rxv_request coalesces near segments into a scatter GET", "[rest]")
 {
   sirius::io::rest::config cfg;
   rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
 
   SECTION("three contiguous segments, separate buffers -> one multi-buffer chunk")
   {
-    cfg.chunk_size   = 1 << 20;  // big enough to fit all three
-    cfg.max_n_chunks = 16;
     std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(0xA00)},
                                         io_object_segment{100, 100, fake_ptr(0xB00)},
                                         io_object_segment{200, 100, fake_ptr(0xC00)}};
@@ -293,48 +336,180 @@ TEST_CASE("prep_host_rxv_request fuses file-adjacent segments into a scatter GET
     CHECK(chunks[0]->chunk.n_chunks() == 3);  // scattered across 3 buffers
     CHECK(chunks[0]->chunk.is_vectored());
   }
-  SECTION("max_n_chunks caps the fusion")
+
+  SECTION("a gap under merge_max_gap is bridged by a hole buffer")
   {
-    cfg.chunk_size   = 1 << 20;
-    cfg.max_n_chunks = 2;  // at most 2 buffers per request
+    // [0,100) and [500,600) are 400 bytes apart: one GET covers [0,600) and the
+    // bridged 400 bytes land in a null (hole) buffer that write_to_sink drops.
     std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(0xA00)},
-                                        io_object_segment{100, 100, fake_ptr(0xB00)},
-                                        io_object_segment{200, 100, fake_ptr(0xC00)}};
+                                        io_object_segment{500, 100, fake_ptr(0xB00)}};
     auto req = rest_reactor::prep_host_rxv_request(cfg, file, segs);
-    REQUIRE(req->size() == 2);  // [0,200) over 2 buffers, then [200,300)
+    REQUIRE(req->size() == 1);
+    auto chunks = req->get_all_chunks();
+    auto const& c = chunks[0]->chunk;
+    CHECK(c.offset == 0);
+    CHECK(c.size == 600);        // the GET spans the gap
+    CHECK(c.n_chunks() == 3);    // real, hole, real
+    CHECK(c.buffers[0].iov_base == fake_ptr(0xA00));
+    CHECK(c.buffers[0].iov_len == 100);
+    CHECK(c.buffers[1].iov_base == nullptr);  // the hole
+    CHECK(c.buffers[1].iov_len == 400);
+    CHECK(c.buffers[2].iov_base == fake_ptr(0xB00));
+    CHECK(c.buffers[2].iov_len == 100);
+    // Only the caller's bytes are reported; the bridged ones are not delivered.
+    CHECK(chunks[0]->manager->bytes_requested == 200);
   }
-  SECTION("chunk_size caps the fused span")
+
+  SECTION("a gap over merge_max_gap stays two GETs")
   {
-    cfg.chunk_size   = 250;  // two 100B segments fit, the third spills over
-    cfg.max_n_chunks = 16;
-    std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(0xA00)},
-                                        io_object_segment{100, 100, fake_ptr(0xB00)},
-                                        io_object_segment{200, 100, fake_ptr(0xC00)}};
-    auto req = rest_reactor::prep_host_rxv_request(cfg, file, segs);
-    REQUIRE(req->size() == 2);  // [0,200) then [200,300)
-  }
-  SECTION("non-contiguous segments stay separate")
-  {
-    cfg.chunk_size   = 1 << 20;
-    cfg.max_n_chunks = 16;
+    cfg.merge_max_gap = 100;
     std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(0xA00)},
                                         io_object_segment{500, 100, fake_ptr(0xB00)}};
     auto req = rest_reactor::prep_host_rxv_request(cfg, file, segs);
     REQUIRE(req->size() == 2);
+    auto chunks = req->get_all_chunks();
+    CHECK(chunks[0]->chunk.size == 100);
+    CHECK(chunks[1]->chunk.offset == 500);
+    CHECK(chunks[1]->chunk.size == 100);
   }
-  SECTION("a large segment in the vector is split")
+
+  SECTION("merge_max_gap of zero fuses only genuinely adjacent segments")
   {
-    cfg.chunk_size   = 4096;
-    cfg.max_n_chunks = 16;
+    cfg.merge_max_gap = 0;
+    std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(0xA00)},
+                                        io_object_segment{100, 100, fake_ptr(0xB00)},
+                                        io_object_segment{201, 100, fake_ptr(0xC00)}};
+    auto req = rest_reactor::prep_host_rxv_request(cfg, file, segs);
+    REQUIRE(req->size() == 2);
+    auto chunks = req->get_all_chunks();
+    CHECK(chunks[0]->chunk.size == 200);
+    CHECK(chunks[0]->chunk.n_chunks() == 2);
+    CHECK(chunks[1]->chunk.offset == 201);
+  }
+
+  SECTION("a coalesced span past twice the floor is cut on a buffer boundary")
+  {
+    cfg.max_chunk_size = 100;
+    std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(0xA00)},
+                                        io_object_segment{100, 100, fake_ptr(0xB00)},
+                                        io_object_segment{200, 100, fake_ptr(0xC00)}};
+    auto req = rest_reactor::prep_host_rxv_request(cfg, file, segs);
+    REQUIRE(req->size() == 3);  // 300 / 100 -> three chunks, one buffer each
+    auto chunks = req->get_all_chunks();
+    std::array<uintptr_t, 3> const bases{0xA00, 0xB00, 0xC00};
+    for (size_t i = 0; i < 3; ++i) {
+      CHECK(chunks[i]->chunk.offset == i * 100);
+      CHECK(chunks[i]->chunk.size == 100);
+      CHECK(chunks[i]->chunk.n_chunks() == 1);
+      CHECK(reinterpret_cast<uintptr_t>(chunks[i]->chunk.data()) == bases[i]);
+    }
+  }
+
+  SECTION("a cut falling inside a buffer divides it between two chunks")
+  {
+    cfg.max_chunk_size = 150;
+    std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(0xA00)},
+                                        io_object_segment{100, 100, fake_ptr(0xB00)},
+                                        io_object_segment{200, 100, fake_ptr(0xC00)}};
+    auto req = rest_reactor::prep_host_rxv_request(cfg, file, segs);
+    REQUIRE(req->size() == 2);  // 300 / 150 -> two 150-byte chunks
+    auto chunks = req->get_all_chunks();
+
+    // [0,150): all of buffer A, then the first half of buffer B.
+    CHECK(chunks[0]->chunk.offset == 0);
+    CHECK(chunks[0]->chunk.size == 150);
+    REQUIRE(chunks[0]->chunk.n_chunks() == 2);
+    CHECK(chunks[0]->chunk.buffers[0].iov_base == fake_ptr(0xA00));
+    CHECK(chunks[0]->chunk.buffers[0].iov_len == 100);
+    CHECK(chunks[0]->chunk.buffers[1].iov_base == fake_ptr(0xB00));
+    CHECK(chunks[0]->chunk.buffers[1].iov_len == 50);
+
+    // [150,300): the second half of buffer B, then all of buffer C.
+    CHECK(chunks[1]->chunk.offset == 150);
+    CHECK(chunks[1]->chunk.size == 150);
+    REQUIRE(chunks[1]->chunk.n_chunks() == 2);
+    CHECK(chunks[1]->chunk.buffers[0].iov_base == fake_ptr(0xB00 + 50));
+    CHECK(chunks[1]->chunk.buffers[0].iov_len == 50);
+    CHECK(chunks[1]->chunk.buffers[1].iov_base == fake_ptr(0xC00));
+    CHECK(chunks[1]->chunk.buffers[1].iov_len == 100);
+  }
+
+  SECTION("a single oversized segment is cut at the floor")
+  {
+    cfg.max_chunk_size = 4096;
     std::vector<io_object_segment> segs{io_object_segment{0, 3 * 4096, fake_ptr(0xA00)}};
     auto req = rest_reactor::prep_host_rxv_request(cfg, file, segs);
-    REQUIRE(req->size() == 3);
+    REQUIRE(req->size() == 3);  // 3 x 4096 / 4096 -> three floor-sized chunks
+    auto chunks = req->get_all_chunks();
+    for (size_t i = 0; i < 3; ++i) {
+      CHECK(chunks[i]->chunk.offset == i * 4096);
+      CHECK(chunks[i]->chunk.size == 4096);
+      CHECK(reinterpret_cast<uintptr_t>(chunks[i]->chunk.data()) == 0xA00 + i * 4096);
+    }
+  }
+}
+
+TEST_CASE("rx_request splits batches by bytes rather than chunk count", "[rest]")
+{
+  sirius::io::rest::config cfg;
+  cfg.merge_max_gap = 0;  // keep one chunk per segment so the split is what is under test
+  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
+
+  // Four small reads and one large one, 800 bytes in total.  A chunk-count
+  // split would put three chunks (300 bytes) against two (500); the byte split
+  // puts four chunks (400) against one (400) — deliberately lopsided in count.
+  std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(0xA00)},
+                                      io_object_segment{200, 100, fake_ptr(0xB00)},
+                                      io_object_segment{400, 100, fake_ptr(0xC00)},
+                                      io_object_segment{600, 100, fake_ptr(0xD00)},
+                                      io_object_segment{800, 400, fake_ptr(0xE00)}};
+  auto req = rest_reactor::prep_host_rxv_request(cfg, file, segs);
+  REQUIRE(req->size() == 5);
+
+  auto parts = sirius::io::rest::rest_rx_request::splits(std::move(req), 2);
+  REQUIRE(parts.size() == 2);
+
+  std::array<size_t, 2> bytes{0, 0};
+  std::array<size_t, 2> counts{0, 0};
+  for (size_t p = 0; p < 2; ++p) {
+    auto chunks = parts[p]->get_all_chunks();
+    counts[p]   = chunks.size();
+    for (auto const& c : chunks) {
+      bytes[p] += c->chunk.size;
+    }
+    complete(chunks);
+  }
+
+  CHECK(bytes[0] == 400);
+  CHECK(bytes[1] == 400);
+  CHECK(counts[0] == 4);
+  CHECK(counts[1] == 1);
+
+}
+
+TEST_CASE("rx_request splits never produces an empty batch", "[rest]")
+{
+  sirius::io::rest::config cfg;
+  cfg.merge_max_gap = 0;
+  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
+
+  // Fewer chunks than splits: the result is short, not padded with empties (an
+  // empty batch would enqueue a request that can never complete its manager).
+  std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(0xA00)},
+                                      io_object_segment{200, 100, fake_ptr(0xB00)}};
+  auto req   = rest_reactor::prep_host_rxv_request(cfg, file, segs);
+  auto parts = sirius::io::rest::rest_rx_request::splits(std::move(req), 8);
+  REQUIRE(parts.size() == 2);
+  for (auto& p : parts) {
+    auto chunks = p->get_all_chunks();
+    CHECK(chunks.size() == 1);
+    complete(chunks);
   }
 }
 
 TEST_CASE("prep_host_to_device fuses contiguous segments into a multi-copy chunk", "[rest]")
 {
-  sirius::io::rest::config cfg;  // default chunk_size (8 MiB) / max_n_chunks (16)
+  sirius::io::rest::config cfg;  // default max_chunk_size (16 MiB) / merge_max_gap (0.5 MiB)
   rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
   constexpr uintptr_t kDst = 0x100000;
   constexpr uintptr_t kB0 = 0xA000, kB1 = 0xB000, kB2 = 0xC000;
@@ -395,19 +570,58 @@ TEST_CASE("prep_host_to_device fuses contiguous segments into a multi-copy chunk
     CHECK(c.cpy_req->copies[2].size == 50);
   }
 
-  SECTION("max_n_chunks caps the fused buffers per chunk")
+  SECTION("a cut inside a buffer splits its copy across the two chunks")
   {
-    cfg.max_n_chunks = 2;
+    cfg.max_chunk_size = 150;
     std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(kB0)},
                                         io_object_segment{100, 100, fake_ptr(kB1)},
                                         io_object_segment{200, 100, fake_ptr(kB2)}};
     auto req = rest_reactor::prep_host_to_device_rx_request(
       cfg, file, segs, fake_ptr(kDst), 0, 300, rmm::cuda_stream_view{}, 0);
-    REQUIRE(req->size() == 2);  // [0,200) over 2 buffers, then [200,300)
+    REQUIRE(req->size() == 2);  // 300 / 150
+    auto chunks = req->get_all_chunks();
+
+    // Buffer B straddles the cut, so each half copies from its own chunk.
+    REQUIRE(chunks[0]->cpy_req->copies.size() == 2);
+    CHECK(reinterpret_cast<uintptr_t>(chunks[0]->cpy_req->copies[0].src) == kB0);
+    CHECK(chunks[0]->cpy_req->copies[0].size == 100);
+    CHECK(reinterpret_cast<uintptr_t>(chunks[0]->cpy_req->copies[1].src) == kB1);
+    CHECK(reinterpret_cast<uintptr_t>(chunks[0]->cpy_req->copies[1].dst) == kDst + 100);
+    CHECK(chunks[0]->cpy_req->copies[1].size == 50);
+
+    REQUIRE(chunks[1]->cpy_req->copies.size() == 2);
+    CHECK(reinterpret_cast<uintptr_t>(chunks[1]->cpy_req->copies[0].src) == kB1 + 50);
+    CHECK(reinterpret_cast<uintptr_t>(chunks[1]->cpy_req->copies[0].dst) == kDst + 150);
+    CHECK(chunks[1]->cpy_req->copies[0].size == 50);
+    CHECK(reinterpret_cast<uintptr_t>(chunks[1]->cpy_req->copies[1].src) == kB2);
+    CHECK(chunks[1]->cpy_req->copies[1].size == 100);
   }
 
-  SECTION("non-contiguous buffers stay separate single-copy chunks")
+  SECTION("a near-neighbor gap is bridged and copies nothing for the hole")
   {
+    std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(kB0)},
+                                        io_object_segment{500, 100, fake_ptr(kB1)}};
+    auto req = rest_reactor::prep_host_to_device_rx_request(
+      cfg, file, segs, fake_ptr(kDst), 0, 600, rmm::cuda_stream_view{}, 0);
+    REQUIRE(req->size() == 1);
+    auto chunks   = req->get_all_chunks();
+    auto const& c = *chunks[0];
+    CHECK(c.chunk.size == 600);
+    CHECK(c.chunk.n_chunks() == 3);  // real, hole, real
+    REQUIRE(c.cpy_req->copies.size() == 2);
+    CHECK(reinterpret_cast<uintptr_t>(c.cpy_req->copies[0].src) == kB0);
+    CHECK(reinterpret_cast<uintptr_t>(c.cpy_req->copies[0].dst) == kDst);
+    CHECK(c.cpy_req->copies[0].size == 100);
+    CHECK(reinterpret_cast<uintptr_t>(c.cpy_req->copies[1].src) == kB1);
+    CHECK(reinterpret_cast<uintptr_t>(c.cpy_req->copies[1].dst) == kDst + 500);
+    CHECK(c.cpy_req->copies[1].size == 100);
+    // The bridged bytes are fetched but never delivered.
+    CHECK(chunks[0]->manager->bytes_requested == 200);
+  }
+
+  SECTION("buffers further apart than merge_max_gap stay separate chunks")
+  {
+    cfg.merge_max_gap = 100;
     std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(kB0)},
                                         io_object_segment{500, 100, fake_ptr(kB1)}};
     auto req = rest_reactor::prep_host_to_device_rx_request(
@@ -424,7 +638,7 @@ TEST_CASE("prep_host_to_device fuses contiguous segments into a multi-copy chunk
 TEST_CASE("prep_host_to_device keeps null-buffer segments as standalone bounce-staged chunks",
           "[rest]")
 {
-  sirius::io::rest::config cfg;  // default chunk_size (8 MiB) / max_n_chunks (16)
+  sirius::io::rest::config cfg;  // default max_chunk_size (16 MiB) / merge_max_gap (0.5 MiB)
   rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
   constexpr uintptr_t kDst = 0x100000;
   constexpr uintptr_t kB0 = 0xA000, kB1 = 0xB000;
@@ -520,8 +734,7 @@ TEST_CASE("prep_device_ranges builds one staged GET per small range", "[rest]")
   // the single-range path — every copy targets its own device buffer.
   std::vector<io_device_range> ranges{
     {0, 100, fake_ptr(kD0)}, {500, 100, fake_ptr(kD1)}, {9000, 300, fake_ptr(kD2)}};
-  auto req =
-    rest_reactor::prep_device_ranges_rx_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+  auto req = rest_reactor::prep_device_rxv_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
   REQUIRE(req->size() == 3);
   auto fut    = req->get_future();
   auto chunks = req->get_all_chunks();
@@ -560,9 +773,8 @@ TEST_CASE("prep_device_ranges splits a range across bounce blocks", "[rest]")
   constexpr uintptr_t kBig = 0x100000, kSmall = 0x200000;
 
   std::vector<io_device_range> ranges{{0, 250, fake_ptr(kBig)}, {1000, 50, fake_ptr(kSmall)}};
-  auto req =
-    rest_reactor::prep_device_ranges_rx_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
-  auto fut    = req->get_future();
+  auto req = rest_reactor::prep_device_rxv_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+  auto fut = req->get_future();
   auto chunks = req->get_all_chunks();
 
   REQUIRE(chunks.size() == 4);  // ceil(250/100) = 3 blocks, plus 1 for the small range
@@ -605,9 +817,8 @@ TEST_CASE("prep_device_ranges clamps a range at the object end and drops ranges 
     {9900, 1000, fake_ptr(kTail)},      // starts in the object, overhangs the end
     {10000, 100, fake_ptr(0x200000)},   // starts exactly at the end
     {20000, 100, fake_ptr(0x300000)}};  // starts past the end
-  auto req =
-    rest_reactor::prep_device_ranges_rx_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
-  auto fut    = req->get_future();
+  auto req = rest_reactor::prep_device_rxv_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+  auto fut = req->get_future();
   auto chunks = req->get_all_chunks();
 
   // Only the in-object range survives; the at/past-end ranges emit no chunk and
@@ -636,8 +847,7 @@ TEST_CASE("prep_device_ranges drops zero-size ranges and null destinations", "[r
     std::vector<io_device_range> ranges{{0, 0, fake_ptr(0x200000)},  // no bytes wanted
                                         {100, 100, nullptr},         // nowhere to put them
                                         {200, 100, fake_ptr(kDst)}};
-    auto req =
-      rest_reactor::prep_device_ranges_rx_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+    auto req = rest_reactor::prep_device_rxv_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
     REQUIRE(req->size() == 1);
     auto fut    = req->get_future();
     auto chunks = req->get_all_chunks();
@@ -655,8 +865,7 @@ TEST_CASE("prep_device_ranges drops zero-size ranges and null destinations", "[r
   SECTION("an all-skipped vector degrades to a ready zero-byte request")
   {
     std::vector<io_device_range> ranges{{0, 0, fake_ptr(0x200000)}, {100, 100, nullptr}};
-    auto req =
-      rest_reactor::prep_device_ranges_rx_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+    auto req = rest_reactor::prep_device_rxv_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
     REQUIRE(req != nullptr);
     CHECK(req->size() == 0);
     auto fut = req->get_future();
@@ -672,8 +881,7 @@ TEST_CASE("prep_device_ranges on an empty range list yields a ready zero-byte re
   rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
 
   std::vector<io_device_range> ranges;
-  auto req =
-    rest_reactor::prep_device_ranges_rx_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+  auto req = rest_reactor::prep_device_rxv_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
   REQUIRE(req != nullptr);
   CHECK(req->size() == 0);
   auto fut = req->get_future();
@@ -696,9 +904,8 @@ TEST_CASE("prep_device_ranges reports the clamped byte total through the request
     {9900, 1000, fake_ptr(0x200000)},   // straddles the end    -> 100
     {20000, 100, fake_ptr(0x300000)}};  // past the end         -> dropped
 
-  auto req =
-    rest_reactor::prep_device_ranges_rx_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
-  auto fut    = req->get_future();
+  auto req = rest_reactor::prep_device_rxv_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+  auto fut = req->get_future();
   auto chunks = req->get_all_chunks();
 
   REQUIRE(chunks.size() == 2);
@@ -721,15 +928,14 @@ TEST_CASE("prep_device_ranges throws without a bounce block size", "[rest]")
     // way to land the bytes — same contract as the single-range prep.
     std::vector<io_device_range> ranges{{0, 100, fake_ptr(0x100000)}};
     CHECK_THROWS_AS(
-      rest_reactor::prep_device_ranges_rx_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0),
+      rest_reactor::prep_device_rxv_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0),
       std::runtime_error);
   }
 
   SECTION("an empty range list short-circuits before the bounce check")
   {
     std::vector<io_device_range> ranges;
-    auto req =
-      rest_reactor::prep_device_ranges_rx_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+    auto req = rest_reactor::prep_device_rxv_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
     CHECK(req->size() == 0);
   }
 }
@@ -738,7 +944,8 @@ TEST_CASE("prep_device_ranges throws without a bounce block size", "[rest]")
 
 TEST_CASE("prep_host_to_device_ranges clips the copy window inside an over-read segment", "[rest]")
 {
-  sirius::io::rest::config cfg;  // default chunk_size (8 MiB) / max_n_chunks (16)
+  sirius::io::rest::config cfg;
+  cfg.merge_max_gap = 0;  // isolate copy-window clipping from gap bridging
   rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
   constexpr uintptr_t kB0 = 0xA000, kB1 = 0xB000;
   constexpr uintptr_t kD0 = 0x100000, kD1 = 0x200000;
@@ -759,12 +966,12 @@ TEST_CASE("prep_host_to_device_ranges clips the copy window inside an over-read 
                                             fake_ptr(kB1),
                                             fake_ptr(kD1)}};
 
-  auto req = rest_reactor::prep_host_to_device_ranges_rx_request(
-    cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+  auto req =
+    rest_reactor::prep_host_to_device_rxv_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
   auto fut    = req->get_future();
   auto chunks = req->get_all_chunks();
 
-  REQUIRE(chunks.size() == 2);  // not file-adjacent, so no fusion
+  REQUIRE(chunks.size() == 2);  // not file-adjacent and no bridging, so no fusion
   CHECK(chunks[0]->manager->total_chunks == 2);
   // The future reports the copy windows (400), never the 2000 bytes fetched.
   CHECK(chunks[0]->manager->bytes_requested == 300 + 100);
@@ -806,8 +1013,8 @@ TEST_CASE("prep_host_to_device_ranges fuses contiguous caller buffers into one s
                                            {100, 100, fake_ptr(kB1), fake_ptr(kD1)},
                                            {200, 100, fake_ptr(kB2), fake_ptr(kD2)}};
 
-  auto req = rest_reactor::prep_host_to_device_ranges_rx_request(
-    cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+  auto req =
+    rest_reactor::prep_host_to_device_rxv_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
   auto fut    = req->get_future();
   auto chunks = req->get_all_chunks();
 
@@ -854,8 +1061,8 @@ TEST_CASE("prep_host_to_device_ranges keeps a null-buffer range standalone betwe
     {400, 100, fake_ptr(kB2), fake_ptr(kD2)},
     {500, 100, fake_ptr(kB3), fake_ptr(kD3)}};
 
-  auto req = rest_reactor::prep_host_to_device_ranges_rx_request(
-    cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+  auto req =
+    rest_reactor::prep_host_to_device_rxv_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
   auto fut    = req->get_future();
   auto chunks = req->get_all_chunks();
 
@@ -897,8 +1104,8 @@ TEST_CASE("prep_host_to_device_ranges splits an oversized null-buffer range acro
   std::vector<io_host_device_range> ranges{
     {0, 500, /*copy_offset=*/150, /*copy_size=*/280, /*host_buffer=*/nullptr, fake_ptr(kDst)}};
 
-  auto req = rest_reactor::prep_host_to_device_ranges_rx_request(
-    cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+  auto req =
+    rest_reactor::prep_host_to_device_rxv_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
   auto fut    = req->get_future();
   auto chunks = req->get_all_chunks();
 
@@ -945,27 +1152,27 @@ TEST_CASE("prep_host_to_device_ranges rejects an invalid or out-of-file copy win
   {
     std::vector<io_host_device_range> ranges{
       {100, 100, /*copy_offset=*/50, 20, fake_ptr(kB), fake_ptr(kD)}};
-    CHECK_THROWS_AS(rest_reactor::prep_host_to_device_ranges_rx_request(
-                      cfg, file, ranges, rmm::cuda_stream_view{}, 0),
-                    std::runtime_error);
+    CHECK_THROWS_AS(
+      rest_reactor::prep_host_to_device_rxv_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0),
+      std::runtime_error);
   }
 
   SECTION("copy window running past the read span")
   {
     std::vector<io_host_device_range> ranges{
       {100, 100, /*copy_offset=*/150, 100, fake_ptr(kB), fake_ptr(kD)}};
-    CHECK_THROWS_AS(rest_reactor::prep_host_to_device_ranges_rx_request(
-                      cfg, file, ranges, rmm::cuda_stream_view{}, 0),
-                    std::runtime_error);
+    CHECK_THROWS_AS(
+      rest_reactor::prep_host_to_device_rxv_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0),
+      std::runtime_error);
   }
 
   SECTION("copy window entirely past the end of the object")
   {
     std::vector<io_host_device_range> ranges{
       {10000, 100, /*copy_offset=*/10000, 100, fake_ptr(kB), fake_ptr(kD)}};
-    CHECK_THROWS_AS(rest_reactor::prep_host_to_device_ranges_rx_request(
-                      cfg, file, ranges, rmm::cuda_stream_view{}, 0),
-                    std::runtime_error);
+    CHECK_THROWS_AS(
+      rest_reactor::prep_host_to_device_rxv_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0),
+      std::runtime_error);
   }
 
   SECTION("a null-buffer range without a bounce block size")
@@ -974,9 +1181,9 @@ TEST_CASE("prep_host_to_device_ranges rejects an invalid or out-of-file copy win
     // for a caller-bufferless range to land.
     std::vector<io_host_device_range> ranges{
       {100, 100, /*host_buffer=*/nullptr, fake_ptr(kD)}};  // cfg.bounce_block_size == 0
-    CHECK_THROWS_AS(rest_reactor::prep_host_to_device_ranges_rx_request(
-                      cfg, file, ranges, rmm::cuda_stream_view{}, 0),
-                    std::runtime_error);
+    CHECK_THROWS_AS(
+      rest_reactor::prep_host_to_device_rxv_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0),
+      std::runtime_error);
   }
 }
 
@@ -990,8 +1197,8 @@ TEST_CASE("prep_host_to_device_ranges on an empty range list yields a ready zero
   SECTION("no ranges at all")
   {
     std::vector<io_host_device_range> ranges;
-    auto req = rest_reactor::prep_host_to_device_ranges_rx_request(
-      cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+    auto req =
+      rest_reactor::prep_host_to_device_rxv_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
     REQUIRE(req != nullptr);
     CHECK(req->size() == 0);
     auto fut = req->get_future();
@@ -1002,8 +1209,8 @@ TEST_CASE("prep_host_to_device_ranges on an empty range list yields a ready zero
   SECTION("only zero-length read spans")
   {
     std::vector<io_host_device_range> ranges{{0, 0, fake_ptr(0xA000), fake_ptr(0x100000)}};
-    auto req = rest_reactor::prep_host_to_device_ranges_rx_request(
-      cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+    auto req =
+      rest_reactor::prep_host_to_device_rxv_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
     REQUIRE(req != nullptr);
     CHECK(req->size() == 0);
     auto fut = req->get_future();

@@ -105,7 +105,6 @@
 #include <deque>
 #include <memory>
 #include <mutex>
-#include <new>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -117,11 +116,19 @@ namespace sirius::exec {
 // Configuration
 // ---------------------------------------------------------------------------
 
-#if defined(__cpp_lib_hardware_interference_size)
-inline constexpr std::size_t cacheline_v = std::hardware_destructive_interference_size;
-#else
-inline constexpr std::size_t cacheline_v = 64;  // aarch64/Grace: 64B lines
-#endif
+// Cache-line size, used to pad and align away false sharing.
+//
+// Pinned rather than taken from std::hardware_destructive_interference_size on
+// purpose.  That constant varies with -mtune, and this one appears in `alignas`
+// on a type (completion_slot) and on members of a class defined in this header,
+// so two translation units compiled with different tuning would disagree about
+// layout and sizeof -- an ODR violation, not merely a missed optimisation.
+// This is precisely what GCC's -Winterference-size warns about, and its own
+// advice is to use a constant you define.
+//
+// 64 is the line size on both host architectures Sirius builds for: x86-64 and
+// aarch64 (including Grace).
+inline constexpr std::size_t cacheline_v = 64;
 
 // Receives the stream's completion status for the batch it was staged with.
 // Must be noexcept: these run on the allocation path.
