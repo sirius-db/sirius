@@ -334,6 +334,7 @@ bool sirius_pipeline::is_pipeline_finished() const
 {
   // todo (amin): there is a potential race condition between scan executor and gpu pipeline
   // executor
+  // Monotonic latch: sole store under _status_mutex (update_pipeline_status); true is final.
   return pipeline_finished.load();
 }
 
@@ -411,6 +412,8 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
       // scan source, all_ports_empty() is split_connector::is_closed() (closed
       // AND drained); port-less sources are trivially exhausted. limit_exhausted
       // keeps its early exit: it finishes without draining the source.
+      // Each finished latch below is read before its paired emptiness check: pre-latch pushes
+      // (concat's taskless forward) stay visible to it — reordering strands batches.
       bool source_exhausted =
         !source || (source->is_source_pipeline_finished() && source->all_ports_empty());
       if (limit_exhausted || (source_exhausted && first_node->is_source_pipeline_finished() &&

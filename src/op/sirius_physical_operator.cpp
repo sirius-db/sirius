@@ -291,6 +291,9 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
 {
   if (ports.empty()) { return std::nullopt; }
 
+  // Finished-latch reads precede the repo-size reads below: a batch in flight between pop and
+  // downstream push (concat's taskless forward) then resolves to WAITING. A poll straddling the
+  // landing can still return a transient nullopt; the forward's schedule() ping re-polls.
   // look at the input ports and see if there are any unfinished hard barriers
   auto unfinished_barrier = std::find_if(_ports_list.begin(), _ports_list.end(), [](const auto& p) {
     return p->type == MemoryBarrierType::FULL && p->src_pipeline &&
