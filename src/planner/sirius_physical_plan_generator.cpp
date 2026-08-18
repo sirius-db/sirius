@@ -842,11 +842,14 @@ namespace {
 
 //! Whether a sink's input semantics permit merge fusion.
 //!
-//! Only sinks with special multi-input wiring are excluded. Everything else -- including
-//! total-input structural sinks such as ORDER_BY, TOP_N, and an outer GROUP BY -- is fusable:
-//! those sinks already buffer their full input, so folding the merge into their pipeline does
-//! not change when they observe complete data, it only removes a task launch and a repository
-//! round-trip.
+//! The safety criterion: a sink is fusable iff folding the merge into its pipeline does not
+//! change when the sink observes complete data. Total-input sinks -- ORDER_BY, TOP_N, an outer
+//! GROUP BY, and DENSE_COUNT_JOIN (a multi-input sink, but FULL-barrier on both of its ports,
+//! so it always sees each side whole before its single task runs) -- satisfy this: they
+//! already buffer their full input, and fusion only removes a task launch and a repository
+//! round-trip. The exclusions below are sinks whose bespoke multi-input wiring or
+//! whole-input-per-task partition contracts break under fusion; "multi-input" alone is NOT
+//! the criterion (DENSE_COUNT_JOIN is the counterexample).
 bool terminal_sink_supports_fusion(const sirius::op::sirius_physical_operator& sink)
 {
   using T = sirius::op::SiriusPhysicalOperatorType;

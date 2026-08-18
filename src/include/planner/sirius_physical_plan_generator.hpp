@@ -197,6 +197,15 @@ class sirius_physical_plan_generator {
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_delim_join(
     duckdb::LogicalComparisonJoin& op);
 
+  //! Fused count-join fast path: when @p op is a single-COUNT aggregate grouped exactly by the
+  //! preserved-side key of a LEFT/RIGHT single-integer-equality comparison join, plan the join
+  //! children directly under a DENSE_COUNT_JOIN operator (skipping the join, the hoist
+  //! projection, the group-by, and all their partition/merge wraps). Returns nullptr when the
+  //! shape or the `enable_dense_count_join` knob declines, letting the caller take the normal
+  //! aggregate path.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_dense_count_join(
+    duckdb::LogicalAggregate& op);
+
   // Sirius reads and projects nested (STRUCT/LIST/MAP) columns but cannot operate
   // on them yet: WHERE / GROUP BY / JOIN ON over a nested column must fail with a
   // clear error naming the column instead of crashing or returning wrong results.

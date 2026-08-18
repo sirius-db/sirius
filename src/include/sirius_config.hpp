@@ -98,6 +98,17 @@ struct valid_domain_coverage_threshold {
 /// (NVIDIA/cuCollections#834) on some key distributions. Re-enable once the fix ships in libcudf.
 constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
+/// Fuse `COUNT(col | *) GROUP BY <preserved-side join key>` over a LEFT/RIGHT integer equi-join
+/// into the DENSE_COUNT_JOIN operator (TPC-H q13 shape): instead of building a hash table over
+/// the counted side, materializing the join, and re-aggregating, the operator counts matches in
+/// a direct-address histogram over the preserved key domain [min, max] measured from the data.
+constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = true;
+
+/// Cap on the combined direct-address histogram footprint (presence + counts arrays) of
+/// DENSE_COUNT_JOIN. A key domain too wide for this budget takes the operator's exact sparse
+/// (eager-aggregation) strategy instead; correctness never depends on this value.
+constexpr uint64_t DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES = 2ULL * 1024 * 1024 * 1024;  // 2 GiB
+
 }  // namespace config
 
 /// Operator parameters shared between planning and execution.
@@ -181,6 +192,14 @@ struct operator_params {
   /// metadata; other scans use native carriers. Logical types remain unchanged, and type-sensitive
   /// boundaries restore native carriers.
   bool enable_compressed_materialization = true;
+
+  /// Fuse COUNT-grouped-by-join-key outer equi-joins into DENSE_COUNT_JOIN (see
+  /// config::DEFAULT_ENABLE_DENSE_COUNT_JOIN).
+  bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;
+
+  /// Direct-address histogram budget for DENSE_COUNT_JOIN (see
+  /// config::DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES).
+  uint64_t dense_count_join_max_bytes = config::DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES;
 
   /// Admission-time GPU allocation: target bytes of projected scan output per GPU.
   /// At query start, the engine estimates total scan output bytes from the plan's

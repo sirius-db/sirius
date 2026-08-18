@@ -1836,3 +1836,63 @@ TEST_CASE("Per-connection state isolates and expires the transparent capture",
   REQUIRE(after_prepare.successful_rebinds == before_prepare.successful_rebinds);
   REQUIRE(conn_state->take_captured_plan_if_current() == nullptr);
 }
+
+TEST_CASE("Sirius configuration parses and validates dense count join knobs", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+
+  {
+    sirius::sirius_config config;
+    REQUIRE_NOTHROW(config.load_from_file(data_dir / "valid_dense_count_join_params.yaml"));
+    REQUIRE_FALSE(config.get_operator_params().enable_dense_count_join);
+    REQUIRE(config.get_operator_params().dense_count_join_max_bytes == 64ULL * 1024 * 1024);
+  }
+  {
+    // Defaults when the keys are absent.
+    sirius::sirius_config config;
+    REQUIRE(config.get_operator_params().enable_dense_count_join ==
+            sirius::config::DEFAULT_ENABLE_DENSE_COUNT_JOIN);
+    REQUIRE(config.get_operator_params().dense_count_join_max_bytes ==
+            sirius::config::DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES);
+  }
+  {
+    sirius::sirius_config config;
+    REQUIRE_THROWS_WITH(
+      config.load_from_file(data_dir / "invalid_dense_count_join_max_bytes_zero.yaml"),
+      Catch::Contains("dense_count_join_max_bytes") &&
+        Catch::Contains("must be greater than zero"));
+  }
+}
+
+TEST_CASE(
+  "DuckDB setting rejects a zero dense count join histogram budget without a Sirius "
+  "context",
+  "[sirius][context][config][isolated_context]")
+{
+  finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
+  setenv("SIRIUS_DISABLE", "1", 1);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+
+  auto result = con.Query("SET dense_count_join_max_bytes = 0");
+  REQUIRE(result != nullptr);
+  REQUIRE(result->HasError());
+  REQUIRE_THAT(result->GetError(),
+               Catch::Contains("dense_count_join_max_bytes must be greater than zero"));
+
+  // Valid values and the enable knob round-trip through current_setting.
+  auto set_bytes = con.Query("SET dense_count_join_max_bytes = 1024");
+  REQUIRE_FALSE(set_bytes->HasError());
+  auto set_enable = con.Query("SET enable_dense_count_join = false");
+  REQUIRE_FALSE(set_enable->HasError());
+  auto readback = con.Query(R"(
+    SELECT
+      current_setting('dense_count_join_max_bytes')::UBIGINT,
+      current_setting('enable_dense_count_join')::BOOLEAN
+  )");
+  REQUIRE_FALSE(readback->HasError());
+  REQUIRE(readback->GetValue(0, 0).GetValue<uint64_t>() == 1024);
+  REQUIRE_FALSE(readback->GetValue(1, 0).GetValue<bool>());
+}

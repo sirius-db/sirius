@@ -295,6 +295,12 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
     "dynamic_filter_keep_threshold", opt.dynamic_filter_keep_threshold, yaml::fraction<double>{});
   r.optional("enable_pinned_zone_map_pruning", opt.enable_pinned_zone_map_pruning);
   r.optional("enable_compressed_materialization", opt.enable_compressed_materialization);
+  r.optional("enable_dense_count_join", opt.enable_dense_count_join);
+  r.optional("dense_count_join_max_bytes", yaml::bytes(opt.dense_count_join_max_bytes));
+  if (opt.dense_count_join_max_bytes == 0) {
+    throw std::runtime_error(
+      "'operator_params.dense_count_join_max_bytes': must be greater than zero");
+  }
   // 0 is meaningful here: it turns the estimate off and leaves sizing to gpus_per_query.
   r.optional("admission_bytes_per_gpu", yaml::bytes(opt.admission_bytes_per_gpu));
   r.optional("avg_variable_column_bytes", yaml::bytes(opt.avg_variable_column_bytes));

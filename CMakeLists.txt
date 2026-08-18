@@ -354,6 +354,7 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_concat.cpp
     src/op/sirius_physical_cte.cpp
     src/op/sirius_physical_delim_join.cpp
+    src/op/sirius_physical_dense_count_join.cpp
     src/op/sirius_physical_dummy_scan.cpp
     src/op/sirius_physical_empty_result.cpp
     src/op/sirius_physical_filter.cpp
@@ -451,6 +452,7 @@ set(EXTENSION_SOURCES
 # Deleting src/legacy/ cleanly removes legacy build support.
 set(CUDA_SOURCES
     src/op/partition/crc32_partition_hash.cu
+    src/cuda/dense_count_join_impl.cu
     src/cuda/dynamic_filter_replica_transfer.cu
     src/cuda/sirius_dynamic_bloom_filter.cu
     src/cuda/sirius_dynamic_in_list_filter.cu
@@ -716,6 +718,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_aggregate_nulls.cpp
     test/cpp/integration/test_gpu_execution_allnull_scan.cpp
     test/cpp/integration/test_gpu_execution_array.cpp
+    test/cpp/integration/test_gpu_execution_dense_count_join.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_native.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_sip.cpp
     test/cpp/integration/test_gpu_execution_filter_nulls.cpp
@@ -790,6 +793,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_gpu_partition_impl.cpp
     test/cpp/operator/test_host_table_chunk_reader.cpp
     test/cpp/operator/test_physical_concat.cpp
+    test/cpp/operator/test_physical_dense_count_join.cpp
     test/cpp/operator/test_physical_sort_sample.cpp
     test/cpp/operator/test_physical_filter.cpp
     test/cpp/operator/test_physical_limit.cpp
@@ -813,6 +817,7 @@ set(TEST_SOURCES
     test/cpp/parallel/test_task_executor.cpp
     src/planner/dynamic_filter/duckdb_join_filter_candidate_adapter.cpp
     test/cpp/planner/test_compressed_schema_propagation.cpp
+    test/cpp/planner/test_dense_count_join_detection.cpp
     test/cpp/planner/test_gpu_admission.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp

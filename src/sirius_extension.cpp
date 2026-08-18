@@ -2385,6 +2385,31 @@ static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
                    params->enable_runtime_distinct_build_probe);
 }
 
+static void SetEnableDenseCountJoin(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                       = lock_operator_params_slot(context);
+  params->enable_dense_count_join = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DENSE_COUNT_JOIN to {}", params->enable_dense_count_join);
+}
+
+static void SetDenseCountJoinMaxBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  // Validate before the context lookup so the rejection also fires without a Sirius context
+  // (mirrors SetHashPartitionBytes).
+  const uint64_t max_bytes = UBigIntValue::Get(parameter);
+  if (max_bytes == 0) {
+    throw InvalidInputException("dense_count_join_max_bytes must be greater than zero");
+  }
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                          = lock_operator_params_slot(context);
+  params->dense_count_join_max_bytes = max_bytes;
+  SIRIUS_LOG_DEBUG("Updated config DENSE_COUNT_JOIN_MAX_BYTES to {}",
+                   params->dense_count_join_max_bytes);
+}
+
 static void SetEnableDynamicFilter(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2754,6 +2779,33 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     LogicalType::DOUBLE,
     Value::DOUBLE(operator_defaults.mark_join_build_switch_ratio),
     SetMarkJoinBuildSwitchRatio);
+
+  config.AddExtensionOption(
+    "enable_runtime_distinct_build_probe",
+    "For BUILD_PROBE hash joins whose build-key uniqueness the planner could not prove, test "
+    "distinctness at runtime (one cudf::distinct_count pass over the cached build) and take the "
+    "single-pass cudf::distinct_hash_join instead of the general two-pass join when the keys are "
+    "distinct (on by default)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.enable_runtime_distinct_build_probe),
+    SetEnableRuntimeDistinctBuildProbe);
+
+  config.AddExtensionOption(
+    "enable_dense_count_join",
+    "Fuse COUNT-grouped-by-join-key outer equi-joins into the DENSE_COUNT_JOIN operator "
+    "(direct-address count histogram over the preserved key domain; exact sparse eager "
+    "aggregation beyond dense_count_join_max_bytes)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.enable_dense_count_join),
+    SetEnableDenseCountJoin);
+
+  config.AddExtensionOption(
+    "dense_count_join_max_bytes",
+    "Maximum combined bytes of DENSE_COUNT_JOIN's direct-address histograms; wider key domains "
+    "take the operator's exact sparse (eager-aggregation) strategy",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.dense_count_join_max_bytes),
+    SetDenseCountJoinMaxBytes);
 
   config.AddExtensionOption(
     "gpu_execution",

@@ -25,6 +25,7 @@
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
+#include "op/sirius_physical_dense_count_join.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -188,12 +189,19 @@ duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> sirius_pipeline_converter::s
 }
 
 std::string_view sirius_pipeline_converter::resolve_port_id(
-  const op::sirius_physical_operator& sink, const op::sirius_physical_operator& /*parent*/)
+  const op::sirius_physical_operator& sink, const op::sirius_physical_operator& parent)
 {
   using T = op::SiriusPhysicalOperatorType;
   // Build-side CONCATs feed the join's "build" port; everything else feeds "default".
   if (sink.type == T::CONCAT) {
     return sink.Cast<op::sirius_physical_concat>().is_build_concat() ? "build" : "default";
+  }
+  // DENSE_COUNT_JOIN takes both children directly (no CONCAT wrap): the preserved subtree
+  // (children[0]) feeds "preserved", the counted subtree (children[1]) feeds "counted".
+  if (parent.type == T::DENSE_COUNT_JOIN) {
+    return (!parent.children.empty() && parent.children[0].get() == &sink)
+             ? op::sirius_physical_dense_count_join::PRESERVED_PORT
+             : op::sirius_physical_dense_count_join::COUNTED_PORT;
   }
   return "default";
 }

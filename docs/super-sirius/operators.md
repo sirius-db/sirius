@@ -346,6 +346,18 @@ Hash-based GROUP BY.
 - **Label-encoded group keys:** when a COLLECT_SET aggregation is present, the input is large (≥ 1M rows), the group key is multi-column and non-nested, and an HLL estimate puts group cardinality below 1% of rows, the key table is collapsed with `cudf::encode` into a single dense INT32 label so cuDF's `stable_sorted_order` takes its single-column radix path; original keys are recovered by a gather at group cardinality. This short-circuits the STRING dictionary-encode path and falls back silently to the plain multi-column sort on failure.
 - **Key members:** `group_idx`, `cudf_aggregates`, `cudf_aggregate_idx`, `aggregate_slots`, `has_avg`, `has_count_distinct`
 
+### `sirius_physical_dense_count_join` — `DENSE_COUNT_JOIN`
+**File:** `src/include/op/sirius_physical_dense_count_join.hpp`, `src/op/sirius_physical_dense_count_join.cpp`, kernels in `src/cuda/dense_count_join_impl.cu`
+
+Fused count-join: computes `COUNT(col | *) GROUP BY <preserved-side join key>` over a LEFT/RIGHT single-integer-equality comparison join without materializing the join. Created by the planner rewrite `sirius_physical_plan_generator::try_plan_dense_count_join` (TPC-H q13 shape), which replaces the HASH_JOIN + hoist PROJECTION + HASH_GROUP_BY fragment — and all of their PARTITION/CONCAT/MERGE wraps — with this single operator. Children are normalized: `children[0]` = preserved (grouped) side, `children[1]` = counted side; each child must be a linear GET/FILTER/PROJECTION chain.
+
+- **Ports:** two FULL-barrier inputs, `"preserved"` and `"counted"` (wired by `resolve_port_id` from the tree-child position). One task drains both sides once both child pipelines finish; the hint override returns READY when both producers finished and any port is non-empty (an empty counted side must still emit the all-zero-count groups).
+- **GPU execution:** strategy chosen from the ACTUAL preserved-key min/max (`cudf::minmax`, never estimates):
+  - *dense* — `presence` + `counts` direct-address histograms over `[min, max]` (`dense_count_state`); duplicate/missing preserved keys are exact via the presence histogram, `COUNT(col)` NULL semantics via the argument's validity mask, out-of-range counted keys drop as unmatched, u32 slots widen to u64 at ≥ 2^32 rows per side; value = `presence * counts` (`COUNT(col)`) or `presence * max(counts, 1)` (`COUNT(*)`); NULL preserved keys emit the single SQL NULL group.
+  - *sparse* — exact cuDF eager aggregation (per-batch groupby-count partials, groupby-sum merge, `cudf::left_join` of the distinct preserved keys) when the key domain exceeds `dense_count_join_max_bytes`.
+- **Knobs:** `enable_dense_count_join` (default on), `dense_count_join_max_bytes` (default 2 GiB) — see [configuration](configuration.md).
+- **Key members:** `preserved_key_idx`, `counted_key_idx`, `counted_value_idx` (nullopt = `COUNT(*)`), `max_bins_bytes`, `last_strategy`
+
 ## Pipeline Breakers (Sirius-Specific)
 
 These operators are injected during pipeline splitting. They don't map to DuckDB logical operators.
@@ -466,6 +478,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | MERGE_AGGREGATE | Agg | Merge ungrouped partitions |
 | MERGE_GROUP_BY | Agg | Merge grouped partitions |
 | HASH_JOIN | Join | `cudf::{inner,left,right,outer}_join()`, `cudf::distinct_hash_join`, or `cudf::{filtered,mark}_join` (MARK) |
+| DENSE_COUNT_JOIN | Join+Agg | Direct-address count histograms (`dense_count_state`) or exact sparse eager aggregation (`cudf::groupby` + `cudf::left_join`) |
 | NESTED_LOOP_JOIN | Join | Fallback nested loops |
 | LEFT_DELIM_JOIN | Join | Correlated subquery wrapper |
 | RIGHT_DELIM_JOIN | Join | Correlated subquery wrapper |
