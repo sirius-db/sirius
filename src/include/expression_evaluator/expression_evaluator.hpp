@@ -446,6 +446,12 @@ class expression_evaluator {
     sirius::ast::node const& column_operand,
     std::initializer_list<sirius::ast::node const*> constant_operands) const;
 
+  // Return the shared carrier when both operands are in-range references and
+  // narrow_domain_reference_pair_eligible accepts their logical types and materialized carriers.
+  // Return std::nullopt otherwise.
+  [[nodiscard]] std::optional<cudf::data_type> narrow_domain_reference_pair_carrier(
+    sirius::ast::node const& lhs, sirius::ast::node const& rhs) const;
+
   // Evaluate a numeric constant as a scalar of @p carrier (a narrowed integer or fixed-point
   // carrier). Callers must have validated representability via narrow_domain_carrier.
   evaluate_result evaluate_constant_in_carrier(sirius::ast::constant const& expr,

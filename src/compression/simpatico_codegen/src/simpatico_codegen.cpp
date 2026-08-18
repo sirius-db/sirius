@@ -408,7 +408,7 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
   // is not bitpack-rooted and it reads the wrong bits and silently drops the
   // wrong rows — and because the caller's guarantee holds only through a chain
   // of reasoning across several files (a request reaches us only via
-  // compressed_scan::for_chunk, whose narrowing is what makes the claim true).
+  // decompression_pushdown_scan::for_chunk, whose narrowing is what makes the claim true).
   // They are host-side plan-tree walks, once per batch, against device work
   // measured in milliseconds.
   auto refuse = [](char const* why) {

@@ -20,6 +20,7 @@
 #include <expression/ast/aggregate.hpp>  // sirius::ast::aggregate
 #include <expression/ast/node.hpp>       // sirius::ast::node alternatives
 #include <expression_evaluator/expression_evaluator.hpp>
+#include <helper/numeric_narrowing.hpp>
 #include <sirius/exception.hpp>
 
 // cudf
@@ -282,7 +283,10 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
       if (result_column->type() != cudf_return_type) {
         // Cast is only valid for fixed-width types (no STRING/LIST/STRUCT/etc.).
         if (IsFixedWidth(result_column->type()) && IsFixedWidth(cudf_return_type)) {
-          result_column = cudf::cast(result_column->view(), cudf_return_type, _stream, _mr);
+          // Final result-type reconciliation is a physical schema restore. The declared output
+          // type provides the provenance needed to restore a narrowed DATE representation.
+          result_column =
+            sirius::cast_through_rep(result_column->view(), cudf_return_type, _stream, _mr);
         } else {
           throw internal_exception("[expression_evaluator] Unsupported type conversion: {} to {}",
                                    cudf::type_to_name(result_column->type()),

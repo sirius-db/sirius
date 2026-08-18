@@ -50,9 +50,9 @@ namespace sirius {
 // already compacted, so the rows a filter rejects are never fully decoded.
 //
 // This header is the whole boundary between the scan and that machinery. The
-// scan says what it wants (@ref scan_decode_request, built from its pushed-down
+// scan says what it wants (@ref pushdown_request, built from its pushed-down
 // filter by @c sirius::op::analyze_scan_filters), the decoder answers with what
-// it managed to do (@ref decode_outcome). Which parts of the request a given
+// it managed to do (@ref pushdown_outcome). Which parts of the request a given
 // chunk can honour is decided per chunk, inside — the scan never inspects a
 // compression plan and never names a kernel.
 //
@@ -97,8 +97,8 @@ struct membership_probe {
 ///
 /// Immutable once built and shared by every batch; per-batch variations (a
 /// fresher join-filter set, or dropping the row selection once measured
-/// unprofitable) are made by copy — see @ref compressed_scan.
-struct scan_decode_request {
+/// unprofitable) are made by copy — see @ref decompression_pushdown_scan.
+struct pushdown_request {
   /// One selected column's share of the filter. Entries are parallel to the
   /// column list the decode is asked for; a shorter vector leaves the tail
   /// unfiltered.
@@ -106,7 +106,7 @@ struct scan_decode_request {
     /// Non-empty ⇒ this column's whole filter is `value IN {…}` over string
     /// constants, and the column is never projected. A dictionary-rooted plan
     /// answers it off its key set, so the column arrives as the BOOL8 ANSWER
-    /// rather than its declared type (see @ref decode_outcome::predicate_columns).
+    /// rather than its declared type (see @ref pushdown_outcome::predicate_columns).
     std::vector<std::string> equals_any;
     /// Row-restricting bounds on this column, evaluated while it decodes.
     std::optional<decode_range> range;
@@ -145,7 +145,7 @@ struct scan_decode_request {
  * Carried as a value so it survives copying and can grow a field without
  * growing a class.
  */
-struct decode_outcome {
+struct pushdown_outcome {
   /// The decode applied the scan's ENTIRE row filter and every column is
   /// compacted to the surviving rows, so the scan can skip filtering
   /// altogether and only project.
@@ -166,7 +166,7 @@ struct decode_outcome {
 
   /// Positions in the decoded table delivered as a BOOL8 predicate RESULT
   /// rather than the column's declared type (see
-  /// @ref scan_decode_request::column_entry::equals_any).
+  /// @ref pushdown_request::column_entry::equals_any).
   ///
   /// Reported because the decoder knows it exactly. The alternative — the scan
   /// re-deriving it per batch by testing each candidate column for
@@ -191,10 +191,10 @@ struct decode_outcome {
   }
 };
 
-/// A decoded chunk and what its decode did.
-struct decode_result {
+/// A decompressed chunk and what its decode did.
+struct decompress_result {
   std::unique_ptr<cudf::table> table;
-  decode_outcome outcome;
+  pushdown_outcome outcome;
 };
 
 /**
@@ -205,22 +205,22 @@ struct decode_result {
  * @c shared_ptr and never mutated, so the per-batch adjustments below hand back
  * a new object rather than editing one that other batches are reading.
  */
-class compressed_scan {
+class decompression_pushdown_scan {
  public:
-  explicit compressed_scan(scan_decode_request request) : _request(std::move(request)) {}
+  explicit decompression_pushdown_scan(pushdown_request request) : _request(std::move(request)) {}
 
-  [[nodiscard]] scan_decode_request const& request() const noexcept { return _request; }
+  [[nodiscard]] pushdown_request const& request() const noexcept { return _request; }
 
   /// This scan without its row-dropping conjuncts — what to attach to the
   /// remaining batches once a decode has reported
-  /// @c decode_outcome::selection_unprofitable. Columns answered in place keep
+  /// @c pushdown_outcome::selection_unprofitable. Columns answered in place keep
   /// working; only the attempt to compact is given up. Null if nothing is left
   /// to ask for.
-  [[nodiscard]] std::shared_ptr<const compressed_scan> without_row_selection() const;
+  [[nodiscard]] std::shared_ptr<const decompression_pushdown_scan> without_row_selection() const;
 
   /// This scan with its join filters replaced by a fresher snapshot. @p probes
   /// is parallel to the selected column list.
-  [[nodiscard]] std::shared_ptr<const compressed_scan> with_membership_probes(
+  [[nodiscard]] std::shared_ptr<const decompression_pushdown_scan> with_membership_probes(
     std::vector<std::vector<membership_probe>> probes, std::uint64_t generation) const;
 
   /// This scan narrowed to what @p chunk is worth asking: a column is only
@@ -229,7 +229,7 @@ class compressed_scan {
   ///
   /// The row-selecting conjuncts are NOT narrowed here — which of those a chunk
   /// can evaluate is decided inside the decode, where the answer is used.
-  [[nodiscard]] std::shared_ptr<const compressed_scan> for_chunk(
+  [[nodiscard]] std::shared_ptr<const decompression_pushdown_scan> for_chunk(
     simpatico::compressed_table const& chunk, std::span<const std::size_t> selected) const;
 
   /// What a decode of @p selected columns of @p chunk is expected to do to the
@@ -248,7 +248,7 @@ class compressed_scan {
     simpatico::compressed_table const& chunk, std::span<const std::size_t> selected) const;
 
  private:
-  scan_decode_request _request;
+  pushdown_request _request;
 };
 
 /**
@@ -257,15 +257,15 @@ class compressed_scan {
  * With @p scan non-null, as much of its request as this chunk's compression
  * plans allow is applied during the decode; the rest is simply not applied,
  * which is always sound — the request is a conjunction, so an unapplied part
- * only means rows the scan must still reject itself. @ref decode_result::outcome
+ * only means rows the scan must still reject itself. @ref decompress_result::outcome
  * says what happened. With @p scan null this is an ordinary decompress.
  *
  * Never returns a null table: every way the filtering can decline ends in the
  * plain decode of the same columns.
  */
-decode_result decode_compressed_chunk(simpatico::compressed_table const& chunk,
+decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
                                       std::span<const std::size_t> selected,
-                                      compressed_scan const* scan,
+                                      decompression_pushdown_scan const* scan,
                                       rmm::cuda_stream_view stream,
                                       rmm::device_async_resource_ref mr);
 

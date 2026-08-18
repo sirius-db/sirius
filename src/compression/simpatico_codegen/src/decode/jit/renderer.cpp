@@ -590,12 +590,6 @@ void Walker::emit_bitpack_producer(const ::codegen::jit::FusedTree& node,
 // bit r%32 of word r/32), stored coalesced.  Mask layout is 32 words per
 // 1024-row chunk (mask base = chunk_start/32); the last chunk's tail
 // bits/words are written as zero, which the CNT/combine wave relies on.
-//
-// There is no Bitpack-specific emitter: value_source() routes a Bitpack
-// leaf to the same closed-form bitpack_value_source the dedicated emitters
-// used, so emit_generic_mask_out / emit_generic_mask_consume produce
-// byte-identical bodies for a Bitpack root (verified by rendering both and
-// diffing the emitted source — the only difference was the comment text).
 // =====================================================================
 
 // Shared mask-consuming stage (warp 0): load the chunk's 32 selection-mask
@@ -889,7 +883,7 @@ void Walker::emit_str_split_meta(const ::codegen::jit::FusedTree& node)
 
 // =====================================================================
 // Generic mask_out — the compositional ballot for
-// non-closed-form roots, primarily delta->bitpack orderkey shapes: the
+// non-closed-form roots, primarily delta->bitpack shapes: the
 // decode-evaluable form of min-max dynamic join filters.  Delta's prefix
 // sum is sequential within a chunk, so the chunk is reconstructed IN FULL
 // via value_source (staged to a shared-mem slab by the existing plain
@@ -1604,9 +1598,6 @@ void Walker::emit_raw_producer(const ::codegen::jit::FusedTree& node,
 
 }  // namespace
 
-// =====================================================================
-// Public entry point.
-// =====================================================================
 bool shape_is_supported(DecodeShape shape)
 {
   // Shipped points of the product. index_list x {dict_gather, offsets_meta}
@@ -1645,6 +1636,9 @@ extern "C" __global__ void simpatico_masked_char_copy(
   return spec;
 }
 
+// =====================================================================
+// Public entry point.
+// =====================================================================
 DecodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
                         const std::string& element_dtype,
                         std::int32_t num_chunks,

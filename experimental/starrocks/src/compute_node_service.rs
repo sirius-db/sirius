@@ -204,7 +204,16 @@ impl SiriusComputeNodeService {
         params: &TExecPlanFragmentParams,
     ) -> std::result::Result<(), String> {
         let params = self.resolve_descriptor_table(params)?;
-        let translated = self.translate_fragment_logged(&params)?;
+        let dump_seq = Self::dump_fragment(&params);
+        // Survey mode: accept every fragment so the FE dispatches (and we dump) the whole
+        // plan even when translation fails. Queries still fail at fetch_data.
+        if std::env::var_os("SIRIUS_CN_TRANSLATE_ONLY").is_some() {
+            if let Err(err) = self.translate_fragment_logged(&params, dump_seq) {
+                tracing::warn!(error = %err, "translate-only mode: accepting untranslatable fragment");
+            }
+            return Ok(());
+        }
+        let translated = self.translate_fragment_logged(&params, dump_seq)?;
         self.execute_and_buffer(&params, &translated)
     }
 
@@ -243,6 +252,22 @@ impl SiriusComputeNodeService {
             cache.insert(query_id, desc.clone());
         }
         Ok(resolved)
+    }
+
+    /// Writes the received fragment params to `$SIRIUS_CN_DUMP_FRAGMENTS/fragment-<seq>.txt`
+    /// (debug format) for offline plan analysis. No-op when the variable is unset.
+    fn dump_fragment(params: &TExecPlanFragmentParams) -> Option<u64> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let Ok(dir) = std::env::var("SIRIUS_CN_DUMP_FRAGMENTS") else {
+            return None;
+        };
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::path::Path::new(&dir).join(format!("fragment-{seq:04}.txt"));
+        if let Err(err) = std::fs::write(&path, format!("{params:#?}")) {
+            tracing::warn!(error = %err, path = %path.display(), "failed to dump fragment params");
+        }
+        Some(seq)
     }
 
     /// Executes a RESULT_SINK fragment and buffers its rows. Non-result-sink fragments (e.g. a
@@ -316,6 +341,7 @@ impl SiriusComputeNodeService {
     fn translate_fragment_logged(
         &self,
         params: &TExecPlanFragmentParams,
+        dump_seq: Option<u64>,
     ) -> std::result::Result<TranslatedPlan, String> {
         let translated = self
             .translator
@@ -326,7 +352,23 @@ impl SiriusComputeNodeService {
             plan = %translated.explain(),
             "translated StarRocks plan fragment"
         );
+        Self::dump_substrait(&translated, dump_seq);
         Ok(translated)
+    }
+
+    /// Writes the translated Substrait plan bytes to `$SIRIUS_CN_DUMP_FRAGMENTS/plan-<seq>.substrait`
+    /// so a failing plan can be replayed against the engine in isolation. No-op when unset.
+    fn dump_substrait(translated: &TranslatedPlan, dump_seq: Option<u64>) {
+        let Ok(dir) = std::env::var("SIRIUS_CN_DUMP_FRAGMENTS") else {
+            return;
+        };
+        let Some(seq) = dump_seq else {
+            return;
+        };
+        let path = std::path::Path::new(&dir).join(format!("plan-{seq:04}.substrait"));
+        if let Err(err) = std::fs::write(&path, translated.to_substrait_bytes()) {
+            tracing::warn!(error = %err, path = %path.display(), "failed to dump substrait plan");
+        }
     }
 
     /// Classifies the fragment output sink: `Ok(true)` for a MySQL text-protocol RESULT_SINK this

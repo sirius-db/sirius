@@ -186,7 +186,7 @@ struct column_decode_caps {
   ///                  TERMINAL (raw/identity — entropy-coded chars cannot be
   ///                  byte-gathered without a full decompress) and whose
   ///                  `offsets` channel is a plain bitpack child. Deeper
-  ///                  offsets chains (c_phone's delta->rle->bitpack) and
+  ///                  offsets chains (e.g. delta->rle->bitpack) and
   ///                  widened (>2 GB, non-UINT8) chars stay `full` — widen only
   ///                  in lockstep with the renderer's masked
   ///                  offsets-reconstruction coverage,

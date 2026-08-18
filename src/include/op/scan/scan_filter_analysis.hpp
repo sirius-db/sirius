@@ -45,8 +45,11 @@ namespace sirius::op {
  * @brief One scan's pushed-down filter, digested once into what a decompressor
  * can evaluate for itself, keyed by column primary index.
  *
- * This speaks only for filter shapes and constant types; what a given chunk can
- * do with them is decided per chunk in @c sirius::compressed_scan.
+ * The scan hands over its whole filter and gets back the parts that survive as
+ * decode-time work, keyed by column primary index. What any given chunk can
+ * actually do with them is decided later and elsewhere (see
+ * @c sirius::decompression_pushdown_scan) — this speaks only for filter shapes and constant
+ * types.
  */
 struct scan_filter_analysis {
   /// Columns whose ENTIRE filter is an equality / IN over non-null string
@@ -99,7 +102,7 @@ scan_filter_analysis analyze_scan_filters(
  * column list. Analysis entries that map to no slot are dropped — a partition
  * filter, say, which is enforced elsewhere.
  */
-sirius::scan_decode_request build_scan_decode_request(
+sirius::pushdown_request build_pushdown_request(
   scan_filter_analysis const& analysis, std::span<const std::size_t> primary_index_by_slot);
 
 /**
@@ -110,10 +113,11 @@ sirius::scan_decode_request build_scan_decode_request(
  * Sirius AST, so per batch the residual is assembled by choosing a form per
  * conjunct — nothing is rebuilt or converted on the batch path.
  *
- * A column answered in place arrives as BOOL8 rather than its declared type
- * (@c sirius::decode_outcome::predicate_columns), so its conjunct MUST become a
- * bare reference to that answer; re-running the comparison would test a mask
- * against a string constant.
+ * A column answered in place arrives as the BOOL8 answer rather than its
+ * declared type, so its conjunct MUST become a bare reference to it; re-running
+ * the comparison would compare a mask against a string constant. Which columns
+ * that happened to is a per-batch fact the decoder reports
+ * (@c sirius::pushdown_outcome::predicate_columns).
  */
 class residual_filter {
  public:

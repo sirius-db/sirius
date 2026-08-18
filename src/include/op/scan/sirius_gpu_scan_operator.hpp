@@ -164,7 +164,7 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   std::shared_ptr<scan_manager::split_connector> _split_connector;
   /// Latch for "compacting during decode does not pay off", shared with every
   /// split this operator hands out (see
-  /// scan_operator_input::decode_selection_unprofitable).
+  /// scan_operator_input::pushdown_selection_unprofitable).
   /// Per-operator so another query's scan of the same pinned entry decides
   /// fresh.
   std::shared_ptr<std::atomic<bool>> _decode_selection_unprofitable =

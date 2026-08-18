@@ -77,8 +77,11 @@ struct insert_delta_segment {
 struct insert_delta_column {
   duckdb::idx_t column_id{0};
   bool is_varchar{false};
+  bool is_array{false};
   std::vector<insert_delta_segment> data_segments;
   std::vector<insert_delta_segment> validity_segments;
+  std::vector<insert_delta_segment> array_child_data_segments;
+  std::vector<insert_delta_segment> array_child_validity_segments;
 };
 
 /// One row group's slice of the insert delta.
@@ -141,10 +144,15 @@ insert_delta_plan prepare_insert_delta_capture(duckdb::DataTable& storage,
  * (under their segment-tree locks), never the ClientContext or LocalStorage;
  * disjoint ranges of one plan may run concurrently.
  *
+ * Fixed-size ARRAY columns are supported when their child is a fixed-width
+ * scalar: the array-level validity, child data, and child validity segments are
+ * staged and decoded like the scalar case.
+ *
  * Throws on states the plan-time guards should have excluded or that break
  * the pin contract: a compressed transient segment, a varchar segment at the
- * overflow-block limit, an unsupported persistent codec, an ARRAY column, or
- * non-StandardColumnData storage.
+ * overflow-block limit, an unsupported persistent codec, an ARRAY column whose
+ * child is not a fixed-width scalar (varchar or nested), or non-StandardColumnData
+ * storage.
  *
  * @param storage_column_indices Union of the querying operators' storage
  *        columns; per-operator splits are cut from it later.

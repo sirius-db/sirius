@@ -18,6 +18,7 @@
 
 #include "compression/compressed_representation.hpp"
 #include "compression/device_compressed_blob.hpp"
+#include "cudf/cudf_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
@@ -30,7 +31,6 @@
 #include "scan_manager/round_robin_strategy.hpp"
 
 #include <cudf/table/table.hpp>
-#include <cudf/unary.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/cuda_device.hpp>
@@ -149,6 +149,14 @@ void validate_duckdb_pin_chunk(const op::scan::scan_info& batch,
   }
 }
 
+cudf::data_type pin_native_type(cudf::data_type decoded_type,
+                                duckdb::LogicalType const* declared_type)
+{
+  if (declared_type == nullptr) { return decoded_type; }
+  auto const native = sirius::try_get_cudf_type(sirius::from_duckdb(*declared_type));
+  return native.value_or(decoded_type);
+}
+
 namespace {
 
 /// Per-materialized-batch sink: receives one GPU-resident table, its GPU placement, the
@@ -188,8 +196,8 @@ narrowed_pin_chunk narrow_pin_chunk(std::unique_ptr<cudf::table> table,
     if (!range) { continue; }
     auto target = choose_narrow_physical_type(logical, *range);
     if (!target || columns[column_idx]->type() == *target) { continue; }
-    auto const actual            = columns[column_idx]->type();
-    columns[column_idx]          = cudf::cast(columns[column_idx]->view(), *target, stream, mr);
+    auto const actual   = columns[column_idx]->type();
+    columns[column_idx] = cast_through_rep(columns[column_idx]->view(), *target, stream, mr);
     narrowed_columns[column_idx] = true;
     SIRIUS_LOG_DEBUG("[compressed_materialization] pin column {} narrowed: {} -> {}",
                      column_idx,
@@ -301,6 +309,16 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
       nvtx3::scoped_range probe_range{"sirius::pin::unique_probe"};
       unique_probe.observe(tbl->view(), stream);
     }
+    // Record declared-native identity before narrowing; decoder type is only the fallback when no
+    // declared mapping is available.
+    std::vector<cudf::data_type> native_types;
+    native_types.reserve(static_cast<std::size_t>(tbl->num_columns()));
+    for (cudf::size_type i = 0; i < tbl->num_columns(); ++i) {
+      auto const idx = static_cast<std::size_t>(i);
+      native_types.push_back(
+        pin_native_type(tbl->get_column(i).type(),
+                        idx < pinned_column_types.size() ? &pinned_column_types[idx] : nullptr));
+    }
     if (options.enable_compressed_materialization) {
       auto narrowed = narrow_pin_chunk(
         std::move(tbl), pinned_column_types, stream, target->get_default_allocator());
@@ -313,8 +331,9 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     std::vector<pinned_column_storage_meta> column_storage;
     column_storage.reserve(static_cast<std::size_t>(tbl->num_columns()));
     for (cudf::size_type i = 0; i < tbl->num_columns(); ++i) {
-      column_storage.push_back(
-        {tbl->get_column(i).type(), narrowed_columns[static_cast<std::size_t>(i)]});
+      column_storage.push_back({tbl->get_column(i).type(),
+                                narrowed_columns[static_cast<std::size_t>(i)],
+                                native_types[static_cast<std::size_t>(i)]});
     }
     on_batch(std::move(tbl), target, stream, std::move(column_storage), std::move(chunk_stats));
   };

@@ -782,6 +782,65 @@ def run_nsys_profile(
                 it += 1
 
 
+def print_runtime_summary(runtime_csv):
+    """Print a per-engine table of query runtimes with one column per iteration and a Total row."""
+    data = {}
+    iterations_seen = set()
+    with open(runtime_csv, newline="") as f:
+        for row in csv.DictReader(f):
+            eng = row["engine"]
+            qname = row["query"]
+            it = int(row["iteration"])
+            try:
+                rt = float(row["runtime_s"])
+            except (ValueError, KeyError):
+                rt = float("nan")
+            data.setdefault(eng, {}).setdefault(qname, {})[it] = rt
+            iterations_seen.add(it)
+
+    if not data:
+        return
+
+    n_iters = max(iterations_seen) + 1 if iterations_seen else 0
+    iter_labels = [f"iter{i}" for i in range(n_iters)]
+    q_w, col_w = 7, 10
+
+    def _fmt(v):
+        return f"{'nan':>{col_w}}" if math.isnan(v) else f"{v:{col_w}.4f}"
+
+    def _qnum(name):
+        try:
+            return int(name.lstrip("q"))
+        except ValueError:
+            return 0
+
+    print()
+    print("=== Runtime Summary (seconds) ===")
+    for eng in sorted(data):
+        print(f"\n[{eng}]")
+        header = f"{'Query':<{q_w}}" + "".join(
+            f"  {lbl:>{col_w}}" for lbl in iter_labels
+        )
+        sep = "-" * len(header)
+        print(header)
+        print(sep)
+
+        col_totals = [0.0] * n_iters
+        for qname in sorted(data[eng], key=_qnum):
+            cells = []
+            for i in range(n_iters):
+                rt = data[eng][qname].get(i, float("nan"))
+                cells.append(_fmt(rt))
+                if not math.isnan(rt):
+                    col_totals[i] += rt
+            print(f"{qname:<{q_w}}" + "".join(f"  {c}" for c in cells))
+
+        print(sep)
+        total_cells = [f"{t:{col_w}.4f}" for t in col_totals]
+        print(f"{'Total':<{q_w}}" + "".join(f"  {c}" for c in total_cells))
+    print()
+
+
 def split_sirius_log(log_dir, benchmark_dir, queries, iterations):
     """Split the combined Sirius spdlog into one log file per query.
 
@@ -1202,6 +1261,8 @@ def main():
         log("Starting validation")
         validate(benchmark_dir, queries)
         log("Validation complete")
+
+    print_runtime_summary(runtime_csv)
 
 
 if __name__ == "__main__":
