@@ -166,6 +166,17 @@ struct operator_params {
   /// metadata; other scans use native carriers. Logical types remain unchanged, and type-sensitive
   /// boundaries restore native carriers.
   bool enable_compressed_materialization = true;
+
+  /// Admission-time GPU allocation: target bytes of projected scan output per GPU.
+  /// At query start, the engine estimates total scan output bytes from the plan's
+  /// estimated_cardinality × per-column width, then assigns
+  /// ceil(total_bytes / admission_bytes_per_gpu) GPUs, clamped to [1, active_gpu_count].
+  /// 0 disables dynamic estimation and falls back to topology.gpus_per_query.
+  uint64_t admission_bytes_per_gpu = 0;
+
+  /// Bytes assumed per variable-width column (VARCHAR, LIST, etc.) when computing
+  /// per-row byte estimates for admission. Only used when admission_bytes_per_gpu > 0.
+  uint64_t avg_variable_column_bytes = 32;
 };
 
 struct telemetry_config {

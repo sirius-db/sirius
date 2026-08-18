@@ -363,6 +363,7 @@ set(EXTENSION_SOURCES
     src/pipeline/sirius_plan_printer.cpp
     src/pipeline/task_request.cpp
     src/planner/duckdb_join_filter_candidate_adapter.cpp
+    src/planner/gpu_admission.cpp
     src/planner/query.cpp
     src/planner/query_index.cpp
     src/planner/sirius_physical_plan_generator.cpp
