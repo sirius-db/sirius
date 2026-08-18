@@ -402,7 +402,7 @@ Bloom filters are runtime-only — there is no AST node that evaluates "is this 
 
 A channel may carry both a zone map for the reader and a Bloom for the post-decode operator. Each becomes visible only after its device replicas are ready. A direct target normally sees both; a transitive target can safely observe either one or both at its per-split checkpoints because the filters are optional conjuncts and the join remains authoritative.
 
-**Build heuristic: raw exact list, then L2-sized hash set, then Bloom (implemented).** The producer first handles 1–12 null-free INT32/INT64 build rows with a linear scan over raw needles. For larger supported columns, it queries the active GPUs' L2 sizes (`cudaDeviceGetAttribute(cudaDevAttrL2CacheSize)`) and selects the hash IN-list only if its set fits the smallest L2; otherwise it uses the smaller Bloom, even if that bitset also spills L2. This L2 decision subsumed the original fixed row-count hash/Bloom cutover.
+**Build heuristic: raw exact list, then L2-sized hash set, then Bloom (implemented).** The producer first handles 1–12 null-free INT32/INT64 build rows with a linear scan over raw needles. For larger supported columns, it queries the active GPUs' L2 sizes (`cudaDeviceGetAttribute(cudaDevAttrL2CacheSize)`) and selects the hash IN-list only if its set stays within `dynamic_filter_inlist_max_l2_fraction` of the smallest L2 (see *Producer policy* above); otherwise it uses the smaller Bloom, even if that bitset also spills L2. This L2 decision subsumed the original fixed row-count hash/Bloom cutover.
 
 #### Fingerprint policy — why neither cuco stock policy is used
 

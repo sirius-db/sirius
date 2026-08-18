@@ -133,9 +133,10 @@ struct operator_params {
   bool enable_runtime_distinct_build_probe = config::DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE;
 
   /// Wire dynamic table-filter pushdown: an eligible BUILD_PROBE hash-join build publishes a raw
-  /// exact IN-list for 1..12 supported build rows, otherwise a hash IN-list if it fits the smallest
-  /// probe-GPU L2, or a Bloom, into the probe-side scan. The scan applies membership post-decode to
-  /// drop non-matching rows before the join. On by default; the master switch for the feature.
+  /// exact IN-list for 1..12 supported build rows, otherwise a hash IN-list when its estimated set
+  /// stays within dynamic_filter_inlist_max_l2_fraction of the smallest probe-GPU L2, or a Bloom,
+  /// into the probe-side scan. The scan applies membership post-decode to drop non-matching rows
+  /// before the join. On by default; the master switch for the feature.
   bool enable_dynamic_filter_pushdown = true;
 
   /// Additionally emit a runtime zone-map (build-key [min,max]) alongside the membership filter,
@@ -156,9 +157,10 @@ struct operator_params {
   /// the smaller Bloom bit array stays cache-resident. A GB300 residency sweep measured the
   /// IN-list's probe cost flat below ~0.28 of L2 and steadily degrading beyond, with the (inexact)
   /// Bloom probing >= 2.2x faster at every swept size; the default 0.125 sits inside that flat
-  /// region, keeping the exact filter only where exactness costs the least. 0 always publishes the
-  /// Bloom when the key type supports it; 1.0 reproduces the legacy L2-fit rule. Ignored when no
-  /// device L2 size is available (the legacy fit rule then applies unchanged).
+  /// region, keeping the exact filter only where exactness costs the least. 0 always demotes the
+  /// hash IN-list to the Bloom when the key type supports it (the small-set brute-force tier never
+  /// consults this fraction); 1.0 reproduces the legacy L2-fit rule. Ignored when no device L2
+  /// size is available (the legacy fit rule then applies unchanged).
   double dynamic_filter_inlist_max_l2_fraction = 0.125;
 
   /// Consumer-side scan gate: disable a scan's post-decode dynamic filtering once a measured split

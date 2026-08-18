@@ -24,11 +24,14 @@
  *  - inlist_max_l2_fraction semantics: a vanishing fraction demotes the hash IN-list to the
  *    Bloom filter; 1.0 reproduces the legacy L2-fit rule; 0 always publishes the Bloom for the
  *    hash tier while leaving small-IN-list precedence untouched; and the
- *    set_bytes <= fraction * l2_bytes comparison is inclusive, bracketed from the same
- *    estimated_set_bytes / cudaDevAttrL2CacheSize inputs the publisher reads.
- *  - Type-coverage canary: Bloom support covers every hash-IN-list key type, so the publisher's
- *    "keep a fitting IN-list when the type lacks Bloom support" clause is unreachable today; the
- *    comment prescribes the follow-up test should the type sets ever diverge.
+ *    set_bytes <= fraction * l2_bytes comparison is inclusive, pinned at exact double equality
+ *    against a synthetic injected L2 size.
+ *  - No device L2 info: the publisher's l2_bytes_override constructor seam injects l2_bytes == 0,
+ *    which fails the legacy fit rule closed and publishes the Bloom before the fraction is ever
+ *    consulted.
+ *  - Type-coverage canary: the hash-IN-list and Bloom supported key-type sets must coincide,
+ *    checked in both directions over candidate key types; divergence prescribes the follow-up
+ *    publish-path test.
  *  - Key-ordinal safety: an inequality condition ordinal never receives a membership filter.
  */
 
@@ -54,6 +57,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -87,7 +91,8 @@ template <typename ExpectedFilter>
 void require_published_membership(
   std::size_t rows,
   double inlist_max_l2_fraction =
-    sirius::op::dynamic_filter_publish_plan::k_default_inlist_max_l2_fraction)
+    sirius::op::dynamic_filter_publish_plan::k_default_inlist_max_l2_fraction,
+  std::optional<std::size_t> l2_bytes_override = std::nullopt)
 {
   rmm::cuda_set_device_raii const device{rmm::cuda_device_id{kDeviceId}};
   auto memory_manager = sirius::test::operator_utils::initialize_memory_manager(1);
@@ -122,17 +127,22 @@ void require_published_membership(
     REQUIRE(sirius::op::sirius_dynamic_small_in_list_filter::supports(keys->view()));
   } else {
     REQUIRE_FALSE(sirius::op::sirius_dynamic_small_in_list_filter::supports(keys->view()));
-    int l2_bytes = 0;
-    REQUIRE(cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, kDeviceId) == cudaSuccess);
-    REQUIRE(l2_bytes > 0);
-    REQUIRE(sirius::op::sirius_dynamic_in_list_filter::estimated_set_bytes(
-              rows, cudf::data_type{cudf::type_id::INT64}) <= static_cast<std::size_t>(l2_bytes));
+    // With an injected L2 size the caller constructs the synthetic scenario deliberately
+    // (including l2_bytes == 0), so the live-device sanity checks apply only without one.
+    if (!l2_bytes_override) {
+      int l2_bytes = 0;
+      REQUIRE(cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, kDeviceId) == cudaSuccess);
+      REQUIRE(l2_bytes > 0);
+      REQUIRE(sirius::op::sirius_dynamic_in_list_filter::estimated_set_bytes(
+                rows, cudf::data_type{cudf::type_id::INT64}) <= static_cast<std::size_t>(l2_bytes));
+    }
   }
 
   std::vector<cudf::column_view> columns{keys->view()};
   cudf::table_view build_view{columns};
-  sirius::op::dynamic_filter_publisher{pushdown, plan, key_casts, right_key_col_indices}.publish(
-    build_view, stream);
+  sirius::op::dynamic_filter_publisher{
+    pushdown, plan, key_casts, right_key_col_indices, l2_bytes_override}
+    .publish(build_view, stream);
 
   auto const snapshot = channel->filters_for_column(kProbeColumnIndex);
   REQUIRE(snapshot.size() == 1);
@@ -196,31 +206,63 @@ TEST_CASE("dynamic-filter publisher fraction 0 leaves small-list precedence unto
   require_published_membership<sirius::op::sirius_dynamic_small_in_list_filter>(3, 0.0);
 }
 
-TEST_CASE("dynamic-filter publisher L2-fraction boundary is inclusive",
+TEST_CASE("dynamic-filter publisher keeps the hash IN-list at exact L2-fraction equality",
           "[dynamic_filter][publisher]")
 {
-  // Bracket the exact set_bytes <= fraction x l2_bytes comparison: publishing just above the
-  // set's own L2 ratio keeps the IN-list, just below demotes to the Bloom. The +/-1e-9 margin
-  // absorbs double rounding while staying under one byte of threshold on any real L2.
+  // Inclusivity pin, exact in double arithmetic on any hardware: with a synthetic L2 of
+  // 2 x set_bytes and fraction 0.5, the threshold equals set_bytes exactly, so the inclusive
+  // set_bytes <= fraction x l2_bytes comparison keeps the IN-list (a strict '<' would demote);
+  // an L2 two bytes smaller puts the threshold at set_bytes - 1 and must demote to the Bloom.
   auto const rows      = sirius::op::sirius_dynamic_small_in_list_filter::k_max_keys + 1;
   auto const set_bytes = sirius::op::sirius_dynamic_in_list_filter::estimated_set_bytes(
     rows, cudf::data_type{cudf::type_id::INT64});
-  int l2_bytes = 0;
-  REQUIRE(cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, kDeviceId) == cudaSuccess);
-  REQUIRE(l2_bytes > 0);
-  double const ratio = static_cast<double>(set_bytes) / static_cast<double>(l2_bytes);
-  require_published_membership<sirius::op::sirius_dynamic_in_list_filter>(rows, ratio * (1 + 1e-9));
-  require_published_membership<sirius::op::sirius_dynamic_bloom_filter>(rows, ratio * (1 - 1e-9));
+  REQUIRE(set_bytes >= 2);
+  require_published_membership<sirius::op::sirius_dynamic_in_list_filter>(rows, 0.5, 2 * set_bytes);
+  require_published_membership<sirius::op::sirius_dynamic_bloom_filter>(
+    rows, 0.5, 2 * set_bytes - 2);
 }
 
-TEST_CASE("dynamic-filter Bloom support covers every hash-IN-list key type",
+TEST_CASE("dynamic-filter publisher publishes the Bloom when no device L2 size is available",
+          "[dynamic_filter][publisher]")
+{
+  // l2_bytes == 0 fails the legacy fit rule closed before the fraction is ever consulted (the
+  // documented fallback in sirius_config.hpp), so the hash tier demotes to the Bloom.
+  require_published_membership<sirius::op::sirius_dynamic_bloom_filter>(
+    sirius::op::sirius_dynamic_small_in_list_filter::k_max_keys + 1,
+    sirius::op::dynamic_filter_publish_plan::k_default_inlist_max_l2_fraction,
+    /*l2_bytes_override=*/0);
+}
+
+TEST_CASE("dynamic-filter Bloom and hash-IN-list supported key types coincide",
           "[dynamic_filter][publisher]")
 {
   // The publish rule keeps an L2-fitting hash IN-list at any fraction when the key type has no
-  // Bloom fallback. That clause is structurally unreachable today because the hash-IN-list and
-  // Bloom supported-type sets are identical (INT32/INT64); this canary documents the premise.
-  // If either REQUIRE ever fails (the type sets diverge), add a publish-path test asserting the
-  // divergent type keeps the fitting IN-list at fraction 0.
+  // Bloom fallback; that clause is structurally unreachable while the two supported-type sets
+  // coincide. This canary fails on divergence in EITHER direction over the candidate key types
+  // below (compared on null-free empty columns: the IN-list signature also checks nulls, but
+  // that dimension is orthogonal and invisible to Bloom's type-only signature). If it fires,
+  // add a publish-path test asserting the divergent type keeps a fitting IN-list at fraction 0
+  // (IN-list-only types) or demotes to the Bloom (Bloom-only types).
+  constexpr cudf::type_id candidate_ids[] = {cudf::type_id::BOOL8,
+                                             cudf::type_id::INT8,
+                                             cudf::type_id::INT16,
+                                             cudf::type_id::INT32,
+                                             cudf::type_id::INT64,
+                                             cudf::type_id::UINT8,
+                                             cudf::type_id::UINT16,
+                                             cudf::type_id::UINT32,
+                                             cudf::type_id::UINT64,
+                                             cudf::type_id::FLOAT32,
+                                             cudf::type_id::FLOAT64,
+                                             cudf::type_id::STRING};
+  for (auto const id : candidate_ids) {
+    auto const type  = cudf::data_type{id};
+    auto const empty = cudf::make_empty_column(type);
+    INFO("type_id=" << static_cast<int>(id));
+    REQUIRE(sirius::op::sirius_dynamic_in_list_filter::supports(empty->view()) ==
+            sirius::op::sirius_dynamic_bloom_filter::supports(type));
+  }
+  // Anchor the sets as non-empty: today both are exactly {INT32, INT64}.
   REQUIRE(sirius::op::sirius_dynamic_bloom_filter::supports(cudf::data_type{cudf::type_id::INT32}));
   REQUIRE(sirius::op::sirius_dynamic_bloom_filter::supports(cudf::data_type{cudf::type_id::INT64}));
 }

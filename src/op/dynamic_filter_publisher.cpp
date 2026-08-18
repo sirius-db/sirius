@@ -111,7 +111,8 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
   }
   auto const allocator_ref = source_space->get_gpu_space().get_default_allocator();
   auto const build_rows    = static_cast<std::size_t>(build_view.num_rows());
-  auto const l2_bytes      = device_l2_cache_bytes(_plan.replica_spaces());
+  auto const l2_bytes =
+    _l2_bytes_override ? *_l2_bytes_override : device_l2_cache_bytes(_plan.replica_spaces());
 
   // Build up to 2 complementary filters per join key:
   //  1) a zone-map (read-time ROW-GROUP pruning, the only path that cuts scan I/O)
@@ -275,7 +276,7 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
       per_key_membership[k] =
         std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(col, stream, allocator_ref);
       choice = "in_list";
-    } else if (sirius::op::sirius_dynamic_bloom_filter::supports(col.type())) {
+    } else if (bloom_supported) {
       nvtx3::scoped_range vr{"dynfilter::build_bloom"};
       per_key_membership[k] =
         std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(col, stream, allocator_ref);

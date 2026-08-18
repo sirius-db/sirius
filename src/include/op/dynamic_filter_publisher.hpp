@@ -25,6 +25,8 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <cstddef>
+#include <optional>
 #include <vector>
 
 namespace sirius::op {
@@ -40,14 +42,22 @@ namespace sirius::op {
 /// arbitration. A publisher instance is single-use and does not outlive the referenced metadata.
 class dynamic_filter_publisher final {
  public:
+  /// @brief Constructs a single-use publisher over the join's borrowed pushdown metadata.
+  ///
+  /// @p l2_bytes_override is a test seam: when set, publish() substitutes it for the queried
+  /// minimum probe-GPU L2 size (cudaDevAttrL2CacheSize across the plan's replica spaces), with 0
+  /// modeling "no device L2 info". Production callers leave it unset, keeping the query path
+  /// unchanged.
   dynamic_filter_publisher(duckdb::JoinFilterPushdownInfo const& filter_pushdown,
                            dynamic_filter_publish_plan const& plan,
                            std::vector<sirius_physical_hash_join::key_cast_info> const& key_casts,
-                           std::vector<cudf::size_type> const& right_key_col_indices)
+                           std::vector<cudf::size_type> const& right_key_col_indices,
+                           std::optional<std::size_t> l2_bytes_override = std::nullopt)
     : _filter_pushdown(filter_pushdown),
       _plan(plan),
       _key_casts(key_casts),
-      _right_key_col_indices(right_key_col_indices)
+      _right_key_col_indices(right_key_col_indices),
+      _l2_bytes_override(l2_bytes_override)
   {
   }
 
@@ -59,6 +69,8 @@ class dynamic_filter_publisher final {
   dynamic_filter_publish_plan const& _plan;
   std::vector<sirius_physical_hash_join::key_cast_info> const& _key_casts;
   std::vector<cudf::size_type> const& _right_key_col_indices;
+  /// Test seam for the publish-time minimum-L2 query; see the constructor doc.
+  std::optional<std::size_t> _l2_bytes_override;
 };
 
 }  // namespace sirius::op

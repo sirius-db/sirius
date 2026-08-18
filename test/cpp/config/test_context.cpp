@@ -15,6 +15,7 @@
  */
 
 #include "catch.hpp"
+#include "op/dynamic_filter_publish_plan.hpp"
 #include "sirius_context.hpp"
 
 #include <cudf/contiguous_split.hpp>
@@ -403,7 +404,20 @@ TEST_CASE("Sirius YAML rejects invalid dynamic-filter thresholds", "[sirius][con
     config.load_from_file(data_dir / "valid_dynamic_filter_threshold_boundaries.yaml"));
   REQUIRE(config.get_operator_params().dynamic_filter_domain_coverage_threshold == Approx(1.5));
   REQUIRE(config.get_operator_params().dynamic_filter_keep_threshold == Approx(0.0));
-  REQUIRE(config.get_operator_params().dynamic_filter_inlist_max_l2_fraction == Approx(0.0));
+  REQUIRE(config.get_operator_params().dynamic_filter_inlist_max_l2_fraction == Approx(1.0));
+}
+
+// The shipped 0.125 default is the measured GB300 flat-region operating point (see
+// operator_params::dynamic_filter_inlist_max_l2_fraction); the SQL setting registers its default
+// from this member and the publish plan carries its own constant, so pinning the member and its
+// equality with the plan constant pins every default surface. Mirrors the compiled-in-default
+// pin in test_compressed_materialization_gate.cpp.
+TEST_CASE("dynamic_filter_inlist_max_l2_fraction ships as 0.125 on every default surface",
+          "[sirius][config]")
+{
+  REQUIRE(sirius::operator_params{}.dynamic_filter_inlist_max_l2_fraction == 0.125);
+  REQUIRE(sirius::op::dynamic_filter_publish_plan::k_default_inlist_max_l2_fraction ==
+          sirius::operator_params{}.dynamic_filter_inlist_max_l2_fraction);
 }
 
 namespace {

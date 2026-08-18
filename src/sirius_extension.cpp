@@ -2433,7 +2433,8 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     "dynamic_filter_inlist_max_l2_fraction",
     "Maximum estimated cuco-set size for the exact hash IN-list dynamic filter, as a fraction of "
     "the smallest probe-GPU L2 cache, in [0, 1]; larger sets publish a Bloom filter, 0 always "
-    "publishes the Bloom when supported, and 1.0 reproduces the legacy L2-fit rule",
+    "demotes the hash IN-list to the Bloom when supported, and 1.0 reproduces the legacy L2-fit "
+    "rule",
     LogicalType::DOUBLE,
     Value::DOUBLE(operator_defaults.dynamic_filter_inlist_max_l2_fraction),
     SetDynamicFilterInlistMaxL2Fraction);
