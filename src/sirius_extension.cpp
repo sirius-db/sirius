@@ -2403,7 +2403,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     "For BUILD_PROBE hash joins whose build-key uniqueness the planner could not prove, test "
     "distinctness at runtime (one cudf::distinct_count pass over the cached build) and take the "
     "single-pass cudf::distinct_hash_join instead of the general two-pass join when the keys are "
-    "distinct (on by default)",
+    "distinct (temporarily off by default pending a cuCollections fix; see issue #1600)",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.enable_runtime_distinct_build_probe),
     SetEnableRuntimeDistinctBuildProbe);
