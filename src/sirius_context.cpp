@@ -113,10 +113,7 @@ optional_ptr<TableCatalogEntry const> find_update_target(PhysicalOperator const&
   return nullptr;
 }
 
-/// Name of the pinned entry holding THIS table, or nullopt. Matched on the full
-/// duckdb identity including the catalog object id, so a table that merely reuses
-/// the qualified name of a pinned-then-dropped one is not treated as pinned — it is
-/// a different table and writing to it is unrestricted.
+/// Find the pin for this table incarnation. A recreated same-name table does not match.
 std::optional<std::string> pinned_name_for_table(
   sirius::scan_manager::sirius_scan_manager const& scan_manager, TableCatalogEntry const& table)
 {

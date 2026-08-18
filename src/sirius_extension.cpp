@@ -1096,10 +1096,7 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
   info->storage = &storage;
   info->context = &context;
   info->db_path = canonical;
-  // Qualified-name + incarnation identity for the pin cache — derived from the
-  // resolved DuckTableEntry so it matches the query-side derivation (the pipeline
-  // converter). The oid is what keeps this pin from serving a later table that
-  // merely reuses the name.
+  // Match the scan path by deriving the cache identity from the resolved entry.
   info->catalog_name           = entry.ParentCatalog().GetName();
   info->schema_name            = entry.ParentSchema().name;
   info->table_name             = entry.name;

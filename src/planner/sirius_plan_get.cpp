@@ -24,6 +24,7 @@
 #include "duckdb/storage/block_manager.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/segment/uncompressed.hpp"
+#include "duckdb/storage/single_file_block_manager.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/statistics/string_stats.hpp"
 #include "duckdb/storage/storage_manager.hpp"
@@ -42,6 +43,7 @@
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <unordered_map>
@@ -231,16 +233,19 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       auto const& schema = table.ParentSchema().name;
       pinned =
         scan_manager.find_pinned_entry_for_duckdb_table(catalog, schema, table.name, table.oid);
-      // A pin of a SUPERSEDED incarnation of this qualified name (the table was
-      // dropped and recreated, or altered, after pin_table) matches on name but not
-      // on oid, so it correctly does not serve. It must not fall through to the
-      // disk-native read either: that path is MVCC-blind, and the pin's checkpoint
-      // suppression is still in force for this database, so the on-disk image is
-      // the DROPPED table's. Refuse HERE, where the throw is still a clean CPU
-      // fallback — the same cache-or-CPU rule the guards below apply.
+      // A same-name pin for an older table cannot serve this scan. Until a
+      // checkpoint rewrites the on-disk image, the disk-native path is also unsafe,
+      // so decline here while transparent CPU fallback is still available.
       if (pinned == nullptr) {
+        auto const* checkpoint_block_manager = dynamic_cast<duckdb::SingleFileBlockManager const*>(
+          &table.GetStorage().GetAttached().GetStorageManager().GetBlockManager());
+        // Unreachable while pin_table admits only single-file databases.
+        std::optional<std::uint64_t> current_iteration;
+        if (checkpoint_block_manager != nullptr) {
+          current_iteration = checkpoint_block_manager->GetCheckpointIteration();
+        }
         auto const superseded = scan_manager.pinned_entry_name_for_superseded_duckdb_table(
-          catalog, schema, table.name, table.oid);
+          catalog, schema, table.name, table.oid, current_iteration);
         if (superseded) {
           throw duckdb::NotImplementedException(
             "duckdb-native scan: table '%s' was dropped and recreated (or altered) after "

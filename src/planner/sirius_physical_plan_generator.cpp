@@ -192,10 +192,7 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
   info->storage = &table.GetStorage();
   info->context = &context;
   info->db_path = table.GetStorage().GetAttached().GetStorageManager().GetDBPath();
-  // Qualified-name + incarnation identity for the pin cache — derived from the
-  // resolved DuckTableEntry so it matches the pin-side derivation
-  // (build_duckdb_pin_info) exactly. Without these a pin_table(format='duckdb', ...)
-  // query silently misses the pinned cache and falls through to disk.
+  // Derive the cache identity from the resolved entry on both pin and scan paths.
   info->catalog_name           = table.ParentCatalog().GetName();
   info->schema_name            = table.ParentSchema().name;
   info->table_name             = table.name;

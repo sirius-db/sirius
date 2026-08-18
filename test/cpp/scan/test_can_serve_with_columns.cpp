@@ -62,9 +62,7 @@ cache_entry_info parquet_cache(std::vector<std::string> files,
   return ci;
 }
 
-// `oid` is the table's catalog object id — the incarnation half of the duckdb
-// identity. Tests that don't care about incarnations leave it at the shared
-// default on both sides.
+// Shared catalog object id for tests that do not vary the table incarnation.
 constexpr duckdb::idx_t kDefaultOid = 42;
 
 cache_entry_info duckdb_cache(std::string catalog,
@@ -197,11 +195,7 @@ TEST_CASE("cache_entry_info: duckdb different name component or superset misses"
 
 TEST_CASE("cache_entry_info: duckdb identity distinguishes table incarnations", "[scan][can_serve]")
 {
-  // DROP TABLE tpch.main.lineitem; CREATE TABLE tpch.main.lineitem (...) leaves the
-  // qualified name and the column layout identical, but the pin still holds the
-  // DROPPED table's rows. DuckDB gives the recreated table a fresh catalog object
-  // id, which is what makes the two incarnations distinguishable — without it the
-  // scan below would be served stale rows.
+  // A recreated table keeps its name but receives a new catalog object id.
   auto pinned = duckdb_cache("tpch", "main", "lineitem", {0, 1}, /*oid=*/7);
 
   duckdb_native_ingestible_table_info same_incarnation;
@@ -239,8 +233,7 @@ TEST_CASE("cache_entry_info: matches_duckdb_table is the shared identity matcher
   // Same qualified name, different incarnation (dropped and recreated).
   REQUIRE_FALSE(cache.matches_duckdb_table("db", "main", "lineitem", 8));
 
-  // The name-only half ignores the incarnation — it is how a superseded pin is
-  // reported, never how one is chosen to serve.
+  // Name-only matching identifies superseded pins but never serves them.
   REQUIRE(cache.matches_duckdb_table_name("db", "main", "lineitem"));
   REQUIRE_FALSE(cache.matches_duckdb_table_name("db", "main", "orders"));
 
