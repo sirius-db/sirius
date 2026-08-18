@@ -201,7 +201,8 @@ class compressed_host_representation : public cucascade::idata_representation {
   }
 
   /// The attached scan, or null when the columns decompress unfiltered.
-  [[nodiscard]] std::shared_ptr<const decompression_pushdown_scan> const& pushdown_scan() const noexcept
+  [[nodiscard]] std::shared_ptr<const decompression_pushdown_scan> const& pushdown_scan()
+    const noexcept
   {
     return _pushdown_scan;
   }
@@ -309,7 +310,8 @@ class compressed_device_representation : public cucascade::idata_representation 
   }
 
   /// The attached scan, or null when the columns decompress unfiltered.
-  [[nodiscard]] std::shared_ptr<const decompression_pushdown_scan> const& pushdown_scan() const noexcept
+  [[nodiscard]] std::shared_ptr<const decompression_pushdown_scan> const& pushdown_scan()
+    const noexcept
   {
     return _pushdown_scan;
   }

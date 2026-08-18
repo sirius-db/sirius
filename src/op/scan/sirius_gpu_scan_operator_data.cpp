@@ -55,7 +55,7 @@ sirius::decompression_pushdown_scan::compaction_forecast pushdown_compaction_for
     std::iota(identity.begin(), identity.end(), std::size_t{0});
   }
   return rep->pushdown_scan()->forecast_compaction(rep->table(),
-                                                 indices.has_value() ? *indices : identity);
+                                                   indices.has_value() ? *indices : identity);
 }
 
 }  // namespace
@@ -175,7 +175,8 @@ void scan_operator_input::prepare_for_processing(
                                         : rep->column_names().size();
           auto snap                 = snapshot_membership_probes(*dynamic_filters, n_slots);
           SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
-            "[decompression-pushdown] join filter attach (decode time) channel={}: slots={} attached={} "
+            "[decompression-pushdown] join filter attach (decode time) channel={}: slots={} "
+            "attached={} "
             "generation={} skipped_non_maskable={}",
             static_cast<void const*>(dynamic_filters.get()),
             n_slots,
@@ -183,10 +184,10 @@ void scan_operator_input::prepare_for_processing(
             snap.generation,
             snap.skipped_non_mask);
           if (snap.attached_probes == 0) { return; }
-          auto const base =
-            rep->pushdown_scan()
-              ? rep->pushdown_scan()
-              : std::make_shared<const ::sirius::decompression_pushdown_scan>(::sirius::pushdown_request{});
+          auto const base = rep->pushdown_scan()
+                              ? rep->pushdown_scan()
+                              : std::make_shared<const ::sirius::decompression_pushdown_scan>(
+                                  ::sirius::pushdown_request{});
           rep->set_pushdown_scan(
             base->with_membership_probes(std::move(snap.probes), snap.generation));
         };
@@ -208,8 +209,9 @@ void scan_operator_input::prepare_for_processing(
       // pay off, so the scan's remaining splits skip it. Off-gate the
       // converters install the plain representation and both stay false.
       if (auto const* decoded =
-            dynamic_cast<::sirius::decompression_pushdown_batch_representation const*>(mut.get_data())) {
-        auto const& outcome        = decoded->outcome();
+            dynamic_cast<::sirius::decompression_pushdown_batch_representation const*>(
+              mut.get_data())) {
+        auto const& outcome          = decoded->outcome();
         pushdown_row_filtered        = outcome.row_filtered;
         pushdown_predicate_columns   = outcome.predicate_columns;
         pushdown_predicates_enforced = outcome.predicates_enforced;

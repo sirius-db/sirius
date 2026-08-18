@@ -387,8 +387,8 @@ scan_filter_analysis analyze_scan_filters(
   return result;
 }
 
-sirius::pushdown_request build_pushdown_request(
-  scan_filter_analysis const& analysis, std::span<const std::size_t> primary_index_by_slot)
+sirius::pushdown_request build_pushdown_request(scan_filter_analysis const& analysis,
+                                                std::span<const std::size_t> primary_index_by_slot)
 {
   sirius::pushdown_request request;
   if (analysis.equality_sets.empty() && analysis.ranges.empty()) { return request; }

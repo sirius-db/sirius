@@ -171,7 +171,8 @@ chunk_pushdown_config build_chunk_pushdown_config(simpatico::compressed_table co
     return config;
   }
   if (request.columns.size() > selected_columns.size()) {
-    throw std::runtime_error("[decompression_pushdown_scan] decode request wider than the projection");
+    throw std::runtime_error(
+      "[decompression_pushdown_scan] decode request wider than the projection");
   }
 
   auto const count = selected_columns.size();
@@ -207,14 +208,15 @@ chunk_pushdown_config build_chunk_pushdown_config(simpatico::compressed_table co
     if (!config.ranges[i].requested) { continue; }
     if (!capability.can_select_rows()) {
       SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
-        "[decompression-pushdown] config: DROPPING range conjunct on selected pos {} (physical {}) — the "
+        "[decompression-pushdown] config: DROPPING range conjunct on selected pos {} (physical {}) "
+        "— the "
         "column cannot evaluate it while decoding (route={} comparable_lane={})",
         i,
         physical,
         static_cast<int>(capability.decode.compact_route),
         capability.comparable_lane);
       config.ranges[i].requested = false;
-      dropped_conjunct          = true;
+      dropped_conjunct           = true;
       continue;
     }
     config.ranges[i].selects = true;
@@ -265,7 +267,8 @@ std::vector<simpatico::decode_predicate> to_decode_predicates(pushdown_request c
   });
   if (!any) { return {}; }
   if (request.columns.size() > count) {
-    throw std::runtime_error("[decompression_pushdown_scan] decode request wider than the projection");
+    throw std::runtime_error(
+      "[decompression_pushdown_scan] decode request wider than the projection");
   }
   std::vector<simpatico::decode_predicate> predicates(count);
   for (std::size_t i = 0; i < request.columns.size(); ++i) {
@@ -340,8 +343,8 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
       return s.what == selection_source::kind::membership;
     });
 
-  auto const config =
-    build_chunk_pushdown_config(chunk, selected, request, !sources.empty(), has_dynamic_join_selection);
+  auto const config = build_chunk_pushdown_config(
+    chunk, selected, request, !sources.empty(), has_dynamic_join_selection);
   if (!config.enabled) { return nullptr; }
 
   // Then the conjuncts planning just decided this chunk can evaluate.
@@ -352,7 +355,8 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
   if (sources.size() > kMaxSelectionSources ||
       chunk.num_rows() > std::numeric_limits<std::int32_t>::max()) {
     SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
-      "[decompression-pushdown] declined on shape ({} row-selecting sources, {} rows) — plain decode",
+      "[decompression-pushdown] declined on shape ({} row-selecting sources, {} rows) — plain "
+      "decode",
       sources.size(),
       chunk.num_rows());
     return nullptr;
@@ -390,8 +394,8 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
         break;
     }
   }
-  SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG("[decompression-pushdown] wave-1 sources, ascending expected keep:{}",
-                                     order_echo);
+  SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
+    "[decompression-pushdown] wave-1 sources, ascending expected keep:{}", order_echo);
   wave_request.source_generation = request.membership_generation;
 
   sirius::codegen::scan_filter_result result;
@@ -444,7 +448,8 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
 // decompression_pushdown_scan
 //===----------------------------------------------------------------------===//
 
-std::shared_ptr<const decompression_pushdown_scan> decompression_pushdown_scan::without_row_selection() const
+std::shared_ptr<const decompression_pushdown_scan>
+decompression_pushdown_scan::without_row_selection() const
 {
   pushdown_request narrowed;
   narrowed.columns.reserve(_request.columns.size());
@@ -455,7 +460,8 @@ std::shared_ptr<const decompression_pushdown_scan> decompression_pushdown_scan::
   return std::make_shared<const decompression_pushdown_scan>(std::move(narrowed));
 }
 
-std::shared_ptr<const decompression_pushdown_scan> decompression_pushdown_scan::with_membership_probes(
+std::shared_ptr<const decompression_pushdown_scan>
+decompression_pushdown_scan::with_membership_probes(
   std::vector<std::vector<membership_probe>> probes, std::uint64_t generation) const
 {
   auto refreshed = _request;
@@ -523,10 +529,10 @@ decompression_pushdown_scan::compaction_forecast decompression_pushdown_scan::fo
 //===----------------------------------------------------------------------===//
 
 decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
-                                      std::span<const std::size_t> selected,
-                                      decompression_pushdown_scan const* scan,
-                                      rmm::cuda_stream_view stream,
-                                      rmm::device_async_resource_ref mr)
+                                   std::span<const std::size_t> selected,
+                                   decompression_pushdown_scan const* scan,
+                                   rmm::cuda_stream_view stream,
+                                   rmm::device_async_resource_ref mr)
 {
   decompress_result out;
   static pushdown_request const no_request;

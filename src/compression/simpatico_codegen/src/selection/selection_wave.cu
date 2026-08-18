@@ -98,8 +98,8 @@ __global__ void mask_and_combine_kernel(uint32_t* dst,
                                         int num_srcs,
                                         int64_t num_quads)
 {
-  auto* d4 = reinterpret_cast<uint4*>(dst);
-  int64_t const stride  = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  auto* d4             = reinterpret_cast<uint4*>(dst);
+  int64_t const stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t q = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; q < num_quads;
        q += stride) {
     uint4 v = reinterpret_cast<uint4 const*>(srcs.p[0])[q];

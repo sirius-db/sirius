@@ -874,9 +874,10 @@ target_include_directories(
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
     # Late-materialization headers include codegen/selection/chunk_row_set.hpp
-    # and row_id_space.hpp, so a test that includes late_mat/prepared_selection.hpp
-    # needs the simpatico include root. It was dropped as dead in #1474 (8a3de03c),
-    # which was true until this feature landed.
+    # and row_id_space.hpp, so a test that includes
+    # late_mat/prepared_selection.hpp needs the simpatico include root. It was
+    # dropped as dead in #1474 (8a3de03c), which was true until this feature
+    # landed.
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/compression/simpatico_codegen/include>
     $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
 )

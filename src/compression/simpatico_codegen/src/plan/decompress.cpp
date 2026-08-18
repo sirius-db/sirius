@@ -1497,8 +1497,8 @@ std::optional<str_split_shape> locate_str_split_shape(PlanTree const& tree)
   }
   str_split_shape shape;
   shape.offsets_nid = static_cast<NodeId>(tree.nodes.size());
-  bool chars_ok      = false;
-  bool offsets_ok    = false;
+  bool chars_ok     = false;
+  bool offsets_ok   = false;
   for (std::size_t i = 0; i < node.output_names.size(); ++i) {
     std::string const& name = node.output_names[i];
     if (name == "chars") {

@@ -102,8 +102,8 @@ scan_filter_analysis analyze_scan_filters(
  * column list. Analysis entries that map to no slot are dropped — a partition
  * filter, say, which is enforced elsewhere.
  */
-sirius::pushdown_request build_pushdown_request(
-  scan_filter_analysis const& analysis, std::span<const std::size_t> primary_index_by_slot);
+sirius::pushdown_request build_pushdown_request(scan_filter_analysis const& analysis,
+                                                std::span<const std::size_t> primary_index_by_slot);
 
 /**
  * @brief The part of a scan's filter that still has to be evaluated after the

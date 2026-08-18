@@ -264,9 +264,9 @@ class decompression_pushdown_scan {
  * plain decode of the same columns.
  */
 decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
-                                      std::span<const std::size_t> selected,
-                                      decompression_pushdown_scan const* scan,
-                                      rmm::cuda_stream_view stream,
-                                      rmm::device_async_resource_ref mr);
+                                   std::span<const std::size_t> selected,
+                                   decompression_pushdown_scan const* scan,
+                                   rmm::cuda_stream_view stream,
+                                   rmm::device_async_resource_ref mr);
 
 }  // namespace sirius
