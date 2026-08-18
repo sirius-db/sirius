@@ -30,6 +30,7 @@
 #include <sirius_context.hpp>
 
 // cudf
+#include <cudf/column/column_stream.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
@@ -130,7 +131,11 @@ std::unique_ptr<cudf::table> normalize_physical_schema(std::unique_ptr<cudf::tab
     auto const restoring = can_restore_to(actual, target);
     auto const narrowing = has_explicit_physical_schema && can_narrow_to(actual, target);
     if (actual == target || (!restoring && !narrowing)) { continue; }
-    columns[column_idx] = cast_through_rep(columns[column_idx]->view(), target, stream, mr);
+    // The source's buffers may be dealloc-bound to the pinned-cache upload stream; rebind them
+    // to `stream` so the free replacing the column queues behind the cast still reading them.
+    auto casted         = cast_through_rep(columns[column_idx]->view(), target, stream, mr);
+    auto source         = cudf::rebind_stream(std::move(*columns[column_idx]), stream);
+    columns[column_idx] = std::move(casted);
     if (observer != nullptr) {
       if (narrowing) {
         observer->record_compressed_materialization_scan_columns_narrowed();
