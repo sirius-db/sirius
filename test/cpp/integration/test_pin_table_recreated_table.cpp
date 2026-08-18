@@ -14,22 +14,9 @@
  * limitations under the License.
  */
 
-// A pinned duckdb table that is DROPped and recreated under the same qualified
-// name is a DIFFERENT table, and the pin still holds the dropped one's rows.
-// Nothing about the name, the column layout or the chunk shape distinguishes the
-// two incarnations — only DuckDB's per-catalog-entry object id does — so the pin
-// cache keys on that id as well.
-//
-// Two ways the old identity leaked stale rows, both covered here:
-//   * serving — a scan of the recreated table hit the pin and returned the
-//     dropped table's values;
-//   * re-pinning — a second pin_table under the same pin name took the
-//     same-row-count MERGE path and built one entry out of two unrelated tables.
-//
-// A scan of the recreated table must not fall through to the disk-native read
-// either: that path is MVCC-blind and the pin's checkpoint suppression is still
-// in force, so it declines at plan time into a clean transparent CPU fallback
-// ({0 rebinds, 1 fallback, 0 executions}) with correct results.
+// A recreated table may reuse a qualified name but has a new catalog object id.
+// These tests ensure an old pin is neither served nor merged into the new table.
+// Fresh GPU reads remain blocked until a checkpoint replaces the on-disk image.
 
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
@@ -46,9 +33,7 @@ using PinRecreateFixture = sirius::test::GpuExecutionFixture;
 
 namespace {
 
-/// Run @p query under gpu_execution=true expecting the plan-time guard to decline
-/// (transparent CPU fallback: {0 rebinds, 1 fallback, 0 executions}) and the
-/// results to match a plain CPU run.
+/// Expect a plan-time GPU decline and results matching a CPU run.
 void expect_fallback_matches_cpu(sirius::test::GpuExecutionFixture& fx, const std::string& query)
 {
   fx.con->Query("SET gpu_execution = true;");
@@ -73,9 +58,7 @@ void expect_fallback_matches_cpu(sirius::test::GpuExecutionFixture& fx, const st
   REQUIRE(gpu_rows == cpu_rows);
 }
 
-/// Cached column names of the pinned entry named @p name, copied out inside the
-/// visitor so no reference escapes. Empty when no such entry exists — which the
-/// callers distinguish from "exists but caches nothing" via @ref entry_exists.
+/// Copy the cached column names for @p name.
 std::set<std::string> cached_column_names(duckdb::Connection& con, const std::string& name)
 {
   auto sirius_ctx = sirius::test::get_registered_sirius_context(con);
@@ -115,42 +98,52 @@ TEST_CASE_METHOD(PinRecreateFixture,
   run_ok("CHECKPOINT;");
   run_ok("CALL pin_table(format='duckdb', name='recreate_t', tier='gpu');");
 
-  // Baseline: the pin serves this scan on the GPU ({1 rebind, 0 fallbacks, 1
-  // execution}), so the assertion below is about identity and not about the pin
-  // having failed to take effect.
+  // Confirm the original table is served from the pin.
   compare_gpu_vs_cpu("SELECT sum(a), sum(b) FROM recreate_t;");
 
-  // Same qualified name, same schema, same ROW COUNT — so every chunk-shape and
-  // column-layout check the cache applies still passes — but different values.
-  //
-  // Deliberately NO checkpoint here. A checkpoint would bump the database's
-  // checkpoint generation and trip the pre-existing staleness guard in
-  // prepare_for_query, which masks this bug behind a runtime error. Without one,
-  // nothing but the table identity stands between the scan and the dropped table's
-  // cached rows — pre-fix, the GPU answered sum(a) over range(50000) while DuckDB
-  // answered over range(50000) + 1000000, silently and with no error.
+  // Recreate the same shape with different values, without checkpointing.
   run_ok("DROP TABLE recreate_t;");
   run_ok(
     "CREATE TABLE recreate_t AS SELECT range + 1000000 AS a, range * 3 AS b FROM "
     "range(50000);");
 
-  // The pin is still registered: what changed is that it no longer matches this
-  // table, not that it vanished.
+  // The old pin remains registered but no longer matches.
   REQUIRE(entry_exists(*con, "recreate_t"));
 
-  // The regression assertion — both halves matter. The counters prove the plan
-  // declined instead of serving (or falling through to the MVCC-blind disk read),
-  // and the row comparison proves the values are the recreated table's.
+  // Fall back instead of serving the old pin or stale disk image.
   expect_fallback_matches_cpu(*this, "SELECT sum(a), sum(b) FROM recreate_t;");
 
-  // Unpinning clears the superseded entry, and a fresh pin of the new incarnation
-  // serves it on the GPU again.
+  // Re-pin the new incarnation.
   run_ok("CHECKPOINT;");
   run_ok("CALL unpin_table('recreate_t');");
   run_ok("CALL pin_table(format='duckdb', name='recreate_t', tier='gpu');");
   compare_gpu_vs_cpu("SELECT sum(a), sum(b) FROM recreate_t;");
 
   run_ok("CALL unpin_table('recreate_t');");
+}
+
+TEST_CASE_METHOD(PinRecreateFixture,
+                 "pin_table - a checkpointed recreate under a pinned name serves a fresh read",
+                 "[integration][gpu_execution][pin_table][pin_table_mvcc]")
+{
+  run_ok("CREATE TABLE ckpt_recreate_t AS SELECT range AS a, range * 2 AS b FROM range(50000);");
+  run_ok("CHECKPOINT;");
+  run_ok("CALL pin_table(format='duckdb', name='ckpt_recreate_t', tier='gpu');");
+  compare_gpu_vs_cpu("SELECT sum(a), sum(b) FROM ckpt_recreate_t;");
+
+  // After checkpointing, the old pin misses and a fresh GPU read is safe.
+  run_ok("DROP TABLE ckpt_recreate_t;");
+  run_ok(
+    "CREATE TABLE ckpt_recreate_t AS SELECT range + 1000000 AS a, range * 3 AS b FROM "
+    "range(50000);");
+  run_ok("CHECKPOINT;");
+
+  // Checkpointing makes the disk image safe; it does not change the pin identity.
+  REQUIRE(entry_exists(*con, "ckpt_recreate_t"));
+
+  compare_gpu_vs_cpu("SELECT sum(a), sum(b) FROM ckpt_recreate_t;");
+
+  run_ok("CALL unpin_table('ckpt_recreate_t');");
 }
 
 TEST_CASE_METHOD(PinRecreateFixture,
@@ -163,20 +156,15 @@ TEST_CASE_METHOD(PinRecreateFixture,
   run_ok("CALL pin_table(format='duckdb', name='repin_t', tier='gpu', cols=['a']);");
   REQUIRE(cached_column_names(*con, "repin_t") == std::set<std::string>{"a"});
 
-  // Recreate with the SAME row count, then pin only column 'b' under the same pin
-  // name. insert_pinned_entry's merge path keys on the row count and the chunk
-  // boundaries, both of which match here — only the identity check keeps it from
-  // fusing the old table's 'a' with the new table's 'b' into one entry.
+  // Recreate with the same row count and pin a different column under the same name.
   run_ok("DROP TABLE repin_t;");
   run_ok("CREATE TABLE repin_t AS SELECT range + 1000000 AS a, range * 3 AS b FROM range(50000);");
-  // pin_table refuses uncheckpointed rows, so this one is required.
   run_ok("CHECKPOINT;");
   run_ok("CALL pin_table(format='duckdb', name='repin_t', tier='gpu', cols=['b']);");
 
-  // Replaced, not merged: the entry caches the second pin's columns only.
+  // The second pin replaces the first instead of merging columns.
   REQUIRE(cached_column_names(*con, "repin_t") == std::set<std::string>{"b"});
 
-  // And it serves the new incarnation on the GPU with the new values.
   compare_gpu_vs_cpu("SELECT sum(b) FROM repin_t;");
 
   run_ok("CALL unpin_table('repin_t');");
