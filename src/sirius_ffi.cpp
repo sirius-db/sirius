@@ -472,17 +472,6 @@ void Fragment::build(const std::string& substrait_plan)
       spec.inputs  = std::move(resolved);
       spec.outputs = impl_->outputs;
 
-      // A routing mode on a single destination is a caller mistake, not a no-op: every row goes
-      // to output 0 either way, so silently dropping the spec hides a fan-out that never
-      // happened. The sink applies the same rule to its own spec.
-      if (impl_->outputs.size() <= 1 &&
-          (impl_->broadcast_outputs || !impl_->hash_key_columns.empty())) {
-        throw sirius::invalid_input_exception(
-          "Fragment: a partition mode was declared but the fragment has " +
-          std::to_string(impl_->outputs.size()) +
-          " output stream(s); routing needs at least two destinations");
-      }
-
       if (impl_->broadcast_outputs && impl_->outputs.size() > 1) {
         sirius::op::partition_spec broadcast;
         broadcast.mode    = sirius::op::partition_mode::broadcast;
