@@ -15,11 +15,13 @@
  */
 
 // sirius
+#include <config.hpp>
 #include <expression/ast/node.hpp>
 #include <expression/function_id.hpp>
 #include <expression/value.hpp>
 #include <expression_evaluator/ast_supported_types.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
+#include <expression_evaluator/like_multiliteral.hpp>
 #include <expression_evaluator/regex/regex_playground.hpp>
 #include <helper/logical_type.hpp>
 #include <sirius/exception.hpp>
@@ -188,12 +190,26 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   };
   if (resolved_id == function_id::like || resolved_id == function_id::not_like) {
     auto [input, match_str] = setup_string_matching();
+    auto const invert       = resolved_id == function_id::not_like;
+
+    // `%lit1%lit2%...%litN%` patterns take a SWAR digram fast path (NOT fused in);
+    // everything else — and any ineligible column layout — takes cudf::strings::like.
+    if (duckdb::Config::ENABLE_LIKE_SWAR_FASTPATH && !input.is_scalar()) {
+      if (auto const parsed =
+            classify_like_multiliteral(std::string_view(match_str), std::string_view())) {
+        if (auto result_column = like_multiliteral(
+              cudf::strings_column_view(input.get_column_view()), *parsed, invert, _stream, _mr)) {
+          return evaluate_result(std::move(result_column));
+        }
+      }
+    }
+
     auto result_column = cudf::strings::like(cudf::strings_column_view(input.get_column_view()),
                                              std::string_view(match_str),
                                              std::string_view(),
                                              _stream,
                                              _mr);
-    if (resolved_id == function_id::not_like) {
+    if (invert) {
       result_column =
         cudf::unary_operation(result_column->view(), cudf::unary_operator::NOT, _stream, _mr);
     }

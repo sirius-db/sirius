@@ -39,6 +39,8 @@ bool Config::ENABLE_FALLBACK_CHECK = false;
 
 bool Config::ENABLE_REGEX_JIT_IMPL = true;
 
+bool Config::ENABLE_LIKE_SWAR_FASTPATH = true;
+
 bool Config::MODIFIED_PIPELINE = false;
 
 uint64_t Config::DEFAULT_SCAN_TASK_BATCH_SIZE = 512ULL * 1024 * 1024;  ///< 50 MB

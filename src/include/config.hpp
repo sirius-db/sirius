@@ -57,6 +57,10 @@ struct Config {
   // Whether to use special JIT implementation for particular regex evaluation
   static bool ENABLE_REGEX_JIT_IMPL;
 
+  // Whether `%lit1%lit2%...%` LIKE patterns take the SWAR digram fast-path kernel
+  // instead of cudf::strings::like
+  static bool ENABLE_LIKE_SWAR_FASTPATH;  // like_swar_fastpath
+
   // Whether to use modified pipeline for the new execution model
   static bool MODIFIED_PIPELINE;
 

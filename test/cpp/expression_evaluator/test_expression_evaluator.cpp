@@ -21,6 +21,7 @@
 #include <utils/utils.hpp>
 
 // sirius
+#include <config.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <data/data_batch_utils.hpp>
@@ -1655,6 +1656,53 @@ TEMPLATE_TEST_CASE("select LIKE and NOT LIKE",
       if (s != "str_1") { expected.push_back(s); }
     }
     REQUIRE(copy_string_column_to_host(ov.column(0)) == expected);
+  }
+
+  SECTION("LIKE '%tr%1%' — multi-literal SWAR fast path")
+  {
+    // col0 LIKE '%tr%1%' — a `%lit1%lit2%` pattern, dispatched to the SWAR fast path.
+    std::vector<std::unique_ptr<ast_node>> children;
+    children.push_back(make_ref(0));
+    children.push_back(make_str_const("%tr%1%"));
+    auto expr = make_func(
+      sirius::function_id::like, std::move(children), logical_type::make(type_id::BOOLEAN));
+
+    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
+    auto in_strs                       = copy_string_column_to_host(iv.column(0));
+    std::vector<std::string> expected;
+    for (auto const& s : in_strs) {
+      auto const tr = s.find("tr");
+      if (tr != std::string::npos && s.find('1', tr + 2) != std::string::npos) {
+        expected.push_back(s);
+      }
+    }
+    REQUIRE(copy_string_column_to_host(ov.column(0)) == expected);
+  }
+
+  SECTION("NOT LIKE '%tr%1%' — fast path agrees with the cudf path (knob off)")
+  {
+    auto run_not_like = [&]() {
+      std::vector<std::unique_ptr<ast_node>> children;
+      children.push_back(make_ref(0));
+      children.push_back(make_str_const("%tr%1%"));
+      auto expr = make_func(
+        sirius::function_id::not_like, std::move(children), logical_type::make(type_id::BOOLEAN));
+      auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
+      return copy_string_column_to_host(ov.column(0));
+    };
+
+    // RAII restore: a throwing/failing run_not_like must not leak knob state into
+    // later test cases.
+    struct knob_restore {
+      bool saved = duckdb::Config::ENABLE_LIKE_SWAR_FASTPATH;
+      ~knob_restore() { duckdb::Config::ENABLE_LIKE_SWAR_FASTPATH = saved; }
+    } const restore_knob;
+
+    duckdb::Config::ENABLE_LIKE_SWAR_FASTPATH = true;
+    auto const with_fast_path                 = run_not_like();
+    duckdb::Config::ENABLE_LIKE_SWAR_FASTPATH = false;
+    auto const with_cudf                      = run_not_like();
+    REQUIRE(with_fast_path == with_cudf);
   }
 }
 

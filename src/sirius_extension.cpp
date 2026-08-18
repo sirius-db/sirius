@@ -1825,6 +1825,14 @@ static void SetEnableRegexJitImpl(ClientContext& context, SetScope scope, Value&
   SIRIUS_LOG_DEBUG("Updated config ENABLE_REGEX_JIT_IMPL to {}", Config::ENABLE_REGEX_JIT_IMPL);
 }
 
+static void SetEnableLikeSwarFastpath(ClientContext& context, SetScope scope, Value& parameter)
+{
+  throw_if_sirius_runtime_unavailable(context);
+  Config::ENABLE_LIKE_SWAR_FASTPATH = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_LIKE_SWAR_FASTPATH to {}",
+                   Config::ENABLE_LIKE_SWAR_FASTPATH);
+}
+
 #ifdef SIRIUS_ENABLE_LEGACY
 static void SetModifiedPipeline(ClientContext& context, SetScope scope, Value& parameter)
 {
@@ -2296,6 +2304,15 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     LogicalType::BOOLEAN,
     Value::BOOLEAN(Config::ENABLE_REGEX_JIT_IMPL),
     SetEnableRegexJitImpl);
+
+  // Add in config option for the multi-literal LIKE SWAR fast path
+  config.AddExtensionOption(
+    "like_swar_fastpath",
+    "Whether '%lit1%lit2%...%' LIKE patterns take the SWAR digram fast-path kernel instead of "
+    "cudf::strings::like",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(Config::ENABLE_LIKE_SWAR_FASTPATH),
+    SetEnableLikeSwarFastpath);
 
 #ifdef SIRIUS_ENABLE_LEGACY
   // Add in config options for modified pipeline
