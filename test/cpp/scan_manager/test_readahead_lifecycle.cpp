@@ -25,8 +25,10 @@
 #include "scan_manager/config.hpp"
 #include "scan_manager/readahead_scan_manager.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <memory>
+#include <thread>
 #include <vector>
 
 using sirius::io::cache::scan_stage;
@@ -290,8 +292,40 @@ struct single_scan_order {
 
 }  // namespace
 
-TEST_CASE("a lull between split waves does not retire the operator",
+TEST_CASE("later groups fill idle readahead budget as soon as a split is registered",
           "[scan_manager][readahead]")
+{
+  constexpr std::size_t FIRST = 10;
+  constexpr std::size_t LATER = 20;
+  test_scan first{FIRST};
+  test_scan later{LATER};
+  std::vector<sirius::planner::prefetch_step> steps{
+    {&first, 1, sirius::planner::scheduling_mode::barrier_all, 1},
+    {&later, 2, sirius::planner::scheduling_mode::barrier_all, 1},
+  };
+
+  readahead_scan_manager m;
+  m.prepare_for_order(steps);
+  m.start(1);
+
+  // The preferred group has emitted nothing. Registration of a later group's
+  // split must wake the worker, which should select it as lookahead rather than
+  // leave the budget idle.
+  auto split = std::make_shared<test_split>();
+  m.register_scan_task(split, LATER);
+  for (int i = 0; i < 100 && m.has_unprefetched_work(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  CHECK_FALSE(m.has_unprefetched_work());
+  // Lookahead must not consume or advance the preferred group's cursor.
+  auto* preferred = m.get_next_prefetching_operator();
+  REQUIRE(preferred != nullptr);
+  CHECK(preferred->get_operator_id() == FIRST);
+  m.stop();
+}
+
+TEST_CASE("a lull between split waves does not retire the operator", "[scan_manager][readahead]")
 {
   // The regression: with only one split emitted so far, "every split I know
   // about is disposed" also describes an operator whose producer is between

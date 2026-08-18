@@ -163,19 +163,21 @@ void readahead_scan_manager::register_scan_task(std::shared_ptr<op::scan::scan_i
 {
   if (!task) { return; }
 
-  std::lock_guard lock{_mutex};
-  auto& state     = _by_operator[operator_id];
-  auto const* key = task.get();
-  if (state.index.contains(key)) { return; }  // a split registers once
-  state.index.emplace(key, state.tasks.size());
-  state.tasks.push_back(task_entry{.task = task});
-  note_active_locked();
-  io::prefetch_census::instance().scans_registered.fetch_add(1, std::memory_order_relaxed);
-  io::prefetch_census::instance().note_registration();
+  {
+    std::lock_guard lock{_mutex};
+    auto& state     = _by_operator[operator_id];
+    auto const* key = task.get();
+    if (state.index.contains(key)) { return; }  // a split registers once
+    state.index.emplace(key, state.tasks.size());
+    state.tasks.push_back(task_entry{.task = task});
+    note_active_locked();
+    io::prefetch_census::instance().scans_registered.fetch_add(1, std::memory_order_relaxed);
+    io::prefetch_census::instance().note_registration();
 
-  // A newly emitted split is exactly what the worker may have been waiting for:
-  // collect_prefetch_batch stops when the head operator has nothing ready.
-  _wake = true;
+    // A newly emitted split is exactly what the worker may have been waiting for.
+    _wake = true;
+  }
+  _cv.notify_one();
 }
 
 bool readahead_scan_manager::is_operator_depleted(std::size_t operator_id) const
@@ -246,19 +248,19 @@ void readahead_scan_manager::update(std::size_t operator_id,
       if (task != nullptr) {
         auto const it = state.index.find(task);
         if (it != state.index.end()) {
-          auto& self             = state.tasks[it->second];
-          auto const read_rank   = ++_next_read_rank;
-          auto& census           = io::prefetch_census::instance();
+          auto& self           = state.tasks[it->second];
+          auto const read_rank = ++_next_read_rank;
+          auto& census         = io::prefetch_census::instance();
           if (self.prefetch_rank == 0) {
             census.read_before_prefetch.fetch_add(1, std::memory_order_relaxed);
           } else {
             census.order_reads.fetch_add(1, std::memory_order_relaxed);
             census.order_lead.fetch_add(_next_prefetch_rank - self.prefetch_rank,
                                         std::memory_order_relaxed);
-            census.order_displacement.fetch_add(
-              self.prefetch_rank > read_rank ? self.prefetch_rank - read_rank
-                                             : read_rank - self.prefetch_rank,
-              std::memory_order_relaxed);
+            census.order_displacement.fetch_add(self.prefetch_rank > read_rank
+                                                  ? self.prefetch_rank - read_rank
+                                                  : read_rank - self.prefetch_rank,
+                                                std::memory_order_relaxed);
             if (self.prefetch_rank < _last_read_prefetch_rank) {
               census.order_inversions.fetch_add(1, std::memory_order_relaxed);
             }
@@ -274,14 +276,13 @@ void readahead_scan_manager::update(std::size_t operator_id,
         if (it != state.index.end()) {
           auto const& self = state.tasks[it->second];
           if (self.prefetched && !self.prefetch_done) {
-            bool const ready_sibling =
-              std::ranges::any_of(state.tasks, [&](task_entry const& t) {
-                return &t != &self && t.prefetched && t.prefetch_done && !t.task.expired() &&
-                       t.stage < io::cache::scan_stage::reading;
-              });
+            bool const ready_sibling = std::ranges::any_of(state.tasks, [&](task_entry const& t) {
+              return &t != &self && t.prefetched && t.prefetch_done && !t.task.expired() &&
+                     t.stage < io::cache::scan_stage::reading;
+            });
             if (ready_sibling) {
-              io::prefetch_census::instance()
-                .read_loading_while_ready_available.fetch_add(1, std::memory_order_relaxed);
+              io::prefetch_census::instance().read_loading_while_ready_available.fetch_add(
+                1, std::memory_order_relaxed);
             }
           }
         }
@@ -313,23 +314,16 @@ readahead_scan_manager::collect_prefetch_batch_locked()
   std::size_t ongoing = count_ongoing_locked();
 
   // Exactly one of these fires per pass; which one says whether the readahead is
-  // throttled by its own budget or head-of-line blocked behind an operator that
-  // has not emitted a split yet.
+  // throttled by its own budget or has exhausted every currently emitted split.
   auto& census = io::prefetch_census::instance();
   census.collect_passes.fetch_add(1, std::memory_order_relaxed);
   bool stopped = false;
 
   while (ongoing < _budget) {
-    // Peek before consuming.  Burning an operator's quantum on a split that is
-    // not there yet would let a LATER operator jump the prefetch order, which is
-    // the one thing the order exists to prevent.
-    //
-    // The head member may simply not have emitted its next split yet, and its
-    // producer runs on another thread.  Stopping there leaves the link idle for
-    // as long as that takes, so fall through to the head's PEERS — the other
-    // members of the same rotation group, which the order already says may run
-    // concurrently with it.  Peers only; the next group is gated behind this one
-    // and is never considered.
+    // Prefer the scheduler's current group, but never leave budget idle solely
+    // because that group has no emitted split ready. Check its peers first, then
+    // later groups in order. A later-group pick is lookahead: it fills capacity
+    // without consuming the current group's cursor or quantum.
     auto const candidates = _scheduler.peek_group_operator_ids();
     if (candidates.empty()) {  // order exhausted
       census.stop_order_exhausted.fetch_add(1, std::memory_order_relaxed);
@@ -356,7 +350,7 @@ readahead_scan_manager::collect_prefetch_batch_locked()
       if (chosen != nullptr) { break; }
     }
 
-    // Nothing in the current group can use this slot: look ahead rather than idle.
+    // Nothing in the current group can use this slot: walk later groups rather than idle.
     bool lookahead = false;
     if (chosen == nullptr) {
       for (auto const id : _scheduler.peek_lookahead_operator_ids()) {
@@ -381,8 +375,8 @@ readahead_scan_manager::collect_prefetch_batch_locked()
       stopped = true;
       break;
     }
-    // No member of this group has a split ready.  Stop: their splits are simply
-    // not emitted yet, and register_scan_task wakes us when they are.
+    // No operator in the remaining order has an emitted split ready. Stop
+    // until registration or a stage transition changes the available work.
     if (chosen == nullptr) {
       census.stop_no_split_ready.fetch_add(1, std::memory_order_relaxed);
       stopped = true;
@@ -406,8 +400,7 @@ readahead_scan_manager::collect_prefetch_batch_locked()
     chosen->prefetch_rank = ++_next_prefetch_rank;
 
     // A split with no file ranges (host-backed, or fully cached) has no IO to
-    // issue, so it never occupies a slot.  Memoized, so this does not rebuild
-    // the range list under the lock.
+    // issue, so it never occupies a slot. Hints were computed with the split.
     if (task->fadvise_hints().empty()) {
       chosen->prefetch_done = true;
       continue;

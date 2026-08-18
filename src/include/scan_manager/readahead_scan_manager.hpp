@@ -16,9 +16,9 @@
 
 #pragma once
 
+#include "exec/query_stage_manager.hpp"
 #include "io/cache/types.hpp"
 #include "planner/query_index.hpp"
-#include "exec/query_stage_manager.hpp"
 #include "scan_manager/prefetching_scheduler.hpp"
 
 #include <condition_variable>
@@ -44,10 +44,11 @@ namespace sirius::scan_manager {
 /// Per-query readahead bookkeeping for GPU scans.  Seeded from the query's
 /// prefetching order, then driven by the scans as they advance.
 ///
-/// The worker keeps the backend's scan budget occupied: every time a split
-/// reports progress it re-checks how many scans are in flight and, while there
-/// is room, pulls the next operator off @ref prefetching_scheduler and issues
-/// prefetch IO for one of its splits.
+/// The worker keeps the backend's scan budget occupied: every time available
+/// work or split progress changes, it fills open slots from the scheduler's
+/// current group, then walks later groups when the preferred group has no
+/// emitted split ready. Later-group lookahead does not consume the preferred
+/// group's cursor or quantum.
 ///
 /// Held by @c shared_ptr (splits report into it from their own threads) and
 /// inherits @c enable_shared_from_this so an in-flight prefetch completion can
