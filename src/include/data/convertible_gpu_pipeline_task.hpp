@@ -158,7 +158,7 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * data away.
    *
    * Sums reclaimable bytes across all data_batches in the task's input that reside in the given
-   * memory space. Accesses memory space via to_read_only() as required by the new cucascade API.
+   * memory space.
    *
    * @param space The memory space to query.
    * @return Total reclaimable bytes, or 0 if no data resides in that space.

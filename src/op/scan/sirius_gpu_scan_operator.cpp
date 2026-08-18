@@ -186,8 +186,10 @@ struct mixed_scan_owner {
 };
 
 // Emit a pure forwarded view when no cast is needed, or combine forwarded and cast columns under a
-// composite owner. Attribute cast allocations exactly and estimate only the referenced input
-// columns, avoiding a full-input charge after projection.
+// composite owner. Cast allocations are attributed exactly; forwarded columns are estimated via
+// estimate_referenced_column_bytes — exact for fixed-width columns, a count-average of the input's
+// variable-width residual otherwise, so dropped variable-width bytes shift onto kept ones pro
+// rata.
 std::shared_ptr<::cucascade::data_batch> emit_view_forward(
   owning_table_view::released_view forwarded,
   std::vector<std::unique_ptr<cudf::column>> casts,
