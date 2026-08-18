@@ -308,8 +308,11 @@ struct Fragment::Impl {
   void declare_streams(
     const std::map<sirius::exec::stream_id_t, sirius::exec::stream_input_spec>& resolved)
   {
+    // declare() overwrites any prior entry for the same id, so there is nothing of this
+    // fragment's own to pre-clear. Must NOT call catalog.clear() here: this catalog is shared
+    // by every Fragment on the same Context (e.g. fragments chained via relay_from), and
+    // clear() would wipe a peer fragment's still-live declarations.
     auto& catalog = *ctx.stream_catalog;
-    catalog.clear();
     for (const auto& [id, spec] : resolved) {
       auto repository = std::make_shared<cucascade::shared_data_repository>();
       if (is_result()) { result_input_repos[id] = repository; }
@@ -433,6 +436,18 @@ void Fragment::build(const std::string& substrait_plan)
     *impl_->ctx.context, client, kQueryLabel);
 
   try {
+    // A routing mode needs at least two destinations to mean anything: with 0 or 1 declared
+    // outputs every row goes to the same place either way, so accepting it here would hide a
+    // fan-out that never happened. Checked before the is_result()/else split below so it also
+    // catches a partition mode declared on a 0-output result fragment, not just a 1-output one.
+    if (impl_->outputs.size() <= 1 &&
+        (impl_->broadcast_outputs || !impl_->hash_key_columns.empty())) {
+      throw sirius::invalid_input_exception(
+        "Fragment: a partition mode was declared but the fragment has " +
+        std::to_string(impl_->outputs.size()) +
+        " output stream(s); routing needs at least two destinations");
+    }
+
     if (impl_->is_result()) {
       // A result fragment takes the single-shot execution path; its leaves may be streaming
       // sources built from the bind catalog.
@@ -456,17 +471,6 @@ void Fragment::build(const std::string& substrait_plan)
                            duckdb::ClientContext&) { return lower_substrait(*conn, plan).plan; };
       spec.inputs  = std::move(resolved);
       spec.outputs = impl_->outputs;
-
-      // A routing mode on a single destination is a caller mistake, not a no-op: every row goes
-      // to output 0 either way, so silently dropping the spec hides a fan-out that never
-      // happened. The sink applies the same rule to its own spec.
-      if (impl_->outputs.size() <= 1 &&
-          (impl_->broadcast_outputs || !impl_->hash_key_columns.empty())) {
-        throw sirius::invalid_input_exception(
-          "Fragment: a partition mode was declared but the fragment has " +
-          std::to_string(impl_->outputs.size()) +
-          " output stream(s); routing needs at least two destinations");
-      }
 
       if (impl_->broadcast_outputs && impl_->outputs.size() > 1) {
         sirius::op::partition_spec broadcast;

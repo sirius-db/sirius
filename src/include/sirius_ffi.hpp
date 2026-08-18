@@ -114,14 +114,16 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// @throws after build() or on duplicate id.
   void declare_output(std::uint64_t stream_id);
 
-  /// Every output receives the full fragment output (broadcast sink). With a single declared
-  /// output this is a no-op. Mutually exclusive with declare_output_hash_key.
-  /// @throws after build().
+  /// Every output receives the full fragment output (broadcast sink). Requires at least two
+  /// declared outputs: build() rejects a partition mode declared on 0 or 1 outputs rather than
+  /// silently ignoring it. Mutually exclusive with declare_output_hash_key.
+  /// @throws after build(), or from build() itself when fewer than two outputs are declared.
   void declare_output_broadcast();
 
   /// Declare one hash-partition key column for a multi-output sink. Call once per key in
-  /// partition-expression order. Mutually exclusive with declare_output_broadcast.
-  /// @throws after build().
+  /// partition-expression order. Requires at least two declared outputs, same as
+  /// declare_output_broadcast(). Mutually exclusive with declare_output_broadcast.
+  /// @throws after build(), or from build() itself when fewer than two outputs are declared.
   void declare_output_hash_key(std::uint32_t column_index);
 
   /// Lower and plan `substrait_plan` against the declared streams; open the query lifecycle.

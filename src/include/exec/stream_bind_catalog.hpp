@@ -42,7 +42,8 @@ struct stream_input_binding {
 };
 
 /// Per-connection declared input streams. ClientContextState so DuckDB bind can resolve schema
-/// before physical planning. One fragment per connection at a time.
+/// before physical planning. Multiple fragments may share one connection at once (e.g. chained
+/// via relay_from), each owning a disjoint set of ids — see clear() vs erase() below.
 class stream_bind_catalog : public duckdb::ClientContextState {
  public:
   static constexpr const char* kStateKey = "sirius_stream_catalog";
@@ -65,7 +66,9 @@ class stream_bind_catalog : public duckdb::ClientContextState {
   /// @throws sirius::invalid_input_exception when `id` was never declared.
   [[nodiscard]] const stream_input_binding& get(stream_id_t id) const;
 
-  /// @throws sirius::invalid_input_exception when `id` was never declared.
+  /// @throws sirius::invalid_input_exception when `id` was never declared, or when it already
+  ///         has a built operator (the same declared stream read by more than one plan leaf —
+  ///         fan-out reads of a single declared stream are not supported).
   void set_built(stream_id_t id, op::sirius_physical_streaming_source* built);
 
   [[nodiscard]] std::vector<stream_id_t> declared_streams() const;

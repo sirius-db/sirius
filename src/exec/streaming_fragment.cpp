@@ -201,9 +201,24 @@ void streaming_fragment::run()
     throw sirius::invalid_input_exception("streaming_fragment: build() must run before run()");
   }
 
-  // Shared query window (don't open a second StandaloneQueryScope): a new window resets
-  // task_creator / scan manager that build() populated → zero tasks, empty output, no error.
-  _engine->execute();
+  try {
+    // Shared query window (don't open a second StandaloneQueryScope): a new window resets
+    // task_creator / scan manager that build() populated → zero tasks, empty output, no error.
+    _engine->execute();
+  } catch (...) {
+    // Poison every output before unwinding: otherwise the streams are neither closed nor
+    // failed, so a peer parked in wait() blocks forever with no error anywhere. fail_output is
+    // idempotent (first-failure-wins), so this stays safe even when a caller (e.g.
+    // sirius::ffi::Fragment::run()) also poisons the same outputs itself.
+    auto const cause = std::current_exception();
+    for (auto id : _spec.outputs) {
+      try {
+        _session.fail_output(id, cause);
+      } catch (...) {  // NOLINT(bugprone-empty-catch)
+      }
+    }
+    throw;
+  }
 }
 
 const duckdb::vector<sirius::logical_type>& streaming_fragment::sink_types() const

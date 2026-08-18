@@ -86,6 +86,15 @@ void stream_bind_catalog::set_built(stream_id_t id, op::sirius_physical_streamin
   std::lock_guard<std::mutex> guard(_mutex);
   auto it = _entries.find(id);
   if (it == _entries.end()) { throw_undeclared(id); }
+  if (it->second.built != nullptr) {
+    // Each declared stream backs exactly one batch_stream; a second plan leaf reading the same
+    // id (e.g. a self-join) would silently overwrite the first leaf's pointer here, so pushes
+    // and closes would never reach it and its pipeline would wait forever.
+    throw sirius::invalid_input_exception(
+      "stream_bind_catalog: input stream " + std::to_string(id) +
+      " is read by more than one operator in the same plan — fan-out reads of a single "
+      "declared stream are not supported");
+  }
   it->second.built = built;
 }
 

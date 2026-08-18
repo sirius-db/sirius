@@ -25,6 +25,7 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "exec/stream_bind_catalog.hpp"
 #include "log/duckdb_sink.hpp"
 #include "log/logging.hpp"
 #include "log/noop_sink.hpp"
@@ -1605,6 +1606,12 @@ void SiriusContextExtensionCallback::OnConnectionOpened(ClientContext& context)
     // capture, label, guard depths) — unlike the shared SiriusContext above.
     context.registered_state->Insert("sirius_connection_state",
                                      duckdb::make_shared_ptr<SiriusConnectionState>());
+    // sirius_stream_source's bind, and any streaming_fragment built on this connection, resolve
+    // declared-stream schemas through a per-connection catalog — without this, both fail
+    // immediately on every normal (transparent) connection instead of just the FFI's own.
+    context.registered_state->Insert(
+      sirius::exec::stream_bind_catalog::kStateKey,
+      duckdb::make_shared_ptr<sirius::exec::stream_bind_catalog>());
   }
 }
 
@@ -1614,6 +1621,7 @@ void SiriusContextExtensionCallback::OnConnectionClosed(ClientContext& context)
   // remove the context from the registered state
   context.registered_state->Remove("sirius_state");
   context.registered_state->Remove("sirius_connection_state");
+  context.registered_state->Remove(sirius::exec::stream_bind_catalog::kStateKey);
 }
 
 void SiriusContextExtensionCallback::OnExtensionLoaded(DatabaseInstance& db, const string& name)
