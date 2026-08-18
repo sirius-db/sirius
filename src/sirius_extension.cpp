@@ -22,6 +22,7 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/open_file_info.hpp"
 #include "expression_evaluator/expression_evaluator_strategy.hpp"
+#include "helper/utils.hpp"
 
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/types.hpp>
@@ -1303,6 +1304,20 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     if (file_paths.empty()) {
       throw InvalidInputException("pin_table: no parquet files matched path: " + data.args.path);
     }
+    // Pin the files in a deterministic, natural (digit-aware) name order instead of raw readdir
+    // order. Multi-file datasets are almost always written as key-contiguous parts
+    // (part.0, part.1, ..., part.N), so natural order makes every pinned chunk a contiguous,
+    // in-order slice of the logical table — which downstream runtime proofs (the clustered
+    // merge bypass's range proof, the sorted-groupby hint's is_sorted check) can then actually
+    // observe. Readdir order is filesystem-dependent and non-deterministic across hosts.
+    // Cache identity is order-insensitive (matches_parquet_files sorts both sides), so this
+    // cannot break pinned-cache matching.
+    if (sirius_ctx->get_config().get_operator_params().pin_table_natural_file_order) {
+      std::sort(
+        file_paths.begin(), file_paths.end(), [](const std::string& lhs, const std::string& rhs) {
+          return sirius::utils::natural_name_less(lhs, rhs);
+        });
+    }
     auto info =
       build_parquet_pin_info(scan_mgr, file_paths, data.args.cols, batch_size, pinned_column_types);
     ingestible = sirius::op::scan::make_ingestible(std::move(info));
@@ -2071,6 +2086,16 @@ static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
                    params->enable_runtime_distinct_build_probe);
 }
 
+static void SetPinTableNaturalFileOrder(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                            = lock_operator_params_slot(context);
+  params->pin_table_natural_file_order = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config PIN_TABLE_NATURAL_FILE_ORDER to {}",
+                   params->pin_table_natural_file_order);
+}
+
 static void SetEnableDynamicFilterPushdown(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2407,6 +2432,15 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.enable_runtime_distinct_build_probe),
     SetEnableRuntimeDistinctBuildProbe);
+
+  config.AddExtensionOption(
+    "pin_table_natural_file_order",
+    "Pin multi-file parquet datasets in natural (digit-aware) file-name order instead of raw "
+    "readdir order, so pinned chunks are contiguous in-order slices of the logical table (on by "
+    "default)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.pin_table_natural_file_order),
+    SetPinTableNaturalFileOrder);
 
   config.AddExtensionOption(
     "gpu_execution",

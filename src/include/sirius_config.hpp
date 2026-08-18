@@ -83,6 +83,14 @@ constexpr double DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO = 8.0;
 /// one cudf::distinct_count pass over the build keys, taken only in BUILD_PROBE mode.
 constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = true;
 
+/// Pin multi-file parquet datasets in natural (digit-aware) file-name order instead of raw
+/// readdir order. Datasets are almost always written as key-contiguous parts (part.0, part.1,
+/// ..., part.N), so natural order makes every pinned chunk a contiguous in-order slice of the
+/// logical table — a property the clustered merge bypass's range proof and the sorted-groupby
+/// hint's is_sorted check can then observe at runtime. Readdir order is filesystem-dependent
+/// and non-deterministic across hosts; pinned-cache identity is order-insensitive either way.
+constexpr bool DEFAULT_PIN_TABLE_NATURAL_FILE_ORDER = true;
+
 }  // namespace config
 
 /// Parameters controlling operator-level resource sizing.
@@ -131,6 +139,10 @@ struct operator_params {
   /// distinct. BUILD_PROBE mode only, INNER/LEFT equality joins with null-unequal semantics. See
   /// DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE.
   bool enable_runtime_distinct_build_probe = config::DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE;
+
+  /// Pin multi-file parquet datasets in natural (digit-aware) file-name order instead of raw
+  /// readdir order. See DEFAULT_PIN_TABLE_NATURAL_FILE_ORDER.
+  bool pin_table_natural_file_order = config::DEFAULT_PIN_TABLE_NATURAL_FILE_ORDER;
 
   /// Wire dynamic table-filter pushdown: an eligible BUILD_PROBE hash-join build publishes a raw
   /// exact IN-list for 1..12 supported build rows, otherwise a hash IN-list if it fits the smallest
