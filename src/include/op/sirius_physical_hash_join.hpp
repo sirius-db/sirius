@@ -104,7 +104,7 @@ struct build_probe_decision {
 /// Only the build side drives broadcast / build-probe, so when `is_build_side` is false (right-
 /// family joins are probe-driven) the result is the plain STANDARD-mode natural count.
 ///
-/// MARK joins cannot be hash-partitioned across batches (build_has_null must be globally
+/// MARK joins cannot be hash-partitioned across batches (mark_build_kind must be globally
 /// consistent), so they are clamped to one partition on a single GPU and forced to broadcast on
 /// multi-GPU.
 ///
@@ -130,14 +130,26 @@ struct build_probe_decision {
   HASH_JOIN_MODE join_mode,
   double estimated_probe_to_build_ratio);
 
-/// Which broadcast slots to discard. In a broadcast join the build table is replicated to every
-/// slot but the probe side is unpartitioned, so a slot may hold build data yet never receive probe
-/// data. Once the probe upstream is finished (`probe_finished`), any slot that is still NOT_BUILT
-/// with a build batch but no probe batch will never be probed and is returned for discard. Returns
-/// empty while the probe side may still deliver data. Pure/unit-testable counterpart of
-/// discard_build_only_slots_if_probe_complete.
-[[nodiscard]] std::vector<std::size_t> broadcast_slots_to_discard(
-  std::vector<build_probe_slot_view> const& slots, bool probe_finished);
+/// Reclaim plan for BUILD_PROBE slots whose probe side has finished without delivering them a
+/// batch. Every such slot's replicated/partitioned build batch would otherwise pin the input
+/// repository open forever. `discard` slots are freed outright. When freeing them all would end the
+/// operator with zero tasks ever issued, `orphan` names one slot to claim for a single build task
+/// with a synthesized empty probe batch instead, so at least one (0-row) output batch flows and the
+/// query-terminal pipeline can complete.
+struct build_probe_reclaim_plan {
+  std::vector<std::size_t> discard;
+  std::optional<std::size_t> orphan;
+};
+
+/// Compute the reclaim plan from a per-partition snapshot. While the probe upstream is unfinished
+/// the plan is empty (nothing is final yet). Candidates are slots that are still NOT_BUILT with a
+/// build batch but no probe batch — a BUILT slot already consumed its build batch, and a slot with
+/// probe data will still be built. The orphan is only planned when no task was ever issued and none
+/// can be (`task_issued` is false, no slot holds a probe batch, and every slot is NOT_BUILT or
+/// DESTROYED); it is the first candidate, with the rest discarded. Pure/unit-testable counterpart
+/// of reclaim_build_only_slots_if_probe_complete.
+[[nodiscard]] build_probe_reclaim_plan plan_build_probe_reclaim(
+  std::vector<build_probe_slot_view> const& slots, bool probe_finished, bool task_issued);
 
 //===----------------------------------------------------------------------===//
 // STANDARD / MIXED_JOIN partial-barrier scheduling helpers.
@@ -378,11 +390,13 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// scheduler (`select_build_probe_action`). Must be called with `op_state_mutex` held.
   std::vector<build_probe_slot_view> snapshot_build_probe_slots();
 
-  /// Broadcast-mode cleanup: once the probe upstream is finished, any NOT_BUILT slot that holds a
-  /// (replicated) build batch but never received probe data is discarded — its build batch is freed
-  /// on its own GPU and the slot is marked DESTROYED so the operator can complete. No-op unless
-  /// `_broadcast`. Must be called with `op_state_mutex` held.
-  void discard_build_only_slots_if_probe_complete();
+  /// BUILD_PROBE cleanup once the probe upstream is finished: applies plan_build_probe_reclaim's
+  /// decision. Discarded slots have their build batch freed on its own GPU and are marked DESTROYED
+  /// so the operator can complete; a planned orphan slot is instead claimed (SCHEDULING) for a
+  /// single build task whose probe input get_next_task_input_data_for_build_probe synthesizes as an
+  /// empty batch. Returns true when an orphan was claimed, so get_next_task_hint can report READY.
+  /// Must be called with `op_state_mutex` held.
+  bool reclaim_build_only_slots_if_probe_complete();
 
   std::optional<task_creation_hint> get_next_task_hint() override;
 
@@ -414,16 +428,23 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   // the probe side is streamed unpartitioned.
   bool _broadcast = false;
 
+  // >= 1 BUILD_PROBE task input has been issued; guarded by op_state_mutex. Consulted by the
+  // reclaim sweep so a join whose probe side finished with zero batches keeps one slot for an
+  // orphan build task instead of discarding them all (see plan_build_probe_reclaim).
+  bool _build_probe_task_issued = false;
+
   // Whether the build port delivers one concat-folded batch covering the entire build side
   // (single-partition or broadcast build with a concat_all'd build-side CONCAT). Set by the
   // upstream PARTITION at sizing time; the one-shot dynamic-filter publisher only claims a build
   // batch when this holds. Guarded by op_state_mutex.
   bool _build_arrives_whole = false;
 
-  // Whether any build-side join key column contains a NULL. Used exclusively for MARK join
-  // three-valued logic. Sentinel -1 = unset, 0 = false, 1 = true. Join-wide (not per-partition)
-  // because MARK joins are forced to a single partition / broadcast, so all build batches agree.
-  std::atomic<int> _build_has_null{-1};
+  // Classification of the build (IN-list) key set, used exclusively for MARK join three-valued
+  // logic. Sentinel -1 = unset; otherwise the underlying value of the mark_build_kind enum (0 =
+  // empty, 1 = non-empty without NULL keys, 2 = non-empty with a NULL key). Join-wide (not
+  // per-partition) because a MARK build is a single partition, a broadcast of one folded batch, or
+  // all-empty synthesized batches, so every publication agrees.
+  std::atomic<int> _mark_build_kind{-1};
 
   // Per-partition build/probe state for BUILD_PROBE mode. Each partition owns one cuco hash table
   // that lives entirely on one GPU . A partition is built once — its

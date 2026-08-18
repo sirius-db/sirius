@@ -360,6 +360,36 @@ TEST_CASE("sirius_physical_hash_join mark join - empty right side", "[physical_m
   REQUIRE(copy_column_to_host<bool>(out_view.column(2)) == std::vector<bool>{false, false, false});
 }
 
+// `x IN (S)` is FALSE for every probe row when S is empty — including a NULL probe key, which
+// yields NULL only against a NON-empty set. The mark must be all-false with no null mask.
+TEST_CASE("sirius_physical_hash_join mark join - empty right side with NULL probe key",
+          "[physical_mark_join]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  // Left key column carries a NULL at row 1; payload is a plain column.
+  auto left_key = make_numeric_batch_with_nulls<int32_t>(
+    *space, {1, 0, 2}, {true, false, true}, cudf::type_id::INT32);
+  auto left_payload = make_numeric_batch<int32_t>(*space, {10, 20, 30}, cudf::type_id::INT32);
+  auto left_batch   = concatenate_batches_horizontal({left_key, left_payload}, *space);
+
+  auto right_batch = make_numeric_batch<int32_t>(*space, {}, cudf::type_id::INT32);
+
+  auto f = create_mark_join();
+  std::vector<std::shared_ptr<cucascade::data_batch>> inputs{left_batch, right_batch};
+  auto outputs =
+    f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+
+  auto out_view = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
+  REQUIRE(out_view.num_rows() == 3);
+
+  auto mark = out_view.column(2);
+  REQUIRE(mark.null_count() == 0);
+  REQUIRE(copy_column_to_host<bool>(mark) == std::vector<bool>{false, false, false});
+}
+
 TEST_CASE("sirius_physical_hash_join mark join - duplicate keys on right side",
           "[physical_mark_join]")
 {

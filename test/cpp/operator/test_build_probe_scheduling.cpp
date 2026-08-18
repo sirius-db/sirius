@@ -34,13 +34,13 @@
 
 #include <stdexcept>
 
-using sirius::op::broadcast_slots_to_discard;
 using sirius::op::BUILD_HASH_TABLE_STATE;
 using sirius::op::build_probe_action;
 using sirius::op::build_probe_slot_view;
 using sirius::op::compute_hash_join_partition_strategy;
 using sirius::op::HASH_JOIN_MODE;
 using sirius::op::partition_strategy;
+using sirius::op::plan_build_probe_reclaim;
 using sirius::op::select_build_probe_action;
 
 namespace {
@@ -357,7 +357,7 @@ TEST_CASE("compute_hash_join_partition_strategy - MARK single-GPU clamps to one 
 
   // A large MARK build stays clamped to one partition and is still forced into BUILD_PROBE even
   // though it is over the per-GPU hash-table cap: MARK must never fall back to a hash-partitioned
-  // STANDARD join (that would split build rows and corrupt build_has_null). Capacity pressure is
+  // STANDARD join (that would split build rows and corrupt mark_build_kind). Capacity pressure is
   // handled by the downgrade/spill path, not by a mode switch.
   auto const large = strategy(8 * k100MB,
                               true,
@@ -381,7 +381,7 @@ TEST_CASE("compute_hash_join_partition_strategy - MARK multi-GPU forces broadcas
   REQUIRE(s.build_probe);
 
   // A MARK build that is over the per-GPU / broadcast cap still forces broadcast BUILD_PROBE on
-  // multi-GPU: MARK must never hash-partition its build (that would corrupt build_has_null), so it
+  // multi-GPU: MARK must never hash-partition its build (that would corrupt mark_build_kind), so it
   // broadcasts the full build to every GPU regardless of size and relies on downgrade for capacity.
   auto const big = strategy(6 * k100MB,
                             true,
@@ -540,28 +540,31 @@ TEST_CASE("select_build_probe_action - first ready build wins across many partit
 }
 
 //===----------------------------------------------------------------------===//
-// broadcast_slots_to_discard
+// plan_build_probe_reclaim
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("broadcast_slots_to_discard - nothing is discarded until the probe side finishes",
+TEST_CASE("plan_build_probe_reclaim - nothing is reclaimed until the probe side finishes",
           "[build_probe]")
 {
-  // Build-only slots exist, but probe may still deliver data — discard nothing yet.
-  auto const d = broadcast_slots_to_discard(
+  // Build-only slots exist, but probe may still deliver data — plan nothing yet.
+  auto const plan = plan_build_probe_reclaim(
     {
       slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
       slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
     },
-    /*probe_finished=*/false);
-  REQUIRE(d.empty());
+    /*probe_finished=*/false,
+    /*task_issued=*/false);
+  REQUIRE(plan.discard.empty());
+  REQUIRE_FALSE(plan.orphan.has_value());
 }
 
-TEST_CASE("broadcast_slots_to_discard - discards only NOT_BUILT slots with build but no probe",
+TEST_CASE("plan_build_probe_reclaim - discards only NOT_BUILT slots with build but no probe",
           "[build_probe]")
 {
-  // p0: has probe -> will be built, keep.  p1: build-only -> discard.  p2: already BUILT -> keep.
-  // p3: build-only -> discard.  p4: no build batch at all -> nothing to discard.
-  auto const d = broadcast_slots_to_discard(
+  // Tasks were issued, so this is pure cleanup. p0: has probe -> will be built, keep.  p1:
+  // build-only -> discard.  p2: already BUILT -> keep.  p3: build-only -> discard.  p4: no build
+  // batch at all -> nothing to discard.
+  auto const plan = plan_build_probe_reclaim(
     {
       slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true),
       slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
@@ -569,17 +572,128 @@ TEST_CASE("broadcast_slots_to_discard - discards only NOT_BUILT slots with build
       slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
       slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, false, false),
     },
-    /*probe_finished=*/true);
-  REQUIRE(d == std::vector<std::size_t>{1, 3});
+    /*probe_finished=*/true,
+    /*task_issued=*/true);
+  REQUIRE(plan.discard == std::vector<std::size_t>{1, 3});
+  REQUIRE_FALSE(plan.orphan.has_value());
 }
 
-TEST_CASE("broadcast_slots_to_discard - a DESTROYED slot is not rediscarded", "[build_probe]")
+TEST_CASE("plan_build_probe_reclaim - a DESTROYED slot is not rediscarded", "[build_probe]")
 {
-  auto const d = broadcast_slots_to_discard(
+  auto const plan = plan_build_probe_reclaim(
     {
       slot(BUILD_HASH_TABLE_STATE::DESTROYED, false, false),
       slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
     },
-    /*probe_finished=*/true);
-  REQUIRE(d == std::vector<std::size_t>{1});
+    /*probe_finished=*/true,
+    /*task_issued=*/true);
+  REQUIRE(plan.discard == std::vector<std::size_t>{1});
+  REQUIRE_FALSE(plan.orphan.has_value());
+}
+
+TEST_CASE("plan_build_probe_reclaim - an already-issued task makes every candidate a discard",
+          "[build_probe]")
+{
+  auto const plan = plan_build_probe_reclaim(
+    {
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
+    },
+    /*probe_finished=*/true,
+    /*task_issued=*/true);
+  REQUIRE(plan.discard == std::vector<std::size_t>{0, 1});
+  REQUIRE_FALSE(plan.orphan.has_value());
+}
+
+TEST_CASE("plan_build_probe_reclaim - zero-task end state keeps one slot as the orphan",
+          "[build_probe]")
+{
+  // Probe finished with zero batches anywhere and no task ever issued: freeing every slot would
+  // leave the operator with zero output batches, so the first candidate becomes the orphan build
+  // task and only the rest are discarded.
+  auto const plan = plan_build_probe_reclaim(
+    {
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
+    },
+    /*probe_finished=*/true,
+    /*task_issued=*/false);
+  REQUIRE(plan.orphan == 0);
+  REQUIRE(plan.discard == std::vector<std::size_t>{1, 2});
+}
+
+TEST_CASE("plan_build_probe_reclaim - probe data anywhere suppresses the orphan", "[build_probe]")
+{
+  // Slot 0 holds a probe batch, so a normal build task will be issued for it; the never-probed
+  // candidate is a plain discard.
+  auto const plan = plan_build_probe_reclaim(
+    {
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true),
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
+    },
+    /*probe_finished=*/true,
+    /*task_issued=*/false);
+  REQUIRE_FALSE(plan.orphan.has_value());
+  REQUIRE(plan.discard == std::vector<std::size_t>{1});
+}
+
+TEST_CASE("plan_build_probe_reclaim - an in-flight or built slot suppresses the orphan",
+          "[build_probe]")
+{
+  // SCHEDULING / SCHEDULED / BUILT all mean a task was or will be issued, so the candidate is a
+  // plain discard.
+  for (auto const state : {BUILD_HASH_TABLE_STATE::SCHEDULING,
+                           BUILD_HASH_TABLE_STATE::SCHEDULED,
+                           BUILD_HASH_TABLE_STATE::BUILT}) {
+    auto const plan = plan_build_probe_reclaim(
+      {
+        slot(state, false, false),
+        slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
+      },
+      /*probe_finished=*/true,
+      /*task_issued=*/false);
+    REQUIRE_FALSE(plan.orphan.has_value());
+    REQUIRE(plan.discard == std::vector<std::size_t>{1});
+  }
+}
+
+TEST_CASE("plan_build_probe_reclaim - a slot still awaiting its build batch is left alone",
+          "[build_probe]")
+{
+  // Slot 0 has no build batch yet, so it is not a candidate (neither discarded nor the orphan);
+  // the orphan goes to the first candidate that already holds its build batch, and a later reclaim
+  // pass discards slot 0 once its build batch arrives.
+  auto const plan = plan_build_probe_reclaim(
+    {
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, false, false),
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
+    },
+    /*probe_finished=*/true,
+    /*task_issued=*/false);
+  REQUIRE(plan.orphan == 1);
+  REQUIRE(plan.discard.empty());
+}
+
+TEST_CASE("plan_build_probe_reclaim - a DESTROYED slot does not block the orphan", "[build_probe]")
+{
+  auto const plan = plan_build_probe_reclaim(
+    {
+      slot(BUILD_HASH_TABLE_STATE::DESTROYED, false, false),
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
+    },
+    /*probe_finished=*/true,
+    /*task_issued=*/false);
+  REQUIRE(plan.orphan == 1);
+  REQUIRE(plan.discard.empty());
+}
+
+TEST_CASE("plan_build_probe_reclaim - single-partition zero-probe join claims the orphan",
+          "[build_probe]")
+{
+  auto const plan = plan_build_probe_reclaim({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false)},
+                                             /*probe_finished=*/true,
+                                             /*task_issued=*/false);
+  REQUIRE(plan.orphan == 0);
+  REQUIRE(plan.discard.empty());
 }

@@ -444,8 +444,8 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   // Mixed join: has at least one equality condition (for hashing) and at least one inequality
   // condition (for the binary predicate).
   if (!is_all_inequality_join && (num_equality_conditions < conditions.size())) {
-    // A MARK join must run in BUILD_PROBE mode (it needs the full build resident for build_has_null
-    // and per-row marks)
+    // A MARK join must run in BUILD_PROBE mode (it needs the full build resident for
+    // mark_build_kind and per-row marks)
     if (join_type == duckdb::JoinType::MARK) {
       throw std::runtime_error(
         "sirius_physical_hash_join: MARK join with mixed (equality + inequality) conditions is not "
@@ -745,7 +745,7 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
   bool const is_full_outer = join_type == duckdb::JoinType::OUTER;
   uint64_t const small     = partition_small_table_bytes(num_gpus);
 
-  // Broadcast candidacy. MARK multi-GPU is forced broadcast (build_has_null must be globally
+  // Broadcast candidacy. MARK multi-GPU is forced broadcast (mark_build_kind must be globally
   // consistent); otherwise a build is a candidate when it is below the small-table threshold, OR
   // below max_broadcast_join_size while the probe side is large relative to the build (replicating
   // the build avoids shuffling a much larger probe across GPUs).
@@ -771,7 +771,7 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
                      !is_right_family && !is_mixed && !is_full_outer;
 
   // A MARK join must always run in BUILD_PROBE mode. It needs the entire build side resident to
-  // compute the global build_has_null sentinel and the per-probe-row marks, and on multi-GPU it is
+  // compute the global mark_build_kind sentinel and the per-probe-row marks, and on multi-GPU it is
   // always broadcast (build replicated to every GPU). Force BUILD_PROBE on even when the build
   // exceeds the hash-table budget. MARK is never right-family/full-outer, and MARK + MIXED is
   // rejected at construction.
@@ -896,38 +896,65 @@ std::vector<build_probe_slot_view> sirius_physical_hash_join::snapshot_build_pro
   return slots;
 }
 
-std::vector<std::size_t> broadcast_slots_to_discard(std::vector<build_probe_slot_view> const& slots,
-                                                    bool probe_finished)
+build_probe_reclaim_plan plan_build_probe_reclaim(std::vector<build_probe_slot_view> const& slots,
+                                                  bool probe_finished,
+                                                  bool task_issued)
 {
-  std::vector<std::size_t> to_discard;
-  if (!probe_finished) { return to_discard; }
+  build_probe_reclaim_plan plan;
+  if (!probe_finished) { return plan; }
+
+  std::vector<std::size_t> candidates;
   for (std::size_t p = 0; p < slots.size(); ++p) {
     auto const& s = slots[p];
-    // NOT_BUILT means the slot was never scheduled (so its replicated build batch is still in the
-    // repo); no probe batch with the probe side finished means none is coming. A BUILT slot already
-    // consumed its build batch, and a slot with probe data will still be built — leave those.
+    // NOT_BUILT means the slot was never scheduled (so its build batch is still in the repo); no
+    // probe batch with the probe side finished means none is coming. A BUILT slot already consumed
+    // its build batch, and a slot with probe data will still be built — leave those.
     if (s.state == BUILD_HASH_TABLE_STATE::NOT_BUILT && s.has_build_batch && !s.has_probe_batch) {
-      to_discard.push_back(p);
+      candidates.push_back(p);
     }
   }
-  return to_discard;
+
+  // Discarding every candidate is only safe when the operator has produced (or will produce) at
+  // least one task; otherwise zero output batches would ever flow and the query-terminal pipeline
+  // could never complete. Any SCHEDULING/SCHEDULED/BUILT slot means a task was or will be issued,
+  // and a slot with probe data will become one, so the orphan is planned only when neither exists.
+  bool const orphan_eligible =
+    !task_issued && std::ranges::none_of(slots, [](build_probe_slot_view const& s) {
+      return s.has_probe_batch || (s.state != BUILD_HASH_TABLE_STATE::NOT_BUILT &&
+                                   s.state != BUILD_HASH_TABLE_STATE::DESTROYED);
+    });
+  if (orphan_eligible && !candidates.empty()) {
+    plan.orphan = candidates.front();
+    plan.discard.assign(candidates.begin() + 1, candidates.end());
+  } else {
+    plan.discard = std::move(candidates);
+  }
+  return plan;
 }
 
-void sirius_physical_hash_join::discard_build_only_slots_if_probe_complete()
+bool sirius_physical_hash_join::reclaim_build_only_slots_if_probe_complete()
 {
-  if (!_broadcast) { return; }
   auto* build_port = get_port("build");
   auto* probe_port = get_port("default");
-  if (!build_port || !probe_port) { return; }
+  if (!build_port || !probe_port) { return false; }
   // Only once the probe upstream is finished do we know no further probe data can arrive for any
-  // slot. Broadcast replicates the build table to every slot, but the probe side is unpartitioned,
-  // so slots on GPUs that saw no probe rows get build data that will never be probed.
+  // slot. A broadcast join replicates the build table to every slot while the probe side is
+  // unpartitioned, so slots on GPUs that saw no probe rows hold build data that will never be
+  // probed; a non-broadcast join reaches the same state when the probe side finishes with zero
+  // batches. The mirror state — an empty BUILD side under BUILD_PROBE — is structurally
+  // unreachable: BUILD_PROBE is only entered via get_partition_strategy, which runs only when the
+  // sizing (build) partition received input, and a build side that finishes with zero batches
+  // instead takes the elected-1 sizing path and leaves the join STANDARD, where the cross-schedule
+  // orphan machinery serves it. Post-sizing, hash_partition emits a slice for every partition and
+  // broadcast replicates every batch, so no slot is left build-batch-less while others got data.
   bool const probe_finished =
     probe_port->src_pipeline && probe_port->src_pipeline->is_pipeline_finished();
 
-  for (std::size_t p : broadcast_slots_to_discard(snapshot_build_probe_slots(), probe_finished)) {
-    // Build-only slot with no probe and none coming: drop its replicated build batch(es), freeing
-    // each on the GPU it was folded onto (rmm requires the owning device to be current).
+  auto const plan = plan_build_probe_reclaim(
+    snapshot_build_probe_slots(), probe_finished, _build_probe_task_issued);
+  for (std::size_t p : plan.discard) {
+    // Build-only slot with no probe and none coming: drop its build batch(es), freeing each on the
+    // GPU it was folded onto (rmm requires the owning device to be current).
     while (auto batch = build_port->repo->pop_next_data_batch(p)) {
       int device_id = -1;
       {
@@ -941,10 +968,25 @@ void sirius_physical_hash_join::discard_build_only_slots_if_probe_complete()
     _partition_build_states[p].build_state.store(BUILD_HASH_TABLE_STATE::DESTROYED,
                                                  std::memory_order_release);
     SIRIUS_LOG_DEBUG(
-      "sirius_physical_hash_join id {}: broadcast discard of build-only slot {} (probe complete)",
+      "sirius_physical_hash_join id {}: discarding never-probed build-only slot {} (probe "
+      "complete)",
       this->get_operator_id(),
       p);
   }
+  if (plan.orphan) {
+    // Claim the orphan slot exactly like a schedule_build claim: the paired
+    // get_next_task_input_data_for_build_probe scans for the SCHEDULING slot and, finding no probe
+    // batch there, synthesizes an empty one.
+    _partition_build_states[*plan.orphan].build_state.store(BUILD_HASH_TABLE_STATE::SCHEDULING,
+                                                            std::memory_order_release);
+    SIRIUS_LOG_DEBUG(
+      "sirius_physical_hash_join id {}: claiming orphan build task for never-probed slot {} "
+      "(probe complete, zero tasks issued)",
+      this->get_operator_id(),
+      *plan.orphan);
+    return true;
+  }
+  return false;
 }
 
 std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint()
@@ -962,9 +1004,13 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
     // sequences interleave (a built partition probes on its GPU while another still builds on a
     // different GPU). Pick the next action from a per-partition snapshot.
 
-    // Broadcast mode: reclaim slots that will never be probed before deciding the next action, so
-    // the operator can reach completion instead of waiting forever on their absent probe data.
-    discard_build_only_slots_if_probe_complete();
+    // Reclaim slots that will never be probed before deciding the next action, so the operator can
+    // reach completion instead of waiting forever on their absent probe data. When the reclaim
+    // claims an orphan build task (the probe side finished with zero batches and no task was ever
+    // issued), report READY so that task is created.
+    if (reclaim_build_only_slots_if_probe_complete()) {
+      return task_creation_hint{TaskCreationHint::READY, this};
+    }
     auto const decision = select_build_probe_action(snapshot_build_probe_slots());
     switch (decision.action) {
       case build_probe_action::schedule_build:
@@ -1046,11 +1092,61 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
         "(concat-folded) build batch for partition " +
         std::to_string(p) + " in operator " + std::to_string(this->get_operator_id()));
     }
+    // A SCHEDULING slot with an empty probe repository is an orphan claim
+    // (reclaim_build_only_slots_if_probe_complete: the probe upstream finished with no batch for
+    // this slot) and gets a synthesized probe input; anything else is a claim/state bug. All
+    // throwing work — the guards and the synthesis — runs BEFORE any batch is popped, so an unwind
+    // never destroys a repository-owned batch (rmm frees must run with the owning device current,
+    // which only the guarded discard paths provide).
+    std::shared_ptr<cucascade::data_batch> probe_batch;
+    if (probe_port->repo->size(p) == 0) {
+      if (!(probe_port->src_pipeline && probe_port->src_pipeline->is_pipeline_finished())) {
+        throw std::runtime_error(
+          "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: SCHEDULING "
+          "partition " +
+          std::to_string(p) +
+          " has no probe batch while the probe upstream is still running in operator " +
+          std::to_string(this->get_operator_id()));
+      }
+      // Synthesize a 0-row probe batch from the probe child's output schema (children[0] =
+      // probe/left), on the build batch's device, so execute() runs the normal build-then-probe
+      // dispatch and emits one 0-row output batch. The child's physical sidecar, when it has one,
+      // is the carrier schema its batches would have arrived with. The build batch is borrowed
+      // (not popped) to reach its memory space, which is only accessible through a read-only
+      // accessor; the accessor is released before the batches are handed to the task.
+      // sirius::make_empty_table throws for nested (LIST/STRUCT) schemas — a pool-thread throw
+      // becomes a clean query error, matching the STANDARD orphan synthesis.
+      auto const borrowed_build =
+        build_port->repo->get_data_batch_by_id(build_port->repo->get_batch_ids(p).front(), p);
+      cucascade::memory::memory_space* ms = nullptr;
+      if (borrowed_build) {
+        auto build_ro = borrowed_build->to_read_only();
+        ms            = build_ro.get_memory_space();
+      }
+      if (!ms) {
+        throw std::runtime_error(
+          "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: orphan build "
+          "batch has no memory space in operator " +
+          std::to_string(this->get_operator_id()));
+      }
+      auto const& probe_child = *children[0];
+      rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{ms->get_device_id()}};
+      auto empty_table = probe_child.has_physical_overrides()
+                           ? sirius::make_empty_table(probe_child.get_physical_types())
+                           : sirius::make_empty_table(probe_child.get_types());
+      probe_batch =
+        make_data_batch(std::move(empty_table), *ms, cudf::get_default_stream(), batch_telemetry());
+    } else {
+      probe_batch = probe_port->repo->pop_next_data_batch(p);
+    }
+    auto build_batch = build_port->repo->pop_next_data_batch(p);
     std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
-    input_batch.push_back(probe_port->repo->pop_next_data_batch(p));
-    input_batch.push_back(build_port->repo->pop_next_data_batch(p));
+    input_batch.reserve(2);
+    input_batch.push_back(std::move(probe_batch));  // [0] = probe / "default" / left
+    input_batch.push_back(std::move(build_batch));  // [1] = build / "build" / right
     _partition_build_states[p].build_state.store(BUILD_HASH_TABLE_STATE::SCHEDULED,
                                                  std::memory_order_release);
+    _build_probe_task_issued = true;
     // Every task of partition p (this build+first-probe and all later probe-only tasks) shares the
     // same tag, so they land on the same GPU as p's hash table.
     return std::make_unique<partitioned_operator_data>(std::move(input_batch), partition_tag(p));
@@ -1074,6 +1170,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
         p,
         this->get_operator_id());
     }
+    _build_probe_task_issued = true;
     return std::make_unique<partitioned_operator_data>(std::move(input_batch), partition_tag(p));
   }
 
@@ -1122,17 +1219,30 @@ std::pair<bool, bool> sirius_physical_hash_join::refresh_cross_schedule()
     }
   }
 
+  // MARK tripwire: sizing (get_partition_strategy) unconditionally flips a MARK join to
+  // BUILD_PROBE, and build batches only flow after sizing (PARTITION refuses to execute before its
+  // partition count is set). A MARK join is therefore only legitimately observed here in STANDARD
+  // mode either pre-sizing (a hint walk reached it before its build chain sized it; no batches on
+  // either side yet) or after the elected-1 sizing path (its build side finished with zero
+  // batches, served by the cross-schedule orphan machinery below) — and in both states every
+  // partition's build_ids stay empty. A MARK partition holding a build batch under STANDARD means
+  // the BUILD_PROBE flip was bypassed; executing STANDARD pairs against a (possibly partial) MARK
+  // build would produce wrong marks, so fail loudly instead.
+  if (join_type == duckdb::JoinType::MARK) {
+    for (std::size_t p = 0; p < num_partitions; ++p) {
+      if (!_cross[p].build_ids.empty()) {
+        throw std::runtime_error(
+          "In sirius_physical_hash_join:refresh_cross_schedule: MARK join received build batches "
+          "while in STANDARD mode (the BUILD_PROBE flip at sizing was bypassed) in operator " +
+          std::to_string(this->get_operator_id()));
+      }
+    }
+  }
+
   // Non-INNER whole-side invariant: whichever side must be seen whole for this join type must stay
   // a single concat-folded batch once its producer is finished. A regression in
   // sirius_physical_concat that stopped folding would otherwise silently corrupt results, so fail
-  // loudly instead. MARK must never reach this path (it is forced to BUILD_PROBE mode).
-  if (join_type == duckdb::JoinType::MARK) {
-    throw std::runtime_error(
-      "In sirius_physical_hash_join:refresh_cross_schedule: MARK join must run in BUILD_PROBE "
-      "mode, "
-      "not STANDARD/MIXED, in operator " +
-      std::to_string(this->get_operator_id()));
-  }
+  // loudly instead.
   bool const check_build_whole =
     build_finished && (join_type == duckdb::JoinType::LEFT || join_type == duckdb::JoinType::SEMI ||
                        join_type == duckdb::JoinType::ANTI || join_type == duckdb::JoinType::OUTER);
@@ -1498,22 +1608,38 @@ static bool build_keys_are_distinct(cudf::table_view const& build_keys,
   return cudf::distinct_count(build_keys, nulls_equal, stream) == num_rows;
 }
 
-/// @brief Thread-safe check-and-set for the join-wide _build_has_null sentinel.
+/// Content classification of a MARK join's build (IN-list) set. Drives the mark column's null
+/// mask: `x IN (S)` is FALSE for every x — including NULL x — when S is empty; NULL semantics
+/// apply only to non-empty sets (see resolve_mark_join_result).
+enum class mark_build_kind : int { empty = 0, no_null_keys = 1, has_null_keys = 2 };
+
+/// @brief Classify a MARK join's build key set for three-valued logic.
 ///
-/// Sentinel encoding: -1 = unset, 0 = false, 1 = true.
+/// A non-empty all-NULL-key set is has_null_keys: CPU semantics make every mark NULL, which the
+/// has_null_keys branch produces since nothing matches under UNEQUAL.
+static mark_build_kind classify_mark_build(cudf::table_view const& build_keys)
+{
+  if (build_keys.num_rows() == 0) { return mark_build_kind::empty; }
+  return table_has_any_null(build_keys) ? mark_build_kind::has_null_keys
+                                        : mark_build_kind::no_null_keys;
+}
+
+/// @brief Thread-safe check-and-set for the join-wide _mark_build_kind sentinel.
+///
+/// Sentinel encoding: -1 = unset, otherwise the underlying value of a mark_build_kind.
 /// On first call: CAS from -1 to the new value.
 /// On subsequent calls: verify the existing value matches; throw if it does not (indicates
-/// inconsistent build batches, which should never happen for MARK joins that are forced to a
-/// single partition or broadcast).
-static void set_build_has_null(std::atomic<int>& atomic_flag, bool has_null)
+/// inconsistent build batches, which should never happen for MARK joins whose build is a single
+/// partition, a broadcast of one folded batch, or all-empty synthesized batches).
+static void set_mark_build_kind(std::atomic<int>& atomic_kind, mark_build_kind kind)
 {
-  int const new_val = has_null ? 1 : 0;
+  int const new_val = static_cast<int>(kind);
   int expected      = -1;
-  if (!atomic_flag.compare_exchange_strong(expected, new_val, std::memory_order_acq_rel)) {
+  if (!atomic_kind.compare_exchange_strong(expected, new_val, std::memory_order_acq_rel)) {
     // Already set — expected now holds the actual current value.
     if (expected != new_val) {
       throw std::runtime_error(
-        "sirius_physical_hash_join: build_has_null inconsistency across build batches for MARK "
+        "sirius_physical_hash_join: mark_build_kind inconsistency across build batches for MARK "
         "join — this should not happen when the join is forced to a single partition or broadcast");
     }
   }
@@ -1529,14 +1655,14 @@ static void set_build_has_null(std::atomic<int>& atomic_flag, bool has_null)
 /// The scattered values are already correct (true at matched rows, false elsewhere), so only a null
 /// mask is added. This is the IN/EXISTS three-valued rule and assumes UNEQUAL matching
 /// (compare_nulls() forces UNEQUAL for MARK joins; a null-safe MARK join such as EXISTS
-/// with IS NOT DISTINCT FROM is a known unsupported case). Because a NULL key never
-/// matches under UNEQUAL, a matched row always has a valid probe key, so the desired
-/// validity reduces to two cases:
-///   - build_has_null == true : every unmatched row is NULL, so valid == matched. The mask is the
-///                              mark values themselves (cudf::bools_to_mask).
-///   - build_has_null == false: valid == probe row validity (all probe key columns valid). The mask
-///                              is cudf::bitmask_and over the probe keys (empty when none
-///                              nullable).
+/// with IS NOT DISTINCT FROM is a known unsupported case). The derivation starts from the
+/// empty set: `x IN (S)` with S empty is FALSE for every x — including NULL x — so no mask
+/// is attached at all. For a non-empty S, a NULL key never matches under UNEQUAL, so a
+/// matched row always has a valid probe key and the desired validity reduces to two cases:
+///   - has_null_keys: every unmatched row is NULL, so valid == matched. The mask is the
+///                    mark values themselves (cudf::bools_to_mask).
+///   - no_null_keys : valid == probe row validity (all probe key columns valid). The mask
+///                    is cudf::bitmask_and over the probe keys (empty when none nullable).
 ///
 /// @param semi_indices  Device vector of left-side row indices that matched the join condition,
 ///                      as returned by cuDF's semi-join. Used as the scatter map for the mark
@@ -1545,8 +1671,8 @@ static void set_build_has_null(std::atomic<int>& atomic_flag, bool has_null)
 /// @param lhs_output_col_idxs  Column indices within @p left_full to include in the output.
 ///                             Drives the projection of the left side.
 /// @param probe_keys    Probe/left join key columns (post-cast); their per-row validity drives the
-///                      NULL mark when the build side has no NULL key.
-/// @param build_has_null  Whether the build/right side contains a NULL in any join key column.
+///                      NULL mark when the build side is non-empty with no NULL key.
+/// @param build_kind    Classification of the build/right key set (see mark_build_kind).
 /// @param left_batch    The original left-side data batch; used to propagate memory space metadata
 ///                      to the returned operator_data.
 /// @param stream        CUDA stream on which all device operations are launched.
@@ -1555,7 +1681,7 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
   cudf::table_view const& left_full,
   std::vector<cudf::size_type> const& lhs_output_col_idxs,
   cudf::table_view const& probe_keys,
-  bool build_has_null,
+  mark_build_kind build_kind,
   ::cucascade::read_only_data_batch const& left_batch,
   rmm::cuda_stream_view stream,
   const telemetry::batch_telemetry_info& telemetry_info = {})
@@ -1593,16 +1719,17 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
     mark_column    = std::move(scattered->release()[0]);
   }
 
-  // Apply SQL three-valued logic by attaching a null mask: unmatched rows become NULL when the
-  // build side has a NULL key (valid == matched) or when the probe key is NULL (valid == probe key
-  // validity). See the function doc comment for the derivation.
+  // Apply SQL three-valued logic by attaching a null mask: none for an empty build set (every mark
+  // is a definite FALSE); otherwise unmatched rows become NULL when the build side has a NULL key
+  // (valid == matched) or when the probe key is NULL (valid == probe key validity). See the
+  // function doc comment for the derivation.
   rmm::device_buffer null_mask;
   cudf::size_type null_count = 0;
-  if (build_has_null) {
+  if (build_kind == mark_build_kind::has_null_keys) {
     auto [mask, count] = cudf::bools_to_mask(mark_column->view(), stream);
     null_mask          = std::move(*mask);
     null_count         = count;
-  } else {
+  } else if (build_kind == mark_build_kind::no_null_keys) {
     auto [mask, count] = cudf::bitmask_and(probe_keys, stream);
     null_mask          = std::move(mask);
     null_count         = count;
@@ -1689,10 +1816,10 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
           // batch's semi_join/anti_join returns left-row match indices (scattered into a BOOL8 mark
           // for MARK, gathered as the output rows for SEMI/ANTI).
           slot.filtered_table = make_right_filtered_join_ptr(build_keys, compare_nulls(), stream);
-          // Record whether the build keys contain a NULL; MARK three-valued logic needs it at probe
-          // time, but the build keys are not retained beyond this scope.
+          // Classify the build key set (empty / clean / NULL-bearing); MARK three-valued logic
+          // needs it at probe time, but the build keys are not retained beyond this scope.
           if (join_type == duckdb::JoinType::MARK) {
-            set_build_has_null(_build_has_null, table_has_any_null(build_keys));
+            set_mark_build_kind(_mark_build_kind, classify_mark_build(build_keys));
           }
           SIRIUS_LOG_DEBUG("sirius_physical_hash_join id {}: using filtered_join (BUILD_PROBE {})",
                            this->get_operator_id(),
@@ -1732,12 +1859,19 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       if (join_type == duckdb::JoinType::MARK) {
         // Reuse the persistent filtered_join (built on the right/filter side): probe with this left
         // batch to get its matched left-row indices, then materialize all left rows + BOOL8 mark.
-        auto semi_indices = slot.filtered_table->semi_join(probe_keys, stream);
+        auto semi_indices          = slot.filtered_table->semi_join(probe_keys, stream);
+        int const build_kind_value = _mark_build_kind.load(std::memory_order_acquire);
+        if (build_kind_value < 0) {
+          throw std::runtime_error(
+            "In sirius_physical_hash_join::execute: MARK probe task ran before its build task "
+            "published the build-set classification in operator " +
+            std::to_string(this->get_operator_id()));
+        }
         return resolve_mark_join_result(*semi_indices,
                                         left_full,
                                         lhs_output_columns.col_idxs,
                                         probe_keys,
-                                        _build_has_null.load(std::memory_order_acquire) > 0,
+                                        static_cast<mark_build_kind>(build_kind_value),
                                         input_batches[0],
                                         stream,
                                         batch_telemetry());
@@ -1840,12 +1974,13 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
     if (join_type == duckdb::JoinType::MARK) {
       auto semi_indices = cudf::mixed_left_semi_join(
         left_eq, right_eq, left_full, right_full, pred->back(), compare_nulls(), stream);
-      set_build_has_null(_build_has_null, table_has_any_null(right_eq));
+      auto const build_kind = classify_mark_build(right_eq);
+      set_mark_build_kind(_mark_build_kind, build_kind);
       return resolve_mark_join_result(*semi_indices,
                                       left_full,
                                       lhs_output_columns.col_idxs,
                                       left_eq,
-                                      _build_has_null.load(std::memory_order_acquire) > 0,
+                                      build_kind,
                                       input_batches[0],
                                       stream,
                                       batch_telemetry());
@@ -2004,24 +2139,26 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
           right_full.num_rows());
         auto mark_join_object = make_left_mark_join(left_keys, compare_nulls(), stream);
         auto semi_indices     = mark_join_object.semi_join(right_keys, stream);
-        set_build_has_null(_build_has_null, table_has_any_null(right_keys));
+        auto const build_kind = classify_mark_build(right_keys);
+        set_mark_build_kind(_mark_build_kind, build_kind);
         return resolve_mark_join_result(*semi_indices,
                                         left_full,
                                         lhs_output_columns.col_idxs,
                                         left_keys,
-                                        _build_has_null.load(std::memory_order_acquire) > 0,
+                                        build_kind,
                                         input_batches[0],
                                         stream,
                                         batch_telemetry());
       }
       auto filtered_join_object = make_right_filtered_join(right_keys, compare_nulls(), stream);
       auto semi_indices         = filtered_join_object.semi_join(left_keys, stream);
-      set_build_has_null(_build_has_null, table_has_any_null(right_keys));
+      auto const build_kind     = classify_mark_build(right_keys);
+      set_mark_build_kind(_mark_build_kind, build_kind);
       return resolve_mark_join_result(*semi_indices,
                                       left_full,
                                       lhs_output_columns.col_idxs,
                                       left_keys,
-                                      _build_has_null.load(std::memory_order_acquire) > 0,
+                                      build_kind,
                                       input_batches[0],
                                       stream,
                                       batch_telemetry());
