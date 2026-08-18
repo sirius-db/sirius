@@ -362,7 +362,7 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   std::vector<insert_delta_split> delta_splits                           = {},
   std::vector<cudf::data_type> normalization_targets                     = {},
   bool has_physical_overrides                                            = false,
-  sirius::pushdown_request pushdown_req                             = {},
+  sirius::pushdown_request pushdown_req                                  = {},
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters = nullptr);
 
 /**

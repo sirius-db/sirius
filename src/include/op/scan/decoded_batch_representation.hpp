@@ -44,12 +44,13 @@ namespace sirius {
  * replaced, where clone() had to decide what the copy "is" and settled for
  * dropping the information.
  */
-class decompression_pushdown_batch_representation final : public ::cucascade::gpu_table_representation {
+class decompression_pushdown_batch_representation final
+  : public ::cucascade::gpu_table_representation {
  public:
   decompression_pushdown_batch_representation(std::unique_ptr<cudf::table> table,
-                               ::cucascade::memory::memory_space& memory_space,
-                               rmm::cuda_stream_view writer_stream,
-                               pushdown_outcome outcome)
+                                              ::cucascade::memory::memory_space& memory_space,
+                                              rmm::cuda_stream_view writer_stream,
+                                              pushdown_outcome outcome)
     : ::cucascade::gpu_table_representation(std::move(table), memory_space, writer_stream),
       _outcome(outcome)
   {

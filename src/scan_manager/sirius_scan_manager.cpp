@@ -230,7 +230,8 @@ struct cached_databatch_provider : public databatch_provider {
             auto snap = sirius::op::scan::snapshot_membership_probes(*_dynamic_filters,
                                                                      _column_indices.size());
             SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
-              "[decompression-pushdown] join filter attach (drain) channel={}: slots={} attached={} "
+              "[decompression-pushdown] join filter attach (drain) channel={}: slots={} "
+              "attached={} "
               "generation={} skipped_non_maskable={}",
               static_cast<void const*>(_dynamic_filters.get()),
               _column_indices.size(),
@@ -238,10 +239,10 @@ struct cached_databatch_provider : public databatch_provider {
               snap.generation,
               snap.skipped_non_mask);
             if (snap.attached_probes > 0) {
-              auto const base =
-                pushdown_scan
-                  ? pushdown_scan
-                  : std::make_shared<const sirius::decompression_pushdown_scan>(sirius::pushdown_request{});
+              auto const base = pushdown_scan
+                                  ? pushdown_scan
+                                  : std::make_shared<const sirius::decompression_pushdown_scan>(
+                                      sirius::pushdown_request{});
               pushdown_scan = base->with_membership_probes(std::move(snap.probes), snap.generation);
             }
           } else {
@@ -789,7 +790,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     // batch decodes rather than after it. The ingestible analysed its filter
     // once at bind; here it is only mapped onto the slots this entry serves.
     auto const slot_map = primary_index_by_slot(*assignment.entry, assignment.columns);
-    auto pushdown_req = sirius::op::build_pushdown_request(
+    auto pushdown_req   = sirius::op::build_pushdown_request(
       assignment.op->get_ingestible().filter_analysis(), slot_map);
     // The provider captures the operator's dynamic-filter CHANNEL (not a
     // snapshot) so each compressed batch can pick up join-published filters at
@@ -804,7 +805,8 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
       // by duckdb's DynamicTableFilterSet pointer) and the one the decode-time
       // snapshot logs.
       SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
-        "[decompression-pushdown] entry '{}': join filter channel={} published_now={} decode request: "
+        "[decompression-pushdown] entry '{}': join filter channel={} published_now={} decode "
+        "request: "
         "{} slot(s), covers_whole_filter={}",
         assignment.entry_name,
         static_cast<void const*>(dynamic_filters.get()),
