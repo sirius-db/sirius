@@ -2086,6 +2086,33 @@ static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
                    params->enable_runtime_distinct_build_probe);
 }
 
+static void SetEnableClusteredMergeBypass(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                             = lock_operator_params_slot(context);
+  params->enable_clustered_merge_bypass = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_CLUSTERED_MERGE_BYPASS to {}",
+                   params->enable_clustered_merge_bypass);
+}
+
+static void SetClusteredBypassMaxOverlapFraction(ClientContext& context,
+                                                 SetScope scope,
+                                                 Value& parameter)
+{
+  const double fraction = DoubleValue::Get(parameter);
+  if (!std::isfinite(fraction) || fraction < 0.0 || fraction > 1.0) {
+    throw InvalidInputException(
+      "clustered_bypass_max_overlap_fraction must be within [0, 1], got %f", fraction);
+  }
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                                     = lock_operator_params_slot(context);
+  params->clustered_bypass_max_overlap_fraction = fraction;
+  SIRIUS_LOG_DEBUG("Updated config CLUSTERED_BYPASS_MAX_OVERLAP_FRACTION to {}",
+                   params->clustered_bypass_max_overlap_fraction);
+}
+
 static void SetEnableSortedGroupbyHint(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2452,6 +2479,24 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.enable_runtime_distinct_build_probe),
     SetEnableRuntimeDistinctBuildProbe);
+
+  config.AddExtensionOption(
+    "enable_clustered_merge_bypass",
+    "Skip the PARTITION/MERGE_GROUP_BY re-hash of grouped-aggregate partials when a runtime "
+    "key-range proof shows the partial batches are range-disjoint on their leading group key "
+    "(clustered input); the merge applies the downstream HAVING filter per partial and re-groups "
+    "only the boundary overlap (on by default)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.enable_clustered_merge_bypass),
+    SetEnableClusteredMergeBypass);
+
+  config.AddExtensionOption(
+    "clustered_bypass_max_overlap_fraction",
+    "Maximum adjacent-batch key-range overlap, as a fraction of the smaller batch's key span, "
+    "that the clustered merge bypass tolerates before declaring the input un-clustered",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(operator_defaults.clustered_bypass_max_overlap_fraction),
+    SetClusteredBypassMaxOverlapFraction);
 
   config.AddExtensionOption(
     "enable_sorted_groupby_hint",

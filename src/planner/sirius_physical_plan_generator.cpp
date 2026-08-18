@@ -436,6 +436,8 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
     if (hgb_ptr->has_physical_overrides()) {
       merge->set_physical_types(hgb_ptr->get_physical_types());
     }
+    merge->set_clustered_bypass_params(op_params.enable_clustered_merge_bypass,
+                                       op_params.clustered_bypass_max_overlap_fraction);
 
     auto& grouped       = hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>();
     grouped.sorted_hint = {op_params.enable_sorted_groupby_hint,
@@ -939,8 +941,17 @@ void sirius_physical_plan_generator::mark_fusable_merge_pipelines(
 {
   // Ungrouped aggregate merges use a different partial-result handoff.
   if (op.type == sirius::op::SiriusPhysicalOperatorType::MERGE_GROUP_BY) {
-    op.Cast<sirius::op::sirius_physical_grouped_aggregate_merge>().set_fuse_into_parent(
-      fusion_enabled && merge_downstream_is_streaming_dead_end(op));
+    auto& merge = op.Cast<sirius::op::sirius_physical_grouped_aggregate_merge>();
+    merge.set_fuse_into_parent(fusion_enabled && merge_downstream_is_streaming_dead_end(op));
+    // Clustered merge bypass: when a FILTER sits directly above this merge (a HAVING over the
+    // grouped aggregate), hand its predicate to the merge so the bypass can push the filter to
+    // range-disjoint partials. This runs after set_parent_ops (same ordering
+    // merge_downstream_is_streaming_dead_end already relies on).
+    if (auto* parent = op.get_parent_op();
+        parent != nullptr && parent->type == sirius::op::SiriusPhysicalOperatorType::FILTER) {
+      merge.set_clustered_bypass_filter(
+        parent->Cast<sirius::op::sirius_physical_filter>().expression.get());
+    }
   } else if (op.type == sirius::op::SiriusPhysicalOperatorType::MERGE_TOP_N) {
     op.Cast<sirius::op::sirius_physical_top_n_merge>().set_fuse_into_parent(
       fusion_enabled && merge_downstream_is_streaming_dead_end(op));

@@ -29,6 +29,10 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <algorithm>
+#include <mutex>
+#include <optional>
+
 namespace sirius {
 namespace op {
 
@@ -151,9 +155,86 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   has_count_distinct                = cudf_defs.has_count_distinct;
 }
 
+bool sirius_physical_grouped_aggregate_merge::clustered_bypass_wanted() const
+{
+  if (!_clustered_bypass_enabled) { return false; }
+  if (_bypass_filter_expression == nullptr) {
+    // NOTE: no get_operator_id() here — eligibility runs on unit-test operators that never
+    // went through pipeline::assign_operator_ids.
+    SIRIUS_LOG_DEBUG("clustered_bypass: not wanted — no downstream FILTER stamped");
+    return false;
+  }
+  // Single GPU only: the bypass funnels every partial into one partition slot, which is only
+  // free when there is no cross-device placement to negotiate.
+  if (_num_gpus != 1) {
+    SIRIUS_LOG_DEBUG("clustered_bypass: not wanted — num_gpus={}", _num_gpus);
+    return false;
+  }
+  // AVG / COUNT(DISTINCT) post-process the merged result, so the partial schema differs from
+  // the merge output schema and the downstream predicate cannot be evaluated on partial rows.
+  if (has_avg || has_count_distinct) { return false; }
+  if (grouping_sets.size() > 1) { return false; }
+  if (group_idx.empty()) { return false; }
+  // The bypass proof needs combine(singleton) == singleton; that holds for SUM/MIN/MAX and for
+  // COUNT partials (merged via SUM), but not for e.g. COLLECT_SET.
+  return std::all_of(
+    cudf_aggregates.begin(), cudf_aggregates.end(), [](cudf::aggregation::Kind kind) {
+      switch (kind) {
+        case cudf::aggregation::Kind::SUM:
+        case cudf::aggregation::Kind::MIN:
+        case cudf::aggregation::Kind::MAX:
+        case cudf::aggregation::Kind::COUNT_ALL:
+        case cudf::aggregation::Kind::COUNT_VALID: return true;
+        default: return false;
+      }
+    });
+}
+
+bool sirius_physical_grouped_aggregate_merge::try_plan_clustered_bypass(
+  const std::vector<std::shared_ptr<::cucascade::data_batch>>& batches)
+{
+  if (!clustered_bypass_wanted()) { return false; }
+  // The leading group key is output column 0 of every partial batch.
+  //
+  // The probe runs GPU work (two cudf::reduce scalars per batch) from partition
+  // task-CREATION, a call path with no OOM/downgrade handling — an escaping exception here
+  // would fail the whole query. The bypass is an optimization, so ANY probe failure (OOM
+  // included) must degrade to the normal partitioned merge instead. A sticky CUDA error
+  // swallowed here simply resurfaces inside the next task, where the existing task-level
+  // error machinery owns it; rethrowing from task creation would only turn it into an
+  // unhandled query failure sooner.
+  std::optional<clustered_bypass::plan> plan;
+  try {
+    plan = clustered_bypass::analyze_partial_ranges(
+      batches, /*key_column_index=*/0, _clustered_bypass_max_overlap_fraction);
+  } catch (const std::exception& e) {
+    SIRIUS_LOG_WARN(
+      "clustered_bypass: range probe failed ({}); taking the normal partitioned merge", e.what());
+    return false;
+  }
+  if (!plan.has_value()) { return false; }
+  std::lock_guard<std::mutex> lg(lock);
+  _bypass_plan = std::move(plan);
+  return true;
+}
+
+bool sirius_physical_grouped_aggregate_merge::clustered_bypass_armed()
+{
+  // Same lock as the try_plan_clustered_bypass write — race-free by construction rather than
+  // by scheduling argument.
+  std::lock_guard<std::mutex> lg(lock);
+  return _bypass_plan.has_value();
+}
+
 partition_strategy sirius_physical_grouped_aggregate_merge::get_partition_strategy(
   const partition_sizing_input& in)
 {
+  {
+    // An armed bypass wants every partial forwarded, unpartitioned, into slot 0: the single
+    // merge task then filters each partial in place instead of re-hashing the union.
+    std::lock_guard<std::mutex> lg(lock);
+    if (_bypass_plan.has_value()) { return {1, /*broadcast=*/false, /*build_probe=*/false}; }
+  }
   int const natural = natural_num_partitions(in.total_bytes, _hash_partition_bytes, _num_gpus);
   // Pre-size this merge's single input repository so every partition slot exists before batches
   // arrive (grouping is never broadcast / build-probe). Guarded on strictly-greater to respect the
@@ -208,6 +289,29 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   if (input_batches.size() == 0) {
     throw std::runtime_error(
       "We expect at least one input batch for grouped aggregate merge operator");
+  }
+
+  // Clustered merge bypass: the range proof armed at partition-sizing time showed the partials
+  // are range-disjoint, so instead of re-hashing their union we push the downstream filter to
+  // each partial and re-group only the boundary windows. See clustered_merge_bypass.hpp.
+  {
+    std::optional<clustered_bypass::plan> bypass_plan;
+    {
+      std::lock_guard<std::mutex> lg(lock);
+      bypass_plan = _bypass_plan;
+    }
+    if (bypass_plan.has_value()) {
+      auto outputs = clustered_bypass::execute_bypass(input_batches,
+                                                      *bypass_plan,
+                                                      _bypass_filter_expression,
+                                                      get_output_grouping_indices(),
+                                                      cudf_aggregates,
+                                                      _hash_partition_bytes,
+                                                      _num_gpus,
+                                                      stream,
+                                                      batch_telemetry());
+      return std::make_unique<pipelineable_operator_data>(std::move(outputs));
+    }
   }
 
   // Fast path: single batch with no post-processing needed

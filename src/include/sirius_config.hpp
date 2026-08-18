@@ -83,6 +83,21 @@ constexpr double DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO = 8.0;
 /// one cudf::distinct_count pass over the build keys, taken only in BUILD_PROBE mode.
 constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = true;
 
+/// Bypass the PARTITION + MERGE_GROUP_BY re-hash of grouped-aggregate partials when the partial
+/// batches are proven range-disjoint on their leading group key at runtime (clustered input, e.g.
+/// a lineitem scan grouped by l_orderkey). The merge instead pushes the downstream HAVING filter
+/// to each partial and re-groups only the tiny boundary overlap. The proof is computed from the
+/// actual batch key min/max — never from table names or plan heuristics — and every branch of the
+/// bypass is exact, so a wrong gate decision can only cost time, not correctness. See
+/// sirius_physical_grouped_aggregate_merge::try_plan_clustered_bypass.
+constexpr bool DEFAULT_ENABLE_CLUSTERED_MERGE_BYPASS = true;
+
+/// Adjacent-batch key-range overlap tolerated by the clustered merge bypass, as a fraction of the
+/// smaller batch's key span (plus a small absolute floor for tiny spans). Clustered scans split a
+/// key across two batches at each batch boundary, so a tiny overlap is expected; a large overlap
+/// means the input is not really clustered and the bypass would only move work around.
+constexpr double DEFAULT_CLUSTERED_BYPASS_MAX_OVERLAP_FRACTION = 0.05;
+
 /// Pass cudf::sorted::YES to the grouped-aggregate groupby when a runtime cudf::is_sorted check
 /// proves the batch's group keys are already sorted (clustered input). The sort-based groupby then
 /// skips both hashing and sorting. The check itself is one cheap pass; the min-rows gate below
@@ -149,6 +164,16 @@ struct operator_params {
   /// distinct. BUILD_PROBE mode only, INNER/LEFT equality joins with null-unequal semantics. See
   /// DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE.
   bool enable_runtime_distinct_build_probe = config::DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE;
+
+  /// Skip PARTITION/MERGE_GROUP_BY for grouped-aggregate partials proven range-disjoint on their
+  /// leading group key at runtime; the merge applies the downstream HAVING filter per partial and
+  /// re-groups only the boundary overlap. See DEFAULT_ENABLE_CLUSTERED_MERGE_BYPASS.
+  bool enable_clustered_merge_bypass = config::DEFAULT_ENABLE_CLUSTERED_MERGE_BYPASS;
+
+  /// Max adjacent-batch key-range overlap (fraction of the smaller batch's key span) the
+  /// clustered merge bypass tolerates before declaring the input un-clustered.
+  double clustered_bypass_max_overlap_fraction =
+    config::DEFAULT_CLUSTERED_BYPASS_MAX_OVERLAP_FRACTION;
 
   /// Pass sorted::YES to the grouped-aggregate groupby when a runtime cudf::is_sorted check
   /// proves the batch keys are pre-sorted. See DEFAULT_ENABLE_SORTED_GROUPBY_HINT.

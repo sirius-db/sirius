@@ -132,6 +132,11 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// consumer's get_partition_strategy, which turns it into a partition count.
   uint64_t compute_total_bytes();
 
+  /// The batches waiting on this partition's input port (partition slot 0 — the upstream sink
+  /// deposits unpartitioned). Handed to a MERGE_GROUP_BY consumer for the clustered-bypass range
+  /// proof at sizing time.
+  std::vector<std::shared_ptr<cucascade::data_batch>> collect_input_batches();
+
   /// The partition slot for a batch residing on `device_id`: its index in `_active_gpu_ids`
   /// (so task_creator routes that slot back to the same GPU). Returns 0 if not found (a
   /// safe fallback that keeps the batch on some valid slot).

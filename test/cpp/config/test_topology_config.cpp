@@ -123,3 +123,47 @@ TEST_CASE("sirius_config accepts a zero admission_bytes_per_gpu", "[topology_con
   REQUIRE_NOTHROW(cfg.load_from_file(yaml.path));
   CHECK(cfg.get_operator_params().admission_bytes_per_gpu == 0);
 }
+
+TEST_CASE("sirius_config bounds clustered_bypass_max_overlap_fraction to [0, 1]",
+          "[clustered_merge_bypass][config]")
+{
+  // The knob is a fraction of the smaller batch's key span; values outside [0, 1] have no
+  // reading. The endpoints are meaningful: 0 admits only the absolute-floor overlap, 1 admits
+  // any adjacent overlap (the disjointedness structure still gates correctness either way).
+  auto config_text = [](std::string const& value) {
+    return "sirius:\n"
+           "  operator_params:\n"
+           "    clustered_bypass_max_overlap_fraction: " +
+           value + "\n";
+  };
+
+  SECTION("rejects a negative fraction")
+  {
+    scoped_yaml yaml("sirius_bypass_overlap_negative.yaml", config_text("-0.1"));
+    sirius::sirius_config cfg;
+    CHECK_THROWS(cfg.load_from_file(yaml.path));
+  }
+
+  SECTION("rejects a fraction above one")
+  {
+    scoped_yaml yaml("sirius_bypass_overlap_above_one.yaml", config_text("1.5"));
+    sirius::sirius_config cfg;
+    CHECK_THROWS(cfg.load_from_file(yaml.path));
+  }
+
+  SECTION("accepts the zero endpoint")
+  {
+    scoped_yaml yaml("sirius_bypass_overlap_zero.yaml", config_text("0"));
+    sirius::sirius_config cfg;
+    REQUIRE_NOTHROW(cfg.load_from_file(yaml.path));
+    CHECK(cfg.get_operator_params().clustered_bypass_max_overlap_fraction == 0.0);
+  }
+
+  SECTION("accepts the one endpoint")
+  {
+    scoped_yaml yaml("sirius_bypass_overlap_one.yaml", config_text("1"));
+    sirius::sirius_config cfg;
+    REQUIRE_NOTHROW(cfg.load_from_file(yaml.path));
+    CHECK(cfg.get_operator_params().clustered_bypass_max_overlap_fraction == 1.0);
+  }
+}
