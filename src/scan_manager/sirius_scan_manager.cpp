@@ -2321,16 +2321,12 @@ bool cache_entry_info::matches_duckdb_table(std::string_view catalog,
 
 bool cache_entry_info::same_source_as(const cache_entry_info& other) const
 {
-  // A duckdb identity on either side makes this a duckdb comparison: an entry with
-  // a table name never describes the same source as one carrying a file set.
+  // A DuckDB entry never matches a parquet entry.
   if (!table_name.empty() || !other.table_name.empty()) {
     return matches_duckdb_table(
       other.catalog_name, other.schema_name, other.table_name, other.table_oid);
   }
-  // Both sides are already canonical (cache_entry_info::from canonicalizes), and
-  // canonicalizing a canonical path is a no-op, so routing through the shared
-  // matcher keeps one definition of parquet identity. Two entries with no files at
-  // all report false — the caller then replaces, which is the safe direction.
+  // Reuse the canonical parquet identity matcher. Empty file sets do not match.
   return matches_parquet_files(other.resolved_file_paths);
 }
 
@@ -2442,10 +2438,8 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
 
   auto existing_it = _pinned_entries.find(name);
   if (existing_it != _pinned_entries.end()) {
-    // Merge only pins that read the same source incarnation and row coverage.
-    // Same-row-count merge only applies when the completeness contracts match.
-    // Mixing a full pin with a partial pin produces an entry whose columns came
-    // from different row coverage — drop and rebuild instead.
+    // Merge only pins for the same source and row coverage. Shape checks alone
+    // cannot distinguish equally sized tables.
     if (existing_it->second->cache_info.same_source_as(cache_info) &&
         existing_it->second->num_rows == new_num_rows) {
       // The merge below mutates the existing entry IN PLACE, and appending a column rehashes
@@ -3078,14 +3072,21 @@ std::optional<std::string> sirius_scan_manager::pinned_entry_name_for_superseded
   std::string_view catalog_name,
   std::string_view schema_name,
   std::string_view table_name,
-  duckdb::idx_t table_oid) const
+  duckdb::idx_t table_oid,
+  std::optional<std::uint64_t> current_checkpoint_iteration) const
 {
   std::lock_guard pin_lk{_pinned_entries_mutex};
   for (auto const& [name, entry] : _pinned_entries) {
-    if (entry->cache_info.matches_duckdb_table_name(catalog_name, schema_name, table_name) &&
-        entry->cache_info.table_oid != table_oid) {
-      return name;
+    if (!entry->cache_info.matches_duckdb_table_name(catalog_name, schema_name, table_name) ||
+        entry->cache_info.table_oid == table_oid) {
+      continue;
     }
+    // A later checkpoint makes the fresh disk read safe.
+    if (entry->mvcc != nullptr && current_checkpoint_iteration.has_value() &&
+        entry->mvcc->checkpoint_iteration != *current_checkpoint_iteration) {
+      continue;
+    }
+    return name;
   }
   return std::nullopt;
 }
