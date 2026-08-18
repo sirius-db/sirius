@@ -125,7 +125,10 @@ Controls how much GPU VRAM Sirius claims and when it starts evicting data to hos
 | `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`; configuration loading rejects both when both values are non-null. |
 | `downgrade_trigger_fraction` | double (0,1] | 0.8 | Start evicting GPU-resident data to host when reserved memory exceeds this fraction of capacity. Must be greater than `downgrade_stop_fraction`. |
 | `downgrade_stop_fraction` | double (0,1] | 0.6 | Stop evicting when reserved memory drops to this fraction of capacity. Must be less than `downgrade_trigger_fraction`; configuration loading rejects an invalid pair. |
-| `track_per_stream_reservation` | bool | false | Track memory reservations per CUDA stream instead of globally. Useful for debugging per-task memory usage. |
+
+The high-level GPU path keeps per-stream reservation tracking off. The
+diagnostic control remains available only through the explicit low-level
+`sirius.space.gpu[].per_stream_reservation` replacement surface.
 
 ### Host Memory (`sirius.memory.host`)
 
@@ -266,12 +269,11 @@ hardware-derived exception described below:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `num_threads` | int (**> 0**) | per pool (below) | Worker threads in the pool. |
-| `thread_name_prefix` | string | per pool | Thread name prefix for logs. |
 | `cpu_affinity` | list of int | — | Cores to pin task-creator and downgrade threads. GPU pipeline affinity is derived from the selected GPU's CPU topology. |
 
 ### `sirius.executor.task_creator`
 
-Thread pool (default `num_threads: 1`, prefix `task_creator`) plus:
+Thread pool (default `num_threads: 1`) plus:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -280,11 +282,11 @@ Thread pool (default `num_threads: 1`, prefix `task_creator`) plus:
 
 ### `sirius.executor.pipeline`
 
-Thread pool only (default `num_threads: 4`, prefix `gpu_pipeline`). No extra keys.
+Thread pool only (default `num_threads: 4`). No extra keys.
 
 ### `sirius.executor.downgrade`
 
-Thread pool (default `num_threads: 1`, prefix `downgrade`) plus:
+Thread pool (default `num_threads: 1`) plus:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -299,7 +301,6 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 1 uring reactor), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
-| `thread_name_prefix` | string | `scan_manager` | Thread name prefix for logs. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `use_sirius_datasource` | bool | true | Route reads through the Sirius `io_uring` datasource. When false, the kvikio fallback is used (single-GPU only; multi-GPU requires the Sirius datasource). |
 | `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
