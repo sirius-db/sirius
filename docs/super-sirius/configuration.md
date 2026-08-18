@@ -93,6 +93,7 @@ sirius:
     enable_dynamic_filter_pushdown: true    # BUILD_PROBE raw/hash IN-list or Bloom filters
     enable_dynamic_zone_map_filter: false  # optional parquet-read/native-post-decode min/max
     dynamic_filter_domain_coverage_threshold: 0.9  # skip keys the build's domain coverage exceeds
+    dynamic_filter_inlist_max_l2_fraction: 0.125  # demote larger IN-list sets to Bloom (fraction of probe-GPU L2; 0 = always Bloom, 1.0 = legacy L2 fit)
     dynamic_filter_keep_threshold: 0.9  # disable a scan's filtering when a split keeps > this fraction
     enable_pinned_zone_map_pruning: true  # capture and use per-chunk stats for pinned tables
   telemetry:
@@ -410,6 +411,7 @@ individually.
 | `enable_dynamic_filter_pushdown` | true | Master switch for dynamic table-filter pushdown. An eligible `BUILD_PROBE` hash-join build selects a raw exact IN-list for 1–12 supported build rows, otherwise a hash IN-list if it fits the smallest probe-GPU L2 or a Bloom, for post-decode application by the probe scan. |
 | `enable_dynamic_zone_map_filter` | false | Additionally publish build-key min/max bounds. Parquet scans use them for read-time row-group pruning; duckdb-native scans apply them row-wise post-decode. Requires `enable_dynamic_filter_pushdown`; intended for clustered-keyset workloads. |
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold for skipping publication when the build covers at least this fraction of the key's domain; ≥ 1.0 effectively disables the gate. |
+| `dynamic_filter_inlist_max_l2_fraction` | 0.125 | Finite threshold in [0, 1]: maximum estimated cuco-set size for the exact hash IN-list dynamic filter, as a fraction of the smallest probe-GPU L2; larger sets publish a Bloom filter (a streaming probe evicts a near-L2 set, the smaller Bloom stays cache-resident). 0 always publishes the Bloom when the key type supports it; 1.0 reproduces the legacy L2-fit rule; with no device L2 info the legacy rule applies unchanged. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
 | `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU. At admission the engine estimates a query's total scan output and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. |
@@ -619,6 +621,7 @@ envelopes can override either behavior in YAML under `sirius.operator_params`.
 | `enable_dynamic_filter_pushdown` | true | Master switch for dynamic table-filter pushdown. Wires eligible `BUILD_PROBE` hash-join-build membership filters into probe scans: raw exact IN-list for 1–12 supported build rows, then a hash IN-list if it fits the smallest probe-GPU L2 or a Bloom. |
 | `enable_dynamic_zone_map_filter` | false | Additionally publish build-key min/max bounds. Parquet scans use them for read-time row-group pruning; duckdb-native scans apply them row-wise post-decode. Has no effect unless `enable_dynamic_filter_pushdown` is enabled. |
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold for skipping publication when the build covers at least this fraction of the key's domain; ≥ 1.0 effectively disables the gate. |
+| `dynamic_filter_inlist_max_l2_fraction` | 0.125 | Finite threshold in [0, 1]: maximum estimated cuco-set size for the exact hash IN-list dynamic filter, as a fraction of the smallest probe-GPU L2; larger sets publish a Bloom filter (a streaming probe evicts a near-L2 set, the smaller Bloom stays cache-resident). 0 always publishes the Bloom when the key type supports it; 1.0 reproduces the legacy L2-fit rule; with no device L2 info the legacy rule applies unchanged. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 
 The direct DuckDB session overrides are registered only when the process
