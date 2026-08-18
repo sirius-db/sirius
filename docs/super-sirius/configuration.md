@@ -302,7 +302,6 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `num_threads` | int (**3..INT_MAX-1**) | remaining cores (min 4) | Configured metadata workers in the scan-manager pool. The pool also owns one internal worker. When omitted, Sirius derives the configured count after parsing the other executor and memory settings: hardware concurrency minus that internal worker, every configured downgrade executor (one per GPU and HOST space), every pipeline executor (one per GPU), the task-creator pool, and the io_uring pool, with a floor of 4. An explicit value is preserved when the constructor's internal-worker addition remains representable. |
-| `thread_name_prefix` | string | `scan_manager` | Thread name prefix for logs. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `use_sirius_datasource` | bool | true | Route reads through the Sirius `io_uring` datasource. When false, the kvikio fallback is used (single-GPU only; multi-GPU requires the Sirius datasource). |
 | `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |

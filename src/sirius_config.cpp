@@ -244,7 +244,6 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("num_threads",
              opt.thread_pool.num_threads,
              yaml::between<int>{3, scan_manager::max_scan_manager_num_threads});
-  r.optional("thread_name_prefix", opt.thread_pool.thread_name_prefix);
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("use_sirius_datasource", opt.use_sirius_datasource);
   r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
