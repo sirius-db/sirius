@@ -482,11 +482,12 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
     default: break;
   }
 
-  // Pipeline wrapper operators (PARTITION, CONCAT, MERGE_*, SORT_PARTITION, SORT_SAMPLE,
-  // GPU_SCAN) are inserted by insert_gpu_pipeline_operators after these passes run; their
-  // carrier contracts are established at wrap time from the finished sidecars.
+  // Pipeline wrapper operators (PARTITION, CONCAT, PASSTHROUGH_SINK, MERGE_*, SORT_PARTITION,
+  // SORT_SAMPLE, GPU_SCAN) are inserted by insert_gpu_pipeline_operators after these passes
+  // run; their carrier contracts are established at wrap time from the finished sidecars.
   D_ASSERT(slot->type != sirius::op::SiriusPhysicalOperatorType::PARTITION &&
            slot->type != sirius::op::SiriusPhysicalOperatorType::CONCAT &&
+           slot->type != sirius::op::SiriusPhysicalOperatorType::PASSTHROUGH_SINK &&
            slot->type != sirius::op::SiriusPhysicalOperatorType::MERGE_SORT &&
            slot->type != sirius::op::SiriusPhysicalOperatorType::MERGE_GROUP_BY &&
            slot->type != sirius::op::SiriusPhysicalOperatorType::MERGE_TOP_N &&

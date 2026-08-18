@@ -53,6 +53,7 @@ class LogicalLimit;
 class LogicalOrder;
 class LogicalTopN;
 class LogicalProjection;
+class LogicalSetOperation;
 class LogicalMaterializedCTE;
 class LogicalCTERef;
 }  // namespace duckdb
@@ -166,8 +167,11 @@ class sirius_physical_plan_generator {
   // &op); duckdb::unique_ptr<sirius::op::sirius_physical_operator>
   // create_plan(duckdb::LogicalCopyToFile &op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalExplain
-  // &op); duckdb::unique_ptr<sirius::op::sirius_physical_operator>
-  // create_plan(duckdb::LogicalSetOperation &op);
+  // &op);
+  //! `UNION ALL` only; the builder rejects distinct UNION. EXCEPT / INTERSECT share the same
+  //! DuckDB node but keep their own throwing case in the dispatch switch, so they never arrive.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
+    duckdb::LogicalSetOperation& op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalUpdate
   // &op); duckdb::unique_ptr<sirius::op::sirius_physical_operator>
   // create_plan(duckdb::LogicalPrepare &expr);
