@@ -24,6 +24,7 @@
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/encode.hpp>
 #include <cudf/reduction/approx_distinct_count.hpp>
+#include <cudf/sorting.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/utilities/error.hpp>
@@ -125,7 +126,8 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   const std::vector<std::vector<int>>& aggregate_struct_col_indices,
   rmm::cuda_stream_view stream,
   cucascade::memory::memory_space& memory_space,
-  const telemetry::batch_telemetry_info& telemetry_info)
+  const telemetry::batch_telemetry_info& telemetry_info,
+  const sorted_hint_options& sorted_hint)
 {
   // Sanity check
   if (aggregates.size() != aggregate_idx.size()) {
@@ -306,7 +308,50 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
     }
   }
   if (use_label_keys) { group_cols.push_back(label_col->view()); }
-  cudf::groupby::groupby grpby_obj(cudf::table_view(group_cols), cudf::null_policy::INCLUDE);
+
+  // ---------------------------------------------------------------------------------------
+  // Sorted-groupby hint (config: enable_sorted_groupby_hint / sorted_groupby_hint_min_rows).
+  //
+  // Clustered inputs (e.g. a lineitem scan grouped by the delta-bitpack-encoded l_orderkey)
+  // reach this groupby with their keys already sorted, yet the hash path re-hashes every row.
+  // cudf's sort-based groupby with `sorted::YES` skips both hashing and sorting; it only needs
+  // adjacent-equal keys, which any consistent lexicographic sortedness guarantees.
+  //
+  // Correctness gate: `sorted::YES` is passed if and only if a runtime `cudf::is_sorted` check
+  // proves the final key columns sorted under the EXACT same column_order / null_precedence
+  // handed to the groupby constructor. The two defaults differ (`is_sorted` assumes
+  // null_order::BEFORE when the vector is empty, the groupby assumes null_order::AFTER), so the
+  // explicit vectors below are load-bearing — never drop them.
+  //
+  // Cost gate: the check is one comparator pass over the key columns, so it is skipped for
+  // small batches and for non-fixed-width keys (string/dictionary comparators make the pass
+  // itself expensive, and those key shapes are rarely clustered).
+  cudf::sorted keys_presorted = cudf::sorted::NO;
+  std::vector<cudf::order> key_column_order;
+  std::vector<cudf::null_order> key_null_precedence;
+  if (sorted_hint.enabled && !group_cols.empty() &&
+      static_cast<uint64_t>(input_table.num_rows()) >= sorted_hint.min_rows &&
+      std::all_of(group_cols.begin(), group_cols.end(), [](cudf::column_view const& col) {
+        return cudf::is_fixed_width(col.type());
+      })) {
+    key_column_order.assign(group_cols.size(), cudf::order::ASCENDING);
+    key_null_precedence.assign(group_cols.size(), cudf::null_order::AFTER);
+    if (cudf::is_sorted(
+          cudf::table_view(group_cols), key_column_order, key_null_precedence, stream)) {
+      keys_presorted = cudf::sorted::YES;
+      SIRIUS_LOG_INFO("local_grouped_agg: sorted-groupby hint engaged (rows={}, key_cols={})",
+                      input_table.num_rows(),
+                      group_cols.size());
+    } else {
+      key_column_order.clear();
+      key_null_precedence.clear();
+    }
+  }
+  cudf::groupby::groupby grpby_obj(cudf::table_view(group_cols),
+                                   cudf::null_policy::INCLUDE,
+                                   keys_presorted,
+                                   key_column_order,
+                                   key_null_precedence);
 
   // Make aggregation requests, group aggregations on the same column in the single request.
   // For multi-column COLLECT_SET, a synthetic negative key -(i+1) is used so that each such

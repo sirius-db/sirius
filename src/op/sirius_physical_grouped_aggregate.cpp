@@ -107,7 +107,8 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                               cudf_aggregate_struct_col_indices,
                                                               stream,
                                                               *space,
-                                                              batch_telemetry());
+                                                              batch_telemetry(),
+                                                              sorted_hint);
     results.push_back(std::move(result));
   }
   return std::make_unique<pipelineable_operator_data>(results);

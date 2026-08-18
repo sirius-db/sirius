@@ -437,7 +437,9 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
       merge->set_physical_types(hgb_ptr->get_physical_types());
     }
 
-    auto& grouped = hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+    auto& grouped       = hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+    grouped.sorted_hint = {op_params.enable_sorted_groupby_hint,
+                           op_params.sorted_groupby_hint_min_rows};
     bool const has_supported_count_distinct_layout =
       grouped.has_count_distinct && !grouped.has_avg && !hgb_ptr->has_physical_overrides() &&
       hgb_ptr->types.size() == grouped.group_idx.size() + grouped.aggregate_slots.size();
@@ -633,8 +635,10 @@ void wrap_delim_distinct(sirius::op::sirius_physical_delim_join& delim_base,
 {
   if (!delim_base.distinct_root) { return; }
 
-  auto original          = std::move(delim_base.distinct_root);
-  auto* original_agg_ptr = &original->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+  auto original                 = std::move(delim_base.distinct_root);
+  auto* original_agg_ptr        = &original->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+  original_agg_ptr->sorted_hint = {op_params.enable_sorted_groupby_hint,
+                                   op_params.sorted_groupby_hint_min_rows};
 
   auto partition =
     duckdb::make_uniq<sirius::op::sirius_physical_partition>(original->types,

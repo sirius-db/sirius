@@ -414,6 +414,8 @@ individually.
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
 | `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU. At admission the engine estimates a query's total scan output and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. |
 | `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns (VARCHAR, LIST, STRUCT, ARRAY) when estimating scan output. Fixed-width columns use their real carrier width. Only consulted when `admission_bytes_per_gpu` is non-zero. |
+| `enable_sorted_groupby_hint` | true | Pass `sorted::YES` to the grouped-aggregate cudf groupby when a per-batch `cudf::is_sorted` check (explicit ASCENDING / `null_order::AFTER`, matching the groupby ctor) proves the keys pre-sorted, skipping both hashing and sorting on clustered batches. Unsorted input cannot take the sorted path. |
+| `sorted_groupby_hint_min_rows` | 1 Mi rows | Minimum batch rows before the sorted-groupby-hint `is_sorted` check runs (the check costs one comparator pass over the key columns). |
 | `pin_table_natural_file_order` | true | Pin multi-file parquet datasets in natural (digit-aware) file-name order — `part.2` before `part.10` — instead of raw readdir order, so pinned chunks are deterministic, contiguous, in-order slices of the logical table. Pinned-cache identity is order-insensitive either way. |
 
 **Note:** `admission_bytes_per_gpu` is a parallelism dial, not a memory budget. Peak GPU residency is bounded by partition sizing (`hash_partition_bytes` and the batch settings), not by the admitted GPU count — a query on fewer GPUs processes more partitions sequentially at roughly unchanged peak memory, trading wall-clock for freed devices. Tune it against how much of the fleet a query should occupy, not against VRAM.
@@ -593,6 +595,8 @@ SET enable_compressed_materialization = false;
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
 | `enable_runtime_distinct_build_probe` | true | Runtime distinct-build test for `BUILD_PROBE` joins; promotes to the single-pass `cudf::distinct_hash_join` when the build keys prove distinct |
+| `enable_sorted_groupby_hint` | true | `cudf::is_sorted`-proven `sorted::YES` for grouped aggregates |
+| `sorted_groupby_hint_min_rows` | 1 Mi rows | Minimum batch rows before the is_sorted check runs |
 | `pin_table_natural_file_order` | true | Natural (digit-aware) pin file order for multi-file parquet datasets |
 
 ### GPU Admission

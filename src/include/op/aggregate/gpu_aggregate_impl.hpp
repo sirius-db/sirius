@@ -36,6 +36,23 @@ class telemetry_context;
 namespace op {
 
 /**
+ * @brief Options for the sorted-groupby hint in `local_grouped_aggregate`.
+ *
+ * When enabled and the batch clears `min_rows`, the implementation runs a runtime
+ * `cudf::is_sorted` check over the (fixed-width) group key columns and, when the keys are proven
+ * pre-sorted, constructs the cudf groupby with `sorted::YES` so the sort-based helper skips both
+ * hashing and sorting. The check is the correctness gate: `sorted::YES` is only ever passed for
+ * keys the check proved sorted under the exact same column order / null order the groupby is
+ * given, so unsorted inputs cannot take the sorted path.
+ */
+struct sorted_hint_options {
+  /// Try the is_sorted check and take the sorted::YES path when it proves the keys sorted.
+  bool enabled = false;
+  /// Minimum input rows before the check runs (it costs one pass over the key columns).
+  uint64_t min_rows = 1ULL << 20;
+};
+
+/**
  * @brief Functionalities for running local aggregation on a data batch.
  *
  * Provide functionalities including:
@@ -79,6 +96,8 @@ class gpu_aggregate_impl {
    *        indices. Empty entries (or an empty outer vector) use `aggregate_idx` directly.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
+   * @param telemetry_info Telemetry lineage for the output batch.
+   * @param sorted_hint See @ref sorted_hint_options (off by default).
    *
    * @return The output data batch.
    */
@@ -90,7 +109,8 @@ class gpu_aggregate_impl {
     const std::vector<std::vector<int>>& aggregate_struct_col_indices,
     rmm::cuda_stream_view stream,
     cucascade::memory::memory_space& memory_space,
-    const telemetry::batch_telemetry_info& telemetry_info = {});
+    const telemetry::batch_telemetry_info& telemetry_info = {},
+    const sorted_hint_options& sorted_hint                = {});
 };
 
 }  // namespace op

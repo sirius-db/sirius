@@ -2086,6 +2086,26 @@ static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
                    params->enable_runtime_distinct_build_probe);
 }
 
+static void SetEnableSortedGroupbyHint(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                          = lock_operator_params_slot(context);
+  params->enable_sorted_groupby_hint = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_SORTED_GROUPBY_HINT to {}",
+                   params->enable_sorted_groupby_hint);
+}
+
+static void SetSortedGroupbyHintMinRows(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                            = lock_operator_params_slot(context);
+  params->sorted_groupby_hint_min_rows = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config SORTED_GROUPBY_HINT_MIN_ROWS to {}",
+                   params->sorted_groupby_hint_min_rows);
+}
+
 static void SetPinTableNaturalFileOrder(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2432,6 +2452,22 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.enable_runtime_distinct_build_probe),
     SetEnableRuntimeDistinctBuildProbe);
+
+  config.AddExtensionOption(
+    "enable_sorted_groupby_hint",
+    "Pass sorted::YES to the grouped-aggregate cudf groupby when a runtime cudf::is_sorted check "
+    "proves a batch's group keys are already sorted, skipping both hashing and sorting (on by "
+    "default)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.enable_sorted_groupby_hint),
+    SetEnableSortedGroupbyHint);
+
+  config.AddExtensionOption("sorted_groupby_hint_min_rows",
+                            "Minimum batch rows before the sorted-groupby-hint is_sorted check "
+                            "runs (small batches hash fast enough that the check cannot pay)",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(operator_defaults.sorted_groupby_hint_min_rows),
+                            SetSortedGroupbyHintMinRows);
 
   config.AddExtensionOption(
     "pin_table_natural_file_order",

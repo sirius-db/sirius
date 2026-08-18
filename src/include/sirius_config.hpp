@@ -83,6 +83,16 @@ constexpr double DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO = 8.0;
 /// one cudf::distinct_count pass over the build keys, taken only in BUILD_PROBE mode.
 constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = true;
 
+/// Pass cudf::sorted::YES to the grouped-aggregate groupby when a runtime cudf::is_sorted check
+/// proves the batch's group keys are already sorted (clustered input). The sort-based groupby then
+/// skips both hashing and sorting. The check itself is one cheap pass; the min-rows gate below
+/// bounds the tax on unsorted inputs.
+constexpr bool DEFAULT_ENABLE_SORTED_GROUPBY_HINT = true;
+
+/// Minimum batch rows before the sorted-groupby-hint is_sorted check runs. Small batches hash
+/// fast enough that the check cannot pay for itself.
+constexpr uint64_t DEFAULT_SORTED_GROUPBY_HINT_MIN_ROWS = 1ULL << 20;
+
 /// Pin multi-file parquet datasets in natural (digit-aware) file-name order instead of raw
 /// readdir order. Datasets are almost always written as key-contiguous parts (part.0, part.1,
 /// ..., part.N), so natural order makes every pinned chunk a contiguous in-order slice of the
@@ -140,9 +150,16 @@ struct operator_params {
   /// DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE.
   bool enable_runtime_distinct_build_probe = config::DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE;
 
+  /// Pass sorted::YES to the grouped-aggregate groupby when a runtime cudf::is_sorted check
+  /// proves the batch keys are pre-sorted. See DEFAULT_ENABLE_SORTED_GROUPBY_HINT.
+  bool enable_sorted_groupby_hint = config::DEFAULT_ENABLE_SORTED_GROUPBY_HINT;
+
   /// Pin multi-file parquet datasets in natural (digit-aware) file-name order instead of raw
   /// readdir order. See DEFAULT_PIN_TABLE_NATURAL_FILE_ORDER.
   bool pin_table_natural_file_order = config::DEFAULT_PIN_TABLE_NATURAL_FILE_ORDER;
+
+  /// Minimum batch rows before the sorted-groupby-hint is_sorted check runs.
+  uint64_t sorted_groupby_hint_min_rows = config::DEFAULT_SORTED_GROUPBY_HINT_MIN_ROWS;
 
   /// Wire dynamic table-filter pushdown: an eligible BUILD_PROBE hash-join build publishes a raw
   /// exact IN-list for 1..12 supported build rows, otherwise a hash IN-list if it fits the smallest
