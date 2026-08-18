@@ -46,7 +46,18 @@
 // propagation would insert a restore projection: join keys, value-sensitive aggregate inputs,
 // ineligible or unmodeled operators, entry into a DELIM_JOIN sub-root, the plan root). The verdict
 // per column is `keep iff transport or (not boundary_restore and (narrow_comparison or not
-// evaluator_restore))`; retracted columns flip back to native in the scan sidecar before
+// evaluator_restore))`.
+//
+// narrow_comparison covers both comparison shapes the evaluator computes at the narrow width:
+// against constants, and between two references sharing a carrier. The reference pair is the
+// weaker of the two, because it holds only while BOTH carriers stay narrow and equal -- so in
+// principle one side retracting could strand the other. No verdict coupling enforces that,
+// because no reachable shape produces it: every modeled operator that boundaries one side either
+// boundaries the other or gives it transport, and transport keeps it on its own merits. Were a
+// stranded side to appear anyway, the evaluator simply declines the pair and restores both, which
+// costs a widening cast rather than correctness.
+//
+// Retracted columns flip back to native in the scan sidecar before
 // propagation runs. Because every case mirrors the propagation case of the same operator, an
 // operator this file does not model is by construction one where propagation restores at the
 // boundary. The conservative default is always native.
@@ -115,6 +126,37 @@ std::optional<std::size_t> narrow_comparison_candidate(
   return candidate;
 }
 
+// The two candidates of a reference-vs-reference comparison that both sit on the same planned
+// carrier. Mirrors the evaluator's `narrow_domain_reference_pair_carrier` so plan-time keep/retract
+// and evaluation-time widening cannot disagree.
+std::optional<std::pair<std::size_t, std::size_t>> narrow_comparison_pair(
+  sirius::ast::node const* lhs,
+  sirius::ast::node const* rhs,
+  carried_columns const& inputs,
+  policy_state const& state)
+{
+  if (!lhs || !rhs || !lhs->holds<sirius::ast::reference>() ||
+      !rhs->holds<sirius::ast::reference>()) {
+    return std::nullopt;
+  }
+  auto const& lhs_ref = lhs->get<sirius::ast::reference>();
+  auto const& rhs_ref = rhs->get<sirius::ast::reference>();
+  if (lhs_ref.column_index >= inputs.size() || rhs_ref.column_index >= inputs.size()) {
+    return std::nullopt;
+  }
+  if (!inputs[lhs_ref.column_index] || !inputs[rhs_ref.column_index]) { return std::nullopt; }
+  auto const lhs_candidate = *inputs[lhs_ref.column_index];
+  auto const rhs_candidate = *inputs[rhs_ref.column_index];
+  if (!sirius::ast::narrow_domain_reference_pair_eligible(
+        lhs_ref.return_type(),
+        state.candidates[lhs_candidate].carrier,
+        rhs_ref.return_type(),
+        state.candidates[rhs_candidate].carrier)) {
+    return std::nullopt;
+  }
+  return std::pair{lhs_candidate, rhs_candidate};
+}
+
 void classify_expression(sirius::ast::node const& expr,
                          carried_columns const& inputs,
                          policy_state& state);
@@ -156,6 +198,18 @@ void classify_expression(sirius::ast::node const& expr,
         if (auto const candidate =
               narrow_comparison_candidate(alt.right.get(), {alt.left.get()}, inputs, state)) {
           state.candidates[*candidate].narrow_comparison = true;
+          return;
+        }
+        // Both operands carried narrow at one shared carrier: the comparison needs no restore, so
+        // vote to keep both and stop -- descending would mark each operand evaluator_restore and
+        // widen a pair that never had to widen.
+        //
+        // If a later verdict retracts one carrier, runtime eligibility declines the pair and
+        // restores the remaining narrow input. That can miscost the keep decision, not the result.
+        if (auto const pair =
+              narrow_comparison_pair(alt.left.get(), alt.right.get(), inputs, state)) {
+          state.candidates[pair->first].narrow_comparison  = true;
+          state.candidates[pair->second].narrow_comparison = true;
           return;
         }
         classify_child(alt.left, inputs, state);

@@ -1157,6 +1157,8 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
       auto const data_positions = output_data_positions(*_plan);
       auto filtered             = data_positions.empty() ? exec.select(input.table.view())
                                                          : exec.select(input.table.view(), data_positions);
+      // The select only enqueued its reads; record before the reassignment drops the read lock.
+      input.table.record_reader_event(stream);
       input = filtered_table{owning_table_view{std::move(filtered)}, filter_state::ROW_FILTERED};
       SIRIUS_LOG_DEBUG(
         "[parquet_gpu_ingestible::post_filter_and_project] Applied the residual filter "

@@ -1,5 +1,5 @@
 /*
- * Copyright 2025, Sirius Contributors.
+ * Copyright 2026, Sirius Contributors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -261,7 +261,7 @@ TEST_CASE("batch_stream BSTR-6: wait unblocks on a push and on the final close",
 }
 
 // ============================================================================
-// BSTR-7: fail() is immediate, fail-fast terminal, and first-wins (S2 / P1–P3)
+// BSTR-7: fail() is immediate, fail-fast terminal, and first-wins (P1–P3)
 // ============================================================================
 
 TEST_CASE("batch_stream BSTR-7: fail() poisons the stream at once", "[batch_stream]")
@@ -315,7 +315,7 @@ TEST_CASE("batch_stream BSTR-8: try_pull rethrows ahead of queued batches", "[ba
 }
 
 // ============================================================================
-// BSTR-9: the poison announces itself like data (S2 / P4)
+// BSTR-9: the poison announces itself like data (S2 / P4 — on_data + HAS_DATA)
 // ============================================================================
 
 TEST_CASE("batch_stream BSTR-9: fail() wakes the consumer and reads as HAS_DATA", "[batch_stream]")
@@ -490,8 +490,8 @@ TEST_CASE("batch_stream BSTR-15: push registers before it wakes", "[batch_stream
   bool seen_registered = false;
   stream->set_on_data([&, repo = repo] { seen_registered = repo->total_size() > 0; });
 
-  // Register-then-announce. A waker that ran first would schedule a task for a batch not yet
-  // in the repository, and the task's pop would come back empty.
+  // S1 — register-then-announce. An on_data hook that ran first would schedule a task for a
+  // batch not yet in the repository, and the task's pop would come back empty.
   REQUIRE(stream->push(make_numeric_batch<int32_t>(*gpu_space, {1}, cudf::type_id::INT32)));
   REQUIRE(seen_registered);
 }

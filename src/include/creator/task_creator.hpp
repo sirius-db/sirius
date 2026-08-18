@@ -97,6 +97,16 @@ class task_creator {
   task_creator(task_creator&&)                 = delete;
   task_creator& operator=(task_creator&&)      = delete;
 
+  /// \brief Narrow this query to a GPU subset, replacing the constructor's topology-derived
+  /// list. Called once per query by sirius_engine::initialize_internal.
+  ///
+  /// @param full_count how many GPUs existed before narrowing. Passed in rather than inferred
+  /// so it and @p ids are cut from the same list.
+  void set_active_gpu_ids(std::vector<int> ids, std::size_t full_count);
+
+  /// \brief The GPU subset this query was admitted onto.
+  [[nodiscard]] const std::vector<int>& get_active_gpu_ids() const noexcept;
+
   /// \brief sets client context needed for task creation
   void set_client_context(::duckdb::ClientContext& client_context);
 
@@ -241,12 +251,18 @@ class task_creator {
   std::shared_ptr<const sirius::memory::topology_index> _topology_index;
   /// Round-robin counter for NUMA-affinity routing when multiple GPUs share a NUMA node.
   std::atomic<uint64_t> _numa_affinity_rr{0};
-  /// Sorted, deduped active GPU device ids, materialized from
-  /// `_topology_index->gpu_ids()` at construction. Partition affinity indexes
-  /// this (`_active_gpu_ids[partition_idx % size]`); it must stay in the same
-  /// sorted order that sirius_physical_partition uses for its device->slot
-  /// mapping (see sirius_engine.cpp) so the two remain inverse to each other.
+  /// Separate from _numa_affinity_rr. A task can take a NUMA pick and then be clamped, so
+  /// sharing one counter advances it twice per task: against an even subset size the stride
+  /// never changes parity and every clamped task lands on the same GPU.
+  std::atomic<uint64_t> _admission_rr{0};
+  /// Sorted, deduped GPU device ids this query is admitted onto: every executor at
+  /// construction, narrowed per query by `set_active_gpu_ids()`. Partition affinity indexes
+  /// it (`_active_gpu_ids[partition_idx % size]`) and must stay in the same sorted order
+  /// sirius_physical_partition uses for its device->slot map, so the two stay inverse.
   std::vector<int> _active_gpu_ids;
+  /// GPU count before this query was narrowed, from the same list the admitted set was cut
+  /// from; `_active_gpu_ids.size() < this` means the query is on a strict subset.
+  std::size_t _full_gpu_count{0};
 };
 
 }  // namespace sirius::creator

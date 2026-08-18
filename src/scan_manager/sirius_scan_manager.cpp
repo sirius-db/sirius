@@ -620,7 +620,8 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
 }
 
 void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
-                                            bool enable_pinned_zone_map_pruning)
+                                            bool enable_pinned_zone_map_pruning,
+                                            const std::vector<int>& allocated_gpu_ids)
 {
   _pruning_enabled = enable_pinned_zone_map_pruning;
   reset();
@@ -641,9 +642,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     }
   }
 
-  auto const gpu_ids = _topology_index->gpu_ids();
-  auto round_robin =
-    std::make_shared<round_robin_strategy>(std::vector<int>(gpu_ids.begin(), gpu_ids.end()));
+  auto round_robin = std::make_shared<round_robin_strategy>(allocated_gpu_ids);
 
   _metadata_processor = std::make_unique<load_balancing_scan_batch_coalescer>();
 
@@ -720,7 +719,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   // masks must be finished before serving starts. No-op when no pinned
   // table has rows beyond its prefix.
   if (!_pending_insert_delta_jobs.empty()) {
-    std::vector<int> const delta_gpu_ids(gpu_ids.begin(), gpu_ids.end());
+    std::vector<int> const delta_gpu_ids(allocated_gpu_ids.begin(), allocated_gpu_ids.end());
     run_insert_delta_jobs(_pending_insert_delta_jobs,
                           *_dispatcher,
                           _reservation_manager,
@@ -1725,12 +1724,12 @@ std::optional<cudf::data_type> pinned_column_narrow_carrier(pinned_entry const& 
   // serving validator has inspected the entry this query.
   if (entry_position >= entry.cache_info.column_ids.size()) { return std::nullopt; }
 
-  // Defense against recorded metadata that contradicts the pin-time logical type (or a
-  // logical-type drift between pin time and plan time): every recorded carrier must be a strict
-  // same-family narrowing of the native carrier. All passing carriers share one family and (for
-  // decimals) one scale, so the widest by size is well-defined.
+  // Native equality preserves the logical domain: width and family alone cannot distinguish a
+  // narrowed DATE from a narrowed INTEGER. Valid carriers then share a family and decimal scale,
+  // making the widest carrier well-defined.
   std::optional<cudf::data_type> widest;
   for (auto const& row : entry.column_storage) {
+    if (row[entry_position].native != native_type) { return std::nullopt; }
     auto const carrier = row[entry_position].carrier;
     if (!sirius::can_narrow_to(native_type, carrier)) { return std::nullopt; }
     if (!widest || cudf::size_of(carrier) > cudf::size_of(*widest)) { widest = carrier; }
@@ -1849,6 +1848,41 @@ cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
   return plan;
 }
 
+namespace {
+
+// DuckDB cache-serve native-type gate. Every non-rowid projection must be present and retain its
+// pin-time native mapping across all chunks. False is a clean cache miss; an empty matrix passes
+// for zero-chunk and hand-built entry compatibility.
+bool pinned_native_types_match_scan(pinned_entry const& entry,
+                                    op::scan::duckdb_native_ingestible_table_info const& info)
+{
+  if (entry.column_storage.empty()) { return true; }
+
+  std::unordered_map<duckdb::idx_t, std::size_t> entry_pos_by_primary;
+  entry_pos_by_primary.reserve(entry.cache_info.column_ids.size());
+  for (std::size_t i = 0; i < entry.cache_info.column_ids.size(); ++i) {
+    entry_pos_by_primary.emplace(entry.cache_info.column_ids[i].GetPrimaryIndex(), i);
+  }
+
+  for (std::size_t ci = 0; ci < info.projected_cols.size(); ++ci) {
+    auto const& pc = info.projected_cols[ci];
+    if (pc.is_rowid) { continue; }
+    auto const it = entry_pos_by_primary.find(pc.storage_idx.GetPrimaryIndex());
+    if (it == entry_pos_by_primary.end()) { return false; }
+    std::optional<cudf::data_type> native;
+    if (ci < info.projected_types.size()) {
+      native = sirius::try_get_cudf_type(info.projected_types[ci]);
+    }
+    if (!native) { return false; }
+    for (auto const& row : entry.column_storage) {
+      if (it->second >= row.size() || row[it->second].native != *native) { return false; }
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
 std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_match_cached_entry(
   op::scan::sirius_gpu_scan_operator* op)
 {
@@ -1858,11 +1892,20 @@ std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_m
     // Identity + serviceability gate: empty when this cache cannot serve the scan
     // (wrong format / file-set / table, or missing a requested column).
     if (entry.cache_info.can_serve_with_columns(table_info).empty()) { continue; }
-    // Cache-or-CPU: for duckdb pins with MVCC metadata, the plan-time guards
-    // promised this scan serves from the pin — the disk-native path is
-    // MVCC-blind and increasingly stale under the pin's checkpoint
-    // suppression, so any failure past the identity gate is a loud error,
-    // never a silent disk fallback.
+    // Check native types before strict MVCC handling so type drift is a clean cache miss rather
+    // than an MVCC error or a cache hit under the wrong type.
+    if (auto const* native_info =
+          dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&table_info);
+        native_info != nullptr && !pinned_native_types_match_scan(entry, *native_info)) {
+      SIRIUS_LOG_INFO(
+        "[sirius_scan_manager] pinned entry '{}' matches operator '{}' by table identity but its "
+        "pin-time native column types differ from the scan's; treating as a cache miss",
+        pinned_name,
+        op->get_operator_id());
+      continue;
+    }
+    // After identity, serviceability, and native-type checks, an MVCC pin must serve from cache.
+    // The disk path is MVCC-blind under checkpoint suppression, so later failures are errors.
     bool const mvcc_strict = entry.mvcc != nullptr;
     try {
       // Serve cached columns in the ingestible's materialized (disk-decode) order rather

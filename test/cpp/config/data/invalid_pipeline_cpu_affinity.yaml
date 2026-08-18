@@ -1,0 +1,4 @@
+sirius:
+  executor:
+    pipeline:
+      cpu_affinity: [0]

@@ -230,12 +230,17 @@ void scan_operator_input::prepare_for_processing(
       // plain gpu_table_representation and never reach this branch), so an
       // unmasked, unfiltered scan may take ownership of it here instead of
       // deep-copying it at materialize. Masked / row-filtered splits keep the
-      // view path: they filter by copy and need the source view alive — and
-      // skipping them means the scan allocates nothing after the take, so an
-      // OOM retry can never re-enter materialize on a consumed split. A
-      // decode-row-filtered split has no filter copy left to make, so it
-      // regains the zero-copy steal.
-      if (!mvcc_keep_mask.has_mask() && (!row_filter_pending || decode_row_filtered)) {
+      // view path: they filter by copy and need the source view alive. Splits
+      // pending a carrier conversion keep it too: normalize_physical_schema
+      // allocates a cast output AFTER materialize, and if that cast OOMs the
+      // rescheduled task must be able to re-enter materialize — impossible once
+      // the wrapper batch has been emptied by the take. A decode-row-filtered
+      // split has no filter copy left to make, so it regains the zero-copy
+      // steal regardless of row_filter_pending. Skipping the rest means the
+      // scan allocates nothing after the take, so an OOM retry can never
+      // re-enter materialize on a consumed split.
+      if (!mvcc_keep_mask.has_mask() && (!row_filter_pending || decode_row_filtered) &&
+          !needs_carrier_conversion) {
         if (auto* gpu_rep = dynamic_cast<::cucascade::gpu_table_representation*>(mut.get_data())) {
           auto& space        = gpu_rep->get_memory_space();
           stolen_table_bytes = gpu_rep->get_size_in_bytes();
