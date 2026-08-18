@@ -653,9 +653,7 @@ void wrap_union_child(sirius::op::sirius_physical_operator& union_op, std::size_
                                                                  : std::vector<cudf::data_type>{};
 
       auto sink = duckdb::make_uniq<sirius::op::sirius_physical_passthrough_sink>(
-        std::move(child_types),
-        est_card,
-        sirius::op::sirius_physical_union::port_label(child_idx));
+        std::move(child_types), est_card, sirius::op::sirius_physical_union::port_label(child_idx));
       // Expected to be empty: the compressed-schema pass treats UNION as a native boundary and
       // restores every arm before this runs. Carried anyway so the sink never silently declares a
       // different carrier than the batches flowing through it, mirroring wrap_join_child.

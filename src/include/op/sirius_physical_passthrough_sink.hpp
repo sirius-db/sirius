@@ -32,7 +32,8 @@ namespace op {
 //!   - It emits plain `pipelineable_operator_data`, so the batch carries no `partition_idx`. Task
 //!     device selection therefore falls through to data locality instead of
 //!     `partition_idx % num_gpus`, and each batch is consumed on the GPU its scan produced it on
-//!     (`task_creator::create_task`). A single-partition CONCAT would pin every UNION task to GPU 0.
+//!     (`task_creator::create_task`). A single-partition CONCAT would pin every UNION task to GPU
+//!     0.
 //!   - It pushes through the base `sink()`, not `push_data_batch_partitioned`, so the receiving
 //!     UNION need not be a `sirius_physical_partition_consumer_operator`.
 //!

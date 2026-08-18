@@ -105,7 +105,8 @@ TEST_CASE_METHOD(UnionAllFixture,
   // At the pinned DuckDB a chain binds to ONE set-operation node with N
   // children rather than a left-deep tree of binary nodes, which is why the
   // operator loops over children instead of indexing 0 and 1.
-  compare_gpu_vs_cpu("SELECT k, v FROM ua UNION ALL SELECT k, v FROM ub UNION ALL SELECT k, v FROM uc");
+  compare_gpu_vs_cpu(
+    "SELECT k, v FROM ua UNION ALL SELECT k, v FROM ub UNION ALL SELECT k, v FROM uc");
   compare_gpu_vs_cpu(
     "SELECT count(*) FROM (SELECT k FROM ua UNION ALL SELECT k FROM ub UNION ALL SELECT k FROM uc "
     "UNION ALL SELECT k FROM uempty) t");
@@ -169,7 +170,8 @@ TEST_CASE_METHOD(UnionAllFixture,
     "LIMIT 3");
 
   // Filter and projection downstream.
-  compare_gpu_vs_cpu("SELECT k * 2 FROM (SELECT k FROM ua UNION ALL SELECT k FROM ub) t WHERE k > 2");
+  compare_gpu_vs_cpu(
+    "SELECT k * 2 FROM (SELECT k FROM ua UNION ALL SELECT k FROM ub) t WHERE k > 2");
 
   // Probe side of a join.
   compare_gpu_vs_cpu(
@@ -194,8 +196,7 @@ TEST_CASE_METHOD(UnionAllFixture,
   // An arm that is itself an aggregate: that arm's root is an unconditional
   // sink, so the passthrough sink ends up alone in its pipeline with an input
   // port, rather than inline at the end of a scan's pipeline.
-  compare_gpu_vs_cpu(
-    "SELECT k FROM (SELECT k FROM ua GROUP BY k) g UNION ALL SELECT k FROM ub");
+  compare_gpu_vs_cpu("SELECT k FROM (SELECT k FROM ua GROUP BY k) g UNION ALL SELECT k FROM ub");
 }
 
 TEST_CASE_METHOD(UnionAllFixture,

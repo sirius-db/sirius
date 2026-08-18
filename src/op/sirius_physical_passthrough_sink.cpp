@@ -27,9 +27,8 @@ sirius_physical_passthrough_sink::sirius_physical_passthrough_sink(
   duckdb::vector<sirius::logical_type> types,
   std::size_t estimated_cardinality,
   std::string port_label)
-  : sirius_physical_operator(SiriusPhysicalOperatorType::PASSTHROUGH_SINK,
-                             std::move(types),
-                             estimated_cardinality),
+  : sirius_physical_operator(
+      SiriusPhysicalOperatorType::PASSTHROUGH_SINK, std::move(types), estimated_cardinality),
     _union_port_label(std::move(port_label))
 {
 }
