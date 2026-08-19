@@ -24,7 +24,9 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 namespace sirius {
@@ -140,8 +142,8 @@ std::unique_ptr<cucascade::idata_representation> compressed_host_representation:
                                        _num_rows,
                                        _selected_indices,
                                        _column_sizes));
-  // The pushdown is indexed by the selected column list, which the clone shares.
-  copy->set_equality_pushdown(_equality_pushdown);
+  // The request is indexed by the selected column list, which the clone shares.
+  copy->set_pushdown_scan(_pushdown_scan);
   return copy;
 }
 
@@ -305,8 +307,8 @@ std::unique_ptr<cucascade::idata_representation> compressed_device_representatio
                                          _num_rows,
                                          _selected_indices,
                                          _column_sizes));
-  // The pushdown is indexed by the selected column list, which the clone shares.
-  copy->set_equality_pushdown(_equality_pushdown);
+  // The request is indexed by the selected column list, which the clone shares.
+  copy->set_pushdown_scan(_pushdown_scan);
   return copy;
 }
 

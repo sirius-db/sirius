@@ -62,7 +62,7 @@ constexpr sender_id_t SOLE_SENDER = 0;
 // ============================================================================
 
 /// Producer contract: the batch goes in through the operator's own push(), so admission and the
-/// waker behave exactly as they do in production.
+/// on_data self-nomination behave exactly as they do in production.
 static void push_batch(sirius_physical_streaming_source& op,
                        std::shared_ptr<cucascade::data_batch> batch)
 {
@@ -680,9 +680,15 @@ TEST_CASE("streaming_source SRC-20: producer thread and consumer loop", "[stream
   auto [op, repo] = make_source();
 
   std::atomic<int> pushed{0};
+  // Catch2 assertions are not thread-safe, so the producer records a refusal and the main thread
+  // asserts on it after the join. A refused push here would silently drop a batch and turn the
+  // row-count check below into a false pass.
+  std::atomic<bool> refused{false};
   std::thread producer([&] {
     for (int i = 0; i < K; ++i) {
-      op->push(make_numeric_batch<int32_t>(*gpu_space, {i}, cudf::type_id::INT32));
+      if (!op->push(make_numeric_batch<int32_t>(*gpu_space, {i}, cudf::type_id::INT32))) {
+        refused.store(true, std::memory_order_release);
+      }
       pushed.fetch_add(1, std::memory_order_release);
     }
     op->close_input(SOLE_SENDER);
@@ -706,6 +712,7 @@ TEST_CASE("streaming_source SRC-20: producer thread and consumer loop", "[stream
   }
   producer.join();
 
+  REQUIRE_FALSE(refused.load(std::memory_order_acquire));
   REQUIRE(received == K);
   REQUIRE(op->all_ports_empty());
 }
@@ -814,9 +821,7 @@ TEST_CASE("streaming_source SRC-24: fan-in stream ends only after all senders cl
 }
 
 // ============================================================================
-// SRC-25: the repository is the producer's, not the operator's — destroying the
-// consumer side leaves the queue and its contents intact. This is what lets a
-// session hand the same repository to a wrapper that outlives one fragment.
+// SRC-25: repository IS the queue — destroying the operator leaves queued batches intact.
 // ============================================================================
 
 TEST_CASE("streaming_source SRC-25: the input repository outlives the operator",
@@ -840,12 +845,7 @@ TEST_CASE("streaming_source SRC-25: the input repository outlives the operator",
 
 // ============================================================================
 // BUG-1 (regression): closing an empty stream must finish a zero-task pipeline.
-//
-// These BUG-* tests exercise the real sirius_pipeline completion predicate
-// (update_pipeline_status() / is_pipeline_finished()), not just the operator's
-// own hint/all_ports_empty() methods, because the bug is in what *calls*
-// update_pipeline_status() (or rather, what fails to), not in the predicate
-// itself.
+// Exercises real sirius_pipeline completion (update_pipeline_status), not just the operator.
 // ============================================================================
 
 TEST_CASE("streaming_source BUG-1: closing an empty stream finishes a zero-task pipeline",
@@ -912,11 +912,7 @@ TEST_CASE("streaming_source BUG-2: late close after last task completed finishes
 }
 
 // ============================================================================
-// BUG-3 / BUG-4: pipeline completion must also re-arm downstream pipelines.
-// update_pipeline_status(false) makes notify_downstream_pipelines() schedule
-// this pipeline's output consumers via the task_creator; with the default
-// (true) an empty or late-closed stream finishes this pipeline but its
-// downstream pipeline never gets a task scheduled.
+// BUG-3 / BUG-4: pipeline completion must also re-arm downstream (original_pipeline=false).
 // ============================================================================
 
 TEST_CASE("streaming_source BUG-3: closing an empty stream schedules downstream consumers",
@@ -975,12 +971,7 @@ TEST_CASE("streaming_source BUG-4: late close after last task schedules downstre
 }
 
 // ============================================================================
-// REARM-1: a push after a WAITING hint re-schedules the starved source.
-//
-// This is the live edge the whole streaming source depends on. A head that
-// answers WAITING{nullptr} is dropped by the task creator, and the only
-// built-in re-nomination is task completion — which a starved stream-fed
-// source will never see. Without this the source is non-functional.
+// REARM-1: push after WAITING re-schedules the starved source (on_data self-nomination).
 // ============================================================================
 
 TEST_CASE("streaming_source REARM-1: a push after a WAITING hint re-schedules the source",
@@ -1018,18 +1009,10 @@ TEST_CASE("streaming_source REARM-1: a push after a WAITING hint re-schedules th
 }
 
 // ============================================================================
-// REARM-4: a producer's second burst is consumed after a drain.
-//
-// The task creator's drain loop is
-//     while (!all_ports_empty()) { d = get_next_task_input_data(); if (!d) break; ... }
-// — it never calls get_next_task_hint(). The head is scheduled once by start_query() and task
-// completion only nominates consumers, so if notification depended on a hint call the head
-// would go silent the moment a drain ended and every later push would be stranded.
-//
-// This drives that exact loop shape instead of hand-calling the hint.
+// REARM-2: second burst after a drain loop that never calls get_next_task_hint().
 // ============================================================================
 
-TEST_CASE("streaming_source REARM-4: a push after a drained drain loop re-schedules the source",
+TEST_CASE("streaming_source REARM-2: a push after a drained drain loop re-schedules the source",
           "[streaming_source][pipeline_completion]")
 {
   auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
@@ -1064,14 +1047,10 @@ TEST_CASE("streaming_source REARM-4: a push after a drained drain loop re-schedu
 }
 
 // ============================================================================
-// REARM-2: a push racing the WAITING hint is not lost.
-//
-// The arm predicate re-checks emptiness under the same lock push() holds while
-// it inserts, so a batch that lands between classify() and the arm turns the
-// hint into READY instead of parking on a waker that will never fire again.
+// REARM-3: push racing WAITING hint is not lost (S1 lock co-covers classify).
 // ============================================================================
 
-TEST_CASE("streaming_source REARM-2: a batch already queued turns the hint into READY",
+TEST_CASE("streaming_source REARM-3: a batch already queued turns the hint into READY",
           "[streaming_source][pipeline_completion]")
 {
   auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
@@ -1092,12 +1071,10 @@ TEST_CASE("streaming_source REARM-2: a batch already queued turns the hint into 
 }
 
 // ============================================================================
-// REARM-3: a source with no task_creator wired parks without crashing. The
-// waker resolves the creator through the pipeline at fire time, so a pipeline
-// built before the executor attached is a no-op, not a null dereference.
+// REARM-4: no task_creator wired → on_data is a no-op, not a null deref.
 // ============================================================================
 
-TEST_CASE("streaming_source REARM-3: a push with no task_creator wired is harmless",
+TEST_CASE("streaming_source REARM-4: a push with no task_creator wired is harmless",
           "[streaming_source][pipeline_completion]")
 {
   auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
@@ -1113,10 +1090,7 @@ TEST_CASE("streaming_source REARM-3: a push with no task_creator wired is harmle
 }
 
 // ============================================================================
-// SRC-26: a producer error reaches the puller as data, then as a throw.
-//
-// The failure travels the same waker → hint → pull path a batch does, because that is the only
-// path a source has: nothing else nominates a starved streaming source.
+// SRC-26: producer error reaches the puller via on_data → hint → rethrow (P4/S2).
 // ============================================================================
 
 TEST_CASE("streaming_source SRC-26: a producer error is rethrown to the puller",
@@ -1146,10 +1120,7 @@ TEST_CASE("streaming_source SRC-26: a producer error is rethrown to the puller",
 }
 
 // ============================================================================
-// SRC-27: an errored stream neither reports success nor wedges the scheduler.
-//
-// all_ports_empty() is error-aware, so a failed stream is never "empty-and-done" and the pipeline
-// cannot finish as if the query had succeeded. The drain loop still terminates — by the throw.
+// SRC-27: errored stream never finishes quietly (S3); drain loop exits by throw.
 // ============================================================================
 
 TEST_CASE("streaming_source SRC-27: an errored stream does not finish the pipeline quietly",

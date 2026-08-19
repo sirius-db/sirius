@@ -21,10 +21,14 @@
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
+#include <rmm/cuda_stream.hpp>
+#include <rmm/device_buffer.hpp>
+
 #include <cuda_runtime_api.h>
 
 #include <catch.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -272,4 +276,116 @@ TEST_CASE("owning_table_view generic owner materializes by copy", "[owning_table
   auto result_ptrs = data_ptrs(result->view());
   REQUIRE(result_ptrs[0] != original_ptrs[0]);
   REQUIRE(result_ptrs[1] != original_ptrs[2]);
+}
+
+// Stream-ordering regression: the copying materialization path must not let the
+// caller reclaim the source memory while the copy is still in flight.
+namespace {
+
+constexpr std::int32_t kSourceByte  = 0x01;  // source fill  -> 0x01010101
+constexpr std::int32_t kPoisonByte  = 0xFF;  // reclaim fill -> 0xFFFFFFFF
+constexpr std::int32_t kSourceValue = 0x01010101;
+constexpr std::int32_t kPoisonValue = -1;
+
+// Observations recorded at the moment the owner is destroyed.
+struct reclaim_probe {
+  cudaStream_t work_stream{};
+  cudaStream_t reclaim_stream{};
+  void* source_data{};
+  std::size_t source_bytes{};
+  cudaError_t stream_status_at_reclaim{cudaSuccess};
+  bool reclaimed{false};
+};
+
+// Stands in for the pinned-cache lock: while this owner lives the source memory
+// is valid, and destroying it lets the cache overwrite that memory. Move-only so
+// only the final owner performs the reclaim.
+struct reclaiming_owner {
+  std::shared_ptr<reclaim_probe> probe;
+  std::unique_ptr<cudf::table> source;
+
+  reclaiming_owner(std::shared_ptr<reclaim_probe> p, std::unique_ptr<cudf::table> s)
+    : probe(std::move(p)), source(std::move(s))
+  {
+  }
+  reclaiming_owner(reclaiming_owner&&)                 = default;
+  reclaiming_owner& operator=(reclaiming_owner&&)      = default;
+  reclaiming_owner(reclaiming_owner const&)            = delete;
+  reclaiming_owner& operator=(reclaiming_owner const&) = delete;
+
+  ~reclaiming_owner()
+  {
+    if (probe == nullptr || source == nullptr) { return; }  // moved-from
+    probe->reclaimed                = true;
+    probe->stream_status_at_reclaim = cudaStreamQuery(probe->work_stream);
+    // Simulate the cache reusing the chunk the instant the lock drops.
+    cudaMemsetAsync(probe->source_data, kPoisonByte, probe->source_bytes, probe->reclaim_stream);
+    cudaStreamSynchronize(probe->reclaim_stream);
+  }
+};
+
+}  // namespace
+
+TEST_CASE("owning_table_view release awaits the copy before the owner reclaims memory",
+          "[owning_table_view][stream_order]")
+{
+  // Non-blocking streams: the reclaim must not be implicitly ordered against the
+  // copy by legacy-default-stream semantics.
+  rmm::cuda_stream work_stream;
+  rmm::cuda_stream reclaim_stream;
+
+  constexpr cudf::size_type kRows = 4 * 1024 * 1024;  // 16 MiB of INT32
+  auto const kSourceBytes         = static_cast<std::size_t>(kRows) * sizeof(std::int32_t);
+
+  auto source       = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                          kRows,
+                                          cudf::mask_state::UNALLOCATED,
+                                          work_stream.view());
+  auto* source_data = source->mutable_view().data<std::int32_t>();
+  cudaMemsetAsync(source_data, kSourceByte, kSourceBytes, work_stream.value());
+  work_stream.synchronize();
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(source));
+  auto source_table      = std::make_unique<cudf::table>(std::move(cols));
+  auto const source_view = source_table->view();
+
+  auto probe            = std::make_shared<reclaim_probe>();
+  probe->work_stream    = work_stream.value();
+  probe->reclaim_stream = reclaim_stream.value();
+  probe->source_data    = source_data;
+  probe->source_bytes   = kSourceBytes;
+
+  // Queue a long blocker ahead of the copy so the materializing copy is
+  // guaranteed to still be pending when release() hands back control. Without
+  // the await this makes the race deterministic rather than probabilistic.
+  constexpr std::size_t kBlockerBytes = 256UL * 1024 * 1024;
+  rmm::device_buffer blocker(kBlockerBytes, work_stream.view(), test_mr());
+  for (int i = 0; i < 8; ++i) {
+    cudaMemsetAsync(blocker.data(), 0, kBlockerBytes, work_stream.value());
+  }
+
+  // View-backed handle over a NON-no_alloc_materializable owner -> copying path.
+  owning_table_view handle{reclaiming_owner{probe, std::move(source_table)}, source_view};
+  REQUIRE(handle.n_columns() == 1);
+
+  auto result = handle.release(work_stream.view(), test_mr());
+  REQUIRE(result != nullptr);
+
+  // The owner was destroyed by release(); the copy must already have completed.
+  REQUIRE(probe->reclaimed);
+  CHECK(probe->stream_status_at_reclaim == cudaSuccess);
+
+  // The materialized copy must hold the source values, not the reclaim poison.
+  std::vector<std::int32_t> host(static_cast<std::size_t>(kRows));
+  cudaMemcpy(host.data(),
+             result->view().column(0).data<std::int32_t>(),
+             kSourceBytes,
+             cudaMemcpyDeviceToHost);
+
+  auto const poisoned = std::count(host.begin(), host.end(), kPoisonValue);
+  INFO("poisoned elements: " << poisoned << " / " << kRows);
+  REQUIRE(poisoned == 0);
+  REQUIRE(host.front() == kSourceValue);
+  REQUIRE(host.back() == kSourceValue);
 }

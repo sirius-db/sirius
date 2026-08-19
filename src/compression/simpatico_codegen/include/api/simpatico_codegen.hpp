@@ -2,6 +2,7 @@
 #pragma once
 
 #include "codegen/plan/plan_interpreter.hpp"
+#include "codegen/selection/selection.hpp"
 #include "codegen/util/stream_pool.hpp"
 
 #include <cudf/table/table.hpp>
@@ -204,8 +205,9 @@ std::unique_ptr<cudf::table> decompress(
 /// The point is to skip the decode entirely for dictionary-compressed columns
 /// consumed only by an equality / IN filter: the predicate is resolved against
 /// the key set and mapped over the indices, so the key chars are never gathered
-/// into a full-width column. Use @c column_supports_predicate_decode to check
-/// that a column's plan can actually do this before pushing a predicate into it.
+/// into a full-width column. Use @c simpatico::probe_column's
+/// @c can_answer_equality to check that a column's plan can actually do this
+/// before pushing a predicate into it.
 ///
 /// @throws std::runtime_error if @p predicates and @p selected_columns differ in
 ///         size, or on the usual decompression failures.
@@ -216,9 +218,53 @@ std::unique_ptr<cudf::table> decompress(
   simpatico::stream_pool& pool,
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
 
-/// True iff column @p column_index of @p table resolves a predicate without
-/// materialising the column (i.e. its plan is dictionary-rooted). False for an
-/// out-of-range index or a column with no plan tree.
-bool column_supports_predicate_decode(const compressed_table& table, std::size_t column_index);
+/// Decompress a column subset with the caller's row filter applied DURING the
+/// decode (experimental, env gate SIRIUS_EXP_FUSED_SCAN_FILTER=1). @p request
+/// carries the conjuncts a decode can resolve plus the output shape tag per
+/// selected column (see codegen/selection/selection.hpp).
+///
+/// When the gate is on and every precondition holds, columns are decoded with
+/// the two-wave mask pipeline: wave 1 ballots each filter column's rows into
+/// mask words, the masks are AND-combined and counted (one host sync for the
+/// survivor count), then wave 2 decodes the compactable columns straight into
+/// survivor_count-row columns and the rest full width. @p result comes back
+/// with applied=true, the selection mask/offsets, and the gather map
+/// (row_indices) it used. The returned table is uniformly survivor-sized —
+/// the compacted routes came back that way and the full-width ones are
+/// compacted here — so the caller only has to skip its own filter pass.
+///
+/// When the gate is off, @p request is empty, or any precondition fails
+/// (non-bitpack filter column, nulls, ...), this is EXACTLY the unfiltered
+/// decompress(table, selected_columns, pool, mr) — same kernels, same
+/// allocations — returned as released columns, and result.applied is false.
+/// result.status refines the applied=false cases: `refused` (no device work),
+/// `declined_unselective` (too many rows survived for compaction to pay off —
+/// the caller should remember this per scan and drop the row selection from its
+/// remaining batches), or `failed` (mid-flight fallback, exceptional).
+///
+/// Equality conjuncts answerable off a dictionary ride INSIDE the request
+/// (scan_filter_request::bool8_filters): wave 1 resolves them via the
+/// decode_predicate path, packs the BOOL8 result to mask words and ANDs it into
+/// the batch mask. On ANY non-applied outcome with bool8_filters present, the
+/// rerun is the PREDICATED decompress — those columns come back as BOOL8
+/// substitution columns exactly like the ordinary pushdown, never a plain
+/// decode (the dictionary win survives every fallback). Callers must therefore
+/// be ready for BOOL8 at those columns whenever result.applied is false.
+/// Assembling the output can itself refuse (a null-masked column, an output
+/// that is neither full width nor survivor-sized): the call then falls back to
+/// the unfiltered decode, sets result.status = failed and writes @p error_out.
+/// A caller never sees a half-filtered batch.
+///
+/// Synchronizes @p stream before returning when the filtering applied, so the
+/// caller may free or rebind the inputs immediately.
+std::unique_ptr<cudf::table> decompress_scan_filter(
+  const compressed_table& table,
+  std::span<const std::size_t> selected_columns,
+  sirius::codegen::scan_filter_request const& request,
+  sirius::codegen::scan_filter_result& result,
+  simpatico::stream_pool& pool,
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
+  std::string* error_out            = nullptr);
 
 }  // namespace simpatico

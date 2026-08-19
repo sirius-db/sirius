@@ -85,6 +85,20 @@ Sirius uses [CODEOWNERS](.github/CODEOWNERS) to automatically route PRs to the r
 
 Approval from any maintainer is sufficient to merge — it does not have to be the auto-assigned reviewer.
 
+The component teams can also be mentioned directly in PR comments and issues to bring the right people into a discussion without a Slack ping — useful when you need expert input on a specific area:
+
+| Team | Components |
+|------|------------|
+| `@sirius-db/sirius-core` | Planner, Executors, Operators & Expressions |
+| `@sirius-db/sirius-io` | Scan & I/O, Memory & Compression |
+| `@sirius-db/sirius-integrations` | Integrations |
+| `@sirius-db/sirius-telemetry` | Telemetry & Observability |
+| `@sirius-db/sirius-cmake` | CMake |
+| `@sirius-db/sirius-build` | CI & Build |
+| `@sirius-db/sirius-docs` | Documentation |
+| `@sirius-db/sirius-rust` | Rust |
+| `@sirius-db/sirius-python` | Python |
+
 When you open or update a PR, you will also be automatically assigned as the author. This helps maintainers track ownership and is not a request for you to review your own work.
 
 ### Commit and title convention

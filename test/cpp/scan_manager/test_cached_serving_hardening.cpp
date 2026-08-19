@@ -120,18 +120,27 @@ int32_t cell(std::size_t chunk, std::size_t col, std::size_t row)
 
 using sirius::pinned_column_storage_meta;
 
-pinned_column_storage_meta narrow_meta(cudf::data_type carrier) { return {carrier, true}; }
+// The serve-site conversion fixtures never read the recorded pin-time native, so it defaults to
+// the EMPTY sentinel; the plan-gate fixtures (pinned_column_narrow_carrier) pass it explicitly.
+pinned_column_storage_meta narrow_meta(cudf::data_type carrier,
+                                       cudf::data_type native = cudf::data_type{
+                                         cudf::type_id::EMPTY})
+{
+  return {carrier, true, native};
+}
 pinned_column_storage_meta native_meta(cudf::data_type carrier) { return {carrier, false}; }
 
 // Storage-metadata row of same-carrier cells with the given narrowed flags — the common shape of
 // hand-built fixtures whose stored columns share one type.
 std::vector<pinned_column_storage_meta> meta_row(cudf::data_type carrier,
-                                                 std::initializer_list<bool> narrowed)
+                                                 std::initializer_list<bool> narrowed,
+                                                 cudf::data_type native = cudf::data_type{
+                                                   cudf::type_id::EMPTY})
 {
   std::vector<pinned_column_storage_meta> row;
   row.reserve(narrowed.size());
   for (bool const flag : narrowed) {
-    row.push_back({carrier, flag});
+    row.push_back({carrier, flag, native});
   }
   return row;
 }
@@ -881,15 +890,17 @@ TEST_CASE("pinned_column_narrow_carrier derives the widest recorded carrier per 
   auto const int16{cudf::data_type{cudf::type_id::INT16}};
   auto const int8{cudf::data_type{cudf::type_id::INT8}};
 
-  // Single-column entry whose chunk c records @p carriers[c], all marked narrowed so the
-  // derivation (not the marker fold) is what each section probes. The fold reads only the
-  // recorded metadata, so the fixture carries no storage at all.
-  auto make_single_column_meta_entry = [](std::vector<cudf::data_type> const& carriers) {
+  // Single-column entry whose chunk c records `carriers[c]` (with `native` as the pin-time
+  // native type), all marked narrowed so the derivation (not the marker fold) is what each
+  // section probes. The fold reads only the recorded metadata, so the fixture carries no storage
+  // at all.
+  auto make_single_column_meta_entry = [](std::vector<cudf::data_type> const& carriers,
+                                          cudf::data_type native) {
     pinned_entry entry;
     set_cached_columns(entry, {"k"});
     entry.tier = cucascade::memory::Tier::GPU;
     for (auto const type : carriers) {
-      entry.column_storage.push_back({narrow_meta(type)});
+      entry.column_storage.push_back({narrow_meta(type, native)});
     }
     entry.num_rows = carriers.size() * 4;
     return entry;
@@ -897,7 +908,7 @@ TEST_CASE("pinned_column_narrow_carrier derives the widest recorded carrier per 
 
   SECTION("uniform carrier")
   {
-    auto entry        = make_single_column_meta_entry({int32, int32, int32});
+    auto entry        = make_single_column_meta_entry({int32, int32, int32}, int64);
     auto const target = sirius::scan_manager::pinned_column_narrow_carrier(entry, 0, int64);
     REQUIRE(target.has_value());
     REQUIRE(*target == int32);
@@ -905,16 +916,40 @@ TEST_CASE("pinned_column_narrow_carrier derives the widest recorded carrier per 
 
   SECTION("mixed widths derive the widest")
   {
-    auto entry        = make_single_column_meta_entry({int8, int16, int32});
+    auto entry        = make_single_column_meta_entry({int8, int16, int32}, int64);
     auto const target = sirius::scan_manager::pinned_column_narrow_carrier(entry, 0, int64);
     REQUIRE(target.has_value());
     REQUIRE(*target == int32);
   }
 
+  SECTION("a drifted or unrecorded pin-time native yields nullopt")
+  {
+    // Same carriers, same widths -- only the recorded native differs. TIMESTAMP_DAYS and INT32
+    // share the int32 representation, so this drop/recreate drift is exactly the case the
+    // same-family width checks alone cannot catch.
+    auto const timestamp_days = cudf::data_type{cudf::type_id::TIMESTAMP_DAYS};
+    auto date_pin             = make_single_column_meta_entry({int16, int16}, timestamp_days);
+    REQUIRE(
+      sirius::scan_manager::pinned_column_narrow_carrier(date_pin, 0, timestamp_days).has_value());
+    REQUIRE_FALSE(
+      sirius::scan_manager::pinned_column_narrow_carrier(date_pin, 0, int32).has_value());
+
+    auto integer_pin = make_single_column_meta_entry({int16, int16}, int32);
+    REQUIRE_FALSE(sirius::scan_manager::pinned_column_narrow_carrier(integer_pin, 0, timestamp_days)
+                    .has_value());
+
+    // An EMPTY (never recorded) native reads as a mismatch defensively.
+    auto unrecorded =
+      make_single_column_meta_entry({int16, int16}, cudf::data_type{cudf::type_id::EMPTY});
+    REQUIRE_FALSE(
+      sirius::scan_manager::pinned_column_narrow_carrier(unrecorded, 0, int64).has_value());
+  }
+
   SECTION("a false marker yields nullopt")
   {
-    auto entry           = make_single_column_meta_entry({int8, int16, int32});
-    entry.column_storage = {{narrow_meta(int8)}, {native_meta(int16)}, {narrow_meta(int32)}};
+    auto entry           = make_single_column_meta_entry({int8, int16, int32}, int64);
+    entry.column_storage = {
+      {narrow_meta(int8, int64)}, {native_meta(int16)}, {narrow_meta(int32, int64)}};
     REQUIRE_FALSE(sirius::scan_manager::pinned_column_narrow_carrier(entry, 0, int64).has_value());
     entry.column_storage = {};
     REQUIRE_FALSE(sirius::scan_manager::pinned_column_narrow_carrier(entry, 0, int64).has_value());
@@ -922,7 +957,7 @@ TEST_CASE("pinned_column_narrow_carrier derives the widest recorded carrier per 
 
   SECTION("a zero-chunk entry yields nullopt")
   {
-    auto entry = make_single_column_meta_entry({});
+    auto entry = make_single_column_meta_entry({}, int64);
     REQUIRE_FALSE(sirius::scan_manager::pinned_column_narrow_carrier(entry, 0, int64).has_value());
   }
 
@@ -930,12 +965,12 @@ TEST_CASE("pinned_column_narrow_carrier derives the widest recorded carrier per 
   {
     // Cross-family: an unsigned recorded carrier against a signed native carrier.
     auto cross_family =
-      make_single_column_meta_entry({int8, cudf::data_type{cudf::type_id::UINT16}, int32});
+      make_single_column_meta_entry({int8, cudf::data_type{cudf::type_id::UINT16}, int32}, int64);
     REQUIRE_FALSE(
       sirius::scan_manager::pinned_column_narrow_carrier(cross_family, 0, int64).has_value());
 
     // Not a strict narrowing: a chunk recorded at the native width.
-    auto native_width = make_single_column_meta_entry({int8, int64});
+    auto native_width = make_single_column_meta_entry({int8, int64}, int64);
     REQUIRE_FALSE(
       sirius::scan_manager::pinned_column_narrow_carrier(native_width, 0, int64).has_value());
   }
@@ -945,14 +980,14 @@ TEST_CASE("pinned_column_narrow_carrier derives the widest recorded carrier per 
     auto const decimal32_s2{cudf::data_type{cudf::type_id::DECIMAL32, -2}};
     auto const decimal64_s2{cudf::data_type{cudf::type_id::DECIMAL64, -2}};
 
-    auto entry        = make_single_column_meta_entry({decimal32_s2, decimal32_s2});
+    auto entry        = make_single_column_meta_entry({decimal32_s2, decimal32_s2}, decimal64_s2);
     auto const target = sirius::scan_manager::pinned_column_narrow_carrier(entry, 0, decimal64_s2);
     REQUIRE(target.has_value());
     REQUIRE(*target == decimal32_s2);
 
     // A chunk with a different cuDF scale is outside the carrier family.
-    auto mixed_scale =
-      make_single_column_meta_entry({decimal32_s2, cudf::data_type{cudf::type_id::DECIMAL32, -1}});
+    auto mixed_scale = make_single_column_meta_entry(
+      {decimal32_s2, cudf::data_type{cudf::type_id::DECIMAL32, -1}}, decimal64_s2);
     REQUIRE_FALSE(
       sirius::scan_manager::pinned_column_narrow_carrier(mixed_scale, 0, decimal64_s2).has_value());
   }
@@ -961,7 +996,7 @@ TEST_CASE("pinned_column_narrow_carrier derives the widest recorded carrier per 
   {
     auto const decimal64_s0{cudf::data_type{cudf::type_id::DECIMAL64, 0}};
     auto const decimal128_s0{cudf::data_type{cudf::type_id::DECIMAL128, 0}};
-    auto entry = make_single_column_meta_entry({decimal64_s0, decimal64_s0});
+    auto entry = make_single_column_meta_entry({decimal64_s0, decimal64_s0}, decimal128_s0);
     auto const decimal_target =
       sirius::scan_manager::pinned_column_narrow_carrier(entry, 0, decimal128_s0);
     REQUIRE(decimal_target.has_value());
@@ -972,7 +1007,7 @@ TEST_CASE("pinned_column_narrow_carrier derives the widest recorded carrier per 
   SECTION("out-of-range entry_position yields nullopt")
   {
     // A position beyond the recorded rows fails the marker fold.
-    auto entry           = make_single_column_meta_entry({int8, int16});
+    auto entry           = make_single_column_meta_entry({int8, int16}, int64);
     entry.column_storage = {meta_row(int8, {true, true}), meta_row(int16, {true, true})};
     REQUIRE_FALSE(sirius::scan_manager::pinned_column_narrow_carrier(entry, 2, int64).has_value());
   }
@@ -982,7 +1017,7 @@ TEST_CASE("pinned_column_narrow_carrier derives the widest recorded carrier per 
     // The matrix and the entry's column list disagree, which insertion would have rejected. This
     // runs at plan time, on an entry no serving validator has inspected, so the narrower of the
     // two authorities wins rather than the fold answering from an unvalidated cell.
-    auto entry           = make_single_column_meta_entry({int8, int16});
+    auto entry           = make_single_column_meta_entry({int8, int16}, int64);
     entry.column_storage = {meta_row(int8, {true, true, true}),
                             meta_row(int16, {true, true, true})};
     REQUIRE_FALSE(sirius::scan_manager::pinned_column_narrow_carrier(entry, 2, int64).has_value());
@@ -1446,8 +1481,8 @@ TEST_CASE("pinned_column_narrow_carrier derives from recorded metadata on compre
   SECTION("compression-enabled device entry (device_chunks form)")
   {
     auto entry           = make_device_chunks_entry(*e.gpu_space, /*n_chunks=*/2, /*rows=*/4);
-    entry.column_storage = {meta_row(int32, {true, true, true}),
-                            meta_row(int32, {true, true, true})};
+    entry.column_storage = {meta_row(int32, {true, true, true}, int64),
+                            meta_row(int32, {true, true, true}, int64)};
     auto const target =
       sirius::scan_manager::pinned_column_narrow_carrier(entry, /*entry_position=*/1, int64);
     REQUIRE(target.has_value());
@@ -1468,7 +1503,7 @@ TEST_CASE("pinned_column_narrow_carrier derives from recorded metadata on compre
       /*uncompressed_bytes=*/256,
       /*num_rows=*/4));
     entry.num_rows       = 4;
-    entry.column_storage = {{narrow_meta(int32)}};
+    entry.column_storage = {{narrow_meta(int32, int64)}};
 
     auto const target =
       sirius::scan_manager::pinned_column_narrow_carrier(entry, /*entry_position=*/0, int64);
