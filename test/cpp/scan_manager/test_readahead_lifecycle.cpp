@@ -292,9 +292,13 @@ struct single_scan_order {
 
 }  // namespace
 
-TEST_CASE("later groups fill idle readahead budget as soon as a split is registered",
+TEST_CASE("a later group is not read ahead of while the preferred group is still open",
           "[scan_manager][readahead]")
 {
+  // Every pipeline's metadata is parsed in parallel, so a later group can
+  // register a split before the preferred group registers its first.  Taking it
+  // would issue IO in the opposite order to the one the executor reads in, so
+  // the budget is left idle until the preferred group can emit nothing more.
   constexpr std::size_t FIRST = 10;
   constexpr std::size_t LATER = 20;
   test_scan first{FIRST};
@@ -308,20 +312,21 @@ TEST_CASE("later groups fill idle readahead budget as soon as a split is registe
   m.prepare_for_order(steps);
   m.start(1);
 
-  // The preferred group has emitted nothing. Registration of a later group's
-  // split must wake the worker, which should select it as lookahead rather than
-  // leave the budget idle.
   auto split = std::make_shared<test_split>();
   m.register_scan_task(split, LATER);
+  for (int i = 0; i < 50; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  // FIRST has not closed, so it may still emit: the later split waits its turn.
+  CHECK(m.has_unprefetched_work());
+
+  // Once the preferred group closes it can produce nothing further, and reading
+  // ahead no longer risks inverting the order.
+  m.mark_operator_closed(FIRST);
   for (int i = 0; i < 100 && m.has_unprefetched_work(); ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
-
   CHECK_FALSE(m.has_unprefetched_work());
-  // Lookahead must not consume or advance the preferred group's cursor.
-  auto* preferred = m.get_next_prefetching_operator();
-  REQUIRE(preferred != nullptr);
-  CHECK(preferred->get_operator_id() == FIRST);
   m.stop();
 }
 

@@ -230,6 +230,13 @@ struct chunk_fill {
 /// chunk) implies for the chunk at @p chunk_off.  Magnitudes are rounded out to
 /// whole pages, so an interior read conservatively fills to the nearer chunk
 /// edge — it over-reads the head or tail, never the whole chunk.
+///
+/// An extent is edge-anchored (see @ref chunk_fill), so a request touching
+/// neither edge cannot be recorded as-is and has to widen to one of them.  Both
+/// widenings are correct; this picks whichever fetches less, which for a request
+/// near the head is the head.  Anchoring unconditionally to the tail — the
+/// obvious reading of "starts inside the chunk, so it is a suffix" — costs the
+/// whole rest of the chunk for a request sitting one page in.
 [[nodiscard]] constexpr chunk_fill needed_fill(std::size_t chunk_off,
                                                std::size_t chunk_bytes,
                                                std::size_t req_lo,
@@ -241,12 +248,14 @@ struct chunk_fill {
   if (lo >= hi) { return chunk_fill::unset(); }  // no overlap
   if (lo <= chunk_off && hi >= chunk_off + chunk_bytes) { return chunk_fill::whole(); }
 
-  auto const bytes = lo <= chunk_off
-                       ? std::min(align_up(hi - chunk_off, page), chunk_bytes)
-                       : std::min((chunk_off + chunk_bytes) - align_down(lo, page), chunk_bytes);
+  // Both shapes contain [lo, hi); the smaller one is the one worth reading.
+  auto const prefix_bytes = std::min(align_up(hi - chunk_off, page), chunk_bytes);
+  auto const suffix_bytes = std::min((chunk_off + chunk_bytes) - align_down(lo, page), chunk_bytes);
+  bool const prefer_prefix = prefix_bytes <= suffix_bytes;
+  auto const bytes         = prefer_prefix ? prefix_bytes : suffix_bytes;
   if (bytes >= chunk_bytes) { return chunk_fill::whole(); }
   auto const pages = static_cast<std::uint16_t>(bytes / page);
-  return lo <= chunk_off ? chunk_fill::prefix_of(pages) : chunk_fill::suffix_of(pages);
+  return prefer_prefix ? chunk_fill::prefix_of(pages) : chunk_fill::suffix_of(pages);
 }
 
 // ---------------------------------------------------------------------------

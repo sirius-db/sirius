@@ -80,16 +80,17 @@ load_balancing_scan_batch_coalescer::get_split_provider_bridge(
   };
 }
 
-void load_balancing_scan_batch_coalescer::worker_loop([[maybe_unused]] std::stop_token const& stop)
+void load_balancing_scan_batch_coalescer::slot_loop(std::size_t pipeline_id,
+                                                    std::stop_token const& stop)
 {
-  for (auto pipeline_id : _pipeline_order) {
-    if (stop.stop_requested()) { break; }
-    auto& state = *_slots.at(pipeline_id);
-    if (state.batch_provider) {
-      process_cached_entries(state, stop);
-    } else {
-      process_provider_inputs(state, stop);
-    }
+  if (stop.stop_requested()) { return; }
+  auto it = _slots.find(pipeline_id);
+  if (it == _slots.end()) { return; }
+  auto& state = *it->second;
+  if (state.batch_provider) {
+    process_cached_entries(state, stop);
+  } else {
+    process_provider_inputs(state, stop);
   }
 }
 
@@ -201,8 +202,7 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(
 {
   // See process_provider_inputs: the readahead needs "no more splits" on every
   // exit, success or failure, or the operator can never be retired.
-  auto close_slot = [&connector, &readahead, operator_id](
-                      std::exception_ptr const& ex = nullptr) {
+  auto close_slot = [&connector, &readahead, operator_id](std::exception_ptr const& ex = nullptr) {
     if (readahead) { readahead->mark_operator_closed(operator_id); }
     connector.close(ex);
   };

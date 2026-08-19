@@ -180,6 +180,16 @@ void readahead_scan_manager::register_scan_task(std::shared_ptr<op::scan::scan_i
   _cv.notify_one();
 }
 
+bool readahead_scan_manager::group_is_closed_locked(std::span<const std::size_t> operator_ids) const
+{
+  // An operator with no entry has registered nothing and been told nothing, so
+  // it is still expected to emit -- the conservative answer is "not closed".
+  return std::ranges::all_of(operator_ids, [this](std::size_t id) {
+    auto it = _by_operator.find(id);
+    return it != _by_operator.end() && it->second.closed;
+  });
+}
+
 bool readahead_scan_manager::is_operator_depleted(std::size_t operator_id) const
 {
   auto it = _by_operator.find(operator_id);
@@ -350,9 +360,17 @@ readahead_scan_manager::collect_prefetch_batch_locked()
       if (chosen != nullptr) { break; }
     }
 
-    // Nothing in the current group can use this slot: walk later groups rather than idle.
+    // Nothing in the current group can use this slot.  Read ahead into later
+    // groups ONLY once this one can emit nothing further.
+    //
+    // Every pipeline's metadata is parsed in parallel, so a later pipeline can
+    // register its splits before the head pipeline registers its first.  A group
+    // that is merely empty *right now* is still going to emit, and prefetching
+    // past it would issue IO in the opposite order to the one the executor reads
+    // in -- spending the budget on splits nobody wants yet while the pipeline
+    // actually running waits for its own.  Idling here is the cheaper mistake.
     bool lookahead = false;
-    if (chosen == nullptr) {
+    if (chosen == nullptr && group_is_closed_locked(candidates)) {
       for (auto const id : _scheduler.peek_lookahead_operator_ids()) {
         auto op_it = _by_operator.find(id);
         if (op_it == _by_operator.end()) { continue; }

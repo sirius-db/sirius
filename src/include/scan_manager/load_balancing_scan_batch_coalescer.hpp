@@ -169,20 +169,34 @@ class load_balancing_scan_batch_coalescer {
                                     std::shared_ptr<readahead_scan_manager> readahead = nullptr,
                                     std::size_t operator_id                           = 0);
 
-  /// Spawn the sequencer task on @p dispatcher.  The dispatcher must
-  /// expose @c enqueue(callable) and inject a @c std::stop_token when
-  /// the callable asks for one (e.g. @c scoped_dispatcher).  Call once
-  /// after all slots have been added — the task captures the slot list
-  /// by reference, so adding slots after this call has undefined
-  /// ordering with respect to the sequencer walk.
+  /// Spawn one sequencer task per slot on @p dispatcher.  The dispatcher must
+  /// expose @c enqueue(callable) and inject a @c std::stop_token when the
+  /// callable asks for one (e.g. @c scoped_dispatcher).  Call once after all
+  /// slots have been added — each task captures its slot by id, so adding slots
+  /// after this call leaves them without a sequencer.
+  ///
+  /// One task per slot rather than one walking them in order: a slot blocks in
+  /// @c wait_dequeue until its own metadata arrives, so a single walker cannot
+  /// emit pipeline N+1's splits until pipeline N has closed, and the readahead's
+  /// cross-pipeline lookahead then never has anything to find.
+  ///
+  /// @warning @p dispatcher must NOT be the one running the metadata tasks that
+  /// feed these slots.  These tasks block waiting for that work, so sharing a
+  /// bounded dispatcher lets them occupy every slot and starve the producers
+  /// they are waiting on — a deadlock, not merely slow.
   template <class Dispatcher>
   void spawn_workers(Dispatcher& dispatcher)
   {
-    dispatcher.enqueue([this](std::stop_token const& stop) { worker_loop(stop); });
+    for (auto pipeline_id : _pipeline_order) {
+      dispatcher.enqueue(
+        [this, pipeline_id](std::stop_token const& stop) { slot_loop(pipeline_id, stop); });
+    }
   }
 
  private:
-  void worker_loop(std::stop_token const& stop);
+  /// Drain one slot to completion.  Runs concurrently with the other slots'
+  /// loops, so everything it touches is per-slot state.
+  void slot_loop(std::size_t pipeline_id, std::stop_token const& stop);
 
   void process_provider_inputs(metadata_processing_state& state, std::stop_token const& stop);
 

@@ -174,6 +174,13 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   /// mark_operator_closed distinguishes the two.
   [[nodiscard]] bool is_operator_depleted(std::size_t operator_id) const;
 
+  /// True when every operator in @p operator_ids has had its producer close, so
+  /// the group will emit no further splits.  Gates read-ahead into later groups:
+  /// a group that is only momentarily empty must be waited for, not skipped, or
+  /// the prefetch order stops matching the execution order.  Caller must hold
+  /// @ref _mutex.
+  [[nodiscard]] bool group_is_closed_locked(std::span<const std::size_t> operator_ids) const;
+
   /// Publish the operator's progress to the scheduler: @c disposed once the
   /// operator is depleted, otherwise @p reported — except that a bare
   /// @c disposed from one split is swallowed, since that is the scheduler's

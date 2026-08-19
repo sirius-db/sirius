@@ -95,11 +95,31 @@ TEST_CASE("needed_fill anchors an extent to the nearer chunk edge", "[cache][fil
     CHECK(f == chunk_fill::suffix_of(2));
   }
 
-  SECTION("an interior request fills out to the tail, never the whole chunk")
+  SECTION("an interior request nearer the tail becomes a suffix, never the whole chunk")
   {
     auto const f = needed_fill(OFF, CHUNK, OFF + 8 * PAGE, OFF + 9 * PAGE);
-    CHECK(f == chunk_fill::suffix_of(8));
+    CHECK(f == chunk_fill::suffix_of(8));  // 8 pages to the tail vs 9 to the head
     CHECK_FALSE(f.full);
+  }
+
+  SECTION("an interior request nearer the head becomes a prefix")
+  {
+    // The case anchoring unconditionally to the tail gets badly wrong: one page
+    // sitting one page in costs 2 pages as a prefix and CHUNK-1 as a suffix.
+    auto const f = needed_fill(OFF, CHUNK, OFF + PAGE, OFF + 2 * PAGE);
+    CHECK(f == chunk_fill::prefix_of(2));
+    CHECK_FALSE(f.full);
+  }
+
+  SECTION("an interior request is covered by whichever edge it is anchored to")
+  {
+    // Whatever shape is chosen must contain the bytes that motivated it.
+    for (std::size_t start = 0; start < CHUNK / PAGE; ++start) {
+      auto const lo = OFF + start * PAGE;
+      auto const hi = lo + PAGE;
+      auto const f  = needed_fill(OFF, CHUNK, lo, hi);
+      CHECK(covers(f, OFF, CHUNK, lo, hi));
+    }
   }
 
   SECTION("a sub-page request is rounded out to whole pages")

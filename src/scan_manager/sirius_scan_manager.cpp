@@ -708,95 +708,34 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   _pending_mvcc_mask_jobs.clear();
   _pending_insert_delta_jobs.clear();
 
-  prepare_scans_for_processing(_scan_op_order);
-
   start_metadata_processing();
-}
-
-void sirius_scan_manager::prepare_scans_for_processing(
-  std::span<op::scan::sirius_gpu_scan_operator* const> scans) noexcept
-{
-  CTRACK_NAME("warmup::prepare_scans");
-  // Gather every distinct file across every scan, skipping the ones already
-  // parsed.  Distinct matters: two scans of the same table would otherwise each
-  // fetch the same footers.
-  std::vector<std::string> to_warm;
-  std::unordered_set<std::string> seen;
-  for (auto* op : scans) {
-    if (op == nullptr) { continue; }
-    try {
-      for (auto const& path : op->get_ingestible().table_info().file_paths()) {
-        auto key = normalize_path(path);
-        if (!seen.insert(key).second) { continue; }
-        auto io_ctx = ioctx_for_path(key);
-        if (!io_ctx) { continue; }  // no backend: leave it to the normal path
-        if (io_ctx->metadata_store().get_metadata(key) != nullptr) { continue; }
-        to_warm.push_back(std::move(key));
-      }
-    } catch (const std::exception& e) {
-      // Best effort: a scan we cannot enumerate simply warms nothing.
-      SIRIUS_LOG_DEBUG("prepare_scans_for_processing: cannot enumerate a scan's files: {}",
-                       e.what());
-    }
-  }
-  if (to_warm.empty()) { return; }
-
-  // Issued together so the reads overlap each other rather than a pipeline's
-  // data traffic.
-  CTRACK_NAME("warmup::fanout(blocked)");
-  std::latch done(static_cast<std::ptrdiff_t>(to_warm.size()));
-  for (auto& key : to_warm) {
-    _dispatcher->enqueue([this, path = std::move(key), &done]() mutable {
-      try {
-        CTRACK_NAME("warmup::file");
-        std::shared_ptr<sirius::io::sirius_datasource> datasource;
-        {
-          // The suffix-range probe: one blocking GET per file, and the part
-          // most likely to dominate.
-          CTRACK_NAME("warmup::file::open_probe");
-          datasource = create_datasource(path, sirius::io::open_hint::parquet_footer_probe);
-        }
-        if (datasource) {
-          std::unique_ptr<cudf::io::datasource::buffer> footer;
-          {
-            // Served from the probe's stash when it landed; a real read if not.
-            CTRACK_NAME("warmup::file::fetch_footer");
-            footer = cudf::io::parquet::fetch_footer_to_host(*datasource);
-          }
-          auto const bytes = footer->size();
-          auto opts        = cudf::io::parquet_reader_options::builder().build();
-          std::shared_ptr<cudf::io::parquet::FileMetaData const> meta;
-          {
-            CTRACK_NAME("warmup::file::thrift_parse");
-            cudf::io::parquet::experimental::hybrid_scan_reader reader{
-              cudf::host_span<std::uint8_t const>(footer->data(), footer->size()), opts};
-            meta =
-              std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata());
-          }
-          std::ignore = datasource->store_metadata(
-            std::make_shared<op::scan::parquet_metadata>(std::move(meta), bytes));
-        }
-      } catch (const std::exception& e) {
-        // A file that cannot be warmed is not an error: split production will
-        // fetch its footer the old way, and report the failure properly there.
-        SIRIUS_LOG_DEBUG("prepare_scans_for_processing: {} not warmed: {}", path, e.what());
-      } catch (...) {
-        SIRIUS_LOG_DEBUG("prepare_scans_for_processing: {} not warmed: unknown error", path);
-      }
-      done.count_down();
-    });
-  }
-  done.wait();
 }
 
 void sirius_scan_manager::start_metadata_processing()
 {
-  _metadata_processor->spawn_workers(*_dispatcher);
+  // ORDER IS LOAD-BEARING: every producer must be enqueued before the first
+  // consumer.
+  //
+  // The slot loops block in wait_dequeue until their own metadata arrives, and
+  // the dispatcher runs at most `max_inflight` tasks with the overflow held in a
+  // FIFO pending queue that only drains when a running task finishes.  Enqueue
+  // the consumers first and, on any plan with at least `max_inflight` scans,
+  // they take every slot and park -- waiting on producers that are stuck behind
+  // them in the queue and can never be dispatched.  That is a hang, not a
+  // slowdown.
+  //
+  // Producers do no waiting of their own: each parses one file's footer and
+  // pushes into an unbounded lock-free queue, so once dispatched they always
+  // finish and hand the slot on.  Putting them ahead of the consumers therefore
+  // guarantees the whole batch drains, and the consumers that follow find their
+  // splits already queued -- which is also what gives the readahead a backlog
+  // across every pipeline at once instead of one pipeline at a time.
   for (auto* op : _scan_op_order) {
     auto it = _providers_by_op.find(op);
     if (it == _providers_by_op.end()) { continue; }
     it->second->run(*_dispatcher, _metadata_processor->get_split_provider_bridge(op));
   }
+  _metadata_processor->spawn_workers(*_dispatcher);
 }
 
 std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datasource(

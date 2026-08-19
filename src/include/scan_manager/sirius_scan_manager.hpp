@@ -623,23 +623,9 @@ class sirius_scan_manager {
   [[nodiscard]] std::size_t s3_list_max_matches(std::string const& s3_uri);
 
  private:
-  /// Fetch and park every scan's file metadata before any scan task can run.
-  ///
-  /// Metadata reads and data reads share one request queue per backend. Left to
-  /// itself the manager parses one pipeline's metadata while that pipeline's
-  /// scans are already issuing data GETs, so the next pipeline's footer reads
-  /// land behind a queue of them and cannot complete until the first pipeline's
-  /// scans do -- the pipelines serialise on the queue rather than overlapping.
-  ///
-  /// Doing every file's footer first, concurrently, costs one small read per
-  /// file at a point when the queue is empty, and leaves split production with
-  /// no IO to do at all. Files already in the metadata store are skipped, so a
-  /// warm re-bind pays nothing. Parquet only: a duckdb database is one file and
-  /// has no per-file footer to gather.
-  void prepare_scans_for_processing(
-    std::span<op::scan::sirius_gpu_scan_operator* const> scans) noexcept;
-
-  /// \brief Run providers sequentially: start each, wait on its future, advance.
+  /// \brief Enqueue every file's metadata task, then the per-slot coalescer
+  /// loops.  See the definition: the producer-before-consumer order is what
+  /// keeps the shared dispatcher from deadlocking.
   void start_metadata_processing();
 
   /// One matched (scan op ← pinned entry) pairing from the cache-match pass.

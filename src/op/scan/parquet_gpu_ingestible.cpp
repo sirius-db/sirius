@@ -586,9 +586,12 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
     }
   }
   if (!file_metadata) {
-    // Reached only when warming missed this file; the fetch+parse it does here
-    // is exactly the work prepare_scans_for_processing exists to have already done.
-    CTRACK_NAME("split::footer_fetch_parse(missed_warm)");
+    // The normal path: this metadata task owns its file's footer fetch + parse.
+    // One task per file, all dispatched before any consumer runs, so the parses
+    // overlap each other rather than a pipeline's data traffic.  A prior bind
+    // (or a pin) may have already stored the metadata, in which case the branch
+    // above serves it and this costs nothing.
+    CTRACK_NAME("split::footer_fetch_parse");
     auto footer           = cudf::io::parquet::fetch_footer_to_host(*sirius_ds);
     auto const footer_len = footer->size();
     hybrid_scan_reader footer_reader(cudf::host_span<uint8_t const>(footer->data(), footer->size()),
