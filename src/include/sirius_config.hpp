@@ -81,7 +81,10 @@ constexpr double DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO = 8.0;
 /// probe row count. Sirius already implements both, but the distinct path is gated on a *proof* of
 /// uniqueness, which only a declared PRIMARY KEY on a catalog table can supply. The runtime test is
 /// one cudf::distinct_count pass over the build keys, taken only in BUILD_PROBE mode.
-constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = true;
+///
+/// Temporarily off by default (issue #1600): cudf::distinct_count can hit a cuCollections bug
+/// (NVIDIA/cuCollections#834) on some key distributions. Re-enable once the fix ships in libcudf.
+constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
 }  // namespace config
 
@@ -149,6 +152,17 @@ struct operator_params {
   /// Skip publishing a key's dynamic filters when the build covers at least this fraction of the
   /// key's domain (rows gate and zone-map range gate). Values >= 1.0 effectively disable the gate.
   double dynamic_filter_domain_coverage_threshold = 0.9;
+
+  /// Maximum estimated cuco-set size for the exact hash IN-list membership filter, as a fraction of
+  /// the smallest queried probe-GPU L2 cache (cudaDevAttrL2CacheSize), in [0, 1]. Larger sets
+  /// publish a Bloom filter instead: a streaming probe evicts a near-L2-sized set every pass, where
+  /// the smaller Bloom bit array stays cache-resident. A GB300 residency sweep measured the
+  /// IN-list's probe cost flat below ~0.28 of L2 and steadily degrading beyond, with the (inexact)
+  /// Bloom probing >= 2.2x faster at every swept size; the default 0.125 sits inside that flat
+  /// region, keeping the exact filter only where exactness costs the least. 0 always publishes the
+  /// Bloom when the key type supports it; 1.0 reproduces the legacy L2-fit rule. Ignored when no
+  /// device L2 size is available (the legacy fit rule then applies unchanged).
+  double dynamic_filter_inlist_max_l2_fraction = 0.125;
 
   /// Consumer-side scan gate: disable a scan's post-decode dynamic filtering once a measured split
   /// keeps more than this fraction of its rows (too unselective to repay the mask kernel). In

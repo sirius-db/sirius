@@ -387,6 +387,12 @@ TEST_CASE("Sirius YAML rejects invalid dynamic-filter thresholds", "[sirius][con
     {"invalid_dynamic_filter_keep_threshold_negative.yaml", "dynamic_filter_keep_threshold"},
     {"invalid_dynamic_filter_keep_threshold_above_one.yaml", "dynamic_filter_keep_threshold"},
     {"invalid_dynamic_filter_keep_threshold_nan.yaml", "dynamic_filter_keep_threshold"},
+    {"invalid_dynamic_filter_inlist_max_l2_fraction_negative.yaml",
+     "dynamic_filter_inlist_max_l2_fraction"},
+    {"invalid_dynamic_filter_inlist_max_l2_fraction_above_one.yaml",
+     "dynamic_filter_inlist_max_l2_fraction"},
+    {"invalid_dynamic_filter_inlist_max_l2_fraction_nan.yaml",
+     "dynamic_filter_inlist_max_l2_fraction"},
   };
 
   for (auto const& invalid : cases) {
@@ -404,6 +410,7 @@ TEST_CASE("Sirius YAML rejects invalid dynamic-filter thresholds", "[sirius][con
     config.load_from_file(data_dir / "valid_dynamic_filter_threshold_boundaries.yaml"));
   REQUIRE(config.get_operator_params().dynamic_filter_domain_coverage_threshold == Approx(1.5));
   REQUIRE(config.get_operator_params().dynamic_filter_keep_threshold == Approx(0.0));
+  REQUIRE(config.get_operator_params().dynamic_filter_inlist_max_l2_fraction == Approx(0.0));
 }
 
 TEST_CASE("Sirius configuration rejects invalid GPU topology selections", "[sirius][config]")
@@ -923,7 +930,8 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
       current_setting('pin_table_input_compression_plan_dir')::VARCHAR,
       current_setting('pin_table_compression_min_batch_size_bytes')::UBIGINT,
       current_setting('pin_table_compression_max_compressed_fraction')::DOUBLE,
-      current_setting('enable_runtime_distinct_build_probe')::BOOLEAN
+      current_setting('enable_runtime_distinct_build_probe')::BOOLEAN,
+      current_setting('dynamic_filter_inlist_max_l2_fraction')::DOUBLE
   )");
   REQUIRE(settings != nullptr);
   REQUIRE_FALSE(settings->HasError());
@@ -949,6 +957,7 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(settings->GetValue(17, 0).GetValue<uint64_t>() == 8 * mib);
   REQUIRE(settings->GetValue(18, 0).GetValue<double>() == Approx(0.6));
   REQUIRE_FALSE(settings->GetValue(19, 0).GetValue<bool>());
+  REQUIRE(settings->GetValue(20, 0).GetValue<double>() == Approx(0.4));
 
   auto zero_partition = con.Query("SET hash_partition_bytes = 0");
   REQUIRE(zero_partition != nullptr);
@@ -978,6 +987,18 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
                Catch::Contains("dynamic_filter_keep_threshold must be in [0.0, 1.0]"));
   REQUIRE(sirius_ctx->get_config().get_operator_params().dynamic_filter_keep_threshold ==
           Approx(0.7));
+
+  for (auto const* bad_fraction : {"SET dynamic_filter_inlist_max_l2_fraction = -0.5",
+                                   "SET dynamic_filter_inlist_max_l2_fraction = 1.5",
+                                   "SET dynamic_filter_inlist_max_l2_fraction = 'NaN'"}) {
+    auto invalid_inlist_fraction = con.Query(bad_fraction);
+    REQUIRE(invalid_inlist_fraction != nullptr);
+    REQUIRE(invalid_inlist_fraction->HasError());
+    REQUIRE_THAT(invalid_inlist_fraction->GetError(),
+                 Catch::Contains("dynamic_filter_inlist_max_l2_fraction must be in [0.0, 1.0]"));
+    REQUIRE(sirius_ctx->get_config().get_operator_params().dynamic_filter_inlist_max_l2_fraction ==
+            Approx(0.4));
+  }
 
   auto nan_mark_join_ratio = con.Query("SET mark_join_build_switch_ratio = 'NaN'");
   REQUIRE(nan_mark_join_ratio != nullptr);
@@ -1036,6 +1057,16 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   require_ok("SET dynamic_filter_keep_threshold = 0.0");
   require_ok("SET dynamic_filter_keep_threshold = 1.0");
   require_ok("RESET dynamic_filter_keep_threshold");
+  require_ok("SET dynamic_filter_inlist_max_l2_fraction = 0.0");
+  REQUIRE(sirius_ctx->get_config().get_operator_params().dynamic_filter_inlist_max_l2_fraction ==
+          Approx(0.0));
+  require_ok("SET dynamic_filter_inlist_max_l2_fraction = 1.0");
+  REQUIRE(sirius_ctx->get_config().get_operator_params().dynamic_filter_inlist_max_l2_fraction ==
+          Approx(1.0));
+  require_ok("RESET dynamic_filter_inlist_max_l2_fraction");
+  // RESET restores the registered default, which this context's YAML set to 0.4.
+  REQUIRE(sirius_ctx->get_config().get_operator_params().dynamic_filter_inlist_max_l2_fraction ==
+          Approx(0.4));
   require_ok("SET enable_runtime_distinct_build_probe = true");
   require_ok("RESET enable_runtime_distinct_build_probe");
   require_ok("SET pin_table_compression = false");

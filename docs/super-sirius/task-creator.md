@@ -133,8 +133,8 @@ Deadlock prevention: both this and sibling partition locks are acquired in a fix
 
 | Method | Behavior |
 |--------|----------|
-| `get_next_task_hint()` | If source finished: READY if data exists. If `_concat_all`: WAITING. Otherwise: checks if any partition's accumulated bytes ≥ `_concat_batch_bytes`. |
-| `get_next_task_input_data()` | For each partition: accumulates batches until byte threshold. Returns `partitioned_operator_data` with partition index. |
+| `get_next_task_hint()` | If source finished: READY if data exists. If `_concat_all`: WAITING. Otherwise: READY only if some partition holds a complete group — accumulated bytes strictly exceed `_concat_batch_bytes` (the overflowing batch seeds the next group); a lone oversized batch is deferred until a second batch arrives or the source finishes. |
+| `get_next_task_input_data()` | Pulls the first partition with a complete group under the same policy as the hint (`plan_pull_for_partition`). Returns `partitioned_operator_data` with partition index. |
 | Why custom | Byte-threshold batching; `_concat_all` mode for LEFT/ANTI/OUTER joins requires all data before output |
 
 ### SORT_SAMPLE
