@@ -28,6 +28,13 @@
 namespace sirius {
 namespace op {
 
+/**
+ * @brief Groups partitioned input batches before a downstream join
+ *
+ * Buffers batches in arrival order for each partition and releases groups based on
+ * `_concat_batch_bytes`. `get_next_task_hint` and `get_next_task_input_data` use the same grouping
+ * policy so a ready hint always corresponds to data that can be pulled.
+ */
 class sirius_physical_concat : public sirius_physical_partition_consumer_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::CONCAT;
@@ -73,6 +80,28 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
     const op::input_stats& stats) const override;
 
  private:
+  /**
+   * @brief Plans the next batch group for one partition without removing data
+   *
+   * A group contains the batches before the first batch that would make its cumulative size exceed
+   * `_concat_batch_bytes`; the overflowing batch remains for the next group. A batch that exceeds
+   * the threshold by itself becomes a single-batch group after another batch arrives or the source
+   * pipeline finishes. Finishing the pipeline also releases an under-threshold tail. When
+   * `_concat_all` is set, the complete partition becomes one group after the pipeline finishes.
+   *
+   * The caller must hold the operator mutex `lock`. The plan remains valid while the lock is held
+   * because consumers remove batches under the same lock and producers only append batches.
+   *
+   * @param[in] repo Repository for the operator's input port
+   * @param[in] partition_idx Partition to inspect
+   * @param[in] pipeline_finished Whether the source pipeline has finished
+   * @return Batch identifiers in pull order, or `std::nullopt` when no group is ready
+   */
+  [[nodiscard]] std::optional<std::vector<uint64_t>> plan_pull_for_partition(
+    ::cucascade::shared_data_repository& repo,
+    std::size_t partition_idx,
+    bool pipeline_finished) const;
+
   bool _is_build;
   bool _concat_all;
   uint64_t _concat_batch_bytes;

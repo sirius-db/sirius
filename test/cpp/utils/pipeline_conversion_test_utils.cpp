@@ -22,6 +22,7 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "sirius/exception.hpp"
 #include "sirius_context.hpp"
 #include "sirius_engine.hpp"
 #include "sirius_interface.hpp"
@@ -247,6 +248,78 @@ void with_initialized_engine(duckdb::Connection& con,
     sirius_engine engine(context, iface, test_query.query_id());
     engine.initialize(std::move(collector));
     consume(engine);
+
+    con.Rollback();
+  } catch (...) {
+    con.Rollback();
+    throw;
+  }
+}
+
+void with_initialized_streaming_fragment(
+  duckdb::Connection& con,
+  const std::string& query,
+  std::vector<std::shared_ptr<cucascade::shared_data_repository>> output_repos,
+  std::optional<op::partition_spec> spec,
+  const std::function<void(sirius_engine&, op::sirius_physical_streaming_sink&)>& consume)
+{
+  auto& context = *con.context;
+
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw sirius::invalid_input_exception(
+      "with_initialized_streaming_fragment: Sirius is not registered on this connection");
+  }
+
+  // Without a partition spec the plan is rooted in a single-destination sink: no repository would
+  // index an empty vector below, and extra ones would be silently dropped rather than wired to
+  // anything. With a spec, every repository becomes a destination.
+  if (output_repos.empty() || (!spec.has_value() && output_repos.size() != 1)) {
+    throw sirius::invalid_input_exception(
+      "with_initialized_streaming_fragment: expected " +
+      std::string(spec.has_value() ? "at least 1" : "exactly 1") + " output repository, got " +
+      std::to_string(output_repos.size()));
+  }
+
+  con.BeginTransaction();
+  try {
+    // The real execution window, not scoped_test_query: consume() may execute(), and only a
+    // window begin points the task creator at this connection. Sink output repositories are
+    // never registered with the window's repository manager, so they survive finish().
+    duckdb::SiriusContext::StandaloneQueryScope window(
+      *sirius_ctx, context, "streaming_fragment_test");
+
+    extracted_plan extracted;
+    {
+      optimizer_disable_guard guard(context);
+      extracted = extract_logical_plan_sirius_order(context, query);
+    }
+
+    sirius::planner::sirius_physical_plan_generator physical_planner(context);
+    auto sirius_plan = physical_planner.create_plan(std::move(extracted.logical_plan));
+
+    // A STREAMING_SINK is a normal unary operator, unlike the RESULT_COLLECTOR, which keeps its
+    // child outside `children[]` and needs special descent in the plan generator. Attaching the
+    // subtree as children[0] is what keeps that special-casing unnecessary.
+    auto types       = sirius_plan->types;
+    auto cardinality = sirius_plan->estimated_cardinality;
+    duckdb::unique_ptr<op::sirius_physical_streaming_sink> sink;
+    if (spec.has_value()) {
+      sink = duckdb::make_uniq<op::sirius_physical_streaming_sink>(
+        std::move(types), cardinality, std::move(output_repos), std::move(*spec));
+    } else {
+      sink = duckdb::make_uniq<op::sirius_physical_streaming_sink>(
+        std::move(types), cardinality, output_repos[0]);
+    }
+    sink->children.push_back(std::move(sirius_plan));
+
+    sirius_interface iface(context);
+    sirius_engine engine(context, iface, window.query_id());
+    // The fragment owns the plan; the engine borrows it. initialize() would take ownership and
+    // destroy the sink with the engine, leaving nothing to pull from afterwards.
+    engine.initialize_internal(*sink);
+    consume(engine, *sink);
+    window.finish();
 
     con.Rollback();
   } catch (...) {

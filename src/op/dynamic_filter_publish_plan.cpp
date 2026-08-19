@@ -29,11 +29,13 @@ dynamic_filter_publish_plan::dynamic_filter_publish_plan(
   bool emit_zone_map_filters,
   std::vector<std::size_t> build_key_domain_cardinalities,
   std::vector<dynamic_filter_replica_space> replica_spaces,
-  double domain_coverage_threshold)
+  double domain_coverage_threshold,
+  double inlist_max_l2_fraction)
   : _probe_targets(std::move(probe_targets)),
     _emit_zone_map_filters(emit_zone_map_filters),
     _build_key_domain_cardinalities(std::move(build_key_domain_cardinalities)),
     _domain_coverage_threshold(domain_coverage_threshold),
+    _inlist_max_l2_fraction(inlist_max_l2_fraction),
     _replica_spaces(std::move(replica_spaces))
 {
   if (!_probe_targets.empty() && _replica_spaces.empty()) {

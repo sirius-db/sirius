@@ -957,6 +957,69 @@ TEST_CASE("Hash partition cast keys stay out of the payload",
   }
 }
 
+TEST_CASE("Hash partition tunnels TIMESTAMP_DAYS keys through an INT16 carrier",
+          "[operator][hash_partition][cast_key][numeric_narrowing]")
+{
+  auto* mem_space = get_shared_mem_space();
+  REQUIRE(mem_space != nullptr);
+
+  auto const stream        = cudf::get_default_stream();
+  auto const mr            = mem_space->get_default_allocator();
+  auto const date_type     = cudf::data_type{cudf::type_id::TIMESTAMP_DAYS};
+  auto const int16_type    = cudf::data_type{cudf::type_id::INT16};
+  constexpr int partitions = 4;
+
+  std::vector<std::int32_t> dates(64);
+  std::iota(dates.begin(), dates.end(), std::int32_t{-16'000});
+  std::vector<std::int64_t> payload(dates.size());
+  std::iota(payload.begin(), payload.end(), std::int64_t{50'000});
+
+  auto date_column = make_fixed_test_column(date_type, dates, stream, mr);
+  auto payload_column =
+    make_fixed_test_column(cudf::data_type{cudf::type_id::INT64}, payload, stream, mr);
+  std::vector<std::unique_ptr<cudf::column>> input_columns;
+  input_columns.push_back(std::move(date_column));
+  input_columns.push_back(std::move(payload_column));
+  auto input = make_data_batch(std::make_unique<cudf::table>(std::move(input_columns)),
+                               *mem_space,
+                               stream,
+                               telemetry::batch_telemetry_info{});
+
+  auto input_ro         = input->to_read_only();
+  auto const input_view = sirius::get_cudf_table_view(input_ro);
+
+  // Construct the key oracle independently on the host. Using cast_through_rep() here would let a
+  // shared defect in production and test code conceal the DATE carrier regression.
+  std::vector<std::int16_t> int16_keys;
+  int16_keys.reserve(dates.size());
+  for (auto const value : dates) {
+    int16_keys.push_back(static_cast<std::int16_t>(value));
+  }
+  auto oracle_key = make_fixed_test_column(int16_type, int16_keys, stream, mr);
+  std::vector<cudf::column_view> oracle_key_views{oracle_key->view()};
+  auto expected = reference_partition_rows<fixed_rows>(
+    input_view, cudf::table_view{oracle_key_views}, partitions, stream, mr, copy_fixed_rows);
+
+  std::vector<cudf::column_view> original_key_views{input_view.column(0)};
+  auto uncasted = reference_partition_rows<fixed_rows>(
+    input_view, cudf::table_view{original_key_views}, partitions, stream, mr, copy_fixed_rows);
+  REQUIRE(expected != uncasted);
+
+  auto output =
+    gpu_partition_impl::hash_partition(input_ro, {0}, {int16_type}, partitions, stream, *mem_space);
+  REQUIRE(output.size() == static_cast<std::size_t>(partitions));
+  require_fixed_aliases_and_sizes(output, {0, 1}, true);
+  for (std::size_t partition = 0; partition < output.size(); ++partition) {
+    auto ro         = output[partition]->to_read_only();
+    auto const view = sirius::get_cudf_table_view(ro);
+    require_canonical_schema(view, input_view);
+    REQUIRE(view.num_columns() == 2);
+    REQUIRE(view.column(0).type() == date_type);
+    REQUIRE(view.column(1).type().id() == cudf::type_id::INT64);
+    REQUIRE(copy_fixed_rows(view) == expected[partition]);
+  }
+}
+
 TEST_CASE("Non-first mixed partition survives registry GPU host GPU round-trip",
           "[operator][hash_partition][conversion][zero_copy]")
 {

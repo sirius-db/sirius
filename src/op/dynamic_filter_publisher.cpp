@@ -241,7 +241,13 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
 
     // (2) Membership filter — post-decode. Prefer, in order:
     //  - A. the exact IN-list with a brute-force scan for a very small key set (no hash build);
-    //  - B. the hash-based IN-list when its cuco set fits the device L2 cache;
+    //  - B. the hash-based IN-list when its cuco set fits the device L2 cache and stays within
+    //       the plan's inlist_max_l2_fraction of it. The fraction bounds residency, not
+    //       capacity: competing with the streaming probe traffic, the set stops being
+    //       cache-resident well before it reaches L2 capacity (measured, its probe cost is flat
+    //       below the bound and degrades steadily beyond), while the smaller-but-inexact Bloom
+    //       probes >= 2.2x faster at every hash-set size — so the exact filter is kept only
+    //       where exactness costs the least;
     //  - C. otherwise the Bloom filter whenever the key type supports it;
     // `none` only when the key type has no membership support (anything other than INT32/INT64).
     auto const set_bytes =
@@ -251,12 +257,20 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
     bool const in_list_fits = l2_bytes > 0 &&
                               sirius::op::sirius_dynamic_in_list_filter::supports(col) &&
                               set_bytes <= l2_bytes;
+    bool const bloom_supported = sirius::op::sirius_dynamic_bloom_filter::supports(col.type());
+    // `in_list_fits` implies l2_bytes > 0, so the fraction threshold is well-defined wherever it
+    // is evaluated; with no device L2 info (l2_bytes == 0) the legacy fit rule above has already
+    // resolved the choice. A key type without Bloom support keeps any fitting IN-list.
+    bool const prefer_in_list =
+      in_list_fits &&
+      (!bloom_supported || static_cast<double>(set_bytes) <=
+                             _plan.inlist_max_l2_fraction() * static_cast<double>(l2_bytes));
     if (sirius::op::sirius_dynamic_small_in_list_filter::supports(col)) {
       nvtx3::scoped_range vr{"dynfilter::build_small_in_list"};
       per_key_membership[k] = std::make_shared<sirius::op::sirius_dynamic_small_in_list_filter>(
         col, stream, allocator_ref);
       choice = "small_in_list";
-    } else if (in_list_fits) {
+    } else if (prefer_in_list) {
       nvtx3::scoped_range vr{"dynfilter::build_in_list"};
       per_key_membership[k] =
         std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(col, stream, allocator_ref);
@@ -269,13 +283,14 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
     }
     SIRIUS_LOG_DEBUG(
       "[sirius_physical_hash_join] dynamic filter key {}: build_rows={} zone_map={} membership: "
-      "in_list_set={}B bloom={}B L2={}B -> {}",
+      "in_list_set={}B bloom={}B L2={}B inlist_max_l2_fraction={} -> {}",
       k,
       build_rows,
       per_key_zone_map[k] ? "yes" : "no",
       set_bytes,
       bloom_bytes,
       l2_bytes,
+      _plan.inlist_max_l2_fraction(),
       choice);
   }
 

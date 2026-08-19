@@ -68,19 +68,34 @@ spill-visible to the downgrade executor when the caller registered that reposito
 manager) bound to the stream state (sender-aware end-of-stream, the availability classification,
 the `on_data` notification, and the producer-error plane).
 
-Key design invariants (S1–S5 are the named stream contracts defined in `exec/batch_stream.hpp`):
+Key design invariants (full S1–S5 / P1–P4 in [Streaming Sessions](streaming-sessions.md#contracts-s1-s5)):
 - Batches cross natively, in their current tier — no Arrow, no forced GPU upgrade.
 - EOS is **sender-aware**: `close_input(sender)` is idempotent per sender, and the stream ends
   only once every *expected* sender has closed. An unexpected sender id is a defined error.
 - **S1** — every batch lands in the repository before `on_data` announces it; `push()` returns
-  false once the stream is terminal, so no batch can arrive after a consumer has seen EOS.
-- **S2–S3** — a producer failure (`fail_input(error)`) fires `on_data` so a parked consumer
-  wakes to collect the rethrow; the stream never reports `END_OF_STREAM` or `drained()` while an
-  error is pending (the only exit is the rethrow).
+  false once the stream is terminal.
+- **S2** — `fail_input` wakes a parked consumer (on_data / P4 for the engine path) for the rethrow.
+- **S3** — an errored stream never reports `END_OF_STREAM` / `drained()`; exit is the rethrow.
+- **S4** — `try_pull` / task input rethrows before popping queued batches.
+- **S5** — `wait` then pull is not atomic; blocking loops must re-check.
 - `execute()` is a pure pass-through (COLUMN_DATA_SCAN shape — no GPU work).
 - `no_history_peak_memory_estimate()` returns `stats.bytes` (no extra allocation).
 
-Hint table:
+Hint state machine (contrast with `GPU_SCAN`: `READY{this} → drain blocking condvar → nullopt`):
+
+```
+WAITING{nullptr} ◄──── classify()=WAITING (open, empty)
+      │                      ▲
+      │ request dropped       │ try_pull() drains; stream still open
+      │                      │
+      └──► push() fires on_data ──► creator->schedule(head) ──► READY{this}
+                                                                      │
+                                              classify()=HAS_DATA ───┘
+                                              get_next_task_input_data() pops one batch
+                                              (or rethrows on error — S4)
+
+classify()=END_OF_STREAM ──► nullopt ──► on_end_of_stream ──► pipeline finishes
+```
 
 | Stream state | `get_next_task_hint()` |
 |---|---|
@@ -95,7 +110,8 @@ admitted between the check and the lock could be reported as end-of-stream and d
 
 **The live wake-up.** The head is scheduled once by `start_query()` and task completion only
 nominates downstream consumers, so `on_data` — fired by every successful `push()` — is the only
-thing that brings a dropped source back. It is deliberately not one-shot; the header explains why.
+thing that brings a dropped source back. It is deliberately not one-shot; `batch_stream::set_on_data`
+explains why.
 
 End-of-stream separately notifies the pipeline (`update_pipeline_status(false)`, via a weak
 pipeline reference wired in `set_pipeline`), so an empty or late-closed stream still finishes its
@@ -105,6 +121,54 @@ pipeline — and re-arms downstream consumers — even when no task is left in f
 relieves memory pressure. Sirius has no upward "stop producing" signal today (hints are only
 `READY` / `WAITING` / nothing), so the intended lever is per-fragment priority, not a bounded
 queue.
+
+### `sirius_physical_streaming_sink` — `STREAMING_SINK`
+**File:** `src/include/op/sirius_physical_streaming_sink.hpp`
+
+Terminal operator of a streaming fragment: every batch the pipeline produces is pushed into one
+`exec::batch_stream` and exposed to an external consumer via `pull()` / `wait()` / `drained()`.
+
+Where the source stands where no table exists, the sink stands where no `RESULT_COLLECTOR` exists:
+the fragment's output travels through an `exec::batch_stream` over a caller-supplied output
+repository rather than into a query result. It is shaped
+like `RESULT_COLLECTOR` (appended to `current` in `build_pipelines`, set as the meta-pipeline sink)
+so the executor places it at `operators[last]` and drives its `on_finalize_operator()` — which is
+the only route to end-of-stream for the output stream.
+
+Lifecycle:
+
+```
+sink(batch) ──► batch_stream[i].push(batch)     (per task, per destination partition)
+      │
+on_finalize_operator()                           (pipeline finish — the only EOS path)
+      │
+batch_stream[i].close(PIPELINE_SENDER)           (for every output stream i)
+      │
+consumers see END_OF_STREAM via wait(i) / drained(i)
+```
+
+Key design facts:
+- **One sender, one finalize.** The pipeline feeding this sink is its single expected sender
+  (`PIPELINE_SENDER = 0`). `on_finalize_operator()` calls `close(PIPELINE_SENDER)` on the output
+  `exec::batch_stream`, which is what makes it terminal. Without `build_pipelines` placing the sink in
+  `operators`, `on_finalize_operator()` is never called and every consumer blocked in `wait()`
+  hangs forever with no error visible.
+- **No self-nomination.** Unlike the source, the sink does not wire an `on_data` hook: its consumer
+  is an external thread blocking in `wait()`, not an engine task needing re-nomination.
+- **Native tier.** Batches are pushed in whatever tier they arrived — no Arrow, no forced GPU
+  upgrade. A queued batch stays spillable in the repository until pulled.
+- **execute() is a pass-through** (same shape as `RESULT_COLLECTOR`): it hands the batches back so
+  `publish_output()` can deliver them to `sink()`. The base implementation drops them.
+- **Partitioned variant (N destinations).** The second constructor takes N repositories and a
+  `partition_spec` (`mode`, key columns + optional casts, validated at construction).
+  `partition_mode::hash` GPU-hash-partitions each input batch and routes slice *i* into
+  `_outputs[i]`, skipping empty slices. `partition_mode::broadcast` replicates every batch to all
+  N outputs: output 0 gets the original handle, outputs 1..N−1 get independent `clone()`s with
+  fresh `batch_id`s. Each destination has its own `exec::batch_stream` and EOS reaches all of them
+  on a single `on_finalize_operator()` call. When N = 1 the spec is ignored and a native push
+  bypasses routing entirely. `no_history_peak_memory_estimate()` stays 0 for N = 1 and becomes 2×
+  the input for N > 1: hash_partition holds a reordered copy + slices; broadcast holds the
+  original + N−1 clones simultaneously.
 
 ### `sirius_physical_dummy_scan` — `DUMMY_SCAN`
 **File:** `src/include/op/sirius_physical_dummy_scan.hpp`
@@ -164,9 +228,13 @@ Three execution modes:
 | `BUILD_PROBE` | Up to one partition per GPU, per-partition build side (< `max_build_hash_table_bytes`) foldable to one batch | `cudf::hash_join`, `cudf::distinct_hash_join`, or `cudf::filtered_join` — built once per partition, probed many times |
 | `MIXED_JOIN` | Equality plus either inequality conditions or a null-safe `IS NOT DISTINCT FROM` key (mixed with a plain `=`), on disjoint columns | `cudf::mixed_join()` with cuDF AST |
 
-`update_join_exec_mode()` selects BUILD_PROBE when `num_partitions <= num_gpus` (one hash table per partition, at most one partition per GPU — this reduces to the historical single-partition rule when `num_gpus == 1`), the per-GPU build side fits `max_build_hash_table_bytes` and folds to a single batch, and the join is not RIGHT-family (`RIGHT`, `RIGHT_SEMI`, `RIGHT_ANTI`), `MIXED_JOIN`, or full `OUTER`. INNER, LEFT, MARK, SEMI, and ANTI joins are eligible (SEMI/ANTI/MARK build a persistent `cudf::filtered_join` on the right and stream left probe batches). Full outer is excluded because BUILD_PROBE streams probe batches and calls `full_join` per batch, which would re-emit unmatched build rows on every batch (and, under broadcast/partitioning, on every GPU) with no global accumulation — full outer joins use the STANDARD path. The pure eligibility gate is `build_probe_mode_eligible()`. For a broadcast join the **full** replicated build size is charged against `max_build_hash_table_bytes` (each GPU builds the entire table); a hash-partitioned build charges the per-partition average.
+Partition count, broadcast, and BUILD_PROBE are decided together by the free function `compute_hash_join_partition_strategy()` (member wrapper: `get_partition_strategy()`), which returns a single `partition_strategy {num_partitions, broadcast, build_probe}`. BUILD_PROBE is selected when `num_partitions <= num_gpus` (one hash table per partition, at most one partition per GPU — this reduces to the historical single-partition rule when `num_gpus == 1`), the per-GPU build side fits `max_build_hash_table_bytes` and folds to a single batch, and the join is not RIGHT-family (`RIGHT`, `RIGHT_SEMI`, `RIGHT_ANTI`), `MIXED_JOIN`, or full `OUTER`. INNER, LEFT, MARK, SEMI, and ANTI joins are eligible (SEMI/ANTI/MARK build a persistent `cudf::filtered_join` on the right and stream left probe batches); MARK force-enables BUILD_PROBE even above the hash-table budget, since it has no STANDARD path. Full outer is excluded because BUILD_PROBE streams probe batches and calls `full_join` per batch, which would re-emit unmatched build rows on every batch (and, under broadcast/partitioning, on every GPU) with no global accumulation — full outer joins use the STANDARD path. For a broadcast join the **full** replicated build size is charged against `max_build_hash_table_bytes` (each GPU builds the entire table); a hash-partitioned build charges the per-partition average.
 
-**Broadcast small build tables.** On multi-GPU, when the build side is small (`< small_table_bytes`), instead of routing the whole build to one GPU the PARTITION operator proposes `num_gpus` partitions and *replicates* the small build table to every GPU (the `_broadcast` flag), so each GPU builds its own hash table and joins its local probe rows. The build sink deposits the build batch into every slot; the probe sink routes each batch to the slot for its current GPU (`slot_for_device`). Once the probe side finishes, any slot that received replicated build data but no probe rows is discarded (`discard_build_only_slots_if_probe_complete`). The pure candidate decision is `make_broadcast_partition_decision()`; right-family / mixed joins reject BUILD_PROBE and fall back to the normal partition count.
+By execution time every equality-condition side is a plain column reference: a complex equality-key expression is materialized into a real column by a planner-inserted projection below the join (`materialize_expression_join_keys()`), because PARTITION — the first key consumer — hashes by column index and cannot evaluate expressions. Inequality sides stay inline as the mixed-join AST predicate.
+
+**NULL comparison for keys.** `compare_nulls()` picks the `null_equality` flag threaded through every cuDF join call (including the build helpers and `filtered_join`/`mark_join`): `EQUAL` only when *every* equi-key is `IS NOT DISTINCT FROM`, `UNEQUAL` otherwise (any plain `=`, delim joins, and MARK). A null-safe key *mixed* with plain `=` is instead routed through MIXED_JOIN (see below).
+
+**Broadcast small build tables.** On multi-GPU, a build side is a broadcast candidate when it is small (`< small_table_bytes`), or when it fits `max_broadcast_join_size` and the estimated probe-to-build ratio is at least `num_gpus * 1.25`; MARK joins are forced broadcast whenever `num_gpus > 1` (see [MARK joins](#mark-joins)). Instead of routing the whole build to one GPU, the PARTITION operator proposes `num_gpus` partitions and *replicates* the small build table to every GPU (the `_broadcast` flag), so each GPU builds its own hash table and joins its local probe rows. The build sink deposits the build batch into every slot; the probe sink routes each batch to the slot for its current GPU (`slot_for_device`). Once the probe side finishes, any slot that received replicated build data but no probe rows is discarded (`discard_build_only_slots_if_probe_complete`). Right-family / mixed joins reject BUILD_PROBE and fall back to the normal partition count.
 
 #### Partial-barrier scheduling (STANDARD / MIXED_JOIN)
 
@@ -174,7 +242,7 @@ The join's own `build` and `default`/probe input ports are **PARTIAL** barriers 
 
 Joining each build batch against each probe batch and unioning the results is only *inherently* correct for INNER. For every other join type, `sirius_physical_concat` folds the side that must be seen whole into a **single batch** (an implicit full barrier), so the streamed side is joined against that one folded batch — correct for all types. `refresh_cross_schedule` asserts this "whole side stays one batch" invariant and throws if a concat regression ever violates it.
 
-**Empty-opposite side (orphan tasks).** When one side is a genuinely empty table, its concat emits *zero* batches. The surviving side's batches then have nothing to pair with, so once both producers finish, `next_cross_schedule_orphan` claims each survivor and `get_next_task_input_data` **synthesizes an empty opposite batch** for it (`make_empty_join_side_table` from the absent child's output types, built on the survivor's device) and returns an ordinary two-batch task. `execute()` then runs the normal join dispatch unchanged, so cuDF NULL-pads the survivor for LEFT/RIGHT/OUTER/ANTI and yields zero rows for INNER/SEMI. Popping the survivor also drains the repository, so the pipeline completes instead of hanging. FULL OUTER and RIGHT-family joins are the reachable cases (they always run STANDARD); small-build INNER/LEFT/SEMI/ANTI take BUILD_PROBE, which handles an empty side separately.
+**Empty-opposite side (orphan tasks).** When one side is a genuinely empty table, its concat emits *zero* batches. The surviving side's batches then have nothing to pair with, so once both producers finish, `next_cross_schedule_orphan` claims each survivor and `get_next_task_input_data` **synthesizes an empty opposite batch** for it (`sirius::make_empty_table` from the absent child's output types, built on the survivor's device) and returns an ordinary two-batch task. `execute()` then runs the normal join dispatch unchanged, so cuDF NULL-pads the survivor for LEFT/RIGHT/OUTER/ANTI and yields zero rows for INNER/SEMI. Popping the survivor also drains the repository, so the pipeline completes instead of hanging. FULL OUTER and RIGHT-family joins are the reachable cases (they always run STANDARD); small-build INNER/LEFT/SEMI/ANTI take BUILD_PROBE, which handles an empty side separately.
 
 The following table summarizes, per join type, what concat folds, which side streams under this scheme, and the partition / broadcast / mode support:
 
@@ -194,10 +262,10 @@ The following table summarizes, per join type, what concat folds, which side str
 † MIXED_JOIN applies to any of these types when the join carries equality conditions **plus** either an inequality condition or a null-safe `IS NOT DISTINCT FROM` key mixed with a plain `=` (the null-safe key is routed to the AST predicate as `NULL_EQUAL`, since cuDF's single `null_equality` flag can't give `=` and null-safe keys opposite semantics). MARK is never routed to MIXED_JOIN: MARK + inequality is rejected at construction, and a MARK + null-safe key stays a `UNEQUAL` hash key (a known null-safe limitation). "Streams multi-batch" describes the STANDARD/MIXED partial-barrier behavior; BUILD_PROBE already streamed its probe side. The whole-side fold is chosen in the `sirius_physical_concat` constructor from the downstream join type (`_concat_all`); partition / broadcast / mode eligibility is decided in `compute_hash_join_partition_strategy`.
 
 #### MARK joins
-A MARK join emits every left row plus a `BOOL8` mark column indicating whether each left row had a match. Both build strategies funnel through `resolve_mark_join_result`, which scatters left-row match indices into the mark column.
+A MARK join emits every left row plus a `BOOL8` mark column with SQL three-valued semantics: **true** for a match, **false** for a non-match when the probe key is non-NULL and the build side has no NULL key, and **NULL** otherwise (NULL probe key, or no match while a NULL build key exists — the row *might* have matched it). Both build strategies funnel through `resolve_mark_join_result`, which scatters left-row match indices into the mark column and attaches the null mask: when the build side has a NULL key, validity equals the match flags (`cudf::bools_to_mask`); otherwise validity is the probe keys' row validity (`cudf::bitmask_and`). Build-key nullness is recorded at build time in `_build_has_null` — an atomic that is join-wide because MARK is forced single-partition (or broadcast on multi-GPU, precisely so `_build_has_null` is globally consistent).
 
 - **STANDARD mode (adaptive build side):** by default the filter (right) side is built into a `cudf::filtered_join` and probed with the left, whose `semi_join` yields left-row match indices. When the right (probe) side is much larger than the left (output) side, Sirius instead builds the smaller left side into a `cudf::mark_join` and probes with the right. The switch is gated by `mark_join_build_switch_ratio` (build on left when `right_rows >= ratio * left_rows`; `0` disables). Both paths produce identical output.
-- **BUILD_PROBE mode:** a single `cudf::filtered_join` is built once on the right (filter) keys and persisted as `_filtered_table`; each streamed left probe batch calls `semi_join` against it, reusing the hash table across probes.
+- **BUILD_PROBE mode:** a `cudf::filtered_join` is built once per partition slot on the right (filter) keys and persisted in that slot's build state; each streamed left probe batch calls `semi_join` against it, reusing the hash table across probes.
 
 #### Distinct Hash Join Optimization
 For INNER/LEFT joins in BUILD_PROBE mode, when the build-side keys are proven unique, Sirius uses `cudf::distinct_hash_join` instead of `cudf::hash_join`. This optimization applies when:
@@ -211,7 +279,7 @@ Uniqueness is detected by walking the DuckDB logical plan:
 
 Only PRIMARY KEY is considered (not plain UNIQUE) due to NULL handling semantics with `null_equality::UNEQUAL`. IS NOT DISTINCT FROM joins are excluded since they require `null_equality::EQUAL`.
 
-Build/probe state machine for BUILD_PROBE mode:
+Build/probe state machine for BUILD_PROBE mode (one instance per partition slot, driven by `build_probe_action`):
 ```mermaid
 stateDiagram-v2
     direction LR
@@ -224,12 +292,10 @@ stateDiagram-v2
 When `get_next_task_hint()` is called after the operator is already finished, it returns `std::nullopt` (no new tasks needed).
 
 Key members:
-- `conditions` — join predicates (equality and inequality)
+- `conditions` — join predicates (equality and inequality; equality sides are always plain column references by execution time)
 - `join_type` — INNER, LEFT, RIGHT, OUTER, MARK
-- `_hash_table` — cached `cudf::hash_join` (BUILD_PROBE mode)
-- `_distinct_hash_table` — cached `cudf::distinct_hash_join`, used instead of `_hash_table` when build keys are proven unique
-- `_filtered_table` — reusable build-on-right `cudf::filtered_join` for MARK joins in BUILD_PROBE mode
-- `_build_table` — materialized build-side data batch
+- `_partition_build_states` — one `per_partition_build_state` per BUILD_PROBE partition slot, holding that slot's cached `hash_table` (`cudf::hash_join`), `distinct_hash_table` (used instead when build keys are proven unique), `filtered_table` (`cudf::filtered_join` for SEMI/ANTI/MARK), materialized `build_table`, `device_id`, and per-slot atomic `build_state`
+- `_build_has_null` — join-wide atomic recording whether any build key was NULL (drives the MARK three-valued mask)
 - `key_casts` — type alignment info for hash key matching
 - `unique_build_keys` / `unique_probe_keys` — cardinality hints (used to select distinct vs standard hash join)
 - `mark_join_build_switch_ratio` — threshold for adaptively building a STANDARD MARK join on the smaller (left) side
@@ -240,6 +306,8 @@ Supported join types: INNER, LEFT, RIGHT, OUTER, MARK via `cudf::inner_join()`, 
 **File:** `src/include/op/sirius_physical_nested_loop_join.hpp`
 
 Fallback for joins not supported by cuDF hash join (pure inequality conditions). Uses `PhysicalNestedLoopJoin::IsSupported()` to validate.
+
+Conditional MARK joins produce the same three-valued mark as the hash join, via a two-semi-join scheme in its own `resolve_mark_join_result`: one `conditional_left_semi_join` on the predicate itself yields the *matched* set, and a second on `predicate IS NOT FALSE` — each comparison rewritten as `cᵢ OR IS_NULL(left) OR IS_NULL(right)` with Kleene `NULL_LOGICAL_OR` — yields the *maybe* set. A row's mark is true if matched, NULL if in the maybe set but not matched, false otherwise. Null-safe (`IS [NOT] DISTINCT FROM`) conjuncts skip the `IS_NULL` tainting since they are never NULL-valued; `distinct_from` is lowered as `NOT(NULL_EQUAL(l, r))`.
 
 ### `sirius_physical_order` — `ORDER_BY`
 **File:** `src/include/op/sirius_physical_order.hpp`
@@ -263,7 +331,7 @@ Aggregate without GROUP BY (e.g., `SELECT COUNT(*), SUM(x) FROM t`).
 
 - **GPU execution:** `gpu_aggregate_impl::local_ungrouped_aggregate()` using `cudf::reduce()`
 - **Supported:** SUM, MIN, MAX, COUNT (of valid values), COUNT(*), AVG, FIRST
-- **AVG handling:** Decomposed into SUM + COUNT and finalized on-device. `make_avg_column()` divides the single-row merged sum/count columns with `cudf::binary_operation` — DECIMAL output divides directly in fixed point to preserve precision, while non-DECIMAL output casts both operands to FLOAT64 and divides. This keeps AVG off the host `long double` path, avoiding both the device→host sync and the precision loss of decimal round-trips.
+- **AVG handling:** Decomposed into SUM + COUNT and finalized on-device. `make_avg_column()` divides the single-row merged sum/count columns with `cudf::binary_operation` — DECIMAL output divides directly in fixed point to preserve precision, while non-DECIMAL output casts both operands to FLOAT64 and divides. This keeps AVG off the host `long double` path, avoiding both the device→host sync and the precision loss of decimal round-trips. The denominator is the count of *non-null* values (matching SUM, which skips NULLs), computed with a NULL-excluding COUNT reduction; when the column has no NULLs the row count is used directly.
 - **DECIMAL overflow handling:** DECIMAL SUM casts to a wider type before reduction — DECIMAL32→DECIMAL64, DECIMAL64→DECIMAL128 — to prevent overflow
 - **BIGINT SUM fallback:** BIGINT (INT64) SUM falls back to CPU execution because GPU lacks INT128 accumulator support. Without this, silent overflow produces incorrect results. BIGINT arithmetic operations (ADD, SUB, MUL) also fall back to CPU for the same reason.
 
@@ -275,6 +343,7 @@ Hash-based GROUP BY.
 - **GPU execution:** `gpu_aggregate_impl::local_grouped_aggregate()` using `cudf::groupby()`
 - **AVG handling:** Decomposed into SUM + COUNT_VALID via `AggregateSlot`
 - **COUNT(DISTINCT):** Implemented via `COLLECT_SET` aggregation with struct column synthesis
+- **Label-encoded group keys:** when a COLLECT_SET aggregation is present, the input is large (≥ 1M rows), the group key is multi-column and non-nested, and an HLL estimate puts group cardinality below 1% of rows, the key table is collapsed with `cudf::encode` into a single dense INT32 label so cuDF's `stable_sorted_order` takes its single-column radix path; original keys are recovered by a gather at group cardinality. This short-circuits the STRING dictionary-encode path and falls back silently to the plain multi-column sort on failure.
 - **Key members:** `group_idx`, `cudf_aggregates`, `cudf_aggregate_idx`, `aggregate_slots`, `has_avg`, `has_count_distinct`
 
 ## Pipeline Breakers (Sirius-Specific)
@@ -284,7 +353,7 @@ These operators are injected during pipeline splitting. They don't map to DuckDB
 ### `sirius_physical_partition` — `PARTITION`
 **File:** `src/include/op/sirius_physical_partition.hpp`
 
-Repartitions data into N buckets based on partition keys.
+Repartitions data into N buckets based on partition keys. Partition keys are always plain column indices — a hash-join equality key that is a complex expression has already been materialized into a real column by a planner-inserted projection (`materialize_expression_join_keys()`), because PARTITION hashes by column index and cannot evaluate expressions.
 
 - **Modes:** `HASH` (most common), `RANGE`, `EVENLY`, `CUSTOM`, `NONE`
 - **Adaptive count:** `determine_num_partitions()` computes N from actual input data size and `hash_partition_bytes` config
@@ -398,7 +467,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | Operator | Category | GPU Method |
 |----------|----------|-----------|
 | GPU_SCAN | Scan | Unified GPU scan source served by `sirius_scan_manager` via a per-format `gpu_ingestible` |
-| STREAMING_SOURCE | Scan | Exchange-input source; drains an `exec::batch_stream` (repository fed by `push()`, sender-aware EOS, producer-error plane) |
+| STREAMING_SOURCE | Scan | Exchange-input source; drains an `exec::batch_stream` |
 | DUMMY_SCAN | Scan | Generates 1 row |
 | COLUMN_DATA_SCAN | Scan | Reads ColumnDataCollection |
 | FILTER | Relational | `expression_evaluator::select()` |
@@ -423,3 +492,4 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | CTE | CTE | Materialize to ColumnDataCollection |
 | RESULT_COLLECTOR | Result | Final result materialization |
 | EMPTY_RESULT | Result | Empty result set |
+| STREAMING_SINK | Result | Terminal operator of a streaming fragment |

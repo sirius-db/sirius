@@ -394,6 +394,7 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
         md.varchar_bytes_per_col.push_back(rgp.varchar_bytes_per_col[ui]);
         op::scan::duckdb_column_metadata cm;
         cm.column_id = src.column_id;
+        cm.is_array  = src.is_array;
         cm.data_segments.reserve(src.data_segments.size());
         for (auto const& s : src.data_segments) {
           cm.data_segments.push_back(to_descriptor(s, rg_slab, any_file_read));
@@ -401,6 +402,14 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
         cm.validity_segments.reserve(src.validity_segments.size());
         for (auto const& s : src.validity_segments) {
           cm.validity_segments.push_back(to_descriptor(s, rg_slab, any_file_read));
+        }
+        cm.array_child_data_segments.reserve(src.array_child_data_segments.size());
+        for (auto const& s : src.array_child_data_segments) {
+          cm.array_child_data_segments.push_back(to_descriptor(s, rg_slab, any_file_read));
+        }
+        cm.array_child_validity_segments.reserve(src.array_child_validity_segments.size());
+        for (auto const& s : src.array_child_validity_segments) {
+          cm.array_child_validity_segments.push_back(to_descriptor(s, rg_slab, any_file_read));
         }
         md.columns.push_back(std::move(cm));
       }

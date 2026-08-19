@@ -17,11 +17,11 @@
 #include "op/partition/gpu_partition_impl.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "helper/numeric_narrowing.hpp"
 
 #include <cudf/column/column_stream.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/partitioning.hpp>
-#include <cudf/unary.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <cuda_runtime.h>
@@ -141,8 +141,8 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
     auto const& key = input_table.column(partition_key_idx[i]);
     if (i < partition_key_cast_types.size() &&
         partition_key_cast_types[i].id() != cudf::type_id::EMPTY) {
-      auto cast_col =
-        cudf::cast(key, partition_key_cast_types[i], stream, memory_space.get_default_allocator());
+      auto cast_col = sirius::cast_through_rep(
+        key, partition_key_cast_types[i], stream, memory_space.get_default_allocator());
       effective_key_views.push_back(cast_col->view());
       owned_cast_cols.push_back(std::move(cast_col));
     } else {
