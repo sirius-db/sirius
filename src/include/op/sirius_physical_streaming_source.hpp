@@ -28,25 +28,13 @@
 
 namespace sirius::op {
 
-/// The plan leaf for a stream. A scan stands where the plan reads a table; this stands where
-/// there is no table at all — a fragment boundary, fed by whatever another fragment or external
-/// producer pushes in at runtime. Publishes one batch per task, in push order.
-///
-/// While a scan owns its input this source owns nothing and its senders are remote: "empty" means
-/// wait, waiting must not block an engine thread, and the stream ends only once every expected
-/// sender has closed.
-///
-/// The repository is the queue, spillable only if the caller registered it with the memory
-/// manager. `exec::batch_stream` binds it to the stream state: who is still producing, whether
-/// empty means wait or over, and how a producer failure reaches the consumer. The rest is
-/// task-protocol glue over that one stream.
+/// Plan leaf over a batch_stream. Repository IS the queue; sender-set EOS; task-protocol glue.
 class sirius_physical_streaming_source : public sirius_physical_operator {
  public:
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::STREAMING_SOURCE;
 
   /// @param input_repository The queue this source drains. Must not be null.
-  /// @param expected_senders Every sender that must call `close_input` before the stream ends —
-  ///        `{0}` for a single producer, `{0 … N-1}` for an N-way fan-in.
+  /// @param expected_senders Senders that must `close_input` before EOS.
   /// @throws sirius::invalid_input_exception when `input_repository` is null.
   sirius_physical_streaming_source(
     duckdb::vector<sirius::logical_type> types,
@@ -54,36 +42,26 @@ class sirius_physical_streaming_source : public sirius_physical_operator {
     std::shared_ptr<cucascade::shared_data_repository> input_repository,
     std::set<exec::sender_id_t> expected_senders);
 
-  /// Wires the two pipeline-facing stream hooks. Both fire on a producer thread, outside the
-  /// stream's lock, and both weak-capture the pipeline rather than `this`:
-  ///
-  /// - end-of-stream → `update_pipeline_status(false)`, so a stream that ends with no task in
-  ///   flight still finishes the pipeline *and* re-arms its downstream consumers;
-  /// - on-data → `task_creator::schedule(head)`, the self-nomination described above. Without it
-  ///   a batch that arrives after the source has been dropped is never looked at.
-  ///
-  /// A stream that has *already* ended fires the first hook inside this call.
+  /// Wire EOS → update_pipeline_status(false); on_data → schedule(head) (self-nomination).
+  /// Without on_data, a WAITING source stays dropped until a task completes — which never happens.
   void set_pipeline(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline) override;
 
   // -----------------------------------------------------------------------
-  // Producer side — called by the session / wrapper, from any thread
+  // Producer side — session / wrapper, any thread
   // -----------------------------------------------------------------------
 
-  /// Register `batch` in the input repository, then fire `on_data`.
-  /// @return false when the stream already ended and the batch was refused.
-  bool push(std::shared_ptr<cucascade::data_batch> batch);
+  /// @return false if terminal (S1). Ignoring the return silently drops the batch.
+  [[nodiscard]] bool push(std::shared_ptr<cucascade::data_batch> batch);
 
-  /// Record that `sender` has finished producing cleanly. Idempotent per sender; the stream ends
-  /// only once every expected sender has closed.
-  /// @throws sirius::invalid_input_exception when `sender` is not an expected sender.
+  /// Sender-set EOS: idempotent per sender.
+  /// @throws sirius::invalid_input_exception when `sender` is not expected.
   void close_input(exec::sender_id_t sender);
 
-  /// A producer failed: poison the input stream. It ends immediately, and the failure is
-  /// rethrown out of `get_next_task_input_data()` — never a clean end-of-stream.
+  /// Poison the input stream (S2 / P1–P4); rethrown from get_next_task_input_data(), never a
+  /// clean EOS.
   /// @throws sirius::invalid_input_exception when `error` is null.
   void fail_input(std::exception_ptr error);
 
-  /// The input stream, for the session and for diagnostics.
   [[nodiscard]] exec::batch_stream& stream() { return *_input; }
 
   // -----------------------------------------------------------------------
@@ -92,39 +70,30 @@ class sirius_physical_streaming_source : public sirius_physical_operator {
 
   bool is_source() const override { return true; }
 
-  /// `READY{this}` when a batch is queued (open or ended); `WAITING{nullptr}` when open and empty;
-  /// `nullopt` at end-of-stream. The `nullptr` producer is deliberate — there is no upstream
-  /// operator for `task_creator` to redirect the request to.
+  /// READY on HAS_DATA (incl. pending error / P4); WAITING_FOR_INPUT_DATA{nullptr} while
+  /// open+empty; nullopt only at clean EOS.
   [[nodiscard]] std::optional<task_creation_hint> get_next_task_hint() override;
 
-  /// True only at a clean end-of-stream: every expected sender closed, queue empty, no producer
-  /// error pending. Drives the task-creation guard and the port-less pipeline-finish predicate,
-  /// so an errored stream is never mistaken for a finished one — it ends by the rethrow out of
-  /// `get_next_task_input_data()`.
+  /// Clean EOS only (S3). Drives task-creation and port-less pipeline-finish.
   [[nodiscard]] bool all_ports_empty() override;
 
-  /// Non-blocking: pop one batch and wrap it in a `pipelineable_operator_data`.
-  /// Returns nullptr when nothing is queued.
-  /// @throws the producer's error, if one is pending, ahead of anything still queued.
+  /// Pop one batch. @throws pending producer error before anything queued (S4).
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   // -----------------------------------------------------------------------
   // Execution
   // -----------------------------------------------------------------------
 
-  /// Pass-through: the sender already materialized these batches; the task only routes them
-  /// downstream.
+  /// Pass-through: batches are already materialized.
   std::unique_ptr<operator_data> execute(const operator_data& input,
                                          rmm::cuda_stream_view stream) override;
 
-  /// Pass-through allocates nothing new; return input bytes so the reservation system
-  /// does not over-reserve with the default 2× heuristic.
+  /// Pass-through: return input bytes so the default 2× heuristic does not over-reserve.
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const input_stats& stats) const override;
 
  private:
-  /// Shared: producer threads co-own it, so the stream they push and close through outlives
-  /// this operator exactly as the repository already did.
+  /// Shared so producer threads co-own the stream past this operator.
   std::shared_ptr<exec::batch_stream> _input;
 };
 

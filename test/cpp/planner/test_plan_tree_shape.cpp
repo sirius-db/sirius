@@ -37,6 +37,7 @@
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_projection.hpp"
+#include "planner/gpu_admission.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
 #include <cudf/types.hpp>
@@ -326,6 +327,8 @@ struct plan_tree_shape_fixture {
       "(9,27),(10,30),(11,33),(12,36),(13,39),(14,42),(15,45),(16,48),(17,51),(18,54),(19,57)");
     con->Query("CREATE TABLE small_right (rid INTEGER, other INTEGER)");
     con->Query("INSERT INTO small_right VALUES (0, 0), (1, 1)");
+    con->Query("CREATE TABLE decimal_values (amount DECIMAL(15,2))");
+    con->Query("INSERT INTO decimal_values VALUES (1.00), (2.50), (3.75)");
 
     // parts/items reproduce TPC-H q17's RIGHT_DELIM_JOIN: the filter on the correlated
     // table keeps the deliminator from rewriting the correlated aggregate into a plain
@@ -361,6 +364,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   REQUIRE(!gpu_scans.empty());
   for (auto* scan : gpu_scans) {
     CHECK(scan->children.empty());
+    CHECK(scan->declared_output_schema_is_runtime_schema());
   }
 }
 
@@ -439,6 +443,30 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(partition->children[0]->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
   }
 
+  SECTION("COUNT(DISTINCT) records LIST locally and BIGINT after merge")
+  {
+    auto plan =
+      generate_sirius_plan(*con, "SELECT val, count(DISTINCT id) FROM big_left GROUP BY val");
+    INFO(tree_to_string(plan.get()));
+
+    auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+    REQUIRE(merge != nullptr);
+    REQUIRE(merge->get_types().size() == 2);
+    CHECK(merge->get_types()[1].id() == sirius::type_id::BIGINT);
+    REQUIRE(merge->children.size() == 1);
+
+    auto* partition = merge->children[0].get();
+    REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
+    REQUIRE(partition->get_types().size() == 2);
+    CHECK(partition->get_types()[1].id() == sirius::type_id::LIST);
+    REQUIRE(partition->children.size() == 1);
+
+    auto* local = partition->children[0].get();
+    REQUIRE(local->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
+    REQUIRE(local->get_types().size() == 2);
+    CHECK(local->get_types()[1].id() == sirius::type_id::LIST);
+  }
+
   SECTION("ungrouped aggregate gains MERGE_AGGREGATE with no PARTITION")
   {
     auto plan = generate_sirius_plan(*con, "SELECT sum(val) FROM big_left");
@@ -448,6 +476,41 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     REQUIRE(merge != nullptr);
     REQUIRE(merge->children.size() == 1);
     CHECK(merge->children[0]->type == SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE);
+  }
+
+  SECTION("AVG records its two-column local accumulator schema below MERGE_AGGREGATE")
+  {
+    auto plan = generate_sirius_plan(*con, "SELECT avg(val) FROM big_left");
+    INFO(tree_to_string(plan.get()));
+
+    auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_AGGREGATE);
+    REQUIRE(merge != nullptr);
+    REQUIRE(merge->get_types().size() == 1);
+    REQUIRE(merge->children.size() == 1);
+
+    auto* local = merge->children[0].get();
+    REQUIRE(local->type == SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE);
+    duckdb::vector<sirius::logical_type> const expected_local_types{
+      sirius::logical_type::make(sirius::type_id::BIGINT),
+      sirius::logical_type::make(sirius::type_id::BIGINT)};
+    CHECK(local->get_types() == expected_local_types);
+  }
+
+  SECTION("AVG preserves its DECIMAL local sum carrier below MERGE_AGGREGATE")
+  {
+    auto plan = generate_sirius_plan(*con, "SELECT avg(amount) FROM decimal_values");
+    INFO(tree_to_string(plan.get()));
+
+    auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_AGGREGATE);
+    REQUIRE(merge != nullptr);
+    REQUIRE(merge->get_types().size() == 1);
+    REQUIRE(merge->children.size() == 1);
+
+    auto* local = merge->children[0].get();
+    REQUIRE(local->type == SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE);
+    REQUIRE(local->get_types().size() == 2);
+    CHECK(local->get_types()[0] == sirius::logical_type::make_decimal(15, 2));
+    CHECK(local->get_types()[1].id() == sirius::type_id::BIGINT);
   }
 }
 
@@ -786,6 +849,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     gen.insert_gpu_pipeline_operators(plan);
 
     auto& delim_ref = plan->Cast<sirius::op::sirius_physical_delim_join>();
+    CHECK_FALSE(delim_ref.declared_output_schema_is_runtime_schema());
     REQUIRE(delim_ref.distinct_root);
     auto* merge = delim_ref.distinct_root.get();
     REQUIRE(merge->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
@@ -850,4 +914,53 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   sirius::planner::sirius_physical_plan_generator generator(*con->context);
   CHECK_THROWS_WITH(generator.create_plan(std::move(logical)),
                     Catch::Contains("Unsupported filter predicate on column 'id'"));
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - admission scan walk reaches delim join subtrees",
+                 "[plan_tree_shape][gpu_admission][isolated_context]")
+{
+  // GPU admission sizes a query from its scans' estimated_cardinality, so a scan it cannot
+  // see is a scan whose bytes are not counted — under-estimating the query and admitting it
+  // onto too few GPUs. DELIM JOIN owns `join`/`distinct_root` outside `children[]`, so a walk
+  // over `children` alone misses everything inside them.
+  //
+  // Cross-check planner::collect_gpu_scans against this suite's independently written
+  // for_each_operator: the two descend the tree separately and must agree.
+  auto plan = generate_sirius_plan(
+    *con,
+    "SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
+    "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)");
+  INFO(tree_to_string(plan.get()));
+
+  REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) != nullptr);
+
+  auto const expected = collect(plan.get(), SiriusPhysicalOperatorType::GPU_SCAN);
+  REQUIRE_FALSE(expected.empty());
+
+  std::vector<const sirius_physical_operator*> found;
+  sirius::planner::collect_gpu_scans(*plan, found);
+
+  CHECK(found.size() == expected.size());
+  for (auto const* op : expected) {
+    CHECK(std::find(found.begin(), found.end(), op) != found.end());
+  }
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - admission scan walk agrees on a plain join",
+                 "[plan_tree_shape][gpu_admission][isolated_context]")
+{
+  // Baseline: with no operator holding subtrees outside children[], both walks agree
+  // trivially. Guards against a descent that double-counts.
+  auto plan =
+    generate_sirius_plan(*con, "SELECT b.val FROM big_left b, small_right s WHERE b.id = s.rid");
+  INFO(tree_to_string(plan.get()));
+
+  auto const expected = collect(plan.get(), SiriusPhysicalOperatorType::GPU_SCAN);
+  REQUIRE(expected.size() == 2);
+
+  std::vector<const sirius_physical_operator*> found;
+  sirius::planner::collect_gpu_scans(*plan, found);
+  CHECK(found.size() == expected.size());
 }

@@ -15,6 +15,7 @@
  */
 
 #include "catch.hpp"
+#include "data/convertible_gpu_pipeline_task.hpp"
 #include "exec/config.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_scheduler.hpp"
@@ -109,6 +110,31 @@ TEST_CASE("Task scheduler can start and stop gracefully", "[task_scheduler]")
   REQUIRE_NOTHROW(executor.stop());
 }
 
+TEST_CASE("Task scheduler derives GPU executor affinity from topology", "[task_scheduler][config]")
+{
+  auto manager = initialize_memory_manager(1);
+  sirius::exec::thread_pool_config gpu_config{2};
+  gpu_config.cpu_affinity_list = {999};
+
+  cucascade::memory::system_topology_info topology;
+  topology.num_gpus = 1;
+  cucascade::memory::gpu_topology_info gpu;
+  gpu.id        = 0;
+  gpu.cpu_cores = {3, 7};
+  topology.gpus.push_back(std::move(gpu));
+
+  task_scheduler executor(
+    gpu_config, *manager, sirius::test::make_test_telemetry_context(), &topology);
+
+  std::size_t visited = 0;
+  executor.visit_executors([&](int device_id, auto const& gpu_executor) {
+    REQUIRE(device_id == 0);
+    REQUIRE(gpu_executor.get_effective_config().cpu_affinity_list == std::vector<int>{3, 7});
+    ++visited;
+  });
+  REQUIRE(visited == 1);
+}
+
 TEST_CASE("Task scheduler executes tasks through pipeline_queue", "[task_scheduler]")
 {
   auto manager = initialize_memory_manager(1);
@@ -158,6 +184,70 @@ TEST_CASE("Task queue handles empty queue gracefully", "[pipeline_queue]")
   REQUIRE(global_state->executed_count.load() == 0);
 
   REQUIRE_NOTHROW(executor.stop());
+}
+
+namespace {
+
+/// Poll until @p done() or @p timeout elapses; FAIL the test on timeout.
+template <typename Pred>
+void wait_or_fail(Pred done, std::chrono::seconds timeout, const char* what)
+{
+  const auto start = std::chrono::steady_clock::now();
+  while (!done()) {
+    std::this_thread::sleep_for(10ms);
+    if (std::chrono::steady_clock::now() - start > timeout) { FAIL(what); }
+  }
+}
+
+}  // namespace
+
+// Regression test for the #1467 deadlock: the downgrade executor extracts
+// queued tasks and returns them via convertible_gpu_pipeline_task's RAII
+// destructor — a direct queue push with no task_available event. With every
+// executor already parked, the pre-fix loop (blocked on the channel) never
+// dispatched them; this stages that interleaving and times out on it.
+TEST_CASE("Tasks extracted and RAII-returned while executors are parked still run",
+          "[task_scheduler][deadlock-1467]")
+{
+  auto manager = initialize_memory_manager(1);
+  sirius::exec::thread_pool_config gpu_config{2};
+  task_scheduler sched(gpu_config, *manager, sirius::test::make_test_telemetry_context());
+
+  auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
+  auto* queue       = sched.get_pipeline_task_queue();
+
+  // Schedule before start() so the extraction below cannot race the matcher.
+  const int num_tasks = 2;
+  for (int i = 0; i < num_tasks; ++i) {
+    auto local_state = std::make_unique<mock_gpu_pipeline_task_local_state>(i, 0);
+    auto task = std::make_unique<mock_gpu_pipeline_task>(i, std::move(local_state), global_state);
+    sched.schedule(std::move(task));
+  }
+
+  // Extract every task, wrapped so the RAII destructor returns it (as the
+  // downgrade's TIER-2 pass does).
+  std::vector<std::unique_ptr<sirius::convertible_gpu_pipeline_task>> extracted;
+  while (auto t = queue->mutable_pop_if([](sirius::parallel::itask&) { return true; },
+                                        /*front_to_back=*/false)) {
+    extracted.push_back(
+      std::make_unique<sirius::convertible_gpu_pipeline_task>(std::move(*t), *queue));
+  }
+  REQUIRE(extracted.size() == num_tasks);
+
+  // Start with an empty queue; every executor posts device_ready and parks.
+  sched.start();
+  std::this_thread::sleep_for(500ms);
+  REQUIRE(global_state->executed_count.load() == 0);
+
+  // Destroying the wrappers pushes the tasks back — the silent return.
+  extracted.clear();
+
+  wait_or_fail([&] { return global_state->executed_count.load() == num_tasks; },
+               10s,
+               "DEADLOCK REGRESSION: RAII-returned tasks were never dispatched "
+               "(downgrade return emitted no event and the matcher never re-ran)");
+
+  sched.stop();
 }
 
 TEST_CASE("Task scheduler dispatches tasks with device preference", "[task_scheduler]")

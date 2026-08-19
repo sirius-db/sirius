@@ -27,7 +27,9 @@
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
+#include <cmath>
 #include <exception>
+#include <limits>
 #include <stdexcept>
 #include <string_view>
 #include <variant>
@@ -138,8 +140,6 @@ static void from_yaml(const YAML::Node& node, exec::thread_pool_config& opt)
 {
   yaml::reader r(node, "thread_pool");
   r.optional("num_threads", opt.num_threads, yaml::greater_than<int>{0});
-  r.optional("thread_name_prefix", opt.thread_name_prefix);
-  r.optional("cpu_affinity", opt.cpu_affinity_list);
   r.reject_unknown();
 }
 
@@ -147,7 +147,6 @@ static void from_yaml(const YAML::Node& node, creator::task_creator_config& opt)
 {
   yaml::reader r(node, "task_creator");
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
-  r.optional("thread_name_prefix", opt.thread_pool.thread_name_prefix);
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("strategy", opt.strategy);
   r.optional("priority_order", opt.priority);
@@ -172,14 +171,18 @@ static void from_yaml(const YAML::Node& node, sirius::io::object_store_config& o
 static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
 {
   yaml::reader r(node, "rest");
+  for (auto const* key : {"ca_bundle_path", "tls_verify"}) {
+    if (r.has(key)) {
+      throw std::runtime_error("'sirius.executor.scan_manager.rest." + std::string(key) +
+                               "': removed; configure 'sirius.executor.scan_manager.object_store." +
+                               key + "' instead");
+    }
+  }
   r.optional("request_timeout_s", opt.request_timeout_s);
-  r.optional("ca_bundle_path", opt.ca_bundle_path);
-  r.optional("tls_verify", opt.tls_verify);
   r.optional("max_connections", opt.max_connections);
   r.optional("chunk_size", yaml::bytes(opt.chunk_size));
   r.optional("max_n_chunks", opt.max_n_chunks);
   r.optional("max_read_split", opt.max_read_split);
-  r.optional("bounce_block_size", yaml::bytes(opt.bounce_block_size));
   r.optional("upkeep_interval_ms", opt.upkeep_interval);
   r.optional("conn_max_age_s", opt.conn_max_age);
   r.optional("retry_backoff_base_ms", opt.retry_backoff_base);
@@ -231,7 +234,6 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
 {
   yaml::reader r(node, "scan_manager");
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{2});
-  r.optional("thread_name_prefix", opt.thread_pool.thread_name_prefix);
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("use_sirius_datasource", opt.use_sirius_datasource);
   r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
@@ -249,6 +251,9 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
 {
   yaml::reader r(node, "operator_params");
   r.optional("scan_task_batch_size", yaml::bytes(opt.scan_task_batch_size));
+  if (opt.scan_task_batch_size == 0) {
+    throw std::runtime_error("'operator_params.scan_task_batch_size': must be greater than zero");
+  }
   r.optional("max_sort_partition_bytes", yaml::bytes(opt.max_sort_partition_bytes));
   r.optional("max_sort_partition_memory_fraction",
              opt.max_sort_partition_memory_fraction,
@@ -261,14 +266,31 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("sort_sample_bytes", yaml::bytes(opt.sort_sample_bytes));
   r.optional("max_build_hash_table_bytes", yaml::bytes(opt.max_build_hash_table_bytes));
   r.optional("max_broadcast_join_size", yaml::bytes(opt.max_broadcast_join_size));
-  r.optional("mark_join_build_switch_ratio", opt.mark_join_build_switch_ratio);
+  r.optional("mark_join_build_switch_ratio",
+             opt.mark_join_build_switch_ratio,
+             yaml::between<double>{0.0, std::numeric_limits<double>::infinity()});
+  r.optional("enable_runtime_distinct_build_probe", opt.enable_runtime_distinct_build_probe);
   r.optional("enable_dynamic_filter_pushdown", opt.enable_dynamic_filter_pushdown);
   r.optional("enable_dynamic_zone_map_filter", opt.enable_dynamic_zone_map_filter);
   r.optional("dynamic_filter_domain_coverage_threshold",
-             opt.dynamic_filter_domain_coverage_threshold);
-  r.optional("dynamic_filter_keep_threshold", opt.dynamic_filter_keep_threshold);
+             opt.dynamic_filter_domain_coverage_threshold,
+             yaml::greater_than<double>{0.0});
+  r.optional("dynamic_filter_inlist_max_l2_fraction",
+             opt.dynamic_filter_inlist_max_l2_fraction,
+             yaml::fraction<double>{});
+  r.optional(
+    "dynamic_filter_keep_threshold", opt.dynamic_filter_keep_threshold, yaml::fraction<double>{});
   r.optional("enable_pinned_zone_map_pruning", opt.enable_pinned_zone_map_pruning);
   r.optional("enable_compressed_materialization", opt.enable_compressed_materialization);
+  // 0 is meaningful here: it turns the estimate off and leaves sizing to gpus_per_query.
+  r.optional("admission_bytes_per_gpu", yaml::bytes(opt.admission_bytes_per_gpu));
+  r.optional("avg_variable_column_bytes", yaml::bytes(opt.avg_variable_column_bytes));
+  // 0 is not meaningful here: variable-width columns would contribute nothing to the per-row
+  // width, so a mixed schema is under-estimated and the query admitted onto too few GPUs.
+  if (opt.avg_variable_column_bytes == 0) {
+    throw std::runtime_error(
+      "'operator_params.avg_variable_column_bytes': must be greater than zero");
+  }
   r.reject_unknown();
 }
 
@@ -288,7 +310,9 @@ static void from_yaml(const YAML::Node& node, compression_config& opt)
   yaml::reader r(node, "compression");
   r.optional("enable_pin_table_compression", opt.enable_pin_table_compression);
   r.optional("min_batch_size_bytes", yaml::bytes(opt.min_batch_size_bytes));
-  r.optional("max_compressed_fraction", opt.max_compressed_fraction);
+  r.optional("max_compressed_fraction", opt.max_compressed_fraction, [](double value) {
+    return std::isfinite(value) && value >= 0.0;
+  });
   r.optional("input_plan_dir", opt.input_plan_dir);
   r.reject_unknown();
 }
@@ -297,7 +321,6 @@ static void from_yaml(const YAML::Node& node, exec::downgrade_executor_config& o
 {
   yaml::reader r(node, "downgrade");
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
-  r.optional("thread_name_prefix", opt.thread_pool.thread_name_prefix);
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("monitor_period", opt.monitor_period);
   r.reject_unknown();
@@ -308,20 +331,39 @@ namespace {
 struct topology {
   /// 0 = auto: use every GPU visible to topology discovery (CUDA_VISIBLE_DEVICES-aware).
   std::variant<size_t, std::vector<int>> num_gpus_or_gpu_ids{size_t{0}};
+  /// 0 = all active GPUs per query (default). Positive value limits each query to the first
+  /// N entries of the sorted active-GPU list, reserving the rest for future concurrent queries.
+  int gpus_per_query{0};
 
   static void from_yaml(const YAML::Node& node, topology& opt)
   {
     yaml::reader r(node, "topology");
-    // gpu_ids and num_gpus are mutually exclusive; try gpu_ids first
-    std::vector<int> ids;
-    r.optional("gpu_ids", ids);
-    if (!ids.empty()) {
+    reject_mutually_exclusive(r, "topology", "gpu_ids", "num_gpus");
+
+    if (r.has_value("gpu_ids")) {
+      std::vector<int> ids;
+      r.optional("gpu_ids", ids);
+      if (ids.empty()) {
+        throw std::runtime_error("topology.gpu_ids must contain at least one device id");
+      }
+      if (std::ranges::any_of(ids, [](int id) { return id < 0; })) {
+        throw std::runtime_error("topology.gpu_ids must contain only non-negative device ids");
+      }
+      auto sorted_ids = ids;
+      std::ranges::sort(sorted_ids);
+      if (std::ranges::adjacent_find(sorted_ids) != sorted_ids.end()) {
+        throw std::runtime_error("topology.gpu_ids must not contain duplicate device ids");
+      }
       opt.num_gpus_or_gpu_ids = std::move(ids);
     } else {
-      size_t n = 0;
+      long long n = 0;
       r.optional("num_gpus", n);
-      opt.num_gpus_or_gpu_ids = n;
+      if (n < 0) { throw std::runtime_error("topology.num_gpus must be non-negative"); }
+      opt.num_gpus_or_gpu_ids = static_cast<size_t>(n);
     }
+    // greater_than{-1} is >= 0: a negative count would otherwise silently read as "use all",
+    // since the admission path treats any non-positive value as unset.
+    r.optional("gpus_per_query", opt.gpus_per_query, yaml::greater_than<int>{-1});
     r.reject_unknown();
   }
 };
@@ -339,11 +381,9 @@ struct gpu_mem_config {
   std::variant<double, std::uint64_t> reservation_limit{1.0};
   double downgrade_trigger_fraction{0.8};
   double downgrade_stop_fraction{0.6};
-  bool track_per_stream_reservation{false};
 
   static void from_yaml(const YAML::Node& node, gpu_mem_config& opt)
   {
-    opt.track_per_stream_reservation = false;
     yaml::reader r(node, "memory.gpu");
     // usage_limit: fraction (double) or absolute bytes — mutually exclusive keys
     std::optional<std::uint64_t> usage_bytes;
@@ -365,7 +405,6 @@ struct gpu_mem_config {
     r.optional(
       "downgrade_trigger_fraction", opt.downgrade_trigger_fraction, yaml::fraction<double>{});
     r.optional("downgrade_stop_fraction", opt.downgrade_stop_fraction, yaml::fraction<double>{});
-    r.optional("track_per_stream_reservation", opt.track_per_stream_reservation);
     r.reject_unknown();
     validate_downgrade_fractions(
       "sirius.memory.gpu", opt.downgrade_trigger_fraction, opt.downgrade_stop_fraction);
@@ -384,7 +423,9 @@ struct gpu_mem_config {
       builder.set_reservation_limit_per_gpu(std::get<std::uint64_t>(reservation_limit));
     }
     builder.set_downgrade_fractions_per_gpu(downgrade_trigger_fraction, downgrade_stop_fraction);
-    builder.track_reservation_per_stream(track_per_stream_reservation);
+    // Keep the high-level path on Sirius's default. The low-level
+    // space.gpu[] replacement surface retains the diagnostic per-stream control.
+    builder.track_reservation_per_stream(false);
   }
 };
 
@@ -586,6 +627,7 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
     // Topology
     topology topo;
     r.optional("topology", topo);
+    _gpus_per_query = topo.gpus_per_query;
 
     // High-level memory config (mutually exclusive with space config)
     gpu_mem_config gpu_cfg;

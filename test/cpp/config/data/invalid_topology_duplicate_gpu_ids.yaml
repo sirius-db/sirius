@@ -1,0 +1,3 @@
+sirius:
+  topology:
+    gpu_ids: [0, 0]

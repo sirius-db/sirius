@@ -284,24 +284,85 @@ void host_table_chunk_reader::column_reader::copy_array(
   auto const child_width =
     static_cast<size_t>(duckdb::GetTypeIdSize(child_vec.GetType().InternalType()));
   auto* child_dest = duckdb::FlatVector::GetData(child_vec);
-  data_accessor.memcpy_to(allocation, child_dest, count * array_size * child_width);
+
+  // The values child is normally fixed-stride, but a gather/sort of a column that holds
+  // NULL arrays (e.g. ORDER BY) compacts the NULL rows' children out, leaving a
+  // shorter, offset-addressed child. Read the LIST offsets to tell the two apart.
+  auto const offset_at = [this, &allocation](size_t idx) -> int64_t {
+    return use_int64_offsets ? offset_accessor_64.get(idx, allocation)
+                             : static_cast<int64_t>(offset_accessor_32.get(idx, allocation));
+  };
+  int64_t const base     = offset_at(row_offset);
+  auto const total_child = static_cast<size_t>(offset_at(row_offset + count) - base);
+
+  if (total_child == count * array_size) {
+    // Fast path: no compaction, every row still owns array_size children in
+    // order, so a single bulk copy reproduces the row-major layout.
+    data_accessor.memcpy_to(allocation, child_dest, count * array_size * child_width);
+
+    // Element-level validity maps straight onto the child vector validity. The
+    // source bits start at absolute child index's base (earlier windows may have
+    // dropped NULL rows' children, so the base is not row_offset*array_size), so
+    // seek there rather than trusting a running cursor the slow path never
+    // advances. Bulk-copy when byte-aligned, else read the shifted bits directly.
+    if (child_null_count != 0) {
+      auto const child_count = count * array_size;
+      auto& child_validity   = duckdb::FlatVector::Validity(child_vec);
+      child_validity.Initialize(child_count);
+      if (static_cast<size_t>(base) % 8 == 0) {
+        auto* child_validity_ptr = reinterpret_cast<uint8_t*>(child_validity.GetData());
+        child_mask_accessor.set_cursor(child_mask_accessor.initial_byte_offset +
+                                       static_cast<size_t>(base) / 8);
+        child_mask_accessor.memcpy_to(
+          allocation, child_validity_ptr, utils::ceil_div_8(child_count));
+      } else {
+        for (size_t e = 0; e < child_count; ++e) {
+          size_t const abs_bit   = static_cast<size_t>(base) + e;
+          uint8_t const src_byte = child_mask_accessor.get(abs_bit / 8, allocation);
+          if (((static_cast<unsigned>(src_byte) >> (abs_bit % 8)) & 1U) == 0U) {
+            child_validity.SetInvalid(e);
+          }
+        }
+      }
+    }
+  } else {
+    // Slow path: the child is compacted. Scatter each row's children (length
+    // offsets[i+1]-offsets[i], i.e. array_size for a present array or 0 for a
+    // NULL array) from the sequential child cursor into its fixed-stride slot.
+    // NULL rows leave their child slots untouched, masked by the list-level
+    // validity below.
+    auto& child_validity = duckdb::FlatVector::Validity(child_vec);
+    if (child_null_count != 0) { child_validity.Initialize(count * array_size); }
+    for (size_t i = 0; i < count; ++i) {
+      int64_t const lo = offset_at(row_offset + i);
+      int64_t const hi = offset_at(row_offset + i + 1);
+      auto const len   = static_cast<size_t>(hi - lo);
+      if (len == 0) { continue; }  // NULL array row: nothing to place
+      data_accessor.memcpy_to(
+        allocation, child_dest + i * array_size * child_width, len * child_width);
+      // Element-level validity: source bits are laid out over the compacted
+      // child (absolute index = offset), so read them bit-by-bit (arbitrary
+      // alignment) and map onto the fixed-stride destination slot. Fetch each
+      // mask byte once and reuse it across the 8 bits it covers.
+      if (child_null_count != 0) {
+        uint8_t src_byte = 0;
+        for (size_t j = 0; j < len; ++j) {
+          size_t const abs_bit = static_cast<size_t>(lo) + j;
+          if (j == 0 || abs_bit % 8 == 0) {
+            src_byte = child_mask_accessor.get(abs_bit / 8, allocation);
+          }
+          if (((static_cast<unsigned>(src_byte) >> (abs_bit % 8)) & 1U) == 0U) {
+            child_validity.SetInvalid(i * array_size + j);
+          }
+        }
+      }
+    }
+  }
 
   // List-level validity
   if (null_count != 0) {
     auto& validity = duckdb::FlatVector::Validity(vector);
     copy_validity_range(validity, row_offset, count, allocation);
-  }
-
-  // Element-level validity: the values child has count*array_size elements
-  // laid out row-major, so its null mask maps straight onto the array's
-  // child vector validity.
-  if (child_null_count != 0) {
-    auto const child_count = count * array_size;
-    assert(utils::mod_8(row_offset * array_size) == 0);  // byte-aligned start
-    auto& child_validity = duckdb::FlatVector::Validity(child_vec);
-    child_validity.Initialize(child_count);
-    auto* child_validity_ptr = reinterpret_cast<uint8_t*>(child_validity.GetData());
-    child_mask_accessor.memcpy_to(allocation, child_validity_ptr, utils::ceil_div_8(child_count));
   }
 }
 

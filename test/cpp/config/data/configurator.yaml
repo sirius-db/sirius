@@ -7,7 +7,6 @@ sirius:
       reservation_limit_fraction: 0.04
       downgrade_trigger_fraction: 0.04
       downgrade_stop_fraction: 0.02
-      track_per_stream_reservation: false
     host:
       capacity_bytes: 160000000
       reservation_limit_fraction: 0.9
@@ -20,10 +19,8 @@ sirius:
   executor:
     pipeline:
       num_threads: 4
-      thread_name_prefix: "sirius_pipeline_executor"
     downgrade:
       num_threads: 1
-      thread_name_prefix: "sirius_downgrade_executor"
       monitor_period: 10ms
   telemetry:
     enable_quent: false

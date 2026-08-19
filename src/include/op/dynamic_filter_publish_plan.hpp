@@ -50,13 +50,24 @@ class dynamic_filter_publish_plan final {
   /// Default fraction of a key's domain a build may cover and still publish that key's filters.
   static constexpr double k_default_domain_coverage_threshold = 0.9;
 
+  /// Default bound on the exact hash IN-list's estimated cuco-set size as a fraction of the
+  /// smallest probe-GPU L2 cache; see operator_params::dynamic_filter_inlist_max_l2_fraction for
+  /// the full semantics.
+  static constexpr double k_default_inlist_max_l2_fraction = 0.125;
+
   dynamic_filter_publish_plan() = default;
+  /// @brief Constructs the plan from the planner's routing, placement, and policy decisions.
+  ///
+  /// The plan performs no domain validation on @p inlist_max_l2_fraction: both configuration
+  /// surfaces already enforce the [0, 1] domain, and tests may legitimately construct out-of-domain
+  /// plans.
   dynamic_filter_publish_plan(
     std::vector<probe_target> probe_targets,
     bool emit_zone_map_filters,
     std::vector<std::size_t> build_key_domain_cardinalities,
     std::vector<dynamic_filter_replica_space> replica_spaces,
-    double domain_coverage_threshold = k_default_domain_coverage_threshold);
+    double domain_coverage_threshold = k_default_domain_coverage_threshold,
+    double inlist_max_l2_fraction    = k_default_inlist_max_l2_fraction);
 
   [[nodiscard]] bool enabled() const noexcept { return !_probe_targets.empty(); }
   [[nodiscard]] std::vector<probe_target> const& probe_targets() const noexcept
@@ -78,12 +89,19 @@ class dynamic_filter_publish_plan final {
   {
     return _domain_coverage_threshold;
   }
+  [[nodiscard]] double inlist_max_l2_fraction() const noexcept { return _inlist_max_l2_fraction; }
+
+  /// \brief Drop replica targets on GPUs outside @p admitted_gpu_ids. An empty list means
+  /// "no subset" and leaves the plan untouched. See
+  /// sirius_pipeline_converter::restrict_dynamic_filter_replicas for why this is needed.
+  void restrict_replicas_to(std::vector<int> const& admitted_gpu_ids);
 
  private:
   std::vector<probe_target> _probe_targets;
   bool _emit_zone_map_filters = false;
   std::vector<std::size_t> _build_key_domain_cardinalities;
   double _domain_coverage_threshold = k_default_domain_coverage_threshold;
+  double _inlist_max_l2_fraction    = k_default_inlist_max_l2_fraction;
   /// Non-owning GPU/HOST placements. See @ref dynamic_filter_replica_space for the lifetime
   /// contract.
   std::vector<dynamic_filter_replica_space> _replica_spaces;

@@ -16,6 +16,7 @@
 
 #include "scan_manager/sirius_scan_manager.hpp"
 
+#include "compression/decompression_pushdown_policy.hpp"
 #include "compression/device_compressed_blob.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
@@ -32,8 +33,11 @@
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/parquet_metadata.hpp"
+#include "op/scan/scan_filter_analysis.hpp"
+#include "op/scan/scan_utils.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
+#include "op/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "planner/query.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
@@ -68,6 +72,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <iterator>
 #include <memory>
 #include <optional>
@@ -103,7 +108,8 @@ struct cached_databatch_provider : public databatch_provider {
                             std::vector<insert_delta_split> delta_splits,
                             std::vector<cudf::data_type> normalization_targets,
                             bool has_physical_overrides,
-                            sirius::decode_equality_pushdown equality_pushdown)
+                            sirius::pushdown_request pushdown_req,
+                            std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters)
     : _plan(std::move(plan)),
       _entry(entry),
       _telemetry_info(telemetry_info),
@@ -111,7 +117,8 @@ struct cached_databatch_provider : public databatch_provider {
       _delta_splits(std::move(delta_splits)),
       _normalization_targets(std::move(normalization_targets)),
       _has_physical_overrides(has_physical_overrides),
-      _equality_pushdown(std::move(equality_pushdown))
+      _pushdown_req(std::move(pushdown_req)),
+      _dynamic_filters(std::move(dynamic_filters))
   {
     auto const& entry_column_names = _entry.cache_info.column_names();
     std::ranges::for_each(selected_columns, [this, &entry_column_names](size_t idx) {
@@ -181,24 +188,72 @@ struct cached_databatch_provider : public databatch_provider {
         // Hand out the projected compressed chunk; decompressed on demand by
         // scan_operator_input::prepare_for_processing.
         auto projected = chunk.compressed->select_columns(_column_indices);
-        // Attach the scan's equality pushdown to this projection only — never to
+        // Attach the scan's decode request to this projection only — never to
         // the shared pinned chunk, which other queries filter differently.
-        // Restricted to columns whose plan can answer a predicate off its
-        // compressed form (a dictionary root); pushing into any other plan is
-        // correct but only moves the comparison, so leave those alone and keep
-        // this a strict no-op for them.
-        if (!_equality_pushdown.empty()) {
-          auto const& ct = chunk.compressed->table();
-          sirius::decode_equality_pushdown chunk_pushdown(_column_indices.size());
-          bool any = false;
-          for (std::size_t i = 0; i < _column_indices.size(); ++i) {
-            if (i >= _equality_pushdown.size() || _equality_pushdown[i].empty()) { continue; }
-            if (!simpatico::column_supports_predicate_decode(ct, _column_indices[i])) { continue; }
-            chunk_pushdown[i] = _equality_pushdown[i];
-            any               = true;
-          }
-          if (any) { projected->set_equality_pushdown(std::move(chunk_pushdown)); }
+        // for_chunk narrows it to what this chunk's compression plans make
+        // worth asking; row dropping is additionally skipped when this operator
+        // carries mvcc keep-masks, since a decode-compacted batch no longer
+        // lines up with a positional deleted-row mask.
+        std::shared_ptr<const sirius::decompression_pushdown_scan> pushdown_scan;
+        if (!_pushdown_req.empty()) {
+          auto scan = std::make_shared<const sirius::decompression_pushdown_scan>(_pushdown_req);
+          // Row dropping cannot compose with a positional deleted-row mask: a
+          // compacted batch no longer lines up with it.
+          if (!_mvcc_masks.empty()) { scan = scan->without_row_selection(); }
+          if (scan) { pushdown_scan = scan->for_chunk(chunk.compressed->table(), _column_indices); }
         }
+        // A PER-BATCH snapshot of the operator's dynamic-filter channel: join
+        // builds publish mid-scan, so later batches legitimately carry more
+        // filters, and `generation` (the channel's monotonic count, read BEFORE
+        // the walk so it never claims filters the walk did not capture) says
+        // which snapshot this batch used.
+        //
+        // THE MAPPING INVARIANT: provider slot order == the ingestible's
+        // materialized_column_order == output columns FIRST, IN OUTPUT ORDER,
+        // then pure-filter columns (gather_by_primary_index at construction),
+        // while the filter set keys by the consumer's OUTPUT-COLUMN position
+        // (parquet installs set_consumer_column_remap with
+        // scan_plan::output_position_by_column_id). Slot i therefore maps to
+        // output position i for every output column, so slot i's filters are
+        // exactly filters_for_column(i); trailing pure-filter slots query keys
+        // the set can never hold (push_filter rejects non-output columns) and
+        // come back empty by construction — no output-arity knowledge is needed
+        // here. Same mvcc guard as the row selection above.
+        //
+        // This drain runs on the metadata thread at query PREPARE, before any
+        // join build has published, so this snapshot is almost always EMPTY. It
+        // is kept as a free early base; the authoritative snapshot is taken at
+        // decode time by scan_operator_input::prepare_for_processing (same
+        // builder, same mapping invariant), which replaces this one.
+        if (sirius::decompression_pushdown_enabled() && _dynamic_filters && _mvcc_masks.empty()) {
+          if (_dynamic_filters->has_filters()) {
+            auto snap = sirius::op::scan::snapshot_membership_probes(*_dynamic_filters,
+                                                                     _column_indices.size());
+            SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
+              "[decompression-pushdown] join filter attach (drain) channel={}: slots={} "
+              "attached={} "
+              "generation={} skipped_non_maskable={}",
+              static_cast<void const*>(_dynamic_filters.get()),
+              _column_indices.size(),
+              snap.attached_probes,
+              snap.generation,
+              snap.skipped_non_mask);
+            if (snap.attached_probes > 0) {
+              auto const base = pushdown_scan
+                                  ? pushdown_scan
+                                  : std::make_shared<const sirius::decompression_pushdown_scan>(
+                                      sirius::pushdown_request{});
+              pushdown_scan = base->with_membership_probes(std::move(snap.probes), snap.generation);
+            }
+          } else {
+            SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
+              "[decompression-pushdown] join filter attach (drain) channel={}: none published yet "
+              "(expected — the drain precedes join publication; the decode-time snapshot "
+              "retries)",
+              static_cast<void const*>(_dynamic_filters.get()));
+          }
+        }
+        if (pushdown_scan) { projected->set_pushdown_scan(std::move(pushdown_scan)); }
         return cucascade::data_batch::make(get_next_batch_id(), std::move(projected));
       }
       // Uncompressed chunk: project the requested columns (positions into the
@@ -349,11 +404,15 @@ struct cached_databatch_provider : public databatch_provider {
   cached_scan_plan _plan;
   std::vector<std::string> _column_names;
   std::vector<size_t> _column_indices;
-  /// Parallel to @c _column_indices; empty entries decompress normally. Only the
-  /// GPU-tier compressed path consumes it (the host path would have to parse the
-  /// chunk header to know whether the plan can exploit it, and that tier is not
-  /// where the decode gather costs anything).
-  sirius::decode_equality_pushdown _equality_pushdown;
+  /// The scan's filter as the decompressor can use it, parallel to
+  /// @c _column_indices. Only the GPU-tier compressed path consumes it: the
+  /// host path would have to parse the chunk header to know what its plans can
+  /// exploit, and that tier is not where the decode costs anything.
+  sirius::pushdown_request _pushdown_req;
+  /// The operator's dynamic-filter channel (may be null). NOT a snapshot: the
+  /// per-batch attach in get_device_databatch snapshots it at serve time so
+  /// batches pick up join filters as they are published mid-scan.
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> _dynamic_filters;
   const pinned_entry& _entry;
   telemetry::batch_telemetry_info _telemetry_info;
   /// This provider's own copy of the entry's per-chunk keep-masks (empty for
@@ -372,29 +431,21 @@ struct cached_databatch_provider : public databatch_provider {
   std::atomic<std::size_t> _index{0};
 };
 
-/// Map the scan's decode-predicate candidates (keyed by column primary index)
-/// onto @p selected_columns, which are positions in the pinned entry's column
-/// list. Returns a vector parallel to @p selected_columns, empty when the scan
-/// offers nothing this entry carries.
-sirius::decode_equality_pushdown build_equality_pushdown(
-  pinned_entry const& entry,
-  std::span<std::size_t const> selected_columns,
-  std::unordered_map<std::size_t, std::vector<std::string>> const& candidates)
+/// The scan's column primary index per served slot: @p selected_columns are
+/// positions in the pinned entry's column list, while a filter analysis is
+/// keyed by primary index. Out-of-range slots map to a sentinel no filter can
+/// match, so they simply carry no request.
+std::vector<std::size_t> primary_index_by_slot(pinned_entry const& entry,
+                                               std::span<std::size_t const> selected_columns)
 {
-  if (candidates.empty()) { return {}; }
-  sirius::decode_equality_pushdown pushdown(selected_columns.size());
-  bool any = false;
+  std::vector<std::size_t> mapping(selected_columns.size(),
+                                   std::numeric_limits<std::size_t>::max());
   for (std::size_t i = 0; i < selected_columns.size(); ++i) {
     auto const entry_pos = selected_columns[i];
     if (entry_pos >= entry.cache_info.column_ids.size()) { continue; }
-    auto const primary_idx =
-      static_cast<std::size_t>(entry.cache_info.column_ids[entry_pos].GetPrimaryIndex());
-    auto const it = candidates.find(primary_idx);
-    if (it == candidates.end()) { continue; }
-    pushdown[i] = it->second;
-    any         = true;
+    mapping[i] = static_cast<std::size_t>(entry.cache_info.column_ids[entry_pos].GetPrimaryIndex());
   }
-  return any ? pushdown : sirius::decode_equality_pushdown{};
+  return mapping;
 }
 
 /// Filter view extracted from the scan's ingestible info: the pushed-down TableFilterSet plus the
@@ -570,7 +621,8 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
 }
 
 void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
-                                            bool enable_pinned_zone_map_pruning)
+                                            bool enable_pinned_zone_map_pruning,
+                                            const std::vector<int>& allocated_gpu_ids)
 {
   _pruning_enabled = enable_pinned_zone_map_pruning;
   reset();
@@ -591,9 +643,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     }
   }
 
-  auto const gpu_ids = _topology_index->gpu_ids();
-  auto round_robin =
-    std::make_shared<round_robin_strategy>(std::vector<int>(gpu_ids.begin(), gpu_ids.end()));
+  auto round_robin = std::make_shared<round_robin_strategy>(allocated_gpu_ids);
 
   _metadata_processor = std::make_unique<load_balancing_scan_batch_coalescer>();
 
@@ -670,7 +720,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   // masks must be finished before serving starts. No-op when no pinned
   // table has rows beyond its prefix.
   if (!_pending_insert_delta_jobs.empty()) {
-    std::vector<int> const delta_gpu_ids(gpu_ids.begin(), gpu_ids.end());
+    std::vector<int> const delta_gpu_ids(allocated_gpu_ids.begin(), allocated_gpu_ids.end());
     run_insert_delta_jobs(_pending_insert_delta_jobs,
                           *_dispatcher,
                           _reservation_manager,
@@ -734,12 +784,42 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
           delta_request->plan.delta_rows());
       }
     }
-    // Columns the scan will only ever test for equality and never project can be
-    // decompressed straight to a BOOL8 mask (see decode_predicate_candidates).
-    auto equality_pushdown =
-      build_equality_pushdown(*assignment.entry,
-                              assignment.columns,
-                              assignment.op->get_ingestible().decode_predicate_candidates());
+    // The scan's filter as the decompressor can use it: columns the query only
+    // ever tests for equality and never projects can come back as the boolean
+    // answer instead of values, and range conjuncts can drop rows while the
+    // batch decodes rather than after it. The ingestible analysed its filter
+    // once at bind; here it is only mapped onto the slots this entry serves.
+    auto const slot_map = primary_index_by_slot(*assignment.entry, assignment.columns);
+    auto pushdown_req   = sirius::op::build_pushdown_request(
+      assignment.op->get_ingestible().filter_analysis(), slot_map);
+    // The provider captures the operator's dynamic-filter CHANNEL (not a
+    // snapshot) so each compressed batch can pick up join-published filters at
+    // serve time.
+    std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters;
+    if (sirius::decompression_pushdown_enabled()) {
+      auto const* pq = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(
+        &assignment.op->get_ingestible().table_info());
+      if (pq != nullptr) { dynamic_filters = pq->sirius_dynamic_filters; }
+      // Channel identity: this pointer must match the one the hash join
+      // publishes into (both resolve through the generator's channel map, keyed
+      // by duckdb's DynamicTableFilterSet pointer) and the one the decode-time
+      // snapshot logs.
+      SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
+        "[decompression-pushdown] entry '{}': join filter channel={} published_now={} decode "
+        "request: "
+        "{} slot(s), covers_whole_filter={}",
+        assignment.entry_name,
+        static_cast<void const*>(dynamic_filters.get()),
+        dynamic_filters ? dynamic_filters->has_filters() : false,
+        pushdown_req.columns.size(),
+        pushdown_req.ranges_cover_whole_filter);
+    } else {
+      // Answering an equality off a dictionary is independent of the gate; row
+      // dropping is not, so give it up when the gate is off.
+      auto const unfiltered =
+        sirius::decompression_pushdown_scan{std::move(pushdown_req)}.without_row_selection();
+      pushdown_req = unfiltered ? unfiltered->request() : sirius::pushdown_request{};
+    }
     // The provider charges a served column only for the cast scan normalization will make, so
     // it needs the scan's carrier targets. They are passed in output order, which is also the
     // order the cached chunks are served in: assignment.columns follows the ingestible's
@@ -757,7 +837,8 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
                                                    std::move(delta_splits),
                                                    assignment.op->normalization_targets(),
                                                    assignment.op->has_physical_overrides(),
-                                                   std::move(equality_pushdown));
+                                                   std::move(pushdown_req),
+                                                   std::move(dynamic_filters));
     _metadata_processor->use_cached_entries_for_pipeline(assignment.op, std::move(provider));
   }
   _pending_mvcc_mask_jobs.clear();
@@ -1645,12 +1726,12 @@ std::optional<cudf::data_type> pinned_column_narrow_carrier(pinned_entry const& 
   // serving validator has inspected the entry this query.
   if (entry_position >= entry.cache_info.column_ids.size()) { return std::nullopt; }
 
-  // Defense against recorded metadata that contradicts the pin-time logical type (or a
-  // logical-type drift between pin time and plan time): every recorded carrier must be a strict
-  // same-family narrowing of the native carrier. All passing carriers share one family and (for
-  // decimals) one scale, so the widest by size is well-defined.
+  // Native equality preserves the logical domain: width and family alone cannot distinguish a
+  // narrowed DATE from a narrowed INTEGER. Valid carriers then share a family and decimal scale,
+  // making the widest carrier well-defined.
   std::optional<cudf::data_type> widest;
   for (auto const& row : entry.column_storage) {
+    if (row[entry_position].native != native_type) { return std::nullopt; }
     auto const carrier = row[entry_position].carrier;
     if (!sirius::can_narrow_to(native_type, carrier)) { return std::nullopt; }
     if (!widest || cudf::size_of(carrier) > cudf::size_of(*widest)) { widest = carrier; }
@@ -1667,7 +1748,8 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   std::vector<insert_delta_split> delta_splits,
   std::vector<cudf::data_type> normalization_targets,
   bool has_physical_overrides,
-  sirius::decode_equality_pushdown equality_pushdown)
+  sirius::pushdown_request pushdown_req,
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters)
 {
   return std::make_unique<cached_databatch_provider>(entry,
                                                      selected_columns,
@@ -1677,7 +1759,8 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
                                                      std::move(delta_splits),
                                                      std::move(normalization_targets),
                                                      has_physical_overrides,
-                                                     std::move(equality_pushdown));
+                                                     std::move(pushdown_req),
+                                                     std::move(dynamic_filters));
 }
 
 cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
@@ -1767,6 +1850,41 @@ cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
   return plan;
 }
 
+namespace {
+
+// DuckDB cache-serve native-type gate. Every non-rowid projection must be present and retain its
+// pin-time native mapping across all chunks. False is a clean cache miss; an empty matrix passes
+// for zero-chunk and hand-built entry compatibility.
+bool pinned_native_types_match_scan(pinned_entry const& entry,
+                                    op::scan::duckdb_native_ingestible_table_info const& info)
+{
+  if (entry.column_storage.empty()) { return true; }
+
+  std::unordered_map<duckdb::idx_t, std::size_t> entry_pos_by_primary;
+  entry_pos_by_primary.reserve(entry.cache_info.column_ids.size());
+  for (std::size_t i = 0; i < entry.cache_info.column_ids.size(); ++i) {
+    entry_pos_by_primary.emplace(entry.cache_info.column_ids[i].GetPrimaryIndex(), i);
+  }
+
+  for (std::size_t ci = 0; ci < info.projected_cols.size(); ++ci) {
+    auto const& pc = info.projected_cols[ci];
+    if (pc.is_rowid) { continue; }
+    auto const it = entry_pos_by_primary.find(pc.storage_idx.GetPrimaryIndex());
+    if (it == entry_pos_by_primary.end()) { return false; }
+    std::optional<cudf::data_type> native;
+    if (ci < info.projected_types.size()) {
+      native = sirius::try_get_cudf_type(info.projected_types[ci]);
+    }
+    if (!native) { return false; }
+    for (auto const& row : entry.column_storage) {
+      if (it->second >= row.size() || row[it->second].native != *native) { return false; }
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
 std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_match_cached_entry(
   op::scan::sirius_gpu_scan_operator* op)
 {
@@ -1776,11 +1894,20 @@ std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_m
     // Identity + serviceability gate: empty when this cache cannot serve the scan
     // (wrong format / file-set / table, or missing a requested column).
     if (entry.cache_info.can_serve_with_columns(table_info).empty()) { continue; }
-    // Cache-or-CPU: for duckdb pins with MVCC metadata, the plan-time guards
-    // promised this scan serves from the pin — the disk-native path is
-    // MVCC-blind and increasingly stale under the pin's checkpoint
-    // suppression, so any failure past the identity gate is a loud error,
-    // never a silent disk fallback.
+    // Check native types before strict MVCC handling so type drift is a clean cache miss rather
+    // than an MVCC error or a cache hit under the wrong type.
+    if (auto const* native_info =
+          dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&table_info);
+        native_info != nullptr && !pinned_native_types_match_scan(entry, *native_info)) {
+      SIRIUS_LOG_INFO(
+        "[sirius_scan_manager] pinned entry '{}' matches operator '{}' by table identity but its "
+        "pin-time native column types differ from the scan's; treating as a cache miss",
+        pinned_name,
+        op->get_operator_id());
+      continue;
+    }
+    // After identity, serviceability, and native-type checks, an MVCC pin must serve from cache.
+    // The disk path is MVCC-blind under checkpoint suppression, so later failures are errors.
     bool const mvcc_strict = entry.mvcc != nullptr;
     try {
       // Serve cached columns in the ingestible's materialized (disk-decode) order rather

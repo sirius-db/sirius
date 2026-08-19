@@ -676,7 +676,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       op_params.enable_dynamic_zone_map_filter,
       std::move(build_key_domains),
       std::move(filter_replica_spaces),
-      op_params.dynamic_filter_domain_coverage_threshold};
+      /*domain_coverage_threshold=*/op_params.dynamic_filter_domain_coverage_threshold,
+      /*inlist_max_l2_fraction=*/op_params.dynamic_filter_inlist_max_l2_fraction};
 
     auto join = duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
       op,
@@ -696,6 +697,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     auto& hj                        = join->Cast<sirius::op::sirius_physical_hash_join>();
     hj.join_stats                   = std::move(op.join_stats);
     hj.mark_join_build_switch_ratio = op_params.mark_join_build_switch_ratio;
+    hj.runtime_distinct_build_probe = op_params.enable_runtime_distinct_build_probe;
 
     // --- Detect build-side key uniqueness ---
     // Gate: only for pure equal conditions (not_distinct_from needs null_equality::EQUAL).

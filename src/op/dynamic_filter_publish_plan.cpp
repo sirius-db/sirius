@@ -29,11 +29,13 @@ dynamic_filter_publish_plan::dynamic_filter_publish_plan(
   bool emit_zone_map_filters,
   std::vector<std::size_t> build_key_domain_cardinalities,
   std::vector<dynamic_filter_replica_space> replica_spaces,
-  double domain_coverage_threshold)
+  double domain_coverage_threshold,
+  double inlist_max_l2_fraction)
   : _probe_targets(std::move(probe_targets)),
     _emit_zone_map_filters(emit_zone_map_filters),
     _build_key_domain_cardinalities(std::move(build_key_domain_cardinalities)),
     _domain_coverage_threshold(domain_coverage_threshold),
+    _inlist_max_l2_fraction(inlist_max_l2_fraction),
     _replica_spaces(std::move(replica_spaces))
 {
   if (!_probe_targets.empty() && _replica_spaces.empty()) {
@@ -61,6 +63,16 @@ dynamic_filter_publish_plan::dynamic_filter_publish_plan(
   std::sort(_replica_spaces.begin(), _replica_spaces.end(), device_less);
   _replica_spaces.erase(std::unique(_replica_spaces.begin(), _replica_spaces.end(), same_device),
                         _replica_spaces.end());
+}
+
+void dynamic_filter_publish_plan::restrict_replicas_to(std::vector<int> const& admitted_gpu_ids)
+{
+  if (admitted_gpu_ids.empty()) { return; }
+  std::erase_if(_replica_spaces, [&](dynamic_filter_replica_space const& target) {
+    auto const gpu_id = target.get_gpu_space().get_device_id();
+    return std::find(admitted_gpu_ids.begin(), admitted_gpu_ids.end(), gpu_id) ==
+           admitted_gpu_ids.end();
+  });
 }
 
 }  // namespace sirius::op

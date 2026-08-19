@@ -60,6 +60,7 @@
 #include <sys/resource.h>
 #include <unistd.h>  // for isatty/fileno
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstddef>
@@ -376,6 +377,7 @@ void SiriusContext::begin_execution_window(ClientContext& context,
   data_repository_registry_.create_for_query(query_id);
   task_creator_->reset();
   task_creator_->set_client_context(context);
+  // GPU admission runs later, in sirius_engine::initialize_internal().
 }
 
 void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::string_view end_tag)
@@ -621,8 +623,9 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   config_ = config;
   // Validate the cached topology before any downstream construction so a stub
   // topology fails loudly rather than producing zero-GPU executors silently.
-  // get_hw_topology() is the only authorised source of GPU/NUMA counts —
-  // never call raw CUDA/NUMA device-enumeration APIs directly elsewhere.
+  // get_hw_topology() is the only authorised source of physical GPU/NUMA discovery — never call
+  // raw CUDA/NUMA device-enumeration APIs directly elsewhere. Configured execution GPU ids come
+  // from the memory manager built below.
   auto const& topo = config_.get_hw_topology();
   if (topo.num_gpus == 0) {
     throw std::runtime_error(
@@ -643,17 +646,18 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 
   // Declare one telemetry device group per GPU so thread/queue telemetry can
   // nest under its device instead of piling up flat under the engine. The GPU
-  // memory space configs already reflect the configured topology.num_gpus /
-  // topology.gpu_ids selection, unlike the raw hardware topology.
-  std::vector<int> telemetry_gpu_ids;
-  for (auto const& space_config : config_.get_memory_space_configs()) {
-    if (auto const* gpu_config =
-          std::get_if<cucascade::memory::gpu_memory_space_config>(&space_config)) {
-      telemetry_gpu_ids.push_back(gpu_config->device_id);
-    }
+  // memory manager already reflects the configured topology.num_gpus / topology.gpu_ids
+  // selection, unlike the raw hardware topology.
+  std::vector<int> active_gpu_ids;
+  for (auto const* gpu_space :
+       memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+    if (gpu_space != nullptr) { active_gpu_ids.push_back(gpu_space->get_device_id()); }
   }
+  std::sort(active_gpu_ids.begin(), active_gpu_ids.end());
+  active_gpu_ids.erase(std::unique(active_gpu_ids.begin(), active_gpu_ids.end()),
+                       active_gpu_ids.end());
   telemetry_context_ = sirius::telemetry::telemetry_context::create(
-    config_.get_telemetry_config(), memory_manager_.get(), telemetry_gpu_ids);
+    config_.get_telemetry_config(), memory_manager_.get(), active_gpu_ids);
 
   if (config_.get_telemetry_config().enable_quent &&
       config_.get_telemetry_config().enable_batch_events) {
@@ -698,49 +702,48 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   topology_index_ = std::make_shared<const sirius::memory::topology_index>(
     config_.get_hw_topology(), *memory_manager_);
 
-  // Enable P2P peer access for every available GPU pair.
+  // Enable P2P peer access for every configured GPU pair.
   // cucascade::convert_gpu_to_gpu calls cudaMemcpyPeerAsync on every GPU->GPU
   // conversion. For that call to bypass host staging, peer access must be
   // enabled ONCE at init for every (src, dst) pair the host supports.
   // Non-fatal failure mode: SIRIUS_LOG_ERROR and continue — host-staged fallback
   // in cucascade's converter is a correct alternate path.
   {
-    auto const& mgpu06_topo = config_.get_hw_topology();
-    if (mgpu06_topo.num_gpus >= 2) {
-      peer_access_enabled_pairs_.reserve(static_cast<size_t>(mgpu06_topo.num_gpus) *
-                                         (mgpu06_topo.num_gpus - 1));
-      for (unsigned i = 0; i < mgpu06_topo.num_gpus; ++i) {
-        rmm::cuda_set_device_raii guard_i{rmm::cuda_device_id{static_cast<int>(i)}};
-        for (unsigned j = 0; j < mgpu06_topo.num_gpus; ++j) {
-          if (i == j) continue;
+    if (active_gpu_ids.size() >= 2) {
+      peer_access_enabled_pairs_.reserve(active_gpu_ids.size() * (active_gpu_ids.size() - 1));
+      for (int source_device : active_gpu_ids) {
+        rmm::cuda_set_device_raii guard_i{rmm::cuda_device_id{source_device}};
+        for (int target_device : active_gpu_ids) {
+          if (source_device == target_device) continue;
           int can_access = 0;
           cudaError_t probe_err =
-            cudaDeviceCanAccessPeer(&can_access, static_cast<int>(i), static_cast<int>(j));
+            cudaDeviceCanAccessPeer(&can_access, source_device, target_device);
           if (probe_err != cudaSuccess) {
             SIRIUS_LOG_ERROR("SiriusContext: cudaDeviceCanAccessPeer({},{}) failed: {}",
-                             i,
-                             j,
+                             source_device,
+                             target_device,
                              cudaGetErrorString(probe_err));
             continue;
           }
           if (can_access == 0) {
-            SIRIUS_LOG_INFO(
-              "SiriusContext: no P2P access {} -> {} -- falling back to host staging", i, j);
+            SIRIUS_LOG_INFO("SiriusContext: no P2P access {} -> {} -- falling back to host staging",
+                            source_device,
+                            target_device);
             continue;
           }
-          cudaError_t enable_err = cudaDeviceEnablePeerAccess(static_cast<int>(j), 0);
+          cudaError_t enable_err = cudaDeviceEnablePeerAccess(target_device, 0);
           // Always consume sticky error state — cudaErrorPeerAccessAlreadyEnabled
           // (and any other non-fatal condition) persists in the runtime until
           // cudaGetLastError() is called, which would make the NEXT CUDA API
           // call fail spuriously in unrelated code (e.g., thrust::exclusive_scan).
           (void)cudaGetLastError();
           if (enable_err == cudaSuccess || enable_err == cudaErrorPeerAccessAlreadyEnabled) {
-            peer_access_enabled_pairs_.emplace(static_cast<int>(i), static_cast<int>(j));
-            SIRIUS_LOG_INFO("SiriusContext: P2P enabled {} -> {}", i, j);
+            peer_access_enabled_pairs_.emplace(source_device, target_device);
+            SIRIUS_LOG_INFO("SiriusContext: P2P enabled {} -> {}", source_device, target_device);
           } else {
             SIRIUS_LOG_ERROR("SiriusContext: cudaDeviceEnablePeerAccess({}) from ctx {} failed: {}",
-                             j,
-                             i,
+                             target_device,
+                             source_device,
                              cudaGetErrorString(enable_err));
           }
         }
@@ -748,8 +751,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     } else {
       SIRIUS_LOG_INFO(
         "SiriusContext: skipping peer-access enable loop (num_gpus={}); "
-        "single-GPU host has no pairs to enable",
-        mgpu06_topo.num_gpus);
+        "configured GPU set has no pairs to enable",
+        active_gpu_ids.size());
     }
   }
 
@@ -1049,8 +1052,11 @@ void SiriusContext::create_query(
     std::move(pipelines), telemetry_context_->context(), query_id, telemetry_info);
   task_scheduler_->prepare_for_query(query_);
   task_creator_->prepare_for_query(*query_);
+  // Reads the admitted subset back off task_creator, so this must run after
+  // initialize_internal has set it — otherwise scan_manager gets the full topology list.
   scan_manager_->prepare_for_query(*query_,
-                                   config_.get_operator_params().enable_pinned_zone_map_pruning);
+                                   config_.get_operator_params().enable_pinned_zone_map_pruning,
+                                   task_creator_->get_active_gpu_ids());
 }
 
 duckdb::shared_ptr<sirius::planner::query> SiriusContext::get_query()

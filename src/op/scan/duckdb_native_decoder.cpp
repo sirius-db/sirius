@@ -586,6 +586,9 @@ staged_column stage_one_array_column(staging_state& s,
 
       if (vseg.all_null) {
         stage_host_copy(s, make_all_null_validity_bytes(vseg.segment_count), vs);
+      } else if (vseg.host_ptr != nullptr) {
+        // Host-backed (transient) array-level validity staged by the insert delta.
+        stage_host_copy(s, {{}, vseg.host_ptr, vseg.bytes_size}, vs);
       } else if (vseg.compression == duckdb::CompressionType::COMPRESSION_ROARING) {
         stage_host_copy(s, decode_roaring_validity(db, block_manager, vseg), vs);
       } else if (vseg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
@@ -610,7 +613,11 @@ staged_column stage_one_array_column(staging_state& s,
       ss.row_count   = static_cast<uint32_t>(seg.segment_count);
       ss.compression = seg.compression;
 
-      if (seg.compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
+      if (seg.host_ptr != nullptr) {
+        // Host-backed (transient) child element bytes staged by the insert
+        // delta; read from host memory rather than the .db file.
+        stage_host_copy(s, {{}, seg.host_ptr, seg.bytes_size}, ss);
+      } else if (seg.compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
         // The child segment's own stats are child-typed numeric stats, so
         // they extract directly — no ArrayStats unwrap.
         auto const& child_stats = constant_segment_stats(seg, col_md.column_id);
@@ -632,6 +639,9 @@ staged_column stage_one_array_column(staging_state& s,
 
       if (vseg.all_null) {
         stage_host_copy(s, make_all_null_validity_bytes(vseg.segment_count), vs);
+      } else if (vseg.host_ptr != nullptr) {
+        // Host-backed (transient) child validity staged by the insert delta.
+        stage_host_copy(s, {{}, vseg.host_ptr, vseg.bytes_size}, vs);
       } else if (vseg.compression == duckdb::CompressionType::COMPRESSION_ROARING) {
         stage_host_copy(s, decode_roaring_validity(db, block_manager, vseg), vs);
       } else if (vseg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {

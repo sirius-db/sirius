@@ -25,6 +25,7 @@
 #include <duckdb/planner/table_filter.hpp>
 
 // standard library
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -50,6 +51,73 @@ namespace sirius::op {
 std::vector<std::optional<std::size_t>> build_batch_column_map(
   const duckdb::vector<duckdb::idx_t>& projection_ids, std::size_t column_ids_count);
 
+/// Where a filter's column lands in the decoded batch.
+enum class filter_column_status : std::uint8_t {
+  /// Resolved: the filter constrains @c batch_position of the decoded batch.
+  usable,
+  /// Not this scan's to apply — a hive partition, which DuckDB already enforced
+  /// at the file-list level, or a filter naming no column of the scan.
+  skipped,
+  /// The column is the scan's but is not in the batch. Every caller has to
+  /// decide this one for itself: a filter that must be evaluated cannot
+  /// reference a column that was never materialized (a wiring bug worth
+  /// failing on), while a filter used only to PRUNE can be dropped silently.
+  not_in_batch,
+};
+
+struct resolved_filter_column {
+  filter_column_status status = filter_column_status::skipped;
+  std::size_t primary_index   = 0;
+  std::size_t batch_position  = 0;
+};
+
+/**
+ * @brief Resolve one entry of a TableFilterSet onto the decoded batch.
+ *
+ * The bookkeeping every walk over a filter set repeats: column_index → primary
+ * index → is it ours → which batch column. Shared so the skip rules and the
+ * bounds checks are stated once; what each walk does with a given filter TYPE
+ * is its own business and deliberately not here.
+ */
+[[nodiscard]] resolved_filter_column resolve_filtered_column(
+  duckdb::idx_t column_index,
+  const duckdb::vector<duckdb::ColumnIndex>& column_ids,
+  const std::vector<std::optional<std::size_t>>& batch_position_by_column_id,
+  const std::unordered_set<std::size_t>& skip_primary_indices);
+
+/**
+ * @brief One top-level conjunct of a scan's pushed-down filter.
+ *
+ * @c expr is the comparison over batch positions, exactly as
+ * @ref convert_table_filters_to_expression would have emitted it. @c primary_index
+ * and @c batch_position name the column it constrains, so a caller that learns
+ * the column arrived already reduced to a boolean answer can swap this conjunct
+ * for a reference to it instead of re-expressing the comparison.
+ */
+struct table_filter_conjunct {
+  std::size_t primary_index  = 0;
+  std::size_t batch_position = 0;
+  duckdb::unique_ptr<duckdb::Expression> expr;
+};
+
+/**
+ * @brief Decompose @p filters into its top-level conjuncts.
+ *
+ * The conjunct set is exactly what @ref convert_table_filters_to_expression
+ * ANDs together — same skips (optional / IS NOT NULL / @p skip_primary_indices),
+ * same order — because that function is implemented on top of this one. A caller
+ * that needs to vary the conjunction per batch decomposes once here rather than
+ * rebuilding the whole expression each time.
+ *
+ * @throws std::runtime_error if a filtered column is not present in the batch.
+ */
+std::vector<table_filter_conjunct> decompose_table_filters(
+  const duckdb::TableFilterSet& filters,
+  const duckdb::vector<duckdb::ColumnIndex>& column_ids,
+  const duckdb::vector<sirius::logical_type>& returned_types,
+  const std::vector<std::optional<std::size_t>>& batch_position_by_column_id,
+  const std::unordered_set<std::size_t>& skip_primary_indices = {});
+
 /**
  * @brief Convert a DuckDB TableFilterSet into a single bound DuckDB expression (conjunction of
  * all filters), suitable for passing to gpu_expression_translator::translate_expression().
@@ -63,13 +131,6 @@ std::vector<std::optional<std::size_t>> build_batch_column_map(
  * partition filters at the file-list level when hive_partitioning is enabled, so dropping them
  * here is safe.
  *
- * @p boolean_substituted_primary_indices names columns that arrive already reduced to a BOOL8
- * predicate result (see @ref extract_string_equality_pushdown and
- * @c sirius::decode_equality_pushdown). Their filter is not re-expressed as a comparison; the
- * batch column *is* the answer, so it contributes a bare boolean reference instead. Passing a
- * column here whose batch column is not actually BOOL8 silently mis-types the expression, so
- * callers must confirm the substitution happened for the batch in hand.
- *
  * Returns nullptr if the filter set is empty or contains only unsupported/skipped filter types.
  */
 duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
@@ -77,28 +138,7 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
   const duckdb::vector<duckdb::ColumnIndex>& column_ids,
   const duckdb::vector<sirius::logical_type>& returned_types,
   const std::vector<std::optional<std::size_t>>& batch_position_by_column_id,
-  const std::unordered_set<std::size_t>& skip_primary_indices                = {},
-  const std::unordered_set<std::size_t>& boolean_substituted_primary_indices = {});
-
-/**
- * @brief Per-column string constants for filters that are pure equality / IN tests.
- *
- * Returns, keyed by column primary index, the value set a column is compared
- * against when its whole pushed-down filter is an equality, an @c IN, or an OR of
- * those over non-null VARCHAR constants (an ANDed @c IS NOT NULL is absorbed —
- * an equality already rejects nulls). Columns with any other filter shape, or a
- * non-string constant, are absent.
- *
- * This is the decision input for pushing a predicate into decompression: such a
- * column can be answered off a dictionary's key set instead of being decoded
- * (@c simpatico::decode_predicate). The caller must additionally confirm the
- * column is never projected — the pushdown replaces its values with a BOOL8
- * mask — and that its compression plan can actually exploit it.
- */
-std::unordered_map<std::size_t, std::vector<std::string>> extract_string_equality_pushdown(
-  const duckdb::TableFilterSet& filters,
-  const duckdb::vector<duckdb::ColumnIndex>& column_ids,
-  const duckdb::vector<sirius::logical_type>& returned_types);
+  const std::unordered_set<std::size_t>& skip_primary_indices = {});
 
 /**
  * @brief Bridge a DuckDB filter expression through sirius::ast::from_duckdb into the
