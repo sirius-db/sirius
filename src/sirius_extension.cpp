@@ -1867,10 +1867,12 @@ static duckdb::unique_ptr<duckdb::SiriusContext::SlotGuard> lock_operator_params
 
 static void SetDefaultScanTaskBatchSize(ClientContext& context, SetScope scope, Value& parameter)
 {
+  auto const bytes = UBigIntValue::Get(parameter);
+  if (bytes == 0) { throw InvalidInputException("scan_task_batch_size must be greater than zero"); }
   auto* params = get_operator_params(context);
   if (!params) { return; }
   auto slot                    = lock_operator_params_slot(context);
-  params->scan_task_batch_size = UBigIntValue::Get(parameter);
+  params->scan_task_batch_size = bytes;
   SIRIUS_LOG_DEBUG("Updated config SCAN_TASK_BATCH_SIZE to {}", params->scan_task_batch_size);
 }
 
@@ -2304,6 +2306,11 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                               LogicalType::BOOLEAN,
                               Value::BOOLEAN(operator_defaults.enable_dynamic_zone_map_filter),
                               SetEnableDynamicZoneMapFilter);
+    config.AddExtensionOption("scan_task_batch_size",
+                              "TEST ONLY: override the internally derived scan batch target",
+                              LogicalType::UBIGINT,
+                              Value::UBIGINT(operator_defaults.scan_task_batch_size),
+                              SetDefaultScanTaskBatchSize);
   }
 
   // Add in config options for special JIT implementation for regex
@@ -2328,14 +2335,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(true),
                             SetFuseMergePipelines);
-
-  // Add in config options for duckdb scan task
-  // Default batch size
-  config.AddExtensionOption("scan_task_batch_size",
-                            "The default batch size for a duckdb scan task",
-                            LogicalType::UBIGINT,
-                            Value::UBIGINT(operator_defaults.scan_task_batch_size),
-                            SetDefaultScanTaskBatchSize);
 
   // Add in config option for sort partition size
   config.AddExtensionOption("max_sort_partition_bytes",
