@@ -233,7 +233,7 @@ void scan_operator_input::prepare_for_processing(
       // unmasked, unfiltered scan may take ownership of it here instead of
       // deep-copying it at materialize. Masked / row-filtered splits keep the
       // view path: they filter by copy and need the source view alive. Splits
-      // pending a carrier conversion keep it too: normalize_physical_schema
+      // pending a carrier conversion keep it too: normalize_physical_schema_casts
       // allocates a cast output AFTER materialize, and if that cast OOMs the
       // rescheduled task must be able to re-enter materialize — impossible once
       // the wrapper batch has been emptied by the take. A decode-row-filtered

@@ -305,7 +305,7 @@ struct cached_databatch_provider : public databatch_provider {
   }
 
   // True when scan normalization will cast the recorded stored @p carrier to @p target: the same
-  // predicate normalize_physical_schema applies per column.
+  // predicate normalize_physical_schema_casts applies per column.
   [[nodiscard]] bool will_convert(cudf::data_type carrier, cudf::data_type target) const
   {
     if (carrier == target) { return false; }
