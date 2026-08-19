@@ -96,6 +96,15 @@ find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)
 
+# The static vcpkg build only exports cuvs::cuvs_static; conda's shared build
+# already provides cuvs::cuvs. Provide the canonical name when it is missing so
+# both build paths link cuvs::cuvs the same way below.
+if(NOT TARGET cuvs::cuvs)
+  add_library(cuvs::cuvs INTERFACE IMPORTED)
+  set_target_properties(cuvs::cuvs PROPERTIES INTERFACE_LINK_LIBRARIES
+                                              cuvs::cuvs_static)
+endif()
+
 # Static NVRTC (vcpkg overlay port). Statically linking the runtime JIT compiler
 # keeps libnvrtc.so out of the distributed extension's runtime dependencies.
 # Like cuco/nvcomp, this is gated on the vcpkg build: the overlay port provides
