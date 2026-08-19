@@ -206,6 +206,25 @@ chunk_pushdown_config build_chunk_pushdown_config(simpatico::compressed_table co
     config.routes[i] = capability.decode.compact_route;
     if (capability.decode.compact_route != sirius::codegen::decode_route::full) { ++compactable; }
     if (!config.ranges[i].requested) { continue; }
+    if (config.ranges[i].bounds.lo > config.ranges[i].bounds.hi) {
+      // A provably empty bound (e.g. `x >= 5 AND x <= 3`) is valid SQL that
+      // simply selects nothing — sound to drop like any other conjunct this
+      // narrowing can't evaluate. Forwarding it to the JIT assembly instead
+      // would refuse the WHOLE decode (simpatico_codegen.cpp's `lo > hi`
+      // check), abandoning every other source in this request too; dropping
+      // it here keeps the rest of the plan on the fast path and leaves the
+      // scan's own residual filter to correctly return no rows.
+      SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
+        "[decompression-pushdown] config: DROPPING provably empty range conjunct on selected pos "
+        "{} (physical {}): [{}, {}]",
+        i,
+        physical,
+        config.ranges[i].bounds.lo,
+        config.ranges[i].bounds.hi);
+      config.ranges[i].requested = false;
+      dropped_conjunct           = true;
+      continue;
+    }
     if (!capability.can_select_rows()) {
       SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
         "[decompression-pushdown] config: DROPPING range conjunct on selected pos {} (physical {}) "
@@ -457,6 +476,7 @@ decompression_pushdown_scan::without_row_selection() const
     narrowed.columns.push_back({column.equals_any, std::nullopt, {}});
   }
   if (narrowed.empty()) { return nullptr; }
+  narrowed.row_selection_disabled = true;
   return std::make_shared<const decompression_pushdown_scan>(std::move(narrowed));
 }
 
@@ -499,26 +519,60 @@ decompression_pushdown_scan::compaction_forecast decompression_pushdown_scan::fo
 {
   compaction_forecast forecast{};
   if (!decompression_pushdown_enabled()) { return forecast; }
+  if (_request.row_selection_disabled) { return forecast; }
   if (!_request.ranges_cover_whole_filter) { return forecast; }
-  bool const any_range = std::any_of(_request.columns.begin(),
-                                     _request.columns.end(),
-                                     [](auto const& c) { return c.range.has_value(); });
+
+  // Count every source the real decode would carry into wave 1 (range +
+  // equality + one entry per membership probe, mirroring
+  // decompress_with_pushdown's `sources` list — a range not yet known to
+  // survive planning is counted too, which only makes this conservative)
+  // against kMaxSelectionSources: beyond it the real decode declines
+  // outright and falls back to the full envelope, which this forecast must
+  // not under-reserve for.
+  std::size_t total_sources = 0;
+  bool any_range            = false;
+  for (auto const& column : _request.columns) {
+    if (column.range.has_value()) {
+      any_range = true;
+      ++total_sources;
+    }
+    if (!column.equals_any.empty()) { ++total_sources; }
+    total_sources += column.membership.size();
+  }
   if (!any_range) { return forecast; }
+  if (total_sources > kMaxSelectionSources) { return forecast; }
 
   // Mirrors the planning above: every column this projection decodes must come
   // back compacted, else the decode runs plain and the caller must reserve the
   // full envelope. A column decoded through a dictionary gather also lifts the
   // selectivity ceiling — that shape wins at every selectivity, so the decode
-  // never gives compaction up for it and the surviving row count is unbounded.
-  bool any_unbounded = false;
-  for (auto const index : selected) {
+  // never gives compaction up for it; str_split is unbounded the same way,
+  // since one surviving row's string length is not bounded by how many rows
+  // survive. Neither lets the reservation shrink below the full envelope.
+  bool any_unbounded     = false;
+  bool any_mask_producer = false;
+  for (std::size_t i = 0; i < selected.size(); ++i) {
+    auto const index = selected[i];
     if (index >= chunk.columns.size()) { return forecast; }
     auto const& plan_tree = chunk.columns[index].plan_tree;
     if (!plan_tree) { return forecast; }
-    auto const route = simpatico::probe_column(*plan_tree).compact_route;
+    auto const capability = simpatico::probe_column(*plan_tree);
+    auto const route      = capability.compact_route;
     if (route == sirius::codegen::decode_route::full) { return forecast; }
-    any_unbounded = any_unbounded || route == sirius::codegen::decode_route::dict_codes;
+    any_unbounded = any_unbounded || route == sirius::codegen::decode_route::dict_codes ||
+                    route == sirius::codegen::decode_route::str_split;
+    // A range conjunct on this column can only drive compaction if this
+    // column's own plan can PRODUCE the mask (bitpack_mask); delta_mask,
+    // dict_codes and str_split can only CONSUME an already-produced one —
+    // see column_decode_caps::can_produce_mask. Without at least one
+    // mask-producing range column, planning drops every range conjunct and
+    // the decode never compacts at all.
+    if (i < _request.columns.size() && _request.columns[i].range.has_value() &&
+        capability.can_produce_mask()) {
+      any_mask_producer = true;
+    }
   }
+  if (!any_mask_producer) { return forecast; }
   forecast.compacts          = true;
   forecast.survivors_bounded = !any_unbounded;
   return forecast;
@@ -545,7 +599,7 @@ decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
     predicates.size(),
     request.empty());
 
-  if (!request.empty()) {
+  if (!request.empty() && !request.row_selection_disabled) {
     out.table = decompress_with_pushdown(chunk, selected, request, stream, mr, out.outcome);
   }
   if (!out.table) {

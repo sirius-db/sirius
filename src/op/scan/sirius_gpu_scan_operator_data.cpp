@@ -343,7 +343,7 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
     bool const unprofitable = pushdown_selection_unprofitable &&
                               pushdown_selection_unprofitable->load(std::memory_order_relaxed);
     if (auto const forecast = pushdown_compaction_forecast(*this);
-        forecast.compacts && !unprofitable) {
+        forecast.compacts && !unprofitable && !dynamic_filter_possible) {
       // Reservation for a compacting decode: the selection mask (1 bit/row per
       // filtered column — <= batch/4 across the source limit at >= 4 B/row
       // columns) plus the compacted outputs, and such splits steal their table,
@@ -354,6 +354,12 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
       // over-reservation handling; by policy that only happens where the
       // forecast was wrong. Replaces a ~5x over-reservation on
       // highly-selective batches.
+      //
+      // The forecast only knows about this split's STATIC request — a
+      // membership probe attaches fresh per batch and adds its own key
+      // decode + BOOL8 mask on top, which this envelope has no way to
+      // size. Excluded here so that extra cost falls back to the
+      // conservative branch below instead of being silently unreserved.
       auto const cap =
         forecast.survivors_bounded ? sirius::decompression_pushdown_max_selectivity() : 1.0;
       return batch_bytes / 4 + static_cast<std::size_t>(static_cast<double>(batch_bytes) * cap);

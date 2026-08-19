@@ -609,6 +609,11 @@ std::unique_ptr<cudf::column> decode_fused_subtree_impl(PlanTree const& tree,
     if (error_out) *error_out = "codegen decompress: output column alloc failed";
     return nullptr;
   }
+  // A zero-survivor chunk has nothing to decode, and a 0-row column's data
+  // pointer is null — launching against it would look like an allocation
+  // failure to the kernel and get refused, forcing a needless full-width
+  // fallback decode of a chunk that was already known to produce no rows.
+  if (masked && sel->survivor_count == 0) { return out_col; }
   if (masked) {
     // Mask walk: decode over all num_rows input rows with the mask
     // words + chunk offsets as kernel arguments, writing only survivor rows
