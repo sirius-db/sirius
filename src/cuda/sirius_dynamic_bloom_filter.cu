@@ -16,6 +16,9 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/stream_compaction.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
 
 // cucascade
 #include <rmm/cuda_device.hpp>
@@ -270,7 +273,18 @@ sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const
     throw std::invalid_argument(
       "[sirius_dynamic_bloom_filter] unsupported key type (INT32 or INT64).");
   }
-  auto const n = keys.size();
+  // Null build slots carry no key value and must not enter the set: ingest only the valid rows.
+  // (The IN-list filters instead refuse nullable input in their supports(); Bloom accepts it and
+  // compacts.) The compacted column is allocated and consumed on `stream`, so its stream-ordered
+  // free at scope exit sequences after add_async. Sizing from the valid rows keeps
+  // estimated_bytes(total_rows) an upper bound.
+  std::unique_ptr<cudf::table> compacted;
+  cudf::column_view build_keys = keys;
+  if (keys.null_count() > 0) {
+    compacted  = cudf::drop_nulls(cudf::table_view{{keys}}, {0}, stream, mr);
+    build_keys = compacted->view().column(0);
+  }
+  auto const n = build_keys.size();
   cuda::stream_ref const s{stream.value()};
   auto const num_blocks = blocks_for(n);
   _impl                 = std::make_unique<impl>();
@@ -281,10 +295,12 @@ sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const
   std::unique_ptr<bloom_replica> source;
   switch (keys.type().id()) {
     case cudf::type_id::INT32:
-      source = build_bloom_replica<std::int32_t>(_impl->source_device, keys, num_blocks, mr, s);
+      source =
+        build_bloom_replica<std::int32_t>(_impl->source_device, build_keys, num_blocks, mr, s);
       break;
     case cudf::type_id::INT64:
-      source = build_bloom_replica<std::int64_t>(_impl->source_device, keys, num_blocks, mr, s);
+      source =
+        build_bloom_replica<std::int64_t>(_impl->source_device, build_keys, num_blocks, mr, s);
       break;
     default:
       throw std::logic_error(

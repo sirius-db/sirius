@@ -50,7 +50,6 @@
 #include "sirius_context.hpp"
 
 #include <algorithm>
-#include <cassert>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -522,7 +521,19 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           }
           auto& scan = terminal.node->Cast<sirius::op::sirius_physical_table_scan>();
           // The exit ordinal is the scan-route push coordinate; see dynamic_filter_route_class.
-          assert(terminal.ordinal < scan.types.size());
+          if (terminal.ordinal >= scan.types.size()) {
+            // The trace owns this invariant; a violation is a planner bug elsewhere. Refuse the
+            // binding rather than read out of bounds — losing it only forfeits pruning.
+            SIRIUS_LOG_WARN(
+              "[sirius_plan_comparison_join] dynamic filter key {}: scan-route terminal at scan "
+              "'{}' carries exit ordinal {} outside the scan's {} output columns; skipping this "
+              "binding.",
+              key_index,
+              scan.function.name,
+              terminal.ordinal,
+              scan.types.size());
+            continue;
+          }
           auto const [entry, inserted] = target_by_scan.try_emplace(terminal.node, targets.size());
           if (inserted) {
             // The scan node is the pairing point: an inner producer's scan already carries its
@@ -575,7 +586,18 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
             return endpoint;
           });
         left = std::move(placed.subtree);
-        assert(site_channels.size() == placed.site_ordinals.size());
+        if (site_channels.size() != placed.site_ordinals.size()) {
+          // The walk owns this invariant; a violation is a planner bug elsewhere. Leave the
+          // spliced endpoints unwired (an empty channel passes rows through) rather than pair
+          // channels and ordinals out of bounds.
+          SIRIUS_LOG_WARN(
+            "[sirius_plan_comparison_join] dynamic filter key {}: direct-route walk placed {} "
+            "endpoints but recorded {} site ordinals; skipping this key's bindings.",
+            key_index,
+            site_channels.size(),
+            placed.site_ordinals.size());
+          continue;
+        }
         for (std::size_t site = 0; site < site_channels.size(); ++site) {
           // The site ordinal is the direct-route push coordinate; see dynamic_filter_route_class.
           targets.push_back({.filter_set  = std::move(site_channels[site]),

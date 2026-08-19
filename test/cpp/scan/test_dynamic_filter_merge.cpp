@@ -25,6 +25,7 @@
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/filling.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
@@ -611,6 +612,61 @@ TEST_CASE("sirius_dynamic_bloom_filter supports INT32 keys with no false negativ
   REQUIRE(survivors.size() <= 10);
   REQUIRE(std::vector<int32_t>(survivors.begin(), survivors.begin() + 5) ==
           std::vector<int32_t>{0, 1, 2, 3, 4});
+}
+
+TEST_CASE("sirius_dynamic_bloom_filter excludes null build slots from the key set",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream = cudf::get_default_stream();
+
+  // Build keys [0,1,2,3,4,999] with the 999 slot nulled: only {0..4} may enter the set.
+  std::vector<int64_t> const key_values{0, 1, 2, 3, 4, 999};
+  auto keys = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT64}, 6, cudf::mask_state::ALL_VALID, stream);
+  cudaMemcpyAsync(keys->mutable_view().data<int64_t>(),
+                  key_values.data(),
+                  key_values.size() * sizeof(int64_t),
+                  cudaMemcpyHostToDevice,
+                  stream.value());
+  cudf::set_null_mask(keys->mutable_view().null_mask(), 5, 6, false, stream);
+  keys->set_null_count(1);
+
+  // Reference filter over the same valid keys, built without nulls. Compaction is exact and the
+  // hash policy deterministic, so the nullable build must produce a bit-identical filter.
+  auto clean_keys = cudf::sequence(5,
+                                   cudf::numeric_scalar<int64_t>(0, true, stream),
+                                   cudf::numeric_scalar<int64_t>(1, true, stream),
+                                   stream);
+
+  sirius_dynamic_filter_set nullable_channel;
+  nullable_channel.push_filter(0,
+                               std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(
+                                 keys->view(), stream, cudf::get_current_device_resource_ref()));
+  sirius_dynamic_filter_set reference_channel;
+  reference_channel.push_filter(
+    0,
+    std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(
+      clean_keys->view(), stream, cudf::get_current_device_resource_ref()));
+
+  // Probe [0..9] plus 999 — the value present only at the null build slot.
+  auto probe = make_values_table<int64_t>(
+    {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 999}, cudf::data_type{cudf::type_id::INT64}, stream);
+  auto out_nullable =
+    sirius::op::scan::apply_dynamic_filters_to_view(probe->view(), nullable_channel, stream);
+  auto out_reference =
+    sirius::op::scan::apply_dynamic_filters_to_view(probe->view(), reference_channel, stream);
+  stream.synchronize();
+  REQUIRE(out_nullable != nullptr);
+  REQUIRE(out_reference != nullptr);
+
+  auto const survivors = to_host_int64(out_nullable->view().column(0), stream);
+  // No false negatives: the five valid keys lead the probe and must all survive, in order.
+  REQUIRE(survivors.size() >= 5);
+  REQUIRE(std::vector<int64_t>(survivors.begin(), survivors.begin() + 5) ==
+          std::vector<int64_t>{0, 1, 2, 3, 4});
+  // Identical behavior to the clean build — this is the deterministic assertion: before the fix
+  // the raw ingest added the null slot's payload, so 999 always survived the nullable filter.
+  REQUIRE(survivors == to_host_int64(out_reference->view().column(0), stream));
 }
 
 TEST_CASE("sirius_dynamic_in_list_filter keeps a build key equal to the INT64 sentinel",

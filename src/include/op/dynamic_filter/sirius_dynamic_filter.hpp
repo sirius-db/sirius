@@ -446,7 +446,8 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
    * @throw std::runtime_error if the current CUDA device cannot be identified
    * @throw std::logic_error if the validated key type changes during construction
    *
-   * @param[in] keys INT32 or INT64 build keys
+   * @param[in] keys INT32 or INT64 build keys; may be nullable — null slots carry no key value
+   * and are excluded from the set (the filter is built from the valid rows only)
    * @param[in] stream Stream used to build the Bloom filter
    * @param[in] mr Device memory resource backing the filter
    */
@@ -484,7 +485,8 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
 
   /**
    * @brief Estimated device footprint in bytes of the Bloom bit array for @p num_keys keys at this
-   * filter's fixed bits-per-key budget
+   * filter's fixed bits-per-key budget. With nullable build keys the constructed filter is sized
+   * from the valid rows, so an estimate from the total row count is an upper bound.
    */
   [[nodiscard]] static std::size_t estimated_bytes(std::size_t num_keys) noexcept;
 
