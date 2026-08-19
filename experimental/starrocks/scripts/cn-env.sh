@@ -7,6 +7,17 @@
 #
 # NIXL_PREFIX / UCX_PREFIX / NIXL_PLUGIN_DIR may also be overridden individually; values
 # already exported by the operator always win.
+#
+# ONE MANUAL STEP THIS FILE DOES NOT DO FOR YOU: the CN's exchange RPCs are a Sirius-only
+# extension to StarRocks' internal_service.proto, and nothing applies them automatically. On a
+# fresh clone, or after any `git submodule update` that resets the submodule working tree:
+#
+#   git -C ../starrocks apply ../patches/nixl-exchange-proto.patch
+#
+# build.rs checks for it and fails with that command in the message, so you cannot get far
+# without noticing -- but doing it up front saves a build.
+#
+# For the environment variables the CN itself reads, see docs/TUNABLES.md.
 
 _here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)   # experimental/starrocks/scripts
 SR_DIR=$(cd "$_here/.." && pwd)                       # experimental/starrocks

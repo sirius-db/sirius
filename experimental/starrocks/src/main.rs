@@ -7,7 +7,7 @@ use clap::Parser;
 use sirius_starrocks_cn::StubExecutor;
 use sirius_starrocks_cn::{
     BackendServer, BrpcServer, ComputeNodeConfig, EngineReadiness, ExchangeIdentity, FeConfig,
-    FragmentExecutor, HeartbeatServer, HttpServer, NixlTransport, SharedHeartbeatState,
+    FragmentExecutor, HeartbeatServer, HttpServer, NixlTransport, SharedHeartbeatState, Tunables,
     register_node, report_to_frontend_once, start_backend_server, start_heartbeat_server,
     start_http_server,
 };
@@ -154,6 +154,13 @@ impl Args {
     /// Starts the CN listeners, registers with FE, and waits for shutdown.
     #[instrument(name = "compute_node", skip_all)]
     async fn run(self) -> Result<()> {
+        // FIRST, before a port is bound or a GPU pool is reserved: read and validate every
+        // transport tunable, and log what this CN actually got. A rejected value fails startup
+        // here rather than surfacing as an unexplained timeout mid-sweep, and the log line is
+        // the ground truth for the knobs the same way `derived-sirius-config.yaml` is for the
+        // engine config (`bench/a100x8/TUNING.md` §1).
+        Tunables::resolve().map_err(|err| anyhow!("invalid CN transport tunable: {err}"))?;
+
         let state = SharedHeartbeatState::new();
         // Closed until the engine is up. Binding the listeners first (below) is what closes the
         // ~7 s window in which this process existed but answered nothing; this gate is what stops

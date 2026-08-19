@@ -305,19 +305,28 @@ mod agent_tier {
         PExchangeNixlMd, PExchangeNixlMdResult, PStagingLeaseRequest, PStagingLeaseResult,
         PTransmitPackedParams, PTransmitPackedResult, PUniqueId, StatusPb,
     };
+    use crate::tunable::Tunables;
 
     /// Bytes of the mandatory first-contact bandwidth canary (finding F1): pool memory over
     /// cuda_ipc silently degrades ~220x with correct bytes, so a slow link must be refused, not
-    /// tolerated.
-    pub(super) const CANARY_BYTES: u64 = 16 << 20;
+    /// tolerated. Tunable via `SIRIUS_CN_NIXL_CANARY_BYTES` (see [`crate::tunable`]).
+    pub(super) fn canary_bytes() -> u64 {
+        Tunables::get().canary_bytes
+    }
     /// A small first WRITE settles UCX connection wireup so the canary times the steady link,
-    /// not the handshake.
+    /// not the handshake. Not tunable: it is a wireup settle, not a measurement.
     pub(super) const WARMUP_BYTES: u64 = 1 << 20;
     /// Floor under which the link is declared degraded. The healthy same-host cuda_ipc path
-    /// measured ~85-90 GB/s; the degraded staged-copy path ~0.4 GB/s.
-    pub(super) const CANARY_FLOOR_GBPS: f64 = 2.0;
-    /// Bound on waiting for one posted WRITE to reach DONE.
-    const XFER_TIMEOUT: Duration = Duration::from_secs(30);
+    /// measured ~85-90 GB/s (A100) and 322-399 GB/s (GB200 NV18); the degraded staged-copy path
+    /// ~0.4 GB/s. Tunable via `SIRIUS_CN_NIXL_CANARY_FLOOR_GBPS`; `0` disables the check.
+    pub(super) fn canary_floor_gbps() -> f64 {
+        Tunables::get().canary_floor_gbps
+    }
+    /// Bound on waiting for one posted WRITE to reach DONE. Tunable via
+    /// `SIRIUS_CN_NIXL_XFER_TIMEOUT_SECS`.
+    fn xfer_timeout() -> Duration {
+        Tunables::get().xfer_timeout
+    }
 
     impl NixlTransport {
         /// Brings up the transport on a dedicated thread (fail-fast): nixl agent named
@@ -620,12 +629,14 @@ mod agent_tier {
             client: &mut PrpcClient,
             remote_agent: &str,
         ) -> Result<(), String> {
+            let canary_bytes = canary_bytes();
+            let floor_gbps = canary_floor_gbps();
             let local_offset = self
                 .executor
-                .staging_lease(CANARY_BYTES)
+                .staging_lease(canary_bytes)
                 .map_err(|err| format!("failed to lease canary staging bytes locally: {err}"))?;
             let result = (|| {
-                let lease = rpc_request_lease(client, CANARY_BYTES)?;
+                let lease = rpc_request_lease(client, canary_bytes)?;
                 let local_addr = self.staging_base + local_offset;
                 // Warmup settles connection wireup; the timed WRITE measures the steady link.
                 write_and_wait(
@@ -640,7 +651,7 @@ mod agent_tier {
                     remote_agent,
                     local_addr,
                     lease.remote_addr,
-                    CANARY_BYTES,
+                    canary_bytes,
                 )?;
                 // The canary flag makes the peer release its lease without touching its engine.
                 rpc_transmit(
@@ -648,24 +659,29 @@ mod agent_tier {
                     PTransmitPackedParams {
                         canary: Some(true),
                         offset: Some(lease.offset),
-                        length: Some(CANARY_BYTES),
+                        length: Some(canary_bytes),
                         ..Default::default()
                     },
                     Vec::new(),
                 )?;
-                let gbps = CANARY_BYTES as f64 / elapsed.as_secs_f64() / 1e9;
+                let gbps = canary_bytes as f64 / elapsed.as_secs_f64() / 1e9;
                 info!(
                     peer = %client.peer(),
                     gbps = format!("{gbps:.1}"),
-                    bytes = CANARY_BYTES,
+                    bytes = canary_bytes,
+                    floor_gbps,
                     "nixl bandwidth canary"
                 );
-                if gbps < CANARY_FLOOR_GBPS {
+                // A zero floor is the documented escape hatch: still measure and still log, so
+                // the number is in the record, but admit the link. `Tunables::resolve` warns
+                // once at bring-up that the F1 trap is unguarded, so this stays quiet here.
+                if floor_gbps > 0.0 && gbps < floor_gbps {
                     return Err(format!(
-                        "nixl link to {} measured {gbps:.2} GB/s, below the {CANARY_FLOOR_GBPS} \
+                        "nixl link to {} measured {gbps:.2} GB/s, below the {floor_gbps} \
                          GB/s floor — the silent cuda_ipc degradation trap (F1: non-cudaMalloc \
                          staging memory, or UCX_TLS missing cuda_ipc). Refusing the transport \
-                         tier",
+                         tier (raise or disable the floor with \
+                         SIRIUS_CN_NIXL_CANARY_FLOOR_GBPS if this fabric is genuinely slower)",
                         client.peer()
                     ));
                 }
@@ -772,7 +788,7 @@ mod agent_tier {
     }
 
     /// Posts one WRITE `[local_addr, +len)` → `[remote_addr, +len)` and polls it to DONE within
-    /// [`XFER_TIMEOUT`]. Returns the elapsed post-to-done time.
+    /// [`xfer_timeout`]. Returns the elapsed post-to-done time.
     pub(super) fn write_and_wait(
         agent: &Agent,
         remote_agent: &str,
@@ -791,15 +807,16 @@ mod agent_tier {
             .map_err(|err| {
                 format!("failed to create a {len}-byte WRITE to agent '{remote_agent}': {err}")
             })?;
+        let timeout = xfer_timeout();
         let start = Instant::now();
         let mut in_progress = agent
             .post_xfer_req(&request, None)
             .map_err(|err| format!("failed to post a {len}-byte WRITE: {err}"))?;
         while in_progress {
-            if start.elapsed() > XFER_TIMEOUT {
+            if start.elapsed() > timeout {
                 return Err(format!(
                     "a {len}-byte nixl WRITE to agent '{remote_agent}' did not complete within \
-                     {XFER_TIMEOUT:?}"
+                     {timeout:?} (SIRIUS_CN_NIXL_XFER_TIMEOUT_SECS)"
                 ));
             }
             match agent
@@ -944,8 +961,10 @@ mod agent_tier {
                 .expect("load the receiver agent's metadata");
             assert_eq!(receiver_name, "127.0.0.1:18061");
 
-            let source = executor.staging_lease(CANARY_BYTES).unwrap();
-            let target = executor.staging_lease(CANARY_BYTES).unwrap();
+            let canary_bytes = canary_bytes();
+            let floor_gbps = canary_floor_gbps();
+            let source = executor.staging_lease(canary_bytes).unwrap();
+            let target = executor.staging_lease(canary_bytes).unwrap();
             assert_ne!(source, target, "two live leases must not alias");
 
             write_and_wait(
@@ -961,16 +980,16 @@ mod agent_tier {
                 &receiver_name,
                 base + source,
                 base + target,
-                CANARY_BYTES,
+                canary_bytes,
             )
             .expect("timed cross-agent WRITE");
-            let gbps = CANARY_BYTES as f64 / elapsed.as_secs_f64() / 1e9;
+            let gbps = canary_bytes as f64 / elapsed.as_secs_f64() / 1e9;
             eprintln!(
-                "nixl cross-agent WRITE: {CANARY_BYTES} bytes in {elapsed:?} = {gbps:.1} GB/s"
+                "nixl cross-agent WRITE: {canary_bytes} bytes in {elapsed:?} = {gbps:.1} GB/s"
             );
             assert!(
-                gbps >= CANARY_FLOOR_GBPS,
-                "cross-agent WRITE measured {gbps:.2} GB/s, below the {CANARY_FLOOR_GBPS} GB/s \
+                gbps >= floor_gbps,
+                "cross-agent WRITE measured {gbps:.2} GB/s, below the {floor_gbps} GB/s \
                  canary floor — the F1 silent-degradation trap"
             );
 

@@ -73,6 +73,26 @@ the real node count: it is the expected size, not a floor, and the sweep aborts 
 more nodes are alive than you declared (a threshold below the real topology can be
 satisfied mid-boot, and the sweep then measures a half-started cluster).
 
+## Before calling a query broken: check whether it was a transport timeout
+
+At SF500 and above, a *refused* query is often a healthy CN that ran out of clock, not a bug.
+The transport is serialized (one thread per CN, blocking round trips), so a peer's
+`request_staging_lease` queues behind whatever fragment its engine thread is currently running.
+The default 60 s bound then fails a query that would have completed — SF100 **q08 refused at
+60758 ms** in `OPEN-ISSUES.md` is exactly this.
+
+Tell the two apart in the CN log:
+
+| | Looks like |
+|---|---|
+| Transport timeout | `request_staging_lease to <host>:<port>: failed to read reply frame: …` — names the peer and method, no peer-side status |
+| Real query failure | `… failed with status <code>: <messages>` — a `StatusPB` the peer actually sent |
+
+For the first, raise `SIRIUS_CN_RPC_TIMEOUT_SECS` and re-run before concluding anything. For
+the second, raising it will not help — the peer answered and refused.
+
+High-level knob list: [`../../docs/TUNABLES.md`](../../docs/TUNABLES.md).
+
 ## Fairness notes
 
 A executes on the GPU (that is the point of the comparison); B's BE is a mature

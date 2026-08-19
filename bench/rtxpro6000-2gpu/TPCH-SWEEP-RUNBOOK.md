@@ -286,7 +286,7 @@ CSV.
 | `wedge`, ms far **below** the timeout | rc=0 with an empty result | **check the oracle first.** A correct 0-row answer looks identical (§0). Only if the oracle disagrees is it the empty-result defect |
 | `refused` + `exchange staging arena exhausted` | arena too small for the concurrent lease set | raise `STAGING` per §2; the error prints capacity, free bytes and lease count |
 | `refused` + `no parked sender output to export for SenderSlot` | head-of-line deadlock in the exchange | a known regression class; usually appears alongside an OOM that it masks |
-| `refused` at ~60 s | `prpc_client.rs` `REPLY_TIMEOUT` is a hardcoded 60 s | not this query's plan — read the **peer** CN's stdout, matching `peer=<host:brpc_port>` |
+| `refused` at ~60 s | the CN→CN PRPC reply timeout, default 60 s | not this query's plan — read the **peer** CN's stdout, matching `peer=<host:brpc_port>`. Tunable via `SIRIUS_CN_RPC_TIMEOUT_SECS`; see `experimental/starrocks/docs/TUNABLES.md` |
 | `pass` but values wrong | decimal drift, or a real bug | §5. Drift is **low-biased** and hits only `sum(x*(1-discount))` expressions |
 | `pass` with a plausible row count | **verified by nothing** | §5 |
 

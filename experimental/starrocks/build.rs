@@ -32,6 +32,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed={}", brpc_dir.display());
     println!("cargo:rerun-if-changed={}", proto_dir.display());
 
+    require_exchange_proto_patch(&manifest_dir, &proto_dir)?;
+
     let mut protos = BRPC_PROTOS
         .iter()
         .map(|proto| {
@@ -52,6 +54,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.compile_protos(&protos, &[brpc_dir.join("src"), proto_dir])?;
 
     Ok(())
+}
+
+/// Fails the build, with the remedy in the message, when the `starrocks` submodule is missing the
+/// Sirius exchange RPCs.
+///
+/// Those RPCs (`PExchangeNixlMd`, `PStagingLeaseRequest`, `PTransmitPackedParams`, …) are
+/// Sirius-only extensions that live in `patches/nixl-exchange-proto.patch`, and nothing applies
+/// the patch automatically. Without it `prost` generates a service that simply lacks three
+/// methods, and the crate fails 200 lines later with `unresolved imports
+/// crate::proto::starrocks::PExchangeNixlMd` and `method exchange_nixl_md is not a member of
+/// trait PInternalService` — errors that name the symptom and give a fresh clone no way to guess
+/// the cause. Checking here turns that into one actionable line.
+///
+/// Same discipline as `scripts/cn-env.sh`'s missing-nixl check and `nixl_transport.rs`'s
+/// `ENV_HINT`: fail at the earliest point that can name the fix.
+fn require_exchange_proto_patch(
+    manifest_dir: &std::path::Path,
+    proto_dir: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let internal_service = proto_dir.join("internal_service.proto");
+    // A missing submodule is a different failure with a different fix, so let prost report it.
+    let Ok(contents) = std::fs::read_to_string(&internal_service) else {
+        return Ok(());
+    };
+    // One representative message rather than all of them: the patch is applied whole or not at
+    // all, and matching on a single name keeps this from breaking when the patch grows.
+    if contents.contains("message PExchangeNixlMd") {
+        return Ok(());
+    }
+    let patch = manifest_dir.join("patches/nixl-exchange-proto.patch");
+    let submodule = proto_dir
+        .parent()
+        .and_then(|gensrc| gensrc.parent())
+        .unwrap_or(proto_dir);
+    // The guidance goes to stderr and the returned error stays one line: cargo renders a build
+    // script's error with `Debug`, which would print embedded newlines as literal `\n`.
+    eprintln!(
+        "\n\
+         {} does not define the Sirius exchange RPCs, so the CN cannot be built.\n\
+         Apply the patch to the starrocks submodule:\n\
+         \n    git -C {} apply {}\n\n\
+         The patch is not applied automatically and is not part of upstream StarRocks. Re-apply\n\
+         it after any `git submodule update` that resets the submodule working tree.\n",
+        internal_service.display(),
+        submodule.display(),
+        patch.display(),
+    );
+    Err("the starrocks submodule is missing patches/nixl-exchange-proto.patch (see above)".into())
 }
 
 /// Emits an async BRPC/Tower service facade from StarRocks' protobuf service

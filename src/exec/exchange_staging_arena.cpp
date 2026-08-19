@@ -16,6 +16,7 @@
 
 #include "exec/exchange_staging_arena.hpp"
 
+#include "log/logging.hpp"
 #include "sirius/exception.hpp"
 #include "yaml_reader.hpp"  // sirius::yaml::parse_bytes
 
@@ -71,6 +72,10 @@ exchange_staging_arena::exchange_staging_arena(std::uint64_t capacity_bytes)
                                        capacity_bytes,
                                        cudaGetErrorString(err));
     }
+    // The size the operator actually got, on the operator's own terms. This slab sits OUTSIDE
+    // the RMM pool, so it appears in no config dump and in no pool accounting -- without this
+    // line the only way to learn it is to read the launcher's environment.
+    SIRIUS_LOG_INFO("exchange staging arena: {} bytes (cudaMalloc)", capacity_);
     return;
   }
 
@@ -139,10 +144,27 @@ exchange_staging_arena::exchange_staging_arena(std::uint64_t capacity_bytes)
   capacity_      = size;
   mapped_bytes_  = size;
   fabric_handle_ = handle;
+  // Both the requested and the granted size: cuMemCreate rounds up to a granularity multiple, so
+  // these differ, and the granted one is what a lease is actually checked against.
+  SIRIUS_LOG_INFO(
+    "exchange staging arena: {} bytes (fabric handle, requested {})", capacity_, capacity_bytes);
 }
 
 exchange_staging_arena::~exchange_staging_arena()
 {
+  // The one number that says how much arena a workload ACTUALLY needed. Sizing this slab is the
+  // hardest configuration decision on the box (bench/a100x8/TUNING.md section 2) and the arena
+  // fails hard rather than degrading, so without this line the only feedback an operator gets is
+  // "exhausted" or silence -- there is no way to learn a passing run had 90% headroom. Nonzero
+  // `outstanding` at teardown means a leaked lease.
+  {
+    std::lock_guard lock(mutex_);
+    SIRIUS_LOG_INFO("exchange staging arena: high water {} of {} bytes ({} leases outstanding)",
+                    high_water_,
+                    capacity_,
+                    leases_.size());
+  }
+
   if (fabric_handle_ != 0) {
     // Unmap before freeing the reservation, and release the physical handle last -- cudaFree
     // cannot release a VMM mapping and would leak the entire arena.

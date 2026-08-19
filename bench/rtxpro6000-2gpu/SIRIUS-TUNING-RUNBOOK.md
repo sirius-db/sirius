@@ -223,6 +223,10 @@ against your build before attributing a null result to the knob.
 
 ## 5. The staging arena — the knob that decides whether queries run at all
 
+> **Canonical env-var overview:** [`experimental/starrocks/docs/TUNABLES.md`](../../experimental/starrocks/docs/TUNABLES.md).
+> Transport knobs are validated at startup; a bad value refuses to boot rather than
+> surfacing as an unexplained timeout mid-sweep.
+
 `SIRIUS_EXCHANGE_STAGING_BYTES` is an **environment variable, not a YAML key**, and it has **no
 engine default**. Unset means *no arena*: the CN boots healthy, registers with the FE, answers
 local queries, and every remote exchange destination fails. The "default" you see quoted is a

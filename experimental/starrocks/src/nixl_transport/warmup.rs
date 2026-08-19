@@ -63,6 +63,7 @@ use super::agent_tier::rpc_exchange_md;
 use super::{SessionWarmup, TransportRequest};
 use crate::FeConfig;
 use crate::prpc_client::PrpcClient;
+use crate::tunable::Tunables;
 
 /// Gap between FE compute-node polls while the cluster assembles.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -70,8 +71,6 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
 /// Cap on the per-peer retry backoff.
 const MAX_BACKOFF: Duration = Duration::from_secs(15);
-/// Default wall-clock budget for the whole warmup.
-const DEFAULT_BUDGET: Duration = Duration::from_secs(180);
 /// How long the discovered peer set must stay unchanged (with every peer established) before the
 /// warmup declares the cluster assembled and stops early.
 const SETTLE: Duration = Duration::from_secs(20);
@@ -102,17 +101,14 @@ impl Settings {
         let peers = std::env::var("SIRIUS_CN_NIXL_WARMUP_PEERS")
             .ok()
             .map(|list| parse_peer_list(&list));
-        let budget = std::env::var("SIRIUS_CN_NIXL_WARMUP_TIMEOUT_SECS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .map_or(DEFAULT_BUDGET, Duration::from_secs);
-        let expect = std::env::var("SIRIUS_CN_NIXL_WARMUP_EXPECT_PEERS")
-            .ok()
-            .and_then(|value| value.parse().ok());
+        // The budget and the expected peer count come from the validated registry, so a typo in
+        // either fails CN bring-up (`Tunables::resolve` in `main`) instead of silently reverting
+        // to the default here — which used to look exactly like the knob having no effect.
+        let tunables = Tunables::get();
         Some(Self {
             peers,
-            budget,
-            expect,
+            budget: tunables.warmup_timeout,
+            expect: tunables.warmup_expect_peers,
         })
     }
 }

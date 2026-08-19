@@ -3,7 +3,7 @@
 **Box**: 2× RTX PRO 6000 Blackwell (97887 MiB each, cc 12.0), driver 580.126.09, GPUs linked
 `PIX` (PCIe, not NVLink). Xeon 8559C 48 vCPU, 499 GB RAM. **Data**: SF100,
 `/home/ubuntu/tpch_parquet_sf100` (26 GB). **Topology**: 2 CNs, one per GPU.
-**Measured** 2026-08-19. Raw CSVs: `results/`.
+**Measured** 2026-08-19. Raw CSVs: `results/`. Re-verified after commit `c1f73993` — no regression (see below).
 
 Two memory arms, everything else identical:
 
@@ -42,7 +42,36 @@ Both: `NUM_CNS=2 HOST_MEM=128GiB SIRIUS_QUERY_WATCHDOG_SECS=90`, `QUERY_TIMEOUT=
 | q22 | 398 | 394 | 1.7e-16 (IEEE) | **ok** |
 
 Warm medians. 18 common queries total **24195 ms (A)** vs **24105 ms (B)** — **−0.4 %**, i.e. a
-50 % larger pool bought no speed. Correctness was **bit-identical** across both arms.
+50 % larger pool bought no speed. Correctness verdicts and drift magnitudes were **identical**
+across both arms; outputs are byte-identical except ~1 ULP of float noise on q01, which is GPU
+reduction-order non-determinism rather than a configuration effect.
+
+## Regression check after `c1f73993` (cherry-pick of `34a25bd4`)
+
+Re-ran **only the 19 queries that pass**, same arm-A config, same harness settings, on binaries
+rebuilt from the CN-tunables commit (which changed `nixl_transport.rs`, `prpc_client.rs`,
+`warmup.rs`, `main.rs` and `exchange_staging_arena.cpp`).
+Results: `results/sf100-regression-c1f73993.csv`.
+
+**No regression.**
+
+| Check | Result |
+|---|---|
+| Status | **19/19 still pass** |
+| Timing | every query within **±2.8 %**; total 26144 → 26069 ms (**−0.3 %**) |
+| Correctness vs oracle | **identical verdicts** — same 16 match, same 3 drift queries at the same magnitudes |
+| Byte-for-byte output | **17/19 identical**; q01 and q15 differ only in the last float digit |
+| Engine logs | no new errors; only the pre-existing benign warnings |
+| Cluster footprint | 57924 MiB/GPU — identical to baseline |
+
+The two byte-level differences are **not** attributable to the commit: a control diff of
+baseline-A against arm-B — *both built before the commit* — shows q01 differing the same way.
+That is GPU reduction-order non-determinism (≈1 ULP), pre-existing. q15's difference is 1 ULP on
+the query that is already known to be flaky.
+
+The commit's new behaviour is live and working: the CN logs `resolved CN transport tunables
+rpc_timeout_secs=60 …` at startup, and rejects out-of-range values before binding a port —
+`SIRIUS_CN_RPC_TIMEOUT_SECS=99999` fails with `must be between 1 and 3600`.
 
 ## Summary
 

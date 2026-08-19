@@ -6,7 +6,14 @@ where a rule is fitted rather than measured, it says so.
 
 Companion docs: [`CONFIGURATIONS.md`](CONFIGURATIONS.md) (the resulting settings) ·
 [`SCALE-OUT-SUMMARY.md`](SCALE-OUT-SUMMARY.md) (what the settings produced) ·
-[`../common/RETARGETING.md`](../common/RETARGETING.md) (moving the whole folder to a new box).
+[`../common/RETARGETING.md`](../common/RETARGETING.md) (moving the whole folder to a new box) ·
+[`../../experimental/starrocks/docs/TUNABLES.md`](../../experimental/starrocks/docs/TUNABLES.md)
+(CN environment variables).
+
+> The CN now logs the arena size it got (`exchange staging arena: N bytes`) and, at teardown,
+> the high-water mark a workload actually reached
+> (`exchange staging arena: high water N of M bytes`). That second line is the measurement §2's
+> grid search had to infer from pass/fail — read it before running another sweep.
 
 ---
 

@@ -22,7 +22,13 @@ use crate::prpc;
 /// Bound on connect and on waiting for a reply. Generous because a peer's `request_staging_lease`
 /// queues behind whatever fragment its engine thread is currently running; a peer that exceeds
 /// this is treated as wedged and the query fails loudly.
-const REPLY_TIMEOUT: Duration = Duration::from_secs(60);
+///
+/// Tunable, and worth tuning at scale — see [`SIRIUS_CN_RPC_TIMEOUT_SECS`](crate::tunable).
+/// Read per dial rather than cached in the client: `Tunables::get` is one atomic load, dials are
+/// rare, and reading through keeps a single source of truth.
+fn reply_timeout() -> Duration {
+    crate::tunable::Tunables::get().rpc_timeout
+}
 
 /// One cached connection to a peer CN's brpc port.
 #[derive(Debug)]
@@ -149,20 +155,17 @@ impl PrpcClient {
                 .peer
                 .parse()
                 .map_err(|err| CallError::Transport(format!("invalid peer address: {err}")))?;
-            let stream = TcpStream::connect_timeout(&address, REPLY_TIMEOUT)
+            let timeout = reply_timeout();
+            let stream = TcpStream::connect_timeout(&address, timeout)
                 .map_err(|err| CallError::Transport(format!("failed to connect: {err}")))?;
             // Bound every read/write: a wedged peer must fail the query, not hang the transport
             // thread forever. NODELAY because request frames are small and latency-sensitive.
-            stream
-                .set_read_timeout(Some(REPLY_TIMEOUT))
-                .map_err(|err| {
-                    CallError::Transport(format!("failed to set read timeout: {err}"))
-                })?;
-            stream
-                .set_write_timeout(Some(REPLY_TIMEOUT))
-                .map_err(|err| {
-                    CallError::Transport(format!("failed to set write timeout: {err}"))
-                })?;
+            stream.set_read_timeout(Some(timeout)).map_err(|err| {
+                CallError::Transport(format!("failed to set read timeout: {err}"))
+            })?;
+            stream.set_write_timeout(Some(timeout)).map_err(|err| {
+                CallError::Transport(format!("failed to set write timeout: {err}"))
+            })?;
             stream
                 .set_nodelay(true)
                 .map_err(|err| CallError::Transport(format!("failed to set nodelay: {err}")))?;

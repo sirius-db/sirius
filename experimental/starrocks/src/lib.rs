@@ -60,6 +60,7 @@ mod prpc;
 mod prpc_client;
 mod result_encoder;
 mod result_store;
+mod tunable;
 #[cfg(all(test, feature = "sirius-engine"))]
 mod wire_type_parity;
 
@@ -71,6 +72,7 @@ pub use engine_settings::{EngineSettings, derive_sirius_config_yaml};
 pub use fragment_executor::{FragmentExecutor, FragmentResult, StubExecutor};
 pub use gpu_affinity::{GpuSocket, cpu_affinity_for_gpu, gpu_socket};
 pub use nixl_transport::NixlTransport;
+pub use tunable::Tunables;
 
 /// Serializes tests that bring up a GPU engine context: the engine keeps process-global GPU
 /// state, so at most one context may be live at a time within the test binary.
