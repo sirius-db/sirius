@@ -132,6 +132,20 @@ struct pushdown_request {
   /// partial request always leaves a residual for the scan to evaluate.
   bool ranges_cover_whole_filter = false;
 
+  /// Set by @ref decompression_pushdown_scan::without_row_selection. Refuses
+  /// the compacting decode outright, regardless of what sources this request
+  /// still carries: an equality answer alone is sufficient to drive
+  /// compaction (its ballot feeds the same combined mask as a range or
+  /// membership source), and a later per-batch refresh (join filters
+  /// publishing mid-scan) can repopulate @c membership on a copy of this
+  /// request after row selection was deliberately dropped. Neither may
+  /// silently re-enable compaction, so the refusal is a sticky property of
+  /// the request rather than something inferred from which fields are empty
+  /// — it survives @ref decompression_pushdown_scan::for_chunk and
+  /// @ref decompression_pushdown_scan::with_membership_probes, both of which
+  /// copy it along with everything else.
+  bool row_selection_disabled = false;
+
   [[nodiscard]] bool empty() const noexcept;
   /// True iff any entry asks for rows to be DROPPED (as opposed to a column
   /// being answered in place, which changes no row count).
