@@ -250,6 +250,12 @@ fn engine_thread(
     let mut parked: HashMap<u64, ParkedOutput<'_>> = HashMap::new();
     let mut parked_slots: HashMap<SenderSlot, (u64, u64)> = HashMap::new();
     let mut next_park_id: u64 = 0;
+    // Why a slot's parked output went away, for the slots the blanket wipe below destroys.
+    // Without this the wipe is silent and the NEXT export of an unrelated slot reports
+    // "no parked sender output", which is collateral -- it masks the error that actually killed
+    // the query. MEASURED: TPC-H q08 reported that error for weeks while the real failure was an
+    // OOM in HASH_JOIN. Bounded: an entry is dropped as soon as the slot is parked again.
+    let mut poisoned: HashMap<SenderSlot, String> = HashMap::new();
 
     info!("sirius-engine thread ready");
     // One request at a time until the handle (and its sender) is dropped. Every respond-send
@@ -261,14 +267,33 @@ fn engine_thread(
                     &context,
                     &mut parked,
                     &mut parked_slots,
+                    &poisoned,
                     &mut next_park_id,
                     &request,
                 );
-                if result.is_err() {
+                if let Err(err) = &result {
                     // A failed query leaves its parked senders unreachable — the receiver that
                     // would have consumed them is the thing that just failed. Dropping them
                     // releases the GPU memory their batches hold rather than leaking it for the
                     // process's lifetime.
+                    //
+                    // The wipe is process-wide, so it also destroys OTHER in-flight fragments'
+                    // parked output. Record why, and say so out loud: a drain that fails right
+                    // after this used to report only "no parked sender output", which names the
+                    // victim and hides the culprit.
+                    if !parked_slots.is_empty() {
+                        warn!(
+                            slots = parked_slots.len(),
+                            error = %err,
+                            "discarding every parked sender output on this CN after a fragment failure"
+                        );
+                    }
+                    // Replace, never accumulate: only the most recent wipe can explain a slot
+                    // that is missing now, and this bounds the map by the live slot count.
+                    poisoned.clear();
+                    for slot in parked_slots.keys() {
+                        poisoned.insert(slot.clone(), err.clone());
+                    }
                     parked.clear();
                     parked_slots.clear();
                 }
@@ -277,11 +302,12 @@ fn engine_thread(
             #[cfg(test)]
             EngineRequest::Sleep(duration) => std::thread::sleep(duration),
             EngineRequest::ExportNext { slot, respond } => {
-                let result = export_next(&mut parked, &parked_slots, slot);
+                let result = export_next(&mut parked, &parked_slots, &poisoned, slot);
                 let _ = respond.send(result);
             }
             EngineRequest::DropParked { slot, respond } => {
-                let result = release_slot(&mut parked, &mut parked_slots, &slot);
+                let result =
+                    release_slot(&mut parked, &mut parked_slots, &poisoned, &slot);
                 let _ = respond.send(result);
             }
         }
@@ -292,16 +318,31 @@ fn engine_thread(
     info!("sirius-engine thread shutting down");
 }
 
+/// The error for a slot whose parked output is gone. When the blanket wipe took it, name the
+/// failure that triggered the wipe — that is the query's REAL error, and reporting only the
+/// generic message is what made TPC-H q08 look like an exchange bug for weeks when it was an
+/// OOM in HASH_JOIN.
+fn missing_slot(poisoned: &HashMap<SenderSlot, String>, slot: &SenderSlot, verb: &str) -> String {
+    match poisoned.get(slot) {
+        Some(cause) => format!(
+            "sender output for {slot:?} was discarded when another fragment on this CN failed: \
+             {cause}"
+        ),
+        None => format!("no parked sender output to {verb} for {slot:?}"),
+    }
+}
+
 /// Packs the next batch parked under `slot` into a fresh staging lease.
 fn export_next(
     parked: &mut HashMap<u64, ParkedOutput<'_>>,
     parked_slots: &HashMap<SenderSlot, (u64, u64)>,
+    poisoned: &HashMap<SenderSlot, String>,
     slot: SenderSlot,
 ) -> Result<Option<StagedBatch>, String> {
     let (park_id, stream) = parked_slots
         .get(&slot)
         .copied()
-        .ok_or_else(|| format!("no parked sender output to export for {slot:?}"))?;
+        .ok_or_else(|| missing_slot(poisoned, &slot, "export"))?;
     let entry = parked
         .get_mut(&park_id)
         .ok_or_else(|| format!("parked fragment vanished under {slot:?}"))?;
@@ -322,11 +363,12 @@ fn export_next(
 fn release_slot(
     parked: &mut HashMap<u64, ParkedOutput<'_>>,
     parked_slots: &mut HashMap<SenderSlot, (u64, u64)>,
+    poisoned: &HashMap<SenderSlot, String>,
     slot: &SenderSlot,
 ) -> Result<(), String> {
     let (park_id, _) = parked_slots
         .remove(slot)
-        .ok_or_else(|| format!("no parked sender output to drop for {slot:?}"))?;
+        .ok_or_else(|| missing_slot(poisoned, slot, "drop"))?;
     let entry = parked
         .get_mut(&park_id)
         .ok_or_else(|| format!("parked fragment vanished under {slot:?}"))?;
@@ -344,6 +386,7 @@ fn run_fragment<'ctx>(
     context: &'ctx SiriusContext,
     parked: &mut HashMap<u64, ParkedOutput<'ctx>>,
     parked_slots: &mut HashMap<SenderSlot, (u64, u64)>,
+    poisoned: &HashMap<SenderSlot, String>,
     next_park_id: &mut u64,
     request: &ExecuteRequest,
 ) -> Result<Option<FragmentResult>, String> {
@@ -352,6 +395,7 @@ fn run_fragment<'ctx>(
         context,
         parked,
         parked_slots,
+        poisoned,
         next_park_id,
         request,
         &mut released,
@@ -384,6 +428,7 @@ fn run_fragment_inner<'ctx>(
     context: &'ctx SiriusContext,
     parked: &mut HashMap<u64, ParkedOutput<'ctx>>,
     parked_slots: &mut HashMap<SenderSlot, (u64, u64)>,
+    poisoned: &HashMap<SenderSlot, String>,
     next_park_id: &mut u64,
     request: &ExecuteRequest,
     released: &mut std::collections::HashSet<u64>,
@@ -485,7 +530,7 @@ fn run_fragment_inner<'ctx>(
                 .map_err(|err| format!("failed to relay sender {sender_id}: {err}"))?;
             // This destination's stream is drained; release its claim (the fragment drops with
             // the last claim, freeing the GPU batches).
-            release_slot(parked, parked_slots, slot)?;
+            release_slot(parked, parked_slots, poisoned, slot)?;
             info!(
                 stream_id,
                 sender_id,

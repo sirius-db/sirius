@@ -18,8 +18,8 @@ FROM (
         l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity AS amount
     FROM
         part,
-        supplier,
         lineitem,
+        supplier,
         partsupp,
         orders,
         nation

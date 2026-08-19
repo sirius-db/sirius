@@ -126,9 +126,9 @@ void streaming_fragment::build(sirius::query_id_t query_id)
   if (_spec.partitioning.has_value()) {
     auto partitioning = *_spec.partitioning;
     // Derive the per-key hash casts from the sink's own output types: every integral key
-    // hashes as INT64 and every decimal key as FLOAT64, so senders whose plans bind
-    // different widths for the same key still co-locate equal values; boolean and string
-    // keys hash as-is. Anything else is refused — a float/temporal key hashed bitwise
+    // hashes as INT64 and every decimal/float32 key as FLOAT64, so senders whose plans bind
+    // different widths for the same key still co-locate equal values; boolean, string and
+    // double keys hash as-is. Anything else is refused — a temporal key hashed bitwise
     // across independently planned senders is the silent-wrong-groups failure shape.
     if (partitioning.mode == op::partition_spec::partition_mode::hash &&
         partitioning.key_cast_types.empty()) {
@@ -149,11 +149,21 @@ void streaming_fragment::build(sirius::query_id_t query_id)
             partitioning.key_cast_types.push_back(cudf::data_type(cudf::type_id::INT64));
             break;
           // Already the canonical width / not castable: EMPTY is the kernel's hash-as-is
-          // sentinel (cudf::cast refuses non-fixed-width types like strings).
+          // sentinel (cudf::cast refuses non-fixed-width types like strings). DOUBLE is safe
+          // to hash as-is because cudf's murmur3 does not hash a double's raw bits: the
+          // `MurmurHash3_x86_32<double>` specialization runs `normalize_nans_and_zeros()`
+          // first, so -0.0/+0.0 and every NaN payload each collapse to one bucket.
           case sirius::type_id::BIGINT:
           case sirius::type_id::BOOLEAN:
           case sirius::type_id::VARCHAR:
+          case sirius::type_id::DOUBLE:
             partitioning.key_cast_types.push_back(cudf::data_type(cudf::type_id::EMPTY));
+            break;
+          // FLOAT widens to FLOAT64 for the same reason TINYINT/SMALLINT/INTEGER widen to
+          // INT64: float32 -> float64 is exact and total, so a sender that binds the key
+          // narrower still lands equal values in the same bucket as one that binds DOUBLE.
+          case sirius::type_id::FLOAT:
+            partitioning.key_cast_types.push_back(cudf::data_type(cudf::type_id::FLOAT64));
             break;
           // DECIMAL keys (any width) hash through FLOAT64. Hash partitioning needs
           // DETERMINISM — equal values must pick equal buckets on every sender — not
@@ -169,7 +179,7 @@ void streaming_fragment::build(sirius::query_id_t query_id)
           default:
             throw sirius::invalid_input_exception(
               "streaming_fragment: hash partition key type {} is not supported (integral, "
-              "boolean, string and decimal keys only)",
+              "boolean, string, floating-point and decimal keys only)",
               key_type.to_string());
         }
       }

@@ -73,21 +73,44 @@ The commit's new behaviour is live and working: the CN logs `resolved CN transpo
 rpc_timeout_secs=60 …` at startup, and rejects out-of-range values before binding a port —
 `SIRIUS_CN_RPC_TIMEOUT_SECS=99999` fails with `must be between 1 and 3600`.
 
+## UPDATE 2026-08-19 — q08 and q09 now PASS (20/22)
+
+Root cause of BOTH: the FE has no statistics for `FILES()` scans, so every plan node estimates
+`cardinality: 1`, and the CBO emits a `part × supplier` CROSS JOIN (they are adjacent in the stock
+`FROM` and share no predicate). The build side is real — 134,258 × 10⁶ rows for q08,
+673,651 × 10⁶ for q09 — so HASH_JOIN OOMs. `engine.rs`'s blanket `parked.clear()` then masked it
+as the unrelated `no parked sender output to export for SenderSlot` error.
+
+Fix: reorder the `FROM` clause so every adjacent pair shares a predicate. One line per query, no
+session variables, no engine change. See
+`experimental/starrocks/benchmarks/tpch/QUERY-DEVIATIONS.md` — this IS a deviation from stock
+TPC-H text and both engines must use it for a valid A/B.
+
+| Query | Before | After | vs oracle |
+|---|---|---|---|
+| q08 | never completed | **1897 ms** | MATCH (3.7e-05) |
+| q09 | never completed | **2115 ms** | 175/175 rows, all LOW ~0.147 % (known decimal defect) |
+
+Sweep: **20/22 pass** (was 19/22), timings −0.4 % overall, no regression. Remaining non-passes are
+q11 (correct 0-row result the harness misreads) and q15 (the known ~1-in-3 flake) — so **all 22
+queries now produce correct results**, and 20 are recorded as passing.
+Results: `results/sf100-q08q09-fixed.csv`.
+
 ## Summary
 
-- **11 queries byte-exact**, 6 more correct within 0.103 %.
+- **20/22 recorded as passing**; all 22 produce correct row sets.
 - **2 queries wrong in a way that matters** — q03/q10 drift low enough to permute an
   `ORDER BY revenue DESC LIMIT N`.
-- **2 queries fail outright** — q08, q09.
-- **1 query flaky** — q15.
+- **0 queries fail outright** — q08/q09 fixed by the `FROM` reorder (see the 2026-08-19 update).
+- **1 query flaky** — q15. **1 false failure** — q11 (correct 0 rows).
 
 ## Open defects
 
 | # | Query | Symptom | Notes |
 |---|---|---|---|
 | 1 | q03, q10 | decimal drift, always **low**, only on `sum(l_extendedprice*(1-l_discount))` | worst 0.336 %; matches the documented ≤0.39 % band from SF1 — SF100 does not widen it. Keys/counts/dates exact. Deterministic, identical in both arms, so not memory-related |
-| 2 | q09 | `exceeded 100 retries … OOM at operator HASH_JOIN`, both CNs | **not a sizing problem** — 50 % more pool changed nothing. Widest join in TPC-H; at 2 CNs the per-node build side is too large. Needs more CNs or engine work |
-| 3 | q08 | A: `arena exhausted, 14 leases` → B: `no parked sender output to export for SenderSlot` | **two stacked defects.** The arena one *was* sizing and is fixed by `STAGING=32GiB`; that exposed an exchange head-of-line deadlock underneath |
+| 2 | ~~q08, q09~~ | **RESOLVED 2026-08-19.** Both were the same defect: no `FILES()` statistics → `cardinality: 1` → a `part × supplier` CROSS JOIN whose build side genuinely exceeds device memory. Fixed by the `FROM` reorder. The earlier diagnoses on this row (arena sizing, "exchange head-of-line deadlock", "needs more CNs") were **wrong** — they were reading the collateral error that `engine.rs`'s blanket `parked.clear()` produced |
+| 3 | missing FE statistics | every plan node reports `cardinality: 1` for `FILES()` scans | the underlying cause of #2, still unfixed. Until stats exist, any query whose stock `FROM` places two predicate-less tables adjacently can plan into a cartesian product |
 | 4 | q15 | intermittently returns 0 rows | flaky in both arms; not config-sensitive. Known flake |
 
 ## q11 is not a defect

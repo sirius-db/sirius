@@ -22,8 +22,8 @@ FROM (
         n2.n_name AS nation
     FROM
         part,
-        supplier,
         lineitem,
+        supplier,
         orders,
         customer,
         nation n1,

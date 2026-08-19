@@ -30,7 +30,9 @@
 #include <utils/sirius_test_env.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -963,6 +965,115 @@ TEST_CASE_METHOD(fragment_fixture,
 
     auto first  = route_keys("frag9_first");
     auto second = route_keys("frag9_second");
+    // Independently built fragments must agree on every key's destination.
+    REQUIRE(first == second);
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-10: a DOUBLE hash key routes equal values together, deterministically
+// ============================================================================
+//
+// The FLOAT64 twin of FRAG-9. build() derives EMPTY (hash-as-is) for a DOUBLE
+// key rather than a cast, so this pins the two properties that make hashing a
+// raw float column safe, neither of which holds for a naive bitwise hash:
+//
+//   * -0.0 and +0.0 are ONE key. cudf's `MurmurHash3_x86_32<double>` runs
+//     `normalize_nans_and_zeros()` before hashing, so the two bit patterns
+//     cannot split a group across destinations.
+//   * every NaN is ONE key, for the same reason.
+//
+// plus the FRAG-9 invariants: equal values co-locate within a fragment and
+// across two independently built ones, and the streams union to the input.
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-10: a DOUBLE hash key routes equal values together, deterministically",
+                 "[integration][streaming_fragment]")
+{
+  // Signed zeros and NaNs are the whole point, so they are keys here, not payload. Every value
+  // appears twice so co-location is asserted directly rather than inferred from uniqueness.
+  const std::vector<std::string> key_exprs{"CAST(1.5 AS DOUBLE)",
+                                           "-CAST(1.5 AS DOUBLE)",
+                                           "CAST(0.0 AS DOUBLE)",
+                                           "-CAST(0.0 AS DOUBLE)",
+                                           "CAST(1e300 AS DOUBLE)",
+                                           "-CAST(1e-300 AS DOUBLE)",
+                                           "CAST('nan' AS DOUBLE)",
+                                           "-CAST('nan' AS DOUBLE)",
+                                           "CAST('inf' AS DOUBLE)",
+                                           "-CAST('inf' AS DOUBLE)"};
+  std::string leaf = "(VALUES ";
+  bool first_value = true;
+  for (const auto& key_expr : key_exprs) {
+    for (int repeat = 0; repeat < 2; ++repeat) {
+      if (!first_value) { leaf += ", "; }
+      first_value = false;
+      leaf += "(" + key_expr + ")";
+    }
+  }
+  leaf += ") t(d)";
+  const std::size_t expected_rows = key_exprs.size() * 2;
+
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+
+  con->BeginTransaction();
+  try {
+    auto route_keys = [&](const std::string& label) {
+      fragment_spec spec;
+      spec.plan_source = sirius::test::sql_plan_source("SELECT d FROM " + leaf);
+      spec.outputs     = {0, 1};
+      // key_cast_types left empty: build() must accept the DOUBLE key and derive EMPTY for it.
+      spec.partitioning = sirius::op::partition_spec{{0}, {}};
+      streaming_fragment fragment(*con->context, std::move(spec));
+      {
+        query_window window(*sirius_ctx, *con->context, label);
+        fragment.build(window.query_id());
+        fragment.run();
+      }
+
+      // Keyed on the raw bits so +0.0/-0.0 and the NaN payloads stay distinguishable here; it
+      // is the ROUTING that has to collapse them, not the bookkeeping.
+      std::map<std::uint64_t, stream_id_t> destination_of;
+      std::map<stream_id_t, std::size_t> nan_rows_on_stream;
+      std::map<stream_id_t, std::size_t> zero_rows_on_stream;
+      std::size_t rows = 0;
+      for (auto id : {stream_id_t{0}, stream_id_t{1}}) {
+        while (auto batch = fragment.session().pull(id)) {
+          auto view = sirius::get_cudf_table_view(**batch);
+          // The partition output keeps the original schema; no cast column leaks into it.
+          REQUIRE(view.column(0).type().id() == cudf::type_id::FLOAT64);
+          auto host = sirius::test::operator_utils::copy_column_to_host<double>(view.column(0));
+          rows += host.size();
+          for (auto value : host) {
+            std::uint64_t bits = 0;
+            std::memcpy(&bits, &value, sizeof(bits));
+            auto [it, inserted] = destination_of.emplace(bits, id);
+            // One key on two streams would hand a downstream merge a partial group.
+            REQUIRE(it->second == id);
+            if (std::isnan(value)) { ++nan_rows_on_stream[id]; }
+            if (value == 0.0) { ++zero_rows_on_stream[id]; }
+          }
+        }
+      }
+      // Nothing dropped, nothing duplicated: the streams union to the whole input.
+      REQUIRE(rows == expected_rows);
+      // -0.0 == +0.0 and NaN != NaN under IEEE, so the per-bit-pattern check above cannot see
+      // these two collapses. Assert them directly: each must occupy exactly ONE destination.
+      REQUIRE(nan_rows_on_stream.size() == 1);
+      REQUIRE(nan_rows_on_stream.begin()->second == 4);
+      REQUIRE(zero_rows_on_stream.size() == 1);
+      REQUIRE(zero_rows_on_stream.begin()->second == 4);
+      return destination_of;
+    };
+
+    auto first  = route_keys("frag10_first");
+    auto second = route_keys("frag10_second");
     // Independently built fragments must agree on every key's destination.
     REQUIRE(first == second);
 
