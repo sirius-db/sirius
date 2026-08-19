@@ -33,6 +33,7 @@
 
 // cudf
 #include <cudf/io/parquet.hpp>
+#include <cudf/io/text/byte_range_info.hpp>
 
 // standard library
 #include <atomic>
@@ -123,6 +124,25 @@ class parquet_split_info : public scan_info {
  public:
   explicit parquet_split_info(std::vector<fadvise_entry> hints) : scan_info(std::move(hints)) {}
 
+  /// The column-chunk byte ranges this split reads, one vector per entry of
+  /// @c rg_slices (empty for a slice with no metadata or no row groups).
+  ///
+  /// Computed once by the coalescer, which already walks them to build this
+  /// split's fadvise hints, and handed over here so materialization can reuse
+  /// them: each computation builds a @c hybrid_scan_reader and walks the
+  /// footer's row groups, which is far from free on a many-row-group file.
+  [[nodiscard]] std::span<std::vector<cudf::io::text::byte_range_info> const>
+  column_chunk_byte_ranges() const
+  {
+    return _column_chunk_ranges;
+  }
+
+  void set_column_chunk_byte_ranges(
+    std::vector<std::vector<cudf::io::text::byte_range_info>> ranges)
+  {
+    _column_chunk_ranges = std::move(ranges);
+  }
+
   /// Row-group slices for this batch — possibly across multiple parquet
   /// files when the per-file row groups don't fill the byte budget.
   std::vector<row_group_slice> rg_slices;
@@ -164,6 +184,10 @@ class parquet_split_info : public scan_info {
     }
     return total;
   }
+
+ private:
+  /// Parallel to @c rg_slices. See @ref column_chunk_byte_ranges.
+  std::vector<std::vector<cudf::io::text::byte_range_info>> _column_chunk_ranges;
 };
 
 //===----------------------------------------------------------------------===//

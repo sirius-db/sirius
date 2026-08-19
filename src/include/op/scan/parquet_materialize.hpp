@@ -63,12 +63,14 @@ struct parquet_source {
 ///
 /// Takes one of two routes, picked from what the backend says it wants:
 ///
-///   bulk    - when there is exactly one source and its backend reports
-///             @c prefers_bulk_io().  Every column chunk is read in a single
-///             vectored device request straight into its own device buffer, and
-///             the table is decoded from those buffers by hybrid_scan_reader.
-///             One round trip for the whole split instead of one per chunk,
-///             which is what makes this worth doing against an object store.
+///   bulk    - when every source's backend reports @c prefers_bulk_io().  Each
+///             source's column chunks are read in a single vectored device
+///             request straight into their own device buffers, and the table is
+///             decoded from those buffers by the hybrid scan reader —
+///             @c hybrid_scan_reader for one source, @c hybrid_scan_multifile
+///             for several.  One round trip per file for the whole split
+///             instead of one per chunk, which is what makes this worth doing
+///             against an object store.
 ///
 ///   general - otherwise.  cudf::io::read_parquet over the datasources and
 ///             their pre-parsed footers, which reads as it decodes.
@@ -80,12 +82,14 @@ struct parquet_source {
 /// all of that.  Handing it filtered options would silently return unfiltered
 /// rows, so a filter on @p options forces the general route.
 ///
-/// @param ranges  column-chunk ranges for the single bulk source.  Only read on
-///                the bulk route; derived from the metadata when empty.
+/// @param ranges  column-chunk ranges, one vector per entry of @p sources and in
+///                the same order.  Only read on the bulk route; any source whose
+///                entry is missing or empty has its ranges derived from the
+///                metadata.  Pass an empty span to derive them all.
 [[nodiscard]] std::unique_ptr<cudf::table> materialize_parquet(
   std::span<parquet_source const> sources,
   cudf::io::parquet_reader_options const& options,
-  std::span<cudf::io::text::byte_range_info const> ranges,
+  std::span<std::vector<cudf::io::text::byte_range_info> const> ranges,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr);
 

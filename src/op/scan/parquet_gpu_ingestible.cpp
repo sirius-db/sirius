@@ -26,6 +26,7 @@
 #include <log/logging.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
+#include <op/scan/parquet_materialize.hpp>
 #include <op/scan/parquet_metadata.hpp>
 #include <op/scan/parquet_schema_mapping.hpp>
 #include <op/scan/scan_utils.hpp>
@@ -43,6 +44,9 @@
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
+
+// rmm
+#include <rmm/device_buffer.hpp>
 
 // cucascade
 #include <cucascade/memory/memory_space.hpp>
@@ -63,6 +67,8 @@
 #include <cctype>
 #include <cstdint>
 #include <filesystem>
+#include <future>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -170,8 +176,11 @@ std::string strip_file_uri(std::string const& p)
   return p;
 }
 
-std::vector<scan_info::fadvise_entry> parquet_fadvise_entries(
+std::vector<std::vector<cudf::io::text::byte_range_info>> slice_column_chunk_ranges(
   std::span<row_group_slice const> slices, cudf::io::parquet_reader_options const& reader_options);
+std::vector<scan_info::fadvise_entry> parquet_fadvise_entries(
+  std::span<row_group_slice const> slices,
+  std::span<std::vector<cudf::io::text::byte_range_info> const> per_slice_ranges);
 
 //===----------------------------------------------------------------------===//
 // parquet_batch_coalescer
@@ -308,10 +317,12 @@ class parquet_batch_coalescer : public batch_coalescer {
  private:
   std::unique_ptr<scan_info> emit_current()
   {
-    auto hints                     = parquet_fadvise_entries(_slices, *_reader_options);
+    auto per_slice_ranges          = slice_column_chunk_ranges(_slices, *_reader_options);
+    auto hints                     = parquet_fadvise_entries(_slices, per_slice_ranges);
     auto split                     = std::make_unique<parquet_split_info>(std::move(hints));
     split->rg_slices               = std::move(_slices);
     split->reader_options          = _reader_options;
+    split->set_column_chunk_byte_ranges(std::move(per_slice_ranges));
     split->plan                    = _plan;
     split->disable_filter_pushdown = _disable_pushdown;
     split->needs_assembly          = _needs_assembly;
@@ -347,32 +358,33 @@ class parquet_batch_coalescer : public batch_coalescer {
   bool _produced_any = false;
 };
 
-/// Column-chunk byte ranges a read fetches for @p row_group_indices, honoring
-/// @p options' column projection — the ranges materialize_table reads, used to
-/// drive prefetch. Empty when there are no row groups.
-std::vector<cudf::io::text::byte_range_info> column_chunk_ranges(
-  cudf::io::parquet::FileMetaData const& metadata,
-  cudf::io::parquet_reader_options const& options,
-  std::vector<cudf::size_type> const& row_group_indices)
+/// @ref column_chunk_ranges for every slice of a batch, in slice order.
+///
+/// Kept parallel to the slices (rather than dropping the empties the way the
+/// fadvise hints do) because materialization indexes it by slice: the hybrid
+/// scan hands cuDF one chunk-data span per range, in exactly the order the
+/// reader enumerated them.
+std::vector<std::vector<cudf::io::text::byte_range_info>> slice_column_chunk_ranges(
+  std::span<row_group_slice const> slices, cudf::io::parquet_reader_options const& reader_options)
 {
-  if (row_group_indices.empty()) { return {}; }
-  hybrid_scan_reader reader(metadata, options);
-  return reader.all_column_chunks_byte_ranges(
-    cudf::host_span<cudf::size_type const>(row_group_indices.data(), row_group_indices.size()),
-    options);
+  std::vector<std::vector<cudf::io::text::byte_range_info>> per_slice(slices.size());
+  for (std::size_t i = 0; i < slices.size(); ++i) {
+    if (!slices[i].file_metadata) { continue; }
+    per_slice[i] =
+      column_chunk_ranges(*slices[i].file_metadata, reader_options, slices[i].row_group_indices);
+  }
+  return per_slice;
 }
 
 std::vector<scan_info::fadvise_entry> parquet_fadvise_entries(
-  std::span<row_group_slice const> slices, cudf::io::parquet_reader_options const& reader_options)
+  std::span<row_group_slice const> slices,
+  std::span<std::vector<cudf::io::text::byte_range_info> const> per_slice_ranges)
 {
   std::vector<scan_info::fadvise_entry> entries;
   entries.reserve(slices.size());
-  for (auto const& slice : slices) {
-    if (!slice.datasource || !slice.file_metadata) { continue; }
-    auto ranges =
-      column_chunk_ranges(*slice.file_metadata, reader_options, slice.row_group_indices);
-    if (ranges.empty()) { continue; }
-    entries.push_back({slice.datasource, std::move(ranges)});
+  for (std::size_t i = 0; i < slices.size(); ++i) {
+    if (!slices[i].datasource || per_slice_ranges[i].empty()) { continue; }
+    entries.push_back({slices[i].datasource, per_slice_ranges[i]});
   }
   return entries;
 }
@@ -826,19 +838,12 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
 {
   auto const& split = static_cast<parquet_split_info const&>(info);
 
-  std::vector<std::unique_ptr<cudf::io::datasource>> sources;
   std::vector<cudf::io::parquet::FileMetaData> metadatas;
   std::vector<std::vector<cudf::size_type>> rg_per_src;
-  sources.reserve(split.rg_slices.size());
   metadatas.reserve(split.rg_slices.size());
   rg_per_src.reserve(split.rg_slices.size());
 
   for (auto const& slice : split.rg_slices) {
-    if (slice.datasource) {
-      sources.push_back(cudf::io::datasource::create(slice.datasource.get()));
-    } else {
-      sources.push_back(cudf::io::datasource::create(slice.file_path));
-    }
     metadatas.push_back(*slice.file_metadata);
     rg_per_src.push_back(slice.row_group_indices);
   }
@@ -856,11 +861,7 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
       return s.row_group_indices.empty();
     });
   auto opts = *split.reader_options;
-  if (all_slices_pruned) {
-    opts.set_num_rows(0);
-  } else {
-    opts.set_row_groups(std::move(rg_per_src));
-  }
+  if (all_slices_pruned) { opts.set_num_rows(0); }
 
   // Per-task AST translation for reader-side row-group + row pushdown. set_filter
   // is gated on translation success AND on the per-batch disable_filter_pushdown
@@ -910,8 +911,43 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   if (reader_filter_root) { opts.set_filter(*reader_filter_root); }
 
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
-  auto [table, _] =
-    cudf::io::read_parquet(std::move(sources), std::move(metadatas), opts, stream, mr_ref);
+
+  // materialize_parquet picks the route: a bulk hybrid scan (hybrid_scan_reader
+  // for one file, hybrid_scan_multifile for several) when every slice's backend
+  // prefers it, otherwise read_parquet.  It refuses the bulk route for filtered
+  // options on its own -- materialize_all_columns ignores a filter rather than
+  // rejecting one, so taking it here would hand back every row while
+  // `reader_applied_full_filter` below claims the reader discharged the
+  // predicate.  The all-pruned split is left to read_parquet too: it has no row
+  // groups to enumerate, and set_num_rows(0) already builds the schema-correct
+  // empty table without touching a data page.
+  std::vector<parquet_source> sources;
+  sources.reserve(split.rg_slices.size());
+  for (auto const& slice : split.rg_slices) {
+    sources.push_back(parquet_source{slice.datasource, slice.file_metadata, slice.row_group_indices});
+  }
+
+  std::unique_ptr<cudf::table> table;
+  bool const bulk = !all_slices_pruned && prefers_bulk_materialize(sources, opts);
+  if (bulk) {
+    table = materialize_parquet(sources, opts, split.column_chunk_byte_ranges(), stream, mr_ref);
+  } else {
+    // The general route reads as it decodes, so it needs the row-group selection
+    // on the options; the hybrid readers take it as a call argument instead.
+    if (!all_slices_pruned) { opts.set_row_groups(rg_per_src); }
+    std::vector<std::unique_ptr<cudf::io::datasource>> cudf_sources;
+    cudf_sources.reserve(split.rg_slices.size());
+    for (auto const& slice : split.rg_slices) {
+      if (slice.datasource) {
+        cudf_sources.push_back(cudf::io::datasource::create(slice.datasource.get()));
+      } else {
+        cudf_sources.push_back(cudf::io::datasource::create(slice.file_path));
+      }
+    }
+    table = std::move(
+      cudf::io::read_parquet(std::move(cudf_sources), std::move(metadatas), opts, stream, mr_ref)
+        .tbl);
+  }
 
   // Hive-partition scans assemble inline here: partition_values are per-split
   // (carried on parquet_split_info) and do not travel to the pipeline-shared
