@@ -36,6 +36,9 @@ namespace sirius::op::detail {
 
 /**
  * @brief Returns CuCascade's aligned charge for one allocation
+ *
+ * Reservations spanning multiple allocations must sum per-allocation aligned charges:
+ * `sum(align_up(b_i)) != align_up(sum(b_i))`.
  */
 [[nodiscard]] inline std::size_t tracked_replica_allocation_bytes(
   std::size_t allocation_bytes) noexcept
@@ -47,8 +50,8 @@ namespace sirius::op::detail {
 /**
  * @brief RAII reservation attached to an allocator tracker
  *
- * Destruction detaches the tracker while live allocations retain accounting. Destroy on the host
- * thread that acquired the reservation.
+ * Destruction detaches the tracker, releasing unused reserved capacity while live allocations
+ * retain their accounting. Destroy on the host thread that acquired the reservation.
  */
 class scoped_replica_reservation final {
  public:

@@ -73,6 +73,8 @@ struct membership_choice_inputs {
 
 /**
  * @brief Tests whether inclusive `[min_value, max_value]` covers the threshold of a known domain
+ *
+ * Not yet wired into production; exercised by tests only.
  */
 [[nodiscard]] constexpr bool zone_map_range_gate_fires(double min_value,
                                                        double max_value,

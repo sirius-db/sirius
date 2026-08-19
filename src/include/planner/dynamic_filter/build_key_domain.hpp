@@ -37,6 +37,8 @@ namespace sirius::planner {
  * @brief Callable returning an exact unfiltered row count, a true upper bound, or `std::nullopt`
  *
  * Production converts callback failures to `std::nullopt`; custom-source exceptions propagate.
+ * Implementations must not answer from `LogicalGet::estimated_cardinality`, which may reflect
+ * filters and understate the domain.
  */
 template <class Source>
 concept base_table_cardinality_source =

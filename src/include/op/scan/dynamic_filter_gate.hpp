@@ -60,6 +60,8 @@ class dynamic_filter_gate {
     sirius::op::sirius_dynamic_filter const* filter, std::size_t observed_filter_count) const;
 
   /// Updates only for a larger observed filter count; equal or older measurements are ignored.
+  /// A newer measurement may overwrite a skippable verdict — a deliberate allowance for splits
+  /// already in flight, not a bug.
   void record_filter_keep_ratio(sirius::op::sirius_dynamic_filter const* filter,
                                 double kept,
                                 std::size_t observed_filter_count);

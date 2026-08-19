@@ -34,6 +34,9 @@ namespace sirius::planner {
 
 /**
  * @brief Classifies a pre-materialization side as a reference, cast reference, or computed key
+ *
+ * The direct/cast/computed trichotomy must match the key-extraction switch in
+ * sirius_physical_hash_join.cpp: a shape admitted here is materialized there.
  */
 [[nodiscard]] op::dynamic_filter_key_shape classify_key_side(duckdb::Expression const& key_side);
 
