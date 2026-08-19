@@ -304,11 +304,14 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
   auto const& targets                          = normalization_targets();
   std::vector<carrier_conversion_plan> transactional_plan;
   std::unique_ptr<cudf::table> output_table;
-  // A decode-row-filtered split may only bypass post_filter_and_project when the assembly it
+  // Only prepare_for_processing arms pending (pipeline contract: prepare runs before execute on
+  // the same task), so a non-candidate split skips the builder lambda entirely. A
+  // decode-row-filtered split may only bypass post_filter_and_project when the assembly it
   // skips is a leading identity — its width match alone cannot prove that, because trailing
   // pure-filter columns can offset synthesized (partition) output columns. An unfiltered split
   // needs no such proof: it decodes exactly the output columns, so a width match is decisive.
-  if (!scan_input->pushdown_row_filtered || _ingestible->output_assembly_is_leading_identity()) {
+  if (scan_input->converted_table_steal_pending &&
+      (!scan_input->pushdown_row_filtered || _ingestible->output_assembly_is_leading_identity())) {
     output_table = scan_input->transactionally_steal_converted_table(
       targets.size(),
       [&](cudf::table_view source) {

@@ -1300,6 +1300,11 @@ TEST_CASE("prepare_for_processing gates immediate and transactional converted-ta
   auto& e = env();
   std::vector<int32_t> const values{20, 21, 22, 23};
 
+  // Each section cross-checks converted_table_transferable() against the observed arming outcome:
+  // the shared predicate is the eligibility policy both steal forms consult, so its answer and the
+  // arming decision must agree row by row (mask -> false, pending row filter -> false,
+  // decode-applied row filter -> true, unflagged -> true).
+
   SECTION("mvcc keep-mask pending")
   {
     auto batch = make_host_batch(e, values);
@@ -1308,6 +1313,7 @@ TEST_CASE("prepare_for_processing gates immediate and transactional converted-ta
     split.prepare_for_processing(e.gpu_space, e.stream());
     REQUIRE(split.stolen_table == nullptr);
     REQUIRE_FALSE(split.converted_table_steal_pending);
+    REQUIRE_FALSE(split.converted_table_transferable());
     // Converted in place but not stolen: the masked materialize path filters
     // by copy from the batch's view.
     auto ro = batch->to_read_only();
@@ -1323,6 +1329,7 @@ TEST_CASE("prepare_for_processing gates immediate and transactional converted-ta
     split.prepare_for_processing(e.gpu_space, e.stream());
     REQUIRE(split.stolen_table == nullptr);
     REQUIRE_FALSE(split.converted_table_steal_pending);
+    REQUIRE_FALSE(split.converted_table_transferable());
     auto ro = batch->to_read_only();
     REQUIRE(ro.get_current_tier() == cucascade::memory::Tier::GPU);
     REQUIRE(ro.get_data()->get_size_in_bytes() > 0);
@@ -1336,6 +1343,7 @@ TEST_CASE("prepare_for_processing gates immediate and transactional converted-ta
     split.prepare_for_processing(e.gpu_space, e.stream());
     REQUIRE(split.stolen_table == nullptr);
     REQUIRE(split.converted_table_steal_pending);
+    REQUIRE(split.converted_table_transferable());
     REQUIRE(split.stolen_table_bytes > 0);
     // Converted in place and retained transactionally: scan normalization will allocate every
     // replacement before committing the source columns.
@@ -1354,6 +1362,7 @@ TEST_CASE("prepare_for_processing gates immediate and transactional converted-ta
     split.prepare_for_processing(e.gpu_space, e.stream());
     REQUIRE(split.stolen_table == nullptr);
     REQUIRE_FALSE(split.converted_table_steal_pending);
+    REQUIRE_FALSE(split.converted_table_transferable());
   }
 
   SECTION("decode-row-filtered carrier conversion regains the transactional path")
@@ -1369,6 +1378,7 @@ TEST_CASE("prepare_for_processing gates immediate and transactional converted-ta
     split.prepare_for_processing(e.gpu_space, e.stream());
     REQUIRE(split.stolen_table == nullptr);
     REQUIRE(split.converted_table_steal_pending);
+    REQUIRE(split.converted_table_transferable());
     REQUIRE(split.stolen_table_bytes > 0);
     auto ro = batch->to_read_only();
     REQUIRE(ro.get_current_tier() == cucascade::memory::Tier::GPU);
@@ -1496,6 +1506,42 @@ TEST_CASE("transactional converted-table steal rolls back and commits on retry",
     retry);
   REQUIRE(consumed == nullptr);
   REQUIRE_FALSE(consumed_builder_called);
+}
+
+TEST_CASE("transactional steal refuses a downgraded wrapper without mutating it",
+          "[cached_serving][scan_manager]")
+{
+  auto& e = env();
+  std::vector<int32_t> const values{50, 51, 52, 53};
+  using replacements = sirius::op::scan::scan_operator_input::converted_column_replacements;
+
+  auto batch = make_host_batch(e, values);
+  sirius::op::scan::scan_operator_input split{batch};
+  split.needs_carrier_conversion = true;
+  split.prepare_for_processing(e.gpu_space, e.stream());
+  REQUIRE(split.converted_table_steal_pending);
+
+  // A mid-query tier downgrade moves the armed wrapper's data off the GPU; the steal must refuse
+  // it before any mutation (the refusal precedes the dealloc-stream rebind).
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::host_data_representation>(
+      sirius::converter_registry::get(), e.host_space, e.stream());
+  }
+  e.stream().synchronize();
+
+  bool builder_called = false;
+  auto refused        = split.transactionally_steal_converted_table(
+    /*output_width=*/1,
+    [&](cudf::table_view) {
+      builder_called = true;
+      return replacements(1);
+    },
+    e.stream());
+  REQUIRE(refused == nullptr);
+  REQUIRE_FALSE(builder_called);
+  REQUIRE(split.converted_table_steal_pending);
+  REQUIRE_FALSE(split.stolen_table_consumed);
 }
 
 TEST_CASE("transactional steal serves decode-row-filtered splits but refuses predicate columns",

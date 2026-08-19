@@ -31,13 +31,10 @@
 #include <memory>
 #include <numeric>
 #include <stdexcept>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
 namespace sirius::op::scan {
-
-static_assert(std::is_nothrow_move_constructible_v<cudf::column>);
 
 namespace {
 
@@ -212,6 +209,14 @@ void scan_operator_input::prepare_for_processing(
       // is not re-evaluated. selection_unprofitable means the attempt did not
       // pay off, so the scan's remaining splits skip it. Off-gate the
       // converters install the plain representation and both stay false.
+      // Established by src/compression/compressed_scan.cpp:
+      // build_chunk_pushdown_config sets config.covers_whole_filter only when
+      // the request covered the whole filter and no conjunct was dropped or
+      // left untranslated, and decompress_with_pushdown sets
+      // outcome.row_filtered only when a compaction was applied under that
+      // flag. The transactional steal's filter bypass depends on this — if
+      // that gate ever weakens, the steal must stop honoring
+      // pushdown_row_filtered.
       if (auto const* decoded =
             dynamic_cast<::sirius::decompression_pushdown_batch_representation const*>(
               mut.get_data())) {
@@ -241,7 +246,7 @@ void scan_operator_input::prepare_for_processing(
       // built every replacement cast; a non-converting split can detach immediately because no
       // allocating GPU operation follows the take, so an OOM retry can never re-enter materialize
       // on a consumed split.
-      if (!mvcc_keep_mask.has_mask() && (!row_filter_pending || pushdown_row_filtered)) {
+      if (converted_table_transferable()) {
         if (auto* gpu_rep = dynamic_cast<::cucascade::gpu_table_representation*>(mut.get_data())) {
           auto& space        = gpu_rep->get_memory_space();
           stolen_table_bytes = gpu_rep->get_size_in_bytes();
@@ -282,8 +287,7 @@ std::unique_ptr<cudf::table> scan_operator_input::transactionally_steal_converte
   // width check below, but a values-only source is a correctness invariant here, so refuse them
   // explicitly rather than by that coincidence.
   if (!converted_table_steal_pending || !needs_carrier_conversion || stolen_table_consumed ||
-      stolen_table || !is_resident() || mvcc_keep_mask.has_mask() ||
-      (row_filter_pending && !pushdown_row_filtered) || !pushdown_predicate_columns.empty()) {
+      stolen_table || !converted_table_transferable() || !pushdown_predicate_columns.empty()) {
     return nullptr;
   }
 
@@ -293,13 +297,17 @@ std::unique_ptr<cudf::table> scan_operator_input::transactionally_steal_converte
   // Keep the exclusive lock and the complete source table through every potentially allocating
   // builder operation. In particular, rmm::out_of_memory unwinds only the replacement columns and
   // this lock; the wrapper still owns every source column for the scheduler's retry.
-  auto mut = batch->to_mutable();
-  mut.rebind_stream(stream);
+  auto mut      = batch->to_mutable();
   auto* gpu_rep = dynamic_cast<::cucascade::gpu_table_representation*>(mut.get_data());
   if (gpu_rep == nullptr) { return nullptr; }
 
   auto const source_view = gpu_rep->get_table_view();
   if (static_cast<std::size_t>(source_view.num_columns()) != output_width) { return nullptr; }
+
+  // First mutation only after every refusal above, so a refused candidate leaves the wrapper
+  // byte-identical. The rebind's requirement — replaced source columns must free on the caller's
+  // stream — still holds: it precedes the builder's casts and the commit.
+  mut.rebind_stream(stream);
 
   auto& space    = gpu_rep->get_memory_space();
   auto empty_rep = std::make_unique<::cucascade::gpu_table_representation>(
@@ -326,12 +334,15 @@ std::unique_ptr<cudf::table> scan_operator_input::transactionally_steal_converte
       "[scan_operator_input::transactionally_steal_converted_table] converted source table was "
       "already released");
   }
+  auto columns = source_table->release();
   for (std::size_t column_idx = 0; column_idx < replacements.size(); ++column_idx) {
-    if (!replacements[column_idx]) { continue; }
-    auto& destination = source_table->get_column(static_cast<cudf::size_type>(column_idx));
-    std::destroy_at(std::addressof(destination));
-    std::construct_at(std::addressof(destination), std::move(*replacements[column_idx]));
+    if (replacements[column_idx]) { columns[column_idx] = std::move(replacements[column_idx]); }
   }
+  // cudf::table's move assignment is deleted, so splice by rebuilding around the column vector.
+  // Host-only: no device allocation, copy, or kernel between release() and the rebuilt table. The
+  // rebuild's lone throw (host bad_alloc) is query-fatal, never rescheduled — the wrapper has
+  // already surrendered its table here, so this window must never gain retry support.
+  source_table = std::make_unique<cudf::table>(std::move(columns));
   mut.set_data(std::move(empty_rep));
   converted_table_steal_pending = false;
   stolen_table_consumed         = true;

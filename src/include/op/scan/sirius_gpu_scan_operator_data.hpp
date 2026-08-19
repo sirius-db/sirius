@@ -109,6 +109,18 @@ class scan_operator_input : public op::operator_data {
     return std::holds_alternative<std::shared_ptr<::cucascade::data_batch>>(materialization_info);
   }
 
+  /// Whether a per-query table freshly converted by prepare_for_processing may leave the cached
+  /// wrapper: the split is resident, carries no mvcc keep-mask, and any pending row filter has
+  /// already been applied by the decode (pushdown_row_filtered). Policy shared by prepare's
+  /// arming/direct-steal gate and the transactional steal's refusal gate; the ingestible-dependent
+  /// leading-identity clause stays at execute's call site, and per-steal state (pending / consumed
+  /// / already-stolen / predicate columns) stays in the steal.
+  [[nodiscard]] bool converted_table_transferable() const noexcept
+  {
+    return is_resident() && !mvcc_keep_mask.has_mask() &&
+           (!row_filter_pending || pushdown_row_filtered);
+  }
+
   [[nodiscard]] bool has_scan_metadata() const noexcept
   {
     return std::holds_alternative<std::unique_ptr<scan_info>>(materialization_info) &&

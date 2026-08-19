@@ -158,6 +158,12 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
   /// trailing pure-filter columns can offset missing synthesized columns.
   /// Conservative default: false (the steal then falls back to the generic
   /// materialize/project path, which is always correct).
+  /// Implementations must derive this from their assembly configuration
+  /// (parquet: `!needs_output_assembly`) or return a structural constant only
+  /// while the invariant is type-level (duckdb-native synthesizes no
+  /// partition/virtual output columns and projects via `std::iota` — see its
+  /// `post_filter_and_project`). An override returning a stale `true` silently
+  /// corrupts decode-row-filtered steals.
   [[nodiscard]] virtual bool output_assembly_is_leading_identity() const noexcept { return false; }
 
   [[nodiscard]] virtual const ingestible_table_info& table_info() const noexcept = 0;

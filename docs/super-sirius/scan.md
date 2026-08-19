@@ -334,7 +334,7 @@ Before decode, the scan walks DuckDB's storage metadata to learn, per row group,
 Runs once, single-threaded, because it touches `ClientContext`/`LocalStorage`, which are not thread-safe:
 
 - Reads `PartitionStatistics` for every row group (the source of each row group's absolute first-row index and row count, used both for rowid synthesis and decoded-byte budgeting).
-- Gates the projected types: an exhaustive type switch refuses 128-bit and nested types up front so an unsupported projection becomes a clean CPU fallback before any per-segment IO.
+- Gates the projected types: an exhaustive type switch refuses 128-bit and nested types up front — except fixed-size `ARRAY` with a supported fixed-width element, which is admitted and decodes as cuDF `LIST` — so an unsupported projection becomes a clean CPU fallback before any per-segment IO.
 - Marks row groups that pushed-down filter statistics prove empty (see **Row Group Pruning**).
 
 The result is a `duckdb_native_walk_plan` carrying per-row-group row starts/counts, the block size, the pruned-row-group bitmap, and the inputs the range walks need. A non-viable plan (unsupported type, invalid partition `row_start`, or the varchar overflow-block refusal) refuses the whole native-scan path.
