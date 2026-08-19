@@ -18,8 +18,10 @@
  * Tests the build-port claim condition in `sirius_physical_hash_join::push_data_batch_partitioned`:
  * the one-shot publisher may claim only a build batch carrying the whole build side, as reported
  * through `set_build_arrives_whole`; the join mode is not part of the condition. The tests drive
- * the build port directly, pinning the claim condition -- and the reopening of a claimed window
- * whose build batch is not GPU-resident -- rather than any partitioning decision.
+ * the build port directly, pinning the claim condition -- plus the reopening of a claimed window
+ * without a usable GPU source (not GPU-resident, or resident on a GPU outside the plan's replica
+ * set) and the fail-open containment of device memory exhaustion -- rather than any partitioning
+ * decision.
  */
 
 #include "expression/join_condition.hpp"
@@ -32,6 +34,9 @@
 #include <cudf/types.hpp>
 
 #include <rmm/cuda_device.hpp>
+#include <rmm/device_buffer.hpp>
+
+#include <cuda_runtime_api.h>
 
 #include <catch.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
@@ -67,8 +72,7 @@ constexpr auto kInt64 = cudf::data_type{cudf::type_id::INT64};
 /// by reference.
 struct claim_fixture {
   rmm::cuda_set_device_raii device{rmm::cuda_device_id{kDeviceId}};
-  decltype(sirius::test::operator_utils::initialize_memory_manager(1)) memory_manager =
-    sirius::test::operator_utils::initialize_memory_manager(1);
+  decltype(sirius::test::operator_utils::initialize_memory_manager(1)) memory_manager;
   std::shared_ptr<sirius_dynamic_filter_set> channel =
     std::make_shared<sirius_dynamic_filter_set>();
   dynamic_filter_stats stats;
@@ -77,7 +81,11 @@ struct claim_fixture {
   duckdb::unique_ptr<duckdb::LogicalComparisonJoin> logical_join;
   duckdb::unique_ptr<sirius_physical_hash_join> hash_join;
 
-  explicit claim_fixture(duckdb::JoinType join_type = duckdb::JoinType::INNER)
+  /// The plan's replica space stays GPU 0 only regardless of @p num_gpus; extra GPUs exist so
+  /// tests can build batches resident outside the replica set.
+  explicit claim_fixture(duckdb::JoinType join_type = duckdb::JoinType::INNER,
+                         std::size_t num_gpus       = 1)
+    : memory_manager(sirius::test::operator_utils::initialize_memory_manager(num_gpus))
   {
     channel->register_producer({kProbeColumnIndex});
 
@@ -163,15 +171,24 @@ struct claim_fixture {
     REQUIRE(stats.producers_enabled.load() == 1);
   }
 
-  /// A GPU-resident single-column build batch of distinct INT64 keys.
-  [[nodiscard]] std::shared_ptr<cucascade::data_batch> make_build_batch()
+  /// A GPU-resident single-column build batch of @p rows distinct INT64 keys, created in
+  /// @p space on that space's device.
+  [[nodiscard]] static std::shared_ptr<cucascade::data_batch> make_build_batch_on(
+    cucascade::memory::memory_space& space, std::size_t rows = kBuildRows)
   {
-    std::vector<std::int64_t> keys(kBuildRows);
+    rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{space.get_device_id()}};
+    std::vector<std::int64_t> keys(rows);
     for (std::size_t i = 0; i < keys.size(); ++i) {
       keys[i] = static_cast<std::int64_t>(i);
     }
     return sirius::test::operator_utils::make_numeric_batch<std::int64_t>(
-      *gpu_space, keys, cudf::type_id::INT64);
+      space, keys, cudf::type_id::INT64);
+  }
+
+  /// The default whole-build batch: kBuildRows keys in the fixture's GPU-0 space.
+  [[nodiscard]] std::shared_ptr<cucascade::data_batch> make_build_batch()
+  {
+    return make_build_batch_on(*gpu_space);
   }
 
   void push_build_batch()
@@ -274,5 +291,93 @@ TEST_CASE("a claimed but not GPU-resident whole build reopens the window for a s
   CHECK(fixture.stats.publications_finished.load() == 1);
   CHECK(fixture.stats.publications_failed.load() == 0);
   CHECK(fixture.stats.publications_skipped_source_not_resident.load() == 1);
+  CHECK_FALSE(fixture.channel->filters_for_column(kProbeColumnIndex).empty());
+}
+
+TEST_CASE("a join whose replica restriction removed every GPU never claims",
+          "[dynamic_filter][publication_claim][gpu_execution]")
+{
+  claim_fixture fixture;
+  // The pipeline converter's per-query GPU restriction admitted none of the plan's replica
+  // devices, disabling publication for this join before execution.
+  fixture.hash_join->restrict_dynamic_filter_replicas({kDeviceId + 1});
+  CHECK_FALSE(fixture.hash_join->publishes_dynamic_filters());
+
+  fixture.hash_join->set_build_arrives_whole(true);
+  CHECK_NOTHROW(fixture.push_build_batch());
+
+  CHECK(fixture.stats.publication_attempts.load() == 0);
+  CHECK(fixture.stats.publications_skipped_build_not_whole.load() == 0);
+  CHECK(fixture.channel->filters_for_column(kProbeColumnIndex).empty());
+}
+
+TEST_CASE("device memory exhaustion during a claimed publication fails open",
+          "[dynamic_filter][publication_claim][gpu_execution]")
+{
+  claim_fixture fixture;
+  fixture.hash_join->set_build_arrives_whole(true);
+
+  // Past the small-list gate, so filter construction must allocate device memory.
+  constexpr std::size_t kLargeBuildRows = 100000;
+  auto batch = claim_fixture::make_build_batch_on(*fixture.gpu_space, kLargeBuildRows);
+
+  {
+    // Leave under 64 KiB of the space's accounting capacity so the filter's first device
+    // allocation deterministically throws cucascade_out_of_memory (an rmm::out_of_memory).
+    constexpr std::size_t kHeadroomBytes = 64ull << 10;
+    auto const stream                    = fixture.gpu_space->acquire_stream();
+    auto const available                 = fixture.gpu_space->get_available_memory();
+    REQUIRE(available > kHeadroomBytes);
+    rmm::device_buffer const ballast{
+      available - kHeadroomBytes, stream, fixture.gpu_space->get_default_allocator()};
+
+    CHECK_NOTHROW(
+      fixture.hash_join->push_data_batch_partitioned("build", batch, /*partition_idx=*/0));
+  }
+
+  CHECK(fixture.stats.publication_attempts.load() == 1);
+  CHECK(fixture.stats.publications_failed.load() == 1);
+  CHECK(fixture.stats.publications_finished.load() == 0);
+  CHECK(fixture.stats.membership_filters_built.load() == 0);
+  CHECK(fixture.channel->filters_for_column(kProbeColumnIndex).empty());
+
+  // FAILED is terminal: with the ballast freed, a second whole-build delivery must not reattempt.
+  fixture.push_build_batch();
+  CHECK(fixture.stats.publication_attempts.load() == 1);
+}
+
+TEST_CASE("a whole build resident on a non-plan GPU reopens the window for a sibling delivery",
+          "[dynamic_filter][publication_claim][gpu_execution]")
+{
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  if (device_count < 2) {
+    WARN(
+      "non-plan-GPU source skip requires >=2 GPUs; single-GPU host -- skipping "
+      "(per Catch2 v2 WARN+return convention)");
+    return;
+  }
+
+  // Two GPU spaces exist, but the plan holds a replica space on GPU 0 only.
+  claim_fixture fixture{duckdb::JoinType::INNER, /*num_gpus=*/2};
+  fixture.hash_join->set_build_arrives_whole(true);
+
+  auto* other_gpu_space =
+    fixture.memory_manager->get_memory_space(cucascade::memory::Tier::GPU, kDeviceId + 1);
+  REQUIRE(other_gpu_space != nullptr);
+
+  fixture.hash_join->push_data_batch_partitioned(
+    "build", claim_fixture::make_build_batch_on(*other_gpu_space), /*partition_idx=*/0);
+
+  CHECK(fixture.stats.publication_attempts.load() == 1);
+  CHECK(fixture.stats.publications_skipped_source_not_resident.load() == 1);
+  CHECK(fixture.stats.publications_finished.load() == 0);
+  CHECK(fixture.stats.publications_failed.load() == 0);
+  CHECK(fixture.channel->filters_for_column(kProbeColumnIndex).empty());
+
+  fixture.push_build_batch();
+
+  CHECK(fixture.stats.publication_attempts.load() == 2);
+  CHECK(fixture.stats.publications_finished.load() == 1);
   CHECK_FALSE(fixture.channel->filters_for_column(kProbeColumnIndex).empty());
 }

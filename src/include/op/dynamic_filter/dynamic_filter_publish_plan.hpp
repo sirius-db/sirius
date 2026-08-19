@@ -302,6 +302,13 @@ class dynamic_filter_publish_plan final {
     return _replica_spaces;
   }
   /**
+   * @brief Whether the plan holds a replica space on GPU @p gpu_device_id
+   *
+   * The delivery hook consults this before publishing: a build batch resident on a GPU outside the
+   * replica set has no source space to allocate from and is skipped, not published.
+   */
+  [[nodiscard]] bool has_replica_on_device(int gpu_device_id) const noexcept;
+  /**
    * @brief Domain coverage at or above which publication skips an eligible key
    */
   [[nodiscard]] double domain_coverage_threshold() const noexcept
@@ -319,8 +326,11 @@ class dynamic_filter_publish_plan final {
   /**
    * @brief Drop replica targets on GPUs outside @p admitted_gpu_ids
    *
-   * An empty list means "no subset" and leaves the plan untouched. See
-   * sirius_pipeline_converter::restrict_dynamic_filter_replicas for why this is needed.
+   * An empty list means "no subset" and leaves the plan untouched. A restriction that would erase
+   * every replica space instead disables the plan (`enabled() == false`, probe targets cleared):
+   * the constructor invariant "probe targets => replica spaces" holds for the plan's whole
+   * lifetime. See sirius_pipeline_converter::restrict_dynamic_filter_replicas for why restriction
+   * is needed.
    */
   void restrict_replicas_to(std::vector<int> const& admitted_gpu_ids);
 

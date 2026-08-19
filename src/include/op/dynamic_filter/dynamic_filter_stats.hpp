@@ -67,8 +67,10 @@ struct dynamic_filter_stats_snapshot {
  * lands in exactly one of the three outcome counters, so `publication_attempts ==
  * publications_finished + publications_failed + publications_skipped_source_not_resident`; a
  * not-resident skip reopens the window, so a skipped-then-rescued broadcast build counts two
- * attempts, one skip, and one finish. `publications_skipped_build_not_whole` is latched once per
- * join, so a join's later non-claiming deliveries, and deliveries after the publication window
+ * attempts, one skip, and one finish. A restriction-disabled producer (see
+ * dynamic_filter_publish_plan::restrict_replicas_to) was already counted in producers_enabled at
+ * construction and contributes no attempts. `publications_skipped_build_not_whole` is latched once
+ * per join, so a join's later non-claiming deliveries, and deliveries after the publication window
  * closes, are counted nowhere.
  */
 struct dynamic_filter_stats {
@@ -89,9 +91,12 @@ struct dynamic_filter_stats {
   // Opportunistic delivery
   std::atomic<std::uint64_t> publication_attempts{0};  ///< OPEN -> PUBLISHING claims
   std::atomic<std::uint64_t> publications_finished{0};
+  /// Claimed attempts whose publication threw; device memory exhaustion is contained (the query
+  /// proceeds filterless), any other failure propagates.
   std::atomic<std::uint64_t> publications_failed{0};
-  /// Build batch was not GPU-resident at delivery; the claimed window reopens so a sibling
-  /// (broadcast) delivery with a GPU-resident replica can claim it
+  /// The delivered build batch had no usable GPU-resident source on a plan device (not
+  /// GPU-resident, or resident on a GPU the plan holds no replica space for); the claimed window
+  /// reopens so a sibling (broadcast) delivery with a usable source can claim it
   std::atomic<std::uint64_t> publications_skipped_source_not_resident{0};
   /// Wired join the upstream PARTITION never reported a whole build for, so its one-shot
   /// publication window can never claim: probe-driven sizing, a hash-partitioned multi-partition

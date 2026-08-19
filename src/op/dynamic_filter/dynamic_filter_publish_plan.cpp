@@ -16,6 +16,8 @@
 
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 
+#include "log/logging.hpp"
+
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
@@ -130,6 +132,20 @@ void dynamic_filter_publish_plan::restrict_replicas_to(std::vector<int> const& a
     auto const gpu_id = target.get_gpu_space().get_device_id();
     return std::find(admitted_gpu_ids.begin(), admitted_gpu_ids.end(), gpu_id) ==
            admitted_gpu_ids.end();
+  });
+  if (_replica_spaces.empty() && !_probe_targets.empty()) {
+    SIRIUS_LOG_WARN(
+      "[dynamic_filter_publish_plan] The admitted GPU set holds none of this plan's replica "
+      "GPUs; disabling dynamic-filter publication for this join ({} probe target(s) dropped).",
+      _probe_targets.size());
+    _probe_targets.clear();
+  }
+}
+
+bool dynamic_filter_publish_plan::has_replica_on_device(int gpu_device_id) const noexcept
+{
+  return std::ranges::any_of(_replica_spaces, [gpu_device_id](auto const& target) {
+    return target.get_gpu_space().get_device_id() == gpu_device_id;
   });
 }
 

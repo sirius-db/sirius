@@ -289,8 +289,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //! Join Keys statistics (optional)
   duckdb::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> join_stats;
 
-  /// \brief Drop dynamic-filter replica targets on GPUs outside @p admitted_gpu_ids. Called
-  /// by sirius_pipeline_converter once the admitted set is known.
+  /// \brief Drop dynamic-filter replica targets on GPUs outside @p admitted_gpu_ids. Called by
+  /// sirius_pipeline_converter once the admitted set is known. An admitted set holding none of the
+  /// plan's replica GPUs disables publication for this join (the plan logs the degrade).
   void restrict_dynamic_filter_replicas(std::vector<int> const& admitted_gpu_ids)
   {
     _dynamic_filter_plan.restrict_replicas_to(admitted_gpu_ids);
@@ -478,7 +479,10 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   ///
   /// This method requires @c PUBLISHING on entry and owns the terminal transition to @c FINISHED or
   /// @c FAILED. GPU work runs without holding @ref op_state_mutex. A successful attempt ends in @c
-  /// FINISHED even when selectivity gates or drained targets cause it to emit no filters. @ref
+  /// FINISHED even when selectivity gates or drained targets cause it to emit no filters. Device
+  /// memory exhaustion (@c rmm::out_of_memory, covering cucascade's subclass) is contained: the
+  /// window ends @c FAILED and the method returns normally, so the query proceeds without filters.
+  /// Any other exception also ends the window @c FAILED but propagates to the caller. @ref
   /// on_finalize_operator never publishes; it only changes an unclaimed @c OPEN window to @c CLOSED
   /// before releasing BUILD_PROBE state.
   ///
@@ -495,7 +499,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   };
 
   /// Plan-time routing, policy, and replica placement; after construction only
-  /// restrict_dynamic_filter_replicas narrows the replica set, before execution begins.
+  /// restrict_dynamic_filter_replicas narrows the replica set -- possibly to disabled -- before
+  /// execution begins.
   dynamic_filter_publish_plan _dynamic_filter_plan;
   // Optional non-owning counter sink. SiriusContext owns it and outlives the plan.
   dynamic_filter_stats* _dynamic_filter_stats = nullptr;
@@ -511,7 +516,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// batch is the publication point. The publication window is claimed (@c OPEN to @c PUBLISHING)
   /// at decision time, under @ref op_state_mutex and before the batch is routed; before control
   /// leaves this method, a claimed window ends terminal (@c FINISHED or @c FAILED) or is reopened
-  /// to @c OPEN by the not-GPU-resident skip so a sibling broadcast delivery can claim it.
+  /// to @c OPEN by the no-usable-GPU-source skip so a sibling broadcast delivery can claim it.
   /// The batch's read-only accessor is likewise acquired BEFORE it is routed: once deposited
   /// into a repository the batch becomes a downgrade candidate, and holding the shared lock across
   /// the deposit pins its GPU representation until publication completes. A stream borrowed from

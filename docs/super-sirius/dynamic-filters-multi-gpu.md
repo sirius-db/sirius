@@ -157,6 +157,7 @@ hash-table build state:
 ```text
 OPEN --claim--> PUBLISHING --success--> FINISHED
                          `--exception--> FAILED
+PUBLISHING --no usable GPU source--> OPEN   (skip; a sibling delivery may reclaim)
 OPEN --finalize without a claim-------> CLOSED
 ```
 

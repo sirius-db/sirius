@@ -51,6 +51,7 @@
 #include "sirius/exception.hpp"
 
 #include <rmm/cuda_device.hpp>
+#include <rmm/error.hpp>
 
 #include <cuda_runtime_api.h>
 #include <nvtx3/nvtx3.hpp>
@@ -843,7 +844,8 @@ bool sirius_physical_hash_join::is_build_probe_mode()
 
 bool sirius_physical_hash_join::publishes_dynamic_filters() const
 {
-  // Fixed at construction, so this needs no lock.
+  // Set at construction and only narrowed by restrict_dynamic_filter_replicas before execution
+  // begins, so this needs no lock.
   return _dynamic_filter_plan.enabled();
 }
 
@@ -2069,6 +2071,24 @@ void sirius_physical_hash_join::publish_dynamic_filters(cudf::table_view const& 
     if (_dynamic_filter_stats != nullptr) {
       _dynamic_filter_stats->publications_finished.fetch_add(1, std::memory_order_relaxed);
     }
+  } catch (rmm::out_of_memory const& oom) {
+    // Device memory exhaustion is an environmental condition, not a defect: publication is a
+    // default-on best-effort optimization and must never fail the query. Construction happens
+    // strictly before fan-out and replication is per-target best-effort, so an escaping OOM has
+    // pushed nothing -- and any pushed prefix would be an independently sound optional conjunct
+    // (each filter is immutable and complete when it becomes visible; consumers snapshot the
+    // channel per split). The window ends FAILED, not reopened: retrying a sibling delivery
+    // under the same memory pressure is the storm this catch exists to avoid.
+    _dynamic_filter_publication_state.store(dynamic_filter_publication_state::FAILED,
+                                            std::memory_order_release);
+    if (_dynamic_filter_stats != nullptr) {
+      _dynamic_filter_stats->publications_failed.fetch_add(1, std::memory_order_relaxed);
+    }
+    SIRIUS_LOG_WARN(
+      "[sirius_physical_hash_join] dynamic-filter publication (id={}) hit device memory "
+      "exhaustion; continuing without filters: {}",
+      get_operator_id(),
+      oom.what());
   } catch (...) {
     _dynamic_filter_publication_state.store(dynamic_filter_publication_state::FAILED,
                                             std::memory_order_release);
@@ -2160,18 +2180,37 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
 
     nvtx3::scoped_range nvtx_range{"dynfilter::publish_hook"};
     auto* ms = build_ro.get_data() ? build_ro.get_memory_space() : nullptr;
-    // Non-GPU residency here means the batch was already downgraded before this delivery (it can
-    // be shared with an earlier consumer, e.g. CTE fan-out). Publication is best-effort: skip it.
-    if (!ms || build_ro.get_current_tier() != ::cucascade::memory::Tier::GPU) {
+    // A usable source is GPU-resident on a device the plan holds a replica space for. Non-GPU
+    // residency means the batch was downgraded before this delivery; a non-plan device means a
+    // batch shared cross-GPU (e.g. CTE fan-out) landed outside the (possibly restricted) replica
+    // set -- the same environmental condition. Publication is best-effort: skip it.
+    bool const gpu_resident =
+      ms != nullptr && build_ro.get_current_tier() == ::cucascade::memory::Tier::GPU;
+    bool const source_usable =
+      gpu_resident && _dynamic_filter_plan.has_replica_on_device(ms->get_device_id());
+    if (!source_usable) {
       if (_dynamic_filter_stats != nullptr) {
         _dynamic_filter_stats->publications_skipped_source_not_resident.fetch_add(
           1, std::memory_order_relaxed);
       }
-      // Reopen so a GPU-resident sibling broadcast delivery can publish. Holding op_state_mutex
-      // serializes every transition into or out of OPEN; this delivery exclusively owns PUBLISHING,
-      // so a plain store suffices. If finalization already observed PUBLISHING, no deliveries
-      // remain and the reopened state is unobservable. Return immediately so the catch cannot mark
-      // the released claim FAILED.
+      if (gpu_resident) {
+        SIRIUS_LOG_DEBUG(
+          "[sirius_physical_hash_join] dynamic-filter publication (id={}) skipped: the "
+          "whole-build batch is resident on GPU {}, a device this join's plan holds no replica "
+          "space for.",
+          get_operator_id(),
+          ms->get_device_id());
+      } else {
+        SIRIUS_LOG_DEBUG(
+          "[sirius_physical_hash_join] dynamic-filter publication (id={}) skipped: the "
+          "whole-build batch is not GPU-resident.",
+          get_operator_id());
+      }
+      // Reopen so a sibling broadcast delivery with a usable source can publish. Holding
+      // op_state_mutex serializes every transition into or out of OPEN; this delivery exclusively
+      // owns PUBLISHING, so a plain store suffices. If finalization already observed PUBLISHING,
+      // no deliveries remain and the reopened state is unobservable. Return immediately so the
+      // catch cannot mark the released claim FAILED.
       std::scoped_lock lg(op_state_mutex);
       _dynamic_filter_publication_state.store(dynamic_filter_publication_state::OPEN,
                                               std::memory_order_release);

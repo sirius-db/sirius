@@ -34,6 +34,9 @@
  *    drained targets.
  *  - Plan validation: invalid targets, bindings, and replica placements are rejected at
  *    construction.
+ *  - Replica restriction: restrict_replicas_to disables a plan whose admitted GPU set is
+ *    disjoint from its replica devices, leaves member/empty restrictions intact, and
+ *    has_replica_on_device reports per-device replica presence.
  *
  * The fraction semantics themselves (0 always demotes to the Bloom, small-list precedence, the
  * exact inclusive boundary, and the no-Bloom exception) are pinned GPU-free in
@@ -254,6 +257,21 @@ void require_nothing_published(sirius::op::dynamic_filter_publication_outcome co
   REQUIRE(outcome.zone_map_filters_built == 0);
   REQUIRE(outcome.active_targets == 0);
   REQUIRE(outcome.filters_pushed == 0);
+}
+
+// One scan target bound to one admitted key, replicated on the fixture's single GPU-0 space.
+dynamic_filter_publish_plan make_single_replica_plan(publisher_fixture const& fixture)
+{
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  std::vector<dynamic_filter_publish_plan::probe_target> targets;
+  targets.push_back({.filter_set               = channel,
+                     .route_class              = dynamic_filter_route_class::scan,
+                     .accepts_zone_map_filters = true,
+                     .key_bindings             = {{.admitted_key_index   = 0,
+                                                   .channel_push_ordinal = kProbeColumnIndex,
+                                                   .probe_storage_type   = kInt64}}});
+  return dynamic_filter_publish_plan{
+    {make_int64_key(0, 0)}, std::move(targets), fixture.replica_spaces};
 }
 
 cucascade::memory::memory_space& host_memory_space(publisher_fixture& fixture)
@@ -948,4 +966,53 @@ TEST_CASE("dynamic-filter publish plan rejects unusable replica placements",
       dynamic_filter_publish_plan({make_int64_key(0, 0)}, make_targets(), std::move(spaces)),
       std::invalid_argument);
   }
+}
+
+TEST_CASE("restricting replicas to a disjoint GPU set disables the plan",
+          "[dynamic_filter][publish_plan]")
+{
+  publisher_fixture fixture;
+  auto plan = make_single_replica_plan(fixture);
+  REQUIRE(plan.enabled());
+
+  plan.restrict_replicas_to({kDeviceId + 1});
+
+  CHECK_FALSE(plan.enabled());
+  CHECK(plan.probe_targets().empty());
+  CHECK(plan.replica_spaces().empty());
+
+  // Restricting an already-disabled plan is a no-op, not an error.
+  CHECK_NOTHROW(plan.restrict_replicas_to({kDeviceId + 1}));
+  CHECK_FALSE(plan.enabled());
+}
+
+TEST_CASE("replica restriction to a member GPU or the empty set leaves the plan enabled",
+          "[dynamic_filter][publish_plan]")
+{
+  publisher_fixture fixture;
+  auto plan = make_single_replica_plan(fixture);
+
+  // An empty list means "no subset".
+  plan.restrict_replicas_to({});
+  CHECK(plan.enabled());
+  CHECK(plan.replica_spaces().size() == 1);
+  CHECK(plan.probe_targets().size() == 1);
+
+  // A restriction that keeps the plan's replica GPU erases nothing.
+  plan.restrict_replicas_to({kDeviceId});
+  CHECK(plan.enabled());
+  CHECK(plan.replica_spaces().size() == 1);
+  CHECK(plan.probe_targets().size() == 1);
+}
+
+TEST_CASE("the plan reports replica presence per device", "[dynamic_filter][publish_plan]")
+{
+  publisher_fixture fixture;
+  auto plan = make_single_replica_plan(fixture);
+
+  CHECK(plan.has_replica_on_device(kDeviceId));
+  CHECK_FALSE(plan.has_replica_on_device(kDeviceId + 1));
+
+  plan.restrict_replicas_to({kDeviceId + 1});
+  CHECK_FALSE(plan.has_replica_on_device(kDeviceId));
 }
