@@ -91,15 +91,19 @@ namespace io {
 class sirius_ioctx;
 }  // namespace io
 
-/// Stored-column metadata for one cached column of one pinned chunk, recorded by the pin
-/// materialization driver at the moment of storage. For a chunk stored uncompressed the carrier is
-/// the stored column's actual cuDF type; for a Simpatico-compressed chunk it is the type
-/// compress_with_plan received -- by Simpatico's round-trip contract also the type decompression
-/// reproduces. The plan-time residency gate and the serve-time restore sizing read this metadata
-/// instead of introspecting storage, so compressed and uncompressed chunks answer identically.
+/**
+ * @brief Physical-type metadata for one cached column in one pinned chunk.
+ *
+ * For uncompressed storage, `carrier` is the stored cuDF type. For Simpatico-compressed storage,
+ * it is the type passed to `compress_with_plan` and therefore reproduced by decompression.
+ * `native` records the declared logical type's native cuDF mapping when available, otherwise the
+ * decoded type. Planning uses it to validate narrow sidecars, and DuckDB cache serving uses it to
+ * reject projected type drift.
+ */
 struct pinned_column_storage_meta {
   cudf::data_type carrier{cudf::type_id::EMPTY};  ///< actual stored / compress-input cuDF type
   bool narrowed{false};  ///< carrier is narrower than the pin-time native mapping
+  cudf::data_type native{cudf::type_id::EMPTY};  ///< declared-native mapping or decoded fallback
 };
 
 /// Chunk-major stored-column metadata: element [c][i] describes cached column i of chunk c.
@@ -139,10 +143,24 @@ void validate_duckdb_pin_chunk(const op::scan::scan_info& batch,
                                std::size_t chunk_rows,
                                std::size_t rows_before_chunk);
 
+/**
+ * @brief Selects the pin-time native cuDF type recorded for a cached column.
+ *
+ * The declared logical mapping is preferred because a decoder may materialize another physical
+ * type for the same logical type, such as a wider Parquet decimal. The decoded type is used when
+ * @p declared_type is null or has no cuDF mapping.
+ *
+ * @param decoded_type Physical type produced by the decoder.
+ * @param declared_type Optional, non-owning pointer to the declared DuckDB type.
+ * @return Declared type's native cuDF mapping when available; otherwise @p decoded_type.
+ */
+[[nodiscard]] cudf::data_type pin_native_type(cudf::data_type decoded_type,
+                                              duckdb::LogicalType const* declared_type);
+
 /// Per-pin materialization behavior, sampled from config at pin time.
 struct pin_materialization_options {
   bool capture_chunk_stats               = true;   ///< capture zone-map statistics per chunk
-  bool enable_compressed_materialization = false;  ///< narrow eligible numeric carriers per chunk
+  bool enable_compressed_materialization = false;  ///< narrow eligible numeric and DATE carriers
 };
 
 /// Drive @p ingestible 's metadata walk + batch coalescer to completion on @p io_ctx,

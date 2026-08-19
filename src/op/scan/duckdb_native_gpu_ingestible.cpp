@@ -366,6 +366,8 @@ owning_table_view duckdb_native_gpu_ingestible::post_filter_and_project(
       // Nothing to project away, or output_arity == 0 (count(*)) — keep all columns.
       final_table = owning_table_view{exec.select(input.table.view())};
     }
+    // The select only enqueued its reads; record before input.table's read-lock owner is dropped.
+    input.table.record_reader_event(stream);
   } else {
     final_table = std::move(input.table);
   }

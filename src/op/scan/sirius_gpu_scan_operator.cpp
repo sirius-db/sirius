@@ -23,6 +23,7 @@
 #include <log/logging.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/owning_table_view.hpp>
+#include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/sirius_gpu_scan_operator.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <op/sirius_physical_operator.hpp>
@@ -32,10 +33,10 @@
 
 // cudf
 #include <cudf/column/column.hpp>
+#include <cudf/column/column_stream.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
-#include <cudf/unary.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
 // cucascade
@@ -138,7 +139,7 @@ std::vector<std::unique_ptr<cudf::column>> normalize_physical_schema_casts(
     auto const restoring = can_restore_to(actual, target);
     auto const narrowing = has_explicit_physical_schema && can_narrow_to(actual, target);
     if (actual == target || (!restoring && !narrowing)) { continue; }
-    casts[column_idx] = cudf::cast(column, target, stream, mr);
+    casts[column_idx] = cast_through_rep(column, target, stream, mr);
     if (observer != nullptr) {
       if (narrowing) {
         observer->record_compressed_materialization_scan_columns_narrowed();
@@ -155,25 +156,24 @@ std::vector<std::unique_ptr<cudf::column>> normalize_physical_schema_casts(
   return casts;
 }
 
-// Normalize an owned table in place, preserving it when no column needs a cast.
-std::unique_ptr<cudf::table> normalize_physical_schema(std::unique_ptr<cudf::table> table,
-                                                       const std::vector<cudf::data_type>& targets,
-                                                       bool has_explicit_physical_schema,
-                                                       duckdb::SiriusContext* observer,
-                                                       rmm::cuda_stream_view stream,
-                                                       rmm::device_async_resource_ref mr)
+// Normalize an owned table by swapping in the prebuilt cast replacements, preserving it when
+// none apply.
+std::unique_ptr<cudf::table> normalize_physical_schema(
+  std::unique_ptr<cudf::table> table,
+  std::vector<std::unique_ptr<cudf::column>> casts,
+  rmm::cuda_stream_view stream)
 {
-  auto casts = normalize_physical_schema_casts(
-    table->view(), targets, has_explicit_physical_schema, observer, stream, mr);
   if (std::all_of(casts.begin(), casts.end(), [](auto const& cast) { return cast == nullptr; })) {
     return table;
   }
-  // Swap the replacements in. The unique_ptr moves never relocate the columns the casts read
-  // from, and a replaced source column is destroyed only after its cast was enqueued on the same
-  // stream.
   auto columns = table->release();
   for (std::size_t column_idx = 0; column_idx < casts.size(); column_idx++) {
-    if (casts[column_idx]) { columns[column_idx] = std::move(casts[column_idx]); }
+    if (!casts[column_idx]) { continue; }
+    // The replaced source's buffers may be dealloc-bound to another stream (the pinned-cache
+    // upload or the decode stream); rebind them to `stream` so the free queues behind the cast
+    // still reading them. The unique_ptr moves never relocate the columns the casts read from.
+    auto source         = cudf::rebind_stream(std::move(*columns[column_idx]), stream);
+    columns[column_idx] = std::move(casts[column_idx]);
   }
   return std::make_unique<cudf::table>(std::move(columns));
 }
@@ -264,6 +264,15 @@ sirius_gpu_scan_operator::sirius_gpu_scan_operator(
     _split_connector(std::make_shared<scan_manager::split_connector>()),
     _compressed_materialization_observer(compressed_materialization_observer)
 {
+  // Resolve the scan's dynamic-filter channel once (null for non-parquet
+  // ingestibles): every split gets it stamped so prepare_for_processing can
+  // snapshot membership filters at decode time.
+  if (_ingestible != nullptr) {
+    if (auto const* pq =
+          dynamic_cast<parquet_ingestible_table_info const*>(&_ingestible->table_info())) {
+      _dynamic_filters_channel = pq->sirius_dynamic_filters;
+    }
+  }
   _native_physical_types.reserve(this->types.size());
   for (std::size_t column_idx = 0; column_idx < this->types.size(); ++column_idx) {
     auto const& type  = this->types[column_idx];
@@ -296,6 +305,14 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
   auto next = _split_connector->get_next_split();
   if (!next.has_value()) { return nullptr; }
   if (auto* scan_input = dynamic_cast<scan_operator_input*>(next->get()); scan_input) {
+    // Share the operator's "compaction is unprofitable" latch with the split
+    // BEFORE any reservation estimate runs: one such batch decides the whole
+    // scan (uniform per-batch selectivity), and both the working-set estimator
+    // and prepare_for_processing consult the latch.
+    scan_input->pushdown_selection_unprofitable = _decode_selection_unprofitable;
+    // Membership channel for the decode-time snapshot (join builds publish
+    // during execution — only a snapshot taken at prepare/decode can see them).
+    scan_input->dynamic_filters = _dynamic_filters_channel;
     scan_input->prefetch(io::cache::prefetching_stage::immediate);
   }
   return std::move(*next);
@@ -335,20 +352,38 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
   auto const has_explicit_physical_schema = has_physical_overrides();
   auto const needs_normalization = has_explicit_physical_schema || scan_input->is_resident();
 
+  // Cast each mismatched column to its planned carrier, reading the live handle's view. A
+  // resident chunk is normalized even without a sidecar: it may be stored narrow (pinned with
+  // the feature on, queried with it off) and must then restore to native. Both branches below
+  // consume the same casts.
+  std::vector<std::unique_ptr<cudf::column>> casts;
+  if (needs_normalization) {
+    try {
+      casts = normalize_physical_schema_casts(result.view(),
+                                              normalization_targets(),
+                                              has_explicit_physical_schema,
+                                              _compressed_materialization_observer,
+                                              stream,
+                                              mem_space->get_default_allocator());
+    } catch (...) {
+      // A throw mid-normalization (e.g. a cast OOM) can leave reads already enqueued on
+      // `stream`; they must be recorded before unwinding drops this handle's read lock, or a
+      // reclaim of the backing cached batch could free storage those reads still touch.
+      result.record_reader_event(stream);
+      throw;
+    }
+  }
+  // The preflight bounds checks and the casts read the view on `stream`. Record before the
+  // owner can leave this handle, so a reclaim of the backing cached batch is ordered after
+  // those reads (no-op unless the owner tracks reader events).
+  result.record_reader_event(stream);
+
   std::shared_ptr<::cucascade::data_batch> batch;
   if (auto forwarded = result.release_view()) {
-    // A copy-requiring view can transfer its owner instead of materializing; raw GPU-pinned inputs
-    // are the production path that does so. Preserve that owner and cast only columns whose stored
-    // carriers disagree with the plan.
-    auto casts = needs_normalization
-                   ? normalize_physical_schema_casts(forwarded->view,
-                                                     normalization_targets(),
-                                                     has_explicit_physical_schema,
-                                                     _compressed_materialization_observer,
-                                                     stream,
-                                                     mem_space->get_default_allocator())
-                   : std::vector<std::unique_ptr<cudf::column>>{};
-    batch      = emit_view_forward(std::move(*forwarded),
+    // A copy-requiring view can transfer its owner instead of materializing; raw GPU-pinned
+    // inputs are the production path that does so. Preserve that owner and forward every
+    // column whose stored carrier already agrees with the plan.
+    batch = emit_view_forward(std::move(*forwarded),
                               std::move(casts),
                               total_input_bytes,
                               *mem_space,
@@ -356,17 +391,7 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
                               batch_telemetry());
   } else {
     auto output_table = result.release(stream, mem_space->get_default_allocator());
-    // Cast each batch column to its planned carrier. A resident chunk is normalized even without
-    // a sidecar: it may be stored narrow (pinned with the feature on, queried with it off) and
-    // must then restore to native.
-    if (needs_normalization) {
-      output_table = normalize_physical_schema(std::move(output_table),
-                                               normalization_targets(),
-                                               has_explicit_physical_schema,
-                                               _compressed_materialization_observer,
-                                               stream,
-                                               mem_space->get_default_allocator());
-    }
+    output_table = normalize_physical_schema(std::move(output_table), std::move(casts), stream);
     batch = sirius::make_data_batch(std::move(output_table), *mem_space, stream, batch_telemetry());
   }
   std::vector<std::shared_ptr<::cucascade::data_batch>> batches{std::move(batch)};

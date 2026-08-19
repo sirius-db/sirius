@@ -62,6 +62,10 @@ concept no_alloc_materializable = requires(Owner& owner) {
   { (*owner).release() } -> std::same_as<std::vector<std::unique_ptr<cudf::column>>>;
 };
 
+template <typename Owner>
+concept reader_event_recording =
+  requires(Owner const& owner, rmm::cuda_stream_view stream) { owner.record_reader_event(stream); };
+
 //===----------------------------------------------------------------------===//
 // my_view
 //===----------------------------------------------------------------------===//
@@ -159,6 +163,8 @@ class my_view {
     return _model->try_surrender_owner();
   }
 
+  void record_reader_event(rmm::cuda_stream_view stream) { _model->record_reader_event(stream); }
+
  private:
   struct owner_concept {
     virtual ~owner_concept() = default;
@@ -171,6 +177,8 @@ class my_view {
       rmm::device_async_resource_ref mr) = 0;
 
     [[nodiscard]] virtual std::optional<std::any> try_surrender_owner() = 0;
+
+    virtual void record_reader_event(rmm::cuda_stream_view) {}
   };
 
   template <typename Owner>
@@ -205,7 +213,14 @@ class my_view {
       } else {
         // Generic owner: copy the selected view into a fresh table.
         std::vector<cudf::size_type> sel(selection.begin(), selection.end());
-        return std::make_unique<cudf::table>(_base_view.select(sel), stream, mr);
+        auto out = std::make_unique<cudf::table>(_base_view.select(sel), stream, mr);
+        // The caller destroys `_owner` as soon as this returns, so the copy must be
+        // complete first: `_owner` is what keeps the source memory alive. Unlike the
+        // scan's carrier cast, the source here belongs to an external owner (a
+        // pinned-cache lock), so there is no buffer of ours whose deallocation
+        // stream could be rebound instead.
+        stream.synchronize();
+        return out;
       }
     }
 
@@ -218,6 +233,11 @@ class my_view {
       } else {
         return std::nullopt;
       }
+    }
+
+    void record_reader_event([[maybe_unused]] rmm::cuda_stream_view stream) override
+    {
+      if constexpr (reader_event_recording<Owner>) { _owner.record_reader_event(stream); }
     }
 
     Owner _owner;
@@ -326,6 +346,13 @@ class owning_table_view {
   /// view first if necessary. Throws on out-of-range or duplicate positions.
   void select_columns(std::span<const std::size_t> positions) const;
 
+  /// Record that reads of the exposed view have been ENQUEUED on @p stream
+  /// (see cucascade::read_only_data_batch::record_reader_event). Must be
+  /// called after enqueuing the reads and before this handle is dropped or
+  /// reassigned, so a reclaim of the backing cached batch is ordered after
+  /// them. No-op unless the owner tracks reader events.
+  void record_reader_event(rmm::cuda_stream_view stream) const;
+
   /// Realize a view state into an owned table. No-op if already materialized or
   /// empty. May allocate (copying path) depending on the underlying owner.
   void materialize(rmm::cuda_stream_view stream      = cudf::get_default_stream(),
@@ -361,6 +388,10 @@ class owning_table_view {
    * transfer. Handle-like owners (e.g. @c std::shared_ptr, @c cucascade::read_only_data_batch)
    * satisfy this; an owner whose transfer relocates or frees the viewed buffers would leave the
    * returned view dangling.
+   *
+   * Reader events recorded through @ref record_reader_event are unaffected by the transfer:
+   * they live on the owner's underlying batch, which awaits them before any mutable access and
+   * on destruction.
    *
    * @return The selected view and its keep-alive owner on success, or @c std::nullopt when the
    *         handle retains its materialization path

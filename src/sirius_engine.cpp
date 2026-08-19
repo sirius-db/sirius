@@ -53,6 +53,45 @@ namespace sirius {
 
 namespace {
 
+/// Select the GPU subset this query is admitted with: gpus_per_query caps the fleet, and
+/// within that cap a non-zero admission_bytes_per_gpu narrows further by estimated scan
+/// bytes. With neither set, every active GPU is used.
+std::vector<int> compute_admission_gpu_ids(const op::sirius_physical_operator& plan,
+                                           std::vector<int> gpu_ids,
+                                           const sirius_config& config)
+{
+  auto const& op_params = config.get_operator_params();
+  auto const bpg        = op_params.admission_bytes_per_gpu;
+
+  gpu_ids           = planner::apply_gpu_cap(std::move(gpu_ids), config.gpus_per_query());
+  auto const n_gpus = static_cast<int>(gpu_ids.size());
+  if (bpg == 0 || n_gpus <= 1) { return gpu_ids; }
+
+  std::vector<const op::sirius_physical_operator*> scans;
+  planner::collect_gpu_scans(plan, scans);
+  std::vector<planner::scan_estimate> estimates;
+  estimates.reserve(scans.size());
+  for (auto const* scan : scans) {
+    estimates.push_back(
+      {static_cast<uint64_t>(scan->estimated_cardinality),
+       planner::estimate_bytes_per_row(scan->types, op_params.avg_variable_column_bytes)});
+  }
+
+  // nullopt means at least one scan carried no usable row estimate; admit the full capped
+  // fleet rather than size the query from what is left.
+  auto const total_bytes = planner::total_scan_bytes(estimates);
+  if (!total_bytes.has_value()) { return gpu_ids; }
+
+  auto const k = planner::gpu_count_for_bytes(*total_bytes, bpg, n_gpus);
+  SIRIUS_LOG_INFO("[gpu_alloc] estimated {} MiB over {} scan(s) -> {} of {} GPU(s)",
+                  *total_bytes / (1024 * 1024),
+                  scans.size(),
+                  k,
+                  n_gpus);
+  gpu_ids.resize(static_cast<size_t>(k));
+  return gpu_ids;
+}
+
 std::shared_ptr<const telemetry::telemetry_context> get_telemetry_context_from_client_context(
   duckdb::ClientContext& context)
 {
@@ -218,7 +257,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   // matters: task_creator holds it, and create_query later reads it back for scan_manager.
   auto const full_gpu_count = gpu_ids.size();
   std::vector<int> active_gpu_ids =
-    planner::apply_gpu_cap(std::move(gpu_ids), sirius_ctx_ptr->get_config().gpus_per_query());
+    compute_admission_gpu_ids(plan, std::move(gpu_ids), sirius_ctx_ptr->get_config());
   sirius_ctx_ptr->get_task_creator().set_active_gpu_ids(active_gpu_ids, full_gpu_count);
   try {
     std::string gpu_list;

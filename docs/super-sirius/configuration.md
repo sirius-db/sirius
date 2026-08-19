@@ -93,6 +93,7 @@ sirius:
     enable_dynamic_filter_pushdown: true    # BUILD_PROBE raw/hash IN-list or Bloom filters
     enable_dynamic_zone_map_filter: false  # optional parquet-read/native-post-decode min/max
     dynamic_filter_domain_coverage_threshold: 0.9  # skip keys the build's domain coverage exceeds
+    dynamic_filter_inlist_max_l2_fraction: 0.125  # demote larger IN-list sets to Bloom (fraction of probe-GPU L2; 0 = always Bloom, 1.0 = legacy L2 fit)
     dynamic_filter_keep_threshold: 0.9  # disable a scan's filtering when a split keeps > this fraction
     enable_pinned_zone_map_pruning: true  # capture and use per-chunk stats for pinned tables
   telemetry:
@@ -109,8 +110,8 @@ Sirius uses cuCascade for tiered memory management across GPU, Host (pinned), an
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_gpus` | int | all visible GPUs | Number of GPUs to use. Defaults to every GPU visible to topology discovery (honors `CUDA_VISIBLE_DEVICES`); `0` also means auto. Mutually exclusive with `gpu_ids`. |
-| `gpu_ids` | list of int | — | Explicit GPU device IDs. Mutually exclusive with `num_gpus`. |
+| `num_gpus` | int | all visible GPUs | Non-negative number of GPUs to use. Defaults to every GPU visible to topology discovery (honors `CUDA_VISIBLE_DEVICES`); `0` also means auto. Mutually exclusive with `gpu_ids`. |
+| `gpu_ids` | list of int | — | Non-empty list of unique, non-negative GPU device IDs. Mutually exclusive with `num_gpus`. |
 | `gpus_per_query` | int | `0` (all) | How many GPUs each query is allocated at admission time. `0` uses all active GPUs. Values exceeding the active GPU count are clamped to the full set. |
 
 ### GPU Memory (`sirius.memory.gpu`)
@@ -125,7 +126,10 @@ Controls how much GPU VRAM Sirius claims and when it starts evicting data to hos
 | `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`; configuration loading rejects both when both values are non-null. |
 | `downgrade_trigger_fraction` | double (0,1] | 0.8 | Start evicting GPU-resident data to host when reserved memory exceeds this fraction of capacity. Must be greater than `downgrade_stop_fraction`. |
 | `downgrade_stop_fraction` | double (0,1] | 0.6 | Stop evicting when reserved memory drops to this fraction of capacity. Must be less than `downgrade_trigger_fraction`; configuration loading rejects an invalid pair. |
-| `track_per_stream_reservation` | bool | false | Track memory reservations per CUDA stream instead of globally. Useful for debugging per-task memory usage. |
+
+The high-level GPU path keeps per-stream reservation tracking off. The
+diagnostic control remains available only through the explicit low-level
+`sirius.space.gpu[].per_stream_reservation` replacement surface.
 
 ### Host Memory (`sirius.memory.host`)
 
@@ -152,6 +156,23 @@ Controls the disk spill tier. Data evicted from host memory is written here. Dis
 | `disk_id` | int | 0 | Identifier for the disk space. |
 | `capacity_bytes` | bytes | 1Ti | Maximum disk space for spill files. |
 | `downgrade_root_dirs` | string | "" | Directory path for spill files. **Must be set** to enable disk spilling. Use a fast local mount (NVMe preferred). |
+
+### Input-table compression (`sirius.compression`)
+
+These settings control optional Simpatico compression when
+`pin_table(tier=>'host')` caches input tables. Compression requires both
+`enable_pin_table_compression: true` and a matching plan in `input_plan_dir`;
+otherwise the table is pinned uncompressed.
+
+| Key | DuckDB setting | Type | Default | Description |
+|-----|----------------|------|---------|-------------|
+| `enable_pin_table_compression` | `pin_table_compression` | bool | false | Attempt planned compression while pinning input tables to host memory. |
+| `min_batch_size_bytes` | `pin_table_compression_min_batch_size_bytes` | bytes | 1Mi | Skip compression below this uncompressed batch size. `0` disables the size gate. |
+| `max_compressed_fraction` | `pin_table_compression_max_compressed_fraction` | finite double >= 0 | 0.75 | Keep a compressed representation only at or below this fraction of the original batch size. `0` retains none; values above `1` deliberately permit expansion, primarily for testing encodability. |
+| `input_plan_dir` | `pin_table_input_compression_plan_dir` | string | "" | Directory of per-table Simpatico plan files. An empty path leaves compression inactive. |
+
+The YAML loader and DuckDB `SET` surface reject negative, NaN, and infinite
+`max_compressed_fraction` values instead of silently changing retention behavior.
 
 ### How Downgrade Thresholds Work
 
@@ -243,17 +264,17 @@ per-pool sub-blocks: `task_creator`, `pipeline`, `downgrade`, and `scan_manager`
 `scan_manager` sub-block is large and is documented in
 [Scan Manager & IO Configuration](#scan-manager--io-configuration) below.
 
-Every thread-pool sub-block shares three keys:
+The thread-pool sub-blocks use these common keys; pipeline affinity is the
+hardware-derived exception described below:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `num_threads` | int (**> 0**) | per pool (below) | Worker threads in the pool. |
-| `thread_name_prefix` | string | per pool | Thread name prefix for logs. |
-| `cpu_affinity` | list of int | — | Cores to pin the pool's threads to. |
+| `cpu_affinity` | list of int | — | Cores to pin task-creator and downgrade threads. GPU pipeline affinity is derived from the selected GPU's CPU topology. |
 
 ### `sirius.executor.task_creator`
 
-Thread pool (default `num_threads: 1`, prefix `task_creator`) plus:
+Thread pool (default `num_threads: 1`) plus:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -262,11 +283,11 @@ Thread pool (default `num_threads: 1`, prefix `task_creator`) plus:
 
 ### `sirius.executor.pipeline`
 
-Thread pool only (default `num_threads: 4`, prefix `gpu_pipeline`). No extra keys.
+Thread pool only (default `num_threads: 4`). No extra keys.
 
 ### `sirius.executor.downgrade`
 
-Thread pool (default `num_threads: 1`, prefix `downgrade`) plus:
+Thread pool (default `num_threads: 1`) plus:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -281,7 +302,6 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 1 uring reactor), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
-| `thread_name_prefix` | string | `scan_manager` | Thread name prefix for logs. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `use_sirius_datasource` | bool | true | Route reads through the Sirius `io_uring` datasource. When false, the kvikio fallback is used (single-GPU only; multi-GPU requires the Sirius datasource). |
 | `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
@@ -377,7 +397,7 @@ individually.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `scan_task_batch_size` | Shared physical/effective GPU batch default described above | Target batch size for DuckDB scan tasks |
+| `scan_task_batch_size` | Shared physical/effective GPU batch default described above | Target batch size for DuckDB scan tasks; must be greater than zero |
 | `enable_compressed_materialization` | true | Store eligible integer and fixed-point DECIMAL values in value-preserving narrower carriers when exact pin-time bounds permit it; restore native carriers at type-sensitive boundaries. |
 | `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. Auto = 33% of GPU memory. |
 | `hash_partition_bytes` | Shared physical/effective GPU batch default described above | Target partition size for hash joins and group-bys; must be greater than zero |
@@ -387,12 +407,17 @@ individually.
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join. A build below this size is replicated to every GPU (instead of hash-partitioned) when it is tiny, or when the DuckDB-estimated probe-to-build row ratio is at least `num_gpus * 1.25`. |
 | `max_sort_partition_memory_fraction` | 0.33 | Fraction of GPU memory per sort partition when `max_sort_partition_bytes` is 0 |
 | `mark_join_build_switch_ratio` | 8.0 | For STANDARD MARK joins, build on the smaller (left) side when `right_rows >= ratio * left_rows` (0 disables) |
-| `enable_runtime_distinct_build_probe` | true | For `BUILD_PROBE` INNER/LEFT equality joins whose build-key uniqueness the planner could not prove, test distinctness at runtime (one `cudf::distinct_count` pass over the cached build, dimension-scale builds only) and take the single-pass `cudf::distinct_hash_join` instead of the general two-pass join when the keys are distinct. |
+| `enable_runtime_distinct_build_probe` | false | For `BUILD_PROBE` INNER/LEFT equality joins whose build-key uniqueness the planner could not prove, test distinctness at runtime (one `cudf::distinct_count` pass over the cached build, dimension-scale builds only) and take the single-pass `cudf::distinct_hash_join` instead of the general two-pass join when the keys are distinct. Temporarily off by default until a cuCollections bug fix ships in libcudf (issue #1600). |
 | `enable_dynamic_filter_pushdown` | true | Master switch for dynamic table-filter pushdown. An eligible `BUILD_PROBE` hash-join build selects a raw exact IN-list for 1–12 supported build rows, otherwise a hash IN-list if it fits the smallest probe-GPU L2 or a Bloom, for post-decode application by the probe scan. |
 | `enable_dynamic_zone_map_filter` | false | Additionally publish build-key min/max bounds. Parquet scans use them for read-time row-group pruning; duckdb-native scans apply them row-wise post-decode. Requires `enable_dynamic_filter_pushdown`; intended for clustered-keyset workloads. |
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold for skipping publication when the build covers at least this fraction of the key's domain; ≥ 1.0 effectively disables the gate. |
+| `dynamic_filter_inlist_max_l2_fraction` | 0.125 | Finite threshold in [0, 1]: maximum estimated cuco-set size for the exact hash IN-list dynamic filter, as a fraction of the smallest probe-GPU L2; larger sets publish a Bloom filter (a streaming probe evicts a near-L2 set, the smaller Bloom stays cache-resident). 0 always publishes the Bloom when the key type supports it; 1.0 reproduces the legacy L2-fit rule; with no device L2 info the legacy rule applies unchanged. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
+| `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU. At admission the engine estimates a query's total scan output and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. |
+| `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns (VARCHAR, LIST, STRUCT, ARRAY) when estimating scan output. Fixed-width columns use their real carrier width. Only consulted when `admission_bytes_per_gpu` is non-zero. |
+
+**Note:** `admission_bytes_per_gpu` is a parallelism dial, not a memory budget. Peak GPU residency is bounded by partition sizing (`hash_partition_bytes` and the batch settings), not by the admitted GPU count — a query on fewer GPUs processes more partitions sequentially at roughly unchanged peak memory, trading wall-clock for freed devices. Tune it against how much of the fleet a query should occupy, not against VRAM.
 
 **Note:** `max_build_hash_table_bytes` can be larger than `concat_batch_bytes`. When it is, the partition operator configures CONCAT to concatenate all batches, enabling the more efficient BUILD_PROBE join mode for larger build sides. Other joins (STANDARD, MIXED) still use `concat_batch_bytes` as the batch size threshold.
 
@@ -496,8 +521,10 @@ per-pool extras.
 | `downgrade_executor` | `executor.downgrade` | 1 | `downgrade` | Data tier migration (GPU→Host) |
 | `scan_manager` | `executor.scan_manager` | remaining cores (min 4) | `scan_manager` | Scan metadata production + IO reactor management |
 
-Each pool supports optional CPU affinity lists (`cpu_affinity`) for core pinning. `num_threads`
-must be `> 0` for every pool except `scan_manager`, which requires `> 2`.
+The task-creator, downgrade, and scan-manager pools support optional CPU affinity lists
+(`cpu_affinity`) for core pinning. GPU pipeline affinity is derived per executor from the selected
+GPU's CPU topology. `num_threads` must be `> 0` for every pool except `scan_manager`, which requires
+`> 2`.
 
 ## DuckDB SET Variables
 
@@ -537,8 +564,12 @@ These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, an
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `scan_task_batch_size` | Shared physical/effective GPU batch default | Target scan batch size |
 | `enable_compressed_materialization` | true | Keep eligible integer and fixed-point DECIMAL values in narrower physical carriers until a native semantic boundary. |
+
+The scan-task batch target is derived from effective GPU capacity. Advanced
+benchmark and test envelopes may still override `scan_task_batch_size` in YAML
+under `sirius.operator_params`, where it must remain greater than zero, but it
+is not a normal session setting.
 
 `enable_compressed_materialization` is also accepted in YAML under `sirius.operator_params`.
 At pin time, exact per-chunk bounds select stored carriers. At query planning, a matching pinned
@@ -566,7 +597,21 @@ SET enable_compressed_materialization = false;
 | `max_build_hash_table_bytes` | 2× batch default | Max build-side hash table bytes |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
-| `enable_runtime_distinct_build_probe` | true | Runtime distinct-build test for `BUILD_PROBE` joins; promotes to the single-pass `cudf::distinct_hash_join` when the build keys prove distinct |
+| `enable_runtime_distinct_build_probe` | false | Runtime distinct-build test for `BUILD_PROBE` joins; promotes to the single-pass `cudf::distinct_hash_join` when the build keys prove distinct. Temporarily off by default (issue #1600) |
+
+### GPU Admission
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU; `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` |
+| `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns when estimating scan output; must be greater than zero |
+
+Both take effect from the next query, since admission runs per query. `topology.gpus_per_query`
+is YAML-only — it is read once when the GPU memory spaces are configured.
+
+```sql
+SET admission_bytes_per_gpu = 34359738368;  -- 32 GiB
+```
 
 ### Dynamic Filters
 
@@ -580,6 +625,7 @@ envelopes can override either behavior in YAML under `sirius.operator_params`.
 | `enable_dynamic_filter_pushdown` | true | Master switch for dynamic table-filter pushdown. Wires eligible `BUILD_PROBE` hash-join-build membership filters into probe scans: raw exact IN-list for 1–12 supported build rows, then a hash IN-list if it fits the smallest probe-GPU L2 or a Bloom. |
 | `enable_dynamic_zone_map_filter` | false | Additionally publish build-key min/max bounds. Parquet scans use them for read-time row-group pruning; duckdb-native scans apply them row-wise post-decode. Has no effect unless `enable_dynamic_filter_pushdown` is enabled. |
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold for skipping publication when the build covers at least this fraction of the key's domain; ≥ 1.0 effectively disables the gate. |
+| `dynamic_filter_inlist_max_l2_fraction` | 0.125 | Finite threshold in [0, 1]: maximum estimated cuco-set size for the exact hash IN-list dynamic filter, as a fraction of the smallest probe-GPU L2; larger sets publish a Bloom filter (a streaming probe evicts a near-L2 set, the smaller Bloom stays cache-resident). 0 always publishes the Bloom when the key type supports it; 1.0 reproduces the legacy L2-fit rule; with no device L2 info the legacy rule applies unchanged. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 
 The direct DuckDB session overrides are registered only when the process
@@ -603,6 +649,18 @@ the setting enabled. See
 The direct DuckDB `SET` override is registered only when the process explicitly enables Sirius
 test options; it is not part of the normal user surface.
 
+### Pinned-Table Compression (Simpatico)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `pin_table_compression` | false | Enable Simpatico compression for `pin_table(tier=>'host')` chunks. |
+| `pin_table_input_compression_plan_dir` | (empty) | Directory of per-table Simpatico plan files (`<table_name>.<ext>`, multi-column plan DSL). Tables with no matching file are pinned uncompressed. No effect on spill compression. |
+| `pin_table_compression_min_batch_size_bytes` | 1 MiB | Minimum uncompressed batch size below which pin-table compression is skipped. |
+| `pin_table_compression_max_compressed_fraction` | 0.75 | Discard the compressed form and pin uncompressed when the compressed size exceeds this fraction of the original (compression saved too little). |
+
+Both size gates are evaluated on the narrowed table when compressed materialization is active.
+See [Compressed Pinning](compressed-pinning.md) for tier selection, plan authoring, and results.
+
 ### Transparent Execution
 
 | Variable | Default | Description |
@@ -614,7 +672,7 @@ test options; it is not part of the normal user surface.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates both plan-time fallback (unsupported operator/type) and runtime fallback (GPU execution failure) on the transparent path, plus the legacy `CALL gpu_execution(...)` path. Set to `false` to surface Sirius errors instead of falling back. |
-| `enable_regex_jit_impl` | - | Use JIT regex implementation |
+| `enable_regex_jit_impl` | true | Use JIT regex implementation |
 
 
 ## Legacy Config Flags

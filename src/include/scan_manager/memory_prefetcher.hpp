@@ -19,8 +19,9 @@
 #include "scan_manager/config.hpp"
 #include "scan_manager/split_connector.hpp"
 
+#include <rmm/cuda_stream_view.hpp>
+
 #include <cucascade/memory/memory_space.hpp>
-#include <cucascade/memory/stream_pool.hpp>
 
 #include <atomic>
 #include <cstddef>
@@ -54,8 +55,10 @@ namespace sirius::scan_manager {
  * reconstructs the cudf table from the host layout, and synchronizes its
  * stream before the batch's exclusive lock can be released, so each in-flight
  * conversion needs a thread to drive it. Concurrency across batches therefore
- * scales with num_threads, each conversion on its own stream from a dedicated
- * pool.
+ * scales with num_threads. Each worker's private CUDA stream carries no copy
+ * traffic (the converter allocates and copies on a pool stream it acquires
+ * internally); it exists only as a stable per-worker key for attaching the
+ * admission reservation to the allocation tracker.
  *
  * Races with a consumer are arbitrated by the data_batch state machine: the
  * conversion holds the exclusive (mutable) lock via try_to_mutable (skip on
@@ -64,11 +67,14 @@ namespace sirius::scan_manager {
  *
  * Memory safety: converted batches live in connector queues, which the
  * downgrade executor does NOT scan (it walks data repositories), so
- * prefetched-but-unconsumed bytes cannot be reclaimed under pressure. The
- * headroom gate must therefore stay conservative: a batch is only converted
- * (and its GPU reservation only taken) while (available - batch_size) >=
- * min_free_fraction * max_memory, so the prefetcher backs off long before it
- * could compete with pipeline task reservations.
+ * prefetched-but-unconsumed bytes cannot be reclaimed under pressure.
+ * Admission must therefore reserve BEFORE gating: the worker reserves the
+ * conversion peak (charging availability immediately) and only then checks
+ * the min_free_fraction floor, so the check sees every concurrent worker's
+ * in-flight admission and the floor holds regardless of num_threads. The
+ * reservation is then attached to the worker thread's allocation tracker so
+ * the conversion's allocations draw it down instead of being counted a
+ * second time on top of it.
  */
 class memory_prefetcher {
  public:
@@ -110,15 +116,12 @@ class memory_prefetcher {
   std::unique_ptr<std::atomic<bool>[]> _drain_claims;
   cucascade::memory::memory_space* _gpu_space;
 
-  /// Dedicated streams so prefetch copies never share a stream with pipeline
-  /// task work (the memory_space's shared round-robin pool would interleave
-  /// our 5GB copies with task kernels on the same stream).
-  std::unique_ptr<cucascade::memory::exclusive_stream_pool> _stream_pool;
-
   std::atomic<bool> _running{true};
   std::atomic<std::size_t> _batches_prefetched{0};
   std::atomic<std::size_t> _bytes_prefetched{0};
   /// Diagnostic gate counters (logged at stop): why sweeps stopped early.
+  /// _stops_reservation: the peak reservation was refused; _stops_headroom:
+  /// the reservation was charged but the post-charge floor check failed.
   std::atomic<std::size_t> _stops_headroom{0};
   std::atomic<std::size_t> _stops_reservation{0};
   std::atomic<std::size_t> _skips_lock{0};

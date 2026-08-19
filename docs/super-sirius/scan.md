@@ -33,8 +33,8 @@ The single GPU scan source operator. It owns:
 
 1. `gpu_ingestible::materialize_table(split, stream)` produces a `filtered_table` — the materialized `cudf::table` (wrapped in an `owning_table_view`) plus a `filter_state` tag describing how much filter/projection the materialize step already applied.
 2. If the tag is `ROW_FILTERED_AND_PROJECTED`, the table is already in final output layout and skips post-processing; otherwise `gpu_ingestible::post_filter_and_project(...)` applies any pending row filter and projection.
-3. If the plan carries a compressed-materialization physical sidecar, exact runtime bounds verify wider-to-narrower casts for columns containing non-null values before the table is normalized to that complete physical schema. Such a sidecar exists only for scans the pinned cache serves with pin-time-narrowed columns (the plan-time residency gate); fresh unpinned scans carry no sidecar and skip normalization entirely. A resident cached input without an override is restored to the native schema when its stored numeric carrier is narrow. Fresh feature-off scans retain their existing natural shape and types.
-4. The result is wrapped in a `data_batch` tagged with the split's target `memory_space` and returned as `pipelineable_operator_data` for the downstream pipeline. An unfiltered GPU-pinned view forwards columns whose carriers already match the plan and casts only mismatched columns; the output batch owns both the forwarded view's keep-alive state and any cast columns. Other results are emitted as owned tables.
+3. If the plan carries a compressed-materialization physical sidecar, exact runtime bounds verify wider-to-narrower casts for columns containing non-null values before the table is normalized to that complete physical schema. Such a sidecar exists only for scans the pinned cache serves with pin-time-narrowed columns (the plan-time residency gate); fresh unpinned scans carry no sidecar and skip normalization entirely. A resident cached input without an override is restored to the native schema when its stored numeric carrier is narrow. Fresh feature-off scans retain their existing natural shape and types. See [Compressed Materialization](compressed-materialization.md) for the narrowing/restoration rules and [Compressed Pinning](compressed-pinning.md) for Simpatico-compressed pinned chunks.
+4. The result is wrapped in a `data_batch` tagged with the split's target `memory_space` and returned as `pipelineable_operator_data` for the downstream pipeline. An unfiltered GPU-pinned view forwards columns whose carriers already match the plan and casts only mismatched columns; the output batch owns both the forwarded view's keep-alive state and any cast columns, and the reads the operator enqueued against the cached storage (bounds preflight, casts) are recorded as reader events on the backing batch before its lock transfers. Other results are emitted as owned tables.
 
 The operator handles two split shapes transparently, both delivered as `scan_operator_input`: a **fresh read** (the input carries a `scan_info`, materialized via the ingestible) and a **pinned-cache hit** (the input carries a resident `data_batch`, filtered when required and normalized to the planned carrier schema). The operator never sees the source format directly.
 
@@ -66,7 +66,7 @@ The operator handles two split shapes transparently, both delivered as `scan_ope
 Two polymorphic carriers separate per-table from per-split state (`gpu_ingestible_types.hpp`):
 
 - **`ingestible_table_info`** — built once by the pipeline converter from the DuckDB binding, parked on the operator. Exposes `column_names()` and `file_paths()` (used for pinned-cache matching). Implementations: `parquet_ingestible_table_info`, `duckdb_native_ingestible_table_info`.
-- **`scan_info`** — one per emitted split. Carries the per-split read description and optional prefetch `fadvise_entries()`, projected-column estimate, and decoded column-buffer estimate. Implementations: `parquet_split_info` (the data-batch split), `parquet_file_scan_info` (the per-file metadata unit), `duckdb_native_scan_info`.
+- **`scan_info`** — one per emitted split. Carries the per-split read description and optional prefetch `fadvise_entries()` (computed only when the bound datasource has a prefetching cache), projected-column estimate, and decoded column-buffer estimate. Implementations: `parquet_split_info` (the data-batch split), `parquet_file_scan_info` (the per-file metadata unit), `duckdb_native_scan_info`.
 
 ### `filtered_table` / `filter_state`
 
@@ -127,13 +127,13 @@ Three index spaces appear in the parquet path:
 
 `output_layout` is walked once during materialization to produce the final table: `DATA(k)` entries `std::move` from the read batch at position k, `PARTITION(k)` entries synthesize a scalar-backed column from the hive partition value. Pure-filter data columns (read but not output) fall out of scope and free.
 
-For `SELECT *` with no partitions and no pure-filter columns, the plan is a trivial identity and the reader output is forwarded unchanged — no permute, no copy. `SELECT count(*)` also has an empty `output_layout`; that short circuit leaves the reader's natural materialized batch unchanged rather than synthesizing a 0-column table. The downstream count aggregation uses the batch row count.
+For `SELECT *` with no partitions and no pure-filter columns, the plan is a trivial identity and the reader output is forwarded unchanged — no permute, no copy. `SELECT count(*)` also has an empty `output_layout`; that short circuit leaves the reader's natural materialized batch unchanged rather than synthesizing a 0-column table. The downstream count aggregation uses the batch row count. A projected plan whose data-column set is empty (e.g. a scan that reads only hive-partition columns) likewise skips the by-name reader projection — `set_column_names({})` is never passed to cuDF.
 
 ## Column Mapping
 
 Parquet column-chunk order is not guaranteed to match DuckDB's logical column order. `parquet_gpu_ingestible` builds a name-based DuckDB->parquet mapping via `parquet_schema_mapping::leaf_indices_for_column(schema, column_name)`, which walks the parquet schema's `path_in_schema` (case-insensitive, mirroring DuckDB).
 
-For nested types (`STRUCT`, `LIST`), one DuckDB column maps to multiple parquet leaf chunks; the mapping returns all leaves under the top-level column name. The cuDF parquet reader, given a top-level column name, materializes the nested `cudf::column` natively without post-read reassembly.
+For nested types (`STRUCT`, `LIST`, `MAP`), one DuckDB column maps to multiple parquet leaf chunks; the mapping returns all leaves under the top-level column name. The cuDF parquet reader, given a top-level column name, materializes the nested `cudf::column` natively without post-read reassembly. MAP-annotated groups are recognized in the schema walk (`parquet_helpers.cpp`), consuming the `key_value` repeated group and mapping to `duckdb::LogicalType::MAP`. Nested columns can be scanned and projected through to the result, but not *operated on* — a nested column in WHERE, GROUP BY, or JOIN ON is rejected during plan generation (see [Physical Plan Generation](physical-plan-generation.md)).
 
 ## Scan Manager
 
@@ -210,15 +210,34 @@ CALL unpin_table('lineitem');
 
 Pinning drives the source's `gpu_ingestible` to completion (`materialize_all_batches` / `materialize_pin_to_host` in `pin_table.cpp`):
 
-- **Shared numeric step:** zone-map statistics, when enabled, are captured from the native decoded table first. With `enable_compressed_materialization`, a separate exact min/max reduction then selects the narrowest signed, unsigned, or same-scale DECIMAL carrier independently for each eligible column in that batch. The logical column-type vector is retained whenever either zone-map capture or narrowing needs it; it is cleared only when both features are disabled.
+- **Shared range step:** zone-map statistics, when enabled, are captured from the unnarrowed decoded
+  table first. With `enable_compressed_materialization`, a separate exact min/max reduction then
+  selects the narrowest signed, unsigned, same-scale DECIMAL, or DATE epoch-day carrier
+  independently for each eligible column in that batch. The logical column-type vector is retained
+  whenever either zone-map capture or narrowing needs it; it is cleared only when both features are
+  disabled. See [Pin-time narrowing](compressed-materialization.md#pin-time-narrowing) for the full
+  narrowing pass and its pin-cache invariants.
+- **Simpatico compression:** with `pin_table_compression`, pinned chunks can additionally be stored compressed on either tier instead of (or after) narrowing — see [Compressed Pinning](compressed-pinning.md) for tier choice, plan selection, and measured results.
 - **GPU tier** (`materialize_all_batches`): each resulting batch is stored as a GPU-resident `cudf::table`, round-robining placement across the GPU memory spaces. Placement is deterministic so re-pinning the same source yields identical per-chunk placement (required by the merge path below).
 - **HOST tier** (`materialize_pin_to_host`): each resulting batch is converted on its round-robin GPU to a `host_data_representation` that preserves carrier type and decimal scale on that GPU's NUMA-local host space, then the GPU table is freed before the next batch. Peak GPU residency is therefore ~one batch, so a host pin never needs the whole table to fit in GPU memory.
 
 ### Storage and matching
 
-Each pinned table is a `pinned_entry` keyed by name in the scan manager. It holds a `cache_entry_info` (the cache identity + column layout) plus the cached batches: `data_batches_by_column` (one chunk vector per column) for the GPU tier, or `host_chunks` (one `host_data_representation` per batch, sliced by column at scan time) for the HOST tier. It also carries a `pinned_zone_maps` sidecar — the pin-time per-column, per-chunk min/max statistics, absent when capture was disabled (see [Zone maps](#zone-maps)).
+Each pinned table is a `pinned_entry` keyed by name in the scan manager. It holds a
+`cache_entry_info` (the cache identity + column layout) plus the cached batches:
+`data_batches_by_column` (one chunk vector per column) for the GPU tier, or `host_chunks` (one
+`host_data_representation` per batch, sliced by column at scan time) for the HOST tier. Its
+`column_storage` sidecar records each chunk-column's pin-time native mapping, stored carrier, and
+narrowing marker. It also carries a `pinned_zone_maps` sidecar — the pin-time per-column, per-chunk
+min/max statistics, absent when capture was disabled (see [Zone maps](#zone-maps)).
 
-`cache_entry_info` captures format identity — the resolved parquet **file set**, or the duckdb **catalog.schema.table** — plus the cached columns (by storage index) and their names. `can_serve_with_columns(other)` returns a gather projection when this entry can serve a scan: same format, same identity, and a **column superset** of the scan's request. A parquet pin never serves a duckdb scan or vice-versa.
+`cache_entry_info` captures format identity — the resolved parquet **file set**, or the DuckDB
+**catalog.schema.table** — plus the cached columns (by storage index) and their names.
+`can_serve_with_columns(other)` returns a gather projection when this entry can serve a scan: same
+format, same identity, and a **column superset** of the scan's request. A Parquet pin never serves a
+DuckDB scan or vice versa. DuckDB cache serving additionally requires every projected column's
+current native cuDF mapping to equal the mapping recorded at pin time; a mismatch is a clean cache
+miss rather than a conversion of stale data under a new type.
 
 During `prepare_for_query`, `try_assign_cached_entries` matches each `GPU_SCAN` operator's `table_info` against the pinned entries. On a hit it builds a `cached_databatch_provider` over the matched entry, ordering columns by the ingestible's `materialized_column_order()` so a cached batch is laid out identically to a fresh disk read and `post_filter_and_project` resolves the same columns on both paths. The provider emits one cached chunk as one resident split and bypasses the fresh-read coalescer. Each split carries whether its selected columns are actually narrow, and `GPU_SCAN` normalizes that chunk to the query's planned physical schema (or the native logical schema when there is no override) before downstream operators can combine batches.
 
@@ -231,10 +250,10 @@ For the GPU tier, `insert_pinned_entry` merges into an existing entry when the r
 A duckdb-format pin caches the table's **checkpointed prefix**: physical rows `[0, n_cache)` in on-disk order. `pin_table` refuses tables where that prefix is not stable — rows with in-flight update chains, or committed-but-uncheckpointed appends ("run CHECKPOINT before pinning"). After the pin, inserts and deletes remain supported; each query reconciles the cached prefix with the table's current state during `prepare_for_query`, against that query's own transaction snapshot:
 
 - **Deletes** — a per-entry mask job walks the row groups covering the prefix with the query's transaction and builds a bit-packed keep-mask (cuDF validity convention) in pinned host memory, fanned out across scan-manager threads. Chunks with no invisible rows skip masking entirely; masked chunks apply the bitmask on device right after the resident batch materializes. A checkpoint that reshapes the row groups under a live pin makes the capture throw rather than serve drifted positions.
-- **Inserts** — physical rows `[n_cache, N_total)` form the query's **insert delta**. Membership is positional; reading branches per segment: `TRANSIENT` segments (small appends, always `UNCOMPRESSED`) are copied into cuda-pinned staging at prepare time, releasing the DuckDB block pins before serving starts, while `PERSISTENT` segments (bulk appends flushed by `MergeStorage`, compressed like a checkpoint) keep their block references and decode through the normal file-read lane. Row groups the snapshot proves all-invisible are skipped whole; partially visible ones stage fully and carry a keep-mask like deleted base chunks. The delta is bundled to roughly the scan batch size, captured once per entry per query (a self-join stages one copy), and served as ordinary duckdb-native scan splits after the resident chunks — decoded on the GPU even for host-tier entries.
+- **Inserts** — physical rows `[n_cache, N_total)` form the query's **insert delta**. Membership is positional; reading branches per segment: `TRANSIENT` segments (small appends, always `UNCOMPRESSED`) are copied into cuda-pinned staging at prepare time, releasing the DuckDB block pins before serving starts, while `PERSISTENT` segments (bulk appends flushed by `MergeStorage`, compressed like a checkpoint) keep their block references and decode through the normal file-read lane. Row groups the snapshot proves all-invisible are skipped whole; partially visible ones stage fully and carry a keep-mask like deleted base chunks. The delta is bundled to roughly the scan batch size, captured once per entry per query (a self-join stages one copy), and served as ordinary duckdb-native scan splits after the resident chunks — decoded on the GPU even for host-tier entries. Fixed-size `ARRAY` columns are served too: the capture walks the array-level validity plus the child element data and validity trees, staging their transient child bytes like any other column.
 - **Updates** — DuckDB update chains version values in place, which the pinned cache cannot represent. Before executing an `UPDATE`, `MERGE ... UPDATE`, or `INSERT ... ON CONFLICT DO UPDATE`, Sirius checks the target against the shared pin registry and returns an error if it is pinned. This check runs for every connection and for prepared statements at execution time. Run `CALL unpin_table(...)` before updating the table.
 
-States the delta cannot represent decline at plan time into the transparent CPU fallback: the querying transaction's own uncommitted rows (`LocalStorage`), rowid-only projections, `ARRAY` projections while a delta exists, and string columns whose statistics no longer fit the GPU string-decode limits. A manual checkpoint while a pin is live changes the database checkpoint generation; the next query refuses that pin and falls back or errors until it is unpinned and pinned again. The delta is re-captured and re-staged on every query, so a pinned table under sustained insert churn pays that cost until the next checkpoint + re-pin; delta splits also carry no zone maps, so filter pruning never drops them.
+States the delta cannot represent decline at plan time into the transparent CPU fallback: the querying transaction's own uncommitted rows (`LocalStorage`), rowid-only projections, and string columns whose statistics no longer fit the GPU string-decode limits. A manual checkpoint while a pin is live changes the database checkpoint generation; the next query refuses that pin and falls back or errors until it is unpinned and pinned again. The delta is re-captured and re-staged on every query, so a pinned table under sustained insert churn pays that cost until the next checkpoint + re-pin; delta splits also carry no zone maps, so filter pruning never drops them.
 
 ### Zone maps
 
@@ -298,7 +317,7 @@ Validity (null) masks decode from `UNCOMPRESSED`, `EMPTY` (all-null), and `CONST
 
 ### Viability gate
 
-The metadata walk (below) rejects any codec or type the decoder cannot handle and falls the query back to DuckDB CPU before staging. The decoder's own `throw`s on unsupported codecs/types are a defensive backstop, not the primary gate. Unsupported cases include 128-bit (`HUGEINT`/`DECIMAL128`) and nested (`STRUCT`/`LIST`) types, and a varchar column whose summed max-string-length upper bound would overflow cuDF's int32 string-offset limit.
+The metadata walk (below) rejects any codec or type the decoder cannot handle and falls the query back to DuckDB CPU before staging. The decoder's own `throw`s on unsupported codecs/types are a defensive backstop, not the primary gate. Unsupported cases include 128-bit (`HUGEINT`/`DECIMAL128`) and nested (`STRUCT`/`LIST`) types — with the exception of `ARRAY` (fixed-size lists, mapped to cuDF `LIST`), which the native path decodes when the element type is fixed-width (a VARCHAR or nested element falls back) — plus two independent varchar refusals: a column that may contain a *single* string at or above DuckDB's overflow-block limit (`StringUncompressed::GetStringBlockLimit`, 4 KB at the default block size — such strings live in overflow blocks behind a `BIG_STRING_MARKER` the GPU decoder cannot follow), and a column whose *summed* max-string-length upper bound would overflow cuDF's int32 string-offset limit. An absent max-string-length statistic is itself a refusal, since overflow strings cannot be ruled out. The overflow-block check is applied at three layers — plan time (`sirius_plan_get.cpp`, from `StringStats::MaxStringLength`, giving the cleanest CPU fallback), the serial prepare phase, and per-segment during the range walk.
 
 ## DuckDB-Native Metadata Walk
 
@@ -333,15 +352,19 @@ Both GPU scan formats drop row groups that a pushed-down filter proves cannot co
 
 ### Parquet path
 
-When filter pushdown is enabled and the `gpu_expression_translator` successfully converts DuckDB `TableFilterSet` filters into a cuDF AST, two mechanisms activate inside `parquet_gpu_ingestible`:
+When filter pushdown is enabled and the `gpu_expression_translator` successfully converts DuckDB `TableFilterSet` filters into a cuDF AST, three mechanisms activate inside `parquet_gpu_ingestible`:
 
 1. **Row group statistics pruning:** during the per-file metadata task, `filter_row_groups_with_stats()` runs against each fetched footer; row groups whose Parquet column min/max statistics cannot match the filter are dropped before any read is scheduled. Pure hive-partition filters are dropped during plan construction since hive columns aren't in the parquet file.
 
-2. **Reader-level filter pushdown:** the cuDF AST is set on `parquet_reader_options` via `set_filter()`, so cuDF applies the filter inside `read_parquet`. When the reader applies the row filter, `materialize_table` reports `ROW_FILTERED` (or `ROW_FILTERED_AND_PROJECTED` once hive partitions are assembled), so the scan operator skips a redundant post-decode filter.
+   Only the stats-safe part of the predicate is handed to the stats filter. `is_unsafe_for_stats_filter()` rejects any expression containing a null test, and a bare column reference used directly as the predicate (`WHERE flag`) — both fault inside cuDF's statistics rewrite rather than merely mis-pruning. `stats_safe_conjuncts()` keeps only the safe top-level AND conjuncts (so `v IS NULL AND id > 3000` still prunes on `id`); a compound conjunct containing anything unsafe is dropped whole. Dropping conjuncts is sound: it can only retain extra row groups, and the full predicate is still applied at read/post-decode time.
+
+2. **Null-count pruning:** a second statistics pass prunes on `null_count`: an `IS NULL` predicate drops row groups with `null_count == 0`, and `IS NOT NULL` drops row groups where every row is null (`null_count == rg.num_rows`); an absent `null_count` stat keeps the row group. The predicates come straight from the `TableFilterSet` (not the converted AST — see the translation-path note below), only from conjunctive positions, and only for scalar leaf columns (nested/legacy-repeated schemas are skipped).
+
+3. **Reader-level filter pushdown:** the cuDF AST is set on `parquet_reader_options` via `set_filter()`, so cuDF applies the filter inside `read_parquet`. When the reader applies the row filter, `materialize_table` reports `ROW_FILTERED` (or `ROW_FILTERED_AND_PROJECTED` once hive partitions are assembled), so the scan operator skips a redundant post-decode filter.
 
 Reader-side pushdown is a per-split decision: an FLBA-decimal safety probe can disable it for a file, in which case the cached DuckDB filter expression is evaluated through `expression_evaluator` on the decoded batch in `post_filter_and_project`.
 
-**Filter translation path:** `TableFilterSet` -> `convert_table_filters_to_expression()` (skips `OPTIONAL_FILTER`, `IS_NOT_NULL`, and partition-column filters) -> `gpu_expression_translator` -> cuDF AST tree.
+**Filter translation path:** `TableFilterSet` -> `convert_table_filters_to_expression()` (skips `OPTIONAL_FILTER`, `IS_NOT_NULL`, and partition-column filters) -> `gpu_expression_translator` -> cuDF AST tree. Because top-level `IS_NOT_NULL` is dropped from this AST, null-test predicates are re-collected directly from the `TableFilterSet` for null-count pruning.
 
 ### DuckDB-native path
 
