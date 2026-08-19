@@ -59,6 +59,18 @@ void readahead_scan_manager::on_task_deployed(query_id_t,
   _cv.notify_one();
 }
 
+void readahead_scan_manager::on_memory_downgrade(query_id_t, int, std::size_t) noexcept
+{
+  if (_strategy != prefetch_strategy::opportunistic) { return; }
+  {
+    std::lock_guard lock{_mutex};
+    _credits       = std::max(_credits, _budget);
+    _may_run_ahead = true;
+    _wake          = true;
+  }
+  _cv.notify_one();
+}
+
 void readahead_scan_manager::on_task_queue_empty() noexcept
 {
   if (_strategy != prefetch_strategy::opportunistic) { return; }
@@ -423,7 +435,7 @@ readahead_scan_manager::collect_prefetch_batch_locked()
     // in -- spending the budget on splits nobody wants yet while the pipeline
     // actually running waits for its own.  Idling here is the cheaper mistake.
     bool lookahead = false;
-    if (chosen == nullptr && group_is_closed_locked(candidates)) {
+    if (chosen == nullptr && (_may_run_ahead || group_is_closed_locked(candidates))) {
       for (auto const id : _scheduler.peek_lookahead_operator_ids()) {
         auto op_it = _by_operator.find(id);
         if (op_it == _by_operator.end()) { continue; }
@@ -482,6 +494,10 @@ readahead_scan_manager::collect_prefetch_batch_locked()
     --allowance;
     if (_strategy == prefetch_strategy::opportunistic && _credits > 0) { --_credits; }
   }
+
+  // One-shot: the stall that granted it is over by the time the next pass runs,
+  // and leaving it set would quietly make read-ahead unordered for good.
+  _may_run_ahead = false;
 
   // Falling out of the while condition (rather than through a break) means the
   // budget -- or, for opportunistic, the invitation -- ran out rather than the

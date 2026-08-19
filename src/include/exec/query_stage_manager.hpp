@@ -91,6 +91,16 @@ class query_stage_listener {
   /// existing but being unplaceable, i.e. a GPU idling against a non-empty
   /// queue.
   virtual void on_executor_awaiting_task(int gpu_id) noexcept {}
+
+  /// An executor could not reserve the memory a task needs on @p gpu_id and is
+  /// spilling to free @p shortfall_bytes before it can run.  The task is parked
+  /// for as long as that takes, so the GPU is about to do no work at all --
+  /// which makes it the one moment the device's IO path is unambiguously free.
+  virtual void on_memory_downgrade(query_id_t query_id,
+                                   int gpu_id,
+                                   std::size_t shortfall_bytes) noexcept
+  {
+  }
 };
 
 /**
@@ -204,6 +214,16 @@ class query_stage_manager : public std::enable_shared_from_this<query_stage_mana
     std::shared_lock g{_listeners_mtx};
     for (auto const& l : _listeners) {
       l->on_executor_awaiting_task(gpu_id);
+    }
+  }
+
+  void notify_memory_downgrade(query_id_t query_id,
+                               int gpu_id,
+                               std::size_t shortfall_bytes) noexcept
+  {
+    std::shared_lock g{_listeners_mtx};
+    for (auto const& l : _listeners) {
+      l->on_memory_downgrade(query_id, gpu_id, shortfall_bytes);
     }
   }
 

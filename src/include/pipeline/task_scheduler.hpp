@@ -130,6 +130,10 @@ class task_scheduler {
   void set_query_stage_manager(sirius::exec::query_stage_manager& manager)
   {
     _query_stage_manager = manager.shared_from_this();
+    // The executors report memory downgrades into the same observer.
+    for (auto& [_, executor] : _gpu_executors) {
+      if (executor) { executor->set_query_stage_manager(manager); }
+    }
   }
 
   /**

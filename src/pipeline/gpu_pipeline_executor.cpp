@@ -214,6 +214,15 @@ void gpu_pipeline_executor::manager_loop()
         gpu_task->get_pipeline_id(),
         gpu_task->get_task_id());
 
+      // Reported before the (blocking) downgrade rather than after: the value of
+      // knowing is that the GPU is about to stall, and a listener told only once
+      // it has finished learns nothing it can act on.
+      _query_stage_manager->notify_memory_downgrade(
+        make_query_id(
+          static_cast<std::uint32_t>(static_cast<std::uint64_t>(gpu_task->get_priority()) >> 32)),
+        _memory_space != nullptr ? _memory_space->get_device_id() : -1,
+        shortfall);
+
       reservation.reset();  // release partial reservation before downgrade
 
       std::unique_ptr<cucascade::memory::reservation> new_reservation;

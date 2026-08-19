@@ -88,6 +88,16 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   /// budget rather than trickle.  Ignored under @c eager.
   void on_task_queue_empty() noexcept override;
 
+  /// An executor is spilling to make room for a task.  The GPU does no work for
+  /// the duration, so under @c opportunistic this both refills the credits and
+  /// lifts the restriction that read-ahead stay within the current group: with
+  /// the executor stalled there is no order left to stay in step with, and the
+  /// far more useful thing is to be further ahead when it resumes.  Ignored
+  /// under @c eager, which is already reading as far ahead as its budget allows.
+  void on_memory_downgrade(query_id_t query_id,
+                           int gpu_id,
+                           std::size_t shortfall_bytes) noexcept override;
+
   /// Request the worker to stop and join it.  Safe to call when not started.
   void stop() noexcept;
 
@@ -234,6 +244,11 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   /// Prefetches @c opportunistic has been invited to issue but has not yet.
   /// Unused by @c eager, which is always invited.
   std::size_t _credits{0};
+  /// One-shot permission to read past the current group even though it can
+  /// still emit.  Granted by a memory downgrade and consumed by the next
+  /// collect pass -- see @ref group_is_closed_locked for why it is otherwise
+  /// refused.
+  bool _may_run_ahead{false};
   /// Set by @ref update_scan_state, cleared by the worker.  A flag rather than a counter:
   /// several updates arriving while the worker is busy collapse into one pass,
   /// which is what we want — the pass reads the current cursor, not a backlog.
