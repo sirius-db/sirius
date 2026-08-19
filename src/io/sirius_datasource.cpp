@@ -262,6 +262,17 @@ bool sirius_datasource::prefetch_async(exec::invocable<void(bool) noexcept> on_d
     on_done(false);
     return false;
   }
+  // The cache's prepare_loop attaches this request's staging buffers on its own
+  // thread, and a chunk can only be claimed for loading once it has one.  Issue
+  // before that lands and every chunk is still empty/queued: nothing is
+  // claimable, no IO goes out, and the request marks itself `ready` anyway -- a
+  // prefetch that silently did nothing, which the reader then pays for.  Wait
+  // for the buffers instead; false means the request was abandoned (e.g. the
+  // pool could not satisfy it), in which case there is nothing to issue.
+  if (!_prefetch_handle.wait_until_prepared()) {
+    on_done(false);
+    return false;
+  }
   return _io_ctx->cache()->prefetch(_prefetch_handle, std::move(on_done));
 }
 

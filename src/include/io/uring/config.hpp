@@ -17,6 +17,7 @@
 #pragma once
 
 #include "exec/config.hpp"
+#include "io/types.hpp"
 
 #include <cstddef>
 
@@ -42,6 +43,18 @@ struct config {
   // prep_host_rxv_request and prep_host_to_device_rx_request paths fuse
   // contiguous segments into one readv SQE, capped at this value.  The
   std::size_t max_n_chunks{1};
+
+  /// O_DIRECT transfers whole pages, so a read is widened to a page boundary
+  /// either way -- naming it lets the caller align once, up front, instead of
+  /// every layer rediscovering it.  Reported even when @ref use_odirect is
+  /// false: a buffered read of a page-aligned span costs no more than an
+  /// unaligned one, and keeping the value constant keeps the two modes
+  /// comparable.
+  [[nodiscard]] std::size_t min_alignment_requirement() const noexcept { return io::IO_BLOCK_SIZE; }
+
+  /// A local read is a syscall against NVMe, so bridging is only worth it when
+  /// the bridged bytes are cheaper than the extra request -- one page.
+  [[nodiscard]] std::size_t merge_gap_size() const noexcept { return io::IO_BLOCK_SIZE; }
 };
 
 }  // namespace sirius::io::uring

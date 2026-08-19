@@ -339,6 +339,16 @@ class templated_ioctx : public ioctx {
 
   /// Every reactor in the pool is built from the same config, so the pool's
   /// budget is that one value rather than a sum over reactors.
+  [[nodiscard]] std::size_t min_alignment_requirement() const noexcept final
+  {
+    return _config.min_alignment_requirement();
+  }
+
+  [[nodiscard]] std::size_t merge_gap_size() const noexcept final
+  {
+    return _config.merge_gap_size();
+  }
+
   [[nodiscard]] std::size_t n_max_concurrent_scans() const noexcept final
   {
     return _config.n_max_concurrent_scans;

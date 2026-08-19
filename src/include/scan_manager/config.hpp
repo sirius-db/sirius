@@ -59,6 +59,48 @@ enum class cache_mode {
   prefetch,
 };
 
+/// How the readahead decides *when* to issue the next prefetch.
+///
+/// The two differ in what they assume the backend costs.  A round trip to an
+/// object store is dead time no matter what else is running, so the deeper the
+/// queue the better; a local NVMe read competes with the executor's own reads
+/// for the same device, so issuing one while a scan is running just reorders
+/// the queue rather than adding throughput.
+enum class prefetch_strategy {
+  /// Keep the backend's scan budget occupied at all times: every wake-up fills
+  /// every free slot.  What an object store wants -- latency is hidden only by
+  /// having more requests outstanding.
+  eager,
+  /// Issue one prefetch each time the executor deploys a task that is NOT a
+  /// scan.  A non-scan task means a pipeline thread just went to compute rather
+  /// than to read, so the device is idle and this prefetch costs nothing that
+  /// the executor wanted.  What a local file wants.
+  opportunistic,
+};
+
+/// Parse a @ref prefetch_strategy from its lowercase YAML spelling.
+inline bool string_to_enum(std::string_view sv, prefetch_strategy& out)
+{
+  static const std::unordered_map<std::string_view, prefetch_strategy> map = {
+    {"eager", prefetch_strategy::eager},
+    {"opportunistic", prefetch_strategy::opportunistic},
+  };
+  auto it = map.find(sv);
+  if (it == map.end()) { return false; }
+  out = it->second;
+  return true;
+}
+
+/// Render a @ref prefetch_strategy as its canonical lowercase name.
+inline bool enum_to_string(prefetch_strategy s, std::string& out)
+{
+  switch (s) {
+    case prefetch_strategy::eager: out = "eager"; return true;
+    case prefetch_strategy::opportunistic: out = "opportunistic"; return true;
+  }
+  return false;
+}
+
 /// Parse a @ref cache_mode from its lowercase YAML spelling.
 inline bool string_to_enum(std::string_view sv, cache_mode& out)
 {
@@ -169,6 +211,16 @@ struct scan_manager_config {
   /// budget it schedules against is @c n_max_concurrent_scans on that backend's
   /// reactor config; a backend that sets it to zero is skipped regardless.
   bool enable_readahead{false};
+
+  /// When the readahead issues.  See @ref prefetch_strategy.
+  prefetch_strategy readahead_strategy{prefetch_strategy::eager};
+
+  /// Scans the executor can have running at once — the pipeline pool's width.
+  /// The budget @c opportunistic schedules against, since one prefetch per
+  /// non-scan deployment is only useful while the executor could still take
+  /// another scan.  Stamped by @c sirius_config from the pipeline config; zero
+  /// means "not stamped", and the backend's own budget is used instead.
+  std::size_t pipeline_width{0};
 
   /// Local (uring) reactor configuration — bounce-slot size, O_DIRECT,
   /// ring depth, etc.  @c use_odirect is derived from @ref cache.

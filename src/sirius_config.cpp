@@ -226,6 +226,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("rest_n_reactors", opt.rest_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("cache", opt.cache);
+  r.optional("readahead_strategy", opt.readahead_strategy);
   if (auto n = r.optional_node("uring")) sirius::from_yaml(*n, opt.uring);
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
   if (auto n = r.optional_node("kvikio")) sirius::from_yaml(*n, opt.kvikio);
@@ -604,6 +605,10 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
     }
 
     derive_uring_scan_budget();
+    // The opportunistic strategy schedules against what the executor can run,
+    // not what the device can queue, so it needs the pipeline pool's width.
+    _scan_manager_config.pipeline_width =
+      static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
     derive_rest_scan_budget();
     enforce_sirius_backend_for_multi_gpu();
 

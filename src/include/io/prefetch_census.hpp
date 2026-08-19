@@ -160,6 +160,16 @@ struct prefetch_census {
     read_order.push_back(op_id);
   }
 
+  // -- byte accounting -------------------------------------------------------
+  // Decomposes what actually reaches the device against what the reader asked
+  // for.  bytes_logical is the sum of the callers' ranges; the rest are disk
+  // bytes broken out by which path fetched them.
+  std::atomic<std::uint64_t> bytes_logical{0};   ///< bytes the reader requested
+  std::atomic<std::uint64_t> bytes_hit{0};       ///< served from cache (no disk)
+  std::atomic<std::uint64_t> bytes_h2d{0};       ///< disk -> cache buffer, then device
+  std::atomic<std::uint64_t> bytes_miss{0};      ///< disk -> bounce, not cached
+  std::atomic<std::uint64_t> bytes_prefetch{0};  ///< disk, issued by the readahead
+
   static prefetch_census& instance() noexcept
   {
     static prefetch_census c;
@@ -192,6 +202,12 @@ struct prefetch_census {
            "\n  splits registered over    : " + std::to_string(first_registration_ms.load()) +
            " ms .. " + std::to_string(last_registration_ms.load()) + " ms" +
            "\n  declined (already reading): " + std::to_string(decl) +
+           "\n  -- bytes --" +
+           "\n  logical (requested)       : " + std::to_string(bytes_logical.load()) +
+           "\n  disk: cache fill (h2d)    : " + std::to_string(bytes_h2d.load()) +
+           "\n  disk: bounce (uncached)   : " + std::to_string(bytes_miss.load()) +
+           "\n  disk: prefetch            : " + std::to_string(bytes_prefetch.load()) +
+           "\n  served from cache         : " + std::to_string(bytes_hit.load()) +
            "\n  -- at first read --" +
            "\n  prefetched, ready in time : " + std::to_string(ready) +
            "\n  prefetched, had to wait   : " + std::to_string(waited) +
@@ -262,6 +278,11 @@ struct prefetch_census {
 
   void reset() noexcept
   {
+    bytes_logical  = 0;
+    bytes_hit      = 0;
+    bytes_h2d      = 0;
+    bytes_miss     = 0;
+    bytes_prefetch = 0;
     scans_registered  = 0;
     prefetch_issued   = 0;
     skipped_no_ranges = 0;

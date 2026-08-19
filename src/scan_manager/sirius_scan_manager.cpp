@@ -570,7 +570,14 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
         if (ctx) { budget = std::max(budget, ctx->n_max_concurrent_scans()); }
       }
     }
-    _readahead->start(budget);
+    // Opportunistic schedules against what the executor can run, not what the
+    // device can queue: one prefetch per non-scan deployment is only useful
+    // while a pipeline thread could still pick up another scan.
+    if (_config.readahead_strategy == prefetch_strategy::opportunistic &&
+        _config.pipeline_width > 0) {
+      budget = _config.pipeline_width;
+    }
+    _readahead->start(budget, _config.readahead_strategy);
   }
 
   std::vector<cached_assignment> cached_assignments;

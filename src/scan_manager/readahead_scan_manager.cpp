@@ -30,7 +30,50 @@ namespace sirius::scan_manager {
 
 readahead_scan_manager::~readahead_scan_manager() { stop(); }
 
-void readahead_scan_manager::start(std::size_t budget)
+void readahead_scan_manager::on_task_deployed(query_id_t,
+                                              std::size_t,
+                                              op::SiriusPhysicalOperatorType operator_type,
+                                              int) noexcept
+{
+  if (_strategy != prefetch_strategy::opportunistic) { return; }
+  // A scan deployment means a pipeline thread is about to read for itself.
+  // Prefetching alongside it only reorders the device queue; the whole point of
+  // this strategy is to use the gaps when the executor is NOT reading.
+  if (operator_type == op::SiriusPhysicalOperatorType::GPU_SCAN) { return; }
+
+  {
+    // Taken rather than using an atomic so the credit cannot land between the
+    // worker's predicate check and its wait, which would lose the wake-up.  The
+    // section is two stores; the worker holds this lock for longer, so this can
+    // stall the scheduler thread briefly -- see count_ongoing_locked, which is
+    // the long pole under it.
+    std::lock_guard lock{_mutex};
+    // Deliberately uncapped.  A credit is permission to read one more scan
+    // ahead, not permission to occupy a slot right now -- the budget still caps
+    // how many can be in flight.  Dropping credits earned while the slots
+    // happened to be full would silently throw away exactly the compute-heavy
+    // stretches this strategy exists to exploit.
+    ++_credits;
+    _wake = true;
+  }
+  _cv.notify_one();
+}
+
+void readahead_scan_manager::on_task_queue_empty() noexcept
+{
+  if (_strategy != prefetch_strategy::opportunistic) { return; }
+  {
+    std::lock_guard lock{_mutex};
+    // An empty queue is not one opportunity, it is the absence of competition:
+    // top up to at least a full budget so the worker runs as far ahead as it is
+    // allowed to while nothing else wants the device.
+    _credits = std::max(_credits, _budget);
+    _wake    = true;
+  }
+  _cv.notify_one();
+}
+
+void readahead_scan_manager::start(std::size_t budget, prefetch_strategy strategy)
 {
   // A backend that publishes a zero budget has opted out; running a worker that
   // can never issue anything would just be a thread parked on a condvar.
@@ -39,7 +82,11 @@ void readahead_scan_manager::start(std::size_t budget)
   std::lock_guard lock{_mutex};
   if (_worker.joinable()) { return; }  // already running
 
-  _budget      = budget;
+  _budget   = budget;
+  _strategy = strategy;
+  // Eager is always invited to fill the budget; opportunistic starts with
+  // nothing and is invited one prefetch at a time by on_task_deployed.
+  _credits     = 0;
   _wake        = false;
   _stop_source = std::stop_source{};
   _worker =
@@ -329,7 +376,13 @@ readahead_scan_manager::collect_prefetch_batch_locked()
   census.collect_passes.fetch_add(1, std::memory_order_relaxed);
   bool stopped = false;
 
-  while (ongoing < _budget) {
+  // Eager fills every free slot; opportunistic issues only what it has been
+  // invited to, so an idle executor does not turn into a background read storm
+  // competing with the reads the executor is about to do itself.
+  std::size_t allowance =
+    _strategy == prefetch_strategy::opportunistic ? std::min(_credits, _budget) : _budget;
+
+  while (ongoing < _budget && allowance > 0) {
     // Prefer the scheduler's current group, but never leave budget idle solely
     // because that group has no emitted split ready. Check its peers first, then
     // later groups in order. A later-group pick is lookahead: it fills capacity
@@ -426,11 +479,16 @@ readahead_scan_manager::collect_prefetch_batch_locked()
 
     batch.push_back(pending_prefetch{.task = std::move(task), .operator_id = chosen_op});
     ++ongoing;
+    --allowance;
+    if (_strategy == prefetch_strategy::opportunistic && _credits > 0) { --_credits; }
   }
 
   // Falling out of the while condition (rather than through a break) means the
-  // budget, not the order, is what stopped us.
-  if (!stopped) { census.stop_budget_full.fetch_add(1, std::memory_order_relaxed); }
+  // budget -- or, for opportunistic, the invitation -- ran out rather than the
+  // order.  Only a genuinely full budget is reported as such.
+  if (!stopped && ongoing >= _budget) {
+    census.stop_budget_full.fetch_add(1, std::memory_order_relaxed);
+  }
   return batch;
 }
 

@@ -159,6 +159,22 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// Conservatively false: a backend opts in.
   [[nodiscard]] virtual bool prefers_bulk_io() const noexcept { return false; }
 
+  /// The smallest unit this backend can address, in bytes.  A read is widened
+  /// out to a multiple of it before being issued: a local file opened O_DIRECT
+  /// can only transfer whole pages, while an object store addresses single
+  /// bytes and pays nothing for an odd offset.
+  ///
+  /// Conservatively 1 -- a backend that has not opted in is never widened.
+  [[nodiscard]] virtual std::size_t min_alignment_requirement() const noexcept { return 1; }
+
+  /// The largest gap between two ranges still worth bridging into one request,
+  /// in bytes.  The bridged bytes are fetched and discarded, traded against the
+  /// cost of a second request: a page for a local file, a whole round trip for
+  /// an object store, which is why the two want very different answers.
+  ///
+  /// Conservatively 0 -- only adjacent ranges are fused.
+  [[nodiscard]] virtual std::size_t merge_gap_size() const noexcept { return 0; }
+
   /// How many scan tasks the readahead manager may keep in flight against this
   /// backend at once, as configured on its reactors.  Zero means this backend
   /// opts out of readahead scheduling entirely.

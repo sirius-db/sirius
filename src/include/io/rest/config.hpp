@@ -25,6 +25,14 @@
 namespace sirius::io::rest {
 
 struct config {
+  /// An object store addresses single bytes: a ranged GET for an odd offset
+  /// costs exactly what it asks for, so nothing is gained by widening.
+  [[nodiscard]] std::size_t min_alignment_requirement() const noexcept { return 1; }
+
+  /// Bridging is worth a great deal here -- the alternative is a second round
+  /// trip -- so the gap the reactor already fuses on is the gap to merge on.
+  [[nodiscard]] std::size_t merge_gap_size() const noexcept { return merge_max_gap; }
+
   /// How many scan tasks the readahead manager may keep in flight against this
   /// backend at once.  Zero disables readahead for it entirely.
   ///

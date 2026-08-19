@@ -294,16 +294,47 @@ prefetching_handle prefetching_cache::insert(const io_object& obj,
 
   const size_t chunk_bytes = _chunk_size;
 
-  // Enumerate the chunk-aligned positions the requested ranges touch, together
-  // with the extent each one is actually wanted for.  Derived from the ORIGINAL
-  // ranges rather than a chunk-aligned coalesce of them: coalescing would pull
-  // in whole chunks that no range touches, and since every chunk now issues its
-  // own IO segment sized to its extent, those chunks would be pure over-read.
-  std::vector<std::pair<size_t, chunk_fill>> wanted;
+  // Normalise the request set to what the backend actually addresses BEFORE
+  // mapping it onto chunks.
+  //
+  // Widen each range to the backend's alignment (a page for an O_DIRECT file, a
+  // single byte for an object store), then fuse ranges close enough that
+  // bridging the gap beats issuing a second request.  Doing it here, once, is
+  // what stops a chunk being touched by several small ranges anchored to
+  // opposite edges -- `merge` folds those to a whole-chunk fill, and the whole
+  // chunk is then read to serve a few kilobytes.
+  auto const alignment = std::max<size_t>(1, _io_ctx->min_alignment_requirement());
+  auto const gap       = _io_ctx->merge_gap_size();
+
+  std::vector<std::pair<size_t, size_t>> spans;  // [lo, hi), aligned
+  spans.reserve(ranges.size());
   for (const auto& r : ranges) {
     if (r.size() <= 0) { continue; }
     auto const lo = static_cast<size_t>(r.offset());
-    auto const hi = lo + static_cast<size_t>(r.size());
+    spans.emplace_back(align_down(lo, alignment),
+                       align_up(lo + static_cast<size_t>(r.size()), alignment));
+  }
+  std::ranges::sort(spans);
+
+  std::vector<std::pair<size_t, size_t>> merged;
+  merged.reserve(spans.size());
+  for (auto const& [lo, hi] : spans) {
+    // `<=` so exactly-adjacent ranges fuse even at gap 0.
+    if (!merged.empty() && lo <= merged.back().second + gap) {
+      merged.back().second = std::max(merged.back().second, hi);
+    } else {
+      merged.emplace_back(lo, hi);
+    }
+  }
+
+  // Enumerate the chunk-aligned positions the merged ranges touch, together
+  // with the extent each one is actually wanted for.  Still derived from the
+  // ranges rather than a chunk-aligned coalesce of them: coalescing to chunk
+  // granularity would pull in whole chunks that no range touches, and since
+  // every chunk issues its own IO segment sized to its extent, those chunks
+  // would be pure over-read.
+  std::vector<std::pair<size_t, chunk_fill>> wanted;
+  for (auto const& [lo, hi] : merged) {
     for (auto off = (lo / chunk_bytes) * chunk_bytes; off < hi; off += chunk_bytes) {
       wanted.emplace_back(off, needed_fill(off, chunk_bytes, lo, hi));
     }
@@ -528,6 +559,8 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const io_obj
             c->state.take_loading_merging(needed_fill(off, chunk_bytes, need_lo, need_hi), fill)) {
           assert(c->data != nullptr);
           auto const [seg_lo, seg_hi] = fill_span(fill, off, chunk_bytes);
+          prefetch_census::instance().bytes_h2d.fetch_add(seg_hi - seg_lo,
+                                                          std::memory_order_relaxed);
           io_chunks.push_back(c);  // host-to-device load into the cache buffer
           io_segments.emplace_back(seg_lo, seg_hi - seg_lo, c->data + (seg_lo - off));
           h2d++;
@@ -538,6 +571,8 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const io_obj
         // an internal bounce slot (null host buffer); do not touch the cache.
         size_t const seg_lo = align_down(need_lo, io::IO_BLOCK_SIZE);
         size_t const seg_hi = std::min(off + chunk_bytes, align_up(need_hi, io::IO_BLOCK_SIZE));
+        prefetch_census::instance().bytes_miss.fetch_add(seg_hi - seg_lo,
+                                                         std::memory_order_relaxed);
         io_segments.emplace_back(seg_lo, seg_hi - seg_lo, nullptr);
         misses++;
       }
@@ -681,7 +716,10 @@ void prefetching_cache::plan_device_range(std::span<cached_chunk* const> chunks,
     size_t const need_hi = std::min(off + chunk_bytes, req_end);
     uint8_t* const dev   = range.device_dst + (need_lo - range.offset);
 
+    prefetch_census::instance().bytes_logical.fetch_add(need_hi - need_lo,
+                                                        std::memory_order_relaxed);
     if (c != nullptr && c->state.try_pin_covering(off, chunk_bytes, need_lo, need_hi)) {
+      prefetch_census::instance().bytes_hit.fetch_add(need_hi - need_lo, std::memory_order_relaxed);
       plan.pinned.push_back(c);
       // Staged, not submitted — the whole batch of ranges goes to the driver in
       // a single call once planning is done.
@@ -696,6 +734,7 @@ void prefetching_cache::plan_device_range(std::span<cached_chunk* const> chunks,
         c->state.take_loading_merging(needed_fill(off, chunk_bytes, need_lo, need_hi), fill)) {
       assert(c->data != nullptr);
       auto const [seg_lo, seg_hi] = fill_span(fill, off, chunk_bytes);
+      prefetch_census::instance().bytes_h2d.fetch_add(seg_hi - seg_lo, std::memory_order_relaxed);
       plan.loading.push_back(c);
       plan.io_ranges.emplace_back(
         seg_lo, seg_hi - seg_lo, need_lo, need_hi - need_lo, c->data + (seg_lo - off), dev);
@@ -705,6 +744,7 @@ void prefetching_cache::plan_device_range(std::span<cached_chunk* const> chunks,
 
     size_t const seg_lo = align_down(need_lo, io::IO_BLOCK_SIZE);
     size_t const seg_hi = std::min(off + chunk_bytes, align_up(need_hi, io::IO_BLOCK_SIZE));
+    prefetch_census::instance().bytes_miss.fetch_add(seg_hi - seg_lo, std::memory_order_relaxed);
     plan.io_ranges.emplace_back(seg_lo, seg_hi - seg_lo, need_lo, need_hi - need_lo, nullptr, dev);
     plan.misses++;
   }
@@ -1099,6 +1139,8 @@ bool prefetching_cache::prefetch(prefetching_handle& handle,
     chunk_fill fill;
     if (c->state.take_loading(fill)) {
       auto const [seg_lo, seg_hi] = fill_span(fill, c->offset, _chunk_size);
+      prefetch_census::instance().bytes_prefetch.fetch_add(seg_hi - seg_lo,
+                                                           std::memory_order_relaxed);
       claimed_chunks.push_back(c);
       segments.emplace_back(seg_lo, seg_hi - seg_lo, c->data + (seg_lo - c->offset));
     }

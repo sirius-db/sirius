@@ -19,6 +19,7 @@
 #include "exec/query_stage_manager.hpp"
 #include "io/cache/types.hpp"
 #include "planner/query_index.hpp"
+#include "scan_manager/config.hpp"
 #include "scan_manager/prefetching_scheduler.hpp"
 
 #include <condition_variable>
@@ -69,7 +70,23 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   /// of scan tasks the worker will try to keep in flight.  A budget of zero
   /// means the backend opts out, and start() is then a no-op: there is no point
   /// running a scheduler that may never issue anything.
-  void start(std::size_t budget);
+  void start(std::size_t budget, prefetch_strategy strategy = prefetch_strategy::eager);
+
+  /// A task reached an executor.  Under @c prefetch_strategy::opportunistic a
+  /// deployment that is NOT a scan is the signal to issue one prefetch: a
+  /// pipeline thread just went to compute rather than to read, so the device
+  /// has capacity the executor is not about to use.  Ignored under
+  /// @c eager, which does not wait to be told.
+  void on_task_deployed(query_id_t query_id,
+                        std::size_t operator_id,
+                        op::SiriusPhysicalOperatorType operator_type,
+                        int gpu_id) noexcept override;
+
+  /// The scheduler's queue ran dry.  Nothing is waiting to be dispatched, so
+  /// whatever the executor is doing it is not about to read -- the strongest
+  /// idle signal available, and under @c opportunistic the moment to fill the
+  /// budget rather than trickle.  Ignored under @c eager.
+  void on_task_queue_empty() noexcept override;
 
   /// Request the worker to stop and join it.  Safe to call when not started.
   void stop() noexcept;
@@ -213,6 +230,10 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
 
   /// Scan tasks the worker tries to keep in flight; 0 means "backend opted out".
   std::size_t _budget{0};
+  prefetch_strategy _strategy{prefetch_strategy::eager};
+  /// Prefetches @c opportunistic has been invited to issue but has not yet.
+  /// Unused by @c eager, which is always invited.
+  std::size_t _credits{0};
   /// Set by @ref update_scan_state, cleared by the worker.  A flag rather than a counter:
   /// several updates arriving while the worker is busy collapse into one pass,
   /// which is what we want — the pass reads the current cursor, not a backlog.
