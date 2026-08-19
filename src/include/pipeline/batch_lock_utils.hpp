@@ -30,6 +30,7 @@
 
 #include <memory>
 #include <optional>
+#include <tuple>
 
 namespace sirius {
 namespace pipeline {
@@ -137,21 +138,22 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
           .new_batch = clone,
           .ro_lock   = clone->to_read_only(),
         };
-        // read_accessor dropped.
+        // read_accessor to the original batch dropped.
       }
 
       // HOST/DISK -> GPU upgrade/readback: convert in place (move), freeing the spilled copy
       {
-        cucascade::data_batch::to_idle(std::move(read_accessor));  // release the read lock
+        std::ignore =
+          cucascade::data_batch::to_idle(std::move(read_accessor));  // release the read lock
         cucascade::mutable_data_batch mut_accessor = batch->to_mutable();
 
-        // this upgrade to mutable is not atomic (shared released, then exclusive acquired): a
+        // this upgrade to mutable is not atomic (shared released, then exclusive acquire): a
         // concurrent consumer of a shared spilled batch may have converted it in the gap.
         // Re-dispatch on the state observed under the exclusive lock:
         const auto* current_space = mut_accessor.get_memory_space();
         if (current_space != nullptr && current_space->get_id() == target_space->get_id()) {
           // Already in the target space — skip the wasteful same-space deep copy.
-          cucascade::data_batch::to_idle(
+          std::ignore = cucascade::data_batch::to_idle(
             std::move(mut_accessor));  // release the exclusive write lock
           return lock_and_prepare_batch_result{
             .new_batch = std::nullopt,
@@ -171,6 +173,7 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
             .new_batch = clone,
             .ro_lock   = clone->to_read_only(),
           };
+          // mut_accessor to the original batch dropped.
         }
         mut_accessor.convert_to<cucascade::gpu_table_representation>(
           registry, target_space, stream);
@@ -191,7 +194,7 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
     case cucascade::memory::Tier::HOST: {
       {
         // release the read lock to get mutable access
-        cucascade::data_batch::to_idle(std::move(read_accessor));
+        std::ignore = cucascade::data_batch::to_idle(std::move(read_accessor));
         cucascade::mutable_data_batch mut_accessor = batch->to_mutable();
         // Same non-atomic-upgrade race as the GPU arm: skip if already in the target space.
         if (mut_accessor.get_memory_space() == nullptr ||

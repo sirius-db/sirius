@@ -108,13 +108,7 @@ void pipelineable_operator_data::prepare_for_processing(
       throw;
     }
   }
-
   _read_only_data_batches = std::move(ro_batches);
-  // When lock_and_prepare_batch produced a clone (cross-GPU input / target-space mismatch), the
-  // loop above already updated _data_batches[i] to that clone in place, so _data_batches[i] and
-  // _read_only_data_batches[i] refer to the same prepared batch. Downstream forwarding
-  // (get_data_batches) and OOM reschedule (remove_read_only_lock) therefore see the prepared
-  // batch, not a stale original.
 }
 
 std::string sirius_physical_operator::get_name() const
