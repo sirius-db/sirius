@@ -246,9 +246,11 @@ void scan_operator_input::prepare_for_processing(
           auto& space        = gpu_rep->get_memory_space();
           stolen_table_bytes = gpu_rep->get_size_in_bytes();
           if (needs_carrier_conversion) {
-            // The transactional steal bypasses post_filter_and_project, so a decode-row-filtered
-            // split (whose projection still runs there) stays view-backed for the generic path.
-            converted_table_steal_pending = !row_filter_pending;
+            // Same eligibility as the direct steal below (the enclosing gate): unfiltered, or
+            // decode-row-filtered. Execute additionally requires the ingestible's assembly to be
+            // a leading identity before consuming a decode-filtered pending split, because the
+            // transactional steal bypasses post_filter_and_project.
+            converted_table_steal_pending = true;
           } else {
             stolen_table = gpu_rep->release_table(stream);
             // The batch cannot hold null data and its size/view queries dereference the table, so
@@ -273,13 +275,15 @@ std::unique_ptr<cudf::table> scan_operator_input::transactionally_steal_converte
   rmm::cuda_stream_view stream) const
 {
   // This gate is deliberately narrower than the generic resident path. Only prepare's own fresh
-  // conversion may set pending; raw GPU pins and any split that needs filtering stay view-backed.
-  // The pushdown states imply row_filter_pending today but are re-checked here: this path skips
-  // post_filter_and_project entirely, which a decode-filtered or predicate-substituted batch
-  // still needs for its projection / conjunct rewrite.
+  // conversion may set pending; raw GPU pins and splits with filtering still ahead of them stay
+  // view-backed. A decode-row-filtered split's filter is already applied, so it qualifies — the
+  // caller vouches for the projection this path skips (see execute's leading-identity check).
+  // Predicate-substituted columns are trailing pure-filter columns and thus can never pass the
+  // width check below, but a values-only source is a correctness invariant here, so refuse them
+  // explicitly rather than by that coincidence.
   if (!converted_table_steal_pending || !needs_carrier_conversion || stolen_table_consumed ||
-      stolen_table || !is_resident() || mvcc_keep_mask.has_mask() || row_filter_pending ||
-      pushdown_row_filtered || !pushdown_predicate_columns.empty()) {
+      stolen_table || !is_resident() || mvcc_keep_mask.has_mask() ||
+      (row_filter_pending && !pushdown_row_filtered) || !pushdown_predicate_columns.empty()) {
     return nullptr;
   }
 

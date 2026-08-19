@@ -1343,6 +1343,37 @@ TEST_CASE("prepare_for_processing gates immediate and transactional converted-ta
     REQUIRE(ro.get_current_tier() == cucascade::memory::Tier::GPU);
     REQUIRE(ro.get_data()->get_size_in_bytes() > 0);
   }
+
+  SECTION("row filter pending with carrier conversion")
+  {
+    // Filtering is still ahead of this split, so neither steal form may take the source.
+    auto batch = make_host_batch(e, values);
+    sirius::op::scan::scan_operator_input split{batch};
+    split.row_filter_pending       = true;
+    split.needs_carrier_conversion = true;
+    split.prepare_for_processing(e.gpu_space, e.stream());
+    REQUIRE(split.stolen_table == nullptr);
+    REQUIRE_FALSE(split.converted_table_steal_pending);
+  }
+
+  SECTION("decode-row-filtered carrier conversion regains the transactional path")
+  {
+    // The decode already applied the whole filter conjunction (pre-stamped here; a plain host
+    // conversion leaves the outcome untouched), so only the carrier cast remains and prepare
+    // arms the transactional steal.
+    auto batch = make_host_batch(e, values);
+    sirius::op::scan::scan_operator_input split{batch};
+    split.row_filter_pending       = true;
+    split.pushdown_row_filtered    = true;
+    split.needs_carrier_conversion = true;
+    split.prepare_for_processing(e.gpu_space, e.stream());
+    REQUIRE(split.stolen_table == nullptr);
+    REQUIRE(split.converted_table_steal_pending);
+    REQUIRE(split.stolen_table_bytes > 0);
+    auto ro = batch->to_read_only();
+    REQUIRE(ro.get_current_tier() == cucascade::memory::Tier::GPU);
+    REQUIRE(ro.get_data()->get_size_in_bytes() > 0);
+  }
 }
 
 TEST_CASE("transactional converted-table steal rolls back and commits on retry",
@@ -1465,6 +1496,58 @@ TEST_CASE("transactional converted-table steal rolls back and commits on retry",
     retry);
   REQUIRE(consumed == nullptr);
   REQUIRE_FALSE(consumed_builder_called);
+}
+
+TEST_CASE("transactional steal serves decode-row-filtered splits but refuses predicate columns",
+          "[cached_serving][scan_manager]")
+{
+  auto& e = env();
+  std::vector<int32_t> const values{40, 41, 42, 43};
+  using replacements = sirius::op::scan::scan_operator_input::converted_column_replacements;
+
+  auto batch = make_host_batch(e, values);
+  sirius::op::scan::scan_operator_input split{batch};
+  split.row_filter_pending       = true;
+  split.pushdown_row_filtered    = true;
+  split.needs_carrier_conversion = true;
+  split.prepare_for_processing(e.gpu_space, e.stream());
+  REQUIRE(split.converted_table_steal_pending);
+
+  // A predicate-substituted column means the source is not values-only; the gate must refuse
+  // without invoking the builder.
+  split.pushdown_predicate_columns = {0};
+  bool builder_called              = false;
+  auto refused                     = split.transactionally_steal_converted_table(
+    /*output_width=*/1,
+    [&](cudf::table_view) {
+      builder_called = true;
+      return replacements(1);
+    },
+    e.stream());
+  REQUIRE(refused == nullptr);
+  REQUIRE_FALSE(builder_called);
+  REQUIRE(split.converted_table_steal_pending);
+
+  // A values-only decode-filtered split commits like the unfiltered case.
+  split.pushdown_predicate_columns.clear();
+  auto out = split.transactionally_steal_converted_table(
+    /*output_width=*/1,
+    [&](cudf::table_view source) {
+      replacements built(1);
+      built[0] = cudf::cast(source.column(0),
+                            cudf::data_type{cudf::type_id::INT64},
+                            e.stream(),
+                            e.gpu_space->get_default_allocator());
+      return built;
+    },
+    e.stream());
+  REQUIRE(out != nullptr);
+  e.stream().synchronize();
+  REQUIRE(out->view().column(0).type().id() == cudf::type_id::INT64);
+  REQUIRE(to_host_column<int64_t>(out->view(), 0) ==
+          std::vector<int64_t>(values.begin(), values.end()));
+  REQUIRE(split.stolen_table_consumed);
+  REQUIRE_FALSE(split.converted_table_steal_pending);
 }
 
 // Compressed chunks are opaque blobs, but the carrier fold never needs to open them: the pin
