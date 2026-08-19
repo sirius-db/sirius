@@ -298,13 +298,18 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
                                    pipeline::sirius_meta_pipeline& meta_pipeline,
                                    sirius_physical_operator& op);
 
+  //! Whether the execute dispatch has an arm for @p join_type. SINGLE does not;
+  //! are_conditions_supported() folds this in so the planner never builds one.
+  static bool is_join_type_supported(duckdb::JoinType join_type);
+
   /**
-   * @brief Returns true if the given join conditions can be handled by this operator.
+   * @brief Returns true if the given join type and conditions can be handled by this operator.
    *
-   * Requires at least one equality condition. For mixed joins (equality + inequality), also
-   * requires that no column referenced by an equality condition appears in any inequality
-   * condition on the same side — cuDF's mixed_join API requires disjoint equality and
-   * conditional table columns.
+   * Requires an executable join type (is_join_type_supported) and at least one equality
+   * condition. For mixed joins (equality + inequality), also requires that no column referenced
+   * by an equality condition appears in any inequality condition on the same side — cuDF's
+   * mixed_join API requires disjoint equality and conditional table columns. A MARK join mixing
+   * null-safe and plain keys is rejected; see mark_join_mixes_null_safe_keys.
    *
    * @param join_type Used to exclude MARK joins from null-safe routing.
    */
@@ -434,12 +439,17 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// construction (conditions and join_type are fixed thereafter). cuDF applies one
   /// flag to all key columns, so it is EQUAL (null-safe -- NULL matches NULL) only
   /// when EVERY equi-key is IS NOT DISTINCT FROM; a plain `=` key (including mixed
-  /// joins such as delim joins) forces UNEQUAL. MARK joins are also forced to
-  /// UNEQUAL to match their IN/EXISTS three-valued result logic -- a null-safe MARK
-  /// join (e.g. EXISTS with IS NOT DISTINCT FROM) is a known unsupported case, see
-  /// the constructor.
+  /// joins such as delim joins) forces UNEQUAL. A MARK join follows the same rule:
+  /// all-null-safe keys use EQUAL and emit definite marks (see mark_is_null_safe),
+  /// anything containing a plain key uses UNEQUAL and the IN/EXISTS three-valued
+  /// result logic. A MARK join *mixing* the two is rejected at plan time.
   cudf::null_equality compare_nulls() const { return compare_nulls_; }
   cudf::null_equality compare_nulls_ = cudf::null_equality::UNEQUAL;
+
+  /// A MARK join whose every condition is IS NOT DISTINCT FROM: the predicate is never UNKNOWN,
+  /// so every mark is definite and the result carries no null mask.
+  [[nodiscard]] bool mark_is_null_safe() const { return mark_is_null_safe_; }
+  bool mark_is_null_safe_ = false;
 
  public:
   //! Per-key cast info: whether each join key needs a cast before comparison

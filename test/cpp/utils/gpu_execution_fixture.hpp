@@ -236,6 +236,38 @@ class GpuExecutionFixture {
     REQUIRE(after.runtime_fallbacks > before.runtime_fallbacks);
   }
 
+  /// Asserts the query is rejected during GPU plan generation and completes via DuckDB's CPU
+  /// plan, returning exactly the CPU results. Distinct from expect_gpu_fallback, which asserts a
+  /// fallback *after* GPU execution started: a plan-time rejection moves `fallbacks` and never
+  /// increments `executions`. Use for shapes Sirius screens out at plan time on purpose.
+  void expect_plan_fallback_matches_cpu(const std::string& query)
+  {
+    run_ok("SET gpu_execution = true;");
+    auto const before = sirius::test::get_transparent_execution_stats(*con);
+    auto gpu_result   = con->Query(query);
+    auto const after  = sirius::test::get_transparent_execution_stats(*con);
+    REQUIRE(gpu_result);
+    if (gpu_result->HasError()) { UNSCOPED_INFO("query error: " << gpu_result->GetError()); }
+    REQUIRE_FALSE(gpu_result->HasError());
+    if (after.fallbacks == before.fallbacks) {
+      UNSCOPED_INFO("expected a plan-time fallback to CPU, but none occurred");
+    }
+    REQUIRE(after.fallbacks == before.fallbacks + 1);
+    REQUIRE(after.executions == before.executions);
+
+    run_ok("SET gpu_execution = false;");
+    auto cpu_result = con->Query(query);
+    run_ok("SET gpu_execution = true;");
+    REQUIRE(cpu_result);
+    REQUIRE_FALSE(cpu_result->HasError());
+
+    REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
+    REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
+    auto gpu_rows = collect_rows(gpu_result->Cast<duckdb::MaterializedQueryResult>(), true);
+    auto cpu_rows = collect_rows(cpu_result->Cast<duckdb::MaterializedQueryResult>(), true);
+    REQUIRE(gpu_rows == cpu_rows);
+  }
+
  private:
   void compare_gpu_vs_cpu_impl(const std::string& query,
                                bool ordered,

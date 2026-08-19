@@ -33,6 +33,7 @@
 #include "cudf/utilities/memory_resource.hpp"
 #include "cudf/version_config.hpp"
 #include "data/data_batch_utils.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
@@ -101,6 +102,28 @@ static bool wants_null_safe_routing(duckdb::vector<sirius::join_condition> const
     }
   }
   return has_plain_equal && has_null_safe;
+}
+
+// Every condition is null-safe (IS NOT DISTINCT FROM). For a MARK join this is the encodable
+// case: null_equality::EQUAL covers every key, and a null-safe comparison is never UNKNOWN, so
+// every mark is definite.
+static bool all_keys_null_safe(duckdb::vector<sirius::join_condition> const& conditions)
+{
+  return !conditions.empty() &&
+         std::all_of(conditions.begin(), conditions.end(), [](auto const& c) {
+           return c.comparison == sirius::comparison_type::not_distinct_from;
+         });
+}
+
+// A MARK join mixing null-safe keys with anything else (a plain `=`, or an inequality). cuDF takes
+// one null_equality for every key and MARK does not route null-safe keys into the mixed-join
+// predicate, so the null-safe key would silently inherit UNEQUAL. Callers must reject this shape.
+static bool mark_join_mixes_null_safe_keys(duckdb::vector<sirius::join_condition> const& conditions)
+{
+  bool const has_null_safe = std::any_of(conditions.begin(), conditions.end(), [](auto const& c) {
+    return c.comparison == sirius::comparison_type::not_distinct_from;
+  });
+  return has_null_safe && !all_keys_null_safe(conditions);
 }
 
 // Whether a condition belongs in the hash key: a plain `=`, or a null-safe key when it
@@ -176,9 +199,35 @@ static cudf::mark_join make_left_mark_join(cudf::table_view const& left_keys,
   return cudf::mark_join(left_keys, compare_nulls, cudf::join_prefilter::NO, stream);
 }
 
+bool sirius_physical_hash_join::is_join_type_supported(duckdb::JoinType join_type)
+{
+  // Keep in lockstep with the join-type dispatch in execute() and its BUILD_PROBE counterpart.
+  switch (join_type) {
+    case duckdb::JoinType::INNER:
+    case duckdb::JoinType::LEFT:
+    case duckdb::JoinType::RIGHT:
+    case duckdb::JoinType::SEMI:
+    case duckdb::JoinType::ANTI:
+    case duckdb::JoinType::RIGHT_SEMI:
+    case duckdb::JoinType::RIGHT_ANTI:
+    case duckdb::JoinType::MARK:
+    case duckdb::JoinType::OUTER: return true;
+    // SINGLE (at most one build row per probe row, NULL-padded otherwise) has no arm in any
+    // dispatch.
+    default: return false;
+  }
+}
+
 bool sirius_physical_hash_join::are_conditions_supported(
   duckdb::vector<sirius::join_condition>& conditions, duckdb::JoinType join_type)
 {
+  if (!is_join_type_supported(join_type)) { return false; }
+
+  // All-null-safe MARK is fine (EQUAL keys, definite marks); only the mixture is unencodable.
+  if (join_type == duckdb::JoinType::MARK && mark_join_mixes_null_safe_keys(conditions)) {
+    return false;
+  }
+
   // Keep support validation and constructor key classification identical.
   bool const route_null_safe = wants_null_safe_routing(conditions, join_type);
 
@@ -298,6 +347,13 @@ sirius_physical_hash_join::sirius_physical_hash_join(
     delim_types(std::move(delim_types)),
     _dynamic_filter_plan(std::move(dynamic_filter_plan))
 {
+  // Backstop for the planner's screen: throwing here still lands in plan generation, which falls
+  // back to CPU, rather than aborting the query from execute().
+  if (!is_join_type_supported(join_type)) {
+    throw duckdb::NotImplementedException("sirius_physical_hash_join: unsupported join type: " +
+                                          duckdb::JoinTypeToString(join_type));
+  }
+
   _max_build_hash_table_bytes = max_build_hash_table_bytes;
   _hash_partition_bytes       = hash_partition_bytes;
   _max_broadcast_join_size    = max_broadcast_join_size;
@@ -315,11 +371,23 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   }
   reorder_join_conditions(conditions, route_null_safe);
 
+  // Backstop for the planner's screen; reaching here would silently give the null-safe key
+  // NULL != NULL semantics.
+  if (join_type == duckdb::JoinType::MARK && mark_join_mixes_null_safe_keys(conditions)) {
+    throw duckdb::NotImplementedException(
+      "sirius_physical_hash_join: MARK join mixing a null-safe (IS NOT DISTINCT FROM) key with a "
+      "plain key is not supported");
+  }
+
   // Pure null-safe hash keys use EQUAL; any plain hash key requires UNEQUAL. Routed
-  // null-safe keys get their semantics from NULL_EQUAL instead. MARK remains UNEQUAL
-  // for three-valued IN/EXISTS semantics and does not yet support null-safe keys.
+  // null-safe keys get their semantics from NULL_EQUAL instead.
   compare_nulls_ = cudf::null_equality::UNEQUAL;
-  if (join_type != duckdb::JoinType::MARK) {
+  if (join_type == duckdb::JoinType::MARK) {
+    // All-null-safe MARK takes EQUAL and emits definite marks; any other MARK keeps UNEQUAL and
+    // the three-valued IN/EXISTS reconstruction, which assumes a NULL key never matches.
+    mark_is_null_safe_ = all_keys_null_safe(conditions);
+    if (mark_is_null_safe_) { compare_nulls_ = cudf::null_equality::EQUAL; }
+  } else {
     bool saw_null_safe   = false;
     bool saw_plain_equal = false;
     for (auto const& cond : conditions) {
@@ -1503,11 +1571,11 @@ static void set_build_has_null(std::atomic<int>& atomic_flag, bool has_null)
 /// when the build/right side contains a NULL join key.
 ///
 /// The scattered values are already correct (true at matched rows, false elsewhere), so only a null
-/// mask is added. This is the IN/EXISTS three-valued rule and assumes UNEQUAL matching
-/// (compare_nulls() forces UNEQUAL for MARK joins; a null-safe MARK join such as EXISTS
-/// with IS NOT DISTINCT FROM is a known unsupported case). Because a NULL key never
-/// matches under UNEQUAL, a matched row always has a valid probe key, so the desired
-/// validity reduces to two cases:
+/// mask is added. When @p marks_are_definite (an all-null-safe MARK, matched under EQUAL) no mask
+/// is added at all: a null-safe comparison is never UNKNOWN, so an unmatched row is a definite
+/// FALSE. Otherwise this is the IN/EXISTS three-valued rule under UNEQUAL matching. Because a
+/// NULL key never matches under UNEQUAL, a matched row always has a valid probe key, so the
+/// desired validity reduces to two cases:
 ///   - build_has_null == true : every unmatched row is NULL, so valid == matched. The mask is the
 ///                              mark values themselves (cudf::bools_to_mask).
 ///   - build_has_null == false: valid == probe row validity (all probe key columns valid). The mask
@@ -1523,6 +1591,9 @@ static void set_build_has_null(std::atomic<int>& atomic_flag, bool has_null)
 /// @param probe_keys    Probe/left join key columns (post-cast); their per-row validity drives the
 ///                      NULL mark when the build side has no NULL key.
 /// @param build_has_null  Whether the build/right side contains a NULL in any join key column.
+///                        Ignored when @p marks_are_definite.
+/// @param marks_are_definite  Every key is null-safe, so the output column gets no null mask
+///                            (sirius_physical_hash_join::mark_is_null_safe()).
 /// @param left_batch    The original left-side data batch; used to propagate memory space metadata
 ///                      to the returned operator_data.
 /// @param stream        CUDA stream on which all device operations are launched.
@@ -1532,6 +1603,7 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
   std::vector<cudf::size_type> const& lhs_output_col_idxs,
   cudf::table_view const& probe_keys,
   bool build_has_null,
+  bool marks_are_definite,
   ::cucascade::read_only_data_batch const& left_batch,
   rmm::cuda_stream_view stream,
   const telemetry::batch_telemetry_info& telemetry_info = {})
@@ -1567,6 +1639,16 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
                                    cudf::table_view({mark_column->view()}),
                                    stream);
     mark_column    = std::move(scattered->release()[0]);
+  }
+
+  // Under EQUAL matching every comparison is definite, so the scattered values are the whole
+  // answer -- no null mask, no three-valued logic.
+  if (marks_are_definite) {
+    mark_out_cols.push_back(std::move(mark_column));
+    auto definite_table = std::make_unique<cudf::table>(std::move(mark_out_cols));
+    return std::make_unique<pipelineable_operator_data>(
+      std::vector<std::shared_ptr<::cucascade::data_batch>>{make_data_batch(
+        std::move(definite_table), *left_batch.get_memory_space(), stream, telemetry_info)});
   }
 
   // Apply SQL three-valued logic by attaching a null mask: unmatched rows become NULL when the
@@ -1714,6 +1796,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                         lhs_output_columns.col_idxs,
                                         probe_keys,
                                         _build_has_null.load(std::memory_order_acquire) > 0,
+                                        mark_is_null_safe(),
                                         input_batches[0],
                                         stream,
                                         batch_telemetry());
@@ -1822,6 +1905,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                       lhs_output_columns.col_idxs,
                                       left_eq,
                                       _build_has_null.load(std::memory_order_acquire) > 0,
+                                      mark_is_null_safe(),
                                       input_batches[0],
                                       stream,
                                       batch_telemetry());
@@ -1986,6 +2070,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                         lhs_output_columns.col_idxs,
                                         left_keys,
                                         _build_has_null.load(std::memory_order_acquire) > 0,
+                                        mark_is_null_safe(),
                                         input_batches[0],
                                         stream,
                                         batch_telemetry());
@@ -1998,6 +2083,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                       lhs_output_columns.col_idxs,
                                       left_keys,
                                       _build_has_null.load(std::memory_order_acquire) > 0,
+                                      mark_is_null_safe(),
                                       input_batches[0],
                                       stream,
                                       batch_telemetry());
