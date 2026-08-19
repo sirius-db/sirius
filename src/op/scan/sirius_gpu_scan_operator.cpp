@@ -22,6 +22,7 @@
 #include <helper/numeric_narrowing.hpp>
 #include <log/logging.hpp>
 #include <op/scan/gpu_ingestible.hpp>
+#include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/sirius_gpu_scan_operator.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <op/sirius_physical_operator.hpp>
@@ -168,6 +169,15 @@ sirius_gpu_scan_operator::sirius_gpu_scan_operator(
     _split_connector(std::make_shared<scan_manager::split_connector>()),
     _compressed_materialization_observer(compressed_materialization_observer)
 {
+  // Resolve the scan's dynamic-filter channel once (null for non-parquet
+  // ingestibles): every split gets it stamped so prepare_for_processing can
+  // snapshot membership filters at decode time.
+  if (_ingestible != nullptr) {
+    if (auto const* pq =
+          dynamic_cast<parquet_ingestible_table_info const*>(&_ingestible->table_info())) {
+      _dynamic_filters_channel = pq->sirius_dynamic_filters;
+    }
+  }
   _native_physical_types.reserve(this->types.size());
   for (std::size_t column_idx = 0; column_idx < this->types.size(); ++column_idx) {
     auto const& type  = this->types[column_idx];
@@ -200,6 +210,14 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
   auto next = _split_connector->get_next_split();
   if (!next.has_value()) { return nullptr; }
   if (auto* scan_input = dynamic_cast<scan_operator_input*>(next->get()); scan_input) {
+    // Share the operator's "compaction is unprofitable" latch with the split
+    // BEFORE any reservation estimate runs: one such batch decides the whole
+    // scan (uniform per-batch selectivity), and both the working-set estimator
+    // and prepare_for_processing consult the latch.
+    scan_input->pushdown_selection_unprofitable = _decode_selection_unprofitable;
+    // Membership channel for the decode-time snapshot (join builds publish
+    // during execution — only a snapshot taken at prepare/decode can see them).
+    scan_input->dynamic_filters = _dynamic_filters_channel;
     scan_input->prefetch(io::cache::prefetching_stage::immediate);
   }
   return std::move(*next);
