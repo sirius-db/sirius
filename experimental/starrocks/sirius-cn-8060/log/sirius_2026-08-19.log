@@ -1,0 +1,293 @@
+[2026-08-19 00:36:44.123] [info] [sirius_context.cpp:632] SiriusContext: topology summary — 2 GPU(s), 1 NUMA node(s), host='ip-172-31-22-86'
+[2026-08-19 00:36:44.123] [info] [sirius_context.cpp:637]   GPU 0: NVIDIA RTX PRO 6000 Blackwell Server Edition (numa=0, pci=00000000:32:00.0)
+[2026-08-19 00:36:44.123] [info] [sirius_context.cpp:637]   GPU 1: NVIDIA RTX PRO 6000 Blackwell Server Edition (numa=0, pci=00000000:33:00.0)
+[2026-08-19 00:36:44.546] [info] [telemetry_context.cpp:136] Telemetry context initialized (engine=siriusDB, 2 GPU device group(s))
+[2026-08-19 00:36:44.546] [info] [batch_telemetry.cpp:227] Batch telemetry installed (4 tier resources).
+[2026-08-19 00:36:44.546] [warning] [sirius_context.cpp:667] SiriusContext: disk memory space is not configured; spilling GPU or HOST data to disk is disabled. If queries run out of GPU/HOST memory, downgrades to disk will not be possible.
+[2026-08-19 00:36:44.546] [info] [sirius_context.cpp:679] SiriusContext: 1 host memory space(s) created for 1 NUMA node(s)
+[2026-08-19 00:36:44.548] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 0 -> 1
+[2026-08-19 00:36:44.548] [info] [sirius_context.cpp:739] SiriusContext: P2P enabled 1 -> 0
+[2026-08-19 00:36:44.571] [info] [sirius_context.cpp:788] SiriusContext: cuDF pinned memory resource configured (NUMA-aware, max slab 8192 B, fallback node=0)
+[2026-08-19 00:37:06.347] [info] [sirius_context.cpp:312] QueryBegin: instance=0x7c4145e77ef0 connection=1 query=1 SQL: BEGIN TRANSACTION
+[2026-08-19 00:37:06.348] [info] [sirius_context.cpp:312] QueryBegin: instance=0x7c4145e77ef0 connection=1 query=2 SQL: COMMIT
+[2026-08-19 00:37:06.348] [info] [sirius_context.cpp:503] [window] begin instance=0x7c4145e77ef0 connection=1 window=1 query=2 outcome=-
+[2026-08-19 00:37:06.348] [info] [sirius_context.cpp:239] [host_pool] HOST:0 QueryBegin instance=0x7c4145e77ef0 connection=1 window=1 query=2 allocated=67108864 bytes peak=67108864 bytes free_blocks=448
+[2026-08-19 00:37:06.348] [info] [sirius_context.cpp:254] [gpu_pool] GPU:0 QueryBegin instance=0x7c4145e77ef0 connection=1 window=1 query=2 allocated=0 bytes peak=0 bytes reserved=0 bytes
+[2026-08-19 00:37:06.348] [info] [sirius_context.cpp:254] [gpu_pool] GPU:1 QueryBegin instance=0x7c4145e77ef0 connection=1 window=1 query=2 allocated=0 bytes peak=0 bytes reserved=0 bytes
+[2026-08-19 00:37:06.348] [info] [sirius_context.cpp:372] QueryBegin: sirius_ffi
+[2026-08-19 00:37:06.365] [info] [sirius_engine.cpp:329] Query Plan:
+=== Pipeline Overview ===
+Pipeline #0: GPU_SCAN (id=0) -> PROJECTION (id=1) -> UNGROUPED_AGGREGATE (id=2)
+  Output: -> MERGE_AGGREGATE [port: default, barrier: FULL]
+Pipeline #1: MERGE_AGGREGATE (id=3)
+  Input: <- Pipeline #0 [on: MERGE_AGGREGATE (id=3), port: default, barrier: FULL]
+  Dependencies: Pipeline #0
+  Output: -> STREAMING_SINK [port: default, barrier: FULL]
+Pipeline #2: STREAMING_SINK (id=4)
+  Input: <- Pipeline #1 [on: STREAMING_SINK (id=4), port: default, barrier: FULL]
+  Dependencies: Pipeline #1
+
+=== Query Plan DAG ===
+┌────────────────────────────┐
+│ Pipeline #2                │
+│ STREAMING_SINK (id=4)      │
+│ Input(#1): FULL            │
+└─────────────┬──────────────┘
+              │               
+┌────────────────────────────┐
+│ Pipeline #1                │
+│ MERGE_AGGREGATE (id=3)     │
+│ Input(#0): FULL            │
+└─────────────┬──────────────┘
+              │               
+┌────────────────────────────┐
+│ Pipeline #0                │
+│ UNGROUPED_AGGREGATE (id=2) │
+│ PROJECTION (id=1)          │
+│ GPU_SCAN (id=0)            │
+└────────────────────────────┘
+
+[2026-08-19 00:37:06.365] [info] [sirius_engine.cpp:212] query 1 telemetry_query=01a0177348bd752280758a82f3c05e16
+[2026-08-19 00:37:06.547] [info] [gpu_pipeline_executor.cpp:129] GPU Pipeline Executor: task queue interrupted, stopping manager loop
+[2026-08-19 00:37:06.547] [info] [gpu_pipeline_executor.cpp:129] GPU Pipeline Executor: task queue interrupted, stopping manager loop
+[2026-08-19 00:37:06.547] [info] [sirius_context.cpp:387] QueryEnd
+[2026-08-19 00:37:06.548] [info] [sirius_context.cpp:239] [host_pool] HOST:0 QueryEnd instance=0x7c4145e77ef0 connection=1 window=1 query=2 allocated=71303168 bytes peak=71303168 bytes free_blocks=444
+[2026-08-19 00:37:06.548] [info] [sirius_context.cpp:254] [gpu_pool] GPU:0 QueryEnd instance=0x7c4145e77ef0 connection=1 window=1 query=2 allocated=256 bytes peak=12709646744 bytes reserved=0 bytes
+[2026-08-19 00:37:06.548] [info] [sirius_context.cpp:254] [gpu_pool] GPU:1 QueryEnd instance=0x7c4145e77ef0 connection=1 window=1 query=2 allocated=0 bytes peak=1513764534 bytes reserved=0 bytes
+[2026-08-19 00:37:06.548] [info] [sirius_context.cpp:503] [window] end instance=0x7c4145e77ef0 connection=1 window=1 query=2 outcome=ok
+[2026-08-19 00:37:06.548] [info] [sirius_context.cpp:312] QueryBegin: instance=0x7c4145e77ef0 connection=1 query=3 SQL: BEGIN TRANSACTION
+[2026-08-19 00:37:06.548] [info] [sirius_context.cpp:312] QueryBegin: instance=0x7c4145e77ef0 connection=1 query=4 SQL: CREATE OR REPLACE VIEW main.sirius_stream_3 AS SELECT * FROM sirius_stream_source(3)
+[2026-08-19 00:37:06.548] [info] [sirius_context.cpp:312] QueryBegin: instance=0x7c4145e77ef0 connection=1 query=5 SQL: COMMIT
+[2026-08-19 00:37:06.548] [info] [sirius_context.cpp:503] [window] begin instance=0x7c4145e77ef0 connection=1 window=2 query=5 outcome=-
+[2026-08-19 00:37:06.548] [info] [sirius_context.cpp:239] [host_pool] HOST:0 QueryBegin instance=0x7c4145e77ef0 connection=1 window=2 query=5 allocated=71303168 bytes peak=71303168 bytes free_blocks=444
+[2026-08-19 00:37:06.548] [info] [sirius_context.cpp:254] [gpu_pool] GPU:0 QueryBegin instance=0x7c4145e77ef0 connection=1 window=2 query=5 allocated=256 bytes peak=12709646744 bytes reserved=0 bytes
+[2026-08-19 00:37:06.548] [info] [sirius_context.cpp:254] [gpu_pool] GPU:1 QueryBegin instance=0x7c4145e77ef0 connection=1 window=2 query=5 allocated=0 bytes peak=1513764534 bytes reserved=0 bytes
+[2026-08-19 00:37:06.548] [info] [sirius_context.cpp:372] QueryBegin: sirius_ffi
+[2026-08-19 00:37:06.549] [info] [sirius_engine.cpp:329] Query Plan:
+=== Pipeline Overview ===
+Pipeline #0: STREAMING_SOURCE (id=0) -> UNGROUPED_AGGREGATE (id=1)
+  Output: -> MERGE_AGGREGATE [port: default, barrier: FULL]
+Pipeline #1: MERGE_AGGREGATE (id=2)
+  Input: <- Pipeline #0 [on: MERGE_AGGREGATE (id=2), port: default, barrier: FULL]
+  Dependencies: Pipeline #0
+  Output: -> RESULT_COLLECTOR [port: default, barrier: FULL]
+Pipeline #2: RESULT_COLLECTOR (id=3)
+  Input: <- Pipeline #1 [on: RESULT_COLLECTOR (id=3), port: default, barrier: FULL]
+  Dependencies: Pipeline #1
+
+=== Query Plan DAG ===
+┌────────────────────────────┐
+│ Pipeline #2                │
+│ RESULT_COLLECTOR (id=3)    │
+│ Input(#1): FULL            │
+└─────────────┬──────────────┘
+              │               
+┌────────────────────────────┐
+│ Pipeline #1                │
+│ MERGE_AGGREGATE (id=2)     │
+│ Input(#0): FULL            │
+└─────────────┬──────────────┘
+              │               
+┌────────────────────────────┐
+│ Pipeline #0                │
+│ UNGROUPED_AGGREGATE (id=1) │
+│ STREAMING_SOURCE (id=0)    │
+└────────────────────────────┘
+
+[2026-08-19 00:37:06.549] [info] [sirius_engine.cpp:212] query 2 telemetry_query=01a0177349757d229b0103992b728bab
+[2026-08-19 00:37:06.549] [warning] [sirius_scan_manager.cpp:631] [sirius_scan_manager::prepare_for_query] no GPU scan operators found in query
+[2026-08-19 00:37:06.550] [info] [gpu_pipeline_executor.cpp:129] GPU Pipeline Executor: task queue interrupted, stopping manager loop
+[2026-08-19 00:37:06.550] [info] [gpu_pipeline_executor.cpp:129] GPU Pipeline Executor: task queue interrupted, stopping manager loop
+[2026-08-19 00:37:06.550] [info] [sirius_context.cpp:387] QueryEnd
+[2026-08-19 00:37:06.550] [info] [sirius_context.cpp:239] [host_pool] HOST:0 QueryEnd instance=0x7c4145e77ef0 connection=1 window=2 query=5 allocated=71303168 bytes peak=72351744 bytes free_blocks=444
+[2026-08-19 00:37:06.550] [info] [sirius_context.cpp:254] [gpu_pool] GPU:0 QueryEnd instance=0x7c4145e77ef0 connection=1 window=2 query=5 allocated=0 bytes peak=12709646744 bytes reserved=0 bytes
+[2026-08-19 00:37:06.550] [info] [sirius_context.cpp:254] [gpu_pool] GPU:1 QueryEnd instance=0x7c4145e77ef0 connection=1 window=2 query=5 allocated=0 bytes peak=1513764534 bytes reserved=0 bytes
+[2026-08-19 00:37:06.550] [info] [sirius_context.cpp:503] [window] end instance=0x7c4145e77ef0 connection=1 window=2 query=5 outcome=ok
+[2026-08-19 00:37:58.141] [info] [sirius_context.cpp:312] QueryBegin: instance=0x7c4145e77ef0 connection=1 query=6 SQL: BEGIN TRANSACTION
+[2026-08-19 00:37:58.141] [info] [sirius_context.cpp:312] QueryBegin: instance=0x7c4145e77ef0 connection=1 query=7 SQL: COMMIT
+[2026-08-19 00:37:58.141] [info] [sirius_context.cpp:503] [window] begin instance=0x7c4145e77ef0 connection=1 window=3 query=7 outcome=-
+[2026-08-19 00:37:58.141] [info] [sirius_context.cpp:239] [host_pool] HOST:0 QueryBegin instance=0x7c4145e77ef0 connection=1 window=3 query=7 allocated=71303168 bytes peak=72351744 bytes free_blocks=444
+[2026-08-19 00:37:58.141] [info] [sirius_context.cpp:254] [gpu_pool] GPU:0 QueryBegin instance=0x7c4145e77ef0 connection=1 window=3 query=7 allocated=0 bytes peak=12709646744 bytes reserved=0 bytes
+[2026-08-19 00:37:58.141] [info] [sirius_context.cpp:254] [gpu_pool] GPU:1 QueryBegin instance=0x7c4145e77ef0 connection=1 window=3 query=7 allocated=0 bytes peak=1513764534 bytes reserved=0 bytes
+[2026-08-19 00:37:58.141] [info] [sirius_context.cpp:372] QueryBegin: sirius_ffi
+[2026-08-19 00:37:58.154] [info] [sirius_engine.cpp:329] Query Plan:
+=== Pipeline Overview ===
+Pipeline #0: GPU_SCAN (id=0) -> PROJECTION (id=1) -> HASH_GROUP_BY (id=2)
+  Output: -> PARTITION [port: default, barrier: FULL]
+Pipeline #1: PARTITION (id=3)
+  Input: <- Pipeline #0 [on: PARTITION (id=3), port: default, barrier: FULL]
+  Dependencies: Pipeline #0
+  Output: -> MERGE_GROUP_BY [port: default, barrier: FULL]
+Pipeline #2: MERGE_GROUP_BY (id=4) -> STREAMING_SINK (id=5)
+  Input: <- Pipeline #1 [on: MERGE_GROUP_BY (id=4), port: default, barrier: FULL]
+  Dependencies: Pipeline #1
+
+=== Query Plan DAG ===
+┌────────────────────────┐
+│ Pipeline #2            │
+│ STREAMING_SINK (id=5)  │
+│ MERGE_GROUP_BY (id=4)  │
+│ Input(#1): FULL        │
+└───────────┬────────────┘
+            │             
+┌────────────────────────┐
+│ Pipeline #1            │
+│ PARTITION (id=3)       │
+│ Input(#0): FULL        │
+└───────────┬────────────┘
+            │             
+┌────────────────────────┐
+│ Pipeline #0            │
+│ HASH_GROUP_BY (id=2)   │
+│ PROJECTION (id=1)      │
+│ GPU_SCAN (id=0)        │
+└────────────────────────┘
+
+[2026-08-19 00:37:58.154] [info] [sirius_engine.cpp:212] query 3 telemetry_query=01a01774130a79f1a19d1e59fab9ccae
+[2026-08-19 00:37:58.463] [info] [gpu_pipeline_executor.cpp:129] GPU Pipeline Executor: task queue interrupted, stopping manager loop
+[2026-08-19 00:37:58.463] [info] [gpu_pipeline_executor.cpp:129] GPU Pipeline Executor: task queue interrupted, stopping manager loop
+[2026-08-19 00:37:58.463] [info] [sirius_context.cpp:387] QueryEnd
+[2026-08-19 00:37:58.463] [info] [sirius_context.cpp:239] [host_pool] HOST:0 QueryEnd instance=0x7c4145e77ef0 connection=1 window=3 query=7 allocated=72351744 bytes peak=72351744 bytes free_blocks=443
+[2026-08-19 00:37:58.463] [info] [sirius_context.cpp:254] [gpu_pool] GPU:0 QueryEnd instance=0x7c4145e77ef0 connection=1 window=3 query=7 allocated=1280 bytes peak=12709646744 bytes reserved=0 bytes
+[2026-08-19 00:37:58.463] [info] [sirius_context.cpp:254] [gpu_pool] GPU:1 QueryEnd instance=0x7c4145e77ef0 connection=1 window=3 query=7 allocated=0 bytes peak=1513764534 bytes reserved=0 bytes
+[2026-08-19 00:37:58.463] [info] [sirius_context.cpp:503] [window] end instance=0x7c4145e77ef0 connection=1 window=3 query=7 outcome=ok
+[2026-08-19 00:37:58.463] [info] [sirius_context.cpp:312] QueryBegin: instance=0x7c4145e77ef0 connection=1 query=8 SQL: BEGIN TRANSACTION
+[2026-08-19 00:37:58.463] [info] [sirius_context.cpp:312] QueryBegin: instance=0x7c4145e77ef0 connection=1 query=9 SQL: CREATE OR REPLACE VIEW main.sirius_stream_2 AS SELECT * FROM sirius_stream_source(2)
+[2026-08-19 00:37:58.464] [info] [sirius_context.cpp:312] QueryBegin: instance=0x7c4145e77ef0 connection=1 query=10 SQL: COMMIT
+[2026-08-19 00:37:58.464] [info] [sirius_context.cpp:503] [window] begin instance=0x7c4145e77ef0 connection=1 window=4 query=10 outcome=-
+[2026-08-19 00:37:58.464] [info] [sirius_context.cpp:239] [host_pool] HOST:0 QueryBegin instance=0x7c4145e77ef0 connection=1 window=4 query=10 allocated=72351744 bytes peak=72351744 bytes free_blocks=443
+[2026-08-19 00:37:58.464] [info] [sirius_context.cpp:254] [gpu_pool] GPU:0 QueryBegin instance=0x7c4145e77ef0 connection=1 window=4 query=10 allocated=1280 bytes peak=12709646744 bytes reserved=0 bytes
+[2026-08-19 00:37:58.464] [info] [sirius_context.cpp:254] [gpu_pool] GPU:1 QueryBegin instance=0x7c4145e77ef0 connection=1 window=4 query=10 allocated=0 bytes peak=1513764534 bytes reserved=0 bytes
+[2026-08-19 00:37:58.464] [info] [sirius_context.cpp:372] QueryBegin: sirius_ffi
+[2026-08-19 00:37:58.465] [info] [sirius_engine.cpp:329] Query Plan:
+=== Pipeline Overview ===
+Pipeline #0: STREAMING_SOURCE (id=0) -> HASH_GROUP_BY (id=1)
+  Output: -> PARTITION [port: default, barrier: FULL]
+Pipeline #1: PARTITION (id=2)
+  Input: <- Pipeline #0 [on: PARTITION (id=2), port: default, barrier: FULL]
+  Dependencies: Pipeline #0
+  Output: -> MERGE_GROUP_BY [port: default, barrier: FULL]
+Pipeline #2: MERGE_GROUP_BY (id=3) -> PROJECTION (id=4) -> ORDER_BY (id=5)
+  Input: <- Pipeline #1 [on: MERGE_GROUP_BY (id=3), port: default, barrier: FULL]
+  Dependencies: Pipeline #1
+  Output: -> SORT_SAMPLE [port: default, barrier: PIPELINE]
+Pipeline #3: SORT_SAMPLE (id=6) -> SORT_PARTITION (id=7)
+  Input: <- Pipeline #2 [on: SORT_SAMPLE (id=6), port: default, barrier: PIPELINE]
+  Dependencies: Pipeline #2
+  Output: -> MERGE_SORT [port: default, barrier: FULL]
+Pipeline #4: MERGE_SORT (id=8)
+  Input: <- Pipeline #3 [on: MERGE_SORT (id=8), port: default, barrier: FULL]
+  Dependencies: Pipeline #3
+  Output: -> STREAMING_SINK [port: default, barrier: FULL]
+Pipeline #5: STREAMING_SINK (id=9)
+  Input: <- Pipeline #4 [on: STREAMING_SINK (id=9), port: default, barrier: FULL]
+  Dependencies: Pipeline #4
+
+=== Query Plan DAG ===
+┌─────────────────────────┐
+│ Pipeline #5             │
+│ STREAMING_SINK (id=9)   │
+│ Input(#4): FULL         │
+└────────────┬────────────┘
+             │             
+┌─────────────────────────┐
+│ Pipeline #4             │
+│ MERGE_SORT (id=8)       │
+│ Input(#3): FULL         │
+└────────────┬────────────┘
+             │             
+┌─────────────────────────┐
+│ Pipeline #3             │
+│ SORT_PARTITION (id=7)   │
+│ SORT_SAMPLE (id=6)      │
+│ Input(#2): PIPELINE     │
+└────────────┬────────────┘
+             │             
+┌─────────────────────────┐
+│ Pipeline #2             │
+│ ORDER_BY (id=5)         │
+│ PROJECTION (id=4)       │
+│ MERGE_GROUP_BY (id=3)   │
+│ Input(#1): FULL         │
+└────────────┬────────────┘
+             │             
+┌─────────────────────────┐
+│ Pipeline #1             │
+│ PARTITION (id=2)        │
+│ Input(#0): FULL         │
+└────────────┬────────────┘
+             │             
+┌─────────────────────────┐
+│ Pipeline #0             │
+│ HASH_GROUP_BY (id=1)    │
+│ STREAMING_SOURCE (id=0) │
+└─────────────────────────┘
+
+[2026-08-19 00:37:58.465] [info] [sirius_engine.cpp:212] query 4 telemetry_query=01a0177414417642a8b7b68572635fcd
+[2026-08-19 00:37:58.465] [warning] [sirius_scan_manager.cpp:631] [sirius_scan_manager::prepare_for_query] no GPU scan operators found in query
+[2026-08-19 00:37:58.481] [info] [gpu_pipeline_executor.cpp:129] GPU Pipeline Executor: task queue interrupted, stopping manager loop
+[2026-08-19 00:37:58.481] [info] [gpu_pipeline_executor.cpp:129] GPU Pipeline Executor: task queue interrupted, stopping manager loop
+[2026-08-19 00:37:58.481] [info] [sirius_context.cpp:387] QueryEnd
+[2026-08-19 00:37:58.482] [info] [sirius_context.cpp:239] [host_pool] HOST:0 QueryEnd instance=0x7c4145e77ef0 connection=1 window=4 query=10 allocated=72351744 bytes peak=72351744 bytes free_blocks=443
+[2026-08-19 00:37:58.482] [info] [sirius_context.cpp:254] [gpu_pool] GPU:0 QueryEnd instance=0x7c4145e77ef0 connection=1 window=4 query=10 allocated=1280 bytes peak=12709646744 bytes reserved=0 bytes
+[2026-08-19 00:37:58.482] [info] [sirius_context.cpp:254] [gpu_pool] GPU:1 QueryEnd instance=0x7c4145e77ef0 connection=1 window=4 query=10 allocated=0 bytes peak=1513764534 bytes reserved=0 bytes
+[2026-08-19 00:37:58.482] [info] [sirius_context.cpp:503] [window] end instance=0x7c4145e77ef0 connection=1 window=4 query=10 outcome=ok
+[2026-08-19 00:37:58.482] [info] [sirius_context.cpp:312] QueryBegin: instance=0x7c4145e77ef0 connection=1 query=11 SQL: BEGIN TRANSACTION
+[2026-08-19 00:37:58.482] [info] [sirius_context.cpp:312] QueryBegin: instance=0x7c4145e77ef0 connection=1 query=12 SQL: CREATE OR REPLACE VIEW main.sirius_stream_5 AS SELECT * FROM sirius_stream_source(5)
+[2026-08-19 00:37:58.482] [info] [sirius_context.cpp:312] QueryBegin: instance=0x7c4145e77ef0 connection=1 query=13 SQL: COMMIT
+[2026-08-19 00:37:58.482] [info] [sirius_context.cpp:503] [window] begin instance=0x7c4145e77ef0 connection=1 window=5 query=13 outcome=-
+[2026-08-19 00:37:58.482] [info] [sirius_context.cpp:239] [host_pool] HOST:0 QueryBegin instance=0x7c4145e77ef0 connection=1 window=5 query=13 allocated=72351744 bytes peak=72351744 bytes free_blocks=443
+[2026-08-19 00:37:58.482] [info] [sirius_context.cpp:254] [gpu_pool] GPU:0 QueryBegin instance=0x7c4145e77ef0 connection=1 window=5 query=13 allocated=1280 bytes peak=12709646744 bytes reserved=0 bytes
+[2026-08-19 00:37:58.482] [info] [sirius_context.cpp:254] [gpu_pool] GPU:1 QueryBegin instance=0x7c4145e77ef0 connection=1 window=5 query=13 allocated=0 bytes peak=1513764534 bytes reserved=0 bytes
+[2026-08-19 00:37:58.482] [info] [sirius_context.cpp:372] QueryBegin: sirius_ffi
+[2026-08-19 00:37:58.483] [info] [sirius_engine.cpp:329] Query Plan:
+=== Pipeline Overview ===
+Pipeline #0: STREAMING_SOURCE (id=0) -> ORDER_BY (id=1)
+  Output: -> SORT_SAMPLE [port: default, barrier: PIPELINE]
+Pipeline #1: SORT_SAMPLE (id=2) -> SORT_PARTITION (id=3)
+  Input: <- Pipeline #0 [on: SORT_SAMPLE (id=2), port: default, barrier: PIPELINE]
+  Dependencies: Pipeline #0
+  Output: -> MERGE_SORT [port: default, barrier: FULL]
+Pipeline #2: MERGE_SORT (id=4)
+  Input: <- Pipeline #1 [on: MERGE_SORT (id=4), port: default, barrier: FULL]
+  Dependencies: Pipeline #1
+  Output: -> RESULT_COLLECTOR [port: default, barrier: FULL]
+Pipeline #3: RESULT_COLLECTOR (id=5)
+  Input: <- Pipeline #2 [on: RESULT_COLLECTOR (id=5), port: default, barrier: FULL]
+  Dependencies: Pipeline #2
+
+=== Query Plan DAG ===
+┌─────────────────────────┐
+│ Pipeline #3             │
+│ RESULT_COLLECTOR (id=5) │
+│ Input(#2): FULL         │
+└────────────┬────────────┘
+             │             
+┌─────────────────────────┐
+│ Pipeline #2             │
+│ MERGE_SORT (id=4)       │
+│ Input(#1): FULL         │
+└────────────┬────────────┘
+             │             
+┌─────────────────────────┐
+│ Pipeline #1             │
+│ SORT_PARTITION (id=3)   │
+│ SORT_SAMPLE (id=2)      │
+│ Input(#0): PIPELINE     │
+└────────────┬────────────┘
+             │             
+┌─────────────────────────┐
+│ Pipeline #0             │
+│ ORDER_BY (id=1)         │
+│ STREAMING_SOURCE (id=0) │
+└─────────────────────────┘
+
+[2026-08-19 00:37:58.483] [info] [sirius_engine.cpp:212] query 5 telemetry_query=01a0177414537bf181b147961da609d1
+[2026-08-19 00:37:58.483] [warning] [sirius_scan_manager.cpp:631] [sirius_scan_manager::prepare_for_query] no GPU scan operators found in query
+[2026-08-19 00:37:58.483] [info] [gpu_pipeline_executor.cpp:129] GPU Pipeline Executor: task queue interrupted, stopping manager loop
+[2026-08-19 00:37:58.483] [info] [gpu_pipeline_executor.cpp:129] GPU Pipeline Executor: task queue interrupted, stopping manager loop
+[2026-08-19 00:37:58.484] [info] [sirius_context.cpp:387] QueryEnd
+[2026-08-19 00:37:58.484] [info] [sirius_context.cpp:239] [host_pool] HOST:0 QueryEnd instance=0x7c4145e77ef0 connection=1 window=5 query=13 allocated=72351744 bytes peak=73400320 bytes free_blocks=443
+[2026-08-19 00:37:58.484] [info] [sirius_context.cpp:254] [gpu_pool] GPU:0 QueryEnd instance=0x7c4145e77ef0 connection=1 window=5 query=13 allocated=0 bytes peak=12709646744 bytes reserved=0 bytes
+[2026-08-19 00:37:58.484] [info] [sirius_context.cpp:254] [gpu_pool] GPU:1 QueryEnd instance=0x7c4145e77ef0 connection=1 window=5 query=13 allocated=0 bytes peak=1513764534 bytes reserved=0 bytes
+[2026-08-19 00:37:58.484] [info] [sirius_context.cpp:503] [window] end instance=0x7c4145e77ef0 connection=1 window=5 query=13 outcome=ok
