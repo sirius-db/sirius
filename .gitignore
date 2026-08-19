@@ -19,6 +19,7 @@ cmake_install.cmake
 dbgen/
 test_datasets/tpch-dbgen/
 test_datasets/tpch-mod-dbgen/
+test_datasets/tpchgen-rs/
 test_datasets/hits_0.parquet
 .codex/
 runs/

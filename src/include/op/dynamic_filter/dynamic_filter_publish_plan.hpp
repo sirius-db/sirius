@@ -69,15 +69,26 @@ enum class dynamic_filter_route_class : std::uint8_t {
 /**
  * @brief Publication policy transported from configuration
  *
- * Validated by `config::valid_domain_coverage_threshold` before planning and stored here without
- * revalidation. The coverage gate arms only for unique keys with DuckDB-native cardinality
- * evidence.
+ * Validated at the configuration surfaces before planning and stored here without revalidation.
+ * The coverage gate arms only for unique keys with DuckDB-native cardinality evidence.
  */
 struct dynamic_filter_publication_policy {
+  /// Default coverage fraction at or above which publication skips a key
+  static constexpr double k_default_domain_coverage_threshold = 0.9;
+  /// Default bound on the exact hash IN-list's estimated set size as a fraction of the smallest
+  /// probe-GPU L2 cache; see operator_params::dynamic_filter_inlist_max_l2_fraction for the full
+  /// semantics
+  static constexpr double k_default_inlist_max_l2_fraction = 0.125;
+
   /// Whether publication constructs zone-map filters alongside membership filters
   bool emit_zone_map_filters = false;
   /// Coverage fraction at or above which publication skips a key
-  double domain_coverage_threshold = 0.9;
+  double domain_coverage_threshold = k_default_domain_coverage_threshold;
+  /// Estimated-set-bytes bound for the exact hash IN-list, as a fraction of the smallest
+  /// probe-GPU L2 cache; larger sets publish the Bloom filter instead. No domain validation
+  /// here: both configuration surfaces enforce [0, 1], and tests may legitimately construct
+  /// out-of-domain plans.
+  double inlist_max_l2_fraction = k_default_inlist_max_l2_fraction;
 };
 
 /**
@@ -215,9 +226,6 @@ class dynamic_filter_publish_plan final {
     std::vector<key_binding> key_bindings;
   };
 
-  static constexpr double k_default_domain_coverage_threshold =
-    0.9;  ///< Default coverage fraction at or above which publication skips a key
-
   /**
    * @brief Construct the disabled plan
    *
@@ -299,6 +307,13 @@ class dynamic_filter_publish_plan final {
   [[nodiscard]] double domain_coverage_threshold() const noexcept
   {
     return _policy.domain_coverage_threshold;
+  }
+  /**
+   * @brief Estimated-set-bytes bound for the exact hash IN-list, as a fraction of probe-GPU L2
+   */
+  [[nodiscard]] double inlist_max_l2_fraction() const noexcept
+  {
+    return _policy.inlist_max_l2_fraction;
   }
 
   /**

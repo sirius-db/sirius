@@ -15,11 +15,15 @@
  */
 
 #include "catch.hpp"
+#include "cudf/cudf_utils.hpp"
 #include "helper/numeric_narrowing.hpp"
+#include "helper/type_conversions.hpp"
 #include "pin_table.hpp"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/unary.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
@@ -83,6 +87,45 @@ std::unique_ptr<cudf::column> make_test_column(cudf::data_type type,
     throw std::runtime_error("failed to populate numeric narrowing test column");
   }
   return column;
+}
+
+/// Read @p column back as @p T, which for a temporal carrier is its device storage type.
+template <typename T>
+std::vector<T> copy_values_to_host(cudf::column_view const& column)
+{
+  std::vector<T> values(static_cast<std::size_t>(column.size()));
+  cudf::get_default_stream().synchronize();
+  if (!values.empty() && cudaMemcpy(values.data(),
+                                    column.data<T>(),
+                                    values.size() * sizeof(T),
+                                    cudaMemcpyDeviceToHost) != cudaSuccess) {
+    throw std::runtime_error("failed to read numeric narrowing test column");
+  }
+  return values;
+}
+
+std::vector<bool> copy_valids_to_host(cudf::column_view const& column)
+{
+  std::vector<bool> valids(static_cast<std::size_t>(column.size()), true);
+  if (!column.nullable() || column.null_count() == 0) { return valids; }
+
+  auto const words = cudf::num_bitmask_words(column.offset() + column.size());
+  std::vector<cudf::bitmask_type> mask(static_cast<std::size_t>(words));
+  cudf::get_default_stream().synchronize();
+  if (cudaMemcpy(mask.data(),
+                 column.null_mask(),
+                 mask.size() * sizeof(cudf::bitmask_type),
+                 cudaMemcpyDeviceToHost) != cudaSuccess) {
+    throw std::runtime_error("failed to read numeric narrowing test validity");
+  }
+
+  constexpr auto bits_per_word = sizeof(cudf::bitmask_type) * 8;
+  for (cudf::size_type row = 0; row < column.size(); ++row) {
+    auto const bit = static_cast<std::size_t>(column.offset() + row);
+    valids[static_cast<std::size_t>(row)] =
+      ((mask[bit / bits_per_word] >> (bit % bits_per_word)) & 1U) != 0U;
+  }
+  return valids;
 }
 
 }  // namespace
@@ -280,7 +323,7 @@ TEST_CASE("numeric narrowing rejects incompatible or malformed requests", "[nume
                                                       decimal_range(-100, 100, 3)));
   }
 
-  SECTION("excluded and already-minimal logical types never narrow")
+  SECTION("excluded, sub-day temporal, and already-minimal logical types never narrow")
   {
     for (auto const id : {type_id::TINYINT,
                           type_id::UTINYINT,
@@ -289,8 +332,10 @@ TEST_CASE("numeric narrowing rejects incompatible or malformed requests", "[nume
                           type_id::FLOAT,
                           type_id::DOUBLE,
                           type_id::BOOLEAN,
-                          type_id::DATE,
-                          type_id::TIMESTAMP}) {
+                          type_id::TIMESTAMP_SEC,
+                          type_id::TIMESTAMP_MS,
+                          type_id::TIMESTAMP,
+                          type_id::TIMESTAMP_NS}) {
       auto const logical = logical_type::make(id);
       REQUIRE_FALSE(sirius::is_narrowable_numeric_type(logical));
       REQUIRE_FALSE(sirius::choose_narrow_physical_type(logical, signed_integer_range(0, 1)));
@@ -362,6 +407,311 @@ TEST_CASE("decimal narrowing eligibility follows cuDF carrier boundaries", "[num
   }
   for (auto const precision : {uint8_t{10}, uint8_t{18}, uint8_t{19}, uint8_t{38}}) {
     REQUIRE(sirius::is_narrowable_numeric_type(sirius::logical_type::make_decimal(precision, 2)));
+  }
+}
+
+TEST_CASE("numeric narrowing admits DATE through its int32 representation", "[numeric_narrowing]")
+{
+  using sirius::logical_type;
+  using sirius::signed_integer_range;
+  using sirius::type_id;
+
+  auto const date  = cudf::data_type{cudf::type_id::TIMESTAMP_DAYS};
+  auto const int8  = cudf::data_type{cudf::type_id::INT8};
+  auto const int16 = cudf::data_type{cudf::type_id::INT16};
+  auto const int32 = cudf::data_type{cudf::type_id::INT32};
+
+  SECTION("narrowing_rep_type maps only TIMESTAMP_DAYS")
+  {
+    REQUIRE(sirius::narrowing_rep_type(date) == int32);
+    for (auto const id : {cudf::type_id::INT8,
+                          cudf::type_id::INT16,
+                          cudf::type_id::INT32,
+                          cudf::type_id::INT64,
+                          cudf::type_id::UINT8,
+                          cudf::type_id::UINT16,
+                          cudf::type_id::UINT32,
+                          cudf::type_id::UINT64,
+                          cudf::type_id::FLOAT64,
+                          cudf::type_id::BOOL8,
+                          cudf::type_id::TIMESTAMP_SECONDS,
+                          cudf::type_id::TIMESTAMP_MICROSECONDS,
+                          cudf::type_id::DURATION_DAYS,
+                          cudf::type_id::STRING}) {
+      auto const type = cudf::data_type{id};
+      REQUIRE(sirius::narrowing_rep_type(type) == type);
+    }
+    for (auto const id : {cudf::type_id::DECIMAL32, cudf::type_id::DECIMAL64}) {
+      auto const type = cudf::data_type{id, -2};
+      REQUIRE(sirius::narrowing_rep_type(type) == type);
+    }
+  }
+
+  SECTION("DATE is narrowable and every other temporal type is not")
+  {
+    REQUIRE(sirius::is_narrowable_numeric_type(logical_type::make(type_id::DATE)));
+    for (auto const id : {type_id::TIMESTAMP_SEC,
+                          type_id::TIMESTAMP_MS,
+                          type_id::TIMESTAMP,
+                          type_id::TIMESTAMP_NS}) {
+      REQUIRE_FALSE(sirius::is_narrowable_numeric_type(logical_type::make(id)));
+    }
+  }
+
+  SECTION("DATE picks the narrowest signed carrier that holds its epoch days")
+  {
+    auto const logical = logical_type::make(type_id::DATE);
+    // 1992-01-01 through 1998-12-31, the span every TPC-H date column lives in.
+    require_type(sirius::choose_narrow_physical_type(logical, signed_integer_range(8035, 10591)),
+                 cudf::type_id::INT16);
+    require_type(sirius::choose_narrow_physical_type(logical, signed_integer_range(0, 100)),
+                 cudf::type_id::INT8);
+    require_type(sirius::choose_narrow_physical_type(
+                   logical,
+                   signed_integer_range(std::numeric_limits<std::int16_t>::lowest(),
+                                        std::numeric_limits<std::int16_t>::max())),
+                 cudf::type_id::INT16);
+    // A range needing four bytes has no carrier at all: INT32 is the width DATE already occupies,
+    // so it is never a reduction.
+    REQUIRE_FALSE(sirius::choose_narrow_physical_type(
+      logical,
+      signed_integer_range(std::numeric_limits<std::int16_t>::lowest() - 1LL,
+                           std::numeric_limits<std::int16_t>::max())));
+    REQUIRE_FALSE(
+      sirius::choose_narrow_physical_type(logical, sirius::unsigned_integer_range(0, 1)));
+    REQUIRE_FALSE(sirius::choose_narrow_physical_type(logical, sirius::decimal_range(0, 1, 0)));
+  }
+
+  SECTION("DATE carriers convert as int32 in both directions")
+  {
+    REQUIRE(sirius::can_narrow_to(date, int16));
+    REQUIRE(sirius::can_narrow_to(date, int8));
+    REQUIRE_FALSE(sirius::can_narrow_to(date, int32));
+    REQUIRE(sirius::can_restore_to(int16, date));
+    REQUIRE_FALSE(sirius::can_restore_to(int32, date));
+    REQUIRE_FALSE(sirius::can_narrow_to(date, cudf::data_type{cudf::type_id::UINT16}));
+    // Only TIMESTAMP_DAYS has a representation; a sub-day carrier is in no family.
+    REQUIRE_FALSE(sirius::can_narrow_to(cudf::data_type{cudf::type_id::TIMESTAMP_SECONDS}, int32));
+
+    // A carrier does not identify the domain it carries: INT16 restores equally to a plain int and
+    // to epoch days, which is why keeping the two apart is the caller's job, not this layer's.
+    REQUIRE(sirius::can_restore_to(int16, int32));
+    REQUIRE(sirius::can_restore_to(int16, date));
+
+    // The representation stands in for TIMESTAMP_DAYS only where the other side is a carrier it
+    // could be narrowed to. INT64 is wider than the int32 representation, so it is in no family
+    // with epoch days in either direction and cannot pass a validator whose job is rejecting a
+    // physical type that contradicts the declared one.
+    auto const int64 = cudf::data_type{cudf::type_id::INT64};
+    REQUIRE_FALSE(sirius::can_narrow_to(int64, date));
+    REQUIRE_FALSE(sirius::can_restore_to(date, int64));
+  }
+}
+
+TEST_CASE("narrowing domains keep the narrowable types apart", "[numeric_narrowing]")
+{
+  using sirius::logical_type;
+  using sirius::narrow_domain;
+  using sirius::type_id;
+
+  REQUIRE(sirius::narrow_domain_of(logical_type::make(type_id::SMALLINT)) ==
+          narrow_domain::SIGNED_INTEGER);
+  REQUIRE(sirius::narrow_domain_of(logical_type::make(type_id::BIGINT)) ==
+          narrow_domain::SIGNED_INTEGER);
+  REQUIRE(sirius::narrow_domain_of(logical_type::make(type_id::UBIGINT)) ==
+          narrow_domain::UNSIGNED_INTEGER);
+  REQUIRE(sirius::narrow_domain_of(logical_type::make_decimal(18, 2)) == narrow_domain::DECIMAL);
+  REQUIRE(sirius::narrow_domain_of(logical_type::make(type_id::DATE)) == narrow_domain::DATE);
+
+  // The distinction the shared comparison predicates rely on: epoch days and plain integers share
+  // every signed carrier but never a domain.
+  REQUIRE(sirius::narrow_domain_of(logical_type::make(type_id::DATE)) !=
+          sirius::narrow_domain_of(logical_type::make(type_id::BIGINT)));
+
+  // A type whose bits carry no narrowable numeric meaning has no domain to be compared against,
+  // which is what keeps a newly admitted type from inheriting one by omission.
+  for (auto const id : {type_id::HUGEINT, type_id::DOUBLE, type_id::BOOLEAN, type_id::TIMESTAMP}) {
+    REQUIRE(sirius::narrow_domain_of(logical_type::make(id)) == narrow_domain::NONE);
+  }
+
+  // Having a domain is not the same as being worth narrowing. The already-minimal carriers mean
+  // something narrowable and still have nowhere narrower to go, so they keep their domain while
+  // declining narrowing -- which is what lets a literal of one fold into a wider column's narrow
+  // carrier instead of forcing that column to restore.
+  struct minimal_case {
+    logical_type type;
+    narrow_domain domain;
+  };
+  for (auto const& c :
+       {minimal_case{logical_type::make(type_id::TINYINT), narrow_domain::SIGNED_INTEGER},
+        minimal_case{logical_type::make(type_id::UTINYINT), narrow_domain::UNSIGNED_INTEGER},
+        minimal_case{logical_type::make_decimal(9, 2), narrow_domain::DECIMAL}}) {
+    REQUIRE(sirius::narrow_domain_of(c.type) == c.domain);
+    REQUIRE_FALSE(sirius::is_narrowable_numeric_type(c.type));
+  }
+}
+
+TEST_CASE("narrowing_rep_view aliases the source buffers", "[numeric_narrowing]")
+{
+  auto const date = cudf::data_type{cudf::type_id::TIMESTAMP_DAYS};
+  auto column =
+    make_test_column<std::int32_t>(date, {8035, 9000, 10591, 0}, {true, false, true, true});
+  auto const view = column->view();
+
+  SECTION("a DATE view is retagged in place")
+  {
+    auto const rep = sirius::narrowing_rep_view(view);
+    REQUIRE(rep.type().id() == cudf::type_id::INT32);
+    REQUIRE(rep.head<void>() == view.head<void>());
+    REQUIRE(rep.null_mask() == view.null_mask());
+    REQUIRE(rep.size() == view.size());
+    REQUIRE(rep.null_count() == view.null_count());
+    REQUIRE(rep.offset() == view.offset());
+  }
+
+  SECTION("a sliced DATE view keeps its offset")
+  {
+    auto const sliced = cudf::slice(view, {1, 4}).front();
+    auto const rep    = sirius::narrowing_rep_view(sliced);
+    REQUIRE(rep.type().id() == cudf::type_id::INT32);
+    REQUIRE(rep.size() == 3);
+    REQUIRE(rep.offset() == sliced.offset());
+    REQUIRE(rep.head<void>() == sliced.head<void>());
+    REQUIRE(rep.data<std::int32_t>() == sliced.data<std::int32_t>());
+  }
+
+  SECTION("carriers that are already their own representation are returned unchanged")
+  {
+    auto integers = make_test_column<std::int32_t>(cudf::data_type{cudf::type_id::INT32}, {-5, 7});
+    auto const integer_rep = sirius::narrowing_rep_view(integers->view());
+    REQUIRE(integer_rep.type() == integers->type());
+    REQUIRE(integer_rep.head<void>() == integers->view().head<void>());
+
+    auto decimals =
+      make_test_column<std::int32_t>(cudf::data_type{cudf::type_id::DECIMAL32, -2}, {-5, 7});
+    auto const decimal_rep = sirius::narrowing_rep_view(decimals->view());
+    REQUIRE(decimal_rep.type() == decimals->type());
+    REQUIRE(decimal_rep.head<void>() == decimals->view().head<void>());
+  }
+}
+
+TEST_CASE("cast_through_rep converts carriers cuDF refuses and defers every other cast",
+          "[numeric_narrowing]")
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+
+  auto const date  = cudf::data_type{cudf::type_id::TIMESTAMP_DAYS};
+  auto const int16 = cudf::data_type{cudf::type_id::INT16};
+
+  SECTION("cuDF refuses the direct temporal conversion")
+  {
+    auto days     = make_test_column<std::int32_t>(date, {8035, 10591});
+    auto narrowed = make_test_column<std::int16_t>(int16, {8035, 10591});
+    REQUIRE_THROWS(cudf::cast(days->view(), int16, stream, mr));
+    REQUIRE_THROWS(cudf::cast(narrowed->view(), date, stream, mr));
+  }
+
+  SECTION("DATE narrows to INT16 preserving values and nulls")
+  {
+    auto column =
+      make_test_column<std::int32_t>(date, {8035, -1, 10591, 0}, {true, false, true, true});
+    auto result = sirius::cast_through_rep(column->view(), int16, stream, mr);
+    REQUIRE(result->type() == int16);
+    REQUIRE(result->size() == 4);
+    REQUIRE(result->null_count() == 1);
+    REQUIRE(copy_values_to_host<std::int16_t>(result->view()) ==
+            std::vector<std::int16_t>{8035, -1, 10591, 0});
+    REQUIRE(copy_valids_to_host(result->view()) == std::vector<bool>{true, false, true, true});
+  }
+
+  SECTION("INT16 restores to DATE preserving values and nulls")
+  {
+    auto column =
+      make_test_column<std::int16_t>(int16, {8035, -1, 10591, 0}, {true, false, true, true});
+    auto result = sirius::cast_through_rep(column->view(), date, stream, mr);
+    REQUIRE(result->type() == date);
+    REQUIRE(result->size() == 4);
+    REQUIRE(result->null_count() == 1);
+    REQUIRE(copy_values_to_host<std::int32_t>(result->view()) ==
+            std::vector<std::int32_t>{8035, -1, 10591, 0});
+    REQUIRE(copy_valids_to_host(result->view()) == std::vector<bool>{true, false, true, true});
+  }
+
+  SECTION("an all-null DATE column keeps its null count in both directions")
+  {
+    auto column   = make_test_column<std::int32_t>(date, {1, 2}, {false, false});
+    auto narrowed = sirius::cast_through_rep(column->view(), int16, stream, mr);
+    REQUIRE(narrowed->type() == int16);
+    REQUIRE(narrowed->null_count() == 2);
+
+    auto restored = sirius::cast_through_rep(narrowed->view(), date, stream, mr);
+    REQUIRE(restored->type() == date);
+    REQUIRE(restored->null_count() == 2);
+  }
+
+  SECTION("an empty column converts to an empty column of the target")
+  {
+    auto empty    = make_test_column<std::int32_t>(date, std::vector<std::int32_t>{});
+    auto narrowed = sirius::cast_through_rep(empty->view(), int16, stream, mr);
+    REQUIRE(narrowed->type() == int16);
+    REQUIRE(narrowed->size() == 0);
+
+    auto restored = sirius::cast_through_rep(narrowed->view(), date, stream, mr);
+    REQUIRE(restored->type() == date);
+    REQUIRE(restored->size() == 0);
+  }
+
+  SECTION("conversions needing no representation match cudf::cast exactly")
+  {
+    auto integers = make_test_column<std::int64_t>(
+      cudf::data_type{cudf::type_id::INT64}, {-300, 42, 1000}, {true, false, true});
+    auto tunnelled = sirius::cast_through_rep(integers->view(), int16, stream, mr);
+    auto direct    = cudf::cast(integers->view(), int16, stream, mr);
+    REQUIRE(tunnelled->type() == direct->type());
+    REQUIRE(tunnelled->null_count() == direct->null_count());
+    REQUIRE(copy_values_to_host<std::int16_t>(tunnelled->view()) ==
+            copy_values_to_host<std::int16_t>(direct->view()));
+
+    auto const decimal32 = cudf::data_type{cudf::type_id::DECIMAL32, -2};
+    auto decimals        = make_test_column<std::int64_t>(
+      cudf::data_type{cudf::type_id::DECIMAL64, -2}, {-12345, 42}, {true, true});
+    auto tunnelled_decimal = sirius::cast_through_rep(decimals->view(), decimal32, stream, mr);
+    auto direct_decimal    = cudf::cast(decimals->view(), decimal32, stream, mr);
+    REQUIRE(tunnelled_decimal->type() == direct_decimal->type());
+    REQUIRE(copy_values_to_host<std::int32_t>(tunnelled_decimal->view()) ==
+            copy_values_to_host<std::int32_t>(direct_decimal->view()));
+  }
+
+  SECTION("a conversion outside the carrier families keeps cuDF's own semantics")
+  {
+    // DATE<->TIMESTAMP is a real unit conversion cuDF performs directly. Tunnelling it would
+    // reinterpret epoch days as a tick count instead.
+    constexpr std::int64_t micros_per_day = 86'400'000'000;
+    auto const timestamp                  = cudf::data_type{cudf::type_id::TIMESTAMP_MICROSECONDS};
+
+    auto days    = make_test_column<std::int32_t>(date, {8035, 10591});
+    auto widened = sirius::cast_through_rep(days->view(), timestamp, stream, mr);
+    REQUIRE(widened->type() == timestamp);
+    REQUIRE(copy_values_to_host<std::int64_t>(widened->view()) ==
+            std::vector<std::int64_t>{8035 * micros_per_day, 10591 * micros_per_day});
+
+    auto narrowed = sirius::cast_through_rep(widened->view(), date, stream, mr);
+    REQUIRE(narrowed->type() == date);
+    REQUIRE(copy_values_to_host<std::int32_t>(narrowed->view()) ==
+            std::vector<std::int32_t>{8035, 10591});
+
+    auto identity = sirius::cast_through_rep(days->view(), date, stream, mr);
+    REQUIRE(identity->type() == date);
+    REQUIRE(copy_values_to_host<std::int32_t>(identity->view()) ==
+            std::vector<std::int32_t>{8035, 10591});
+
+    // A carrier wider than int32 is never a DATE carrier, so neither direction is a carrier
+    // conversion and cuDF refuses the pair as it refuses any timestamp<->numeric cast.
+    auto const int64 = cudf::data_type{cudf::type_id::INT64};
+    auto wide        = make_test_column<std::int64_t>(int64, {8035, 10591});
+    REQUIRE_THROWS(sirius::cast_through_rep(wide->view(), date, stream, mr));
+    REQUIRE_THROWS(sirius::cast_through_rep(days->view(), int64, stream, mr));
   }
 }
 
@@ -460,4 +810,70 @@ TEST_CASE("exact numeric minmax handles nulls and wide decimals", "[numeric_narr
     REQUIRE(range->minimum == minimum);
     REQUIRE(range->maximum == maximum);
   }
+
+  SECTION("DATE reduces over its int32 representation")
+  {
+    auto const date    = cudf::data_type{cudf::type_id::TIMESTAMP_DAYS};
+    auto const logical = sirius::logical_type::make(sirius::type_id::DATE);
+
+    // cudf::minmax on a TIMESTAMP_DAYS column yields timestamp scalars, which carry no numeric
+    // range: reducing over the representation is the whole reason DATE narrowing ever engages.
+    auto column =
+      make_test_column<int32_t>(date, {8035, -9999, 10591, 9000}, {true, false, true, true});
+    auto range = sirius::compute_exact_numeric_range(column->view(), logical, stream, mr);
+    REQUIRE(range);
+    REQUIRE(range->domain == sirius::numeric_range_domain::SIGNED_INTEGER);
+    REQUIRE(range->minimum == 8035);
+    REQUIRE(range->maximum == 10591);
+
+    auto carrier_range = sirius::compute_exact_numeric_range(column->view(), stream, mr);
+    REQUIRE(carrier_range);
+    REQUIRE(carrier_range->domain == sirius::numeric_range_domain::SIGNED_INTEGER);
+    REQUIRE(carrier_range->minimum == 8035);
+    REQUIRE(carrier_range->maximum == 10591);
+
+    // The logical overload still demands the native carrier, so a DATE declared over raw int32
+    // days has no range.
+    auto integers = make_test_column<int32_t>(cudf::data_type{cudf::type_id::INT32}, {8035, 10591});
+    REQUIRE_FALSE(sirius::compute_exact_numeric_range(integers->view(), logical, stream, mr));
+
+    auto empty = make_test_column<int32_t>(date, std::vector<int32_t>{});
+    REQUIRE_FALSE(sirius::compute_exact_numeric_range(empty->view(), stream, mr));
+    auto all_null = make_test_column<int32_t>(date, {1, 2}, {false, false});
+    REQUIRE_FALSE(sirius::compute_exact_numeric_range(all_null->view(), stream, mr));
+
+    auto seconds =
+      make_test_column<int64_t>(cudf::data_type{cudf::type_id::TIMESTAMP_SECONDS}, {1, 2});
+    REQUIRE_FALSE(sirius::compute_exact_numeric_range(seconds->view(), stream, mr));
+
+    auto const target = sirius::choose_narrow_physical_type(logical, *range);
+    require_type(target, cudf::type_id::INT16);
+    REQUIRE(sirius::can_narrow_to(date, *target));
+    REQUIRE(sirius::can_restore_to(*target, date));
+  }
+}
+
+TEST_CASE("pin-time native type records the declared mapping, not the decoded carrier",
+          "[numeric_narrowing]")
+{
+  // Parquet fixed-length-byte-array decimals with precision <= 18 decode as DECIMAL128, while the
+  // declared DECIMAL(15,2) maps to DECIMAL64 at plan time. Recording the decoded type would make
+  // the scan manager's strict native-identity comparisons fail on every query, permanently
+  // disabling the pin's narrow serving.
+  auto const declared = duckdb::LogicalType::DECIMAL(15, 2);
+  auto const decoded  = cudf::data_type{cudf::type_id::DECIMAL128, -2};
+
+  auto const plan_time_native = sirius::try_get_cudf_type(sirius::from_duckdb(declared));
+  require_decimal_type(plan_time_native, cudf::type_id::DECIMAL64, -2);
+
+  REQUIRE(sirius::pin_native_type(decoded, &declared) == *plan_time_native);
+
+  // A cleared declared vector (zone-map stats and compressed pin both off) is the only case the
+  // pin drivers pass no declared type; only then does the decoded type stand in.
+  REQUIRE(sirius::pin_native_type(decoded, nullptr) == decoded);
+
+  // When declared and decoded already agree the two rules coincide.
+  auto const declared_int = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
+  auto const decoded_int  = cudf::data_type{cudf::type_id::INT32};
+  REQUIRE(sirius::pin_native_type(decoded_int, &declared_int) == decoded_int);
 }

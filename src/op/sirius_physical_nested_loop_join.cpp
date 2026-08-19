@@ -25,6 +25,7 @@
 #include "expression/ast/to_duckdb.hpp"
 #include "expression_evaluator/expression_evaluator.hpp"
 #include "expression_evaluator/gpu_expression_translator_internal.hpp"
+#include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_hash_join.hpp"
@@ -672,7 +673,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
               "is no BOUND_CAST");
           }
           intermediates_scope_holder.push_back(
-            cudf::cast(table.column(source_idx), target_type, stream));
+            sirius::cast_through_rep(table.column(source_idx), target_type, stream));
           col_views.push_back(intermediates_scope_holder.back()->view());
         } else {
           col_views.push_back(table.column(source_idx));

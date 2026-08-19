@@ -19,6 +19,7 @@
 #include <expression_evaluator/ast_supported_types.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <helper/logical_type.hpp>
+#include <helper/numeric_narrowing.hpp>
 #include <sirius/exception.hpp>
 
 // cudf
@@ -58,7 +59,10 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, eva
 
   auto const ast_op_count = alt.cudf_ast_op_count();
 
-  if (ast_supported && _strategy != expression_evaluator_strategy::MATERIALIZE &&
+  // Carrier restores must reach the materialized branch, the only path authorized to use the
+  // physical representation tunnel. Semantic casts may use the cuDF AST path.
+  if (ast_supported && alt.kind == sirius::ast::cast_kind::semantic &&
+      _strategy != expression_evaluator_strategy::MATERIALIZE &&
       (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size)) {
     auto child            = evaluate(*alt.child, evaluation_mode::AST);
     auto const& cast_expr = _ast_tree.emplace<cudf::ast::operation>(
@@ -79,7 +83,12 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, eva
   auto const return_type = sirius::get_cudf_type(alt.target_type);
   auto child             = evaluate(*alt.child, evaluation_mode::MATERIALIZE);
   D_ASSERT(!child.is_scalar());  // CAST should never be called on a scalar
-  auto result_column = cudf::cast(child.get_column_view(), return_type, _stream, _mr);
+  // Only planner-certified carrier restoration may tunnel through the narrowed representation.
+  // A semantic cast delegates to cuDF and is never reinterpreted as a physical DATE restore.
+  auto result_column =
+    alt.kind == sirius::ast::cast_kind::carrier_restore
+      ? sirius::cast_through_rep(child.get_column_view(), return_type, _stream, _mr)
+      : cudf::cast(child.get_column_view(), return_type, _stream, _mr);
   if (mode == evaluation_mode::AST) {
     // The parent is executing in AST mode, so add the materialized result to the AST tree.
     return materialize_as_ast_column(std::move(result_column));

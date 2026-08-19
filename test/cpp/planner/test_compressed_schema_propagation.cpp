@@ -87,8 +87,19 @@ std::unique_ptr<sirius::ast::node> make_reference(uint32_t column_index)
 }
 
 // A restore cast as the passes emit it: an untyped reference under a cast to the native
-// logical type.
+// logical type, tagged with the carrier_restore provenance.
 std::unique_ptr<sirius::ast::node> make_restore_cast(uint32_t column_index)
+{
+  return std::make_unique<sirius::ast::node>(
+    sirius::ast::cast{std::make_unique<sirius::ast::node>(sirius::ast::reference{column_index}),
+                      integer_type(),
+                      /*try_cast=*/false,
+                      sirius::ast::cast_kind::carrier_restore});
+}
+
+// A user-written cast of the same shape as a restore cast, carrying the default semantic
+// provenance.
+std::unique_ptr<sirius::ast::node> make_semantic_cast(uint32_t column_index)
 {
   return std::make_unique<sirius::ast::node>(
     sirius::ast::cast{std::make_unique<sirius::ast::node>(sirius::ast::reference{column_index}),
@@ -707,6 +718,45 @@ TEST_CASE("compressed_schema_propagation - pruning removes only zero-benefit res
     auto const& chain_op = *plan->children[0];
     REQUIRE(chain_op.get_physical_types() == std::vector<cudf::data_type>{k_int8, k_int8});
     REQUIRE(chain_op.children[0]->get_physical_types() == std::vector<cudf::data_type>{k_int8});
+  }
+}
+
+TEST_CASE("compressed_schema_propagation - pruning requires the carrier_restore provenance",
+          "[compressed_schema_propagation][compressed_materialization]")
+{
+  // One projection over a narrowed scan, holding a single cast-over-reference expression whose
+  // shape is identical in both sections; only the provenance tag differs.
+  auto make_projection_over_narrow_scan = [](std::unique_ptr<sirius::ast::node> expression) {
+    auto scan = make_scan(1, {k_int8});
+    duckdb::vector<std::unique_ptr<sirius::ast::node>> select_list;
+    select_list.push_back(std::move(expression));
+    auto projection = duckdb::make_uniq<sirius::op::sirius_physical_projection>(
+      integer_types(1), std::move(select_list), /*estimated_cardinality=*/1);
+    projection->children.push_back(std::move(scan));
+    return projection;
+  };
+
+  SECTION("a tagged restore cast is pruned to a native scan")
+  {
+    duckdb::unique_ptr<sirius_physical_operator> plan =
+      make_projection_over_narrow_scan(make_restore_cast(0));
+    sirius::planner::prune_immediate_scan_restores(plan);
+
+    REQUIRE(plan->type == SiriusPhysicalOperatorType::TABLE_SCAN);
+    REQUIRE(!plan->has_physical_overrides());
+  }
+
+  SECTION("an untagged semantic cast of identical shape is never misidentified as a restore")
+  {
+    duckdb::unique_ptr<sirius_physical_operator> plan =
+      make_projection_over_narrow_scan(make_semantic_cast(0));
+    sirius::planner::prune_immediate_scan_restores(plan);
+
+    REQUIRE(plan->type == SiriusPhysicalOperatorType::PROJECTION);
+    REQUIRE(plan->Cast<sirius::op::sirius_physical_projection>()
+              .select_list[0]
+              ->holds<sirius::ast::cast>());
+    REQUIRE(plan->children[0]->get_physical_types() == std::vector<cudf::data_type>{k_int8});
   }
 }
 

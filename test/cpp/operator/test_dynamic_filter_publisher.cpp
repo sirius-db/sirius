@@ -14,6 +14,32 @@
  * limitations under the License.
  */
 
+/**
+ * @file test_dynamic_filter_publisher.cpp
+ * @brief Pins publish_dynamic_filters' per-key filter construction, fan-out, and plan validation
+ *
+ * Sections, in file order:
+ *  - Tier precedence: the raw small IN-list wins at <= k_max_keys build rows, and one row above
+ *    that gate falls through to the hash IN-list under the default L2 fraction.
+ *  - inlist_max_l2_fraction plumbing: a vanishing fraction demotes the hash IN-list to the Bloom
+ *    filter, 1.0 keeps every L2-fitting set, and the inclusive boundary is bracketed from the
+ *    same estimated_set_bytes / cudaDevAttrL2CacheSize inputs the publisher reads.
+ *  - Type-coverage canary: Bloom support covers every hash-IN-list key type, so the policy's
+ *    "keep a fitting IN-list when the type lacks Bloom support" clause is unreachable through the
+ *    real publisher today.
+ *  - Sparse fan-out and gating: each target receives only its bound keys, the domain-coverage
+ *    gate consults each key's own domain, and unbound keys cost no construction.
+ *  - Runtime guards and degenerate publications: plan/runtime key-mapping inconsistencies,
+ *    per-binding zone-map suppression, membership-only targets, keyless plans, empty builds, and
+ *    drained targets.
+ *  - Plan validation: invalid targets, bindings, and replica placements are rejected at
+ *    construction.
+ *
+ * The fraction semantics themselves (0 always demotes to the Bloom, small-list precedence, the
+ * exact inclusive boundary, and the no-Bloom exception) are pinned GPU-free in
+ * `test_dynamic_filter_source_policy.cpp`.
+ */
+
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "operator_test_utils.hpp"
@@ -169,7 +195,10 @@ std::size_t count_filters_of_kind(
 }
 
 template <typename ExpectedFilter>
-void require_published_membership(std::size_t rows)
+void require_published_membership(
+  std::size_t rows,
+  double inlist_max_l2_fraction =
+    sirius::op::dynamic_filter_publication_policy::k_default_inlist_max_l2_fraction)
 {
   publisher_fixture fixture;
   fixture.add_key_column(rows);
@@ -182,8 +211,10 @@ void require_published_membership(std::size_t rows)
                      .key_bindings             = {{.admitted_key_index   = 0,
                                                    .channel_push_ordinal = kProbeColumnIndex,
                                                    .probe_storage_type   = kInt64}}});
-  dynamic_filter_publish_plan plan{
-    {make_int64_key(0, 0)}, std::move(targets), std::move(fixture.replica_spaces)};
+  dynamic_filter_publish_plan plan{{make_int64_key(0, 0)},
+                                   std::move(targets),
+                                   std::move(fixture.replica_spaces),
+                                   {.inlist_max_l2_fraction = inlist_max_l2_fraction}};
 
   auto const& keys = *fixture.columns.front();
   if constexpr (std::is_same_v<ExpectedFilter, sirius::op::sirius_dynamic_small_in_list_filter>) {
@@ -205,7 +236,9 @@ void require_published_membership(std::size_t rows)
   auto const* selected = dynamic_cast<ExpectedFilter const*>(snapshot.front().get());
   REQUIRE(selected != nullptr);
   REQUIRE(selected->is_available_on_device(kDeviceId));
-  REQUIRE(selected->size() == rows);
+  if constexpr (requires(ExpectedFilter const& f) { f.size(); }) {
+    REQUIRE(selected->size() == rows);
+  }
   REQUIRE(selected->replica_count() == 1);
   if constexpr (std::is_same_v<ExpectedFilter, sirius::op::sirius_dynamic_in_list_filter>) {
     REQUIRE(selected->has_persistent_set());
@@ -305,6 +338,56 @@ TEST_CASE("dynamic-filter publisher falls through to the hash IN-list above the 
 {
   require_published_membership<sirius::op::sirius_dynamic_in_list_filter>(
     sirius::op::sirius_dynamic_small_in_list_filter::k_max_keys + 1);
+}
+
+TEST_CASE("dynamic-filter publisher demotes the hash IN-list to Bloom above the L2 fraction",
+          "[dynamic_filter][publisher]")
+{
+  // A vanishing fraction makes the residency threshold (fraction x L2) smaller than any real
+  // hash set, so the smallest hash-tier build must demote to the Bloom; this pins the
+  // plan-to-publisher plumbing of inlist_max_l2_fraction end to end.
+  require_published_membership<sirius::op::sirius_dynamic_bloom_filter>(
+    sirius::op::sirius_dynamic_small_in_list_filter::k_max_keys + 1, 1e-12);
+}
+
+TEST_CASE("dynamic-filter publisher fraction 1.0 reproduces the legacy L2-fit rule",
+          "[dynamic_filter][publisher]")
+{
+  // fraction = 1.0 -> threshold = the full L2, so every L2-fitting set keeps the exact IN-list.
+  require_published_membership<sirius::op::sirius_dynamic_in_list_filter>(
+    sirius::op::sirius_dynamic_small_in_list_filter::k_max_keys + 1, 1.0);
+}
+
+TEST_CASE("dynamic-filter publisher L2-fraction boundary is inclusive",
+          "[dynamic_filter][publisher]")
+{
+  // The exact set_bytes <= fraction x l2_bytes boundary arithmetic is pinned GPU-free in
+  // test_dynamic_filter_source_policy.cpp; this bracket pins that the publisher feeds the choice
+  // the same estimated_set_bytes and min-cudaDevAttrL2CacheSize values this test computes. The
+  // +/-1e-9 margin absorbs double rounding while staying under one byte of threshold on any
+  // real L2.
+  auto const rows      = sirius::op::sirius_dynamic_small_in_list_filter::k_max_keys + 1;
+  auto const set_bytes = sirius::op::sirius_dynamic_in_list_filter::estimated_set_bytes(
+    rows, cudf::data_type{cudf::type_id::INT64});
+  int l2_bytes = 0;
+  REQUIRE(cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, kDeviceId) == cudaSuccess);
+  REQUIRE(l2_bytes > 0);
+  double const ratio = static_cast<double>(set_bytes) / static_cast<double>(l2_bytes);
+  require_published_membership<sirius::op::sirius_dynamic_in_list_filter>(rows, ratio * (1 + 1e-9));
+  require_published_membership<sirius::op::sirius_dynamic_bloom_filter>(rows, ratio * (1 - 1e-9));
+}
+
+TEST_CASE("dynamic-filter Bloom support covers every hash-IN-list key type",
+          "[dynamic_filter][publisher]")
+{
+  // choose_membership_filter keeps an L2-fitting hash IN-list at any fraction when the key type
+  // has no Bloom fallback; that clause is pinned GPU-free in test_dynamic_filter_source_policy.cpp.
+  // This canary documents that the clause remains unreachable through the real publisher because
+  // the hash-IN-list and Bloom supported-type sets are identical (INT32/INT64). If either REQUIRE
+  // ever fails (the type sets diverge), add a publish-path test asserting the divergent type keeps
+  // the fitting IN-list at fraction 0.
+  REQUIRE(sirius::op::sirius_dynamic_bloom_filter::supports(cudf::data_type{cudf::type_id::INT32}));
+  REQUIRE(sirius::op::sirius_dynamic_bloom_filter::supports(cudf::data_type{cudf::type_id::INT64}));
 }
 
 TEST_CASE("dynamic-filter publisher fans out sparsely: each target receives only its bound keys",

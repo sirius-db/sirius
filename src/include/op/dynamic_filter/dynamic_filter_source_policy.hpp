@@ -35,8 +35,10 @@ namespace sirius::op {
 enum class membership_filter_kind : std::uint8_t {
   none,           ///< No eligible membership representation
   small_in_list,  ///< Exact list scanned linearly; no hash build
-  hash_in_list,   ///< Exact hash set, chosen when it fits the smallest probe GPU's L2 cache
-  bloom           ///< Probabilistic fallback for sets too large to fit L2
+  hash_in_list,   ///< Exact hash set; kept only while it stays within the policy's residency
+                  ///< fraction of the smallest probe GPU's L2 (or merely fits L2 when the key type
+                  ///< has no Bloom fallback)
+  bloom           ///< Probabilistic fallback for sets past the hash IN-list's residency bound
 };
 
 /**
@@ -48,13 +50,31 @@ struct membership_choice_inputs {
   std::size_t build_rows               = 0;
   std::size_t l2_cache_bytes           = 0;  ///< 0 when unknown; hash IN-list is then ineligible
   std::size_t estimated_hash_set_bytes = 0;
-  bool supports_small_in_list          = false;
-  bool supports_hash_in_list           = false;
-  bool supports_bloom                  = false;
+  /// Bound on the exact hash set as a fraction of `l2_cache_bytes`. Not validated here: both
+  /// configuration surfaces enforce [0, 1], and tests may construct out-of-domain inputs.
+  /// Zero-init deliberately demotes the hash tier wherever a Bloom exists; callers pass the
+  /// plan's policy value.
+  double inlist_max_l2_fraction = 0.0;
+  bool supports_small_in_list   = false;
+  bool supports_hash_in_list    = false;
+  bool supports_bloom           = false;
 };
 
 /**
  * @brief Choose a key's membership representation
+ *
+ * The small IN-list wins unconditionally; the exact hash IN-list is kept only while its
+ * estimated set both fits the smallest probe GPU's L2 and stays within
+ * `inlist_max_l2_fraction` of it (both comparisons inclusive); otherwise the Bloom filter when
+ * supported.
+ *
+ * The fraction bounds residency, not capacity: competing with the streaming probe traffic, the
+ * set stops being cache-resident well before it reaches L2 capacity (measured, its probe cost
+ * is flat below the bound and degrades steadily beyond), while the smaller-but-inexact Bloom
+ * probes >= 2.2x faster at every hash-set size -- so the exact filter is kept only where
+ * exactness costs the least. A key type with no Bloom fallback keeps any L2-fitting IN-list
+ * regardless of the fraction. An unknown L2 size (0) makes the hash IN-list ineligible outright,
+ * before the fraction is consulted.
  *
  * @return The representation to construct, or `membership_filter_kind::none`
  */
@@ -62,8 +82,12 @@ struct membership_choice_inputs {
   membership_choice_inputs const& inputs) noexcept
 {
   if (inputs.supports_small_in_list) { return membership_filter_kind::small_in_list; }
-  if (inputs.supports_hash_in_list && inputs.l2_cache_bytes > 0 &&
-      inputs.estimated_hash_set_bytes <= inputs.l2_cache_bytes) {
+  bool const hash_set_fits_l2 = inputs.supports_hash_in_list && inputs.l2_cache_bytes > 0 &&
+                                inputs.estimated_hash_set_bytes <= inputs.l2_cache_bytes;
+  if (hash_set_fits_l2 &&
+      (!inputs.supports_bloom ||
+       static_cast<double>(inputs.estimated_hash_set_bytes) <=
+         inputs.inlist_max_l2_fraction * static_cast<double>(inputs.l2_cache_bytes))) {
     return membership_filter_kind::hash_in_list;
   }
   if (inputs.supports_bloom) { return membership_filter_kind::bloom; }

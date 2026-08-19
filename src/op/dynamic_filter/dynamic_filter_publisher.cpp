@@ -208,6 +208,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
       {.build_rows               = build_rows,
        .l2_cache_bytes           = l2_bytes,
        .estimated_hash_set_bytes = set_bytes,
+       .inlist_max_l2_fraction   = plan.inlist_max_l2_fraction(),
        .supports_small_in_list   = sirius::op::sirius_dynamic_small_in_list_filter::supports(col),
        .supports_hash_in_list    = sirius::op::sirius_dynamic_in_list_filter::supports(col),
        .supports_bloom           = sirius::op::sirius_dynamic_bloom_filter::supports(col.type())});
@@ -242,13 +243,14 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
     if (per_key_zone_map[admitted_key_index]) { ++outcome.zone_map_filters_built; }
     SIRIUS_LOG_DEBUG(
       "[sirius_physical_hash_join] dynamic filter key {}: build_rows={} zone_map={} membership: "
-      "in_list_set={}B bloom={}B L2={}B -> {}",
+      "in_list_set={}B bloom={}B L2={}B inlist_max_l2_fraction={} -> {}",
       admitted_key_index,
       build_rows,
       per_key_zone_map[admitted_key_index] ? "yes" : "no",
       set_bytes,
       bloom_bytes,
       l2_bytes,
+      plan.inlist_max_l2_fraction(),
       choice);
   }
 
