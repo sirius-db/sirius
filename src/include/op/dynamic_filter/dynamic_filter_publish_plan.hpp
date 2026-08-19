@@ -92,11 +92,12 @@ struct dynamic_filter_publication_policy {
 };
 
 /**
- * @brief Immutable publication plan for one `sirius_physical_hash_join`
+ * @brief Publication plan for one `sirius_physical_hash_join`, immutable once execution begins
  *
  * `sirius_plan_comparison_join` builds a dense array of admitted keys, sparse bindings from each
- * target to that array, publication policy, and device-replica placements. The plan is consumed by
- * `publish_dynamic_filters()`.
+ * target to that array, publication policy, and device-replica placements. The one permitted
+ * mutation is `restrict_replicas_to()`, called by the pipeline converter before execution and
+ * possibly disabling the plan. The plan is consumed by `publish_dynamic_filters()`.
  */
 class dynamic_filter_publish_plan final {
  public:
