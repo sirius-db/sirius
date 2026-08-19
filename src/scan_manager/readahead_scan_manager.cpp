@@ -59,7 +59,10 @@ void readahead_scan_manager::on_task_deployed(query_id_t,
   _cv.notify_one();
 }
 
-void readahead_scan_manager::on_memory_downgrade(query_id_t, int, std::size_t) noexcept
+void readahead_scan_manager::on_memory_downgrade_for_task(query_id_t,
+                                                          std::size_t,
+                                                          int,
+                                                          std::size_t) noexcept
 {
   if (_strategy != prefetch_strategy::opportunistic) { return; }
   {

@@ -100,13 +100,15 @@ class query_stage_listener {
   /// queue.
   virtual void on_executor_awaiting_task(int gpu_id) noexcept {}
 
-  /// An executor could not reserve the memory a task needs on @p gpu_id and is
-  /// spilling to free @p shortfall_bytes before it can run.  The task is parked
-  /// for as long as that takes, so the GPU is about to do no work at all --
-  /// which makes it the one moment the device's IO path is unambiguously free.
-  virtual void on_memory_downgrade(query_id_t query_id,
-                                   int gpu_id,
-                                   std::size_t shortfall_bytes) noexcept
+  /// An executor could not reserve the memory the task from @p operator_id
+  /// needs on @p gpu_id, and is spilling to free @p shortfall_bytes before it
+  /// can run.  That task is parked for as long as that takes, so the GPU is
+  /// about to do no work at all -- which makes it the one moment the device's
+  /// IO path is unambiguously free.
+  virtual void on_memory_downgrade_for_task(query_id_t query_id,
+                                            std::size_t operator_id,
+                                            int gpu_id,
+                                            std::size_t shortfall_bytes) noexcept
   {
   }
 };
@@ -227,13 +229,14 @@ class query_stage_manager : public std::enable_shared_from_this<query_stage_mana
     }
   }
 
-  void notify_memory_downgrade(query_id_t query_id,
-                               int gpu_id,
-                               std::size_t shortfall_bytes) noexcept
+  void notify_memory_downgrade_for_task(query_id_t query_id,
+                                        std::size_t operator_id,
+                                        int gpu_id,
+                                        std::size_t shortfall_bytes) noexcept
   {
     std::shared_lock g{_listeners_mtx};
     for (auto const& l : _listeners) {
-      l->on_memory_downgrade(query_id, gpu_id, shortfall_bytes);
+      l->on_memory_downgrade_for_task(query_id, operator_id, gpu_id, shortfall_bytes);
     }
   }
 

@@ -217,9 +217,16 @@ void gpu_pipeline_executor::manager_loop()
       // Reported before the (blocking) downgrade rather than after: the value of
       // knowing is that the GPU is about to stall, and a listener told only once
       // it has finished learns nothing it can act on.
-      _query_stage_manager->notify_memory_downgrade(
+      std::size_t stalled_operator_id = op::sirius_physical_operator::invalid_operator_id;
+      if (auto const* pipe = gpu_task->get_pipeline()) {
+        if (auto src = pipe->get_source(); src && src->has_operator_id()) {
+          stalled_operator_id = src->get_operator_id();
+        }
+      }
+      _query_stage_manager->notify_memory_downgrade_for_task(
         make_query_id(
           static_cast<std::uint32_t>(static_cast<std::uint64_t>(gpu_task->get_priority()) >> 32)),
+        stalled_operator_id,
         _memory_space != nullptr ? _memory_space->get_device_id() : -1,
         shortfall);
 

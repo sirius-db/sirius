@@ -94,9 +94,10 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   /// the executor stalled there is no order left to stay in step with, and the
   /// far more useful thing is to be further ahead when it resumes.  Ignored
   /// under @c eager, which is already reading as far ahead as its budget allows.
-  void on_memory_downgrade(query_id_t query_id,
-                           int gpu_id,
-                           std::size_t shortfall_bytes) noexcept override;
+  void on_memory_downgrade_for_task(query_id_t query_id,
+                                    std::size_t operator_id,
+                                    int gpu_id,
+                                    std::size_t shortfall_bytes) noexcept override;
 
   /// Request the worker to stop and join it.  Safe to call when not started.
   void stop() noexcept;
