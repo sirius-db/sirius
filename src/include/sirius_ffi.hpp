@@ -162,6 +162,11 @@ class SIRIUS_FFI_EXPORT StagingArena {
   /// Capacity of the arena in bytes.
   std::uint64_t capacity() const noexcept;
 
+  /// Leases currently held. Nonzero once a query has quiesced means a leaked lease, which is
+  /// the only way a caller outside C++ can observe one. Not `noexcept`: it takes the arena
+  /// mutex, unlike the two trivial getters above.
+  std::size_t outstanding() const;
+
  private:
   std::shared_ptr<sirius::exec::exchange_staging_arena> arena_;
 };

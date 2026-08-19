@@ -32,12 +32,12 @@ namespace sirius::exec {
 /// staged host copies — correct bytes, no error. Keeping the arena outside every pool is the
 /// reason this class exists.
 ///
-/// Leases are bump-allocated under a mutex and freed explicitly (`lease` / `release` cross an
-/// FFI, so RAII cannot carry them). They are short-lived by design — a send lease is released
-/// after the transmit, a receive lease after the copy-out-on-arrival — so there is no free
-/// list: each release drops the bump head back to the end of the highest lease still
-/// outstanding (to the base when none remain), so trailing space is reclaimed immediately and
-/// a long-lived lease pins at most the region up to its own end.
+/// Leases are allocated from an address-ordered free list under a mutex and freed explicitly
+/// (`lease` / `release` cross an FFI). Each release returns the block and coalesces it with its
+/// free neighbours, so ANY released space is immediately reusable — the allocator has no bump
+/// head and cannot drift: capacity bounds concurrent live bytes, not lifetime totals. A lease
+/// remains one contiguous, `kAlignment`-aligned range, so it is still a valid RDMA target and a
+/// valid `cudf::unpack` source.
 class exchange_staging_arena {
  public:
   /// Every lease offset is a multiple of this, so any lease is a valid aligned transfer target.
@@ -87,9 +87,8 @@ class exchange_staging_arena {
   ///         naming the requested, free, and capacity byte counts.
   std::uint64_t lease(std::uint64_t len);
 
-  /// Return the lease at `offset`. The bump head drops back to the end of the highest lease
-  /// still outstanding (to the base when none remain) — trailing reclamation, relying on
-  /// leases being short-lived.
+  /// Return the lease at `offset`. The block goes back to the free list and coalesces with its
+  /// free neighbours, so the space is immediately reusable regardless of release order.
   /// @throws sirius::invalid_input_exception when `offset` is not an outstanding lease
   ///         (double release, or a corrupted offset).
   void release(std::uint64_t offset);
@@ -105,8 +104,20 @@ class exchange_staging_arena {
   /// Leases currently held. Diagnostics: nonzero at quiesce means a leaked lease.
   [[nodiscard]] std::size_t outstanding() const;
 
-  /// Highest bump-head watermark ever reached — how much arena a workload actually needed.
-  [[nodiscard]] std::uint64_t high_water() const;
+  /// Peak sum of outstanding lease lengths — the working set the workload actually needed.
+  /// With a free list this is also the peak arena occupancy, because released space is
+  /// immediately reusable; under the old bump allocator the two diverged (that gap was drift).
+  [[nodiscard]] std::uint64_t peak_live_bytes() const;
+
+  /// Current sum of outstanding lease lengths.
+  [[nodiscard]] std::uint64_t live_bytes() const;
+
+  /// Largest single contiguous free block. `total_free() - largest_free()` is the external
+  /// fragmentation; a lease no larger than this is guaranteed to succeed.
+  [[nodiscard]] std::uint64_t largest_free() const;
+
+  /// Sum of all free blocks.
+  [[nodiscard]] std::uint64_t total_free() const;
 
  private:
   void* base_             = nullptr;
@@ -120,9 +131,18 @@ class exchange_staging_arena {
   std::uint64_t mapped_bytes_       = 0;
 
   mutable std::mutex mutex_;
-  std::uint64_t head_       = 0;  // next free offset; always kAlignment-aligned
-  std::uint64_t high_water_ = 0;
+  //! Free blocks, address-ordered and always coalesced: no two entries are adjacent.
+  //! Seeded with the whole region at construction.
+  std::map<std::uint64_t, std::uint64_t> free_;
   std::map<std::uint64_t, std::uint64_t> leases_;  // offset -> aligned length
+  std::uint64_t live_bytes_      = 0;
+  std::uint64_t peak_live_bytes_ = 0;
+
+  //! Total free bytes and the largest single contiguous free block. Both are reported on
+  //! exhaustion: the gap between them IS the external fragmentation, and it is the number that
+  //! tells an operator whether to raise capacity or to fix retention.
+  [[nodiscard]] std::uint64_t total_free_locked() const;
+  [[nodiscard]] std::uint64_t largest_free_locked() const;
 };
 
 }  // namespace sirius::exec

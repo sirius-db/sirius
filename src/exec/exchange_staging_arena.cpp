@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 
 namespace sirius::exec {
 
@@ -76,6 +77,8 @@ exchange_staging_arena::exchange_staging_arena(std::uint64_t capacity_bytes)
     // the RMM pool, so it appears in no config dump and in no pool accounting -- without this
     // line the only way to learn it is to read the launcher's environment.
     SIRIUS_LOG_INFO("exchange staging arena: {} bytes (cudaMalloc)", capacity_);
+    // Seeded at the end of the constructor, after BOTH paths have settled `capacity_`.
+    free_.emplace(0, capacity_);
     return;
   }
 
@@ -148,6 +151,9 @@ exchange_staging_arena::exchange_staging_arena(std::uint64_t capacity_bytes)
   // these differ, and the granted one is what a lease is actually checked against.
   SIRIUS_LOG_INFO(
     "exchange staging arena: {} bytes (fabric handle, requested {})", capacity_, capacity_bytes);
+  // Seeded only now: the fabric path OVERWRITES `capacity_` with the granularity-rounded size
+  // (above), and the free list must describe the region actually mapped, not the one requested.
+  free_.emplace(0, capacity_);
 }
 
 exchange_staging_arena::~exchange_staging_arena()
@@ -159,10 +165,14 @@ exchange_staging_arena::~exchange_staging_arena()
   // `outstanding` at teardown means a leaked lease.
   {
     std::lock_guard lock(mutex_);
-    SIRIUS_LOG_INFO("exchange staging arena: high water {} of {} bytes ({} leases outstanding)",
-                    high_water_,
-                    capacity_,
-                    leases_.size());
+    SIRIUS_LOG_INFO(
+      "exchange staging arena: peak live {} of {} bytes ({} leases outstanding, {} free blocks, "
+      "largest {})",
+      peak_live_bytes_,
+      capacity_,
+      leases_.size(),
+      free_.size(),
+      largest_free_locked());
   }
 
   if (fabric_handle_ != 0) {
@@ -207,22 +217,43 @@ std::uint64_t exchange_staging_arena::lease(std::uint64_t len)
   }
   std::lock_guard lock(mutex_);
   const auto aligned = align_up(len);
-  const auto free    = capacity_ - head_;
-  if (aligned > free) {
+  // align_up wraps for len within kAlignment-1 of UINT64_MAX; a wrapped 0 would slip past the
+  // fit scan and register a zero-length lease aliasing a live one. `len` is wire-supplied
+  // (handle_staging_lease), so this guard is load-bearing, not theoretical.
+  if (aligned < len || aligned > capacity_) {
     throw sirius::invalid_input_exception(
-      "exchange staging arena exhausted: requested {} bytes ({} aligned), {} free of {} capacity "
-      "with {} leases outstanding (raise SIRIUS_EXCHANGE_STAGING_BYTES)",
-      len,
-      aligned,
-      free,
-      capacity_,
-      leases_.size());
+      "exchange staging arena: lease of {} bytes exceeds the {} byte capacity", len, capacity_);
   }
-  const auto offset = head_;
-  head_ += aligned;
-  high_water_ = std::max(high_water_, head_);
-  leases_.emplace(offset, aligned);
-  return offset;
+
+  // Address-ordered first fit: keeps low addresses dense and needs no second index. At the tens
+  // of blocks this arena holds, the linear scan is cheaper than maintaining a size index.
+  for (auto it = free_.begin(); it != free_.end(); ++it) {
+    if (it->second < aligned) { continue; }
+    const auto offset    = it->first;
+    const auto block_len = it->second;
+    free_.erase(it);
+    if (block_len > aligned) { free_.emplace(offset + aligned, block_len - aligned); }
+    leases_.emplace(offset, aligned);
+    live_bytes_ += aligned;
+    peak_live_bytes_ = std::max(peak_live_bytes_, live_bytes_);
+    return offset;
+  }
+
+  // Both numbers, because they mean different things: total free short of the request means
+  // raise capacity (or fix retention); total free ample but largest block short means external
+  // fragmentation, which a bigger arena does not necessarily fix.
+  throw sirius::invalid_input_exception(
+    "exchange staging arena exhausted: requested {} bytes ({} aligned), {} free of {} capacity "
+    "in {} blocks (largest {}), {} leases outstanding holding {} bytes "
+    "(raise SIRIUS_EXCHANGE_STAGING_BYTES)",
+    len,
+    aligned,
+    total_free_locked(),
+    capacity_,
+    free_.size(),
+    largest_free_locked(),
+    leases_.size(),
+    live_bytes_);
 }
 
 void exchange_staging_arena::release(std::uint64_t offset)
@@ -235,19 +266,43 @@ void exchange_staging_arena::release(std::uint64_t offset)
       "(double release?)",
       offset);
   }
+  const auto len = it->second;
   leases_.erase(it);
-  // Trailing reclamation, no free list: the bump head drops back to the end of the highest
-  // lease still outstanding (to the base when none remain). Gaps below the head are only
-  // reusable once everything above them goes back — but a lease that outlives its neighbours
-  // now pins at most the region up to its own end, never the whole arena, so steady-state
-  // traffic keeps reusing the same space above it instead of burning arena for the process
-  // lifetime.
-  if (leases_.empty()) {
-    head_ = 0;
-  } else {
-    const auto& highest = *leases_.rbegin();
-    head_               = highest.first + highest.second;
+  live_bytes_ -= len;
+
+  // Insert and coalesce with both neighbours, so the free list never holds two adjacent blocks
+  // and released space is reusable regardless of the order releases arrive in. Merge forward
+  // first (this block absorbs its successor), then backward (the predecessor absorbs the
+  // result) -- doing it in the other order would leave `ins` dangling before the forward merge.
+  auto [ins, ok] = free_.emplace(offset, len);
+  (void)ok;  // offset came out of leases_, so it cannot already be in free_
+
+  auto next = std::next(ins);
+  if (next != free_.end() && ins->first + ins->second == next->first) {
+    ins->second += next->second;
+    free_.erase(next);
   }
+  if (ins != free_.begin()) {
+    auto prev = std::prev(ins);
+    if (prev->first + prev->second == ins->first) {
+      prev->second += ins->second;
+      free_.erase(ins);
+    }
+  }
+}
+
+std::uint64_t exchange_staging_arena::total_free_locked() const
+{
+  std::uint64_t sum = 0;
+  for (const auto& [offset, len] : free_) { sum += len; }
+  return sum;
+}
+
+std::uint64_t exchange_staging_arena::largest_free_locked() const
+{
+  std::uint64_t best = 0;
+  for (const auto& [offset, len] : free_) { best = std::max(best, len); }
+  return best;
 }
 
 std::size_t exchange_staging_arena::outstanding() const
@@ -256,10 +311,28 @@ std::size_t exchange_staging_arena::outstanding() const
   return leases_.size();
 }
 
-std::uint64_t exchange_staging_arena::high_water() const
+std::uint64_t exchange_staging_arena::total_free() const
 {
   std::lock_guard lock(mutex_);
-  return high_water_;
+  return total_free_locked();
+}
+
+std::uint64_t exchange_staging_arena::largest_free() const
+{
+  std::lock_guard lock(mutex_);
+  return largest_free_locked();
+}
+
+std::uint64_t exchange_staging_arena::live_bytes() const
+{
+  std::lock_guard lock(mutex_);
+  return live_bytes_;
+}
+
+std::uint64_t exchange_staging_arena::peak_live_bytes() const
+{
+  std::lock_guard lock(mutex_);
+  return peak_live_bytes_;
 }
 
 }  // namespace sirius::exec

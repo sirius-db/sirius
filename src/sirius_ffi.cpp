@@ -355,6 +355,8 @@ std::uintptr_t StagingArena::base() const noexcept { return arena_->base(); }
 
 std::uint64_t StagingArena::capacity() const noexcept { return arena_->capacity(); }
 
+std::size_t StagingArena::outstanding() const { return arena_->outstanding(); }
+
 namespace {
 std::string stream_view_name_of(std::uint64_t stream_id)
 {

@@ -90,8 +90,8 @@ mod ffi {
         /// from `base()`. Fallible on exhaustion (the arena never blocks).
         fn lease(self: &StagingArena, len: u64) -> Result<u64>;
 
-        /// Return the lease at `offset`; the arena's bump head resets when the
-        /// last outstanding lease is released.
+        /// Return the lease at `offset`; the block goes back to the arena's
+        /// free list and coalesces with its free neighbours.
         fn release(self: &StagingArena, offset: u64) -> Result<()>;
 
         /// Device base address of the arena, for transport memory registration.
@@ -99,6 +99,11 @@ mod ffi {
 
         /// Capacity of the arena in bytes.
         fn capacity(self: &StagingArena) -> u64;
+
+        /// Leases currently held. Nonzero at quiesce means a leaked lease.
+        /// `Result` rather than a bare `usize` because, unlike `base`/`capacity`,
+        /// the C++ side takes the arena mutex and is therefore not `noexcept`.
+        fn outstanding(self: &StagingArena) -> Result<usize>;
 
         /// One plan fragment of a multi-fragment query. Either declares output
         /// streams (an intermediate fragment, whose results park as native GPU

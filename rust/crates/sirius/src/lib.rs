@@ -405,8 +405,9 @@ impl StagingArena {
         self.inner.lease(len)
     }
 
-    /// Return the lease at `offset`; the arena's bump head drops back to the end of the
-    /// highest lease still outstanding (to the base when none remain).
+    /// Return the lease at `offset`; the block goes back to the arena's free list and
+    /// coalesces with its free neighbours, so the space is reusable regardless of release
+    /// order.
     pub fn release(&self, offset: u64) -> Result<(), Exception> {
         self.inner.release(offset)
     }
@@ -419,6 +420,12 @@ impl StagingArena {
     /// Capacity of the arena in bytes.
     pub fn capacity(&self) -> u64 {
         self.inner.capacity()
+    }
+
+    /// Leases currently held. Nonzero once a query has quiesced means a leaked lease — this is
+    /// the only way the CN can observe one.
+    pub fn outstanding(&self) -> Result<usize, Exception> {
+        self.inner.outstanding()
     }
 }
 
@@ -1148,7 +1155,8 @@ mod tests {
             for batch in &staged {
                 ctx.staging_release(batch.offset).unwrap();
             }
-            // ...and with nothing outstanding the bump head reset to the base.
+            // ...and with nothing outstanding the free list coalesced back to one whole-arena
+            // block, so the next lease lands at the base.
             let probe = ctx.staging_lease(1024).unwrap();
             assert_eq!(probe, 0);
             ctx.staging_release(probe).unwrap();

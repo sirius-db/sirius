@@ -1048,7 +1048,8 @@ mod tests {
         let rows: usize = result.batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(rows, 3, "the staged remote hop preserved every row");
 
-        // Every lease went back (push-then-release), so the bump head reset to the base.
+        // Every lease went back (push-then-release), so the free list coalesced back to one
+        // whole-arena block and the next lease lands at the base.
         let probe = engine.staging_lease(1024).expect("arena drained");
         assert_eq!(probe, 0);
         engine.staging_release(probe).unwrap();
