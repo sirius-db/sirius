@@ -958,6 +958,18 @@ std::unique_ptr<cudf::column> build_rowid_column(
   return cudf::concatenate(views, stream, mr);
 }
 
+// Zero-row column carrying the projected schema of column @p type / @p pcol. Mirrors the
+// non-empty decode outputs: rowid synthesizes INT64 (build_rowid_column), ARRAY becomes a cuDF
+// LIST of its fixed-width element (make_empty_column rejects nested types), everything else maps
+// through sirius_to_cudf_type. A rowid slot's declared type is arbitrary and never read.
+std::unique_ptr<cudf::column> empty_column_for(projected_column const& pcol,
+                                               sirius::logical_type const& type)
+{
+  if (pcol.is_rowid) { return cudf::make_empty_column(cudf::data_type{cudf::type_id::INT64}); }
+  return type.is_array() ? cudf::make_empty_lists_column(sirius_to_cudf_type(type.array_child()))
+                         : cudf::make_empty_column(sirius_to_cudf_type(type));
+}
+
 }  // namespace
 
 std::vector<cudf::io::text::byte_range_info> row_group_file_ranges(
@@ -987,17 +999,13 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
   rmm::cuda_stream_view stream)
 {
   if (row_groups.empty()) {
-    // Empty / fully-pruned split: emit a schema-correct 0-row table (one empty
-    // column per projected column) rather than a 0-column table, so it flows
-    // through post_filter_and_project and downstream concat like any decoded
-    // batch. Rowid columns decode as INT64 (see the fixed-width path below).
+    // Preserve the projected schema so an empty or fully pruned split follows
+    // the normal filter/project/concat path.
     std::vector<std::unique_ptr<cudf::column>> empty_cols;
     empty_cols.reserve(table_info.projected_cols.size());
     for (std::size_t ci = 0; ci < table_info.projected_cols.size(); ++ci) {
-      auto const dt = table_info.projected_cols[ci].is_rowid
-                        ? cudf::data_type{cudf::type_id::INT64}
-                        : sirius_to_cudf_type(table_info.projected_types[ci]);
-      empty_cols.push_back(cudf::make_empty_column(dt));
+      empty_cols.push_back(
+        empty_column_for(table_info.projected_cols[ci], table_info.projected_types[ci]));
     }
     return std::make_unique<cudf::table>(std::move(empty_cols));
   }

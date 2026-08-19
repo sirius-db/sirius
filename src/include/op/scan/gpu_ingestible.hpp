@@ -149,6 +149,23 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    */
   [[nodiscard]] virtual bool has_row_filter() const noexcept { return false; }
 
+  /// Whether @ref post_filter_and_project's assembly is a leading-identity
+  /// projection: output column k is materialized column k, and no partition or
+  /// other synthesized column joins the output. When true, a decode-row-filtered
+  /// batch whose width already matches the output arity needs no assembly at
+  /// all, so the scan's transactional carrier-cast steal may bypass
+  /// post_filter_and_project for it. A width match alone cannot prove this:
+  /// trailing pure-filter columns can offset missing synthesized columns.
+  /// Conservative default: false (the steal then falls back to the generic
+  /// materialize/project path, which is always correct).
+  /// Implementations must derive this from their assembly configuration
+  /// (parquet: `!needs_output_assembly`) or return a structural constant only
+  /// while the invariant is type-level (duckdb-native synthesizes no
+  /// partition/virtual output columns and projects via `std::iota` — see its
+  /// `post_filter_and_project`). An override returning a stale `true` silently
+  /// corrupts decode-row-filtered steals.
+  [[nodiscard]] virtual bool output_assembly_is_leading_identity() const noexcept { return false; }
+
   [[nodiscard]] virtual const ingestible_table_info& table_info() const noexcept = 0;
 
   /// Column primary (storage) indices in the exact order @ref materialize_table emits
