@@ -67,10 +67,18 @@ class query_stage_listener {
   {
   }
 
-  /// A source operator could not find a next producer, so no task was created.
-  /// Distinguishes "nothing to do yet" from "nothing left to do".
+  /// No task was created for @p source_operator_id: the walk from it found
+  /// nobody able to produce.  Distinguishes "nothing to do yet" from "nothing
+  /// left to do".
+  ///
+  /// @p failed_operator_id is where the walk actually stopped.  It differs from
+  /// @p source_operator_id whenever the walk descended through operators that
+  /// were themselves waiting on input, and it is the one that says where the
+  /// pipeline is stuck -- the source may simply be waiting on it.  The two are
+  /// equal when the source itself could not produce.
   virtual void on_failed_to_create_task(query_id_t query_id,
-                                        std::size_t source_operator_id) noexcept
+                                        std::size_t source_operator_id,
+                                        std::size_t failed_operator_id) noexcept
   {
   }
 
@@ -183,11 +191,13 @@ class query_stage_manager : public std::enable_shared_from_this<query_stage_mana
     }
   }
 
-  void notify_failed_to_create_task(query_id_t query_id, std::size_t source_operator_id) noexcept
+  void notify_failed_to_create_task(query_id_t query_id,
+                                    std::size_t source_operator_id,
+                                    std::size_t failed_operator_id) noexcept
   {
     std::shared_lock g{_listeners_mtx};
     for (auto const& l : _listeners) {
-      l->on_failed_to_create_task(query_id, source_operator_id);
+      l->on_failed_to_create_task(query_id, source_operator_id, failed_operator_id);
     }
   }
 

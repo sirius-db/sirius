@@ -73,6 +73,22 @@ struct task_creation_request {
   request_type type = request_type::active;
 };
 
+/// Why @ref task_creator::get_operator_for_next_task stopped.
+enum class next_task_state {
+  /// An operator is ready to have a task created for it.
+  ready,
+  /// No operator in the chain can produce right now.  Not necessarily terminal:
+  /// an operator waiting on input reports this until its input arrives.
+  depleted,
+};
+
+/// The operator @ref task_creator::get_operator_for_next_task settled on,
+/// together with what it means -- see @c next_task_state.
+struct next_task_result {
+  op::sirius_physical_operator* op{nullptr};
+  next_task_state state{next_task_state::depleted};
+};
+
 class task_creator {
  public:
   /**
@@ -195,13 +211,19 @@ class task_creator {
   /**
    * @brief Find the operator for which to create the next task based on operator hints.
    *
-   * This method queries the given node for a hint about what task to create next.
+   * This method queries the given node for a hint about what task to create next,
+   * walking through operators that are themselves waiting on input.
    *
    * @param node The operator node to get the next task hint from.
-   * @return The operator node that should be scheduled next, or nullptr if no task should be
-   * scheduled.
+   * @return The operator and what it means.  On @c ready, the operator is the
+   *         one to schedule.  On @c depleted, it is the operator that was asked
+   *         last and could not produce -- which is what makes the failure
+   *         attributable: the walk can descend several operators past the one
+   *         the request named, and reporting the request's own operator would
+   *         name a node that is waiting perfectly happily.  Null only when
+   *         @p node is null.
    */
-  op::sirius_physical_operator* get_operator_for_next_task(op::sirius_physical_operator* node);
+  [[nodiscard]] next_task_result get_operator_for_next_task(op::sirius_physical_operator* node);
 
   /**
    * @brief Manager loop to consume task creation requests and dispatch to the thread pool.

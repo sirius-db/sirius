@@ -254,13 +254,13 @@ void task_creator::reset()
   }
 }
 
-op::sirius_physical_operator* task_creator::get_operator_for_next_task(
-  op::sirius_physical_operator* node)
+next_task_result task_creator::get_operator_for_next_task(op::sirius_physical_operator* node)
 {
-  if (node == nullptr) { return nullptr; }
+  // The only case with nobody to blame: there was no operator to ask.
+  if (node == nullptr) { return {nullptr, next_task_state::depleted}; }
 
   auto hint = node->get_next_task_hint();
-  if (!hint.has_value()) { return nullptr; }
+  if (!hint.has_value()) { return {node, next_task_state::depleted}; }
 
   if (hint.value().hint == op::TaskCreationHint::READY) {
     if (hint.value().producer == nullptr) {
@@ -268,11 +268,19 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
         "During get_operator_for_next_task Producer is nullptr for operator " + node->get_name());
     }
     // WSM TODO: how do we handle other ports that are not default?
-    return hint.value().producer;
-  } else if (hint.value().hint == op::TaskCreationHint::WAITING_FOR_INPUT_DATA) {
-    return get_operator_for_next_task(hint.value().producer);
+    return {hint.value().producer, next_task_state::ready};
   }
-  return nullptr;
+
+  if (hint.value().hint == op::TaskCreationHint::WAITING_FOR_INPUT_DATA) {
+    auto const deeper = get_operator_for_next_task(hint.value().producer);
+    // A null producer means the chain ran out below us, so this node is the last
+    // one that was actually asked -- keep it rather than propagating the null,
+    // or the failure loses its subject on the way back up.
+    if (deeper.op == nullptr) { return {node, next_task_state::depleted}; }
+    return deeper;
+  }
+
+  return {node, next_task_state::depleted};
 }
 
 void task_creator::stop()
@@ -367,19 +375,27 @@ void task_creator::manager_loop()
     auto request_kind = request->type;
     if (node == nullptr) { continue; }
 
-    // get_operator_for_next_task overwrites `node`.
     auto* requested_node = node;
-    node                 = get_operator_for_next_task(node);
+    auto const next      = get_operator_for_next_task(node);
 
-    if (node == nullptr) {
+    if (next.state != next_task_state::ready) {
+      // Report both ends of the walk: the operator the request named, and the
+      // one that actually could not produce.  They differ whenever the walk
+      // descended through operators waiting on input, and it is the latter that
+      // says where the pipeline is actually stuck.
+      //
       // Observation only, so an unnumbered operator is reported as the sentinel
       // rather than throwing out of the manager loop.
+      auto const id_of = [](op::sirius_physical_operator const* op) {
+        return op != nullptr && op->has_operator_id()
+                 ? op->get_operator_id()
+                 : op::sirius_physical_operator::invalid_operator_id;
+      };
       _query_stage_manager->notify_failed_to_create_task(
-        _query_id,
-        requested_node->has_operator_id() ? requested_node->get_operator_id()
-                                          : op::sirius_physical_operator::invalid_operator_id);
+        _query_id, id_of(requested_node), id_of(next.op != nullptr ? next.op : requested_node));
       continue;
     }
+    node = next.op;
 
     // Dispatch the task creation work to the pool
     _bounded_pool->dispatch(std::move(slot), [this, node, request_kind]() mutable {
