@@ -242,20 +242,11 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
   return info;
 }
 
-//! Build the GPU scan source leaf for a table scan, wrapping it in a `DYNAMIC_FILTER` operator
-//! when a producing join wired runtime dynamic filters into this scan.
-//!
-//! Shared by every scan format; `InfoT` is the concrete `ingestible_table_info` subtype. The
-//! template body relies on two per-format properties it resolves statically: `InfoT` exposes a
-//! `sirius_dynamic_filters` channel field, and a `make_ingestible` overload accepts
-//! `unique_ptr<InfoT>`.
-//!
-//! `mode` selects the wrapped operator's post-decode capability and is the scan format's only
-//! behavioral input here: a parquet scan already evaluated AST-capable filters (zone maps)
-//! through the reader's `set_filter`, so it wraps in `membership_masks_only`; a duckdb-native
-//! scan has no read-time dynamic path, so it wraps in `include_ast_row_masks` to also evaluate
-//! zone maps row-wise. Channels without registered producers are elided. Registration finishes
-//! after the whole tree is built, so `has_producers()` is settled.
+/**
+ * @brief Builds a GPU scan, wrapping it when registered dynamic-filter producers exist
+ *
+ * @p mode selects membership-only or AST-plus-membership post-decode filtering.
+ */
 template <typename InfoT>
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
   std::unique_ptr<InfoT> info,
@@ -275,21 +266,16 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
       scan.estimated_cardinality,
       std::move(ingestible),
       compressed_materialization_observer);
-  // The propagation pass already forced every planned dynamic-filter target column native in the
-  // scan sidecar, so the leaf advertises the scan's actual output carriers: scan normalization
-  // reads them to decide per-chunk casts, and execution validation compares batches against them.
+  // Preserve propagated carriers; dynamic-filter targets are already native.
   if (scan.has_physical_overrides()) { leaf->set_physical_types(scan.get_physical_types()); }
 
   if (dynamic_filters) {
-    // Under a PARTITION parent this emits the [GPU_SCAN, DYNAMIC_FILTER] pipeline (filter as
-    // sink); in inline contexts both join the current pipeline.
     auto dynamic_filter_op = duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
       scan.types,
       scan.estimated_cardinality,
       std::move(dynamic_filters),
       op_params.dynamic_filter_keep_threshold,
       mode);
-    // The filter only drops rows of the scan output, so its column carriers are the scan's.
     if (scan.has_physical_overrides()) {
       dynamic_filter_op->set_physical_types(scan.get_physical_types());
     }
@@ -338,24 +324,20 @@ void wrap_table_scan_source(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf;
   bool replace_slot = false;
   if (fn == "seq_scan") {
-    // The duckdb-native scan has no read-time dynamic-filter path, so its wrapped DYNAMIC_FILTER
-    // also evaluates AST-capable filters (zone maps) row-wise, not membership masks alone.
-    leaf = make_gpu_scan_leaf(build_duckdb_native_table_info(scan, op_params, context),
+    // Native scans apply AST-capable filters post-decode.
+    leaf         = make_gpu_scan_leaf(build_duckdb_native_table_info(scan, op_params, context),
                               scan,
                               op_params,
                               sirius::op::scan::dynamic_filter_apply_mode::include_ast_row_masks,
                               sirius_ctx.get());
-    // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
     replace_slot = true;
   } else if (fn == "parquet_scan" || fn == "read_parquet" || fn == "sirius_read_parquet") {
-    // The parquet ingestible consumes AST filters for read-time row-group pruning, so its wrapped
-    // DYNAMIC_FILTER applies membership masks only.
-    leaf = make_gpu_scan_leaf(build_parquet_table_info(scan, op_params),
+    // Parquet applies AST filters in the reader; post-decode uses membership only.
+    leaf         = make_gpu_scan_leaf(build_parquet_table_info(scan, op_params),
                               scan,
                               op_params,
                               sirius::op::scan::dynamic_filter_apply_mode::membership_masks_only,
                               sirius_ctx.get());
-    // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
     replace_slot = true;
   } else {
     throw std::runtime_error(

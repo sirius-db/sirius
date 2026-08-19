@@ -14,16 +14,6 @@
  * limitations under the License.
  */
 
-/**
- * @file build_filter_evidence.hpp
- * @brief Classifies logical join builds for dynamic-filter routing
- *
- * Either `build_subtree_is_filtering` or `build_relation_is_opaque` can arm scan and join-edge
- * target discovery. Sirius owns both checks and does not consume DuckDB pushdown metadata:
- * `build_subtree_is_filtering` mirrors DuckDB's `JoinFilterPushdownOptimizer::IsFiltering`, while
- * `build_relation_is_opaque` covers build roots whose defining subtree is unavailable here.
- */
-
 #pragma once
 
 namespace duckdb {
@@ -33,20 +23,12 @@ class LogicalOperator;
 namespace sirius::planner {
 
 /**
- * @brief Reports whether @p op's subtree contains filter evidence
- *
- * Mirrors DuckDB's `JoinFilterPushdownOptimizer::IsFiltering` exactly: true for a `LOGICAL_GET`
- * with a non-empty `table_filters`, for a `LOGICAL_FILTER`, for a `LOGICAL_TOP_N`, or for any
- * subtree containing one of those; false otherwise.
+ * @brief Mirrors DuckDB's join-filter test for GET filters, FILTER, TOP_N, or a containing subtree
  */
 [[nodiscard]] bool build_subtree_is_filtering(duckdb::LogicalOperator const& op);
 
 /**
- * @brief Reports whether a logical build root hides its defining subtree
- *
- * Returns true only for a `LOGICAL_DELIM_GET` or `LOGICAL_CTE_REF` root, optionally wrapped in one
- * or more valid single-child `LOGICAL_PROJECTION` operators. Other roots return false even when
- * they contain an opaque leaf below a non-projection operator.
+ * @brief Tests for a DELIM_GET or CTE_REF root behind valid single-child projections
  */
 [[nodiscard]] bool build_relation_is_opaque(duckdb::LogicalOperator const& op);
 

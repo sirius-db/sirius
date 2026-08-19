@@ -239,7 +239,6 @@ bool sirius_physical_hash_join::are_conditions_supported(
 
 namespace {
 
-// Move hash-equality conditions ahead of the routed/inequality rest.
 void reorder_join_conditions(duckdb::vector<sirius::join_condition>& conditions,
                              bool route_null_safe_to_conditional)
 {
@@ -844,8 +843,7 @@ bool sirius_physical_hash_join::is_build_probe_mode()
 
 bool sirius_physical_hash_join::publishes_dynamic_filters() const
 {
-  // Set at construction and only narrowed by restrict_dynamic_filter_replicas before execution
-  // begins, so this needs no lock.
+  // Replica restriction completes before execution; the plan is immutable afterward.
   return _dynamic_filter_plan.enabled();
 }
 
@@ -2024,14 +2022,10 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                             batch_telemetry());
 }
 
-//===----------------------------------------------------------------------===//
-// Dynamic Filters
-//===----------------------------------------------------------------------===//
 void sirius_physical_hash_join::publish_dynamic_filters(cudf::table_view const& build_view,
                                                         rmm::cuda_stream_view stream)
 {
-  // The delivery hook claims OPEN -> PUBLISHING under op_state_mutex at decision time; this
-  // publisher runs only inside a claimed window and owns its terminal transition.
+  // The delivery hook owns the PUBLISHING claim until this function sets a terminal state.
   D_ASSERT(_dynamic_filter_publication_state.load(std::memory_order_acquire) ==
            dynamic_filter_publication_state::PUBLISHING);
 
@@ -2072,13 +2066,9 @@ void sirius_physical_hash_join::publish_dynamic_filters(cudf::table_view const& 
       _dynamic_filter_stats->publications_finished.fetch_add(1, std::memory_order_relaxed);
     }
   } catch (rmm::out_of_memory const& oom) {
-    // Device memory exhaustion is an environmental condition, not a defect: publication is a
-    // default-on best-effort optimization and must never fail the query. Construction happens
-    // strictly before fan-out and replication is per-target best-effort, so an escaping OOM has
-    // pushed nothing -- and any pushed prefix would be an independently sound optional conjunct
-    // (each filter is immutable and complete when it becomes visible; consumers snapshot the
-    // channel per split). The window ends FAILED, not reopened: retrying a sibling delivery
-    // under the same memory pressure is the storm this catch exists to avoid.
+    // Dynamic filters are optional; device OOM fails publication without failing the query.
+    // FAILED, not reopen: retrying a sibling delivery under the same memory pressure is the
+    // storm this catch exists to avoid (the no-usable-source skip path reopens instead).
     _dynamic_filter_publication_state.store(dynamic_filter_publication_state::FAILED,
                                             std::memory_order_release);
     if (_dynamic_filter_stats != nullptr) {
@@ -2098,23 +2088,13 @@ void sirius_physical_hash_join::publish_dynamic_filters(cudf::table_view const& 
     throw;
   }
 }
-//===----------------------------------------------------------------------===//
 
 void sirius_physical_hash_join::push_data_batch_partitioned(
   std::string_view port_id,
   std::shared_ptr<::cucascade::data_batch> batch,
   std::size_t partition_idx)
 {
-  //===----------Dynamic Table Filters----------===//
-  // Build-side dynamic-filter publish: the moment the (single, concat-folded) build batch arrives,
-  // compute and publish the filter from the build keys.
-  //
-  // The publisher is one-shot, so the batch it claims must carry the WHOLE build side — a filter
-  // built from part of the key set would drop probe rows that do in fact join. The upstream
-  // PARTITION knows whether that holds (a single-partition or broadcast build, folded to one batch
-  // by a concat_all build-side CONCAT) and reports it at sizing time through
-  // `set_build_arrives_whole`. The join mode is deliberately not part of the condition: a
-  // single-partition STANDARD / MIXED_JOIN build publishes on the same terms as BUILD_PROBE.
+  // Publish only from a complete build; a partial filter could drop valid join rows.
   bool claimed = false;
   if (port_id == "build" && batch) {
     bool wired_but_unusable = false;
@@ -2125,17 +2105,12 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
                         dynamic_filter_publication_state::OPEN;
       const bool wired = _dynamic_filter_plan.enabled();
       claimed          = open && wired && _build_arrives_whole;
-      // Claim the one-shot window at decision time: on_finalize_operator closes only an unclaimed
-      // OPEN window under this same mutex, so an early pipeline finish cannot land between the
-      // decision and the publication. A plain store suffices because every transition out of OPEN
-      // happens under this mutex.
+      // Claim under the mutex that closes OPEN, preventing finalization from racing publication.
       if (claimed) {
         _dynamic_filter_publication_state.store(dynamic_filter_publication_state::PUBLISHING,
                                                 std::memory_order_release);
       }
 
-      // A join that has a filter plan and is still open but cannot use the one-shot publisher
-      // silently publishes nothing — say so, once per join.
       wired_but_unusable = open && wired && !claimed && !_build_not_whole_reported;
       if (wired_but_unusable) { _build_not_whole_reported = true; }
       mode = _join_mode;
@@ -2169,21 +2144,14 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
     return;
   }
 
-  // Do not strand a claimed window in PUBLISHING if setup or routing throws before
-  // publish_dynamic_filters() owns the terminal transition.
   try {
-    // The read-only accessor is acquired BEFORE routing: once deposited into a repository the
-    // batch becomes a downgrade candidate, and the shared lock pins its GPU representation.
+    // Acquire the read lock before routing makes the batch eligible for downgrade.
     auto build_ro = batch->to_read_only();
     sirius_physical_partition_consumer_operator::push_data_batch_partitioned(
       port_id, batch, partition_idx);
 
     nvtx3::scoped_range nvtx_range{"dynfilter::publish_hook"};
     auto* ms = build_ro.get_data() ? build_ro.get_memory_space() : nullptr;
-    // A usable source is GPU-resident on a device the plan holds a replica space for. Non-GPU
-    // residency means the batch was downgraded before this delivery; a non-plan device means a
-    // batch shared cross-GPU (e.g. CTE fan-out) landed outside the (possibly restricted) replica
-    // set -- the same environmental condition. Publication is best-effort: skip it.
     bool const gpu_resident =
       ms != nullptr && build_ro.get_current_tier() == ::cucascade::memory::Tier::GPU;
     bool const source_usable =
@@ -2206,19 +2174,14 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
           "whole-build batch is not GPU-resident.",
           get_operator_id());
       }
-      // Reopen so a sibling broadcast delivery with a usable source can publish. Holding
-      // op_state_mutex serializes every transition into or out of OPEN; this delivery exclusively
-      // owns PUBLISHING, so a plain store suffices. If finalization already observed PUBLISHING,
-      // no deliveries remain and the reopened state is unobservable. Return immediately so the
-      // catch cannot mark the released claim FAILED.
+      // Reopen for another broadcast delivery; OPEN transitions share op_state_mutex.
       std::scoped_lock lg(op_state_mutex);
       _dynamic_filter_publication_state.store(dynamic_filter_publication_state::OPEN,
                                               std::memory_order_release);
       return;
     }
 
-    // The build batch was produced on a different stream than the publication stream. Order the
-    // publication stream after the batch's writer event.
+    // Wait for the build writer before reading on the publication stream.
     rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{ms->get_device_id()}};
     auto publish_stream = ms->acquire_stream();
     if (auto const writer_event = build_ro.get_writer_event(); writer_event != nullptr) {
@@ -2240,8 +2203,7 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
     }
     publish_dynamic_filters(sirius::get_cudf_table_view(build_ro), publish_stream);
   } catch (...) {
-    // publish_dynamic_filters() records FAILED before rethrowing, so its failure makes this CAS a
-    // no-op. Failures earlier in the delivery hook are transitioned and counted here.
+    // Handle only failures that occurred before publish_dynamic_filters().
     auto expected = dynamic_filter_publication_state::PUBLISHING;
     if (_dynamic_filter_publication_state.compare_exchange_strong(
           expected,
@@ -2259,8 +2221,7 @@ void sirius_physical_hash_join::on_finalize_operator()
 {
   std::scoped_lock lg(op_state_mutex);
 
-  // Close an unclaimed publication window before BUILD_PROBE state is released. If publication
-  // already started, its explicit PUBLISHING -> FINISHED/FAILED transition remains authoritative.
+  // Finalization closes only an unclaimed publication window.
   auto expected = dynamic_filter_publication_state::OPEN;
   _dynamic_filter_publication_state.compare_exchange_strong(
     expected,

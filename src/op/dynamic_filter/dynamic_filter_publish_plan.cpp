@@ -101,8 +101,6 @@ dynamic_filter_publish_plan::dynamic_filter_publish_plan(
           "[dynamic_filter_publish_plan] A key binding references an admitted key that does not "
           "exist");
       }
-      // planner::direct_route_admissible admits only INT32/INT64 keys whose probe and build
-      // storage types match; a direct binding that disagrees bypassed admission.
       if (target.route_class == dynamic_filter_route_class::direct) {
         auto const& key = _admitted_keys[binding.admitted_key_index];
         if ((binding.probe_storage_type.id() != cudf::type_id::INT32 &&
@@ -115,8 +113,7 @@ dynamic_filter_publish_plan::dynamic_filter_publish_plan(
       }
       bound_keys.push_back(binding.admitted_key_index);
     }
-    // Duplicate channel_push_ordinals are legal (the channel conjoins same-column filters); the
-    // same admitted key bound twice on one target would push the same filter twice.
+    // Channel ordinals may repeat, but each admitted key may bind once per target.
     std::ranges::sort(bound_keys);
     if (std::ranges::adjacent_find(bound_keys) != bound_keys.end()) {
       throw std::invalid_argument(

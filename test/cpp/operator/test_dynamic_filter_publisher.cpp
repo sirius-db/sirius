@@ -29,6 +29,9 @@
  *    real publisher today.
  *  - Sparse fan-out and gating: each target receives only its bound keys, the domain-coverage
  *    gate consults each key's own domain, and unbound keys cost no construction.
+ *  - Floating-point suppression: a FLOAT64 key whose build holds a NaN receives no zone map (the
+ *    lowered IEEE bounds would drop NaN probe rows the authoritative join matches) while its
+ *    INT64 sibling keeps both of its filters.
  *  - Runtime guards and degenerate publications: plan/runtime key-mapping inconsistencies,
  *    per-binding zone-map suppression, membership-only targets, keyless plans, empty builds, and
  *    drained targets.
@@ -64,6 +67,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <type_traits>
@@ -78,7 +82,8 @@ constexpr std::size_t kProbeColumnIndex = 7;
 using sirius::op::dynamic_filter_publish_plan;
 using sirius::op::dynamic_filter_route_class;
 
-constexpr auto kInt64 = cudf::data_type{cudf::type_id::INT64};
+constexpr auto kInt64   = cudf::data_type{cudf::type_id::INT64};
+constexpr auto kFloat64 = cudf::data_type{cudf::type_id::FLOAT64};
 
 template <typename MemoryManager>
 std::vector<sirius::op::dynamic_filter_replica_space> get_replica_spaces(
@@ -158,6 +163,24 @@ std::unique_ptr<cudf::column> make_int64_values(publisher_fixture const& fixture
   auto const err = cudaMemcpyAsync(column->mutable_view().data<std::int64_t>(),
                                    values.data(),
                                    values.size() * sizeof(std::int64_t),
+                                   cudaMemcpyHostToDevice,
+                                   fixture.stream.value());
+  REQUIRE(err == cudaSuccess);
+  fixture.stream.synchronize();
+  return column;
+}
+
+std::unique_ptr<cudf::column> make_float64_values(publisher_fixture const& fixture,
+                                                  std::vector<double> const& values)
+{
+  auto column    = cudf::make_numeric_column(kFloat64,
+                                          static_cast<cudf::size_type>(values.size()),
+                                          cudf::mask_state::UNALLOCATED,
+                                          fixture.stream,
+                                          cudf::get_current_device_resource_ref());
+  auto const err = cudaMemcpyAsync(column->mutable_view().data<double>(),
+                                   values.data(),
+                                   values.size() * sizeof(double),
                                    cudaMemcpyHostToDevice,
                                    fixture.stream.value());
   REQUIRE(err == cudaSuccess);
@@ -464,6 +487,59 @@ TEST_CASE("dynamic-filter publisher applies the domain-coverage gate to each key
 {
   SECTION("the first admitted key covers its domain") { require_domain_gate_skips_only(0); }
   SECTION("the second admitted key covers its domain") { require_domain_gate_skips_only(1); }
+}
+
+TEST_CASE("dynamic-filter publisher suppresses zone maps for floating-point keys",
+          "[dynamic_filter][publisher]")
+{
+  // The lowered zone-map AST compares with IEEE semantics under which NaN fails both bounds,
+  // while the authoritative join matches NaN keys to each other; a FLOAT64 key must therefore
+  // build no zone map. The NaN in the build column reproduces the observed row-dropping bug;
+  // suppression is type-based, so no reduction runs on the column at all.
+  constexpr std::size_t kInt64PushOrdinal   = 3;
+  constexpr std::size_t kFloat64PushOrdinal = 5;
+
+  publisher_fixture fixture;
+  fixture.add_key_column(3);
+  fixture.columns.push_back(
+    make_float64_values(fixture, {1.0, std::numeric_limits<double>::quiet_NaN(), 2.0}));
+
+  auto float64_key         = make_int64_key(1, 1);
+  float64_key.storage_type = kFloat64;
+
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  std::vector<dynamic_filter_publish_plan::probe_target> targets;
+  targets.push_back({.filter_set               = channel,
+                     .route_class              = dynamic_filter_route_class::scan,
+                     .accepts_zone_map_filters = true,
+                     .key_bindings             = {{.admitted_key_index   = 0,
+                                                   .channel_push_ordinal = kInt64PushOrdinal,
+                                                   .probe_storage_type   = kInt64},
+                                                  {.admitted_key_index   = 1,
+                                                   .channel_push_ordinal = kFloat64PushOrdinal,
+                                                   .probe_storage_type   = kFloat64}}});
+  dynamic_filter_publish_plan plan{{make_int64_key(0, 0), float64_key},
+                                   std::move(targets),
+                                   std::move(fixture.replica_spaces),
+                                   {.emit_zone_map_filters = true}};
+
+  auto const outcome =
+    sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
+
+  // Suppression is a capability outcome, not the type-mismatch skip path.
+  REQUIRE(outcome.keys_considered == 2);
+  REQUIRE(outcome.keys_skipped_type_mismatch == 0);
+  REQUIRE(outcome.zone_map_filters_built == 1);
+  REQUIRE(outcome.membership_filters_built == 1);
+  REQUIRE(outcome.filters_pushed == 2);
+
+  // With no filter published, every probe row (NaN included) reaches the authoritative join.
+  REQUIRE(channel->filters_for_column(kFloat64PushOrdinal).empty());
+
+  auto const int64_snapshot = channel->filters_for_column(kInt64PushOrdinal);
+  REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_zone_map_filter>(int64_snapshot) == 1);
+  REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_small_in_list_filter>(int64_snapshot) ==
+          1);
 }
 
 TEST_CASE("dynamic-filter publisher fails loudly on a plan/runtime key-mapping inconsistency",

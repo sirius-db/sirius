@@ -289,9 +289,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //! Join Keys statistics (optional)
   duckdb::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> join_stats;
 
-  /// \brief Drop dynamic-filter replica targets on GPUs outside @p admitted_gpu_ids. Called by
-  /// sirius_pipeline_converter once the admitted set is known. An admitted set holding none of the
-  /// plan's replica GPUs disables publication for this join (the plan logs the degrade).
   void restrict_dynamic_filter_replicas(std::vector<int> const& admitted_gpu_ids)
   {
     _dynamic_filter_plan.restrict_replicas_to(admitted_gpu_ids);
@@ -331,21 +328,14 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// decision so the partition can finish its own wiring (e.g. enabling build-side concat_all).
   partition_strategy get_partition_strategy(const partition_sizing_input& in) override;
 
-  /// True when this join publishes dynamic filters (an enabled publication plan, i.e. wired probe
-  /// targets). The upstream PARTITION folds a single-partition build to one batch for such a join
-  /// so the one-shot publisher sees the whole key set.
   [[nodiscard]] bool publishes_dynamic_filters() const;
 
-  /// The per-GPU hash-table byte budget (also the upstream PARTITION's bound on folding a build
-  /// whole for dynamic-filter publication).
   [[nodiscard]] uint64_t max_build_hash_table_bytes() const noexcept
   {
     return _max_build_hash_table_bytes;
   }
 
-  /// Reported by the upstream PARTITION at sizing time: the build port will deliver one
-  /// concat-folded batch covering the entire build side (single-partition or broadcast build).
-  /// Precondition for claiming a build batch for dynamic-filter publication, in any join mode.
+  // Publication may claim only a delivery known to contain the whole build.
   void set_build_arrives_whole(bool arrives_whole);
 
   /// @brief True when this join runs in build-then-probe mode (see `get_partition_strategy`).
@@ -401,14 +391,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   // the probe side is streamed unpartitioned.
   bool _broadcast = false;
 
-  // Whether the build port delivers one concat-folded batch covering the entire build side
-  // (single-partition or broadcast build with a concat_all'd build-side CONCAT). Set by the
-  // upstream PARTITION at sizing time; the one-shot dynamic-filter publisher only claims a build
-  // batch when this holds. Guarded by op_state_mutex.
   bool _build_arrives_whole = false;
 
-  // Latches the "dynamic filter NOT published" diagnostic and its stats counter to once per
-  // join, not once per build batch. Guarded by op_state_mutex.
+  // Guarded by op_state_mutex.
   bool _build_not_whole_reported = false;
 
   // Whether any build-side join key column contains a NULL. Used exclusively for MARK join
@@ -468,70 +453,30 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
  protected:
   std::vector<key_cast_info> key_casts;
 
-  //===----------------------------------------------------------------------===//
-  // Dynamic Filters
-  //===----------------------------------------------------------------------===//
-  /// @brief Perform this join's claimed dynamic-filter publication attempt.
-  ///
-  /// The only publishing caller is @ref push_data_batch_partitioned. It claims @c OPEN to @c
-  /// PUBLISHING under @ref op_state_mutex at decision time and publishes from an eligible,
-  /// concat-folded whole-build batch before any probe batch is required.
-  ///
-  /// This method requires @c PUBLISHING on entry and owns the terminal transition to @c FINISHED or
-  /// @c FAILED. GPU work runs without holding @ref op_state_mutex. A successful attempt ends in @c
-  /// FINISHED even when selectivity gates or drained targets cause it to emit no filters. Device
-  /// memory exhaustion (@c rmm::out_of_memory, covering cucascade's subclass) is contained: the
-  /// window ends @c FAILED and the method returns normally, so the query proceeds without filters.
-  /// Any other exception also ends the window @c FAILED but propagates to the caller. @ref
-  /// on_finalize_operator never publishes; it only changes an unclaimed @c OPEN window to @c CLOSED
-  /// before releasing BUILD_PROBE state.
-  ///
-  /// @param build_view The build side to reduce / build membership over.
-  /// @param stream     Durable build-memory-space stream used for filter construction.
+  // Requires PUBLISHING and leaves FINISHED or FAILED. Device OOM is contained; other failures
+  // propagate.
   void publish_dynamic_filters(cudf::table_view const& build_view, rmm::cuda_stream_view stream);
 
   enum class dynamic_filter_publication_state : std::uint8_t {
-    OPEN,        ///< An eligible whole-build delivery may claim the publication window.
-    PUBLISHING,  ///< The claiming delivery owns construction, replication, and fan-out.
-    FINISHED,    ///< A claimed attempt completed successfully (possibly emitting none).
-    FAILED,      ///< The claimed attempt threw; the uncertain state must not be retried.
-    CLOSED       ///< Finalization closed an unclaimed publication window.
+    OPEN,
+    PUBLISHING,
+    FINISHED,
+    FAILED,  ///< Terminal: a failed window is never reopened for a sibling retry.
+    CLOSED
   };
 
-  /// Plan-time routing, policy, and replica placement; after construction only
-  /// restrict_dynamic_filter_replicas narrows the replica set -- possibly to disabled -- before
-  /// execution begins.
+  // Narrowed before execution; immutable during execution.
   dynamic_filter_publish_plan _dynamic_filter_plan;
-  // Optional non-owning counter sink. SiriusContext owns it and outlives the plan.
+  // Non-owning; SiriusContext outlives the plan.
   dynamic_filter_stats* _dynamic_filter_stats = nullptr;
-  /// Arbitrates publication claims against finalization.
   std::atomic<dynamic_filter_publication_state> _dynamic_filter_publication_state{
     dynamic_filter_publication_state::OPEN};
-  //===----------------------------------------------------------------------===//
 
  public:
-  /// @brief Route a partitioned batch and publish dynamic filters from an eligible build batch.
-  ///
-  /// For an eligible delivery on the @c build port of a wired join, the concat-folded whole-build
-  /// batch is the publication point. The publication window is claimed (@c OPEN to @c PUBLISHING)
-  /// at decision time, under @ref op_state_mutex and before the batch is routed; before control
-  /// leaves this method, a claimed window ends terminal (@c FINISHED or @c FAILED) or is reopened
-  /// to @c OPEN by the no-usable-GPU-source skip so a sibling broadcast delivery can claim it.
-  /// The batch's read-only accessor is likewise acquired BEFORE it is routed: once deposited
-  /// into a repository the batch becomes a downgrade candidate, and holding the shared lock across
-  /// the deposit pins its GPU representation until publication completes. A stream borrowed from
-  /// the build memory space then waits on the batch writer event and builds and replicates filters
-  /// from the build keys without requiring a probe batch or a built hash table.
-  ///
-  /// Other ports and ineligible build deliveries are routed without publishing. For @c BUILD_PROBE,
-  /// this synchronous hook completes before the join's immediate probe producer is scheduled.
-  /// Other join modes and scan targets reached through an intervening join are not gated by that
-  /// edge.
   void push_data_batch_partitioned(std::string_view port_id,
                                    std::shared_ptr<::cucascade::data_batch> batch,
                                    std::size_t partition_idx) override;
 
-  /// @brief This join's dynamic-filter publication plan.
   [[nodiscard]] dynamic_filter_publish_plan const& dynamic_filter_plan() const noexcept
   {
     return _dynamic_filter_plan;

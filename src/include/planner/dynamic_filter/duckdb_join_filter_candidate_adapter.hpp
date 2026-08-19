@@ -18,11 +18,7 @@
 
 /**
  * @file
- * @brief Test-only parity oracle over DuckDB's join-filter pushdown metadata
- *
- * Parity tests snapshot DuckDB's `JoinFilterPushdownInfo` and compare it with Sirius-owned target
- * discovery. Production code does not consume these values, and the adapter translation unit is
- * linked only into the test target.
+ * @brief Test-only adapter for comparing Sirius discovery with DuckDB pushdown metadata
  */
 
 #include <duckdb/common/enums/expression_type.hpp>
@@ -47,35 +43,18 @@ class candidate_builder;
 
 using duckdb_dynamic_filter_channel = duckdb::shared_ptr<duckdb::DynamicTableFilterSet const>;
 
-/**
- * @brief Structural classification of one comparison join's DuckDB dynamic-filter metadata.
- */
-enum class duckdb_candidate_kind {
-  absent,           ///< No JoinFilterPushdownInfo was attached to the join.
-  statistics_only,  ///< DuckDB deliberately recorded no probe target; the build hint is false.
-  admitted,         ///< The recorded indexes, target arity, and channel identities are usable.
-  malformed,        ///< The adapter can prove that the recorded structure is inconsistent.
-};
+enum class duckdb_candidate_kind { absent, statistics_only, admitted, malformed };
 
 /**
- * @brief One probe target named by the producing join, copied into Sirius-owned values.
+ * @brief Snapshot of one DuckDB probe target
  *
- * A target is one base-table scan (`LogicalGet`) on the join's probe subtree that DuckDB's
- * pushdown walk selected to receive the build-side filters — one entry per `probe_info` element.
- * A join can name several scans (e.g., a probe side built from a UNION reaches one per branch),
- * and every target carries the full key arity: `columns[j]` names where filter ordinal `j`'s
- * key lives in THIS scan's output.
- *
- * `channel_identity` keeps the exact shared DuckDB object alive and exposes it as a read-only,
- * opaque map key during planning. DuckDB owns mutation of the underlying runtime filter set.
- * Targets have no disengaged state, so they are copyable but not movable.
+ * `columns[j]` locates filter ordinal `j` in the scan's `column_ids`; `channel_identity` is
+ * used only to pair producer and scan snapshots.
  */
 class duckdb_probe_target_candidate final {
  public:
   struct probe_column {
-    /// Index INTO the target scan's `column_ids` vector (its projection position, i.e.,
-    /// probe_info[t].columns[j]), NOT the base-table column index stored at that position
-    /// (`column_ids[i].GetPrimaryIndex()`).
+    // Position in column_ids, not a base-table column ID.
     std::size_t column_index = 0;
     duckdb::LogicalType storage_type{};
   };
@@ -102,19 +81,10 @@ class duckdb_probe_target_candidate final {
 };
 
 /**
- * @brief Immutable Sirius-owned snapshot of one comparison join's dynamic-filter metadata.
+ * @brief Immutable snapshot keyed by DuckDB filter ordinal
  *
- * The filter-key set is decided once per producing join and is SHARED by every target; a target
- * records only where each shared key lands in its own scan. The vectors form a keys-by-targets
- * grid indexed by DuckDB filter ordinal `j` (the position in the aligned vectors — a different
- * ordinal space from the join-condition index stored at that position):
- *
- *   shared across targets    condition_indexes[j]       index into the join's condition vector
- *                            condition_comparisons[j]   comparison at that condition index
- *   per target t             targets[t].columns[j]      where key j lands in scan t's output
- *
- * The filter ordinal exists only to align these vectors; the stored condition index and
- * per-target scan-column position remain distinct coordinate spaces.
+ * `condition_indexes[j]` and `condition_comparisons[j]` are shared; each
+ * `targets[t].columns[j]` locates that key in target `t`.
  */
 class duckdb_join_filter_candidate final {
  public:
@@ -160,35 +130,17 @@ class duckdb_join_filter_candidate final {
   std::vector<duckdb_probe_target_candidate> _targets;
 };
 
-/**
- * @brief Reads DuckDB's dynamic-filter metadata layout into Sirius-owned values.
- *
- * Consumers do not retain or dereference DuckDB's `JoinFilterPushdownInfo`; only the opaque
- * channel handle keeps a shared DuckDB object alive, without exposing mutation.
- */
 namespace duckdb_join_filter_candidate_adapter {
 
 /**
- * @brief Classify and snapshot one comparison join's dynamic-filter metadata into Sirius values.
+ * @brief Snapshots metadata, returning malformed for inconsistent indices, arity, or identities
  *
- * Fails closed (@c malformed) on structural corruption it can prove locally:
- *  - an empty recorded condition-index list,
- *  - an out-of-range or duplicate condition index,
- *  - a target whose column count disagrees with the recorded ordinal count,
- *  - targetless metadata carrying a build-side filter hint, or
- *  - a non-empty `probe_info` whose every channel identity is null.
- *
- * A malformed result carries only `kind == malformed`; callers must not rely on partially copied
- * fields from the rejected metadata.
+ * Malformed results expose only `kind`.
  */
 [[nodiscard]] duckdb_join_filter_candidate extract(duckdb::LogicalComparisonJoin const& op);
 
 /**
- * @brief Return the opaque channel identity at the scan end of the join-scan pairing.
- *
- * Pointer equality with the producer-side handle from @ref extract pairs the two ends during
- * planning. The returned handle keeps the channel alive but exposes only a const pointee; DuckDB
- * owns runtime mutation.
+ * @brief Returns the scan-side identity used to pair with @ref extract
  */
 [[nodiscard]] duckdb_dynamic_filter_channel scan_channel_identity(duckdb::LogicalGet const& get);
 

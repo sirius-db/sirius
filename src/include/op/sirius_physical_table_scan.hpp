@@ -97,8 +97,6 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   duckdb::vector<duckdb::Value> parameters;
   //! Named parameters of the table function
   duckdb::named_parameter_map_t named_parameters;
-  /// The dynamic-filter channel feeding this scan, if any; attached by a producing join's
-  /// discovery walk when a key binds into this scan, consumed by `make_gpu_scan_leaf`.
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> sirius_dynamic_filters;
   //! Virtual columns
   duckdb::virtual_column_map_t virtual_columns;

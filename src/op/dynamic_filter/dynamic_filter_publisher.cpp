@@ -42,8 +42,7 @@
 namespace sirius::op {
 
 namespace {
-// Minimum L2 cache size across every GPU that may probe the filter (0 if any query fails). A single
-// filter kind is replicated to all probe devices, so the exact set must fit the smallest cache.
+// Size exact filters for the smallest probe-device L2; return 0 if unavailable.
 std::size_t device_l2_cache_bytes(
   std::span<dynamic_filter_replica_space const> replica_spaces) noexcept
 {
@@ -96,8 +95,6 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
 
   auto const& admitted_keys = plan.admitted_keys();
 
-  // Admission records legality, not consumption: an admitted key may have no binding, and such a
-  // key must cost no filter construction. Binding indexes are constructor-validated.
   std::vector<char> key_bound(admitted_keys.size(), 0);
   for (auto const& target : probe_targets) {
     for (auto const& binding : target.key_bindings) {
@@ -125,9 +122,6 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
   auto const build_rows    = static_cast<std::size_t>(build_view.num_rows());
   auto const l2_bytes      = device_l2_cache_bytes(plan.replica_spaces());
 
-  // Up to two complementary filters per key: a zone map (read-time row-group pruning) and a
-  // post-decode membership filter; either may be absent. All three vectors are indexed by
-  // admitted-key index.
   std::vector<std::shared_ptr<sirius_dynamic_filter>> per_key_zone_map(admitted_keys.size());
   std::vector<std::shared_ptr<sirius_dynamic_filter>> per_key_membership(admitted_keys.size());
   std::vector<cudf::data_type> per_key_build_type(admitted_keys.size(),
@@ -166,7 +160,6 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
     }
     auto const& col = build_view.column(admitted_key.build_key_ordinal);
     if (col.type() != admitted_key.storage_type) {
-      // Advisory skip rather than a query failure: the join remains authoritative.
       SIRIUS_LOG_WARN(
         "[sirius_physical_hash_join] dynamic filter key {}: skipped (plan recorded type id {} but "
         "build column {} carries type id {}).",
@@ -179,7 +172,8 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
     }
     per_key_build_type[admitted_key_index] = col.type();
 
-    if (plan.emit_zone_map_filters()) {
+    if (plan.emit_zone_map_filters() &&
+        sirius::op::sirius_dynamic_zone_map_filter::supports(col.type())) {
       nvtx3::scoped_range vr{"dynfilter::build_zone_map"};
       auto min_s = cudf::reduce(col,
                                 *cudf::make_min_aggregation<cudf::reduce_aggregation>(),
@@ -254,15 +248,12 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
       choice);
   }
 
-  // Publish is cross-stream: consumers probe these structures from their own task streams the
-  // moment push_filter lands, with no event ordering back to local producer `stream`.
+  // Finish construction and replication before publishing to independent consumer streams.
   auto const built = [](auto const& f) { return static_cast<bool>(f); };
   if (std::any_of(per_key_membership.begin(), per_key_membership.end(), built) ||
       std::any_of(per_key_zone_map.begin(), per_key_zone_map.end(), built)) {
     stream.synchronize();
 
-    // Replication completes before any filter is published, so consumers never wait and never
-    // observe a cross-device pointer.
     nvtx3::scoped_range replicate_range{"dynfilter::replicate_devices"};
     auto replicate = [&plan](std::shared_ptr<sirius_dynamic_filter> const& filter) {
       if (!filter) { return; }
@@ -282,8 +273,6 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
     }
   }
 
-  // Fan out across probe targets, sparsely: each target receives exactly its bound keys' filters
-  // at its own channel push ordinals.
   std::size_t total_pushed   = 0;
   std::size_t active_targets = 0;
   for (auto const& tgt : probe_targets) {
@@ -292,7 +281,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
     ++outcome.active_targets;
 
     for (auto const& binding : tgt.key_bindings) {
-      assert(binding.admitted_key_index < admitted_keys.size());  // plan-constructor invariant
+      assert(binding.admitted_key_index < admitted_keys.size());
       auto const& zone_map = per_key_zone_map[binding.admitted_key_index];
       if (zone_map && tgt.accepts_zone_map_filters &&
           binding.probe_storage_type == per_key_build_type[binding.admitted_key_index] &&

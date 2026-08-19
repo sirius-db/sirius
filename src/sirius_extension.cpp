@@ -2298,7 +2298,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
       SetEnablePinnedZoneMapPruning);
     config.AddExtensionOption("enable_dynamic_filter",
                               "TEST ONLY: disable runtime dynamic-filter discovery for eligible "
-                              "BUILD_PROBE hash joins (probe-side scan and join-edge targets)",
+                              "hash joins (probe-side scan and join-edge targets)",
                               LogicalType::BOOLEAN,
                               Value::BOOLEAN(operator_defaults.enable_dynamic_filter),
                               SetEnableDynamicFilter);
@@ -2470,7 +2470,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
   config.AddExtensionOption(
     "dynamic_filter_domain_coverage_threshold",
     "Skip publishing a key's dynamic filters when the hash-join build covers at least this "
-    "fraction of the key's domain; >= 1.0 effectively disables the gate",
+    "fraction of the key's domain; values above 1.0 disable the gate",
     LogicalType::DOUBLE,
     Value::DOUBLE(operator_defaults.dynamic_filter_domain_coverage_threshold),
     SetDynamicFilterDomainCoverageThreshold);

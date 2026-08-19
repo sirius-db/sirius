@@ -414,17 +414,15 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   bool const dynamic_filter_enabled =
     sirius_context && sirius_context->get_config().get_operator_params().enable_dynamic_filter;
 
-  // Filter or opaque-build evidence enables discovery; tracked apart only for the wired log.
   bool const build_filtered = dynamic_filter_enabled && build_subtree_is_filtering(*op.children[1]);
   bool const build_opaque   = dynamic_filter_enabled && build_relation_is_opaque(*op.children[1]);
   bool const build_evidence = build_filtered || build_opaque;
 
-  // Gather domain evidence before create_plan() moves state out of the logical children.
+  // Capture domain and uniqueness evidence before create_plan() moves the logical children.
   auto condition_domains =
     build_evidence ? build_key_domain_cardinalities(op, duckdb_base_table_cardinality{context})
                    : std::vector<std::size_t>{};
 
-  // Probe build-side uniqueness BEFORE create_plan, which moves data out of the logical nodes.
   auto build_side_unique_cols  = prove_unique_columns(*op.children[1]);
   auto left                    = create_plan(*op.children[0]);
   auto right                   = create_plan(*op.children[1]);
@@ -440,9 +438,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   // Preserve key shape before materialization makes computed keys look like direct references.
   auto condition_key_shapes = classify_join_key_shapes(op.conditions);
 
-  // Materialize any complex expressions in equality conditions into real columns below the join,
-  // rewriting those condition sides to plain references. This must run before the conditions are
-  // inspected/wrapped below so all downstream analysis sees plain column references.
+  // Materialize computed equality keys before downstream admission and join planning.
   materialize_expression_join_keys(op, left, right);
 
   std::size_t has_range              = 0;
@@ -478,15 +474,13 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   if (is_supported_by_hash_join && !prefer_range_joins) {
     const auto& op_params = sirius_context->get_config().get_operator_params();
 
-    // Device placement is resolved before discovery attaches or mints any channel: a producer
-    // must not register on channels it would then abandon for want of a replica placement.
+    // Resolve placements before registering any producer channel.
     auto& memory_manager  = sirius_context->get_memory_manager();
     auto const gpu_spaces = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
     auto const host_spaces =
       memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
 
-    // Only a single-column uniqueness proof arms a key's coverage gate: tuple uniqueness bounds
-    // distinct tuples, not distinct values of one column, so a composite proof passes nothing.
+    // Only a single-column proof can establish per-key uniqueness.
     auto const build_side_unique_column =
       build_side_unique_cols.size() == 1
         ? std::optional<std::size_t>{static_cast<std::size_t>(*build_side_unique_cols.begin())}
@@ -494,9 +488,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     auto admitted_keys = admit_dynamic_filter_keys(
       conditions, condition_key_shapes, condition_domains, build_side_unique_column);
 
-    // Scan bindings take precedence over join-edge endpoints, so one key never publishes through
-    // both routes. Delim joins share this planner entry point but are not dynamic-filter
-    // producers.
+    // Prefer scan binding; each key uses one route.
     std::vector<sirius::op::dynamic_filter_publish_plan::probe_target> targets;
     std::size_t scan_target_count = 0;
     bool const discovery_runs     = build_evidence &&
@@ -509,8 +501,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       for (std::size_t key_index = 0; key_index < admitted_keys.size(); ++key_index) {
         auto const& key       = admitted_keys[key_index];
         auto const& condition = conditions[key.planner_condition_index];
-        // The entry ordinal is in the probe child's output space; each terminal's ordinal is in
-        // that terminal operator's own output space. They relate only through the trace.
+        // Terminal ordinals are local to each terminal, not the probe entry schema.
         auto const terminals =
           trace_probe_key(*left, static_cast<std::size_t>(key.probe_key_ordinal), policy);
         bool scan_bound = false;
@@ -520,10 +511,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
             continue;
           }
           auto& scan = terminal.node->Cast<sirius::op::sirius_physical_table_scan>();
-          // The exit ordinal is the scan-route push coordinate; see dynamic_filter_route_class.
           if (terminal.ordinal >= scan.types.size()) {
-            // The trace owns this invariant; a violation is a planner bug elsewhere. Refuse the
-            // binding rather than read out of bounds — losing it only forfeits pruning.
             SIRIUS_LOG_WARN(
               "[sirius_plan_comparison_join] dynamic filter key {}: scan-route terminal at scan "
               "'{}' carries exit ordinal {} outside the scan's {} output columns; skipping this "
@@ -536,9 +524,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           }
           auto const [entry, inserted] = target_by_scan.try_emplace(terminal.node, targets.size());
           if (inserted) {
-            // The scan node is the pairing point: an inner producer's scan already carries its
-            // channel when an outer producer's trace reaches it (bottom-up construction), so
-            // attach-or-reuse shares one channel across producers.
+            // Reuse the scan channel so multiple producers share the consumer.
             if (!scan.sirius_dynamic_filters) {
               scan.sirius_dynamic_filters =
                 std::make_shared<sirius::op::sirius_dynamic_filter_set>();
@@ -557,10 +543,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           scan_bound = true;
         }
         if (scan_bound) { continue; }
-        // Build-block descent is safe only for admission-vetted equality keys; the null-equal
-        // hazard is documented at admit_scan_route_key. Projection folding preserves the outer
-        // output and inner input spaces, so a recorded site ordinal remains valid when
-        // fold_adjacent_projections() runs later.
+        // Admission proves build-block safety; placement preserves the reported site ordinal.
         if (!direct_route_admissible(op.join_type,
                                      condition.comparison,
                                      key.key_shape,
@@ -587,9 +570,6 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           });
         left = std::move(placed.subtree);
         if (site_channels.size() != placed.site_ordinals.size()) {
-          // The walk owns this invariant; a violation is a planner bug elsewhere. Leave the
-          // spliced endpoints unwired (an empty channel passes rows through) rather than pair
-          // channels and ordinals out of bounds.
           SIRIUS_LOG_WARN(
             "[sirius_plan_comparison_join] dynamic filter key {}: direct-route walk placed {} "
             "endpoints but recorded {} site ordinals; skipping this key's bindings.",
@@ -599,7 +579,6 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           continue;
         }
         for (std::size_t site = 0; site < site_channels.size(); ++site) {
-          // The site ordinal is the direct-route push coordinate; see dynamic_filter_route_class.
           targets.push_back({.filter_set  = std::move(site_channels[site]),
                              .route_class = sirius::op::dynamic_filter_route_class::direct,
                              .accepts_zone_map_filters = false,
@@ -608,10 +587,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                                                            .probe_storage_type   = key.probe_storage_type}}});
         }
       }
-      // Register this join as a producer on each wired channel only after every key has bound:
-      // a later key can bind to a channel an earlier key created, and the declared plan must be
-      // exhaustive for every push_filter this producer can ever issue. The planned coordinates
-      // are the bindings' push ordinals — the exact space push_filter uses on that channel.
+      // Register after all keys bind so each declaration covers every planned push.
       for (auto const& target : targets) {
         std::vector<std::size_t> planned_columns;
         planned_columns.reserve(target.key_bindings.size());

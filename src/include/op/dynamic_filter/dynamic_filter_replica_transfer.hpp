@@ -27,47 +27,21 @@ class memory_space;
 
 namespace sirius::op::detail {
 
-/**
- * @brief The route selected for a dynamic-filter replica transfer
- *
- * @note Exposed for transfer tests and logging.
- */
-enum class replica_transfer_route {
-  none,
-  local,        ///< Same-device copy
-  peer_dma,     ///< GPU-to-GPU copy via peer DMA
-  host_staging  ///< Copy through the target's Sirius HOST memory space
-};
+enum class replica_transfer_route { none, local, peer_dma, host_staging };
+
+enum class replica_transfer_policy { automatic, force_host_staging };
 
 /**
- * @brief The transfer policy
+ * @brief Enqueues a finalized replica copy and returns its route
  *
- * @note Exposed for transfer-route tests.
- */
-enum class replica_transfer_policy {
-  automatic,
-  force_host_staging  ///< For deterministic host-fallback testing
-};
-
-/**
- * @brief Submit a copy of finalized dynamic-filter storage and return the selected route
+ * Source writes must already be complete. Local and peer copies are asynchronous on
+ * @p destination_stream; keep both allocations alive and synchronize before publication. Host
+ * staging completes before return. @p source_space must own @p source; @p destination and
+ * @p destination_stream must belong to @p destination_device.
  *
- * The caller must make all source writes complete before calling; this function deliberately does
- * not infer or synchronize the source's producer stream. @p source_space must be the Sirius GPU
- * memory space that owns @p source; the staged fallback acquires a source-bound pooled stream from
- * it. The destination allocation and stream must belong to @p destination_device. Directionally
- * verified peer DMA is preferred; if the probe rejects it, the source is copied through fixed
- * pinned blocks borrowed from @p host_staging_space.
- *
- * Local and peer-DMA copies are only enqueued on @p destination_stream; the caller must keep both
- * allocations alive and synchronize that stream before publishing the replica. HOST staging
- * completes both dependent legs before returning so its borrowed blocks can immediately return to
- * the pool. An enqueue or synchronization failure propagates.
- *
- * @throw std::invalid_argument if a pointer is null for a non-empty copy or either memory space
- * has the wrong tier
- * @throw std::runtime_error if host staging is required but the HOST space has no fixed-size
- * staging resource
+ * @throw std::invalid_argument if a pointer is null for a non-empty copy, the source is not
+ * GPU-tier, or required host staging is not HOST-tier
+ * @throw std::runtime_error if required host staging is unavailable
  */
 replica_transfer_route enqueue_replica_copy(
   void* destination,

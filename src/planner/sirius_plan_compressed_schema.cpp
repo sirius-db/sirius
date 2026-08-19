@@ -281,9 +281,7 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
         slot->set_physical_types({});
         return;
       }
-      // Planned target columns are scan output ordinals: the channel's push, store, and lookup
-      // coordinate (the discovery walk's exit ordinal at this scan). No column_ids translation
-      // exists between the channel and the scan output.
+      // Channel target ordinals are scan outputs; no column_ids remap applies.
       auto const targets = scan.sirius_dynamic_filters->planned_target_columns();
       auto const native  = native_physical_schema(*slot);
       auto physical      = slot->get_physical_types();
@@ -457,10 +455,7 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
       return;
     }
 
-    // A plan-time-placed dynamic-filter endpoint (build-side placement) applies membership masks
-    // whose probe storage types were recorded native at admission, so narrowed carriers stop at
-    // the boundary restore below. Scan-companion DYNAMIC_FILTER wrappers only appear after
-    // these passes, at insert_gpu_pipeline_operators time.
+    // Plan-time endpoints require native carriers; scan wrappers are inserted after propagation.
     case sirius::op::SiriusPhysicalOperatorType::DYNAMIC_FILTER: break;
 
     default: break;

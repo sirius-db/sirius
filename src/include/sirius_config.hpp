@@ -75,9 +75,6 @@ constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
 /// disable (always use filtered_join).
 constexpr double DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO = 8.0;
 
-/**
- * @brief Ingress validation predicate for `dynamic_filter_domain_coverage_threshold`
- */
 struct valid_domain_coverage_threshold {
   [[nodiscard]] bool operator()(double value) const noexcept
   {
@@ -150,34 +147,22 @@ struct operator_params {
   /// DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE.
   bool enable_runtime_distinct_build_probe = config::DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE;
 
-  /// Enable runtime dynamic-filter discovery for eligible BUILD_PROBE hash joins. Targets may be
-  /// probe-side scans or join-edge endpoints.
+  /// Enable dynamic filters for eligible hash joins.
   bool enable_dynamic_filter = true;
 
-  /// Emit build-key min/max filters in addition to membership filters. Parquet scans use them for
-  /// row-group pruning; duckdb-native scans apply them post-decode. Effective only when
-  /// `enable_dynamic_filter` is enabled.
+  /// Emit build-key min/max filters in addition to membership filters.
   bool enable_dynamic_zone_map_filter = false;
 
-  /// Skip all publication for a key when the build covers at least this fraction of its unfiltered
-  /// base-table row bound. The gate applies only to proven-unique keys with DuckDB-native
-  /// cardinality evidence. Values above 1.0 disable it; 1.0 skips full coverage.
+  /// Skip a proven-unique key when its complete build meets this known-domain coverage. Values
+  /// above 1 disable the gate.
   double dynamic_filter_domain_coverage_threshold = 0.9;
 
-  /// Maximum estimated cuco-set size for the exact hash IN-list membership filter, as a fraction of
-  /// the smallest queried probe-GPU L2 cache (cudaDevAttrL2CacheSize), in [0, 1]. Larger sets
-  /// publish a Bloom filter instead: a streaming probe evicts a near-L2-sized set every pass, where
-  /// the smaller Bloom bit array stays cache-resident. A GB300 residency sweep measured the
-  /// IN-list's probe cost flat below ~0.28 of L2 and steadily degrading beyond, with the (inexact)
-  /// Bloom probing >= 2.2x faster at every swept size; the default 0.125 sits inside that flat
-  /// region, keeping the exact filter only where exactness costs the least. 0 always publishes the
-  /// Bloom when the key type supports it; 1.0 reproduces the legacy L2-fit rule. Ignored when no
-  /// device L2 size is available (the legacy fit rule then applies unchanged).
+  /// Hash-IN-list size limit as a fraction of the smallest known probe-GPU L2, in [0, 1]. Larger
+  /// sets use Bloom; unknown L2 makes the hash IN-list ineligible.
   double dynamic_filter_inlist_max_l2_fraction = 0.125;
 
-  /// Consumer-side scan gate: disable a scan's post-decode dynamic filtering once a measured split
-  /// keeps more than this fraction of its rows (too unselective to repay the mask kernel). In
-  /// [0, 1]; 1.0 keeps filtering always on.
+  /// Disable post-decode filtering above this measured keep ratio. Values are in [0, 1]; 1 keeps
+  /// the scan-level gate active.
   double dynamic_filter_keep_threshold = 0.9;
 
   /// Zone-map pruning of pinned-table chunks at cache-serve time: skip cached chunks whose pin-time

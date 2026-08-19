@@ -25,12 +25,9 @@ class memory_space;
 namespace sirius::op {
 
 /**
- * @brief Non-owning placement handle for one device-local dynamic-filter replica
+ * @brief Non-owning GPU and host-staging spaces for one replica
  *
- * The GPU memory space supplies reservation admission, the replica allocator, and a pooled CUDA
- * stream. The paired HOST memory space supplies pre-pinned fixed blocks when direct peer DMA is
- * unavailable. Both referenced spaces must outlive this handle. Placement is immutable, while
- * reservation accounting mutates the GPU space at runtime.
+ * Both spaces must outlive this handle.
  */
 class dynamic_filter_replica_space final {
  public:
@@ -40,17 +37,11 @@ class dynamic_filter_replica_space final {
   {
   }
 
-  /**
-   * @brief GPU placement and mutable runtime accounting state for the replica
-   */
   [[nodiscard]] cucascade::memory::memory_space& get_gpu_space() const noexcept
   {
     return _gpu_space.get();
   }
 
-  /**
-   * @brief Host staging space paired with the GPU placement
-   */
   [[nodiscard]] cucascade::memory::memory_space const& get_host_staging_space() const noexcept
   {
     return _host_staging_space.get();

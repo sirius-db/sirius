@@ -61,8 +61,7 @@ std::optional<op::dynamic_filter_publish_plan::admitted_key> admit_scan_route_ke
   std::size_t domain_cardinality,
   std::optional<std::size_t> build_side_unique_column)
 {
-  // Under null-equal semantics, pruning a LEFT join's build input can create an accepted
-  // NULL-padded row, so null-equal keys are not admissible.
+  // Null-equal keys could turn a pruned LEFT join match into an accepted NULL-padded row.
   if (condition.comparison != sirius::comparison_type::equal) { return std::nullopt; }
   if (side_blocks_scan_route(shape.probe) || side_blocks_scan_route(shape.build)) {
     return std::nullopt;
@@ -76,8 +75,7 @@ std::optional<op::dynamic_filter_publish_plan::admitted_key> admit_scan_route_ke
 
   auto const build_key_ordinal = to_key_column_ordinal(build_ref.column_index);
 
-  // Discovery requires a real probe entry ordinal. EMPTY preserves an unrepresentable probe type
-  // for zone-map suppression and direct-route rejection.
+  // EMPTY preserves unsupported probe types for later route checks.
   auto const& probe_side = *condition.left;
   if (!probe_side.is_reference()) { return std::nullopt; }
   auto const probe_key_ordinal  = to_key_column_ordinal(probe_side.as_reference().column_index);

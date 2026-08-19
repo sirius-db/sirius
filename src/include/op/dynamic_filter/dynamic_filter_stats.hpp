@@ -22,11 +22,9 @@
 namespace sirius::op {
 
 /**
- * @brief Plain copyable snapshot of @ref dynamic_filter_stats
+ * @brief Relaxed, copyable snapshot of @ref dynamic_filter_stats
  *
- * Field meanings are documented once, on the atomic aggregate. Each field is individually coherent
- * at any time; cross-field comparisons are meaningful only while no publisher is updating the
- * counters.
+ * Individual fields are coherent; cross-field identities require no concurrent updates.
  */
 struct dynamic_filter_stats_snapshot {
   std::uint64_t producers_enabled = 0;
@@ -49,67 +47,33 @@ struct dynamic_filter_stats_snapshot {
 };
 
 /**
- * @brief Connection-lifetime dynamic-filter publication counters, owned by `SiriusContext`
+ * @brief Connection-lifetime publication counters owned by `SiriusContext`
  *
- * `sirius_physical_hash_join` folds each `dynamic_filter_publication_outcome` into this sink
- * through a non-owning pointer handed to it at construction by `sirius_plan_comparison_join`. The
- * owning `SiriusContext` outlives every plan built during a query -- the same lifetime contract as
- * `dynamic_filter_replica_space`.
- *
- * `producers_enabled` counts plan constructions, not executed producers: the transparent path
- * builds the physical plan at prepare and again at execution, so one query contributes twice per
- * producing join. Never use it in an accounting identity against the other counters.
- *
- * The key and filter counters record policy decisions for attempts that reach per-key processing. A
- * source-residency or all-targets-drained return occurs earlier and does not increment them.
- *
- * The delivery counters classify build deliveries, not joins. Each claim counts one attempt and
- * lands in exactly one of the three outcome counters, so `publication_attempts ==
- * publications_finished + publications_failed + publications_skipped_source_not_resident`; a
- * not-resident skip reopens the window, so a skipped-then-rescued broadcast build counts two
- * attempts, one skip, and one finish. A restriction-disabled producer (see
- * dynamic_filter_publish_plan::restrict_replicas_to) was already counted in producers_enabled at
- * construction and contributes no attempts. `publications_skipped_build_not_whole` is latched once
- * per join, so a join's later non-claiming deliveries, and deliveries after the publication window
- * closes, are counted nowhere.
+ * `producers_enabled` counts plan construction, not execution. Each claim increments
+ * `publication_attempts` and exactly one of `publications_finished`, `publications_failed`, or
+ * `publications_skipped_source_not_resident`; a source skip may reopen the claim window.
  */
 struct dynamic_filter_stats {
-  // Plan-time fact
-  std::atomic<std::uint64_t> producers_enabled{0};  ///< Joins constructed with an enabled plan
+  std::atomic<std::uint64_t> producers_enabled{0};
 
-  // Deterministic policy decisions
-  std::atomic<std::uint64_t> keys_considered{0};  ///< Bound admitted keys walked by publication
-                                                  ///< attempts
-  std::atomic<std::uint64_t> keys_with_known_domain{0};      ///< Keys carrying a nonzero domain
-  std::atomic<std::uint64_t> keys_skipped_domain_gate{0};    ///< Coverage gate fired
-  std::atomic<std::uint64_t> keys_skipped_type_mismatch{0};  ///< Plan/runtime type disagreement
-  std::atomic<std::uint64_t> keys_build_exceeded_domain{0};  ///< Build row count exceeded the
-                                                             ///< recorded domain bound
-  std::atomic<std::uint64_t> membership_filters_built{0};    ///< Constructed, before delivery
-  std::atomic<std::uint64_t> zone_map_filters_built{0};      ///< Constructed, before delivery
+  std::atomic<std::uint64_t> keys_considered{0};
+  std::atomic<std::uint64_t> keys_with_known_domain{0};
+  std::atomic<std::uint64_t> keys_skipped_domain_gate{0};
+  std::atomic<std::uint64_t> keys_skipped_type_mismatch{0};
+  std::atomic<std::uint64_t> keys_build_exceeded_domain{0};
+  std::atomic<std::uint64_t> membership_filters_built{0};
+  std::atomic<std::uint64_t> zone_map_filters_built{0};
 
-  // Opportunistic delivery
-  std::atomic<std::uint64_t> publication_attempts{0};  ///< OPEN -> PUBLISHING claims
+  std::atomic<std::uint64_t> publication_attempts{0};
   std::atomic<std::uint64_t> publications_finished{0};
-  /// Claimed attempts whose publication threw; device memory exhaustion is contained (the query
-  /// proceeds filterless), any other failure propagates.
   std::atomic<std::uint64_t> publications_failed{0};
-  /// The delivered build batch had no usable GPU-resident source on a plan device (not
-  /// GPU-resident, or resident on a GPU the plan holds no replica space for); the claimed window
-  /// reopens so a sibling (broadcast) delivery with a usable source can claim it
   std::atomic<std::uint64_t> publications_skipped_source_not_resident{0};
-  /// Wired join the upstream PARTITION never reported a whole build for, so its one-shot
-  /// publication window can never claim: probe-driven sizing, a hash-partitioned multi-partition
-  /// build (a broadcast build is whole on every partition), or no build-side CONCAT to fold.
-  /// Counted once per join, at the first build delivery that observes the condition.
+  // Counted once per join rather than once per delivery.
   std::atomic<std::uint64_t> publications_skipped_build_not_whole{0};
-  /// Attempt hit the all-targets-drained early return; no deterministic counter moved for it
   std::atomic<std::uint64_t> publications_skipped_targets_drained{0};
-  std::atomic<std::uint64_t> filters_pushed{0};  ///< Accepted pushes; drain-dependent
+  std::atomic<std::uint64_t> filters_pushed{0};
 
-  /**
-   * @brief Read every counter with relaxed ordering
-   */
+  // Snapshot loads are relaxed and are not atomic across fields.
   [[nodiscard]] dynamic_filter_stats_snapshot snapshot() const noexcept
   {
     return dynamic_filter_stats_snapshot{

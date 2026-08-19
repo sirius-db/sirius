@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-// sirius
 #include <expression/ast/node.hpp>
 #include <op/sirius_physical_filter.hpp>
 #include <op/sirius_physical_grouped_aggregate.hpp>
@@ -24,7 +23,6 @@
 #include <op/sirius_physical_projection.hpp>
 #include <planner/dynamic_filter/dynamic_filter_target_discovery.hpp>
 
-// stdlib
 #include <cassert>
 #include <variant>
 
@@ -32,8 +30,7 @@ namespace sirius::planner {
 
 namespace {
 
-// The probe/left block carries the traced value out un-null-padded for these join types. RIGHT and
-// FULL_OUTER (OUTER) null-pad the left block; SINGLE is unsupported by the GPU join.
+// These join types do not null-pad the probe block.
 bool probe_block_is_value_preserving(duckdb::JoinType join_type) noexcept
 {
   switch (join_type) {
@@ -52,8 +49,7 @@ bool probe_block_is_value_preserving(duckdb::JoinType join_type) noexcept
   return false;  // unreachable
 }
 
-// For INNER and LEFT joins, removing a build row only removes a result row or creates a NULL-padded
-// row that the producing join later drops. Other join types are not safe build-block routes.
+// Only INNER and LEFT preserve surviving probe values when build rows are removed.
 bool build_block_is_value_preserving(duckdb::JoinType join_type) noexcept
 {
   switch (join_type) {
@@ -146,8 +142,7 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
                                          output_ordinal,
                                          policy));
     }
-    // A filter is a row predicate over unchanged columns: value-preserving through its output
-    // gather and commuting with any other independent row predicate applied below it.
+    // Independent row predicates commute without changing column values.
     case SiriusPhysicalOperatorType::FILTER: {
       auto const& filter = node.Cast<sirius::op::sirius_physical_filter>();
       if (std::holds_alternative<sirius::op::passthrough>(filter.output_columns)) {
@@ -263,7 +258,6 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
 
 namespace {
 
-// A missing child turns the current node into a terminal.
 bool steps_are_followable(sirius::op::sirius_physical_operator const& node,
                           std::vector<descent_step> const& steps)
 {

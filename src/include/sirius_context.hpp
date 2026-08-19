@@ -546,12 +546,10 @@ class SiriusContext : public ClientContextState {
   /// \brief Snapshot counters for transparent execution observability.
   [[nodiscard]] transparent_execution_stats get_transparent_execution_stats() const noexcept;
 
-  /// \brief Return the connection-owned dynamic-filter counter sink.
   [[nodiscard]] sirius::op::dynamic_filter_stats& get_dynamic_filter_stats() noexcept
   {
     return dynamic_filter_stats_;
   }
-  /// \brief Return a non-transactional snapshot of the dynamic-filter counters.
   [[nodiscard]] sirius::op::dynamic_filter_stats_snapshot get_dynamic_filter_stats_snapshot()
     const noexcept
   {

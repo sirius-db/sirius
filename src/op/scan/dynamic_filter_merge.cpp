@@ -88,7 +88,6 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
 
   auto const include_ast_masks = mode == dynamic_filter_apply_mode::include_ast_row_masks;
 
-  // Conjoin AST-lowerable filters into one row mask when the scan reader did not apply them.
   if (include_ast_masks) {
     cudf::ast::tree tree;
     cudf::ast::expression const* root = nullptr;
@@ -110,19 +109,18 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
       }
     }
     if (root) {
-      // The AST mask can span columns, so only the scan-level gate records its combined effect.
+      // Cross-column AST masks update only the scan-level gate.
       (void)cascade_step(cudf::compute_column(current, *root, stream, mr));
     }
   }
 
-  // Apply membership filters in recorded selectivity order and omit filters the gate disabled.
   struct membership_entry {
     std::size_t col_idx;
     sirius::op::sirius_mask_applicable const* filter;
     sirius::op::sirius_dynamic_filter const* identity;
     std::optional<double> recorded;
   };
-  // Scope every marginal ratio read and update to one channel-size snapshot.
+  // Use one filter-count snapshot for every gate measurement in this pass.
   auto const observed_filter_count = filters.filter_count();
   std::vector<membership_entry> entries;
   for (auto const col_idx : filters.filtered_columns()) {
@@ -167,10 +165,9 @@ std::optional<double> dynamic_filter_gate::filter_keep_ratio(
   std::scoped_lock lock(_filter_ratios_mu);
   auto it = _filter_keep_ratios.find(filter);
   if (it == _filter_keep_ratios.end()) { return std::nullopt; }
-  // A skippable verdict is permanent: rechecking it would cost the very kernel the verdict
-  // avoids, and a wrong skip only forfeits pruning, never correctness.
+  // Skipping an optional filter cannot affect correctness, so its verdict is permanent.
   if (filter_skippable(it->second.kept)) { return it->second.kept; }
-  // Channel growth changes the rows reaching a selective filter, so remeasure its stale ratio.
+  // New filters can change this filter's marginal selectivity.
   if (it->second.observed_filter_count < observed_filter_count) { return std::nullopt; }
   return it->second.kept;
 }
@@ -183,7 +180,7 @@ void dynamic_filter_gate::record_filter_keep_ratio(sirius::op::sirius_dynamic_fi
   auto const it = _filter_keep_ratios.find(filter);
   if (it != _filter_keep_ratios.end() &&
       it->second.observed_filter_count >= observed_filter_count) {
-    return;  // already measured against at least this many filters -- no new information
+    return;
   }
   _filter_keep_ratios.insert_or_assign(
     filter, filter_measurement{.kept = kept, .observed_filter_count = observed_filter_count});
