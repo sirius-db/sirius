@@ -48,7 +48,9 @@ struct partition_column_plan {
 };
 
 // Copyable owner stored with one mixed partition view. Fixed columns are shared by nonempty sibling
-// batches; copied columns, when present, belong only to this partition.
+// batches; copied columns, when present, belong only to this partition. Consumers must read these
+// batches through get_table_view(); release_table() is unsafe on them (see the @warning on
+// sirius::make_data_batch_from_view).
 struct partition_view_owner {
   std::shared_ptr<cudf::table const> shared_fixed_columns;
   std::shared_ptr<cudf::table const> copied_columns;
