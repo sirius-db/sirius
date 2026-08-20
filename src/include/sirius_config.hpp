@@ -128,10 +128,11 @@ struct operator_params {
   /// disable (always use filtered_join).
   double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
 
-  /// When the planner could not prove build-key uniqueness, test it at runtime (one
-  /// cudf::distinct_count pass over the build keys) and take the single-pass
-  /// cudf::distinct_hash_join instead of the two-pass general path when the keys are in fact
-  /// distinct. BUILD_PROBE mode only, INNER/LEFT equality joins with null-unequal semantics. See
+  /// Engine-owned policy: when enabled and the planner could not prove build-key uniqueness, test
+  /// it at runtime (one cudf::distinct_count pass over the build keys) and take the single-pass
+  /// cudf::distinct_hash_join when the keys are distinct. Temporarily disabled pending issue #1600.
+  /// BUILD_PROBE mode only, INNER/LEFT equality joins with null-unequal semantics. Tests retain
+  /// direct programmatic control of this field to exercise both implementations. See
   /// DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE.
   bool enable_runtime_distinct_build_probe = config::DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE;
 

@@ -64,7 +64,9 @@ num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 - `src/op/sirius_physical_grouped_aggregate_merge.cpp`, `src/op/sirius_physical_top_n.cpp` — `build_pipelines()` overrides
 - `src/sirius_engine.cpp` — invokes marking after parent pointers are refreshed
 
-**Config:** `fuse_merge_pipelines` (default: true). See [physical-plan-generation.md](physical-plan-generation.md) → Merge fusion for pipeline-shape details.
+**Policy:** Sirius applies eligible merge fusion automatically. See
+[physical-plan-generation.md](physical-plan-generation.md) → Merge fusion for pipeline-shape
+details.
 
 ### Task Creator Look-Ahead (PR #1174)
 
