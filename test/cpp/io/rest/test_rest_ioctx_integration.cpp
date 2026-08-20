@@ -154,7 +154,7 @@ scan_manager_config make_fake_rest_config(std::string endpoint)
   cfg.rest.retry_jitter            = std::chrono::milliseconds{0};
   cfg.rest.honor_retry_after       = false;
   cfg.rest_n_reactors              = 1;
-  cfg.enable_prefetch_cache        = false;
+  cfg.cache.mode                   = sirius::io::cache::cache_mode::none;
   return cfg;
 }
 

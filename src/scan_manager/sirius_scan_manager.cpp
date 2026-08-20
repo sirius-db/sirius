@@ -82,6 +82,21 @@ namespace {
 using sirius::pinned_column_storage_matrix;
 using sirius::pinned_column_storage_meta;
 
+/// The readahead strategy a backend of @p type prefers, used when the config
+/// does not name one.  An object-store round trip is dead time no matter what
+/// else is running, so only queue depth hides it; a local device read competes
+/// with the executor's own reads, so issuing one mid-scan reorders the queue
+/// rather than adding throughput.  See @ref prefetch_strategy.
+prefetch_strategy backend_prefetch_strategy(io::io_context_type type) noexcept
+{
+  switch (type) {
+    case io::io_context_type::restful: return prefetch_strategy::eager;
+    case io::io_context_type::uring:
+    case io::io_context_type::kvikio: return prefetch_strategy::opportunistic;
+  }
+  return prefetch_strategy::eager;
+}
+
 // Actual cuDF carrier of one column of an uncompressed pinned host chunk, rebuilt from the
 // chunk's host column metadata. Keyed on the DECIMAL type ids, not on a nonzero scale: a
 // DECIMAL(p,0) column has cuDF scale 0 and must still take the two-argument fixed-point
@@ -438,8 +453,8 @@ sirius_scan_manager::sirius_scan_manager(
   // user has disabled prefetching so the construction is always
   // unconditional and there's no "is the cache present" branch to
   // worry about in callers.
-  if (_config.enable_prefetch_cache && _io_ctx->can_use_prefetching_cache()) {
-    _io_ctx->initialize_cache(reservation_manager, _config.prefetch_cache, _topology_index);
+  if (_config.cache.use_prefetching_cache() && _io_ctx->can_use_prefetching_cache()) {
+    _io_ctx->initialize_cache(reservation_manager, _config.cache, _topology_index);
   }
 
   // Reactors are built parked; start() launches their worker threads and
@@ -552,32 +567,42 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   // Subscribe for the query's lifetime; unsubscribed in reset().
   _query_stage_manager->subscribe(_readahead);
 
-  // Any cache mode but `none` wants scans ordered ahead of demand.  The budget
-  // is the backend's own: a backend publishing zero (kvikIO by default) opts
-  // out, and start() then does nothing.
+  // Order scans ahead of demand, on the terms resolve_readahead settles: an
+  // explicit `max_readahead_scans` / `readahead_strategy`, or what the serving
+  // backend wants.  A budget of zero means "do not read ahead" — either
+  // configured off, or a backend that publishes no depth (kvikIO by default) —
+  // and start() is then a no-op.
   //
-  // The budget spans every live backend, not just the default `_io_ctx`: a
-  // path-routed backend serves its own scans (an `s3://` query reads through the
-  // REST ioctx while `_io_ctx` is the local uring one) and one readahead manager
-  // covers them all.  Take the widest, since object-store reads are
-  // latency-bound rather than bandwidth-bound and need the deeper queue to keep
-  // the link busy — clamping them to the local disk's depth starves the link.
-  if (_config.enable_readahead) {
-    std::size_t budget = _io_ctx != nullptr ? _io_ctx->n_max_concurrent_scans() : 0;
+  // The serving backend is not necessarily the default `_io_ctx`: a path-routed
+  // backend serves its own scans (an `s3://` query reads through the REST ioctx
+  // while `_io_ctx` is the local uring one) and one readahead manager covers
+  // them all.  Take the one publishing the widest budget, since object-store
+  // reads are latency-bound rather than bandwidth-bound and need the deeper
+  // queue to keep the link busy — clamping them to the local disk's depth
+  // starves the link — and take its strategy preference with it, so budget and
+  // strategy describe the same backend.
+  {
+    io::ioctx const* widest    = nullptr;
+    std::size_t backend_budget = 0;
+    auto consider              = [&](io::ioctx const* ctx) {
+      if (ctx == nullptr) { return; }
+      auto const budget = ctx->n_max_concurrent_scans();
+      if (widest == nullptr || budget > backend_budget) {
+        widest         = ctx;
+        backend_budget = budget;
+      }
+    };
+    consider(_io_ctx.get());
     {
       std::lock_guard lk{_routed_io_ctxs_mtx};
       for (auto const& [_, ctx] : _routed_io_ctxs) {
-        if (ctx) { budget = std::max(budget, ctx->n_max_concurrent_scans()); }
+        consider(ctx.get());
       }
     }
-    // Opportunistic schedules against what the executor can run, not what the
-    // device can queue: one prefetch per non-scan deployment is only useful
-    // while a pipeline thread could still pick up another scan.
-    if (_config.readahead_strategy == prefetch_strategy::opportunistic &&
-        _config.pipeline_width > 0) {
-      budget = _config.pipeline_width;
-    }
-    _readahead->start(budget, _config.readahead_strategy);
+    auto const backend_strategy =
+      widest != nullptr ? backend_prefetch_strategy(widest->type()) : prefetch_strategy::eager;
+    auto const plan = _config.resolve_readahead(backend_budget, backend_strategy);
+    _readahead->start(plan.budget, plan.strategy);
   }
 
   std::vector<cached_assignment> cached_assignments;
@@ -851,8 +876,8 @@ std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_type(
   auto io_ctx = _ioctx_registry.make_ioctx(type);
   if (!io_ctx) { return nullptr; }
   io_ctx->start();
-  if (_config.enable_prefetch_cache && io_ctx->can_use_prefetching_cache()) {
-    io_ctx->initialize_cache(_reservation_manager, _config.prefetch_cache, _topology_index);
+  if (_config.cache.use_prefetching_cache() && io_ctx->can_use_prefetching_cache()) {
+    io_ctx->initialize_cache(_reservation_manager, _config.cache, _topology_index);
   }
   std::lock_guard lk{_routed_io_ctxs_mtx};
   auto [it, inserted] = _routed_io_ctxs.emplace(type, std::move(io_ctx));

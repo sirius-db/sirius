@@ -299,7 +299,7 @@ class engine {
     // no fusing, so chunk_size == GET size == staging block size.
     cfg.rest.max_n_chunks = opts.max_n_chunks;
 
-    cfg.cache = scan_manager::cache_mode::none;
+    cfg.cache.mode = io::cache::cache_mode::none;
     cfg.apply_cache_mode();
     return cfg;
   }

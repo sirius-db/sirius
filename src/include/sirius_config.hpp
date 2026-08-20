@@ -208,6 +208,14 @@ struct sirius_config {
 
   [[nodiscard]] const scan_manager::scan_manager_config& get_scan_manager_config() const noexcept;
 
+  /// The read path's caching configuration (the @c sirius.cache YAML block).
+  /// Stored inside the scan_manager config, which is its only consumer, so the
+  /// two can never disagree.
+  [[nodiscard]] const io::cache::config& get_cache_config() const noexcept
+  {
+    return _scan_manager_config.cache;
+  }
+
   /// Overwrite the stored scan_manager_config. Allows callers (e.g.
   /// SiriusContext::initialize()) to persist runtime-derived wiring so a later
   /// get_scan_manager_config() reflects the actual scan_manager state.

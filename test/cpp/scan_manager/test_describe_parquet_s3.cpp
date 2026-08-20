@@ -96,7 +96,7 @@ scan_manager_config make_minio_rest_config(bool perf_instrumentation = false)
   cfg.rest.max_connections      = 8;
   cfg.rest.perf_instrumentation = perf_instrumentation;
   cfg.rest_n_reactors           = 1;
-  cfg.enable_prefetch_cache     = false;
+  cfg.cache.mode                = sirius::io::cache::cache_mode::none;
   return cfg;
 }
 

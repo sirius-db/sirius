@@ -31,8 +31,9 @@
 #include <thread>
 #include <vector>
 
+using sirius::io::cache::cache_mode;
+using sirius::io::cache::eviction_policy;
 using sirius::io::cache::scan_stage;
-using sirius::scan_manager::cache_mode;
 using sirius::scan_manager::readahead_scan_manager;
 using sirius::scan_manager::scan_manager_config;
 
@@ -53,32 +54,35 @@ TEST_CASE("each backend publishes its own default scan budget", "[scan_manager][
   CHECK(sirius::io::kvikio_config{}.n_max_concurrent_scans == 0);
 }
 
-TEST_CASE("readahead is enabled for every cache mode but none", "[scan_manager][readahead]")
+TEST_CASE("the readahead budget follows the cache mode when unset", "[scan_manager][readahead]")
 {
-  auto enabled_for = [](cache_mode mode) {
+  // Stand-in for the widest n_max_concurrent_scans a live backend publishes.
+  constexpr std::size_t backend_budget = 6;
+
+  auto budget_for = [](cache_mode mode) {
     scan_manager_config cfg;
-    cfg.cache = mode;
+    cfg.cache.mode = mode;
     cfg.apply_cache_mode();
-    return cfg.enable_readahead;
+    return cfg.resolve_readahead(backend_budget, sirius::scan_manager::prefetch_strategy::eager)
+      .budget;
   };
 
-  CHECK_FALSE(enabled_for(cache_mode::none));
+  CHECK(budget_for(cache_mode::none) == 0);
   // `os` has no prefetching cache, but ordering scans ahead of demand still
   // warms the page cache, so readahead is on.
-  CHECK(enabled_for(cache_mode::os));
-  CHECK(enabled_for(cache_mode::persistent));
-  CHECK(enabled_for(cache_mode::prefetch));
+  CHECK(budget_for(cache_mode::os) == backend_budget);
+  CHECK(budget_for(cache_mode::sirius) == backend_budget);
 }
 
 TEST_CASE("apply_cache_mode leaves the other derived knobs alone", "[scan_manager][readahead]")
 {
   scan_manager_config cfg;
-  cfg.cache = cache_mode::prefetch;
+  cfg.cache.mode     = cache_mode::sirius;
+  cfg.cache.eviction = eviction_policy::idle;
   cfg.apply_cache_mode();
 
-  CHECK(cfg.enable_readahead);
-  CHECK(cfg.enable_prefetch_cache);
-  CHECK(cfg.prefetch_cache.dispose_on_idle);
+  CHECK(cfg.cache.use_prefetching_cache());
+  CHECK(cfg.cache.dispose_on_idle);
   CHECK(cfg.uring.use_odirect);
 }
 

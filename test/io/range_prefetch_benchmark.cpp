@@ -445,9 +445,11 @@ int main(int argc, char** argv)
   rmm::cuda_stream stream;
 
   sirius::io::cache::config cache_cfg;
+  cache_cfg.mode                            = sirius::io::cache::cache_mode::sirius;
+  cache_cfg.eviction                        = sirius::io::cache::eviction_policy::lru;
   cache_cfg.min_prefetching_budget_fraction = 0.9;
   cache_cfg.eviction_threshold_fraction     = 0.9;
-  cache_cfg.dispose_on_idle                 = false;
+  cache_cfg.apply_mode();
 
   std::cout << "dir           : " << dir << "\n"
             << "files         : " << n_files << "\n"

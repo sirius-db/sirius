@@ -79,8 +79,9 @@ sirius:
       downgrade_stop_fraction: 0.6
     host: { capacity_bytes: 25GB, initial_number_pools: 50, pool_size: 512, block_size: 1048576 }
     disk: { disk_id: 0, capacity_bytes: 1000000000000, downgrade_root_dirs: "/tmp/sirius_disk_memory" }
+  cache: { mode: none, eviction: lru }
   executor:
-    scan_manager: { num_threads: 4, backend: sirius, uring_n_reactors: 1, cache: none }
+    scan_manager: { num_threads: 4, backend: sirius, uring_n_reactors: 1 }
     pipeline:     { num_threads: 4 }
     downgrade:    { num_threads: 1 }
     task_creator: { num_threads: 1 }
@@ -268,7 +269,7 @@ Thread pool (default `num_threads: 1`, prefix `downgrade`) plus:
 
 ## Scan Manager & IO Configuration
 
-**Files:** `src/include/scan_manager/config.hpp`, `src/include/io/uring/config.hpp`, `src/include/io/rest/config.hpp`, `src/include/io/cache/config.hpp`, `src/include/io/object_store_config.hpp`
+**Files:** `src/include/scan_manager/config.hpp`, `src/include/io/uring/config.hpp`, `src/include/io/rest/config.hpp`, `src/include/io/object_store_config.hpp`
 
 The `sirius.executor.scan_manager` block configures the scan-metadata thread pool and the Sirius IO layer that feeds the GPU scan operators.
 
@@ -280,23 +281,37 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `backend` | enum: `sirius`, `kvikio` | `sirius` | IO backend for reads. `sirius` uses the Sirius IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` routes local files to the kvikIO fallback (single-GPU only; multi-GPU requires `sirius`). Values are lowercase. |
 | `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
-| `cache` | enum: `none`, `os`, `persistent`, `prefetch` | `none` | Read-path caching strategy (see below). Values are lowercase. |
+| `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
+| `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local ones (uring, kvikIO). Values are lowercase. |
 
-`cache` is the single knob for the read path; it derives three settings that are
-therefore **not** individually settable from YAML:
+Caching itself is configured in the top-level [`sirius.cache`](#cache--read-path-caching-iocacheconfighpp)
+block, not here.
 
-| `cache` | `uring.use_odirect` | `enable_prefetch_cache` | `prefetch_cache.dispose_on_idle` |
-|---------|---------------------|-------------------------|----------------------------------|
-| `none` | true | false | — |
-| `os` | false | false | — |
-| `persistent` | true | true | false |
-| `prefetch` | true | true | true |
+`max_readahead_scans` has three states:
 
-`none` bypasses every cache (`O_DIRECT`, no prefetching cache). `os` reads through the
-kernel page cache instead. `persistent` adds the pinned-memory prefetching cache and retains
-chunks for reuse; `prefetch` uses the same cache but drops each chunk once it goes idle.
+| Value | Effect |
+|-------|--------|
+| unset (default) | Defers to `sirius.cache`: with `mode` other than `none`, the budget is the backend reactor's own `n_max_concurrent_scans`; with `mode: none` the readahead does not run. |
+| `0` | The readahead does not run, whatever the cache mode. |
+| `n > 0` | The readahead runs with a budget of `n`, whatever the cache mode. |
 
-Five optional nested sub-configs tune the individual backends and caches:
+`readahead_strategy` works the same way, deferring to the backend rather than to the cache:
+
+| Value | Effect |
+|-------|--------|
+| unset (default) | The serving backend's preference — `eager` for REST, `opportunistic` for uring and kvikIO. |
+| `eager` | Every wake-up fills every free slot in the budget. An object-store round trip is dead time no matter what else is running, so only queue depth hides it. |
+| `opportunistic` | One prefetch each time the executor deploys a task that is *not* a scan, i.e. only while the device is not already busy with the executor's own reads. A local device read competes with those, so issuing one mid-scan reorders the queue rather than adding throughput. |
+
+When the readahead ends up `opportunistic` (either way), an *unset* `max_readahead_scans` schedules
+against the pipeline pool's width rather than the backend's depth — one prefetch per non-scan
+deployment is only useful while a pipeline thread could still pick up another scan. An explicit
+`max_readahead_scans` wins over that substitution.
+
+Both are resolved against a single backend: the live one publishing the widest
+`n_max_concurrent_scans`, so the budget and the strategy always describe the same reactor.
+
+Four optional nested sub-configs tune the individual backends:
 
 ### `scan_manager.uring` — io_uring backend (`io/uring/config.hpp`)
 
@@ -367,13 +382,6 @@ constructor, so it scopes to files this backend opens.
 | `thread_pool_per_block_device` | bool | `KVIKIO_THREAD_POOL_PER_BLOCK_DEVICE` (false) | Give each block device its own pool instead of sharing one global pool. |
 | `compat_mode` | enum: `auto`, `on`, `off` | `KVIKIO_COMPAT_MODE` | cuFile vs POSIX selection, per file handle. `off` enforces cuFile/GDS, `on` enforces POSIX, `auto` tries cuFile and falls back. Values are lowercase. |
 
-### `scan_manager.prefetch_cache` — prefetching cache (`io/cache/config.hpp`)
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `eviction_threshold_fraction` | double [0,1] | 0.6 | Start evicting when the pool fills to this fraction. |
-| `min_prefetching_budget_fraction` | double [0,1] | 0.05 | Floor of the budget reserved for prefetching. |
-
 ### `scan_manager.object_store` — S3 credentials & endpoint (`io/object_store_config.hpp`)
 
 | Key | Type | Default | Description |
@@ -386,6 +394,45 @@ constructor, so it scopes to files this backend opens.
 | `s3_transport` | enum: `auto`, `http`, `https`, `rdma` | `auto` | Transport selection. Values are lowercase; `https` is an alias for `http`. `auto` lets the backend choose from the URI scheme and endpoint. |
 | `ca_bundle_path` | string | "" | PEM CA bundle for TLS verification. |
 | `tls_verify` | bool | true | Verify the endpoint's TLS certificate. |
+
+## `cache` — read-path caching (`io/cache/config.hpp`)
+
+**File:** `src/include/io/cache/config.hpp`
+
+Everything about read-path caching lives in the top-level `sirius.cache` block — one
+home, rather than a mode on the scan manager and the cache's tunables somewhere else.
+
+```yaml
+sirius:
+  cache:
+    mode: sirius
+    eviction: lru
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `mode` | enum: `none`, `os`, `sirius` | `none` | Which cache the read path goes through. Values are lowercase. |
+| `eviction` | enum: `idle`, `lru` | `lru` | What retires an idle chunk from the Sirius cache. Only meaningful under `mode: sirius`. Values are lowercase. |
+| `eviction_threshold_fraction` | double [0,1] | 0.8 | Start evicting when the cache pool fills to this fraction. |
+| `min_prefetching_budget_fraction` | double [0,1] | 0.05 | Floor of the pool reserved for prefetching. |
+
+`mode: none` bypasses every cache (`O_DIRECT`, no prefetching cache). `mode: os` reads
+through the kernel page cache instead. `mode: sirius` reads `O_DIRECT` into Sirius's own
+pinned prefetching cache.
+
+`eviction: lru` keeps idle chunks for reuse and evicts least-recently-used ones once the
+pool fills past `eviction_threshold_fraction`; `eviction: idle` drops each chunk as soon as
+it goes idle, making the cache a prefetch staging area sized for the reads in flight rather
+than for reuse.
+
+Those two knobs derive the settings below, which are therefore **not** individually settable from YAML:
+
+| Derived setting | Derived from |
+|-----------------|--------------|
+| `scan_manager.uring.use_odirect` | `mode` — true for everything but `os` |
+| whether the prefetching cache is armed | `mode` — only under `sirius` |
+| `dispose_on_idle` | `eviction` — true under `idle` |
+| the readahead's default budget | `mode` — the readahead does not run under `none`; see [`max_readahead_scans`](#scan-manager--io-configuration) |
 
 ## Operator Parameters
 
@@ -676,5 +723,6 @@ These are compile-time defaults. Runtime configuration via `sirius_config` and D
 | `src/include/sirius_config.hpp` | Config class, operator_params, thread pool configs |
 | `src/include/config.hpp` | Legacy config flags |
 | `src/sirius_extension.cpp` | SET variable registration |
-| `src/include/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, prefetch cache, object store) |
-| `src/include/io/uring/config.hpp`, `io/rest/config.hpp`, `io/cache/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / cache / object-store sub-configs |
+| `src/include/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, readahead, object store) |
+| `src/include/io/cache/config.hpp` | Read-path caching config (`sirius.cache`: mode, eviction policy, prefetching-cache tunables) |
+| `src/include/io/uring/config.hpp`, `io/rest/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / object-store sub-configs |

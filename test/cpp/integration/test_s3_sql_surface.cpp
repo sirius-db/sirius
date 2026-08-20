@@ -378,13 +378,14 @@ class sirius_config_env_guard {
         << yaml_quote((dir_ / "disk_memory").string())
         << "\n"
            "        memory_capacity: "
-        << limits.disk_capacity
-        << "\n"
-           "  executor:\n"
-           "    scan_manager:\n";
+        << limits.disk_capacity << "\n";
     if (limits.enable_prefetch_cache.has_value()) {
-      out << "      cache: " << (*limits.enable_prefetch_cache ? "persistent" : "none") << "\n";
+      out << "  cache:\n"
+             "    mode: "
+          << (*limits.enable_prefetch_cache ? "sirius" : "none") << "\n";
     }
+    out << "  executor:\n"
+           "    scan_manager:\n";
     if (limits.backend.has_value()) {
       std::string backend_name;
       REQUIRE(sirius::scan_manager::enum_to_string(*limits.backend, backend_name));

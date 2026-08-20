@@ -283,9 +283,10 @@ class sirius_httpfs_config_env_guard {
            "        downgrade_stop_fraction: 0.6\n"
            "        memory_capacity: 512 MiB\n"
            "        block_size: 1 MiB\n"
+           "  cache:\n"
+           "    mode: none\n"
            "  executor:\n"
            "    scan_manager:\n"
-           "      enable_prefetch_cache: false\n"
            "      object_store:\n"
            "        endpoint: "
         << yaml_quote(env.endpoint)

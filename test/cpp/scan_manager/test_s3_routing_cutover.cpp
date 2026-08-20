@@ -190,7 +190,7 @@ scan_manager_config make_s3_scan_config(std::string endpoint,
   cfg.thread_pool.num_threads      = 1;
   cfg.uring_n_reactors             = 1;
   cfg.rest_n_reactors              = 1;
-  cfg.enable_prefetch_cache        = false;
+  cfg.cache.mode                   = sirius::io::cache::cache_mode::none;
   return cfg;
 }
 
@@ -647,8 +647,8 @@ TEST_CASE("scan_manager re-primes routed S3 cache on every query",
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
   scan_manager_fixture fixture;
-  auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius);
-  cfg.enable_prefetch_cache = true;
+  auto cfg       = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius);
+  cfg.cache.mode = sirius::io::cache::cache_mode::sirius;
   sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
 
   auto datasource = manager.create_datasource("s3://routing-bucket/data.parquet");
@@ -680,7 +680,7 @@ TEST_CASE("scan_manager tolerates routed S3 ioctx without a prefetch cache",
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
   scan_manager_fixture fixture;
   auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius);
-  REQUIRE_FALSE(cfg.enable_prefetch_cache);
+  REQUIRE_FALSE(cfg.cache.use_prefetching_cache());
   sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
 
   auto datasource = manager.create_datasource("s3://routing-bucket/data.parquet");

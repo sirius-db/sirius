@@ -26,6 +26,8 @@
 #include "io/uring/config.hpp"
 
 #include <algorithm>
+#include <cstddef>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -45,19 +47,6 @@ inline constexpr std::size_t default_uring_n_reactors = 1;
     exec::default_gpu_pipeline_num_threads + static_cast<int>(default_uring_n_reactors);
   return std::max(4, static_cast<int>(std::thread::hardware_concurrency()) - reserved);
 }
-
-/// Read-path caching strategy. Single knob that derives @c uring.use_odirect,
-/// @c enable_prefetch_cache and @c prefetch_cache.dispose_on_idle.
-enum class cache_mode {
-  /// O_DIRECT reads, no cache anywhere.
-  none,
-  /// Buffered reads through the OS page cache, no prefetching cache.
-  os,
-  /// O_DIRECT reads into the pinned prefetching cache, chunks retained for reuse.
-  persistent,
-  /// O_DIRECT reads into the pinned prefetching cache, chunks dropped once idle.
-  prefetch,
-};
 
 /// How the readahead decides *when* to issue the next prefetch.
 ///
@@ -101,35 +90,6 @@ inline bool enum_to_string(prefetch_strategy s, std::string& out)
   return false;
 }
 
-/// Parse a @ref cache_mode from its lowercase YAML spelling.
-inline bool string_to_enum(std::string_view sv, cache_mode& out)
-{
-  static const std::unordered_map<std::string_view, cache_mode> map = {
-    {"none", cache_mode::none},
-    {"os", cache_mode::os},
-    {"persistent", cache_mode::persistent},
-    {"prefetch", cache_mode::prefetch},
-  };
-  auto it = map.find(sv);
-  if (it != map.end()) {
-    out = it->second;
-    return true;
-  }
-  return false;
-}
-
-/// Render a @ref cache_mode as its canonical lowercase name.
-inline bool enum_to_string(cache_mode mode, std::string& s)
-{
-  switch (mode) {
-    case cache_mode::none: s = "none"; return true;
-    case cache_mode::os: s = "os"; return true;
-    case cache_mode::persistent: s = "persistent"; return true;
-    case cache_mode::prefetch: s = "prefetch"; return true;
-  }
-  return false;
-}
-
 /// IO backend that serves managed reads.
 enum class io_backend {
   /// Sirius's own IO stack: uring for local paths, REST for @c s3:// URLs.
@@ -163,6 +123,13 @@ inline bool enum_to_string(io_backend b, std::string& s)
   return false;
 }
 
+/// What the readahead scan manager is started with, resolved from the config
+/// and the backend serving the scans.  A @c budget of zero means it does not run.
+struct readahead_plan {
+  std::size_t budget{0};
+  prefetch_strategy strategy{prefetch_strategy::eager};
+};
+
 /**
  * @brief Configuration for the scan_manager.
  *
@@ -172,16 +139,16 @@ inline bool enum_to_string(io_backend b, std::string& s)
  * @c sirius_datasource either way; the kvikio backend drives
  * @c kvikio::FileHandle directly. Multi-GPU forces @ref io_backend::sirius.
  *
- * @c cache picks the read-path caching strategy; @ref apply_cache_mode derives
- * @c uring.use_odirect, @c enable_prefetch_cache and
- * @c prefetch_cache.dispose_on_idle from it, so those three are not settable
- * on their own.
+ * @c cache is the read path's whole caching configuration, stamped from the
+ * top-level @c sirius.cache YAML block; @ref apply_cache_mode derives
+ * @c uring.use_odirect and @c cache.dispose_on_idle from it, so neither is
+ * settable on its own.
  *
  * Sub-configs:
  *  - @c uring   — uring reactor tunables (local-disk IO path).
  *  - @c rest    — REST reactor tunables (S3/object-store IO path).
  *  - @c kvikio  — kvikIO backend tunables (local-file fallback path).
- *  - @c prefetch_cache — prefetching cache tunables.
+ *  - @c cache   — caching mode, eviction policy and prefetching-cache tunables.
  *  - @c object_store — object-store credentials and endpoint.
  */
 struct scan_manager_config {
@@ -190,9 +157,6 @@ struct scan_manager_config {
   /// IO backend that serves managed reads.
   io_backend backend{io_backend::sirius};
 
-  /// Read-path caching strategy; the source of truth for the derived knobs.
-  cache_mode cache{cache_mode::none};
-
   /// Number of uring reactor worker threads for the local-disk IO path.
   std::size_t uring_n_reactors{default_uring_n_reactors};
 
@@ -200,20 +164,20 @@ struct scan_manager_config {
   /// (each its own libcurl event loop + connection pool).
   std::size_t rest_n_reactors{2};
 
-  /// Enable the prefetching cache on the ioctx.  When false the cache is
-  /// constructed but unarmed (no background IO threads).  Derived from @ref cache.
-  bool enable_prefetch_cache{false};
+  /// Scans the readahead scan manager may keep in flight, and the switch that
+  /// runs it at all.  Unset (the default) defers to the caching configuration:
+  /// with a cache on, the budget is the backend reactor's own
+  /// @c n_max_concurrent_scans (see @ref resolve_readahead); with
+  /// @c cache.mode of @c none there is nothing to read ahead into and the
+  /// readahead does not run.  Set it to @c 0 to turn the readahead off even
+  /// with a cache on, or to a positive count to override the backend's budget.
+  std::optional<std::size_t> max_readahead_scans{};
 
-  /// Run the readahead scan manager, which drives the prefetching scheduler and
-  /// keeps the backend's scan budget occupied.  Derived from @ref cache: any
-  /// mode other than @c none benefits from ordering scans ahead of demand, even
-  /// @c os, where the readahead still warms the page cache.  The per-backend
-  /// budget it schedules against is @c n_max_concurrent_scans on that backend's
-  /// reactor config; a backend that sets it to zero is skipped regardless.
-  bool enable_readahead{false};
-
-  /// When the readahead issues.  See @ref prefetch_strategy.
-  prefetch_strategy readahead_strategy{prefetch_strategy::eager};
+  /// When the readahead issues.  Unset (the default) takes the serving
+  /// backend's own preference — @c eager for an object store, @c opportunistic
+  /// for a local device (see @ref prefetch_strategy).  Set it to pin one
+  /// strategy whatever the backend.
+  std::optional<prefetch_strategy> readahead_strategy{};
 
   /// Scans the executor can have running at once — the pipeline pool's width.
   /// The budget @c opportunistic schedules against, since one prefetch per
@@ -234,40 +198,46 @@ struct scan_manager_config {
   /// optional; unset leaves kvikIO's own env-seeded default in place.
   io::kvikio_config kvikio{};
 
-  /// Prefetching cache configuration — in-flight budget, pool sizing,
-  /// dispose-on-idle policy.  @c dispose_on_idle is derived from @ref cache.
-  io::cache::config prefetch_cache{};
+  /// The read path's caching configuration: mode, eviction policy and the
+  /// prefetching cache's tunables.  Stamped from the top-level @c sirius.cache
+  /// YAML block, which is its only home.
+  io::cache::config cache{};
 
   /// Object-store credentials and endpoint consumed by the REST reactor.
   /// Empty fields disable the S3/REST backend.
   io::object_store_config object_store{};
 
-  /// Overwrite the knobs derived from @ref cache.
+  /// Refresh the knobs derived from @ref cache.
   void apply_cache_mode() noexcept
   {
-    // Every mode but `none` wants scans ordered ahead of demand.
-    enable_readahead = cache != cache_mode::none;
+    cache.apply_mode();
+    uring.use_odirect = cache.use_odirect();
+  }
 
-    switch (cache) {
-      case cache_mode::none:
-        uring.use_odirect     = true;
-        enable_prefetch_cache = false;
-        break;
-      case cache_mode::os:
-        uring.use_odirect     = false;
-        enable_prefetch_cache = false;
-        break;
-      case cache_mode::persistent:
-        uring.use_odirect              = true;
-        enable_prefetch_cache          = true;
-        prefetch_cache.dispose_on_idle = false;
-        break;
-      case cache_mode::prefetch:
-        uring.use_odirect              = true;
-        enable_prefetch_cache          = true;
-        prefetch_cache.dispose_on_idle = true;
-        break;
+  /// Resolve what the readahead should run with, or a budget of 0 to not run
+  /// it at all.  @p backend_budget and @p backend_strategy come from the
+  /// backend serving the scans — its @c n_max_concurrent_scans and the
+  /// preference implied by its reactor type — and are what an unset
+  /// @ref max_readahead_scans / @ref readahead_strategy defers to.
+  [[nodiscard]] readahead_plan resolve_readahead(std::size_t backend_budget,
+                                                 prefetch_strategy backend_strategy) const noexcept
+  {
+    readahead_plan plan{.budget = 0, .strategy = readahead_strategy.value_or(backend_strategy)};
+    // An explicit budget is the whole answer, zero (off) included.
+    if (max_readahead_scans.has_value()) {
+      plan.budget = *max_readahead_scans;
+      return plan;
     }
+    // Without a cache the readahead has nowhere to read into: a prefetched
+    // chunk would be dropped before its scan ever asked for it.
+    if (!cache.enabled()) { return plan; }
+    // Opportunistic schedules against what the executor can run, not what the
+    // device can queue: one prefetch per non-scan deployment is only useful
+    // while a pipeline thread could still pick up another scan.
+    plan.budget = plan.strategy == prefetch_strategy::opportunistic && pipeline_width > 0
+                    ? pipeline_width
+                    : backend_budget;
+    return plan;
   }
 };
 
