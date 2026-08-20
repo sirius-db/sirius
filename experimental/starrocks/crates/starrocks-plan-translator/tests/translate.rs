@@ -2939,3 +2939,161 @@ fn each_aggregate_takes_its_own_output_slot() {
     assert!(names.contains(&"sum".to_string()), "{names:?}");
     assert!(names.contains(&"count".to_string()), "{names:?}");
 }
+
+/// Builds a SORT_NODE over sort tuple 1 carrying `limit` and `offset`, sorting on the single
+/// BIGINT column the `sort_fetch_desc` fixture materializes.
+fn sort_node_with(limit: i64, offset: Option<i64>) -> TPlanNode {
+    let sort_info = TSortInfo::new(
+        vec![slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT))],
+        vec![true],
+        vec![false],
+        None,
+    );
+    let mut sort = base_plan_node(1, TPlanNodeType::SORT_NODE, 1, vec![1]);
+    sort.limit = limit;
+    sort.sort_node = Some(TSortNode::new(
+        sort_info,
+        true,
+        offset,
+        None,
+        None,
+        None,
+        None,
+        Some(vec![slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))]),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ));
+    sort
+}
+
+/// Scan tuple 0 (`id`, `name`) plus a sort tuple 1 materializing only `id`.
+fn sort_fetch_desc() -> TDescriptorTable {
+    desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    )
+}
+
+/// Translates a fragment whose only node is a sort with `limit`/`offset`, returning its fetch.
+#[allow(deprecated)]
+fn fetch_modes(
+    limit: i64,
+    offset: Option<i64>,
+) -> (
+    Option<substrait::proto::fetch_rel::CountMode>,
+    Option<substrait::proto::fetch_rel::OffsetMode>,
+) {
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![
+            sort_node_with(limit, offset),
+            scan_node(0, 0),
+        ])),
+        Some(sort_fetch_desc()),
+        None,
+    ))
+    .unwrap();
+    let root = root(&translated.plan);
+    match root.input.as_ref().unwrap().rel_type.as_ref().unwrap() {
+        rel::RelType::Fetch(fetch) => (fetch.count_mode.clone(), fetch.offset_mode.clone()),
+        other => panic!("expected a fetch relation, got {other:?}"),
+    }
+}
+
+/// An offset with no limit must still emit an explicit unlimited count: DuckDB's consumer reads
+/// the plain `count` field without checking the oneof, so an unset count decodes as `LIMIT 0` and
+/// the query silently returns no rows.
+#[test]
+#[allow(deprecated)]
+fn offset_without_limit_emits_an_unlimited_count() {
+    use substrait::proto::fetch_rel::{CountMode, OffsetMode};
+    assert_eq!(
+        fetch_modes(-1, Some(5)),
+        (Some(CountMode::Count(-1)), Some(OffsetMode::Offset(5)))
+    );
+}
+
+/// `LIMIT n OFFSET m` carries both modes.
+#[test]
+#[allow(deprecated)]
+fn limit_and_offset_emit_both_modes() {
+    use substrait::proto::fetch_rel::{CountMode, OffsetMode};
+    assert_eq!(
+        fetch_modes(10, Some(5)),
+        (Some(CountMode::Count(10)), Some(OffsetMode::Offset(5)))
+    );
+}
+
+/// `LIMIT 0` is a real limit, not the "unset" sentinel: it must reach the plan as `Count(0)`
+/// rather than being folded away into an unlimited fetch.
+#[test]
+#[allow(deprecated)]
+fn zero_limit_is_not_treated_as_unlimited() {
+    use substrait::proto::fetch_rel::CountMode;
+    assert_eq!(fetch_modes(0, Some(0)), (Some(CountMode::Count(0)), None));
+}
+
+/// A limit on a non-sort node still becomes a fetch, and it sits *above* that node's conjunct
+/// filter — StarRocks applies a scan or aggregation's limit to the rows that passed its
+/// predicates, so `Filter(Fetch(..))` would truncate before filtering and return too few rows.
+#[test]
+#[allow(deprecated)]
+fn a_limit_on_an_aggregation_fetches_above_its_having_filter() {
+    let mut agg = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![aggregate_expr(
+            "sum",
+            scalar_type(TPrimitiveType::BIGINT),
+            Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+        )],
+    );
+    agg.limit = 3;
+    agg.conjuncts = Some(vec![binary_pred(
+        TExprOpcode::GT,
+        slot_ref(2, 1, scalar_type(TPrimitiveType::BIGINT)),
+        int_literal(10),
+    )]);
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+        Some(agg_desc()),
+        None,
+    ))
+    .unwrap();
+
+    let root = root(&translated.plan);
+    let rel::RelType::Fetch(fetch) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected the limit to become a fetch above the aggregation");
+    };
+    assert_eq!(
+        fetch.count_mode,
+        Some(substrait::proto::fetch_rel::CountMode::Count(3))
+    );
+    let rel::RelType::Filter(filter) = fetch.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the HAVING filter under the fetch");
+    };
+    let rel::RelType::Aggregate(_) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the aggregate under the HAVING filter");
+    };
+}
