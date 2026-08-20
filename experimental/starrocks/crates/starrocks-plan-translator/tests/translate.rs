@@ -55,12 +55,15 @@ fn complex_type(kind: TTypeNodeType) -> TTypeDesc {
 }
 
 /// Builds a materialized slot descriptor owned by a test tuple.
-fn slot(id: i32, tuple_id: i32, column_pos: i32, name: &str, ty: TTypeDesc) -> TSlotDescriptor {
+///
+/// `column_pos` is always -1: the FE sets it unconditionally and the IDL marks it deprecated, so
+/// a fixture carrying a real position would be a shape the translator never sees.
+fn slot(id: i32, tuple_id: i32, name: &str, ty: TTypeDesc) -> TSlotDescriptor {
     TSlotDescriptor::new(
         Some(id),
         Some(tuple_id),
         Some(ty),
-        Some(column_pos),
+        Some(-1),
         None,
         None,
         None,
@@ -354,8 +357,8 @@ fn base_desc() -> TDescriptorTable {
     desc_table(
         vec![(0, Some(100))],
         vec![
-            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
-            slot(2, 0, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
         ],
     )
 }
@@ -943,9 +946,9 @@ fn duplicate_output_names_are_unique_and_match_root() {
     let desc = desc_table(
         vec![(0, Some(100))],
         vec![
-            slot(1, 0, 0, "name", scalar_type(TPrimitiveType::BIGINT)),
-            slot(2, 0, 1, "name_1", scalar_type(TPrimitiveType::BIGINT)),
-            slot(3, 0, 2, "name", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 0, "name", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name_1", scalar_type(TPrimitiveType::BIGINT)),
+            slot(3, 0, "name", scalar_type(TPrimitiveType::BIGINT)),
         ],
     );
 
@@ -1029,7 +1032,7 @@ fn integer_literal_preserves_expr_width() {
 
     let desc = desc_table(
         vec![(0, Some(100))],
-        vec![slot(1, 0, 0, "id", scalar_type(TPrimitiveType::INT))],
+        vec![slot(1, 0, "id", scalar_type(TPrimitiveType::INT))],
     );
     let translated = translate_fragment(&params(
         Some(TPlan::new(vec![select, scan_node(0, 0)])),
@@ -1081,10 +1084,10 @@ fn scan_project_preserves_descriptor_output_order() {
     let desc = desc_table(
         vec![(0, Some(100)), (1, None)],
         vec![
-            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
-            slot(2, 0, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
-            slot(3, 1, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
-            slot(4, 1, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(3, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(4, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
         ],
     );
 
@@ -1187,7 +1190,7 @@ fn unsupported_expression_is_structured_error() {
 fn unsupported_complex_type_is_structured_error() {
     let desc = desc_table(
         vec![(0, Some(100))],
-        vec![slot(1, 0, 0, "items", complex_type(TTypeNodeType::ARRAY))],
+        vec![slot(1, 0, "items", complex_type(TTypeNodeType::ARRAY))],
     );
     let err = translate_fragment(&params(
         Some(TPlan::new(vec![scan_node(0, 0)])),
@@ -1207,13 +1210,13 @@ fn unsupported_complex_type_is_structured_error() {
 /// Verifies unsupported types on non-materialized slots do not block visible output.
 #[test]
 fn non_materialized_unsupported_slot_type_is_ignored() {
-    let mut hidden_slot = slot(2, 0, 1, "hidden", complex_type(TTypeNodeType::ARRAY));
+    let mut hidden_slot = slot(2, 0, "hidden", complex_type(TTypeNodeType::ARRAY));
     hidden_slot.is_materialized = Some(false);
 
     let desc = desc_table(
         vec![(0, Some(100))],
         vec![
-            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
             hidden_slot,
         ],
     );
@@ -1232,7 +1235,7 @@ fn non_materialized_unsupported_slot_type_is_ignored() {
 fn unsupported_largeint_is_structured_error() {
     let desc = desc_table(
         vec![(0, Some(100))],
-        vec![slot(1, 0, 0, "big", scalar_type(TPrimitiveType::LARGEINT))],
+        vec![slot(1, 0, "big", scalar_type(TPrimitiveType::LARGEINT))],
     );
     let err = translate_fragment(&params(
         Some(TPlan::new(vec![scan_node(0, 0)])),
@@ -1256,7 +1259,6 @@ fn unsupported_decimal256_is_structured_error() {
         vec![(0, Some(100))],
         vec![slot(
             1,
-            0,
             0,
             "huge_decimal",
             scalar_type_with(TPrimitiveType::DECIMAL256, None, Some(76), Some(0)),
@@ -1294,8 +1296,8 @@ fn project_node_conjuncts_are_unsupported() {
     let desc = desc_table(
         vec![(0, Some(100)), (1, None)],
         vec![
-            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
-            slot(3, 1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(3, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
         ],
     );
 
@@ -1485,13 +1487,7 @@ fn hdfs_scan_node(node_id: i32, tuple_id: i32) -> TPlanNode {
 /// Builds a single-column descriptor whose table carries `db` (empty for fallback tests).
 fn desc_with_db(db: &str) -> TDescriptorTable {
     TDescriptorTable::new(
-        Some(vec![slot(
-            1,
-            0,
-            0,
-            "id",
-            scalar_type(TPrimitiveType::BIGINT),
-        )]),
+        Some(vec![slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT))]),
         vec![TTupleDescriptor::new(Some(0), None, None, Some(7), None)],
         Some(vec![table_descriptor(7, db, "t", 1)]),
         None,
@@ -1853,10 +1849,10 @@ fn project_emit_mapping_starts_after_input_columns() {
     let desc = desc_table(
         vec![(0, Some(100)), (1, None)],
         vec![
-            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
-            slot(2, 0, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
-            slot(3, 1, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
-            slot(4, 1, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(3, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(4, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
         ],
     );
 
@@ -1893,7 +1889,7 @@ fn project_emit_mapping_starts_after_input_columns() {
 fn scan_table_name_falls_back_when_table_missing() {
     let desc = desc_table(
         vec![(0, None)],
-        vec![slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT))],
+        vec![slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT))],
     );
     let translated = translate_fragment(&params(
         Some(TPlan::new(vec![scan_node(0, 0)])),
@@ -2056,10 +2052,10 @@ fn agg_desc() -> TDescriptorTable {
     desc_table(
         vec![(0, Some(100)), (1, None)],
         vec![
-            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
-            slot(2, 0, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
-            slot(1, 1, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
-            slot(2, 1, 1, "total", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 1, "total", scalar_type(TPrimitiveType::BIGINT)),
         ],
     )
 }
@@ -2156,9 +2152,9 @@ fn merge_aggregation_is_rejected() {
     let desc = desc_table(
         vec![(0, Some(100)), (1, None)],
         vec![
-            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
-            slot(2, 0, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
-            slot(1, 1, 0, "total", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, "total", scalar_type(TPrimitiveType::BIGINT)),
         ],
     );
     let err = translate_fragment(&params(
@@ -2212,9 +2208,9 @@ fn sort_with_limit_becomes_project_sort_fetch() {
     let desc = desc_table(
         vec![(0, Some(100)), (1, None)],
         vec![
-            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
-            slot(2, 0, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
-            slot(1, 1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
         ],
     );
     let translated = translate_fragment(&params(
@@ -2349,7 +2345,7 @@ fn date_literal_translates_to_epoch_days() {
         Some(filtered_scan(TExpr::new(nodes))),
         Some(desc_table(
             vec![(0, Some(100))],
-            vec![slot(1, 0, 0, "d", scalar_type(TPrimitiveType::DATE))],
+            vec![slot(1, 0, "d", scalar_type(TPrimitiveType::DATE))],
         )),
         None,
     ))
@@ -2566,9 +2562,9 @@ fn partitioned_topn_sort_is_rejected() {
     let desc = desc_table(
         vec![(0, Some(100)), (1, None)],
         vec![
-            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
-            slot(2, 0, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
-            slot(1, 1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
         ],
     );
     let err = translate_fragment(&params(
@@ -2607,9 +2603,9 @@ fn sort_tuple_exprs_come_from_sort_info() {
     let desc = desc_table(
         vec![(0, Some(100)), (1, None)],
         vec![
-            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
-            slot(2, 0, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
-            slot(1, 1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
         ],
     );
     let translated = translate_fragment(&params(
@@ -2694,9 +2690,9 @@ fn gpu_unsupported_shapes_are_rejected() {
     let desc = desc_table(
         vec![(0, Some(100)), (1, None)],
         vec![
-            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
-            slot(2, 0, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
-            slot(1, 1, 0, "cnt", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, "cnt", scalar_type(TPrimitiveType::BIGINT)),
         ],
     );
     let err = translate_fragment(&params(
@@ -2751,11 +2747,11 @@ fn aggregation_output_tuple_follows_wire_order_not_slot_id() {
     let desc = desc_table(
         vec![(0, Some(100)), (1, None)],
         vec![
-            slot(1, 0, -1, "id", scalar_type(TPrimitiveType::BIGINT)),
-            slot(2, 0, -1, "name", scalar_type(TPrimitiveType::VARCHAR)),
-            slot(2, 1, -1, "name", scalar_type(TPrimitiveType::VARCHAR)),
-            slot(1, 1, -1, "id", scalar_type(TPrimitiveType::BIGINT)),
-            slot(3, 1, -1, "total", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(3, 1, "total", scalar_type(TPrimitiveType::BIGINT)),
         ],
     );
     let translated = translate_fragment(&params(
@@ -2829,10 +2825,10 @@ fn sort_tuple_follows_wire_order_not_slot_id() {
     let desc = desc_table(
         vec![(0, Some(100)), (1, None)],
         vec![
-            slot(1, 0, -1, "id", scalar_type(TPrimitiveType::BIGINT)),
-            slot(2, 0, -1, "name", scalar_type(TPrimitiveType::VARCHAR)),
-            slot(2, 1, -1, "name", scalar_type(TPrimitiveType::VARCHAR)),
-            slot(1, 1, -1, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
         ],
     );
     let translated = translate_fragment(&params(
@@ -2849,4 +2845,97 @@ fn sort_tuple_follows_wire_order_not_slot_id() {
     };
     // The projection below emits `name` first, so the ordering key is field 0.
     assert_eq!(field_index(sorted.sorts[0].expr.as_ref().unwrap()), 0);
+}
+
+/// Name of a Substrait type's kind, for asserting which descriptor slot a measure was paired with.
+fn type_kind_name(ty: &substrait::proto::Type) -> &'static str {
+    use substrait::proto::r#type::Kind;
+    match ty.kind.as_ref().expect("measure output type") {
+        Kind::I64(_) => "i64",
+        Kind::Fp64(_) => "fp64",
+        Kind::String(_) => "string",
+        other => panic!("unexpected measure output type {other:?}"),
+    }
+}
+
+/// StarRocks appends one output-tuple slot per aggregate after the grouping keys, so measure `i`
+/// takes its declared output type from slot `keys + i`. The two measures are given different
+/// types so that both an off-by-one into the grouping keys and a swap between the measures are
+/// visible; with one measure, every wrong slice lands on the same slot.
+#[test]
+fn each_aggregate_takes_its_own_output_slot() {
+    let agg = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![
+            aggregate_expr(
+                "sum",
+                scalar_type(TPrimitiveType::DOUBLE),
+                Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+            ),
+            aggregate_expr(
+                "count",
+                scalar_type(TPrimitiveType::BIGINT),
+                Some(slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))),
+            ),
+        ],
+    );
+    // Output tuple 1: grouping key `name` (VARCHAR), then one slot per aggregate in aggregate
+    // order — `total` DOUBLE, `n` BIGINT.
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 1, "total", scalar_type(TPrimitiveType::DOUBLE)),
+            slot(3, 1, "n", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["name", "total", "n"]);
+    let rel::RelType::Aggregate(aggregate) =
+        root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate relation");
+    };
+    assert_eq!(aggregate.grouping_expressions.len(), 1);
+    assert_eq!(aggregate.measures.len(), 2);
+
+    let calls: Vec<_> = aggregate
+        .measures
+        .iter()
+        .map(|m| m.measure.as_ref().unwrap())
+        .collect();
+    // Each measure keeps its own argument: `sum(id)` reads field 0, `count(name)` field 1.
+    let arg_fields: Vec<_> = calls
+        .iter()
+        .map(|call| {
+            let substrait::proto::function_argument::ArgType::Value(expr) =
+                call.arguments[0].arg_type.as_ref().unwrap()
+            else {
+                panic!("expected a value argument");
+            };
+            field_index(expr)
+        })
+        .collect();
+    assert_eq!(arg_fields, vec![0, 1]);
+    // And its own output slot: slice past the grouping keys, in aggregate order.
+    let out_kinds: Vec<_> = calls
+        .iter()
+        .map(|call| type_kind_name(call.output_type.as_ref().unwrap()))
+        .collect();
+    assert_eq!(out_kinds, vec!["fp64", "i64"]);
+
+    let names = extension_function_names(&translated.plan);
+    assert!(names.contains(&"sum".to_string()), "{names:?}");
+    assert!(names.contains(&"count".to_string()), "{names:?}");
 }
