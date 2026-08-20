@@ -16,6 +16,7 @@
 
 #include "late_mat/port_materialize.hpp"
 
+#include "helper/numeric_narrowing.hpp"
 #include "late_mat/materialize.hpp"
 #include "late_mat/prepared_selection.hpp"
 #include "scan_manager/late_mat_resolver.hpp"
@@ -97,9 +98,15 @@ void restore_bundle(std::vector<std::size_t> const& output_positions,
                                " no longer resolves");
     }
     auto produced = materialize(*column, selection, stream, mr);
+    // A narrow-stored pin may come back a strictly narrower carrier of the
+    // restored type, and only that; anything else is not what was deferred.
     if (produced->type() != restored_types[i]) {
-      throw std::runtime_error("late_mat::materialize_at_port: origin column " + std::to_string(i) +
-                               " came back as a different type than the scan gave up");
+      if (!sirius::can_restore_to(produced->type(), restored_types[i])) {
+        throw std::runtime_error("late_mat::materialize_at_port: origin column " +
+                                 std::to_string(i) +
+                                 " came back as a different type than the scan gave up");
+      }
+      produced = sirius::cast_through_rep(produced->view(), restored_types[i], stream, mr);
     }
     restored_by_position.emplace(output_positions[i], std::move(produced));
   }

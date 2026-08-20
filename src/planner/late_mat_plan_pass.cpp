@@ -89,6 +89,10 @@ struct step {
   /// column_lifetime::consumed_as_count_only.
   bool count_only = false;
 
+  /// Output position of a carrier-restore cast this column passed through. Not
+  /// a read — the ride continues — but a site the installer must neutralize.
+  std::optional<std::size_t> carrier_restore_at;
+
   // Designated rather than positional: these have grown a member at a time, and
   // a positional initializer silently sets the wrong flag when one lands in the
   // middle.
@@ -377,6 +381,7 @@ step trace_through(sirius_physical_operator const& node,
       // A bare column reference MOVES the column. Anything else computes with
       // it, which is a read.
       std::optional<std::size_t> moved_to;
+      std::optional<std::size_t> restore_at;
       bool computed_with = false;
       for (std::size_t out = 0; out < projection.select_list.size(); ++out) {
         auto const& expr = projection.select_list[out];
@@ -385,10 +390,25 @@ step trace_through(sirius_physical_operator const& node,
           if (ref->column_index == in_pos && !moved_to.has_value()) { moved_to = out; }
           continue;
         }
+        // A carrier restore changes a column's bit width, not its value, so the
+        // ride MOVES through one — but it is recorded: it would convert a rowid.
+        if (auto const* cast_expr = std::get_if<ast::cast>(&expr->v)) {
+          if (cast_expr->kind == ast::cast_kind::carrier_restore) {
+            if (auto const* inner = std::get_if<ast::reference>(&cast_expr->child->v)) {
+              if (inner->column_index == in_pos && !moved_to.has_value()) {
+                moved_to   = out;
+                restore_at = out;
+              }
+              continue;
+            }
+          }
+        }
         if (reads_column(*expr, in_pos)) { computed_with = true; }
       }
       // moved_to is nullopt when the projection simply drops the column.
-      return computed_with ? step::reads_and_moves(moved_to) : step::to(moved_to);
+      auto moved = computed_with ? step::reads_and_moves(moved_to) : step::to(moved_to);
+      moved.carrier_restore_at = restore_at;
+      return moved;
     }
 
     default:
@@ -519,6 +539,11 @@ std::vector<column_lifetime> analyze_column_lifetimes(sirius_physical_operator c
       // local aggregate hashes the same keys, but it is plumbing on the ride,
       // not an aggregate a proof has to cover.
       if (moved.as_group_key && is_group_by(*node)) { life.group_key_at.push_back(node); }
+      // For the whole ride, not just up to the first reader: the group-key
+      // extension's port sits further up.
+      if (moved.carrier_restore_at.has_value()) {
+        life.carrier_restores.push_back(carrier_restore_site{node, *moved.carrier_restore_at});
+      }
       for (auto const condition : moved.compared_in) {
         life.join_key_at.push_back(join_key_role{node, condition, moved.from_lhs});
       }
@@ -744,10 +769,50 @@ planned_deferral plan_deferral(sirius_physical_operator& scan, late_mat::defer_p
     planned.positions.push_back(position);
     planned.restored_types.push_back(scan.types[position]);
     planned.port_positions.push_back(lifetimes[position].position_at_reader);
+    auto const& sites = lifetimes[position].carrier_restores;
+    planned.carrier_restores.insert(planned.carrier_restores.end(), sites.begin(), sites.end());
   }
   planned.port_input      = lifetimes[planned.positions.front()].reader_input;
   planned.group_extension = plan_group_key_extension(lifetimes, planned.positions);
   return planned;
+}
+
+std::size_t neutralize_carrier_restores(std::vector<carrier_restore_site> const& sites,
+                                        sirius_physical_operator const& port)
+{
+  // A fact about the plan chain, not about the order the walk recorded them in
+  // — riders put several columns' sites in one unordered list.
+  auto const below_port = [&port](sirius_physical_operator const& site) {
+    for (auto const* node = site.get_parent_op(); node != nullptr; node = node->get_parent_op()) {
+      if (node == &port) { return true; }
+    }
+    return false;
+  };
+
+  std::size_t rewritten = 0;
+  for (auto const& site : sites) {
+    if (site.projection == nullptr || !below_port(*site.projection)) { continue; }
+    if (site.projection->type != SiriusPhysicalOperatorType::PROJECTION) { continue; }
+    // The walk only reads, so it holds const pointers; the caller handed us the
+    // mutable tree they address, exactly as install_deferral does.
+    auto& projection = const_cast<op::sirius_physical_projection&>(
+      static_cast<op::sirius_physical_projection const&>(*site.projection));
+    if (site.output_position >= projection.select_list.size()) { continue; }
+    auto& expr = projection.select_list[site.output_position];
+    if (!expr) { continue; }
+    // Re-checked rather than trusted: rewriting the wrong expression is a wrong
+    // answer, not a missed deferral.
+    auto* cast_expr = std::get_if<ast::cast>(&expr->v);
+    if (cast_expr == nullptr || cast_expr->kind != ast::cast_kind::carrier_restore) { continue; }
+    if (cast_expr->try_cast || !cast_expr->child) { continue; }
+    auto const* inner = std::get_if<ast::reference>(&cast_expr->child->v);
+    if (inner == nullptr) { continue; }
+    // The reference declares the type the cast targeted — that is what makes
+    // the two equivalent for every input the cast was inserted for.
+    expr->v = ast::reference{inner->column_index, cast_expr->target_type};
+    ++rewritten;
+  }
+  return rewritten;
 }
 
 bool install_deferral(sirius_physical_operator& scan,

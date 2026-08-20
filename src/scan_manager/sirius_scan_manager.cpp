@@ -39,6 +39,7 @@
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_dynamic_filter.hpp"
+#include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "planner/late_mat_plan_pass.hpp"
 #include "planner/query.hpp"
@@ -980,6 +981,17 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
   if (!sirius::planner::install_deferral(scan_op, *port, std::move(pair))) {
     return decline("the pair would not install (the port already carries one, or it is malformed)");
   }
+  // Only once the pair is committed: this rewrites the plan, and a rewrite for
+  // a deferral that did not install would be a change nothing asked for.
+  auto const neutralized =
+    sirius::planner::neutralize_carrier_restores(planned.carrier_restores, *port);
+  if (neutralized > 0) {
+    SIRIUS_LOG_INFO(
+      "[late-mat] operator {}: {} carrier-restore cast(s) below the port rewritten to bare "
+      "references so the rowid rides through them",
+      scan_op.get_operator_id(),
+      neutralized);
+  }
   SIRIUS_LOG_INFO(
     "[late-mat] operator {}: deferring {} column(s) to {} (id={}) — {} B/row over {} boundaries",
     scan_op.get_operator_id(),
@@ -1146,6 +1158,9 @@ void install_rider_deferrals(std::vector<rider_candidate> const& candidates,
       decline("the rider would not attach (positions collide, or the schemas disagree)");
       continue;
     }
+    // A rider's columns ride the same stretch of plan as the primary's, and a
+    // restore below the port is as opaque to its rowid as to the primary's.
+    sirius::planner::neutralize_carrier_restores(planned.carrier_restores, *port);
     SIRIUS_LOG_INFO(
       "[late-mat] operator {}: riding along with the bundle at {} (id={}) — {} column(s), {} B/row "
       "over {} boundaries, unique key '{}'",

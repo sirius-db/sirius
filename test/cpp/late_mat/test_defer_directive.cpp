@@ -208,3 +208,38 @@ TEST_CASE("a column may not change type on the ride", "[late_mat][directive]")
   wrong[1]                           = dt(cudf::type_id::INT32);  // was STRING
   REQUIRE_FALSE(make_defer_pair(customer_schema(), {1, 3}, wrong, {1, 3}, origins(2)).valid());
 }
+
+TEST_CASE("a pinned column stored narrowed rides to a port that expects it restored",
+          "[late_mat][directive]")
+{
+  // TPC-H q10's c_acctbal whenever narrowing is on: refusing this as a type
+  // mismatch refuses a deferral over a disagreement that is only bit width.
+  auto scan_schema       = customer_schema();
+  scan_schema[2]         = dt(cudf::type_id::DECIMAL32);  // c_acctbal, stored narrow
+  auto const port_schema = customer_schema();             // ...restored before the port
+
+  auto const pair = make_defer_pair(scan_schema, {1, 2}, port_schema, {1, 2}, origins(2));
+  REQUIRE(pair.valid());
+
+  // The RESTORED type, not the narrow one the pin produces: the materializer
+  // widens, over the rows that reached the port.
+  REQUIRE(pair.port.restored_types ==
+          std::vector<cudf::data_type>{dt(cudf::type_id::STRING), dt(cudf::type_id::DECIMAL64)});
+}
+
+TEST_CASE("a type disagreement that is not a carrier width still refuses", "[late_mat][directive]")
+{
+  // The relaxation is exactly as wide as `can_restore_to`; anything else is the
+  // two halves describing different columns.
+  auto scan_schema = customer_schema();
+  scan_schema[2]   = dt(cudf::type_id::INT32);  // an integer where the port wants DECIMAL64
+  REQUIRE_FALSE(
+    make_defer_pair(scan_schema, {1, 2}, customer_schema(), {1, 2}, origins(2)).valid());
+
+  // One-way: a port narrower than what the pin hands back is not a restore, and
+  // nothing here may quietly truncate a value.
+  auto port_schema = customer_schema();
+  port_schema[2]   = dt(cudf::type_id::DECIMAL32);
+  REQUIRE_FALSE(
+    make_defer_pair(customer_schema(), {1, 2}, port_schema, {1, 2}, origins(2)).valid());
+}

@@ -84,6 +84,13 @@ struct group_key_ride {
   bool read_as_join_key = false;
 };
 
+/// A carrier-restore cast on a column's ride. Transparent to a column riding
+/// REAL, NOT to one riding as a rowid: the cast converts whatever it is handed.
+struct carrier_restore_site {
+  op::sirius_physical_operator const* projection = nullptr;
+  std::size_t output_position                    = 0;
+};
+
 /// Where a column is compared as a join key: which join, which condition of it,
 /// and which side the column arrived on.
 ///
@@ -147,6 +154,9 @@ struct column_lifetime {
   /// one whose pin-time uniqueness can admit ANOTHER column's ride, and the
   /// proof has to hold at every aggregate that ride crosses.
   std::vector<op::sirius_physical_operator const*> group_key_at;
+  /// Every carrier-restore cast this column rode through, in ride order. Kept
+  /// past the plain stop too: the group-key extension's port sits further up.
+  std::vector<carrier_restore_site> carrier_restores;
   /// Present when the column rode at least one group-by AS A KEY: the fields
   /// above then describe the sound stop at the first such aggregate, and this
   /// describes the longer ride that the pin-uniqueness bijection would unlock.
@@ -269,6 +279,9 @@ struct planned_deferral {
   /// The group-by-rowid extension of this bundle, when the walk found one. See
   /// @ref group_key_extension: reported, not admitted.
   std::optional<group_key_extension> group_extension;
+  /// Every carrier-restore cast the bundle's columns ride through, unordered.
+  /// Which lie below the port is @ref neutralize_carrier_restores' business.
+  std::vector<carrier_restore_site> carrier_restores;
   /// EVERY column of this bundle is read only by COUNTs. Such a bundle needs no
   /// materialization at all — the rowid counts identically to the values —
   /// provided those values carry no nulls, which only the pinned entry knows.
@@ -284,6 +297,12 @@ struct planned_deferral {
 /// whether this scan's rows are addressable at all — completes the pair.
 [[nodiscard]] planned_deferral plan_deferral(op::sirius_physical_operator& scan,
                                              late_mat::defer_policy const& policy = {});
+
+/// Rewrite each @p sites cast below @p port into the bare reference it is
+/// equivalent to (the reference specialization restores narrow carriers too,
+/// but passes a rowid through), and report how many were rewritten.
+std::size_t neutralize_carrier_restores(std::vector<carrier_restore_site> const& sites,
+                                        op::sirius_physical_operator const& port);
 
 /// Stamp both halves of @p pair, or neither.
 ///

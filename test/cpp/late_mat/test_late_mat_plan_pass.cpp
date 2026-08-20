@@ -27,6 +27,7 @@
 
 #include <catch.hpp>
 #include <duckdb/planner/operator/logical_dummy_scan.hpp>
+#include <expression/ast/cast.hpp>
 #include <expression/ast/comparison.hpp>
 #include <expression/ast/node.hpp>
 #include <expression/ast/reference.hpp>
@@ -934,4 +935,63 @@ TEST_CASE("a join key records which condition compared it", "[late_mat][lifetime
   REQUIRE(lives[1].join_key_at.front().condition == 0);
   REQUIRE(lives[1].join_key_at.front().from_lhs);
   REQUIRE(lives[0].join_key_at.empty());  // beside the key, never compared
+}
+
+TEST_CASE("a carrier-restore cast is recorded as a site the ride passes through",
+          "[late_mat][lifetime]")
+{
+  // The ride crosses one — width, not value — but a rowid would come out the
+  // far side as a value of the restored type, so the site must be recorded.
+  fake_scan scan(2);
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> list;
+  list.push_back(ref(0));
+  list.push_back(std::make_unique<sirius::ast::node>(
+    sirius::ast::cast{ref(1), int32_type(), false, sirius::ast::cast_kind::carrier_restore}));
+  test_projection projection(make_types(2), std::move(list), 0);
+  scan.link(&projection);
+
+  auto const lives = analyze_column_lifetimes(scan);
+  REQUIRE(lives[1].first_reader == nullptr);  // moved, not read
+  REQUIRE(lives[1].position_at_reader == 1);
+  REQUIRE(lives[1].carrier_restores.size() == 1);
+  REQUIRE(lives[1].carrier_restores.front().projection == &projection);
+  REQUIRE(lives[1].carrier_restores.front().output_position == 1);
+  // Only the slot actually holding a restore is a site.
+  REQUIRE(lives[0].carrier_restores.empty());
+}
+
+TEST_CASE("neutralizing rewrites the restores below the port and leaves the rest",
+          "[late_mat][lifetime]")
+{
+  // Two restores in a row, port at the upper one: the lower is on the rowid's
+  // path, the upper runs after the port has put the real values back.
+  fake_scan scan(1);
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> lower_list;
+  lower_list.push_back(std::make_unique<sirius::ast::node>(
+    sirius::ast::cast{ref(0), int32_type(), false, sirius::ast::cast_kind::carrier_restore}));
+  test_projection lower(make_types(1), std::move(lower_list), 0);
+
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> upper_list;
+  upper_list.push_back(std::make_unique<sirius::ast::node>(
+    sirius::ast::cast{ref(0), int32_type(), false, sirius::ast::cast_kind::carrier_restore}));
+  test_projection upper(make_types(1), std::move(upper_list), 0);
+
+  opaque_op port(1);
+  scan.link(&lower);
+  lower.link(&upper);
+  upper.link(&port);
+
+  std::vector<sirius::planner::carrier_restore_site> const sites{
+    sirius::planner::carrier_restore_site{&lower, 0},
+    sirius::planner::carrier_restore_site{&upper, 0}};
+
+  REQUIRE(sirius::planner::neutralize_carrier_restores(sites, upper) == 1);
+  REQUIRE(lower.select_list[0]->holds<sirius::ast::reference>());
+  REQUIRE(lower.select_list[0]->get<sirius::ast::reference>().column_index == 0);
+  // The declared type is what makes the two do the same thing to a real column.
+  REQUIRE(lower.select_list[0]->get<sirius::ast::reference>().return_type() == int32_type());
+  REQUIRE(upper.select_list[0]->holds<sirius::ast::cast>());
+
+  // Idempotent by construction: a rewritten slot no longer holds a cast.
+  REQUIRE(sirius::planner::neutralize_carrier_restores(sites, upper) == 0);
 }

@@ -16,6 +16,8 @@
 
 #include "late_mat/defer_directive.hpp"
 
+#include "helper/numeric_narrowing.hpp"
+
 #include <algorithm>
 #include <atomic>
 
@@ -142,14 +144,19 @@ defer_pair make_defer_pair(std::vector<cudf::data_type> const& scan_schema,
     auto const port_position = port_positions[i];
     if (scan_position >= scan_schema.size() || port_position >= port_schema.size()) { return {}; }
     if (i > 0 && scan_position <= scan_positions[i - 1]) { return {}; }
-    // A column's type may not change on the ride: it is what the port must hand
-    // back, and the scan is what gave it up.
-    if (port_schema[port_position] != scan_schema[scan_position]) { return {}; }
+    // A pin may STORE a column narrowed, so the scan carries the narrow carrier
+    // while the port is declared to hold the type the planner restores it to.
+    if (port_schema[port_position] != scan_schema[scan_position] &&
+        !sirius::can_restore_to(scan_schema[scan_position], port_schema[port_position])) {
+      return {};
+    }
     // The rowid rides at the FIRST deferred scan position; the rest become
     // placeholders, which exist only to keep the arity and the positions after
     // them where they were.
     scan_substituted[scan_position] = cudf::data_type{(i == 0) ? rowid_type : kPlaceholderType};
-    columns.push_back(deferred_column{port_position, scan_schema[scan_position], origins[i]});
+    // The PORT's type: what the far end hands back is what its consumer was
+    // planned against.
+    columns.push_back(deferred_column{port_position, port_schema[port_position], origins[i]});
   }
 
   // Where the rowid ends up at the port is wherever THAT column travelled to —

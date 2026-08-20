@@ -184,10 +184,13 @@ struct defer_pair {
 /// order internally, so a ride that reorders the bundle is handled here rather
 /// than by every caller.
 ///
+/// The two ends' types must AGREE, or differ only by a carrier width the pin's
+/// value can be restored to — in which case the materializer widens at the port.
+///
 /// Returns a pair whose valid() is false if the request is not installable —
 /// no positions, positions out of range or repeated, mismatched counts, or a
-/// port column whose type disagrees with what the scan gave up. The caller
-/// installs both halves or neither.
+/// port column whose type is neither what the scan gave up nor a restoration of
+/// it. The caller installs both halves or neither.
 [[nodiscard]] defer_pair make_defer_pair(std::vector<cudf::data_type> const& scan_schema,
                                          std::vector<std::size_t> const& scan_positions,
                                          std::vector<cudf::data_type> const& port_schema,
