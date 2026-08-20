@@ -26,6 +26,7 @@
 #include <op/scan/sirius_gpu_scan_operator.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <op/sirius_physical_operator.hpp>
+#include <pipeline/data_size_estimator.hpp>
 #include <scan_manager/split_connector.hpp>
 #include <sirius/exception.hpp>
 #include <sirius_context.hpp>
@@ -47,6 +48,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -258,6 +260,24 @@ std::optional<task_creation_hint> sirius_gpu_scan_operator::get_next_task_hint()
 
 bool sirius_gpu_scan_operator::all_ports_empty() { return _split_connector->is_closed(); }
 
+std::optional<std::size_t> sirius_gpu_scan_operator::total_source_input_bytes() const
+{
+  if (!_split_connector->is_discovery_complete()) { return std::nullopt; }
+  return _split_connector->discovered_bytes();
+}
+
+std::optional<std::size_t> sirius_gpu_scan_operator::total_source_output_bytes() const
+{
+  std::size_t rows  = 0;
+  std::size_t bytes = 0;
+  {
+    std::lock_guard<std::mutex> guard(_emitted_mutex);
+    rows  = _emitted_rows;
+    bytes = _emitted_bytes;
+  }
+  return pipeline::project_source_output_bytes(estimated_cardinality, rows, bytes);
+}
+
 std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input_data()
 {
   auto next = _split_connector->get_next_split();
@@ -351,6 +371,19 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
                                                mem_space->get_default_allocator());
     }
   }
+
+  // Feed the bytes-per-row factor behind total_source_output_bytes(). Read both from the table
+  // while we still own it: for an owned table the batch's get_size_in_bytes() is exactly
+  // alloc_size(), so locking the batch afterwards would buy the same number at the cost of a
+  // shared lock. Rows and bytes are only meaningful as a pair, so publish them in one update.
+  auto const emitted_rows  = static_cast<std::size_t>(output_table->num_rows());
+  auto const emitted_bytes = output_table->alloc_size();
+  {
+    std::lock_guard<std::mutex> guard(_emitted_mutex);
+    _emitted_rows += emitted_rows;
+    _emitted_bytes += emitted_bytes;
+  }
+
   auto batch =
     sirius::make_data_batch(std::move(output_table), *mem_space, stream, batch_telemetry());
   std::vector<std::shared_ptr<::cucascade::data_batch>> batches{std::move(batch)};

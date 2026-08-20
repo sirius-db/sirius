@@ -42,6 +42,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -192,6 +193,16 @@ struct cross_schedule_pair {
 /// >= 1 batch), and symmetrically for build batches. Idempotent.
 [[nodiscard]] std::vector<cross_schedule_discard> collect_cross_schedule_discards(
   std::vector<partition_cross_schedule>& cross, bool probe_finished, bool build_finished);
+
+/// Sum over probe batches of `bytes x (pairings done / build batches)` — the size estimator's
+/// denominator. Output accrues once per pairing, so charging a batch whole at its first pairing
+/// would leave the ratio low by the build batch count until the last one lands; weighting puts
+/// both terms at the same fraction of the way through. A partition with no build batch yet
+/// contributes nothing, having nothing to be a fraction of; those reach the total whole, once,
+/// via the orphan path.
+[[nodiscard]] std::size_t pairing_weighted_probe_bytes(
+  std::vector<partition_cross_schedule> const& cross,
+  std::unordered_map<uint64_t, std::size_t> const& probe_bytes);
 
 /// Find and claim the next unscheduled (probe,build) pair across partitions, marking it scheduled
 /// and bumping the paired counts. If none is schedulable now, reports whether to wait on the build
@@ -371,7 +382,56 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
+  /// The probe side, but only where it is the side still streaming — the estimator extrapolates
+  /// along the nominated port, so a port already at its final volume carries no prediction.
+  /// INNER/LEFT/SEMI/ANTI/MARK fold the build whole and stream the probe, which is that axis.
+  /// RIGHT-family inverts it (refresh_cross_schedule pins the *probe* whole and streams the build)
+  /// and OUTER pins both, so they nominate nothing: with the probe closed, `consumed` is final
+  /// from the first pairing while output keeps climbing, and the ratio would collapse to "bytes
+  /// emitted so far" — blind to the unpaired build, worst when the build dwarfs the probe.
+  /// Following the build side would be predictive for RIGHT-family but needs build-byte accounting
+  /// this operator does not keep. See sirius_physical_operator::primary_input_port.
+  [[nodiscard]] std::optional<std::string_view> primary_input_port() const override
+  {
+    if (is_right_family() || join_type == duckdb::JoinType::OUTER) { return std::nullopt; }
+    return std::string_view{"default"};
+  }
+
+  /// Probe bytes consumed so far: batches taken whole, plus the cross schedule's pairing-weighted
+  /// share (see @ref pairing_weighted_probe_bytes). Withheld until the build side is whole, since
+  /// the weights divide by a build batch count that is still growing before then.
+  /// Out of line: the predicate needs sirius_pipeline complete.
+  [[nodiscard]] std::optional<std::size_t> consumed_primary_input_bytes() const override;
+
  protected:
+  /// Record @p batch's size in @ref _probe_batch_bytes for the cross schedule to weight, once per
+  /// distinct batch. Idempotent, so call it at every sighting rather than identifying the first:
+  /// the size read is non-blocking and a later sighting retries a lost one. Build bytes are never
+  /// recorded; null batches ignored. Only for sites that see a batch repeatedly — where it is seen
+  /// once, a lost read is unrecoverable, so use note_probe_bytes_counted instead.
+  void note_probe_bytes(const std::shared_ptr<cucascade::data_batch>& batch);
+
+  /// Recompute @ref _weighted_probe_bytes from the current schedule. Call after a pairing is
+  /// claimed, never before: a stale total lets the task's output reach the numerator while its
+  /// weight is still missing from the denominator, inflating the ratio. No-op until @p
+  /// build_finished — the same predicate consumed_primary_input_bytes() gates on, so nothing can
+  /// read it before then and the walk stays off the streaming phase. Caller holds op_state_mutex.
+  void publish_weighted_probe_bytes(bool build_finished);
+
+  /// Add @p bytes to @ref _whole_probe_bytes, once per distinct batch — for a batch consumed
+  /// exactly once, with no pairing fraction to weight. The caller has already read the size off its
+  /// own accessor, so this takes no batch lock and cannot lose. Takes @ref _probe_bytes_mutex
+  /// itself, so it is safe to call while holding a batch lock.
+  void note_probe_bytes_counted(uint64_t batch_id, std::size_t bytes);
+
+  /// Record @p bytes as @p batch_id's size for the cross schedule to weight, once per batch, and
+  /// carry it in @ref _unpublished_probe_bytes until a publish folds it into the weights. The
+  /// single place that writes @ref _probe_batch_bytes, so the "paired or counted whole, never
+  /// both" split holds by construction: a batch already counted whole is skipped, which is what
+  /// keeps an orphan task — whose probe survivor the scheduler has already counted, and whose
+  /// synthesized empty opposite is not a probe batch at all — from disturbing the totals.
+  void record_probe_batch_bytes(uint64_t batch_id, std::size_t bytes);
+
   // double get_progress(duckdb::ClientContext &context, duckdb::GlobalSourceState &gstate) const
   // override;
 
@@ -400,6 +460,41 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   // Guarded by op_state_mutex.
   bool _build_not_whole_reported = false;
+
+  // Probe bytes for batches consumed exactly once, with no pairing multiplicity to discount:
+  // BUILD_PROBE pops and cross-schedule orphans. Relaxed ordering: the derived value is an
+  // estimate and readers tolerate a slightly stale count.
+  std::atomic<std::size_t> _whole_probe_bytes{0};
+
+  // The STANDARD / MIXED_JOIN cross schedule's share, republished by refresh_cross_schedule
+  // because a batch's weight rises with every pairing. See pairing_weighted_probe_bytes.
+  std::atomic<std::size_t> _weighted_probe_bytes{0};
+
+  // Dedup for _whole_probe_bytes, so repeated sightings of a batch count once. Guarded by
+  // _probe_bytes_mutex below, not op_state_mutex: execute() updates this while holding a batch
+  // lock, and taking op_state_mutex there would invert the order (see that member).
+  std::unordered_set<uint64_t> _counted_probe_batch_ids;
+
+  // Sizes recorded since the last publish. execute() cannot republish (that needs _cross under
+  // op_state_mutex, which it must not take), and scheduler polling is event-driven, so it may
+  // never run again — a batch recorded by the drain tail's last task would otherwise sit out of
+  // the denominator for good. Adding its FULL size here instead of its pairing fraction
+  // deliberately over-counts the denominator, which biases the ratio low: the direction the whole
+  // design already errs in. publish_weighted_probe_bytes folds these into the weights and clears
+  // it.
+  std::atomic<std::size_t> _unpublished_probe_bytes{0};
+
+  // Size of every probe batch the cross schedule has seen, keyed by batch id — the weights are
+  // applied to these. Disjoint from _counted_probe_batch_ids: a batch is either paired (here) or
+  // consumed whole (there), never both.
+  //
+  // Deliberately NOT op_state_mutex: execute() records here while holding a batch's shared lock,
+  // and the scheduler blocks on a batch lock while holding op_state_mutex (the orphan path), so
+  // reusing it would invert the order against a queued writer (spill readback takes a blocking
+  // exclusive lock; the downgrade's try_to_mutable does not). Innermost lock: op_state_mutex ->
+  // _probe_bytes_mutex, and nothing waits on a batch lock while holding it.
+  std::mutex _probe_bytes_mutex;
+  std::unordered_map<uint64_t, std::size_t> _probe_batch_bytes;
 
   // Whether any build-side join key column contains a NULL. Used exclusively for MARK join
   // three-valued logic. Sentinel -1 = unset, 0 = false, 1 = true. Join-wide (not per-partition)

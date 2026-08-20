@@ -97,9 +97,22 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
    *
    * Used to record and query historical memory consumption patterns so that
    * future tasks can make better reservation estimates.
+   *
+   * The history is owned by the pipeline itself, not by this global state, so that the
+   * data size estimator can reach a producer pipeline's ratio through `port::src_pipeline`
+   * without going through the task_creator. There is exactly one global state per pipeline
+   * (task_creator::prepare_for_query), so this delegation preserves the previous 1:1
+   * lifetime. Falls back to a per-state history for the test paths that construct a global
+   * state with a null pipeline.
    */
-  pipeline_memory_history& get_memory_history() { return _memory_history; }
-  const pipeline_memory_history& get_memory_history() const { return _memory_history; }
+  pipeline_memory_history& get_memory_history()
+  {
+    return _pipeline ? _pipeline->get_memory_history() : _detached_memory_history;
+  }
+  const pipeline_memory_history& get_memory_history() const
+  {
+    return _pipeline ? _pipeline->get_memory_history() : _detached_memory_history;
+  }
 
   /**
    * @brief Set the preferred GPU device ID for this pipeline's tasks.
@@ -133,9 +146,11 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
 
  private:
   duckdb::shared_ptr<sirius_pipeline> _pipeline;  ///< Shared pointer to the GPU pipeline to execute
-  pipeline_memory_history _memory_history;        ///< Historical memory metrics for estimation
-  std::optional<int> _preferred_device_id;        ///< Pipeline-level preferred GPU device
-  exec::queue_priority _priority{0};              ///< Pipeline-level scheduling priority
+  /// Stand-in history used only when @c _pipeline is null (tests that construct a global
+  /// state without a pipeline). The real history lives on sirius_pipeline.
+  pipeline_memory_history _detached_memory_history;
+  std::optional<int> _preferred_device_id;  ///< Pipeline-level preferred GPU device
+  exec::queue_priority _priority{0};        ///< Pipeline-level scheduling priority
   std::shared_ptr<const telemetry::telemetry_context>
     _telemetry_context;  ///< SiriusContext telemetry
 };

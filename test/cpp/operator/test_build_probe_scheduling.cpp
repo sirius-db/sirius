@@ -27,12 +27,17 @@
 // (interleaved per-partition build/probe sequencing) deterministically. The
 // end-to-end multi-GPU behavior is covered by the [mgpu] integration tests.
 
+#include "expression/join_condition.hpp"
+#include "helper/type_conversions.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_partition.hpp"
 
 #include <catch.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <duckdb/planner/operator/logical_comparison_join.hpp>
 
 #include <stdexcept>
+#include <string_view>
 
 using sirius::op::broadcast_slots_to_discard;
 using sirius::op::BUILD_HASH_TABLE_STATE;
@@ -582,4 +587,84 @@ TEST_CASE("broadcast_slots_to_discard - a DESTROYED slot is not rediscarded", "[
     },
     /*probe_finished=*/true);
   REQUIRE(d == std::vector<std::size_t>{1});
+}
+
+//===----------------------------------------------------------------------===//
+// primary_input_port — which side the size estimator may extrapolate along
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+// A bare hash join of a given type: single-INTEGER children joined on col0, no pipelines, no GPU.
+// The LogicalComparisonJoin must outlive the join, which holds op.types by reference.
+struct nomination_fixture {
+  duckdb::unique_ptr<duckdb::LogicalComparisonJoin> logical_join;
+  duckdb::unique_ptr<sirius::op::sirius_physical_hash_join> hash_join;
+};
+
+nomination_fixture make_join(duckdb::JoinType join_type)
+{
+  nomination_fixture f;
+  f.logical_join        = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(join_type);
+  f.logical_join->types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER};
+
+  auto make_child = [] {
+    return duckdb::make_uniq<sirius::op::sirius_physical_operator>(
+      sirius::op::SiriusPhysicalOperatorType::PROJECTION,
+      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+      0);
+  };
+
+  duckdb::vector<duckdb::JoinCondition> conditions;
+  duckdb::JoinCondition cond;
+  cond.left  = duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
+  cond.right = duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
+  cond.comparison = duckdb::ExpressionType::COMPARE_EQUAL;
+  conditions.push_back(std::move(cond));
+
+  f.hash_join = duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
+    *f.logical_join,
+    make_child(),
+    make_child(),
+    sirius::wrap_join_conditions(std::move(conditions)),
+    join_type,
+    duckdb::vector<duckdb::idx_t>{},
+    duckdb::vector<duckdb::idx_t>{},
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),
+    1000,
+    nullptr);
+  return f;
+}
+
+}  // namespace
+
+TEST_CASE("primary_input_port - probe-streaming joins nominate the probe side",
+          "[hash_join][size_estimation][unit]")
+{
+  // These fold the build to one whole batch and stream the probe, so probe volume is the open
+  // axis the estimator's ratio extrapolates along.
+  for (auto const jt : {duckdb::JoinType::INNER,
+                        duckdb::JoinType::LEFT,
+                        duckdb::JoinType::SEMI,
+                        duckdb::JoinType::ANTI,
+                        duckdb::JoinType::MARK}) {
+    auto f = make_join(jt);
+    INFO("join type: " << duckdb::JoinTypeToString(jt));
+    REQUIRE(f.hash_join->primary_input_port() == std::string_view{"default"});
+  }
+}
+
+TEST_CASE("primary_input_port - build-streaming joins nominate nothing",
+          "[hash_join][size_estimation][unit]")
+{
+  // RIGHT-family pins the probe whole and streams the build; OUTER pins both. With no open axis
+  // to extrapolate along, nominating nothing yields no estimate instead of an under-estimate.
+  for (auto const jt : {duckdb::JoinType::RIGHT,
+                        duckdb::JoinType::RIGHT_SEMI,
+                        duckdb::JoinType::RIGHT_ANTI,
+                        duckdb::JoinType::OUTER}) {
+    auto f = make_join(jt);
+    INFO("join type: " << duckdb::JoinTypeToString(jt));
+    REQUIRE_FALSE(f.hash_join->primary_input_port().has_value());
+  }
 }

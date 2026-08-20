@@ -77,13 +77,24 @@ TEST_CASE("pipeline_memory_history skips records with zero estimated_bytes",
 {
   pipeline_memory_history history;
 
-  history.record({0, 500, 300});    // Should be skipped
+  history.record({0, 500, 300});    // Skipped by the ring: peak estimation divides by the basis
   history.record({100, 300, 200});  // ratio = 3.0
 
   auto estimate = history.estimate_peak_memory(100);
   REQUIRE(estimate.has_value());
   // Only the second record contributes: 100 * 3.0 = 300
   REQUIRE(*estimate == 300);
+
+  // ...but its emitted bytes still count toward the pipeline's output total, which must not
+  // depend on whether a task's input happened to be measurable.
+  REQUIRE(history.totals().output_records == 2);
+  REQUIRE(history.totals().output_bytes == 500);
+  // The ratio ignores it: a zero basis cannot be paired with an output.
+  REQUIRE(history.totals().ratio_records == 1);
+  REQUIRE(history.totals().ratio_input_bytes == 100);
+  auto ratio = history.totals().ratio();
+  REQUIRE(ratio.has_value());
+  REQUIRE(*ratio == Approx(2.0));
 }
 
 TEST_CASE("pipeline_memory_history ring buffer evicts oldest records",
@@ -140,4 +151,97 @@ TEST_CASE("pipeline_memory_history is thread-safe for concurrent recording",
   auto estimate = history.estimate_peak_memory(200);
   REQUIRE(estimate.has_value());
   REQUIRE(*estimate > 0);
+
+  // Every record is counted in the running totals, unlike the capped ring buffer.
+  REQUIRE(history.totals().ratio_records ==
+          static_cast<std::size_t>(num_threads) * static_cast<std::size_t>(records_per_thread));
+}
+
+TEST_CASE("pipeline_memory_history has no output/input ratio without records",
+          "[pipeline_memory_history][ratio]")
+{
+  pipeline_memory_history history;
+  REQUIRE_FALSE(history.totals().ratio().has_value());
+  REQUIRE(history.totals().output_bytes == 0);
+}
+
+TEST_CASE("pipeline_memory_history aggregates the output/input ratio over all records",
+          "[pipeline_memory_history][ratio]")
+{
+  pipeline_memory_history history;
+
+  history.record({100, 200, 60});
+  history.record({300, 600, 140});
+
+  // Aggregate, not per-record: 200 out of 400 in.
+  auto ratio = history.totals().ratio();
+  REQUIRE(ratio.has_value());
+  REQUIRE(*ratio == Approx(0.5));
+
+  REQUIRE(history.totals().output_bytes == 200);
+  REQUIRE(history.totals().ratio_input_bytes == 400);
+  REQUIRE(history.totals().ratio_records == 2);
+}
+
+TEST_CASE("pipeline_memory_history totals survive ring-buffer eviction",
+          "[pipeline_memory_history][ratio][ring_buffer]")
+{
+  pipeline_memory_history history;
+
+  // 200 records is well past the 64-entry ring, so a totals implementation backed by the ring
+  // would lose most of this.
+  for (std::size_t i = 0; i < 200; ++i) {
+    history.record({100, 200, 25});
+  }
+
+  REQUIRE(history.size() == 64);
+  REQUIRE(history.totals().ratio_records == 200);
+  REQUIRE(history.totals().output_bytes == std::size_t{200} * 25);
+
+  auto ratio = history.totals().ratio();
+  REQUIRE(ratio.has_value());
+  REQUIRE(*ratio == Approx(0.25));
+}
+
+TEST_CASE("pipeline_memory_history excludes failed tasks from the output/input ratio",
+          "[pipeline_memory_history][ratio]")
+{
+  pipeline_memory_history history;
+
+  history.record({100, 200, 50});
+  // A task that OOM'd produced no output; counting its input would drag the ratio down.
+  history.record_on_failure(400, 900);
+
+  auto ratio = history.totals().ratio();
+  REQUIRE(ratio.has_value());
+  REQUIRE(*ratio == Approx(0.5));
+  REQUIRE(history.totals().ratio_records == 1);
+  REQUIRE(history.totals().ratio_input_bytes == 100);
+}
+
+TEST_CASE("pipeline_memory_history excludes resumed tasks from the output/input ratio",
+          "[pipeline_memory_history][ratio]")
+{
+  pipeline_memory_history history;
+
+  history.record({100, 200, 50});
+  // A task resumed mid-pipeline after a reschedule: its basis is the intermediate data it
+  // restarted from, not pipeline input, so mixing it in would inflate the ratio. It still
+  // belongs in the ring, which feeds per-task peak estimation.
+  history.record({10, 200, 50, /*ratio_eligible=*/false});
+
+  REQUIRE(history.size() == 2);
+
+  // The ratio takes only the first: pairing 50 output with a 10-byte intermediate basis would
+  // report 5.0 for a pipeline that actually halves its input.
+  auto ratio = history.totals().ratio();
+  REQUIRE(ratio.has_value());
+  REQUIRE(*ratio == Approx(0.5));
+  REQUIRE(history.totals().ratio_records == 1);
+  REQUIRE(history.totals().ratio_input_bytes == 100);
+
+  // The output total takes both: a resumed task's basis is unusable, but the bytes it emitted
+  // are still the pipeline's output and must not vanish from a finished pipeline's total.
+  REQUIRE(history.totals().output_records == 2);
+  REQUIRE(history.totals().output_bytes == 100);
 }

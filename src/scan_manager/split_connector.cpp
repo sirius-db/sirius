@@ -34,6 +34,9 @@ void split_connector::push_split(std::unique_ptr<op::operator_data> split)
   {
     std::lock_guard<std::mutex> lock(_mutex);
     assert(!_closed && "push_split after close() is forbidden");
+    // Accumulate before the move: this is the one choke point every split passes through,
+    // so it is where the scan's total input basis is tallied for the data size estimator.
+    _discovered_bytes += split->get_estimated_size_in_bytes();
     _splits.push_back(std::move(split));
   }
   _cv.notify_one();
@@ -104,6 +107,18 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> split_connector::peek_resi
     }
   }
   return batches;
+}
+
+bool split_connector::is_discovery_complete() const
+{
+  std::lock_guard<std::mutex> lock(_mutex);
+  return _closed;
+}
+
+std::size_t split_connector::discovered_bytes() const
+{
+  std::lock_guard<std::mutex> lock(_mutex);
+  return _discovered_bytes;
 }
 
 }  // namespace sirius::scan_manager

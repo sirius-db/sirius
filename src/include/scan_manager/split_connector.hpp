@@ -107,6 +107,14 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   /// prefetch threads grabbing exclusive locks would serialize them.
   [[nodiscard]] bool is_draining(std::size_t quiet_ms) const;
 
+  /// \brief True once close() has been called — i.e. @ref discovered_bytes is now the scan's
+  ///        complete total. Distinct from @ref is_closed, which means closed AND drained.
+  [[nodiscard]] bool is_discovery_complete() const;
+
+  /// \brief Σ `get_estimated_size_in_bytes()` over every split pushed so far. Monotonic, so
+  ///        consumers draining the queue do not reduce it; a lower bound until discovery closes.
+  [[nodiscard]] std::size_t discovered_bytes() const;
+
  private:
   friend class load_balancing_scan_batch_coalescer;
 
@@ -122,6 +130,9 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   std::exception_ptr _exception;
   /// steady_clock ms timestamp of the last get_next_split() pop (0 = never).
   std::atomic<std::int64_t> _last_pop_ms{0};
+  /// Monotonic discovery total: accumulated in push_split, never decremented when a
+  /// consumer pops. See @ref discovered_bytes.
+  std::size_t _discovered_bytes{0};
 };
 
 }  // namespace sirius::scan_manager
