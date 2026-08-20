@@ -2083,6 +2083,13 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
   std::shared_ptr<::cucascade::data_batch> batch,
   std::size_t partition_idx)
 {
+  // Names the batches that belong to the build side, which nothing downstream can infer: tier
+  // traces carry a batch id but no port.
+  if (port_id == "build" && batch) {
+    SIRIUS_LOG_DEBUG(
+      "[hash_join] id {} build-port batch {}", get_operator_id(), batch->get_batch_id());
+  }
+
   //===----------Dynamic Table Filters----------===//
   // Build-side dynamic-filter publish: the moment the (single, concat-folded) build batch arrives,
   // compute and publish the filter from the build keys.

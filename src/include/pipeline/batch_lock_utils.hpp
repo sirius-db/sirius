@@ -143,6 +143,15 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
         return clone->to_read_only();
       }
       mut_accessor.convert_to<cucascade::gpu_table_representation>(registry, target_space, stream);
+      // Paired with the downgrade executor's spill trace: together they show a batch's round trip.
+      // The column count travels with it because a batch id alone says nothing about which side of
+      // a join the data came from.
+      SIRIUS_LOG_DEBUG("[upgrade] batch {} restored to GPU for processing, {} columns",
+                       mut_accessor.get_batch_id(),
+                       mut_accessor.get_data()
+                         ->cast<cucascade::gpu_table_representation>()
+                         .get_table_view()
+                         .num_columns());
       telemetry::batch_telemetry_registry::instance().on_tier_change(
         mut_accessor.get_batch_id(),
         target_space->get_tier(),
