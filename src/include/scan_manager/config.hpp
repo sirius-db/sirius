@@ -139,10 +139,9 @@ struct readahead_plan {
  * @c sirius_datasource either way; the kvikio backend drives
  * @c kvikio::FileHandle directly. Multi-GPU forces @ref io_backend::sirius.
  *
- * @c cache is the read path's whole caching configuration, stamped from the
- * top-level @c sirius.cache YAML block; @ref apply_cache_mode derives
- * @c uring.use_odirect and @c cache.dispose_on_idle from it, so neither is
- * settable on its own.
+ * @c cache is the read path's whole caching configuration, and its only home;
+ * @ref apply_cache_mode derives @c uring.use_odirect and
+ * @c cache.dispose_on_idle from it, so neither is settable on its own.
  *
  * Sub-configs:
  *  - @c uring   — uring reactor tunables (local-disk IO path).
@@ -199,8 +198,8 @@ struct scan_manager_config {
   io::kvikio_config kvikio{};
 
   /// The read path's caching configuration: mode, eviction policy and the
-  /// prefetching cache's tunables.  Stamped from the top-level @c sirius.cache
-  /// YAML block, which is its only home.
+  /// prefetching cache's tunables.  One block, rather than a mode here and the
+  /// tunables in a sibling one.
   io::cache::config cache{};
 
   /// Object-store credentials and endpoint consumed by the REST reactor.

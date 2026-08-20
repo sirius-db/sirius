@@ -75,7 +75,9 @@ std::string scan_manager_yaml(std::string const& body)
 std::string cache_yaml(std::string const& body)
 {
   return "sirius:\n"
-         "  cache:\n" +
+         "  executor:\n"
+         "    scan_manager:\n"
+         "      cache:\n" +
          body;
 }
 
@@ -210,22 +212,22 @@ TEST_CASE("apply_cache_mode overwrites hand-set derived knobs",
 TEST_CASE("sirius_config derives scan_manager knobs from the cache block",
           "[scan_manager][config][cache_mode]")
 {
-  auto const os = load_scan_manager("sirius_cache_mode_os.yaml", cache_yaml("    mode: os\n"));
+  auto const os = load_scan_manager("sirius_cache_mode_os.yaml", cache_yaml("        mode: os\n"));
   CHECK(os.cache.mode == cache_mode::os);
   CHECK_FALSE(os.uring.use_odirect);
   CHECK_FALSE(os.cache.use_prefetching_cache());
 
   auto const lru = load_scan_manager("sirius_cache_mode_lru.yaml",
-                                     cache_yaml("    mode: sirius\n"
-                                                "    eviction: lru\n"));
+                                     cache_yaml("        mode: sirius\n"
+                                                "        eviction: lru\n"));
   CHECK(lru.cache.mode == cache_mode::sirius);
   CHECK(lru.uring.use_odirect);
   CHECK(lru.cache.use_prefetching_cache());
   CHECK_FALSE(lru.cache.dispose_on_idle);
 
   auto const idle = load_scan_manager("sirius_cache_mode_idle.yaml",
-                                      cache_yaml("    mode: sirius\n"
-                                                 "    eviction: idle\n"));
+                                      cache_yaml("        mode: sirius\n"
+                                                 "        eviction: idle\n"));
   CHECK(idle.cache.mode == cache_mode::sirius);
   CHECK(idle.uring.use_odirect);
   CHECK(idle.cache.use_prefetching_cache());
@@ -247,10 +249,10 @@ TEST_CASE("sirius_config defaults the cache mode to none when YAML omits it",
 TEST_CASE("sirius_config reads the cache tunables", "[scan_manager][config][cache_mode]")
 {
   auto const cfg = load_scan_manager("sirius_cache_tunables.yaml",
-                                     cache_yaml("    mode: sirius\n"
-                                                "    eviction: idle\n"
-                                                "    eviction_threshold_fraction: 0.25\n"
-                                                "    min_prefetching_budget_fraction: 0.5\n"));
+                                     cache_yaml("        mode: sirius\n"
+                                                "        eviction: idle\n"
+                                                "        eviction_threshold_fraction: 0.25\n"
+                                                "        min_prefetching_budget_fraction: 0.5\n"));
 
   CHECK(cfg.cache.eviction_threshold_fraction == Approx(0.25));
   CHECK(cfg.cache.min_prefetching_budget_fraction == Approx(0.5));
@@ -259,7 +261,7 @@ TEST_CASE("sirius_config reads the cache tunables", "[scan_manager][config][cach
 
 TEST_CASE("sirius_config rejects an unknown cache mode", "[scan_manager][config][cache_mode]")
 {
-  scoped_yaml yaml("sirius_cache_mode_invalid.yaml", cache_yaml("    mode: persistent_host\n"));
+  scoped_yaml yaml("sirius_cache_mode_invalid.yaml", cache_yaml("        mode: persistent_host\n"));
 
   sirius::sirius_config cfg;
   CHECK_THROWS(cfg.load_from_file(yaml.path()));
@@ -274,12 +276,12 @@ TEST_CASE("sirius_config rejects the knobs superseded by the cache block",
     CHECK_THROWS(cfg.load_from_file(yaml.path()));
   };
 
-  rejects("sirius_cache_mode_dispose.yaml", cache_yaml("    dispose_on_idle: true\n"));
+  rejects("sirius_cache_mode_dispose.yaml", cache_yaml("        dispose_on_idle: true\n"));
   rejects("sirius_cache_mode_odirect.yaml",
           scan_manager_yaml("      uring:\n"
                             "        use_odirect: false\n"));
-  // The pre-consolidation homes: a `cache` key and a `prefetch_cache` block on
-  // the scan_manager, both now the top-level `cache` block's business.
+  // The pre-consolidation spellings: `cache` as a bare mode scalar, and a
+  // sibling `prefetch_cache` block, both now the `cache` block's business.
   rejects("sirius_cache_mode_scan_manager_cache.yaml", scan_manager_yaml("      cache: sirius\n"));
   rejects("sirius_cache_mode_prefetch_cache.yaml",
           scan_manager_yaml("      prefetch_cache:\n"

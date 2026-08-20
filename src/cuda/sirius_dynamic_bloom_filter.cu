@@ -25,7 +25,7 @@
 #include <cuco/hash_functions.cuh>
 #include <cuda/sirius_rmm_cuco_allocator.cuh>
 #include <cuda/std/cstddef>
-#include <cuda/stream_ref>
+#include <cuda/stream>
 
 #include <cucascade/memory/memory_space.hpp>
 #include <log/logging.hpp>

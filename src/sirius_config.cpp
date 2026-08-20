@@ -233,8 +233,12 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   if (auto n = r.optional_node("uring")) sirius::from_yaml(*n, opt.uring);
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
   if (auto n = r.optional_node("kvikio")) sirius::from_yaml(*n, opt.kvikio);
+  if (auto n = r.optional_node("cache")) sirius::from_yaml(*n, opt.cache);
   if (auto n = r.optional_node("object_store")) sirius::from_yaml(*n, opt.object_store);
   r.reject_unknown();
+  // Stamped here rather than by the caller: `cache` and the `uring` sub-config
+  // it overrides have both been read by now.
+  opt.apply_cache_mode();
 }
 
 static void from_yaml(const YAML::Node& node, operator_params& opt)
@@ -542,12 +546,6 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
       mr.reject_unknown();
     }
 
-    // Read-path caching: mode, eviction policy and prefetching-cache tunables.
-    // A top-level block rather than a scan_manager one, because it describes
-    // what the engine caches rather than how the scan manager is wired; the
-    // scan_manager_config carries a copy so its consumers see one struct.
-    if (auto n = r.optional_node("cache")) { sirius::from_yaml(*n, _scan_manager_config.cache); }
-
     // Executors
     if (auto exec_node = r.optional_node("executor")) {
       yaml::reader er(*exec_node, "sirius.executor");
@@ -610,10 +608,6 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
       disk_cfg.setup_configurator(builder);
       _memory_space_configs = builder.build(_hw_topology);
     }
-
-    // Both halves of the cache wiring are read by now (`sirius.cache` and the
-    // uring sub-config it overrides), so the derived knobs can be stamped.
-    _scan_manager_config.apply_cache_mode();
 
     derive_uring_scan_budget();
     // The opportunistic strategy schedules against what the executor can run,

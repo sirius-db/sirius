@@ -464,7 +464,7 @@ Separately from the prefetching cache, the ioctx always exposes a `metadata_stor
 | `IO_BLOCK_SIZE` (4096) | `io/types.hpp` | `O_DIRECT` alignment for local-disk reads. |
 | chunk size | `buffer_pool::chunk_size()` (FSMR block size) | Cache / bounce chunk granularity; sourced from the pinned `fixed_size_host_memory_resource`'s block size rather than a compile-time constant. |
 | `eviction_threshold_fraction` / `min_prefetching_budget_fraction` | `io/cache/config.hpp` | When the pool starts evicting and the floor reserved for prefetching. |
-| `bounce_size` / `max_n_chunks` / `use_odirect` | `io/uring/config.hpp` | Per-reactor uring tunables: bounce-slot size, max contiguous segments fused into one `readv`, and the buffered-vs-`O_DIRECT` toggle (`use_odirect` is derived from the top-level `cache.mode`). |
+| `bounce_size` / `max_n_chunks` / `use_odirect` | `io/uring/config.hpp` | Per-reactor uring tunables: bounce-slot size, max contiguous segments fused into one `readv`, and the buffered-vs-`O_DIRECT` toggle (`use_odirect` is derived from `scan_manager.cache.mode`). |
 | `max_chunk_size` / `merge_max_gap` / retry policy | `io/rest/config.hpp` | Per-reactor REST tunables (see [S3 / Object-Store Backend](#s3--object-store-backend)). Every read is coalesced across gaps up to `merge_max_gap` (bridged bytes are fetched and discarded), then cut into requests of at least `max_chunk_size` with the bytes balanced across them. |
 
 ## Complete Scan Flow

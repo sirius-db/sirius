@@ -378,14 +378,15 @@ class sirius_config_env_guard {
         << yaml_quote((dir_ / "disk_memory").string())
         << "\n"
            "        memory_capacity: "
-        << limits.disk_capacity << "\n";
+        << limits.disk_capacity
+        << "\n"
+           "  executor:\n"
+           "    scan_manager:\n";
     if (limits.enable_prefetch_cache.has_value()) {
-      out << "  cache:\n"
-             "    mode: "
+      out << "      cache:\n"
+             "        mode: "
           << (*limits.enable_prefetch_cache ? "sirius" : "none") << "\n";
     }
-    out << "  executor:\n"
-           "    scan_manager:\n";
     if (limits.backend.has_value()) {
       std::string backend_name;
       REQUIRE(sirius::scan_manager::enum_to_string(*limits.backend, backend_name));
@@ -1609,8 +1610,8 @@ bench_record run_rest_minio_bench_scenario(
   bool perf_instrumentation,
   std::vector<std::string> columns,
   std::optional<std::size_t> rest_n_reactors = std::nullopt,
-  bool enable_prefetch_cache                      = true,
-  bool use_footer_probe                           = false)
+  bool enable_prefetch_cache                 = true,
+  bool use_footer_probe                      = false)
 {
   INFO("scenario=" << scenario << " columns=" << columns.size()
                    << " rest_n_reactors=" << rest_n_reactors.value_or(std::size_t{2})
@@ -1666,8 +1667,7 @@ bench_record run_rest_aws_bench_scenario(s3_test_env const& env,
                                          bool use_footer_probe = false)
 {
   INFO("scenario=" << scenario << " key=" << aws_bench_lineitem_key()
-                   << " columns=" << columns.size()
-                   << " use_footer_probe=" << use_footer_probe);
+                   << " columns=" << columns.size() << " use_footer_probe=" << use_footer_probe);
   auto limits                      = large_sirius_memory_limits(/*enable_prefetch_cache=*/true);
   limits.rest_perf_instrumentation = true;
   limits.rest_n_reactors           = std::size_t{2};
@@ -2355,11 +2355,8 @@ TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
   // old max_connections sweep would run each scenario twice with identical
   // settings; one pass remains.
   auto const max_connections = kRestConnectionsPerReactor;
-  auto projected = run_rest_aws_bench_scenario(*env,
-                                               uri,
-                                               "aws_https_projected",
-                                               bench_single_column_projection(),
-                                               projected_rows);
+  auto projected             = run_rest_aws_bench_scenario(
+    *env, uri, "aws_https_projected", bench_single_column_projection(), projected_rows);
   if (!projected_rows.has_value()) { projected_rows = projected.row_count; }
   if (!projected_payload_bytes.has_value()) {
     projected_payload_bytes = projected.payload_bytes_read;
@@ -2428,10 +2425,11 @@ TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
   CHECK(full_probe.terminal_failures_total == 0);
   CHECK(full_probe.device_stream_sync_total == 0);
   CHECK(full_probe.bind_chunk_get_count == 1);
-  WARN("AWS REST full_probe mc="
-       << max_connections << " throughput=" << full_probe.effective_mib_per_sec
-       << " MiB/s footer_fetch_ms=" << full_probe.footer_fetch_ms
-       << " ttfb_ns=" << full_probe.ttfb_ns << " retries=" << full_probe.retries_total);
+  WARN("AWS REST full_probe mc=" << max_connections
+                                 << " throughput=" << full_probe.effective_mib_per_sec
+                                 << " MiB/s footer_fetch_ms=" << full_probe.footer_fetch_ms
+                                 << " ttfb_ns=" << full_probe.ttfb_ns
+                                 << " retries=" << full_probe.retries_total);
   warn_footer_probe_ab("aws_https_full", records.back(), full_probe);
   attach_baseline_comparison(full_probe, baseline_json, backend);
   records.push_back(std::move(full_probe));

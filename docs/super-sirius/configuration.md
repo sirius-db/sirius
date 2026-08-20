@@ -79,9 +79,12 @@ sirius:
       downgrade_stop_fraction: 0.6
     host: { capacity_bytes: 25GB, initial_number_pools: 50, pool_size: 512, block_size: 1048576 }
     disk: { disk_id: 0, capacity_bytes: 1000000000000, downgrade_root_dirs: "/tmp/sirius_disk_memory" }
-  cache: { mode: none, eviction: lru }
   executor:
-    scan_manager: { num_threads: 4, backend: sirius, uring_n_reactors: 1 }
+    scan_manager:
+      num_threads: 4
+      backend: sirius
+      uring_n_reactors: 1
+      cache: { mode: none, eviction: lru }
     pipeline:     { num_threads: 4 }
     downgrade:    { num_threads: 1 }
     task_creator: { num_threads: 1 }
@@ -269,7 +272,7 @@ Thread pool (default `num_threads: 1`, prefix `downgrade`) plus:
 
 ## Scan Manager & IO Configuration
 
-**Files:** `src/include/scan_manager/config.hpp`, `src/include/io/uring/config.hpp`, `src/include/io/rest/config.hpp`, `src/include/io/object_store_config.hpp`
+**Files:** `src/include/scan_manager/config.hpp`, `src/include/io/uring/config.hpp`, `src/include/io/rest/config.hpp`, `src/include/io/cache/config.hpp`, `src/include/io/object_store_config.hpp`
 
 The `sirius.executor.scan_manager` block configures the scan-metadata thread pool and the Sirius IO layer that feeds the GPU scan operators.
 
@@ -284,14 +287,14 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local ones (uring, kvikIO). Values are lowercase. |
 
-Caching itself is configured in the top-level [`sirius.cache`](#cache--read-path-caching-iocacheconfighpp)
-block, not here.
+Caching itself is configured in the [`cache`](#scan_managercache--read-path-caching-iocacheconfighpp)
+sub-config below.
 
 `max_readahead_scans` has three states:
 
 | Value | Effect |
 |-------|--------|
-| unset (default) | Defers to `sirius.cache`: with `mode` other than `none`, the budget is the backend reactor's own `n_max_concurrent_scans`; with `mode: none` the readahead does not run. |
+| unset (default) | Defers to `cache`: with `mode` other than `none`, the budget is the backend reactor's own `n_max_concurrent_scans`; with `mode: none` the readahead does not run. |
 | `0` | The readahead does not run, whatever the cache mode. |
 | `n > 0` | The readahead runs with a budget of `n`, whatever the cache mode. |
 
@@ -311,7 +314,7 @@ deployment is only useful while a pipeline thread could still pick up another sc
 Both are resolved against a single backend: the live one publishing the widest
 `n_max_concurrent_scans`, so the budget and the strategy always describe the same reactor.
 
-Four optional nested sub-configs tune the individual backends:
+Five optional nested sub-configs tune the individual backends and the cache:
 
 ### `scan_manager.uring` — io_uring backend (`io/uring/config.hpp`)
 
@@ -382,31 +385,18 @@ constructor, so it scopes to files this backend opens.
 | `thread_pool_per_block_device` | bool | `KVIKIO_THREAD_POOL_PER_BLOCK_DEVICE` (false) | Give each block device its own pool instead of sharing one global pool. |
 | `compat_mode` | enum: `auto`, `on`, `off` | `KVIKIO_COMPAT_MODE` | cuFile vs POSIX selection, per file handle. `off` enforces cuFile/GDS, `on` enforces POSIX, `auto` tries cuFile and falls back. Values are lowercase. |
 
-### `scan_manager.object_store` — S3 credentials & endpoint (`io/object_store_config.hpp`)
+### `scan_manager.cache` — read-path caching (`io/cache/config.hpp`)
 
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `endpoint` | string | "" | S3 endpoint URL. |
-| `region` | string | "" | AWS region. |
-| `access_key` / `secret_key` | string | "" | Static credentials. |
-| `session_token` | string | "" | STS session token for temporary credentials. |
-| `signing_mode` | enum: `presigned`, `header` | `presigned` | SigV4 form: `presigned` (auth in the URL query string) or `header` (`Authorization` + `x-amz-*` headers). Values are lowercase. |
-| `s3_transport` | enum: `auto`, `http`, `https`, `rdma` | `auto` | Transport selection. Values are lowercase; `https` is an alias for `http`. `auto` lets the backend choose from the URI scheme and endpoint. |
-| `ca_bundle_path` | string | "" | PEM CA bundle for TLS verification. |
-| `tls_verify` | bool | true | Verify the endpoint's TLS certificate. |
-
-## `cache` — read-path caching (`io/cache/config.hpp`)
-
-**File:** `src/include/io/cache/config.hpp`
-
-Everything about read-path caching lives in the top-level `sirius.cache` block — one
-home, rather than a mode on the scan manager and the cache's tunables somewhere else.
+Everything about read-path caching lives in this one block — rather than a mode on the
+scan manager and the cache's tunables in a sibling block.
 
 ```yaml
 sirius:
-  cache:
-    mode: sirius
-    eviction: lru
+  executor:
+    scan_manager:
+      cache:
+        mode: sirius
+        eviction: lru
 ```
 
 | Key | Type | Default | Description |
@@ -429,10 +419,23 @@ Those two knobs derive the settings below, which are therefore **not** individua
 
 | Derived setting | Derived from |
 |-----------------|--------------|
-| `scan_manager.uring.use_odirect` | `mode` — true for everything but `os` |
+| `uring.use_odirect` | `mode` — true for everything but `os` |
 | whether the prefetching cache is armed | `mode` — only under `sirius` |
 | `dispose_on_idle` | `eviction` — true under `idle` |
 | the readahead's default budget | `mode` — the readahead does not run under `none`; see [`max_readahead_scans`](#scan-manager--io-configuration) |
+
+### `scan_manager.object_store` — S3 credentials & endpoint (`io/object_store_config.hpp`)
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `endpoint` | string | "" | S3 endpoint URL. |
+| `region` | string | "" | AWS region. |
+| `access_key` / `secret_key` | string | "" | Static credentials. |
+| `session_token` | string | "" | STS session token for temporary credentials. |
+| `signing_mode` | enum: `presigned`, `header` | `presigned` | SigV4 form: `presigned` (auth in the URL query string) or `header` (`Authorization` + `x-amz-*` headers). Values are lowercase. |
+| `s3_transport` | enum: `auto`, `http`, `https`, `rdma` | `auto` | Transport selection. Values are lowercase; `https` is an alias for `http`. `auto` lets the backend choose from the URI scheme and endpoint. |
+| `ca_bundle_path` | string | "" | PEM CA bundle for TLS verification. |
+| `tls_verify` | bool | true | Verify the endpoint's TLS certificate. |
 
 ## Operator Parameters
 
@@ -724,5 +727,5 @@ These are compile-time defaults. Runtime configuration via `sirius_config` and D
 | `src/include/config.hpp` | Legacy config flags |
 | `src/sirius_extension.cpp` | SET variable registration |
 | `src/include/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, readahead, object store) |
-| `src/include/io/cache/config.hpp` | Read-path caching config (`sirius.cache`: mode, eviction policy, prefetching-cache tunables) |
+| `src/include/io/cache/config.hpp` | Read-path caching config (`scan_manager.cache`: mode, eviction policy, prefetching-cache tunables) |
 | `src/include/io/uring/config.hpp`, `io/rest/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / object-store sub-configs |
