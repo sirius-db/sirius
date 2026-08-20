@@ -3144,3 +3144,27 @@ fn sort_with_a_pre_aggregation_payload_is_rejected() {
         );
     }
 }
+
+/// A sort carrying its own predicates is refused. StarRocks' sorter applies the limit internally
+/// and never evaluates conjuncts — its backend asserts they are absent — so there is no reference
+/// answer for whether the predicate runs before or after the truncation, and either choice
+/// silently returns a different row set.
+#[test]
+fn sort_with_conjuncts_is_rejected() {
+    let mut sort = sort_node_with(5, Some(0));
+    sort.conjuncts = Some(vec![binary_pred(
+        TExprOpcode::GT,
+        slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        int_literal(10),
+    )]);
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![sort, scan_node(0, 0)])),
+        Some(sort_fetch_desc()),
+        None,
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(err, TranslateError::UnsupportedPlanNode { .. }),
+        "{err:?}"
+    );
+}

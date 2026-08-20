@@ -482,6 +482,19 @@ fn translate_sort(
             context: "SORT_NODE",
             field: "row_tuples",
         })?;
+    // StarRocks' sorter applies the limit internally and never evaluates predicates -- its
+    // backend asserts as much (`be/src/exec/topn_node.cpp`: `DCHECK_EQ(_conjuncts.size(), 0)
+    // << "TopNNode should never have predicates to evaluate."`), because the FE puts the
+    // predicate in a SELECT_NODE above instead. There is therefore no reference semantics for
+    // where a sort's own conjuncts sit relative to its limit; translating them either way
+    // invents an answer, so refuse the shape.
+    if has_conjuncts(node) {
+        return Err(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "SORT_NODE with conjuncts is not supported",
+        });
+    }
     // A second row tuple means the sorter carries a payload the sort tuple does not describe.
     // Only the first is translated, so the rest would be dropped from the output row.
     if node.row_tuples.len() > 1 {
