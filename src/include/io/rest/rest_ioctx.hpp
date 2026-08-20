@@ -20,10 +20,12 @@
 #include "io/rest/s3/list_parser.hpp"
 #include "io/templated_ioctx.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -124,6 +126,21 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
                                                         io_op_type type,
                                                         int device_id = -1) noexcept override;
 
+  /// Open every reactor's connection pool against @p bucket_url's bucket, so the
+  /// query's first reads find pooled connections instead of paying TCP+TLS on
+  /// the hot path.  Fans the work out to the reactors and returns immediately:
+  /// each reactor's connection cache is thread-confined, so only its own worker
+  /// can fill it.
+  ///
+  /// Rate-limited rather than run once, because what goes stale is the
+  /// connection, not the bucket.  @c conn_max_age is a hard cap on reusing a
+  /// pooled connection (@c CURLOPT_MAXAGE_CONN), so a pool warmed before an idle
+  /// gap longer than that is cold again by the next query -- a warm-once flag
+  /// would serve the first query and no other.  Re-warms when the endpoint
+  /// changes or the last warm-up is at least @c conn_max_age old, which is free
+  /// for back-to-back queries and self-correcting for spaced-out ones.
+  void warmup(std::string_view bucket_url) noexcept override;
+
  protected:
   /// Backend hook invoked by @c ioctx::open_datasource: parse @p path
   /// (s3://bucket/key), HEAD it for the size, and build a @c rest_io_object.
@@ -147,6 +164,14 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// to a HEAD when the suffix response is unusable.  The stash lives only as
   /// long as the returned io_object — a per-open transport shortcut, not a cache.
   std::shared_ptr<io_object> create_footer_probe_object(std::string path);
+
+  /// Guards the warm-up rate limiter.  Contended once per query at most, and
+  /// never on a read path.
+  std::mutex _warm_mtx;
+  /// Bucket the pools were last warmed against, and when.  An unset time means
+  /// "never warmed", which no elapsed comparison can express.
+  std::string _warmed_bucket;
+  std::optional<std::chrono::steady_clock::time_point> _warmed_at;
 };
 
 }  // namespace sirius::io::rest

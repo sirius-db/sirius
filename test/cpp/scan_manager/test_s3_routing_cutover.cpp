@@ -58,8 +58,8 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
-#include <set>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -322,6 +322,9 @@ class range_s3_server {
   range_s3_server& operator=(range_s3_server const&) = delete;
 
   [[nodiscard]] std::string endpoint() const { return "http://127.0.0.1:" + std::to_string(_port); }
+
+  /// Every request the server has served, of any method.
+  [[nodiscard]] int request_count() const { return _request_count.load(std::memory_order_relaxed); }
 
  private:
   static std::string errno_message() { return std::strerror(errno); }
@@ -831,12 +834,75 @@ TEST_CASE("rest perf queue wait counts original requests rather than retry attem
   CHECK(snapshot.chunk_get_count == 1);
 }
 
+TEST_CASE("warmup opens every reactor's connection pool, and only once per bucket",
+          "[s3][routing][scan_manager][warmup]")
+{
+  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{7}));
+  scan_manager_fixture fixture;
+  auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius);
+  // One connection per reactor over two reactors: small enough for the serial
+  // test server to serve the burst, but still per-reactor rather than global.
+  cfg.rest.max_connections = 1;
+  cfg.rest_n_reactors      = 2;
+  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+
+  // Routes s3:// to the REST ioctx and starts its reactors; the size HEAD it
+  // costs is the baseline the warm-up requests are counted on top of.
+  auto datasource = manager.create_datasource("s3://warm-bucket/data.parquet");
+  REQUIRE(datasource != nullptr);
+  auto io_ctx = datasource->io_ctx();
+  REQUIRE(io_ctx != nullptr);
+
+  auto const wait_for_requests = [&server](int at_least) {
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    while (server.request_count() < at_least && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return server.request_count();
+  };
+
+  int const baseline          = server.request_count();
+  constexpr int expected_warm = 2;  // rest_n_reactors * max_connections
+
+  // A bucket URL, with no object in it: warm-up traffic never names a data file.
+  io_ctx->warmup("s3://warm-bucket");
+  CHECK(wait_for_requests(baseline + expected_warm) >= baseline + expected_warm);
+  int const after_warm = server.request_count();
+
+  // Warming the same bucket again well inside conn_max_age is redundant — the
+  // pools it would fill are already full — so it must not reach the server.
+  io_ctx->warmup("s3://warm-bucket");
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  CHECK(server.request_count() == after_warm);
+
+  // An object URL is accepted and its key ignored: same bucket, still rate-limited.
+  io_ctx->warmup("s3://warm-bucket/some/deep/key.parquet");
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  CHECK(server.request_count() == after_warm);
+}
+
+TEST_CASE("warmup is a no-op for backends with nothing to connect",
+          "[s3][routing][scan_manager][warmup]")
+{
+  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{7}));
+  scan_manager_fixture fixture;
+  auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius);
+  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+
+  // The default ioctx is the local uring one: a file it can open is already
+  // "connected", so the base class no-op is the whole implementation.
+  REQUIRE(manager.io_ctx() != nullptr);
+  manager.io_ctx()->warmup("s3://warm-bucket");
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  CHECK(server.request_count() == 0);
+}
+
 TEST_CASE("rest dispatch spreads a request over two reactors and rotates when idle",
           "[s3][rest][dispatch]")
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{11}));
   scan_manager_fixture fixture;
-  auto cfg            = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius);
+  auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius);
   cfg.rest_n_reactors = 4;
   sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
 
@@ -853,8 +919,8 @@ TEST_CASE("rest dispatch spreads a request over two reactors and rotates when id
   std::set<rest_reactor*> seen;
   for (int i = 0; i < 4; ++i) {
     auto picked = rest_ctx->next_reactor(obj, /*n_chunks=*/8, io_op_type::host_vector_async);
-    REQUIRE(picked.size() == 2);       // never the whole pool
-    CHECK(picked[0] != picked[1]);     // and never the same reactor twice
+    REQUIRE(picked.size() == 2);    // never the whole pool
+    CHECK(picked[0] != picked[1]);  // and never the same reactor twice
     seen.insert(picked.begin(), picked.end());
   }
   CHECK(seen.size() == 4);  // four dispatches reach every reactor in the pool

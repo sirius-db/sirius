@@ -694,11 +694,10 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(const reactor_
   return prep_host_rx_request(cfg, file, segment, host_read_attribution::async_chunk);
 }
 
-rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(
-  const reactor_config_type& cfg,
-  const io_object_type& file,
-  const io_object_segment& segment,
-  host_read_attribution attribution)
+rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(const reactor_config_type& cfg,
+                                                                  const io_object_type& file,
+                                                                  const io_object_segment& segment,
+                                                                  host_read_attribution attribution)
 {
   if (segment.size == 0) { return rest_rx_request::create({}); }
 
@@ -771,8 +770,9 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rxv_request(
 
   // Coalesce near neighbors into scatter GETs and cut the result at the chunk
   // floor; neither step changes the byte total delivered to the caller.
-  auto groups = plan_chunks(
-    std::span<const planned_buffer>(bufs.data(), bufs.size()), cfg.merge_max_gap, cfg.max_chunk_size);
+  auto groups = plan_chunks(std::span<const planned_buffer>(bufs.data(), bufs.size()),
+                            cfg.merge_max_gap,
+                            cfg.max_chunk_size);
 
   auto manager   = std::make_shared<request_manager>(bytes_requested, groups.size());
   auto const obj = file.get_object_ref();
@@ -883,8 +883,9 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_to_device_rx_request(
       planned_buffer{s.offset, std::min(s.size, fsize - s.offset), s.data(), bufs.size()});
   }
 
-  auto groups = plan_chunks(
-    std::span<const planned_buffer>(bufs.data(), bufs.size()), cfg.merge_max_gap, cfg.max_chunk_size);
+  auto groups = plan_chunks(std::span<const planned_buffer>(bufs.data(), bufs.size()),
+                            cfg.merge_max_gap,
+                            cfg.max_chunk_size);
 
   auto manager = std::make_shared<request_manager>(bytes_covered, groups.size());
 
@@ -912,11 +913,11 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_to_device_rx_request(
         // plan_chunks never fuses such a buffer, so it is alone in its chunk and
         // the bounce holds its whole span from offset 0.
         bool const bounce_staged = (b.host == nullptr);
-        cpy->copies.push_back(
-          device_cpy_request::copy{/*dst=*/dst + (data_lo - offset),
-                                   /*src=*/bounce_staged ? nullptr : b.host + (data_lo - b.file_off),
-                                   /*src_off=*/bounce_staged ? (data_lo - b.file_off) : size_t{0},
-                                   /*size=*/data_hi - data_lo});
+        cpy->copies.push_back(device_cpy_request::copy{
+          /*dst=*/dst + (data_lo - offset),
+          /*src=*/bounce_staged ? nullptr : b.host + (data_lo - b.file_off),
+          /*src_off=*/bounce_staged ? (data_lo - b.file_off) : size_t{0},
+          /*size=*/data_hi - data_lo});
       }
     }
 
@@ -1055,8 +1056,9 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_to_device_rxv_request(
     bufs.push_back(planned_buffer{p.offset, p.size, p.host_buffer, bufs.size()});
   }
 
-  auto groups = plan_chunks(
-    std::span<const planned_buffer>(bufs.data(), bufs.size()), cfg.merge_max_gap, cfg.max_chunk_size);
+  auto groups = plan_chunks(std::span<const planned_buffer>(bufs.data(), bufs.size()),
+                            cfg.merge_max_gap,
+                            cfg.max_chunk_size);
 
   auto manager = std::make_shared<request_manager>(bytes_covered, groups.size());
 
@@ -1212,6 +1214,16 @@ void rest_reactor::reset_perf() noexcept
   z(_perf.curl_ttfb_ns_total);
   z(_perf.curl_total_ns_total);
   z(_perf.curl_timed_count);
+}
+
+void rest_reactor::warmup(std::string bucket)
+{
+  {
+    std::lock_guard lk{_warm_mtx};
+    _warm_bucket = std::move(bucket);
+  }
+  _warm_requested.store(true, std::memory_order_release);
+  interrupt();
 }
 
 head_object_result rest_reactor::head_object(std::string_view bucket, std::string_view key)
@@ -1708,6 +1720,72 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       slots[i].bounce = i < bounce_bufs.size() ? bounce_bufs[i] : nullptr;
     }
 
+    // Warm-up requests in flight.  Deliberately NOT slot handles: a slot handle
+    // is configured for ranged chunk GETs and reused across requests, so
+    // borrowing one would leave warm-up request options on a handle that later
+    // serves a chunk.  These are throwaway handles on the same `worker_share`,
+    // which is what matters -- the connection they open lands in that shared
+    // cache and the slot handles pick it up from there.
+    std::vector<curl_easy_ptr> warm_handles;
+    std::vector<curl_slist_ptr> warm_headers;  // must outlive their transfers
+
+    // Open `max_connections` connections against `bucket`, one bucket-scoped
+    // ListObjectsV2 each.  The response is irrelevant -- a 403 from a credential
+    // that cannot list completed the same handshake a 200 would have -- so
+    // nothing here inspects status, retries, or reports failure.
+    auto prime_connections = [&](std::string const& bucket) {
+      // max-keys=0 is the cheapest well-formed bucket request there is: a signed
+      // ListObjectsV2 that names no object and returns a near-empty body.
+      constexpr std::string_view k_warm_query = "list-type=2&max-keys=0";
+      for (std::size_t i = 0; i < _config.max_connections; ++i) {
+        try {
+          auto const authd =
+            _ctx->authorizer()->authorize_list(bucket, k_warm_query, presign_ttl(_config));
+          curl_easy_ptr h{curl_easy_init()};
+          if (!h) { break; }
+          configure_easy_handle(h.get(),
+                                worker_share.get(),
+                                upkeep_ms,
+                                static_cast<long>(_config.conn_max_age.count()));
+          apply_request_opts(h.get(), _config);
+          curl_slist_ptr hdrs = build_header_list(authd.headers, nullptr);
+          SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_URL, authd.url.c_str()));
+          SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HTTPHEADER, hdrs.get()));
+          SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_WRITEFUNCTION, &write_discard));
+          // Distinguishes a warm-up completion from a slot completion, whose
+          // CURLOPT_PRIVATE is its slot index in [0, max_connections).
+          SIRIUS_CURL_CHECK(
+            curl_easy_setopt(h.get(), CURLOPT_PRIVATE, reinterpret_cast<void*>(intptr_t{-1})));
+          // A fresh connection per handle is the entire point: without this the
+          // second handle would reuse the first's connection and the pool would
+          // end up one deep.
+          SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_FRESH_CONNECT, 1L));
+          if (curl_multi_add_handle(multi.get(), h.get()) != CURLM_OK) { break; }
+          warm_headers.push_back(std::move(hdrs));
+          warm_handles.push_back(std::move(h));
+        } catch (std::exception const& e) {
+          SIRIUS_LOG_DEBUG("rest_reactor: warm-up handle {} not issued: {}", i, e.what());
+          break;
+        }
+      }
+      SIRIUS_LOG_INFO(
+        "rest_reactor: warming {} connections against bucket '{}'", warm_handles.size(), bucket);
+    };
+
+    auto maybe_prime = [&]() {
+      if (!_warm_requested.exchange(false, std::memory_order_acq_rel)) { return; }
+      // A round still in flight means the pool is already being filled; a second
+      // round on top of it would only open connections the first is opening.
+      if (!warm_handles.empty()) { return; }
+      std::string bucket;
+      {
+        std::lock_guard lk{_warm_mtx};
+        bucket = _warm_bucket;
+      }
+      if (bucket.empty()) { return; }
+      prime_connections(bucket);
+    };
+
     int running  = 0;
     int inflight = 0;  // GETs currently added to the multi (excludes parked H2D)
 
@@ -2106,7 +2184,24 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       while ((msg = curl_multi_info_read(multi.get(), &in_queue)) != nullptr) {
         if (msg->msg != CURLMSG_DONE) { continue; }
         CTRACK_NAME("rest::completion");
-        CURL* const h     = msg->easy_handle;
+        CURL* const h = msg->easy_handle;
+        // A warm-up request.  Its connection is already back in the worker's shared
+        // cache, which was the whole point, and the response is irrelevant.  Bail
+        // before the accounting below: charging its handshake to
+        // conn_opened_total would corrupt the one counter that says whether the
+        // READ path is reconnecting.
+        {
+          char* warm_priv = nullptr;
+          curl_easy_getinfo(h, CURLINFO_PRIVATE, &warm_priv);
+          if (reinterpret_cast<intptr_t>(warm_priv) < 0) {
+            curl_multi_remove_handle(multi.get(), h);
+            std::erase_if(warm_handles, [h](curl_easy_ptr const& p) { return p.get() == h; });
+            // The header lists back the transfers, so they can only go once the
+            // last of them is done.
+            if (warm_handles.empty()) { warm_headers.clear(); }
+            continue;
+          }
+        }
         CURLcode const rc = msg->data.result;
         long status       = 0;
         curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);
@@ -2158,7 +2253,8 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
 
     std::vector<epoll_event> events{};
     events.resize(_config.max_connections);
-    submit();  // kickstart anything already queued
+    maybe_prime();  // a warm-up asked for before the worker was up
+    submit();       // kickstart anything already queued
     // Duty-cycle accounting: charge each loop iteration's wall time to "idle" or
     // "busy" by whether anything was on the wire when the iteration began.  One
     // clock read per iteration, and epoll_wait is the only blocking point, so
@@ -2221,6 +2317,7 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       }
       process_completions();
       poll_copy_completions();
+      maybe_prime();
       submit();
       {
         // Close the span that began after the previous submit() — that is the
@@ -2254,6 +2351,14 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
       }
     }
     copying.clear();
+
+    // Warm-up handles carry no request and nobody is waiting on them, so they
+    // just need detaching before their storage goes.
+    for (auto& h : warm_handles) {
+      curl_multi_remove_handle(multi.get(), h.get());
+    }
+    warm_handles.clear();
+    warm_headers.clear();
 
     // Detach in-flight handles and cancel every outstanding request (in-flight,
     // retry-scheduled, ready, queued) so no future is left unfulfilled.

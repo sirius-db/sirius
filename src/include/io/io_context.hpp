@@ -118,6 +118,26 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   [[nodiscard]] std::unique_ptr<sirius_datasource> open_datasource(std::string path,
                                                                    std::uint64_t known_size);
 
+  /// Open the backend's connections to whatever serves @p bucket_url, ahead of
+  /// the first read, so a query does not pay connection setup on its hot path.
+  ///
+  /// @p bucket_url names a container, not an object -- @c "s3://my-bucket".  A
+  /// full object URL is accepted and its key ignored, since connections are per
+  /// endpoint and the object adds nothing to the identity.  Deliberately not an
+  /// @c io_object: opening one is itself a round trip over the connection being
+  /// warmed, which would leave the warm-up nothing left to hide, and it would
+  /// tie warm-up traffic to individual data files.
+  ///
+  /// Best-effort by contract: it must not throw and must not block the caller,
+  /// and a failed warm-up is never a reason to fail a read.  For a transport
+  /// that is what warms, even a rejected request is a success -- a 403 still
+  /// completed the DNS lookup, the TCP connect and the TLS handshake, which is
+  /// all that was being bought.
+  ///
+  /// The default is a no-op, which is the right answer for every backend whose
+  /// "connection" is a file descriptor it already holds.
+  virtual void warmup(std::string_view /*bucket_url*/) noexcept {}
+
   /// Whether this backend can serve reads for @p path.  Backends should
   /// validate scheme/protocol support and any backend-specific
   /// preconditions (e.g. file existence for local-disk backends).

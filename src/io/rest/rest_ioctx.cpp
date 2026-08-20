@@ -20,10 +20,13 @@
 #include "io/uri_parser.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <format>
 #include <memory>
+#include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 namespace sirius::io::rest {
@@ -343,6 +346,64 @@ std::shared_ptr<io_object> rest_ioctx::create_io_object(std::string path, std::u
                                           std::move(parsed.host),
                                           std::move(parsed.path),
                                           static_cast<size_t>(known_size));
+}
+
+namespace {
+
+/// The bucket out of an @c s3:// URL, whether or not it names an object.
+///
+/// @c io::parse cannot serve this: it rejects a bucket-only URL with "empty
+/// object key", which is exactly the shape a warm-up takes -- warming is about
+/// the endpoint, and naming a data file to reach it would be beside the point.
+std::optional<std::string> bucket_of(std::string_view url)
+{
+  constexpr std::string_view k_scheme = "s3://";
+  if (url.size() <= k_scheme.size()) { return std::nullopt; }
+  for (std::size_t i = 0; i < k_scheme.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(url[i])) != k_scheme[i]) { return std::nullopt; }
+  }
+  auto const rest   = url.substr(k_scheme.size());
+  auto const bucket = rest.substr(0, rest.find('/'));
+  if (bucket.empty()) { return std::nullopt; }
+  return std::string{bucket};
+}
+
+}  // namespace
+
+void rest_ioctx::warmup(std::string_view bucket_url) noexcept
+{
+  try {
+    // Only the bucket is read: an object key, if the caller passed one, names
+    // nothing the connection pool cares about.
+    auto const bucket = bucket_of(bucket_url);
+    if (!bucket.has_value()) { return; }
+
+    // Connections are per-endpoint, so the bucket -- not the object -- is the
+    // identity that decides whether a warm-up is redundant. A thousand-file
+    // scan calling this per file collapses to one round.
+    {
+      std::lock_guard lk{_warm_mtx};
+      auto const now = std::chrono::steady_clock::now();
+      // conn_max_age of 0 means "no cap" to libcurl, which leaves us no honest
+      // staleness horizon; fall back to a minute rather than re-warm forever.
+      auto const stale_after =
+        _config.conn_max_age.count() > 0
+          ? std::chrono::duration_cast<std::chrono::steady_clock::duration>(_config.conn_max_age)
+          : std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+              std::chrono::seconds{60});
+      bool const same_bucket = _warmed_bucket == *bucket;
+      if (same_bucket && _warmed_at.has_value() && now - *_warmed_at < stale_after) { return; }
+      _warmed_bucket = *bucket;
+      _warmed_at     = now;
+    }
+
+    for (auto& reactor : _reactors) {
+      if (reactor) { reactor->warmup(*bucket); }
+    }
+  } catch (...) {  // NOLINT(bugprone-empty-catch)
+    // Warming is an optimization; a query that would have run without it still
+    // runs. Nothing here is worth failing a read over.
+  }
 }
 
 std::shared_ptr<io_object> rest_ioctx::create_footer_probe_object(std::string path)

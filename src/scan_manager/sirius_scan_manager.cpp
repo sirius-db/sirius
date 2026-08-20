@@ -610,6 +610,13 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     if (scan_op->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_SCAN) { continue; }
     auto* op = &scan_op->Cast<op::scan::sirius_gpu_scan_operator>();
     if (_providers_by_op.find(op) != _providers_by_op.end()) { continue; }
+    // Open the backend's connections before this operator's reads need them.
+    // One path per operator, not per file: the backend warms per endpoint and
+    // rate-limits itself, so the extra paths would only re-ask the same
+    // question. A no-op for local backends, which have nothing to connect.
+    if (auto const paths = op->get_ingestible().table_info().file_paths(); !paths.empty()) {
+      if (auto io_ctx = ioctx_for_path(paths.front())) { io_ctx->warmup(paths.front()); }
+    }
     _metadata_processor->register_pipeline(op, round_robin, _readahead);
     // On a pinned-cache hit the coalescer serves this operator from a cached
     // batch_provider (process_cached_entries); skip the disk-reading

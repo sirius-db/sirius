@@ -32,6 +32,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stop_token>
@@ -415,6 +416,21 @@ class rest_reactor {
   /// Synchronous buffered host read (blocking ranged GET).  Blocks the caller.
   size_t host_read(const io_object_type& file, size_t offset, size_t size, uint8_t* dst);
 
+  /// Ask the worker to open its connection pool against @p bucket before any
+  /// read needs it.  Returns immediately: the worker does the HEADs on its own
+  /// thread at the top of its next pass, because the connection cache it fills
+  /// is thread-confined (see the @c curl_share warning) and is reachable from
+  /// nowhere else.  Coalescing is the caller's job -- a second call before the
+  /// first is serviced simply replaces the target.
+  ///
+  /// The request is a bucket-scoped @c ListObjectsV2 capped at zero keys, not a
+  /// HEAD: a HEAD is signed per object and @c sigv4_authorizer refuses an empty
+  /// key, whereas @c authorize_list already signs a bucket-only URI, so this
+  /// keeps warm-up traffic off the query's data files without touching the
+  /// signing path.  The response is discarded and never inspected -- the
+  /// handshake is what is being bought, so even a 403 is a success.
+  void warmup(std::string bucket);
+
   /// Blocking HEAD to discover an object's size and ETag.  Used by the ioctx to
   /// build an @c rest_io_object.  @p bucket / @p key identify the object.
   head_object_result head_object(std::string_view bucket, std::string_view key);
@@ -484,6 +500,13 @@ class rest_reactor {
   // allocation handle returns the blocks to the upstream resource when the
   // reactor is destroyed.  Null when no host_memory_resource is set.
   cucascade::memory::fixed_multiple_blocks_allocation _bounce_storage;
+
+  // Set by warmup() on a caller thread, consumed by the worker at the top of a
+  // pass.  The bucket is guarded because a std::string is not atomically
+  // publishable; the flag is what the worker actually polls.
+  std::atomic<bool> _warm_requested{false};
+  std::mutex _warm_mtx;
+  std::string _warm_bucket;
 
   // Cross-thread wakeup: written by enqueue()/interrupt() and the CUDA
   // copy-completion callback to break the worker out of epoll_wait.
