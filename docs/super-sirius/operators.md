@@ -373,9 +373,9 @@ each payload column:
   allocation family.
 
 Consequently, one unsupported column does not disable zero-copy aliases for eligible siblings.
-View batches retain type-erased owners, Sirius synchronizes the operator stream before publication,
-and consumers that require an owning table materialize the view on demand through
-`gpu_table_representation::release_table()`.
+View batches retain type-erased owners for their backing storage, and Sirius synchronizes the
+operator stream before publication. Their GPU representations also record the producer's writer
+event so cross-stream or cross-device consumers can order reads without materializing the view.
 
 ### `sirius_physical_concat` — `CONCAT`
 **File:** `src/include/op/sirius_physical_concat.hpp`
