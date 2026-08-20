@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -82,6 +83,7 @@ struct publication_deltas {
 struct switch_comparison {
   publication_deltas off;
   publication_deltas on;
+  std::vector<std::vector<std::string>> rows;
 };
 
 publication_deltas run_and_measure(duckdb::Connection& con,
@@ -121,6 +123,7 @@ switch_comparison require_switch_result_equivalence(duckdb::Connection& con,
   }
 
   REQUIRE(on_rows == off_rows);
+  deltas.rows = std::move(on_rows);
   return deltas;
 }
 
@@ -180,6 +183,83 @@ TEST_CASE("gpu_execution - opaque-build and build-block routes preserve results"
     REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
     REQUIRE(deltas.on.membership_filters_built > deltas.off.membership_filters_built);
     REQUIRE(deltas.on.filters_pushed > deltas.off.filters_pushed);
+  }
+
+  SECTION("a RIGHT join admits build-block descent")
+  {
+    sirius::test::disabled_optimizers_guard shape(
+      con, "statistics_propagation,join_order,build_side_probe_side");
+    sirius::test::coverage_gate_disable_guard gate_off(con);
+    auto const deltas =
+      require_switch_result_equivalence(con,
+                                        "SELECT count(*), count(o.o_orderkey) "
+                                        "FROM orders o "
+                                        "RIGHT JOIN customer c ON o.o_custkey = c.c_custkey "
+                                        "JOIN nation n ON c.c_nationkey = n.n_nationkey "
+                                        "WHERE n.n_regionkey = 3");
+
+    REQUIRE(deltas.off.producers_enabled == 0);
+    REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
+    REQUIRE(deltas.on.membership_filters_built > deltas.off.membership_filters_built);
+    REQUIRE(deltas.on.filters_pushed > deltas.off.filters_pushed);
+    REQUIRE(deltas.rows.size() == 1);
+    REQUIRE(deltas.rows[0].size() == 2);
+    CHECK(std::stoull(deltas.rows[0][0]) > std::stoull(deltas.rows[0][1]));
+  }
+
+  SECTION("a FULL OUTER join admits build-block descent under equality semantics")
+  {
+    sirius::test::disabled_optimizers_guard shape(
+      con, "statistics_propagation,join_order,build_side_probe_side");
+    sirius::test::coverage_gate_disable_guard gate_off(con);
+    auto const deltas =
+      require_switch_result_equivalence(con,
+                                        "SELECT count(*), count(o.o_orderkey) "
+                                        "FROM orders o "
+                                        "FULL OUTER JOIN customer c ON o.o_custkey = c.c_custkey "
+                                        "JOIN nation n ON c.c_nationkey = n.n_nationkey "
+                                        "WHERE n.n_regionkey = 3");
+
+    REQUIRE(deltas.off.producers_enabled == 0);
+    REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
+    REQUIRE(deltas.on.membership_filters_built > deltas.off.membership_filters_built);
+    REQUIRE(deltas.on.filters_pushed > deltas.off.filters_pushed);
+    REQUIRE(deltas.rows.size() == 1);
+    REQUIRE(deltas.rows[0].size() == 2);
+    CHECK(std::stoull(deltas.rows[0][0]) > std::stoull(deltas.rows[0][1]));
+  }
+
+  SECTION("RIGHT, FULL OUTER, and ANTI joins admit probe-block descent")
+  {
+    sirius::test::disabled_optimizers_guard shape(
+      con, "statistics_propagation,join_order,build_side_probe_side");
+    sirius::test::coverage_gate_disable_guard gate_off(con);
+    std::vector<std::string> const queries{
+      "SELECT count(*), sum(o.o_orderkey) "
+      "FROM orders o "
+      "RIGHT JOIN customer c ON o.o_custkey = c.c_custkey "
+      "JOIN lineitem l ON o.o_orderkey = l.l_orderkey "
+      "WHERE l.l_shipdate < DATE '1992-02-01'",
+      "SELECT count(*), sum(o.o_orderkey) "
+      "FROM orders o "
+      "FULL OUTER JOIN customer c ON o.o_custkey = c.c_custkey "
+      "JOIN lineitem l ON o.o_orderkey = l.l_orderkey "
+      "WHERE l.l_shipdate < DATE '1992-02-01'",
+      "SELECT count(*), sum(o.o_orderkey) "
+      "FROM orders o "
+      "ANTI JOIN nation n ON o.o_custkey = n.n_nationkey "
+      "JOIN lineitem l ON o.o_orderkey = l.l_orderkey "
+      "WHERE l.l_shipdate < DATE '1992-02-01'"};
+
+    for (auto const& query : queries) {
+      CAPTURE(query);
+      auto const deltas = require_switch_result_equivalence(con, query);
+
+      REQUIRE(deltas.off.producers_enabled == 0);
+      REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
+      REQUIRE(deltas.on.membership_filters_built > deltas.off.membership_filters_built);
+      REQUIRE(deltas.on.filters_pushed > deltas.off.filters_pushed);
+    }
   }
 
   SECTION("a null-equal producing condition still returns identical results")

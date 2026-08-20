@@ -30,17 +30,17 @@ namespace sirius::planner {
 
 namespace {
 
-// These join types do not null-pad the probe block.
-bool probe_block_is_value_preserving(duckdb::JoinType join_type) noexcept
+// ANTI preserves LHS values; RIGHT/OUTER synthesize only NULLs rejected by producer equality.
+bool probe_block_descent_admissible(duckdb::JoinType join_type) noexcept
 {
   switch (join_type) {
     case duckdb::JoinType::INNER:
     case duckdb::JoinType::LEFT:
     case duckdb::JoinType::SEMI:
     case duckdb::JoinType::ANTI:
-    case duckdb::JoinType::MARK: return true;
     case duckdb::JoinType::RIGHT:
     case duckdb::JoinType::OUTER:
+    case duckdb::JoinType::MARK: return true;
     case duckdb::JoinType::SINGLE:
     case duckdb::JoinType::RIGHT_SEMI:
     case duckdb::JoinType::RIGHT_ANTI:
@@ -49,14 +49,14 @@ bool probe_block_is_value_preserving(duckdb::JoinType join_type) noexcept
   return false;  // unreachable
 }
 
-// Only INNER and LEFT preserve surviving probe values when build rows are removed.
-bool build_block_is_value_preserving(duckdb::JoinType join_type) noexcept
+// LEFT/OUTER synthesize only NULLs rejected by producer equality.
+bool build_block_descent_admissible(duckdb::JoinType join_type) noexcept
 {
   switch (join_type) {
     case duckdb::JoinType::INNER:
-    case duckdb::JoinType::LEFT: return true;
     case duckdb::JoinType::RIGHT:
-    case duckdb::JoinType::OUTER:
+    case duckdb::JoinType::LEFT:
+    case duckdb::JoinType::OUTER: return true;
     case duckdb::JoinType::SEMI:
     case duckdb::JoinType::ANTI:
     case duckdb::JoinType::MARK:
@@ -100,13 +100,13 @@ std::optional<descent_step> join_block_descent(
 {
   auto const probe_block_size = probe_block_output_columns.size();
   if (output_ordinal < probe_block_size) {
-    if (!probe_block_is_value_preserving(join_type)) { return std::nullopt; }
+    if (!probe_block_descent_admissible(join_type)) { return std::nullopt; }
     return descent_step{
       .child_index   = 0,
       .child_ordinal = static_cast<std::size_t>(probe_block_output_columns[output_ordinal])};
   }
   if (!policy.descend_build_blocks) { return std::nullopt; }
-  if (!build_block_is_value_preserving(join_type)) { return std::nullopt; }
+  if (!build_block_descent_admissible(join_type)) { return std::nullopt; }
   auto const build_ordinal = output_ordinal - probe_block_size;
   if (build_ordinal >= build_block_output_columns.size()) { return std::nullopt; }
   return descent_step{
@@ -241,6 +241,9 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
     case SiriusPhysicalOperatorType::VERIFY_VECTOR:
     case SiriusPhysicalOperatorType::UPDATE_EXTENSIONS:
     case SiriusPhysicalOperatorType::CREATE_SECRET:
+    // Join feeders are added after discovery as CONCAT -> PARTITION -> existing child in
+    // `insert_gpu_pipeline_operators()`. Targets therefore end up below both even though either
+    // wrapper is terminal if encountered here.
     case SiriusPhysicalOperatorType::PARTITION:
     case SiriusPhysicalOperatorType::CONCAT:
     case SiriusPhysicalOperatorType::MERGE_SORT:
@@ -251,7 +254,8 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
     case SiriusPhysicalOperatorType::SORT_SAMPLE:
     case SiriusPhysicalOperatorType::GPU_VALUES:
     case SiriusPhysicalOperatorType::GPU_SCAN:
-    case SiriusPhysicalOperatorType::STREAMING_SOURCE: return {};
+    case SiriusPhysicalOperatorType::STREAMING_SOURCE:
+    case SiriusPhysicalOperatorType::STREAMING_SINK: return {};
   }
   return {};  // unreachable
 }

@@ -80,6 +80,8 @@ struct endpoint_placement {
 
 /**
  * @brief Returns the join child and ordinal that safely supplies an output column
+ *
+ * LEFT/OUTER build-block and RIGHT/OUTER probe-block descent rely on plain-equality admission.
  */
 [[nodiscard]] std::optional<descent_step> join_block_descent(
   duckdb::JoinType join_type,
@@ -103,11 +105,7 @@ struct endpoint_placement {
   sirius::op::sirius_physical_operator& root, std::size_t a0, descent_policy policy);
 
 /**
- * @brief Tests whether probe-side scan filtering preserves join semantics
- *
- * Only INNER, RIGHT, and SEMI are safe; other joins preserve or negate unmatched probe rows.
- * RIGHT qualifies because its NULL-padded rows come from unmatched build rows, which a probe-side
- * filter cannot touch — parity with DuckDB's JoinFilterPushdownOptimizer::GenerateJoinFilters.
+ * @brief Matches DuckDB's INNER/RIGHT/SEMI producer allowlist
  */
 [[nodiscard]] constexpr bool scan_route_join_type_admissible(duckdb::JoinType t) noexcept
 {

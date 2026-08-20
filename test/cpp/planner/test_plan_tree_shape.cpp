@@ -467,24 +467,51 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
-                 "plan tree shape - SIP places a membership endpoint on the inner join's build "
+                 "plan tree shape - SIP places a membership endpoint on a nested join's RHS "
                  "input",
                  "[plan_tree_shape][isolated_context]")
 {
-  // Preserve the left-deep shape and build sides. The outer probe key comes from the inner build,
-  // so only SIP can place a target on that join edge.
+  // Preserve the left-deep shape and input sides. The outer probe key comes from the nested RHS,
+  // so only SIP can place a target there.
   const std::string query =
     "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid "
     "JOIN small_c c ON r.other = c.ckey";
   const std::vector<OptimizerType> keep_shape{OptimizerType::JOIN_ORDER,
                                               OptimizerType::BUILD_SIDE_PROBE_SIDE};
 
-  auto require_inner_join = [](sirius_physical_operator* plan) {
+  auto require_nested_join = [](sirius_physical_operator* plan) {
     auto joins = collect(plan, SiriusPhysicalOperatorType::HASH_JOIN);
     REQUIRE(joins.size() == 2);
     REQUIRE(joins[0]->children.size() == 2);
     REQUIRE(contains(joins[0]->children[0].get(), joins[1]));
     return joins[1];
+  };
+
+  auto require_rhs_endpoint = [&](const std::string& endpoint_query, JoinType expected_join_type) {
+    auto plan = generate_sirius_plan(*con, endpoint_query, keep_shape);
+    INFO(tree_to_string(plan.get()));
+
+    auto* nested = require_nested_join(plan.get());
+    auto joins   = collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+    auto const& targets =
+      joins[0]->Cast<sirius::op::sirius_physical_hash_join>().dynamic_filter_plan().probe_targets();
+    REQUIRE(targets.size() == 1);
+    CHECK(targets[0].route_class == sirius::op::dynamic_filter_route_class::scan);
+    CHECK(targets[0].accepts_zone_map_filters);
+    CHECK(std::none_of(targets.begin(), targets.end(), [](auto const& target) {
+      return target.route_class == sirius::op::dynamic_filter_route_class::direct;
+    }));
+
+    REQUIRE(nested->Cast<sirius::op::sirius_physical_hash_join>().join_type == expected_join_type);
+
+    auto* build_subtree =
+      require_join_child_wrap(nested->children[1].get(), nested, /*is_build=*/true);
+    REQUIRE(build_subtree != nullptr);
+    REQUIRE(build_subtree->type == SiriusPhysicalOperatorType::DYNAMIC_FILTER);
+    REQUIRE(build_subtree->children.size() == 1);
+    CHECK(build_subtree->children[0]->type == SiriusPhysicalOperatorType::GPU_SCAN);
+
+    require_parent_links(plan.get(), /*expected_parent=*/nullptr);
   };
 
   SECTION("filter on, unfiltered build: no endpoint wires anywhere")
@@ -497,7 +524,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
     CHECK(collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER).empty());
 
-    auto* inner = require_inner_join(plan.get());
+    auto* inner = require_nested_join(plan.get());
     auto* build_subtree =
       require_join_child_wrap(inner->children[1].get(), inner, /*is_build=*/true);
     REQUIRE(build_subtree != nullptr);
@@ -514,7 +541,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
     CHECK(collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER).empty());
 
-    auto* inner = require_inner_join(plan.get());
+    auto* inner = require_nested_join(plan.get());
     auto* build_subtree =
       require_join_child_wrap(inner->children[1].get(), inner, /*is_build=*/true);
     REQUIRE(build_subtree != nullptr);
@@ -523,7 +550,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     require_parent_links(plan.get(), /*expected_parent=*/nullptr);
   }
 
-  SECTION("filter on: the endpoint lands on a LEFT join's build input")
+  SECTION("filter on: equality semantics allow descent into a LEFT join's build input")
   {
     // The producing join's build filter (pushed into the small_c scan) supplies the required
     // evidence; holding back join reordering preserves the LEFT join.
@@ -532,39 +559,60 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
       "JOIN small_c c ON r.other = c.ckey WHERE c.cother >= 0";
 
     dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
-    auto plan = generate_sirius_plan(*con, left_query, keep_shape);
-    INFO(tree_to_string(plan.get()));
-
-    auto* inner = require_inner_join(plan.get());
-    REQUIRE(inner->Cast<sirius::op::sirius_physical_hash_join>().join_type == JoinType::LEFT);
-
-    auto* build_subtree =
-      require_join_child_wrap(inner->children[1].get(), inner, /*is_build=*/true);
-    REQUIRE(build_subtree != nullptr);
-    REQUIRE(build_subtree->type == SiriusPhysicalOperatorType::DYNAMIC_FILTER);
-    REQUIRE(build_subtree->children.size() == 1);
-    CHECK(build_subtree->children[0]->type == SiriusPhysicalOperatorType::GPU_SCAN);
-
-    require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+    require_rhs_endpoint(left_query, JoinType::LEFT);
   }
 
-  SECTION("filter on: a null-equal producing condition places no endpoint")
+  SECTION("filter on: RIGHT and equality-safe OUTER joins admit build-input descent")
   {
-    // The build filter supplies discovery evidence, so null-equal inadmissibility is the only
-    // rule blocking an endpoint here.
+    dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
+    require_rhs_endpoint(
+      "SELECT * FROM big_left l RIGHT JOIN small_right r ON l.id = r.rid "
+      "JOIN small_c c ON r.other = c.ckey WHERE c.cother >= 0",
+      JoinType::RIGHT);
+    require_rhs_endpoint(
+      "SELECT * FROM big_left l FULL OUTER JOIN small_right r ON l.id = r.rid "
+      "JOIN small_c c ON r.other = c.ckey WHERE c.cother >= 0",
+      JoinType::OUTER);
+  }
+
+  SECTION("filter on: null-equal semantics block OUTER build-input descent")
+  {
+    // Pruning can turn an OUTER match into a NULL-padded row, which a null-equal producer could
+    // accept. The build filter supplies evidence, leaving key admission as the blocking rule.
     const std::string null_equal_query =
-      "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid "
+      "SELECT * FROM big_left l FULL OUTER JOIN small_right r ON l.id = r.rid "
       "JOIN small_c c ON r.other IS NOT DISTINCT FROM c.ckey WHERE c.cother >= 0";
 
     dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
     auto plan = generate_sirius_plan(*con, null_equal_query, keep_shape);
     INFO(tree_to_string(plan.get()));
 
-    auto* inner = require_inner_join(plan.get());
+    auto* nested = require_nested_join(plan.get());
+    REQUIRE(nested->Cast<sirius::op::sirius_physical_hash_join>().join_type == JoinType::OUTER);
     auto* build_subtree =
-      require_join_child_wrap(inner->children[1].get(), inner, /*is_build=*/true);
+      require_join_child_wrap(nested->children[1].get(), nested, /*is_build=*/true);
     REQUIRE(build_subtree != nullptr);
     CHECK(build_subtree->type == SiriusPhysicalOperatorType::GPU_SCAN);
+
+    require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+  }
+
+  SECTION("filter on: null-equal semantics block OUTER probe-input descent")
+  {
+    const std::string null_equal_query =
+      "SELECT * FROM big_left l FULL OUTER JOIN small_right r ON l.id = r.rid "
+      "JOIN small_c c ON l.id IS NOT DISTINCT FROM c.ckey WHERE c.cother >= 0";
+
+    dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
+    auto plan = generate_sirius_plan(*con, null_equal_query, keep_shape);
+    INFO(tree_to_string(plan.get()));
+
+    auto* nested = require_nested_join(plan.get());
+    REQUIRE(nested->Cast<sirius::op::sirius_physical_hash_join>().join_type == JoinType::OUTER);
+    auto* probe_subtree =
+      require_join_child_wrap(nested->children[0].get(), nested, /*is_build=*/false);
+    REQUIRE(probe_subtree != nullptr);
+    CHECK(probe_subtree->type == SiriusPhysicalOperatorType::GPU_SCAN);
 
     require_parent_links(plan.get(), /*expected_parent=*/nullptr);
   }
