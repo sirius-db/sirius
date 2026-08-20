@@ -2710,3 +2710,143 @@ fn gpu_unsupported_shapes_are_rejected() {
         "{err:?}"
     );
 }
+
+/// Extracts the struct-field index from a Substrait direct field reference.
+fn field_index(expr: &substrait::proto::Expression) -> i32 {
+    let Some(expression::RexType::Selection(selection)) = expr.rex_type.as_ref() else {
+        panic!("expected a field reference, got {expr:?}");
+    };
+    let Some(expression::field_reference::ReferenceType::DirectReference(segment)) =
+        selection.reference_type.as_ref()
+    else {
+        panic!("expected a direct reference");
+    };
+    let Some(expression::reference_segment::ReferenceType::StructField(field)) =
+        segment.reference_type.as_ref()
+    else {
+        panic!("expected a struct field reference");
+    };
+    field.field
+}
+
+/// StarRocks orders an aggregation's output tuple by `groupBys` clause order, which is not
+/// sorted by slot id: TPC-H Q18 emits `group by: 2: c_name, 1: c_custkey`. Pins that the
+/// translated column order follows the descriptor's wire order rather than ascending slot id.
+#[test]
+fn aggregation_output_tuple_follows_wire_order_not_slot_id() {
+    let agg = aggregation_node(
+        1,
+        1,
+        vec![
+            slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR)),
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+        ],
+        vec![aggregate_expr(
+            "sum",
+            scalar_type(TPrimitiveType::BIGINT),
+            Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+        )],
+    );
+    // Output tuple 1 lists `name` (slot 2) before `id` (slot 1), matching the grouping order.
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, -1, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, -1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 1, -1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, -1, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(3, 1, -1, "total", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["name", "id", "total"]);
+    let rel::RelType::Aggregate(aggregate) =
+        root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate relation");
+    };
+    // Scan tuple 0 is `id` then `name`, so the keys resolve to fields 1 and 0 in that order.
+    assert_eq!(
+        aggregate
+            .grouping_expressions
+            .iter()
+            .map(field_index)
+            .collect::<Vec<_>>(),
+        vec![1, 0]
+    );
+}
+
+/// StarRocks builds a sort tuple ordering-slots-first, so its wire order is not sorted by slot
+/// id. Pins that the sort key resolves against the projection the translator emits.
+#[test]
+fn sort_tuple_follows_wire_order_not_slot_id() {
+    let sort_info = TSortInfo::new(
+        vec![slot_ref(2, 1, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![true],
+        vec![false],
+        None,
+    );
+    let mut sort = base_plan_node(1, TPlanNodeType::SORT_NODE, 1, vec![1]);
+    sort.sort_node = Some(TSortNode::new(
+        sort_info,
+        true,
+        Some(0),
+        None,
+        None,
+        None,
+        None,
+        // Sort-tuple expressions in wire order: the ordering column first, then the payload.
+        Some(vec![
+            slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR)),
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+        ]),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ));
+    // Sort tuple 1 lists `name` (slot 2) before `id` (slot 1).
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, -1, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, -1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 1, -1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, -1, "id", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![sort, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["name", "id"]);
+    let rel::RelType::Sort(sorted) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected sort relation");
+    };
+    // The projection below emits `name` first, so the ordering key is field 0.
+    assert_eq!(field_index(sorted.sorts[0].expr.as_ref().unwrap()), 0);
+}

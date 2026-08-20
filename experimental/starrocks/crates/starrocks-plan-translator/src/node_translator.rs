@@ -15,6 +15,7 @@ use crate::descriptor_table::DescriptorTable;
 use crate::error::{Result, TranslateError};
 use crate::expr_translator::{self, ExprContext, TranslateExpr};
 use crate::scan_paths::ScanFilePaths;
+use crate::type_mapper;
 use crate::{ExtensionRegistry, URN_AGGREGATE, URN_ARITHMETIC, URN_BOOLEAN};
 
 /// Partially translated relation plus the StarRocks row layout it emits.
@@ -343,6 +344,31 @@ fn translate_aggregation(
             grouping_expressions.len(),
             agg.aggregate_functions.len()
         )));
+    }
+
+    // A count check alone cannot see a permuted output tuple, so also require each grouping
+    // key's type to match the slot it is paired with. Compare only the type kind: the slot's
+    // nullability and decimal width are allowed to differ from the key expression's.
+    for (index, (expr, slot_id)) in grouping_exprs.iter().zip(&output_slots).enumerate() {
+        let Some(key_type) = expr
+            .nodes
+            .first()
+            .map(|node| type_mapper::map_type_desc(&node.type_, true))
+            .transpose()?
+        else {
+            continue;
+        };
+        let slot = ctx.desc.slot(output_tuple, *slot_id)?;
+        let Some(slot_type) = slot.substrait_type.as_ref() else {
+            continue;
+        };
+        let kind_of = |ty: &substrait::proto::Type| ty.kind.as_ref().map(std::mem::discriminant);
+        if kind_of(&key_type) != kind_of(slot_type) {
+            return Err(TranslateError::descriptor(format!(
+                "AGGREGATION_NODE {} output tuple {} slot {} does not match grouping key {}",
+                node.node_id, output_tuple, slot_id, index
+            )));
+        }
     }
 
     let mut measures = Vec::with_capacity(agg.aggregate_functions.len());
