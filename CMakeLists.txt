@@ -363,6 +363,7 @@ set(EXTENSION_SOURCES
     src/pipeline/sirius_pipeline_converter.cpp
     src/pipeline/repository_wiring_materializer.cpp
     src/pipeline/sirius_plan_printer.cpp
+    src/pipeline/fusion_matcher.cpp
     src/pipeline/task_request.cpp
     src/planner/duckdb_join_filter_candidate_adapter.cpp
     src/planner/gpu_admission.cpp
@@ -773,6 +774,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
     test/cpp/pipeline/test_get_next_ports_after_sink.cpp
     test/cpp/pipeline/test_merge_pipeline_fusion.cpp
+    test/cpp/pipeline/test_fusion_matcher.cpp
     test/cpp/pipeline/test_partition_build_pipelines.cpp
     test/cpp/pipeline/test_pipeline_build_context.cpp
     test/cpp/pipeline/test_pipeline_dynamic_filter_native_shape.cpp

@@ -29,6 +29,7 @@
 #include "op/sirius_physical_operator_type.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_result_collector.hpp"
+#include "pipeline/fusion_matcher.hpp"
 #include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"
 #include "pipeline/sirius_plan_printer.hpp"
@@ -315,6 +316,11 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   // Auto-log the enriched query plan
   pipeline::sirius_plan_printer plan_printer(new_scheduled);
   SIRIUS_LOG_INFO("Query Plan:\n{}", plan_printer.render());
+
+  // Static probe: which adjacent FILTER/PROJECTION runs could collapse into a single
+  // expression evaluation. Analysis only — it does not change what executes.
+  SIRIUS_LOG_DEBUG("{}",
+                   pipeline::render_fusion_report(pipeline::match_fusable_chains(new_scheduled)));
 }
 
 }  // namespace sirius
