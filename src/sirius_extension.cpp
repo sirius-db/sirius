@@ -124,6 +124,7 @@ extern "C" int cudaProfilerStop();
 #include <cstdlib>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 
 namespace duckdb {
 
@@ -140,6 +141,20 @@ bool test_options_enabled() noexcept
 {
   auto const* value = std::getenv("SIRIUS_ENABLE_TEST_OPTIONS");
   return value != nullptr && std::string_view{value} == "1";
+}
+
+enum class option_visibility { user, internal };
+
+template <typename... Args>
+void add_sirius_option(DBConfig& config,
+                       option_visibility visibility,
+                       const std::string& name,
+                       std::string description,
+                       Args&&... args)
+{
+  if (visibility == option_visibility::internal && !test_options_enabled()) { return; }
+  if (visibility == option_visibility::internal) { description = "TEST ONLY: " + description; }
+  config.AddExtensionOption(name, description, std::forward<Args>(args)...);
 }
 
 std::uint64_t count_narrowed_columns(
@@ -1867,10 +1882,12 @@ static duckdb::unique_ptr<duckdb::SiriusContext::SlotGuard> lock_operator_params
 
 static void SetDefaultScanTaskBatchSize(ClientContext& context, SetScope scope, Value& parameter)
 {
+  auto const bytes = UBigIntValue::Get(parameter);
+  if (bytes == 0) { throw InvalidInputException("scan_task_batch_size must be greater than zero"); }
   auto* params = get_operator_params(context);
   if (!params) { return; }
   auto slot                    = lock_operator_params_slot(context);
-  params->scan_task_batch_size = UBigIntValue::Get(parameter);
+  params->scan_task_batch_size = bytes;
   SIRIUS_LOG_DEBUG("Updated config SCAN_TASK_BATCH_SIZE to {}", params->scan_task_batch_size);
 }
 
@@ -2118,6 +2135,23 @@ static void SetDynamicFilterDomainCoverageThreshold(ClientContext& context,
                    params->dynamic_filter_domain_coverage_threshold);
 }
 
+static void SetDynamicFilterInlistMaxL2Fraction(ClientContext& context,
+                                                SetScope scope,
+                                                Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot             = lock_operator_params_slot(context);
+  const double fraction = parameter.GetValue<double>();
+  if (!(fraction >= 0.0 && fraction <= 1.0)) {
+    throw InvalidInputException(
+      "dynamic_filter_inlist_max_l2_fraction must be in [0.0, 1.0], got %f", fraction);
+  }
+  params->dynamic_filter_inlist_max_l2_fraction = fraction;
+  SIRIUS_LOG_DEBUG("Updated config DYNAMIC_FILTER_INLIST_MAX_L2_FRACTION to {}",
+                   params->dynamic_filter_inlist_max_l2_fraction);
+}
+
 static void SetDynamicFilterKeepThreshold(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2264,7 +2298,9 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                             SetEnableFallbackCheck);
 #endif
 
-  config.AddExtensionOption(
+  add_sirius_option(
+    config,
+    option_visibility::user,
     "enable_duckdb_fallback",
     "Whether to enable fallback to duckdb execution after an error is detected",
     LogicalType::BOOLEAN,
@@ -2273,39 +2309,80 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                            // fallback policy into every freshly-created database).
     SetEnableDuckdbFallback);
 
-  // Test hooks are absent from normal duckdb_settings(). The unittest harness opts in before
-  // constructing any database so fallback tests can still inject a deterministic runtime error.
-  if (test_options_enabled()) {
-    config.AddExtensionOption(
-      "sirius_test_inject_transparent_gpu_error",
-      "TEST ONLY: force transparent GPU execution to fail at runtime with this message",
-      LogicalType::VARCHAR,
-      Value(""));
-    config.AddExtensionOption(
-      "enable_pinned_zone_map_pruning",
-      "TEST ONLY: disable automatic pinned-table zone-map capture and pruning",
-      LogicalType::BOOLEAN,
-      Value::BOOLEAN(operator_defaults.enable_pinned_zone_map_pruning),
-      SetEnablePinnedZoneMapPruning);
-    config.AddExtensionOption("enable_dynamic_filter_pushdown",
-                              "TEST ONLY: disable automatic dynamic membership-filter pushdown",
-                              LogicalType::BOOLEAN,
-                              Value::BOOLEAN(operator_defaults.enable_dynamic_filter_pushdown),
-                              SetEnableDynamicFilterPushdown);
-    config.AddExtensionOption("enable_dynamic_zone_map_filter",
-                              "TEST ONLY: enable the clustered-keyset dynamic zone-map path",
-                              LogicalType::BOOLEAN,
-                              Value::BOOLEAN(operator_defaults.enable_dynamic_zone_map_filter),
-                              SetEnableDynamicZoneMapFilter);
-  }
+  // Keep internal policy and test hooks out of the normal duckdb_settings() surface. The
+  // unittest harness opts in before constructing a database. Centralizing visibility here keeps
+  // option registration from growing scattered environment checks.
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_inject_transparent_gpu_error",
+                    "force transparent GPU execution to fail at runtime with this message",
+                    LogicalType::VARCHAR,
+                    Value(""));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_pinned_zone_map_pruning",
+                    "disable automatic pinned-table zone-map capture and pruning",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_pinned_zone_map_pruning),
+                    SetEnablePinnedZoneMapPruning);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_dynamic_filter_pushdown",
+                    "disable automatic dynamic membership-filter pushdown",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_dynamic_filter_pushdown),
+                    SetEnableDynamicFilterPushdown);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_dynamic_zone_map_filter",
+                    "enable the clustered-keyset dynamic zone-map path",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_dynamic_zone_map_filter),
+                    SetEnableDynamicZoneMapFilter);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "scan_task_batch_size",
+                    "override the internally derived scan batch target",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(operator_defaults.scan_task_batch_size),
+                    SetDefaultScanTaskBatchSize);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "fuse_merge_pipelines",
+                    "toggle merge pipeline fusion",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(true),
+                    SetFuseMergePipelines);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_runtime_distinct_build_probe",
+                    "toggle the internal runtime distinct-build probe",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_runtime_distinct_build_probe),
+                    SetEnableRuntimeDistinctBuildProbe);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_aggregate_label_remap",
+                    "toggle the internal grouped-aggregate label remap",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_aggregate_label_remap),
+                    SetEnableAggregateLabelRemap);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "concat_batch_bytes",
+                    "override the internally derived CONCAT batch target",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(operator_defaults.concat_batch_bytes),
+                    SetConcatBatchBytes);
 
   // Add in config options for special JIT implementation for regex
-  config.AddExtensionOption(
-    "enable_regex_jit_impl",
-    "Whether to use special JIT implementation for particular regex evaluation",
-    LogicalType::BOOLEAN,
-    Value::BOOLEAN(Config::ENABLE_REGEX_JIT_IMPL),
-    SetEnableRegexJitImpl);
+  add_sirius_option(config,
+                    option_visibility::user,
+                    "enable_regex_jit_impl",
+                    "Whether to use special JIT implementation for particular regex evaluation",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(Config::ENABLE_REGEX_JIT_IMPL),
+                    SetEnableRegexJitImpl);
 
 #ifdef SIRIUS_ENABLE_LEGACY
   // Add in config options for modified pipeline
@@ -2315,20 +2392,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                             Value::BOOLEAN(Config::MODIFIED_PIPELINE),
                             SetModifiedPipeline);
 #endif
-
-  config.AddExtensionOption("fuse_merge_pipelines",
-                            "Fuse eligible GROUP BY and TOP_N merges into downstream pipelines",
-                            LogicalType::BOOLEAN,
-                            Value::BOOLEAN(true),
-                            SetFuseMergePipelines);
-
-  // Add in config options for duckdb scan task
-  // Default batch size
-  config.AddExtensionOption("scan_task_batch_size",
-                            "The default batch size for a duckdb scan task",
-                            LogicalType::UBIGINT,
-                            Value::UBIGINT(operator_defaults.scan_task_batch_size),
-                            SetDefaultScanTaskBatchSize);
 
   // Add in config option for sort partition size
   config.AddExtensionOption("max_sort_partition_bytes",
@@ -2372,12 +2435,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                             Value::UBIGINT(operator_defaults.hash_partition_bytes),
                             SetHashPartitionBytes);
 
-  config.AddExtensionOption("concat_batch_bytes",
-                            "Target size for concat operator",
-                            LogicalType::UBIGINT,
-                            Value::UBIGINT(operator_defaults.concat_batch_bytes),
-                            SetConcatBatchBytes);
-
   config.AddExtensionOption("sort_sample_bytes",
                             "Target bytes to sample before computing sort partition boundaries",
                             LogicalType::UBIGINT,
@@ -2407,26 +2464,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     LogicalType::DOUBLE,
     Value::DOUBLE(operator_defaults.mark_join_build_switch_ratio),
     SetMarkJoinBuildSwitchRatio);
-
-  config.AddExtensionOption(
-    "enable_runtime_distinct_build_probe",
-    "For BUILD_PROBE hash joins whose build-key uniqueness the planner could not prove, test "
-    "distinctness at runtime (one cudf::distinct_count pass over the cached build) and take the "
-    "single-pass cudf::distinct_hash_join instead of the general two-pass join when the keys are "
-    "distinct (on by default)",
-    LogicalType::BOOLEAN,
-    Value::BOOLEAN(operator_defaults.enable_runtime_distinct_build_probe),
-    SetEnableRuntimeDistinctBuildProbe);
-
-  config.AddExtensionOption(
-    "enable_aggregate_label_remap",
-    "For grouped aggregates on the COLLECT_SET (COUNT DISTINCT) label path, compute the dense "
-    "INT32 group labels with cudf::distinct + cudf::key_remapping (hash probe) instead of "
-    "cudf::encode (per-row lexicographic binary search); labels are byte-identical, this is "
-    "the faster default (off = encode)",
-    LogicalType::BOOLEAN,
-    Value::BOOLEAN(operator_defaults.enable_aggregate_label_remap),
-    SetEnableAggregateLabelRemap);
 
   config.AddExtensionOption(
     "gpu_execution",
@@ -2477,6 +2514,15 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     LogicalType::DOUBLE,
     Value::DOUBLE(operator_defaults.dynamic_filter_domain_coverage_threshold),
     SetDynamicFilterDomainCoverageThreshold);
+
+  config.AddExtensionOption(
+    "dynamic_filter_inlist_max_l2_fraction",
+    "Maximum estimated cuco-set size for the exact hash IN-list dynamic filter, as a fraction of "
+    "the smallest probe-GPU L2 cache, in [0, 1]; larger sets publish a Bloom filter, 0 always "
+    "publishes the Bloom when supported, and 1.0 reproduces the legacy L2-fit rule",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(operator_defaults.dynamic_filter_inlist_max_l2_fraction),
+    SetDynamicFilterInlistMaxL2Fraction);
 
   config.AddExtensionOption(
     "dynamic_filter_keep_threshold",

@@ -235,6 +235,7 @@ endif()
 # cmake-format: off
 set(EXTENSION_SOURCES
     src/compression/compressed_representation.cpp
+    src/compression/compressed_scan.cpp
     src/compression/compression_converters.cpp
     src/compression/plan_register.cpp
     src/config.cpp
@@ -314,6 +315,7 @@ set(EXTENSION_SOURCES
     src/op/scan/owning_table_view.cpp
     src/op/scan/parquet_schema_mapping.cpp
     src/op/scan/scan_plan.cpp
+    src/op/scan/scan_filter_analysis.cpp
     src/op/scan/scan_utils.cpp
     src/op/scan/sirius_gpu_scan_operator.cpp
     src/op/scan/sirius_gpu_scan_operator_data.cpp
@@ -787,6 +789,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_duckdb_mvcc_visibility.cpp
     test/cpp/scan/test_duckdb_native_batch_coalescer.cpp
     test/cpp/scan/test_duckdb_native_dynamic_filter_remap.cpp
+    test/cpp/scan/test_duckdb_native_empty_split_decode.cpp
     test/cpp/scan/test_duckdb_native_host_backed_decode.cpp
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_dynamic_filter_merge.cpp
@@ -799,6 +802,8 @@ set(TEST_SOURCES
     test/cpp/scan/test_owning_table_view.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_null_count_pruning.cpp
+    test/cpp/scan/test_residual_filter.cpp
+    test/cpp/scan/test_scan_filter_ranges.cpp
     test/cpp/scan/test_parquet_scan_sizing.cpp
     test/cpp/scan/test_scan_schema_normalization.cpp
     test/cpp/scan/test_stream_lineage_item5.cpp

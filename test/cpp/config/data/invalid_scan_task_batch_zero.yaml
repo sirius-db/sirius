@@ -1,0 +1,3 @@
+sirius:
+  operator_params:
+    scan_task_batch_size: 0

@@ -23,6 +23,7 @@
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <op/scan/batch_coalescer.hpp>
 #include <op/scan/gpu_ingestible_types.hpp>
+#include <op/scan/scan_filter_analysis.hpp>
 
 // rmm
 #include "io/io_context.hpp"
@@ -148,6 +149,23 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    */
   [[nodiscard]] virtual bool has_row_filter() const noexcept { return false; }
 
+  /// Whether @ref post_filter_and_project's assembly is a leading-identity
+  /// projection: output column k is materialized column k, and no partition or
+  /// other synthesized column joins the output. When true, a decode-row-filtered
+  /// batch whose width already matches the output arity needs no assembly at
+  /// all, so the scan's transactional carrier-cast steal may bypass
+  /// post_filter_and_project for it. A width match alone cannot prove this:
+  /// trailing pure-filter columns can offset missing synthesized columns.
+  /// Conservative default: false (the steal then falls back to the generic
+  /// materialize/project path, which is always correct).
+  /// Implementations must derive this from their assembly configuration
+  /// (parquet: `!needs_output_assembly`) or return a structural constant only
+  /// while the invariant is type-level (duckdb-native synthesizes no
+  /// partition/virtual output columns and projects via `std::iota` — see its
+  /// `post_filter_and_project`). An override returning a stale `true` silently
+  /// corrupts decode-row-filtered steals.
+  [[nodiscard]] virtual bool output_assembly_is_leading_identity() const noexcept { return false; }
+
   [[nodiscard]] virtual const ingestible_table_info& table_info() const noexcept = 0;
 
   /// Column primary (storage) indices in the exact order @ref materialize_table emits
@@ -160,26 +178,23 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
   /// @ref post_filter_and_project resolves the same columns on both paths.
   [[nodiscard]] virtual std::vector<std::size_t> materialized_column_order() const = 0;
 
-  /// Columns this scan can consume as a decode-time BOOL8 predicate mask rather
-  /// than as values, keyed by column primary (storage) index; the mapped value is
-  /// the constant set to test against.
+  /// This scan's pushed-down filter, digested into the work a decompressor can
+  /// do for it: which columns can be answered off a dictionary instead of
+  /// decoded, and which rows can be dropped while decoding.
   ///
-  /// A column qualifies when its whole pushed-down filter is an equality / IN
-  /// over string constants *and* it is never projected — the mask replaces the
-  /// column's values, so a projected column could not survive the substitution.
+  /// A source that can exploit this (a Simpatico-compressed pin, whose
+  /// dictionary answers an equality off its key set without gathering the
+  /// decoded chars) hands it to the decoder as a
+  /// @c sirius::pushdown_request; every other source supplies the columns
+  /// normally. @ref post_filter_and_project copes with either by reading what
+  /// the batch it is handed reports, so the two need not agree.
   ///
-  /// A source that can exploit this (a Simpatico-compressed pin, whose dictionary
-  /// answers the predicate off its key set without gathering the decoded chars)
-  /// attaches it via @c sirius::decode_equality_pushdown; every other source
-  /// supplies the column normally. @ref post_filter_and_project copes with either
-  /// by inspecting the batch it is handed, so the two need not agree.
-  ///
-  /// Empty by default: an ingestible whose filter path does not implement the
-  /// substitution must not advertise candidates.
-  [[nodiscard]] virtual std::unordered_map<std::size_t, std::vector<std::string>>
-  decode_predicate_candidates() const
+  /// Empty by default: an ingestible whose filter path does not implement this
+  /// must not advertise work it cannot honour.
+  [[nodiscard]] virtual scan_filter_analysis const& filter_analysis() const
   {
-    return {};
+    static scan_filter_analysis const none;
+    return none;
   }
 
  protected:
