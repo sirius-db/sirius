@@ -61,6 +61,8 @@ class convertible_data_batch : public convertible_data {
   {
   }
 
+  std::optional<std::uint64_t> data_id() const override { return _batch->get_batch_id(); }
+
   /**
    * @brief Convert this batch to reside in one of the target memory spaces.
    *

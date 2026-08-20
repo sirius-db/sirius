@@ -19,6 +19,7 @@
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -86,6 +87,14 @@ class convertible_data {
    * @return The size in bytes, or 0 if not in that space.
    */
   virtual std::size_t bytes_in_space(cucascade::memory::memory_space* space) const = 0;
+
+  /**
+   * @brief Stable id of the underlying data unit, when it has one.
+   *
+   * Lets a caller trace an individual unit across tiers. Units that do not map to a single batch
+   * (a pipeline task wrapping several) return nullopt.
+   */
+  virtual std::optional<std::uint64_t> data_id() const { return std::nullopt; }
 };
 
 /**

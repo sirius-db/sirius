@@ -259,7 +259,8 @@ void downgrade_executor::processing_loop()
              host_end_idx,
              &repo_stats,
              &host_target_stats,
-             &disk_target_stats]() mutable {
+             &disk_target_stats,
+             &cum_repo_bytes = _cumulative_repo_bytes_downgraded]() mutable {
               try {
                 auto result = cand->convert(targets, exc_stream, res_mgr, false);
                 if (result) {
@@ -267,6 +268,16 @@ void downgrade_executor::processing_loop()
                   req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
                   repo_stats.batches.fetch_add(1, std::memory_order_relaxed);
                   repo_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
+                  // Published here rather than once the request retires: monitor requests are
+                  // fire-and-forget, so a caller that observes them after a query completes would
+                  // otherwise race the request's own aggregation and read stale totals.
+                  cum_repo_bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
+                  // Per-batch trace: lets a reader follow one batch across tiers, which the
+                  // aggregate counter cannot express.
+                  if (auto const id = cand->data_id(); id.has_value()) {
+                    SIRIUS_LOG_DEBUG(
+                      "[downgrade] batch {} spilled GPU->lower, {} bytes", *id, candidate_bytes);
+                  }
                   for (size_t i = 0; i < result->size(); ++i) {
                     if ((*result)[i] == 0) continue;
                     if (i < host_end_idx) {

@@ -171,6 +171,24 @@ class downgrade_executor {
     return _monitor_requests_issued.load(std::memory_order_relaxed);
   }
 
+  /**
+   * @brief Cumulative bytes PROCESSED out of this executor's source space from data-repository
+   *        candidates (operator-port batches parked between pipelines), across every request.
+   *
+   * Useful operationally, not just in tests: repository spill that keeps climbing means a working
+   * set that does not fit the tier.
+   *
+   * Bytes processed, not unique bytes moved — a batch spilled, upgraded on demand and spilled again
+   * counts each time, so this can exceed the data the query ever held. Read it as work done.
+   *
+   * Published per conversion rather than when a request retires, so a reader never races the
+   * in-flight aggregation of a fire-and-forget monitor request.
+   */
+  size_t repository_bytes_downgraded() const
+  {
+    return _cumulative_repo_bytes_downgraded.load(std::memory_order_relaxed);
+  }
+
  private:
   void processing_loop();
   void monitor_loop();
@@ -195,6 +213,7 @@ class downgrade_executor {
   std::atomic<bool> _monitor_request_enqueued{false};
   std::atomic<bool> _running{false};
   std::atomic<size_t> _monitor_requests_issued{0};
+  std::atomic<size_t> _cumulative_repo_bytes_downgraded{0};
   std::unique_ptr<cucascade::memory::exclusive_stream_pool> _stream_pool;
 
   std::mutex _monitor_cv_mutex;
