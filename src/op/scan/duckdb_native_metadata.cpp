@@ -44,7 +44,6 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
-#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <string>
@@ -55,14 +54,9 @@ namespace sirius::op::scan {
 
 std::size_t metadata_parse_chunk()
 {
-  constexpr std::size_t kDefaultParseChunk = 8;
-  if (const char* env = std::getenv("SIRIUS_METADATA_PARSE_CHUNK")) {
-    try {
-      if (const auto v = std::stoull(env); v > 0) return static_cast<std::size_t>(v);
-    } catch (...) { /* fall through to default */
-    }
-  }
-  return kDefaultParseChunk;
+  // This is an internal scheduling granularity, not a user tuning surface.
+  constexpr std::size_t kParseChunk = 8;
+  return kParseChunk;
 }
 
 namespace {

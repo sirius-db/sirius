@@ -95,7 +95,7 @@ equivalent — which is sound precisely because the base data is byte-identical 
 
 ### Rewriting parquet with GPU-optimized settings
 
-The `rewrite_parquet.py` script reads existing parquet files and rewrites them with larger row groups, snappy compression, V2 page headers, dictionary encoding, and configurable max file size (large tables are split into numbered files). Uses cudf (GPU) if available, otherwise falls back to pyarrow (CPU-only). Requires the pixi environment in this directory (`pixi install`).
+The `rewrite_parquet.py` script reads existing parquet files and rewrites them with larger row groups, snappy compression, V2 page headers, dictionary encoding, and configurable max file size (large tables are split into numbered files). Uses cudf (GPU) if available, otherwise falls back to pyarrow (CPU-only, via the root `pixi install`).
 
 ```bash
 cd test/tpch_performance

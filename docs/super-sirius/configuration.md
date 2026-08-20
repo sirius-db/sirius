@@ -274,12 +274,12 @@ hardware-derived exception described below:
 
 ### `sirius.executor.task_creator`
 
-Thread pool (default `num_threads: 1`) plus:
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `strategy` | enum: `active`, `lookahead` | `active` | Most speculative request type the task creator may use. `active` is demand-driven only; `lookahead` additionally warms up not-yet-activated scans one task at a time. Values are lowercase. |
-| `priority_order` | enum: `source`, `sink` | `source` | Order in which the task creator prioritizes tasks within a duckdb pipeline. `source` closer to source has higher priority; `sink` closer to sink has higher priority. Values are lowercase. |
+Thread pool (default `num_threads: 1`). Task creation
+policy and within-branch priority are internal: Sirius currently creates tasks
+on demand and prioritizes source-side pipelines first. The former
+`sirius.executor.task_creator.strategy` and
+`sirius.executor.task_creator.priority_order` keys have been removed;
+configurations that still contain either key must delete it.
 
 ### `sirius.executor.pipeline`
 
@@ -407,7 +407,6 @@ individually.
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join. A build below this size is replicated to every GPU (instead of hash-partitioned) when it is tiny, or when the DuckDB-estimated probe-to-build row ratio is at least `num_gpus * 1.25`. |
 | `max_sort_partition_memory_fraction` | 0.33 | Fraction of GPU memory per sort partition when `max_sort_partition_bytes` is 0 |
 | `mark_join_build_switch_ratio` | 8.0 | For STANDARD MARK joins, build on the smaller (left) side when `right_rows >= ratio * left_rows` (0 disables) |
-| `enable_runtime_distinct_build_probe` | false | For `BUILD_PROBE` INNER/LEFT equality joins whose build-key uniqueness the planner could not prove, test distinctness at runtime (one `cudf::distinct_count` pass over the cached build, dimension-scale builds only) and take the single-pass `cudf::distinct_hash_join` instead of the general two-pass join when the keys are distinct. Temporarily off by default until a cuCollections bug fix ships in libcudf (issue #1600). |
 | `enable_dynamic_filter` | true | Enable runtime filters for eligible hash joins. Plan-time wiring admits keys by join type (not join mode); at delivery, any join whose build side arrives as one whole batch publishes — a single-partition or broadcast `BUILD_PROBE` build, and a single-partition `STANDARD`/`MIXED_JOIN` build on the same terms. Targets may be probe scans or join-edge endpoints. An eligible build selects a raw exact IN-list for 1–12 supported build rows, otherwise a hash IN-list within the L2 budget or a Bloom. |
 | `enable_dynamic_zone_map_filter` | false | Publish build-key min/max filters in addition to membership filters. Parquet scans use them for row-group pruning; duckdb-native scans apply them post-decode. Requires `enable_dynamic_filter`; intended for clustered-keyset workloads. |
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold. Before constructing either a membership filter or zone map, skip the key when the complete build covers at least this fraction of the key's unfiltered base-table row bound. Applies only to build keys proven unique in their base relation, with evidence from DuckDB-native scans. Values above 1.0 disable the gate; exactly 1.0 fires only at full coverage. |
@@ -420,6 +419,11 @@ individually.
 **Note:** `admission_bytes_per_gpu` is a parallelism dial, not a memory budget. Peak GPU residency is bounded by partition sizing (`hash_partition_bytes` and the batch settings), not by the admitted GPU count — a query on fewer GPUs processes more partitions sequentially at roughly unchanged peak memory, trading wall-clock for freed devices. Tune it against how much of the fleet a query should occupy, not against VRAM.
 
 **Note:** `max_build_hash_table_bytes` can be larger than `concat_batch_bytes`. When it is, the partition operator configures CONCAT to concatenate all batches, enabling the more efficient BUILD_PROBE join mode for larger build sides. Other joins (STANDARD, MIXED) still use `concat_batch_bytes` as the batch size threshold.
+
+Runtime distinct-build probing is an internal join policy, not a user configuration choice. It is
+temporarily disabled while the cuCollections defect tracked in #1600 remains unresolved. The
+engine retains the guarded single-pass `cudf::distinct_hash_join` path for policy-controlled use
+after that dependency is fixed.
 
 ## Telemetry
 
@@ -435,8 +439,8 @@ sirius:
 |-----|------|---------|-------------|
 | `enable_quent` | bool | true | Emit Quent telemetry using the configured exporter. When false, telemetry uses the noop exporter. |
 | `exporter` | string | `ndjson` | Quent filesystem exporter: `ndjson`, `msgpack`, or `postcard`. |
-| `output_directory` | string | `telemetry_data` | Directory for Quent telemetry files. |
-| `engine_name` | string | `siriusDB` | Engine name reported in engine-level telemetry. |
+| `output_directory` | non-empty string | `telemetry_data` | Directory for Quent telemetry files. |
+| `engine_name` | non-empty string | `siriusDB` | Engine name reported in engine-level telemetry. |
 
 Per-query labels are configured separately from YAML. They can be set with the
 `sirius_set_query_label` SQL function or inline with the `query_label` named
@@ -588,16 +592,23 @@ SET enable_compressed_materialization = false;
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `fuse_merge_pipelines` | true | Fuse eligible GROUP BY / TOP_N merges into their downstream pipeline instead of cutting a boundary (see [physical-plan-generation.md](physical-plan-generation.md) → Merge fusion) |
 | `max_sort_partition_bytes` | 0 (auto) | Max sort partition bytes |
 | `max_sort_partition_memory_fraction` | 0.33 | Auto sort-partition fraction when `max_sort_partition_bytes` is 0 |
 | `hash_partition_bytes` | Shared physical/effective GPU batch default | Hash partition target size; must be greater than zero |
-| `concat_batch_bytes` | Shared physical/effective GPU batch default | CONCAT output batch size |
 | `sort_sample_bytes` | Shared physical/effective GPU batch default | Bytes sampled before computing sort boundaries |
 | `max_build_hash_table_bytes` | 2× batch default | Max build-side hash table bytes |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
-| `enable_runtime_distinct_build_probe` | false | Runtime distinct-build test for `BUILD_PROBE` joins; promotes to the single-pass `cudf::distinct_hash_join` when the build keys prove distinct. Temporarily off by default (issue #1600) |
+
+Eligible GROUP BY and TOP_N merge pipelines are fused automatically. This is an engine-owned plan
+policy rather than a user configuration choice; see
+[Merge fusion](physical-plan-generation.md#merge-fusion).
+
+The CONCAT output-batch target is derived from effective GPU capacity. Advanced
+benchmark and test envelopes may still override `concat_batch_bytes` in YAML
+under `sirius.operator_params`, but it is not a normal session setting.
+
+Runtime distinct-build probing is also engine-owned and is temporarily disabled pending #1600.
 
 ### GPU Admission
 

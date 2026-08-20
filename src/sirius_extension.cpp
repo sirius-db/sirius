@@ -124,6 +124,7 @@ extern "C" int cudaProfilerStop();
 #include <cstdlib>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 
 namespace duckdb {
 
@@ -140,6 +141,20 @@ bool test_options_enabled() noexcept
 {
   auto const* value = std::getenv("SIRIUS_ENABLE_TEST_OPTIONS");
   return value != nullptr && std::string_view{value} == "1";
+}
+
+enum class option_visibility { user, internal };
+
+template <typename... Args>
+void add_sirius_option(DBConfig& config,
+                       option_visibility visibility,
+                       const std::string& name,
+                       std::string description,
+                       Args&&... args)
+{
+  if (visibility == option_visibility::internal && !test_options_enabled()) { return; }
+  if (visibility == option_visibility::internal) { description = "TEST ONLY: " + description; }
+  config.AddExtensionOption(name, description, std::forward<Args>(args)...);
 }
 
 std::uint64_t count_narrowed_columns(
@@ -2273,7 +2288,9 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                             SetEnableFallbackCheck);
 #endif
 
-  config.AddExtensionOption(
+  add_sirius_option(
+    config,
+    option_visibility::user,
     "enable_duckdb_fallback",
     "Whether to enable fallback to duckdb execution after an error is detected",
     LogicalType::BOOLEAN,
@@ -2282,45 +2299,74 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                            // fallback policy into every freshly-created database).
     SetEnableDuckdbFallback);
 
-  // Test hooks are absent from normal duckdb_settings(). The unittest harness opts in before
-  // constructing any database so fallback tests can still inject a deterministic runtime error.
-  if (test_options_enabled()) {
-    config.AddExtensionOption(
-      "sirius_test_inject_transparent_gpu_error",
-      "TEST ONLY: force transparent GPU execution to fail at runtime with this message",
-      LogicalType::VARCHAR,
-      Value(""));
-    config.AddExtensionOption(
-      "enable_pinned_zone_map_pruning",
-      "TEST ONLY: disable automatic pinned-table zone-map capture and pruning",
-      LogicalType::BOOLEAN,
-      Value::BOOLEAN(operator_defaults.enable_pinned_zone_map_pruning),
-      SetEnablePinnedZoneMapPruning);
-    config.AddExtensionOption("enable_dynamic_filter",
-                              "TEST ONLY: disable runtime dynamic-filter discovery for eligible "
-                              "hash joins (probe-side scan and join-edge targets)",
-                              LogicalType::BOOLEAN,
-                              Value::BOOLEAN(operator_defaults.enable_dynamic_filter),
-                              SetEnableDynamicFilter);
-    config.AddExtensionOption("enable_dynamic_zone_map_filter",
-                              "TEST ONLY: enable the clustered-keyset dynamic zone-map path",
-                              LogicalType::BOOLEAN,
-                              Value::BOOLEAN(operator_defaults.enable_dynamic_zone_map_filter),
-                              SetEnableDynamicZoneMapFilter);
-    config.AddExtensionOption("scan_task_batch_size",
-                              "TEST ONLY: override the internally derived scan batch target",
-                              LogicalType::UBIGINT,
-                              Value::UBIGINT(operator_defaults.scan_task_batch_size),
-                              SetDefaultScanTaskBatchSize);
-  }
+  // Keep internal policy and test hooks out of the normal duckdb_settings() surface. The
+  // unittest harness opts in before constructing a database. Centralizing visibility here keeps
+  // option registration from growing scattered environment checks.
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_inject_transparent_gpu_error",
+                    "force transparent GPU execution to fail at runtime with this message",
+                    LogicalType::VARCHAR,
+                    Value(""));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_pinned_zone_map_pruning",
+                    "disable automatic pinned-table zone-map capture and pruning",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_pinned_zone_map_pruning),
+                    SetEnablePinnedZoneMapPruning);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_dynamic_filter",
+                    "disable runtime dynamic-filter discovery for eligible hash joins "
+                    "(probe-side scan and join-edge targets)",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_dynamic_filter),
+                    SetEnableDynamicFilter);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_dynamic_zone_map_filter",
+                    "enable the clustered-keyset dynamic zone-map path",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_dynamic_zone_map_filter),
+                    SetEnableDynamicZoneMapFilter);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "scan_task_batch_size",
+                    "override the internally derived scan batch target",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(operator_defaults.scan_task_batch_size),
+                    SetDefaultScanTaskBatchSize);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "fuse_merge_pipelines",
+                    "toggle merge pipeline fusion",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(true),
+                    SetFuseMergePipelines);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_runtime_distinct_build_probe",
+                    "toggle the internal runtime distinct-build probe",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_runtime_distinct_build_probe),
+                    SetEnableRuntimeDistinctBuildProbe);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "concat_batch_bytes",
+                    "override the internally derived CONCAT batch target",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(operator_defaults.concat_batch_bytes),
+                    SetConcatBatchBytes);
 
   // Add in config options for special JIT implementation for regex
-  config.AddExtensionOption(
-    "enable_regex_jit_impl",
-    "Whether to use special JIT implementation for particular regex evaluation",
-    LogicalType::BOOLEAN,
-    Value::BOOLEAN(Config::ENABLE_REGEX_JIT_IMPL),
-    SetEnableRegexJitImpl);
+  add_sirius_option(config,
+                    option_visibility::user,
+                    "enable_regex_jit_impl",
+                    "Whether to use special JIT implementation for particular regex evaluation",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(Config::ENABLE_REGEX_JIT_IMPL),
+                    SetEnableRegexJitImpl);
 
 #ifdef SIRIUS_ENABLE_LEGACY
   // Add in config options for modified pipeline
@@ -2330,12 +2376,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                             Value::BOOLEAN(Config::MODIFIED_PIPELINE),
                             SetModifiedPipeline);
 #endif
-
-  config.AddExtensionOption("fuse_merge_pipelines",
-                            "Fuse eligible GROUP BY and TOP_N merges into downstream pipelines",
-                            LogicalType::BOOLEAN,
-                            Value::BOOLEAN(true),
-                            SetFuseMergePipelines);
 
   // Add in config option for sort partition size
   config.AddExtensionOption("max_sort_partition_bytes",
@@ -2379,12 +2419,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                             Value::UBIGINT(operator_defaults.hash_partition_bytes),
                             SetHashPartitionBytes);
 
-  config.AddExtensionOption("concat_batch_bytes",
-                            "Target size for concat operator",
-                            LogicalType::UBIGINT,
-                            Value::UBIGINT(operator_defaults.concat_batch_bytes),
-                            SetConcatBatchBytes);
-
   config.AddExtensionOption("sort_sample_bytes",
                             "Target bytes to sample before computing sort partition boundaries",
                             LogicalType::UBIGINT,
@@ -2414,16 +2448,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     LogicalType::DOUBLE,
     Value::DOUBLE(operator_defaults.mark_join_build_switch_ratio),
     SetMarkJoinBuildSwitchRatio);
-
-  config.AddExtensionOption(
-    "enable_runtime_distinct_build_probe",
-    "For BUILD_PROBE hash joins whose build-key uniqueness the planner could not prove, test "
-    "distinctness at runtime (one cudf::distinct_count pass over the cached build) and take the "
-    "single-pass cudf::distinct_hash_join instead of the general two-pass join when the keys are "
-    "distinct (temporarily off by default pending a cuCollections fix; see issue #1600)",
-    LogicalType::BOOLEAN,
-    Value::BOOLEAN(operator_defaults.enable_runtime_distinct_build_probe),
-    SetEnableRuntimeDistinctBuildProbe);
 
   config.AddExtensionOption(
     "gpu_execution",
