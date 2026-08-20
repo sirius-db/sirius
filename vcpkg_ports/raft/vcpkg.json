@@ -13,12 +13,11 @@
     "cuco",
     "fmt",
     "nvtx3",
-    "raft",
     "rmm",
     "spdlog"
   ],
   "license": "Apache-2.0",
-  "name": "cuvs",
+  "name": "raft",
   "supports": "linux",
   "version-string": "26.06.00"
 }

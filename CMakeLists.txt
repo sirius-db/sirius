@@ -88,6 +88,7 @@ endforeach()
 
 # Dependencies
 find_package(cudf REQUIRED CONFIG)
+find_package(raft REQUIRED CONFIG) # raft must be found before cuvs
 find_package(cuvs REQUIRED CONFIG)
 find_package(spdlog REQUIRED CONFIG)
 find_package(yaml-cpp REQUIRED CONFIG)
@@ -566,6 +567,7 @@ foreach(_target sirius_extension sirius_loadable_extension)
     ${_target}
     cudf::cudf
     cuvs::cuvs
+    raft::raft
     cuco::cuco
     rmm::rmm
     spdlog::spdlog
