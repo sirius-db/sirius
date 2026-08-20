@@ -59,6 +59,7 @@
 #include "op/sirius_physical_top_n_merge.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
+#include "planner/eager_agg_pushdown_plan_pass.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_config.hpp"
@@ -1020,26 +1021,80 @@ bool sirius_physical_plan_generator::preserve_insertion_order(
   return preserve_insertion_order(context, plan);
 }
 
+namespace {
+
+/// Exception-safe StartPhase/EndPhase pairing: create_plan_stages can throw
+/// between the two (that is how unsupported plans decline GPU execution), and
+/// the eager-aggregation retry below runs the stages a second time — an
+/// unbalanced phase from the first attempt would corrupt the profiler state.
+struct profiler_phase_guard {
+  profiler_phase_guard(duckdb::QueryProfiler& profiler, duckdb::MetricType metric)
+    : _profiler(profiler)
+  {
+    _profiler.StartPhase(metric);
+  }
+  ~profiler_phase_guard() { end(); }
+  void end()
+  {
+    if (!_ended) {
+      _ended = true;
+      _profiler.EndPhase();
+    }
+  }
+  profiler_phase_guard(const profiler_phase_guard&)            = delete;
+  profiler_phase_guard& operator=(const profiler_phase_guard&) = delete;
+
+ private:
+  duckdb::QueryProfiler& _profiler;
+  bool _ended = false;
+};
+
+}  // namespace
+
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOperator> op)
+{
+  // Eager aggregation pushdown (Yan & Larson) — a logical-level rewrite, so it
+  // runs before type/binding resolution. Fail closed twice over: the matcher
+  // only fires on shapes it can prove (see eager_agg_pushdown_plan_pass.cpp),
+  // the rewrite is applied to a COPY, and if the rewritten plan fails ANY
+  // later planning stage we fall back to the untouched original — the query
+  // then behaves exactly as if the pass did not exist.
+  if (auto rewritten = planner::try_eager_aggregation_pushdown(*op, context)) {
+    try {
+      return create_plan_stages(std::move(rewritten));
+    } catch (std::exception& e) {
+      SIRIUS_LOG_INFO(
+        "Eager aggregation pushdown: rewritten plan failed physical planning ({}); "
+        "retrying with the original plan",
+        e.what());
+    }
+  }
+  return create_plan_stages(std::move(op));
+}
+
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::create_plan_stages(duckdb::unique_ptr<duckdb::LogicalOperator> op)
 {
   auto& profiler = duckdb::QueryProfiler::Get(context);
 
   // Resolve the types of each operator.
-  profiler.StartPhase(duckdb::MetricType::PHYSICAL_PLANNER_RESOLVE_TYPES);
-  op->ResolveOperatorTypes();
-  profiler.EndPhase();
+  {
+    profiler_phase_guard phase(profiler, duckdb::MetricType::PHYSICAL_PLANNER_RESOLVE_TYPES);
+    op->ResolveOperatorTypes();
+  }
 
   // Resolve the column references.
-  profiler.StartPhase(duckdb::MetricType::PHYSICAL_PLANNER_COLUMN_BINDING);
-  duckdb::ColumnBindingResolver resolver;
-  resolver.VisitOperator(*op);
-  profiler.EndPhase();
+  {
+    profiler_phase_guard phase(profiler, duckdb::MetricType::PHYSICAL_PLANNER_COLUMN_BINDING);
+    duckdb::ColumnBindingResolver resolver;
+    resolver.VisitOperator(*op);
+  }
 
   // then create the main physical plan
-  profiler.StartPhase(duckdb::MetricType::PHYSICAL_PLANNER_CREATE_PLAN);
+  profiler_phase_guard create_phase(profiler, duckdb::MetricType::PHYSICAL_PLANNER_CREATE_PLAN);
   auto plan = create_plan(*op);
-  profiler.EndPhase();
+  create_phase.end();
 
   plan = fold_adjacent_projections(std::move(plan));
   if (compressed_materialization_active(context)) {

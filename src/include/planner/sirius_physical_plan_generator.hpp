@@ -114,7 +114,9 @@ class sirius_physical_plan_generator {
   get_or_create_dynamic_filter_channel(duckdb::DynamicTableFilterSet const* key);
 
   //! Creates a plan from the logical operator. This involves resolving column bindings and
-  //! generating physical operator nodes.
+  //! generating physical operator nodes. Attempts the eager-aggregation-pushdown logical
+  //! rewrite first; if the rewritten copy fails any later planning stage, planning is retried
+  //! with the untouched original plan (fail closed).
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::unique_ptr<duckdb::LogicalOperator> logical);
 
@@ -131,6 +133,12 @@ class sirius_physical_plan_generator {
     sirius::op::sirius_physical_operator& op);
 
  protected:
+  //! The actual planning stages (type resolution, column binding, physical operator
+  //! generation, plan passes). create_plan() runs these on the eager-agg-rewritten copy
+  //! first and again on the original plan if that attempt throws.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan_stages(
+    duckdb::unique_ptr<duckdb::LogicalOperator> logical);
+
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalOperator& op);
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
