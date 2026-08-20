@@ -2088,16 +2088,6 @@ static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
                    params->enable_runtime_distinct_build_probe);
 }
 
-static void SetEnableAggregateLabelRemap(ClientContext& context, SetScope scope, Value& parameter)
-{
-  auto* params = get_operator_params(context);
-  if (!params) { return; }
-  auto slot                            = lock_operator_params_slot(context);
-  params->enable_aggregate_label_remap = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config ENABLE_AGGREGATE_LABEL_REMAP to {}",
-                   params->enable_aggregate_label_remap);
-}
-
 static void SetEnableDynamicFilterPushdown(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2360,13 +2350,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_runtime_distinct_build_probe),
                     SetEnableRuntimeDistinctBuildProbe);
-  add_sirius_option(config,
-                    option_visibility::internal,
-                    "enable_aggregate_label_remap",
-                    "toggle the internal grouped-aggregate label remap",
-                    LogicalType::BOOLEAN,
-                    Value::BOOLEAN(operator_defaults.enable_aggregate_label_remap),
-                    SetEnableAggregateLabelRemap);
   add_sirius_option(config,
                     option_visibility::internal,
                     "concat_batch_bytes",

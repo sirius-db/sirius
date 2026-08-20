@@ -86,15 +86,6 @@ constexpr double DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO = 8.0;
 /// (NVIDIA/cuCollections#834) on some key distributions. Re-enable once the fix ships in libcudf.
 constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
-/// Produce the grouped-aggregate COLLECT_SET group labels with cudf::distinct +
-/// cudf::key_remapping instead of cudf::encode.
-///
-/// Both mechanisms yield byte-identical labels; the hash probe replaces encode's per-input-row
-/// lexicographic binary search and is ~5x faster at many-rows/few-groups shapes. The remap path
-/// transiently holds one extra input-cardinality INT32 column, so the encode path remains
-/// available as a no-rebuild escape hatch.
-constexpr bool DEFAULT_ENABLE_AGGREGATE_LABEL_REMAP = true;
-
 }  // namespace config
 
 /// Parameters controlling operator-level resource sizing.
@@ -144,11 +135,6 @@ struct operator_params {
   /// direct programmatic control of this field to exercise both implementations. See
   /// DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE.
   bool enable_runtime_distinct_build_probe = config::DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE;
-
-  /// For the grouped-aggregate COLLECT_SET label path: compute group labels with cudf::distinct +
-  /// cudf::key_remapping instead of cudf::encode. Byte-identical labels; escape hatch back to
-  /// encode. See DEFAULT_ENABLE_AGGREGATE_LABEL_REMAP.
-  bool enable_aggregate_label_remap = config::DEFAULT_ENABLE_AGGREGATE_LABEL_REMAP;
 
   /// Wire dynamic table-filter pushdown: an eligible BUILD_PROBE hash-join build publishes a raw
   /// exact IN-list for 1..12 supported build rows, otherwise a hash IN-list if it fits the smallest

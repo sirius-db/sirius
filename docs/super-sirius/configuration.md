@@ -415,7 +415,6 @@ individually.
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
 | `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU. At admission the engine estimates a query's total scan output and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. |
 | `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns (VARCHAR, LIST, STRUCT, ARRAY) when estimating scan output. Fixed-width columns use their real carrier width. Only consulted when `admission_bytes_per_gpu` is non-zero. |
-| `enable_aggregate_label_remap` | true | For grouped aggregates on the COLLECT_SET (COUNT DISTINCT) label path, compute the dense INT32 group labels with `cudf::distinct` + `cudf::key_remapping` (hash probe) instead of `cudf::encode` (per-row binary search). Labels are byte-identical; off = encode. |
 
 **Note:** `admission_bytes_per_gpu` is a parallelism dial, not a memory budget. Peak GPU residency is bounded by partition sizing (`hash_partition_bytes` and the batch settings), not by the admitted GPU count — a query on fewer GPUs processes more partitions sequentially at roughly unchanged peak memory, trading wall-clock for freed devices. Tune it against how much of the fleet a query should occupy, not against VRAM.
 
@@ -610,10 +609,6 @@ benchmark and test envelopes may still override `concat_batch_bytes` in YAML
 under `sirius.operator_params`, but it is not a normal session setting.
 
 Runtime distinct-build probing is also engine-owned and is temporarily disabled pending #1600.
-
-The aggregate label-remap path is likewise engine-owned. Advanced benchmark and test envelopes
-may disable it with `enable_aggregate_label_remap` in YAML under `sirius.operator_params`; it is
-not a normal session setting.
 
 ### GPU Admission
 

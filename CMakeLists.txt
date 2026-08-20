@@ -299,6 +299,7 @@ set(EXTENSION_SOURCES
     src/memory/defragmenter_oom_policy.cpp
     src/memory/sirius_memory_reservation_manager.cpp
     src/op/aggregate/aggregate_op_util.cpp
+    src/op/aggregate/group_key_labels.cpp
     src/op/aggregate/gpu_aggregate_impl.cpp
     src/op/merge/gpu_merge_impl.cpp
     src/op/order/gpu_order_impl.cpp
@@ -727,7 +728,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_build_probe_scheduling.cpp
     test/cpp/operator/test_cross_schedule.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
-    test/cpp/operator/aggregate/test_group_label_remap.cpp
+    test/cpp/operator/aggregate/test_group_key_labels.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_merge.cpp

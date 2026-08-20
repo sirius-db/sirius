@@ -33,7 +33,6 @@
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
-#include "sirius_context.hpp"
 
 #include <memory>
 
@@ -376,9 +375,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
     throw duckdb::NotImplementedException("Non simple aggregation is not supported");
   }
 
-  auto sirius_context   = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  const auto& op_params = sirius_context->get_config().get_operator_params();
-
   // groups! create a GROUP BY aggregator
   // use a partitioned or perfect hash aggregate if possible
   duckdb::vector<duckdb::column_t> partition_columns;
@@ -395,8 +391,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
       op.estimated_cardinality,
       group_validity,
       op.distinct_validity);
-    group_by->Cast<sirius::op::sirius_physical_grouped_aggregate>().aggregate_label_remap =
-      op_params.enable_aggregate_label_remap;
     group_by->children.push_back(std::move(plan));
     return group_by;
   }
@@ -412,8 +406,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
       op.estimated_cardinality,
       group_validity,
       op.distinct_validity);
-    group_by->Cast<sirius::op::sirius_physical_grouped_aggregate>().aggregate_label_remap =
-      op_params.enable_aggregate_label_remap;
     group_by->children.push_back(std::move(plan));
     return group_by;
   }
@@ -428,8 +420,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
     op.estimated_cardinality,
     group_validity,
     op.distinct_validity);
-  group_by->Cast<sirius::op::sirius_physical_grouped_aggregate>().aggregate_label_remap =
-    op_params.enable_aggregate_label_remap;
   group_by->children.push_back(std::move(plan));
   return group_by;
 }

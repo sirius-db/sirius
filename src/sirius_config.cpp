@@ -283,7 +283,6 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
       "build probing is an internal join policy (temporarily disabled pending issue #1600); "
       "remove this key");
   }
-  r.optional("enable_aggregate_label_remap", opt.enable_aggregate_label_remap);
   r.optional("enable_dynamic_filter_pushdown", opt.enable_dynamic_filter_pushdown);
   r.optional("enable_dynamic_zone_map_filter", opt.enable_dynamic_zone_map_filter);
   r.optional("dynamic_filter_domain_coverage_threshold",
