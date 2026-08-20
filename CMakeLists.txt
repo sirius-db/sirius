@@ -88,12 +88,23 @@ endforeach()
 
 # Dependencies
 find_package(cudf REQUIRED CONFIG)
+find_package(raft REQUIRED CONFIG) # raft must be found before cuvs
+find_package(cuvs REQUIRED CONFIG)
 find_package(spdlog REQUIRED CONFIG)
 find_package(yaml-cpp REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)
+
+# The static vcpkg build only exports cuvs::cuvs_static; conda's shared build
+# already provides cuvs::cuvs. Provide the canonical name when it is missing so
+# both build paths link cuvs::cuvs the same way below.
+if(NOT TARGET cuvs::cuvs)
+  add_library(cuvs::cuvs INTERFACE IMPORTED)
+  set_target_properties(cuvs::cuvs PROPERTIES INTERFACE_LINK_LIBRARIES
+                                              cuvs::cuvs_static)
+endif()
 
 # Static NVRTC (vcpkg overlay port). Statically linking the runtime JIT compiler
 # keeps libnvrtc.so out of the distributed extension's runtime dependencies.
@@ -411,7 +422,12 @@ set(EXTENSION_SOURCES
     src/transparent/physical_sirius_execution.cpp
     src/transparent/sirius_optimizer_extension.cpp
     src/util/stream_check_wrapper.cpp
-    src/util/segfault_backtrace_handler.cpp)
+    src/util/segfault_backtrace_handler.cpp
+    src/vss/distance_metric.cpp
+    src/vss/enn_top_k.cpp
+    src/vss/pinned_column.cpp
+    src/vss/vector_search.cpp
+    src/vss/vector_search_enn.cpp)
 # cmake-format: on
 
 # Legacy Sirius — all legacy-specific config lives in src/legacy/CMakeLists.txt.
@@ -431,7 +447,9 @@ set(CUDA_SOURCES
     src/cuda/scan/strings/dict_fsst.cu
     src/cuda/scan/strings/dictionary.cu
     src/cuda/scan/strings/fsst.cu
-    src/cuda/scan/strings/uncompressed.cu)
+    src/cuda/scan/strings/uncompressed.cu
+    src/cuda/vss/cudf_raft_interop.cu
+    src/cuda/vss/brute_force_search.cu)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   add_subdirectory(src/legacy)
   list(APPEND EXTENSION_SOURCES ${SIRIUS_LEGACY_SOURCES}
@@ -548,6 +566,8 @@ foreach(_target sirius_extension sirius_loadable_extension)
   target_link_libraries(
     ${_target}
     cudf::cudf
+    cuvs::cuvs
+    raft::raft
     cuco::cuco
     rmm::rmm
     spdlog::spdlog
@@ -689,6 +709,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_tpcds_nulls.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
+    test/cpp/integration/test_gpu_execution_vector_search.cpp
     test/cpp/integration/test_pin_table_host_streaming.cpp
     test/cpp/integration/test_pin_table_merge_columns.cpp
     test/cpp/integration/test_pin_table_column_order.cpp
@@ -810,6 +831,12 @@ set(TEST_SOURCES
     test/cpp/sql/test_sirius_sql_rewrite.cpp
     test/cpp/telemetry/test_telemetry_context.cpp
     test/cpp/transparent/test_preserve_dynamic_filter_metadata.cpp
+    test/cpp/vss/test_brute_force_search.cpp
+    test/cpp/vss/test_cudf_raft_interop.cpp
+    test/cpp/vss/test_distance_metric.cpp
+    test/cpp/vss/test_enn_top_k.cpp
+    test/cpp/vss/test_pinned_column.cpp
+    test/cpp/vss/test_vector_search.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/pipeline_conversion_test_utils.cpp
     test/cpp/utils/sirius_test_env.cpp
