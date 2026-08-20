@@ -93,6 +93,9 @@ struct size_estimate_options {
  *  3. leaf — anchor on the source's own total;
  *  4. single producer — recurse, then apply this pipeline's ratio.
  *
+ * An unfinished pipeline holding an operator that caps its output by row count (a LIMIT) short
+ * circuits to nullopt ahead of 2-4: no ratio extrapolates through a cap.
+ *
  * @return nullopt whenever any link in the chain is unknown.
  */
 [[nodiscard]] std::optional<data_size_estimate> estimate_pipeline_total_output_bytes(

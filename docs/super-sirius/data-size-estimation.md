@@ -26,8 +26,9 @@ will this port have received once its producer is done?"*.
 | # | condition | result |
 |---|-----------|--------|
 | 1 | pipeline finished | its recorded output total, `exact = true`; a pipeline that finished having never created a task emitted exactly 0, while one whose tasks all recorded nothing is `nullopt` |
+| — | output capped (a row limit) | `nullopt` — see [capped pipelines](#capped-pipelines) |
 | 2 | several input ports (fan-in) | follow the source's nominated primary port, scaled by `output total / consumed primary bytes`; `nullopt` if it nominates none |
-| 3 | source has no input ports (a leaf) | `total_source_input_bytes × ratio`, or `total_source_output_bytes` unscaled |
+| 3 | source has no input ports (a leaf) | `total_source_input_bytes × ratio`, or — only when the source is the pipeline's sole operator — `total_source_output_bytes` unscaled |
 | 4 | exactly one input port | recurse into the producer, then apply this pipeline's ratio |
 
 `estimate_port_total_input_bytes` resolves the port's `src_pipeline` and delegates. It returns
@@ -106,6 +107,15 @@ pre-filter number — so the ratio already encodes filter selectivity. `estimate
 **post**-filter, so scaling it by the ratio would count selectivity twice. Hence
 `total_source_output_bytes` is used unscaled.
 
+That only works when the source is the pipeline's **only** operator, which for a GPU_SCAN holds
+just when its tree parent is a `PARTITION`. Otherwise `FILTER`, `PROJECTION`, `LIMIT` or
+`DYNAMIC_FILTER` sit in the same pipeline, the scan's output stops being the pipeline's output, and
+neither option is available: unscaled ignores those operators, while the pipeline ratio cannot
+bridge the gap because its denominator is the pre-filter input rather than the scan's output. The
+estimator checks `source == sink` — `get_operators()` runs source through sink, so a lone operator
+is both — and returns `nullopt` when anything follows. The measured `total_source_input_bytes` path
+has no such restriction: its ratio is the pipeline's own, end to end.
+
 For `GPU_SCAN` the total is tallied in `split_connector::push_split` — the choke point every split
 passes through — and `is_discovery_complete()` reports when the tally is final. That is distinct
 from the pre-existing `is_closed()`, which means *closed and drained*.
@@ -123,6 +133,32 @@ an observed partial, or zero, and every downstream hop would multiply that out. 
 floored at the bytes already emitted: a measured partial is a hard lower bound on a total, and
 `max(estimated_cardinality × bytes/row, emitted_bytes)` is the weakest correct statement available.
 Returning `nullopt` instead would also be sound but discards a usable bound.
+
+## Capped pipelines
+
+Everything above models a pipeline as a linear map: output grows in proportion to input, so a
+measured ratio extrapolates. A row limit breaks that. `STREAMING_LIMIT` makes output
+`min(k, input × selectivity)` — saturating, not linear — so past the cap more input yields no more
+output, and a ratio measured before the cap binds projects a total the pipeline will never reach.
+The error is worst exactly where the operator is most useful: `SELECT * FROM huge LIMIT 10`.
+
+It compounds. `sirius_pipeline::update_pipeline_status` treats `is_limit_exhausted()` as grounds to
+finish early *without draining the source*, so the pipeline stops consuming while
+`total_source_input_bytes` still reports the whole table. The scan itself is never told to stop —
+no split is skipped and the split connector is only ever closed by its producer — but those splits
+no longer flow through a pipeline that has already finished.
+
+So a pipeline containing an operator whose `caps_pipeline_output()` is true gets no estimate at all
+while it is unfinished, in any of the four cases. Once it *is* finished, case 1 answers from the
+recorded total and is unaffected. The check is a virtual on the operator rather than a type test,
+and is deliberately distinct from the existing `is_limit_exhausted()`: the cap bounds the eventual
+total from the start, whether or not it has bound yet.
+
+This is a hard stop rather than a bound because bounding needs the limit in *bytes*, and the limit
+is a row count while the history records only bytes. `LIMIT_PERCENT` would need no treatment (a
+percentage is multiplicative) but Sirius rejects it at planning. `TOP_N` is a sink heading its own
+pipeline, so it caps what that pipeline's *consumer* sees rather than what this one emits, and it
+does not set the flag.
 
 ## Fan-in
 
@@ -172,9 +208,9 @@ contributes an equal share of a probe batch's output. It does not, in general, a
 the ratio reads **high** — the unsafe direction, and the one the mechanisms below are supposed to
 rule out.
 
-`next_cross_schedule_pair` hands out the first unscheduled pair in `(partition, probe, build)` order,
-so partition 0's grid is fully scheduled before partition 1 gets anything, and within a partition
-probe batch 0 sweeps all B build batches before probe batch 1 starts. At the moment the fan-in gate
+`next_cross_schedule_pair` hands out the first unscheduled pair in `(partition, probe, build)`
+order, so partition 0's grid is fully scheduled before partition 1 gets anything, and within a
+partition probe batch 0 sweeps all B build batches before probe batch 1 starts. At the fan-in gate
 opens — `min_fan_in_ratio_samples` completed pairings, 16 by default — the denominator therefore
 carries weight for only the first probe batch or two, while the numerator is the pipeline's *whole*
 output. If matches concentrate in the early build batches, output is already near its final value
@@ -270,14 +306,15 @@ opposite direction to the in-flight effect and not necessarily smaller than it.
 | category | operators |
 |----------|-----------|
 | anchors | `GPU_SCAN`; `GPU_VALUES` (also covers `COLUMN_DATA_SCAN`, `DUMMY_SCAN`, `EMPTY_RESULT`, rewritten to it at plan generation); any finished pipeline |
-| pass-through (recurse) | any single-ingress pipeline — `FILTER`, `PROJECTION`, `LIMIT`, sorts, aggregates, `CONCAT`, `PARTITION` |
+| pass-through (recurse) | any single-ingress pipeline — `FILTER`, `PROJECTION`, sorts, aggregates, `CONCAT`, `PARTITION` |
 | fan-in | `HASH_JOIN` (INNER/LEFT/SEMI/ANTI/MARK) |
-| dead ends (`nullopt`) | `STREAMING_SOURCE` (by design); `TABLE_SCAN`; `NESTED_LOOP_JOIN`, delim joins, `CTE`, `HASH_JOIN` RIGHT-family and OUTER (no nominated primary) |
+| dead ends (`nullopt`) | `STREAMING_SOURCE` (by design); `TABLE_SCAN`; `NESTED_LOOP_JOIN`, delim joins, `CTE`, `HASH_JOIN` RIGHT-family and OUTER (no nominated primary); any unfinished pipeline holding a `STREAMING_LIMIT` |
 
 Because the estimator works at pipeline granularity, single-input operators need no per-operator
 model: a pipeline's ratio is measured end-to-end, so whatever a projection or filter does to byte
 volume is captured automatically. The cost is attribution — a bad ratio cannot be traced to one
-operator.
+operator. The exception is an operator that breaks proportionality rather than merely scaling it,
+which is why `STREAMING_LIMIT` has to opt out by hand — see [capped pipelines](#capped-pipelines).
 
 `NESTED_LOOP_JOIN` uses the same port names and could take the identical fan-in treatment; leaving
 it unnominated preserves fall-back-to-waiting behaviour.

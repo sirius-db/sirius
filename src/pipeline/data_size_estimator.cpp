@@ -42,10 +42,12 @@ op::sirius_physical_operator::port* resolve_data_port(op::sirius_physical_operat
 }
 
 /// How many distinct data-carrying producer pipelines feed a pipeline, and (when there is
-/// exactly one) which. See @ref scan_producer_pipelines.
+/// exactly one) which. Also reports whether any operator caps the pipeline's output, since that
+/// falls out of the same walk. See @ref scan_producer_pipelines.
 struct producer_scan {
   std::size_t count      = 0;
   sirius_pipeline* first = nullptr;
+  bool output_capped     = false;
 };
 
 /**
@@ -69,6 +71,8 @@ producer_scan scan_producer_pipelines(sirius_pipeline& pipeline)
 
   auto collect_from = [&](op::sirius_physical_operator* candidate) {
     if (candidate == nullptr) { return; }
+    // Idempotent, so unlike the port count this needs no dedup against a second visit.
+    result.output_capped |= candidate->caps_pipeline_output();
     for (auto port_id : candidate->get_port_ids()) {
       auto* p = resolve_data_port(*candidate, port_id);
       if (p == nullptr) { continue; }
@@ -169,6 +173,11 @@ std::optional<data_size_estimate> estimate_output_bytes_impl(sirius_pipeline& pi
 
   auto const producers = scan_producer_pipelines(pipeline);
 
+  // A row limit caps output independently of input, so no measured ratio extrapolates through
+  // this pipeline: output stops growing once the cap binds, and the pipeline may then finish
+  // without its source draining. Only the finished case above can answer for it.
+  if (producers.output_capped) { return std::nullopt; }
+
   // 2. Fan-in: follow only the source's nominated primary input.
   //
   //    The recorded input_basis is unusable here: a STANDARD join pairs each probe batch with
@@ -228,13 +237,19 @@ std::optional<data_size_estimate> estimate_output_bytes_impl(sirius_pipeline& pi
         data_size_estimate{.bytes = *input_bytes, .exact = true, .hops = hops},
         options);
     }
-    // Already an output quantity — returned as-is. Scaling it by the pipeline ratio (which is
-    // derived from pre-filter input bytes) would double-count filter selectivity.
-    // The one planner-derived number in the design (GPU_SCAN's estimated_cardinality projection),
-    // so this is where the provenance flag originates.
-    if (auto output_bytes = source->total_source_output_bytes()) {
-      return data_size_estimate{
-        .bytes = *output_bytes, .exact = false, .hops = hops, .planner_derived = true};
+    // An output quantity for the *source*, which is the pipeline's output only when nothing
+    // follows it — get_operators() runs source..sink, so source == sink means a lone operator.
+    // With a FILTER, PROJECTION or DYNAMIC_FILTER in between there is no way to bridge the gap:
+    // the pipeline ratio's denominator is pre-filter input bytes, so scaling by it would count
+    // the scan's pushdown selectivity twice, and returning it unscaled would ignore the
+    // downstream operators entirely.
+    if (pipeline.get_sink().get() == source) {
+      // GPU_SCAN's estimated_cardinality projection, the one planner-derived number in the
+      // design, so this is where the provenance flag originates.
+      if (auto output_bytes = source->total_source_output_bytes()) {
+        return data_size_estimate{
+          .bytes = *output_bytes, .exact = false, .hops = hops, .planner_derived = true};
+      }
     }
     return std::nullopt;
   }

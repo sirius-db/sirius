@@ -727,6 +727,12 @@ class sirius_physical_operator {
   /// \brief check if this operator has exhausted its limit, allowing the pipeline to finish early
   virtual bool is_limit_exhausted() const { return false; }
 
+  /// \brief whether this operator caps its pipeline's output independently of how much input
+  /// arrives — a row limit. Unlike @ref is_limit_exhausted this is true from the start, since the
+  /// cap bounds the eventual total whether or not it has bound yet. The data size estimator
+  /// refuses to extrapolate a ratio through such a pipeline.
+  [[nodiscard]] virtual bool caps_pipeline_output() const { return false; }
+
   //! Get the input batch
   virtual std::unique_ptr<operator_data> get_next_task_input_data();
 

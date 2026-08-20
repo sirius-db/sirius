@@ -75,10 +75,13 @@ struct test_source_operator : sirius_physical_operator {
     return consumed_primary;
   }
 
+  [[nodiscard]] bool caps_pipeline_output() const override { return caps_output; }
+
   std::optional<std::size_t> input_total;
   std::optional<std::size_t> output_total;
   std::string primary_port;  ///< empty = nominates none
   std::optional<std::size_t> consumed_primary;
+  bool caps_output = false;  ///< stands in for a LIMIT in the pipeline
   /// Fires as the denominator is read. See the numerator/denominator ordering test.
   std::function<void()> on_consumed_read;
 };
@@ -144,6 +147,18 @@ class estimator_dag {
   static test_source_operator& source_of(test_pipeline& pipeline)
   {
     return static_cast<test_source_operator&>(*pipeline.get_source());
+  }
+
+  /// Give `pipeline` a sink distinct from its source, modelling a scan pipeline that also holds
+  /// a FILTER or PROJECTION. add() otherwise makes one operator serve as both ends.
+  test_source_operator& add_distinct_sink(test_pipeline& pipeline)
+  {
+    auto op = std::make_unique<test_source_operator>();
+    op->set_pipeline(shared_for(pipeline));
+    _bs.set_pipeline_sink(pipeline, sirius::optional_ptr<sirius_physical_operator>(op.get()), 0);
+    auto& ref = *op;
+    _ops.push_back(std::move(op));
+    return ref;
   }
 
  private:
@@ -409,6 +424,77 @@ TEST_CASE("data_size_estimator: an output-level source total bypasses the pipeli
   CHECK(est->bytes == 300 * kMiB);
   CHECK_FALSE(est->exact);
   CHECK(est->planner_derived);  // the output-level total is the scan's cardinality projection
+}
+
+TEST_CASE("data_size_estimator: an output-level source total is unusable when operators follow it",
+          "[data_size_estimator][estimation]")
+{
+  estimator_dag dag;
+  auto& producer                                  = dag.add();
+  estimator_dag::source_of(producer).output_total = 300 * kMiB;
+  record_ratio(producer, 100 * kMiB, 10 * kMiB);
+  // A FILTER or PROJECTION now sits between source and sink, so the source's output is no longer
+  // the pipeline's. Returning it unscaled would ignore that operator; scaling it by the ratio
+  // would count the scan's pushdown selectivity twice. Neither is an answer.
+  dag.add_distinct_sink(producer);
+
+  CHECK_FALSE(estimate_pipeline_total_output_bytes(producer).has_value());
+}
+
+TEST_CASE("data_size_estimator: a capped pipeline is not extrapolated while unfinished",
+          "[data_size_estimator][estimation]")
+{
+  estimator_dag dag;
+  auto& producer                                 = dag.add();
+  estimator_dag::source_of(producer).input_total = 1024 * kMiB;
+  record_ratio(producer, 100 * kMiB, 50 * kMiB);
+
+  auto before = estimate_pipeline_total_output_bytes(producer);
+  REQUIRE(before.has_value());
+  CHECK(before->bytes == 512 * kMiB);
+
+  // A LIMIT bounds output by a row count, so the pipeline stops emitting once the cap binds and
+  // may finish without its source draining. Projecting the whole source total through the ratio
+  // would overshoot by however much of the table the limit spares.
+  estimator_dag::source_of(producer).caps_output = true;
+  CHECK_FALSE(estimate_pipeline_total_output_bytes(producer).has_value());
+  // A cap is not a missing ratio, so the unit-ratio escape does not apply either.
+  CHECK_FALSE(estimate_pipeline_total_output_bytes(producer,
+                                                   size_estimate_options{
+                                                     .assume_unit_ratio = true,
+                                                   })
+                .has_value());
+}
+
+TEST_CASE("data_size_estimator: a finished capped pipeline still reports its measured output",
+          "[data_size_estimator][estimation]")
+{
+  estimator_dag dag;
+  auto& producer                                 = dag.add();
+  estimator_dag::source_of(producer).caps_output = true;
+  record_ratio(producer, 100 * kMiB, 10 * kMiB);
+  producer.finished = true;
+
+  auto est = estimate_pipeline_total_output_bytes(producer);
+  REQUIRE(est.has_value());
+  CHECK(est->bytes == 10 * kMiB);
+  CHECK(est->exact);
+}
+
+TEST_CASE("data_size_estimator: a cap anywhere in the chain stops the walk",
+          "[data_size_estimator][estimation]")
+{
+  estimator_dag dag;
+  auto& scan = dag.add();
+  auto& mid  = dag.add();
+  dag.connect(scan, mid);
+
+  estimator_dag::source_of(scan).input_total = 1024 * kMiB;
+  record_ratio(scan, 100 * kMiB, 100 * kMiB);
+  record_ratio(mid, 100 * kMiB, 50 * kMiB);
+  estimator_dag::source_of(mid).caps_output = true;
+
+  CHECK_FALSE(estimate_pipeline_total_output_bytes(mid).has_value());
 }
 
 TEST_CASE("data_size_estimator: a cardinality projection never falls below bytes emitted",

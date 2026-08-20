@@ -49,6 +49,8 @@ class sirius_physical_streaming_limit : public sirius_physical_operator {
     return _limit_exhausted.load(std::memory_order_acquire);
   }
 
+  [[nodiscard]] bool caps_pipeline_output() const override { return true; }
+
  private:
   // Shared atomic state for coordinating limit/offset across concurrent tasks.
   // Each task atomically claims rows to skip (offset) or produce (limit).
