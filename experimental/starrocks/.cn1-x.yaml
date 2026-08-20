@@ -1,0 +1,23 @@
+sirius:
+    topology:
+        num_gpus: 1
+    memory:
+        gpu:
+            usage_limit_bytes: "65GiB"
+            reservation_limit_fraction: 1.0
+            downgrade_trigger_fraction: 0.8
+            downgrade_stop_fraction: 0.6
+        host:
+            capacity_bytes: "200GiB"
+        disk:
+            disk_id: 0
+            capacity_bytes: 2000GB
+            downgrade_root_dirs: "/opt/dlami/nvme/sirius_spill/cn1"
+    operator_params:
+        hash_partition_bytes: 512MiB
+        max_build_hash_table_bytes: 1GiB
+        scan_task_batch_size: 512MiB
+        concat_batch_bytes: 512MiB
+    telemetry:
+        enable_quent: false
+        output_directory: ".cn1/telemetry"
