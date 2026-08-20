@@ -409,6 +409,51 @@ TEST_CASE("Sirius configuration rejects zero scan task batch bytes", "[sirius][c
                         Catch::Contains("greater than zero"));
 }
 
+TEST_CASE("Sirius configuration validates telemetry exporters before initialization",
+          "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+  auto const invalid       = data_dir / "invalid_telemetry_exporter.yaml";
+  sirius::sirius_config rejected;
+  auto const default_exporter = rejected.get_telemetry_config().exporter;
+  REQUIRE_THROWS_WITH(
+    rejected.load_from_file(invalid),
+    Catch::Contains("telemetry.exporter") && Catch::Contains("ndjson, msgpack, postcard"));
+  REQUIRE(rejected.get_telemetry_config().exporter == default_exporter);
+
+  for (auto const& [exporter, fixture] : std::array<std::pair<const char*, const char*>, 3>{{
+         {"ndjson", "valid_telemetry_exporter_ndjson.yaml"},
+         {"msgpack", "valid_telemetry_exporter_msgpack.yaml"},
+         {"postcard", "valid_telemetry_exporter_postcard.yaml"},
+       }}) {
+    sirius::sirius_config accepted;
+    REQUIRE_NOTHROW(accepted.load_from_file(data_dir / fixture));
+    REQUIRE(accepted.get_telemetry_config().exporter == exporter);
+  }
+}
+
+TEST_CASE("Sirius configuration rejects empty telemetry destination and identity",
+          "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+
+  for (auto const& [field, fixture] : std::array<std::pair<const char*, const char*>, 2>{{
+         {"output_directory", "invalid_telemetry_output_directory_empty.yaml"},
+         {"engine_name", "invalid_telemetry_engine_name_empty.yaml"},
+       }}) {
+    sirius::sirius_config config;
+    auto const default_output_directory = config.get_telemetry_config().output_directory;
+    auto const default_engine_name      = config.get_telemetry_config().engine_name;
+    REQUIRE_THROWS_WITH(
+      config.load_from_file(data_dir / fixture),
+      Catch::Contains("telemetry." + std::string(field)) && Catch::Contains("must not be empty"));
+    REQUIRE(config.get_telemetry_config().output_directory == default_output_directory);
+    REQUIRE(config.get_telemetry_config().engine_name == default_engine_name);
+  }
+}
+
 TEST_CASE("Sirius configuration rejects negative host capacity bytes", "[sirius][config]")
 {
   std::source_location loc = std::source_location::current();
