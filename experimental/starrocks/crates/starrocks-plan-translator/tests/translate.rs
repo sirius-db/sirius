@@ -3097,3 +3097,50 @@ fn a_limit_on_an_aggregation_fetches_above_its_having_filter() {
         panic!("expected the aggregate under the HAVING filter");
     };
 }
+
+/// A sorter carrying a payload tuple beyond the sort tuple is refused: only the first row tuple
+/// is translated, so the rest would vanish from the output row.
+#[test]
+fn sort_with_a_second_row_tuple_is_rejected() {
+    let mut sort = sort_node_with(-1, Some(0));
+    sort.row_tuples = vec![1, 2];
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![sort, scan_node(0, 0)])),
+        Some(sort_fetch_desc()),
+        None,
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(err, TranslateError::UnsupportedPlanNode { .. }),
+        "{err:?}"
+    );
+}
+
+/// StarRocks can fold a partial aggregation into the sorter; a Substrait sort has nowhere to put
+/// it, so the node is refused rather than translated as a plain sort over unaggregated rows.
+#[test]
+fn sort_with_a_pre_aggregation_payload_is_rejected() {
+    for with_slots in [false, true] {
+        let mut sort = sort_node_with(-1, Some(0));
+        let node = sort.sort_node.as_mut().unwrap();
+        if with_slots {
+            node.pre_agg_output_slot_id = Some(vec![1]);
+        } else {
+            node.pre_agg_exprs = Some(vec![aggregate_expr(
+                "sum",
+                scalar_type(TPrimitiveType::BIGINT),
+                Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+            )]);
+        }
+        let err = translate_fragment(&params(
+            Some(TPlan::new(vec![sort, scan_node(0, 0)])),
+            Some(sort_fetch_desc()),
+            None,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, TranslateError::UnsupportedPlanNode { .. }),
+            "with_slots={with_slots}: {err:?}"
+        );
+    }
+}

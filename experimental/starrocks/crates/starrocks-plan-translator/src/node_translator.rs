@@ -482,6 +482,32 @@ fn translate_sort(
             context: "SORT_NODE",
             field: "row_tuples",
         })?;
+    // A second row tuple means the sorter carries a payload the sort tuple does not describe.
+    // Only the first is translated, so the rest would be dropped from the output row.
+    if node.row_tuples.len() > 1 {
+        return Err(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "SORT_NODE with more than one row tuple is not supported",
+        });
+    }
+    // StarRocks can fold a partial aggregation into the sorter. Substrait's sort has nowhere to
+    // put it, so translating the node as a plain sort would return unaggregated rows.
+    if sort
+        .pre_agg_exprs
+        .as_ref()
+        .is_some_and(|exprs| !exprs.is_empty())
+        || sort
+            .pre_agg_output_slot_id
+            .as_ref()
+            .is_some_and(|slots| !slots.is_empty())
+    {
+        return Err(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "SORT_NODE with a pre-aggregation payload is not supported",
+        });
+    }
     // Partitioned top-N (per-partition limits) and rank-based top-N have no Substrait
     // representation here; a global sort would silently return the wrong row set.
     if sort
