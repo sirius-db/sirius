@@ -640,6 +640,26 @@ fn translate_hash_join(
             context: "HASH_JOIN_NODE",
             field: "hash_join_node",
         })?;
+    // Validated before the conjuncts so an unsupported op is reported as such, rather than as the
+    // missing conjuncts an anti join arrives with once the FE has folded its predicate away.
+    //
+    // Anti joins (from NOT IN / NOT EXISTS rewrites) are not translated: DuckDB's Substrait
+    // consumer has no left-anti conversion, so an emitted plan would fail downstream anyway.
+    let (join_type, semi) = match join.join_op {
+        TJoinOp::INNER_JOIN => (join_rel::JoinType::Inner, false),
+        TJoinOp::LEFT_OUTER_JOIN => (join_rel::JoinType::Left, false),
+        TJoinOp::RIGHT_OUTER_JOIN => (join_rel::JoinType::Right, false),
+        TJoinOp::FULL_OUTER_JOIN => (join_rel::JoinType::Outer, false),
+        TJoinOp::LEFT_SEMI_JOIN => (join_rel::JoinType::LeftSemi, true),
+        _ => {
+            return Err(TranslateError::UnsupportedPlanNode {
+                node_id: node.node_id,
+                node_type: node.node_type,
+                reason: "hash join type is unsupported",
+            });
+        }
+    };
+
     let mut children = children.into_iter();
     let left = children.next().unwrap();
     let right = children.next().unwrap();
@@ -676,23 +696,6 @@ fn translate_hash_join(
         node_type: node.node_type,
         reason: "hash join without join conjuncts",
     })?;
-
-    // Anti joins (from NOT IN / NOT EXISTS rewrites) are not translated: DuckDB's Substrait
-    // consumer has no left-anti conversion, so an emitted plan would fail downstream anyway.
-    let (join_type, semi) = match join.join_op {
-        TJoinOp::INNER_JOIN => (join_rel::JoinType::Inner, false),
-        TJoinOp::LEFT_OUTER_JOIN => (join_rel::JoinType::Left, false),
-        TJoinOp::RIGHT_OUTER_JOIN => (join_rel::JoinType::Right, false),
-        TJoinOp::FULL_OUTER_JOIN => (join_rel::JoinType::Outer, false),
-        TJoinOp::LEFT_SEMI_JOIN => (join_rel::JoinType::LeftSemi, true),
-        _ => {
-            return Err(TranslateError::UnsupportedPlanNode {
-                node_id: node.node_id,
-                node_type: node.node_type,
-                reason: "hash join type is unsupported",
-            });
-        }
-    };
 
     // Semi joins emit only the probe-side row; other joins emit probe then build columns.
     let (row_tuples, output_width) = if semi {

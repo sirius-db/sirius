@@ -2652,6 +2652,21 @@ fn anti_hash_join_is_rejected() {
     }
 }
 
+/// Verifies an unsupported join op is named as the reason even when the plan also carries no join
+/// conjuncts, which is the shape an anti join arrives in once the FE has folded its predicate away.
+#[test]
+fn unsupported_join_type_is_reported_before_missing_conjuncts() {
+    let mut join = hash_join_node(TJoinOp::LEFT_ANTI_JOIN);
+    join.hash_join_node.as_mut().unwrap().eq_join_conjuncts = vec![];
+    let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+
+    let err = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap_err();
+    let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
+        panic!("expected an unsupported plan node, got {err:?}");
+    };
+    assert_eq!(reason, "hash join type is unsupported");
+}
+
 /// Verifies decimal-typed arithmetic is rejected (it crashes the engine's GPU projection).
 #[test]
 fn decimal_arithmetic_is_rejected() {
