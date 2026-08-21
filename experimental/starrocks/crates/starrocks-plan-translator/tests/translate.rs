@@ -4240,3 +4240,39 @@ fn bare_cross_join_translates_to_constant_key_join() {
         .collect();
     assert_eq!(operands, vec![2, 4]);
 }
+
+/// Two splits that both cover the head of the file are refused. They "cover" every byte, so a
+/// sweep that only rejects gaps collapses them into one whole-file read — Sirius would scan the
+/// shared row groups once where StarRocks scans them on both instances, and `count(*)` would
+/// disagree with no error.
+#[test]
+fn overlapping_split_broker_ranges_are_unsupported() {
+    let path = "file:///data/users.parquet";
+    let mut fragment = params_with_scan_range(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        0,
+        broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 0, 1024, Some(1024)),
+    );
+    fragment
+        .params
+        .as_mut()
+        .unwrap()
+        .per_node_scan_ranges
+        .get_mut(&0)
+        .unwrap()
+        .push(TScanRangeParams::new(
+            broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 0, 512, Some(1024)),
+            None,
+            None,
+            None,
+        ));
+    let err = PlanTranslator::new()
+        .translate_fragment(&fragment)
+        .unwrap_err();
+    let TranslateError::UnsupportedScanRange { node_id, reason } = err else {
+        panic!("expected an unsupported scan range, got {err:?}");
+    };
+    assert_eq!(node_id, 0);
+    assert_eq!(reason, "byte-range splits do not tile the parquet file");
+}
