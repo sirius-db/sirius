@@ -99,10 +99,10 @@ struct valid_domain_coverage_threshold {
 constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
 /// Fuse `COUNT(col | *) GROUP BY <preserved-side join key>` over a LEFT/RIGHT integer equi-join
-/// into the DENSE_COUNT_JOIN operator (TPC-H q13 shape): instead of building a hash table over
-/// the counted side, materializing the join, and re-aggregating, the operator counts matches in
+/// into the DENSE_COUNT_JOIN operator. Instead of building a hash table over the counted side,
+/// materializing the join, and re-aggregating, the operator counts matches in
 /// a direct-address histogram over the preserved key domain [min, max] measured from the data.
-constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = true;
+constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = false;
 
 /// Cap on the combined direct-address histogram footprint (presence + counts arrays) of
 /// DENSE_COUNT_JOIN. A key domain too wide for this budget takes the operator's exact sparse
@@ -111,9 +111,10 @@ constexpr uint64_t DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES = 2ULL * 1024 * 1024 * 102
 
 }  // namespace config
 
-/// Operator parameters shared between planning and execution.
-/// User-tunable members can be set under sirius.operator_params in YAML or overridden with
-/// DuckDB SET commands; engine-owned query policy is noted below.
+/// Parameters controlling operator-level resource sizing.
+/// Public fields can be set under `sirius.operator_params` in YAML or with DuckDB SET unless
+/// documented as engine-owned. Engine-owned fields are rejected in YAML; any test-only SET hook
+/// is registered only when `SIRIUS_ENABLE_TEST_OPTIONS=1` is set during extension initialization.
 struct operator_params {
   /// Engine-owned query policy. The user-facing setting defaults to enabled, but an unwired
   /// execution context stays fail-closed until the engine snapshots the connection value.
@@ -193,11 +194,12 @@ struct operator_params {
   /// boundaries restore native carriers.
   bool enable_compressed_materialization = true;
 
-  /// Fuse COUNT-grouped-by-join-key outer equi-joins into DENSE_COUNT_JOIN (see
-  /// config::DEFAULT_ENABLE_DENSE_COUNT_JOIN).
+  /// Experimental production opt-in for fusing COUNT-grouped-by-join-key outer equi-joins into
+  /// DENSE_COUNT_JOIN. Accepted in YAML as `enable_dense_count_join`; test builds also expose a
+  /// session override. See config::DEFAULT_ENABLE_DENSE_COUNT_JOIN.
   bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;
 
-  /// Direct-address histogram budget for DENSE_COUNT_JOIN (see
+  /// Engine-owned, test-only direct-address histogram budget for DENSE_COUNT_JOIN (see
   /// config::DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES).
   uint64_t dense_count_join_max_bytes = config::DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES;
 

@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <vector>
@@ -179,9 +180,18 @@ class pipeline_memory_history {
       weight_sum += weight;
     }
 
-    double avg_ratio = weighted_ratio_sum / weight_sum;
+    double const avg_ratio = weighted_ratio_sum / weight_sum;
 
-    return static_cast<std::size_t>(static_cast<double>(estimated_bytes) * avg_ratio);
+    double const scaled_estimate = static_cast<double>(estimated_bytes) * avg_ratio;
+    // Floating-to-integer conversion is only defined for values representable by the target.
+    if (!(scaled_estimate > 0.0)) { return 0; }
+
+    constexpr auto max_size = std::numeric_limits<std::size_t>::max();
+    if (!std::isfinite(scaled_estimate) || scaled_estimate >= static_cast<double>(max_size)) {
+      return max_size;
+    }
+
+    return static_cast<std::size_t>(scaled_estimate);
   }
 
   /**

@@ -32,6 +32,7 @@
 #include "op/sirius_physical_operator_type.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "pipeline/repository_wiring.hpp"
+#include "sirius/exception.hpp"
 
 #include <algorithm>
 #include <functional>
@@ -199,9 +200,18 @@ std::string_view sirius_pipeline_converter::resolve_port_id(
   // DENSE_COUNT_JOIN takes both children directly (no CONCAT wrap): the preserved subtree
   // (children[0]) feeds "preserved", the counted subtree (children[1]) feeds "counted".
   if (parent.type == T::DENSE_COUNT_JOIN) {
-    return (!parent.children.empty() && parent.children[0].get() == &sink)
-             ? op::sirius_physical_dense_count_join::PRESERVED_PORT
-             : op::sirius_physical_dense_count_join::COUNTED_PORT;
+    if (parent.children.size() != 2) {
+      throw sirius::internal_exception(
+        "DENSE_COUNT_JOIN repository wiring requires exactly two children");
+    }
+    if (parent.children[0].get() == &sink) {
+      return op::sirius_physical_dense_count_join::PRESERVED_PORT;
+    }
+    if (parent.children[1].get() == &sink) {
+      return op::sirius_physical_dense_count_join::COUNTED_PORT;
+    }
+    throw sirius::internal_exception(
+      "DENSE_COUNT_JOIN repository wiring source is not a direct child");
   }
   return "default";
 }
@@ -210,6 +220,18 @@ op::MemoryBarrierType sirius_pipeline_converter::resolve_barrier(
   const op::sirius_physical_operator& sink, const sirius_pipeline& dest)
 {
   using T = op::SiriusPhysicalOperatorType;
+  // The current implementation constructs both histograms and emits the result in one task,
+  // so both direct inputs must be complete before it is scheduled.
+  auto dense = dest.get_source();
+  if (!dense || dense->type != T::DENSE_COUNT_JOIN) { dense = dest.get_sink(); }
+  if (dense && dense->type == T::DENSE_COUNT_JOIN) {
+    auto const port = resolve_port_id(sink, *dense);
+    if (port != op::sirius_physical_dense_count_join::PRESERVED_PORT &&
+        port != op::sirius_physical_dense_count_join::COUNTED_PORT) {
+      throw sirius::internal_exception("DENSE_COUNT_JOIN resolved an unknown input port");
+    }
+    return op::MemoryBarrierType::FULL;
+  }
   // Sort sinks process batches as they arrive. GPU_SCAN is intentionally excluded
   // (legacy gives it FULL/PARTIAL, not PIPELINE); SORT_SAMPLE is never a pipeline
   // sink (it runs as an intermediate in the SORT_PARTITION pipeline).

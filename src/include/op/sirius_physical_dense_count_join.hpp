@@ -26,7 +26,7 @@ namespace sirius::op {
 
 /**
  * @brief Input container for DENSE_COUNT_JOIN: the first @ref num_preserved_batches batches are
- * the preserved (outer, grouped) side, the rest are the counted (streamed) side.
+ * the preserved (outer, grouped) side, and the rest are the counted side.
  */
 class dense_count_join_input : public pipelineable_operator_data {
  public:
@@ -54,14 +54,15 @@ class dense_count_join_input : public pipelineable_operator_data {
  *   HASH_GROUP_BY(groups = [preserved-side join key], aggregates = [COUNT(counted-side col)
  *   or COUNT(*)]) over LEFT/RIGHT LogicalComparisonJoin(single integer equality condition)
  * detected by `sirius_physical_plan_generator::try_plan_dense_count_join`. Children are
- * normalized: children[0] = preserved side (the outer-preserved, grouped input, e.g. TPC-H q13
- * customer), children[1] = counted side (the other input, e.g. filtered orders).
+ * normalized: children[0] = preserved side (the outer-preserved, grouped input), children[1] =
+ * counted side (the other input, which may contain a pushed-down filter).
  *
  * Both input ports are FULL barriers; a single task drains both sides once both child pipelines
  * finish and picks one of two exact execution strategies from the ACTUAL preserved-side key
- * min/max (never from estimates):
+ * min/max and input size (never from estimates):
  *  - **dense**: two direct-address histograms over [min, max] (see `dense_count_state`) when
- *    the histogram bytes fit `dense_count_join_max_bytes` — the q13 fast path;
+ *    the range is sufficiently dense and the combined histogram bytes fit both the configured
+ *    histogram budget and a multiple of the input size — the dense direct-address fast path;
  *  - **sparse**: eager aggregation via cuDF (per-batch groupby-count partials, merge, left join
  *    of the distinct preserved keys against the counted aggregate) when the key range is too
  *    wide for a direct-address array.
@@ -88,8 +89,8 @@ class sirius_physical_dense_count_join : public sirius_physical_operator {
    * @param counted_value_idx COUNT(col) argument column index within the counted child's
    *        output (its validity mask supplies the exact COUNT NULL semantics), or std::nullopt
    *        for COUNT(*).
-   * @param max_bins_bytes Cap on the combined direct-address histogram size; a wider actual
-   *        key range takes the sparse strategy instead.
+   * @param max_bins_bytes Cap on the combined direct-address histogram size. The runtime gate
+   *        also rejects ranges that are sparse relative to the actual rows or input bytes.
    */
   sirius_physical_dense_count_join(duckdb::vector<sirius::logical_type> types,
                                    std::size_t estimated_cardinality,
@@ -118,7 +119,7 @@ class sirius_physical_dense_count_join : public sirius_physical_operator {
   /// computes the whole aggregate).
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
-  /// Histograms (bounded by the knob) + output table; input bytes are charged separately.
+  /// Proportional first-run estimate for the strategy predicted from child cardinalities.
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const input_stats& stats) const override;
 

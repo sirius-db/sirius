@@ -1,0 +1,49 @@
+# TPC-H SF1000 performance configuration. Run benchmarks from the repository root and pass
+# this file explicitly with --config; the relative paths below resolve from the process CWD.
+sirius:
+  topology:
+    num_gpus: 1
+  executor:
+    pipeline:
+      num_threads: 8
+    task_creator:
+      num_threads: 4
+    downgrade:
+      num_threads: 1
+    scan_manager:
+      memory_prefetcher:
+        enable: true
+        num_threads: 3
+      num_threads: 18
+      use_sirius_datasource: true
+      uring_n_reactors: 4
+      enable_prefetch_cache: false
+  operator_params:
+    enable_dense_count_join: true
+    scan_task_batch_size: 8GB
+    max_sort_partition_bytes: 0
+    hash_partition_bytes: 32GB
+    concat_batch_bytes: 5GB
+    max_build_hash_table_bytes: 32GB
+  memory:
+    gpu:
+      usage_limit_fraction: 0.95
+      reservation_limit_fraction: 1.0
+      downgrade_trigger_fraction: 0.9
+      downgrade_stop_fraction: 0.85
+    host:
+      capacity_bytes: 471200000000
+      initial_number_pools: 392
+      pool_size: 8
+      block_size: 67108864
+    disk:
+      disk_id: 0
+      capacity_bytes: 1000000000000
+      downgrade_root_dirs: /tmp/sirius_disk_memory
+  compression:
+    enable_pin_table_compression: true
+    input_plan_dir: src/compression/simpatico_codegen/plans/tpch_sf1000
+  telemetry:
+    enable_quent: true
+    output_directory: telemetry_data/tpch_sf1000
+    engine_name: siriusDB

@@ -2,5 +2,4 @@ sirius:
   topology:
     num_gpus: 1
   operator_params:
-    enable_dense_count_join: false
     dense_count_join_max_bytes: 64MiB

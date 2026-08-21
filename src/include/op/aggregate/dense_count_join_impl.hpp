@@ -27,8 +27,21 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <utility>
+#include <vector>
 
 namespace sirius::op {
+
+/**
+ * @brief Find the global non-NULL extrema of integer key batches.
+ *
+ * Batch reductions and extrema merging stay on @p stream. The implementation performs one
+ * two-value device-to-host transfer after every batch reduction has been enqueued.
+ */
+std::optional<std::pair<int64_t, int64_t>> dense_count_global_minmax(
+  std::vector<cudf::column_view> const& keys,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
 
 /**
  * @brief Device-side state for the dense direct-address count-join fast path.
@@ -59,7 +72,7 @@ class dense_count_state {
    *
    * @param min_key Smallest non-NULL preserved-side key (array offset origin).
    * @param range   Number of slots: max_key - min_key + 1. Must be > 0.
-   * @param wide    Use 64-bit slots (required when either side has >= 2^32 rows).
+   * @param wide    Use 64-bit slots (selected when either side has at least `UINT32_MAX` rows).
    * @param stream  Stream for allocation and the zeroing memsets.
    * @param mr      Device memory resource for the histograms.
    */
@@ -101,13 +114,16 @@ class dense_count_state {
    * @param count_star COUNT(*) semantics (see class comment) instead of COUNT(col).
    * @param null_group_rows Number of NULL-key preserved rows; > 0 appends the NULL group whose
    *        value is `null_group_rows` for COUNT(*) and 0 for COUNT(col).
+   * @param check_product_overflow Whether to validate the rare case where the host row-count
+   *        upper bound cannot prove every output COUNT fits in BIGINT.
    * @return Two-column table [key (key_type), value (INT64)].
    */
   std::unique_ptr<cudf::table> emit(cudf::data_type key_type,
                                     bool count_star,
                                     int64_t null_group_rows,
                                     rmm::cuda_stream_view stream,
-                                    rmm::device_async_resource_ref mr) const;
+                                    rmm::device_async_resource_ref mr,
+                                    bool check_product_overflow) const;
 
   [[nodiscard]] int64_t min_key() const noexcept { return _min_key; }
   [[nodiscard]] int64_t range() const noexcept { return _range; }
@@ -135,5 +151,16 @@ std::unique_ptr<cudf::table> dense_count_empty_output(cudf::data_type key_type,
                                                       int64_t null_group_rows,
                                                       rmm::cuda_stream_view stream,
                                                       rmm::device_async_resource_ref mr);
+
+/**
+ * @brief Throw when any pairwise product of two nonnegative INT64 columns exceeds BIGINT.
+ *
+ * This reads a device flag back to the host. Callers should invoke it only after a cheap
+ * row-count upper bound cannot prove that every product fits.
+ */
+void throw_if_count_product_overflows(cudf::column_view const& lhs,
+                                      cudf::column_view const& rhs,
+                                      rmm::cuda_stream_view stream,
+                                      rmm::device_async_resource_ref mr);
 
 }  // namespace sirius::op

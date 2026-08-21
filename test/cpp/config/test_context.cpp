@@ -279,6 +279,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "scan_task_batch_size") == 0);
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 0);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 0);
+    REQUIRE(setting_count(con, "enable_dense_count_join") == 0);
+    REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
     REQUIRE(result != nullptr);
@@ -301,6 +303,12 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     result = con.Query("SET enable_runtime_distinct_build_probe = true");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
+    result = con.Query("SET enable_dense_count_join = false");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    result = con.Query("SET dense_count_join_max_bytes = 1024");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
     result = con.Query("SET concat_batch_bytes = 1048576");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
@@ -317,6 +325,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "scan_task_batch_size") == 0);
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 0);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 0);
+    REQUIRE(setting_count(con, "enable_dense_count_join") == 0);
+    REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
   }
 
@@ -331,6 +341,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "scan_task_batch_size") == 1);
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 1);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 1);
+    REQUIRE(setting_count(con, "enable_dense_count_join") == 1);
+    REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 1);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 1);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
     REQUIRE(result != nullptr);
@@ -369,6 +381,22 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     result = con.Query("RESET enable_runtime_distinct_build_probe");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET enable_dense_count_join = false");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("RESET enable_dense_count_join");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET dense_count_join_max_bytes = 1024");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET dense_count_join_max_bytes = 0");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    REQUIRE_THAT(result->GetError(), Catch::Contains("must be greater than zero"));
+    result = con.Query("RESET dense_count_join_max_bytes");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     result = con.Query("SET concat_batch_bytes = 1048576");
@@ -1837,62 +1865,30 @@ TEST_CASE("Per-connection state isolates and expires the transparent capture",
   REQUIRE(conn_state->take_captured_plan_if_current() == nullptr);
 }
 
-TEST_CASE("Sirius configuration parses and validates dense count join knobs", "[sirius][config]")
+TEST_CASE("Sirius configuration exposes a bounded dense count join YAML opt-in", "[sirius][config]")
 {
   std::source_location loc = std::source_location::current();
   auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
 
-  {
-    sirius::sirius_config config;
-    REQUIRE_NOTHROW(config.load_from_file(data_dir / "valid_dense_count_join_params.yaml"));
-    REQUIRE_FALSE(config.get_operator_params().enable_dense_count_join);
-    REQUIRE(config.get_operator_params().dense_count_join_max_bytes == 64ULL * 1024 * 1024);
-  }
-  {
-    // Defaults when the keys are absent.
-    sirius::sirius_config config;
-    REQUIRE(config.get_operator_params().enable_dense_count_join ==
-            sirius::config::DEFAULT_ENABLE_DENSE_COUNT_JOIN);
-    REQUIRE(config.get_operator_params().dense_count_join_max_bytes ==
-            sirius::config::DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES);
-  }
-  {
-    sirius::sirius_config config;
-    REQUIRE_THROWS_WITH(
-      config.load_from_file(data_dir / "invalid_dense_count_join_max_bytes_zero.yaml"),
-      Catch::Contains("dense_count_join_max_bytes") &&
-        Catch::Contains("must be greater than zero"));
-  }
-}
+  sirius::sirius_config defaults;
+  REQUIRE_FALSE(defaults.get_operator_params().enable_dense_count_join);
+  REQUIRE_FALSE(sirius::config::DEFAULT_ENABLE_DENSE_COUNT_JOIN);
 
-TEST_CASE(
-  "DuckDB setting rejects a zero dense count join histogram budget without a Sirius "
-  "context",
-  "[sirius][context][config][isolated_context]")
-{
-  finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
-  setenv("SIRIUS_DISABLE", "1", 1);
+  sirius::sirius_config enabled;
+  REQUIRE_NOTHROW(enabled.load_from_file(data_dir / "valid_dense_count_join_opt_in.yaml"));
+  REQUIRE(enabled.get_operator_params().enable_dense_count_join);
+  REQUIRE(enabled.get_operator_params().dense_count_join_max_bytes ==
+          sirius::config::DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES);
 
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
+  sirius::sirius_config invalid_type;
+  REQUIRE_THROWS_WITH(
+    invalid_type.load_from_file(data_dir / "invalid_dense_count_join_enable_type.yaml"),
+    Catch::Contains("operator_params.enable_dense_count_join") &&
+      Catch::Contains("bad conversion"));
 
-  auto result = con.Query("SET dense_count_join_max_bytes = 0");
-  REQUIRE(result != nullptr);
-  REQUIRE(result->HasError());
-  REQUIRE_THAT(result->GetError(),
-               Catch::Contains("dense_count_join_max_bytes must be greater than zero"));
-
-  // Valid values and the enable knob round-trip through current_setting.
-  auto set_bytes = con.Query("SET dense_count_join_max_bytes = 1024");
-  REQUIRE_FALSE(set_bytes->HasError());
-  auto set_enable = con.Query("SET enable_dense_count_join = false");
-  REQUIRE_FALSE(set_enable->HasError());
-  auto readback = con.Query(R"(
-    SELECT
-      current_setting('dense_count_join_max_bytes')::UBIGINT,
-      current_setting('enable_dense_count_join')::BOOLEAN
-  )");
-  REQUIRE_FALSE(readback->HasError());
-  REQUIRE(readback->GetValue(0, 0).GetValue<uint64_t>() == 1024);
-  REQUIRE_FALSE(readback->GetValue(1, 0).GetValue<bool>());
+  sirius::sirius_config invalid_budget;
+  REQUIRE_THROWS_WITH(
+    invalid_budget.load_from_file(data_dir / "invalid_dense_count_join_engine_policy.yaml"),
+    Catch::Contains("sirius.operator_params.dense_count_join_max_bytes") &&
+      Catch::Contains("internal engine policy") && Catch::Contains("remove this key"));
 }

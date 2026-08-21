@@ -26,12 +26,16 @@
 #include "helper/type_conversions.hpp"
 #include "operator_test_utils.hpp"
 
+#include <rmm/cuda_stream.hpp>
+
 #include <catch.hpp>
 #include <op/aggregate/dense_count_join_impl.hpp>
 #include <op/sirius_physical_dense_count_join.hpp>
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -54,7 +58,8 @@ std::vector<group_row> run_dense_count_join(
   const std::vector<std::shared_ptr<cucascade::data_batch>>& counted_batches,
   std::optional<std::size_t> counted_value_idx,
   uint64_t max_bins_bytes,
-  sirius_physical_dense_count_join::strategy expected_strategy)
+  sirius_physical_dense_count_join::strategy expected_strategy,
+  rmm::cuda_stream_view stream = cudf::get_default_stream())
 {
   duckdb::vector<duckdb::LogicalType> types;
   types.push_back(duckdb::LogicalType(key_logical_type));
@@ -71,7 +76,8 @@ std::vector<group_row> run_dense_count_join(
   batches.insert(batches.end(), counted_batches.begin(), counted_batches.end());
   dense_count_join_input input(std::move(batches), preserved_batches.size());
 
-  auto output = op.execute(input, cudf::get_default_stream());
+  auto output = op.execute(input, stream);
+  stream.synchronize();
   REQUIRE(op.last_strategy() == expected_strategy);
 
   auto const& out_batches =
@@ -338,10 +344,12 @@ TEST_CASE("dense_count_join: duplicate keys across batches accumulate on both si
   // merge sums match counts).
   std::vector<std::shared_ptr<cucascade::data_batch>> preserved{
     make_numeric_batch<int32_t>(*space, {1, 2}, cudf::type_id::INT32),
-    make_numeric_batch<int32_t>(*space, {2, 3}, cudf::type_id::INT32)};
+    make_numeric_batch<int32_t>(*space, {2}, cudf::type_id::INT32),
+    make_numeric_batch<int32_t>(*space, {3}, cudf::type_id::INT32)};
   std::vector<std::shared_ptr<cucascade::data_batch>> counted{
     make_numeric_batch<int32_t>(*space, {2}, cudf::type_id::INT32),
-    make_numeric_batch<int32_t>(*space, {2, 3}, cudf::type_id::INT32)};
+    make_numeric_batch<int32_t>(*space, {2}, cudf::type_id::INT32),
+    make_numeric_batch<int32_t>(*space, {3}, cudf::type_id::INT32)};
 
   // presence(2)=2, matched(2)=2 -> 4; presence(3)=1, matched(3)=1 -> 1; key 1 unmatched -> 0.
   const std::vector<group_row> expected{{1, 0}, {2, 4}, {3, 1}};
@@ -383,11 +391,215 @@ TEST_CASE("dense_count_join: wide (u64) histogram slots match the u32 result", "
                             /*count_star=*/false,
                             /*null_group_rows=*/0,
                             stream,
-                            mr);
+                            mr,
+                            /*check_product_overflow=*/false);
     auto const keys   = copy_column_to_host<int32_t>(table->view().column(0));
     auto const counts = copy_column_to_host<int64_t>(table->view().column(1));
     REQUIRE(keys == std::vector<int32_t>{5, 6, 8});
     // presence(6)=2 x matched(6)=3 -> 6; 5 and 8 exist with zero matches.
     REQUIRE(counts == std::vector<int64_t>{0, 6, 0});
   }
+}
+
+TEST_CASE("dense_count_join: runtime density and input-cost gates", "[dense_count_join]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space);
+
+  SECTION("tiny contiguous domain remains dense")
+  {
+    std::vector<std::shared_ptr<cucascade::data_batch>> preserved{
+      make_numeric_batch<int32_t>(*space, {3, 4}, cudf::type_id::INT32)};
+    auto rows = run_dense_count_join<int32_t>(*space,
+                                              duckdb::LogicalTypeId::INTEGER,
+                                              preserved,
+                                              {},
+                                              std::size_t{0},
+                                              k_default_max_bytes,
+                                              sirius_physical_dense_count_join::strategy::DENSE);
+    REQUIRE((rows == std::vector<group_row>{{3, 0}, {4, 0}}));
+  }
+
+  SECTION("within-budget but sparse domain avoids a disproportionate histogram")
+  {
+    std::vector<std::shared_ptr<cucascade::data_batch>> preserved{
+      make_numeric_batch<int32_t>(*space, {0, 100}, cudf::type_id::INT32)};
+    std::vector<std::shared_ptr<cucascade::data_batch>> counted{
+      make_numeric_batch<int32_t>(*space, {0}, cudf::type_id::INT32)};
+    auto rows = run_dense_count_join<int32_t>(*space,
+                                              duckdb::LogicalTypeId::INTEGER,
+                                              preserved,
+                                              counted,
+                                              std::size_t{0},
+                                              k_default_max_bytes,
+                                              sirius_physical_dense_count_join::strategy::SPARSE);
+    REQUIRE((rows == std::vector<group_row>{{0, 1}, {100, 0}}));
+  }
+}
+
+TEST_CASE("dense_count_join: all-NULL batches merge extrema on a non-default stream",
+          "[dense_count_join]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space);
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> preserved{
+    make_numeric_batch_with_nulls<int32_t>(
+      *space, {0, 0, 0}, {false, false, false}, cudf::type_id::INT32),
+    make_numeric_batch<int32_t>(*space, {4, 5}, cudf::type_id::INT32)};
+  std::vector<std::shared_ptr<cucascade::data_batch>> counted{
+    make_numeric_batch<int32_t>(*space, {4, 4}, cudf::type_id::INT32)};
+
+  // The direct operator-test path does not run task input preparation, so order batch creation
+  // before deliberately executing the operator on another stream.
+  cudf::get_default_stream().synchronize();
+  rmm::cuda_stream stream;
+  auto rows = run_dense_count_join<int32_t>(*space,
+                                            duckdb::LogicalTypeId::INTEGER,
+                                            preserved,
+                                            counted,
+                                            std::size_t{0},
+                                            k_default_max_bytes,
+                                            sirius_physical_dense_count_join::strategy::DENSE,
+                                            stream.view());
+  REQUIRE((rows == std::vector<group_row>{{std::nullopt, 0}, {4, 2}, {5, 0}}));
+}
+
+TEST_CASE("dense_count_join: extreme INT64 domain takes exact sparse path", "[dense_count_join]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space);
+
+  auto const min = std::numeric_limits<int64_t>::min();
+  auto const max = std::numeric_limits<int64_t>::max();
+  std::vector<std::shared_ptr<cucascade::data_batch>> preserved{
+    make_numeric_batch<int64_t>(*space, {min, max}, cudf::type_id::INT64)};
+  std::vector<std::shared_ptr<cucascade::data_batch>> counted{
+    make_numeric_batch<int64_t>(*space, {min}, cudf::type_id::INT64)};
+
+  auto rows = run_dense_count_join<int64_t>(*space,
+                                            duckdb::LogicalTypeId::BIGINT,
+                                            preserved,
+                                            counted,
+                                            std::size_t{0},
+                                            k_default_max_bytes,
+                                            sirius_physical_dense_count_join::strategy::SPARSE);
+  REQUIRE((rows == std::vector<group_row>{{min, 1}, {max, 0}}));
+}
+
+TEST_CASE("dense_count_join rejects malformed batch metadata with diagnostics",
+          "[dense_count_join][validation]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space);
+  auto batch = make_numeric_batch<int32_t>(*space, {1, 2}, cudf::type_id::INT32);
+
+  auto make_operator = [](std::size_t preserved_key_idx,
+                          std::size_t counted_key_idx,
+                          std::optional<std::size_t> counted_value_idx) {
+    duckdb::vector<duckdb::LogicalType> types;
+    types.push_back(duckdb::LogicalType::INTEGER);
+    types.push_back(duckdb::LogicalType::BIGINT);
+    return std::make_unique<sirius_physical_dense_count_join>(sirius::from_duckdb_vec(types),
+                                                              /*estimated_cardinality=*/2,
+                                                              preserved_key_idx,
+                                                              counted_key_idx,
+                                                              counted_value_idx,
+                                                              k_default_max_bytes);
+  };
+
+  SECTION("preserved-batch count cannot exceed the total batch count")
+  {
+    auto op = make_operator(0, 0, std::nullopt);
+    dense_count_join_input input({batch}, /*num_preserved_batches=*/2);
+    REQUIRE_THROWS_WITH(op->execute(input, default_stream()),
+                        Catch::Contains("marks 2 preserved batches but contains only 1"));
+  }
+
+  SECTION("preserved key index is checked before narrowing")
+  {
+    auto op = make_operator(1, 0, std::nullopt);
+    dense_count_join_input input({batch}, /*num_preserved_batches=*/1);
+    REQUIRE_THROWS_WITH(op->execute(input, default_stream()),
+                        Catch::Contains("preserved key column index 1 is out of range"));
+  }
+
+  SECTION("COUNT argument index is checked before narrowing")
+  {
+    auto op = make_operator(0, 0, std::size_t{1});
+    dense_count_join_input input({batch}, /*num_preserved_batches=*/0);
+    REQUIRE_THROWS_WITH(op->execute(input, default_stream()),
+                        Catch::Contains("COUNT argument column index 1 is out of range"));
+  }
+}
+
+TEST_CASE("dense_count_join first-run estimate is proportional and saturates",
+          "[dense_count_join][no_history_peak_memory_estimate]")
+{
+  constexpr std::size_t allocation_floor = 1024 * 1024;
+  duckdb::vector<duckdb::LogicalType> types;
+  types.push_back(duckdb::LogicalType::INTEGER);
+  types.push_back(duckdb::LogicalType::BIGINT);
+
+  constexpr uint64_t histogram_budget = 2ULL * 1024 * 1024 * 1024;
+  sirius_physical_dense_count_join op(sirius::from_duckdb_vec(types),
+                                      /*estimated_cardinality=*/2,
+                                      /*preserved_key_idx=*/0,
+                                      /*counted_key_idx=*/0,
+                                      /*counted_value_idx=*/std::nullopt,
+                                      histogram_budget);
+  CHECK(op.max_bins_bytes() == histogram_budget);
+  auto const tiny_estimate = op.no_history_peak_memory_estimate({1, 8});
+  CHECK(tiny_estimate >= allocation_floor);
+  CHECK(tiny_estimate < 2 * allocation_floor);
+  CHECK(tiny_estimate < histogram_budget);
+
+  duckdb::vector<duckdb::LogicalType> sparse_types;
+  sparse_types.push_back(duckdb::LogicalType::INTEGER);
+  sparse_types.push_back(duckdb::LogicalType::BIGINT);
+  sirius_physical_dense_count_join sparse(sirius::from_duckdb_vec(sparse_types),
+                                          /*estimated_cardinality=*/100,
+                                          /*preserved_key_idx=*/0,
+                                          /*counted_key_idx=*/0,
+                                          /*counted_value_idx=*/std::nullopt,
+                                          /*max_bins_bytes=*/8);
+  CHECK(sparse.no_history_peak_memory_estimate({2, 100}) == allocation_floor + 16 * 100);
+  CHECK(sparse.no_history_peak_memory_estimate({2, std::numeric_limits<std::size_t>::max()}) ==
+        std::numeric_limits<std::size_t>::max());
+}
+
+TEST_CASE("dense_count_join rejects histogram allocation arithmetic overflow",
+          "[dense_count_join][validation]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space);
+
+  REQUIRE_THROWS_WITH(dense_count_state(/*min_key=*/0,
+                                        std::numeric_limits<int64_t>::max(),
+                                        /*wide=*/true,
+                                        default_stream(),
+                                        get_resource_ref(*space)),
+                      Catch::Contains("exceeds size_t allocation capacity"));
+}
+
+TEST_CASE("dense_count_join exact rare-path BIGINT product validation",
+          "[dense_count_join][validation]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space);
+  auto const stream = default_stream();
+  auto const mr     = get_resource_ref(*space);
+
+  auto lhs = make_numeric_batch<int64_t>(
+    *space, {std::numeric_limits<int64_t>::max(), 4}, cudf::type_id::INT64);
+  auto safe_rhs     = make_numeric_batch<int64_t>(*space, {1, 2}, cudf::type_id::INT64);
+  auto overflow_rhs = make_numeric_batch<int64_t>(*space, {2, 2}, cudf::type_id::INT64);
+
+  auto const lhs_view          = sirius::get_cudf_table_view(*lhs).column(0);
+  auto const safe_rhs_view     = sirius::get_cudf_table_view(*safe_rhs).column(0);
+  auto const overflow_rhs_view = sirius::get_cudf_table_view(*overflow_rhs).column(0);
+
+  REQUIRE_NOTHROW(throw_if_count_product_overflows(lhs_view, safe_rhs_view, stream, mr));
+  REQUIRE_THROWS_WITH(throw_if_count_product_overflows(lhs_view, overflow_rhs_view, stream, mr),
+                      Catch::Contains("COUNT result exceeds BIGINT max"));
 }

@@ -296,10 +296,10 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("enable_pinned_zone_map_pruning", opt.enable_pinned_zone_map_pruning);
   r.optional("enable_compressed_materialization", opt.enable_compressed_materialization);
   r.optional("enable_dense_count_join", opt.enable_dense_count_join);
-  r.optional("dense_count_join_max_bytes", yaml::bytes(opt.dense_count_join_max_bytes));
-  if (opt.dense_count_join_max_bytes == 0) {
+  if (r.has("dense_count_join_max_bytes")) {
     throw std::runtime_error(
-      "'operator_params.dense_count_join_max_bytes': must be greater than zero");
+      "'sirius.operator_params.dense_count_join_max_bytes': removed; dense count-join histogram "
+      "sizing is an internal engine policy; remove this key");
   }
   // 0 is meaningful here: it turns the estimate off and leaves sizing to gpus_per_query.
   r.optional("admission_bytes_per_gpu", yaml::bytes(opt.admission_bytes_per_gpu));

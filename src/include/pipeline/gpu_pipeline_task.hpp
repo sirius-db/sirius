@@ -17,6 +17,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_itask.hpp"
@@ -28,8 +29,10 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace sirius {
@@ -90,6 +93,38 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
   /// Task ID of the original (non-retried) task; only meaningful when retry_count > 0.
   std::optional<uint64_t> original_task_id = std::nullopt;
 
+  /// Request-size fallback used when an OOM does not expose the failed allocation size.
+  static constexpr std::size_t kDefaultRetryRequestBytes = 1024 * 1024;
+
+  /**
+   * @brief Raise the total reservation floor after an out-of-memory failure.
+   *
+   * The next attempt must make useful progress beyond the failed reservation while
+   * also covering the allocation that was live plus the failed request.
+   */
+  void update_retry_reservation_floor_after_oom(std::size_t current_reservation_bytes,
+                                                std::size_t live_allocated_bytes,
+                                                std::optional<std::size_t> requested_bytes) noexcept
+  {
+    auto const request_bytes = requested_bytes.value_or(kDefaultRetryRequestBytes);
+    auto next_floor          = memory::saturating_mul(current_reservation_bytes, 2);
+    next_floor = std::max(next_floor, memory::saturating_add(live_allocated_bytes, request_bytes));
+    next_floor = std::max(next_floor, kDefaultRetryRequestBytes);
+    _retry_reservation_floor = std::max(_retry_reservation_floor, next_floor);
+  }
+
+  /** @brief Preserve a previous attempt's reservation floor on reschedule. */
+  void inherit_retry_reservation_floor(const gpu_pipeline_task_local_state& previous) noexcept
+  {
+    _retry_reservation_floor =
+      std::max(_retry_reservation_floor, previous._retry_reservation_floor);
+  }
+
+  [[nodiscard]] std::size_t get_retry_reservation_floor() const noexcept
+  {
+    return _retry_reservation_floor;
+  }
+
   [[nodiscard]] std::size_t get_task_consumption_basis() const override
   {
     if (_reservation_size_info) { return _reservation_size_info->input_basis; }
@@ -111,7 +146,8 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
     const cucascade::memory::memory_space* target_space) const;
 
  private:
-  std::optional<int> _preferred_device_id;  ///< Preferred GPU device based on data locality
+  std::optional<int> _preferred_device_id;   ///< Preferred GPU device based on data locality
+  std::size_t _retry_reservation_floor = 0;  ///< Minimum total reservation for the next attempt
 };
 
 /**

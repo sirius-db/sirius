@@ -33,6 +33,7 @@ class DenseCountJoinFixture : public sirius::test::GpuExecutionFixture {
  public:
   DenseCountJoinFixture()
   {
+    run_ok("SET enable_dense_count_join = true;");
     run_ok("CREATE TABLE cust (c_id INTEGER, c_grp INTEGER);");
     // Keys 1..8 with 3 duplicated, plus two NULL-key rows; 4 and 6..8 have no orders.
     run_ok(

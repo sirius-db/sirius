@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
@@ -24,6 +26,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "expression/aggregate_id.hpp"
 #include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
@@ -36,8 +39,10 @@
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
+#include "sirius/exception.hpp"
 #include "sirius_context.hpp"
 
+#include <limits>
 #include <memory>
 #include <optional>
 
@@ -127,9 +132,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
 // Dense count-join detection
 //===----------------------------------------------------------------------===//
 
-/// The resolved DENSE_COUNT_JOIN rewrite target (see try_plan_dense_count_join).
+/// Immutable result of the pure DENSE_COUNT_JOIN eligibility matcher.
 struct dense_count_join_detection {
-  duckdb::LogicalComparisonJoin* join = nullptr;
   /// Which join child is the outer-preserved (grouped) input: 0 for LEFT, 1 for RIGHT.
   std::size_t preserved_child = 0;
   /// Join-key column index within the preserved child's output.
@@ -140,24 +144,41 @@ struct dense_count_join_detection {
   std::optional<std::size_t> counted_value_idx;
 };
 
-/// Map a join-output column position to (side, column index within that side's child output),
-/// honoring the projection maps. Mirrors the convention in prove_unique_columns
-/// (sirius_plan_comparison_join.cpp): output = mapped left columns, then mapped right columns.
-static std::optional<std::pair<std::size_t, std::size_t>> resolve_join_output_column(
-  const duckdb::LogicalComparisonJoin& join, std::size_t position)
+struct join_projection_layout {
+  std::size_t left_output_count;
+  std::size_t right_output_count;
+};
+
+/// Validate both projection maps before any ordinal is dereferenced.
+static std::optional<join_projection_layout> validate_join_projection_layout(
+  const duckdb::LogicalComparisonJoin& join)
 {
-  const std::size_t left_width = join.children[0]->types.size();
-  const std::size_t left_output_count =
-    join.left_projection_map.empty() ? left_width : join.left_projection_map.size();
-  if (position < left_output_count) {
+  if (join.children.size() != 2) { return std::nullopt; }
+  const std::size_t left_width  = join.children[0]->types.size();
+  const std::size_t right_width = join.children[1]->types.size();
+  for (auto const index : join.left_projection_map) {
+    if (index >= left_width) { return std::nullopt; }
+  }
+  for (auto const index : join.right_projection_map) {
+    if (index >= right_width) { return std::nullopt; }
+  }
+  return join_projection_layout{
+    join.left_projection_map.empty() ? left_width : join.left_projection_map.size(),
+    join.right_projection_map.empty() ? right_width : join.right_projection_map.size()};
+}
+
+/// Map a validated join-output ordinal to (child, child-column ordinal).
+static std::optional<std::pair<std::size_t, std::size_t>> resolve_join_output_column(
+  const duckdb::LogicalComparisonJoin& join,
+  const join_projection_layout& layout,
+  std::size_t position)
+{
+  if (position < layout.left_output_count) {
     return std::pair<std::size_t, std::size_t>{
       0, join.left_projection_map.empty() ? position : join.left_projection_map[position]};
   }
-  const std::size_t right_pos          = position - left_output_count;
-  const std::size_t right_output_count = join.right_projection_map.empty()
-                                           ? join.children[1]->types.size()
-                                           : join.right_projection_map.size();
-  if (right_pos >= right_output_count) { return std::nullopt; }
+  const std::size_t right_pos = position - layout.left_output_count;
+  if (right_pos >= layout.right_output_count) { return std::nullopt; }
   return std::pair<std::size_t, std::size_t>{
     1, join.right_projection_map.empty() ? right_pos : join.right_projection_map[right_pos]};
 }
@@ -185,24 +206,87 @@ static bool is_linear_scan_chain(const duckdb::LogicalOperator& node)
   }
 }
 
-/// Pure shape detection for the DENSE_COUNT_JOIN rewrite. Every gate is exact: it only reads
-/// resolved BOUND_REF indices and the join/aggregate structure — no statistics, no estimates —
-/// so a positive detection can never change query semantics.
-static std::optional<dense_count_join_detection> detect_dense_count_join(
-  duckdb::LogicalAggregate& op)
+/// Authenticate COUNT against DuckDB's host system catalog.
+///
+/// The loadable extension contains a hidden DuckDB copy, so comparing a bound host function to
+/// CountFunctionBase::GetFunction() from this DSO compares different callback addresses. Instead,
+/// locate the one canonical system-catalog overload and compare two host-owned function objects.
+/// Metadata checks keep optimizer-created functions with empty provenance eligible while rejecting
+/// user-defined aggregates that merely reuse the built-in name.
+static std::optional<sirius::aggregate_id> exact_builtin_count_id(
+  duckdb::ClientContext& context, const duckdb::BoundAggregateExpression& aggr)
 {
-  // Single plain group, single aggregate, no grouping sets/functions.
-  if (op.groups.size() != 1 || op.grouping_sets.size() > 1 || !op.grouping_functions.empty() ||
+  auto const aggregate_id = sirius::from_duckdb_aggregate_name(aggr.function.name);
+  if (!aggregate_id || (*aggregate_id != sirius::aggregate_id::count &&
+                        *aggregate_id != sirius::aggregate_id::count_star)) {
+    return std::nullopt;
+  }
+
+  const bool is_count              = *aggregate_id == sirius::aggregate_id::count;
+  const std::size_t expected_arity = is_count ? 1 : 0;
+  auto const canonical_name        = sirius::to_duckdb_aggregate_name(*aggregate_id);
+  auto const& function             = aggr.function;
+
+  if (function.name != canonical_name || aggr.children.size() != expected_arity ||
+      function.arguments.size() != expected_arity ||
+      function.GetReturnType() != duckdb::LogicalType::BIGINT ||
+      aggr.return_type != duckdb::LogicalType::BIGINT || function.HasVarArgs() ||
+      function.GetNullHandling() != duckdb::FunctionNullHandling::SPECIAL_HANDLING ||
+      function.GetOrderDependent() != duckdb::AggregateOrderDependent::NOT_ORDER_DEPENDENT ||
+      aggr.bind_info != nullptr) {
+    return std::nullopt;
+  }
+  if ((!function.catalog_name.empty() && function.catalog_name != SYSTEM_CATALOG) ||
+      (!function.schema_name.empty() && function.schema_name != DEFAULT_SCHEMA)) {
+    return std::nullopt;
+  }
+
+  // DuckDB registers both COUNT(expr) and COUNT(*) in the "count" function set and normalizes
+  // both catalog overload names to "count". Bound and optimizer-created COUNT(*) expressions
+  // use "count_star"; callback equality below authenticates them against the nullary overload.
+  auto& entry =
+    duckdb::Catalog::GetSystemCatalog(context).GetEntry<duckdb::AggregateFunctionCatalogEntry>(
+      context, DEFAULT_SCHEMA, "count");
+
+  const duckdb::AggregateFunction* canonical = nullptr;
+  for (auto const& candidate : entry.functions.functions) {
+    const bool signature_matches =
+      candidate.name == "count" && candidate.arguments.size() == expected_arity &&
+      candidate.GetReturnType() == duckdb::LogicalType::BIGINT && !candidate.HasVarArgs() &&
+      (!is_count || candidate.arguments[0].id() == duckdb::LogicalTypeId::ANY);
+    if (!signature_matches) { continue; }
+    // A duplicate canonical signature would make identity ambiguous; fail closed.
+    if (canonical != nullptr) { return std::nullopt; }
+    canonical = &candidate;
+  }
+  if (canonical == nullptr || function != *canonical) { return std::nullopt; }
+  return aggregate_id;
+}
+
+/// Pure shape detection for the DENSE_COUNT_JOIN rewrite. Every gate is exact: it only reads
+/// resolved BOUND_REF indices, immutable system-catalog function metadata, and the
+/// join/aggregate structure — no statistics, no estimates — so a positive detection can never
+/// change query semantics.
+static std::optional<dense_count_join_detection> detect_dense_count_join(
+  duckdb::ClientContext& context, const duckdb::LogicalAggregate& op)
+{
+  // One ordinary grouping set containing the sole group, and one aggregate.
+  if (op.groups.size() != 1 || op.grouping_sets.size() != 1 || op.grouping_sets[0].size() != 1 ||
+      op.grouping_sets[0].count(0) != 1 || !op.grouping_functions.empty() ||
       op.expressions.size() != 1) {
     return std::nullopt;
   }
   if (op.groups[0]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
     return std::nullopt;
   }
-  auto& aggr               = op.expressions[0]->Cast<duckdb::BoundAggregateExpression>();
-  const bool is_count      = aggr.function.name == "count";
-  const bool is_count_star = aggr.function.name == "count_star";
-  if (!is_count && !is_count_star) { return std::nullopt; }
+  if (op.expressions[0]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_AGGREGATE) {
+    return std::nullopt;
+  }
+  auto const& aggr        = op.expressions[0]->Cast<duckdb::BoundAggregateExpression>();
+  auto const aggregate_id = exact_builtin_count_id(context, aggr);
+  if (!aggregate_id) { return std::nullopt; }
+  const bool is_count      = *aggregate_id == sirius::aggregate_id::count;
+  const bool is_count_star = *aggregate_id == sirius::aggregate_id::count_star;
   if (aggr.IsDistinct() || aggr.filter || aggr.order_bys) { return std::nullopt; }
   if (is_count && (aggr.children.size() != 1 ||
                    aggr.children[0]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF)) {
@@ -215,15 +299,45 @@ static std::optional<dense_count_join_detection> detect_dense_count_join(
       op.children[0]->type != duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
     return std::nullopt;
   }
-  auto& join = op.children[0]->Cast<duckdb::LogicalComparisonJoin>();
+  auto const& join = op.children[0]->Cast<duckdb::LogicalComparisonJoin>();
   if (join.join_type != duckdb::JoinType::LEFT && join.join_type != duckdb::JoinType::RIGHT) {
     return std::nullopt;
   }
-  if (join.children.size() != 2 || join.conditions.size() != 1) { return std::nullopt; }
-  auto& cond = join.conditions[0];
+  if (join.children.size() != 2 || join.conditions.size() != 1 || join.predicate) {
+    return std::nullopt;
+  }
+  auto const layout = validate_join_projection_layout(join);
+  if (!layout) { return std::nullopt; }
+  if (layout->left_output_count >
+      std::numeric_limits<std::size_t>::max() - layout->right_output_count) {
+    return std::nullopt;
+  }
+  const auto join_output_width = layout->left_output_count + layout->right_output_count;
+  if (join.types.size() != join_output_width) { return std::nullopt; }
+  for (std::size_t output_idx = 0; output_idx < layout->left_output_count; ++output_idx) {
+    auto const child_idx =
+      join.left_projection_map.empty() ? output_idx : join.left_projection_map[output_idx];
+    if (join.types[output_idx] != join.children[0]->types[child_idx]) { return std::nullopt; }
+  }
+  for (std::size_t right_idx = 0; right_idx < layout->right_output_count; ++right_idx) {
+    auto const child_idx =
+      join.right_projection_map.empty() ? right_idx : join.right_projection_map[right_idx];
+    auto const output_idx = layout->left_output_count + right_idx;
+    if (join.types[output_idx] != join.children[1]->types[child_idx]) { return std::nullopt; }
+  }
+
+  auto const& cond = join.conditions[0];
   if (cond.comparison != duckdb::ExpressionType::COMPARE_EQUAL ||
       cond.left->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF ||
       cond.right->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
+    return std::nullopt;
+  }
+  auto const& left_ref  = cond.left->Cast<duckdb::BoundReferenceExpression>();
+  auto const& right_ref = cond.right->Cast<duckdb::BoundReferenceExpression>();
+  if (left_ref.index >= join.children[0]->types.size() ||
+      right_ref.index >= join.children[1]->types.size() ||
+      left_ref.return_type != join.children[0]->types[left_ref.index] ||
+      right_ref.return_type != join.children[1]->types[right_ref.index]) {
     return std::nullopt;
   }
   const auto key_type_id = cond.left->return_type.id();
@@ -234,7 +348,6 @@ static std::optional<dense_count_join_detection> detect_dense_count_join(
   }
 
   dense_count_join_detection det;
-  det.join                        = &join;
   det.preserved_child             = join.join_type == duckdb::JoinType::LEFT ? 0 : 1;
   const std::size_t counted_child = 1 - det.preserved_child;
 
@@ -246,8 +359,12 @@ static std::optional<dense_count_join_detection> detect_dense_count_join(
   }
 
   // The group key must be exactly the preserved side's join key.
-  const auto group_target =
-    resolve_join_output_column(join, op.groups[0]->Cast<duckdb::BoundReferenceExpression>().index);
+  auto const& group_ref = op.groups[0]->Cast<duckdb::BoundReferenceExpression>();
+  if (group_ref.index >= join_output_width ||
+      group_ref.return_type != join.types[group_ref.index]) {
+    return std::nullopt;
+  }
+  const auto group_target = resolve_join_output_column(join, *layout, group_ref.index);
   if (!group_target || group_target->first != det.preserved_child) { return std::nullopt; }
   const auto& preserved_cond = det.preserved_child == 0 ? cond.left : cond.right;
   det.preserved_key_idx      = preserved_cond->Cast<duckdb::BoundReferenceExpression>().index;
@@ -255,13 +372,22 @@ static std::optional<dense_count_join_detection> detect_dense_count_join(
 
   const auto& counted_cond = det.preserved_child == 0 ? cond.right : cond.left;
   det.counted_key_idx      = counted_cond->Cast<duckdb::BoundReferenceExpression>().index;
+  if (det.preserved_key_idx >= join.children[det.preserved_child]->types.size() ||
+      det.counted_key_idx >= join.children[counted_child]->types.size()) {
+    return std::nullopt;
+  }
 
   // COUNT(col): the argument must come from the counted side (a preserved-side or computed
   // argument has different NULL semantics under the outer join).
   if (is_count) {
-    const auto count_target = resolve_join_output_column(
-      join, aggr.children[0]->Cast<duckdb::BoundReferenceExpression>().index);
+    auto const& count_ref = aggr.children[0]->Cast<duckdb::BoundReferenceExpression>();
+    if (count_ref.index >= join_output_width ||
+        count_ref.return_type != join.types[count_ref.index]) {
+      return std::nullopt;
+    }
+    const auto count_target = resolve_join_output_column(join, *layout, count_ref.index);
     if (!count_target || count_target->first != counted_child) { return std::nullopt; }
+    if (count_target->second >= join.children[counted_child]->types.size()) { return std::nullopt; }
     det.counted_value_idx = count_target->second;
   }
   return det;
@@ -279,9 +405,9 @@ sirius_physical_plan_generator::try_plan_dense_count_join(duckdb::LogicalAggrega
   const auto& op_params = sirius_ctx->get_config().get_operator_params();
   if (!op_params.enable_dense_count_join) { return nullptr; }
 
-  auto detection = detect_dense_count_join(op);
+  auto detection = detect_dense_count_join(context, op);
   if (!detection) { return nullptr; }
-  auto& join                      = *detection->join;
+  auto& join                      = op.children[0]->Cast<duckdb::LogicalComparisonJoin>();
   const std::size_t counted_child = 1 - detection->preserved_child;
 
   // Mirror plan_comparison_join: capture cardinalities before create_plan drains the nodes.
@@ -295,9 +421,9 @@ sirius_physical_plan_generator::try_plan_dense_count_join(duckdb::LogicalAggrega
   preserved->estimated_cardinality = preserved_cardinality;
   counted->estimated_cardinality   = counted_cardinality;
   if (preserved->children.size() > 1 || counted->children.size() > 1) {
-    // Unreachable with the logical-shape gate; falls back to DuckDB CPU execution.
-    throw duckdb::NotImplementedException(
-      "dense_count_join: planned child subtree root is not unary");
+    // Unreachable with the logical-shape gate: this is an internal planner invariant.
+    throw sirius::internal_exception(
+      "dense_count_join: eligible logical child produced a non-unary physical root");
   }
 
   SIRIUS_LOG_INFO(
@@ -546,8 +672,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
     reject_nested_column_operation(*group, "GROUP BY");
   }
 
-  // Fused count-join fast path: COUNT grouped by the preserved-side key of an outer equi-join
-  // collapses the join + group-by into a single DENSE_COUNT_JOIN operator (TPC-H q13 shape).
+  // Fuse COUNT grouped by the preserved-side key of an outer equi-join into one
+  // DENSE_COUNT_JOIN operator.
   if (auto fused = try_plan_dense_count_join(op)) { return fused; }
 
   auto plan = create_plan(*op.children[0]);

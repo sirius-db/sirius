@@ -20,6 +20,7 @@
 #include "expression/ast/utils.hpp"
 #include "helper/numeric_narrowing.hpp"
 #include "op/sirius_physical_delim_join.hpp"
+#include "op/sirius_physical_dense_count_join.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
@@ -433,6 +434,28 @@ carried_columns analyze_subtree(sirius::op::sirius_physical_operator& op, policy
       if (collect_right) { forward_payloads(join.rhs_output_columns.col_idxs, rhs); }
       // Carried columns absent from the output maps die free.
       return map;
+    }
+
+    case sirius::op::SiriusPhysicalOperatorType::DENSE_COUNT_JOIN: {
+      if (op.children.size() != 2) { break; }
+      auto const& join             = op.Cast<sirius::op::sirius_physical_dense_count_join>();
+      auto const preserved_key_idx = join.preserved_key_idx();
+      auto const counted_key_idx   = join.counted_key_idx();
+      if (preserved_key_idx >= child_maps[0].size() || counted_key_idx >= child_maps[1].size() ||
+          (join.counted_value_idx() && *join.counted_value_idx() >= child_maps[1].size())) {
+        break;
+      }
+
+      // Dense-count execution consumes both key values at native width. COUNT(col) reads
+      // only the value column's validity mask, and all other child columns are ignored, so none
+      // of those carriers needs a restore. The fused operator always emits its declared native
+      // [key, BIGINT] schema and therefore forwards no candidate carrier.
+      auto mark_key = [&state](carried_columns const& side, std::size_t key_idx) {
+        if (side[key_idx]) { state.candidates[*side[key_idx]].boundary_restore = true; }
+      };
+      mark_key(child_maps[0], preserved_key_idx);
+      mark_key(child_maps[1], counted_key_idx);
+      return carried_columns(op.types.size());
     }
 
     case sirius::op::SiriusPhysicalOperatorType::HASH_GROUP_BY: {

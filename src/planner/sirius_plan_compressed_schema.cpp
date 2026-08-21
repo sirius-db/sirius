@@ -21,6 +21,7 @@
 #include "expression/ast/utils.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_delim_join.hpp"
+#include "op/sirius_physical_dense_count_join.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
@@ -385,6 +386,28 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
         }
       }
       install_physical_schema(*slot, std::move(schema), native);
+      return;
+    }
+
+    case sirius::op::SiriusPhysicalOperatorType::DENSE_COUNT_JOIN: {
+      if (slot->children.size() != 2) { break; }
+      auto const& join             = slot->Cast<sirius::op::sirius_physical_dense_count_join>();
+      auto const preserved_key_idx = join.preserved_key_idx();
+      auto const counted_key_idx   = join.counted_key_idx();
+      if (preserved_key_idx >= slot->children[0]->types.size() ||
+          counted_key_idx >= slot->children[1]->types.size() ||
+          (join.counted_value_idx() &&
+           *join.counted_value_idx() >= slot->children[1]->types.size())) {
+        break;
+      }
+
+      // The fused join reads both equality keys as values, but COUNT(col) consumes only its
+      // validity mask. Restore precisely the keys; value and ignored columns retain their narrow
+      // carriers until the operator discards them. Dense-count output is always [native key,
+      // BIGINT], so it carries no physical sidecar.
+      restore_native_columns(slot->children[0], {preserved_key_idx});
+      restore_native_columns(slot->children[1], {counted_key_idx});
+      slot->set_physical_types({});
       return;
     }
 

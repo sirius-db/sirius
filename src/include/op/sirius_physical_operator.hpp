@@ -21,6 +21,7 @@
 #include "helper/logical_type.hpp"
 #include "helper/types.hpp"
 #include "late_mat/defer_directive.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "sirius/exception.hpp"
 #include "telemetry-bridge/gen/uuid.rs.h"
@@ -307,7 +308,8 @@ class pipelineable_operator_data : public operator_data {
     std::size_t total = 0;
     auto ro_batches   = get_read_only_batches(false);
     for (auto const& ro : ro_batches) {
-      if (ro.get_data()) { total += ro.get_data()->get_uncompressed_data_size_in_bytes(); }
+      if (!ro.get_data()) { continue; }
+      total = memory::saturating_add(total, ro.get_data()->get_uncompressed_data_size_in_bytes());
     }
     return total;
   }
@@ -559,7 +561,7 @@ class sirius_physical_operator {
    */
   [[nodiscard]] virtual std::size_t no_history_peak_memory_estimate(const input_stats& stats) const
   {
-    return stats.bytes * 2;
+    return memory::saturating_mul(stats.bytes, 2);
   }
 
   virtual std::unique_ptr<operator_data> execute(const operator_data& input_data,

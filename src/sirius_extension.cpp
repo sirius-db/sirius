@@ -2396,16 +2396,14 @@ static void SetEnableDenseCountJoin(ClientContext& context, SetScope scope, Valu
 
 static void SetDenseCountJoinMaxBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
-  // Validate before the context lookup so the rejection also fires without a Sirius context
-  // (mirrors SetHashPartitionBytes).
-  const uint64_t max_bytes = UBigIntValue::Get(parameter);
-  if (max_bytes == 0) {
+  auto const bytes = UBigIntValue::Get(parameter);
+  if (bytes == 0) {
     throw InvalidInputException("dense_count_join_max_bytes must be greater than zero");
   }
   auto* params = get_operator_params(context);
   if (!params) { return; }
   auto slot                          = lock_operator_params_slot(context);
-  params->dense_count_join_max_bytes = max_bytes;
+  params->dense_count_join_max_bytes = bytes;
   SIRIUS_LOG_DEBUG("Updated config DENSE_COUNT_JOIN_MAX_BYTES to {}",
                    params->dense_count_join_max_bytes);
 }
@@ -2673,6 +2671,20 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_runtime_distinct_build_probe),
                     SetEnableRuntimeDistinctBuildProbe);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_dense_count_join",
+                    "internal test hook for the dense count-join rewrite",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_dense_count_join),
+                    SetEnableDenseCountJoin);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "dense_count_join_max_bytes",
+                    "internal test hook for the dense count-join histogram budget",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(operator_defaults.dense_count_join_max_bytes),
+                    SetDenseCountJoinMaxBytes);
   add_sirius_option(config,
                     option_visibility::internal,
                     "concat_batch_bytes",
