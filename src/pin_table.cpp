@@ -646,7 +646,7 @@ device_pin_result materialize_all_batches_compressed(
   // capture would be computed and dropped — force it off.
   options.capture_chunk_stats = false;
 
-  materialize_pin_batches(
+  out.unique_verdicts = materialize_pin_batches(
     ingestible,
     gpu_spaces,
     io_ctx,
