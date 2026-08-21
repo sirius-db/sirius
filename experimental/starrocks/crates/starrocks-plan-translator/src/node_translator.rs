@@ -1,6 +1,9 @@
+use std::collections::BTreeMap;
+
 use starrocks_thrift::exprs::TExpr;
 use starrocks_thrift::opcodes::TExprOpcode;
 use starrocks_thrift::plan_nodes::{TJoinOp, TPlan, TPlanNode, TPlanNodeType, TSortInfo};
+use starrocks_thrift::types::TSlotId;
 use substrait::proto::read_rel::local_files::FileOrFiles;
 use substrait::proto::read_rel::local_files::file_or_files::{
     FileFormat, ParquetReadOptions, PathType,
@@ -272,12 +275,37 @@ fn translate_scan(
 }
 
 /// Wraps the child relation of a `SELECT_NODE` with its filter conjuncts.
+/// Refuses a node whose `common_slot_map` this translator does not materialize.
+///
+/// Only `PROJECT_NODE` appends its common slots. Every other node carrying the field would have
+/// its shared sub-expressions dropped, and any slot ref resolving to one of them then reads a
+/// column that was never emitted -- wrong values under the right names, with no error.
+fn reject_common_slots(
+    node: &TPlanNode,
+    common_slot_map: Option<&BTreeMap<TSlotId, TExpr>>,
+) -> Result<()> {
+    if common_slot_map.is_some_and(|map| !map.is_empty()) {
+        return Err(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "common slots are only materialized on PROJECT_NODE",
+        });
+    }
+    Ok(())
+}
+
 fn translate_select(
     node: &TPlanNode,
     children: Vec<TranslatedRel>,
     ctx: &mut PlanContext<'_>,
 ) -> Result<TranslatedRel> {
     expect_children(node, &children, 1)?;
+    reject_common_slots(
+        node,
+        node.select_node
+            .as_ref()
+            .and_then(|select| select.common_slot_map.as_ref()),
+    )?;
     apply_conjuncts(children.into_iter().next().unwrap(), node, ctx)
 }
 
@@ -640,6 +668,12 @@ fn translate_hash_join(
     ctx: &mut PlanContext<'_>,
 ) -> Result<TranslatedRel> {
     expect_children(node, &children, 2)?;
+    reject_common_slots(
+        node,
+        node.hash_join_node
+            .as_ref()
+            .and_then(|join| join.common_slot_map.as_ref()),
+    )?;
     let join = node
         .hash_join_node
         .as_ref()
@@ -830,6 +864,7 @@ fn translate_nestloop_join(
             context: "NESTLOOP_JOIN_NODE",
             field: "nestloop_join_node",
         })?;
+    reject_common_slots(node, join.common_slot_map.as_ref())?;
     match join.join_op {
         None | Some(TJoinOp::CROSS_JOIN) | Some(TJoinOp::INNER_JOIN) => {}
         Some(_) => {
