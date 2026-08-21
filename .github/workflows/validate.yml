@@ -5,6 +5,7 @@ on:
     types: [opened, reopened, edited, synchronize]
 
 jobs:
+  # Checks the PR title to ensure it follows Conventional Commits guidelines
   semantic-pr:
     name: pr-title
     runs-on: ubuntu-slim
@@ -14,3 +15,25 @@ jobs:
       - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Removes HTML comments from our PR template to keep our commits clean; #1609
+  clean-pr-body:
+    name: pr-body
+    runs-on: ubuntu-slim
+    if: github.event.action != 'synchronize' && (github.event.action != 'edited' || github.event.changes.body)
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/github-script@<pinned-sha> # v7
+        with:
+          script: |
+            const body = context.payload.pull_request.body || '';
+            const stripped = body.replace(/<!--[\s\S]*?-->/g, '').replace(/\n{3,}/g, '\n\n').trim();
+            if (stripped !== body) {
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.pull_request.number,
+                body: stripped,
+              });
+            }
