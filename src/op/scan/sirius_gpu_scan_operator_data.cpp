@@ -92,6 +92,9 @@ void scan_operator_input::update(io::cache::scan_stage site) const
                             : nullptr;
   if (_readahead) { _readahead->update_scan_state(_operator_id, task, site); }
   if (task == nullptr) { return; }
+  // The split's own record of where its consumer is, which is what the readahead
+  // asks when deciding whether prefetching it is still worth anything.
+  std::get<std::shared_ptr<scan_info>>(materialization_info)->set_scan_stage(site);
   // Datasources only, not the fadvise hints: this runs on every stage
   // transition of every split, and the hints carry the split's entire
   // byte-range list with them.

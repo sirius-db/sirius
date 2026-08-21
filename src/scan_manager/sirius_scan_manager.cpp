@@ -561,12 +561,11 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     std::make_shared<round_robin_strategy>(std::vector<int>(gpu_ids.begin(), gpu_ids.end()));
 
   _metadata_processor = std::make_unique<load_balancing_scan_batch_coalescer>();
-  _readahead          = std::make_shared<readahead_scan_manager>();
-  _readahead->prepare_for_query(query);
 
-  // Subscribe for the query's lifetime; unsubscribed in reset().
-  _query_stage_manager->subscribe(_readahead);
-
+  // Settle the readahead's terms before building it: the budget rations device
+  // IO between the readahead and the executor, so it has to be in place before
+  // the manager is subscribed and can start being told about executor work.
+  //
   // Order scans ahead of demand, on the terms resolve_readahead settles: an
   // explicit `max_readahead_scans` / `readahead_strategy`, or what the serving
   // backend wants.  A budget of zero means "do not read ahead" — either
@@ -602,7 +601,12 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     auto const backend_strategy =
       widest != nullptr ? backend_prefetch_strategy(widest->type()) : prefetch_strategy::eager;
     auto const plan = _config.resolve_readahead(backend_budget, backend_strategy);
-    _readahead->start(plan.budget, plan.strategy);
+
+    _readahead = std::make_shared<readahead_scan_manager>(plan.budget);
+    _readahead->prepare_for_query(query);
+    // Subscribe for the query's lifetime; unsubscribed in reset().
+    _query_stage_manager->subscribe(_readahead);
+    _readahead->start(plan.strategy);
   }
 
   std::vector<cached_assignment> cached_assignments;

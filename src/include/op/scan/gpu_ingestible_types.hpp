@@ -19,6 +19,7 @@
 
 #include <io/sirius_datasource.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <memory>
@@ -144,6 +145,52 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     /// Whether a following @ref prefetch has anything to issue.
     [[nodiscard]] bool ready() const noexcept { return prepared > 0; }
   };
+
+  /// Where the consumer has got to with this split, reported by
+  /// @c scan_operator_input::update as it moves through the executor.
+  ///
+  /// The stage belongs to the split, not to its files: they all advance with it,
+  /// so polling N per-file prefetch handles to rediscover one fact only invites
+  /// them to disagree.
+  ///
+  /// Monotone, because stages only ever advance and a report that arrives late
+  /// must not walk one back.
+  void set_scan_stage(io::cache::scan_stage stage) noexcept
+  {
+    auto cur = _scan_stage.load(std::memory_order_relaxed);
+    while (stage > cur && !_scan_stage.compare_exchange_weak(
+                            cur, stage, std::memory_order_release, std::memory_order_relaxed)) {}
+  }
+
+  [[nodiscard]] io::cache::scan_stage get_scan_stage() const noexcept
+  {
+    return _scan_stage.load(std::memory_order_acquire);
+  }
+
+  /// The consumer has reached this split -- it is preparing to read it, or
+  /// already reading -- so a prefetch started now would only duplicate the IO
+  /// the executor is doing for itself.
+  [[nodiscard]] bool has_fallen_behind() const noexcept
+  {
+    return get_scan_stage() >= io::cache::scan_stage::preparing;
+  }
+
+  /// Take / give back the readahead ticket this split holds for its own read.
+  ///
+  /// A split the readahead never covered spends from the same IO budget the
+  /// readahead does, and the flag is what makes that exactly-once: `take`
+  /// returns false if it already holds one (a stage can be reported twice), and
+  /// `give_back` returns false if it never had one, so neither a double-charge
+  /// nor a double-refund is possible.
+  [[nodiscard]] bool take_readahead_ticket() noexcept
+  {
+    return !_holds_readahead_ticket.exchange(true, std::memory_order_acq_rel);
+  }
+
+  [[nodiscard]] bool give_back_readahead_ticket() noexcept
+  {
+    return _holds_readahead_ticket.exchange(false, std::memory_order_acq_rel);
+  }
 
   /// Allocate staging buffers for this split's prefetch requests.  A chunk
   /// without one cannot be claimed for loading, so a prefetch issued over it
@@ -277,6 +324,8 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
   std::vector<fadvise_entry> _hints;
   std::vector<std::shared_ptr<sirius::io::sirius_datasource>> _datasources;
   std::atomic<prefetch_state> _prefetch_state{prefetch_state::idle};
+  std::atomic<io::cache::scan_stage> _scan_stage{io::cache::scan_stage::none};
+  std::atomic<bool> _holds_readahead_ticket{false};
 };
 
 //===----------------------------------------------------------------------===//
