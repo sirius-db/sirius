@@ -3858,6 +3858,72 @@ fn bare_cross_join_translates_to_constant_key_join() {
         })
         .collect();
     assert_eq!(operands, vec![2, 4]);
+/// A null-aware anti join is only equivalent to `LeftMark + NOT(marker)` when one equality key
+/// decides the match. Both executors null out *every* unmatched marker as soon as any build row
+/// has a NULL in any key, so a row made definitely non-matching by a second predicate is reported
+/// UNKNOWN and dropped. Correlated `NOT IN` (correlation predicate in `other_join_conjuncts`) and
+/// tuple `NOT IN` (several eq conjuncts) are therefore refused rather than silently returning too
+/// few rows.
+#[test]
+fn null_aware_anti_join_with_extra_predicates_is_rejected() {
+    let extra_eq = || {
+        TEqJoinCondition::new(
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+            Some(TExprOpcode::EQ),
+        )
+    };
+    let correlation = || {
+        binary_pred(
+            TExprOpcode::EQ,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        )
+    };
+
+    // Tuple NOT IN: two equality keys.
+    let mut multi_key = hash_join_node(TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN);
+    multi_key
+        .hash_join_node
+        .as_mut()
+        .unwrap()
+        .eq_join_conjuncts
+        .push(extra_eq());
+
+    // Correlated NOT IN: the correlation predicate rides in other_join_conjuncts.
+    let mut correlated = hash_join_node(TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN);
+    correlated
+        .hash_join_node
+        .as_mut()
+        .unwrap()
+        .other_join_conjuncts = Some(vec![correlation()]);
+
+    for (label, join) in [
+        ("tuple NOT IN", multi_key),
+        ("correlated NOT IN", correlated),
+    ] {
+        let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+        let err = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap_err();
+        let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
+            panic!("{label}: expected an unsupported plan node, got {err:?}");
+        };
+        assert_eq!(
+            reason, "null-aware left anti join with correlated or multi-column keys",
+            "{label}"
+        );
+    }
+
+    // The single-key, no-extra-conjunct form stays supported: there, "unmatched with a NULL on
+    // the build side" really is UNKNOWN, so the global rule is exact.
+    let plan = TPlan::new(vec![
+        hash_join_node(TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN),
+        scan_node(0, 0),
+        scan_node(1, 1),
+    ]);
+    translate_fragment(&params(Some(plan), Some(join_desc()), None))
+        .expect("plain single-key null-aware anti join is still supported");
+}
+
 /// Builds an EXCHANGE_NODE with id 7 over `input_row_tuples`, optionally merging or offset.
 fn exchange_node_with(
     input_row_tuples: Vec<i32>,

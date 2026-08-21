@@ -730,6 +730,37 @@ fn translate_hash_join(
         }
     };
 
+    // A null-aware anti join is only equivalent to `LeftMark + NOT(marker)` when the marker's
+    // NULL-ness is decided per probe row. Neither executor does that: DuckDB sets one global
+    // `has_null` if any build row has a NULL in any equality key and then rewrites every FALSE
+    // marker to NULL (`duckdb/src/execution/join_hashtable.cpp:431` and `:1211-1217`), and the
+    // GPU path does the same with `table_has_any_null(right_keys)`
+    // (`src/op/sirius_physical_hash_join.cpp:1657`). The per-group path that would be correct is
+    // only reachable from DuckDB's own delim-join planner, never from a Substrait `JoinRel`.
+    //
+    // That is exact for a single equality key and nothing else, because then "unmatched with a
+    // NULL somewhere on the build side" really is UNKNOWN. It is wrong as soon as another
+    // predicate can make a row definitely non-matching: a correlated `NOT IN` puts its
+    // correlation predicate in `other_join_conjuncts` (FE `QuantifiedApply2JoinRule` builds
+    // `eq AND correlatedConjuncts AND predicate`, and `JoinHelper` filters correlated equalities
+    // out of the eq conjuncts), and a tuple `NOT IN` arrives as several eq conjuncts. In both
+    // cases a row that is definitely FALSE is reported UNKNOWN and silently dropped, so
+    // `NOT IN` returns too few rows -- often none. StarRocks itself does not have this problem;
+    // its BE only short-circuits when `_other_join_conjunct_ctxs` is empty.
+    if matches!(join.join_op, TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN)
+        && (join.eq_join_conjuncts.len() != 1
+            || join
+                .other_join_conjuncts
+                .as_ref()
+                .is_some_and(|conjuncts| !conjuncts.is_empty()))
+    {
+        return Err(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "null-aware left anti join with correlated or multi-column keys",
+        });
+    }
+
     let mut children = children.into_iter();
     let left = children.next().unwrap();
     let right = children.next().unwrap();
