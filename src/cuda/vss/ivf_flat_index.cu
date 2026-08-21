@@ -98,17 +98,26 @@ std::unique_ptr<any_cuvs_index> build_ivf_flat_index_from_chunks(
     raft::device_resources res;
     auto const stream = raft::resource::get_cuda_stream(res);
 
-    // Centroids are trained on the first non-empty chunk.
+    // Train centroids on the first batch that has at least n_lists rows.
     // NOTE: could improve recall if we do a cross-chunk training sample
     cudf::column_view const* train_chunk = nullptr;
+    bool any_non_empty                   = false;
     for (auto const& chunk : chunks) {
-      if (chunk.size() > 0) {
+      auto const rows = static_cast<std::int64_t>(chunk.size());
+      if (rows == 0) { continue; }
+      any_non_empty = true;
+      if (rows >= static_cast<std::int64_t>(n_lists)) {
         train_chunk = &chunk;
         break;
       }
     }
     if (train_chunk == nullptr) {
-      throw std::invalid_argument("build_ivf_flat_index_from_chunks: all chunks are empty");
+      if (!any_non_empty) {
+        throw std::invalid_argument("build_ivf_flat_index_from_chunks: all chunks are empty");
+      }
+      throw std::invalid_argument(
+        "build_ivf_flat_index_from_chunks: no batch has at least n_lists=" +
+        std::to_string(n_lists) + " rows to train IVF-Flat centroids; lower n_lists");
     }
     auto const train_view = list_column_as_dataset_view(*train_chunk, dim);
     auto idx              = cuvs::neighbors::ivf_flat::build(res, index_params, train_view);

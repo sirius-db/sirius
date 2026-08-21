@@ -235,6 +235,58 @@ TEST_CASE("build_ivf_flat_index_from_chunks skips empty chunks without shifting 
   REQUIRE(to_host_i64(result.neighbors->view())[0] == 2);
 }
 
+TEST_CASE("build_ivf_flat_index_from_chunks rejects n_lists larger than every batch", "[vss]")
+{
+  constexpr cudf::size_type dim = 2;
+  auto const mr                 = cudf::get_current_device_resource_ref();
+
+  // Two non-empty batches of 2 rows each: 4 rows total, but no single batch reaches
+  // n_lists=4, so kmeans cannot train the requested clusters.
+  auto chunk_a = make_fixed_size_float_list({0.0f, 0.0f, 1.0f, 0.0f}, 2, dim);
+  auto chunk_b = make_fixed_size_float_list({10.0f, 10.0f, 11.0f, 10.0f}, 2, dim);
+
+  REQUIRE_THROWS_WITH(
+    build_ivf_flat_index_from_chunks(
+      {chunk_a->view(), chunk_b->view()}, dim, /*n_lists=*/4, Metric::L2SqrtExpanded, mr),
+    Catch::Contains("no batch has at least n_lists=4"));
+}
+
+TEST_CASE("build_ivf_flat_index_from_chunks rejects all-empty input", "[vss]")
+{
+  constexpr cudf::size_type dim = 2;
+  auto const mr                 = cudf::get_current_device_resource_ref();
+
+  auto empty = make_fixed_size_float_list({}, 0, dim);
+
+  REQUIRE_THROWS_WITH(
+    build_ivf_flat_index_from_chunks(
+      {empty->view(), empty->view()}, dim, /*n_lists=*/1, Metric::L2SqrtExpanded, mr),
+    Catch::Contains("all chunks are empty"));
+}
+
+TEST_CASE("build_ivf_flat_index_from_chunks trains on a later batch when the first is too small",
+          "[vss]")
+{
+  constexpr cudf::size_type dim = 2;
+  auto const stream             = cudf::get_default_stream();
+  auto const mr                 = cudf::get_current_device_resource_ref();
+
+  // First batch has 1 row (< n_lists), so it can't train, but the second can. The
+  // small first batch must still be indexed as data (global id 0), not dropped.
+  auto small = make_fixed_size_float_list({0.0f, 0.0f}, 1, dim);  // id 0
+  auto big   = make_fixed_size_float_list(
+    {10.0f, 10.0f, 11.0f, 10.0f, 12.0f, 10.0f, 13.0f, 10.0f}, 4, dim);  // ids 1..4
+
+  auto index = build_ivf_flat_index_from_chunks(
+    {small->view(), big->view()}, dim, /*n_lists=*/2, Metric::L2SqrtExpanded, mr);
+
+  // Query at the first batch's only vector: it is present and returned as id 0.
+  auto q      = upload({0.0f, 0.0f}, stream);
+  auto result = search_ivf_flat_index(
+    *index, static_cast<const float*>(q.data()), dim, /*k=*/1, /*n_probes=*/2, stream, mr);
+  REQUIRE(to_host_i64(result.neighbors->view())[0] == 0);
+}
+
 // Pin the distance magnitude: L2SqrtExpanded must yield Euclidean (rooted)
 // distances, which is the array_distance contract the ANN operator relies on.
 // Ordering-only checks would let a squared-L2 regression pass silently.

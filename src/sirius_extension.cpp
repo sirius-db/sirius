@@ -1849,8 +1849,8 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   // Cap n_lists in 64-bit before narrowing to uint32
   int64_t n_lists64 =
     data.n_lists > 0 ? data.n_lists : static_cast<int64_t>(default_ivf_n_lists(n_rows));
-  n_lists64 = std::min(n_lists64, n_rows);
-  n_lists64 = std::min<int64_t>(n_lists64, std::numeric_limits<std::uint32_t>::max());
+  n_lists64          = std::min(n_lists64, n_rows);
+  n_lists64          = std::min<int64_t>(n_lists64, std::numeric_limits<std::uint32_t>::max());
   auto const n_lists = static_cast<std::uint32_t>(n_lists64);
 
   // Reserve the index footprint (heuristic, over-estimated to cover build-time
