@@ -71,7 +71,7 @@ TEST_CASE("cuvs_index_cache inserts and looks up by management name", "[vss]")
 
   REQUIRE(cache.size() == 1);
   REQUIRE(cache.contains("idx"));
-  const auto* entry = cache.find("idx");
+  auto entry = cache.find("idx");
   REQUIRE(entry != nullptr);
   REQUIRE(entry->meta.table_name == "docs");
   REQUIRE(entry->meta.column_name == "vec");
@@ -89,7 +89,7 @@ TEST_CASE("cuvs_index_cache find_by_column matches the auto-routing identity", "
 
   SECTION("exact (table, column, metric) match hits")
   {
-    const auto* e = cache.find_by_column("docs", "vec", Metric::L2SqrtExpanded);
+    auto e = cache.find_by_column("docs", "vec", Metric::L2SqrtExpanded);
     REQUIRE(e != nullptr);
     REQUIRE(e->meta.table_name == "docs");
   }
@@ -138,7 +138,7 @@ TEST_CASE("cuvs_index_cache insert replaces an existing name in place", "[vss]")
   insert_dummy(cache, "idx", make_meta("docs", "embedding", Metric::CosineExpanded));
 
   REQUIRE(cache.size() == 1);  // replaced, not appended
-  const auto* entry = cache.find("idx");
+  auto entry = cache.find("idx");
   REQUIRE(entry != nullptr);
   REQUIRE(entry->meta.column_name == "embedding");
   REQUIRE(entry->meta.metric == Metric::CosineExpanded);
@@ -179,8 +179,47 @@ TEST_CASE("cuvs_index_cache find_by_column returns a match among several entries
   insert_dummy(cache, "idx_b", make_meta("docs", "vec", Metric::L2SqrtExpanded));
   insert_dummy(cache, "idx_c", make_meta("docs", "title_vec", Metric::L2SqrtExpanded));
 
-  const auto* e = cache.find_by_column("docs", "title_vec", Metric::L2SqrtExpanded);
+  auto e = cache.find_by_column("docs", "title_vec", Metric::L2SqrtExpanded);
   REQUIRE(e != nullptr);
   REQUIRE(e->meta.table_name == "docs");
   REQUIRE(e->meta.column_name == "title_vec");
+}
+
+TEST_CASE("cuvs_index_cache lookup handle outlives an erase", "[vss]")
+{
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  cuvs_index_cache cache(*manager);
+
+  insert_dummy(cache, "idx", make_meta("docs", "vec", Metric::L2SqrtExpanded));
+
+  // A caller mid-search holds the handle. Erasing (a concurrent DROP) unlinks the
+  // map entry but must not destroy the entry or its reservation under the caller.
+  auto handle = cache.find("idx");
+  REQUIRE(handle != nullptr);
+
+  REQUIRE(cache.erase("idx"));
+  REQUIRE(cache.size() == 0);
+  REQUIRE(cache.find("idx") == nullptr);
+
+  // The held handle is still valid: entry, index, and reservation are all alive.
+  REQUIRE(handle->meta.column_name == "vec");
+  REQUIRE(handle->index != nullptr);
+  REQUIRE(handle->reservation != nullptr);
+}
+
+TEST_CASE("cuvs_index_cache lookup handle outlives a replace", "[vss]")
+{
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  cuvs_index_cache cache(*manager);
+
+  insert_dummy(cache, "idx", make_meta("docs", "vec", Metric::L2SqrtExpanded));
+  auto old_handle = cache.find("idx");
+  REQUIRE(old_handle != nullptr);
+
+  // Replacing the name installs a new entry; the old handle keeps pointing at the
+  // old one, which stays alive and unchanged for as long as the handle is held.
+  insert_dummy(cache, "idx", make_meta("docs", "embedding", Metric::CosineExpanded));
+
+  REQUIRE(old_handle->meta.column_name == "vec");
+  REQUIRE(cache.find("idx")->meta.column_name == "embedding");
 }

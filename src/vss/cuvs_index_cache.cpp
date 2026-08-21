@@ -55,19 +55,6 @@ cuvs_index_cache::cuvs_index_cache(
 // the header) is destroyed here, where cucascade::memory::reservation is complete.
 cuvs_index_cache::~cuvs_index_cache() = default;
 
-// Explicit move assignment op
-pinned_index_entry& pinned_index_entry::operator=(pinned_index_entry&& other) noexcept
-{
-  if (this != &other) {
-    index.reset();
-    reservation.reset();
-    meta        = std::move(other.meta);
-    reservation = std::move(other.reservation);
-    index       = std::move(other.index);
-  }
-  return *this;
-}
-
 std::unique_ptr<cucascade::memory::reservation> cuvs_index_cache::reserve_index_memory(
   std::size_t bytes, int preferred_gpu)
 {
@@ -86,32 +73,32 @@ void cuvs_index_cache::insert(std::string name,
                               std::unique_ptr<any_cuvs_index> index,
                               std::unique_ptr<cucascade::memory::reservation> reservation)
 {
-  pinned_index_entry entry;
-  entry.meta        = std::move(meta);
-  entry.index       = std::move(index);
-  entry.reservation = std::move(reservation);
+  auto entry         = std::make_shared<pinned_index_entry>();
+  entry->meta        = std::move(meta);
+  entry->index       = std::move(index);
+  entry->reservation = std::move(reservation);
 
   std::lock_guard<std::mutex> lock(_mutex);
   _entries[std::move(name)] = std::move(entry);
 }
 
-const pinned_index_entry* cuvs_index_cache::find(std::string_view name) const
+std::shared_ptr<const pinned_index_entry> cuvs_index_cache::find(std::string_view name) const
 {
   std::lock_guard<std::mutex> lock(_mutex);
   auto it = _entries.find(std::string(name));
-  return it == _entries.end() ? nullptr : &it->second;
+  return it == _entries.end() ? nullptr : it->second;
 }
 
-const pinned_index_entry* cuvs_index_cache::find_by_column(
+std::shared_ptr<const pinned_index_entry> cuvs_index_cache::find_by_column(
   std::string_view table, std::string_view column, cuvs::distance::DistanceType metric) const
 {
   std::lock_guard<std::mutex> lock(_mutex);
   auto const wanted = canonical_metric(metric);
   for (auto const& kv : _entries) {
     auto const& entry = kv.second;
-    if (entry.meta.table_name == table && entry.meta.column_name == column &&
-        canonical_metric(entry.meta.metric) == wanted) {
-      return &entry;
+    if (entry->meta.table_name == table && entry->meta.column_name == column &&
+        canonical_metric(entry->meta.metric) == wanted) {
+      return entry;
     }
   }
   return nullptr;

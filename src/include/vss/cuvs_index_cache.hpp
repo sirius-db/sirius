@@ -98,19 +98,16 @@ template <class Index>
 /// index's device buffers were allocated through
 /// @c reservation->get_memory_resource(), so Sirius owns every byte and
 /// releasing the reservation frees the index. Move-only (owns unique resources).
+///
+/// The cache stores entries as @c shared_ptr, and lookups hand back a shared
+/// handle, so a caller that is mid-search keeps the whole entry (index +
+/// reservation) alive even if it is dropped or replaced concurrently.
 struct pinned_index_entry {
   // The index's device buffers were allocated through reservation,
   // so the index must be freed before the reservation.
   index_metadata meta;
   std::unique_ptr<cucascade::memory::reservation> reservation;
   std::unique_ptr<any_cuvs_index> index;
-
-  pinned_index_entry()                     = default; // default constructor
-  pinned_index_entry(pinned_index_entry&&) = default; // default move constructor
-
-  // The move assignment op (frees the old payload and installs the new one) needs to release the
-  // old payload in the same order as the destructor (i.e., index before reservation, see .cpp).
-  pinned_index_entry& operator=(pinned_index_entry&& other) noexcept;
 
   /// Recover the concrete cuVS index, or nullptr if the held index is not of
   /// type @c Index. The returned pointer is owned by this entry.
@@ -137,10 +134,14 @@ struct pinned_index_entry {
 /// allocates outside Sirius's cucascade reservation manager.
 ///
 /// Lifetime: entries live until @ref erase / @ref clear or session teardown.
-/// There is no eviction or spilling yet (future work), so a pointer returned by
-/// @ref find stays valid until the named entry is explicitly removed.
+/// There is no eviction or spilling yet (future work). Lookups return a shared
+/// handle to the entry, so the entry (and its reservation) stays alive for as
+/// long as any caller holds the handle, even if the named entry is erased or
+/// replaced in the meantime.
 ///
-/// Thread-safety: all members are guarded by an internal mutex.
+/// Thread-safety: all members are guarded by an internal mutex. The mutex only
+/// guards the map itself; the shared handle returned by a lookup is what keeps
+/// the entry alive after the lock is released.
 class cuvs_index_cache {
  public:
   explicit cuvs_index_cache(cucascade::memory::memory_reservation_manager& reservation_manager);
@@ -167,16 +168,18 @@ class cuvs_index_cache {
     std::size_t bytes, int preferred_gpu = -1);
 
   /// Pin a built index under @p name, replacing any existing entry with that
-  /// name (its old index + reservation are freed). Takes ownership of both the
-  /// index payload and its reservation.
+  /// name. The old entry is unlinked here; its index and reservation are freed
+  /// once no outstanding lookup handle still refers to it. Takes ownership of
+  /// both the index payload and its reservation.
   void insert(std::string name,
               index_metadata meta,
               std::unique_ptr<any_cuvs_index> index,
               std::unique_ptr<cucascade::memory::reservation> reservation);
 
   /// Look up a pinned index by its management name, or nullptr if absent. The
-  /// pointer is stable until the entry is erased (no eviction).
-  [[nodiscard]] const pinned_index_entry* find(std::string_view name) const;
+  /// returned handle keeps the entry alive for as long as it is held, even if the
+  /// entry is erased or replaced afterward (no eviction).
+  [[nodiscard]] std::shared_ptr<const pinned_index_entry> find(std::string_view name) const;
 
   /// Find a pinned index by its auto-routing identity, i.e., the first entry whose
   /// metadata matches (@p table, @p column, @p metric). This is the lookup a
@@ -184,14 +187,18 @@ class cuvs_index_cache {
   /// nullptr if no pinned index covers that column under that metric. Metrics
   /// are compared up to canonicalization: L2SqrtExpanded/L2SqrtUnexpanded fold
   /// together, so a query's unexpanded metric still matches an index built expanded.
-  [[nodiscard]] const pinned_index_entry* find_by_column(std::string_view table,
-                                                         std::string_view column,
-                                                         cuvs::distance::DistanceType metric) const;
+  ///
+  /// Like @ref find, the returned handle keeps the entry alive while held.
+  [[nodiscard]] std::shared_ptr<const pinned_index_entry> find_by_column(
+    std::string_view table,
+    std::string_view column,
+    cuvs::distance::DistanceType metric) const;
 
   [[nodiscard]] bool contains(std::string_view name) const;
 
-  /// Remove the entry for @p name, freeing its index and releasing its
-  /// reservation. Returns true iff an entry was removed.
+  /// Remove the entry for @p name. Its index and reservation are freed once no
+  /// outstanding lookup handle still refers to it. Returns true iff an entry was
+  /// removed.
   bool erase(std::string_view name);
 
   /// Drop all pinned indexes.
@@ -202,7 +209,7 @@ class cuvs_index_cache {
  private:
   cucascade::memory::memory_reservation_manager& _reservation_manager;
   mutable std::mutex _mutex;
-  std::unordered_map<std::string, pinned_index_entry> _entries;
+  std::unordered_map<std::string, std::shared_ptr<pinned_index_entry>> _entries;
 };
 
 }  // namespace sirius::vss
