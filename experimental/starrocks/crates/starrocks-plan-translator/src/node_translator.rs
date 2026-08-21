@@ -671,14 +671,11 @@ fn translate_hash_join(
         let mut expr_ctx = ctx.expr_context(&combined_tuples);
         conditions.push(expr.translate(&mut expr_ctx)?);
     }
-    if conditions.is_empty() {
-        return Err(TranslateError::UnsupportedPlanNode {
-            node_id: node.node_id,
-            node_type: node.node_type,
-            reason: "hash join without join conjuncts",
-        });
-    }
-    let condition = and_conditions(conditions, ctx);
+    let condition = and_conditions(conditions, ctx).ok_or(TranslateError::UnsupportedPlanNode {
+        node_id: node.node_id,
+        node_type: node.node_type,
+        reason: "hash join without join conjuncts",
+    })?;
 
     // Anti joins (from NOT IN / NOT EXISTS rewrites) are not translated: DuckDB's Substrait
     // consumer has no left-anti conversion, so an emitted plan would fail downstream anyway.
@@ -721,8 +718,8 @@ fn translate_hash_join(
     apply_conjuncts(joined, node, ctx)
 }
 
-/// Translates a `NESTLOOP_JOIN_NODE` into a Substrait cross product (plus a filter when the
-/// join carries conjuncts). Only inner/cross nested-loop joins are supported.
+/// Translates a `NESTLOOP_JOIN_NODE` into a Substrait cross product with the join conjuncts as a
+/// filter on top. Only inner/cross nested-loop joins are supported.
 fn translate_nestloop_join(
     node: &TPlanNode,
     children: Vec<TranslatedRel>,
@@ -752,72 +749,61 @@ fn translate_nestloop_join(
     let row_tuples = [left.row_tuples.as_slice(), right.row_tuples.as_slice()].concat();
     let output_width = left.output_width + right.output_width;
 
-    let cross = TranslatedRel {
+    let mut conditions = Vec::new();
+    for expr in join.join_conjuncts.as_deref().unwrap_or_default() {
+        let mut expr_ctx = ctx.expr_context(&row_tuples);
+        conditions.push(expr.translate(&mut expr_ctx)?);
+    }
+    // A conjunct-free cross product is rejected: the GPU physical planner has no cross-product
+    // operator, so the plan would translate and then fail at execution.
+    let condition = and_conditions(conditions, ctx).ok_or(TranslateError::UnsupportedPlanNode {
+        node_id: node.node_id,
+        node_type: node.node_type,
+        reason: "cross joins without join conjuncts are not supported",
+    })?;
+
+    let cross = Rel {
+        rel_type: Some(rel::RelType::Cross(Box::new(CrossRel {
+            left: Some(Box::new(left.rel)),
+            right: Some(Box::new(right.rel)),
+            ..Default::default()
+        }))),
+    };
+    let filtered = TranslatedRel {
         rel: Rel {
-            rel_type: Some(rel::RelType::Cross(Box::new(CrossRel {
-                left: Some(Box::new(left.rel)),
-                right: Some(Box::new(right.rel)),
+            rel_type: Some(rel::RelType::Filter(Box::new(FilterRel {
+                input: Some(Box::new(cross)),
+                condition: Some(Box::new(condition)),
                 ..Default::default()
             }))),
         },
         row_tuples,
         output_width,
     };
-
-    // A conjunct-free cross product is rejected: the GPU physical planner has no cross-product
-    // operator, so the plan would translate and then fail at execution.
-    if join
-        .join_conjuncts
-        .as_ref()
-        .is_none_or(|conjuncts| conjuncts.is_empty())
-    {
-        return Err(TranslateError::UnsupportedPlanNode {
-            node_id: node.node_id,
-            node_type: node.node_type,
-            reason: "cross joins without join conjuncts are not supported",
-        });
-    }
-    let filtered = if let Some(conjuncts) = join
-        .join_conjuncts
-        .as_ref()
-        .filter(|conjuncts| !conjuncts.is_empty())
-    {
-        let mut conditions = Vec::with_capacity(conjuncts.len());
-        for expr in conjuncts {
-            let mut expr_ctx = ctx.expr_context(&cross.row_tuples);
-            conditions.push(expr.translate(&mut expr_ctx)?);
-        }
-        let condition = and_conditions(conditions, ctx);
-        let TranslatedRel {
-            rel,
-            row_tuples,
-            output_width,
-        } = cross;
-        TranslatedRel {
-            rel: Rel {
-                rel_type: Some(rel::RelType::Filter(Box::new(FilterRel {
-                    input: Some(Box::new(rel)),
-                    condition: Some(Box::new(condition)),
-                    ..Default::default()
-                }))),
-            },
-            row_tuples,
-            output_width,
-        }
-    } else {
-        cross
-    };
     // Node conjuncts are post-join predicates over the join's output row.
     apply_conjuncts(filtered, node, ctx)
 }
 
-/// Combines one or more boolean conditions with `and`.
-fn and_conditions(mut conditions: Vec<Expression>, ctx: &mut PlanContext<'_>) -> Expression {
-    if conditions.len() == 1 {
-        return conditions.pop().unwrap();
+/// Combines boolean conditions with `and`.
+///
+/// `None` for an empty list: a zero-argument `and()` is not a valid Substrait expression, so what
+/// an absent condition means is the caller's decision.
+fn and_conditions(
+    mut conditions: Vec<Expression>,
+    ctx: &mut PlanContext<'_>,
+) -> Option<Expression> {
+    match conditions.len() {
+        0 => None,
+        1 => conditions.pop(),
+        _ => {
+            let anchor = ctx.registry.register_function(URN_BOOLEAN, "and");
+            Some(expr_translator::scalar_function(
+                anchor,
+                conditions,
+                crate::type_mapper::bool_type(),
+            ))
+        }
     }
-    let anchor = ctx.registry.register_function(URN_BOOLEAN, "and");
-    expr_translator::scalar_function(anchor, conditions, crate::type_mapper::bool_type())
 }
 
 /// Builds a Substrait read for a StarRocks scan tuple.
@@ -971,24 +957,14 @@ fn apply_conjuncts(
     node: &TPlanNode,
     ctx: &mut PlanContext<'_>,
 ) -> Result<TranslatedRel> {
-    let Some(conjuncts) = node.conjuncts.as_ref().filter(|_| has_conjuncts(node)) else {
-        return Ok(input);
-    };
+    let conjuncts = node.conjuncts.as_deref().unwrap_or_default();
     let mut conditions = Vec::with_capacity(conjuncts.len());
     for expr in conjuncts {
         let mut expr_ctx = ctx.expr_context(&input.row_tuples);
         conditions.push(expr.translate(&mut expr_ctx)?);
     }
-    let condition = match conditions.len() {
-        1 => conditions.pop().unwrap(),
-        _ => {
-            let and_anchor = ctx.registry.register_function(URN_BOOLEAN, "and");
-            expr_translator::scalar_function(
-                and_anchor,
-                conditions,
-                crate::type_mapper::bool_type(),
-            )
-        }
+    let Some(condition) = and_conditions(conditions, ctx) else {
+        return Ok(input);
     };
 
     // A filter does not change the column layout, so the width passes through.
