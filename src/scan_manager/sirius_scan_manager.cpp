@@ -665,8 +665,6 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
 ///    must have exactly ONE next port, or a batch from some other producer
 ///    could reach the port and be materialized against origins that do not
 ///    describe it.
-///  * THE VOLUME. Optional floor on the first ridden aggregate's input; see
-///    late_mat::min_group_by_rowid_input_rows (inert by default).
 ///
 /// @return the proving column's name when the ride is admitted.
 std::optional<std::string> admit_group_key_extension(
@@ -714,19 +712,6 @@ std::optional<std::string> admit_group_key_extension(
       "neither a group key riding real nor a deferred column is proven unique over the "
       "pinned table");
     return std::nullopt;
-  }
-
-  auto const floor = late_mat::min_group_by_rowid_input_rows();
-  if (floor > 0 && !extension.group_bys.empty()) {
-    auto const* first = extension.group_bys.front();
-    std::size_t const input_rows =
-      (first != nullptr && !first->children.empty() && first->children[0])
-        ? first->children[0]->estimated_cardinality
-        : 0;
-    if (input_rows > 0 && input_rows < floor) {
-      say("the first ridden aggregate reads fewer rows than the group-by-rowid floor");
-      return std::nullopt;
-    }
   }
 
   // Walk the pipelines from the sound port to the far one. The sound port is

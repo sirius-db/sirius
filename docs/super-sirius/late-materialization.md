@@ -31,7 +31,6 @@ using `all`; without a proof there is no group-by-rowid ride and no riders.
 | `SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS` | 300000000 | Row cap on the exact uniqueness stage, so a fact table does not buy a sort per column at pin time. |
 | `SIRIUS_EXP_LATE_MAT_MIN_BOUNDARIES` | 4 | Port crossings a ride must save. |
 | `SIRIUS_EXP_LATE_MAT_MIN_VALUE_X_BOUNDARIES` | 128 | Net bytes/row TIMES crossings saved — value and crossings trade off, so this is the floor that matters. |
-| `SIRIUS_EXP_LATE_MAT_GBR_MIN_GROUP_ROWS` | 0 (inert) | Floor on the first ridden aggregate's input rows. Never calibrated. |
 | `SIRIUS_EXP_LATE_MAT_COUNT_DEFER` | off | Count-on-deferred (below). |
 | `SIRIUS_EXP_LATE_MAT_MIN_VALUE_COMPRESSED` | = the ordinary floor | Separate floor for compressed origins. Inert until the decode-skip exists to measure. |
 

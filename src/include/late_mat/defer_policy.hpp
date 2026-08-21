@@ -124,28 +124,6 @@ inline std::int64_t default_min_value_x_boundaries()
   return value;
 }
 
-/// Group-input floor for the group-by-rowid ride, in rows
-/// (SIRIUS_EXP_LATE_MAT_GBR_MIN_GROUP_ROWS, default 0 = inert).
-///
-/// The longer ride pays fixed costs the short one does not — hashing a rowid
-/// key, and a gather per group at the far end — so on a small aggregate it can
-/// cost more than the carrying it avoids. The floor is measured against the
-/// FIRST ridden aggregate's estimated input rows. Default off: on the shapes
-/// measured so far the ride wins wherever it is admissible at all, and a
-/// threshold nobody has calibrated is a way to refuse the case that pays.
-inline std::size_t min_group_by_rowid_input_rows()
-{
-  static std::size_t const value = []() -> std::size_t {
-    char const* v = std::getenv("SIRIUS_EXP_LATE_MAT_GBR_MIN_GROUP_ROWS");
-    if (v == nullptr || v[0] == '\0') { return 0; }
-    std::size_t parsed = 0;
-    auto const* end    = v + std::strlen(v);
-    auto const rc      = std::from_chars(v, end, parsed);
-    return (rc.ec == std::errc{} && rc.ptr == end) ? parsed : 0;
-  }();
-  return value;
-}
-
 /// Count-on-deferred admit switch (SIRIUS_EXP_LATE_MAT_COUNT_DEFER, default OFF).
 ///
 /// A column read only by COUNTs can ride and never come back: the aggregate
