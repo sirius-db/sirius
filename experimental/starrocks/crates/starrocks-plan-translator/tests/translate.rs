@@ -2252,8 +2252,8 @@ fn join_desc() -> TDescriptorTable {
     desc_table(
         vec![(0, Some(100)), (1, Some(100))],
         vec![
-            slot(1, 0, 0, "a", scalar_type(TPrimitiveType::BIGINT)),
-            slot(1, 1, 0, "b", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 0, "a", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 1, "b", scalar_type(TPrimitiveType::BIGINT)),
         ],
     )
 }
@@ -2265,9 +2265,9 @@ fn wide_join_desc() -> TDescriptorTable {
     desc_table(
         vec![(0, Some(100)), (1, Some(100))],
         vec![
-            slot(1, 0, 0, "a", scalar_type(TPrimitiveType::BIGINT)),
-            slot(2, 0, 1, "b", scalar_type(TPrimitiveType::BIGINT)),
-            slot(1, 1, 0, "c", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 0, "a", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "b", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 1, "c", scalar_type(TPrimitiveType::BIGINT)),
         ],
     )
 }
@@ -2313,24 +2313,6 @@ fn argument_field_indices(scalar: &expression::ScalarFunction) -> Vec<i32> {
             other => panic!("unexpected argument {other:?}"),
         })
         .collect()
-}
-
-/// Extracts the field index from a direct struct-field reference.
-fn field_index(expr: &substrait::proto::Expression) -> i32 {
-    let expression::RexType::Selection(selection) = expr.rex_type.as_ref().unwrap() else {
-        panic!("expected field reference");
-    };
-    let expression::field_reference::ReferenceType::DirectReference(segment) =
-        selection.reference_type.as_ref().unwrap()
-    else {
-        panic!("expected direct reference");
-    };
-    let expression::reference_segment::ReferenceType::StructField(field) =
-        segment.reference_type.as_ref().unwrap()
-    else {
-        panic!("expected struct field");
-    };
-    field.field
 }
 
 /// Verifies an inner hash join becomes a Substrait join whose equality condition references the
