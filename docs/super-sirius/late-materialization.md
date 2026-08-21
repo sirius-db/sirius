@@ -7,8 +7,8 @@ what is IN them.
 
 Late materialization replaces those columns at the scan with a pin-order **rowid**, carries that
 instead, and puts the values back at the far end by gathering them out of the pinned table. It
-works only for a **pinned** table — the values have to still exist somewhere addressable when
-the far end asks for them.
+works only for a **GPU-tier pinned** table — the values have to still exist somewhere
+addressable when the far end asks for them, and that is what the pin guarantees.
 
 ## Turning it on (experimental)
 
@@ -122,6 +122,15 @@ deferral with a single half, admitted only over pinned columns with no nulls. Of
 - Filtered scans of compressed pins are refused (above).
 - Deferred-value widths are ESTIMATED for variable-width columns, which can only refuse a bundle
   that would have qualified.
+- **Host-tier pins are refused**, not just unpinned scans: `install_late_materialization`
+  declines on tier, and `resolve_pinned_layout`/`resolve_pinned_column` refuse independently at
+  the far end. Supporting them would mean staging a chunk back to the device per gather, so the
+  ride would have to repay a host round trip rather than a device read.
+- **A non-pinned scan cannot defer at all.** A fresh parquet or DuckDB-native read consumes its
+  decoded batch, so there is nothing for the port to gather from. Deferring against a file would
+  mean a rowid addressing a file offset and a re-read per gather — the shape classic disk-based
+  late materialization takes, and a different cost model from this one, whose floors are
+  calibrated against a device-memory gather.
 
 ## Results
 
