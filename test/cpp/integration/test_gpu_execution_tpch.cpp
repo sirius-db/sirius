@@ -25,6 +25,7 @@
 #include <duckdb/common/enums/optimizer_type.hpp>
 #include <duckdb/main/config.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
+#include <utils/log_test_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/tpch_queries.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
@@ -4422,7 +4423,12 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 20 parquet",
                  "[integration][gpu_execution][parquet][TPC-H][Q20]")
 {
+  sirius::test::scoped_recording_log_sink logs{"warn"};
   RUN_TPCH_MGPU(sirius::test::kTpchQ20);
+  for (auto const& record : logs.records()) {
+    CHECK(record.message.find("RIGHT_DELIM_JOIN") == std::string::npos);
+    CHECK(record.message.find("output batch") == std::string::npos);
+  }
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,

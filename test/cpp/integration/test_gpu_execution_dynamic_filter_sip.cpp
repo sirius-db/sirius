@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -53,6 +54,7 @@ struct dynamic_filter_switch_guard {
   bool original;
 };
 
+// Set the multi-partition subordinate switch for one scope and restore it on exit.
 struct dynamic_filter_multi_partition_switch_guard {
   dynamic_filter_multi_partition_switch_guard(duckdb::Connection& c, bool enabled)
     : con(c),
@@ -111,6 +113,7 @@ struct publication_deltas {
 struct switch_comparison {
   publication_deltas off;
   publication_deltas on;
+  std::vector<std::vector<std::string>> rows;
 };
 
 publication_deltas run_and_measure(duckdb::Connection& con,
@@ -152,6 +155,7 @@ switch_comparison require_switch_result_equivalence(duckdb::Connection& con,
   }
 
   REQUIRE(on_rows == off_rows);
+  deltas.rows = std::move(on_rows);
   return deltas;
 }
 
@@ -220,8 +224,7 @@ TEST_CASE("the dynamic-filter Bloom cap is exposed through SQL",
   REQUIRE_FALSE(restored->HasError());
 }
 
-// Verify result parity for derived-build and build-block routes; plan-shape tests pin placement.
-TEST_CASE("gpu_execution - derived-build and build-block routes preserve results",
+TEST_CASE("gpu_execution - opaque-build and build-block routes preserve results",
           "[integration][gpu_execution][dynamic_filter]")
 {
   REQUIRE(sirius::test::g_integration_env != nullptr);
@@ -252,8 +255,6 @@ TEST_CASE("gpu_execution - derived-build and build-block routes preserve results
                                         "WHERE c.c_nationkey = 3");
 
     REQUIRE(deltas.off.producers_enabled == 0);
-
-    // Check each publication stage independently.
     REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
     REQUIRE(deltas.on.membership_filters_built > deltas.off.membership_filters_built);
     REQUIRE(deltas.on.filters_pushed > deltas.off.filters_pushed);
@@ -261,8 +262,7 @@ TEST_CASE("gpu_execution - derived-build and build-block routes preserve results
 
   SECTION("a LEFT join in the query keeps results identical while SIP is active")
   {
-    // Use the same structural attribution as the inner-join case. Dedicated plan-shape tests
-    // cover LEFT-join descent.
+    // Dedicated plan-shape tests cover LEFT-join descent.
     sirius::test::disabled_optimizers_guard shape(
       con, "statistics_propagation,join_order,build_side_probe_side");
     sirius::test::coverage_gate_disable_guard gate_off(con);
@@ -278,6 +278,83 @@ TEST_CASE("gpu_execution - derived-build and build-block routes preserve results
     REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
     REQUIRE(deltas.on.membership_filters_built > deltas.off.membership_filters_built);
     REQUIRE(deltas.on.filters_pushed > deltas.off.filters_pushed);
+  }
+
+  SECTION("a RIGHT join admits build-block descent")
+  {
+    sirius::test::disabled_optimizers_guard shape(
+      con, "statistics_propagation,join_order,build_side_probe_side");
+    sirius::test::coverage_gate_disable_guard gate_off(con);
+    auto const deltas =
+      require_switch_result_equivalence(con,
+                                        "SELECT count(*), count(o.o_orderkey) "
+                                        "FROM orders o "
+                                        "RIGHT JOIN customer c ON o.o_custkey = c.c_custkey "
+                                        "JOIN nation n ON c.c_nationkey = n.n_nationkey "
+                                        "WHERE n.n_regionkey = 3");
+
+    REQUIRE(deltas.off.producers_enabled == 0);
+    REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
+    REQUIRE(deltas.on.membership_filters_built > deltas.off.membership_filters_built);
+    REQUIRE(deltas.on.filters_pushed > deltas.off.filters_pushed);
+    REQUIRE(deltas.rows.size() == 1);
+    REQUIRE(deltas.rows[0].size() == 2);
+    CHECK(std::stoull(deltas.rows[0][0]) > std::stoull(deltas.rows[0][1]));
+  }
+
+  SECTION("a FULL OUTER join admits build-block descent under equality semantics")
+  {
+    sirius::test::disabled_optimizers_guard shape(
+      con, "statistics_propagation,join_order,build_side_probe_side");
+    sirius::test::coverage_gate_disable_guard gate_off(con);
+    auto const deltas =
+      require_switch_result_equivalence(con,
+                                        "SELECT count(*), count(o.o_orderkey) "
+                                        "FROM orders o "
+                                        "FULL OUTER JOIN customer c ON o.o_custkey = c.c_custkey "
+                                        "JOIN nation n ON c.c_nationkey = n.n_nationkey "
+                                        "WHERE n.n_regionkey = 3");
+
+    REQUIRE(deltas.off.producers_enabled == 0);
+    REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
+    REQUIRE(deltas.on.membership_filters_built > deltas.off.membership_filters_built);
+    REQUIRE(deltas.on.filters_pushed > deltas.off.filters_pushed);
+    REQUIRE(deltas.rows.size() == 1);
+    REQUIRE(deltas.rows[0].size() == 2);
+    CHECK(std::stoull(deltas.rows[0][0]) > std::stoull(deltas.rows[0][1]));
+  }
+
+  SECTION("RIGHT, FULL OUTER, and ANTI joins admit probe-block descent")
+  {
+    sirius::test::disabled_optimizers_guard shape(
+      con, "statistics_propagation,join_order,build_side_probe_side");
+    sirius::test::coverage_gate_disable_guard gate_off(con);
+    std::vector<std::string> const queries{
+      "SELECT count(*), sum(o.o_orderkey) "
+      "FROM orders o "
+      "RIGHT JOIN customer c ON o.o_custkey = c.c_custkey "
+      "JOIN lineitem l ON o.o_orderkey = l.l_orderkey "
+      "WHERE l.l_shipdate < DATE '1992-02-01'",
+      "SELECT count(*), sum(o.o_orderkey) "
+      "FROM orders o "
+      "FULL OUTER JOIN customer c ON o.o_custkey = c.c_custkey "
+      "JOIN lineitem l ON o.o_orderkey = l.l_orderkey "
+      "WHERE l.l_shipdate < DATE '1992-02-01'",
+      "SELECT count(*), sum(o.o_orderkey) "
+      "FROM orders o "
+      "ANTI JOIN nation n ON o.o_custkey = n.n_nationkey "
+      "JOIN lineitem l ON o.o_orderkey = l.l_orderkey "
+      "WHERE l.l_shipdate < DATE '1992-02-01'"};
+
+    for (auto const& query : queries) {
+      CAPTURE(query);
+      auto const deltas = require_switch_result_equivalence(con, query);
+
+      REQUIRE(deltas.off.producers_enabled == 0);
+      REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
+      REQUIRE(deltas.on.membership_filters_built > deltas.off.membership_filters_built);
+      REQUIRE(deltas.on.filters_pushed > deltas.off.filters_pushed);
+    }
   }
 
   SECTION("a null-equal producing condition still returns identical results")
@@ -297,7 +374,7 @@ TEST_CASE("gpu_execution - derived-build and build-block routes preserve results
   SECTION("an endpoint whose channel receives no filter passes rows through")
   {
     // The customer predicate produces no rows but remains inside the column statistics, preserving
-    // the join in the plan. The empty-build endpoint receives no filter and must pass rows through.
+    // the join in the plan.
     require_switch_result_equivalence(con,
                                       "SELECT count(*), sum(o.o_custkey) "
                                       "FROM lineitem l "
@@ -309,9 +386,7 @@ TEST_CASE("gpu_execution - derived-build and build-block routes preserve results
   SECTION("a single-partition MIXED_JOIN publishes through the partition fold")
   {
     // An equality plus an inequality condition puts the join in MIXED_JOIN mode, which
-    // compute_hash_join_partition_strategy excludes from BUILD_PROBE. Such a join could not
-    // publish at all until the PARTITION started folding a single-partition build for any
-    // publishing join.
+    // compute_hash_join_partition_strategy excludes from BUILD_PROBE.
     sirius::test::coverage_gate_disable_guard gate_off(con);
     auto const deltas = require_switch_result_equivalence(
       con,
@@ -327,11 +402,19 @@ TEST_CASE("gpu_execution - derived-build and build-block routes preserve results
 
   SECTION("a multi-partition build obeys the subordinate switch")
   {
+    // Correctness stake: a filter built from one partition's slice of the build keys would drop
+    // probe rows that do join, so this must be pinned on a build that really spans partitions.
+    // The summed columns exist only to keep the projection from pruning them, widening the build
+    // past broadcast candidacy. Reaching a genuinely partition-sliced build needs all three pins:
+    // broadcast off, a small hash-partition target so the natural count exceeds one, and a build
+    // budget below the build size so BUILD_PROBE cannot fold it back to one table per GPU.
     sirius::test::disabled_optimizers_guard shape(
       con, "statistics_propagation,join_order,build_side_probe_side");
     sirius::test::coverage_gate_disable_guard gate_off(con);
     sirius::test::scoped_setting no_broadcast(con, "max_broadcast_join_size", 1);
     sirius::test::scoped_setting small_partitions(con, "hash_partition_bytes", 8ULL * 1024 * 1024);
+    sirius::test::scoped_setting small_build_budget(
+      con, "max_build_hash_table_bytes", 8ULL * 1024 * 1024);
     auto const query =
       "select count(*), sum(l.l_partkey), sum(l.l_suppkey), sum(l.l_linenumber), "
       "       sum(l.l_quantity), sum(l.l_extendedprice), sum(l.l_discount), sum(l.l_tax) "
@@ -376,10 +459,10 @@ TEST_CASE("gpu_execution - derived-build and build-block routes preserve results
     }
   }
 
-  SECTION("an unfiltered aggregate build supplies derived evidence")
+  SECTION("an unfiltered aggregate build supplies no publication evidence")
   {
-    // No predicate appears anywhere in the build subtree, so only the derivation marker on the
-    // aggregate arms discovery. The join order is pinned so the aggregate stays the build side.
+    // The join order is pinned so the aggregate stays the build side. With no filter in that
+    // visible subtree and no opaque build root, enabling dynamic filters must arm no producer.
     sirius::test::disabled_optimizers_guard shape(con, "join_order,build_side_probe_side");
     sirius::test::coverage_gate_disable_guard gate_off(con);
     auto const deltas = require_switch_result_equivalence(
@@ -388,12 +471,12 @@ TEST_CASE("gpu_execution - derived-build and build-block routes preserve results
       "join (select l_orderkey from lineitem group by l_orderkey) g "
       "on l.l_orderkey = g.l_orderkey");
 
-    REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
+    REQUIRE(deltas.off.producers_enabled == 0);
+    REQUIRE(deltas.on.producers_enabled == deltas.off.producers_enabled);
   }
 
-  SECTION("TPC-H q17: a delim-scan build wires only through derived-build evidence")
+  SECTION("TPC-H q17: a delim-scan build wires only through opaque-build evidence")
   {
-    // q17's DELIM_GET build uses derived evidence to bind the internal lineitem scan.
     auto const deltas =
       require_switch_result_equivalence(con,
                                         "select sum(l.l_extendedprice) / 7.0 as avg_yearly "

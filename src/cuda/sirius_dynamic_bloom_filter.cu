@@ -16,8 +16,10 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/stream_compaction.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
 
-// cucascade
 #include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
 
@@ -25,7 +27,9 @@
 #include <cuco/bloom_filter_policies.cuh>
 #include <cuco/hash_functions.cuh>
 #include <cuda/sirius_rmm_cuco_allocator.cuh>
+#include <cuda/std/bit>
 #include <cuda/std/cstddef>
+#include <cuda/std/limits>
 #include <cuda/stream_ref>
 
 #include <cucascade/memory/memory_space.hpp>
@@ -50,11 +54,10 @@
 namespace sirius::op {
 
 namespace {
-// ~16 bits/key → num_blocks ≈ keys/16
 constexpr std::size_t kBitsPerBlock                 = 256;
 constexpr std::size_t kTargetBitsPerKey             = 16;
-constexpr std::size_t kMaximumReductionScratchBytes = 4U * 1024U * 1024U;
 constexpr std::size_t kBytesPerBlock                = kBitsPerBlock / 8;
+constexpr std::size_t kMaximumReductionScratchBytes = 4U * 1024U * 1024U;
 
 std::size_t blocks_for(std::size_t num_keys)
 {
@@ -65,29 +68,68 @@ std::size_t blocks_for(std::size_t num_keys)
 
 using bloom_alloc = sirius::rmm_cuco_allocator<cuda::std::byte>;
 
+/**
+ * @brief cuco-compatible Bloom policy using Lemire fast-range
+ *
+ * Arrow's policy caps filter size, while cuco's default uses costly 64-bit modulo. Construction
+ * and lookup share this mapping, preserving the no-false-negative contract.
+ */
 template <class KeyT>
-using arrow_policy = cuco::arrow_filter_policy<KeyT>;
-template <class KeyT>
-using default_policy = cuco::default_filter_policy<cuco::xxhash_64<KeyT>, std::uint32_t, 8>;
+class sirius_bloom_policy {
+ public:
+  using hasher             = cuco::xxhash_64<KeyT>;
+  using word_type          = std::uint32_t;
+  using hash_argument_type = typename hasher::argument_type;
+  using hash_result_type   = decltype(std::declval<hasher>()(std::declval<hash_argument_type>()));
 
-template <class KeyT, class Policy>
-using bloom_filter_for = cuco::
-  bloom_filter<KeyT, cuco::extent<std::size_t>, cuda::thread_scope_device, Policy, bloom_alloc>;
+  static constexpr std::uint32_t words_per_block = 8;
+
+ private:
+  static constexpr std::uint32_t word_bits       = cuda::std::numeric_limits<word_type>::digits;
+  static constexpr std::uint32_t bit_index_width = cuda::std::bit_width(word_bits - 1);
+  static constexpr word_type bit_index_mask      = (word_type{1} << bit_index_width) - 1;
+
+  static_assert(words_per_block * bit_index_width <=
+                  cuda::std::numeric_limits<hash_result_type>::digits,
+                "hash is too narrow to supply one fingerprint bit per word");
+
+ public:
+  __device__ constexpr hash_result_type hash(hash_argument_type const& key) const
+  {
+    return hash_(key);
+  }
+
+  template <class Extent>
+  [[nodiscard]] __device__ constexpr Extent block_index(hash_result_type hash,
+                                                        Extent num_blocks) const
+  {
+    auto const wide = static_cast<__uint128_t>(static_cast<std::uint64_t>(hash)) *
+                      static_cast<__uint128_t>(static_cast<std::uint64_t>(num_blocks));
+    return static_cast<Extent>(static_cast<std::uint64_t>(wide >> 64));
+  }
+
+  [[nodiscard]] __device__ constexpr word_type word_pattern(hash_result_type hash,
+                                                            std::uint32_t word_index) const
+  {
+    return word_type{1} << ((hash >> (word_index * bit_index_width)) & bit_index_mask);
+  }
+
+ private:
+  hasher hash_{};
+};
 
 template <class KeyT>
-using arrow_bloom = bloom_filter_for<KeyT, arrow_policy<KeyT>>;
-
-template <class KeyT>
-using standard_bloom = bloom_filter_for<KeyT, default_policy<KeyT>>;
+using sirius_bloom = cuco::bloom_filter<KeyT,
+                                        cuco::extent<std::size_t>,
+                                        cuda::thread_scope_device,
+                                        sirius_bloom_policy<KeyT>,
+                                        bloom_alloc>;
 
 template <class Filter>
 using bloom_owner = std::unique_ptr<Filter>;
 
-// The four legal key-width/policy combinations. A live replica owns exactly one alternative.
-using bloom_storage = std::variant<bloom_owner<arrow_bloom<std::int32_t>>,
-                                   bloom_owner<standard_bloom<std::int32_t>>,
-                                   bloom_owner<arrow_bloom<std::int64_t>>,
-                                   bloom_owner<standard_bloom<std::int64_t>>>;
+using bloom_storage =
+  std::variant<bloom_owner<sirius_bloom<std::int32_t>>, bloom_owner<sirius_bloom<std::int64_t>>>;
 
 template <class Filter>
 bloom_owner<Filter> make_bloom(std::size_t num_blocks,
@@ -126,20 +168,6 @@ __global__ void or_bloom_words(Word* destination, Word const* source, std::size_
 {
   auto const index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (index < count) { destination[index] |= source[index]; }
-}
-
-template <class Filter>
-bloom_owner<Filter> build_bloom(cudf::column_view const& keys,
-                                std::size_t num_blocks,
-                                rmm::device_async_resource_ref mr,
-                                cuda::stream_ref stream)
-{
-  using key_type = typename Filter::key_type;
-  auto result    = make_bloom<Filter>(num_blocks, mr, stream);
-  auto const* d  = keys.data<key_type>();
-  auto const n   = keys.size();
-  result->add_async(d, d + n, stream);
-  return result;
 }
 
 template <class KeyT>
@@ -184,35 +212,20 @@ std::unique_ptr<bloom_replica> make_empty_bloom_replica(int device_id,
                                                         rmm::device_async_resource_ref mr,
                                                         cuda::stream_ref stream)
 {
-  if (num_blocks <= arrow_policy<KeyT>::max_filter_blocks) {
-    return std::make_unique<bloom_replica>(device_id,
-                                           make_bloom<arrow_bloom<KeyT>>(num_blocks, mr, stream));
-  }
   return std::make_unique<bloom_replica>(device_id,
-                                         make_bloom<standard_bloom<KeyT>>(num_blocks, mr, stream));
-}
-
-template <class KeyT>
-std::unique_ptr<bloom_replica> build_bloom_replica(int device_id,
-                                                   cudf::column_view const& keys,
-                                                   std::size_t num_blocks,
-                                                   rmm::device_async_resource_ref mr,
-                                                   cuda::stream_ref stream)
-{
-  if (num_blocks <= arrow_policy<KeyT>::max_filter_blocks) {
-    return std::make_unique<bloom_replica>(
-      device_id, build_bloom<arrow_bloom<KeyT>>(keys, num_blocks, mr, stream));
-  }
-  return std::make_unique<bloom_replica>(
-    device_id, build_bloom<standard_bloom<KeyT>>(keys, num_blocks, mr, stream));
+                                         make_bloom<sirius_bloom<KeyT>>(num_blocks, mr, stream));
 }
 }  // namespace
 
 // Owns the complete set of ready device-local Bloom replicas.
 struct sirius_dynamic_bloom_filter::impl {
   int source_device = -1;
+  // Retained for null-compaction inside add() and for scratch allocation.
+  rmm::device_async_resource_ref mr;
   std::vector<std::unique_ptr<bloom_replica>> replicas;
   std::unique_ptr<rmm::device_buffer> reduction_scratch;
+
+  explicit impl(rmm::device_async_resource_ref mr) : mr{mr} {}
 
   ~impl()
   {
@@ -255,6 +268,7 @@ std::size_t sirius_dynamic_bloom_filter::estimated_bytes(std::size_t num_keys) n
   return detail::tracked_replica_allocation_bytes(raw_bytes);
 }
 
+// Sizing on the pre-compaction key count is conservative when nulls are dropped in add().
 sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const& keys,
                                                          rmm::cuda_stream_view stream,
                                                          rmm::device_async_resource_ref mr)
@@ -282,7 +296,7 @@ sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::data_type key_typ
   if (raw_bytes > maximum - (rmm::CUDA_ALLOCATION_ALIGNMENT - 1)) {
     throw std::length_error("[sirius_dynamic_bloom_filter] requested geometry is too large.");
   }
-  _impl = std::make_unique<impl>();
+  _impl = std::make_unique<impl>(mr);
   if (cudaGetDevice(&_impl->source_device) != cudaSuccess) {
     throw std::runtime_error("[sirius_dynamic_bloom_filter] failed to identify source device.");
   }
@@ -315,16 +329,24 @@ void sirius_dynamic_bloom_filter::add(cudf::column_view const& keys, rmm::cuda_s
   if (source == nullptr) {
     throw std::logic_error("[sirius_dynamic_bloom_filter::add] source replica is missing.");
   }
+  // A null row's payload is garbage; inserting it would poison the filter. Keep compacted
+  // storage alive until add_async is queued on stream.
+  std::unique_ptr<cudf::table> compacted;
+  cudf::column_view build_keys = keys;
+  if (keys.null_count() > 0) {
+    compacted  = cudf::drop_nulls(cudf::table_view{{keys}}, {0}, stream, _impl->mr);
+    build_keys = compacted->view().column(0);
+  }
   cuda::stream_ref const cuda_stream{stream.value()};
   std::visit(
     [&](auto& bloom) {
       using filter_type = typename std::decay_t<decltype(bloom)>::element_type;
       using key_type    = typename filter_type::key_type;
-      if (keys.type().id() != key_type_id<key_type>()) {
+      if (build_keys.type().id() != key_type_id<key_type>()) {
         throw std::invalid_argument("[sirius_dynamic_bloom_filter::add] key type mismatch.");
       }
-      auto const* data = keys.data<key_type>();
-      bloom->add_async(data, data + keys.size(), cuda_stream);
+      auto const* data = build_keys.data<key_type>();
+      bloom->add_async(data, data + build_keys.size(), cuda_stream);
     },
     source->bloom);
 }
@@ -349,8 +371,7 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
   }
   auto const& source_space = source_target->get_gpu_space();
 
-  // Retain all destination objects and streams until direct peer copies have been submitted to
-  // every target. The completion pass then waits on transfers already running in parallel.
+  // Keep copies and streams alive until all peer transfers are queued and synchronized.
   std::vector<std::pair<std::unique_ptr<bloom_replica>, rmm::cuda_stream_view>> pending;
   pending.reserve(spaces.size());
   _impl->replicas.reserve(_impl->replicas.size() + spaces.size());

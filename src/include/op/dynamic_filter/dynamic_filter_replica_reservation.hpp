@@ -35,13 +35,10 @@
 namespace sirius::op::detail {
 
 /**
- * @brief Return the number of bytes charged by CuCascade for one RMM allocation
+ * @brief Returns CuCascade's aligned charge for one allocation
  *
- * The reservation-aware allocator tracks each allocation at CUDA's allocation alignment. Callers
- * with multiple allocations must align each allocation separately before summing them.
- *
- * @param[in] allocation_bytes Size of a single RMM allocation, in bytes
- * @return `allocation_bytes` rounded up to CUDA's allocation alignment
+ * Reservations spanning multiple allocations must sum per-allocation aligned charges:
+ * `sum(align_up(b_i)) != align_up(sum(b_i))`.
  */
 [[nodiscard]] inline std::size_t tracked_replica_allocation_bytes(
   std::size_t allocation_bytes) noexcept
@@ -51,29 +48,19 @@ namespace sirius::op::detail {
 }
 
 /**
- * @brief Scoped destination-space reservation for constructing one dynamic-filter replica
+ * @brief RAII reservation attached to an allocator tracker
  *
- * @ref try_acquire first reserves capacity in the destination GPU memory space, then attaches that
- * reservation to the destination allocator's tracker. Allocations made through @ref allocator are
- * charged to the reservation instead of being counted a second time. Destruction resets the
- * tracker; CuCascade releases unused reserved capacity while retaining accounting for allocations
- * that remain live in the completed replica.
- *
- * @warning The scope must be destroyed on the same host thread that acquired it when CuCascade uses
- * per-thread reservation tracking.
+ * Destruction detaches the tracker, releasing unused reserved capacity while live allocations
+ * retain their accounting. Destroy on the host thread that acquired the reservation.
  */
 class scoped_replica_reservation final {
  public:
   /**
-   * @brief Try to reserve and attach @p bytes in @p target's GPU memory space
+   * @brief Attempts to reserve and attach destination capacity
    *
    * @throw std::invalid_argument if @p bytes is zero
    * @throw std::logic_error if @p target has no GPU reservation-aware allocator
-   * @param[in] target Destination replica space whose GPU memory space admits the reservation
-   * @param[in] bytes Number of bytes to reserve
-   * @param[in] stream Stream the reservation is attached to
-   * @return An attached scope, or `std::nullopt` when the destination reservation limit cannot
-   * admit the request or the selected execution context already tracks another reservation
+   * @return An attached scope, or `std::nullopt` when capacity or tracker state rejects it
    */
   [[nodiscard]] static std::optional<scoped_replica_reservation> try_acquire(
     dynamic_filter_replica_space const& target, std::size_t bytes, rmm::cuda_stream_view stream)
@@ -116,11 +103,6 @@ class scoped_replica_reservation final {
     if (_allocator != nullptr) { _allocator->reset_stream_reservation(_stream); }
   }
 
-  /**
-   * @brief The destination allocator backed by the attached reservation
-   *
-   * @return The reservation-aware device allocator
-   */
   [[nodiscard]] rmm::device_async_resource_ref allocator() const noexcept
   {
     return rmm::device_async_resource_ref{*_allocator};

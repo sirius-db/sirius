@@ -132,8 +132,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_typed_double(
 }
 
 // A place_endpoint factory that records the sited operator and the endpoint it splices in, then
-// returns a PROJECTION as the (childless) endpoint. The captures are by reference, so the caller
-// reads them after place_endpoint returns.
+// returns a PROJECTION as the (childless) endpoint.
 auto capturing_endpoint_factory(sirius::op::sirius_physical_operator const*& sited,
                                 sirius::op::sirius_physical_operator*& endpoint)
 {
@@ -238,12 +237,14 @@ TEST_CASE("join_block_descent maps a probe-block output into the probe child",
   std::vector<cudf::size_type> const probe_cols{5, 6, 7};  // probe block size 3
   std::vector<cudf::size_type> const build_cols{1, 2};
 
-  SECTION("the probe block is value-preserving for INNER/LEFT/SEMI/ANTI/MARK, at either policy")
+  SECTION("admissible probe blocks descend at either policy")
   {
     for (auto const join_type : {duckdb::JoinType::INNER,
                                  duckdb::JoinType::LEFT,
                                  duckdb::JoinType::SEMI,
                                  duckdb::JoinType::ANTI,
+                                 duckdb::JoinType::RIGHT,
+                                 duckdb::JoinType::OUTER,
                                  duckdb::JoinType::MARK}) {
       for (auto const policy : {kSipOn, kSipOff}) {
         auto const step =
@@ -255,28 +256,29 @@ TEST_CASE("join_block_descent maps a probe-block output into the probe child",
     }
   }
 
-  SECTION("the probe block refuses for types that null-pad the left block")
+  SECTION("the remaining join types refuse the probe block")
   {
-    for (auto const join_type : {duckdb::JoinType::RIGHT,
-                                 duckdb::JoinType::OUTER,
-                                 duckdb::JoinType::SINGLE,
+    for (auto const join_type : {duckdb::JoinType::SINGLE,
                                  duckdb::JoinType::RIGHT_SEMI,
-                                 duckdb::JoinType::RIGHT_ANTI}) {
+                                 duckdb::JoinType::RIGHT_ANTI,
+                                 duckdb::JoinType::INVALID}) {
       REQUIRE(join_block_descent(join_type, probe_cols, build_cols, 1, kSipOn) == std::nullopt);
     }
   }
 }
 
-TEST_CASE(
-  "join_block_descent maps a build-block output into the build child for INNER and LEFT only",
-  "[dynamic_filter][placement]")
+TEST_CASE("join_block_descent maps an admissible build-block output into the build child",
+          "[dynamic_filter][placement]")
 {
   std::vector<cudf::size_type> const probe_cols{5, 6, 7};  // probe block size 3
   std::vector<cudf::size_type> const build_cols{1, 2};
 
-  SECTION("INNER and LEFT descend into the build child under the SIP policy")
+  SECTION("INNER/RIGHT descend directly; LEFT/OUTER rely on equality admission")
   {
-    for (auto const join_type : {duckdb::JoinType::INNER, duckdb::JoinType::LEFT}) {
+    for (auto const join_type : {duckdb::JoinType::INNER,
+                                 duckdb::JoinType::LEFT,
+                                 duckdb::JoinType::RIGHT,
+                                 duckdb::JoinType::OUTER}) {
       // output ordinal 4 -> build ordinal 4 - 3 = 1 -> build_cols[1] = 2
       auto const step =
         join_block_descent(join_type, probe_cols, build_cols, /*output_ordinal=*/4, kSipOn);
@@ -296,18 +298,17 @@ TEST_CASE(
       join_block_descent(duckdb::JoinType::INNER, probe_cols, build_cols, 4, kSipOn).has_value());
   }
 
-  SECTION("every other join type refuses the build block")
+  SECTION("the remaining join types refuse the build block")
   {
-    // SEMI/ANTI emit no build block, MARK emits a synthetic mark, and the remaining join types do
-    // not safely support build-block descent.
+    // SEMI/ANTI emit no RHS block, MARK emits a synthetic mark, and right-semi/anti require their
+    // RHS-only output layout to be mapped explicitly.
     for (auto const join_type : {duckdb::JoinType::SEMI,
                                  duckdb::JoinType::ANTI,
                                  duckdb::JoinType::MARK,
-                                 duckdb::JoinType::RIGHT,
-                                 duckdb::JoinType::OUTER,
                                  duckdb::JoinType::SINGLE,
                                  duckdb::JoinType::RIGHT_SEMI,
-                                 duckdb::JoinType::RIGHT_ANTI}) {
+                                 duckdb::JoinType::RIGHT_ANTI,
+                                 duckdb::JoinType::INVALID}) {
       REQUIRE(join_block_descent(join_type, probe_cols, build_cols, 4, kSipOn) == std::nullopt);
     }
   }
@@ -330,8 +331,6 @@ TEST_CASE("join_block_descent refuses a build ordinal past the build block",
 TEST_CASE("scan_route_join_type_admissible mirrors DuckDB's producer join-type gate",
           "[dynamic_filter][placement][discovery]")
 {
-  // The admitted set is exactly what DuckDB's GenerateJoinFilters generates filters for. Widening
-  // it would wire probe filters for producers that preserve or negate unmatched probe rows.
   for (auto const join_type :
        {duckdb::JoinType::INNER, duckdb::JoinType::RIGHT, duckdb::JoinType::SEMI}) {
     REQUIRE(scan_route_join_type_admissible(join_type));
@@ -512,7 +511,6 @@ TEST_CASE("trace_probe_key yields one terminal per UNION branch, mixed kinds inc
 TEST_CASE("trace_probe_key and place_endpoint agree on the site for a spliced key",
           "[dynamic_filter][placement][discovery]")
 {
-  // Both consume descent_steps, so the classified terminal and the spliced site cannot diverge.
   auto make_subtree = [](sirius::op::sirius_physical_operator** scan_out) {
     auto scan = make_scan(/*width=*/8);
     *scan_out = scan.get();
@@ -633,8 +631,7 @@ TEST_CASE("place_endpoint descends a FILTER and sites below it",
           "[dynamic_filter][placement][discovery]")
 {
   // Q19-class shape: a residual-predicate FILTER stands between the producing join and the probe
-  // scan. The trace passes through it, so the endpoint lands below the FILTER, directly above the
-  // refusing scan, with the gather-remapped ordinal.
+  // scan.
   auto scan         = make_scan(/*width=*/6);
   auto* scan_node   = scan.get();
   auto filter       = make_gather_filter({5, 3});
@@ -678,8 +675,7 @@ TEST_CASE("place_endpoint splices one endpoint per UNION branch in traversal ord
   REQUIRE(placed.subtree.get() == root);
   REQUIRE(placed.site_ordinals == std::vector<std::size_t>{4, 1});
   REQUIRE(endpoints.size() == 2);
-  // Factory invocations zip with site_ordinals: endpoints[0] wraps branch 0's scan at ordinal 4,
-  // endpoints[1] wraps branch 1's scan at ordinal 1.
+  // Factory invocations zip with site_ordinals.
   REQUIRE(endpoints[0]->children[0].get() == s0);
   REQUIRE(endpoints[1]->children[0].get() == s1);
 }
@@ -688,8 +684,7 @@ TEST_CASE("a second placement descends past the endpoint the first placed",
           "[dynamic_filter][placement]")
 {
   // A producer places one endpoint per direct-routed key into the same probe subtree, so placement
-  // depth must not depend on key order: the second key's descent crosses the first key's endpoint
-  // and reaches the same deepest site.
+  // depth must not depend on key order.
   //
   // proj_top: output 0 -> input 2, output 1 -> input 5
   // scan:     refuses, so both keys site at the scan

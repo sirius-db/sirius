@@ -309,16 +309,18 @@ inline std::unique_ptr<cudf::scalar> value_to_cudf_scalar(duckdb::Value const& v
 /**
  * @brief Build a 0-row cudf table with one column per logical type.
  *
- * Column order and types mirror @p types (each via get_cudf_type). Used wherever an empty but
- * schema-bearing table is needed — e.g. an all-pruned GPU-values source, or the synthesized missing
- * side of a join against an empty table.
+ * Column order and types mirror @p types (each via get_cudf_type). An ARRAY entry becomes an empty
+ * cuDF LIST column of its fixed-width element type (`cudf::make_empty_column` rejects nested
+ * types). Used wherever an empty but schema-bearing table is needed — e.g. an all-pruned GPU-values
+ * source, or the synthesized missing side of a join against an empty table.
  */
 inline std::unique_ptr<cudf::table> make_empty_table(const duckdb::vector<logical_type>& types)
 {
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.reserve(types.size());
   for (auto const& t : types) {
-    columns.push_back(cudf::make_empty_column(get_cudf_type(t)));
+    columns.push_back(t.is_array() ? cudf::make_empty_lists_column(get_cudf_type(t.array_child()))
+                                   : cudf::make_empty_column(get_cudf_type(t)));
   }
   return std::make_unique<cudf::table>(std::move(columns));
 }
@@ -328,10 +330,22 @@ inline std::unique_ptr<cudf::table> make_empty_table(const duckdb::vector<logica
  *
  * The carrier-exact counterpart of the logical-type overload, for callers holding an operator's
  * `physical_types` sidecar: the result reproduces those carriers instead of re-deriving native
- * ones.
+ * ones. Every entry must be non-nested: an id-only `cudf::data_type` carries no child type, so a
+ * nested carrier cannot be synthesized here.
+ *
+ * @throws duckdb::InvalidInputException on a nested entry — use the logical-type overload, which
+ *         carries element types.
  */
 inline std::unique_ptr<cudf::table> make_empty_table(const std::vector<cudf::data_type>& types)
 {
+  for (auto const& t : types) {
+    if (cudf::is_nested(t)) {
+      throw duckdb::InvalidInputException(
+        "sirius::make_empty_table: carrier-exact make_empty_table cannot synthesize nested type "
+        "%s; use the logical-type overload, which carries element types",
+        cudf::type_to_name(t));
+    }
+  }
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.reserve(types.size());
   for (auto const& t : types) {
@@ -470,14 +484,15 @@ inline std::unique_ptr<cudf::scalar> DuckDBValueToCudfScalar(Value const& val,
   }
 }
 
+/**
+ * @brief Build a zero-row cuDF table with the same per-column types as @p input.
+ *
+ * Nested-safe via `cudf::empty_like`: nested columns (LIST/STRUCT) reproduce their full child
+ * hierarchy, not just the top-level type id.
+ */
 inline std::unique_ptr<cudf::table> make_empty_like(cudf::table_view input)
 {
-  std::vector<std::unique_ptr<cudf::column>> empty_cols;
-  empty_cols.reserve(input.num_columns());
-  for (cudf::size_type col_idx = 0; col_idx < input.num_columns(); ++col_idx) {
-    empty_cols.push_back(cudf::make_empty_column(input.column(col_idx).type()));
-  }
-  return std::make_unique<cudf::table>(std::move(empty_cols));
+  return cudf::empty_like(input);
 }
 
 }  // namespace duckdb

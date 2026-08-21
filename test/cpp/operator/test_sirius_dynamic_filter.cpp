@@ -45,6 +45,18 @@ std::unique_ptr<cudf::scalar> make_int32_scalar(int32_t v)
     v, true, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
 }
 
+std::unique_ptr<cudf::scalar> make_int64_scalar(int64_t v)
+{
+  return std::make_unique<cudf::numeric_scalar<int64_t>>(
+    v, true, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+}
+
+std::unique_ptr<cudf::scalar> make_float64_scalar(double v)
+{
+  return std::make_unique<cudf::numeric_scalar<double>>(
+    v, true, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+}
+
 zone_map_entry make_zone(int32_t lo, int32_t hi)
 {
   return zone_map_entry{make_int32_scalar(lo), make_int32_scalar(hi)};
@@ -229,8 +241,8 @@ TEST_CASE("ignore_columns drops pushes for the marked output columns", "[dynamic
   sirius_dynamic_filter_set set;
   set.ignore_columns({0});
 
-  REQUIRE_FALSE(set.push_filter(0, make_single_zone_filter(0, 100)));  // ignored
-  REQUIRE(set.push_filter(1, make_single_zone_filter(0, 100)));        // kept
+  REQUIRE_FALSE(set.push_filter(0, make_single_zone_filter(0, 100)));
+  REQUIRE(set.push_filter(1, make_single_zone_filter(0, 100)));
   REQUIRE(set.filtered_columns() == std::vector<std::size_t>{1});
 }
 
@@ -249,6 +261,62 @@ TEST_CASE("sirius_dynamic_zone_map_filter rejects null bounds", "[dynamic_filter
   std::vector<zone_map_entry> zones2;
   zones2.push_back(zone_map_entry{make_int32_scalar(0), nullptr});
   REQUIRE_THROWS_AS(sirius_dynamic_zone_map_filter(std::move(zones2)), std::invalid_argument);
+}
+
+TEST_CASE("sirius_dynamic_zone_map_filter::supports allowlists lowerable non-float types",
+          "[dynamic_filter]")
+{
+  REQUIRE_FALSE(sirius_dynamic_zone_map_filter::supports(cudf::data_type{cudf::type_id::FLOAT32}));
+  REQUIRE_FALSE(sirius_dynamic_zone_map_filter::supports(cudf::data_type{cudf::type_id::FLOAT64}));
+
+  for (auto const id : {cudf::type_id::INT8,
+                        cudf::type_id::INT16,
+                        cudf::type_id::INT32,
+                        cudf::type_id::INT64,
+                        cudf::type_id::UINT8,
+                        cudf::type_id::UINT16,
+                        cudf::type_id::UINT32,
+                        cudf::type_id::UINT64,
+                        cudf::type_id::BOOL8,
+                        cudf::type_id::TIMESTAMP_DAYS,
+                        cudf::type_id::TIMESTAMP_SECONDS,
+                        cudf::type_id::TIMESTAMP_MILLISECONDS,
+                        cudf::type_id::TIMESTAMP_MICROSECONDS,
+                        cudf::type_id::TIMESTAMP_NANOSECONDS,
+                        cudf::type_id::DECIMAL32,
+                        cudf::type_id::DECIMAL64,
+                        cudf::type_id::DECIMAL128,
+                        cudf::type_id::STRING}) {
+    REQUIRE(sirius_dynamic_zone_map_filter::supports(cudf::data_type{id}));
+  }
+
+  for (auto const id : {cudf::type_id::EMPTY,
+                        cudf::type_id::DURATION_SECONDS,
+                        cudf::type_id::LIST,
+                        cudf::type_id::STRUCT,
+                        cudf::type_id::DICTIONARY32}) {
+    REQUIRE_FALSE(sirius_dynamic_zone_map_filter::supports(cudf::data_type{id}));
+  }
+}
+
+TEST_CASE("sirius_dynamic_zone_map_filter rejects unsupported and mismatched bound types",
+          "[dynamic_filter]")
+{
+  std::vector<zone_map_entry> float64_zones;
+  float64_zones.push_back(zone_map_entry{make_float64_scalar(0.0), make_float64_scalar(10.0)});
+  REQUIRE_THROWS_AS(sirius_dynamic_zone_map_filter(std::move(float64_zones)),
+                    std::invalid_argument);
+
+  std::vector<zone_map_entry> mismatched_zones;
+  mismatched_zones.push_back(zone_map_entry{make_int32_scalar(0), make_int64_scalar(10)});
+  REQUIRE_THROWS_AS(sirius_dynamic_zone_map_filter(std::move(mismatched_zones)),
+                    std::invalid_argument);
+
+  std::vector<zone_map_entry> cross_zone_mismatch;
+  cross_zone_mismatch.push_back(zone_map_entry{make_int32_scalar(0), make_int32_scalar(10)});
+  cross_zone_mismatch.push_back(zone_map_entry{make_int64_scalar(20), make_int64_scalar(30)});
+  REQUIRE_THROWS_AS(sirius_dynamic_zone_map_filter(std::move(cross_zone_mismatch)),
+                    std::invalid_argument);
 }
 
 TEST_CASE("sirius_dynamic_zone_map_filter::to_ast emits a single bounded conjunction for N=1",

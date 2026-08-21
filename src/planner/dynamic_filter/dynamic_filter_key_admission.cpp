@@ -42,7 +42,6 @@ bool side_blocks_scan_route(op::dynamic_filter_key_shape shape) noexcept
   return true;  // Reject unrecognized enum values conservatively.
 }
 
-// Validate before narrowing an AST reference ordinal to cuDF's column-index type.
 cudf::size_type to_key_column_ordinal(std::uint32_t bound_reference_index)
 {
   constexpr auto k_max_ordinal =
@@ -62,14 +61,12 @@ std::optional<op::dynamic_filter_publish_plan::admitted_key> admit_scan_route_ke
   std::size_t domain_cardinality,
   std::optional<std::size_t> build_side_unique_column)
 {
-  // Under null-equal semantics, pruning a LEFT join's build input can create an accepted
-  // NULL-padded row, so null-equal keys are not admissible.
+  // Null-equal keys could turn a pruned LEFT join match into an accepted NULL-padded row.
   if (condition.comparison != sirius::comparison_type::equal) { return std::nullopt; }
   if (side_blocks_scan_route(shape.probe) || side_blocks_scan_route(shape.build)) {
     return std::nullopt;
   }
 
-  // Admission requires a Sirius build reference and a cuDF-representable type.
   if (!condition.right->is_reference()) { return std::nullopt; }
   auto const& build_ref = condition.right->as_reference();
 
@@ -78,8 +75,7 @@ std::optional<op::dynamic_filter_publish_plan::admitted_key> admit_scan_route_ke
 
   auto const build_key_ordinal = to_key_column_ordinal(build_ref.column_index);
 
-  // Discovery requires a real probe entry ordinal. EMPTY preserves an unrepresentable probe type
-  // for zone-map suppression and direct-route rejection.
+  // EMPTY preserves unsupported probe types for later route checks.
   auto const& probe_side = *condition.left;
   if (!probe_side.is_reference()) { return std::nullopt; }
   auto const probe_key_ordinal  = to_key_column_ordinal(probe_side.as_reference().column_index);
@@ -127,11 +123,6 @@ std::vector<op::dynamic_filter_condition_shape> classify_join_key_shapes(
   return shapes;
 }
 
-// Which space each input is indexed in, in parameter order:
-//   conditions                      condition index
-//   condition_shapes                condition index
-//   condition_domain_cardinalities  condition index
-//   build_side_unique_column        a build-child output ordinal, not a condition index
 std::vector<op::dynamic_filter_publish_plan::admitted_key> admit_dynamic_filter_keys(
   duckdb::vector<sirius::join_condition> const& conditions,
   std::vector<op::dynamic_filter_condition_shape> const& condition_shapes,

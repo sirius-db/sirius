@@ -156,7 +156,6 @@ TEST_CASE("duckdb-native scans consume dynamic filters", "[integration][pipeline
   }
 }
 
-// Verify that join wrapping leaves endpoints on the source side of PARTITION.
 TEST_CASE("the dynamic-filter endpoint is never fed partitioned data",
           "[integration][pipeline][dynamic_filter]")
 {
@@ -186,7 +185,6 @@ TEST_CASE("the dynamic-filter endpoint is never fed partitioned data",
   REQUIRE(endpoints_checked > 0);
 }
 
-// Verify the endpoint input contract across join and group-by wrappers.
 TEST_CASE("dynamic-filter endpoints obey the data contract on SIP-shaped plans",
           "[integration][pipeline][dynamic_filter]")
 {
@@ -223,7 +221,7 @@ TEST_CASE("dynamic-filter endpoints obey the data contract on SIP-shaped plans",
   SECTION("Q5: the feature wires endpoints, and every endpoint obeys the data contract")
   {
     // The pinned join order puts n_regionkey on the nation join's build side, so only join-edge
-    // descent reaches it. Every discovered endpoint must consume pipelineable data.
+    // descent reaches it.
     sirius::test::disabled_optimizers_guard shape(con, "join_order,build_side_probe_side");
     std::size_t endpoints_off = 0;
     {

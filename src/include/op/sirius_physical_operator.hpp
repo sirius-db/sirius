@@ -432,6 +432,15 @@ class sirius_physical_operator {
   //! Return a vector of the types that will be returned by this operator
   const duckdb::vector<sirius::logical_type>& get_types() const { return types; }
 
+  //! Whether `get_types()` describes the batches returned directly by execute(). Most operators
+  //! materialize their declared logical schema. Structural pass-through stages may instead carry
+  //! a different runtime schema; those operators must opt out so the task-level diagnostic does
+  //! not compare unrelated schemas.
+  [[nodiscard]] virtual bool declared_output_schema_is_runtime_schema() const noexcept
+  {
+    return true;
+  }
+
   //! Return the optional physical output schema. Empty means the native schema derived from
   //! get_types().
   [[nodiscard]] const std::vector<cudf::data_type>& get_physical_types() const noexcept

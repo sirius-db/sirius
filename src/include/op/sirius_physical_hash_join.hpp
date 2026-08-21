@@ -107,9 +107,9 @@ struct build_probe_decision {
 /// consistent), so they are clamped to one partition on a single GPU and forced to broadcast on
 /// multi-GPU.
 ///
-/// BUILD_PROBE eligibility requires: at most one partition per GPU, the per-GPU hash table fits
-/// within `max_build_hash_table_bytes` (a broadcast join charges the FULL build to every GPU; a
-/// hash-partitioned build charges the per-partition average), the build folds to one batch, and the
+/// BUILD_PROBE eligibility requires: the build folds to one hash table per GPU within
+/// `max_build_hash_table_bytes` (a broadcast join charges the FULL build to every GPU; a
+/// hash-partitioned build charges the per-GPU average), the build folds to one batch, and the
 /// join is not right-family, mixed, or full-outer (those over-emit build rows on the streamed
 /// path). `join_mode` distinguishes MIXED_JOIN; `join_type` supplies the rest.
 ///
@@ -285,6 +285,13 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   mutable bool unique_probe_keys = false;
 
+  //! When the planner could not *prove* build-key uniqueness, test it at runtime instead (one hash
+  //! pass over the build keys) and, if the keys are in fact distinct, take the single-pass
+  //! cudf::distinct_hash_join path rather than the general two-pass multiset path. Proving
+  //! uniqueness statically needs a declared PRIMARY KEY on a catalog table. Set from
+  //! operator_params at planning time.
+  bool runtime_distinct_build_probe = config::DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE;
+
   //! Row-count ratio gate for switching STANDARD-mode MARK joins to cudf::mark_join (build on the
   //! left/output side) instead of filtered_join (build on the right side). Switch when
   //! right_rows >= ratio * left_rows; 0 disables. Set from operator_params at planning time.
@@ -293,19 +300,32 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //! Join Keys statistics (optional)
   duckdb::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> join_stats;
 
+  void restrict_dynamic_filter_replicas(std::vector<int> const& admitted_gpu_ids)
+  {
+    _dynamic_filter_plan.restrict_replicas_to(admitted_gpu_ids);
+  }
+
   static void build_join_pipelines(pipeline::sirius_pipeline& current,
                                    pipeline::sirius_meta_pipeline& meta_pipeline,
                                    sirius_physical_operator& op);
 
+  //! Whether the execute dispatch has an arm for @p join_type. SINGLE does not;
+  //! are_conditions_supported() folds this in so the planner never builds one.
+  static bool is_join_type_supported(duckdb::JoinType join_type);
+
   /**
-   * @brief Returns true if the given join conditions can be handled by this operator.
+   * @brief Returns true if the given join type and conditions can be handled by this operator.
    *
-   * Requires at least one equality condition. For mixed joins (equality + inequality), also
-   * requires that no column referenced by an equality condition appears in any inequality
-   * condition on the same side — cuDF's mixed_join API requires disjoint equality and
-   * conditional table columns.
+   * Requires an executable join type (is_join_type_supported) and at least one equality
+   * condition. For mixed joins (equality + inequality), also requires that no column referenced
+   * by an equality condition appears in any inequality condition on the same side — cuDF's
+   * mixed_join API requires disjoint equality and conditional table columns. A MARK join mixing
+   * null-safe and plain keys is rejected; see mark_join_mixes_null_safe_keys.
+   *
+   * @param join_type Used to exclude MARK joins from null-safe routing.
    */
-  static bool are_conditions_supported(duckdb::vector<sirius::join_condition>& conditions);
+  static bool are_conditions_supported(duckdb::vector<sirius::join_condition>& conditions,
+                                       duckdb::JoinType join_type);
 
   [[nodiscard]] bool is_right_family() const
   {
@@ -324,9 +344,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// decision so the partition can finish its own wiring (e.g. enabling build-side concat_all).
   partition_strategy get_partition_strategy(const partition_sizing_input& in) override;
 
-  /// True when this join publishes dynamic filters (an enabled publication plan, i.e. wired probe
-  /// targets). The upstream PARTITION folds a single-partition build to one batch for such a join
-  /// so the one-shot publisher sees the whole key set.
   [[nodiscard]] bool publishes_dynamic_filters() const;
 
   [[nodiscard]] bool wants_multi_partition_dynamic_filters() const noexcept
@@ -335,7 +352,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   }
 
   /**
-   * @brief Attempt to arm accumulation from a complete pre-scatter build snapshot
+   * @brief Attempts to arm accumulation from a complete pre-scatter build snapshot
    *
    * @param[in] snapshot Complete pre-scatter build identity and row geometry
    * @return True if this call armed the accumulator; false if ineligible, already claimed, or
@@ -344,7 +361,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   [[nodiscard]] bool arm_multi_partition_dynamic_filters(complete_build_snapshot snapshot);
 
   /**
-   * @brief Contribute one original build batch before hash scatter
+   * @brief Contributes one original build batch before hash scatter
    *
    * Ignored unless accumulation is active. A newly accepted contribution synchronizes @p stream
    * before returning; an invalid contribution fails accumulation closed.
@@ -357,9 +374,12 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
                                              cudf::table_view const& build_view,
                                              rmm::cuda_stream_view stream);
 
-  /// Reported by the upstream PARTITION at sizing time: the build port will deliver one
-  /// concat-folded batch covering the entire build side (single-partition or broadcast build).
-  /// Precondition for claiming a build batch for dynamic-filter publication, in any join mode.
+  [[nodiscard]] uint64_t max_build_hash_table_bytes() const noexcept
+  {
+    return _max_build_hash_table_bytes;
+  }
+
+  // Publication may claim only a delivery known to contain the whole build.
   void set_build_arrives_whole(bool arrives_whole);
 
   /// @brief True when this join runs in build-then-probe mode (see `get_partition_strategy`).
@@ -415,14 +435,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   // the probe side is streamed unpartitioned.
   bool _broadcast = false;
 
-  // Whether the build port delivers one concat-folded batch covering the entire build side
-  // (single-partition or broadcast build with a concat_all'd build-side CONCAT). Set by the
-  // upstream PARTITION at sizing time; the one-shot dynamic-filter publisher only claims a build
-  // batch when this holds. Guarded by op_state_mutex.
   bool _build_arrives_whole = false;
 
-  // One-shot latch for the "dynamic filter NOT published" diagnostic and its stats counter: a
-  // wired join whose build cannot arrive whole reports that once, not once per build batch.
   // Guarded by op_state_mutex.
   bool _build_not_whole_reported = false;
 
@@ -464,12 +478,17 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// construction (conditions and join_type are fixed thereafter). cuDF applies one
   /// flag to all key columns, so it is EQUAL (null-safe -- NULL matches NULL) only
   /// when EVERY equi-key is IS NOT DISTINCT FROM; a plain `=` key (including mixed
-  /// joins such as delim joins) forces UNEQUAL. MARK joins are also forced to
-  /// UNEQUAL to match their IN/EXISTS three-valued result logic -- a null-safe MARK
-  /// join (e.g. EXISTS with IS NOT DISTINCT FROM) is a known unsupported case, see
-  /// the constructor.
+  /// joins such as delim joins) forces UNEQUAL. A MARK join follows the same rule:
+  /// all-null-safe keys use EQUAL and emit definite marks (see mark_is_null_safe),
+  /// anything containing a plain key uses UNEQUAL and the IN/EXISTS three-valued
+  /// result logic. A MARK join *mixing* the two is rejected at plan time.
   cudf::null_equality compare_nulls() const { return compare_nulls_; }
   cudf::null_equality compare_nulls_ = cudf::null_equality::UNEQUAL;
+
+  /// A MARK join whose every condition is IS NOT DISTINCT FROM: the predicate is never UNKNOWN,
+  /// so every mark is definite and the result carries no null mask.
+  [[nodiscard]] bool mark_is_null_safe() const { return mark_is_null_safe_; }
+  bool mark_is_null_safe_ = false;
 
  public:
   //! Per-key cast info: whether each join key needs a cast before comparison
@@ -483,43 +502,21 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
  protected:
   std::vector<key_cast_info> key_casts;
 
-  //===----------------------------------------------------------------------===//
-  // Dynamic Filters
-  //===----------------------------------------------------------------------===//
-  /// @brief Forward one-shot publication to the hash-join-owned session.
-  /// @param build_view The complete build side to reduce or build membership over.
-  /// @param stream Durable build-memory-space stream used for filter construction.
+  // Forwards one-shot publication to the session, which contains device OOM; other failures
+  // propagate.
   void publish_dynamic_filters(cudf::table_view const& build_view, rmm::cuda_stream_view stream);
 
-  /// Plan-time routing, policy, and replica placement; not mutated after construction.
+  // Narrowed before execution; immutable during execution.
   dynamic_filter_publish_plan _dynamic_filter_plan;
-  /// Publication lifetime and one-shot versus accumulated arbitration. Declared after the plan so
-  /// its retained plan reference remains valid through destruction.
+  // Publication lifetime and one-shot versus accumulated arbitration. Declared after the plan so
+  // its retained plan reference remains valid through destruction.
   dynamic_filter_publication_session _dynamic_filter_publication_session;
-  //===----------------------------------------------------------------------===//
 
  public:
-  /// @brief Route a partitioned batch and publish dynamic filters from an eligible build batch.
-  ///
-  /// For the @c build port of a wired join whose build arrives whole, the concat-folded batch is
-  /// the publication point. Its read-only accessor is acquired before routing, which pins its GPU
-  /// representation until publication completes. A stream borrowed from the build memory space
-  /// waits on the batch writer event and builds and replicates filters without requiring a probe
-  /// batch or built hash table.
-  ///
-  /// In @c BUILD_PROBE mode this synchronous hook completes before the immediate probe producer is
-  /// scheduled. @c STANDARD and @c MIXED_JOIN builds may also publish when they arrive whole, but
-  /// they do not gain that ordering. Other ports only route, and a scan target reached through an
-  /// intervening join is never gated by this edge.
   void push_data_batch_partitioned(std::string_view port_id,
                                    std::shared_ptr<::cucascade::data_batch> batch,
                                    std::size_t partition_idx) override;
 
-  /**
-   * @brief Return this join's dynamic-filter publication plan
-   *
-   * @return The plan, which is not mutated after construction
-   */
   [[nodiscard]] dynamic_filter_publish_plan const& dynamic_filter_plan() const noexcept
   {
     return _dynamic_filter_plan;

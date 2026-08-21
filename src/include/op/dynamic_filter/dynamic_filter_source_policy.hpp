@@ -14,14 +14,6 @@
  * limitations under the License.
  */
 
-/**
- * @file dynamic_filter_source_policy.hpp
- * @brief Representation and gate policy for dynamic-filter publication
- *
- * The publisher (`dynamic_filter_publisher.hpp`) supplies runtime inputs and owns filter
- * construction, replication, and fan-out.
- */
-
 #pragma once
 
 #include <cstddef>
@@ -30,46 +22,34 @@
 
 namespace sirius::op {
 
-/**
- * @brief Membership representation chosen for one admitted build key
- */
-enum class membership_filter_kind : std::uint8_t {
-  none,           ///< No eligible membership representation
-  small_in_list,  ///< Exact list scanned linearly; no hash build
-  hash_in_list,   ///< Exact hash set, chosen when it fits the smallest probe GPU's L2 cache
-  bloom           ///< Probabilistic fallback for sets too large to fit L2
-};
+enum class membership_filter_kind : std::uint8_t { none, small_in_list, hash_in_list, bloom };
 
-/**
- * @brief Everything the representation choice depends on
- *
- * Contains the cache budget, size estimate, and capability flags passed to
- * `choose_membership_filter()`. The small-list capability also incorporates its row-count limit.
- */
 struct membership_choice_inputs {
   std::size_t build_rows               = 0;
-  std::size_t l2_cache_bytes           = 0;  ///< 0 when unknown; hash IN-list is then ineligible
+  std::size_t l2_cache_bytes           = 0;  // 0 means unknown.
   std::size_t estimated_hash_set_bytes = 0;
+  double inlist_max_l2_fraction        = 0.0;
   bool supports_small_in_list          = false;
   bool supports_hash_in_list           = false;
   bool supports_bloom                  = false;
 };
 
 /**
- * @brief Choose a key's membership representation
+ * @brief Chooses a membership representation
  *
- * The function selects the small exact list when supported, otherwise the exact hash set when its
- * footprint fits the smallest probe GPU's L2 cache, otherwise a Bloom filter when supported.
- *
- * @param[in] inputs Cache budget, size estimate, and per-kind capability answers
- * @return The representation to construct, or `membership_filter_kind::none`
+ * Small lists win. A hash IN-list requires known L2 and an estimate within both L2 and the
+ * configured fraction. Without Bloom support, fitting L2 is enough.
  */
 [[nodiscard]] constexpr membership_filter_kind choose_membership_filter(
   membership_choice_inputs const& inputs) noexcept
 {
   if (inputs.supports_small_in_list) { return membership_filter_kind::small_in_list; }
-  if (inputs.supports_hash_in_list && inputs.l2_cache_bytes > 0 &&
-      inputs.estimated_hash_set_bytes <= inputs.l2_cache_bytes) {
+  bool const hash_set_fits_l2 = inputs.supports_hash_in_list && inputs.l2_cache_bytes > 0 &&
+                                inputs.estimated_hash_set_bytes <= inputs.l2_cache_bytes;
+  if (hash_set_fits_l2 &&
+      (!inputs.supports_bloom ||
+       static_cast<double>(inputs.estimated_hash_set_bytes) <=
+         inputs.inlist_max_l2_fraction * static_cast<double>(inputs.l2_cache_bytes))) {
     return membership_filter_kind::hash_in_list;
   }
   if (inputs.supports_bloom) { return membership_filter_kind::bloom; }
@@ -99,20 +79,9 @@ struct membership_choice_inputs {
 }
 
 /**
- * @brief Whether a build is too dense a sample of its key domain for a filter to repay itself
+ * @brief Tests whether a proven-unique build covers the configured fraction of a known domain
  *
- * The ratio is valid only for a key proven unique in its base relation; otherwise row count does
- * not equal distinct-key count. An unknown domain, an unproven key, or a threshold above 1.0
- * disables the gate.
- *
- * @param[in] build_rows Rows in the completed build
- * @param[in] domain_cardinality Unfiltered row upper bound of the base table the key traces to; 0
- * means untraceable and disables the gate
- * @param[in] build_key_proven_unique Whether the key is proven unique in its base relation; false
- * disables the gate
- * @param[in] threshold Coverage fraction at or above which the key is skipped; above 1.0 disables
- * the gate
- * @return True when the key should be skipped
+ * Unknown domains, non-unique keys, and thresholds above 1 disable the gate.
  */
 [[nodiscard]] constexpr bool domain_coverage_gate_fires(std::size_t build_rows,
                                                         std::size_t domain_cardinality,
@@ -126,18 +95,9 @@ struct membership_choice_inputs {
 }
 
 /**
- * @brief The zone-map analogue of @ref domain_coverage_gate_fires
+ * @brief Tests whether inclusive `[min_value, max_value]` covers the threshold of a known domain
  *
- * A `[min, max]` bound spanning most of the key domain prunes no row group.
- *
- * The publisher has no base-column value-range domain and does not call this function. A row-count
- * domain cannot substitute for a value span. A 0 domain disables the gate.
- *
- * @param[in] min_value Lowest build key value
- * @param[in] max_value Highest build key value
- * @param[in] domain_cardinality Unfiltered span of the key's domain; 0 disables the gate
- * @param[in] threshold Span fraction at or above which the zone map is skipped
- * @return True when the zone map should be skipped
+ * Not yet wired into production; exercised by tests only.
  */
 [[nodiscard]] constexpr bool zone_map_range_gate_fires(double min_value,
                                                        double max_value,

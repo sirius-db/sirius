@@ -14,27 +14,19 @@
  * limitations under the License.
  */
 
-// sirius
-#include <op/dynamic_filter/dynamic_filter_device.hpp>
-#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
-
-// cudf
 #include <cudf/ast/expressions.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/search.hpp>
 #include <cudf/utilities/traits.hpp>
 #include <cudf/wrappers/timestamps.hpp>
 
-// cucascade
-#include <cucascade/memory/memory_space.hpp>
-
-// rmm
 #include <rmm/cuda_device.hpp>
 
-// sirius
+#include <cucascade/memory/memory_space.hpp>
 #include <log/logging.hpp>
+#include <op/dynamic_filter/dynamic_filter_device.hpp>
+#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 
-// standard library
 #include <algorithm>
 #include <stdexcept>
 #include <utility>
@@ -264,9 +256,6 @@ cudf::ast::expression const& emplace_literal_from_scalar(cudf::ast::tree& tree, 
 
 }  // namespace
 
-//===----------------------------------------------------------------------===//
-// AST mix-in
-//===----------------------------------------------------------------------===//
 cudf::ast::tree sirius_ast_lowerable::to_standalone_ast(
   std::function<cudf::ast::expression const&(cudf::ast::tree&)> const& column_ref_factory) const
 {
@@ -276,9 +265,33 @@ cudf::ast::tree sirius_ast_lowerable::to_standalone_ast(
   return tree;
 }
 
-//===----------------------------------------------------------------------===//
-// sirius_dynamic_zone_map_filter
-//===----------------------------------------------------------------------===//
+// The allowlist is exactly the type set clone_scalar_to_device and emplace_literal_from_scalar
+// handle, minus the floating-point ids the declaration excludes.
+bool sirius_dynamic_zone_map_filter::supports(cudf::data_type t) noexcept
+{
+  switch (t.id()) {
+    case cudf::type_id::INT8:
+    case cudf::type_id::INT16:
+    case cudf::type_id::INT32:
+    case cudf::type_id::INT64:
+    case cudf::type_id::UINT8:
+    case cudf::type_id::UINT16:
+    case cudf::type_id::UINT32:
+    case cudf::type_id::UINT64:
+    case cudf::type_id::BOOL8:
+    case cudf::type_id::TIMESTAMP_DAYS:
+    case cudf::type_id::TIMESTAMP_SECONDS:
+    case cudf::type_id::TIMESTAMP_MILLISECONDS:
+    case cudf::type_id::TIMESTAMP_MICROSECONDS:
+    case cudf::type_id::TIMESTAMP_NANOSECONDS:
+    case cudf::type_id::DECIMAL32:
+    case cudf::type_id::DECIMAL64:
+    case cudf::type_id::DECIMAL128:
+    case cudf::type_id::STRING: return true;
+    default: return false;
+  }
+}
+
 struct sirius_dynamic_zone_map_filter::device_zones {
   int device_id = -1;
   std::vector<zone_map_entry> zones;
@@ -290,8 +303,7 @@ struct sirius_dynamic_zone_map_filter::device_zones {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
       zones.clear();
     } catch (...) {
-      // Do not destroy device scalars after CUDA device selection fails; releasing ownership
-      // avoids freeing them in the wrong device context.
+      // Leak scalars rather than free them on the wrong device.
       for (auto& zone : zones) {
         (void)zone.min.release();
         (void)zone.max.release();
@@ -314,6 +326,18 @@ sirius_dynamic_zone_map_filter::sirius_dynamic_zone_map_filter(std::vector<zone_
       throw std::invalid_argument(
         "[sirius_dynamic_zone_map_filter] Every zone must have non-null min and max");
     }
+    if (z.min->type() != z.max->type()) {
+      throw std::invalid_argument(
+        "[sirius_dynamic_zone_map_filter] Zone min and max must share one type");
+    }
+    // to_ast lowers every zone against the same column reference, so one type spans all zones.
+    if (z.min->type() != _zones.front().min->type()) {
+      throw std::invalid_argument(
+        "[sirius_dynamic_zone_map_filter] All zones must share one bound type");
+    }
+    if (!supports(z.min->type())) {
+      throw std::invalid_argument("[sirius_dynamic_zone_map_filter] Unsupported zone bound type");
+    }
   }
   if (cudaGetDevice(&_source_device) != cudaSuccess) {
     throw std::runtime_error("[sirius_dynamic_zone_map_filter] failed to identify source device.");
@@ -322,16 +346,14 @@ sirius_dynamic_zone_map_filter::sirius_dynamic_zone_map_filter(std::vector<zone_
 
 sirius_dynamic_zone_map_filter::~sirius_dynamic_zone_map_filter() noexcept
 {
-  // device_zones selects each replica's device before releasing its scalars.
+  // Replica destructors select their owning devices.
   _replicas.clear();
-  // Release source scalars while their source device is current.
   if (_source_device >= 0) {
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{_source_device}};
       _zones.clear();
     } catch (...) {
-      // Do not destroy device scalars after CUDA device selection fails; releasing ownership
-      // avoids freeing them in the wrong device context.
+      // Leak scalars rather than free them on the wrong device.
       for (auto& zone : _zones) {
         (void)zone.min.release();
         (void)zone.max.release();
@@ -366,8 +388,7 @@ void sirius_dynamic_zone_map_filter::replicate_to_devices(
     return;
   }
 
-  // The publisher synchronized source construction before replication. Use the source memory
-  // space's pooled stream to read exact scalar values.
+  // Publication synchronizes construction before replication.
   rmm::cuda_set_device_raii source_guard{rmm::cuda_device_id{_source_device}};
   auto const source_stream = source->get_gpu_space().acquire_stream();
 
@@ -379,7 +400,6 @@ void sirius_dynamic_zone_map_filter::replicate_to_devices(
       auto replica       = std::make_unique<device_zones>();
       replica->device_id = device_id;
 
-      // Target scalars use the target space's allocator and pooled stream.
       {
         rmm::cuda_set_device_raii target_guard{rmm::cuda_device_id{device_id}};
         auto const target_stream = target_space.acquire_stream();
@@ -442,15 +462,6 @@ cudf::ast::expression const& sirius_dynamic_zone_map_filter::to_ast(
   return *result;
 }
 
-//===----------------------------------------------------------------------===//
-// sirius_dynamic_in_list_filter --
-//   implemented in src/cuda/sirius_dynamic_in_list_filter.cu (the
-//   persistent cuco::static_set is device code, PIMPL'd behind set_impl).
-//===----------------------------------------------------------------------===//
-
-//===----------------------------------------------------------------------===//
-// sirius_dynamic_filter_set
-//===----------------------------------------------------------------------===//
 bool sirius_dynamic_filter_set::push_filter(std::size_t col_idx,
                                             std::shared_ptr<sirius_dynamic_filter const> f)
 {
@@ -471,8 +482,7 @@ void sirius_dynamic_filter_set::ignore_columns(std::vector<std::size_t> const& c
   _ignored_columns.insert(cols.begin(), cols.end());
 }
 
-void sirius_dynamic_filter_set::register_producer(
-  std::vector<std::size_t> planned_target_columns)
+void sirius_dynamic_filter_set::register_producer(std::vector<std::size_t> planned_target_columns)
 {
   if (planned_target_columns.empty()) {
     _has_unscoped_producer.store(true, std::memory_order_release);

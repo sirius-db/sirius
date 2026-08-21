@@ -15,13 +15,8 @@
  */
 
 /*
- * Unit tests for `planner/dynamic_filter/build_filter_evidence.hpp`.
- *
- * `build_subtree_is_filtering` mirrors DuckDB's join-filter evidence rules for filtered scans,
- * filters, top-N operators, and containing subtrees; the parity suite compares both implementations
- * on optimized plans. `build_relation_is_derived` fires on a derivation marker anywhere in the
- * subtree -- a derived leaf or a reducing operator; the tests pin which operators are markers and
- * that the walk is any-descendant.
+ * Unit tests for `planner/dynamic_filter/build_filter_evidence.hpp`. The parity suite compares
+ * the DuckDB-mirroring rules against DuckDB's own implementation on optimized plans.
  */
 
 #include "planner/dynamic_filter/build_filter_evidence.hpp"
@@ -49,7 +44,7 @@
 
 namespace {
 
-using sirius::planner::build_relation_is_derived;
+using sirius::planner::build_relation_is_opaque;
 using sirius::planner::build_subtree_is_filtering;
 
 // Minimal constructible scan; the evidence walk never invokes its table function.
@@ -210,162 +205,136 @@ TEST_CASE("a childless non-filtering operator carries no evidence", "[dynamic_fi
   REQUIRE_FALSE(build_subtree_is_filtering(*projection));
 }
 
-TEST_CASE("a derived-leaf root is a derived relation", "[dynamic_filter][evidence]")
+TEST_CASE("opaque build leaves carry fallback evidence", "[dynamic_filter][evidence]")
 {
-  SECTION("a DELIM_GET root") { REQUIRE(build_relation_is_derived(*make_delim_get())); }
+  SECTION("a bare DELIM_GET") { REQUIRE(build_relation_is_opaque(*make_delim_get())); }
 
-  SECTION("a CTE_REF root") { REQUIRE(build_relation_is_derived(*make_cte_ref())); }
-}
-
-TEST_CASE("projection wrappers are transparent to derivation", "[dynamic_filter][evidence]")
-{
-  // Projection expressions do not affect whether the input is a derived leaf.
-  SECTION("a projection over a DELIM_GET")
+  SECTION("a projected DELIM_GET")
   {
-    auto const projection = make_projection_over(make_delim_get());
-    REQUIRE(build_relation_is_derived(*projection));
+    REQUIRE(build_relation_is_opaque(*make_projection_over(make_delim_get())));
   }
 
-  SECTION("stacked projections over a CTE_REF")
+  SECTION("a DELIM_GET below stacked projections")
   {
-    auto const projection = make_projection_over(make_projection_over(make_cte_ref()));
-    REQUIRE(build_relation_is_derived(*projection));
-  }
-}
-
-TEST_CASE("derivation is orthogonal to filtering", "[dynamic_filter][evidence]")
-{
-  // The two predicates disagree on purpose in both directions.
-  SECTION("a base-table GET is never derived, filtered or not")
-  {
-    REQUIRE_FALSE(build_relation_is_derived(*make_get()));
-    REQUIRE_FALSE(build_relation_is_derived(*make_filtered_get()));
+    REQUIRE(
+      build_relation_is_opaque(*make_projection_over(make_projection_over(make_delim_get()))));
   }
 
-  SECTION("the mirror carries no evidence at a derived leaf")
+  SECTION("a bare CTE_REF") { REQUIRE(build_relation_is_opaque(*make_cte_ref())); }
+
+  SECTION("a projected CTE_REF")
   {
-    // The opacity this predicate exists for: the mirror bottoms out at the childless reference.
-    REQUIRE_FALSE(build_subtree_is_filtering(*make_delim_get()));
-    REQUIRE_FALSE(build_subtree_is_filtering(*make_cte_ref()));
+    REQUIRE(build_relation_is_opaque(*make_projection_over(make_cte_ref())));
+  }
+
+  SECTION("a CTE_REF below stacked projections")
+  {
+    REQUIRE(build_relation_is_opaque(*make_projection_over(make_projection_over(make_cte_ref()))));
   }
 }
 
-TEST_CASE("operators in the mirror's jurisdiction are not derived", "[dynamic_filter][evidence]")
+TEST_CASE("base-table builds carry no opaque fallback evidence", "[dynamic_filter][evidence]")
 {
-  SECTION("a FILTER over a GET")
+  REQUIRE_FALSE(build_relation_is_opaque(*make_get()));
+  REQUIRE_FALSE(build_relation_is_opaque(*make_filtered_get()));
+  REQUIRE_FALSE(build_relation_is_opaque(*make_projection_over(make_get())));
+}
+
+TEST_CASE("malformed projections carry no opaque fallback evidence", "[dynamic_filter][evidence]")
+{
+  SECTION("a childless projection")
   {
-    duckdb::LogicalFilter filter;
-    filter.children.push_back(make_get());
-    REQUIRE_FALSE(build_relation_is_derived(filter));
+    auto projection = duckdb::make_uniq<duckdb::LogicalProjection>(
+      /*table_index=*/6, duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{});
+    REQUIRE_FALSE(build_relation_is_opaque(*projection));
   }
 
-  SECTION("a TOP_N")
+  SECTION("a projection with a null child")
   {
-    duckdb::LogicalTopN top_n({}, /*limit=*/10, /*offset=*/0);
-    REQUIRE_FALSE(build_relation_is_derived(top_n));
+    auto projection = duckdb::make_uniq<duckdb::LogicalProjection>(
+      /*table_index=*/6, duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{});
+    projection->children.push_back(nullptr);
+    REQUIRE_FALSE(build_relation_is_opaque(*projection));
+  }
+
+  SECTION("a projection with multiple children")
+  {
+    auto projection = make_projection_over(make_cte_ref());
+    projection->children.push_back(make_get());
+    REQUIRE_FALSE(build_relation_is_opaque(*projection));
   }
 }
 
-TEST_CASE("derivation is any-descendant over derivation markers", "[dynamic_filter][evidence]")
+TEST_CASE("reducing operators are not opaque build roots", "[dynamic_filter][evidence]")
 {
-  SECTION("a group-less aggregate over a projected CTE_REF is derived")
+  SECTION("a grouped aggregate")
   {
-    // Two markers: the aggregate itself and the reference below it.
-    REQUIRE(build_relation_is_derived(*make_aggregate_over(make_projection_over(make_cte_ref()))));
+    REQUIRE_FALSE(build_relation_is_opaque(*make_aggregate_over(make_get())));
   }
 
-  SECTION("a comparison join with a CTE_REF child is derived")
-  {
-    REQUIRE(build_relation_is_derived(*make_join_over(make_cte_ref(), make_get())));
-  }
-
-  SECTION("a marker below a non-projection wrapper is still found")
-  {
-    // The property the walk exists for: no operator between the root and a marker hides it.
-    REQUIRE(build_relation_is_derived(*make_order_over(make_join_over(make_get(), make_get()))));
-    REQUIRE(build_relation_is_derived(*make_limit_over(make_join_over(make_get(), make_get()))));
-  }
-
-  SECTION("a LIMIT over a CTE_REF is derived")
-  {
-    // Deliberate: one uniform rule for leaves and reducing operators alike. A rule that admitted
-    // an unfiltered aggregate under this LIMIT but refused the CTE reference -- the more clearly
-    // derived relation of the two -- would be incoherent.
-    REQUIRE(build_relation_is_derived(*make_limit_over(make_cte_ref())));
-  }
-}
-
-TEST_CASE("reducing operators are derivation markers", "[dynamic_filter][evidence]")
-{
-  SECTION("a grouped aggregate over a GET")
-  {
-    REQUIRE(build_relation_is_derived(*make_aggregate_over(make_get())));
-  }
-
-  SECTION("a DISTINCT over a GET")
+  SECTION("a DISTINCT")
   {
     auto distinct = duckdb::make_uniq<duckdb::LogicalDistinct>(
       duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{}, duckdb::DistinctType::DISTINCT);
     distinct->children.push_back(make_get());
-    REQUIRE(build_relation_is_derived(*distinct));
+    REQUIRE_FALSE(build_relation_is_opaque(*distinct));
   }
 
-  SECTION("a DELIM_JOIN over two GETs")
+  SECTION("a comparison join")
   {
-    // A delim join is a LogicalComparisonJoin carrying its own operator type, so the marker switch
-    // has to name it separately from LOGICAL_COMPARISON_JOIN.
+    REQUIRE_FALSE(build_relation_is_opaque(*make_join_over(make_get(), make_get())));
+  }
+
+  SECTION("a DELIM_JOIN")
+  {
     auto join = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(
       duckdb::JoinType::INNER, duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN);
     join->children.push_back(make_get());
     join->children.push_back(make_get());
-    REQUIRE(join->type == duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN);
-    REQUIRE(build_relation_is_derived(*join));
+    REQUIRE_FALSE(build_relation_is_opaque(*join));
   }
 
-  SECTION("an ANY_JOIN over two GETs")
+  SECTION("an ANY_JOIN")
   {
     auto join = duckdb::make_uniq<duckdb::LogicalAnyJoin>(duckdb::JoinType::INNER);
     join->children.push_back(make_get());
     join->children.push_back(make_get());
-    REQUIRE(build_relation_is_derived(*join));
+    REQUIRE_FALSE(build_relation_is_opaque(*join));
   }
 
-  SECTION("an INTERSECT of two GETs")
+  SECTION("an INTERSECT")
   {
-    REQUIRE(build_relation_is_derived(
+    REQUIRE_FALSE(build_relation_is_opaque(
       *make_set_operation(duckdb::LogicalOperatorType::LOGICAL_INTERSECT)));
   }
 
-  SECTION("an EXCEPT of two GETs")
+  SECTION("an EXCEPT")
   {
-    REQUIRE(
-      build_relation_is_derived(*make_set_operation(duckdb::LogicalOperatorType::LOGICAL_EXCEPT)));
-  }
-}
-
-TEST_CASE("row-preserving operators over base tables are not derived", "[dynamic_filter][evidence]")
-{
-  SECTION("a LIMIT over a GET")
-  {
-    REQUIRE_FALSE(build_relation_is_derived(*make_limit_over(make_get())));
-  }
-
-  SECTION("an ORDER_BY over a GET")
-  {
-    REQUIRE_FALSE(build_relation_is_derived(*make_order_over(make_get())));
-  }
-
-  SECTION("a UNION of two GETs")
-  {
-    // A union does not reduce either input's key set, so it is deliberately not a marker.
     REQUIRE_FALSE(
-      build_relation_is_derived(*make_set_operation(duckdb::LogicalOperatorType::LOGICAL_UNION)));
+      build_relation_is_opaque(*make_set_operation(duckdb::LogicalOperatorType::LOGICAL_EXCEPT)));
   }
 }
 
-TEST_CASE("a childless projection is not derived", "[dynamic_filter][evidence]")
+TEST_CASE("non-projection wrappers hide opaque leaves from the fallback classifier",
+          "[dynamic_filter][evidence]")
 {
-  auto const projection = duckdb::make_uniq<duckdb::LogicalProjection>(
-    /*table_index=*/6, duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{});
-  REQUIRE_FALSE(build_relation_is_derived(*projection));
+  SECTION("an aggregate over a CTE_REF")
+  {
+    REQUIRE_FALSE(build_relation_is_opaque(*make_aggregate_over(make_cte_ref())));
+  }
+
+  SECTION("a join over a CTE_REF")
+  {
+    REQUIRE_FALSE(build_relation_is_opaque(*make_join_over(make_cte_ref(), make_get())));
+  }
+
+  SECTION("a LIMIT over a CTE_REF")
+  {
+    REQUIRE_FALSE(build_relation_is_opaque(*make_limit_over(make_cte_ref())));
+  }
+
+  SECTION("an ORDER_BY over a CTE_REF")
+  {
+    REQUIRE_FALSE(build_relation_is_opaque(*make_order_over(make_cte_ref())));
+  }
 }

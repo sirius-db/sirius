@@ -191,8 +191,6 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       duckdb::unique_ptr<duckdb::LogicalOperator> fresh_plan;
       if (logical_plan_) {
         try {
-          // LogicalOperator::Copy strips DuckDB join-filter metadata, which Sirius target discovery
-          // does not consume.
           fresh_plan = sirius::transparent::copy_logical_plan(*logical_plan_, context.client);
         } catch (duckdb::NotImplementedException&) {
           // Drop logical_plan_ — we know it can't be copied, so future executes

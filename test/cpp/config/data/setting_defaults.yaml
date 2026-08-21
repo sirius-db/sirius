@@ -1,0 +1,39 @@
+sirius:
+  topology:
+    num_gpus: 1
+  memory:
+    gpu:
+      usage_limit_fraction: 0.05
+      reservation_limit_fraction: 0.04
+      downgrade_trigger_fraction: 0.04
+      downgrade_stop_fraction: 0.02
+    host:
+      capacity_bytes: 160000000
+  executor:
+    downgrade:
+      num_threads: 1
+      monitor_period: 10ms
+  operator_params:
+    scan_task_batch_size: 1MiB
+    max_sort_partition_bytes: 2MiB
+    max_sort_partition_memory_fraction: 0.25
+    hash_partition_bytes: 3MiB
+    concat_batch_bytes: 4MiB
+    sort_sample_bytes: 5MiB
+    max_build_hash_table_bytes: 6MiB
+    max_broadcast_join_size: 7MiB
+    mark_join_build_switch_ratio: 3.0
+    enable_dynamic_filter: false
+    enable_dynamic_zone_map_filter: true
+    dynamic_filter_domain_coverage_threshold: 0.8
+    dynamic_filter_inlist_max_l2_fraction: 0.4
+    dynamic_filter_keep_threshold: 0.7
+    enable_pinned_zone_map_pruning: false
+    enable_compressed_materialization: false
+  compression:
+    enable_pin_table_compression: true
+    min_batch_size_bytes: 8MiB
+    max_compressed_fraction: 0.6
+    input_plan_dir: /tmp/sirius-compression-plans
+  telemetry:
+    enable_quent: false

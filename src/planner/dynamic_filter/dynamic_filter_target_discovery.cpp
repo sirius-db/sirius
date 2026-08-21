@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-// sirius
 #include <expression/ast/node.hpp>
 #include <op/sirius_physical_filter.hpp>
 #include <op/sirius_physical_grouped_aggregate.hpp>
@@ -24,7 +23,6 @@
 #include <op/sirius_physical_projection.hpp>
 #include <planner/dynamic_filter/dynamic_filter_target_discovery.hpp>
 
-// stdlib
 #include <cassert>
 #include <variant>
 
@@ -32,18 +30,17 @@ namespace sirius::planner {
 
 namespace {
 
-// The probe/left block carries the traced value out un-null-padded for these join types. RIGHT and
-// FULL_OUTER (OUTER) null-pad the left block; SINGLE is unsupported by the GPU join.
-bool probe_block_is_value_preserving(duckdb::JoinType join_type) noexcept
+// ANTI preserves LHS values; RIGHT/OUTER synthesize only NULLs rejected by producer equality.
+bool probe_block_descent_admissible(duckdb::JoinType join_type) noexcept
 {
   switch (join_type) {
     case duckdb::JoinType::INNER:
     case duckdb::JoinType::LEFT:
     case duckdb::JoinType::SEMI:
     case duckdb::JoinType::ANTI:
-    case duckdb::JoinType::MARK: return true;
     case duckdb::JoinType::RIGHT:
     case duckdb::JoinType::OUTER:
+    case duckdb::JoinType::MARK: return true;
     case duckdb::JoinType::SINGLE:
     case duckdb::JoinType::RIGHT_SEMI:
     case duckdb::JoinType::RIGHT_ANTI:
@@ -52,15 +49,14 @@ bool probe_block_is_value_preserving(duckdb::JoinType join_type) noexcept
   return false;  // unreachable
 }
 
-// For INNER and LEFT joins, removing a build row only removes a result row or creates a NULL-padded
-// row that the producing join later drops. Other join types are not safe build-block routes.
-bool build_block_is_value_preserving(duckdb::JoinType join_type) noexcept
+// LEFT/OUTER synthesize only NULLs rejected by producer equality.
+bool build_block_descent_admissible(duckdb::JoinType join_type) noexcept
 {
   switch (join_type) {
     case duckdb::JoinType::INNER:
-    case duckdb::JoinType::LEFT: return true;
     case duckdb::JoinType::RIGHT:
-    case duckdb::JoinType::OUTER:
+    case duckdb::JoinType::LEFT:
+    case duckdb::JoinType::OUTER: return true;
     case duckdb::JoinType::SEMI:
     case duckdb::JoinType::ANTI:
     case duckdb::JoinType::MARK:
@@ -69,7 +65,7 @@ bool build_block_is_value_preserving(duckdb::JoinType join_type) noexcept
     case duckdb::JoinType::RIGHT_ANTI:
     case duckdb::JoinType::INVALID: return false;
   }
-  return false;  // unreachable;
+  return false;  // unreachable
 }
 
 std::vector<descent_step> as_steps(std::optional<descent_step> step)
@@ -104,13 +100,13 @@ std::optional<descent_step> join_block_descent(
 {
   auto const probe_block_size = probe_block_output_columns.size();
   if (output_ordinal < probe_block_size) {
-    if (!probe_block_is_value_preserving(join_type)) { return std::nullopt; }
+    if (!probe_block_descent_admissible(join_type)) { return std::nullopt; }
     return descent_step{
       .child_index   = 0,
       .child_ordinal = static_cast<std::size_t>(probe_block_output_columns[output_ordinal])};
   }
   if (!policy.descend_build_blocks) { return std::nullopt; }
-  if (!build_block_is_value_preserving(join_type)) { return std::nullopt; }
+  if (!build_block_descent_admissible(join_type)) { return std::nullopt; }
   auto const build_ordinal = output_ordinal - probe_block_size;
   if (build_ordinal >= build_block_output_columns.size()) { return std::nullopt; }
   return descent_step{
@@ -146,8 +142,7 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
                                          output_ordinal,
                                          policy));
     }
-    // A filter is a row predicate over unchanged columns: value-preserving through its output
-    // gather and commuting with any other independent row predicate applied below it.
+    // Independent row predicates commute without changing column values.
     case SiriusPhysicalOperatorType::FILTER: {
       auto const& filter = node.Cast<sirius::op::sirius_physical_filter>();
       if (std::holds_alternative<sirius::op::passthrough>(filter.output_columns)) {
@@ -158,8 +153,6 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
       return {descent_step{.child_index   = 0,
                            .child_ordinal = static_cast<std::size_t>((*gather)[output_ordinal])}};
     }
-    // A physical union's output is positionally aligned with every child by construction, so the
-    // trace fans out into each child at the same ordinal.
     case SiriusPhysicalOperatorType::UNION: {
       std::vector<descent_step> steps;
       steps.reserve(node.children.size());
@@ -169,8 +162,6 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
       }
       return steps;
     }
-    // A row mask passes every column through unchanged and commutes with any other row filter, so a
-    // later key's endpoint may descend past an earlier key's rather than stopping on it.
     case SiriusPhysicalOperatorType::DYNAMIC_FILTER:
       return {descent_step{.child_index = 0, .child_ordinal = output_ordinal}};
     case SiriusPhysicalOperatorType::INVALID:
@@ -250,6 +241,9 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
     case SiriusPhysicalOperatorType::VERIFY_VECTOR:
     case SiriusPhysicalOperatorType::UPDATE_EXTENSIONS:
     case SiriusPhysicalOperatorType::CREATE_SECRET:
+    // Join feeders are added after discovery as CONCAT -> PARTITION -> existing child in
+    // `insert_gpu_pipeline_operators()`. Targets therefore end up below both even though either
+    // wrapper is terminal if encountered here.
     case SiriusPhysicalOperatorType::PARTITION:
     case SiriusPhysicalOperatorType::CONCAT:
     case SiriusPhysicalOperatorType::MERGE_SORT:
@@ -260,14 +254,14 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
     case SiriusPhysicalOperatorType::SORT_SAMPLE:
     case SiriusPhysicalOperatorType::GPU_VALUES:
     case SiriusPhysicalOperatorType::GPU_SCAN:
-    case SiriusPhysicalOperatorType::STREAMING_SOURCE: return {};
+    case SiriusPhysicalOperatorType::STREAMING_SOURCE:
+    case SiriusPhysicalOperatorType::STREAMING_SINK: return {};
   }
   return {};  // unreachable
 }
 
 namespace {
 
-// A missing child turns the current node into a terminal.
 bool steps_are_followable(sirius::op::sirius_physical_operator const& node,
                           std::vector<descent_step> const& steps)
 {
@@ -327,7 +321,6 @@ endpoint_placement place_endpoint(duckdb::unique_ptr<sirius::op::sirius_physical
     result.subtree = std::move(subtree);
     return result;
   }
-  // Deepest safe site: the endpoint becomes this operator's new parent.
   auto endpoint = make_endpoint(*subtree);
   endpoint->children.push_back(std::move(subtree));
   return endpoint_placement{.subtree = std::move(endpoint), .site_ordinals = {a0}};

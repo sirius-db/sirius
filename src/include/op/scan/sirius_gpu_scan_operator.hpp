@@ -25,6 +25,7 @@
 #include <cudf/types.hpp>
 
 // standard library
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -33,6 +34,10 @@ namespace sirius::scan_manager {
 class split_connector;
 class sirius_scan_manager;
 }  // namespace sirius::scan_manager
+
+namespace sirius::op {
+class sirius_dynamic_filter_set;  // membership channel (op/sirius_dynamic_filter.hpp)
+}
 
 namespace duckdb {
 class SiriusContext;
@@ -148,9 +153,29 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
 
   scan_manager::split_connector& get_split_connector();
 
+  /// Shared handle to the connector, for components (e.g. the memory
+  /// prefetcher) that must outlive-safely reference it from a background
+  /// thread.
+  [[nodiscard]] std::shared_ptr<scan_manager::split_connector> get_shared_split_connector() const
+  {
+    return _split_connector;
+  }
+
  private:
   std::shared_ptr<gpu_ingestible> _ingestible;
   std::shared_ptr<scan_manager::split_connector> _split_connector;
+  /// Latch for "compacting during decode does not pay off", shared with every
+  /// split this operator hands out (see
+  /// scan_operator_input::pushdown_selection_unprofitable).
+  /// Per-operator so another query's scan of the same pinned entry decides
+  /// fresh.
+  std::shared_ptr<std::atomic<bool>> _decode_selection_unprofitable =
+    std::make_shared<std::atomic<bool>>(false);
+  /// The scan's dynamic-filter channel (null for non-parquet ingestibles),
+  /// resolved once at construction and stamped onto every split so
+  /// prepare_for_processing can snapshot membership filters at DECODE time
+  /// (see scan_operator_input::dynamic_filters).
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> _dynamic_filters_channel;
   /// Non-owning observer. The registered-state shared_ptr owns the context for
   /// at least as long as the query plan; unit-test operators may leave it null.
   duckdb::SiriusContext* _compressed_materialization_observer;

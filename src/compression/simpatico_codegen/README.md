@@ -10,7 +10,7 @@ nvcomp-Cascaded, bitcomp, ANS, bitextract/bitjoin — specified via a human-read
 
 - NVIDIA GPU (Turing or newer)
 - [pixi](https://prefix.dev/) (or conda)
-- CUDA 13.x driver
+- CUDA 12.9 or CUDA 13.x
 
 ## Quick start
 
@@ -191,9 +191,10 @@ headers (`nvrtcCreateProgram`):
 
 - the two project headers (`codegen/decode/rle_block.cuh`, `codegen/stdint_shim.hpp`), embedded
   by `cmake/embed_jit_headers.cmake`;
-- the CCCL closure (`<cuda/std/...>`, `<cub/...>`) — the transitive `#include` set reachable from
-  the kernel preludes, scanned at build time and embedded by `cmake/embed_cccl_headers.cmake`
-  (so it tracks the CCCL version the extension is built against).
+- the CCCL closure (`<cuda/std/...>`, `<cub/...>`, and `<thrust/...>`) — the transitive
+  `#include` set reachable from the kernel preludes, scanned at build time and embedded by
+  `cmake/embed_cccl_headers.cmake` (so it tracks the CCCL version the extension is built
+  against).
 
 As a result the runtime JIT needs **no CCCL/CUDA headers on disk** — only the driver and the
 `libnvrtc` runtime (which the Sirius vcpkg build links statically via the `nvrtc` overlay port).

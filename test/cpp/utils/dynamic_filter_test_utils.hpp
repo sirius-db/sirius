@@ -39,10 +39,8 @@ inline sirius::op::dynamic_filter_stats_snapshot get_dynamic_filter_stats_snapsh
 
 /// Sets one numeric Sirius setting for a scope and restores its previous value on destruction.
 ///
-/// These settings live on `SiriusContext`, so they outlive the connection that changed them. The
-/// restore is issued from a destructor and its result is therefore discarded rather than asserted:
-/// a destructor must not throw, and Catch2's assertion macros do. A restore can only fail if the
-/// connection is already unusable, in which case the rest of the test is failing anyway.
+/// The setting lives on the shared `SiriusContext` and outlives the connection, so the restore
+/// matters; its result is unchecked because destructors must not throw.
 struct scoped_setting {
   scoped_setting(duckdb::Connection& c, std::string setting, std::uint64_t value)
     : con(c), name(std::move(setting))
@@ -111,7 +109,7 @@ struct disabled_optimizers_guard {
   std::string original;
 };
 
-/// Path to the integration DuckDB carrying the SF1 TPC-H schema, honoring the
+/// Path to the vendored TPC-H integration DuckDB, honoring the
 /// `SIRIUS_INTEGRATION_TEST_DB_PATH` override. Fails the test if the database is absent.
 inline std::filesystem::path integration_tpch_db_path()
 {

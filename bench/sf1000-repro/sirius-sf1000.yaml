@@ -1,0 +1,55 @@
+# TPC-H SF1000 reproduction config -- GB300 (152 SM, 256 GB HBM, 72-core Grace aarch64).
+# Measured 8.501 s suite (best-of-3, 22/22 byte-identical), vs a 15.99 s starting point.
+#
+# Knobs that were swept and measured INERT on this machine (do not bother retuning):
+#   pipeline.num_threads        6 / 8 / 12   all within 0.55%
+#   hash_partition_bytes        16GB vs 32GB  -0.06%
+#   scan_manager.num_threads    18 vs 24      -0.33%
+# GPU-busy is 91-97% of wall, so scheduling/parallelism knobs cannot help here.
+#
+# scan_task_batch_size is the ONE knob that mattered: 5GB -> 8GB is -1.85%
+# (q4 -25%, q12 -18%), and it is a STEP not a gradient -- 10GB adds nothing and
+# costs q9 2.6%. 8GB peaks at 253.9 GB of 256 GB, so do not raise it further.
+sirius:
+    topology:
+        num_gpus: 1
+    memory:
+        gpu:
+            usage_limit_fraction: 0.95
+            reservation_limit_fraction: 1.0
+            downgrade_trigger_fraction: 0.9      # Y1 delta (arm Z was 0.8)
+            downgrade_stop_fraction: 0.85        # Y1 delta (arm Z was 0.6)
+        host:
+            capacity_bytes: 471200000000
+            initial_number_pools: 392
+            pool_size: 8
+            block_size: 67108864
+        disk:
+            disk_id: 0
+            capacity_bytes: 1000000000000
+            downgrade_root_dirs: "/localhome/local-faramburu/sirius_disk_memory"
+    executor:
+        scan_manager:
+          memory_prefetcher:
+            enable: true
+            num_threads: 3
+          num_threads: 18
+          use_sirius_datasource: true
+          uring_n_reactors: 4
+          enable_prefetch_cache: false
+        pipeline:
+            num_threads: 8
+        downgrade:
+            num_threads: 1
+        task_creator:
+            num_threads: 4
+    operator_params:
+        scan_task_batch_size: 8GB
+        max_sort_partition_bytes: 0               # 0: auto (33% GPU memory)
+        hash_partition_bytes: 32GB
+        concat_batch_bytes: 5GB
+        max_build_hash_table_bytes: 32GB
+    telemetry:
+        enable_quent: false
+        output_directory: telemetry_data
+        engine_name: siriusDB

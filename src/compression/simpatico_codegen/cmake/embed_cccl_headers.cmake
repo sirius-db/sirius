@@ -5,12 +5,13 @@
 # -I into a CCCL tree, so a binary distribution needs only the driver + the
 # nvrtc runtime it already links. Invoked via `cmake -P`.
 #
-# Inputs (-D): CCCL_DIR  the build-time CCCL include root (contains cuda/ and
-# cub/) OUT       path of the .cpp to generate
+# Inputs (-D): CCCL_DIR  the build-time CCCL include root (contains cuda/, cub/,
+# and thrust/) OUT       path of the .cpp to generate
 #
-# The scan follows every `#include` line (both #ifdef branches) from the fixed
-# kernel-prelude roots below, so it is a safe SUPERSET of what NVRTC actually
-# reads. Recomputed at build time, so it tracks the CCCL version in use.
+# The scan follows every literal `#include` line (both #ifdef branches) from the
+# fixed kernel-prelude roots below. Dependencies reached through macro-expanded
+# includes must be seeded explicitly. Recomputed at build time, so it tracks the
+# CCCL version in use.
 
 cmake_minimum_required(VERSION 3.24)
 
@@ -19,7 +20,9 @@ if(NOT IS_DIRECTORY "${CCCL_DIR}")
     FATAL_ERROR "embed_cccl_headers: CCCL_DIR '${CCCL_DIR}' is not a directory")
 endif()
 
-# Union of the includes emitted by the encode + decode kernel preludes.
+# Union of the includes emitted by the encode + decode kernel preludes. CUDA 12
+# reaches execution_policy.h through a macro-expanded include, which the
+# literal-include scanner cannot discover, so seed it explicitly.
 set(roots
     cub/block/block_reduce.cuh
     cub/block/block_scan.cuh
@@ -27,7 +30,9 @@ set(roots
     cuda/std/cstdint
     cuda/std/cstddef
     cuda/std/climits
-    cuda/std/type_traits)
+    cuda/std/type_traits
+    thrust/system/cpp/detail/execution_policy.h
+    thrust/system/cuda/detail/execution_policy.h)
 
 set(worklist ${roots})
 set(found "")

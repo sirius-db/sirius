@@ -62,6 +62,13 @@ class sirius_physical_delim_join : public sirius_physical_operator {
 
   bool is_sink() const override { return true; }
 
+  //! DELIM_JOIN execute() forwards its pipeline input unchanged. `types` describes the logical
+  //! join result produced by the internal join subtree, not those pass-through batches.
+  [[nodiscard]] bool declared_output_schema_is_runtime_schema() const noexcept override
+  {
+    return false;
+  }
+
   sirius::OrderPreservationType source_order() const override
   {
     return sirius::OrderPreservationType::NO_ORDER;

@@ -22,7 +22,6 @@ namespace sirius::planner {
 
 bool build_subtree_is_filtering(duckdb::LogicalOperator const& op)
 {
-  // Match DuckDB's join-filter pushdown predicate.
   switch (op.type) {
     case duckdb::LogicalOperatorType::LOGICAL_GET:
       return !op.Cast<duckdb::LogicalGet>().table_filters.filters.empty();
@@ -36,29 +35,16 @@ bool build_subtree_is_filtering(duckdb::LogicalOperator const& op)
   return false;
 }
 
-bool build_relation_is_derived(duckdb::LogicalOperator const& op)
+bool build_relation_is_opaque(duckdb::LogicalOperator const& op)
 {
   switch (op.type) {
-    // Childless derived leaves. The build_subtree_is_filtering mirror bottoms out here, so its
-    // "unfiltered" verdict means "cannot see", not "whole key domain".
     case duckdb::LogicalOperatorType::LOGICAL_DELIM_GET:
-    case duckdb::LogicalOperatorType::LOGICAL_CTE_REF:
-    // Reducing operators. Their output key set is a subset of the domain even when no predicate
-    // appears anywhere below them: a join output carries only surviving keys, an aggregate
-    // collapses to its groups, a set operation removes rows.
-    case duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
-    case duckdb::LogicalOperatorType::LOGICAL_ANY_JOIN:
-    case duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN:
-    case duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
-    case duckdb::LogicalOperatorType::LOGICAL_DISTINCT:
-    case duckdb::LogicalOperatorType::LOGICAL_INTERSECT:
-    case duckdb::LogicalOperatorType::LOGICAL_EXCEPT: return true;
-    default: break;
+    case duckdb::LogicalOperatorType::LOGICAL_CTE_REF: return true;
+    case duckdb::LogicalOperatorType::LOGICAL_PROJECTION:
+      return op.children.size() == 1 && op.children.front() != nullptr &&
+             build_relation_is_opaque(*op.children.front());
+    default: return false;
   }
-  for (auto const& child : op.children) {
-    if (child && build_relation_is_derived(*child)) { return true; }
-  }
-  return false;
 }
 
 }  // namespace sirius::planner

@@ -19,12 +19,14 @@
 #include "config.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression/ast/to_duckdb.hpp"
 #include "expression_evaluator/expression_evaluator.hpp"
 #include "expression_evaluator/gpu_expression_translator_internal.hpp"
+#include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_hash_join.hpp"
@@ -98,6 +100,34 @@ void reorder_conditions(duckdb::vector<sirius::join_condition>& conditions)
   }
 }
 
+bool sirius_physical_nested_loop_join::is_join_type_supported(duckdb::JoinType join_type)
+{
+  // Keep in lockstep with the `switch (join_type)` in execute() and emit_one_side_empty_result().
+  switch (join_type) {
+    case duckdb::JoinType::INNER:
+    case duckdb::JoinType::LEFT:
+    case duckdb::JoinType::RIGHT:
+    case duckdb::JoinType::SEMI:
+    case duckdb::JoinType::ANTI:
+    case duckdb::JoinType::MARK:
+    case duckdb::JoinType::OUTER: return true;
+    // RIGHT_SEMI / RIGHT_ANTI would need the predicate rebuilt with the table references
+    // swapped, SINGLE the matches deduplicated to one right row per left row; neither exists.
+    default: return false;
+  }
+}
+
+// Backstop for a construction site that skipped the planner's screen: throwing here still lands
+// in plan generation, which falls back to CPU, rather than aborting the query from execute().
+static void require_supported_join_type(duckdb::JoinType join_type)
+{
+  if (!sirius_physical_nested_loop_join::is_join_type_supported(join_type)) {
+    throw duckdb::NotImplementedException(
+      "sirius_physical_nested_loop_join: unsupported join type: " +
+      duckdb::JoinTypeToString(join_type));
+  }
+}
+
 sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
   duckdb::LogicalOperator& op,
   duckdb::unique_ptr<sirius_physical_operator> left,
@@ -111,6 +141,7 @@ sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
     conditions(std::move(cond)),
     join_type(join_type)
 {
+  require_supported_join_type(join_type);
   reorder_conditions(conditions);
 
   children.push_back(std::move(left));
@@ -142,6 +173,7 @@ sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
     conditions(std::move(cond)),
     join_type(join_type)
 {
+  require_supported_join_type(join_type);
   reorder_conditions(conditions);
   children.push_back(std::move(left));
   children.push_back(std::move(right));
@@ -170,6 +202,7 @@ sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
 bool sirius_physical_nested_loop_join::is_supported(
   const duckdb::vector<sirius::join_condition>& conditions, duckdb::JoinType join_type)
 {
+  if (!is_join_type_supported(join_type)) { return false; }
   if (join_type == duckdb::JoinType::MARK) { return true; }
   for (auto& cond : conditions) {
     auto left_expr = sirius::ast::to_duckdb(*cond.left);
@@ -433,7 +466,7 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
 
   out_cols.push_back(std::move(mark_column));
 
-  auto output_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
+  auto output_table = std::make_unique<cudf::table>(std::move(out_cols));
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<cucascade::data_batch>>{
       make_data_batch(std::move(output_table), space, stream, telemetry_info)});
@@ -534,7 +567,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::emit_one_side_e
   for (std::size_t idx : right_output_col_idxs) {
     if (idx < right_released.size()) { out_cols.push_back(std::move(right_released[idx])); }
   }
-  auto result_table = std::make_unique<cudf::table>(std::move(out_cols), stream, mr);
+  auto result_table = std::make_unique<cudf::table>(std::move(out_cols));
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<cucascade::data_batch>>{
       make_data_batch(std::move(result_table), space, stream, batch_telemetry())});
@@ -602,7 +635,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
         out_cols.push_back(std::move(left_released[left_n + idx]));
       }
     }
-    result_table = std::make_unique<cudf::table>(std::move(out_cols), stream, mr);
+    result_table = std::make_unique<cudf::table>(std::move(out_cols));
   } else {
     // Resolve column indices and target types so AST predicate operands match (cudf requires
     // matching types). Columns used in conditions may be cast to the expression return type.
@@ -672,7 +705,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
               "is no BOUND_CAST");
           }
           intermediates_scope_holder.push_back(
-            cudf::cast(table.column(source_idx), target_type, stream));
+            sirius::cast_through_rep(table.column(source_idx), target_type, stream));
           col_views.push_back(intermediates_scope_holder.back()->view());
         } else {
           col_views.push_back(table.column(source_idx));
@@ -821,6 +854,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
         join_result =
           cudf::conditional_full_join(left_effective, right_effective, predicate, stream, mr);
         break;
+      // Unreachable: is_join_type_supported() screens these out at plan time and at construction.
       default:
         throw std::runtime_error("sirius_physical_nested_loop_join: unsupported join type: " +
                                  duckdb::JoinTypeToString(join_type));
@@ -865,7 +899,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
     for (std::size_t idx : right_output_col_idxs) {
       if (idx < right_released.size()) { out_cols.push_back(std::move(right_released[idx])); }
     }
-    result_table = std::make_unique<cudf::table>(std::move(out_cols), stream, mr);
+    result_table = std::make_unique<cudf::table>(std::move(out_cols));
   }
 
   SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, 1 output batches", pipeline_id);

@@ -48,7 +48,7 @@ class sirius_dynamic_bloom_filter;
 class complete_build_snapshot final {
  public:
   /**
-   * @brief Validate and take ownership of a complete build snapshot
+   * @brief Validates and takes ownership of a complete build snapshot
    *
    * @param[in] total_rows Global build row count
    * @param[in] batch_ids Original pre-scatter batch IDs
@@ -94,7 +94,7 @@ struct complete_build_batch_summary {
 };
 
 /**
- * @brief Sum exact batch rows and create a validated complete build snapshot
+ * @brief Sums exact batch rows and creates a validated complete build snapshot
  *
  * @param[in] batches Original build batch identities and row counts
  * @param[in] partition_count Number of hash partitions
@@ -105,62 +105,29 @@ struct complete_build_batch_summary {
 
 }  // namespace detail
 
-//===----------------------------------------------------------------------===//
-// publish_dynamic_filters
-//===----------------------------------------------------------------------===//
-
-/**
- * @brief What one publication attempt did
- *
- * `publish_dynamic_filters()` returns these counts without updating `dynamic_filter_stats`;
- * `dynamic_filter_publication_session` folds a claimed attempt into its optional sink.
- */
 struct dynamic_filter_publication_outcome {
-  std::size_t keys_considered            = 0;  ///< Bound admitted keys the attempt walked
-  std::size_t keys_with_known_domain     = 0;  ///< Keys whose domain cardinality was nonzero
-  std::size_t keys_build_exceeded_domain = 0;  ///< Build rows exceeded the domain bound
-  std::size_t skipped_targets_drained    = 0;  ///< 1 when the attempt hit the all-drained return
-  std::size_t keys_skipped_domain_gate   = 0;  ///< Skipped: build too dense a sample of the domain
-  std::size_t keys_skipped_bloom_size_gate = 0;  ///< Skipped: aggregate Bloom budget exceeded
-  std::size_t keys_skipped_type_mismatch   = 0;  ///< Skipped: plan type disagreed with the column
+  std::size_t keys_considered              = 0;
+  std::size_t keys_with_known_domain       = 0;
+  std::size_t keys_build_exceeded_domain   = 0;
+  std::size_t skipped_targets_drained      = 0;
+  std::size_t keys_skipped_domain_gate     = 0;
+  std::size_t keys_skipped_bloom_size_gate = 0;
+  std::size_t keys_skipped_type_mismatch   = 0;
   std::size_t membership_filters_built     = 0;
   std::size_t zone_map_filters_built       = 0;
-  std::size_t active_targets               = 0;  ///< Targets still accepting filters
-  std::size_t filters_pushed               = 0;  ///< Accepted pushes across every target
+  std::size_t active_targets               = 0;
+  std::size_t filters_pushed               = 0;
 };
 
 /**
- * @brief Build, replicate, and fan out one immutable dynamic-filter snapshot from a complete
- * hash-join build table
+ * @brief Builds and publishes filters from a complete hash-join build table
  *
- * The immutable @ref dynamic_filter_publish_plan is the only key and target input. The function
- * constructs filters only for admitted keys with at least one binding, completes device
- * replication, and pushes each filter at the binding's channel push ordinal. It retains none of its
- * inputs.
- *
- * `sirius_physical_hash_join` owns source readiness.
- * `dynamic_filter_publication_session::publish_one_shot` owns exactly-once arbitration.
- *
- * A key whose recorded storage type disagrees with its runtime build column is skipped and counted.
- * Before accessing a build column, the function validates its ordinal against @p build_view; an
- * out-of-range ordinal fails the publication attempt with `std::logic_error`.
- *
- * Before propagating an exception after filter work begins, the function best-effort synchronizes
- * @p stream without replacing the original exception. The caller may therefore release storage
- * backing @p build_view when the call exits normally or exceptionally.
+ * Replicas are ready before filters reach bound channels. The function retains no inputs; the
+ * caller owns source readiness and one-shot arbitration. Type-mismatched keys are skipped.
  *
  * @pre @p plan is enabled
  * @throw std::runtime_error if the source GPU cannot be identified
- * @throw std::logic_error if an admitted key's build ordinal lies outside `build_view`, if the
- * source GPU is absent from the plan's replica spaces, or if a constructed filter does not
- * implement `sirius_device_replicable`
- *
- * @param[in] plan The join's enabled publication plan (admitted keys, targets, policy, replica
- * placements)
- * @param[in] build_view The complete build table to reduce / build membership over; admitted build
- * key ordinals index its columns
- * @param[in] stream Stream used for filter construction
- * @return Counts describing what the attempt constructed, skipped, and pushed
+ * @throw std::logic_error for inconsistent plan or filter metadata
  */
 [[nodiscard]] dynamic_filter_publication_outcome publish_dynamic_filters(
   dynamic_filter_publish_plan const& plan,
@@ -189,8 +156,7 @@ namespace detail {
 struct dynamic_filter_accumulator_test_hooks {
   std::function<void(std::uint64_t)> after_id_claim;
   std::function<void(std::uint64_t)> after_insert_sync;
-  std::function<void(sirius_dynamic_bloom_filter&,
-                     std::span<dynamic_filter_replica_space const>)>
+  std::function<void(sirius_dynamic_bloom_filter&, std::span<dynamic_filter_replica_space const>)>
     strict_replicate;  ///< Replaces strict replication at the pre-fan-out boundary
 };
 }  // namespace detail
@@ -204,7 +170,7 @@ struct dynamic_filter_accumulator_test_hooks {
 class dynamic_filter_accumulator final {
  public:
   /**
-   * @brief Create an accumulator for a complete build snapshot
+   * @brief Creates an accumulator for a complete build snapshot
    *
    * @throw std::invalid_argument if @p plan is disabled or @p snapshot is invalid
    *
@@ -227,7 +193,7 @@ class dynamic_filter_accumulator final {
   dynamic_filter_accumulator& operator=(dynamic_filter_accumulator const&) = delete;
 
   /**
-   * @brief Contribute one expected build batch
+   * @brief Contributes one expected build batch
    *
    * A newly accepted batch is consumed on the current GPU, and @p stream is synchronized before
    * return. Invalid IDs, devices, or columns produce an `aborted` result.
@@ -242,14 +208,14 @@ class dynamic_filter_accumulator final {
                                                               rmm::cuda_stream_view stream);
 
   /**
-   * @brief Atomically abort an incomplete accumulator
+   * @brief Atomically aborts an incomplete accumulator
    *
    * @return The outcome when this call performs the abort, otherwise `std::nullopt`
    */
   [[nodiscard]] std::optional<dynamic_filter_publication_outcome> abort_if_incomplete() noexcept;
 
   /**
-   * @brief Resolve the accumulator to its current terminal result, aborting it if incomplete
+   * @brief Resolves the accumulator to its current terminal result, aborting it if incomplete
    *
    * @return `published` with the complete outcome, or `aborted` with the failure outcome
    */
@@ -290,7 +256,7 @@ struct dynamic_filter_publication_session_test_hooks {
 class dynamic_filter_publication_session final {
  public:
   /**
-   * @brief Create a publication session
+   * @brief Creates a publication session
    *
    * @param[in] plan Immutable publication plan
    * @param[in] stats Optional non-owning statistics sink
@@ -313,17 +279,18 @@ class dynamic_filter_publication_session final {
   [[nodiscard]] bool is_open() const noexcept;
 
   /**
-   * @brief Install an exact-ID accumulator if the publication window is still open
+   * @brief Installs an exact-ID accumulator if the publication window is still open
    *
    * @param[in] snapshot Complete build snapshot consumed by the accumulator
    * @return True when the accumulator was installed; false when multi-partition publication is
-   * disabled, the snapshot is invalid, the session is no longer open, or construction fails. Only
-   * construction failure begins an attempt and records failure.
+   * disabled, the snapshot is invalid, the session is no longer open, or construction fails.
+   * Every call that finds the session open begins an attempt; only construction failure records
+   * a failure.
    */
   [[nodiscard]] bool try_arm(complete_build_snapshot snapshot);
 
   /**
-   * @brief Contribute one original build batch to an armed accumulator
+   * @brief Contributes one original build batch to an armed accumulator
    *
    * Invalid contributions fail the optional publication without failing query execution.
    *
@@ -338,11 +305,11 @@ class dynamic_filter_publication_session final {
                   rmm::cuda_stream_view stream) noexcept;
 
   /**
-   * @brief Claim and perform one-shot publication from a complete build table
+   * @brief Claims and performs one-shot publication from a complete build table
    *
-   * Does nothing after another path claims or closes the session. Publication exceptions mark the
-   * session failed and are rethrown. Exceptional stream and input-lifetime behavior follows
-   * `publish_dynamic_filters()`.
+   * Does nothing after another path claims or closes the session. Device memory exhaustion marks
+   * the session failed without rethrowing; other publication exceptions mark it failed and are
+   * rethrown. Exceptional stream and input-lifetime behavior follows `publish_dynamic_filters()`.
    *
    * @param[in] complete_build Complete build table
    * @param[in] stream Durable construction stream
@@ -350,19 +317,19 @@ class dynamic_filter_publication_session final {
   void publish_one_shot(cudf::table_view const& complete_build, rmm::cuda_stream_view stream);
 
   /**
-   * @brief Close an open session or abort an incomplete accumulator
+   * @brief Closes an open session or aborts an incomplete accumulator
    */
   void finalize_or_abort() noexcept;
 
   /**
-   * @brief Record one source-not-resident delivery without claiming the session
+   * @brief Records one source-not-resident delivery without claiming the session
    *
    * Does nothing after the session leaves OPEN or when the statistics sink is null.
    */
   void record_source_not_resident() noexcept;
 
   /**
-   * @brief Record one build-not-whole delivery without claiming the session
+   * @brief Records one build-not-whole delivery without claiming the session
    *
    * Does nothing after the session leaves OPEN or when the statistics sink is null. The caller owns
    * once-per-join latching.

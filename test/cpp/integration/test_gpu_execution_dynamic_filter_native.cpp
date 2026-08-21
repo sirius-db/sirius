@@ -138,8 +138,6 @@ TEST_CASE("gpu_execution - dynamic filters over duckdb-native tables",
   }
 }
 
-// Verify coverage gating for unique grouped build keys traced to the native part scan. Exact
-// policy counters distinguish covering, selective, and disabled-gate behavior.
 TEST_CASE("gpu_execution - dynamic-filter domain-coverage gate",
           "[integration][gpu_execution][dynamic_filter]")
 {
@@ -173,9 +171,9 @@ TEST_CASE("gpu_execution - dynamic-filter domain-coverage gate",
     compare_gpu_vs_cpu(con, covering_query);
     auto const after = sirius::test::get_dynamic_filter_stats_snapshot(con);
 
-    REQUIRE(after.keys_with_known_domain > before.keys_with_known_domain);  // the trace resolved
-    REQUIRE(after.keys_skipped_domain_gate > before.keys_skipped_domain_gate);  // the gate fired
-    REQUIRE(after.filters_pushed == before.filters_pushed);  // and nothing was published
+    REQUIRE(after.keys_with_known_domain > before.keys_with_known_domain);
+    REQUIRE(after.keys_skipped_domain_gate > before.keys_skipped_domain_gate);
+    REQUIRE(after.filters_pushed == before.filters_pushed);
     REQUIRE(after.publications_failed == before.publications_failed);
     REQUIRE(after.keys_build_exceeded_domain == before.keys_build_exceeded_domain);
   }

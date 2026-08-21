@@ -39,10 +39,11 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Data Management](data-management.md) | Data batches, repositories, ports, barrier semantics |
 | [Configuration](configuration.md) | sirius_config, operator_params, SET variables |
 | [Optimizations](optimizations.md) | Performance optimizations with PRs, code paths, configs |
+| [Compressed Pinning](compressed-pinning.md) | Simpatico-compressed pin_table on host/GPU tiers — which tier to compress on, plan selection vs the H2D link, GB300 SF1000 results |
 | [Compressed Materialization](compressed-materialization.md) | Value-preserving narrow integer and DECIMAL carriers, restoration boundaries, and pin-cache invariants |
 | [Multi-GPU Architecture](multi-gpu-architecture.md) | How Sirius executes SQL across every GPU on a node — tiers, pin tables, SCHED-RR, cross-GPU transfers, downgrade, concurrency invariants |
 | [Dynamic Filters](dynamic-filters.md) | Ordered hash-build publication, zone-map/IN-list/Bloom consumers, multi-GPU replicas, join-edge (SIP) endpoint placement, and the refinement design that remains future work |
-| [Dynamic Filters — Multi-GPU](dynamic-filters-multi-gpu.md) | Device-local replica fan-out, peer-DMA/HOST-staging routes, ownership contracts, and two-GPU validation |
+| [Dynamic Filters — Multi-GPU](dynamic-filters-multi-gpu.md) | Device-local replica fan-out, the global multi-partition Bloom accumulation contract, strict-replication policy, and single-GPU validation status |
 | [Debugging](debugging.md) | Practical guide to debugging crashes and races — building/running with ASan & TSan, the `tsan.supp` file, and capturing/inspecting core dumps with gdb |
 
 ## Suggested Reading Order
@@ -60,4 +61,4 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 11. **Configuration** — tuning knobs and runtime settings
 12. **Optimizations** — performance improvements and their mechanisms
 
-<!-- last-updated-commit: 84543810a303c81c891b2adbae222157a4e17204 -->
+<!-- last-updated-commit: f03762faf2aba9966050102d632c92cb770ff14d -->

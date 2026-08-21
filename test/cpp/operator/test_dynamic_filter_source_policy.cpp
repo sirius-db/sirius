@@ -35,10 +35,9 @@ using sirius::op::domain_coverage_gate_fires;
 using sirius::op::membership_filter_kind;
 using sirius::op::zone_map_range_gate_fires;
 
-// Cache budget used to test the exact hash-set fit boundary.
 constexpr std::size_t kL2Bytes = 1024;
 
-// Exactly representable threshold used to test the inclusive gate boundary.
+// Exactly representable, so the inclusive gate-boundary tests are deterministic.
 constexpr double kThreshold = 0.5;
 
 }  // namespace
@@ -51,6 +50,7 @@ TEST_CASE("membership policy prefers the small IN-list whenever the key type sup
   REQUIRE(choose_membership_filter({.build_rows               = 3,
                                     .l2_cache_bytes           = kL2Bytes,
                                     .estimated_hash_set_bytes = 64,
+                                    .inlist_max_l2_fraction   = 1.0,
                                     .supports_small_in_list   = true,
                                     .supports_hash_in_list    = true,
                                     .supports_bloom           = true}) ==
@@ -60,18 +60,32 @@ TEST_CASE("membership policy prefers the small IN-list whenever the key type sup
   REQUIRE(choose_membership_filter({.build_rows               = 3,
                                     .l2_cache_bytes           = kL2Bytes,
                                     .estimated_hash_set_bytes = kL2Bytes + 1,
+                                    .inlist_max_l2_fraction   = 1.0,
+                                    .supports_small_in_list   = true,
+                                    .supports_hash_in_list    = true,
+                                    .supports_bloom           = true}) ==
+          membership_filter_kind::small_in_list);
+
+  // The residency fraction governs only the hash-vs-Bloom trade: even at 0 the small IN-list
+  // still wins first.
+  REQUIRE(choose_membership_filter({.build_rows               = 3,
+                                    .l2_cache_bytes           = kL2Bytes,
+                                    .estimated_hash_set_bytes = 64,
+                                    .inlist_max_l2_fraction   = 0.0,
                                     .supports_small_in_list   = true,
                                     .supports_hash_in_list    = true,
                                     .supports_bloom           = true}) ==
           membership_filter_kind::small_in_list);
 }
 
-TEST_CASE("membership policy chooses the hash IN-list exactly while its set fits L2",
+TEST_CASE("membership policy keeps the hash IN-list exactly while its set fits L2 at fraction 1.0",
           "[dynamic_filter][source_policy]")
 {
+  // A residency fraction of 1.0 reproduces the legacy inclusive L2-fit rule.
   REQUIRE(choose_membership_filter({.build_rows               = 4096,
                                     .l2_cache_bytes           = kL2Bytes,
                                     .estimated_hash_set_bytes = kL2Bytes - 1,
+                                    .inlist_max_l2_fraction   = 1.0,
                                     .supports_small_in_list   = false,
                                     .supports_hash_in_list    = true,
                                     .supports_bloom           = true}) ==
@@ -81,15 +95,16 @@ TEST_CASE("membership policy chooses the hash IN-list exactly while its set fits
   REQUIRE(choose_membership_filter({.build_rows               = 4096,
                                     .l2_cache_bytes           = kL2Bytes,
                                     .estimated_hash_set_bytes = kL2Bytes,
+                                    .inlist_max_l2_fraction   = 1.0,
                                     .supports_small_in_list   = false,
                                     .supports_hash_in_list    = true,
                                     .supports_bloom           = true}) ==
           membership_filter_kind::hash_in_list);
 
-  // One byte over, and the exact set gives way to the probabilistic fallback.
   REQUIRE(choose_membership_filter({.build_rows               = 4096,
                                     .l2_cache_bytes           = kL2Bytes,
                                     .estimated_hash_set_bytes = kL2Bytes + 1,
+                                    .inlist_max_l2_fraction   = 1.0,
                                     .supports_small_in_list   = false,
                                     .supports_hash_in_list    = true,
                                     .supports_bloom = true}) == membership_filter_kind::bloom);
@@ -98,11 +113,11 @@ TEST_CASE("membership policy chooses the hash IN-list exactly while its set fits
 TEST_CASE("membership policy treats an unknown L2 size as no hash IN-list",
           "[dynamic_filter][source_policy]")
 {
-  // An unknown cache size is reported as 0, which a size comparison alone would read as "every set
-  // of 0 estimated bytes fits". The eligibility test must reject it outright.
+  // An unknown cache size is reported as 0 and must be rejected outright, not read as a fit.
   REQUIRE(choose_membership_filter({.build_rows               = 4096,
                                     .l2_cache_bytes           = 0,
                                     .estimated_hash_set_bytes = 0,
+                                    .inlist_max_l2_fraction   = 1.0,
                                     .supports_small_in_list   = false,
                                     .supports_hash_in_list    = true,
                                     .supports_bloom = true}) == membership_filter_kind::bloom);
@@ -110,6 +125,7 @@ TEST_CASE("membership policy treats an unknown L2 size as no hash IN-list",
   REQUIRE(choose_membership_filter({.build_rows               = 4096,
                                     .l2_cache_bytes           = 0,
                                     .estimated_hash_set_bytes = 0,
+                                    .inlist_max_l2_fraction   = 1.0,
                                     .supports_small_in_list   = false,
                                     .supports_hash_in_list    = true,
                                     .supports_bloom = false}) == membership_filter_kind::none);
@@ -121,6 +137,7 @@ TEST_CASE("membership policy chooses nothing when no representation is available
   REQUIRE(choose_membership_filter({.build_rows               = 4096,
                                     .l2_cache_bytes           = kL2Bytes,
                                     .estimated_hash_set_bytes = 64,
+                                    .inlist_max_l2_fraction   = 1.0,
                                     .supports_small_in_list   = false,
                                     .supports_hash_in_list    = false,
                                     .supports_bloom = false}) == membership_filter_kind::none);
@@ -129,6 +146,75 @@ TEST_CASE("membership policy chooses nothing when no representation is available
   REQUIRE(choose_membership_filter({.build_rows               = 4096,
                                     .l2_cache_bytes           = kL2Bytes,
                                     .estimated_hash_set_bytes = kL2Bytes + 1,
+                                    .inlist_max_l2_fraction   = 1.0,
+                                    .supports_small_in_list   = false,
+                                    .supports_hash_in_list    = true,
+                                    .supports_bloom = false}) == membership_filter_kind::none);
+}
+
+TEST_CASE("membership policy demotes the hash IN-list to the Bloom above the residency fraction",
+          "[dynamic_filter][source_policy]")
+{
+  // A vanishing fraction makes the residency threshold smaller than any real set estimate, so
+  // even a tiny L2-fitting set demotes to the Bloom.
+  REQUIRE(choose_membership_filter({.build_rows               = 4096,
+                                    .l2_cache_bytes           = kL2Bytes,
+                                    .estimated_hash_set_bytes = 64,
+                                    .inlist_max_l2_fraction   = 1e-12,
+                                    .supports_small_in_list   = false,
+                                    .supports_hash_in_list    = true,
+                                    .supports_bloom = true}) == membership_filter_kind::bloom);
+
+  // 0 x L2 = 0 and a non-empty build's estimate is positive, so no special case is needed.
+  REQUIRE(choose_membership_filter({.build_rows               = 4096,
+                                    .l2_cache_bytes           = kL2Bytes,
+                                    .estimated_hash_set_bytes = 64,
+                                    .inlist_max_l2_fraction   = 0.0,
+                                    .supports_small_in_list   = false,
+                                    .supports_hash_in_list    = true,
+                                    .supports_bloom = true}) == membership_filter_kind::bloom);
+}
+
+TEST_CASE("membership policy's residency-fraction boundary is inclusive",
+          "[dynamic_filter][source_policy]")
+{
+  // 0.5 x 1024 = 512.0 is exactly representable, so the inclusive comparison is deterministic.
+  REQUIRE(choose_membership_filter({.build_rows               = 4096,
+                                    .l2_cache_bytes           = kL2Bytes,
+                                    .estimated_hash_set_bytes = 512,
+                                    .inlist_max_l2_fraction   = 0.5,
+                                    .supports_small_in_list   = false,
+                                    .supports_hash_in_list    = true,
+                                    .supports_bloom           = true}) ==
+          membership_filter_kind::hash_in_list);
+
+  REQUIRE(choose_membership_filter({.build_rows               = 4096,
+                                    .l2_cache_bytes           = kL2Bytes,
+                                    .estimated_hash_set_bytes = 513,
+                                    .inlist_max_l2_fraction   = 0.5,
+                                    .supports_small_in_list   = false,
+                                    .supports_hash_in_list    = true,
+                                    .supports_bloom = true}) == membership_filter_kind::bloom);
+}
+
+TEST_CASE("membership policy keeps a fitting IN-list at any fraction without a Bloom fallback",
+          "[dynamic_filter][source_policy]")
+{
+  // With no Bloom to demote to, exactness is the only membership option; the fraction only
+  // arbitrates the hash-vs-Bloom trade, so the plain inclusive L2 fit decides alone.
+  REQUIRE(choose_membership_filter({.build_rows               = 4096,
+                                    .l2_cache_bytes           = kL2Bytes,
+                                    .estimated_hash_set_bytes = kL2Bytes,
+                                    .inlist_max_l2_fraction   = 0.0,
+                                    .supports_small_in_list   = false,
+                                    .supports_hash_in_list    = true,
+                                    .supports_bloom           = false}) ==
+          membership_filter_kind::hash_in_list);
+
+  REQUIRE(choose_membership_filter({.build_rows               = 4096,
+                                    .l2_cache_bytes           = kL2Bytes,
+                                    .estimated_hash_set_bytes = kL2Bytes + 1,
+                                    .inlist_max_l2_fraction   = 0.0,
                                     .supports_small_in_list   = false,
                                     .supports_hash_in_list    = true,
                                     .supports_bloom = false}) == membership_filter_kind::none);
@@ -167,7 +253,6 @@ TEST_CASE("domain-coverage gate fires only for proven-unique keys",
 TEST_CASE("domain-coverage gate treats a threshold above 1.0 as disabled outright",
           "[dynamic_filter][source_policy]")
 {
-  // A threshold above 1.0 disables the gate before considering any other input.
   REQUIRE_FALSE(domain_coverage_gate_fires(2'000'000, 1'000'000, true, 2.0));
   REQUIRE_FALSE(domain_coverage_gate_fires(2'000'000, 1'000'000, false, 2.0));
   REQUIRE_FALSE(domain_coverage_gate_fires(1'000'000, 1'000'000, true, 1.5));
@@ -178,8 +263,7 @@ TEST_CASE("domain-coverage gate treats a threshold above 1.0 as disabled outrigh
 
 TEST_CASE("zone-map range gate fires at and above its threshold", "[dynamic_filter][source_policy]")
 {
-  // The span is inclusive of both bounds: [10, 59] covers 50 of the 100 domain values, so the
-  // at-threshold case also pins that the endpoint is counted.
+  // The span is inclusive of both bounds: [10, 59] covers 50 of the 100 domain values.
   REQUIRE(zone_map_range_gate_fires(10.0, 59.0, 100, kThreshold));
   REQUIRE(zone_map_range_gate_fires(10.0, 60.0, 100, kThreshold));
   REQUIRE_FALSE(zone_map_range_gate_fires(10.0, 58.0, 100, kThreshold));

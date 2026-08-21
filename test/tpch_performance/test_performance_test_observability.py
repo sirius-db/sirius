@@ -218,7 +218,9 @@ class DynamicFilterObservabilityTest(unittest.TestCase):
 
         _, rows = performance_test.time_query(connection, 99, use_gpu=True)
 
-        self.assertEqual(connection.commands, ["SET gpu_execution = true;", "SELECT 99"])
+        self.assertEqual(
+            connection.commands, ["SET gpu_execution = true;", "SELECT 99"]
+        )
         self.assertEqual(rows, [(1,)])
 
 

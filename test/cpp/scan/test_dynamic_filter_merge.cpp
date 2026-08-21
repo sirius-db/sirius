@@ -25,6 +25,7 @@
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/filling.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
@@ -613,6 +614,61 @@ TEST_CASE("sirius_dynamic_bloom_filter supports INT32 keys with no false negativ
           std::vector<int32_t>{0, 1, 2, 3, 4});
 }
 
+TEST_CASE("sirius_dynamic_bloom_filter excludes null build slots from the key set",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream = cudf::get_default_stream();
+
+  // Build keys [0,1,2,3,4,999] with the 999 slot nulled: only {0..4} may enter the set.
+  std::vector<int64_t> const key_values{0, 1, 2, 3, 4, 999};
+  auto keys = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT64}, 6, cudf::mask_state::ALL_VALID, stream);
+  cudaMemcpyAsync(keys->mutable_view().data<int64_t>(),
+                  key_values.data(),
+                  key_values.size() * sizeof(int64_t),
+                  cudaMemcpyHostToDevice,
+                  stream.value());
+  cudf::set_null_mask(keys->mutable_view().null_mask(), 5, 6, false, stream);
+  keys->set_null_count(1);
+
+  // Reference filter over the same valid keys, built without nulls. Compaction is exact and the
+  // hash policy deterministic, so the nullable build must produce a bit-identical filter.
+  auto clean_keys = cudf::sequence(5,
+                                   cudf::numeric_scalar<int64_t>(0, true, stream),
+                                   cudf::numeric_scalar<int64_t>(1, true, stream),
+                                   stream);
+
+  sirius_dynamic_filter_set nullable_channel;
+  nullable_channel.push_filter(0,
+                               std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(
+                                 keys->view(), stream, cudf::get_current_device_resource_ref()));
+  sirius_dynamic_filter_set reference_channel;
+  reference_channel.push_filter(
+    0,
+    std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(
+      clean_keys->view(), stream, cudf::get_current_device_resource_ref()));
+
+  // Probe [0..9] plus 999 — the value present only at the null build slot.
+  auto probe = make_values_table<int64_t>(
+    {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 999}, cudf::data_type{cudf::type_id::INT64}, stream);
+  auto out_nullable =
+    sirius::op::scan::apply_dynamic_filters_to_view(probe->view(), nullable_channel, stream);
+  auto out_reference =
+    sirius::op::scan::apply_dynamic_filters_to_view(probe->view(), reference_channel, stream);
+  stream.synchronize();
+  REQUIRE(out_nullable != nullptr);
+  REQUIRE(out_reference != nullptr);
+
+  auto const survivors = to_host_int64(out_nullable->view().column(0), stream);
+  // No false negatives: the five valid keys lead the probe and must all survive, in order.
+  REQUIRE(survivors.size() >= 5);
+  REQUIRE(std::vector<int64_t>(survivors.begin(), survivors.begin() + 5) ==
+          std::vector<int64_t>{0, 1, 2, 3, 4});
+  // Identical behavior to the clean build — this is the deterministic assertion: before the fix
+  // the raw ingest added the null slot's payload, so 999 always survived the nullable filter.
+  REQUIRE(survivors == to_host_int64(out_reference->view().column(0), stream));
+}
+
 TEST_CASE("sirius_dynamic_in_list_filter keeps a build key equal to the INT64 sentinel",
           "[dynamic_filter][scan_merge]")
 {
@@ -1102,7 +1158,6 @@ TEST_CASE("per-filter gate keeps a dead verdict when the channel grows",
   stream.synchronize();
   REQUIRE(out != nullptr);
 
-  // Measured against a one-filter cascade and found skippable.
   auto const measured = gate.filter_keep_ratio(useless.get(), filters.filter_count());
   REQUIRE(measured.has_value());
   REQUIRE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*measured));
@@ -1136,13 +1191,12 @@ TEST_CASE("per-filter gate excludes a dead filter from the re-armed apply withou
   REQUIRE(useless->mask_calls() == 1);
   REQUIRE_FALSE(gate.applicable(filters));
 
-  // A selective filter lands later: growth re-arms the scan-level gate for one measurement...
+  // Growth re-arms the scan-level gate; the dead verdict is permanent, so the re-armed apply
+  // runs only the newcomer.
   auto selective = make_in_list_prefix(2, stream);
   filters.push_filter(0, selective);
   REQUIRE(gate.applicable(filters));
 
-  // ...and the re-armed apply runs only the newcomer — the dead filter's verdict is permanent,
-  // so its mask kernel never runs again.
   auto out2 = sirius::op::scan::apply_dynamic_filters_gated_view(
     table->view(), filters, gate, stream, dynamic_filter_apply_mode::include_ast_row_masks);
   stream.synchronize();
@@ -1150,7 +1204,6 @@ TEST_CASE("per-filter gate excludes a dead filter from the re-armed apply withou
   REQUIRE(out2->num_rows() == 2);
   REQUIRE(useless->mask_calls() == 1);
 
-  // The dead verdict survives at the larger channel size; the newcomer measured selective.
   auto const useless_kept = gate.filter_keep_ratio(useless.get(), filters.filter_count());
   REQUIRE(useless_kept.has_value());
   REQUIRE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*useless_kept));
@@ -1177,7 +1230,6 @@ TEST_CASE("per-filter gate stales a selective verdict when the channel grows",
   REQUIRE(out != nullptr);
   REQUIRE(out->num_rows() == 2);
 
-  // Measured against a one-filter cascade and found selective: the verdict is live at this size.
   auto const measured = gate.filter_keep_ratio(selective.get(), filters.filter_count());
   REQUIRE(measured.has_value());
   REQUIRE_FALSE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*measured));
