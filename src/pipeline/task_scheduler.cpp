@@ -394,17 +394,11 @@ void task_scheduler::management_eventloop()
           // queue's key extractor unpacks it the same way.
           auto const query_id = make_query_id(
             static_cast<std::uint32_t>(static_cast<std::uint64_t>(gpu_task->get_priority()) >> 32));
-          std::size_t operator_id = op::sirius_physical_operator::invalid_operator_id;
-          op::SiriusPhysicalOperatorType operator_type = op::SiriusPhysicalOperatorType::INVALID;
-          if (auto const* pipe = gpu_task->get_pipeline()) {
-            if (auto src = pipe->get_source()) {
-              // Reporting must not throw: a plan that never ran
-              // assign_operator_ids still has to dispatch, so an unnumbered
-              // source is published as the sentinel rather than aborting here.
-              if (src->has_operator_id()) { operator_id = src->get_operator_id(); }
-              operator_type = src->type;
-            }
-          }
+          auto const* pipe = gpu_task->get_pipeline();
+          auto const [operator_id, operator_type] =
+            pipe != nullptr ? pipe->get_source_operator()
+                            : std::pair{op::sirius_physical_operator::invalid_operator_id,
+                                        op::SiriusPhysicalOperatorType::INVALID};
           _query_stage_manager->notify_task_deployed(
             query_id, operator_id, operator_type, device_id);
         }

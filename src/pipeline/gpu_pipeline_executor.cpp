@@ -191,12 +191,10 @@ void gpu_pipeline_executor::manager_loop()
     auto reservation = _memory_space->make_reservation_or_null(bytes_needs);
     if (!reservation) {
       if (_query_stage_manager) {
-        std::size_t stalled_operator_id = op::sirius_physical_operator::invalid_operator_id;
-        if (auto const* pipe = gpu_task->get_pipeline()) {
-          if (auto src = pipe->get_source(); src && src->has_operator_id()) {
-            stalled_operator_id = src->get_operator_id();
-          }
-        }
+        auto const* pipe               = gpu_task->get_pipeline();
+        auto const stalled_operator_id = pipe != nullptr
+                                           ? pipe->get_source_operator().first
+                                           : op::sirius_physical_operator::invalid_operator_id;
         _query_stage_manager->notify_wait_for_memory_for_task(
           make_query_id(
             static_cast<std::uint32_t>(static_cast<std::uint64_t>(gpu_task->get_priority()) >> 32)),
@@ -239,12 +237,10 @@ void gpu_pipeline_executor::manager_loop()
       // Reported before the (blocking) downgrade rather than after: the value of
       // knowing is that the GPU is about to stall, and a listener told only once
       // it has finished learns nothing it can act on.
-      std::size_t stalled_operator_id = op::sirius_physical_operator::invalid_operator_id;
-      if (auto const* pipe = gpu_task->get_pipeline()) {
-        if (auto src = pipe->get_source(); src && src->has_operator_id()) {
-          stalled_operator_id = src->get_operator_id();
-        }
-      }
+      auto const* downgrade_pipe     = gpu_task->get_pipeline();
+      auto const stalled_operator_id = downgrade_pipe != nullptr
+                                         ? downgrade_pipe->get_source_operator().first
+                                         : op::sirius_physical_operator::invalid_operator_id;
       _query_stage_manager->notify_memory_downgrade_for_task(
         make_query_id(
           static_cast<std::uint32_t>(static_cast<std::uint64_t>(gpu_task->get_priority()) >> 32)),
