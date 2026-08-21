@@ -219,6 +219,69 @@ TEST_CASE("cuvs_index_cache keeps same-named tables in different schemas distinc
   REQUIRE(e1 != e2);  // each schema routes to its own index
 }
 
+TEST_CASE("cuvs_index_cache reserve_index_memory is non-blocking", "[vss]")
+{
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  cuvs_index_cache cache(*manager);
+
+  SECTION("a request that fits returns a reservation")
+  {
+    auto r = cache.reserve_index_memory(/*bytes=*/1024, /*preferred_gpu=*/0);
+    REQUIRE(r != nullptr);
+  }
+  SECTION("a request larger than the GPU can hold returns null instead of blocking")
+  {
+    // The test GPU space is 512 MiB; ask for far more. A blocking reserve would
+    // hang here, so returning null is what lets CREATE INDEX fail cleanly (the
+    // "not enough free GPU memory" error in SiriusCreateAnnIndexFunction).
+    auto r = cache.reserve_index_memory(/*bytes=*/8ull << 30, /*preferred_gpu=*/0);
+    REQUIRE(r == nullptr);
+  }
+  SECTION("a negative device id returns null")
+  {
+    auto r = cache.reserve_index_memory(/*bytes=*/1024, /*preferred_gpu=*/-1);
+    REQUIRE(r == nullptr);
+  }
+}
+
+TEST_CASE("cuvs_index_cache erase_by_column drops the matching index before a rebuild", "[vss]")
+{
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  cuvs_index_cache cache(*manager);
+
+  SECTION("removes the identity match regardless of its management name, leaving others")
+  {
+    insert_dummy(cache, "custom_name", make_meta("docs", "vec", Metric::L2SqrtExpanded));
+    insert_dummy(cache, "other", make_meta("docs", "title_vec", Metric::L2SqrtExpanded));
+
+    REQUIRE(cache.erase_by_column("mem", "main", "docs", "vec", Metric::L2SqrtExpanded) == 1);
+    REQUIRE(cache.find("custom_name") == nullptr);
+    REQUIRE(cache.find("other") != nullptr);  // different column untouched
+  }
+  SECTION("matches up to metric canonicalization (unexpanded query drops an expanded index)")
+  {
+    insert_dummy(cache, "idx", make_meta("docs", "vec", Metric::L2SqrtExpanded));
+    REQUIRE(cache.erase_by_column("mem", "main", "docs", "vec", Metric::L2SqrtUnexpanded) == 1);
+    REQUIRE(cache.size() == 0);
+  }
+  SECTION("scoped to the schema (rebuilding s1's index leaves s2's alone)")
+  {
+    insert_dummy(cache, "s1_idx", make_meta("docs", "vec", Metric::L2SqrtExpanded, "mem", "s1"));
+    insert_dummy(cache, "s2_idx", make_meta("docs", "vec", Metric::L2SqrtExpanded, "mem", "s2"));
+
+    REQUIRE(cache.erase_by_column("mem", "s1", "docs", "vec", Metric::L2SqrtExpanded) == 1);
+    REQUIRE(cache.find("s1_idx") == nullptr);
+    REQUIRE(cache.find("s2_idx") != nullptr);
+  }
+  SECTION("no match removes nothing")
+  {
+    insert_dummy(cache, "idx", make_meta("docs", "vec", Metric::L2SqrtExpanded));
+    REQUIRE(cache.erase_by_column("mem", "main", "docs", "vec", Metric::CosineExpanded) == 0);
+    REQUIRE(cache.erase_by_column("mem", "main", "docs", "other", Metric::L2SqrtExpanded) == 0);
+    REQUIRE(cache.size() == 1);
+  }
+}
+
 TEST_CASE("cuvs_index_cache lookup handle outlives an erase", "[vss]")
 {
   auto manager = sirius::test::operator_utils::initialize_memory_manager();

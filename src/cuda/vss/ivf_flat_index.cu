@@ -79,8 +79,14 @@ std::unique_ptr<any_cuvs_index> build_ivf_flat_index_from_chunks(
   cuvs::neighbors::ivf_flat::index_params index_params;
   index_params.n_lists = n_lists;
   index_params.metric  = metric;
-  // Train the kmeans centroids only; the dataset is added chunk by chunk.
+  // Train the kmeans centroids only; the dataset is added batch by batch.
   index_params.add_data_on_build = false;
+  // Size each list to what it holds instead of the default padded growth.
+  // We extend batch by batch, so the default policy over-allocates every list and
+  // re-grows it on each batch, inflating the build-time peak well past the final
+  // index size. Exact sizing keeps the peak close to the real footprint so the
+  // build fits inside the reservation alongside the still-pinned source table.
+  index_params.conservative_memory_allocation = true;
 
   // Allocate the index (and its build-time scratch) through the reservation's
   // resource so the whole thing lives in Sirius-reserved GPU memory. The handle

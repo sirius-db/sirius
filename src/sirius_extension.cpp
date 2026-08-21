@@ -1858,7 +1858,17 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   std::size_t const footprint = vec_bytes * 2 + centroid_bytes * 2 + (std::size_t{1} << 20);
 
   auto& index_cache = sirius_ctx->get_cuvs_index_cache();
-  auto reservation  = index_cache.reserve_index_memory(footprint, target_gpu);
+
+  // Drop any existing index before reserving the new one
+  index_cache.erase_by_column(entry_catalog, entry_schema, entry.name, data.column_name, metric);
+  auto reservation = index_cache.reserve_index_memory(footprint, target_gpu);
+  if (!reservation) {
+    auto const avail = target_space->get_available_memory();
+    throw InvalidInputException(
+      "sirius_create_ann_index: not enough free GPU memory to build the index for '" + entry.name +
+      "." + data.column_name + "': need ~" + std::to_string(footprint >> 20) + " MiB, only ~" +
+      std::to_string(avail >> 20) + " MiB free on GPU " + std::to_string(target_gpu));
+  }
 
   // Build IVF-Flat through the reservation's resource, then pin it
   auto handle = sirius::vss::build_ivf_flat_index_from_chunks(

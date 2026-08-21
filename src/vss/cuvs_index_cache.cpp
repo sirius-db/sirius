@@ -60,12 +60,11 @@ std::unique_ptr<cucascade::memory::reservation> cuvs_index_cache::reserve_index_
 {
   using namespace cucascade::memory;
   if (preferred_gpu >= 0) {
-    any_memory_space_in_tier_with_preference strategy(Tier::GPU,
-                                                      static_cast<std::size_t>(preferred_gpu));
-    return _reservation_manager.request_reservation(strategy, bytes);
+    if (auto* space = _reservation_manager.get_memory_space(Tier::GPU, preferred_gpu)) {
+      return space->make_reservation_or_null(bytes);
+    }
   }
-  any_memory_space_in_tier strategy(Tier::GPU);
-  return _reservation_manager.request_reservation(strategy, bytes);
+  return nullptr;
 }
 
 void cuvs_index_cache::insert(std::string name,
@@ -119,6 +118,28 @@ bool cuvs_index_cache::erase(std::string_view name)
 {
   std::lock_guard<std::mutex> lock(_mutex);
   return _entries.erase(std::string(name)) > 0;
+}
+
+std::size_t cuvs_index_cache::erase_by_column(std::string_view catalog,
+                                              std::string_view schema,
+                                              std::string_view table,
+                                              std::string_view column,
+                                              cuvs::distance::DistanceType metric)
+{
+  std::lock_guard<std::mutex> lock(_mutex);
+  auto const wanted   = canonical_metric(metric);
+  std::size_t removed = 0;
+  for (auto it = _entries.begin(); it != _entries.end();) {
+    auto const& meta = it->second->meta;
+    if (meta.catalog_name == catalog && meta.schema_name == schema && meta.table_name == table &&
+        meta.column_name == column && canonical_metric(meta.metric) == wanted) {
+      it = _entries.erase(it);
+      ++removed;
+        } else {
+          ++it;
+        }
+  }
+  return removed;
 }
 
 void cuvs_index_cache::clear()

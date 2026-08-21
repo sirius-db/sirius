@@ -156,13 +156,15 @@ class cuvs_index_cache {
   /// @c reservation->get_memory_resource() set as the current device resource,
   /// then move the same reservation into @ref insert to pin it.
   ///
-  /// Delegates to @c memory_reservation_manager::request_reservation, which
-  /// blocks until the GPU tier can satisfy the request (it does not return null);
-  /// the returned reservation is therefore always valid.
+  /// Non-blocking, and pinned to @p preferred_gpu: the index must be reserved on
+  /// the same GPU that holds the table's pinned data. Returns null instead of
+  /// waiting, so the caller can fail cleanly rather than blocking indefinitely
+  /// when the device cannot fit the index.
   ///
   /// \param bytes         Estimated GPU footprint of the index to build
-  /// \param preferred_gpu Device id to prefer (>= 0), or -1 for any GPU in the tier
-  /// \returns The non-null GPU reservation
+  /// \param preferred_gpu Device id that holds the table's data (>= 0); null is
+  ///                      returned for a negative id or an unknown device
+  /// \returns The GPU reservation on @p preferred_gpu, or null if it cannot satisfy @p bytes
   [[nodiscard]] std::unique_ptr<cucascade::memory::reservation> reserve_index_memory(
     std::size_t bytes, int preferred_gpu = -1);
 
@@ -194,6 +196,15 @@ class cuvs_index_cache {
     std::string_view table,
     std::string_view column,
     cuvs::distance::DistanceType metric) const;
+
+  /// Remove every entry whose auto-routing identity matches
+  /// (@p catalog, @p schema, @p table, @p column, @p metric). Metrics are compared
+  /// up to canonicalization. Returns the number of entries removed.
+  std::size_t erase_by_column(std::string_view catalog,
+                              std::string_view schema,
+                              std::string_view table,
+                              std::string_view column,
+                              cuvs::distance::DistanceType metric);
 
   [[nodiscard]] bool contains(std::string_view name) const;
 
