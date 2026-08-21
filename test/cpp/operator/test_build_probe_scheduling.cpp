@@ -631,8 +631,7 @@ nomination_fixture make_join(duckdb::JoinType join_type)
     duckdb::vector<duckdb::idx_t>{},
     duckdb::vector<duckdb::idx_t>{},
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),
-    1000,
-    nullptr);
+    1000);
   return f;
 }
 
