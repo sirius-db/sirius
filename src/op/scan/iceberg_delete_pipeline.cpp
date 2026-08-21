@@ -18,6 +18,9 @@
 
 #include <op/scan/iceberg_delete_filter.hpp>
 
+#include <stdexcept>
+#include <string>
+
 namespace sirius::op::scan {
 
 void iceberg_delete_pipeline::add_filter(std::shared_ptr<iceberg_delete_filter> filter)
@@ -39,12 +42,18 @@ std::unique_ptr<cudf::table> iceberg_delete_pipeline::apply(std::unique_ptr<cudf
     auto const total = tbl->num_columns();
     auto const keep =
       static_cast<cudf::size_type>(total) - static_cast<cudf::size_type>(_extra_column_count);
-    if (keep > 0 && keep < total) {
-      // Move columns out and truncate — no GPU memory copy.
-      auto cols = tbl->release();
-      cols.resize(static_cast<size_t>(keep));
-      tbl = std::make_unique<cudf::table>(std::move(cols));
+    // Nothing but appended keys means this pipeline's count and the scan's projection disagree.
+    // Skipping the strip would return the key columns as query output.
+    if (keep <= 0) {
+      throw std::invalid_argument(
+        "[iceberg_delete_pipeline] batch has " + std::to_string(total) +
+        " column(s) but the pipeline expects " + std::to_string(_extra_column_count) +
+        " of them to be appended equality keys; the projection and the pipeline disagree");
     }
+    // Move columns out and truncate — no GPU memory copy.
+    auto cols = tbl->release();
+    cols.resize(static_cast<size_t>(keep));
+    tbl = std::make_unique<cudf::table>(std::move(cols));
   }
 
   return tbl;

@@ -167,6 +167,26 @@ TEST_CASE("strip_file_scheme removes a file:// scheme", "[uri_parser]")
         "/var/tmp/t/data/00000-0-abc.parquet");
 }
 
+TEST_CASE("strip_file_scheme handles every legal file URI form", "[uri_parser]")
+{
+  // https://iceberg.apache.org/spec/#paths-in-metadata points at the file URI scheme, which has
+  // three spellings. An unstripped one fails during EXECUTION, taking the runtime fallback that
+  // poisons the connection rather than declining at plan time.
+  CHECK(strip_file_scheme("file:/abs/path.parquet") == "/abs/path.parquet");
+  CHECK(strip_file_scheme("file:///abs/path.parquet") == "/abs/path.parquet");
+  CHECK(strip_file_scheme("file://localhost/abs/path.parquet") == "/abs/path.parquet");
+}
+
+TEST_CASE("strip_file_scheme percent-decodes a file URI", "[uri_parser]")
+{
+  // Only what was stripped is a URI. A bare path or object-store key keeps a literal `%`, which
+  // the case below asserts.
+  CHECK(strip_file_scheme("file:///abs/a%20b/data.parquet") == "/abs/a b/data.parquet");
+  CHECK(strip_file_scheme("file:///abs/100%25.parquet") == "/abs/100%.parquet");
+  // A malformed escape is not a reason to fail an open: keep the stripped bytes as they are.
+  CHECK(strip_file_scheme("file:///abs/a%2.parquet") == "/abs/a%2.parquet");
+}
+
 TEST_CASE("strip_file_scheme is case-insensitive", "[uri_parser]")
 {
   // The ad-hoc stripper this replaced in the iceberg delete-key matcher was case-SENSITIVE.
@@ -196,8 +216,11 @@ TEST_CASE("strip_file_scheme does not throw on input parse() rejects", "[uri_par
   CHECK_NOTHROW(strip_file_scheme(""));
   CHECK_NOTHROW(strip_file_scheme("file://"));
   CHECK_NOTHROW(strip_file_scheme("://"));
-  CHECK_NOTHROW(strip_file_scheme("file://relative/path"));
-  // Too short to carry the scheme: returned unchanged rather than truncated.
-  CHECK(strip_file_scheme("file:/") == "file:/");
+  // The non-standard "double-slash path" form: duckdb::Path rejects it, but this repo's fixtures
+  // use it for repo-RELATIVE paths, so it keeps the plain strip.
+  CHECK(strip_file_scheme("file://relative/path") == "relative/path");
+  // `file:/` is the host-omitted spelling of the root path. `file://` alone has no path and no
+  // localhost authority, so the original bytes come back.
+  CHECK(strip_file_scheme("file:/") == "/");
   CHECK(strip_file_scheme("file://") == "file://");
 }

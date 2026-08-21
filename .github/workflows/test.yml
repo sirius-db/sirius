@@ -172,6 +172,28 @@ jobs:
           nvidia-smi
           timeout 45m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort 2>&1 | tee /tmp/unittest.log
 
+      - name: Iceberg conformance (correctness + connection liveness)
+        # The C++ suite asserts routes and rows, but every case shares one in-process
+        # connection, so it cannot observe the failure mode this guards: a RUNTIME GPU fallback
+        # poisons the connection and the NEXT GPU query on it deadlocks forever. This harness
+        # runs each case in its own duckdb process and issues a second query on the same
+        # connection, which is the only automated check that a decline happened at plan time
+        # rather than at execution. It also compares rows against pyiceberg's own recorded
+        # output -- an external oracle, where the in-tree fixtures only agree with themselves.
+        run: |
+          set -o pipefail
+          timeout 20m python3 test/cpp/integration/data/iceberg_conformance/run_conformance.py \
+            test/cpp/integration/data/iceberg_conformance \
+            --duckdb ./build/release/duckdb 2>&1 | tee /tmp/conformance.log
+
+      - name: Surface conformance failures
+        if: failure()
+        run: |
+          echo '## Iceberg conformance failures' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -60 /tmp/conformance.log >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
       - name: Surface test failures
         if: failure()
         run: |

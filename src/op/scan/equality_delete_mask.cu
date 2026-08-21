@@ -43,10 +43,11 @@ struct anti_join_to_bool {
 std::unique_ptr<cudf::column> make_anti_join_mask(
   rmm::device_uvector<cudf::size_type> const& build_indices,
   cudf::size_type n_rows,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
 {
   auto bool_col = cudf::make_fixed_width_column(
-    cudf::data_type{cudf::type_id::BOOL8}, n_rows, cudf::mask_state::UNALLOCATED, stream);
+    cudf::data_type{cudf::type_id::BOOL8}, n_rows, cudf::mask_state::UNALLOCATED, stream, mr);
 
   thrust::transform(rmm::exec_policy_nosync(stream),
                     build_indices.begin(),

@@ -21,6 +21,7 @@
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_uvector.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <memory>
 
@@ -40,11 +41,14 @@ namespace sirius::op::scan {
  *                       cudf::distinct_hash_join::left_join().
  * @param n_rows         Number of rows to process (may be <= build_indices.size()).
  * @param stream         CUDA stream for the GPU operation.
+ * @param mr             Must be the scan's, not the default: memory-space accounting cannot see
+ *                       what it did not hand out, and this is part of the batch's footprint.
  * @return A BOOL8 column of length n_rows suitable for cudf::apply_boolean_mask.
  */
 std::unique_ptr<cudf::column> make_anti_join_mask(
   rmm::device_uvector<cudf::size_type> const& build_indices,
   cudf::size_type n_rows,
-  rmm::cuda_stream_view stream);
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
 
 }  // namespace sirius::op::scan

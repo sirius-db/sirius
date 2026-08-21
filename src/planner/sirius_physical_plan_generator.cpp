@@ -194,76 +194,6 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_t
   return info;
 }
 
-//! Resolve which snapshot an unpinned `iceberg_scan` actually bound to, or nullopt when that
-//! cannot be proven.
-//!
-//! Sirius plans every query twice, and an unpinned scan resolves "current" separately in each
-//! pass. Asking the table for "current" a third time here would only add another resolution to
-//! disagree with the first two, so this does not trust the answer: it lists the data files of the
-//! snapshot it resolved and requires them to be exactly the set this pass's bind produced. If a
-//! commit landed in between, the two lists differ and the caller declines.
-//!
-//! Returning the id rather than a bool is the point. Passing it to read_iceberg_delete_data() puts
-//! it in that function's cache key, so a delete set read for one snapshot can never be handed to a
-//! scan reading another -- which is the way the two could previously be mixed.
-std::optional<uint64_t> resolve_bound_snapshot(sirius::op::sirius_physical_table_scan& scan_op,
-                                               std::string const& table_path,
-                                               duckdb::ClientContext& context)
-{
-  auto const bound_files = resolve_parquet_scan_file_paths(
-    scan_op.function.name, scan_op.bind_data.get(), scan_op.parameters);
-  if (bound_files.empty()) { return std::nullopt; }
-
-  std::set<std::string> bound;
-  for (auto const& f : bound_files) {
-    bound.insert(sirius::io::strip_file_scheme(f));
-  }
-
-  std::string escaped;
-  for (char c : table_path) {
-    if (c == '\'') { escaped += '\''; }
-    escaped += c;
-  }
-
-  duckdb::Connection conn(*context.db);
-  duckdb::SiriusContext::InternalQueryGuard conn_guard(*conn.context);
-  // A fresh connection inherits no session settings, and a table with no version hint is
-  // unreadable without this. Same reason discover_from_manifests sets it on its own connection.
-  conn.Query("SET unsafe_enable_version_guessing = true");
-
-  auto snap = conn.Query("SELECT snapshot_id FROM iceberg_snapshots('" + escaped +
-                         "') ORDER BY sequence_number DESC LIMIT 1");
-  if (!snap || snap->HasError() || snap->RowCount() != 1) { return std::nullopt; }
-  auto const snapshot_id = snap->GetValue(0, 0).GetValue<uint64_t>();
-
-  // content 'EXISTING' is DuckDB's name for a DATA file, NOT the status of the same spelling.
-  auto files = conn.Query("SELECT file_path FROM iceberg_metadata('" + escaped +
-                          "', snapshot_from_id = " + std::to_string(snapshot_id) +
-                          ") WHERE content = 'EXISTING' AND status <> 'DELETED'");
-  if (!files || files->HasError()) { return std::nullopt; }
-
-  std::set<std::string> listed;
-  while (true) {
-    auto chunk = files->Fetch();
-    if (!chunk || chunk->size() == 0) { break; }
-    for (duckdb::idx_t i = 0; i < chunk->size(); ++i) {
-      listed.insert(sirius::io::strip_file_scheme(chunk->GetValue(0, i).ToString()));
-    }
-  }
-
-  if (listed != bound) {
-    SIRIUS_LOG_DEBUG(
-      "[sirius_physical_plan_generator] iceberg snapshot {} lists {} data file(s) but the scan "
-      "bound {} for '{}'; the table moved while this query was planned",
-      snapshot_id,
-      listed.size(),
-      bound.size(),
-      table_path);
-    return std::nullopt;
-  }
-  return snapshot_id;
-}
-
 //! Build an `iceberg_ingestible_table_info`: the parquet bind data plus the table's delete
 //! data, resolved here at plan time.
 //!
@@ -284,30 +214,18 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
   }
   info->table_path = scan_op.parameters.front().GetValue<std::string>();
 
-  // Resolve deletes against the same snapshot the scan reads, not merely the latest.
-  std::optional<uint64_t> snapshot_id;
+  // Second line of the gate in sirius_plan_get.cpp, which already declines an unpinned scan: a
+  // caller reaching here without an id must fail loudly rather than read "current" a third time.
+  // Deriving one here is not a fallback -- see that gate for why every derivation is unsound.
   auto const sid_it = scan_op.named_parameters.find("snapshot_from_id");
-  if (sid_it != scan_op.named_parameters.end() && !sid_it->second.IsNull()) {
-    snapshot_id = static_cast<uint64_t>(sid_it->second.GetValue<int64_t>());
-  } else {
-    // Unpinned. Requiring the user to name a snapshot would be the simpler fix, but the only
-    // parameter that pins one is `snapshot_from_id`, which is Iceberg's time-travel selector: it
-    // also reads with that snapshot's schema instead of the table's current one. Forcing it would
-    // silently answer a different question for any table whose schema changed after its last data
-    // commit, and would freeze the query on one snapshot for good.
-    //
-    // So the snapshot is resolved and then PROVEN against the files this pass bound, which closes
-    // the same gap without changing what the query means.
-    snapshot_id = resolve_bound_snapshot(scan_op, info->table_path, context);
-    if (!snapshot_id.has_value()) {
-      // Throwing hands the query to DuckDB. Proceeding unpinned would leave the delete read keyed
-      // on the word "current", which is what let one snapshot's deletes reach another's files.
-      throw duckdb::NotImplementedException(
-        "iceberg_scan could not be tied to a single snapshot: the data files it bound are not the "
-        "ones the table's current snapshot lists, so its deletes cannot be resolved without "
-        "risking a mix of two snapshots");
-    }
+  if (sid_it == scan_op.named_parameters.end() || sid_it->second.IsNull()) {
+    throw duckdb::NotImplementedException(
+      "iceberg_scan reached GPU physical planning without 'snapshot_from_id': the snapshot its "
+      "delete files must be read from is unknown, and reading them from whatever is current now "
+      "risks pairing one snapshot's data files with another's deletes");
   }
+  std::optional<uint64_t> const snapshot_id =
+    static_cast<uint64_t>(sid_it->second.GetValue<int64_t>());
 
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) {

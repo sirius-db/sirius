@@ -54,8 +54,8 @@ std::unique_ptr<cudf::table> equality_delete_filter::apply(std::unique_ptr<cudf:
   // rows from a data file that may post-date the delete.
   auto applies_to = [&](std::string const& path) {
     if (group.sequence_number <= 0) { return true; }
-    auto seq_it = _delete_data->data_file_sequence_numbers.find(path);
-    if (seq_it == _delete_data->data_file_sequence_numbers.end()) {
+    auto seq_it = _delete_data->data_file_manifest_sequence_numbers.find(path);
+    if (seq_it == _delete_data->data_file_manifest_sequence_numbers.end()) {
       throw std::invalid_argument(
         "[equality_delete_filter] no sequence number recorded for data file '" + path +
         "'; equality deletes apply only to data files strictly older than the delete, so this "
@@ -97,9 +97,11 @@ std::unique_ptr<cudf::table> equality_delete_filter::apply(std::unique_ptr<cudf:
 
   auto data_key_view = tbl->select(_data_key_indices);
 
-  auto build_indices = group.hash_join->left_join(data_key_view, stream);
+  // Both allocations are part of this batch's footprint, so both come from the scan's resource --
+  // the default one is invisible to the accounting that drives downgrade decisions.
+  auto build_indices = group.hash_join->left_join(data_key_view, stream, mr);
 
-  auto bool_col = make_anti_join_mask(*build_indices, n_rows, stream);
+  auto bool_col = make_anti_join_mask(*build_indices, n_rows, stream, mr);
 
   return cudf::apply_boolean_mask(tbl->view(), bool_col->view(), stream, mr);
 }

@@ -30,6 +30,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -196,13 +197,19 @@ void iceberg_gpu_ingestible::build_delete_key_map(
   // positional entries, so positional_deletes alone would leave this empty.
   std::vector<std::string const*> manifest_keys;
   manifest_keys.reserve(_delete_data->positional_deletes.size() +
-                        _delete_data->data_file_sequence_numbers.size());
+                        _delete_data->data_file_manifest_sequence_numbers.size());
   for (auto const& [delete_key, positions] : _delete_data->positional_deletes) {
     if (!positions.empty()) { manifest_keys.push_back(&delete_key); }
   }
-  for (auto const& entry : _delete_data->data_file_sequence_numbers) {
+  for (auto const& entry : _delete_data->data_file_manifest_sequence_numbers) {
     manifest_keys.push_back(&entry.first);
   }
+
+  // Collects EVERY matching key, including one that already spells the file exactly as the scan
+  // does. Skipping that one early would leave a second, differently-spelled entry looking like the
+  // only claimant (a bare v2 path vs a `file://` v3 one), so the guard below would not fire and
+  // the other entry's deleted rows would come back.
+  std::unordered_map<std::string, std::vector<std::string const*>> keys_by_scan_path;
 
   for (auto const* delete_key_ptr : manifest_keys) {
     auto const& delete_key = *delete_key_ptr;
@@ -232,19 +239,22 @@ void iceberg_gpu_ingestible::build_delete_key_map(
         delete_key);
       continue;
     }
-    if (*match == delete_key) { continue; }
-    // Both key sources come from iceberg_metadata() and agree; were that untrue, emplace would
-    // keep whichever arrived first and the other's lookups would miss.
-    auto const [it, inserted] = _delete_key_by_scan_path.emplace(*match, delete_key);
-    if (!inserted && it->second != delete_key) {
+    keys_by_scan_path[*match].push_back(&delete_key);
+  }
+
+  for (auto const& [scan_path, keys] : keys_by_scan_path) {
+    if (keys.size() > 1) {
       throw duckdb::NotImplementedException(
-        "iceberg table '{}': scanned data file '{}' is named by two different manifest entries "
-        "('{}' and '{}'), so its deletes cannot be attributed to one of them",
+        "iceberg table '{}': scanned data file '{}' is named by {} different manifest entries "
+        "(including '{}' and '{}'), so its deletes cannot be attributed to one of them",
         _table_path,
-        *match,
-        it->second,
-        delete_key);
+        scan_path,
+        keys.size(),
+        *keys[0],
+        *keys[1]);
     }
+    if (*keys[0] == scan_path) { continue; }
+    _delete_key_by_scan_path.emplace(scan_path, *keys[0]);
   }
 }
 

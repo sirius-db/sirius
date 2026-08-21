@@ -76,7 +76,7 @@ struct IcebergManifestDiscovery {
   std::vector<IcebergDeleteFileEntry> equality_delete_entries;
   std::vector<IcebergDeleteFileEntry> deletion_vector_entries;
   /// From the data manifests; equality deletes need them to test applicability.
-  std::unordered_map<std::string, int64_t> data_file_sequence_numbers;
+  std::unordered_map<std::string, int64_t> data_file_manifest_sequence_numbers;
 };
 
 std::string escape_sql_string(std::string const& s)
@@ -241,7 +241,7 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
         entry.sequence_number = seq;
         result.equality_delete_entries.push_back(std::move(entry));
       } else if (content == kContentDataFile) {
-        result.data_file_sequence_numbers[filepath] = seq;
+        result.data_file_manifest_sequence_numbers[filepath] = seq;
       } else {
         // Refuse rather than skip. "EXISTING" is DuckDB's name for the spec's DATA, so if a
         // future iceberg extension corrects it, this branch is the difference between the scan
@@ -264,7 +264,7 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
     result.positional_delete_files.size(),
     result.equality_delete_entries.size(),
     result.deletion_vector_entries.size(),
-    result.data_file_sequence_numbers.size());
+    result.data_file_manifest_sequence_numbers.size());
 
   return result;
 }
@@ -425,47 +425,6 @@ void materialize_positional_deletes(duckdb::DatabaseInstance& db,
   }
 }
 
-EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
-                                         std::vector<std::optional<int32_t>> key_field_ids,
-                                         std::vector<cudf::table_view> const& views)
-{
-  auto stream = cudf::get_default_stream();
-
-  auto all_rows = (views.size() == 1) ? std::make_unique<cudf::table>(views[0], stream)
-                                      : cudf::concatenate(views, stream);
-
-  std::vector<cudf::size_type> all_key_indices(static_cast<size_t>(all_rows->num_columns()));
-  std::iota(all_key_indices.begin(), all_key_indices.end(), cudf::size_type{0});
-
-  auto deduped = cudf::distinct(all_rows->view(),
-                                all_key_indices,
-                                cudf::duplicate_keep_option::KEEP_FIRST,
-                                cudf::null_equality::EQUAL,
-                                cudf::nan_equality::ALL_EQUAL,
-                                stream);
-
-  // Avoid fmt::join — it requires <fmt/ranges.h> which the vcpkg fmt build
-  // does not pull in transitively. Format the comma-joined list manually.
-  std::string key_names_joined;
-  for (size_t i = 0; i < key_names.size(); ++i) {
-    if (i > 0) key_names_joined += ", ";
-    key_names_joined += key_names[i];
-  }
-  SIRIUS_LOG_INFO(
-    "[iceberg] Equality-delete group [{}]: {} row(s).", key_names_joined, deduped->num_rows());
-
-  auto hash_join = std::make_unique<cudf::distinct_hash_join>(
-    deduped->view(), cudf::null_equality::EQUAL, 0.5, stream);
-  stream.synchronize();
-
-  EqualityDeleteGroup group;
-  group.delete_table  = std::move(deduped);
-  group.key_names     = std::move(key_names);
-  group.key_field_ids = std::move(key_field_ids);
-  group.hash_join     = std::move(hash_join);
-  return group;
-}
-
 /// Groups equality deletes by (schema, sequence number) so the scan-time applicability check is
 /// one CPU comparison per group.
 void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_entries,
@@ -526,6 +485,47 @@ void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_
 
 }  // anonymous namespace
 
+EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
+                                         std::vector<std::optional<int32_t>> key_field_ids,
+                                         std::vector<cudf::table_view> const& views)
+{
+  auto stream = cudf::get_default_stream();
+
+  auto all_rows = (views.size() == 1) ? std::make_unique<cudf::table>(views[0], stream)
+                                      : cudf::concatenate(views, stream);
+
+  std::vector<cudf::size_type> all_key_indices(static_cast<size_t>(all_rows->num_columns()));
+  std::iota(all_key_indices.begin(), all_key_indices.end(), cudf::size_type{0});
+
+  auto deduped = cudf::distinct(all_rows->view(),
+                                all_key_indices,
+                                cudf::duplicate_keep_option::KEEP_FIRST,
+                                cudf::null_equality::EQUAL,
+                                cudf::nan_equality::ALL_EQUAL,
+                                stream);
+
+  // Avoid fmt::join — it requires <fmt/ranges.h> which the vcpkg fmt build
+  // does not pull in transitively. Format the comma-joined list manually.
+  std::string key_names_joined;
+  for (size_t i = 0; i < key_names.size(); ++i) {
+    if (i > 0) key_names_joined += ", ";
+    key_names_joined += key_names[i];
+  }
+  SIRIUS_LOG_INFO(
+    "[iceberg] Equality-delete group [{}]: {} row(s).", key_names_joined, deduped->num_rows());
+
+  auto hash_join = std::make_unique<cudf::distinct_hash_join>(
+    deduped->view(), cudf::null_equality::EQUAL, 0.5, stream);
+  stream.synchronize();
+
+  EqualityDeleteGroup group;
+  group.delete_table  = std::move(deduped);
+  group.key_names     = std::move(key_names);
+  group.key_field_ids = std::move(key_field_ids);
+  group.hash_join     = std::move(hash_join);
+  return group;
+}
+
 namespace {
 
 /// Per-query memo; the wrapper below explains the key and the scope.
@@ -549,6 +549,10 @@ void clear_iceberg_delete_data_cache()
 }
 
 namespace {
+
+/// The single switch that turns the equality-delete route on. Two defects keep it false; both are
+/// named at the refusal site below.
+constexpr bool kEqualityDeleteRouteImplementedToSpec = false;
 
 std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data_uncached(
   duckdb::ClientContext& context,
@@ -586,7 +590,27 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data_uncached(
     materialize_positional_deletes(*context.db, discovery, data->positional_deletes);
   }
   if (has_eq_deletes) {
-    data->data_file_sequence_numbers = std::move(discovery.data_file_sequence_numbers);
+    // The plan gate declines these tables, so reaching here means it has a hole. Two pieces of
+    // this machinery do not implement the spec yet and both fail SILENTLY:
+    //
+    //  1. applies_to compares the MANIFEST's sequence number, not the entry's inherited data
+    //     sequence number, so after a manifest rewrite it skips deletes that apply and applies
+    //     deletes to data that post-dates them.
+    //  2. Keys are every column of the delete file, not the entry's `equality_ids`. A Flink
+    //     upsert writer persists the whole row with `equality_ids=[pk]`, so matching on all
+    //     columns deletes nothing whose non-key columns have since changed.
+    //
+    // Fix both and add tests that reach the route before flipping the flag.
+    if (!kEqualityDeleteRouteImplementedToSpec) {
+      throw std::runtime_error(
+        "[iceberg] '" + table_path + "' has " +
+        std::to_string(discovery.equality_delete_entries.size()) +
+        " live equality-delete entr(ies); the GPU path does not implement equality deletes to "
+        "spec (manifest-level sequence numbers, and keys taken from every column rather than the "
+        "entry's equality_ids), so this table must be read by DuckDB");
+    }
+    data->data_file_manifest_sequence_numbers =
+      std::move(discovery.data_file_manifest_sequence_numbers);
     materialize_equality_deletes(discovery.equality_delete_entries, *metadata_ioctx, *data);
   }
 
@@ -648,11 +672,23 @@ std::unordered_map<std::string, int32_t> extract_field_id_map(
   // The schema vector is a flattened depth-first representation.
   // Leaf columns have num_children == 0.  The root element (index 0)
   // is the message/file-level container and is always skipped.
+  //
+  // Leaf names are not unique -- `a.id` and `b.id` both spell `id` here -- so last-writer-wins
+  // would hand one field's id to the other. An ambiguous name is dropped; the caller already
+  // reads a missing entry as "no field id for this column".
+  std::unordered_set<std::string> ambiguous;
   for (size_t i = 1; i < file_meta.schema.size(); ++i) {
     auto const& elem = file_meta.schema[i];
-    if (elem.num_children == 0 && elem.field_id.has_value()) {
-      result[elem.name] = elem.field_id.value();
-    }
+    if (elem.num_children != 0 || !elem.field_id.has_value()) { continue; }
+    auto const [it, inserted] = result.emplace(elem.name, elem.field_id.value());
+    if (!inserted && it->second != elem.field_id.value()) { ambiguous.insert(elem.name); }
+  }
+  for (auto const& name : ambiguous) {
+    SIRIUS_LOG_DEBUG(
+      "[iceberg] leaf column name '{}' occurs at more than one field id in this parquet schema; "
+      "dropping it rather than guessing which field the delete file means",
+      name);
+    result.erase(name);
   }
 
   return result;

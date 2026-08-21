@@ -46,7 +46,12 @@ struct EqualityDeleteGroup {
   std::vector<std::optional<int32_t>> key_field_ids;
   /// Build side = delete_table.
   std::unique_ptr<cudf::distinct_hash_join> hash_join;
-  /// Applies only to data files with a STRICTLY lower sequence number.
+  /// Applies only to data files with a STRICTLY lower DATA sequence number.
+  ///
+  /// ⚠️ Holds the MANIFEST's number, which is not that. Per the inheritance rule an entry takes
+  /// its manifest's number only when its own is null AND its status is ADDED, so after a manifest
+  /// rewrite these are inflated and the strict-inequality test flips both ways. This is one of the
+  /// reasons read_iceberg_delete_data() refuses live equality entries.
   int64_t sequence_number{0};
 };
 
@@ -64,14 +69,26 @@ struct IcebergDeleteData {
   /// One per unique (key-column schema, sequence number).
   std::vector<EqualityDeleteGroup> equality_delete_groups;
 
-  /// data_file_path -> manifest sequence number, keyed as the MANIFEST wrote the path.
-  std::unordered_map<std::string, int64_t> data_file_sequence_numbers;
+  /// Keyed as the manifest wrote the path. NOT the file's data sequence number -- see above.
+  std::unordered_map<std::string, int64_t> data_file_manifest_sequence_numbers;
 
   [[nodiscard]] bool empty() const
   {
     return positional_deletes.empty() && equality_delete_groups.empty();
   }
 };
+
+/**
+ * @brief Concatenate the delete files' rows, deduplicate them, and stand up the GPU hash join the
+ *        scan probes. All @p views must share @p key_names.
+ *
+ * Exported only so this and the anti-join mask can be tested directly: the SQL route that reaches
+ * them is declined at plan time, so no fixture can, and an inverted mask would stay green until
+ * the route is switched on.
+ */
+EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
+                                         std::vector<std::optional<int32_t>> key_field_ids,
+                                         std::vector<cudf::table_view> const& views);
 
 /**
  * @brief Read and fully materialize every kind of delete for one table.

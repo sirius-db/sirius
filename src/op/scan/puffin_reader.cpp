@@ -115,9 +115,25 @@ constexpr uint32_t SERIAL_COOKIE                 = 12347;
 /// from the file, and forming a pointer past the end is UB even if only compared.
 size_t remaining(const uint8_t* p, const uint8_t* p_end) { return static_cast<size_t>(p_end - p); }
 
-size_t deserialize_roaring32(const uint8_t* data, size_t data_len, std::vector<uint32_t>& out)
+/// Decoded output is unbounded relative to input size: a 4-byte run entry expands to 65,536
+/// positions and there can be 65,536 containers, so a sub-megabyte blob can demand billions of
+/// them. @p max_out is enforced INSIDE the expansion loops -- checking afterwards is checking
+/// after the allocation that already killed the process. It cannot be derived from @p data_len,
+/// because a legitimate run container really is that dense.
+size_t deserialize_roaring32(const uint8_t* data,
+                             size_t data_len,
+                             std::vector<uint32_t>& out,
+                             size_t max_out)
 {
   if (data_len < 4) { throw std::runtime_error("roaring: buffer too small for cookie"); }
+
+  auto const admit = [&out, max_out](size_t n) {
+    if (n > max_out || out.size() > max_out - n) {
+      throw std::runtime_error(
+        "roaring: decoded positions exceed the " + std::to_string(max_out) +
+        " this deletion vector declares; the blob is corrupt or was crafted to expand");
+    }
+  };
 
   const uint8_t* p     = data;
   const uint8_t* p_end = data + data_len;
@@ -209,6 +225,7 @@ size_t deserialize_roaring32(const uint8_t* data, size_t data_len, std::vector<u
       if (remaining(p, p_end) < nbytes) {
         throw std::runtime_error("roaring: truncated array container");
       }
+      admit(containers[i].cardinality);
       for (uint32_t j = 0; j < containers[i].cardinality; ++j) {
         out.push_back(high | read_u16_le(p));
         p += 2;
@@ -220,6 +237,7 @@ size_t deserialize_roaring32(const uint8_t* data, size_t data_len, std::vector<u
       }
       for (int w = 0; w < 1024; ++w) {
         uint64_t word = read_u64_le(p + w * 8);
+        admit(static_cast<size_t>(__builtin_popcountll(word)));
         while (word != 0) {
           int bit = __builtin_ctzll(word);
           out.push_back(high | static_cast<uint32_t>(w * 64 + bit));
@@ -242,6 +260,7 @@ size_t deserialize_roaring32(const uint8_t* data, size_t data_len, std::vector<u
         uint16_t start  = read_u16_le(p);
         uint16_t length = read_u16_le(p + 2);
         p += 4;
+        admit(static_cast<size_t>(length) + 1);
         for (uint32_t v = start; v <= static_cast<uint32_t>(start) + length; ++v) {
           out.push_back(high | v);
         }
@@ -422,6 +441,7 @@ std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref)
   auto const& puffin_path          = ref.puffin_path;
   auto const content_offset        = ref.content_offset;
   auto const content_size_in_bytes = ref.content_size_in_bytes;
+  auto const record_count          = ref.record_count;
 
   if (content_offset < 0 || content_size_in_bytes <= 0) {
     throw std::runtime_error(
@@ -490,7 +510,14 @@ std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref)
   p += 4;  // skip magic
 
   // combined_length covers magic + roaring_vector; the CRC follows it.
+  //
+  // Not redundant with the `roaring_len < 8` check below: that one runs on `checksummed_len - 4`,
+  // which WRAPS for lengths 0..3 and sails past it.
   size_t checksummed_len = combined_length;
+  if (checksummed_len < 12) {
+    throw std::runtime_error("[puffin] combined_length=" + std::to_string(combined_length) +
+                             " is too short to hold a deletion vector's magic and bitmap count");
+  }
   if (4 + checksummed_len + 4 > blob_size) {
     throw std::runtime_error(
       "[puffin] Blob size mismatch: combined_length=" + std::to_string(combined_length) +
@@ -522,6 +549,12 @@ std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref)
                              ") in " + puffin_path);
   }
 
+  // The decoded count is already required to equal record_count, so anything beyond it is corrupt
+  // by definition. Absent that, an absolute cap on what may be materialized while planning.
+  static constexpr size_t kMaxPositionsWithoutRecordCount = 32u * 1024u * 1024u;
+  size_t const max_positions =
+    record_count >= 0 ? static_cast<size_t>(record_count) : kMaxPositionsWithoutRecordCount;
+
   std::vector<int64_t> positions;
 
   for (int64_t bm = 0; bm < num_bitmaps; ++bm) {
@@ -533,7 +566,9 @@ std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref)
     int64_t high = static_cast<int64_t>(static_cast<uint32_t>(key)) << 32;
 
     std::vector<uint32_t> low_positions;
-    size_t consumed = deserialize_roaring32(p, roaring_len, low_positions);
+    // Shared across bitmaps, so a blob cannot beat the ceiling by splitting across keys.
+    size_t const budget = max_positions - positions.size();
+    size_t consumed     = deserialize_roaring32(p, roaring_len, low_positions, budget);
     p += consumed;
     roaring_len -= consumed;
 

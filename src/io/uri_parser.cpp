@@ -16,6 +16,8 @@
 
 #include "io/uri_parser.hpp"
 
+#include <duckdb/common/path.hpp>
+
 #include <cctype>
 #include <stdexcept>
 #include <string>
@@ -235,8 +237,11 @@ std::string strip_file_scheme(std::string_view path)
   // Deliberately NOT implemented via parse(): this runs on every datasource open,
   // must not throw on inputs parse() rejects (relative paths, empty keys), and
   // must return the ORIGINAL bytes for everything it does not strip — no
-  // percent-decoding, no normalization of any other scheme.
-  constexpr std::string_view kFileSchemePrefix = "file://";
+  // normalization of any other scheme.
+  //
+  // Do NOT reduce the `file:` handling to a `file://` prefix test: that strips one of the three
+  // forms the URI scheme admits and leaves `file:/abs` unopenable by any local datasource.
+  constexpr std::string_view kFileSchemePrefix = "file:";
   if (path.size() <= kFileSchemePrefix.size()) { return std::string{path}; }
   for (std::size_t i = 0; i < kFileSchemePrefix.size(); ++i) {
     if (std::tolower(static_cast<unsigned char>(path[i])) !=
@@ -244,7 +249,38 @@ std::string strip_file_scheme(std::string_view path)
       return std::string{path};
     }
   }
-  return std::string{path.substr(kFileSchemePrefix.size())};
+
+  // duckdb::Path dispatches on a case-SENSITIVE "file:/", but the scheme is case-insensitive per
+  // RFC 3986 and manifests spell it FILE:// and File://. A missed match pairs a delete file with
+  // no data file, which silently returns deleted rows. Scheme bytes only.
+  std::string normalized{kFileSchemePrefix};
+  normalized.append(path.substr(kFileSchemePrefix.size()));
+
+  // The non-standard "double-slash path" form, which duckdb::Path rejects. This repo's fixtures
+  // use it for repo-RELATIVE paths, which committed metadata cannot spell as absolute URIs, so it
+  // keeps the plain strip.
+  constexpr std::string_view kDoubleSlash = "file://";
+  auto const bare_prefix_strip            = [&]() -> std::string {
+    return path.size() > kDoubleSlash.size() ? std::string{path.substr(kDoubleSlash.size())}
+                                                        : std::string{path};
+  };
+
+  std::string local;
+  try {
+    auto const parsed = duckdb::Path::FromString(normalized);
+    if (!parsed.IsLocal()) { return bare_prefix_strip(); }
+    local = parsed.GetAnchor() + parsed.GetPath() + parsed.GetTrailingSeparator();
+  } catch (...) {
+    // Must not throw: this is on every datasource open.
+    return bare_prefix_strip();
+  }
+
+  // Only what was stripped is a URI, so only there is `%20` a space.
+  try {
+    return percent_decode(local, path);
+  } catch (...) {
+    return local;
+  }
 }
 
 }  // namespace sirius::io
