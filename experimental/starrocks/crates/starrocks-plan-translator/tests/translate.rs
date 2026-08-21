@@ -1126,9 +1126,9 @@ fn project_common_slots_are_materialized_before_visible_expressions() {
     let desc = desc_table(
         vec![(0, Some(100)), (1, None)],
         vec![
-            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
-            slot(2, 0, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
-            slot(3, 1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(3, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
         ],
     );
 
