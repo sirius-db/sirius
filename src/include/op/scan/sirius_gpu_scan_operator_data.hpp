@@ -31,6 +31,7 @@
 // standard library
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <variant>
 
 namespace sirius::scan_manager {
@@ -57,10 +58,20 @@ namespace sirius::op::scan {
  */
 class scan_operator_input : public op::operator_data {
  public:
+  /// Hint the IO layer about every range this split will read, then publish it
+  /// to @p readahead -- in that order, which is why both belong here.
+  /// Registration makes the split eligible for prefetching and takes the
+  /// readahead's mutex, which the worker also takes to collect, so it is the
+  /// release/acquire pair that publishes the hints written before it.  Hinting
+  /// from the caller instead would let the worker collect a split whose
+  /// datasources have no prefetch handle yet, and would leave the handle write
+  /// racing the worker's read of it.  @p preferred_device is passed in for the
+  /// same reason: an fadvise names the GPU its bytes are headed for.
   explicit scan_operator_input(
     std::shared_ptr<scan_info> metadata,
     std::shared_ptr<scan_manager::readahead_scan_manager> readahead = nullptr,
-    std::size_t operator_id                                         = 0);
+    std::size_t operator_id                                         = 0,
+    std::optional<int> preferred_device                             = std::nullopt);
 
   explicit scan_operator_input(
     std::shared_ptr<cucascade::data_batch> cached_batch,

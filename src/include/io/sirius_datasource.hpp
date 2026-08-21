@@ -64,6 +64,18 @@ enum class prefetch_refusal : std::uint8_t {
   other,
 };
 
+/// How preparing one datasource's prefetch request turned out.  Kept apart from
+/// a plain bool because "there was nothing to prepare" and "the pool had nothing
+/// to give" are opposite answers to "should the readahead be worried".
+enum class prepare_result : std::uint8_t {
+  /// The request owns staging buffers and its chunks can now be claimed.
+  prepared,
+  /// The pool could not satisfy the request, which was abandoned.
+  allocation_failed,
+  /// No request on this datasource: no prefetching cache, or no fadvise.
+  nothing_to_prepare,
+};
+
 class sirius_datasource : public cudf::io::datasource {
  public:
   explicit sirius_datasource(std::shared_ptr<ioctx> io_ctx, std::shared_ptr<io_object> io_obj);
@@ -157,6 +169,11 @@ class sirius_datasource : public cudf::io::datasource {
 
   /// Drive the stashed handle's consumer stage to @p site.
   void update(cache::scan_stage site);
+
+  /// Allocate staging buffers for the stashed request, ahead of prefetching it.
+  /// @p wait_for_eviction lets the call wait on the evictor rather than fail on
+  /// a momentarily empty pool.  See @c prefetching_cache::prepare.
+  prepare_result prepare_prefetch(bool wait_for_eviction);
 
   /// Issue prefetch IO for the stashed handle.  @p on_done fires exactly once
   /// with the outcome — inline when no IO is issued, otherwise from the IO

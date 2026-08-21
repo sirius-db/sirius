@@ -27,13 +27,34 @@ namespace sirius::op::scan {
 scan_operator_input::scan_operator_input(
   std::shared_ptr<scan_info> metadata,
   std::shared_ptr<scan_manager::readahead_scan_manager> readahead,
-  std::size_t operator_id)
+  std::size_t operator_id,
+  std::optional<int> preferred_device)
   : materialization_info(std::move(metadata)),
     _readahead(std::move(readahead)),
     _operator_id(operator_id)
 {
   auto const& stored = std::get<std::shared_ptr<scan_info>>(materialization_info);
-  if (_readahead && stored) { _readahead->register_scan_task(stored, _operator_id); }
+  if (!stored) { return; }
+
+  if (preferred_device.has_value() && *preferred_device >= 0) {
+    set_preferred_device_id(*preferred_device);
+  }
+
+  // Hint BEFORE publishing.  Registration below is what makes this split
+  // eligible for prefetching, and the readahead worker can act on it the moment
+  // it returns -- so a split published before its datasources carry prefetch
+  // handles is one the worker collects, finds nothing to issue for, and retires
+  // from the prefetch order for good.
+  for (auto const& hint : stored->fadvise_hints()) {
+    if (hint.datasource && !hint.ranges.empty()) {
+      hint.datasource->fadvise(hint.ranges, preferred_device);
+    }
+  }
+
+  // The publication barrier.  register_scan_task takes the readahead's mutex,
+  // which the worker also takes to collect, so the hints above are ordered
+  // before any read of them on the worker's side.  Keep this last.
+  if (_readahead) { _readahead->register_scan_task(stored, _operator_id); }
 }
 
 scan_operator_input::~scan_operator_input()

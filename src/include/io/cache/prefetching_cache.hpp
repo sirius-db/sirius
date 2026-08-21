@@ -152,10 +152,10 @@ class prefetching_handle {
   /// the request was abandoned.  No-op and returns false on an empty handle.
   [[nodiscard]] bool wait_until_ready() noexcept;
 
-  /// Block until the prepare_loop has allocated staging buffers for every
-  /// chunk in this request (producer state >= prepared).  Returns true iff
-  /// preparation succeeded; false means the request was abandoned (e.g. the
-  /// pool ran out of memory).  No-op and returns false on an empty handle.
+  /// Block until staging buffers have been allocated for every chunk in this
+  /// request (producer state >= prepared).  Returns true iff preparation
+  /// succeeded; false means the request was abandoned (e.g. the pool ran out of
+  /// memory).  No-op and returns false on an empty handle.
   [[nodiscard]] bool wait_until_prepared() noexcept;
 
   /// The chunks of the underlying request.  Null when the handle is empty.
@@ -252,9 +252,31 @@ class prefetching_cache {
   }
 
  private:
-  [[nodiscard]] prefetching_handle insert(const io_object& obj,
-                                          std::span<const byte_range> ranges,
-                                          std::optional<int> gpu_id = {});
+  [[nodiscard]] prefetching_handle initiate_prefetching_request(const io_object& obj,
+                                                                std::span<const byte_range> ranges,
+                                                                std::optional<int> gpu_id = {});
+
+  /// Attach staging buffers to @p handle's request, so a following @ref prefetch
+  /// has chunks it can claim: a chunk without a buffer cannot be taken for
+  /// loading, and a prefetch over one issues no IO and settles `ready` having
+  /// done nothing.
+  ///
+  /// @p wait_for_eviction lets the call wait for the evictor to hand chunks back
+  /// rather than fail on a momentarily empty pool.  Callers that can afford to
+  /// stall -- the readahead, whose whole job is to be ahead -- should; callers
+  /// on a read path should not.
+  ///
+  /// Private, and reached only through @c sirius_datasource (which the readahead
+  /// drives via @c scan_info::prepare_for_prefetching): preparing is part of the
+  /// fadvise-owned request lifecycle, not something an arbitrary caller starts.
+  ///
+  /// @return false when the request could not be prepared -- the pool could not
+  ///         satisfy it, the consumer has already moved past it, or somebody
+  ///         else has already taken it past @c queued.  Only the first two leave
+  ///         it @c abandoned.
+  bool prepare(prefetching_handle& handle, bool wait_for_eviction);
+
+  [[nodiscard]] bool prepare_request(prefetch_request& req, bool wait_for_eviction = false);
 
   [[nodiscard]] bool host_read_from_cache_only(
     const io_object& obj, size_t offset, size_t size, uint8_t* dst, prefetching_handle* out_handle);
@@ -351,7 +373,6 @@ class prefetching_cache {
   /// in a transient stage with waiters asleep on it.
   static void drain_and_abandon(request_queue_type& queue) noexcept;
 
-  void prepare_loop(const std::stop_token& st);
   void evict_loop(const std::stop_token& st);
 
   file_entry& get_or_create_file_entry(const io_object& obj);
@@ -393,10 +414,6 @@ class prefetching_cache {
   counters _counters;
   counters_snapshot _last_reported;
 
-  std::jthread _preparation_thread;
-  request_queue_type _preparation_queue;
-  std::stop_source _preparation_stop_source;
-
   /// One slot per issued prefetch IO, parked in that IO's completion so it
   /// drops when the completion runs.  This is NOT a rate limit -- @c acquire
   /// never blocks, and how much read-ahead is in flight is the readahead
@@ -421,11 +438,11 @@ class prefetching_cache {
     2, "io_cb"};  // single-threaded pool for IO completion callbacks
   exec::scoped_dispatcher _io_cb_dispatcher{_io_cb_thread_pool, 2};
 
-  /// Retires each device read's chunk-state transitions when its stream's
+  /// Retires each device read's chunk-state transitions once its stream's
   /// completion frontier passes the copies, instead of parking a thread on a
-  /// per-read CUDA event.  Drained opportunistically by whoever is about to
-  /// need a staging buffer (prepare_loop, evict_loop) or a cache hit (the read
-  /// paths); nothing polls it in steady state.
+  /// per-read CUDA event.  Drained opportunistically by whoever is about to need
+  /// a staging buffer (@ref evict_loop, as each request arrives) or a cache hit
+  /// (the read paths); nothing polls it in steady state.
   ///
   /// Declared last so it is destroyed first — its lanes hand staging buffers
   /// back to @ref _pool, which must still be alive.  @c ~prefetching_cache

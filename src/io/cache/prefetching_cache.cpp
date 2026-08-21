@@ -205,11 +205,9 @@ prefetching_cache::prefetching_cache(
     _topology_index(std::move(topology_index)),
     _armed(_io_ctx->can_use_prefetching_cache())
 {
-  _preparation_thread = std::jthread([this](const std::stop_token& st) { prepare_loop(st); },
-                                     _preparation_stop_source.get_token());
-  _evictor_thread     = std::jthread([this](const std::stop_token& st) { evict_loop(st); },
+  _evictor_thread = std::jthread([this](const std::stop_token& st) { evict_loop(st); },
                                  _evictor_stop_source.get_token());
-  _chunk_size         = _pool->chunk_size();
+  _chunk_size     = _pool->chunk_size();
 
   // chunk_state records a chunk's populated extent as a 14-bit page count, so a
   // chunk wider than that many pages could not express a partial fill.
@@ -236,13 +234,11 @@ void prefetching_cache::drain_inflight_io() noexcept
 prefetching_cache::~prefetching_cache()
 {
   _shutting_down.store(true, std::memory_order_release);
-  _preparation_stop_source.request_stop();
   _evictor_stop_source.request_stop();
 
   // The IO completions write into file entries this object owns, so they have
   // to have run before any of it is torn down.
   drain_inflight_io();
-  _preparation_thread.join();
   _evictor_thread.join();
 
   // After the workers are joined, so nothing can submit while we resync, and
@@ -284,9 +280,8 @@ prefetching_cache::file_entry& prefetching_cache::get_or_create_file_entry(const
   return *it->second;
 }
 
-prefetching_handle prefetching_cache::insert(const io_object& obj,
-                                             std::span<const byte_range> ranges,
-                                             std::optional<int> gpu_id)
+prefetching_handle prefetching_cache::initiate_prefetching_request(
+  const io_object& obj, std::span<const byte_range> ranges, std::optional<int> gpu_id)
 {
   if (!_armed) { return prefetching_handle(); }
 
@@ -369,9 +364,54 @@ prefetching_handle prefetching_cache::insert(const io_object& obj,
   if (gpu_id && _topology_index) { req.preferred_numa = _topology_index->numa_node_of(*gpu_id); }
 
   std::ignore = req.producer->mark_queued();
-  _preparation_queue.enqueue(req);
+  _eviction_queue.enqueue(req);
 
   return prefetching_handle(std::move(req));
+}
+
+bool prefetching_cache::prepare_request(prefetch_request& req, bool wait_for_eviction)
+{
+  // Never allocate for a request the consumer has already moved past.  A request
+  // is handed to the evictor when it is created, and once its consumer disposes
+  // the evictor releases its subscriber references and retires it from the
+  // batch -- so buffers attached after that point are named by nothing, and
+  // nothing will ever reclaim them.  Abandon instead: terminal and notified, so
+  // no waiter is stranded on the transient `preparing` stage.
+  if (!req.chunks || req.has_fallen_behind()) {
+    req.producer->mark_abandoned();
+    return false;
+  }
+
+  if (!req.producer->mark_preparing()) { return false; }
+
+  auto const& chunks = *req.chunks;
+
+  std::size_t n_chunks_needed = std::ranges::count_if(
+    chunks, [](cached_chunk* c) { return c->state.get_state() == chunk_state::empty; });
+
+  int numa_allocated = req.preferred_numa;
+  auto buffers       = _pool->allocate_bulk(n_chunks_needed, numa_allocated);
+  if (buffers.size() != n_chunks_needed) {
+    if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
+    req.producer->mark_abandoned();
+    return false;
+  }
+
+  for (auto* c : chunks) {
+    if (buffers.empty()) { break; }
+    if (c->state.mark_queued()) {
+      auto* buffer = buffers.back();
+      buffers.pop_back();
+      c->data      = reinterpret_cast<uint8_t*>(buffer);
+      c->numa_node = numa_allocated;
+      if (!c->state.mark_allocated()) { buffers.push_back(buffer); }
+    }
+  }
+
+  if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
+
+  std::ignore = req.producer->mark_prepared();
+  return true;
 }
 
 bool prefetching_cache::host_read_from_cache_only(
@@ -827,9 +867,9 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_ranges_async(
     }
   } catch (...) {
     if (!plan.pinned.empty()) {
-      SIRIUS_TRY_AND_LOG_EXCEPTION(
-        stream.synchronize(),
-        "prefetching_cache: failed to synchronize CUDA stream while unwinding cached range copies");
+      SIRIUS_TRY_AND_LOG_EXCEPTION(stream.synchronize(),
+                                   "prefetching_cache: failed to synchronize CUDA stream while "
+                                   "unwinding cached range copies");
       std::ranges::for_each(plan.pinned, [](cached_chunk* c) { c->state.release_read(); });
     }
     std::ranges::for_each(plan.loading,
@@ -1020,94 +1060,10 @@ void prefetching_cache::drain_and_abandon(request_queue_type& queue) noexcept
   }
 }
 
-void prefetching_cache::prepare_loop(const std::stop_token& st)
+bool prefetching_cache::prepare(prefetching_handle& handle, bool wait_for_eviction)
 {
-  std::stop_callback cb(st, [this]() {
-    SIRIUS_LOG_TRACE("prefetching_cache: prepare_loop received stop request, unblocking queue");
-    // unblock the worker if it's waiting on an empty queueue
-    _preparation_queue.enqueue(prefetch_request{});
-  });
-
-  while (!_shutting_down && !st.stop_requested()) {
-    prefetch_request req;
-    _preparation_queue.wait_dequeue(req);
-    if (!req) { continue; }  // spurious wakeup or shutdown
-
-    if (req.has_fallen_behind() || !req.chunks) {
-      req.producer->mark_abandoned();
-      // Still route it to the evictor: insert() already counted this request as
-      // a subscriber of every chunk it named, and only the evictor hands that
-      // reference back.  Dropping the request here would pin those chunks for
-      // the lifetime of the process.
-      _eviction_queue.enqueue(std::move(req));
-      continue;
-    }
-
-    std::ignore = req.producer->mark_preparing();
-
-    // Nothing polls the retirer, so this is where completed reads give their
-    // pins back before we ask the pool for buffers.  Without it a chunk stays
-    // pinned — and its buffer unreclaimable — until some other path happens to
-    // drain, and the pool exhausts under steady load.
-    std::ignore = _retirer.drain_all();
-
-    auto const& chunks = *req.chunks;
-
-    // how many buffers we need to allocate from the pool to prepare this request?
-    std::size_t n_chunks_needed = std::ranges::count_if(
-      chunks, [](cached_chunk* c) { return c->state.get_state() == chunk_state::empty; });
-
-    // Allocate from the arena on the request's preferred NUMA node, falling
-    // back to any other arena (allocate_bulk wraps around).  numa_allocated is
-    // updated to the arena we actually drew from — the whole batch comes from a
-    // single arena, so all chunks share that NUMA node.
-    int numa_allocated = req.preferred_numa;
-    auto buffers       = _pool->allocate_bulk(n_chunks_needed, numa_allocated);
-    if (buffers.size() != n_chunks_needed) {
-      // No single arena could satisfy the request.  Return whatever we got, ask
-      // the evictor to free some, and retire this request on `abandoned` so no
-      // waiter is left parked on the transient `preparing` stage.
-      if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
-      req.producer->mark_abandoned();
-      _eviction_queue.enqueue(prefetch_request{});  // sentinel: free some buffers
-      _eviction_queue.enqueue(std::move(req));      // and take back our subscriptions
-      continue;
-    }
-
-    for (auto* c : chunks) {
-      if (buffers.empty()) { break; }
-      if (c->state.mark_queued()) {
-        auto* buffer = buffers.back();
-        buffers.pop_back();
-        c->data      = reinterpret_cast<uint8_t*>(buffer);
-        c->numa_node = numa_allocated;
-        if (!c->state.mark_allocated()) {
-          buffers.push_back(buffer);  // return the buffer to the pool
-          SIRIUS_LOG_ERROR(
-            "prefetching_cache: chunk at offset {} was marked queued but failed to mark "
-            "allocated",
-            c->offset);
-        }
-      }
-    }
-
-    if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
-
-    if (!all_chunks_have_buffers(chunks)) {
-      // Buffers were already attached above, so the request still has to reach
-      // the evictor or those chunks are never reclaimed.
-      _eviction_queue.enqueue(req);
-      req.producer->mark_abandoned();
-      continue;
-    }
-    std::ignore = req.producer->mark_prepared();
-
-    // Register with the evictor eagerly; the evictor skips the request until
-    // its consumer is disposed.
-    _eviction_queue.enqueue(req);
-  }
-
-  drain_and_abandon(_preparation_queue);
+  if (!handle) { return false; }
+  return prepare_request(handle._req, wait_for_eviction);
 }
 
 bool prefetching_cache::prefetch(prefetching_handle& handle,
@@ -1147,9 +1103,9 @@ bool prefetching_cache::prefetch(prefetching_handle& handle,
   }
   if (segments.empty()) {
     // Nothing was claimable.  Either the request genuinely had no IO left to do
-    // (already cached / host-backed), or we beat prepare_loop to it and no chunk
-    // had a buffer yet — in which case this `ready` is a lie the reader will pay
-    // for, so the two are counted apart.
+    // (already cached / host-backed), or it was issued before anything prepared
+    // it and no chunk had a buffer yet — in which case this `ready` is a lie the
+    // reader will pay for, so the two are counted apart.
     auto& census = prefetch_census::instance();
     (was_prepared ? census.skipped_no_ranges : census.prefetch_unprepared)
       .fetch_add(1, std::memory_order_relaxed);
@@ -1211,13 +1167,20 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
     prefetch_request req;
     _eviction_queue.wait_dequeue(req);
 
-    // A null request is the "free some memory now" sentinel prepare_loop sends
-    // when the pool cannot satisfy an allocation.  It has to survive into the
+    // A null request is the "free some memory now" sentinel a caller sends when
+    // the pool cannot satisfy an allocation.  It has to survive into the
     // eviction decision below rather than be skipped past, or the back-pressure
     // signal does nothing and the pool never recovers.
     bool eviction_requested = false;
     auto absorb             = [&](prefetch_request&& r) {
       if (r) {
+        // A newly-arrived request is one its issuer is about to ask the pool
+        // for buffers for, so this is the moment to hand back the pins of reads
+        // that have already completed -- otherwise their buffers stay
+        // unreclaimable and the allocation fails against a pool that is only
+        // nominally full.  Cheap when nothing is ready: one relaxed load per
+        // lane.
+        std::ignore = _retirer.drain_all();
         eviction_batch.push_back({std::move(r), false});
       } else {
         eviction_requested = true;

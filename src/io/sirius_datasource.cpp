@@ -223,10 +223,10 @@ void sirius_datasource::fadvise(std::span<const cudf::io::text::byte_range_info>
     return;
   }
 
-  // Hand the ranges to the cache.  insert() returns an empty handle when
-  // it didn't enqueue any new work (dormant cache, every range coalesced
-  // with an existing entry); we only stash a real handle.
-  auto handle = cache->insert(*_io_object, ranges, dev_id);
+  // Hand the ranges to the cache.  It returns an empty handle when it didn't
+  // enqueue any new work (dormant cache, every range coalesced with an existing
+  // entry); we only stash a real handle.
+  auto handle = cache->initiate_prefetching_request(*_io_object, ranges, dev_id);
   if (handle) { _prefetch_handle = std::move(handle); }
 }
 
@@ -248,37 +248,41 @@ void sirius_datasource::await_inflight_prefetch() noexcept
   std::ignore = _prefetch_handle.wait_until_ready();
 }
 
+prepare_result sirius_datasource::prepare_prefetch(bool wait_for_eviction)
+{
+  if (!_prefetch_handle || !uses_prefetching_cache()) { return prepare_result::nothing_to_prepare; }
+  auto* cache = _io_ctx->cache();
+  if (cache == nullptr) { return prepare_result::nothing_to_prepare; }
+  return cache->prepare(_prefetch_handle, wait_for_eviction) ? prepare_result::prepared
+                                                             : prepare_result::allocation_failed;
+}
+
 prefetch_refusal sirius_datasource::prefetch_async(exec::invocable<void(bool) noexcept> on_done)
 {
   if (!_prefetch_handle || !uses_prefetching_cache()) {
     on_done(false);
     return prefetch_refusal::no_cache;
   }
-  // The executor already started reading this split, so its own reads are
-  // pulling the bytes through.  Prefetching now would issue the same IO a
-  // second time and race the reader for the same chunks.
+
   if (_prefetch_handle.has_started_reading()) {
     prefetch_census::instance().declined_reading.fetch_add(1, std::memory_order_relaxed);
     on_done(false);
     return prefetch_refusal::consumer_ahead;
   }
-  // The cache's prepare_loop attaches this request's staging buffers on its own
-  // thread, and a chunk can only be claimed for loading once it has one.  Issue
-  // before that lands and every chunk is still empty/queued: nothing is
-  // claimable, no IO goes out, and the request marks itself `ready` anyway -- a
-  // prefetch that silently did nothing, which the reader then pays for.  Wait
-  // for the buffers instead; false means the request was abandoned (e.g. the
-  // pool could not satisfy it), in which case there is nothing to issue.
-  if (!_prefetch_handle.wait_until_prepared()) {
+
+  auto const producer = _prefetch_handle.producer_state();
+  if (producer == cache::producer_stage::abandoned) {
     on_done(false);
     return prefetch_refusal::memory_pressure;
+  }
+  if (producer < cache::producer_stage::prepared) {
+    on_done(false);
+    return prefetch_refusal::other;
   }
   if (_io_ctx->cache()->prefetch(_prefetch_handle, std::move(on_done))) {
     return prefetch_refusal::issued;
   }
-  // The cache turned it down on a gate of its own. Its dominant case is the one
-  // above seen a moment later -- the reader got there while we were waiting on
-  // the buffers -- so re-ask the handle rather than lump every refusal together.
+
   return _prefetch_handle.has_started_reading() ? prefetch_refusal::consumer_ahead
                                                 : prefetch_refusal::other;
 }

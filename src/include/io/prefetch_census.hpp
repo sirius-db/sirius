@@ -40,7 +40,7 @@ struct prefetch_census {
   std::atomic<std::uint64_t> prefetch_issued{0};    ///< splits the worker issued IO for
   std::atomic<std::uint64_t> skipped_no_ranges{0};  ///< nothing to read (host-backed / cached)
   std::atomic<std::uint64_t> declined_reading{0};   ///< refused: the reader had already started
-  /// Issued before prepare_loop attached buffers: every chunk was still
+  /// Issued before anything attached buffers: every chunk was still
   /// empty/queued, so the claim loop found nothing to read and the request was
   /// retired `ready` having done NO IO.  A reader then sees a "ready" prefetch
   /// that never fetched anything, and pays for the whole split itself.
@@ -135,6 +135,11 @@ struct prefetch_census {
   std::atomic<std::uint64_t> stop_order_exhausted{0};   ///< scheduler had nothing left
   std::atomic<std::uint64_t> stop_operator_unknown{0};  ///< head operator has emitted no splits
   std::atomic<std::uint64_t> stop_no_split_ready{0};    ///< head operator's splits all taken
+  /// Opportunistic only: budget was free and splits were waiting, but the
+  /// strategy had no credits left -- the executor had not invited another
+  /// prefetch.  The one stop reason that means "throttled on purpose" rather
+  /// than "nothing to do", so it reads as healthy until you separate it out.
+  std::atomic<std::uint64_t> stop_no_credits{0};
 
   // ---- predicted vs actual order ------------------------------------------
   // Operator ids in the order the scheduler handed them out, against the order
@@ -221,6 +226,7 @@ struct prefetch_census {
            "\n    order exhausted         : " + std::to_string(stop_order_exhausted.load()) +
            "\n    head operator unknown   : " + std::to_string(stop_operator_unknown.load()) +
            "\n    head operator no split  : " + std::to_string(stop_no_split_ready.load()) +
+           "\n    out of credits          : " + std::to_string(stop_no_credits.load()) +
            "\n  -- operator order --" +
            "\n  scheduler order : " + join(prefetch_order) +
            "\n  issued order    : " + join(issue_order) +
@@ -317,6 +323,7 @@ struct prefetch_census {
     stop_order_exhausted  = 0;
     stop_operator_unknown = 0;
     stop_no_split_ready   = 0;
+    stop_no_credits       = 0;
 
     std::lock_guard g(order_mtx);
     prefetch_order.clear();

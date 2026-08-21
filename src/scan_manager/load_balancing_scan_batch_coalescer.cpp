@@ -112,22 +112,13 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
     state.connector->close(ex);
   };
 
-  // Balance one coalesced batch onto a GPU and hand it to the connector.
+  // Balance one coalesced batch onto a GPU and hand it to the connector.  The
+  // device is chosen before the split exists because the constructor fadvises
+  // and publishes in one step, leaving no window afterwards to stamp one in.
   auto emit = [&state](std::unique_ptr<op::scan::scan_info> batch) {
-    auto op_data = std::make_unique<op::scan::scan_operator_input>(
-      std::move(batch), state.readahead, state.op_id);
-    auto dev_id = state.balancer->get_next_gpu(state.pipeline_id, op_data.get());
-    if (dev_id.has_value() && *dev_id >= 0) { op_data->set_preferred_device_id(dev_id.value()); }
-
-    auto fadvise_hints = op_data->get_fadvise_hints();
-    if (!fadvise_hints.empty()) {
-      for (auto& hint : fadvise_hints) {
-        if (hint.datasource && !hint.ranges.empty()) {
-          hint.datasource->fadvise(hint.ranges, dev_id);
-        }
-      }
-    }
-    state.connector->push_split(std::move(op_data));
+    auto dev_id = state.balancer->get_next_gpu(state.pipeline_id);
+    state.connector->push_split(std::make_unique<op::scan::scan_operator_input>(
+      std::move(batch), state.readahead, state.op_id, dev_id));
   };
 
   while (!stop.stop_requested()) {
@@ -222,23 +213,14 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(
       }
       if (next.scan_info) {
         // Insert-delta split. row_filter_pending stays false: scan_info
-        // splits fold filter costs into their own estimates. Same fadvise +
-        // opportunistic prefetch as the walk path; host-backed splits have
+        // splits fold filter costs into their own estimates. The constructor
+        // fadvises and publishes, as on the walk path; host-backed splits have
         // no file ranges, so the hints no-op.
-        auto split = std::make_unique<op::scan::scan_operator_input>(
-          std::move(next.scan_info), readahead, operator_id);
-        split->mvcc_keep_mask = std::move(next.mvcc_keep_mask);
         std::optional<int> device;
-        if (next.preferred_device >= 0) {
-          device = next.preferred_device;
-          split->set_preferred_device_id(next.preferred_device);
-        }
-        auto fadvise_hints = split->get_fadvise_hints();
-        for (auto& hint : fadvise_hints) {
-          if (hint.datasource && !hint.ranges.empty()) {
-            hint.datasource->fadvise(hint.ranges, device);
-          }
-        }
+        if (next.preferred_device >= 0) { device = next.preferred_device; }
+        auto split = std::make_unique<op::scan::scan_operator_input>(
+          std::move(next.scan_info), readahead, operator_id, device);
+        split->mvcc_keep_mask = std::move(next.mvcc_keep_mask);
         connector.push_split(std::move(split));
         continue;
       }

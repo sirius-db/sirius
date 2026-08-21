@@ -134,6 +134,36 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     bool ok{true};  ///< every datasource that started IO completed it
   };
 
+  /// How preparing this split's prefetch requests turned out, across its
+  /// datasources.  A split spanning several files can have some prepared and the
+  /// rest refused, so both are counted rather than reduced to a verdict here.
+  struct prepare_outcome {
+    std::size_t prepared{0};  ///< requests that now own staging buffers
+    std::size_t failed{0};    ///< requests the cache pool could not satisfy
+
+    /// Whether a following @ref prefetch has anything to issue.
+    [[nodiscard]] bool ready() const noexcept { return prepared > 0; }
+  };
+
+  /// Allocate staging buffers for this split's prefetch requests.  A chunk
+  /// without one cannot be claimed for loading, so a prefetch issued over it
+  /// reads nothing and settles `ready` having done nothing -- and the reader
+  /// then pays for the whole split.
+  ///
+  /// @p wait_for_eviction: see @c prefetching_cache::prepare.
+  prepare_outcome prepare_for_prefetching(bool wait_for_eviction = false)
+  {
+    prepare_outcome out;
+    for (auto const& ds : _datasources) {
+      switch (ds->prepare_prefetch(wait_for_eviction)) {
+        case sirius::io::prepare_result::prepared: ++out.prepared; break;
+        case sirius::io::prepare_result::allocation_failed: ++out.failed; break;
+        case sirius::io::prepare_result::nothing_to_prepare: break;
+      }
+    }
+    return out;
+  }
+
   /// Issue prefetch IO for every datasource this split reads.  Reports through
   /// @p on_done exactly once, when the last datasource has settled -- there is
   /// no return value, because the answer is not known when this returns.
