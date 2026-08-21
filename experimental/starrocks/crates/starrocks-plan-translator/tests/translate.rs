@@ -4196,3 +4196,50 @@ fn bare_cross_join_translates_to_constant_key_join() {
         .collect();
     assert_eq!(operands, vec![2, 4]);
 }
+
+/// Only `PROJECT_NODE` materializes its common slots. A `SELECT_NODE`, hash join or nested-loop
+/// join carrying the same field is refused rather than having its shared sub-expressions dropped
+/// — a slot ref resolving to one of them would otherwise read a column that was never emitted.
+#[test]
+fn common_slots_outside_a_project_are_rejected() {
+    let common = || {
+        let mut map = BTreeMap::new();
+        map.insert(5, slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)));
+        Some(map)
+    };
+
+    let mut select = base_plan_node(1, TPlanNodeType::SELECT_NODE, 1, vec![0]);
+    select.select_node = Some(TSelectNode::new(common()));
+    let select_plan = TPlan::new(vec![select, scan_node(0, 0)]);
+
+    let mut hash_join = hash_join_node(TJoinOp::INNER_JOIN);
+    hash_join.hash_join_node.as_mut().unwrap().common_slot_map = common();
+    let hash_plan = TPlan::new(vec![hash_join, scan_node(0, 0), scan_node(1, 1)]);
+
+    let mut nestloop = nestloop_join_node(
+        TJoinOp::INNER_JOIN,
+        vec![binary_pred(
+            TExprOpcode::LT,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        )],
+    );
+    nestloop
+        .nestloop_join_node
+        .as_mut()
+        .unwrap()
+        .common_slot_map = common();
+    let nestloop_plan = TPlan::new(vec![nestloop, scan_node(0, 0), scan_node(1, 1)]);
+
+    for (label, plan, desc) in [
+        ("SELECT_NODE", select_plan, base_desc()),
+        ("HASH_JOIN_NODE", hash_plan, join_desc()),
+        ("NESTLOOP_JOIN_NODE", nestloop_plan, join_desc()),
+    ] {
+        let err = translate_fragment(&params(Some(plan), Some(desc), None)).unwrap_err();
+        let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
+            panic!("{label}: expected an unsupported plan node, got {err:?}");
+        };
+        assert_eq!(reason, "common slots are only materialized on PROJECT_NODE");
+    }
+}
