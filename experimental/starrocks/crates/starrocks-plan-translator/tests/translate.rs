@@ -1164,10 +1164,27 @@ fn project_common_slots_are_materialized_before_visible_expressions() {
         panic!("expected struct field");
     };
     assert_eq!(field.field, 2);
-    assert!(matches!(
-        visible.input.as_ref().unwrap().rel_type.as_ref().unwrap(),
-        rel::RelType::Project(_)
-    ));
+
+    // The hidden project must pass its two input columns through and append the common slot,
+    // and the visible project must then read past all three. Asserting only that a project
+    // exists leaves the emit mappings -- the single line this lowering rests on -- unobserved.
+    let rel::RelType::Project(hidden) = visible.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the hidden project under the visible one");
+    };
+    assert_eq!(hidden.expressions.len(), 1);
+    assert_eq!(emit_mapping(hidden.common.as_ref()), vec![0, 1, 2]);
+    assert_eq!(emit_mapping(visible.common.as_ref()), vec![3]);
+}
+
+/// Reads a relation's `RelCommon` emit mapping, which is what a consumer projects by.
+fn emit_mapping(common: Option<&substrait::proto::RelCommon>) -> Vec<i32> {
+    let Some(substrait::proto::rel_common::EmitKind::Emit(emit)) =
+        common.and_then(|common| common.emit_kind.as_ref())
+    else {
+        panic!("expected an explicit emit mapping");
+    };
+    emit.output_mapping.clone()
 }
 
 /// Verifies fragment output expressions add the final root projection.
