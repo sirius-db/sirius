@@ -2899,13 +2899,65 @@ fn aggregation_conjuncts_become_having_filter() {
     };
 }
 
-/// Verifies anti joins are lowered through supported outer/mark join forms.
+/// Reads a relation's `RelCommon` emit mapping — what a consumer actually projects by.
+fn emit_mapping(common: Option<&substrait::proto::RelCommon>) -> Vec<i32> {
+    let Some(substrait::proto::rel_common::EmitKind::Emit(emit)) =
+        common.and_then(|common| common.emit_kind.as_ref())
+    else {
+        panic!("expected an explicit emit mapping");
+    };
+    emit.output_mapping.clone()
+}
+
+/// Names the extension function a scalar-function expression invokes.
+fn scalar_function_name(
+    plan: &substrait::proto::Plan,
+    expr: &substrait::proto::Expression,
+) -> String {
+    let expression::RexType::ScalarFunction(call) = expr.rex_type.as_ref().unwrap() else {
+        panic!("expected a scalar function, got {expr:?}");
+    };
+    plan.extensions
+        .iter()
+        .find_map(|ext| {
+            match ext.mapping_type.as_ref().unwrap() {
+            substrait::proto::extensions::simple_extension_declaration::MappingType
+                ::ExtensionFunction(f) if f.function_anchor == call.function_reference =>
+            {
+                Some(f.name.clone())
+            }
+            _ => None,
+        }
+        })
+        .unwrap_or_else(|| panic!("no extension for anchor {}", call.function_reference))
+}
+
+/// Verifies each anti join is lowered through the specific supported form it needs, not merely
+/// that it translates: a left anti becomes a LEFT join filtered on the build key being NULL, a
+/// right anti mirrors that, and a null-aware left anti becomes a MARK join filtered on NOT of the
+/// marker column the join appends. Asserting only the output arity cannot tell these apart, and
+/// every one of them is a different answer.
 #[test]
 fn anti_hash_joins_are_lowered() {
-    for join_op in [
-        TJoinOp::LEFT_ANTI_JOIN,
-        TJoinOp::RIGHT_ANTI_JOIN,
-        TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN,
+    for (join_op, want_type, want_filter, want_emit) in [
+        (
+            TJoinOp::LEFT_ANTI_JOIN,
+            substrait::proto::join_rel::JoinType::Left,
+            "is_null",
+            vec![0],
+        ),
+        (
+            TJoinOp::RIGHT_ANTI_JOIN,
+            substrait::proto::join_rel::JoinType::Right,
+            "is_null",
+            vec![1],
+        ),
+        (
+            TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN,
+            substrait::proto::join_rel::JoinType::LeftMark,
+            "not",
+            vec![0],
+        ),
     ] {
         let plan = TPlan::new(vec![
             hash_join_node(join_op),
@@ -2914,7 +2966,36 @@ fn anti_hash_joins_are_lowered() {
         ]);
         let translated = translate_fragment(&params(Some(plan), Some(join_desc()), None))
             .unwrap_or_else(|err| panic!("{join_op:?}: {err:?}"));
-        assert_eq!(root(&translated.plan).names.len(), 1);
+
+        let root = root(&translated.plan);
+        assert_eq!(root.names.len(), 1, "{join_op:?}");
+        let rel::RelType::Project(project) =
+            root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+        else {
+            panic!("{join_op:?}: expected the output projection under the root");
+        };
+        assert_eq!(
+            emit_mapping(project.common.as_ref()),
+            want_emit,
+            "{join_op:?}"
+        );
+
+        let rel::RelType::Filter(filter) =
+            project.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+        else {
+            panic!("{join_op:?}: expected the anti-join filter under the projection");
+        };
+        assert_eq!(
+            scalar_function_name(&translated.plan, filter.condition.as_ref().unwrap()),
+            want_filter,
+            "{join_op:?}"
+        );
+
+        let rel::RelType::Join(join) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+        else {
+            panic!("{join_op:?}: expected the join under the filter");
+        };
+        assert_eq!(join.r#type, want_type as i32, "{join_op:?}");
     }
 }
 
