@@ -1080,7 +1080,8 @@ void dynamic_filter_publication_session::publish_one_shot(cudf::table_view const
     }
     invoke_noexcept([&] {
       SIRIUS_LOG_DEBUG(
-        "[dynamic_filter_publication_session] publication: {} key(s) considered, {} skipped "
+        "[dynamic_filter_publication_session] dynamic-filter publication: {} key(s) considered, "
+        "{} skipped "
         "(domain gate), {} skipped (Bloom size gate), {} skipped (type mismatch), {} membership + "
         "{} zone-map built, {} filter(s) pushed across {} active target(s).",
         outcome.keys_considered,
