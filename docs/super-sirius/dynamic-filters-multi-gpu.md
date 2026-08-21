@@ -2,9 +2,12 @@
 
 > **Status:** PR #1277's device-local replica publication is implemented. The
 > global multi-partition Bloom accumulator is also implemented behind
-> `enable_dynamic_filter_multi_partition` (default `false`). Single-GPU build
-> and focused validation are complete; physical multi-GPU runtime and
-> performance evaluation are deferred to a multi-GPU machine.
+> `enable_dynamic_filter_multi_partition` (default `false`). Four-GPU GB200
+> functional validation now covers device-local replication, cross-device
+> accumulation, direct peer DMA, forced host staging, and two-GPU SF1 query
+> execution. Automatic probe-selected staging on peer-DMA-broken hardware and
+> performance evaluation remain open. See the
+> [2026-08-21 multi-GPU validation report](mgpu-validation-2026-08-21.md).
 > See [dynamic-filters.md](dynamic-filters.md) for the general feature.
 
 ## Summary
@@ -414,12 +417,13 @@ cases, direct publisher-selection tests for the raw and adjacent hash tiers,
 and a focused two-GPU case. The latter destroys the original build-key column
 before fan-out, verifies remote unavailability before replication and exact
 masking afterward, checks reservation/allocation growth, and checks teardown.
-The reservation-denial suite also covers the raw small IN-list. These multi-GPU
-cases skip automatically when fewer than two devices are visible, so a passing
-two-device run is still required before the raw path can be called revalidated.
+The reservation-denial suite also covers the raw small IN-list. On 2026-08-21,
+the four-GB200 rerun activated these multi-GPU cases—including the three-GPU
+direct-peer fan-out—and they passed without a skip warning.
 
-The multi-partition accumulator's typed snapshot validation, exact-ID accounting, zero-row no-op, drained-target completion (including a mid-accumulation drain observed at the next contribution), OR reduction, failure handling, flag gates, and result equivalence are covered by focused tests on this single-GPU host. Timed synchronization hooks cover an in-flight duplicate, competing final contributions with exactly one publisher, terminal-result exception races, both deterministic finalize-versus-in-flight-final-contribution winners, strict-replication failure before fan-out, and destruction after a short-lived task stream. A real-repository PARTITION regression pins freeze-before-pop and stable task identity; its cross-GPU clone/retry branch automatically returns with a warning when fewer than two GPUs are visible.
-Physical multi-GPU execution and performance have not been evaluated here. That validation is intentionally deferred to a machine with at least two visible GPUs and representative peer and staged-copy routes.
+The multi-partition accumulator's typed snapshot validation, exact-ID accounting, zero-row no-op, drained-target completion (including a mid-accumulation drain observed at the next contribution), OR reduction, failure handling, flag gates, and result equivalence are covered by focused tests. Timed synchronization hooks cover an in-flight duplicate, competing final contributions with exactly one publisher, terminal-result exception races, both deterministic finalize-versus-in-flight-final-contribution winners, strict-replication failure before fan-out, and destruction after a short-lived task stream. The four-GPU rerun also activated the cross-device strict-replication/reservation and real-repository PARTITION clone/retry legs; both race selectors then passed 10/10 independent processes.
+
+Physical multi-GPU functional validation is complete on the four-GB200 host for the tested scope, including direct peer-DMA replication, exact-byte forced host staging, and byte-exact GPU-vs-CPU SF1 Q5/Q7/Q21 results under the two-GPU configuration. Because peer DMA works on GB200, the automatic probe-selected host-staging fallback was not exercised. The run was correctness validation rather than a performance evaluation.
 
 ## Code map
 

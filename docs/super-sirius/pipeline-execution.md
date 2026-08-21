@@ -133,7 +133,7 @@ The fix is not to patch every read site to detect cross-GPU input. The fix is th
 
 ### The contract
 
-> **Every operator's input batches MUST arrive on the task's reservation device.** Operators MUST NOT use `batches[0]->get_memory_space()` as the authoritative target memory space; that read is acceptable only as an alias for `target_space` *after* `prepare_for_processing` has run upstream. New operators that read `get_memory_space()` from a batch they did not themselves construct MUST add an `INVARIANT` comment naming the upstream enforcement path (see "For new operator authors" below).
+> **Every operator's input batches MUST arrive on the task's reservation device, and the task's execution stream MUST belong to that same device.** Operators MUST NOT use `batches[0]->get_memory_space()` as the authoritative target memory space; that read is acceptable only as an alias for `target_space` *after* `prepare_for_processing` has run upstream. New operators that read `get_memory_space()` from a batch they did not themselves construct MUST add an `INVARIANT` comment naming the upstream enforcement path (see "For new operator authors" below). Direct callers and tests that bypass `gpu_pipeline_executor` must make the requested GPU current and explicitly create or acquire a stream on it before calling `prepare_for_processing` or `lock_or_prepare_batch`.
 
 This is a four-layer contract: the scheduler picks `target_space`, the task layer enforces it, the per-batch lock protocol implements it, and the operator layer relies on the postcondition. Each layer is shown below with the source line where it lives.
 
@@ -141,7 +141,7 @@ This is a four-layer contract: the scheduler picks `target_space`, the task laye
 
 **Layer 1 — `gpu_pipeline_task::execute` captures `target_space` from the task's reservation.**
 
-`src/pipeline/gpu_pipeline_task.cpp` (`release_reservation()`):
+`src/pipeline/gpu_pipeline_task.cpp` (`gpu_pipeline_task::execute`):
 
 ```cpp
 auto reservation = local_state.release_reservation();
@@ -150,11 +150,11 @@ const auto* requested_memory_space =
   reservation != nullptr ? &reservation->get_memory_space() : nullptr;
 ```
 
-The reservation was attached by the GPU executor's manager loop (see [GPU Pipeline Executor](#gpu-pipeline-executor) above) on the SCHED-RR-chosen device. `requested_memory_space` is the authoritative target for every input batch this task will touch.
+The reservation was attached by the GPU executor's manager loop (see [GPU Pipeline Executor](#gpu-pipeline-executor) below) on the SCHED-RR-chosen device. `requested_memory_space` is the authoritative target for every input batch this task will touch. The same executor owns an `exclusive_stream_pool` constructed for that memory-space device and dispatches the task with a stream acquired from that pool. Reservation space and execution stream therefore form one device-affine pair.
 
 **Layer 2 — `gpu_pipeline_task::execute` calls `prepare_for_processing` on the operator-data input.**
 
-This is the gate. `compute_task(stream)` — which iterates the pipeline's operators and calls each one's `execute()` — does not run until `prepare_for_processing(requested_memory_space, stream)` has returned. Every batch is available read-only on `requested_memory_space` by the time any operator sees it.
+This is the gate. `compute_task(stream)` — which iterates the pipeline's operators and calls each one's `execute()` — does not run until `prepare_for_processing(requested_memory_space, stream)` has returned. Every batch is available read-only on `requested_memory_space` by the time any operator sees it. For a GPU target, `stream` belongs to that same GPU; passing a foreign-device stream violates the executor contract even when peer access is available.
 
 **Layer 3 — `pipelineable_operator_data::prepare_for_processing` walks each batch and locks-or-clones it.**
 
@@ -188,7 +188,7 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
   rmm::cuda_stream_view stream);
 ```
 
-If the batch is already on `target_space`, it is locked in place under a shared (read) lock. If it lives on a *different GPU*, it is **cloned** into the target space under the same shared lock (`read_accessor.clone_to<...>`) — the source batch is never exclusively locked and never mutated, so concurrent readers on its home GPU proceed unhindered (see [Multi-GPU Architecture](multi-gpu-architecture.md)). Host/disk-resident batches are converted via `mut_accessor.convert_to<...>` (an upgrade, not a clone). The cross-GPU route goes through `cucascade::convert_gpu_to_gpu` (peer-DMA on server hardware, automatic host-staging on consumer hardware whose chipset misreports peer-access support). For HOST-targeted conversions the helper first attempts a caller-owned reservation (`make_reservation_or_null`) and passes it to the reservation-taking `convert_to` overload, falling back with a warning to the no-reservation overload — see [Memory Management](memory-management.md).
+If the batch is already on `target_space`, it is locked in place under a shared (read) lock. Before taking that lock, the helper may opportunistically rebind an idle GPU batch's deallocation stream to the task stream; cuCascade rejects the operation if the stream and representation belong to different devices, because a foreign stream would place frees in the wrong RMM device pool. Always pass the consumer/target-device stream, not the source batch's stream: the source writer event provides cross-device ordering, while the caller stream remains the task's target-device stream. If the batch lives on a *different GPU*, it is **cloned** into the target space under the same shared lock (`read_accessor.clone_to<...>`) — the source batch is never exclusively locked and never mutated, so concurrent readers on its home GPU proceed unhindered (see [Multi-GPU Architecture](multi-gpu-architecture.md)). Host/disk-resident batches are converted via `mut_accessor.convert_to<...>` (an upgrade, not a clone). The cross-GPU route goes through `cucascade::convert_gpu_to_gpu` (peer-DMA on server hardware, automatic host-staging on consumer hardware whose chipset misreports peer-access support). For HOST-targeted conversions the helper first attempts a caller-owned reservation (`make_reservation_or_null`) and passes it to the reservation-taking `convert_to` overload, falling back with a warning to the no-reservation overload — see [Memory Management](memory-management.md).
 
 **Postcondition.** When `prepare_for_processing` returns, every input accessor references data on `requested_memory_space`. Therefore the per-operator expression `batches[0].get_memory_space() == target_space` holds at every audited read site. Operators that walk every batch and adopt the first non-null batch's space (e.g. `sirius_physical_sort_sample.cpp`, `sirius_physical_merge_sort.cpp`, `sirius_physical_table_scan.cpp`) are safe by the same postcondition.
 

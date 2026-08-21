@@ -70,12 +70,18 @@ memory_capacity = 1TB;          // total spill capacity
 
 ## Memory Reservations
 
-Pipeline tasks acquire memory reservations before execution to prevent GPU OOM:
+Pipeline tasks acquire a memory reservation and an execution stream for the same GPU before
+execution. This pairing prevents GPU OOM while preserving the per-task device contract:
 
 1. GPU executor's `manager_loop()` calls `memory_space.make_reservation(estimated_size)`
 2. The reservation is attached to the task's local state via `set_reservation()`
-3. During execution, operators allocate within the reservation
-4. Reservations are released when the task completes
+3. The executor acquires a stream from its device-bound stream pool, matching the reservation's
+   memory space
+4. During execution, operators allocate within the reservation and use that same-device stream
+5. Reservations are released when the task completes
+
+See [Pipeline Execution](pipeline-execution.md#the-contract) for the authoritative reservation
+space, requested space, and stream-device contract.
 
 ### `reservation_aware_resource_adaptor`
 

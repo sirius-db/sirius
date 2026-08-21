@@ -35,6 +35,7 @@
 #include <cudf/lists/lists_column_view.hpp>
 #include <cudf/table/table.hpp>
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
@@ -519,15 +520,22 @@ TEST_CASE("prepare_for_processing rebinds idle batches to the prepared clones",
   batch_lock_utils_fixture f;
   REQUIRE(f.setup(2));
 
-  rmm::cuda_stream stream;
-  auto batch           = f.make_gpu_batch(kNumRows, *f.gpu0, stream.view());
+  rmm::cuda_set_device_raii gpu0_guard{rmm::cuda_device_id{f.gpu0->get_device_id()}};
+  rmm::cuda_stream gpu0_stream{rmm::cuda_stream::flags::non_blocking};
+  auto batch           = f.make_gpu_batch(kNumRows, *f.gpu0, gpu0_stream.view());
   auto const source_id = batch->get_batch_id();
+
+  // Match the executor's device/stream affinity: construct the source on GPU 0, then run both
+  // prepares with GPU 1 current and a GPU 1-owned task stream. Declaration order keeps each
+  // stream alive until after the batches whose deallocation is bound to it.
+  rmm::cuda_set_device_raii gpu1_guard{rmm::cuda_device_id{f.gpu1->get_device_id()}};
+  rmm::cuda_stream gpu1_stream{rmm::cuda_stream::flags::non_blocking};
 
   sirius::op::pipelineable_operator_data op_data(
     std::vector<std::shared_ptr<cucascade::data_batch>>{batch});
   auto const require_source_identity = [&] { REQUIRE(op_data.task_input_batch_id() == source_id); };
   require_source_identity();
-  op_data.prepare_for_processing(f.gpu1, stream.view());
+  op_data.prepare_for_processing(f.gpu1, gpu1_stream.view());
   require_source_identity();
 
   // get_data_batches() must return the clone underlying the read-only accessor, not the
@@ -543,13 +551,13 @@ TEST_CASE("prepare_for_processing rebinds idle batches to the prepared clones",
   REQUIRE(clone_sp->get_state() == cucascade::batch_state::read_only);
 
   // OOM-reschedule survival: remove_read_only_lock materializes the idle vector from the
-  // accessors before dropping them, so the clone (and its transfer work) outlives the locks.
+  // accessors before dropping them, so the prepared clone remains owned across the retry.
   op_data.remove_read_only_lock();
   REQUIRE(op_data.get_data_batches().at(0) == clone_sp);
   require_source_identity();
   REQUIRE(clone_sp->get_state() == cucascade::batch_state::idle);
 
-  op_data.prepare_for_processing(f.gpu1, stream.view());
+  op_data.prepare_for_processing(f.gpu1, gpu1_stream.view());
   require_source_identity();
   REQUIRE(op_data.get_data_batches().at(0) == clone_sp);
   {

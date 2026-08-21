@@ -43,7 +43,7 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Compressed Materialization](compressed-materialization.md) | Value-preserving narrow integer and DECIMAL carriers, restoration boundaries, and pin-cache invariants |
 | [Multi-GPU Architecture](multi-gpu-architecture.md) | How Sirius executes SQL across every GPU on a node — tiers, pin tables, SCHED-RR, cross-GPU transfers, downgrade, concurrency invariants |
 | [Dynamic Filters](dynamic-filters.md) | Ordered hash-build publication, zone-map/IN-list/Bloom consumers, multi-GPU replicas, join-edge (SIP) endpoint placement, and the refinement design that remains future work |
-| [Dynamic Filters — Multi-GPU](dynamic-filters-multi-gpu.md) | Device-local replica fan-out, the global multi-partition Bloom accumulation contract, strict-replication policy, and single-GPU validation status |
+| [Dynamic Filters — Multi-GPU](dynamic-filters-multi-gpu.md) | Device-local replica fan-out, the global multi-partition Bloom accumulation contract, strict-replication policy, four-GPU validation status, and remaining automatic-fallback/performance gaps |
 | [Debugging](debugging.md) | Practical guide to debugging crashes and races — building/running with ASan & TSan, the `tsan.supp` file, and capturing/inspecting core dumps with gdb |
 
 ## Suggested Reading Order
@@ -60,5 +60,9 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 10. **Data Management** — data batch lifecycle and port wiring
 11. **Configuration** — tuning knobs and runtime settings
 12. **Optimizations** — performance improvements and their mechanisms
+
+For multi-GPU or GPU-memory work, read **Multi-GPU Architecture** immediately after **Pipeline
+Execution**; it specializes the reservation-space/stream-device and cross-GPU transfer contracts.
+For dynamic-filter work, continue with **Dynamic Filters**, then **Dynamic Filters — Multi-GPU**.
 
 <!-- last-updated-commit: f03762faf2aba9966050102d632c92cb770ff14d -->
