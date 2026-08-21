@@ -475,6 +475,9 @@ TEST_CASE("a join-child wrap concat carries the payload past", "[late_mat][lifet
                        duckdb::make_uniq<wide_scan>(2),
                        std::move(conditions),
                        duckdb::JoinType::INNER,
+                       /*left_projection_map=*/{},
+                       /*right_projection_map=*/{},
+                       /*delim_types=*/{},
                        /*estimated_cardinality=*/1);
   opaque_op reader(2);
 
@@ -511,6 +514,9 @@ TEST_CASE("a join key may not be deferred, however far it rides", "[late_mat][li
                  duckdb::make_uniq<wide_scan>(3),
                  std::move(conditions),
                  duckdb::JoinType::INNER,
+                 /*left_projection_map=*/{},
+                 /*right_projection_map=*/{},
+                 /*delim_types=*/{},
                  /*estimated_cardinality=*/1);
 
   // Insert the wrap a real plan builds between the join and its probe child:
@@ -665,6 +671,9 @@ TEST_CASE("a column an outer join could null is withheld from the weighing", "[l
                  std::move(scan),
                  std::move(conditions),
                  duckdb::JoinType::LEFT,
+                 /*left_projection_map=*/{},
+                 /*right_projection_map=*/{},
+                 /*delim_types=*/{},
                  /*estimated_cardinality=*/1);
   opaque_op reader(6);
   scan_ptr->link(&join);
@@ -787,6 +796,9 @@ TEST_CASE("a partition below a join still refuses a group key", "[late_mat][life
                  duckdb::make_uniq<wide_scan>(3),
                  std::move(conditions),
                  duckdb::JoinType::INNER,
+                 /*left_projection_map=*/{},
+                 /*right_projection_map=*/{},
+                 /*delim_types=*/{},
                  /*estimated_cardinality=*/1);
 
   wide_scan scan(3);
@@ -924,6 +936,9 @@ TEST_CASE("a join key records which condition compared it", "[late_mat][lifetime
                  duckdb::make_uniq<wide_scan>(3),
                  std::move(conditions),
                  duckdb::JoinType::INNER,
+                 /*left_projection_map=*/{},
+                 /*right_projection_map=*/{},
+                 /*delim_types=*/{},
                  /*estimated_cardinality=*/1);
 
   auto* lhs_scan = static_cast<wide_scan*>(join.children[0].get());

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "dependencies": [
+    {
+      "host": true,
+      "name": "vcpkg-cmake"
+    },
+    {
+      "host": true,
+      "name": "vcpkg-cmake-config"
+    },
+    "cccl",
+    "cuco",
+    "fmt",
+    "nvtx3",
+    "raft",
+    "rmm",
+    "spdlog"
+  ],
+  "license": "Apache-2.0",
+  "name": "cuvs",
+  "supports": "linux",
+  "version-string": "26.06.00"
+}

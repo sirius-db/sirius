@@ -129,11 +129,11 @@ bool is_supported_validity_compression(duckdb::CompressionType c);
 //    are walked concurrently.
 //===----------------------------------------------------------------------===//
 
-/// @brief Read PartitionStatistics, validate projected types and partition
-/// `row_start`, and capture the row-group count, block size, and a storage
-/// primary index -> projected column index map. No per-segment IO.
-/// PartitionStatistics touches ClientContext / LocalStorage, which are not
-/// thread-safe, so this runs before the concurrent range walks.
+/// @brief Prepared state shared by concurrent DuckDB-native row-group walks.
+///
+/// Carries the validated projection, partition statistics, block layout, and
+/// filter-statistics pruning results. A fully pruned plan remains viable and
+/// produces empty range results.
 struct duckdb_native_walk_plan {
   duckdb::DataTable* storage     = nullptr;
   duckdb::ClientContext* context = nullptr;
@@ -160,7 +160,8 @@ struct duckdb_native_walk_plan {
   const duckdb::TableFilterSet* table_filters           = nullptr;
   const duckdb::vector<duckdb::ColumnIndex>* column_ids = nullptr;
   /// True for row groups proven empty by pushed-down filter statistics. Range
-  /// workers skip these row groups entirely.
+  /// workers skip these row groups entirely; an all-true vector does not make
+  /// the plan non-viable.
   std::vector<bool> row_group_pruned_by_stats;
   /// Approximate decoded-byte budget for each stat-pruned row group. Exact for
   /// fixed-width projections; conservative for VARCHAR because per-segment max
@@ -170,13 +171,29 @@ struct duckdb_native_walk_plan {
   std::size_t pruned_decoded_bytes = 0;
 
   //===----------Error Handling----------===//
-  /// `viable == false` (with reason) for:
-  ///  - unsupported projected types, or
-  ///  - an invalid partition `row_start`.
+  /// False when preparation rejects a projected type, a partition row start,
+  /// or a VARCHAR row group whose statistics cannot rule out overflow-block
+  /// strings. A fully pruned plan is viable.
   bool viable = false;
   std::string viability_failure_reason;
 };
 
+/**
+ * @brief Prepare a DuckDB-native metadata walk without per-segment I/O.
+ *
+ * Reads partition statistics serially because DuckDB's client context and
+ * local storage are not thread-safe. The referenced inputs must outlive every
+ * range walk that consumes the returned plan.
+ *
+ * @param storage Table storage whose row groups will be walked.
+ * @param context Client context used to read partition statistics.
+ * @param projected_cols Projected storage columns.
+ * @param projected_types Types parallel to @p projected_cols.
+ * @param table_filters Optional pushed-down filters used for statistics pruning.
+ * @param column_ids Optional mapping from filter positions to storage columns.
+ * @return The prepared plan. Check @c viable before scheduling range walks; a
+ *         plan with every row group pruned is still viable.
+ */
 duckdb_native_walk_plan prepare_duckdb_native_walk(
   duckdb::DataTable& storage,
   duckdb::ClientContext& context,
@@ -214,9 +231,9 @@ struct duckdb_native_row_group_range {
 duckdb_native_row_group_range walk_duckdb_native_row_group_range(
   const duckdb_native_walk_plan& plan, std::size_t rg_begin, std::size_t rg_end);
 
-/// @brief Row groups per parallel-walk task unit (env `SIRIUS_METADATA_PARSE_CHUNK`,
-/// default 8). Shared by the metadata parse fan-out and the MVCC mask job so both
-/// slice row-group work into the same task granularity.
+/// @brief Row groups per parallel-walk task unit (fixed internally at 8).
+/// Shared by the metadata parse fan-out and the MVCC mask job so both slice
+/// row-group work into the same task granularity.
 std::size_t metadata_parse_chunk();
 
 }  // namespace sirius::op::scan

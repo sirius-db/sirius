@@ -23,12 +23,12 @@
 #include <io/io_context.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
+#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/duckdb_native_decoder.hpp>
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
 #include <op/scan/scan_plan.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
-#include <op/sirius_dynamic_filter.hpp>
 
 // duckdb
 #include <duckdb/storage/single_file_block_manager.hpp>
@@ -209,9 +209,6 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
   }
   _block_manager = sf_bm;
 
-  // Emission order: the k-th decoded column is column_ids[source_ids[k]]. Computed outside the
-  // static-filter guard — the dynamic-filter remap below needs it even when the scan carries no
-  // static filters.
   duckdb::vector<duckdb::idx_t> source_ids_fallback;
   if (bind.projection_ids.empty()) {
     source_ids_fallback.reserve(bind.column_ids.size());
@@ -233,21 +230,6 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
     if (filter_expr_duckdb) {
       _filter_expression = std::shared_ptr<duckdb::Expression>(filter_expr_duckdb.release());
     }
-  }
-
-  // Producers push dynamic filters keyed in DuckDB's column_ids space; the post-decode operator
-  // applies them by output position. Install the translation now — the ctor runs at plan time,
-  // before any producing join can publish. Decode positions at or past the output arity are
-  // pure-filter columns that post_filter_and_project drops; they map to the sentinel so
-  // push_filter rejects filters nothing downstream could apply.
-  if (bind.sirius_dynamic_filters) {
-    std::vector<std::size_t> output_position_by_column_id(bind.column_ids.size(),
-                                                          scan_plan::no_output_position);
-    auto const output_arity = bind.output_types.size();
-    for (std::size_t k = 0; k < source_ids.size() && k < output_arity; ++k) {
-      output_position_by_column_id[source_ids[k]] = k;
-    }
-    bind.sirius_dynamic_filters->set_consumer_column_remap(std::move(output_position_by_column_id));
   }
 
   // Slice [0, n_row_groups) into parse ranges; each becomes one thunk (Phase 2).

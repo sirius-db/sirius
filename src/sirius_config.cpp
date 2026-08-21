@@ -146,10 +146,18 @@ static void from_yaml(const YAML::Node& node, exec::thread_pool_config& opt)
 static void from_yaml(const YAML::Node& node, creator::task_creator_config& opt)
 {
   yaml::reader r(node, "task_creator");
+  if (r.has("strategy")) {
+    throw std::runtime_error(
+      "'sirius.executor.task_creator.strategy': removed; task creation policy is internal and "
+      "currently demand-driven; remove this key");
+  }
+  if (r.has("priority_order")) {
+    throw std::runtime_error(
+      "'sirius.executor.task_creator.priority_order': removed; scheduling priority is internal "
+      "and currently source-first; remove this key");
+  }
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
-  r.optional("strategy", opt.strategy);
-  r.optional("priority_order", opt.priority);
   r.reject_unknown();
 }
 
@@ -251,6 +259,9 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
 {
   yaml::reader r(node, "operator_params");
   r.optional("scan_task_batch_size", yaml::bytes(opt.scan_task_batch_size));
+  if (opt.scan_task_batch_size == 0) {
+    throw std::runtime_error("'operator_params.scan_task_batch_size': must be greater than zero");
+  }
   r.optional("max_sort_partition_bytes", yaml::bytes(opt.max_sort_partition_bytes));
   r.optional("max_sort_partition_memory_fraction",
              opt.max_sort_partition_memory_fraction,
@@ -266,12 +277,17 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("mark_join_build_switch_ratio",
              opt.mark_join_build_switch_ratio,
              yaml::between<double>{0.0, std::numeric_limits<double>::infinity()});
-  r.optional("enable_runtime_distinct_build_probe", opt.enable_runtime_distinct_build_probe);
-  r.optional("enable_dynamic_filter_pushdown", opt.enable_dynamic_filter_pushdown);
+  if (r.has("enable_runtime_distinct_build_probe")) {
+    throw std::runtime_error(
+      "'sirius.operator_params.enable_runtime_distinct_build_probe': removed; runtime distinct "
+      "build probing is an internal join policy (temporarily disabled pending issue #1600); "
+      "remove this key");
+  }
+  r.optional("enable_dynamic_filter", opt.enable_dynamic_filter);
   r.optional("enable_dynamic_zone_map_filter", opt.enable_dynamic_zone_map_filter);
   r.optional("dynamic_filter_domain_coverage_threshold",
              opt.dynamic_filter_domain_coverage_threshold,
-             yaml::greater_than<double>{0.0});
+             config::valid_domain_coverage_threshold{});
   r.optional("dynamic_filter_inlist_max_l2_fraction",
              opt.dynamic_filter_inlist_max_l2_fraction,
              yaml::fraction<double>{});
@@ -296,9 +312,18 @@ static void from_yaml(const YAML::Node& node, telemetry_config& opt)
   yaml::reader r(node, "telemetry");
   r.optional("enable_quent", opt.enable_quent);
   r.optional("enable_batch_events", opt.enable_batch_events);
-  r.optional("exporter", opt.exporter);
-  r.optional("output_directory", opt.output_directory);
-  r.optional("engine_name", opt.engine_name);
+  r.optional("exporter", opt.exporter, [](std::string const& value) {
+    if (value == "ndjson" || value == "msgpack" || value == "postcard") return true;
+    throw std::runtime_error("must be one of ndjson, msgpack, postcard");
+  });
+  r.optional("output_directory", opt.output_directory, [](std::string const& value) {
+    if (!value.empty()) return true;
+    throw std::runtime_error("must not be empty");
+  });
+  r.optional("engine_name", opt.engine_name, [](std::string const& value) {
+    if (!value.empty()) return true;
+    throw std::runtime_error("must not be empty");
+  });
   r.reject_unknown();
 }
 

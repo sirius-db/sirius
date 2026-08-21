@@ -27,12 +27,17 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+// cudf
+#include <cudf/column/column.hpp>
+#include <cudf/table/table_view.hpp>
+
 // rmm
 #include <rmm/cuda_stream_view.hpp>
 
 // standard library
 #include <atomic>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <variant>
 #include <vector>
@@ -75,17 +80,12 @@ struct membership_snapshot {
 // scan_operator_input
 //===----------------------------------------------------------------------===//
 /**
- * @brief Operator input for a fresh-read scan task (one emitted split from
- *        the unified gpu scan operator's connector).
+ * @brief Operator input for one fresh or resident scan split.
  *
- * Carries the per-split scan descriptor and (optional) post-decode
- * filter/projection description. The materialize step delegates to the
- * operator's installed @c gpu_ingestible — the operator does not see
+ * Carries either a per-split read descriptor or a cached resident batch, plus
+ * optional post-decode filtering and carrier-normalization state. Materialize
+ * delegates to the installed @c gpu_ingestible, so the operator does not see
  * the source format directly.
- *
- * Source operator data: holds no upstream batches that need locking, so
- * @ref prepare_for_processing only captures the requested memory space so
- * @c sirius_gpu_scan_operator::execute knows where to tag the output batch.
  */
 class scan_operator_input : public op::operator_data {
  public:
@@ -109,6 +109,18 @@ class scan_operator_input : public op::operator_data {
     return std::holds_alternative<std::shared_ptr<::cucascade::data_batch>>(materialization_info);
   }
 
+  /// Whether a per-query table freshly converted by prepare_for_processing may leave the cached
+  /// wrapper: the split is resident, carries no mvcc keep-mask, and any pending row filter has
+  /// already been applied by the decode (pushdown_row_filtered). Policy shared by prepare's
+  /// arming/direct-steal gate and the transactional steal's refusal gate; the ingestible-dependent
+  /// leading-identity clause stays at execute's call site, and per-steal state (pending / consumed
+  /// / already-stolen / predicate columns) stays in the steal.
+  [[nodiscard]] bool converted_table_transferable() const noexcept
+  {
+    return is_resident() && !mvcc_keep_mask.has_mask() &&
+           (!row_filter_pending || pushdown_row_filtered);
+  }
+
   [[nodiscard]] bool has_scan_metadata() const noexcept
   {
     return std::holds_alternative<std::unique_ptr<scan_info>>(materialization_info) &&
@@ -130,8 +142,37 @@ class scan_operator_input : public op::operator_data {
     }
   }
 
+  /**
+   * @brief Prepare this split for execution in the requested memory space.
+   *
+   * Fresh reads issue their just-in-time prefetch. Resident inputs are
+   * converted or decompressed to a plain GPU table when needed. An eligible
+   * per-query conversion result is detached for ownership transfer; inputs
+   * requiring a mask, row filter, or carrier cast retain the wrapper so
+   * materialization can be retried.
+   *
+   * @param requested_memory_space Preferred destination memory space; may be
+   *                               null when the caller has no preference.
+   * @param stream CUDA stream used for resident conversion.
+   */
   void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
-                              rmm::cuda_stream_view /*stream*/) override;
+                              rmm::cuda_stream_view stream) override;
+
+  using converted_column_replacements = std::vector<std::unique_ptr<cudf::column>>;
+  using converted_table_builder =
+    std::function<converted_column_replacements(cudf::table_view source)>;
+
+  /**
+   * @brief Build carrier replacements while retaining a freshly converted source, then commit.
+   *
+   * Returns null without mutation when this split is not an exact-width transactional candidate.
+   * A builder exception leaves the source table owned by the cached wrapper and retryable. Null
+   * replacement entries transfer the corresponding source columns without copying.
+   */
+  [[nodiscard]] std::unique_ptr<cudf::table> transactionally_steal_converted_table(
+    std::size_t output_width,
+    const converted_table_builder& builder,
+    rmm::cuda_stream_view stream) const;
 
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override;
 
@@ -218,13 +259,11 @@ class scan_operator_input : public op::operator_data {
   /// decides fresh. May be null (splits not routed through the operator, e.g.
   /// tests): all reads null-check.
   std::shared_ptr<std::atomic<bool>> pushdown_selection_unprofitable;
-  /// Per-query table taken out of the cached wrapper batch right after
-  /// prepare_for_processing's conversion produced it (decompressed or
-  /// uploaded fresh for this split) — never raw GPU pin storage, which is
-  /// served as a plain gpu_table_representation and never converted.
-  /// Consumed at most once by materialize_table, which moves it into the
-  /// scan output instead of deep-copying the batch. Mutable: the operator
-  /// only sees its input as const during execute.
+  /// Per-query table detached after the cached wrapper is converted or
+  /// decompressed. Raw GPU pins and splits requiring a mask, a not-yet-
+  /// decode-applied row filter, or a carrier cast remain view-backed.
+  /// Consumed at most once by materialize_table. Mutable because execute
+  /// receives its operator input as const.
   mutable std::unique_ptr<cudf::table> stolen_table;
   /// Size of the stolen table, kept past consumption so OOM-retry size
   /// estimates stay accurate while the wrapper batch holds only an empty
@@ -239,9 +278,14 @@ class scan_operator_input : public op::operator_data {
   /// drain_cached_provider from databatch_provider::batch, which owns the definition; null
   /// unless the gate is on and the scan is one whose batches are a pinned chunk each.
   std::shared_ptr<late_mat::scan_batch_origin const> origin;
-  /// True when scan normalization will cast at least one selected column of this resident cached
-  /// split. Stamped by drain_cached_provider from databatch_provider::batch, which owns the
-  /// definition.
+  /// A fresh owned conversion result that still needs carrier casts. The wrapper retains the
+  /// complete source until every replacement column has been built successfully, then the scan
+  /// commits by moving unchanged columns and installing the replacements.
+  mutable bool converted_table_steal_pending{false};
+  /// True when scan normalization will cast at least one selected column of
+  /// this resident cached split. Besides sizing the conversion reservation,
+  /// this prevents table detachment so an OOM retry can rematerialize the
+  /// retained view and rerun the cast.
   bool needs_carrier_conversion{false};
   /// Stamped by drain_cached_provider from databatch_provider::batch::conversion_destination_bytes,
   /// which owns the definition. Zero means unknown; the scan memory estimate then keeps its

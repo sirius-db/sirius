@@ -24,13 +24,13 @@
 #include <io/io_context.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
+#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/parquet_metadata.hpp>
 #include <op/scan/parquet_schema_mapping.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
-#include <op/sirius_dynamic_filter.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 
 // cudf
@@ -595,13 +595,6 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
   }
 
   _sirius_dynamic_filters = bind.sirius_dynamic_filters;
-
-  // Producers reference probe columns in DuckDB's column_ids space; the AST merge and the
-  // post-decode apply both key by output-column position. Install the translation so push_filter
-  // remaps before storing. Wiring-time setup, before the producing build publishes.
-  if (_sirius_dynamic_filters) {
-    _sirius_dynamic_filters->set_consumer_column_remap(_plan->output_position_by_column_id);
-  }
 
   // Hive-partition columns are path-derived constants, not decoded parquet columns, so they must
   // not receive post-decode dynamic filters.
@@ -1216,6 +1209,15 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
     assembled.select_columns(kept);
   }
   return assembled.release(stream, mr_ref);
+}
+
+bool parquet_gpu_ingestible::output_assembly_is_leading_identity() const noexcept
+{
+  // !needs_output_assembly means assemble_scan_output is a pass-through: no
+  // partition columns to synthesize and output_layout reads data columns
+  // 0..N-1 in order. (Its other false case, the empty count(*) layout, can
+  // never reach the transactional steal: such scans have no carrier targets.)
+  return !needs_output_assembly(*_plan);
 }
 
 //===----------------------------------------------------------------------===//

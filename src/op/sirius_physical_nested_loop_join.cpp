@@ -19,6 +19,7 @@
 #include "config.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -99,6 +100,34 @@ void reorder_conditions(duckdb::vector<sirius::join_condition>& conditions)
   }
 }
 
+bool sirius_physical_nested_loop_join::is_join_type_supported(duckdb::JoinType join_type)
+{
+  // Keep in lockstep with the `switch (join_type)` in execute() and emit_one_side_empty_result().
+  switch (join_type) {
+    case duckdb::JoinType::INNER:
+    case duckdb::JoinType::LEFT:
+    case duckdb::JoinType::RIGHT:
+    case duckdb::JoinType::SEMI:
+    case duckdb::JoinType::ANTI:
+    case duckdb::JoinType::MARK:
+    case duckdb::JoinType::OUTER: return true;
+    // RIGHT_SEMI / RIGHT_ANTI would need the predicate rebuilt with the table references
+    // swapped, SINGLE the matches deduplicated to one right row per left row; neither exists.
+    default: return false;
+  }
+}
+
+// Backstop for a construction site that skipped the planner's screen: throwing here still lands
+// in plan generation, which falls back to CPU, rather than aborting the query from execute().
+static void require_supported_join_type(duckdb::JoinType join_type)
+{
+  if (!sirius_physical_nested_loop_join::is_join_type_supported(join_type)) {
+    throw duckdb::NotImplementedException(
+      "sirius_physical_nested_loop_join: unsupported join type: " +
+      duckdb::JoinTypeToString(join_type));
+  }
+}
+
 sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
   duckdb::LogicalOperator& op,
   duckdb::unique_ptr<sirius_physical_operator> left,
@@ -112,6 +141,7 @@ sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
     conditions(std::move(cond)),
     join_type(join_type)
 {
+  require_supported_join_type(join_type);
   reorder_conditions(conditions);
 
   children.push_back(std::move(left));
@@ -126,36 +156,6 @@ sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
   for (std::size_t i = 0; i < rhs_types.size(); i++) {
     right_output_col_idxs.push_back(i);
   }
-}
-
-sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
-  duckdb::LogicalOperator& op,
-  duckdb::unique_ptr<sirius_physical_operator> left,
-  duckdb::unique_ptr<sirius_physical_operator> right,
-  duckdb::vector<sirius::join_condition> cond,
-  duckdb::JoinType join_type,
-  std::size_t estimated_cardinality,
-  duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info_p)
-  : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::NESTED_LOOP_JOIN,
-                                                sirius::from_duckdb_vec(op.types),
-                                                estimated_cardinality),
-    conditions(std::move(cond)),
-    join_type(join_type)
-{
-  reorder_conditions(conditions);
-  children.push_back(std::move(left));
-  children.push_back(std::move(right));
-  auto& lhs_types = children[0]->get_types();
-  auto& rhs_types = children[1]->get_types();
-  left_output_col_idxs.reserve(lhs_types.size());
-  for (std::size_t i = 0; i < lhs_types.size(); i++) {
-    left_output_col_idxs.push_back(i);
-  }
-  right_output_col_idxs.reserve(rhs_types.size());
-  for (std::size_t i = 0; i < rhs_types.size(); i++) {
-    right_output_col_idxs.push_back(i);
-  }
-  filter_pushdown = std::move(pushdown_info_p);
 }
 
 sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
@@ -173,6 +173,7 @@ sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
     conditions(std::move(cond)),
     join_type(join_type)
 {
+  require_supported_join_type(join_type);
   reorder_conditions(conditions);
   children.push_back(std::move(left));
   children.push_back(std::move(right));
@@ -201,6 +202,7 @@ sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
 bool sirius_physical_nested_loop_join::is_supported(
   const duckdb::vector<sirius::join_condition>& conditions, duckdb::JoinType join_type)
 {
+  if (!is_join_type_supported(join_type)) { return false; }
   if (join_type == duckdb::JoinType::MARK) { return true; }
   for (auto& cond : conditions) {
     auto left_expr = sirius::ast::to_duckdb(*cond.left);
@@ -852,6 +854,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
         join_result =
           cudf::conditional_full_join(left_effective, right_effective, predicate, stream, mr);
         break;
+      // Unreachable: is_join_type_supported() screens these out at plan time and at construction.
       default:
         throw std::runtime_error("sirius_physical_nested_loop_join: unsupported join type: " +
                                  duckdb::JoinTypeToString(join_type));

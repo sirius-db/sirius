@@ -306,6 +306,8 @@ class parquet_gpu_ingestible : public gpu_ingestible {
 
   [[nodiscard]] std::vector<std::size_t> materialized_column_order() const override;
 
+  [[nodiscard]] bool output_assembly_is_leading_identity() const noexcept override;
+
   [[nodiscard]] bool has_row_filter() const noexcept override
   {
     return _duckdb_filter_expression != nullptr;

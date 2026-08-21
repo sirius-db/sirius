@@ -11,6 +11,8 @@
   },
   "dependencies": [
     "cudf",
+    "cuvs",
+    "raft",
     "cuco",
     "nvrtc",
     "yaml-cpp",
