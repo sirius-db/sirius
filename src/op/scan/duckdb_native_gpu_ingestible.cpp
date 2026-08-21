@@ -340,11 +340,30 @@ std::unique_ptr<batch_coalescer> duckdb_native_gpu_ingestible::create_batch_coal
 //===----------------------------------------------------------------------===//
 // post_filter_and_project — filter eval + projection to output arity
 //===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Positions of `width` minus `elided`, ascending. Empty when nothing would be
+/// left: a zero-column table carries no row count, and the rowid needs one.
+std::vector<std::size_t> kept_positions(std::size_t width, std::span<std::size_t const> elided)
+{
+  if (elided.empty() || elided.size() >= width) { return {}; }
+  std::vector<std::size_t> kept;
+  kept.reserve(width - elided.size());
+  for (std::size_t pos = 0; pos < width; ++pos) {
+    if (std::find(elided.begin(), elided.end(), pos) == elided.end()) { kept.push_back(pos); }
+  }
+  return kept;
+}
+
+}  // namespace
+
 std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_project(
   filtered_table&& input,
   ::cucascade::memory::memory_space const& mem_space,
   rmm::cuda_stream_view stream,
-  std::unique_ptr<cudf::column>* /*survivors*/)
+  std::unique_ptr<cudf::column>* /*survivors*/,
+  std::span<std::size_t const> elided)
 {
   auto const output_arity = _info->output_types.size();
   auto const decoded_cols =
@@ -384,6 +403,11 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
     final_table.select_columns(selected_cols);
   }
 
+  if (auto const kept =
+        kept_positions(static_cast<std::size_t>(final_table.view().num_columns()), elided);
+      !kept.empty()) {
+    final_table.select_columns(kept);
+  }
   return final_table.release(stream, mr_ref);
 }
 

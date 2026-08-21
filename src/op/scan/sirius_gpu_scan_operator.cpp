@@ -75,6 +75,7 @@ std::unique_ptr<cudf::table> substitute_deferred_columns(
   late_mat::deferred_scan_output const& deferred,
   late_mat::scan_batch_origin const& origin,
   cudf::column_view const* survivors,
+  std::size_t arity,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr)
 {
@@ -98,6 +99,29 @@ std::unique_ptr<cudf::table> substitute_deferred_columns(
   }
 
   auto columns = output->release();
+  // The scan may have ELIDED the deferred columns from the projection, so that
+  // realizing the batch never copied values it was about to replace. Then they
+  // are missing rather than present-and-overwritten, and this restores the
+  // arity by inserting at their positions instead.
+  bool const inserting = columns.size() + deferred.output_positions.size() == arity;
+  if (!inserting && columns.size() != arity) {
+    throw std::runtime_error("[sirius_gpu_scan_operator] a deferred scan produced " +
+                             std::to_string(columns.size()) + " columns for an output of " +
+                             std::to_string(arity));
+  }
+  if (inserting) {
+    std::vector<std::unique_ptr<cudf::column>> widened;
+    widened.reserve(arity);
+    std::size_t next_kept = 0;
+    for (std::size_t position = 0; position < arity; ++position) {
+      if (deferred.defers(position)) {
+        widened.push_back(nullptr);  // filled in below, in bundle order
+      } else {
+        widened.push_back(std::move(columns[next_kept++]));
+      }
+    }
+    columns = std::move(widened);
+  }
   for (std::size_t i = 0; i < deferred.output_positions.size(); ++i) {
     auto const position = deferred.output_positions[i];
     if (position >= columns.size()) {
@@ -162,12 +186,17 @@ constexpr std::size_t saturating_mul(std::size_t value, std::size_t factor) noex
   return value > max / factor ? max : value * factor;
 }
 
-std::unique_ptr<cudf::table> normalize_physical_schema(std::unique_ptr<cudf::table> table,
-                                                       const std::vector<cudf::data_type>& targets,
-                                                       bool has_explicit_physical_schema,
-                                                       duckdb::SiriusContext* observer,
-                                                       rmm::cuda_stream_view stream,
-                                                       rmm::device_async_resource_ref mr)
+/// Deferred positions are skipped: substitute_deferred_columns overwrites them
+/// with a rowid and placeholders, so casting them first is work whose result is
+/// discarded -- and on a narrow-stored pin queried natively it is a full widen.
+std::unique_ptr<cudf::table> normalize_physical_schema(
+  std::unique_ptr<cudf::table> table,
+  const std::vector<cudf::data_type>& targets,
+  bool has_explicit_physical_schema,
+  late_mat::deferred_scan_output const& deferred,
+  duckdb::SiriusContext* observer,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
 {
   if (targets.empty()) { return table; }
 
@@ -186,6 +215,7 @@ std::unique_ptr<cudf::table> normalize_physical_schema(std::unique_ptr<cudf::tab
   // the planned target.
   auto const table_view = table->view();
   for (std::size_t column_idx = 0; column_idx < targets.size(); column_idx++) {
+    if (deferred.defers(column_idx)) { continue; }
     auto const& column = table_view.column(column_idx);
     auto const actual  = column.type();
     auto const target  = targets[column_idx];
@@ -222,6 +252,7 @@ std::unique_ptr<cudf::table> normalize_physical_schema(std::unique_ptr<cudf::tab
 
   auto columns = table->release();
   for (std::size_t column_idx = 0; column_idx < columns.size(); column_idx++) {
+    if (deferred.defers(column_idx)) { continue; }
     auto const target    = targets[column_idx];
     auto const actual    = columns[column_idx]->type();
     auto const restoring = can_restore_to(actual, target);
@@ -350,24 +381,17 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
   auto const wants_survivors = !deferred_output().empty();
   auto materialized_table    = _ingestible->materialize_table(*scan_input, stream);
   if (materialized_table.state != filter_state::ROW_FILTERED_AND_PROJECTED) {
-    output_table = _ingestible->post_filter_and_project(
-      std::move(materialized_table), *mem_space, stream, wants_survivors ? &survivors : nullptr);
+    // Elide the deferred columns from the projection: realizing the batch would
+    // copy values this scan is about to replace with a rowid.
+    output_table = _ingestible->post_filter_and_project(std::move(materialized_table),
+                                                        *mem_space,
+                                                        stream,
+                                                        wants_survivors ? &survivors : nullptr,
+                                                        deferred_output().output_positions);
   } else {
     output_table = materialized_table.table.release(stream, mem_space->get_default_allocator());
   }
 
-  // Cast each batch column to its planned carrier. A resident chunk is normalized even without a
-  // sidecar: it may be stored narrow (pinned with the feature on, queried with it off) and must
-  // then restore to native.
-  auto const has_explicit_physical_schema = has_physical_overrides();
-  if (has_explicit_physical_schema || scan_input->is_resident()) {
-    output_table = normalize_physical_schema(std::move(output_table),
-                                             normalization_targets(),
-                                             has_explicit_physical_schema,
-                                             _compressed_materialization_observer,
-                                             stream,
-                                             mem_space->get_default_allocator());
-  }
   // Late materialization, producing half. Installed only where a served batch is
   // one pinned chunk's whole row span, so a batch arriving here without an
   // origin means the install-time conditions and the serve-time stamping have
@@ -385,8 +409,24 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
                                                deferred_output(),
                                                *scan_input->origin,
                                                survivor_view ? &*survivor_view : nullptr,
+                                               this->types.size(),
                                                stream,
                                                mem_space->get_default_allocator());
+  }
+
+  // Cast each batch column to its planned carrier. A resident chunk is normalized even without a
+  // sidecar: it may be stored narrow (pinned with the feature on, queried with it off) and must
+  // then restore to native. AFTER substitution: the deferred positions then hold a rowid and
+  // placeholders, which it skips, and the elided columns are back so the arity check holds.
+  auto const has_explicit_physical_schema = has_physical_overrides();
+  if (has_explicit_physical_schema || scan_input->is_resident()) {
+    output_table = normalize_physical_schema(std::move(output_table),
+                                             normalization_targets(),
+                                             has_explicit_physical_schema,
+                                             deferred_output(),
+                                             _compressed_materialization_observer,
+                                             stream,
+                                             mem_space->get_default_allocator());
   }
 
   auto batch =

@@ -299,7 +299,8 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     filtered_table&& table,
     const cucascade::memory::memory_space& mem_space,
     rmm::cuda_stream_view stream,
-    std::unique_ptr<cudf::column>* survivors = nullptr) override;
+    std::unique_ptr<cudf::column>* survivors = nullptr,
+    std::span<std::size_t const> elided      = {}) override;
 
   [[nodiscard]] const ingestible_table_info& table_info() const noexcept override { return *_info; }
 

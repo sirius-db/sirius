@@ -123,10 +123,12 @@ class stub_ingestible final : public sirius::op::scan::gpu_ingestible {
 
   explicit stub_ingestible(table_factory produce) : _produce(std::move(produce)) {}
 
-  std::unique_ptr<cudf::table> post_filter_and_project(sirius::op::scan::filtered_table&&,
-                                                       const cucascade::memory::memory_space&,
-                                                       rmm::cuda_stream_view,
-                                                       std::unique_ptr<cudf::column>*) override
+  std::unique_ptr<cudf::table> post_filter_and_project(
+    sirius::op::scan::filtered_table&&,
+    const cucascade::memory::memory_space&,
+    rmm::cuda_stream_view,
+    std::unique_ptr<cudf::column>*,
+    std::span<std::size_t const> /*elided*/) override
   {
     return _produce();
   }
