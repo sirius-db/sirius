@@ -3610,3 +3610,52 @@ fn constant_key_join_indexes_past_the_synthetic_keys() {
         .collect();
     assert_eq!(operands, vec![2, 4]);
 }
+
+/// `SELECT * FROM a, b` — a nested-loop join with no conjuncts at all. This is the shape the PR
+/// exists to accept, and it takes the one branch the conjunct-carrying tests never reach: no
+/// filter is emitted, so the projection is the root's direct input.
+#[test]
+fn bare_cross_join_translates_to_constant_key_join() {
+    let join = nestloop_join_node(TJoinOp::CROSS_JOIN, Vec::new());
+    let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+    let translated =
+        translate_fragment(&params(Some(plan), Some(asymmetric_join_desc()), None)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["a", "a2", "b"]);
+    let rel::RelType::Project(project) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the output projection directly under the root, with no filter");
+    };
+    assert!(project.expressions.is_empty());
+    assert_eq!(emit_mapping(project.common.as_ref()), vec![0, 1, 3]);
+
+    let rel::RelType::Join(join) = project.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected constant-key join under projection");
+    };
+    assert_eq!(
+        join.r#type,
+        substrait::proto::join_rel::JoinType::Inner as i32
+    );
+    // Both operands are the appended literal keys, so the join is a Cartesian product expressed
+    // as an equality the GPU planner accepts.
+    let expression::RexType::ScalarFunction(condition) =
+        join.expression.as_ref().unwrap().rex_type.as_ref().unwrap()
+    else {
+        panic!("expected a scalar-function join condition");
+    };
+    let operands: Vec<_> = condition
+        .arguments
+        .iter()
+        .map(|arg| {
+            let substrait::proto::function_argument::ArgType::Value(expr) =
+                arg.arg_type.as_ref().unwrap()
+            else {
+                panic!("expected a value argument");
+            };
+            field_index(expr)
+        })
+        .collect();
+    assert_eq!(operands, vec![2, 4]);
+}
