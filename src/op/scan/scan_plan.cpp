@@ -246,10 +246,6 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
   std::unordered_set<std::size_t> seen_primary_indices;
   std::unordered_map<std::size_t, std::size_t> primary_to_batch;  // P → D
 
-  // C → output-position map; filled as output entries are appended (see field doc). Sized to
-  // column_ids; positions that never produce output keep the sentinel.
-  plan.output_position_by_column_id.assign(column_ids.size(), scan_plan::no_output_position);
-
   auto handle_position = [&](std::size_t column_ids_pos, bool is_output) {
     auto const primary_idx = column_ids.at(column_ids_pos).GetPrimaryIndex();
     if (duckdb::IsVirtualColumn(primary_idx)) { return; }
@@ -265,7 +261,6 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
       auto const partition_cols_idx = plan.partition_columns.size();
       plan.partition_columns.push_back(scan_plan::partition_column{
         primary_idx, names.at(primary_idx), returned_types.at(primary_idx)});
-      plan.output_position_by_column_id[column_ids_pos] = plan.output_layout.size();
       plan.output_layout.push_back(
         scan_plan::output_entry{scan_plan::output_entry::PARTITION, partition_cols_idx});
     } else {
@@ -279,7 +274,6 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
       plan.data_columns.push_back(scan_plan::data_column{primary_idx, std::move(col_name)});
       primary_to_batch[primary_idx] = batch_idx;
       if (is_output) {
-        plan.output_position_by_column_id[column_ids_pos] = plan.output_layout.size();
         plan.output_layout.push_back(
           scan_plan::output_entry{scan_plan::output_entry::DATA, batch_idx});
       }

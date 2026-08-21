@@ -116,7 +116,6 @@ hash_join_test_fixture create_test_hash_join(
     duckdb::vector<duckdb::idx_t>{},  // right_projection_map (empty = all)
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),  // delim_types
     1000,                                                            // estimated_cardinality
-    nullptr,                                                         // pushdown_info
     sirius::config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
     sirius::op::dynamic_filter_publish_plan{},  // dynamic_filter_plan
     hash_partition_bytes);

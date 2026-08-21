@@ -16,18 +16,20 @@
 
 #pragma once
 
-#include <cuda_runtime_api.h>
+namespace duckdb {
+class LogicalOperator;
+}  // namespace duckdb
 
-namespace sirius::op::detail {
+namespace sirius::planner {
 
-/// @brief Resolve a dynamic-filter device argument, treating a negative ID as the current device.
-///
-/// @return The explicit device ID, the current CUDA device, or -1 if CUDA cannot report one.
-[[nodiscard]] inline int resolve_dynamic_filter_device_id(int device_id) noexcept
-{
-  if (device_id >= 0) { return device_id; }
-  int current = -1;
-  return cudaGetDevice(&current) == cudaSuccess ? current : -1;
-}
+/**
+ * @brief Mirrors DuckDB's join-filter test for GET filters, FILTER, TOP_N, or a containing subtree
+ */
+[[nodiscard]] bool build_subtree_is_filtering(duckdb::LogicalOperator const& op);
 
-}  // namespace sirius::op::detail
+/**
+ * @brief Tests for a DELIM_GET or CTE_REF root behind valid single-child projections
+ */
+[[nodiscard]] bool build_relation_is_opaque(duckdb::LogicalOperator const& op);
+
+}  // namespace sirius::planner

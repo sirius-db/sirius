@@ -135,36 +135,6 @@ sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
   duckdb::vector<sirius::join_condition> cond,
   duckdb::JoinType join_type,
   std::size_t estimated_cardinality,
-  duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info_p)
-  : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::NESTED_LOOP_JOIN,
-                                                sirius::from_duckdb_vec(op.types),
-                                                estimated_cardinality),
-    conditions(std::move(cond)),
-    join_type(join_type)
-{
-  reorder_conditions(conditions);
-  children.push_back(std::move(left));
-  children.push_back(std::move(right));
-  auto& lhs_types = children[0]->get_types();
-  auto& rhs_types = children[1]->get_types();
-  left_output_col_idxs.reserve(lhs_types.size());
-  for (std::size_t i = 0; i < lhs_types.size(); i++) {
-    left_output_col_idxs.push_back(i);
-  }
-  right_output_col_idxs.reserve(rhs_types.size());
-  for (std::size_t i = 0; i < rhs_types.size(); i++) {
-    right_output_col_idxs.push_back(i);
-  }
-  filter_pushdown = std::move(pushdown_info_p);
-}
-
-sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
-  duckdb::LogicalOperator& op,
-  duckdb::unique_ptr<sirius_physical_operator> left,
-  duckdb::unique_ptr<sirius_physical_operator> right,
-  duckdb::vector<sirius::join_condition> cond,
-  duckdb::JoinType join_type,
-  std::size_t estimated_cardinality,
   duckdb::vector<std::size_t> left_projection_map,
   duckdb::vector<std::size_t> right_projection_map)
   : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::NESTED_LOOP_JOIN,

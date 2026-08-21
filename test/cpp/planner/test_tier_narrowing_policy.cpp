@@ -31,7 +31,7 @@
 #include "expression/join_condition.hpp"
 #include "expression/value.hpp"
 #include "helper/logical_type.hpp"
-#include "op/sirius_dynamic_filter.hpp"
+#include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
@@ -218,12 +218,16 @@ duckdb::unique_ptr<sirius::op::sirius_physical_hash_join> make_hash_join(
   condition.left  = make_reference(0);
   condition.right = make_reference(0);
   conditions.push_back(std::move(condition));
-  return duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(stub,
-                                                                  std::move(left),
-                                                                  std::move(right),
-                                                                  std::move(conditions),
-                                                                  join_type,
-                                                                  /*estimated_cardinality=*/1);
+  return duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
+    stub,
+    std::move(left),
+    std::move(right),
+    std::move(conditions),
+    join_type,
+    /*left_projection_map=*/duckdb::vector<std::size_t>{},
+    /*right_projection_map=*/duckdb::vector<std::size_t>{},
+    /*delim_types=*/duckdb::vector<sirius::logical_type>{},
+    /*estimated_cardinality=*/1);
 }
 
 std::unique_ptr<sirius::ast::node> make_aggregate_expression(uint32_t input_idx,

@@ -23,9 +23,9 @@
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <log/logging.hpp>
+#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/decoded_batch_representation.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
-#include <op/sirius_dynamic_filter.hpp>
 
 #include <algorithm>
 #include <memory>

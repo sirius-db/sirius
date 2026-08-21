@@ -2315,14 +2315,13 @@ static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
                    params->enable_runtime_distinct_build_probe);
 }
 
-static void SetEnableDynamicFilterPushdown(ClientContext& context, SetScope scope, Value& parameter)
+static void SetEnableDynamicFilter(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
   if (!params) { return; }
-  auto slot                              = lock_operator_params_slot(context);
-  params->enable_dynamic_filter_pushdown = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_FILTER_PUSHDOWN to {}",
-                   params->enable_dynamic_filter_pushdown);
+  auto slot                     = lock_operator_params_slot(context);
+  params->enable_dynamic_filter = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_FILTER to {}", params->enable_dynamic_filter);
 }
 
 static void SetEnableDynamicZoneMapFilter(ClientContext& context, SetScope scope, Value& parameter)
@@ -2343,8 +2342,9 @@ static void SetDynamicFilterDomainCoverageThreshold(ClientContext& context,
   if (!params) { return; }
   auto slot              = lock_operator_params_slot(context);
   const double threshold = parameter.GetValue<double>();
-  if (!(threshold > 0.0)) {
-    throw InvalidInputException("dynamic_filter_domain_coverage_threshold must be > 0.0, got %f",
+  if (!sirius::config::valid_domain_coverage_threshold{}(threshold)) {
+    throw InvalidInputException("dynamic_filter_domain_coverage_threshold %s, got %f",
+                                sirius::config::valid_domain_coverage_threshold::description(),
                                 threshold);
   }
   params->dynamic_filter_domain_coverage_threshold = threshold;
@@ -2544,11 +2544,12 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                     SetEnablePinnedZoneMapPruning);
   add_sirius_option(config,
                     option_visibility::internal,
-                    "enable_dynamic_filter_pushdown",
-                    "disable automatic dynamic membership-filter pushdown",
+                    "enable_dynamic_filter",
+                    "disable runtime dynamic-filter discovery for eligible hash joins "
+                    "(probe-side scan and join-edge targets)",
                     LogicalType::BOOLEAN,
-                    Value::BOOLEAN(operator_defaults.enable_dynamic_filter_pushdown),
-                    SetEnableDynamicFilterPushdown);
+                    Value::BOOLEAN(operator_defaults.enable_dynamic_filter),
+                    SetEnableDynamicFilter);
   add_sirius_option(config,
                     option_visibility::internal,
                     "enable_dynamic_zone_map_filter",
@@ -2720,7 +2721,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
   config.AddExtensionOption(
     "dynamic_filter_domain_coverage_threshold",
     "Skip publishing a key's dynamic filters when the hash-join build covers at least this "
-    "fraction of the key's domain; >= 1.0 effectively disables the gate",
+    "fraction of the key's domain; values above 1.0 disable the gate",
     LogicalType::DOUBLE,
     Value::DOUBLE(operator_defaults.dynamic_filter_domain_coverage_threshold),
     SetDynamicFilterDomainCoverageThreshold);

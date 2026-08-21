@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "planner/duckdb_join_filter_candidate_adapter.hpp"
+#include "planner/dynamic_filter/duckdb_join_filter_candidate_adapter.hpp"
 
 #include <duckdb/common/helper.hpp>
 #include <duckdb/common/typedefs.hpp>
@@ -240,63 +240,6 @@ class candidate_builder final {
 
 static_assert(std::numeric_limits<std::size_t>::max() >= std::numeric_limits<duckdb::idx_t>::max(),
               "DuckDB idx_t ordinals must fit in std::size_t without narrowing");
-
-duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> detail::clone_sirius_filter_pushdown_info(
-  duckdb::JoinFilterPushdownInfo const& src)
-{
-  // Clone the Sirius-consumed fields but share every DynamicTableFilterSet. min_max_aggregates is
-  // deliberately omitted: this partial clone must never enter DuckDB physical join execution.
-  auto dst                   = duckdb::make_uniq<duckdb::JoinFilterPushdownInfo>();
-  dst->join_condition        = src.join_condition;
-  dst->build_side_has_filter = src.build_side_has_filter;
-  dst->probe_info.reserve(src.probe_info.size());
-  for (auto const& pi : src.probe_info) {
-    duckdb::JoinFilterPushdownFilter copy_pi;
-    copy_pi.dynamic_filters = pi.dynamic_filters;
-    copy_pi.columns         = pi.columns;
-    dst->probe_info.push_back(std::move(copy_pi));
-  }
-  return dst;
-}
-
-namespace {
-
-bool structurally_aligned(duckdb::LogicalOperator const& a, duckdb::LogicalOperator const& b)
-{
-  if (a.type != b.type || a.children.size() != b.children.size()) { return false; }
-  for (std::size_t i = 0; i < a.children.size(); ++i) {
-    if (!structurally_aligned(*a.children[i], *b.children[i])) { return false; }
-  }
-  return true;
-}
-
-void preserve_aligned(duckdb::LogicalOperator const& original, duckdb::LogicalOperator& copy)
-{
-  if (original.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
-    auto const& o = original.Cast<duckdb::LogicalGet>();
-    auto& c       = copy.Cast<duckdb::LogicalGet>();
-    if (o.dynamic_filters) { c.dynamic_filters = o.dynamic_filters; }
-  } else if (original.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-    auto const& o = original.Cast<duckdb::LogicalComparisonJoin>();
-    auto& c       = copy.Cast<duckdb::LogicalComparisonJoin>();
-    if (o.filter_pushdown) {
-      c.filter_pushdown = detail::clone_sirius_filter_pushdown_info(*o.filter_pushdown);
-    }
-  }
-  for (std::size_t i = 0; i < original.children.size(); ++i) {
-    preserve_aligned(*original.children[i], *copy.children[i]);
-  }
-}
-
-}  // namespace
-
-void preserve_dynamic_filter_metadata(duckdb::LogicalOperator const& original,
-                                      duckdb::LogicalOperator& copy)
-{
-  // Check the complete pair before copying anything so preservation is all-or-nothing.
-  if (!structurally_aligned(original, copy)) { return; }
-  preserve_aligned(original, copy);
-}
 
 duckdb_join_filter_candidate extract(duckdb::LogicalComparisonJoin const& op)
 {

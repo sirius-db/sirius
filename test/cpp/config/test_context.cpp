@@ -224,7 +224,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     duckdb::Connection con(db);
     REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 0);
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 0);
-    REQUIRE(setting_count(con, "enable_dynamic_filter_pushdown") == 0);
+    REQUIRE(setting_count(con, "enable_dynamic_filter") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 0);
     REQUIRE(setting_count(con, "scan_task_batch_size") == 0);
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 0);
@@ -236,7 +236,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     result = con.Query("SET enable_pinned_zone_map_pruning = false");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
-    result = con.Query("SET enable_dynamic_filter_pushdown = false");
+    result = con.Query("SET enable_dynamic_filter = false");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
     result = con.Query("SET enable_dynamic_zone_map_filter = true");
@@ -262,7 +262,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     duckdb::Connection con(db);
     REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 0);
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 0);
-    REQUIRE(setting_count(con, "enable_dynamic_filter_pushdown") == 0);
+    REQUIRE(setting_count(con, "enable_dynamic_filter") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 0);
     REQUIRE(setting_count(con, "scan_task_batch_size") == 0);
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 0);
@@ -276,7 +276,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     duckdb::Connection con(db);
     REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 1);
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 1);
-    REQUIRE(setting_count(con, "enable_dynamic_filter_pushdown") == 1);
+    REQUIRE(setting_count(con, "enable_dynamic_filter") == 1);
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 1);
     REQUIRE(setting_count(con, "scan_task_batch_size") == 1);
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 1);
@@ -291,10 +291,10 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     result = con.Query("RESET enable_pinned_zone_map_pruning");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
-    result = con.Query("SET enable_dynamic_filter_pushdown = false");
+    result = con.Query("SET enable_dynamic_filter = false");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
-    result = con.Query("RESET enable_dynamic_filter_pushdown");
+    result = con.Query("RESET enable_dynamic_filter");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     result = con.Query("SET enable_dynamic_zone_map_filter = true");
@@ -1092,7 +1092,7 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
       current_setting('max_build_hash_table_bytes')::UBIGINT,
       current_setting('max_broadcast_join_size')::UBIGINT,
       current_setting('mark_join_build_switch_ratio')::DOUBLE,
-      current_setting('enable_dynamic_filter_pushdown')::BOOLEAN,
+      current_setting('enable_dynamic_filter')::BOOLEAN,
       current_setting('enable_dynamic_zone_map_filter')::BOOLEAN,
       current_setting('dynamic_filter_domain_coverage_threshold')::DOUBLE,
       current_setting('dynamic_filter_keep_threshold')::DOUBLE,
@@ -1146,7 +1146,8 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(invalid_domain_threshold != nullptr);
   REQUIRE(invalid_domain_threshold->HasError());
   REQUIRE_THAT(invalid_domain_threshold->GetError(),
-               Catch::Contains("dynamic_filter_domain_coverage_threshold must be > 0.0"));
+               Catch::Contains(
+                 "dynamic_filter_domain_coverage_threshold must be finite and greater than 0.0"));
   REQUIRE(sirius_ctx->get_config().get_operator_params().dynamic_filter_domain_coverage_threshold ==
           Approx(0.8));
 
@@ -1220,8 +1221,8 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   require_ok("RESET scan_task_batch_size");
   require_ok("SET max_sort_partition_memory_fraction = 0.9");
   require_ok("RESET max_sort_partition_memory_fraction");
-  require_ok("SET enable_dynamic_filter_pushdown = true");
-  require_ok("RESET enable_dynamic_filter_pushdown");
+  require_ok("SET enable_dynamic_filter = true");
+  require_ok("RESET enable_dynamic_filter");
   require_ok("SET dynamic_filter_domain_coverage_threshold = 1.5");
   require_ok("RESET dynamic_filter_domain_coverage_threshold");
   require_ok("SET dynamic_filter_keep_threshold = 0.0");
@@ -1246,7 +1247,7 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
     SELECT
       current_setting('scan_task_batch_size')::UBIGINT,
       current_setting('max_sort_partition_memory_fraction')::DOUBLE,
-      current_setting('enable_dynamic_filter_pushdown')::BOOLEAN,
+      current_setting('enable_dynamic_filter')::BOOLEAN,
       current_setting('pin_table_compression')::BOOLEAN,
       current_setting('pin_table_compression_max_compressed_fraction')::DOUBLE
   )");
@@ -1261,7 +1262,7 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   auto const& params = sirius_ctx->get_config().get_operator_params();
   REQUIRE(params.scan_task_batch_size == 1 * mib);
   REQUIRE(params.max_sort_partition_memory_fraction == Approx(0.25));
-  REQUIRE_FALSE(params.enable_dynamic_filter_pushdown);
+  REQUIRE_FALSE(params.enable_dynamic_filter);
   auto const& compression = sirius_ctx->get_config().get_compression_config();
   REQUIRE(compression.enable_pin_table_compression);
   REQUIRE(compression.max_compressed_fraction == Approx(0.6));
