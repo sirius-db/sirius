@@ -21,6 +21,7 @@
 #include "downgrade/downgrade_executor.hpp"
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/dynamic_filter/dynamic_filter_stats.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "planner/query.hpp"
@@ -545,6 +546,16 @@ class SiriusContext : public ClientContextState {
   /// \brief Snapshot counters for transparent execution observability.
   [[nodiscard]] transparent_execution_stats get_transparent_execution_stats() const noexcept;
 
+  [[nodiscard]] sirius::op::dynamic_filter_stats& get_dynamic_filter_stats() noexcept
+  {
+    return dynamic_filter_stats_;
+  }
+  [[nodiscard]] sirius::op::dynamic_filter_stats_snapshot get_dynamic_filter_stats_snapshot()
+    const noexcept
+  {
+    return dynamic_filter_stats_.snapshot();
+  }
+
   /// \brief Record a successful transparent rebind to Sirius.
   void record_transparent_rebind_success() noexcept;
 
@@ -683,6 +694,7 @@ class SiriusContext : public ClientContextState {
   std::unique_ptr<sirius::scan_manager::sirius_scan_manager> scan_manager_;
   duckdb::shared_ptr<sirius::planner::query> query_;
 
+  sirius::op::dynamic_filter_stats dynamic_filter_stats_;
   std::atomic<uint64_t> transparent_rebind_success_count_{0};
   std::atomic<uint64_t> transparent_fallback_count_{0};
   std::atomic<uint64_t> transparent_execution_count_{0};

@@ -124,46 +124,24 @@ TEST_CASE("sirius_config accepts a zero admission_bytes_per_gpu", "[topology_con
   CHECK(cfg.get_operator_params().admission_bytes_per_gpu == 0);
 }
 
-TEST_CASE("sirius_config bounds clustered_bypass_max_overlap_fraction to [0, 1]",
-          "[clustered_merge_bypass][config]")
+TEST_CASE("sirius_config accepts merge and pinning diagnostic YAML controls", "[config]")
 {
-  // The knob is a fraction of the smaller batch's key span; values outside [0, 1] have no
-  // reading. The endpoints are meaningful: 0 admits only the absolute-floor overlap, 1 admits
-  // any adjacent overlap (the disjointedness structure still gates correctness either way).
-  auto config_text = [](std::string const& value) {
-    return "sirius:\n"
-           "  operator_params:\n"
-           "    clustered_bypass_max_overlap_fraction: " +
-           value + "\n";
-  };
+  sirius::operator_params defaults;
+  CHECK_FALSE(defaults.enable_disjoint_groupby_passthrough);
+  CHECK(defaults.enable_sorted_groupby_hint);
+  CHECK(defaults.sorted_groupby_hint_min_rows == (1ULL << 20));
+  CHECK(defaults.pin_table_natural_file_order);
 
-  SECTION("rejects a negative fraction")
-  {
-    scoped_yaml yaml("sirius_bypass_overlap_negative.yaml", config_text("-0.1"));
-    sirius::sirius_config cfg;
-    CHECK_THROWS(cfg.load_from_file(yaml.path));
-  }
+  scoped_yaml yaml("sirius_merge_pinning_diagnostics.yaml",
+                   "sirius:\n  operator_params:\n    enable_disjoint_groupby_passthrough: true\n   "
+                   " enable_sorted_groupby_hint: false\n    sorted_groupby_hint_min_rows: 17\n    "
+                   "pin_table_natural_file_order: false\n");
 
-  SECTION("rejects a fraction above one")
-  {
-    scoped_yaml yaml("sirius_bypass_overlap_above_one.yaml", config_text("1.5"));
-    sirius::sirius_config cfg;
-    CHECK_THROWS(cfg.load_from_file(yaml.path));
-  }
-
-  SECTION("accepts the zero endpoint")
-  {
-    scoped_yaml yaml("sirius_bypass_overlap_zero.yaml", config_text("0"));
-    sirius::sirius_config cfg;
-    REQUIRE_NOTHROW(cfg.load_from_file(yaml.path));
-    CHECK(cfg.get_operator_params().clustered_bypass_max_overlap_fraction == 0.0);
-  }
-
-  SECTION("accepts the one endpoint")
-  {
-    scoped_yaml yaml("sirius_bypass_overlap_one.yaml", config_text("1"));
-    sirius::sirius_config cfg;
-    REQUIRE_NOTHROW(cfg.load_from_file(yaml.path));
-    CHECK(cfg.get_operator_params().clustered_bypass_max_overlap_fraction == 1.0);
-  }
+  sirius::sirius_config cfg;
+  REQUIRE_NOTHROW(cfg.load_from_file(yaml.path));
+  auto const& params = cfg.get_operator_params();
+  CHECK(params.enable_disjoint_groupby_passthrough);
+  CHECK_FALSE(params.enable_sorted_groupby_hint);
+  CHECK(params.sorted_groupby_hint_min_rows == 17);
+  CHECK_FALSE(params.pin_table_natural_file_order);
 }

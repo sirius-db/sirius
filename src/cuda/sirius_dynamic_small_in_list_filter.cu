@@ -16,11 +16,11 @@
 
 // sirius
 #include <log/logging.hpp>
-#include <op/dynamic_filter_device.hpp>
-#include <op/dynamic_filter_replica_reservation.hpp>
-#include <op/dynamic_filter_replica_space.hpp>
-#include <op/dynamic_filter_replica_transfer.hpp>
-#include <op/sirius_dynamic_filter.hpp>
+#include <op/dynamic_filter/dynamic_filter_device.hpp>
+#include <op/dynamic_filter/dynamic_filter_replica_reservation.hpp>
+#include <op/dynamic_filter/dynamic_filter_replica_space.hpp>
+#include <op/dynamic_filter/dynamic_filter_replica_transfer.hpp>
+#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 
 // cudf
 #include <cudf/column/column.hpp>

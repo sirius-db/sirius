@@ -27,14 +27,12 @@
 #include "duckdb/storage/data_table.hpp"
 #include "expression/ast/node.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
-#include "op/aggregate/clustered_merge_bypass.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 
 #include <memory>
 #include <numeric>
-#include <optional>
 
 namespace sirius {
 namespace planner {
@@ -144,54 +142,19 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
-  // --- Clustered merge bypass (see op/aggregate/clustered_merge_bypass.hpp for the proof) ---
-
-  //! Configure the bypass knobs. Stamped from operator_params at plan time; the operator
-  //! default is OFF so unstamped construction paths keep the normal merge.
-  void set_clustered_bypass_params(bool enabled, double max_overlap_fraction) noexcept
+  //! Enable the merge-local strict-disjoint passthrough. The operator default is off so only
+  //! plan-generator-stamped instances can take the optimization.
+  void set_disjoint_groupby_passthrough(bool enabled) noexcept
   {
-    _clustered_bypass_enabled              = enabled;
-    _clustered_bypass_max_overlap_fraction = max_overlap_fraction;
+    _enable_disjoint_groupby_passthrough = enabled;
   }
-
-  //! The predicate of the FILTER directly above this merge (non-owning; the filter operator
-  //! outlives the plan). Stamped by the plan generator when the merge's tree parent is a FILTER;
-  //! unit tests may stamp it directly. Required for the bypass: without a downstream filter to
-  //! push into the partials, skipping the merge would not remove any work.
-  void set_clustered_bypass_filter(const sirius::ast::node* filter_expression) noexcept
-  {
-    _bypass_filter_expression = filter_expression;
-  }
-
-  //! Static eligibility (knob + plan shape) checked before spending GPU time on the range proof:
-  //! single GPU, a stamped downstream filter, no AVG / COUNT(DISTINCT) post-processing (their
-  //! partial schema differs from the merge output schema, so the filter predicate could not be
-  //! evaluated on partial rows), no grouping sets, and only merge combines that are identities
-  //! on singletons (SUM/MIN/MAX/COUNT — required by the bypass proof).
-  [[nodiscard]] bool clustered_bypass_wanted() const;
-
-  //! Run the runtime range proof over the partial batches waiting on the upstream PARTITION's
-  //! port and arm the bypass when it succeeds. Called by the PARTITION at sizing time, before
-  //! get_partition_strategy. Returns whether the bypass was armed.
-  bool try_plan_clustered_bypass(
-    const std::vector<std::shared_ptr<::cucascade::data_batch>>& batches);
-
-  //! Whether the bypass is armed (for tests / logging). Locks the operator mutex (same lock
-  //! the arming write takes), hence non-const.
-  [[nodiscard]] bool clustered_bypass_armed();
 
  private:
   friend class sirius::planner::sirius_physical_plan_generator;
   void set_fuse_into_parent(bool fuse) noexcept { _fuse_into_parent = fuse; }
 
-  bool _fuse_into_parent = false;
-
-  //! Clustered merge bypass state. The plan is written once at partition-sizing time (under
-  //! `lock`) and read by the single merge task that sizing produces.
-  bool _clustered_bypass_enabled                     = false;
-  double _clustered_bypass_max_overlap_fraction      = 0.0;
-  const sirius::ast::node* _bypass_filter_expression = nullptr;
-  std::optional<clustered_bypass::plan> _bypass_plan;
+  bool _fuse_into_parent                    = false;
+  bool _enable_disjoint_groupby_passthrough = false;
 };
 
 }  // namespace op

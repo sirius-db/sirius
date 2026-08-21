@@ -295,23 +295,6 @@ void sirius_physical_partition::sink(const operator_data& input_data, rmm::cuda_
   }
 }
 
-std::vector<std::shared_ptr<cucascade::data_batch>>
-sirius_physical_partition::collect_input_batches()
-{
-  if (ports.find("default") == ports.end()) {
-    throw std::runtime_error(
-      "sirius_physical_partition::collect_input_batches() did not find default repo for id " +
-      std::to_string(this->get_operator_id()));
-  }
-  auto& repo = ports.at("default")->repo;
-  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
-  for (auto batch_id : repo->get_batch_ids(0)) {
-    auto batch = repo->get_data_batch_by_id(batch_id, 0);
-    if (batch) { batches.push_back(std::move(batch)); }
-  }
-  return batches;
-}
-
 uint64_t sirius_physical_partition::compute_total_bytes()
 {
   if (ports.find("default") == ports.end()) {
@@ -491,21 +474,6 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
   } else {
     std::lock_guard<std::mutex> guard(lock);
     if (!_num_partitions.has_value()) {
-      // Clustered merge bypass probe: a group-by PARTITION runs in its own pipeline whose child
-      // meta-pipeline (the local aggregate) must finish first, so at sizing time EVERY partial
-      // batch is already on this port. Hand them to the merge for the runtime range proof; when
-      // it arms, get_partition_strategy below returns one partition and execute() forwards the
-      // partials zero-copy instead of hash-partitioning them.
-      if (auto* merge = dynamic_cast<sirius_physical_grouped_aggregate_merge*>(consumer);
-          merge != nullptr) {
-        bool const wanted = merge->clustered_bypass_wanted();
-        bool armed        = false;
-        if (wanted) { armed = merge->try_plan_clustered_bypass(collect_input_batches()); }
-        SIRIUS_LOG_DEBUG("clustered_bypass probe at partition id {}: wanted={} armed={}",
-                         this->get_operator_id(),
-                         wanted,
-                         armed);
-      }
       partition_sizing_input const in{compute_total_bytes(),
                                       _is_build,
                                       /*build_foldable=*/false};

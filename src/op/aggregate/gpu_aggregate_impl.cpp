@@ -339,9 +339,9 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
     if (cudf::is_sorted(
           cudf::table_view(group_cols), key_column_order, key_null_precedence, stream)) {
       keys_presorted = cudf::sorted::YES;
-      SIRIUS_LOG_INFO("local_grouped_agg: sorted-groupby hint engaged (rows={}, key_cols={})",
-                      input_table.num_rows(),
-                      group_cols.size());
+      SIRIUS_LOG_DEBUG("local_grouped_agg: sorted-groupby hint engaged (rows={}, key_cols={})",
+                       input_table.num_rows(),
+                       group_cols.size());
     } else {
       key_column_order.clear();
       key_null_precedence.clear();

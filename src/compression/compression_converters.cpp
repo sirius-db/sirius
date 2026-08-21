@@ -17,6 +17,7 @@
 #include "compression_converters.hpp"
 
 #include "compressed_representation.hpp"
+#include "compressed_scan.hpp"
 #include "device_compressed_blob.hpp"
 
 #include <cudf/column/column.hpp>
@@ -35,12 +36,15 @@
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <log/logging.hpp>
+#include <op/scan/decoded_batch_representation.hpp>
 
-#include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <numeric>
 #include <optional>
+#include <span>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -48,24 +52,11 @@ namespace sirius {
 
 namespace {
 
-// Thread-local pool of 4 CUDA streams for cross-column decode parallelism.
-// Work is submitted from the calling thread so cuCascade memory-reservation
-// tracking (attached to the calling thread) sees all allocations.
-// 4 is not a configuration parameter — it matches the typical SM occupancy
-// sweet spot for column-parallel decode without thread-spawn overhead.
-simpatico::stream_pool& decode_pool()
-{
-  thread_local simpatico::stream_pool pool;
-  if (pool.streams.empty()) {
-    if (!pool.init(4)) throw std::runtime_error("[compression_converters] stream_pool init failed");
-  }
-  return pool;
-}
-
 // Rebind a column's buffers (recursively) to `s` for ordered teardown.
-// Pool streams are long-lived (thread-local), but the caller's pipeline stream
-// `s` is what orders the rest of the work downstream — re-pointing frees here
-// ensures deallocation is not racing concurrent pipeline operations on `s`.
+// The decode's stream pool is long-lived (thread-local), but the caller's
+// pipeline stream `s` is what orders the rest of the work downstream —
+// re-pointing frees here ensures deallocation is not racing concurrent pipeline
+// operations on `s`.
 std::unique_ptr<cudf::column> rebind_column_stream(std::unique_ptr<cudf::column> col,
                                                    rmm::cuda_stream_view s)
 {
@@ -87,27 +78,6 @@ std::unique_ptr<cudf::column> rebind_column_stream(std::unique_ptr<cudf::column>
     type, size, std::move(*contents.data), std::move(null_mask), nc, std::move(children));
 }
 
-// Translate the representation's string-only pushdown into simpatico's decode
-// directives, padded to `count` so it lines up 1:1 with the columns being
-// decompressed. Returns empty when nothing is pushed down, which lets callers
-// stay on the plain decompress overload.
-std::vector<simpatico::decode_predicate> to_decode_predicates(
-  decode_equality_pushdown const& pushdown, std::size_t count)
-{
-  bool const any =
-    std::any_of(pushdown.begin(), pushdown.end(), [](auto const& v) { return !v.empty(); });
-  if (!any) { return {}; }
-  if (pushdown.size() > count) {
-    throw std::runtime_error(
-      "[compression_converters] equality pushdown wider than the projection");
-  }
-  std::vector<simpatico::decode_predicate> predicates(count);
-  for (std::size_t i = 0; i < pushdown.size(); ++i) {
-    predicates[i].equals_any = pushdown[i];
-  }
-  return predicates;
-}
-
 // Reconstruct + project + decompress a compressed_table into a GPU table
 // representation. Shared by the host and device compression converters — only
 // the byte transport (how `fetch` pulls the payload) differs between them.
@@ -115,7 +85,7 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   std::span<const std::uint8_t> header,
   simpatico::payload_fetch_fn const& fetch,
   const std::optional<std::vector<std::size_t>>& selected_indices,
-  decode_equality_pushdown const& equality_pushdown,
+  decompression_pushdown_scan const* scan,
   cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
   rmm::cuda_stream_view stream)
@@ -145,20 +115,14 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   // threads are spawned. The H2D fetch above ran on `stream`; sync it first so
   // pool-stream reads are ordered after all fetched bytes are resident.
   stream.synchronize();
-  auto& pool    = decode_pool();
   auto const mr = rmm::mr::get_current_device_resource_ref();
-  // `subset` already holds only the projected columns, so the pushdown — which
-  // is indexed by projected position — lines up with 0..num_columns.
-  auto const predicates =
-    to_decode_predicates(equality_pushdown, static_cast<std::size_t>(subset.num_columns()));
-  std::unique_ptr<cudf::table> decompressed;
-  if (predicates.empty()) {
-    decompressed = simpatico::decompress(subset, pool, mr);
-  } else {
-    std::vector<std::size_t> all(subset.num_columns());
-    std::iota(all.begin(), all.end(), std::size_t{0});
-    decompressed = simpatico::decompress(subset, all, predicates, pool, mr);
-  }
+  // `subset` already holds only the projected columns, so the scan's request —
+  // which is indexed by projected position — lines up with 0..num_columns.
+  std::vector<std::size_t> selection(subset.num_columns());
+  std::iota(selection.begin(), selection.end(), std::size_t{0});
+  auto decoded      = decompress_chunk(subset, selection, scan, stream, mr);
+  auto decompressed = std::move(decoded.table);
+
   // Re-point decoded buffers onto `stream` so pipeline teardown is ordered.
   auto cols = decompressed->release();
   for (auto& c : cols)
@@ -173,6 +137,17 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
                    decompressed->num_rows(),
                    space->get_device_id());
 
+  // What the decode did is a value on the representation when there is
+  // anything to report; the plain type is used otherwise, so an unfiltered
+  // decode is byte-identical to what it always was.
+  auto const& outcome = decoded.outcome;
+  if (outcome.any()) {
+    return std::make_unique<decompression_pushdown_batch_representation>(
+      std::move(decompressed),
+      *const_cast<cucascade::memory::memory_space*>(space),
+      stream,
+      outcome);
+  }
   return std::make_unique<cucascade::gpu_table_representation>(
     std::move(decompressed), *const_cast<cucascade::memory::memory_space*>(space), stream);
 }
@@ -198,7 +173,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
   return reconstruct_and_decompress_to_gpu(rep.header(),
                                            fetch,
                                            rep.selected_indices(),
-                                           rep.equality_pushdown(),
+                                           rep.pushdown_scan().get(),
                                            source,
                                            target_memory_space,
                                            stream);
@@ -218,24 +193,23 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
   auto const& indices = rep.selected_indices();
   auto const& ct      = rep.table();
   auto const mr       = rmm::mr::get_current_device_resource_ref();
-  auto& pool          = decode_pool();
 
-  // Projected column count — what the pushdown is indexed by.
+  // Projected column count — what the scan's request is indexed by.
   auto const n_selected =
     indices.has_value() ? indices->size() : static_cast<std::size_t>(ct.num_columns());
-  auto const predicates = to_decode_predicates(rep.equality_pushdown(), n_selected);
-
-  std::unique_ptr<cudf::table> decompressed;
-  if (predicates.empty()) {
-    decompressed = indices.has_value() ? simpatico::decompress(ct, *indices, pool, mr)
-                                       : simpatico::decompress(ct, pool, mr);
-  } else if (indices.has_value()) {
-    decompressed = simpatico::decompress(ct, *indices, predicates, pool, mr);
+  std::vector<std::size_t> identity_selection;
+  std::span<const std::size_t> selected;
+  if (indices.has_value()) {
+    selected = *indices;
   } else {
-    std::vector<std::size_t> all(n_selected);
-    std::iota(all.begin(), all.end(), std::size_t{0});
-    decompressed = simpatico::decompress(ct, all, predicates, pool, mr);
+    identity_selection.resize(n_selected);
+    std::iota(identity_selection.begin(), identity_selection.end(), std::size_t{0});
+    selected = identity_selection;
   }
+
+  auto decoded      = decompress_chunk(ct, selected, rep.pushdown_scan().get(), stream, mr);
+  auto decompressed = std::move(decoded.table);
+
   auto cols = decompressed->release();
   for (auto& c : cols)
     c = rebind_column_stream(std::move(c), stream);
@@ -249,6 +223,16 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
                    decompressed->num_rows(),
                    space->get_device_id());
 
+  // What the decode did is a value on the representation when there is
+  // anything to report; the plain type is used otherwise.
+  auto const& outcome = decoded.outcome;
+  if (outcome.any()) {
+    return std::make_unique<decompression_pushdown_batch_representation>(
+      std::move(decompressed),
+      *const_cast<cucascade::memory::memory_space*>(space),
+      stream,
+      outcome);
+  }
   return std::make_unique<cucascade::gpu_table_representation>(
     std::move(decompressed), *const_cast<cucascade::memory::memory_space*>(space), stream);
 }

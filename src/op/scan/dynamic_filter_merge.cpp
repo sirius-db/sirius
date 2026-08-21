@@ -22,7 +22,7 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <log/logging.hpp>
-#include <op/dynamic_filter_device.hpp>
+#include <op/dynamic_filter/dynamic_filter_device.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
 
 #include <algorithm>
@@ -76,8 +76,6 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   auto const num_cols = static_cast<std::size_t>(input.num_columns());
   auto const mr       = cudf::get_current_device_resource_ref();
 
-  // Filters apply as a CASCADE, most-selective-first (for membership filters) and AND-merge (for
-  // AST-lowerable filters).
   std::unique_ptr<cudf::table> owned;  // most recent step's product backing `current`
   cudf::table_view current = input;
   auto const cascade_step  = [&](std::unique_ptr<cudf::column> mask) -> double {
@@ -90,8 +88,6 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
 
   auto const include_ast_masks = mode == dynamic_filter_apply_mode::include_ast_row_masks;
 
-  // (1) AST-lowerable filters (zone-maps) -> one conjoined predicate via compute_column. Skipped
-  // in membership_masks_only mode, where they are already used for row-group pruning at read.
   if (include_ast_masks) {
     cudf::ast::tree tree;
     cudf::ast::expression const* root = nullptr;
@@ -113,21 +109,19 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
       }
     }
     if (root) {
-      // Because AST-lowering is cross-column, we don't have a per-column keep ratio to gate on.
-      // Ignore it.
+      // Cross-column AST masks update only the scan-level gate.
       (void)cascade_step(cudf::compute_column(current, *root, stream, mr));
     }
   }
 
-  // (2) Mask-applicable filters (IN-list / bloom membership). Order by recorded marginal keep
-  // ratio (unmeasured filters last, where the cascade has already shrunk the row count, so their
-  // first measurement is cheap); drop filters the gate has marked as not worth their kernel.
   struct membership_entry {
     std::size_t col_idx;
     sirius::op::sirius_mask_applicable const* filter;
     sirius::op::sirius_dynamic_filter const* identity;
     std::optional<double> recorded;
   };
+  // Use one filter-count snapshot for every gate measurement in this pass.
+  auto const observed_filter_count = filters.filter_count();
   std::vector<membership_entry> entries;
   for (auto const col_idx : filters.filtered_columns()) {
     if (col_idx >= num_cols) { continue; }
@@ -135,7 +129,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
       if (!f->is_available_on_device(device_id)) { continue; }
       auto const* applicable = dynamic_cast<sirius::op::sirius_mask_applicable const*>(f.get());
       if (!applicable) { continue; }
-      auto recorded = gate ? gate->filter_keep_ratio(f.get()) : std::nullopt;
+      auto recorded = gate ? gate->filter_keep_ratio(f.get(), observed_filter_count) : std::nullopt;
       if (recorded && dynamic_filter_gate::filter_skippable(*recorded)) { continue; }
       entries.push_back({col_idx, applicable, f.get(), recorded});
     }
@@ -148,7 +142,9 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
     if (current.num_rows() == 0) { break; }
     auto const& probe = current.column(static_cast<cudf::size_type>(e.col_idx));
     auto const kept   = cascade_step(e.filter->compute_mask(probe, device_id, stream, mr));
-    if (gate && !e.recorded) { gate->record_filter_keep_ratio(e.identity, kept); }
+    if (gate && !e.recorded) {
+      gate->record_filter_keep_ratio(e.identity, kept, observed_filter_count);
+    }
   }
 
   if (!owned) { return nullptr; }
@@ -164,23 +160,36 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
 }
 
 std::optional<double> dynamic_filter_gate::filter_keep_ratio(
-  sirius::op::sirius_dynamic_filter const* filter) const
+  sirius::op::sirius_dynamic_filter const* filter, std::size_t observed_filter_count) const
 {
   std::scoped_lock lock(_filter_ratios_mu);
   auto it = _filter_keep_ratios.find(filter);
-  return it != _filter_keep_ratios.end() ? std::optional<double>{it->second} : std::nullopt;
+  if (it == _filter_keep_ratios.end()) { return std::nullopt; }
+  // Skipping an optional filter cannot affect correctness, so its verdict is permanent.
+  if (filter_skippable(it->second.kept)) { return it->second.kept; }
+  // New filters can change this filter's marginal selectivity.
+  if (it->second.observed_filter_count < observed_filter_count) { return std::nullopt; }
+  return it->second.kept;
 }
 
 void dynamic_filter_gate::record_filter_keep_ratio(sirius::op::sirius_dynamic_filter const* filter,
-                                                   double kept)
+                                                   double kept,
+                                                   std::size_t observed_filter_count)
 {
   std::scoped_lock lock(_filter_ratios_mu);
-  auto const [it, inserted] = _filter_keep_ratios.emplace(filter, kept);
-  if (inserted && filter_skippable(kept)) {
+  auto const it = _filter_keep_ratios.find(filter);
+  if (it != _filter_keep_ratios.end() &&
+      it->second.observed_filter_count >= observed_filter_count) {
+    return;
+  }
+  _filter_keep_ratios.insert_or_assign(
+    filter, filter_measurement{.kept = kept, .observed_filter_count = observed_filter_count});
+  if (filter_skippable(kept)) {
     SIRIUS_LOG_DEBUG(
-      "[apply_dynamic_filters] per-filter gate: marginal kept {:.3f} -> SKIP filter for the rest "
-      "of this scan.",
-      kept);
+      "[apply_dynamic_filters] per-filter gate: marginal kept {:.3f} against {} filters -> SKIP "
+      "filter permanently.",
+      kept,
+      observed_filter_count);
   }
 }
 
@@ -188,9 +197,6 @@ bool dynamic_filter_gate::applicable(sirius::op::sirius_dynamic_filter_set const
 {
   if (!filters.has_filters()) { return false; }
   if (_state.load(std::memory_order_relaxed) != state::disabled) { return true; }
-  // The channel is append-only and may grow after a transitive target's earlier split snapshots it.
-  // If it grew beyond the snapshot that disabled the gate, the combined mask deserves one fresh
-  // measurement. An immediate Phase 1 probe normally starts after the complete fan-out.
   return filters.filter_count() > _decided_filter_count.load(std::memory_order_relaxed);
 }
 
@@ -200,9 +206,6 @@ void dynamic_filter_gate::record_keep_ratio(std::size_t rows_before,
 {
   if (rows_before == 0) { return; }
 
-  // Multiple GPU tasks can finish masks concurrently. Re-read both values while holding the slow
-  // decision-path lock: otherwise an older task can observe UNKNOWN, pause, and overwrite ACTIVE
-  // after a selective task has already committed it.
   std::scoped_lock decision_lock(_decision_mu);
   auto const current = _state.load(std::memory_order_relaxed);
   if (current == state::active) { return; }
@@ -228,14 +231,10 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_gated_view(
   int device_id)
 {
   if (!gate.applicable(filters)) { return nullptr; }
-  // Attribute the measurement to the filter-count snapshot used to begin this apply. A transitive
-  // target or another producer may grow the append-only channel beyond that snapshot; the count
-  // change then re-arms the gate once without crediting a mask that omitted the larger snapshot.
+  // Attribute the result to the channel-size snapshot used to start this apply.
   auto const observed_filters = filters.filter_count();
   auto const rows_before      = input.num_rows();
   auto filtered = apply_dynamic_filters_to_view(input, filters, stream, mode, &gate, device_id);
-  // nullptr means no compatible local filter produced a mask/AST. Do not train the shared gate on
-  // that no-op, or one GPU missing a best-effort replica could suppress useful replicas globally.
   if (!filtered) { return nullptr; }
   gate.record_keep_ratio(
     rows_before, static_cast<std::size_t>(filtered->num_rows()), observed_filters);

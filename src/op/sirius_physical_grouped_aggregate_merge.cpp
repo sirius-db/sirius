@@ -25,13 +25,19 @@
 
 #include <cudf/binaryop.hpp>
 #include <cudf/lists/count_elements.hpp>
+#include <cudf/reduction.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/traits.hpp>
+#include <cudf/utilities/type_dispatcher.hpp>
 
 #include <nvtx3/nvtx3.hpp>
 
 #include <algorithm>
 #include <mutex>
 #include <optional>
+#include <type_traits>
+#include <variant>
 
 namespace sirius {
 namespace op {
@@ -56,6 +62,120 @@ convert_grouping_functions(const duckdb::vector<duckdb::vector<std::size_t>>& sr
   }
   return result;
 }
+
+namespace {
+
+struct signed_key_range {
+  int64_t low;
+  int64_t high;
+};
+
+struct unsigned_key_range {
+  uint64_t low;
+  uint64_t high;
+};
+
+using host_key_range = std::variant<signed_key_range, unsigned_key_range>;
+
+struct host_key_range_extractor {
+  cudf::scalar const& minimum;
+  cudf::scalar const& maximum;
+  rmm::cuda_stream_view stream;
+
+  template <typename T>
+  std::optional<host_key_range> operator()() const
+  {
+    if constexpr (cudf::is_integral<T>()) {
+      using scalar_type = cudf::scalar_type_t<T>;
+      auto const low    = static_cast<scalar_type const&>(minimum).value(stream);
+      auto const high   = static_cast<scalar_type const&>(maximum).value(stream);
+      if constexpr (std::is_signed_v<T>) {
+        return signed_key_range{static_cast<int64_t>(low), static_cast<int64_t>(high)};
+      } else {
+        return unsigned_key_range{static_cast<uint64_t>(low), static_cast<uint64_t>(high)};
+      }
+    } else if constexpr (cudf::is_timestamp<T>()) {
+      using scalar_type = cudf::scalar_type_t<T>;
+      auto const low    = static_cast<scalar_type const&>(minimum).value(stream);
+      auto const high   = static_cast<scalar_type const&>(maximum).value(stream);
+      return signed_key_range{static_cast<int64_t>(low.time_since_epoch().count()),
+                              static_cast<int64_t>(high.time_since_epoch().count())};
+    } else {
+      return std::nullopt;
+    }
+  }
+};
+
+template <typename Range>
+bool ranges_are_strictly_disjoint(const std::vector<host_key_range>& ranges)
+{
+  std::vector<Range> typed_ranges;
+  typed_ranges.reserve(ranges.size());
+  for (auto const& range : ranges) {
+    auto const* typed_range = std::get_if<Range>(&range);
+    if (typed_range == nullptr) { return false; }
+    typed_ranges.push_back(*typed_range);
+  }
+  std::sort(typed_ranges.begin(), typed_ranges.end(), [](auto const& lhs, auto const& rhs) {
+    return lhs.low < rhs.low || (lhs.low == rhs.low && lhs.high < rhs.high);
+  });
+  for (std::size_t index = 1; index < typed_ranges.size(); ++index) {
+    if (!(typed_ranges[index - 1].high < typed_ranges[index].low)) { return false; }
+  }
+  return true;
+}
+
+bool leading_key_ranges_are_strictly_disjoint(
+  const std::vector<cucascade::read_only_data_batch>& batches, rmm::cuda_stream_view stream)
+{
+  std::optional<cudf::data_type> key_type;
+  std::vector<host_key_range> ranges;
+  ranges.reserve(batches.size());
+
+  // The read-only accessors in batches own every table view used by this proof.
+  for (auto const& batch : batches) {
+    auto* const data  = batch.get_data();
+    auto* const space = batch.get_memory_space();
+    if (data == nullptr || space == nullptr || space->get_tier() != cucascade::memory::Tier::GPU) {
+      return false;
+    }
+    auto const table = get_cudf_table_view(batch);
+    if (table.num_columns() == 0 || table.num_rows() == 0) { return false; }
+    auto const key = table.column(0);
+    if (key.has_nulls() || (!cudf::is_integral(key.type()) && !cudf::is_timestamp(key.type()))) {
+      return false;
+    }
+    if (key_type.has_value() && key.type() != *key_type) { return false; }
+    key_type = key.type();
+
+    auto [minimum, maximum] = cudf::minmax(key, stream, space->get_default_allocator());
+    auto range =
+      cudf::type_dispatcher(key.type(), host_key_range_extractor{*minimum, *maximum, stream});
+    if (!range.has_value()) { return false; }
+    ranges.push_back(*range);
+  }
+
+  if (ranges.empty()) { return false; }
+  return std::holds_alternative<signed_key_range>(ranges.front())
+           ? ranges_are_strictly_disjoint<signed_key_range>(ranges)
+           : ranges_are_strictly_disjoint<unsigned_key_range>(ranges);
+}
+
+bool task_bytes_fit(const std::vector<cucascade::read_only_data_batch>& batches,
+                    uint64_t byte_limit)
+{
+  uint64_t total_bytes = 0;
+  for (auto const& batch : batches) {
+    auto const* data = batch.get_data();
+    if (data == nullptr) { return false; }
+    auto const batch_bytes = static_cast<uint64_t>(data->get_size_in_bytes());
+    if (batch_bytes > byte_limit - total_bytes) { return false; }
+    total_bytes += batch_bytes;
+  }
+  return true;
+}
+
+}  // namespace
 
 void sirius_physical_grouped_aggregate_merge::build_pipelines(
   pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
@@ -83,6 +203,7 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
                                             grouped_aggregate->estimated_cardinality)
 {
   child_op              = grouped_aggregate;
+  grouping_sets         = grouped_aggregate->grouping_sets;
   _hash_partition_bytes = hash_partition_bytes;
 }
 
@@ -155,86 +276,9 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   has_count_distinct                = cudf_defs.has_count_distinct;
 }
 
-bool sirius_physical_grouped_aggregate_merge::clustered_bypass_wanted() const
-{
-  if (!_clustered_bypass_enabled) { return false; }
-  if (_bypass_filter_expression == nullptr) {
-    // NOTE: no get_operator_id() here — eligibility runs on unit-test operators that never
-    // went through pipeline::assign_operator_ids.
-    SIRIUS_LOG_DEBUG("clustered_bypass: not wanted — no downstream FILTER stamped");
-    return false;
-  }
-  // Single GPU only: the bypass funnels every partial into one partition slot, which is only
-  // free when there is no cross-device placement to negotiate.
-  if (_num_gpus != 1) {
-    SIRIUS_LOG_DEBUG("clustered_bypass: not wanted — num_gpus={}", _num_gpus);
-    return false;
-  }
-  // AVG / COUNT(DISTINCT) post-process the merged result, so the partial schema differs from
-  // the merge output schema and the downstream predicate cannot be evaluated on partial rows.
-  if (has_avg || has_count_distinct) { return false; }
-  if (grouping_sets.size() > 1) { return false; }
-  if (group_idx.empty()) { return false; }
-  // The bypass proof needs combine(singleton) == singleton; that holds for SUM/MIN/MAX and for
-  // COUNT partials (merged via SUM), but not for e.g. COLLECT_SET.
-  return std::all_of(
-    cudf_aggregates.begin(), cudf_aggregates.end(), [](cudf::aggregation::Kind kind) {
-      switch (kind) {
-        case cudf::aggregation::Kind::SUM:
-        case cudf::aggregation::Kind::MIN:
-        case cudf::aggregation::Kind::MAX:
-        case cudf::aggregation::Kind::COUNT_ALL:
-        case cudf::aggregation::Kind::COUNT_VALID: return true;
-        default: return false;
-      }
-    });
-}
-
-bool sirius_physical_grouped_aggregate_merge::try_plan_clustered_bypass(
-  const std::vector<std::shared_ptr<::cucascade::data_batch>>& batches)
-{
-  if (!clustered_bypass_wanted()) { return false; }
-  // The leading group key is output column 0 of every partial batch.
-  //
-  // The probe runs GPU work (two cudf::reduce scalars per batch) from partition
-  // task-CREATION, a call path with no OOM/downgrade handling — an escaping exception here
-  // would fail the whole query. The bypass is an optimization, so ANY probe failure (OOM
-  // included) must degrade to the normal partitioned merge instead. A sticky CUDA error
-  // swallowed here simply resurfaces inside the next task, where the existing task-level
-  // error machinery owns it; rethrowing from task creation would only turn it into an
-  // unhandled query failure sooner.
-  std::optional<clustered_bypass::plan> plan;
-  try {
-    plan = clustered_bypass::analyze_partial_ranges(
-      batches, /*key_column_index=*/0, _clustered_bypass_max_overlap_fraction);
-  } catch (const std::exception& e) {
-    SIRIUS_LOG_WARN(
-      "clustered_bypass: range probe failed ({}); taking the normal partitioned merge", e.what());
-    return false;
-  }
-  if (!plan.has_value()) { return false; }
-  std::lock_guard<std::mutex> lg(lock);
-  _bypass_plan = std::move(plan);
-  return true;
-}
-
-bool sirius_physical_grouped_aggregate_merge::clustered_bypass_armed()
-{
-  // Same lock as the try_plan_clustered_bypass write — race-free by construction rather than
-  // by scheduling argument.
-  std::lock_guard<std::mutex> lg(lock);
-  return _bypass_plan.has_value();
-}
-
 partition_strategy sirius_physical_grouped_aggregate_merge::get_partition_strategy(
   const partition_sizing_input& in)
 {
-  {
-    // An armed bypass wants every partial forwarded, unpartitioned, into slot 0: the single
-    // merge task then filters each partial in place instead of re-hashing the union.
-    std::lock_guard<std::mutex> lg(lock);
-    if (_bypass_plan.has_value()) { return {1, /*broadcast=*/false, /*build_probe=*/false}; }
-  }
   int const natural = natural_num_partitions(in.total_bytes, _hash_partition_bytes, _num_gpus);
   // Pre-size this merge's single input repository so every partition slot exists before batches
   // arrive (grouping is never broadcast / build-probe). Guarded on strictly-greater to respect the
@@ -284,39 +328,27 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_grouped_aggregate_merge::execute"};
-  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_read_only_batches();
+  auto& input        = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  auto input_batches = input.get_read_only_batches();
   if (input_batches.size() == 0) {
     throw std::runtime_error(
       "We expect at least one input batch for grouped aggregate merge operator");
   }
 
-  // Clustered merge bypass: the range proof armed at partition-sizing time showed the partials
-  // are range-disjoint, so instead of re-hashing their union we push the downstream filter to
-  // each partial and re-group only the boundary windows. See clustered_merge_bypass.hpp.
-  {
-    std::optional<clustered_bypass::plan> bypass_plan;
-    {
-      std::lock_guard<std::mutex> lg(lock);
-      bypass_plan = _bypass_plan;
-    }
-    if (bypass_plan.has_value()) {
-      auto outputs = clustered_bypass::execute_bypass(input_batches,
-                                                      *bypass_plan,
-                                                      _bypass_filter_expression,
-                                                      get_output_grouping_indices(),
-                                                      cudf_aggregates,
-                                                      _hash_partition_bytes,
-                                                      _num_gpus,
-                                                      stream,
-                                                      batch_telemetry());
-      return std::make_unique<pipelineable_operator_data>(std::move(outputs));
-    }
+  auto const* input_port = ports.size() == 1 ? ports.begin()->second : nullptr;
+  bool const one_upstream_partition =
+    input_port != nullptr && input_port->repo != nullptr && input_port->repo->num_partitions() == 1;
+  bool const passthrough_candidate =
+    _enable_disjoint_groupby_passthrough && input_batches.size() > 1 && !has_avg &&
+    !has_count_distinct && grouping_sets.size() <= 1 && !group_idx.empty() &&
+    one_upstream_partition && task_bytes_fit(input_batches, _hash_partition_bytes);
+  if (passthrough_candidate && leading_key_ranges_are_strictly_disjoint(input_batches, stream)) {
+    return std::make_unique<pipelineable_operator_data>(std::move(input_batches));
   }
 
   // Fast path: single batch with no post-processing needed
   if (input_batches.size() == 1 && !has_avg && !has_count_distinct) {
-    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
+    return std::make_unique<pipelineable_operator_data>(std::move(input_batches));
   }
 
   // Merge multiple batches, or use single batch directly if only one

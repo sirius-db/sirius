@@ -19,8 +19,8 @@
 // GPUs. Before replica support, the corresponding cross-device dereference is the
 // cudaErrorIllegalAddress reported by TPC-H Q2.
 
-#include "op/dynamic_filter_replica_transfer.hpp"
-#include "op/sirius_dynamic_filter.hpp"
+#include "op/dynamic_filter/dynamic_filter_replica_transfer.hpp"
+#include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "operator_test_utils.hpp"
 
 #include <cudf/ast/expressions.hpp>
