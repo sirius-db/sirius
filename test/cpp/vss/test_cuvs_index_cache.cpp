@@ -101,7 +101,8 @@ TEST_CASE("cuvs_index_cache find_by_column matches the auto-routing identity", "
   }
   SECTION("wrong column misses")
   {
-    REQUIRE(cache.find_by_column("mem", "main", "docs", "other", Metric::L2SqrtExpanded) == nullptr);
+    REQUIRE(cache.find_by_column("mem", "main", "docs", "other", Metric::L2SqrtExpanded) ==
+            nullptr);
   }
   SECTION("wrong table misses")
   {
@@ -113,7 +114,8 @@ TEST_CASE("cuvs_index_cache find_by_column matches the auto-routing identity", "
   }
   SECTION("wrong catalog misses")
   {
-    REQUIRE(cache.find_by_column("other", "main", "docs", "vec", Metric::L2SqrtExpanded) == nullptr);
+    REQUIRE(cache.find_by_column("other", "main", "docs", "vec", Metric::L2SqrtExpanded) ==
+            nullptr);
   }
   SECTION("right column but wrong metric misses (an l2 index can't serve a cosine query)")
   {
@@ -129,7 +131,8 @@ TEST_CASE("cuvs_index_cache find_by_column folds L2 expanded/unexpanded", "[vss]
   SECTION("index built L2SqrtExpanded matches an L2SqrtUnexpanded query")
   {
     insert_dummy(cache, "idx", make_meta("docs", "vec", Metric::L2SqrtExpanded));
-    REQUIRE(cache.find_by_column("mem", "main", "docs", "vec", Metric::L2SqrtUnexpanded) != nullptr);
+    REQUIRE(cache.find_by_column("mem", "main", "docs", "vec", Metric::L2SqrtUnexpanded) !=
+            nullptr);
   }
   SECTION("index built L2SqrtUnexpanded matches an L2SqrtExpanded query")
   {
@@ -139,7 +142,8 @@ TEST_CASE("cuvs_index_cache find_by_column folds L2 expanded/unexpanded", "[vss]
   SECTION("the fold stays within the metric family (an L2 query misses a cosine index)")
   {
     insert_dummy(cache, "idx", make_meta("docs", "vec", Metric::CosineExpanded));
-    REQUIRE(cache.find_by_column("mem", "main", "docs", "vec", Metric::L2SqrtUnexpanded) == nullptr);
+    REQUIRE(cache.find_by_column("mem", "main", "docs", "vec", Metric::L2SqrtUnexpanded) ==
+            nullptr);
   }
 }
 

@@ -135,9 +135,9 @@ std::size_t cuvs_index_cache::erase_by_column(std::string_view catalog,
         meta.column_name == column && canonical_metric(meta.metric) == wanted) {
       it = _entries.erase(it);
       ++removed;
-        } else {
-          ++it;
-        }
+    } else {
+      ++it;
+    }
   }
   return removed;
 }
