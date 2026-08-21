@@ -55,6 +55,19 @@ cuvs_index_cache::cuvs_index_cache(
 // the header) is destroyed here, where cucascade::memory::reservation is complete.
 cuvs_index_cache::~cuvs_index_cache() = default;
 
+// Explicit move assignment op
+pinned_index_entry& pinned_index_entry::operator=(pinned_index_entry&& other) noexcept
+{
+  if (this != &other) {
+    index.reset();
+    reservation.reset();
+    meta        = std::move(other.meta);
+    reservation = std::move(other.reservation);
+    index       = std::move(other.index);
+  }
+  return *this;
+}
+
 std::unique_ptr<cucascade::memory::reservation> cuvs_index_cache::reserve_index_memory(
   std::size_t bytes, int preferred_gpu)
 {

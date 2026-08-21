@@ -99,9 +99,18 @@ template <class Index>
 /// @c reservation->get_memory_resource(), so Sirius owns every byte and
 /// releasing the reservation frees the index. Move-only (owns unique resources).
 struct pinned_index_entry {
+  // The index's device buffers were allocated through reservation,
+  // so the index must be freed before the reservation.
   index_metadata meta;
-  std::unique_ptr<any_cuvs_index> index;
   std::unique_ptr<cucascade::memory::reservation> reservation;
+  std::unique_ptr<any_cuvs_index> index;
+
+  pinned_index_entry()                     = default; // default constructor
+  pinned_index_entry(pinned_index_entry&&) = default; // default move constructor
+
+  // The move assignment op (frees the old payload and installs the new one) needs to release the
+  // old payload in the same order as the destructor (i.e., index before reservation, see .cpp).
+  pinned_index_entry& operator=(pinned_index_entry&& other) noexcept;
 
   /// Recover the concrete cuVS index, or nullptr if the held index is not of
   /// type @c Index. The returned pointer is owned by this entry.
