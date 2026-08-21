@@ -364,6 +364,16 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
         forecast.survivors_bounded ? sirius::decompression_pushdown_max_selectivity() : 1.0;
       return batch_bytes / 4 + static_cast<std::size_t>(static_cast<double>(batch_bytes) * cap);
     }
+    if (!row_filter_pending) {
+      // A wired dynamic filter and NO static one, so nothing here filters by
+      // copy. The decode either compacts (output far below full width) or
+      // declines and hands back full-width columns it did NOT row-filter -- see
+      // pushdown_outcome::selection_unprofitable -- and post_filter_and_project
+      // then has no predicate to apply. Either way the peak is one full-width
+      // decode plus the probe's BOOL8 mask (1 B/row, under batch/4 at the >= 4
+      // B/row a projected column carries), not two full widths.
+      return batch_bytes + batch_bytes / 4;
+    }
     // post_filter_and_project filters by copy: the materialized input and the
     // compacted output (up to input-sized) coexist at peak. The BOOL8
     // predicate column (1 B/row) hides inside the 2x conservatism (any
