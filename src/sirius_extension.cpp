@@ -1923,7 +1923,7 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   // build, so pin_owner must outlive it — a concurrent unpin on another connection must not
   // invalidate the entry mid-build.
   std::shared_ptr<sirius::scan_manager::pinned_entry const> pin_owner =
-    scan_mgr.find_pinned_entry_for_duckdb_table(entry_catalog, entry_schema, entry.name);
+    scan_mgr.find_pinned_entry_for_duckdb_table(entry_catalog, entry_schema, entry.name, entry.oid);
   sirius::scan_manager::pinned_entry const* pin = pin_owner.get();
   if (pin == nullptr || pin->tier != cucascade::memory::Tier::GPU) {
     throw InvalidInputException("sirius_create_ann_index: table '" + data.table_name +
@@ -2319,6 +2319,7 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   req.catalog             = entry.ParentCatalog().GetName();
   req.schema              = entry.ParentSchema().name;
   req.table_name          = entry.name;  // catalog-resolved name (matches query-side derivation)
+  req.table_oid           = entry.oid;
   auto const& columns     = entry.GetColumns();
   auto const schema_names = columns.GetColumnNames();
   auto const schema_types = columns.GetColumnTypes();
@@ -2333,7 +2334,7 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   // must not invalidate it mid-search.
   duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
   auto pin_owner = sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
-    req.catalog, req.schema, req.table_name);
+    req.catalog, req.schema, req.table_name, req.table_oid);
   const auto* pin = pin_owner.get();
   if (pin == nullptr) {
     throw BinderException("sirius_knn_search: table '" + req.table_name +
