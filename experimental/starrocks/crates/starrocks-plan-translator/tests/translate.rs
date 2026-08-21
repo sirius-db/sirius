@@ -18,9 +18,9 @@ use starrocks_thrift::internal_service::{
 use starrocks_thrift::opcodes::TExprOpcode;
 use starrocks_thrift::partitions::{TDataPartition, TPartitionType};
 use starrocks_thrift::plan_nodes::{
-    TAggregationNode, TBrokerRangeDesc, TBrokerScanRange, TBrokerScanRangeParams, TFileFormatType,
-    TFileScanNode, TFileScanType, TPlan, TPlanNode, TPlanNodeType, TProjectNode, TScanRange,
-    TSelectNode, TSortInfo, TSortNode,
+    TAggregationNode, TBrokerRangeDesc, TBrokerScanRange, TBrokerScanRangeParams, TEqJoinCondition,
+    TFileFormatType, TFileScanNode, TFileScanType, THashJoinNode, TJoinOp, TNestLoopJoinNode,
+    TPlan, TPlanNode, TPlanNodeType, TProjectNode, TScanRange, TSelectNode, TSortInfo, TSortNode,
 };
 use starrocks_thrift::planner::TPlanFragment;
 use starrocks_thrift::types::{
@@ -1139,10 +1139,10 @@ fn fragment_output_exprs_add_root_projection() {
     }
 }
 
-/// Verifies unsupported joins return a structured unsupported-plan-node error.
+/// Verifies unsupported plan nodes return a structured unsupported-plan-node error.
 #[test]
-fn unsupported_hash_join_is_structured_error() {
-    let join = base_plan_node(9, TPlanNodeType::HASH_JOIN_NODE, 0, vec![0]);
+fn unsupported_merge_join_is_structured_error() {
+    let join = base_plan_node(9, TPlanNodeType::MERGE_JOIN_NODE, 0, vec![0]);
     let err = translate_fragment(&params(
         Some(TPlan::new(vec![join])),
         Some(base_desc()),
@@ -1155,7 +1155,7 @@ fn unsupported_hash_join_is_structured_error() {
             node_id: 9,
             node_type,
             ..
-        } if node_type == TPlanNodeType::HASH_JOIN_NODE
+        } if node_type == TPlanNodeType::MERGE_JOIN_NODE
     ));
 }
 
@@ -2247,6 +2247,319 @@ fn sort_with_limit_becomes_project_sort_fetch() {
     };
 }
 
+/// Two-table descriptor for join tests: tuple 0 = users(`a`), tuple 1 = orders(`b`).
+fn join_desc() -> TDescriptorTable {
+    desc_table(
+        vec![(0, Some(100)), (1, Some(100))],
+        vec![
+            slot(1, 0, "a", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 1, "b", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    )
+}
+
+/// Two-table descriptor whose sides differ in width: tuple 0 = users(`a`, `b`), tuple 1 =
+/// orders(`c`). A build-side slot lands at field 2, so an index into the concatenated
+/// probe-then-build row cannot be confused with a literal `1`.
+fn wide_join_desc() -> TDescriptorTable {
+    desc_table(
+        vec![(0, Some(100)), (1, Some(100))],
+        vec![
+            slot(1, 0, "a", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "b", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 1, "c", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    )
+}
+
+/// Builds a hash-join plan node with one `left = right` equality conjunct.
+fn hash_join_node(join_op: TJoinOp) -> TPlanNode {
+    let mut join = base_plan_node(2, TPlanNodeType::HASH_JOIN_NODE, 2, vec![0, 1]);
+    join.hash_join_node = Some(THashJoinNode::new(
+        join_op,
+        vec![TEqJoinCondition::new(
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+            Some(TExprOpcode::EQ),
+        )],
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ));
+    join
+}
+
+/// Field indices referenced by a scalar function's arguments, in order.
+fn argument_field_indices(scalar: &expression::ScalarFunction) -> Vec<i32> {
+    scalar
+        .arguments
+        .iter()
+        .map(|argument| match argument.arg_type.as_ref().unwrap() {
+            substrait::proto::function_argument::ArgType::Value(value) => field_index(value),
+            other => panic!("unexpected argument {other:?}"),
+        })
+        .collect()
+}
+
+/// Verifies an inner hash join becomes a Substrait join whose equality condition references the
+/// concatenated left-then-right row (right side offset by the left width).
+#[test]
+fn inner_hash_join_translates_to_join_rel() {
+    let plan = TPlan::new(vec![
+        hash_join_node(TJoinOp::INNER_JOIN),
+        scan_node(0, 0),
+        scan_node(1, 1),
+    ]);
+    let translated = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["a", "b"]);
+    let rel::RelType::Join(join) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected join relation");
+    };
+    assert_eq!(
+        join.r#type,
+        substrait::proto::join_rel::JoinType::Inner as i32
+    );
+    let expression::RexType::ScalarFunction(equal) =
+        join.expression.as_ref().unwrap().rex_type.as_ref().unwrap()
+    else {
+        panic!("expected scalar function join condition");
+    };
+    assert_eq!(argument_field_indices(equal), vec![0, 1]);
+}
+
+/// Verifies an ON-clause predicate beyond the equality is ANDed into the join condition, and that
+/// both operands resolve against the concatenated probe-then-build row.
+///
+/// Run over the asymmetric descriptor: with a two-column probe side a build-side reference lands
+/// at field 2, which a wrong offset (a literal 1, or the build width) cannot reproduce.
+#[test]
+fn other_join_conjuncts_are_anded_into_the_join_condition() {
+    let bigint = || scalar_type(TPrimitiveType::BIGINT);
+    let mut join = hash_join_node(TJoinOp::INNER_JOIN);
+    join.hash_join_node.as_mut().unwrap().other_join_conjuncts = Some(vec![binary_pred(
+        TExprOpcode::LT,
+        slot_ref(2, 0, bigint()),
+        slot_ref(1, 1, bigint()),
+    )]);
+    let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+    let translated = translate_fragment(&params(Some(plan), Some(wide_join_desc()), None)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["a", "b", "c"]);
+    let rel::RelType::Join(join) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected join relation");
+    };
+    let conjunction = scalar_fn(join.expression.as_ref().unwrap());
+    let (urn, name) = resolved_function(&translated.plan, conjunction.function_reference);
+    assert_eq!((urn.as_str(), name.as_str()), (URN_BOOLEAN, "and"));
+
+    let operands: Vec<_> = conjunction
+        .arguments
+        .iter()
+        .map(|argument| match argument.arg_type.as_ref().unwrap() {
+            substrait::proto::function_argument::ArgType::Value(value) => scalar_fn(value),
+            other => panic!("unexpected argument {other:?}"),
+        })
+        .collect();
+    let names: Vec<_> = operands
+        .iter()
+        .map(|operand| resolved_function(&translated.plan, operand.function_reference).1)
+        .collect();
+    assert_eq!(names, vec!["equal", "lt"]);
+    // `a = c` then `b < c`: fields 0 and 1 are the probe side, field 2 is the build side.
+    assert_eq!(argument_field_indices(operands[0]), vec![0, 2]);
+    assert_eq!(argument_field_indices(operands[1]), vec![1, 2]);
+}
+
+/// Verifies a join's own conjuncts become a filter over the join, resolved against the
+/// concatenated row rather than the probe side alone.
+#[test]
+fn join_node_conjuncts_become_a_post_join_filter() {
+    let mut join = hash_join_node(TJoinOp::INNER_JOIN);
+    join.conjuncts = Some(vec![binary_pred(
+        TExprOpcode::GT,
+        slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        int_literal(10),
+    )]);
+    let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+    let translated = translate_fragment(&params(Some(plan), Some(wide_join_desc()), None)).unwrap();
+
+    let rel::RelType::Filter(filter) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected a filter over the join");
+    };
+    let rel::RelType::Join(_) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected the join under the filter");
+    };
+    let greater = scalar_fn(filter.condition.as_deref().unwrap());
+    let substrait::proto::function_argument::ArgType::Value(probed) =
+        greater.arguments[0].arg_type.as_ref().unwrap()
+    else {
+        panic!("expected a value argument");
+    };
+    assert_eq!(field_index(probed), 2);
+}
+
+/// Verifies a left semi join keeps only the probe-side row layout.
+#[test]
+fn left_semi_join_keeps_probe_layout() {
+    let plan = TPlan::new(vec![
+        hash_join_node(TJoinOp::LEFT_SEMI_JOIN),
+        scan_node(0, 0),
+        scan_node(1, 1),
+    ]);
+    let translated = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["a"]);
+    let rel::RelType::Join(join) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected join relation");
+    };
+    assert_eq!(
+        join.r#type,
+        substrait::proto::join_rel::JoinType::LeftSemi as i32
+    );
+}
+
+/// Builds a nested-loop join plan node carrying `conjuncts` as its join predicate.
+fn nestloop_join_node(join_op: TJoinOp, conjuncts: Vec<TExpr>) -> TPlanNode {
+    let mut join = base_plan_node(2, TPlanNodeType::NESTLOOP_JOIN_NODE, 2, vec![0, 1]);
+    join.nestloop_join_node = Some(TNestLoopJoinNode::new(
+        Some(join_op),
+        None,
+        Some(conjuncts),
+        None,
+        None,
+        None,
+    ));
+    join
+}
+
+/// Builds `left OR right`.
+fn or_pred(left: TExpr, right: TExpr) -> TExpr {
+    let mut node = base_expr_node(
+        TExprNodeType::COMPOUND_PRED,
+        scalar_type(TPrimitiveType::BOOLEAN),
+        2,
+    );
+    node.opcode = Some(TExprOpcode::COMPOUND_OR);
+    let mut nodes = vec![node];
+    nodes.extend(left.nodes);
+    nodes.extend(right.nodes);
+    TExpr::new(nodes)
+}
+
+/// Verifies a cross nested-loop join with a conjunct becomes filter-over-cross-product.
+#[test]
+fn nestloop_join_translates_to_filtered_cross_rel() {
+    let join = nestloop_join_node(
+        TJoinOp::CROSS_JOIN,
+        vec![binary_pred(
+            TExprOpcode::LT,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        )],
+    );
+    let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+    let translated = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["a", "b"]);
+    let rel::RelType::Filter(filter) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected filter over cross product");
+    };
+    let rel::RelType::Cross(_) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected cross product under filter");
+    };
+}
+
+/// Verifies a nested-loop join that is not inner or cross is rejected: the translation emits a
+/// cross product, which keeps no unmatched rows.
+#[test]
+fn non_inner_nestloop_join_is_rejected() {
+    for join_op in [TJoinOp::LEFT_OUTER_JOIN, TJoinOp::LEFT_SEMI_JOIN] {
+        let plan = TPlan::new(vec![
+            nestloop_join_node(
+                join_op,
+                vec![binary_pred(
+                    TExprOpcode::LT,
+                    slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+                    slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+                )],
+            ),
+            scan_node(0, 0),
+            scan_node(1, 1),
+        ]);
+        let err = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap_err();
+        let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
+            panic!("{join_op:?}: expected an unsupported plan node, got {err:?}");
+        };
+        assert_eq!(reason, "only inner/cross nested-loop joins are supported");
+    }
+}
+
+/// Verifies a nested-loop join is rejected unless a conjunct survives as a join condition.
+///
+/// A predicate reading one input is pushed into that input and leaves a bare cross product; a
+/// disjunction reading both is demoted to an any-join. The GPU planner has neither operator, so
+/// either shape would translate here and then fail at execution.
+#[test]
+fn nestloop_join_without_a_liftable_comparison_is_rejected() {
+    let bigint = || scalar_type(TPrimitiveType::BIGINT);
+    let probe_side_only = binary_pred(TExprOpcode::LT, slot_ref(1, 0, bigint()), int_literal(10));
+    let disjunction = or_pred(
+        binary_pred(
+            TExprOpcode::LT,
+            slot_ref(1, 0, bigint()),
+            slot_ref(1, 1, bigint()),
+        ),
+        binary_pred(
+            TExprOpcode::GT,
+            slot_ref(1, 0, bigint()),
+            slot_ref(1, 1, bigint()),
+        ),
+    );
+
+    for conjunct in [probe_side_only, disjunction] {
+        let plan = TPlan::new(vec![
+            nestloop_join_node(TJoinOp::CROSS_JOIN, vec![conjunct]),
+            scan_node(0, 0),
+            scan_node(1, 1),
+        ]);
+        let err = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap_err();
+        let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
+            panic!("expected an unsupported plan node, got {err:?}");
+        };
+        assert_eq!(
+            reason,
+            "nested-loop joins need a comparison between the two inputs"
+        );
+    }
+}
+
 /// Verifies an exchange node is still rejected: fragments are translated in isolation and
 /// multi-fragment plans are a later milestone.
 #[test]
@@ -2488,6 +2801,38 @@ fn aggregation_conjuncts_become_having_filter() {
     };
 }
 
+/// Verifies anti joins are rejected: the Substrait consumer has no left-anti conversion.
+#[test]
+fn anti_hash_join_is_rejected() {
+    for join_op in [TJoinOp::LEFT_ANTI_JOIN, TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN] {
+        let plan = TPlan::new(vec![
+            hash_join_node(join_op),
+            scan_node(0, 0),
+            scan_node(1, 1),
+        ]);
+        let err = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap_err();
+        assert!(
+            matches!(err, TranslateError::UnsupportedPlanNode { .. }),
+            "{join_op:?}: {err:?}"
+        );
+    }
+}
+
+/// Verifies an unsupported join op is named as the reason even when the plan also carries no join
+/// conjuncts, which is the shape an anti join arrives in once the FE has folded its predicate away.
+#[test]
+fn unsupported_join_type_is_reported_before_missing_conjuncts() {
+    let mut join = hash_join_node(TJoinOp::LEFT_ANTI_JOIN);
+    join.hash_join_node.as_mut().unwrap().eq_join_conjuncts = vec![];
+    let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+
+    let err = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap_err();
+    let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
+        panic!("expected an unsupported plan node, got {err:?}");
+    };
+    assert_eq!(reason, "hash join type is unsupported");
+}
+
 /// Verifies decimal-typed arithmetic is rejected (it crashes the engine's GPU projection).
 #[test]
 fn decimal_arithmetic_is_rejected() {
@@ -2624,7 +2969,7 @@ fn sort_tuple_exprs_come_from_sort_info() {
 }
 
 /// Verifies GPU-executor guards: non-constant LIKE patterns, non-constant substring bounds,
-/// and ungrouped DISTINCT aggregates are rejected.
+/// bare cross joins, and ungrouped DISTINCT aggregates are rejected.
 #[test]
 fn gpu_unsupported_shapes_are_rejected() {
     // LIKE with a column pattern (not a literal).
@@ -2673,6 +3018,23 @@ fn gpu_unsupported_shapes_are_rejected() {
     .unwrap_err();
     assert!(
         matches!(err, TranslateError::UnsupportedExpression { .. }),
+        "{err:?}"
+    );
+
+    // Nested-loop join without conjuncts (bare cross product).
+    let mut join = base_plan_node(2, TPlanNodeType::NESTLOOP_JOIN_NODE, 2, vec![0, 1]);
+    join.nestloop_join_node = Some(TNestLoopJoinNode::new(
+        Some(TJoinOp::CROSS_JOIN),
+        None,
+        None,
+        None,
+        None,
+        None,
+    ));
+    let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+    let err = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap_err();
+    assert!(
+        matches!(err, TranslateError::UnsupportedPlanNode { .. }),
         "{err:?}"
     );
 
