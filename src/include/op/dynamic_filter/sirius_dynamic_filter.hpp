@@ -280,8 +280,9 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
 /**
  * @brief Probabilistic membership filter with no false negatives
  *
- * False positives pass extra rows to the authoritative join. The construction stream and memory
- * resource are retained for deallocation and later insertions; both must outlive the filter.
+ * False positives pass extra rows to the authoritative join. Each replica retains its construction
+ * stream and memory resource for deallocation; the source resource is also used by later
+ * insertions. These dependencies must outlive the filter.
  */
 class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
                                           public sirius_mask_applicable,
@@ -343,6 +344,8 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
   /**
    * @brief Enqueues another build-key batch into the source replica, excluding nulls
    *
+   * @pre The filter has not been replicated or published; this operation updates only its source
+   * replica
    * @pre The current device and @p keys type match the source replica, and key storage remains
    * valid until @p stream completes
    * @throw std::invalid_argument if @p keys is unsupported or differs from the construction type
@@ -353,6 +356,9 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
   /**
    * @brief Enqueues an OR of @p source into this filter's source replica
    *
+   * @pre All writes to @p source are complete; prior writes to this filter are complete or ordered
+   * before the merge on @p root_stream
+   * @pre This filter has not been replicated or published; only its source replica is updated
    * @pre Both filters have equal geometry, match their device spaces, and remain alive until
    * @p root_stream completes
    * @pre @p root_stream belongs to @p root_space; calls on the same destination are stream-ordered

@@ -150,9 +150,10 @@ struct dynamic_filter_accumulation_result {
 
   status state = status::pending;
   dynamic_filter_publication_outcome publication;  ///< Current outcome counters
-  std::size_t exact_contribution_count = 0;        ///< Completed unique IDs at publication
-  std::size_t global_build_rows        = 0;        ///< Validated global build geometry
-  int root_device_id = -1;  ///< Final contributor selected as reduction/replication source
+  std::size_t exact_contribution_count = 0;  ///< Completed unique IDs at the terminal transition
+  std::size_t global_build_rows        = 0;  ///< Validated global build geometry
+  int root_device_id = -1;  ///< Final contributor device (the reduction root when filters are
+                            ///< built), or drained-target sealing device
 };
 
 namespace detail {
@@ -174,9 +175,9 @@ struct dynamic_filter_accumulator_test_hooks {
  *
  * `contribute()` is thread-safe and accepts each expected ID at most once. Nothing is exposed until
  * all expected IDs finish. Once every bound probe target has drained, the next validated
- * contribution seals the accumulator as complete without building filters; the terminal outcome
- * counts one skipped-targets-drained publication. The retained plan reference must outlive this
- * object.
+ * contribution seals the accumulator as complete without further construction or publication;
+ * the terminal outcome counts one skipped-targets-drained publication. The retained plan reference
+ * must outlive this object.
  */
 class dynamic_filter_accumulator final {
  public:
@@ -206,10 +207,12 @@ class dynamic_filter_accumulator final {
   /**
    * @brief Contributes one expected build batch
    *
-   * A newly accepted batch is consumed on the current GPU, and @p stream is synchronized before
-   * return. Invalid IDs, devices, or columns produce an `aborted` result. A validated contribution
-   * that observes every bound probe target drained instead seals the accumulator; the returned
-   * `exact_contribution_count` reports the contributions completed at the terminal transition.
+   * For a valid contribution with at least one active key, insertion is enqueued on the current GPU
+   * and @p stream is synchronized before the contribution is marked complete. An inert accumulator
+   * enqueues no GPU work and does not synchronize @p stream. Invalid IDs, devices, or columns
+   * produce an `aborted` result. A validated contribution that observes every bound probe target
+   * drained instead seals the accumulator; the returned `exact_contribution_count` reports the
+   * contributions completed at the terminal transition.
    *
    * @param[in] batch_id Original pre-scatter batch ID
    * @param[in] build_view Batch containing the admitted build-key ordinals
@@ -271,11 +274,11 @@ struct dynamic_filter_publication_session_test_hooks {
  * whose source turns out unusable is released with `reopen_from_claim()` (a sibling delivery may
  * then claim; each claim counts one attempt) or failed with `fail_claim()`.
  *
- * Lock ordering: an operator lock (the hash join's `op_state_mutex` or the build PARTITION's
- * `lock`, never nested with each other) may be held while calling into the session, which acquires
- * the session mutex, which may be followed by the accumulator's coordinator mutex and then a
- * per-device partial mutex. The session mutex is a leaf with respect to operator locks: no session
- * member calls back into an operator while holding it.
+ * Lock ordering: multi-partition arming may hold the build PARTITION `lock` while acquiring the
+ * hash join's `op_state_mutex`, followed by the session mutex. Other operator paths may hold
+ * `op_state_mutex` while acquiring the session mutex. Session methods do not acquire the
+ * accumulator's coordinator or per-device mutexes while holding the session mutex and never call
+ * back into an operator while holding it.
  */
 class dynamic_filter_publication_session final {
  public:
@@ -339,16 +342,18 @@ class dynamic_filter_publication_session final {
   /**
    * @brief Releases an unused one-shot claim (PUBLISHING -> OPEN)
    *
-   * Lets a sibling delivery claim after this one found no usable source. No-op unless the session
-   * holds an unconsumed claim.
+   * The caller must own a claim not yet passed to `publish_one_shot()`; claim ownership is not
+   * tracked. Lets a sibling delivery claim after this one found no usable source. No-op unless the
+   * session holds an unconsumed claim.
    */
   void reopen_from_claim() noexcept;
 
   /**
    * @brief Fails a claimed, not-yet-published attempt (PUBLISHING -> FAILED)
    *
-   * For exceptions between claim and publication. No-op in any other state, so a terminal already
-   * committed by publish_one_shot() is never double-counted.
+   * The caller must own the claim; claim ownership is not tracked. For exceptions between claim
+   * and publication. No-op in any other state, so a terminal already committed by
+   * `publish_one_shot()` is never double-counted.
    */
   void fail_claim() noexcept;
 
@@ -378,6 +383,8 @@ class dynamic_filter_publication_session final {
    * Unlike finalize_or_abort(), never closes an unclaimed OPEN window, so the once-per-join
    * NOT-published diagnostic path stays intact. Logs @p reason when this call performs the abort;
    * no-op in every other state.
+   *
+   * @param[in] reason Diagnostic reason for the abort
    */
   void abort_accumulation(std::string_view reason) noexcept;
 

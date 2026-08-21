@@ -623,10 +623,8 @@ struct dynamic_filter_accumulator::impl {
     return completed_result(dynamic_filter_accumulation_result::status::published);
   }
 
-  // Deliberately runs under the coordinator mutex: all expected contributions have already
-  // completed, so only late duplicates and finalization can contend, and both are rare and
-  // latency-tolerant. Restructuring to a publishing marker would re-open the
-  // finalize/seal/terminal races -- do not move this off-mutex without re-deriving them.
+  // Runs under the coordinator mutex so finalization and late contributions cannot observe a gap
+  // between the last expected completion and the terminal state.
   [[nodiscard]] dynamic_filter_accumulation_result publish_locked(int root_device)
   {
     auto const* root_space = replica_space(root_device);

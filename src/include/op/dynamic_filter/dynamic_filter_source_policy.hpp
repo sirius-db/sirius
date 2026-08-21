@@ -61,7 +61,7 @@ struct membership_choice_inputs {
  *
  * @p bytes_per_filter is already allocator-aligned. The division form makes the aggregate check
  * overflow-safe. Equality is admitted for representable footprints; `SIZE_MAX` is the estimator's
- * overflow sentinel and is rejected.
+ * overflow sentinel and is rejected when @p filter_count is nonzero.
  *
  * @param[in] bytes_per_filter Allocator-accounted bytes for one Bloom bit array
  * @param[in] filter_count Number of candidate Bloom keys

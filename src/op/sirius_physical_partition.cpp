@@ -548,7 +548,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
   if (_is_build && _partition_type == PartitionType::HASH) {
     auto* hash_join = dynamic_cast<sirius_physical_hash_join*>(consumer);
     if (hash_join != nullptr && hash_join->wants_multi_partition_dynamic_filters()) {
-      // The one-shot latch test-and-set, the freeze, and the arm share one critical section:
+      // The snapshot-attempt latch, freeze, and arm share one critical section:
       // every popping thread traverses it and observes the attempt latched before reaching the
       // unlocked tail pop below, which is what keeps the snapshot freeze-before-pop exact.
       std::lock_guard<std::mutex> guard(lock);
@@ -578,7 +578,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
             this->get_operator_id());
         }
       }
-    }  // guard released: the tail pop below runs unlocked, as on every prior release
+    }  // Release the snapshot lock before the ordinary tail pop.
   }
   return sirius_physical_operator::get_next_task_input_data();
 }

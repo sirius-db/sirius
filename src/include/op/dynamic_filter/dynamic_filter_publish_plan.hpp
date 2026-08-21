@@ -148,10 +148,11 @@ class dynamic_filter_publish_plan final {
     return _policy.inlist_max_l2_fraction;
   }
   /**
-   * @brief Allocator-accounted Bloom bit-array budget for this join on each GPU
+   * @brief Allocator-accounted accumulated-Bloom bit-array budget for this join on each GPU
    *
-   * The budget is shared by every Bloom key but is not multiplied by replica count. A value of 0
-   * disables Bloom construction while leaving exact membership and zone-map filters eligible.
+   * The budget is shared by all accumulated Bloom keys but is not multiplied by replica count. A
+   * value of 0 disables multi-partition Bloom accumulation; it does not change one-shot membership
+   * or zone-map eligibility.
    *
    * @return Maximum bytes per GPU
    */

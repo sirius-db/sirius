@@ -1620,7 +1620,9 @@ static unique_ptr<GlobalTableFunctionState> DynamicFilterObservabilityInit(Clien
     throw InvalidInputException(
       "sirius_dynamic_filter_observability requires Sirius to be initialized");
   }
-  auto result    = make_uniq<DynamicFilterObservabilityState>();
+  auto result = make_uniq<DynamicFilterObservabilityState>();
+  // These are separate snapshots; consumers must exclude concurrent Sirius work before
+  // correlating counters with journal records.
   result->stats  = sirius_ctx->get_dynamic_filter_stats_snapshot();
   result->events = sirius_ctx->get_dynamic_filter_event_snapshot();
   return result;
@@ -2728,9 +2730,9 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
   add_sirius_option(config,
                     option_visibility::internal,
                     "max_dynamic_filter_bloom_bytes_per_gpu",
-                    "per-join budget for the multi-partition accumulated Bloom on each GPU; "
-                    "one-shot publication is not budget-gated; 0 disables accumulated Bloom "
-                    "construction only",
+                    "per-join budget for allocator-accounted multi-partition Bloom bit arrays on "
+                    "each GPU; transient reduction scratch is excluded; one-shot publication is "
+                    "not gated; 0 disables accumulated Bloom construction only",
                     LogicalType::UBIGINT,
                     Value::UBIGINT(operator_defaults.max_dynamic_filter_bloom_bytes_per_gpu),
                     SetMaxDynamicFilterBloomBytesPerGpu);

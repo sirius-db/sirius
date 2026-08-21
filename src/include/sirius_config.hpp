@@ -158,9 +158,10 @@ struct operator_params {
   /// enabled.
   bool enable_dynamic_filter_multi_partition = false;
 
-  /// Per-join allocator-accounted budget for the multi-partition accumulated Bloom on each GPU,
-  /// summed across its Bloom keys; the full candidate set is skipped when it exceeds the cap.
-  /// One-shot publication is not budget-gated. 0 disables accumulated Bloom construction only.
+  /// Per-join budget for allocator-accounted Bloom bit arrays used by multi-partition accumulation
+  /// on each GPU, summed across active Bloom keys. Transient reduction scratch is excluded. The
+  /// full candidate set is skipped when it exceeds the cap; one-shot publication is not gated.
+  /// Zero disables accumulated Bloom construction only.
   uint64_t max_dynamic_filter_bloom_bytes_per_gpu =
     config::DEFAULT_MAX_DYNAMIC_FILTER_BLOOM_BYTES_PER_GPU;
 

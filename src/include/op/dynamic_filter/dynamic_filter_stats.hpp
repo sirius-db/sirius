@@ -118,7 +118,7 @@ struct dynamic_filter_stats_snapshot {
 };
 
 /**
- * @brief Connection-lifetime publication counters owned by `SiriusContext`
+ * @brief SiriusContext-lifetime publication counters and bounded completion journal
  *
  * `producers_enabled` counts plan construction, not execution. Each session claim increments
  * `publication_attempts`; a claim that reaches a terminal also increments exactly one of
@@ -177,7 +177,11 @@ struct dynamic_filter_stats {
       .filters_pushed = filters_pushed.load(std::memory_order_relaxed)};
   }
 
-  /** Record one successfully completed exact-ID global accumulator. */
+  /**
+   * @brief Records a successful global-accumulator terminal
+   *
+   * A drained-target completion is successful even when no filter is published.
+   */
   void record_global_accumulator_completion(std::uint64_t join_operator_id,
                                             std::uint64_t exact_contribution_count,
                                             int root_device_id,

@@ -352,8 +352,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /**
    * @brief Contributes one original build batch before hash scatter
    *
-   * Ignored unless accumulation is active. A newly accepted contribution synchronizes @p stream
-   * before returning; an invalid contribution fails accumulation closed.
+   * Ignored unless accumulation is active. A newly accepted contribution that inserts an active
+   * Bloom key synchronizes @p stream before returning. An invalid contribution aborts only the
+   * optional publication.
    *
    * @param[in] batch_id Original pre-scatter batch ID
    * @param[in] build_view Batch containing the admitted build-key ordinals
@@ -363,7 +364,13 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
                                              cudf::table_view const& build_view,
                                              rmm::cuda_stream_view stream);
 
-  /// @brief Fails this join's in-progress dynamic-filter accumulation without failing the query.
+  /**
+   * @brief Aborts an active multi-partition dynamic-filter accumulation
+   *
+   * Does nothing unless accumulation is active. The query continues without the optional filter.
+   *
+   * @param[in] reason Diagnostic reason for the abort
+   */
   void abort_multi_partition_dynamic_filters(std::string_view reason) noexcept;
 
   [[nodiscard]] uint64_t max_build_hash_table_bytes() const noexcept

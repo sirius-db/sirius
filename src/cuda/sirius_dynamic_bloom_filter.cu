@@ -163,6 +163,7 @@ void copy_filter_storage(Filter const& source,
                                host_staging_space);
 }
 
+// Each thread owns one destination word; callers stream-order merges on the root stream.
 template <class Word>
 __global__ void or_bloom_words(Word* destination, Word const* source, std::size_t count)
 {
@@ -217,10 +218,10 @@ std::unique_ptr<bloom_replica> make_empty_bloom_replica(int device_id,
 }
 }  // namespace
 
-// Owns the complete set of ready device-local Bloom replicas.
+// Owns the source Bloom and every completed device-local replica.
 struct sirius_dynamic_bloom_filter::impl {
   int source_device = -1;
-  // Retained for null-compaction inside add() and for scratch allocation.
+  // Retained for null compaction in add().
   rmm::device_async_resource_ref mr;
   std::vector<std::unique_ptr<bloom_replica>> replicas;
   std::unique_ptr<rmm::device_buffer> reduction_scratch;
