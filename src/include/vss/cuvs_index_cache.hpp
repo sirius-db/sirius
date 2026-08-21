@@ -47,13 +47,12 @@ enum class index_kind : std::uint8_t {
 /// (type-erased) index payload so the cache can be inspected, logged, and
 /// matched without instantiating any cuVS index type.
 ///
-/// The (@c table_name, @c column_name, @c metric) triple is the index's
-/// auto-routing identity: a search recognizer resolves a query's vector column
-/// to its base (table, column) and matches it against pinned indexes here. The
-/// cache map key (i.e., the CREATE INDEX name) is separate and only used for
-/// management (i.e., drop/replace).
+/// The (@c catalog_name, @c schema_name, @c table_name, @c column_name, @c metric) tuple is
+/// the index's auto-routing identity.
 struct index_metadata {
   index_kind kind{index_kind::ivf_flat};
+  std::string catalog_name;  ///< Resolved catalog the table lives in
+  std::string schema_name;   ///< Resolved schema the table lives in
   std::string table_name;    ///< Base table the index was built on
   std::string column_name;   ///< Vector column the index was built on
   std::int64_t dim{0};       ///< Vector dimensionality
@@ -182,14 +181,16 @@ class cuvs_index_cache {
   [[nodiscard]] std::shared_ptr<const pinned_index_entry> find(std::string_view name) const;
 
   /// Find a pinned index by its auto-routing identity, i.e., the first entry whose
-  /// metadata matches (@p table, @p column, @p metric). This is the lookup a
-  /// search recognizer uses to decide whether a query can use ANN. Returns
-  /// nullptr if no pinned index covers that column under that metric. Metrics
-  /// are compared up to canonicalization: L2SqrtExpanded/L2SqrtUnexpanded fold
-  /// together, so a query's unexpanded metric still matches an index built expanded.
+  /// metadata matches (@p catalog, @p schema, @p table, @p column, @p metric).
+  /// This is the lookup a search recognizer uses to decide whether a query can use
+  /// ANN. Returns nullptr if no pinned index covers that column under that metric.
+  /// Metrics are compared up to canonicalization: L2SqrtExpanded/L2SqrtUnexpanded fold together,
+  /// so a query's unexpanded metric still matches an index built expanded.
   ///
   /// Like @ref find, the returned handle keeps the entry alive while held.
   [[nodiscard]] std::shared_ptr<const pinned_index_entry> find_by_column(
+    std::string_view catalog,
+    std::string_view schema,
     std::string_view table,
     std::string_view column,
     cuvs::distance::DistanceType metric) const;

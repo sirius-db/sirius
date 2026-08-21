@@ -32,10 +32,16 @@ using sirius::vss::index_kind;
 using sirius::vss::index_metadata;
 using Metric = cuvs::distance::DistanceType;
 
-index_metadata make_meta(std::string table, std::string column, Metric metric)
+index_metadata make_meta(std::string table,
+                         std::string column,
+                         Metric metric,
+                         std::string catalog = "mem",
+                         std::string schema  = "main")
 {
   index_metadata meta;
   meta.kind           = index_kind::ivf_flat;
+  meta.catalog_name   = std::move(catalog);
+  meta.schema_name    = std::move(schema);
   meta.table_name     = std::move(table);
   meta.column_name    = std::move(column);
   meta.dim            = 3;
@@ -87,23 +93,31 @@ TEST_CASE("cuvs_index_cache find_by_column matches the auto-routing identity", "
 
   insert_dummy(cache, "idx", make_meta("docs", "vec", Metric::L2SqrtExpanded));
 
-  SECTION("exact (table, column, metric) match hits")
+  SECTION("exact (catalog, schema, table, column, metric) match hits")
   {
-    auto e = cache.find_by_column("docs", "vec", Metric::L2SqrtExpanded);
+    auto e = cache.find_by_column("mem", "main", "docs", "vec", Metric::L2SqrtExpanded);
     REQUIRE(e != nullptr);
     REQUIRE(e->meta.table_name == "docs");
   }
   SECTION("wrong column misses")
   {
-    REQUIRE(cache.find_by_column("docs", "other", Metric::L2SqrtExpanded) == nullptr);
+    REQUIRE(cache.find_by_column("mem", "main", "docs", "other", Metric::L2SqrtExpanded) == nullptr);
   }
   SECTION("wrong table misses")
   {
-    REQUIRE(cache.find_by_column("other", "vec", Metric::L2SqrtExpanded) == nullptr);
+    REQUIRE(cache.find_by_column("mem", "main", "other", "vec", Metric::L2SqrtExpanded) == nullptr);
+  }
+  SECTION("wrong schema misses (a same-named table in another schema does not route here)")
+  {
+    REQUIRE(cache.find_by_column("mem", "other", "docs", "vec", Metric::L2SqrtExpanded) == nullptr);
+  }
+  SECTION("wrong catalog misses")
+  {
+    REQUIRE(cache.find_by_column("other", "main", "docs", "vec", Metric::L2SqrtExpanded) == nullptr);
   }
   SECTION("right column but wrong metric misses (an l2 index can't serve a cosine query)")
   {
-    REQUIRE(cache.find_by_column("docs", "vec", Metric::CosineExpanded) == nullptr);
+    REQUIRE(cache.find_by_column("mem", "main", "docs", "vec", Metric::CosineExpanded) == nullptr);
   }
 }
 
@@ -115,17 +129,17 @@ TEST_CASE("cuvs_index_cache find_by_column folds L2 expanded/unexpanded", "[vss]
   SECTION("index built L2SqrtExpanded matches an L2SqrtUnexpanded query")
   {
     insert_dummy(cache, "idx", make_meta("docs", "vec", Metric::L2SqrtExpanded));
-    REQUIRE(cache.find_by_column("docs", "vec", Metric::L2SqrtUnexpanded) != nullptr);
+    REQUIRE(cache.find_by_column("mem", "main", "docs", "vec", Metric::L2SqrtUnexpanded) != nullptr);
   }
   SECTION("index built L2SqrtUnexpanded matches an L2SqrtExpanded query")
   {
     insert_dummy(cache, "idx", make_meta("docs", "vec", Metric::L2SqrtUnexpanded));
-    REQUIRE(cache.find_by_column("docs", "vec", Metric::L2SqrtExpanded) != nullptr);
+    REQUIRE(cache.find_by_column("mem", "main", "docs", "vec", Metric::L2SqrtExpanded) != nullptr);
   }
   SECTION("the fold stays within the metric family (an L2 query misses a cosine index)")
   {
     insert_dummy(cache, "idx", make_meta("docs", "vec", Metric::CosineExpanded));
-    REQUIRE(cache.find_by_column("docs", "vec", Metric::L2SqrtUnexpanded) == nullptr);
+    REQUIRE(cache.find_by_column("mem", "main", "docs", "vec", Metric::L2SqrtUnexpanded) == nullptr);
   }
 }
 
@@ -179,10 +193,30 @@ TEST_CASE("cuvs_index_cache find_by_column returns a match among several entries
   insert_dummy(cache, "idx_b", make_meta("docs", "vec", Metric::L2SqrtExpanded));
   insert_dummy(cache, "idx_c", make_meta("docs", "title_vec", Metric::L2SqrtExpanded));
 
-  auto e = cache.find_by_column("docs", "title_vec", Metric::L2SqrtExpanded);
+  auto e = cache.find_by_column("mem", "main", "docs", "title_vec", Metric::L2SqrtExpanded);
   REQUIRE(e != nullptr);
   REQUIRE(e->meta.table_name == "docs");
   REQUIRE(e->meta.column_name == "title_vec");
+}
+
+TEST_CASE("cuvs_index_cache keeps same-named tables in different schemas distinct", "[vss]")
+{
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  cuvs_index_cache cache(*manager);
+
+  // s1.docs.vec and s2.docs.vec share table/column/metric and differ only by schema.
+  insert_dummy(cache, "s1_idx", make_meta("docs", "vec", Metric::L2SqrtExpanded, "mem", "s1"));
+  insert_dummy(cache, "s2_idx", make_meta("docs", "vec", Metric::L2SqrtExpanded, "mem", "s2"));
+
+  REQUIRE(cache.size() == 2);  // distinct identities, not a replace
+
+  auto e1 = cache.find_by_column("mem", "s1", "docs", "vec", Metric::L2SqrtExpanded);
+  auto e2 = cache.find_by_column("mem", "s2", "docs", "vec", Metric::L2SqrtExpanded);
+  REQUIRE(e1 != nullptr);
+  REQUIRE(e2 != nullptr);
+  REQUIRE(e1->meta.schema_name == "s1");
+  REQUIRE(e2->meta.schema_name == "s2");
+  REQUIRE(e1 != e2);  // each schema routes to its own index
 }
 
 TEST_CASE("cuvs_index_cache lookup handle outlives an erase", "[vss]")

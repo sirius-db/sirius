@@ -1747,12 +1747,6 @@ static unique_ptr<FunctionData> SiriusCreateAnnIndexBind(ClientContext& context,
     throw BinderException("sirius_create_ann_index: n_lists must be >= 0");
   }
 
-  // Default the management name from the index identity when not given.
-  if (result->index_name.empty()) {
-    result->index_name =
-      result->table_name + "_" + result->column_name + "_" + result->metric + "_ann";
-  }
-
   return_types.emplace_back(LogicalType::BOOLEAN);
   names.emplace_back("Success");
   return std::move(result);
@@ -1873,6 +1867,8 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
 
   sirius::vss::index_metadata meta;
   meta.kind           = ann_index_kind_from_type(data.index_type);
+  meta.catalog_name   = entry_catalog;  // resolved identity, matches the pin cache + query side
+  meta.schema_name    = entry_schema;
   meta.table_name     = entry.name;  // catalog-resolved name (matches query-side derivation)
   meta.column_name    = data.column_name;
   meta.dim            = dim;
@@ -1880,7 +1876,15 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   meta.n_lists        = static_cast<int64_t>(n_lists);
   meta.metric         = metric;
   meta.reserved_bytes = reservation->size();
-  index_cache.insert(data.index_name, std::move(meta), std::move(handle), std::move(reservation));
+
+  // Default the management name from its identity when not given.
+  std::string index_name = data.index_name;
+  if (index_name.empty()) {
+    index_name = entry_catalog + "_" + entry_schema + "_" + entry.name + "_" + data.column_name +
+                 "_" + data.metric + "_ann";
+  }
+  index_cache.insert(
+    std::move(index_name), std::move(meta), std::move(handle), std::move(reservation));
 
   output.SetCardinality(1);
   output.SetValue(0, 0, Value::BOOLEAN(true));

@@ -90,13 +90,18 @@ std::shared_ptr<const pinned_index_entry> cuvs_index_cache::find(std::string_vie
 }
 
 std::shared_ptr<const pinned_index_entry> cuvs_index_cache::find_by_column(
-  std::string_view table, std::string_view column, cuvs::distance::DistanceType metric) const
+  std::string_view catalog,
+  std::string_view schema,
+  std::string_view table,
+  std::string_view column,
+  cuvs::distance::DistanceType metric) const
 {
   std::lock_guard<std::mutex> lock(_mutex);
   auto const wanted = canonical_metric(metric);
   for (auto const& kv : _entries) {
     auto const& entry = kv.second;
-    if (entry->meta.table_name == table && entry->meta.column_name == column &&
+    if (entry->meta.catalog_name == catalog && entry->meta.schema_name == schema &&
+        entry->meta.table_name == table && entry->meta.column_name == column &&
         canonical_metric(entry->meta.metric) == wanted) {
       return entry;
     }
