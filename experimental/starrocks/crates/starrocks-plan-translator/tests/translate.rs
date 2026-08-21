@@ -3531,3 +3531,82 @@ fn sort_with_conjuncts_is_rejected() {
         "{err:?}"
     );
 }
+
+/// Reads a relation's `RelCommon` emit mapping — what a consumer actually projects by.
+fn emit_mapping(common: Option<&substrait::proto::RelCommon>) -> Vec<i32> {
+    let Some(substrait::proto::rel_common::EmitKind::Emit(emit)) =
+        common.and_then(|common| common.emit_kind.as_ref())
+    else {
+        panic!("expected an explicit emit mapping");
+    };
+    emit.output_mapping.clone()
+}
+
+/// A two-column left side and a one-column right side, so the synthetic-key arithmetic cannot be
+/// satisfied by more than one formula.
+fn asymmetric_join_desc() -> TDescriptorTable {
+    desc_table(
+        vec![(0, Some(100)), (1, Some(100))],
+        vec![
+            slot(1, 0, "a", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "a2", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 1, "b", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    )
+}
+
+/// Pins the synthetic-key index arithmetic, which is the only thing in this lowering that can be
+/// wrong. With one column per side every off-by-one formula produces the same numbers; with a
+/// 2x1 descriptor the join row is `[a, a2, key_l, b, key_r]`, so the condition must compare
+/// fields 2 and 4 and the projection must emit `[0, 1, 3]` — dropping both synthetic keys.
+#[test]
+fn constant_key_join_indexes_past_the_synthetic_keys() {
+    let join = nestloop_join_node(
+        TJoinOp::CROSS_JOIN,
+        vec![binary_pred(
+            TExprOpcode::LT,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        )],
+    );
+    let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+    let translated =
+        translate_fragment(&params(Some(plan), Some(asymmetric_join_desc()), None)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["a", "a2", "b"]);
+    let rel::RelType::Filter(filter) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected filter over constant-key join");
+    };
+    let rel::RelType::Project(project) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected output projection under filter");
+    };
+    // The projection only drops columns; it must not compute anything.
+    assert!(project.expressions.is_empty());
+    assert_eq!(emit_mapping(project.common.as_ref()), vec![0, 1, 3]);
+
+    let rel::RelType::Join(join) = project.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected constant-key join under projection");
+    };
+    let expression::RexType::ScalarFunction(condition) =
+        join.expression.as_ref().unwrap().rex_type.as_ref().unwrap()
+    else {
+        panic!("expected a scalar-function join condition");
+    };
+    let operands: Vec<_> = condition
+        .arguments
+        .iter()
+        .map(|arg| {
+            let substrait::proto::function_argument::ArgType::Value(expr) =
+                arg.arg_type.as_ref().unwrap()
+            else {
+                panic!("expected a value argument");
+            };
+            field_index(expr)
+        })
+        .collect();
+    assert_eq!(operands, vec![2, 4]);
+}
