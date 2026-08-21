@@ -111,7 +111,7 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
  public:
   readahead_scan_manager() = default;
   /// Stops and joins the worker.
-  ~readahead_scan_manager();
+  ~readahead_scan_manager() override;
   readahead_scan_manager(readahead_scan_manager const&)            = delete;
   readahead_scan_manager& operator=(readahead_scan_manager const&) = delete;
 
@@ -151,22 +151,15 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
                                     int gpu_id,
                                     std::size_t shortfall_bytes) noexcept override;
 
-  /// Request the worker to stop and join it.  Safe to call when not started.
-  void stop() noexcept;
-
-  [[nodiscard]] bool is_running() const noexcept;
-
-  /// Seed the per-operator readahead order for @p query.
-  void prepare_for_query(const sirius::planner::query& query);
-
-  /// Seed directly from a prefetching order, bypassing plan analysis.  The
-  /// query path is this plus @c query_index::prefetching_orders.
-  void prepare_for_order(std::span<const planner::prefetch_step> order);
-
-  /// Record a split under the operator that produced it.  Splits are kept in
-  /// emission order, which is the order the worker prefetches them in.
-  void register_scan_task(std::shared_ptr<op::scan::scan_info> const& task,
-                          std::size_t operator_id);
+  /// An executor is about to block waiting for memory to free up.  Same shape
+  /// of opportunity as @ref on_memory_downgrade_for_task and handled the same
+  /// way: the task is parked and the GPU is about to be idle, so the device's
+  /// IO path is free and read-ahead costs the executor nothing it wanted.
+  /// Ignored under @c eager, which is already reading as far ahead as it can.
+  void on_wait_for_memory_for_task(query_id_t query_id,
+                                   std::size_t operator_id,
+                                   int gpu_id,
+                                   std::size_t bytes_needed) noexcept override;
 
   /// Report that @p task, emitted under @p operator_id, reached @p stage.
   /// Wakes the worker so a freed slot is refilled.
@@ -183,6 +176,23 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   /// Called from every close path of the producer, including failures: a slot
   /// that closed with an exception emits nothing further either.
   void mark_operator_closed(std::size_t operator_id);
+
+  /// Request the worker to stop and join it.  Safe to call when not started.
+  void stop() noexcept;
+
+  [[nodiscard]] bool is_running() const noexcept;
+
+  /// Seed the per-operator readahead order for @p query.
+  void prepare_for_query(const sirius::planner::query& query);
+
+  /// Seed directly from a prefetching order, bypassing plan analysis.  The
+  /// query path is this plus @c query_index::prefetching_orders.
+  void prepare_for_order(std::span<const planner::prefetch_step> order);
+
+  /// Record a split under the operator that produced it.  Splits are kept in
+  /// emission order, which is the order the worker prefetches them in.
+  void register_scan_task(std::shared_ptr<op::scan::scan_info> const& task,
+                          std::size_t operator_id);
 
   /// The scan that should be prefetched next, or nullptr once the query's
   /// prefetching order is exhausted.  Consumes one unit of the current step's

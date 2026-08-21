@@ -183,7 +183,29 @@ void gpu_pipeline_executor::manager_loop()
       _memory_space->get_available_memory(),
       _memory_space->get_total_reserved_memory(),
       _memory_space->get_max_memory());
-    auto reservation = _memory_space->make_reservation(bytes_needs);
+    // Try without blocking first, purely so the blocking case can be reported.
+    // make_reservation() parks until the memory frees up, and a listener told
+    // only once it returns learns nothing it can act on -- by then the stall it
+    // would have exploited is over.  A reservation that succeeds outright is the
+    // common case and raises nothing.
+    auto reservation = _memory_space->make_reservation_or_null(bytes_needs);
+    if (!reservation) {
+      if (_query_stage_manager) {
+        std::size_t stalled_operator_id = op::sirius_physical_operator::invalid_operator_id;
+        if (auto const* pipe = gpu_task->get_pipeline()) {
+          if (auto src = pipe->get_source(); src && src->has_operator_id()) {
+            stalled_operator_id = src->get_operator_id();
+          }
+        }
+        _query_stage_manager->notify_wait_for_memory_for_task(
+          make_query_id(
+            static_cast<std::uint32_t>(static_cast<std::uint64_t>(gpu_task->get_priority()) >> 32)),
+          stalled_operator_id,
+          _memory_space != nullptr ? _memory_space->get_device_id() : -1,
+          bytes_needs);
+      }
+      reservation = _memory_space->make_reservation(bytes_needs);
+    }
     if (!reservation) {
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to acquire memory reservation for task {}",
                        gpu_task->get_task_id());

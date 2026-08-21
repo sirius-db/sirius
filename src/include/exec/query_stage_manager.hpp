@@ -111,6 +111,22 @@ class query_stage_listener {
                                             std::size_t shortfall_bytes) noexcept
   {
   }
+
+  /// An executor could not reserve @p bytes_needed for the task from
+  /// @p operator_id on @p gpu_id and is about to block until the memory frees
+  /// up.  Distinct from @ref on_memory_downgrade_for_task, which is the executor
+  /// actively spilling to make room: here it is simply waiting on someone else
+  /// to release.  Either way the task is parked and the GPU is about to do no
+  /// work, which is what makes it worth reporting.
+  ///
+  /// Raised BEFORE the blocking call, because a listener told only once the wait
+  /// is over learns nothing it can act on.
+  virtual void on_wait_for_memory_for_task(query_id_t query_id,
+                                           std::size_t operator_id,
+                                           int gpu_id,
+                                           std::size_t bytes_needed) noexcept
+  {
+  }
 };
 
 /**
@@ -237,6 +253,17 @@ class query_stage_manager : public std::enable_shared_from_this<query_stage_mana
     std::shared_lock g{_listeners_mtx};
     for (auto const& l : _listeners) {
       l->on_memory_downgrade_for_task(query_id, operator_id, gpu_id, shortfall_bytes);
+    }
+  }
+
+  void notify_wait_for_memory_for_task(query_id_t query_id,
+                                       std::size_t operator_id,
+                                       int gpu_id,
+                                       std::size_t bytes_needed) noexcept
+  {
+    std::shared_lock g{_listeners_mtx};
+    for (auto const& l : _listeners) {
+      l->on_wait_for_memory_for_task(query_id, operator_id, gpu_id, bytes_needed);
     }
   }
 

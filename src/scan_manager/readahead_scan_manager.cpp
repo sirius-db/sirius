@@ -77,6 +77,24 @@ void readahead_scan_manager::on_memory_downgrade_for_task(query_id_t,
   _cv.notify_one();
 }
 
+void readahead_scan_manager::on_wait_for_memory_for_task(query_id_t,
+                                                         std::size_t,
+                                                         int,
+                                                         std::size_t) noexcept
+{
+  if (_strategy != prefetch_strategy::opportunistic) { return; }
+  {
+    std::lock_guard lock{_mutex};
+    // Same reasoning as a downgrade stall: the executor is parked, so there is
+    // no read order left to stay in step with and the useful thing is to be
+    // further ahead when it resumes.
+    _credits       = std::max(_credits, _budget);
+    _may_run_ahead = true;
+    _wake          = true;
+  }
+  _cv.notify_one();
+}
+
 void readahead_scan_manager::on_task_queue_empty() noexcept
 {
   if (_strategy != prefetch_strategy::opportunistic) { return; }
@@ -534,9 +552,14 @@ readahead_scan_manager::collect_prefetch_batch_locked()
 
   // Falling out of the while condition (rather than through a break) means the
   // budget -- or, for opportunistic, the invitation -- ran out rather than the
-  // order.  Only a genuinely full budget is reported as such.
+  // order.  The two are reported apart: a full budget is the readahead working
+  // as hard as it is allowed to, whereas spare budget with no credits left is
+  // the strategy holding it back, and only one of those is a reason to change
+  // anything.  Budget wins the tie, being the harder limit.
   if (!stopped && ongoing >= _budget) {
     census.stop_budget_full.fetch_add(1, std::memory_order_relaxed);
+  } else if (!stopped && allowance == 0) {
+    census.stop_no_credits.fetch_add(1, std::memory_order_relaxed);
   }
   return batch;
 }
@@ -546,6 +569,24 @@ void readahead_scan_manager::issue_prefetches(std::vector<pending_prefetch> batc
   for (auto& p : batch) {
     io::prefetch_census::instance().note_issue(p.operator_id);
     auto const* key = p.task.get();
+
+    // Buffers first, on this thread.  A chunk with no staging buffer cannot be
+    // claimed for loading, so a prefetch issued over one reads nothing and
+    // settles `ready` having done nothing -- and the reader then pays for the
+    // whole split.  Waiting for the evictor here IS the back-pressure: there is
+    // no point issuing more read-ahead while the pool has nothing to give, and
+    // stalling the readahead is exactly the right thing to do about it.
+    auto const prep = p.task->prepare_for_prefetching(/*wait_for_eviction=*/true);
+    if (!prep.ready()) {
+      // Nothing to issue.  Settle the attempt here rather than calling prefetch
+      // to be told the same: the slot has to be freed and the verdict recorded
+      // either way, and this keeps the failure off the IO path entirely.
+      on_prefetch_complete(p.operator_id,
+                           key,
+                           /*allocation_failed=*/prep.failed > 0,
+                           /*issued_io=*/false);
+      continue;
+    }
 
     // The split fans the request out over its own datasources and reports once
     // they have all landed.  Nothing is waited on here: that single report is
