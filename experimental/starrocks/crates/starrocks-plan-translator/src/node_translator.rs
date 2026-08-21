@@ -761,18 +761,18 @@ fn translate_nestloop_join(
         ],
         crate::type_mapper::bool_type(),
     );
-    let joined = TranslatedRel {
-        rel: Rel {
-            rel_type: Some(rel::RelType::Join(Box::new(JoinRel {
-                left: Some(Box::new(left.rel)),
-                right: Some(Box::new(right.rel)),
-                expression: Some(Box::new(condition)),
-                r#type: join_rel::JoinType::Inner as i32,
-                ..Default::default()
-            }))),
-        },
-        row_tuples: row_tuples.clone(),
-        output_width: left.output_width + right.output_width,
+    // Kept as a bare `Rel`, not a `TranslatedRel`: the join row carries both synthetic keys, so
+    // it is two columns wider than `row_tuples` describes, and a `TranslatedRel` claiming that
+    // layout would resolve every right-side slot to the wrong index. The projection below drops
+    // the keys and restores the invariant.
+    let joined = Rel {
+        rel_type: Some(rel::RelType::Join(Box::new(JoinRel {
+            left: Some(Box::new(left.rel)),
+            right: Some(Box::new(right.rel)),
+            expression: Some(Box::new(condition)),
+            r#type: join_rel::JoinType::Inner as i32,
+            ..Default::default()
+        }))),
     };
     let mut mapping = (0..left_width as i32).collect::<Vec<_>>();
     mapping.extend(left.output_width as i32..left.output_width as i32 + right_width as i32);
@@ -1005,11 +1005,7 @@ fn append_project(input: TranslatedRel, expression: Expression) -> TranslatedRel
 }
 
 /// Emits selected input columns without evaluating new expressions.
-fn emit_columns(
-    input: TranslatedRel,
-    output_mapping: Vec<i32>,
-    row_tuples: Vec<i32>,
-) -> TranslatedRel {
+fn emit_columns(input: Rel, output_mapping: Vec<i32>, row_tuples: Vec<i32>) -> TranslatedRel {
     let output_width = output_mapping.len();
     TranslatedRel {
         rel: Rel {
@@ -1020,7 +1016,7 @@ fn emit_columns(
                     })),
                     ..Default::default()
                 }),
-                input: Some(Box::new(input.rel)),
+                input: Some(Box::new(input)),
                 ..Default::default()
             }))),
         },
