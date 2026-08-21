@@ -517,14 +517,13 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
     // the deferred positions then hold a rowid and placeholders, which it skips, and the elided
     // columns are back so the arity check holds.
     if (has_explicit_physical_schema || scan_input->is_resident()) {
-      output_table = normalize_physical_schema(
-        std::move(output_table),
-        targets,
-        has_explicit_physical_schema,
-        wants_survivors ? &deferred_output() : nullptr,
-        _compressed_materialization_observer,
-        stream,
-        mem_space->get_default_allocator());
+      output_table = normalize_physical_schema(std::move(output_table),
+                                               targets,
+                                               has_explicit_physical_schema,
+                                               wants_survivors ? &deferred_output() : nullptr,
+                                               _compressed_materialization_observer,
+                                               stream,
+                                               mem_space->get_default_allocator());
     }
   }
 
