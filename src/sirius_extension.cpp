@@ -1730,6 +1730,7 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   req.catalog             = entry.ParentCatalog().GetName();
   req.schema              = entry.ParentSchema().name;
   req.table_name          = entry.name;  // catalog-resolved name (matches query-side derivation)
+  req.table_oid           = entry.oid;
   auto const& columns     = entry.GetColumns();
   auto const schema_names = columns.GetColumnNames();
   auto const schema_types = columns.GetColumnTypes();
@@ -1740,7 +1741,7 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
     throw InvalidInputException("sirius_knn_search requires the Sirius context to be initialized");
   }
   const auto* pin = sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
-    req.catalog, req.schema, req.table_name);
+    req.catalog, req.schema, req.table_name, req.table_oid);
   if (pin == nullptr) {
     throw BinderException("sirius_knn_search: table '" + req.table_name +
                           "' must be pinned before it can be searched");

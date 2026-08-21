@@ -35,6 +35,7 @@ struct vector_search_request {
   std::string catalog;                      ///< Resolved catalog of the pinned table.
   std::string schema;                       ///< Resolved schema of the pinned table.
   std::string table_name;                   ///< GPU-pinned base table to search.
+  std::uint64_t table_oid{0};               ///< Resolved table catalog object id.
   std::string column_name;                  ///< FLOAT[dim] vector column.
   std::string metric;                       ///< Distance metric.
   std::vector<float> query;                 ///< Query vector, length == dim.

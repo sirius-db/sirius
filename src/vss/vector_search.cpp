@@ -90,7 +90,7 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search(
   // The table must be GPU-pinned: the search reads its vectors and gathers the
   // output columns straight from GPU-resident chunks (same order the index built in).
   const auto* pin = ctx.get_scan_manager().find_pinned_entry_for_duckdb_table(
-    req.catalog, req.schema, req.table_name);
+    req.catalog, req.schema, req.table_name, req.table_oid);
   if (pin == nullptr || pin->tier != cucascade::memory::Tier::GPU) {
     throw duckdb::InvalidInputException("sirius_knn_search: table '" + req.table_name +
                                         "' must be pinned on the GPU tier");
