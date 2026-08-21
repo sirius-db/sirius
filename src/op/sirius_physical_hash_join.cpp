@@ -523,32 +523,6 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   }
 };
 
-sirius_physical_hash_join::sirius_physical_hash_join(
-  duckdb::LogicalOperator& op,
-  duckdb::unique_ptr<sirius_physical_operator> left,
-  duckdb::unique_ptr<sirius_physical_operator> right,
-  duckdb::vector<sirius::join_condition> cond,
-  duckdb::JoinType join_type,
-  std::size_t estimated_cardinality,
-  uint64_t max_build_hash_table_bytes,
-  uint64_t hash_partition_bytes,
-  uint64_t max_broadcast_join_size)
-  : sirius_physical_hash_join(op,
-                              std::move(left),
-                              std::move(right),
-                              std::move(cond),
-                              join_type,
-                              {},
-                              {},
-                              {},
-                              estimated_cardinality,
-                              max_build_hash_table_bytes,
-                              {},
-                              hash_partition_bytes,
-                              max_broadcast_join_size)
-{
-}
-
 //===--------------------------------------------------------------------===//
 // Pipeline Construction
 //===--------------------------------------------------------------------===//
@@ -951,6 +925,12 @@ void sirius_physical_hash_join::contribute_dynamic_filter_build_batch(
   uint64_t batch_id, cudf::table_view const& build_view, rmm::cuda_stream_view stream)
 {
   _dynamic_filter_publication_session.contribute(get_operator_id(), batch_id, build_view, stream);
+}
+
+void sirius_physical_hash_join::abort_multi_partition_dynamic_filters(
+  std::string_view reason) noexcept
+{
+  _dynamic_filter_publication_session.abort_accumulation(reason);
 }
 
 void sirius_physical_hash_join::set_build_arrives_whole(bool arrives_whole)
@@ -2158,19 +2138,20 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
   std::size_t partition_idx)
 {
   // Publish only from a complete build; a partial filter could drop valid join rows.
-  // The session claims lazily inside publish_one_shot, so an attempt abandoned before
-  // publication begins leaves the window open for a sibling broadcast delivery.
-  bool attempt_publish = false;
+  bool claimed = false;
   if (port_id == "build" && batch) {
     bool wired_but_unusable = false;
     HASH_JOIN_MODE mode     = HASH_JOIN_MODE::STANDARD;
     {
       std::scoped_lock lg(op_state_mutex);
-      auto const open  = _dynamic_filter_publication_session.is_open();
       auto const wired = _dynamic_filter_publication_session.enabled();
-      attempt_publish  = open && wired && _build_arrives_whole;
-
-      wired_but_unusable = open && wired && !attempt_publish && !_build_not_whole_reported;
+      // Claim before routing: routing below can finish the build pipeline and run
+      // on_finalize_operator, and finalization must never close a window this delivery already
+      // owns. The session CAS makes claim-vs-finalize atomic.
+      claimed =
+        wired && _build_arrives_whole && _dynamic_filter_publication_session.try_claim_one_shot();
+      wired_but_unusable = wired && !claimed && !_build_not_whole_reported &&
+                           _dynamic_filter_publication_session.is_open();
       if (wired_but_unusable) { _build_not_whole_reported = true; }
       mode = _join_mode;
     }
@@ -2191,63 +2172,72 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
     }
   }
 
-  if (!attempt_publish) {
+  if (!claimed) {
     sirius_physical_partition_consumer_operator::push_data_batch_partitioned(
       port_id, batch, partition_idx);
     return;
   }
 
-  // Acquire the read lock before routing makes the batch eligible for downgrade.
-  auto build_ro = batch->to_read_only();
-  sirius_physical_partition_consumer_operator::push_data_batch_partitioned(
-    port_id, batch, partition_idx);
+  try {
+    // Acquire the read lock before routing makes the batch eligible for downgrade.
+    auto build_ro = batch->to_read_only();
+    sirius_physical_partition_consumer_operator::push_data_batch_partitioned(
+      port_id, batch, partition_idx);
 
-  nvtx3::scoped_range nvtx_range{"dynfilter::publish_hook"};
-  auto* ms = build_ro.get_data() ? build_ro.get_memory_space() : nullptr;
-  bool const gpu_resident =
-    ms != nullptr && build_ro.get_current_tier() == ::cucascade::memory::Tier::GPU;
-  bool const source_usable =
-    gpu_resident && _dynamic_filter_plan.has_replica_on_device(ms->get_device_id());
-  if (!source_usable) {
-    _dynamic_filter_publication_session.record_source_not_resident();
-    if (gpu_resident) {
-      SIRIUS_LOG_DEBUG(
-        "[sirius_physical_hash_join] dynamic-filter publication (id={}) skipped: the "
-        "whole-build batch is resident on GPU {}, a device this join's plan holds no replica "
-        "space for.",
-        get_operator_id(),
-        ms->get_device_id());
+    nvtx3::scoped_range nvtx_range{"dynfilter::publish_hook"};
+    auto* ms = build_ro.get_data() ? build_ro.get_memory_space() : nullptr;
+    bool const gpu_resident =
+      ms != nullptr && build_ro.get_current_tier() == ::cucascade::memory::Tier::GPU;
+    bool const source_usable =
+      gpu_resident && _dynamic_filter_plan.has_replica_on_device(ms->get_device_id());
+    if (!source_usable) {
+      // Release the claim so a sibling broadcast delivery can publish, then record the skip. A
+      // sibling claiming between the two calls suppresses the skip counter once; the gate is
+      // accepted as-is because the skip counter is diagnostic, not an accounting identity.
+      _dynamic_filter_publication_session.reopen_from_claim();
+      _dynamic_filter_publication_session.record_source_not_resident();
+      if (gpu_resident) {
+        SIRIUS_LOG_DEBUG(
+          "[sirius_physical_hash_join] dynamic-filter publication (id={}) skipped: the "
+          "whole-build batch is resident on GPU {}, a device this join's plan holds no replica "
+          "space for.",
+          get_operator_id(),
+          ms->get_device_id());
+      } else {
+        SIRIUS_LOG_DEBUG(
+          "[sirius_physical_hash_join] dynamic-filter publication (id={}) skipped: the "
+          "whole-build batch is not GPU-resident.",
+          get_operator_id());
+      }
+      return;
+    }
+
+    // Wait for the build writer before reading on the publication stream.
+    rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{ms->get_device_id()}};
+    auto publish_stream = ms->acquire_stream();
+    if (auto const writer_event = build_ro.get_writer_event(); writer_event != nullptr) {
+      auto const status = cudaStreamWaitEvent(publish_stream.value(), writer_event, 0);
+      if (status != cudaSuccess) {
+        throw std::runtime_error(
+          std::string("[sirius_physical_hash_join::push_data_batch_partitioned] dynamic-filter "
+                      "writer-event wait failed: ") +
+          cudaGetErrorString(status));
+      }
     } else {
-      SIRIUS_LOG_DEBUG(
-        "[sirius_physical_hash_join] dynamic-filter publication (id={}) skipped: the "
-        "whole-build batch is not GPU-resident.",
-        get_operator_id());
+      auto const status = cudaDeviceSynchronize();
+      if (status != cudaSuccess) {
+        throw std::runtime_error(
+          std::string("[sirius_physical_hash_join::push_data_batch_partitioned] dynamic-filter "
+                      "source synchronization failed: ") +
+          cudaGetErrorString(status));
+      }
     }
-    // The unclaimed session stays open for another broadcast delivery.
-    return;
+    publish_dynamic_filters(sirius::get_cudf_table_view(build_ro), publish_stream);
+  } catch (...) {
+    // Resolves only a claim publish_one_shot did not already resolve.
+    _dynamic_filter_publication_session.fail_claim();
+    throw;
   }
-
-  // Wait for the build writer before reading on the publication stream.
-  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{ms->get_device_id()}};
-  auto publish_stream = ms->acquire_stream();
-  if (auto const writer_event = build_ro.get_writer_event(); writer_event != nullptr) {
-    auto const status = cudaStreamWaitEvent(publish_stream.value(), writer_event, 0);
-    if (status != cudaSuccess) {
-      throw std::runtime_error(
-        std::string("[sirius_physical_hash_join::push_data_batch_partitioned] dynamic-filter "
-                    "writer-event wait failed: ") +
-        cudaGetErrorString(status));
-    }
-  } else {
-    auto const status = cudaDeviceSynchronize();
-    if (status != cudaSuccess) {
-      throw std::runtime_error(
-        std::string("[sirius_physical_hash_join::push_data_batch_partitioned] dynamic-filter "
-                    "source synchronization failed: ") +
-        cudaGetErrorString(status));
-    }
-  }
-  publish_dynamic_filters(sirius::get_cudf_table_view(build_ro), publish_stream);
 }
 
 void sirius_physical_hash_join::on_finalize_operator()

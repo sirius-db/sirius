@@ -1655,6 +1655,8 @@ static void DynamicFilterObservabilityFunction(ClientContext&,
   auto set_null = [&](idx_t column, idx_t row, LogicalType type) {
     output.SetValue(column, row, Value(std::move(type)));
   };
+  // `state.stats` is an immutable snapshot, so one materialization serves the whole chunk.
+  auto const named_stats = state.stats.named_values();
   while (state.next_row < total && output_rows < STANDARD_VECTOR_SIZE) {
     if (state.next_row == 0) {
       output.SetValue(record_type_col, output_rows, Value("stats"));
@@ -1669,7 +1671,6 @@ static void DynamicFilterObservabilityFunction(ClientContext&,
       set_null(filters_col, output_rows, LogicalType::UBIGINT);
       set_null(active_targets_col, output_rows, LogicalType::UBIGINT);
       set_null(filters_pushed_col, output_rows, LogicalType::UBIGINT);
-      auto const named_stats = state.stats.named_values();
       for (idx_t stat_idx = 0; stat_idx < named_stats.size(); ++stat_idx) {
         output.SetValue(
           stats_begin + stat_idx, output_rows, Value::UBIGINT(named_stats[stat_idx].value));
@@ -1688,7 +1689,7 @@ static void DynamicFilterObservabilityFunction(ClientContext&,
       output.SetValue(filters_col, output_rows, Value::UBIGINT(event.filters_built));
       output.SetValue(active_targets_col, output_rows, Value::UBIGINT(event.active_targets));
       output.SetValue(filters_pushed_col, output_rows, Value::UBIGINT(event.filters_pushed));
-      for (idx_t stat_idx = 0; stat_idx < state.stats.named_values().size(); ++stat_idx) {
+      for (idx_t stat_idx = 0; stat_idx < named_stats.size(); ++stat_idx) {
         set_null(stats_begin + stat_idx, output_rows, LogicalType::UBIGINT);
       }
     }
@@ -2727,8 +2728,9 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
   add_sirius_option(config,
                     option_visibility::internal,
                     "max_dynamic_filter_bloom_bytes_per_gpu",
-                    "maximum allocator-accounted Bloom bit-array bytes produced by one join on "
-                    "each GPU; 0 disables Bloom construction",
+                    "per-join budget for the multi-partition accumulated Bloom on each GPU; "
+                    "one-shot publication is not budget-gated; 0 disables accumulated Bloom "
+                    "construction only",
                     LogicalType::UBIGINT,
                     Value::UBIGINT(operator_defaults.max_dynamic_filter_bloom_bytes_per_gpu),
                     SetMaxDynamicFilterBloomBytesPerGpu);

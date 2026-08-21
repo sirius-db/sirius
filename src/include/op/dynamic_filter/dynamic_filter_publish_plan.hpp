@@ -58,7 +58,8 @@ struct dynamic_filter_publication_policy {
   bool emit_zone_map_filters       = false;
   double domain_coverage_threshold = k_default_domain_coverage_threshold;
   double inlist_max_l2_fraction    = k_default_inlist_max_l2_fraction;
-  /// Allocator-accounted Bloom bit-array budget for one join on each GPU
+  /// Allocator-accounted budget for one join's multi-partition accumulated Bloom on each GPU;
+  /// one-shot publication is not budget-gated
   std::uint64_t max_bloom_bytes_per_gpu = std::numeric_limits<std::uint64_t>::max();
 };
 

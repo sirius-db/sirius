@@ -103,7 +103,7 @@ If no probe-GPU L2 size is available, the hash IN-list is not selected; the publ
 - The domain-coverage gate skips the key before either filter is built when a proven-unique native build key covers at least `dynamic_filter_domain_coverage_threshold` of its known base-table domain.
 - The consumer keep-ratio gate disables ineffective post-decode filtering when a measured batch retains more than `dynamic_filter_keep_threshold` of its rows.
 
-Bloom construction is additionally bounded by `max_dynamic_filter_bloom_bytes_per_gpu`. A filter's footprint is 16 bits per global build row in 256-bit blocks, rounded to CUDA allocation alignment, and the overflow-safe sum across the join's Bloom keys is charged against the cap; the per-GPU cap is neither multiplied by replica count nor divided by partitions. When the whole candidate set exceeds the cap, every Bloom candidate for that join is skipped (fail-open) and counted in `keys_skipped_bloom_size_gate`.
+Multi-partition accumulated Bloom construction is additionally bounded by `max_dynamic_filter_bloom_bytes_per_gpu`; one-shot publication is not budget-gated (its pathological allocations are contained by the fail-open out-of-memory handling instead). A filter's footprint is 16 bits per global build row in 256-bit blocks, rounded to CUDA allocation alignment, and the overflow-safe sum across the join's Bloom keys is charged against the cap; the per-GPU cap is neither multiplied by replica count nor divided by partitions. When the whole candidate set exceeds the cap, every accumulated Bloom candidate for that join is skipped (fail-open) and counted in `keys_skipped_bloom_size_gate`.
 
 Zone maps are off by default because DuckDB static pushdown already handles many known ranges, while scattered runtime keys often span most of the domain. Floating-point keys never receive a zone map: the lowered bounds compare with IEEE semantics under which NaN fails both, while the authoritative join matches NaN keys to each other (DuckDB total order), so a range filter could drop matching rows.
 
@@ -143,7 +143,7 @@ The settings live under `sirius.operator_params`:
 |---|---:|---|
 | `enable_dynamic_filter` | `true` | Enable key discovery, membership publication, scan targets, and join-edge endpoints |
 | `enable_dynamic_filter_multi_partition` | `false` | Accumulate a globally complete Bloom across a non-broadcast hash-partitioned build; requires dynamic filters |
-| `max_dynamic_filter_bloom_bytes_per_gpu` | `256 MiB` | Per-join allocator-accounted Bloom budget on each GPU; `0` disables Bloom construction only |
+| `max_dynamic_filter_bloom_bytes_per_gpu` | `256 MiB` | Per-join allocator-accounted budget for the multi-partition accumulated Bloom on each GPU; one-shot publication is not budget-gated; `0` disables accumulated Bloom construction only |
 | `enable_dynamic_zone_map_filter` | `false` | Also emit a global min/max filter; requires dynamic filters |
 | `dynamic_filter_domain_coverage_threshold` | `0.9` | Skip a proven-unique key at or above this known-domain coverage; values above `1.0` disable the gate |
 | `dynamic_filter_inlist_max_l2_fraction` | `0.125` | Maximum fraction of the smallest probe-GPU L2 used by the hash IN-list estimate |
@@ -159,7 +159,7 @@ The cumulative counters fall into three families: the plan-time `producers_enabl
 - Routing is deliberately allowlisted by join type, key shape, and lineage; unsupported shapes lose optimization rather than results.
 - Membership filters currently support `INT32` and `INT64` keys.
 - The publisher emits one global zone map per key; multi-zone publication is not implemented.
-- A genuinely hash-partitioned multi-batch build cannot publish through the one-shot path because no delivery contains the complete key set; `enable_dynamic_filter_multi_partition` instead accumulates the exact batch set into a global Bloom.
+- A genuinely hash-partitioned multi-batch build cannot publish through the one-shot path because no delivery contains the complete key set; `enable_dynamic_filter_multi_partition` instead accumulates the exact batch set into a global Bloom. Accumulation is Bloom-only; incremental zone-map min/max merge across partitions is future work.
 - Other producers and incremental refinement would require explicit producer identity, versioning, and completion semantics; they are not implemented.
 
 ## Implementation map

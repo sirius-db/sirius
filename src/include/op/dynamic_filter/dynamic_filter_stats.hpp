@@ -70,14 +70,15 @@ struct dynamic_filter_event_snapshot {
 struct dynamic_filter_stats_snapshot {
   std::uint64_t producers_enabled = 0;
 
-  std::uint64_t keys_considered              = 0;
-  std::uint64_t keys_with_known_domain       = 0;
-  std::uint64_t keys_skipped_domain_gate     = 0;
-  std::uint64_t keys_skipped_bloom_size_gate = 0;
-  std::uint64_t keys_skipped_type_mismatch   = 0;
-  std::uint64_t keys_build_exceeded_domain   = 0;
-  std::uint64_t membership_filters_built     = 0;
-  std::uint64_t zone_map_filters_built       = 0;
+  std::uint64_t keys_considered                = 0;
+  std::uint64_t keys_with_known_domain         = 0;
+  std::uint64_t keys_skipped_domain_gate       = 0;
+  std::uint64_t keys_skipped_bloom_size_gate   = 0;
+  std::uint64_t keys_skipped_type_mismatch     = 0;
+  std::uint64_t keys_skipped_bloom_unsupported = 0;
+  std::uint64_t keys_build_exceeded_domain     = 0;
+  std::uint64_t membership_filters_built       = 0;
+  std::uint64_t zone_map_filters_built         = 0;
 
   std::uint64_t publication_attempts                     = 0;
   std::uint64_t publications_finished                    = 0;
@@ -102,6 +103,7 @@ struct dynamic_filter_stats_snapshot {
        {"keys_skipped_domain_gate", keys_skipped_domain_gate},
        {"keys_skipped_bloom_size_gate", keys_skipped_bloom_size_gate},
        {"keys_skipped_type_mismatch", keys_skipped_type_mismatch},
+       {"keys_skipped_bloom_unsupported", keys_skipped_bloom_unsupported},
        {"keys_build_exceeded_domain", keys_build_exceeded_domain},
        {"membership_filters_built", membership_filters_built},
        {"zone_map_filters_built", zone_map_filters_built},
@@ -119,9 +121,9 @@ struct dynamic_filter_stats_snapshot {
  * @brief Connection-lifetime publication counters owned by `SiriusContext`
  *
  * `producers_enabled` counts plan construction, not execution. Each session claim increments
- * `publication_attempts` and exactly one of `publications_finished` or `publications_failed`; a
- * non-resident source increments `publications_skipped_source_not_resident` without claiming the
- * session, so broadcast deliveries may repeat it.
+ * `publication_attempts`; a claim that reaches a terminal also increments exactly one of
+ * `publications_finished` or `publications_failed`. A non-resident source releases its claim back
+ * to OPEN, so broadcast deliveries may repeat the skip; each claim counts one attempt.
  */
 struct dynamic_filter_stats {
   /// Most-recent completions retained by the event journal (~72 B/record, ~74 KiB resident).
@@ -134,6 +136,7 @@ struct dynamic_filter_stats {
   std::atomic<std::uint64_t> keys_skipped_domain_gate{0};
   std::atomic<std::uint64_t> keys_skipped_bloom_size_gate{0};
   std::atomic<std::uint64_t> keys_skipped_type_mismatch{0};
+  std::atomic<std::uint64_t> keys_skipped_bloom_unsupported{0};
   std::atomic<std::uint64_t> keys_build_exceeded_domain{0};
   std::atomic<std::uint64_t> membership_filters_built{0};
   std::atomic<std::uint64_t> zone_map_filters_built{0};
@@ -157,12 +160,14 @@ struct dynamic_filter_stats {
       .keys_skipped_domain_gate     = keys_skipped_domain_gate.load(std::memory_order_relaxed),
       .keys_skipped_bloom_size_gate = keys_skipped_bloom_size_gate.load(std::memory_order_relaxed),
       .keys_skipped_type_mismatch   = keys_skipped_type_mismatch.load(std::memory_order_relaxed),
-      .keys_build_exceeded_domain   = keys_build_exceeded_domain.load(std::memory_order_relaxed),
-      .membership_filters_built     = membership_filters_built.load(std::memory_order_relaxed),
-      .zone_map_filters_built       = zone_map_filters_built.load(std::memory_order_relaxed),
-      .publication_attempts         = publication_attempts.load(std::memory_order_relaxed),
-      .publications_finished        = publications_finished.load(std::memory_order_relaxed),
-      .publications_failed          = publications_failed.load(std::memory_order_relaxed),
+      .keys_skipped_bloom_unsupported =
+        keys_skipped_bloom_unsupported.load(std::memory_order_relaxed),
+      .keys_build_exceeded_domain = keys_build_exceeded_domain.load(std::memory_order_relaxed),
+      .membership_filters_built   = membership_filters_built.load(std::memory_order_relaxed),
+      .zone_map_filters_built     = zone_map_filters_built.load(std::memory_order_relaxed),
+      .publication_attempts       = publication_attempts.load(std::memory_order_relaxed),
+      .publications_finished      = publications_finished.load(std::memory_order_relaxed),
+      .publications_failed        = publications_failed.load(std::memory_order_relaxed),
       .publications_skipped_source_not_resident =
         publications_skipped_source_not_resident.load(std::memory_order_relaxed),
       .publications_skipped_build_not_whole =

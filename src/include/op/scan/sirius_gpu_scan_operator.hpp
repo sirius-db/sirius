@@ -147,8 +147,6 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
     return has_physical_overrides() ? get_physical_types() : _native_physical_types;
   }
 
-  [[nodiscard]] ingestible_table_info const& peek_table_info() const;
-
   [[nodiscard]] gpu_ingestible& get_ingestible() const;
 
   scan_manager::split_connector& get_split_connector();

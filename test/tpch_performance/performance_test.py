@@ -407,59 +407,64 @@ _DYNAMIC_FILTER_EVENT_FIELDS = (
 
 def _read_dynamic_filter_observability(con):
     """Read one cumulative counter/event snapshot through Sirius's SQL surface."""
-    # Keep this instrumentation query on DuckDB and outside the timed region. time_query()
-    # explicitly restores gpu_execution=true before the next GPU iteration.
+    # Snapshot on DuckDB, outside the timed region. Restore GPU execution on every
+    # exit -- including validation failures -- so surrounding pin/unpin statements
+    # keep running on the engine under test.
     con.execute("SET gpu_execution = false;")
-    result = con.execute(_DYNAMIC_FILTER_OBSERVABILITY_SQL)
-    columns = [description[0] for description in result.description]
-    rows = [dict(zip(columns, row)) for row in result.fetchall()]
-    snapshot_rows = [row for row in rows if row["record_type"] == "stats"]
-    if len(snapshot_rows) != 1:
-        raise RuntimeError(
-            "sirius_dynamic_filter_observability() returned "
-            f"{len(snapshot_rows)} stats rows; expected exactly one"
-        )
-    snapshot = snapshot_rows[0]
-    stat_columns = [column for column in columns if column.startswith("stats_")]
-    if not stat_columns:
-        raise RuntimeError(
-            "sirius_dynamic_filter_observability() exposed no stats_* columns"
-        )
-    stats = {
-        column.removeprefix("stats_"): int(snapshot[column]) for column in stat_columns
-    }
-    events = []
-    for row in rows:
-        if row["record_type"] == "stats":
-            continue
-        events.append(
-            {
-                field: row[field]
-                for field in _DYNAMIC_FILTER_EVENT_FIELDS
-                if row[field] is not None
-            }
-        )
+    try:
+        result = con.execute(_DYNAMIC_FILTER_OBSERVABILITY_SQL)
+        columns = [description[0] for description in result.description]
+        rows = [dict(zip(columns, row)) for row in result.fetchall()]
+        snapshot_rows = [row for row in rows if row["record_type"] == "stats"]
+        if len(snapshot_rows) != 1:
+            raise RuntimeError(
+                "sirius_dynamic_filter_observability() returned "
+                f"{len(snapshot_rows)} stats rows; expected exactly one"
+            )
+        snapshot = snapshot_rows[0]
+        stat_columns = [column for column in columns if column.startswith("stats_")]
+        if not stat_columns:
+            raise RuntimeError(
+                "sirius_dynamic_filter_observability() exposed no stats_* columns"
+            )
+        stats = {
+            column.removeprefix("stats_"): int(snapshot[column])
+            for column in stat_columns
+        }
+        events = []
+        for row in rows:
+            if row["record_type"] == "stats":
+                continue
+            events.append(
+                {
+                    field: row[field]
+                    for field in _DYNAMIC_FILTER_EVENT_FIELDS
+                    if row[field] is not None
+                }
+            )
 
-    high_watermark = int(snapshot["event_high_watermark"])
-    if "event_first_retained" not in snapshot:
-        raise RuntimeError(
-            "sirius_dynamic_filter_observability() exposed no event_first_retained "
-            "column; the bounded event journal cannot be validated"
-        )
-    first_retained = int(snapshot["event_first_retained"])
-    event_ids = sorted(int(event["event_id"]) for event in events)
-    expected_ids = list(range(first_retained, high_watermark + 1))
-    if event_ids != expected_ids:
-        raise RuntimeError(
-            "dynamic-filter event snapshot is not contiguous: "
-            f"expected IDs {expected_ids}, got {event_ids}"
-        )
-    return {
-        "event_high_watermark": high_watermark,
-        "event_first_retained": first_retained,
-        "stats": stats,
-        "events": events,
-    }
+        high_watermark = int(snapshot["event_high_watermark"])
+        if "event_first_retained" not in snapshot:
+            raise RuntimeError(
+                "sirius_dynamic_filter_observability() exposed no event_first_retained "
+                "column; the bounded event journal cannot be validated"
+            )
+        first_retained = int(snapshot["event_first_retained"])
+        event_ids = sorted(int(event["event_id"]) for event in events)
+        expected_ids = list(range(first_retained, high_watermark + 1))
+        if event_ids != expected_ids:
+            raise RuntimeError(
+                "dynamic-filter event snapshot is not contiguous: "
+                f"expected IDs {expected_ids}, got {event_ids}"
+            )
+        return {
+            "event_high_watermark": high_watermark,
+            "event_first_retained": first_retained,
+            "stats": stats,
+            "events": events,
+        }
+    finally:
+        con.execute("SET gpu_execution = true;")
 
 
 def _write_dynamic_filter_iteration_observability(path, qnum, iteration, before, after):

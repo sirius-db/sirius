@@ -254,17 +254,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     dynamic_filter_stats* dynamic_filter_stats_sink = {},
     bool enable_dynamic_filter_multi_partition      = false);
 
-  sirius_physical_hash_join(
-    duckdb::LogicalOperator& op,
-    duckdb::unique_ptr<sirius_physical_operator> left,
-    duckdb::unique_ptr<sirius_physical_operator> right,
-    duckdb::vector<sirius::join_condition> cond,
-    duckdb::JoinType join_type,
-    std::size_t estimated_cardinality,
-    uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
-    uint64_t hash_partition_bytes       = config::DEFAULT_HASH_PARTITION_BYTES,
-    uint64_t max_broadcast_join_size    = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE);
-
   duckdb::vector<sirius::join_condition> conditions;
   //! The types of the join keys
   duckdb::vector<sirius::logical_type> condition_types;
@@ -373,6 +362,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   void contribute_dynamic_filter_build_batch(uint64_t batch_id,
                                              cudf::table_view const& build_view,
                                              rmm::cuda_stream_view stream);
+
+  /// @brief Fails this join's in-progress dynamic-filter accumulation without failing the query.
+  void abort_multi_partition_dynamic_filters(std::string_view reason) noexcept;
 
   [[nodiscard]] uint64_t max_build_hash_table_bytes() const noexcept
   {

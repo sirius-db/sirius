@@ -152,12 +152,17 @@ drains while accumulation is in progress, the next validated contribution instea
 accumulator as complete without building further partials, counted as one skipped-targets-drained
 publication.
 
+Accumulation is Bloom-only by design: keys whose storage type Bloom cannot represent are skipped
+and counted (`keys_skipped_bloom_unsupported`), and zone maps are never accumulated. A completion
+with zero filters still records its journal event; the event's filter counts describe the
+coverage.
+
 Before any per-device partial is allocated, `max_dynamic_filter_bloom_bytes_per_gpu` admits the complete active-key set against one GPU's allocator-aligned global-geometry footprint. The calculation does not multiply by GPU count: each GPU holds the same steady-state key set. If the aggregate exceeds the cap, every Bloom candidate is skipped and the exact build still completes normally.
 
 ```text
                          +-> PUBLISHING -> FINISHED
-                         |                `-> FAILED
-OPEN --one-shot claim---+
+                         |       |       `-> FAILED
+OPEN --one-shot claim---+       `--released claim (unusable source)-> OPEN
   |
   +--successful accumulator initialization-> ACCUMULATING -> FINISHED
   |                                                          `-> FAILED
@@ -379,6 +384,12 @@ and therefore the ordered immediate-probe start or the coverage of a transitive
 target, while the managed pool avoids per-filter stream creation/destruction. It
 is not a consumer-side wait or a correctness hazard and does not alter the
 ownership or readiness contracts.
+
+The accumulated publication (reduction, strict replication, fan-out) runs under
+the accumulator's coordinator mutex, so operator finalization arriving during
+that window waits it out before observing the completed terminal; every ordinary
+contribution has already finished by then, so the wait affects only teardown and
+late duplicate retries.
 
 ## Correctness coverage
 

@@ -30,6 +30,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -106,17 +107,18 @@ struct complete_build_batch_summary {
 }  // namespace detail
 
 struct dynamic_filter_publication_outcome {
-  std::size_t keys_considered              = 0;
-  std::size_t keys_with_known_domain       = 0;
-  std::size_t keys_build_exceeded_domain   = 0;
-  std::size_t skipped_targets_drained      = 0;
-  std::size_t keys_skipped_domain_gate     = 0;
-  std::size_t keys_skipped_bloom_size_gate = 0;
-  std::size_t keys_skipped_type_mismatch   = 0;
-  std::size_t membership_filters_built     = 0;
-  std::size_t zone_map_filters_built       = 0;
-  std::size_t active_targets               = 0;
-  std::size_t filters_pushed               = 0;
+  std::size_t keys_considered                = 0;
+  std::size_t keys_with_known_domain         = 0;
+  std::size_t keys_build_exceeded_domain     = 0;
+  std::size_t skipped_targets_drained        = 0;
+  std::size_t keys_skipped_domain_gate       = 0;
+  std::size_t keys_skipped_bloom_size_gate   = 0;
+  std::size_t keys_skipped_type_mismatch     = 0;
+  std::size_t keys_skipped_bloom_unsupported = 0;
+  std::size_t membership_filters_built       = 0;
+  std::size_t zone_map_filters_built         = 0;
+  std::size_t active_targets                 = 0;
+  std::size_t filters_pushed                 = 0;
 };
 
 /**
@@ -156,6 +158,9 @@ struct dynamic_filter_accumulation_result {
 namespace detail {
 struct dynamic_filter_accumulator_test_hooks {
   std::function<void(std::uint64_t)> after_id_claim;
+  std::function<void(std::uint64_t)>
+    before_insert_sync;  ///< Fires after insertion submission releases the per-device lock and
+                         ///< before the task-stream synchronize
   std::function<void(std::uint64_t)>
     after_insert_sync;  ///< Fires once per accepted contribution whose insertion block ran (at
                         ///< least one active key); an inert accumulator never fires it
@@ -260,6 +265,17 @@ struct dynamic_filter_publication_session_test_hooks {
  * attempt that produces a `dynamic_filter_publication_outcome` folds it exactly once; accumulator
  * construction failure records failure without an outcome. A terminal transition releases the
  * session-owned accumulator; in-flight calls retain shared ownership until they return.
+ *
+ * One-shot publication is claim-based: `try_claim_one_shot()` moves OPEN to PUBLISHING and counts
+ * one publication attempt, `publish_one_shot()` consumes the claim into a terminal, and a claim
+ * whose source turns out unusable is released with `reopen_from_claim()` (a sibling delivery may
+ * then claim; each claim counts one attempt) or failed with `fail_claim()`.
+ *
+ * Lock ordering: an operator lock (the hash join's `op_state_mutex` or the build PARTITION's
+ * `lock`, never nested with each other) may be held while calling into the session, which acquires
+ * the session mutex, which may be followed by the accumulator's coordinator mutex and then a
+ * per-device partial mutex. The session mutex is a leaf with respect to operator locks: no session
+ * member calls back into an operator while holding it.
  */
 class dynamic_filter_publication_session final {
  public:
@@ -313,11 +329,38 @@ class dynamic_filter_publication_session final {
                   rmm::cuda_stream_view stream) noexcept;
 
   /**
-   * @brief Claims and performs one-shot publication from a complete build table
+   * @brief Claims the one-shot publication window (OPEN -> PUBLISHING)
    *
-   * Does nothing after another path claims or closes the session. Device memory exhaustion marks
-   * the session failed without rethrowing; other publication exceptions mark it failed and are
-   * rethrown. Exceptional stream and input-lifetime behavior follows `publish_dynamic_filters()`.
+   * Counts one publication attempt. Fails when the plan is disabled or the window is no longer
+   * open.
+   */
+  [[nodiscard]] bool try_claim_one_shot() noexcept;
+
+  /**
+   * @brief Releases an unused one-shot claim (PUBLISHING -> OPEN)
+   *
+   * Lets a sibling delivery claim after this one found no usable source. No-op unless the session
+   * holds an unconsumed claim.
+   */
+  void reopen_from_claim() noexcept;
+
+  /**
+   * @brief Fails a claimed, not-yet-published attempt (PUBLISHING -> FAILED)
+   *
+   * For exceptions between claim and publication. No-op in any other state, so a terminal already
+   * committed by publish_one_shot() is never double-counted.
+   */
+  void fail_claim() noexcept;
+
+  /**
+   * @brief Performs one-shot publication from a complete build table, consuming the claim
+   *
+   * The caller must hold the claim from try_claim_one_shot(). A call while no claim is outstanding
+   * is inert; a call made while another delivery owns the claim is a caller contract violation the
+   * session cannot detect (the state alone cannot identify the claim owner). Device memory
+   * exhaustion marks the session failed without rethrowing; other publication exceptions mark it
+   * failed and are rethrown. Exceptional stream and input-lifetime behavior follows
+   * `publish_dynamic_filters()`.
    *
    * @param[in] complete_build Complete build table
    * @param[in] stream Durable construction stream
@@ -330,9 +373,19 @@ class dynamic_filter_publication_session final {
   void finalize_or_abort() noexcept;
 
   /**
-   * @brief Records one source-not-resident delivery without claiming the session
+   * @brief Aborts an in-progress accumulation (ACCUMULATING -> FAILED)
    *
-   * Does nothing after the session leaves OPEN or when the statistics sink is null.
+   * Unlike finalize_or_abort(), never closes an unclaimed OPEN window, so the once-per-join
+   * NOT-published diagnostic path stays intact. Logs @p reason when this call performs the abort;
+   * no-op in every other state.
+   */
+  void abort_accumulation(std::string_view reason) noexcept;
+
+  /**
+   * @brief Records one delivery skipped for a source not resident on a plan GPU
+   *
+   * The skipping delivery releases its claim through reopen_from_claim() before recording, so this
+   * counts only while the session is OPEN; does nothing when the statistics sink is null.
    */
   void record_source_not_resident() noexcept;
 
@@ -352,6 +405,7 @@ class dynamic_filter_publication_session final {
   void commit_accumulation_terminal_locked(state terminal,
                                            dynamic_filter_accumulation_result const& result,
                                            std::uint64_t join_operator_id) noexcept;
+  void abort_accumulation_impl(std::string_view warn_message) noexcept;
 
   dynamic_filter_publish_plan const& _plan;
   dynamic_filter_stats* _stats;

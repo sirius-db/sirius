@@ -158,9 +158,9 @@ struct operator_params {
   /// enabled.
   bool enable_dynamic_filter_multi_partition = false;
 
-  /// Maximum allocator-accounted Bloom bit-array bytes produced by one join on each GPU, summed
-  /// across its Bloom keys. 0 disables Bloom construction without disabling exact membership or
-  /// zone-map filters.
+  /// Per-join allocator-accounted budget for the multi-partition accumulated Bloom on each GPU,
+  /// summed across its Bloom keys; the full candidate set is skipped when it exceeds the cap.
+  /// One-shot publication is not budget-gated. 0 disables accumulated Bloom construction only.
   uint64_t max_dynamic_filter_bloom_bytes_per_gpu =
     config::DEFAULT_MAX_DYNAMIC_FILTER_BLOOM_BYTES_PER_GPU;
 

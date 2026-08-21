@@ -240,6 +240,12 @@ class pipelineable_operator_data : public operator_data {
   pipelineable_operator_data();
   explicit pipelineable_operator_data(
     std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches);
+  /**
+   * @brief Constructs a payload over already-locked read-only batch accessors
+   *
+   * @pre Every accessor in @p read_only_data_batches is live (not moved-from);
+   * `read_only_data_batch` exposes no validity predicate, so this cannot be checked here.
+   */
   explicit pipelineable_operator_data(
     std::vector<::cucascade::read_only_data_batch> read_only_data_batches);
 

@@ -18,11 +18,11 @@
  * Tests the build-port claim condition in `sirius_physical_hash_join::push_data_batch_partitioned`:
  * the one-shot publisher may claim only a build batch carrying the whole build side, as reported
  * through `set_build_arrives_whole`; the join mode is not part of the condition. The tests drive
- * the build port directly, pinning the claim condition -- plus the still-open window after a
- * delivery without a usable GPU source (not GPU-resident, or resident on a GPU outside the plan's
- * replica set) and the fail-open containment of device memory exhaustion -- rather than any
- * partitioning decision. The multi-partition tests pin the hash-join arm/contribute surface and
- * the build PARTITION's exact snapshot freeze.
+ * the build port directly, pinning the claim condition -- plus the reopening of a claimed window
+ * without a usable GPU source (not GPU-resident, or resident on a GPU outside the plan's replica
+ * set) and the fail-open containment of device memory exhaustion -- rather than any partitioning
+ * decision. The multi-partition tests pin the hash-join arm/contribute surface and the build
+ * PARTITION's exact snapshot freeze.
  */
 
 #include "expression/join_condition.hpp"
@@ -380,15 +380,14 @@ TEST_CASE("a claimed but not GPU-resident whole build reopens the window for a s
 {
   // On a multi-GPU broadcast build every GPU delivers the whole build side, so a first delivery
   // that was already downgraded to the host tier must not end the window terminally: a sibling
-  // delivery with a GPU-resident replica can still claim and publish. The unusable source is
-  // skipped without claiming the session, so it moves no attempt counter.
+  // delivery with a GPU-resident replica can still claim and publish.
   claim_fixture fixture;
   fixture.hash_join->set_build_arrives_whole(true);
 
   fixture.hash_join->push_data_batch_partitioned(
     "build", fixture.make_host_build_batch(), /*partition_idx=*/0);
 
-  CHECK(fixture.stats.publication_attempts.load() == 0);
+  CHECK(fixture.stats.publication_attempts.load() == 1);
   CHECK(fixture.stats.publications_skipped_source_not_resident.load() == 1);
   CHECK(fixture.stats.publications_finished.load() == 0);
   CHECK(fixture.stats.publications_failed.load() == 0);
@@ -396,8 +395,9 @@ TEST_CASE("a claimed but not GPU-resident whole build reopens the window for a s
 
   fixture.push_build_batch();
 
-  // Each claimed attempt ends finished or failed; the earlier skip never claimed.
-  CHECK(fixture.stats.publication_attempts.load() == 1);
+  // The full accounting identity after the rescue: attempts == finished + failed + skipped
+  // (skipped meaning released claims).
+  CHECK(fixture.stats.publication_attempts.load() == 2);
   CHECK(fixture.stats.publications_finished.load() == 1);
   CHECK(fixture.stats.publications_failed.load() == 0);
   CHECK(fixture.stats.publications_skipped_source_not_resident.load() == 1);
@@ -480,7 +480,7 @@ TEST_CASE("a whole build resident on a non-plan GPU reopens the window for a sib
   fixture.hash_join->push_data_batch_partitioned(
     "build", claim_fixture::make_build_batch_on(*other_gpu_space), /*partition_idx=*/0);
 
-  CHECK(fixture.stats.publication_attempts.load() == 0);
+  CHECK(fixture.stats.publication_attempts.load() == 1);
   CHECK(fixture.stats.publications_skipped_source_not_resident.load() == 1);
   CHECK(fixture.stats.publications_finished.load() == 0);
   CHECK(fixture.stats.publications_failed.load() == 0);
@@ -488,7 +488,7 @@ TEST_CASE("a whole build resident on a non-plan GPU reopens the window for a sib
 
   fixture.push_build_batch();
 
-  CHECK(fixture.stats.publication_attempts.load() == 1);
+  CHECK(fixture.stats.publication_attempts.load() == 2);
   CHECK(fixture.stats.publications_finished.load() == 1);
   CHECK_FALSE(fixture.channel->filters_for_column(kProbeColumnIndex).empty());
 }
@@ -688,7 +688,7 @@ TEST_CASE("a source batch can become resident before claiming one-shot publicati
 
   fixture.hash_join->push_data_batch_partitioned("build", batch, /*partition_idx=*/0);
   REQUIRE(fixture.stats.publications_skipped_source_not_resident.load() == 1);
-  REQUIRE(fixture.stats.publication_attempts.load() == 0);
+  REQUIRE(fixture.stats.publication_attempts.load() == 1);
   REQUIRE(fixture.stats.publications_finished.load() == 0);
   REQUIRE(fixture.stats.publications_failed.load() == 0);
   REQUIRE(fixture.stats.publications_skipped_build_not_whole.load() == 0);
@@ -704,7 +704,7 @@ TEST_CASE("a source batch can become resident before claiming one-shot publicati
 
   fixture.hash_join->push_data_batch_partitioned("build", batch, /*partition_idx=*/0);
   REQUIRE(fixture.stats.publications_skipped_source_not_resident.load() == 1);
-  REQUIRE(fixture.stats.publication_attempts.load() == 1);
+  REQUIRE(fixture.stats.publication_attempts.load() == 2);
   REQUIRE(fixture.stats.publications_finished.load() == 1);
   REQUIRE(fixture.stats.publications_failed.load() == 0);
   REQUIRE(fixture.stats.publications_skipped_build_not_whole.load() == 0);
@@ -713,7 +713,7 @@ TEST_CASE("a source batch can become resident before claiming one-shot publicati
 
   fixture.hash_join->push_data_batch_partitioned("build", batch, /*partition_idx=*/0);
   REQUIRE(fixture.stats.publications_skipped_source_not_resident.load() == 1);
-  REQUIRE(fixture.stats.publication_attempts.load() == 1);
+  REQUIRE(fixture.stats.publication_attempts.load() == 2);
   REQUIRE(fixture.stats.publications_finished.load() == 1);
   REQUIRE(fixture.stats.publications_failed.load() == 0);
   REQUIRE(fixture.stats.filters_pushed.load() == 1);
@@ -909,4 +909,104 @@ TEST_CASE("build PARTITION fails open once when an exact snapshot cannot be froz
     REQUIRE(partition->get_next_task_input_data() != nullptr);
     REQUIRE(fixture.stats.publication_attempts.load() == 0);
   }
+
+  SECTION("a non-FULL barrier never withholds the partition's input")
+  {
+    // Only a FULL barrier makes "no pop yet" mean "the repository holds the complete build", so
+    // an unfinished source pipeline behind a non-FULL port must not delay the partition: the
+    // one freeze attempt is latched immediately and input drains.
+    claim_fixture fixture(duckdb::JoinType::INNER, true);
+    cucascade::shared_data_repository repository;
+    auto source_pipeline = duckdb::make_shared_ptr<controllable_source_pipeline>(false);
+    auto partition       = make_build_partition(
+      fixture, repository, source_pipeline, sirius::op::MemoryBarrierType::PARTIAL);
+    repository.add_data_batch(fixture.make_build_batch(), 0);
+
+    auto input = partition->get_next_task_input_data();
+    REQUIRE(input != nullptr);
+    REQUIRE(fixture.stats.publication_attempts.load() == 0);
+
+    repository.add_data_batch(fixture.make_build_batch(), 0);
+    REQUIRE(partition->get_next_task_input_data() != nullptr);
+    REQUIRE(fixture.stats.publication_attempts.load() == 0);
+  }
+}
+
+TEST_CASE("a contribution without task identity fails the accumulation open",
+          "[dynamic_filter][publication_claim][physical_partition][partition_snapshot]")
+{
+  // A payload holding a null sibling batch never captures a task-input ID, yet its read-only view
+  // carries exactly one batch. Exact-ID dedup cannot stay sound without the identity, so the
+  // accumulation fails closed while the partition task -- and the query -- proceed.
+  claim_fixture fixture(duckdb::JoinType::INNER, true);
+  cucascade::shared_data_repository repository;
+  auto source_pipeline = duckdb::make_shared_ptr<controllable_source_pipeline>(true);
+  auto partition       = make_build_partition(fixture, repository, source_pipeline);
+
+  REQUIRE(fixture.hash_join->arm_multi_partition_dynamic_filters(
+    make_complete_build_snapshot(2 * kBuildRows, {101, 202})));
+  REQUIRE(fixture.stats.publication_attempts.load() == 1);
+
+  auto batch = fixture.make_build_batch();
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+  sirius::op::pipelineable_operator_data const idless_input(
+    std::vector<std::shared_ptr<cucascade::data_batch>>{batch, nullptr});
+  REQUIRE_FALSE(idless_input.task_input_batch_id().has_value());
+
+  auto const stream = fixture.gpu_space->acquire_stream();
+  auto output       = partition->execute(idless_input, stream);
+  REQUIRE(output != nullptr);
+  REQUIRE(fixture.stats.publications_failed.load() == 1);
+  REQUIRE(fixture.stats.publications_finished.load() == 0);
+  REQUIRE(fixture.channel->empty());
+
+  // The abort is terminal: a second identity-less execute changes nothing (and warns once).
+  auto second_output = partition->execute(idless_input, stream);
+  REQUIRE(second_output != nullptr);
+  REQUIRE(fixture.stats.publications_failed.load() == 1);
+  REQUIRE(fixture.stats.publications_finished.load() == 0);
+  REQUIRE(fixture.stats.publication_attempts.load() == 1);
+}
+
+TEST_CASE("probe-side and single-partition executes never require task identity",
+          "[dynamic_filter][publication_claim][physical_partition][partition_snapshot]")
+{
+  claim_fixture fixture(duckdb::JoinType::INNER, true);
+  auto batch = fixture.make_build_batch();
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+  sirius::op::pipelineable_operator_data const idless_input(
+    std::vector<std::shared_ptr<cucascade::data_batch>>{batch, nullptr});
+  REQUIRE_FALSE(idless_input.task_input_batch_id().has_value());
+  auto const stream = fixture.gpu_space->acquire_stream();
+
+  SECTION("probe-side partition")
+  {
+    auto probe_partition = std::make_unique<sirius::op::sirius_physical_partition>(
+      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT}),
+      /*estimated_cardinality=*/1000,
+      fixture.hash_join.get(),
+      /*is_build=*/false);
+    probe_partition->operator_id = 101;
+    probe_partition->set_num_partitions(2);
+
+    REQUIRE(probe_partition->execute(idless_input, stream) != nullptr);
+  }
+
+  SECTION("single-partition build partition")
+  {
+    auto build_partition = std::make_unique<sirius::op::sirius_physical_partition>(
+      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT}),
+      /*estimated_cardinality=*/1000,
+      fixture.hash_join.get(),
+      /*is_build=*/true);
+    build_partition->operator_id = 102;
+    build_partition->set_num_partitions(1);
+
+    REQUIRE(build_partition->execute(idless_input, stream) != nullptr);
+  }
+
+  REQUIRE(fixture.stats.publication_attempts.load() == 0);
+  REQUIRE(fixture.stats.publications_failed.load() == 0);
+  REQUIRE(fixture.stats.publications_finished.load() == 0);
+  REQUIRE(fixture.channel->empty());
 }

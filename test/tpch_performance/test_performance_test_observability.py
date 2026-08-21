@@ -83,6 +83,7 @@ class DynamicFilterObservabilityTest(unittest.TestCase):
 
         self.assertEqual(connection.commands[0], "SET gpu_execution = false;")
         self.assertIn("sirius_dynamic_filter_observability", connection.commands[1])
+        self.assertEqual(connection.commands[-1], "SET gpu_execution = true;")
         self.assertEqual(snapshot["event_high_watermark"], 1)
         self.assertEqual(snapshot["event_first_retained"], 1)
         self.assertEqual(snapshot["stats"], {"publications_finished": 4})
@@ -102,6 +103,18 @@ class DynamicFilterObservabilityTest(unittest.TestCase):
                 }
             ],
         )
+
+    def test_reader_restores_gpu_execution_on_validation_failure(self):
+        # No stats row: the reader raises, and the finally-restore must still run so the
+        # surrounding pin/unpin statements keep executing on the engine under test.
+        columns = ["record_type", "event_id"]
+        rows = [("global_accumulator_completion", 1)]
+        connection = _FakeConnection(columns, rows)
+
+        with self.assertRaises(RuntimeError):
+            performance_test._read_dynamic_filter_observability(connection)
+
+        self.assertEqual(connection.commands[-1], "SET gpu_execution = true;")
 
     def test_sql_snapshot_rejects_noncontiguous_journal(self):
         columns = [

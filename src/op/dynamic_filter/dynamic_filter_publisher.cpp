@@ -42,6 +42,7 @@
 #include <mutex>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <unordered_set>
 #include <utility>
@@ -156,6 +157,7 @@ void fold_dynamic_filter_outcome(dynamic_filter_stats& stats,
   stats.keys_skipped_domain_gate.fetch_add(outcome.keys_skipped_domain_gate, relaxed);
   stats.keys_skipped_bloom_size_gate.fetch_add(outcome.keys_skipped_bloom_size_gate, relaxed);
   stats.keys_skipped_type_mismatch.fetch_add(outcome.keys_skipped_type_mismatch, relaxed);
+  stats.keys_skipped_bloom_unsupported.fetch_add(outcome.keys_skipped_bloom_unsupported, relaxed);
   stats.keys_build_exceeded_domain.fetch_add(outcome.keys_build_exceeded_domain, relaxed);
   stats.membership_filters_built.fetch_add(outcome.membership_filters_built, relaxed);
   stats.zone_map_filters_built.fetch_add(outcome.zone_map_filters_built, relaxed);
@@ -262,7 +264,6 @@ dynamic_filter_publication_outcome publish_dynamic_filters_impl(
 
   std::vector<std::shared_ptr<sirius_dynamic_filter>> per_key_zone_map(admitted_keys.size());
   std::vector<std::shared_ptr<sirius_dynamic_filter>> per_key_membership(admitted_keys.size());
-  std::vector<char> per_key_bloom_candidate(admitted_keys.size(), 0);
   std::vector<cudf::data_type> per_key_build_type(admitted_keys.size(),
                                                   cudf::data_type{cudf::type_id::EMPTY});
 
@@ -368,9 +369,10 @@ dynamic_filter_publication_outcome publish_dynamic_filters_impl(
         break;
       }
       case membership_filter_kind::bloom: {
-        // Deferred: construction happens after the loop, under the aggregate per-GPU budget.
-        per_key_bloom_candidate[admitted_key_index] = 1;
-        choice                                      = "bloom";
+        nvtx3::scoped_range vr{"dynfilter::build_bloom"};
+        per_key_membership[admitted_key_index] =
+          std::make_shared<sirius_dynamic_bloom_filter>(col, stream, allocator_ref);
+        choice = "bloom";
         break;
       }
       case membership_filter_kind::none: break;
@@ -389,29 +391,6 @@ dynamic_filter_publication_outcome publish_dynamic_filters_impl(
         l2_bytes,
         plan.inlist_max_l2_fraction(),
         choice);
-    });
-  }
-
-  auto const bloom_candidate_count = static_cast<std::size_t>(
-    std::count(per_key_bloom_candidate.begin(), per_key_bloom_candidate.end(), 1));
-  if (bloom_budget_allows(bloom_bytes, bloom_candidate_count, plan.max_bloom_bytes_per_gpu())) {
-    nvtx3::scoped_range vr{"dynfilter::build_bloom"};
-    for (std::size_t key_index = 0; key_index < per_key_bloom_candidate.size(); ++key_index) {
-      if (per_key_bloom_candidate[key_index] == 0) { continue; }
-      auto const& column = build_view.column(admitted_keys[key_index].build_key_ordinal);
-      per_key_membership[key_index] =
-        std::make_shared<sirius_dynamic_bloom_filter>(column, stream, allocator_ref);
-      ++outcome.membership_filters_built;
-    }
-  } else {
-    outcome.keys_skipped_bloom_size_gate += bloom_candidate_count;
-    invoke_noexcept([&] {
-      SIRIUS_LOG_INFO(
-        "[sirius_physical_hash_join] Skipping {} Bloom filter candidate(s): each would use {} "
-        "allocator-accounted bytes against the {}-byte aggregate per-GPU budget.",
-        bloom_candidate_count,
-        bloom_bytes,
-        plan.max_bloom_bytes_per_gpu());
     });
   }
 
@@ -557,7 +536,10 @@ struct dynamic_filter_accumulator::impl {
         continue;
       }
       if (build_rows == 0) { continue; }
-      if (!sirius_dynamic_bloom_filter::supports(key.storage_type)) { continue; }
+      if (!sirius_dynamic_bloom_filter::supports(key.storage_type)) {
+        ++outcome.keys_skipped_bloom_unsupported;
+        continue;
+      }
       active_keys[key_index] = 1;
       build_types[key_index] = key.storage_type;
     }
@@ -641,6 +623,10 @@ struct dynamic_filter_accumulator::impl {
     return completed_result(dynamic_filter_accumulation_result::status::published);
   }
 
+  // Deliberately runs under the coordinator mutex: all expected contributions have already
+  // completed, so only late duplicates and finalization can contend, and both are rare and
+  // latency-tolerant. Restructuring to a publishing marker would re-open the
+  // finalize/seal/terminal races -- do not move this off-mutex without re-deriving them.
   [[nodiscard]] dynamic_filter_accumulation_result publish_locked(int root_device)
   {
     auto const* root_space = replica_space(root_device);
@@ -726,12 +712,14 @@ struct dynamic_filter_accumulator::impl {
     invoke_noexcept([&] {
       SIRIUS_LOG_INFO(
         "[dynamic_filter_accumulator] published {} global Bloom filter(s) across {} active "
-        "target(s) after {} exact build contribution(s), {} build rows, root GPU {}.",
+        "target(s) after {} exact build contribution(s), {} build rows, root GPU {}, {} key(s) "
+        "skipped (Bloom-unsupported type).",
         outcome.membership_filters_built,
         outcome.active_targets,
         completed_ids.size(),
         build_rows,
-        root_device);
+        root_device,
+        outcome.keys_skipped_bloom_unsupported);
     });
     return completed_result(dynamic_filter_accumulation_result::status::published);
   }
@@ -810,9 +798,12 @@ struct dynamic_filter_accumulator::impl {
             }
             partial->filters[key_index]->add(column, stream);
           }
-          stream.synchronize();
         }
 
+        if (test_hooks.before_insert_sync) { test_hooks.before_insert_sync(batch_id); }
+        // Outside the lock: cuco adds are device-scope atomics, so a sibling contribution may
+        // submit while this stream drains; completion accounting below still waits for this sync.
+        stream.synchronize();
         if (test_hooks.after_insert_sync) { test_hooks.after_insert_sync(batch_id); }
       }
     } catch (build_type_mismatch const& error) {
@@ -1098,14 +1089,36 @@ void dynamic_filter_publication_session::contribute(std::uint64_t join_operator_
   }
 }
 
+bool dynamic_filter_publication_session::try_claim_one_shot() noexcept
+{
+  std::scoped_lock lock(_mutex);
+  if (_state != state::open || !enabled()) { return false; }
+  _state = state::publishing;
+  if (_stats != nullptr) { _stats->publication_attempts.fetch_add(1, std::memory_order_relaxed); }
+  return true;
+}
+
+void dynamic_filter_publication_session::reopen_from_claim() noexcept
+{
+  std::scoped_lock lock(_mutex);
+  if (_state == state::publishing) { _state = state::open; }
+}
+
+void dynamic_filter_publication_session::fail_claim() noexcept
+{
+  std::scoped_lock lock(_mutex);
+  if (_state == state::publishing) {
+    commit_terminal_locked(state::failed, dynamic_filter_publication_outcome{});
+  }
+}
+
 void dynamic_filter_publication_session::publish_one_shot(cudf::table_view const& complete_build,
                                                           rmm::cuda_stream_view stream)
 {
   {
     std::scoped_lock lock(_mutex);
-    if (_state != state::open || !enabled()) { return; }
-    _state = state::publishing;
-    if (_stats != nullptr) { _stats->publication_attempts.fetch_add(1, std::memory_order_relaxed); }
+    // A claim from try_claim_one_shot() is required; an unclaimed call is inert.
+    if (_state != state::publishing) { return; }
   }
 
   try {
@@ -1158,13 +1171,39 @@ void dynamic_filter_publication_session::publish_one_shot(cudf::table_view const
 
 void dynamic_filter_publication_session::finalize_or_abort() noexcept
 {
-  std::shared_ptr<dynamic_filter_accumulator> accumulator;
   {
     std::scoped_lock lock(_mutex);
     if (_state == state::open) {
       _state = state::closed;
       return;
     }
+    // A claimed one-shot window is left for its owner's terminal commit (never closed).
+    if (_state != state::accumulating || !_accumulator) { return; }
+  }
+  abort_accumulation_impl(
+    "global dynamic Bloom closed with a missing build contribution; no filter was published.");
+}
+
+void dynamic_filter_publication_session::abort_accumulation(std::string_view reason) noexcept
+{
+  std::string message;
+  try {
+    message = "global dynamic Bloom aborted: ";
+    message += reason;
+    message += "; no filter was published.";
+  } catch (...) {
+    abort_accumulation_impl("global dynamic Bloom aborted; no filter was published.");
+    return;
+  }
+  abort_accumulation_impl(message);
+}
+
+void dynamic_filter_publication_session::abort_accumulation_impl(
+  std::string_view warn_message) noexcept
+{
+  std::shared_ptr<dynamic_filter_accumulator> accumulator;
+  {
+    std::scoped_lock lock(_mutex);
     if (_state != state::accumulating || !_accumulator) { return; }
     accumulator = _accumulator;
   }
@@ -1181,11 +1220,8 @@ void dynamic_filter_publication_session::finalize_or_abort() noexcept
     }
   }
   if (committed) {
-    invoke_noexcept([] {
-      SIRIUS_LOG_WARN(
-        "[dynamic_filter_publication_session] global dynamic Bloom closed with a missing build "
-        "contribution; no filter was published.");
-    });
+    invoke_noexcept(
+      [&] { SIRIUS_LOG_WARN("[dynamic_filter_publication_session] {}", warn_message); });
   }
 }
 

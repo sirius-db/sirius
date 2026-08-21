@@ -55,6 +55,9 @@ pipelineable_operator_data::pipelineable_operator_data(
   std::vector<::cucascade::read_only_data_batch> read_only_data_batches)
   : _read_only_data_batches(std::move(read_only_data_batches))
 {
+  // Deliberately unguarded, unlike the shared_ptr overload above: a null shared_ptr element is a
+  // representable, tolerated state, while a moved-from accessor violates this constructor's
+  // documented precondition (the accessor type exposes no validity predicate to check).
   if (_read_only_data_batches->size() == 1) {
     _task_input_batch_id = _read_only_data_batches->front().get_batch_id();
   }

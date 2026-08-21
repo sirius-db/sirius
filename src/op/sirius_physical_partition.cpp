@@ -171,13 +171,11 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
                                                                   rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_partition::execute"};
-  auto& input                    = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches      = input.get_read_only_batches();
-  auto const task_input_batch_id = input.task_input_batch_id();
-  if (input_batches.size() != 1 || !task_input_batch_id.has_value()) {
-    throw std::runtime_error(
-      "We expect one input batch and its task identity for partition operator " +
-      std::to_string(this->get_operator_id()));
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_read_only_batches();
+  if (input_batches.size() != 1) {
+    throw std::runtime_error("We expect only one input batch for partition operator " +
+                             std::to_string(this->get_operator_id()));
   }
   if (!_num_partitions.has_value()) {
     throw std::runtime_error("Num partitions was not set in sirius_physical_partition operator " +
@@ -192,9 +190,15 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
       _partition_type == PartitionType::HASH) {
     auto* hash_join = dynamic_cast<sirius_physical_hash_join*>(_downstream_consumer_op);
     if (hash_join != nullptr && hash_join->wants_multi_partition_dynamic_filters()) {
-      // Preparation may replace the physical batch with a fresh-ID cross-GPU clone.
-      hash_join->contribute_dynamic_filter_build_batch(
-        *task_input_batch_id, get_cudf_table_view(input_batch_ro), stream);
+      if (auto const task_input_batch_id = input.task_input_batch_id()) {
+        // Preparation may replace the physical batch with a fresh-ID cross-GPU clone.
+        hash_join->contribute_dynamic_filter_build_batch(
+          *task_input_batch_id, get_cudf_table_view(input_batch_ro), stream);
+      } else {
+        // Exact-ID dedup needs the task identity; without it accumulation is unsound.
+        hash_join->abort_multi_partition_dynamic_filters(
+          "a build contribution arrived without its task identity");
+      }
     }
   }
 
@@ -544,17 +548,27 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
   if (_is_build && _partition_type == PartitionType::HASH) {
     auto* hash_join = dynamic_cast<sirius_physical_hash_join*>(consumer);
     if (hash_join != nullptr && hash_join->wants_multi_partition_dynamic_filters()) {
+      // The one-shot latch test-and-set, the freeze, and the arm share one critical section:
+      // every popping thread traverses it and observes the attempt latched before reaching the
+      // unlocked tail pop below, which is what keeps the snapshot freeze-before-pop exact.
       std::lock_guard<std::mutex> guard(lock);
       if (_num_partitions.has_value() && *_num_partitions > 1 && !_broadcast &&
           !_dynamic_filter_snapshot_attempted) {
-        auto const port_it = ports.find("default");
-        if (port_it != ports.end() && port_it->second->src_pipeline != nullptr &&
-            !port_it->second->src_pipeline->is_pipeline_finished()) {
+        auto const port_it      = ports.find("default");
+        auto const* port        = port_it != ports.end() ? port_it->second : nullptr;
+        bool const full_barrier = port != nullptr && port->type == MemoryBarrierType::FULL;
+        if (full_barrier && port->src_pipeline != nullptr &&
+            !port->src_pipeline->is_pipeline_finished()) {
+          // A FULL input barrier is what makes "no pop yet" mean "the repository holds the
+          // complete build"; wait for the source pipeline rather than consuming the one freeze
+          // attempt early.
           return nullptr;
         }
 
         _dynamic_filter_snapshot_attempted = true;
-        auto snapshot = try_freeze_complete_build(static_cast<std::size_t>(*_num_partitions));
+        auto snapshot                      = full_barrier
+                                               ? try_freeze_complete_build(static_cast<std::size_t>(*_num_partitions))
+                                               : std::nullopt;
         if (snapshot) {
           static_cast<void>(hash_join->arm_multi_partition_dynamic_filters(std::move(*snapshot)));
         } else {
@@ -564,8 +578,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
             this->get_operator_id());
         }
       }
-      return sirius_physical_operator::get_next_task_input_data();
-    }
+    }  // guard released: the tail pop below runs unlocked, as on every prior release
   }
   return sirius_physical_operator::get_next_task_input_data();
 }
