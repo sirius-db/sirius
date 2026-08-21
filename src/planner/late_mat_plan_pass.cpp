@@ -413,7 +413,19 @@ step trace_through(sirius_physical_operator const& node,
         auto const& expr = projection.select_list[out];
         if (!expr) { continue; }
         if (auto const* ref = std::get_if<ast::reference>(&expr->v)) {
-          if (ref->column_index == in_pos && !moved_to.has_value()) { moved_to = out; }
+          if (ref->column_index == in_pos) {
+            if (!moved_to.has_value()) {
+              moved_to = out;
+            } else {
+              // Fan-out: a second output position also wants this column (`SELECT x AS a, x AS
+              // b`). moved_to only tracks one destination, so the second copy would silently end
+              // up carrying whatever the first destination got — a rowid where it should have a
+              // real value. Fail closed like every other unmodelled shape here: treat this as a
+              // read, which ends the ride at this projection instead of installing a deferral
+              // that would materialize the wrong thing at one of the two outputs.
+              computed_with = true;
+            }
+          }
           continue;
         }
         // A carrier restore changes a column's bit width, not its value, so the

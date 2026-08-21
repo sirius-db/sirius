@@ -44,7 +44,15 @@ struct sorted_unique_ids {
   rmm::device_buffer ids;           ///< uint64 x original_count; the first
                                     ///< unique_count entries are the ascending
                                     ///< distinct ids, the rest are scratch.
-  rmm::device_buffer restore_rank;  ///< int32 x original_count
+  rmm::device_buffer restore_rank;  ///< int32 x original_count. Indexes into the deduplicated
+                                    ///< array, so its values run up to unique_count -- which is
+                                    ///< bounded differently than the batch-local ids below (see
+                                    ///< "WHY IDS ARE 64-BIT HERE AND 32-BIT BELOW" above): it is
+                                    ///< the distinct-id count over the WHOLE original_count input,
+                                    ///< not a single batch. sort_unique_global_ids enforces the
+                                    ///< int32 fit directly -- it throws when original_count (an
+                                    ///< upper bound on unique_count) exceeds INT32_MAX -- rather
+                                    ///< than relying on callers staying under it by construction.
   rmm::device_buffer count_dev;     ///< int32 x 1: unique_count, ON DEVICE
   std::int64_t original_count = 0;
 };

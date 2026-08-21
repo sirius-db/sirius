@@ -19,6 +19,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -126,9 +127,17 @@ __global__ void to_local_kernel(std::uint64_t const* __restrict__ ids,
   auto const stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
   for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
        i += stride) {
-    // Signed, and deliberately not clamped: an id from another batch lands
-    // outside [0, batch rows) and the bucketer rejects it there.
-    out_local[i] = static_cast<std::int32_t>(static_cast<std::int64_t>(ids[i]) - batch_row_start);
+    // Signed, and deliberately not clamped for small mismatches: an id from a nearby batch
+    // lands outside [0, batch rows) in the int64 difference and the bucketer rejects it there.
+    // But a difference outside int32 range would silently wrap back into range on the narrowing
+    // cast below (e.g. 2^32 + 500 -> 500), which a pinned entry past 2^32 rows can reach. Range-
+    // check the int64 difference first and emit a guaranteed-rejected sentinel instead of
+    // truncating.
+    auto const diff = static_cast<std::int64_t>(ids[i]) - batch_row_start;
+    out_local[i]    = (diff >= std::numeric_limits<std::int32_t>::min() &&
+                    diff <= std::numeric_limits<std::int32_t>::max())
+                        ? static_cast<std::int32_t>(diff)
+                        : std::int32_t{-1};
   }
 }
 

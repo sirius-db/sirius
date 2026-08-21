@@ -319,10 +319,12 @@ one join equality with its side proven distinct.
 **Config:** `SIRIUS_EXP_LATE_MAT=1` gates the feature (off by default, inert when off);
 `SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS` selects the columns the uniqueness probe observes, without
 which no group-by-rowid ride is admissible. Five further `SIRIUS_EXP_LATE_MAT_*` knobs tune the
-floors and the dark count-on-deferred path. Requires `enable_compressed_materialization = false`
-to engage fully — narrowing a deferred column suppresses the deferral. Measured GB300 SF1000
-(narrowing off): suite 7.1878 s → 6.8801 s, q10 0.5202 s → 0.2359 s. See
-[Late Materialization](late-materialization.md).
+floors and the dark count-on-deferred path. Composes with `enable_compressed_materialization`
+(default on) — a deferred column riding through a carrier-restore cast is carried past it rather
+than suppressing the deferral.
+
+**Measured:** GB300 SF1000, default `enable_compressed_materialization`. See
+[Late Materialization](late-materialization.md) for the full results table.
 
 ### Row Group Pruning with Filter Pushdown (PR #363)
 

@@ -267,13 +267,15 @@ std::unique_ptr<cudf::table> decompress(
 // throwing — a REFUSAL, not a failure. The caller then picks the next route,
 // and the cascade ends at the full decode, which always works.
 //
-// All three re-tag the decode's storage type to the column's stored dtype. That
-// is not cosmetic: a DECIMAL64 returned as its INT64 storage silently drops its
-// scale, which is a wrong-results bug rather than a type complaint.
+// The three functions below (decompress_column_rows, decompress_column_compacted,
+// decompress_column_full) all re-tag the decode's storage type to the column's stored
+// dtype. That is not cosmetic: a DECIMAL64 returned as its INT64 storage silently drops
+// its scale, which is a wrong-results bug rather than a type complaint.
 
 /// One column decoded for a chunk-bucketed row set — the sparse walk, one block
 /// per touched chunk. Refuses any plan without random access (dictionary,
-/// str_split, delta roots).
+/// str_split, delta roots). Re-tags the decode's storage type to the column's
+/// stored dtype (see the per-column decode note above).
 std::unique_ptr<cudf::column> decompress_column_rows(
   const compressed_table& table,
   std::size_t column_index,
@@ -284,7 +286,9 @@ std::unique_ptr<cudf::column> decompress_column_rows(
 
 /// One column decoded compacted against a mask the caller already holds — the
 /// shipped mask route, reached as the capability fallback when the sparse walk
-/// refuses. The mask must have been counted (chunk_offsets present).
+/// refuses. The mask must have been counted (chunk_offsets present). Re-tags
+/// the decode's storage type to the column's stored dtype (see the per-column
+/// decode note above).
 std::unique_ptr<cudf::column> decompress_column_compacted(
   const compressed_table& table,
   std::size_t column_index,
@@ -294,7 +298,8 @@ std::unique_ptr<cudf::column> decompress_column_compacted(
   std::string* error_out            = nullptr);
 
 /// One column decoded full width — the end of every cascade, so it refuses only
-/// on a genuine decode failure.
+/// on a genuine decode failure. Re-tags the decode's storage type to the
+/// column's stored dtype (see the per-column decode note above).
 std::unique_ptr<cudf::column> decompress_column_full(
   const compressed_table& table,
   std::size_t column_index,

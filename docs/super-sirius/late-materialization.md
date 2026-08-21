@@ -46,7 +46,9 @@ using `all`; without a proof there is no group-by-rowid ride and no riders.
 
 **A pair of instructions, installed together or not at all.** The scan stops emitting the
 values; the consumer puts them back. Either half alone is a wrong answer, so
-`planner::install_deferral` writes both or neither.
+`planner::install_deferral` writes both or neither. (Count-on-deferred, below, is the one
+exception: when NOTHING downstream reads the values — every reader only counts — there is no
+"putting them back" to do, so that deferral installs a single half by design, not by omission.)
 
 Between the two ends the deferred columns ride as ordinary data: a rowid at the FIRST deferred
 position and 1-byte placeholders at the rest. Arity and positions are preserved, so every
@@ -55,6 +57,12 @@ operator in between sees the shape it expected and needs to know nothing about a
 **The two ends speak different coordinate systems.** A join widens and reorders the table, so
 both halves carry their own schema and positions, and the consumer matches a batch by its WHOLE
 schema — materializing against the wrong batch would read arbitrary rows of the pinned table.
+`port_materialize_directive` (`defer_directive.hpp`) carries only that schema and the origins it
+was installed for — no producer or operator id. This defends against a loose matcher (a check
+that only asked "is there a rowid-shaped column here" could fire on an unrelated batch), but not
+against two structurally identical batches from different producers at the same port — a
+self-join, or two scans of the same table each installing a bundle. Schema equality is the entire
+identity check today.
 
 ## Which columns, and how far
 
@@ -91,8 +99,14 @@ group is then exactly one row of that table, so every row of a group carries the
 deferred column that is itself unique proves it just as well.
 
 The same argument is why a partition ABOVE a local aggregate may hash a riding key while a
-partition below a JOIN may not — equal keys must land in one partition, and a rowid does not
-preserve that. That narrow exception is the difference between a fast query and a wrong one.
+partition below a JOIN may not. A rowid is a bijective relabelling of a proven-unique column, so
+equal values on THIS side really do still imply equal rowids — that alone would not break a
+partition hashing only this side. What breaks it is the OTHER side of the join: it still hashes
+the real value, since it is not the side the deferral was proven against, so a row pair that
+matches on value can land in different partitions once one side is rehashed by rowid and the
+other is not. Equal keys must land in one partition, and a rowid does not preserve that agreement
+across the two sides. That narrow exception is the difference between a fast query and a wrong
+one.
 
 Two pinned tables can materialize at one consumer: each **rider** carries its own rowid and
 origins, because a rowid means nothing outside the table it indexes. A rider is admitted either
@@ -106,6 +120,12 @@ Established once, at pin time, in two stages (`late_mat::unique_probe`): per chu
 with distinct count equal to row count and pairwise disjoint ranges; then, exactly, for what the
 ranges leave undecided, by sorting the concatenated chunks and counting runs. The exact stage is
 load-bearing rather than a fallback, because chunk ranges usually overlap.
+
+`SIRIUS_EXP_LATE_MAT_EXACT_MAX_ROWS` is a ROW cap only — there is no separate memory guard on the
+exact stage. It concatenates and sorts, so a wide or variable-width column just under the cap is
+a multi-GB GPU allocation at pin time, on top of the pin itself. This is the sharpest edge of
+`PIN_UNIQUE_COLS=all`: it is not just "extra pin-time work" (above) but, for a wide column near
+the cap, a pin-time OOM risk rather than a slow pin. Name the columns a ride actually needs.
 
 **Absence of a fact means UNKNOWN, never "not unique."** A false positive would collapse
 distinct groups into one — wrong answers, not slow ones. Facts attach to the pinned entry BY
@@ -128,8 +148,12 @@ deferral with a single half, admitted only over pinned columns with no nulls. Of
 - A compressed origin cannot skip its decode — the scan substitutes on the FINISHED output, so a
   deferred column from a compressed pin is decompressed and then discarded.
 - Filtered scans of compressed pins are refused (above).
-- Deferred-value widths are ESTIMATED for variable-width columns, which can only refuse a bundle
-  that would have qualified.
+- Deferred-value widths are ESTIMATED for variable-width columns, not measured, and the error runs
+  both ways: underestimating a wide column can refuse a bundle that would have qualified, but
+  overestimating a short one can just as easily admit a bundle that does not actually repay (a
+  handful of short strings can clear the floor on the estimate while saving fewer bytes/row than
+  the measured value would show). The real fix is measuring the width — the scan already has the
+  offsets for it.
 - **Host-tier pins are refused**, not just unpinned scans: `install_late_materialization`
   declines on tier, and `resolve_pinned_layout`/`resolve_pinned_column` refuse independently at
   the far end. Supporting them would mean staging a chunk back to the device per gather, so the
@@ -139,6 +163,20 @@ deferral with a single half, admitted only over pinned columns with no nulls. Of
   mean a rowid addressing a file offset and a re-read per gather — the shape classic disk-based
   late materialization takes, and a different cost model from this one, whose floors are
   calibrated against a device-memory gather.
+- **A pin's lifecycle is `pin_table`/`unpin_table`, not the downgrade executor** — pinned entries
+  are not spilled to reclaim memory the way ordinary data batches are, so a chunk backing an
+  installed deferral does not move tiers mid-query on its own. What DOES change it — an explicit
+  `unpin_table`, a re-pin that replaces the entry, or an in-place column merge — bumps or
+  invalidates the entry's generation (`pin_entry_handle`, `column_origin.hpp`). A consumer
+  resolving an origin against a generation that no longer matches gets `nullopt`, never a stale or
+  dangling pointer: resolution fails closed, at the cost of a re-read, rather than materializing
+  against data that already changed underneath the rowid.
+- **Multi-GPU pins are refused.** `resolve_pinned_column`/`materialize()` pass a pin's raw column
+  views and compressed-table pointers straight to a gather on the consumer's current GPU, with no
+  per-device tag and no P2P check, clone, or host-staging fallback — a chunk pinned on a different
+  GPU than the consumer could otherwise be dereferenced directly. Installation refuses outright
+  whenever more than one GPU memory space is active, matching the memory prefetcher's own
+  single-GPU prototype scope.
 
 ## Results
 

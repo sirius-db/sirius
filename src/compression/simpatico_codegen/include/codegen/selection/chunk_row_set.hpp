@@ -22,12 +22,18 @@
 // from block_offsets[b]. Empty chunks are absent rather than launched-and-
 // skipped, and the output is in ascending row order by construction.
 //
-// Why uint16 positions: they cannot address another chunk. The index list's
-// global ids are turned into in-chunk positions by subtracting chunk_start,
-// which is correct only while every id in a block's slice really belongs to that
-// block's chunk — an invariant the mask->indices wave supplies but a
-// post-join caller would have to be trusted for. A position that cannot exceed
-// 1023 makes the invariant structural.
+// Why uint16 positions: a stray offset cannot reach far past its own chunk. The
+// index list's global ids are turned into in-chunk positions by subtracting
+// chunk_start, which is correct only while every id in a block's slice really
+// belongs to that block's chunk — an invariant the mask->indices wave supplies
+// but a post-join caller would have to be trusted for. The 16-bit width bounds
+// the blast radius of a wrong id (kChunkSize = 1024, so it can address up to 64
+// chunks of reach, not an arbitrary one) — it does not enforce the invariant by
+// itself. What actually enforces it is build_chunk_row_set validating ids as
+// in-range and strictly increasing, so id - chunk_start < kChunkSize by
+// construction; that guarantee lives in the builder, not the type. This is a
+// public struct with public members, so a view assembled by hand elsewhere
+// gets none of the builder's protection.
 //
 // Size, for S survivors over T touched chunks: 2S + 8T bytes, against 4S + 4(C+1)
 // for the index list over C chunks. The crossover is DENSITY, not clustering:
@@ -37,9 +43,15 @@
 // clustering at all — and still skip 5.4M of 5.86M empty blocks; q18 is the one
 // genuinely clustered case, at T/C 0.011 against a 0.073 baseline.
 //
-// So this form never launches more blocks than the index list and never occupies
-// more memory. What it costs instead is construction: the index list falls out
-// of the mask->indices wave, while the CSR has to be bucketed.
+// So this form never launches more blocks than the index list and never occupies more
+// memory THAN A SELECTION AT RANDOM DENSITY WOULD — that is what the size comparison above
+// models. It is not an absolute bound: CSR costs 4S + 4(T+1) + 2S against the index list's
+// 4S + 4(C+1), so CSR loses once nearly every chunk is touched with very few survivors each
+// (roughly T = C with fewer than ~2 survivors/chunk). A random selection cannot reach that —
+// T collapses below C well before S gets that sparse per chunk — so the crossover only bites
+// a STRUCTURED selection (one row per chunk), which the density argument above deliberately
+// sets aside. What this form costs instead is construction: the index list falls out of the
+// mask->indices wave, while the CSR has to be bucketed.
 
 #pragma once
 
@@ -71,7 +83,9 @@ struct chunk_row_set {
 
   [[nodiscard]] bool valid() const noexcept
   {
-    if (num_survivors == 0) { return true; }  // an empty selection needs no arrays
+    // An empty selection needs no arrays, but a non-zero block count with no survivors is
+    // still invalid: a launcher trusting this view would dispatch blocks against null pointers.
+    if (num_survivors == 0) { return num_touched == 0; }
     return chunk_ids != nullptr && block_offsets != nullptr && in_chunk_rows != nullptr &&
            num_touched > 0 && num_touched <= num_survivors &&
            num_touched <= (num_rows + ::codegen::kChunkSize - 1) / ::codegen::kChunkSize;

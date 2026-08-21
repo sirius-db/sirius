@@ -187,7 +187,7 @@ struct cached_databatch_provider : public databatch_provider {
       }
     };
     if (!_entry.late_mat_handle) { return decline("the pinned entry has no late-mat handle"); }
-    if (!_mvcc_masks.empty()) { return decline("the scan carries MVCC keep-masks"); }
+    if (has_any_mask(_mvcc_masks)) { return decline("the scan carries MVCC keep-masks"); }
     if (!_delta_splits.empty()) { return decline("the scan carries insert-delta splits"); }
     if (_entry.tier != cucascade::memory::Tier::GPU) {
       return decline("the pinned entry is not device-resident");
@@ -780,7 +780,8 @@ struct late_mat_outcome {
 late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator& scan_op,
                                               pinned_entry const& entry,
                                               std::span<std::size_t const> selected_columns,
-                                              bool serves_whole_chunks)
+                                              bool serves_whole_chunks,
+                                              bool single_gpu_pin)
 {
   if (!late_mat::late_mat_enabled()) { return {}; }
   // An uninstalled deferral looks exactly like one that installed and did
@@ -793,6 +794,11 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
   if (!entry.late_mat_handle) { return decline("the pinned entry has no late-mat handle"); }
   if (entry.tier != cucascade::memory::Tier::GPU) {
     return decline("the pinned entry is not device-resident");
+  }
+  if (!single_gpu_pin) {
+    return decline(
+      "more than one GPU space is active; materialization is not yet device-aware and cannot "
+      "safely gather a chunk pinned on a different GPU than the consumer");
   }
   if (!serves_whole_chunks) {
     return decline("a served batch is not one pinned chunk's whole row span");
@@ -938,6 +944,24 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
     return decline(
       "a join on the ride multiplied the rows and nothing collapsed them again, so materializing "
       "at the port would gather the fan-out rather than the scan's rows");
+  }
+
+  // A null in a value-deferred column has no representable placeholder: the materializer
+  // (late_mat_resolver.cpp, materialize.cpp::require_non_null) gathers real values back out of
+  // the pin and cannot restore a validity bit it never carried past the scan. Unlike the outer-
+  // join case above (nullable_columns_skipped, seen by the plan pass), this is the pinned SOURCE
+  // being nullable, which only the pin can answer — so it is checked here, before install, using
+  // the same nullopt-means-unknown-so-assume-nullable helper the count-only path already uses.
+  // Checked late (after the group-by-rowid extension) so a column ruled out here still gets a
+  // specific reason instead of failing opaquely at materialize time.
+  for (auto const position : planned.positions) {
+    if (position >= selected_columns.size()) { continue; }  // caught again, and reported, below
+    auto const nulls = pinned_column_null_count(entry, selected_columns[position]);
+    if (!nulls.has_value() || *nulls != 0) {
+      return decline(
+        "a deferred column's pinned values may contain nulls, which materialization cannot "
+        "restore");
+    }
   }
 
   // Output position p is served slot p is entry column selected_columns[p] —
@@ -1114,6 +1138,24 @@ void install_rider_deferrals(std::vector<rider_candidate> const& candidates,
           "neither its own columns nor a join with the ride's scan determines its row in a group");
         continue;
       }
+    }
+
+    // Same gap as the primary bundle's install: a null in a rider's pinned source has no
+    // representable placeholder, and only the pin can answer whether one exists.
+    bool rider_null_free = true;
+    for (auto const position : planned.positions) {
+      if (position >= candidate.columns.size()) { continue; }  // caught again below
+      auto const nulls = pinned_column_null_count(entry, candidate.columns[position]);
+      if (!nulls.has_value() || *nulls != 0) {
+        rider_null_free = false;
+        break;
+      }
+    }
+    if (!rider_null_free) {
+      decline(
+        "a deferred column's pinned values may contain nulls, which materialization cannot "
+        "restore");
+      continue;
     }
 
     std::vector<late_mat::column_origin> origins;
@@ -1421,6 +1463,14 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   // The rides that DID install, so a rider can be argued against the scan that
   // owns the port it would join.
   std::vector<installed_ride> installed_rides;
+  // resolve_pinned_column/materialize() pass a pin's raw column views and compressed-table
+  // pointers straight to a gather that runs on the consumer's current GPU, with no per-device
+  // tag and no P2P check, clone, or host-staging fallback. On more than one GPU space a chunk's
+  // owning device need not be the consumer's, which can dereference a remote pointer outright.
+  // Fail closed here — matching the memory prefetcher's single-GPU prototype gate
+  // (maybe_start_memory_prefetcher, above) — until materialization is device-aware.
+  bool const single_gpu_pin =
+    _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU).size() == 1;
   for (auto& assignment : cached_assignments) {
     mvcc_chunk_mask_set masks;  // stays empty for parquet pins
     std::vector<insert_delta_split> delta_splits;
@@ -1519,11 +1569,12 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     // Both halves of the deferral, installed before a single task runs. Read
     // the eligibility conditions here against prepare_origin_annotation's: the
     // scan side must substitute only for batches the provider stamps.
-    auto const late_mat =
-      install_late_materialization(*assignment.op,
-                                   *assignment.entry,
-                                   assignment.columns,
-                                   /*serves_whole_chunks=*/masks.empty() && delta_splits.empty());
+    auto const late_mat = install_late_materialization(
+      *assignment.op,
+      *assignment.entry,
+      assignment.columns,
+      /*serves_whole_chunks=*/!has_any_mask(masks) && delta_splits.empty(),
+      single_gpu_pin);
     if (late_mat.may_ride_along) {
       // Addressable but deferring nothing of its own: it may still join another
       // scan's ride, which can only be decided once every assignment has been
