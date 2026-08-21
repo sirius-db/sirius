@@ -617,24 +617,6 @@ class sirius_scan_manager {
   void attach_proven_unique_columns(const std::string& name,
                                     std::span<std::string const> unique_column_names);
 
-  /// \brief Exact fallback for columns the pin-time per-chunk probe could not decide.
-  ///
-  /// The cheap probe concludes only when the chunks' value ranges are disjoint,
-  /// and a pin's chunks routinely interleave (the coalescer partitions by row
-  /// groups, not by key), so on real data almost every genuinely unique column
-  /// arrives here unproven. This assembles each named column from the pinned
-  /// chunks and counts its distinct values exactly (see
-  /// @c late_mat::exact_distinct_over_chunks), recording a fact only on a
-  /// clean proof. Runs at pin time only, once per named column.
-  ///
-  /// Only GPU-tier, uncompressed, single-device storage can be assembled;
-  /// anything else is logged and skipped (leaving the column "unknown"). A
-  /// column already proven is not re-checked, and a CUDA/cudf failure is caught
-  /// and reported rather than failing the pin. Throws std::invalid_argument
-  /// when no entry exists for @p name.
-  void prove_unique_columns_exactly(const std::string& name,
-                                    std::span<std::string const> candidate_names);
-
   /// \brief Remove the pinned entry for @p name. No-op if absent.
   void remove_pinned_entry(const std::string& name);
 

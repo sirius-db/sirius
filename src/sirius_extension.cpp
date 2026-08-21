@@ -1407,25 +1407,20 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   auto attach_proven_unique = [&](std::vector<sirius::late_mat::unique_verdict> const& verdicts) {
     if (verdicts.size() != pinned_column_names.size()) { return; }
     std::vector<std::string> proven_names;
-    std::vector<std::string> undecided_names;
     for (std::size_t i = 0; i < verdicts.size(); ++i) {
       switch (verdicts[i]) {
         case sirius::late_mat::unique_verdict::proven:
           proven_names.push_back(pinned_column_names[i]);
           break;
-        case sirius::late_mat::unique_verdict::undecided:
-          undecided_names.push_back(pinned_column_names[i]);
-          break;
-        default: break;  // not observed, or refused — an exact check cannot help either
+        // undecided/refused/not observed: materialize_pin_batches already ran the
+        // exact stage while the values were still uncompressed, so nothing here
+        // can add to what it concluded.
+        default: break;
       }
     }
     if (!proven_names.empty()) {
       scan_mgr.attach_proven_unique_columns(data.args.name, proven_names);
     }
-    // The per-chunk pass concludes only for chunks with disjoint value ranges,
-    // which a multi-file pin usually does not produce. Everything it left
-    // undecided gets the exact check against the now-pinned data.
-    scan_mgr.prove_unique_columns_exactly(data.args.name, undecided_names);
     for (auto const& n : proven_names) {
       SIRIUS_LOG_INFO("[late-mat] pin '{}': column '{}' proven distinct table-wide (per-chunk)",
                       data.args.name,
