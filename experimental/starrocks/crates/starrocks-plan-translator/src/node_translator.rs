@@ -17,9 +17,7 @@ use crate::error::{Result, TranslateError};
 use crate::expr_translator::{self, ExprContext, TranslateExpr};
 use crate::scan_paths::ScanFilePaths;
 use crate::type_mapper;
-use crate::{
-    ExtensionRegistry, URN_AGGREGATE, URN_ARITHMETIC, URN_BOOLEAN, URN_COMPARISON,
-};
+use crate::{ExtensionRegistry, URN_AGGREGATE, URN_ARITHMETIC, URN_BOOLEAN, URN_COMPARISON};
 
 /// Partially translated relation plus the StarRocks row layout it emits.
 pub(crate) struct TranslatedRel {
