@@ -127,14 +127,8 @@ class sirius_physical_gpu_values : public sirius_physical_operator {
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const input_stats& stats) const override;
 
-  /**
-   * @brief Exact total input basis: this source is single-shot, so its one task input is the
-   *        whole thing, known from plan time.
-   *
-   * The anchor is immediate; an estimate resting on it is not. The leaf case scales it by the
-   * pipeline ratio, which single-shot caps at one sample — below the default min_ratio_samples,
-   * so an estimate here needs assume_unit_ratio.
-   */
+  /// Exact whole-query input basis, known at plan time. This single-shot source yields at most
+  /// one ratio sample, so default estimation requires `assume_unit_ratio`.
   [[nodiscard]] std::optional<std::size_t> total_source_input_bytes() const override
   {
     return estimated_source_bytes();

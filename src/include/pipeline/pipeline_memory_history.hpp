@@ -36,40 +36,27 @@ struct task_memory_record {
   std::size_t estimated_bytes;              ///< Pre-history estimation basis
   std::size_t peak_memory_bytes;            ///< Actual peak allocated bytes during execution
   std::optional<std::size_t> output_bytes;  ///< Total output data size (nullopt if task OOM'd)
-  /// Whether @ref estimated_bytes is in pipeline-input units, and so may contribute to the
-  /// aggregate ratio. False for a task resumed mid-pipeline after an OOM/CUDA reschedule: its
-  /// basis is the intermediate data it restarted from, which is a different quantity. Such a
-  /// record is still valid for @ref estimate_peak_memory, which is per-task.
+  /// Whether @ref estimated_bytes is in pipeline-input units. False for mid-pipeline resumes;
+  /// they remain valid for per-task @ref estimate_peak_memory.
   bool ratio_eligible = true;
 };
 
 /**
- * @brief Running totals over the successful tasks a pipeline has completed.
+ * @brief Non-evicting totals over successful pipeline tasks.
  *
- * Unlike the ring buffer these are monotonic and never evicted, so they stay
- * accurate for pipelines that run more than kMaxRecords tasks.
- *
- * Two sets of terms, because the estimator asks two questions with different
- * admission rules: what ratio does this pipeline have (needs a basis and an
- * output that describe the same task), and how much has it emitted in total
- * (needs every task that produced anything). Conflating them lets a pipeline
- * with unmeasurable inputs under-report its output.
+ * Ratio terms require matching usable input and output; output terms include every successful
+ * task. Keeping them separate prevents unsized inputs from reducing the emitted total.
  */
 struct history_totals {
-  /// Ratio terms — only tasks whose basis is a usable pipeline-input quantity, i.e. nonzero and
-  /// ratio-eligible. A pairing of input and output is meaningless without both.
+  /// Tasks with nonzero, ratio-eligible input and recorded output.
   std::size_t ratio_input_bytes  = 0;
   std::size_t ratio_output_bytes = 0;
   std::size_t ratio_records      = 0;
-  /// Output terms — EVERY successful task, including those whose basis was zero (a scan split
-  /// with no a-priori size estimate) or mid-pipeline. A pipeline's total emitted bytes must not
-  /// depend on whether its inputs happened to be measurable.
+  /// Every task with recorded output, including zero-basis and resumed tasks.
   std::size_t output_bytes   = 0;
   std::size_t output_records = 0;
 
-  /// Aggregate output/input ratio over the ratio-eligible tasks, or nullopt when none has been
-  /// recorded. Deliberately an aggregate rather than the proximity-weighted scheme
-  /// estimate_peak_memory() uses: this projects a total, it does not size one task.
+  /// Aggregate ratio over eligible tasks, or nullopt without usable input.
   [[nodiscard]] std::optional<double> ratio() const
   {
     if (ratio_records == 0 || ratio_input_bytes == 0) { return std::nullopt; }
@@ -83,9 +70,7 @@ struct history_totals {
  * Stores a bounded ring buffer of recent task_memory_records and provides
  * an estimation function that uses historical ratios to predict peak memory
  * consumption for a new task given its estimation basis.
- *
- * Separately maintains unbounded @ref history_totals so the pipeline's
- * aggregate input->output ratio survives ring-buffer eviction.
+ * Also maintains @ref history_totals beyond ring-buffer eviction.
  */
 class pipeline_memory_history {
  public:
@@ -101,22 +86,19 @@ class pipeline_memory_history {
   void record(task_memory_record rec)
   {
     std::lock_guard<std::mutex> lock(_mutex);
-    // A failed (OOM'd) task carries no output_bytes; it contributes to neither total.
+    // OOM'd tasks have no output and contribute to neither total.
     if (rec.output_bytes.has_value()) {
-      // Emitted bytes count regardless of whether the basis was usable, so a finished pipeline's
-      // output total is complete even when some tasks had no a-priori size estimate.
+      // Output totals include every successful task.
       _totals.output_bytes += *rec.output_bytes;
       _totals.output_records++;
-      // The ratio additionally needs a basis in pipeline-input units: nonzero, and not a
-      // mid-pipeline resume (see task_memory_record::ratio_eligible).
+      // Ratio totals additionally require a usable pipeline-input basis.
       if (rec.estimated_bytes > 0 && rec.ratio_eligible) {
         _totals.ratio_input_bytes += rec.estimated_bytes;
         _totals.ratio_output_bytes += *rec.output_bytes;
         _totals.ratio_records++;
       }
     }
-    // The ring feeds estimate_peak_memory, which divides by estimated_bytes — a zero-basis record
-    // is unusable there and is skipped, as it always has been.
+    // estimate_peak_memory divides by the basis, so zero-basis records skip the ring.
     if (rec.estimated_bytes == 0) { return; }
     if (_records.size() < kMaxRecords) {
       _records.push_back(rec);
@@ -211,9 +193,7 @@ class pipeline_memory_history {
     return _records.size();
   }
 
-  /**
-   * @brief Unbounded running totals over every successful task (see @ref history_totals).
-   */
+  /// Non-evicting totals over successful tasks.
   [[nodiscard]] history_totals totals() const
   {
     std::lock_guard<std::mutex> lock(_mutex);

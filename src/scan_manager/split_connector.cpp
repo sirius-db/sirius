@@ -34,10 +34,7 @@ void split_connector::push_split(std::unique_ptr<op::operator_data> split)
   {
     std::lock_guard<std::mutex> lock(_mutex);
     assert(!_closed && "push_split after close() is forbidden");
-    // Accumulate before the move: this is the one choke point every split passes through,
-    // so it is where the scan's total input basis is tallied for the data size estimator.
-    // A zero here is "no a-priori estimate", not "no data", so it is latched rather than
-    // silently folded into the sum.
+    // A zero estimate means unknown, not empty; latch it so the total remains conservative.
     auto const split_bytes = split->get_estimated_size_in_bytes();
     _discovered_bytes += split_bytes;
     _has_unsized_splits = _has_unsized_splits || split_bytes == 0;

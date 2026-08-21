@@ -45,7 +45,6 @@ namespace {
 
 constexpr std::size_t kMiB = 1024ull * 1024ull;
 
-/// Leaf-source stand-in whose two "what is my total?" answers are set per test.
 struct test_source_operator : sirius_physical_operator {
   test_source_operator() : sirius_physical_operator(SiriusPhysicalOperatorType::PROJECTION, {}, 0)
   {
@@ -60,8 +59,7 @@ struct test_source_operator : sirius_physical_operator {
     return output_total;
   }
 
-  // Fan-in nomination: which port carries the primary (probe-equivalent) input, and how many
-  // bytes have been taken from it. Both unset by default, matching every non-join operator.
+  // Fan-in primary input and the bytes consumed from it.
   [[nodiscard]] std::optional<std::string_view> primary_input_port() const override
   {
     if (primary_port.empty()) { return std::nullopt; }
@@ -69,8 +67,7 @@ struct test_source_operator : sirius_physical_operator {
   }
   [[nodiscard]] std::optional<std::size_t> consumed_primary_input_bytes() const override
   {
-    // Lets a test observe *when* the denominator is sampled relative to the numerator, by running
-    // side effects at exactly that instant. Unset in every other test.
+    // The hook simulates a task completing between estimator reads.
     if (on_consumed_read) { on_consumed_read(); }
     return consumed_primary;
   }
@@ -79,15 +76,13 @@ struct test_source_operator : sirius_physical_operator {
 
   std::optional<std::size_t> input_total;
   std::optional<std::size_t> output_total;
-  std::string primary_port;  ///< empty = nominates none
+  std::string primary_port;
   std::optional<std::size_t> consumed_primary;
-  bool caps_output = false;  ///< stands in for a LIMIT in the pipeline
-  /// Fires as the denominator is read. See the numerator/denominator ordering test.
+  bool caps_output = false;
   std::function<void()> on_consumed_read;
 };
 
-/// Pipeline whose finished state is set directly, instead of being driven through the task
-/// counters that update_pipeline_status() normally maintains.
+/// Pipeline with a directly controlled finished state.
 struct test_pipeline : sirius_pipeline {
   explicit test_pipeline(const pipeline_build_context& ctx) : sirius_pipeline(ctx) {}
 
@@ -96,11 +91,9 @@ struct test_pipeline : sirius_pipeline {
   bool finished = false;
 };
 
-/// Builds a chain/DAG of single-operator pipelines wired through data-carrying ports, mirroring
-/// how the planner wires real pipelines. Each pipeline's operator doubles as source and sink.
+/// Builds test pipeline DAGs with one operator per pipeline by default.
 class estimator_dag {
  public:
-  /// Add a pipeline and return it. `source` is the operator standing in for its leaf source.
   test_pipeline& add()
   {
     auto pipeline = duckdb::make_shared_ptr<test_pipeline>(_ctx);
@@ -114,7 +107,7 @@ class estimator_dag {
     return ref;
   }
 
-  /// Wire a data-flow edge from -> to. `with_repo=false` models a dependency-only port.
+  /// `with_repo=false` creates a dependency-only port.
   void connect(test_pipeline& from,
                test_pipeline& to,
                MemoryBarrierType barrier    = MemoryBarrierType::FULL,
@@ -143,14 +136,12 @@ class estimator_dag {
       sirius_physical_operator::next_port_info{consumer_op, name, uuid::now_v7()});
   }
 
-  /// The operator standing in as `pipeline`'s leaf source.
   static test_source_operator& source_of(test_pipeline& pipeline)
   {
     return static_cast<test_source_operator&>(*pipeline.get_source());
   }
 
-  /// Give `pipeline` a sink distinct from its source, modelling a scan pipeline that also holds
-  /// a FILTER or PROJECTION. add() otherwise makes one operator serve as both ends.
+  /// Models a pipeline with an operator after its source.
   test_source_operator& add_distinct_sink(test_pipeline& pipeline)
   {
     auto op = std::make_unique<test_source_operator>();
@@ -178,19 +169,12 @@ class estimator_dag {
   std::vector<duckdb::shared_ptr<sirius_pipeline>> _pipelines;
 };
 
-/// Record one completed task on `pipeline`.
 void record_task(test_pipeline& pipeline, std::size_t in_bytes, std::size_t out_bytes)
 {
   pipeline.get_memory_history().record(task_memory_record{in_bytes, in_bytes * 2, out_bytes});
 }
 
-/// Give `pipeline` a measured output/input ratio backed by `samples` completed tasks.
-///
-/// Defaults to exactly what size_estimate_options::min_ratio_samples requires, so a pipeline
-/// set up this way has a ratio the estimator will trust; cases that are *about* the sample
-/// count pass it explicitly. The bytes are split evenly across the samples, so the aggregate
-/// ratio is `out_bytes / in_bytes` regardless of the count (every value here is a multiple of
-/// kMiB, which divides exactly).
+/// Records an aggregate output/input ratio with enough samples to be trusted by default.
 void record_ratio(test_pipeline& pipeline,
                   std::size_t in_bytes,
                   std::size_t out_bytes,
@@ -225,8 +209,7 @@ TEST_CASE("data_size_estimator: a finished pipeline whose tasks recorded nothing
   estimator_dag dag;
   auto& producer    = dag.add();
   producer.finished = true;
-  // Tasks ran and none recorded output — every one OOM'd. Measurement was attempted and lost, so
-  // reporting 0 would size a large input onto a single partition.
+  // Treat failed measurement as unknown, not as zero output.
   producer.mark_task_created();
   producer.mark_task_created();
 
@@ -239,8 +222,7 @@ TEST_CASE("data_size_estimator: a finished pipeline that never created a task is
   estimator_dag dag;
   auto& producer    = dag.add();
   producer.finished = true;
-  // An empty scan: nothing to measure rather than a measurement that failed. Finishing requires
-  // source exhaustion, not just balanced counters, so zero tasks means drained.
+  // A finished pipeline with no tasks has drained without producing output.
 
   auto est = estimate_pipeline_total_output_bytes(producer);
   REQUIRE(est.has_value());
@@ -254,8 +236,6 @@ TEST_CASE("data_size_estimator: a finished pipeline counts output from zero-basi
 {
   estimator_dag dag;
   auto& producer = dag.add();
-  // A scan split with no a-priori size estimate reports a zero basis. Its output is still part
-  // of the pipeline's total; omitting it would under-count while still claiming exact.
   record_task(producer, 100 * kMiB, 40 * kMiB);
   record_task(producer, 0, 60 * kMiB);
   producer.finished = true;
@@ -271,7 +251,6 @@ TEST_CASE("data_size_estimator: a finished pipeline that emitted nothing reports
 {
   estimator_dag dag;
   auto& producer = dag.add();
-  // Distinct from "no evidence": tasks ran and succeeded, they just produced no rows.
   record_task(producer, 100 * kMiB, 0);
   producer.finished = true;
 
@@ -285,15 +264,13 @@ TEST_CASE("data_size_estimator: an unfinished leaf scales its known total by the
           "[data_size_estimator][estimation]")
 {
   estimator_dag dag;
-  auto& producer = dag.add();
-  // The source will feed 1 GiB; the pipeline has so far turned 100 MiB of input into 25 MiB.
+  auto& producer                                 = dag.add();
   estimator_dag::source_of(producer).input_total = 1024 * kMiB;
   record_ratio(producer, 100 * kMiB, 25 * kMiB);
 
   auto est = estimate_pipeline_total_output_bytes(producer);
   REQUIRE(est.has_value());
   CHECK(est->bytes == 256 * kMiB);
-  // A learned ratio is a projection even though the leaf total is known exactly.
   CHECK_FALSE(est->exact);
 }
 
@@ -303,7 +280,6 @@ TEST_CASE("data_size_estimator: no ratio yet means no estimate, unless unit rati
   estimator_dag dag;
   auto& producer                                 = dag.add();
   estimator_dag::source_of(producer).input_total = 512 * kMiB;
-  // No task has completed, so the pipeline has no measured input->output ratio.
 
   CHECK_FALSE(estimate_pipeline_total_output_bytes(producer).has_value());
 
@@ -328,8 +304,7 @@ TEST_CASE("data_size_estimator: a substituted unit ratio claims no measured supp
   dag.connect(scan, mid);
 
   estimator_dag::source_of(scan).input_total = 1024 * kMiB;
-  record_ratio(scan, 100 * kMiB, 100 * kMiB, /*samples=*/8);  // well-supported, ratio 1.0
-  // `mid` has a ratio, but from too few tasks to trust, so 1:1 is substituted for it.
+  record_ratio(scan, 100 * kMiB, 100 * kMiB, /*samples=*/8);
   record_task(mid, 100 * kMiB, 50 * kMiB);
 
   auto est = estimate_pipeline_total_output_bytes(mid,
@@ -337,12 +312,9 @@ TEST_CASE("data_size_estimator: a substituted unit ratio claims no measured supp
                                                     .assume_unit_ratio = true,
                                                   });
   REQUIRE(est.has_value());
-  // The substituted link must not be credited with mid's 1 under-floor record...
   CHECK(est->ratio_samples != 1);
-  // ...nor zero out the scan's genuine support, which 0 would also confuse with "exact".
   CHECK(est->ratio_samples == 8);
   CHECK_FALSE(est->exact);
-  // Substituting 1.0 for mid leaves the scan's 1.0-scaled total unchanged.
   CHECK(est->bytes == 1024 * kMiB);
 }
 
@@ -350,22 +322,18 @@ TEST_CASE("data_size_estimator: a single-input ratio from too few tasks is not t
           "[data_size_estimator][estimation]")
 {
   auto const min_samples = size_estimate_options{}.min_ratio_samples;
-  REQUIRE(min_samples > 1);  // otherwise this case asserts nothing
+  REQUIRE(min_samples > 1);
 
   estimator_dag dag;
   auto& producer                                 = dag.add();
   estimator_dag::source_of(producer).input_total = 1024 * kMiB;
 
-  // One task short of the floor. The ratio exists and is arithmetically usable, but a filter
-  // over clustered data can make a single batch's selectivity nothing like the table's — and
-  // the consumer latches the first estimate it gets, so an unlucky sample is never corrected.
+  // A single batch may not represent selectivity over clustered data.
   for (std::size_t i = 0; i < min_samples - 1; ++i) {
     record_task(producer, 100 * kMiB, 25 * kMiB);
   }
   CHECK_FALSE(estimate_pipeline_total_output_bytes(producer).has_value());
 
-  // An untrusted ratio is treated exactly as no ratio, so the unit-ratio escape still applies
-  // and yields the unscaled source total.
   auto assumed = estimate_pipeline_total_output_bytes(producer,
                                                       size_estimate_options{
                                                         .assume_unit_ratio = true,
@@ -374,8 +342,6 @@ TEST_CASE("data_size_estimator: a single-input ratio from too few tasks is not t
   CHECK(assumed->bytes == 1024 * kMiB);
   CHECK_FALSE(assumed->exact);
 
-  // The floor is a knob, not a constant: on the very same history, a caller willing to act on
-  // thinner evidence lowers it and gets the measured ratio applied (1 GiB x 0.25).
   auto lowered = estimate_pipeline_total_output_bytes(producer,
                                                       size_estimate_options{
                                                         .min_ratio_samples = 1,
@@ -383,7 +349,6 @@ TEST_CASE("data_size_estimator: a single-input ratio from too few tasks is not t
   REQUIRE(lowered.has_value());
   CHECK(lowered->bytes == 256 * kMiB);
 
-  // One more task clears the default floor, and the same answer arrives without the override.
   record_task(producer, 100 * kMiB, 25 * kMiB);
   auto est = estimate_pipeline_total_output_bytes(producer);
   REQUIRE(est.has_value());
@@ -397,10 +362,8 @@ TEST_CASE("data_size_estimator: a source that knows nothing yields no estimate",
   estimator_dag dag;
   auto& producer = dag.add();
   record_ratio(producer, 100 * kMiB, 50 * kMiB);
-  // Both source totals stay nullopt — this is the streaming-source case.
 
   CHECK_FALSE(estimate_pipeline_total_output_bytes(producer).has_value());
-  // A unit ratio does not invent a total that the source cannot supply.
   CHECK_FALSE(estimate_pipeline_total_output_bytes(producer,
                                                    size_estimate_options{
                                                      .assume_unit_ratio = true,
@@ -412,18 +375,16 @@ TEST_CASE("data_size_estimator: an output-level source total bypasses the pipeli
           "[data_size_estimator][estimation]")
 {
   estimator_dag dag;
-  auto& producer = dag.add();
-  // Only the post-filter output total is known (the scan's cardinality fallback).
+  auto& producer                                  = dag.add();
   estimator_dag::source_of(producer).output_total = 300 * kMiB;
-  // A ratio exists but must NOT be applied: it is derived from pre-filter input bytes, so
-  // using it here would count filter selectivity twice.
+  // Applying the pre-filter ratio would count selectivity twice.
   record_ratio(producer, 100 * kMiB, 10 * kMiB);
 
   auto est = estimate_pipeline_total_output_bytes(producer);
   REQUIRE(est.has_value());
   CHECK(est->bytes == 300 * kMiB);
   CHECK_FALSE(est->exact);
-  CHECK(est->planner_derived);  // the output-level total is the scan's cardinality projection
+  CHECK(est->planner_derived);
 }
 
 TEST_CASE("data_size_estimator: an output-level source total is unusable when operators follow it",
@@ -433,9 +394,7 @@ TEST_CASE("data_size_estimator: an output-level source total is unusable when op
   auto& producer                                  = dag.add();
   estimator_dag::source_of(producer).output_total = 300 * kMiB;
   record_ratio(producer, 100 * kMiB, 10 * kMiB);
-  // A FILTER or PROJECTION now sits between source and sink, so the source's output is no longer
-  // the pipeline's. Returning it unscaled would ignore that operator; scaling it by the ratio
-  // would count the scan's pushdown selectivity twice. Neither is an answer.
+  // The source total cannot represent output after another operator.
   dag.add_distinct_sink(producer);
 
   CHECK_FALSE(estimate_pipeline_total_output_bytes(producer).has_value());
@@ -453,12 +412,9 @@ TEST_CASE("data_size_estimator: a capped pipeline is not extrapolated while unfi
   REQUIRE(before.has_value());
   CHECK(before->bytes == 512 * kMiB);
 
-  // A LIMIT bounds output by a row count, so the pipeline stops emitting once the cap binds and
-  // may finish without its source draining. Projecting the whole source total through the ratio
-  // would overshoot by however much of the table the limit spares.
+  // A capped pipeline may finish without draining its source.
   estimator_dag::source_of(producer).caps_output = true;
   CHECK_FALSE(estimate_pipeline_total_output_bytes(producer).has_value());
-  // A cap is not a missing ratio, so the unit-ratio escape does not apply either.
   CHECK_FALSE(estimate_pipeline_total_output_bytes(producer,
                                                    size_estimate_options{
                                                      .assume_unit_ratio = true,
@@ -502,7 +458,6 @@ TEST_CASE("data_size_estimator: a cardinality projection never falls below bytes
 {
   using sirius::pipeline::project_source_output_bytes;
 
-  // 10 rows / 1000 bytes measured so far -> 100 bytes per row.
   constexpr std::size_t kRows  = 10;
   constexpr std::size_t kBytes = 1000;
 
@@ -513,15 +468,12 @@ TEST_CASE("data_size_estimator: a cardinality projection never falls below bytes
 
   SECTION("a cardinality below the rows already emitted is floored at the observed bytes")
   {
-    // The planner said 4 rows; 10 have already come out. 400 would be a whole-query total below
-    // an observed partial, which is provably wrong whatever the planner thinks.
     CHECK(project_source_output_bytes(4, kRows, kBytes) == kBytes);
   }
 
   SECTION("a zero cardinality does not claim the scan emits nothing")
   {
-    // Reachable: DuckDB zeroes the estimate outright on a zero base-table stat. Unfloored this
-    // returns 0 rather than nullopt, which a leaf anchor would multiply out across the chain.
+    // DuckDB can report zero cardinality for a nonempty scan.
     CHECK(project_source_output_bytes(0, kRows, kBytes) == kBytes);
   }
 
@@ -555,23 +507,20 @@ TEST_CASE("data_size_estimator: a measured anchor is not marked planner-derived"
 TEST_CASE("data_size_estimator: planner provenance survives a downstream ratio",
           "[data_size_estimator][estimation]")
 {
-  // The regression the flag exists for: one hop is enough to overwrite the anchor's zero, leaving
-  // the estimate indistinguishable from a fully measured chain.
+  // Regression: downstream ratios must preserve planner-derived provenance.
   estimator_dag dag;
   auto& scan = dag.add();
   auto& mid  = dag.add();
   dag.connect(scan, mid);
 
   estimator_dag::source_of(scan).output_total = 300 * kMiB;
-  record_ratio(mid, 100 * kMiB, 50 * kMiB);  // ratio 0.5, backed by min_ratio_samples tasks
+  record_ratio(mid, 100 * kMiB, 50 * kMiB);
 
   auto est = estimate_pipeline_total_output_bytes(mid);
   REQUIRE(est.has_value());
   CHECK(est->bytes == 150 * kMiB);
   CHECK_FALSE(est->exact);
-  // mid's genuine support is reported, exactly as before — the zero is gone...
   CHECK(est->ratio_samples == size_estimate_options{}.min_ratio_samples);
-  // ...so this is the only surviving signal that part of the number is a planner guess.
   CHECK(est->planner_derived);
 }
 
@@ -586,15 +535,15 @@ TEST_CASE("data_size_estimator: ratios compose along a multi-hop chain",
   dag.connect(mid, consumer);
 
   estimator_dag::source_of(scan).input_total = 1024 * kMiB;
-  record_ratio(scan, 100 * kMiB, 50 * kMiB);  // ratio 0.5  -> 512 MiB leaves the scan
-  record_ratio(mid, 100 * kMiB, 25 * kMiB);   // ratio 0.25 -> 128 MiB leaves mid
+  record_ratio(scan, 100 * kMiB, 50 * kMiB);
+  record_ratio(mid, 100 * kMiB, 25 * kMiB);
 
   auto& consumer_op = *consumer.get_source();
   auto est = estimate_port_total_input_bytes(consumer_op, consumer_op.get_port_ids().front());
   REQUIRE(est.has_value());
   CHECK(est->bytes == 128 * kMiB);
   CHECK_FALSE(est->exact);
-  CHECK(est->hops == 1);  // consumer's port -> mid (hop 0) -> scan (hop 1)
+  CHECK(est->hops == 1);
 }
 
 TEST_CASE("data_size_estimator: the walk stops at the first finished pipeline",
@@ -607,8 +556,7 @@ TEST_CASE("data_size_estimator: the walk stops at the first finished pipeline",
   dag.connect(scan, mid);
   dag.connect(mid, consumer);
 
-  // mid is done, so its recorded output total is authoritative and the scan is never consulted
-  // (deliberately left with no source total, which would otherwise abort the walk).
+  // Leaving scan unknown verifies that the walk stops at finished mid.
   record_ratio(mid, 100 * kMiB, 200 * kMiB);
   mid.finished = true;
 
@@ -622,8 +570,7 @@ TEST_CASE("data_size_estimator: the walk stops at the first finished pipeline",
 
 namespace {
 
-/// A `probe -> join <- build`, `join -> consumer` shape. Returns the consumer's only port name
-/// so callers can estimate through it.
+/// A `probe -> join <- build`, `join -> consumer` test DAG.
 struct fan_in_dag {
   estimator_dag dag;
   test_pipeline* probe    = nullptr;
@@ -642,9 +589,7 @@ struct fan_in_dag {
     dag.connect(*join, *consumer);
   }
 
-  /// Record exactly `n` completed tasks on the join pipeline so it clears
-  /// size_estimate_options::min_fan_in_ratio_samples. The ratio is unaffected by the count.
-  /// Uses record_task rather than record_ratio so `n` means n tasks, not n groups of them.
+  /// Records the join ratio across exactly `n` tasks.
   void record_join_ratio(std::size_t in_bytes, std::size_t out_bytes, std::size_t n = 16)
   {
     for (std::size_t i = 0; i < n; ++i) {
@@ -652,8 +597,6 @@ struct fan_in_dag {
     }
   }
 
-  /// Drive the join pipeline's task counters. The estimator must ignore these entirely — see
-  /// the "does not correct its ratio from task counts" case for why.
   void set_join_task_counters(std::size_t created, std::size_t completed)
   {
     for (std::size_t i = 0; i < created; ++i) {
@@ -664,12 +607,10 @@ struct fan_in_dag {
     }
   }
 
-  /// Probe side projects 1 GiB; build side is deliberately given a wildly different total so a
-  /// test can prove it is not consulted.
   void give_both_sides_totals()
   {
     estimator_dag::source_of(*probe).input_total = 1024 * kMiB;
-    record_ratio(*probe, 100 * kMiB, 100 * kMiB);  // ratio 1.0 -> 1 GiB leaves the probe side
+    record_ratio(*probe, 100 * kMiB, 100 * kMiB);
     estimator_dag::source_of(*build).input_total = 1 * kMiB;
     record_ratio(*build, 100 * kMiB, 100 * kMiB);
   }
@@ -690,7 +631,6 @@ TEST_CASE("data_size_estimator: a fan-in that nominates no primary port yields n
   f.give_both_sides_totals();
   f.record_join_ratio(100 * kMiB, 50 * kMiB);
   estimator_dag::source_of(*f.join).consumed_primary = 100 * kMiB;
-  // primary_port left empty — this is the CTE / delim-join case, which must still bail out.
 
   CHECK_FALSE(f.estimate().has_value());
 }
@@ -701,8 +641,7 @@ TEST_CASE("data_size_estimator: a fan-in with no consumed primary bytes yields n
   fan_in_dag f;
   f.give_both_sides_totals();
   f.record_join_ratio(100 * kMiB, 50 * kMiB);
-  estimator_dag::source_of(*f.join).primary_port = "default";
-  // No probe batch taken yet, so there is nothing to form a ratio against.
+  estimator_dag::source_of(*f.join).primary_port     = "default";
   estimator_dag::source_of(*f.join).consumed_primary = 0;
 
   CHECK_FALSE(f.estimate().has_value());
@@ -713,27 +652,23 @@ TEST_CASE("data_size_estimator: a fan-in scales the primary upstream by output-p
 {
   fan_in_dag f;
   f.give_both_sides_totals();
-  // The join pipeline has emitted 50 MiB while taking 200 MiB of probe input: ratio 0.25.
-  // Note the ratio comes from consumed_primary, NOT from the recorded input_basis — that is
-  // the whole point, since a STANDARD join's input_basis double-counts re-paired batches.
-  f.record_join_ratio(999 * kMiB, 50 * kMiB);  // input_basis deliberately bogus
+  // STANDARD joins must use consumed primary bytes, not re-paired input basis.
+  f.record_join_ratio(999 * kMiB, 50 * kMiB);
   estimator_dag::source_of(*f.join).primary_port     = "default";
   estimator_dag::source_of(*f.join).consumed_primary = 200 * kMiB;
 
   auto est = f.estimate();
   REQUIRE(est.has_value());
-  CHECK(est->bytes == 256 * kMiB);  // 1 GiB (probe projection) x 0.25
+  CHECK(est->bytes == 256 * kMiB);
   CHECK_FALSE(est->exact);
-  CHECK(est->hops == 1);              // consumer -> join (0) -> probe side (1)
-  CHECK_FALSE(est->planner_derived);  // both sides anchored on measured split totals
+  CHECK(est->hops == 1);
+  CHECK_FALSE(est->planner_derived);
 }
 
 TEST_CASE("data_size_estimator: planner provenance survives a fan-in hop",
           "[data_size_estimator][estimation][fan_in]")
 {
   fan_in_dag f;
-  // Probe side anchors on the scan's cardinality projection rather than a measured split total.
-  // The build side is never walked, so it needs no total of its own.
   estimator_dag::source_of(*f.probe).output_total = 1024 * kMiB;
   f.record_join_ratio(999 * kMiB, 50 * kMiB);
   estimator_dag::source_of(*f.join).primary_port     = "default";
@@ -741,9 +676,7 @@ TEST_CASE("data_size_estimator: planner provenance survives a fan-in hop",
 
   auto est = f.estimate();
   REQUIRE(est.has_value());
-  CHECK(est->bytes == 256 * kMiB);  // 1 GiB (probe projection) x 0.25
-  // The sample count reads as well-supported while the anchor beneath it is still a guess —
-  // the pair a consumer has to be able to tell apart.
+  CHECK(est->bytes == 256 * kMiB);
   CHECK(est->ratio_samples == size_estimate_options{}.min_fan_in_ratio_samples);
   CHECK(est->planner_derived);
 }
@@ -751,8 +684,7 @@ TEST_CASE("data_size_estimator: planner provenance survives a fan-in hop",
 TEST_CASE("data_size_estimator: a fan-in samples its numerator before its denominator",
           "[data_size_estimator][estimation][fan_in]")
 {
-  // The terms cannot be read atomically, so the read order decides which way a task landing
-  // between them skews the ratio. Reading output first keeps the error low rather than inflated.
+  // Reading output first prevents an interleaved completion from inflating the ratio.
   fan_in_dag f;
   f.give_both_sides_totals();
   f.record_join_ratio(999 * kMiB, 50 * kMiB);
@@ -760,20 +692,18 @@ TEST_CASE("data_size_estimator: a fan-in samples its numerator before its denomi
   src.primary_port     = "default";
   src.consumed_primary = 200 * kMiB;
 
-  // Stand in for a task both created and completed between the two reads: 50 MiB of output lands
-  // at the instant the denominator is sampled, with no matching input in `consumed`. Read second,
-  // the numerator would take it and the ratio would go 0.25 -> 0.5; read first, it cannot.
+  // Simulate a task completing when the denominator is sampled.
   bool fired           = false;
   src.on_consumed_read = [&] {
-    if (fired) { return; }  // fire once, whatever the estimator's call pattern
+    if (fired) { return; }
     fired = true;
     record_task(*f.join, 0, 50 * kMiB);
   };
 
   auto est = f.estimate();
-  REQUIRE(fired);  // the hook must actually have run, or this test proves nothing
+  REQUIRE(fired);  // Ensure the simulated race occurred.
   REQUIRE(est.has_value());
-  CHECK(est->bytes == 256 * kMiB);  // unchanged by the interleaved task
+  CHECK(est->bytes == 256 * kMiB);
 }
 
 TEST_CASE("data_size_estimator: a fan-in with too few completed tasks yields no estimate",
@@ -784,15 +714,11 @@ TEST_CASE("data_size_estimator: a fan-in with too few completed tasks yields no 
   estimator_dag::source_of(*f.join).primary_port     = "default";
   estimator_dag::source_of(*f.join).consumed_primary = 200 * kMiB;
 
-  // A fan-in ratio divides a completion-accrued numerator by a live denominator, so it reads
-  // low while tasks are in flight — and worst at the first opportunity to sample it. One
-  // completed task is not enough evidence.
+  // In-flight tasks can temporarily depress the fan-in ratio.
   f.record_join_ratio(100 * kMiB, 50 * kMiB, /*n=*/1);
   CHECK_FALSE(f.estimate().has_value());
 
-  // The fan-in floor is a hard gate: unlike the single-input floor, assume_unit_ratio does not
-  // substitute 1:1 here, because a join can multiply or divide its input volume by orders of
-  // magnitude and a unit ratio would be a fabricated answer rather than a neutral one.
+  // A unit ratio is unsafe for joins that may greatly change data volume.
   {
     auto& op = *f.consumer->get_source();
     CHECK_FALSE(estimate_port_total_input_bytes(op,
@@ -803,8 +729,6 @@ TEST_CASE("data_size_estimator: a fan-in with too few completed tasks yields no 
                   .has_value());
   }
 
-  // Clearing the threshold unblocks it. (The reported sample count is the weakest link in the
-  // chain, not the join's own — see the next case.)
   f.record_join_ratio(100 * kMiB, 50 * kMiB, /*n=*/16);
   CHECK(f.estimate().has_value());
 }
@@ -813,19 +737,17 @@ TEST_CASE("data_size_estimator: a fan-in does not correct its ratio from task co
           "[data_size_estimator][estimation][fan_in]")
 {
   fan_in_dag f;
-  f.give_both_sides_totals();  // probe side projects 1 GiB
+  f.give_both_sides_totals();
   f.record_join_ratio(100 * kMiB, 50 * kMiB);
   estimator_dag::source_of(*f.join).primary_port     = "default";
   estimator_dag::source_of(*f.join).consumed_primary = 200 * kMiB;
 
   auto const before = f.estimate();
   REQUIRE(before.has_value());
-  CHECK(before->bytes == 256 * kMiB);  // 1 GiB x (50/200)
+  CHECK(before->bytes == 256 * kMiB);
 
-  // An earlier version scaled the denominator by completed/created to discount tasks still in
-  // flight. That is only valid if every task consumes an equal share of `consumed`, and a join's
-  // do not: `consumed` advances on a probe batch's FIRST pairing, so with B build batches only
-  // one task in B moves it at all. Leaving tasks in flight must not move the projection.
+  // Regression: join tasks consume unequal shares because only a probe's first pairing advances
+  // the denominator, so task completion counts must not scale it.
   f.set_join_task_counters(/*created=*/25, /*completed=*/20);
   auto const after = f.estimate();
   REQUIRE(after.has_value());
@@ -838,14 +760,11 @@ TEST_CASE("data_size_estimator: a projection that would overflow is reported as 
   estimator_dag dag;
   auto& scan = dag.add();
 
-  // A near-maximal input paired with an expanding ratio: the product does not fit in a byte
-  // count. Report nothing rather than a wrapped total that would then size a partition count.
   estimator_dag::source_of(scan).input_total = std::numeric_limits<std::size_t>::max();
   record_ratio(scan, 1 * kMiB, 1024 * kMiB);
 
   CHECK_FALSE(estimate_pipeline_total_output_bytes(scan).has_value());
 
-  // The same input with a ratio that keeps the product in range is still answered.
   estimator_dag::source_of(scan).input_total = 1024 * kMiB;
   CHECK(estimate_pipeline_total_output_bytes(scan).has_value());
 }
@@ -854,15 +773,13 @@ TEST_CASE("data_size_estimator: ratio_samples reports the weakest ratio in the c
           "[data_size_estimator][estimation][fan_in]")
 {
   fan_in_dag f;
-  f.give_both_sides_totals();  // probe side gets exactly min_ratio_samples records
+  f.give_both_sides_totals();
   f.record_join_ratio(100 * kMiB, 50 * kMiB, /*n=*/40);
   estimator_dag::source_of(*f.join).primary_port     = "default";
   estimator_dag::source_of(*f.join).consumed_primary = 200 * kMiB;
 
   auto est = f.estimate();
   REQUIRE(est.has_value());
-  // The join has 40 samples but the probe pipeline has only the bare minimum — the chain is
-  // only as trustworthy as its weakest link.
   CHECK(est->ratio_samples == size_estimate_options{}.min_ratio_samples);
 }
 
@@ -878,7 +795,6 @@ TEST_CASE("data_size_estimator: a fan-in ignores the non-primary side entirely",
   auto const before = f.estimate();
   REQUIRE(before.has_value());
 
-  // Move the build side dramatically; the projection must not budge.
   estimator_dag::source_of(*f.build).input_total = 4096 * kMiB;
   record_ratio(*f.build, 100 * kMiB, 800 * kMiB);
 
@@ -891,8 +807,6 @@ TEST_CASE("data_size_estimator: a fan-in whose primary upstream is unknown yield
           "[data_size_estimator][estimation][fan_in]")
 {
   fan_in_dag f;
-  // Build side is fully knowable; probe side is not (its source knows no total). The strict
-  // fallback means we report nothing rather than substituting the side we happen to know.
   estimator_dag::source_of(*f.build).input_total = 1 * kMiB;
   record_ratio(*f.build, 100 * kMiB, 100 * kMiB);
   f.record_join_ratio(100 * kMiB, 50 * kMiB);
@@ -928,7 +842,6 @@ TEST_CASE("data_size_estimator: unknown and dependency-only ports yield no estim
   estimator_dag dag;
   auto& producer = dag.add();
   auto& consumer = dag.add();
-  // A dependency-only edge: no repository, so no bytes ever flow through it.
   dag.connect(producer, consumer, MemoryBarrierType::FULL, /*with_repo=*/false);
 
   producer.finished = true;

@@ -263,9 +263,7 @@ bool sirius_gpu_scan_operator::all_ports_empty() { return _split_connector->is_c
 std::optional<std::size_t> sirius_gpu_scan_operator::total_source_input_bytes() const
 {
   if (!_split_connector->is_discovery_complete()) { return std::nullopt; }
-  // A split with no a-priori estimate contributes 0 to the tally and is excluded from the
-  // pipeline ratio, yet still emits rows — so the sum omits its output rather than approximating
-  // it, and reads exactly 0 when no split had an estimate at all. Neither is a total.
+  // An unsized split may still emit rows, so discovered bytes are not a total.
   if (_split_connector->has_unsized_splits()) { return std::nullopt; }
   return _split_connector->discovered_bytes();
 }
@@ -376,10 +374,8 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
     }
   }
 
-  // Feed the bytes-per-row factor behind total_source_output_bytes(). Read both from the table
-  // while we still own it: for an owned table the batch's get_size_in_bytes() is exactly
-  // alloc_size(), so locking the batch afterwards would buy the same number at the cost of a
-  // shared lock. Rows and bytes are only meaningful as a pair, so publish them in one update.
+  // Read the size before moving the table into a batch to avoid locking the batch. Publish rows
+  // and bytes together because they form one sample.
   auto const emitted_rows  = static_cast<std::size_t>(output_table->num_rows());
   auto const emitted_bytes = output_table->alloc_size();
   {

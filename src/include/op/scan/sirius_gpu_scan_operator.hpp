@@ -135,22 +135,13 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   [[nodiscard]] static std::size_t resident_carrier_conversion_peak_memory_estimate(
     const op::input_stats& stats) noexcept;
 
-  /// Σ `scan_info::estimated_bytes()` over every split pushed into this operator's connector —
-  /// the same quantity `pipeline_memory_history` records as a scan task's `input_basis`, so the
-  /// estimator may scale it by the pipeline's learned ratio. nullopt until split discovery
-  /// closes; there is deliberately no partial-discovery extrapolation, because the split
-  /// provider claims every metadata unit up front and a claim-based progress fraction would
-  /// saturate while the byte tally is still near zero.
-  ///
-  /// Also nullopt if any split reported no a-priori estimate. Such a split adds 0 to the tally
-  /// and is excluded from the ratio, so its output is absent from both sides rather than
-  /// approximated — the sum would be a partial total presented as a complete one.
+  /// Whole-query sum of `scan_info::estimated_bytes()` for all pushed splits, in scan-task
+  /// `input_basis` units.
+  /// Returns nullopt until discovery closes or if any split lacks an a-priori estimate.
   [[nodiscard]] std::optional<std::size_t> total_source_input_bytes() const override;
 
-  /// `pipeline::project_source_output_bytes` over the per-batch counters below: the planner's
-  /// `estimated_cardinality` scaled by measured bytes/row, floored at the bytes already emitted
-  /// (see that function for why the floor is load-bearing). Both factors are post-filter, so the
-  /// estimator uses this unscaled. nullopt until a batch with rows has been emitted.
+  /// @ref pipeline::project_source_output_bytes: planner cardinality times measured post-filter
+  /// bytes/row, floored at emitted bytes. Returns nullopt before measurement; used unscaled.
   [[nodiscard]] std::optional<std::size_t> total_source_output_bytes() const override;
 
   /**
@@ -199,10 +190,7 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   duckdb::SiriusContext* _compressed_materialization_observer;
   /// Native cuDF carrier for each logical output column, in output order.
   std::vector<cudf::data_type> _native_physical_types;
-  /// Running post-filter output totals, accumulated per batch in execute(). Only meaningful as
-  /// a pair — their quotient is the bytes-per-row factor — so they are published together under
-  /// one mutex rather than as two atomics, which would let a reader divide a row count by a byte
-  /// total that excludes those rows.
+  /// Post-filter totals, locked together to provide a consistent bytes/row sample.
   mutable std::mutex _emitted_mutex;
   std::size_t _emitted_bytes{0};
   std::size_t _emitted_rows{0};

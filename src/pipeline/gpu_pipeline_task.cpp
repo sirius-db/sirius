@@ -624,10 +624,8 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
       }
     }
     auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
-    // A task resumed mid-pipeline restarted from intermediate data, so its input_basis is not in
-    // pipeline-input units and must not feed the aggregate ratio (it still informs per-task peak
-    // estimation). The prepare_for_processing OOM path rethrows the ORIGINAL input at index 0 and
-    // stays eligible.
+    // Mid-pipeline retries use intermediate input units and must not affect the aggregate ratio.
+    // An OOM before processing restarts at index 0 with the original input and remains eligible.
     bool const ratio_eligible = local_state._start_operator_index == 0;
     global.get_memory_history().record({input_basis, peak_bytes, output_bytes, ratio_eligible});
     SIRIUS_LOG_TRACE(

@@ -595,8 +595,7 @@ TEST_CASE("broadcast_slots_to_discard - a DESTROYED slot is not rediscarded", "[
 
 namespace {
 
-// A bare hash join of a given type: single-INTEGER children joined on col0, no pipelines, no GPU.
-// The LogicalComparisonJoin must outlive the join, which holds op.types by reference.
+// LogicalComparisonJoin must outlive hash_join, which references op.types.
 struct nomination_fixture {
   duckdb::unique_ptr<duckdb::LogicalComparisonJoin> logical_join;
   duckdb::unique_ptr<sirius::op::sirius_physical_hash_join> hash_join;
@@ -640,8 +639,7 @@ nomination_fixture make_join(duckdb::JoinType join_type)
 TEST_CASE("primary_input_port - probe-streaming joins nominate the probe side",
           "[hash_join][size_estimation][unit]")
 {
-  // These fold the build to one whole batch and stream the probe, so probe volume is the open
-  // axis the estimator's ratio extrapolates along.
+  // Probe volume is the estimator's open axis for these joins.
   for (auto const jt : {duckdb::JoinType::INNER,
                         duckdb::JoinType::LEFT,
                         duckdb::JoinType::SEMI,
@@ -656,8 +654,7 @@ TEST_CASE("primary_input_port - probe-streaming joins nominate the probe side",
 TEST_CASE("primary_input_port - build-streaming joins nominate nothing",
           "[hash_join][size_estimation][unit]")
 {
-  // RIGHT-family pins the probe whole and streams the build; OUTER pins both. With no open axis
-  // to extrapolate along, nominating nothing yields no estimate instead of an under-estimate.
+  // These joins have no probe-side axis the estimator can safely extrapolate.
   for (auto const jt : {duckdb::JoinType::RIGHT,
                         duckdb::JoinType::RIGHT_SEMI,
                         duckdb::JoinType::RIGHT_ANTI,

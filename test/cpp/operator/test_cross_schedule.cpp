@@ -289,8 +289,7 @@ TEST_CASE("orphan path does nothing when both sides are empty", "[cross_schedule
 TEST_CASE("pairing-weighted probe bytes track how far through its pairings a batch is",
           "[cross_schedule][size_estimation]")
 {
-  // One probe batch of 1000 bytes against 4 build batches: charging the full 1000 up front would
-  // make the ratio read a quarter of true until the last pairing lands.
+  // Weighting by completed pairings prevents early ratios from reading artificially low.
   std::vector<partition_cross_schedule> cross{make_partition({7}, {10, 11, 12, 13})};
   std::unordered_map<uint64_t, std::size_t> bytes{{7, 1000}};
 
@@ -299,7 +298,6 @@ TEST_CASE("pairing-weighted probe bytes track how far through its pairings a bat
   CHECK(pairing_weighted_probe_bytes(cross, bytes) == 250);
   cross[0].probe_paired_count[0] = 2;
   CHECK(pairing_weighted_probe_bytes(cross, bytes) == 500);
-  // Fully paired: worth exactly its own size.
   cross[0].probe_paired_count[0] = 4;
   CHECK(pairing_weighted_probe_bytes(cross, bytes) == 1000);
 }
@@ -310,9 +308,9 @@ TEST_CASE("pairing-weighted probe bytes sum across batches and partitions",
   std::vector<partition_cross_schedule> cross{make_partition({1, 2}, {10, 11}),
                                               make_partition({3}, {20, 21, 22, 23})};
   std::unordered_map<uint64_t, std::size_t> bytes{{1, 800}, {2, 400}, {3, 1000}};
-  cross[0].probe_paired_count[0] = 2;  // 800 x 2/2 = 800
-  cross[0].probe_paired_count[1] = 1;  // 400 x 1/2 = 200
-  cross[1].probe_paired_count[0] = 3;  // 1000 x 3/4 = 750
+  cross[0].probe_paired_count[0] = 2;
+  cross[0].probe_paired_count[1] = 1;
+  cross[1].probe_paired_count[0] = 3;
 
   CHECK(pairing_weighted_probe_bytes(cross, bytes) == 1750);
 }
@@ -320,7 +318,6 @@ TEST_CASE("pairing-weighted probe bytes sum across batches and partitions",
 TEST_CASE("pairing-weighted probe bytes ignore a partition with no build batch yet",
           "[cross_schedule][size_estimation]")
 {
-  // Nothing to be a fraction of; such a batch reaches the total whole via the orphan path.
   std::vector<partition_cross_schedule> cross{make_partition({1}, {})};
   std::unordered_map<uint64_t, std::size_t> bytes{{1, 500}};
 
@@ -330,10 +327,9 @@ TEST_CASE("pairing-weighted probe bytes ignore a partition with no build batch y
 TEST_CASE("pairing-weighted probe bytes skip a batch whose size was never recorded",
           "[cross_schedule][size_estimation]")
 {
-  // The non-blocking size read lost its race; the batch contributes once a later pairing records
-  // it.
+  // Simulate a non-blocking size read that could not acquire the batch lock.
   std::vector<partition_cross_schedule> cross{make_partition({1, 2}, {10})};
-  std::unordered_map<uint64_t, std::size_t> bytes{{1, 600}};  // no entry for batch 2
+  std::unordered_map<uint64_t, std::size_t> bytes{{1, 600}};
   cross[0].probe_paired_count[0] = 1;
   cross[0].probe_paired_count[1] = 1;
 

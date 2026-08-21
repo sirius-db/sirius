@@ -546,45 +546,29 @@ class sirius_physical_operator {
     return sirius::OrderPreservationType::INSERTION_ORDER;
   }
 
-  // Hooks for the data size estimator (`pipeline/data_size_estimator.hpp`). All four default to
-  // nullopt, meaning "this operator cannot answer", which makes the estimator report no estimate
-  // — the correct outcome for STREAMING_SOURCE, CTE and delim-join wiring. See
+  // Data-size estimator hooks. nullopt means unavailable; see
   // docs/super-sirius/data-size-estimation.md.
 
-  /// Total bytes this leaf source will feed its pipeline over the whole query, in the same units
-  /// as `pipeline_memory_history::input_basis`, so the estimator may scale it by the pipeline's
-  /// learned input->output ratio.
+  /// Whole-query leaf input in `pipeline_memory_history::input_basis` units.
   [[nodiscard]] virtual std::optional<std::size_t> total_source_input_bytes() const
   {
     return std::nullopt;
   }
 
-  /// Total bytes this leaf source will *emit*, consulted only when @ref total_source_input_bytes
-  /// is nullopt. Already an output quantity, so the estimator does NOT apply the pipeline ratio:
-  /// that ratio's denominator is pre-filter, and scaling a post-filter figure by it would count
-  /// filter selectivity twice.
-  ///
-  /// An override projecting from a planner estimate must floor its answer at whatever it has
-  /// already emitted: this is a *total*, so a value below an observed partial is provably wrong.
-  /// Results built on this hook are always marked `planner_derived`.
+  /// Whole-query leaf output, used unscaled only when @ref total_source_input_bytes is nullopt.
+  /// Planner-based overrides must floor totals at emitted bytes; results are `planner_derived`.
   [[nodiscard]] virtual std::optional<std::size_t> total_source_output_bytes() const
   {
     return std::nullopt;
   }
 
-  /// For a fan-in operator, the port carrying the volume-driving input — a hash join nominates
-  /// its probe port, since the build side is consumed once into a hash table. Tells the
-  /// estimator which upstream to follow. Must be paired with @ref consumed_primary_input_bytes.
+  /// Fan-in port that drives output volume. Must pair with @ref consumed_primary_input_bytes.
   [[nodiscard]] virtual std::optional<std::string_view> primary_input_port() const
   {
     return std::nullopt;
   }
 
-  /// Bytes *processed* from @ref primary_input_port, counted once per distinct batch. Both
-  /// halves are load-bearing: count on first entry into a task, not on arrival in the port, or
-  /// the ratio reads far too low while input is still streaming; and once per batch, because a
-  /// STANDARD join re-pairs each probe batch against every build batch, which is exactly why
-  /// `input_basis` cannot serve here (its sum is a cross product, not an input volume).
+  /// Bytes processed from @ref primary_input_port, counted at task entry once per distinct batch.
   [[nodiscard]] virtual std::optional<std::size_t> consumed_primary_input_bytes() const
   {
     return std::nullopt;
@@ -692,13 +676,10 @@ class sirius_physical_operator {
   void push_data_batch(std::string_view port_id, std::shared_ptr<::cucascade::data_batch> batch);
   //! Add a port to the operator
   void add_port(std::string_view port_id, std::unique_ptr<port> p);
-  //! Get a port from the operator
-  //! Look up a port, or nullptr when this operator has no port by that name. Prefer this over
-  //! @ref get_port wherever a missing port is an ordinary outcome rather than a bug — get_port
-  //! throws, and a throw escaping a scheduling path (get_next_task_hint) is not recoverable.
+  //! Look up a port, or nullptr if absent. Use @ref get_port when absence is an error.
   [[nodiscard]] port* try_get_port(std::string_view port_id);
   [[nodiscard]] const port* try_get_port(std::string_view port_id) const;
-  //! As @ref try_get_port, but throws when the name is unknown.
+  //! Look up a port; throws if absent.
   port* get_port(std::string_view port_id);
   //! Get all ports from the operator
   std::vector<std::string_view> get_port_ids();
@@ -727,10 +708,8 @@ class sirius_physical_operator {
   /// \brief check if this operator has exhausted its limit, allowing the pipeline to finish early
   virtual bool is_limit_exhausted() const { return false; }
 
-  /// \brief whether this operator caps its pipeline's output independently of how much input
-  /// arrives — a row limit. Unlike @ref is_limit_exhausted this is true from the start, since the
-  /// cap bounds the eventual total whether or not it has bound yet. The data size estimator
-  /// refuses to extrapolate a ratio through such a pipeline.
+  /// \brief Whether this operator caps pipeline output regardless of input volume.
+  /// True before the cap binds; the data-size estimator will not extrapolate through it.
   [[nodiscard]] virtual bool caps_pipeline_output() const { return false; }
 
   //! Get the input batch

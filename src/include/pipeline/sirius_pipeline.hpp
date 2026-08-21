@@ -217,11 +217,8 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   [[nodiscard]] uuid::UUID pipeline_uuid() const { return _pipeline_uuid; }
 
-  //! Historical memory/size metrics for this pipeline's completed tasks. Recorded by
-  //! gpu_pipeline_task via sirius_pipeline_task_global_state::get_memory_history() (which
-  //! delegates here), and read by the data size estimator, which needs to reach a producer
-  //! pipeline's input->output ratio through `port::src_pipeline` — a path that has no access
-  //! to the task_creator-owned global states.
+  //! Completed-task memory and size history, owned here so upstream estimators can access it
+  //! through `port::src_pipeline`.
   [[nodiscard]] pipeline_memory_history& get_memory_history() noexcept { return _memory_history; }
   [[nodiscard]] const pipeline_memory_history& get_memory_history() const noexcept
   {
@@ -287,7 +284,7 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   std::atomic<std::size_t> tasks_created   = 0;
   std::atomic<std::size_t> tasks_completed = 0;
 
-  //! Historical memory metrics for this pipeline's tasks (see get_memory_history).
+  //! Completed-task history; see get_memory_history().
   pipeline_memory_history _memory_history;
 
   //! NVTX process-wide range tracking the pipeline's active lifetime

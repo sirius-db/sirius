@@ -38,11 +38,11 @@ will this port have received once its producer is done?"*.
 
 ```cpp
 struct data_size_estimate {
-  std::size_t bytes;           // projected total
-  bool        exact;           // measured, not projected — anchored on a finished pipeline
-  std::size_t hops;            // pipelines traversed; ratio error compounds per hop
-  std::size_t ratio_samples;   // completed tasks behind the weakest ratio in the chain
-  bool        planner_derived; // the anchor was a planner guess, not a measurement
+  std::size_t bytes;           // projected whole-query total
+  bool        exact;           // no learned ratio was applied
+  std::size_t hops;            // producer pipelines traversed
+  std::size_t ratio_samples;   // tasks backing the weakest measured ratio
+  bool        planner_derived; // anchored on planner cardinality
 };
 ```
 

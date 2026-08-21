@@ -107,18 +107,14 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   /// prefetch threads grabbing exclusive locks would serialize them.
   [[nodiscard]] bool is_draining(std::size_t quiet_ms) const;
 
-  /// \brief True once close() has been called — i.e. @ref discovered_bytes is now the scan's
-  ///        complete total. Distinct from @ref is_closed, which means closed AND drained.
+  /// \brief True after close(); unlike @ref is_closed, does not require the queue to be drained.
   [[nodiscard]] bool is_discovery_complete() const;
 
-  /// \brief Σ `get_estimated_size_in_bytes()` over every split pushed so far. Monotonic, so
-  ///        consumers draining the queue do not reduce it; a lower bound until discovery closes,
-  ///        and a complete total only when @ref has_unsized_splits is false.
+  /// \brief Monotonic sum of `get_estimated_size_in_bytes()` for all pushed splits.
+  /// Complete after discovery only if @ref has_unsized_splits is false.
   [[nodiscard]] std::size_t discovered_bytes() const;
 
-  /// \brief Whether any split reported no a-priori size estimate. Such a split adds 0 to
-  ///        @ref discovered_bytes while still emitting rows, so the sum omits its contribution
-  ///        rather than merely approximating it.
+  /// \brief Whether any split lacked an a-priori size estimate and contributed zero.
   [[nodiscard]] bool has_unsized_splits() const;
 
  private:
@@ -136,10 +132,9 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   std::exception_ptr _exception;
   /// steady_clock ms timestamp of the last get_next_split() pop (0 = never).
   std::atomic<std::int64_t> _last_pop_ms{0};
-  /// Monotonic discovery total: accumulated in push_split, never decremented when a
-  /// consumer pops. See @ref discovered_bytes.
+  /// Monotonic total; consumers never decrement it.
   std::size_t _discovered_bytes{0};
-  /// Latched once any split reports a zero size estimate. See @ref has_unsized_splits.
+  /// Latched when a split reports no size estimate.
   bool _has_unsized_splits{false};
 };
 
