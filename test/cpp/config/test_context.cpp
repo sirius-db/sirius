@@ -1376,7 +1376,7 @@ TEST_CASE("global dynamic-filter observability is exposed as a SiriusContext rea
   auto result = con.Query(
     "SELECT record_type, event_id, event_high_watermark, join_operator_id, "
     "exact_contribution_count, device_id, build_rows, filters_built, active_targets, "
-    "filters_pushed, stats_keys_considered "
+    "filters_pushed, stats_keys_considered, event_first_retained "
     "FROM sirius_dynamic_filter_observability() ORDER BY event_id NULLS FIRST");
   REQUIRE(result != nullptr);
   REQUIRE_FALSE(result->HasError());
@@ -1386,6 +1386,7 @@ TEST_CASE("global dynamic-filter observability is exposed as a SiriusContext rea
   CHECK(result->GetValue(1, 0).IsNull());
   CHECK(result->GetValue(2, 0).GetValue<std::uint64_t>() == 1);
   CHECK(result->GetValue(10, 0).GetValue<std::uint64_t>() == 7);
+  CHECK(result->GetValue(11, 0).GetValue<std::uint64_t>() == 1);
 
   CHECK(result->GetValue(0, 1).ToString() == "global_accumulator_completion");
   CHECK(result->GetValue(1, 1).GetValue<std::uint64_t>() == 1);
@@ -1398,6 +1399,7 @@ TEST_CASE("global dynamic-filter observability is exposed as a SiriusContext rea
   CHECK(result->GetValue(8, 1).GetValue<std::uint64_t>() == 1);
   CHECK(result->GetValue(9, 1).GetValue<std::uint64_t>() == 2);
   CHECK(result->GetValue(10, 1).IsNull());
+  CHECK(result->GetValue(11, 1).IsNull());
 }
 
 // ============================================================================

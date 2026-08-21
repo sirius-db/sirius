@@ -63,6 +63,7 @@ class DynamicFilterObservabilityTest(unittest.TestCase):
             "record_type",
             "event_id",
             "event_high_watermark",
+            "event_first_retained",
             "join_operator_id",
             "exact_contribution_count",
             "device_id",
@@ -73,8 +74,8 @@ class DynamicFilterObservabilityTest(unittest.TestCase):
             "stats_publications_finished",
         ]
         rows = [
-            ("stats", None, 1, None, None, None, None, None, None, None, 4),
-            ("global_accumulator_completion", 1, None, 9, 3, 1, 6, 1, 1, 1, None),
+            ("stats", None, 1, 1, None, None, None, None, None, None, None, 4),
+            ("global_accumulator_completion", 1, None, None, 9, 3, 1, 6, 1, 1, 1, None),
         ]
         connection = _FakeConnection(columns, rows)
 
@@ -83,6 +84,7 @@ class DynamicFilterObservabilityTest(unittest.TestCase):
         self.assertEqual(connection.commands[0], "SET gpu_execution = false;")
         self.assertIn("sirius_dynamic_filter_observability", connection.commands[1])
         self.assertEqual(snapshot["event_high_watermark"], 1)
+        self.assertEqual(snapshot["event_first_retained"], 1)
         self.assertEqual(snapshot["stats"], {"publications_finished": 4})
         self.assertEqual(
             snapshot["events"],
@@ -106,6 +108,7 @@ class DynamicFilterObservabilityTest(unittest.TestCase):
             "record_type",
             "event_id",
             "event_high_watermark",
+            "event_first_retained",
             "join_operator_id",
             "exact_contribution_count",
             "device_id",
@@ -116,22 +119,51 @@ class DynamicFilterObservabilityTest(unittest.TestCase):
             "stats_publications_finished",
         ]
         rows = [
-            ("stats", None, 2, None, None, None, None, None, None, None, 1),
-            ("global_accumulator_completion", 2, None, 9, 2, 0, 6, 1, 1, 1, None),
+            ("stats", None, 2, 1, None, None, None, None, None, None, None, 1),
+            ("global_accumulator_completion", 2, None, None, 9, 2, 0, 6, 1, 1, 1, None),
         ]
         with self.assertRaisesRegex(RuntimeError, "not contiguous"):
             performance_test._read_dynamic_filter_observability(
                 _FakeConnection(columns, rows)
             )
 
+    def test_sql_snapshot_accepts_evicted_prefix(self):
+        columns = [
+            "record_type",
+            "event_id",
+            "event_high_watermark",
+            "event_first_retained",
+            "join_operator_id",
+            "exact_contribution_count",
+            "device_id",
+            "build_rows",
+            "filters_built",
+            "active_targets",
+            "filters_pushed",
+            "stats_publications_finished",
+        ]
+        rows = [
+            ("stats", None, 2, 2, None, None, None, None, None, None, None, 1),
+            ("global_accumulator_completion", 2, None, None, 9, 2, 0, 6, 1, 1, 1, None),
+        ]
+        connection = _FakeConnection(columns, rows)
+
+        snapshot = performance_test._read_dynamic_filter_observability(connection)
+
+        self.assertEqual(snapshot["event_high_watermark"], 2)
+        self.assertEqual(snapshot["event_first_retained"], 2)
+        self.assertEqual([event["event_id"] for event in snapshot["events"]], [2])
+
     def test_iteration_record_subtracts_all_fields_and_selects_new_events(self):
         before = {
             "event_high_watermark": 2,
+            "event_first_retained": 1,
             "stats": {"a": 10, "b": 20},
             "events": [{"event_id": 1}, {"event_id": 2}],
         }
         after = {
             "event_high_watermark": 4,
+            "event_first_retained": 1,
             "stats": {"a": 13, "b": 20},
             "events": [
                 {"event_id": 1},
@@ -150,19 +182,51 @@ class DynamicFilterObservabilityTest(unittest.TestCase):
         self.assertEqual([event["event_id"] for event in record["events"]], [3, 4])
 
     def test_iteration_record_rejects_counter_decrease(self):
-        before = {"event_high_watermark": 0, "stats": {"a": 2}, "events": []}
-        after = {"event_high_watermark": 0, "stats": {"a": 1}, "events": []}
+        before = {
+            "event_high_watermark": 0,
+            "event_first_retained": 1,
+            "stats": {"a": 2},
+            "events": [],
+        }
+        after = {
+            "event_high_watermark": 0,
+            "event_first_retained": 1,
+            "stats": {"a": 1},
+            "events": [],
+        }
         with self.assertRaisesRegex(RuntimeError, "counter 'a' decreased"):
             self._write_iteration(before, after)
 
     def test_iteration_record_rejects_missing_new_event(self):
-        before = {"event_high_watermark": 2, "stats": {"a": 1}, "events": []}
+        before = {
+            "event_high_watermark": 2,
+            "event_first_retained": 1,
+            "stats": {"a": 1},
+            "events": [],
+        }
         after = {
             "event_high_watermark": 4,
+            "event_first_retained": 1,
             "stats": {"a": 1},
             "events": [{"event_id": 1}, {"event_id": 2}, {"event_id": 3}],
         }
         with self.assertRaisesRegex(RuntimeError, "expected IDs.*3, 4.*got.*3"):
+            self._write_iteration(before, after)
+
+    def test_iteration_delta_rejects_eviction_across_interval(self):
+        before = {
+            "event_high_watermark": 1,
+            "event_first_retained": 1,
+            "stats": {"a": 1},
+            "events": [{"event_id": 1}],
+        }
+        after = {
+            "event_high_watermark": 4,
+            "event_first_retained": 3,
+            "stats": {"a": 1},
+            "events": [{"event_id": 3}, {"event_id": 4}],
+        }
+        with self.assertRaisesRegex(RuntimeError, "k_event_journal_capacity"):
             self._write_iteration(before, after)
 
     def test_skip_cache_drop_is_recorded_in_metadata(self):

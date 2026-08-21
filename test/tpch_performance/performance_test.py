@@ -441,8 +441,14 @@ def _read_dynamic_filter_observability(con):
         )
 
     high_watermark = int(snapshot["event_high_watermark"])
+    if "event_first_retained" not in snapshot:
+        raise RuntimeError(
+            "sirius_dynamic_filter_observability() exposed no event_first_retained "
+            "column; the bounded event journal cannot be validated"
+        )
+    first_retained = int(snapshot["event_first_retained"])
     event_ids = sorted(int(event["event_id"]) for event in events)
-    expected_ids = list(range(1, high_watermark + 1))
+    expected_ids = list(range(first_retained, high_watermark + 1))
     if event_ids != expected_ids:
         raise RuntimeError(
             "dynamic-filter event snapshot is not contiguous: "
@@ -450,6 +456,7 @@ def _read_dynamic_filter_observability(con):
         )
     return {
         "event_high_watermark": high_watermark,
+        "event_first_retained": first_retained,
         "stats": stats,
         "events": events,
     }
@@ -477,6 +484,13 @@ def _write_dynamic_filter_iteration_observability(path, qnum, iteration, before,
         raise RuntimeError(
             "dynamic-filter event high-water mark decreased "
             f"from {before_event} to {after_event}"
+        )
+    if after["event_first_retained"] > before_event + 1:
+        raise RuntimeError(
+            "dynamic-filter journal evicted events within one query iteration "
+            f"(first retained ID {after['event_first_retained']} exceeds interval "
+            f"start {before_event + 1}); raise "
+            "dynamic_filter_stats::k_event_journal_capacity"
         )
     new_events = [
         event for event in after["events"] if int(event["event_id"]) > before_event

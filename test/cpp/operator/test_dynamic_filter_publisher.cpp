@@ -1554,10 +1554,13 @@ TEST_CASE("zero-row accumulated snapshots complete without constructing a Bloom"
   publisher_fixture fixture;
   fixture.add_key_column(0);
   fixture.add_key_column(0);
-  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
-  auto plan    = make_accumulator_plan(fixture, channel);
-  sirius::op::dynamic_filter_accumulator accumulator(plan,
-                                                     make_complete_build_snapshot(0, {101, 202}));
+  std::size_t insert_syncs = 0;
+  sirius::op::detail::dynamic_filter_accumulator_test_hooks hooks;
+  hooks.after_insert_sync = [&](std::uint64_t) { ++insert_syncs; };
+  auto channel            = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto plan               = make_accumulator_plan(fixture, channel);
+  sirius::op::dynamic_filter_accumulator accumulator(
+    plan, make_complete_build_snapshot(0, {101, 202}), std::move(hooks));
 
   auto const first =
     accumulator.contribute(101, one_column_view(*fixture.columns[0]), fixture.stream);
@@ -1570,6 +1573,8 @@ TEST_CASE("zero-row accumulated snapshots complete without constructing a Bloom"
   REQUIRE(last.root_device_id == kDeviceId);
   REQUIRE(last.publication.membership_filters_built == 0);
   REQUIRE(last.publication.filters_pushed == 0);
+  // A zero-row snapshot leaves every key inactive, so no contribution synchronizes its stream.
+  REQUIRE(insert_syncs == 0);
   REQUIRE(accumulator.complete());
   REQUIRE_FALSE(accumulator.aborted());
   REQUIRE(channel->empty());
@@ -1761,6 +1766,8 @@ TEST_CASE("drained targets complete an accumulated session without fan-out",
   sirius::op::dynamic_filter_publication_session session(plan, &stats, true);
 
   REQUIRE(session.try_arm(make_complete_build_snapshot(6, {101, 202})));
+  // The channel drained before arming, so the first contribution seals the accumulator and the
+  // second is a terminal no-op.
   session.contribute(kJoinOperatorId, 101, one_column_view(*fixture.columns[0]), fixture.stream);
   session.contribute(kJoinOperatorId, 202, one_column_view(*fixture.columns[1]), fixture.stream);
 
@@ -1776,12 +1783,40 @@ TEST_CASE("drained targets complete an accumulated session without fan-out",
   REQUIRE(events.last_event_id == 1);
   REQUIRE(events.records.size() == 1);
   CHECK(events.records[0].join_operator_id == kJoinOperatorId);
-  CHECK(events.records[0].exact_contribution_count == 2);
+  CHECK(events.records[0].exact_contribution_count == 0);
   CHECK(events.records[0].device_id == kDeviceId);
   CHECK(events.records[0].build_rows == 6);
   CHECK(events.records[0].filters_built == 0);
   CHECK(events.records[0].active_targets == 0);
   CHECK(events.records[0].filters_pushed == 0);
+}
+
+TEST_CASE("a session sealed by a mid-accumulation drain reports finished with a drained skip",
+          "[dynamic_filter][publisher][publication_session]")
+{
+  publisher_fixture fixture;
+  fixture.add_key_column(3, 0);
+  fixture.add_key_column(3, 3);
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto plan    = make_accumulator_plan(fixture, channel);
+  sirius::op::dynamic_filter_stats stats;
+  sirius::op::dynamic_filter_publication_session session(plan, &stats, true);
+
+  REQUIRE(session.try_arm(make_complete_build_snapshot(6, {101, 202})));
+  session.contribute(kJoinOperatorId, 101, one_column_view(*fixture.columns[0]), fixture.stream);
+  channel->close_for_new_filters();
+  session.contribute(kJoinOperatorId, 202, one_column_view(*fixture.columns[1]), fixture.stream);
+
+  REQUIRE(channel->empty());
+  REQUIRE(stats.publications_finished.load() == 1);
+  REQUIRE(stats.publications_failed.load() == 0);
+  REQUIRE(stats.publications_skipped_targets_drained.load() == 1);
+  auto const events = stats.event_snapshot();
+  REQUIRE(events.last_event_id == 1);
+  REQUIRE(events.records.size() == 1);
+  CHECK(events.records[0].exact_contribution_count == 1);
+  CHECK(events.records[0].filters_built == 0);
+  CHECK(events.records[0].active_targets == 0);
 }
 
 TEST_CASE("multi-partition Bloom admission accounts for every key on one GPU",
@@ -1817,6 +1852,202 @@ TEST_CASE("multi-partition Bloom admission accounts for every key on one GPU",
   REQUIRE(accumulator.complete());
   REQUIRE_FALSE(accumulator.aborted());
   REQUIRE(channel->empty());
+}
+
+TEST_CASE("targets that drain mid-accumulation seal the accumulator without further building",
+          "[dynamic_filter][publisher][accumulator]")
+{
+  publisher_fixture fixture;
+  fixture.add_key_column(3, 0);
+  fixture.add_key_column(3, 3);
+  std::size_t insert_syncs = 0;
+  sirius::op::detail::dynamic_filter_accumulator_test_hooks hooks;
+  hooks.after_insert_sync = [&](std::uint64_t) { ++insert_syncs; };
+  auto channel            = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto plan               = make_accumulator_plan(fixture, channel);
+  sirius::op::dynamic_filter_accumulator accumulator(
+    plan, make_complete_build_snapshot(6, {101, 202}), std::move(hooks));
+
+  auto const first =
+    accumulator.contribute(101, one_column_view(*fixture.columns[0]), fixture.stream);
+  REQUIRE(first.state == sirius::op::dynamic_filter_accumulation_result::status::pending);
+  REQUIRE(insert_syncs == 1);
+
+  channel->close_for_new_filters();
+
+  auto const sealed =
+    accumulator.contribute(202, one_column_view(*fixture.columns[1]), fixture.stream);
+  REQUIRE(sealed.state == sirius::op::dynamic_filter_accumulation_result::status::published);
+  REQUIRE(sealed.exact_contribution_count == 1);
+  REQUIRE(sealed.publication.skipped_targets_drained == 1);
+  REQUIRE(sealed.publication.membership_filters_built == 0);
+  REQUIRE(sealed.publication.filters_pushed == 0);
+  // The sealing contribution performed no per-batch device work: no insert, no stream sync.
+  REQUIRE(insert_syncs == 1);
+  REQUIRE(accumulator.complete());
+  REQUIRE(channel->empty());
+  REQUIRE_FALSE(accumulator.abort_if_incomplete());
+
+  auto const late =
+    accumulator.contribute(202, one_column_view(*fixture.columns[1]), fixture.stream);
+  REQUIRE(late.state == sirius::op::dynamic_filter_accumulation_result::status::duplicate);
+}
+
+TEST_CASE("a drain seal during an in-flight contribution publishes exactly once",
+          "[dynamic_filter][publisher][accumulator][concurrency]")
+{
+  publisher_fixture fixture;
+  fixture.add_key_column(3, 0);
+  fixture.add_key_column(3, 3);
+  fixture.stream.synchronize();
+
+  std::binary_semaphore id_claimed{0};
+  std::binary_semaphore release_claim{0};
+  sirius::op::detail::dynamic_filter_accumulator_test_hooks hooks;
+  hooks.after_id_claim = [&](std::uint64_t batch_id) {
+    if (batch_id != 101) { return; }
+    id_claimed.release();
+    if (!release_claim.try_acquire_for(kConcurrencyTimeout)) {
+      throw std::runtime_error("timed out waiting to release the claimed contribution");
+    }
+  };
+
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto plan    = make_accumulator_plan(fixture, channel);
+  sirius::op::dynamic_filter_accumulator accumulator(
+    plan, make_complete_build_snapshot(6, {101, 202}), std::move(hooks));
+  rmm::cuda_stream task_stream{rmm::cuda_stream::flags::non_blocking};
+
+  auto first_future         = std::async(std::launch::async, [&] {
+    rmm::cuda_set_device_raii device{rmm::cuda_device_id{kDeviceId}};
+    return accumulator.contribute(101, one_column_view(*fixture.columns[0]), task_stream.view());
+  });
+  auto const claim_observed = id_claimed.try_acquire_for(kConcurrencyTimeout);
+  if (!claim_observed) { release_claim.release(); }
+  REQUIRE(claim_observed);
+
+  channel->close_for_new_filters();
+  auto const sealed =
+    accumulator.contribute(202, one_column_view(*fixture.columns[1]), fixture.stream);
+  REQUIRE(sealed.state == sirius::op::dynamic_filter_accumulation_result::status::published);
+  REQUIRE(sealed.exact_contribution_count == 0);
+
+  release_claim.release();
+  REQUIRE(first_future.wait_for(kConcurrencyTimeout) == std::future_status::ready);
+  auto const first = first_future.get();
+
+  // The released contribution observes the seal through the final locked block's terminal
+  // check: the documented post-completion `duplicate`, not a stale `pending`, and the sealed
+  // result's exact_contribution_count stays frozen at 0.
+  REQUIRE(first.state == sirius::op::dynamic_filter_accumulation_result::status::duplicate);
+  REQUIRE(accumulator.complete());
+  REQUIRE(channel->empty());
+}
+
+TEST_CASE("a contribution failing after a drain seal reports the sealed terminal",
+          "[dynamic_filter][publisher][publication_session][concurrency]")
+{
+  publisher_fixture fixture;
+  fixture.add_key_column(3, 0);
+  auto wrong_type = cudf::sequence(3,
+                                   cudf::numeric_scalar<std::int32_t>(3, true, fixture.stream),
+                                   cudf::numeric_scalar<std::int32_t>(1, true, fixture.stream),
+                                   fixture.stream,
+                                   cudf::get_current_device_resource_ref());
+  fixture.stream.synchronize();
+
+  std::binary_semaphore id_claimed{0};
+  std::binary_semaphore release_claim{0};
+  // The semaphore handshake strictly orders the two contribute calls, so the plain vector is
+  // written race-free: the sealing status lands before the mismatched contribution is released.
+  std::vector<sirius::op::dynamic_filter_accumulation_result::status> observed_statuses;
+  sirius::op::detail::dynamic_filter_publication_session_test_hooks hooks;
+  hooks.accumulator.after_id_claim = [&](std::uint64_t batch_id) {
+    if (batch_id != 101) { return; }
+    id_claimed.release();
+    if (!release_claim.try_acquire_for(kConcurrencyTimeout)) {
+      throw std::runtime_error("timed out waiting to release the claimed contribution");
+    }
+  };
+  hooks.after_accumulation_result = [&](auto status) { observed_statuses.push_back(status); };
+
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto plan    = make_accumulator_plan(fixture, channel);
+  sirius::op::dynamic_filter_stats stats;
+  sirius::op::dynamic_filter_publication_session session(plan, &stats, true, std::move(hooks));
+  REQUIRE(session.try_arm(make_complete_build_snapshot(6, {101, 202})));
+
+  rmm::cuda_stream task_stream{rmm::cuda_stream::flags::non_blocking};
+  auto mismatch_future      = std::async(std::launch::async, [&] {
+    rmm::cuda_set_device_raii device{rmm::cuda_device_id{kDeviceId}};
+    session.contribute(kJoinOperatorId, 101, one_column_view(*wrong_type), task_stream.view());
+  });
+  auto const claim_observed = id_claimed.try_acquire_for(kConcurrencyTimeout);
+  if (!claim_observed) { release_claim.release(); }
+  REQUIRE(claim_observed);
+
+  channel->close_for_new_filters();
+  session.contribute(kJoinOperatorId, 202, one_column_view(*fixture.columns[0]), fixture.stream);
+
+  release_claim.release();
+  REQUIRE(mismatch_future.wait_for(kConcurrencyTimeout) == std::future_status::ready);
+  mismatch_future.get();
+
+  // The type-mismatched contribution failed after the seal, so it must report the sealed
+  // terminal (duplicate), leave the session finished, and record no failure or mismatch.
+  using status = sirius::op::dynamic_filter_accumulation_result::status;
+  REQUIRE(observed_statuses == std::vector<status>{status::published, status::duplicate});
+  REQUIRE(stats.publications_finished.load() == 1);
+  REQUIRE(stats.publications_failed.load() == 0);
+  REQUIRE(stats.publications_skipped_targets_drained.load() == 1);
+  REQUIRE(stats.keys_skipped_type_mismatch.load() == 0);
+  REQUIRE(stats.event_snapshot().records.size() == 1);
+  REQUIRE(channel->empty());
+}
+
+TEST_CASE("an inert budget-gated accumulator contributes without stream synchronization",
+          "[dynamic_filter][publisher][accumulator][bloom_budget]")
+{
+  publisher_fixture fixture;
+  fixture.add_key_column(3, 0);
+  fixture.add_key_column(3, 3);
+  std::size_t insert_syncs = 0;
+  sirius::op::detail::dynamic_filter_accumulator_test_hooks hooks;
+  hooks.after_insert_sync = [&](std::uint64_t) { ++insert_syncs; };
+  auto channel            = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+
+  SECTION("budget gate zeroes every key")
+  {
+    auto plan = make_accumulator_plan(fixture, channel, {.max_bloom_bytes_per_gpu = 1});
+    sirius::op::dynamic_filter_accumulator accumulator(
+      plan, make_complete_build_snapshot(6, {101, 202}), std::move(hooks));
+
+    auto const first =
+      accumulator.contribute(101, one_column_view(*fixture.columns[0]), fixture.stream);
+    REQUIRE(first.state == sirius::op::dynamic_filter_accumulation_result::status::pending);
+    auto const last =
+      accumulator.contribute(202, one_column_view(*fixture.columns[1]), fixture.stream);
+    REQUIRE(last.state == sirius::op::dynamic_filter_accumulation_result::status::published);
+    REQUIRE(insert_syncs == 0);
+    REQUIRE(last.publication.keys_skipped_bloom_size_gate == 1);
+    REQUIRE(channel->empty());
+  }
+
+  SECTION("active keys still synchronize per accepted contribution")
+  {
+    auto plan = make_accumulator_plan(fixture, channel);
+    sirius::op::dynamic_filter_accumulator accumulator(
+      plan, make_complete_build_snapshot(6, {101, 202}), std::move(hooks));
+
+    auto const first =
+      accumulator.contribute(101, one_column_view(*fixture.columns[0]), fixture.stream);
+    REQUIRE(first.state == sirius::op::dynamic_filter_accumulation_result::status::pending);
+    auto const last =
+      accumulator.contribute(202, one_column_view(*fixture.columns[1]), fixture.stream);
+    REQUIRE(last.state == sirius::op::dynamic_filter_accumulation_result::status::published);
+    REQUIRE(insert_syncs == 2);
+    REQUIRE(channel->filter_count() == 1);
+  }
 }
 
 TEST_CASE("multi-partition accumulator close prevents publication with a missing ID",

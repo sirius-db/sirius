@@ -18,6 +18,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <string_view>
@@ -33,7 +34,7 @@ struct named_dynamic_filter_stat {
 enum class dynamic_filter_event_kind : std::uint8_t { global_accumulator_completion };
 
 /**
- * @brief One append-only global-accumulator completion record
+ * @brief One global-accumulator completion record
  */
 struct dynamic_filter_event_record {
   std::uint64_t event_id = 0;
@@ -47,9 +48,18 @@ struct dynamic_filter_event_record {
   std::uint64_t filters_pushed           = 0;
 };
 
+/**
+ * @brief Coherent copy of the bounded event journal
+ *
+ * Event IDs are monotone and contiguous within the retained window: the records span
+ * `[first_retained_event_id, last_event_id]` in ascending order, and the range is empty when the
+ * lower bound exceeds the upper.
+ */
 struct dynamic_filter_event_snapshot {
-  std::uint64_t last_event_id = 0;
-  std::vector<dynamic_filter_event_record> records;
+  std::uint64_t last_event_id = 0;  ///< High-water mark: the most recently recorded event ID
+  std::uint64_t first_retained_event_id =
+    1;  ///< Oldest retained event ID; greater than one once older completions were evicted
+  std::vector<dynamic_filter_event_record> records;  ///< Ascending, contiguous event IDs
 };
 
 /**
@@ -114,6 +124,9 @@ struct dynamic_filter_stats_snapshot {
  * session, so broadcast deliveries may repeat it.
  */
 struct dynamic_filter_stats {
+  /// Most-recent completions retained by the event journal (~72 B/record, ~74 KiB resident).
+  static constexpr std::size_t k_event_journal_capacity = 1024;
+
   std::atomic<std::uint64_t> producers_enabled{0};
 
   std::atomic<std::uint64_t> keys_considered{0};
@@ -178,19 +191,33 @@ struct dynamic_filter_stats {
     try {
       std::scoped_lock lock(event_mutex_);
       record.event_id = next_event_id_;
-      event_records_.push_back(record);
+      // Event `e` lives in slot `(e - 1) % capacity` in both phases: during lazy growth the
+      // journal holds events 1..size, so the modulus equals the push_back index.
+      if (event_records_.size() < k_event_journal_capacity) {
+        event_records_.push_back(record);
+      } else {
+        event_records_[(next_event_id_ - 1) % k_event_journal_capacity] = record;
+      }
       ++next_event_id_;
     } catch (...) {
       // Dynamic-filter telemetry is best effort and must never fail a query. Advancing the ID only
-      // after push_back succeeds keeps every visible snapshot contiguous.
+      // after the slot write succeeds keeps every visible snapshot contiguous.
     }
   }
 
-  /** Return a coherent copy of the append-only event journal and its high-water mark. */
+  /** Return a coherent ascending-ID copy of the bounded event journal with its high-water mark and
+   * eviction floor. */
   [[nodiscard]] dynamic_filter_event_snapshot event_snapshot() const
   {
     std::scoped_lock lock(event_mutex_);
-    return {.last_event_id = next_event_id_ - 1, .records = event_records_};
+    dynamic_filter_event_snapshot out;
+    out.last_event_id           = next_event_id_ - 1;
+    out.first_retained_event_id = next_event_id_ - event_records_.size();
+    out.records.reserve(event_records_.size());
+    for (auto id = out.first_retained_event_id; id <= out.last_event_id; ++id) {
+      out.records.push_back(event_records_[(id - 1) % k_event_journal_capacity]);
+    }
+    return out;
   }
 
  private:

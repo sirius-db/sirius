@@ -141,7 +141,8 @@ struct dynamic_filter_accumulation_result {
   enum class status : std::uint8_t {
     pending,    ///< Accepted; expected IDs remain
     duplicate,  ///< Ignored after completion or because the expected ID was already accepted
-    published,  ///< This call completed publication
+    published,  ///< This call completed the accumulation: published filters, or sealed a
+                ///< drained-target skip
     aborted     ///< Publication cannot proceed for this contribution
   };
 
@@ -155,7 +156,9 @@ struct dynamic_filter_accumulation_result {
 namespace detail {
 struct dynamic_filter_accumulator_test_hooks {
   std::function<void(std::uint64_t)> after_id_claim;
-  std::function<void(std::uint64_t)> after_insert_sync;
+  std::function<void(std::uint64_t)>
+    after_insert_sync;  ///< Fires once per accepted contribution whose insertion block ran (at
+                        ///< least one active key); an inert accumulator never fires it
   std::function<void(sirius_dynamic_bloom_filter&, std::span<dynamic_filter_replica_space const>)>
     strict_replicate;  ///< Replaces strict replication at the pre-fan-out boundary
 };
@@ -165,7 +168,10 @@ struct dynamic_filter_accumulator_test_hooks {
  * @brief Accumulates expected pre-scatter batches into one global Bloom snapshot
  *
  * `contribute()` is thread-safe and accepts each expected ID at most once. Nothing is exposed until
- * all expected IDs finish. The retained plan reference must outlive this object.
+ * all expected IDs finish. Once every bound probe target has drained, the next validated
+ * contribution seals the accumulator as complete without building filters; the terminal outcome
+ * counts one skipped-targets-drained publication. The retained plan reference must outlive this
+ * object.
  */
 class dynamic_filter_accumulator final {
  public:
@@ -196,7 +202,9 @@ class dynamic_filter_accumulator final {
    * @brief Contributes one expected build batch
    *
    * A newly accepted batch is consumed on the current GPU, and @p stream is synchronized before
-   * return. Invalid IDs, devices, or columns produce an `aborted` result.
+   * return. Invalid IDs, devices, or columns produce an `aborted` result. A validated contribution
+   * that observes every bound probe target drained instead seals the accumulator; the returned
+   * `exact_contribution_count` reports the contributions completed at the terminal transition.
    *
    * @param[in] batch_id Original pre-scatter batch ID
    * @param[in] build_view Batch containing the admitted build-key ordinals

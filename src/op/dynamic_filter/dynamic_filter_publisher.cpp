@@ -163,6 +163,18 @@ void fold_dynamic_filter_outcome(dynamic_filter_stats& stats,
   stats.filters_pushed.fetch_add(outcome.filters_pushed, relaxed);
 }
 
+[[nodiscard]] bool target_accepts_filters(
+  dynamic_filter_publish_plan::probe_target const& target) noexcept
+{
+  return target.filter_set && target.filter_set->accepting_filters();
+}
+
+[[nodiscard]] bool any_target_accepting_filters(dynamic_filter_publish_plan const& plan) noexcept
+{
+  auto const& targets = plan.probe_targets();
+  return std::any_of(targets.begin(), targets.end(), target_accepts_filters);
+}
+
 // Size exact filters for the smallest probe-device L2; return 0 if unavailable.
 std::size_t device_l2_cache_bytes(
   std::span<dynamic_filter_replica_space const> replica_spaces) noexcept
@@ -206,11 +218,8 @@ dynamic_filter_publication_outcome publish_dynamic_filters_impl(
     return outcome;
   }
 
-  auto target_accepts_filters = [](dynamic_filter_publish_plan::probe_target const& tgt) {
-    return tgt.filter_set && tgt.filter_set->accepting_filters();
-  };
   auto const& probe_targets = plan.probe_targets();
-  if (std::none_of(probe_targets.begin(), probe_targets.end(), target_accepts_filters)) {
+  if (!any_target_accepting_filters(plan)) {
     invoke_noexcept([] {
       SIRIUS_LOG_DEBUG(
         "[sirius_physical_hash_join] Skipping dynamic filter push: all target scans drained.");
@@ -497,6 +506,9 @@ struct dynamic_filter_accumulator::impl {
   std::unordered_set<std::uint64_t> completed_ids;
   std::vector<char> active_keys;
   std::vector<cudf::data_type> build_types;
+  // Whether any admitted key survived construction gating; immutable after the constructor, so it
+  // is readable without the coordinator mutex.
+  bool has_active_keys = false;
   std::map<int, std::unique_ptr<device_partial>> partials;
   dynamic_filter_publication_outcome outcome;
   detail::dynamic_filter_accumulator_test_hooks test_hooks;
@@ -566,6 +578,8 @@ struct dynamic_filter_accumulator::impl {
           plan.max_bloom_bytes_per_gpu());
       });
     }
+    has_active_keys =
+      std::any_of(active_keys.begin(), active_keys.end(), [](char key) { return key != 0; });
   }
 
   [[nodiscard]] dynamic_filter_replica_space const* replica_space(int device_id) const noexcept
@@ -611,6 +625,22 @@ struct dynamic_filter_accumulator::impl {
     return aborted_result();
   }
 
+  /// Seals a drained accumulation: terminal complete, counted as a skipped publication.
+  [[nodiscard]] dynamic_filter_accumulation_result complete_drained_locked(int sealing_device)
+  {
+    outcome.skipped_targets_drained = 1;
+    published_root_device_id        = sealing_device;
+    is_complete                     = true;
+    invoke_noexcept([&] {
+      SIRIUS_LOG_DEBUG(
+        "[dynamic_filter_accumulator] all probe targets drained after {} of {} exact build "
+        "contribution(s); completing without publication.",
+        completed_ids.size(),
+        expected_ids.size());
+    });
+    return completed_result(dynamic_filter_accumulation_result::status::published);
+  }
+
   [[nodiscard]] dynamic_filter_accumulation_result publish_locked(int root_device)
   {
     auto const* root_space = replica_space(root_device);
@@ -618,68 +648,62 @@ struct dynamic_filter_accumulator::impl {
       throw std::logic_error("the final contribution GPU is absent from the replica plan");
     }
 
-    auto target_accepts_filters = [](dynamic_filter_publish_plan::probe_target const& target) {
-      return target.filter_set && target.filter_set->accepting_filters();
-    };
-    if (std::none_of(
-          plan.probe_targets().begin(), plan.probe_targets().end(), target_accepts_filters)) {
-      outcome.skipped_targets_drained = 1;
-      published_root_device_id        = root_device;
-      is_complete                     = true;
-      return completed_result(dynamic_filter_accumulation_result::status::published);
-    }
+    if (!any_target_accepting_filters(plan)) { return complete_drained_locked(root_device); }
 
-    rmm::cuda_set_device_raii root_guard{rmm::cuda_device_id{root_device}};
-    auto const root_stream = root_space->get_gpu_space().acquire_stream();
-    auto& root_filters     = partials.at(root_device)->filters;
-    root_filters.resize(active_keys.size());
+    auto& root_filters = partials.at(root_device)->filters;
+    if (has_active_keys) {
+      rmm::cuda_set_device_raii root_guard{rmm::cuda_device_id{root_device}};
+      auto const root_stream = root_space->get_gpu_space().acquire_stream();
+      root_filters.resize(active_keys.size());
 
-    try {
+      try {
+        for (std::size_t key_index = 0; key_index < active_keys.size(); ++key_index) {
+          if (active_keys[key_index] == 0) { continue; }
+          if (!root_filters[key_index]) {
+            root_filters[key_index] = std::make_shared<sirius_dynamic_bloom_filter>(
+              build_types[key_index],
+              build_rows,
+              root_stream,
+              root_space->get_gpu_space().get_default_allocator());
+          }
+          for (auto const& [device_id, partial] : partials) {
+            if (device_id == root_device || key_index >= partial->filters.size() ||
+                !partial->filters[key_index]) {
+              continue;
+            }
+            auto const* source_space = replica_space(device_id);
+            if (source_space == nullptr) {
+              throw std::logic_error(
+                "a contributing GPU is absent from the immutable replica plan");
+            }
+            root_filters[key_index]->merge_from(
+              *partial->filters[key_index], *source_space, *root_space, root_stream);
+          }
+        }
+        root_stream.synchronize();
+      } catch (...) {
+        synchronize_after_failure(root_stream, "root reduction");
+        throw;
+      }
+
       for (std::size_t key_index = 0; key_index < active_keys.size(); ++key_index) {
-        if (active_keys[key_index] == 0) { continue; }
-        if (!root_filters[key_index]) {
-          root_filters[key_index] = std::make_shared<sirius_dynamic_bloom_filter>(
-            build_types[key_index],
-            build_rows,
-            root_stream,
-            root_space->get_gpu_space().get_default_allocator());
-        }
-        for (auto const& [device_id, partial] : partials) {
-          if (device_id == root_device || key_index >= partial->filters.size() ||
-              !partial->filters[key_index]) {
-            continue;
-          }
-          auto const* source_space = replica_space(device_id);
-          if (source_space == nullptr) {
-            throw std::logic_error("a contributing GPU is absent from the immutable replica plan");
-          }
-          root_filters[key_index]->merge_from(
-            *partial->filters[key_index], *source_space, *root_space, root_stream);
+        if (active_keys[key_index] != 0 && root_filters[key_index]) {
+          root_filters[key_index]->release_reduction_scratch();
         }
       }
-      root_stream.synchronize();
-    } catch (...) {
-      synchronize_after_failure(root_stream, "root reduction");
-      throw;
-    }
-
-    for (std::size_t key_index = 0; key_index < active_keys.size(); ++key_index) {
-      if (active_keys[key_index] != 0 && root_filters[key_index]) {
-        root_filters[key_index]->release_reduction_scratch();
+      for (auto& [device_id, partial] : partials) {
+        if (device_id != root_device) { partial->filters.clear(); }
       }
-    }
-    for (auto& [device_id, partial] : partials) {
-      if (device_id != root_device) { partial->filters.clear(); }
-    }
 
-    for (std::size_t key_index = 0; key_index < active_keys.size(); ++key_index) {
-      if (active_keys[key_index] == 0 || !root_filters[key_index]) { continue; }
-      if (test_hooks.strict_replicate) {
-        test_hooks.strict_replicate(*root_filters[key_index], plan.replica_spaces());
-      } else {
-        root_filters[key_index]->replicate_to_devices_strict(plan.replica_spaces());
+      for (std::size_t key_index = 0; key_index < active_keys.size(); ++key_index) {
+        if (active_keys[key_index] == 0 || !root_filters[key_index]) { continue; }
+        if (test_hooks.strict_replicate) {
+          test_hooks.strict_replicate(*root_filters[key_index], plan.replica_spaces());
+        } else {
+          root_filters[key_index]->replicate_to_devices_strict(plan.replica_spaces());
+        }
+        ++outcome.membership_filters_built;
       }
-      ++outcome.membership_filters_built;
     }
 
     for (auto const& target : plan.probe_targets()) {
@@ -743,6 +767,7 @@ struct dynamic_filter_accumulator::impl {
       if (it == partials.end()) {
         return abort_locked("the contribution GPU is absent from the immutable replica plan");
       }
+      if (!any_target_accepting_filters(plan)) { return complete_drained_locked(device_id); }
       in_flight_ids.insert(batch_id);
       partial = it->second.get();
     }
@@ -750,63 +775,75 @@ struct dynamic_filter_accumulator::impl {
     try {
       if (test_hooks.after_id_claim) { test_hooks.after_id_claim(batch_id); }
 
-      {
-        std::scoped_lock partial_lock(partial->mutex);
-        for (std::size_t key_index = 0; key_index < active_keys.size(); ++key_index) {
-          if (active_keys[key_index] == 0) { continue; }
-          auto const& key = plan.admitted_keys()[key_index];
-          if (key.build_key_ordinal >= build_view.num_columns()) {
-            throw std::invalid_argument(
-              "an admitted build-key ordinal is outside a contribution table");
+      if (has_active_keys) {
+        {
+          std::scoped_lock partial_lock(partial->mutex);
+          for (std::size_t key_index = 0; key_index < active_keys.size(); ++key_index) {
+            if (active_keys[key_index] == 0) { continue; }
+            auto const& key = plan.admitted_keys()[key_index];
+            if (key.build_key_ordinal >= build_view.num_columns()) {
+              throw std::invalid_argument(
+                "an admitted build-key ordinal is outside a contribution table");
+            }
+            if (build_view.column(key.build_key_ordinal).type() != build_types[key_index]) {
+              throw build_type_mismatch{};
+            }
           }
-          if (build_view.column(key.build_key_ordinal).type() != build_types[key_index]) {
-            throw build_type_mismatch{};
+
+          partial->filters.resize(active_keys.size());
+          for (std::size_t key_index = 0; key_index < active_keys.size(); ++key_index) {
+            if (active_keys[key_index] == 0) { continue; }
+            auto const column =
+              build_view.column(plan.admitted_keys()[key_index].build_key_ordinal);
+            if (!partial->filters[key_index]) {
+              auto const& space         = *replica_space(device_id);
+              auto const durable_stream = space.get_gpu_space().acquire_stream();
+              auto filter               = std::make_shared<sirius_dynamic_bloom_filter>(
+                build_types[key_index],
+                build_rows,
+                durable_stream,
+                space.get_gpu_space().get_default_allocator());
+              // CUCO retains the construction stream for deallocation; finish its initial clear
+              // on this durable stream before inserting on the task stream.
+              durable_stream.synchronize();
+              partial->filters[key_index] = std::move(filter);
+            }
+            partial->filters[key_index]->add(column, stream);
           }
+          stream.synchronize();
         }
 
-        partial->filters.resize(active_keys.size());
-        for (std::size_t key_index = 0; key_index < active_keys.size(); ++key_index) {
-          if (active_keys[key_index] == 0) { continue; }
-          auto const column = build_view.column(plan.admitted_keys()[key_index].build_key_ordinal);
-          if (!partial->filters[key_index]) {
-            auto const& space         = *replica_space(device_id);
-            auto const durable_stream = space.get_gpu_space().acquire_stream();
-            auto filter               = std::make_shared<sirius_dynamic_bloom_filter>(
-              build_types[key_index],
-              build_rows,
-              durable_stream,
-              space.get_gpu_space().get_default_allocator());
-            // CUCO retains the construction stream for deallocation; finish its initial clear on
-            // this durable stream before inserting on the task stream.
-            durable_stream.synchronize();
-            partial->filters[key_index] = std::move(filter);
-          }
-          partial->filters[key_index]->add(column, stream);
-        }
-        stream.synchronize();
+        if (test_hooks.after_insert_sync) { test_hooks.after_insert_sync(batch_id); }
       }
-
-      if (test_hooks.after_insert_sync) { test_hooks.after_insert_sync(batch_id); }
     } catch (build_type_mismatch const& error) {
       std::scoped_lock coordinator_lock(mutex);
       in_flight_ids.erase(batch_id);
-      if (!is_aborted) { ++outcome.keys_skipped_type_mismatch; }
+      // A contribution finishing after a terminal transition (a mid-flight drain seal) must
+      // report that terminal and leave the outcome untouched, never surface a fresh abort.
+      if (auto terminal = terminal_result_locked()) { return *terminal; }
+      ++outcome.keys_skipped_type_mismatch;
       return abort_locked(error.what());
     } catch (std::exception const& error) {
       synchronize_after_failure(stream, "build contribution");
       std::scoped_lock coordinator_lock(mutex);
       in_flight_ids.erase(batch_id);
+      if (auto terminal = terminal_result_locked()) { return *terminal; }
       return abort_locked(error.what());
     } catch (...) {
       synchronize_after_failure(stream, "build contribution");
       std::scoped_lock coordinator_lock(mutex);
       in_flight_ids.erase(batch_id);
+      if (auto terminal = terminal_result_locked()) { return *terminal; }
       return abort_locked("unknown accumulation failure");
     }
 
     std::scoped_lock coordinator_lock(mutex);
     in_flight_ids.erase(batch_id);
-    if (is_aborted) { return aborted_result(); }
+    // A drain seal can complete the accumulator while this contribution is in flight. Reporting
+    // the terminal here yields the documented post-completion `duplicate` instead of a stale
+    // `pending`, and keeps `exact_contribution_count` frozen at its seal-time value by preventing
+    // post-terminal `completed_ids` growth.
+    if (auto terminal = terminal_result_locked()) { return *terminal; }
     completed_ids.insert(batch_id);
     if (completed_ids.size() != expected_ids.size()) {
       return {.state = dynamic_filter_accumulation_result::status::pending, .publication = outcome};

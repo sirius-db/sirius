@@ -551,6 +551,86 @@ TEST_CASE("hash join identifies one successful global accumulator completion eve
   REQUIRE(fixture.stats.event_snapshot().records.size() == 1);
 }
 
+TEST_CASE("the event journal retains only the most recent completions after overflow",
+          "[dynamic_filter][publication_claim][observability]")
+{
+  dynamic_filter_stats stats;
+  // Encode the event number into build_rows so a retained record's payload identifies the
+  // completion it was recorded for.
+  auto record_event = [&stats](std::uint64_t event_number) {
+    stats.record_global_accumulator_completion(/*join_operator_id=*/7,
+                                               /*exact_contribution_count=*/2,
+                                               /*root_device_id=*/0,
+                                               /*build_rows=*/event_number,
+                                               /*filters_built=*/1,
+                                               /*active_targets=*/1,
+                                               /*accepted_pushes=*/1);
+  };
+  constexpr auto capacity = dynamic_filter_stats::k_event_journal_capacity;
+
+  SECTION("before overflow")
+  {
+    for (std::uint64_t event_number = 1; event_number <= 3; ++event_number) {
+      record_event(event_number);
+    }
+    auto const snapshot = stats.event_snapshot();
+    REQUIRE(snapshot.first_retained_event_id == 1);
+    REQUIRE(snapshot.last_event_id == 3);
+    REQUIRE(snapshot.records.size() == 3);
+    for (std::size_t index = 0; index < snapshot.records.size(); ++index) {
+      REQUIRE(snapshot.records[index].event_id == index + 1);
+      REQUIRE(snapshot.records[index].build_rows == index + 1);
+    }
+  }
+
+  SECTION("at capacity, nothing is evicted")
+  {
+    for (std::uint64_t event_number = 1; event_number <= capacity; ++event_number) {
+      record_event(event_number);
+    }
+    auto const snapshot = stats.event_snapshot();
+    REQUIRE(snapshot.last_event_id == capacity);
+    REQUIRE(snapshot.first_retained_event_id == 1);
+    REQUIRE(snapshot.records.size() == capacity);
+    for (std::size_t index = 0; index < snapshot.records.size(); ++index) {
+      REQUIRE(snapshot.records[index].event_id == index + 1);
+      REQUIRE(snapshot.records[index].build_rows == index + 1);
+    }
+  }
+
+  SECTION("one past capacity evicts exactly the oldest record")
+  {
+    for (std::uint64_t event_number = 1; event_number <= capacity + 1; ++event_number) {
+      record_event(event_number);
+    }
+    auto const snapshot = stats.event_snapshot();
+    REQUIRE(snapshot.last_event_id == capacity + 1);
+    REQUIRE(snapshot.first_retained_event_id == 2);
+    REQUIRE(snapshot.records.size() == capacity);
+    for (std::size_t index = 0; index < snapshot.records.size(); ++index) {
+      REQUIRE(snapshot.records[index].event_id == index + 2);
+      REQUIRE(snapshot.records[index].build_rows == index + 2);
+    }
+  }
+
+  SECTION("after overflow")
+  {
+    for (std::uint64_t event_number = 1; event_number <= capacity + 3; ++event_number) {
+      record_event(event_number);
+    }
+    auto const snapshot = stats.event_snapshot();
+    REQUIRE(snapshot.last_event_id == capacity + 3);
+    REQUIRE(snapshot.first_retained_event_id == 4);
+    REQUIRE(snapshot.records.size() == capacity);
+    REQUIRE(snapshot.records.front().event_id == 4);
+    REQUIRE(snapshot.records.back().event_id == capacity + 3);
+    for (std::size_t index = 0; index < snapshot.records.size(); ++index) {
+      REQUIRE(snapshot.records[index].event_id == index + 4);
+      REQUIRE(snapshot.records[index].build_rows == index + 4);
+    }
+  }
+}
+
 TEST_CASE("an aborted accumulator folds policy counters into hash-join stats exactly once",
           "[dynamic_filter][publication_claim][accumulator]")
 {

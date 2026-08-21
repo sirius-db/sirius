@@ -1568,6 +1568,7 @@ enum class DynamicFilterObservabilityColumn : idx_t {
   record_type = 0,
   event_id,
   event_high_watermark,
+  event_first_retained,
   join_operator_id,
   exact_contribution_count,
   device_id,
@@ -1596,6 +1597,7 @@ static unique_ptr<FunctionData> DynamicFilterObservabilityBind(ClientContext&,
   add("record_type", LogicalType::VARCHAR);
   add("event_id", LogicalType::UBIGINT);
   add("event_high_watermark", LogicalType::UBIGINT);
+  add("event_first_retained", LogicalType::UBIGINT);
   add("join_operator_id", LogicalType::UBIGINT);
   add("exact_contribution_count", LogicalType::UBIGINT);
   add("device_id", LogicalType::INTEGER);
@@ -1636,6 +1638,8 @@ static void DynamicFilterObservabilityFunction(ClientContext&,
   auto const event_id_col    = static_cast<idx_t>(DynamicFilterObservabilityColumn::event_id);
   auto const high_water_col =
     static_cast<idx_t>(DynamicFilterObservabilityColumn::event_high_watermark);
+  auto const first_retained_col =
+    static_cast<idx_t>(DynamicFilterObservabilityColumn::event_first_retained);
   auto const join_id_col = static_cast<idx_t>(DynamicFilterObservabilityColumn::join_operator_id);
   auto const contribution_col =
     static_cast<idx_t>(DynamicFilterObservabilityColumn::exact_contribution_count);
@@ -1656,6 +1660,8 @@ static void DynamicFilterObservabilityFunction(ClientContext&,
       output.SetValue(record_type_col, output_rows, Value("stats"));
       set_null(event_id_col, output_rows, LogicalType::UBIGINT);
       output.SetValue(high_water_col, output_rows, Value::UBIGINT(state.events.last_event_id));
+      output.SetValue(
+        first_retained_col, output_rows, Value::UBIGINT(state.events.first_retained_event_id));
       set_null(join_id_col, output_rows, LogicalType::UBIGINT);
       set_null(contribution_col, output_rows, LogicalType::UBIGINT);
       set_null(device_col, output_rows, LogicalType::INTEGER);
@@ -1673,6 +1679,7 @@ static void DynamicFilterObservabilityFunction(ClientContext&,
       output.SetValue(record_type_col, output_rows, Value("global_accumulator_completion"));
       output.SetValue(event_id_col, output_rows, Value::UBIGINT(event.event_id));
       set_null(high_water_col, output_rows, LogicalType::UBIGINT);
+      set_null(first_retained_col, output_rows, LogicalType::UBIGINT);
       output.SetValue(join_id_col, output_rows, Value::UBIGINT(event.join_operator_id));
       output.SetValue(
         contribution_col, output_rows, Value::UBIGINT(event.exact_contribution_count));

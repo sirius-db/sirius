@@ -177,7 +177,10 @@ Key flags:
   concurrent Sirius work between the immediately-before and post-`fetchall()` snapshots. For the
   tested global multi-partition design, require a record with contribution count greater than one
   and positive filters built, active targets, and accepted pushes, plus zero publication-failure
-  and targets-drained deltas. Not supported in `nsys-profile` mode.
+  and targets-drained deltas. Event selection remains by high-water mark; the journal retains only
+  a bounded most-recent window whose floor the stats row reports as `event_first_retained`, and
+  the harness fails fast if eviction crosses an iteration interval. Not supported in
+  `nsys-profile` mode.
 - `--skip-os-cache-drop` — explicitly bypass the normal fadvise-based page-cache eviction when
   the protocol deviation is intentional; the choice is recorded in metadata and logged
   prominently. In `isolated` mode it also skips the per-iteration evictions.

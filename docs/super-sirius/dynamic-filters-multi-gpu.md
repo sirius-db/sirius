@@ -147,7 +147,10 @@ partials and scratch, and strictly completes every planned replica before channe
 completion-selected root reuses the task thread's existing source reservation under per-thread
 reservation tracking; strict replication attaches only the other GPU adaptors. Bloom OR is
 associative and commutative, so the selected source does not affect membership. An unknown,
-missing, incompatible, or failed contribution publishes no filter.
+missing, incompatible, or failed contribution publishes no filter. If every bound probe target
+drains while accumulation is in progress, the next validated contribution instead seals the
+accumulator as complete without building further partials, counted as one skipped-targets-drained
+publication.
 
 Before any per-device partial is allocated, `max_dynamic_filter_bloom_bytes_per_gpu` admits the complete active-key set against one GPU's allocator-aligned global-geometry footprint. The calculation does not multiply by GPU count: each GPU holds the same steady-state key set. If the aggregate exceeds the cap, every Bloom candidate is skipped and the exact build still completes normally.
 
@@ -404,7 +407,7 @@ The reservation-denial suite also covers the raw small IN-list. These multi-GPU
 cases skip automatically when fewer than two devices are visible, so a passing
 two-device run is still required before the raw path can be called revalidated.
 
-The multi-partition accumulator's typed snapshot validation, exact-ID accounting, zero-row no-op, drained-target completion, OR reduction, failure handling, flag gates, and result equivalence are covered by focused tests on this single-GPU host. Timed synchronization hooks cover an in-flight duplicate, competing final contributions with exactly one publisher, terminal-result exception races, both deterministic finalize-versus-in-flight-final-contribution winners, strict-replication failure before fan-out, and destruction after a short-lived task stream. A real-repository PARTITION regression pins freeze-before-pop and stable task identity; its cross-GPU clone/retry branch automatically returns with a warning when fewer than two GPUs are visible.
+The multi-partition accumulator's typed snapshot validation, exact-ID accounting, zero-row no-op, drained-target completion (including a mid-accumulation drain observed at the next contribution), OR reduction, failure handling, flag gates, and result equivalence are covered by focused tests on this single-GPU host. Timed synchronization hooks cover an in-flight duplicate, competing final contributions with exactly one publisher, terminal-result exception races, both deterministic finalize-versus-in-flight-final-contribution winners, strict-replication failure before fan-out, and destruction after a short-lived task stream. A real-repository PARTITION regression pins freeze-before-pop and stable task identity; its cross-GPU clone/retry branch automatically returns with a warning when fewer than two GPUs are visible.
 Physical multi-GPU execution and performance have not been evaluated here. That validation is intentionally deferred to a machine with at least two visible GPUs and representative peer and staged-copy routes.
 
 ## Code map
