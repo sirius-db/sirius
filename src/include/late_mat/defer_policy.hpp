@@ -43,6 +43,7 @@
 // not happen looks exactly like one that did nothing, and the difference is
 // the whole question when a measurement disappoints.
 
+#include <algorithm>
 #include <charconv>
 #include <cstdint>
 #include <cstdlib>
@@ -65,6 +66,9 @@ enum class defer_refusal : std::uint8_t {
   /// and therefore needing its own — is not representable. A representational
   /// limit, not an economic one, and the widest bundle is the one kept.
   second_bundle,
+  /// Real but does not repay: 16 B/row over 9 crossings pays where 8 B/row
+  /// over 9 does not, so what is weighed is the product.
+  below_value_x_boundaries,
 };
 
 [[nodiscard]] char const* describe(defer_refusal r) noexcept;
@@ -90,7 +94,8 @@ struct defer_candidate {
   [[nodiscard]] std::int64_t net_value_bytes(std::int64_t rowid_bytes) const noexcept;
 };
 
-/// Port-crossing floor, env-overridable for measurement (default 4).
+/// Port-crossing floor, env-overridable for measurement (default 4). The
+/// product below relaxes the VALUE floor for long rides, never this one.
 inline int default_min_boundaries()
 {
   static int const value = [] {
@@ -100,6 +105,21 @@ inline int default_min_boundaries()
     auto const* end = v + std::strlen(v);
     auto const rc   = std::from_chars(v, end, parsed);
     return (rc.ec == std::errc{} && rc.ptr == end && parsed >= 0) ? parsed : 4;
+  }();
+  return value;
+}
+
+/// Value x crossings floor (default 128 = the 32 B/row x 4 crossings the two
+/// independent floors used to imply). Value and crossings TRADE OFF.
+inline std::int64_t default_min_value_x_boundaries()
+{
+  static std::int64_t const value = [] {
+    char const* v = std::getenv("SIRIUS_EXP_LATE_MAT_MIN_VALUE_X_BOUNDARIES");
+    if (v == nullptr || v[0] == '\0') { return std::int64_t{128}; }
+    std::int64_t parsed = 0;
+    auto const* end     = v + std::strlen(v);
+    auto const rc       = std::from_chars(v, end, parsed);
+    return (rc.ec == std::errc{} && rc.ptr == end && parsed >= 0) ? parsed : std::int64_t{128};
   }();
   return value;
 }
@@ -164,8 +184,11 @@ inline std::int64_t min_value_bytes_compressed(std::int64_t ordinary)
 
 /// The thresholds, in one place so a measurement can move them together.
 struct defer_policy {
-  /// Deferred value must exceed this, per row, after the rowid is paid for.
-  std::int64_t min_value_bytes = 32;
+  /// A ride must save SOMETHING per row after the rowid; whether it repays is
+  /// @ref min_value_x_boundaries.
+  std::int64_t min_value_bytes = 1;
+  /// Net value per row TIMES crossings saved — what the floor is really about.
+  std::int64_t min_value_x_boundaries = default_min_value_x_boundaries();
   /// Port crossings the ride must save. Overridable with
   /// SIRIUS_EXP_LATE_MAT_MIN_BOUNDARIES so a measurement can separate "the ride is
   /// not worth taking" from "the crossing count under-reports it".

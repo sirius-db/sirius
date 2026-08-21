@@ -924,7 +924,12 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
         extension.port->get_operator_id(),
         why);
     };
-    if (auto const proof = admit_group_key_extension(planned, entry, selected_columns, refuse)) {
+    if (extension.fanned_out_at_port) {
+      refuse(
+        "a join below that port multiplied the rows and nothing collapsed them again, so the "
+        "gather would run over the fan-out rather than the scan's rows");
+    } else if (auto const proof =
+                 admit_group_key_extension(planned, entry, selected_columns, refuse)) {
       port           = extension.port;
       port_positions = &extension.port_positions;
       port_input     = extension.port_input;
@@ -940,6 +945,14 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
         extension.boundaries,
         planned.boundaries);
     }
+  }
+
+  // At the port that actually installs. The group-by-rowid ride passes on its
+  // own merits: its port sits above the aggregate that collapses the fan-out.
+  if (port == planned.port && planned.fanned_out_at_port) {
+    return decline(
+      "a join on the ride multiplied the rows and nothing collapsed them again, so materializing "
+      "at the port would gather the fan-out rather than the scan's rows");
   }
 
   // Output position p is served slot p is entry column selected_columns[p] —
@@ -981,17 +994,8 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
   if (!sirius::planner::install_deferral(scan_op, *port, std::move(pair))) {
     return decline("the pair would not install (the port already carries one, or it is malformed)");
   }
-  // Only once the pair is committed: this rewrites the plan, and a rewrite for
-  // a deferral that did not install would be a change nothing asked for.
-  auto const neutralized =
-    sirius::planner::neutralize_carrier_restores(planned.carrier_restores, *port);
-  if (neutralized > 0) {
-    SIRIUS_LOG_INFO(
-      "[late-mat] operator {}: {} carrier-restore cast(s) below the port rewritten to bare "
-      "references so the rowid rides through them",
-      scan_op.get_operator_id(),
-      neutralized);
-  }
+  // Only once the pair is committed: this rewrites the plan.
+  sirius::planner::neutralize_carrier_restores(planned.carrier_restores, *port);
   SIRIUS_LOG_INFO(
     "[late-mat] operator {}: deferring {} column(s) to {} (id={}) — {} B/row over {} boundaries",
     scan_op.get_operator_id(),
@@ -1096,7 +1100,9 @@ void install_rider_deferrals(std::vector<rider_candidate> const& candidates,
 
     // The ride it would join has paid the crossing already; what this bundle
     // must still repay is its own rowid.
-    late_mat::defer_policy const rider_policy{.min_value_bytes = 1};
+    // A rider repays only its own rowid: it joins a ride somebody else already
+    // argued for, so the floor that prices INSTALLING one does not apply.
+    late_mat::defer_policy const rider_policy{.min_value_bytes = 1, .min_value_x_boundaries = 0};
     auto const planned = sirius::planner::plan_deferral(scan_op, rider_policy);
     if (!planned.installable() || !planned.group_extension.has_value()) { continue; }
     auto const& extension = *planned.group_extension;

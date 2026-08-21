@@ -58,13 +58,18 @@ TEST_CASE("a wide bundle over a long ride installs", "[late_mat][defer]")
   REQUIRE(out[0].net_value_bytes == 25 + 40 + 89 - 8);
 }
 
-TEST_CASE("a narrow dimension ride is refused", "[late_mat][defer]")
+TEST_CASE("a narrow dimension ride over a short one is refused", "[late_mat][defer]")
 {
-  // The shape that cost +61 ms: an 11-25 B name column. It saves almost
-  // nothing per row and still pays to materialize.
-  auto const out = choose_deferrals({bundle("agg", {25}, 8)});
+  // A 25 B name column is 17 B net, and over 4 crossings that is 68 — under the
+  // value x crossings floor. The same column over 8 crossings clears it, and
+  // deliberately: 16 B/row over 9 measured -14.0% on q9. What protects the
+  // shape this case was written for (+61 ms on an 800M-row port) is now the
+  // fan-out guard in the plan pass, which refuses a port above a join that
+  // multiplied the rows — a fact choose_deferrals cannot see from here.
+  auto const out = choose_deferrals({bundle("agg", {25}, 4)});
   REQUIRE_FALSE(out[0].installed());
-  REQUIRE(out[0].refusal == defer_refusal::too_little_value);
+  REQUIRE(out[0].refusal == defer_refusal::below_value_x_boundaries);
+  REQUIRE(choose_deferrals({bundle("agg", {25}, 8)})[0].installed());
 }
 
 TEST_CASE("a wide bundle over a short ride is refused", "[late_mat][defer]")
@@ -76,14 +81,16 @@ TEST_CASE("a wide bundle over a short ride is refused", "[late_mat][defer]")
   REQUIRE(out[0].refusal == defer_refusal::too_short_a_ride);
 }
 
-TEST_CASE("the value floor is net of the rowid the ride carries instead", "[late_mat][defer]")
+TEST_CASE("the floor is net of the rowid the ride carries instead", "[late_mat][defer]")
 {
-  defer_policy const policy;  // 32 B floor, 8 B rowid
-  // 39 B of values is 31 B net — just under.
-  REQUIRE(choose_deferrals({bundle("agg", {39}, 6)}, policy)[0].refusal ==
-          defer_refusal::too_little_value);
-  // 41 B is 33 B net — just over. The rowid is the difference, not a rounding.
-  REQUIRE(choose_deferrals({bundle("agg", {41}, 6)}, policy)[0].installed());
+  defer_policy const policy;  // 128 value x crossings, 8 B rowid
+  // Over 6 crossings the floor needs 22 B net: 29 B of values is 21 net, and
+  // 21 * 6 = 126 — just under.
+  REQUIRE(choose_deferrals({bundle("agg", {29}, 6)}, policy)[0].refusal ==
+          defer_refusal::below_value_x_boundaries);
+  // 30 B is 22 net and 132 — just over. The rowid is the difference, not a
+  // rounding.
+  REQUIRE(choose_deferrals({bundle("agg", {30}, 6)}, policy)[0].installed());
 }
 
 TEST_CASE("a wider bundle evicts a narrower one holding the same slot", "[late_mat][defer]")
@@ -126,7 +133,7 @@ TEST_CASE("every candidate gets an outcome, refusals included", "[late_mat][defe
   });
   REQUIRE(out.size() == 4);
   REQUIRE(out[0].refusal == defer_refusal::no_columns);
-  REQUIRE(out[1].refusal == defer_refusal::too_little_value);
+  REQUIRE(out[1].refusal == defer_refusal::below_value_x_boundaries);
   REQUIRE(out[2].refusal == defer_refusal::too_short_a_ride);
   REQUIRE(out[3].installed());
   for (auto const& o : out) {

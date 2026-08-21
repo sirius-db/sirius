@@ -29,6 +29,7 @@ char const* describe(defer_refusal r) noexcept
     case defer_refusal::no_columns: return "no columns to defer";
     case defer_refusal::evicted: return "evicted by a wider bundle";
     case defer_refusal::second_bundle: return "a wider bundle already rides this scan";
+    case defer_refusal::below_value_x_boundaries: return "value x crossings below the floor";
   }
   return "unknown";
 }
@@ -58,6 +59,11 @@ std::vector<defer_outcome> choose_deferrals(std::vector<defer_candidate> const& 
       out.refusal = defer_refusal::too_short_a_ride;
     } else if (out.net_value_bytes < policy.min_value_bytes) {
       out.refusal = defer_refusal::too_little_value;
+    } else if (out.net_value_bytes * static_cast<std::int64_t>(out.boundaries) <
+               policy.min_value_x_boundaries) {
+      // Two independent floors cannot say that a thin ride over many crossings
+      // repays where a fat one over few does not.
+      out.refusal = defer_refusal::below_value_x_boundaries;
     }
     outcomes.push_back(std::move(out));
   }

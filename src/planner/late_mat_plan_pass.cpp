@@ -120,6 +120,32 @@ bool is_group_by(sirius_physical_operator const& node)
          node.type == SiriusPhysicalOperatorType::MERGE_GROUP_BY;
 }
 
+/// Whether `node` can emit MORE rows than one side handed it. A port above one
+/// gathers the fan-out rather than the rows the scan produced.
+bool multiplies_rows(sirius_physical_operator const& node)
+{
+  switch (node.type) {
+    case SiriusPhysicalOperatorType::HASH_JOIN:
+    case SiriusPhysicalOperatorType::NESTED_LOOP_JOIN:
+    case SiriusPhysicalOperatorType::BLOCKWISE_NL_JOIN:
+    case SiriusPhysicalOperatorType::PIECEWISE_MERGE_JOIN:
+    case SiriusPhysicalOperatorType::IE_JOIN:
+    case SiriusPhysicalOperatorType::LEFT_DELIM_JOIN:
+    case SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN:
+    case SiriusPhysicalOperatorType::POSITIONAL_JOIN:
+    case SiriusPhysicalOperatorType::ASOF_JOIN: return true;
+    default: return false;
+  }
+}
+
+/// Whether `node` collapses rows: a group-by emits one per group, a top-n cuts
+/// to N. Either undoes a fan-out below it.
+bool reduces_rows(sirius_physical_operator const& node)
+{
+  return is_group_by(node) || node.type == SiriusPhysicalOperatorType::TOP_N ||
+         node.type == SiriusPhysicalOperatorType::MERGE_TOP_N;
+}
+
 /// The grouping/aggregate metadata both group-by shapes carry, or nullopt for a
 /// node that claims a group-by type but is not one of the two modelled classes
 /// (which must read everything, like any unmodelled shape).
@@ -468,7 +494,7 @@ std::vector<late_mat::defer_candidate> build_defer_candidates(
     // 0.18 -> 3.33 s. A ride that ends where rows can multiply is refused until
     // the policy can price that fan-out; ports that only ever reduce rows (an
     // aggregate, a top-n) are unaffected, which is where q10's ride lands.
-    if (life.first_reader->type == SiriusPhysicalOperatorType::HASH_JOIN) { continue; }
+    if (multiplies_rows(*life.first_reader)) { continue; }
 
     auto slot = std::find(readers.begin(), readers.end(), life.first_reader);
     if (slot == readers.end()) {
@@ -511,6 +537,9 @@ std::vector<column_lifetime> analyze_column_lifetimes(sirius_physical_operator c
     /// The stop was a group-key read, and every read since has been one too —
     /// so the longer ride is still open and still being measured.
     bool extending = false;
+    /// A join below the column's current position multiplied the rows, and no
+    /// reduction has undone it. A port here gathers the fan-out.
+    bool fanned_out = false;
   };
   std::vector<live_column> live;
   live.reserve(lifetimes.size());
@@ -560,6 +589,7 @@ std::vector<column_lifetime> analyze_column_lifetimes(sirius_physical_operator c
         life.nullified_on_ride      = col.nullified;
         life.read_as_join_key       = moved.as_join_key;
         life.consumed_as_count_only = moved.count_only;
+        life.fanned_out_at_reader   = col.fanned_out;
         col.stopped                 = true;
         // Extendable only if the stop was a key role and nothing else about the
         // column's values was needed here.
@@ -569,13 +599,14 @@ std::vector<column_lifetime> analyze_column_lifetimes(sirius_physical_operator c
         }
       } else if (col.extending && moved.read_content) {
         // The longer ride ends where something wants the values back.
-        life.group_ride->reader             = node;
-        life.group_ride->port_crossings     = crossings;
-        life.group_ride->position_at_reader = col.position;
-        life.group_ride->reader_input       = from;
-        life.group_ride->nullified_on_ride  = col.nullified;
-        life.group_ride->read_as_join_key   = moved.as_join_key;
-        col.extending                       = false;
+        life.group_ride->reader               = node;
+        life.group_ride->port_crossings       = crossings;
+        life.group_ride->position_at_reader   = col.position;
+        life.group_ride->reader_input         = from;
+        life.group_ride->nullified_on_ride    = col.nullified;
+        life.group_ride->read_as_join_key     = moved.as_join_key;
+        life.group_ride->fanned_out_at_reader = col.fanned_out;
+        col.extending                         = false;
       }
       if (col.extending && moved.as_group_key && is_group_by(*node)) {
         life.group_ride->group_bys.push_back(node);
@@ -593,18 +624,24 @@ std::vector<column_lifetime> analyze_column_lifetimes(sirius_physical_operator c
           life.nullified_on_ride      = col.nullified;
           life.read_as_join_key       = moved.as_join_key;
           life.consumed_as_count_only = moved.count_only;
+          life.fanned_out_at_reader   = col.fanned_out;
           col.stopped                 = true;
         }
         if (col.extending) {
-          life.group_ride->reader             = node;
-          life.group_ride->port_crossings     = crossings;
-          life.group_ride->position_at_reader = col.position;
-          life.group_ride->reader_input       = from;
-          life.group_ride->nullified_on_ride  = col.nullified;
-          col.extending                       = false;
+          life.group_ride->reader               = node;
+          life.group_ride->port_crossings       = crossings;
+          life.group_ride->position_at_reader   = col.position;
+          life.group_ride->reader_input         = from;
+          life.group_ride->nullified_on_ride    = col.nullified;
+          life.group_ride->fanned_out_at_reader = col.fanned_out;
+          col.extending                         = false;
         }
         continue;
       }
+      // For the NEXT node up. After the stop snapshots, because a port
+      // materializes at its INPUT: what counts is strictly what is below it.
+      if (multiplies_rows(*node)) { col.fanned_out = true; }
+      if (reduces_rows(*node)) { col.fanned_out = false; }
       col.position = *moved.moved_to;
       still_travelling.push_back(col);
     }
@@ -617,17 +654,19 @@ std::vector<column_lifetime> analyze_column_lifetimes(sirius_physical_operator c
   for (auto const& col : live) {
     auto& life = lifetimes[col.index];
     if (col.extending) {
-      life.group_ride->port_crossings     = crossings;
-      life.group_ride->position_at_reader = col.position;
-      life.group_ride->reader_input       = from;
-      life.group_ride->nullified_on_ride  = col.nullified;
+      life.group_ride->port_crossings       = crossings;
+      life.group_ride->position_at_reader   = col.position;
+      life.group_ride->reader_input         = from;
+      life.group_ride->nullified_on_ride    = col.nullified;
+      life.group_ride->fanned_out_at_reader = col.fanned_out;
       continue;  // reader stays nullptr: nothing past the aggregates reads it
     }
     if (col.stopped) { continue; }  // its lifetime was recorded where it stopped
-    life.port_crossings     = crossings;
-    life.position_at_reader = col.position;
-    life.reader_input       = from;
-    life.nullified_on_ride  = col.nullified;
+    life.port_crossings       = crossings;
+    life.position_at_reader   = col.position;
+    life.reader_input         = from;
+    life.nullified_on_ride    = col.nullified;
+    life.fanned_out_at_reader = col.fanned_out;
   }
   return lifetimes;
 }
@@ -668,6 +707,7 @@ std::optional<group_key_extension> plan_group_key_extension(
       return std::nullopt;
     }
     extension.port_positions.push_back(ride.position_at_reader);
+    extension.fanned_out_at_port = extension.fanned_out_at_port || ride.fanned_out_at_reader;
   }
 
   // Which columns could carry the proof: one that RIDES REAL (the bundle
@@ -772,8 +812,9 @@ planned_deferral plan_deferral(sirius_physical_operator& scan, late_mat::defer_p
     auto const& sites = lifetimes[position].carrier_restores;
     planned.carrier_restores.insert(planned.carrier_restores.end(), sites.begin(), sites.end());
   }
-  planned.port_input      = lifetimes[planned.positions.front()].reader_input;
-  planned.group_extension = plan_group_key_extension(lifetimes, planned.positions);
+  planned.port_input         = lifetimes[planned.positions.front()].reader_input;
+  planned.fanned_out_at_port = lifetimes[planned.positions.front()].fanned_out_at_reader;
+  planned.group_extension    = plan_group_key_extension(lifetimes, planned.positions);
   return planned;
 }
 

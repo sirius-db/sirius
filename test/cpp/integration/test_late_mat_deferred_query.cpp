@@ -28,10 +28,11 @@
 // anything: the answer must match the CPU's, AND a deferral must actually have
 // installed. A query that deferred nothing also returns the right answer.
 //
-// Shape: three wide strings from a pinned table ride an INNER join and are read
-// by an aggregate that is not grouped on them. Grouping on them instead would
-// make them partition keys, which the walk refuses — restoring a group key
-// needs the rowid to survive the group-by, which is a different feature.
+// Shape: three wide strings from a pinned table ride two INNER joins and the
+// aggregate that GROUPS on them, materializing one row per group at the far end
+// — q10's shape in miniature. Reading them as aggregate inputs instead puts the
+// port above a join fan-out, which the plan pass now refuses: the gather would
+// run over the joined rows rather than the ones the scan produced.
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -41,6 +42,7 @@
 #include <utils/sirius_test_env.hpp>
 
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -59,11 +61,12 @@ constexpr std::int64_t kLines     = 120'000;
 /// crossings and one join's wrap chain is three: a join streams into the
 /// group-by that consumes it, so there is no port between those two.
 constexpr char const* kQuery =
-  "SELECT o.o_status, max(c.c_name), max(c.c_address), max(c.c_comment) "
+  "SELECT c.c_custkey, c.c_name, c.c_address, c.c_comment, count(*) AS n "
   "FROM read_parquet('{C}') c "
   "JOIN read_parquet('{O}') o ON c.c_custkey = o.o_custkey "
   "JOIN read_parquet('{L}') l ON o.o_orderkey = l.l_orderkey "
-  "GROUP BY o.o_status ORDER BY o.o_status";
+  "GROUP BY c.c_custkey, c.c_name, c.c_address, c.c_comment "
+  "ORDER BY c.c_custkey";
 
 std::string query_for(fs::path const& customer, fs::path const& orders, fs::path const& lines)
 {
@@ -200,6 +203,11 @@ TEST_CASE("a deferred payload rides a real plan and comes back right", "[late_ma
   REQUIRE(fb);
   REQUIRE_FALSE(fb->HasError());
 
+  // c_custkey rides REAL — it is the join key and a group key — so proving it
+  // distinct over the pin is what admits the ride past the aggregates. The
+  // probe reads this per pin, so setting it here is enough.
+  ::setenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", "c_custkey", 1);
+
   // GPU tier: a deferral addresses rows by their position in device-resident
   // pinned storage, so nothing installs against a host pin.
   auto pin = con.Query("CALL pin_table(" + sirius::test::sql_literal(customer.string()) +
@@ -228,6 +236,7 @@ TEST_CASE("a deferred payload rides a real plan and comes back right", "[late_ma
   // nothing, which is the failure mode a correctness test is least able to see.
   REQUIRE(sirius::late_mat::deferrals_installed() > before);
 
+  ::unsetenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS");
   auto unpin = con.Query("CALL unpin_table('late_mat_customer');");
   REQUIRE(unpin);
   REQUIRE_FALSE(unpin->HasError());

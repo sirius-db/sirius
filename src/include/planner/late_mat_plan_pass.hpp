@@ -82,6 +82,9 @@ struct group_key_ride {
   /// Something past the aggregates compares this column as a join key — the
   /// extension is void (the conservative stop still stands).
   bool read_as_join_key = false;
+  /// A join below this reader multiplied the rows and no reduction undid it.
+  /// See column_lifetime::fanned_out_at_reader.
+  bool fanned_out_at_reader = false;
 };
 
 /// A carrier-restore cast on a column's ride. Transparent to a column riding
@@ -141,6 +144,9 @@ struct column_lifetime {
   /// partition has already hashed. This is the walk's one silent-wrong-answer
   /// shape; every other refusal merely costs a deferral.
   bool read_as_join_key = false;
+  /// A join below this reader multiplied the rows and nothing collapsed them
+  /// again, so materializing here gathers the fan-out, not the scan's rows.
+  bool fanned_out_at_reader = false;
   /// The reader needs to know the column's rows are THERE, not what is in them:
   /// every read of it is a COUNT. A rowid counts identically to the values it
   /// stands for — so long as those values carry no nulls, which only the pinned
@@ -233,6 +239,8 @@ struct group_key_extension {
   std::vector<std::size_t> port_positions;
   op::sirius_physical_operator const* port_input = nullptr;
   int boundaries                                 = 0;
+  /// See column_lifetime::fanned_out_at_reader, for the extension's own port.
+  bool fanned_out_at_port = false;
   /// Scan output positions that ride REAL (are not in the bundle) and are group
   /// keys at every aggregate in @ref group_bys. One of these being unique over
   /// the pinned table is what makes grouping by the rowid the same grouping —
@@ -262,6 +270,8 @@ struct planned_deferral {
   op::sirius_physical_operator const* port_input = nullptr;
   /// The columns' types as the port must restore them, parallel to positions.
   std::vector<sirius::logical_type> restored_types;
+  /// See column_lifetime::fanned_out_at_reader, for the plain port.
+  bool fanned_out_at_port      = false;
   std::int64_t net_value_bytes = 0;
   int boundaries               = 0;
   /// Every candidate weighed, in the order the walk found them.
