@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Reproduce the TPC-H SF1000 result: 9.139 s suite, 22/22 byte-identical.
+# Reproduce the TPC-H SF1000 result: 7.00 s suite best-of-3, 22/22 byte-identical (unpatched
+# libcudf, late-materialization + fused decode-time filtering on).
 # Run from the repo root:  pixi run bash bench/sf1000-repro/run.sh
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -10,6 +11,15 @@ CUDF_SO="${CUDF_SO:-}"                             # leave unset to use pixi-pro
 PLANS="${PLANS:-$HERE/plans}"
 CFG="${CFG:-$HERE/sirius-sf1000.yaml}"
 NAME="${NAME:-sf1000_repro}"
+
+# Late materialization (group-by-rowid ride) and fused decode-time filtering. Both off by
+# default; both are worth real suite time here and are safe to leave on for a repro run.
+# PIN_UNIQUE_COLS must cover every rider's key, not just the ride's own — dropping n_name/
+# n_nationkey still gets a correct answer (nation just stops riding) but costs real time.
+# See docs/super-sirius/late-materialization.md.
+export SIRIUS_EXP_LATE_MAT="${SIRIUS_EXP_LATE_MAT:-1}"
+export SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS="${SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS:-c_custkey,n_name,n_nationkey}"
+export SIRIUS_EXP_FUSED_SCAN_FILTER="${SIRIUS_EXP_FUSED_SCAN_FILTER:-1}"
 
 [ -d "$DATA" ] || { echo "ERROR: no SF1000 parquet at $DATA (set DATA=)"; exit 1; }
 
@@ -43,6 +53,8 @@ echo "data      : $DATA"
 echo "libcudf   : ${CUDF_SO:-<pixi-provided>}"
 echo "plans     : $PLANS"
 echo "config    : $CFG"
+echo "late-mat  : SIRIUS_EXP_LATE_MAT=$SIRIUS_EXP_LATE_MAT SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS=$SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS"
+echo "fused scan: SIRIUS_EXP_FUSED_SCAN_FILTER=$SIRIUS_EXP_FUSED_SCAN_FILTER"
 echo
 
 cd "$REPO"

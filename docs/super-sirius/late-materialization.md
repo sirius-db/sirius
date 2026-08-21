@@ -17,6 +17,14 @@ SIRIUS_EXP_LATE_MAT=1                               # the gate; off = nothing be
 SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS=c_custkey,...   # or `all`
 ```
 
+For the TPC-H SF1000 q10 ride specifically, the column list needs to cover BOTH the group-by-rowid
+key and every rider's key: `c_custkey` (customer, the ride itself) plus `n_name,n_nationkey`
+(nation, riding alongside on the join to customer):
+
+```bash
+SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS=c_custkey,n_name,n_nationkey   # needed for q10's full ride
+```
+
 Off by default and inert when off. The census goes to the log under the `[late-mat]` tag, and
 every refusal says which refusal it was — a deferral that silently did not happen looks exactly
 like one that did nothing.
@@ -134,13 +142,14 @@ deferral with a single half, admitted only over pinned columns with no nulls. Of
 
 ## Results
 
-GB300, TPC-H SF1000, GPU-pinned, decompression pushdown on, `enable_compressed_materialization`
-at its default, best-of-3. The suite gain is q9 and q10; no other query moves outside noise.
+GB300, TPC-H SF1000, unpatched libcudf, GPU-pinned, `SIRIUS_EXP_FUSED_SCAN_FILTER=1` held on in
+both arms, best-of-3, 22/22 byte-identical validated vs DuckDB CPU. The suite gain is q9 and
+q10; no other query moves outside noise.
 
 | | Suite | q9 | q10 |
 |---|---|---|---|
-| Gate off | 7.7634 s | 1.0404 s | 0.5020 s |
-| Gate on | **7.3198 s** | **0.8894 s** | **0.2343 s** |
+| Gate off | 7.3911 s | 0.8481 s | 0.4991 s |
+| Gate on | **7.0031 s** | **0.7611 s** | **0.2250 s** |
 
 ## Where the code is
 
