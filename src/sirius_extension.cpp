@@ -1784,6 +1784,10 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
       "sirius_create_ann_index requires the Sirius context to be initialized");
   }
 
+  // Required to hold the query-lifecycle slot for the whole build since the pinned entry is
+  // non-owning. The slot also serializes the current-device-resource swap the build does.
+  duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
+
   // --- Resolve the vector column's fixed dimensionality from the catalog. ---
   auto const qname          = QualifiedName::Parse(data.table_name);
   std::string const catalog = qname.catalog;  // empty => search path
