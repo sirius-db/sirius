@@ -112,8 +112,14 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   [[nodiscard]] bool is_discovery_complete() const;
 
   /// \brief Σ `get_estimated_size_in_bytes()` over every split pushed so far. Monotonic, so
-  ///        consumers draining the queue do not reduce it; a lower bound until discovery closes.
+  ///        consumers draining the queue do not reduce it; a lower bound until discovery closes,
+  ///        and a complete total only when @ref has_unsized_splits is false.
   [[nodiscard]] std::size_t discovered_bytes() const;
+
+  /// \brief Whether any split reported no a-priori size estimate. Such a split adds 0 to
+  ///        @ref discovered_bytes while still emitting rows, so the sum omits its contribution
+  ///        rather than merely approximating it.
+  [[nodiscard]] bool has_unsized_splits() const;
 
  private:
   friend class load_balancing_scan_batch_coalescer;
@@ -133,6 +139,8 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   /// Monotonic discovery total: accumulated in push_split, never decremented when a
   /// consumer pops. See @ref discovered_bytes.
   std::size_t _discovered_bytes{0};
+  /// Latched once any split reports a zero size estimate. See @ref has_unsized_splits.
+  bool _has_unsized_splits{false};
 };
 
 }  // namespace sirius::scan_manager

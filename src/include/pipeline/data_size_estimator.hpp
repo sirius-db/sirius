@@ -104,9 +104,7 @@ struct size_estimate_options {
 /**
  * @brief `bytes * ratio`, or nullopt if the product would not survive narrowing to std::size_t.
  *
- * Shared with the source hooks that feed the estimator. Narrowing an out-of-range double is UB,
- * and on x86-64 yields a huge positive value rather than anything obviously wrong — an unguarded
- * cast turns "we cannot answer" into a confident exabyte-scale total.
+ * Shared with the source hooks that feed the estimator.
  */
 [[nodiscard]] std::optional<std::size_t> scale_bytes_checked(std::size_t bytes, double ratio);
 

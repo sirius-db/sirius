@@ -141,6 +141,10 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   /// closes; there is deliberately no partial-discovery extrapolation, because the split
   /// provider claims every metadata unit up front and a claim-based progress fraction would
   /// saturate while the byte tally is still near zero.
+  ///
+  /// Also nullopt if any split reported no a-priori estimate. Such a split adds 0 to the tally
+  /// and is excluded from the ratio, so its output is absent from both sides rather than
+  /// approximated — the sum would be a partial total presented as a complete one.
   [[nodiscard]] std::optional<std::size_t> total_source_input_bytes() const override;
 
   /// `pipeline::project_source_output_bytes` over the per-batch counters below: the planner's

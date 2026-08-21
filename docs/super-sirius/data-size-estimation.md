@@ -98,7 +98,7 @@ Tasks that OOM'd record no output and are in neither: they consumed input and pr
 
 | operator | `total_source_input_bytes` | `total_source_output_bytes` |
 |----------|---------------------------|-----------------------------|
-| `GPU_SCAN` | Σ split bytes, once split discovery closes | `max(estimated_cardinality × bytes/row, bytes emitted so far)` |
+| `GPU_SCAN` | Σ split bytes, once split discovery closes and if every split was sized | `max(estimated_cardinality × bytes/row, bytes emitted so far)` |
 | `GPU_VALUES` | exact, known at plan time | — |
 
 Both exist because the quantities live in different coordinate systems.
@@ -119,6 +119,14 @@ has no such restriction: its ratio is the pipeline's own, end to end.
 For `GPU_SCAN` the total is tallied in `split_connector::push_split` — the choke point every split
 passes through — and `is_discovery_complete()` reports when the tally is final. That is distinct
 from the pre-existing `is_closed()`, which means *closed and drained*.
+
+`scan_info::estimated_bytes()` returns 0 for a split with no a-priori estimate, and that zero is a
+gap rather than a measurement. Such a split adds nothing to the tally, and `pipeline_memory_history`
+also excludes zero-basis tasks from the ratio — so its bytes are missing from *both* terms, and the
+projection silently omits whatever it emits instead of approximating it. When no split carries an
+estimate the tally is exactly 0, which under `assume_unit_ratio` would scale to a confident total of
+zero. So `push_split` latches `has_unsized_splits()` and the scan returns `nullopt` when it is set:
+a partial sum must not be presented as a complete total.
 
 `total_source_output_bytes` is the one planner-derived number anywhere in the chain: its row count
 comes from DuckDB's `estimated_cardinality`, not from measurement. It is consulted only while split

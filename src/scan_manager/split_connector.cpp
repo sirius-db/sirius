@@ -36,7 +36,11 @@ void split_connector::push_split(std::unique_ptr<op::operator_data> split)
     assert(!_closed && "push_split after close() is forbidden");
     // Accumulate before the move: this is the one choke point every split passes through,
     // so it is where the scan's total input basis is tallied for the data size estimator.
-    _discovered_bytes += split->get_estimated_size_in_bytes();
+    // A zero here is "no a-priori estimate", not "no data", so it is latched rather than
+    // silently folded into the sum.
+    auto const split_bytes = split->get_estimated_size_in_bytes();
+    _discovered_bytes += split_bytes;
+    _has_unsized_splits = _has_unsized_splits || split_bytes == 0;
     _splits.push_back(std::move(split));
   }
   _cv.notify_one();
@@ -119,6 +123,12 @@ std::size_t split_connector::discovered_bytes() const
 {
   std::lock_guard<std::mutex> lock(_mutex);
   return _discovered_bytes;
+}
+
+bool split_connector::has_unsized_splits() const
+{
+  std::lock_guard<std::mutex> lock(_mutex);
+  return _has_unsized_splits;
 }
 
 }  // namespace sirius::scan_manager

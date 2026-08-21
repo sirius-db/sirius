@@ -263,6 +263,10 @@ bool sirius_gpu_scan_operator::all_ports_empty() { return _split_connector->is_c
 std::optional<std::size_t> sirius_gpu_scan_operator::total_source_input_bytes() const
 {
   if (!_split_connector->is_discovery_complete()) { return std::nullopt; }
+  // A split with no a-priori estimate contributes 0 to the tally and is excluded from the
+  // pipeline ratio, yet still emits rows — so the sum omits its output rather than approximating
+  // it, and reads exactly 0 when no split had an estimate at all. Neither is a total.
+  if (_split_connector->has_unsized_splits()) { return std::nullopt; }
   return _split_connector->discovered_bytes();
 }
 

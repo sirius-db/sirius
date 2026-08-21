@@ -60,8 +60,7 @@ struct producer_scan {
  *
  * Deduplication by port pointer is load-bearing: `operators` normally already contains the
  * source and sink, so without it every port is seen twice and a single-input pipeline reads as
- * a fan-in. A reserved vector rather than a hash set because this runs on every task-creation
- * poll until a projection latches, and port counts are single digits.
+ * a fan-in.
  */
 producer_scan scan_producer_pipelines(sirius_pipeline& pipeline)
 {
