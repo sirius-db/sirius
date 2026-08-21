@@ -13,12 +13,32 @@ block per full-table column in schema order; a pin of a column subset selects th
 blocks (`select_plan_blocks`). Scans of a compressed entry decompress the projected columns
 at task-prepare time via the `compressed_host_representation` /
 `compressed_device_blob` → `gpu_table_representation` converters, column-parallel across
-4 fixed streams (measured strictly better than serial).
+4 fixed streams (measured strictly better than serial; the stream count is deliberately
+not configurable).
+
+## Decode-time equality pushdown
+
+A string equality filter over a compressed pinned column can be evaluated *inside* the
+decode instead of re-expressed as a post-decode comparison. At `prepare_for_query`, the
+scan manager derives a `sirius::decode_equality_pushdown` from the query's pushed-down
+filters and attaches it to the entry's scan (`set_equality_pushdown()`); the converter
+translates it into a `simpatico::decode_predicate`, so the decoder emits the match result
+directly. Interfaces: `src/compression/compressed_representation.hpp`
+(`decode_equality_pushdown`), `src/compression/compression_converters.cpp` (predicate
+translation), threaded through `sirius_scan_manager::prepare_for_query`.
+
+The compression settings can be staged in either order before a table is pinned. They become
+active only when `pin_table_compression` is true, the plan-directory setting is non-empty, and a
+matching table plan exists. `pin_table` warns and pins uncompressed when the enable flag is true
+but the plan directory is empty; a missing table plan likewise warns and falls back. The batch-size
+and compressed-fraction settings are inert until a matching plan activates compression.
 
 ## Which tier to compress on (GB300, TPC-H SF1000, 22-query hot suite)
 
 The tier decides whether compression helps at all. Measured against a 20.74 s all-host
-uncompressed baseline (dev `c4e8a10b`, pipeline 4, host-pinned, hot = min of iters 1–2):
+uncompressed baseline (dev `c4e8a10b`, pipeline 4, host-pinned, hot = min of iters 1–2 —
+note the shipped TPC-H plans were rewritten onto `bitpack` after this measurement, so
+per-column throughput/ratio figures below predate the current plans):
 
 | Config | Hot total | vs baseline |
 |---|---|---|
@@ -55,6 +75,59 @@ Rules of thumb:
   nvcomp-backed codecs (snappy) or identity for large text columns. Pin batches are
   `scan_task_batch_size` of the *pinned subset*, so a narrow pin concentrates a column's
   chars in each batch.
+
+## Filtering while decompressing (experimental)
+
+A scan can hand its row filter to the decompressor instead of evaluating it afterwards. Where
+a column's plan allows it the filter is answered from the compressed form, and the surviving
+rows come back already compacted — so rows the filter rejects are never fully decoded, and the
+scan skips its own filter pass when the decode carried the whole predicate.
+
+It is off by default and inert when off (byte-identical to an ordinary decompress):
+
+```bash
+SIRIUS_EXP_FUSED_SCAN_FILTER=1     # the gate
+SIRIUS_EXP_FUSED_SCAN_DIAG=1       # the decision trace — reach for this first
+```
+
+Measured on GB300, TPC-H SF1000, on top of a GPU-pinned compressed configuration: the suite
+went 7.866 s -> 6.918 s. The wins are concentrated where a filter is selective and the column
+is wide — q12 -35.8% from the string route.
+
+**This is a property of the plan, not of the query.** What a column can do while decoding
+follows from the compressor at its root:
+
+| Plan root | What the decode can do |
+|---|---|
+| `bitpack` (leaf) | evaluates ranges into a selection mask; rejected rows are never unpacked |
+| `delta -> bitpack` | the chunk is still reconstructed (a prefix sum is sequential), but only survivors are STORED — saves the full-width write and the downstream compaction |
+| `dictionary` with bitpack codes | answers string equality/IN off the key set, and gathers only surviving keys. Wins 2.1-2.6x at EVERY selectivity, since it skips the string materialization round trip |
+| `str_split` | reconstructs offsets under the mask and gathers only the survivors' chars |
+| anything else (`identity`, entropy-coded, ...) | decodes full width and is compacted by a gather, which is admitted only when few rows survive |
+
+So a plan chosen purely for ratio can cost row-skipping. `input -> identity` is the right GPU-tier
+choice for a column nothing filters on (see above), but on a column the workload filters on, a
+bitpack-rooted plan additionally buys the mask walk.
+
+Selectivity governs whether compaction is attempted at all, because compacting is only cheaper
+than decoding when enough rows are dropped:
+
+- a batch with any full-width column proceeds only below `SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL`
+  (0.10);
+- otherwise compaction is given up above `SIRIUS_EXP_FUSED_SCAN_MAX_SEL` (0.35), unless a
+  dictionary output is present — that route is exempt, since it wins regardless;
+- below `SIRIUS_EXP_FUSED_SCAN_K4_MAX_SEL` (0.15) the decode walks a survivor index list
+  instead of the mask bits.
+
+One batch measured unselective predicts the rest of that scan, so the scan stops attempting it
+rather than paying per batch.
+
+Two operational caveats. These are environment variables, not `SET` options: they are
+process-wide, read once and cached, so they cannot be changed per session and do not appear in
+`duckdb_settings()`. And the trace is the only way to see what happened — the plan per column (route,
+bounds, what was dropped and why), then per batch the sources in the order they ran, the
+enumeration chosen, the survivor count and whether the batch came back needing no further
+filtering.
 
 ## Interaction with the downgrade executor
 

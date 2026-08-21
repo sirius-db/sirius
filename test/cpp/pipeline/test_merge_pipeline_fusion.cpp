@@ -52,8 +52,9 @@ fs::path integration_db_path()
 #endif
 }
 
-// `fuse_merge_pipelines` is a per-connection DuckDB setting (no process-global), so the toggle is
-// driven with `SET`/`RESET` on the connection the plan is generated on.
+// The unittest process explicitly enables guarded test settings before constructing a database.
+// The test-only toggle is per-connection, so drive it with `SET`/`RESET` on the connection whose
+// plan is generated.
 class fusion_flag_guard {
  public:
   fusion_flag_guard(duckdb::Connection& con, bool enabled) : con_(con)

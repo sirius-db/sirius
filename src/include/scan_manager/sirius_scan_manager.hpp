@@ -33,6 +33,10 @@
 #include "scan_manager/pinned_chunk_stats.hpp"
 #include "scan_manager/split_provider.hpp"
 
+namespace sirius::op {
+class sirius_dynamic_filter_set;  // membership pushdown channel (op/sirius_dynamic_filter.hpp)
+}
+
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
 
@@ -192,11 +196,10 @@ struct pinned_entry {
   /// (the plain, non-compression GPU pin path) when non-empty.
   std::vector<sirius::device_pin_chunk> device_chunks;
   /// Chunk-major stored-column metadata, positional with the cached data:
-  /// column_storage[c][i] is the recorded carrier of cached column i in chunk c
-  /// (for a compressed chunk, the type its decompression reproduces) plus whether
-  /// that carrier is narrower than the pin-time native mapping. Recorded by the
-  /// pin driver at the moment of storage; insertion requires a matrix covering
-  /// every chunk and column and cross-checks recorded carriers against
+  /// column_storage[c][i] records the carrier, pin-time native mapping, and
+  /// narrowing marker for cached column i in chunk c. Recorded by the pin driver
+  /// at the moment of storage; insertion requires a matrix covering every chunk
+  /// and column and cross-checks recorded carriers against
   /// uncompressed storage. An empty matrix reads as all-native — a legitimate
   /// state for a zero-chunk or hand-built entry, which is why the serving
   /// validator still accepts it. The plan-time narrowing folds and the
@@ -298,15 +301,22 @@ void validate_recorded_column_storage(sirius::pinned_column_storage_matrix const
 [[nodiscard]] bool pinned_column_narrowed_in_all_chunks(pinned_entry const& entry,
                                                         std::size_t entry_position);
 
-/// The narrow plan-target carrier for the cached column at @p entry_position (a position into
-/// cache_info.column_ids): the widest recorded carrier across all chunks. A pure fold over the
-/// entry's @c column_storage metadata — compressed and uncompressed chunks, both tiers, answer
-/// identically and no storage is touched. Returns `std::nullopt` unless
-/// pinned_column_narrowed_in_all_chunks passes and every recorded carrier is a strict same-family
-/// narrowing of @p native_type (can_narrow_to, the defense against metadata that contradicts the
-/// pin-time logical type). Chunks narrower than the returned target widen at serve through the
-/// verified same-family restore. Non-owning read of @p entry: obtain and read it inside one
-/// slot-scoped window, and never hold it across a pin or unpin.
+/**
+ * @brief Derives the widest validated narrow carrier recorded for a cached column.
+ *
+ * Reads only @p entry's column-storage metadata. Returns no target unless @p entry_position is
+ * covered by the cached-column identity and every chunk marks the column narrowed, records
+ * @p native_type as its pin-time native type, and records a strict same-family narrowing of that
+ * type. Chunks narrower than the returned target widen when served.
+ *
+ * Call only while @p entry is protected from concurrent pin or unpin; this function does not
+ * retain it.
+ *
+ * @param entry Pinned entry to inspect.
+ * @param entry_position Position in `entry.cache_info.column_ids`.
+ * @param native_type Current scan's native cuDF type.
+ * @return Widest valid recorded carrier, or `std::nullopt`.
+ */
 [[nodiscard]] std::optional<cudf::data_type> pinned_column_narrow_carrier(
   pinned_entry const& entry, std::size_t entry_position, cudf::data_type native_type);
 
@@ -333,20 +343,27 @@ struct cached_scan_plan {
 /// conversion allocates. Declared here so the chunk↔mask pairing and the
 /// conversion sizing are unit-testable; the provider type itself stays internal
 /// to the scan manager.
-/// @p equality_pushdown is parallel to @p selected_columns and lets a GPU-tier
-/// compressed chunk answer an equality/IN filter *during* decompression — the
-/// column arrives as a BOOL8 mask instead of being reconstructed. See
-/// @c sirius::decode_equality_pushdown. Empty (the default) disables it.
+/// @p pushdown_req is the scan's filter as a decompressor can use it, parallel
+/// to @p selected_columns: a GPU-tier compressed chunk may answer an equality/IN
+/// filter off its dictionary (the column then arrives as the boolean answer) and
+/// may drop rows against the ranges while decoding, handing back an
+/// already-filtered batch. See @c sirius::pushdown_request; an empty request
+/// (the default) leaves every chunk decoding unfiltered.
+/// @p dynamic_filters is the operator's dynamic-filter channel (join builds
+/// publish into it mid-scan); the provider snapshots it PER BATCH onto the
+/// attached scan, so later batches legitimately see more filters. Null (the
+/// default) disables it.
 std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   pinned_entry const& entry,
   std::span<std::size_t const> selected_columns,
   cached_scan_plan plan,
   const telemetry::batch_telemetry_info& telemetry_info,
-  mvcc_chunk_mask_set mvcc_masks                     = {},
-  std::vector<insert_delta_split> delta_splits       = {},
-  std::vector<cudf::data_type> normalization_targets = {},
-  bool has_physical_overrides                        = false,
-  sirius::decode_equality_pushdown equality_pushdown = {});
+  mvcc_chunk_mask_set mvcc_masks                                         = {},
+  std::vector<insert_delta_split> delta_splits                           = {},
+  std::vector<cudf::data_type> normalization_targets                     = {},
+  bool has_physical_overrides                                            = false,
+  sirius::pushdown_request pushdown_req                                  = {},
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters = nullptr);
 
 /**
  * @brief Build the survivor plan for serving @p entry to a scan into @p requiested_column_ids with
@@ -423,7 +440,12 @@ class sirius_scan_manager {
   ///                                        changes must be forwarded per query by the caller).
   ///                                        Consulted by try_assign_cached_entries when building
   ///                                        the survivor plan.
-  void prepare_for_query(const sirius::planner::query& query, bool enable_pinned_zone_map_pruning);
+  /// @param allocated_gpu_ids GPU IDs allocated to this query (from
+  ///        SiriusContext::compute_allocated_gpu_ids). Scan splits are
+  ///        distributed round-robin across this subset instead of all GPUs.
+  void prepare_for_query(const sirius::planner::query& query,
+                         bool enable_pinned_zone_map_pruning,
+                         const std::vector<int>& allocated_gpu_ids);
 
   /// \brief Clear the providers map and join the driver thread if it is
   ///        still running.

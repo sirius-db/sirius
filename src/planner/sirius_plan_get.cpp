@@ -52,6 +52,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -489,6 +490,42 @@ std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
   return changed ? result : std::vector<cudf::data_type>{};
 }
 
+// Plan-time counterpart of the DuckDB serve-time native-type gate. Every storage-backed projected
+// column must retain its pin-time native mapping across all chunks. Column coverage remains the
+// cache-serviceability guard's responsibility; an empty matrix passes for zero-chunk compatibility.
+[[nodiscard]] bool pinned_native_types_match_columns(
+  sirius::scan_manager::pinned_entry const& entry,
+  duckdb::vector<duckdb::ColumnIndex> const& column_ids,
+  duckdb::vector<duckdb::LogicalType> const& returned_types)
+{
+  if (entry.column_storage.empty()) { return true; }
+
+  std::unordered_map<duckdb::idx_t, std::size_t> entry_pos_by_primary;
+  entry_pos_by_primary.reserve(entry.cache_info.column_ids.size());
+  for (std::size_t i = 0; i < entry.cache_info.column_ids.size(); ++i) {
+    entry_pos_by_primary.emplace(entry.cache_info.column_ids[i].GetPrimaryIndex(), i);
+  }
+
+  for (auto const& col_idx : column_ids) {
+    if (!col_idx.HasPrimaryIndex() || col_idx.IsRowIdColumn() || col_idx.IsVirtualColumn() ||
+        col_idx.IsEmptyColumn()) {
+      continue;
+    }
+    auto const primary = col_idx.GetPrimaryIndex();
+    auto const it      = entry_pos_by_primary.find(primary);
+    if (it == entry_pos_by_primary.end()) { continue; }
+    std::optional<cudf::data_type> native;
+    if (primary < returned_types.size()) {
+      native = sirius::try_get_cudf_type(sirius::from_duckdb(returned_types[primary]));
+    }
+    if (!native) { return false; }
+    for (auto const& row : entry.column_storage) {
+      if (it->second >= row.size() || row[it->second].native != *native) { return false; }
+    }
+  }
+  return true;
+}
+
 // An OPTIONAL_FILTER is advisory and an IS_NOT_NULL is applied by the scan itself, so
 // neither contributes to the predicate convert_table_filters_to_expression builds
 // (scan_utils.cpp). This must stay in step with that skip set: probing a filter the
@@ -666,14 +703,17 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         }
       }
 
-      if (pinned != nullptr && pinned->mvcc != nullptr) {
+      // Plan and serve must classify native-type drift identically. Treat a mismatched pin as
+      // unpinned so the fresh disk path remains available.
+      if (pinned != nullptr && pinned->mvcc != nullptr &&
+          pinned_native_types_match_columns(*pinned, column_ids, op.returned_types)) {
         // Cache-or-CPU guards: while this table is MVCC-pinned, a GPU plan
         // either serves exactly from the pinned cache (DELETE keep-masks) or is
         // refused HERE, where the throw still becomes a clean CPU fallback. The
         // disk-native path is MVCC-blind, and the pin's checkpoint suppression
         // makes its snapshot increasingly stale — so scans the pin cannot serve
         // never fall through to it.
-        auto const n_cache = pinned->mvcc->n_cache();
+
         // (a) snapshot-too-old: this transaction opened before the pin, so
         // the cache's base image is from its future.
         auto const start_time =
@@ -697,25 +737,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
             "transaction-local inserts are not served from the cache",
             table.name);
         }
-        // (b') the insert delta does not serve ARRAY columns, so decline
-        // while rows beyond the pinned prefix exist. Rows inserted after
-        // this check are caught by the capture's own ARRAY check.
-        if (static_cast<std::size_t>(storage.GetTotalRows()) > n_cache) {
-          for (auto const& col_idx : column_ids) {
-            if (!col_idx.HasPrimaryIndex() || col_idx.IsRowIdColumn() ||
-                col_idx.IsVirtualColumn() || col_idx.IsEmptyColumn()) {
-              continue;
-            }
-            auto const primary = col_idx.GetPrimaryIndex();
-            if (primary < op.returned_types.size() &&
-                op.returned_types[primary].id() == duckdb::LogicalTypeId::ARRAY) {
-              throw duckdb::NotImplementedException(
-                "duckdb-native scan: table '%s' has rows beyond the pinned prefix and an ARRAY "
-                "projection; the insert delta does not serve ARRAY columns",
-                table.name);
-            }
-          }
-        }
         bool pin_serves = !has_unservable_column;
         if (pin_serves && !column_ids.empty()) {
           pin_serves = !pinned->cache_info.column_projection_for(column_ids).empty();
@@ -736,6 +757,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         // relaxation. The update-chain branch is redundant because UPDATE
         // statements on pinned tables are rejected before execution; direct
         // UPDATE serving remains out of scope here (#1162).
+        auto const n_cache = pinned->mvcc->n_cache();
         std::vector<duckdb::storage_t> projected;
         for (auto const& col_idx : column_ids) {
           if (col_idx.HasPrimaryIndex() && !col_idx.IsRowIdColumn() &&
@@ -1002,12 +1024,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     if (sirius_state) { sirius_state->record_compressed_materialization_scan_sidecar_installed(); }
   }
   node->named_parameters = std::move(op.named_parameters);
-  node->dynamic_filters  = op.dynamic_filters;
-  if (op.dynamic_filters) {
-    node->sirius_dynamic_filters = get_or_create_dynamic_filter_channel(op.dynamic_filters.get());
-    SIRIUS_LOG_INFO("[sirius_plan_get] LogicalGet has dynamic_filters attached (channel key={}).",
-                    static_cast<void const*>(op.dynamic_filters.get()));
-  }
   if (filter) {
     filter->children.push_back(std::move(node));
     return filter;

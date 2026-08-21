@@ -30,12 +30,14 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 | `LOGICAL_DELIM_GET` | `DELIM_SCAN` | `src/planner/sirius_plan_delim_get.cpp` |
 | `LOGICAL_EXPRESSION_GET` | `COLUMN_DATA_SCAN` | `src/planner/sirius_plan_expression_get.cpp` |
 | `LOGICAL_MATERIALIZED_CTE` | `CTE` | `src/planner/sirius_plan_cte.cpp` |
-| `LOGICAL_CTE_REF` | `CTE_SCAN` | `src/planner/sirius_plan_recursive_cte.cpp` |
+| `LOGICAL_CTE_REF` | `CTE_SCAN` | `src/planner/sirius_plan_recursive_cte.cpp` (materialized CTE refs only — recursive CTEs are unsupported) |
 | `LOGICAL_DUMMY_SCAN` | `DUMMY_SCAN` | `src/planner/sirius_plan_dummy_scan.cpp` |
 | `LOGICAL_EMPTY_RESULT` | `EMPTY_RESULT` | `src/planner/sirius_plan_empty_result.cpp` |
 
 **Unsupported operators** (throw `NotImplementedException`, triggering CPU fallback):
 `LOGICAL_WINDOW`, `LOGICAL_UNNEST`, `LOGICAL_SAMPLE`, `LOGICAL_ANY_JOIN`, `LOGICAL_ASOF_JOIN`, `LOGICAL_CROSS_PRODUCT`, `LOGICAL_RECURSIVE_CTE`
+
+**Unsupported expressions** are rejected the same way, during plan construction rather than at execution time. Wherever a plan builder translates a DuckDB expression via `sirius::ast::from_duckdb()`, a `nullptr` result (untranslatable expression) throws `NotImplementedException` so the query falls back to CPU instead of reaching the GPU evaluator with a hole in its expression list. Rejection sites: projections (`sirius_plan_projection.cpp`), filter predicates (`sirius_plan_filter.cpp`), pushed-down scan filters (`sirius_plan_get.cpp`, `src/op/scan/parquet_gpu_ingestible.cpp`, `sirius_physical_table_scan.cpp` — where a *skipped* pushdown translation is distinguished from a *failed* one so a predicate is never silently dropped), and join conditions (`src/expression/join_condition.cpp`). Nested-typed (STRUCT/LIST/MAP) columns are accepted for scan and projection passthrough but rejected as *operands* — in WHERE, GROUP BY, JOIN ON, and sort keys (`sirius_plan_order.cpp`, `sirius_plan_top_n.cpp`) — via `reject_nested_column_operation()` in `sirius_physical_plan_generator.cpp`. Two further non-operator reject conditions: any plan node whose output types contain `SQLNULL` (e.g. an uncast `NULL` in `VALUES`), and any aggregate expression the translator declines (e.g. ORDER BY aggregates lowered to `arg_min_null`/`create_sort_key`) — both throw in `sirius_physical_plan_generator.cpp` / `sirius_plan_aggregate.cpp`. Because rejection is a plan-capability decision, an unsupported expression falls back even when the input is empty.
 
 ### Join Planning
 
@@ -59,6 +61,7 @@ Before either is chosen, `materialize_expression_join_keys()` pushes a projectio
 - **AVG decomposition** — AVG is split into SUM + COUNT_VALID (cuDF doesn't support AVG directly)
 - **COUNT(DISTINCT)** — implemented via `COLLECT_SET` aggregation, then counting unique rows
 - **HUGEINT downcast** — HUGEINT types are downcast to BIGINT (cuDF doesn't support int128)
+- **Unsupported aggregate expressions** — `translate_expressions()` rejects any aggregate expression `from_duckdb` cannot translate (see *Unsupported expressions* above), and `can_use_partitioned_aggregate()` declines on a failed translation
 
 ### Filter Pushdown
 
@@ -79,7 +82,7 @@ Projections are omitted when columns are already in the correct order (passthrou
 
 After the operator tree is built, `create_plan()` runs `fold_adjacent_projections()` over the whole plan as a final pass. Sirius routes every planner-created projection through `push_projection()`, which both elides identity passthrough projections and, when its child is already a projection, composes the two select lists into one. The standalone `fold_adjacent_projections()` post-pass then collapses any remaining `PROJECTION → PROJECTION` stacks anywhere in the tree — including projection pairs that arise from separate plan-builder steps (filter `projection_map` reordering, aggregate child/filter hoisting, table-scan unsupported-filter projections, and the user's `SELECT` list) and projections sitting under other operators such as joins.
 
-Composition substitutes each outer select-list reference (`#i`) with a clone of the inner projection's `select_list[i]`. Folding is refused when either select list has a null slot (an unsupported-expression fallback) or when a non-trivial inner expression would be duplicated across multiple outer reference sites; only immediate parent/child projection pairs are candidates, never folds across non-projection operators. The result is a single GPU expression-evaluation stage where multiple stacked projections would otherwise each run `expression_evaluator` over every batch.
+Composition substitutes each outer select-list reference (`#i`) with a clone of the inner projection's `select_list[i]`. Folding is refused when either select list has a null slot (a defensive backstop — plan construction rejects untranslatable expressions up front, so a null slot should not occur) or when a non-trivial inner expression would be duplicated across multiple outer reference sites; only immediate parent/child projection pairs are candidates, never folds across non-projection operators. The result is a single GPU expression-evaluation stage where multiple stacked projections would otherwise each run `expression_evaluator` over every batch.
 
 ## Part 2: Pipeline Structure
 
@@ -308,7 +311,8 @@ graph LR
 2. **Pipeline 2**: PARTITION. Repository to MERGE_GROUP_BY uses `FULL` barrier (downstream is not CONCAT — `PARTIAL` is only used when PARTITION feeds directly into CONCAT)
 3. **Pipeline 3**: MERGE_GROUP_BY. Downstream pipelines updated to use MERGE_GROUP_BY as source
 
-> With `fuse_merge_pipelines` (default on), Pipeline 3 is usually not a standalone pipeline: MERGE_GROUP_BY folds into the downstream sink's pipeline as an intermediate. See [Merge fusion](#merge-fusion) below.
+> Pipeline 3 is usually not standalone: Sirius automatically folds MERGE_GROUP_BY into the
+> downstream sink's pipeline as an intermediate. See [Merge fusion](#merge-fusion) below.
 
 ### UNGROUPED_AGGREGATE
 
@@ -330,11 +334,12 @@ graph LR
 
 MERGE_TOP_N merges local top-N results.
 
-> With `fuse_merge_pipelines` (default on), Pipeline 2 usually folds MERGE_TOP_N into the downstream sink's pipeline rather than forming its own. See [Merge fusion](#merge-fusion) below.
+> Pipeline 2 usually folds MERGE_TOP_N into the downstream sink's pipeline rather than forming its
+> own. See [Merge fusion](#merge-fusion) below.
 
 ### Merge fusion
 
-By default (`fuse_merge_pipelines = true`) an eligible `MERGE_GROUP_BY` or `MERGE_TOP_N` does **not** open its own terminal pipeline. Instead it joins its downstream sink's pipeline as an intermediate operator, removing one task launch and one repository round-trip (typically `merge → RESULT_COLLECTOR` at the query tail):
+An eligible `MERGE_GROUP_BY` or `MERGE_TOP_N` does **not** open its own terminal pipeline. Instead it joins its downstream sink's pipeline as an intermediate operator, removing one task launch and one repository round-trip (typically `merge → RESULT_COLLECTOR` at the query tail):
 
 ```mermaid
 graph LR

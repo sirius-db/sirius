@@ -50,15 +50,6 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
     SiriusPhysicalOperatorType::NESTED_LOOP_JOIN;
 
  public:
-  sirius_physical_nested_loop_join(
-    duckdb::LogicalOperator& op,
-    duckdb::unique_ptr<sirius_physical_operator> left,
-    duckdb::unique_ptr<sirius_physical_operator> right,
-    duckdb::vector<sirius::join_condition> cond,
-    duckdb::JoinType join_type,
-    std::size_t estimated_cardinality,
-    duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info_p);
-
   sirius_physical_nested_loop_join(duckdb::LogicalOperator& op,
                                    duckdb::unique_ptr<sirius_physical_operator> left,
                                    duckdb::unique_ptr<sirius_physical_operator> right,
@@ -99,8 +90,6 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
   //! Duplicate eliminated types; only used for delim_joins (i.e. correlated subqueries)
   duckdb::vector<sirius::logical_type> delim_types;
 
-  duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> filter_pushdown;
-
  protected:
   // CachingOperator Interface
 
@@ -133,6 +122,11 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
  public:
   static bool is_supported(const duckdb::vector<sirius::join_condition>& conditions,
                            duckdb::JoinType join_type);
+
+  //! Whether `execute` has an arm for @p join_type. DuckDB's PhysicalNestedLoopJoin::IsSupported
+  //! is broader -- RIGHT_SEMI / RIGHT_ANTI / SINGLE pass it -- so the planner screens on this
+  //! too, turning a mid-query throw into a plan-time rejection that falls back to CPU.
+  static bool is_join_type_supported(duckdb::JoinType join_type);
 
  public:
   //! Returns a list of the types of the join conditions

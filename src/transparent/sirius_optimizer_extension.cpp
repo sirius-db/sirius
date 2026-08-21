@@ -16,7 +16,6 @@
 
 #include "transparent/sirius_optimizer_extension.hpp"
 
-#include "planner/duckdb_join_filter_candidate_adapter.hpp"
 #include "sirius_context.hpp"
 
 #include <duckdb/common/enums/optimizer_type.hpp>
@@ -239,9 +238,7 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
 duckdb::unique_ptr<duckdb::LogicalOperator> copy_logical_plan(duckdb::LogicalOperator const& plan,
                                                               duckdb::ClientContext& context)
 {
-  auto copy = plan.Copy(context);
-  planner::duckdb_join_filter_candidate_adapter::preserve_dynamic_filter_metadata(plan, *copy);
-  return copy;
+  return plan.Copy(context);
 }
 
 void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
