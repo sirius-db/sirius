@@ -2638,7 +2638,10 @@ fn materialized_exchange_feeds_aggregate() {
             &[ExchangeInput {
                 node_id: 7,
                 paths: vec!["/tmp/materialized-exchange.parquet".to_string()],
-                names: vec!["id".to_string(), "name".to_string()],
+                // Deliberately unlike the descriptor's own names: the sender's names are what
+                // must reach `base_schema`, and matching names cannot tell the override from no
+                // override at all.
+                names: vec!["sender_id".to_string(), "sender_name".to_string()],
             }],
         )
         .unwrap();
@@ -2657,7 +2660,22 @@ fn materialized_exchange_feeds_aggregate() {
         panic!("expected local_files exchange input");
     };
     assert_eq!(files.items.len(), 1);
-    assert_eq!(read.base_schema.as_ref().unwrap().names, vec!["id", "name"]);
+    let base_schema = read.base_schema.as_ref().unwrap();
+    assert_eq!(base_schema.names, vec!["sender_id", "sender_name"]);
+    // The names come from the sender; the types still come from the descriptor.
+    let kinds: Vec<_> = base_schema
+        .r#struct
+        .as_ref()
+        .unwrap()
+        .types
+        .iter()
+        .map(|ty| match ty.kind.as_ref().expect("column type") {
+            substrait::proto::r#type::Kind::I64(_) => "i64",
+            substrait::proto::r#type::Kind::Varchar(_) => "varchar",
+            other => panic!("unexpected exchange column type {other:?}"),
+        })
+        .collect();
+    assert_eq!(kinds, vec!["i64", "varchar"]);
 }
 
 /// Returns every extension function name declared by the plan.
