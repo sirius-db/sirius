@@ -3739,3 +3739,152 @@ fn bare_cross_join_translates_to_constant_key_join() {
         .collect();
     assert_eq!(operands, vec![2, 4]);
 }
+
+/// Builds an EXCHANGE_NODE with id 7 over `input_row_tuples`, optionally merging or offset.
+fn exchange_node_with(
+    input_row_tuples: Vec<i32>,
+    sort_info: Option<TSortInfo>,
+    offset: Option<i64>,
+) -> TPlanNode {
+    let mut exchange = base_plan_node(7, TPlanNodeType::EXCHANGE_NODE, 0, vec![0]);
+    exchange.exchange_node = Some(TExchangeNode::new(
+        input_row_tuples,
+        sort_info,
+        offset,
+        Some(TPartitionType::UNPARTITIONED),
+        Some(true),
+        None,
+    ));
+    exchange
+}
+
+/// Translates a lone exchange node with the given materialized inputs.
+fn translate_exchange_only(
+    exchange: TPlanNode,
+    inputs: &[ExchangeInput],
+) -> Result<substrait::proto::Plan, TranslateError> {
+    PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(
+            &params(Some(TPlan::new(vec![exchange])), Some(agg_desc()), None),
+            inputs,
+        )
+        .map(|translated| translated.plan)
+}
+
+/// The materialized input for node 7 covering `agg_desc`'s tuple 0.
+fn exchange_input_for_node_7() -> ExchangeInput {
+    ExchangeInput {
+        node_id: 7,
+        paths: vec!["/tmp/materialized-exchange.parquet".to_string()],
+        names: vec!["sender_id".to_string(), "sender_name".to_string()],
+    }
+}
+
+/// A merging exchange carries the cross-fragment ORDER BY. Reading its inputs as plain files
+/// discards that order, so the query would return unordered rows with no error.
+#[test]
+fn merging_exchange_is_rejected() {
+    let sort_info = TSortInfo::new(
+        vec![slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))],
+        vec![true],
+        vec![false],
+        None,
+    );
+    let err = translate_exchange_only(
+        exchange_node_with(vec![0], Some(sort_info), None),
+        &[exchange_input_for_node_7()],
+    )
+    .unwrap_err();
+    let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
+        panic!("expected an unsupported plan node, got {err:?}");
+    };
+    assert_eq!(
+        reason,
+        "merging exchanges are not supported by sequential execution"
+    );
+}
+
+/// Without `input_row_tuples` there is no row layout to bind the materialized files against.
+#[test]
+fn exchange_without_input_row_tuples_is_rejected() {
+    let err = translate_exchange_only(
+        exchange_node_with(Vec::new(), None, None),
+        &[exchange_input_for_node_7()],
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            TranslateError::MissingField {
+                context: "TExchangeNode",
+                field: "input_row_tuples"
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+/// An exchange whose sender produced no file cannot be read as one. Accepting it would emit a
+/// `local_files` read over an empty list, which binds to nothing.
+#[test]
+fn exchange_with_no_materialized_files_is_rejected() {
+    let err = translate_exchange_only(
+        exchange_node_with(vec![0], None, None),
+        &[ExchangeInput {
+            node_id: 7,
+            paths: Vec::new(),
+            names: vec!["sender_id".to_string(), "sender_name".to_string()],
+        }],
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, TranslateError::MalformedPlan { .. }),
+        "{err:?}"
+    );
+}
+
+/// The sender's name list must have one entry per column of the declared row layout; a mismatch
+/// would otherwise bind columns positionally under the wrong names.
+#[test]
+fn exchange_names_must_match_the_row_layout_arity() {
+    let err = translate_exchange_only(
+        exchange_node_with(vec![0], None, None),
+        &[ExchangeInput {
+            node_id: 7,
+            paths: vec!["/tmp/materialized-exchange.parquet".to_string()],
+            names: vec!["only_one".to_string()],
+        }],
+    )
+    .unwrap_err();
+    assert!(matches!(err, TranslateError::Descriptor(_)), "{err:?}");
+}
+
+/// An exchange node carries its own skip offset, not just a sort. It must reach the fetch with an
+/// explicit unlimited count, or the consumer decodes the unset count as `LIMIT 0`.
+#[test]
+#[allow(deprecated)]
+fn exchange_offset_becomes_a_fetch() {
+    let plan = translate_exchange_only(
+        exchange_node_with(vec![0], None, Some(5)),
+        &[exchange_input_for_node_7()],
+    )
+    .unwrap();
+    let rel::RelType::Fetch(fetch) = root(&plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected the exchange offset to become a fetch");
+    };
+    assert_eq!(
+        fetch.count_mode,
+        Some(substrait::proto::fetch_rel::CountMode::Count(-1))
+    );
+    assert_eq!(
+        fetch.offset_mode,
+        Some(substrait::proto::fetch_rel::OffsetMode::Offset(5))
+    );
+}
