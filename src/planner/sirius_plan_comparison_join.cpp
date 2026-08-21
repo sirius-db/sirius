@@ -407,6 +407,28 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     reject_nested_column_operation(*condition.right, "a join condition");
   }
 
+  // A MARK join mixing null-safe (IS NOT DISTINCT FROM) and plain keys has no correct GPU
+  // encoding (see mark_join_mixes_null_safe_keys in sirius_physical_hash_join.cpp), and the NLJ
+  // is no escape hatch: its MARK arm models the mixture but evaluates each (left batch x right
+  // batch) pair independently, so a left side spread over several right batches emits one partial
+  // mark per pair. Reject here so both routes are closed and DuckDB's CPU mark join answers.
+  if (op.join_type == duckdb::JoinType::MARK) {
+    bool has_null_safe = false;
+    bool all_null_safe = !op.conditions.empty();
+    for (auto const& condition : op.conditions) {
+      if (condition.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+        has_null_safe = true;
+      } else {
+        all_null_safe = false;
+      }
+    }
+    if (has_null_safe && !all_null_safe) {
+      throw duckdb::NotImplementedException(
+        "MARK join mixing a null-safe (IS NOT DISTINCT FROM) key with a plain key not supported "
+        "in GPU");
+    }
+  }
+
   std::size_t lhs_cardinality = op.children[0]->EstimateCardinality(context);
   std::size_t rhs_cardinality = op.children[1]->EstimateCardinality(context);
 
@@ -462,8 +484,15 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
 
   // Check DuckDB's NLJ IsSupported here because it needs the raw `op.conditions`; wrapping the
   // conditions below drains them.
-  const bool nlj_is_supported =
+  const bool nlj_conditions_supported =
     duckdb::PhysicalNestedLoopJoin::IsSupported(op.conditions, op.join_type);
+  // DuckDB's check accepts join types the Sirius NLJ execute switch has no arm for
+  // (RIGHT_SEMI / RIGHT_ANTI / SINGLE), which would throw mid-query instead of falling back.
+  // The hash join screens the same way via are_conditions_supported, so SINGLE -- which no GPU
+  // join implements -- is rejected on both routes.
+  const bool nlj_join_type_supported =
+    sirius::op::sirius_physical_nested_loop_join::is_join_type_supported(op.join_type);
+  const bool nlj_is_supported = nlj_conditions_supported && nlj_join_type_supported;
 
   // Wrap once — subsequent checks and ctors consume from the wrapped vector.
   duckdb::vector<sirius::join_condition> conditions =
@@ -764,6 +793,13 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                                                                       op.left_projection_map,
                                                                       op.right_projection_map);
     return join;
+  }
+
+  // Neither GPU join implements this join type, so say so plainly: the generic "blockwise nested
+  // loop" message below would misattribute the rejection to the conditions.
+  if (!nlj_join_type_supported) {
+    throw duckdb::NotImplementedException("Join type " + duckdb::JoinTypeToString(op.join_type) +
+                                          " not supported in GPU");
   }
 
   throw duckdb::NotImplementedException("Blockwise nested loop join not supported in GPU");
