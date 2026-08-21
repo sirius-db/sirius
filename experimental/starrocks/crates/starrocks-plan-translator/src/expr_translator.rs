@@ -354,6 +354,13 @@ fn translate_arithmetic(
         }
     };
     expect_child_count(node, &children, 2)?;
+    // Decimal arithmetic is evaluated in FP64: the Sirius GPU expression path cannot consume
+    // decimal arithmetic, and refusing it instead -- which is what this replaced -- rejects every
+    // TPC-H revenue query. The result is approximate and is NOT cast back: a project's output slot
+    // may be declared DECIMAL while the expression yields FP64, and nothing downstream can detect
+    // that, because a Substrait `ProjectRel` carries no per-column output type. Sums of money
+    // columns therefore differ from StarRocks in the last few digits (~1e-14 relative) and render
+    // as a double. A decimal-native GPU path is the real fix.
     let decimal = is_decimal(&node.type_)?;
     let children = if decimal {
         children
