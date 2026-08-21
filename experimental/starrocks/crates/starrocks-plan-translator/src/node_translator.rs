@@ -1,19 +1,22 @@
 use starrocks_thrift::exprs::TExpr;
-use starrocks_thrift::plan_nodes::{TPlan, TPlanNode, TPlanNodeType};
+use starrocks_thrift::plan_nodes::{TPlan, TPlanNode, TPlanNodeType, TSortInfo};
 use substrait::proto::read_rel::local_files::FileOrFiles;
 use substrait::proto::read_rel::local_files::file_or_files::{
     FileFormat, ParquetReadOptions, PathType,
 };
 use substrait::proto::read_rel::{LocalFiles, NamedTable, ReadType};
 use substrait::proto::{
-    Expression, FilterRel, ProjectRel, ReadRel, Rel, RelCommon, rel, rel_common,
+    AggregateFunction, AggregateRel, Expression, FetchRel, FilterRel, ProjectRel, ReadRel, Rel,
+    RelCommon, SortField, SortRel, aggregate_rel, fetch_rel, function_argument, rel, rel_common,
+    sort_field,
 };
 
 use crate::descriptor_table::DescriptorTable;
 use crate::error::{Result, TranslateError};
 use crate::expr_translator::{self, ExprContext, TranslateExpr};
 use crate::scan_paths::ScanFilePaths;
-use crate::{ExtensionRegistry, URN_BOOLEAN};
+use crate::type_mapper;
+use crate::{ExtensionRegistry, URN_AGGREGATE, URN_ARITHMETIC, URN_BOOLEAN};
 
 /// Partially translated relation plus the StarRocks row layout it emits.
 pub(crate) struct TranslatedRel {
@@ -142,16 +145,59 @@ fn translate_plan_node(
     children: Vec<TranslatedRel>,
     ctx: &mut PlanContext<'_>,
 ) -> Result<TranslatedRel> {
-    match node.node_type {
+    let translated = match node.node_type {
         TPlanNodeType::FILE_SCAN_NODE => translate_file_scan(node, children, ctx),
         TPlanNodeType::HDFS_SCAN_NODE => translate_hdfs_scan(node, children, ctx),
         TPlanNodeType::SELECT_NODE => translate_select(node, children, ctx),
         TPlanNodeType::PROJECT_NODE => translate_project(node, children, ctx),
+        TPlanNodeType::AGGREGATION_NODE => translate_aggregation(node, children, ctx),
+        TPlanNodeType::SORT_NODE => translate_sort(node, children, ctx),
         _ => Err(TranslateError::UnsupportedPlanNode {
             node_id: node.node_id,
             node_type: node.node_type,
             reason: "plan node is outside the v1 StarRocks slice",
         }),
+    }?;
+    Ok(apply_fetch(translated, node))
+}
+
+/// Wraps a relation in a Substrait fetch when the StarRocks node carries a limit or offset.
+///
+/// `TPlanNode::limit` applies to any node type; a skip offset only appears on sort and exchange
+/// payloads.
+// The deprecated plain offset/count oneof variants share wire tags with their expression
+// counterparts and are the fields DuckDB's Substrait consumer reads.
+#[allow(deprecated)]
+fn apply_fetch(input: TranslatedRel, node: &TPlanNode) -> TranslatedRel {
+    let offset = node
+        .sort_node
+        .as_ref()
+        .and_then(|sort| sort.offset)
+        .unwrap_or(0);
+    if node.limit < 0 && offset == 0 {
+        return input;
+    }
+    let TranslatedRel {
+        rel,
+        row_tuples,
+        output_width,
+    } = input;
+    // For an offset-only fetch, emit an explicit unlimited count: the consumer reads the plain
+    // count field without checking the oneof, and an unset count would decode as `LIMIT 0`.
+    let count = if node.limit >= 0 { node.limit } else { -1 };
+    let count_mode = Some(fetch_rel::CountMode::Count(count));
+    let offset_mode = (offset != 0).then_some(fetch_rel::OffsetMode::Offset(offset));
+    TranslatedRel {
+        rel: Rel {
+            rel_type: Some(rel::RelType::Fetch(Box::new(FetchRel {
+                input: Some(Box::new(rel)),
+                offset_mode,
+                count_mode,
+                ..Default::default()
+            }))),
+        },
+        row_tuples,
+        output_width,
     }
 }
 
@@ -250,6 +296,325 @@ pub(crate) fn translate_plan(
 ) -> Result<TranslatedRel> {
     let mut ctx = PlanContext::new(desc, scan_paths, registry);
     plan.translate(&mut ctx)
+}
+
+/// Translates a one-phase `AGGREGATION_NODE` into a Substrait aggregate relation.
+///
+/// Only finalized single-phase aggregation is supported (run StarRocks with
+/// `new_planner_agg_stage = 1`); merge/update phases would require modeling partial aggregate
+/// states. The output row layout is the aggregation output tuple, whose materialized slots are
+/// the grouping keys followed by the aggregate results (StarRocks allocates them in that order).
+fn translate_aggregation(
+    node: &TPlanNode,
+    children: Vec<TranslatedRel>,
+    ctx: &mut PlanContext<'_>,
+) -> Result<TranslatedRel> {
+    expect_children(node, &children, 1)?;
+    let child = children.into_iter().next().unwrap();
+    let agg = node.agg_node.as_ref().ok_or(TranslateError::MissingField {
+        context: "AGGREGATION_NODE",
+        field: "agg_node",
+    })?;
+    if !agg.need_finalize || agg.intermediate_tuple_id != agg.output_tuple_id {
+        return Err(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "only finalized one-phase aggregation is supported (new_planner_agg_stage=1)",
+        });
+    }
+    let output_tuple = agg.output_tuple_id;
+
+    let grouping_exprs = agg.grouping_exprs.as_deref().unwrap_or_default();
+    let mut grouping_expressions = Vec::with_capacity(grouping_exprs.len());
+    for expr in grouping_exprs {
+        let mut expr_ctx = ctx.expr_context(&child.row_tuples);
+        grouping_expressions.push(expr.translate(&mut expr_ctx)?);
+    }
+
+    // Aggregate output types come from the output tuple's slots, which carry the grouping keys
+    // first and then one slot per aggregate function.
+    let output_slots = ctx.desc.materialized_slot_ids(output_tuple)?;
+    let output_width = output_slots.len();
+    if output_width != grouping_expressions.len() + agg.aggregate_functions.len() {
+        return Err(TranslateError::descriptor(format!(
+            "AGGREGATION_NODE {} output tuple {} has {} slots for {} keys + {} aggregates",
+            node.node_id,
+            output_tuple,
+            output_width,
+            grouping_expressions.len(),
+            agg.aggregate_functions.len()
+        )));
+    }
+
+    // A count check alone cannot see a permuted output tuple, so also require each grouping
+    // key's type to match the slot it is paired with. Compare only the type kind: the slot's
+    // nullability and decimal width are allowed to differ from the key expression's.
+    for (index, (expr, slot_id)) in grouping_exprs.iter().zip(&output_slots).enumerate() {
+        let Some(key_type) = expr
+            .nodes
+            .first()
+            .map(|node| type_mapper::map_type_desc(&node.type_, true))
+            .transpose()?
+        else {
+            continue;
+        };
+        let slot = ctx.desc.slot(output_tuple, *slot_id)?;
+        let Some(slot_type) = slot.substrait_type.as_ref() else {
+            continue;
+        };
+        let kind_of = |ty: &substrait::proto::Type| ty.kind.as_ref().map(std::mem::discriminant);
+        if kind_of(&key_type) != kind_of(slot_type) {
+            return Err(TranslateError::descriptor(format!(
+                "AGGREGATION_NODE {} output tuple {} slot {} does not match grouping key {}",
+                node.node_id, output_tuple, slot_id, index
+            )));
+        }
+    }
+
+    let mut measures = Vec::with_capacity(agg.aggregate_functions.len());
+    for (expr, slot_id) in agg
+        .aggregate_functions
+        .iter()
+        .zip(&output_slots[grouping_expressions.len()..])
+    {
+        let mut expr_ctx = ctx.expr_context(&child.row_tuples);
+        let call = expr_translator::aggregate_call(expr, &mut expr_ctx)?;
+        // The GPU ungrouped-aggregate operator rejects every distinct aggregate, so a
+        // grouping-free DISTINCT measure would translate fine and then fail at execution.
+        if call.distinct && grouping_expressions.is_empty() {
+            return Err(TranslateError::UnsupportedPlanNode {
+                node_id: node.node_id,
+                node_type: node.node_type,
+                reason: "distinct aggregates without grouping keys are not supported",
+            });
+        }
+        let output_type = ctx
+            .desc
+            .slot(output_tuple, *slot_id)?
+            .substrait_type
+            .clone()
+            .ok_or(TranslateError::MissingField {
+                context: "aggregate output slot",
+                field: "slotType",
+            })?;
+        // `count` lives in the generic aggregate extension; sum/avg/min/max are declared by
+        // the arithmetic extension.
+        let urn = if call.name == "count" {
+            URN_AGGREGATE
+        } else {
+            URN_ARITHMETIC
+        };
+        let anchor = ctx.registry.register_function(urn, &call.name);
+        measures.push(aggregate_rel::Measure {
+            measure: Some(AggregateFunction {
+                function_reference: anchor,
+                arguments: call
+                    .arguments
+                    .into_iter()
+                    .map(|expr| substrait::proto::FunctionArgument {
+                        arg_type: Some(function_argument::ArgType::Value(expr)),
+                    })
+                    .collect(),
+                output_type: Some(output_type),
+                invocation: if call.distinct {
+                    substrait::proto::aggregate_function::AggregationInvocation::Distinct as i32
+                } else {
+                    substrait::proto::aggregate_function::AggregationInvocation::All as i32
+                },
+                ..Default::default()
+            }),
+            filter: None,
+        });
+    }
+
+    let groupings = if grouping_expressions.is_empty() {
+        Vec::new()
+    } else {
+        #[allow(deprecated)]
+        let grouping = aggregate_rel::Grouping {
+            grouping_expressions: Vec::new(),
+            expression_references: (0..grouping_expressions.len() as u32).collect(),
+        };
+        vec![grouping]
+    };
+
+    let aggregated = TranslatedRel {
+        rel: Rel {
+            rel_type: Some(rel::RelType::Aggregate(Box::new(AggregateRel {
+                input: Some(Box::new(child.rel)),
+                groupings,
+                measures,
+                grouping_expressions,
+                ..Default::default()
+            }))),
+        },
+        row_tuples: vec![output_tuple],
+        output_width,
+    };
+    // Node conjuncts evaluate over the aggregation output (HAVING predicates).
+    apply_conjuncts(aggregated, node, ctx)
+}
+
+/// Translates a `SORT_NODE` into a Substrait sort (plus the fetch added by `apply_fetch` for
+/// top-N limits).
+///
+/// StarRocks sorts materialize a dedicated sort tuple first (`sort_tuple_slot_exprs`, one
+/// expression per materialized slot); the ordering expressions then reference that tuple.
+fn translate_sort(
+    node: &TPlanNode,
+    children: Vec<TranslatedRel>,
+    ctx: &mut PlanContext<'_>,
+) -> Result<TranslatedRel> {
+    expect_children(node, &children, 1)?;
+    let child = children.into_iter().next().unwrap();
+    let sort = node
+        .sort_node
+        .as_ref()
+        .ok_or(TranslateError::MissingField {
+            context: "SORT_NODE",
+            field: "sort_node",
+        })?;
+    let sort_tuple = node
+        .row_tuples
+        .first()
+        .copied()
+        .ok_or(TranslateError::MissingField {
+            context: "SORT_NODE",
+            field: "row_tuples",
+        })?;
+    // StarRocks' sorter applies the limit internally and never evaluates predicates -- its
+    // backend asserts as much (`be/src/exec/topn_node.cpp`: `DCHECK_EQ(_conjuncts.size(), 0)
+    // << "TopNNode should never have predicates to evaluate."`), because the FE puts the
+    // predicate in a SELECT_NODE above instead. There is therefore no reference semantics for
+    // where a sort's own conjuncts sit relative to its limit; translating them either way
+    // invents an answer, so refuse the shape.
+    if has_conjuncts(node) {
+        return Err(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "SORT_NODE with conjuncts is not supported",
+        });
+    }
+    // A second row tuple means the sorter carries a payload the sort tuple does not describe.
+    // Only the first is translated, so the rest would be dropped from the output row.
+    if node.row_tuples.len() > 1 {
+        return Err(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "SORT_NODE with more than one row tuple is not supported",
+        });
+    }
+    // StarRocks can fold a partial aggregation into the sorter. Substrait's sort has nowhere to
+    // put it, so translating the node as a plain sort would return unaggregated rows.
+    if sort
+        .pre_agg_exprs
+        .as_ref()
+        .is_some_and(|exprs| !exprs.is_empty())
+        || sort
+            .pre_agg_output_slot_id
+            .as_ref()
+            .is_some_and(|slots| !slots.is_empty())
+    {
+        return Err(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "SORT_NODE with a pre-aggregation payload is not supported",
+        });
+    }
+    // Partitioned top-N (per-partition limits) and rank-based top-N have no Substrait
+    // representation here; a global sort would silently return the wrong row set.
+    if sort
+        .partition_exprs
+        .as_ref()
+        .is_some_and(|exprs| !exprs.is_empty())
+        || sort
+            .topn_type
+            .is_some_and(|topn| topn != starrocks_thrift::plan_nodes::TTopNType::ROW_NUMBER)
+    {
+        return Err(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "partitioned or rank-based top-N sorts are not supported",
+        });
+    }
+
+    // The resolved materialization expressions live in `TSortInfo`; the node-level field is a
+    // deprecated duplicate some senders omit.
+    let sort_tuple_slot_exprs = sort
+        .sort_info
+        .sort_tuple_slot_exprs
+        .as_ref()
+        .or(sort.sort_tuple_slot_exprs.as_ref());
+    let input = if let Some(slot_exprs) = sort_tuple_slot_exprs.filter(|exprs| !exprs.is_empty()) {
+        let expected = ctx.desc.materialized_slot_ids(sort_tuple)?.len();
+        if slot_exprs.len() != expected {
+            return Err(TranslateError::descriptor(format!(
+                "SORT_NODE {} materializes {} exprs for sort tuple {} with {} slots",
+                node.node_id,
+                slot_exprs.len(),
+                sort_tuple,
+                expected
+            )));
+        }
+        let mut expressions = Vec::with_capacity(slot_exprs.len());
+        for expr in slot_exprs {
+            let mut expr_ctx = ctx.expr_context(&child.row_tuples);
+            expressions.push(expr.translate(&mut expr_ctx)?);
+        }
+        project_rel(child, expressions, vec![sort_tuple])
+    } else {
+        child
+    };
+
+    let sorts = sort_fields(&sort.sort_info, &input, ctx)?;
+    let row_tuples = input.row_tuples.clone();
+    let output_width = input.output_width;
+    let sorted = TranslatedRel {
+        rel: Rel {
+            rel_type: Some(rel::RelType::Sort(Box::new(SortRel {
+                input: Some(Box::new(input.rel)),
+                sorts,
+                ..Default::default()
+            }))),
+        },
+        row_tuples,
+        output_width,
+    };
+    apply_conjuncts(sorted, node, ctx)
+}
+
+/// Builds Substrait sort fields from a StarRocks sort-info payload against `input`'s row layout.
+fn sort_fields(
+    sort_info: &TSortInfo,
+    input: &TranslatedRel,
+    ctx: &mut PlanContext<'_>,
+) -> Result<Vec<SortField>> {
+    let ordering = &sort_info.ordering_exprs;
+    if sort_info.is_asc_order.len() != ordering.len()
+        || sort_info.nulls_first.len() != ordering.len()
+    {
+        return Err(TranslateError::malformed(
+            "sort info direction lists do not match ordering expressions",
+        ));
+    }
+    ordering
+        .iter()
+        .zip(sort_info.is_asc_order.iter().zip(&sort_info.nulls_first))
+        .map(|(expr, (asc, nulls_first))| {
+            let mut expr_ctx = ctx.expr_context(&input.row_tuples);
+            let expr = expr.translate(&mut expr_ctx)?;
+            let direction = match (asc, nulls_first) {
+                (true, true) => sort_field::SortDirection::AscNullsFirst,
+                (true, false) => sort_field::SortDirection::AscNullsLast,
+                (false, true) => sort_field::SortDirection::DescNullsFirst,
+                (false, false) => sort_field::SortDirection::DescNullsLast,
+            };
+            Ok(SortField {
+                expr: Some(expr),
+                sort_kind: Some(sort_field::SortKind::Direction(direction as i32)),
+            })
+        })
+        .collect()
 }
 
 /// Builds a Substrait read for a StarRocks scan tuple.
