@@ -18,12 +18,15 @@
 
 #include "io/prefetch_census.hpp"
 #include "io/sirius_datasource.hpp"
+#include "log/logging.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "planner/query_index.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <format>
+#include <string>
 #include <utility>
 
 namespace sirius::scan_manager {
@@ -115,10 +118,37 @@ void readahead_scan_manager::stop() noexcept
     if (!_worker.joinable()) { return; }
     _stop_source.request_stop();
   }
+  // One line per query, on the way down: the manager is per-query, so this is
+  // the last moment its counters describe a whole query and nothing else.
+  SIRIUS_LOG_INFO("[readahead] {}", summary());
   // condition_variable_any's stop-aware wait already wakes on the request; this
   // also covers a worker parked between the predicate check and the wait.
   _cv.notify_all();
   _worker.join();
+}
+
+std::string readahead_scan_manager::summary() const
+{
+  auto const prefetched = _counters.prefetched.load(std::memory_order_relaxed);
+  auto const waited     = _counters.wait_for_prefetch.load(std::memory_order_relaxed);
+  auto const skipped    = _counters.skipped.load(std::memory_order_relaxed);
+  auto const mem        = _counters.skipped_memory_pressure.load(std::memory_order_relaxed);
+  auto const behind     = _counters.skipped_fell_behind.load(std::memory_order_relaxed);
+  // Whatever the two named reasons do not account for: scans with no
+  // prefetching cache, plus the cache's own gates (already loading, cancelled).
+  // Attempts that were neither a win nor a miss: nothing to issue, because the
+  // split had no ranges or the scan has no prefetching cache to issue into.
+  auto const other = skipped - std::min(skipped, mem + behind);
+
+  return std::format(
+    "prefetched={} wait_for_prefetch={} "
+    "skipped={}[memory_pressure={} fell_behind={} other={}]",
+    prefetched,
+    waited,
+    skipped,
+    mem,
+    behind,
+    other);
 }
 
 bool readahead_scan_manager::is_running() const noexcept
@@ -534,25 +564,86 @@ void readahead_scan_manager::issue_prefetches(std::vector<pending_prefetch> batc
         io::prefetch_census::instance().prefetch_declined_with_work.fetch_add(
           out.declined, std::memory_order_relaxed);
       }
-      self->on_prefetch_complete(op_id, key);
+      // Accounting happens in here, not out here: the verdict depends on what
+      // the consumer is doing right now, which is state behind the manager's
+      // lock.
+      self->on_prefetch_complete(op_id, key, out.declined_memory_pressure > 0, out.issued > 0);
     });
   }
 }
 
+prefetch_outcome_kind readahead_scan_manager::classify_prefetch(
+  bool allocation_failed, bool split_alive, bool issued_io, io::cache::scan_stage stage) noexcept
+{
+  // A hard failure outranks anything the consumer was doing: with no buffers
+  // there was never an attempt to be early or late for.
+  if (allocation_failed) { return prefetch_outcome_kind::skipped_memory_pressure; }
+  // The split is gone, so whatever it was going to be read for already happened
+  // or never will.
+  if (!split_alive) { return prefetch_outcome_kind::skipped_fell_behind; }
+  if (!issued_io) {
+    // Nothing went out. If the consumer has moved on regardless, that is still
+    // the readahead running behind it; otherwise there was simply nothing here.
+    return stage >= io::cache::scan_stage::preparing ? prefetch_outcome_kind::skipped_fell_behind
+                                                     : prefetch_outcome_kind::nothing_to_issue;
+  }
+  // IO landed. `reading` is carved out of "preparing or higher" because it is
+  // the more specific case: the consumer is on this split right now and is
+  // waiting on the very prefetch that just settled.
+  if (stage == io::cache::scan_stage::reading) { return prefetch_outcome_kind::wait_for_prefetch; }
+  if (stage >= io::cache::scan_stage::preparing) {
+    return prefetch_outcome_kind::skipped_fell_behind;
+  }
+  return prefetch_outcome_kind::prefetched;
+}
+
 void readahead_scan_manager::on_prefetch_complete(std::size_t operator_id,
-                                                  const op::scan::scan_info* task)
+                                                  const op::scan::scan_info* task,
+                                                  bool allocation_failed,
+                                                  bool issued_io)
 {
   {
     std::lock_guard lock{_mutex};
     auto op_it = _by_operator.find(operator_id);
-    if (op_it == _by_operator.end()) { return; }
+    // No entry left to judge against: the operator or the split has been retired
+    // out from under this completion, which is the readahead being behind.
+    if (op_it == _by_operator.end()) {
+      record_prefetch_outcome(prefetch_outcome_kind::skipped_fell_behind);
+      return;
+    }
     auto it = op_it->second.index.find(task);
-    if (it == op_it->second.index.end()) { return; }
-    op_it->second.tasks[it->second].prefetch_done = true;
+    if (it == op_it->second.index.end()) {
+      record_prefetch_outcome(prefetch_outcome_kind::skipped_fell_behind);
+      return;
+    }
+    auto& entry         = op_it->second.tasks[it->second];
+    entry.prefetch_done = true;
+    record_prefetch_outcome(
+      classify_prefetch(allocation_failed, !entry.task.expired(), issued_io, entry.stage));
     note_active_locked();
     _wake = true;
   }
   _cv.notify_one();
+}
+
+void readahead_scan_manager::record_prefetch_outcome(prefetch_outcome_kind kind) noexcept
+{
+  switch (kind) {
+    case prefetch_outcome_kind::prefetched:
+      _counters.prefetched.fetch_add(1, std::memory_order_relaxed);
+      return;
+    case prefetch_outcome_kind::wait_for_prefetch:
+      _counters.wait_for_prefetch.fetch_add(1, std::memory_order_relaxed);
+      return;
+    case prefetch_outcome_kind::skipped_memory_pressure:
+      _counters.skipped_memory_pressure.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case prefetch_outcome_kind::skipped_fell_behind:
+      _counters.skipped_fell_behind.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case prefetch_outcome_kind::nothing_to_issue: break;
+  }
+  _counters.skipped.fetch_add(1, std::memory_order_relaxed);
 }
 
 void readahead_scan_manager::worker_loop(const std::stop_token& st)

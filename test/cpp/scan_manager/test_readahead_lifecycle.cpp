@@ -178,6 +178,98 @@ constexpr std::size_t OP = 1;
 
 }  // namespace
 
+TEST_CASE("a prefetch is judged by what the consumer was doing when it settled",
+          "[scan_manager][readahead][counters]")
+{
+  using kind          = sirius::scan_manager::prefetch_outcome_kind;
+  auto const classify = &readahead_scan_manager::classify_prefetch;
+
+  SECTION("allocation failure outranks everything")
+  {
+    // Even with a live split and an untouched consumer, no buffers means there
+    // was never an attempt to be early or late for.
+    CHECK(classify(/*allocation_failed=*/true,
+                   /*split_alive=*/true,
+                   /*issued_io=*/false,
+                   scan_stage::none) == kind::skipped_memory_pressure);
+    CHECK(classify(true, true, true, scan_stage::reading) == kind::skipped_memory_pressure);
+  }
+
+  SECTION("an expired split is the readahead running behind")
+  {
+    CHECK(classify(false, /*split_alive=*/false, true, scan_stage::none) ==
+          kind::skipped_fell_behind);
+  }
+
+  SECTION("IO that landed before the consumer arrived is the win")
+  {
+    for (auto stage : {scan_stage::none, scan_stage::initialized, scan_stage::queued}) {
+      CHECK(classify(false, true, /*issued_io=*/true, stage) == kind::prefetched);
+    }
+  }
+
+  SECTION("reading is carved out of preparing-or-higher")
+  {
+    // The two rules overlap here and the more specific one wins: the prefetch
+    // did land, the consumer is simply already on this split waiting for it.
+    CHECK(classify(false, true, true, scan_stage::reading) == kind::wait_for_prefetch);
+    CHECK(classify(false, true, true, scan_stage::preparing) == kind::skipped_fell_behind);
+    CHECK(classify(false, true, true, scan_stage::disposed) == kind::skipped_fell_behind);
+  }
+
+  SECTION("nothing issued is a miss only if the consumer moved on")
+  {
+    CHECK(classify(false, true, /*issued_io=*/false, scan_stage::queued) == kind::nothing_to_issue);
+    CHECK(classify(false, true, false, scan_stage::preparing) == kind::skipped_fell_behind);
+    CHECK(classify(false, true, false, scan_stage::reading) == kind::skipped_fell_behind);
+  }
+}
+
+TEST_CASE("a fresh manager reports an all-zero readahead summary",
+          "[scan_manager][readahead][counters]")
+{
+  readahead_scan_manager m;
+  auto const& c = m.counters();
+
+  CHECK(c.prefetched.load() == 0);
+  CHECK(c.wait_for_prefetch.load() == 0);
+  CHECK(c.skipped.load() == 0);
+  CHECK(c.skipped_memory_pressure.load() == 0);
+  CHECK(c.skipped_fell_behind.load() == 0);
+
+  auto const line = m.summary();
+  INFO(line);
+  CHECK(line.find("prefetched=0") != std::string::npos);
+  CHECK(line.find("wait_for_prefetch=0") != std::string::npos);
+  CHECK(line.find("skipped=0[memory_pressure=0 fell_behind=0 other=0]") != std::string::npos);
+}
+
+TEST_CASE("a split with nothing to prefetch is neither prefetched nor skipped",
+          "[scan_manager][readahead][counters]")
+{
+  // No datasources at all: scan_info::prefetch reports an empty outcome, which
+  // is an attempt that could never have issued rather than a refusal. Counting
+  // it as either would make both numbers lie.
+  readahead_scan_manager m;
+  auto split = std::make_shared<test_split>();
+  m.register_scan_task(split, OP);
+  m.mark_operator_closed(OP);
+  m.start(4);
+
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+  while (m.has_unprefetched_work() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  m.stop();
+
+  auto const& c = m.counters();
+  INFO(m.summary());
+  CHECK(c.prefetched.load() == 0);
+  CHECK(c.skipped.load() == 0);
+  CHECK(c.skipped_memory_pressure.load() == 0);
+  CHECK(c.skipped_fell_behind.load() == 0);
+}
+
 TEST_CASE("an unprefetched split counts as ongoing only once it is reading",
           "[scan_manager][readahead]")
 {

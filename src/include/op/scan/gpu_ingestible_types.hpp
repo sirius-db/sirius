@@ -126,7 +126,12 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
   struct prefetch_outcome {
     std::size_t issued{0};    ///< datasources that started IO
     std::size_t declined{0};  ///< datasources that refused the request
-    bool ok{true};            ///< every datasource that started IO completed it
+    /// Refused because the cache pool could not attach staging buffers.  The
+    /// only refusal reason that has to travel: every other one is a statement
+    /// about the consumer, which the readahead manager can read off its own
+    /// per-split state at the moment the attempt completes.
+    std::size_t declined_memory_pressure{0};
+    bool ok{true};  ///< every datasource that started IO completed it
   };
 
   /// Issue prefetch IO for every datasource this split reads.  Reports through
@@ -157,12 +162,19 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
       std::make_shared<prefetch_completion>(_datasources.size() + 1, std::move(on_done));
     std::size_t issued = 0;
     for (auto const& ds : _datasources) {
-      if (ds->prefetch_async([pending](bool ok) noexcept { pending->arrive(ok); })) {
-        ++issued;
-        pending->issued.fetch_add(1, std::memory_order_relaxed);
-      } else {
-        pending->declined.fetch_add(1, std::memory_order_relaxed);
+      switch (ds->prefetch_async([pending](bool ok) noexcept { pending->arrive(ok); })) {
+        case sirius::io::prefetch_refusal::issued:
+          ++issued;
+          pending->issued.fetch_add(1, std::memory_order_relaxed);
+          continue;
+        case sirius::io::prefetch_refusal::memory_pressure:
+          pending->declined_memory_pressure.fetch_add(1, std::memory_order_relaxed);
+          break;
+        case sirius::io::prefetch_refusal::consumer_ahead:
+        case sirius::io::prefetch_refusal::other:
+        case sirius::io::prefetch_refusal::no_cache: break;
       }
+      pending->declined.fetch_add(1, std::memory_order_relaxed);
     }
     // Published before the guard drops, so anybody woken by the completion
     // already sees which of the two outcomes this was.
@@ -216,6 +228,7 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     std::atomic<std::size_t> remaining;
     std::atomic<std::size_t> issued{0};
     std::atomic<std::size_t> declined{0};
+    std::atomic<std::size_t> declined_memory_pressure{0};
     std::atomic<bool> ok{true};
     sirius::exec::invocable<void(prefetch_outcome) noexcept> on_done;
 
@@ -223,9 +236,11 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     void settle() noexcept
     {
       if (remaining.fetch_sub(1, std::memory_order_acq_rel) != 1) { return; }
-      on_done(prefetch_outcome{.issued   = issued.load(std::memory_order_relaxed),
-                               .declined = declined.load(std::memory_order_relaxed),
-                               .ok       = ok.load(std::memory_order_relaxed)});
+      on_done(prefetch_outcome{
+        .issued                   = issued.load(std::memory_order_relaxed),
+        .declined                 = declined.load(std::memory_order_relaxed),
+        .declined_memory_pressure = declined_memory_pressure.load(std::memory_order_relaxed),
+        .ok                       = ok.load(std::memory_order_relaxed)});
     }
   };
 

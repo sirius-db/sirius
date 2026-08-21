@@ -248,11 +248,11 @@ void sirius_datasource::await_inflight_prefetch() noexcept
   std::ignore = _prefetch_handle.wait_until_ready();
 }
 
-bool sirius_datasource::prefetch_async(exec::invocable<void(bool) noexcept> on_done)
+prefetch_refusal sirius_datasource::prefetch_async(exec::invocable<void(bool) noexcept> on_done)
 {
   if (!_prefetch_handle || !uses_prefetching_cache()) {
     on_done(false);
-    return false;
+    return prefetch_refusal::no_cache;
   }
   // The executor already started reading this split, so its own reads are
   // pulling the bytes through.  Prefetching now would issue the same IO a
@@ -260,7 +260,7 @@ bool sirius_datasource::prefetch_async(exec::invocable<void(bool) noexcept> on_d
   if (_prefetch_handle.has_started_reading()) {
     prefetch_census::instance().declined_reading.fetch_add(1, std::memory_order_relaxed);
     on_done(false);
-    return false;
+    return prefetch_refusal::consumer_ahead;
   }
   // The cache's prepare_loop attaches this request's staging buffers on its own
   // thread, and a chunk can only be claimed for loading once it has one.  Issue
@@ -271,9 +271,16 @@ bool sirius_datasource::prefetch_async(exec::invocable<void(bool) noexcept> on_d
   // pool could not satisfy it), in which case there is nothing to issue.
   if (!_prefetch_handle.wait_until_prepared()) {
     on_done(false);
-    return false;
+    return prefetch_refusal::memory_pressure;
   }
-  return _io_ctx->cache()->prefetch(_prefetch_handle, std::move(on_done));
+  if (_io_ctx->cache()->prefetch(_prefetch_handle, std::move(on_done))) {
+    return prefetch_refusal::issued;
+  }
+  // The cache turned it down on a gate of its own. Its dominant case is the one
+  // above seen a moment later -- the reader got there while we were waiting on
+  // the buffers -- so re-ask the handle rather than lump every refusal together.
+  return _prefetch_handle.has_started_reading() ? prefetch_refusal::consumer_ahead
+                                                : prefetch_refusal::other;
 }
 
 bool sirius_datasource::uses_prefetching_cache() const noexcept

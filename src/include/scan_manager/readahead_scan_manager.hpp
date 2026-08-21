@@ -22,12 +22,15 @@
 #include "scan_manager/config.hpp"
 #include "scan_manager/prefetching_scheduler.hpp"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <stop_token>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -54,6 +57,55 @@ namespace sirius::scan_manager {
 /// Held by @c shared_ptr (splits report into it from their own threads) and
 /// inherits @c enable_shared_from_this so an in-flight prefetch completion can
 /// find the manager again without keeping it alive.
+/// How one prefetch attempt turned out, judged when it COMPLETES against what
+/// the consumer was doing at that instant -- not when it was issued.  Issue time
+/// says only what the readahead intended; completion time says whether it
+/// actually got there first, which is the whole question.
+///
+/// Exactly one applies per attempt, in this priority order.  The first two rules
+/// overlap on @c reading -- a consumer that is reading is also "preparing or
+/// higher" -- and @ref wait_for_prefetch wins, because it is the more specific
+/// statement: the prefetch did land, the consumer was simply already on it.
+enum class prefetch_outcome_kind : std::uint8_t {
+  /// The pool could not attach staging buffers, so nothing was ever claimable.
+  skipped_memory_pressure,
+  /// The split is gone (its weak_ptr expired) or the consumer had reached
+  /// @c preparing or beyond by the time the prefetch settled: the readahead was
+  /// working behind the executor rather than in front of it.
+  skipped_fell_behind,
+  /// IO went out and had not finished by the time the consumer started reading,
+  /// so the read is waiting on a prefetch that is on the right split but late.
+  wait_for_prefetch,
+  /// IO went out and completed while the consumer had still not reached this
+  /// split -- the readahead got there first, which is the point of it.
+  prefetched,
+  /// The attempt had nothing to issue: a split with no ranges, or a scan with no
+  /// prefetching cache to issue into (@c cache.mode: os warms the page cache and
+  /// nothing else).  Neither a win nor a miss.
+  nothing_to_issue,
+};
+
+/// What one query's readahead did, in the four outcomes that matter.
+///
+/// Deliberately a per-manager member rather than another slice of the global
+/// @c prefetch_census: a readahead manager lives for exactly one query, so the
+/// numbers are already scoped to one and need no epoch or delta bookkeeping to
+/// be read.
+struct readahead_counters {
+  /// @ref prefetch_outcome_kind::prefetched -- the readahead got there first.
+  std::atomic<std::uint64_t> prefetched{0};
+  /// @ref prefetch_outcome_kind::wait_for_prefetch.
+  std::atomic<std::uint64_t> wait_for_prefetch{0};
+  /// Every attempt that produced no usable prefetch: the two reasons below plus
+  /// @ref prefetch_outcome_kind::nothing_to_issue, which is why it can exceed
+  /// their sum.
+  std::atomic<std::uint64_t> skipped{0};
+  /// @ref prefetch_outcome_kind::skipped_memory_pressure.
+  std::atomic<std::uint64_t> skipped_memory_pressure{0};
+  /// @ref prefetch_outcome_kind::skipped_fell_behind.
+  std::atomic<std::uint64_t> skipped_fell_behind{0};
+};
+
 class readahead_scan_manager : public std::enable_shared_from_this<readahead_scan_manager>,
                                public exec::query_stage_listener {
  public:
@@ -148,7 +200,27 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
 
   void reset();
 
+  /// The rule behind @ref prefetch_outcome_kind, a pure function so it can be
+  /// read -- and tested -- without a live manager.  @p stage is the consumer's
+  /// stage at completion; @p split_alive is false once the split's weak_ptr has
+  /// expired.
+  [[nodiscard]] static prefetch_outcome_kind classify_prefetch(
+    bool allocation_failed, bool split_alive, bool issued_io, io::cache::scan_stage stage) noexcept;
+
+  /// This query's readahead outcomes.  Exposed for tests and diagnostics; the
+  /// log line built from them is @ref summary.
+  [[nodiscard]] readahead_counters const& counters() const noexcept { return _counters; }
+
+  /// One-line account of this query's readahead, in the shape
+  /// @c prefetching_cache::summary uses.  Safe to call at any time; the
+  /// counters are relaxed atomics and a concurrent update only means the line
+  /// is a moment stale.
+  [[nodiscard]] std::string summary() const;
+
  private:
+  /// This query's readahead outcomes; see @ref readahead_counters.
+  readahead_counters _counters;
+
   /// One emitted split.
   struct task_entry {
     std::weak_ptr<op::scan::scan_info> task;
@@ -225,7 +297,19 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   void issue_prefetches(std::vector<pending_prefetch> batch);
 
   /// A split's prefetch IO finished; free its slot and wake the worker.
-  void on_prefetch_complete(std::size_t operator_id, const op::scan::scan_info* task);
+  /// Classify and record one settled prefetch attempt, then free its slot.
+  ///
+  /// Takes the split's report as the two facts it actually carries rather than
+  /// the struct itself: everything else the verdict needs is this manager's own
+  /// per-split state, read under @ref _mutex at this instant.
+  void on_prefetch_complete(std::size_t operator_id,
+                            const op::scan::scan_info* task,
+                            bool allocation_failed,
+                            bool issued_io);
+
+  /// Fold one verdict into @ref _counters.  Caller holds @ref _mutex; the
+  /// counters are atomics so the lock is incidental, not load-bearing.
+  void record_prefetch_outcome(prefetch_outcome_kind kind) noexcept;
 
   /// Waits for a scan to report progress, then tops the in-flight scan set back
   /// up from the scheduler.  Sleeps rather than polls: the only thing that can

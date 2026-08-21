@@ -23,6 +23,7 @@
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/text/byte_range_info.hpp>
 
+#include <cstdint>
 #include <span>
 
 namespace sirius::io {
@@ -43,6 +44,26 @@ namespace sirius::io {
  * itself stores per-scan state (notably the @c prefetching_handle returned
  * by an @c fadvise call) and is therefore not safe to share.
  */
+/// Why a datasource did or did not start a prefetch, so the readahead can
+/// attribute a refusal instead of only counting one.  A refusal is normal --
+/// the readahead offers work the read path is free to turn down -- but the
+/// reason decides whether it means "we are out of memory" or "we are too late".
+enum class prefetch_refusal : std::uint8_t {
+  /// IO went out.
+  issued,
+  /// No prefetching cache for this scan, so there was never anything to issue.
+  no_cache,
+  /// The executor had already started reading this split: prefetching now would
+  /// issue the same IO a second time and race the reader for its chunks.
+  consumer_ahead,
+  /// The cache could not attach staging buffers -- its pool had nothing to give
+  /// -- so the request was abandoned before any IO could be claimed.
+  memory_pressure,
+  /// The cache refused for a reason of its own (already loading, request
+  /// cancelled, backend cannot serve vectored host reads).
+  other,
+};
+
 class sirius_datasource : public cudf::io::datasource {
  public:
   explicit sirius_datasource(std::shared_ptr<ioctx> io_ctx, std::shared_ptr<io_object> io_obj);
@@ -139,8 +160,9 @@ class sirius_datasource : public cudf::io::datasource {
 
   /// Issue prefetch IO for the stashed handle.  @p on_done fires exactly once
   /// with the outcome — inline when no IO is issued, otherwise from the IO
-  /// completion.  Returns whether IO was issued.
-  bool prefetch_async(exec::invocable<void(bool) noexcept> on_done);
+  /// completion.  Returns @c prefetch_refusal::issued when IO went out, and
+  /// otherwise why it did not.
+  prefetch_refusal prefetch_async(exec::invocable<void(bool) noexcept> on_done);
 
   [[nodiscard]] bool uses_prefetching_cache() const noexcept;
 
