@@ -43,6 +43,19 @@ jobs:
           cat /tmp/harness.log >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Test performance harness observability
+        run: |
+          set -o pipefail
+          python3 -m unittest discover -s test/tpch_performance -p test_performance_test_observability.py 2>&1 | tee /tmp/observability.log
+
+      - name: Surface performance harness observability errors
+        if: failure()
+        run: |
+          echo '## Performance harness observability errors' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/observability.log >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
       - uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347 # v0.10.1
         with:
           cache: false

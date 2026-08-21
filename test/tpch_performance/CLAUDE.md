@@ -555,6 +555,7 @@ Output: `reports/<label>_<YYYYMMDD_HHMMSS>/` containing `report.md`, `summary.js
 | `generate_tpch_data.sh` | Generate TPC-H parquet (tpchgen-rs) or duckdb (`--format duckdb`, classic dbgen + `tpch_schema.sql`) data |
 | `tpch_schema.sql` | TPC-H DDL for loading dbgen `.tbl` output, typed to match what DuckDB's tpch extension creates |
 | `sweep_threads.sh` | Thread configuration sweep (Sirius-only) |
+| `test_sweep_threads.sh` | Host-only self-test of `sweep_threads.sh` (runs in CI: `check.yml` lint job) |
 | `profile_tpch_nsys.sh` | Profile queries with nsys, producing .nsys-rep and .sqlite per query |
 | `nsys_analyze.sh` | Analyze nsys SQLite profiles (kernels, memory, NVTX, I/O) |
 | `nsys_compare.sh` | Compare two nsys reports and flag regressions |
@@ -562,6 +563,7 @@ Output: `reports/<label>_<YYYYMMDD_HHMMSS>/` containing `report.md`, `summary.js
 | `nsys_report.sh` | Orchestrate profiling + analysis into a self-contained report |
 | `rewrite_parquet.py` | Rewrite parquet with GPU-optimized row groups (cudf or pyarrow fallback) |
 | `performance_test.py` | Python-based benchmark with result verification |
+| `test_performance_test_observability.py` | Host-only unittest of `performance_test.py`'s dynamic-filter observability plumbing (runs in CI: `check.yml` lint job) |
 | `queries.py` | TPC-H query templates (`{PLACEHOLDER}` substitution parameters) + the fixed default rendering `QUERIES` |
 | `tpch_query_streams.py` | Load the qgen stream files: split on `(Q<n>)` tags, fold the `:n` row limit into a `LIMIT` |
 | `generate_tpch_queries.sh` | Generate per-stream query sets (`stream<N>.sql`) with `qgen` |
