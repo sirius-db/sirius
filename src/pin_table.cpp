@@ -257,6 +257,28 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
   // free) unless the caller selected columns to observe.
   late_mat::unique_probe unique_probe{options.probe_unique_columns};
 
+  // The cheap per-chunk pass usually leaves a key UNDECIDED: chunk ranges
+  // overlap, because the coalescer interleaves row groups rather than
+  // partitioning the key space. Settling that needs every chunk at once, which
+  // only exists HERE -- once a compressed pin has been encoded, the values are
+  // gone, and the deferred exact check at query time skips a compressed chunk
+  // outright. So retain the observed columns as they pass and finish the proof
+  // before returning. Retention is bounded by the same row cap the query-time
+  // stage uses and abandoned outright if the pin spreads across devices.
+  std::vector<std::vector<std::unique_ptr<cudf::column>>> exact_chunks(
+    options.probe_unique_columns.size());
+  bool exact_retaining         = unique_probe.active();
+  std::size_t exact_rows       = 0;
+  std::optional<int> exact_gpu = std::nullopt;
+  auto abandon_exact           = [&](char const* why) {
+    if (!exact_retaining) { return; }
+    exact_retaining = false;
+    for (auto& col : exact_chunks) {
+      col.clear();
+    }
+    SIRIUS_LOG_DEBUG("[late-mat] pin-time exact uniqueness check abandoned: {}", why);
+  };
+
   // Materialize one coalesced batch into a GPU-resident cudf::table and hand it to on_batch
   // together with its GPU placement + the decode stream. Mirrors
   // load_balancing_scan_batch_coalescer::process_provider_inputs, minus the connector/balancer
@@ -309,6 +331,27 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
       nvtx3::scoped_range probe_range{"sirius::pin::unique_probe"};
       unique_probe.observe(tbl->view(), stream);
     }
+    if (exact_retaining) {
+      if (exact_gpu.has_value() && *exact_gpu != gpu_id) {
+        abandon_exact("the pin spans devices");
+      } else if (exact_rows + static_cast<std::size_t>(tbl->num_rows()) >
+                 late_mat::exact_uniqueness_row_cap()) {
+        abandon_exact("the pin is past the exact-stage row cap");
+      } else if (static_cast<std::size_t>(tbl->num_columns()) !=
+                 options.probe_unique_columns.size()) {
+        abandon_exact("a chunk's width disagrees with the selection");
+      } else {
+        exact_gpu = gpu_id;
+        exact_rows += static_cast<std::size_t>(tbl->num_rows());
+        for (std::size_t i = 0; i < options.probe_unique_columns.size(); ++i) {
+          if (!options.probe_unique_columns[i]) { continue; }
+          exact_chunks[i].push_back(
+            std::make_unique<cudf::column>(tbl->view().column(static_cast<cudf::size_type>(i)),
+                                           stream,
+                                           target->get_default_allocator()));
+        }
+      }
+    }
     // Record declared-native identity before narrowing; decoder type is only the fallback when no
     // declared mapping is available.
     std::vector<cudf::data_type> native_types;
@@ -356,6 +399,31 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
                   options.probe_unique_columns.end(),
                   [](bool selected) { return selected; })) {
     auto verdicts = unique_probe.verdicts();
+    // Only what the cheap pass left open: `proven` needs nothing more and
+    // `refused` cannot be helped (the column repeats a value, or is nullable).
+    if (exact_retaining) {
+      rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{exact_gpu.value_or(0)}};
+      for (std::size_t i = 0; i < verdicts.size(); ++i) {
+        if (verdicts[i] != late_mat::unique_verdict::undecided || exact_chunks[i].empty()) {
+          continue;
+        }
+        std::vector<cudf::column_view> views;
+        views.reserve(exact_chunks[i].size());
+        for (auto const& col : exact_chunks[i]) {
+          views.push_back(col->view());
+        }
+        try {
+          auto const unique = late_mat::exact_distinct_over_chunks(views, rmm::cuda_stream_view{});
+          if (!unique.has_value()) { continue; }  // undecidable stays UNKNOWN
+          verdicts[i] =
+            *unique ? late_mat::unique_verdict::proven : late_mat::unique_verdict::refused;
+        } catch (std::exception const& e) {
+          // A failed check must cost the optimization, never the pin.
+          SIRIUS_LOG_WARN("[late-mat] pin-time exact uniqueness check failed: {}", e.what());
+        }
+      }
+    }
+    abandon_exact("done");
     SIRIUS_LOG_DEBUG(
       "[late-mat] pin uniqueness probe: {} proven, {} undecided (exact check pending), {} refused",
       std::count(verdicts.begin(), verdicts.end(), late_mat::unique_verdict::proven),
