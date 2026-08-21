@@ -744,6 +744,14 @@ fn translate_nestloop_join(
             });
         }
     }
+    // Lowering a Cartesian product to a constant-key equality join replaced the rejection that
+    // used to refuse it ("the GPU physical planner has no cross-product operator"), so this shape
+    // now reaches the GPU instead of failing translation. Nothing here bounds its size: the FE
+    // reports `cardinality: 1` for every FILES() external scan, so the translator has no estimate
+    // to gate on, and TPC-H q08/q09 at SF100 plan a genuine `NESTLOOP JOIN / CROSS JOIN` whose
+    // build side exhausts memory. Bounding it belongs to the executor, which knows the real row
+    // counts; refusing it here would also refuse the small cross joins the FE emits from
+    // scalar-subquery rewrites.
     let mut children = children.into_iter();
     let left = children.next().unwrap();
     let right = children.next().unwrap();
