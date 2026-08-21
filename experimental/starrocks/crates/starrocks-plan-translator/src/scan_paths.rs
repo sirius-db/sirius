@@ -156,18 +156,23 @@ impl ScanFilePaths {
                 intervals.sort_unstable();
                 let mut covered_until = 0;
                 for (start, end) in intervals {
-                    if start < 0 || end <= start || start > covered_until {
+                    // Each split must begin exactly where the previous one ended. `>` alone
+                    // rejects gaps but absorbs overlaps into `covered_until`, and an overlap
+                    // survives as a single whole-file read: Sirius would scan the shared row
+                    // groups once where StarRocks scans them on both instances, so `count(*)`
+                    // disagrees with no error.
+                    if start < 0 || end <= start || start != covered_until {
                         return Err(Self::unsupported(
                             node_id,
-                            "byte-range splits do not cover the whole parquet file",
+                            "byte-range splits do not tile the parquet file",
                         ));
                     }
-                    covered_until = covered_until.max(end);
+                    covered_until = end;
                 }
                 if covered_until < file_size {
                     return Err(Self::unsupported(
                         node_id,
-                        "byte-range splits do not cover the whole parquet file",
+                        "byte-range splits do not tile the parquet file",
                     ));
                 }
                 debug_assert!(!path.is_empty());
