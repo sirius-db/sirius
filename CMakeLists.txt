@@ -790,6 +790,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
+    test/cpp/pipeline/test_gpu_pipeline_task_finalize_throw.cpp
     test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
     test/cpp/pipeline/test_get_next_ports_after_sink.cpp

@@ -440,6 +440,22 @@ void gpu_pipeline_executor::manager_loop()
         }
         task.reset();
 
+        // ~gpu_pipeline_task is noexcept, so a throw out of mark_task_completed() above is
+        // parked on the pipeline rather than propagated. Claim it here, the first frame that can
+        // still reach the completion handler: a throw raised before update_pipeline_status()
+        // flips pipeline_finished leaves nobody able to finish the pipeline, so only failing the
+        // query keeps it from waiting forever.
+        if (pipeline) {
+          if (auto completion_error = pipeline->take_task_completion_error()) {
+            SIRIUS_LOG_ERROR(
+              "GPU Pipeline Executor: pipeline {} failed while completing a task; failing the "
+              "query",
+              pipeline->get_pipeline_id());
+            if (_completion_handler) { _completion_handler->report_error(completion_error); }
+            return;
+          }
+        }
+
         // Check if query is complete BEFORE scheduling downstream tasks.
         // mark_completed() signals the future that engine.execute() is waiting on,
         // which may destroy the engine and its operators. We must not schedule

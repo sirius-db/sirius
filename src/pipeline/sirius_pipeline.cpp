@@ -488,6 +488,19 @@ void sirius_pipeline::mark_task_completed()
   update_pipeline_status();
 }
 
+void sirius_pipeline::record_task_completion_error(std::exception_ptr error) noexcept
+{
+  if (!error) { return; }
+  std::lock_guard<std::mutex> lock(_task_completion_error_mutex);
+  if (!_task_completion_error) { _task_completion_error = std::move(error); }
+}
+
+std::exception_ptr sirius_pipeline::take_task_completion_error() noexcept
+{
+  std::lock_guard<std::mutex> lock(_task_completion_error_mutex);
+  return std::exchange(_task_completion_error, nullptr);
+}
+
 std::vector<op::sirius_physical_operator*> sirius_pipeline::get_output_consumers() const
 {
   auto parents = get_parents();

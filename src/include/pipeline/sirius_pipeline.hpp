@@ -27,6 +27,7 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <exception>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -193,6 +194,13 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   void mark_task_created();
   void mark_task_completed();
 
+  //! Park an exception that escaped mark_task_completed(), for whoever destroyed the task to
+  //! claim. Only the first is kept; later ones are symptoms of it.
+  void record_task_completion_error(std::exception_ptr error) noexcept;
+
+  //! Remove and return the parked error, or nullptr if there is none.
+  [[nodiscard]] std::exception_ptr take_task_completion_error() noexcept;
+
   //! Observers for the per-pipeline task counters (testing / diagnostics).
   [[nodiscard]] std::size_t get_tasks_created() const { return tasks_created.load(); }
   [[nodiscard]] std::size_t get_tasks_completed() const { return tasks_completed.load(); }
@@ -274,6 +282,11 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   std::atomic<std::size_t> tasks_created   = 0;
   std::atomic<std::size_t> tasks_completed = 0;
+
+  //! First exception that escaped mark_task_completed(), waiting to be claimed. Not guarded by
+  //! _status_mutex: it is recorded while unwinding out of that lock.
+  std::mutex _task_completion_error_mutex;
+  std::exception_ptr _task_completion_error;
 
   //! NVTX process-wide range tracking the pipeline's active lifetime
   std::atomic<bool> _nvtx_range_started{false};

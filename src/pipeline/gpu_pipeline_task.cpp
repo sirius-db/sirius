@@ -320,14 +320,41 @@ gpu_pipeline_task::~gpu_pipeline_task()
   }
   _subscribed_batches.clear();
 
-  if (_global_state == nullptr ||
-      _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline() == nullptr) {
-    return;
+  if (_global_state == nullptr) { return; }
+  auto* pipeline = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
+  if (pipeline == nullptr) { return; }
+
+  // mark_task_completed() runs finalize_operator() on every operator — device work that throws
+  // (the hash join frees cuco tables there). This destructor is implicitly noexcept, so letting
+  // that escape is std::terminate: the whole process aborts on a failed query. Park it on the
+  // pipeline instead; gpu_pipeline_executor claims it and fails the query through the completion
+  // handler, which a destructor cannot reach.
+  try {
+    pipeline->mark_task_completed();
+  } catch (const std::exception& e) {
+    SIRIUS_LOG_ERROR(
+      "gpu_pipeline_task: pipeline {} threw while completing task {}; failing the query instead "
+      "of aborting the process: {}",
+      pipeline->get_pipeline_id(),
+      get_task_id(),
+      e.what());
+    pipeline->record_task_completion_error(std::current_exception());
+  } catch (...) {
+    SIRIUS_LOG_ERROR(
+      "gpu_pipeline_task: pipeline {} threw a non-std exception while completing task {}; "
+      "failing the query instead of aborting the process",
+      pipeline->get_pipeline_id(),
+      get_task_id());
+    pipeline->record_task_completion_error(std::current_exception());
   }
-  _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()->mark_task_completed();
 }
 
 const sirius_pipeline* gpu_pipeline_task::get_pipeline() const
+{
+  return _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
+}
+
+sirius_pipeline* gpu_pipeline_task::get_pipeline()
 {
   return _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
 }
