@@ -29,10 +29,13 @@
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 
+#include <nvtx3/nvtx3.hpp>
+
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 // Forward-declare CUDA profiler API functions (linked via libcudart).
@@ -48,6 +51,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/assert.hpp"
 #include "duckdb/common/limits.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -88,19 +92,27 @@ extern "C" int cudaProfilerStop();
 #include "gpu_context.hpp"
 #include "gpu_physical_plan_generator.hpp"
 #endif
+#include "duckdb/common/types/value.hpp"
 #include "duckdb/main/connection_manager.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "op/result/host_table_chunk_reader.hpp"
 #include "op/scan/duckdb_mvcc_visibility.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "pin_table.hpp"
+#include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "sirius_interface.hpp"
 #include "sirius_sql_rewrite.hpp"
 #include "util/segfault_backtrace.hpp"
+#include "vss/pinned_column.hpp"
+#include "vss/vector_search.hpp"
+
+#include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 // PinTableFunction routes parquet reads through the scan manager's sirius_ioctx
 // instead of cudf's bundled file_source factory (which uses kvikio internally
@@ -119,6 +131,7 @@ extern "C" int cudaProfilerStop();
 #include "io/types.hpp"                // sirius::io::sirius_ioctx
 #include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -1617,6 +1630,206 @@ static void SiriusSetQueryLabelFunction(ClientContext& context,
   data.finished = true;
 }
 
+struct SiriusVectorSearchBindData : public TableFunctionData {
+  sirius::vss::vector_search_request req;
+  // Output column types + trailing distance, for the host_table_chunk_reader.
+  duckdb::vector<sirius::logical_type> reader_types;
+};
+
+struct SiriusVectorSearchGlobalState : public GlobalTableFunctionState {
+  std::unique_ptr<cucascade::host_data_representation> host_repr;
+  std::unique_ptr<sirius::op::result::host_table_chunk_reader> reader;
+};
+
+// Pull the float components out of the query argument, accepting either a
+// FLOAT[] ARRAY (e.g. [1,2,3]::FLOAT[3]) or a LIST of numbers.
+static std::vector<float> vector_search_query_floats(const Value& query)
+{
+  auto const id                         = query.type().id();
+  const duckdb::vector<Value>* children = nullptr;
+  if (id == LogicalTypeId::ARRAY) {
+    children = &ArrayValue::GetChildren(query);
+  } else if (id == LogicalTypeId::LIST) {
+    children = &ListValue::GetChildren(query);
+  } else {
+    throw BinderException(
+      "sirius_knn_search: query (3rd argument) must be a FLOAT array, e.g. [..]::FLOAT[N]");
+  }
+  std::vector<float> out;
+  out.reserve(children->size());
+  for (auto const& child : *children) {
+    if (child.IsNull()) {
+      throw BinderException("sirius_knn_search: query vector must not contain NULLs");
+    }
+    out.push_back(child.GetValue<float>());
+  }
+  return out;
+}
+
+static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
+                                                       TableFunctionBindInput& input,
+                                                       vector<LogicalType>& return_types,
+                                                       vector<string>& names)
+{
+  auto result = make_uniq<SiriusVectorSearchBindData>();
+  auto& req   = result->req;
+
+  // Required params
+  if (input.inputs.size() < 3 || input.inputs[0].IsNull() || input.inputs[1].IsNull() ||
+      input.inputs[2].IsNull()) {
+    throw BinderException(
+      "sirius_knn_search requires three non-NULL positional arguments: table, column, query");
+  }
+  req.table_name  = input.inputs[0].ToString();
+  req.column_name = input.inputs[1].ToString();
+  req.query       = vector_search_query_floats(input.inputs[2]);
+
+  // Optional params' default values
+  req.metric                    = "l2";
+  req.k                         = 10;
+  std::string schema_name       = "main";
+  bool output_columns_specified = false;
+  for (auto& kv : input.named_parameters) {
+    auto const key = StringUtil::Lower(kv.first);
+    if (kv.second.IsNull()) {
+      throw BinderException("sirius_knn_search: named parameter '" + kv.first + "' cannot be NULL");
+    }
+    if (key == "k") {
+      req.k = kv.second.GetValue<int64_t>();
+    } else if (key == "metric") {
+      req.metric = StringUtil::Lower(kv.second.ToString());
+    } else if (key == "schema_name") {
+      schema_name = kv.second.ToString();
+    } else if (key == "output_columns") {
+      output_columns_specified = true;
+      for (auto const& c : ListValue::GetChildren(kv.second)) {
+        req.output_columns.push_back(c.ToString());
+      }
+    }
+  }
+  if (req.k <= 0) { throw BinderException("sirius_knn_search: k must be >= 1"); }
+  if (req.metric != "l2" && req.metric != "cosine") {
+    throw BinderException("sirius_knn_search: metric must be one of 'l2', 'cosine', got '" +
+                          req.metric + "'");
+  }
+  // An explicitly-passed empty list is a user error.
+  if (output_columns_specified && req.output_columns.empty()) {
+    throw BinderException(
+      "sirius_knn_search: output_columns cannot be empty; omit it to default to the pinned "
+      "columns");
+  }
+
+  // Resolve the vector column's dimensionality and each output column's type
+  // from the catalog so the return schema and the host reader agree.
+  auto const qname          = QualifiedName::Parse(req.table_name);
+  std::string const catalog = qname.catalog;
+  std::string const schema  = !qname.schema.empty() ? qname.schema : schema_name;
+  auto& entry_base =
+    Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, catalog, schema, qname.name);
+  auto& entry             = entry_base.Cast<DuckTableEntry>();
+  req.catalog             = entry.ParentCatalog().GetName();
+  req.schema              = entry.ParentSchema().name;
+  req.table_name          = entry.name;  // catalog-resolved name (matches query-side derivation)
+  auto const& columns     = entry.GetColumns();
+  auto const schema_names = columns.GetColumnNames();
+  auto const schema_types = columns.GetColumnTypes();
+
+  // The search gathers output columns from the pin.
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw InvalidInputException("sirius_knn_search requires the Sirius context to be initialized");
+  }
+  const auto* pin = sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
+    req.catalog, req.schema, req.table_name);
+  if (pin == nullptr) {
+    throw BinderException("sirius_knn_search: table '" + req.table_name +
+                          "' must be pinned before it can be searched");
+  }
+  auto const& pinned_names = pin->cache_info.column_names();
+  auto is_pinned           = [&](const std::string& col) {
+    return std::find(pinned_names.begin(), pinned_names.end(), col) != pinned_names.end();
+  };
+
+  if (req.output_columns.empty()) {
+    // Default to the columns that are pinned and in catalog schema order.
+    for (auto const& name : schema_names) {
+      if (is_pinned(name)) { req.output_columns.push_back(name); }
+    }
+  } else {
+    // Explicitly-pass: every column must exist and be pinned.
+    for (auto const& col : req.output_columns) {
+      bool const in_catalog =
+        std::find(schema_names.begin(), schema_names.end(), col) != schema_names.end();
+      if (!in_catalog) {
+        throw BinderException("sirius_knn_search: column '" + col + "' not found in table '" +
+                              req.table_name + "'");
+      }
+      if (!is_pinned(col)) {
+        throw BinderException("sirius_knn_search: output column '" + col +
+                              "' is not pinned on table '" + req.table_name +
+                              "'; pin it (pin_table cols => [...]) or omit output_columns");
+      }
+    }
+  }
+
+  auto type_of = [&](const std::string& col) -> const LogicalType& {
+    for (std::size_t i = 0; i < schema_names.size(); ++i) {
+      if (schema_names[i] == col) { return schema_types[i]; }
+    }
+    throw BinderException("sirius_knn_search: column '" + col + "' not found in table '" +
+                          req.table_name + "'");
+  };
+
+  auto const& vec_type = type_of(req.column_name);
+  if (vec_type.id() != LogicalTypeId::ARRAY ||
+      ArrayType::GetChildType(vec_type).id() != LogicalTypeId::FLOAT) {
+    throw BinderException("sirius_knn_search: column '" + req.column_name +
+                          "' must be a FLOAT[N] array column");
+  }
+  req.dim = static_cast<int64_t>(ArrayType::GetSize(vec_type));
+  if (static_cast<int64_t>(req.query.size()) != req.dim) {
+    throw BinderException("sirius_knn_search: query has " + std::to_string(req.query.size()) +
+                          " elements but column '" + req.column_name + "' is FLOAT[" +
+                          std::to_string(req.dim) + "]");
+  }
+
+  for (auto const& col : req.output_columns) {
+    return_types.push_back(type_of(col));
+    names.push_back(col);
+  }
+  return_types.push_back(LogicalType::FLOAT);
+  names.push_back("distance");
+
+  result->reader_types = sirius::from_duckdb_vec(return_types);
+  return std::move(result);
+}
+
+static unique_ptr<GlobalTableFunctionState> SiriusVectorSearchInit(ClientContext& context,
+                                                                   TableFunctionInitInput& input)
+{
+  nvtx3::scoped_range nvtx_range{"SiriusVectorSearchInit"};
+  auto& bind_data = input.bind_data->Cast<SiriusVectorSearchBindData>();
+
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw InvalidInputException("sirius_knn_search requires the Sirius context to be initialized");
+  }
+
+  auto state       = make_uniq<SiriusVectorSearchGlobalState>();
+  state->host_repr = sirius::vss::run_vector_search(*sirius_ctx, bind_data.req);
+  state->reader    = std::make_unique<sirius::op::result::host_table_chunk_reader>(
+    context, *state->host_repr, bind_data.reader_types);
+  return std::move(state);
+}
+
+static void SiriusVectorSearchFunction(ClientContext& context,
+                                       TableFunctionInput& data_p,
+                                       DataChunk& output)
+{
+  auto& state = data_p.global_state->Cast<SiriusVectorSearchGlobalState>();
+  state.reader->get_next_chunk(output);
+}
+
 void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 {
   auto transaction = CatalogTransaction::GetSystemTransaction(instance);
@@ -1700,6 +1913,20 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     "unpin_table", {LogicalType::VARCHAR}, UnpinTableFunction, UnpinTableBind);
   CreateTableFunctionInfo unpin_table_info(unpin_table);
   catalog.CreateTableFunction(transaction, unpin_table_info);
+
+  // sirius_knn_search(table, column, query, k =>, output_columns =>, metric =>,
+  // schema_name =>)
+  TableFunction vector_search("sirius_knn_search",
+                              {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
+                              SiriusVectorSearchFunction,
+                              SiriusVectorSearchBind,
+                              SiriusVectorSearchInit);
+  vector_search.named_parameters["k"]              = LogicalType::BIGINT;
+  vector_search.named_parameters["output_columns"] = LogicalType::LIST(LogicalType::VARCHAR);
+  vector_search.named_parameters["metric"]         = LogicalType::VARCHAR;
+  vector_search.named_parameters["schema_name"]    = LogicalType::VARCHAR;
+  CreateTableFunctionInfo vector_search_info(vector_search);
+  catalog.CreateTableFunction(transaction, vector_search_info);
 }
 
 // Process-global Config writes are refused once the Sirius runtime is
