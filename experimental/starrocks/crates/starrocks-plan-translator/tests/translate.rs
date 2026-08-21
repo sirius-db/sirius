@@ -2364,22 +2364,45 @@ fn left_semi_join_keeps_probe_layout() {
     );
 }
 
-/// Verifies a cross nested-loop join with a conjunct becomes filter-over-cross-product.
-#[test]
-fn nestloop_join_translates_to_filtered_cross_rel() {
+/// Builds a nested-loop join plan node carrying `conjuncts` as its join predicate.
+fn nestloop_join_node(join_op: TJoinOp, conjuncts: Vec<TExpr>) -> TPlanNode {
     let mut join = base_plan_node(2, TPlanNodeType::NESTLOOP_JOIN_NODE, 2, vec![0, 1]);
     join.nestloop_join_node = Some(TNestLoopJoinNode::new(
-        Some(TJoinOp::CROSS_JOIN),
+        Some(join_op),
         None,
-        Some(vec![binary_pred(
-            TExprOpcode::LT,
-            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
-            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
-        )]),
+        Some(conjuncts),
         None,
         None,
         None,
     ));
+    join
+}
+
+/// Builds `left OR right`.
+fn or_pred(left: TExpr, right: TExpr) -> TExpr {
+    let mut node = base_expr_node(
+        TExprNodeType::COMPOUND_PRED,
+        scalar_type(TPrimitiveType::BOOLEAN),
+        2,
+    );
+    node.opcode = Some(TExprOpcode::COMPOUND_OR);
+    let mut nodes = vec![node];
+    nodes.extend(left.nodes);
+    nodes.extend(right.nodes);
+    TExpr::new(nodes)
+}
+
+/// Verifies a cross nested-loop join with a conjunct becomes filter-over-cross-product.
+#[test]
+fn nestloop_join_translates_to_filtered_cross_rel() {
+    let join = nestloop_join_node(
+        TJoinOp::CROSS_JOIN,
+        vec![binary_pred(
+            TExprOpcode::LT,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        )],
+    );
     let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
     let translated = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap();
 
@@ -2392,6 +2415,45 @@ fn nestloop_join_translates_to_filtered_cross_rel() {
     let rel::RelType::Cross(_) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
         panic!("expected cross product under filter");
     };
+}
+
+/// Verifies a nested-loop join is rejected unless a conjunct survives as a join condition.
+///
+/// A predicate reading one input is pushed into that input and leaves a bare cross product; a
+/// disjunction reading both is demoted to an any-join. The GPU planner has neither operator, so
+/// either shape would translate here and then fail at execution.
+#[test]
+fn nestloop_join_without_a_liftable_comparison_is_rejected() {
+    let bigint = || scalar_type(TPrimitiveType::BIGINT);
+    let probe_side_only = binary_pred(TExprOpcode::LT, slot_ref(1, 0, bigint()), int_literal(10));
+    let disjunction = or_pred(
+        binary_pred(
+            TExprOpcode::LT,
+            slot_ref(1, 0, bigint()),
+            slot_ref(1, 1, bigint()),
+        ),
+        binary_pred(
+            TExprOpcode::GT,
+            slot_ref(1, 0, bigint()),
+            slot_ref(1, 1, bigint()),
+        ),
+    );
+
+    for conjunct in [probe_side_only, disjunction] {
+        let plan = TPlan::new(vec![
+            nestloop_join_node(TJoinOp::CROSS_JOIN, vec![conjunct]),
+            scan_node(0, 0),
+            scan_node(1, 1),
+        ]);
+        let err = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap_err();
+        let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
+            panic!("expected an unsupported plan node, got {err:?}");
+        };
+        assert_eq!(
+            reason,
+            "nested-loop joins need a comparison between the two inputs"
+        );
+    }
 }
 
 /// Verifies an exchange node is still rejected: fragments are translated in isolation and

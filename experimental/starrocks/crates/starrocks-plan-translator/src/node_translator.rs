@@ -1,4 +1,4 @@
-use starrocks_thrift::exprs::TExpr;
+use starrocks_thrift::exprs::{TExpr, TExprNodeType};
 use starrocks_thrift::opcodes::TExprOpcode;
 use starrocks_thrift::plan_nodes::{TJoinOp, TPlan, TPlanNode, TPlanNodeType, TSortInfo};
 use substrait::proto::read_rel::local_files::FileOrFiles;
@@ -752,8 +752,9 @@ fn translate_nestloop_join(
     let row_tuples = [left.row_tuples.as_slice(), right.row_tuples.as_slice()].concat();
     let output_width = left.output_width + right.output_width;
 
-    let mut conditions = Vec::new();
-    for expr in join.join_conjuncts.as_deref().unwrap_or_default() {
+    let conjuncts = join.join_conjuncts.as_deref().unwrap_or_default();
+    let mut conditions = Vec::with_capacity(conjuncts.len());
+    for expr in conjuncts {
         let mut expr_ctx = ctx.expr_context(&row_tuples);
         conditions.push(expr.translate(&mut expr_ctx)?);
     }
@@ -764,6 +765,16 @@ fn translate_nestloop_join(
         node_type: node.node_type,
         reason: "cross joins without join conjuncts are not supported",
     })?;
+    if !conjuncts
+        .iter()
+        .any(|conjunct| becomes_join_condition(conjunct, &left.row_tuples, &right.row_tuples))
+    {
+        return Err(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "nested-loop joins need a comparison between the two inputs",
+        });
+    }
 
     let cross = Rel {
         rel_type: Some(rel::RelType::Cross(Box::new(CrossRel {
@@ -785,6 +796,36 @@ fn translate_nestloop_join(
     };
     // Node conjuncts are post-join predicates over the join's output row.
     apply_conjuncts(filtered, node, ctx)
+}
+
+/// Returns whether DuckDB will lift `conjunct` out of the filter above the cross product and into
+/// a join condition.
+///
+/// `FilterPushdown::PushdownCrossProduct` splits that filter by side: a predicate reading only one
+/// input is pushed into that input, and only predicates reading both become join conditions —
+/// which `ExtractJoinConditions` then keeps as conditions when the predicate is a comparison, and
+/// demotes to an any-join otherwise. With no such predicate the plan lowers to a bare cross
+/// product or an any-join, and the GPU planner implements neither
+/// (`sirius_physical_plan_generator.cpp`), so it would fail at execution instead of here.
+///
+/// This approximates the rule from the one side that matters: a comparison whose own operands each
+/// read both inputs (`a.x + b.y < 10`) also becomes an any-join, and is accepted here.
+fn becomes_join_condition(conjunct: &TExpr, left_tuples: &[i32], right_tuples: &[i32]) -> bool {
+    conjunct
+        .nodes
+        .first()
+        .is_some_and(|root| root.node_type == TExprNodeType::BINARY_PRED)
+        && reads_tuples(conjunct, left_tuples)
+        && reads_tuples(conjunct, right_tuples)
+}
+
+/// Returns whether any slot reference in `expr` belongs to one of `tuples`.
+fn reads_tuples(expr: &TExpr, tuples: &[i32]) -> bool {
+    expr.nodes.iter().any(|node| {
+        node.slot_ref
+            .as_ref()
+            .is_some_and(|slot_ref| tuples.contains(&slot_ref.tuple_id))
+    })
 }
 
 /// Combines boolean conditions with `and`.
