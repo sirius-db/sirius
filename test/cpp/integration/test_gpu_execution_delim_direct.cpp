@@ -23,17 +23,48 @@
 // plus the degenerate cardinalities (runtime-empty inner side, all-match, no-match) and the
 // enable_delim_direct_lowering knob A/B.
 //
+// The lowering only runs when DuckDB plans a DELIM join in the first place; at this toy scale
+// DuckDB's subquery unnesting plans a bare semi/anti join instead unless the subquery carries an
+// inner-side predicate. The predicates below (qty > 0, qty > -1000, qty % 1000 > -1000, ...)
+// exist exactly for that — the all-matching ones keep every inner row in play so they change
+// only the plan, never the membership outcome. A predicate comparing a plain-`=`-correlated
+// column with a constant is not enough: DuckDB's filter equivalence rewrites it onto the dedup
+// keys, un-baring the DELIM_GET so the classifier refuses (sandwich_shape) — hence the opaque
+// modulo form wherever the filtered column is itself a correlation key. Every case asserts the
+// full precondition via require_lowerable_delim_plan (DELIM planned on this connection AND
+// classified eligible), so neither a DuckDB planning change nor a classifier change can silently
+// turn a case into a stock-path or delim-machinery test.
+//
 // Every query goes through the shared file-backed GpuExecutionFixture, which runs it once on
 // the GPU (asserting a real GPU execution with no fallback) and once on DuckDB CPU, then
 // compares the results (order-insensitive).
 
+#include "planner/sirius_plan_delim_direct.hpp"
+
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <duckdb/execution/column_binding_resolver.hpp>
+#include <duckdb/optimizer/optimizer.hpp>
+#include <duckdb/parser/parser.hpp>
+#include <duckdb/planner/operator/logical_comparison_join.hpp>
+#include <duckdb/planner/planner.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
 #include <string>
 
 namespace {
+
+duckdb::LogicalComparisonJoin* find_delim_join(duckdb::LogicalOperator* op)
+{
+  if (!op) { return nullptr; }
+  if (op->type == duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+    return &op->Cast<duckdb::LogicalComparisonJoin>();
+  }
+  for (auto& child : op->children) {
+    if (auto* found = find_delim_join(child.get())) { return found; }
+  }
+  return nullptr;
+}
 
 // Outer rows with NULL keys (ids 6, 7) and duplicate keys (10 twice); inner rows with a NULL
 // key, duplicate matching keys (10 twice), and a key with no outer counterpart (99).
@@ -48,6 +79,51 @@ class DelimDirectFixture : public sirius::test::GpuExecutionFixture {
     run_ok("CREATE TABLE inner_t (k INTEGER, qty INTEGER);");
     run_ok("INSERT INTO inner_t VALUES (10, 1), (10, 2), (20, 3), (NULL, 4), (99, 5), (30, -1);");
     run_ok("CHECKPOINT;");
+  }
+
+  /// Require that on THIS connection (same tables, statistics, and optimizer settings as the
+  /// GPU run) DuckDB's optimized logical plan for @p sql contains a DELIM join AND that the
+  /// delim-direct classifier accepts it — so the GPU execution that follows provably runs
+  /// through the lowered direct join (see the file comment). Planned manually on the CPU path;
+  /// a refusal failure prints the typed reason.
+  void require_lowerable_delim_plan(const std::string& sql)
+  {
+    run_ok("SET gpu_execution = false;");
+    run_ok("BEGIN TRANSACTION;");
+    try {
+      auto& context = *con->context;
+      duckdb::Parser parser(context.GetParserOptions());
+      parser.ParseQuery(sql);
+      REQUIRE(parser.statements.size() == 1);
+      duckdb::Planner planner(context);
+      planner.CreatePlan(std::move(parser.statements[0]));
+      REQUIRE(planner.plan);
+      duckdb::Optimizer optimizer(*planner.binder, context);
+      auto plan = optimizer.Optimize(std::move(planner.plan));
+      plan->ResolveOperatorTypes();
+      duckdb::ColumnBindingResolver resolver;
+      resolver.VisitOperator(*plan);
+
+      auto* delim = find_delim_join(plan.get());
+      REQUIRE(delim != nullptr);
+      const std::string refusal =
+        sirius::planner::to_string(sirius::planner::classify_delim_direct_lowering(*delim).refusal);
+      CHECK(refusal == "none");
+    } catch (...) {
+      con->Query("ROLLBACK;");
+      con->Query("SET gpu_execution = true;");
+      throw;
+    }
+    run_ok("ROLLBACK;");
+    run_ok("SET gpu_execution = true;");
+  }
+
+  /// require_lowerable_delim_plan + the GPU-vs-CPU comparison: the standard shape of every
+  /// case here.
+  void compare_lowered_gpu_vs_cpu(const std::string& sql)
+  {
+    require_lowerable_delim_plan(sql);
+    compare_gpu_vs_cpu(sql);
   }
 };
 
@@ -67,7 +143,7 @@ TEST_CASE_METHOD(DelimDirectFixture,
 {
   // NULL-keyed outer rows (6, 7) are excluded; the NULL-keyed inner row matches nothing;
   // duplicate outer key 10 keeps both its rows; duplicate inner matches do not multiply rows.
-  compare_gpu_vs_cpu(exists_sql);
+  compare_lowered_gpu_vs_cpu(exists_sql);
 }
 
 TEST_CASE_METHOD(DelimDirectFixture,
@@ -75,20 +151,21 @@ TEST_CASE_METHOD(DelimDirectFixture,
                  "[integration][gpu_execution][delim_direct][nulls]")
 {
   // NULL-keyed outer rows (6, 7) are KEPT: no match is possible, so NOT EXISTS is true.
-  compare_gpu_vs_cpu(not_exists_sql);
+  compare_lowered_gpu_vs_cpu(not_exists_sql);
 }
 
 TEST_CASE_METHOD(DelimDirectFixture,
                  "gpu_execution delim-direct EXISTS/NOT EXISTS with an aggregate on top",
                  "[integration][gpu_execution][delim_direct]")
 {
-  // The TPC-H q4 / q22 shape: membership test feeding a GROUP BY.
-  compare_gpu_vs_cpu(
+  // The TPC-H q4 / q22 shape: membership test feeding a GROUP BY. The all-matching qty
+  // predicate keeps every inner row in play (unlike the qty > 0 of exists_sql).
+  compare_lowered_gpu_vs_cpu(
     "SELECT tag, count(*) FROM outer_t WHERE EXISTS "
-    "(SELECT 1 FROM inner_t WHERE inner_t.k = outer_t.k) GROUP BY tag");
-  compare_gpu_vs_cpu(
+    "(SELECT 1 FROM inner_t WHERE inner_t.k = outer_t.k AND qty > -1000) GROUP BY tag");
+  compare_lowered_gpu_vs_cpu(
     "SELECT tag, count(*) FROM outer_t WHERE NOT EXISTS "
-    "(SELECT 1 FROM inner_t WHERE inner_t.k = outer_t.k) GROUP BY tag");
+    "(SELECT 1 FROM inner_t WHERE inner_t.k = outer_t.k AND qty > -1000) GROUP BY tag");
 }
 
 TEST_CASE_METHOD(DelimDirectFixture,
@@ -97,10 +174,10 @@ TEST_CASE_METHOD(DelimDirectFixture,
 {
   // The predicate keeps no inner rows at runtime (opaque to the optimizer's stats): EXISTS
   // yields nothing, NOT EXISTS yields every outer row (including the NULL-keyed ones).
-  compare_gpu_vs_cpu(
+  compare_lowered_gpu_vs_cpu(
     "SELECT id FROM outer_t WHERE EXISTS "
     "(SELECT 1 FROM inner_t WHERE inner_t.k = outer_t.k AND qty % 2 = 7)");
-  compare_gpu_vs_cpu(
+  compare_lowered_gpu_vs_cpu(
     "SELECT id FROM outer_t WHERE NOT EXISTS "
     "(SELECT 1 FROM inner_t WHERE inner_t.k = outer_t.k AND qty % 2 = 7)");
 }
@@ -109,18 +186,19 @@ TEST_CASE_METHOD(DelimDirectFixture,
                  "gpu_execution delim-direct handles all-match and no-match outer sides",
                  "[integration][gpu_execution][delim_direct]")
 {
-  // All non-NULL outer keys match (subquery over the union of outer keys themselves).
-  compare_gpu_vs_cpu(
+  // All non-NULL outer keys match (subquery over the union of outer keys themselves; the
+  // all-matching id predicate only keeps the DELIM join planned).
+  compare_lowered_gpu_vs_cpu(
     "SELECT id FROM outer_t WHERE EXISTS "
-    "(SELECT 1 FROM outer_t o2 WHERE o2.k = outer_t.k)");
-  compare_gpu_vs_cpu(
+    "(SELECT 1 FROM outer_t o2 WHERE o2.k = outer_t.k AND o2.id > -1000)");
+  compare_lowered_gpu_vs_cpu(
     "SELECT id FROM outer_t WHERE NOT EXISTS "
-    "(SELECT 1 FROM outer_t o2 WHERE o2.k = outer_t.k)");
+    "(SELECT 1 FROM outer_t o2 WHERE o2.k = outer_t.k AND o2.id > -1000)");
   // No outer key matches (inner keys shifted out of range at runtime).
-  compare_gpu_vs_cpu(
+  compare_lowered_gpu_vs_cpu(
     "SELECT id FROM outer_t WHERE EXISTS "
     "(SELECT 1 FROM inner_t WHERE inner_t.k + 1000 = outer_t.k)");
-  compare_gpu_vs_cpu(
+  compare_lowered_gpu_vs_cpu(
     "SELECT id FROM outer_t WHERE NOT EXISTS "
     "(SELECT 1 FROM inner_t WHERE inner_t.k + 1000 = outer_t.k)");
 }
@@ -129,7 +207,10 @@ TEST_CASE_METHOD(DelimDirectFixture,
                  "gpu_execution delim-direct matches the knob-off delim lowering",
                  "[integration][gpu_execution][delim_direct]")
 {
-  // A/B the same queries through the regular delim lowering; both must match CPU.
+  // A/B the same queries through the regular delim lowering; both must match CPU. The delim
+  // precondition holds for both legs (the knob only selects how Sirius lowers the delim).
+  require_lowerable_delim_plan(exists_sql);
+  require_lowerable_delim_plan(not_exists_sql);
   run_ok("SET enable_delim_direct_lowering = false;");
   try {
     compare_gpu_vs_cpu(exists_sql);
@@ -147,14 +228,19 @@ TEST_CASE_METHOD(DelimDirectFixture,
                  "gpu_execution delim-direct two-key EXISTS/NOT EXISTS matches CPU",
                  "[integration][gpu_execution][delim_direct][nulls]")
 {
-  // Compound correlation (two dedup keys, both constrained). NULL-keyed outer rows are
-  // excluded by EXISTS and kept by NOT EXISTS, per key vector.
-  compare_gpu_vs_cpu(
+  // Compound correlation (two dedup keys, both constrained), so the lowered join carries two
+  // conditions and apply's per-condition key substitution executes beyond n = 1. NULL-keyed
+  // outer rows are excluded by EXISTS and kept by NOT EXISTS, per key vector. (The modulo form
+  // of the all-matching filter is load-bearing: qty is a correlation key — see the file
+  // comment.)
+  compare_lowered_gpu_vs_cpu(
     "SELECT id FROM outer_t WHERE EXISTS "
-    "(SELECT 1 FROM inner_t WHERE inner_t.k = outer_t.k AND inner_t.qty = outer_t.id)");
-  compare_gpu_vs_cpu(
+    "(SELECT 1 FROM inner_t WHERE inner_t.k = outer_t.k AND inner_t.qty = outer_t.id "
+    "AND qty % 1000 > -1000)");
+  compare_lowered_gpu_vs_cpu(
     "SELECT id FROM outer_t WHERE NOT EXISTS "
-    "(SELECT 1 FROM inner_t WHERE inner_t.k = outer_t.k AND inner_t.qty = outer_t.id)");
+    "(SELECT 1 FROM inner_t WHERE inner_t.k = outer_t.k AND inner_t.qty = outer_t.id "
+    "AND qty % 1000 > -1000)");
 }
 
 TEST_CASE_METHOD(DelimDirectFixture,
@@ -163,11 +249,31 @@ TEST_CASE_METHOD(DelimDirectFixture,
 {
   // IS NOT DISTINCT FROM correlation: NULL outer keys DO match the NULL inner key here, for
   // both the EXISTS and NOT EXISTS forms — the null-safe/null-safe pairing the classifier
-  // accepts, executed end-to-end.
-  compare_gpu_vs_cpu(
+  // accepts, executed end-to-end through the direct join.
+  compare_lowered_gpu_vs_cpu(
     "SELECT id FROM outer_t WHERE EXISTS "
-    "(SELECT 1 FROM inner_t WHERE inner_t.k IS NOT DISTINCT FROM outer_t.k)");
-  compare_gpu_vs_cpu(
+    "(SELECT 1 FROM inner_t WHERE inner_t.k IS NOT DISTINCT FROM outer_t.k AND qty > -1000)");
+  compare_lowered_gpu_vs_cpu(
     "SELECT id FROM outer_t WHERE NOT EXISTS "
-    "(SELECT 1 FROM inner_t WHERE inner_t.k IS NOT DISTINCT FROM outer_t.k)");
+    "(SELECT 1 FROM inner_t WHERE inner_t.k IS NOT DISTINCT FROM outer_t.k AND qty > -1000)");
+}
+
+TEST_CASE_METHOD(DelimDirectFixture,
+                 "gpu_execution delim-direct mixed null-safe and plain-equality correlation "
+                 "matches CPU",
+                 "[integration][gpu_execution][delim_direct][nulls]")
+{
+  // Two correlated conditions of different comparison kinds on one lowered join: the null-safe
+  // key (k) lets a NULL outer key match the NULL inner key, while the plain `=` key (id) never
+  // matches NULL — the pairing the null_safety proof admits, executed end-to-end. (The modulo
+  // form of the all-matching filter is load-bearing: qty is a correlation key — see the file
+  // comment.)
+  compare_lowered_gpu_vs_cpu(
+    "SELECT id FROM outer_t WHERE EXISTS "
+    "(SELECT 1 FROM inner_t WHERE inner_t.k IS NOT DISTINCT FROM outer_t.k "
+    "AND inner_t.qty = outer_t.id AND qty % 1000 > -1000)");
+  compare_lowered_gpu_vs_cpu(
+    "SELECT id FROM outer_t WHERE NOT EXISTS "
+    "(SELECT 1 FROM inner_t WHERE inner_t.k IS NOT DISTINCT FROM outer_t.k "
+    "AND inner_t.qty = outer_t.id AND qty % 1000 > -1000)");
 }
