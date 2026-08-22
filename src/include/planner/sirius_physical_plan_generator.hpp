@@ -197,13 +197,6 @@ class sirius_physical_plan_generator {
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_delim_join(
     duckdb::LogicalComparisonJoin& op);
 
-  //! Fused count-join fast path: when @p op is a single-COUNT aggregate grouped exactly by the
-  //! preserved-side key of a LEFT/RIGHT single-integer-equality comparison join, plan the join
-  //! children directly under a DENSE_COUNT_JOIN operator (skipping the join, the hoist
-  //! projection, the group-by, and all their partition/merge wraps). Returns nullptr when the
-  //! shape or the internal dense-count policy declines, letting the caller take the normal
-  //! aggregate path. A DuckDB SET override is registered only when
-  //! `SIRIUS_ENABLE_TEST_OPTIONS=1` is set during extension initialization.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_dense_count_join(
     duckdb::LogicalAggregate& op);
 

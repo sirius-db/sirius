@@ -14,15 +14,6 @@
  * limitations under the License.
  */
 
-/**
- * @file test_physical_dense_count_join.cpp
- * @brief Execution-semantics tests for DENSE_COUNT_JOIN: exact LEFT-outer COUNT semantics
- *        (zero-count groups), COUNT(col) NULL handling via the validity mask, NULL join keys
- *        (skipped on the counted side, the SQL NULL group on the preserved side), duplicate
- *        preserved keys, offset key ranges, dense-gate positive/negative (the sparse
- *        eager-aggregation strategy must be byte-equivalent), and empty sides.
- */
-
 #include "helper/type_conversions.hpp"
 #include "operator_test_utils.hpp"
 
@@ -47,7 +38,7 @@ using namespace sirius::test::operator_utils;
 
 namespace {
 
-/// A group row: key (nullopt = SQL NULL group) and its COUNT value.
+// nullopt denotes the SQL NULL group.
 using group_row = std::pair<std::optional<int64_t>, int64_t>;
 
 template <typename KeyT>
@@ -96,18 +87,15 @@ std::vector<group_row> run_dense_count_join(
       validity[i] ? std::optional<int64_t>(static_cast<int64_t>(keys[i])) : std::nullopt,
       counts[i]);
   }
-  // Sort for order-insensitive comparison (the sparse strategy's output order is unspecified);
-  // nullopt (the SQL NULL group) sorts first under std::optional ordering.
+  // Sparse output order is unspecified.
   std::sort(rows.begin(), rows.end());
   return rows;
 }
 
 constexpr uint64_t k_default_max_bytes = 2ULL * 1024 * 1024 * 1024;
-// Forces the sparse strategy for every test range: 8 bytes admits only a single u32
-// presence+counts slot pair, and all tests use key ranges of at least 2.
+// Eight bytes admit one u32 presence/count slot and force these tests through the sparse path.
 constexpr uint64_t k_tiny_max_bytes = 8;
 
-/// Two-column counted batch [key, value] with per-row value validity.
 std::shared_ptr<cucascade::data_batch> make_counted_batch(cucascade::memory::memory_space& space,
                                                           const std::vector<int32_t>& keys,
                                                           const std::vector<int64_t>& values,
@@ -127,19 +115,15 @@ TEST_CASE("dense_count_join: zero-count outer groups, duplicates, out-of-range c
   auto* space = get_default_gpu_space();
   REQUIRE(space);
 
-  // Preserved keys across two batches: 1..6 with key 2 duplicated.
   std::vector<std::shared_ptr<cucascade::data_batch>> preserved{
     make_numeric_batch<int32_t>(*space, {1, 2, 2, 3}, cudf::type_id::INT32),
     make_numeric_batch<int32_t>(*space, {4, 5, 6}, cudf::type_id::INT32)};
-  // Counted keys: 2->2 rows, 3->1, 5->3; 99 matches no preserved key (dropped exactly).
   std::vector<std::shared_ptr<cucascade::data_batch>> counted{
     make_counted_batch(*space,
                        {2, 2, 3, 5, 5, 5, 99},
                        {10, 10, 10, 10, 10, 10, 10},
                        {true, true, true, true, true, true, true})};
 
-  // Duplicate preserved key 2 doubles its group count (2 rows x 2 matches = 4), and every
-  // unmatched key emits COUNT(col) = 0 — the q13 c_count=0 bucket.
   const std::vector<group_row> expected{{1, 0}, {2, 4}, {3, 1}, {4, 0}, {5, 3}, {6, 0}};
 
   SECTION("dense strategy")
@@ -171,12 +155,9 @@ TEST_CASE("dense_count_join: NULL keys and COUNT(col) NULL semantics", "[dense_c
   auto* space = get_default_gpu_space();
   REQUIRE(space);
 
-  // Preserved: keys {1, 2, 2} plus two NULL-key rows (their own SQL group).
   std::vector<std::shared_ptr<cucascade::data_batch>> preserved{
     make_numeric_batch_with_nulls<int32_t>(
       *space, {1, 2, 2, 0, 0}, {true, true, true, false, false}, cudf::type_id::INT32)};
-  // Counted: key 1 has one valid and one NULL value row; key 2 has two valid rows; key 0
-  // matches no preserved key (the preserved 0-storage rows are NULL, and NULL never equals 0).
   std::vector<std::shared_ptr<cucascade::data_batch>> counted{make_counted_batch(
     *space, {1, 1, 2, 2, 0}, {10, 0, 10, 10, 10}, {true, false, true, true, true})};
 
@@ -193,8 +174,6 @@ TEST_CASE("dense_count_join: NULL keys and COUNT(col) NULL semantics", "[dense_c
                                                 std::size_t{1},
                                                 max_bytes,
                                                 strategy);
-      // Key 0 in the counted side matches nothing (preserved key 0 rows are NULL, and
-      // NULL = 0 is not a join match).
       REQUIRE(rows == expected);
     }
   }
@@ -223,8 +202,6 @@ TEST_CASE("dense_count_join: NULL counted keys never match", "[dense_count_join]
 
   std::vector<std::shared_ptr<cucascade::data_batch>> preserved{
     make_numeric_batch<int32_t>(*space, {0, 1}, cudf::type_id::INT32)};
-  // Counted keys: {0, NULL, NULL}; a NULL counted key must not match preserved key 0 even
-  // though the null-slot's underlying storage value is 0.
   auto counted_keys = make_numeric_batch_with_nulls<int32_t>(
     *space, {0, 0, 0}, {true, false, false}, cudf::type_id::INT32);
 
@@ -248,7 +225,6 @@ TEST_CASE("dense_count_join: offset BIGINT key range", "[dense_count_join]")
   auto* space = get_default_gpu_space();
   REQUIRE(space);
 
-  // Keys far from zero: the histogram is addressed relative to the runtime min.
   std::vector<std::shared_ptr<cucascade::data_batch>> preserved{make_numeric_batch<int64_t>(
     *space, {1000000007LL, 1000000009LL, 1000000010LL}, cudf::type_id::INT64)};
   std::vector<std::shared_ptr<cucascade::data_batch>> counted{
@@ -308,8 +284,6 @@ TEST_CASE("dense_count_join: negative and zero keys address the offset histogram
   auto* space = get_default_gpu_space();
   REQUIRE(space);
 
-  // min_key < 0 exercises the signed side of the offset addressing; counted key 5 lies
-  // outside [-3, 1] and must be dropped as unmatched.
   std::vector<std::shared_ptr<cucascade::data_batch>> preserved{
     make_numeric_batch<int32_t>(*space, {-3, -2, 0, 1}, cudf::type_id::INT32)};
   std::vector<std::shared_ptr<cucascade::data_batch>> counted{
@@ -336,10 +310,6 @@ TEST_CASE("dense_count_join: duplicate keys across batches accumulate on both si
   auto* space = get_default_gpu_space();
   REQUIRE(space);
 
-  // Preserved key 2 is duplicated ACROSS batches (dense: two accumulate_preserved calls;
-  // sparse: the preserved partial merge sums multiplicities), and counted key 2 rows are
-  // split across batches (dense: two accumulate_counted calls; sparse: the counted partial
-  // merge sums match counts).
   std::vector<std::shared_ptr<cucascade::data_batch>> preserved{
     make_numeric_batch<int32_t>(*space, {1, 2}, cudf::type_id::INT32),
     make_numeric_batch<int32_t>(*space, {2}, cudf::type_id::INT32),
@@ -349,7 +319,6 @@ TEST_CASE("dense_count_join: duplicate keys across batches accumulate on both si
     make_numeric_batch<int32_t>(*space, {2}, cudf::type_id::INT32),
     make_numeric_batch<int32_t>(*space, {3}, cudf::type_id::INT32)};
 
-  // presence(2)=2, matched(2)=2 -> 4; presence(3)=1, matched(3)=1 -> 1; key 1 unmatched -> 0.
   const std::vector<group_row> expected{{1, 0}, {2, 4}, {3, 1}};
   for (auto [max_bytes, strategy] :
        {std::pair{k_default_max_bytes, sirius_physical_dense_count_join::strategy::DENSE},
@@ -372,9 +341,6 @@ TEST_CASE("dense_count_join: wide (u64) histogram slots match the u32 result", "
   auto mr     = get_resource_ref(*space);
   auto stream = default_stream();
 
-  // The widening trigger needs >= 2^32 rows per side, but the u64 slot path itself is
-  // directly constructible: run both widths over the same small data and require identical
-  // output. Domain [5, 8]; counted keys 9 and 4 are out of range and must be dropped.
   auto preserved = make_numeric_batch<int32_t>(*space, {5, 6, 6, 8}, cudf::type_id::INT32);
   auto counted   = make_numeric_batch<int32_t>(*space, {6, 6, 6, 9, 4}, cudf::type_id::INT32);
   auto const preserved_keys = sirius::get_cudf_table_view(*preserved).column(0);
@@ -394,7 +360,6 @@ TEST_CASE("dense_count_join: wide (u64) histogram slots match the u32 result", "
     auto const keys   = copy_column_to_host<int32_t>(table->view().column(0));
     auto const counts = copy_column_to_host<int64_t>(table->view().column(1));
     REQUIRE(keys == std::vector<int32_t>{5, 6, 8});
-    // presence(6)=2 x matched(6)=3 -> 6; 5 and 8 exist with zero matches.
     REQUIRE(counts == std::vector<int64_t>{0, 6, 0});
   }
 }

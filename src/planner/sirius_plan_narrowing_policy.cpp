@@ -446,10 +446,8 @@ carried_columns analyze_subtree(sirius::op::sirius_physical_operator& op, policy
         break;
       }
 
-      // Dense-count execution consumes both key values at native width. COUNT(col) reads
-      // only the value column's validity mask, and all other child columns are ignored, so none
-      // of those carriers needs a restore. The fused operator always emits its declared native
-      // [key, BIGINT] schema and therefore forwards no candidate carrier.
+      // Keys require native values; COUNT(col) uses only its validity mask. Output is native
+      // [key, BIGINT] with no forwarded carrier.
       auto mark_key = [&state](carried_columns const& side, std::size_t key_idx) {
         if (side[key_idx]) { state.candidates[*side[key_idx]].boundary_restore = true; }
       };

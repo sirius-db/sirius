@@ -128,19 +128,10 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
                          estimated_cardinality);
 }
 
-//===----------------------------------------------------------------------===//
-// Dense count-join detection
-//===----------------------------------------------------------------------===//
-
-/// Immutable result of the pure DENSE_COUNT_JOIN eligibility matcher.
 struct dense_count_join_detection {
-  /// Which join child is the outer-preserved (grouped) input: 0 for LEFT, 1 for RIGHT.
-  std::size_t preserved_child = 0;
-  /// Join-key column index within the preserved child's output.
+  std::size_t preserved_child   = 0;
   std::size_t preserved_key_idx = 0;
-  /// Join-key column index within the counted child's output.
-  std::size_t counted_key_idx = 0;
-  /// COUNT(col) argument index within the counted child's output; nullopt for COUNT(*).
+  std::size_t counted_key_idx   = 0;
   std::optional<std::size_t> counted_value_idx;
 };
 
@@ -149,7 +140,6 @@ struct join_projection_layout {
   std::size_t right_output_count;
 };
 
-/// Validate both projection maps before any ordinal is dereferenced.
 static std::optional<join_projection_layout> validate_join_projection_layout(
   const duckdb::LogicalComparisonJoin& join)
 {
@@ -167,7 +157,6 @@ static std::optional<join_projection_layout> validate_join_projection_layout(
     join.right_projection_map.empty() ? right_width : join.right_projection_map.size()};
 }
 
-/// Map a validated join-output ordinal to (child, child-column ordinal).
 static std::optional<std::pair<std::size_t, std::size_t>> resolve_join_output_column(
   const duckdb::LogicalComparisonJoin& join,
   const join_projection_layout& layout,
@@ -183,12 +172,7 @@ static std::optional<std::pair<std::size_t, std::size_t>> resolve_join_output_co
     1, join.right_projection_map.empty() ? right_pos : join.right_projection_map[right_pos]};
 }
 
-/// True when @p node is a linear GET/FILTER/PROJECTION chain down to a childless GET leaf.
-/// The DENSE_COUNT_JOIN gate requires this of both join children so the PLANNED physical
-/// subtree roots are unary-or-leaf under every planner transformation — in particular,
-/// push_projection may ELIDE an identity projection root, exposing whatever sits below it, so
-/// checking only the root type would let a projection-over-join child through and later
-/// surface a multi-child physical root.
+// Identity projections may be elided, so require the entire child to be a unary scan chain.
 static bool is_linear_scan_chain(const duckdb::LogicalOperator& node)
 {
   const duckdb::LogicalOperator* current = &node;
@@ -206,13 +190,8 @@ static bool is_linear_scan_chain(const duckdb::LogicalOperator& node)
   }
 }
 
-/// Authenticate COUNT against DuckDB's host system catalog.
-///
-/// The loadable extension contains a hidden DuckDB copy, so comparing a bound host function to
-/// CountFunctionBase::GetFunction() from this DSO compares different callback addresses. Instead,
-/// locate the one canonical system-catalog overload and compare two host-owned function objects.
-/// Metadata checks keep optimizer-created functions with empty provenance eligible while rejecting
-/// user-defined aggregates that merely reuse the built-in name.
+// The extension's hidden DuckDB copy has different callback addresses from bound host functions.
+// Compare host-owned catalog functions while rejecting user aggregates that reuse COUNT's name.
 static std::optional<sirius::aggregate_id> exact_builtin_count_id(
   duckdb::ClientContext& context, const duckdb::BoundAggregateExpression& aggr)
 {
@@ -241,9 +220,6 @@ static std::optional<sirius::aggregate_id> exact_builtin_count_id(
     return std::nullopt;
   }
 
-  // DuckDB registers both COUNT(expr) and COUNT(*) in the "count" function set and normalizes
-  // both catalog overload names to "count". Bound and optimizer-created COUNT(*) expressions
-  // use "count_star"; callback equality below authenticates them against the nullary overload.
   auto& entry =
     duckdb::Catalog::GetSystemCatalog(context).GetEntry<duckdb::AggregateFunctionCatalogEntry>(
       context, DEFAULT_SCHEMA, "count");
@@ -263,14 +239,9 @@ static std::optional<sirius::aggregate_id> exact_builtin_count_id(
   return aggregate_id;
 }
 
-/// Pure shape detection for the DENSE_COUNT_JOIN rewrite. Every gate is exact: it only reads
-/// resolved BOUND_REF indices, immutable system-catalog function metadata, and the
-/// join/aggregate structure — no statistics, no estimates — so a positive detection can never
-/// change query semantics.
 static std::optional<dense_count_join_detection> detect_dense_count_join(
   duckdb::ClientContext& context, const duckdb::LogicalAggregate& op)
 {
-  // One ordinary grouping set containing the sole group, and one aggregate.
   if (op.groups.size() != 1 || op.grouping_sets.size() != 1 || op.grouping_sets[0].size() != 1 ||
       op.grouping_sets[0].count(0) != 1 || !op.grouping_functions.empty() ||
       op.expressions.size() != 1) {
@@ -294,7 +265,6 @@ static std::optional<dense_count_join_detection> detect_dense_count_join(
   }
   if (is_count_star && !aggr.children.empty()) { return std::nullopt; }
 
-  // Child must be a plain outer comparison join with one integer equality condition.
   if (op.children.size() != 1 ||
       op.children[0]->type != duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
     return std::nullopt;
@@ -351,14 +321,10 @@ static std::optional<dense_count_join_detection> detect_dense_count_join(
   det.preserved_child             = join.join_type == duckdb::JoinType::LEFT ? 0 : 1;
   const std::size_t counted_child = 1 - det.preserved_child;
 
-  // Restrict each join child to a linear GET/FILTER/PROJECTION chain so the operator's
-  // pipeline construction (one pipeline per child subtree, child root as sink) holds for the
-  // planned physical roots under every planner transformation (see is_linear_scan_chain).
   for (auto const& child : join.children) {
     if (!is_linear_scan_chain(*child)) { return std::nullopt; }
   }
 
-  // The group key must be exactly the preserved side's join key.
   auto const& group_ref = op.groups[0]->Cast<duckdb::BoundReferenceExpression>();
   if (group_ref.index >= join_output_width ||
       group_ref.return_type != join.types[group_ref.index]) {
@@ -421,7 +387,6 @@ sirius_physical_plan_generator::try_plan_dense_count_join(duckdb::LogicalAggrega
   preserved->estimated_cardinality = preserved_cardinality;
   counted->estimated_cardinality   = counted_cardinality;
   if (preserved->children.size() > 1 || counted->children.size() > 1) {
-    // Unreachable with the logical-shape gate: this is an internal planner invariant.
     throw sirius::internal_exception(
       "dense_count_join: eligible logical child produced a non-unary physical root");
   }
@@ -672,8 +637,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
     reject_nested_column_operation(*group, "GROUP BY");
   }
 
-  // Fuse COUNT grouped by the preserved-side key of an outer equi-join into one
-  // DENSE_COUNT_JOIN operator.
   if (auto fused = try_plan_dense_count_join(op)) { return fused; }
 
   auto plan = create_plan(*op.children[0]);

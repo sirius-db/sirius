@@ -14,11 +14,10 @@
  * limitations under the License.
  */
 
-// sirius
+// clang-format off
 #include <op/aggregate/dense_count_join_impl.hpp>
 #include <sirius/exception.hpp>
 
-// cudf
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
@@ -27,15 +26,12 @@
 #include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/error.hpp>
 
-// rmm
 #include <rmm/exec_policy.hpp>
 
-// thrust
 #include <thrust/copy.h>
 #include <thrust/count.h>
 #include <thrust/iterator/counting_iterator.h>
 
-// cuda
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
@@ -46,6 +42,7 @@
 #include <optional>
 #include <utility>
 #include <vector>
+// clang-format on
 
 namespace sirius::op {
 
@@ -126,10 +123,6 @@ __device__ __forceinline__ void histogram_add(uint64_t* slot)
   atomicAdd(reinterpret_cast<unsigned long long*>(slot), 1ULL);
 }
 
-/// Grid-stride histogram accumulation. A row contributes iff its key is valid, the optional
-/// second validity mask (the COUNT(col) argument) is valid at that row, and — when
-/// @p bounds_check — the key lies inside [min_key, min_key + range). Preserved-side keys skip
-/// the bounds check (the histogram was sized from their global min/max).
 template <typename KeyT, typename CountT>
 __global__ void accumulate_kernel(KeyT const* __restrict__ keys,
                                   cudf::bitmask_type const* __restrict__ key_mask,
@@ -153,10 +146,7 @@ __global__ void accumulate_kernel(KeyT const* __restrict__ keys,
         !cudf::bit_is_set(value_mask, value_mask_offset + static_cast<cudf::size_type>(i))) {
       continue;
     }
-    // Unsigned offset arithmetic: defined for ANY int64 key/min_key pair (a signed
-    // subtraction could overflow for extreme counted-side keys). An in-domain key yields
-    // offset < range exactly; every out-of-domain key — including ones whose signed
-    // subtraction would have wrapped — lands at offset >= range and is dropped.
+    // Unsigned subtraction avoids signed overflow; offset < range exactly for in-domain keys.
     auto const offset =
       static_cast<uint64_t>(static_cast<int64_t>(keys[i])) - static_cast<uint64_t>(min_key);
     if (bounds_check && offset >= static_cast<uint64_t>(range)) { continue; }
@@ -170,8 +160,6 @@ struct presence_positive {
   __device__ bool operator()(int64_t k) const { return presence[k] != CountT{0}; }
 };
 
-/// Write the output rows for the selected (presence > 0) slots, in ascending key order.
-/// COUNT(col): value = presence * counts. COUNT(*): value = presence * max(counts, 1).
 template <typename KeyT, typename CountT>
 __global__ void emit_kernel(int64_t const* __restrict__ selected,
                             int64_t num_selected,
@@ -272,9 +260,7 @@ void accumulate_impl(cudf::column_view const& keys,
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
-/// Zero-filled trailing NULL-group row: key storage is zeroed (deterministic bytes under the
-/// null), the key null mask marks it NULL, and the value is `null_group_rows` for COUNT(*)
-/// (each unmatched NULL-key preserved row survives the outer join) or 0 for COUNT(col).
+// Zero the key payload so bytes beneath the NULL are deterministic.
 template <typename KeyT>
 __global__ void write_null_group_kernel(
   KeyT* key, int64_t* value, cudf::size_type row, bool count_star, int64_t null_group_rows)
@@ -341,8 +327,7 @@ std::unique_ptr<cudf::table> emit_impl(CountT const* presence,
   if (null_group_rows < 0) {
     throw sirius::internal_exception("dense_count_join: negative NULL-group row count");
   }
-  // Route thrust/cub temporary storage through the memory space's resource so pool
-  // accounting stays honest (the single-argument overload would use the device default).
+  // Use this memory space's resource for Thrust/CUB temporaries so reservations account for them.
   auto const policy = rmm::exec_policy(stream, mr);
   auto const begin  = thrust::make_counting_iterator<int64_t>(0);
   auto const end    = thrust::make_counting_iterator<int64_t>(range);
@@ -578,8 +563,7 @@ void throw_if_count_product_overflows(cudf::column_view const& lhs,
     lhs.data<int64_t>(), rhs.data<int64_t>(), static_cast<int64_t>(lhs.size()), status.data());
   CUDF_CUDA_TRY(cudaGetLastError());
 
-  // Deliberately synchronous: callers reach this function only when the cheap host upper bound
-  // cannot prove safety, so it adds no synchronization to the normal path.
+  // This rare-path validation synchronizes only when the host bound cannot prove safety.
   auto const result = status.value(stream);
   if (result == 2) {
     throw sirius::internal_exception(

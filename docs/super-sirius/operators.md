@@ -349,16 +349,11 @@ Hash-based GROUP BY.
 ### `sirius_physical_dense_count_join` — `DENSE_COUNT_JOIN`
 **File:** `src/include/op/sirius_physical_dense_count_join.hpp`, `src/op/sirius_physical_dense_count_join.cpp`, kernels in `src/cuda/dense_count_join_impl.cu`
 
-Fused count-join: computes `COUNT(col | *) GROUP BY <preserved-side join key>` over a LEFT/RIGHT single-integer-equality comparison join without materializing the join. Created by the planner rewrite `sirius_physical_plan_generator::try_plan_dense_count_join`, which replaces the HASH_JOIN + hoist PROJECTION + HASH_GROUP_BY fragment — and all of their PARTITION/CONCAT/MERGE wraps — with this single operator. Children are normalized: `children[0]` = preserved (grouped) side, `children[1]` = counted side; each child must be a linear GET/FILTER/PROJECTION chain.
+Fuses eligible `COUNT(col | *) GROUP BY key` over a preserved-side outer equi-join, replacing the
+partitioned join and aggregate fragment. Children are normalized as [preserved, counted].
 
-- **Status and capacity:** enabled by default. The current FULL/FULL design drains both complete inputs in one task, so both inputs, the output, and workspace must fit the memory available to one GPU task. Ineligible plans, or configurations that disable the optimization, retain the partitioned HASH_JOIN plus HASH_GROUP_BY plan.
-- **Planner eligibility:** authenticates `COUNT`/`COUNT(*)` against DuckDB's host system catalog. Optimizer-created `COUNT(*)` with empty provenance remains eligible; a user aggregate that only reuses a built-in name does not.
-- **Ports:** two FULL-barrier inputs, `"preserved"` and `"counted"`. The operator owns their child-identity mapping through `input_port_for`; one task drains both sides once both child pipelines finish. The hint override returns READY when both producers finished and any port is non-empty (an empty counted side must still emit the all-zero-count groups).
-- **GPU execution:** strategy chosen from the ACTUAL preserved-key min/max (`cudf::minmax`, never estimates):
-  - *dense* — `presence` + `counts` direct-address histograms over `[min, max]` (`dense_count_state`); duplicate/missing preserved keys are exact via the presence histogram, `COUNT(col)` NULL semantics via the argument's validity mask, out-of-range counted keys drop as unmatched, u32 slots widen to u64 when either side has at least `UINT32_MAX` rows; value = `presence * counts` (`COUNT(col)`) or `presence * max(counts, 1)` (`COUNT(*)`); NULL preserved keys emit the single SQL NULL group.
-  - *sparse* — exact cuDF eager aggregation (per-batch groupby-count partials, groupby-sum merge, `cudf::left_join` of the distinct preserved keys) when the key domain exceeds the direct-address histogram budget.
-- **Configuration:** enabled by default; disable it at startup with the strict boolean YAML key `sirius.operator_params.enable_dense_count_join: false`. `dense_count_join_max_bytes` remains engine-owned and is rejected in YAML. Test builds can expose session overrides for both fields with `SIRIUS_ENABLE_TEST_OPTIONS=1`.
-- **Key members:** `preserved_key_idx`, `counted_key_idx`, `counted_value_idx` (nullopt = `COUNT(*)`), `max_bins_bytes`, `last_strategy`
+Both inputs are FULL barriers. Execution uses direct-address histograms or exact sparse aggregation;
+ineligible and disabled plans retain the standard path. See [Configuration](configuration.md).
 
 ## Pipeline Breakers (Sirius-Specific)
 
@@ -480,7 +475,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | MERGE_AGGREGATE | Agg | Merge ungrouped partitions |
 | MERGE_GROUP_BY | Agg | Merge grouped partitions |
 | HASH_JOIN | Join | `cudf::{inner,left,right,outer}_join()`, `cudf::distinct_hash_join`, or `cudf::{filtered,mark}_join` (MARK) |
-| DENSE_COUNT_JOIN | Join+Agg | Direct-address count histograms (`dense_count_state`) or exact sparse eager aggregation (`cudf::groupby` + `cudf::left_join`) |
+| DENSE_COUNT_JOIN | Join+Agg | Fused dense/sparse COUNT over an outer join |
 | NESTED_LOOP_JOIN | Join | Fallback nested loops |
 | LEFT_DELIM_JOIN | Join | Correlated subquery wrapper |
 | RIGHT_DELIM_JOIN | Join | Correlated subquery wrapper |

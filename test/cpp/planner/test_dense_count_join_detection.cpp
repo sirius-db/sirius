@@ -14,15 +14,6 @@
  * limitations under the License.
  */
 
-/**
- * @file test_dense_count_join_detection.cpp
- * @brief Plan-time gates for the DENSE_COUNT_JOIN rewrite: the q13 shape (COUNT over an outer
- *        equi-join grouped by the preserved-side key) fuses into one operator with no HASH_JOIN
- *        and no inner HASH_GROUP_BY, while every off-shape variant (inner join, non-key group,
- *        multiple aggregates, DISTINCT, non-COUNT aggregate, disabled knob) keeps the normal
- *        join + aggregate plan.
- */
-
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_dense_count_join.hpp"
@@ -66,8 +57,8 @@ using namespace duckdb;
 
 namespace {
 
-/// RAII on-disk DuckDB path: the GPU-native seq_scan ingestible refuses non-single-file
-/// block managers, so these tests need an on-disk database rather than :memory:.
+// The GPU seq_scan ingestible requires a single-file block manager, so these tests use an
+// on-disk database.
 class scoped_temp_db_path {
  public:
   scoped_temp_db_path()
@@ -181,7 +172,6 @@ bool assign_non_system_count_provenance(duckdb::LogicalOperator& op)
   return true;
 }
 
-/// Generate a Sirius physical plan from a SQL query string.
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
   Connection& con, const std::string& query, plan_generation_options options = {})
 {
@@ -273,7 +263,6 @@ void require_q13_counted_filter(sirius::op::sirius_physical_operator* preserved,
   REQUIRE(filter != nullptr);
   REQUIRE(column_index < counted_scan.column_ids.size());
   REQUIRE(counted_scan.column_ids[column_index].HasPrimaryIndex());
-  // The fixture's sole predicate is on ord.o_note, storage column 2.
   CHECK(counted_scan.column_ids[column_index].GetPrimaryIndex() == 2);
 }
 
@@ -291,13 +280,9 @@ struct dense_count_join_fixture {
     REQUIRE(enabled != nullptr);
     REQUIRE_FALSE(enabled->HasError());
 
-    // q13 shape: customers (preserved) vs orders (counted); orders is larger so the join
-    // orientation matches TPC-H (either LEFT or RIGHT is accepted by the gate).
     con->Query("CREATE TABLE cust (c_id INTEGER, c_grp INTEGER)");
     con->Query("INSERT INTO cust SELECT range, range % 3 FROM range(20)");
-    // A NULL c_grp keeps DuckDB's optimizer from rewriting count(c_grp) into count_star()
-    // (which WOULD be a legitimate fusion target); the preserved-side-count decline test
-    // below needs the count(col) shape to survive optimization.
+    // Keep c_grp nullable so DuckDB does not rewrite count(c_grp) to count_star().
     con->Query("INSERT INTO cust VALUES (100, NULL)");
     con->Query("CREATE TABLE ord (o_id BIGINT, o_cust INTEGER, o_note VARCHAR)");
     con->Query(
@@ -313,7 +298,6 @@ struct dense_count_join_fixture {
     using T          = sirius::op::SiriusPhysicalOperatorType;
     auto const fused = collect(plan.get(), T::DENSE_COUNT_JOIN);
     if (fused.empty()) { return false; }
-    // Whenever the rewrite fires the join and the inner group-by must be gone.
     REQUIRE(fused.size() == 1);
     REQUIRE(collect(plan.get(), T::HASH_JOIN).empty());
     REQUIRE(collect(plan.get(), T::NESTED_LOOP_JOIN).empty());
@@ -335,7 +319,6 @@ TEST_CASE_METHOD(dense_count_join_fixture,
   auto const query =
     "SELECT c_id, count(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id";
   REQUIRE(has_dense_count_join(query));
-  // The fused plan has no HASH_GROUP_BY at all: the only aggregate was the rewritten one.
   auto plan = generate_sirius_plan(*con, query);
   REQUIRE(collect(plan.get(), sirius::op::SiriusPhysicalOperatorType::HASH_GROUP_BY).empty());
 }
@@ -369,7 +352,6 @@ TEST_CASE_METHOD(dense_count_join_fixture,
   CHECK(collect(fused[0]->children[0].get(), T::FILTER).empty());
   CHECK(collect(fused[0]->children[1].get(), T::FILTER).empty());
   require_q13_counted_filter(fused[0]->children[0].get(), fused[0]->children[1].get());
-  // Exactly the outer distribution group-by survives.
   REQUIRE(collect(plan.get(), T::HASH_GROUP_BY).size() == 1);
 }
 
@@ -441,24 +423,18 @@ TEST_CASE_METHOD(dense_count_join_fixture,
                  "dense_count_join declines off-shape aggregates and joins",
                  "[dense_count_join][plan]")
 {
-  // INNER join: no preserved side.
   CHECK_FALSE(has_dense_count_join(
     "SELECT c_id, count(o_id) FROM cust JOIN ord ON c_id = o_cust GROUP BY c_id"));
-  // Grouped by a non-key column.
   CHECK_FALSE(has_dense_count_join(
     "SELECT c_grp, count(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_grp"));
-  // Two aggregates.
   CHECK_FALSE(has_dense_count_join(
     "SELECT c_id, count(o_id), max(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY "
     "c_id"));
-  // DISTINCT count.
   CHECK_FALSE(has_dense_count_join(
     "SELECT c_id, count(DISTINCT o_id) FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id"));
-  // Non-COUNT aggregate.
   CHECK_FALSE(has_dense_count_join(
     "SELECT c_id, sum(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id"));
-  // COUNT of a nullable preserved-side column (different NULL semantics; a NON-null
-  // preserved-side count is rewritten to count_star() by DuckDB itself and legitimately fuses).
+  // A nullable preserved-side COUNT has different outer-join NULL semantics.
   CHECK_FALSE(has_dense_count_join(
     "SELECT c_id, count(c_grp) FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id"));
 }
@@ -529,27 +505,21 @@ TEST_CASE_METHOD(dense_count_join_fixture,
                  "non-plain keys",
                  "[dense_count_join][plan]")
 {
-  // Aggregate FILTER clause: the filtered count is not a plain per-group match count.
   CHECK_FALSE(has_dense_count_join(
     "SELECT c_id, count(o_id) FILTER (WHERE o_id > 0) FROM cust LEFT JOIN ord ON c_id = o_cust "
     "GROUP BY c_id"));
-  // More than one join condition.
   CHECK_FALSE(has_dense_count_join(
     "SELECT c_id, count(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust AND c_grp = o_cust "
     "GROUP BY c_id"));
-  // A preserved-side-only ON residual cannot be pushed below a LEFT join: filtering that child
-  // would incorrectly remove the rows the outer join must retain. Once the dense rewrite
-  // declines it, the generic Sirius planner reports this non-equi residual as unsupported.
+  // A preserved-side ON residual cannot move below LEFT JOIN without dropping retained rows.
   CHECK_THROWS_WITH(
     has_dense_count_join(
       "SELECT c_id, count(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust AND c_grp > 0 "
       "GROUP BY c_id"),
     Catch::Contains("Any join not supported"));
-  // Mixed key types (INTEGER vs BIGINT): the binder inserts a CAST, which the BOUND_REF gate
-  // refuses.
+  // INTEGER = BIGINT inserts a CAST, so the plain-reference gate declines.
   CHECK_FALSE(has_dense_count_join(
     "SELECT c_id, count(o_cust) FROM cust LEFT JOIN ord ON c_id = o_id GROUP BY c_id"));
-  // IS NOT DISTINCT FROM (NULL-matches-NULL semantics must never take the fused path).
   CHECK_FALSE(has_dense_count_join(
     "SELECT c_id, count(o_id) FROM cust LEFT JOIN ord ON c_id IS NOT DISTINCT FROM o_cust "
     "GROUP BY c_id"));
@@ -559,16 +529,12 @@ TEST_CASE_METHOD(dense_count_join_fixture,
                  "dense_count_join declines intervening operators and non-linear join children",
                  "[dense_count_join][plan]")
 {
-  // A residual WHERE referencing both sides stays a FILTER between the aggregate and the
-  // join (not pushable into either child, not NULL-rejecting for o_id).
   CHECK_FALSE(
     has_dense_count_join("SELECT c_id, count(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust "
                          "WHERE (o_id IS NULL OR c_grp = 0) GROUP BY c_id"));
-  // Grouping by the COUNTED side's key is not the preserved-group shape.
   CHECK_FALSE(has_dense_count_join(
     "SELECT o_cust, count(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY o_cust"));
-  // A join-rooted counted child is not a linear GET/FILTER/PROJECTION chain (and an identity
-  // projection above it would be elided by push_projection — the chain gate must refuse).
+  // Identity projection can be elided, exposing the non-linear join child.
   CHECK_FALSE(
     has_dense_count_join("SELECT c_id, count(o.o_id) FROM cust LEFT JOIN ("
                          "  SELECT o1.o_id, o1.o_cust FROM ord o1 JOIN ord o2 ON o1.o_id = o2.o_id"

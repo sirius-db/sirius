@@ -25,12 +25,7 @@
 
 namespace sirius::test {
 
-/**
- * @brief Temporarily override a process-shared Sirius setting.
- *
- * Captures the setting's actual current value before applying the override and restores it from a
- * non-throwing destructor, including when a Catch assertion or query exception unwinds the scope.
- */
+/** Temporarily overrides a shared Sirius setting; destruction silently attempts restoration. */
 class scoped_sirius_setting final {
  public:
   scoped_sirius_setting(duckdb::Connection& connection, std::string name, bool value)

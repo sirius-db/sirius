@@ -29,7 +29,6 @@
 
 namespace sirius::test {
 
-/** @brief Build the canonical two-child dense-count operator used by planner-pass tests. */
 inline duckdb::unique_ptr<op::sirius_physical_dense_count_join> make_dense_count_join(
   std::size_t preserved_key_idx,
   std::size_t counted_key_idx,

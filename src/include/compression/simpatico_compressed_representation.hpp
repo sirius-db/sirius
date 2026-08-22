@@ -20,12 +20,7 @@
 
 namespace sirius {
 
-/**
- * @brief Lightweight RTTI base for Simpatico-compressed data representations.
- *
- * Consumers that only need to classify a representation can include this header
- * without depending on the concrete compression implementation.
- */
+/** @brief RTTI base for Simpatico-compressed data representations. */
 class simpatico_compressed_representation : public cucascade::idata_representation {
  public:
   ~simpatico_compressed_representation() override = default;
@@ -37,7 +32,6 @@ class simpatico_compressed_representation : public cucascade::idata_representati
   }
 };
 
-/** @brief Return whether @p representation stores a Simpatico-compressed payload. */
 [[nodiscard]] inline bool is_simpatico_compressed_representation(
   const cucascade::idata_representation* representation) noexcept
 {

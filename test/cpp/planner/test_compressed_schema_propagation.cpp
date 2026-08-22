@@ -19,10 +19,10 @@
  * @brief Contract tests for the compressed-materialization planner passes
  *        (`propagate_compressed_schema`, `restore_native_schema`,
  *        `prune_immediate_scan_restores`, `apply_compressed_schema_passes`) over hand-built
- *        physical operator trees: hash-join and dense-count key restoration, per-join-type output
+ *        physical operator trees: hash-join key restoration and per-join-type output-layout
  *        mapping, native boundaries for other operators, dynamic-filter scans, root restores,
- *        DELIM_JOIN sub-tree restoration, zero-benefit restore pruning (including the aliased-
- *        duplicate guard), and the unmappable-type full clear.
+ *        DELIM_JOIN sub-tree restoration, zero-benefit restore pruning (including the
+ *        aliased-duplicate guard), and the unmappable-type full clear.
  */
 
 #include "expression/aggregate_id.hpp"
@@ -267,7 +267,6 @@ void require_restore_projection_at(sirius_physical_operator const& op,
   REQUIRE(op.get_physical_types() == expected);
 }
 
-// Assert @p slot is a restore projection over key column 0, with bare references elsewhere.
 void require_key_restore_projection(sirius_physical_operator const& op,
                                     std::vector<cudf::data_type> const& expected)
 {

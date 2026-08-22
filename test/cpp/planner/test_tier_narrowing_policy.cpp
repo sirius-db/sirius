@@ -19,9 +19,9 @@
  * @brief Contract tests for `apply_tier_narrowing_policy` over hand-built physical operator
  *        trees: the per-column verdict rule (transport keeps, narrow-domain comparisons rescue,
  *        boundary restores veto, evaluator restores retract), the exact eligibility mirrors of
- *        the propagation cases (hash-join and dense-count-join keys, payload maps, the
- *        grouped-aggregate ladder, DELIM_JOIN sub-trees, unmodeled boundaries), host-tier
- *        invisibility, multi-scan independence, and pass-pipeline composition.
+ *        the propagation cases (hash-join keys and payload maps, the grouped-aggregate ladder,
+ *        DELIM_JOIN sub-trees, unmodeled boundaries), host-tier invisibility, multi-scan
+ *        independence, and the pass-pipeline composition over a Q1-shaped tree.
  */
 
 #include "expression/aggregate_id.hpp"

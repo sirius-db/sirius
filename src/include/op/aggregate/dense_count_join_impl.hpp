@@ -32,92 +32,34 @@
 
 namespace sirius::op {
 
-/**
- * @brief Find the global non-NULL extrema of integer key batches.
+/** @brief Find global non-NULL extrema across INT32 or INT64 key batches.
  *
- * Batch reductions and extrema merging stay on @p stream. The implementation performs one
- * two-value device-to-host transfer after every batch reduction has been enqueued.
+ * Returns std::nullopt for empty/all-NULL input and synchronizes @p stream once.
  */
 std::optional<std::pair<int64_t, int64_t>> dense_count_global_minmax(
   std::vector<cudf::column_view> const& keys,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr);
 
-/**
- * @brief Device-side state for the dense direct-address count-join fast path.
- *
- * Holds two histograms over the preserved-side key domain [min_key, min_key + range):
- *  - `presence[k]` — number of preserved-side rows whose key equals `min_key + k`
- *    (exact duplicate handling; a zero slot means the key does not exist and emits no group),
- *  - `counts[k]`   — number of counted-side rows whose key equals `min_key + k` and whose
- *    count column (when present) is non-NULL — exactly the per-key `COUNT(col)` contribution.
- *
- * The final aggregate value per existing key k is
- *  - `presence[k] * counts[k]` for `COUNT(counted_col)` (0 when no counted rows match — the
- *    outer-join "zero count" groups), or
- *  - `presence[k] * max(counts[k], 1)` for `COUNT(*)` (unmatched preserved rows survive an
- *    outer join as one row each).
- *
- * Histogram slots are `uint32_t` by default and widen to `uint64_t` when either side's total
- * row count could overflow a 32-bit slot, so the accumulation is exact at any scale.
- *
- * NULL semantics: callers must skip NULL keys via the column validity masks (handled inside
- * `accumulate_*`); NULL preserved keys form the SQL NULL group, appended by `emit` when
- * `null_group_rows > 0`.
+/** @brief Accumulate preserved-key multiplicities and counted matches in direct-address histograms.
  */
 class dense_count_state {
  public:
-  /**
-   * @brief Allocate and zero the two histograms.
-   *
-   * @param min_key Smallest non-NULL preserved-side key (array offset origin).
-   * @param range   Number of slots: max_key - min_key + 1. Must be > 0.
-   * @param wide    Use 64-bit slots (selected when either side has at least `UINT32_MAX` rows).
-   * @param stream  Stream for allocation and the zeroing memsets.
-   * @param mr      Device memory resource for the histograms.
-   */
   dense_count_state(int64_t min_key,
                     int64_t range,
                     bool wide,
                     rmm::cuda_stream_view stream,
                     rmm::device_async_resource_ref mr);
 
-  /**
-   * @brief Accumulate preserved-side keys into `presence`. NULL keys are skipped (they are
-   * accounted for separately as the NULL group). Every non-NULL key must lie in
-   * [min_key, min_key + range) — guaranteed when the state was sized from these columns'
-   * global min/max.
-   */
+  /** @brief Accumulate non-NULL preserved keys, which must lie in the histogram domain. */
   void accumulate_preserved(cudf::column_view const& keys, rmm::cuda_stream_view stream);
 
-  /**
-   * @brief Accumulate counted-side keys into `counts`.
-   *
-   * A row contributes iff its key is non-NULL, its key lies inside [min_key, min_key + range)
-   * (out-of-range keys cannot match any preserved key, and unmatched counted rows contribute
-   * nothing to a preserved-side outer join), and — when @p count_validity_source is given —
-   * the count column is non-NULL at that row (exact `COUNT(col)` NULL semantics).
-   *
-   * @param keys Counted-side join key column.
-   * @param count_validity_source The COUNT(col) argument column, used ONLY for its validity
-   *        mask; nullptr for COUNT(*) or a provably mask-free column.
-   */
+  /** @brief Accumulate in-domain counted keys; nullptr validity applies COUNT(*) semantics. */
   void accumulate_counted(cudf::column_view const& keys,
                           cudf::column_view const* count_validity_source,
                           rmm::cuda_stream_view stream);
 
-  /**
-   * @brief Materialize the aggregate output table: one row per key with presence > 0
-   * (ascending key order), plus one trailing NULL-key row when @p null_group_rows > 0.
-   *
-   * @param key_type Output key column type (INT32 or INT64; values fit by construction).
-   * @param count_star COUNT(*) semantics (see class comment) instead of COUNT(col).
-   * @param null_group_rows Number of NULL-key preserved rows; > 0 appends the NULL group whose
-   *        value is `null_group_rows` for COUNT(*) and 0 for COUNT(col).
-   * @param check_product_overflow Whether to validate the rare case where the host row-count
-   *        upper bound cannot prove every output COUNT fits in BIGINT.
-   * @return Two-column table [key (key_type), value (INT64)].
-   */
+  /** @brief Emit `[key, BIGINT count]`, optionally checking products for BIGINT overflow. */
   std::unique_ptr<cudf::table> emit(cudf::data_type key_type,
                                     bool count_star,
                                     int64_t null_group_rows,
@@ -140,23 +82,16 @@ class dense_count_state {
   std::optional<rmm::device_uvector<uint64_t>> _counts64;
 };
 
-/**
- * @brief Build the NULL-group-only / empty output for the degenerate cases (no non-NULL
- * preserved keys). Returns a [key (key_type), value (INT64)] table with one row when
- * @p null_group_rows > 0 (NULL key; value `null_group_rows` for COUNT(*), else 0) and zero
- * rows otherwise.
- */
+/** @brief Build the NULL-group-only or empty output when no non-NULL preserved key exists. */
 std::unique_ptr<cudf::table> dense_count_empty_output(cudf::data_type key_type,
                                                       bool count_star,
                                                       int64_t null_group_rows,
                                                       rmm::cuda_stream_view stream,
                                                       rmm::device_async_resource_ref mr);
 
-/**
- * @brief Throw when any pairwise product of two nonnegative INT64 columns exceeds BIGINT.
+/** @brief Validate equal-length, non-null INT64 products against BIGINT overflow.
  *
- * This reads a device flag back to the host. Callers should invoke it only after a cheap
- * row-count upper bound cannot prove that every product fits.
+ * Synchronizes @p stream to read the result.
  */
 void throw_if_count_product_overflows(cudf::column_view const& lhs,
                                       cudf::column_view const& rhs,

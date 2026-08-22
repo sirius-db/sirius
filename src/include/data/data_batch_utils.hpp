@@ -70,13 +70,8 @@ inline cudf::table_view get_cudf_table_view(const cucascade::read_only_data_batc
 /**
  * @brief Peak device bytes needed to materialize @p data on the GPU.
  *
- * For ordinary representations, only the logical destination lands on device,
- * so the peak equals the uncompressed size. A Simpatico representation must
- * also stage its physical payload before decompression produces that destination,
- * so both are alive simultaneously: physical_bytes + logical_bytes. Classification
- * is type-based rather than inferred from a compression ratio: equal-sized,
- * expanded, and projected Simpatico payloads still require staging. The estimate
- * saturates when the reported sizes exceed the range of std::size_t.
+ * nullptr returns zero. Simpatico keeps its physical payload live with the logical output; other
+ * representations charge only logical bytes. Addition saturates.
  */
 inline std::size_t peak_materialization_bytes(const cucascade::idata_representation* data)
 {

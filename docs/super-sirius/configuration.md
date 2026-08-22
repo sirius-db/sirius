@@ -614,24 +614,9 @@ under `sirius.operator_params`, but it is not a normal session setting.
 
 Runtime distinct-build probing is also engine-owned and is temporarily disabled pending #1600.
 
-The fused dense count-join optimization is enabled by default. Disable it at startup to retain the
-partitioned join and aggregate plan for a workload:
-
-```yaml
-sirius:
-  operator_params:
-    enable_dense_count_join: false
-```
-
-The current operator has FULL barriers on both inputs and executes in one task. Both complete
-inputs, its output, and its workspace must therefore fit the memory available to one GPU task.
-With the default `true` setting, eligible SQL uses DENSE_COUNT_JOIN. Setting the option to `false`
-keeps the normal partitioned `HASH_JOIN` plus `HASH_GROUP_BY` plan.
-
-`dense_count_join_max_bytes` remains engine-owned and is rejected in YAML. Direct runtime
-overrides for both dense count-join fields mutate process-shared engine configuration. They are
-registered only when `SIRIUS_ENABLE_TEST_OPTIONS=1` and are not part of the production session
-surface.
+Dense count-join is enabled by default and can be disabled with
+`sirius.operator_params.enable_dense_count_join: false`. Both inputs are FULL barriers, so the
+inputs and workspace must fit one GPU task. Its histogram budget is engine-owned.
 
 ### GPU Admission
 

@@ -98,23 +98,15 @@ struct valid_domain_coverage_threshold {
 /// (NVIDIA/cuCollections#834) on some key distributions. Re-enable once the fix ships in libcudf.
 constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
-/// Fuse `COUNT(col | *) GROUP BY <preserved-side join key>` over a LEFT/RIGHT integer equi-join
-/// into the DENSE_COUNT_JOIN operator. Instead of building a hash table over the counted side,
-/// materializing the join, and re-aggregating, the operator counts matches in
-/// a direct-address histogram over the preserved key domain [min, max] measured from the data.
 constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = true;
 
-/// Cap on the combined direct-address histogram footprint (presence + counts arrays) of
-/// DENSE_COUNT_JOIN. A key domain too wide for this budget takes the operator's exact sparse
-/// (eager-aggregation) strategy instead; correctness never depends on this value.
 constexpr uint64_t DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES = 2ULL * 1024 * 1024 * 1024;  // 2 GiB
 
 }  // namespace config
 
 /// Parameters controlling operator-level resource sizing.
-/// Public fields can be set under `sirius.operator_params` in YAML or with DuckDB SET unless
-/// documented as engine-owned. Engine-owned fields are rejected in YAML; any test-only SET hook
-/// is registered only when `SIRIUS_ENABLE_TEST_OPTIONS=1` is set during extension initialization.
+/// Fields are YAML-configurable unless documented as engine-owned; runtime test hooks require
+/// `SIRIUS_ENABLE_TEST_OPTIONS=1`.
 struct operator_params {
   /// Engine-owned query policy. The user-facing setting defaults to enabled, but an unwired
   /// execution context stays fail-closed until the engine snapshots the connection value.
@@ -194,13 +186,10 @@ struct operator_params {
   /// boundaries restore native carriers.
   bool enable_compressed_materialization = true;
 
-  /// Enable fusion of COUNT-grouped-by-join-key outer equi-joins into DENSE_COUNT_JOIN. Enabled by
-  /// default and accepted in YAML as `enable_dense_count_join`; test-option-enabled processes also
-  /// expose an internal runtime override. See config::DEFAULT_ENABLE_DENSE_COUNT_JOIN.
+  /// Enable DENSE_COUNT_JOIN planning for eligible aggregates.
   bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;
 
-  /// Engine-owned, test-only direct-address histogram budget for DENSE_COUNT_JOIN (see
-  /// config::DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES).
+  /// Engine-owned histogram budget; declined ranges use exact sparse aggregation.
   uint64_t dense_count_join_max_bytes = config::DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES;
 
   /// Admission-time GPU allocation: target bytes of projected scan output per GPU.

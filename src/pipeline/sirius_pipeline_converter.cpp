@@ -359,8 +359,9 @@ void sirius_pipeline_converter::finalize_pipeline_structure()
 void sirius_pipeline_converter::link_join_partition_siblings()
 {
   for (const auto& pipeline : scheduled_) {
-    // Both join types get the same CONCAT/PARTITION build+probe wrap from `wrap_join`, and
-    // both can stream the probe, so the upstream→probe-partition edge is PARTIAL for both.
+    // Both join types use the same CONCAT/PARTITION wrap. Probe input is PARTIAL except for
+    // right-family hash joins whose complete probe drives partition sizing; RIGHT_DELIM_JOIN
+    // inner joins use their build side instead.
     if (pipeline->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
         pipeline->source->type == op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
       auto build_concat_pipeline    = pipeline->dependencies[0];
@@ -373,10 +374,6 @@ void sirius_pipeline_converter::link_join_partition_siblings()
       D_ASSERT(
         build_concat_pipeline->get_sink()->type == op::SiriusPhysicalOperatorType::CONCAT &&
         build_concat_pipeline->get_sink()->Cast<op::sirius_physical_concat>().is_build_concat());
-      // A RIGHT_DELIM_JOIN's inner join bootstraps its probe subtree from build-side (distinct)
-      // data, so the build side drives the partition count. Detect it off the join's tree parent
-      // (the same predicate PARTITION's input_barrier_for uses), since the build partition is plain
-      // that the sink type alone does not distinguish.
       bool const inner_join_of_rdj =
         pipeline->source->get_parent_op() != nullptr &&
         pipeline->source->get_parent_op()->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN;

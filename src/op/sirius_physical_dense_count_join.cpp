@@ -115,9 +115,7 @@ namespace {
   return rhs != 0 && lhs > max / rhs;
 }
 
-/// Per-batch eager-aggregation partial: distinct non-NULL keys with their per-key row count.
-/// @p value_policy EXCLUDE counts only rows whose @p values entry is non-NULL (COUNT(col));
-/// INCLUDE counts every row of the group (COUNT(*) / presence).
+// EXCLUDE implements COUNT(col); INCLUDE implements COUNT(*) and preserved-key presence.
 std::unique_ptr<cudf::table> sparse_partial_count(cudf::column_view const& keys,
                                                   cudf::column_view const& values,
                                                   cudf::null_policy value_policy,
@@ -140,7 +138,6 @@ std::unique_ptr<cudf::table> sparse_partial_count(cudf::column_view const& keys,
   return std::make_unique<cudf::table>(std::move(columns));
 }
 
-/// Merge two `(key, INT64 count)` partials and release both inputs after their use is enqueued.
 std::unique_ptr<cudf::table> sparse_merge_pair(std::unique_ptr<cudf::table> lhs,
                                                std::unique_ptr<cudf::table> rhs,
                                                rmm::cuda_stream_view stream,
@@ -168,7 +165,7 @@ std::unique_ptr<cudf::table> sparse_merge_pair(std::unique_ptr<cudf::table> lhs,
   return merged;
 }
 
-/// Merge per-batch partials in balanced rounds so no all-input concatenation is resident.
+// Merge in balanced pairs to avoid one all-partials concatenation.
 std::unique_ptr<cudf::table> sparse_merge_partials(
   std::vector<std::unique_ptr<cudf::table>> partials,
   cudf::data_type key_type,
@@ -306,16 +303,10 @@ MemoryBarrierType sirius_physical_dense_count_join::input_barrier_for(
   return MemoryBarrierType::FULL;
 }
 
-//===--------------------------------------------------------------------===//
-// Pipeline construction
-//===--------------------------------------------------------------------===//
-
 void sirius_physical_dense_count_join::build_pipelines(
   pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
 {
-  // Always a blocking boundary: the operator forms its own single-op pipeline; each child
-  // subtree becomes the sink of its own pipeline feeding the "preserved"/"counted" ports
-  // (wired by the pipeline converter through this consumer's input wiring hooks).
+  // FULL-barrier sink with one input port per child.
   if (children.size() != 2) {
     throw sirius::internal_exception("dense_count_join: expected 2 children, got {}",
                                      children.size());
@@ -325,15 +316,13 @@ void sirius_physical_dense_count_join::build_pipelines(
 
   auto build_child_side = [&](sirius_physical_operator& child) {
     auto& child_meta = sink_meta.create_child_meta_pipeline(host_current, child);
-    if (child.children.empty()) { return; }  // leaf source (e.g. GPU_SCAN) — single-op pipeline
+    if (child.children.empty()) { return; }
     if (child.children.size() != 1) {
-      // The planner gate restricts child roots to unary/leaf shapes; anything else is a bug.
       throw sirius::internal_exception(
         "dense_count_join: child subtree root must be unary or a leaf");
     }
     child_meta.build(*child.children[0]);
   };
-  // Build the typically larger counted side first, mirroring join build-side-first order.
   build_child_side(*children[1]);
   build_child_side(*children[0]);
 }
@@ -342,16 +331,13 @@ std::optional<task_creation_hint> sirius_physical_dense_count_join::get_next_tas
 {
   if (ports.empty()) { return std::nullopt; }
 
-  // FULL-barrier semantics on every port: wait until each producing pipeline has finished.
+  // Either input may be empty, but both producers must finish before the task runs.
   for (auto const& p : _ports_list) {
     if (p->src_pipeline && !p->src_pipeline->is_pipeline_finished()) {
       auto* producer = &(p->src_pipeline->get_operators()[0].get());
       return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
     }
   }
-  // Both producers finished: one task drains everything. Unlike the base hint, READY does not
-  // require every port to be non-empty — an empty counted side must still produce the
-  // all-zero-count groups, and an empty preserved side must still drain the counted batches.
   if (!all_ports_empty()) { return task_creation_hint{TaskCreationHint::READY, this}; }
   return std::nullopt;
 }
@@ -391,8 +377,7 @@ std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
     return (padded / allocation_alignment) * allocation_alignment;
   };
 
-  // Every dense execution necessarily satisfies both byte gates. The row-density gates can only
-  // lower this bound, so planner cardinality is neither needed nor allowed to reduce it.
+  // Dense histogram bytes are capped at min(max_bins_bytes, 4 * input bytes).
   auto const histogram_cap   = static_cast<std::size_t>(_max_bins_bytes);
   auto const histogram_bytes = std::min(histogram_cap, saturating_mul(4, stats.bytes));
 
@@ -412,8 +397,7 @@ std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
   dense_peak      = saturating_add(dense_peak, mask_bytes);
   dense_peak      = saturating_add(dense_peak, histogram_bytes);  // selection/CUB workspace
 
-  // minmax retains two scalars per nonempty batch through the final synchronization. Each scalar
-  // owns a value and a validity allocation; reservations charge every allocation separately.
+  // Retain each batch's value/validity scalars through the final sync and charge them separately.
   auto const global_extrema = aligned_charge(2 * sizeof(int64_t));
   auto const scalar_bytes = saturating_add(aligned_charge(key_width), aligned_charge(sizeof(bool)));
   auto const extrema_per_batch = saturating_mul(2, scalar_bytes);
@@ -423,10 +407,6 @@ std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
   auto const sparse_peak = saturating_add(allocation_floor, saturating_mul(16, stats.bytes));
   return std::max({dense_peak, sparse_peak, minmax_peak});
 }
-
-//===--------------------------------------------------------------------===//
-// Execution
-//===--------------------------------------------------------------------===//
 
 std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
@@ -445,10 +425,8 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
       ro_batches.size());
   }
 
-  // INVARIANT (SCHED-RR contract): all input batches arrive on the task's reservation device
-  // via gpu_pipeline_task::execute -> pipelineable_operator_data::prepare_for_processing ->
-  // lock_or_prepare_batch. See docs/super-sirius/pipeline-execution.md
-  // "Per-task-device contract under SCHED-RR".
+  // Task preparation colocates every input in the reservation space, so any batch supplies the
+  // allocator.
   cucascade::memory::memory_space* space = nullptr;
   for (auto const& batch : ro_batches) {
     if (batch.get_memory_space() != nullptr) {
@@ -472,7 +450,6 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
     }
   };
 
-  // Collect the key (and count-argument) column views per side.
   std::vector<cudf::column_view> preserved_keys;
   std::vector<cudf::column_view> counted_keys;
   std::vector<std::optional<cudf::column_view>> counted_values;
@@ -517,11 +494,9 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
 
   std::unique_ptr<cudf::table> output;
   if (non_null_keys == 0) {
-    // No non-NULL preserved keys: the output is the NULL group alone (or empty).
     _last_strategy = strategy::DENSE;
     output = dense_count_empty_output(key_type, count_star, preserved_null_keys, stream, mr);
   } else {
-    // Batch reductions and merging remain on-device until one final extrema readback.
     auto const min_max = dense_count_global_minmax(preserved_keys, stream, mr);
     if (!min_max) {
       throw sirius::internal_exception(
@@ -529,8 +504,7 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
         non_null_keys);
     }
 
-    // Unsigned difference is exact for any int64 pair; a wrapped (zero) range means the domain
-    // spans the full 64-bit space and can never take the dense path.
+    // A zero unsigned range denotes the full 64-bit domain and forces the sparse path.
     uint64_t const range_u =
       static_cast<uint64_t>(min_max->second) - static_cast<uint64_t>(min_max->first) + 1;
     bool const wide = preserved_rows >= std::numeric_limits<uint32_t>::max() ||
@@ -585,7 +559,6 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
         input_logical_bytes,
         _max_bins_bytes);
 
-      // Counted side: per-batch groupby-count partials, then a groupby-sum merge.
       std::vector<std::unique_ptr<cudf::table>> counted_partials;
       for (std::size_t i = 0; i < counted_keys.size(); ++i) {
         if (counted_keys[i].size() == 0) { continue; }
@@ -608,7 +581,6 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
       auto preserved_agg =
         sparse_merge_partials(std::move(preserved_partials), key_type, stream, mr);
 
-      // preserved LEFT JOIN counted on the distinct keys; unmatched -> 0 matches.
       auto const preserved_key_view      = cudf::table_view({preserved_agg->view().column(0)});
       auto const counted_key_view        = cudf::table_view({counted_agg->view().column(0)});
       auto [left_indices, right_indices] = cudf::left_join(

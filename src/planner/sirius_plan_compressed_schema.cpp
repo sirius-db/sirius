@@ -401,10 +401,8 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
         break;
       }
 
-      // The fused join reads both equality keys as values, but COUNT(col) consumes only its
-      // validity mask. Restore precisely the keys; value and ignored columns retain their narrow
-      // carriers until the operator discards them. Dense-count output is always [native key,
-      // BIGINT], so it carries no physical sidecar.
+      // Keys require native values; COUNT(col) uses only its validity mask. Output is native
+      // [key, BIGINT] with no physical sidecar.
       restore_native_columns(slot->children[0], {preserved_key_idx});
       restore_native_columns(slot->children[1], {counted_key_idx});
       slot->set_physical_types({});
