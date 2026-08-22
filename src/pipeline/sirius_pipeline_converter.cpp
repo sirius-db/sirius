@@ -462,17 +462,15 @@ void sirius_pipeline_converter::link_join_partition_siblings()
       // Exception: a dynamic-filter-publishing RIGHT_SEMI/RIGHT_ANTI join stays BUILD-driven:
       // its filter must fold and publish from the build before the probe-side scan launches
       // (probe-driven sizing would defer the build behind the full unfiltered probe and never
-      // take the single-partition publish path — see sirius_physical_partition's sizing
-      // fallback, whose byte bound still refuses oversized builds). The exception's invariant
-      // — such joins arise only from the delim-direct lowering — and the explicit exclusion
-      // of plain RIGHT joins (stock DuckDB DOES attach pushdown to those) live in
+      // take the single-partition publish path). Why exactly those two types are safe to size
+      // from the build — and why plain RIGHT joins are not — is documented with
       // sirius_physical_hash_join::right_family_join_sizes_build_driven.
+      auto* hash_join = pipeline->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN
+                          ? &pipeline->source->Cast<op::sirius_physical_hash_join>()
+                          : nullptr;
       bool const probe_drives_partition_count =
-        pipeline->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN &&
-        pipeline->source->Cast<op::sirius_physical_hash_join>().is_right_family() &&
-        !pipeline->source->Cast<op::sirius_physical_hash_join>()
-           .sizes_build_driven_for_filter_publication() &&
-        !inner_join_of_rdj;
+        hash_join != nullptr && hash_join->is_right_family() &&
+        !hash_join->sizes_build_driven_for_filter_publication() && !inner_join_of_rdj;
 
       // partition pipeline only has one operator, so sink and source are the same
       auto& build_partition_op =

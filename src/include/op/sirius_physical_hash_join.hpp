@@ -323,15 +323,16 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   }
 
   /// Pure sizing-exception predicate: a right-family join takes BUILD-driven partition sizing
-  /// (instead of the probe-driven right-family default) exactly when it is RIGHT_SEMI or
-  /// RIGHT_ANTI AND publishes dynamic filters — the build must fold and publish before the
-  /// probe scan launches. Restricted to those two types because stock DuckDB never attaches
-  /// join-filter pushdown to them (JoinFilterPushdownOptimizer::GenerateJoinFilters refuses
-  /// MARK/SINGLE/LEFT/OUTER/ANTI/RIGHT_ANTI/RIGHT_SEMI), so a DF-publishing
-  /// RIGHT_SEMI/RIGHT_ANTI join arises only from the delim-direct lowering, whose build is the
-  /// filtered outer relation. Plain RIGHT joins are routine in stock plans (LEFT flipped by
-  /// BuildProbeSideOptimizer) and CAN carry pushdown — they must keep probe-driven sizing:
-  /// nothing bounds the probe-side working set that 1-partition build-driven sizing implies.
+  /// (instead of the probe-driven right-family default) exactly when it is RIGHT_SEMI or RIGHT_ANTI
+  /// AND publishes dynamic filters — the build must fold and publish before the probe-side scan
+  /// launches. For those two types the build side is the join's output side and, whether by the
+  /// delim-direct lowering's construction or by DuckDB's build-side flip heuristic, the
+  /// estimated-smaller side, so build-driven sizing stays bounded while the probe streams;
+  /// sirius_physical_partition's byte-bound sizing fallback still degrades an unexpectedly large
+  /// build to multi-partition (no publication) rather than overcommitting. Plain RIGHT joins keep
+  /// probe-driven sizing: they are routine in stock plans, nothing bounds the probe-side working
+  /// set that 1-partition build-driven sizing implies for them, and they were never measured under
+  /// it.
   [[nodiscard]] static constexpr bool right_family_join_sizes_build_driven(duckdb::JoinType type,
                                                                            bool publishes_filters)
   {
