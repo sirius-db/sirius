@@ -123,7 +123,7 @@ TEST_CASE("sorted-groupby hint matches the hash path on sorted and unsorted keys
   std::vector<int64_t> sorted_keys(num_rows);
   std::vector<int64_t> values(num_rows);
   for (std::size_t i = 0; i < num_rows; ++i) {
-    sorted_keys[i] = static_cast<int64_t>(i / 4);  // non-decreasing runs of 4
+    sorted_keys[i] = static_cast<int64_t>(i / 4);
     values[i]      = static_cast<int64_t>(i % 97);
   }
   auto shuffled_keys = sorted_keys;

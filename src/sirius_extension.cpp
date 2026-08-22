@@ -1332,9 +1332,6 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     if (file_paths.empty()) {
       throw InvalidInputException("pin_table: no parquet files matched path: " + data.args.path);
     }
-    // Natural filename order is deterministic and preserves key-range order when names encode
-    // ranges. Cache matching remains order-insensitive because matches_parquet_files sorts both
-    // file sets.
     if (sirius_ctx->get_config().get_operator_params().pin_table_natural_file_order) {
       std::sort(
         file_paths.begin(), file_paths.end(), [](const std::string& lhs, const std::string& rhs) {

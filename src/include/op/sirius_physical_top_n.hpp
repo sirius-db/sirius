@@ -60,6 +60,8 @@ class sirius_physical_top_n : public sirius_physical_operator {
 
  public:
   bool is_sink() const override { return true; }
+  //! Emits one candidate batch per input batch, capped at `offset + limit` rows;
+  //! sirius_physical_top_n_merge applies the global limit and offset.
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 };

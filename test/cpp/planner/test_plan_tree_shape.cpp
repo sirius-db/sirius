@@ -296,9 +296,9 @@ sirius_physical_operator* require_join_child_wrap(sirius_physical_operator* op,
   return partition->children[0].get();
 }
 
-/// Assert the shared delim-join topology and grouped-aggregate option stamping: the distinct
-/// chain is `MERGE_GROUP_BY -> PARTITION -> HASH_GROUP_BY` with the chain top tagged as owned by
-/// the delim join and `distinct` borrowing the chain bottom, and the internal join carries the
+/// Assert the delim-join invariants shared by both variants: the distinct chain is
+/// `MERGE_GROUP_BY -> PARTITION -> HASH_GROUP_BY` with the chain top tagged as owned by the
+/// delim join and `distinct` borrowing the chain bottom, and the internal join carries the
 /// standard CONCAT/PARTITION wrap on both children.
 void require_delim_join_common(sirius::op::sirius_physical_delim_join& delim,
                                const sirius::op::sorted_hint_options& expected_sorted_hint,

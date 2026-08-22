@@ -309,9 +309,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   }
   if (use_label_keys) { group_cols.push_back(label_col->view()); }
 
-  // `cudf::is_sorted` and `cudf::groupby` use different null-order defaults. Explicit
-  // ASCENDING/nulls-AFTER vectors keep the proof and sorted groupby consistent; the row and type
-  // gates avoid the comparator pass for small or variable-width key sets.
+  // The sortedness proof and groupby must use the same order and null precedence.
   cudf::sorted keys_presorted = cudf::sorted::NO;
   std::vector<cudf::order> key_column_order;
   std::vector<cudf::null_order> key_null_precedence;

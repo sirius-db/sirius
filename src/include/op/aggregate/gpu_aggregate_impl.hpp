@@ -36,17 +36,10 @@ class telemetry_context;
 
 namespace op {
 
-/**
- * @brief Controls the runtime sorted-key proof for gpu_aggregate_impl::local_grouped_aggregate
- *
- * Eligible fixed-width keys are checked with `cudf::is_sorted` using the same ascending,
- * nulls-after order passed to the groupby. `sorted::YES` skips hashing and key sorting, but cuDF
- * may still allocate group/order metadata and gathered values.
- */
+/// Controls the optional sorted-key proof in gpu_aggregate_impl::local_grouped_aggregate.
 struct sorted_hint_options {
-  /// Try the is_sorted check and take the sorted::YES path when it proves the keys sorted.
   bool enabled = false;
-  /// Minimum input rows before the check runs (it costs one pass over the key columns).
+  /// Minimum input rows required before checking sortedness.
   uint64_t min_rows = config::DEFAULT_SORTED_GROUPBY_HINT_MIN_ROWS;
 };
 
@@ -94,8 +87,7 @@ class gpu_aggregate_impl {
    *        indices. Empty entries (or an empty outer vector) use `aggregate_idx` directly.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
-   * @param telemetry_info Telemetry lineage for the output batch.
-   * @param sorted_hint Options for proving that group keys are sorted before aggregation.
+   * @param sorted_hint Controls the optional sorted-key proof.
    *
    * @return The output data batch.
    */

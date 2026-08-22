@@ -120,7 +120,7 @@ bool validate_leading_keys(const std::vector<cucascade::read_only_data_batch>& b
 
   bool key_type_initialized = false;
   keys.reserve(batches.size());
-  // The read-only batch handles keep every collected key view alive for this proof.
+  // Batch handles keep the collected key views alive.
   for (auto const& batch : batches) {
     auto* const data        = batch.get_data();
     auto* const batch_space = batch.get_memory_space();
@@ -128,7 +128,6 @@ bool validate_leading_keys(const std::vector<cucascade::read_only_data_batch>& b
         batch_space->get_tier() != cucascade::memory::Tier::GPU) {
       return false;
     }
-    // All extrema use task_space's allocator, so reject keys from any other memory space.
     if (task_space == nullptr) {
       task_space = batch_space;
     } else if (batch_space != task_space ||
@@ -169,8 +168,7 @@ struct prove_disjoint_ranges {
     } else {
       using scalar_type = cudf::scalar_type_t<T>;
 
-      // Retain every scalar until the explicit synchronization. A synchronous custom memory
-      // resource could otherwise introduce a barrier as each pair leaves scope.
+      // Keep extrema alive until synchronization to avoid synchronous deallocation barriers.
       std::vector<scalar_pair> extrema;
       extrema.reserve(keys.size());
       for (auto const& key : keys) {

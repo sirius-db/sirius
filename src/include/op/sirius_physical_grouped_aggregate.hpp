@@ -87,7 +87,7 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   bool has_avg            = false;
   bool has_count_distinct = false;
 
-  //! Runtime sorted-key proof options stamped from operator parameters during plan generation.
+  //! Sorted-key proof options captured during plan generation.
   sorted_hint_options sorted_hint;
 
  public:

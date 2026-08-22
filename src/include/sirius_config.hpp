@@ -98,19 +98,12 @@ struct valid_domain_coverage_threshold {
 /// (NVIDIA/cuCollections#834) on some key distributions. Re-enable once the fix ships in libcudf.
 constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
-/// Enable merge-local passthrough for grouped-aggregate partials whose leading key ranges are
-/// proven disjoint.
 constexpr bool DEFAULT_ENABLE_DISJOINT_GROUPBY_PASSTHROUGH = false;
 
-/// Enable a runtime sortedness proof that may pass cudf::sorted::YES to grouped aggregation. cuDF
-/// may still allocate group/order metadata and gathered values on the sorted path.
 constexpr bool DEFAULT_ENABLE_SORTED_GROUPBY_HINT = false;
 
-/// Minimum batch rows before the sorted-groupby-hint is_sorted check runs.
 constexpr uint64_t DEFAULT_SORTED_GROUPBY_HINT_MIN_ROWS = 1ULL << 20;
 
-/// Pin multi-file parquet datasets in deterministic natural filename order. When names encode key
-/// ranges, this preserves their range order. Pinned-cache identity is order-insensitive.
 constexpr bool DEFAULT_PIN_TABLE_NATURAL_FILE_ORDER = true;
 
 }  // namespace config
@@ -161,19 +154,16 @@ struct operator_params {
   /// DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE.
   bool enable_runtime_distinct_build_probe = config::DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE;
 
-  /// Keep read-only grouped-aggregate partial batches separate when the merge proves that their
-  /// leading group keys are disjoint. See DEFAULT_ENABLE_DISJOINT_GROUPBY_PASSTHROUGH.
+  /// Allow merge aggregation to pass through partial batches with disjoint leading-key ranges.
   bool enable_disjoint_groupby_passthrough = config::DEFAULT_ENABLE_DISJOINT_GROUPBY_PASSTHROUGH;
 
-  /// Pass sorted::YES to the grouped-aggregate groupby when a runtime cudf::is_sorted check
-  /// proves the batch keys are pre-sorted. See DEFAULT_ENABLE_SORTED_GROUPBY_HINT.
+  /// Allow runtime verification to select cuDF's sorted-key groupby path.
   bool enable_sorted_groupby_hint = config::DEFAULT_ENABLE_SORTED_GROUPBY_HINT;
 
-  /// Pin multi-file parquet datasets in deterministic natural filename order. See
-  /// DEFAULT_PIN_TABLE_NATURAL_FILE_ORDER.
+  /// Sort multi-file parquet paths in natural filename order before pinning.
   bool pin_table_natural_file_order = config::DEFAULT_PIN_TABLE_NATURAL_FILE_ORDER;
 
-  /// Minimum batch rows before the sorted-groupby-hint is_sorted check runs.
+  /// Minimum input rows required before checking grouped-aggregation keys for sortedness.
   uint64_t sorted_groupby_hint_min_rows = config::DEFAULT_SORTED_GROUPBY_HINT_MIN_ROWS;
 
   /// Enable dynamic filters for eligible hash joins.

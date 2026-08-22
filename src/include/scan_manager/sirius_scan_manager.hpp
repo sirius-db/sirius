@@ -254,6 +254,12 @@ void validate_column_storage_shape(sirius::pinned_column_storage_matrix const& m
                                    std::string_view context,
                                    bool allow_empty);
 
+/// Requires matching table identity and parquet read order before merging columns by row.
+/// @throw std::runtime_error If the identities differ
+void validate_merge_source_identity(const cache_entry_info& existing,
+                                    const cache_entry_info& incoming,
+                                    std::string_view context);
+
 /// Report a recorded carrier that contradicts the type storage actually holds. The single throw
 /// site of @ref validate_recorded_column_storage's cross-check; declared here only because that
 /// validator is a template.

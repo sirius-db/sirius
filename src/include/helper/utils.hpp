@@ -24,10 +24,10 @@
 namespace sirius::utils {
 
 /**
- * @brief Orders names using numeric digit runs
+ * @brief Compares names in natural numeric order
  *
- * Digit runs compare by numeric magnitude without integer conversion; equal values place fewer
- * leading zeros first. Other bytes compare lexicographically.
+ * ASCII digit runs compare by magnitude, with fewer leading zeros first on ties; other bytes
+ * compare unsigned.
  *
  * @param lhs Left name
  * @param rhs Right name
@@ -39,7 +39,6 @@ inline bool natural_name_less(std::string_view lhs, std::string_view rhs)
   auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
   while (i < lhs.size() && j < rhs.size()) {
     if (is_digit(lhs[i]) && is_digit(rhs[j])) {
-      // Skip leading zeros, then compare the significant digit runs.
       std::size_t li = i, rj = j;
       while (li < lhs.size() && lhs[li] == '0')
         ++li;
@@ -56,13 +55,14 @@ inline bool natural_name_less(std::string_view lhs, std::string_view rhs)
       auto const lrun = lhs.substr(li, llen);
       auto const rrun = rhs.substr(rj, rlen);
       if (lrun != rrun) { return lrun < rrun; }
-      // Equal numeric value: fewer leading zeros first, for a total deterministic order.
       if ((li - i) != (rj - j)) { return (li - i) < (rj - j); }
       i = le;
       j = re;
       continue;
     }
-    if (lhs[i] != rhs[j]) { return lhs[i] < rhs[j]; }
+    auto const lc = static_cast<unsigned char>(lhs[i]);
+    auto const rc = static_cast<unsigned char>(rhs[j]);
+    if (lc != rc) { return lc < rc; }
     ++i;
     ++j;
   }

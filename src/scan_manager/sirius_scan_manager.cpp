@@ -1247,6 +1247,8 @@ void sirius_scan_manager::insert_pinned_entry(
       // the same files differently. Reject any mismatch loudly rather than
       // silently aliasing.
       auto& entry = existing_it->second;
+      // Positional merges require the same table identity and parquet file order.
+      validate_merge_source_identity(entry.cache_info, cache_info, kInsertContext);
       if (entry.chunk_memory_spaces.size() != chunk_memory_spaces.size()) {
         throw std::runtime_error(
           "[sirius_scan_manager::insert_pinned_entry] merge mismatch — "
@@ -1593,6 +1595,36 @@ pinned_entry const* sirius_scan_manager::find_pinned_entry_for_parquet_files(
     if (entry.cache_info.matches_parquet_files(resolved_file_paths)) { return &entry; }
   }
   return nullptr;
+}
+
+void validate_merge_source_identity(const cache_entry_info& existing,
+                                    const cache_entry_info& incoming,
+                                    std::string_view context)
+{
+  if (existing.resolved_file_paths.size() != incoming.resolved_file_paths.size()) {
+    throw std::runtime_error(std::string{context} + " merge mismatch — the cached entry resolved " +
+                             std::to_string(existing.resolved_file_paths.size()) +
+                             " parquet file(s) but the new pin resolved " +
+                             std::to_string(incoming.resolved_file_paths.size()));
+  }
+  for (std::size_t i = 0; i < existing.resolved_file_paths.size(); ++i) {
+    if (existing.resolved_file_paths[i] != incoming.resolved_file_paths[i]) {
+      throw std::runtime_error(std::string{context} + " merge mismatch — parquet file[" +
+                               std::to_string(i) + "] is '" + existing.resolved_file_paths[i] +
+                               "' in the cached entry but '" + incoming.resolved_file_paths[i] +
+                               "' in the new pin (same files in a different order still pair rows "
+                               "from different source rows)");
+    }
+  }
+  if (existing.catalog_name != incoming.catalog_name ||
+      existing.schema_name != incoming.schema_name || existing.table_name != incoming.table_name) {
+    auto qualified = [](const cache_entry_info& info) {
+      return info.catalog_name + "." + info.schema_name + "." + info.table_name;
+    };
+    throw std::runtime_error(std::string{context} + " merge mismatch — the cached entry pins '" +
+                             qualified(existing) + "' but the new pin resolved '" +
+                             qualified(incoming) + "'");
+  }
 }
 
 void validate_column_storage_shape(pinned_column_storage_matrix const& matrix,

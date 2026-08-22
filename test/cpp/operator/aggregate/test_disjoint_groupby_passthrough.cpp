@@ -19,6 +19,8 @@
 #include "aggregate_test_utils.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
+#include "op/sirius_physical_top_n.hpp"
+#include "op/sirius_physical_top_n_merge.hpp"
 #include "utils/data_utils.hpp"
 #include "utils/log_test_utils.hpp"
 #include "utils/test_validation_utility.hpp"
@@ -28,6 +30,9 @@
 
 #include <catch.hpp>
 #include <cucascade/data/data_repository.hpp>
+#include <duckdb/planner/bound_result_modifier.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <helper/type_conversions.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -548,4 +553,61 @@ TEST_CASE("multiple grouping sets preserve metadata and use the normal merge",
   auto output = execute_with_outcome(merge, partials, stream, "multiple_grouping_sets");
   stream.synchronize();
   require_normal_merge(*output, partials, expected->view());
+}
+
+TEST_CASE("passthrough partials feed straight into TopN", "[disjoint_groupby_passthrough]")
+{
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = space->acquire_stream();
+
+  std::vector<std::vector<int64_t>> const keys{{100, 101}, {0, 1, 2}, {50, 51}};
+  std::vector<std::vector<int64_t>> const values{{1000, 1010}, {10, 20, 30}, {500, 510}};
+
+  std::vector<std::shared_ptr<data_batch>> inputs;
+  inputs.reserve(keys.size());
+  for (std::size_t index = 0; index < keys.size(); ++index) {
+    inputs.push_back(make_partial_batch<I64Traits>(keys[index], values[index], *space, stream));
+  }
+
+  merge_fixture fixture;
+  auto partials = execute_with_outcome(*fixture.merge, inputs, stream, "engaged");
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*partials).get_data_batches().size() ==
+          inputs.size());
+
+  duckdb::vector<duckdb::LogicalType> types;
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));  // group key
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));  // summed value
+
+  auto make_value_orders = [] {
+    duckdb::vector<duckdb::BoundOrderByNode> orders;
+    orders.push_back(duckdb::BoundOrderByNode(
+      duckdb::OrderType::DESCENDING,
+      duckdb::OrderByNullType::NULLS_LAST,
+      duckdb::make_uniq<duckdb::BoundReferenceExpression>(
+        duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT), duckdb::idx_t{1})));
+    return orders;
+  };
+  constexpr std::size_t limit  = 2;
+  constexpr std::size_t offset = 1;
+
+  sirius_physical_top_n topn(
+    sirius::from_duckdb_vec(types), make_value_orders(), limit, offset, nullptr, 0);
+  auto local_out = topn.execute(*partials, stream);
+  auto const& candidates =
+    dynamic_cast<const pipelineable_operator_data&>(*local_out).get_data_batches();
+  REQUIRE(candidates.size() == inputs.size());
+
+  sirius_physical_top_n_merge topn_merge(
+    sirius::from_duckdb_vec(types), make_value_orders(), limit, offset, nullptr, 0);
+  auto merged = topn_merge.execute(pipelineable_operator_data(candidates), stream);
+  auto const& merged_batches =
+    dynamic_cast<const pipelineable_operator_data&>(*merged).get_data_batches();
+  REQUIRE(merged_batches.size() == 1);
+
+  stream.synchronize();
+  auto const view = sirius::get_cudf_table_view(*merged_batches.front());
+  REQUIRE(copy_column_to_host<int64_t>(view.column(0)) == std::vector<int64_t>{100, 51});
+  REQUIRE(copy_column_to_host<int64_t>(view.column(1)) == std::vector<int64_t>{1000, 510});
 }

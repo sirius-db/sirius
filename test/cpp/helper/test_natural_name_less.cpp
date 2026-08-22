@@ -29,13 +29,83 @@ TEST_CASE("natural_name_less orders numbered parts numerically", "[natural_file_
   REQUIRE(natural_name_less("part.9.parquet", "part.10.parquet"));
   REQUIRE(natural_name_less("part.0.parquet", "part.1.parquet"));
   REQUIRE(natural_name_less("a/part.19.parquet", "a/part.20.parquet"));
-  REQUIRE(natural_name_less("part.2", "part.2.parquet"));  // prefix first
-  REQUIRE(natural_name_less("part.2", "part.02"));         // equal value: fewer leading zeros first
+  REQUIRE(natural_name_less("part.2", "part.2.parquet"));
+  REQUIRE(natural_name_less("part.2", "part.02"));
   REQUIRE_FALSE(natural_name_less("part.02", "part.2"));
-  REQUIRE_FALSE(natural_name_less("abc", "abc"));  // irreflexive
+  REQUIRE_FALSE(natural_name_less("abc", "abc"));
   std::vector<std::string> names{"part.10", "part.2", "part.1", "part.0", "part.11"};
   std::sort(names.begin(), names.end(), [](const std::string& l, const std::string& r) {
     return natural_name_less(l, r);
   });
   REQUIRE(names == std::vector<std::string>{"part.0", "part.1", "part.2", "part.10", "part.11"});
+}
+
+TEST_CASE("natural_name_less orders high bytes as unsigned", "[natural_file_order]")
+{
+  using sirius::utils::natural_name_less;
+  auto const named = [](unsigned char byte) {
+    return std::string{"part."} + static_cast<char>(byte);
+  };
+  std::string const ascii  = named(0x7f);
+  std::string const high   = named(0x80);
+  std::string const higher = named(0xff);
+  REQUIRE(natural_name_less(ascii, high));
+  REQUIRE_FALSE(natural_name_less(high, ascii));
+  REQUIRE(natural_name_less(high, higher));
+  REQUIRE_FALSE(natural_name_less(higher, high));
+  REQUIRE(natural_name_less("part.a", high));
+}
+
+TEST_CASE("natural_name_less is a strict weak ordering", "[natural_file_order]")
+{
+  using sirius::utils::natural_name_less;
+  std::vector<std::string> universe{""};
+  std::string const alphabet = "01.a";
+  for (int len = 1; len <= 3; ++len) {
+    std::vector<std::string> next;
+    for (auto const& word : universe) {
+      if (word.size() + 1 != static_cast<std::size_t>(len)) { continue; }
+      for (char c : alphabet) {
+        next.push_back(word + c);
+      }
+    }
+    universe.insert(universe.end(), next.begin(), next.end());
+  }
+
+  auto const equiv = [](const std::string& a, const std::string& b) {
+    return !natural_name_less(a, b) && !natural_name_less(b, a);
+  };
+
+  std::vector<std::string> irreflexive;
+  std::vector<std::string> asymmetric;
+  std::vector<std::string> transitive;
+  std::vector<std::string> incomparable;
+  for (auto const& a : universe) {
+    if (natural_name_less(a, a)) { irreflexive.push_back("'" + a + "'"); }
+    for (auto const& b : universe) {
+      bool const ab = natural_name_less(a, b);
+      if (ab && natural_name_less(b, a)) { asymmetric.push_back("'" + a + "' '" + b + "'"); }
+      for (auto const& c : universe) {
+        if (ab && natural_name_less(b, c) && !natural_name_less(a, c)) {
+          transitive.push_back("'" + a + "' '" + b + "' '" + c + "'");
+        }
+        if (equiv(a, b) && equiv(b, c) && !equiv(a, c)) {
+          incomparable.push_back("'" + a + "' '" + b + "' '" + c + "'");
+        }
+      }
+    }
+  }
+
+  auto const first = [](const std::vector<std::string>& violations) {
+    return violations.empty() ? std::string{"none"} : violations.front();
+  };
+  INFO("universe size " << universe.size());
+  INFO("irreflexive violation: " << first(irreflexive));
+  INFO("asymmetry violation: " << first(asymmetric));
+  INFO("transitivity violation: " << first(transitive));
+  INFO("incomparability-transitivity violation: " << first(incomparable));
+  REQUIRE(irreflexive.empty());
+  REQUIRE(asymmetric.empty());
+  REQUIRE(transitive.empty());
+  REQUIRE(incomparable.empty());
 }

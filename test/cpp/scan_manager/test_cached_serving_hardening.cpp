@@ -1755,3 +1755,93 @@ TEST_CASE("validate_recorded_column_storage cross-checks recorded carriers again
       sirius::pinned_column_storage_matrix{}, 0, 2, kContext, stored));
   }
 }
+
+TEST_CASE("validate_merge_source_identity accepts an identical source",
+          "[cached_serving][scan_manager]")
+{
+  using sirius::scan_manager::cache_entry_info;
+  using sirius::scan_manager::validate_merge_source_identity;
+  constexpr std::string_view kContext = "[test]";
+
+  SECTION("same parquet files in the same order")
+  {
+    cache_entry_info existing;
+    existing.resolved_file_paths = {"/d/part.2.parquet", "/d/part.10.parquet"};
+    cache_entry_info incoming    = existing;
+    REQUIRE_NOTHROW(validate_merge_source_identity(existing, incoming, kContext));
+  }
+
+  SECTION("same duckdb table")
+  {
+    cache_entry_info existing;
+    existing.catalog_name     = "memory";
+    existing.schema_name      = "main";
+    existing.table_name       = "t";
+    cache_entry_info incoming = existing;
+    REQUIRE_NOTHROW(validate_merge_source_identity(existing, incoming, kContext));
+  }
+
+  SECTION("an entry carrying no identity at all")
+  {
+    REQUIRE_NOTHROW(
+      validate_merge_source_identity(cache_entry_info{}, cache_entry_info{}, kContext));
+  }
+}
+
+TEST_CASE("validate_merge_source_identity refuses a differing source",
+          "[cached_serving][scan_manager]")
+{
+  using sirius::scan_manager::cache_entry_info;
+  using sirius::scan_manager::validate_merge_source_identity;
+  constexpr std::string_view kContext = "[test]";
+
+  cache_entry_info existing;
+  existing.resolved_file_paths = {"/d/part.2.parquet", "/d/part.10.parquet"};
+
+  SECTION("the same file set read in a different order")
+  {
+    // Ordered source identity prevents positional column merges from pairing different rows.
+    cache_entry_info incoming;
+    incoming.resolved_file_paths = {"/d/part.10.parquet", "/d/part.2.parquet"};
+    REQUIRE_THROWS_AS(validate_merge_source_identity(existing, incoming, kContext),
+                      std::runtime_error);
+  }
+
+  SECTION("a different file set of the same size")
+  {
+    cache_entry_info incoming;
+    incoming.resolved_file_paths = {"/other/part.2.parquet", "/other/part.10.parquet"};
+    REQUIRE_THROWS_AS(validate_merge_source_identity(existing, incoming, kContext),
+                      std::runtime_error);
+  }
+
+  SECTION("a different file count")
+  {
+    cache_entry_info incoming;
+    incoming.resolved_file_paths = {"/d/part.2.parquet"};
+    REQUIRE_THROWS_AS(validate_merge_source_identity(existing, incoming, kContext),
+                      std::runtime_error);
+  }
+
+  SECTION("a duckdb-native pin onto a parquet entry")
+  {
+    cache_entry_info incoming;
+    incoming.catalog_name = "memory";
+    incoming.schema_name  = "main";
+    incoming.table_name   = "t";
+    REQUIRE_THROWS_AS(validate_merge_source_identity(existing, incoming, kContext),
+                      std::runtime_error);
+  }
+
+  SECTION("a different duckdb table")
+  {
+    cache_entry_info duckdb_entry;
+    duckdb_entry.catalog_name = "memory";
+    duckdb_entry.schema_name  = "main";
+    duckdb_entry.table_name   = "t";
+    cache_entry_info incoming = duckdb_entry;
+    incoming.table_name       = "other";
+    REQUIRE_THROWS_AS(validate_merge_source_identity(duckdb_entry, incoming, kContext),
+                      std::runtime_error);
+  }
+}
