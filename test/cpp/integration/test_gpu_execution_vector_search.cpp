@@ -212,3 +212,35 @@ TEST_CASE_METHOD(VectorSearchFixture,
 
   run_ok("SELECT * FROM unpin_table('vs_enn_cos');");
 }
+
+TEST_CASE_METHOD(VectorSearchFixture,
+                 "sirius_create_ann_index - prepared statement rebuilds on every execution",
+                 "[integration][gpu_execution][array][vss][vector_search]")
+{
+  run_ok(
+    "CREATE TABLE vs_reexec AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec FROM range(1000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'vs_reexec', tier => 'gpu', format => 'duckdb');");
+
+  // Prepare once, execute twice. finished now lives in per-execution state, so each
+  // execution rebuilds and returns its one success row. When the flag lived in bind
+  // data (reused across executions of a prepared plan) the second execution returned
+  // zero rows and skipped the rebuild.
+  auto prep = con->Prepare(
+    "SELECT * FROM sirius_create_ann_index('vs_reexec', 'vec', metric => 'l2', n_lists => 16);");
+  REQUIRE(prep);
+  if (prep->HasError()) { UNSCOPED_INFO("prepare error: " << prep->GetError()); }
+  REQUIRE_FALSE(prep->HasError());
+
+  for (int exec = 1; exec <= 2; ++exec) {
+    INFO("execution #" << exec);
+    auto res = prep->Execute();
+    REQUIRE(res);
+    if (res->HasError()) { UNSCOPED_INFO("execute error: " << res->GetError()); }
+    REQUIRE_FALSE(res->HasError());
+    auto& mat = res->Cast<duckdb::MaterializedQueryResult>();
+    REQUIRE(mat.RowCount() == 1);  // rebuilt and returned its success row
+  }
+
+  run_ok("SELECT * FROM unpin_table('vs_reexec');");
+}

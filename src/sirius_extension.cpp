@@ -1700,8 +1700,18 @@ struct CreateAnnIndexData : public TableFunctionData {
   std::string metric      = "l2";        ///< lowercased; one of l2 / cosine
   std::string schema_name = "main";
   int64_t n_lists         = 0;  ///< IVF-Flat list count; 0 = choose a default at build time
-  bool finished           = false;
 };
+
+// Per-execution state
+struct CreateAnnIndexGlobalState : public GlobalTableFunctionState {
+  bool finished = false;
+};
+
+static unique_ptr<GlobalTableFunctionState> SiriusCreateAnnIndexInit(ClientContext& context,
+                                                                     TableFunctionInitInput& input)
+{
+  return make_uniq<CreateAnnIndexGlobalState>();
+}
 
 static unique_ptr<FunctionData> SiriusCreateAnnIndexBind(ClientContext& context,
                                                          TableFunctionBindInput& input,
@@ -1773,8 +1783,9 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
                                          TableFunctionInput& data_p,
                                          DataChunk& output)
 {
-  auto& data = data_p.bind_data->CastNoConst<CreateAnnIndexData>();
-  if (data.finished) { return; }
+  auto& data   = data_p.bind_data->CastNoConst<CreateAnnIndexData>();
+  auto& gstate = data_p.global_state->Cast<CreateAnnIndexGlobalState>();
+  if (gstate.finished) { return; }
 
   nvtx3::scoped_range nvtx_range{"SiriusCreateAnnIndexFunction"};
 
@@ -1906,7 +1917,7 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
 
   output.SetCardinality(1);
   output.SetValue(0, 0, Value::BOOLEAN(true));
-  data.finished = true;
+  gstate.finished = true;
 }
 
 struct SiriusVectorSearchBindData : public TableFunctionData {
@@ -2203,7 +2214,8 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   TableFunction create_ann_index("sirius_create_ann_index",
                                  {LogicalType::VARCHAR, LogicalType::VARCHAR},
                                  SiriusCreateAnnIndexFunction,
-                                 SiriusCreateAnnIndexBind);
+                                 SiriusCreateAnnIndexBind,
+                                 SiriusCreateAnnIndexInit);
   create_ann_index.named_parameters["name"]        = LogicalType::VARCHAR;
   create_ann_index.named_parameters["metric"]      = LogicalType::VARCHAR;
   create_ann_index.named_parameters["index_type"]  = LogicalType::VARCHAR;
