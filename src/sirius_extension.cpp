@@ -2105,6 +2105,10 @@ static unique_ptr<GlobalTableFunctionState> SiriusVectorSearchInit(ClientContext
     throw InvalidInputException("sirius_knn_search requires the Sirius context to be initialized");
   }
 
+  // Required to hold the query-lifecycle slot for the whole build since the pinned entry is
+  // non-owning. The slot also serializes the current-device-resource swap the build does.
+  duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
+
   auto state       = make_uniq<SiriusVectorSearchGlobalState>();
   state->host_repr = sirius::vss::run_vector_search(*sirius_ctx, bind_data.req);
   state->reader    = std::make_unique<sirius::op::result::host_table_chunk_reader>(

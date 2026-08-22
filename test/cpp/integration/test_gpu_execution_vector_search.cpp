@@ -234,7 +234,9 @@ TEST_CASE_METHOD(VectorSearchFixture,
 
   for (int exec = 1; exec <= 2; ++exec) {
     INFO("execution #" << exec);
-    auto res = prep->Execute();
+    // allow_stream_result = false so we get a materialized result to count rows.
+    duckdb::vector<duckdb::Value> params;
+    auto res = prep->Execute(params, /*allow_stream_result=*/false);
     REQUIRE(res);
     if (res->HasError()) { UNSCOPED_INFO("execute error: " << res->GetError()); }
     REQUIRE_FALSE(res->HasError());
