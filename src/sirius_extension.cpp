@@ -1332,12 +1332,9 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     if (file_paths.empty()) {
       throw InvalidInputException("pin_table: no parquet files matched path: " + data.args.path);
     }
-    // Natural (digit-aware) name order makes multi-file pinning deterministic. When filenames
-    // map to key-range order, as with key-contiguous part.0 through part.N layouts, this also
-    // preserves the ordering that strict-disjoint groupby passthrough and the sorted-groupby hint
-    // can observe. Readdir order is filesystem-dependent and non-deterministic across hosts.
-    // Cache identity is order-insensitive (matches_parquet_files sorts both sides), so this
-    // cannot break pinned-cache matching.
+    // Natural filename order is deterministic and preserves key-range order when names encode
+    // ranges. Cache matching remains order-insensitive because matches_parquet_files sorts both
+    // file sets.
     if (sirius_ctx->get_config().get_operator_params().pin_table_natural_file_order) {
       std::sort(
         file_paths.begin(), file_paths.end(), [](const std::string& lhs, const std::string& rhs) {
@@ -2352,10 +2349,14 @@ static void SetEnableSortedGroupbyHint(ClientContext& context, SetScope scope, V
 
 static void SetSortedGroupbyHintMinRows(ClientContext& context, SetScope scope, Value& parameter)
 {
+  auto const min_rows = UBigIntValue::Get(parameter);
+  if (min_rows == 0) {
+    throw InvalidInputException("sorted_groupby_hint_min_rows must be at least 1");
+  }
   auto* params = get_operator_params(context);
   if (!params) { return; }
   auto slot                            = lock_operator_params_slot(context);
-  params->sorted_groupby_hint_min_rows = UBigIntValue::Get(parameter);
+  params->sorted_groupby_hint_min_rows = min_rows;
   SIRIUS_LOG_DEBUG("Updated config SORTED_GROUPBY_HINT_MIN_ROWS to {}",
                    params->sorted_groupby_hint_min_rows);
 }
@@ -2376,9 +2377,9 @@ static void SetEnableDynamicFilter(ClientContext& context, SetScope scope, Value
   if (!params) { return; }
   auto slot                     = lock_operator_params_slot(context);
   params->enable_dynamic_filter = BooleanValue::Get(parameter);
-
   SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_FILTER to {}", params->enable_dynamic_filter);
 }
+
 static void SetEnableDynamicZoneMapFilter(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2654,13 +2655,14 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_sorted_groupby_hint),
                     SetEnableSortedGroupbyHint);
-  add_sirius_option(config,
-                    option_visibility::internal,
-                    "sorted_groupby_hint_min_rows",
-                    "set the row threshold for the sorted grouped-aggregate diagnostic hint",
-                    LogicalType::UBIGINT,
-                    Value::UBIGINT(operator_defaults.sorted_groupby_hint_min_rows),
-                    SetSortedGroupbyHintMinRows);
+  add_sirius_option(
+    config,
+    option_visibility::internal,
+    "sorted_groupby_hint_min_rows",
+    "set the row threshold (minimum 1) for the sorted grouped-aggregate diagnostic hint",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.sorted_groupby_hint_min_rows),
+    SetSortedGroupbyHintMinRows);
   add_sirius_option(config,
                     option_visibility::internal,
                     "pin_table_natural_file_order",
@@ -2784,13 +2786,13 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     Value(compression_defaults.input_plan_dir),
     SetPinTableInputCompressionPlanDir);
 
-  config.AddExtensionOption("pin_table_compression_min_batch_size_bytes",
-                            "Minimum uncompressed batch size in bytes below which active "
-                            "pin_table compression is skipped; "
-                            "inert until compression is enabled and a matching plan resolves",
-                            LogicalType::UBIGINT,
-                            Value::UBIGINT(compression_defaults.min_batch_size_bytes),
-                            SetPinTableCompressionMinBatchSizeBytes);
+  config.AddExtensionOption(
+    "pin_table_compression_min_batch_size_bytes",
+    "Minimum uncompressed batch size in bytes below which active pin_table compression is skipped; "
+    "inert until compression is enabled and a matching plan resolves",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(compression_defaults.min_batch_size_bytes),
+    SetPinTableCompressionMinBatchSizeBytes);
 
   config.AddExtensionOption(
     "pin_table_compression_max_compressed_fraction",

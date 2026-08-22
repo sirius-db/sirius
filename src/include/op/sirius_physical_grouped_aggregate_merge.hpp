@@ -142,11 +142,15 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
-  //! Enable the merge-local strict-disjoint passthrough. The operator default is off so only
-  //! plan-generator-stamped instances can take the optimization.
+  //! Enables the merge-local strict-disjoint passthrough policy.
   void set_disjoint_groupby_passthrough(bool enabled) noexcept
   {
     _enable_disjoint_groupby_passthrough = enabled;
+  }
+
+  [[nodiscard]] bool disjoint_groupby_passthrough_enabled() const noexcept
+  {
+    return _enable_disjoint_groupby_passthrough;
   }
 
  private:

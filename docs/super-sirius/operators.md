@@ -338,13 +338,14 @@ Aggregate without GROUP BY (e.g., `SELECT COUNT(*), SUM(x) FROM t`).
 ### `sirius_physical_grouped_aggregate` — `HASH_GROUP_BY`
 **File:** `src/include/op/sirius_physical_grouped_aggregate.hpp`
 
-Hash-based GROUP BY.
+Hash-based GROUP BY, with an optional runtime-proven sorted-key path.
 
 - **GPU execution:** `gpu_aggregate_impl::local_grouped_aggregate()` using `cudf::groupby()`
 - **AVG handling:** Decomposed into SUM + COUNT_VALID via `AggregateSlot`
+- **Sorted-key path:** for sufficiently large fixed-width key sets, a default-off `cudf::is_sorted` proof may pass `sorted::YES` to the groupby.
 - **COUNT(DISTINCT):** Implemented via `COLLECT_SET` aggregation with struct column synthesis
 - **Label-encoded group keys:** when a COLLECT_SET aggregation is present, the input is large (≥ 1M rows), the group key is multi-column and non-nested, and an HLL estimate puts group cardinality below 1% of rows, the key table is collapsed with `cudf::encode` into a single dense INT32 label so cuDF's `stable_sorted_order` takes its single-column radix path; original keys are recovered by a gather at group cardinality. This short-circuits the STRING dictionary-encode path and falls back silently to the plain multi-column sort on failure.
-- **Key members:** `group_idx`, `cudf_aggregates`, `cudf_aggregate_idx`, `aggregate_slots`, `has_avg`, `has_count_distinct`
+- **Key members:** `group_idx`, `cudf_aggregates`, `cudf_aggregate_idx`, `aggregate_slots`, `has_avg`, `has_count_distinct`, `sorted_hint`
 
 ## Pipeline Breakers (Sirius-Specific)
 
@@ -395,7 +396,7 @@ Merges pre-sorted partitions using `gpu_merge_impl::merge_order_by()` (multi-way
 ### `sirius_physical_grouped_aggregate_merge` — `MERGE_GROUP_BY`
 **File:** `src/include/op/sirius_physical_grouped_aggregate_merge.hpp`
 
-Merges grouped aggregate results from multiple partitions. Drains one partition per task, similar to MERGE_SORT.
+Merges grouped aggregate results from multiple partitions. Drains one partition per task, similar to MERGE_SORT. A default-off diagnostic path may preserve read-only partial batches after proving that their leading key ranges are strictly disjoint.
 
 ### `sirius_physical_ungrouped_aggregate_merge` — `MERGE_AGGREGATE`
 **File:** `src/include/op/sirius_physical_ungrouped_aggregate_merge.hpp`

@@ -363,6 +363,25 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     result = con.Query("RESET enable_sorted_groupby_hint");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
+
+    auto before_setting =
+      con.Query("SELECT current_setting('sorted_groupby_hint_min_rows')::UBIGINT");
+    REQUIRE(before_setting != nullptr);
+    REQUIRE_FALSE(before_setting->HasError());
+    auto const before_threshold = before_setting->GetValue(0, 0).GetValue<uint64_t>();
+
+    auto invalid_threshold = con.Query("SET sorted_groupby_hint_min_rows = 0");
+    REQUIRE(invalid_threshold != nullptr);
+    REQUIRE(invalid_threshold->HasError());
+    REQUIRE_THAT(invalid_threshold->GetError(),
+                 Catch::Contains("sorted_groupby_hint_min_rows must be at least 1"));
+
+    auto retained_setting =
+      con.Query("SELECT current_setting('sorted_groupby_hint_min_rows')::UBIGINT");
+    REQUIRE(retained_setting != nullptr);
+    REQUIRE_FALSE(retained_setting->HasError());
+    REQUIRE(retained_setting->GetValue(0, 0).GetValue<uint64_t>() == before_threshold);
+
     result = con.Query("SET sorted_groupby_hint_min_rows = 17");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());

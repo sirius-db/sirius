@@ -98,31 +98,24 @@ struct valid_domain_coverage_threshold {
 /// (NVIDIA/cuCollections#834) on some key distributions. Re-enable once the fix ships in libcudf.
 constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
-/// Keep independently computed grouped-aggregate partials as separate batches when the merge can
-/// prove that their leading keys are disjoint. Disabled by default while the landing is evaluated.
+/// Enable merge-local passthrough for grouped-aggregate partials whose leading key ranges are
+/// proven disjoint.
 constexpr bool DEFAULT_ENABLE_DISJOINT_GROUPBY_PASSTHROUGH = false;
 
-/// Pass cudf::sorted::YES to the grouped-aggregate groupby when a runtime cudf::is_sorted check
-/// proves the batch's group keys are already sorted (clustered input). The sort-based groupby then
-/// skips both hashing and sorting. The check itself is one cheap pass; the min-rows gate below
-/// bounds the tax on unsorted inputs.
-constexpr bool DEFAULT_ENABLE_SORTED_GROUPBY_HINT = true;
+/// Enable a runtime sortedness proof that may pass cudf::sorted::YES to grouped aggregation. cuDF
+/// may still allocate group/order metadata and gathered values on the sorted path.
+constexpr bool DEFAULT_ENABLE_SORTED_GROUPBY_HINT = false;
 
-/// Minimum batch rows before the sorted-groupby-hint is_sorted check runs. Small batches hash
-/// fast enough that the check cannot pay for itself.
+/// Minimum batch rows before the sorted-groupby-hint is_sorted check runs.
 constexpr uint64_t DEFAULT_SORTED_GROUPBY_HINT_MIN_ROWS = 1ULL << 20;
 
-/// Pin multi-file parquet datasets in natural (digit-aware) file-name order instead of raw
-/// readdir order. This guarantees deterministic traversal and, when filenames map to key ranges,
-/// preserves the ordering that grouped-aggregate optimizations can observe. Pinned-cache identity
-/// is order-insensitive.
+/// Pin multi-file parquet datasets in deterministic natural filename order. When names encode key
+/// ranges, this preserves their range order. Pinned-cache identity is order-insensitive.
 constexpr bool DEFAULT_PIN_TABLE_NATURAL_FILE_ORDER = true;
 
 }  // namespace config
 
-/// Parameters controlling operator-level resource sizing.
-/// These can be set via the .yaml file under the sirius.operator_params section
-/// or overridden at runtime using DuckDB SET commands.
+/// Operator-level resource sizing and policy parameters.
 struct operator_params {
   /// Target batch size (bytes) for DuckDB scan tasks.
   uint64_t scan_task_batch_size = config::derived_default_batch_size();
@@ -176,8 +169,8 @@ struct operator_params {
   /// proves the batch keys are pre-sorted. See DEFAULT_ENABLE_SORTED_GROUPBY_HINT.
   bool enable_sorted_groupby_hint = config::DEFAULT_ENABLE_SORTED_GROUPBY_HINT;
 
-  /// Pin multi-file parquet datasets in natural (digit-aware) file-name order instead of raw
-  /// readdir order. See DEFAULT_PIN_TABLE_NATURAL_FILE_ORDER.
+  /// Pin multi-file parquet datasets in deterministic natural filename order. See
+  /// DEFAULT_PIN_TABLE_NATURAL_FILE_ORDER.
   bool pin_table_natural_file_order = config::DEFAULT_PIN_TABLE_NATURAL_FILE_ORDER;
 
   /// Minimum batch rows before the sorted-groupby-hint is_sorted check runs.

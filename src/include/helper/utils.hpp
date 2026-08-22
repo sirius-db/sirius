@@ -23,11 +23,16 @@
 
 namespace sirius::utils {
 
-/// Natural (digit-aware) name ordering: maximal digit runs compare by numeric value (a longer
-/// run of significant digits is larger; equal-length runs compare lexicographically, which
-/// equals numeric order), everything else compares byte-wise. So "part.2" < "part.10" while
-/// plain lexicographic order would give "part.10" < "part.2". Used to pin multi-file datasets
-/// in their logical part order regardless of readdir order.
+/**
+ * @brief Orders names using numeric digit runs
+ *
+ * Digit runs compare by numeric magnitude without integer conversion; equal values place fewer
+ * leading zeros first. Other bytes compare lexicographically.
+ *
+ * @param lhs Left name
+ * @param rhs Right name
+ * @return True if `lhs` precedes `rhs` in natural order
+ */
 inline bool natural_name_less(std::string_view lhs, std::string_view rhs)
 {
   std::size_t i = 0, j = 0;

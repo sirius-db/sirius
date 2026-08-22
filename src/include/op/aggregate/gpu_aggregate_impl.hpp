@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "sirius_config.hpp"
 #include "telemetry/data_batch_probe.hpp"
 
 #include <cudf/cudf_utils.hpp>
@@ -36,20 +37,17 @@ class telemetry_context;
 namespace op {
 
 /**
- * @brief Options for the sorted-groupby hint in `local_grouped_aggregate`.
+ * @brief Controls the runtime sorted-key proof for gpu_aggregate_impl::local_grouped_aggregate
  *
- * When enabled and the batch clears `min_rows`, the implementation runs a runtime
- * `cudf::is_sorted` check over the (fixed-width) group key columns and, when the keys are proven
- * pre-sorted, constructs the cudf groupby with `sorted::YES` so the sort-based helper skips both
- * hashing and sorting. The check is the correctness gate: `sorted::YES` is only ever passed for
- * keys the check proved sorted under the exact same column order / null order the groupby is
- * given, so unsorted inputs cannot take the sorted path.
+ * Eligible fixed-width keys are checked with `cudf::is_sorted` using the same ascending,
+ * nulls-after order passed to the groupby. `sorted::YES` skips hashing and key sorting, but cuDF
+ * may still allocate group/order metadata and gathered values.
  */
 struct sorted_hint_options {
   /// Try the is_sorted check and take the sorted::YES path when it proves the keys sorted.
   bool enabled = false;
   /// Minimum input rows before the check runs (it costs one pass over the key columns).
-  uint64_t min_rows = 1ULL << 20;
+  uint64_t min_rows = config::DEFAULT_SORTED_GROUPBY_HINT_MIN_ROWS;
 };
 
 /**
@@ -97,7 +95,7 @@ class gpu_aggregate_impl {
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
    * @param telemetry_info Telemetry lineage for the output batch.
-   * @param sorted_hint See @ref sorted_hint_options (off by default).
+   * @param sorted_hint Options for proving that group keys are sorted before aggregation.
    *
    * @return The output data batch.
    */

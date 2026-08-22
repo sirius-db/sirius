@@ -20,6 +20,7 @@
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "utils/data_utils.hpp"
+#include "utils/log_test_utils.hpp"
 #include "utils/test_validation_utility.hpp"
 
 #include <cudf/null_mask.hpp>
@@ -33,6 +34,8 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -45,6 +48,18 @@ namespace {
 using namespace sirius::test::operator_utils;
 using I64Traits = gpu_type_traits<int64_t>;
 using sirius::test::vector_to_cudf_column;
+
+template <typename T>
+struct passthrough_key_traits : gpu_type_traits<T> {};
+
+template <>
+struct passthrough_key_traits<uint64_t> {
+  using type                               = uint64_t;
+  static constexpr cudf::type_id cudf_type = cudf::type_id::UINT64;
+  static constexpr bool is_decimal         = false;
+  static constexpr bool is_string          = false;
+  static constexpr bool is_ts              = false;
+};
 
 template <typename KeyTraits>
 std::unique_ptr<cudf::table> make_partial_table(const std::vector<typename KeyTraits::type>& keys,
@@ -111,6 +126,58 @@ void attach_input_repository(sirius_physical_grouped_aggregate_merge& merge,
   merge.add_port("input", std::move(input_port));
 }
 
+constexpr std::string_view passthrough_log_prefix = "disjoint_groupby_passthrough outcome=";
+
+void require_passthrough_outcome(const sirius::test::scoped_recording_log_sink& logs,
+                                 std::string_view outcome,
+                                 std::size_t input_batches)
+{
+  auto const records = logs.records();
+  auto const record  = std::find_if(records.begin(), records.end(), [](auto const& candidate) {
+    return candidate.message.starts_with(passthrough_log_prefix);
+  });
+  auto const outcome_count =
+    std::count_if(records.begin(), records.end(), [](auto const& candidate) {
+      return candidate.message.starts_with(passthrough_log_prefix);
+    });
+  REQUIRE(outcome_count == 1);
+  REQUIRE(record != records.end());
+  REQUIRE(record->level == sirius::log::level::debug);
+  REQUIRE(record->message == std::string{passthrough_log_prefix} + std::string{outcome} +
+                               " input_batches=" + std::to_string(input_batches));
+}
+
+void require_no_passthrough_outcome(const sirius::test::scoped_recording_log_sink& logs)
+{
+  auto const records = logs.records();
+  REQUIRE(std::none_of(records.begin(), records.end(), [](auto const& record) {
+    return record.message.starts_with(passthrough_log_prefix);
+  }));
+}
+
+std::unique_ptr<operator_data> execute_with_outcome(
+  sirius_physical_grouped_aggregate_merge& merge,
+  const std::vector<std::shared_ptr<data_batch>>& inputs,
+  rmm::cuda_stream_view stream,
+  std::string_view outcome)
+{
+  sirius::test::scoped_recording_log_sink logs{"debug"};
+  auto output = merge.execute(pipelineable_operator_data(inputs), stream);
+  require_passthrough_outcome(logs, outcome, inputs.size());
+  return output;
+}
+
+std::unique_ptr<operator_data> execute_without_outcome(
+  sirius_physical_grouped_aggregate_merge& merge,
+  const std::vector<std::shared_ptr<data_batch>>& inputs,
+  rmm::cuda_stream_view stream)
+{
+  sirius::test::scoped_recording_log_sink logs{"debug"};
+  auto output = merge.execute(pipelineable_operator_data(inputs), stream);
+  require_no_passthrough_outcome(logs);
+  return output;
+}
+
 std::shared_ptr<data_batch> run_local(sirius_physical_grouped_aggregate& local,
                                       const std::shared_ptr<data_batch>& input,
                                       rmm::cuda_stream_view stream)
@@ -145,9 +212,9 @@ class merge_fixture {
     attach_input_repository(*merge, repository);
   }
 
+  cucascade::shared_data_repository repository;
   std::unique_ptr<sirius_physical_grouped_aggregate> local_aggregate;
   std::unique_ptr<sirius_physical_grouped_aggregate_merge> merge;
-  cucascade::shared_data_repository repository;
 };
 
 const std::vector<std::shared_ptr<data_batch>>& output_batches(const operator_data& output)
@@ -172,32 +239,96 @@ void require_normal_merge(const operator_data& output,
 TEMPLATE_TEST_CASE("disjoint grouped partials pass through without changing batch identity",
                    "[disjoint_groupby_passthrough]",
                    int64_t,
+                   uint64_t,
                    timestamp_us_tag)
 {
-  using KeyTraits = gpu_type_traits<TestType>;
+  using KeyTraits = passthrough_key_traits<TestType>;
+  using Key       = typename KeyTraits::type;
 
   auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(Tier::GPU, 0);
   REQUIRE(space != nullptr);
   auto stream = space->acquire_stream();
 
-  std::vector<std::shared_ptr<data_batch>> inputs{
-    make_partial_batch<KeyTraits>({0, 1, 2}, {10, 20, 30}, *space, stream),
-    make_partial_batch<KeyTraits>({100, 101}, {40, 50}, *space, stream)};
+  Key const base = [] {
+    if constexpr (std::is_same_v<TestType, uint64_t>) {
+      return static_cast<Key>(std::numeric_limits<int64_t>::max()) + static_cast<Key>(1024);
+    } else {
+      return Key{0};
+    }
+  }();
+  std::vector<std::vector<Key>> const expected_keys{
+    {base + static_cast<Key>(100), base + static_cast<Key>(101)},
+    {base, base + static_cast<Key>(1), base + static_cast<Key>(2)},
+    {base + static_cast<Key>(50), base + static_cast<Key>(51)}};
+  std::vector<std::vector<int64_t>> const expected_values{{1000, 1010}, {10, 20, 30}, {500, 510}};
+
+  std::vector<std::shared_ptr<data_batch>> inputs;
+  inputs.reserve(expected_keys.size());
+  for (std::size_t index = 0; index < expected_keys.size(); ++index) {
+    inputs.push_back(
+      make_partial_batch<KeyTraits>(expected_keys[index], expected_values[index], *space, stream));
+  }
   std::vector<uint64_t> expected_ids;
+  expected_ids.reserve(inputs.size());
   for (auto const& input : inputs) {
     expected_ids.push_back(input->get_batch_id());
   }
 
   merge_fixture fixture;
-  auto output  = fixture.merge->execute(pipelineable_operator_data(inputs), stream);
+  auto output  = execute_with_outcome(*fixture.merge, inputs, stream, "engaged");
   auto batches = dynamic_cast<const pipelineable_operator_data&>(*output).get_read_only_batches();
 
+  stream.synchronize();
   REQUIRE(batches.size() == inputs.size());
   for (std::size_t index = 0; index < batches.size(); ++index) {
     REQUIRE(batches[index].get_batch_id() == expected_ids[index]);
+    auto const table = sirius::get_cudf_table_view(batches[index]);
+    REQUIRE(table.num_columns() == 2);
+    REQUIRE(table.num_rows() == static_cast<cudf::size_type>(expected_keys[index].size()));
+    REQUIRE(table.column(0).type().id() == KeyTraits::cudf_type);
+    REQUIRE(table.column(1).type().id() == cudf::type_id::INT64);
+    REQUIRE(copy_column_to_host<Key>(table.column(0)) == expected_keys[index]);
+    REQUIRE(copy_column_to_host<int64_t>(table.column(1)) == expected_values[index]);
   }
-  stream.synchronize();
+}
+
+TEST_CASE("passthrough outcomes cover single input and disabled execution",
+          "[disjoint_groupby_passthrough]")
+{
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto stream = space->acquire_stream();
+
+  SECTION("single input reports its outcome and preserves identity")
+  {
+    std::vector<std::shared_ptr<data_batch>> inputs{
+      make_partial_batch<I64Traits>({0, 1}, {10, 20}, *space, stream)};
+    auto const expected_id = inputs.front()->get_batch_id();
+    merge_fixture fixture;
+    auto output = execute_with_outcome(*fixture.merge, inputs, stream, "single_input");
+    stream.synchronize();
+
+    auto const& batches = output_batches(*output);
+    REQUIRE(batches.size() == 1);
+    REQUIRE(batches.front()->get_batch_id() == expected_id);
+  }
+
+  SECTION("disabled passthrough emits no outcome and uses the normal merge")
+  {
+    std::vector<std::shared_ptr<data_batch>> inputs{
+      make_partial_batch<I64Traits>({0, 1}, {10, 20}, *space, stream),
+      make_partial_batch<I64Traits>({100, 101}, {30, 40}, *space, stream)};
+    auto expected = make_partial_table<I64Traits>(
+      {0, 1, 100, 101}, {10, 20, 30, 40}, stream, get_resource_ref(*space));
+    merge_fixture fixture;
+    fixture.merge->set_disjoint_groupby_passthrough(false);
+    auto output = execute_without_outcome(*fixture.merge, inputs, stream);
+    stream.synchronize();
+
+    require_normal_merge(*output, inputs, expected->view());
+  }
 }
 
 TEST_CASE("overlapping grouped partial ranges use the normal merge",
@@ -220,7 +351,7 @@ TEST_CASE("overlapping grouped partial ranges use the normal merge",
     auto expected = make_partial_table<I64Traits>(
       expected_keys, expected_values, stream, get_resource_ref(*space));
     merge_fixture fixture;
-    auto output = fixture.merge->execute(pipelineable_operator_data(inputs), stream);
+    auto output = execute_with_outcome(*fixture.merge, inputs, stream, "overlapping_ranges");
     stream.synchronize();
     require_normal_merge(*output, inputs, expected->view());
   };
@@ -261,7 +392,7 @@ TEST_CASE("unsupported and nullable leading keys use the normal merge",
     auto expected = make_partial_table<F64Traits>(
       {0.0, 1.0, 100.0, 101.0}, {10, 20, 30, 40}, stream, get_resource_ref(*space));
     merge_fixture fixture;
-    auto output = fixture.merge->execute(pipelineable_operator_data(inputs), stream);
+    auto output = execute_with_outcome(*fixture.merge, inputs, stream, "unsupported_key");
     stream.synchronize();
     require_normal_merge(*output, inputs, expected->view());
   }
@@ -272,7 +403,7 @@ TEST_CASE("unsupported and nullable leading keys use the normal merge",
       make_nullable_partial_batch({0, 2}, {false, true}, {10, 20}, *space, stream),
       make_nullable_partial_batch({0, 3}, {false, true}, {30, 40}, *space, stream)};
     merge_fixture fixture;
-    auto output = fixture.merge->execute(pipelineable_operator_data(inputs), stream);
+    auto output = execute_with_outcome(*fixture.merge, inputs, stream, "unsupported_key");
     stream.synchronize();
 
     auto const& batches = output_batches(*output);
@@ -302,14 +433,15 @@ TEST_CASE("passthrough requires one upstream partition and a fitting task",
   SECTION("multiple upstream partitions")
   {
     merge_fixture fixture("sum", std::numeric_limits<uint64_t>::max(), 2);
-    auto output = fixture.merge->execute(pipelineable_operator_data(inputs), stream);
+    auto output =
+      execute_with_outcome(*fixture.merge, inputs, stream, "multiple_upstream_partitions");
     stream.synchronize();
     require_normal_merge(*output, inputs, expected->view());
   }
   SECTION("input exceeds hash partition budget")
   {
     merge_fixture fixture("sum", 1, 1);
-    auto output = fixture.merge->execute(pipelineable_operator_data(inputs), stream);
+    auto output = execute_with_outcome(*fixture.merge, inputs, stream, "byte_budget");
     stream.synchronize();
     require_normal_merge(*output, inputs, expected->view());
   }
@@ -338,7 +470,7 @@ TEST_CASE("AVG grouped partials never use disjoint passthrough", "[disjoint_grou
                                                   make_avg_partial({100, 101}, {40, 50}, {2, 5})};
 
   merge_fixture fixture("avg");
-  auto output = fixture.merge->execute(pipelineable_operator_data(inputs), stream);
+  auto output = execute_with_outcome(*fixture.merge, inputs, stream, "avg");
   stream.synchronize();
   auto const& batches = output_batches(*output);
   REQUIRE(batches.size() == 1);
@@ -357,13 +489,13 @@ TEST_CASE("COUNT DISTINCT partials never use disjoint passthrough",
 
   auto aggregate_definitions =
     sirius::test::create_count_distinct_expressions<I64Traits, I64Traits>({0}, 1);
+  cucascade::shared_data_repository repository;
   sirius_physical_grouped_aggregate local(std::move(aggregate_definitions.output_types),
                                           std::move(aggregate_definitions.aggregates),
                                           std::move(aggregate_definitions.groups),
                                           4);
   sirius_physical_grouped_aggregate_merge merge(&local, std::numeric_limits<uint64_t>::max());
   merge.set_disjoint_groupby_passthrough(true);
-  cucascade::shared_data_repository repository;
   attach_input_repository(merge, repository);
 
   auto first_input  = make_partial_batch<I64Traits>({0, 0, 1}, {10, 10, 20}, *space, stream);
@@ -373,7 +505,7 @@ TEST_CASE("COUNT DISTINCT partials never use disjoint passthrough",
   auto expected =
     make_partial_table<I64Traits>({0, 1, 100, 101}, {1, 1, 2, 1}, stream, get_resource_ref(*space));
 
-  auto output = merge.execute(pipelineable_operator_data(partials), stream);
+  auto output = execute_with_outcome(merge, partials, stream, "count_distinct");
   stream.synchronize();
   require_normal_merge(*output, partials, expected->view());
 }
@@ -391,6 +523,7 @@ TEST_CASE("multiple grouping sets preserve metadata and use the normal merge",
   duckdb::vector<duckdb::GroupingSet> grouping_sets;
   grouping_sets.push_back(duckdb::GroupingSet{0});
   grouping_sets.push_back(duckdb::GroupingSet{});
+  cucascade::shared_data_repository repository;
   sirius_physical_grouped_aggregate local(std::move(aggregate_definitions.output_types),
                                           std::move(aggregate_definitions.aggregates),
                                           std::move(aggregate_definitions.groups),
@@ -404,7 +537,6 @@ TEST_CASE("multiple grouping sets preserve metadata and use the normal merge",
   REQUIRE(merge.grouping_sets[0] == duckdb::GroupingSet{0});
   REQUIRE(merge.grouping_sets[1].empty());
   merge.set_disjoint_groupby_passthrough(true);
-  cucascade::shared_data_repository repository;
   attach_input_repository(merge, repository);
 
   std::vector<std::shared_ptr<data_batch>> partials{
@@ -413,7 +545,7 @@ TEST_CASE("multiple grouping sets preserve metadata and use the normal merge",
   auto expected = make_partial_table<I64Traits>(
     {0, 1, 100, 101}, {10, 20, 30, 40}, stream, get_resource_ref(*space));
 
-  auto output = merge.execute(pipelineable_operator_data(partials), stream);
+  auto output = execute_with_outcome(merge, partials, stream, "multiple_grouping_sets");
   stream.synchronize();
   require_normal_merge(*output, partials, expected->view());
 }

@@ -279,7 +279,9 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
              yaml::between<double>{0.0, std::numeric_limits<double>::infinity()});
   r.optional("enable_disjoint_groupby_passthrough", opt.enable_disjoint_groupby_passthrough);
   r.optional("enable_sorted_groupby_hint", opt.enable_sorted_groupby_hint);
-  r.optional("sorted_groupby_hint_min_rows", opt.sorted_groupby_hint_min_rows);
+  r.optional("sorted_groupby_hint_min_rows",
+             opt.sorted_groupby_hint_min_rows,
+             yaml::between<uint64_t>{1, std::numeric_limits<uint64_t>::max()});
   r.optional("pin_table_natural_file_order", opt.pin_table_natural_file_order);
   if (r.has("enable_runtime_distinct_build_probe")) {
     throw std::runtime_error(

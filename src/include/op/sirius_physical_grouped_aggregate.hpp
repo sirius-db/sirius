@@ -87,9 +87,7 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   bool has_avg            = false;
   bool has_count_distinct = false;
 
-  //! Sorted-groupby hint (see sorted_hint_options). Stamped from operator_params at plan time
-  //! (insert_gpu_pipeline_operators); off by default so unstamped construction paths (tests,
-  //! embedded aggregates) keep the plain hash behavior unless they opt in.
+  //! Runtime sorted-key proof options stamped from operator parameters during plan generation.
   sorted_hint_options sorted_hint;
 
  public:

@@ -309,23 +309,9 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   }
   if (use_label_keys) { group_cols.push_back(label_col->view()); }
 
-  // ---------------------------------------------------------------------------------------
-  // Sorted-groupby hint (config: enable_sorted_groupby_hint / sorted_groupby_hint_min_rows).
-  //
-  // Clustered inputs (e.g. a lineitem scan grouped by the delta-bitpack-encoded l_orderkey)
-  // reach this groupby with their keys already sorted, yet the hash path re-hashes every row.
-  // cudf's sort-based groupby with `sorted::YES` skips both hashing and sorting; it only needs
-  // adjacent-equal keys, which any consistent lexicographic sortedness guarantees.
-  //
-  // Correctness gate: `sorted::YES` is passed if and only if a runtime `cudf::is_sorted` check
-  // proves the final key columns sorted under the EXACT same column_order / null_precedence
-  // handed to the groupby constructor. The two defaults differ (`is_sorted` assumes
-  // null_order::BEFORE when the vector is empty, the groupby assumes null_order::AFTER), so the
-  // explicit vectors below are load-bearing — never drop them.
-  //
-  // Cost gate: the check is one comparator pass over the key columns, so it is skipped for
-  // small batches and for non-fixed-width keys (string/dictionary comparators make the pass
-  // itself expensive, and those key shapes are rarely clustered).
+  // `cudf::is_sorted` and `cudf::groupby` use different null-order defaults. Explicit
+  // ASCENDING/nulls-AFTER vectors keep the proof and sorted groupby consistent; the row and type
+  // gates avoid the comparator pass for small or variable-width key sets.
   cudf::sorted keys_presorted = cudf::sorted::NO;
   std::vector<cudf::order> key_column_order;
   std::vector<cudf::null_order> key_null_precedence;

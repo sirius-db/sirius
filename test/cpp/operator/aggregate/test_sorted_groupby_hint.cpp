@@ -18,6 +18,7 @@
 #include "../operator_type_traits.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
 #include "utils/data_utils.hpp"
+#include "utils/log_test_utils.hpp"
 #include "utils/test_validation_utility.hpp"
 
 #include <cudf/null_mask.hpp>
@@ -40,7 +41,6 @@ using namespace sirius::test::operator_utils;
 using I64Traits = gpu_type_traits<int64_t>;
 using sirius::test::vector_to_cudf_column;
 
-/// Build a (key, value) INT64 partial-aggregate-shaped batch.
 std::shared_ptr<data_batch> make_partial_batch(const std::vector<int64_t>& keys,
                                                const std::vector<int64_t>& values,
                                                cucascade::memory::memory_space& space,
@@ -94,6 +94,20 @@ std::shared_ptr<data_batch> make_nullable_multikey_batch(const std::vector<int64
                                  sirius::telemetry::batch_telemetry_info{});
 }
 
+std::size_t sorted_hint_engagement_count(
+  const std::vector<sirius::test::recording_log_sink::record>& records)
+{
+  std::size_t count = 0;
+  for (auto const& record : records) {
+    if (record.message.find("local_grouped_agg: sorted-groupby hint engaged") !=
+        std::string::npos) {
+      CHECK(record.level == sirius::log::level::debug);
+      ++count;
+    }
+  }
+  return count;
+}
+
 }  // namespace
 
 TEST_CASE("sorted-groupby hint matches the hash path on sorted and unsorted keys",
@@ -139,18 +153,42 @@ TEST_CASE("sorted-groupby hint matches the hash path on sorted and unsorted keys
 
   SECTION("sorted keys: hinted path equals hash path")
   {
+    sirius::test::scoped_recording_log_sink logs{"debug"};
     auto hinted = run(sorted_keys, hint_on);
     auto hashed = run(sorted_keys, hint_off);
     stream.synchronize();
     REQUIRE(sirius::test::expect_data_batches_equivalent(hinted, hashed, /*sort=*/true));
+    REQUIRE(sorted_hint_engagement_count(logs.records()) == 1);
   }
 
   SECTION("unsorted keys: is_sorted gate must fall back to the hash path, results identical")
   {
+    sirius::test::scoped_recording_log_sink logs{"debug"};
     auto hinted = run(shuffled_keys, hint_on);
     auto hashed = run(shuffled_keys, hint_off);
     stream.synchronize();
     REQUIRE(sirius::test::expect_data_batches_equivalent(hinted, hashed, /*sort=*/true));
+    REQUIRE(sorted_hint_engagement_count(logs.records()) == 0);
+  }
+
+  SECTION("disabled hint does not engage")
+  {
+    sirius::test::scoped_recording_log_sink logs{"debug"};
+    auto hashed = run(sorted_keys, hint_off);
+    stream.synchronize();
+    REQUIRE(hashed != nullptr);
+    REQUIRE(sorted_hint_engagement_count(logs.records()) == 0);
+  }
+
+  SECTION("minimum row threshold gates the hint")
+  {
+    const sorted_hint_options threshold_gated{true, num_rows + 1};
+    sirius::test::scoped_recording_log_sink logs{"debug"};
+    auto gated  = run(sorted_keys, threshold_gated);
+    auto hashed = run(sorted_keys, hint_off);
+    stream.synchronize();
+    REQUIRE(sirius::test::expect_data_batches_equivalent(gated, hashed, /*sort=*/true));
+    REQUIRE(sorted_hint_engagement_count(logs.records()) == 0);
   }
 
   SECTION("nullable multi-column keys use ASCENDING nulls-AFTER ordering")
@@ -180,10 +218,12 @@ TEST_CASE("sorted-groupby hint matches the hash path on sorted and unsorted keys
                                                          hint);
     };
 
+    sirius::test::scoped_recording_log_sink logs{"debug"};
     auto hinted = run_multikey(second_keys, second_valid, hint_on);
     auto hashed = run_multikey(second_keys, second_valid, hint_off);
     stream.synchronize();
     REQUIRE(sirius::test::expect_data_batches_equivalent(hinted, hashed, /*sort=*/true));
+    REQUIRE(sorted_hint_engagement_count(logs.records()) == 1);
 
     auto unsorted_keys  = second_keys;
     auto unsorted_valid = second_valid;
@@ -195,5 +235,6 @@ TEST_CASE("sorted-groupby hint matches the hash path on sorted and unsorted keys
     hashed                      = run_multikey(unsorted_keys, unsorted_valid, hint_off);
     stream.synchronize();
     REQUIRE(sirius::test::expect_data_batches_equivalent(hinted, hashed, /*sort=*/true));
+    REQUIRE(sorted_hint_engagement_count(logs.records()) == 1);
   }
 }
