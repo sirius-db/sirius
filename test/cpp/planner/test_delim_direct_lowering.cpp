@@ -48,6 +48,7 @@
 #include <duckdb/planner/planner.hpp>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <filesystem>
 #include <string>
@@ -256,6 +257,28 @@ struct delim_direct_fixture_base {
     }
   }
 
+  /// Generate the full Sirius physical plan for @p query as generate_sirius_plan does, first
+  /// requiring that the optimized logical plan contains a DELIM join of @p delim_type with the
+  /// @p delim_flipped orientation. Orientation-sensitive tests fail loudly here if DuckDB's
+  /// planning of the fixture ever changes, instead of silently exercising the other orientation.
+  duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan_requiring_delim(
+    const std::string& query, JoinType delim_type, bool delim_flipped)
+  {
+    scoped_planning_session session{*con};
+    try {
+      auto plan   = build_logical_plan(*con, query);
+      auto* delim = find_delim_join(plan.get());
+      REQUIRE(delim != nullptr);
+      REQUIRE(delim->join_type == delim_type);
+      REQUIRE(delim->delim_flipped == delim_flipped);
+      sirius::planner::sirius_physical_plan_generator gen(*con->context);
+      return gen.create_plan(std::move(plan));
+    } catch (...) {
+      session.committed = false;
+      throw;
+    }
+  }
+
   /// Classify the first DELIM join planned for @p query, with an optional mutation applied to
   /// the logical delim join first (for shapes SQL cannot produce directly). Returns the typed
   /// refusal's log-stable name so a failing CHECK prints the reason, not an enum number.
@@ -313,6 +336,22 @@ constexpr const char* not_exists_query =
   "SELECT val, count(*) FROM outer_t WHERE NOT EXISTS "
   "(SELECT 1 FROM inner_t WHERE rid = outer_t.id AND qty < 100) GROUP BY val";
 
+/// A 100k-row inner relation, large enough that DuckDB's build-side flip emits the delim in
+/// flipped orientation (RIGHT_SEMI / RIGHT_ANTI with delim_flipped set, the dedup sandwich at
+/// children[0]) — the orientation TPC-H q4/q22 take at scale. Created only by the tests that
+/// pin that orientation.
+constexpr const char* create_inner_big =
+  "CREATE TABLE inner_big AS SELECT (i % 20)::INTEGER AS rid, i::INTEGER AS qty "
+  "FROM range(100000) t(i)";
+
+constexpr const char* flipped_exists_query =
+  "SELECT val, count(*) FROM outer_t WHERE EXISTS "
+  "(SELECT 1 FROM inner_big WHERE rid = outer_t.id AND qty < 100) GROUP BY val";
+
+constexpr const char* flipped_not_exists_query =
+  "SELECT val, count(*) FROM outer_t WHERE NOT EXISTS "
+  "(SELECT 1 FROM inner_big WHERE rid = outer_t.id AND qty < 100) GROUP BY val";
+
 }  // namespace
 
 TEST_CASE_METHOD(delim_direct_fixture,
@@ -344,6 +383,66 @@ TEST_CASE_METHOD(delim_direct_fixture,
   auto& hj = joins[0]->Cast<sirius::op::sirius_physical_hash_join>();
   // Always emitted right-family: probe = inner relation, build = outer relation.
   CHECK(hj.join_type == JoinType::RIGHT_ANTI);
+}
+
+TEST_CASE_METHOD(delim_direct_fixture,
+                 "delim direct - flipped RIGHT_SEMI/RIGHT_ANTI delims lower to the same direct "
+                 "joins",
+                 "[delim_direct][isolated_context]")
+{
+  // The flipped orientation drives classify's sandwich_index == 0 collect path and apply's
+  // children[0]-overwrite splice, which the unflipped SEMI/ANTI tests above never reach.
+  auto created = con->Query(create_inner_big);
+  REQUIRE_FALSE(created->HasError());
+  auto verify = [this](const char* sql, JoinType join_type) {
+    auto plan = generate_sirius_plan_requiring_delim(sql, join_type, /*delim_flipped=*/true);
+    REQUIRE(plan);
+    CHECK_FALSE(contains_delim_machinery(plan.get()));
+    auto joins = collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+    REQUIRE(joins.size() == 1);
+    auto& hj = joins[0]->Cast<sirius::op::sirius_physical_hash_join>();
+    CHECK(hj.join_type == join_type);
+    CHECK(hj.conditions.size() == 1);
+  };
+  verify(flipped_exists_query, JoinType::RIGHT_SEMI);
+  verify(flipped_not_exists_query, JoinType::RIGHT_ANTI);
+}
+
+TEST_CASE_METHOD(delim_direct_fixture,
+                 "delim direct - two-condition correlations lower with both conditions preserved",
+                 "[delim_direct][isolated_context]")
+{
+  // apply substitutes the pinned outer source column per correlated condition; a two-condition
+  // shape mixing a plain `=` with a null-safe comparison pins that beyond n = 1, including the
+  // per-condition comparison preservation. (The uncorrelated qty filter keeps DuckDB from
+  // unnesting the subquery to a bare semi/anti join at this scale.)
+  auto verify = [this](const std::string& sql, JoinType delim_type, JoinType direct_type) {
+    auto plan = generate_sirius_plan_requiring_delim(sql, delim_type, /*delim_flipped=*/false);
+    REQUIRE(plan);
+    CHECK_FALSE(contains_delim_machinery(plan.get()));
+    auto joins = collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+    REQUIRE(joins.size() == 1);
+    auto& hj = joins[0]->Cast<sirius::op::sirius_physical_hash_join>();
+    CHECK(hj.join_type == direct_type);
+    REQUIRE(hj.conditions.size() == 2);
+    const auto null_safe_count   = std::ranges::count(hj.conditions,
+                                                    sirius::comparison_type::not_distinct_from,
+                                                    &sirius::join_condition::comparison);
+    const auto plain_equal_count = std::ranges::count(
+      hj.conditions, sirius::comparison_type::equal, &sirius::join_condition::comparison);
+    CHECK(null_safe_count == 1);
+    CHECK(plain_equal_count == 1);
+  };
+  const std::string two_condition_exists =
+    "SELECT val, count(*) FROM outer_t WHERE EXISTS "
+    "(SELECT 1 FROM inner_t WHERE rid = outer_t.id AND qty IS NOT DISTINCT FROM outer_t.val "
+    "AND qty < 100) GROUP BY val";
+  const std::string two_condition_not_exists =
+    "SELECT val, count(*) FROM outer_t WHERE NOT EXISTS "
+    "(SELECT 1 FROM inner_t WHERE rid = outer_t.id AND qty IS NOT DISTINCT FROM outer_t.val "
+    "AND qty < 100) GROUP BY val";
+  verify(two_condition_exists, JoinType::SEMI, JoinType::RIGHT_SEMI);
+  verify(two_condition_not_exists, JoinType::ANTI, JoinType::RIGHT_ANTI);
 }
 
 TEST_CASE_METHOD(delim_direct_fixture,
@@ -483,6 +582,31 @@ TEST_CASE_METHOD(delim_classify_fixture,
 {
   CHECK(classify_query(exists_query) == "none");
   CHECK(classify_query(not_exists_query) == "none");
+}
+
+TEST_CASE_METHOD(delim_classify_fixture,
+                 "delim direct - flipped RIGHT_SEMI/RIGHT_ANTI delims classify as eligible",
+                 "[delim_direct][isolated_context]")
+{
+  auto created = con->Query(create_inner_big);
+  REQUIRE_FALSE(created->HasError());
+
+  // The mutation hook doubles as the orientation assertion: these queries must actually plan
+  // the flipped delim (dedup sandwich at children[0]) the eligibility pin is about.
+  CHECK(classify_query(flipped_exists_query, [](LogicalComparisonJoin& delim) {
+          REQUIRE(delim.join_type == JoinType::RIGHT_SEMI);
+          REQUIRE(delim.delim_flipped);
+        }) == "none");
+  CHECK(classify_query(flipped_not_exists_query, [](LogicalComparisonJoin& delim) {
+          REQUIRE(delim.join_type == JoinType::RIGHT_ANTI);
+          REQUIRE(delim.delim_flipped);
+        }) == "none");
+
+  // The mirror of the SEMI-side orientation defense: a RIGHT_SEMI delim whose recorded
+  // orientation says unflipped must refuse.
+  CHECK(classify_query(flipped_exists_query, [](LogicalComparisonJoin& delim) {
+          delim.delim_flipped = false;
+        }) == "orientation_mismatch");
 }
 
 TEST_CASE_METHOD(delim_classify_fixture,
