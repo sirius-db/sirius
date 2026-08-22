@@ -194,7 +194,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
 
     // `%lit1%lit2%...%litN%` patterns take a SWAR digram fast path (NOT fused in);
     // everything else — and any ineligible column layout — takes cudf::strings::like.
-    if (duckdb::Config::ENABLE_LIKE_SWAR_FASTPATH && !input.is_scalar()) {
+    if (_like_swar_fastpath && !input.is_scalar()) {
       if (auto const parsed =
             classify_like_multiliteral(std::string_view(match_str), std::string_view())) {
         if (auto result_column = like_multiliteral(

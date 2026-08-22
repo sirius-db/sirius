@@ -47,6 +47,10 @@ namespace sirius::scan_manager {
 class sirius_scan_manager;
 }  // namespace sirius::scan_manager
 
+namespace sirius::planner {
+class sirius_physical_plan_generator;
+}  // namespace sirius::planner
+
 namespace sirius::op {
 class operator_data;
 
@@ -150,6 +154,11 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
 
   [[nodiscard]] virtual const ingestible_table_info& table_info() const noexcept = 0;
 
+  [[nodiscard]] bool like_swar_fastpath_enabled() const noexcept
+  {
+    return _like_swar_fastpath_enabled;
+  }
+
   /// Column primary (storage) indices in the exact order @ref materialize_table emits
   /// them — output columns first (in output order), then pure-filter columns; partition
   /// and virtual columns excluded. This is the layout @ref post_filter_and_project assumes
@@ -184,6 +193,16 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
 
  protected:
   gpu_ingestible() noexcept = default;
+
+ private:
+  bool _like_swar_fastpath_enabled = true;
+
+  void set_like_swar_fastpath_enabled(bool enabled) noexcept
+  {
+    _like_swar_fastpath_enabled = enabled;
+  }
+
+  friend class ::sirius::planner::sirius_physical_plan_generator;
 };
 
 }  // namespace scan

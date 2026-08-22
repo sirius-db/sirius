@@ -23,6 +23,7 @@
 #include "op/sirius_physical_operator.hpp"
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -233,12 +234,14 @@ class sirius_physical_plan_generator {
 
  public:
   //! Recursive post-pass that derives each operator's `_parent_op` from the final tree's
-  //! `children[]`, run after all tree rewrites have settled so the pointer cannot drift.
+  //! `children[]` and optionally stamps its expression-evaluator policy, run after all tree
+  //! rewrites have settled so neither value can drift.
   //! Public so the engine can re-run it after the RESULT_COLLECTOR wrap is added around the
   //! plan post-generation — otherwise the wrapped child's `_parent_op` would stay null and
   //! break the tree-parent-driven wiring.
   static void set_parent_ops(sirius::op::sirius_physical_operator& op,
-                             sirius::op::sirius_physical_operator* parent);
+                             sirius::op::sirius_physical_operator* parent,
+                             std::optional<bool> like_swar_fastpath = std::nullopt);
 
   //! Mark eligible merge operators for downstream pipeline fusion.
   static void mark_fusable_merge_pipelines(duckdb::ClientContext& context,

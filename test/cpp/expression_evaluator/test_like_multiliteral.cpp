@@ -413,6 +413,24 @@ TEST_CASE("like_multiliteral handles column-layout edges",
     require_matches_cudf(slices.front(), "%special%requests%");
   }
 
+  SECTION("tail words use bounded loads for every remainder and offset width")
+  {
+    std::string const literal = "abcdefghijklmnopqrst";
+    for (bool const int64_offsets : {false, true}) {
+      for (int remainder = 1; remainder < 8; ++remainder) {
+        CAPTURE(int64_offsets, remainder);
+        auto const col = make_strings(
+          {std::string(remainder, 'x'), "zz" + literal, "miss", "yy" + literal}, {}, int64_offsets);
+        auto const scv = cudf::strings_column_view(col->view());
+        REQUIRE(scv.chars_size(stream) % 8 == remainder);
+        require_matches_cudf(col->view(), "%" + literal + "%");
+
+        auto const slice = cudf::slice(col->view(), {1, 3}, stream);
+        require_matches_cudf(slice.front(), "%" + literal + "%");
+      }
+    }
+  }
+
   SECTION("misaligned chars base returns nullptr and the cudf fallback still works")
   {
     // Hand-build a strings view whose chars base sits at buffer+1 (odd address).

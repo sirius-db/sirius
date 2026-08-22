@@ -63,24 +63,38 @@ __device__ __forceinline__ uint64_t byte_eq_mask(uint64_t x, uint64_t bcast)
   return (v - 0x0101010101010101ULL) & ~v & 0x8080808080808080ULL;
 }
 
+/// Load one aligned little-endian word without reading past the chars child.
+__device__ __forceinline__ uint64_t load_aligned_word(uint64_t const* __restrict__ words,
+                                                      int64_t chars_size,
+                                                      int64_t word_index)
+{
+  int64_t const byte_pos = word_index << 3;
+  if (byte_pos >= chars_size) { return 0; }
+  if (chars_size - byte_pos >= static_cast<int64_t>(sizeof(uint64_t))) { return words[word_index]; }
+  auto const* tail = reinterpret_cast<unsigned char const*>(words) + byte_pos;
+  uint64_t value   = 0;
+#pragma unroll
+  for (int i = 0; i < static_cast<int>(sizeof(uint64_t)); ++i) {
+    if (byte_pos + i >= chars_size) { break; }
+    value |= static_cast<uint64_t>(tail[i]) << (i * 8);
+  }
+  return value;
+}
+
 /**
  * @brief Unaligned little-endian u64 window at byte position @p p of an aligned u64 stream.
  *
- * The caller guarantees the low word overlaps valid bytes (p < words_end_pos); the high word
- * is loaded only when needed and only when it also overlaps valid bytes, so no aligned load
- * ever starts at or past @p words_end_pos. Positions past @p words_end_pos read as 0 only in
- * a substituted high word; within a genuinely loaded word they are whatever the buffer holds
- * — callers must mask or bounds-reject such bytes either way.
+ * Bytes at or beyond @p chars_size read as zero.
  */
 __device__ __forceinline__ uint64_t read_u64_window(uint64_t const* __restrict__ words,
-                                                    int64_t words_end_pos,
+                                                    int64_t chars_size,
                                                     int64_t p)
 {
   int64_t const w   = p >> 3;
   int const off     = static_cast<int>(p & 7) * 8;
-  uint64_t const lo = words[w];
+  uint64_t const lo = load_aligned_word(words, chars_size, w);
   if (off == 0) { return lo; }
-  uint64_t const hi = ((w + 1) << 3) < words_end_pos ? words[w + 1] : 0;
+  uint64_t const hi = load_aligned_word(words, chars_size, w + 1);
   return (lo >> off) | (hi << (64 - off));
 }
 
@@ -101,14 +115,14 @@ candidate_mask(uint64_t cur, uint64_t next, uint64_t b0, uint64_t b1, int32_t le
 
 /// Full literal verification at byte position @p p (caller guarantees p + lit.len fits the row).
 __device__ __forceinline__ bool verify_literal(uint64_t const* __restrict__ words,
-                                               int64_t words_end_pos,
+                                               int64_t chars_size,
                                                int64_t p,
                                                literal_desc const& lit)
 {
 #pragma unroll
   for (int c = 0; c < max_chunks; ++c) {
     if (c == lit.nchunks) { break; }
-    uint64_t const win = read_u64_window(words, words_end_pos, p + 8 * c);
+    uint64_t const win = read_u64_window(words, chars_size, p + 8 * c);
     if ((win & lit.chunk_mask[c]) != lit.chunk_val[c]) { return false; }
   }
   return true;
@@ -123,18 +137,13 @@ __device__ __forceinline__ bool verify_literal(uint64_t const* __restrict__ word
  * the end of the previous match — exact for `%lit1%...%litN%` semantics.
  *
  * All positions are absolute byte positions into the chars buffer (offsets are stored that
- * way even for sliced views). Aligned loads are guarded by `buf_end = offsets[nrows]`: a
- * word starting at or past it may lie outside the mapped allocation and reads as 0 instead
- * — such bytes are past every row's end, so they never influence a result.
- *
- * Known-benign sanitizer note: the last aligned word may over-read up to 7 bytes past the
- * logical chars size (within rmm's 256B allocation-alignment slack; fault-free because the
- * base is 8B-aligned so no load crosses a page boundary) — compute-sanitizer memcheck may
- * flag this on exactly-sized allocations; do not "fix" it with a per-load guard.
+ * way even for sliced views). The chars-child size bounds memory loads; each row's offsets
+ * independently bound candidate matching.
  */
 template <typename OffT>
 __global__ void like_multiliteral_kernel(uint64_t const* __restrict__ words,
                                          OffT const* __restrict__ offsets,
+                                         int64_t chars_size,
                                          cudf::size_type nrows,
                                          cudf::bitmask_type const* __restrict__ null_mask,
                                          cudf::size_type mask_offset,
@@ -150,9 +159,8 @@ __global__ void like_multiliteral_kernel(uint64_t const* __restrict__ words,
     null_mask == nullptr ||
     cudf::bit_is_set(null_mask, mask_offset + static_cast<cudf::size_type>(row));
   if (is_valid) {
-    int64_t const buf_end = static_cast<int64_t>(offsets[nrows]);  // broadcast load
-    int64_t const s       = static_cast<int64_t>(offsets[row]);
-    int64_t const e       = static_cast<int64_t>(offsets[row + 1]);
+    int64_t const s = static_cast<int64_t>(offsets[row]);
+    int64_t const e = static_cast<int64_t>(offsets[row + 1]);
     if (e - s >= pat.total_len) {  // rows shorter than the literals cannot match
       int li          = 0;
       int64_t min_pos = s;  // next literal may start no earlier than this
@@ -163,10 +171,9 @@ __global__ void like_multiliteral_kernel(uint64_t const* __restrict__ words,
 
       int64_t w        = s >> 3;
       int64_t const we = (e + 7) >> 3;  // exclusive
-      // Safe unguarded: s < e (total_len >= 1), so word w overlaps byte s < buf_end.
-      uint64_t cur = words[w];
+      uint64_t cur     = load_aligned_word(words, chars_size, w);
       for (; w < we && !match; ++w) {
-        uint64_t const next = ((w + 1) << 3) < buf_end ? words[w + 1] : 0;
+        uint64_t const next = load_aligned_word(words, chars_size, w + 1);
         int64_t const base  = w << 3;
         uint64_t cand       = candidate_mask(cur, next, b0, b1, len);
         while (cand) {
@@ -177,7 +184,7 @@ __global__ void like_multiliteral_kernel(uint64_t const* __restrict__ words,
           // end (including digram second-bytes that belong to the next row), are rejected
           // here — candidate detection may fire on them, verification never sees them.
           if (p < min_pos || p + len > e) { continue; }
-          if (!verify_literal(words, buf_end, p, pat.literals[li])) { continue; }
+          if (!verify_literal(words, chars_size, p, pat.literals[li])) { continue; }
           min_pos = p + len;
           ++li;
           if (li == pat.n) {
@@ -295,17 +302,18 @@ std::unique_ptr<cudf::column> like_multiliteral(cudf::strings_column_view const&
 
   auto const* null_mask = input.null_count() > 0 ? input.null_mask() : nullptr;
   auto const* words     = reinterpret_cast<uint64_t const*>(chars_base);
+  auto const chars_size = static_cast<int64_t>(input.chars_size(stream));
   auto const num_blocks = static_cast<unsigned>(
     (static_cast<int64_t>(nrows) + threads_per_block - 1) / threads_per_block);
 
   if (offsets_id == cudf::type_id::INT32) {
     auto const* offsets = input.offsets().data<int32_t>() + input.offset();
     like_multiliteral_kernel<int32_t><<<num_blocks, threads_per_block, 0, stream.value()>>>(
-      words, offsets, nrows, null_mask, input.offset(), pat, invert, out);
+      words, offsets, chars_size, nrows, null_mask, input.offset(), pat, invert, out);
   } else {
     auto const* offsets = input.offsets().data<int64_t>() + input.offset();
     like_multiliteral_kernel<int64_t><<<num_blocks, threads_per_block, 0, stream.value()>>>(
-      words, offsets, nrows, null_mask, input.offset(), pat, invert, out);
+      words, offsets, chars_size, nrows, null_mask, input.offset(), pat, invert, out);
   }
   CUDF_CHECK_CUDA(stream.value());
   return result;

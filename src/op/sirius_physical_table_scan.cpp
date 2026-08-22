@@ -172,8 +172,12 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   }
 
   if (local_filter_expr != nullptr) {
-    sirius::expression_evaluator evaluator(
-      *local_filter_expr, cudf::get_current_device_resource_ref(), stream);
+    sirius::expression_evaluator evaluator(*local_filter_expr,
+                                           cudf::get_current_device_resource_ref(),
+                                           stream,
+                                           strategy_from_config(),
+                                           2,
+                                           like_swar_fastpath_enabled());
     auto filtered_table = evaluator.select(
       batch_ref.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
     output_batch = sirius::make_data_batch(

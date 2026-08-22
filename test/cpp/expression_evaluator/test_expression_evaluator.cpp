@@ -21,7 +21,6 @@
 #include <utils/utils.hpp>
 
 // sirius
-#include <config.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <data/data_batch_utils.hpp>
@@ -390,9 +389,11 @@ exec_result run_execute(memory_space& space,
 exec_result run_select(memory_space& space,
                        std::shared_ptr<data_batch> const& input_batch,
                        std::unique_ptr<ast_node> node,
-                       exp_strategy_enum strategy = MAT)
+                       exp_strategy_enum strategy = MAT,
+                       bool like_swar_fastpath    = true)
 {
-  exp_executor executor(*node, get_resource_ref(space), cudf::get_default_stream(), strategy);
+  exp_executor executor(
+    *node, get_resource_ref(space), cudf::get_default_stream(), strategy, 2, like_swar_fastpath);
   auto input_ro     = input_batch->to_read_only();
   auto& in_repr     = input_ro.get_data()->cast<gpu_table_representation>();
   auto output_table = executor.select(in_repr.get_table_view());
@@ -1679,29 +1680,21 @@ TEMPLATE_TEST_CASE("select LIKE and NOT LIKE",
     REQUIRE(copy_string_column_to_host(ov.column(0)) == expected);
   }
 
-  SECTION("NOT LIKE '%tr%1%' — fast path agrees with the cudf path (knob off)")
+  SECTION("NOT LIKE '%tr%1%' — fast path agrees with the cudf path (fast path disabled)")
   {
-    auto run_not_like = [&]() {
+    auto run_not_like = [&](bool like_swar_fastpath) {
       std::vector<std::unique_ptr<ast_node>> children;
       children.push_back(make_ref(0));
       children.push_back(make_str_const("%tr%1%"));
       auto expr = make_func(
         sirius::function_id::not_like, std::move(children), logical_type::make(type_id::BOOLEAN));
-      auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
+      auto [in_batch, out_batch, iv, ov] =
+        run_select(*space, input, std::move(expr), strategy, like_swar_fastpath);
       return copy_string_column_to_host(ov.column(0));
     };
 
-    // RAII restore: a throwing/failing run_not_like must not leak knob state into
-    // later test cases.
-    struct knob_restore {
-      bool saved = duckdb::Config::ENABLE_LIKE_SWAR_FASTPATH;
-      ~knob_restore() { duckdb::Config::ENABLE_LIKE_SWAR_FASTPATH = saved; }
-    } const restore_knob;
-
-    duckdb::Config::ENABLE_LIKE_SWAR_FASTPATH = true;
-    auto const with_fast_path                 = run_not_like();
-    duckdb::Config::ENABLE_LIKE_SWAR_FASTPATH = false;
-    auto const with_cudf                      = run_not_like();
+    auto const with_fast_path = run_not_like(true);
+    auto const with_cudf      = run_not_like(false);
     REQUIRE(with_fast_path == with_cudf);
   }
 }

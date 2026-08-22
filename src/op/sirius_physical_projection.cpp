@@ -101,7 +101,12 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
   // Construct the evaluator once (reused across batches; evaluate() resets its state each call).
   std::optional<sirius::expression_evaluator> evaluator;
   if (!all_passthrough) {
-    evaluator.emplace(evaluated_exprs, cudf::get_current_device_resource_ref(), stream);
+    evaluator.emplace(evaluated_exprs,
+                      cudf::get_current_device_resource_ref(),
+                      stream,
+                      strategy_from_config(),
+                      2,
+                      like_swar_fastpath_enabled());
   }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;

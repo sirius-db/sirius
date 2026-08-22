@@ -197,6 +197,49 @@ TEST_CASE("Legacy-only settings follow the build surface",
   }
 }
 
+TEST_CASE("like_swar_fastpath is isolated between connections",
+          "[sirius][config][like-swar][isolated_context]")
+{
+  finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
+  setenv("SIRIUS_DISABLE", "1", 1);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con_a(db);
+  duckdb::Connection con_b(db);
+
+  REQUIRE(duckdb::like_swar_fastpath_enabled(*con_a.context));
+  REQUIRE(duckdb::like_swar_fastpath_enabled(*con_b.context));
+
+  auto set_result = con_a.Query("SET like_swar_fastpath = false");
+  REQUIRE(set_result != nullptr);
+  REQUIRE_FALSE(set_result->HasError());
+  REQUIRE_FALSE(duckdb::like_swar_fastpath_enabled(*con_a.context));
+  REQUIRE(duckdb::like_swar_fastpath_enabled(*con_b.context));
+
+  auto reset_result = con_a.Query("RESET like_swar_fastpath");
+  REQUIRE(reset_result != nullptr);
+  REQUIRE_FALSE(reset_result->HasError());
+  REQUIRE(duckdb::like_swar_fastpath_enabled(*con_a.context));
+}
+
+TEST_CASE("like_swar_fastpath does not leak into a separate database",
+          "[sirius][config][like-swar][isolated_context]")
+{
+  finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
+  setenv("SIRIUS_DISABLE", "1", 1);
+
+  duckdb::DuckDB db_a(nullptr);
+  duckdb::Connection con_a(db_a);
+  auto set_result = con_a.Query("SET like_swar_fastpath = false");
+  REQUIRE(set_result != nullptr);
+  REQUIRE_FALSE(set_result->HasError());
+  REQUIRE_FALSE(duckdb::like_swar_fastpath_enabled(*con_a.context));
+
+  duckdb::DuckDB db_b(nullptr);
+  duckdb::Connection con_b(db_b);
+  REQUIRE(duckdb::like_swar_fastpath_enabled(*con_b.context));
+}
+
 TEST_CASE("Test-only settings require explicit process opt-in",
           "[sirius][config][test-settings][isolated_context]")
 {

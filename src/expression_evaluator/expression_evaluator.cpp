@@ -139,8 +139,13 @@ expression_evaluator::expression_evaluator(
   rmm::device_async_resource_ref resource_ref,
   rmm::cuda_stream_view stream,
   expression_evaluator_strategy strategy,
-  std::size_t min_ast_size)
-  : _strategy(strategy), _mr(resource_ref), _stream(stream), _min_ast_size(min_ast_size)
+  std::size_t min_ast_size,
+  bool like_swar_fastpath)
+  : _strategy(strategy),
+    _mr(resource_ref),
+    _stream(stream),
+    _min_ast_size(min_ast_size),
+    _like_swar_fastpath(like_swar_fastpath)
 {
   _ast_expressions.reserve(expressions.size());
   for (auto const& expr : expressions) {
@@ -152,8 +157,10 @@ expression_evaluator::expression_evaluator(sirius::ast::node const& expression,
                                            rmm::device_async_resource_ref resource_ref,
                                            rmm::cuda_stream_view stream,
                                            expression_evaluator_strategy strategy,
-                                           std::size_t min_ast_size)
-  : expression_evaluator(&expression, resource_ref, stream, strategy, min_ast_size)
+                                           std::size_t min_ast_size,
+                                           bool like_swar_fastpath)
+  : expression_evaluator(
+      &expression, resource_ref, stream, strategy, min_ast_size, like_swar_fastpath)
 {
 }
 
@@ -161,8 +168,13 @@ expression_evaluator::expression_evaluator(sirius::ast::node const* expression,
                                            rmm::device_async_resource_ref resource_ref,
                                            rmm::cuda_stream_view stream,
                                            expression_evaluator_strategy strategy,
-                                           std::size_t min_ast_size)
-  : _strategy(strategy), _mr(resource_ref), _stream(stream), _min_ast_size(min_ast_size)
+                                           std::size_t min_ast_size,
+                                           bool like_swar_fastpath)
+  : _strategy(strategy),
+    _mr(resource_ref),
+    _stream(stream),
+    _min_ast_size(min_ast_size),
+    _like_swar_fastpath(like_swar_fastpath)
 {
   _ast_expressions.push_back(expression);
 }
@@ -171,12 +183,14 @@ expression_evaluator::expression_evaluator(std::vector<sirius::ast::node const*>
                                            rmm::device_async_resource_ref resource_ref,
                                            rmm::cuda_stream_view stream,
                                            expression_evaluator_strategy strategy,
-                                           std::size_t min_ast_size)
+                                           std::size_t min_ast_size,
+                                           bool like_swar_fastpath)
   : _ast_expressions(std::move(expressions)),
     _strategy(strategy),
     _mr(resource_ref),
     _stream(stream),
-    _min_ast_size(min_ast_size)
+    _min_ast_size(min_ast_size),
+    _like_swar_fastpath(like_swar_fastpath)
 {
 }
 

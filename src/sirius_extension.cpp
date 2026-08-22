@@ -1825,12 +1825,11 @@ static void SetEnableRegexJitImpl(ClientContext& context, SetScope scope, Value&
   SIRIUS_LOG_DEBUG("Updated config ENABLE_REGEX_JIT_IMPL to {}", Config::ENABLE_REGEX_JIT_IMPL);
 }
 
-static void SetEnableLikeSwarFastpath(ClientContext& context, SetScope scope, Value& parameter)
+static void SetEnableLikeSwarFastpath(ClientContext& /*context*/,
+                                      SetScope /*scope*/,
+                                      Value& /*parameter*/)
 {
-  throw_if_sirius_runtime_unavailable(context);
-  Config::ENABLE_LIKE_SWAR_FASTPATH = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config ENABLE_LIKE_SWAR_FASTPATH to {}",
-                   Config::ENABLE_LIKE_SWAR_FASTPATH);
+  // DuckDB stores this setting in the client context.
 }
 
 #ifdef SIRIUS_ENABLE_LEGACY
@@ -2311,7 +2310,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     "Whether '%lit1%lit2%...%' LIKE patterns take the SWAR digram fast-path kernel instead of "
     "cudf::strings::like",
     LogicalType::BOOLEAN,
-    Value::BOOLEAN(Config::ENABLE_LIKE_SWAR_FASTPATH),
+    Value::BOOLEAN(true),
     SetEnableLikeSwarFastpath);
 
 #ifdef SIRIUS_ENABLE_LEGACY

@@ -275,9 +275,24 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
     duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context),
     std::move(active_gpu_ids)};
 
-  // The collector is added after planning, so refresh parent pointers before marking fusion.
+  // A root wrapper added after planning has not been stamped yet. Recover the captured policy
+  // from its planned subtree: RESULT_COLLECTOR keeps that subtree outside children[], while
+  // ordinary wrappers such as STREAMING_SINK own it as a child.
+  auto* policy_source = sirius_physical_plan.get();
+  if (sirius_physical_plan->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
+    policy_source = &sirius_physical_plan->Cast<op::sirius_physical_result_collector>().plan;
+  } else {
+    for (auto const& child : sirius_physical_plan->children) {
+      if (child) {
+        policy_source = child.get();
+        break;
+      }
+    }
+  }
+  auto const like_swar_fastpath = policy_source->like_swar_fastpath_enabled();
   sirius::planner::sirius_physical_plan_generator::set_parent_ops(*sirius_physical_plan,
-                                                                  /*parent=*/nullptr);
+                                                                  /*parent=*/nullptr,
+                                                                  like_swar_fastpath);
   sirius::planner::sirius_physical_plan_generator::mark_fusable_merge_pipelines(
     context, *sirius_physical_plan);
 
