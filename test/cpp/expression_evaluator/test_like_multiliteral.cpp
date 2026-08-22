@@ -300,6 +300,7 @@ TEST_CASE("like_multiliteral matches cudf on adversarial fixed rows",
     "%s%p%e%c%",                   // four 1-byte literals
     "%al requ%",                   // literal spanning the gap between the q13 words
     "%" + lit32 + "%",             // 32-byte literal (4 verify chunks)
+    "%special package with%",      // 20-byte literal: partially-masked verify chunk at index 2
     "%special%requests%special%",  // literal count > occurrences in most rows
   };
   for (auto const& pattern : patterns) {
