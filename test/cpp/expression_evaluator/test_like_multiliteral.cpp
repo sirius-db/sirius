@@ -19,12 +19,15 @@
 //      else (anchored patterns, `_`, escapes, non-ASCII, over-caps) is refused;
 //   2. the kernel — differential against cudf::strings::like on adversarial fixed rows (word
 //      alignment sweeps, literal-at-row-edges, greedy/overlap traps, UTF-8 neighbours, nulls,
-//      sliced views) and on seeded random near-miss data.
+//      sliced views) and on seeded random near-miss data;
+//   3. the host launcher contract — caps-violating patterns that bypass the classifier throw
+//      sirius::internal_exception instead of silently falling back.
 
 #include "catch.hpp"
 
 // sirius
 #include <expression_evaluator/like_multiliteral.hpp>
+#include <sirius/exception.hpp>
 
 // cudf
 #include <cudf/column/column.hpp>
@@ -321,6 +324,25 @@ TEST_CASE("like_multiliteral matches cudf on adversarial fixed rows",
       col->view(), {3, static_cast<cudf::size_type>(rows.size()) - 5}, cudf::get_default_stream());
     require_matches_cudf(slices.front(), "%special%requests%");
     require_matches_cudf(slices.front(), "%aa%aa%");
+
+    // Sliced view WITH nulls pins the kernel's `mask_offset + row` null-mask read and the
+    // copy_bitmask rebase of the sliced result mask. Detection property: the slice offset (4)
+    // must not be a multiple of the null period (3), so an un-offset mask read yields a different
+    // validity pattern; and each tested pattern needs a genuinely-valid MATCHING row at a slice
+    // position r with r % 3 == 0, which such a read mis-classifies as null and flips from !invert
+    // to invert. Witnesses: original row 10 "specialrequestsrequests" -> r = 6 for
+    // %special%requests%, original row 58 "aabaa" -> r = 54 for %aa%aa%. Re-verify these
+    // witnesses when editing the row list, the valids period, or the slice bounds.
+    std::vector<bool> valids(rows.size(), true);
+    for (size_t i = 0; i < rows.size(); i += 3) {
+      valids[i] = false;
+    }
+    auto const with_nulls        = make_strings(rows, valids);
+    auto const slices_with_nulls = cudf::slice(with_nulls->view(),
+                                               {4, static_cast<cudf::size_type>(rows.size()) - 5},
+                                               cudf::get_default_stream());
+    require_matches_cudf(slices_with_nulls.front(), "%special%requests%");
+    require_matches_cudf(slices_with_nulls.front(), "%aa%aa%");
   }
 }
 
@@ -382,6 +404,12 @@ TEST_CASE("like_multiliteral handles column-layout edges",
     REQUIRE(cudf::strings_column_view(col->view()).offsets().type().id() == cudf::type_id::INT64);
     require_matches_cudf(col->view(), "%special%requests%");
     require_matches_cudf(col->view(), "%aa%aa%");
+
+    // A sliced view pins the `data<int64_t>() + input.offset()` offsets-pointer rebase in the
+    // int64 launch branch: without it, slice row 0 ("requests special", no match) reads original
+    // row 0's bounds ("special requests", match) and diverges from cudf.
+    auto const slices = cudf::slice(col->view(), {1, 5}, stream);
+    require_matches_cudf(slices.front(), "%special%requests%");
   }
 
   SECTION("misaligned chars base returns nullptr and the cudf fallback still works")
@@ -444,6 +472,14 @@ TEST_CASE("like_multiliteral handles column-layout edges",
     }
   }
 
+  SECTION("all-null column: zero-byte chars buffer, validity gate does all the work")
+  {
+    // With every row null the chars buffer holds 0 bytes and its base may be nullptr, which
+    // passes the 8-byte-alignment check by design; the null mask alone decides every output.
+    auto const col = make_strings({"special requests", "x", ""}, {false, false, false});
+    require_matches_cudf(col->view(), "%special%requests%");
+  }
+
   SECTION("embedded NUL bytes in data rows (literals cannot contain NUL, data can)")
   {
     using namespace std::string_literals;
@@ -461,4 +497,34 @@ TEST_CASE("like_multiliteral handles column-layout edges",
     require_matches_cudf(col->view(), "%special%requests%");
     require_matches_cudf(col->view(), "%aa%aa%");
   }
+}
+
+// ---------------------------------------------------------------------------
+// Host launcher contract: caps violations throw, they never fall back
+// ---------------------------------------------------------------------------
+
+TEST_CASE("like_multiliteral throws on patterns violating the classifier caps",
+          "[expression_evaluator][like_multiliteral]")
+{
+  auto stream = cudf::get_default_stream();
+  auto mr     = cudf::get_current_device_resource_ref();
+
+  // Hand-built patterns bypass the classifier; a caps-violating pattern reaching the launcher is
+  // a contract violation and must throw (nullptr exclusively means layout ineligibility). The
+  // column must be non-empty: the literal-count check precedes the nrows == 0 early return, but
+  // the per-literal byte check follows it.
+  auto const col = make_strings({"x"});
+  auto const scv = cudf::strings_column_view(col->view());
+
+  sirius::like_multiliteral_pattern const five_literals{{"a", "b", "c", "d", "e"}};
+  REQUIRE_THROWS_AS(like_multiliteral(scv, five_literals, false, stream, mr),
+                    sirius::internal_exception);
+
+  sirius::like_multiliteral_pattern const oversized_literal{{std::string(33, 'x')}};
+  REQUIRE_THROWS_AS(like_multiliteral(scv, oversized_literal, false, stream, mr),
+                    sirius::internal_exception);
+
+  sirius::like_multiliteral_pattern const empty_literal{{""}};
+  REQUIRE_THROWS_AS(like_multiliteral(scv, empty_literal, false, stream, mr),
+                    sirius::internal_exception);
 }

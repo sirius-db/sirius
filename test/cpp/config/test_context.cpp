@@ -143,12 +143,13 @@ constexpr std::array<setting_assignment, 10> legacy_only_settings{{
   {"modified_pipeline", "true"},
 }};
 
-constexpr std::array<const char*, 5> super_sirius_settings{{
+constexpr std::array<const char*, 6> super_sirius_settings{{
   "expression_evaluator_strategy",
   "enable_regex_jit_impl",
   "enable_duckdb_fallback",
   "fuse_merge_pipelines",
   "scan_task_batch_size",
+  "like_swar_fastpath",
 }};
 }  // namespace
 
