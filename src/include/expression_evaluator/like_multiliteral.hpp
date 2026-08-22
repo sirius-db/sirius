@@ -34,6 +34,7 @@
 namespace sirius {
 
 /**
+ * @file
  * @brief SWAR fast path for multi-literal LIKE patterns of the form `%lit1%lit2%...%litN%`.
  *
  * cudf's `like_fn` is thread-per-row and byte-at-a-time; on wide comment-style columns it is
@@ -70,6 +71,8 @@ struct like_multiliteral_pattern {
  * - 1..like_multiliteral_max_literals literals, each of at most
  *   like_multiliteral_max_literal_bytes bytes.
  *
+ * @param pattern The LIKE pattern to classify
+ * @param escape  The LIKE escape clause; any non-empty value refuses the pattern
  * @return The parsed literal sequence, or std::nullopt when the pattern must take the
  *         `cudf::strings::like` path.
  */
@@ -84,6 +87,9 @@ std::optional<like_multiliteral_pattern> classify_like_multiliteral(std::string_
  * fused): row i is true iff the literals occur in order, non-overlapping, within row i.
  * The null mask of @p input is copied to the result; null rows carry value `invert`
  * (matching the cudf like → cudf NOT composition, where null rows carry false pre-NOT).
+ *
+ * @throws sirius::internal_exception if @p pattern was not produced by
+ *         classify_like_multiliteral() (violates the literal count or byte-length caps)
  *
  * @param input   Strings column to match. Rows must be valid UTF-8 (the same precondition
  *                cudf's strings APIs document); for ASCII literals, byte-level search is then
