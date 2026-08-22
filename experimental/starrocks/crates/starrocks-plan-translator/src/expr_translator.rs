@@ -591,6 +591,93 @@ fn integer_literal_value(expr: &Expression) -> Option<i64> {
     }
 }
 
+/// A StarRocks aggregate call decomposed for Substrait `AggregateRel` measures.
+pub(crate) struct AggregateCall {
+    /// Substrait/DuckDB aggregate function name.
+    pub name: String,
+    /// Translated argument expressions over the aggregation input row.
+    pub arguments: Vec<Expression>,
+    /// Whether the aggregate applies to distinct inputs.
+    pub distinct: bool,
+}
+
+/// Decomposes a StarRocks aggregate-function expression (the root of a
+/// `TAggregationNode::aggregate_functions` entry) into name, arguments, and distinct-ness.
+pub(crate) fn aggregate_call(expr: &TExpr, ctx: &mut ExprContext<'_>) -> Result<AggregateCall> {
+    let root = expr
+        .nodes
+        .first()
+        .ok_or_else(|| TranslateError::malformed("aggregate function TExpr is empty"))?;
+    let is_aggregate_root = matches!(
+        root.node_type,
+        TExprNodeType::AGG_EXPR | TExprNodeType::FUNCTION_CALL
+    ) && root.agg_expr.is_some();
+    if !is_aggregate_root {
+        return Err(TranslateError::UnsupportedExpression {
+            node_type: root.node_type,
+            reason: "aggregate function root is not an aggregate expression",
+        });
+    }
+    // One-phase aggregation only: a merge aggregate consumes partial states this translator
+    // does not model (run with `new_planner_agg_stage = 1`).
+    if root
+        .agg_expr
+        .as_ref()
+        .is_some_and(|agg_expr| agg_expr.is_merge_agg)
+    {
+        return Err(TranslateError::UnsupportedExpression {
+            node_type: root.node_type,
+            reason: "merge-phase aggregate functions are not supported (one-phase only)",
+        });
+    }
+    let function = root.fn_.as_ref().ok_or(TranslateError::MissingField {
+        context: "aggregate expression",
+        field: "fn",
+    })?;
+    // `multi_distinct_sum` is intentionally absent: the GPU grouped-aggregate path only
+    // honors DISTINCT for count and would silently overcount a distinct sum.
+    let (name, distinct) = match function.name.function_name.as_str() {
+        name @ ("sum" | "count" | "min" | "max" | "avg") => (name, false),
+        "multi_distinct_count" => ("count", true),
+        name => {
+            return Err(TranslateError::malformed(format!(
+                "unsupported StarRocks aggregate function {name:?}"
+            )));
+        }
+    };
+    // Multi-column COUNT(DISTINCT a, b) needs key packing the executor does not do here.
+    if distinct && root.num_children != 1 {
+        return Err(TranslateError::UnsupportedExpression {
+            node_type: root.node_type,
+            reason: "distinct aggregates over multiple columns are not supported",
+        });
+    }
+    // Only double-returning `avg` translates faithfully. StarRocks `avg` over decimals returns
+    // a decimal (DuckDB computes a double and the consumer ignores the declared output type),
+    // and temporal `avg` has StarRocks-specific day-rounding semantics.
+    if name == "avg" && type_mapper::scalar_primitive(&function.ret_type)? != TPrimitiveType::DOUBLE
+    {
+        return Err(TranslateError::UnsupportedExpression {
+            node_type: root.node_type,
+            reason: "only avg with a DOUBLE result is supported (decimal/temporal avg differ)",
+        });
+    }
+
+    let mut cursor = ExprNodeCursor::new(&expr.nodes);
+    // Consume the root marker; its children are the aggregate arguments.
+    cursor.idx = 1;
+    let arguments = (0..root.num_children)
+        .map(|_| cursor.translate_next(ctx))
+        .collect::<Result<Vec<_>>>()?;
+    cursor.ensure_consumed()?;
+
+    Ok(AggregateCall {
+        name: name.to_string(),
+        arguments,
+        distinct,
+    })
+}
+
 /// Converts supported comparison opcodes into Substrait comparison functions.
 fn translate_binary_pred(
     node: &TExprNode,

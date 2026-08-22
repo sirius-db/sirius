@@ -27,8 +27,10 @@
 #include "helper/logical_type.hpp"
 
 #include <cudf/column/column.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/cudf_utils.hpp>
+#include <cudf/lists/lists_column_view.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
@@ -40,6 +42,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <utility>
 #include <vector>
 
 using sirius::estimate_referenced_column_bytes;
@@ -229,4 +233,56 @@ TEST_CASE("make_empty_table - the logical-type overload derives native carriers"
   REQUIRE(table->num_rows() == 0);
   REQUIRE(table->get_column(0).type() == cudf::data_type{cudf::type_id::INT64});
   REQUIRE(table->get_column(1).type() == cudf::data_type{cudf::type_id::DECIMAL64, -2});
+}
+
+TEST_CASE("make_empty_table - the logical-type overload builds nested-safe ARRAY columns",
+          "[cudf_utils]")
+{
+  // An ARRAY entry needs cuDF's LIST factory (make_empty_column rejects nested types) and must
+  // carry its fixed-width element type on the child column, so empty synthesized tables
+  // concatenate/join cleanly against decoded batches.
+  duckdb::vector<logical_type> const types{
+    logical_type::make(type_id::INTEGER),
+    logical_type::make_array(logical_type::make(type_id::INTEGER), 3),
+    logical_type::make(type_id::VARCHAR)};
+
+  auto const table = sirius::make_empty_table(types);
+  REQUIRE(table != nullptr);
+  REQUIRE(table->num_columns() == 3);
+  REQUIRE(table->num_rows() == 0);
+  REQUIRE(table->get_column(0).type().id() == cudf::type_id::INT32);
+  REQUIRE(table->get_column(1).type().id() == cudf::type_id::LIST);
+  cudf::lists_column_view const lists(table->get_column(1).view());
+  REQUIRE(lists.child().type().id() == cudf::type_id::INT32);
+  REQUIRE(table->get_column(2).type().id() == cudf::type_id::STRING);
+}
+
+TEST_CASE("make_empty_table - the cudf-type overload refuses nested carriers", "[cudf_utils]")
+{
+  // An id-only cudf::data_type carries no element type, so the carrier-exact overload cannot
+  // synthesize a nested column; it must direct the caller to the logical-type overload instead of
+  // surfacing an opaque cudf::logic_error.
+  std::vector<cudf::data_type> const carriers{cudf::data_type{cudf::type_id::INT32},
+                                              cudf::data_type{cudf::type_id::LIST}};
+  REQUIRE_THROWS_AS(sirius::make_empty_table(carriers), duckdb::InvalidInputException);
+  REQUIRE_THROWS_WITH(sirius::make_empty_table(carriers), Catch::Contains("logical-type overload"));
+}
+
+TEST_CASE("make_empty_like reproduces nested LIST columns", "[cudf_utils]")
+{
+  // The empty rebuild must mirror the input's full per-column type hierarchy, not just the
+  // top-level type ids -- a fully pruned ARRAY scan hands TOP-N a 0-row LIST view to emulate.
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::INT32}));
+  cols.push_back(cudf::make_empty_lists_column(cudf::data_type{cudf::type_id::FLOAT64}));
+  cudf::table const input(std::move(cols));
+
+  auto const empty = duckdb::make_empty_like(input.view());
+  REQUIRE(empty != nullptr);
+  REQUIRE(empty->num_columns() == 2);
+  REQUIRE(empty->num_rows() == 0);
+  REQUIRE(empty->get_column(0).type().id() == cudf::type_id::INT32);
+  REQUIRE(empty->get_column(1).type().id() == cudf::type_id::LIST);
+  cudf::lists_column_view const lists(empty->get_column(1).view());
+  REQUIRE(lists.child().type().id() == cudf::type_id::FLOAT64);
 }

@@ -304,26 +304,19 @@ class parquet_gpu_ingestible : public gpu_ingestible {
 
   [[nodiscard]] std::vector<std::size_t> materialized_column_order() const override;
 
+  [[nodiscard]] bool output_assembly_is_leading_identity() const noexcept override;
+
   [[nodiscard]] bool has_row_filter() const noexcept override
   {
     return _duckdb_filter_expression != nullptr;
   }
 
-  [[nodiscard]] std::unordered_map<std::size_t, std::vector<std::string>>
-  decode_predicate_candidates() const override
+  [[nodiscard]] scan_filter_analysis const& filter_analysis() const override
   {
-    return _decode_predicate_candidates;
+    return _filter_analysis;
   }
 
  private:
-  /// The filter form matching @p batch when one or more candidate columns
-  /// arrived as a decode-time BOOL8 mask: those contribute a bare boolean
-  /// reference instead of a comparison. Returns null when nothing was
-  /// substituted, meaning the caller should use @c _duckdb_filter_expression.
-  /// Never called without @c _duckdb_filter_expression.
-  [[nodiscard]] duckdb::unique_ptr<duckdb::Expression> build_filter_expression_for(
-    cudf::table_view const& batch) const;
-
   /// Read one file's footer, prune its row groups against the filter, and record
   /// per-row-group byte accounting. Returns a single @c parquet_file_scan_info.
   /// Runs on a scan-manager dispatcher thread (the task returned by
@@ -344,18 +337,16 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   // partition-column drop pass.
   std::shared_ptr<duckdb::Expression> _duckdb_filter_expression;
 
-  // Pure-filter string columns this scan is willing to receive as a decode-time
-  // BOOL8 mask instead of values, as (batch D-space position, primary index)
-  // pairs. Empty when none qualify.
-  //
-  // Only the position list is precomputed: whether a column *was* substituted is
-  // a per-batch, per-column fact (a pinned compressed chunk supplies masks only
-  // for plans that can produce them; the same scan's disk splits supply raw
-  // strings), so build_filter_expression_for reads it off each batch's column
-  // types.
-  std::vector<std::pair<std::size_t, std::size_t>> _pushdown_primary_by_batch_position;
-  // What decode_predicate_candidates() advertises: primary index → constant set.
-  std::unordered_map<std::size_t, std::vector<std::string>> _decode_predicate_candidates;
+  // This scan's pushed-down filter digested once at bind — what filter_analysis()
+  // advertises. Empty when the scan has no pushed-down filter.
+  scan_filter_analysis _filter_analysis;
+  // The same filter as the predicate the scan must still evaluate after the
+  // decode, decomposed into conjuncts at bind. Which conjuncts a given batch
+  // still needs is a per-batch fact — a pinned compressed chunk answers a
+  // column only when its plan can, and the same scan's disk splits never do —
+  // so post_filter_and_project assembles the residual from what the batch
+  // reports rather than from anything precomputed here.
+  residual_filter _residual;
 
   // The part of _duckdb_filter_expression safe to push into the reader: the
   // full predicate minus any top-level AND conjunct that cuDF's row-group

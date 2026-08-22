@@ -311,7 +311,8 @@ graph LR
 2. **Pipeline 2**: PARTITION. Repository to MERGE_GROUP_BY uses `FULL` barrier (downstream is not CONCAT — `PARTIAL` is only used when PARTITION feeds directly into CONCAT)
 3. **Pipeline 3**: MERGE_GROUP_BY. Downstream pipelines updated to use MERGE_GROUP_BY as source
 
-> With `fuse_merge_pipelines` (default on), Pipeline 3 is usually not a standalone pipeline: MERGE_GROUP_BY folds into the downstream sink's pipeline as an intermediate. See [Merge fusion](#merge-fusion) below.
+> Pipeline 3 is usually not standalone: Sirius automatically folds MERGE_GROUP_BY into the
+> downstream sink's pipeline as an intermediate. See [Merge fusion](#merge-fusion) below.
 
 ### UNGROUPED_AGGREGATE
 
@@ -333,11 +334,12 @@ graph LR
 
 MERGE_TOP_N merges local top-N results.
 
-> With `fuse_merge_pipelines` (default on), Pipeline 2 usually folds MERGE_TOP_N into the downstream sink's pipeline rather than forming its own. See [Merge fusion](#merge-fusion) below.
+> Pipeline 2 usually folds MERGE_TOP_N into the downstream sink's pipeline rather than forming its
+> own. See [Merge fusion](#merge-fusion) below.
 
 ### Merge fusion
 
-By default (`fuse_merge_pipelines = true`) an eligible `MERGE_GROUP_BY` or `MERGE_TOP_N` does **not** open its own terminal pipeline. Instead it joins its downstream sink's pipeline as an intermediate operator, removing one task launch and one repository round-trip (typically `merge → RESULT_COLLECTOR` at the query tail):
+An eligible `MERGE_GROUP_BY` or `MERGE_TOP_N` does **not** open its own terminal pipeline. Instead it joins its downstream sink's pipeline as an intermediate operator, removing one task launch and one repository round-trip (typically `merge → RESULT_COLLECTOR` at the query tail):
 
 ```mermaid
 graph LR

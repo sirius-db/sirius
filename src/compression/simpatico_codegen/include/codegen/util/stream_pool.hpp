@@ -42,4 +42,20 @@ struct stream_pool {
   cudaError_t sync_all();
 };
 
+/// A pool of @p n streams belonging to the calling thread and the CURRENT
+/// device, created on first use and reused for the thread's lifetime.
+///
+/// Keyed by device because CUDA streams are device-bound: launching on a stream
+/// that belongs to another device fails. A single thread_local pool would hand
+/// device-0 streams to a thread that has since switched to device 1, so callers
+/// that may see more than one device must come through here rather than holding
+/// their own.
+///
+/// Never destroyed before the thread ends, which is deliberate: buffers record
+/// the stream they were built on for their eventual async free, so a handle has
+/// to stay valid for as long as anything allocated on it might be freed.
+///
+/// @throws std::runtime_error if the streams cannot be created.
+stream_pool& thread_device_stream_pool(size_t n);
+
 }  // namespace simpatico

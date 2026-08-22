@@ -162,9 +162,7 @@ ensure_parquet_data() {
     echo "Generating TPC-H SF${SF} dataset..."
     (
         cd "$SCRIPT_DIR" &&
-            env -u PIXI_PROJECT_MANIFEST -u PIXI_ENVIRONMENT_NAME \
-                pixi run --manifest-path "$SCRIPT_DIR/pixi.toml" \
-                bash generate_tpch_data.sh "$SF" "$PARQUET_DIR"
+            pixi run bash generate_tpch_data.sh "$SF" "$PARQUET_DIR"
     )
     local status=$?
     if [ "$status" -ne 0 ]; then

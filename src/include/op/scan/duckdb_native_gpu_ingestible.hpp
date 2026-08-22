@@ -179,6 +179,13 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
 
   [[nodiscard]] std::vector<std::size_t> materialized_column_order() const override;
 
+  /// The native projection is literally "keep the leading output_arity columns"
+  /// (see post_filter_and_project) and native scans synthesize no partition or
+  /// virtual output columns — rowid decodes as a regular leading data column.
+  /// If native scans ever synthesize output columns, replace this constant with
+  /// a derivation like parquet's.
+  [[nodiscard]] bool output_assembly_is_leading_identity() const noexcept override { return true; }
+
   [[nodiscard]] bool has_row_filter() const noexcept override
   {
     return _filter_expression != nullptr;

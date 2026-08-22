@@ -95,7 +95,7 @@ equivalent — which is sound precisely because the base data is byte-identical 
 
 ### Rewriting parquet with GPU-optimized settings
 
-The `rewrite_parquet.py` script reads existing parquet files and rewrites them with larger row groups, snappy compression, V2 page headers, dictionary encoding, and configurable max file size (large tables are split into numbered files). Uses cudf (GPU) if available, otherwise falls back to pyarrow (CPU-only). Requires the pixi environment in this directory (`pixi install`).
+The `rewrite_parquet.py` script reads existing parquet files and rewrites them with larger row groups, snappy compression, V2 page headers, dictionary encoding, and configurable max file size (large tables are split into numbered files). Uses cudf (GPU) if available, otherwise falls back to pyarrow (CPU-only, via the root `pixi install`).
 
 ```bash
 cd test/tpch_performance
@@ -317,8 +317,11 @@ query creates a view and nothing is shared between concurrent streams.
 `--pin-compression` pins the tables Simpatico-compressed (either tier): the runner sets
 `pin_table_compression` and points `pin_table_input_compression_plan_dir` at
 `--compression-plan-dir`, which defaults to the explore-generated TPC-H plans shipped under
-`src/compression/simpatico_codegen/plans/tpch_sf1000` (6 of 8 tables; `nation`/`region` have no
-plans and pin uncompressed). Compression happens at pin time, so the flag requires a pinned tier.
+`src/compression/simpatico_codegen/plans/tpch_sf1000` (2 of 8 tables active — `lineitem`, `orders`;
+`part`, `partsupp`, `supplier`, `customer` are present but named `*_disabled.txt` pending
+performance/correctness validation of a whole-table plan against the SF1000 repro, and `nation`/
+`region` have no plans at all — all six pin uncompressed). Compression happens at pin time, so the
+flag requires a pinned tier.
 A table whose plan is missing or does not cover the pinned columns degrades to uncompressed with
 a `[pin_table]` WARN in the log; the runner counts the `compressing with plan` INFO markers after
 pinning and aborts if nothing compressed, so a misconfigured run cannot silently measure
