@@ -2029,6 +2029,9 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   if (!sirius_ctx) {
     throw InvalidInputException("sirius_knn_search requires the Sirius context to be initialized");
   }
+  // Required to hold the query-lifecycle slot for the whole build since the pinned entry is
+  // non-owning. The slot also serializes the current-device-resource swap the build does.
+  duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
   const auto* pin = sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
     req.catalog, req.schema, req.table_name);
   if (pin == nullptr) {
