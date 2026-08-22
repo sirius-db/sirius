@@ -59,8 +59,10 @@ enum class delim_direct_refusal : uint8_t {
   /// Some duplicate-eliminated column is not pinned by any join-back condition, so an outer row
   /// is not provably matched against its own correlation key.
   delim_column_mismatch,
-  /// A plain `=` join-back is paired with a null-safe correlated condition: the original plan
-  /// drops NULL-keyed outer rows at the join-back while the direct join would let them match.
+  /// A plain `=` join-back drops NULL-keyed outer rows in ways the direct join cannot
+  /// reproduce: either it is paired with a null-safe correlated condition (the direct join would
+  /// let the dropped rows match), or its key column has no correlated condition at all (the
+  /// rewrite deletes the join-back and carries no condition on the column).
   null_safety,
   /// The delim join or the inner join carries a residual ON-clause predicate the rewrite does
   /// not model.
@@ -90,18 +92,19 @@ struct delim_direct_analysis {
 /// Classify @p op (a LOGICAL_DELIM_JOIN) for lowering to a direct semi/anti comparison join.
 /// Pure analysis: collects the candidate sandwich, matches its shape, and proves the collapse is
 /// semantics-preserving (sole-consumer, join-back coverage, NULL-key safety). Never mutates the
-/// plan.
+/// plan. The result borrows into op's subtree and is valid only while op is unmodified.
 [[nodiscard]] delim_direct_analysis classify_delim_direct_lowering(
   duckdb::LogicalComparisonJoin& op);
 
-/// Rewrite @p op in place into the direct comparison join described by @p analysis (which must be
-/// eligible), always in right-family form: probe = the inner relation (children[0]), build = the
-/// outer relation (children[1]), join type RIGHT_SEMI / RIGHT_ANTI. The conditions become the
-/// correlated join's conditions with the dedup key substituted by its outer source column, and
-/// the inner join's filter-pushdown metadata is re-homed so the inner probe keeps its dynamic
-/// filter (now published from the outer build — the same key set, published earlier). After the
-/// call, op is a plain LOGICAL_COMPARISON_JOIN ready for plan_comparison_join.
+/// Rewrite @p op in place into the direct comparison join described by @p analysis, always in
+/// right-family form: probe = the inner relation (children[0]), build = the outer relation
+/// (children[1]), join type RIGHT_SEMI / RIGHT_ANTI. The conditions become the correlated join's
+/// conditions with the dedup key substituted by its outer source column. Consumes the analysis
+/// (one-shot): it must be eligible and @p op must be the same, unmutated operator it was produced
+/// from. After the call, op is a plain LOGICAL_COMPARISON_JOIN ready for plan_comparison_join,
+/// whose native dynamic-filter discovery re-derives any probe-scan membership filter (the pass
+/// itself carries no filter metadata).
 void apply_delim_direct_lowering(duckdb::LogicalComparisonJoin& op,
-                                 delim_direct_analysis& analysis);
+                                 delim_direct_analysis&& analysis);
 
 }  // namespace sirius::planner

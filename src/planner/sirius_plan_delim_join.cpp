@@ -29,6 +29,7 @@
 #include "sirius_context.hpp"
 
 #include <memory>
+#include <utility>
 
 namespace sirius::planner {
 
@@ -91,7 +92,7 @@ sirius_physical_plan_generator::plan_delim_join(duckdb::LogicalComparisonJoin& o
   if (delim_direct_lowering_enabled(context)) {
     auto analysis = classify_delim_direct_lowering(op);
     if (analysis.eligible()) {
-      apply_delim_direct_lowering(op, analysis);
+      apply_delim_direct_lowering(op, std::move(analysis));
       SIRIUS_LOG_INFO(
         "[delim_direct] Lowered a DELIM join to a direct {} hash join with {} condition(s).",
         duckdb::EnumUtil::ToString(op.join_type),

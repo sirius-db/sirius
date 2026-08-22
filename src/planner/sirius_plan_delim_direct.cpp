@@ -33,8 +33,13 @@
 // correlated equality equates with it (they coincide on the correlated join's output, and
 // DuckDB's projection forwards whichever it likes); both forms pin the key. The reduction is
 // exact for any equality-family C, provided (a) every dedup key column is pinned by the
-// join-back and (b) a plain `=` join-back is never paired with a null-safe correlated condition
-// (a NULL outer key must fail to match in both forms — see the null_safety refusal).
+// join-back and (b) every plain `=` join-back is backed by a plain `=` correlated condition on
+// the same key column — the NULL outer keys the join-back drops then fail the direct join's own
+// `=` comparison identically. Clause (b) refuses two shapes as null_safety: a plain `=`
+// join-back over a null-safe correlated condition (the direct null-safe join would match the
+// NULL keys the join-back dropped), and a plain `=` join-back on a key column no correlated
+// condition constrains (the rewrite deletes that join-back and carries no condition on the
+// column at all, so nothing reproduces its NULL-drop).
 //
 // Staging follows the house planner-pass pattern: collect the candidate roles, match the shape,
 // prove the semantics obligations, then rewrite. Every early-out carries a typed refusal reason
@@ -46,10 +51,10 @@
 #include "duckdb/planner/joinside.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_delim_get.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
-#include "log/logging.hpp"
 
+#include <algorithm>
+#include <functional>
 #include <utility>
 
 namespace sirius::planner {
@@ -79,27 +84,8 @@ namespace {
 bool contains_delim_get(const duckdb::LogicalOperator& op)
 {
   if (op.type == duckdb::LogicalOperatorType::LOGICAL_DELIM_GET) { return true; }
-  for (const auto& child : op.children) {
-    if (contains_delim_get(*child)) { return true; }
-  }
-  return false;
-}
-
-/// Mirror of DuckDB's JoinFilterPushdownOptimizer::IsFiltering: the subtree reduces its input
-/// somewhere (pushed-down table filters, a FILTER, or a TOP_N).
-bool subtree_is_filtering(const duckdb::LogicalOperator& op)
-{
-  switch (op.type) {
-    case duckdb::LogicalOperatorType::LOGICAL_GET:
-      return !op.Cast<duckdb::LogicalGet>().table_filters.filters.empty();
-    case duckdb::LogicalOperatorType::LOGICAL_FILTER:
-    case duckdb::LogicalOperatorType::LOGICAL_TOP_N: return true;
-    default: break;
-  }
-  for (const auto& child : op.children) {
-    if (subtree_is_filtering(*child)) { return true; }
-  }
-  return false;
+  return std::ranges::any_of(op.children,
+                             [](const auto& child) { return contains_delim_get(*child); });
 }
 
 bool is_equality_family(duckdb::ExpressionType comparison)
@@ -187,10 +173,10 @@ delim_direct_analysis classify_delim_direct_lowering(duckdb::LogicalComparisonJo
   std::vector<const duckdb::LogicalProjection*> projections;
   while (sandwich->type == duckdb::LogicalOperatorType::LOGICAL_PROJECTION) {
     const auto& projection = sandwich->Cast<duckdb::LogicalProjection>();
-    for (const auto& expr : projection.expressions) {
-      if (!expr || expr->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
-        return refuse(delim_direct_refusal::sandwich_shape);
-      }
+    if (!std::ranges::all_of(projection.expressions, [](const auto& expr) {
+          return expr && expr->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF;
+        })) {
+      return refuse(delim_direct_refusal::sandwich_shape);
     }
     if (sandwich->children.size() != 1) { return refuse(delim_direct_refusal::sandwich_shape); }
     projections.push_back(&projection);
@@ -228,10 +214,10 @@ delim_direct_analysis classify_delim_direct_lowering(duckdb::LogicalComparisonJo
   if (key_width == 0 || delim_get.chunk_types.size() != key_width) {
     return refuse(delim_direct_refusal::join_back_shape);
   }
-  for (const auto& column : op.duplicate_eliminated_columns) {
-    if (!column || column->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
-      return refuse(delim_direct_refusal::join_back_shape);
-    }
+  if (!std::ranges::all_of(op.duplicate_eliminated_columns, [](const auto& column) {
+        return column && column->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF;
+      })) {
+    return refuse(delim_direct_refusal::join_back_shape);
   }
 
   // --- Match: the correlated conditions must be equality-family with a plain dedup-key side. ---
@@ -312,8 +298,8 @@ delim_direct_analysis classify_delim_direct_lowering(duckdb::LogicalComparisonJo
     }
     if (!pinned_any) { return refuse(delim_direct_refusal::join_back_shape); }
   }
-  for (std::size_t column = 0; column < key_width; column++) {
-    if (!pinned[column]) { return refuse(delim_direct_refusal::delim_column_mismatch); }
+  if (!std::ranges::all_of(pinned, std::identity{})) {
+    return refuse(delim_direct_refusal::delim_column_mismatch);
   }
 
   // --- Prove: NULL-key semantics. A plain `=` join-back drops NULL-keyed outer rows before the
@@ -349,7 +335,8 @@ delim_direct_analysis classify_delim_direct_lowering(duckdb::LogicalComparisonJo
   return analysis;
 }
 
-void apply_delim_direct_lowering(duckdb::LogicalComparisonJoin& op, delim_direct_analysis& analysis)
+void apply_delim_direct_lowering(duckdb::LogicalComparisonJoin& op,
+                                 delim_direct_analysis&& analysis)
 {
   D_ASSERT(analysis.eligible() && analysis.inner_join != nullptr);
   auto& inner_join            = *analysis.inner_join;
@@ -359,16 +346,14 @@ void apply_delim_direct_lowering(duckdb::LogicalComparisonJoin& op, delim_direct
   // The direct join is always emitted in right-family form: build = the outer relation
   // (children[1]), probe = the inner relation (children[0]). The outer is the delim's dedup
   // source — the filtered, membership-tested side — so building on it keeps the build small and
-  // is the only direction that lets the re-homed dynamic filter keep pruning the (typically far
-  // larger) inner probe. A SEMI/ANTI-oriented delim is therefore flipped to RIGHT_SEMI /
-  // RIGHT_ANTI; the emitted column set is unchanged (still the outer side).
+  // is the only direction where a published membership filter prunes the (typically far larger)
+  // inner probe. A SEMI/ANTI-oriented delim is therefore flipped to RIGHT_SEMI / RIGHT_ANTI; the
+  // emitted column set is unchanged (still the outer side).
   //
   // Direct conditions: the correlated join's conditions with each dedup key replaced by the
-  // outer source column it was proven to pin. Order is preserved 1:1 so any re-homed
-  // filter-pushdown condition indices stay valid.
+  // outer source column it was proven to pin, order preserved 1:1.
   duckdb::vector<duckdb::JoinCondition> conditions;
   conditions.reserve(inner_join.conditions.size());
-  bool all_plain_equal = true;
   for (std::size_t i = 0; i < inner_join.conditions.size(); i++) {
     auto& correlated   = inner_join.conditions[i];
     const auto& source = op.duplicate_eliminated_columns[analysis.dedup_column_of_condition[i]]
@@ -377,40 +362,22 @@ void apply_delim_direct_lowering(duckdb::LogicalComparisonJoin& op, delim_direct
       duckdb::make_uniq<duckdb::BoundReferenceExpression>(source.return_type, source.index);
     duckdb::JoinCondition direct;
     direct.comparison = correlated.comparison;
-    all_plain_equal &= correlated.comparison == duckdb::ExpressionType::COMPARE_EQUAL;
-    direct.left  = std::move(delim_get == 0 ? correlated.right : correlated.left);
-    direct.right = std::move(outer_key);
+    direct.left       = std::move(delim_get == 0 ? correlated.right : correlated.left);
+    direct.right      = std::move(outer_key);
     conditions.push_back(std::move(direct));
-  }
-
-  // Re-home the correlated join's dynamic-filter pushdown metadata onto the direct join. The
-  // metadata exists only when the inner relation was the correlated join's probe side
-  // (delim_get == 1: DuckDB pushes filters toward children[0]), and the inner relation is this
-  // join's probe side too, so the targets still describe the probe. The membership filter stays
-  // sound for the right-family semi/anti: a pruned probe row's key is absent from the build, so
-  // it could never have marked a build row. Restricted to all-plain-`=` conditions so the hash
-  // join's condition reordering cannot desync the pushed indices.
-  const std::size_t outer_index = 1 - sandwich;
-  if (!op.filter_pushdown && inner_join.filter_pushdown && delim_get == 1 && all_plain_equal) {
-    // The build side is now the outer relation, not the derived dedup keys — recompute the
-    // "filtered build" hint the producer-wiring gate reads.
-    inner_join.filter_pushdown->build_side_has_filter =
-      subtree_is_filtering(*op.children[outer_index]);
-    op.filter_pushdown = std::move(inner_join.filter_pushdown);
-  } else if (inner_join.filter_pushdown) {
-    SIRIUS_LOG_INFO(
-      "[delim_direct] Dropping the correlated join's filter-pushdown metadata: it no longer "
-      "describes the direct join's probe side.");
   }
 
   // Splice: probe (inner relation) at children[0], build (outer relation) at children[1].
   // Detach the inner relation first: the correlated join (and analysis.inner_join with it)
-  // lives inside the sandwich subtree the assignments below destroy.
-  auto inner_relation = std::move(inner_join.children[1 - delim_get]);
-  analysis.inner_join = nullptr;
-  auto outer_relation = std::move(op.children[outer_index]);
-  op.children[0]      = std::move(inner_relation);
-  op.children[1]      = std::move(outer_relation);
+  // lives inside the sandwich subtree the assignments below destroy. Any DuckDB filter-pushdown
+  // metadata on the correlated join dies with that subtree — nothing in the live Sirius path
+  // reads it; plan_comparison_join re-derives dynamic-filter targets natively, and
+  // scan_route_join_type_admissible admits the direct join's RIGHT_SEMI / RIGHT_ANTI types.
+  const std::size_t outer_index = 1 - sandwich;
+  auto inner_relation           = std::move(inner_join.children[1 - delim_get]);
+  auto outer_relation           = std::move(op.children[outer_index]);
+  op.children[0]                = std::move(inner_relation);
+  op.children[1]                = std::move(outer_relation);
 
   // The outer side's projection map moves with it to the right slot; the probe side contributes
   // no output columns (right-family join), so its map is cleared.

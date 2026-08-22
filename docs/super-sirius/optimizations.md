@@ -180,6 +180,20 @@ Both feed the same `resolve_mark_join_result()`, which scatters the match indice
 - `src/planner/sirius_physical_plan_generator.cpp` — post-pass invocation of `fold_adjacent_projections()`
 - `src/expression/ast/reference_utils.cpp` — `visit_references()`, `substitute_references()`
 
+### Delim-Direct Lowering of Pure-Equality EXISTS / NOT EXISTS (PR #1612)
+
+**Motivation:** DuckDB decorrelates an equality-correlated `EXISTS` / `NOT EXISTS` into a DELIM join whose delim-scan side is a "dedup sandwich": a DISTINCT of the correlation keys, an INNER join against the inner relation, and a join back to the outer rows. Executed literally on the GPU, the outer keys are deduplicated, joined, and membership-tested a second time — machinery a single membership join makes redundant (the TPC-H q4 and q22 delims).
+
+**Mechanism:** Before building any delim machinery, `plan_delim_join` runs a staged pass (collect → match → prove → rewrite) over the logical DELIM join. When the delim-scan side is exactly the canonical dedup sandwich, every correlated condition is equality-family, every dedup key is pinned by the join-back to its own outer source column, and the NULL-key pairing rules prove equivalence, the whole construct is rewritten in place into one direct right-family hash join — probe = inner relation, build = outer relation, RIGHT_SEMI for EXISTS and RIGHT_ANTI for NOT EXISTS. The pass is default-deny: ineligible shapes keep the regular delim lowering with a typed refusal reason logged, and every reason is unit-pinned. Two companion changes preserve the delim plan's dynamic-filter behavior: `scan_route_join_type_admissible` admits RIGHT_SEMI/RIGHT_ANTI so discovery re-derives the probe-scan membership filter for the direct join, and the pipeline converter sizes DF-publishing RIGHT_SEMI/RIGHT_ANTI partitions from the build side so the filter publishes before the probe scan launches.
+
+**Code path:**
+- `src/planner/sirius_plan_delim_direct.cpp` — the pass (classify/apply, refusal taxonomy, correctness argument)
+- `src/planner/sirius_plan_delim_join.cpp` — integration ahead of the regular delim lowering
+- `src/include/planner/dynamic_filter/dynamic_filter_target_discovery.hpp` — the widened scan-route join-type gate
+- `src/pipeline/sirius_pipeline_converter.cpp` — build-driven partition sizing for DF-publishing right-family joins
+
+**Config:** `enable_delim_direct_lowering` (default: true), settable via YAML
+
 ## Memory Optimizations
 
 ### Memory-Pressure-Driven Downgrade (PR #368)

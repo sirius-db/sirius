@@ -17,12 +17,16 @@
 /**
  * @file test_delim_direct_lowering.cpp
  * @brief The delim-direct lowering pass (sirius_plan_delim_direct): eligible pure-equality
- *        EXISTS / NOT EXISTS DELIM joins collapse to a single direct semi/anti hash join,
- *        ineligible shapes are refused with their pinned typed reason (scalar-aggregate
- *        correlations like TPC-H q2/q17/q20, non-equality correlations like q21), and the
- *        `enable_delim_direct_lowering` knob restores the regular delim lowering.
+ *        EXISTS / NOT EXISTS DELIM joins collapse to a single direct semi/anti hash join that
+ *        keeps publishing the probe scan's membership filter, ineligible shapes are refused
+ *        with their pinned typed reason (scalar-aggregate correlations like TPC-H q2/q17/q20,
+ *        non-equality correlations like q21), and the `enable_delim_direct_lowering` knob
+ *        restores the regular delim lowering.
  */
 
+#include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
+#include "op/scan/duckdb_native_gpu_ingestible.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -187,6 +191,28 @@ bool contains_delim_machinery(sirius_physical_operator* root)
          !collect(root, SiriusPhysicalOperatorType::DELIM_SCAN).empty();
 }
 
+/// Base-table names of the GPU scans consuming @p hj's scan-route dynamic-filter targets
+/// (resolved by matching each target's channel to the scan that holds it, as in the discovery
+/// parity suite).
+std::vector<std::string> scan_route_target_tables(const sirius::op::sirius_physical_hash_join& hj,
+                                                  sirius_physical_operator* root)
+{
+  std::vector<std::string> tables;
+  for (const auto& target : hj.dynamic_filter_plan().probe_targets()) {
+    if (target.route_class != sirius::op::dynamic_filter_route_class::scan) { continue; }
+    for_each_operator(root, [&](sirius_physical_operator* op) {
+      if (op->type != SiriusPhysicalOperatorType::GPU_SCAN) { return; }
+      const auto& scan = op->Cast<sirius::op::scan::sirius_gpu_scan_operator>();
+      const auto* info = dynamic_cast<const sirius::op::scan::duckdb_native_ingestible_table_info*>(
+        &scan.get_ingestible().table_info());
+      if (info != nullptr && info->sirius_dynamic_filters.get() == target.filter_set.get()) {
+        tables.push_back(info->table_name);
+      }
+    });
+  }
+  return tables;
+}
+
 struct delim_direct_fixture_base {
   /// @param with_sirius_context true builds a SiriusContext (GPU pools — needed for the full
   ///        physical create_plan); false keeps SIRIUS_DISABLE=1 so classification-only tests
@@ -318,6 +344,48 @@ TEST_CASE_METHOD(delim_direct_fixture,
   auto& hj = joins[0]->Cast<sirius::op::sirius_physical_hash_join>();
   // Always emitted right-family: probe = inner relation, build = outer relation.
   CHECK(hj.join_type == JoinType::RIGHT_ANTI);
+}
+
+TEST_CASE_METHOD(delim_direct_fixture,
+                 "delim direct - the lowered join keeps the probe scan's membership filter",
+                 "[delim_direct][isolated_context]")
+{
+  // Publication continuity: the direct join must publish the membership filter the delim plan's
+  // sandwich INNER join used to feed the probe scan. Discovery re-derives the binding natively —
+  // evidence from the outer (build) side's pushed-down filter, the direct join's own plain `=`
+  // key, and the probe key traced to the inner relation's scan. The published key set is the
+  // outer relation's keys (the same set the dedup build published, since dedup only removes the
+  // duplicates a membership filter ignores), available without waiting on the dedup group-by.
+  auto& params                 = operator_params();
+  const bool original          = params.enable_dynamic_filter;
+  params.enable_dynamic_filter = true;
+  auto restore                 = [&params, original]() { params.enable_dynamic_filter = original; };
+  try {
+    auto verify = [this](const char* sql, JoinType expected_type) {
+      auto plan = generate_sirius_plan(sql);
+      REQUIRE(plan);
+      auto joins = collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+      REQUIRE(joins.size() == 1);
+      auto& hj = joins[0]->Cast<sirius::op::sirius_physical_hash_join>();
+      REQUIRE(hj.join_type == expected_type);
+      REQUIRE(hj.dynamic_filter_plan().enabled());
+      CHECK(scan_route_target_tables(hj, plan.get()) == std::vector<std::string>{"inner_t"});
+    };
+    // Outer (build) side carries a pushed-down table filter; the inner (probe) side is a plain
+    // scan — the TPC-H q4 / q22 geometry.
+    verify(
+      "SELECT val, count(*) FROM outer_t WHERE val > 0 AND EXISTS "
+      "(SELECT 1 FROM inner_t WHERE rid = outer_t.id) GROUP BY val",
+      JoinType::RIGHT_SEMI);
+    verify(
+      "SELECT val, count(*) FROM outer_t WHERE val > 0 AND NOT EXISTS "
+      "(SELECT 1 FROM inner_t WHERE rid = outer_t.id) GROUP BY val",
+      JoinType::RIGHT_ANTI);
+  } catch (...) {
+    restore();
+    throw;
+  }
+  restore();
 }
 
 TEST_CASE_METHOD(delim_direct_fixture,
@@ -530,9 +598,10 @@ std::string classify_name(LogicalComparisonJoin& delim)
 TEST_CASE("delim direct - build-driven sizing exception excludes plain RIGHT joins",
           "[delim_direct]")
 {
-  // The converter's sizing exception must hold exactly for joins this pass produces
-  // (RIGHT_SEMI / RIGHT_ANTI with a published filter) and never for stock shapes: plain RIGHT
-  // joins DO receive join-filter pushdown from DuckDB and must stay probe-driven.
+  // The converter's sizing exception must hold exactly for DF-publishing RIGHT_SEMI/RIGHT_ANTI
+  // joins, whose build side is the output side and the estimated-smaller side (by this pass's
+  // construction or by DuckDB's build-side flip), and never for plain RIGHT joins: nothing
+  // bounds the probe-side working set that build-driven sizing implies for those.
   using sirius::op::sirius_physical_hash_join;
   STATIC_REQUIRE(
     sirius_physical_hash_join::right_family_join_sizes_build_driven(JoinType::RIGHT_SEMI, true));
@@ -560,6 +629,12 @@ TEST_CASE_METHOD(delim_classify_fixture,
   // residual_predicate: the delim join carries an extra ON-clause predicate.
   CHECK(classify_query(exists_query, [](LogicalComparisonJoin& delim) {
           delim.predicate = make_uniq<BoundConstantExpression>(duckdb::Value::BOOLEAN(true));
+        }) == "residual_predicate");
+
+  // residual_predicate: the correlated INNER join carries an extra ON-clause predicate.
+  CHECK(classify_query(exists_query, [](LogicalComparisonJoin& delim) {
+          sandwich_inner_join(delim).predicate =
+            make_uniq<BoundConstantExpression>(duckdb::Value::BOOLEAN(true));
         }) == "residual_predicate");
 
   // inner_condition_shape: the correlated condition's dedup-key side is not a valid key column.

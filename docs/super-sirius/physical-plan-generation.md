@@ -370,9 +370,14 @@ key pinned by the join-back (null-safe, or plain `=` when the NULL-key pairing r
 **single direct semi/anti hash join**
 between the outer and inner relations (TPC-H q4 → direct RIGHT_SEMI, q22 → direct RIGHT_ANTI),
 skipping the dedup group-by, the inner join, the join-back join, and their PARTITION/CONCAT
-plumbing. The sandwich INNER join's dynamic-filter pushdown metadata is re-homed onto the
-direct join when it still describes the probe side, so the probe scan keeps its membership
-filter (published from the outer build instead of the dedup keys — same key set, earlier).
+plumbing. The direct join's probe is the same inner relation whose scan the sandwich INNER join
+used to filter, and [dynamic-filter](dynamic-filters.md) discovery re-derives that binding
+natively: build evidence from the outer subtree's filters, plain-`=` keys admitted from the
+direct join's own conditions, and the probe key traced to the same scan
+(`scan_route_join_type_admissible` admits the direct RIGHT_SEMI/RIGHT_ANTI types). The published
+key set is the outer relation's keys — semantically the same set the dedup build published,
+since dedup only removes duplicates a membership filter ignores — and it publishes earlier
+because the outer build folds without waiting on the dedup group-by.
 Ineligible shapes keep the lowering below, with a typed refusal reason logged
 (`unsupported_join_type` for the scalar-aggregate correlations of q2/q17/q20,
 `non_equality_correlation` for q21's `<>` correlations, etc. — see
