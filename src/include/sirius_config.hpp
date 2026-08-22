@@ -102,7 +102,7 @@ constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 /// into the DENSE_COUNT_JOIN operator. Instead of building a hash table over the counted side,
 /// materializing the join, and re-aggregating, the operator counts matches in
 /// a direct-address histogram over the preserved key domain [min, max] measured from the data.
-constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = false;
+constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = true;
 
 /// Cap on the combined direct-address histogram footprint (presence + counts arrays) of
 /// DENSE_COUNT_JOIN. A key domain too wide for this budget takes the operator's exact sparse
@@ -194,9 +194,9 @@ struct operator_params {
   /// boundaries restore native carriers.
   bool enable_compressed_materialization = true;
 
-  /// Experimental production opt-in for fusing COUNT-grouped-by-join-key outer equi-joins into
-  /// DENSE_COUNT_JOIN. Accepted in YAML as `enable_dense_count_join`; test builds also expose a
-  /// session override. See config::DEFAULT_ENABLE_DENSE_COUNT_JOIN.
+  /// Enable fusion of COUNT-grouped-by-join-key outer equi-joins into DENSE_COUNT_JOIN. Enabled by
+  /// default and accepted in YAML as `enable_dense_count_join`; test-option-enabled processes also
+  /// expose an internal runtime override. See config::DEFAULT_ENABLE_DENSE_COUNT_JOIN.
   bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;
 
   /// Engine-owned, test-only direct-address histogram budget for DENSE_COUNT_JOIN (see

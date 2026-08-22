@@ -36,6 +36,7 @@ cufile.log
 envs/
 compile_commands.json
 .cache
+/sirius-perf-sf1000.yaml
 .rumdl_cache/
 
 # Zed editor settings

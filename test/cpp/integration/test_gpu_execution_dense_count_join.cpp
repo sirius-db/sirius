@@ -24,7 +24,9 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/scoped_sirius_setting.hpp>
 
+#include <optional>
 #include <string>
 
 namespace {
@@ -33,7 +35,7 @@ class DenseCountJoinFixture : public sirius::test::GpuExecutionFixture {
  public:
   DenseCountJoinFixture()
   {
-    run_ok("SET enable_dense_count_join = true;");
+    enable_guard.emplace(*con, "enable_dense_count_join", true);
     run_ok("CREATE TABLE cust (c_id INTEGER, c_grp INTEGER);");
     // Keys 1..8 with 3 duplicated, plus two NULL-key rows; 4 and 6..8 have no orders.
     run_ok(
@@ -46,6 +48,8 @@ class DenseCountJoinFixture : public sirius::test::GpuExecutionFixture {
       "(104, 5, NULL), (105, 5, 13), (106, 42, 14), (107, NULL, 15);");
     run_ok("CHECKPOINT;");
   }
+
+  std::optional<sirius::test::scoped_sirius_setting> enable_guard;
 };
 
 }  // namespace
@@ -95,22 +99,42 @@ TEST_CASE_METHOD(DenseCountJoinFixture,
                  "gpu_execution dense count-join: sparse strategy under a tiny histogram budget",
                  "[integration][gpu_execution][dense_count_join]")
 {
-  run_ok("SET dense_count_join_max_bytes = 8;");
+  sirius::test::scoped_sirius_setting budget{*con, "dense_count_join_max_bytes", std::uint64_t{8}};
   compare_gpu_vs_cpu(
     "SELECT c_id, count(o_id) AS c_count FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id");
   compare_gpu_vs_cpu(
     "SELECT c_id, count(*) AS c_count FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id");
-  run_ok("SET dense_count_join_max_bytes = 2147483648;");
 }
 
 TEST_CASE_METHOD(DenseCountJoinFixture,
                  "gpu_execution dense count-join: disabled knob keeps the join plan correct",
                  "[integration][gpu_execution][dense_count_join]")
 {
-  run_ok("SET enable_dense_count_join = false;");
+  sirius::test::scoped_sirius_setting disabled{*con, "enable_dense_count_join", false};
   compare_gpu_vs_cpu(
     "SELECT c_id, count(o_id) AS c_count FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id");
-  run_ok("SET enable_dense_count_join = true;");
+}
+
+TEST_CASE_METHOD(DenseCountJoinFixture,
+                 "gpu_execution dense count-join: scoped settings restore during unwinding",
+                 "[integration][gpu_execution][dense_count_join]")
+{
+  auto sirius_ctx          = sirius::test::get_registered_sirius_context(*con);
+  auto const enable_before = sirius_ctx->get_config().get_operator_params().enable_dense_count_join;
+  auto const budget_before =
+    sirius_ctx->get_config().get_operator_params().dense_count_join_max_bytes;
+
+  struct forced_unwind {};
+  try {
+    sirius::test::scoped_sirius_setting disabled{*con, "enable_dense_count_join", false};
+    sirius::test::scoped_sirius_setting budget{
+      *con, "dense_count_join_max_bytes", std::uint64_t{8}};
+    throw forced_unwind{};
+  } catch (forced_unwind const&) {
+  }
+
+  CHECK(sirius_ctx->get_config().get_operator_params().enable_dense_count_join == enable_before);
+  CHECK(sirius_ctx->get_config().get_operator_params().dense_count_join_max_bytes == budget_before);
 }
 
 TEST_CASE_METHOD(DenseCountJoinFixture,

@@ -55,6 +55,17 @@ std::optional<std::size_t> extract_bound_ref_index(const duckdb::Expression& exp
   return std::nullopt;
 }
 
+constexpr bool producer_requires_full_partition_input(SiriusPhysicalOperatorType type) noexcept
+{
+  switch (type) {
+    case SiriusPhysicalOperatorType::PARTITION:
+    case SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE:
+    case SiriusPhysicalOperatorType::TOP_N:
+    case SiriusPhysicalOperatorType::SORT_PARTITION: return true;
+    default: return false;
+  }
+}
+
 }  // namespace
 
 sirius_physical_partition::sirius_physical_partition(
@@ -165,6 +176,28 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
 }
 
 bool sirius_physical_partition::is_build_partition() const { return _is_build; }
+MemoryBarrierType sirius_physical_partition::input_barrier_for(
+  sirius_physical_operator const& producer) const
+{
+  if (producer.type == SiriusPhysicalOperatorType::ORDER_BY) {
+    return sirius_physical_operator::input_barrier_for(producer);
+  }
+  if (producer_requires_full_partition_input(producer.type)) { return MemoryBarrierType::FULL; }
+
+  auto* partition_parent = get_parent_op();
+  bool const join_feeder =
+    partition_parent != nullptr && partition_parent->type == SiriusPhysicalOperatorType::CONCAT;
+  auto* join = join_feeder ? partition_parent->get_parent_op() : nullptr;
+  bool const right_family_full =
+    join != nullptr && join->type == SiriusPhysicalOperatorType::HASH_JOIN &&
+    join->Cast<sirius_physical_hash_join>().is_right_family() &&
+    !(join->get_parent_op() &&
+      join->get_parent_op()->type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
+  if (!is_build_partition() && join_feeder && !right_family_full) {
+    return MemoryBarrierType::PARTIAL;
+  }
+  return sirius_physical_operator::input_barrier_for(producer);
+}
 
 std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator_data& input_data,
                                                                   rmm::cuda_stream_view stream)

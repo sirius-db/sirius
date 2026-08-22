@@ -19,7 +19,8 @@
  * @brief PARTITION's custom `build_pipelines` override and the wiring it produces: every
  *        PARTITION is its own single-operator pipeline, its tree child terminates the deeper
  *        meta-pipeline as sink, its input edge carries the probe/build barrier semantics from
- *        `resolve_barrier`, and its output routes to the downstream CONCAT/MERGE pipeline.
+ *        consumer-owned barrier hooks, and its output routes to the downstream CONCAT/MERGE
+ * pipeline.
  */
 
 #include "op/sirius_physical_concat.hpp"

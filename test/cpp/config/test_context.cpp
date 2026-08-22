@@ -1865,19 +1865,20 @@ TEST_CASE("Per-connection state isolates and expires the transparent capture",
   REQUIRE(conn_state->take_captured_plan_if_current() == nullptr);
 }
 
-TEST_CASE("Sirius configuration exposes a bounded dense count join YAML opt-in", "[sirius][config]")
+TEST_CASE("Sirius configuration enables dense count join by default and accepts a YAML override",
+          "[sirius][config]")
 {
   std::source_location loc = std::source_location::current();
   auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
 
   sirius::sirius_config defaults;
-  REQUIRE_FALSE(defaults.get_operator_params().enable_dense_count_join);
-  REQUIRE_FALSE(sirius::config::DEFAULT_ENABLE_DENSE_COUNT_JOIN);
+  REQUIRE(defaults.get_operator_params().enable_dense_count_join);
+  REQUIRE(sirius::config::DEFAULT_ENABLE_DENSE_COUNT_JOIN);
 
-  sirius::sirius_config enabled;
-  REQUIRE_NOTHROW(enabled.load_from_file(data_dir / "valid_dense_count_join_opt_in.yaml"));
-  REQUIRE(enabled.get_operator_params().enable_dense_count_join);
-  REQUIRE(enabled.get_operator_params().dense_count_join_max_bytes ==
+  sirius::sirius_config disabled;
+  REQUIRE_NOTHROW(disabled.load_from_file(data_dir / "valid_dense_count_join_disable.yaml"));
+  REQUIRE_FALSE(disabled.get_operator_params().enable_dense_count_join);
+  REQUIRE(disabled.get_operator_params().dense_count_join_max_bytes ==
           sirius::config::DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES);
 
   sirius::sirius_config invalid_type;

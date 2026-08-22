@@ -416,7 +416,11 @@ std::optional<std::pair<int64_t, int64_t>> dense_count_global_minmax(
   initialize_extrema_kernel<<<1, 1, 0, stream.value()>>>(extrema.data());
   CUDF_CUDA_TRY(cudaGetLastError());
 
-  bool has_values = false;
+  bool has_values   = false;
+  using scalar_pair = std::pair<std::unique_ptr<cudf::scalar>, std::unique_ptr<cudf::scalar>>;
+  std::vector<scalar_pair> scalar_owners;
+  scalar_owners.reserve(keys.size());
+
   for (auto const& column : keys) {
     if (column.size() == 0 || column.size() == column.null_count()) { continue; }
 
@@ -438,6 +442,7 @@ std::optional<std::pair<int64_t, int64_t>> dense_count_global_minmax(
     }
     CUDF_CUDA_TRY(cudaGetLastError());
     has_values = true;
+    scalar_owners.push_back(std::move(minmax));
   }
 
   if (!has_values) { return std::nullopt; }

@@ -66,6 +66,8 @@ class sirius_physical_partition : public sirius_physical_operator {
   bool is_source() const override;
 
   bool is_sink() const override;
+  [[nodiscard]] MemoryBarrierType input_barrier_for(
+    sirius_physical_operator const& producer) const override;
 
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;

@@ -24,26 +24,28 @@
 
 namespace sirius::op {
 
-/**
- * @brief Input container for DENSE_COUNT_JOIN: the first @ref num_preserved_batches batches are
- * the preserved (outer, grouped) side, and the rest are the counted side.
- */
+/** @brief Input container that retains the logical side of every dense-count batch. */
 class dense_count_join_input : public pipelineable_operator_data {
  public:
-  dense_count_join_input(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
-                         std::size_t num_preserved_batches)
-    : pipelineable_operator_data(std::move(data_batches)),
-      _num_preserved_batches(num_preserved_batches)
-  {
-  }
+  enum class input_side : uint8_t { PRESERVED, COUNTED };
 
-  [[nodiscard]] std::size_t num_preserved_batches() const noexcept
-  {
-    return _num_preserved_batches;
-  }
+  dense_count_join_input(std::vector<std::shared_ptr<::cucascade::data_batch>> preserved_batches,
+                         std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches);
+
+  [[nodiscard]] std::vector<input_side> const& input_sides() const noexcept { return _input_sides; }
 
  private:
-  std::size_t _num_preserved_batches;
+  struct tagged_batches {
+    std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
+    std::vector<input_side> sides;
+  };
+
+  explicit dense_count_join_input(tagged_batches input);
+  [[nodiscard]] static tagged_batches tag_batches(
+    std::vector<std::shared_ptr<::cucascade::data_batch>> preserved_batches,
+    std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches);
+
+  std::vector<input_side> _input_sides;
 };
 
 /**
@@ -100,6 +102,10 @@ class sirius_physical_dense_count_join : public sirius_physical_operator {
                                    uint64_t max_bins_bytes);
 
   std::string params_to_string() const override;
+  [[nodiscard]] std::string_view input_port_for(
+    sirius_physical_operator const& producer) const override;
+  [[nodiscard]] MemoryBarrierType input_barrier_for(
+    sirius_physical_operator const& producer) const override;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
@@ -119,7 +125,7 @@ class sirius_physical_dense_count_join : public sirius_physical_operator {
   /// computes the whole aggregate).
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
-  /// Proportional first-run estimate for the strategy predicted from child cardinalities.
+  /// Conservative first-run peak across the dense, sparse, and extrema-reduction strategies.
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const input_stats& stats) const override;
 

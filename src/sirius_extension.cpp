@@ -2674,7 +2674,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
   add_sirius_option(config,
                     option_visibility::internal,
                     "enable_dense_count_join",
-                    "internal test hook for the dense count-join rewrite",
+                    "runtime override for dense count-join planning",
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_dense_count_join),
                     SetEnableDenseCountJoin);

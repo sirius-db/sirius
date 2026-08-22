@@ -228,6 +228,16 @@ bool sirius_physical_concat::is_source() const { return true; }
 bool sirius_physical_concat::is_sink() const { return true; }
 
 bool sirius_physical_concat::is_build_concat() const { return _is_build; }
+MemoryBarrierType sirius_physical_concat::input_barrier_for(
+  sirius_physical_operator const& producer) const
+{
+  using T = SiriusPhysicalOperatorType;
+  if (producer.type == T::PARTITION || producer.type == T::UNGROUPED_AGGREGATE ||
+      producer.type == T::TOP_N || producer.type == T::SORT_PARTITION) {
+    return MemoryBarrierType::PARTIAL;
+  }
+  return sirius_physical_operator::input_barrier_for(producer);
+}
 
 void sirius_physical_concat::set_concat_all(bool concat_all)
 {

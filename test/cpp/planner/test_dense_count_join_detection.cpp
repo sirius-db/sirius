@@ -504,7 +504,7 @@ TEST_CASE_METHOD(dense_count_join_fixture,
 }
 
 TEST_CASE_METHOD(dense_count_join_fixture,
-                 "dense_count_join defaults to the partitioned plan and requires explicit opt-in",
+                 "dense_count_join defaults to the fused plan and supports an explicit opt-out",
                  "[dense_count_join][plan]")
 {
   auto const query =
@@ -512,16 +512,16 @@ TEST_CASE_METHOD(dense_count_join_fixture,
 
   auto reset = con->Query("RESET enable_dense_count_join");
   REQUIRE_FALSE(reset->HasError());
-  auto default_plan = generate_sirius_plan(*con, query);
-  REQUIRE(default_plan);
-  using T = sirius::op::SiriusPhysicalOperatorType;
-  CHECK(collect(default_plan.get(), T::DENSE_COUNT_JOIN).empty());
-  CHECK(collect(default_plan.get(), T::HASH_JOIN).size() == 1);
-  CHECK(collect(default_plan.get(), T::HASH_GROUP_BY).size() == 1);
-
-  auto on = con->Query("SET enable_dense_count_join = true");
-  REQUIRE_FALSE(on->HasError());
   REQUIRE(has_dense_count_join(query));
+
+  auto off = con->Query("SET enable_dense_count_join = false");
+  REQUIRE_FALSE(off->HasError());
+  auto disabled_plan = generate_sirius_plan(*con, query);
+  REQUIRE(disabled_plan);
+  using T = sirius::op::SiriusPhysicalOperatorType;
+  CHECK(collect(disabled_plan.get(), T::DENSE_COUNT_JOIN).empty());
+  CHECK(collect(disabled_plan.get(), T::HASH_JOIN).size() == 1);
+  CHECK(collect(disabled_plan.get(), T::HASH_GROUP_BY).size() == 1);
 }
 
 TEST_CASE_METHOD(dense_count_join_fixture,

@@ -50,6 +50,7 @@
 
 #include <catch.hpp>
 #include <duckdb/planner/operator/logical_dummy_scan.hpp>
+#include <utils/dense_count_join_test_builder.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -64,6 +65,7 @@ using sirius::op::sirius_physical_operator;
 using sirius::op::SiriusPhysicalOperatorType;
 
 namespace {
+using sirius::test::make_dense_count_join;
 
 constexpr cudf::data_type k_int8{cudf::type_id::INT8};
 constexpr cudf::data_type k_int16{cudf::type_id::INT16};
@@ -192,28 +194,6 @@ duckdb::unique_ptr<sirius::op::sirius_physical_hash_join> make_hash_join(
     /*right_projection_map=*/duckdb::vector<std::size_t>{},
     /*delim_types=*/duckdb::vector<sirius::logical_type>{},
     /*estimated_cardinality=*/1);
-}
-
-duckdb::unique_ptr<sirius::op::sirius_physical_dense_count_join> make_dense_count_join(
-  std::size_t preserved_key_idx,
-  std::size_t counted_key_idx,
-  std::optional<std::size_t> counted_value_idx,
-  duckdb::unique_ptr<sirius_physical_operator> preserved,
-  duckdb::unique_ptr<sirius_physical_operator> counted)
-{
-  duckdb::vector<sirius::logical_type> output_types;
-  output_types.push_back(integer_type());
-  output_types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
-  auto join =
-    duckdb::make_uniq<sirius::op::sirius_physical_dense_count_join>(std::move(output_types),
-                                                                    /*estimated_cardinality=*/1,
-                                                                    preserved_key_idx,
-                                                                    counted_key_idx,
-                                                                    counted_value_idx,
-                                                                    uint64_t{1} << 20);
-  join->children.push_back(std::move(preserved));
-  join->children.push_back(std::move(counted));
-  return join;
 }
 
 duckdb::vector<duckdb::LogicalType> duckdb_integer_types(std::size_t count)

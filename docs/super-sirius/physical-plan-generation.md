@@ -193,7 +193,7 @@ After `is_ready()`:
 The plan generator inserts every GPU pipeline operator into the plan tree (Part 1), so `sirius_pipeline_converter::convert()` (`src/pipeline/sirius_pipeline_converter.cpp`) is a pure topology pass over the meta-pipeline tree:
 
 1. `schedule_pipelines()` — walk the meta-pipeline tree and schedule pipelines in dependency order
-2. `compute_repository_wiring()` — emit sink→consumer wiring descriptors via tree-parent lookup; `resolve_port_id()` / `resolve_barrier()` pick each edge's port and barrier semantics
+2. `compute_repository_wiring()` — emit sink→consumer wiring descriptors via tree-parent lookup; the logical consumer's `input_port_for(producer)` and `input_barrier_for(producer)` hooks pick each edge's port and barrier semantics
 3. `setup_pipeline_parents()` — derive parent pipeline edges from the wiring descriptors
 4. `finalize_pipeline_structure()` — populate `dependencies`, build-side-first for joins (see [Pipeline Finalization](#pipeline-finalization))
 5. `link_join_partition_siblings()` — link PARTITION/JOIN/CONCAT sibling chains

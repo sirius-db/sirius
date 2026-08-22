@@ -95,10 +95,6 @@ class sirius_pipeline_converter {
   //! Runtime materialization is done by `materialize_repository_wiring()` from
   //! `pipeline/repository_wiring.hpp`.
   void compute_repository_wiring(sirius_pipeline_build_state& state);
-  static std::string_view resolve_port_id(const op::sirius_physical_operator& sink,
-                                          const op::sirius_physical_operator& parent);
-  static op::MemoryBarrierType resolve_barrier(const op::sirius_physical_operator& sink,
-                                               const sirius_pipeline& dest);
 
   //! Set up parent/dependency pipeline edges from the wiring descriptors.
   void setup_pipeline_parents();

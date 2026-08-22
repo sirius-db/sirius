@@ -602,7 +602,7 @@ SET enable_compressed_materialization = false;
 | `max_build_hash_table_bytes` | 2× batch default | Max build-side hash table bytes |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
-| `enable_dense_count_join` | false | Experimental startup opt-in for the fused count-over-outer-join operator; accepted only as a strict boolean under `sirius.operator_params`. |
+| `enable_dense_count_join` | true | Enable the fused count-over-outer-join operator; accepted only as a strict boolean under `sirius.operator_params`. |
 
 Eligible GROUP BY and TOP_N merge pipelines are fused automatically. This is an engine-owned plan
 policy rather than a user configuration choice; see
@@ -614,23 +614,24 @@ under `sirius.operator_params`, but it is not a normal session setting.
 
 Runtime distinct-build probing is also engine-owned and is temporarily disabled pending #1600.
 
-The fused dense count-join optimization is experimental and disabled by default. Enable it at
-startup for a controlled workload:
+The fused dense count-join optimization is enabled by default. Disable it at startup to retain the
+partitioned join and aggregate plan for a workload:
 
 ```yaml
 sirius:
   operator_params:
-    enable_dense_count_join: true
+    enable_dense_count_join: false
 ```
 
 The current operator has FULL barriers on both inputs and executes in one task. Both complete
 inputs, its output, and its workspace must therefore fit the memory available to one GPU task.
-With the default `false` setting, eligible SQL keeps the normal partitioned `HASH_JOIN` plus
-`HASH_GROUP_BY` plan.
+With the default `true` setting, eligible SQL uses DENSE_COUNT_JOIN. Setting the option to `false`
+keeps the normal partitioned `HASH_JOIN` plus `HASH_GROUP_BY` plan.
 
-`dense_count_join_max_bytes` remains engine-owned and is rejected in YAML. Direct session
-overrides for both dense count-join fields are test hooks registered only when
-`SIRIUS_ENABLE_TEST_OPTIONS=1`; they are not part of the production session surface.
+`dense_count_join_max_bytes` remains engine-owned and is rejected in YAML. Direct runtime
+overrides for both dense count-join fields mutate process-shared engine configuration. They are
+registered only when `SIRIUS_ENABLE_TEST_OPTIONS=1` and are not part of the production session
+surface.
 
 ### GPU Admission
 

@@ -21,6 +21,7 @@
 #include <data/sirius_converter_registry.hpp>
 #include <helper/numeric_narrowing.hpp>
 #include <log/logging.hpp>
+#include <memory/size_arithmetic.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/sirius_gpu_scan_operator.hpp>
@@ -50,7 +51,6 @@
 // standard library
 #include <algorithm>
 #include <cstdint>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -61,133 +61,8 @@ namespace sirius::op::scan {
 namespace {
 constexpr std::size_t kMaxNumericCarrierExpansion = 8;
 
-/// Emit the deferred positions as a rowid and placeholders instead of values.
-///
-/// The ids are a SEQUENCE over the origin's span, which is what makes this
-/// cheap: a served batch is one pinned chunk's rows, in order, so row i of the
-/// output is global row `range.start + i`. That equality is checked rather than
-/// assumed — a batch whose rows were dropped somewhere would still produce a
-/// column of the right length, holding ids for rows it no longer contains, and
-/// the wrongness would only surface as plausible values at the far end.
-///
-/// This runs on the FINISHED scan output, which is why v1 refuses any scan that
-/// restricts rows (see install_late_materialization). Admitting one means
-/// substituting ahead of the filter's gather so the rowid is carried through it.
-std::unique_ptr<cudf::table> substitute_deferred_columns(
-  std::unique_ptr<cudf::table> output,
-  late_mat::deferred_scan_output const& deferred,
-  late_mat::scan_batch_origin const& origin,
-  cudf::column_view const* survivors,
-  std::size_t arity,
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr)
-{
-  auto const rows = output->num_rows();
-  // Two shapes, and the check is what tells them apart. Unfiltered: the batch
-  // IS the chunk, so row k is global row start + k. Filtered: the batch holds
-  // the survivors, and row k is global row start + survivors[k] — which is why
-  // a filtered batch without survivors must fail here rather than emit ids for
-  // rows it no longer holds.
-  if (survivors != nullptr) {
-    if (survivors->size() != rows) {
-      throw std::runtime_error("[sirius_gpu_scan_operator] a deferred scan emitted " +
-                               std::to_string(rows) + " rows but captured " +
-                               std::to_string(survivors->size()) + " survivor positions");
-    }
-  } else if (static_cast<std::int64_t>(rows) != origin.range.rows) {
-    throw std::runtime_error("[sirius_gpu_scan_operator] a deferred scan emitted " +
-                             std::to_string(rows) + " rows for a pinned chunk of " +
-                             std::to_string(origin.range.rows) +
-                             "; the rowid would address rows this batch no longer holds");
-  }
-
-  auto columns = output->release();
-  // The scan may have ELIDED the deferred columns from the projection, so that
-  // realizing the batch never copied values it was about to replace. Then they
-  // are missing rather than present-and-overwritten, and this restores the
-  // arity by inserting at their positions instead.
-  bool const inserting = columns.size() + deferred.output_positions.size() == arity;
-  if (!inserting && columns.size() != arity) {
-    throw std::runtime_error("[sirius_gpu_scan_operator] a deferred scan produced " +
-                             std::to_string(columns.size()) + " columns for an output of " +
-                             std::to_string(arity));
-  }
-  if (inserting) {
-    std::vector<std::unique_ptr<cudf::column>> widened;
-    widened.reserve(arity);
-    std::size_t next_kept = 0;
-    for (std::size_t position = 0; position < arity; ++position) {
-      if (deferred.defers(position)) {
-        widened.push_back(nullptr);  // filled in below, in bundle order
-      } else {
-        widened.push_back(std::move(columns[next_kept++]));
-      }
-    }
-    columns = std::move(widened);
-  }
-  for (std::size_t i = 0; i < deferred.output_positions.size(); ++i) {
-    auto const position = deferred.output_positions[i];
-    if (position >= columns.size()) {
-      throw std::runtime_error("[sirius_gpu_scan_operator] deferred position " +
-                               std::to_string(position) + " is outside the scan's output");
-    }
-    if (i == 0) {
-      if (survivors != nullptr) {
-        // start + survivor position, in the agreed width. cudf::binary_operation
-        // casts the INT32 positions into the output type, so the narrow case
-        // stays narrow.
-        auto const base = cudf::numeric_scalar<std::uint64_t>(
-          static_cast<std::uint64_t>(origin.range.start), true, stream, mr);
-        auto const type = cudf::data_type{deferred.rowid_type};
-        columns[position] =
-          cudf::binary_operation(base, *survivors, cudf::binary_operator::ADD, type, stream, mr);
-        continue;
-      }
-      // The width the pair agreed on: a pinned table whose rows fit 32 bits
-      // rides half the bytes. The range check is not a formality — a wrong
-      // width here wraps the id and materializes a plausible WRONG row.
-      if (deferred.rowid_type == late_mat::kNarrowRowidType) {
-        auto const last = origin.range.start + origin.range.rows;
-        if (last > static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
-          throw std::runtime_error(
-            "[sirius_gpu_scan_operator] a narrow rowid was installed for a pinned span reaching "
-            "row " +
-            std::to_string(last) + ", which does not fit 32 bits");
-        }
-        auto const init = cudf::numeric_scalar<std::uint32_t>(
-          static_cast<std::uint32_t>(origin.range.start), true, stream, mr);
-        auto const step   = cudf::numeric_scalar<std::uint32_t>(1, true, stream, mr);
-        columns[position] = cudf::sequence(rows, init, step, stream, mr);
-        continue;
-      }
-      auto const init = cudf::numeric_scalar<std::uint64_t>(
-        static_cast<std::uint64_t>(origin.range.start), true, stream, mr);
-      auto const step   = cudf::numeric_scalar<std::uint64_t>(1, true, stream, mr);
-      columns[position] = cudf::sequence(rows, init, step, stream, mr);
-      continue;
-    }
-    // A placeholder only has to keep the position occupied and the arity
-    // unchanged. Zeroed rather than left uninitialized: nothing between the two
-    // halves reads it, but a byte nobody defines is a byte that makes an
-    // otherwise deterministic run differ.
-    auto const zero   = cudf::numeric_scalar<std::int8_t>(0, true, stream, mr);
-    columns[position] = cudf::make_column_from_scalar(zero, rows, stream, mr);
-  }
-  return std::make_unique<cudf::table>(std::move(columns));
-}
-
-constexpr std::size_t saturating_add(std::size_t lhs, std::size_t rhs) noexcept
-{
-  auto const max = std::numeric_limits<std::size_t>::max();
-  return rhs > max - lhs ? max : lhs + rhs;
-}
-
-constexpr std::size_t saturating_mul(std::size_t value, std::size_t factor) noexcept
-{
-  auto const max = std::numeric_limits<std::size_t>::max();
-  if (value == 0 || factor == 0) { return 0; }
-  return value > max / factor ? max : value * factor;
-}
+using sirius::memory::saturating_add;
+using sirius::memory::saturating_mul;
 
 enum class carrier_conversion_kind : uint8_t { NONE, RESTORE, NARROW };
 

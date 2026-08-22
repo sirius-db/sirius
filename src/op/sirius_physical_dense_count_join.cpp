@@ -38,6 +38,8 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/unary.hpp>
 
+#include <rmm/aligned.hpp>
+
 #include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/memory/memory_space.hpp>
@@ -211,6 +213,51 @@ cudf::column_view gather_map_view(rmm::device_uvector<cudf::size_type> const& in
 
 }  // namespace
 
+dense_count_join_input::tagged_batches dense_count_join_input::tag_batches(
+  std::vector<std::shared_ptr<::cucascade::data_batch>> preserved_batches,
+  std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches)
+{
+  if (preserved_batches.size() > std::numeric_limits<std::size_t>::max() - counted_batches.size()) {
+    throw sirius::internal_exception("dense_count_join: input batch count overflow");
+  }
+
+  tagged_batches result;
+  auto const total_batches = preserved_batches.size() + counted_batches.size();
+  result.batches.reserve(total_batches);
+  result.sides.reserve(total_batches);
+
+  auto append = [&](std::vector<std::shared_ptr<::cucascade::data_batch>> batches,
+                    input_side side,
+                    std::string_view side_name) {
+    for (std::size_t i = 0; i < batches.size(); ++i) {
+      if (!batches[i]) {
+        throw sirius::internal_exception(
+          "dense_count_join: null {} batch at index {}", side_name, i);
+      }
+      result.batches.push_back(std::move(batches[i]));
+      result.sides.push_back(side);
+    }
+  };
+  append(std::move(preserved_batches), input_side::PRESERVED, "preserved");
+  append(std::move(counted_batches), input_side::COUNTED, "counted");
+  return result;
+}
+
+dense_count_join_input::dense_count_join_input(
+  std::vector<std::shared_ptr<::cucascade::data_batch>> preserved_batches,
+  std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches)
+  : dense_count_join_input(tag_batches(std::move(preserved_batches), std::move(counted_batches)))
+{
+}
+
+dense_count_join_input::dense_count_join_input(tagged_batches input)
+  : pipelineable_operator_data(std::move(input.batches)), _input_sides(std::move(input.sides))
+{
+  if (_input_sides.size() != get_data_batches().size()) {
+    throw sirius::internal_exception("dense_count_join: input side metadata is not batch-aligned");
+  }
+}
+
 sirius_physical_dense_count_join::sirius_physical_dense_count_join(
   duckdb::vector<sirius::logical_type> types,
   std::size_t estimated_cardinality,
@@ -240,6 +287,25 @@ std::string sirius_physical_dense_count_join::params_to_string() const
          ", max_bins_bytes=" + std::to_string(_max_bins_bytes) + ")";
 }
 
+std::string_view sirius_physical_dense_count_join::input_port_for(
+  sirius_physical_operator const& producer) const
+{
+  if (children.size() != 2) {
+    throw sirius::internal_exception(
+      "DENSE_COUNT_JOIN repository wiring requires exactly two children");
+  }
+  if (children[0].get() == &producer) { return PRESERVED_PORT; }
+  if (children[1].get() == &producer) { return COUNTED_PORT; }
+  throw sirius::internal_exception(
+    "DENSE_COUNT_JOIN repository wiring source is not a direct child");
+}
+
+MemoryBarrierType sirius_physical_dense_count_join::input_barrier_for(
+  sirius_physical_operator const& /*producer*/) const
+{
+  return MemoryBarrierType::FULL;
+}
+
 //===--------------------------------------------------------------------===//
 // Pipeline construction
 //===--------------------------------------------------------------------===//
@@ -249,7 +315,7 @@ void sirius_physical_dense_count_join::build_pipelines(
 {
   // Always a blocking boundary: the operator forms its own single-op pipeline; each child
   // subtree becomes the sink of its own pipeline feeding the "preserved"/"counted" ports
-  // (wired by the pipeline converter's tree-parent lookup — see resolve_port_id).
+  // (wired by the pipeline converter through this consumer's input wiring hooks).
   if (children.size() != 2) {
     throw sirius::internal_exception("dense_count_join: expected 2 children, got {}",
                                      children.size());
@@ -292,24 +358,22 @@ std::optional<task_creation_hint> sirius_physical_dense_count_join::get_next_tas
 
 std::unique_ptr<operator_data> sirius_physical_dense_count_join::get_next_task_input_data()
 {
-  std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
-  std::size_t num_preserved = 0;
+  std::vector<std::shared_ptr<::cucascade::data_batch>> preserved_batches;
+  std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches;
 
-  auto* preserved_port = get_port(PRESERVED_PORT);
-  if (preserved_port->repo != nullptr) {
-    while (auto batch = preserved_port->repo->pop_next_data_batch()) {
-      batches.push_back(std::move(batch));
-      ++num_preserved;
+  auto drain = [](port* input_port,
+                  std::vector<std::shared_ptr<::cucascade::data_batch>>& destination) {
+    if (input_port->repo == nullptr) { return; }
+    while (auto batch = input_port->repo->pop_next_data_batch()) {
+      destination.push_back(std::move(batch));
     }
-  }
-  auto* counted_port = get_port(COUNTED_PORT);
-  if (counted_port->repo != nullptr) {
-    while (auto batch = counted_port->repo->pop_next_data_batch()) {
-      batches.push_back(std::move(batch));
-    }
-  }
-  if (batches.empty()) { return nullptr; }
-  return std::make_unique<dense_count_join_input>(std::move(batches), num_preserved);
+  };
+  drain(get_port(PRESERVED_PORT), preserved_batches);
+  drain(get_port(COUNTED_PORT), counted_batches);
+
+  if (preserved_batches.empty() && counted_batches.empty()) { return nullptr; }
+  return std::make_unique<dense_count_join_input>(std::move(preserved_batches),
+                                                  std::move(counted_batches));
 }
 
 std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
@@ -319,33 +383,25 @@ std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
   using sirius::memory::saturating_mul;
 
   constexpr std::size_t allocation_floor = 1024 * 1024;
-  auto const preserved_rows =
-    children.size() == 2 ? children[0]->estimated_cardinality : estimated_cardinality;
-  auto const counted_rows = children.size() == 2 ? children[1]->estimated_cardinality : 0;
-  auto const groups =
-    estimated_cardinality == 0 ? preserved_rows : std::min(preserved_rows, estimated_cardinality);
-  auto const range = preserved_rows == 0 ? std::size_t{0} : std::max(groups, std::size_t{1});
-  auto const wide  = preserved_rows >= std::numeric_limits<uint32_t>::max() ||
-                    counted_rows >= std::numeric_limits<uint32_t>::max();
-  auto const slot_bytes      = wide ? sizeof(uint64_t) : sizeof(uint32_t);
-  auto const histogram_bytes = saturating_mul(saturating_mul(2, slot_bytes), range);
-  auto const histogram_cap   = _max_bins_bytes > std::numeric_limits<std::size_t>::max()
-                                 ? std::numeric_limits<std::size_t>::max()
-                                 : static_cast<std::size_t>(_max_bins_bytes);
+  constexpr auto allocation_alignment    = rmm::CUDA_ALLOCATION_ALIGNMENT;
+  auto const aligned_charge              = [](std::size_t bytes) {
+    if (bytes == 0) { return std::size_t{0}; }
+    auto const padded = saturating_add(bytes, static_cast<std::size_t>(allocation_alignment - 1));
+    if (padded == std::numeric_limits<std::size_t>::max()) { return padded; }
+    return (padded / allocation_alignment) * allocation_alignment;
+  };
 
-  auto const total_rows   = saturating_add(preserved_rows, counted_rows);
-  bool const likely_dense = preserved_rows > 0 && histogram_bytes <= histogram_cap &&
-                            range <= saturating_mul(8, preserved_rows) &&
-                            range <= saturating_mul(2, total_rows) &&
-                            histogram_bytes <= saturating_mul(4, stats.bytes);
+  // Every dense execution necessarily satisfies both byte gates. The row-density gates can only
+  // lower this bound, so planner cardinality is neither needed nor allowed to reduce it.
+  auto const histogram_cap   = static_cast<std::size_t>(_max_bins_bytes);
+  auto const histogram_bytes = std::min(histogram_cap, saturating_mul(4, stats.bytes));
 
-  auto const cudf_row_limit = static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
-  auto const bounded_groups = std::min(groups, cudf_row_limit);
-  auto const output_rows    = std::min(saturating_add(bounded_groups, 1), cudf_row_limit);
   auto const key_width      = sirius::get_cudf_type(types[0]).id() == cudf::type_id::INT32
                                 ? sizeof(int32_t)
                                 : sizeof(int64_t);
-  auto const selected_bytes = saturating_mul(sizeof(int64_t), bounded_groups);
+  auto const cudf_row_limit = static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
+  auto const output_rows    = std::min(stats.bytes / key_width, cudf_row_limit);
+  auto const selected_bytes = saturating_mul(sizeof(int64_t), output_rows);
   auto const output_bytes = saturating_mul(saturating_add(key_width, sizeof(int64_t)), output_rows);
   auto const mask_bytes   = static_cast<std::size_t>(
     cudf::bitmask_allocation_size_bytes(checked_cudf_size(output_rows, "output row bound")));
@@ -356,11 +412,16 @@ std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
   dense_peak      = saturating_add(dense_peak, mask_bytes);
   dense_peak      = saturating_add(dense_peak, histogram_bytes);  // selection/CUB workspace
 
-  auto const extrema_per_batch = saturating_mul(6, key_width);
-  auto const minmax_peak =
-    saturating_add(allocation_floor, saturating_mul(stats.num_batches, extrema_per_batch));
+  // minmax retains two scalars per nonempty batch through the final synchronization. Each scalar
+  // owns a value and a validity allocation; reservations charge every allocation separately.
+  auto const global_extrema = aligned_charge(2 * sizeof(int64_t));
+  auto const scalar_bytes = saturating_add(aligned_charge(key_width), aligned_charge(sizeof(bool)));
+  auto const extrema_per_batch = saturating_mul(2, scalar_bytes);
+  auto minmax_peak             = saturating_add(allocation_floor, global_extrema);
+  minmax_peak = saturating_add(minmax_peak, saturating_mul(stats.num_batches, extrema_per_batch));
+
   auto const sparse_peak = saturating_add(allocation_floor, saturating_mul(16, stats.bytes));
-  return std::max(likely_dense ? dense_peak : sparse_peak, minmax_peak);
+  return std::max({dense_peak, sparse_peak, minmax_peak});
 }
 
 //===--------------------------------------------------------------------===//
@@ -375,12 +436,12 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
   if (input == nullptr) {
     throw sirius::internal_exception("dense_count_join: unexpected input data type");
   }
-  auto const ro_batches    = input->get_read_only_batches();
-  auto const num_preserved = input->num_preserved_batches();
-  if (num_preserved > ro_batches.size()) {
+  auto const ro_batches   = input->get_read_only_batches();
+  auto const& input_sides = input->input_sides();
+  if (input_sides.size() != ro_batches.size()) {
     throw sirius::internal_exception(
-      "dense_count_join: input marks {} preserved batches but contains only {} total batches",
-      num_preserved,
+      "dense_count_join: {} side tags are not aligned with {} materialized batches",
+      input_sides.size(),
       ro_batches.size());
   }
 
@@ -427,7 +488,7 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
     input_logical_bytes = sirius::memory::saturating_add(
       input_logical_bytes, representation->get_uncompressed_data_size_in_bytes());
     auto const batch_view = sirius::get_cudf_table_view(ro_batches[i]);
-    if (i < num_preserved) {
+    if (input_sides[i] == dense_count_join_input::input_side::PRESERVED) {
       auto const col = checked_column(batch_view, _preserved_key_idx, i, "preserved key");
       require_key_type(col, "preserved");
       preserved_rows =

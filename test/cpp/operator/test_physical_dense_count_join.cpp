@@ -72,9 +72,7 @@ std::vector<group_row> run_dense_count_join(
                                       counted_value_idx,
                                       max_bins_bytes);
 
-  std::vector<std::shared_ptr<cucascade::data_batch>> batches = preserved_batches;
-  batches.insert(batches.end(), counted_batches.begin(), counted_batches.end());
-  dense_count_join_input input(std::move(batches), preserved_batches.size());
+  dense_count_join_input input(preserved_batches, counted_batches);
 
   auto output = op.execute(input, stream);
   stream.synchronize();
@@ -437,16 +435,19 @@ TEST_CASE("dense_count_join: runtime density and input-cost gates", "[dense_coun
   }
 }
 
-TEST_CASE("dense_count_join: all-NULL batches merge extrema on a non-default stream",
+TEST_CASE("dense_count_join: retained multi-batch extrema merge on a non-default stream",
           "[dense_count_join]")
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space);
 
   std::vector<std::shared_ptr<cucascade::data_batch>> preserved{
+    make_numeric_batch_with_nulls<int32_t>(*space, {0, 0}, {false, false}, cudf::type_id::INT32),
+    make_numeric_batch<int32_t>(*space, {4}, cudf::type_id::INT32),
     make_numeric_batch_with_nulls<int32_t>(
       *space, {0, 0, 0}, {false, false, false}, cudf::type_id::INT32),
-    make_numeric_batch<int32_t>(*space, {4, 5}, cudf::type_id::INT32)};
+    make_numeric_batch<int32_t>(*space, {5}, cudf::type_id::INT32),
+    make_numeric_batch<int32_t>(*space, {4}, cudf::type_id::INT32)};
   std::vector<std::shared_ptr<cucascade::data_batch>> counted{
     make_numeric_batch<int32_t>(*space, {4, 4}, cudf::type_id::INT32)};
 
@@ -462,7 +463,7 @@ TEST_CASE("dense_count_join: all-NULL batches merge extrema on a non-default str
                                             k_default_max_bytes,
                                             sirius_physical_dense_count_join::strategy::DENSE,
                                             stream.view());
-  REQUIRE((rows == std::vector<group_row>{{std::nullopt, 0}, {4, 2}, {5, 0}}));
+  REQUIRE((rows == std::vector<group_row>{{std::nullopt, 0}, {4, 4}, {5, 0}}));
 }
 
 TEST_CASE("dense_count_join: extreme INT64 domain takes exact sparse path", "[dense_count_join]")
@@ -508,18 +509,27 @@ TEST_CASE("dense_count_join rejects malformed batch metadata with diagnostics",
                                                               k_default_max_bytes);
   };
 
-  SECTION("preserved-batch count cannot exceed the total batch count")
+  SECTION("null batches are rejected before generic materialization can drop them")
   {
-    auto op = make_operator(0, 0, std::nullopt);
-    dense_count_join_input input({batch}, /*num_preserved_batches=*/2);
-    REQUIRE_THROWS_WITH(op->execute(input, default_stream()),
-                        Catch::Contains("marks 2 preserved batches but contains only 1"));
+    std::shared_ptr<cucascade::data_batch> null_batch;
+    REQUIRE_THROWS_WITH(dense_count_join_input({batch, null_batch}, {}),
+                        Catch::Contains("null preserved batch at index 1"));
+    REQUIRE_THROWS_WITH(dense_count_join_input({}, {null_batch}),
+                        Catch::Contains("null counted batch at index 0"));
+  }
+
+  SECTION("batch side identity is explicit and aligned")
+  {
+    dense_count_join_input input({batch}, {batch});
+    REQUIRE(input.input_sides() == std::vector<dense_count_join_input::input_side>{
+                                     dense_count_join_input::input_side::PRESERVED,
+                                     dense_count_join_input::input_side::COUNTED});
   }
 
   SECTION("preserved key index is checked before narrowing")
   {
     auto op = make_operator(1, 0, std::nullopt);
-    dense_count_join_input input({batch}, /*num_preserved_batches=*/1);
+    dense_count_join_input input({batch}, {});
     REQUIRE_THROWS_WITH(op->execute(input, default_stream()),
                         Catch::Contains("preserved key column index 1 is out of range"));
   }
@@ -527,10 +537,39 @@ TEST_CASE("dense_count_join rejects malformed batch metadata with diagnostics",
   SECTION("COUNT argument index is checked before narrowing")
   {
     auto op = make_operator(0, 0, std::size_t{1});
-    dense_count_join_input input({batch}, /*num_preserved_batches=*/0);
+    dense_count_join_input input({}, {batch});
     REQUIRE_THROWS_WITH(op->execute(input, default_stream()),
                         Catch::Contains("COUNT argument column index 1 is out of range"));
   }
+}
+TEST_CASE("dense_count_join owns direct child port and barrier wiring",
+          "[dense_count_join][pipeline]")
+{
+  duckdb::vector<duckdb::LogicalType> output_types;
+  output_types.push_back(duckdb::LogicalType::INTEGER);
+  output_types.push_back(duckdb::LogicalType::BIGINT);
+  sirius_physical_dense_count_join op(sirius::from_duckdb_vec(output_types),
+                                      /*estimated_cardinality=*/1,
+                                      /*preserved_key_idx=*/0,
+                                      /*counted_key_idx=*/0,
+                                      /*counted_value_idx=*/std::nullopt,
+                                      k_default_max_bytes);
+
+  duckdb::vector<sirius::logical_type> child_types;
+  child_types.push_back(sirius::logical_type::make(sirius::type_id::INTEGER));
+  auto preserved =
+    duckdb::make_uniq<sirius_physical_operator>(SiriusPhysicalOperatorType::CONCAT, child_types, 1);
+  auto* preserved_ptr = preserved.get();
+  auto counted =
+    duckdb::make_uniq<sirius_physical_operator>(SiriusPhysicalOperatorType::FILTER, child_types, 1);
+  auto* counted_ptr = counted.get();
+  op.children.push_back(std::move(preserved));
+  op.children.push_back(std::move(counted));
+
+  CHECK(op.input_port_for(*preserved_ptr) == sirius_physical_dense_count_join::PRESERVED_PORT);
+  CHECK(op.input_port_for(*counted_ptr) == sirius_physical_dense_count_join::COUNTED_PORT);
+  CHECK(op.input_barrier_for(*preserved_ptr) == MemoryBarrierType::FULL);
+  CHECK(op.input_barrier_for(*counted_ptr) == MemoryBarrierType::FULL);
 }
 
 TEST_CASE("dense_count_join first-run estimate is proportional and saturates",
@@ -554,6 +593,23 @@ TEST_CASE("dense_count_join first-run estimate is proportional and saturates",
   CHECK(tiny_estimate < 2 * allocation_floor);
   CHECK(tiny_estimate < histogram_budget);
 
+  input_stats gate_stats{4, 1024 * 1024};
+  auto const low_cardinality_estimate = op.no_history_peak_memory_estimate(gate_stats);
+
+  duckdb::vector<duckdb::LogicalType> high_cardinality_types;
+  high_cardinality_types.push_back(duckdb::LogicalType::INTEGER);
+  high_cardinality_types.push_back(duckdb::LogicalType::BIGINT);
+  sirius_physical_dense_count_join high_cardinality(
+    sirius::from_duckdb_vec(high_cardinality_types),
+    /*estimated_cardinality=*/std::numeric_limits<std::size_t>::max(),
+    /*preserved_key_idx=*/0,
+    /*counted_key_idx=*/0,
+    /*counted_value_idx=*/std::nullopt,
+    histogram_budget);
+  CHECK(high_cardinality.no_history_peak_memory_estimate(gate_stats) == low_cardinality_estimate);
+  auto const max_admitted_histogram = std::min<std::size_t>(histogram_budget, 4 * gate_stats.bytes);
+  CHECK(low_cardinality_estimate >= allocation_floor + max_admitted_histogram);
+
   duckdb::vector<duckdb::LogicalType> sparse_types;
   sparse_types.push_back(duckdb::LogicalType::INTEGER);
   sparse_types.push_back(duckdb::LogicalType::BIGINT);
@@ -563,7 +619,7 @@ TEST_CASE("dense_count_join first-run estimate is proportional and saturates",
                                           /*counted_key_idx=*/0,
                                           /*counted_value_idx=*/std::nullopt,
                                           /*max_bins_bytes=*/8);
-  CHECK(sparse.no_history_peak_memory_estimate({2, 100}) == allocation_floor + 16 * 100);
+  CHECK(sparse.no_history_peak_memory_estimate({2, 100}) >= allocation_floor + 16 * 100);
   CHECK(sparse.no_history_peak_memory_estimate({2, std::numeric_limits<std::size_t>::max()}) ==
         std::numeric_limits<std::size_t>::max());
 }

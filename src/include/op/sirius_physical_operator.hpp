@@ -539,6 +539,21 @@ class sirius_physical_operator {
   virtual bool equals(const sirius_physical_operator& other) const { return false; }
 
   virtual void verify();
+  /**
+   * @brief Resolve the receiving port for an edge from @p producer into this consumer.
+   *
+   * Multi-input consumers override this to own their port naming. The default is "default".
+   */
+  [[nodiscard]] virtual std::string_view input_port_for(
+    sirius_physical_operator const& producer) const;
+
+  /**
+   * @brief Resolve the memory barrier for an edge from @p producer into this consumer.
+   *
+   * The default is FULL, except that ORDER_BY producers retain their streaming PIPELINE edge.
+   */
+  [[nodiscard]] virtual MemoryBarrierType input_barrier_for(
+    sirius_physical_operator const& producer) const;
 
  public:
   // Operator interface

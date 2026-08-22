@@ -148,6 +148,18 @@ sirius_physical_operator::get_children() const
   }
   return result;
 }
+std::string_view sirius_physical_operator::input_port_for(
+  sirius_physical_operator const& /*producer*/) const
+{
+  return "default";
+}
+
+MemoryBarrierType sirius_physical_operator::input_barrier_for(
+  sirius_physical_operator const& producer) const
+{
+  return producer.type == SiriusPhysicalOperatorType::ORDER_BY ? MemoryBarrierType::PIPELINE
+                                                               : MemoryBarrierType::FULL;
+}
 
 //===--------------------------------------------------------------------===//
 // Pipeline Construction

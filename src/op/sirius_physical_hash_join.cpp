@@ -46,6 +46,7 @@
 #include "log/logging.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
+#include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -198,6 +199,23 @@ static cudf::mark_join make_left_mark_join(cudf::table_view const& left_keys,
                                            rmm::cuda_stream_view stream)
 {
   return cudf::mark_join(left_keys, compare_nulls, cudf::join_prefilter::NO, stream);
+}
+
+std::string_view sirius_physical_hash_join::input_port_for(
+  sirius_physical_operator const& producer) const
+{
+  if (producer.type == SiriusPhysicalOperatorType::CONCAT) {
+    return producer.Cast<sirius_physical_concat>().is_build_concat() ? "build" : "default";
+  }
+  return sirius_physical_operator::input_port_for(producer);
+}
+
+MemoryBarrierType sirius_physical_hash_join::input_barrier_for(
+  sirius_physical_operator const& producer) const
+{
+  return producer.type == SiriusPhysicalOperatorType::CONCAT
+           ? MemoryBarrierType::PARTIAL
+           : sirius_physical_operator::input_barrier_for(producer);
 }
 
 bool sirius_physical_hash_join::is_join_type_supported(duckdb::JoinType join_type)
