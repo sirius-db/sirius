@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use starrocks_plan_translator::{
-    ExchangeInput, ExtensionRegistry, PlanTranslator, TranslateError, URN_BOOLEAN, URN_COMPARISON,
-    translate_fragment,
+    ExchangeInput, ExtensionRegistry, PlanTranslator, TranslateError, TranslatedPlan, URN_BOOLEAN,
+    URN_COMPARISON, translate_fragment,
 };
 use starrocks_thrift::descriptors::{
     TDescriptorTable, TSlotDescriptor, TTableDescriptor, TTupleDescriptor,
@@ -651,36 +651,198 @@ fn non_parquet_broker_range_is_unsupported() {
 /// Verifies a byte-range split broker scan range is rejected as unsupported,
 /// both for a non-zero start offset and for a first split (offset 0, partial size).
 #[test]
-fn split_broker_range_is_unsupported() {
-    for range in [
-        broker_scan_range(
-            "file:///data/users.parquet",
-            TFileFormatType::FORMAT_PARQUET,
-            1024,
-            -1,
+fn split_broker_range_without_a_file_size_is_unsupported() {
+    // Without the total file size a range cannot be validated against EOF or collapsed when
+    // it tiles the whole file.
+    let err = PlanTranslator::new()
+        .translate_fragment(&params_with_scan_range(
+            TPlan::new(vec![scan_node(0, 0)]),
+            base_desc(),
+            0,
+            broker_scan_range(
+                "file:///data/users.parquet",
+                TFileFormatType::FORMAT_PARQUET,
+                1024,
+                -1,
+                None,
+            ),
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        TranslateError::UnsupportedScanRange { node_id: 0, .. }
+    ));
+}
+
+/// Extracts the LocalFiles items of the plan's root read.
+fn local_files_items(
+    translated: &TranslatedPlan,
+) -> &[substrait::proto::read_rel::local_files::FileOrFiles] {
+    let rel::RelType::Read(read) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected local read");
+    };
+    let Some(read_rel::ReadType::LocalFiles(files)) = read.read_type.as_ref() else {
+        panic!("expected local files");
+    };
+    &files.items
+}
+
+/// Verifies a byte-range split translates to a local-files item carrying the range — the
+/// exact shape a live 2-CN FE emits (162140518-byte lineitem split at 81070259).
+#[test]
+fn split_broker_range_emits_a_ranged_local_file() {
+    let path = "file:///data/lineitem.parquet";
+    let translated = PlanTranslator::new()
+        .translate_fragment(&params_with_scan_range(
+            TPlan::new(vec![scan_node(0, 0)]),
+            base_desc(),
+            0,
+            broker_scan_range(
+                path,
+                TFileFormatType::FORMAT_PARQUET,
+                81070259,
+                81070259,
+                Some(162140518),
+            ),
+        ))
+        .unwrap();
+    let items = local_files_items(&translated);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].start, 81070259);
+    assert_eq!(items[0].length, 81070259);
+}
+
+/// Verifies `size == -1` reads from the start offset to the end of the file.
+#[test]
+fn open_ended_split_reads_to_the_end_of_the_file() {
+    let translated = PlanTranslator::new()
+        .translate_fragment(&params_with_scan_range(
+            TPlan::new(vec![scan_node(0, 0)]),
+            base_desc(),
+            0,
+            broker_scan_range(
+                "file:///data/users.parquet",
+                TFileFormatType::FORMAT_PARQUET,
+                1024,
+                -1,
+                Some(4096),
+            ),
+        ))
+        .unwrap();
+    let items = local_files_items(&translated);
+    assert_eq!(items.len(), 1);
+    assert_eq!((items[0].start, items[0].length), (1024, 3072));
+}
+
+/// Verifies overlapping ranges are refused: under start-offset row-group ownership they would
+/// read the same rows twice, silently.
+#[test]
+fn overlapping_split_ranges_are_refused() {
+    let path = "file:///data/users.parquet";
+    let mut fragment = params_with_scan_range(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        0,
+        broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 0, 600, Some(1024)),
+    );
+    fragment
+        .params
+        .as_mut()
+        .unwrap()
+        .per_node_scan_ranges
+        .get_mut(&0)
+        .unwrap()
+        .push(TScanRangeParams::new(
+            broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 512, 512, Some(1024)),
             None,
-        ),
+            None,
+            None,
+        ));
+    let err = PlanTranslator::new()
+        .translate_fragment(&fragment)
+        .unwrap_err();
+    assert!(err.to_string().contains("overlapping"), "{err}");
+}
+
+/// Verifies a range extending past the end of the file is refused.
+#[test]
+fn split_past_the_end_of_the_file_is_refused() {
+    let err = PlanTranslator::new()
+        .translate_fragment(&params_with_scan_range(
+            TPlan::new(vec![scan_node(0, 0)]),
+            base_desc(),
+            0,
+            broker_scan_range(
+                "file:///data/users.parquet",
+                TFileFormatType::FORMAT_PARQUET,
+                512,
+                1024,
+                Some(1024),
+            ),
+        ))
+        .unwrap_err();
+    assert!(err.to_string().contains("past the end"), "{err}");
+}
+
+/// Verifies an outer compression_type on a parquet range is refused — it describes a
+/// compressed container the reader would have to unwrap, not parquet's per-page compression.
+#[test]
+fn compressed_container_scan_range_is_refused() {
+    let mut range = broker_scan_range(
+        "file:///data/users.parquet",
+        TFileFormatType::FORMAT_PARQUET,
+        0,
+        -1,
+        Some(1024),
+    );
+    range.broker_scan_range.as_mut().unwrap().ranges[0].compression_type =
+        Some(starrocks_thrift::types::TCompressionType::GZIP);
+    let err = PlanTranslator::new()
+        .translate_fragment(&params_with_scan_range(
+            TPlan::new(vec![scan_node(0, 0)]),
+            base_desc(),
+            0,
+            range,
+        ))
+        .unwrap_err();
+    assert!(err.to_string().contains("compression"), "{err}");
+}
+
+/// Verifies incremental scan-range delivery is refused: this CN never receives the rest, so
+/// accepting the prefix would silently read a subset of the data.
+#[test]
+fn has_more_scan_ranges_are_refused() {
+    let mut fragment = params_with_scan_range(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        0,
         broker_scan_range(
             "file:///data/users.parquet",
             TFileFormatType::FORMAT_PARQUET,
             0,
-            512,
+            -1,
             Some(1024),
         ),
-    ] {
-        let err = PlanTranslator::new()
-            .translate_fragment(&params_with_scan_range(
-                TPlan::new(vec![scan_node(0, 0)]),
-                base_desc(),
-                0,
-                range,
-            ))
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            TranslateError::UnsupportedScanRange { node_id: 0, .. }
-        ));
-    }
+    );
+    fragment
+        .params
+        .as_mut()
+        .unwrap()
+        .per_node_scan_ranges
+        .get_mut(&0)
+        .unwrap()[0]
+        .has_more = Some(true);
+    let err = PlanTranslator::new()
+        .translate_fragment(&fragment)
+        .unwrap_err();
+    assert!(err.to_string().contains("has_more"), "{err}");
 }
 
 /// Verifies complete byte-range splits are collapsed to one whole-file local read.
@@ -3125,16 +3287,6 @@ fn aggregation_conjuncts_become_having_filter() {
     };
 }
 
-/// Reads a relation's `RelCommon` emit mapping — what a consumer actually projects by.
-fn emit_mapping(common: Option<&substrait::proto::RelCommon>) -> Vec<i32> {
-    let Some(substrait::proto::rel_common::EmitKind::Emit(emit)) =
-        common.and_then(|common| common.emit_kind.as_ref())
-    else {
-        panic!("expected an explicit emit mapping");
-    };
-    emit.output_mapping.clone()
-}
-
 /// Names the extension function a scalar-function expression invokes.
 fn scalar_function_name(
     plan: &substrait::proto::Plan,
@@ -3958,198 +4110,6 @@ fn sort_with_conjuncts_is_rejected() {
     );
 }
 
-/// Reads a relation's `RelCommon` emit mapping — what a consumer actually projects by.
-fn emit_mapping(common: Option<&substrait::proto::RelCommon>) -> Vec<i32> {
-    let Some(substrait::proto::rel_common::EmitKind::Emit(emit)) =
-        common.and_then(|common| common.emit_kind.as_ref())
-    else {
-        panic!("expected an explicit emit mapping");
-    };
-    emit.output_mapping.clone()
-}
-
-/// A two-column left side and a one-column right side, so the synthetic-key arithmetic cannot be
-/// satisfied by more than one formula.
-fn asymmetric_join_desc() -> TDescriptorTable {
-    desc_table(
-        vec![(0, Some(100)), (1, Some(100))],
-        vec![
-            slot(1, 0, "a", scalar_type(TPrimitiveType::BIGINT)),
-            slot(2, 0, "a2", scalar_type(TPrimitiveType::BIGINT)),
-            slot(1, 1, "b", scalar_type(TPrimitiveType::BIGINT)),
-        ],
-    )
-}
-
-/// Pins the synthetic-key index arithmetic, which is the only thing in this lowering that can be
-/// wrong. With one column per side every off-by-one formula produces the same numbers; with a
-/// 2x1 descriptor the join row is `[a, a2, key_l, b, key_r]`, so the condition must compare
-/// fields 2 and 4 and the projection must emit `[0, 1, 3]` — dropping both synthetic keys.
-#[test]
-fn constant_key_join_indexes_past_the_synthetic_keys() {
-    let join = nestloop_join_node(
-        TJoinOp::CROSS_JOIN,
-        vec![binary_pred(
-            TExprOpcode::LT,
-            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
-            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
-        )],
-    );
-    let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
-    let translated =
-        translate_fragment(&params(Some(plan), Some(asymmetric_join_desc()), None)).unwrap();
-
-    let root = root(&translated.plan);
-    assert_eq!(root.names, vec!["a", "a2", "b"]);
-    let rel::RelType::Filter(filter) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
-    else {
-        panic!("expected filter over constant-key join");
-    };
-    let rel::RelType::Project(project) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap()
-    else {
-        panic!("expected output projection under filter");
-    };
-    // The projection only drops columns; it must not compute anything.
-    assert!(project.expressions.is_empty());
-    assert_eq!(emit_mapping(project.common.as_ref()), vec![0, 1, 3]);
-
-    let rel::RelType::Join(join) = project.input.as_ref().unwrap().rel_type.as_ref().unwrap()
-    else {
-        panic!("expected constant-key join under projection");
-    };
-    let expression::RexType::ScalarFunction(condition) =
-        join.expression.as_ref().unwrap().rex_type.as_ref().unwrap()
-    else {
-        panic!("expected a scalar-function join condition");
-    };
-    let operands: Vec<_> = condition
-        .arguments
-        .iter()
-        .map(|arg| {
-            let substrait::proto::function_argument::ArgType::Value(expr) =
-                arg.arg_type.as_ref().unwrap()
-            else {
-                panic!("expected a value argument");
-            };
-            field_index(expr)
-        })
-        .collect();
-    assert_eq!(operands, vec![2, 4]);
-}
-
-/// `SELECT * FROM a, b` — a nested-loop join with no conjuncts at all. This is the shape the PR
-/// exists to accept, and it takes the one branch the conjunct-carrying tests never reach: no
-/// filter is emitted, so the projection is the root's direct input.
-#[test]
-fn bare_cross_join_translates_to_constant_key_join() {
-    let join = nestloop_join_node(TJoinOp::CROSS_JOIN, Vec::new());
-    let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
-    let translated =
-        translate_fragment(&params(Some(plan), Some(asymmetric_join_desc()), None)).unwrap();
-
-    let root = root(&translated.plan);
-    assert_eq!(root.names, vec!["a", "a2", "b"]);
-    let rel::RelType::Project(project) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
-    else {
-        panic!("expected the output projection directly under the root, with no filter");
-    };
-    assert!(project.expressions.is_empty());
-    assert_eq!(emit_mapping(project.common.as_ref()), vec![0, 1, 3]);
-
-    let rel::RelType::Join(join) = project.input.as_ref().unwrap().rel_type.as_ref().unwrap()
-    else {
-        panic!("expected constant-key join under projection");
-    };
-    assert_eq!(
-        join.r#type,
-        substrait::proto::join_rel::JoinType::Inner as i32
-    );
-    // Both operands are the appended literal keys, so the join is a Cartesian product expressed
-    // as an equality the GPU planner accepts.
-    let expression::RexType::ScalarFunction(condition) =
-        join.expression.as_ref().unwrap().rex_type.as_ref().unwrap()
-    else {
-        panic!("expected a scalar-function join condition");
-    };
-    let operands: Vec<_> = condition
-        .arguments
-        .iter()
-        .map(|arg| {
-            let substrait::proto::function_argument::ArgType::Value(expr) =
-                arg.arg_type.as_ref().unwrap()
-            else {
-                panic!("expected a value argument");
-            };
-            field_index(expr)
-        })
-        .collect();
-    assert_eq!(operands, vec![2, 4]);
-/// A null-aware anti join is only equivalent to `LeftMark + NOT(marker)` when one equality key
-/// decides the match. Both executors null out *every* unmatched marker as soon as any build row
-/// has a NULL in any key, so a row made definitely non-matching by a second predicate is reported
-/// UNKNOWN and dropped. Correlated `NOT IN` (correlation predicate in `other_join_conjuncts`) and
-/// tuple `NOT IN` (several eq conjuncts) are therefore refused rather than silently returning too
-/// few rows.
-#[test]
-fn null_aware_anti_join_with_extra_predicates_is_rejected() {
-    let extra_eq = || {
-        TEqJoinCondition::new(
-            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
-            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
-            Some(TExprOpcode::EQ),
-        )
-    };
-    let correlation = || {
-        binary_pred(
-            TExprOpcode::EQ,
-            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
-            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
-        )
-    };
-
-    // Tuple NOT IN: two equality keys.
-    let mut multi_key = hash_join_node(TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN);
-    multi_key
-        .hash_join_node
-        .as_mut()
-        .unwrap()
-        .eq_join_conjuncts
-        .push(extra_eq());
-
-    // Correlated NOT IN: the correlation predicate rides in other_join_conjuncts.
-    let mut correlated = hash_join_node(TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN);
-    correlated
-        .hash_join_node
-        .as_mut()
-        .unwrap()
-        .other_join_conjuncts = Some(vec![correlation()]);
-
-    for (label, join) in [
-        ("tuple NOT IN", multi_key),
-        ("correlated NOT IN", correlated),
-    ] {
-        let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
-        let err = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap_err();
-        let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
-            panic!("{label}: expected an unsupported plan node, got {err:?}");
-        };
-        assert_eq!(
-            reason, "null-aware left anti join with correlated or multi-column keys",
-            "{label}"
-        );
-    }
-
-    // The single-key, no-extra-conjunct form stays supported: there, "unmatched with a NULL on
-    // the build side" really is UNKNOWN, so the global rule is exact.
-    let plan = TPlan::new(vec![
-        hash_join_node(TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN),
-        scan_node(0, 0),
-        scan_node(1, 1),
-    ]);
-    translate_fragment(&params(Some(plan), Some(join_desc()), None))
-        .expect("plain single-key null-aware anti join is still supported");
-}
-
 /// Builds an EXCHANGE_NODE with id 7 over `input_row_tuples`, optionally merging or offset.
 fn exchange_node_with(
     input_row_tuples: Vec<i32>,
@@ -4299,6 +4259,141 @@ fn exchange_offset_becomes_a_fetch() {
     );
 }
 
+/// A null-aware anti join is only equivalent to `LeftMark + NOT(marker)` when one equality key
+/// decides the match. Both executors null out *every* unmatched marker as soon as any build row
+/// has a NULL in any key, so a row made definitely non-matching by a second predicate is reported
+/// UNKNOWN and dropped. Correlated `NOT IN` (correlation predicate in `other_join_conjuncts`) and
+/// tuple `NOT IN` (several eq conjuncts) are therefore refused rather than silently returning too
+/// few rows.
+#[test]
+fn null_aware_anti_join_with_extra_predicates_is_rejected() {
+    let extra_eq = || {
+        TEqJoinCondition::new(
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+            Some(TExprOpcode::EQ),
+        )
+    };
+    let correlation = || {
+        binary_pred(
+            TExprOpcode::EQ,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        )
+    };
+
+    // Tuple NOT IN: two equality keys.
+    let mut multi_key = hash_join_node(TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN);
+    multi_key
+        .hash_join_node
+        .as_mut()
+        .unwrap()
+        .eq_join_conjuncts
+        .push(extra_eq());
+
+    // Correlated NOT IN: the correlation predicate rides in other_join_conjuncts.
+    let mut correlated = hash_join_node(TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN);
+    correlated
+        .hash_join_node
+        .as_mut()
+        .unwrap()
+        .other_join_conjuncts = Some(vec![correlation()]);
+
+    for (label, join) in [
+        ("tuple NOT IN", multi_key),
+        ("correlated NOT IN", correlated),
+    ] {
+        let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+        let err = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap_err();
+        let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
+            panic!("{label}: expected an unsupported plan node, got {err:?}");
+        };
+        assert_eq!(
+            reason, "null-aware left anti join with correlated or multi-column keys",
+            "{label}"
+        );
+    }
+
+    // The single-key, no-extra-conjunct form stays supported: there, "unmatched with a NULL on
+    // the build side" really is UNKNOWN, so the global rule is exact.
+    let plan = TPlan::new(vec![
+        hash_join_node(TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN),
+        scan_node(0, 0),
+        scan_node(1, 1),
+    ]);
+    translate_fragment(&params(Some(plan), Some(join_desc()), None))
+        .expect("plain single-key null-aware anti join is still supported");
+}
+
+/// A two-column left side and a one-column right side, so the synthetic-key arithmetic cannot be
+/// satisfied by more than one formula.
+fn asymmetric_join_desc() -> TDescriptorTable {
+    desc_table(
+        vec![(0, Some(100)), (1, Some(100))],
+        vec![
+            slot(1, 0, "a", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "a2", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 1, "b", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    )
+}
+
+/// Pins the synthetic-key index arithmetic, which is the only thing in this lowering that can be
+/// wrong. With one column per side every off-by-one formula produces the same numbers; with a
+/// 2x1 descriptor the join row is `[a, a2, key_l, b, key_r]`, so the condition must compare
+/// fields 2 and 4 and the projection must emit `[0, 1, 3]` — dropping both synthetic keys.
+#[test]
+fn constant_key_join_indexes_past_the_synthetic_keys() {
+    let join = nestloop_join_node(
+        TJoinOp::CROSS_JOIN,
+        vec![binary_pred(
+            TExprOpcode::LT,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        )],
+    );
+    let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+    let translated =
+        translate_fragment(&params(Some(plan), Some(asymmetric_join_desc()), None)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["a", "a2", "b"]);
+    let rel::RelType::Filter(filter) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected filter over constant-key join");
+    };
+    let rel::RelType::Project(project) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected output projection under filter");
+    };
+    // The projection only drops columns; it must not compute anything.
+    assert!(project.expressions.is_empty());
+    assert_eq!(emit_mapping(project.common.as_ref()), vec![0, 1, 3]);
+
+    let rel::RelType::Join(join) = project.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected constant-key join under projection");
+    };
+    let expression::RexType::ScalarFunction(condition) =
+        join.expression.as_ref().unwrap().rex_type.as_ref().unwrap()
+    else {
+        panic!("expected a scalar-function join condition");
+    };
+    let operands: Vec<_> = condition
+        .arguments
+        .iter()
+        .map(|arg| {
+            let substrait::proto::function_argument::ArgType::Value(expr) =
+                arg.arg_type.as_ref().unwrap()
+            else {
+                panic!("expected a value argument");
+            };
+            field_index(expr)
+        })
+        .collect();
+    assert_eq!(operands, vec![2, 4]);
+}
+
 /// `SELECT * FROM a, b` — a nested-loop join with no conjuncts at all. This is the shape the PR
 /// exists to accept, and it takes the one branch the conjunct-carrying tests never reach: no
 /// filter is emitted, so the projection is the root's direct input.
@@ -4395,42 +4490,6 @@ fn common_slots_outside_a_project_are_rejected() {
     }
 }
 
-/// Two splits that both cover the head of the file are refused. They "cover" every byte, so a
-/// sweep that only rejects gaps collapses them into one whole-file read — Sirius would scan the
-/// shared row groups once where StarRocks scans them on both instances, and `count(*)` would
-/// disagree with no error.
-#[test]
-fn overlapping_split_broker_ranges_are_unsupported() {
-    let path = "file:///data/users.parquet";
-    let mut fragment = params_with_scan_range(
-        TPlan::new(vec![scan_node(0, 0)]),
-        base_desc(),
-        0,
-        broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 0, 1024, Some(1024)),
-    );
-    fragment
-        .params
-        .as_mut()
-        .unwrap()
-        .per_node_scan_ranges
-        .get_mut(&0)
-        .unwrap()
-        .push(TScanRangeParams::new(
-            broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 0, 512, Some(1024)),
-            None,
-            None,
-            None,
-        ));
-    let err = PlanTranslator::new()
-        .translate_fragment(&fragment)
-        .unwrap_err();
-    let TranslateError::UnsupportedScanRange { node_id, reason } = err else {
-        panic!("expected an unsupported scan range, got {err:?}");
-    };
-    assert_eq!(node_id, 0);
-    assert_eq!(reason, "byte-range splits do not tile the parquet file");
-}
-
 /// Builds fragment params whose node-0 scan carries every `(start, size)` split of `path`, all
 /// declaring `file_size`, in the order given.
 fn params_with_splits(
@@ -4475,6 +4534,17 @@ fn params_with_splits(
     fragment
 }
 
+/// Translates `splits` that are expected to be accepted.
+fn splits_accepted(file_size: i64, splits: &[(i64, i64)]) -> TranslatedPlan {
+    PlanTranslator::new()
+        .translate_fragment(&params_with_splits(
+            "file:///data/users.parquet",
+            file_size,
+            splits,
+        ))
+        .expect("splits are accepted")
+}
+
 /// Translates `splits` and returns the `UnsupportedScanRange` reason they were refused with.
 fn splits_rejected_because(file_size: i64, splits: &[(i64, i64)]) -> &'static str {
     let err = PlanTranslator::new()
@@ -4491,23 +4561,31 @@ fn splits_rejected_because(file_size: i64, splits: &[(i64, i64)]) -> &'static st
     reason
 }
 
-/// Splits that leave a hole are refused: collapsing them to a whole-file read would scan the
-/// hole, which a sibling instance is already scanning.
+/// Splits that leave a hole stay separate items. Collapsing them to a whole-file read would
+/// scan the hole, which a sibling instance is already scanning; emitting them as-is lets the
+/// engine read only the row groups each split owns.
 #[test]
-fn split_broker_ranges_with_a_gap_are_unsupported() {
+fn split_broker_ranges_with_a_gap_stay_separate() {
+    let translated = splits_accepted(1024, &[(0, 256), (512, 512)]);
+    let items = local_files_items(&translated);
     assert_eq!(
-        splits_rejected_because(1024, &[(0, 256), (512, 512)]),
-        "byte-range splits do not tile the parquet file"
+        items
+            .iter()
+            .map(|item| (item.start, item.length))
+            .collect::<Vec<_>>(),
+        vec![(0, 256), (512, 512)]
     );
 }
 
-/// Splits that tile a prefix but stop short of the file are refused: the tail would be dropped.
+/// Splits that tile a prefix but stop short of the file coalesce into that one prefix range,
+/// not a whole-file read: the tail belongs to a sibling instance, and reading it here would
+/// double-count those rows.
 #[test]
-fn split_broker_ranges_covering_only_a_prefix_are_unsupported() {
-    assert_eq!(
-        splits_rejected_because(1024, &[(0, 256), (256, 256)]),
-        "byte-range splits do not tile the parquet file"
-    );
+fn split_broker_ranges_covering_only_a_prefix_coalesce() {
+    let translated = splits_accepted(1024, &[(0, 256), (256, 256)]);
+    let items = local_files_items(&translated);
+    assert_eq!(items.len(), 1, "adjacent splits coalesce");
+    assert_eq!((items[0].start, items[0].length), (0, 512));
 }
 
 /// Two splits that both cover the head of the file are refused. They "cover" every byte, so a
@@ -4518,7 +4596,7 @@ fn split_broker_ranges_covering_only_a_prefix_are_unsupported() {
 fn overlapping_split_broker_ranges_are_unsupported() {
     assert_eq!(
         splits_rejected_because(1024, &[(0, 1024), (0, 512)]),
-        "byte-range splits do not tile the parquet file"
+        "overlapping byte ranges would read the same rows twice"
     );
 }
 
