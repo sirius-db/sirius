@@ -385,6 +385,16 @@ void sirius_physical_operator::set_pipeline(duckdb::shared_ptr<pipeline::sirius_
   _pipeline = std::move(pipeline);
 }
 
+bool sirius_physical_operator::like_swar_fastpath_enabled() const noexcept
+{
+  return _pipeline != nullptr && _pipeline->get_operator_params().like_swar_fastpath;
+}
+
+std::shared_ptr<like_multiliteral_cache const> sirius_physical_operator::like_cache() const noexcept
+{
+  return _pipeline != nullptr ? _pipeline->get_like_multiliteral_cache() : nullptr;
+}
+
 telemetry::batch_telemetry_info sirius_physical_operator::batch_telemetry() const
 {
   if (not _pipeline) { return {nullptr, uuid::UUID{}}; }

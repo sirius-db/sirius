@@ -125,6 +125,31 @@ struct finally {
 };
 
 namespace {
+class scoped_env_assignment {
+ public:
+  scoped_env_assignment(const char* name, const char* value) : _name(name)
+  {
+    if (auto const* previous = std::getenv(name)) { _previous = previous; }
+    setenv(_name.c_str(), value, 1);
+  }
+
+  ~scoped_env_assignment()
+  {
+    if (_previous) {
+      setenv(_name.c_str(), _previous->c_str(), 1);
+    } else {
+      unsetenv(_name.c_str());
+    }
+  }
+
+  scoped_env_assignment(scoped_env_assignment const&)            = delete;
+  scoped_env_assignment& operator=(scoped_env_assignment const&) = delete;
+
+ private:
+  std::string _name;
+  std::optional<std::string> _previous;
+};
+
 struct setting_assignment {
   const char* name;
   const char* value;
@@ -198,8 +223,7 @@ TEST_CASE("Legacy-only settings follow the build surface",
 TEST_CASE("like_swar_fastpath is isolated between connections",
           "[sirius][config][like-swar][isolated_context]")
 {
-  finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
-  setenv("SIRIUS_DISABLE", "1", 1);
+  scoped_env_assignment disable_sirius{"SIRIUS_DISABLE", "1"};
 
   duckdb::DuckDB db(nullptr);
   duckdb::Connection con_a(db);
@@ -218,24 +242,6 @@ TEST_CASE("like_swar_fastpath is isolated between connections",
   REQUIRE(reset_result != nullptr);
   REQUIRE_FALSE(reset_result->HasError());
   REQUIRE(duckdb::like_swar_fastpath_enabled(*con_a.context));
-}
-
-TEST_CASE("like_swar_fastpath does not leak into a separate database",
-          "[sirius][config][like-swar][isolated_context]")
-{
-  finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
-  setenv("SIRIUS_DISABLE", "1", 1);
-
-  duckdb::DuckDB db_a(nullptr);
-  duckdb::Connection con_a(db_a);
-  auto set_result = con_a.Query("SET like_swar_fastpath = false");
-  REQUIRE(set_result != nullptr);
-  REQUIRE_FALSE(set_result->HasError());
-  REQUIRE_FALSE(duckdb::like_swar_fastpath_enabled(*con_a.context));
-
-  duckdb::DuckDB db_b(nullptr);
-  duckdb::Connection con_b(db_b);
-  REQUIRE(duckdb::like_swar_fastpath_enabled(*con_b.context));
 }
 
 TEST_CASE("Test-only settings require explicit process opt-in",

@@ -153,9 +153,12 @@ class stub_ingestible final : public sirius::op::scan::gpu_ingestible {
 
   explicit stub_ingestible(table_factory produce) : _produce(std::move(produce)) {}
 
-  std::unique_ptr<cudf::table> post_filter_and_project(sirius::op::scan::filtered_table&&,
-                                                       const cucascade::memory::memory_space&,
-                                                       rmm::cuda_stream_view) override
+  std::unique_ptr<cudf::table> post_filter_and_project(
+    sirius::op::scan::filtered_table&&,
+    const cucascade::memory::memory_space&,
+    rmm::cuda_stream_view,
+    bool,
+    std::shared_ptr<const sirius::like_multiliteral_cache>) override
   {
     return _produce();
   }
@@ -172,7 +175,9 @@ class stub_ingestible final : public sirius::op::scan::gpu_ingestible {
   sirius::op::scan::filtered_table materialize_metadata_to_table(
     const sirius::op::scan::scan_info&,
     const cucascade::memory::memory_space&,
-    rmm::cuda_stream_view) override
+    rmm::cuda_stream_view,
+    bool,
+    std::shared_ptr<const sirius::like_multiliteral_cache>) override
   {
     throw std::logic_error("stub_ingestible: a resident split never decodes scan metadata");
   }

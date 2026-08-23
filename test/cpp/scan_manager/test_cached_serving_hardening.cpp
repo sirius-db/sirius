@@ -349,14 +349,18 @@ struct stub_ingestible final : sirius::op::scan::gpu_ingestible {
   sirius::op::scan::filtered_table materialize_metadata_to_table(
     const sirius::op::scan::scan_info& /*info*/,
     const cucascade::memory::memory_space& /*mem_space*/,
-    rmm::cuda_stream_view /*stream*/) override
+    rmm::cuda_stream_view /*stream*/,
+    bool /*like_swar_fastpath*/,
+    std::shared_ptr<const sirius::like_multiliteral_cache> /*like_cache*/) override
   {
     throw std::logic_error("stub_ingestible::materialize_metadata_to_table is unreachable");
   }
   std::unique_ptr<cudf::table> post_filter_and_project(
     sirius::op::scan::filtered_table&& /*input*/,
     const cucascade::memory::memory_space& /*mem_space*/,
-    rmm::cuda_stream_view /*stream*/) override
+    rmm::cuda_stream_view /*stream*/,
+    bool /*like_swar_fastpath*/,
+    std::shared_ptr<const sirius::like_multiliteral_cache> /*like_cache*/) override
   {
     throw std::logic_error("stub_ingestible::post_filter_and_project is unreachable");
   }

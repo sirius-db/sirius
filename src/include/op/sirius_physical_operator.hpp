@@ -41,6 +41,8 @@
 
 namespace sirius {
 
+class like_multiliteral_cache;
+
 namespace telemetry {
 struct batch_telemetry_info;
 }  // namespace telemetry
@@ -447,10 +449,9 @@ class sirius_physical_operator {
 
   [[nodiscard]] bool has_physical_overrides() const noexcept { return !_physical_types.empty(); }
 
-  [[nodiscard]] bool like_swar_fastpath_enabled() const noexcept
-  {
-    return _like_swar_fastpath_enabled;
-  }
+  [[nodiscard]] bool like_swar_fastpath_enabled() const noexcept;
+
+  [[nodiscard]] std::shared_ptr<like_multiliteral_cache const> like_cache() const noexcept;
 
   //! Install a complete physical output schema. Callers must supply one entry per logical column;
   //! keeping this invariant local prevents a partial sidecar from silently shifting columns.
@@ -719,16 +720,8 @@ class sirius_physical_operator {
   //! set_physical_types() cannot be bypassed by direct assignment.
   std::vector<cudf::data_type> _physical_types;
 
-  //! Per-query expression-evaluator policy stamped after the plan's rewrites complete.
-  bool _like_swar_fastpath_enabled = true;
-
   //! Restricted to the plan generator so parent pointers stay immutable post-plan-gen.
   void set_parent_op(sirius_physical_operator* parent_op) noexcept { _parent_op = parent_op; }
-
-  void set_like_swar_fastpath_enabled(bool enabled) noexcept
-  {
-    _like_swar_fastpath_enabled = enabled;
-  }
 
   friend class ::sirius::planner::sirius_physical_plan_generator;
 };

@@ -180,13 +180,13 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   }
 
   //----------String Matching Functions----------//
-  auto setup_string_matching = [&]() -> std::pair<evaluate_result, std::string> {
+  auto setup_string_matching = [&]() -> std::pair<evaluate_result, std::string_view> {
     D_ASSERT(args.size() == 2);
     D_ASSERT(args[1]->holds<sirius::ast::constant>());
 
-    auto input     = evaluate(*args[0], evaluation_mode::MATERIALIZE);
-    auto match_str = std::get<std::string>(args[1]->get<sirius::ast::constant>().payload);
-    return {evaluate_result(std::move(input)), std::move(match_str)};
+    auto input            = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    auto const& match_str = std::get<std::string>(args[1]->get<sirius::ast::constant>().payload);
+    return {evaluate_result(std::move(input)), std::string_view(match_str)};
   };
   if (resolved_id == function_id::like || resolved_id == function_id::not_like) {
     auto [input, match_str] = setup_string_matching();
@@ -195,10 +195,10 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
     // `%lit1%lit2%...%litN%` patterns take a SWAR digram fast path (NOT fused in);
     // everything else — and any ineligible column layout — takes cudf::strings::like.
     if (_like_swar_fastpath && !input.is_scalar()) {
-      if (auto const parsed =
-            classify_like_multiliteral(std::string_view(match_str), std::string_view())) {
+      auto const parsed = _like_cache->get_or_classify(match_str);
+      if (*parsed) {
         if (auto result_column = like_multiliteral(
-              cudf::strings_column_view(input.get_column_view()), *parsed, invert, _stream, _mr)) {
+              cudf::strings_column_view(input.get_column_view()), **parsed, invert, _stream, _mr)) {
           return evaluate_result(std::move(result_column));
         }
       }

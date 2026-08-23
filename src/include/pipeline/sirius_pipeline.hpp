@@ -224,6 +224,17 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
     return build_ctx_.telemetry_context().get();
   }
 
+  [[nodiscard]] const sirius::operator_params& get_operator_params() const noexcept
+  {
+    return build_ctx_.get_operator_params();
+  }
+
+  [[nodiscard]] const std::shared_ptr<const sirius::like_multiliteral_cache>&
+  get_like_multiliteral_cache() const noexcept
+  {
+    return build_ctx_.get_like_multiliteral_cache();
+  }
+
  private:
   //! Whether or not the pipeline has been readied
   bool ready;

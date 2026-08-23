@@ -1931,9 +1931,9 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 
 // Process-global Config writes are refused once the Sirius runtime is
 // latched unavailable (stable, session-preserving error). Connection-local
-// settings (gpu_execution, enable_duckdb_fallback) and operator_params
-// setters are not gated here; the latter serialize via
-// lock_operator_params_slot instead.
+// settings (gpu_execution, enable_duckdb_fallback, fuse_merge_pipelines,
+// like_swar_fastpath) and operator_params setters are not gated here; the latter
+// serialize via lock_operator_params_slot instead.
 static void throw_if_sirius_runtime_unavailable(ClientContext& context)
 {
   if (auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");

@@ -799,33 +799,24 @@ sirius_physical_plan_generator::sirius_physical_plan_generator(duckdb::ClientCon
 sirius_physical_plan_generator::~sirius_physical_plan_generator() {}
 
 void sirius_physical_plan_generator::set_parent_ops(sirius::op::sirius_physical_operator& op,
-                                                    sirius::op::sirius_physical_operator* parent,
-                                                    std::optional<bool> like_swar_fastpath)
+                                                    sirius::op::sirius_physical_operator* parent)
 {
   op.set_parent_op(parent);
-  if (like_swar_fastpath) {
-    op.set_like_swar_fastpath_enabled(*like_swar_fastpath);
-    if (op.type == sirius::op::SiriusPhysicalOperatorType::GPU_SCAN) {
-      op.Cast<sirius::op::scan::sirius_gpu_scan_operator>()
-        .get_ingestible()
-        .set_like_swar_fastpath_enabled(*like_swar_fastpath);
-    }
-  }
 
   // CTE is transparent on its consumer side: children[0] materializes into the CTE while
-  // children[1]'s result IS the CTE's output (CTE::execute just forwards it). Stamp
-  // children[1] with CTE's own parent so the tree-parent wiring never emits
+  // children[1]'s result IS the CTE's output (CTE::execute just forwards it). Assign the CTE's
+  // own parent to children[1] so the tree-parent wiring never emits
   // consumer_sink -> CTE_pipeline edges, which would close a cycle with the CTE sink's own
   // CTE_pipeline -> consumer emissions.
   if (op.type == sirius::op::SiriusPhysicalOperatorType::CTE) {
     D_ASSERT(op.children.size() == 2);
-    set_parent_ops(*op.children[0], &op, like_swar_fastpath);
-    set_parent_ops(*op.children[1], parent, like_swar_fastpath);
+    set_parent_ops(*op.children[0], &op);
+    set_parent_ops(*op.children[1], parent);
     return;
   }
 
   for (auto& child : op.children) {
-    if (child) { set_parent_ops(*child, &op, like_swar_fastpath); }
+    if (child) { set_parent_ops(*child, &op); }
   }
   // DELIM JOIN keeps its internal `join`/`distinct_root` subtrees outside `children[]`;
   // descend so the wrapped operators inside get tree parents. PARTITION's ctor `key_source`
@@ -834,8 +825,8 @@ void sirius_physical_plan_generator::set_parent_ops(sirius::op::sirius_physical_
   if (op.type == sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
       op.type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
     auto& delim = op.Cast<sirius::op::sirius_physical_delim_join>();
-    if (delim.join) { set_parent_ops(*delim.join, &op, like_swar_fastpath); }
-    if (delim.distinct_root) { set_parent_ops(*delim.distinct_root, &op, like_swar_fastpath); }
+    if (delim.join) { set_parent_ops(*delim.join, &op); }
+    if (delim.distinct_root) { set_parent_ops(*delim.distinct_root, &op); }
   }
   // RESULT_COLLECTOR keeps its tree child in `plan` (a reference, outside `children[]`) —
   // it's the engine-injected root wrapper. Without descending, the wrapped sink's `_parent_op`
@@ -843,7 +834,7 @@ void sirius_physical_plan_generator::set_parent_ops(sirius::op::sirius_physical_
   // source — runtime hang.
   if (op.type == sirius::op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
     auto& rc = op.Cast<sirius::op::sirius_physical_result_collector>();
-    set_parent_ops(rc.plan, &op, like_swar_fastpath);
+    set_parent_ops(rc.plan, &op);
   }
 }
 
@@ -992,8 +983,7 @@ bool sirius_physical_plan_generator::preserve_insertion_order(
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOperator> op)
 {
-  auto& profiler                = duckdb::QueryProfiler::Get(context);
-  bool const like_swar_fastpath = duckdb::like_swar_fastpath_enabled(context);
+  auto& profiler = duckdb::QueryProfiler::Get(context);
 
   // Resolve the types of each operator.
   profiler.StartPhase(duckdb::MetricType::PHYSICAL_PLANNER_RESOLVE_TYPES);
@@ -1029,7 +1019,7 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   // pure topology pass over `build_pipelines` virtuals; `set_parent_ops` then derives every
   // `_parent_op` from the final tree for the tree-parent-lookup wiring.
   insert_gpu_pipeline_operators(plan);
-  set_parent_ops(*plan, /*parent=*/nullptr, like_swar_fastpath);
+  set_parent_ops(*plan, /*parent=*/nullptr);
 
   return plan;
 }

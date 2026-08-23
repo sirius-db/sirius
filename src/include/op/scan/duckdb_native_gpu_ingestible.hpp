@@ -168,12 +168,16 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
   op::scan::filtered_table materialize_metadata_to_table(
     scan_info const& info,
     ::cucascade::memory::memory_space const& mem_space,
-    rmm::cuda_stream_view stream) override;
+    rmm::cuda_stream_view stream,
+    bool like_swar_fastpath,
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache) override;
 
   std::unique_ptr<cudf::table> post_filter_and_project(
     filtered_table&& input,
     ::cucascade::memory::memory_space const& mem_space,
-    rmm::cuda_stream_view stream) override;
+    rmm::cuda_stream_view stream,
+    bool like_swar_fastpath,
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache) override;
 
   [[nodiscard]] const ingestible_table_info& table_info() const noexcept override { return *_info; }
 

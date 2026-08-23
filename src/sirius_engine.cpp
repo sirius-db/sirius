@@ -240,7 +240,6 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
       "Sirius context is not initialized. Check that SIRIUS_DISABLE is not set "
       "and review extension loading logs for errors.");
   }
-  const sirius::operator_params& op_params = sirius_ctx_ptr->get_config().get_operator_params();
 
   sirius_physical_plan = &plan;
 
@@ -269,30 +268,19 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   } catch (...) {  // best-effort observability
   }
 
-  // Create plan-time build context (decoupled from engine).
+  auto query_operator_params =
+    std::make_shared<sirius::operator_params>(sirius_ctx_ptr->get_config().get_operator_params());
+  query_operator_params->like_swar_fastpath = duckdb::like_swar_fastpath_enabled(context);
+
+  // Create the plan-time context with one immutable snapshot of query policy.
   const pipeline::pipeline_build_context build_ctx{
     sirius_ctx_ptr->get_telemetry_context(),
     duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context),
-    std::move(active_gpu_ids)};
+    std::move(active_gpu_ids),
+    std::move(query_operator_params)};
 
-  // A root wrapper added after planning has not been stamped yet. Recover the captured policy
-  // from its planned subtree: RESULT_COLLECTOR keeps that subtree outside children[], while
-  // ordinary wrappers such as STREAMING_SINK own it as a child.
-  auto* policy_source = sirius_physical_plan.get();
-  if (sirius_physical_plan->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
-    policy_source = &sirius_physical_plan->Cast<op::sirius_physical_result_collector>().plan;
-  } else {
-    for (auto const& child : sirius_physical_plan->children) {
-      if (child) {
-        policy_source = child.get();
-        break;
-      }
-    }
-  }
-  auto const like_swar_fastpath = policy_source->like_swar_fastpath_enabled();
   sirius::planner::sirius_physical_plan_generator::set_parent_ops(*sirius_physical_plan,
-                                                                  /*parent=*/nullptr,
-                                                                  like_swar_fastpath);
+                                                                  /*parent=*/nullptr);
   sirius::planner::sirius_physical_plan_generator::mark_fusable_merge_pipelines(
     context, *sirius_physical_plan);
 
@@ -306,7 +294,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   root_pipeline_idx = 0;
 
   // Convert meta-pipelines into execution-ready pipelines
-  pipeline::sirius_pipeline_converter converter(build_ctx, op_params);
+  pipeline::sirius_pipeline_converter converter(build_ctx);
   auto result = converter.convert(*root_pipeline);
 
   auto repo_manager = sirius_ctx_ptr->get_data_repository_manager(query_id_);

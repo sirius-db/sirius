@@ -100,10 +100,14 @@ constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
 }  // namespace config
 
-/// Parameters controlling operator-level resource sizing.
-/// These can be set via the .yaml file under the sirius.operator_params section
-/// or overridden at runtime using DuckDB SET commands.
+/// Operator parameters shared between planning and execution.
+/// User-tunable members can be set under sirius.operator_params in YAML or overridden with
+/// DuckDB SET commands; engine-owned query policy is noted below.
 struct operator_params {
+  /// Engine-owned query policy. The user-facing setting defaults to enabled, but an unwired
+  /// execution context stays fail-closed until the engine snapshots the connection value.
+  bool like_swar_fastpath = false;
+
   /// Target batch size (bytes) for DuckDB scan tasks.
   uint64_t scan_task_batch_size = config::derived_default_batch_size();
 

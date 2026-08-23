@@ -27,31 +27,17 @@
 
 // standard library
 #include <cstdint>
+#include <utility>
 
 namespace sirius {
 namespace {
 
 constexpr int max_literals      = like_multiliteral_max_literals;
-constexpr int max_chunks        = like_multiliteral_max_literal_bytes / 8;
+constexpr int max_chunks        = detail::like_multiliteral_max_chunks;
 constexpr int threads_per_block = 256;
 
-/// One literal, pre-digested for the kernel: SWAR broadcast bytes for the candidate digram
-/// plus masked little-endian u64 chunks for full verification.
-struct literal_desc {
-  uint64_t chunk_val[max_chunks];   ///< literal bytes, 8 per chunk, little-endian, zero-padded
-  uint64_t chunk_mask[max_chunks];  ///< 0xFF per literal byte within each chunk
-  uint64_t b0_bcast;                ///< first literal byte broadcast to all 8 lanes
-  uint64_t b1_bcast;                ///< second literal byte broadcast (unused when len == 1)
-  int32_t len;                      ///< literal byte length (1..max_literal_bytes)
-  int32_t nchunks;                  ///< ceil(len / 8)
-};
-
-/// The whole pattern, passed to the kernel by value.
-struct pattern_desc {
-  literal_desc literals[max_literals];
-  int32_t n;          ///< number of literals (1..max_literals)
-  int32_t total_len;  ///< sum of literal lengths — rows shorter than this cannot match
-};
+using literal_desc = detail::like_multiliteral_literal_desc;
+using pattern_desc = detail::like_multiliteral_pattern_desc;
 
 /// SWAR byte-equality candidate mask: a SUPERSET of the equal-byte positions of @p x vs the
 /// broadcast byte of @p bcast, as bit 7 per byte. Every byte equal to bcast is flagged, but
@@ -137,13 +123,12 @@ __device__ __forceinline__ bool verify_literal(uint64_t const* __restrict__ word
  * the end of the previous match — exact for `%lit1%...%litN%` semantics.
  *
  * All positions are absolute byte positions into the chars buffer (offsets are stored that
- * way even for sliced views). The chars-child size bounds memory loads; each row's offsets
- * independently bound candidate matching.
+ * way even for sliced views). The sliced view's final offset bounds memory loads; each row's
+ * offsets independently bound candidate matching.
  */
 template <typename OffT>
 __global__ void like_multiliteral_kernel(uint64_t const* __restrict__ words,
                                          OffT const* __restrict__ offsets,
-                                         int64_t chars_size,
                                          cudf::size_type nrows,
                                          cudf::bitmask_type const* __restrict__ null_mask,
                                          cudf::size_type mask_offset,
@@ -153,6 +138,7 @@ __global__ void like_multiliteral_kernel(uint64_t const* __restrict__ words,
 {
   auto const row = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (row >= nrows) { return; }
+  int64_t const chars_size = static_cast<int64_t>(offsets[nrows]);
 
   bool match = false;
   bool const is_valid =
@@ -223,6 +209,24 @@ literal_desc make_literal_desc(std::string const& lit)
 
 }  // namespace
 
+like_multiliteral_pattern::like_multiliteral_pattern(std::vector<std::string> literals)
+  : _literals(std::move(literals))
+{
+  if (_literals.empty() || _literals.size() > static_cast<size_t>(max_literals)) { return; }
+  for (auto const& literal : _literals) {
+    if (literal.empty() ||
+        literal.size() > static_cast<size_t>(like_multiliteral_max_literal_bytes)) {
+      return;
+    }
+  }
+
+  _descriptor.n = static_cast<int32_t>(_literals.size());
+  for (size_t i = 0; i < _literals.size(); ++i) {
+    _descriptor.literals[i] = make_literal_desc(_literals[i]);
+    _descriptor.total_len += _descriptor.literals[i].len;
+  }
+}
+
 std::optional<like_multiliteral_pattern> classify_like_multiliteral(std::string_view pattern,
                                                                     std::string_view escape)
 {
@@ -230,16 +234,16 @@ std::optional<like_multiliteral_pattern> classify_like_multiliteral(std::string_
   if (pattern.size() < 2 || pattern.front() != '%' || pattern.back() != '%') {
     return std::nullopt;  // anchored (prefix/suffix/exact) patterns: cudf path
   }
-  like_multiliteral_pattern result;
+  std::vector<std::string> literals;
   std::string current;
   for (char const ch : pattern) {
     if (ch == '%') {
       if (!current.empty()) {
         if (current.size() > static_cast<size_t>(like_multiliteral_max_literal_bytes) ||
-            result.literals.size() == static_cast<size_t>(like_multiliteral_max_literals)) {
+            literals.size() == static_cast<size_t>(like_multiliteral_max_literals)) {
           return std::nullopt;
         }
-        result.literals.push_back(std::move(current));
+        literals.push_back(std::move(current));
         current.clear();
       }
       continue;  // consecutive '%' collapse
@@ -251,8 +255,27 @@ std::optional<like_multiliteral_pattern> classify_like_multiliteral(std::string_
     current.push_back(ch);
   }
   // The pattern ends with '%', so no literal is pending here.
-  if (result.literals.empty()) { return std::nullopt; }  // pure '%'/'%%': cudf path
-  return result;
+  if (literals.empty()) { return std::nullopt; }  // pure '%'/'%%': cudf path
+  return like_multiliteral_pattern{std::move(literals)};
+}
+
+like_multiliteral_cache::entry_ptr like_multiliteral_cache::get_or_classify(
+  std::string_view pattern) const
+{
+  std::lock_guard lock(_mutex);
+  if (auto const cached = _entries.find(pattern); cached != _entries.end()) {
+    return cached->second;
+  }
+
+  auto classification = std::make_shared<like_multiliteral_cache::classification const>(
+    classify_like_multiliteral(pattern, std::string_view{}));
+  return _entries.emplace(std::string(pattern), std::move(classification)).first->second;
+}
+
+std::size_t like_multiliteral_cache::classification_count_for_testing() const
+{
+  std::lock_guard lock(_mutex);
+  return _entries.size();
 }
 
 std::unique_ptr<cudf::column> like_multiliteral(cudf::strings_column_view const& input,
@@ -261,10 +284,18 @@ std::unique_ptr<cudf::column> like_multiliteral(cudf::strings_column_view const&
                                                 rmm::cuda_stream_view stream,
                                                 rmm::device_async_resource_ref mr)
 {
-  auto const n = static_cast<int64_t>(pattern.literals.size());
+  auto const& literals = pattern.literals();
+  auto const n         = static_cast<int64_t>(literals.size());
   if (n < 1 || n > max_literals) {
     throw internal_exception("[like_multiliteral] pattern with {} literals was not classified out",
                              n);
+  }
+  for (auto const& literal : literals) {
+    if (literal.empty() ||
+        literal.size() > static_cast<size_t>(like_multiliteral_max_literal_bytes)) {
+      throw internal_exception("[like_multiliteral] literal of {} bytes was not classified out",
+                               literal.size());
+    }
   }
 
   auto const nrows = input.size();
@@ -280,17 +311,7 @@ std::unique_ptr<cudf::column> like_multiliteral(cudf::strings_column_view const&
   char const* chars_base = input.chars_begin(stream);
   if (reinterpret_cast<uintptr_t>(chars_base) & 7) { return nullptr; }
 
-  pattern_desc pat{};
-  pat.n = static_cast<int32_t>(n);
-  for (int64_t i = 0; i < n; ++i) {
-    auto const& lit = pattern.literals[i];
-    if (lit.empty() || lit.size() > static_cast<size_t>(like_multiliteral_max_literal_bytes)) {
-      throw internal_exception("[like_multiliteral] literal of {} bytes was not classified out",
-                               lit.size());
-    }
-    pat.literals[i] = make_literal_desc(lit);
-    pat.total_len += pat.literals[i].len;
-  }
+  auto const& pat = pattern._descriptor;
 
   auto result = cudf::make_numeric_column(cudf::data_type{cudf::type_id::BOOL8},
                                           nrows,
@@ -302,18 +323,17 @@ std::unique_ptr<cudf::column> like_multiliteral(cudf::strings_column_view const&
 
   auto const* null_mask = input.null_count() > 0 ? input.null_mask() : nullptr;
   auto const* words     = reinterpret_cast<uint64_t const*>(chars_base);
-  auto const chars_size = static_cast<int64_t>(input.chars_size(stream));
   auto const num_blocks = static_cast<unsigned>(
     (static_cast<int64_t>(nrows) + threads_per_block - 1) / threads_per_block);
 
   if (offsets_id == cudf::type_id::INT32) {
     auto const* offsets = input.offsets().data<int32_t>() + input.offset();
     like_multiliteral_kernel<int32_t><<<num_blocks, threads_per_block, 0, stream.value()>>>(
-      words, offsets, chars_size, nrows, null_mask, input.offset(), pat, invert, out);
+      words, offsets, nrows, null_mask, input.offset(), pat, invert, out);
   } else {
     auto const* offsets = input.offsets().data<int64_t>() + input.offset();
     like_multiliteral_kernel<int64_t><<<num_blocks, threads_per_block, 0, stream.value()>>>(
-      words, offsets, chars_size, nrows, null_mask, input.offset(), pat, invert, out);
+      words, offsets, nrows, null_mask, input.offset(), pat, invert, out);
   }
   CUDF_CHECK_CUDA(stream.value());
   return result;

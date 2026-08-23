@@ -25,7 +25,11 @@
 #include <rmm/resource_ref.hpp>
 
 // standard library
+#include <cstdint>
+#include <functional>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -54,10 +58,44 @@ inline constexpr int like_multiliteral_max_literals = 4;
 /// Maximum byte length of each literal the fast-path kernel supports.
 inline constexpr int like_multiliteral_max_literal_bytes = 32;
 
+namespace detail {
+
+inline constexpr int like_multiliteral_max_chunks = like_multiliteral_max_literal_bytes / 8;
+
+struct like_multiliteral_literal_desc {
+  uint64_t chunk_val[like_multiliteral_max_chunks];
+  uint64_t chunk_mask[like_multiliteral_max_chunks];
+  uint64_t b0_bcast;
+  uint64_t b1_bcast;
+  int32_t len;
+  int32_t nchunks;
+};
+
+struct like_multiliteral_pattern_desc {
+  like_multiliteral_literal_desc literals[like_multiliteral_max_literals];
+  int32_t n;
+  int32_t total_len;
+};
+
+}  // namespace detail
+
 /// Parsed form of an eligible `%lit1%lit2%...%litN%` pattern.
-struct like_multiliteral_pattern {
+class like_multiliteral_pattern {
+ public:
+  explicit like_multiliteral_pattern(std::vector<std::string> literals);
+
   /// The literals, in pattern order. Each is 1..max_literal_bytes ASCII bytes.
-  std::vector<std::string> literals;
+  [[nodiscard]] std::vector<std::string> const& literals() const noexcept { return _literals; }
+
+ private:
+  std::vector<std::string> _literals;
+  detail::like_multiliteral_pattern_desc _descriptor{};
+
+  friend std::unique_ptr<cudf::column> like_multiliteral(cudf::strings_column_view const&,
+                                                         like_multiliteral_pattern const&,
+                                                         bool,
+                                                         rmm::cuda_stream_view,
+                                                         rmm::device_async_resource_ref);
 };
 
 /**
@@ -80,6 +118,39 @@ std::optional<like_multiliteral_pattern> classify_like_multiliteral(std::string_
                                                                     std::string_view escape);
 
 /**
+ * @brief Thread-safe query cache for immutable multi-literal LIKE classifications
+ *
+ * Entries are keyed by pattern value so separately built AST nodes and task-local evaluators
+ * share one compiled descriptor. Returned entries remain valid independently of later cache
+ * insertions.
+ */
+class like_multiliteral_cache {
+ public:
+  using classification = std::optional<like_multiliteral_pattern>;
+  using entry_ptr      = std::shared_ptr<classification const>;
+
+  like_multiliteral_cache()                                          = default;
+  like_multiliteral_cache(like_multiliteral_cache const&)            = delete;
+  like_multiliteral_cache& operator=(like_multiliteral_cache const&) = delete;
+
+  /**
+   * @brief Return the cached classification for a pattern, classifying it when absent
+   *
+   * Concurrent calls for the same pattern perform classification once.
+   *
+   * @param pattern Constant LIKE pattern value
+   * @return Shared immutable eligible pattern or fallback marker
+   */
+  [[nodiscard]] entry_ptr get_or_classify(std::string_view pattern) const;
+
+  [[nodiscard]] std::size_t classification_count_for_testing() const;
+
+ private:
+  mutable std::mutex _mutex;
+  mutable std::map<std::string, entry_ptr, std::less<>> _entries;
+};
+
+/**
  * @brief Evaluate a classified multi-literal LIKE pattern over a strings column.
  *
  * Produces a BOOL8 column identical to
@@ -91,9 +162,11 @@ std::optional<like_multiliteral_pattern> classify_like_multiliteral(std::string_
  * @throws sirius::internal_exception if @p pattern was not produced by
  *         classify_like_multiliteral() (violates the literal count or byte-length caps)
  *
- * @param input   Strings column to match. Rows must be valid UTF-8 (the same precondition
- *                cudf's strings APIs document); for ASCII literals, byte-level search is then
- *                exactly character-level search.
+ * @pre Every non-null row in @p input is valid UTF-8. Supported Sirius ingestion supplies DuckDB
+ *      VARCHAR/cuDF STRING data under this contract; this hot path does not redundantly validate
+ *      the invariant.
+ *
+ * @param input   Strings column to match.
  * @param pattern A pattern accepted by classify_like_multiliteral().
  * @param invert  When true, computes NOT LIKE.
  * @param stream  CUDA stream to run on.

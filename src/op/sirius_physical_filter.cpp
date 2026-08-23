@@ -67,8 +67,9 @@ std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_da
                                          cudf::get_current_device_resource_ref(),
                                          stream,
                                          strategy_from_config(),
-                                         2,
-                                         like_swar_fastpath_enabled());
+                                         expression_evaluator::default_min_ast_size,
+                                         like_swar_fastpath_enabled(),
+                                         like_cache());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(input_batches.size());

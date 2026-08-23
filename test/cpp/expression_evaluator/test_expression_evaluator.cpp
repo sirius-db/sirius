@@ -1680,6 +1680,44 @@ TEMPLATE_TEST_CASE("select LIKE and NOT LIKE",
     REQUIRE(copy_string_column_to_host(ov.column(0)) == expected);
   }
 
+  SECTION("LIKE fast-path classification is shared by pattern value across evaluators")
+  {
+    auto make_like_expression = [] {
+      std::vector<std::unique_ptr<ast_node>> children;
+      children.push_back(make_ref(0));
+      children.push_back(make_str_const("%tr%1%"));
+      return make_func(
+        sirius::function_id::like, std::move(children), logical_type::make(type_id::BOOLEAN));
+    };
+    auto first_expr  = make_like_expression();
+    auto second_expr = make_like_expression();
+    REQUIRE(first_expr.get() != second_expr.get());
+
+    auto input_ro   = input->to_read_only();
+    auto& repr      = input_ro.get_data()->cast<gpu_table_representation>();
+    auto like_cache = std::make_shared<sirius::like_multiliteral_cache>();
+    exp_executor first_executor(*first_expr,
+                                get_resource_ref(*space),
+                                cudf::get_default_stream(),
+                                strategy,
+                                exp_executor::default_min_ast_size,
+                                /*like_swar_fastpath=*/true,
+                                like_cache);
+    exp_executor second_executor(*second_expr,
+                                 get_resource_ref(*space),
+                                 cudf::get_default_stream(),
+                                 strategy,
+                                 exp_executor::default_min_ast_size,
+                                 /*like_swar_fastpath=*/true,
+                                 like_cache);
+
+    auto first  = first_executor.select(repr.get_table_view());
+    auto second = second_executor.select(repr.get_table_view());
+    REQUIRE(copy_string_column_to_host(first->view().column(0)) ==
+            copy_string_column_to_host(second->view().column(0)));
+    REQUIRE(like_cache->classification_count_for_testing() == 1);
+  }
+
   SECTION("NOT LIKE '%tr%1%' — fast path agrees with the cudf path (fast path disabled)")
   {
     auto run_not_like = [&](bool like_swar_fastpath) {

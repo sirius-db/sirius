@@ -17,10 +17,11 @@
 // Tests for the multi-literal LIKE SWAR fast path (expression_evaluator/like_multiliteral.hpp):
 //   1. the pattern classifier — exactly `%lit1%lit2%...%litN%` shapes are accepted, everything
 //      else (anchored patterns, `_`, escapes, non-ASCII, over-caps) is refused;
-//   2. the kernel — differential against cudf::strings::like on adversarial fixed rows (word
+//   2. the query cache — concurrent lookups share one immutable value-keyed classification;
+//   3. the kernel — differential against cudf::strings::like on adversarial fixed rows (word
 //      alignment sweeps, literal-at-row-edges, greedy/overlap traps, UTF-8 neighbours, nulls,
 //      sliced views) and on seeded random near-miss data;
-//   3. the host launcher contract — caps-violating patterns that bypass the classifier throw
+//   4. the host launcher contract — caps-violating patterns that bypass the classifier throw
 //      sirius::internal_exception instead of silently falling back.
 
 #include "catch.hpp"
@@ -48,6 +49,7 @@
 
 // standard library
 #include <cstdint>
+#include <future>
 #include <random>
 #include <string>
 #include <vector>
@@ -188,30 +190,30 @@ TEST_CASE("like_multiliteral classifier accepts %lit...% shapes",
 {
   auto p = classify_like_multiliteral("%special%requests%", {});
   REQUIRE(p.has_value());
-  REQUIRE(p->literals == std::vector<std::string>{"special", "requests"});
+  REQUIRE(p->literals() == std::vector<std::string>{"special", "requests"});
 
   p = classify_like_multiliteral("%abc%", {});
   REQUIRE(p.has_value());
-  REQUIRE(p->literals == std::vector<std::string>{"abc"});
+  REQUIRE(p->literals() == std::vector<std::string>{"abc"});
 
   // Consecutive '%' collapse per SQL semantics.
   p = classify_like_multiliteral("%%a%%%b%%", {});
   REQUIRE(p.has_value());
-  REQUIRE(p->literals == std::vector<std::string>{"a", "b"});
+  REQUIRE(p->literals() == std::vector<std::string>{"a", "b"});
 
   // Max caps: 4 literals, 32 bytes each.
   p = classify_like_multiliteral("%a%b%c%d%", {});
   REQUIRE(p.has_value());
-  REQUIRE(p->literals.size() == 4);
+  REQUIRE(p->literals().size() == 4);
   std::string const lit32(32, 'x');
   p = classify_like_multiliteral("%" + lit32 + "%", {});
   REQUIRE(p.has_value());
-  REQUIRE(p->literals == std::vector<std::string>{lit32});
+  REQUIRE(p->literals() == std::vector<std::string>{lit32});
 
   // Punctuation and spaces are plain ASCII literal bytes.
   p = classify_like_multiliteral("% a.b-c! %", {});
   REQUIRE(p.has_value());
-  REQUIRE(p->literals == std::vector<std::string>{" a.b-c! "});
+  REQUIRE(p->literals() == std::vector<std::string>{" a.b-c! "});
 }
 
 TEST_CASE("like_multiliteral classifier refuses everything else",
@@ -239,6 +241,25 @@ TEST_CASE("like_multiliteral classifier refuses everything else",
   // Over caps: 5 literals / 33-byte literal.
   CHECK_FALSE(classify_like_multiliteral("%a%b%c%d%e%", {}).has_value());
   CHECK_FALSE(classify_like_multiliteral("%" + std::string(33, 'x') + "%", {}).has_value());
+}
+
+TEST_CASE("like_multiliteral cache classifies a pattern once under concurrency",
+          "[expression_evaluator][like_multiliteral][cache]")
+{
+  auto cache = std::make_shared<sirius::like_multiliteral_cache>();
+  std::vector<std::future<sirius::like_multiliteral_cache::entry_ptr>> lookups;
+  for (int i = 0; i < 8; ++i) {
+    lookups.push_back(std::async(std::launch::async,
+                                 [cache] { return cache->get_or_classify("%special%requests%"); }));
+  }
+
+  auto const first = lookups.front().get();
+  REQUIRE(first->has_value());
+  for (std::size_t i = 1; i < lookups.size(); ++i) {
+    auto const entry = lookups[i].get();
+    REQUIRE(entry.get() == first.get());
+  }
+  REQUIRE(cache->classification_count_for_testing() == 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -529,21 +550,42 @@ TEST_CASE("like_multiliteral throws on patterns violating the classifier caps",
   auto mr     = cudf::get_current_device_resource_ref();
 
   // Hand-built patterns bypass the classifier; a caps-violating pattern reaching the launcher is
-  // a contract violation and must throw (nullptr exclusively means layout ineligibility). The
-  // column must be non-empty: the literal-count check precedes the nrows == 0 early return, but
-  // the per-literal byte check follows it.
-  auto const col = make_strings({"x"});
-  auto const scv = cudf::strings_column_view(col->view());
+  // a contract violation and must throw (nullptr exclusively means layout ineligibility).
+  auto const col   = make_strings({"x"});
+  auto const empty = cudf::make_empty_column(cudf::type_id::STRING);
 
   sirius::like_multiliteral_pattern const five_literals{{"a", "b", "c", "d", "e"}};
-  REQUIRE_THROWS_AS(like_multiliteral(scv, five_literals, false, stream, mr),
-                    sirius::internal_exception);
-
   sirius::like_multiliteral_pattern const oversized_literal{{std::string(33, 'x')}};
-  REQUIRE_THROWS_AS(like_multiliteral(scv, oversized_literal, false, stream, mr),
-                    sirius::internal_exception);
-
   sirius::like_multiliteral_pattern const empty_literal{{""}};
-  REQUIRE_THROWS_AS(like_multiliteral(scv, empty_literal, false, stream, mr),
-                    sirius::internal_exception);
+
+  auto require_throws = [&](cudf::strings_column_view const& input) {
+    REQUIRE_THROWS_AS(like_multiliteral(input, five_literals, false, stream, mr),
+                      sirius::internal_exception);
+    REQUIRE_THROWS_AS(like_multiliteral(input, oversized_literal, false, stream, mr),
+                      sirius::internal_exception);
+    REQUIRE_THROWS_AS(like_multiliteral(input, empty_literal, false, stream, mr),
+                      sirius::internal_exception);
+  };
+
+  require_throws(cudf::strings_column_view(col->view()));
+  require_throws(cudf::strings_column_view(empty->view()));
+
+  rmm::device_buffer chars_buf(9, stream, mr);
+  auto offsets_col = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 2, cudf::mask_state::UNALLOCATED, stream, mr);
+  std::vector<int32_t> const offsets{0, 1};
+  cudaMemcpyAsync(offsets_col->mutable_view().data<int32_t>(),
+                  offsets.data(),
+                  offsets.size() * sizeof(int32_t),
+                  cudaMemcpyHostToDevice,
+                  stream.value());
+  stream.synchronize();
+  cudf::column_view const misaligned_view(cudf::data_type{cudf::type_id::STRING},
+                                          1,
+                                          static_cast<char const*>(chars_buf.data()) + 1,
+                                          nullptr,
+                                          0,
+                                          0,
+                                          {offsets_col->view()});
+  require_throws(cudf::strings_column_view(misaligned_view));
 }
