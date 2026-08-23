@@ -208,6 +208,12 @@ CALL unpin_table('lineitem');
 
 `format` is `parquet` or `duckdb`, resolved at bind time from an explicit parameter or inferred from the path extension. `tier` is `gpu` (columns in GPU device memory) or `host` (columns in pinned host memory).
 
+Multi-file Parquet pins preserve DuckDB's `GlobFiles` order by default. The opt-in
+`pin_table_natural_file_order` setting sorts by precomputed canonical path keys (so `part.2`
+precedes `part.10`) while retaining the raw path strings passed to the reader. This keeps relative
+versus absolute spelling and symlink normalization from changing the ordering key without
+disturbing Hive partition parsing.
+
 ### Materializing a pin
 
 Pinning drives the source's `gpu_ingestible` to completion (`materialize_all_batches` / `materialize_pin_to_host` in `pin_table.cpp`):
@@ -245,7 +251,13 @@ During `prepare_for_query`, `try_assign_cached_entries` matches each `GPU_SCAN` 
 
 ### Re-pin semantics
 
-For the GPU tier, `insert_pinned_entry` merges into an existing entry when the row count matches (adding only columns not already cached; per-chunk memory-space placement must match) and replaces it otherwise. The HOST tier always replaces, since each host chunk already holds every column.
+For the GPU tier, `insert_pinned_entry` merges columns positionally only when both the row count and
+the exact ordered source identity match. Parquet identity is the byte-exact ordered vector of
+canonical file paths; DuckDB identity is `catalog.schema.table`. An identity mismatch (including a
+different Parquet file order) replaces the named entry, even when the row count matches, so columns
+from different source-row orders are never combined. Once identity matches, chunk count,
+per-chunk memory-space placement, and per-chunk row counts remain hard alignment requirements and
+throw on mismatch. The HOST tier always replaces, since each host chunk already holds every column.
 
 ### MVCC under concurrent DML (duckdb pins)
 

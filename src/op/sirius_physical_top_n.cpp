@@ -38,12 +38,19 @@
 #include <cucascade/cudf/gpu_data_representation.hpp>
 
 #include <algorithm>
+#include <limits>
 #include <memory>
 
 namespace sirius {
 namespace op {
 
 namespace {
+
+std::size_t candidate_row_cap(std::size_t offset, std::size_t limit) noexcept
+{
+  constexpr auto max = std::numeric_limits<std::size_t>::max();
+  return offset > max - limit ? max : offset + limit;
+}
 
 //! Selects the first `keep_rows` rows of `input` under the given lexicographic ordering.
 //!
@@ -83,8 +90,8 @@ std::unique_ptr<cudf::table> compute_top_n_table(
   if (limit == 0 || input.num_rows() == 0) { return duckdb::make_empty_like(input); }
   if (orders.empty()) { throw internal_exception("TopN requires at least one ordering key"); }
 
-  auto const keep_rows =
-    std::min<cudf::size_type>(input.num_rows(), static_cast<cudf::size_type>(offset + limit));
+  auto const keep_rows = static_cast<cudf::size_type>(std::min<std::size_t>(
+    static_cast<std::size_t>(input.num_rows()), candidate_row_cap(offset, limit)));
   if (keep_rows == 0) { return duckdb::make_empty_like(input); }
 
   std::unique_ptr<cudf::table> kept;
@@ -184,8 +191,8 @@ std::unique_ptr<operator_data> sirius_physical_top_n::execute(const operator_dat
                                                               rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_top_n::execute"};
-  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_read_only_batches();
+  auto& input        = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  auto input_batches = input.get_read_only_batches();
   if (limit == 0 || input_batches.empty()) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
@@ -193,12 +200,23 @@ std::unique_ptr<operator_data> sirius_physical_top_n::execute(const operator_dat
 
   // Keeping each batch's top `offset + limit` candidates is sufficient; merge applies `offset`
   // once.
+  auto const candidate_cap = candidate_row_cap(offset, limit);
   std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
   outputs.reserve(input_batches.size());
-  for (auto const& batch : input_batches) {
-    auto* space = batch.get_memory_space();
+  for (auto& batch : input_batches) {
+    auto const* data = batch.get_data();
+    auto* space      = batch.get_memory_space();
+    if (data == nullptr || space == nullptr) { continue; }
+
     auto const input_table_view =
-      batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+      data->cast<cucascade::gpu_table_representation>().get_table_view();
+    if (input_table_view.num_rows() == 0) { continue; }
+
+    if (static_cast<std::size_t>(input_table_view.num_rows()) <= candidate_cap) {
+      outputs.push_back(cucascade::data_batch::to_idle(std::move(batch)));
+      continue;
+    }
+
     auto candidates = compute_top_n_table(
       input_table_view, orders, limit, offset, stream, space->get_default_allocator());
     // STREAM-LINEAGE: candidates were last written on `stream`.
@@ -270,25 +288,30 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operat
   }
   auto* space = input_batches.front().get_memory_space();
 
-  // `input_batches` keeps the collected table views locked through concatenation.
+  // The read-only accessors in `input_batches` keep the table-view storage alive through selection.
   std::vector<cudf::table_view> concat_views;
   concat_views.reserve(input_batches.size());
+  auto const first_input_view =
+    input_batches.front().get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
   for (auto const& batch : input_batches) {
-    concat_views.push_back(
-      batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
+    auto const view =
+      batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+    if (view.num_rows() != 0) { concat_views.push_back(view); }
   }
 
   std::unique_ptr<cudf::table> combined;
+  // Use the first input's schema when every batch is empty.
+  auto combined_view = first_input_view;
   if (concat_views.size() == 1) {
-    combined =
-      std::make_unique<cudf::table>(concat_views.front(), stream, space->get_default_allocator());
-  } else {
-    combined = cudf::concatenate(concat_views, stream, space->get_default_allocator());
+    combined_view = concat_views.front();
+  } else if (concat_views.size() > 1) {
+    combined      = cudf::concatenate(concat_views, stream, space->get_default_allocator());
+    combined_view = combined->view();
   }
 
   auto output_table = compute_top_n_table(
-    combined->view(), orders, limit, offset, stream, space->get_default_allocator());
-  if (output_table->num_rows() <= static_cast<cudf::size_type>(offset)) {
+    combined_view, orders, limit, offset, stream, space->get_default_allocator());
+  if (static_cast<std::size_t>(output_table->num_rows()) <= offset) {
     output_table = duckdb::make_empty_like(output_table->view());
   } else if (offset > 0) {
     auto out_start = static_cast<cudf::size_type>(offset);

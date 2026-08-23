@@ -212,8 +212,8 @@ struct pinned_entry {
   /// it into a per-chunk vector. GPU-tier entries leave it null.
   cucascade::memory::memory_space* memory_space{nullptr};
   /// Total number of rows across all pinned chunks. Used by insert_pinned_entry
-  /// to decide whether a re-insert merges into the existing entry (same row
-  /// count → add unique columns) or replaces it (different row count).
+  /// as one merge-eligibility condition; the ordered source identity must also
+  /// match before columns can be combined positionally.
   std::size_t num_rows{0};
   /// Zone-map sidecar: pin-time DuckDB types + per-chunk min/max statistics,
   /// positional with cache_info.column_ids. Absent (never prunes) when the
@@ -254,11 +254,17 @@ void validate_column_storage_shape(sirius::pinned_column_storage_matrix const& m
                                    std::string_view context,
                                    bool allow_empty);
 
-/// Requires matching table identity and parquet read order before merging columns by row.
-/// @throw std::runtime_error If the identities differ
-void validate_merge_source_identity(const cache_entry_info& existing,
-                                    const cache_entry_info& incoming,
-                                    std::string_view context);
+/// Returns whether two cache descriptors identify the same source in the same row order. Parquet
+/// descriptors must contain canonical paths and compare their file vectors in order; DuckDB
+/// descriptors compare catalog, schema, and table.
+[[nodiscard]] bool merge_source_identity_matches(const cache_entry_info& existing,
+                                                 const cache_entry_info& incoming) noexcept;
+
+/// Returns whether an incoming pin has the same row count and ordered source identity as @p
+/// existing, allowing its columns to be merged positionally.
+[[nodiscard]] bool pinned_entry_merge_eligible(const pinned_entry& existing,
+                                               const cache_entry_info& incoming,
+                                               std::size_t incoming_num_rows) noexcept;
 
 /// Report a recorded carrier that contradicts the type storage actually holds. The single throw
 /// site of @ref validate_recorded_column_storage's cross-check; declared here only because that
@@ -472,16 +478,17 @@ class sirius_scan_manager {
   ///
   /// Re-insert semantics (keyed by @p name):
   ///   - If no entry exists for @p name, a fresh one is created.
-  ///   - If an entry exists and its @c num_rows equals the new total row count, the
-  ///     incoming columns whose names are not already present are merged in
-  ///     (duplicate columns are dropped), and the entry's @c cache_info is extended
-  ///     to the union of pinned columns so later cache-hit matching can serve them.
-  ///     The existing cache identity is preserved; the merge requires the incoming
-  ///     @p chunk_memory_spaces to be identical to the existing entry's and rejects
-  ///     any mismatch.
-  ///   - If row counts differ, the existing entry is dropped and replaced. (An
-  ///     n_rows-capped "partial" pin therefore never merges with a full pin of the
-  ///     same table, since their row counts differ.)
+  ///   - If an entry exists, its @c num_rows and ordered source identity must both match before
+  ///     columns can merge positionally. Parquet identity is the byte-exact ordered vector of
+  ///     canonical file paths; DuckDB identity is catalog.schema.table. Incoming columns whose
+  ///     names are not already present are merged in (duplicate columns are dropped), and the
+  ///     entry's @c cache_info is extended to the union of pinned columns so later cache-hit
+  ///     matching can serve them. Once identity matches, chunk count, @p chunk_memory_spaces, and
+  ///     per-chunk row counts must be identical to the existing entry's; a layout mismatch throws.
+  ///   - If row counts or ordered source identities differ, the existing entry is dropped and
+  ///     replaced. An n_rows-capped "partial" pin therefore never merges with a full pin of the
+  ///     same table, and changing a Parquet pin's file order never combines columns from different
+  ///     source-row positions.
   ///   - Zone-map types/statistics mirror the data decisions: kept when a merge
   ///     drops duplicate columns, appended for new columns that received chunks,
   ///     and degraded to statless when the union column set cannot stay

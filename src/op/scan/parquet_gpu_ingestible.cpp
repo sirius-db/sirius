@@ -21,6 +21,7 @@
 #include <expression/ast/from_duckdb.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <expression_evaluator/gpu_expression_translator_internal.hpp>
+#include <helper/utils.hpp>
 #include <io/io_context.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
@@ -425,6 +426,34 @@ void canonicalize_scan_file_paths(std::vector<std::string>& paths)
 {
   for (auto& p : paths) {
     p = canonical_scan_file_path(p);
+  }
+}
+
+void order_pin_file_paths(std::vector<std::string>& paths, bool natural_order)
+{
+  if (!natural_order || paths.size() < 2) { return; }
+
+  struct keyed_path {
+    std::string raw;
+    std::string canonical;
+    std::size_t ordinal;
+  };
+
+  std::vector<keyed_path> keyed;
+  keyed.reserve(paths.size());
+  for (std::size_t index = 0; index < paths.size(); ++index) {
+    keyed.push_back({paths[index], canonical_scan_file_path(paths[index]), index});
+  }
+
+  std::stable_sort(keyed.begin(), keyed.end(), [](keyed_path const& lhs, keyed_path const& rhs) {
+    if (utils::natural_name_less(lhs.canonical, rhs.canonical)) { return true; }
+    if (utils::natural_name_less(rhs.canonical, lhs.canonical)) { return false; }
+    if (lhs.raw != rhs.raw) { return lhs.raw < rhs.raw; }
+    return lhs.ordinal < rhs.ordinal;
+  });
+
+  for (std::size_t index = 0; index < keyed.size(); ++index) {
+    paths[index] = std::move(keyed[index].raw);
   }
 }
 

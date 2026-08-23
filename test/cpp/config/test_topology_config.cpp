@@ -124,39 +124,17 @@ TEST_CASE("sirius_config accepts a zero admission_bytes_per_gpu", "[topology_con
   CHECK(cfg.get_operator_params().admission_bytes_per_gpu == 0);
 }
 
-TEST_CASE("sirius_config accepts merge and pinning diagnostic YAML controls",
-          "[topology_config][config]")
+TEST_CASE("sirius_config accepts opt-in natural pin file order", "[topology_config][config]")
 {
   sirius::operator_params defaults;
-  CHECK_FALSE(defaults.enable_disjoint_groupby_passthrough);
-  CHECK_FALSE(defaults.enable_sorted_groupby_hint);
-  CHECK(defaults.sorted_groupby_hint_min_rows ==
-        sirius::config::DEFAULT_SORTED_GROUPBY_HINT_MIN_ROWS);
-  CHECK(defaults.pin_table_natural_file_order);
+  CHECK_FALSE(defaults.pin_table_natural_file_order);
 
-  scoped_yaml yaml("sirius_merge_pinning_diagnostics.yaml",
-                   "sirius:\n  operator_params:\n    enable_disjoint_groupby_passthrough: true\n   "
-                   " enable_sorted_groupby_hint: true\n    sorted_groupby_hint_min_rows: 17\n    "
-                   "pin_table_natural_file_order: false\n");
+  scoped_yaml yaml("sirius_natural_pin_file_order.yaml",
+                   "sirius:\n"
+                   "  operator_params:\n"
+                   "    pin_table_natural_file_order: true\n");
 
   sirius::sirius_config cfg;
   REQUIRE_NOTHROW(cfg.load_from_file(yaml.path));
-  auto const& params = cfg.get_operator_params();
-  CHECK(params.enable_disjoint_groupby_passthrough);
-  CHECK(params.enable_sorted_groupby_hint);
-  CHECK(params.sorted_groupby_hint_min_rows == 17);
-  CHECK_FALSE(params.pin_table_natural_file_order);
-}
-
-TEST_CASE("sirius_config rejects a zero sorted groupby hint threshold", "[topology_config][config]")
-{
-  scoped_yaml yaml("sirius_sorted_groupby_hint_zero.yaml",
-                   "sirius:\n"
-                   "  operator_params:\n"
-                   "    sorted_groupby_hint_min_rows: 0\n");
-
-  sirius::sirius_config cfg;
-  CHECK_THROWS_WITH(cfg.load_from_file(yaml.path), Catch::Contains("sorted_groupby_hint_min_rows"));
-  CHECK(cfg.get_operator_params().sorted_groupby_hint_min_rows ==
-        sirius::config::DEFAULT_SORTED_GROUPBY_HINT_MIN_ROWS);
+  CHECK(cfg.get_operator_params().pin_table_natural_file_order);
 }

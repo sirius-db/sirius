@@ -16,8 +16,10 @@
 
 #include "catch.hpp"
 #include "helper/utils.hpp"
+#include "op/scan/parquet_gpu_ingestible.hpp"
 
 #include <algorithm>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -108,4 +110,39 @@ TEST_CASE("natural_name_less is a strict weak ordering", "[natural_file_order]")
   REQUIRE(asymmetric.empty());
   REQUIRE(transitive.empty());
   REQUIRE(incomparable.empty());
+}
+
+TEST_CASE("pin file ordering is opt-in", "[natural_file_order]")
+{
+  std::vector<std::string> paths{"part.10.parquet", "part.2.parquet"};
+  auto const original = paths;
+
+  sirius::op::scan::order_pin_file_paths(paths, false);
+
+  REQUIRE(paths == original);
+}
+
+TEST_CASE("pin file ordering uses canonical natural keys and retains raw paths",
+          "[natural_file_order]")
+{
+  namespace fs   = std::filesystem;
+  auto const cwd = fs::current_path();
+
+  auto const relative_two = std::string{"./part.2.parquet"};
+  auto const absolute_ten = (cwd / "part.10.parquet").string();
+  std::vector<std::string> mixed_paths{absolute_ten, relative_two};
+
+  sirius::op::scan::order_pin_file_paths(mixed_paths, true);
+
+  REQUIRE(mixed_paths == std::vector<std::string>{relative_two, absolute_ten});
+
+  std::vector<std::string> relative_paths{"./part.10.parquet", "./part.2.parquet"};
+  std::vector<std::string> absolute_paths{(cwd / "part.10.parquet").string(),
+                                          (cwd / "part.2.parquet").string()};
+  sirius::op::scan::order_pin_file_paths(relative_paths, true);
+  sirius::op::scan::order_pin_file_paths(absolute_paths, true);
+
+  sirius::op::scan::canonicalize_scan_file_paths(relative_paths);
+  sirius::op::scan::canonicalize_scan_file_paths(absolute_paths);
+  REQUIRE(relative_paths == absolute_paths);
 }

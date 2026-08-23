@@ -22,7 +22,6 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/open_file_info.hpp"
 #include "expression_evaluator/expression_evaluator_strategy.hpp"
-#include "helper/utils.hpp"
 
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/types.hpp>
@@ -1332,12 +1331,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     if (file_paths.empty()) {
       throw InvalidInputException("pin_table: no parquet files matched path: " + data.args.path);
     }
-    if (sirius_ctx->get_config().get_operator_params().pin_table_natural_file_order) {
-      std::sort(
-        file_paths.begin(), file_paths.end(), [](const std::string& lhs, const std::string& rhs) {
-          return sirius::utils::natural_name_less(lhs, rhs);
-        });
-    }
+    sirius::op::scan::order_pin_file_paths(
+      file_paths, sirius_ctx->get_config().get_operator_params().pin_table_natural_file_order);
     auto info =
       build_parquet_pin_info(scan_mgr, file_paths, data.args.cols, batch_size, pinned_column_types);
     ingestible = sirius::op::scan::make_ingestible(std::move(info));
@@ -2322,42 +2317,6 @@ static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
                    params->enable_runtime_distinct_build_probe);
 }
 
-static void SetEnableDisjointGroupbyPassthrough(ClientContext& context,
-                                                SetScope scope,
-                                                Value& parameter)
-{
-  auto* params = get_operator_params(context);
-  if (!params) { return; }
-  auto slot                                   = lock_operator_params_slot(context);
-  params->enable_disjoint_groupby_passthrough = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config ENABLE_DISJOINT_GROUPBY_PASSTHROUGH to {}",
-                   params->enable_disjoint_groupby_passthrough);
-}
-
-static void SetEnableSortedGroupbyHint(ClientContext& context, SetScope scope, Value& parameter)
-{
-  auto* params = get_operator_params(context);
-  if (!params) { return; }
-  auto slot                          = lock_operator_params_slot(context);
-  params->enable_sorted_groupby_hint = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config ENABLE_SORTED_GROUPBY_HINT to {}",
-                   params->enable_sorted_groupby_hint);
-}
-
-static void SetSortedGroupbyHintMinRows(ClientContext& context, SetScope scope, Value& parameter)
-{
-  auto const min_rows = UBigIntValue::Get(parameter);
-  if (min_rows == 0) {
-    throw InvalidInputException("sorted_groupby_hint_min_rows must be at least 1");
-  }
-  auto* params = get_operator_params(context);
-  if (!params) { return; }
-  auto slot                            = lock_operator_params_slot(context);
-  params->sorted_groupby_hint_min_rows = min_rows;
-  SIRIUS_LOG_DEBUG("Updated config SORTED_GROUPBY_HINT_MIN_ROWS to {}",
-                   params->sorted_groupby_hint_min_rows);
-}
-
 static void SetPinTableNaturalFileOrder(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2640,30 +2599,8 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                     SetConcatBatchBytes);
   add_sirius_option(config,
                     option_visibility::internal,
-                    "enable_disjoint_groupby_passthrough",
-                    "toggle merge-local passthrough for disjoint grouped-aggregate partials",
-                    LogicalType::BOOLEAN,
-                    Value::BOOLEAN(operator_defaults.enable_disjoint_groupby_passthrough),
-                    SetEnableDisjointGroupbyPassthrough);
-  add_sirius_option(config,
-                    option_visibility::internal,
-                    "enable_sorted_groupby_hint",
-                    "toggle the sorted grouped-aggregate diagnostic hint",
-                    LogicalType::BOOLEAN,
-                    Value::BOOLEAN(operator_defaults.enable_sorted_groupby_hint),
-                    SetEnableSortedGroupbyHint);
-  add_sirius_option(
-    config,
-    option_visibility::internal,
-    "sorted_groupby_hint_min_rows",
-    "set the row threshold (minimum 1) for the sorted grouped-aggregate diagnostic hint",
-    LogicalType::UBIGINT,
-    Value::UBIGINT(operator_defaults.sorted_groupby_hint_min_rows),
-    SetSortedGroupbyHintMinRows);
-  add_sirius_option(config,
-                    option_visibility::internal,
                     "pin_table_natural_file_order",
-                    "toggle natural multi-file parquet ordering while pinning",
+                    "opt in to natural multi-file parquet ordering while pinning",
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.pin_table_natural_file_order),
                     SetPinTableNaturalFileOrder);

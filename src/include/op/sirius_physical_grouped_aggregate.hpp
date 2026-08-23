@@ -27,7 +27,6 @@
 #include "duckdb/storage/data_table.hpp"
 #include "expression/ast/node.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
-#include "op/aggregate/gpu_aggregate_impl.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 #include <memory>
@@ -86,9 +85,6 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   std::vector<AggregateSlot> aggregate_slots;
   bool has_avg            = false;
   bool has_count_distinct = false;
-
-  //! Sorted-key proof options captured during plan generation.
-  sorted_hint_options sorted_hint;
 
  public:
   std::vector<int> get_output_grouping_indices() const

@@ -42,6 +42,7 @@
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_dummy_scan.hpp"
+#include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_gpu_values.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
@@ -388,15 +389,6 @@ void replace_with_gpu_values(duckdb::unique_ptr<sirius::op::sirius_physical_oper
   slot = std::move(gpu_values);
 }
 
-void stamp_grouped_aggregate_options(sirius::op::sirius_physical_grouped_aggregate& grouped,
-                                     sirius::op::sirius_physical_grouped_aggregate_merge& merge,
-                                     const sirius::operator_params& op_params)
-{
-  grouped.sorted_hint = {op_params.enable_sorted_groupby_hint,
-                         op_params.sorted_groupby_hint_min_rows};
-  merge.set_disjoint_groupby_passthrough(op_params.enable_disjoint_groupby_passthrough);
-}
-
 //! Replace a HASH_GROUP_BY slot with `GROUPED_AGGREGATE_MERGE → PARTITION → HASH_GROUP_BY →
 //! original_input`: the original stays the per-thread sink, PARTITION buckets for the merge.
 //! The aggregate's physical sidecar (narrow group keys, native aggregate outputs) is copied onto
@@ -411,13 +403,14 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 
     // Construct the merge while the child still carries the final SQL schema. COUNT(DISTINCT)
     // emits LIST sets locally and only becomes BIGINT after merge post-processing.
-    auto& grouped = hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>();
-    auto merge    = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(
-      &grouped, op_params.hash_partition_bytes);
+    auto merge = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(
+      &hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>(),
+      op_params.hash_partition_bytes);
     if (hgb_ptr->has_physical_overrides()) {
       merge->set_physical_types(hgb_ptr->get_physical_types());
     }
-    stamp_grouped_aggregate_options(grouped, *merge, op_params);
+
+    auto& grouped = hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>();
     bool const has_supported_count_distinct_layout =
       grouped.has_count_distinct && !grouped.has_avg && !hgb_ptr->has_physical_overrides() &&
       hgb_ptr->types.size() == grouped.group_idx.size() + grouped.aggregate_slots.size();
@@ -614,7 +607,7 @@ void wrap_delim_distinct(sirius::op::sirius_physical_delim_join& delim_base,
   if (!delim_base.distinct_root) { return; }
 
   auto original          = std::move(delim_base.distinct_root);
-  auto& original_grouped = original->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+  auto* original_agg_ptr = &original->Cast<sirius::op::sirius_physical_grouped_aggregate>();
 
   auto partition =
     duckdb::make_uniq<sirius::op::sirius_physical_partition>(original->types,
@@ -625,8 +618,7 @@ void wrap_delim_distinct(sirius::op::sirius_physical_delim_join& delim_base,
   partition->children.push_back(std::move(original));
 
   auto merge = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(
-    &original_grouped, op_params.hash_partition_bytes);
-  stamp_grouped_aggregate_options(original_grouped, *merge, op_params);
+    original_agg_ptr, op_params.hash_partition_bytes);
   // The partition's downstream sizing consumer is the merge (key_source only supplies keys).
   partition_ptr->set_downstream_consumer_op(merge.get());
   merge->children.push_back(std::move(partition));

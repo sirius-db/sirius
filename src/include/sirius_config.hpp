@@ -98,17 +98,13 @@ struct valid_domain_coverage_threshold {
 /// (NVIDIA/cuCollections#834) on some key distributions. Re-enable once the fix ships in libcudf.
 constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
-constexpr bool DEFAULT_ENABLE_DISJOINT_GROUPBY_PASSTHROUGH = false;
-
-constexpr bool DEFAULT_ENABLE_SORTED_GROUPBY_HINT = false;
-
-constexpr uint64_t DEFAULT_SORTED_GROUPBY_HINT_MIN_ROWS = 1ULL << 20;
-
-constexpr bool DEFAULT_PIN_TABLE_NATURAL_FILE_ORDER = true;
+constexpr bool DEFAULT_PIN_TABLE_NATURAL_FILE_ORDER = false;
 
 }  // namespace config
 
-/// Operator-level resource sizing and policy parameters.
+/// Parameters controlling operator-level resource sizing.
+/// These can be set via the .yaml file under the sirius.operator_params section
+/// or overridden at runtime using DuckDB SET commands.
 struct operator_params {
   /// Target batch size (bytes) for DuckDB scan tasks.
   uint64_t scan_task_batch_size = config::derived_default_batch_size();
@@ -154,17 +150,9 @@ struct operator_params {
   /// DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE.
   bool enable_runtime_distinct_build_probe = config::DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE;
 
-  /// Allow merge aggregation to pass through partial batches with disjoint leading-key ranges.
-  bool enable_disjoint_groupby_passthrough = config::DEFAULT_ENABLE_DISJOINT_GROUPBY_PASSTHROUGH;
-
-  /// Allow runtime verification to select cuDF's sorted-key groupby path.
-  bool enable_sorted_groupby_hint = config::DEFAULT_ENABLE_SORTED_GROUPBY_HINT;
-
-  /// Sort multi-file parquet paths in natural filename order before pinning.
+  /// Opt in to sorting multi-file Parquet inputs by canonical-path natural order before pinning.
+  /// This can change pinned row order; the DuckDB setting is exposed only with test options.
   bool pin_table_natural_file_order = config::DEFAULT_PIN_TABLE_NATURAL_FILE_ORDER;
-
-  /// Minimum input rows required before checking grouped-aggregation keys for sortedness.
-  uint64_t sorted_groupby_hint_min_rows = config::DEFAULT_SORTED_GROUPBY_HINT_MIN_ROWS;
 
   /// Enable dynamic filters for eligible hash joins.
   bool enable_dynamic_filter = true;

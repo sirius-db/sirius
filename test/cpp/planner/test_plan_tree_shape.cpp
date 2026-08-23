@@ -62,7 +62,6 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <sstream>
@@ -300,16 +299,12 @@ sirius_physical_operator* require_join_child_wrap(sirius_physical_operator* op,
 /// `MERGE_GROUP_BY -> PARTITION -> HASH_GROUP_BY` with the chain top tagged as owned by the
 /// delim join and `distinct` borrowing the chain bottom, and the internal join carries the
 /// standard CONCAT/PARTITION wrap on both children.
-void require_delim_join_common(sirius::op::sirius_physical_delim_join& delim,
-                               const sirius::op::sorted_hint_options& expected_sorted_hint,
-                               bool expected_passthrough)
+void require_delim_join_common(sirius::op::sirius_physical_delim_join& delim)
 {
   REQUIRE(delim.distinct_root);
   auto* merge = delim.distinct_root.get();
   REQUIRE(merge->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
   CHECK(merge->owning_delim_join() == &delim);
-  CHECK(merge->Cast<sirius::op::sirius_physical_grouped_aggregate_merge>()
-          .disjoint_groupby_passthrough_enabled() == expected_passthrough);
 
   REQUIRE(merge->children.size() == 1);
   auto* partition = merge->children[0].get();
@@ -319,9 +314,6 @@ void require_delim_join_common(sirius::op::sirius_physical_delim_join& delim,
   REQUIRE(partition->children.size() == 1);
   auto* hgb = partition->children[0].get();
   REQUIRE(hgb->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
-  auto const& sorted_hint = hgb->Cast<sirius::op::sirius_physical_grouped_aggregate>().sorted_hint;
-  CHECK(sorted_hint.enabled == expected_sorted_hint.enabled);
-  CHECK(sorted_hint.min_rows == expected_sorted_hint.min_rows);
 
   // `distinct` always borrows the subtree bottom (the bare DISTINCT).
   REQUIRE(delim.distinct != nullptr);
@@ -332,42 +324,6 @@ void require_delim_join_common(sirius::op::sirius_physical_delim_join& delim,
   require_join_child_wrap(delim.join->children[0].get(), delim.join.get(), /*is_build=*/false);
   require_join_child_wrap(delim.join->children[1].get(), delim.join.get(), /*is_build=*/true);
 }
-
-class groupby_options_guard {
- public:
-  groupby_options_guard(Connection& con,
-                        bool enable_passthrough,
-                        const sirius::op::sorted_hint_options& sorted_hint)
-    : _state(con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state"))
-  {
-    REQUIRE(_state != nullptr);
-    auto& params             = _state->get_config().get_operator_params();
-    _original_passthrough    = params.enable_disjoint_groupby_passthrough;
-    _original_sorted_enabled = params.enable_sorted_groupby_hint;
-    _original_min_rows       = params.sorted_groupby_hint_min_rows;
-
-    params.enable_disjoint_groupby_passthrough = enable_passthrough;
-    params.enable_sorted_groupby_hint          = sorted_hint.enabled;
-    params.sorted_groupby_hint_min_rows        = sorted_hint.min_rows;
-  }
-
-  ~groupby_options_guard()
-  {
-    auto& params                               = _state->get_config().get_operator_params();
-    params.enable_disjoint_groupby_passthrough = _original_passthrough;
-    params.enable_sorted_groupby_hint          = _original_sorted_enabled;
-    params.sorted_groupby_hint_min_rows        = _original_min_rows;
-  }
-
-  groupby_options_guard(const groupby_options_guard&)            = delete;
-  groupby_options_guard& operator=(const groupby_options_guard&) = delete;
-
- private:
-  duckdb::shared_ptr<duckdb::SiriusContext> _state;
-  bool _original_passthrough    = false;
-  bool _original_sorted_enabled = false;
-  uint64_t _original_min_rows   = 0;
-};
 
 class dynamic_filter_switch_guard {
  public:
@@ -985,15 +941,11 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 {
   SECTION("grouped aggregate gains a MERGE_GROUP_BY -> PARTITION fanout")
   {
-    sirius::op::sorted_hint_options const expected_sorted_hint{true, 17};
-    groupby_options_guard options_guard(*con, true, expected_sorted_hint);
     auto plan = generate_sirius_plan(*con, "SELECT val, count(*) FROM big_left GROUP BY val");
     INFO(tree_to_string(plan.get()));
 
     auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_GROUP_BY);
     REQUIRE(merge != nullptr);
-    CHECK(merge->Cast<sirius::op::sirius_physical_grouped_aggregate_merge>()
-            .disjoint_groupby_passthrough_enabled());
     REQUIRE(merge->children.size() == 1);
 
     auto* partition = merge->children[0].get();
@@ -1002,10 +954,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
     REQUIRE(partition->children.size() == 1);
     CHECK(partition->children[0]->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
-    auto const& sorted_hint =
-      partition->children[0]->Cast<sirius::op::sirius_physical_grouped_aggregate>().sorted_hint;
-    CHECK(sorted_hint.enabled == expected_sorted_hint.enabled);
-    CHECK(sorted_hint.min_rows == expected_sorted_hint.min_rows);
   }
 
   SECTION("COUNT(DISTINCT) records LIST locally and BIGINT after merge")
@@ -1116,9 +1064,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - delim join internal subtrees are rewritten and tagged",
                  "[plan_tree_shape][isolated_context]")
 {
-  sirius::op::sorted_hint_options const expected_sorted_hint{true, 17};
-  groupby_options_guard options_guard(*con, true, expected_sorted_hint);
-
   SECTION("RIGHT_DELIM_JOIN: partition_join points at the build-side PARTITION")
   {
     // TPC-H q17 shape: correlated aggregate whose outer is a filtered join.
@@ -1131,7 +1076,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     auto* node = find_first(plan.get(), SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
     REQUIRE(node != nullptr);
     auto& delim = node->Cast<sirius::op::sirius_physical_right_delim_join>();
-    require_delim_join_common(delim, expected_sorted_hint, true);
+    require_delim_join_common(delim);
 
     // partition_join is the build-side PARTITION freshly planted by wrap_join.
     auto* build_concat = delim.join->children[1].get();
@@ -1162,7 +1107,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     auto* node = find_first(plan.get(), SiriusPhysicalOperatorType::LEFT_DELIM_JOIN);
     REQUIRE(node != nullptr);
     auto& delim = node->Cast<sirius::op::sirius_physical_left_delim_join>();
-    require_delim_join_common(delim, expected_sorted_hint, true);
+    require_delim_join_common(delim);
 
     // The cached chunk scan (filled at runtime by the delim join's fan-out) is buried under
     // the internal join's probe-side CONCAT/PARTITION chain.

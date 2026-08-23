@@ -18,7 +18,6 @@
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -26,25 +25,9 @@
 
 #include <cudf/binaryop.hpp>
 #include <cudf/lists/count_elements.hpp>
-#include <cudf/reduction.hpp>
-#include <cudf/scalar/scalar.hpp>
 #include <cudf/unary.hpp>
-#include <cudf/utilities/error.hpp>
-#include <cudf/utilities/traits.hpp>
-#include <cudf/utilities/type_dispatcher.hpp>
 
-#include <rmm/device_uvector.hpp>
-#include <rmm/resource_ref.hpp>
-
-#include <cuda_runtime_api.h>
 #include <nvtx3/nvtx3.hpp>
-
-#include <algorithm>
-#include <memory>
-#include <mutex>
-#include <string_view>
-#include <utility>
-#include <vector>
 
 namespace sirius {
 namespace op {
@@ -69,186 +52,6 @@ convert_grouping_functions(const duckdb::vector<duckdb::vector<std::size_t>>& sr
   }
   return result;
 }
-
-namespace {
-
-enum class range_proof_result { strictly_disjoint, overlapping_ranges, unsupported_key };
-
-enum class passthrough_outcome {
-  engaged,
-  single_input,
-  avg,
-  count_distinct,
-  multiple_grouping_sets,
-  missing_group_key,
-  multiple_upstream_partitions,
-  byte_budget,
-  unsupported_key,
-  overlapping_ranges,
-};
-
-std::string_view passthrough_outcome_name(passthrough_outcome outcome)
-{
-  switch (outcome) {
-    case passthrough_outcome::engaged: return "engaged";
-    case passthrough_outcome::single_input: return "single_input";
-    case passthrough_outcome::avg: return "avg";
-    case passthrough_outcome::count_distinct: return "count_distinct";
-    case passthrough_outcome::multiple_grouping_sets: return "multiple_grouping_sets";
-    case passthrough_outcome::missing_group_key: return "missing_group_key";
-    case passthrough_outcome::multiple_upstream_partitions: return "multiple_upstream_partitions";
-    case passthrough_outcome::byte_budget: return "byte_budget";
-    case passthrough_outcome::unsupported_key: return "unsupported_key";
-    case passthrough_outcome::overlapping_ranges: return "overlapping_ranges";
-  }
-  return "unsupported_key";
-}
-
-void log_passthrough_outcome(passthrough_outcome outcome, std::size_t input_batches)
-{
-  SIRIUS_LOG_DEBUG("disjoint_groupby_passthrough outcome={} input_batches={}",
-                   passthrough_outcome_name(outcome),
-                   input_batches);
-}
-
-bool validate_leading_keys(const std::vector<cucascade::read_only_data_batch>& batches,
-                           std::vector<cudf::column_view>& keys,
-                           cucascade::memory::memory_space*& task_space,
-                           cudf::data_type& key_type)
-{
-  if (batches.empty()) { return false; }
-
-  bool key_type_initialized = false;
-  keys.reserve(batches.size());
-  // Batch handles keep the collected key views alive.
-  for (auto const& batch : batches) {
-    auto* const data        = batch.get_data();
-    auto* const batch_space = batch.get_memory_space();
-    if (data == nullptr || batch_space == nullptr ||
-        batch_space->get_tier() != cucascade::memory::Tier::GPU) {
-      return false;
-    }
-    if (task_space == nullptr) {
-      task_space = batch_space;
-    } else if (batch_space != task_space ||
-               batch_space->get_device_id() != task_space->get_device_id()) {
-      return false;
-    }
-
-    auto const table = get_cudf_table_view(batch);
-    if (table.num_columns() == 0 || table.num_rows() == 0) { return false; }
-    auto const key = table.column(0);
-    if (key.size() == 0 || key.has_nulls() ||
-        (!cudf::is_integral_not_bool(key.type()) && !cudf::is_timestamp(key.type()))) {
-      return false;
-    }
-    if (!key_type_initialized) {
-      key_type             = key.type();
-      key_type_initialized = true;
-    } else if (key.type() != key_type) {
-      return false;
-    }
-    keys.push_back(key);
-  }
-  return !keys.empty();
-}
-
-using scalar_pair = std::pair<std::unique_ptr<cudf::scalar>, std::unique_ptr<cudf::scalar>>;
-
-struct prove_disjoint_ranges {
-  const std::vector<cudf::column_view>& keys;
-  rmm::cuda_stream_view stream;
-  rmm::device_async_resource_ref mr;
-
-  template <typename T>
-  range_proof_result operator()() const
-  {
-    if constexpr (!(cudf::is_integral_not_bool<T>() || cudf::is_timestamp<T>())) {
-      return range_proof_result::unsupported_key;
-    } else {
-      using scalar_type = cudf::scalar_type_t<T>;
-
-      // Keep extrema alive until synchronization to avoid synchronous deallocation barriers.
-      std::vector<scalar_pair> extrema;
-      extrema.reserve(keys.size());
-      for (auto const& key : keys) {
-        extrema.push_back(cudf::minmax(key, stream, mr));
-      }
-
-      rmm::device_uvector<T> packed(keys.size() * 2, stream, mr);
-      for (std::size_t index = 0; index < extrema.size(); ++index) {
-        auto const& minimum = static_cast<scalar_type const&>(*extrema[index].first);
-        auto const& maximum = static_cast<scalar_type const&>(*extrema[index].second);
-        CUDF_CUDA_TRY(cudaMemcpyAsync(packed.data() + index * 2,
-                                      minimum.data(),
-                                      sizeof(T),
-                                      cudaMemcpyDeviceToDevice,
-                                      stream.value()));
-        CUDF_CUDA_TRY(cudaMemcpyAsync(packed.data() + index * 2 + 1,
-                                      maximum.data(),
-                                      sizeof(T),
-                                      cudaMemcpyDeviceToDevice,
-                                      stream.value()));
-      }
-
-      std::vector<T> host_extrema(packed.size());
-      CUDF_CUDA_TRY(cudaMemcpyAsync(host_extrema.data(),
-                                    packed.data(),
-                                    packed.size() * sizeof(T),
-                                    cudaMemcpyDeviceToHost,
-                                    stream.value()));
-      CUDF_CUDA_TRY(cudaStreamSynchronize(stream.value()));
-
-      struct key_range {
-        T low;
-        T high;
-      };
-      std::vector<key_range> ranges;
-      ranges.reserve(keys.size());
-      for (std::size_t index = 0; index < keys.size(); ++index) {
-        ranges.push_back({host_extrema[index * 2], host_extrema[index * 2 + 1]});
-      }
-      std::sort(ranges.begin(), ranges.end(), [](auto const& lhs, auto const& rhs) {
-        return lhs.low < rhs.low || (lhs.low == rhs.low && lhs.high < rhs.high);
-      });
-      for (std::size_t index = 1; index < ranges.size(); ++index) {
-        if (!(ranges[index - 1].high < ranges[index].low)) {
-          return range_proof_result::overlapping_ranges;
-        }
-      }
-      return range_proof_result::strictly_disjoint;
-    }
-  }
-};
-
-range_proof_result prove_leading_key_ranges_disjoint(
-  const std::vector<cucascade::read_only_data_batch>& batches, rmm::cuda_stream_view stream)
-{
-  std::vector<cudf::column_view> keys;
-  cucascade::memory::memory_space* task_space = nullptr;
-  cudf::data_type key_type{cudf::type_id::EMPTY};
-  if (!validate_leading_keys(batches, keys, task_space, key_type)) {
-    return range_proof_result::unsupported_key;
-  }
-  return cudf::type_dispatcher(
-    key_type, prove_disjoint_ranges{keys, stream, task_space->get_default_allocator()});
-}
-
-bool task_bytes_fit(const std::vector<cucascade::read_only_data_batch>& batches,
-                    uint64_t byte_limit)
-{
-  uint64_t total_bytes = 0;
-  for (auto const& batch : batches) {
-    auto const* data = batch.get_data();
-    if (data == nullptr) { return false; }
-    auto const batch_bytes = static_cast<uint64_t>(data->get_size_in_bytes());
-    if (batch_bytes > byte_limit - total_bytes) { return false; }
-    total_bytes += batch_bytes;
-  }
-  return true;
-}
-
-}  // namespace
 
 void sirius_physical_grouped_aggregate_merge::build_pipelines(
   pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
@@ -276,7 +79,6 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
                                             grouped_aggregate->estimated_cardinality)
 {
   child_op              = grouped_aggregate;
-  grouping_sets         = grouped_aggregate->grouping_sets;
   _hash_partition_bytes = hash_partition_bytes;
 }
 
@@ -401,56 +203,16 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_grouped_aggregate_merge::execute"};
-  auto& input        = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  auto input_batches = input.get_read_only_batches();
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_read_only_batches();
   if (input_batches.size() == 0) {
     throw std::runtime_error(
       "We expect at least one input batch for grouped aggregate merge operator");
   }
 
-  if (_enable_disjoint_groupby_passthrough) {
-    passthrough_outcome outcome = passthrough_outcome::unsupported_key;
-    if (input_batches.size() == 1) {
-      outcome = passthrough_outcome::single_input;
-    } else if (has_avg) {
-      outcome = passthrough_outcome::avg;
-    } else if (has_count_distinct) {
-      outcome = passthrough_outcome::count_distinct;
-    } else if (grouping_sets.size() > 1) {
-      outcome = passthrough_outcome::multiple_grouping_sets;
-    } else if (group_idx.empty()) {
-      outcome = passthrough_outcome::missing_group_key;
-    } else {
-      auto const* input_port            = ports.size() == 1 ? ports.begin()->second : nullptr;
-      bool const one_upstream_partition = input_port != nullptr && input_port->repo != nullptr &&
-                                          input_port->repo->num_partitions() == 1;
-      if (!one_upstream_partition) {
-        outcome = passthrough_outcome::multiple_upstream_partitions;
-      } else if (!task_bytes_fit(input_batches, _hash_partition_bytes)) {
-        outcome = passthrough_outcome::byte_budget;
-      } else {
-        auto const proof = prove_leading_key_ranges_disjoint(input_batches, stream);
-        switch (proof) {
-          case range_proof_result::strictly_disjoint: outcome = passthrough_outcome::engaged; break;
-          case range_proof_result::overlapping_ranges:
-            outcome = passthrough_outcome::overlapping_ranges;
-            break;
-          case range_proof_result::unsupported_key:
-            outcome = passthrough_outcome::unsupported_key;
-            break;
-        }
-      }
-    }
-
-    log_passthrough_outcome(outcome, input_batches.size());
-    if (outcome == passthrough_outcome::engaged) {
-      return std::make_unique<pipelineable_operator_data>(std::move(input_batches));
-    }
-  }
-
   // Fast path: single batch with no post-processing needed
   if (input_batches.size() == 1 && !has_avg && !has_count_distinct) {
-    return std::make_unique<pipelineable_operator_data>(std::move(input_batches));
+    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
   }
 
   // Merge multiple batches, or use single batch directly if only one

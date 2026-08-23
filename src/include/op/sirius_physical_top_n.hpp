@@ -60,8 +60,14 @@ class sirius_physical_top_n : public sirius_physical_operator {
 
  public:
   bool is_sink() const override { return true; }
-  //! Emits one candidate batch per input batch, capped at `offset + limit` rows;
-  //! sirius_physical_top_n_merge applies the global limit and offset.
+  /**
+   * @brief Produces per-batch Top-N candidates for `sirius_physical_top_n_merge`
+   *
+   * Returns no batches when `limit` is zero and omits batches without data, a memory space, or
+   * rows. Otherwise, it forwards batches no larger than the saturated `offset + limit` candidate
+   * cap without copying their table data and reduces larger batches. `sirius_physical_top_n_merge`
+   * applies the global ordering, limit, and offset.
+   */
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 };

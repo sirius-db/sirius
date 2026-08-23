@@ -142,22 +142,11 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
-  void set_disjoint_groupby_passthrough(bool enabled) noexcept
-  {
-    _enable_disjoint_groupby_passthrough = enabled;
-  }
-
-  [[nodiscard]] bool disjoint_groupby_passthrough_enabled() const noexcept
-  {
-    return _enable_disjoint_groupby_passthrough;
-  }
-
  private:
   friend class sirius::planner::sirius_physical_plan_generator;
   void set_fuse_into_parent(bool fuse) noexcept { _fuse_into_parent = fuse; }
 
-  bool _fuse_into_parent                    = false;
-  bool _enable_disjoint_groupby_passthrough = false;
+  bool _fuse_into_parent = false;
 };
 
 }  // namespace op

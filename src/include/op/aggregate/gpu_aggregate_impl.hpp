@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "sirius_config.hpp"
 #include "telemetry/data_batch_probe.hpp"
 
 #include <cudf/cudf_utils.hpp>
@@ -35,13 +34,6 @@ class telemetry_context;
 }  // namespace telemetry
 
 namespace op {
-
-/// Controls the optional sorted-key proof in gpu_aggregate_impl::local_grouped_aggregate.
-struct sorted_hint_options {
-  bool enabled = false;
-  /// Minimum input rows required before checking sortedness.
-  uint64_t min_rows = config::DEFAULT_SORTED_GROUPBY_HINT_MIN_ROWS;
-};
 
 /**
  * @brief Functionalities for running local aggregation on a data batch.
@@ -87,7 +79,6 @@ class gpu_aggregate_impl {
    *        indices. Empty entries (or an empty outer vector) use `aggregate_idx` directly.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
-   * @param sorted_hint Controls the optional sorted-key proof.
    *
    * @return The output data batch.
    */
@@ -99,8 +90,7 @@ class gpu_aggregate_impl {
     const std::vector<std::vector<int>>& aggregate_struct_col_indices,
     rmm::cuda_stream_view stream,
     cucascade::memory::memory_space& memory_space,
-    const telemetry::batch_telemetry_info& telemetry_info = {},
-    const sorted_hint_options& sorted_hint                = {});
+    const telemetry::batch_telemetry_info& telemetry_info = {});
 };
 
 }  // namespace op

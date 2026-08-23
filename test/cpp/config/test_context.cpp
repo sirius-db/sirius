@@ -230,9 +230,6 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 0);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
-    REQUIRE(setting_count(con, "enable_disjoint_groupby_passthrough") == 0);
-    REQUIRE(setting_count(con, "enable_sorted_groupby_hint") == 0);
-    REQUIRE(setting_count(con, "sorted_groupby_hint_min_rows") == 0);
     REQUIRE(setting_count(con, "pin_table_natural_file_order") == 0);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
     REQUIRE(result != nullptr);
@@ -258,16 +255,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     result = con.Query("SET concat_batch_bytes = 1048576");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
-    result = con.Query("SET enable_disjoint_groupby_passthrough = true");
-    REQUIRE(result != nullptr);
-    REQUIRE(result->HasError());
-    result = con.Query("SET enable_sorted_groupby_hint = false");
-    REQUIRE(result != nullptr);
-    REQUIRE(result->HasError());
-    result = con.Query("SET sorted_groupby_hint_min_rows = 17");
-    REQUIRE(result != nullptr);
-    REQUIRE(result->HasError());
-    result = con.Query("SET pin_table_natural_file_order = false");
+    result = con.Query("SET pin_table_natural_file_order = true");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
   }
@@ -284,9 +272,6 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 0);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
-    REQUIRE(setting_count(con, "enable_disjoint_groupby_passthrough") == 0);
-    REQUIRE(setting_count(con, "enable_sorted_groupby_hint") == 0);
-    REQUIRE(setting_count(con, "sorted_groupby_hint_min_rows") == 0);
     REQUIRE(setting_count(con, "pin_table_natural_file_order") == 0);
   }
 
@@ -302,9 +287,6 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 1);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 1);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 1);
-    REQUIRE(setting_count(con, "enable_disjoint_groupby_passthrough") == 1);
-    REQUIRE(setting_count(con, "enable_sorted_groupby_hint") == 1);
-    REQUIRE(setting_count(con, "sorted_groupby_hint_min_rows") == 1);
     REQUIRE(setting_count(con, "pin_table_natural_file_order") == 1);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
     REQUIRE(result != nullptr);
@@ -351,44 +333,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     result = con.Query("RESET concat_batch_bytes");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
-    result = con.Query("SET enable_disjoint_groupby_passthrough = true");
-    REQUIRE(result != nullptr);
-    REQUIRE_FALSE(result->HasError());
-    result = con.Query("RESET enable_disjoint_groupby_passthrough");
-    REQUIRE(result != nullptr);
-    REQUIRE_FALSE(result->HasError());
-    result = con.Query("SET enable_sorted_groupby_hint = false");
-    REQUIRE(result != nullptr);
-    REQUIRE_FALSE(result->HasError());
-    result = con.Query("RESET enable_sorted_groupby_hint");
-    REQUIRE(result != nullptr);
-    REQUIRE_FALSE(result->HasError());
-
-    auto before_setting =
-      con.Query("SELECT current_setting('sorted_groupby_hint_min_rows')::UBIGINT");
-    REQUIRE(before_setting != nullptr);
-    REQUIRE_FALSE(before_setting->HasError());
-    auto const before_threshold = before_setting->GetValue(0, 0).GetValue<uint64_t>();
-
-    auto invalid_threshold = con.Query("SET sorted_groupby_hint_min_rows = 0");
-    REQUIRE(invalid_threshold != nullptr);
-    REQUIRE(invalid_threshold->HasError());
-    REQUIRE_THAT(invalid_threshold->GetError(),
-                 Catch::Contains("sorted_groupby_hint_min_rows must be at least 1"));
-
-    auto retained_setting =
-      con.Query("SELECT current_setting('sorted_groupby_hint_min_rows')::UBIGINT");
-    REQUIRE(retained_setting != nullptr);
-    REQUIRE_FALSE(retained_setting->HasError());
-    REQUIRE(retained_setting->GetValue(0, 0).GetValue<uint64_t>() == before_threshold);
-
-    result = con.Query("SET sorted_groupby_hint_min_rows = 17");
-    REQUIRE(result != nullptr);
-    REQUIRE_FALSE(result->HasError());
-    result = con.Query("RESET sorted_groupby_hint_min_rows");
-    REQUIRE(result != nullptr);
-    REQUIRE_FALSE(result->HasError());
-    result = con.Query("SET pin_table_natural_file_order = false");
+    result = con.Query("SET pin_table_natural_file_order = true");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     result = con.Query("RESET pin_table_natural_file_order");

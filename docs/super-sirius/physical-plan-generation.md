@@ -57,7 +57,7 @@ Before either is chosen, `materialize_expression_join_keys()` pushes a projectio
 **File:** `src/planner/sirius_plan_aggregate.cpp`
 
 - **Ungrouped aggregate** — when no GROUP BY columns exist
-- **Grouped aggregate** — `HASH_GROUP_BY` using cuDF's `groupby()` API; a default-off runtime proof may select its sorted path
+- **Grouped aggregate** — hash-based GROUP BY using cuDF's `groupby()` API
 - **AVG decomposition** — AVG is split into SUM + COUNT_VALID (cuDF doesn't support AVG directly)
 - **COUNT(DISTINCT)** — implemented via `COLLECT_SET` aggregation, then counting unique rows
 - **HUGEINT downcast** — HUGEINT types are downcast to BIGINT (cuDF doesn't support int128)

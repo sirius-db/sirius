@@ -24,7 +24,6 @@
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/encode.hpp>
 #include <cudf/reduction/approx_distinct_count.hpp>
-#include <cudf/sorting.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/utilities/error.hpp>
@@ -126,8 +125,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   const std::vector<std::vector<int>>& aggregate_struct_col_indices,
   rmm::cuda_stream_view stream,
   cucascade::memory::memory_space& memory_space,
-  const telemetry::batch_telemetry_info& telemetry_info,
-  const sorted_hint_options& sorted_hint)
+  const telemetry::batch_telemetry_info& telemetry_info)
 {
   // Sanity check
   if (aggregates.size() != aggregate_idx.size()) {
@@ -308,34 +306,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
     }
   }
   if (use_label_keys) { group_cols.push_back(label_col->view()); }
-
-  // The sortedness proof and groupby must use the same order and null precedence.
-  cudf::sorted keys_presorted = cudf::sorted::NO;
-  std::vector<cudf::order> key_column_order;
-  std::vector<cudf::null_order> key_null_precedence;
-  if (sorted_hint.enabled && !group_cols.empty() &&
-      static_cast<uint64_t>(input_table.num_rows()) >= sorted_hint.min_rows &&
-      std::all_of(group_cols.begin(), group_cols.end(), [](cudf::column_view const& col) {
-        return cudf::is_fixed_width(col.type());
-      })) {
-    key_column_order.assign(group_cols.size(), cudf::order::ASCENDING);
-    key_null_precedence.assign(group_cols.size(), cudf::null_order::AFTER);
-    if (cudf::is_sorted(
-          cudf::table_view(group_cols), key_column_order, key_null_precedence, stream)) {
-      keys_presorted = cudf::sorted::YES;
-      SIRIUS_LOG_DEBUG("local_grouped_agg: sorted-groupby hint engaged (rows={}, key_cols={})",
-                       input_table.num_rows(),
-                       group_cols.size());
-    } else {
-      key_column_order.clear();
-      key_null_precedence.clear();
-    }
-  }
-  cudf::groupby::groupby grpby_obj(cudf::table_view(group_cols),
-                                   cudf::null_policy::INCLUDE,
-                                   keys_presorted,
-                                   key_column_order,
-                                   key_null_precedence);
+  cudf::groupby::groupby grpby_obj(cudf::table_view(group_cols), cudf::null_policy::INCLUDE);
 
   // Make aggregation requests, group aggregations on the same column in the single request.
   // For multi-column COLLECT_SET, a synthetic negative key -(i+1) is used so that each such
