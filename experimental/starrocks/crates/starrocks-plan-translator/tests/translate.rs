@@ -894,16 +894,32 @@ fn bounded_split_with_unknown_file_size_is_unsupported() {
 }
 
 /// Verifies an empty (zero-byte) file range is rejected: it is not a readable
-/// parquet file, so it must not be passed to `parquet_scan`.
+/// parquet file, so it must not be passed to `parquet_scan`. Pins the reason too —
+/// an empty file used to be reported as a file-size disagreement, which sent the
+/// reader hunting for a second, differing range that does not exist.
 #[test]
 fn empty_file_scan_range_is_unsupported() {
-    assert_scan_range_unsupported(broker_scan_range(
-        "file:///data/users.parquet",
-        TFileFormatType::FORMAT_PARQUET,
-        0,
-        0,
-        Some(0),
-    ));
+    let err = PlanTranslator::new()
+        .translate_fragment(&params_with_scan_range(
+            TPlan::new(vec![scan_node(0, 0)]),
+            base_desc(),
+            0,
+            broker_scan_range(
+                "file:///data/users.parquet",
+                TFileFormatType::FORMAT_PARQUET,
+                0,
+                0,
+                Some(0),
+            ),
+        ))
+        .unwrap_err();
+    let TranslateError::UnsupportedScanRange { reason, .. } = err else {
+        panic!("expected an unsupported scan range, got {err:?}");
+    };
+    assert_eq!(
+        reason,
+        "parquet scan range reports an empty or negative file size"
+    );
 }
 
 /// Verifies a renamed column mapping is rejected: destination slot 1 ("id") fed
@@ -4532,6 +4548,36 @@ fn split_broker_ranges_disagreeing_on_file_size_are_unsupported() {
         panic!("expected an unsupported scan range, got {err:?}");
     };
     assert_eq!(reason, "scan ranges disagree on the parquet file size");
+}
+
+/// A split missing its `file_size` reports as missing wherever it lands in the list, not
+/// only when it happens to be inserted first. Checking agreement before presence made the
+/// message depend on arrival order: the same fragment reported "missing" or "disagree"
+/// depending on which range the FE sent first.
+#[test]
+fn split_broker_range_missing_file_size_after_the_first_is_unsupported() {
+    let path = "file:///data/users.parquet";
+    let mut fragment = params_with_splits(path, 1024, &[(0, 512)]);
+    fragment
+        .params
+        .as_mut()
+        .unwrap()
+        .per_node_scan_ranges
+        .get_mut(&0)
+        .unwrap()
+        .push(TScanRangeParams::new(
+            broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 512, 512, None),
+            None,
+            None,
+            None,
+        ));
+    let err = PlanTranslator::new()
+        .translate_fragment(&fragment)
+        .unwrap_err();
+    let TranslateError::UnsupportedScanRange { reason, .. } = err else {
+        panic!("expected an unsupported scan range, got {err:?}");
+    };
+    assert_eq!(reason, "scan range is missing the parquet file size");
 }
 
 /// Splits arriving out of order still tile the file: the sweep sorts before checking, and the FE
