@@ -176,6 +176,6 @@ For a full list of current limitations and ongoing work, please refer to our [Gi
 ## Future Roadmap
 Sirius is still under major development and we are working on adding more features to Sirius, such as multi-node, more operators, data types, accelerating more engines, and many more.
 
-Sirius always welcomes new contributors! If you are interested, check our [website](https://www.sirius-db.com/), reach out to our [email](siriusdb@cs.wisc.edu), or join our [slack channel](https://join.slack.com/t/sirius-db/shared_invite/zt-33tuwt1sk-aa2dk0EU_dNjklSjIGW3vg).
+Sirius always welcomes new contributors! If you are interested, check our [website](https://www.sirius-db.com/), reach out to our [email](mailto:siriusdb@cs.wisc.edu), or join our [slack channel](https://join.slack.com/t/sirius-db/shared_invite/zt-33tuwt1sk-aa2dk0EU_dNjklSjIGW3vg).
 
 **Let's kickstart the GPU eras for Data Analytics!**

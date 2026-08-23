@@ -156,7 +156,7 @@ Do not spend time retuning these on this machine:
 | `dynamic_filter_keep_threshold` | 0.5 / 0.2 (default 0.9) | −0.11% / +0.69% — gate never binds |
 | `max_broadcast_join_size` | 8GB (default 256MB) | −0.24% |
 | `enable_dynamic_zone_map_filter` | true (default false) | +0.06% — scattered keys prune nothing |
-| `enable_dynamic_filter_pushdown` | **false** | **LIVELOCKS** — see below |
+| `enable_dynamic_filter` | **false** | **LIVELOCKS** — see below |
 
 **Do not disable dynamic filter pushdown.** At 251 GB of a 256 GB card it is load-bearing for
 *memory feasibility*, not speed: without it more rows survive the scan, intermediates grow, the

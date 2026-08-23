@@ -39,11 +39,15 @@
 
 #include <rmm/cuda_stream.hpp>
 
+#include <cuda_runtime.h>
+
 #include <catch.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <data/data_batch_utils.hpp>
+#include <data/sirius_converter_registry.hpp>
 #include <helper/type_conversions.hpp>
 #include <io/io_context.hpp>
 #include <op/scan/gpu_ingestible.hpp>
@@ -53,6 +57,7 @@
 #include <op/sirius_physical_operator.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <span>
@@ -66,11 +71,13 @@ namespace {
 struct test_env {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> mgr;
   cucascade::memory::memory_space* gpu_space;
+  cucascade::memory::memory_space* host_space;
   rmm::cuda_stream conv_stream;
 
   test_env()
     : mgr(sirius::test::operator_utils::initialize_memory_manager()),
       gpu_space(mgr->get_memory_space(cucascade::memory::Tier::GPU, 0)),
+      host_space(mgr->get_memory_space(cucascade::memory::Tier::HOST, 0)),
       conv_stream()
   {
   }
@@ -92,6 +99,29 @@ std::unique_ptr<cudf::column> make_column(cucascade::memory::memory_space& space
   auto stream = sirius::test::operator_utils::default_stream();
   return cudf::make_numeric_column(
     type, static_cast<cudf::size_type>(rows), cudf::mask_state::UNALLOCATED, stream, mr);
+}
+
+std::shared_ptr<cucascade::data_batch> make_host_resident_batch(
+  test_env& e, const std::vector<std::vector<int32_t>>& values_by_column)
+{
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.reserve(values_by_column.size());
+  for (auto const& values : values_by_column) {
+    auto column = make_column(*e.gpu_space, cudf::data_type{cudf::type_id::INT32}, values.size());
+    cudaMemcpyAsync(column->mutable_view().data<int32_t>(),
+                    values.data(),
+                    sizeof(int32_t) * values.size(),
+                    cudaMemcpyHostToDevice,
+                    e.stream().value());
+    columns.push_back(std::move(column));
+  }
+
+  cucascade::gpu_table_representation gpu_repr(
+    std::make_unique<cudf::table>(std::move(columns)), *e.gpu_space, e.stream());
+  auto host_repr = sirius::converter_registry::get().convert<cucascade::host_data_representation>(
+    gpu_repr, e.host_space, e.stream());
+  e.stream().synchronize();
+  return cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(host_repr));
 }
 
 /// Cached chunk standing in for a pinned split: its own contents never reach the assertions,
@@ -260,4 +290,75 @@ TEST_CASE("scan execute restores a narrowed resident carrier to its native outpu
   REQUIRE(view.num_columns() == 1);
   REQUIRE(view.column(0).type().id() == cudf::type_id::INT64);
   REQUIRE(view.num_rows() == static_cast<cudf::size_type>(kRows));
+}
+
+TEST_CASE("scan execute transactionally restores a fresh cached conversion",
+          "[scan_normalization][gpu_scan][transactional_steal]")
+{
+  auto& e = env();
+  std::vector<int32_t> const narrow_values{1, 2, 3, 4, 5, 6, 7, 8};
+  std::vector<int32_t> const unchanged_values{11, 12, 13, 14, 15, 16, 17, 18};
+  auto batch = make_host_resident_batch(e, {narrow_values, unchanged_values});
+
+  bool post_filter_reached = false;
+  auto ingestible = std::make_shared<stub_ingestible>([&]() -> std::unique_ptr<cudf::table> {
+    post_filter_reached = true;
+    throw std::logic_error("transactional scan must bypass post_filter_and_project");
+  });
+  duckdb::vector<duckdb::LogicalType> logical_types;
+  logical_types.push_back(duckdb::LogicalType::BIGINT);
+  logical_types.push_back(duckdb::LogicalType::INTEGER);
+  sirius::op::scan::sirius_gpu_scan_operator scan{
+    sirius::from_duckdb_vec(logical_types), /*estimated_cardinality=*/0, ingestible};
+
+  sirius::op::scan::scan_operator_input input(batch);
+  input.needs_carrier_conversion = true;
+  input.prepare_for_processing(e.gpu_space, e.stream());
+  REQUIRE(input.converted_table_steal_pending);
+  REQUIRE(input.stolen_table_bytes > 0);
+
+  const void* narrow_source_data;
+  const void* unchanged_source_data;
+  {
+    auto ro          = batch->to_read_only();
+    auto source_view = sirius::get_cudf_table_view(ro);
+    REQUIRE(source_view.num_columns() == 2);
+    narrow_source_data    = source_view.column(0).data<int32_t>();
+    unchanged_source_data = source_view.column(1).data<int32_t>();
+  }
+
+  auto output        = scan.execute(input, e.stream());
+  auto* pipelineable = dynamic_cast<const sirius::op::pipelineable_operator_data*>(output.get());
+  REQUIRE(pipelineable != nullptr);
+  REQUIRE_FALSE(post_filter_reached);
+  REQUIRE_FALSE(input.converted_table_steal_pending);
+  REQUIRE(input.stolen_table_consumed);
+  {
+    auto ro = batch->to_read_only();
+    REQUIRE(ro.get_data()->get_size_in_bytes() == 0);
+  }
+
+  auto const& batches = pipelineable->get_data_batches();
+  REQUIRE(batches.size() == 1);
+  auto restored = batches[0]->to_read_only();
+  auto view     = sirius::get_cudf_table_view(restored);
+  REQUIRE(view.num_columns() == 2);
+  REQUIRE(view.column(0).type().id() == cudf::type_id::INT64);
+  REQUIRE(view.column(1).type().id() == cudf::type_id::INT32);
+  REQUIRE(static_cast<const void*>(view.column(0).data<int64_t>()) != narrow_source_data);
+  REQUIRE(static_cast<const void*>(view.column(1).data<int32_t>()) == unchanged_source_data);
+
+  e.stream().synchronize();
+  std::vector<int64_t> restored_values(narrow_values.size());
+  std::vector<int32_t> moved_values(unchanged_values.size());
+  cudaMemcpy(restored_values.data(),
+             view.column(0).data<int64_t>(),
+             sizeof(int64_t) * restored_values.size(),
+             cudaMemcpyDeviceToHost);
+  cudaMemcpy(moved_values.data(),
+             view.column(1).data<int32_t>(),
+             sizeof(int32_t) * moved_values.size(),
+             cudaMemcpyDeviceToHost);
+  REQUIRE(restored_values == std::vector<int64_t>(narrow_values.begin(), narrow_values.end()));
+  REQUIRE(moved_values == unchanged_values);
 }

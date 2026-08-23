@@ -1,7 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "codegen/util/stream_pool.hpp"
 
+#include <map>
+#include <stdexcept>
+#include <string>
+
 namespace simpatico {
+
+stream_pool& thread_device_stream_pool(size_t n)
+{
+  // One pool per (thread, device). A map rather than a single pool so a thread
+  // that works on several devices gets streams belonging to each.
+  thread_local std::map<int, stream_pool> pools;
+  int device = 0;
+  if (cudaGetDevice(&device) != cudaSuccess) {
+    throw std::runtime_error("stream_pool: cannot query the current device");
+  }
+  auto& pool = pools[device];
+  if (pool.streams.empty()) {
+    if (!pool.init(n)) {
+      throw std::runtime_error("stream_pool: failed to create " + std::to_string(n) +
+                               " streams on device " + std::to_string(device));
+    }
+  }
+  return pool;
+}
 
 bool stream_pool::init(size_t n)
 {

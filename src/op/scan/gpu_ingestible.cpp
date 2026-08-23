@@ -53,13 +53,22 @@ filtered_table gpu_ingestible::materialize_table(const op::scan::scan_operator_i
     }
     return materialized;
   } else {
+    // A decode-row-filtered batch already had the split's whole table-filter
+    // conjunction applied during decompression: rows are compacted to the
+    // survivors, but the batch still carries the materialized column order.
+    // ROW_FILTERED makes post_filter_and_project skip filter evaluation while
+    // still assembling the projection/output layout.
+    auto const decoded_state =
+      split.pushdown_row_filtered ? filter_state::ROW_FILTERED : filter_state::UNFILTERED;
     if (split.stolen_table) {
       // prepare_for_processing took ownership of the wrapper batch's per-query
       // table; move it straight into the scan output — the owned-table
       // owning_table_view releases by moving columns, so no copy is made.
       split.stolen_table_consumed = true;
-      return {.table = owning_table_view{std::move(split.stolen_table)},
-              .state = filter_state::UNFILTERED};
+      return {.table               = owning_table_view{std::move(split.stolen_table)},
+              .state               = decoded_state,
+              .predicate_columns   = split.pushdown_predicate_columns,
+              .predicates_enforced = split.pushdown_predicates_enforced};
     }
     if (split.stolen_table_consumed) {
       throw std::runtime_error(
@@ -70,6 +79,9 @@ filtered_table gpu_ingestible::materialize_table(const op::scan::scan_operator_i
     auto rbatch = batch->to_read_only();
     auto view   = get_cudf_table_view(rbatch);
     if (split.mvcc_keep_mask.has_mask()) {
+      // prepare_for_processing already refuses the decode-filtered + keep-mask
+      // combination, and the row-count check below catches any slip: a
+      // compacted table can no longer line up with the positional mask.
       auto const& mask = split.mvcc_keep_mask;
       if (mask.row_count != static_cast<std::size_t>(view.num_rows())) {
         throw std::runtime_error("[gpu_ingestible::materialize_table] mvcc keep-mask covers " +
@@ -88,7 +100,10 @@ filtered_table gpu_ingestible::materialize_table(const op::scan::scan_operator_i
       stream.synchronize();
       return {.table = owning_table_view{std::move(masked)}, .state = filter_state::UNFILTERED};
     }
-    return {.table = owning_table_view{std::move(rbatch), view}, .state = filter_state::UNFILTERED};
+    return {.table               = owning_table_view{std::move(rbatch), view},
+            .state               = decoded_state,
+            .predicate_columns   = split.pushdown_predicate_columns,
+            .predicates_enforced = split.pushdown_predicates_enforced};
   }
 }
 

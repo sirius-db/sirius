@@ -28,8 +28,8 @@ sirius:
 |-----|------|---------|-------------|
 | `enable_quent` | bool | `true` | Emit Quent telemetry using the configured exporter. When `false`, telemetry uses the no-op exporter and nothing is written. |
 | `exporter` | string | `ndjson` | Quent filesystem exporter: `ndjson`, `msgpack`, or `postcard`. |
-| `output_directory` | string | `telemetry_data` | Directory for Quent telemetry files. |
-| `engine_name` | string | `siriusDB` | Engine name reported in engine-level telemetry. |
+| `output_directory` | non-empty string | `telemetry_data` | Directory for Quent telemetry files. |
+| `engine_name` | non-empty string | `siriusDB` | Engine name reported in engine-level telemetry. |
 
 Load the config through the normal resolution path — usually by setting
 `SIRIUS_CONFIG_FILE=/path/to/sirius.yaml` before loading the extension. Any Sirius query run with
