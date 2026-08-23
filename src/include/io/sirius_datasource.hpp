@@ -19,6 +19,7 @@
 #include "exec/invocable.hpp"
 #include "io/cache/prefetching_cache.hpp"
 #include "io/io_context.hpp"
+#include "io/types.hpp"
 
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/text/byte_range_info.hpp>
@@ -140,8 +141,10 @@ class sirius_datasource : public cudf::io::datasource {
   /// read.  Callers holding many ranges (e.g. a parquet scan's column chunks)
   /// should prefer this over one @c device_read_async per range: it costs one
   /// request instead of N, and lets the backend fuse and order the whole batch.
-  std::future<size_t> device_read_ranges_async(std::span<const io_device_range> ranges,
+  std::future<size_t> device_read_ranges_async(std::span<slice> slices,
                                                rmm::cuda_stream_view stream);
+
+  std::future<size_t> host_read_ranges_async(std::span<slice> slices, std::span<uint8_t*> dst);
 
   // ---- Advisory IO ---------------------------------------------------------
 

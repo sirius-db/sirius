@@ -17,11 +17,12 @@
 #pragma once
 
 #include <cudf/io/datasource.hpp>
-#include <cudf/io/text/byte_range_info.hpp>
+
+#include <rmm/cuda_stream_view.hpp>
 
 #include <cuda_runtime.h>
 
-#include <sys/uio.h>
+#include <io/cache/types.hpp>
 
 #include <cassert>
 #include <cstddef>
@@ -29,11 +30,8 @@
 #include <memory>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace sirius::io {
-
-static constexpr size_t IO_BLOCK_SIZE = 4096;  // O_DIRECT page size
 
 /**
  * @brief RAII wrapper for a POSIX file descriptor.
@@ -107,166 +105,132 @@ class io_object_metadata {
   virtual ~io_object_metadata() = default;
 };
 
-/// A read of @c size bytes starting at file @c offset, scattered into one or
-/// more destination buffers (@c buffers, in file order).  A single-buffer
-/// segment is a plain read; a multi-buffer segment is a vectored (readv) read
-/// whose iovecs cover @c [offset, offset + size) contiguously in the file but
-/// may land in discontiguous host allocations.
-///
-/// Invariant: @c size == Σ buffers[i].iov_len.  The merge step that fuses
-/// neighboring segments during request preparation maintains this by routing
-/// every growth through @c append.
-class io_object_segment {
- public:
-  io_object_segment() = default;
-
-  io_object_segment(size_t offset, size_t size)
-    : offset(offset), size(size), buffers{iovec{nullptr, size}}
-  {
-  }
-
-  io_object_segment(size_t offset, size_t size, uint8_t* buffer)
-    : offset(offset), size(size), buffers{iovec{static_cast<void*>(buffer), size}}
-  {
-  }
-
-  /// Set the destination of a single-buffer segment (the bounce-slot path
-  /// assigns the reactor's internal buffer late, once a slot is acquired).
-  void set_data(uint8_t* buffer)
-  {
-    assert(buffers.size() == 1 && "set_data is only valid for a single-buffer segment");
-    buffers.front().iov_base = static_cast<void*>(buffer);
-  }
-
-  [[nodiscard]] uint8_t* data() const noexcept
-  {
-    return buffers.empty() ? nullptr : static_cast<uint8_t*>(buffers.front().iov_base);
-  }
-
-  [[nodiscard]] bool is_buffer_allocated() const noexcept { return data() != nullptr; }
-
-  /// Number of destination buffers (== number of iovecs in a readv).
-  [[nodiscard]] size_t n_chunks() const noexcept { return buffers.size(); }
-
-  /// True iff this segment must be submitted via io_uring_prep_readv (rather
-  /// than a single io_uring_prep_read).
-  [[nodiscard]] bool is_vectored() const noexcept { return buffers.size() > 1; }
-
-  /// O_DIRECT requires the file offset, the total length, and every iovec base
-  /// and length to be block-aligned.
-  [[nodiscard]] bool is_odirect_compatible() const noexcept
-  {
-    if (offset % IO_BLOCK_SIZE != 0 || size % IO_BLOCK_SIZE != 0) { return false; }
-    for (auto const& b : buffers) {
-      if (b.iov_len % IO_BLOCK_SIZE != 0) { return false; }
-      if (b.iov_base != nullptr && reinterpret_cast<uintptr_t>(b.iov_base) % IO_BLOCK_SIZE != 0) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  /// Append a destination buffer, fusing a contiguous neighbor into this
-  /// segment.  Grows @c size by the buffer length to preserve the invariant.
-  void append(iovec iov) noexcept
-  {
-    buffers.push_back(iov);
-    size += iov.iov_len;
-  }
-
-  /// Rebuild the iovec list for resuming a short read after @p skip bytes were
-  /// already read: drops fully-consumed buffers and advances into the
-  /// straddling one.  Fills @p out in place (reusing its capacity across
-  /// resubmissions); @c buffers is untouched.
-  void fill_remaining_buffers(size_t skip, std::vector<iovec>& out) const
-  {
-    out.clear();
-    out.reserve(buffers.size());
-    for (auto const& iov : buffers) {
-      if (skip >= iov.iov_len) {
-        skip -= iov.iov_len;
-        continue;
-      }
-      out.push_back(iovec{static_cast<uint8_t*>(iov.iov_base) + skip, iov.iov_len - skip});
-      skip = 0;
-    }
-  }
-
-  size_t offset{0};
-  size_t size{0};
-  // Destination buffers in file order.  Owned here so the iovec array stays
-  // alive until the SQE referencing it is reaped.
-  std::vector<iovec> buffers;
+struct range {
+  std::size_t offset{0};
+  std::size_t size{0};
 };
 
-/// True iff @p a immediately precedes @p b in the file (no gap, no overlap):
-/// a.offset + a.size == b.offset.  Used to decide whether two segments can be
-/// fused into a single vectored (readv) submission over one contiguous range.
-[[nodiscard]] inline bool contiguous(const io_object_segment& a,
-                                     const io_object_segment& b) noexcept
-{
-  return a.offset + a.size == b.offset;
-}
+struct slice {
+  slice() noexcept = default;
 
-/// One entry of a vectored device read: @c [offset, offset + size) of the file
-/// delivered to @c device_dst.  The backend owns the staging and the physical
-/// alignment, so the caller states only what it wants and where.
-struct io_device_range {
-  size_t offset{0};
-  size_t size{0};
-  uint8_t* device_dst{nullptr};
+  explicit slice(std::size_t offset, std::size_t size, std::uint8_t* dst) noexcept
+    : rng{offset, size}, dst{dst}
+  {
+    assert(dst != nullptr);
+    assert(size > 0);
+  }
+
+  [[nodiscard]] size_t size() const noexcept { return rng.size; }
+
+  [[nodiscard]] std::size_t offset() const noexcept { return rng.offset; }
+
+  range rng;
+  std::uint8_t* dst{nullptr};
 };
 
-/// One entry of a vectored host-to-device read.  @c [offset, offset + size) —
-/// the caller's own, O_DIRECT-aligned read span — is read into @c host_buffer
-/// (or an internal bounce slot when null), and only
-/// @c [copy_offset, copy_offset + copy_size) of it, in absolute file offsets, is
-/// copied to @c device_dst.  Separating the two is what lets a caller over-read
-/// for alignment, or read a whole cache chunk, and still land exactly the bytes
-/// it asked for on the device.
-struct io_host_device_range {
-  io_host_device_range() = default;
+struct host_buffer {
+  host_buffer() noexcept = default;
 
-  /// Read and copy the same span: the whole read lands at @p device_dst.
-  io_host_device_range(size_t offset, size_t size, uint8_t* host_buffer, uint8_t* device_dst)
-    : offset(offset),
-      size(size),
-      copy_offset(offset),
-      copy_size(size),
-      host_buffer(host_buffer),
-      device_dst(device_dst)
+  explicit host_buffer(std::uint8_t* dst) noexcept : buffer(dst) { assert(dst != nullptr); }
+
+  explicit host_buffer(std::span<cache::cached_chunk*> cached_chunks) noexcept
+    : buffer(std::move(cached_chunks))
+  {
+    assert(!cached_chunks.empty());
+  }
+
+  [[nodiscard]] bool needs_staging() const noexcept
+  {
+    return std::holds_alternative<std::monostate>(buffer);
+  }
+
+  [[nodiscard]] bool is_fragmented() const noexcept
+  {
+    return std::holds_alternative<std::span<cache::cached_chunk*>>(buffer);
+  }
+
+  [[nodiscard]] bool is_contiguous() const noexcept
+  {
+    return std::holds_alternative<std::uint8_t*>(buffer);
+  }
+
+  [[nodiscard]] bool is_staged() const noexcept
+  {
+    return std::holds_alternative<std::monostate>(buffer);
+  }
+
+  [[nodiscard]] bool is_fragmented() const noexcept
+  {
+    return std::holds_alternative<std::span<cache::cached_chunk*>>(buffer);
+  }
+
+  [[nodiscard]] bool is_contiguous() const noexcept
+  {
+    return std::holds_alternative<std::uint8_t*>(buffer);
+  }
+
+  [[nodiscard]] bool needs_staging() const noexcept
+  {
+    return std::holds_alternative<std::monostate>(buffer);
+  }
+
+  [[nodiscard]] bool is_fragmented() const noexcept
+  {
+    return std::holds_alternative<std::span<cache::cached_chunk*>>(buffer);
+  }
+
+  [[nodiscard]] bool is_contiguous() const noexcept
+  {
+    return std::holds_alternative<std::uint8_t*>(buffer);
+  }
+
+  std::variant<std::monostate, std::uint8_t*, std::span<cache::cached_chunk*>> buffer;
+};
+
+struct device_buffer {
+  device_buffer() noexcept = default;
+
+  explicit device_buffer(std::uint8_t* dst, rmm::cuda_stream_view stream) noexcept
+    : data(dst), stream(stream)
+  {
+    assert(dst != nullptr);
+  }
+
+  std::uint8_t* data{nullptr};
+  rmm::cuda_stream_view stream;
+};
+
+struct prepared_io_slice {
+  range rng;
+  host_buffer h_buffer;  // monostate if using staged buffers
+  device_buffer d_buffer;
+
+  prepared_io_slice() noexcept = default;
+  explicit prepared_io_slice(range r, host_buffer h) noexcept : rng(r), h_buffer(std::move(h)) {}
+  explicit prepared_io_slice(range r, device_buffer d) noexcept : rng(r), d_buffer(std::move(d)) {}
+  explicit prepared_io_slice(range r, host_buffer h, device_buffer d) noexcept
+    : rng(r), h_buffer(std::move(h)), d_buffer(std::move(d))
   {
   }
 
-  io_host_device_range(size_t offset,
-                       size_t size,
-                       size_t copy_offset,
-                       size_t copy_size,
-                       uint8_t* host_buffer,
-                       uint8_t* device_dst)
-    : offset(offset),
-      size(size),
-      copy_offset(copy_offset),
-      copy_size(copy_size),
-      host_buffer(host_buffer),
-      device_dst(device_dst)
+  [[nodiscard]] bool is_staged() const noexcept { return h_buffer.needs_staging(); }
+
+  [[nodiscard]] bool is_fragmented() const noexcept { return h_buffer.is_fragmented(); }
+
+  [[nodiscard]] bool is_contiguous() const noexcept { return h_buffer.is_contiguous(); }
+
+  [[nodiscard]] bool has_host_request() const noexcept { return !h_buffer.needs_staging(); }
+
+  [[nodiscard]] bool has_device_request() const noexcept { return d_buffer.data != nullptr; }
+
+  [[nodiscard]] bool is_host_request() const noexcept
   {
+    return !h_buffer.needs_staging() && !has_device_request();
   }
 
-  /// True iff the copy window lies inside the read span.
-  [[nodiscard]] bool is_copy_window_valid() const noexcept
-  {
-    if (copy_offset < offset) { return false; }
-    size_t const head = copy_offset - offset;
-    return head <= size && copy_size <= size - head;
-  }
+  [[nodiscard]] size_t size() const noexcept { return rng.size; }
 
-  size_t offset{0};
-  size_t size{0};
-  size_t copy_offset{0};
-  size_t copy_size{0};
-  uint8_t* host_buffer{nullptr};
-  uint8_t* device_dst{nullptr};
+  [[nodiscard]] size_t offset() const noexcept { return rng.offset; }
 };
 
 }  // namespace sirius::io

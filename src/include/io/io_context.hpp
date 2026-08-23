@@ -19,7 +19,6 @@
 #include "exec/semi_future.hpp"
 #include "io/cache/config.hpp"
 #include "io/cache/metadata_store.hpp"
-#include "io/cache/types.hpp"
 #include "io/types.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
@@ -283,35 +282,23 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   virtual exec::semi_future<size_t> host_read_async_io(const io_object& obj,
                                                        size_t offset,
                                                        size_t size,
-                                                       uint8_t* dst) noexcept = 0;
+                                                       uint8_t* dst) noexcept;
 
   virtual exec::semi_future<size_t> device_read_async_io(const io_object& obj,
                                                          size_t offset,
                                                          size_t size,
                                                          uint8_t* dst,
-                                                         rmm::cuda_stream_view stream) noexcept = 0;
+                                                         rmm::cuda_stream_view stream) noexcept;
 
-  virtual exec::semi_future<size_t> host_to_device_read_async_io(
-    const io_object& obj,
-    std::span<io_object_segment> slices,
-    size_t offset,
-    size_t size,
-    uint8_t* device_dst,
-    rmm::cuda_stream_view stream) noexcept = 0;
+  virtual exec::semi_future<size_t> host_readv_async_io(const io_object& obj,
+                                                        std::span<slice> slices) noexcept;
 
-  virtual exec::semi_future<size_t> host_read_ranges_async_io(
-    const io_object& obj, std::span<io_object_segment> segments) noexcept = 0;
+  virtual exec::semi_future<size_t> device_readv_async_io(const io_object& obj,
+                                                          std::span<slice> slices,
+                                                          rmm::cuda_stream_view stream) noexcept;
 
-  /// Vectored device read: every range lands in its own device destination, all
-  /// staged by the backend.  Ranges are taken as given — never coalesced — and
-  /// empty, past-EOF or null-destination entries are dropped.  Reports the bytes
-  /// delivered, each range clamped to the object's end.  Like
-  /// @c device_read_async_io it resolves once the copies are enqueued on
-  /// @p stream, so the destinations must outlive the stream work.
-  virtual exec::semi_future<size_t> device_read_ranges_async_io(
-    const io_object& obj,
-    std::span<const io_device_range> ranges,
-    rmm::cuda_stream_view stream) noexcept = 0;
+  virtual exec::semi_future<size_t> host_device_readv_async_io(
+    const io_object& obj, std::vector<prepared_io_slice>&& slices) noexcept = 0;
 
   bool can_use_prefetching_cache() const noexcept
   {
@@ -319,21 +306,6 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   }
 
  protected:
-  /// Vectored host-to-device read, staged through buffers the CALLER owns.  Each
-  /// range is read into its own host buffer — or an internal bounce slot when
-  /// null — and only its copy window reaches its device destination, so the
-  /// caller can over-read for O_DIRECT alignment or fill a whole cache chunk and
-  /// still land exactly what was asked for.  Reports the bytes copied to device
-  /// memory, not the bytes read.
-  ///
-  /// Not public: supplying host buffers only makes sense for a caller that owns
-  /// and outlives them (the prefetching cache).  Everyone else uses
-  /// @c device_read_ranges_async_io.
-  virtual exec::semi_future<size_t> host_to_device_read_ranges_async_io(
-    const io_object& obj,
-    std::span<const io_host_device_range> ranges,
-    rmm::cuda_stream_view stream) noexcept = 0;
-
   /// Whether the backend implements @c host_to_device_read_ranges_async_io.
   [[nodiscard]] virtual bool supports_host_to_device_range_read() const noexcept = 0;
 

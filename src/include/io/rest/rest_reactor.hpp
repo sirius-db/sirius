@@ -335,55 +335,34 @@ class rest_reactor {
 
   // -- request preparation (static: build chunk descriptions) --------------
 
-  static request_type_ptr prep_host_rx_request(const reactor_config_type& cfg,
-                                               const io_object_type& file,
-                                               const io_object_segment& segment);
-  static request_type_ptr prep_host_rx_request(const reactor_config_type& cfg,
-                                               const io_object_type& file,
-                                               const io_object_segment& segment,
-                                               host_read_attribution attribution);
+  static std::vector<prepared_io_slice> prep_host_rx_request(const reactor_config_type& cfg,
+                                                             const io_object_type& file,
+                                                             const slice& segment);
 
-  static request_type_ptr prep_host_rxv_request(const reactor_config_type& cfg,
-                                                const io_object_type& file,
-                                                std::span<io_object_segment> segments);
+  static std::vector<prepared_io_slice> prep_device_rx_request(const reactor_config_type& cfg,
+                                                               const io_object_type& file,
+                                                               const slice& segment,
+                                                               rmm::cuda_stream_view stream,
+                                                               int device_id);
 
-  static request_type_ptr prep_device_rx_request(const reactor_config_type& cfg,
-                                                 const io_object_type& file,
-                                                 uint8_t* dst,
-                                                 size_t offset,
-                                                 size_t size,
-                                                 rmm::cuda_stream_view stream,
-                                                 int device_id);
+  /// Vectored form of @c prep_device_rx_request: read N logical ranges in one
+  /// request, each into its own device destination.  Every range is clamped to
+  /// the file, aligned outward for O_DIRECT, and split into @c cfg.bounce_size
+  /// windows staged through the reactor's internal bounce slots.
+  static std::vector<prepared_io_slice> prep_device_rxv_request(const reactor_config_type& cfg,
+                                                                const io_object_type& file,
+                                                                std::span<const slice> ranges,
+                                                                rmm::cuda_stream_view stream,
+                                                                int device_id);
 
-  static request_type_ptr prep_host_to_device_rx_request(const reactor_config_type& cfg,
-                                                         const io_object_type& file,
-                                                         std::span<io_object_segment> bounce,
-                                                         uint8_t* dst,
-                                                         size_t offset,
-                                                         size_t size,
-                                                         rmm::cuda_stream_view stream,
-                                                         int device_id);
-
-  /// Vectored form of @c prep_device_rx_request: every range is clamped to the
-  /// file end, staged through reactor-owned pinned bounce slots and H2D-copied
-  /// into its own device destination.  Ranges with a null destination (or no
-  /// bytes left after clamping) are skipped.
-  static request_type_ptr prep_device_rxv_request(const reactor_config_type& cfg,
-                                                  const io_object_type& file,
-                                                  std::span<const io_device_range> ranges,
-                                                  rmm::cuda_stream_view stream,
-                                                  int device_id);
-
-  /// Vectored host-to-device read: each range is read into its own caller
-  /// buffer (null => an internal bounce slot) and only its copy window is
-  /// H2D-copied to its own device destination.  File-adjacent buffers fuse into
-  /// scatter GETs that batch their copies.
-  static request_type_ptr prep_host_to_device_rxv_request(
-    const reactor_config_type& cfg,
-    const io_object_type& file,
-    std::span<const io_host_device_range> ranges,
-    rmm::cuda_stream_view stream,
-    int device_id);
+  /// Vectored form of @c prep_device_rx_request: read N logical ranges in one
+  /// request, each into its own device destination.  Every range is clamped to
+  /// the file, aligned outward for O_DIRECT, and split into @c cfg.bounce_size
+  /// windows staged through the reactor's internal bounce slots.
+  static std::vector<prepared_io_slice> prep_host_rxv_request(const reactor_config_type& cfg,
+                                                              const io_object_type& file,
+                                                              std::span<const slice> ranges,
+                                                              int device_id);
 
   // -- dispatch / lifecycle ------------------------------------------------
 

@@ -187,59 +187,34 @@ class uring_reactor {
   /// place — the context — rather than being passed in separately.
   [[nodiscard]] const reactor_config_type& get_config() const noexcept { return _config; }
 
-  static request_type_ptr prep_host_rx_request(const reactor_config_type& cfg,
-                                               const io_object_type& file,
-                                               const io_object_segment& segment);
+  static prepared_io_slice prep_host_rx_request(const reactor_config_type& cfg,
+                                                const io_object_type& file,
+                                                const slice& segment);
 
-  static request_type_ptr prep_device_rx_request(const reactor_config_type& cfg,
-                                                 const io_object_type& file,
-                                                 uint8_t* dst,
-                                                 size_t offset,
-                                                 size_t size,
-                                                 rmm::cuda_stream_view stream,
-                                                 int device_id);
+  static prepared_io_slice prep_device_rx_request(const reactor_config_type& cfg,
+                                                  const io_object_type& file,
+                                                  const slice& segment,
+                                                  rmm::cuda_stream_view stream,
+                                                  int device_id);
 
   /// Vectored form of @c prep_device_rx_request: read N logical ranges in one
   /// request, each into its own device destination.  Every range is clamped to
   /// the file, aligned outward for O_DIRECT, and split into @c cfg.bounce_size
   /// windows staged through the reactor's internal bounce slots.
-  static request_type_ptr prep_device_rxv_request(const reactor_config_type& cfg,
-                                                  const io_object_type& file,
-                                                  std::span<const io_device_range> ranges,
-                                                  rmm::cuda_stream_view stream,
-                                                  int device_id);
+  static std::vector<prepared_io_slice> prep_device_rxv_request(const reactor_config_type& cfg,
+                                                                const io_object_type& file,
+                                                                std::span<const slice> ranges,
+                                                                rmm::cuda_stream_view stream,
+                                                                int device_id);
 
-  static request_type_ptr prep_host_to_device_rx_request(const reactor_config_type& cfg,
-                                                         const io_object_type& file,
-                                                         std::span<io_object_segment> bounce,
-                                                         uint8_t* dst,
-                                                         size_t offset,
-                                                         size_t size,
-                                                         rmm::cuda_stream_view stream,
-                                                         int device_id);
-
-  /// Vectored host-to-device read: each range is read into its own caller
-  /// buffer (null => an internal bounce slot) and only its copy window is
-  /// H2D-copied to its own device destination.  Contiguous caller buffers fuse
-  /// into readv groups that batch their copies.
-  static request_type_ptr prep_host_to_device_rxv_request(
-    const reactor_config_type& cfg,
-    const io_object_type& file,
-    std::span<const io_host_device_range> ranges,
-    rmm::cuda_stream_view stream,
-    int device_id);
-
-  /// Build a host-read request that fuses runs of contiguous segments sharing
-  /// the same backing fd into vectored (readv) submissions of at most
-  /// @c cfg.max_n_chunks buffers each; non-contiguous boundaries / fd changes
-  /// start a new group.  A 1-buffer group degrades to a plain read.
-  ///
-  /// request_manager::total_chunks is set to the number of emitted GROUPS (each
-  /// group calls chunk_complete exactly once); bytes_requested is the clamped
-  /// sum over input segments.
-  static request_type_ptr prep_host_rxv_request(const reactor_config_type& cfg,
-                                                const io_object_type& file,
-                                                std::span<io_object_segment> segments);
+  /// Vectored form of @c prep_device_rx_request: read N logical ranges in one
+  /// request, each into its own device destination.  Every range is clamped to
+  /// the file, aligned outward for O_DIRECT, and split into @c cfg.bounce_size
+  /// windows staged through the reactor's internal bounce slots.
+  static std::vector<prepared_io_slice> prep_host_rxv_request(const reactor_config_type& cfg,
+                                                              const io_object_type& file,
+                                                              std::span<const slice> ranges,
+                                                              int device_id);
 
   /// Allocate the pinned bounce slots and launch the worker thread.  Split out
   /// of the constructor so a reactor can be built cheaply (it only copies its

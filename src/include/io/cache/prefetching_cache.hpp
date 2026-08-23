@@ -233,9 +233,19 @@ class prefetching_cache {
   /// end, resolving once the copies are enqueued on @p stream.
   [[nodiscard]] exec::semi_future<std::size_t> device_read_ranges_async(
     const io_object& obj,
-    std::span<const io::io_device_range> ranges,
+    std::span<const slice> slices,
     rmm::cuda_stream_view stream,
     prefetching_handle* out_handle = nullptr);
+
+  /// Vectored form of @ref device_read_async: each range is served from the
+  /// cache where it is populated, loaded through the cache where it can be, and
+  /// bounced through the backend otherwise — all in one dispatch.  Requires a
+  /// backend with one of the two batch capabilities (both reactors have them);
+  /// on any other it returns the backend's failed future without touching the
+  /// cache.  Reports the bytes delivered, each range clamped to the object's
+  /// end, resolving once the copies are enqueued on @p stream.
+  [[nodiscard]] exec::semi_future<std::size_t> host_read_ranges_async(
+    const io_object& obj, std::span<const slice> slices, prefetching_handle* out_handle = nullptr);
 
   /// Issue prefetch IO for @p handle's request.  @p on_done fires exactly once
   /// with the outcome — inline when no IO is issued, otherwise from the IO

@@ -19,6 +19,7 @@
 #include "io/cache/config.hpp"
 #include "io/cache/prefetching_cache.hpp"
 #include "io/sirius_datasource.hpp"
+#include "io/types.hpp"
 
 #include <cassert>
 #include <cmath>
@@ -92,6 +93,51 @@ std::shared_ptr<io_object> ioctx::create_io_object(std::string path, open_hint /
 std::shared_ptr<io_object> ioctx::create_io_object(std::string path, std::uint64_t /*known_size*/)
 {
   return create_io_object(std::move(path));
+}
+
+exec::semi_future<size_t> ioctx::host_read_async_io(const io_object& obj,
+                                                    size_t offset,
+                                                    size_t size,
+                                                    uint8_t* dst) noexcept
+{
+  std::vector<prepared_io_slice> slices{prepared_io_slice{range{offset, size}, host_buffer{dst}}};
+  return host_device_readv_async_io(obj, std::move(slices));
+}
+
+exec::semi_future<size_t> ioctx::device_read_async_io(const io_object& obj,
+                                                      size_t offset,
+                                                      size_t size,
+                                                      uint8_t* dst,
+                                                      rmm::cuda_stream_view stream) noexcept
+{
+  std::vector<prepared_io_slice> slices{
+    prepared_io_slice{range{offset, size}, device_buffer{dst, stream}}};
+  return host_device_readv_async_io(obj, std::move(slices));
+}
+
+exec::semi_future<size_t> ioctx::host_readv_async_io(const io_object& obj,
+                                                     std::span<slice> slices) noexcept
+{
+  std::vector<prepared_io_slice> prepared_slices;
+  prepared_slices.reserve(slices.size());
+  std::transform(
+    slices.begin(), slices.end(), std::back_inserter(prepared_slices), [](const slice& s) {
+      return prepared_io_slice{range{s.offset(), s.size()}, host_buffer{s.dst}};
+    });
+  return host_device_readv_async_io(obj, std::move(prepared_slices));
+}
+
+exec::semi_future<size_t> ioctx::device_readv_async_io(const io_object& obj,
+                                                       std::span<slice> slices,
+                                                       rmm::cuda_stream_view stream) noexcept
+{
+  std::vector<prepared_io_slice> prepared_slices;
+  prepared_slices.reserve(slices.size());
+  std::transform(
+    slices.begin(), slices.end(), std::back_inserter(prepared_slices), [stream](const slice& s) {
+      return prepared_io_slice{range{s.offset(), s.size()}, device_buffer{s.dst, stream}};
+    });
+  return host_device_readv_async_io(obj, std::move(prepared_slices));
 }
 
 }  // namespace sirius::io
