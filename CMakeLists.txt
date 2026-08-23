@@ -385,6 +385,7 @@ set(EXTENSION_SOURCES
     src/planner/query_index.cpp
     src/planner/sirius_physical_plan_generator.cpp
     src/planner/sirius_plan_aggregate.cpp
+    src/planner/substrait_scan_ranges.cpp
     src/planner/sirius_plan_column_data_get.cpp
     src/planner/sirius_plan_comparison_join.cpp
     src/planner/sirius_plan_compressed_schema.cpp

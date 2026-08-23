@@ -38,6 +38,7 @@
 #include "from_substrait.hpp"     // duckdb::SubstraitToDuckDB (compiled into libsirius)
 #include "parquet_extension.hpp"  // duckdb::ParquetExtension
 #include "planner/sirius_physical_plan_generator.hpp"  // sirius::planner::sirius_physical_plan_generator
+#include "planner/substrait_scan_ranges.hpp"           // sirius::planner::scan_byte_ranges_state
 #include "sirius_config.hpp"                           // sirius::sirius_config
 #include "sirius_context.hpp"                          // duckdb::SiriusContext
 #include "sirius_interface.hpp"  // sirius::sirius_interface, sirius::sirius_prepared_statement_data
@@ -125,6 +126,18 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
   impl_->conn->BeginTransaction();
   duckdb::unique_ptr<duckdb::QueryResult> result;
   try {
+    // 0. Byte-ranged parquet splits ride the plan's LocalFiles items, but DuckDB's Substrait
+    //    consumer drops FileOrFiles.start/.length and parquet_scan has no byte-range
+    //    parameter — extract them into a per-plan state the physical plan generator consumes.
+    //    Always replaced (and removed when this plan carries none), so a stale registry can
+    //    never leak a previous plan's ranges into this one.
+    client.registered_state->Remove(sirius::planner::scan_byte_ranges_state::kStateKey);
+    if (auto ranges = sirius::planner::extract_scan_byte_ranges(plan); !ranges.empty()) {
+      client.registered_state->Insert(
+        sirius::planner::scan_byte_ranges_state::kStateKey,
+        duckdb::make_shared_ptr<sirius::planner::scan_byte_ranges_state>(std::move(ranges)));
+    }
+
     // 1. Substrait bytes -> DuckDB Relation. DuckDB is used only for this lowering.
     duckdb::SubstraitToDuckDB transformer(impl_->conn->context, plan, /*json=*/false);
     auto relation = transformer.TransformPlan();
