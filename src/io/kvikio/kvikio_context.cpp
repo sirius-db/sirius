@@ -19,6 +19,10 @@
 #include <kvikio/defaults.hpp>
 #include <kvikio/remote_handle.hpp>
 
+#include <rmm/cuda_device.hpp>
+
+#include <cuda_runtime.h>
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -186,77 +190,93 @@ size_t kvikio_context::host_read_io(const io_object& obj, size_t offset, size_t 
   return as_kvikio(obj).read_at(dst, size, offset);
 }
 
-exec::semi_future<size_t> kvikio_context::host_read_async_io(const io_object& obj,
-                                                             size_t offset,
-                                                             size_t size,
-                                                             uint8_t* dst) noexcept
+exec::semi_future<size_t> kvikio_context::mixed_readv_async_io(
+  const io_object& obj, std::vector<prepared_io_slice>&& slices) noexcept
 {
-  // make_semi_future_with invokes eagerly, so the kvikIO future is consumed
-  // here and the returned semi_future is already satisfied.  Callers that need
-  // true overlap use the uring backend.
-  return exec::make_semi_future_with(
-    [&obj, offset, size, dst]() -> size_t { return as_kvikio(obj).read_at(dst, size, offset); });
-}
+  // make_semi_future_with invokes eagerly. KvikIO remains the simple fallback
+  // backend while sharing the exact prepared-slice contract with reactors.
+  return exec::make_semi_future_with([&obj, slices = std::move(slices)]() mutable -> size_t {
+    auto const& object = as_kvikio(obj);
+    std::size_t total  = 0;
 
-exec::semi_future<size_t> kvikio_context::device_read_async_io(
-  const io_object& obj,
-  size_t offset,
-  size_t size,
-  uint8_t* dst,
-  rmm::cuda_stream_view stream) noexcept
-{
-  size = clamp_to_object(obj, offset, size);
-  return exec::make_semi_future_with([&obj, offset, size, dst, stream]() -> size_t {
-    if (size == 0) { return 0; }
-    const auto* local = dynamic_cast<const kvikio_io_object*>(&obj);
-    if (local == nullptr) { return as_kvikio(obj).read_at(dst, size, offset); }
-    auto fut = local->handle().read_async(dst,
-                                          size,
-                                          static_cast<off_t>(offset),
-                                          /*devPtr_offset=*/0,
-                                          stream.value());
-    return fut.check_bytes_done();
+    for (std::size_t index = 0; index < slices.size(); ++index) {
+      auto& slice = slices[index];
+      try {
+        auto const bytes = clamp_to_object(obj, slice.offset(), slice.size());
+        slice.rng.size   = bytes;
+
+        if (bytes != 0) {
+          if (slice.is_fragmented()) {
+            throw std::runtime_error("kvikio_context does not accept fragmented cache buffers");
+          }
+
+          std::size_t completed = 0;
+          if (slice.is_contiguous()) {
+            auto* host = std::get<std::uint8_t*>(slice.h_buffer.buffer);
+            completed  = object.read_at(host, bytes, slice.offset());
+
+            if (completed == bytes && slice.has_device_request()) {
+              int device_id = slice.d_buffer.device_id;
+              if (device_id < 0) {
+                auto const status = cudaGetDevice(&device_id);
+                if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
+              }
+              rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
+              auto const copy_status = cudaMemcpyAsync(
+                slice.d_buffer.data, host, bytes, cudaMemcpyDefault, slice.d_buffer.stream.value());
+              if (copy_status != cudaSuccess) {
+                throw std::runtime_error(cudaGetErrorString(copy_status));
+              }
+              auto const sync_status = cudaStreamSynchronize(slice.d_buffer.stream.value());
+              if (sync_status != cudaSuccess) {
+                throw std::runtime_error(cudaGetErrorString(sync_status));
+              }
+            }
+          } else if (slice.has_device_request()) {
+            int device_id = slice.d_buffer.device_id;
+            if (device_id < 0) {
+              auto const status = cudaGetDevice(&device_id);
+              if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
+            }
+            rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
+
+            auto const* local = dynamic_cast<kvikio_io_object const*>(&object);
+            if (local == nullptr) {
+              completed = object.read_at(slice.d_buffer.data, bytes, slice.offset());
+            } else {
+              auto future = local->handle().read_async(slice.d_buffer.data,
+                                                       bytes,
+                                                       static_cast<off_t>(slice.offset()),
+                                                       0,
+                                                       slice.d_buffer.stream.value());
+              completed   = future.check_bytes_done();
+            }
+          } else {
+            throw std::invalid_argument("prepared slice has no destination");
+          }
+
+          if (completed != bytes) { throw std::runtime_error("kvikio_context: short read"); }
+          total += completed;
+        }
+
+        if (slice.on_complete != nullptr) {
+          (*slice.on_complete)(slice.h_buffer.fragments(), true);
+        }
+      } catch (...) {
+        if (slice.on_complete != nullptr) {
+          (*slice.on_complete)(slice.h_buffer.fragments(), false);
+        }
+        for (++index; index < slices.size(); ++index) {
+          auto& skipped = slices[index];
+          if (skipped.on_complete != nullptr) {
+            (*skipped.on_complete)(skipped.h_buffer.fragments(), false);
+          }
+        }
+        throw;
+      }
+    }
+    return total;
   });
-}
-
-exec::semi_future<size_t> kvikio_context::host_to_device_read_async_io(
-  const io_object& /*obj*/,
-  std::span<io_object_segment> /*slices*/,
-  size_t /*offset*/,
-  size_t /*size*/,
-  uint8_t* /*device_dst*/,
-  rmm::cuda_stream_view /*stream*/) noexcept
-{
-  return exec::make_semi_future<size_t>(std::make_exception_ptr(
-    std::runtime_error("kvikio_context does not support host_to_device_read_async_io; use "
-                       "device_read_async instead")));
-}
-
-exec::semi_future<size_t> kvikio_context::host_read_ranges_async_io(
-  const io_object& /*obj*/, std::span<io_object_segment> /*segments*/) noexcept
-{
-  return exec::make_semi_future<size_t>(std::make_exception_ptr(
-    std::runtime_error("kvikio_context does not support host_read_ranges_async_io")));
-}
-
-exec::semi_future<size_t> kvikio_context::device_read_ranges_async_io(
-  const io_object& /*obj*/,
-  std::span<const io_device_range> /*ranges*/,
-  rmm::cuda_stream_view /*stream*/) noexcept
-{
-  return exec::make_semi_future<size_t>(
-    std::make_exception_ptr(std::runtime_error("kvikio_context does not support "
-                                               "device_read_ranges_async_io; use "
-                                               "device_read_async_io per range instead")));
-}
-
-exec::semi_future<size_t> kvikio_context::host_to_device_read_ranges_async_io(
-  const io_object& /*obj*/,
-  std::span<const io_host_device_range> /*ranges*/,
-  rmm::cuda_stream_view /*stream*/) noexcept
-{
-  return exec::make_semi_future<size_t>(std::make_exception_ptr(
-    std::runtime_error("kvikio_context does not support host_to_device_read_ranges_async_io")));
 }
 
 }  // namespace sirius::io

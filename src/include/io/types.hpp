@@ -16,22 +16,37 @@
 
 #pragma once
 
+#include "exec/invocable.hpp"
+
 #include <cudf/io/datasource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cuda_runtime.h>
 
-#include <io/cache/types.hpp>
+#include <unistd.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <mutex>
+#include <span>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <variant>
+#include <vector>
+
+namespace sirius::io::cache {
+class cached_chunk;
+}
 
 namespace sirius::io {
+
+inline constexpr std::size_t IO_BLOCK_SIZE = 4096;
 
 /**
  * @brief RAII wrapper for a POSIX file descriptor.
@@ -108,7 +123,23 @@ class io_object_metadata {
 struct range {
   std::size_t offset{0};
   std::size_t size{0};
+
+  [[nodiscard]] std::size_t end() const noexcept
+  {
+    return size > std::numeric_limits<std::size_t>::max() - offset
+             ? std::numeric_limits<std::size_t>::max()
+             : offset + size;
+  }
+
+  [[nodiscard]] bool empty() const noexcept { return size == 0; }
 };
+
+[[nodiscard]] inline range intersect(range lhs, range rhs) noexcept
+{
+  auto const begin = std::max(lhs.offset, rhs.offset);
+  auto const end   = std::min(lhs.end(), rhs.end());
+  return end > begin ? range{begin, end - begin} : range{begin, 0};
+}
 
 struct slice {
   slice() noexcept = default;
@@ -133,40 +164,16 @@ struct host_buffer {
 
   explicit host_buffer(std::uint8_t* dst) noexcept : buffer(dst) { assert(dst != nullptr); }
 
-  explicit host_buffer(std::span<cache::cached_chunk*> cached_chunks) noexcept
-    : buffer(std::move(cached_chunks))
+  explicit host_buffer(std::span<cache::cached_chunk*> cached_chunks)
+    : buffer(std::vector<cache::cached_chunk*>{cached_chunks.begin(), cached_chunks.end()})
   {
     assert(!cached_chunks.empty());
   }
 
-  [[nodiscard]] bool needs_staging() const noexcept
+  explicit host_buffer(std::vector<cache::cached_chunk*> cached_chunks)
+    : buffer(std::move(cached_chunks))
   {
-    return std::holds_alternative<std::monostate>(buffer);
-  }
-
-  [[nodiscard]] bool is_fragmented() const noexcept
-  {
-    return std::holds_alternative<std::span<cache::cached_chunk*>>(buffer);
-  }
-
-  [[nodiscard]] bool is_contiguous() const noexcept
-  {
-    return std::holds_alternative<std::uint8_t*>(buffer);
-  }
-
-  [[nodiscard]] bool is_staged() const noexcept
-  {
-    return std::holds_alternative<std::monostate>(buffer);
-  }
-
-  [[nodiscard]] bool is_fragmented() const noexcept
-  {
-    return std::holds_alternative<std::span<cache::cached_chunk*>>(buffer);
-  }
-
-  [[nodiscard]] bool is_contiguous() const noexcept
-  {
-    return std::holds_alternative<std::uint8_t*>(buffer);
+    assert(!std::get<std::vector<cache::cached_chunk*>>(buffer).empty());
   }
 
   [[nodiscard]] bool needs_staging() const noexcept
@@ -176,7 +183,7 @@ struct host_buffer {
 
   [[nodiscard]] bool is_fragmented() const noexcept
   {
-    return std::holds_alternative<std::span<cache::cached_chunk*>>(buffer);
+    return std::holds_alternative<std::vector<cache::cached_chunk*>>(buffer);
   }
 
   [[nodiscard]] bool is_contiguous() const noexcept
@@ -184,26 +191,64 @@ struct host_buffer {
     return std::holds_alternative<std::uint8_t*>(buffer);
   }
 
-  std::variant<std::monostate, std::uint8_t*, std::span<cache::cached_chunk*>> buffer;
+  [[nodiscard]] bool is_staged() const noexcept { return needs_staging(); }
+
+  [[nodiscard]] std::span<cache::cached_chunk* const> fragments() const noexcept
+  {
+    if (!is_fragmented()) return {};
+    return std::get<std::vector<cache::cached_chunk*>>(buffer);
+  }
+
+  std::variant<std::monostate, std::uint8_t*, std::vector<cache::cached_chunk*>> buffer;
 };
 
 struct device_buffer {
   device_buffer() noexcept = default;
 
-  explicit device_buffer(std::uint8_t* dst, rmm::cuda_stream_view stream) noexcept
-    : data(dst), stream(stream)
+  explicit device_buffer(std::uint8_t* dst,
+                         rmm::cuda_stream_view stream,
+                         int device_id = -1) noexcept
+    : data(dst), stream(stream), device_id(device_id)
   {
     assert(dst != nullptr);
   }
 
   std::uint8_t* data{nullptr};
   rmm::cuda_stream_view stream;
+  int device_id{-1};
+};
+
+class prepared_io_completion final {
+ public:
+  using callback_type = exec::invocable<void(std::span<cache::cached_chunk* const>, bool) noexcept>;
+
+  template <typename Callback>
+  explicit prepared_io_completion(Callback&& callback) : _callback(std::forward<Callback>(callback))
+  {
+  }
+
+  prepared_io_completion(prepared_io_completion const&)            = delete;
+  prepared_io_completion& operator=(prepared_io_completion const&) = delete;
+
+  void operator()(std::span<cache::cached_chunk* const> chunks, bool success) noexcept
+  {
+    std::lock_guard lock(_mutex);
+    _callback(chunks, success);
+  }
+
+ private:
+  std::mutex _mutex;
+  callback_type _callback;
 };
 
 struct prepared_io_slice {
+  /// The logical caller-requested window. A reactor may widen the physical I/O
+  /// for alignment or a cached chunk's advertised fill, but device copies and
+  /// returned byte accounting remain limited to this range.
   range rng;
-  host_buffer h_buffer;  // monostate if using staged buffers
+  host_buffer h_buffer;  // monostate if using reactor-owned staging
   device_buffer d_buffer;
+  std::shared_ptr<prepared_io_completion> on_complete;
 
   prepared_io_slice() noexcept = default;
   explicit prepared_io_slice(range r, host_buffer h) noexcept : rng(r), h_buffer(std::move(h)) {}

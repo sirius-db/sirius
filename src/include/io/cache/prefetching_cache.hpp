@@ -17,22 +17,24 @@
 #pragma once
 
 #include "blockingconcurrentqueue.h"
-#include "cuda/device_copy_batch.hpp"
 #include "exec/completion_controller.hpp"
 #include "exec/invocable.hpp"
-#include "exec/scoped_dispatcher.hpp"
 #include "exec/semi_future.hpp"
-#include "exec/stream_ordered_retirer.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/cache/config.hpp"
 #include "io/cache/types.hpp"
 
+#include <cudf/io/text/byte_range_info.hpp>
+
 #include <concurrentqueue.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
+#include <span>
 #include <stop_token>
 #include <thread>
 #include <unordered_map>
@@ -42,6 +44,10 @@ namespace sirius::io {
 class ioctx;
 class sirius_datasource;
 }  // namespace sirius::io
+
+namespace sirius::cuda {
+class device_copy_batch;
+}  // namespace sirius::cuda
 
 namespace sirius::memory {
 class topology_index;
@@ -262,6 +268,8 @@ class prefetching_cache {
   }
 
  private:
+  struct cached_copy_retirement;
+
   [[nodiscard]] prefetching_handle initiate_prefetching_request(const io_object& obj,
                                                                 std::span<const byte_range> ranges,
                                                                 std::optional<int> gpu_id = {});
@@ -288,8 +296,14 @@ class prefetching_cache {
 
   [[nodiscard]] bool prepare_request(prefetch_request& req, bool wait_for_eviction = false);
 
-  [[nodiscard]] bool host_read_from_cache_only(
-    const io_object& obj, size_t offset, size_t size, uint8_t* dst, prefetching_handle* out_handle);
+  /// Resolve cache positions handle-first, then against the file-wide entry.
+  /// A partial lookup preserves every materialised position so the read planner
+  /// can mix resident, loadable, and backend-staged pieces in one dispatch.
+  [[nodiscard]] std::vector<cached_chunk*> ranges_in_cache(const io_object& obj,
+                                                           size_t offset,
+                                                           size_t size,
+                                                           coverage_policy policy,
+                                                           prefetching_handle* out_handle) const;
 
   struct file_entry {
     /// Materialise a chunk for every offset in @p incoming, fold the matching
@@ -319,64 +333,13 @@ class prefetching_cache {
     size_t chunk_size{1};
   };
 
-  /// Pin every chunk of @p chunks over the part of @p range it covers and stage
-  /// the copy to the range's device destination into @p copies, appending the
-  /// pins to @p pinned — which the caller must release only after draining the
-  /// stream the batch is issued on, since a released pin makes its chunk
-  /// evictable mid-copy.  Returns false if the range went unserved: a chunk
-  /// populated too little releases its own pins and stages nothing.
-  ///
-  /// Nothing reaches the driver here.  The caller owns @p copies across every
-  /// range of the batch and issues them in one @c cudaMemcpyBatchAsync, so a
-  /// scan's worth of column chunks costs one driver round-trip, not one each.
-  [[nodiscard]] bool copy_range_from_cache(std::span<cached_chunk* const> chunks,
-                                           const io::io_device_range& range,
-                                           std::vector<cached_chunk*>& pinned,
-                                           sirius::cuda::device_copy_batch& copies);
-
-  /// How a batch of ranges resolves against the cache: chunks pinned for a
-  /// direct copy, chunks claimed for loading, the staged copies for everything
-  /// already resident, and the IO ranges covering everything that still has to
-  /// be read.  Both chunk lists stay held until the caller retires them once the
-  /// IO and the copies have drained.
-  struct device_read_plan {
-    std::vector<cached_chunk*> pinned;
-    std::vector<cached_chunk*> loading;
-    std::vector<io::io_host_device_range> io_ranges;
-    /// Cache-resident copies for the whole batch, issued once by the caller.
-    sirius::cuda::device_copy_batch copies;
-    std::size_t served{0};
-    std::size_t hits{0};
-    std::size_t h2d{0};
-    std::size_t misses{0};
-  };
-
-  /// Classify every chunk position of @p range into @p plan: stage what is
-  /// already populated into @c plan.copies, claim what can be loaded and read it
-  /// through the chunk's own buffer, and bounce the rest through the backend.
-  void plan_device_range(std::span<cached_chunk* const> chunks,
-                         const io::io_device_range& range,
-                         device_read_plan& plan);
-
-  /// Apply a device read's outcome to its chunks once @p stream has executed
-  /// the copies: drop the read pins in @p pinned and publish (or fail) the
-  /// chunks in @p loading.
-  ///
-  /// Deferred through @ref _retirer rather than waited on.  Both lists must
-  /// stay untouched until the copies have drained — a released pin makes its
-  /// chunk evictable, and its staging buffer reusable, while the copy engines
-  /// are still reading it.
-  ///
-  /// @p host_ok — the host-side result of the read — is what decides whether
-  /// the chunks in @p loading are published or failed.  `cached` is a claim
-  /// about the pinned staging buffer, and only the host read can establish it;
-  /// the stream's completion status describes the copy out of that buffer into
-  /// the caller's device memory, which cannot invalidate its source.  A device
-  /// fault is therefore reported, not folded into the chunk state.
-  void retire_after_stream(rmm::cuda_stream_view stream,
-                           std::vector<cached_chunk*>&& pinned,
-                           std::vector<cached_chunk*>&& loading,
-                           bool host_ok) noexcept;
+  /// Enqueue @p copies and keep their cache-hit pins alive until @p stream has
+  /// passed them. The preallocated retirement also settles the cache-copy
+  /// credit in the caller's grouped coordinator, so even an all-hit read's
+  /// future waits for the asynchronous H2D work.
+  void retire_pins_after_stream(rmm::cuda_stream_view stream,
+                                sirius::cuda::device_copy_batch const& copies,
+                                std::shared_ptr<cached_copy_retirement> retirement) noexcept;
 
   /// Pop every request still sitting in @p queue and retire its producer on
   /// @c producer_stage::abandoned, so a shutdown never leaves a request parked
@@ -424,13 +387,17 @@ class prefetching_cache {
   counters _counters;
   counters_snapshot _last_reported;
 
-  /// One slot per issued prefetch IO, parked in that IO's completion so it
-  /// drops when the completion runs.  This is NOT a rate limit -- @c acquire
+  /// One slot per issued cache-backed IO, retained by its physical completion
+  /// callback until no reactor can touch cache-owned chunk state. This is NOT
+  /// a rate limit -- @c acquire
   /// never blocks, and how much read-ahead is in flight is the readahead
   /// manager's budget to set.  It exists because the completion writes through
   /// raw @c cached_chunk pointers into file entries this cache owns, so the
   /// destructor has to wait those completions out before letting them go.
   exec::completion_controller _inflight_io;
+  std::mutex _inflight_io_mtx;
+
+  [[nodiscard]] exec::completion_controller::slot acquire_inflight_io() noexcept;
 
   /// Block until every issued prefetch IO has run its completion.  Closes
   /// @ref _inflight_io, so it is a teardown step and not repeatable.
@@ -444,20 +411,10 @@ class prefetching_cache {
   mutable std::shared_mutex _map_mtx;
   std::unordered_map<std::string, std::unique_ptr<file_entry>> _file_cache;
 
-  exec::static_thread_pool _io_cb_thread_pool{
-    2, "io_cb"};  // single-threaded pool for IO completion callbacks
-  exec::scoped_dispatcher _io_cb_dispatcher{_io_cb_thread_pool, 2};
-
-  /// Retires each device read's chunk-state transitions once its stream's
-  /// completion frontier passes the copies, instead of parking a thread on a
-  /// per-read CUDA event.  Drained opportunistically by whoever is about to need
-  /// a staging buffer (@ref evict_loop, as each request arrives) or a cache hit
-  /// (the read paths); nothing polls it in steady state.
-  ///
-  /// Declared last so it is destroyed first — its lanes hand staging buffers
-  /// back to @ref _pool, which must still be alive.  @c ~prefetching_cache
-  /// quiesces it explicitly as well, so the order is not load-bearing.
-  exec::stream_ordered_retirer _retirer;
+  /// CUDA completion waits run here, never inside a CUDA stream callback. Each
+  /// task is fully scheduled before its copies are published and retains an
+  /// inflight cache slot through coordinator settlement.
+  exec::static_thread_pool _io_cb_thread_pool{2, "io_cb"};
 };
 
 }  // namespace sirius::io::cache

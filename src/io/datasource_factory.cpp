@@ -118,12 +118,8 @@ factory_type make_uring_ioctx_factory(
           "make_uring_ioctx_factory: no HOST-tier memory resource for the reactor staging");
         return nullptr;
       }
-      // One reactor_context shared by the whole pool: it carries the per-reactor
-      // config (bounce-slot size taken from the staging resource's block size)
-      // and the pinned bounce-staging resource itself.
-      auto uring_cfg        = config.uring;
-      uring_cfg.bounce_size = host_mr->get_block_size();
-      auto ctx = std::make_shared<uring::uring_reactor::reactor_context>(uring_cfg, host_mr);
+      // One reactor_context shares config and the pinned staging resource.
+      auto ctx = std::make_shared<uring::uring_reactor::reactor_context>(config.uring, host_mr);
       return std::make_shared<uring::uring_ioctx>(config.uring_n_reactors, std::move(ctx));
     } catch (const std::exception& e) {
       SIRIUS_LOG_ERROR("make_uring_ioctx_factory: construction failed: {}", e.what());
@@ -145,11 +141,8 @@ factory_type make_rest_ioctx_factory(
           "region missing); REST backend disabled");
         return nullptr;
       }
-      // Host staging is optional for REST — when absent, reactor-staged device
-      // reads are disabled (bounce_block_size 0), host reads still work.
-      auto* host_mr              = first_host_resource(reservation_manager);
-      auto rest_cfg              = config.rest;
-      rest_cfg.bounce_block_size = host_mr != nullptr ? host_mr->get_block_size() : 0;
+      auto* host_mr = first_host_resource(reservation_manager);
+      auto rest_cfg = config.rest;
       // The object store owns the endpoint and its TLS trust; the reactor's
       // curl GETs must verify against the same CA bundle / policy the authorizer
       // presigns for, so source these from object_store rather than rest config.

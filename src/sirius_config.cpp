@@ -153,7 +153,6 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
   r.optional("request_timeout_s", opt.request_timeout_s);
   r.optional("ca_bundle_path", opt.ca_bundle_path);
   r.optional("tls_verify", opt.tls_verify);
-  r.optional("max_chunk_size", yaml::bytes(opt.max_chunk_size));
   r.optional("merge_max_gap", yaml::bytes(opt.merge_max_gap));
   r.optional("upkeep_interval_ms", opt.upkeep_interval);
   r.optional("conn_max_age_s", opt.conn_max_age);
@@ -162,7 +161,6 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
   r.optional("max_retry_attempts", opt.max_retry_attempts);
   r.optional("max_auth_retry_attempts", opt.max_auth_retry_attempts);
   r.optional("honor_retry_after", opt.honor_retry_after);
-  r.optional("perf_instrumentation", opt.perf_instrumentation);
   r.optional("footer_probe_bytes", yaml::bytes(opt.footer_probe_bytes));
   r.optional("list_max_matches", opt.list_max_matches);
   r.optional("list_max_scanned", opt.list_max_scanned);
@@ -173,7 +171,6 @@ static void from_yaml(const YAML::Node& node, sirius::io::uring::config& opt)
 {
   yaml::reader r(node, "uring");
   r.optional("n_max_concurrent_scans", opt.n_max_concurrent_scans);
-  r.optional("max_n_chunks", opt.max_n_chunks);
   r.reject_unknown();
 }
 

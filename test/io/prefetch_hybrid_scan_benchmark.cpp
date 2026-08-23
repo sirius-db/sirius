@@ -27,7 +27,6 @@
 //   --nthreads N        reader/decode pool threads (and CUDA streams)
 //   --host_chunk_mib N  host memory pool block size
 //   --chunk_mib N       IO chunk size (REST: target bytes per GET before fusing)
-//   --max_n_chunks N    IO segments fused into one request
 //   --max_connections N in-flight requests per reactor (REST)
 //   --n_reactors N      reactor count (REST)
 //
@@ -219,12 +218,12 @@ void run_hybrid_scan(std::vector<file_info>& files,
       // One batched request for every column chunk this file needs, not one
       // device_read_async per range: the backend gets the whole batch in a
       // single dispatch and can fuse and order it as it sees fit.
-      std::vector<sirius::io::io_device_range> reads;
+      std::vector<sirius::io::slice> reads;
       reads.reserve(f.ranges.size());
       for (std::size_t i = 0; i < f.ranges.size(); ++i) {
-        reads.push_back(sirius::io::io_device_range{static_cast<std::size_t>(f.ranges[i].offset()),
-                                                    static_cast<std::size_t>(f.ranges[i].size()),
-                                                    static_cast<std::uint8_t*>(buffers[i].data())});
+        reads.emplace_back(static_cast<std::size_t>(f.ranges[i].offset()),
+                           static_cast<std::size_t>(f.ranges[i].size()),
+                           static_cast<std::uint8_t*>(buffers[i].data()));
       }
       f.ds->device_read_ranges_async(reads, stream.get()).get();
 
@@ -272,10 +271,9 @@ int main(int argc, char** argv)
   std::string config_path;
   std::size_t n_files = 0;
   std::string mode;  // "b" or "p"
-  std::size_t nthreads = 4;
-  std::size_t host_chunk_mib = 1;   // host memory pool block size
-  std::size_t chunk_mib      = 1;   // IO chunk size
-  std::size_t max_n_chunks   = 8;   // IO segments fused per request
+  std::size_t nthreads        = 4;
+  std::size_t host_chunk_mib  = 1;    // host memory pool block size
+  std::size_t chunk_mib       = 1;    // IO chunk size
   std::size_t max_connections = 128;  // REST only
   std::size_t n_reactors      = 8;    // REST only
 
@@ -283,7 +281,7 @@ int main(int argc, char** argv)
     std::cerr << "usage: " << argv[0]
               << " (--dir DIR | --s3 s3://BUCKET/PREFIX --config YAML) --mode <b|p>\n"
                  "       [--n_files N] [--nthreads N] [--host_chunk_mib N] [--chunk_mib N]\n"
-                 "       [--max_n_chunks N] [--max_connections N] [--n_reactors N]\n";
+                 "       [--max_connections N] [--n_reactors N]\n";
   };
 
   for (int i = 1; i < argc; ++i) {
@@ -302,8 +300,6 @@ int main(int argc, char** argv)
       nthreads = std::stoull(argv[++i]);
     } else if (arg == "--n_reactors" && i + 1 < argc) {
       n_reactors = std::stoull(argv[++i]);
-    } else if (arg == "--max_n_chunks" && i + 1 < argc) {
-      max_n_chunks = std::stoull(argv[++i]);
     } else if (arg == "--max_connections" && i + 1 < argc) {
       max_connections = std::stoull(argv[++i]);
     } else if (arg == "--host_chunk_mib" && i + 1 < argc) {
@@ -333,7 +329,7 @@ int main(int argc, char** argv)
   //
   // S3 borrows both from s3_bench::engine, which builds the REST ioctx from the
   // --config YAML — so the object_store credentials and every REST tunable
-  // (max_connections, max_n_chunks, n_max_concurrent_scans, ...) come from the
+  // (max_connections, n_max_concurrent_scans, ...) come from the
   // same file the engine itself reads.  The local path keeps its own hand-rolled
   // uring stack, whose knobs are not configurable from YAML.
   constexpr std::size_t host_region_bytes = sirius::bench::host_region_capacity_v;
@@ -345,15 +341,13 @@ int main(int argc, char** argv)
     sirius::bench::bench_options opts;
     opts.config_path     = config_path;
     opts.n_reactors      = n_reactors;
-    opts.max_n_chunks    = max_n_chunks;
     opts.max_nconnection = max_connections;
     opts.chunk_size_mib  = chunk_mib;
     opts.host_chunk_mib  = host_chunk_mib;
     // Allocate the whole host region up front so a mid-run pool growth times the
     // allocator rather than the scan.
-    opts.host_initial_pools =
-      std::max<std::size_t>(1, host_region_bytes / (sirius::bench::host_pool_size_v *
-                                                    (host_chunk_mib << 20)));
+    opts.host_initial_pools = std::max<std::size_t>(
+      1, host_region_bytes / (sirius::bench::host_pool_size_v * (host_chunk_mib << 20)));
     s3_engine = std::make_unique<sirius::bench::engine>(opts);
   } else {
     // sirius_memory_reservation_manager installs the cucascade GPU allocator as
@@ -365,21 +359,20 @@ int main(int argc, char** argv)
       .use_gpu_id_as_host_id()
       .set_per_numa_region_capacity(host_region_bytes)
       .set_reservation_fraction_per_numa_region(0.9)
-      .set_host_pool_features(host_chunk_mib << 20,
-                              1024,  // blocks per slab
-                              std::max<std::size_t>(
-                                1, host_region_bytes / (1024 * (host_chunk_mib << 20))));
+      .set_host_pool_features(
+        host_chunk_mib << 20,
+        1024,  // blocks per slab
+        std::max<std::size_t>(1, host_region_bytes / (1024 * (host_chunk_mib << 20))));
 
-    local_mgr = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
+    local_mgr =
+      std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
 
     // Bounce pool comes from the manager — no separate allocation.
     auto* host_space = local_mgr->get_memory_space(cucascade::memory::Tier::HOST, 0);
     auto* bounce_mr  = host_space->get_memory_resource_of<cucascade::memory::Tier::HOST>();
 
     auto ctx = std::make_shared<sirius::io::uring::uring_reactor::reactor_context>(
-      sirius::io::uring::uring_reactor::reactor_config_type{
-        .bounce_size = bounce_mr->get_block_size(), .max_n_chunks = max_n_chunks},
-      bounce_mr);
+      sirius::io::uring::uring_reactor::reactor_config_type{}, bounce_mr);
     local_io_ctx = std::make_shared<sirius::io::uring::uring_ioctx>(1, std::move(ctx));
     local_io_ctx->start();
   }

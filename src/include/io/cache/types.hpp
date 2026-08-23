@@ -16,9 +16,9 @@
 
 #pragma once
 
-// Shared cache entry types used by both prefetching_cache and the IO context
-// virtual interface (device_read_async_io_using).  Extracted here to break the
-// circular include between io_context.hpp and prefetching_cache.hpp.
+// Shared cache entry types used by both prefetching_cache and prepared IO
+// slices. Extracted here to keep the shared request contracts independent of
+// the cache implementation.
 
 #include "cucascade/memory/memory_reservation.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"

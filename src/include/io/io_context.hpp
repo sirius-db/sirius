@@ -21,6 +21,8 @@
 #include "io/cache/metadata_store.hpp"
 #include "io/types.hpp"
 
+#include <cudf/io/text/byte_range_info.hpp>
+
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cstddef>
@@ -31,6 +33,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace sirius::io {
@@ -74,14 +77,6 @@ namespace sirius::io {
  * threads, ...). Extend this class to provide a concrete I/O backend.
  */
 class ioctx : public std::enable_shared_from_this<ioctx> {
-  // prefetching_cache is the only caller of the vector-read entry points
-  // (host_read_ranges_async_io, and the protected
-  // host_to_device_read_ranges_async_io / supports_host_to_device_range_read)
-  // through a ioctx* base pointer.  Friending the cache lets those call sites
-  // reach in without forcing primitives that only make sense to a buffer owner
-  // into the public API.
-  friend class cache::prefetching_cache;
-
  public:
   ioctx();
   virtual ~ioctx();
@@ -152,15 +147,13 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   [[nodiscard]] virtual bool supports_host_to_device_read() const noexcept = 0;
 
   /// Whether the backend can serve a batch of host reads in a single dispatch
-  /// (cf. @c host_read_ranges_async_io).  When false, the prefetching layer
+  /// (cf. @c host_readv_async_io).  When false, the prefetching layer
   /// cannot amortise per-request overhead and must fall back to
   /// @c scan_stage::none.
   [[nodiscard]] virtual bool supports_vector_host_read() const noexcept = 0;
 
-  /// Whether the backend can serve a batch of device reads in a single dispatch.
-  /// When false, @c device_read_ranges_async_io yields a failed future — callers
-  /// that cannot require a batching backend must check this and issue one
-  /// @c device_read_async_io per range instead.
+  /// Whether the backend can efficiently serve a batch of device reads.
+  /// Backends may still process mixed slices serially when this is false.
   [[nodiscard]] virtual bool supports_device_range_read() const noexcept = 0;
 
   /// Whether this backend would rather be handed one batched request covering
@@ -291,14 +284,23 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
                                                          rmm::cuda_stream_view stream) noexcept;
 
   virtual exec::semi_future<size_t> host_readv_async_io(const io_object& obj,
-                                                        std::span<slice> slices) noexcept;
+                                                        std::span<const slice> slices) noexcept;
 
   virtual exec::semi_future<size_t> device_readv_async_io(const io_object& obj,
-                                                          std::span<slice> slices,
+                                                          std::span<const slice> slices,
                                                           rmm::cuda_stream_view stream) noexcept;
 
-  virtual exec::semi_future<size_t> host_device_readv_async_io(
+  /// The sole asynchronous backend hook. All scalar/vector host/device APIs
+  /// construct prepared slices and forward here; reactors perform physical
+  /// chunking only after queue and slot pressure are known.
+  virtual exec::semi_future<size_t> mixed_readv_async_io(
     const io_object& obj, std::vector<prepared_io_slice>&& slices) noexcept = 0;
+
+  exec::semi_future<size_t> host_device_readv_async_io(
+    const io_object& obj, std::vector<prepared_io_slice>&& slices) noexcept
+  {
+    return mixed_readv_async_io(obj, std::move(slices));
+  }
 
   bool can_use_prefetching_cache() const noexcept
   {
@@ -306,9 +308,6 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   }
 
  protected:
-  /// Whether the backend implements @c host_to_device_read_ranges_async_io.
-  [[nodiscard]] virtual bool supports_host_to_device_range_read() const noexcept = 0;
-
   /// Backend hook: open native handles / resolve metadata for @p path and
   /// return a populated io_object.  Invoked by @c open_datasource; not part of
   /// the public surface (callers receive a ready @c sirius_datasource).  Throws

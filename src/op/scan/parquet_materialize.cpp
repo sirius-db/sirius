@@ -102,12 +102,12 @@ fetched_chunks fetch_chunks(parquet_source const& src,
     out.buffers.emplace_back(static_cast<std::size_t>(range.size()), stream, mr);
   }
 
-  std::vector<io::io_device_range> reads;
+  std::vector<io::slice> reads;
   reads.reserve(ranges.size());
   for (std::size_t i = 0; i < ranges.size(); ++i) {
-    reads.push_back(io::io_device_range{static_cast<std::size_t>(ranges[i].offset()),
-                                        static_cast<std::size_t>(ranges[i].size()),
-                                        static_cast<std::uint8_t*>(out.buffers[i].data())});
+    reads.emplace_back(static_cast<std::size_t>(ranges[i].offset()),
+                       static_cast<std::size_t>(ranges[i].size()),
+                       static_cast<std::uint8_t*>(out.buffers[i].data()));
   }
 
   {
@@ -148,14 +148,14 @@ std::unique_ptr<cudf::table> materialize_bulk(
 
     CTRACK_NAME("materialize_parquet::bulk::decode");
     hybrid_scan_reader reader(*src.metadata, options);
-    auto result = reader.materialize_all_columns(
-      cudf::host_span<cudf::size_type const>(src.row_group_indices.data(),
-                                             src.row_group_indices.size()),
-      cudf::host_span<cudf::device_span<std::uint8_t const> const>(chunks.spans.data(),
-                                                                   chunks.spans.size()),
-      options,
-      stream,
-      mr);
+    auto result =
+      reader.materialize_all_columns(cudf::host_span<cudf::size_type const>(
+                                       src.row_group_indices.data(), src.row_group_indices.size()),
+                                     cudf::host_span<cudf::device_span<std::uint8_t const> const>(
+                                       chunks.spans.data(), chunks.spans.size()),
+                                     options,
+                                     stream,
+                                     mr);
     return std::move(result.tbl);
   }
 
@@ -196,11 +196,10 @@ std::unique_ptr<cudf::table> materialize_bulk(
 }
 
 /// General route: let cudf read as it decodes, over whatever sources there are.
-std::unique_ptr<cudf::table> materialize_general(
-  std::span<parquet_source const> sources,
-  cudf::io::parquet_reader_options const& options,
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr)
+std::unique_ptr<cudf::table> materialize_general(std::span<parquet_source const> sources,
+                                                 cudf::io::parquet_reader_options const& options,
+                                                 rmm::cuda_stream_view stream,
+                                                 rmm::device_async_resource_ref mr)
 {
   CTRACK_NAME("materialize_parquet::general");
 

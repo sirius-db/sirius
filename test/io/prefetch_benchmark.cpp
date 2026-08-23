@@ -281,9 +281,7 @@ int main(int argc, char** argv)
 
   // ---- io context ----------------------------------------------------------
   auto ctx = std::make_shared<sirius::io::uring::uring_reactor::reactor_context>(
-    sirius::io::uring::uring_reactor::reactor_config_type{
-      .bounce_size = bounce_mr->get_block_size(), .max_n_chunks = 1},
-    bounce_mr);
+    sirius::io::uring::uring_reactor::reactor_config_type{}, bounce_mr);
   auto io_ctx = std::make_shared<sirius::io::uring::uring_ioctx>(1, std::move(ctx));
   io_ctx->start();
 

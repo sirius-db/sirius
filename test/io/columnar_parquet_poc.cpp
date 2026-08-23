@@ -383,12 +383,12 @@ std::unique_ptr<cudf::table> columnar_parquet_parser(
       buffers.emplace_back(static_cast<std::size_t>(r.size()), stream.get(), mr);
     }
 
-    std::vector<sirius::io::io_device_range> reads;
+    std::vector<sirius::io::slice> reads;
     reads.reserve(ranges.size());
     for (std::size_t c = 0; c < ranges.size(); ++c) {
-      reads.push_back(sirius::io::io_device_range{static_cast<std::size_t>(ranges[c].offset()),
-                                                  static_cast<std::size_t>(ranges[c].size()),
-                                                  static_cast<std::uint8_t*>(buffers[c].data())});
+      reads.emplace_back(static_cast<std::size_t>(ranges[c].offset()),
+                         static_cast<std::size_t>(ranges[c].size()),
+                         static_cast<std::uint8_t*>(buffers[c].data()));
     }
 
     // The future resolves once this column's copies are enqueued on `stream`;
@@ -400,7 +400,7 @@ std::unique_ptr<cudf::table> columnar_parquet_parser(
     // `buffers` on purpose — captures are destroyed in reverse declaration
     // order, so the buffers release their stream-ordered allocations before the
     // borrowed stream goes back to the pool.
-    io_ctx->device_read_ranges_async_io(io_object, reads, stream.get())
+    io_ctx->device_readv_async_io(io_object, reads, stream.get())
       .via(&disp)
       .then_try([i,
                  &decode_metadata,
@@ -622,9 +622,7 @@ int main(int argc, char** argv)
 
   // ---- io context ----------------------------------------------------------
   auto ctx = std::make_shared<sirius::io::uring::uring_reactor::reactor_context>(
-    sirius::io::uring::uring_reactor::reactor_config_type{
-      .bounce_size = bounce_mr->get_block_size(), .max_n_chunks = 1},
-    bounce_mr);
+    sirius::io::uring::uring_reactor::reactor_config_type{}, bounce_mr);
   auto io_ctx = std::make_shared<sirius::io::uring::uring_ioctx>(1, std::move(ctx));
   io_ctx->start();
 

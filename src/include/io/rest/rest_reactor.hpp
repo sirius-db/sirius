@@ -22,13 +22,12 @@
 #include "io/rest/types.hpp"
 #include "io/types.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cudf/io/text/byte_range_info.hpp>
 
 #include <blockingconcurrentqueue.h>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 #include <atomic>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -185,81 +184,6 @@ class rest_io_object : public io_object {
 };
 
 // ---------------------------------------------------------------------------
-// rest_perf_snapshot
-// ---------------------------------------------------------------------------
-
-/// Plain-value perf counters read out of a reactor, or summed across the pool
-/// by @c rest_ioctx.  The ns totals/maxes and ttfb stay 0 unless the reactor's
-/// @c perf_instrumentation is on; retry / terminal / device-stream-sync and
-/// payload-bytes counts are populated regardless.
-struct rest_perf_snapshot {
-  std::uint64_t chunk_get_ns_total{0};
-  std::uint64_t chunk_get_count{0};
-  std::uint64_t chunk_get_ns_max{0};
-  std::uint64_t queue_wait_ns_total{0};
-  std::uint64_t queue_wait_count{0};
-  std::uint64_t ttfb_ns{0};
-  std::uint64_t h2d_observed_ns_total{0};
-  std::uint64_t h2d_observed_count{0};
-  std::uint64_t h2d_observed_ns_max{0};
-  std::uint64_t retries_total{0};
-  std::uint64_t terminal_failures_total{0};
-  std::uint64_t device_stream_sync_total{0};
-  // Always-on: HTTP response *body* bytes received (sink.total_received), summed
-  // over every completed curl attempt incl. retries / partial / failed bodies.
-  // Not TLS/header/TCP-frame bytes — this is the S3-scan payload byte budget.
-  std::uint64_t payload_bytes_read_total{0};
-  // perf_instrumentation-gated. Blocking host GETs remain part of chunk_get_*
-  // and are also attributed to blocking_host_get_*. Stash hits issue no GET and
-  // increment neither.
-  std::uint64_t blocking_host_get_count{0};
-  std::uint64_t blocking_host_get_wall_ns_total{0};
-  std::uint64_t blocking_host_get_wall_ns_max{0};
-
-  // -- always-on saturation / failure attribution --------------------------
-  // Why each submit() pass stopped feeding the multi handle.  `slot_starved`
-  // means every connection was busy (the reactor is the bottleneck);
-  // `work_starved` means the inbound queue ran dry (the *producer* is the
-  // bottleneck).  Their ratio is the primary "are we I/O bound?" signal.
-  std::uint64_t submit_slot_starved_total{0};
-  std::uint64_t submit_work_starved_total{0};
-  std::uint64_t submit_added_total{0};
-  // In-flight GETs sampled once per submit() pass -> mean concurrency =
-  // inflight_sum / inflight_samples.
-  std::uint64_t inflight_sum{0};
-  std::uint64_t inflight_samples{0};
-  std::uint64_t inflight_max{0};
-  // Wall time the reactor spent with nothing at all on the wire, against the
-  // total time its loop was running.  This is the duty cycle: a reactor that is
-  // idle half the query is not slow, it is unfed.
-  std::uint64_t loop_idle_ns_total{0};
-  std::uint64_t loop_wall_ns_total{0};
-  // Connections libcurl had to open for a transfer (CURLINFO_NUM_CONNECTS).
-  // Non-zero means the pooled connection was unusable -> TCP+TLS on the hot path.
-  std::uint64_t conn_opened_total{0};
-  // Retry attribution, by cause.
-  std::uint64_t retry_slowdown_total{0};    // 429 / 503
-  std::uint64_t retry_server_err_total{0};  // 500 / 502 / 504 / 408
-  std::uint64_t retry_transport_total{0};   // curl transport error
-  std::uint64_t retry_short_read_total{0};  // 206 with a truncated body
-  std::uint64_t retry_auth_total{0};        // 403, presigned URL expired
-  std::uint64_t retry_delay_ns_total{0};    // summed backoff actually scheduled
-  // libcurl's own phase timings, summed over completed transfers
-  // (perf_instrumentation-gated; needs one getinfo call per completion).
-  std::uint64_t curl_dns_ns_total{0};
-  std::uint64_t curl_connect_ns_total{0};
-  std::uint64_t curl_tls_ns_total{0};
-  std::uint64_t curl_ttfb_ns_total{0};
-  std::uint64_t curl_total_ns_total{0};
-  std::uint64_t curl_timed_count{0};
-};
-
-/// How @c prep_host_rx_request attributes the resulting GETs in the perf
-/// snapshot: a @c blocking read (synchronous host_read) is counted in
-/// blocking_host_get_* in addition to chunk_get_*.
-enum class host_read_attribution : std::uint8_t { async_chunk, blocking };
-
-// ---------------------------------------------------------------------------
 // rest_reactor
 // ---------------------------------------------------------------------------
 
@@ -267,8 +191,8 @@ enum class host_read_attribution : std::uint8_t { async_chunk, blocking };
  * @brief Single-threaded I/O reactor for RESTful object storage (s3://...).
  *
  * Owns one worker thread driving a libcurl multi handle over an epoll event
- * loop (curl_multi_socket_action), a pool of reusable easy handles, optional
- * pinned bounce slots for device staging, a timerfd + min-heap retry
+ * loop (curl_multi_socket_action), a pool of reusable easy handles, dynamic
+ * CuCascade staging for device reads, a timerfd + min-heap retry
  * scheduler, and an MPSC request queue.  Models the reactor concept consumed
  * by @c templated_ioctx.  Presigned GET/HEAD URLs come from a
  * @c request_authorizer, re-issued on every attempt.
@@ -315,8 +239,6 @@ class rest_reactor {
   };
 
   using io_object_type       = rest_io_object;
-  using request_type         = rest_rx_request;
-  using request_type_ptr     = std::unique_ptr<rest_rx_request>;
   using reactor_config_type  = config;
   using reactor_context_type = reactor_context;
 
@@ -333,49 +255,16 @@ class rest_reactor {
   /// in separately.
   [[nodiscard]] const reactor_config_type& get_config() const noexcept { return _config; }
 
-  // -- request preparation (static: build chunk descriptions) --------------
-
-  static std::vector<prepared_io_slice> prep_host_rx_request(const reactor_config_type& cfg,
-                                                             const io_object_type& file,
-                                                             const slice& segment);
-
-  static std::vector<prepared_io_slice> prep_device_rx_request(const reactor_config_type& cfg,
-                                                               const io_object_type& file,
-                                                               const slice& segment,
-                                                               rmm::cuda_stream_view stream,
-                                                               int device_id);
-
-  /// Vectored form of @c prep_device_rx_request: read N logical ranges in one
-  /// request, each into its own device destination.  Every range is clamped to
-  /// the file, aligned outward for O_DIRECT, and split into @c cfg.bounce_size
-  /// windows staged through the reactor's internal bounce slots.
-  static std::vector<prepared_io_slice> prep_device_rxv_request(const reactor_config_type& cfg,
-                                                                const io_object_type& file,
-                                                                std::span<const slice> ranges,
-                                                                rmm::cuda_stream_view stream,
-                                                                int device_id);
-
-  /// Vectored form of @c prep_device_rx_request: read N logical ranges in one
-  /// request, each into its own device destination.  Every range is clamped to
-  /// the file, aligned outward for O_DIRECT, and split into @c cfg.bounce_size
-  /// windows staged through the reactor's internal bounce slots.
-  static std::vector<prepared_io_slice> prep_host_rxv_request(const reactor_config_type& cfg,
-                                                              const io_object_type& file,
-                                                              std::span<const slice> ranges,
-                                                              int device_id);
-
   // -- dispatch / lifecycle ------------------------------------------------
 
-  /// Allocate the pinned bounce slots and launch the worker thread.  Split out
-  /// of the constructor so a reactor can be built cheaply (it only copies its
-  /// config and creates its wakeup fd) and parked until it is actually needed —
-  /// see @c ioctx::start.  Idempotent: a second call (while the worker is
-  /// already running) is a no-op.
+  /// Launch the worker thread. Split out of the constructor so a reactor can be
+  /// built cheaply and parked until it is actually needed. Idempotent while
+  /// running; shutdown is terminal and a later start is ignored.
   void start();
 
-  void enqueue(request_type_ptr req);
+  void enqueue(std::unique_ptr<grouped_io_request> req) noexcept;
   void interrupt();
-  void shutdown();
+  void shutdown() noexcept;
 
   /// Bytes of queued-but-not-yet-submitted work — the reactor's backlog, and the
   /// signal @c rest_ioctx::next_reactor balances dispatch against.  Counts only
@@ -429,21 +318,10 @@ class rest_reactor {
   /// body on HTTP 200.  @p canonical_query is the pre-encoded, key-sorted
   /// request query (no auth params — authorization is added via
   /// @c authorize_list).  @p prefix is only for retry-log / error text.
-  /// Control-plane op: retries/terminals are counted (and retries WARN-logged)
-  /// like every retry loop here, but the XML body never touches the
-  /// chunk-GET / payload byte counters.
+  /// Control-plane op: transient failures are retried and WARN-logged.
   std::string list_page(std::string_view bucket,
                         std::string_view prefix,
                         std::string_view canonical_query);
-
-  /// Snapshot of this reactor's perf counters.  Lock-free (relaxed atomic
-  /// loads); safe to call while the reactor is running.
-  [[nodiscard]] rest_perf_snapshot perf_snapshot() const noexcept;
-
-  /// Zero every perf counter.  Racy by construction (the worker keeps counting
-  /// while this runs), so it is only for per-query deltas in observability
-  /// dumps — never for anything correctness-bearing.
-  void reset_perf() noexcept;
 
   // -- capabilities / factory ----------------------------------------------
 
@@ -464,21 +342,12 @@ class rest_reactor {
  private:
   void worker_loop(const std::stop_token& stop_token);
 
-  /// Enqueue a batch of chunks with a single wake notification.
-  void enqueue_chunks(std::span<std::unique_ptr<rest_chunked_rx_request>> batch);
-
   // Shared services + tunables for the whole reactor pool; kept alive for this
   // reactor's lifetime (the authorizer is used on every request).
   std::shared_ptr<reactor_context> _ctx;
   config _config;  // copy of _ctx->cfg() for hot-path access
   // Thread name prefix captured at construction; applied to the worker in start().
   std::string _tname;
-  std::size_t _bounce_slot_size{0};
-
-  // Keeps the bounce-slot blocks alive for the reactor's lifetime; the
-  // allocation handle returns the blocks to the upstream resource when the
-  // reactor is destroyed.  Null when no host_memory_resource is set.
-  cucascade::memory::fixed_multiple_blocks_allocation _bounce_storage;
 
   // Set by warmup() on a caller thread, consumed by the worker at the top of a
   // pass.  The bucket is guarded because a std::string is not atomically
@@ -487,61 +356,20 @@ class rest_reactor {
   std::mutex _warm_mtx;
   std::string _warm_bucket;
 
-  // Cross-thread wakeup: written by enqueue()/interrupt() and the CUDA
-  // copy-completion callback to break the worker out of epoll_wait.
+  // Cross-thread wakeup: written by enqueue()/interrupt() to break the worker
+  // out of epoll_wait.
   file_descriptor _wakeup_fd;
 
   std::stop_source _stop_source;
-  duckdb_moodycamel::BlockingConcurrentQueue<std::unique_ptr<rest_chunked_rx_request>> _requests;
+  duckdb_moodycamel::BlockingConcurrentQueue<std::unique_ptr<grouped_io_request>> _requests;
+  mutable std::mutex _enqueue_mutex;
+  bool _running{false};
+  bool _accepting{false};
+  bool _stopped{false};
 
-  // Byte depth of _requests: added by the enqueuing thread, subtracted by the
-  // worker as it dequeues.  See queued_bytes().
+  // Logical bytes not yet assigned to a curl slot. Retries are already claimed
+  // work and therefore never get counted a second time.
   std::atomic<std::size_t> _queued_bytes{0};
-
-  // Instrumentation counters, owned by the reactor (not worker_loop locals) so
-  // rest_ioctx can read them cross-thread.  Micro timings are stamped only under
-  // perf_instrumentation; retries/terminal/device_stream_sync/payload_bytes are
-  // always-on.
-  struct perf_counters {
-    std::atomic<std::uint64_t> chunk_get_ns_total{0};
-    std::atomic<std::uint64_t> chunk_get_count{0};
-    std::atomic<std::uint64_t> chunk_get_ns_max{0};
-    std::atomic<std::uint64_t> queue_wait_ns_total{0};
-    std::atomic<std::uint64_t> queue_wait_count{0};
-    std::atomic<std::uint64_t> ttfb_ns{0};
-    std::atomic<std::uint64_t> h2d_observed_ns_total{0};
-    std::atomic<std::uint64_t> h2d_observed_count{0};
-    std::atomic<std::uint64_t> h2d_observed_ns_max{0};
-    std::atomic<std::uint64_t> retries_total{0};
-    std::atomic<std::uint64_t> terminal_failures_total{0};
-    std::atomic<std::uint64_t> device_stream_sync_total{0};
-    std::atomic<std::uint64_t> payload_bytes_read_total{0};
-    std::atomic<std::uint64_t> blocking_host_get_count{0};
-    std::atomic<std::uint64_t> blocking_host_get_wall_ns_total{0};
-    std::atomic<std::uint64_t> blocking_host_get_wall_ns_max{0};
-    std::atomic<std::uint64_t> submit_slot_starved_total{0};
-    std::atomic<std::uint64_t> submit_work_starved_total{0};
-    std::atomic<std::uint64_t> submit_added_total{0};
-    std::atomic<std::uint64_t> inflight_sum{0};
-    std::atomic<std::uint64_t> inflight_samples{0};
-    std::atomic<std::uint64_t> inflight_max{0};
-    std::atomic<std::uint64_t> loop_idle_ns_total{0};
-    std::atomic<std::uint64_t> loop_wall_ns_total{0};
-    std::atomic<std::uint64_t> conn_opened_total{0};
-    std::atomic<std::uint64_t> retry_slowdown_total{0};
-    std::atomic<std::uint64_t> retry_server_err_total{0};
-    std::atomic<std::uint64_t> retry_transport_total{0};
-    std::atomic<std::uint64_t> retry_short_read_total{0};
-    std::atomic<std::uint64_t> retry_auth_total{0};
-    std::atomic<std::uint64_t> retry_delay_ns_total{0};
-    std::atomic<std::uint64_t> curl_dns_ns_total{0};
-    std::atomic<std::uint64_t> curl_connect_ns_total{0};
-    std::atomic<std::uint64_t> curl_tls_ns_total{0};
-    std::atomic<std::uint64_t> curl_ttfb_ns_total{0};
-    std::atomic<std::uint64_t> curl_total_ns_total{0};
-    std::atomic<std::uint64_t> curl_timed_count{0};
-  };
-  perf_counters _perf;
 
   std::jthread _worker;
 };

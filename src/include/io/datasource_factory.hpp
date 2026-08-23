@@ -132,8 +132,8 @@ class io_context_registry {
 io_context_registry::factory_type make_kvikio_ioctx_factory();
 
 /// io_uring local-disk backend.  Builds a @c uring_reactor::reactor_context from
-/// @c config.uring (bounce-slot size taken from the HOST-tier resource's block
-/// size) and @c config.uring_n_reactors.
+/// @c config.uring and @c config.uring_n_reactors. Pinned staging uses the
+/// HOST-tier resource block size; physical grouping is chosen by the worker.
 io_context_registry::factory_type make_uring_ioctx_factory(
   cucascade::memory::memory_reservation_manager& reservation_manager);
 

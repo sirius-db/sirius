@@ -73,8 +73,8 @@ struct bench_options {
   std::size_t per_file_gib{1};       ///< GB of data to read per file (random segments)
   std::size_t repeat{3};
 
-  /// Target GET size in MiB. Each aligned chunk of this size becomes one GET
-  /// (rest.max_n_chunks is forced to 1 so no fusing occurs).
+  /// Logical request size in MiB. The REST reactor may split a logical request
+  /// further according to its current connection availability and backlog.
   std::size_t chunk_size_mib{1};
 
   /// Exact GET size in bytes, overriding @c chunk_size_mib when non-zero.  For
@@ -88,19 +88,9 @@ struct bench_options {
   /// Number of REST reactor instances.
   std::size_t n_reactors{1};
 
-  /// Record the reactor's per-chunk micro timings (ttfb, queue wait, GET wall
-  /// time).  Costs a couple of atomics per GET; worth it for a benchmark that
-  /// feeds the measured latency back into its own model.
-  bool perf_instrumentation{false};
-
   /// Share of each GPU's memory the pool may use.  Only matters for benchmarks
   /// that allocate device memory; raw-throughput ones can leave it alone.
   double gpu_usage_ratio{0.5};
-
-  /// How many chunk_size-aligned segments may fuse into one GET.  The default of
-  /// 1 disables fusing, which is what a throughput benchmark wants (GET size
-  /// then equals chunk_size); a benchmark measuring a real scan wants it higher.
-  std::size_t max_n_chunks{1};
 
   /// Host pinned pool slabs allocated up front.  host_pool_size_v blocks each,
   /// so initial bytes = host_initial_pools * host_pool_size_v * host_block_bytes().
@@ -291,13 +281,8 @@ class engine {
     if (!opts.secret_key.empty()) { cfg.object_store.secret_key = opts.secret_key; }
     if (!opts.session_token.empty()) { cfg.object_store.session_token = opts.session_token; }
 
-    cfg.rest.max_connections      = opts.max_nconnection;
-    cfg.rest.chunk_size           = opts.chunk_bytes();
-    cfg.rest_n_reactors           = opts.n_reactors;
-    cfg.rest.perf_instrumentation = opts.perf_instrumentation;
-    // Default 1: each chunk_size-aligned segment becomes exactly one GET with
-    // no fusing, so chunk_size == GET size == staging block size.
-    cfg.rest.max_n_chunks = opts.max_n_chunks;
+    cfg.rest.max_connections = opts.max_nconnection;
+    cfg.rest_n_reactors      = opts.n_reactors;
 
     cfg.cache.mode = io::cache::cache_mode::none;
     cfg.apply_cache_mode();

@@ -41,22 +41,25 @@ namespace sirius::io {
 
 namespace {
 
-// Bridge a semi_future into a real (promise-backed) std::future.  The result is
-// pushed in via install_callback when the IO settles, so the std::future
-// reports readiness normally (wait_for never returns `deferred`) and the
-// completion bookkeeping runs on the IO callback thread rather than being
-// pulled onto the caller's thread the way std::async(deferred) would.
-std::future<size_t> bridge_semi_to_std(exec::semi_future<size_t>&& sf)
+// Bridge a semi_future into a real (promise-backed) std::future. Promise,
+// std::future, and the exact type-erased terminal are all built before
+// producer() may publish IO, so callback installation is a move-only,
+// non-allocating handoff.
+template <typename Producer>
+std::future<size_t> bridge_semi_to_std(Producer&& producer)
 {
-  auto p   = std::make_shared<std::promise<size_t>>();
-  auto fut = p->get_future();
-  std::move(sf).install_callback([p = std::move(p)](exec::try_t<size_t>&& t) mutable {
+  auto p              = std::make_shared<std::promise<size_t>>();
+  auto fut            = p->get_future();
+  using terminal_type = exec::invocable<void(exec::try_t<size_t>&&) &&>;
+  terminal_type terminal{[p = std::move(p)](exec::try_t<size_t>&& t) mutable {
     if (t.has_exception()) {
       p->set_exception(std::move(t).exception());
     } else {
       p->set_value(std::move(t).value());
     }
-  });
+  }};
+  auto sf = std::forward<Producer>(producer)();
+  std::move(sf).install_callback(std::move(terminal));
   return fut;
 }
 
@@ -101,11 +104,12 @@ bool sirius_datasource::is_device_read_preferred(size_t) const
 
 size_t sirius_datasource::host_read(size_t offset, size_t size, uint8_t* dst)
 {
+  await_inflight_prefetch();
   if (uses_prefetching_cache()) {
     auto* cache = _io_ctx->cache();
     return cache->host_read(*_io_object, offset, size, dst, &_prefetch_handle);
   }
-  return _io_ctx->host_read_io(*_io_object, offset, size, dst);
+  return std::move(_io_ctx->host_read_async_io(*_io_object, offset, size, dst)).get();
 }
 
 std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::host_read(size_t offset,
@@ -119,14 +123,14 @@ std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::host_read(size_
 
 std::future<size_t> sirius_datasource::host_read_async(size_t offset, size_t size, uint8_t* dst)
 {
-  exec::semi_future<size_t> semi;
-  if (uses_prefetching_cache()) {
-    auto* cache = _io_ctx->cache();
-    semi        = cache->host_read_async(*_io_object, offset, size, dst, &_prefetch_handle);
-  } else {
-    semi = _io_ctx->host_read_async_io(*_io_object, offset, size, dst);
-  }
-  return bridge_semi_to_std(std::move(semi));
+  await_inflight_prefetch();
+  return bridge_semi_to_std([&] {
+    if (uses_prefetching_cache()) {
+      auto* cache = _io_ctx->cache();
+      return cache->host_read_async(*_io_object, offset, size, dst, &_prefetch_handle);
+    }
+    return _io_ctx->host_read_async_io(*_io_object, offset, size, dst);
+  });
 }
 
 std::future<std::unique_ptr<cudf::io::datasource::buffer>> sirius_datasource::host_read_async(
@@ -171,28 +175,38 @@ std::future<size_t> sirius_datasource::device_read_async(size_t offset,
 {
   CTRACK_NAME("ds::device_read_async");
   await_inflight_prefetch();
-  exec::semi_future<size_t> semi;
-  if (uses_prefetching_cache()) {
-    auto* cache = _io_ctx->cache();
-    semi = cache->device_read_async(*_io_object, offset, size, dst, stream, &_prefetch_handle);
-  } else {
-    semi = _io_ctx->device_read_async_io(*_io_object, offset, size, dst, stream);
-  }
-  return bridge_semi_to_std(std::move(semi));
+  return bridge_semi_to_std([&] {
+    if (uses_prefetching_cache()) {
+      auto* cache = _io_ctx->cache();
+      return cache->device_read_async(*_io_object, offset, size, dst, stream, &_prefetch_handle);
+    }
+    return _io_ctx->device_read_async_io(*_io_object, offset, size, dst, stream);
+  });
 }
 
-std::future<size_t> sirius_datasource::device_read_ranges_async(
-  std::span<const io_device_range> ranges, rmm::cuda_stream_view stream)
+std::future<size_t> sirius_datasource::device_read_ranges_async(std::span<const slice> ranges,
+                                                                rmm::cuda_stream_view stream)
 {
   await_inflight_prefetch();
-  exec::semi_future<size_t> semi;
-  if (uses_prefetching_cache()) {
-    auto* cache = _io_ctx->cache();
-    semi        = cache->device_read_ranges_async(*_io_object, ranges, stream, &_prefetch_handle);
-  } else {
-    semi = _io_ctx->device_read_ranges_async_io(*_io_object, ranges, stream);
-  }
-  return bridge_semi_to_std(std::move(semi));
+  return bridge_semi_to_std([&] {
+    if (uses_prefetching_cache()) {
+      auto* cache = _io_ctx->cache();
+      return cache->device_read_ranges_async(*_io_object, ranges, stream, &_prefetch_handle);
+    }
+    return _io_ctx->device_readv_async_io(*_io_object, ranges, stream);
+  });
+}
+
+std::future<size_t> sirius_datasource::host_read_ranges_async(std::span<const slice> ranges)
+{
+  await_inflight_prefetch();
+  return bridge_semi_to_std([&] {
+    if (uses_prefetching_cache()) {
+      auto* cache = _io_ctx->cache();
+      return cache->host_read_ranges_async(*_io_object, ranges, &_prefetch_handle);
+    }
+    return _io_ctx->host_readv_async_io(*_io_object, ranges);
+  });
 }
 
 std::unique_ptr<sirius_datasource> sirius_datasource::duplicate() const

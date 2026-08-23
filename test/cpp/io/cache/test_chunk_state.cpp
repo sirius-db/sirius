@@ -15,8 +15,11 @@
  */
 
 #include "catch.hpp"
+#include "exec/completion_controller.hpp"
 #include "io/cache/types.hpp"
+#include "io/types.hpp"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <random>
@@ -540,6 +543,7 @@ TEST_CASE("concurrent pins and subscriber churn leave a consistent word",
       }
     });
   }
+
   for (auto& w : workers) {
     w.join();
   }
@@ -549,4 +553,76 @@ TEST_CASE("concurrent pins and subscriber churn leave a consistent word",
   CHECK(snap.pins() == 0);
   CHECK(snap.subscribers() == 0);
   CHECK(snap.fill() == chunk_fill::whole());
+}
+
+TEST_CASE("prepared cache completion publishes only its exact physical segment",
+          "[cache][completion]")
+{
+  cached_chunk succeeded;
+  cached_chunk failed;
+  cached_chunk pending;
+
+  auto make_loading = [](cached_chunk& chunk) {
+    REQUIRE(chunk.state.mark_queued());
+    REQUIRE(chunk.state.mark_allocated());
+    chunk_fill fill;
+    REQUIRE(chunk.state.take_loading_merging(chunk_fill::whole(), fill));
+  };
+  make_loading(succeeded);
+  make_loading(failed);
+  make_loading(pending);
+
+  auto completion = std::make_shared<sirius::io::prepared_io_completion>(
+    [](std::span<cached_chunk* const> completed, bool host_ok) noexcept {
+      for (auto* chunk : completed) {
+        std::ignore = host_ok ? chunk->state.mark_cached() : chunk->state.mark_load_failed();
+      }
+    });
+
+  std::array<cached_chunk*, 1> first{&succeeded};
+  (*completion)(first, true);
+  CHECK(succeeded.state.get_state() == chunk_state::cached);
+  CHECK(failed.state.get_state() == chunk_state::loading);
+  CHECK(pending.state.get_state() == chunk_state::loading);
+
+  std::array<cached_chunk*, 1> second{&failed};
+  (*completion)(second, false);
+  CHECK(succeeded.state.get_state() == chunk_state::cached);
+  CHECK(failed.state.get_state() == chunk_state::allocated);
+  CHECK(pending.state.get_state() == chunk_state::loading);
+
+  // A device-copy failure reports host_ok=true: the host cache source remains
+  // valid and is published even though the request coordinator reports error.
+  std::array<cached_chunk*, 1> third{&pending};
+  (*completion)(third, true);
+  CHECK(pending.state.get_state() == chunk_state::cached);
+}
+
+TEST_CASE("cache callback lifetime holds teardown admission through callback ownership",
+          "[cache][completion][lifetime]")
+{
+  sirius::exec::completion_controller inflight;
+  std::atomic<bool> drained{false};
+  std::atomic<bool> invoked{false};
+  auto subscription = inflight.on_completion([&drained] { drained.store(true); });
+  auto lifetime = std::make_shared<sirius::exec::completion_controller::slot>(inflight.acquire());
+
+  auto completion = std::make_shared<sirius::io::prepared_io_completion>(
+    [lifetime = std::move(lifetime), &invoked](std::span<cached_chunk* const>, bool) noexcept {
+      std::ignore = lifetime;
+      invoked.store(true);
+    });
+
+  inflight.close();
+  CHECK_FALSE(drained.load());
+
+  (*completion)({}, true);
+  CHECK(invoked.load());
+  CHECK_FALSE(drained.load());
+
+  // The completion may be shared by several physical operations. Teardown is
+  // released only when the final callback owner disappears, not after the
+  // first invocation returns.
+  completion.reset();
+  CHECK(drained.load());
 }

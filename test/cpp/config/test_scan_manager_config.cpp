@@ -471,13 +471,15 @@ TEST_CASE("sirius_config rejects the removed use_sirius_datasource key",
   CHECK_THROWS(cfg.load_from_file(yaml.path()));
 }
 
-TEST_CASE("sirius_config reads the uring sub-config", "[scan_manager][config][backend]")
+TEST_CASE("sirius_config rejects the removed uring max_n_chunks key",
+          "[scan_manager][config][backend]")
 {
-  auto const cfg = load_scan_manager("sirius_uring_node.yaml",
-                                     scan_manager_yaml("      uring:\n"
-                                                       "        max_n_chunks: 4\n"));
+  scoped_yaml yaml("sirius_uring_removed_key.yaml",
+                   scan_manager_yaml("      uring:\n"
+                                     "        max_n_chunks: 4\n"));
 
-  CHECK(cfg.uring.max_n_chunks == 4);
+  sirius::sirius_config cfg;
+  CHECK_THROWS(cfg.load_from_file(yaml.path()));
 }
 
 TEST_CASE("sirius_config rejects the removed REST max_read_split key",

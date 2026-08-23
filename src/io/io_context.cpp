@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <exception>
 #include <memory>
+#include <stdexcept>
 #include <utility>
 
 namespace sirius::io {
@@ -100,8 +101,14 @@ exec::semi_future<size_t> ioctx::host_read_async_io(const io_object& obj,
                                                     size_t size,
                                                     uint8_t* dst) noexcept
 {
-  std::vector<prepared_io_slice> slices{prepared_io_slice{range{offset, size}, host_buffer{dst}}};
-  return host_device_readv_async_io(obj, std::move(slices));
+  if (size == 0) return exec::make_semi_future<size_t>(0);
+  try {
+    if (dst == nullptr) throw std::invalid_argument("host read destination is null");
+    std::vector<prepared_io_slice> slices{prepared_io_slice{range{offset, size}, host_buffer{dst}}};
+    return host_device_readv_async_io(obj, std::move(slices));
+  } catch (...) {
+    return exec::make_semi_future<size_t>(std::current_exception());
+  }
 }
 
 exec::semi_future<size_t> ioctx::device_read_async_io(const io_object& obj,
@@ -110,34 +117,54 @@ exec::semi_future<size_t> ioctx::device_read_async_io(const io_object& obj,
                                                       uint8_t* dst,
                                                       rmm::cuda_stream_view stream) noexcept
 {
-  std::vector<prepared_io_slice> slices{
-    prepared_io_slice{range{offset, size}, device_buffer{dst, stream}}};
-  return host_device_readv_async_io(obj, std::move(slices));
+  if (size == 0) return exec::make_semi_future<size_t>(0);
+  try {
+    if (dst == nullptr) throw std::invalid_argument("device read destination is null");
+    std::vector<prepared_io_slice> slices{
+      prepared_io_slice{range{offset, size}, device_buffer{dst, stream}}};
+    return host_device_readv_async_io(obj, std::move(slices));
+  } catch (...) {
+    return exec::make_semi_future<size_t>(std::current_exception());
+  }
 }
 
 exec::semi_future<size_t> ioctx::host_readv_async_io(const io_object& obj,
-                                                     std::span<slice> slices) noexcept
+                                                     std::span<const slice> slices) noexcept
 {
-  std::vector<prepared_io_slice> prepared_slices;
-  prepared_slices.reserve(slices.size());
-  std::transform(
-    slices.begin(), slices.end(), std::back_inserter(prepared_slices), [](const slice& s) {
-      return prepared_io_slice{range{s.offset(), s.size()}, host_buffer{s.dst}};
-    });
-  return host_device_readv_async_io(obj, std::move(prepared_slices));
+  if (slices.empty()) return exec::make_semi_future<size_t>(0);
+  try {
+    std::vector<prepared_io_slice> prepared_slices;
+    prepared_slices.reserve(slices.size());
+    for (auto const& current : slices) {
+      if (current.size() == 0) continue;
+      if (current.dst == nullptr) throw std::invalid_argument("host readv destination is null");
+      prepared_slices.emplace_back(range{current.offset(), current.size()},
+                                   host_buffer{current.dst});
+    }
+    return host_device_readv_async_io(obj, std::move(prepared_slices));
+  } catch (...) {
+    return exec::make_semi_future<size_t>(std::current_exception());
+  }
 }
 
 exec::semi_future<size_t> ioctx::device_readv_async_io(const io_object& obj,
-                                                       std::span<slice> slices,
+                                                       std::span<const slice> slices,
                                                        rmm::cuda_stream_view stream) noexcept
 {
-  std::vector<prepared_io_slice> prepared_slices;
-  prepared_slices.reserve(slices.size());
-  std::transform(
-    slices.begin(), slices.end(), std::back_inserter(prepared_slices), [stream](const slice& s) {
-      return prepared_io_slice{range{s.offset(), s.size()}, device_buffer{s.dst, stream}};
-    });
-  return host_device_readv_async_io(obj, std::move(prepared_slices));
+  if (slices.empty()) return exec::make_semi_future<size_t>(0);
+  try {
+    std::vector<prepared_io_slice> prepared_slices;
+    prepared_slices.reserve(slices.size());
+    for (auto const& current : slices) {
+      if (current.size() == 0) continue;
+      if (current.dst == nullptr) throw std::invalid_argument("device readv destination is null");
+      prepared_slices.emplace_back(range{current.offset(), current.size()},
+                                   device_buffer{current.dst, stream});
+    }
+    return host_device_readv_async_io(obj, std::move(prepared_slices));
+  } catch (...) {
+    return exec::make_semi_future<size_t>(std::current_exception());
+  }
 }
 
 }  // namespace sirius::io

@@ -145,8 +145,8 @@ class kvikio_remote_io_object final : public kvikio_object {
  *
  * LIST / glob is NOT served here: it stays on the REST backend.
  *
- * It implements the protected @c _io primitives (not the public read API); the
- * base class's public reads route through them.
+ * It implements synchronous host I/O plus the shared `mixed_readv_async_io`
+ * hook eagerly; the base scalar and vector wrappers construct prepared slices.
  *
  * Capabilities:
  *   - @c supports_device_read: true (kvikIO reads into device memory, via GDS
@@ -210,41 +210,11 @@ class kvikio_context final : public ioctx {
 
   size_t host_read_io(const io_object& obj, size_t offset, size_t size, uint8_t* dst) final;
 
-  exec::semi_future<size_t> host_read_async_io(const io_object& obj,
-                                               size_t offset,
-                                               size_t size,
-                                               uint8_t* dst) noexcept final;
-
-  /// @note Stream ordering holds only for LOCAL objects (@c FileHandle
-  ///       @c read_async on @p stream); a remote object falls back to a
-  ///       blocking host-bounced read, so @p stream is unused there.
-  exec::semi_future<size_t> device_read_async_io(const io_object& obj,
-                                                 size_t offset,
-                                                 size_t size,
-                                                 uint8_t* dst,
-                                                 rmm::cuda_stream_view stream) noexcept final;
-
-  /// Unsupported: kvikIO has no bounce-staged host->device path here.  Returns
-  /// a failed future rather than misbehaving silently.
-  exec::semi_future<size_t> host_to_device_read_async_io(
-    const io_object& obj,
-    std::span<io_object_segment> slices,
-    size_t offset,
-    size_t size,
-    uint8_t* device_dst,
-    rmm::cuda_stream_view stream) noexcept final;
-
-  /// Unsupported: no batched dispatch (hence @c supports_vector_host_read()
-  /// is false and the prefetching cache stays unarmed).
-  exec::semi_future<size_t> host_read_ranges_async_io(
-    const io_object& obj, std::span<io_object_segment> segments) noexcept final;
-
-  /// Unsupported: no batched dispatch.  Callers issue one
-  /// @c device_read_async_io per range instead.
-  exec::semi_future<size_t> device_read_ranges_async_io(
-    const io_object& obj,
-    std::span<const io_device_range> ranges,
-    rmm::cuda_stream_view stream) noexcept final;
+  /// KvikIO has no reactor queue, so it consumes prepared slices eagerly.
+  /// This is the backend's only asynchronous hook; the base scalar/vector
+  /// wrappers all forward here.
+  exec::semi_future<size_t> mixed_readv_async_io(
+    const io_object& obj, std::vector<prepared_io_slice>&& slices) noexcept final;
 
   /// The config this context was built with (default-constructed when none was
   /// supplied).  Only @c compat_mode is still consulted after construction; the
@@ -255,14 +225,6 @@ class kvikio_context final : public ioctx {
   [[nodiscard]] object_store_config const& object_store() const noexcept { return _object_store; }
 
  protected:
-  /// Unsupported: kvikIO has no bounce-staged host->device path here.
-  exec::semi_future<size_t> host_to_device_read_ranges_async_io(
-    const io_object& obj,
-    std::span<const io_host_device_range> ranges,
-    rmm::cuda_stream_view stream) noexcept final;
-
-  [[nodiscard]] bool supports_host_to_device_range_read() const noexcept final { return false; }
-
   /// Backend hook invoked by @c ioctx::open_datasource: open @p path with
   /// kvikIO and record its size.  An @c s3:// path builds a signed
   /// @c RemoteHandle from @ref object_store (throwing when the store is not

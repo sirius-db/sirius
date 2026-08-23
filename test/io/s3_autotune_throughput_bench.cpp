@@ -29,7 +29,7 @@
 // IO is gated by --npread: a counting semaphore starts with --npread permits,
 // ONE FILE at a time is registered per acquired permit -- every one of that
 // file's ranges (already coalesced and chunked by the model) goes out in a
-// single batched host_read_ranges_async_io call, and the permit is only
+// single batched host_readv_async_io call, and the permit is only
 // released once every range of that file has completed.  So --npread is
 // "how many files are being actively read at once", not a per-range knob:
 // acquiring a permit for a file with 400 coalesced ranges puts all 400 on the
@@ -72,20 +72,20 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
-#include <fstream>
 #include <format>
+#include <fstream>
+#include <functional>
 #include <iostream>
 #include <latch>
 #include <map>
 #include <memory>
 #include <optional>
 #include <semaphore>
-#include <sstream>
 #include <span>
-#include <functional>
+#include <sstream>
 #include <stdexcept>
-#include <thread>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -119,8 +119,9 @@ constexpr std::size_t gib_v = 1UL << 30;
 /// line, until the returned jthread is destroyed (its destructor requests stop
 /// and joins, so a caller only has to let it go out of scope) -- a final call
 /// to @p line() lands with a trailing newline so later output starts clean.
-[[nodiscard]] std::jthread progress_reporter(std::function<std::string()> line,
-                                             std::chrono::milliseconds interval = std::chrono::milliseconds{500})
+[[nodiscard]] std::jthread progress_reporter(
+  std::function<std::string()> line,
+  std::chrono::milliseconds interval = std::chrono::milliseconds{500})
 {
   return std::jthread([line = std::move(line), interval](std::stop_token st) {
     while (!st.stop_requested()) {
@@ -207,7 +208,9 @@ namespace plan_json {
 
 void skip_ws(std::string_view s, std::size_t& i)
 {
-  while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) { ++i; }
+  while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) {
+    ++i;
+  }
 }
 
 std::string parse_string(std::string_view s, std::size_t& i)
@@ -326,9 +329,11 @@ table_columns load(std::string const& path, std::size_t query)
   std::string const text = buf.str();
 
   std::string_view s = text;
-  std::size_t i       = 0;
+  std::size_t i      = 0;
   skip_ws(s, i);
-  if (i >= s.size() || s[i] != '{') { throw std::runtime_error(path + ": expected top-level object"); }
+  if (i >= s.size() || s[i] != '{') {
+    throw std::runtime_error(path + ": expected top-level object");
+  }
   ++i;
   skip_ws(s, i);
   if (i < s.size() && s[i] == '}') { throw std::runtime_error(path + ": no queries found"); }
@@ -343,7 +348,7 @@ table_columns load(std::string const& path, std::size_t query)
     // Not the query we want: skip its value by depth-tracking braces/brackets
     // across strings, since a naive scan would trip on '{' inside a name.
     skip_ws(s, i);
-    int depth = 0;
+    int depth      = 0;
     bool in_string = false;
     for (; i < s.size(); ++i) {
       char const c = s[i];
@@ -393,7 +398,7 @@ struct file_plan {
   /// One allocation per file, carved into a slice per request.  Value-init
   /// touches every page, so the timed loop never takes a first-touch fault.
   std::vector<std::uint8_t> buffer;
-  std::vector<sirius::io::io_object_segment> segments;
+  std::vector<sirius::io::slice> slices;
   std::unique_ptr<sirius::io::sirius_datasource> ds;
 };
 
@@ -408,15 +413,16 @@ struct table_stats {
 
   [[nodiscard]] double avg_segment_bytes() const noexcept
   {
-    return n_segments == 0 ? 0.0 : static_cast<double>(useful_bytes) / static_cast<double>(n_segments);
+    return n_segments == 0 ? 0.0
+                           : static_cast<double>(useful_bytes) / static_cast<double>(n_segments);
   }
 };
 
 struct discovery {
   std::vector<file_plan> files;
-  std::size_t n_requests{0};     ///< GETs across every file, after coalescing
-  std::size_t n_segments{0};     ///< column chunks before coalescing
-  std::size_t n_blocks{0};       ///< coalesced blocks
+  std::size_t n_requests{0};  ///< GETs across every file, after coalescing
+  std::size_t n_segments{0};  ///< column chunks before coalescing
+  std::size_t n_blocks{0};    ///< coalesced blocks
   std::size_t useful_bytes{0};
   std::size_t wire_bytes{0};
   std::size_t min_request{std::numeric_limits<std::size_t>::max()};
@@ -429,7 +435,7 @@ discovery discover_query(engine& eng,
                          plan_json::table_columns const& tables,
                          at::connection_plan const& plan)
 {
-  double const max_waste = 1.0 - std::clamp(opts.params.gap_efficiency, 0.0, 1.0);
+  double const max_waste   = 1.0 - std::clamp(opts.params.gap_efficiency, 0.0, 1.0);
   using hybrid_scan_reader = cudf::io::parquet::experimental::hybrid_scan_reader;
 
   discovery d;
@@ -458,14 +464,16 @@ discovery discover_query(engine& eng,
     // opts.common.n_files caps files PER TABLE here (list_prefix is called once
     // per table), unlike its "total across prefixes" meaning at other call sites
     // in this shared bench_options struct.
-    auto const s3_files = list_prefix(eng, prefix, opts.common.n_files);
+    auto const s3_files        = list_prefix(eng, prefix, opts.common.n_files);
     d.per_table[table].n_files = s3_files.size();
 
     std::size_t const table_idx = table_entries.size();
     table_entries.push_back(
       {table, cudf::io::parquet_reader_options::builder().column_names(columns).build()});
     tasks.reserve(tasks.size() + s3_files.size());
-    for (auto const& f : s3_files) { tasks.push_back({table_idx, f}); }
+    for (auto const& f : s3_files) {
+      tasks.push_back({table_idx, f});
+    }
   }
 
   // Phase 2 (parallel): open + footer-fetch + range-discover each file on its
@@ -486,19 +494,20 @@ discovery discover_query(engine& eng,
     // Scoped so the reporter's destructor (stop + join) runs before this
     // block returns, right after wait_for_all -- not tied to `disp`/`pool`.
     auto reporter = progress_reporter([&files_scanned, total = tasks.size()] {
-      return std::format("[discover] {}/{} files ({:.0f}%)",
-                         files_scanned.load(std::memory_order_relaxed),
-                         total,
-                         total == 0 ? 100.0
-                                    : 100.0 * static_cast<double>(files_scanned.load(std::memory_order_relaxed)) /
-                                        static_cast<double>(total));
+      return std::format(
+        "[discover] {}/{} files ({:.0f}%)",
+        files_scanned.load(std::memory_order_relaxed),
+        total,
+        total == 0 ? 100.0
+                   : 100.0 * static_cast<double>(files_scanned.load(std::memory_order_relaxed)) /
+                       static_cast<double>(total));
     });
 
     for (std::size_t i = 0; i < tasks.size(); ++i) {
       disp.enqueue([&, i] {
         auto const& task    = tasks[i];
         auto const& table_e = table_entries[task.table_idx];
-        auto ds              = eng.io_ctx().open_datasource(task.file.path, task.file.size_bytes);
+        auto ds             = eng.io_ctx().open_datasource(task.file.path, task.file.size_bytes);
 
         auto footer = cudf::io::parquet::fetch_footer_to_host(*ds);
         hybrid_scan_reader reader(cudf::host_span<uint8_t const>(footer->data(), footer->size()),
@@ -515,14 +524,15 @@ discovery discover_query(engine& eng,
         std::vector<at::byte_span> spans;
         spans.reserve(ranges.size());
         for (auto const& r : ranges) {
-          spans.push_back({static_cast<std::size_t>(r.offset()), static_cast<std::size_t>(r.size())});
+          spans.push_back(
+            {static_cast<std::size_t>(r.offset()), static_cast<std::size_t>(r.size())});
         }
 
         file_plan fp;
-        fp.path                     = task.file.path;
-        fp.table                    = table_e.name;
+        fp.path                       = task.file.path;
+        fp.table                      = table_e.name;
         fp.n_segments_before_coalesce = spans.size();
-        fp.io = at::coalesce_and_chunk(
+        fp.io                         = at::coalesce_and_chunk(
           std::move(spans), plan.rtt_bytes, max_waste, plan.chunk_bytes, opts.merge_within_chunk);
         if (fp.io.requests.empty()) {
           files_scanned.fetch_add(1, std::memory_order_relaxed);
@@ -532,14 +542,14 @@ discovery discover_query(engine& eng,
         // One buffer per file, sliced per request -- the reactor writes each
         // GET's body straight into its slice, no staging copy.
         fp.buffer.assign(fp.io.wire_bytes, std::uint8_t{0});
-        fp.segments.reserve(fp.io.requests.size());
+        fp.slices.reserve(fp.io.requests.size());
         std::size_t cursor = 0;
         for (auto const& r : fp.io.requests) {
-          fp.segments.emplace_back(r.offset, r.length, fp.buffer.data() + cursor);
+          fp.slices.emplace_back(r.offset, r.length, fp.buffer.data() + cursor);
           cursor += r.length;
         }
-        fp.ds       = std::move(ds);
-        slots[i]    = std::move(fp);
+        fp.ds    = std::move(ds);
+        slots[i] = std::move(fp);
         files_scanned.fetch_add(1, std::memory_order_relaxed);
       });
     }
@@ -585,9 +595,12 @@ discovery discover_query(engine& eng,
 /// completed.  The submission loop blocks on acquire() once `npread` files are
 /// outstanding, so a file with hundreds of ranges is one unit of concurrency,
 /// not hundreds -- the next file only starts once an entire file finishes.
-iteration_result run_once(sirius::io::ioctx& io_ctx, std::vector<file_plan>& files, std::size_t npread)
+iteration_result run_once(sirius::io::ioctx& io_ctx,
+                          std::vector<file_plan>& files,
+                          std::size_t npread)
 {
-  std::counting_semaphore<1 << 20> sem{static_cast<std::ptrdiff_t>(std::max<std::size_t>(1, npread))};
+  std::counting_semaphore<1 << 20> sem{
+    static_cast<std::ptrdiff_t>(std::max<std::size_t>(1, npread))};
   std::atomic<std::size_t> bytes_read{0};
   std::atomic<std::size_t> files_completed{0};
   std::atomic<std::size_t> failures{0};
@@ -600,44 +613,43 @@ iteration_result run_once(sirius::io::ioctx& io_ctx, std::vector<file_plan>& fil
   // timed window, only observe it.
   {
     auto reporter = progress_reporter([&] {
-      auto const n     = files_completed.load(std::memory_order_relaxed);
-      auto const bytes = bytes_read.load(std::memory_order_relaxed);
+      auto const n      = files_completed.load(std::memory_order_relaxed);
+      auto const bytes  = bytes_read.load(std::memory_order_relaxed);
       double const secs = ms_since(start) / 1e3;
       double const gbps = secs > 0 ? (static_cast<double>(bytes) / at::bytes_per_gb_v) / secs : 0.0;
-      return std::format("[read] {}/{} files ({:.0f}%), {:.2f} GiB, {:.2f} GB/s",
-                         n,
-                         files.size(),
-                         files.empty() ? 100.0
-                                      : 100.0 * static_cast<double>(n) / static_cast<double>(files.size()),
-                         as_gib(bytes),
-                         gbps);
+      return std::format(
+        "[read] {}/{} files ({:.0f}%), {:.2f} GiB, {:.2f} GB/s",
+        n,
+        files.size(),
+        files.empty() ? 100.0 : 100.0 * static_cast<double>(n) / static_cast<double>(files.size()),
+        as_gib(bytes),
+        gbps);
     });
 
     for (auto& fp : files) {
       sem.acquire();
       // The whole file's ranges go out together in one call -- the reactor
-      // gets fp.segments.size() requests at once, not one at a time.
-      auto fut = io_ctx.host_read_ranges_async_io(fp.ds->get_io_object(), fp.segments);
+      // gets fp.slices.size() logical ranges at once, not one at a time.
+      auto fut = io_ctx.host_readv_async_io(fp.ds->get_io_object(), fp.slices);
 
-      std::move(fut).install_callback(
-        [&sem, &bytes_read, &files_completed, &failures, &done](
-          sirius::exec::try_t<std::size_t>&& t) mutable {
-          if (t.has_exception()) {
-            failures.fetch_add(1, std::memory_order_relaxed);
-            try {
-              std::rethrow_exception(t.exception());
-            } catch (std::exception const& e) {
-              std::cerr << "read failed: " << e.what() << "\n";
-            } catch (...) {
-              std::cerr << "read failed: unknown exception\n";
-            }
-          } else {
-            bytes_read.fetch_add(std::move(t).get(), std::memory_order_relaxed);
+      std::move(fut).install_callback([&sem, &bytes_read, &files_completed, &failures, &done](
+                                        sirius::exec::try_t<std::size_t>&& t) mutable {
+        if (t.has_exception()) {
+          failures.fetch_add(1, std::memory_order_relaxed);
+          try {
+            std::rethrow_exception(t.exception());
+          } catch (std::exception const& e) {
+            std::cerr << "read failed: " << e.what() << "\n";
+          } catch (...) {
+            std::cerr << "read failed: unknown exception\n";
           }
-          files_completed.fetch_add(1, std::memory_order_relaxed);
-          sem.release();
-          done.count_down();
-        });
+        } else {
+          bytes_read.fetch_add(std::move(t).get(), std::memory_order_relaxed);
+        }
+        files_completed.fetch_add(1, std::memory_order_relaxed);
+        sem.release();
+        done.count_down();
+      });
     }
 
     done.wait();
@@ -703,9 +715,10 @@ void report_plan(query_bench_options const& opts,
             << std::format("  conn / reactor       : {}\n", opts.common.max_nconnection)
             << std::format("  ceiling              : {} concurrent GETs\n",
                            opts.common.n_reactors * opts.common.max_nconnection)
-            << std::format("  nic wants (fyi)      : {} streams to fill the NIC at the assumed "
-                           "per-stream rate\n",
-                           plan.nic_connections)
+            << std::format(
+                 "  nic wants (fyi)      : {} streams to fill the NIC at the assumed "
+                 "per-stream rate\n",
+                 plan.nic_connections)
             << std::format("  --npread             : {} files being actively read at once\n",
                            opts.npread);
 
@@ -736,7 +749,12 @@ void report_plan(query_bench_options const& opts,
 
   std::cout << "  -- per table --\n"
             << std::format("  {:<10} {:>7} {:>10} {:>10} {:>12} {:>12}\n",
-                           "table", "files", "segments", "requests", "avg seg", "useful");
+                           "table",
+                           "files",
+                           "segments",
+                           "requests",
+                           "avg seg",
+                           "useful");
   for (auto const& [table, ts] : d.per_table) {
     std::cout << std::format("  {:<10} {:>7} {:>10} {:>10} {:>10.2f}K {:>10.2f}M\n",
                              table,
@@ -749,7 +767,9 @@ void report_plan(query_bench_options const& opts,
   std::cout << "\n";
 }
 
-void report_runs(std::vector<iteration_result> const& runs, std::size_t useful_bytes, double nic_gbps)
+void report_runs(std::vector<iteration_result> const& runs,
+                 std::size_t useful_bytes,
+                 double nic_gbps)
 {
   if (runs.empty()) { return; }
 
@@ -782,34 +802,6 @@ void report_runs(std::vector<iteration_result> const& runs, std::size_t useful_b
                            nic_gbps > 0 ? 100.0 * median_wire * 8.0 / nic_gbps : 0.0);
 }
 
-/// Hand back what the run measured in the units the model consumes, so the next
-/// invocation can be given real numbers instead of guesses.
-void report_feedback(sirius::io::rest::rest_perf_snapshot const& s, iteration_result const& last)
-{
-  double const mean_inflight = s.inflight_samples == 0 ? 0.0
-                                                       : static_cast<double>(s.inflight_sum) /
-                                                           static_cast<double>(s.inflight_samples);
-  double const mean_ttfb_s =
-    s.curl_timed_count == 0
-      ? 0.0
-      : static_cast<double>(s.curl_ttfb_ns_total) / static_cast<double>(s.curl_timed_count) / 1e9;
-
-  std::cout << "  -- measured, for the next run --\n"
-            << std::format(
-                 "  in-flight GETs       : mean {:.1f} / max {}\n", mean_inflight, s.inflight_max);
-  if (mean_ttfb_s > 0) {
-    std::cout << std::format(
-      "  ttfb                 : {:.2f} ms -> --rtt {:.4f}\n", mean_ttfb_s * 1e3, mean_ttfb_s);
-  }
-  if (mean_inflight > 0 && last.duration_ms > 0) {
-    double const mb_per_s =
-      (static_cast<double>(last.bytes) / at::bytes_per_mb_v) / (last.duration_ms / 1e3);
-    std::cout << std::format("  per-stream rate      : {:.1f} MB/s -> --stream-throughput {:.1f}\n",
-                             mb_per_s / mean_inflight,
-                             mb_per_s / mean_inflight);
-  }
-}
-
 }  // namespace
 
 int main(int argc, char** argv)
@@ -832,16 +824,16 @@ int main(int argc, char** argv)
 
     auto const tables = plan_json::load(opts.plan_json_path, opts.query);
     if (tables.empty()) {
-      throw std::runtime_error("plan.json: query " + std::to_string(opts.query) +
-                               " has no tables");
+      throw std::runtime_error("plan.json: query " + std::to_string(opts.query) + " has no tables");
     }
 
     // ---- what the model says for GET size / merge threshold -----------------
     // Independent of the workload size (see s3_autotune.hpp) — computed before
-    // discovery because discovery needs it to shape each file's requests, and
-    // discovery needs the engine, which needs chunk_bytes to size rest.chunk_size.
-    auto plan = at::plan_connections(
-      opts.params, /*workload_bytes=*/0, opts.min_chunks_per_connection, mib_to_bytes(opts.min_chunk_mib));
+    // discovery because discovery needs it to shape each file's logical requests.
+    auto plan = at::plan_connections(opts.params,
+                                     /*workload_bytes=*/0,
+                                     opts.min_chunks_per_connection,
+                                     mib_to_bytes(opts.min_chunk_mib));
     if (opts.override_chunk_mib > 0) { plan.chunk_bytes = mib_to_bytes(opts.override_chunk_mib); }
     if (plan.chunk_bytes == 0) { throw std::runtime_error("derived GET size is 0"); }
 
@@ -850,17 +842,13 @@ int main(int argc, char** argv)
     // derived from the model: the workload's size is only known after
     // discovery, which needs the engine to already exist.
     opts.common.chunk_size_bytes = plan.chunk_bytes;
-    // Requests are already individually sized by coalesce_and_chunk; stop the
-    // reactor from re-deciding. max_n_chunks 1 disables re-fusing, and
-    // rest.chunk_size == our cap means none is split further.
-    opts.common.max_n_chunks = 1;
+    // coalesce_and_chunk shapes logical requests. The reactor can still split
+    // them dynamically to match its current connection availability and backlog.
     // Reads land in malloc'd buffers, so the pinned pool only has to cover the
     // reactors' bounce slots: one 1 MiB block per connection per reactor.
-    opts.common.host_chunk_mib = 1;
+    opts.common.host_chunk_mib      = 1;
     std::size_t const bounce_blocks = opts.common.n_reactors * opts.common.max_nconnection;
-    opts.common.host_initial_pools =
-      (bounce_blocks + host_pool_size_v - 1) / host_pool_size_v + 1;
-    opts.common.perf_instrumentation = true;
+    opts.common.host_initial_pools  = (bounce_blocks + host_pool_size_v - 1) / host_pool_size_v + 1;
 
     engine eng{opts.common};
 
@@ -878,19 +866,10 @@ int main(int argc, char** argv)
     std::size_t const repeat = std::max<std::size_t>(1, opts.common.repeat);
     std::vector<iteration_result> runs;
     runs.reserve(repeat);
-    std::string perf;
     for (std::size_t r = 0; r < repeat; ++r) {
       runs.push_back(run_once(eng.io_ctx(), d.files, opts.npread));
-      // Snapshot before the report resets the counters, so both describe the
-      // iteration that just finished rather than every iteration so far.
-      auto const snapshot = eng.rest().perf_snapshot();
-      perf                = eng.rest().perf_report_and_reset();
-      if (r + 1 == repeat) {
-        report_runs(runs, d.useful_bytes, opts.params.nic_gbps);
-        if (!perf.empty()) { std::cout << perf; }
-        report_feedback(snapshot, runs.back());
-      }
     }
+    report_runs(runs, d.useful_bytes, opts.params.nic_gbps);
     return 0;
 
   } catch (std::exception const& e) {

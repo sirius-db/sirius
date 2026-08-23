@@ -185,12 +185,13 @@ struct scan_manager_config {
   /// means "not stamped", and the backend's own budget is used instead.
   std::size_t pipeline_width{0};
 
-  /// Local (uring) reactor configuration — bounce-slot size, O_DIRECT,
-  /// ring depth, etc.  @c use_odirect is derived from @ref cache.
+  /// Local (uring) reactor configuration. @c use_odirect is derived from
+  /// @ref cache; physical operation size is selected by the worker.
   io::uring::config uring{};
 
-  /// REST (S3/object-store) reactor configuration — timeouts, TLS, chunking,
-  /// retry policy, etc.
+  /// REST (S3/object-store) reactor configuration — timeouts, TLS, logical
+  /// merge hints, retry policy, and connection limits. Physical GET sizing is
+  /// worker-owned.
   io::rest::config rest{};
 
   /// kvikIO backend tunables for the local-file fallback path.  Every field is

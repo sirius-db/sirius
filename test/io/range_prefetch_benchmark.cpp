@@ -81,7 +81,6 @@ constexpr double RESERVATION_FRACTION      = 0.9;
 constexpr std::size_t HOST_BLOCK_SIZE      = MIB;
 constexpr std::size_t HOST_POOL_SIZE       = 1024;
 constexpr std::uint32_t BOUNCE_POOL_SLABS  = 20;
-constexpr std::size_t MAX_N_CHUNKS         = 1;
 constexpr std::uint64_t RANGE_SEED         = 0x5EEDULL;
 
 using clock_type = std::chrono::steady_clock;
@@ -250,9 +249,7 @@ io_stack make_io_stack(std::size_t n_reactors)
                                                                          BOUNCE_POOL_SLABS);
 
   auto ctx = std::make_shared<sirius::io::uring::uring_reactor::reactor_context>(
-    sirius::io::uring::uring_reactor::reactor_config_type{
-      .bounce_size = stack.bounce_mr->get_block_size(), .max_n_chunks = MAX_N_CHUNKS},
-    stack.bounce_mr.get());
+    sirius::io::uring::uring_reactor::reactor_config_type{}, stack.bounce_mr.get());
   stack.io_ctx = std::make_shared<sirius::io::uring::uring_ioctx>(n_reactors, std::move(ctx));
   stack.io_ctx->start();
   return stack;
