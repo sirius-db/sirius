@@ -196,9 +196,10 @@ The plan generator inserts every GPU pipeline operator into the plan tree (Part 
 2. `compute_repository_wiring()` — emit sink→consumer wiring descriptors via tree-parent lookup; `resolve_port_id()` / `resolve_barrier()` pick each edge's port and barrier semantics
 3. `setup_pipeline_parents()` — derive parent pipeline edges from the wiring descriptors
 4. `finalize_pipeline_structure()` — populate `dependencies`, build-side-first for joins (see [Pipeline Finalization](#pipeline-finalization))
-5. `link_join_partition_siblings()` — link PARTITION/JOIN/CONCAT sibling chains
-6. `configure_partition_min_partitions()` — apply the multi-GPU partition floor
-7. `reorder_pipelines_topologically()` — permute the schedule into a strict leaf-first topological order (every pipeline after its producers) and renumber pipeline IDs to match; join dependencies stay build-side-first so a join publishes its dynamic filters before the probe-side scans they prune are launched
+5. `restrict_dynamic_filter_replicas()` — drop replicas on GPUs the admitted set does not hold, disabling publication for a join left with none. Runs before step 6, which reads `publishes_dynamic_filters()` to pick a sizing side: a join switched to build-driven sizing for a filter it then lost would be sizing for a publication that never happens
+6. `link_join_partition_siblings()` — link PARTITION/JOIN/CONCAT sibling chains and choose which side drives the partition count (see [Partition sizing](#partition-sizing-which-side-drives-the-count-and-what-bounds-the-fold))
+7. `configure_partition_min_partitions()` — apply the multi-GPU partition floor
+8. `reorder_pipelines_topologically()` — permute the schedule into a strict leaf-first topological order (every pipeline after its producers) and renumber pipeline IDs to match; join dependencies stay build-side-first so a join publishes its dynamic filters before the probe-side scans they prune are launched
 
 `sirius_engine::initialize_internal()` is a thin orchestrator calling `sirius_pipeline_converter(build_ctx, op_params).convert(*root_pipeline)` and materializing the wiring descriptors into runtime repositories and ports.
 
@@ -284,6 +285,18 @@ transitively through an intervening join; such a scan samples the channel opport
 normal scheduler order. See
 [Immediate-probe ordering](dynamic-filters.md#immediate-probe-ordering) and
 [Transitive scan targets and publication timing](dynamic-filters.md#transitive-scan-targets-and-publication-timing).
+
+### Partition sizing: which side drives the count, and what bounds the fold
+
+Both PARTITION operators of a join agree on one partition count, and exactly one of them — the *sizing* side — measures its input to choose it. `link_join_partition_siblings()` picks that side, and `sirius_physical_hash_join::get_partition_strategy` turns the measurement into a count via the pure `compute_hash_join_partition_strategy`.
+
+**Which side sizes.** The build side sizes by default: it is the side broadcast and BUILD_PROBE eligibility are about, and it is the side that must be resident before the probe can be joined. Right-family joins (RIGHT / RIGHT_SEMI / RIGHT_ANTI) invert that, because the side they must see whole is the probe. One exception inverts it back: a RIGHT_SEMI or RIGHT_ANTI join that publishes dynamic filters stays build-driven, because its filter has to be built and published from a folded build *before* the probe-side scan launches, and probe-driven sizing would defer the build behind the full unfiltered probe. A `RIGHT_DELIM_JOIN`'s internal join is likewise build-driven — it bootstraps its probe subtree from build-side distinct data.
+
+**What the count has to satisfy.** Beyond the byte target (`hash_partition_bytes`), the count is what establishes [INV-FOLD](operators.md#inv-fold-every-group-becomes-one-cudf-table) for whichever side the join folds into one batch per partition. `compute_hash_join_partition_strategy` therefore floors the count at `fold_partition_floor(measured_rows, fold_row_target(max_fold_rows))` when the measured side is a folding side, refuses broadcast for a build that exceeds the target (a broadcast build is replicated, not split, so raising the count cannot shrink its fold), and throws for a MARK join in the same position, whose count is pinned at one partition or at broadcast and can never be raised.
+
+**Residual R1': the fold the count does not bound.** The floor is a measurement of the sizing side, and nothing measures the other side. Under the build-driven exception above, the side that folds is the probe — so a RIGHT_SEMI/RIGHT_ANTI join's probe fold has no floor. It is bounded only at execution, by `gpu_merge_impl::concat`'s `[fold_limit]` guard, which refuses the fold and falls the query back to the CPU. A FULL OUTER join's probe is in the same position for the same reason (it folds both sides but sizes from the build). Deliberately no estimate is used here: a floor derived from DuckDB's cardinality estimate can under-count and would create a *false* impression of a bound. The real fix is an incremental build-side match-flag accumulator that lets RIGHT_SEMI/RIGHT_ANTI stream the probe instead of folding it, which removes the fold, the exception, and this residual together.
+
+Two related warnings are emitted from `get_partition_strategy` at WARN level: one when a build-driven RIGHT_SEMI/RIGHT_ANTI does not fit one partition (so no filter can publish and its probe is neither filtered nor bounded), and one when a multi-GPU MARK join is forced to broadcast an over-size build.
 
 ### ORDER_BY → 3-Phase Sort
 

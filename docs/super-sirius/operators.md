@@ -259,7 +259,7 @@ The following table summarizes, per join type, what concat folds, which side str
 | RIGHT_ANTI | probe → 1 | build | ✅ | ✅ | ❌ | STANDARD, MIXED_JOIN† |
 | SINGLE | — | — | — | — | — | unsupported (throws) |
 
-† MIXED_JOIN applies to any of these types when the join carries equality conditions **plus** either an inequality condition or a null-safe `IS NOT DISTINCT FROM` key mixed with a plain `=` (the null-safe key is routed to the AST predicate as `NULL_EQUAL`, since cuDF's single `null_equality` flag can't give `=` and null-safe keys opposite semantics). MARK is never routed to MIXED_JOIN: MARK + inequality is rejected at construction, and a MARK + null-safe key stays a `UNEQUAL` hash key (a known null-safe limitation). "Streams multi-batch" describes the STANDARD/MIXED partial-barrier behavior; BUILD_PROBE already streamed its probe side. The whole-side fold is chosen in the `sirius_physical_concat` constructor from the downstream join type (`_concat_all`); partition / broadcast / mode eligibility is decided in `compute_hash_join_partition_strategy`.
+† MIXED_JOIN applies to any of these types when the join carries equality conditions **plus** either an inequality condition or a null-safe `IS NOT DISTINCT FROM` key mixed with a plain `=` (the null-safe key is routed to the AST predicate as `NULL_EQUAL`, since cuDF's single `null_equality` flag can't give `=` and null-safe keys opposite semantics). MARK is never routed to MIXED_JOIN: MARK + inequality is rejected at construction, and a MARK + null-safe key stays a `UNEQUAL` hash key (a known null-safe limitation). "Streams multi-batch" describes the STANDARD/MIXED partial-barrier behavior; BUILD_PROBE already streamed its probe side. The whole-side fold is chosen in the `sirius_physical_concat` constructor from `sirius_physical_hash_join::join_folds_side` (`_concat_all`); partition / broadcast / mode eligibility — including the row-aware floor that keeps each fold addressable (INV-FOLD, below) — is decided in `compute_hash_join_partition_strategy`.
 
 #### MARK joins
 A MARK join emits every left row plus a `BOOL8` mark column with SQL three-valued semantics: **true** for a match, **false** for a non-match when the probe key is non-NULL and the build side has no NULL key, and **NULL** otherwise (NULL probe key, or no match while a NULL build key exists — the row *might* have matched it). Both build strategies funnel through `resolve_mark_join_result`, which scatters left-row match indices into the mark column and attaches the null mask: when the build side has a NULL key, validity equals the match flags (`cudf::bools_to_mask`); otherwise validity is the probe keys' row validity (`cudf::bitmask_and`). Build-key nullness is recorded at build time in `_build_has_null` — an atomic that is join-wide because MARK is forced single-partition (or broadcast on multi-GPU, precisely so `_build_has_null` is globally consistent).
@@ -356,17 +356,27 @@ These operators are injected during pipeline splitting. They don't map to DuckDB
 Repartitions data into N buckets based on partition keys. Partition keys are always plain column indices — a hash-join equality key that is a complex expression has already been materialized into a real column by a planner-inserted projection (`materialize_expression_join_keys()`), because PARTITION hashes by column index and cannot evaluate expressions.
 
 - **Modes:** `HASH` (most common), `RANGE`, `EVENLY`, `CUSTOM`, `NONE`
-- **Adaptive count:** `determine_num_partitions()` computes N from actual input data size and `hash_partition_bytes` config
-- **Sibling coordination:** Build-side partition normally determines the shared count. For RIGHT-family hash joins other than `RIGHT_DELIM_JOIN`, the retained probe side determines it instead.
+- **Adaptive count:** `measure_input()` reports the resident input's bytes and a sound upper bound on its rows; the downstream consumer's `get_partition_strategy` turns both into N (`hash_partition_bytes` for the byte target, the INV-FOLD row floor for the folding side)
+- **Sibling coordination:** Build-side partition normally determines the shared count. RIGHT-family hash joins hand it to the retained probe side instead — except a `RIGHT_DELIM_JOIN`'s internal join, and except a RIGHT_SEMI / RIGHT_ANTI join that publishes dynamic filters, which stays build-driven so its filter can publish before the probe scan launches. See [Partition sizing](physical-plan-generation.md#partition-sizing-which-side-drives-the-count-and-what-bounds-the-fold).
 - **Key members:** `_partition_keys`, `_partition_type`, `_num_partitions`, `_is_build`, `_drives_partition_count`, `_sibling_partition_op`
 
 ### `sirius_physical_concat` — `CONCAT`
 **File:** `src/include/op/sirius_physical_concat.hpp`
 
-Reassembles partitioned data back into a linear stream. Behavior depends on join type:
+Reassembles partitioned data back into a linear stream. Which of two grouping policies it uses is decided at construction by `sirius_physical_hash_join::join_folds_side(join_type, is_build)` — the single source of truth for which side a join must see whole (LEFT/SEMI/ANTI fold the build, RIGHT-family folds the probe, OUTER folds both, INNER/MARK fold neither):
 
-- `_concat_all = true` (LEFT/ANTI/OUTER joins): waits for all data before emitting
-- `_concat_all = false` (INNER joins): emits tasks when byte threshold (`_concat_batch_bytes`) is met
+- `_concat_all = true` (the folding side): waits for the source pipeline to finish, then makes the whole partition one group. `set_concat_all(true)` additionally turns this on for the build side when the partition operator selects BUILD_PROBE, or when it folds the build so a dynamic filter can publish from a single batch.
+- `_concat_all = false`: emits a group once its accumulated size reaches `_concat_batch_bytes`.
+
+#### INV-FOLD: every group becomes one cuDF table
+
+`gpu_merge_impl::concat` merges a group with `cudf::concatenate`, which produces exactly one `cudf::table`, and cuDF indexes table rows with `cudf::size_type` (`int32_t`). So:
+
+> **INV-FOLD.** Every batch group a CONCAT forms holds at most `std::numeric_limits<cudf::size_type>::max()` rows.
+
+Under `_concat_batch_bytes` this holds incidentally, because that target is small. Under `_concat_all` nothing in the CONCAT can shrink a group — `refresh_cross_schedule` requires exactly one folded batch per partition — so the invariant rests entirely on the **partition count**. `compute_hash_join_partition_strategy` establishes it by raising the count until the measured folding side fits `fold_row_target(max_fold_rows)` rows per partition, refusing broadcast for a build that cannot be split down to it, and throwing for a MARK join, whose count cannot be raised at all.
+
+That floor bounds only the side the sizing PARTITION measured. A side that folds but is never measured — the probe of a right-family join under build-driven sizing, or a FULL OUTER join's probe — has no floor and is bounded solely by `check_fold_row_limit` inside `gpu_merge_impl::concat`, which refuses the fold with the stable `[fold_limit]` marker before cuDF can. `sirius_physical_concat::execute` catches that refusal to name the CONCAT, its partition, its side and the join it feeds, then rethrows into the normal CPU-fallback path. See `src/include/op/fold_limits.hpp` and the `max_concat_fold_rows` setting.
 
 ### `sirius_physical_sort_sample` — `SORT_SAMPLE`
 **File:** `src/include/op/sirius_physical_sort_sample.hpp`

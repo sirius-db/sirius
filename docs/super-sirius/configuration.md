@@ -402,6 +402,7 @@ individually.
 | `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. Auto = 33% of GPU memory. |
 | `hash_partition_bytes` | Shared physical/effective GPU batch default described above | Target partition size for hash joins and group-bys; must be greater than zero |
 | `concat_batch_bytes` | Shared physical/effective GPU batch default described above | Target output batch size for CONCAT operator |
+| `max_concat_fold_rows` | `cudf::size_type` max (2147483647) | Rows one folded CONCAT output batch may hold. The default is what cuDF can address in a single table, not a tuning target; it exists so the row-aware partition floor and the fold guard are reachable at test data volumes. Must be between 1 and the cuDF limit — raising it would not raise cuDF's. See [operators.md](operators.md#inv-fold-every-group-becomes-one-cudf-table). |
 | `sort_sample_bytes` | Shared physical/effective GPU batch default described above | Bytes sampled before computing sort partition boundaries |
 | `max_build_hash_table_bytes` | 2× batch default | Max build-side size for BUILD_PROBE join mode |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join. A build below this size is replicated to every GPU (instead of hash-partitioned) when it is tiny, or when the DuckDB-estimated probe-to-build row ratio is at least `num_gpus * 1.25`. |
@@ -607,7 +608,9 @@ policy rather than a user configuration choice; see
 
 The CONCAT output-batch target is derived from effective GPU capacity. Advanced
 benchmark and test envelopes may still override `concat_batch_bytes` in YAML
-under `sirius.operator_params`, but it is not a normal session setting.
+under `sirius.operator_params`, but it is not a normal session setting. The same
+applies to `max_concat_fold_rows`, whose default is a cuDF addressing limit
+rather than a tuning choice.
 
 Runtime distinct-build probing is also engine-owned and is temporarily disabled pending #1600.
 
