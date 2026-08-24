@@ -855,39 +855,14 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
 
 std::optional<std::size_t> sirius_physical_hash_join::consumed_primary_input_bytes() const
 {
+  // Only the unweighted BUILD_PROBE count is published; see probe_bytes_are_unweighted().
+  if (!probe_bytes_are_unweighted()) { return std::nullopt; }
   // Read live completion state so drain-phase polls cannot observe a stale latch.
   auto const* build = try_get_port("build");
   if (build == nullptr || !build->src_pipeline || !build->src_pipeline->is_pipeline_finished()) {
     return std::nullopt;
   }
-  // Read unpublished bytes first. A concurrent publish may then double-count bytes, conservatively
-  // biasing the ratio low; the reverse order could omit them and inflate it.
-  auto const unpublished = _unpublished_probe_bytes.load(std::memory_order_acquire);
-  // Each batch is counted either by pairing weight or in full.
-  return _whole_probe_bytes.load(std::memory_order_relaxed) +
-         _weighted_probe_bytes.load(std::memory_order_relaxed) + unpublished;
-}
-
-void sirius_physical_hash_join::publish_weighted_probe_bytes(bool build_finished)
-{
-  // Pairing weights are stable only after the build side finishes.
-  if (!build_finished) { return; }
-  // Lock order: op_state_mutex (caller) -> _probe_bytes_mutex. This path takes no batch lock.
-  std::lock_guard<std::mutex> lg(_probe_bytes_mutex);
-  _weighted_probe_bytes.store(pairing_weighted_probe_bytes(_cross, _probe_batch_bytes),
-                              std::memory_order_relaxed);
-  // Release after publishing weights so readers that see zero also see the new value.
-  _unpublished_probe_bytes.store(0, std::memory_order_release);
-}
-
-void sirius_physical_hash_join::record_probe_batch_bytes(uint64_t batch_id, std::size_t bytes)
-{
-  std::lock_guard<std::mutex> lg(_probe_bytes_mutex);
-  // Batches counted in full must not also contribute pairing weight.
-  if (_counted_probe_batch_ids.contains(batch_id)) { return; }
-  if (_probe_batch_bytes.try_emplace(batch_id, bytes).second) {
-    _unpublished_probe_bytes.fetch_add(bytes, std::memory_order_release);
-  }
+  return _whole_probe_bytes.load(std::memory_order_relaxed);
 }
 
 void sirius_physical_hash_join::note_probe_bytes_counted(uint64_t batch_id, std::size_t bytes)
@@ -895,22 +870,6 @@ void sirius_physical_hash_join::note_probe_bytes_counted(uint64_t batch_id, std:
   std::lock_guard<std::mutex> lg(_probe_bytes_mutex);
   if (!_counted_probe_batch_ids.insert(batch_id).second) { return; }
   _whole_probe_bytes.fetch_add(bytes, std::memory_order_relaxed);
-}
-
-void sirius_physical_hash_join::note_probe_bytes(
-  const std::shared_ptr<cucascade::data_batch>& batch)
-{
-  if (!batch) { return; }
-  {
-    std::lock_guard<std::mutex> lg(_probe_bytes_mutex);
-    if (_probe_batch_bytes.contains(batch->get_batch_id())) { return; }
-  }
-  // Do not block under op_state_mutex while a downgrade holds the batch lock. A later pairing
-  // retries a missed read, and execute() handles batches with no later pairing.
-  auto ro = batch->try_to_read_only();
-  if (!ro || ro->get_data() == nullptr) { return; }
-  auto const bytes = ro->get_data()->get_uncompressed_data_size_in_bytes();
-  record_probe_batch_bytes(batch->get_batch_id(), bytes);
 }
 
 partition_strategy sirius_physical_hash_join::get_partition_strategy(
@@ -1295,7 +1254,6 @@ std::pair<bool, bool> sirius_physical_hash_join::refresh_cross_schedule()
     }
   }
 
-  publish_weighted_probe_bytes(build_finished);
   return {probe_finished, build_finished};
 }
 
@@ -1336,12 +1294,6 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
         "batches for a newly-scheduled pair in partition " +
         std::to_string(step.partition) + " of operator " + std::to_string(this->get_operator_id()));
     }
-
-    // Retry the non-blocking size read at every pairing; batch-id dedup prevents double counting.
-    note_probe_bytes(probe_batch);
-
-    // Republish after the paired-count increment so the denominator leads task output.
-    publish_weighted_probe_bytes(finished.second);
 
     std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
     input_batch.reserve(2);
@@ -1786,16 +1738,6 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
 
   cudf::table_view left_full, right_full;
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices, right_indices;
-
-  // Backstop a failed claim-time read through this blocking accessor. Record before task output so
-  // the denominator leads; take only _probe_bytes_mutex to preserve lock order.
-  if (_join_mode != HASH_JOIN_MODE::BUILD_PROBE && !input_batches.empty()) {
-    if (auto const* probe_data = input_batches[0].get_data(); probe_data != nullptr) {
-      auto const probe_id    = input_batches[0].get_batch_id();
-      auto const probe_bytes = probe_data->get_uncompressed_data_size_in_bytes();
-      record_probe_batch_bytes(probe_id, probe_bytes);
-    }
-  }
 
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
     // Each partition owns one hash table. The incoming batch is tagged with its partition index

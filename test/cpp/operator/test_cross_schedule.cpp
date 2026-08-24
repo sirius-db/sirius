@@ -324,6 +324,43 @@ TEST_CASE("pairing-weighted probe bytes ignore a partition with no build batch y
   CHECK(pairing_weighted_probe_bytes(cross, bytes) == 0);
 }
 
+TEST_CASE("pairing-weighted probe bytes read far below the probe volume mid-sweep",
+          "[cross_schedule][size_estimation]")
+{
+  // Why STANDARD / MIXED_JOIN withhold the fan-in estimate: next_cross_schedule_pair sweeps one
+  // probe batch across every build batch before starting the next, so at the 16-pairing sample
+  // gate the denominator holds 16% of one batch's bytes while the numerator may already be near
+  // its final value — the ratio overstates by the same factor.
+  std::vector<uint64_t> builds;
+  builds.reserve(100);
+  for (uint64_t i = 0; i < 100; ++i) {
+    builds.push_back(10 + i);
+  }
+  std::vector<partition_cross_schedule> cross{make_partition({1}, builds)};
+  std::unordered_map<uint64_t, std::size_t> bytes{{1, 1000}};
+
+  cross[0].probe_paired_count[0] = 16;
+  CHECK(pairing_weighted_probe_bytes(cross, bytes) == 160);
+  // The gap closes only when the sweep completes, which is the end of the join.
+  cross[0].probe_paired_count[0] = 100;
+  CHECK(pairing_weighted_probe_bytes(cross, bytes) == 1000);
+}
+
+TEST_CASE("pairing-weighted probe bytes lag the probe side while later batches wait",
+          "[cross_schedule][size_estimation]")
+{
+  // The same sweep order leaves later probe batches at zero weight, so the denominator describes
+  // the opening batches rather than the probe side as a whole.
+  std::vector<partition_cross_schedule> cross{make_partition({1, 2, 3}, {10, 11})};
+  std::unordered_map<uint64_t, std::size_t> bytes{{1, 900}, {2, 900}, {3, 900}};
+  cross[0].probe_paired_count[0] = 2;  // swept
+  cross[0].probe_paired_count[1] = 1;  // mid-sweep
+  cross[0].probe_paired_count[2] = 0;  // untouched
+
+  // 900 + 450 + 0 against 2700 bytes actually queued.
+  CHECK(pairing_weighted_probe_bytes(cross, bytes) == 1350);
+}
+
 TEST_CASE("pairing-weighted probe bytes skip a batch whose size was never recorded",
           "[cross_schedule][size_estimation]")
 {

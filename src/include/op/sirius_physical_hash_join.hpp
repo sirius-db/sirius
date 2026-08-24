@@ -194,8 +194,10 @@ struct cross_schedule_pair {
 [[nodiscard]] std::vector<cross_schedule_discard> collect_cross_schedule_discards(
   std::vector<partition_cross_schedule>& cross, bool probe_finished, bool build_finished);
 
-/// Size-estimator denominator: sum `probe bytes * completed pairings / build batches`.
-/// Partitions without build batches contribute zero; orphan probe batches are counted separately.
+/// Reference arithmetic for a pairing-weighted probe-byte denominator: sum
+/// `probe bytes * completed pairings / build batches`. Unused — the STANDARD/MIXED estimate is
+/// withheld — but kept with its tests for the eventual fix. See
+/// data-size-estimation.md#why-standard-and-mixed_join-are-not-estimated.
 [[nodiscard]] std::size_t pairing_weighted_probe_bytes(
   std::vector<partition_cross_schedule> const& cross,
   std::unordered_map<uint64_t, std::size_t> const& probe_bytes);
@@ -387,26 +389,23 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     return std::string_view{"default"};
   }
 
-  /// Whole-counted plus @ref pairing_weighted_probe_bytes probe bytes. Returns nullopt until the
-  /// build side is complete. Defined out of line because that check needs `sirius_pipeline`.
+  /// True only in BUILD_PROBE, where each probe batch is popped exactly once and `consumed` is
+  /// a plain running total. A cross schedule would need pairing weights, which read high under
+  /// skew, so the estimate is withheld there. See
+  /// data-size-estimation.md#why-standard-and-mixed_join-are-not-estimated.
+  [[nodiscard]] bool probe_bytes_are_unweighted() const
+  {
+    return _join_mode == HASH_JOIN_MODE::BUILD_PROBE;
+  }
+
+  /// Whole-counted probe bytes, or nullopt until the build side is complete — and always nullopt
+  /// unless @ref probe_bytes_are_unweighted. Out of line because the check needs `sirius_pipeline`.
   [[nodiscard]] std::optional<std::size_t> consumed_primary_input_bytes() const override;
 
  protected:
-  /// Idempotently record a probe batch for pairing weights. The non-blocking size read may be
-  /// retried at later sightings; use note_probe_bytes_counted for single-sighting paths.
-  void note_probe_bytes(const std::shared_ptr<cucascade::data_batch>& batch);
-
-  /// Publish current pairing weights after a pairing is claimed, preventing output from preceding
-  /// its denominator. No-op until @p build_finished. Caller holds `op_state_mutex`.
-  void publish_weighted_probe_bytes(bool build_finished);
-
-  /// Count @p bytes once for an unweighted probe batch. Takes @ref _probe_bytes_mutex but no batch
+  /// Count @p bytes once for a popped probe batch. Takes @ref _probe_bytes_mutex but no batch
   /// lock, so callers may hold a batch lock.
   void note_probe_bytes_counted(uint64_t batch_id, std::size_t bytes);
-
-  /// Record a weighted probe batch once and carry its full size in
-  /// @ref _unpublished_probe_bytes until publication. Skips batches already counted whole.
-  void record_probe_batch_bytes(uint64_t batch_id, std::size_t bytes);
 
   // double get_progress(duckdb::ClientContext &context, duckdb::GlobalSourceState &gstate) const
   // override;
@@ -440,22 +439,12 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   // Whole-counted BUILD_PROBE and orphan bytes. Relaxed reads may be slightly stale.
   std::atomic<std::size_t> _whole_probe_bytes{0};
 
-  // Published STANDARD/MIXED_JOIN share; updated as pairing weights increase.
-  std::atomic<std::size_t> _weighted_probe_bytes{0};
-
   // Deduplicates _whole_probe_bytes. Guarded by _probe_bytes_mutex.
   std::unordered_set<uint64_t> _counted_probe_batch_ids;
 
-  // Full sizes awaiting publication. execute() cannot take op_state_mutex to recompute weights,
-  // and no later scheduler poll is guaranteed; full-size carry biases the ratio low, not high.
-  std::atomic<std::size_t> _unpublished_probe_bytes{0};
-
-  // Probe sizes for pairing weights; disjoint from _counted_probe_batch_ids.
-  //
   // Lock order: op_state_mutex -> _probe_bytes_mutex. execute() may take this mutex while holding
   // a batch lock; nothing may wait on a batch lock or op_state_mutex while holding it.
   std::mutex _probe_bytes_mutex;
-  std::unordered_map<uint64_t, std::size_t> _probe_batch_bytes;
 
   // Whether any build-side join key column contains a NULL. Used exclusively for MARK join
   // three-valued logic. Sentinel -1 = unset, 0 = false, 1 = true. Join-wide (not per-partition)

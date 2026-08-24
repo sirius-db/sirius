@@ -196,30 +196,34 @@ batch and *borrows* rather than pops, so the same bytes enter `input_basis` once
 sum is a cross product, not an input volume. The join therefore counts probe bytes itself, as they
 enter a task rather than as they land in the port — which would measure arrival, not consumption.
 
-Bytes are **weighted by pairing progress** rather than charged whole at first sighting. Output
-accrues once per completed pairing, so a batch through 1 of B pairings has emitted 1/B of what it
-finally will; charging its full size up front completes the denominator while the numerator is 1/B
-of the way there, and the ratio reads low by a factor unbounded in B — untouched by the sample
-floor, which counts tasks rather than pairings. `pairing_weighted_probe_bytes` sums
-`bytes x (pairings done / build batches)`, putting both terms at the same fraction of the way
-through. This is INNER-specific in practice: every other join type pins the build side whole,
-leaving B = 1 and nothing to weight.
+In BUILD_PROBE — the only mode that publishes a denominator — each probe batch is popped exactly
+once, so the count is a plain running total: `note_probe_bytes_counted` adds each popped batch's
+bytes to `_whole_probe_bytes`, deduplicated by batch id so an OOM-rescheduled task re-entering
+`execute()` with the same batch counts nothing new. Cross-schedule orphans (a surviving batch whose
+opposite side finished empty) are counted the same way.
 
-Batches with no such multiplicity — BUILD_PROBE pops, and cross-schedule orphans whose opposite side
-finished empty — are counted whole in a separate accumulator. The two sets are disjoint, so the
-reported total is their sum.
+A STANDARD or MIXED_JOIN cross schedule has no such clean count: it borrows each probe batch once
+per build batch, so its bytes would have to be **weighted by pairing progress** (a batch through 1
+of B pairings has emitted 1/B of what it finally will), and that weighting is biased under skew —
+the next section. The estimate is withheld for those modes, and the operator-side weighted
+bookkeeping (the per-batch size map, the pairing-weight publication, and the late-size carry) has
+been removed with it. `pairing_weighted_probe_bytes` survives, with its unit tests, as the
+reference arithmetic for the eventual fix.
 
-#### Known bias: the weighting assumes output accrues evenly across build batches
+#### Why STANDARD and MIXED_JOIN are not estimated
 
-**This is an open defect, not a solved problem.** The weighting is unbiased only if each build batch
-contributes an equal share of a probe batch's output. It does not, in general, and when it does not
-the ratio reads **high** — the unsafe direction, and the one the mechanisms below are supposed to
-rule out.
+**The pairing weighting has an unsolved bias, so the estimate is withheld for those modes.**
+`consumed_primary_input_bytes()` answers only in BUILD_PROBE mode, where each probe batch is popped
+exactly once and `consumed` is a plain running total with no weighting to bias. The weighting is
+unbiased only if each build batch contributes an equal share of a probe batch's output. It does not,
+in general, and when it does not the ratio reads **high** — the unsafe direction, and the one the
+mechanisms below are supposed to rule out. The rest of this section records why, so the gate is not
+lifted without fixing it.
 
 `next_cross_schedule_pair` hands out the first unscheduled pair in `(partition, probe, build)`
 order, so partition 0's grid is fully scheduled before partition 1 gets anything, and within a
-partition probe batch 0 sweeps all B build batches before probe batch 1 starts. At the fan-in gate
-opens — `min_fan_in_ratio_samples` completed pairings, 16 by default — the denominator therefore
+partition probe batch 0 sweeps all B build batches before probe batch 1 starts. When the fan-in
+gate opens — `min_fan_in_ratio_samples` completed pairings, 16 by default — the denominator would
 carries weight for only the first probe batch or two, while the numerator is the pipeline's *whole*
 output. If matches concentrate in the early build batches, output is already near its final value
 while the denominator reads `bytes(p0) × 16/B`, overstating the ratio by roughly **B/16** for
@@ -237,49 +241,36 @@ is then the true total probe bytes — but it is largest early, which is when co
 Neither available fix is cheap. Restricting the ratio to fully-paired probe batches would remove the
 bias outright, but the join records output per *task*, not per probe batch, so the numerator cannot
 be narrowed to match. Gating on pairing completeness instead of task count would work, at the cost
-of withholding the estimate until near the end of the join. Until one lands, treat a fan-in estimate
-as an upper-biased figure under build or partition skew.
+of withholding the estimate until near the end of the join. Until one lands, STANDARD and
+MIXED_JOIN report no consumed total at all, and the weighted bookkeeping is removed rather than
+maintained inert. Lifting the gate therefore means restoring, from git history: the size map and
+its recorders, the publish-after-claim ordering, the late-size carry, and the `execute()` backstop
+for a batch whose only pairing loses the non-blocking size read.
 
 ### Keeping the error one-directional
 
 An estimate that reads low costs a consumer some headroom; one that reads high can leave it
-under-provisioned. Three mechanisms exist to keep the error on the low side — bounding the *races
-and read orders* below, not the modelling bias documented just above, which they do not address.
+under-provisioned. One mechanism keeps race error on the low side (it does not address the
+modelling bias documented above):
 
 *Read order.* The two terms live on different objects and cannot be read atomically, so the
-numerator is sampled before the denominator. `consumed` advances at task *creation* and
-`output_bytes` at *completion*, both monotonically, so reading output first leaves the denominator a
-superset of the numerator's tasks. The opposite order lets a task both created and completed between
-the two reads contribute output with no matching input.
+numerator is sampled before the denominator. `consumed` advances when a task takes its probe batch
+and `output_bytes` at *completion*, both monotonically, so reading output first leaves the
+denominator a superset of the numerator's tasks. The opposite order lets a task that both took its
+batch and completed between the two reads contribute output with no matching input.
 
-*Publish order.* The weighted total is republished after a pairing is claimed, never before:
-`refresh_cross_schedule` runs ahead of the increment, so its store alone would leave the new
-pairing's weight unpublished while the task it hands out is already free to record output. The claim
-republishes for itself; the store in `refresh_cross_schedule` covers only the polls that claim
-nothing. Both are no-ops until the build side finishes — the predicate
-`consumed_primary_input_bytes()` gates on — which also keeps the walk off the streaming phase, as
-the discard sweep beside it already does.
-
-*Late sizes.* `execute()` cannot republish (the weights need `_cross`, hence `op_state_mutex`), and
-scheduler polling is event-driven, so it may never run again after the last task is handed out. A
-size learned in the drain tail is therefore carried in a separate accumulator at its **full** size
-rather than its pairing fraction: over-counting the denominator biases the ratio low. A publish
-folds it into the weights and clears the carry.
+The removed weighted path needed two more — publish-after-claim ordering and a full-size carry for
+sizes learned too late to weight — recorded in git history with the machinery, to return with it.
 
 ### Recording sizes
 
-`record_probe_batch_bytes` is the only writer of the size map, so the "paired or counted whole,
-never both" split holds by construction. It skips ids already counted whole, which is what keeps an
-orphan task from disturbing the totals: the scheduler has already counted the survivor, and the
-synthesized empty opposite handed to the same task is not a probe batch at all.
-
-The claim-time read is non-blocking, since it runs under the join's state lock and a resident batch
-may be exclusively locked by a concurrent conversion; a lost race is retried at the batch's next
-pairing. A batch paired only once has no next pairing, so `execute()` records again off the accessor
-it has already materialized with a blocking read. Sizes come from
+`note_probe_bytes_counted` is the only writer: each popped probe batch's bytes enter
+`_whole_probe_bytes` once, keyed by batch id in `_counted_probe_batch_ids`, so an OOM-rescheduled
+task re-entering `execute()` with the same batch — or an orphan already counted by the scheduler —
+adds nothing. Sizes come from
 `get_uncompressed_data_size_in_bytes()`: `get_size_in_bytes()` is representation-dependent, so the
-same rows would contribute different numbers depending on tier — and on whether a lock race was
-lost — and would not match the units `input_basis` counts.
+same rows would contribute different numbers depending on tier, and would not match the units
+`input_basis` counts.
 
 That accounting takes `_probe_bytes_mutex`, never `op_state_mutex`: `execute()` updates it while
 holding a batch lock, and two scheduler paths (the cross-schedule orphan and the broadcast slot
@@ -305,7 +296,7 @@ There is deliberately no task-count correction for in-flight tasks: `consumed` d
 once per task, so the completed fraction of tasks does not map onto the consumed fraction of bytes.
 
 The in-flight skew described above is not the only bias on the fan-in ratio, and `16` does not
-bound the other one. See [the known bias](#known-bias-the-weighting-assumes-output-accrues-evenly-across-build-batches):
+bound the other one. See [why STANDARD and MIXED_JOIN are not estimated](#why-standard-and-mixed_join-are-not-estimated):
 under build or partition skew the pairing weighting pushes the ratio high by roughly `B/16`, in the
 opposite direction to the in-flight effect and not necessarily smaller than it.
 
@@ -315,8 +306,8 @@ opposite direction to the in-flight effect and not necessarily smaller than it.
 |----------|-----------|
 | anchors | `GPU_SCAN`; `GPU_VALUES` (also covers `COLUMN_DATA_SCAN`, `DUMMY_SCAN`, `EMPTY_RESULT`, rewritten to it at plan generation); any finished pipeline |
 | pass-through (recurse) | any single-ingress pipeline — `FILTER`, `PROJECTION`, sorts, aggregates, `CONCAT`, `PARTITION` |
-| fan-in | `HASH_JOIN` (INNER/LEFT/SEMI/ANTI/MARK) |
-| dead ends (`nullopt`) | `STREAMING_SOURCE` (by design); `TABLE_SCAN`; `NESTED_LOOP_JOIN`, delim joins, `CTE`, `HASH_JOIN` RIGHT-family and OUTER (no nominated primary); any unfinished pipeline holding a `STREAMING_LIMIT` |
+| fan-in | `HASH_JOIN` (INNER/LEFT/SEMI/ANTI/MARK) in **BUILD_PROBE mode only** |
+| dead ends (`nullopt`) | `STREAMING_SOURCE` (by design); `TABLE_SCAN`; `NESTED_LOOP_JOIN`, delim joins, `CTE`, `HASH_JOIN` RIGHT-family and OUTER (no nominated primary); any unfinished pipeline holding a `STREAMING_LIMIT`; `HASH_JOIN` in STANDARD or MIXED_JOIN mode |
 
 Because the estimator works at pipeline granularity, single-input operators need no per-operator
 model: a pipeline's ratio is measured end-to-end, so whatever a projection or filter does to byte

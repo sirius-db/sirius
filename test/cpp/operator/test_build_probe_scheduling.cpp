@@ -31,11 +31,14 @@
 #include "helper/type_conversions.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_partition.hpp"
+#include "pipeline/pipeline_build_context.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 
 #include <catch.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 
+#include <memory>
 #include <stdexcept>
 #include <string_view>
 
@@ -595,6 +598,27 @@ TEST_CASE("broadcast_slots_to_discard - a DESTROYED slot is not rediscarded", "[
 
 namespace {
 
+// Exposes the protected mode knob and byte recorder so BUILD_PROBE accounting is testable
+// without a wired pipeline graph.
+struct exposed_hash_join : sirius::op::sirius_physical_hash_join {
+  using sirius_physical_hash_join::note_probe_bytes_counted;
+  using sirius_physical_hash_join::sirius_physical_hash_join;
+
+  void set_build_probe_mode() { _join_mode = sirius::op::HASH_JOIN_MODE::BUILD_PROBE; }
+};
+
+/// Pipeline whose finished state is set directly.
+struct finishable_pipeline : sirius::pipeline::sirius_pipeline {
+  explicit finishable_pipeline(const sirius::pipeline::pipeline_build_context& ctx)
+    : sirius_pipeline(ctx)
+  {
+  }
+
+  [[nodiscard]] bool is_pipeline_finished() const override { return finished; }
+
+  bool finished = false;
+};
+
 // LogicalComparisonJoin must outlive hash_join, which references op.types.
 struct nomination_fixture {
   duckdb::unique_ptr<duckdb::LogicalComparisonJoin> logical_join;
@@ -621,7 +645,7 @@ nomination_fixture make_join(duckdb::JoinType join_type)
   cond.comparison = duckdb::ExpressionType::COMPARE_EQUAL;
   conditions.push_back(std::move(cond));
 
-  f.hash_join = duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
+  f.hash_join = duckdb::make_uniq<exposed_hash_join>(
     *f.logical_join,
     make_child(),
     make_child(),
@@ -663,4 +687,47 @@ TEST_CASE("primary_input_port - build-streaming joins nominate nothing",
     INFO("join type: " << duckdb::JoinTypeToString(jt));
     REQUIRE_FALSE(f.hash_join->primary_input_port().has_value());
   }
+}
+
+TEST_CASE("probe bytes are only unweighted in BUILD_PROBE mode",
+          "[hash_join][size_estimation][unit]")
+{
+  // Only BUILD_PROBE, which pops each probe batch exactly once, reports a consumed total; a
+  // cross schedule would need pairing weights, which are biased under skew.
+  auto f = make_join(duckdb::JoinType::INNER);
+  CHECK_FALSE(f.hash_join->probe_bytes_are_unweighted());
+  // consumed_primary_input_bytes() gates on the same predicate before anything else.
+  CHECK_FALSE(f.hash_join->consumed_primary_input_bytes().has_value());
+}
+
+TEST_CASE("BUILD_PROBE byte accounting - accumulation, dedup, and the build-finished gate",
+          "[hash_join][size_estimation][unit]")
+{
+  auto f  = make_join(duckdb::JoinType::INNER);
+  auto* j = static_cast<exposed_hash_join*>(f.hash_join.get());
+  j->set_build_probe_mode();
+  REQUIRE(j->probe_bytes_are_unweighted());
+
+  // Without a build port the accessor cannot know the build side finished.
+  CHECK_FALSE(j->consumed_primary_input_bytes().has_value());
+
+  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  auto build_pipeline = duckdb::make_shared_ptr<finishable_pipeline>(ctx);
+  auto port           = std::make_unique<sirius::op::sirius_physical_operator::port>();
+  port->src_pipeline  = build_pipeline;
+  j->add_port("build", std::move(port));
+
+  // Bytes recorded while the build side is still open are withheld...
+  j->note_probe_bytes_counted(7, 1000);
+  j->note_probe_bytes_counted(8, 500);
+  CHECK_FALSE(j->consumed_primary_input_bytes().has_value());
+
+  // ...and reported once it finishes.
+  build_pipeline->finished = true;
+  CHECK(j->consumed_primary_input_bytes() == std::size_t{1500});
+
+  // An OOM-rescheduled task re-enters execute() with the same batch id; the dedup counts it once,
+  // whatever size the retry reads.
+  j->note_probe_bytes_counted(7, 999999);
+  CHECK(j->consumed_primary_input_bytes() == std::size_t{1500});
 }
