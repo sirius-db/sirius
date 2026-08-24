@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "exec/streaming_fragment.hpp"
 #include "op/sirius_physical_streaming_sink.hpp"
 #include "query_id.hpp"
 
@@ -93,6 +94,9 @@ void with_conversion_result(
 void with_initialized_engine(duckdb::Connection& con,
                              const std::string& query,
                              const std::function<void(sirius_engine&)>& consume);
+
+//! SQL → bound LogicalOperator (tests stand in for Substrait). Caller must have a transaction.
+exec::logical_plan_source sql_plan_source(const std::string& query);
 
 //! Like with_initialized_engine, but roots the plan in a STREAMING_SINK over output_repos.
 //! Caller owns the plan tree; engine borrows via initialize_internal.

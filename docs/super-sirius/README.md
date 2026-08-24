@@ -37,6 +37,8 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Scan](scan.md) | Scan subsystem: unified GPU scan operator, `gpu_ingestible` (parquet + DuckDB-native), scan manager, pinned tables, DuckDB-native decode, row-group pruning, Sirius IO layer (uring/REST/kvikio + prefetching cache) |
 | [Memory Management](memory-management.md) | cuCascade tiers, reservations, downgrade executor |
 | [Data Management](data-management.md) | Data batches, repositories, ports, barrier semantics |
+| [Streaming Sessions](streaming-sessions.md) | Fragment boundaries for distributed queries: `exec::batch_stream`, streaming source/sink, the id-addressed `stream_session` |
+| [Streaming Fragments](streaming-fragments.md) | Building and running one fragment: `stream_bind_catalog`, `exec::streaming_fragment`, the cross-language `sirius::ffi::Fragment`/`Context` lifecycle |
 | [Configuration](configuration.md) | sirius_config, operator_params, SET variables |
 | [Optimizations](optimizations.md) | Performance optimizations with PRs, code paths, configs |
 | [Compressed Pinning](compressed-pinning.md) | Simpatico-compressed pin_table on host/GPU tiers — which tier to compress on, plan selection vs the H2D link, GB300 SF1000 results |

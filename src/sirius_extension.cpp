@@ -94,6 +94,7 @@ extern "C" int cudaProfilerStop();
 #endif
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/connection_manager.hpp"
+#include "exec/stream_plan_bindings.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "op/result/host_table_chunk_reader.hpp"
@@ -1832,6 +1833,11 @@ static void SiriusVectorSearchFunction(ClientContext& context,
 
 void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 {
+  // A fragment plan reads each of its input streams through sirius_stream_source(id). Register
+  // it wherever Sirius is loaded, not just on the FFI's embedded DuckDB, so a fragment plan binds
+  // on the transparent path too.
+  sirius::exec::register_stream_source_function(instance);
+
   auto transaction = CatalogTransaction::GetSystemTransaction(instance);
   auto& catalog    = Catalog::GetSystemCatalog(instance);
 
