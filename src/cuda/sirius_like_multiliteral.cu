@@ -35,34 +35,48 @@ namespace {
 constexpr int max_literals      = like_multiliteral_max_literals;
 constexpr int max_chunks        = detail::like_multiliteral_max_chunks;
 constexpr int threads_per_block = 256;
+constexpr int word_shift        = 3;
+constexpr int bytes_per_word     = 1 << word_shift;
+constexpr int word_mask          = bytes_per_word - 1;
+constexpr int bits_per_byte      = 8;
+constexpr int bits_per_word      = bytes_per_word * bits_per_byte;
+
+static_assert(bytes_per_word == sizeof(uint64_t));
 
 using literal_desc = detail::like_multiliteral_literal_desc;
 using pattern_desc = detail::like_multiliteral_pattern_desc;
 
-/// SWAR byte-equality candidate mask: a SUPERSET of the equal-byte positions of @p x vs the
-/// broadcast byte of @p bcast, as bit 7 per byte. Every byte equal to bcast is flagged, but
-/// borrow propagation from the subtraction can set spurious bits on unequal bytes — callers
-/// MUST verify candidates against the actual bytes before acting on them.
+/// SWAR (SIMD Within A Register) byte-equality candidate mask: a SUPERSET of the equal-byte
+/// positions of @p x vs the broadcast byte of @p bcast, as bit 7 per byte. Every byte equal to
+/// bcast is flagged, but borrow propagation from the subtraction can set spurious bits on unequal
+/// bytes — callers MUST verify candidates against the actual bytes before acting on them.
 __device__ __forceinline__ uint64_t byte_eq_mask(uint64_t x, uint64_t bcast)
 {
-  uint64_t const v = x ^ bcast;  // equal bytes become 0
+  /// @p bcast is the target byte replicated 8 times
+  /// The result uses the high bit of each byte as a marker
+  auto const v = x ^ bcast;  // equal bytes become 0
+  /// SISD: (z - 1) & ~z & 0x80 would identify a zero byte. The computation below is a 'SIMD'
+  /// version that will produce false positives due to underflow.
   return (v - 0x0101010101010101ULL) & ~v & 0x8080808080808080ULL;
 }
 
-/// Load one aligned little-endian word without reading past the chars child.
+/// Load one aligned little-endian word without reading past the chars child (here: word = 8 bytes
+/// [uint64_t])
 __device__ __forceinline__ uint64_t load_aligned_word(uint64_t const* __restrict__ words,
                                                       int64_t chars_size,
                                                       int64_t word_index)
 {
-  int64_t const byte_pos = word_index << 3;
+  auto const byte_pos = word_index << word_shift;
   if (byte_pos >= chars_size) { return 0; }
-  if (chars_size - byte_pos >= static_cast<int64_t>(sizeof(uint64_t))) { return words[word_index]; }
+  if (chars_size - byte_pos >= static_cast<int64_t>(bytes_per_word)) {
+    return words[word_index];
+  }
   auto const* tail = reinterpret_cast<unsigned char const*>(words) + byte_pos;
   uint64_t value   = 0;
 #pragma unroll
-  for (int i = 0; i < static_cast<int>(sizeof(uint64_t)); ++i) {
+  for (int i = 0; i < bytes_per_word; ++i) {
     if (byte_pos + i >= chars_size) { break; }
-    value |= static_cast<uint64_t>(tail[i]) << (i * 8);
+    value |= static_cast<uint64_t>(tail[i]) << (i * bits_per_byte);
   }
   return value;
 }
@@ -76,12 +90,12 @@ __device__ __forceinline__ uint64_t read_u64_window(uint64_t const* __restrict__
                                                     int64_t chars_size,
                                                     int64_t p)
 {
-  int64_t const w   = p >> 3;
-  int const off     = static_cast<int>(p & 7) * 8;
-  uint64_t const lo = load_aligned_word(words, chars_size, w);
-  if (off == 0) { return lo; }
-  uint64_t const hi = load_aligned_word(words, chars_size, w + 1);
-  return (lo >> off) | (hi << (64 - off));
+  auto const w       = p >> word_shift;
+  auto const bit_off = static_cast<int>(p & word_mask) * bits_per_byte;
+  auto const lo      = load_aligned_word(words, chars_size, w);
+  if (bit_off == 0) { return lo; }
+  auto const hi = load_aligned_word(words, chars_size, w + 1);
+  return (lo >> bit_off) | (hi << (bits_per_word - bit_off));
 }
 
 /// Candidate positions for a literal within the aligned word @p cur: a SUPERSET of the byte
@@ -92,11 +106,11 @@ __device__ __forceinline__ uint64_t read_u64_window(uint64_t const* __restrict__
 __device__ __forceinline__ uint64_t
 candidate_mask(uint64_t cur, uint64_t next, uint64_t b0, uint64_t b1, int32_t len)
 {
-  uint64_t const c1 = byte_eq_mask(cur, b0);
+  auto const c1 = byte_eq_mask(cur, b0);
   if (len == 1) { return c1; }
-  uint64_t const c2  = byte_eq_mask(cur, b1);
-  uint64_t const c2n = byte_eq_mask(next, b1);
-  return c1 & ((c2 >> 8) | (c2n << 56));
+  auto const c2  = byte_eq_mask(cur, b1);
+  auto const c2n = byte_eq_mask(next, b1);
+  return c1 & ((c2 >> bits_per_byte) | (c2n << (bits_per_word - bits_per_byte)));
 }
 
 /// Full literal verification at byte position @p p (caller guarantees p + lit.len fits the row).
@@ -108,7 +122,7 @@ __device__ __forceinline__ bool verify_literal(uint64_t const* __restrict__ word
 #pragma unroll
   for (int c = 0; c < max_chunks; ++c) {
     if (c == lit.nchunks) { break; }
-    uint64_t const win = read_u64_window(words, chars_size, p + 8 * c);
+    auto const win = read_u64_window(words, chars_size, p + bytes_per_word * c);
     if ((win & lit.chunk_mask[c]) != lit.chunk_val[c]) { return false; }
   }
   return true;
@@ -138,34 +152,36 @@ __global__ void like_multiliteral_kernel(uint64_t const* __restrict__ words,
 {
   auto const row = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (row >= nrows) { return; }
-  int64_t const chars_size = static_cast<int64_t>(offsets[nrows]);
+  auto const chars_size = static_cast<int64_t>(offsets[nrows]);
 
   bool match = false;
   bool const is_valid =
     null_mask == nullptr ||
     cudf::bit_is_set(null_mask, mask_offset + static_cast<cudf::size_type>(row));
   if (is_valid) {
-    int64_t const s = static_cast<int64_t>(offsets[row]);
-    int64_t const e = static_cast<int64_t>(offsets[row + 1]);
+    auto const s = static_cast<int64_t>(offsets[row]);
+    auto const e = static_cast<int64_t>(offsets[row + 1]);
     if (e - s >= pat.total_len) {  // rows shorter than the literals cannot match
-      int li          = 0;
-      int64_t min_pos = s;  // next literal may start no earlier than this
+      int li       = 0;
+      auto min_pos = s;  // next literal may start no earlier than this
       // Hot fields of the current literal, kept in registers.
-      uint64_t b0 = pat.literals[0].b0_bcast;
-      uint64_t b1 = pat.literals[0].b1_bcast;
-      int32_t len = pat.literals[0].len;
+      auto b0  = pat.literals[0].b0_bcast;
+      auto b1  = pat.literals[0].b1_bcast;
+      auto len = pat.literals[0].len;
 
-      int64_t w        = s >> 3;
-      int64_t const we = (e + 7) >> 3;  // exclusive
-      uint64_t cur     = load_aligned_word(words, chars_size, w);
+      auto w        = s >> word_shift;
+      auto const we = (e + word_mask) >> word_shift;  // exclusive
+      auto cur      = load_aligned_word(words, chars_size, w);
       for (; w < we && !match; ++w) {
-        uint64_t const next = load_aligned_word(words, chars_size, w + 1);
-        int64_t const base  = w << 3;
-        uint64_t cand       = candidate_mask(cur, next, b0, b1, len);
+        auto const next = load_aligned_word(words, chars_size, w + 1);
+        auto const base = w << word_shift;  // byte position of aligned word index
+        auto cand       = candidate_mask(cur, next, b0, b1, len);
         while (cand) {
-          int const k = __ffsll(static_cast<long long>(cand)) - 1;
+          // Extract the earliest candidate
+          auto const k = __ffsll(static_cast<long long>(cand)) - 1;
+          // Clear the lowest set bit in the candidate mask
           cand &= cand - 1;
-          int64_t const p = base + (k >> 3);
+          auto const p = base + (k >> word_shift);  // convert bit index into byte lane
           // Bytes before the row start / previous match, or literals overrunning the row
           // end (including digram second-bytes that belong to the next row), are rejected
           // here — candidate detection may fire on them, verification never sees them.
@@ -195,12 +211,12 @@ __global__ void like_multiliteral_kernel(uint64_t const* __restrict__ words,
 literal_desc make_literal_desc(std::string const& lit)
 {
   literal_desc d{};
-  d.len     = static_cast<int32_t>(lit.size());
-  d.nchunks = (d.len + 7) / 8;
+  d.len     = static_cast<int>(lit.size());
+  d.nchunks = (d.len + word_mask) / bytes_per_word;
   for (int i = 0; i < d.len; ++i) {
     auto const byte = static_cast<uint64_t>(static_cast<unsigned char>(lit[i]));
-    d.chunk_val[i / 8] |= byte << (8 * (i % 8));
-    d.chunk_mask[i / 8] |= 0xFFULL << (8 * (i % 8));
+    d.chunk_val[i / bytes_per_word] |= byte << (bits_per_byte * (i % bytes_per_word));
+    d.chunk_mask[i / bytes_per_word] |= 0xFFULL << (bits_per_byte * (i % bytes_per_word));
   }
   d.b0_bcast = 0x0101010101010101ULL * static_cast<unsigned char>(lit[0]);
   d.b1_bcast = d.len >= 2 ? 0x0101010101010101ULL * static_cast<unsigned char>(lit[1]) : 0;
@@ -215,13 +231,13 @@ like_multiliteral_pattern::like_multiliteral_pattern(std::vector<std::string> li
   if (_literals.empty() || _literals.size() > static_cast<size_t>(max_literals)) { return; }
   for (auto const& literal : _literals) {
     if (literal.empty() ||
-        literal.size() > static_cast<size_t>(like_multiliteral_max_literal_bytes)) {
+        literal.size() > static_cast<std::size_t>(like_multiliteral_max_literal_bytes)) {
       return;
     }
   }
 
-  _descriptor.n = static_cast<int32_t>(_literals.size());
-  for (size_t i = 0; i < _literals.size(); ++i) {
+  _descriptor.n = static_cast<int>(_literals.size());
+  for (std::size_t i = 0; i < _literals.size(); ++i) {
     _descriptor.literals[i] = make_literal_desc(_literals[i]);
     _descriptor.total_len += _descriptor.literals[i].len;
   }
@@ -236,7 +252,7 @@ std::optional<like_multiliteral_pattern> classify_like_multiliteral(std::string_
   }
   std::vector<std::string> literals;
   std::string current;
-  for (char const ch : pattern) {
+  for (auto const ch : pattern) {
     if (ch == '%') {
       if (!current.empty()) {
         if (current.size() > static_cast<size_t>(like_multiliteral_max_literal_bytes) ||
@@ -292,7 +308,7 @@ std::unique_ptr<cudf::column> like_multiliteral(cudf::strings_column_view const&
   }
   for (auto const& literal : literals) {
     if (literal.empty() ||
-        literal.size() > static_cast<size_t>(like_multiliteral_max_literal_bytes)) {
+        literal.size() > static_cast<std::size_t>(like_multiliteral_max_literal_bytes)) {
       throw internal_exception("[like_multiliteral] literal of {} bytes was not classified out",
                                literal.size());
     }
@@ -309,7 +325,7 @@ std::unique_ptr<cudf::column> like_multiliteral(cudf::strings_column_view const&
   auto const offsets_id = input.offsets().type().id();
   if (offsets_id != cudf::type_id::INT32 && offsets_id != cudf::type_id::INT64) { return nullptr; }
   char const* chars_base = input.chars_begin(stream);
-  if (reinterpret_cast<uintptr_t>(chars_base) & 7) { return nullptr; }
+  if (reinterpret_cast<uintptr_t>(chars_base) & word_mask) { return nullptr; }
 
   auto const& pat = pattern._descriptor;
 
@@ -323,12 +339,12 @@ std::unique_ptr<cudf::column> like_multiliteral(cudf::strings_column_view const&
 
   auto const* null_mask = input.null_count() > 0 ? input.null_mask() : nullptr;
   auto const* words     = reinterpret_cast<uint64_t const*>(chars_base);
-  auto const num_blocks = static_cast<unsigned>(
+  auto const num_blocks = static_cast<uint32_t>(
     (static_cast<int64_t>(nrows) + threads_per_block - 1) / threads_per_block);
 
   if (offsets_id == cudf::type_id::INT32) {
-    auto const* offsets = input.offsets().data<int32_t>() + input.offset();
-    like_multiliteral_kernel<int32_t><<<num_blocks, threads_per_block, 0, stream.value()>>>(
+    auto const* offsets = input.offsets().data<int>() + input.offset();
+    like_multiliteral_kernel<int><<<num_blocks, threads_per_block, 0, stream.value()>>>(
       words, offsets, nrows, null_mask, input.offset(), pat, invert, out);
   } else {
     auto const* offsets = input.offsets().data<int64_t>() + input.offset();

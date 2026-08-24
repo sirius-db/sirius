@@ -45,8 +45,7 @@ namespace sirius {
  * load-instruction-bound. For the restricted-but-common pattern shape `%lit%...%lit%` an exact
  * match can be computed by scanning each row's characters as aligned `u64` words, detecting
  * candidate positions with a SWAR digram (first-two-bytes) equality mask, and verifying the
- * full literal only at candidate hits (measured ~6x over `cudf::strings::like` on TPC-H q13's
- * `o_comment NOT LIKE '%special%requests%'`).
+ * full literal only at candidate hits.
  *
  * The classifier is deliberately conservative: anything that is not plainly
  * `%lit1%lit2%...%litN%` with ASCII literals (no `_` wildcard, no escape character, no
@@ -60,21 +59,24 @@ inline constexpr int like_multiliteral_max_literal_bytes = 32;
 
 namespace detail {
 
+/// Max number of uint64_ts in a literal
 inline constexpr int like_multiliteral_max_chunks = like_multiliteral_max_literal_bytes / 8;
 
+/// Descriptor for a single literal in the fast-path kernel.
 struct like_multiliteral_literal_desc {
   uint64_t chunk_val[like_multiliteral_max_chunks];
   uint64_t chunk_mask[like_multiliteral_max_chunks];
   uint64_t b0_bcast;
   uint64_t b1_bcast;
-  int32_t len;
-  int32_t nchunks;
+  int len;
+  int nchunks;
 };
 
+/// Descriptor for the whole multi-literal pattern
 struct like_multiliteral_pattern_desc {
   like_multiliteral_literal_desc literals[like_multiliteral_max_literals];
-  int32_t n;
-  int32_t total_len;
+  int n;
+  int total_len;
 };
 
 }  // namespace detail

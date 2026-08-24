@@ -204,6 +204,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
       }
     }
 
+    // cuDF fallback
     auto result_column = cudf::strings::like(cudf::strings_column_view(input.get_column_view()),
                                              std::string_view(match_str),
                                              std::string_view(),
