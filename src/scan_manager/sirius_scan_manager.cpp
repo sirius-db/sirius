@@ -648,6 +648,23 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
   return nulls;
 }
 
+/// Whether this column's pin is a single uncompressed chunk — the one gather shape (a plain
+/// cudf::gather) that propagates validity. Must agree with resolve_pinned_column's own check.
+[[nodiscard]] bool pinned_column_nulls_are_safe(pinned_entry const& entry,
+                                                std::size_t column_position)
+{
+  if (entry.tier != cucascade::memory::Tier::GPU) { return false; }
+  if (!entry.device_chunks.empty()) {
+    return entry.device_chunks.size() == 1 && !entry.device_chunks.front().compressed &&
+           column_position < entry.device_chunks.front().columns.size() &&
+           entry.device_chunks.front().columns[column_position] != nullptr;
+  }
+  if (column_position >= entry.cache_info.names.size()) { return false; }
+  auto const it = entry.data_batches_by_column.find(entry.cache_info.names[column_position]);
+  return it != entry.data_batches_by_column.end() && it->second.size() == 1 &&
+         it->second.front() != nullptr;
+}
+
 /// Admit the plan's group-by-rowid extension, or refuse it with a reason.
 ///
 /// The plan pass found a ride that continues past the aggregates and reported
@@ -946,16 +963,12 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
       "at the port would gather the fan-out rather than the scan's rows");
   }
 
-  // A null in a value-deferred column has no representable placeholder: the materializer
-  // (late_mat_resolver.cpp, materialize.cpp::require_non_null) gathers real values back out of
-  // the pin and cannot restore a validity bit it never carried past the scan. Unlike the outer-
-  // join case above (nullable_columns_skipped, seen by the plan pass), this is the pinned SOURCE
-  // being nullable, which only the pin can answer — so it is checked here, before install, using
-  // the same nullopt-means-unknown-so-assume-nullable helper the count-only path already uses.
-  // Checked late (after the group-by-rowid extension) so a column ruled out here still gets a
-  // specific reason instead of failing opaquely at materialize time.
+  // The pinned SOURCE being nullable is only the pin's to answer, so it's checked here,
+  // before install, unless the gather shape can carry validity through (see
+  // pinned_column_nulls_are_safe).
   for (auto const position : planned.positions) {
     if (position >= selected_columns.size()) { continue; }  // caught again, and reported, below
+    if (pinned_column_nulls_are_safe(entry, selected_columns[position])) { continue; }
     auto const nulls = pinned_column_null_count(entry, selected_columns[position]);
     if (!nulls.has_value() || *nulls != 0) {
       return decline(
@@ -1140,11 +1153,11 @@ void install_rider_deferrals(std::vector<rider_candidate> const& candidates,
       }
     }
 
-    // Same gap as the primary bundle's install: a null in a rider's pinned source has no
-    // representable placeholder, and only the pin can answer whether one exists.
+    // Same gap and exemption as the primary bundle's install, above.
     bool rider_null_free = true;
     for (auto const position : planned.positions) {
       if (position >= candidate.columns.size()) { continue; }  // caught again below
+      if (pinned_column_nulls_are_safe(entry, candidate.columns[position])) { continue; }
       auto const nulls = pinned_column_null_count(entry, candidate.columns[position]);
       if (!nulls.has_value() || *nulls != 0) {
         rider_null_free = false;

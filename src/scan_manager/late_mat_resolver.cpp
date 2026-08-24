@@ -87,6 +87,10 @@ std::optional<late_mat::pinned_column_view> resolve_pinned_column(
   view.pin_generation = origin.generation;
 
   if (uses_device_chunks(*entry)) {
+    // Only the single-batch gather (a plain cudf::gather) propagates validity; the
+    // multi-batch and compressed routes write values into an unallocated-mask output.
+    bool const nulls_are_safe =
+      entry->device_chunks.size() == 1 && !entry->device_chunks.front().compressed;
     for (auto const& chunk : entry->device_chunks) {
       late_mat::batch_source source;
       source.num_rows = chunk_rows(chunk);
@@ -107,7 +111,7 @@ std::optional<late_mat::pinned_column_view> resolve_pinned_column(
           return std::nullopt;
         }
         auto const& col = *chunk.columns[origin.column_pos];
-        if (col.null_count() != 0) { return std::nullopt; }
+        if (!nulls_are_safe && col.null_count() != 0) { return std::nullopt; }
         source.uncompressed = col.view();
         if (view.dtype.id() == cudf::type_id::EMPTY) { view.dtype = col.type(); }
       }
@@ -116,8 +120,10 @@ std::optional<late_mat::pinned_column_view> resolve_pinned_column(
   } else {
     auto const it = entry->data_batches_by_column.find(names[origin.column_pos]);
     if (it == entry->data_batches_by_column.end()) { return std::nullopt; }
+    bool const nulls_are_safe = it->second.size() == 1;
     for (auto const& col : it->second) {
-      if (!col || col->null_count() != 0) { return std::nullopt; }
+      if (!col) { return std::nullopt; }
+      if (!nulls_are_safe && col->null_count() != 0) { return std::nullopt; }
       late_mat::batch_source source;
       source.uncompressed = col->view();
       source.num_rows     = col->size();

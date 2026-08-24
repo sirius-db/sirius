@@ -30,6 +30,8 @@
 #include "operator/operator_test_utils.hpp"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/null_mask.hpp>
+#include <cudf/utilities/bit.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
@@ -250,4 +252,148 @@ TEST_CASE("an origin materializes the rows a join asked for, end to end", "[late
     expect.push_back(static_cast<std::int32_t>(id));
   }
   REQUIRE(read_back(out->view()) == expect);
+}
+
+TEST_CASE("a single batch materializes through the raw gather path", "[late_mat][resolver]")
+{
+  auto const stream = rmm::cuda_stream_view{};
+  auto const mr     = rmm::mr::get_current_device_resource_ref();
+  fake_entry pin({64}, "l_quantity", stream);
+
+  auto const layout = resolve_pinned_layout(pin.origin());
+  auto const column = resolve_pinned_column(pin.origin());
+  REQUIRE(layout.has_value());
+  REQUIRE(column.has_value());
+  REQUIRE(column->batches.size() == 1);
+
+  std::vector<std::uint64_t> const ids{0, 17, 63, 1, 40};
+  auto d_ids = upload_ids(ids, stream);
+  prepared_selection const prepared(*layout,
+                                    row_id_list{static_cast<std::uint64_t const*>(d_ids.data()),
+                                                static_cast<std::int64_t>(ids.size()),
+                                                false});
+  auto const out = materialize(*column, prepared, stream, mr);
+  cudaStreamSynchronize(stream.value());
+  std::vector<std::int32_t> expect;
+  for (auto const id : ids) {
+    expect.push_back(static_cast<std::int32_t>(id));
+  }
+  REQUIRE(read_back(out->view()) == expect);
+}
+
+namespace {
+
+/// Like fake_entry, but `null_rows` (global row ids) are set null.
+struct fake_nullable_entry {
+  pinned_entry entry;
+  std::shared_ptr<pin_entry_handle> handle;
+
+  fake_nullable_entry(std::vector<std::int64_t> const& batch_rows,
+                      std::vector<std::int64_t> const& null_rows,
+                      std::string const& name,
+                      rmm::cuda_stream_view stream)
+  {
+    entry.tier = cucascade::memory::Tier::GPU;
+    entry.cache_info.names.push_back(name);
+
+    std::vector<std::shared_ptr<cudf::column>> chunks;
+    std::int64_t next = 0;
+    for (auto const rows : batch_rows) {
+      std::vector<std::int32_t> host(static_cast<std::size_t>(rows));
+      std::iota(host.begin(), host.end(), static_cast<std::int32_t>(next));
+
+      auto col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                           static_cast<cudf::size_type>(rows),
+                                           cudf::mask_state::ALL_VALID,
+                                           stream);
+      cudaMemcpyAsync(col->mutable_view().data<std::int32_t>(),
+                      host.data(),
+                      host.size() * sizeof(std::int32_t),
+                      cudaMemcpyHostToDevice,
+                      stream.value());
+      cudf::size_type null_count = 0;
+      for (auto const global_row : null_rows) {
+        if (global_row < next || global_row >= next + rows) { continue; }
+        auto const local = static_cast<cudf::size_type>(global_row - next);
+        cudf::set_null_mask(col->mutable_view().null_mask(), local, local + 1, false, stream);
+        ++null_count;
+      }
+      col->set_null_count(null_count);
+      next += rows;
+
+      chunks.push_back(std::shared_ptr<cudf::column>(std::move(col)));
+      entry.num_rows += static_cast<std::size_t>(rows);
+    }
+    cudaStreamSynchronize(stream.value());
+    entry.data_batches_by_column.emplace(name, std::move(chunks));
+
+    handle = std::make_shared<pin_entry_handle>(name, 5);
+    handle->set_entry(&entry);
+  }
+
+  [[nodiscard]] column_origin origin(std::uint32_t pos = 0) const
+  {
+    column_origin o;
+    o.handle     = handle;
+    o.column_pos = pos;
+    o.generation = handle->generation();
+    return o;
+  }
+};
+
+}  // namespace
+
+TEST_CASE("a single uncompressed batch may carry nulls, and the mask survives materialize",
+          "[late_mat][resolver]")
+{
+  auto const stream = rmm::cuda_stream_view{};
+  auto const mr     = rmm::mr::get_current_device_resource_ref();
+  fake_nullable_entry pin({64}, /*null_rows=*/{0, 17, 63}, "c_mktsegment", stream);
+
+  auto const column = resolve_pinned_column(pin.origin());
+  REQUIRE(column.has_value());
+  REQUIRE(column->batches.size() == 1);
+
+  auto const layout = resolve_pinned_layout(pin.origin());
+  REQUIRE(layout.has_value());
+
+  std::vector<std::uint64_t> const ids{0, 17, 63, 1, 40};
+  auto d_ids = upload_ids(ids, stream);
+  prepared_selection const prepared(*layout,
+                                    row_id_list{static_cast<std::uint64_t const*>(d_ids.data()),
+                                                static_cast<std::int64_t>(ids.size()),
+                                                false});
+  auto const out = materialize(*column, prepared, stream, mr);
+  cudaStreamSynchronize(stream.value());
+
+  REQUIRE(out->view().size() == static_cast<cudf::size_type>(ids.size()));
+  REQUIRE(out->view().nullable());
+  // The null mask lives on device; copy it to host before inspecting bits.
+  std::vector<cudf::bitmask_type> host_mask(static_cast<std::size_t>(
+    cudf::bitmask_allocation_size_bytes(out->view().size()) / sizeof(cudf::bitmask_type)));
+  cudaMemcpy(host_mask.data(),
+             out->view().null_mask(),
+             host_mask.size() * sizeof(cudf::bitmask_type),
+             cudaMemcpyDeviceToHost);
+  auto const* mask = host_mask.data();
+  // ids 0, 17, 63 were nulled; 1, 40 were not.
+  REQUIRE_FALSE(cudf::bit_is_set(mask, 0));
+  REQUIRE_FALSE(cudf::bit_is_set(mask, 1));
+  REQUIRE_FALSE(cudf::bit_is_set(mask, 2));
+  REQUIRE(cudf::bit_is_set(mask, 3));
+  REQUIRE(cudf::bit_is_set(mask, 4));
+  auto const values = read_back(out->view());
+  REQUIRE(values[3] == 1);
+  REQUIRE(values[4] == 40);
+}
+
+TEST_CASE("a multi-batch column with nulls is not deferred", "[late_mat][resolver]")
+{
+  auto const stream = rmm::cuda_stream_view{};
+  fake_nullable_entry pin({32, 32}, /*null_rows=*/{40}, "c_mktsegment", stream);
+
+  // The layout half still resolves — chunking alone decides it — but the column half must
+  // refuse: a multi-batch gather has no way to carry a validity bit through.
+  REQUIRE(resolve_pinned_layout(pin.origin()).has_value());
+  REQUIRE_FALSE(resolve_pinned_column(pin.origin()).has_value());
 }
