@@ -272,6 +272,8 @@ TEST_CASE("data_size_estimator: an unfinished leaf scales its known total by the
   REQUIRE(est.has_value());
   CHECK(est->bytes == 256 * kMiB);
   CHECK_FALSE(est->exact);
+  // A leaf applies its own ratio without recursing, so the count is 1 at zero recursion depth.
+  CHECK(est->hops == 1);
 }
 
 TEST_CASE("data_size_estimator: no ratio yet means no estimate, unless unit ratio is allowed",
@@ -524,6 +526,26 @@ TEST_CASE("data_size_estimator: planner provenance survives a downstream ratio",
   CHECK(est->planner_derived);
 }
 
+TEST_CASE("data_size_estimator: a projection never falls below the bytes already emitted",
+          "[data_size_estimator][estimation]")
+{
+  estimator_dag dag;
+  auto& producer                                 = dag.add();
+  estimator_dag::source_of(producer).input_total = 500 * kMiB;
+
+  // Ratio-eligible tasks: 400 MiB in, 40 MiB out, so the measured ratio is 0.1.
+  record_ratio(producer, 400 * kMiB, 40 * kMiB);
+  // Zero-basis tasks emit real bytes but cannot inform a ratio, so the projection is blind to
+  // them however accurate the upstream total is.
+  record_task(producer, 0, 200 * kMiB);
+
+  // 500 MiB x 0.1 = 50 MiB, which is less than the 240 MiB already emitted.
+  auto est = estimate_pipeline_total_output_bytes(producer);
+  REQUIRE(est.has_value());
+  CHECK(est->bytes == 240 * kMiB);
+  CHECK_FALSE(est->exact);
+}
+
 TEST_CASE("data_size_estimator: ratios compose along a multi-hop chain",
           "[data_size_estimator][estimation]")
 {
@@ -543,7 +565,8 @@ TEST_CASE("data_size_estimator: ratios compose along a multi-hop chain",
   REQUIRE(est.has_value());
   CHECK(est->bytes == 128 * kMiB);
   CHECK_FALSE(est->exact);
-  CHECK(est->hops == 1);
+  // scan's own ratio, then mid's.
+  CHECK(est->hops == 2);
 }
 
 TEST_CASE("data_size_estimator: the walk stops at the first finished pipeline",
@@ -661,8 +684,29 @@ TEST_CASE("data_size_estimator: a fan-in scales the primary upstream by output-p
   REQUIRE(est.has_value());
   CHECK(est->bytes == 256 * kMiB);
   CHECK_FALSE(est->exact);
-  CHECK(est->hops == 1);
+  // probe side's ratio, then the join's.
+  CHECK(est->hops == 2);
   CHECK_FALSE(est->planner_derived);
+}
+
+TEST_CASE("data_size_estimator: a fan-in projection never falls below the bytes already emitted",
+          "[data_size_estimator][estimation][fan_in]")
+{
+  fan_in_dag f;
+  // Probe projects 8 MiB and has emitted only 4, so its own floor does not bind and the join
+  // scales a genuinely small upstream.
+  estimator_dag::source_of(*f.probe).input_total = 8 * kMiB;
+  record_ratio(*f.probe, 4 * kMiB, 4 * kMiB);
+  // Consumed primary bytes are deliberately over-counted, so the ratio can read far below the
+  // join's true expansion: 8 MiB x (64/512) = 1 MiB, against 64 MiB already emitted.
+  f.record_join_ratio(999 * kMiB, 64 * kMiB);
+  estimator_dag::source_of(*f.join).primary_port     = "default";
+  estimator_dag::source_of(*f.join).consumed_primary = 512 * kMiB;
+
+  auto est = f.estimate();
+  REQUIRE(est.has_value());
+  CHECK(est->bytes == 64 * kMiB);
+  CHECK_FALSE(est->exact);
 }
 
 TEST_CASE("data_size_estimator: planner provenance survives a fan-in hop",

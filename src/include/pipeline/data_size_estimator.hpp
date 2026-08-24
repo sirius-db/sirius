@@ -37,7 +37,9 @@ struct data_size_estimate {
   std::size_t bytes = 0;
   /// True when anchored on an exact total with no learned ratio applied.
   bool exact = false;
-  /// Pipelines traversed; ratio error compounds per hop.
+  /// Ratios applied between the anchor and this answer; error compounds per hop, and exact
+  /// implies zero. Distinct from the recursion depth @ref size_estimate_options::max_hops
+  /// bounds — a leaf applies its own ratio without recursing.
   std::size_t hops = 0;
   /// Completed tasks behind the weakest measured ratio; zero means no measured ratio applies.
   std::size_t ratio_samples = 0;

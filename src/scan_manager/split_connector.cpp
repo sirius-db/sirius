@@ -31,11 +31,13 @@ split_connector::~split_connector() = default;
 void split_connector::push_split(std::unique_ptr<op::operator_data> split)
 {
   assert(split != nullptr && "push_split requires a non-null split");
+  // Sized before the lock: a cached-batch split reads its size through the blocking
+  // to_read_only(), which waits on a downgrade — under _mutex that stalls every consumer pop.
+  auto const split_bytes = split->get_estimated_size_in_bytes();
   {
     std::lock_guard<std::mutex> lock(_mutex);
     assert(!_closed && "push_split after close() is forbidden");
     // A zero estimate means unknown, not empty; latch it so the total remains conservative.
-    auto const split_bytes = split->get_estimated_size_in_bytes();
     _discovered_bytes += split_bytes;
     _has_unsized_splits = _has_unsized_splits || split_bytes == 0;
     _splits.push_back(std::move(split));

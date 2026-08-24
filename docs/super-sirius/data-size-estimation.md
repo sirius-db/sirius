@@ -40,7 +40,7 @@ will this port have received once its producer is done?"*.
 struct data_size_estimate {
   std::size_t bytes;           // projected whole-query total
   bool        exact;           // no learned ratio was applied
-  std::size_t hops;            // producer pipelines traversed
+  std::size_t hops;            // ratios applied; error compounds per hop
   std::size_t ratio_samples;   // tasks backing the weakest measured ratio
   bool        planner_derived; // anchored on planner cardinality
 };

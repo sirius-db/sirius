@@ -683,6 +683,9 @@ class sirius_physical_operator {
   port* get_port(std::string_view port_id);
   //! Get all ports from the operator
   std::vector<std::string_view> get_port_ids();
+  //! Ports in ownership order. Allocation-free, and reaches each port without the per-name
+  //! map lookup get_port_ids() implies.
+  [[nodiscard]] const std::list<std::unique_ptr<port>>& get_ports() const { return _ports_list; }
   //! Check if the source pipeline is finished
   bool is_source_pipeline_finished();
   //! Returns true if any FULL-barrier port has src_pipeline == src

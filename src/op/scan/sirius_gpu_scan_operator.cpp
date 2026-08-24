@@ -378,14 +378,16 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
   // and bytes together because they form one sample.
   auto const emitted_rows  = static_cast<std::size_t>(output_table->num_rows());
   auto const emitted_bytes = output_table->alloc_size();
+
+  auto batch =
+    sirius::make_data_batch(std::move(output_table), *mem_space, stream, batch_telemetry());
+  // Published only after make_data_batch succeeds: an OOM there reschedules the task into
+  // re-running the same split, and these bytes floor total_source_output_bytes().
   {
     std::lock_guard<std::mutex> guard(_emitted_mutex);
     _emitted_rows += emitted_rows;
     _emitted_bytes += emitted_bytes;
   }
-
-  auto batch =
-    sirius::make_data_batch(std::move(output_table), *mem_space, stream, batch_telemetry());
   std::vector<std::shared_ptr<::cucascade::data_batch>> batches{std::move(batch)};
   return std::make_unique<pipelineable_operator_data>(std::move(batches));
 }

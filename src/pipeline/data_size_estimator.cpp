@@ -29,12 +29,17 @@ namespace pipeline {
 
 namespace {
 
+// A port carries bytes only with a repository behind it and a pipeline producing into it.
+bool carries_data(const op::sirius_physical_operator::port* p)
+{
+  return p != nullptr && p->repo != nullptr && p->src_pipeline;
+}
+
 op::sirius_physical_operator::port* resolve_data_port(op::sirius_physical_operator& op,
                                                       std::string_view id)
 {
   auto* p = op.try_get_port(id);
-  if (p == nullptr || p->repo == nullptr || !p->src_pipeline) { return nullptr; }
-  return p;
+  return carries_data(p) ? p : nullptr;
 }
 
 struct producer_scan {
@@ -52,9 +57,9 @@ producer_scan scan_producer_pipelines(sirius_pipeline& pipeline)
   auto collect_from = [&](op::sirius_physical_operator* candidate) {
     if (candidate == nullptr) { return; }
     result.output_capped |= candidate->caps_pipeline_output();
-    for (auto port_id : candidate->get_port_ids()) {
-      auto* p = resolve_data_port(*candidate, port_id);
-      if (p == nullptr) { continue; }
+    for (auto const& owned : candidate->get_ports()) {
+      auto* p = owned.get();
+      if (!carries_data(p)) { continue; }
       if (std::find(seen.begin(), seen.end(), p) != seen.end()) { continue; }
       seen.push_back(p);
       if (result.count == 0) { result.first = p->src_pipeline.get(); }
@@ -93,9 +98,12 @@ std::optional<data_size_estimate> apply_pipeline_ratio(const history_totals& tot
   auto const scaled = scale_bytes_checked(input.bytes, trust_measured ? *totals.ratio() : 1.0);
   if (!scaled.has_value()) { return std::nullopt; }
   return data_size_estimate{
-    .bytes = *scaled,
+    // Floor at the bytes already emitted: the ratio is measured over eligible tasks only, so
+    // output from zero-basis and resumed tasks is invisible to it.
+    .bytes = std::max(*scaled, totals.output_bytes),
     .exact = false,
-    .hops  = input.hops,
+    // One more ratio now stands between the anchor and this answer.
+    .hops = input.hops + 1,
     // A substituted unit ratio contributes no measured support.
     .ratio_samples = trust_measured ? weaker_sample_count(input.ratio_samples, totals.ratio_records)
                                     : input.ratio_samples,
@@ -117,12 +125,12 @@ std::optional<data_size_estimate> estimate_output_bytes_impl(sirius_pipeline& pi
     if (totals.output_records == 0) {
       // No tasks means exact empty output; created tasks with no records lost measurement.
       if (pipeline.get_tasks_created() != 0) { return std::nullopt; }
-      return data_size_estimate{.bytes = 0, .exact = true, .hops = hops};
+      return data_size_estimate{.bytes = 0, .exact = true, .hops = 0};
     }
     return data_size_estimate{
       .bytes = totals.output_bytes,
       .exact = true,
-      .hops  = hops,
+      .hops  = 0,
     };
   }
 
@@ -159,9 +167,11 @@ std::optional<data_size_estimate> estimate_output_bytes_impl(sirius_pipeline& pi
     auto const scaled = scale_bytes_checked(upstream->bytes, ratio);
     if (!scaled.has_value()) { return std::nullopt; }
     return data_size_estimate{
-      .bytes           = *scaled,
+      // Floored as above: consumed primary bytes are deliberately over-counted, so the projection
+      // can fall below the bytes already emitted.
+      .bytes           = std::max(*scaled, totals.output_bytes),
       .exact           = false,
-      .hops            = upstream->hops,
+      .hops            = upstream->hops + 1,
       .ratio_samples   = weaker_sample_count(upstream->ratio_samples, totals.output_records),
       .planner_derived = upstream->planner_derived,
     };
@@ -175,7 +185,7 @@ std::optional<data_size_estimate> estimate_output_bytes_impl(sirius_pipeline& pi
     if (auto input_bytes = source->total_source_input_bytes()) {
       return apply_pipeline_ratio(
         pipeline.get_memory_history().totals(),
-        data_size_estimate{.bytes = *input_bytes, .exact = true, .hops = hops},
+        data_size_estimate{.bytes = *input_bytes, .exact = true, .hops = 0},
         options);
     }
     // A source-output estimate is also the pipeline output only for a lone source. Scaling it
@@ -183,8 +193,13 @@ std::optional<data_size_estimate> estimate_output_bytes_impl(sirius_pipeline& pi
     if (pipeline.get_sink().get() == source) {
       // GPU scan cardinality projection is planner-derived.
       if (auto output_bytes = source->total_source_output_bytes()) {
-        return data_size_estimate{
-          .bytes = *output_bytes, .exact = false, .hops = hops, .planner_derived = true};
+        // The source floors this at its own emitted bytes; the pipeline's recorded output is a
+        // second, independently measured lower bound on the same total.
+        auto const totals = pipeline.get_memory_history().totals();
+        return data_size_estimate{.bytes           = std::max(*output_bytes, totals.output_bytes),
+                                  .exact           = false,
+                                  .hops            = 0,
+                                  .planner_derived = true};
       }
     }
     return std::nullopt;
