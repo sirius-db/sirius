@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <variant>
+
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/transform.hpp>
