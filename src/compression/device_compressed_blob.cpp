@@ -47,7 +47,10 @@ void reconstruct_table(compressed_device_blob& blob,
 const simpatico::compressed_table& compressed_device_blob::ensure_table(
   rmm::cuda_stream_view stream, rmm::device_async_resource_ref scratch_mr)
 {
-  std::call_once(table_built, [&] { reconstruct_table(*this, stream, scratch_mr); });
+  std::call_once(table_built, [&] {
+    reconstruct_table(*this, stream, scratch_mr);
+    table_ready.store(true, std::memory_order_release);
+  });
   return table;
 }
 
@@ -108,9 +111,12 @@ std::shared_ptr<compressed_device_blob> build_device_compressed_blob(
 
   // Consume the once_flag either way, so the eager table is never rebuilt and the
   // lazy one is built exactly once whenever ensure_table first reaches it.
-  if (reconstruct_now) {
-    std::call_once(blob->table_built, [&] { reconstruct_table(*blob, stream, scratch_mr); });
-  }
+  //
+  // Via ensure_table rather than call_once directly, so both paths also set
+  // table_ready. Building here without it left has_table() false for eagerly
+  // built blobs — the pin path — which is precisely the case the no-argument
+  // table() accessor exists to serve.
+  if (reconstruct_now) { blob->ensure_table(stream, scratch_mr); }
 
   // The caller may drop the source compressed_table (which owns `buffers`) as soon
   // as this returns, so the copies above must have landed.

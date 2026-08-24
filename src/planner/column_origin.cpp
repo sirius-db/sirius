@@ -171,7 +171,18 @@ std::optional<column_origin> column_origin_resolver::lookup(const duckdb::Column
 
 column_origins column_origin_resolver::origins_of(duckdb::LogicalOperator& op) const
 {
-  auto bindings = op.GetColumnBindings();
+  // Lineage is an optimization for the spill compressor: it lets a spilled batch
+  // reuse its base table's offline plan instead of exploring for one mid-query.
+  // Nothing about correctness depends on it, so a failure to derive it must never
+  // fail the query. GetColumnBindings() can throw on an operator whose children a
+  // planner has already moved out, and until this guard existed that took the
+  // whole GPU plan down and sent the query to DuckDB CPU.
+  duckdb::vector<duckdb::ColumnBinding> bindings;
+  try {
+    bindings = op.GetColumnBindings();
+  } catch (const std::exception&) {
+    return {};
+  }
   column_origins out;
   out.reserve(bindings.size());
   for (auto const& b : bindings) {

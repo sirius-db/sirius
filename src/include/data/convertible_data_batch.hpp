@@ -18,8 +18,10 @@
 
 #include "compression/compressed_disk_representation.hpp"
 #include "compression/compressed_representation.hpp"
+#include "compression/compression_converters.hpp"
 #include "compression/output_compression.hpp"
 #include "compression/plan_register.hpp"
+#include "compression/compression_device_pool.hpp"
 #include "compression/spill_context.hpp"
 #include "data/convertible_data.hpp"
 #include "data/sirius_converter_registry.hpp"
@@ -260,9 +262,19 @@ class convertible_data_batch : public convertible_data {
       SIRIUS_LOG_DEBUG("[convertible_data_batch] spill compression skip: suppressed-or-disabled");
       return false;
     }
+    // No edge key: the batch reached the downgrade executor without a producing
+    // repository, so the plan register has nothing to look up and no lineage to
+    // resolve. That is not a reason to spill it raw — compression does not need a
+    // plan, only a carrier. The converter falls back to `default_plan_for` per
+    // column (bitpack for fixed-width numerics, passthrough for strings), and the
+    // usual whole-batch threshold still declines the result if it does not pay.
+    //
+    // Worth doing because unkeyed batches are the bulk of the traffic: on
+    // q5/SF1000, 117,915 spill attempts skipped for this reason against 874
+    // compressed spills.
     if (_source_repo == nullptr) {
-      SIRIUS_LOG_DEBUG("[convertible_data_batch] spill compression skip: no source edge");
-      return false;
+      SIRIUS_LOG_DEBUG(
+        "[convertible_data_batch] no source edge; compressing with dtype defaults");
     }
 
     auto& reg      = compression::plan_register::global();
@@ -311,6 +323,12 @@ class convertible_data_batch : public convertible_data {
       compression::scoped_spill_context guard(ctx);
       mut.convert_to<CompressedRep>(converter_registry, reservation, stream);
       return true;
+    } catch (const sirius::spill_source_consumed&) {
+      // The converter already owns (and has partly freed) this batch's columns,
+      // so there is no intact source to spill uncompressed. Falling back would
+      // convert an empty representation and hand downstream a zero-column batch.
+      // Fail the downgrade instead; the executor logs it and moves on.
+      throw;
     } catch (const std::exception& e) {
       // An OOM here is compression's own doing: the encode wanted device memory
       // during a spill, which is exactly when there is none. Suppress further
@@ -324,7 +342,13 @@ class convertible_data_batch : public convertible_data {
       // compression caused, so latching there toggles far too often to hold for
       // an episode. Only out-of-memory declines latch; a plan that merely
       // compressed too little is a verdict about the data, not memory pressure.
-      if (dynamic_cast<const rmm::out_of_memory*>(&e) != nullptr) {
+      // Only when the encoder shares the query's pool. With a dedicated arena
+      // the premise is gone: an OOM there means the arena's other concurrent
+      // encodes have it full right now, which says nothing about query memory
+      // and clears as they finish. Latching on it would disable compression for
+      // the whole episode on the first burst of concurrent spills.
+      if (dynamic_cast<const rmm::out_of_memory*>(&e) != nullptr &&
+          !compression::compression_device_pool_enabled()) {
         compression::set_spill_compression_suppressed(true);
       }
       SIRIUS_LOG_DEBUG(

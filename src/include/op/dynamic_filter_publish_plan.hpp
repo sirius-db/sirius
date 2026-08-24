@@ -79,6 +79,11 @@ class dynamic_filter_publish_plan final {
     return _domain_coverage_threshold;
   }
 
+  /// \brief Drop replica targets on GPUs outside @p admitted_gpu_ids. An empty list means
+  /// "no subset" and leaves the plan untouched. See
+  /// sirius_pipeline_converter::restrict_dynamic_filter_replicas for why this is needed.
+  void restrict_replicas_to(std::vector<int> const& admitted_gpu_ids);
+
  private:
   std::vector<probe_target> _probe_targets;
   bool _emit_zone_map_filters = false;

@@ -32,6 +32,7 @@
 #include <expression/ast/comparison.hpp>
 #include <expression/ast/conjunction.hpp>
 #include <expression/ast/constant.hpp>
+#include <expression/ast/constant_range.hpp>
 #include <expression/ast/function_call.hpp>
 #include <expression/ast/in_list.hpp>
 #include <expression/ast/node.hpp>
@@ -42,6 +43,7 @@
 #include <expression/value.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <helper/logical_type.hpp>
+#include <helper/numeric_narrowing.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 
 // cudf, etc.
@@ -300,6 +302,36 @@ std::shared_ptr<data_batch> make_decimal128_batch(memory_space& space,
   return data_batch::make(batch_id, std::move(gpu_repr));
 }
 
+// A column of type `carrier` holding `values`. make_input_batch's generator stops at
+// INT32, INT64, and STRING; the narrow-domain paths need carriers strictly narrower than the
+// reference's declared type, and a reference pair needs two of them side by side.
+template <typename T>
+std::unique_ptr<cudf::column> make_carrier_column(memory_space& space,
+                                                  cudf::data_type carrier,
+                                                  const std::vector<T>& values)
+{
+  auto stream = cudf::get_default_stream();
+  auto col    = cudf::make_numeric_column(carrier,
+                                       static_cast<cudf::size_type>(values.size()),
+                                       cudf::mask_state::UNALLOCATED,
+                                       stream,
+                                       get_resource_ref(space));
+  cudaMemcpy(col->mutable_view().data<T>(),
+             values.data(),
+             sizeof(T) * values.size(),
+             cudaMemcpyHostToDevice);
+  return col;
+}
+
+std::shared_ptr<data_batch> make_batch_from_columns(
+  memory_space& space, std::vector<std::unique_ptr<cudf::column>> columns)
+{
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto gpu_repr =
+    std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
+  return data_batch::make(::sirius::get_next_batch_id(), std::move(gpu_repr));
+}
+
 using exp_executor      = ::sirius::expression_evaluator;
 using exp_strategy_enum = ::sirius::expression_evaluator_strategy;
 auto constexpr MAT      = exp_strategy_enum::MATERIALIZE;
@@ -379,6 +411,19 @@ std::vector<std::unique_ptr<ast_node>> one(std::unique_ptr<ast_node> n)
   std::vector<std::unique_ptr<ast_node>> v;
   v.push_back(std::move(n));
   return v;
+}
+
+// DATE literals. The shared builders in ast_test_support.hpp stop at the literal kinds its GPU
+// suites materialize; only the narrow-domain eligibility tests below need a date.
+sirius::ast::constant date_literal(int32_t days)
+{
+  return sirius::ast::constant{sirius::value{sirius::date_value{days}},
+                               logical_type::make(type_id::DATE)};
+}
+
+std::unique_ptr<ast_node> make_date_const(int32_t days)
+{
+  return std::make_unique<ast_node>(date_literal(days));
 }
 }  // namespace
 
@@ -642,6 +687,333 @@ TEST_CASE("narrow-domain BETWEEN evaluates on the narrowed carrier",
   for (std::size_t i = 0; i < input_values.size(); ++i) {
     auto const value = static_cast<int64_t>(input_values[i]);
     REQUIRE(output_values[i] == ((value >= 5 && value < 20) ? 1U : 0U));
+  }
+}
+
+TEST_CASE("narrow-domain reference pairs evaluate on their shared carrier",
+          "[expression_evaluator][compressed_materialization][narrow_domain]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  auto const bigint_type = logical_type::make(type_id::BIGINT);
+  auto const date_type   = logical_type::make(type_id::DATE);
+  auto const int8        = cudf::data_type{cudf::type_id::INT8};
+  auto const int16       = cudf::data_type{cudf::type_id::INT16};
+
+  // Epoch days spanning 1969-12-02 to 1998-12-31, so the same two columns serve the DATE sections.
+  std::vector<int16_t> const left_values{-30, 0, 209, 8035, 10'591, 10'591};
+  std::vector<int16_t> const right_values{-30, 5, 208, 10'591, 8035, 10'591};
+
+  struct evaluation {
+    std::size_t restored_casts;
+    std::size_t narrow_comparisons;
+    std::vector<uint8_t> values;
+    std::vector<bool> valids;
+  };
+
+  auto evaluate_predicate = [&](std::vector<std::unique_ptr<cudf::column>> columns,
+                                std::unique_ptr<ast_node> predicate) {
+    exp_executor executor(*predicate, get_resource_ref(*space));
+    auto input      = make_batch_from_columns(*space, std::move(columns));
+    auto input_ro   = input->to_read_only();
+    auto input_view = input_ro.get_data()->cast<gpu_table_representation>().get_table_view();
+    auto output     = executor.evaluate(input_view);
+    REQUIRE(output != nullptr);
+    REQUIRE(output->num_columns() == 1);
+    return evaluation{executor.restored_reference_cast_count_for_testing(),
+                      executor.narrow_domain_comparison_count_for_testing(),
+                      copy_bool_column_to_host(output->view().column(0)),
+                      copy_valids_to_host(output->view().column(0))};
+  };
+
+  // Two INT16 carriers holding `left_values` and `right_values`.
+  auto narrow_pair_columns = [&] {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(make_carrier_column(*space, int16, left_values));
+    columns.push_back(make_carrier_column(*space, int16, right_values));
+    return columns;
+  };
+
+  auto require_less_than = [&](evaluation const& result) {
+    REQUIRE(result.values.size() == left_values.size());
+    for (std::size_t i = 0; i < left_values.size(); ++i) {
+      REQUIRE(result.valids[i]);
+      REQUIRE(result.values[i] == ((left_values[i] < right_values[i]) ? 1U : 0U));
+    }
+  };
+
+  SECTION("two BIGINT references on one carrier compare narrow, neither side restored")
+  {
+    auto const result = evaluate_predicate(narrow_pair_columns(),
+                                           make_cmp(sirius::comparison_type::lt,
+                                                    make_ref_typed(0, bigint_type),
+                                                    make_ref_typed(1, bigint_type)));
+    REQUIRE(result.narrow_comparisons == 1);
+    REQUIRE(result.restored_casts == 0);
+    require_less_than(result);
+  }
+
+  SECTION("two BIGINT references on different carriers restore both sides")
+  {
+    // The positive case's twin: only the left carrier changes, and the pair stops engaging because
+    // the evaluator will not widen the narrower side to meet the other.
+    std::vector<int8_t> const left_int8{-30, 0, 100, 120, -128, 127};
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(make_carrier_column(*space, int8, left_int8));
+    columns.push_back(make_carrier_column(*space, int16, right_values));
+
+    auto const result = evaluate_predicate(std::move(columns),
+                                           make_cmp(sirius::comparison_type::lt,
+                                                    make_ref_typed(0, bigint_type),
+                                                    make_ref_typed(1, bigint_type)));
+    REQUIRE(result.narrow_comparisons == 0);
+    REQUIRE(result.restored_casts == 2);
+    for (std::size_t i = 0; i < left_int8.size(); ++i) {
+      REQUIRE(result.values[i] == ((left_int8[i] < right_values[i]) ? 1U : 0U));
+    }
+  }
+
+  SECTION("two DATE references on one carrier compare narrow, neither side restored")
+  {
+    auto const result = evaluate_predicate(
+      narrow_pair_columns(),
+      make_cmp(
+        sirius::comparison_type::lt, make_ref_typed(0, date_type), make_ref_typed(1, date_type)));
+    REQUIRE(result.narrow_comparisons == 1);
+    REQUIRE(result.restored_casts == 0);
+    require_less_than(result);
+  }
+
+  SECTION("a DATE reference and a DATE literal compare narrow")
+  {
+    constexpr int32_t last_day_1998 = 10'591;
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(make_carrier_column(*space, int16, left_values));
+
+    auto const result = evaluate_predicate(
+      std::move(columns),
+      make_cmp(
+        sirius::comparison_type::lt, make_ref_typed(0, date_type), make_date_const(last_day_1998)));
+    REQUIRE(result.narrow_comparisons == 1);
+    REQUIRE(result.restored_casts == 0);
+    for (std::size_t i = 0; i < left_values.size(); ++i) {
+      REQUIRE(result.valids[i]);
+      REQUIRE(result.values[i] == ((left_values[i] < last_day_1998) ? 1U : 0U));
+    }
+  }
+
+  SECTION("a DATE reference against a typed NULL yields NULL at the narrow width")
+  {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(make_carrier_column(*space, int16, left_values));
+
+    auto const result = evaluate_predicate(
+      std::move(columns),
+      make_cmp(
+        sirius::comparison_type::lt, make_ref_typed(0, date_type), make_null_const(date_type)));
+    REQUIRE(result.narrow_comparisons == 1);
+    REQUIRE(result.restored_casts == 0);
+    REQUIRE(result.valids.size() == left_values.size());
+    for (auto const valid : result.valids) {
+      REQUIRE_FALSE(valid);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Narrow-domain eligibility predicates (sirius::ast, host-only)
+//
+// The evaluator reaches these through narrow_domain_carrier and
+// narrow_domain_reference_pair_carrier; the narrowing policy reaches the same predicates with the
+// planned carrier instead of the batch's. Testing them directly pins the shapes that are awkward
+// to build as batches -- mistyped payloads, decimal scale mismatches, unsigned families.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("constant_range - a DATE literal folds to its epoch-day signed range",
+          "[expression_evaluator][compressed_materialization][narrow_domain]")
+{
+  auto const last_day_1998 = sirius::ast::constant_numeric_range(date_literal(10'591));
+  REQUIRE(last_day_1998.has_value());
+  REQUIRE(last_day_1998->domain == sirius::numeric_range_domain::SIGNED_INTEGER);
+  REQUIRE(static_cast<int64_t>(last_day_1998->minimum) == 10'591);
+  REQUIRE(static_cast<int64_t>(last_day_1998->maximum) == 10'591);
+
+  auto const pre_epoch = sirius::ast::constant_numeric_range(date_literal(-1));
+  REQUIRE(pre_epoch.has_value());
+  REQUIRE(static_cast<int64_t>(pre_epoch->minimum) == -1);
+  REQUIRE(static_cast<int64_t>(pre_epoch->maximum) == -1);
+
+  // A payload alternative disagreeing with the declared type folds to nothing rather than
+  // reinterpreting whichever alternative happens to be present.
+  auto const mistyped =
+    sirius::ast::constant{sirius::value{int32_t{10'591}}, logical_type::make(type_id::DATE)};
+  REQUIRE_FALSE(sirius::ast::constant_numeric_range(mistyped).has_value());
+
+  // DATE is the only temporal type admitted; a sub-day literal has no narrow domain to fold into.
+  auto const timestamp = sirius::ast::constant{sirius::value{sirius::timestamp_us_value{1}},
+                                               logical_type::make(type_id::TIMESTAMP)};
+  REQUIRE_FALSE(sirius::ast::constant_numeric_range(timestamp).has_value());
+
+  // A typed NULL carries no value to fold; constant_representable_in_carrier admits it instead.
+  auto const null_date = sirius::ast::constant{sirius::value{}, logical_type::make(type_id::DATE)};
+  REQUIRE_FALSE(sirius::ast::constant_numeric_range(null_date).has_value());
+}
+
+TEST_CASE("constant_range - a DATE literal is representable only inside the carrier",
+          "[expression_evaluator][compressed_materialization][narrow_domain]")
+{
+  auto const int8_carrier   = cudf::data_type{cudf::type_id::INT8};
+  auto const int16_carrier  = cudf::data_type{cudf::type_id::INT16};
+  auto const uint16_carrier = cudf::data_type{cudf::type_id::UINT16};
+
+  REQUIRE(sirius::ast::constant_representable_in_carrier(int16_carrier, date_literal(10'591)));
+  REQUIRE(sirius::ast::constant_representable_in_carrier(int8_carrier, date_literal(100)));
+
+  // Out of the carrier's range the literal is rejected, never truncated into it.
+  REQUIRE_FALSE(sirius::ast::constant_representable_in_carrier(int8_carrier, date_literal(10'591)));
+  REQUIRE_FALSE(
+    sirius::ast::constant_representable_in_carrier(int16_carrier, date_literal(40'000)));
+
+  // Epoch days are signed, so an unsigned carrier is a different family even for a positive day.
+  REQUIRE_FALSE(sirius::ast::constant_representable_in_carrier(uint16_carrier, date_literal(100)));
+
+  // Only a validity bit is materialized, so a typed NULL fits even the narrowest carrier.
+  auto const null_date = sirius::ast::constant{sirius::value{}, logical_type::make(type_id::DATE)};
+  REQUIRE(sirius::ast::constant_representable_in_carrier(int8_carrier, null_date));
+}
+
+TEST_CASE("narrow_domain_carrier_eligible - epoch days never pair with a plain integer literal",
+          "[expression_evaluator][compressed_materialization][narrow_domain]")
+{
+  using sirius::ast::narrow_domain_carrier_eligible;
+
+  auto const date_type     = logical_type::make(type_id::DATE);
+  auto const integer_type  = logical_type::make(type_id::INTEGER);
+  auto const int16_carrier = cudf::data_type{cudf::type_id::INT16};
+  auto const date_carrier  = cudf::data_type{cudf::type_id::TIMESTAMP_DAYS};
+
+  auto const date_const    = make_date_const(10'000);
+  auto const integer_const = make_int_const(10'000);
+
+  SECTION("a literal of the column's own domain engages")
+  {
+    REQUIRE(narrow_domain_carrier_eligible(date_type, int16_carrier, {date_const.get()}));
+    REQUIRE(narrow_domain_carrier_eligible(integer_type, int16_carrier, {integer_const.get()}));
+  }
+
+  SECTION("a literal of the other domain declines in both directions")
+  {
+    // Both operands land in the same INT16 carrier, where epoch days and plain integers are
+    // indistinguishable, so agreement at the narrow width would be a coincidence of the values.
+    REQUIRE_FALSE(narrow_domain_carrier_eligible(date_type, int16_carrier, {integer_const.get()}));
+    REQUIRE_FALSE(narrow_domain_carrier_eligible(integer_type, int16_carrier, {date_const.get()}));
+  }
+
+  SECTION("a typed NULL is admitted whatever domain it declares")
+  {
+    // Only the validity bit is materialized, so no carrier width can misread the literal and its
+    // declared type does not matter. Declining here would cost a DATE column the narrow path an
+    // integer column keeps for the very same predicate.
+    auto const null_date    = make_null_const(date_type);
+    auto const null_integer = make_null_const(integer_type);
+    REQUIRE(narrow_domain_carrier_eligible(date_type, int16_carrier, {null_date.get()}));
+    REQUIRE(narrow_domain_carrier_eligible(date_type, int16_carrier, {null_integer.get()}));
+    REQUIRE(narrow_domain_carrier_eligible(integer_type, int16_carrier, {null_date.get()}));
+  }
+
+  SECTION("a DATE literal outside the carrier declines")
+  {
+    auto const far_date = make_date_const(40'000);
+    REQUIRE_FALSE(narrow_domain_carrier_eligible(date_type, int16_carrier, {far_date.get()}));
+  }
+
+  SECTION("a natively carried DATE column declines")
+  {
+    REQUIRE_FALSE(narrow_domain_carrier_eligible(date_type, date_carrier, {date_const.get()}));
+  }
+
+  SECTION("a missing or non-constant operand declines")
+  {
+    auto const reference = make_ref_typed(0, date_type);
+    REQUIRE_FALSE(narrow_domain_carrier_eligible(date_type, int16_carrier, {nullptr}));
+    REQUIRE_FALSE(narrow_domain_carrier_eligible(date_type, int16_carrier, {reference.get()}));
+  }
+}
+
+TEST_CASE("narrow_domain_reference_pair_eligible - one shared carrier and one shared domain",
+          "[expression_evaluator][compressed_materialization][narrow_domain]")
+{
+  using sirius::ast::narrow_domain_reference_pair_eligible;
+
+  auto const date_type      = logical_type::make(type_id::DATE);
+  auto const smallint_type  = logical_type::make(type_id::SMALLINT);
+  auto const integer_type   = logical_type::make(type_id::INTEGER);
+  auto const bigint_type    = logical_type::make(type_id::BIGINT);
+  auto const uinteger_type  = logical_type::make(type_id::UINTEGER);
+  auto const double_type    = logical_type::make(type_id::DOUBLE);
+  auto const timestamp_type = logical_type::make(type_id::TIMESTAMP);
+  auto const decimal_2      = logical_type::make_decimal(18, 2);
+  auto const decimal_3      = logical_type::make_decimal(18, 3);
+
+  auto const int8_carrier   = cudf::data_type{cudf::type_id::INT8};
+  auto const int16_carrier  = cudf::data_type{cudf::type_id::INT16};
+  auto const int32_carrier  = cudf::data_type{cudf::type_id::INT32};
+  auto const uint16_carrier = cudf::data_type{cudf::type_id::UINT16};
+  auto const dec32_scale_2  = cudf::data_type{cudf::type_id::DECIMAL32, -2};
+  auto const dec32_scale_3  = cudf::data_type{cudf::type_id::DECIMAL32, -3};
+
+  SECTION("both sides narrowed onto one carrier engage")
+  {
+    REQUIRE(narrow_domain_reference_pair_eligible(
+      integer_type, int16_carrier, integer_type, int16_carrier));
+    REQUIRE(
+      narrow_domain_reference_pair_eligible(date_type, int16_carrier, date_type, int16_carrier));
+    REQUIRE(
+      narrow_domain_reference_pair_eligible(decimal_2, dec32_scale_2, decimal_2, dec32_scale_2));
+    // Unequal logical widths still compare exactly: narrowing preserves values and applies no
+    // offset, so the shared carrier is the whole contract.
+    REQUIRE(narrow_domain_reference_pair_eligible(
+      bigint_type, int16_carrier, integer_type, int16_carrier));
+  }
+
+  SECTION("different carriers decline even within one domain")
+  {
+    REQUIRE_FALSE(narrow_domain_reference_pair_eligible(
+      integer_type, int8_carrier, integer_type, int16_carrier));
+    // Scale belongs to the carrier, so a scale mismatch never reaches a width comparison.
+    REQUIRE_FALSE(
+      narrow_domain_reference_pair_eligible(decimal_2, dec32_scale_2, decimal_3, dec32_scale_3));
+  }
+
+  SECTION("a side that is not carried narrow declines")
+  {
+    // SMALLINT natively materializes as INT16, so an INT16 column of it is native, not narrowed.
+    REQUIRE_FALSE(narrow_domain_reference_pair_eligible(
+      smallint_type, int16_carrier, integer_type, int16_carrier));
+    REQUIRE_FALSE(narrow_domain_reference_pair_eligible(
+      integer_type, int32_carrier, integer_type, int32_carrier));
+    REQUIRE_FALSE(narrow_domain_reference_pair_eligible(
+      double_type, int16_carrier, integer_type, int16_carrier));
+    REQUIRE_FALSE(narrow_domain_reference_pair_eligible(
+      timestamp_type, int16_carrier, integer_type, int16_carrier));
+  }
+
+  SECTION("epoch days and plain integers decline at one carrier, in both orders")
+  {
+    REQUIRE_FALSE(
+      narrow_domain_reference_pair_eligible(date_type, int16_carrier, integer_type, int16_carrier));
+    REQUIRE_FALSE(
+      narrow_domain_reference_pair_eligible(integer_type, int16_carrier, date_type, int16_carrier));
+  }
+
+  SECTION("crossing the signedness family declines")
+  {
+    REQUIRE_FALSE(narrow_domain_reference_pair_eligible(
+      uinteger_type, uint16_carrier, integer_type, int16_carrier));
+    // Even at one carrier: INT16 is not a narrowing of UINT32, so the unsigned side is not carried.
+    REQUIRE_FALSE(narrow_domain_reference_pair_eligible(
+      uinteger_type, int16_carrier, integer_type, int16_carrier));
   }
 }
 

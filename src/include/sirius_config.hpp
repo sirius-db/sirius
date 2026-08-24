@@ -39,7 +39,9 @@ constexpr uint64_t DEFAULT_BATCH_SIZE = 800ULL * 1024 * 1024;  // 800 MiB
 /// Shared operator batch default: 2.5% of the smallest visible GPU's total memory,
 /// clamped to [512 MiB, 5 GiB]; DEFAULT_BATCH_SIZE when no GPU is visible. Queried
 /// once per process (memoized). operator_params derives its batch members from this,
-/// so every default-constructed instance (config, SET registration) agrees.
+/// so every default-constructed instance agrees. When YAML explicitly configures an
+/// effective GPU capacity, sirius_config narrows the shared defaults from the resolved
+/// memory-space configs before applying explicit operator_params overrides.
 uint64_t derived_default_batch_size();
 
 constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE       = DEFAULT_BATCH_SIZE;
@@ -71,6 +73,15 @@ constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
 /// that the crossover is hardware- and workload-dependent. Recalibrate per GPU; set to 0 to
 /// disable (always use filtered_join).
 constexpr double DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO = 8.0;
+
+/// Test build-key uniqueness at runtime when the planner could not prove it statically.
+///
+/// cudf's general hash join probes twice — a count pass to size the output, then a retrieve pass —
+/// while cudf::distinct_hash_join probes once, because a distinct build bounds the output by the
+/// probe row count. Sirius already implements both, but the distinct path is gated on a *proof* of
+/// uniqueness, which only a declared PRIMARY KEY on a catalog table can supply. The runtime test is
+/// one cudf::distinct_count pass over the build keys, taken only in BUILD_PROBE mode.
+constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = true;
 
 }  // namespace config
 
@@ -114,6 +125,13 @@ struct operator_params {
   /// disable (always use filtered_join).
   double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
 
+  /// When the planner could not prove build-key uniqueness, test it at runtime (one
+  /// cudf::distinct_count pass over the build keys) and take the single-pass
+  /// cudf::distinct_hash_join instead of the two-pass general path when the keys are in fact
+  /// distinct. BUILD_PROBE mode only, INNER/LEFT equality joins with null-unequal semantics. See
+  /// DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE.
+  bool enable_runtime_distinct_build_probe = config::DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE;
+
   /// Wire dynamic table-filter pushdown: an eligible BUILD_PROBE hash-join build publishes a raw
   /// exact IN-list for 1..12 supported build rows, otherwise a hash IN-list if it fits the smallest
   /// probe-GPU L2, or a Bloom, into the probe-side scan. The scan applies membership post-decode to
@@ -148,6 +166,17 @@ struct operator_params {
   /// metadata; other scans use native carriers. Logical types remain unchanged, and type-sensitive
   /// boundaries restore native carriers.
   bool enable_compressed_materialization = true;
+
+  /// Admission-time GPU allocation: target bytes of projected scan output per GPU.
+  /// At query start, the engine estimates total scan output bytes from the plan's
+  /// estimated_cardinality × per-column width, then assigns
+  /// ceil(total_bytes / admission_bytes_per_gpu) GPUs, clamped to [1, active_gpu_count].
+  /// 0 disables dynamic estimation and falls back to topology.gpus_per_query.
+  uint64_t admission_bytes_per_gpu = 0;
+
+  /// Bytes assumed per variable-width column (VARCHAR, LIST, etc.) when computing
+  /// per-row byte estimates for admission. Only used when admission_bytes_per_gpu > 0.
+  uint64_t avg_variable_column_bytes = 32;
 };
 
 struct telemetry_config {
@@ -185,6 +214,8 @@ struct compression_config {
   /// size, for the compressed form to be kept.  When the compressed header +
   /// payload exceeds this fraction of the original (i.e. compression saved too
   /// little), the compressed data is discarded and the uncompressed batch is used.
+  /// Must be finite and non-negative. Values above 1 deliberately allow compressed
+  /// representations that expand relative to the original batch.
   //  Default 0.75 (that coincides with a 1.33x compression ratio).
   ///
   /// Applies to BOTH paths: a pin chunk is stored uncompressed, and a spilled
@@ -318,6 +349,45 @@ struct compression_config {
   /// Below this size the setup cost dominates so heavily that compressing is
   /// worse than spilling raw, however good the ratio.
   std::size_t spill_min_batch_bytes{64ULL * 1024 * 1024};
+  /// Device memory reserved exclusively for spill-compression transients.
+  /// 0 (the default) keeps the encoder allocating from the query's pool.
+  ///
+  /// Sharing that pool is circular: a downgrade happens *because* the pool is
+  /// full, so the encode that would relieve the pressure is the one allocation
+  /// certain to fail. Measured on q3/SF1000 with no arena, compression latched
+  /// off and on 11 times while the monitor issued 111,641 downgrade requests.
+  ///
+  /// This is a partition of the device, not extra memory: reserving N bytes
+  /// requires lowering `memory.gpu.usage_limit_fraction` by the same N. Undersizing
+  /// is a cliff rather than a gradient — at 1 GiB, too small for the concurrent
+  /// encodes, the same query failed outright. Size it for
+  /// `downgrade.num_threads` concurrent encodes of the largest spill batch.
+  std::size_t device_pool_bytes{0};
+
+  /// Free each uncompressed source column as soon as it has been encoded, instead
+  /// of holding the whole batch until the converter returns.
+  ///
+  /// This is the memory the spill exists to reclaim, and releasing it during the
+  /// encode rather than after is what lets the compression arena be small: per
+  /// encode the device carries one column's source instead of the batch's.
+  ///
+  /// Opt-in because it forfeits the fall-back. Once a column has been freed the
+  /// batch cannot be spilled uncompressed any more, so the encode must run to
+  /// completion — a column that cannot even be stored raw (identity, no codec
+  /// scratch) becomes fatal for the batch rather than a decline. Requires
+  /// ownership of the table; batches viewing externally-owned memory are skipped.
+  bool spill_release_columns_early{false};
+
+  /// Fraction of a batch's uncompressed size reserved on the device for encode
+  /// working memory when no compression arena is configured. See
+  /// spill_context.hpp::encode_reserve_fraction.
+  double spill_encode_reserve_fraction{0.5};
+
+  /// Decline spill compression when free device memory is below this fraction of
+  /// capacity and no arena is configured. See
+  /// spill_context.hpp::encode_min_headroom_fraction.
+  double spill_encode_min_headroom_fraction{0.10};
+
   /// When true, the downgrade executor may satisfy a request by compressing
   /// batches in place on the device, instead of spilling them to host/disk.
   ///
@@ -379,6 +449,11 @@ struct sirius_config {
     return _compression_config;
   }
 
+  /// How many GPUs to allocate per query. 0 = use all active GPUs (default).
+  /// Limits each query to the first @c gpus_per_query entries of the sorted
+  /// active-GPU list; the rest are left available for future concurrent queries.
+  [[nodiscard]] int gpus_per_query() const noexcept { return _gpus_per_query; }
+
  private:
   /// When @c _memory_space_configs contains more than one GPU memory space,
   /// force @c _scan_manager_config.use_sirius_datasource to true (sirius
@@ -387,6 +462,7 @@ struct sirius_config {
   void enforce_sirius_datasource_for_multi_gpu();
 
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
+  int _gpus_per_query = 0;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   creator::task_creator_config _task_creator_config;
   scan_manager::scan_manager_config _scan_manager_config{};

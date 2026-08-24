@@ -17,7 +17,7 @@ This document covers the GPU expression-evaluation subsystem used by FILTER and 
 
 Both methods accept a `cudf::table_view` and return a new `cudf::table` with the result. The `rmm::cuda_stream_view` and memory resource are passed to the constructor and stored as members — they are not per-call arguments.
 
-The evaluator can be constructed from a `duckdb::vector<std::unique_ptr<sirius::ast::node>>` (the full operator expression list), from a single `sirius::ast::node`, from a non-owning `sirius::ast::node const*`, or from a non-owning `std::vector<sirius::ast::node const*>`. The PROJECTION operator uses the non-owning vector form to pass only the entries that actually need evaluation, after pulling out pure BOUND_REF passthroughs that it exposes as zero-copy views (see [operators](operators.md)). `evaluate()` returns one output column per supplied expression, in order. If a slot is ever null (an unsupported expression that `from_duckdb` could not translate), the evaluator throws `InternalException` rather than dereferencing it.
+The evaluator can be constructed from a `duckdb::vector<std::unique_ptr<sirius::ast::node>>` (the full operator expression list), from a single `sirius::ast::node`, from a non-owning `sirius::ast::node const*`, or from a non-owning `std::vector<sirius::ast::node const*>`. The PROJECTION operator uses the non-owning vector form to pass only the entries that actually need evaluation, after pulling out pure BOUND_REF passthroughs that it exposes as zero-copy views (see [operators](operators.md)). `evaluate()` returns one output column per supplied expression, in order. Unsupported expressions never reach the evaluator: the plan builders reject any expression that `from_duckdb` cannot translate during GPU plan construction (throwing `NotImplementedException`, which triggers the transparent CPU fallback — see [Physical Plan Generation](physical-plan-generation.md)). A null slot in the evaluator's expression list therefore indicates a planner bug, and the evaluator throws `sirius::internal_exception` as a defensive backstop rather than dereferencing it.
 
 ## Sirius AST Type Hierarchy
 
@@ -43,7 +43,7 @@ struct node {
 };
 ```
 
-The alternative order is part of the ABI: `std::variant` indexes by position and downstream dispatch depends on it, so new alternatives are appended at the end. `node` is move-only. Children are stored as `std::unique_ptr<node>` inside each alternative struct, making the tree recursive without incomplete-type issues. Every alternative must implement `cudf_ast_op_count() const`, enforced by a `static_assert` at the variant declaration.
+The alternative order is part of the ABI: `std::variant` indexes by position and downstream dispatch depends on it, so new alternatives are appended at the end. `node` is move-only. Children are stored as `std::unique_ptr<node>` inside each alternative struct, making the tree recursive without incomplete-type issues. Every alternative must implement `cudf_ast_op_count() const` and `return_type() const` (returning `sirius::logical_type`), both enforced by concepts and `static_assert`s at the variant declaration. `node::return_type()` dispatches to the active alternative via `std::visit`, so the evaluator reads each expression's result type natively from the Sirius AST — the output cuDF type in `post_process` and the BOOLEAN assertion on the filter path both come from `return_type()`, with no round-trip through DuckDB types.
 
 | Alternative | Sirius type | Typical source |
 |-------------|-------------|----------------|
@@ -135,6 +135,10 @@ SET expression_evaluator_strategy = 'ast_jit';   -- or 'ast_interpret', 'materia
 
 String concatenation covers the `concat(a, b, …)` function and the `||` operator, which have **different** NULL semantics and therefore resolve to **distinct** ids: `concat()` ignores NULL arguments (`concat(NULL, 'x') = 'x'`) and maps to `function_id::concat`; the `||` operator propagates NULL (`'a' || NULL = NULL`) and maps to `function_id::concat_operator` (DuckDB lowers `||` to a function named `"||"`). Both are dispatched as a materialize-only function in `src/expression_evaluator/specializations/function.cpp`: every argument is materialized, any scalar argument is broadcast to a full-length column via `cudf::make_column_from_scalar`, and the columns are joined with `cudf::strings::concatenate` using an empty separator. The two semantics are selected by the narep scalar: a valid empty string for `concat()` (NULL → `""`, ignored) and an invalid narep for `||` (NULL → NULL, propagated).
 
+### Logical AND/OR NULL semantics
+
+SQL `AND`/`OR` use Kleene three-valued logic (`TRUE OR NULL = TRUE`, `FALSE AND NULL = FALSE`), so conjunctions map to cuDF's Kleene operators — `NULL_LOGICAL_AND`/`NULL_LOGICAL_OR` as AST operators and `cudf::binary_operator::NULL_LOGICAL_*` on the materialize path — never the null-propagating `LOGICAL_*` variants. The plain `LOGICAL_AND` still appears for internal structural conjunctions where operands cannot be NULL, such as the BETWEEN lowering and the AND that combines multi-condition join predicates.
+
 Per-expression-type dispatch lives in `src/expression_evaluator/specializations/` (one file per Sirius AST alternative: `comparison.cpp`, `case.cpp`, etc.). Each specialization decides how to emit cuDF AST nodes, materialize, or fall back based on the effective evaluation mode.
 
 ### AST-Eligible Operations
@@ -145,7 +149,7 @@ The following translate directly into cuDF AST nodes:
 |----------|-----------|
 | Arithmetic | `+`, `-`, `*`, `/`, `//`, `%` |
 | Comparison | `=`, `!=`, `<`, `>`, `<=`, `>=`, `IS NOT DISTINCT FROM` (via `NULL_EQUALS`) |
-| Logical | `AND`, `OR`, `NOT` |
+| Logical | `AND`, `OR` (Kleene `NULL_LOGICAL_AND`/`NULL_LOGICAL_OR`), `NOT` |
 | BETWEEN | Translated to `(val >= lower) AND (val <= upper)` |
 | Casting | Fixed-width types: `UBIGINT`, `BIGINT`, `DOUBLE` (see `supported_ast_cast_types`) |
 
@@ -190,7 +194,7 @@ The translator provides specialized methods for join conditions:
 - `translate_join_condition(condition)` — translates a single equality or inequality condition
 - `translate_join_conditions(conditions, start, end, swap_sides)` — combines multiple conditions with AND, optionally swapping LEFT/RIGHT table references for RIGHT/OUTER joins
 
-This is used by `sirius_physical_hash_join` in MIXED_JOIN mode to pass inequality conditions to `cudf::mixed_join()` as a cuDF AST expression.
+This is used by `sirius_physical_hash_join` in MIXED_JOIN mode to pass the conditional predicates — inequality conditions, and null-safe `IS NOT DISTINCT FROM` keys (emitted as `NULL_EQUAL`) that were mixed with a plain `=` — to `cudf::mixed_join()` as a cuDF AST expression.
 
 ## Key Files
 

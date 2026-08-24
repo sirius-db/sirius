@@ -30,7 +30,20 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f # v0.10.0
+      - name: Test thread sweep harness
+        run: |
+          set -o pipefail
+          bash test/tpch_performance/test_sweep_threads.sh 2>&1 | tee /tmp/harness.log
+
+      - name: Surface thread sweep harness errors
+        if: failure()
+        run: |
+          echo '## Thread sweep harness errors' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/harness.log >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347 # v0.10.1
         with:
           cache: false
           pixi-version: v0.71.1
@@ -99,7 +112,7 @@ jobs:
         exclude:
           # On PRs, drop rows marked merge/dev-only; on merge_group/dev, match nothing.
           - build:
-              run-on-pr: ${{ fromJSON(github.event_name == 'pull_request' && 'false' || 'null') }}
+              run-on-pr: ${{ case(github.event_name == 'pull_request', false, 'no-match') }}
       fail-fast: false
     name: build (${{ matrix.build.arch }}, ${{ matrix.build.compiler }}, ${{ matrix.build.build-type }}, ${{ matrix.build.environment }}, ${{ matrix.build.cudf-channel }})
     runs-on: >-
@@ -125,7 +138,7 @@ jobs:
             git -C vcpkg fetch --unshallow
           fi
 
-      - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f # v0.10.0
+      - uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347 # v0.10.1
         with:
           cache: false
           pixi-version: v0.71.1
@@ -143,8 +156,10 @@ jobs:
             echo "SCCACHE_BUCKET UNDEFINED -> GitHub Runner, Enable GHA sccache"
             echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
           fi
+          # Use 'sirius' prefix for sccache and vcpkg caches
+          echo "SCCACHE_S3_KEY_PREFIX=sirius" >> $GITHUB_ENV
           if [[ -n "${VCPKG_BUCKET}" ]]; then
-            echo "VCPKG_BINARY_SOURCES=clear;x-aws,s3://${VCPKG_BUCKET}/,readwrite" >> $GITHUB_ENV
+            echo "VCPKG_BINARY_SOURCES=clear;x-aws,s3://${VCPKG_BUCKET}/sirius/,readwrite" >> $GITHUB_ENV
           fi
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11

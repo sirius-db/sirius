@@ -1,0 +1,4 @@
+sirius:
+  executor:
+    downgrade:
+      thread_name_prefix: custom_downgrade

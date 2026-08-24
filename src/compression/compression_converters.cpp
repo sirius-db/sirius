@@ -18,6 +18,7 @@
 
 #include "compressed_disk_representation.hpp"
 #include "compressed_representation.hpp"
+#include "compression_device_pool.hpp"
 #include "device_compressed_blob.hpp"
 #include "plan_register.hpp"
 #include "simpatico_bridge.hpp"
@@ -44,6 +45,7 @@
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <explore/compression_explorer.hpp>
 #include <log/logging.hpp>
 
@@ -54,6 +56,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -117,6 +120,27 @@ std::unique_ptr<cudf::column> rebind_column_stream(std::unique_ptr<cudf::column>
     type, size, std::move(*contents.data), std::move(null_mask), nc, std::move(children));
 }
 
+// Translate the representation's string-only pushdown into simpatico's decode
+// directives, padded to `count` so it lines up 1:1 with the columns being
+// decompressed. Returns empty when nothing is pushed down, which lets callers
+// stay on the plain decompress overload.
+std::vector<simpatico::decode_predicate> to_decode_predicates(
+  decode_equality_pushdown const& pushdown, std::size_t count)
+{
+  bool const any =
+    std::any_of(pushdown.begin(), pushdown.end(), [](auto const& v) { return !v.empty(); });
+  if (!any) { return {}; }
+  if (pushdown.size() > count) {
+    throw std::runtime_error(
+      "[compression_converters] equality pushdown wider than the projection");
+  }
+  std::vector<simpatico::decode_predicate> predicates(count);
+  for (std::size_t i = 0; i < pushdown.size(); ++i) {
+    predicates[i].equals_any = pushdown[i];
+  }
+  return predicates;
+}
+
 // Reconstruct + project + decompress a compressed_table into a GPU table
 // representation. Shared by the host and device compression converters — only
 // the byte transport (how `fetch` pulls the payload) differs between them.
@@ -124,6 +148,7 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   std::span<const std::uint8_t> header,
   simpatico::payload_fetch_fn const& fetch,
   const std::optional<std::vector<std::size_t>>& selected_indices,
+  decode_equality_pushdown const& equality_pushdown,
   cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
   rmm::cuda_stream_view stream)
@@ -153,9 +178,20 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   // threads are spawned. The H2D fetch above ran on `stream`; sync it first so
   // pool-stream reads are ordered after all fetched bytes are resident.
   stream.synchronize();
-  auto& pool = column_pool();
-  auto decompressed =
-    simpatico::decompress(subset, pool, rmm::mr::get_current_device_resource_ref());
+  auto& pool    = column_pool();
+  auto const mr = rmm::mr::get_current_device_resource_ref();
+  // `subset` already holds only the projected columns, so the pushdown — which
+  // is indexed by projected position — lines up with 0..num_columns.
+  auto const predicates =
+    to_decode_predicates(equality_pushdown, static_cast<std::size_t>(subset.num_columns()));
+  std::unique_ptr<cudf::table> decompressed;
+  if (predicates.empty()) {
+    decompressed = simpatico::decompress(subset, pool, mr);
+  } else {
+    std::vector<std::size_t> all(subset.num_columns());
+    std::iota(all.begin(), all.end(), std::size_t{0});
+    decompressed = simpatico::decompress(subset, all, predicates, pool, mr);
+  }
   // Re-point decoded buffers onto `stream` so pipeline teardown is ordered.
   auto cols = decompressed->release();
   for (auto& c : cols)
@@ -184,6 +220,58 @@ std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
   nvtx3::scoped_range nvtx_range{"sirius::compression::host_to_gpu"};
   auto& rep = source.cast<compressed_host_representation>();
 
+  // Per-column form: each entry is a complete 1-column .hpln, decoded on its own
+  // and concatenated back into the batch. Projections pick entries directly
+  // instead of going through the subset reader, since a column IS an artifact here.
+  if (!rep.column_blobs().empty()) {
+    auto const& blobs = rep.column_blobs();
+    auto const& sel   = rep.selected_indices();
+    std::vector<std::unique_ptr<cudf::column>> cols;
+    cols.reserve(sel ? sel->size() : blobs.size());
+
+    auto decode_one = [&](std::size_t idx) {
+      auto const& b = *blobs.at(idx);
+      simpatico::payload_fetch_fn fetch =
+        [&b](std::uint64_t off, std::size_t sz, void* dst, rmm::cuda_stream_view st) {
+          copy_pinned_blocks_to_device(*b.payload, off, dst, sz, st);
+        };
+      std::string read_error;
+      auto one = simpatico::read_compressed_table_from_memory(
+        b.header, fetch, stream, rmm::mr::get_current_device_resource_ref(), &read_error);
+      if (!read_error.empty()) {
+        throw std::runtime_error("[compression_converters] per-column reconstruct failed: " +
+                                 read_error);
+      }
+      stream.synchronize();
+      auto& pool = column_pool();
+      auto tbl   = simpatico::decompress(one, pool, rmm::mr::get_current_device_resource_ref());
+      auto parts = tbl->release();
+      if (parts.empty()) {
+        throw std::runtime_error("[compression_converters] per-column decode produced no column");
+      }
+      cols.push_back(rebind_column_stream(std::move(parts.front()), stream));
+    };
+
+    if (sel) {
+      for (auto idx : *sel) {
+        decode_one(idx);
+      }
+    } else {
+      for (std::size_t i = 0; i < blobs.size(); ++i) {
+        decode_one(i);
+      }
+    }
+
+    auto table = std::make_unique<cudf::table>(std::move(cols));
+    const cucascade::memory::memory_space* sp =
+      (target_memory_space != nullptr) ? target_memory_space : &source.get_memory_space();
+    SIRIUS_LOG_DEBUG("[compression_converters] decompressed per-column cols={} rows={}",
+                     table->num_columns(),
+                     table->num_rows());
+    return std::make_unique<cucascade::gpu_table_representation>(
+      std::move(table), *const_cast<cucascade::memory::memory_space*>(sp), stream);
+  }
+
   // Pull each compressed leaf buffer straight from the pinned host payload into
   // device memory (block-aware, since the payload is a multi-block allocation).
   auto const& payload = rep.payload();
@@ -192,8 +280,13 @@ std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
       copy_pinned_blocks_to_device(payload, off, dst, sz, s);
     };
 
-  return reconstruct_and_decompress_to_gpu(
-    rep.header(), fetch, rep.selected_indices(), source, target_memory_space, stream);
+  return reconstruct_and_decompress_to_gpu(rep.header(),
+                                           fetch,
+                                           rep.selected_indices(),
+                                           rep.equality_pushdown(),
+                                           source,
+                                           target_memory_space,
+                                           stream);
 }
 
 // compressed_device_representation (device memory) → GPU.
@@ -211,11 +304,26 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
   auto const mr       = rmm::mr::get_current_device_resource_ref();
   // Reconstructs here for a blob staged by the output/downgrade tiers, which defer it;
   // for a pinned chunk the table is already built and this is a plain lookup.
-  auto const& ct    = rep.table(stream, mr);
-  auto& pool        = column_pool();
-  auto decompressed = indices.has_value() ? simpatico::decompress(ct, *indices, pool, mr)
-                                          : simpatico::decompress(ct, pool, mr);
-  auto cols         = decompressed->release();
+  auto const& ct = rep.table(stream, mr);
+  auto& pool     = column_pool();
+
+  // Projected column count — what the pushdown is indexed by.
+  auto const n_selected =
+    indices.has_value() ? indices->size() : static_cast<std::size_t>(ct.num_columns());
+  auto const predicates = to_decode_predicates(rep.equality_pushdown(), n_selected);
+
+  std::unique_ptr<cudf::table> decompressed;
+  if (predicates.empty()) {
+    decompressed = indices.has_value() ? simpatico::decompress(ct, *indices, pool, mr)
+                                       : simpatico::decompress(ct, pool, mr);
+  } else if (indices.has_value()) {
+    decompressed = simpatico::decompress(ct, *indices, predicates, pool, mr);
+  } else {
+    std::vector<std::size_t> all(n_selected);
+    std::iota(all.begin(), all.end(), std::size_t{0});
+    decompressed = simpatico::decompress(ct, all, predicates, pool, mr);
+  }
+  auto cols = decompressed->release();
   for (auto& c : cols)
     c = rebind_column_stream(std::move(c), stream);
   decompressed = std::make_unique<cudf::table>(std::move(cols));
@@ -285,6 +393,29 @@ std::string default_plan_for(cudf::data_type type)
   return "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
 }
 
+/// Whether a column of @p type can be carried without a plan of its own.
+///
+/// Two carriers exist for a column the planner has nothing for: `identity`,
+/// which stores the values as a single leaf, and `bitpack`, which stores integral
+/// leaves. Neither covers every dtype:
+///
+///  * `identity` leaves are reconstructed with `cudf::make_numeric_column`
+///    (compressed_table_io.cpp), which accepts only cudf's *numeric* types —
+///    DECIMAL and TIMESTAMP fault with "Invalid, non-numeric type" on the way
+///    back in, long after the spill reported success;
+///  * `bitpack` refuses non-fusable dtypes, DECIMAL128 among them.
+///
+/// So a fixed-width non-numeric column (decimal, timestamp, duration) can only be
+/// spilled compressed when it has a real plan. Without one the batch must decline
+/// to an uncompressed spill — measured on TPC-H q18, where a DECIMAL128 column
+/// took the raw fallback and the query then died in cudf on restore.
+///
+/// STRING and nested types are safe: their passthrough leaves are INT32/INT8.
+bool can_carry_without_plan(cudf::data_type type)
+{
+  return !cudf::is_fixed_width(type) || cudf::is_numeric(type);
+}
+
 // Compress every column of `view` with its own plan, one column per pool stream.
 //
 // The pool streams do not observe `stream`, so work that produced `view` has to
@@ -317,6 +448,23 @@ std::vector<column_state> resolve_or_explore_spill_plan(cudf::table_view view,
                                                         rmm::cuda_stream_view stream)
 {
   using verdict = compression::plan_register::spill_plan_verdict;
+
+  // An unkeyed batch (no producing repository) has nothing to look up and no
+  // lineage to follow, but it can still be carried by its dtype's default plan.
+  // Nothing is recorded against the register — there is no edge to record it
+  // against — so these batches neither consume plan uses nor steer any verdict,
+  // and they never explore: the beam search is what the edge key exists to
+  // amortize. If the defaults do not pay, compress_for_spill's whole-batch
+  // threshold declines the batch to an uncompressed spill as usual.
+  if (ctx.repo == nullptr) {
+    std::vector<column_state> defaults;
+    defaults.reserve(static_cast<std::size_t>(view.num_columns()));
+    for (cudf::size_type i = 0; i < view.num_columns(); ++i) {
+      defaults.push_back(column_state{.dsl    = default_plan_for(view.column(i).type()),
+                                      .viable = true});
+    }
+    return defaults;
+  }
 
   auto& reg           = compression::plan_register::global();
   const auto decision = reg.decide_spill_plan(ctx.repo, ctx.replan_after_uses);
@@ -399,7 +547,7 @@ std::vector<column_state> resolve_or_explore_spill_plan(cudf::table_view view,
   try {
     for (cudf::size_type i = 0; i < table.num_columns(); ++i) {
       auto result = simpatico::explore_column_compression(
-        table.column(i), ecfg, stream, rmm::mr::get_current_device_resource_ref());
+        table.column(i), ecfg, stream, compression::compression_device_mr());
       candidates.push_back({std::move(result.plan_dsl),
                             result.compression_ratio,
                             result.compress_throughput_gbps,
@@ -437,9 +585,11 @@ std::vector<column_state> resolve_or_explore_spill_plan(cudf::table_view view,
 const compression::spill_context& require_spill_context()
 {
   const auto* ctx = compression::current_spill_context();
-  if (ctx == nullptr || ctx->repo == nullptr) {
+  if (ctx == nullptr) {
     throw std::runtime_error("[compression_converters] no spill context installed");
   }
+  // A null repo is allowed: that is the unkeyed batch, compressed with dtype
+  // defaults rather than a looked-up plan (see resolve_or_explore_spill_plan).
   return *ctx;
 }
 
@@ -453,16 +603,27 @@ struct staged_compression {
   std::uint64_t payload_bytes = 0;
 };
 
-staged_compression compress_for_spill(cudf::table_view view,
-                                      const compression::spill_context& ctx,
-                                      std::size_t uncompressed_bytes,
-                                      rmm::cuda_stream_view stream)
+/// @param owned_columns When non-null, the caller has handed over ownership of
+///        the source columns and each is freed as soon as it has been encoded.
+///        The batch is then committed to a compressed spill: the source no longer
+///        exists to fall back to, so the whole-batch decline below is skipped and
+///        a column that cannot even be stored raw is fatal rather than a decline.
+staged_compression compress_for_spill(
+  cudf::table_view view,
+  const compression::spill_context& ctx,
+  std::size_t uncompressed_bytes,
+  rmm::cuda_stream_view stream,
+  std::vector<std::unique_ptr<cudf::column>>* owned_columns = nullptr)
 {
   using outcome_kind      = compression::plan_register::spill_attempt_outcome;
   using column_result     = compression::plan_register::spill_column_result;
   const auto column_plans = resolve_or_explore_spill_plan(view, ctx, stream);
   const auto num_columns  = static_cast<std::size_t>(view.num_columns());
-  auto const mr = rmm::mr::get_current_device_resource_ref();
+  // The dedicated arena when one is configured, else the query's pool.
+  // Everything allocated here is transient — the compressed table is staged out
+  // and dropped — so it never has to come from the pool that owns query data.
+  // See compression_device_pool.hpp for why sharing that pool is self-defeating.
+  auto const mr = compression::compression_device_mr();
 
   // Report per-column outcomes exactly once, on every exit path. Everything
   // defaults to `failed`, so an exception anywhere below is reported as an error
@@ -488,19 +649,106 @@ staged_compression compress_for_spill(cudf::table_view view,
   // judged not worth compressing is stored raw instead: the compressed table must
   // still carry it for the batch to round-trip, but running a codec that does not
   // shrink it would be pure cost.
+  // Compressed one column at a time rather than handing the whole table to
+  // compress_columns, so that a column which cannot be encoded costs only itself.
+  //
+  // Encoding the table in one call makes any failure fatal for the batch: the
+  // exception unwinds past every column already done and the whole batch spills
+  // raw. Under a tight device that is the common case, and the columns that
+  // failed are usually the widest ones — precisely where the codec scratch, not
+  // the data, was the problem. Per column, a failed encode falls back to storing
+  // that column raw and its neighbours keep their compression.
+  //
+  // simpatico already encodes columns sequentially inside compress_columns (its
+  // encoders block the submitting thread), so splitting the call costs no
+  // parallelism; it only changes the blast radius of a failure.
   staged_compression out;
-  std::vector<std::string> dsls;
-  dsls.reserve(num_columns);
+  out.table.columns.reserve(num_columns);
+  const auto names = synthetic_column_names(view.num_columns());
+  /// Columns stored raw because their encode threw, not because the data proved
+  /// incompressible. Kept apart so the measurement loop below reports them as
+  /// errors rather than as a verdict.
+  std::vector<bool> failed_columns(num_columns, false);
+  // Measured up front: once a column is freed below, view.column(i) dangles, and
+  // the verdict loop further down needs the original size to judge the ratio.
+  std::vector<std::uint64_t> original_bytes(num_columns, 0);
   for (std::size_t i = 0; i < num_columns; ++i) {
-    dsls.push_back(column_plans[i].viable ? column_plans[i].dsl : kPassthroughDsl);
+    original_bytes[i] =
+      simpatico::column_size_bytes_ex(view.column(static_cast<cudf::size_type>(i)), stream);
   }
-  out.table = compress_columns_with_plans(
-    view, std::move(dsls), synthetic_column_names(view.num_columns()), stream, mr);
 
-  const std::string hdr_err = simpatico::build_compressed_table_header(
-    out.table, out.header, out.buffers, out.payload_bytes, stream);
-  if (!hdr_err.empty()) {
-    throw std::runtime_error("[compression_converters] build_compressed_table_header: " + hdr_err);
+  for (std::size_t i = 0; i < num_columns; ++i) {
+    const auto col        = view.column(static_cast<cudf::size_type>(i));
+    const cudf::table_view one_col{{col}};
+    std::vector<std::string> one_name{names[i]};
+
+    auto encode = [&](const std::string& dsl) {
+      nvtx3::scoped_range encode_range{"sirius::compression::encode_column"};
+      return compress_columns_with_plans(one_col, {dsl}, one_name, stream, mr);
+    };
+
+    // The carrier for a column with no plan of its own depends on its dtype:
+    // `identity` cannot round-trip a decimal or timestamp. default_plan_for picks
+    // the one that can, and can_carry_without_plan says when neither does.
+    const std::string fallback_plan = default_plan_for(col.type());
+    const std::string& plan = column_plans[i].viable ? column_plans[i].dsl : fallback_plan;
+    if (!column_plans[i].viable && !can_carry_without_plan(col.type())) {
+      throw std::runtime_error(
+        "[compression_converters] column " + std::to_string(i) +
+        " has no plan and no safe raw carrier for its dtype; spilling uncompressed");
+    }
+    try {
+      auto encoded = encode(plan);
+      if (encoded.columns.empty()) {
+        throw std::runtime_error("[compression_converters] encode produced no column for index " +
+                                 std::to_string(i));
+      }
+      out.table.columns.push_back(std::move(encoded.columns.front()));
+    } catch (const std::exception& e) {
+      // Retry with the dtype's default carrier: it needs far less codec scratch,
+      // so it survives the memory pressure that sank the real plan. If the dtype
+      // has no safe carrier, or even this throws, the batch genuinely cannot be
+      // staged and the caller falls back to an uncompressed spill.
+      if (plan == fallback_plan || !can_carry_without_plan(col.type())) { throw; }
+      SIRIUS_LOG_DEBUG(
+        "[compression_converters] repo={} column {} encode failed ({}); storing it raw",
+        static_cast<const void*>(ctx.repo),
+        i,
+        e.what());
+      auto encoded = encode(fallback_plan);
+      if (encoded.columns.empty()) {
+        throw std::runtime_error(
+          "[compression_converters] raw fallback produced no column for index " +
+          std::to_string(i));
+      }
+      out.table.columns.push_back(std::move(encoded.columns.front()));
+      // Not a verdict on the data — the plan may be fine and the device merely
+      // full — so it is reported as an error, which the register absorbs up to
+      // its tolerance rather than writing the column off on one bad batch.
+      failed_columns[i] = true;
+    }
+
+    // The encode was this column's last reader, so drop it now rather than
+    // holding the whole batch until the converter returns. This is the memory the
+    // downgrade is trying to reclaim, and releasing it here is what keeps the
+    // encode's device footprint to one column rather than the whole batch.
+    // NOT freed here. Freeing a column the moment it is encoded is the obvious
+    // way to keep the encode's footprint to one column, and it is unsound: the
+    // encode can still fail on a later column (an arena OOM is routine), and by
+    // then the earlier columns are gone. The batch cannot be spilled
+    // uncompressed and cannot be reconstructed — measured as zero-column batches
+    // that surfaced much later as an out-of-range access during materialization.
+    // The caller frees the whole set once the encode has succeeded, which is the
+    // first moment nothing can fail.
+  }
+
+  {
+    nvtx3::scoped_range header_range{"sirius::compression::build_header"};
+    const std::string hdr_err = simpatico::build_compressed_table_header(
+      out.table, out.header, out.buffers, out.payload_bytes, stream);
+    if (!hdr_err.empty()) {
+      throw std::runtime_error("[compression_converters] build_compressed_table_header: " + hdr_err);
+    }
   }
 
   // Judge each column on its own bytes. Compressibility is a per-column property,
@@ -514,8 +762,7 @@ staged_compression compress_for_spill(cudf::table_view view,
         col_compressed += buf.size_bytes;
       }
     }
-    const auto col_original =
-      simpatico::column_size_bytes_ex(view.column(static_cast<cudf::size_type>(i)), stream);
+    const auto col_original = original_bytes[i];
 
     const bool worth_it =
       col_original == 0 || static_cast<double>(col_compressed) <=
@@ -528,6 +775,15 @@ staged_compression compress_for_spill(cudf::table_view view,
     // in use delivered on a whole batch, and it becomes the number a later
     // re-explore has to beat — without it the comparison is against the seed's
     // placeholder and any candidate wins.
+    //
+    // A column that fell back to raw because its encode threw is reported as
+    // `failed` instead. Its bytes say nothing about compressibility — they are
+    // the identity plan's — so recording them as a measurement would write the
+    // column off for a transient allocation failure.
+    if (failed_columns[i]) {
+      outcome.per_column[i].outcome = outcome_kind::failed;
+      continue;
+    }
     outcome.per_column[i].outcome = worth_it ? outcome_kind::compressed : outcome_kind::not_worth_it;
     outcome.per_column[i].achieved_ratio =
       (col_original > 0 && col_compressed > 0)
@@ -541,8 +797,15 @@ staged_compression compress_for_spill(cudf::table_view view,
   // store a compressed form that costs more to keep and to read back. The
   // per-column verdicts above are still recorded, so the next batch stores the
   // columns that did not pay raw — or skips the edge entirely if none of them did.
+  //
+  // Skipped once the source columns have been freed: there is nothing left to
+  // spill uncompressed, so declining here would destroy the batch rather than
+  // fall back. The cost of not declining is bounded — columns that did not pay
+  // are already stored raw via the identity plan, so the compressed form is at
+  // worst the raw bytes plus a header — and the per-column verdicts above still
+  // steer the next batch on this edge.
   const std::size_t compressed_bytes = out.header.size() + out.payload_bytes;
-  if (uncompressed_bytes > 0 &&
+  if (owned_columns == nullptr && uncompressed_bytes > 0 &&
       static_cast<double>(compressed_bytes) >
         ctx.max_compressed_fraction * static_cast<double>(uncompressed_bytes)) {
     SIRIUS_LOG_DEBUG(
@@ -557,6 +820,102 @@ staged_compression compress_for_spill(cudf::table_view view,
   }
 
   return out;
+}
+
+/// Holds a device reservation covering an encode's working memory, attached to
+/// the calling thread for as long as it lives.
+///
+/// Only used when there is no compression arena. With an arena the encode
+/// allocates from a pool carved off the device at startup, which is outside
+/// cuCascade's accounting entirely — reserving as well would double-count.
+/// Without one, the encode allocates from the query's own pool, during a
+/// downgrade, and does so unreserved: it can push the pool past what
+/// reservations promised, which then surfaces as an OOM in some unrelated
+/// operator that did everything right. Reserving makes the demand visible and
+/// gives it somewhere to fail cleanly.
+///
+/// Sirius runs the reservation adaptor in PER_THREAD tracking scope
+/// (`per_stream_reservation` defaults false), so attaching binds to the calling
+/// thread — which is why every encode must be submitted from this thread, the
+/// same constraint the column pool already operates under.
+class scoped_encode_reservation {
+ public:
+  /// @return an inactive guard when no reservation was needed or one could not
+  ///         be granted; check `ok()` before proceeding.
+  scoped_encode_reservation(cucascade::memory::memory_space* gpu_space,
+                            std::size_t bytes,
+                            std::size_t min_headroom_bytes,
+                            rmm::cuda_stream_view stream)
+    : _stream(stream)
+  {
+    if (gpu_space == nullptr || bytes == 0) {
+      _ok = true;  // nothing to reserve; not a failure
+      return;
+    }
+    // Headroom first. A reservation for a fraction of one batch is grantable
+    // long after the device has run out of room to actually encode in, so
+    // asking only "does this reservation fit" lets compression keep starting
+    // work that the allocator then refuses.
+    if (min_headroom_bytes > 0 && gpu_space->get_available_memory() < min_headroom_bytes) {
+      _declined_for_headroom = true;
+      return;  // _ok stays false: caller declines to an uncompressed spill
+    }
+    auto reservation = gpu_space->make_reservation_or_null(bytes);
+    if (!reservation) { return; }  // _ok stays false: caller declines
+    _allocator = gpu_space->get_memory_resource_of<cucascade::memory::Tier::GPU>();
+    if (_allocator == nullptr) {
+      _ok = true;  // no adaptor to attach to; behave as before
+      return;
+    }
+    _attached = _allocator->attach_reservation_to_tracker(stream, std::move(reservation));
+    _ok       = true;
+  }
+
+  ~scoped_encode_reservation()
+  {
+    if (_attached && _allocator != nullptr) { _allocator->reset_stream_reservation(_stream); }
+  }
+
+  scoped_encode_reservation(const scoped_encode_reservation&)            = delete;
+  scoped_encode_reservation& operator=(const scoped_encode_reservation&) = delete;
+  scoped_encode_reservation(scoped_encode_reservation&&)                 = delete;
+  scoped_encode_reservation& operator=(scoped_encode_reservation&&)      = delete;
+
+  [[nodiscard]] bool ok() const noexcept { return _ok; }
+
+  /// True when the decline was for lack of device headroom rather than an
+  /// ungrantable reservation; distinguishes "too tight to compress at all" from
+  /// "this particular reservation did not fit".
+  [[nodiscard]] bool declined_for_headroom() const noexcept { return _declined_for_headroom; }
+
+ private:
+  rmm::cuda_stream_view _stream;
+  cucascade::memory::reservation_aware_resource_adaptor* _allocator{nullptr};
+  bool _attached{false};
+  bool _ok{false};
+  bool _declined_for_headroom{false};
+};
+
+/// Free device bytes below which a spill declines to compress, or 0 when the
+/// check does not apply (an arena is installed, or the fraction is disabled).
+std::size_t encode_min_headroom_bytes(const compression::spill_context& ctx,
+                                      const cucascade::memory::memory_space* gpu_space)
+{
+  if (compression::compression_device_pool_enabled()) { return 0; }
+  if (gpu_space == nullptr || !(ctx.encode_min_headroom_fraction > 0.0)) { return 0; }
+  return static_cast<std::size_t>(static_cast<double>(gpu_space->get_max_memory()) *
+                                  ctx.encode_min_headroom_fraction);
+}
+
+/// Bytes to reserve for encoding a unit of @p uncompressed_bytes, or 0 when no
+/// reservation is wanted (an arena is installed, or the fraction is disabled).
+std::size_t encode_reservation_bytes(const compression::spill_context& ctx,
+                                     std::size_t uncompressed_bytes)
+{
+  if (compression::compression_device_pool_enabled()) { return 0; }
+  if (!(ctx.encode_reserve_fraction > 0.0)) { return 0; }
+  return static_cast<std::size_t>(static_cast<double>(uncompressed_bytes) *
+                                  ctx.encode_reserve_fraction);
 }
 
 // Resolve the memory space a converter should place its result in.
@@ -649,6 +1008,130 @@ void write_hpln_file(
   flush();
 }
 
+
+// Encode one column, stage it to pinned host, and free both its compressed form
+// and its source before moving to the next.
+//
+// The ordering is the point. A whole-table spill only becomes durable once every
+// column has been encoded and staged, so freeing sources during that loop leaves
+// a window in which a later failure loses the columns already freed — their
+// compressed forms live only in device memory and go with the exception. Staging
+// each column as it is produced closes the window: by the time column i's source
+// is freed, column i is already on the host, and a failure at column i+1 costs
+// only that column, whose source is still intact.
+//
+// It also bounds the arena to one column instead of accumulating every column's
+// compressed output, which is what forced the arena to 4 GB.
+// @param column_plans  Resolved by the caller, before it took ownership of the
+//        columns: resolution explores on first contact with an edge and the
+//        explorer allocates, so under the pressure that triggered this spill it
+//        can fail — and after the release a failure is no longer a decline.
+std::vector<std::shared_ptr<pinned_compressed_blob>> encode_and_stage_per_column(
+  cudf::table_view view,
+  const compression::spill_context& ctx,
+  const std::vector<column_state>& column_plans,
+  std::vector<std::unique_ptr<cudf::column>>& owned_columns,
+  cucascade::memory::fixed_size_host_memory_resource* host_mr,
+  cucascade::memory::reservation* reservation,
+  rmm::cuda_stream_view stream,
+  std::uint64_t& out_compressed_bytes)
+{
+  const auto num_columns   = static_cast<std::size_t>(view.num_columns());
+  auto const mr            = compression::compression_device_mr();
+  const auto names         = synthetic_column_names(view.num_columns());
+  out_compressed_bytes     = 0;
+
+  std::vector<std::shared_ptr<pinned_compressed_blob>> blobs;
+  blobs.reserve(num_columns);
+
+  for (std::size_t i = 0; i < num_columns; ++i) {
+    const cudf::table_view one_col{{view.column(static_cast<cudf::size_type>(i))}};
+    std::vector<std::string> one_name{names[i]};
+
+    auto encode = [&](const std::string& dsl) {
+      nvtx3::scoped_range encode_range{"sirius::compression::encode_column"};
+      return compress_columns_with_plans(one_col, {dsl}, one_name, stream, mr);
+    };
+
+    simpatico::compressed_table encoded;
+    // Same dtype-aware carrier as the whole-table path: `identity` cannot
+    // round-trip a decimal or timestamp. Callers check can_carry_without_plan for
+    // every column *before* releasing the source, so a column reaching here
+    // without a plan always has a usable fallback.
+    const std::string fallback_plan =
+      default_plan_for(view.column(static_cast<cudf::size_type>(i)).type());
+    const std::string& plan = column_plans[i].viable ? column_plans[i].dsl : fallback_plan;
+    try {
+      encoded = encode(plan);
+    } catch (const std::exception& e) {
+      // Raw is the floor: the default carrier needs no codec scratch, so it
+      // survives the pressure that sank the real plan. Only this column is affected.
+      SIRIUS_LOG_DEBUG("[compression_converters] column {} encode failed ({}); storing it raw",
+                       i,
+                       e.what());
+      // Raw is the floor and it has to succeed: by this point earlier columns have
+      // been staged and their sources freed, so there is no intact batch to fall
+      // back to and throwing would destroy it. identity needs no codec scratch,
+      // and the previous column's compressed form was freed as soon as it was
+      // staged, so the arena drains between columns — a failure here is transient
+      // contention with the other downgrade threads, not a real shortage.
+      bool staged_raw = false;
+      for (int attempt = 1; attempt <= 20 && !staged_raw; ++attempt) {
+        try {
+          encoded    = encode(fallback_plan);
+          staged_raw = true;
+        } catch (const std::exception& raw_err) {
+          if (attempt == 20) {
+            throw std::runtime_error(
+              std::string("[compression_converters] column ") + std::to_string(i) +
+              " could not be stored even raw after 20 attempts: " + raw_err.what());
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(25 * attempt));
+        }
+      }
+    }
+
+    std::vector<std::uint8_t> header;
+    std::vector<simpatico::payload_buffer_ref> buffers;
+    std::uint64_t payload_bytes = 0;
+    {
+      nvtx3::scoped_range header_range{"sirius::compression::build_header"};
+      const std::string hdr_err =
+        simpatico::build_compressed_table_header(encoded, header, buffers, payload_bytes, stream);
+      if (!hdr_err.empty()) {
+        throw std::runtime_error("[compression_converters] header for column " + std::to_string(i) +
+                                 ": " + hdr_err);
+      }
+    }
+
+    auto blob           = std::make_shared<pinned_compressed_blob>();
+    blob->header        = std::move(header);
+    blob->payload       = host_mr->allocate_multiple_blocks(payload_bytes, reservation);
+    blob->payload_bytes = payload_bytes;
+    {
+      nvtx3::scoped_range stage_range{"sirius::compression::stage_column_to_host"};
+      for (auto const& b : buffers) {
+        if (b.size_bytes > 0 && b.device_ptr != nullptr) {
+          copy_device_to_pinned_blocks(
+            b.device_ptr, *blob->payload, b.offset, static_cast<std::size_t>(b.size_bytes), stream);
+        }
+      }
+      // The copies read `encoded`'s device buffers, so they must land before it dies.
+      stream.synchronize();
+    }
+
+    out_compressed_bytes += blob->header.size() + payload_bytes;
+    blobs.push_back(std::move(blob));
+
+    // Column i is now durable on the host. Its compressed form and its source are
+    // both dead weight, and this is the first moment freeing either is safe.
+    encoded.columns.clear();
+    if (i < owned_columns.size()) { owned_columns[i].reset(); }
+  }
+
+  return blobs;
+}
+
 // gpu_table_representation → compressed_host_representation (compress on spill).
 std::unique_ptr<cucascade::idata_representation> compress_gpu_to_host(
   cucascade::idata_representation& source,
@@ -662,18 +1145,136 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_host(
   auto view       = rep.get_table_view();
 
   const std::size_t uncompressed_bytes = source.get_size_in_bytes();
-  auto staged                          = compress_for_spill(view, ctx, uncompressed_bytes, stream);
+
+  // Reserve the encode's device working memory before anything else happens.
+  // Ahead of the plan resolve and the source release, both because a decline
+  // must still be a clean decline at this point and because a reservation is
+  // cheap to fail and expensive to discover late.
+  auto* gpu_space = const_cast<cucascade::memory::memory_space*>(&source.get_memory_space());
+  scoped_encode_reservation encode_reservation(gpu_space,
+                                               encode_reservation_bytes(ctx, uncompressed_bytes),
+                                               encode_min_headroom_bytes(ctx, gpu_space),
+                                               stream);
+  if (!encode_reservation.ok()) {
+    SIRIUS_LOG_DEBUG(
+      "[compression_converters] repo={} declining ({}): free={}B, needed headroom {}B, "
+      "reserve {}B; spilling uncompressed",
+      static_cast<const void*>(ctx.repo),
+      encode_reservation.declined_for_headroom() ? "device too tight to encode"
+                                                 : "reservation not grantable",
+      gpu_space != nullptr ? gpu_space->get_available_memory() : 0,
+      encode_min_headroom_bytes(ctx, gpu_space),
+      encode_reservation_bytes(ctx, uncompressed_bytes));
+    throw std::runtime_error(
+      "[compression_converters] insufficient device memory for the encode");
+  }
 
   const auto* space = resolve_target_space(source, target_memory_space, reservation);
   auto* space_mut   = const_cast<cucascade::memory::memory_space*>(space);
-  auto* host_mr     = space_mut->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  auto* host_mr_early = space_mut->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+
+  // Take ownership so each column can be freed as it is encoded. try_release_table,
+  // not release_table: the latter deep-copies when the batch views externally
+  // owned memory, adding a whole batch to the device at the moment we are trying
+  // to free one. A null return means this batch is that kind, and it takes the
+  // ordinary whole-table path below.
+  //
+  // Everything that can decline runs BEFORE this point, because the release is
+  // the point of no return: the columns move out of `rep`, so from here on a
+  // failure cannot fall back to an uncompressed spill — there is nothing left to
+  // spill. Resolving the plan is such a step. It explores on first contact with
+  // an edge, and the explorer allocates from exactly the memory that is scarce
+  // during a spill; on q3/SF1000 with a 2 GB arena it OOM'd, the generic handler
+  // declined to an uncompressed spill of the already-emptied representation, and
+  // the resulting zero-column batch surfaced 20 s later as an out-of-range access
+  // inside PARTITION.
+  std::unique_ptr<cudf::table> owned;
+  std::vector<std::unique_ptr<cudf::column>> owned_columns;
+  std::vector<cudf::column_view> owned_views;
+  std::vector<column_state> column_plans;
+  // Releasing early is only safe when *every* column could still be stored by its
+  // dtype's default carrier: after the release there is no uncompressed spill to
+  // fall back to, so a column whose planned encode fails must have somewhere to
+  // land. A DECIMAL128 column has nowhere — bitpack refuses it and identity cannot
+  // be read back — so on TPC-H q18 the retry loop exhausted its 20 attempts, took
+  // the batch down with it, and the empty batch resurfaced in PARTITION as an
+  // out-of-range access. Such batches take the whole-table path below instead,
+  // where any failure is still a clean decline.
+  const auto early_release_safe = [&] {
+    for (cudf::size_type i = 0; i < view.num_columns(); ++i) {
+      if (!can_carry_without_plan(view.column(i).type())) { return false; }
+    }
+    return true;
+  }();
+  if (ctx.release_columns_early && host_mr_early != nullptr && early_release_safe) {
+    column_plans = resolve_or_explore_spill_plan(view, ctx, stream);
+    owned        = rep.try_release_table(stream);
+    if (owned) {
+      owned_columns = owned->release();
+      owned_views.reserve(owned_columns.size());
+      for (auto const& c : owned_columns) {
+        owned_views.push_back(c->view());
+      }
+      view = cudf::table_view{owned_views};
+    }
+  }
+
+  if (owned) {
+    const auto num_columns = static_cast<std::size_t>(view.num_columns());
+    const auto num_rows    = static_cast<std::int64_t>(view.num_rows());
+    std::uint64_t compressed_bytes = 0;
+    std::vector<std::shared_ptr<pinned_compressed_blob>> blobs;
+    try {
+      blobs = encode_and_stage_per_column(view,
+                                          ctx,
+                                          column_plans,
+                                          owned_columns,
+                                          host_mr_early,
+                                          reservation,
+                                          stream,
+                                          compressed_bytes);
+    } catch (const std::exception& e) {
+      // The source is gone, so this is not a decline. Rethrown as
+      // spill_source_consumed so the caller fails the downgrade instead of
+      // spilling the emptied representation as a zero-column batch, which is
+      // silent corruption that only surfaces when something materializes it.
+      throw spill_source_consumed(
+        std::string("[compression_converters] per-column spill failed after the source was "
+                    "released: ") +
+        e.what());
+    }
+
+    SIRIUS_LOG_DEBUG(
+      "[compression_converters] spilled {}B → {}B compressed host per-column (cols={} rows={})",
+      uncompressed_bytes,
+      compressed_bytes,
+      num_columns,
+      num_rows);
+
+    // The aggregate blob carries no bytes of its own; the data lives in `blobs`.
+    auto aggregate = std::make_shared<pinned_compressed_blob>();
+    auto out       = std::make_unique<compressed_host_representation>(
+      *space_mut,
+      std::move(aggregate),
+      synthetic_column_names(static_cast<int>(num_columns)),
+      static_cast<std::size_t>(compressed_bytes),
+      uncompressed_bytes,
+      num_rows);
+    out->set_column_blobs(std::move(blobs));
+    return out;
+  }
+
+  auto* host_mr = space_mut->get_memory_resource_of<cucascade::memory::Tier::HOST>();
   if (host_mr == nullptr) {
     throw std::runtime_error(
       "[compression_converters] spill target has no fixed_size_host_memory_resource");
   }
 
-  // Shape is read off `view` now because the source is released below, after
-  // which the view dangles.
+  // Ordinary whole-table spill: encode every column into one .hpln, then stage it.
+  // The source stays intact throughout, so a failure anywhere here is a clean
+  // decline that falls back to an uncompressed spill.
+  auto staged = compress_for_spill(view, ctx, uncompressed_bytes, stream);
+
   const auto num_columns = static_cast<std::size_t>(view.num_columns());
   const auto num_rows    = static_cast<std::int64_t>(view.num_rows());
 
@@ -681,15 +1282,6 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_host(
   // was sized for the uncompressed batch, so it comfortably covers the (smaller)
   // compressed payload.
   //
-  // Allocate BEFORE releasing the source. Not because an uncompressed spill could
-  // still succeed if this fails — it could not, it needs strictly more host memory
-  // than the compressed payload — but because of what a failure costs. Throwing
-  // here leaves the batch untouched, so the downgrade just declines it and the
-  // query carries on. Throwing after the release would leave the batch holding an
-  // emptied source, since convert_to installs the new representation only on
-  // success: data loss rather than a decline. That is the hazard the device
-  // converter has to absorb with a bounded retry loop around its staging; keeping
-  // the fallible step ahead of the release avoids needing one here.
   auto blob           = std::make_shared<pinned_compressed_blob>();
   blob->header        = std::move(staged.header);
   blob->payload       = host_mr->allocate_multiple_blocks(staged.payload_bytes, reservation);
@@ -720,16 +1312,19 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_host(
   // It becomes worth revisiting if the release can be made stream-ordered (freeing
   // on `stream` rather than syncing), or once arena capacity rather than query
   // memory is the binding constraint.
-  for (auto const& b : staged.buffers) {
-    if (b.size_bytes > 0 && b.device_ptr != nullptr) {
-      copy_device_to_pinned_blocks(
-        b.device_ptr, *blob->payload, b.offset, static_cast<std::size_t>(b.size_bytes), stream);
+  {
+    nvtx3::scoped_range stage_range{"sirius::compression::stage_table_to_host"};
+    for (auto const& b : staged.buffers) {
+      if (b.size_bytes > 0 && b.device_ptr != nullptr) {
+        copy_device_to_pinned_blocks(
+          b.device_ptr, *blob->payload, b.offset, static_cast<std::size_t>(b.size_bytes), stream);
+      }
     }
+    // `staged.table` owns the device buffers being read above; sync before it dies.
+    // Still required: the mapping may have been unusable, or a column may hold
+    // buffers past its recorded last one.
+    stream.synchronize();
   }
-  // `staged.table` owns the device buffers being read above; sync before it dies.
-  // Still required: the mapping may have been unusable, or a column may hold
-  // buffers past its recorded last one.
-  stream.synchronize();
 
   SIRIUS_LOG_DEBUG("[compression_converters] spilled {}B → {}B compressed host (cols={} rows={})",
                    uncompressed_bytes,
@@ -1014,7 +1609,25 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_disk(
   auto view       = rep.get_table_view();
 
   const std::size_t uncompressed_bytes = source.get_size_in_bytes();
-  auto staged                          = compress_for_spill(view, ctx, uncompressed_bytes, stream);
+
+  // See compress_gpu_to_host: without an arena the encode is otherwise
+  // unreserved pressure on the query's own pool.
+  auto* gpu_space = const_cast<cucascade::memory::memory_space*>(&source.get_memory_space());
+  scoped_encode_reservation encode_reservation(gpu_space,
+                                               encode_reservation_bytes(ctx, uncompressed_bytes),
+                                               encode_min_headroom_bytes(ctx, gpu_space),
+                                               stream);
+  if (!encode_reservation.ok()) {
+    SIRIUS_LOG_DEBUG(
+      "[compression_converters] repo={} declining ({}); spilling uncompressed",
+      static_cast<const void*>(ctx.repo),
+      encode_reservation.declined_for_headroom() ? "device too tight to encode"
+                                                 : "reservation not grantable");
+    throw std::runtime_error(
+      "[compression_converters] insufficient device memory for the encode");
+  }
+
+  auto staged = compress_for_spill(view, ctx, uncompressed_bytes, stream);
 
   const auto* space = resolve_target_space(source, target_memory_space, reservation);
   auto* space_mut   = const_cast<cucascade::memory::memory_space*>(space);
@@ -1193,6 +1806,56 @@ std::unique_ptr<cucascade::idata_representation> flush_host_to_disk(
   const auto* space = resolve_target_space(source, target_memory_space, reservation);
   auto* space_mut   = const_cast<cucascade::memory::memory_space*>(space);
 
+  // A per-column representation keeps its bytes in column_blobs(); the aggregate
+  // blob is empty by construction, so the whole-table flush below would write a
+  // zero-byte .hpln and silently destroy the batch. Each artifact is a complete
+  // 1-column .hpln, so the disk form is one file per column: the same shape as
+  // the host form, and each file stays readable by the ordinary reader.
+  //
+  // One file per column rather than a single indexed container, because a
+  // container would need its own reader — the .hpln readers take either a path or
+  // an in-memory image, so a sub-range of a file would have to be staged on the
+  // host first, re-introducing the host copy this path exists to avoid.
+  if (!rep.column_blobs().empty()) {
+    auto const& blobs = rep.column_blobs();
+    std::vector<std::string> paths;
+    paths.reserve(blobs.size());
+    std::size_t total_bytes    = 0;
+    std::size_t max_artifact   = 0;
+    // Partial output is not a leak: on a throw the paths written so far are
+    // unlinked here, since no representation owns them yet.
+    absl::Cleanup remove_partial = [&paths] {
+      for (const auto& p : paths) {
+        std::error_code rm_ec;
+        std::filesystem::remove(p, rm_ec);
+      }
+    };
+    for (auto const& blob : blobs) {
+      const std::string col_path =
+        compression::make_compressed_temp_path(std::string(space_mut->get_disk_mount_path()));
+      paths.push_back(col_path);
+      write_hpln_file(col_path, blob->header, *blob->payload, blob->payload_bytes);
+      const std::size_t artifact_bytes = blob->header.size() + blob->payload_bytes;
+      total_bytes += artifact_bytes;
+      max_artifact = std::max(max_artifact, artifact_bytes);
+    }
+    std::move(remove_partial).Cancel();
+
+    SIRIUS_LOG_DEBUG(
+      "[compression_converters] flushed per-column compressed host chunk → {} files ({}B)",
+      paths.size(),
+      total_bytes);
+
+    return std::make_unique<compressed_disk_representation>(
+      *space_mut,
+      std::move(paths),
+      total_bytes,
+      max_artifact,
+      rep.get_uncompressed_data_size_in_bytes(),
+      rep.num_rows(),
+      rep.column_names());
+  }
+
   const std::string path =
     compression::make_compressed_temp_path(std::string(space_mut->get_disk_mount_path()));
   write_hpln_file(path, rep.header(), rep.payload(), rep.payload_bytes());
@@ -1220,6 +1883,61 @@ std::unique_ptr<cucascade::idata_representation> decompress_disk_to_gpu(
   nvtx3::scoped_range nvtx_range{"sirius::compression::disk_to_gpu"};
   auto& rep     = source.cast<compressed_disk_representation>();
   auto const mr = rmm::mr::get_current_device_resource_ref();
+
+  // Per-column form: one complete 1-column .hpln per column, read and decoded one
+  // at a time and assembled into the batch. A projection picks files directly —
+  // a column IS an artifact here, so there is nothing for the subset reader to do.
+  if (rep.is_per_column()) {
+    auto const& paths = rep.column_paths();
+    auto const& sel   = rep.selected_indices();
+    std::vector<std::unique_ptr<cudf::column>> cols;
+    cols.reserve(sel ? sel->size() : paths.size());
+
+    auto decode_one = [&](std::size_t idx) {
+      if (idx >= paths.size()) {
+        throw std::runtime_error("[compression_converters] per-column disk index " +
+                                 std::to_string(idx) + " out of range (" +
+                                 std::to_string(paths.size()) + " artifacts)");
+      }
+      std::string err;
+      simpatico::compressed_table one =
+        simpatico::read_compressed_table(paths[idx], stream, mr, &err);
+      if (!err.empty()) {
+        throw std::runtime_error("[compression_converters] per-column disk read failed (" +
+                                 paths[idx] + "): " + err);
+      }
+      // The read filled device buffers on `stream`; the pool streams are not
+      // ordered after it, so barrier before decoding (as the whole-table path does).
+      stream.synchronize();
+      auto& pool = column_pool();
+      auto tbl   = simpatico::decompress(one, pool, mr);
+      auto parts = tbl->release();
+      if (parts.empty()) {
+        throw std::runtime_error(
+          "[compression_converters] per-column disk decode produced no column");
+      }
+      cols.push_back(rebind_column_stream(std::move(parts.front()), stream));
+    };
+
+    if (sel) {
+      for (auto idx : *sel) {
+        decode_one(idx);
+      }
+    } else {
+      for (std::size_t i = 0; i < paths.size(); ++i) {
+        decode_one(i);
+      }
+    }
+
+    auto table = std::make_unique<cudf::table>(std::move(cols));
+    const cucascade::memory::memory_space* sp =
+      (target_memory_space != nullptr) ? target_memory_space : &source.get_memory_space();
+    SIRIUS_LOG_DEBUG("[compression_converters] decompressed per-column from disk cols={} rows={}",
+                     table->num_columns(),
+                     table->num_rows());
+    return std::make_unique<cucascade::gpu_table_representation>(
+      std::move(table), *const_cast<cucascade::memory::memory_space*>(sp), stream);
+  }
 
   std::string read_error;
   simpatico::compressed_table ct =
@@ -1331,11 +2049,21 @@ std::size_t estimated_materialization_bytes(const cucascade::idata_representatio
   // payload on device, then build the table beside it — so all three carry the
   // compressed footprint as extra transient peak. See the header for why the two
   // coexist rather than replace one another.
-  const bool compressed = dynamic_cast<const compressed_host_representation*>(&data) != nullptr ||
-                          dynamic_cast<const compressed_device_representation*>(&data) != nullptr ||
-                          dynamic_cast<const compressed_disk_representation*>(&data) != nullptr;
-
-  return compressed ? uncompressed + data.get_size_in_bytes() : uncompressed;
+  //
+  // A per-column batch stages one artifact at a time and frees it before the
+  // next, so its transient is the largest column, not the sum; charging the sum
+  // would over-reserve by roughly the column count on exactly the batches this
+  // form exists to make cheaper.
+  if (const auto* host = dynamic_cast<const compressed_host_representation*>(&data)) {
+    return uncompressed + host->decode_transient_bytes();
+  }
+  if (const auto* disk = dynamic_cast<const compressed_disk_representation*>(&data)) {
+    return uncompressed + disk->decode_transient_bytes();
+  }
+  if (dynamic_cast<const compressed_device_representation*>(&data) != nullptr) {
+    return uncompressed + data.get_size_in_bytes();
+  }
+  return uncompressed;
 }
 
 }  // namespace sirius

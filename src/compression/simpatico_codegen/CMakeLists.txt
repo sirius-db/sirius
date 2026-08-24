@@ -44,7 +44,11 @@ elseif(CONDA_PREFIX)
       CACHE FILEPATH "nvcc from prefix")
   set(CUDA_TOOLKIT_INCLUDE
       "${CONDA_PREFIX}/targets/${CUDA_TARGET_TRIPLE}/include")
-  set(CUDA_CCCL_INCLUDE "${CUDA_TOOLKIT_INCLUDE}/cccl")
+  if(EXISTS "${CUDA_TOOLKIT_INCLUDE}/cccl")
+    set(CUDA_CCCL_INCLUDE "${CUDA_TOOLKIT_INCLUDE}/cccl")
+  else()
+    set(CUDA_CCCL_INCLUDE "${CUDA_TOOLKIT_INCLUDE}")
+  endif()
   set(_SIMPATICO_INCLUDE_DIRS
       "${CONDA_PREFIX}/include" "${CONDA_PREFIX}/include/rapids"
       "${CUDA_TOOLKIT_INCLUDE}")

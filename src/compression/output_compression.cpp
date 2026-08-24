@@ -39,41 +39,59 @@ bool try_compress_output_batch(cucascade::data_batch& batch,
 {
   if (!output_compression_enabled() || repo == nullptr) { return false; }
 
+  // Every gate below is a silent decline, and with all of them silent the feature
+  // is indistinguishable from being switched off: enabling it on q3/q5 changed
+  // nothing and the log said nothing about why. Each reason is now traceable.
+  auto decline = [repo](const char* why) {
+    SIRIUS_LOG_DEBUG("[output_compression] skip for repo={}: {}",
+                     static_cast<const void*>(repo),
+                     why);
+    return false;
+  };
+
   // Only where the data will actually sit. A PIPELINE or PARTIAL consumer starts
   // on these batches almost immediately, so compressing them just buys an
   // immediate decompress. See the header for the full reasoning.
-  if (barrier != op::MemoryBarrierType::FULL) { return false; }
+  if (barrier != op::MemoryBarrierType::FULL) { return decline("consumer barrier is not FULL"); }
 
   try {
     // Non-blocking: a batch a consumer already holds is not ours to rewrite, and
     // publication must not stall waiting for one.
     auto mut_opt = batch.try_to_mutable();
-    if (!mut_opt) { return false; }
+    if (!mut_opt) { return decline("batch is not exclusively ours"); }
     auto& mut = *mut_opt;
 
     auto* space = const_cast<cucascade::memory::memory_space*>(mut.get_memory_space());
-    if (space == nullptr || space->get_tier() != cucascade::memory::Tier::GPU) { return false; }
+    if (space == nullptr || space->get_tier() != cucascade::memory::Tier::GPU) {
+      return decline("batch does not live on the GPU tier");
+    }
 
     auto const* data = mut.get_data();
-    if (data == nullptr) { return false; }
+    if (data == nullptr) { return decline("no representation"); }
     // Must be an uncompressed GPU table: the GPU tier also holds
     // compressed_device_representation, and re-compressing one is both wrong and
     // a no-op we should not pay for.
     auto const* gpu_rep = dynamic_cast<const cucascade::gpu_table_representation*>(data);
-    if (gpu_rep == nullptr) { return false; }
+    if (gpu_rep == nullptr) { return decline("not an uncompressed GPU table"); }
 
     const std::size_t data_size = data->get_size_in_bytes();
-    if (data_size == 0) { return false; }
+    if (data_size == 0) { return decline("batch is empty"); }
 
     // Amortization gate. Compressing costs a roughly fixed ~3 ms per batch
     // (per-column, per-plan-node stream syncs plus blob staging), measured on the
     // SF100 sweep at ~1-2% of the codecs' rated throughput — so the cost is
     // almost entirely independent of how much data the batch holds. A small
     // batch cannot repay it however well it compresses.
-    if (data_size < make_output_compression_context(repo).min_batch_bytes) { return false; }
+    if (data_size < make_output_compression_context(repo).min_batch_bytes) {
+      SIRIUS_LOG_DEBUG("[output_compression] skip for repo={}: batch {}B < min {}B",
+                       static_cast<const void*>(repo),
+                       data_size,
+                       make_output_compression_context(repo).min_batch_bytes);
+      return false;
+    }
 
     const auto num_columns = static_cast<std::size_t>(gpu_rep->get_table_view().num_columns());
-    if (num_columns == 0) { return false; }
+    if (num_columns == 0) { return decline("batch has no columns"); }
 
     // Cheap pre-check before reserving anything: an edge where no column's plan
     // clears the gate is the common case and must cost nothing but a lookup.
@@ -81,13 +99,13 @@ bool try_compress_output_batch(cucascade::data_batch& batch,
     if (!plan_register::global()
            .decide_output_plan(repo, num_columns, output_compression_gate())
            .has_value()) {
-      return false;
+      return decline("no column's lineage plan clears the output gate");
     }
 
     // Compressing allocates the compressed form while the source table is still
     // live, so reserve the source's size as the upper bound on that transient.
     auto reservation = space->make_reservation_or_null(data_size);
-    if (!reservation) { return false; }
+    if (!reservation) { return decline("could not reserve the source's size for the transient"); }
 
     const auto ctx = make_output_compression_context(repo);
     scoped_output_compression_context guard(ctx);

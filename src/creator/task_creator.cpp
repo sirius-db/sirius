@@ -73,6 +73,17 @@ task_creator::task_creator(task_creator_config config,
 
 task_creator::~task_creator() { stop(); }
 
+void task_creator::set_active_gpu_ids(std::vector<int> ids, std::size_t full_count)
+{
+  _active_gpu_ids = std::move(ids);
+  _full_gpu_count = full_count;
+}
+
+const std::vector<int>& task_creator::get_active_gpu_ids() const noexcept
+{
+  return _active_gpu_ids;
+}
+
 void task_creator::set_client_context(::duckdb::ClientContext& client_context)
 {
   std::lock_guard<std::mutex> lock(_global_state_mutex);
@@ -244,9 +255,11 @@ void task_creator::reset()
 }
 
 op::sirius_physical_operator* task_creator::get_operator_for_next_task(
-  op::sirius_physical_operator* node)
+  op::sirius_physical_operator* node,
+  std::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& visited_pipelines)
 {
   if (node == nullptr) { return nullptr; }
+  if (auto pipeline = node->get_pipeline()) { visited_pipelines.push_back(std::move(pipeline)); }
 
   auto hint = node->get_next_task_hint();
   if (!hint.has_value()) { return nullptr; }
@@ -259,7 +272,7 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
     // WSM TODO: how do we handle other ports that are not default?
     return hint.value().producer;
   } else if (hint.value().hint == op::TaskCreationHint::WAITING_FOR_INPUT_DATA) {
-    return get_operator_for_next_task(hint.value().producer);
+    return get_operator_for_next_task(hint.value().producer, visited_pipelines);
   }
   return nullptr;
 }
@@ -356,9 +369,24 @@ void task_creator::manager_loop()
     auto request_kind = request->type;
     if (node == nullptr) { continue; }
 
-    node = get_operator_for_next_task(node);
+    std::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> visited_pipelines;
 
-    if (node == nullptr) { continue; }
+    node = get_operator_for_next_task(node, visited_pipelines);
+
+    if (node == nullptr) {
+      // Same re-evaluation the creation path does on exit: get_next_task_hint()
+      // can have drained ports (hash join's discard sweep) in ANY pipeline the
+      // hint walk visited, making it finishable. A visited upstream pipeline
+      // whose tasks all completed earlier gets no later mark_task_completed(),
+      // so this is its only chance to be marked finished.
+      std::sort(visited_pipelines.begin(), visited_pipelines.end());
+      visited_pipelines.erase(std::unique(visited_pipelines.begin(), visited_pipelines.end()),
+                              visited_pipelines.end());
+      for (auto& visited : visited_pipelines) {
+        visited->update_pipeline_status(false);
+      }
+      continue;
+    }
 
     // Dispatch the task creation work to the pool
     _bounded_pool->dispatch(std::move(slot), [this, node, request_kind]() mutable {
@@ -375,6 +403,10 @@ void task_creator::manager_loop()
         while (!node->all_ports_empty()) {
           auto task_lock  = pipeline->get_task_creation_lock();
           auto input_data = node->get_next_task_input_data();
+          // Every override funnels through here, so this is the one place that can
+          // give the spill path an edge key for operators whose own
+          // get_next_task_input_data does not record one.
+          if (input_data) { node->record_source_repos_if_absent(*input_data); }
           auto* pipelineable_input =
             dynamic_cast<op::pipelineable_operator_data*>(input_data.get());
           if (!input_data ||
@@ -509,6 +541,26 @@ void task_creator::manager_loop()
                       preferred_device_id.value_or(-1));
                   }
                 }
+              }
+            }
+            // Confine the task to the admitted subset. Every preference above except the
+            // partition pin comes from where data lives rather than from the subset, and the
+            // scheduler treats a preference as binding — so an excluded id would be honoured.
+            // Clamping a residency-derived one costs the locality it encoded, but honouring
+            // it would put the query on a GPU it was not admitted to. An unpreferred task
+            // escapes too: the scheduler gives those to whichever executor asks first. Pin
+            // those as well, but only on a real subset, since a pin costs the scheduler's
+            // freedom to place them wherever frees up first.
+            if (!_active_gpu_ids.empty()) {
+              bool const names_excluded_device =
+                preferred_device_id.has_value() &&
+                std::find(_active_gpu_ids.begin(), _active_gpu_ids.end(), *preferred_device_id) ==
+                  _active_gpu_ids.end();
+              bool const unpinned_on_a_subset =
+                !preferred_device_id.has_value() && _active_gpu_ids.size() < _full_gpu_count;
+              if (names_excluded_device || unpinned_on_a_subset) {
+                auto const idx      = _admission_rr.fetch_add(1) % _active_gpu_ids.size();
+                preferred_device_id = _active_gpu_ids[idx];
               }
             }
             if (preferred_device_id.has_value()) {

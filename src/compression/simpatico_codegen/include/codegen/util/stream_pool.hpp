@@ -36,8 +36,10 @@ struct stream_pool {
   bool init(size_t n);
   /// Destroy all streams.
   void shutdown();
-  /// Synchronize all streams.
-  void sync_all();
+  /// Synchronize all streams. Returns the first failure while still
+  /// synchronizing the remaining streams, so an async kernel error is
+  /// reported instead of silently dropped. Callable from destructors.
+  cudaError_t sync_all();
 };
 
 }  // namespace simpatico

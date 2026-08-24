@@ -168,7 +168,9 @@ class multi_index_priority_queue {
   ~multi_index_priority_queue()                                            = default;
 
   /// Inserts a task, computing its priority and secondary-index keys once, then
-  /// wakes one thread blocked in pop()/pop_back(). If the queue is interrupted
+  /// wakes every thread blocked in pop()/pop_back()/wait() (notify_all: with
+  /// mixed waiter kinds, notify_one could wake a non-consuming wait() and
+  /// strand a pop()). If the queue is interrupted
   /// (i.e. shutting down) the task is dropped rather than enqueued, matching the
   /// teardown contract callers rely on (e.g. returning a task to a closed queue).
   /// Strongly exception-safe: if any allocation throws, the queue is left as it
@@ -227,10 +229,17 @@ class multi_index_priority_queue {
         throw;
       }
     }
-    _cv.notify_one();
+    // notify_all, not notify_one: the scheduler's management loop is itself a
+    // waiter on this CV (it sleeps here when the queue is empty), so waking a
+    // single waiter could wake a pop()-blocked worker and leave the loop asleep.
+    _cv.notify_all();
     // Outside the lock: the callback publishes into the scheduler's request
     // channel, and holding the queue mutex across that would invert the lock
     // order against the management loop's matcher.
+    //
+    // Redundant with the CV wake-up above now that the management loop waits on
+    // this queue directly, but retained as a second path: it also reaches a loop
+    // parked on the request channel rather than on the queue.
     if (_on_push) { _on_push(); }
   }
 
@@ -261,6 +270,16 @@ class multi_index_priority_queue {
     _cv.wait(lock, [this] { return !_levels.empty() || !_active; });
     if (_levels.empty()) { return nullptr; }
     return extract_node(&_levels.begin()->second.tasks.front());
+  }
+
+  /// Blocks until the queue is non-empty, without extracting — the caller
+  /// picks what to take via the non-blocking accessors. Returns false if
+  /// interrupted while empty (shutdown).
+  [[nodiscard]] bool wait() const
+  {
+    std::unique_lock<std::mutex> lock(_mutex);
+    _cv.wait(lock, [this] { return !_levels.empty() || !_active; });
+    return !_levels.empty();
   }
 
   /// Like pop(), but blocks for and returns the globally-last (highest-priority-
@@ -679,8 +698,8 @@ class multi_index_priority_queue {
   }
 
   mutable std::mutex _mutex;
-  std::condition_variable _cv;
-  bool _active{true};  ///< false after interrupt(): blocked pops stop waiting.
+  mutable std::condition_variable _cv;  ///< mutable so const wait() can block on it
+  bool _active{true};                   ///< false after interrupt(): blocked pops stop waiting.
   /// Invoked after each successful push, outside the lock. See set_on_push().
   std::function<void()> _on_push;
 

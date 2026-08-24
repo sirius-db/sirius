@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <stdexcept>
 
 namespace sirius {
 namespace op {
@@ -65,6 +66,9 @@ struct partition_strategy {
                                                 uint64_t hash_partition_bytes,
                                                 int num_gpus)
 {
+  if (hash_partition_bytes == 0) {
+    throw std::invalid_argument("hash_partition_bytes must be greater than zero");
+  }
   int num_partitions =
     static_cast<int>(std::max(uint64_t{1},
                               total_bytes / hash_partition_bytes +

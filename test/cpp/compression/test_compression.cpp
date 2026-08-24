@@ -25,6 +25,7 @@
 
 #include <catch.hpp>
 #include <compression/plan_register.hpp>
+#include <utils/log_test_utils.hpp>
 
 // standard library
 #include <string>
@@ -415,6 +416,187 @@ TEST_CASE("pin_table compression - device tier column-subset projection correctn
   REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(24995000LL));
 
   run_ok(con, "CALL unpin_table('t_proj_dev');", "unpin");
+
+  fs::remove_all(tmp);
+}
+
+// ─── Decode-time predicate pushdown ──────────────────────────────────────────
+//
+// The TPC-H q19 shape: a low-cardinality string column that is only ever
+// equality-tested and never projected. On a GPU-tier dictionary pin the scan
+// hands the predicate to decompression, which answers it against the four-entry
+// key set and returns a BOOL8 mask instead of gathering the decoded chars. The
+// observable contract is that the answer does not change — including for the
+// shapes that must decline the substitution.
+
+TEST_CASE("pin_table compression - dictionary predicate pushdown preserves results",
+          "[compression][pin_table][isolated_context]")
+{
+  if (no_gpu()) { return; }
+
+  auto [tmp, yaml_path] = make_comp_env("dictpred");
+
+  // Four distinct labels over 5000 rows, mirroring l_shipinstruct. Rows with
+  // s = 'DELIVER IN PERSON' are range % 4 == 0 (1250 rows) and carry
+  // v = range * 2, so SUM(v) = 2 * 4 * (0 + 1 + ... + 1249) = 6245000.
+  sirius::test::mgpu::generate_parquet_surface(
+    tmp,
+    "SELECT CASE range % 4 WHEN 0 THEN 'DELIVER IN PERSON' WHEN 1 THEN 'COLLECT COD' "
+    "WHEN 2 THEN 'NONE' ELSE 'TAKE BACK RETURN' END AS s, range * 2 AS v FROM range(5000)",
+    1);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con  = env.make_connection();
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+  run_ok(con, "SET pin_table_compression = true;", "set compression");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
+
+  auto plan_dir = tmp / "plans";
+  // The exact l_shipinstruct plan from the SF1000 lineitem plan file — depth 3,
+  // with both keys_offsets and indices bitpacked — so the interception is
+  // exercised against the shape production actually decodes, where the indices
+  // reach the dictionary rep from a JIT bitpack inverse rather than raw storage.
+  // v stays raw so it can be summed.
+  write_plan_file(plan_dir,
+                  "t_dictpred",
+                  "input -> dictionary -> keys_offsets, keys_chars, indices\n"
+                  "dictionary.keys_offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, "
+                  "packed\n"
+                  "dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+                  "---\ninput -> identity\n");
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
+
+  auto pin = con.Query("CALL pin_table('" + glob + "', tier='gpu', name='t_dictpred');");
+  require_ok(pin, "pin dictpred");
+
+  // s is filter-only — never in the select list — so the scan may replace it
+  // with the decode-time mask. This is the case the optimization exists for.
+  auto eq = con.Query("CALL gpu_execution(\"SELECT SUM(v) FROM read_parquet('" + glob +
+                      "') WHERE s = 'DELIVER IN PERSON'\");");
+  require_ok(eq, "equality pushdown");
+  REQUIRE(eq->RowCount() == 1);
+  REQUIRE(eq->GetValue(0, 0) == duckdb::Value::BIGINT(6245000LL));
+
+  // IN over two keys exercises the multi-value LUT: range % 4 in {0, 2} →
+  // SUM(v) = 2 * ((0+4+...+4996) + (2+6+...+4998)) = 2 * (3122500 + 3125000).
+  auto in_res = con.Query("CALL gpu_execution(\"SELECT SUM(v) FROM read_parquet('" + glob +
+                          "') WHERE s IN ('DELIVER IN PERSON', 'NONE')\");");
+  require_ok(in_res, "in pushdown");
+  REQUIRE(in_res->RowCount() == 1);
+  REQUIRE(in_res->GetValue(0, 0) == duckdb::Value::BIGINT(12495000LL));
+
+  // A *projected* dictionary column must not be substituted — the mask would
+  // replace the very values the query selects.
+  auto proj = con.Query("CALL gpu_execution(\"SELECT COUNT(s), MIN(s) FROM read_parquet('" + glob +
+                        "') WHERE s = 'DELIVER IN PERSON'\");");
+  require_ok(proj, "projected dictionary column");
+  REQUIRE(proj->RowCount() == 1);
+  REQUIRE(proj->GetValue(0, 0) == duckdb::Value::BIGINT(1250LL));
+  REQUIRE(proj->GetValue(1, 0).ToString() == "DELIVER IN PERSON");
+
+  // A non-equality filter is not a candidate and must still evaluate normally.
+  auto ne = con.Query("CALL gpu_execution(\"SELECT COUNT(*) FROM read_parquet('" + glob +
+                      "') WHERE s <> 'DELIVER IN PERSON'\");");
+  require_ok(ne, "inequality falls back");
+  REQUIRE(ne->RowCount() == 1);
+  REQUIRE(ne->GetValue(0, 0) == duckdb::Value::BIGINT(3750LL));
+
+  run_ok(con, "CALL unpin_table('t_dictpred');", "unpin dictpred");
+
+  fs::remove_all(tmp);
+}
+
+TEST_CASE("pin_table compression - predicate pushdown mixes substituted and decoded columns",
+          "[compression][pin_table][isolated_context]")
+{
+  if (no_gpu()) { return; }
+
+  auto [tmp, yaml_path] = make_comp_env("dictpredmix");
+
+  // The literal q19 shape: two filter-only string columns, only one of which a
+  // dictionary can answer. l_shipinstruct-alike `s` is dictionary-compressed and
+  // substitutes; l_shipmode-alike `m` is str_split and must still be decoded and
+  // compared. Rows matching both are range % 12 == 0 (417 rows), v = range * 2 →
+  // SUM(v) = 2081664. This is the case that would break if one ineligible
+  // candidate disabled the pushdown for its eligible sibling.
+  sirius::test::mgpu::generate_parquet_surface(
+    tmp,
+    "SELECT CASE range % 4 WHEN 0 THEN 'DELIVER IN PERSON' WHEN 1 THEN 'COLLECT COD' "
+    "WHEN 2 THEN 'NONE' ELSE 'TAKE BACK RETURN' END AS s, "
+    "CASE range % 3 WHEN 0 THEN 'AIR' WHEN 1 THEN 'RAIL' ELSE 'SHIP' END AS m, "
+    "range * 2 AS v FROM range(5000)",
+    1);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con  = env.make_connection();
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+  run_ok(con, "SET pin_table_compression = true;", "set compression");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
+
+  auto plan_dir = tmp / "plans";
+  write_plan_file(plan_dir,
+                  "t_dictpred_mix",
+                  "input -> dictionary\n---\ninput -> str_split -> offsets, chars\n---\ninput -> "
+                  "identity\n");
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
+
+  auto pin = con.Query("CALL pin_table('" + glob + "', tier='gpu', name='t_dictpred_mix');");
+  require_ok(pin, "pin mixed");
+
+  auto res = con.Query("CALL gpu_execution(\"SELECT SUM(v) FROM read_parquet('" + glob +
+                       "') WHERE s = 'DELIVER IN PERSON' AND m = 'AIR'\");");
+  require_ok(res, "mixed substitution");
+  REQUIRE(res->RowCount() == 1);
+  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(2081664LL));
+
+  run_ok(con, "CALL unpin_table('t_dictpred_mix');", "unpin mixed");
+
+  fs::remove_all(tmp);
+}
+
+TEST_CASE("pin_table compression - predicate pushdown declines a non-dictionary plan",
+          "[compression][pin_table][isolated_context]")
+{
+  if (no_gpu()) { return; }
+
+  auto [tmp, yaml_path] = make_comp_env("dictpredfb");
+
+  // str_split cannot answer a predicate from its compressed form, so the scan
+  // must decode and compare as before. Same 1250-matching-row surface:
+  // SUM(v) = 6245000.
+  sirius::test::mgpu::generate_parquet_surface(
+    tmp,
+    "SELECT CASE range % 4 WHEN 0 THEN 'AIR' WHEN 1 THEN 'RAIL' WHEN 2 THEN 'SHIP' "
+    "ELSE 'TRUCK' END AS s, range * 2 AS v FROM range(5000)",
+    1);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con  = env.make_connection();
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+  run_ok(con, "SET pin_table_compression = true;", "set compression");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
+
+  auto plan_dir = tmp / "plans";
+  write_plan_file(
+    plan_dir, "t_dictpred_fb", "input -> str_split -> offsets, chars\n---\ninput -> identity\n");
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
+
+  auto pin = con.Query("CALL pin_table('" + glob + "', tier='gpu', name='t_dictpred_fb');");
+  require_ok(pin, "pin fallback");
+
+  auto res = con.Query("CALL gpu_execution(\"SELECT SUM(v) FROM read_parquet('" + glob +
+                       "') WHERE s = 'AIR'\");");
+  require_ok(res, "str_split fallback");
+  REQUIRE(res->RowCount() == 1);
+  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(6245000LL));
+
+  run_ok(con, "CALL unpin_table('t_dictpred_fb');", "unpin fallback");
 
   fs::remove_all(tmp);
 }
@@ -1516,6 +1698,30 @@ TEST_CASE("pin_table compression - no plan file for the table pins uncompressed"
   run_ok(con, "SET pin_table_compression = true;", "set compression");
   run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
   run_ok(con, "SET enable_compressed_materialization = true;", "set narrowing");
+
+  // Runtime settings may be staged in either order, so setting the enable flag before the plan
+  // directory is valid. The final pin must nevertheless make the inactive state visible rather
+  // than silently accepting a compression request it cannot honor.
+  {
+    sirius::test::scoped_recording_log_sink logs{"warn"};
+    auto pin_without_plan_source =
+      con.Query("CALL pin_table('" + glob + "', tier='host', name='t_noplan');");
+    require_ok(pin_without_plan_source, "pin without plan source");
+
+    std::size_t missing_plan_source_warnings = 0;
+    for (auto const& record : logs.records()) {
+      if (record.message.find("pin_table_input_compression_plan_dir is empty") !=
+          std::string::npos) {
+        ++missing_plan_source_warnings;
+        REQUIRE(record.level == sirius::log::level::warn);
+        REQUIRE(record.message.find("pinning uncompressed") != std::string::npos);
+      }
+    }
+    REQUIRE(missing_plan_source_warnings == 1);
+  }
+  REQUIRE(sirius::test::census_entry(con, "t_noplan").compressed_chunks == 0);
+  run_ok(con, "CALL unpin_table('t_noplan');", "unpin without plan source");
+
   // A plan directory holding a plan for some OTHER table: the resolver finds no plan for this
   // one, so compression never engages.
   auto plan_dir = tmp / "plans";

@@ -435,6 +435,23 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
   wrap_above(slot, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> hgb_op) {
     auto* hgb_ptr = hgb_op.get();
 
+    // Construct the merge while the child still carries the final SQL schema. COUNT(DISTINCT)
+    // emits LIST sets locally and only becomes BIGINT after merge post-processing.
+    auto merge = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(
+      &hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>(),
+      op_params.hash_partition_bytes);
+    if (hgb_ptr->has_physical_overrides()) {
+      merge->set_physical_types(hgb_ptr->get_physical_types());
+    }
+
+    auto& grouped = hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+    bool const has_supported_count_distinct_layout =
+      grouped.has_count_distinct && !grouped.has_avg && !hgb_ptr->has_physical_overrides() &&
+      hgb_ptr->types.size() == grouped.group_idx.size() + grouped.aggregate_slots.size();
+    if (has_supported_count_distinct_layout) {
+      hgb_ptr->types = grouped.get_count_distinct_local_output_types();
+    }
+
     auto partition =
       duckdb::make_uniq<sirius::op::sirius_physical_partition>(hgb_ptr->types,
                                                                hgb_ptr->estimated_cardinality,
@@ -447,12 +464,6 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
     }
     partition->children.push_back(std::move(hgb_op));
 
-    auto merge = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(
-      &hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>(),
-      op_params.hash_partition_bytes);
-    if (hgb_ptr->has_physical_overrides()) {
-      merge->set_physical_types(hgb_ptr->get_physical_types());
-    }
     // The partition's downstream sizing consumer is the merge (key_source hgb only supplies keys).
     partition_ptr->set_downstream_consumer_op(merge.get());
     merge->children.push_back(std::move(partition));
@@ -468,6 +479,11 @@ void wrap_ungrouped_aggregate(duckdb::unique_ptr<sirius::op::sirius_physical_ope
     auto* ungrouped_ptr = ungrouped_op.get();
     auto merge          = duckdb::make_uniq<sirius::op::sirius_physical_ungrouped_aggregate_merge>(
       &ungrouped_ptr->Cast<sirius::op::sirius_physical_ungrouped_aggregate>());
+    // MERGE_AGGREGATE keeps the final SQL schema copied above. The child emits per-task
+    // accumulator carriers instead: AVG is SUM + COUNT, so its runtime width is larger than the
+    // final width. Recording that schema on the child keeps task-level output validation exact.
+    ungrouped_ptr->types = ungrouped_ptr->Cast<sirius::op::sirius_physical_ungrouped_aggregate>()
+                             .get_local_output_types();
     merge->children.push_back(std::move(ungrouped_op));
     return merge;
   });
@@ -1091,6 +1107,15 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
   op.estimated_cardinality                                      = op.EstimateCardinality(context);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan = nullptr;
 
+  // Read the lineage BEFORE planning this operator. `origins_of` asks the logical
+  // operator for its column bindings, and several planners consume the operator
+  // they are given — plan_delim_join moves the join's children out — after which
+  // GetColumnBindings() indexes an empty `children` and throws
+  // "Attempted to access index 0 within vector of size 0". That aborted GPU plan
+  // generation for every query with a correlated subquery (q2, q17, q18, q20 at
+  // TPC-H), which then ran on DuckDB CPU without saying so.
+  auto origins = _column_origins.origins_of(op);
+
   // SQLNULL-typed columns (e.g. an uncast NULL in VALUES) have no cuDF
   // representation — get_cudf_type() / fixed_width_byte_size() reject them at
   // execution time, after the GPU plan is already running. Reject the plan
@@ -1300,7 +1325,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
   // Carry base-table lineage onto the physical operator. Done here, in the one
   // dispatcher that sees both the logical operator (which owns the bindings) and
   // the physical operator built from it, rather than in each per-type overload.
-  plan->column_origins = _column_origins.origins_of(op);
+  // The lineage itself was read above, before the planner could consume `op`.
+  plan->column_origins = std::move(origins);
 #ifdef DUCKDB_VERIFY_VECTOR_OPERATOR
   auto verify = duckdb::make_uniq<duckdb::PhysicalVerifyVector>(std::move(plan));
   plan        = std::move(verify);

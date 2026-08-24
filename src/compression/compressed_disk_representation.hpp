@@ -29,19 +29,26 @@
 namespace sirius {
 
 /**
- * @brief DISK-tier idata_representation backed by a Simpatico .hpln file.
+ * @brief DISK-tier idata_representation backed by Simpatico .hpln file(s).
  *
- * Owns a path to a compressed `.hpln` file written by either:
- *  - `simpatico::write_compressed_table()` (for GPU→DISK direct spill), or
- *  - a raw flush of a `pinned_compressed_blob` (for HOST→DISK cascade).
+ * Comes in two forms, mirroring @ref compressed_host_representation:
  *
- * File ownership is shared: the file is unlinked when the last owner of
- * `_owns_file` is destroyed (RAII via `shared_ptr<bool>`). Multiple
- * representations may share the same file path after `clone()`.
+ *  - **whole-table**: one `.hpln` holding every column, written by either
+ *    `simpatico::write_compressed_table()` (GPU→DISK direct spill) or a raw
+ *    flush of a `pinned_compressed_blob` (HOST→DISK cascade). `path()`.
+ *  - **per-column**: one complete 1-column `.hpln` per column, in schema order,
+ *    produced by flushing a per-column `compressed_host_representation` whose
+ *    bytes live in `column_blobs()`. `column_paths()`; `is_per_column()`.
+ *
+ * File ownership is shared: every file listed in `_files` is unlinked when the
+ * last owner of `_owns_file` is destroyed (RAII via `shared_ptr<bool>`).
+ * Multiple representations may share the same files after `clone()`.
  *
  * The `compressed_disk_representation → gpu_table_representation` converter
  * calls `simpatico::read_compressed_table(path, stream, mr)` then
- * `simpatico::decompress()`, optionally projecting to `_selected_indices`.
+ * `simpatico::decompress()`, optionally projecting to `_selected_indices`; for
+ * the per-column form it reads and decodes one file per selected column and
+ * assembles the batch from the results.
  */
 class compressed_disk_representation : public cucascade::idata_representation {
  public:
@@ -56,6 +63,22 @@ class compressed_disk_representation : public cucascade::idata_representation {
   compressed_disk_representation(cucascade::memory::memory_space& memory_space,
                                  std::string path,
                                  std::size_t compressed_bytes,
+                                 std::size_t uncompressed_bytes,
+                                 std::int64_t num_rows,
+                                 std::vector<std::string> column_names);
+
+  /**
+   * @brief Construct the per-column form: one 1-column .hpln per column.
+   *
+   * @param column_paths       One path per column, in schema order; must be the
+   *                           same length as @p column_names.
+   * @param max_artifact_bytes Size of the largest single artifact — the decode
+   *                           transient, since the files are read one at a time.
+   */
+  compressed_disk_representation(cucascade::memory::memory_space& memory_space,
+                                 std::vector<std::string> column_paths,
+                                 std::size_t compressed_bytes,
+                                 std::size_t max_artifact_bytes,
                                  std::size_t uncompressed_bytes,
                                  std::int64_t num_rows,
                                  std::vector<std::string> column_names);
@@ -87,7 +110,27 @@ class compressed_disk_representation : public cucascade::idata_representation {
 
   // ── Accessors ───────────────────────────────────────────────────────────────
 
-  [[nodiscard]] const std::string& path() const noexcept { return *_path; }
+  /// The whole-table artifact. Only valid when !is_per_column().
+  [[nodiscard]] const std::string& path() const noexcept { return _files->front(); }
+
+  /// True when the batch is stored as one .hpln per column; see the class docs.
+  [[nodiscard]] bool is_per_column() const noexcept { return _per_column; }
+
+  /// The per-column artifacts, in schema order. Empty unless is_per_column().
+  [[nodiscard]] const std::vector<std::string>& column_paths() const noexcept
+  {
+    static const std::vector<std::string> kNone;
+    return _per_column ? *_files : kNone;
+  }
+
+  /// Compressed bytes that decoding this batch stages on the device at once: the
+  /// whole file for the whole-table form, the largest single artifact for the
+  /// per-column form, which reads one file at a time. Feeds
+  /// estimated_materialization_bytes().
+  [[nodiscard]] std::size_t decode_transient_bytes() const noexcept
+  {
+    return _per_column ? _max_artifact_bytes : _compressed_bytes;
+  }
 
   [[nodiscard]] const std::vector<std::string>& column_names() const noexcept
   {
@@ -102,22 +145,28 @@ class compressed_disk_representation : public cucascade::idata_representation {
   }
 
  private:
-  // Private constructor for clone/select_columns (shares path + owns_file).
+  // Private constructor for clone/select_columns (shares files + owns_file).
   compressed_disk_representation(cucascade::memory::memory_space& memory_space,
-                                 std::shared_ptr<std::string> path,
+                                 std::shared_ptr<std::vector<std::string>> files,
+                                 bool per_column,
                                  std::shared_ptr<bool> owns_file,
                                  std::size_t compressed_bytes,
+                                 std::size_t max_artifact_bytes,
                                  std::size_t uncompressed_bytes,
                                  std::int64_t num_rows,
                                  std::vector<std::string> column_names,
                                  std::optional<std::vector<std::size_t>> selected_indices);
 
-  // Shared ownership: the file is unlinked when _owns_file.use_count() drops to 1
-  // (i.e., this is the last owner).
-  std::shared_ptr<std::string> _path;
+  // Shared ownership: the files are unlinked when _owns_file.use_count() drops to
+  // 1 (i.e., this is the last owner). One entry for the whole-table form, one per
+  // column for the per-column form.
+  std::shared_ptr<std::vector<std::string>> _files;
+  bool _per_column = false;
   std::shared_ptr<bool> _owns_file;
 
   std::size_t _compressed_bytes;
+  /// Largest single artifact; equals _compressed_bytes for the whole-table form.
+  std::size_t _max_artifact_bytes;
   std::size_t _uncompressed_bytes;
   std::int64_t _num_rows;
   std::vector<std::string> _column_names;

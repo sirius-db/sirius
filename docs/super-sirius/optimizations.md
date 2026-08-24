@@ -66,22 +66,32 @@ num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 
 **Config:** `fuse_merge_pipelines` (default: true). See [physical-plan-generation.md](physical-plan-generation.md) → Merge fusion for pipeline-shape details.
 
+### Task Creator Look-Ahead (PR #1174)
+
+**Motivation:** With demand-driven (`active`) task creation, a drained task queue leaves GPU workers idle even when not-yet-activated scans could already be producing work.
+
+**Mechanism:** The task creator keeps a `_lookahead_queue` of candidate operators (built at query start from the plan's scan operators after the first, cleared on drain/restart). When the task scheduler finds its task queue empty, it calls `schedule_lookahead(device_hint)`, which — only under `strategy: lookahead` — emits one speculative request for the next not-yet-activated operator, warming scans up one task at a time. The manager loop creates a single task per look-ahead request rather than draining the source. See [task-creator.md](task-creator.md).
+
+**Code path:** `src/creator/task_creator.cpp` — `schedule_lookahead()`; `src/pipeline/task_scheduler.cpp` — empty-queue trigger; `src/include/creator/config.hpp` — `request_type`
+
+**Config:** `executor.task_creator.strategy` (`active` default, `lookahead` opt-in) — see [configuration.md](configuration.md).
+
 ## Operator-Level Optimizations
 
 ### Adaptive Join BUILD_PROBE Mode (PR #423)
 
 **Motivation:** For small build-side datasets, building the hash table once and probing many times is more efficient than the standard multi-partition Cartesian product approach.
 
-**Mechanism:** `update_join_exec_mode()` switches to BUILD_PROBE mode when:
+**Mechanism:** `compute_hash_join_partition_strategy()` selects BUILD_PROBE mode when:
 - `num_partitions <= num_gpus` (one hash table per partition, at most one partition per GPU; reduces to a single partition when `num_gpus == 1`)
 - per-partition average build side < `max_build_hash_table_bytes`, foldable to a single batch per partition
 - the join is neither RIGHT-family nor `MIXED_JOIN`
 
 In BUILD_PROBE mode, each partition's first task builds a `cudf::hash_join` hash table and caches it; subsequent tasks for that partition only probe.
 
-**Broadcast small build tables (multi-GPU):** when the build side is small (`< small_table_bytes`), the PARTITION operator replicates it to every GPU (proposes `num_gpus` partitions, `_broadcast` flag) instead of funneling the build to one GPU, so every GPU builds its own hash table and probes locally. Build-only slots are discarded once the probe side finishes. Pure decision: `make_broadcast_partition_decision()`.
+**Broadcast small build tables (multi-GPU):** when the build side is small (`< small_table_bytes`), the PARTITION operator replicates it to every GPU (proposes `num_gpus` partitions, `_broadcast` flag) instead of funneling the build to one GPU, so every GPU builds its own hash table and probes locally. Build-only slots are discarded once the probe side finishes.
 
-**Code path:** `src/op/sirius_physical_hash_join.cpp` — `update_join_exec_mode()`, `build_probe_mode_eligible()`; `src/op/sirius_physical_partition.cpp` — `make_broadcast_partition_decision()`
+**Code path:** `src/op/sirius_physical_hash_join.cpp` — `compute_hash_join_partition_strategy()`, `get_partition_strategy()`; `src/op/sirius_physical_partition.cpp` — broadcast slot routing
 
 **Config:** `max_build_hash_table_bytes` (default: 500 MB)
 
@@ -92,8 +102,17 @@ In BUILD_PROBE mode, each partition's first task builds a `cudf::hash_join` hash
 **Mechanism:** Uses cuDF's `COLLECT_SET` aggregation for distinct value collection, with `MERGE_SETS` in the merge phase. For multi-column DISTINCT, synthesizes struct columns from multiple input columns.
 
 **Code path:**
-- `src/op/aggregate/gpu_aggregate_impl.cpp` — `cudf::approx_distinct_count` usage
-- `src/op/aggregate/aggregate_op_util.cpp` — `has_count_distinct` flag
+- `src/op/aggregate/gpu_aggregate_impl.cpp` — `local_grouped_agg()` COLLECT_SET handling
+
+### Label-Encoded Group Keys for COUNT DISTINCT (PR #1375)
+
+**Motivation:** cuDF's sorted groupby finds group boundaries via `stable_sorted_order(keys)`, which takes the radix fast path only for a single key column. A multi-column group key falls to lexicographic merge sort — on TPC-H q16 at SF1000, 308.7 ms for 118.8M rows, 92% of the aggregate. The pre-existing dictionary-encode path narrows the comparators but leaves multiple key columns, so the single-column gate is never reached.
+
+**Mechanism:** `cudf::encode` collapses the key table into one dense INT32 label; the groupby sorts on that label, and original keys are recovered with a gather at group cardinality. `cudf::encode` returns distinct key rows in sorted order, so label ordering equals lexicographic key ordering; NULL key tuples get their own label (`null_policy::INCLUDE`). Gated on: a COLLECT_SET aggregation being present, ≥ 1M input rows, a multi-column non-nested key, and an HLL estimate putting group cardinality below 1% of rows (otherwise `cudf::encode`'s internal distinct+sort costs as much as the sort it replaces). Falls back silently to the plain multi-column sort if encoding throws; short-circuits the STRING dictionary-encode path when active.
+
+**Code path:** `src/op/aggregate/gpu_aggregate_impl.cpp` — `local_grouped_agg()`, label path (`use_label_keys`)
+
+**Config:** none (thresholds hard-coded). TPC-H SF1000 GB300: q16 0.490 s → 0.298 s.
 
 ### Distinct Hash Join (PR #558)
 
@@ -173,7 +192,7 @@ Data is moved from GPU to HOST tier via converter registry.
 
 **Code path:** `src/downgrade/downgrade_executor.cpp` — `monitor_loop()`, `run_downgrade_pass()`
 
-**Config:** `downgrade_trigger_fraction` (default: 1.0 for GPU, 0.8 for Host), `downgrade_stop_fraction` (default: 0.7)
+**Config:** `downgrade_trigger_fraction` (default: 0.8 for GPU, 0.9 for host), `downgrade_stop_fraction` (default: 0.6 for GPU, 0.8 for host). Configuration requires `0 < stop < trigger <= 1`.
 
 ### OOM Retry Mechanism (PR #364)
 
@@ -230,7 +249,7 @@ Data is moved from GPU to HOST tier via converter registry.
 
 ## Scan Optimizations
 
-### Compressed Materialization (unreleased)
+### Compressed Materialization (PR #1260)
 
 **Motivation:** Integer and fixed-point DECIMAL columns often use only a fraction of their declared
 range. Carrying their native width through every GPU batch increases memory traffic and cache
@@ -273,6 +292,26 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 **Code path:**
 - `src/op/scan/scan_utils.cpp` — `convert_table_filters_to_expression()`, `filter_row_groups_with_stats()`
 - `src/op/scan/parquet_gpu_ingestible.cpp` — filter translation + row-group pruning in the per-file metadata task
+
+### Null-Count Row-Group Pruning (PR #1430)
+
+**Motivation:** Null-test predicates cannot be handed to cuDF's min/max stats filter (it faults on them — see PR #1417), so `WHERE v IS NULL` read every row group even though the parquet footer's `null_count` statistic answers the test directly.
+
+**Mechanism:** A second pruning pass over each footer applies null tests from the `TableFilterSet`: `IS NULL` cannot match a row group with `null_count == 0`; `IS NOT NULL` cannot match one where every row is null (`null_count == num_rows`). An absent `null_count` (it is optional in the spec) keeps the row group. Applies only to scalar leaf columns (nested-column leaf stats describe repeated/leaf-level nullness; legacy top-level `REPEATED` primitives are excluded) and only to conjunctive predicate positions — null tests inside `OR` cannot prune. Only provably non-matching row groups are skipped; the full predicate still runs at read/post-decode time.
+
+**Code path:** `src/op/scan/parquet_gpu_ingestible.cpp` — `collect_null_prune_predicates()` and the null-count pruning loop; `src/include/op/scan/parquet_gpu_ingestible.hpp` — `null_prune_predicate`
+
+**Config:** none
+
+### Pure-Filter Column Elision (PRs #1019, #1027)
+
+**Motivation:** The scan's post-decode filter path gathered every decoded column and then dropped pure-filter columns (read only for the predicate) during projection — materializing data just to throw it away. The standalone `FILTER` operator had the same waste for columns not needed downstream.
+
+**Mechanism:** `expression_evaluator::select(input, output_indices)` evaluates the predicate over the full input (pure-filter columns stay visible to it) but gathers only the requested output columns. Because `scan_plan::data_columns` is laid out output-first, the kept columns are the contiguous prefix `[0, K)`, so existing assembly and prefix projection apply unchanged. For the FILTER operator, `sirius_plan_filter` translates DuckDB's `LogicalFilter::projection_map` into `output_indices` on `sirius_physical_filter` (empty means keep all). `count(*)`-style filters with no output columns use the all-columns overload, since a 0-column/N-row gather result is unrepresentable.
+
+**Code path:** `src/include/expression_evaluator/expression_evaluator.hpp` — `select()` overloads, `compute_mask()`; `src/include/op/scan/scan_plan.hpp` — `output_data_positions()`; `src/op/scan/parquet_gpu_ingestible.cpp`, `duckdb_native_gpu_ingestible.cpp`; `src/planner/sirius_plan_filter.cpp`
+
+**Config:** none
 
 ### Batch Coalescing for Small Files (PR #503)
 
@@ -352,6 +391,16 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 
 **Config:** `object_store` config (endpoint / region / credentials / signing mode) under `executor.scan_manager`
 
+### Single-Request S3 Parquet Footer Bind (PR #1087)
+
+**Motivation:** A cold S3 parquet bind issued a HEAD for the object size plus separate trailer and footer GETs — three round-trips per file over high-RTT links.
+
+**Mechanism:** Opening with `open_hint::parquet_footer_probe` makes the REST backend issue one suffix-range GET (`Range: bytes=-N`), which returns the object size (from `Content-Range`) and stashes the trailing N bytes on the open object; the reactor then serves cuDF's trailer/footer reads from that per-open stash. `describe_parquet` is metadata-aware: a cold bind probes, while a warm re-bind opens `generic` (one HEAD) and reuses the parsed footer from the metadata store. Unusable suffix responses (a 200 full-body reply, 416, or a missing `Content-Range`) abort the body mid-stream and fall back to a plain HEAD. See the scan doc's S3 backend section for the open-path details.
+
+**Code path:** `src/include/io/io_context.hpp` — `open_hint`; `src/io/rest/rest_ioctx.cpp`, `src/io/rest/rest_reactor.cpp`; `src/io/cache/metadata_store.cpp`; `src/scan_manager/sirius_scan_manager.cpp`
+
+**Config:** `scan_manager.rest.footer_probe_bytes` (default 512 KiB) — must cover the footer or the probe falls back to a body re-GET
+
 ### Zero-Copy from Pinned and Cached Tables (PR #881)
 
 **Motivation:** When scan input is an already-resident pinned/cached host table, copying the data again on consumption is wasted work.
@@ -412,6 +461,7 @@ chunk 0 is retained as a sentinel and emptied by the GPU filter so the pipeline 
 `src/scan_manager/pinned_chunk_stats.cpp` owns the statistics and safety checks; and
 `src/scan_manager/sirius_scan_manager.cpp` builds and serves the survivor plan.
 
-**Config:** `enable_pinned_zone_map_pruning` (default: `true`) is available through YAML and
-DuckDB `SET`. It gates both capture and pruning; entries pinned while it is disabled remain
-statless until re-pinned. See [Pinned-table zone maps](scan.md#zone-maps) for limitations.
+**Config:** zone-map capture and pruning are automatic and enabled by default. The advanced YAML
+escape hatch `sirius.operator_params.enable_pinned_zone_map_pruning` gates both capture and
+pruning; entries pinned while it is disabled remain statless until re-pinned. The direct DuckDB
+session override is test-only. See [Pinned-table zone maps](scan.md#zone-maps) for limitations.
