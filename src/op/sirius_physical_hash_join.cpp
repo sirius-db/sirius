@@ -757,36 +757,29 @@ cross_schedule_kind peek_cross_schedule_kind(std::vector<partition_cross_schedul
   return cross_schedule_kind::done;
 }
 
-partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
-                                                        bool is_build_side,
-                                                        bool build_foldable,
-                                                        int num_gpus,
-                                                        uint64_t hash_partition_bytes,
-                                                        uint64_t max_build_hash_table_bytes,
-                                                        uint64_t max_broadcast_join_size,
-                                                        duckdb::JoinType join_type,
-                                                        HASH_JOIN_MODE join_mode,
-                                                        double estimated_probe_to_build_ratio)
+partition_strategy compute_hash_join_partition_strategy(const hash_join_sizing_inputs& in)
 {
   // Invariant: num_gpus defaults to 1 and is only ever set to a hardware GPU count >= 1. A value
   // < 1 is a programming error (it makes the per-partition division below ill-defined).
-  if (num_gpus < 1) {
+  if (in.num_gpus < 1) {
     throw std::invalid_argument("compute_hash_join_partition_strategy: num_gpus (" +
-                                std::to_string(num_gpus) + ") must be >= 1");
+                                std::to_string(in.num_gpus) + ") must be >= 1");
   }
+  int const num_gpus         = in.num_gpus;
+  uint64_t const total_bytes = in.total_bytes;
 
-  int const natural = natural_num_partitions(total_bytes, hash_partition_bytes, num_gpus);
+  int const natural = natural_num_partitions(total_bytes, in.hash_partition_bytes, num_gpus);
 
   // Only the build side can drive broadcast / BUILD_PROBE. Right-family joins are probe-driven
   // (probe partition sizes the join), so they always take the plain STANDARD natural count.
-  if (!is_build_side) { return {natural, /*broadcast=*/false, /*build_probe=*/false}; }
+  if (!in.is_build_side) { return {natural, /*broadcast=*/false, /*build_probe=*/false}; }
 
-  bool const is_mark         = join_type == duckdb::JoinType::MARK;
-  bool const is_right_family = join_type == duckdb::JoinType::RIGHT ||
-                               join_type == duckdb::JoinType::RIGHT_SEMI ||
-                               join_type == duckdb::JoinType::RIGHT_ANTI;
-  bool const is_mixed      = join_mode == HASH_JOIN_MODE::MIXED_JOIN;
-  bool const is_full_outer = join_type == duckdb::JoinType::OUTER;
+  bool const is_mark         = in.join_type == duckdb::JoinType::MARK;
+  bool const is_right_family = in.join_type == duckdb::JoinType::RIGHT ||
+                               in.join_type == duckdb::JoinType::RIGHT_SEMI ||
+                               in.join_type == duckdb::JoinType::RIGHT_ANTI;
+  bool const is_mixed      = in.join_mode == HASH_JOIN_MODE::MIXED_JOIN;
+  bool const is_full_outer = in.join_type == duckdb::JoinType::OUTER;
   uint64_t const small     = partition_small_table_bytes(num_gpus);
 
   // Broadcast candidacy. MARK multi-GPU is forced broadcast (build_has_null must be globally
@@ -796,8 +789,8 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
   bool const broadcast_candidate =
     is_mark ? num_gpus > 1
             : (total_bytes < small ||
-               (total_bytes < max_broadcast_join_size &&
-                estimated_probe_to_build_ratio >= static_cast<double>(num_gpus) * 1.25));
+               (total_bytes < in.max_broadcast_join_size &&
+                in.estimated_probe_to_build_ratio >= static_cast<double>(num_gpus) * 1.25));
 
   // BUILD_PROBE eligibility. MARK/SEMI/ANTI are eligible (persistent filtered_join built on the
   // right, reused across streamed left probe batches); RIGHT_SEMI/RIGHT_ANTI/RIGHT and full OUTER
@@ -811,7 +804,7 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
   int const build_probe_partitions = std::max(1, std::min(natural, num_gpus));
   uint64_t const per_gpu_build_bytes =
     broadcast_candidate ? total_bytes : total_bytes / static_cast<uint64_t>(build_probe_partitions);
-  bool build_probe = per_gpu_build_bytes < max_build_hash_table_bytes && build_foldable &&
+  bool build_probe = per_gpu_build_bytes < in.max_build_hash_table_bytes && in.build_foldable &&
                      !is_right_family && !is_mixed && !is_full_outer;
 
   // A MARK join must always run in BUILD_PROBE mode. It needs the entire build side resident to
@@ -841,16 +834,17 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
   build_card_est                   = std::max(build_card_est, 1UL);
   const double estimated_probe_to_build_ratio =
     static_cast<double>(probe_card_est) / build_card_est;
-  auto const strategy = compute_hash_join_partition_strategy(in.total_bytes,
-                                                             in.is_build_side,
-                                                             in.build_foldable,
-                                                             _num_gpus,
-                                                             _hash_partition_bytes,
-                                                             _max_build_hash_table_bytes,
-                                                             _max_broadcast_join_size,
-                                                             join_type,
-                                                             _join_mode,
-                                                             estimated_probe_to_build_ratio);
+  auto const strategy = compute_hash_join_partition_strategy(
+    {.total_bytes                    = in.total_bytes,
+     .is_build_side                  = in.is_build_side,
+     .build_foldable                 = in.build_foldable,
+     .num_gpus                       = _num_gpus,
+     .hash_partition_bytes           = _hash_partition_bytes,
+     .max_build_hash_table_bytes     = _max_build_hash_table_bytes,
+     .max_broadcast_join_size        = _max_broadcast_join_size,
+     .join_type                      = join_type,
+     .join_mode                      = _join_mode,
+     .estimated_probe_to_build_ratio = estimated_probe_to_build_ratio});
 
   if (join_type == duckdb::JoinType::MARK && _num_gpus > 1 && in.is_build_side &&
       in.total_bytes >= partition_small_table_bytes(_num_gpus)) {

@@ -84,16 +84,17 @@ partition_strategy strategy(uint64_t total_bytes,
                             uint64_t max_broadcast_join_size      = kMaxBroadcastBytes,
                             double estimated_probe_to_build_ratio = 0.0)
 {
-  return compute_hash_join_partition_strategy(total_bytes,
-                                              is_build_side,
-                                              build_foldable,
-                                              num_gpus,
-                                              hash_partition_bytes,
-                                              max_build_hash_table_bytes,
-                                              max_broadcast_join_size,
-                                              join_type,
-                                              join_mode,
-                                              estimated_probe_to_build_ratio);
+  return compute_hash_join_partition_strategy(
+    {.total_bytes                    = total_bytes,
+     .is_build_side                  = is_build_side,
+     .build_foldable                 = build_foldable,
+     .num_gpus                       = num_gpus,
+     .hash_partition_bytes           = hash_partition_bytes,
+     .max_build_hash_table_bytes     = max_build_hash_table_bytes,
+     .max_broadcast_join_size        = max_broadcast_join_size,
+     .join_type                      = join_type,
+     .join_mode                      = join_mode,
+     .estimated_probe_to_build_ratio = estimated_probe_to_build_ratio});
 }
 
 }  // namespace

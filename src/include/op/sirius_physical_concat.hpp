@@ -76,6 +76,12 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   //! before the join so the hash join sees a single build batch.
   void set_concat_all(bool concat_all);
 
+  //! Whether this CONCAT folds a whole partition into one batch instead of grouping by
+  //! `_concat_batch_bytes`. Derived at construction from
+  //! `sirius_physical_hash_join::join_folds_side`; `set_concat_all` may additionally turn it on
+  //! at partition-sizing time, which completes before any `execute` runs.
+  [[nodiscard]] bool folds_all() const noexcept { return _concat_all; }
+
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;
 

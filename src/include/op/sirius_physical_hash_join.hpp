@@ -30,6 +30,7 @@
 #include "expression/join_condition.hpp"
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
+#include "op/fold_limits.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "sirius_config.hpp"
 #include "utils.hpp"
@@ -41,6 +42,8 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 #include <unordered_set>
 #include <vector>
@@ -98,6 +101,22 @@ struct build_probe_decision {
 [[nodiscard]] build_probe_decision select_build_probe_action(
   std::vector<build_probe_slot_view> const& slots);
 
+/// Everything the hash join's partition-sizing decision reads. A parameter object rather than a
+/// long positional list: several of the fields are interchangeable `bool` / `uint64_t` pairs, so
+/// both call sites aggregate-initialise it with designators and no argument can be transposed.
+struct hash_join_sizing_inputs {
+  uint64_t total_bytes                  = 0;  ///< Measured bytes on the sizing side.
+  bool is_build_side                    = false;
+  bool build_foldable                   = false;
+  int num_gpus                          = 1;
+  uint64_t hash_partition_bytes         = 0;
+  uint64_t max_build_hash_table_bytes   = 0;
+  uint64_t max_broadcast_join_size      = 0;
+  duckdb::JoinType join_type            = duckdb::JoinType::INVALID;
+  HASH_JOIN_MODE join_mode              = HASH_JOIN_MODE::STANDARD;
+  double estimated_probe_to_build_ratio = 0.0;
+};
+
 /// Pure decision for how a PARTITION operator should partition its input for a hash join, folding
 /// the natural-count, broadcast-candidacy, and BUILD_PROBE-eligibility logic into one place.
 ///
@@ -119,16 +138,7 @@ struct build_probe_decision {
 /// (`estimated_probe_to_build_ratio >= num_gpus * 1.25`) — replicating a medium build avoids
 /// shuffling a much larger probe across GPUs.
 [[nodiscard]] partition_strategy compute_hash_join_partition_strategy(
-  uint64_t total_bytes,
-  bool is_build_side,
-  bool build_foldable,
-  int num_gpus,
-  uint64_t hash_partition_bytes,
-  uint64_t max_build_hash_table_bytes,
-  uint64_t max_broadcast_join_size,
-  duckdb::JoinType join_type,
-  HASH_JOIN_MODE join_mode,
-  double estimated_probe_to_build_ratio);
+  const hash_join_sizing_inputs& in);
 
 /// Which broadcast slots to discard. In a broadcast join the build table is replicated to every
 /// slot but the probe side is unpartitioned, so a slot may hold build data yet never receive probe
@@ -320,6 +330,37 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   {
     return join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::RIGHT_SEMI ||
            join_type == duckdb::JoinType::RIGHT_ANTI;
+  }
+
+  /// Whether a CONCAT feeding side @p is_build of a @p type join must fold that side into ONE
+  /// batch per partition before the join can consume it:
+  ///   LEFT / SEMI / ANTI              -> build
+  ///   RIGHT / RIGHT_SEMI / RIGHT_ANTI -> probe
+  ///   OUTER                           -> both
+  ///   INNER / MARK                    -> neither
+  ///
+  /// Single source of truth for that rule: `sirius_physical_concat` sets `_concat_all` from it,
+  /// and `compute_hash_join_partition_strategy` derives its fold-bounded partition floor from it,
+  /// so the sizing arithmetic and the CONCAT's actual behaviour cannot drift apart. See
+  /// `op/fold_limits.hpp` for the invariant the floor establishes.
+  ///
+  /// @throws std::runtime_error for a join type the hash join does not implement.
+  [[nodiscard]] static constexpr bool join_folds_side(duckdb::JoinType type, bool is_build)
+  {
+    switch (type) {
+      case duckdb::JoinType::LEFT:
+      case duckdb::JoinType::SEMI:
+      case duckdb::JoinType::ANTI: return is_build;
+      case duckdb::JoinType::RIGHT:
+      case duckdb::JoinType::RIGHT_SEMI:
+      case duckdb::JoinType::RIGHT_ANTI: return !is_build;
+      case duckdb::JoinType::OUTER: return true;
+      case duckdb::JoinType::INNER:
+      case duckdb::JoinType::MARK: return false;
+      default: break;
+    }
+    throw std::runtime_error("sirius_physical_hash_join::join_folds_side: unsupported join type: " +
+                             duckdb::JoinTypeToString(type));
   }
 
   /// Pure sizing-exception predicate: a right-family join takes BUILD-driven partition sizing
