@@ -19,7 +19,9 @@
 // Reaching a join operator through the pipeline headers instantiates
 // `vector<join_condition>`'s destructor, which needs the AST node definition.
 #include <expression/ast/node.hpp>
+#include <op/sirius_physical_hash_join.hpp>
 #include <op/sirius_physical_operator.hpp>
+#include <op/sirius_physical_partition.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 #include <pipeline/sirius_pipeline_converter.hpp>
 #include <sirius_config.hpp>
@@ -31,8 +33,11 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -254,4 +259,82 @@ TEST_CASE("dynamic-filter endpoints obey the data contract on SIP-shaped plans",
         for_each_endpoint(result, require_not_fed_partitioned_data);
       });
   }
+}
+
+TEST_CASE("a join that loses its filter replicas is not left sizing from the build",
+          "[integration][pipeline][dynamic_filter]")
+{
+  // A dynamic-filter-publishing RIGHT_SEMI / RIGHT_ANTI join takes build-driven partition sizing
+  // so its filter can publish before the probe scan launches. That choice is only justified while
+  // the filter survives: restrict_dynamic_filter_replicas can drop every replica -- and with it
+  // the publication -- when the admitted GPU set holds none of the plan's replica GPUs. The
+  // converter must therefore settle the publish plan before it picks a sizing side, or the join
+  // ends up sizing from the build for a filter it no longer has.
+  REQUIRE(sirius::test::g_integration_env != nullptr);
+  if (!sirius::test::g_integration_env->is_active()) { sirius::test::g_integration_env->resume(); }
+  auto con = sirius::test::g_integration_env->make_connection();
+
+  auto db_path = integration_db_path();
+  REQUIRE(fs::exists(db_path));
+  auto r = con.Query("ATTACH IF NOT EXISTS '" + db_path.string() + "' AS tpch (READ_ONLY);");
+  REQUIRE(r);
+  REQUIRE_FALSE(r->HasError());
+  r = con.Query("USE tpch;");
+  REQUIRE(r);
+  REQUIRE_FALSE(r->HasError());
+
+  // TPC-H q4: the delim-direct lowering turns this EXISTS into the RIGHT_SEMI join the sizing
+  // exception is about.
+  const std::string q4 =
+    "SELECT o_orderpriority, count(*) AS order_count FROM orders "
+    "WHERE o_orderdate >= DATE '1993-07-01' AND o_orderdate < DATE '1993-10-01' "
+    "AND EXISTS (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey "
+    "AND l_commitdate < l_receiptdate) "
+    "GROUP BY o_orderpriority ORDER BY o_orderpriority";
+
+  // Reports (publishes, build partition drives the count) for the right-family join in the plan.
+  auto sizing_of = [&](std::vector<int> admitted_gpu_ids) {
+    std::optional<std::pair<bool, bool>> observed;
+    sirius::test::with_conversion_result_for_gpus(
+      con, q4, std::move(admitted_gpu_ids), [&](sirius::pipeline::pipeline_conversion_result& r) {
+        for (auto const& pipeline : r.scheduled_pipelines) {
+          auto* source = pipeline->get_source().get();
+          if (source == nullptr ||
+              source->type != sirius::op::SiriusPhysicalOperatorType::HASH_JOIN) {
+            continue;
+          }
+          auto& join = source->Cast<sirius::op::sirius_physical_hash_join>();
+          if (!join.is_right_family()) { continue; }
+          for (auto const& other : r.scheduled_pipelines) {
+            auto* sink = other->get_sink().get();
+            if (sink == nullptr ||
+                sink->type != sirius::op::SiriusPhysicalOperatorType::PARTITION) {
+              continue;
+            }
+            auto& partition = sink->Cast<sirius::op::sirius_physical_partition>();
+            if (partition.get_downstream_consumer_op() != source ||
+                !partition.is_build_partition()) {
+              continue;
+            }
+            observed =
+              std::pair{join.publishes_dynamic_filters(), partition.drives_partition_count()};
+          }
+        }
+      });
+    return observed;
+  };
+
+  // Guard against a vacuous pass: with the real GPU set this join must publish AND size from the
+  // build, so that the restricted case below actually flips something.
+  auto const admitted = sizing_of({});
+  REQUIRE(admitted.has_value());
+  REQUIRE(admitted->first);
+  REQUIRE(admitted->second);
+
+  // No admitted GPU holds a replica: publication is dropped, so the build must not be left
+  // driving the count.
+  auto const restricted = sizing_of({4242});
+  REQUIRE(restricted.has_value());
+  CHECK_FALSE(restricted->first);
+  CHECK_FALSE(restricted->second);
 }

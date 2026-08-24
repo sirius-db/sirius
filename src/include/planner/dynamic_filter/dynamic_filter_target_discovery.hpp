@@ -105,12 +105,23 @@ struct endpoint_placement {
   sirius::op::sirius_physical_operator& root, std::size_t a0, descent_policy policy);
 
 /**
- * @brief Matches DuckDB's INNER/RIGHT/SEMI producer allowlist
+ * @brief Join types for which pruning probe rows by build-key membership is sound
+ *
+ * Sound means the join's output can never include an unmatched probe row. INNER/SEMI emit only
+ * matched pairs / matched probe rows; RIGHT emits matched pairs plus unmatched build rows;
+ * RIGHT_SEMI/RIGHT_ANTI emit build rows only -- a probe row whose key is absent from the complete
+ * build key set can neither mark a build row (RIGHT_SEMI) nor un-mark one (RIGHT_ANTI).
+ * LEFT/OUTER/MARK/ANTI/SINGLE all give unmatched probe rows an observable output and must not be
+ * pruned. DuckDB's own JoinFilterPushdownOptimizer allowlist is INNER/RIGHT/SEMI; the two
+ * right-family additions are a Sirius extension with the argument above -- they matter for the
+ * delim-direct lowering (`sirius_plan_delim_direct.cpp`), whose joins are always
+ * RIGHT_SEMI/RIGHT_ANTI with the filtered outer relation as the build.
  */
 [[nodiscard]] constexpr bool scan_route_join_type_admissible(duckdb::JoinType t) noexcept
 {
   return t == duckdb::JoinType::INNER || t == duckdb::JoinType::RIGHT ||
-         t == duckdb::JoinType::SEMI;
+         t == duckdb::JoinType::SEMI || t == duckdb::JoinType::RIGHT_SEMI ||
+         t == duckdb::JoinType::RIGHT_ANTI;
 }
 
 /**

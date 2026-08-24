@@ -338,7 +338,8 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   dynamic_filter_publish_plan dynamic_filter_plan,
   uint64_t hash_partition_bytes,
   uint64_t max_broadcast_join_size,
-  dynamic_filter_stats* dynamic_filter_stats_sink)
+  dynamic_filter_stats* dynamic_filter_stats_sink,
+  uint64_t max_fold_rows)
   : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::HASH_JOIN,
                                                 sirius::from_duckdb_vec(op.types),
                                                 estimated_cardinality),
@@ -357,6 +358,7 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   _max_build_hash_table_bytes = max_build_hash_table_bytes;
   _hash_partition_bytes       = hash_partition_bytes;
   _max_broadcast_join_size    = max_broadcast_join_size;
+  _max_fold_rows              = max_fold_rows;
 
   // Route mixed null-safe keys to a NULL_EQUAL predicate; plain `=` remains a hash key.
   bool const wants_routing   = wants_null_safe_routing(conditions, join_type);
@@ -757,47 +759,76 @@ cross_schedule_kind peek_cross_schedule_kind(std::vector<partition_cross_schedul
   return cross_schedule_kind::done;
 }
 
-partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
-                                                        bool is_build_side,
-                                                        bool build_foldable,
-                                                        int num_gpus,
-                                                        uint64_t hash_partition_bytes,
-                                                        uint64_t max_build_hash_table_bytes,
-                                                        uint64_t max_broadcast_join_size,
-                                                        duckdb::JoinType join_type,
-                                                        HASH_JOIN_MODE join_mode,
-                                                        double estimated_probe_to_build_ratio)
+partition_strategy compute_hash_join_partition_strategy(const hash_join_sizing_inputs& in)
 {
   // Invariant: num_gpus defaults to 1 and is only ever set to a hardware GPU count >= 1. A value
   // < 1 is a programming error (it makes the per-partition division below ill-defined).
-  if (num_gpus < 1) {
+  if (in.num_gpus < 1) {
     throw std::invalid_argument("compute_hash_join_partition_strategy: num_gpus (" +
-                                std::to_string(num_gpus) + ") must be >= 1");
+                                std::to_string(in.num_gpus) + ") must be >= 1");
   }
+  int const num_gpus         = in.num_gpus;
+  uint64_t const total_bytes = in.total_bytes;
 
-  int const natural = natural_num_partitions(total_bytes, hash_partition_bytes, num_gpus);
+  int const natural = natural_num_partitions(total_bytes, in.hash_partition_bytes, num_gpus);
+
+  // INV-FOLD: partitions the measured side needs before each of its folds is addressable. One
+  // whenever the whole measurement already fits max_fold_rows -- that fold is the measurement, so
+  // there is no skew to reserve against; only a genuine split is costed against the halved target
+  // (fold_partition_count). Computed for every join type because a side can be folded either by
+  // the join's shape or by BUILD_PROBE, which concat_alls the build whatever the shape says.
+  int const measured_fold_floor = fold_partition_count(in.total_rows, in.max_fold_rows);
+  bool const one_fold_suffices  = measured_fold_floor <= 1;
 
   // Only the build side can drive broadcast / BUILD_PROBE. Right-family joins are probe-driven
-  // (probe partition sizes the join), so they always take the plain STANDARD natural count.
-  if (!is_build_side) { return {natural, /*broadcast=*/false, /*build_probe=*/false}; }
+  // (probe partition sizes the join), so they always take the plain STANDARD natural count --
+  // floored so the probe fold the join requires stays addressable.
+  if (!in.is_build_side) {
+    int const probe_partitions =
+      sirius_physical_hash_join::measured_side_folds(in.join_type, false, /*build_probe=*/false)
+        ? std::max(natural, measured_fold_floor)
+        : natural;
+    return {probe_partitions, /*broadcast=*/false, /*build_probe=*/false};
+  }
 
-  bool const is_mark         = join_type == duckdb::JoinType::MARK;
-  bool const is_right_family = join_type == duckdb::JoinType::RIGHT ||
-                               join_type == duckdb::JoinType::RIGHT_SEMI ||
-                               join_type == duckdb::JoinType::RIGHT_ANTI;
-  bool const is_mixed      = join_mode == HASH_JOIN_MODE::MIXED_JOIN;
-  bool const is_full_outer = join_type == duckdb::JoinType::OUTER;
+  bool const is_mark         = in.join_type == duckdb::JoinType::MARK;
+  bool const is_right_family = in.join_type == duckdb::JoinType::RIGHT ||
+                               in.join_type == duckdb::JoinType::RIGHT_SEMI ||
+                               in.join_type == duckdb::JoinType::RIGHT_ANTI;
+  bool const is_mixed      = in.join_mode == HASH_JOIN_MODE::MIXED_JOIN;
+  bool const is_full_outer = in.join_type == duckdb::JoinType::OUTER;
   uint64_t const small     = partition_small_table_bytes(num_gpus);
 
   // Broadcast candidacy. MARK multi-GPU is forced broadcast (build_has_null must be globally
   // consistent); otherwise a build is a candidate when it is below the small-table threshold, OR
   // below max_broadcast_join_size while the probe side is large relative to the build (replicating
   // the build avoids shuffling a much larger probe across GPUs).
+  //
+  // A broadcast build is replicated rather than split, so every replica folds the WHOLE build and
+  // raising the partition count cannot shrink that fold. A build that does not fit one fold is
+  // therefore inadmissible for broadcast and must be hash-partitioned instead -- but only an EXACT
+  // measurement may withhold broadcast, since an inexact upper bound must never disable anything.
   bool const broadcast_candidate =
-    is_mark ? num_gpus > 1
-            : (total_bytes < small ||
-               (total_bytes < max_broadcast_join_size &&
-                estimated_probe_to_build_ratio >= static_cast<double>(num_gpus) * 1.25));
+    (one_fold_suffices || !in.total_rows_exact) &&
+    (is_mark ? num_gpus > 1
+             : (total_bytes < small ||
+                (total_bytes < in.max_broadcast_join_size &&
+                 in.estimated_probe_to_build_ratio >= static_cast<double>(num_gpus) * 1.25)));
+
+  // The one shape with no legal partition count: MARK is always BUILD_PROBE, so its build always
+  // folds, and its count is pinned either way -- one partition on a single GPU, or broadcast to
+  // every GPU (build_has_null must be globally consistent). Raising the count is not available to
+  // it, so a build that cannot fit one cuDF table can be satisfied at no count. Fail here, naming
+  // the counts, rather than letting cudf::concatenate discover it. Only an EXACT measurement may
+  // fail the query; an inexact upper bound is left to the fold guard in gpu_merge_impl, which
+  // reports an attributable [fold_limit] error against the real row count.
+  if (is_mark && !one_fold_suffices && in.total_rows_exact) {
+    throw std::runtime_error(
+      "compute_hash_join_partition_strategy: a MARK join folds its whole build and cannot be "
+      "hash-partitioned, but its build of " +
+      std::to_string(in.total_rows) + " rows exceeds the " + std::to_string(in.max_fold_rows) +
+      " rows one folded batch can hold");
+  }
 
   // BUILD_PROBE eligibility. MARK/SEMI/ANTI are eligible (persistent filtered_join built on the
   // right, reused across streamed left probe batches); RIGHT_SEMI/RIGHT_ANTI/RIGHT and full OUTER
@@ -811,7 +842,7 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
   int const build_probe_partitions = std::max(1, std::min(natural, num_gpus));
   uint64_t const per_gpu_build_bytes =
     broadcast_candidate ? total_bytes : total_bytes / static_cast<uint64_t>(build_probe_partitions);
-  bool build_probe = per_gpu_build_bytes < max_build_hash_table_bytes && build_foldable &&
+  bool build_probe = per_gpu_build_bytes < in.max_build_hash_table_bytes && in.build_foldable &&
                      !is_right_family && !is_mixed && !is_full_outer;
 
   // A MARK join must always run in BUILD_PROBE mode. It needs the entire build side resident to
@@ -823,12 +854,37 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
 
   bool const broadcast = broadcast_candidate && build_probe;
 
-  // BUILD_PROBE runs at the count its eligibility was measured at; MARK single-GPU is clamped to
-  // one partition; broadcast takes num_gpus; everything else the natural count.
-  int const num_partitions = broadcast                    ? num_gpus
-                             : build_probe                ? build_probe_partitions
-                             : (is_mark && num_gpus <= 1) ? 1
-                                                          : natural;
+  // MARK's count is pinned by its semantics, not by sizing: build_has_null is join-wide, so its
+  // whole build must be visible to every probe row. That means broadcast (one replica per GPU) or
+  // exactly one partition -- never a hash-partitioned build, which would compute the sentinel per
+  // partition and return wrong results rather than fail. Deciding it here, before the general
+  // arms, is what makes the guarantee structural: the throw above covers the case where neither
+  // count can hold the fold, but MARK never depends on that throw to avoid being split.
+  //
+  // Otherwise: BUILD_PROBE runs at the count its eligibility was measured at, broadcast takes
+  // num_gpus, everything else the natural count.
+  int const selected = is_mark       ? (broadcast ? num_gpus : 1)
+                       : broadcast   ? num_gpus
+                       : build_probe ? build_probe_partitions
+                                     : natural;
+
+  // INV-FOLD floor. Applies when the build folds -- by the join's shape, or because BUILD_PROBE
+  // concat_alls it -- and only to the hash-partitioned outcomes: a broadcast build is already
+  // excluded above, while `natural` and `build_probe_partitions` both split the build, so raising
+  // the count only shrinks each per-partition build and BUILD_PROBE's byte eligibility (measured
+  // at min(natural, num_gpus)) still holds.
+  //
+  // measured_side_folds excludes MARK, whose count is already pinned above.
+  //
+  // Residual R5: this is the one `total_rows` consumer that is NOT gated on an exact measurement.
+  // Raising the count past 1 turns `build_arrives_whole` false, so an over-estimated inexact bound
+  // can cost a single-partition dynamic filter. Gating it would be worse: an inexact bound cannot
+  // tell a real overflow from a phantom one, and leaving a possibly-overflowing fold unfloored is
+  // a query failure rather than a lost optimization.
+  bool const build_folds =
+    sirius_physical_hash_join::measured_side_folds(in.join_type, true, build_probe);
+  int const num_partitions =
+    (build_folds && !broadcast) ? std::max(selected, measured_fold_floor) : selected;
   return {num_partitions, broadcast, build_probe};
 }
 
@@ -841,16 +897,38 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
   build_card_est                   = std::max(build_card_est, 1UL);
   const double estimated_probe_to_build_ratio =
     static_cast<double>(probe_card_est) / build_card_est;
-  auto const strategy = compute_hash_join_partition_strategy(in.total_bytes,
-                                                             in.is_build_side,
-                                                             in.build_foldable,
-                                                             _num_gpus,
-                                                             _hash_partition_bytes,
-                                                             _max_build_hash_table_bytes,
-                                                             _max_broadcast_join_size,
-                                                             join_type,
-                                                             _join_mode,
-                                                             estimated_probe_to_build_ratio);
+  auto const strategy = compute_hash_join_partition_strategy(
+    {.total_bytes                    = in.total_bytes,
+     .total_rows                     = in.total_rows,
+     .total_rows_exact               = in.total_rows_exact,
+     .is_build_side                  = in.is_build_side,
+     .build_foldable                 = in.build_foldable,
+     .num_gpus                       = _num_gpus,
+     .hash_partition_bytes           = _hash_partition_bytes,
+     .max_build_hash_table_bytes     = _max_build_hash_table_bytes,
+     .max_broadcast_join_size        = _max_broadcast_join_size,
+     .max_fold_rows                  = _max_fold_rows,
+     .join_type                      = join_type,
+     .join_mode                      = _join_mode,
+     .estimated_probe_to_build_ratio = estimated_probe_to_build_ratio});
+
+  // Residual R2: this join took build-driven sizing so its membership filter could publish from a
+  // single folded build, but the build did not fit one partition, so nothing will publish. The
+  // probe is then both unfiltered and -- because the build is the side that was measured --
+  // unbounded by the partition count, leaving it to the fold guard in gpu_merge_impl::concat.
+  if (in.is_build_side && strategy.num_partitions > 1 &&
+      sizes_build_driven_for_filter_publication()) {
+    SIRIUS_LOG_WARN(
+      "sirius_physical_hash_join id {}: {} join sized {} partitions from a {}-byte build, so no "
+      "dynamic filter can publish; its probe will be neither filtered nor bounded by the "
+      "partition count (build_card_est {}, probe_card_est {})",
+      this->get_operator_id(),
+      duckdb::JoinTypeToString(join_type),
+      strategy.num_partitions,
+      in.total_bytes,
+      build_card_est,
+      probe_card_est);
+  }
 
   if (join_type == duckdb::JoinType::MARK && _num_gpus > 1 && in.is_build_side &&
       in.total_bytes >= partition_small_table_bytes(_num_gpus)) {
@@ -888,9 +966,22 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
                               : _join_mode == HASH_JOIN_MODE::MIXED_JOIN ? "MIXED_JOIN"
                                                                          : "STANDARD";
 
+  // The fold floor is reported as APPLIED, not as computed. A right-family build-driven join
+  // (residual R1') measures a side it does not fold, and a broadcast build is exempted after the
+  // fact; a line claiming a floor in either case would say the opposite of the truth exactly where
+  // a reader most needs to recognise it. The field is named for what the predicate means -- "the
+  // floor applies to the measured side" -- rather than "this side folds", which is a different
+  // statement: a MARK build is the most unconditionally folded thing in the engine and still has
+  // no floor, because its count is pinned instead.
+  bool const floor_applies =
+    measured_side_folds(join_type, in.is_build_side, strategy.build_probe) && !strategy.broadcast;
+  int const applied_fold_floor =
+    floor_applies ? fold_partition_count(in.total_rows, _max_fold_rows) : 1;
+
   SIRIUS_LOG_DEBUG(
     "sirius_physical_hash_join id {} partition strategy: {} partitions ({} GPUs), build side {} "
-    "bytes. Join Type: {}. Join Mode: {} {}. build_card_est {} probe_card_est {}",
+    "bytes. Join Type: {}. Join Mode: {} {}. build_card_est {} probe_card_est {}. sizing side "
+    "total_rows {} ({}) floor_applies {} applied fold_floor {} max_fold_rows {}",
     this->get_operator_id(),
     strategy.num_partitions,
     _num_gpus,
@@ -899,7 +990,12 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
     join_mode_str,
     (strategy.broadcast ? " [broadcast]" : ""),
     build_card_est,
-    probe_card_est);
+    probe_card_est,
+    in.total_rows,
+    (in.total_rows_exact ? "exact" : "upper bound"),
+    floor_applies,
+    applied_fold_floor,
+    _max_fold_rows);
   return strategy;
 }
 
@@ -1066,8 +1162,10 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
   }
 
   // How a partition's tasks are tagged for GPU routing (task_creator uses tag % num_gpus):
-  //  - Multiple partitions: tag with the real partition index p, so partitions spread one-per-GPU
-  //    and execute() can select the matching hash-table slot from the tag.
+  //  - Multiple partitions: tag with the real partition index p, so partitions spread round-robin
+  //    across GPUs and execute() can select the matching hash-table slot from the tag. The count
+  //    may exceed num_gpus -- the INV-FOLD floor can raise it (see
+  //    compute_hash_join_partition_strategy) -- in which case several slots share a GPU.
   //  - Single partition: tag with operator_id, preserving the historical routing where several
   //    small single-partition BUILD_PROBE joins in one query spread across GPUs instead of all
   //    pinning to GPU 0. execute() maps the lone partition back to slot 0.
@@ -2316,8 +2414,9 @@ void sirius_physical_hash_join::on_finalize_operator()
     std::memory_order_acquire);
 
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
-    // Each partition's hash table lives on its own GPU (partition_idx % num_gpus). Free every slot
-    // on the device it was built on so cuco/rmm releases memory in the right device context.
+    // Each partition's hash table lives on the GPU its tasks were routed to
+    // (partition_idx % num_gpus, so several partitions may share a GPU). Free every slot on the
+    // device it was actually built on so cuco/rmm releases memory in the right device context.
     for (auto& slot : _partition_build_states) {
       std::optional<rmm::cuda_set_device_raii> device_guard;
       if (slot.device_id >= 0) { device_guard.emplace(rmm::cuda_device_id{slot.device_id}); }

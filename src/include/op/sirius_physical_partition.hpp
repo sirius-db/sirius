@@ -34,6 +34,21 @@ namespace op {
 
 enum class PartitionType { HASH, RANGE, EVENLY, CUSTOM, NONE };
 
+/// What a sizing PARTITION measured on its own input port; see
+/// sirius_physical_partition::measure_input for how each field is obtained.
+struct partition_input_measurement {
+  uint64_t bytes;       ///< Sum of the resident batch sizes.
+  uint64_t rows_bound;  ///< Total rows; see `rows_exact` for what this is worth when that is false.
+  /// Every batch on the port contributed its own exact row count, so `rows_bound` is the truth.
+  ///
+  /// When false, `rows_bound` is best-effort and may err in EITHER direction: a batch on a tier
+  /// that reports no row count is charged a byte-derived over-estimate, while a batch that could
+  /// not be measured at all is simply missing. Consumers must not fail a query or refuse a
+  /// broadcast on it, and INV-FOLD then rests on the fold guard in `gpu_merge_impl` rather than on
+  /// the partition count.
+  bool rows_exact;
+};
+
 // PartitionType to string
 inline std::string partition_type_to_string(PartitionType type)
 {
@@ -73,6 +88,8 @@ class sirius_physical_partition : public sirius_physical_operator {
   bool is_build_partition() const;
 
   void set_drives_partition_count(bool drives) { _drives_partition_count = drives; }
+
+  [[nodiscard]] bool drives_partition_count() const noexcept { return _drives_partition_count; }
 
   //! Get the parent operator (e.g., HASH_JOIN for build partition)
   [[nodiscard]] sirius_physical_operator* get_parent_op() const { return _parent_op; }
@@ -128,9 +145,34 @@ class sirius_physical_partition : public sirius_physical_operator {
  private:
   void get_partition_keys_and_type(sirius_physical_operator* op, bool is_build = false);
 
-  /// Sum the bytes of all batches waiting on this partition's input port. Fed to the downstream
-  /// consumer's get_partition_strategy, which turns it into a partition count.
-  uint64_t compute_total_bytes();
+  /**
+   * @brief Measure every batch waiting on this partition's input port, in one pass.
+   *
+   * Fed to the downstream consumer's `get_partition_strategy`, which turns the measurement into a
+   * partition count. Both sides of a join get a FULL barrier when either drives sizing, so the
+   * measured side's input is entirely resident here -- this is a measurement, not a sample.
+   *
+   * Every tier a batch can rest on reports its own row count (`try_batch_num_rows`), including a
+   * batch the downgrade executor has spilled to host or disk -- which is exactly the state a
+   * FULL-barriered build port gets into under memory pressure, when the partition count matters
+   * most. `rows_exact` is then true and `rows_bound` is the truth.
+   *
+   * A tier that cannot report one (only `cucascade::host_data_packed_representation` today) is
+   * bounded instead by its uncompressed byte size divided by the smallest per-row footprint this
+   * operator's schema can have: one byte per column, since cuDF's narrowest fixed-width carrier is
+   * one byte and a variable-width column spends at least four offset bytes per row. That
+   * over-counts rows, which over-partitions -- the safe direction for the partition floor, but not
+   * for a decision that fails the query or refuses a broadcast, which is what `rows_exact` gates.
+   * The bound is deliberately derived from the schema rather than from
+   * `planner::estimate_bytes_per_row`: that helper reads *logical* widths and so over-charges the
+   * narrow carriers compressed materialization installs, which would UNDER-count rows.
+   *
+   * A batch that cannot be measured at all is skipped and clears `rows_exact`. That leaves an
+   * under-count, which no flag can turn into a bound: the partition floor may then be too low and
+   * the publication gate may admit a fold that does not fit. Both land on the fold guard in
+   * `gpu_merge_impl`, which fails attributably rather than silently.
+   */
+  [[nodiscard]] partition_input_measurement measure_input();
 
   /// The partition slot for a batch residing on `device_id`: its index in `_active_gpu_ids`
   /// (so task_creator routes that slot back to the same GPU). Returns 0 if not found (a

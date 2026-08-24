@@ -30,11 +30,28 @@
 namespace sirius {
 namespace op {
 
+namespace {
+
+/// Rows the concatenation of @p views would hold. `num_rows()` is `cudf::size_type`, so the sum is
+/// accumulated in `uint64_t`: the point of the check that consumes it is precisely that the total
+/// may not fit that type.
+[[nodiscard]] uint64_t total_rows_of(const std::vector<cudf::table_view>& views)
+{
+  uint64_t total = 0;
+  for (const auto& view : views) {
+    total += static_cast<uint64_t>(view.num_rows());
+  }
+  return total;
+}
+
+}  // namespace
+
 std::shared_ptr<cucascade::data_batch> gpu_merge_impl::concat(
   const std::vector<cucascade::read_only_data_batch>& input,
   rmm::cuda_stream_view stream,
   cucascade::memory::memory_space& memory_space,
-  const telemetry::batch_telemetry_info& telemetry_info)
+  const telemetry::batch_telemetry_info& telemetry_info,
+  uint64_t max_fold_rows)
 {
   // Sanity check.
   if (input.size() < 2) {
@@ -47,6 +64,7 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::concat(
   for (const auto& batch : input) {
     input_cudf_table_views.push_back(get_cudf_table_view(batch));
   }
+  check_fold_row_limit(total_rows_of(input_cudf_table_views), input.size(), max_fold_rows);
   auto output_cudf_table =
     cudf::concatenate(input_cudf_table_views, stream, memory_space.get_default_allocator());
 
@@ -82,6 +100,7 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate
     throw std::runtime_error(
       "mismatch between num columns and num aggregates in `merge_ungrouped_aggregate()`");
   }
+  check_fold_row_limit(total_rows_of(input_cudf_table_views), input.size(), k_fold_row_limit);
   auto concatenated =
     cudf::concatenate(input_cudf_table_views, stream, memory_space.get_default_allocator());
 
@@ -178,6 +197,7 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
     throw std::runtime_error(
       "`num columns = num_group_cols + num aggregates` not true in `merge_grouped_aggregate()`");
   }
+  check_fold_row_limit(total_rows_of(input_cudf_table_views), input.size(), k_fold_row_limit);
   auto concatenated =
     cudf::concatenate(input_cudf_table_views, stream, memory_space.get_default_allocator());
 

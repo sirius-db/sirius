@@ -402,11 +402,13 @@ individually.
 | `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. Auto = 33% of GPU memory. |
 | `hash_partition_bytes` | Shared physical/effective GPU batch default described above | Target partition size for hash joins and group-bys; must be greater than zero |
 | `concat_batch_bytes` | Shared physical/effective GPU batch default described above | Target output batch size for CONCAT operator |
+| `max_concat_fold_rows` | 2147483646 | Rows one folded CONCAT output batch may hold. The default is what cuDF can address in a single table, not a tuning target; it exists so the row-aware partition floor and the fold guard are reachable at test data volumes. Must be between 1 and the cuDF limit — raising it would not raise cuDF's. The default is one below `cudf::size_type`'s maximum because a STRING or LIST column carries one offset more than it has rows, and `cudf::concatenate` caps offsets at the same maximum. See [operators.md](operators.md#inv-fold-every-group-becomes-one-cudf-table). |
 | `sort_sample_bytes` | Shared physical/effective GPU batch default described above | Bytes sampled before computing sort partition boundaries |
 | `max_build_hash_table_bytes` | 2× batch default | Max build-side size for BUILD_PROBE join mode |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join. A build below this size is replicated to every GPU (instead of hash-partitioned) when it is tiny, or when the DuckDB-estimated probe-to-build row ratio is at least `num_gpus * 1.25`. |
 | `max_sort_partition_memory_fraction` | 0.33 | Fraction of GPU memory per sort partition when `max_sort_partition_bytes` is 0 |
 | `mark_join_build_switch_ratio` | 8.0 | For STANDARD MARK joins, build on the smaller (left) side when `right_rows >= ratio * left_rows` (0 disables) |
+| `enable_delim_direct_lowering` | true | Collapse pure-equality EXISTS / NOT EXISTS DELIM joins into a single direct semi/anti hash join at plan time; ineligible shapes (scalar-aggregate or non-equality correlations) keep the delim lowering (see [physical-plan-generation.md](physical-plan-generation.md) → Delim-direct lowering). |
 | `enable_dynamic_filter` | true | Enable runtime filters for eligible hash joins. Plan-time wiring admits keys by join type (not join mode); at delivery, any join whose build side arrives as one whole batch publishes — a single-partition or broadcast `BUILD_PROBE` build, and a single-partition `STANDARD`/`MIXED_JOIN` build on the same terms. Targets may be probe scans or join-edge endpoints. An eligible build selects a raw exact IN-list for 1–12 supported build rows, otherwise a hash IN-list within the L2 budget or a Bloom. |
 | `enable_dynamic_zone_map_filter` | false | Publish build-key min/max filters in addition to membership filters. Parquet scans use them for row-group pruning; duckdb-native scans apply them post-decode. Requires `enable_dynamic_filter`; intended for clustered-keyset workloads. |
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold. Before constructing either a membership filter or zone map, skip the key when the complete build covers at least this fraction of the key's unfiltered base-table row bound. Applies only to build keys proven unique in their base relation, with evidence from DuckDB-native scans. Values above 1.0 disable the gate; exactly 1.0 fires only at full coverage. |
@@ -606,9 +608,16 @@ policy rather than a user configuration choice; see
 
 The CONCAT output-batch target is derived from effective GPU capacity. Advanced
 benchmark and test envelopes may still override `concat_batch_bytes` in YAML
-under `sirius.operator_params`, but it is not a normal session setting.
+under `sirius.operator_params`, but it is not a normal session setting. The same
+applies to `max_concat_fold_rows`, whose default is a cuDF addressing limit
+rather than a tuning choice.
 
 Runtime distinct-build probing is also engine-owned and is temporarily disabled pending #1600.
+
+Delim-direct lowering of pure-equality EXISTS / NOT EXISTS DELIM joins is likewise an
+engine-owned plan policy (on by default, overridable in YAML via
+`operator_params.enable_delim_direct_lowering`); see
+[DELIM_JOIN](physical-plan-generation.md#delim_join).
 
 ### GPU Admission
 

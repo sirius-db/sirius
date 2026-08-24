@@ -229,6 +229,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "scan_task_batch_size") == 0);
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 0);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 0);
+    REQUIRE(setting_count(con, "enable_delim_direct_lowering") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
     REQUIRE(result != nullptr);
@@ -251,6 +252,9 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     result = con.Query("SET enable_runtime_distinct_build_probe = true");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
+    result = con.Query("SET enable_delim_direct_lowering = false");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
     result = con.Query("SET concat_batch_bytes = 1048576");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
@@ -267,6 +271,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "scan_task_batch_size") == 0);
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 0);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 0);
+    REQUIRE(setting_count(con, "enable_delim_direct_lowering") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
   }
 
@@ -281,6 +286,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "scan_task_batch_size") == 1);
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 1);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 1);
+    REQUIRE(setting_count(con, "enable_delim_direct_lowering") == 1);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 1);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
     REQUIRE(result != nullptr);
@@ -319,6 +325,12 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     result = con.Query("RESET enable_runtime_distinct_build_probe");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET enable_delim_direct_lowering = false");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("RESET enable_delim_direct_lowering");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     result = con.Query("SET concat_batch_bytes = 1048576");
@@ -1102,7 +1114,8 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
       current_setting('pin_table_input_compression_plan_dir')::VARCHAR,
       current_setting('pin_table_compression_min_batch_size_bytes')::UBIGINT,
       current_setting('pin_table_compression_max_compressed_fraction')::DOUBLE,
-      current_setting('dynamic_filter_inlist_max_l2_fraction')::DOUBLE
+      current_setting('dynamic_filter_inlist_max_l2_fraction')::DOUBLE,
+      current_setting('enable_delim_direct_lowering')::BOOLEAN
   )");
   REQUIRE(settings != nullptr);
   REQUIRE_FALSE(settings->HasError());
@@ -1128,6 +1141,7 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(settings->GetValue(17, 0).GetValue<uint64_t>() == 8 * mib);
   REQUIRE(settings->GetValue(18, 0).GetValue<double>() == Approx(0.6));
   REQUIRE(settings->GetValue(19, 0).GetValue<double>() == Approx(0.4));
+  REQUIRE_FALSE(settings->GetValue(20, 0).GetValue<bool>());
 
   auto zero_partition = con.Query("SET hash_partition_bytes = 0");
   REQUIRE(zero_partition != nullptr);
@@ -1228,6 +1242,8 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   require_ok("SET dynamic_filter_keep_threshold = 0.0");
   require_ok("SET dynamic_filter_keep_threshold = 1.0");
   require_ok("RESET dynamic_filter_keep_threshold");
+  require_ok("SET enable_delim_direct_lowering = true");
+  require_ok("RESET enable_delim_direct_lowering");
   require_ok("SET dynamic_filter_inlist_max_l2_fraction = 0.0");
   REQUIRE(sirius_ctx->get_config().get_operator_params().dynamic_filter_inlist_max_l2_fraction ==
           Approx(0.0));

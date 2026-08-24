@@ -311,6 +311,7 @@ set(EXTENSION_SOURCES
     src/memory/sirius_memory_reservation_manager.cpp
     src/op/aggregate/aggregate_op_util.cpp
     src/op/aggregate/gpu_aggregate_impl.cpp
+    src/op/fold_limits.cpp
     src/op/merge/gpu_merge_impl.cpp
     src/op/order/gpu_order_impl.cpp
     src/op/partition/gpu_partition_impl.cpp
@@ -388,6 +389,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_comparison_join.cpp
     src/planner/sirius_plan_compressed_schema.cpp
     src/planner/sirius_plan_cte.cpp
+    src/planner/sirius_plan_delim_direct.cpp
     src/planner/sirius_plan_delim_get.cpp
     src/planner/sirius_plan_delim_join.cpp
     src/planner/sirius_plan_dummy_scan.cpp
@@ -701,6 +703,8 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_dynamic_filter_native.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_sip.cpp
     test/cpp/integration/test_gpu_execution_filter_nulls.cpp
+    test/cpp/integration/test_gpu_execution_fold_limit.cpp
+    test/cpp/integration/test_gpu_execution_delim_direct.cpp
     test/cpp/integration/test_gpu_execution_join_nulls.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
@@ -751,6 +755,7 @@ set(TEST_SOURCES
     test/cpp/memory/test_topology_index.cpp
     test/cpp/operator/test_build_probe_scheduling.cpp
     test/cpp/operator/test_cross_schedule.cpp
+    test/cpp/operator/test_fold_limits.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
@@ -782,6 +787,7 @@ set(TEST_SOURCES
     test/cpp/parallel/test_task_executor.cpp
     src/planner/dynamic_filter/duckdb_join_filter_candidate_adapter.cpp
     test/cpp/planner/test_compressed_schema_propagation.cpp
+    test/cpp/planner/test_delim_direct_lowering.cpp
     test/cpp/planner/test_gpu_admission.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp

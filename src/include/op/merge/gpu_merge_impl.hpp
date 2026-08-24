@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "op/fold_limits.hpp"
 #include "telemetry/data_batch_probe.hpp"
 
 #include <cudf/cudf_utils.hpp>
@@ -53,17 +54,28 @@ class gpu_merge_impl {
   /**
    * @brief Concatenate multiple data batches.
    *
+   * Every fold a CONCAT performs passes through here, so this is where INV-FOLD is enforced: the
+   * result is one `cudf::table`, whose rows `cudf::size_type` must be able to address. The two
+   * aggregate merges below fold as well and carry the same check, at the fixed cuDF limit.
+   *
    * @param input The input batches to be concatenated.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
+   * @param telemetry_info Telemetry context linking the output batch into the query's lineage.
+   * @param max_fold_rows Rows the result may hold; see `op/fold_limits.hpp`. Callers that are not
+   *                      configurable keep the cuDF limit.
    *
    * @return The output data batch.
+   * @throws fold_row_limit_exceeded (message marker `[fold_limit]`) when @p input holds more rows
+   *         in total than @p max_fold_rows. A distinct type so a caller can tell an INV-FOLD
+   *         violation from the other ways a fold fails -- device OOM, a non-GPU-resident batch.
    */
   static std::shared_ptr<cucascade::data_batch> concat(
     const std::vector<cucascade::read_only_data_batch>& input,
     rmm::cuda_stream_view stream,
     cucascade::memory::memory_space& memory_space,
-    const telemetry::batch_telemetry_info& telemetry_info = {});
+    const telemetry::batch_telemetry_info& telemetry_info = {},
+    uint64_t max_fold_rows                                = k_fold_row_limit);
 
   /**
    * @brief Perform ungrouped merge aggregate on multiple data batches.
@@ -76,6 +88,8 @@ class gpu_merge_impl {
    * @param memory_space The memory space used to allocate memory for the output data batch.
    *
    * @return The output data batch.
+   * @throws fold_row_limit_exceeded when @p input holds more rows in total than one cuDF table can
+   *         address (INV-FOLD; the merge concatenates before aggregating).
    */
   static std::shared_ptr<cucascade::data_batch> merge_ungrouped_aggregate(
     const std::vector<cucascade::read_only_data_batch>& input,
@@ -98,6 +112,10 @@ class gpu_merge_impl {
    * @param memory_space The memory space used to allocate memory for the output data batch.
    *
    * @return The output data batch.
+   * @throws fold_row_limit_exceeded when @p input holds more rows in total than one cuDF table can
+   *         address (INV-FOLD; the merge concatenates before aggregating). Unlike a CONCAT fold,
+   *         no partition-count floor keeps this group small -- MERGE_GROUP_BY sizes by bytes
+   *         alone -- so this check is the whole bound (residual R4).
    */
   static std::shared_ptr<cucascade::data_batch> merge_grouped_aggregate(
     const std::vector<cucascade::read_only_data_batch>& input,

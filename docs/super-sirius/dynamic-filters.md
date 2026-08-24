@@ -55,7 +55,7 @@ flowchart LR
 The main components are:
 
 - **Evidence and key admission.** `build_subtree_is_filtering` and `build_relation_is_opaque` decide whether discovery should run. `admit_dynamic_filter_keys` accepts supported equality keys and records the build/probe metadata needed at runtime.
-- **Target discovery.** `trace_probe_key` follows a key through physical operators only while its value and row semantics remain safe. A reachable GPU scan wins; otherwise `place_endpoint` may insert a membership-only `sirius_physical_dynamic_filter` at the deepest safe point. Unknown or unsafe transformations stop descent.
+- **Target discovery.** `trace_probe_key` follows a key through physical operators only while its value and row semantics remain safe. A reachable GPU scan wins; otherwise `place_endpoint` may insert a membership-only `sirius_physical_dynamic_filter` at the deepest safe point. Unknown or unsafe transformations stop descent. Scan binding is armed only for producing join types whose output can never include an unmatched probe row — INNER, RIGHT, SEMI, RIGHT_SEMI, and RIGHT_ANTI (`scan_route_join_type_admissible`; the right-family semi/anti types are how the delim-direct lowering's joins publish); join-edge endpoints are additionally restricted to INNER and SEMI.
 - **Publication plan.** `dynamic_filter_publish_plan` binds admitted build keys to target channels and target output ordinals, carries filter policy, and identifies the admitted GPU/HOST replica spaces.
 - **Channel.** `sirius_dynamic_filter_set` is a thread-safe, append-only channel shared by producers and one logical consumer endpoint. It is not a readiness barrier.
 

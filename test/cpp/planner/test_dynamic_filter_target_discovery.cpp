@@ -328,20 +328,28 @@ TEST_CASE("join_block_descent refuses a build ordinal past the build block",
 // scan_route_join_type_admissible
 // ---------------------------------------------------------------------------------------------
 
-TEST_CASE("scan_route_join_type_admissible mirrors DuckDB's producer join-type gate",
-          "[dynamic_filter][placement][discovery]")
+TEST_CASE(
+  "scan_route_join_type_admissible admits exactly the join types whose output has no "
+  "unmatched probe rows",
+  "[dynamic_filter][placement][discovery]")
 {
-  for (auto const join_type :
-       {duckdb::JoinType::INNER, duckdb::JoinType::RIGHT, duckdb::JoinType::SEMI}) {
+  // Membership pruning is sound when an unmatched probe row cannot be observed in the join's
+  // output: INNER/SEMI emit only matched pairs / matched probe rows, RIGHT adds unmatched BUILD
+  // rows, and RIGHT_SEMI/RIGHT_ANTI emit build rows only.
+  for (auto const join_type : {duckdb::JoinType::INNER,
+                               duckdb::JoinType::RIGHT,
+                               duckdb::JoinType::SEMI,
+                               duckdb::JoinType::RIGHT_SEMI,
+                               duckdb::JoinType::RIGHT_ANTI}) {
     REQUIRE(scan_route_join_type_admissible(join_type));
   }
+  // These give unmatched probe rows an observable output (a padded row, a false mark, an ANTI
+  // survivor), so pruning them would change results.
   for (auto const join_type : {duckdb::JoinType::LEFT,
                                duckdb::JoinType::OUTER,
                                duckdb::JoinType::ANTI,
                                duckdb::JoinType::MARK,
                                duckdb::JoinType::SINGLE,
-                               duckdb::JoinType::RIGHT_SEMI,
-                               duckdb::JoinType::RIGHT_ANTI,
                                duckdb::JoinType::INVALID}) {
     REQUIRE_FALSE(scan_route_join_type_admissible(join_type));
   }

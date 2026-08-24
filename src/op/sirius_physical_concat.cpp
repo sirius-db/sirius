@@ -17,6 +17,7 @@
 #include "op/sirius_physical_concat.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "log/logging.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -30,36 +31,20 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<sirius::logical_ty
                                                std::size_t estimated_cardinality,
                                                sirius_physical_operator* downstream_join,
                                                bool is_build,
-                                               uint64_t concat_batch_bytes)
+                                               uint64_t concat_batch_bytes,
+                                               uint64_t max_fold_rows)
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::CONCAT, std::move(types), estimated_cardinality)
 {
   _is_build           = is_build;
   _concat_batch_bytes = concat_batch_bytes;
+  _max_fold_rows      = max_fold_rows;
   // `downstream_join` (the HJ/NLJ this CONCAT feeds — not the tree parent) picks
   // `_concat_all` and is stashed for the legacy converter's destination lookup.
   _downstream_join = downstream_join;
   if (downstream_join->type == SiriusPhysicalOperatorType::HASH_JOIN) {
     auto hash_join = dynamic_cast<sirius_physical_hash_join*>(downstream_join);
-    if (hash_join->join_type == duckdb::JoinType::LEFT ||
-        hash_join->join_type == duckdb::JoinType::ANTI ||
-        hash_join->join_type == duckdb::JoinType::SEMI) {
-      // if the join type is left or anti, then we need to concat all the batches into one batch for
-      // the build side
-      _concat_all = is_build;
-    } else if (hash_join->is_right_family()) {
-      // if the join type is right or right anti, then we need to concat all the batches into one
-      // batch for the probe side
-      _concat_all = !is_build;
-    } else if (hash_join->join_type == duckdb::JoinType::INNER ||
-               hash_join->join_type == duckdb::JoinType::MARK) {
-      _concat_all = false;
-    } else if (hash_join->join_type == duckdb::JoinType::OUTER) {
-      _concat_all = true;
-    } else {
-      throw std::runtime_error("sirius_physical_concat: unsupported join type: " +
-                               duckdb::JoinTypeToString(hash_join->join_type));
-    }
+    _concat_all    = sirius_physical_hash_join::join_folds_side(hash_join->join_type, is_build);
   } else if (downstream_join->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
     _concat_all = false;
   } else {
@@ -194,8 +179,34 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
     auto output = cucascade::data_batch::to_idle(std::move(copy));
     output_batches.push_back(std::move(output));
   } else {
-    auto merged_batch = gpu_merge_impl::concat(input_batches, stream, *space, batch_telemetry());
-    output_batches.push_back(std::move(merged_batch));
+    // Attribute a failed fold before it unwinds: gpu_merge_impl names the counts but not which
+    // fold produced them, and a query can hold many CONCATs. Only an INV-FOLD violation carries
+    // the [fold_limit] marker -- a fold also fails on device OOM and on a batch that is not
+    // GPU-resident, and a marker stamped on those would classify nothing.
+    auto log_fold_failure = [&](const char* marker, const char* what) {
+      SIRIUS_LOG_ERROR(
+        "{}CONCAT id {} (partition {}, concat_all={}, {} side of {} id {}) failed folding {} input "
+        "batches into one cuDF table: {}",
+        marker,
+        get_operator_id(),
+        partition_idx,
+        _concat_all,
+        _is_build ? "build" : "probe",
+        SiriusPhysicalOperatorToString(_downstream_join->type),
+        _downstream_join->get_operator_id(),
+        input_batches.size(),
+        what);
+    };
+    try {
+      output_batches.push_back(
+        gpu_merge_impl::concat(input_batches, stream, *space, batch_telemetry(), _max_fold_rows));
+    } catch (const fold_row_limit_exceeded& e) {
+      log_fold_failure("[fold_limit] ", e.what());
+      throw;
+    } catch (const std::exception& e) {
+      log_fold_failure("", e.what());
+      throw;
+    }
   }
   return std::make_unique<partitioned_operator_data>(output_batches, partition_idx);
 }

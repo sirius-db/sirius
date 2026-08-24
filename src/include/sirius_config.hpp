@@ -19,6 +19,7 @@
 #include "config.hpp"
 #include "creator/config.hpp"
 #include "exec/config.hpp"
+#include "op/fold_limits.hpp"
 #include "scan_manager/config.hpp"
 
 #include <cucascade/memory/config.hpp>
@@ -119,6 +120,12 @@ struct operator_params {
   /// Target size (bytes) for the concat operator output batch.
   uint64_t concat_batch_bytes = config::derived_default_batch_size();
 
+  /// Rows one folded CONCAT output batch may hold (INV-FOLD; see `op/fold_limits.hpp`). The
+  /// default is what `cudf::size_type` can address, a library truth rather than a tuning target;
+  /// it exists as a setting so the whole fold-bounding path -- the partition floor, the fold
+  /// guard, and the CONCAT/join wiring between them -- is exercisable at test data volumes.
+  uint64_t max_concat_fold_rows = op::k_fold_row_limit;
+
   /// Target size (bytes) of data to sample before computing sort partition boundaries.
   uint64_t sort_sample_bytes = config::derived_default_batch_size();
 
@@ -177,6 +184,12 @@ struct operator_params {
   /// metadata; other scans use native carriers. Logical types remain unchanged, and type-sensitive
   /// boundaries restore native carriers.
   bool enable_compressed_materialization = true;
+
+  /// Collapse pure-equality EXISTS / NOT EXISTS DELIM joins into a single direct semi/anti hash
+  /// join at plan time (sirius_plan_delim_direct.cpp), skipping the dedup + join + join-back
+  /// sandwich. Ineligible shapes (scalar-aggregate correlations, non-equality correlations)
+  /// always keep the delim lowering. Off = always use the delim lowering.
+  bool enable_delim_direct_lowering = true;
 
   /// Admission-time GPU allocation: target bytes of projected scan output per GPU.
   /// At query start, the engine estimates total scan output bytes from the plan's

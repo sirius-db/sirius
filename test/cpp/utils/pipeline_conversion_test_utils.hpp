@@ -89,6 +89,16 @@ void with_conversion_result(
   const std::string& query,
   const std::function<void(pipeline::pipeline_conversion_result&)>& consume);
 
+//! Like `with_conversion_result`, but converts against an explicit admitted-GPU list instead of
+//! the one derived from the configured GPU memory spaces. An empty list means "derive it", so the
+//! two entry points agree by construction. Lets a test reach the converter's replica-restriction
+//! path -- a plan whose dynamic-filter replicas sit on GPUs the admitted set does not hold.
+void with_conversion_result_for_gpus(
+  duckdb::Connection& con,
+  const std::string& query,
+  std::vector<int> admitted_gpu_ids,
+  const std::function<void(pipeline::pipeline_conversion_result&)>& consume);
+
 //! Initialize an engine for `query` and invoke `consume` while its plan is alive.
 void with_initialized_engine(duckdb::Connection& con,
                              const std::string& query,

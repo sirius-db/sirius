@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "duckdb/common/enum_util.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/node.hpp"
@@ -23,12 +25,46 @@
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "planner/sirius_plan_delim_direct.hpp"
+#include "sirius_context.hpp"
 
 #include <memory>
+#include <utility>
 
 namespace sirius::planner {
 
 namespace {
+
+/// Read the delim-direct-lowering enable flag from the active SiriusContext config.
+///
+/// Refuses when the state cannot be read at all. This is a deliberate divergence from the
+/// surrounding convention, where an absent SiriusContext falls back to a default-constructed
+/// `operator_params` and so to the registered default (see
+/// sirius_physical_plan_generator.cpp's compressed-materialization gate): those are *sizing*
+/// defaults, where guessing costs performance, whereas this knob gates a semantics-preserving
+/// rewrite that is default-deny by construction. A default-deny pass must not run on a
+/// configuration it never read.
+bool delim_direct_lowering_enabled(duckdb::ClientContext& context)
+{
+  if (!context.registered_state) { return false; }
+  auto state = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!state) { return false; }
+  return state->get_config().get_operator_params().enable_delim_direct_lowering;
+}
+
+/// Raises the enclosing-DELIM-join depth for a scope. See
+/// sirius_physical_plan_generator::open_delim_join_depth.
+class open_delim_join_scope {
+ public:
+  explicit open_delim_join_scope(std::size_t& depth) noexcept : _depth(depth) { ++_depth; }
+  ~open_delim_join_scope() { --_depth; }
+
+  open_delim_join_scope(const open_delim_join_scope&)            = delete;
+  open_delim_join_scope& operator=(const open_delim_join_scope&) = delete;
+
+ private:
+  std::size_t& _depth;
+};
 
 // Translate a vector of DuckDB expressions into Sirius AST nodes at the planner
 // boundary. The source vector is drained; size and order are preserved, with a
@@ -72,8 +108,35 @@ static void gather_delim_scans(
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::plan_delim_join(duckdb::LogicalComparisonJoin& op)
 {
-  // first create the underlying join
-  auto plan = plan_comparison_join(op);
+  // Pure-equality EXISTS / NOT EXISTS delims collapse into a single direct semi/anti hash join
+  // (sirius_plan_delim_direct.cpp). Ineligible shapes — with the typed reason logged — keep the
+  // regular delim lowering below.
+  if (delim_direct_lowering_enabled(context)) {
+    // A DELIM_GET reached under a still-live enclosing delim join is not provably ours, so the
+    // context gate short-circuits the structural classifier.
+    auto analysis = open_delim_join_depth > 0
+                      ? delim_direct_analysis{delim_direct_refusal::nested_delim_context}
+                      : classify_delim_direct_lowering(op);
+    if (analysis.eligible()) {
+      apply_delim_direct_lowering(op, std::move(analysis));
+      SIRIUS_LOG_DEBUG(
+        "[delim_direct] Lowered a DELIM join to a direct {} hash join with {} condition(s).",
+        duckdb::EnumUtil::ToString(op.join_type),
+        op.conditions.size());
+      return plan_comparison_join(op);
+    }
+    SIRIUS_LOG_DEBUG("[delim_direct] Keeping the DELIM lowering for a {} delim join: {}.",
+                     duckdb::EnumUtil::ToString(op.join_type),
+                     to_string(analysis.refusal));
+  }
+
+  // first create the underlying join. This delim join keeps its lowering, so its
+  // duplicate-eliminated data stays live for everything planned beneath it.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan;
+  {
+    open_delim_join_scope nested_guard(open_delim_join_depth);
+    plan = plan_comparison_join(op);
+  }
   // this should create a join, not a cross product
   D_ASSERT(plan && plan->type != sirius::op::SiriusPhysicalOperatorType::CROSS_PRODUCT);
   // duplicate eliminated join

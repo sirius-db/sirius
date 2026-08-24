@@ -8,15 +8,20 @@ This document catalogs Super Sirius performance optimizations by category. Each 
 
 **Motivation:** Fixed partition counts waste resources on small datasets and under-partition large ones.
 
-**Mechanism:** `determine_num_partitions()` computes partition count from actual input data size:
+**Mechanism:** the sizing PARTITION measures its resident input (`measure_input()`) and hands bytes *and* a sound upper bound on rows to its downstream consumer, which turns them into a count:
 ```
-total_bytes = sum of all batch sizes from input repository
-num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
+natural  = max(1, ceil(total_bytes / hash_partition_bytes))
+floor    = folding side ? fold_partition_count(total_rows, max_fold_rows) : 1
+count    = max(natural, floor)
+
+fold_partition_count(rows, limit) = rows <= limit ? 1
+                                                  : ceil(rows / fold_row_target(limit))
 ```
+Bytes alone are the wrong unit for a side the join folds into one cuDF table: at a 32 GB target a partition of 8-byte rows holds 4.0 G rows, which `cudf::size_type` cannot address. The row term is the fold budget. It splits only when the measurement genuinely does not fit one fold — the halved target exists to reserve skew headroom for a split, and charging it at a count of one would split partitions cuDF handles perfectly well. See [INV-FOLD](operators.md#inv-fold-every-group-becomes-one-cudf-table).
 
-**Code path:** `src/op/sirius_physical_partition.cpp` — `determine_num_partitions()`
+**Code path:** `src/op/sirius_physical_partition.cpp` — `measure_input()`; `src/op/sirius_physical_hash_join.cpp` — `compute_hash_join_partition_strategy()`
 
-**Config:** `hash_partition_bytes` (default: 512 MB)
+**Config:** `hash_partition_bytes` (default: 512 MB), `max_concat_fold_rows`
 
 ### Drain and Restart Task Creator (PR #479)
 
@@ -86,7 +91,7 @@ look-ahead is not a user-selectable YAML setting.
 **Motivation:** For small build-side datasets, building the hash table once and probing many times is more efficient than the standard multi-partition Cartesian product approach.
 
 **Mechanism:** `compute_hash_join_partition_strategy()` selects BUILD_PROBE mode when:
-- `num_partitions <= num_gpus` (one hash table per partition, at most one partition per GPU; reduces to a single partition when `num_gpus == 1`)
+- eligibility is measured at `min(natural, num_gpus)` partitions (one hash table per partition; reduces to a single partition when `num_gpus == 1`). The final count can exceed `num_gpus` when the INV-FOLD floor raises it, which leaves total build bytes unchanged and simply places several hash tables on one GPU
 - per-partition average build side < `max_build_hash_table_bytes`, foldable to a single batch per partition
 - the join is neither RIGHT-family nor `MIXED_JOIN`
 
@@ -179,6 +184,25 @@ Both feed the same `resolve_mark_join_result()`, which scatters the match indice
 - `src/planner/sirius_plan_projection_utils.cpp` — `push_projection()`, `fold_adjacent_projections()`
 - `src/planner/sirius_physical_plan_generator.cpp` — post-pass invocation of `fold_adjacent_projections()`
 - `src/expression/ast/reference_utils.cpp` — `visit_references()`, `substitute_references()`
+
+### Delim-Direct Lowering of Pure-Equality EXISTS / NOT EXISTS (PR #1612)
+
+**Motivation:** DuckDB decorrelates an equality-correlated `EXISTS` / `NOT EXISTS` into a DELIM join whose delim-scan side is a "dedup sandwich": a DISTINCT of the correlation keys, an INNER join against the inner relation, and a join back to the outer rows. Executed literally on the GPU, the outer keys are deduplicated, joined, and membership-tested a second time — machinery a single membership join makes redundant (the TPC-H q4 and q22 delims).
+
+**Mechanism:** Before building any delim machinery, `plan_delim_join` runs a staged pass (collect → match → prove → rewrite) over the logical DELIM join. When the delim-scan side is exactly the canonical dedup sandwich, every correlated condition is equality-family, every dedup key is pinned by the join-back to its own outer source column, and the NULL-key pairing rules prove equivalence, the whole construct is rewritten in place into one direct right-family hash join — probe = inner relation, build = outer relation, RIGHT_SEMI for EXISTS and RIGHT_ANTI for NOT EXISTS. The pass is default-deny: ineligible shapes keep the regular delim lowering with a typed refusal reason logged, and every reason is unit-pinned. Two companion changes preserve the delim plan's dynamic-filter behavior: `scan_route_join_type_admissible` admits RIGHT_SEMI/RIGHT_ANTI so discovery re-derives the probe-scan membership filter for the direct join, and the pipeline converter sizes DF-publishing RIGHT_SEMI/RIGHT_ANTI partitions from the build side so the filter publishes before the probe scan launches.
+
+**Executability precondition:** the direct join is right-family, so a CONCAT folds its whole probe partition into one cuDF table, which `cudf::size_type` must be able to address ([INV-FOLD](operators.md#inv-fold-every-group-becomes-one-cudf-table)). Because the build-driven sizing exception puts the probe in a single partition, the partition count does not bound that fold — TPC-H q4's `lineitem` probe is 3.7 G rows at SF1000, well past the 2^31 limit, and only the published membership filter brings it under. `compute_hash_join_partition_strategy`'s row-aware floor cannot help here: it bounds the side the PARTITION measured, and under this exception that side is the build.
+
+**Residual R1':** the build-driven exception therefore remains estimate-free and is backstopped solely by `gpu_merge_impl::concat`'s `[fold_limit]` guard. If the filter does not prune enough — because the build did not fit one partition, because the keys are not selective, or because the scan's `dynamic_filter_keep_threshold` disabled the filter adaptively — the fold is refused and the query falls back to the CPU rather than returning a wrong answer. Gating the lowering on DuckDB's probe cardinality estimate was considered and rejected on measurement: the logged `probe_card_est` for q4 at SF1000 is the full 6.0 G `lineitem` cardinality, so an estimate-based gate would refuse the exception at SF1000 and give up the measured 24.6% win while proving nothing. The fix that removes the residual is an incremental build-side match-flag accumulator, which lets RIGHT_SEMI/RIGHT_ANTI stream the probe instead of folding it; with the probe streamed the exception is unconditionally safe and the filter publishes at every scale.
+
+**Code path:**
+- `src/planner/sirius_plan_delim_direct.cpp` — the pass (classify/apply, refusal taxonomy, correctness argument)
+- `src/planner/sirius_plan_delim_join.cpp` — integration ahead of the regular delim lowering, and the nested-delim context gate
+- `src/include/planner/dynamic_filter/dynamic_filter_target_discovery.hpp` — the widened scan-route join-type gate
+- `src/pipeline/sirius_pipeline_converter.cpp` — build-driven partition sizing for DF-publishing right-family joins
+- `src/include/op/fold_limits.hpp` — INV-FOLD, the partition floor arithmetic, and the fold guard
+
+**Config:** `enable_delim_direct_lowering` (default: true), settable via YAML; `max_concat_fold_rows` lowers the fold limit so the whole path is reachable at test data volumes
 
 ## Memory Optimizations
 

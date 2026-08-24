@@ -154,6 +154,15 @@ void with_conversion_result(
   const std::string& query,
   const std::function<void(pipeline::pipeline_conversion_result&)>& consume)
 {
+  with_conversion_result_for_gpus(con, query, {}, consume);
+}
+
+void with_conversion_result_for_gpus(
+  duckdb::Connection& con,
+  const std::string& query,
+  std::vector<int> admitted_gpu_ids,
+  const std::function<void(pipeline::pipeline_conversion_result&)>& consume)
+{
   auto& context = *con.context;
 
   // The optimizer's catalog reads and the GPU-native seq_scan ingestible construction require
@@ -182,10 +191,12 @@ void with_conversion_result(
     }
     const auto& op_params = sirius_ctx_ptr->get_config().get_operator_params();
 
-    std::vector<int> active_gpu_ids;
-    for (auto const* space : sirius_ctx_ptr->get_memory_manager().get_memory_spaces_for_tier(
-           cucascade::memory::Tier::GPU)) {
-      if (space != nullptr) { active_gpu_ids.push_back(space->get_device_id()); }
+    std::vector<int> active_gpu_ids = std::move(admitted_gpu_ids);
+    if (active_gpu_ids.empty()) {
+      for (auto const* space : sirius_ctx_ptr->get_memory_manager().get_memory_spaces_for_tier(
+             cucascade::memory::Tier::GPU)) {
+        if (space != nullptr) { active_gpu_ids.push_back(space->get_device_id()); }
+      }
     }
     std::sort(active_gpu_ids.begin(), active_gpu_ids.end());
     active_gpu_ids.erase(std::unique(active_gpu_ids.begin(), active_gpu_ids.end()),
