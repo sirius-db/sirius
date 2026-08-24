@@ -365,6 +365,7 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_top_n.cpp
     src/op/sirius_physical_ungrouped_aggregate.cpp
     src/parallel/task_executor.cpp
+    src/pipeline/downgraded_task_prefetcher.cpp
     src/pipeline/gpu_pipeline_executor.cpp
     src/pipeline/gpu_pipeline_task.cpp
     src/pipeline/sirius_pipeline_itask.cpp
@@ -798,6 +799,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_query_index.cpp
     test/cpp/planner/test_tier_narrowing_policy.cpp
     test/cpp/pipeline/test_batch_lock_utils.cpp
+    test/cpp/pipeline/test_downgraded_task_prefetcher.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
