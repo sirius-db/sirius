@@ -37,6 +37,11 @@ namespace sirius::late_mat {
 /// copy and belongs on the canonical path. Ids must be valid pin-order
 /// positions; they are not bounds-checked, matching cudf::gather's DONT_CHECK.
 ///
+/// `masks_dev` is an optional DEVICE array of B per-batch null-mask pointers
+/// (cudf::bitmask_type); a null entry means that batch has no nulls (the usual
+/// cudf convention). Pass `masks_dev == nullptr` to skip validity work
+/// entirely; otherwise `out_mask` must be sized for `count` bits.
+///
 /// Asynchronous on `stream`.
 void multi_source_gather_fixed(void const* const* bases_dev,
                                std::int64_t const* row_start_dev,
@@ -45,6 +50,8 @@ void multi_source_gather_fixed(void const* const* bases_dev,
                                std::uint64_t const* ids,
                                std::int64_t count,
                                void* out,
+                               std::uint32_t const* const* masks_dev,
+                               std::uint32_t* out_mask,
                                rmm::cuda_stream_view stream);
 
 }  // namespace sirius::late_mat

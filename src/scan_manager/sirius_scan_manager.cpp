@@ -648,21 +648,25 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
   return nulls;
 }
 
-/// Whether this column's pin is a single uncompressed chunk — the one gather shape (a plain
-/// cudf::gather) that propagates validity. Must agree with resolve_pinned_column's own check.
+/// Whether this column's pin is uncompressed — every such gather shape (single-batch,
+/// multi-batch fixed-width, multi-batch variable-width) propagates validity. Must agree with
+/// resolve_pinned_column's own check.
 [[nodiscard]] bool pinned_column_nulls_are_safe(pinned_entry const& entry,
                                                 std::size_t column_position)
 {
   if (entry.tier != cucascade::memory::Tier::GPU) { return false; }
   if (!entry.device_chunks.empty()) {
-    return entry.device_chunks.size() == 1 && !entry.device_chunks.front().compressed &&
-           column_position < entry.device_chunks.front().columns.size() &&
-           entry.device_chunks.front().columns[column_position] != nullptr;
+    return std::all_of(
+      entry.device_chunks.begin(), entry.device_chunks.end(), [&](auto const& chunk) {
+        return !chunk.compressed && column_position < chunk.columns.size() &&
+               chunk.columns[column_position] != nullptr;
+      });
   }
   if (column_position >= entry.cache_info.names.size()) { return false; }
   auto const it = entry.data_batches_by_column.find(entry.cache_info.names[column_position]);
-  return it != entry.data_batches_by_column.end() && it->second.size() == 1 &&
-         it->second.front() != nullptr;
+  return it != entry.data_batches_by_column.end() &&
+         std::all_of(
+           it->second.begin(), it->second.end(), [](auto const& col) { return col != nullptr; });
 }
 
 /// Admit the plan's group-by-rowid extension, or refuse it with a reason.

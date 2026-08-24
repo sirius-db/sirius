@@ -22,6 +22,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/traits.hpp>
@@ -34,6 +35,7 @@
 #include <codegen/selection/chunk_row_set.hpp>
 #include <codegen/selection/selection.hpp>
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -102,19 +104,27 @@ std::unique_ptr<cudf::column> materialize_raw(pinned_column_view const& column,
   }
 
   auto const elem_size = cudf::size_of(column.dtype);
-  auto out             = cudf::make_fixed_width_column(column.dtype,
-                                           static_cast<cudf::size_type>(ids.count),
-                                           cudf::mask_state::UNALLOCATED,
-                                           stream,
-                                           mr);
+  bool const any_nullable =
+    std::any_of(column.batches.begin(), column.batches.end(), [](batch_source const& b) {
+      return b.uncompressed.nullable();
+    });
+  auto out = cudf::make_fixed_width_column(
+    column.dtype,
+    static_cast<cudf::size_type>(ids.count),
+    any_nullable ? cudf::mask_state::UNINITIALIZED : cudf::mask_state::UNALLOCATED,
+    stream,
+    mr);
 
   std::vector<void const*> host_bases;
   std::vector<std::int64_t> host_starts;
+  std::vector<cudf::bitmask_type const*> host_masks;
   host_bases.reserve(column.batches.size());
   host_starts.reserve(column.batches.size());
+  if (any_nullable) { host_masks.reserve(column.batches.size()); }
   for (std::size_t b = 0; b < column.batches.size(); ++b) {
     host_bases.push_back(column.batches[b].uncompressed.head<void>());
     host_starts.push_back(selection.layout().batch_row_start[b]);
+    if (any_nullable) { host_masks.push_back(column.batches[b].uncompressed.null_mask()); }
   }
 
   rmm::device_buffer bases(host_bases.size() * sizeof(void const*), stream, mr);
@@ -130,17 +140,34 @@ std::unique_ptr<cudf::column> materialize_raw(pinned_column_view const& column,
                   cudaMemcpyHostToDevice,
                   stream.value());
 
-  multi_source_gather_fixed(static_cast<void const* const*>(bases.data()),
-                            static_cast<std::int64_t const*>(starts.data()),
-                            static_cast<int>(column.batches.size()),
-                            elem_size,
-                            ids.ids,
-                            ids.count,
-                            out->mutable_view().head<void>(),
-                            stream);
-  // The base and start arrays are freed as this returns; they are stream-
+  rmm::device_buffer masks;
+  if (any_nullable) {
+    masks = rmm::device_buffer(host_masks.size() * sizeof(cudf::bitmask_type const*), stream, mr);
+    cudaMemcpyAsync(masks.data(),
+                    host_masks.data(),
+                    host_masks.size() * sizeof(cudf::bitmask_type const*),
+                    cudaMemcpyHostToDevice,
+                    stream.value());
+  }
+
+  multi_source_gather_fixed(
+    static_cast<void const* const*>(bases.data()),
+    static_cast<std::int64_t const*>(starts.data()),
+    static_cast<int>(column.batches.size()),
+    elem_size,
+    ids.ids,
+    ids.count,
+    out->mutable_view().head<void>(),
+    any_nullable ? static_cast<std::uint32_t const* const*>(masks.data()) : nullptr,
+    any_nullable ? reinterpret_cast<std::uint32_t*>(out->mutable_view().null_mask()) : nullptr,
+    stream);
+  // The base, start and mask arrays are freed as this returns; they are stream-
   // ordered on the same stream the gather was enqueued on, so the deallocation
   // is already ordered after it.
+  if (any_nullable) {
+    out->set_null_count(cudf::null_count(
+      out->view().null_mask(), 0, static_cast<cudf::size_type>(ids.count), stream));
+  }
   return out;
 }
 

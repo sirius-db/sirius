@@ -45,6 +45,7 @@
 #include <scan_manager/late_mat_resolver.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <numeric>
@@ -283,7 +284,9 @@ TEST_CASE("a single batch materializes through the raw gather path", "[late_mat]
 
 namespace {
 
-/// Like fake_entry, but `null_rows` (global row ids) are set null.
+/// Like fake_entry, but `null_rows` (global row ids) are set null. A batch index in
+/// `unmasked_batches` gets no null mask allocated at all (UNALLOCATED, not ALL_VALID) --
+/// the "this batch has no nulls" shape a multi-batch gather must also treat as valid.
 struct fake_nullable_entry {
   pinned_entry entry;
   std::shared_ptr<pin_entry_handle> handle;
@@ -291,34 +294,41 @@ struct fake_nullable_entry {
   fake_nullable_entry(std::vector<std::int64_t> const& batch_rows,
                       std::vector<std::int64_t> const& null_rows,
                       std::string const& name,
-                      rmm::cuda_stream_view stream)
+                      rmm::cuda_stream_view stream,
+                      std::vector<std::size_t> const& unmasked_batches = {})
   {
     entry.tier = cucascade::memory::Tier::GPU;
     entry.cache_info.names.push_back(name);
 
     std::vector<std::shared_ptr<cudf::column>> chunks;
     std::int64_t next = 0;
-    for (auto const rows : batch_rows) {
+    for (std::size_t batch_idx = 0; batch_idx < batch_rows.size(); ++batch_idx) {
+      auto const rows   = batch_rows[batch_idx];
+      bool const masked = std::find(unmasked_batches.begin(), unmasked_batches.end(), batch_idx) ==
+                          unmasked_batches.end();
       std::vector<std::int32_t> host(static_cast<std::size_t>(rows));
       std::iota(host.begin(), host.end(), static_cast<std::int32_t>(next));
 
-      auto col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
-                                           static_cast<cudf::size_type>(rows),
-                                           cudf::mask_state::ALL_VALID,
-                                           stream);
+      auto col = cudf::make_numeric_column(
+        cudf::data_type{cudf::type_id::INT32},
+        static_cast<cudf::size_type>(rows),
+        masked ? cudf::mask_state::ALL_VALID : cudf::mask_state::UNALLOCATED,
+        stream);
       cudaMemcpyAsync(col->mutable_view().data<std::int32_t>(),
                       host.data(),
                       host.size() * sizeof(std::int32_t),
                       cudaMemcpyHostToDevice,
                       stream.value());
-      cudf::size_type null_count = 0;
-      for (auto const global_row : null_rows) {
-        if (global_row < next || global_row >= next + rows) { continue; }
-        auto const local = static_cast<cudf::size_type>(global_row - next);
-        cudf::set_null_mask(col->mutable_view().null_mask(), local, local + 1, false, stream);
-        ++null_count;
+      if (masked) {
+        cudf::size_type null_count = 0;
+        for (auto const global_row : null_rows) {
+          if (global_row < next || global_row >= next + rows) { continue; }
+          auto const local = static_cast<cudf::size_type>(global_row - next);
+          cudf::set_null_mask(col->mutable_view().null_mask(), local, local + 1, false, stream);
+          ++null_count;
+        }
+        col->set_null_count(null_count);
       }
-      col->set_null_count(null_count);
       next += rows;
 
       chunks.push_back(std::shared_ptr<cudf::column>(std::move(col)));
@@ -340,6 +350,17 @@ struct fake_nullable_entry {
     return o;
   }
 };
+
+/// The output null mask, copied to host so bits can be inspected without dereferencing
+/// device memory from host code.
+std::vector<cudf::bitmask_type> read_back_mask(cudf::column_view const& col)
+{
+  std::vector<cudf::bitmask_type> host(static_cast<std::size_t>(
+    cudf::bitmask_allocation_size_bytes(col.size()) / sizeof(cudf::bitmask_type)));
+  cudaMemcpy(
+    host.data(), col.null_mask(), host.size() * sizeof(cudf::bitmask_type), cudaMemcpyDeviceToHost);
+  return host;
+}
 
 }  // namespace
 
@@ -368,14 +389,8 @@ TEST_CASE("a single uncompressed batch may carry nulls, and the mask survives ma
 
   REQUIRE(out->view().size() == static_cast<cudf::size_type>(ids.size()));
   REQUIRE(out->view().nullable());
-  // The null mask lives on device; copy it to host before inspecting bits.
-  std::vector<cudf::bitmask_type> host_mask(static_cast<std::size_t>(
-    cudf::bitmask_allocation_size_bytes(out->view().size()) / sizeof(cudf::bitmask_type)));
-  cudaMemcpy(host_mask.data(),
-             out->view().null_mask(),
-             host_mask.size() * sizeof(cudf::bitmask_type),
-             cudaMemcpyDeviceToHost);
-  auto const* mask = host_mask.data();
+  auto const host_mask = read_back_mask(out->view());
+  auto const* mask     = host_mask.data();
   // ids 0, 17, 63 were nulled; 1, 40 were not.
   REQUIRE_FALSE(cudf::bit_is_set(mask, 0));
   REQUIRE_FALSE(cudf::bit_is_set(mask, 1));
@@ -387,13 +402,46 @@ TEST_CASE("a single uncompressed batch may carry nulls, and the mask survives ma
   REQUIRE(values[4] == 40);
 }
 
-TEST_CASE("a multi-batch column with nulls is not deferred", "[late_mat][resolver]")
+TEST_CASE("a multi-batch column carries nulls through the multi-source gather kernel",
+          "[late_mat][resolver]")
 {
   auto const stream = rmm::cuda_stream_view{};
-  fake_nullable_entry pin({32, 32}, /*null_rows=*/{40}, "c_mktsegment", stream);
+  auto const mr     = rmm::mr::get_current_device_resource_ref();
+  // Batch 1 (rows 32-47) is left unmasked entirely -- no null mask allocated at all -- to
+  // exercise the "this batch has no nulls" convention alongside batches that do have one.
+  fake_nullable_entry pin({32, 16, 24},
+                          /*null_rows=*/{5, 60},
+                          "c_mktsegment",
+                          stream,
+                          /*unmasked_batches=*/{1});
 
-  // The layout half still resolves — chunking alone decides it — but the column half must
-  // refuse: a multi-batch gather has no way to carry a validity bit through.
-  REQUIRE(resolve_pinned_layout(pin.origin()).has_value());
-  REQUIRE_FALSE(resolve_pinned_column(pin.origin()).has_value());
+  auto const column = resolve_pinned_column(pin.origin());
+  REQUIRE(column.has_value());
+  REQUIRE(column->batches.size() == 3);
+  auto const layout = resolve_pinned_layout(pin.origin());
+  REQUIRE(layout.has_value());
+
+  // Spans all three batches, with a repeat, and touches both null rows.
+  std::vector<std::uint64_t> const ids{5, 40, 60, 5, 20};
+  auto d_ids = upload_ids(ids, stream);
+  prepared_selection const prepared(*layout,
+                                    row_id_list{static_cast<std::uint64_t const*>(d_ids.data()),
+                                                static_cast<std::int64_t>(ids.size()),
+                                                false});
+  auto const out = materialize(*column, prepared, stream, mr);
+  cudaStreamSynchronize(stream.value());
+
+  REQUIRE(out->view().nullable());
+  auto const host_mask = read_back_mask(out->view());
+  auto const* mask     = host_mask.data();
+  // ids 5 and 60 were nulled; 40, 5 (again) and 20 were not.
+  REQUIRE_FALSE(cudf::bit_is_set(mask, 0));
+  REQUIRE(cudf::bit_is_set(mask, 1));
+  REQUIRE_FALSE(cudf::bit_is_set(mask, 2));
+  REQUIRE_FALSE(cudf::bit_is_set(mask, 3));
+  REQUIRE(cudf::bit_is_set(mask, 4));
+
+  auto const values = read_back(out->view());
+  REQUIRE(values[1] == 40);
+  REQUIRE(values[4] == 20);
 }

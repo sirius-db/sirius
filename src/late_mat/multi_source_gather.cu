@@ -33,6 +33,8 @@
 
 #include "late_mat/multi_source_gather.hpp"
 
+#include <cudf/utilities/bit.hpp>
+
 #include <cuda_runtime.h>
 
 #include <stdexcept>
@@ -77,15 +79,27 @@ __global__ void gather_fixed_kernel(void const* const* __restrict__ bases,
                                     int num_batches,
                                     std::uint64_t const* __restrict__ ids,
                                     std::int64_t count,
-                                    T* __restrict__ out)
+                                    T* __restrict__ out,
+                                    cudf::bitmask_type const* const* __restrict__ masks,
+                                    cudf::bitmask_type* __restrict__ out_mask)
 {
   auto const stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
   for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
        i += stride) {
-    auto const id   = static_cast<std::int64_t>(ids[i]);
-    int const b     = find_batch(row_start, num_batches, id);
-    auto const* src = static_cast<T const*>(bases[b]);
-    out[i]          = src[id - row_start[b]];
+    auto const id    = static_cast<std::int64_t>(ids[i]);
+    int const b      = find_batch(row_start, num_batches, id);
+    auto const local = static_cast<cudf::size_type>(id - row_start[b]);
+    auto const* src  = static_cast<T const*>(bases[b]);
+    out[i]           = src[local];
+    if (out_mask != nullptr) {
+      auto const* src_mask = masks[b];
+      bool const valid     = src_mask == nullptr || cudf::bit_is_set(src_mask, local);
+      if (valid) {
+        cudf::set_bit(out_mask, static_cast<cudf::size_type>(i));
+      } else {
+        cudf::clear_bit(out_mask, static_cast<cudf::size_type>(i));
+      }
+    }
   }
 }
 
@@ -98,6 +112,8 @@ void multi_source_gather_fixed(void const* const* bases_dev,
                                std::uint64_t const* ids,
                                std::int64_t count,
                                void* out,
+                               std::uint32_t const* const* masks_dev,
+                               std::uint32_t* out_mask,
                                rmm::cuda_stream_view stream)
 {
   if (count == 0) { return; }
@@ -110,28 +126,65 @@ void multi_source_gather_fixed(void const* const* bases_dev,
   if (blocks > 4096) { blocks = 4096; }  // grid-stride covers the rest
   auto const grid = static_cast<unsigned>(blocks);
 
+  auto const* masks = reinterpret_cast<cudf::bitmask_type const* const*>(masks_dev);
+  auto* out_bits    = reinterpret_cast<cudf::bitmask_type*>(out_mask);
+
   // One instantiation per element width rather than a byte loop: the copy is
   // the whole kernel, so it should be one aligned load and store.
   switch (elem_size) {
     case 1:
-      gather_fixed_kernel<std::uint8_t><<<grid, kBlock, 0, stream.value()>>>(
-        bases_dev, row_start_dev, num_batches, ids, count, static_cast<std::uint8_t*>(out));
+      gather_fixed_kernel<std::uint8_t>
+        <<<grid, kBlock, 0, stream.value()>>>(bases_dev,
+                                              row_start_dev,
+                                              num_batches,
+                                              ids,
+                                              count,
+                                              static_cast<std::uint8_t*>(out),
+                                              masks,
+                                              out_bits);
       break;
     case 2:
-      gather_fixed_kernel<std::uint16_t><<<grid, kBlock, 0, stream.value()>>>(
-        bases_dev, row_start_dev, num_batches, ids, count, static_cast<std::uint16_t*>(out));
+      gather_fixed_kernel<std::uint16_t>
+        <<<grid, kBlock, 0, stream.value()>>>(bases_dev,
+                                              row_start_dev,
+                                              num_batches,
+                                              ids,
+                                              count,
+                                              static_cast<std::uint16_t*>(out),
+                                              masks,
+                                              out_bits);
       break;
     case 4:
-      gather_fixed_kernel<std::uint32_t><<<grid, kBlock, 0, stream.value()>>>(
-        bases_dev, row_start_dev, num_batches, ids, count, static_cast<std::uint32_t*>(out));
+      gather_fixed_kernel<std::uint32_t>
+        <<<grid, kBlock, 0, stream.value()>>>(bases_dev,
+                                              row_start_dev,
+                                              num_batches,
+                                              ids,
+                                              count,
+                                              static_cast<std::uint32_t*>(out),
+                                              masks,
+                                              out_bits);
       break;
     case 8:
-      gather_fixed_kernel<std::uint64_t><<<grid, kBlock, 0, stream.value()>>>(
-        bases_dev, row_start_dev, num_batches, ids, count, static_cast<std::uint64_t*>(out));
+      gather_fixed_kernel<std::uint64_t>
+        <<<grid, kBlock, 0, stream.value()>>>(bases_dev,
+                                              row_start_dev,
+                                              num_batches,
+                                              ids,
+                                              count,
+                                              static_cast<std::uint64_t*>(out),
+                                              masks,
+                                              out_bits);
       break;
     case 16:
-      gather_fixed_kernel<uint4><<<grid, kBlock, 0, stream.value()>>>(
-        bases_dev, row_start_dev, num_batches, ids, count, static_cast<uint4*>(out));
+      gather_fixed_kernel<uint4><<<grid, kBlock, 0, stream.value()>>>(bases_dev,
+                                                                      row_start_dev,
+                                                                      num_batches,
+                                                                      ids,
+                                                                      count,
+                                                                      static_cast<uint4*>(out),
+                                                                      masks,
+                                                                      out_bits);
       break;
     default:
       throw std::runtime_error("multi_source_gather: element width " + std::to_string(elem_size) +
