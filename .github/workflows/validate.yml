@@ -6,6 +6,7 @@ on:
   merge_group:
 
 jobs:
+  # Checks the PR title to ensure it follows Conventional Commits guidelines
   semantic-pr:
     name: pr-title
     runs-on: ubuntu-slim
@@ -21,3 +22,25 @@ jobs:
       # became mergeable, so there's nothing to re-verify here.
       - if: github.event_name == 'merge_group'
         run: exit 0
+
+  # Removes HTML comments from our PR template to keep our commits clean; #1609
+  clean-pr-body:
+    name: pr-body
+    runs-on: ubuntu-slim
+    if: github.event.action != 'synchronize' && (github.event.action != 'edited' || github.event.changes.body)
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const body = context.payload.pull_request.body || '';
+            const stripped = body.replace(/[ \t]*<!--[\s\S]*?-->[ \t]*\r?\n?/g, '').trim();
+            if (stripped !== body) {
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.pull_request.number,
+                body: stripped,
+              });
+            }
