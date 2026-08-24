@@ -57,9 +57,15 @@ pipeline_conversion_result sirius_pipeline_converter::convert(sirius_meta_pipeli
   compute_repository_wiring(root_pipeline.get_state());
   setup_pipeline_parents();
   finalize_pipeline_structure();
+  // Must settle the publish plan before any consumer reads publishes_dynamic_filters():
+  // link_join_partition_siblings picks a join's sizing side from it, and a join switched to
+  // build-driven sizing for a filter it then loses would size for a publication that never
+  // happens. Safe here -- restrict_dynamic_filter_replicas reads only `scheduled_` and the
+  // admitted GPU ids, and the barrier resolution that ran with compute_repository_wiring never
+  // consults the publish plan.
+  restrict_dynamic_filter_replicas();
   link_join_partition_siblings();
   configure_partition_min_partitions();
-  restrict_dynamic_filter_replicas();
   // Must run after finalize_pipeline_structure (populates `dependencies`) and after
   // link_join_partition_siblings (reads dependencies[0]/[1] positionally pre-reorder).
   reorder_pipelines_topologically(scheduled_);
@@ -220,10 +226,11 @@ op::MemoryBarrierType sirius_pipeline_converter::resolve_barrier(
   // FULL (build must accumulate every partition before the probe can join). Aggregate-
   // fanout PARTITIONs are also FULL — the merge operator needs every per-thread bucket.
   // Join-feeders sit under a CONCAT (wrap_join_child's wrap chain); aggregate-fanouts sit
-  // under MERGE_GROUP_BY / GROUPED_AGGREGATE_MERGE. Exception: a RIGHT-family join sizes
-  // from the complete probe input (CONCAT retains the whole probe partition), so its probe
-  // PARTITION stays FULL — unless it is a RIGHT_DELIM_JOIN's internal join, which
-  // bootstraps its probe subtree from build-side distinct data.
+  // under MERGE_GROUP_BY / GROUPED_AGGREGATE_MERGE. Exception: a RIGHT-family join's probe
+  // CONCAT folds the whole partition (`_concat_all = !is_build`, see
+  // sirius_physical_hash_join::join_folds_side), so its probe PARTITION stays FULL regardless
+  // of which side drives the partition count — unless it is a RIGHT_DELIM_JOIN's internal
+  // join, which bootstraps its probe subtree from build-side distinct data.
   if (dest.get_sink() && dest.get_sink()->type == T::PARTITION) {
     auto& partition        = dest.get_sink()->Cast<op::sirius_physical_partition>();
     auto* partition_parent = partition.get_parent_op();

@@ -81,6 +81,8 @@ class sirius_physical_partition : public sirius_physical_operator {
 
   void set_drives_partition_count(bool drives) { _drives_partition_count = drives; }
 
+  [[nodiscard]] bool drives_partition_count() const noexcept { return _drives_partition_count; }
+
   //! Get the parent operator (e.g., HASH_JOIN for build partition)
   [[nodiscard]] sirius_physical_operator* get_parent_op() const { return _parent_op; }
 
