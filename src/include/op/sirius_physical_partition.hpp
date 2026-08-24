@@ -34,6 +34,13 @@ namespace op {
 
 enum class PartitionType { HASH, RANGE, EVENLY, CUSTOM, NONE };
 
+/// What a sizing PARTITION measured on its own input port; see
+/// sirius_physical_partition::measure_input for how each field is obtained.
+struct partition_input_measurement {
+  uint64_t bytes;       ///< Sum of the resident batch sizes.
+  uint64_t rows_bound;  ///< Sound UPPER bound on the total rows.
+};
+
 // PartitionType to string
 inline std::string partition_type_to_string(PartitionType type)
 {
@@ -128,9 +135,24 @@ class sirius_physical_partition : public sirius_physical_operator {
  private:
   void get_partition_keys_and_type(sirius_physical_operator* op, bool is_build = false);
 
-  /// Sum the bytes of all batches waiting on this partition's input port. Fed to the downstream
-  /// consumer's get_partition_strategy, which turns it into a partition count.
-  uint64_t compute_total_bytes();
+  /**
+   * @brief Measure every batch waiting on this partition's input port, in one pass.
+   *
+   * Fed to the downstream consumer's `get_partition_strategy`, which turns the measurement into a
+   * partition count. Both sides of a join get a FULL barrier when either drives sizing, so the
+   * measured side's input is entirely resident here -- this is a measurement, not a sample.
+   *
+   * `rows_bound` is exact whenever every batch is GPU-resident, which is the normal case. A batch
+   * on any other tier exposes no tier-agnostic row count, so it is bounded instead by its
+   * uncompressed byte size divided by the smallest per-row footprint this operator's schema can
+   * have: one byte per column, since cuDF's narrowest fixed-width carrier is one byte and a
+   * variable-width column spends at least four offset bytes per row. That over-counts rows, which
+   * over-partitions, which is the safe direction. It is deliberately derived from the schema
+   * rather than from `planner::estimate_bytes_per_row`: that helper reads *logical* widths and so
+   * over-charges the narrow carriers compressed materialization installs, which would UNDER-count
+   * rows.
+   */
+  [[nodiscard]] partition_input_measurement measure_input();
 
   /// The partition slot for a batch residing on `device_id`: its index in `_active_gpu_ids`
   /// (so task_creator routes that slot back to the same GPU). Returns 0 if not found (a

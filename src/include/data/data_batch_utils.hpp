@@ -66,6 +66,24 @@ inline cudf::table_view get_cudf_table_view(const cucascade::read_only_data_batc
 }
 
 /**
+ * @brief Exact cuDF row count of @p batch, or `std::nullopt` when it holds no GPU cuDF table.
+ *
+ * A batch that has been spilled to the host or disk tier carries no tier-agnostic row count, and
+ * that is a normal state rather than an error — so this probes with a pointer `dynamic_cast`
+ * instead of `idata_representation::cast<>()`, which throws.
+ *
+ * The caller MUST already hold the read-only lock, exactly as for get_cudf_table_view.
+ */
+[[nodiscard]] inline std::optional<int64_t> try_batch_num_rows(
+  const cucascade::read_only_data_batch& batch) noexcept
+{
+  const auto* gpu_table =
+    dynamic_cast<const cucascade::gpu_table_representation*>(batch.get_data());
+  if (gpu_table == nullptr) { return std::nullopt; }
+  return static_cast<int64_t>(gpu_table->get_table_view().num_rows());
+}
+
+/**
  * @brief Peak device bytes needed to materialize @p data on the GPU.
  *
  * For uncompressed data the source lives in host memory; only the destination

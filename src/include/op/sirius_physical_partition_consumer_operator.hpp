@@ -27,9 +27,13 @@ namespace sirius {
 namespace op {
 
 /// What the upstream PARTITION operator measures/knows and forwards to its downstream consumer so
-/// the consumer can decide how many partitions to produce (and whether to broadcast).
+/// the consumer can decide how many partitions to produce (and whether to broadcast). The
+/// mechanism/policy split lives here: the PARTITION only measures, and the consumer decides what
+/// the measurements mean for its own join shape.
 struct partition_sizing_input {
   uint64_t total_bytes;  ///< Bytes waiting on the sizing partition's input port.
+  uint64_t total_rows;   ///< Sound UPPER bound on the rows waiting there; see
+                         ///< sirius_physical_partition::measure_input for when it is exact.
   bool is_build_side;    ///< The sizing partition drives the build side (only the build side can
                          ///< drive broadcast / build-probe).
   bool build_foldable;   ///< A downstream build-side CONCAT can concat_all to a single batch.

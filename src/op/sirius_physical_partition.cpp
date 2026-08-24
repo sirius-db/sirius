@@ -295,24 +295,33 @@ void sirius_physical_partition::sink(const operator_data& input_data, rmm::cuda_
   }
 }
 
-uint64_t sirius_physical_partition::compute_total_bytes()
+partition_input_measurement sirius_physical_partition::measure_input()
 {
   if (ports.find("default") == ports.end()) {
     throw std::runtime_error(
-      "sirius_physical_partition::compute_total_bytes() did not find default repo for id " +
+      "sirius_physical_partition::measure_input() did not find default repo for id " +
       std::to_string(this->get_operator_id()));
   }
-  auto& repo           = ports.at("default")->repo;
-  auto batch_ids       = repo->get_batch_ids(0);
-  uint64_t total_bytes = 0;
+  // Smallest per-row footprint this operator's schema admits: one byte per column. Used only for
+  // batches that expose no row count; a schema-less batch is charged one byte per row.
+  auto const min_bytes_per_row = std::max<uint64_t>(1, types.size());
+
+  auto& repo     = ports.at("default")->repo;
+  auto batch_ids = repo->get_batch_ids(0);
+  partition_input_measurement measurement{.bytes = 0, .rows_bound = 0};
   for (auto batch_id : batch_ids) {
     auto batch = repo->get_data_batch_by_id(batch_id, 0);
-    if (batch) {
-      auto ro = batch->to_read_only();
-      if (ro.get_data()) { total_bytes += ro.get_data()->get_size_in_bytes(); }
-    }
+    if (!batch) { continue; }
+    auto ro          = batch->to_read_only();
+    const auto* data = ro.get_data();
+    if (data == nullptr) { continue; }
+    measurement.bytes += data->get_size_in_bytes();
+    auto const num_rows = try_batch_num_rows(ro);
+    measurement.rows_bound += num_rows
+                                ? static_cast<uint64_t>(*num_rows)
+                                : data->get_uncompressed_data_size_in_bytes() / min_bytes_per_row;
   }
-  return total_bytes;
+  return measurement;
 }
 
 void sirius_physical_partition::set_num_partitions(int num_partitions)
@@ -422,9 +431,12 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
     std::scoped_lock guard(lock, sibling.lock);
     if (!_num_partitions.has_value()) {
       auto& sizing_partition = _drives_partition_count ? *this : sibling;
-      partition_sizing_input const in{sizing_partition.compute_total_bytes(),
-                                      sizing_partition._is_build,
-                                      has_build_concat(*this) || has_build_concat(sibling)};
+      auto const measured    = sizing_partition.measure_input();
+      partition_sizing_input const in{
+        .total_bytes    = measured.bytes,
+        .total_rows     = measured.rows_bound,
+        .is_build_side  = sizing_partition._is_build,
+        .build_foldable = has_build_concat(*this) || has_build_concat(sibling)};
       // The consumer owns the decision: it computes the count / broadcast flag, updates its own
       // execution state (e.g. hash-join BUILD_PROBE mode), and pre-sizes its own input repos.
       auto const strategy      = consumer->get_partition_strategy(in);
@@ -445,13 +457,18 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
         build_arrives_whole = strategy.num_partitions == 1 || strategy.broadcast;
       } else if (in.is_build_side && strategy.num_partitions == 1 && hash_join != nullptr &&
                  hash_join->publishes_dynamic_filters() &&
-                 in.total_bytes < hash_join->max_build_hash_table_bytes()) {
+                 in.total_bytes < hash_join->max_build_hash_table_bytes() &&
+                 in.total_rows <= hash_join->max_fold_rows()) {
         // Not BUILD_PROBE, but the build lands in one partition and this join publishes a filter
         // from a single build batch, so folding it only moves a batch boundary. Best-effort: no
         // build-side CONCAT means no publication. Build-side sizing is required — right-family
         // joins size from the probe, where one partition says nothing about the build's size.
         // The byte bound matters when hash_partition_bytes exceeds the build budget: a build
         // refused BUILD_PROBE for being too large must not be folded whole for a filter either.
+        // The row bound is INV-FOLD: this fold is opt-in and is not covered by the partition
+        // count, so a build cuDF cannot address in one table gives up the filter instead. The
+        // hard limit rather than fold_row_target applies here — the count is already fixed at
+        // one, so there is no skew headroom to reserve.
         bool const found_this    = enable_build_concat_all(*this);
         bool const found_sibling = enable_build_concat_all(sibling);
         build_arrives_whole      = found_this || found_sibling;
@@ -474,9 +491,11 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
   } else {
     std::lock_guard<std::mutex> guard(lock);
     if (!_num_partitions.has_value()) {
-      partition_sizing_input const in{compute_total_bytes(),
-                                      _is_build,
-                                      /*build_foldable=*/false};
+      auto const measured = measure_input();
+      partition_sizing_input const in{.total_bytes    = measured.bytes,
+                                      .total_rows     = measured.rows_bound,
+                                      .is_build_side  = _is_build,
+                                      .build_foldable = false};
       auto const strategy = consumer->get_partition_strategy(in);
       _num_partitions     = strategy.num_partitions;
       SIRIUS_LOG_DEBUG("sirius_physical_partition id {} sized {} partitions",

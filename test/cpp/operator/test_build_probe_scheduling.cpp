@@ -40,6 +40,7 @@ using sirius::op::build_probe_action;
 using sirius::op::build_probe_slot_view;
 using sirius::op::compute_hash_join_partition_strategy;
 using sirius::op::HASH_JOIN_MODE;
+using sirius::op::hash_join_sizing_inputs;
 using sirius::op::partition_strategy;
 using sirius::op::select_build_probe_action;
 
@@ -95,6 +96,19 @@ partition_strategy strategy(uint64_t total_bytes,
      .join_type                      = join_type,
      .join_mode                      = join_mode,
      .estimated_probe_to_build_ratio = estimated_probe_to_build_ratio});
+}
+
+// Rows one folded partition is planned for. The row-aware cases below are stated as multiples of
+// it so they read the same whatever cudf::size_type is.
+constexpr uint64_t kFoldTarget = sirius::op::fold_row_target(sirius::op::k_fold_row_limit);
+
+// The byte-side knobs the `strategy(...)` helper defaults to, so a row-aware case states only the
+// fields it is actually about.
+hash_join_sizing_inputs sizing_defaults()
+{
+  return {.hash_partition_bytes       = kBigPartitionBytes,
+          .max_build_hash_table_bytes = kMaxBuildBytes,
+          .max_broadcast_join_size    = kMaxBroadcastBytes};
 }
 
 }  // namespace
@@ -419,6 +433,191 @@ TEST_CASE("compute_hash_join_partition_strategy - num_gpus < 1 is a precondition
 {
   REQUIRE_THROWS_AS(strategy(k100MB, true, true, /*num_gpus=*/0, duckdb::JoinType::INNER),
                     std::invalid_argument);
+}
+
+//===----------------------------------------------------------------------===//
+// INV-FOLD: the row-aware partition floor (see op/fold_limits.hpp)
+//===----------------------------------------------------------------------===//
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - a folding side under the row target keeps the "
+  "byte-driven count",
+  "[hash_join][build_probe][unit]")
+{
+  // SEMI folds its build. Below the target the row term contributes nothing and the answer is
+  // still the byte-driven one.
+  auto in           = sizing_defaults();
+  in.total_bytes    = k100MB;
+  in.total_rows     = kFoldTarget - 1;
+  in.is_build_side  = true;
+  in.build_foldable = false;  // keep BUILD_PROBE out of it; this is about the SEMI fold
+  in.num_gpus       = 1;
+  in.join_type      = duckdb::JoinType::SEMI;
+  CHECK(compute_hash_join_partition_strategy(in).num_partitions == 1);
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - a folding build above the row target raises the "
+  "count",
+  "[hash_join][build_probe][unit]")
+{
+  auto in           = sizing_defaults();
+  in.total_bytes    = k100MB;  // one natural partition by bytes
+  in.total_rows     = 4 * kFoldTarget;
+  in.is_build_side  = true;
+  in.build_foldable = false;
+  in.num_gpus       = 1;
+  in.join_type      = duckdb::JoinType::SEMI;
+  CHECK(compute_hash_join_partition_strategy(in).num_partitions >= 4);
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - a RIGHT_SEMI probe fold is bounded by its own "
+  "measured rows",
+  "[hash_join][build_probe][unit]")
+{
+  // The regression case, at TPC-H q4 SF1000 scale: 30.35 GB of lineitem is one natural partition
+  // under a 32 GB target, but its 3.70e9 rows cannot be addressed by one cuDF table, and a
+  // RIGHT_SEMI join needs its probe folded to one batch per partition.
+  auto in                 = sizing_defaults();
+  in.hash_partition_bytes = 32ull * 1024 * 1024 * 1024;
+  in.total_bytes          = 30350ull * 1024 * 1024;
+  in.total_rows           = 3'700'000'000ull;
+  in.is_build_side        = false;
+  in.num_gpus             = 1;
+  in.join_type            = duckdb::JoinType::RIGHT_SEMI;
+
+  auto const natural_only = in;
+  auto unbounded          = natural_only;
+  unbounded.total_rows    = 0;
+  CHECK(compute_hash_join_partition_strategy(unbounded).num_partitions == 1);
+  CHECK(compute_hash_join_partition_strategy(in).num_partitions >= 4);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - the floor never fires on a non-folding side",
+          "[hash_join][build_probe][unit]")
+{
+  // A RIGHT_SEMI join folds its probe, never its build, so build-driven sizing keeps one
+  // partition no matter how many rows the build holds. The probe fold this leaves unbounded is
+  // residual R1', backstopped by gpu_merge_impl::concat's guard.
+  auto in           = sizing_defaults();
+  in.total_bytes    = k100MB;
+  in.total_rows     = 8 * kFoldTarget;
+  in.is_build_side  = true;
+  in.build_foldable = true;
+  in.num_gpus       = 1;
+  in.join_type      = duckdb::JoinType::RIGHT_SEMI;
+  CHECK(compute_hash_join_partition_strategy(in).num_partitions == 1);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - INNER folds neither side by shape",
+          "[hash_join][build_probe][unit]")
+{
+  auto in        = sizing_defaults();
+  in.total_bytes = k100MB;
+  in.total_rows  = 4 * kFoldTarget;
+  in.num_gpus    = 1;
+  in.join_type   = duckdb::JoinType::INNER;
+
+  auto probe          = in;
+  probe.is_build_side = false;
+  CHECK(compute_hash_join_partition_strategy(probe).num_partitions == 1);
+
+  // An unfoldable build takes the STANDARD path, where nothing folds either.
+  auto build           = in;
+  build.is_build_side  = true;
+  build.build_foldable = false;
+  CHECK(compute_hash_join_partition_strategy(build).num_partitions == 1);
+
+  // A MARK probe side likewise folds nothing.
+  auto mark      = probe;
+  mark.join_type = duckdb::JoinType::MARK;
+  CHECK(compute_hash_join_partition_strategy(mark).num_partitions == 1);
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - BUILD_PROBE folds the build whatever the shape "
+  "says",
+  "[hash_join][build_probe][unit]")
+{
+  // An INNER join folds neither side by shape, but selecting BUILD_PROBE makes the partition
+  // operator concat_all the build. The floor has to cover that fold too.
+  auto in           = sizing_defaults();
+  in.total_bytes    = k100MB;
+  in.total_rows     = 4 * kFoldTarget;
+  in.is_build_side  = true;
+  in.build_foldable = true;
+  in.num_gpus       = 1;
+  in.join_type      = duckdb::JoinType::INNER;
+  auto const result = compute_hash_join_partition_strategy(in);
+  REQUIRE(result.build_probe);
+  CHECK(result.num_partitions >= 4);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - a build over the row target is not broadcast",
+          "[hash_join][build_probe][unit]")
+{
+  // A broadcast build is replicated, not split, so raising the count cannot shrink its fold.
+  auto in           = sizing_defaults();
+  in.total_bytes    = 10ull * 1024 * 1024;  // under the small-table threshold
+  in.is_build_side  = true;
+  in.build_foldable = true;
+  in.num_gpus       = 4;
+  in.join_type      = duckdb::JoinType::INNER;
+
+  auto fitting       = in;
+  fitting.total_rows = kFoldTarget;
+  CHECK(compute_hash_join_partition_strategy(fitting).broadcast);
+
+  auto oversized       = in;
+  oversized.total_rows = kFoldTarget + 1;
+  CHECK_FALSE(compute_hash_join_partition_strategy(oversized).broadcast);
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - a MARK build over the row target has no legal "
+  "count",
+  "[hash_join][build_probe][unit]")
+{
+  // MARK always runs BUILD_PROBE (so its build always folds) and its count is pinned either way:
+  // one partition on a single GPU, broadcast to every GPU on multi-GPU. Neither can be raised.
+  auto in           = sizing_defaults();
+  in.total_bytes    = k100MB;
+  in.total_rows     = kFoldTarget + 1;
+  in.is_build_side  = true;
+  in.build_foldable = true;
+  in.join_type      = duckdb::JoinType::MARK;
+
+  auto single_gpu     = in;
+  single_gpu.num_gpus = 1;
+  REQUIRE_THROWS_AS(compute_hash_join_partition_strategy(single_gpu), std::runtime_error);
+
+  auto multi_gpu     = in;
+  multi_gpu.num_gpus = 4;
+  REQUIRE_THROWS_AS(compute_hash_join_partition_strategy(multi_gpu), std::runtime_error);
+
+  // Exactly at the target there is still a legal count.
+  auto fitting       = single_gpu;
+  fitting.total_rows = kFoldTarget;
+  CHECK(compute_hash_join_partition_strategy(fitting).num_partitions == 1);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - the floor scales with max_fold_rows",
+          "[hash_join][build_probe][unit]")
+{
+  // The property the end-to-end coverage relies on: lowering max_fold_rows exercises the whole
+  // fold-bounding path at test data volumes.
+  auto in          = sizing_defaults();
+  in.total_bytes   = k100MB;
+  in.total_rows    = 1000;
+  in.is_build_side = false;
+  in.num_gpus      = 1;
+  in.join_type     = duckdb::JoinType::RIGHT_SEMI;
+
+  CHECK(compute_hash_join_partition_strategy(in).num_partitions == 1);
+
+  in.max_fold_rows = 200;  // target 100 rows per fold
+  CHECK(compute_hash_join_partition_strategy(in).num_partitions == 10);
 }
 
 //===----------------------------------------------------------------------===//

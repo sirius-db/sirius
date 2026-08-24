@@ -106,12 +106,14 @@ struct build_probe_decision {
 /// both call sites aggregate-initialise it with designators and no argument can be transposed.
 struct hash_join_sizing_inputs {
   uint64_t total_bytes                  = 0;  ///< Measured bytes on the sizing side.
+  uint64_t total_rows                   = 0;  ///< Sound upper bound on rows on the sizing side.
   bool is_build_side                    = false;
   bool build_foldable                   = false;
   int num_gpus                          = 1;
   uint64_t hash_partition_bytes         = 0;
   uint64_t max_build_hash_table_bytes   = 0;
   uint64_t max_broadcast_join_size      = 0;
+  uint64_t max_fold_rows                = k_fold_row_limit;  ///< INV-FOLD limit; see fold_limits.
   duckdb::JoinType join_type            = duckdb::JoinType::INVALID;
   HASH_JOIN_MODE join_mode              = HASH_JOIN_MODE::STANDARD;
   double estimated_probe_to_build_ratio = 0.0;
@@ -137,6 +139,18 @@ struct hash_join_sizing_inputs {
 /// when it is below `max_broadcast_join_size` AND the probe side is large relative to the build
 /// (`estimated_probe_to_build_ratio >= num_gpus * 1.25`) — replicating a medium build avoids
 /// shuffling a much larger probe across GPUs.
+///
+/// INV-FOLD (see `op/fold_limits.hpp`): when the sizing side is a side this join makes a CONCAT
+/// fold into one batch per partition, the count is additionally floored so each fold stays within
+/// `fold_row_target(max_fold_rows)` rows, a broadcast build is refused when replicating it would
+/// exceed that target, and the one shape with no legal count (a multi-GPU MARK, which is forced
+/// both to broadcast and to BUILD_PROBE) throws rather than reaching `cudf::concatenate`.
+///
+/// The floor deliberately bounds only the *measured* side. It does not try to bound the opposite
+/// side from a cardinality estimate: an estimate-derived floor can under-count and would create a
+/// false impression of a bound. A folding side that is not the sizing side -- the probe of a
+/// right-family join under build-driven sizing -- stays bounded solely by the fold guard in
+/// `gpu_merge_impl::concat` (residual R1', documented in `docs/super-sirius/optimizations.md`).
 [[nodiscard]] partition_strategy compute_hash_join_partition_strategy(
   const hash_join_sizing_inputs& in);
 
@@ -405,6 +419,11 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     return _max_build_hash_table_bytes;
   }
 
+  /// Rows this join lets one folded batch hold (INV-FOLD; see `op/fold_limits.hpp`). The default
+  /// is a cuDF limit rather than a tuning target; the `max_concat_fold_rows` setting lowers it so
+  /// the whole fold-bounding path is exercisable at test data volumes.
+  [[nodiscard]] uint64_t max_fold_rows() const noexcept { return _max_fold_rows; }
+
   // Publication may claim only a delivery known to contain the whole build.
   void set_build_arrives_whole(bool arrives_whole);
 
@@ -455,6 +474,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   // Maximum build-side bytes eligible for a broadcast join (see get_partition_strategy). Set from
   // operator_params at construction.
   uint64_t _max_broadcast_join_size = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE;
+  // Rows one folded batch may hold (see max_fold_rows). Set from operator_params at construction.
+  uint64_t _max_fold_rows = k_fold_row_limit;
   // _num_gpus lives on sirius_physical_partition_consumer_operator (set via set_num_gpus).
 
   // Broadcast (small build table) BUILD_PROBE join: the build side is replicated to every slot and
