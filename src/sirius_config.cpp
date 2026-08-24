@@ -271,6 +271,12 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
     throw std::runtime_error("'operator_params.hash_partition_bytes': must be greater than zero");
   }
   r.optional("concat_batch_bytes", yaml::bytes(opt.concat_batch_bytes));
+  r.optional("max_concat_fold_rows", opt.max_concat_fold_rows);
+  if (opt.max_concat_fold_rows == 0 || opt.max_concat_fold_rows > op::k_fold_row_limit) {
+    throw std::runtime_error("'operator_params.max_concat_fold_rows': must be between 1 and " +
+                             std::to_string(op::k_fold_row_limit) +
+                             " (the rows cuDF can address in one table)");
+  }
   r.optional("sort_sample_bytes", yaml::bytes(opt.sort_sample_bytes));
   r.optional("max_build_hash_table_bytes", yaml::bytes(opt.max_build_hash_table_bytes));
   r.optional("max_broadcast_join_size", yaml::bytes(opt.max_broadcast_join_size));

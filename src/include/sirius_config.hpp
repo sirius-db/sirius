@@ -19,6 +19,7 @@
 #include "config.hpp"
 #include "creator/config.hpp"
 #include "exec/config.hpp"
+#include "op/fold_limits.hpp"
 #include "scan_manager/config.hpp"
 
 #include <cucascade/memory/config.hpp>
@@ -118,6 +119,12 @@ struct operator_params {
 
   /// Target size (bytes) for the concat operator output batch.
   uint64_t concat_batch_bytes = config::derived_default_batch_size();
+
+  /// Rows one folded CONCAT output batch may hold (INV-FOLD; see `op/fold_limits.hpp`). The
+  /// default is what `cudf::size_type` can address, a library truth rather than a tuning target;
+  /// it exists as a setting so the whole fold-bounding path -- the partition floor, the fold
+  /// guard, and the CONCAT/join wiring between them -- is exercisable at test data volumes.
+  uint64_t max_concat_fold_rows = op::k_fold_row_limit;
 
   /// Target size (bytes) of data to sample before computing sort partition boundaries.
   uint64_t sort_sample_bytes = config::derived_default_batch_size();

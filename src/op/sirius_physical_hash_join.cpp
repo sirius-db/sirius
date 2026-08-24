@@ -338,7 +338,8 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   dynamic_filter_publish_plan dynamic_filter_plan,
   uint64_t hash_partition_bytes,
   uint64_t max_broadcast_join_size,
-  dynamic_filter_stats* dynamic_filter_stats_sink)
+  dynamic_filter_stats* dynamic_filter_stats_sink,
+  uint64_t max_fold_rows)
   : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::HASH_JOIN,
                                                 sirius::from_duckdb_vec(op.types),
                                                 estimated_cardinality),
@@ -357,6 +358,7 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   _max_build_hash_table_bytes = max_build_hash_table_bytes;
   _hash_partition_bytes       = hash_partition_bytes;
   _max_broadcast_join_size    = max_broadcast_join_size;
+  _max_fold_rows              = max_fold_rows;
 
   // Route mixed null-safe keys to a NULL_EQUAL predicate; plain `=` remains a hash key.
   bool const wants_routing   = wants_null_safe_routing(conditions, join_type);

@@ -48,6 +48,7 @@
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <duckdb/planner/planner.hpp>
+#include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
 #include <string>
@@ -276,4 +277,43 @@ TEST_CASE_METHOD(DelimDirectFixture,
     "SELECT id FROM outer_t WHERE NOT EXISTS "
     "(SELECT 1 FROM inner_t WHERE inner_t.k IS NOT DISTINCT FROM outer_t.k "
     "AND inner_t.qty = outer_t.id AND qty % 1000 > -1000)");
+}
+
+TEST_CASE_METHOD(DelimDirectFixture,
+                 "gpu_execution delim-direct executes over a row-bounded multi-partition probe",
+                 "[integration][gpu_execution][delim_direct][fold_limit]")
+{
+  // The lowered join is right-family, so a CONCAT folds its whole probe partition into one cuDF
+  // table and the partition count is what bounds that fold (INV-FOLD, op/fold_limits.hpp).
+  // max_concat_fold_rows brings that bound down to a volume CI can reach.
+  //
+  // The case is self-proving: 300k probe rows arrive in three scan batches (one per DuckDB row
+  // group, kept separate by the minimum scan_task_batch_size), and a 200k-row limit means a
+  // single-partition plan would fold 300k rows and be refused. The query can only succeed if the
+  // row-aware floor spread the probe across partitions first. Dynamic filters are off so the
+  // probe -- the side that folds -- is also the side that drives the count, which is the regime
+  // the floor governs.
+  run_ok(
+    "CREATE TABLE inner_many AS SELECT (((i % 6) + 1) * 10)::INTEGER AS k, i::INTEGER AS qty "
+    "FROM range(300000) t(i);");
+  run_ok("CHECKPOINT;");
+
+  const std::string exists_many =
+    "SELECT id, tag FROM outer_t WHERE EXISTS "
+    "(SELECT 1 FROM inner_many WHERE inner_many.k = outer_t.k AND qty > 0)";
+  const std::string not_exists_many =
+    "SELECT id, tag FROM outer_t WHERE NOT EXISTS "
+    "(SELECT 1 FROM inner_many WHERE inner_many.k = outer_t.k AND qty > 0)";
+
+  run_ok("SET enable_dynamic_filter = false;");
+  try {
+    sirius::test::scoped_setting scan_batches(*con, "scan_task_batch_size", 1);
+    sirius::test::scoped_setting fold_rows(*con, "max_concat_fold_rows", 200000);
+    compare_lowered_gpu_vs_cpu(exists_many);
+    compare_lowered_gpu_vs_cpu(not_exists_many);
+  } catch (...) {
+    con->Query("RESET enable_dynamic_filter;");
+    throw;
+  }
+  run_ok("RESET enable_dynamic_filter;");
 }

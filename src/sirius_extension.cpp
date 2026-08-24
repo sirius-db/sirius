@@ -2165,6 +2165,22 @@ static void SetConcatBatchBytes(ClientContext& context, SetScope scope, Value& p
   SIRIUS_LOG_DEBUG("Updated config CONCAT_BATCH_BYTES to {}", params->concat_batch_bytes);
 }
 
+static void SetMaxConcatFoldRows(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const rows = UBigIntValue::Get(parameter);
+  if (rows == 0 || rows > sirius::op::k_fold_row_limit) {
+    throw InvalidInputException(
+      "max_concat_fold_rows must be between 1 and %llu (the rows cuDF "
+      "can address in one table)",
+      sirius::op::k_fold_row_limit);
+  }
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                    = lock_operator_params_slot(context);
+  params->max_concat_fold_rows = rows;
+  SIRIUS_LOG_DEBUG("Updated config MAX_CONCAT_FOLD_ROWS to {}", params->max_concat_fold_rows);
+}
+
 static void SetSortSampleBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2603,6 +2619,14 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                     LogicalType::UBIGINT,
                     Value::UBIGINT(operator_defaults.concat_batch_bytes),
                     SetConcatBatchBytes);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "max_concat_fold_rows",
+                    "lower the rows one folded CONCAT batch may hold, so the partition floor and "
+                    "the fold guard are reachable at test data volumes",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(operator_defaults.max_concat_fold_rows),
+                    SetMaxConcatFoldRows);
 
   // Add in config options for special JIT implementation for regex
   add_sirius_option(config,

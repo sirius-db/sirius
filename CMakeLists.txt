@@ -703,6 +703,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_dynamic_filter_native.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_sip.cpp
     test/cpp/integration/test_gpu_execution_filter_nulls.cpp
+    test/cpp/integration/test_gpu_execution_fold_limit.cpp
     test/cpp/integration/test_gpu_execution_delim_direct.cpp
     test/cpp/integration/test_gpu_execution_join_nulls.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp

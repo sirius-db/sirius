@@ -140,11 +140,13 @@ struct hash_join_sizing_inputs {
 /// (`estimated_probe_to_build_ratio >= num_gpus * 1.25`) — replicating a medium build avoids
 /// shuffling a much larger probe across GPUs.
 ///
-/// INV-FOLD (see `op/fold_limits.hpp`): when the sizing side is a side this join makes a CONCAT
-/// fold into one batch per partition, the count is additionally floored so each fold stays within
-/// `fold_row_target(max_fold_rows)` rows, a broadcast build is refused when replicating it would
-/// exceed that target, and the one shape with no legal count (a multi-GPU MARK, which is forced
-/// both to broadcast and to BUILD_PROBE) throws rather than reaching `cudf::concatenate`.
+/// INV-FOLD (see `op/fold_limits.hpp`): when the sizing side is one a CONCAT folds into a single
+/// batch per partition -- by this join's shape (`join_folds_side`), or because BUILD_PROBE
+/// concat_alls the build -- the count is additionally floored so each fold stays within
+/// `fold_row_target(max_fold_rows)` rows. A broadcast build is replicated rather than split, so it
+/// is refused outright when it exceeds that target. A MARK join, whose count is pinned at one
+/// partition or at broadcast and can never be raised, throws rather than reaching
+/// `cudf::concatenate`.
 ///
 /// The floor deliberately bounds only the *measured* side. It does not try to bound the opposite
 /// side from a cardinality estimate: an estimate-derived floor can under-count and would create a
@@ -276,7 +278,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     dynamic_filter_publish_plan dynamic_filter_plan = {},
     uint64_t hash_partition_bytes                   = config::DEFAULT_HASH_PARTITION_BYTES,
     uint64_t max_broadcast_join_size                = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE,
-    dynamic_filter_stats* dynamic_filter_stats_sink = {});
+    dynamic_filter_stats* dynamic_filter_stats_sink = {},
+    uint64_t max_fold_rows                          = k_fold_row_limit);
 
   duckdb::vector<sirius::join_condition> conditions;
   //! The types of the join keys
