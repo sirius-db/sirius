@@ -766,7 +766,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
       SIRIUS_LOG_WARN(
         "SiriusContext: host space count ({}) != NUMA node count ({}) — "
         "expected one host space per NUMA domain. Check "
-        "sirius_config apply_defaults (.use_numa_id_as_host_id()) or YAML host "
+        "sirius_config apply_defaults (.use_host_per_numa()) or YAML host "
         "configuration.",
         mgpu05_host_spaces.size(),
         topo.num_numa_nodes);
@@ -1479,10 +1479,6 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     duckdb::unique_ptr<duckdb::LogicalOperator> validation_plan;
     bool plan_is_copyable = true;
     try {
-      // Preserve LogicalComparisonJoin::filter_pushdown / LogicalGet::dynamic_filters across
-      // the Copy round-trip — these fields are not in DuckDB's serialization schema, so a plain
-      // Copy strips them. Without this, downstream Sirius wiring would not see runtime-computed
-      // dynamic filters even when DuckDB's optimizer produced them.
       validation_plan = sirius::transparent::copy_logical_plan(*logical_plan, context);
     } catch (NotImplementedException&) {
       plan_is_copyable = false;

@@ -59,10 +59,10 @@ struct stream_lineage_fixture {
       builder.set_number_of_gpus(1)
         .set_gpu_usage_limit(512ULL << 20)
         .set_reservation_fraction_per_gpu(0.75)
-        .set_per_numa_region_capacity(1ULL << 30)
-        .use_numa_id_as_host_id()
+        .set_per_host_capacity(1ULL << 30)
+        .use_host_per_numa()
         .track_reservation_per_stream(false)
-        .set_reservation_fraction_per_numa_region(0.75);
+        .set_reservation_fraction_per_host(0.75);
       auto space_configs = builder.build();
       manager            = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
         std::move(space_configs));
@@ -382,12 +382,12 @@ TEST_CASE("reader events order a convert reclaim's mutable acquisition after in-
   setup_stream.synchronize();
 
   {
-    auto ro         = batch->to_read_only();
-    auto view       = sirius::get_cudf_table_view(ro);
+    auto mut        = batch->to_mutable();
+    auto view       = sirius::get_cudf_table_view(*batch);
     void const* src = view.column(0).head();
     enqueue_blockers(scratch, kScratchMiB << 20, reader_stream.view());
     cudaMemcpyAsync(result_dev, src, kBytes, cudaMemcpyDeviceToDevice, reader_stream.value());
-    ro.record_reader_event(reader_stream.view());
+    mut.get_data()->record_writer_event(reader_stream.view());
   }  // read lock dropped with the read still in flight
 
   // Anti-vacuity: the lock is already gone, so only a pending reader event can

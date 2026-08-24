@@ -40,6 +40,43 @@
 // the other gpu_execution integration suites; keep the historical name locally.
 using ArrayFixture = sirius::test::GpuExecutionFixture;
 
+namespace {
+
+/// Appends @p extra to the live `disabled_optimizers` mask and restores the exact prior mask on
+/// scope exit. Sirius publishes a global mask at extension load (`in_clause`,
+/// `compressed_materialization`, `late_materialization`) that transparent execution depends on,
+/// so a test must never RESET this setting -- that wipes the mask and breaks every later test on
+/// the shared database.
+class disabled_optimizers_guard {
+ public:
+  disabled_optimizers_guard(duckdb::Connection& con, const std::string& extra) : _con(con)
+  {
+    auto current = _con.Query("SELECT current_setting('disabled_optimizers');");
+    REQUIRE(current);
+    REQUIRE_FALSE(current->HasError());
+    _saved       = current->GetValue(0, 0).ToString();
+    auto updated = _con.Query("SET disabled_optimizers = '" + _saved + (_saved.empty() ? "" : ",") +
+                              extra + "';");
+    REQUIRE(updated);
+    REQUIRE_FALSE(updated->HasError());
+  }
+  ~disabled_optimizers_guard()
+  {
+    auto restored = _con.Query("SET disabled_optimizers = '" + _saved + "';");
+    // CHECK (not REQUIRE): destructors must not throw; a failed restore still fails the test.
+    CHECK(restored);
+    if (restored) { CHECK_FALSE(restored->HasError()); }
+  }
+  disabled_optimizers_guard(const disabled_optimizers_guard&)            = delete;
+  disabled_optimizers_guard& operator=(const disabled_optimizers_guard&) = delete;
+
+ private:
+  duckdb::Connection& _con;
+  std::string _saved;
+};
+
+}  // namespace
+
 //===----------------------------------------------------------------------===//
 // Scan + projection passthrough
 //===----------------------------------------------------------------------===//
@@ -473,6 +510,54 @@ TEST_CASE_METHOD(ArrayFixture,
   run_ok("INSERT INTO arr_prune SELECT i, [i, i + 1, i + 2] FROM range(200000) t(i);");
   run_ok("CHECKPOINT;");
   compare_gpu_vs_cpu("SELECT id, a FROM arr_prune WHERE id >= 150000;");
+}
+
+TEST_CASE_METHOD(ArrayFixture,
+                 "gpu_execution array - fully pruned ARRAY scan through ORDER BY LIMIT",
+                 "[integration][gpu_execution][array][filter]")
+{
+  // id >= 1000000 is FILTER_ALWAYS_FALSE for every row group, so the scan serves one
+  // schema-correct 0-row split whose ARRAY column is a cuDF LIST. TOP-N then rebuilds an empty
+  // output table from that view (compute_top_n_table -> duckdb::make_empty_like), which must
+  // reproduce the LIST child hierarchy; the fixture's no-fallback delta turns a silent CPU
+  // fallback into a failure. statistics_propagation must be off so the provably-false filter is
+  // not folded into an EMPTY_RESULT before the scan exists (the standing Sirius mask's
+  // late_materialization entry already keeps the ARRAY column inside TOP-N rather than joined
+  // back after an id-only sort).
+  run_ok("CREATE TABLE arr_prune (id INTEGER, a INTEGER[3]);");
+  run_ok("INSERT INTO arr_prune SELECT i, [i, i + 1, i + 2] FROM range(3000) t(i);");
+  run_ok("CHECKPOINT;");
+  disabled_optimizers_guard const guard(*con, "statistics_propagation");
+  // Non-empty control first: proves the non-empty ARRAY top-n path, so a failure below isolates
+  // to emptiness rather than to ARRAY-through-TOP-N support.
+  compare_gpu_vs_cpu_ordered("SELECT id, a FROM arr_prune ORDER BY id LIMIT 5;");
+  compare_gpu_vs_cpu_ordered(
+    "SELECT id, a FROM arr_prune WHERE id >= 1000000 ORDER BY id LIMIT 5;");
+}
+
+TEST_CASE_METHOD(ArrayFixture,
+                 "gpu_execution array - join against a fully pruned ARRAY side",
+                 "[integration][gpu_execution][array][filter][join]")
+{
+  // The fully pruned subquery serves one schema-correct 0-row LIST batch that must flow through
+  // the hash join's empty-side handling on the GPU (the outer join NULL-pads each surviving row);
+  // the no-fallback delta fails if any step of that pipeline falls back to CPU. The join's
+  // orphan/absent-side synthesis (sirius::make_empty_table at the hash join's orphan branch) is
+  // NOT reachable from SQL -- the partition slicer deposits a zero-row batch in every partition,
+  // so a side that yields no row still deposits batches (see
+  // test_compressed_materialization_partition.cpp); that helper's ARRAY handling is pinned by the
+  // make_empty_table unit tests in test_cudf_utils.cpp instead. statistics_propagation must be
+  // off so the provably-false filter is not folded into an EMPTY_RESULT before the scan exists.
+  run_ok("CREATE TABLE arr_prune (id INTEGER, a INTEGER[3]);");
+  run_ok("INSERT INTO arr_prune SELECT i, [i, i + 1, i + 2] FROM range(3000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("CREATE TABLE dim (id INTEGER);");
+  run_ok("INSERT INTO dim SELECT i FROM range(100) t(i);");
+  run_ok("CHECKPOINT;");
+  disabled_optimizers_guard const guard(*con, "statistics_propagation");
+  compare_gpu_vs_cpu(
+    "SELECT d.id, t.a FROM dim d LEFT JOIN "
+    "(SELECT * FROM arr_prune WHERE id >= 1000000) t USING (id);");
 }
 
 //===----------------------------------------------------------------------===//

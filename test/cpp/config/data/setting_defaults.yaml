@@ -23,10 +23,10 @@ sirius:
     max_build_hash_table_bytes: 6MiB
     max_broadcast_join_size: 7MiB
     mark_join_build_switch_ratio: 3.0
-    enable_runtime_distinct_build_probe: false
-    enable_dynamic_filter_pushdown: false
+    enable_dynamic_filter: false
     enable_dynamic_zone_map_filter: true
     dynamic_filter_domain_coverage_threshold: 0.8
+    dynamic_filter_inlist_max_l2_fraction: 0.4
     dynamic_filter_keep_threshold: 0.7
     enable_pinned_zone_map_pruning: false
     enable_compressed_materialization: false

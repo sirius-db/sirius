@@ -106,9 +106,9 @@ struct spill_test_env {
     builder.set_number_of_gpus(1)
       .set_gpu_usage_limit(512ull << 20)
       .set_reservation_fraction_per_gpu(0.75)
-      .set_per_numa_region_capacity(512ull << 20)
-      .use_gpu_id_as_host_id()
-      .set_reservation_fraction_per_numa_region(0.75)
+      .set_per_host_capacity(512ull << 20)
+      .use_host_per_gpu()
+      .set_reservation_fraction_per_host(0.75)
       .set_disk_mounting_point(0, 2ull << 30, tmp_dir.string());
 
     auto space_configs = builder.build();
@@ -543,8 +543,7 @@ TEST_CASE("spill compression: per-column host->disk flush writes one file per co
     auto& host = ro.get_data()->cast<sirius::compressed_host_representation>();
     REQUIRE(host.column_blobs().size() == 2);
     for (auto const& blob : host.column_blobs()) {
-      artifact_sizes.push_back(blob->header.size() +
-                               static_cast<std::size_t>(blob->payload_bytes));
+      artifact_sizes.push_back(blob->header.size() + static_cast<std::size_t>(blob->payload_bytes));
     }
     // One artifact is staged on the device at a time, so the decode transient is
     // the largest column rather than the sum of both.
@@ -613,7 +612,7 @@ TEST_CASE("spill compression: materialization estimate covers the decode transie
   // A GPU-resident table decodes nothing, so its estimate is just its footprint.
   {
     auto ro = batch->to_read_only();
-    REQUIRE(sirius::estimated_materialization_bytes(*ro.get_data()) ==
+    REQUIRE(sirius::peak_materialization_bytes(ro.get_data()) ==
             ro.get_data()->get_uncompressed_data_size_in_bytes());
   }
 
@@ -630,8 +629,8 @@ TEST_CASE("spill compression: materialization estimate covers the decode transie
     const auto compressed   = data->get_size_in_bytes();
 
     REQUIRE(compressed > 0);
-    REQUIRE(sirius::estimated_materialization_bytes(*data) == uncompressed + compressed);
-    REQUIRE(sirius::estimated_materialization_bytes(*data) > uncompressed);
+    REQUIRE(sirius::peak_materialization_bytes(data) == uncompressed + compressed);
+    REQUIRE(sirius::peak_materialization_bytes(data) > uncompressed);
   }
 
   require_restores_to(batch, &repo_a(), expected_sum_of(n));
@@ -959,18 +958,19 @@ TEST_CASE("spill compression: a rejected edge is marked and later batches skip c
   auto& e   = env();
   auto& reg = sirius::compression::plan_register::global();
   reg.clear_all();
-  sirius::compression::set_spill_compression_settings(true,
-                                                      /*explore_beam_width=*/4,
-                                                      /*explore_max_bytes=*/8ull << 20,
-                                                      /*max_compressed_fraction=*/0.75,
-                                                      /*replan_after_uses=*/0,
-                                                      /*error_tolerance=*/1,
-                                                      /*replan_change_threshold=*/0.20,
-                                                      /*explore_sample_rows=*/0,
-                                                      /*min_batch_bytes=*/0,
-                                                      /*release_columns_early=*/false,
-                                                      /*encode_reserve_fraction=*/0.5,
-                                                      /*encode_min_headroom_fraction=*/0.0);  // never expire
+  sirius::compression::set_spill_compression_settings(
+    true,
+    /*explore_beam_width=*/4,
+    /*explore_max_bytes=*/8ull << 20,
+    /*max_compressed_fraction=*/0.75,
+    /*replan_after_uses=*/0,
+    /*error_tolerance=*/1,
+    /*replan_change_threshold=*/0.20,
+    /*explore_sample_rows=*/0,
+    /*min_batch_bytes=*/0,
+    /*release_columns_early=*/false,
+    /*encode_reserve_fraction=*/0.5,
+    /*encode_min_headroom_fraction=*/0.0);  // never expire
   set_plan_1col(&repo_a(), kNonCompressingDsl);
 
   // First batch: compression runs, misses the threshold, and the edge is marked.

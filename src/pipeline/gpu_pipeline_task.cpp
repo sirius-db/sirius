@@ -16,7 +16,6 @@
 
 #include "pipeline/gpu_pipeline_task.hpp"
 
-#include "compression/compression_converters.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "log/logging.hpp"
 #include "memory/defragmenter_oom_policy.hpp"
@@ -231,29 +230,13 @@ std::unique_ptr<op::operator_data> run_one_operator(
 
 }  // namespace
 
-namespace {
-
-/// True when @p data is an ordinary GPU table an operator can read directly.
-/// The GPU tier also holds compressed_device_representation, which must be
-/// decoded before use — and that decode allocates, so it has to be reserved for.
-bool is_plain_gpu_table(const cucascade::idata_representation& data)
-{
-  return dynamic_cast<const cucascade::gpu_table_representation*>(&data) != nullptr;
-}
-
-}  // namespace
-
 std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_input(
   const cucascade::memory::memory_space* target_space) const
 {
-  // Peak device memory while making one representation GPU-resident is computed by
-  // estimated_materialization_bytes() (see compression_converters.hpp): uncompressed
-  // size for a plain representation, plus the compressed payload for a compressed one,
-  // since decode stages the payload on device alongside the table it builds. Column
-  // projections scale both byte fields pro-rata, so the estimate follows them.
-  //
-  // A per-column compressed batch is charged its LARGEST artifact rather than the
-  // sum, since it stages one at a time; see decode_transient_bytes().
+  // Peak device memory while making one representation GPU-resident.
+  auto peak_materialization_bytes = [](const cucascade::idata_representation* data) {
+    return sirius::peak_materialization_bytes(data);
+  };
 
   if (auto* scan_input = dynamic_cast<const op::scan::scan_operator_input*>(_input_data.get());
       scan_input && scan_input->is_resident()) {
@@ -263,11 +246,8 @@ std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_in
 
     auto ro          = batch->to_read_only();
     auto const* data = ro.get_data();
-    if (!data) { return 0; }
-    if (ro.get_current_tier() == cucascade::memory::Tier::GPU && is_plain_gpu_table(*data)) {
-      return 0;
-    }
-    return estimated_materialization_bytes(*data);
+    if (!data || ro.get_current_tier() == cucascade::memory::Tier::GPU) { return 0; }
+    return peak_materialization_bytes(data);
   }
 
   std::size_t input_size   = 0;
@@ -278,15 +258,7 @@ std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_in
       const bool non_gpu     = ro.get_current_tier() != cucascade::memory::Tier::GPU;
       const bool cross_space = target_space != nullptr && ro.get_memory_space() != nullptr &&
                                ro.get_memory_space()->get_id() != target_space->get_id();
-      // A batch held compressed *on the GPU* (eager output compression, or a
-      // compressed pin) is neither off-tier nor cross-space, so neither flag
-      // above catches it — yet lock_or_prepare_batch decodes it in place and
-      // allocates the whole decompressed table. Left out, that allocation is
-      // entirely unreserved.
-      const bool decode_in_place = !non_gpu && !is_plain_gpu_table(*ro.get_data());
-      if (non_gpu || cross_space || decode_in_place) {
-        input_size += estimated_materialization_bytes(*ro.get_data());
-      }
+      if (non_gpu || cross_space) { input_size += peak_materialization_bytes(ro.get_data()); }
     }
   }
   return input_size;
@@ -648,7 +620,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
       dynamic_cast<const op::pipelineable_operator_data*>(output_data.get());
     if (pipelineable_output) {
       for (const auto& batch : pipelineable_output->get_read_only_batches(false)) {
-        output_bytes += batch.get_data()->get_uncompressed_data_size_in_bytes();
+        output_bytes += batch.get_data()->get_size_in_bytes();
       }
     }
     auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
@@ -681,7 +653,7 @@ std::size_t gpu_pipeline_task::get_input_size() const
     dynamic_cast<const op::pipelineable_operator_data*>(local_state._input_data.get());
   if (!pipelineable_input) { return 0; }
   for (const auto& batch : pipelineable_input->get_read_only_batches(false)) {
-    input_size += batch.get_data()->get_uncompressed_data_size_in_bytes();
+    input_size += batch.get_data()->get_size_in_bytes();
   }
   return input_size;
 }

@@ -21,6 +21,7 @@
 #include <catch.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <duckdb/common/exception.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <op/sirius_physical_hash_join.hpp>
@@ -69,10 +70,12 @@ struct projected_nlj_result {
 };
 
 /**
- * @brief Create a mark join operator with two INT32 key columns (left col[0] = right col[0]).
+ * @brief Create a mark join operator with two INT32 key columns joined by @p comparison
+ * (left col[0] <comparison> right col[0]).
  * Left child has types {INTEGER, INTEGER} (key + payload), right child has {INTEGER} (key only).
  */
-mark_join_fixture create_mark_join()
+mark_join_fixture create_mark_join(
+  duckdb::ExpressionType comparison = duckdb::ExpressionType::COMPARE_EQUAL)
 {
   mark_join_fixture f;
 
@@ -94,7 +97,7 @@ mark_join_fixture create_mark_join()
   duckdb::JoinCondition cond;
   cond.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
   cond.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  cond.comparison = duckdb::ExpressionType::COMPARE_EQUAL;
+  cond.comparison = comparison;
   conditions.push_back(std::move(cond));
 
   f.hash_join = duckdb::make_uniq<sirius_physical_hash_join>(
@@ -106,8 +109,7 @@ mark_join_fixture create_mark_join()
     duckdb::vector<duckdb::idx_t>{},  // left_projection_map (empty = all)
     duckdb::vector<duckdb::idx_t>{},  // right_projection_map (not used by MARK)
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),  // delim_types
-    1000,
-    nullptr);
+    1000);
 
   // No pipelines exist in this fixture, so the converter's assign_operator_ids never runs.
   // Number the tree here — operator code reads get_operator_id(), which rejects the sentinel.
@@ -569,8 +571,7 @@ TEST_CASE("sirius_physical_hash_join mark join - mixed conditions are unsupporte
                       duckdb::vector<duckdb::idx_t>{},
                       duckdb::vector<duckdb::idx_t>{},
                       sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),
-                      1000,
-                      nullptr),
+                      1000),
                     std::runtime_error);
 }
 
@@ -887,6 +888,123 @@ TEST_CASE("sirius_physical_nested_loop_join MARK mixed null-safe + null-propagat
     REQUIRE(mark.null_count() == 1);
     REQUIRE(copy_validity_to_host(mark) == std::vector<bool>{false});
   }
+}
+
+// DuckDB's PhysicalNestedLoopJoin::IsSupported admits RIGHT_SEMI, RIGHT_ANTI and SINGLE, which
+// used to survive planning and then hit the execute switch's `default:` throw mid-query.
+TEST_CASE("sirius_physical_nested_loop_join rejects join types it cannot execute",
+          "[physical_nested_loop_join][join_type]")
+{
+  using JT = duckdb::JoinType;
+
+  for (auto join_type : {JT::INNER, JT::LEFT, JT::RIGHT, JT::SEMI, JT::ANTI, JT::MARK, JT::OUTER}) {
+    INFO("join type " << duckdb::JoinTypeToString(join_type));
+    REQUIRE(sirius_physical_nested_loop_join::is_join_type_supported(join_type));
+  }
+
+  for (auto join_type : {JT::RIGHT_SEMI, JT::RIGHT_ANTI, JT::SINGLE}) {
+    INFO("join type " << duckdb::JoinTypeToString(join_type));
+    REQUIRE_FALSE(sirius_physical_nested_loop_join::is_join_type_supported(join_type));
+    // The DuckDB-mirroring condition check must agree, so neither entry point can admit them.
+    REQUIRE_FALSE(sirius_physical_nested_loop_join::is_supported(
+      duckdb::vector<sirius::join_condition>{}, join_type));
+    // Backstop: constructing one anyway throws inside plan generation (which falls back to CPU)
+    // rather than aborting the query from execute().
+    REQUIRE_THROWS_AS(create_projected_nlj(join_type, duckdb::ExpressionType::COMPARE_EQUAL),
+                      duckdb::NotImplementedException);
+  }
+}
+
+// SINGLE reaches neither GPU join: both dispatches fall through to a mid-query throw.
+// are_conditions_supported now folds in the join-type screen so the planner rejects it.
+TEST_CASE("sirius_physical_hash_join rejects join types it cannot execute",
+          "[physical_hash_join][join_type]")
+{
+  using JT = duckdb::JoinType;
+
+  for (auto join_type : {JT::INNER,
+                         JT::LEFT,
+                         JT::RIGHT,
+                         JT::SEMI,
+                         JT::ANTI,
+                         JT::RIGHT_SEMI,
+                         JT::RIGHT_ANTI,
+                         JT::MARK,
+                         JT::OUTER}) {
+    INFO("join type " << duckdb::JoinTypeToString(join_type));
+    REQUIRE(sirius_physical_hash_join::is_join_type_supported(join_type));
+  }
+  REQUIRE_FALSE(sirius_physical_hash_join::is_join_type_supported(JT::SINGLE));
+
+  // A plain equality condition the hash join would otherwise accept.
+  auto make_conditions = [](duckdb::ExpressionType comparison) {
+    duckdb::vector<duckdb::JoinCondition> conditions;
+    duckdb::JoinCondition cond;
+    cond.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
+    cond.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
+    cond.comparison = comparison;
+    conditions.push_back(std::move(cond));
+    return sirius::wrap_join_conditions(std::move(conditions));
+  };
+
+  auto equal_conditions = make_conditions(duckdb::ExpressionType::COMPARE_EQUAL);
+  REQUIRE(sirius_physical_hash_join::are_conditions_supported(equal_conditions, JT::INNER));
+  REQUIRE(sirius_physical_hash_join::are_conditions_supported(equal_conditions, JT::MARK));
+  // Rejected on the join type alone, not the conditions.
+  REQUIRE_FALSE(sirius_physical_hash_join::are_conditions_supported(equal_conditions, JT::SINGLE));
+
+  // An all-null-safe MARK is supported: one EQUAL covers every key and the marks are definite.
+  auto null_safe_conditions = make_conditions(duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM);
+  REQUIRE(sirius_physical_hash_join::are_conditions_supported(null_safe_conditions, JT::INNER));
+  REQUIRE(sirius_physical_hash_join::are_conditions_supported(null_safe_conditions, JT::MARK));
+
+  // Mixing the two is not, since one null_equality cannot express both policies.
+  duckdb::vector<duckdb::JoinCondition> mixed;
+  for (auto comparison :
+       {duckdb::ExpressionType::COMPARE_EQUAL, duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM}) {
+    duckdb::JoinCondition cond;
+    auto const idx = static_cast<duckdb::idx_t>(mixed.size());
+    cond.left      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, idx);
+    cond.right     = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, idx);
+    cond.comparison = comparison;
+    mixed.push_back(std::move(cond));
+  }
+  auto mixed_conditions = sirius::wrap_join_conditions(std::move(mixed));
+  REQUIRE(sirius_physical_hash_join::are_conditions_supported(mixed_conditions, JT::INNER));
+  REQUIRE_FALSE(sirius_physical_hash_join::are_conditions_supported(mixed_conditions, JT::MARK));
+}
+
+// An all-null-safe MARK runs under EQUAL: NULL matches NULL and no comparison is UNKNOWN, so the
+// mark column carries no nulls. Under the previous UNEQUAL pin a NULL probe key produced NULL.
+TEST_CASE("sirius_physical_hash_join MARK with all null-safe keys emits definite marks",
+          "[physical_hash_join][mark][nulls]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  // compare_nulls()/mark_is_null_safe() are internal, so assert the semantics instead: NULL
+  // matching NULL proves EQUAL, a null-free mark column proves definiteness.
+  auto f = create_mark_join(duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM);
+
+  // Left keys {NULL, 5, 7} with payload; right (build) keys {NULL, 5}.
+  auto left_key = make_numeric_batch_with_nulls<int32_t>(
+    *space, {0, 5, 7}, {false, true, true}, cudf::type_id::INT32);
+  auto left_payload = make_numeric_batch<int32_t>(*space, {10, 20, 30}, cudf::type_id::INT32);
+  auto left         = concatenate_batches_horizontal({left_key, left_payload}, *space);
+  auto right =
+    make_numeric_batch_with_nulls<int32_t>(*space, {0, 5}, {false, true}, cudf::type_id::INT32);
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> inputs{left, right};
+  auto outputs =
+    f.hash_join->execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
+  auto const& output_data = dynamic_cast<const pipelineable_operator_data&>(*outputs);
+  REQUIRE(output_data.get_data_batches().size() == 1);
+  auto view = sirius::get_cudf_table_view(*output_data.get_data_batches()[0]);
+
+  // NULL matches NULL, 5 matches 5, 7 matches nothing -- and the miss is FALSE, never NULL.
+  auto mark = view.column(view.num_columns() - 1);
+  REQUIRE(mark.null_count() == 0);
+  REQUIRE(copy_column_to_host<bool>(mark) == std::vector<bool>{true, true, false});
 }
 
 TEST_CASE("sirius_physical_nested_loop_join SEMI and ANTI honor the left projection map",

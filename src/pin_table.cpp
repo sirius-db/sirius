@@ -338,16 +338,10 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
   }
 }
 
-// Thread-local pool of 4 CUDA streams for cross-column encode parallelism,
-// matching the decompress path in compression_converters.cpp.
-simpatico::stream_pool& compress_pool()
-{
-  thread_local simpatico::stream_pool pool;
-  if (pool.streams.empty()) {
-    if (!pool.init(4)) throw std::runtime_error("[pin_table] compress stream_pool init failed");
-  }
-  return pool;
-}
+// Streams for cross-column encode parallelism, one pool per thread and device —
+// the same accessor the decode path uses, so a thread that both pins and
+// decodes holds one pool rather than two.
+simpatico::stream_pool& compress_pool() { return simpatico::thread_device_stream_pool(4); }
 
 // Diagnostic for a compression failure inside a pin sink, shared by both drivers. Reports the real
 // blast radius: the sink latches compression off for every remaining chunk of the pin, not only the

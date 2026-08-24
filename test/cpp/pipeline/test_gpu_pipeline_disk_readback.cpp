@@ -74,9 +74,9 @@ make_test_memory_manager_with_disk()
   builder.set_number_of_gpus(1)
     .set_gpu_usage_limit(gpu_capacity)
     .set_reservation_fraction_per_gpu(limit_ratio)
-    .set_per_numa_region_capacity(host_capacity)
-    .use_gpu_id_as_host_id()
-    .set_reservation_fraction_per_numa_region(limit_ratio)
+    .set_per_host_capacity(host_capacity)
+    .use_host_per_gpu()
+    .set_reservation_fraction_per_host(limit_ratio)
     .set_disk_mounting_point(0, disk_capacity, tmp_dir.string());
 
   auto space_configs = builder.build();

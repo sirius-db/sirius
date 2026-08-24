@@ -64,17 +64,20 @@ num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 - `src/op/sirius_physical_grouped_aggregate_merge.cpp`, `src/op/sirius_physical_top_n.cpp` — `build_pipelines()` overrides
 - `src/sirius_engine.cpp` — invokes marking after parent pointers are refreshed
 
-**Config:** `fuse_merge_pipelines` (default: true). See [physical-plan-generation.md](physical-plan-generation.md) → Merge fusion for pipeline-shape details.
+**Policy:** Sirius applies eligible merge fusion automatically. See
+[physical-plan-generation.md](physical-plan-generation.md) → Merge fusion for pipeline-shape
+details.
 
 ### Task Creator Look-Ahead (PR #1174)
 
 **Motivation:** With demand-driven (`active`) task creation, a drained task queue leaves GPU workers idle even when not-yet-activated scans could already be producing work.
 
-**Mechanism:** The task creator keeps a `_lookahead_queue` of candidate operators (built at query start from the plan's scan operators after the first, cleared on drain/restart). When the task scheduler finds its task queue empty, it calls `schedule_lookahead(device_hint)`, which — only under `strategy: lookahead` — emits one speculative request for the next not-yet-activated operator, warming scans up one task at a time. The manager loop creates a single task per look-ahead request rather than draining the source. See [task-creator.md](task-creator.md).
+**Mechanism:** The task creator retains a `_lookahead_queue` of candidate operators (built at query start from the plan's scan operators after the first, cleared on drain/restart). When an engine-controlled policy selects the internal `request_type::lookahead` primitive and the task scheduler finds its task queue empty, `schedule_lookahead(device_hint)` emits one speculative request for the next not-yet-activated operator, warming scans up one task at a time. The manager loop creates a single task per look-ahead request rather than draining the source. See [task-creator.md](task-creator.md).
 
 **Code path:** `src/creator/task_creator.cpp` — `schedule_lookahead()`; `src/pipeline/task_scheduler.cpp` — empty-queue trigger; `src/include/creator/config.hpp` — `request_type`
 
-**Config:** `executor.task_creator.strategy` (`active` default, `lookahead` opt-in) — see [configuration.md](configuration.md).
+**Policy:** internal. The current shipped policy is active and demand-driven;
+look-ahead is not a user-selectable YAML setting.
 
 ## Operator-Level Optimizations
 
@@ -363,13 +366,11 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 **Mechanism:** The walk is structured for minimal, parallel, typed metadata access with statistics pruning:
 1. **Projected-column-only, typed walk (#868, #936):** `walk_duckdb_native_row_group_range()` walks the DuckDB segment trees directly for only the projected columns, reading typed `block_id` / compression / row counts / validity-child / max-string-length per segment instead of calling `GetColumnSegmentInfo` and re-parsing strings.
 2. **Stats pruning (#900):** `prepare_duckdb_native_walk()` evaluates DuckDB's own `TableFilter::CheckStatistics` against each row group's per-column statistics and drops any row group a pushed-down filter proves `FILTER_ALWAYS_FALSE` before it is staged, copied to the GPU, or decoded; an all-pruned table routes to DuckDB CPU up front.
-3. **Parallel range walk + early decode (#895):** `prepare_duckdb_native_walk()` runs as a cheap serial pre-step (partition stats, type-viability gate, row-group count) with no per-segment I/O; the row groups are sliced into ranges of `SIRIUS_METADATA_PARSE_CHUNK` groups, and the scan-manager pool walks the ranges in parallel so cold segment reads for different ranges overlap. The batch coalescer packs parsed ranges into cap-sized batches that decode while later ranges are still being parsed.
+3. **Parallel range walk + early decode (#895):** `prepare_duckdb_native_walk()` runs as a cheap serial pre-step (partition stats, type-viability gate, row-group count) with no per-segment I/O; the row groups are sliced into fixed internal ranges of eight groups, and the scan-manager pool walks the ranges in parallel so cold segment reads for different ranges overlap. The batch coalescer packs parsed ranges into cap-sized batches that decode while later ranges are still being parsed.
 
 **Code path:**
 - `src/op/scan/duckdb_native_metadata.cpp` — `prepare_duckdb_native_walk()`, `walk_duckdb_native_row_group_range()`, `mark_row_groups_pruned_by_filter_stats()`
 - `src/op/scan/duckdb_native_gpu_ingestible.cpp` — parse-range slicing, per-range walk thunks, and the `duckdb_native_batch_coalescer`
-
-**Config:** `SIRIUS_METADATA_PARSE_CHUNK` (row groups per parallel parse range, default 8)
 
 ### DuckDB-Native Async Coalesced Reads (PR #849)
 

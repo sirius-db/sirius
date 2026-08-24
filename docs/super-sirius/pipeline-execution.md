@@ -250,8 +250,8 @@ If you are reading older operator code that says "all batches are expected to sh
 Three pieces of evidence corroborate that the contract holds for every currently-shipping operator:
 
 - **Phase 14 ship-validation** — `[mgpu]` 12/13 PASS, `[TPC-H][parquet]` 22/22 PASS, `[integration][TPC-H]` 48/48 PASS (71608 assertions). The single `[mgpu]` fail is the Phase-12-territory `physical_order - small sort stays single-GPU` `vector::_M_range_check`, fixed on `fix/order-small-sort-rangecheck` and unrelated to operator colocation.
-- **Phase 15 Wave 1 audit** — All 11 operator sites that read `valid_batches[0]->get_memory_space()` (or equivalent) are classified `SAFE` based on upstream-trace through `gpu_pipeline_task::execute -> pipelineable_operator_data::prepare_for_processing -> lock_or_prepare_batch`. The per-site classification table and justification were recorded in the Phase 15 audit log.
-- **Phase 15 Wave 2 stress test** — `test/cpp/operator/test_mgpu_stress.cpp` exercises five representative `[mgpu]` queries under 100 distinct `_no_pref_rr_counter` starting offsets (500 inner runs, 77053 assertions), each asserting CPU baseline match via `require_gpu_matches_cpu`. PASS in 86.6s on `2 × RTX 6000 Ada`. Catches hash-bucket-order-dependent bugs and any latent off-by-one that a counter-always-starts-at-0 test would mask.
+- **Phase 15 Wave 1 audit** — All 11 operator sites that read `valid_batches[0]->get_memory_space()` (or equivalent) are classified `SAFE` based on upstream-trace through `gpu_pipeline_task::execute -> pipelineable_operator_data::prepare_for_processing -> lock_or_prepare_batch`.
+- **Phase 15 Wave 2 stress test** — `test/cpp/operator/test_mgpu_stress.cpp` exercises five representative `[mgpu]` queries under 100 distinct `_no_pref_rr_counter` starting offsets (500 inner runs, 77053 assertions), each asserting CPU baseline match via `require_gpu_matches_cpu`. Catches hash-bucket-order-dependent bugs and any latent off-by-one that a counter-always-starts-at-0 test would mask.
 
 ### For new operator authors
 
@@ -328,8 +328,8 @@ such edge and samples whatever complete filters are visible at its reader and po
 checkpoints.
 
 Issue [#1124](https://github.com/sirius-db/sirius/issues/1124) measured the former build-subtree
-preference at SF300. It provided no coverage benefit; disabling it cut wall time by 9–25% and
-substantially reduced run-to-run variance, so it was removed. See
+preference. It provided no coverage benefit while costing wall time and run-to-run variance, so it
+was removed. See
 [Transitive scan targets and publication timing](dynamic-filters.md#transitive-scan-targets-and-publication-timing)
 for the consumer semantics.
 
