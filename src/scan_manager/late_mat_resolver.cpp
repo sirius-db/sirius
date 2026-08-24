@@ -97,21 +97,35 @@ std::optional<late_mat::pinned_column_view> resolve_pinned_column(
         if (!chunk.compressed->has_table()) { return std::nullopt; }
         source.compressed   = chunk.compressed.get();
         source.column_index = origin.column_pos;
-        // The compressed table carries its own dtype per column, and it is the
-        // one the decode re-tags to; taking it from the first compressed chunk
-        // is safe because a pin stores one type per column throughout.
+        // The compressed table carries its own carrier dtype per column, and it
+        // is the one the decode re-tags to. That carrier is chosen PER CHUNK —
+        // narrow_pin_chunk() computes each chunk's exact range independently, so
+        // one logical BIGINT can be stored INT8 in one chunk and INT16 in the
+        // next. The view carries a single dtype, which the gather reads every
+        // batch at, so a pin whose chunks disagree has no single answer here and
+        // is refused rather than read at the first chunk's width.
         auto const& table = chunk.compressed->table();
         if (origin.column_pos >= table.columns.size()) { return std::nullopt; }
+        auto const carrier = table.columns[origin.column_pos].dtype;
         if (view.dtype.id() == cudf::type_id::EMPTY) {
-          view.dtype = table.columns[origin.column_pos].dtype;
+          view.dtype = carrier;
+        } else if (view.dtype != carrier) {
+          return std::nullopt;
         }
       } else {
         if (origin.column_pos >= chunk.columns.size() || !chunk.columns[origin.column_pos]) {
           return std::nullopt;
         }
+        // Same per-chunk carrier caveat as the compressed branch above: with
+        // compressed materialization on, narrow_pin_chunk() narrows every chunk
+        // it materializes, including ones the sink then stores uncompressed.
         auto const& col     = *chunk.columns[origin.column_pos];
         source.uncompressed = col.view();
-        if (view.dtype.id() == cudf::type_id::EMPTY) { view.dtype = col.type(); }
+        if (view.dtype.id() == cudf::type_id::EMPTY) {
+          view.dtype = col.type();
+        } else if (view.dtype != col.type()) {
+          return std::nullopt;
+        }
       }
       view.batches.push_back(source);
     }
@@ -124,7 +138,11 @@ std::optional<late_mat::pinned_column_view> resolve_pinned_column(
       source.uncompressed = col->view();
       source.num_rows     = col->size();
       view.batches.push_back(source);
-      if (view.dtype.id() == cudf::type_id::EMPTY) { view.dtype = col->type(); }
+      if (view.dtype.id() == cudf::type_id::EMPTY) {
+        view.dtype = col->type();
+      } else if (view.dtype != col->type()) {
+        return std::nullopt;
+      }
     }
   }
 

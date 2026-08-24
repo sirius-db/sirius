@@ -105,6 +105,12 @@ struct join_key_role {
   op::sirius_physical_operator const* join = nullptr;
   std::size_t condition                    = 0;
   bool from_lhs                            = false;
+  /// Whether the condition is a plain `lhs_column = rhs_column` — both sides a
+  /// bare column reference, compared for equality. Only such a condition proves
+  /// at-most-one match per row: an inequality (`a < b`) matches many rows even
+  /// when one side is distinct, and a computed side (`a = b + 1`) says nothing
+  /// about the column's own distinctness. See @ref group_key_extension.
+  bool bare_column_equality = false;
 };
 
 /// Where one scan output column stops being merely carried.

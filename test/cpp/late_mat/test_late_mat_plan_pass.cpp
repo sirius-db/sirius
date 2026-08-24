@@ -952,6 +952,93 @@ TEST_CASE("a join key records which condition compared it", "[late_mat][lifetime
   REQUIRE(lives[0].join_key_at.empty());  // beside the key, never compared
 }
 
+TEST_CASE("a join key records whether its condition is a bare column equality",
+          "[late_mat][lifetime]")
+{
+  // The rider's functional-dependency proof turns "these two scans meet in this
+  // condition" into "at most one rider row per primary row". That step holds
+  // only for `column = column`: under `<` a distinct side still matches many
+  // rows, and a computed side is not the value the distinctness proof covered.
+  duckdb::LogicalDummyScan stub(0);
+  stub.types = duckdb::vector<duckdb::LogicalType>(6, duckdb::LogicalType::VARCHAR);
+
+  auto const bare_ref = [] {
+    return std::make_unique<sirius::ast::node>(sirius::ast::reference{1, string_type()});
+  };
+
+  auto const is_bare_equality = [&stub](sirius::comparison_type comparison,
+                                        std::unique_ptr<sirius::ast::node> lhs_side) {
+    duckdb::vector<sirius::join_condition> conditions;
+    sirius::join_condition condition;
+    condition.left  = std::move(lhs_side);
+    condition.right = std::make_unique<sirius::ast::node>(sirius::ast::reference{0, string_type()});
+    condition.comparison = comparison;
+    conditions.push_back(std::move(condition));
+
+    test_join join(stub,
+                   duckdb::make_uniq<wide_scan>(3),
+                   duckdb::make_uniq<wide_scan>(3),
+                   std::move(conditions),
+                   duckdb::JoinType::INNER,
+                   /*left_projection_map=*/{},
+                   /*right_projection_map=*/{},
+                   /*delim_types=*/{},
+                   /*estimated_cardinality=*/1);
+    auto* lhs_scan = static_cast<wide_scan*>(join.children[0].get());
+    lhs_scan->link(&join);
+    auto const lives = analyze_column_lifetimes(*lhs_scan);
+    REQUIRE(lives[1].join_key_at.size() == 1);
+    return lives[1].join_key_at.front().bare_column_equality;
+  };
+
+  REQUIRE(is_bare_equality(sirius::comparison_type::equal, bare_ref()));
+
+  // An inequality: same two scans, same condition, no bound on the matches.
+  REQUIRE_FALSE(is_bare_equality(sirius::comparison_type::lt, bare_ref()));
+
+  // Equality, but against a COMPUTED side — `cast(x) = y` compares a value the
+  // distinctness proof was never taken over.
+  REQUIRE_FALSE(is_bare_equality(
+    sirius::comparison_type::equal,
+    std::make_unique<sirius::ast::node>(sirius::ast::cast{bare_ref(), string_type()})));
+}
+
+TEST_CASE("a bundle every column of which is only counted is planned count-only",
+          "[late_mat][lifetime]")
+{
+  // The one-half install (planner::install_count_deferral) needs the WHOLE
+  // bundle to be count-only: one column whose values are read gives the pair a
+  // far end to restore at, and it installs as a pair like any other.
+  wide_scan counted_scan(5);
+  auto counting = make_aggregate(5,
+                                 /*groups=*/{},
+                                 /*aggregate_inputs=*/{0, 1, 2, 3, 4},
+                                 cudf::aggregation::Kind::COUNT_VALID);
+  keyless_key_source keys;
+  auto chain = partition_chain(5, 3, keys);
+  link_chain(counted_scan, chain, *counting);
+
+  auto const counted = sirius::planner::plan_deferral(counted_scan);
+  REQUIRE(counted.installable());
+  REQUIRE(counted.count_only_bundle);
+
+  // One SUM among the counts, and the bundle needs its far end back.
+  wide_scan mixed_scan(5);
+  auto mixed                = make_aggregate(5,
+                              /*groups=*/{},
+                              /*aggregate_inputs=*/{0, 1, 2, 3, 4},
+                              cudf::aggregation::Kind::COUNT_VALID);
+  mixed->cudf_aggregates[4] = cudf::aggregation::Kind::SUM;
+  keyless_key_source mixed_keys;
+  auto mixed_chain = partition_chain(5, 3, mixed_keys);
+  link_chain(mixed_scan, mixed_chain, *mixed);
+
+  auto const planned_mixed = sirius::planner::plan_deferral(mixed_scan);
+  REQUIRE(planned_mixed.installable());
+  REQUIRE(planned_mixed.positions.size() == 5);
+  REQUIRE_FALSE(planned_mixed.count_only_bundle);
+}
+
 TEST_CASE("a carrier-restore cast is recorded as a site the ride passes through",
           "[late_mat][lifetime]")
 {

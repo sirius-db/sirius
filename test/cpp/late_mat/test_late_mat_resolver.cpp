@@ -226,6 +226,26 @@ TEST_CASE("a compressed chunk with no readable table is not deferred", "[late_ma
   REQUIRE_FALSE(resolve_pinned_column(pin.origin()).has_value());
 }
 
+TEST_CASE("a column whose chunks disagree on their carrier is not deferred", "[late_mat][resolver]")
+{
+  // narrow_pin_chunk() picks a carrier from each chunk's OWN exact range, so a
+  // logical BIGINT can be stored INT32 in one chunk and INT16 in the next. The
+  // resolved view carries a single dtype and the gather reads every batch at
+  // that width, so a pin whose chunks disagree has no answer to give — refusing
+  // is the only alternative to reading the later chunks at the wrong width.
+  auto const stream = rmm::cuda_stream_view{};
+  fake_entry pin({64, 32}, "l_quantity", stream);
+  REQUIRE(resolve_pinned_column(pin.origin()).has_value());
+
+  auto& chunks  = pin.entry.data_batches_by_column.at("l_quantity");
+  auto narrower = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT16}, 32, cudf::mask_state::UNALLOCATED, stream);
+  cudaStreamSynchronize(stream.value());
+  chunks[1] = std::shared_ptr<cudf::column>(std::move(narrower));
+
+  REQUIRE_FALSE(resolve_pinned_column(pin.origin()).has_value());
+}
+
 TEST_CASE("an origin materializes the rows a join asked for, end to end", "[late_mat][resolver]")
 {
   auto const stream = rmm::cuda_stream_view{};

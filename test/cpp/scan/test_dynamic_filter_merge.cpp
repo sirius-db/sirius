@@ -664,8 +664,8 @@ TEST_CASE("sirius_dynamic_bloom_filter excludes null build slots from the key se
   REQUIRE(survivors.size() >= 5);
   REQUIRE(std::vector<int64_t>(survivors.begin(), survivors.begin() + 5) ==
           std::vector<int64_t>{0, 1, 2, 3, 4});
-  // Identical behavior to the clean build — this is the deterministic assertion: before the fix
-  // the raw ingest added the null slot's payload, so 999 always survived the nullable filter.
+  // The nullable build must behave identically to the clean one: a null build slot
+  // contributes no payload, so 999 must not survive the nullable filter either.
   REQUIRE(survivors == to_host_int64(out_reference->view().column(0), stream));
 }
 

@@ -514,7 +514,13 @@ class sirius_scan_manager {
   /// \param column_storage        Chunk-major stored-column metadata as the pin driver
   ///                              recorded it; must cover every chunk and cached column. A
   ///                              recorded carrier that contradicts a stored column type throws.
-  void insert_pinned_entry(
+  /// \return The names of the columns whose data this call actually STORED. On the replace
+  ///         path that is every column; on the merge path it is only the newly added ones —
+  ///         a column already cached keeps its previous chunks and the incoming ones are
+  ///         dropped, so anything derived from this materialization (uniqueness verdicts,
+  ///         say) describes data that never entered the cache. See
+  ///         @ref attach_proven_unique_columns.
+  [[nodiscard]] std::vector<std::string> insert_pinned_entry(
     const std::string& name,
     cache_entry_info cache_info,
     std::vector<std::unique_ptr<cudf::table>> data_tables,
@@ -607,13 +613,19 @@ class sirius_scan_manager {
   /// positive here is wrong query results, not a slow query.
   ///
   /// Facts are OR-ed in and never cleared: a merge leaves the already-pinned
-  /// columns' data untouched (the merge path rejects any materialization whose
-  /// chunk boundaries differ), so a proof taken against them still holds, while
-  /// a replacing re-pin builds a fresh entry with no facts at all. Names absent
-  /// from @p unique_column_names are left as they were — absence is
+  /// columns' data untouched, so a proof taken against THAT data still holds,
+  /// while a replacing re-pin builds a fresh entry with no facts at all. Names
+  /// absent from @p unique_column_names are left as they were — absence is
   /// "unknown", so nothing is asserted by omission. A name that matches no
   /// pinned column is ignored. Throws std::invalid_argument when no entry
   /// exists for @p name.
+  ///
+  /// The caller must pass only columns whose data the accompanying insert
+  /// actually STORED (@ref insert_pinned_entry returns exactly that set). A
+  /// verdict describes the values the pin driver read; the merge path keeps an
+  /// already-cached column's earlier chunks and drops the incoming ones, so
+  /// attaching that verdict to the retained column would assert distinctness
+  /// about bytes nothing ever examined — and this flag admits a group key.
   void attach_proven_unique_columns(const std::string& name,
                                     std::span<std::string const> unique_column_names);
 

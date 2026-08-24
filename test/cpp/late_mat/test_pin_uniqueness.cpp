@@ -28,6 +28,7 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 
@@ -362,6 +363,46 @@ void pin_columns(sirius_scan_manager& manager,
     table, std::move(info), std::move(chunks), space, std::move(storage));
 }
 
+/// Pin `names` under `table` through the merge-capable GPU path (one INT32
+/// column each, one chunk of 8 rows), and report which columns the insert
+/// actually stored.
+std::vector<std::string> pin_columns_mergeable(sirius_scan_manager& manager,
+                                               cucascade::memory::memory_space& space,
+                                               std::string const& table,
+                                               std::vector<std::string> const& names,
+                                               rmm::cuda_stream_view stream)
+{
+  sirius::scan_manager::cache_entry_info info;
+  info.table_name = table;
+  info.names      = names;
+  for (std::size_t i = 0; i < names.size(); ++i) {
+    info.column_ids.emplace_back(static_cast<duckdb::idx_t>(i));
+  }
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  for (std::size_t i = 0; i < names.size(); ++i) {
+    columns.push_back(cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                                8,
+                                                cudf::mask_state::UNALLOCATED,
+                                                stream,
+                                                space.get_default_allocator()));
+  }
+  std::vector<std::unique_ptr<cudf::table>> tables;
+  tables.push_back(std::make_unique<cudf::table>(std::move(columns)));
+
+  sirius::pinned_column_storage_matrix storage{std::vector<sirius::pinned_column_storage_meta>(
+    names.size(),
+    sirius::pinned_column_storage_meta{cudf::data_type{cudf::type_id::INT32}, false})};
+
+  return manager.insert_pinned_entry(table,
+                                     std::move(info),
+                                     std::move(tables),
+                                     {&space},
+                                     duckdb::vector<duckdb::LogicalType>{},
+                                     {},
+                                     std::move(storage));
+}
+
 std::vector<bool> proven_of(sirius_scan_manager const& manager, std::string_view table)
 {
   std::vector<bool> out;
@@ -414,4 +455,39 @@ TEST_CASE("a replacing re-pin starts with no facts", "[late_mat][pin_uniqueness]
   pin_columns(manager, *space, "customer", {"c_nationkey", "c_custkey"}, stream);
   auto const after = proven_of(manager, "customer");
   REQUIRE(std::count(after.begin(), after.end(), true) == 0);
+}
+
+TEST_CASE("a merge reports only the columns it actually stored", "[late_mat][pin_uniqueness]")
+{
+  // The merge path keeps an already-cached column's chunks and DROPS the
+  // incoming ones. A uniqueness verdict describes the values the pin driver just
+  // read, so attaching it to a retained column would assert distinctness about
+  // bytes that never entered the cache — and this flag admits a group key. The
+  // insert therefore reports what it stored, and the caller filters by it.
+  rmm::cuda_stream_view const stream{};
+  auto memory   = sirius::test::operator_utils::initialize_memory_manager();
+  auto topology = single_gpu_index();
+  auto* space   = memory->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  sirius_scan_manager manager{scan_manager_config{}, *memory, topology};
+
+  // First pin stores both of its columns.
+  auto const first =
+    pin_columns_mergeable(manager, *space, "customer", {"c_custkey", "c_name"}, stream);
+  REQUIRE(first == std::vector<std::string>{"c_custkey", "c_name"});
+
+  // Same row count, one column already cached: only c_nationkey is stored, and
+  // c_custkey keeps the chunks it was pinned with.
+  auto const merged =
+    pin_columns_mergeable(manager, *space, "customer", {"c_custkey", "c_nationkey"}, stream);
+  REQUIRE(merged == std::vector<std::string>{"c_nationkey"});
+
+  // What the caller does with that: a verdict for the retained column is not
+  // attached, so the entry claims nothing about data this pin never stored.
+  std::vector<std::string> const attachable{"c_nationkey"};
+  manager.attach_proven_unique_columns("customer", attachable);
+  auto const proven = proven_of(manager, "customer");
+  REQUIRE(proven.size() == 3u);
+  REQUIRE(proven[0] == false);  // c_custkey — retained, and unclaimed
+  REQUIRE(proven[1] == false);  // c_name
+  REQUIRE(proven[2] == true);   // c_nationkey — newly stored
 }

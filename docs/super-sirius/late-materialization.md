@@ -161,8 +161,13 @@ deferral with a single half, admitted only over pinned columns with no nulls. Of
   materializer does not do yet.
 - A nullable PINNED SOURCE column is admitted for any uncompressed origin (single-batch,
   multi-batch fixed-width, or multi-batch variable-width — every such gather path propagates
-  validity). Only a compressed origin is still refused if it has any nulls: the decode routes
-  write values only, with no output validity buffer at all.
+  validity). A compressed origin is refused UNCONDITIONALLY, whether or not it actually has any
+  nulls: per-column nullability inside a Simpatico-compressed blob is opaque (see
+  [Compressed Materialization](compressed-materialization.md)), so nothing upstream of the
+  install-time gate can tell "no nulls" apart from "unknown," and the gate treats both as unsafe.
+  `materialize_compressed`'s decode routes in `materialize.cpp` do write values only, with no
+  output validity buffer — but that is a secondary reason and moot in practice, since a compressed
+  origin never reaches them today.
 - A compressed origin cannot skip its decode — the scan substitutes on the FINISHED output, so a
   deferred column from a compressed pin is decompressed and then discarded.
 - Filtered scans of compressed pins are refused (above).

@@ -53,6 +53,19 @@ bool reads_column(ast::node const& expr, std::size_t pos)
   return found;
 }
 
+/// Whether @p condition is a plain `lhs_column = rhs_column`.
+///
+/// The rider proof turns "these two scans meet in this condition" into "at most
+/// one rider row per primary row", and only this shape supports that step. An
+/// inequality matches many rows on a distinct side; a computed side is a
+/// different value than the one proven distinct.
+bool is_bare_column_equality(sirius::join_condition const& condition)
+{
+  return condition.comparison == sirius::comparison_type::equal && condition.left &&
+         condition.right && condition.left->holds<ast::reference>() &&
+         condition.right->holds<ast::reference>();
+}
+
 /// What one operator does to a column arriving from `from` at input position
 /// `in_pos`.
 struct step {
@@ -78,7 +91,11 @@ struct step {
   /// The join conditions that compared this column, when the reader is a join.
   /// Empty at a partition, which hashes a key the join above it will compare —
   /// the walk records the role where the comparison actually is.
-  std::vector<std::size_t> compared_in;
+  struct compared_condition {
+    std::size_t index  = 0;
+    bool bare_equality = false;
+  };
+  std::vector<compared_condition> compared_in;
   /// Which side of the join the column arrived on; only meaningful with
   /// compared_in. Two scans meeting on opposite sides of ONE condition is what
   /// determines a rider's row from the ride's.
@@ -244,10 +261,12 @@ step trace_through(sirius_physical_operator const& node,
       // A key is read: the join compares its values. The conditions' left
       // nodes address the lhs and their right nodes the rhs, so only this
       // side's half is consulted.
-      std::vector<std::size_t> compared_in;
+      std::vector<step::compared_condition> compared_in;
       for (std::size_t c = 0; c < join.conditions.size(); ++c) {
         auto const& side = from_lhs ? join.conditions[c].left : join.conditions[c].right;
-        if (side && reads_column(*side, in_pos)) { compared_in.push_back(c); }
+        if (side && reads_column(*side, in_pos)) {
+          compared_in.push_back({c, is_bare_column_equality(join.conditions[c])});
+        }
       }
 
       std::vector<int> const lhs(join.lhs_output_columns.col_idxs.begin(),
@@ -585,8 +604,9 @@ std::vector<column_lifetime> analyze_column_lifetimes(sirius_physical_operator c
       if (moved.carrier_restore_at.has_value()) {
         life.carrier_restores.push_back(carrier_restore_site{node, *moved.carrier_restore_at});
       }
-      for (auto const condition : moved.compared_in) {
-        life.join_key_at.push_back(join_key_role{node, condition, moved.from_lhs});
+      for (auto const& condition : moved.compared_in) {
+        life.join_key_at.push_back(
+          join_key_role{node, condition.index, moved.from_lhs, condition.bare_equality});
       }
 
       // A group-by reads its keys, so a key read stops a plain ride exactly
@@ -827,6 +847,13 @@ planned_deferral plan_deferral(sirius_physical_operator& scan, late_mat::defer_p
   planned.port_input         = lifetimes[planned.positions.front()].reader_input;
   planned.fanned_out_at_port = lifetimes[planned.positions.front()].fanned_out_at_reader;
   planned.group_extension    = plan_group_key_extension(lifetimes, planned.positions);
+  // The one-half install needs EVERY column of the bundle to be count-only: a
+  // single column whose values are read has a far end to restore at, and the
+  // bundle installs as a pair like any other.
+  planned.count_only_bundle =
+    std::all_of(planned.positions.begin(), planned.positions.end(), [&](std::size_t position) {
+      return lifetimes[position].consumed_as_count_only;
+    });
   return planned;
 }
 

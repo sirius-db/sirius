@@ -1064,6 +1064,13 @@ struct installed_ride {
 /// Same condition, opposite sides: a multi-condition join where the two scans
 /// meet in DIFFERENT conditions says nothing about how many rider rows a group
 /// sees.
+///
+/// And the condition itself must be a plain `column = column`. Distinctness of
+/// the rider's side bounds the matches at ONE only under equality between the
+/// values themselves: `A.x < B.unique_id` matches many rider rows however
+/// distinct `unique_id` is, and `A.x = B.unique_id + 1` compares a value the
+/// proof never covered. Either would split a group across several rider rowids
+/// and corrupt the aggregate.
 [[nodiscard]] std::optional<std::string> rider_determined_by_ride(
   op::scan::sirius_gpu_scan_operator const& rider_scan,
   pinned_entry const& rider_entry,
@@ -1087,6 +1094,9 @@ struct installed_ride {
           if (primary_role.join != rider_role.join) { continue; }
           if (primary_role.condition != rider_role.condition) { continue; }
           if (primary_role.from_lhs == rider_role.from_lhs) { continue; }
+          // Both sides observe the same condition, so either flag answers for
+          // it; requiring both is the cheap way to not depend on that.
+          if (!rider_role.bare_column_equality || !primary_role.bare_column_equality) { continue; }
           return entry_position < rider_entry.cache_info.names.size()
                    ? rider_entry.cache_info.names[entry_position]
                    : ("entry column " + std::to_string(entry_position));
@@ -1934,7 +1944,7 @@ std::vector<std::size_t> cache_entry_info::column_projection_for(
   return column_superset_projection(column_ids, requested_ids);
 }
 
-void sirius_scan_manager::insert_pinned_entry(
+std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
   const std::string& name,
   cache_entry_info cache_info,
   std::vector<std::unique_ptr<cudf::table>> data_tables,
@@ -2153,7 +2163,15 @@ void sirius_scan_manager::insert_pinned_entry(
         entry.late_mat_handle->bump_generation(
           _next_pin_generation.fetch_add(1, std::memory_order_relaxed));
       }
-      return;
+      // Only the appended columns hold data from THIS materialization; the rest
+      // kept the chunks they were already cached with.
+      std::vector<std::string> stored;
+      for (std::size_t i = 0; i < is_new_col.size(); ++i) {
+        if (is_new_col[i] && entry.data_batches_by_column.contains(column_names[i])) {
+          stored.push_back(column_names[i]);
+        }
+      }
+      return stored;
     }
     // Row count or completeness contract differs → drop the stale entry and rebuild below.
     retire_late_mat_handle(name);
@@ -2188,6 +2206,8 @@ void sirius_scan_manager::insert_pinned_entry(
   retire_late_mat_handle(name);
   _pinned_entries[name] = std::move(entry);
   publish_late_mat_handle(name);
+  // The replace path stored every column.
+  return column_names;
 }
 
 namespace {
