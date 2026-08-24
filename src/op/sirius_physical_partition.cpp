@@ -23,6 +23,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression/ast/to_duckdb.hpp"
 #include "log/logging.hpp"
+#include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
@@ -184,6 +185,23 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
   auto const& input_batch_ro = input_batches[0];
   auto* space                = input_batch_ro.get_memory_space();
 
+  // Contribute before scatter so each snapshot ID covers its original batch; retries deduplicate.
+  if (_is_build && !_broadcast && _num_partitions.value() > 1 &&
+      _partition_type == PartitionType::HASH) {
+    auto* hash_join = dynamic_cast<sirius_physical_hash_join*>(_downstream_consumer_op);
+    if (hash_join != nullptr && hash_join->wants_multi_partition_dynamic_filters()) {
+      if (auto const task_input_batch_id = input.task_input_batch_id()) {
+        // Preparation may replace the physical batch with a fresh-ID cross-GPU clone.
+        hash_join->contribute_dynamic_filter_build_batch(
+          *task_input_batch_id, get_cudf_table_view(input_batch_ro), stream);
+      } else {
+        // Exact-ID dedup needs the task identity; without it accumulation is unsound.
+        hash_join->abort_multi_partition_dynamic_filters(
+          "a build contribution arrived without its task identity");
+      }
+    }
+  }
+
   // Broadcast mode never hash-partitions: the build side replicates its (small) batch to every
   // slot and the probe side streams through unpartitioned. In both cases execute() just forwards
   // the input batches; the fan-out to slots happens in sink().
@@ -302,17 +320,58 @@ uint64_t sirius_physical_partition::compute_total_bytes()
       "sirius_physical_partition::compute_total_bytes() did not find default repo for id " +
       std::to_string(this->get_operator_id()));
   }
-  auto& repo           = ports.at("default")->repo;
-  auto batch_ids       = repo->get_batch_ids(0);
+  auto& repo = ports.at("default")->repo;
+  if (!repo) {
+    throw std::runtime_error(
+      "sirius_physical_partition::compute_total_bytes() found a null default repo for id " +
+      std::to_string(this->get_operator_id()));
+  }
+
   uint64_t total_bytes = 0;
-  for (auto batch_id : batch_ids) {
+  for (auto const batch_id : repo->get_batch_ids(0)) {
     auto batch = repo->get_data_batch_by_id(batch_id, 0);
-    if (batch) {
-      auto ro = batch->to_read_only();
-      if (ro.get_data()) { total_bytes += ro.get_data()->get_size_in_bytes(); }
-    }
+    if (!batch) { continue; }
+    auto ro          = batch->to_read_only();
+    auto const* data = ro.get_data();
+    if (data != nullptr) { total_bytes += data->get_size_in_bytes(); }
   }
   return total_bytes;
+}
+
+std::optional<complete_build_snapshot> sirius_physical_partition::try_freeze_complete_build(
+  std::size_t partition_count)
+{
+  auto const port_it = ports.find("default");
+  if (port_it == ports.end()) {
+    throw std::runtime_error(
+      "sirius_physical_partition::try_freeze_complete_build() did not find default repo for id " +
+      std::to_string(this->get_operator_id()));
+  }
+  auto const& port = port_it->second;
+  if (!port->repo) {
+    throw std::runtime_error(
+      "sirius_physical_partition::try_freeze_complete_build() found a null default repo for id " +
+      std::to_string(this->get_operator_id()));
+  }
+  if (port->type != MemoryBarrierType::FULL || port->src_pipeline == nullptr ||
+      !port->src_pipeline->is_pipeline_finished()) {
+    return std::nullopt;
+  }
+
+  auto const batch_ids = port->repo->get_batch_ids(0);
+  std::vector<detail::complete_build_batch_summary> batches;
+  batches.reserve(batch_ids.size());
+  for (auto const batch_id : batch_ids) {
+    auto batch = port->repo->get_data_batch_by_id(batch_id, 0);
+    if (!batch) { return std::nullopt; }
+    auto const read_only = batch->to_read_only();
+    auto const* gpu =
+      dynamic_cast<cucascade::gpu_table_representation const*>(read_only.get_data());
+    if (gpu == nullptr || gpu->get_table_view().num_rows() < 0) { return std::nullopt; }
+    batches.push_back(
+      {.batch_id = batch_id, .rows = static_cast<std::uint64_t>(gpu->get_table_view().num_rows())});
+  }
+  return detail::try_summarize_complete_build(batches, partition_count);
 }
 
 void sirius_physical_partition::set_num_partitions(int num_partitions)
@@ -422,13 +481,14 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
     std::scoped_lock guard(lock, sibling.lock);
     if (!_num_partitions.has_value()) {
       auto& sizing_partition = _drives_partition_count ? *this : sibling;
+      auto* hash_join        = dynamic_cast<sirius_physical_hash_join*>(consumer);
       partition_sizing_input const in{sizing_partition.compute_total_bytes(),
                                       sizing_partition._is_build,
                                       has_build_concat(*this) || has_build_concat(sibling)};
+
       // The consumer owns the decision: it computes the count / broadcast flag, updates its own
       // execution state (e.g. hash-join BUILD_PROBE mode), and pre-sizes its own input repos.
       auto const strategy      = consumer->get_partition_strategy(in);
-      auto* hash_join          = dynamic_cast<sirius_physical_hash_join*>(consumer);
       bool build_arrives_whole = false;
       if (strategy.build_probe) {
         // Configure both siblings' build-side CONCAT (do not short-circuit) and require that at
@@ -483,6 +543,42 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
                        this->get_operator_id(),
                        strategy.num_partitions);
     }
+  }
+
+  if (_is_build && _partition_type == PartitionType::HASH) {
+    auto* hash_join = dynamic_cast<sirius_physical_hash_join*>(consumer);
+    if (hash_join != nullptr && hash_join->wants_multi_partition_dynamic_filters()) {
+      // The snapshot-attempt latch, freeze, and arm share one critical section:
+      // every popping thread traverses it and observes the attempt latched before reaching the
+      // unlocked tail pop below, which is what keeps the snapshot freeze-before-pop exact.
+      std::lock_guard<std::mutex> guard(lock);
+      if (_num_partitions.has_value() && *_num_partitions > 1 && !_broadcast &&
+          !_dynamic_filter_snapshot_attempted) {
+        auto const port_it      = ports.find("default");
+        auto const* port        = port_it != ports.end() ? port_it->second : nullptr;
+        bool const full_barrier = port != nullptr && port->type == MemoryBarrierType::FULL;
+        if (full_barrier && port->src_pipeline != nullptr &&
+            !port->src_pipeline->is_pipeline_finished()) {
+          // A FULL input barrier is what makes "no pop yet" mean "the repository holds the
+          // complete build"; wait for the source pipeline rather than consuming the one freeze
+          // attempt early.
+          return nullptr;
+        }
+
+        _dynamic_filter_snapshot_attempted = true;
+        auto snapshot                      = full_barrier
+                                               ? try_freeze_complete_build(static_cast<std::size_t>(*_num_partitions))
+                                               : std::nullopt;
+        if (snapshot) {
+          static_cast<void>(hash_join->arm_multi_partition_dynamic_filters(std::move(*snapshot)));
+        } else {
+          SIRIUS_LOG_WARN(
+            "sirius_physical_partition id {} could not freeze an exact build snapshot; global "
+            "dynamic Bloom publication is disabled for this join.",
+            this->get_operator_id());
+        }
+      }
+    }  // Release the snapshot lock before the ordinary tail pop.
   }
   return sirius_physical_operator::get_next_task_input_data();
 }

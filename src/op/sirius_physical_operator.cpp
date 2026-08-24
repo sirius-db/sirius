@@ -37,6 +37,37 @@ namespace op {
 // operator_data
 //===--------------------------------------------------------------------===//
 
+pipelineable_operator_data::pipelineable_operator_data()
+  : _data_batches(std::vector<std::shared_ptr<::cucascade::data_batch>>{})
+{
+}
+
+pipelineable_operator_data::pipelineable_operator_data(
+  std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
+  : _data_batches(std::move(data_batches))
+{
+  if (_data_batches->size() == 1 && _data_batches->front()) {
+    _task_input_batch_id = _data_batches->front()->get_batch_id();
+  }
+}
+
+pipelineable_operator_data::pipelineable_operator_data(
+  std::vector<::cucascade::read_only_data_batch> read_only_data_batches)
+  : _read_only_data_batches(std::move(read_only_data_batches))
+{
+  // Deliberately unguarded, unlike the shared_ptr overload above: a null shared_ptr element is a
+  // representable, tolerated state, while a moved-from accessor violates this constructor's
+  // documented precondition (the accessor type exposes no validity predicate to check).
+  if (_read_only_data_batches->size() == 1) {
+    _task_input_batch_id = _read_only_data_batches->front().get_batch_id();
+  }
+}
+
+std::optional<std::uint64_t> pipelineable_operator_data::task_input_batch_id() const noexcept
+{
+  return _task_input_batch_id;
+}
+
 const std::vector<std::shared_ptr<::cucascade::data_batch>>&
 pipelineable_operator_data::get_data_batches() const
 {

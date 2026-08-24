@@ -284,6 +284,9 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
       "remove this key");
   }
   r.optional("enable_dynamic_filter", opt.enable_dynamic_filter);
+  r.optional("enable_dynamic_filter_multi_partition", opt.enable_dynamic_filter_multi_partition);
+  r.optional("max_dynamic_filter_bloom_bytes_per_gpu",
+             yaml::bytes(opt.max_dynamic_filter_bloom_bytes_per_gpu));
   r.optional("enable_dynamic_zone_map_filter", opt.enable_dynamic_zone_map_filter);
   r.optional("dynamic_filter_domain_coverage_threshold",
              opt.dynamic_filter_domain_coverage_threshold,

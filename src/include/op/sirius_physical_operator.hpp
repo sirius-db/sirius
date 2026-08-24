@@ -31,6 +31,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <limits>
 #include <list>
 #include <memory>
@@ -229,25 +230,24 @@ class operator_data {
  *   - get_data_batches() populates _data_batches from _read_only_data_batches if needed
  *   - get_read_only_batches() populates _read_only_data_batches from _data_batches if needed
  *
- * prepare_for_processing() locks idle batches and stores the result in
- * _read_only_data_batches. remove_read_only_lock() releases all shared locks.
+ * prepare_for_processing() locks idle batches and stores the result in _read_only_data_batches.
+ * remove_read_only_lock() releases all shared locks. A payload constructed with exactly one
+ * non-null batch captures that batch's task-input ID, which remains unchanged when preparation
+ * replaces the physical batch with a clone.
  */
 class pipelineable_operator_data : public operator_data {
  public:
-  pipelineable_operator_data()
-  {
-    _data_batches = std::vector<std::shared_ptr<::cucascade::data_batch>>();
-  }
+  pipelineable_operator_data();
   explicit pipelineable_operator_data(
-    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
-    : _data_batches(std::move(data_batches))
-  {
-  }
+    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches);
+  /**
+   * @brief Constructs a payload over already-locked read-only batch accessors
+   *
+   * @pre Every accessor in @p read_only_data_batches is live (not moved-from);
+   * `read_only_data_batch` exposes no validity predicate, so this cannot be checked here.
+   */
   explicit pipelineable_operator_data(
-    std::vector<::cucascade::read_only_data_batch> read_only_data_batches)
-    : _read_only_data_batches(std::move(read_only_data_batches))
-  {
-  }
+    std::vector<::cucascade::read_only_data_batch> read_only_data_batches);
 
   [[nodiscard]] operator_data_type get_type() const override
   {
@@ -267,6 +267,14 @@ class pipelineable_operator_data : public operator_data {
     bool leave_locked = false) const;
 
   /**
+   * @brief Get the immutable task-input ID
+   *
+   * @return Captured ID for a payload constructed with exactly one non-null batch; std::nullopt
+   * otherwise
+   */
+  [[nodiscard]] std::optional<std::uint64_t> task_input_batch_id() const noexcept;
+
+  /**
    * @brief Release all read-only locks by resetting _read_only_data_batches.
    */
   void remove_read_only_lock()
@@ -284,6 +292,14 @@ class pipelineable_operator_data : public operator_data {
    * Iterates over all idle batches and locks (or converts then locks) each one,
    * storing the results in _read_only_data_batches. Throws sirius::internal_exception
    * if any batch pointer is null or any batch fails to lock. Propagates rmm::out_of_memory.
+   * Cross-GPU preparation may replace an input with a clone. Subsequent batch access returns the
+   * prepared clone, while any task-input ID captured at construction remains unchanged.
+   * For a GPU target, the caller must make that device current and pass a stream owned by the
+   * same device; gpu_pipeline_executor supplies this pairing from its device-bound stream pool
+   * and reservation space.
+   *
+   * @param requested_memory_space Target space for every prepared input batch.
+   * @param stream Device-affine execution stream; must belong to a GPU target when one is given.
    */
   void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
                               rmm::cuda_stream_view stream) override;
@@ -318,6 +334,7 @@ class pipelineable_operator_data : public operator_data {
  private:
   mutable std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> _data_batches;
   mutable std::optional<std::vector<::cucascade::read_only_data_batch>> _read_only_data_batches;
+  std::optional<std::uint64_t> _task_input_batch_id;
 };
 
 /**

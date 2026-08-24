@@ -280,7 +280,9 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
 /**
  * @brief Probabilistic membership filter with no false negatives
  *
- * False positives pass extra rows to the authoritative join.
+ * False positives pass extra rows to the authoritative join. Each replica retains its construction
+ * stream and memory resource for deallocation; the source resource is also used by later
+ * insertions. These dependencies must outlive the filter.
  */
 class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
                                           public sirius_mask_applicable,
@@ -295,6 +297,21 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
    * @throw std::logic_error if the validated key type changes during construction
    */
   sirius_dynamic_bloom_filter(cudf::column_view const& keys,
+                              rmm::cuda_stream_view stream,
+                              rmm::device_async_resource_ref mr);
+
+  /**
+   * @brief Constructs an empty Bloom filter sized for @p expected_num_keys
+   *
+   * Initialization is enqueued on @p stream; work submitted on another stream must wait for it.
+   *
+   * @throw std::invalid_argument if @p key_type is not INT32 or INT64
+   * @throw std::length_error if the aligned bit-array footprint is not representable
+   * @throw std::runtime_error if the current CUDA device cannot be identified
+   * @throw std::logic_error if the validated key type changes during construction
+   */
+  sirius_dynamic_bloom_filter(cudf::data_type key_type,
+                              std::size_t expected_num_keys,
                               rmm::cuda_stream_view stream,
                               rmm::device_async_resource_ref mr);
   ~sirius_dynamic_bloom_filter() override;
@@ -314,10 +331,58 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
     rmm::device_async_resource_ref mr) const override;
 
   void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
+
+  /**
+   * @brief Replicates to every supplied device
+   *
+   * Successful replicas remain installed if a later requested replica is unavailable.
+   *
+   * @throw std::runtime_error if any requested replica is unavailable
+   */
+  void replicate_to_devices_strict(std::span<dynamic_filter_replica_space const> spaces);
+
+  /**
+   * @brief Enqueues another build-key batch into the source replica, excluding nulls
+   *
+   * @pre The filter has not been replicated or published; this operation updates only its source
+   * replica
+   * @pre The current device and @p keys type match the source replica, and key storage remains
+   * valid until @p stream completes
+   * @throw std::invalid_argument if @p keys is unsupported or differs from the construction type
+   * @throw std::logic_error if the current device is not the source device or its replica is absent
+   */
+  void add(cudf::column_view const& keys, rmm::cuda_stream_view stream);
+
+  /**
+   * @brief Enqueues an OR of @p source into this filter's source replica
+   *
+   * @pre All writes to @p source are complete; prior writes to this filter are complete or ordered
+   * before the merge on @p root_stream
+   * @pre This filter has not been replicated or published; only its source replica is updated
+   * @pre Both filters have equal geometry, match their device spaces, and remain alive until
+   * @p root_stream completes
+   * @pre @p root_stream belongs to @p root_space; calls on the same destination are stream-ordered
+   * or externally synchronized
+   * @throw std::logic_error if the filters, geometry, or device spaces do not match
+   * @throw std::runtime_error if an OR kernel cannot be launched
+   */
+  void merge_from(sirius_dynamic_bloom_filter const& source,
+                  dynamic_filter_replica_space const& source_space,
+                  dynamic_filter_replica_space const& root_space,
+                  rmm::cuda_stream_view root_stream);
+
+  /**
+   * @brief Releases reduction scratch
+   *
+   * @pre All work enqueued by `merge_from()` has completed
+   */
+  void release_reduction_scratch();
+
   [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;
 
   [[nodiscard]] std::size_t replica_count() const noexcept;
   [[nodiscard]] static bool supports(cudf::data_type t) noexcept;
+  // Allocator-aligned bit-array footprint; overflow saturates at SIZE_MAX.
   [[nodiscard]] static std::size_t estimated_bytes(std::size_t num_keys) noexcept;
 
  private:

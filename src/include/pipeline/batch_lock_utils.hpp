@@ -59,10 +59,16 @@ namespace pipeline {
  * @param batch                   The batch to lock/prepare.
  * @param requested_memory_space  Target memory space; may be nullptr to use the batch's current
  *                                space.
- * @param stream                  CUDA stream used for any data-movement kernels.
+ * @param stream                  CUDA stream used for any data-movement kernels. When the target
+ *                                tier is GPU, the caller must make that GPU current and the stream
+ *                                must belong to it. The per-GPU executor enforces this by pairing
+ *                                its device-bound stream pool with reservations from the same
+ *                                memory space; direct callers and tests must preserve that pairing.
  * @return A read_only_data_batch holding the shared lock (on the clone for cross-GPU inputs),
  *         or std::nullopt on failure.
  * @throws rmm::out_of_memory  If a GPU memory allocation fails during the conversion or clone.
+ * @throws cucascade::logic_error If an idle target-GPU batch is paired with a stream from a
+ *                                different CUDA device during the opportunistic stream rebind.
  */
 inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
   const std::shared_ptr<cucascade::data_batch>& batch,
@@ -76,10 +82,12 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
   // when the task later frees the data the free lands on the active stream's free list rather
   // than on the stream the data was produced on. We use try_to_mutable() so we never block --
   // if another reader holds the batch (e.g. a probe task on another GPU sharing a build batch)
-  // or it is otherwise busy, we simply skip the rebind; correctness is unaffected. Gating on a
-  // space match guarantees the stream and the data live on the same device (important for
-  // multi-GPU). The mismatch case below converts via `stream`, which already allocates the new
-  // table on it, so no rebind is needed there.
+  // or it is otherwise busy, we simply skip the rebind; correctness is unaffected. The caller's
+  // target-stream contract above, combined with the space-match gate, guarantees the stream and
+  // data live on the same device (important for multi-GPU). cuCascade rejects a foreign-device
+  // stream before rebinding because placing the table's frees on that stream would corrupt RMM's
+  // per-device free lists. Mismatch paths allocate on a target-device stream, supplied either by
+  // the caller or the target memory space's pool, so this same-space rebind is not needed there.
   if (auto mut = batch->try_to_mutable()) {
     const auto* current_space = mut->get_memory_space();
     const auto* rebind_target =

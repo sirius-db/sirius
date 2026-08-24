@@ -52,7 +52,6 @@
 #include "sirius/exception.hpp"
 
 #include <rmm/cuda_device.hpp>
-#include <rmm/error.hpp>
 
 #include <cuda_runtime_api.h>
 #include <nvtx3/nvtx3.hpp>
@@ -338,14 +337,17 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   dynamic_filter_publish_plan dynamic_filter_plan,
   uint64_t hash_partition_bytes,
   uint64_t max_broadcast_join_size,
-  dynamic_filter_stats* dynamic_filter_stats_sink)
+  dynamic_filter_stats* dynamic_filter_stats_sink,
+  bool enable_dynamic_filter_multi_partition)
   : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::HASH_JOIN,
                                                 sirius::from_duckdb_vec(op.types),
                                                 estimated_cardinality),
     conditions(std::move(cond)),
     join_type(join_type),
     delim_types(std::move(delim_types)),
-    _dynamic_filter_plan(std::move(dynamic_filter_plan))
+    _dynamic_filter_plan(std::move(dynamic_filter_plan)),
+    _dynamic_filter_publication_session(
+      _dynamic_filter_plan, dynamic_filter_stats_sink, enable_dynamic_filter_multi_partition)
 {
   // Backstop for the planner's screen: throwing here still lands in plan generation, which falls
   // back to CPU, rather than aborting the query from execute().
@@ -398,11 +400,6 @@ sirius_physical_hash_join::sirius_physical_hash_join(
       }
     }
     if (saw_null_safe && !saw_plain_equal) { compare_nulls_ = cudf::null_equality::EQUAL; }
-  }
-
-  _dynamic_filter_stats = dynamic_filter_stats_sink;
-  if (_dynamic_filter_stats != nullptr && _dynamic_filter_plan.enabled()) {
-    _dynamic_filter_stats->producers_enabled.fetch_add(1, std::memory_order_relaxed);
   }
 
   children.push_back(std::move(left));
@@ -912,7 +909,28 @@ bool sirius_physical_hash_join::is_build_probe_mode()
 bool sirius_physical_hash_join::publishes_dynamic_filters() const
 {
   // Replica restriction completes before execution; the plan is immutable afterward.
-  return _dynamic_filter_plan.enabled();
+  return _dynamic_filter_publication_session.enabled();
+}
+
+bool sirius_physical_hash_join::arm_multi_partition_dynamic_filters(
+  complete_build_snapshot snapshot)
+{
+  if (!wants_multi_partition_dynamic_filters()) { return false; }
+
+  std::scoped_lock lock(op_state_mutex);
+  return !_broadcast && _dynamic_filter_publication_session.try_arm(std::move(snapshot));
+}
+
+void sirius_physical_hash_join::contribute_dynamic_filter_build_batch(
+  uint64_t batch_id, cudf::table_view const& build_view, rmm::cuda_stream_view stream)
+{
+  _dynamic_filter_publication_session.contribute(get_operator_id(), batch_id, build_view, stream);
+}
+
+void sirius_physical_hash_join::abort_multi_partition_dynamic_filters(
+  std::string_view reason) noexcept
+{
+  _dynamic_filter_publication_session.abort_accumulation(reason);
 }
 
 void sirius_physical_hash_join::set_build_arrives_whole(bool arrives_whole)
@@ -1121,9 +1139,9 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     return std::make_unique<partitioned_operator_data>(std::move(input_batch), partition_tag(p));
   }
 
-  // No SCHEDULING slot and no BUILT slot with probe data. This happens when a hint's READY raced
-  // ahead of another task draining the same probe data; there is simply nothing to issue now.
-  SIRIUS_LOG_WARN(
+  // A stale READY can race another task that drains the same build/probe input. This is a benign
+  // scheduling miss: there is no task to issue and no correctness failure to report.
+  SIRIUS_LOG_DEBUG(
     "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: no schedulable "
     "partition (build/probe already drained) in operator {}",
     this->get_operator_id());
@@ -2111,68 +2129,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
 void sirius_physical_hash_join::publish_dynamic_filters(cudf::table_view const& build_view,
                                                         rmm::cuda_stream_view stream)
 {
-  // The delivery hook owns the PUBLISHING claim until this function sets a terminal state.
-  D_ASSERT(_dynamic_filter_publication_state.load(std::memory_order_acquire) ==
-           dynamic_filter_publication_state::PUBLISHING);
-
-  try {
-    if (_dynamic_filter_plan.enabled()) {
-      auto const outcome =
-        sirius::op::publish_dynamic_filters(_dynamic_filter_plan, build_view, stream);
-      SIRIUS_LOG_DEBUG(
-        "[sirius_physical_hash_join] dynamic-filter publication: {} key(s) considered, {} skipped "
-        "(domain gate), {} skipped (type mismatch), {} membership + {} zone-map built, {} "
-        "filter(s) "
-        "pushed across {} active target(s).",
-        outcome.keys_considered,
-        outcome.keys_skipped_domain_gate,
-        outcome.keys_skipped_type_mismatch,
-        outcome.membership_filters_built,
-        outcome.zone_map_filters_built,
-        outcome.filters_pushed,
-        outcome.active_targets);
-      if (_dynamic_filter_stats != nullptr) {
-        auto& stats        = *_dynamic_filter_stats;
-        auto const relaxed = std::memory_order_relaxed;
-        stats.keys_considered.fetch_add(outcome.keys_considered, relaxed);
-        stats.keys_with_known_domain.fetch_add(outcome.keys_with_known_domain, relaxed);
-        stats.keys_skipped_domain_gate.fetch_add(outcome.keys_skipped_domain_gate, relaxed);
-        stats.keys_skipped_type_mismatch.fetch_add(outcome.keys_skipped_type_mismatch, relaxed);
-        stats.keys_build_exceeded_domain.fetch_add(outcome.keys_build_exceeded_domain, relaxed);
-        stats.membership_filters_built.fetch_add(outcome.membership_filters_built, relaxed);
-        stats.zone_map_filters_built.fetch_add(outcome.zone_map_filters_built, relaxed);
-        stats.publications_skipped_targets_drained.fetch_add(outcome.skipped_targets_drained,
-                                                             relaxed);
-        stats.filters_pushed.fetch_add(outcome.filters_pushed, relaxed);
-      }
-    }
-    _dynamic_filter_publication_state.store(dynamic_filter_publication_state::FINISHED,
-                                            std::memory_order_release);
-    if (_dynamic_filter_stats != nullptr) {
-      _dynamic_filter_stats->publications_finished.fetch_add(1, std::memory_order_relaxed);
-    }
-  } catch (rmm::out_of_memory const& oom) {
-    // Dynamic filters are optional; device OOM fails publication without failing the query.
-    // FAILED, not reopen: retrying a sibling delivery under the same memory pressure is the
-    // storm this catch exists to avoid (the no-usable-source skip path reopens instead).
-    _dynamic_filter_publication_state.store(dynamic_filter_publication_state::FAILED,
-                                            std::memory_order_release);
-    if (_dynamic_filter_stats != nullptr) {
-      _dynamic_filter_stats->publications_failed.fetch_add(1, std::memory_order_relaxed);
-    }
-    SIRIUS_LOG_WARN(
-      "[sirius_physical_hash_join] dynamic-filter publication (id={}) hit device memory "
-      "exhaustion; continuing without filters: {}",
-      get_operator_id(),
-      oom.what());
-  } catch (...) {
-    _dynamic_filter_publication_state.store(dynamic_filter_publication_state::FAILED,
-                                            std::memory_order_release);
-    if (_dynamic_filter_stats != nullptr) {
-      _dynamic_filter_stats->publications_failed.fetch_add(1, std::memory_order_relaxed);
-    }
-    throw;
-  }
+  _dynamic_filter_publication_session.publish_one_shot(build_view, stream);
 }
 
 void sirius_physical_hash_join::push_data_batch_partitioned(
@@ -2187,22 +2144,16 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
     HASH_JOIN_MODE mode     = HASH_JOIN_MODE::STANDARD;
     {
       std::scoped_lock lg(op_state_mutex);
-      const bool open = _dynamic_filter_publication_state.load(std::memory_order_acquire) ==
-                        dynamic_filter_publication_state::OPEN;
-      const bool wired = _dynamic_filter_plan.enabled();
-      claimed          = open && wired && _build_arrives_whole;
-      // Claim under the mutex that closes OPEN, preventing finalization from racing publication.
-      if (claimed) {
-        _dynamic_filter_publication_state.store(dynamic_filter_publication_state::PUBLISHING,
-                                                std::memory_order_release);
-      }
-
-      wired_but_unusable = open && wired && !claimed && !_build_not_whole_reported;
+      auto const wired = _dynamic_filter_publication_session.enabled();
+      // Claim before routing: routing below can finish the build pipeline and run
+      // on_finalize_operator, and finalization must never close a window this delivery already
+      // owns. The session CAS makes claim-vs-finalize atomic.
+      claimed =
+        wired && _build_arrives_whole && _dynamic_filter_publication_session.try_claim_one_shot();
+      wired_but_unusable = wired && !claimed && !_build_not_whole_reported &&
+                           _dynamic_filter_publication_session.is_open();
       if (wired_but_unusable) { _build_not_whole_reported = true; }
       mode = _join_mode;
-    }
-    if (claimed && _dynamic_filter_stats != nullptr) {
-      _dynamic_filter_stats->publication_attempts.fetch_add(1, std::memory_order_relaxed);
     }
     if (wired_but_unusable) {
       SIRIUS_LOG_DEBUG(
@@ -2217,10 +2168,7 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
         mode == HASH_JOIN_MODE::BUILD_PROBE  ? "BUILD_PROBE"
         : mode == HASH_JOIN_MODE::MIXED_JOIN ? "MIXED_JOIN"
                                              : "STANDARD");
-      if (_dynamic_filter_stats != nullptr) {
-        _dynamic_filter_stats->publications_skipped_build_not_whole.fetch_add(
-          1, std::memory_order_relaxed);
-      }
+      _dynamic_filter_publication_session.record_build_not_whole();
     }
   }
 
@@ -2243,10 +2191,11 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
     bool const source_usable =
       gpu_resident && _dynamic_filter_plan.has_replica_on_device(ms->get_device_id());
     if (!source_usable) {
-      if (_dynamic_filter_stats != nullptr) {
-        _dynamic_filter_stats->publications_skipped_source_not_resident.fetch_add(
-          1, std::memory_order_relaxed);
-      }
+      // Release the claim so a sibling broadcast delivery can publish, then record the skip. A
+      // sibling claiming between the two calls suppresses the skip counter once; the gate is
+      // accepted as-is because the skip counter is diagnostic, not an accounting identity.
+      _dynamic_filter_publication_session.reopen_from_claim();
+      _dynamic_filter_publication_session.record_source_not_resident();
       if (gpu_resident) {
         SIRIUS_LOG_DEBUG(
           "[sirius_physical_hash_join] dynamic-filter publication (id={}) skipped: the "
@@ -2260,10 +2209,6 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
           "whole-build batch is not GPU-resident.",
           get_operator_id());
       }
-      // Reopen for another broadcast delivery; OPEN transitions share op_state_mutex.
-      std::scoped_lock lg(op_state_mutex);
-      _dynamic_filter_publication_state.store(dynamic_filter_publication_state::OPEN,
-                                              std::memory_order_release);
       return;
     }
 
@@ -2289,35 +2234,19 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
     }
     publish_dynamic_filters(sirius::get_cudf_table_view(build_ro), publish_stream);
   } catch (...) {
-    // Handle only failures that occurred before publish_dynamic_filters().
-    auto expected = dynamic_filter_publication_state::PUBLISHING;
-    if (_dynamic_filter_publication_state.compare_exchange_strong(
-          expected,
-          dynamic_filter_publication_state::FAILED,
-          std::memory_order_acq_rel,
-          std::memory_order_acquire) &&
-        _dynamic_filter_stats != nullptr) {
-      _dynamic_filter_stats->publications_failed.fetch_add(1, std::memory_order_relaxed);
-    }
+    // Resolves only a claim publish_one_shot did not already resolve.
+    _dynamic_filter_publication_session.fail_claim();
     throw;
   }
 }
 
 void sirius_physical_hash_join::on_finalize_operator()
 {
-  std::scoped_lock lg(op_state_mutex);
+  _dynamic_filter_publication_session.finalize_or_abort();
 
-  // Finalization closes only an unclaimed publication window.
-  auto expected = dynamic_filter_publication_state::OPEN;
-  _dynamic_filter_publication_state.compare_exchange_strong(
-    expected,
-    dynamic_filter_publication_state::CLOSED,
-    std::memory_order_acq_rel,
-    std::memory_order_acquire);
-
+  std::scoped_lock lock(op_state_mutex);
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
-    // Each partition's hash table lives on its own GPU (partition_idx % num_gpus). Free every slot
-    // on the device it was built on so cuco/rmm releases memory in the right device context.
+    // Destroy each partition's GPU allocations under its owning device.
     for (auto& slot : _partition_build_states) {
       std::optional<rmm::cuda_set_device_raii> device_guard;
       if (slot.device_id >= 0) { device_guard.emplace(rmm::cuda_device_id{slot.device_id}); }

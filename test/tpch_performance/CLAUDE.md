@@ -170,6 +170,20 @@ Key flags:
 - `--pin gpu|host|none` — Sirius cache pre-load tier. Both `gpu` and `host` are supported; `host` converts the pinned table into NUMA-local pinned host memory. Any other tier throws `NotImplementedException` at bind time (`src/sirius_extension.cpp:811-813`).
 - `--pin-compression` / `--compression-plan-dir <dir>` — pin the tables Simpatico-compressed (requires `--pin gpu|host`; plan dir defaults to the shipped `plans/tpch_sf1000`). Confirm engagement by grepping the run's logs for `compressing with plan`.
 - `--validation` — byte-compare GPU vs CPU `result.txt` after timing (with `abs_tol=1e-10` on float columns). Requires `--engine both`.
+- `--dynamic-filter-observability` — outside each GPU iteration's timed region, snapshot
+  `sirius_dynamic_filter_observability()`, subtract every cumulative counter, select newly completed
+  global-accumulator records by event high-water mark, and write
+  `csv/dynamic_filter_observability.jsonl`. Attribution assumes one process/connection and no
+  concurrent Sirius work between the immediately-before and post-`fetchall()` snapshots. For the
+  tested global multi-partition design, require a record with contribution count greater than one
+  and positive filters built, active targets, and accepted pushes, plus zero publication-failure
+  and targets-drained deltas. Event selection remains by high-water mark; the journal retains only
+  a bounded most-recent window whose floor the stats row reports as `event_first_retained`, and
+  the harness fails fast if eviction crosses an iteration interval. Not supported in
+  `nsys-profile` mode.
+- `--skip-os-cache-drop` — explicitly bypass the normal fadvise-based page-cache eviction when
+  the protocol deviation is intentional; the choice is recorded in metadata and logged
+  prominently. In `isolated` mode it also skips the per-iteration evictions.
 - `--mode nsys-profile` — wrap each query in `nsys profile` (one DuckDB CLI subprocess per query; the cudaProfilerApi capture range covers the cold + hot iterations). Requires `--engine gpu`; incompatible with `--validation` and `--duckdb-profiling`.
 - `--query-timeout N` — per-query subprocess timeout in nsys-profile mode (default 90s).
 - `--name <NAME>` — override the auto-timestamped benchmark subdirectory name.
@@ -541,6 +555,7 @@ Output: `reports/<label>_<YYYYMMDD_HHMMSS>/` containing `report.md`, `summary.js
 | `generate_tpch_data.sh` | Generate TPC-H parquet (tpchgen-rs) or duckdb (`--format duckdb`, classic dbgen + `tpch_schema.sql`) data |
 | `tpch_schema.sql` | TPC-H DDL for loading dbgen `.tbl` output, typed to match what DuckDB's tpch extension creates |
 | `sweep_threads.sh` | Thread configuration sweep (Sirius-only) |
+| `test_sweep_threads.sh` | Host-only self-test of `sweep_threads.sh` (runs in CI: `check.yml` lint job) |
 | `profile_tpch_nsys.sh` | Profile queries with nsys, producing .nsys-rep and .sqlite per query |
 | `nsys_analyze.sh` | Analyze nsys SQLite profiles (kernels, memory, NVTX, I/O) |
 | `nsys_compare.sh` | Compare two nsys reports and flag regressions |
@@ -548,6 +563,7 @@ Output: `reports/<label>_<YYYYMMDD_HHMMSS>/` containing `report.md`, `summary.js
 | `nsys_report.sh` | Orchestrate profiling + analysis into a self-contained report |
 | `rewrite_parquet.py` | Rewrite parquet with GPU-optimized row groups (cudf or pyarrow fallback) |
 | `performance_test.py` | Python-based benchmark with result verification |
+| `test_performance_test_observability.py` | Host-only unittest of `performance_test.py`'s dynamic-filter observability plumbing (runs in CI: `check.yml` lint job) |
 | `queries.py` | TPC-H query templates (`{PLACEHOLDER}` substitution parameters) + the fixed default rendering `QUERIES` |
 | `tpch_query_streams.py` | Load the qgen stream files: split on `(Q<n>)` tags, fold the `:n` row limit into a `LIMIT` |
 | `generate_tpch_queries.sh` | Generate per-stream query sets (`stream<N>.sql`) with `qgen` |

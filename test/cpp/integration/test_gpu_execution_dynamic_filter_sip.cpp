@@ -54,6 +54,35 @@ struct dynamic_filter_switch_guard {
   bool original;
 };
 
+// Set the multi-partition subordinate switch for one scope and restore it on exit.
+struct dynamic_filter_multi_partition_switch_guard {
+  dynamic_filter_multi_partition_switch_guard(duckdb::Connection& c, bool enabled)
+    : con(c),
+      original(sirius::test::get_registered_sirius_context(c)
+                 ->get_config()
+                 .get_operator_params()
+                 .enable_dynamic_filter_multi_partition)
+  {
+    auto result = con.Query(std::string{"SET enable_dynamic_filter_multi_partition = "} +
+                            (enabled ? "true" : "false") + ";");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
+  }
+  ~dynamic_filter_multi_partition_switch_guard()
+  {
+    con.Query(std::string{"SET enable_dynamic_filter_multi_partition = "} +
+              (original ? "true" : "false") + ";");
+  }
+
+  dynamic_filter_multi_partition_switch_guard(const dynamic_filter_multi_partition_switch_guard&) =
+    delete;
+  dynamic_filter_multi_partition_switch_guard& operator=(
+    const dynamic_filter_multi_partition_switch_guard&) = delete;
+
+  duckdb::Connection& con;
+  bool original;
+};
+
 // Verify GPU execution and return the result as a sorted bag.
 std::vector<std::vector<std::string>> run_on_gpu(duckdb::Connection& con, const std::string& query)
 {
@@ -75,6 +104,7 @@ std::vector<std::vector<std::string>> run_on_gpu(duckdb::Connection& con, const 
 struct publication_deltas {
   std::uint64_t producers_enabled                    = 0;
   std::uint64_t membership_filters_built             = 0;
+  std::uint64_t keys_skipped_bloom_size_gate         = 0;
   std::uint64_t publications_finished                = 0;
   std::uint64_t publications_skipped_build_not_whole = 0;
   std::uint64_t filters_pushed                       = 0;
@@ -96,7 +126,9 @@ publication_deltas run_and_measure(duckdb::Connection& con,
   return publication_deltas{
     .producers_enabled        = after.producers_enabled - before.producers_enabled,
     .membership_filters_built = after.membership_filters_built - before.membership_filters_built,
-    .publications_finished    = after.publications_finished - before.publications_finished,
+    .keys_skipped_bloom_size_gate =
+      after.keys_skipped_bloom_size_gate - before.keys_skipped_bloom_size_gate,
+    .publications_finished = after.publications_finished - before.publications_finished,
     .publications_skipped_build_not_whole =
       after.publications_skipped_build_not_whole - before.publications_skipped_build_not_whole,
     .filters_pushed = after.filters_pushed - before.filters_pushed};
@@ -128,6 +160,69 @@ switch_comparison require_switch_result_equivalence(duckdb::Connection& con,
 }
 
 }  // namespace
+
+TEST_CASE("the multi-partition dynamic-filter switch is exposed through SQL",
+          "[integration][config_opt][dynamic_filter]")
+{
+  REQUIRE(sirius::test::g_integration_env != nullptr);
+  if (!sirius::test::g_integration_env->is_active()) { sirius::test::g_integration_env->resume(); }
+  auto con            = sirius::test::g_integration_env->make_connection();
+  auto const original = sirius::test::get_registered_sirius_context(con)
+                          ->get_config()
+                          .get_operator_params()
+                          .enable_dynamic_filter_multi_partition;
+
+  {
+    dynamic_filter_multi_partition_switch_guard enabled(con, true);
+    auto value =
+      con.Query("SELECT current_setting('enable_dynamic_filter_multi_partition')::BOOLEAN;");
+    REQUIRE(value);
+    REQUIRE_FALSE(value->HasError());
+    REQUIRE(value->GetValue(0, 0).GetValue<bool>());
+    REQUIRE(sirius::test::get_registered_sirius_context(con)
+              ->get_config()
+              .get_operator_params()
+              .enable_dynamic_filter_multi_partition);
+  }
+
+  auto restored =
+    con.Query("SELECT current_setting('enable_dynamic_filter_multi_partition')::BOOLEAN;");
+  REQUIRE(restored);
+  REQUIRE_FALSE(restored->HasError());
+  REQUIRE(restored->GetValue(0, 0).GetValue<bool>() == original);
+}
+
+TEST_CASE("the dynamic-filter Bloom cap is exposed through SQL",
+          "[integration][config_opt][dynamic_filter][bloom_budget]")
+{
+  REQUIRE(sirius::test::g_integration_env != nullptr);
+  if (!sirius::test::g_integration_env->is_active()) { sirius::test::g_integration_env->resume(); }
+  auto con            = sirius::test::g_integration_env->make_connection();
+  auto const original = sirius::test::get_registered_sirius_context(con)
+                          ->get_config()
+                          .get_operator_params()
+                          .max_dynamic_filter_bloom_bytes_per_gpu;
+
+  constexpr std::uint64_t kCap = 64ULL * 1024;
+  auto set                     = con.Query("SET max_dynamic_filter_bloom_bytes_per_gpu = 65536;");
+  REQUIRE(set);
+  REQUIRE_FALSE(set->HasError());
+
+  auto value =
+    con.Query("SELECT current_setting('max_dynamic_filter_bloom_bytes_per_gpu')::UBIGINT;");
+  REQUIRE(value);
+  REQUIRE_FALSE(value->HasError());
+  REQUIRE(value->GetValue(0, 0).GetValue<std::uint64_t>() == kCap);
+  REQUIRE(sirius::test::get_registered_sirius_context(con)
+            ->get_config()
+            .get_operator_params()
+            .max_dynamic_filter_bloom_bytes_per_gpu == kCap);
+
+  auto restored =
+    con.Query("SET max_dynamic_filter_bloom_bytes_per_gpu = " + std::to_string(original) + ";");
+  REQUIRE(restored);
+  REQUIRE_FALSE(restored->HasError());
+}
 
 TEST_CASE("gpu_execution - opaque-build and build-block routes preserve results",
           "[integration][gpu_execution][dynamic_filter]")
@@ -305,7 +400,7 @@ TEST_CASE("gpu_execution - opaque-build and build-block routes preserve results"
     REQUIRE(deltas.on.filters_pushed > deltas.off.filters_pushed);
   }
 
-  SECTION("a multi-partition build publishes nothing")
+  SECTION("a multi-partition build obeys the subordinate switch")
   {
     // Correctness stake: a filter built from one partition's slice of the build keys would drop
     // probe rows that do join, so this must be pinned on a build that really spans partitions.
@@ -320,16 +415,48 @@ TEST_CASE("gpu_execution - opaque-build and build-block routes preserve results"
     sirius::test::scoped_setting small_partitions(con, "hash_partition_bytes", 8ULL * 1024 * 1024);
     sirius::test::scoped_setting small_build_budget(
       con, "max_build_hash_table_bytes", 8ULL * 1024 * 1024);
-    auto const deltas = require_switch_result_equivalence(
-      con,
+    auto const query =
       "select count(*), sum(l.l_partkey), sum(l.l_suppkey), sum(l.l_linenumber), "
       "       sum(l.l_quantity), sum(l.l_extendedprice), sum(l.l_discount), sum(l.l_tax) "
       "from orders o join lineitem l on o.o_orderkey = l.l_orderkey "
-      "where l.l_shipdate >= date '1992-01-01'");
+      "where l.l_shipdate >= date '1992-01-01'";
 
-    REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
-    REQUIRE(deltas.on.publications_finished == 0);
-    REQUIRE(deltas.on.publications_skipped_build_not_whole > 0);
+    SECTION("off preserves the one-shot-only behavior")
+    {
+      dynamic_filter_multi_partition_switch_guard multi_partition_off(con, false);
+      auto const deltas = require_switch_result_equivalence(con, query);
+
+      REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
+      REQUIRE(deltas.on.publications_finished == 0);
+      REQUIRE(deltas.on.publications_skipped_build_not_whole > 0);
+    }
+
+    SECTION("on publishes one globally complete Bloom and the master switch still dominates")
+    {
+      dynamic_filter_multi_partition_switch_guard multi_partition_on(con, true);
+      auto const deltas = require_switch_result_equivalence(con, query);
+
+      REQUIRE(deltas.off.producers_enabled == 0);
+      REQUIRE(deltas.off.publications_finished == 0);
+      REQUIRE(deltas.on.producers_enabled > 0);
+      REQUIRE(deltas.on.membership_filters_built > 0);
+      REQUIRE(deltas.on.publications_finished > 0);
+      REQUIRE(deltas.on.filters_pushed > 0);
+      REQUIRE(deltas.on.publications_skipped_build_not_whole == 0);
+    }
+
+    SECTION("a zero Bloom cap skips Bloom construction through the planned policy")
+    {
+      dynamic_filter_multi_partition_switch_guard multi_partition_on(con, true);
+      sirius::test::scoped_setting zero_bloom_cap(con, "max_dynamic_filter_bloom_bytes_per_gpu", 0);
+      auto const deltas = require_switch_result_equivalence(con, query);
+
+      REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
+      REQUIRE(deltas.on.keys_skipped_bloom_size_gate > 0);
+      REQUIRE(deltas.on.membership_filters_built == 0);
+      REQUIRE(deltas.on.publications_finished > 0);
+      REQUIRE(deltas.on.filters_pushed == 0);
+    }
   }
 
   SECTION("an unfiltered aggregate build supplies no publication evidence")

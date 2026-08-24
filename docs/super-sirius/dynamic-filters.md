@@ -57,18 +57,25 @@ The main components are:
 - **Evidence and key admission.** `build_subtree_is_filtering` and `build_relation_is_opaque` decide whether discovery should run. `admit_dynamic_filter_keys` accepts supported equality keys and records the build/probe metadata needed at runtime.
 - **Target discovery.** `trace_probe_key` follows a key through physical operators only while its value and row semantics remain safe. A reachable GPU scan wins; otherwise `place_endpoint` may insert a membership-only `sirius_physical_dynamic_filter` at the deepest safe point. Unknown or unsafe transformations stop descent.
 - **Publication plan.** `dynamic_filter_publish_plan` binds admitted build keys to target channels and target output ordinals, carries filter policy, and identifies the admitted GPU/HOST replica spaces.
+- **Publication session.** `dynamic_filter_publication_session`, owned by the hash join, arbitrates exactly one publication per join between the one-shot path (`publish_one_shot`) and, when `enable_dynamic_filter_multi_partition` is enabled, exact-ID accumulation (`try_arm` / `contribute`, closed by `finalize_or_abort`). It also folds the terminal outcome into the statistics sink.
 - **Channel.** `sirius_dynamic_filter_set` is a thread-safe, append-only channel shared by producers and one logical consumer endpoint. It is not a readiness barrier.
 
 The probe key's entry ordinal and a target's output ordinal are different coordinate spaces. The discovery walk performs that translation; channel push, storage, and lookup all use the target output ordinal.
 
 ## Publication and consumption
 
-1. Only a delivery containing the complete build can claim publication. At most one usable delivery constructs and publishes filters; an unusable broadcast delivery can release its claim so a sibling can try. Single-partition and broadcast builds can satisfy the complete-build requirement, but a slice of a hash-partitioned build cannot.
+1. Only a delivery containing the complete build can claim publication. At most one usable delivery constructs and publishes filters; an unusable broadcast delivery can release its claim so a sibling can try. Single-partition and broadcast builds can satisfy the complete-build requirement, but a slice of a hash-partitioned build cannot — unless `enable_dynamic_filter_multi_partition` accumulates the slices (see below).
 2. The winning build delivery pins the build representation, constructs the selected filters, and creates device-local replicas on admitted probe GPUs.
 3. A filter becomes visible only after all of its usable replicas are ready. The publisher then appends it to each accepting target channel. Multi-filter fan-out is not atomic, so a racing consumer may observe any independently complete subset.
 4. Consumers take fresh per-column snapshots at their application checkpoint. They never wait for publication.
 
 An `rmm::out_of_memory` during source-filter construction is logged and ends the optional publication attempt without failing the query. A reservation, construction, or transfer failure for one target GPU omits that replica, and consumers on that GPU skip that filter. Unexpected failures outside target-local replication still propagate.
+
+### Multi-partition accumulation
+
+With `enable_dynamic_filter_multi_partition` enabled, a non-broadcast hash-partitioned build publishes through exact-ID accumulation instead of a one-shot delivery. The build-side PARTITION freezes a `complete_build_snapshot` (`try_freeze_complete_build`) — the exact pre-scatter batch IDs and global row count — before its first pop makes the set unknowable, and arms the session with it. Each original batch then contributes its keys into a per-GPU partial Bloom filter; the final contributor OR-reduces every partial into its root filter in 4 MiB scratch chunks, replicates the result to every planned replica space **strictly** (a missing replica aborts to no-filter, unlike the one-shot path's best-effort replication), and fans out. A missing, duplicate-claimed, or invalid contribution fails the accumulation closed without failing the query. If every probe target drains while accumulation is in progress, the next contribution completes the publication as skipped (`publications_skipped_targets_drained`) without building further partial filters.
+
+A wired join whose build never arrives whole and which does not accumulate logs the once-per-join "dynamic filter NOT published" diagnostic and counts `publications_skipped_build_not_whole`.
 
 DuckDB static filters remain on their existing, authoritative path. Dynamic filters add redundant conjuncts through these consumer paths:
 
@@ -95,6 +102,8 @@ If no probe-GPU L2 size is available, the hash IN-list is not selected; the publ
 
 - The domain-coverage gate skips the key before either filter is built when a proven-unique native build key covers at least `dynamic_filter_domain_coverage_threshold` of its known base-table domain.
 - The consumer keep-ratio gate disables ineffective post-decode filtering when a measured batch retains more than `dynamic_filter_keep_threshold` of its rows.
+
+Multi-partition accumulated Bloom construction is additionally bounded by `max_dynamic_filter_bloom_bytes_per_gpu`; one-shot publication is not budget-gated (its pathological allocations are contained by the fail-open out-of-memory handling instead). A filter's footprint is 16 bits per global build row in 256-bit blocks, rounded to CUDA allocation alignment, and the overflow-safe sum across the join's Bloom keys is charged against the cap; the per-GPU cap is neither multiplied by replica count nor divided by partitions. When the whole candidate set exceeds the cap, every accumulated Bloom candidate for that join is skipped (fail-open) and counted in `keys_skipped_bloom_size_gate`.
 
 Zone maps are off by default because DuckDB static pushdown already handles many known ranges, while scattered runtime keys often span most of the domain. Floating-point keys never receive a zone map: the lowered bounds compare with IEEE semantics under which NaN fails both, while the authoritative join matches NaN keys to each other (DuckDB total order), so a range filter could drop matching rows.
 
@@ -133,12 +142,16 @@ The settings live under `sirius.operator_params`:
 | Setting | Default | Meaning |
 |---|---:|---|
 | `enable_dynamic_filter` | `true` | Enable key discovery, membership publication, scan targets, and join-edge endpoints |
+| `enable_dynamic_filter_multi_partition` | `false` | Accumulate a globally complete Bloom across a non-broadcast hash-partitioned build; requires dynamic filters |
+| `max_dynamic_filter_bloom_bytes_per_gpu` | `256 MiB` | Per-join allocator-accounted budget for the multi-partition accumulated Bloom on each GPU; one-shot publication is not budget-gated; `0` disables accumulated Bloom construction only |
 | `enable_dynamic_zone_map_filter` | `false` | Also emit a global min/max filter; requires dynamic filters |
 | `dynamic_filter_domain_coverage_threshold` | `0.9` | Skip a proven-unique key at or above this known-domain coverage; values above `1.0` disable the gate |
 | `dynamic_filter_inlist_max_l2_fraction` | `0.125` | Maximum fraction of the smallest probe-GPU L2 used by the hash IN-list estimate |
 | `dynamic_filter_keep_threshold` | `0.9` | Disable post-decode filtering when the measured keep ratio is higher |
 
-`SiriusContext::get_dynamic_filter_stats_snapshot()` exposes cumulative planning, policy, and publication counters for diagnostics and tests.
+### Observability
+
+The cumulative counters fall into three families: the plan-time `producers_enabled`, the deterministic policy-decision `keys_*` counters, and the delivery family (`publication_attempts`, `publications_*`, `filters_pushed`), which varies with probe-side draining and target lifetime and is best read as per-query deltas. `SiriusContext::get_dynamic_filter_stats_snapshot()` returns them programmatically, and the `sirius_dynamic_filter_observability()` table function exposes one cumulative `stats` row plus a bounded `global_accumulator_completion` event journal recording the most recent `k_event_journal_capacity` (1024) successful exact-ID accumulations. Event IDs are monotone and contiguous within the retained window; the snapshot's `first_retained_event_id` (SQL: the stats row's `event_first_retained` column) is greater than 1 once older events have been evicted.
 
 ## Limitations and future work
 
@@ -146,17 +159,18 @@ The settings live under `sirius.operator_params`:
 - Routing is deliberately allowlisted by join type, key shape, and lineage; unsupported shapes lose optimization rather than results.
 - Membership filters currently support `INT32` and `INT64` keys.
 - The publisher emits one global zone map per key; multi-zone publication is not implemented.
-- A genuinely hash-partitioned multi-batch build cannot publish because no delivery contains the complete key set.
+- A genuinely hash-partitioned multi-batch build cannot publish through the one-shot path because no delivery contains the complete key set; `enable_dynamic_filter_multi_partition` instead accumulates the exact batch set into a global Bloom. Accumulation is Bloom-only; incremental zone-map min/max merge across partitions is future work.
 - Other producers and incremental refinement would require explicit producer identity, versioning, and completion semantics; they are not implemented.
 
 ## Implementation map
 
 - Planning and routing: `src/planner/sirius_plan_comparison_join.cpp` and `src/planner/dynamic_filter/`
 - Publication metadata and policy: `src/include/op/dynamic_filter/dynamic_filter_publish_plan.hpp` and `src/include/op/dynamic_filter/dynamic_filter_source_policy.hpp`
-- Runtime publication: `src/op/dynamic_filter/dynamic_filter_publisher.cpp` and `src/op/sirius_physical_hash_join.cpp`
+- Runtime publication: `src/op/dynamic_filter/dynamic_filter_publisher.cpp` (one-shot publisher, accumulator, publication session) and `src/op/sirius_physical_hash_join.cpp` (session ownership, arm/contribute surface)
+- Multi-partition snapshot freeze and contributions: `src/include/op/sirius_physical_partition.hpp` and `src/op/sirius_physical_partition.cpp`
 - Filter capabilities and channel: `src/include/op/dynamic_filter/sirius_dynamic_filter.hpp`
 - Consumer application: `src/op/scan/dynamic_filter_merge.cpp`, `src/op/scan/sirius_physical_dynamic_filter.cpp`, and `src/op/scan/parquet_gpu_ingestible.cpp`
 - GPU membership implementations: `src/cuda/sirius_dynamic_small_in_list_filter.cu`, `src/cuda/sirius_dynamic_in_list_filter.cu`, and `src/cuda/sirius_dynamic_bloom_filter.cu`
-- Focused validation: dynamic-filter tests under `test/cpp/planner/`, `test/cpp/operator/`, `test/cpp/scan/`, `test/cpp/pipeline/`, and `test/cpp/integration/`
+- Focused validation: dynamic-filter tests under `test/cpp/planner/`, `test/cpp/operator/`, `test/cpp/scan/`, `test/cpp/pipeline/`, and `test/cpp/integration/`, including the publication-claim and batch-lock regression tests (`test/cpp/operator/test_dynamic_filter_publication_claim.cpp`, `test/cpp/pipeline/test_batch_lock_utils.cpp`)
 
 Related details are covered in [Pipeline Execution](pipeline-execution.md), [Scan](scan.md), and [Multi-GPU Architecture](multi-gpu-architecture.md).

@@ -128,9 +128,29 @@ class sirius_physical_partition : public sirius_physical_operator {
  private:
   void get_partition_keys_and_type(sirius_physical_operator* op, bool is_build = false);
 
-  /// Sum the bytes of all batches waiting on this partition's input port. Fed to the downstream
-  /// consumer's get_partition_strategy, which turns it into a partition count.
+  /**
+   * @brief Sum the bytes of waiting batches
+   *
+   * @throw std::runtime_error if the default port or its repository is missing
+   *
+   * @return Total representation bytes
+   */
   uint64_t compute_total_bytes();
+
+  /**
+   * @brief Freeze the complete pre-scatter build identity and row geometry
+   *
+   * Must be called with `lock` held after the default port's FULL source barrier completes and
+   * before the first repository pop. Every batch must still resolve to a GPU table.
+   *
+   * @throw std::runtime_error if the default port or its repository is missing
+   *
+   * @param[in] partition_count Planned hash partition count
+   * @return The validated snapshot, or `std::nullopt` when the source is incomplete, any batch
+   * cannot be summarized exactly, or snapshot validation fails
+   */
+  [[nodiscard]] std::optional<complete_build_snapshot> try_freeze_complete_build(
+    std::size_t partition_count);
 
   /// The partition slot for a batch residing on `device_id`: its index in `_active_gpu_ids`
   /// (so task_creator routes that slot back to the same GPU). Returns 0 if not found (a
@@ -158,6 +178,8 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// num_gpus partitions. Build side deposits its batch into every slot; probe side deposits each
   /// batch into the slot matching its current GPU. See get_next_task_input_data / sink.
   bool _broadcast{false};
+  /// Guarded by `lock`; set before the first build input is popped whether arming succeeds or not.
+  bool _dynamic_filter_snapshot_attempted{false};
   /// Non-owning observer for the narrow-passthrough counter. The registered-state shared_ptr owns
   /// the context for at least as long as the query plan; unit-test operators may leave it null.
   duckdb::SiriusContext* _compressed_materialization_observer = nullptr;

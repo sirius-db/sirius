@@ -180,9 +180,11 @@ The pin also survives OOM reschedule. When a partitioned task OOMs and is rebuil
 
 When an operator must consume data on GPU A that lives on GPU B (e.g., a hash join's probe side has chunks scattered across all GPUs), `lock_or_prepare_batch` (`src/include/pipeline/batch_lock_utils.hpp`) **clones the batch into the consumer's memory space under a shared (read) lock** via `read_only_data_batch::clone_to`. The source batch is never exclusively locked and never mutated: it stays resident on GPU B for consumers local to that device, concurrent readers proceed during the transfer, and the source drops back to the idle state as soon as the prepare completes — making it immediately downgrade-eligible. Source lifetime is ownership-driven: repositories and other tasks holding the batch keep it alive, and the consuming task releases its own pin on the original right after prepare, so a single-consumer source is freed as soon as its clone exists. The clone's allocation is charged to the consuming task's memory reservation, and the reservation estimator counts GPU inputs residing in a different memory space in `bytes_to_materialize_input`.
 
+The consumer memory space and the stream passed to `prepare_for_processing` are a device-affine pair: each `gpu_pipeline_executor` acquires both from objects constructed for its own GPU. This remains required after an OOM reschedule. If the prepared clone is retried on the same GPU, `lock_or_prepare_batch` may rebind its deallocation stream to the new task stream; cuCascade deliberately rejects a stream owned by another GPU before that rebind. Tests and other direct callers that bypass the executor must make the target GPU current and create or acquire their stream there.
+
 Host- and disk-resident inputs intentionally keep **move semantics**: `lock_or_prepare_batch` upgrades them to the GPU in place, freeing the spilled copy — the common case is a single consumer re-materializing a downgraded batch.
 
-The underlying byte transfer is `cucascade::convert_gpu_to_gpu` (in `cucascade/src/data/representation_converter.cpp`), which waits on the source's writer event and synchronizes its copy stream before returning, so the clone is complete when `clone_to` returns. The transfer chooses one of two paths empirically:
+The underlying byte transfer is `cucascade::convert_gpu_to_gpu` (in `cucascade/src/cudf/representation_converter_builtins.cpp`), which waits on the source's writer event and synchronizes its copy stream before returning, so the clone is complete when `clone_to` returns. The transfer chooses one of two paths empirically:
 
 1. **Direct peer DMA** (`cudaMemcpyPeerAsync`) — fastest, used when `probe_peer_dma_works(src, dst)` returns true. Real peer access requires both GPUs to have driver-level P2P enabled AND the hardware to actually honor it.
 2. **Host-staging** (`cudaMemcpyAsync(DtoH)` → host buffer → `cudaMemcpyAsync(HtoD)`) — fallback for hardware where peer DMA is empirically broken (e.g., the consumer-grade RTX 6000 Ada we use for development, which advertises P2P but silently fails DMA in both directions).
@@ -230,7 +232,8 @@ After a downgrade frees enough space, the rescheduled task retries. The reservat
 
 | Invariant | Where enforced | Why |
 |-----------|---------------|-----|
-| Same-stream for DtoH+HtoD in `alloc_and_peer_copy_async` | `cucascade/src/data/representation_converter.cpp` | Prevents Phase 22 Cluster B race seen at SF100 Q11 |
+| Same-stream for DtoH+HtoD in `alloc_and_peer_copy_async` | `cucascade/src/cudf/representation_converter_builtins.cpp` | Prevents Phase 22 Cluster B race seen at SF100 Q11 |
+| The `prepare_for_processing` stream belongs to the target reservation GPU | `gpu_pipeline_executor` device-bound stream pool; cuCascade `gpu_table_representation::rebind_stream` guard | Rebinding GPU memory to a foreign-device stream can retire buffers into the wrong RMM device pool |
 | `dst_guard` around HtoD memcpy in `alloc_and_peer_copy_async` | Same file (Phase 23 fix) | Outer `target_guard` doesn't propagate through `reconstruct_column_p2p`; broken-peer-DMA hardware needs the inner guard |
 | `run_p2p_probe_locked` restores caller's device context on exit | `cucascade/src/memory/common.cpp` (Phase 23 fix) | Probe was hardcoding `cudaSetDevice(0)`, clobbering caller's RAII guard |
 | `cudaDeviceSynchronize` per GPU before `cudaMemPoolDestroy` | `src/memory/sirius_memory_reservation_manager.cpp` (post-Phase-24 fix) | Pending `cudaFreeAsync` against a soon-destroyed pool corrupts the driver's per-device pool list |
@@ -269,7 +272,7 @@ After a downgrade frees enough space, the rescheduled task retries. The reservat
 | `src/include/pipeline/gpu_pipeline_task.hpp` | `preferred_device_id` two-level lookup |
 | `src/pipeline/gpu_pipeline_executor.cpp` + `task_scheduler.cpp` | SCHED-RR distribution, locality scoring, OOM-reschedule pin carry-forward |
 | `src/downgrade/downgrade_executor.cpp` | Per-tier downgrade workers, K.6-gated `cudaSetDevice` |
-| `cucascade/src/data/representation_converter.cpp` | `convert_gpu_to_gpu` / `alloc_and_peer_copy_async` with peer-DMA probe + dst_guard |
+| `cucascade/src/cudf/representation_converter_builtins.cpp` | `convert_gpu_to_gpu` / `alloc_and_peer_copy_async` with peer-DMA probe + dst_guard |
 | `cucascade/src/memory/common.cpp` | `probe_peer_dma_works`, `run_p2p_probe_locked` |
 
 ## Related Documentation

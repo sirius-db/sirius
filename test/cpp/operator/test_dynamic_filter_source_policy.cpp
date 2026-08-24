@@ -24,9 +24,12 @@
 #include <catch.hpp>
 
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 
 namespace {
 
+using sirius::op::bloom_budget_allows;
 using sirius::op::choose_membership_filter;
 using sirius::op::domain_coverage_gate_fires;
 using sirius::op::membership_filter_kind;
@@ -270,4 +273,19 @@ TEST_CASE("zone-map range gate is disabled for an untraceable key domain",
           "[dynamic_filter][source_policy]")
 {
   REQUIRE_FALSE(zone_map_range_gate_fires(0.0, 1'000'000.0, 0, kThreshold));
+}
+
+TEST_CASE("Bloom budget admits only the complete candidate set at the inclusive boundary",
+          "[dynamic_filter][source_policy][bloom_budget]")
+{
+  constexpr std::size_t kBytesPerFilter = 256;
+
+  REQUIRE(bloom_budget_allows(kBytesPerFilter, 2, 512));
+  REQUIRE_FALSE(bloom_budget_allows(kBytesPerFilter, 2, 511));
+  REQUIRE(bloom_budget_allows(kBytesPerFilter, 0, 0));
+  REQUIRE_FALSE(bloom_budget_allows(kBytesPerFilter, 1, 0));
+
+  auto const size_max = std::numeric_limits<std::size_t>::max();
+  REQUIRE_FALSE(bloom_budget_allows(size_max, 1, std::numeric_limits<std::uint64_t>::max()));
+  REQUIRE_FALSE(bloom_budget_allows(size_max / 2 + 1, 2, static_cast<std::uint64_t>(size_max)));
 }

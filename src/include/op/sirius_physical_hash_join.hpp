@@ -28,8 +28,7 @@
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "expression/ast/node.hpp"  // complete sirius::ast::node for join_condition's destructor
 #include "expression/join_condition.hpp"
-#include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
-#include "op/dynamic_filter/dynamic_filter_stats.hpp"
+#include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "sirius_config.hpp"
 #include "utils.hpp"
@@ -252,7 +251,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     dynamic_filter_publish_plan dynamic_filter_plan = {},
     uint64_t hash_partition_bytes                   = config::DEFAULT_HASH_PARTITION_BYTES,
     uint64_t max_broadcast_join_size                = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE,
-    dynamic_filter_stats* dynamic_filter_stats_sink = {});
+    dynamic_filter_stats* dynamic_filter_stats_sink = {},
+    bool enable_dynamic_filter_multi_partition      = false);
 
   duckdb::vector<sirius::join_condition> conditions;
   //! The types of the join keys
@@ -334,6 +334,44 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   partition_strategy get_partition_strategy(const partition_sizing_input& in) override;
 
   [[nodiscard]] bool publishes_dynamic_filters() const;
+
+  [[nodiscard]] bool wants_multi_partition_dynamic_filters() const noexcept
+  {
+    return _dynamic_filter_publication_session.wants_multi_partition();
+  }
+
+  /**
+   * @brief Attempts to arm accumulation from a complete pre-scatter build snapshot
+   *
+   * @param[in] snapshot Complete pre-scatter build identity and row geometry
+   * @return True if this call armed the accumulator; false if ineligible, already claimed, or
+   * initialization failed
+   */
+  [[nodiscard]] bool arm_multi_partition_dynamic_filters(complete_build_snapshot snapshot);
+
+  /**
+   * @brief Contributes one original build batch before hash scatter
+   *
+   * Ignored unless accumulation is active. A newly accepted contribution that inserts an active
+   * Bloom key synchronizes @p stream before returning. An invalid contribution aborts only the
+   * optional publication.
+   *
+   * @param[in] batch_id Original pre-scatter batch ID
+   * @param[in] build_view Batch containing the admitted build-key ordinals
+   * @param[in] stream Stream used for insertion
+   */
+  void contribute_dynamic_filter_build_batch(uint64_t batch_id,
+                                             cudf::table_view const& build_view,
+                                             rmm::cuda_stream_view stream);
+
+  /**
+   * @brief Aborts an active multi-partition dynamic-filter accumulation
+   *
+   * Does nothing unless accumulation is active. The query continues without the optional filter.
+   *
+   * @param[in] reason Diagnostic reason for the abort
+   */
+  void abort_multi_partition_dynamic_filters(std::string_view reason) noexcept;
 
   [[nodiscard]] uint64_t max_build_hash_table_bytes() const noexcept
   {
@@ -463,24 +501,15 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
  protected:
   std::vector<key_cast_info> key_casts;
 
-  // Requires PUBLISHING and leaves FINISHED or FAILED. Device OOM is contained; other failures
+  // Forwards one-shot publication to the session, which contains device OOM; other failures
   // propagate.
   void publish_dynamic_filters(cudf::table_view const& build_view, rmm::cuda_stream_view stream);
 
-  enum class dynamic_filter_publication_state : std::uint8_t {
-    OPEN,
-    PUBLISHING,
-    FINISHED,
-    FAILED,  ///< Terminal: a failed window is never reopened for a sibling retry.
-    CLOSED
-  };
-
   // Narrowed before execution; immutable during execution.
   dynamic_filter_publish_plan _dynamic_filter_plan;
-  // Non-owning; SiriusContext outlives the plan.
-  dynamic_filter_stats* _dynamic_filter_stats = nullptr;
-  std::atomic<dynamic_filter_publication_state> _dynamic_filter_publication_state{
-    dynamic_filter_publication_state::OPEN};
+  // Publication lifetime and one-shot versus accumulated arbitration. Declared after the plan so
+  // its retained plan reference remains valid through destruction.
+  dynamic_filter_publication_session _dynamic_filter_publication_session;
 
  public:
   void push_data_batch_partitioned(std::string_view port_id,
