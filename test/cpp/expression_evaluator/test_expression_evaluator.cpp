@@ -1711,10 +1711,47 @@ TEMPLATE_TEST_CASE("select LIKE and NOT LIKE",
                                  /*like_swar_fastpath=*/true,
                                  like_cache);
 
-    auto first  = first_executor.select(repr.get_table_view());
-    auto second = second_executor.select(repr.get_table_view());
+    auto first       = first_executor.select(repr.get_table_view());
+    auto first_again = first_executor.select(repr.get_table_view());
+    auto second      = second_executor.select(repr.get_table_view());
+    REQUIRE(copy_string_column_to_host(first->view().column(0)) ==
+            copy_string_column_to_host(first_again->view().column(0)));
     REQUIRE(copy_string_column_to_host(first->view().column(0)) ==
             copy_string_column_to_host(second->view().column(0)));
+    REQUIRE(first_executor.like_shared_cache_lookup_count_for_testing() == 1);
+    REQUIRE(second_executor.like_shared_cache_lookup_count_for_testing() == 1);
+    REQUIRE(like_cache->classification_count_for_testing() == 1);
+  }
+
+  SECTION("NOT LIKE fallback classification is memoized across evaluator batches")
+  {
+    std::vector<std::unique_ptr<ast_node>> children;
+    children.push_back(make_ref(0));
+    children.push_back(make_str_const("%tr_1%"));
+    auto expr = make_func(
+      sirius::function_id::not_like, std::move(children), logical_type::make(type_id::BOOLEAN));
+
+    auto input_ro   = input->to_read_only();
+    auto& repr      = input_ro.get_data()->cast<gpu_table_representation>();
+    auto like_cache = std::make_shared<sirius::like_multiliteral_cache>();
+    exp_executor executor(*expr,
+                          get_resource_ref(*space),
+                          cudf::get_default_stream(),
+                          strategy,
+                          exp_executor::default_min_ast_size,
+                          /*like_swar_fastpath=*/true,
+                          like_cache);
+
+    auto first  = executor.select(repr.get_table_view());
+    auto second = executor.select(repr.get_table_view());
+    auto const input_strings = copy_string_column_to_host(repr.get_table_view().column(0));
+    std::vector<std::string> expected;
+    for (auto const& value : input_strings) {
+      if (value != "str_1") { expected.push_back(value); }
+    }
+    REQUIRE(copy_string_column_to_host(first->view().column(0)) == expected);
+    REQUIRE(copy_string_column_to_host(second->view().column(0)) == expected);
+    REQUIRE(executor.like_shared_cache_lookup_count_for_testing() == 1);
     REQUIRE(like_cache->classification_count_for_testing() == 1);
   }
 

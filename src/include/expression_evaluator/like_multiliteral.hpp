@@ -31,6 +31,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -59,6 +60,8 @@ inline constexpr int like_multiliteral_max_literal_bytes = 32;
 
 namespace detail {
 
+class like_multiliteral_pattern_factory;
+
 /// Max number of uint64_ts in a literal
 inline constexpr int like_multiliteral_max_chunks = like_multiliteral_max_literal_bytes / 8;
 
@@ -84,15 +87,16 @@ struct like_multiliteral_pattern_desc {
 /// Parsed form of an eligible `%lit1%lit2%...%litN%` pattern.
 class like_multiliteral_pattern {
  public:
-  explicit like_multiliteral_pattern(std::vector<std::string> literals);
-
   /// The literals, in pattern order. Each is 1..max_literal_bytes ASCII bytes.
   [[nodiscard]] std::vector<std::string> const& literals() const noexcept { return _literals; }
 
  private:
+  explicit like_multiliteral_pattern(std::vector<std::string> literals);
+
   std::vector<std::string> _literals;
   detail::like_multiliteral_pattern_desc _descriptor{};
 
+  friend class detail::like_multiliteral_pattern_factory;
   friend std::unique_ptr<cudf::column> like_multiliteral(cudf::strings_column_view const&,
                                                          like_multiliteral_pattern const&,
                                                          bool,
@@ -148,7 +152,7 @@ class like_multiliteral_cache {
   [[nodiscard]] std::size_t classification_count_for_testing() const;
 
  private:
-  mutable std::mutex _mutex;
+  mutable std::shared_mutex _mutex;
   mutable std::map<std::string, entry_ptr, std::less<>> _entries;
 };
 

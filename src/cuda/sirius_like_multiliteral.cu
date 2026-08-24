@@ -225,6 +225,18 @@ literal_desc make_literal_desc(std::string const& lit)
 
 }  // namespace
 
+namespace detail {
+
+class like_multiliteral_pattern_factory {
+ public:
+  static like_multiliteral_pattern make(std::vector<std::string> literals)
+  {
+    return like_multiliteral_pattern{std::move(literals)};
+  }
+};
+
+}  // namespace detail
+
 like_multiliteral_pattern::like_multiliteral_pattern(std::vector<std::string> literals)
   : _literals(std::move(literals))
 {
@@ -272,17 +284,23 @@ std::optional<like_multiliteral_pattern> classify_like_multiliteral(std::string_
   }
   // The pattern ends with '%', so no literal is pending here.
   if (literals.empty()) { return std::nullopt; }  // pure '%'/'%%': cudf path
-  return like_multiliteral_pattern{std::move(literals)};
+  return detail::like_multiliteral_pattern_factory::make(std::move(literals));
 }
 
 like_multiliteral_cache::entry_ptr like_multiliteral_cache::get_or_classify(
   std::string_view pattern) const
 {
-  std::lock_guard lock(_mutex);
+  {
+    std::shared_lock lock(_mutex);
+    if (auto const cached = _entries.find(pattern); cached != _entries.end()) {
+      return cached->second;
+    }
+  }
+
+  std::unique_lock lock(_mutex);
   if (auto const cached = _entries.find(pattern); cached != _entries.end()) {
     return cached->second;
   }
-
   auto classification = std::make_shared<like_multiliteral_cache::classification const>(
     classify_like_multiliteral(pattern, std::string_view{}));
   return _entries.emplace(std::string(pattern), std::move(classification)).first->second;
@@ -290,7 +308,7 @@ like_multiliteral_cache::entry_ptr like_multiliteral_cache::get_or_classify(
 
 std::size_t like_multiliteral_cache::classification_count_for_testing() const
 {
-  std::lock_guard lock(_mutex);
+  std::shared_lock lock(_mutex);
   return _entries.size();
 }
 

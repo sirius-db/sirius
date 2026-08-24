@@ -21,14 +21,12 @@
 //   3. the kernel — differential against cudf::strings::like on adversarial fixed rows (word
 //      alignment sweeps, literal-at-row-edges, greedy/overlap traps, UTF-8 neighbours, nulls,
 //      sliced views) and on seeded random near-miss data;
-//   4. the host launcher contract — caps-violating patterns that bypass the classifier throw
-//      sirius::internal_exception instead of silently falling back.
+//   4. the host launcher contract — only the classifier can construct a kernel pattern.
 
 #include "catch.hpp"
 
 // sirius
 #include <expression_evaluator/like_multiliteral.hpp>
-#include <sirius/exception.hpp>
 
 // cudf
 #include <cudf/column/column.hpp>
@@ -52,6 +50,7 @@
 #include <future>
 #include <random>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 using sirius::classify_like_multiliteral;
@@ -219,6 +218,9 @@ TEST_CASE("like_multiliteral classifier accepts %lit...% shapes",
 TEST_CASE("like_multiliteral classifier refuses everything else",
           "[expression_evaluator][like_multiliteral]")
 {
+  STATIC_REQUIRE_FALSE((std::is_constructible_v<sirius::like_multiliteral_pattern,
+                                                std::vector<std::string>>));
+
   // Anchored / non-%-delimited shapes (q16's 'PROMO POLISHED%' shape included).
   CHECK_FALSE(classify_like_multiliteral("PROMO POLISHED%", {}).has_value());
   CHECK_FALSE(classify_like_multiliteral("%MEDIUM POLISHED", {}).has_value());
@@ -537,55 +539,4 @@ TEST_CASE("like_multiliteral handles column-layout edges",
     require_matches_cudf(col->view(), "%special%requests%");
     require_matches_cudf(col->view(), "%aa%aa%");
   }
-}
-
-// ---------------------------------------------------------------------------
-// Host launcher contract: caps violations throw, they never fall back
-// ---------------------------------------------------------------------------
-
-TEST_CASE("like_multiliteral throws on patterns violating the classifier caps",
-          "[expression_evaluator][like_multiliteral]")
-{
-  auto stream = cudf::get_default_stream();
-  auto mr     = cudf::get_current_device_resource_ref();
-
-  // Hand-built patterns bypass the classifier; a caps-violating pattern reaching the launcher is
-  // a contract violation and must throw (nullptr exclusively means layout ineligibility).
-  auto const col   = make_strings({"x"});
-  auto const empty = cudf::make_empty_column(cudf::type_id::STRING);
-
-  sirius::like_multiliteral_pattern const five_literals{{"a", "b", "c", "d", "e"}};
-  sirius::like_multiliteral_pattern const oversized_literal{{std::string(33, 'x')}};
-  sirius::like_multiliteral_pattern const empty_literal{{""}};
-
-  auto require_throws = [&](cudf::strings_column_view const& input) {
-    REQUIRE_THROWS_AS(like_multiliteral(input, five_literals, false, stream, mr),
-                      sirius::internal_exception);
-    REQUIRE_THROWS_AS(like_multiliteral(input, oversized_literal, false, stream, mr),
-                      sirius::internal_exception);
-    REQUIRE_THROWS_AS(like_multiliteral(input, empty_literal, false, stream, mr),
-                      sirius::internal_exception);
-  };
-
-  require_throws(cudf::strings_column_view(col->view()));
-  require_throws(cudf::strings_column_view(empty->view()));
-
-  rmm::device_buffer chars_buf(9, stream, mr);
-  auto offsets_col = cudf::make_numeric_column(
-    cudf::data_type{cudf::type_id::INT32}, 2, cudf::mask_state::UNALLOCATED, stream, mr);
-  std::vector<int32_t> const offsets{0, 1};
-  cudaMemcpyAsync(offsets_col->mutable_view().data<int32_t>(),
-                  offsets.data(),
-                  offsets.size() * sizeof(int32_t),
-                  cudaMemcpyHostToDevice,
-                  stream.value());
-  stream.synchronize();
-  cudf::column_view const misaligned_view(cudf::data_type{cudf::type_id::STRING},
-                                          1,
-                                          static_cast<char const*>(chars_buf.data()) + 1,
-                                          nullptr,
-                                          0,
-                                          0,
-                                          {offsets_col->view()});
-  require_throws(cudf::strings_column_view(misaligned_view));
 }

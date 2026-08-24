@@ -54,6 +54,21 @@
 namespace sirius {
 using evaluate_result = expression_evaluator::evaluate_result;
 
+like_multiliteral_cache::entry_ptr const& expression_evaluator::get_or_classify_like(
+  std::string_view pattern)
+{
+  if (auto const found = _like_classifications.find(pattern);
+      found != _like_classifications.end()) {
+    return found->second;
+  }
+
+  auto classification = _like_cache->get_or_classify(pattern);
+  ++_like_shared_cache_lookup_count;
+  return _like_classifications
+    .emplace(std::string(pattern), std::move(classification))
+    .first->second;
+}
+
 evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const& alt,
                                                evaluation_mode mode)
 {
@@ -195,7 +210,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
     // `%lit1%lit2%...%litN%` patterns take a SWAR digram fast path (NOT fused in);
     // everything else — and any ineligible column layout — takes cudf::strings::like.
     if (_like_swar_fastpath && !input.is_scalar()) {
-      auto const parsed = _like_cache->get_or_classify(match_str);
+      auto const& parsed = get_or_classify_like(match_str);
       if (*parsed) {
         if (auto result_column = like_multiliteral(
               cudf::strings_column_view(input.get_column_view()), **parsed, invert, _stream, _mr)) {
