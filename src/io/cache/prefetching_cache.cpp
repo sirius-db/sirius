@@ -50,7 +50,9 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace sirius::io::cache {
@@ -448,7 +450,7 @@ prefetching_handle prefetching_cache::initiate_prefetching_request(
   if (gpu_id && _topology_index) { req.preferred_numa = _topology_index->numa_node_of(*gpu_id); }
 
   std::ignore = req.producer->mark_queued();
-  _eviction_queue.enqueue(req);
+  _eviction_queue.enqueue(cache_request{req});
 
   return prefetching_handle(std::move(req));
 }
@@ -936,12 +938,30 @@ void prefetching_cache::prepare_for_query() noexcept
 
 // ===========================================================================
 
+std::size_t prefetching_cache::claimed_bytes() const noexcept
+{
+  return _pool ? _pool->total_allocated_bytes() : 0;
+}
+
+void prefetching_cache::evict(std::size_t bytes_to_free)
+{
+  // Nothing to free, nothing holding memory, or a cache on its way down -- in
+  // the last case the evictor is already reclaiming everything it can, and a
+  // demand queued behind the stop sentinel would never be looked at.
+  if (bytes_to_free == 0 || !_armed || _shutting_down.load(std::memory_order_relaxed)) { return; }
+  _eviction_queue.enqueue(cache_request{eviction_request{bytes_to_free}});
+}
+
 void prefetching_cache::drain_and_abandon(request_queue_type& queue) noexcept
 {
-  prefetch_request req;
-  while (queue.try_dequeue(req)) {
-    if (req) { req.producer->mark_abandoned(); }
-    req = {};
+  cache_request entry;
+  while (queue.try_dequeue(entry)) {
+    // Only prefetch requests have anything to abandon: an eviction request owns
+    // no stage machine and no waiter, so dropping it strands nobody.
+    if (auto* req = std::get_if<prefetch_request>(&entry); req != nullptr && *req) {
+      req->producer->mark_abandoned();
+    }
+    entry = {};
   }
 }
 
@@ -1061,44 +1081,57 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
   std::stop_callback cb(st, [this]() {
     SIRIUS_LOG_TRACE("prefetching_cache: evict_loop received stop request, unblocking queue");
     // unblock the worker if it's waiting on an empty queueue
-    _eviction_queue.enqueue(prefetch_request{});
+    _eviction_queue.enqueue(cache_request{});
   });
 
   // One queued prefetch request plus whether its per-chunk subscriber
   // references have been handed back yet.
-  struct eviction_request {
+  struct tracked_request {
     prefetch_request req;
     bool released{false};
   };
 
-  std::vector<eviction_request> eviction_batch;
+  std::vector<tracked_request> eviction_batch;
   // Reclaimed buffers grouped by their origin NUMA node so each group can be
   // returned to the arena it came from.
   std::unordered_map<int, std::vector<std::byte*>> reclaim_by_numa;
   while (!_shutting_down && !st.stop_requested()) {
-    prefetch_request req;
-    _eviction_queue.wait_dequeue(req);
+    cache_request entry;
+    _eviction_queue.wait_dequeue(entry);
 
-    // A null request is the "free some memory now" sentinel a caller sends when
-    // the pool cannot satisfy an allocation.  It has to survive into the
-    // eviction decision below rather than be skipped past, or the back-pressure
-    // signal does nothing and the pool never recovers.
-    bool eviction_requested = false;
-    auto absorb             = [&](prefetch_request&& r) {
-      if (r) {
-        eviction_batch.push_back({std::move(r), false});
-      } else {
-        eviction_requested = true;
-      }
+    // Bytes explicitly demanded this round, summed across every eviction
+    // request absorbed below.  Summed rather than maxed: two callers each short
+    // by their own amount are short by the total, and serving only the larger
+    // leaves the other one still waiting.
+    std::size_t requested_bytes = 0;
+    bool eviction_requested     = false;
+    auto absorb                 = [&](cache_request&& e) {
+      std::visit(
+        [&](auto&& r) {
+          using T = std::decay_t<decltype(r)>;
+          if constexpr (std::is_same_v<T, prefetch_request>) {
+            // A falsy request is the wakeup sentinel and names no chunks, so
+            // there is nothing to track -- it has already done its job by
+            // getting the loop past wait_dequeue.
+            if (r) { eviction_batch.push_back({std::move(r), false}); }
+          } else {
+            // An explicit demand has to survive into the eviction decision
+            // below rather than be skipped past, or the back-pressure signal
+            // does nothing and the pool never recovers.
+            eviction_requested = true;
+            requested_bytes += r.bytes_to_free;
+          }
+        },
+        std::move(e));
     };
 
     // Accumulate newly-queued requests into the persistent batch.  The batch is
     // NOT cleared each round: a request is retired only once every chunk it
     // named has been reclaimed or taken over, so chunks that are busy this
     // round stay candidates for a later one instead of being lost.
-    absorb(std::move(req));
-    while (_eviction_queue.try_dequeue(req)) {
-      absorb(std::move(req));
+    absorb(std::move(entry));
+    while (_eviction_queue.try_dequeue(entry)) {
+      absorb(std::move(entry));
     }
 
     if (_shutting_down || st.stop_requested()) { break; }
@@ -1124,10 +1157,23 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
       _cfg.dispose_on_idle || eviction_requested || _pool->should_start_evicting();
     if (!should_evict) { continue; }
 
-    size_t const need =
-      _cfg.dispose_on_idle
-        ? std::numeric_limits<size_t>::max()
-        : static_cast<size_t>(static_cast<double>(_pool->total_allocated_chunks()) * 0.25);
+    // Under pressure the target is a fraction of what the pool holds; an
+    // explicit demand raises it to at least what was asked for.  A floor rather
+    // than a replacement, so a demand that arrives while the pool is ALSO over
+    // its own threshold does not talk the evictor down to the smaller of the
+    // two -- both reasons to free memory are still true.
+    size_t need = 0;
+    if (_cfg.dispose_on_idle) {
+      need = std::numeric_limits<size_t>::max();
+    } else {
+      if (_pool->should_start_evicting()) {
+        need = static_cast<size_t>(static_cast<double>(_pool->total_allocated_chunks()) * 0.25);
+      }
+      // Rounded up: freeing whole chunks is the only granularity there is, so a
+      // demand for part of one still costs the whole thing.
+      auto const chunk_bytes = std::max<size_t>(_pool->chunk_size(), 1);
+      need                   = std::max(need, (requested_bytes + chunk_bytes - 1) / chunk_bytes);
+    }
 
     for (auto& [_, buffers] : reclaim_by_numa) {
       buffers.clear();
@@ -1169,7 +1215,7 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
     // named is either reclaimed or now owned by somebody else.  Counting our
     // own evictions instead would strand every request that shares a chunk:
     // whoever loses the race to reclaim it could never reach its own count.
-    std::erase_if(eviction_batch, [](eviction_request const& er) {
+    std::erase_if(eviction_batch, [](tracked_request const& er) {
       if (!er.req || !er.req.chunks) { return true; }
       if (!er.released) { return false; }
       return std::ranges::all_of(*er.req.chunks, [](cached_chunk const* c) {

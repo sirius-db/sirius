@@ -38,6 +38,7 @@
 #include <stop_token>
 #include <thread>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 namespace sirius::io {
@@ -122,7 +123,34 @@ struct prefetch_request {
   }
 };
 
-using request_queue_type = duckdb_moodycamel::BlockingConcurrentQueue<prefetch_request>;
+/// A standing demand on the evictor: free at least @p bytes_to_free bytes of
+/// staging memory, whether or not the pool has crossed its own pressure
+/// threshold.
+///
+/// The evictor's own trigger is a fraction of what the pool holds, which is the
+/// right rule when the cache is the only thing under pressure and the wrong one
+/// when it is not: a caller that needs a specific amount back -- because its own
+/// allocation just failed, or because it is about to make a large one -- knows a
+/// number the cache cannot derive.  This carries that number.
+///
+/// A demand, not a guarantee: the evictor frees what it can reclaim and does not
+/// report back.  Chunks a reader has pinned stay put, so a request for more than
+/// is reclaimable simply frees everything reclaimable.
+struct eviction_request {
+  std::size_t bytes_to_free{0};
+};
+
+/// What the evictor's queue carries.  Two things reach it: prefetch requests,
+/// handed over at creation so their chunks become eviction candidates once the
+/// consumer is done, and explicit demands for memory back.  They are different
+/// enough that a single struct would have to encode "which kind am I" in a
+/// field, so the queue carries the variant and the loop visits it.
+///
+/// A default-constructed value holds an empty @ref prefetch_request, which is
+/// the queue's wakeup sentinel -- see @ref prefetching_cache::evict_loop.
+using cache_request = std::variant<prefetch_request, eviction_request>;
+
+using request_queue_type = duckdb_moodycamel::BlockingConcurrentQueue<cache_request>;
 
 class prefetching_handle {
  public:
@@ -257,6 +285,32 @@ class prefetching_cache {
   /// with the outcome — inline when no IO is issued, otherwise from the IO
   /// completion.  Returns whether IO was issued.
   bool prefetch(prefetching_handle& handle, exec::invocable<void(bool) noexcept> on_done);
+
+  /// Bytes of staging memory the cache currently holds: every chunk buffer
+  /// handed out by the pool and not yet reclaimed.  This is what an explicit
+  /// @ref evict can act on -- the ceiling on how much it could ever free, and
+  /// the number to re-read afterwards to see how much it did.
+  ///
+  /// A relaxed read of a counter other threads are moving, so it is a snapshot
+  /// rather than a value to compute an exact target from.
+  [[nodiscard]] std::size_t claimed_bytes() const noexcept;
+
+  /// Ask the evictor to free at least @p bytes_to_free bytes of staging memory.
+  ///
+  /// Asynchronous and best-effort: this enqueues the demand and returns.  The
+  /// evictor gets to it on its next round and frees what it can -- chunks a
+  /// reader has pinned are not reclaimable, so a demand larger than what is
+  /// reclaimable frees everything reclaimable and no more.  Poll
+  /// @ref claimed_bytes to see the result.
+  ///
+  /// The point of it is that memory pressure is not always the cache's own: the
+  /// evictor's built-in trigger fires on the pool's occupancy, which says
+  /// nothing about a GPU allocation failing elsewhere.  This is how something
+  /// that knows it needs host memory back says so.
+  ///
+  /// A zero request is a no-op, as is one on a cache that is not armed or is
+  /// already shutting down.
+  void evict(std::size_t bytes_to_free);
 
   [[nodiscard]] std::string summary() const;
 
