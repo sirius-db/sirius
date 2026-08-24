@@ -354,11 +354,6 @@ const sirius_pipeline* gpu_pipeline_task::get_pipeline() const
   return _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
 }
 
-sirius_pipeline* gpu_pipeline_task::get_pipeline()
-{
-  return _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
-}
-
 std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_stream_view stream)
 {
   auto pipeline     = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();

@@ -142,11 +142,13 @@ TEST_CASE("a finalize throw in the task destructor does not abort, and completio
   CHECK(pipeline->get_tasks_created() == 1);
   CHECK(pipeline->get_tasks_completed() == 1);
 
-  // The error is parked for whoever destroyed the task, and is handed out exactly once.
-  auto parked = pipeline->take_task_completion_error();
-  REQUIRE(parked != nullptr);
-  CHECK(message_of(parked) == kFinalizeThrowMessage);
-  CHECK(pipeline->take_task_completion_error() == nullptr);
+  // The snapshot pairs the finished flag with the parked error, and the error stays parked so
+  // every observer sees it (report_error downstream is first-wins).
+  auto completion = pipeline->get_completion_status();
+  CHECK(completion.finished);
+  REQUIRE(completion.error != nullptr);
+  CHECK(message_of(completion.error) == kFinalizeThrowMessage);
+  CHECK(pipeline->get_completion_status().error != nullptr);
 }
 
 TEST_CASE("a throw raised before the pipeline_finished flip is still parked for the caller",
@@ -164,11 +166,9 @@ TEST_CASE("a throw raised before the pipeline_finished flip is still parked for 
 
   make_task(global_state).reset();
 
-  CHECK_FALSE(pipeline->is_pipeline_finished());
-
-  auto parked = pipeline->take_task_completion_error();
-  REQUIRE(parked != nullptr);
-  CHECK(message_of(parked).find("First node of pipeline is nullptr") != std::string::npos);
+  auto completion = pipeline->get_completion_status();
+  CHECK_FALSE(completion.finished);
+  REQUIRE(completion.error != nullptr);
 }
 
 TEST_CASE("only the first task-completion error is kept",
@@ -181,10 +181,82 @@ TEST_CASE("only the first task-completion error is kept",
   pipeline->record_task_completion_error(std::make_exception_ptr(std::runtime_error("second")));
   pipeline->record_task_completion_error(nullptr);
 
-  auto parked = pipeline->take_task_completion_error();
-  REQUIRE(parked != nullptr);
-  CHECK(message_of(parked) == "first");
-  CHECK(pipeline->take_task_completion_error() == nullptr);
+  auto completion = pipeline->get_completion_status();
+  REQUIRE(completion.error != nullptr);
+  CHECK(message_of(completion.error) == "first");
+}
+
+namespace {
+
+// Flips pipeline_finished, then blocks in finalize until released — holding
+// update_pipeline_status() mid-throw so a concurrent status snapshot lands in the window
+// between the flip and the park.
+class gated_throwing_finalize_operator : public sirius::op::sirius_physical_operator {
+ public:
+  gated_throwing_finalize_operator()
+    : sirius_physical_operator(
+        SiriusPhysicalOperatorType::FILTER, duckdb::vector<sirius::logical_type>{}, 0)
+  {
+  }
+
+  std::string get_name() const override { return "gated_throwing_finalize_operator"; }
+
+  bool is_limit_exhausted() const override { return true; }
+
+  std::atomic<bool> in_finalize{false};
+  std::atomic<bool> release{false};
+
+ protected:
+  void on_finalize_operator() override
+  {
+    in_finalize.store(true);
+    while (!release.load()) {
+      std::this_thread::yield();
+    }
+    throw std::runtime_error(kFinalizeThrowMessage);
+  }
+};
+
+}  // namespace
+
+TEST_CASE("a status snapshot taken during a finalize throw never sees finished without the error",
+          "[pipeline][gpu_pipeline_task][finalize_throw]")
+{
+  // Regression for the flip-vs-park race: pipeline_finished is stored before the finalize loop,
+  // so a sibling task's epilogue could once observe the flip, find no parked error yet, and
+  // report the query successful. The park now shares the flip's critical section, so the
+  // snapshot below must block until the error is visible.
+  auto pipeline = duckdb::make_shared_ptr<sirius_pipeline>(
+    sirius::pipeline::pipeline_build_context{sirius::test::make_test_telemetry_context()});
+  pipeline->set_pipeline_id(13);
+
+  gated_throwing_finalize_operator op;
+  sirius_pipeline_build_state build_state;
+  build_state.add_pipeline_operator(*pipeline, op);
+
+  auto global_state = std::make_shared<sirius_pipeline_task_global_state>(
+    pipeline, sirius::test::make_test_telemetry_context());
+
+  std::thread destroyer([&] { make_task(global_state).reset(); });
+
+  // The destructor is inside finalize: pipeline_finished is already stored, the throw has not
+  // happened yet — the exact window the race lived in.
+  while (!op.in_finalize.load()) {
+    std::this_thread::yield();
+  }
+
+  sirius_pipeline::completion_status observed;
+  std::thread observer([&] { observed = pipeline->get_completion_status(); });
+
+  // Give the observer time to reach the snapshot lock while finalize still blocks.
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  op.release.store(true);
+  observer.join();
+  destroyer.join();
+
+  CHECK(observed.finished);
+  REQUIRE(observed.error != nullptr);
+  CHECK(message_of(observed.error) == kFinalizeThrowMessage);
 }
 
 namespace {

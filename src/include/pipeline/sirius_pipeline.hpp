@@ -195,11 +195,20 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   void mark_task_completed();
 
   //! Park an exception that escaped mark_task_completed(), for whoever destroyed the task to
-  //! claim. Only the first is kept; later ones are symptoms of it.
+  //! observe. Only the first is kept; later ones are symptoms of it.
   void record_task_completion_error(std::exception_ptr error) noexcept;
 
-  //! Remove and return the parked error, or nullptr if there is none.
-  [[nodiscard]] std::exception_ptr take_task_completion_error() noexcept;
+  //! One locked snapshot of pipeline_finished plus any parked completion error.
+  struct completion_status {
+    bool finished = false;
+    std::exception_ptr error;
+  };
+
+  //! update_pipeline_status() parks a finalize throw in the same _status_mutex critical section
+  //! that flips pipeline_finished, and this reads both under that mutex: an observer can never
+  //! see the pipeline finished without also seeing the error. The error stays parked
+  //! (report_error is first-wins downstream), so every observer sees it.
+  [[nodiscard]] completion_status get_completion_status() const noexcept;
 
   //! Observers for the per-pipeline task counters (testing / diagnostics).
   [[nodiscard]] std::size_t get_tasks_created() const { return tasks_created.load(); }
@@ -283,9 +292,8 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   std::atomic<std::size_t> tasks_created   = 0;
   std::atomic<std::size_t> tasks_completed = 0;
 
-  //! First exception that escaped mark_task_completed(), waiting to be claimed. Not guarded by
-  //! _status_mutex: it is recorded while unwinding out of that lock.
-  std::mutex _task_completion_error_mutex;
+  //! First exception that escaped mark_task_completed(). Guarded by _status_mutex so it is
+  //! recorded atomically with the pipeline_finished flip it may have interrupted.
   std::exception_ptr _task_completion_error;
 
   //! NVTX process-wide range tracking the pipeline's active lifetime

@@ -383,7 +383,24 @@ void task_creator::manager_loop()
       visited_pipelines.erase(std::unique(visited_pipelines.begin(), visited_pipelines.end()),
                               visited_pipelines.end());
       for (auto& visited : visited_pipelines) {
-        visited->update_pipeline_status(false);
+        // update_pipeline_status() runs finalize_operator() device work that can throw, and an
+        // exception escaping this thread is std::terminate. Unlike the dispatch-lambda catch
+        // below, stop() must not be called here — it joins this very thread.
+        try {
+          visited->update_pipeline_status(false);
+        } catch (const std::exception& e) {
+          SIRIUS_LOG_ERROR("Task Creator: pipeline {} threw while re-evaluating its status: {}",
+                           visited->get_pipeline_id(),
+                           e.what());
+          _task_scheduler->terminate_query(std::current_exception());
+          break;
+        } catch (...) {
+          SIRIUS_LOG_ERROR(
+            "Task Creator: pipeline {} threw a non-std exception while re-evaluating its status",
+            visited->get_pipeline_id());
+          _task_scheduler->terminate_query(std::current_exception());
+          break;
+        }
       }
       continue;
     }

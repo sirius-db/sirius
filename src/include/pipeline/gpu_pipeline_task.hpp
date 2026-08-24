@@ -192,13 +192,6 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
   const sirius_pipeline* get_pipeline() const;
 
   /**
-   * @brief Get the GPU pipeline associated with this task, for mutation.
-   *
-   * @return sirius_pipeline* Pointer to the GPU pipeline
-   */
-  sirius_pipeline* get_pipeline();
-
-  /**
    * @brief Compute and return the output data batches for this task.
    *
    * Executes the GPU pipeline on the input batches and returns the computed results.

@@ -391,40 +391,50 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
     if (pipeline_finished.load()) {
       should_notify = true;
     } else {
-      op::sirius_physical_operator* first_node =
-        operators.size() > 0 ? &operators[0].get() : (sink ? sink.get() : nullptr);
-      if (first_node == nullptr) { throw internal_exception("First node of pipeline is nullptr"); }
-      // Check if any operator has exhausted its limit — this allows the pipeline to finish
-      // early without waiting for the source pipeline to drain all remaining batches.
-      bool limit_exhausted = false;
-      for (auto& op_ref : operators) {
-        if (op_ref.get().is_limit_exhausted()) {
-          limit_exhausted = true;
-          break;
+      try {
+        op::sirius_physical_operator* first_node =
+          operators.size() > 0 ? &operators[0].get() : (sink ? sink.get() : nullptr);
+        if (first_node == nullptr) {
+          throw internal_exception("First node of pipeline is nullptr");
         }
-      }
-      // Source-exhaustion conjunct: the task
-      // counters can be transiently balanced (0==0 before the first split
-      // arrives, or all-done-before-close), so finishing additionally requires
-      // the pipeline's SOURCE MEMBER — get_operators()/first_node excludes it —
-      // to be past the point where it could ever create another task. For a GPU
-      // scan source, all_ports_empty() is split_connector::is_closed() (closed
-      // AND drained); port-less sources are trivially exhausted. limit_exhausted
-      // keeps its early exit: it finishes without draining the source.
-      bool source_exhausted =
-        !source || (source->is_source_pipeline_finished() && source->all_ports_empty());
-      if (limit_exhausted || (source_exhausted && first_node->is_source_pipeline_finished() &&
-                              first_node->all_ports_empty())) {
-        if (tasks_created.load() == tasks_completed.load()) {
-          pipeline_finished.store(true);
-          for (auto& op : get_operators()) {
-            op.get().finalize_operator();
+        // Check if any operator has exhausted its limit — this allows the pipeline to finish
+        // early without waiting for the source pipeline to drain all remaining batches.
+        bool limit_exhausted = false;
+        for (auto& op_ref : operators) {
+          if (op_ref.get().is_limit_exhausted()) {
+            limit_exhausted = true;
+            break;
           }
-          end_nvtx_range_if_finished();
-          should_notify = true;
         }
+        // Source-exhaustion conjunct: the task
+        // counters can be transiently balanced (0==0 before the first split
+        // arrives, or all-done-before-close), so finishing additionally requires
+        // the pipeline's SOURCE MEMBER — get_operators()/first_node excludes it —
+        // to be past the point where it could ever create another task. For a GPU
+        // scan source, all_ports_empty() is split_connector::is_closed() (closed
+        // AND drained); port-less sources are trivially exhausted. limit_exhausted
+        // keeps its early exit: it finishes without draining the source.
+        bool source_exhausted =
+          !source || (source->is_source_pipeline_finished() && source->all_ports_empty());
+        if (limit_exhausted || (source_exhausted && first_node->is_source_pipeline_finished() &&
+                                first_node->all_ports_empty())) {
+          if (tasks_created.load() == tasks_completed.load()) {
+            pipeline_finished.store(true);
+            for (auto& op : get_operators()) {
+              op.get().finalize_operator();
+            }
+            end_nvtx_range_if_finished();
+            should_notify = true;
+          }
+        }
+        if (!pipeline_finished.load()) { end_nvtx_range_if_finished(); }
+      } catch (...) {
+        // Park while still holding _status_mutex, the critical section that may have just
+        // flipped pipeline_finished: a status snapshot that sees the flip then also sees this
+        // error, so no sibling task's epilogue can report the query successful ahead of it.
+        if (!_task_completion_error) { _task_completion_error = std::current_exception(); }
+        throw;
       }
-      if (!pipeline_finished.load()) { end_nvtx_range_if_finished(); }
     }
   }  // _status_mutex released here — notify_downstream_pipelines must run outside the lock
      // to avoid holding the child pipeline mutex while acquiring a parent's
@@ -491,14 +501,14 @@ void sirius_pipeline::mark_task_completed()
 void sirius_pipeline::record_task_completion_error(std::exception_ptr error) noexcept
 {
   if (!error) { return; }
-  std::lock_guard<std::mutex> lock(_task_completion_error_mutex);
+  std::lock_guard<std::mutex> lock(_status_mutex);
   if (!_task_completion_error) { _task_completion_error = std::move(error); }
 }
 
-std::exception_ptr sirius_pipeline::take_task_completion_error() noexcept
+sirius_pipeline::completion_status sirius_pipeline::get_completion_status() const noexcept
 {
-  std::lock_guard<std::mutex> lock(_task_completion_error_mutex);
-  return std::exchange(_task_completion_error, nullptr);
+  std::lock_guard<std::mutex> lock(_status_mutex);
+  return {pipeline_finished.load(), _task_completion_error};
 }
 
 std::vector<op::sirius_physical_operator*> sirius_pipeline::get_output_consumers() const
