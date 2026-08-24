@@ -59,6 +59,16 @@ enum class delim_direct_refusal : uint8_t {
   /// Some duplicate-eliminated column is not pinned by any join-back condition, so an outer row
   /// is not provably matched against its own correlation key.
   delim_column_mismatch,
+  /// A DELIM_GET column's type differs from the duplicate-eliminated column that produced it, so
+  /// the correlated condition was typed against a different value than the one the rewrite
+  /// substitutes. Also the type half of the DELIM_GET-ownership proof (see nested_delim_context).
+  delim_column_type_mismatch,
+  /// The candidate sits inside another DELIM join that kept its delim lowering, so the matched
+  /// DELIM_GET's owner is not locally provable -- it could be the enclosing join's. Supplied by
+  /// sirius_physical_plan_generator, which is the only place that knows what is still being
+  /// planned above the cursor; classify_delim_direct_lowering, being a pure per-join analysis,
+  /// never returns it.
+  nested_delim_context,
   /// A plain `=` join-back drops NULL-keyed outer rows in ways the direct join cannot
   /// reproduce: either it is paired with a null-safe correlated condition (the direct join would
   /// let the dropped rows match), or its key column has no correlated condition at all (the

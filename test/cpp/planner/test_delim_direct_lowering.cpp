@@ -36,6 +36,7 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
+#include <duckdb/execution/operator/join/join_filter_pushdown.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
@@ -820,4 +821,140 @@ TEST_CASE(
     delim->conditions.pop_back();
     CHECK(classify_name(*delim) == "delim_column_mismatch");
   }
+}
+
+namespace {
+
+/// Every DELIM join in the subtree, outermost first.
+void find_delim_joins(LogicalOperator* op, std::vector<LogicalComparisonJoin*>& out)
+{
+  if (!op) { return; }
+  if (op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+    out.push_back(&op->Cast<LogicalComparisonJoin>());
+  }
+  for (auto& child : op->children) {
+    find_delim_joins(child.get(), out);
+  }
+}
+
+/// A doubly-correlated shape: a scalar-aggregate correlation (which the pass refuses outright)
+/// wrapping an EXISTS correlation that is eligible on its own. The inner candidate's DELIM_GET is
+/// therefore reached while the outer delim join is still live.
+constexpr const char* nested_delim_query =
+  "SELECT t1.id FROM outer_t t1 WHERE t1.val < "
+  "(SELECT 0.5 * avg(t2.val) FROM outer_t t2 WHERE t2.id = t1.id AND EXISTS "
+  "(SELECT 1 FROM inner_t i WHERE i.rid = t2.id AND i.qty < 100))";
+
+}  // namespace
+
+TEST_CASE_METHOD(delim_classify_fixture,
+                 "delim direct - a DELIM_GET under a live enclosing delim join is not ours",
+                 "[delim_direct][isolated_context]")
+{
+  // The inner candidate is structurally eligible: only its planning context refuses it. Pinning
+  // both halves is what shows the refusal is contextual rather than a shape failure.
+  scoped_planning_session session{*con};
+  auto plan = build_logical_plan(*con, nested_delim_query);
+  std::vector<LogicalComparisonJoin*> delims;
+  find_delim_joins(plan.get(), delims);
+  REQUIRE(delims.size() == 2);
+
+  // Outermost: the scalar-aggregate correlation the pass never claims.
+  CHECK(sirius::planner::to_string(classify_delim_direct_lowering(*delims[0]).refusal) ==
+        "unsupported_join_type");
+  // Innermost: eligible in isolation, which is exactly why the context gate has to exist.
+  CHECK(sirius::planner::to_string(classify_delim_direct_lowering(*delims[1]).refusal) == "none");
+}
+
+TEST_CASE_METHOD(delim_direct_fixture,
+                 "delim direct - a nested delim candidate is refused, a plain one is not",
+                 "[delim_direct][isolated_context]")
+{
+  auto shape_of = [&](const std::string& sql) {
+    auto plan = generate_sirius_plan(sql);
+    REQUIRE(plan);
+    std::vector<SiriusPhysicalOperatorType> shape;
+    for_each_operator(plan.get(),
+                      [&shape](sirius_physical_operator* op) { shape.push_back(op->type); });
+    return shape;
+  };
+
+  auto& params = operator_params();
+  auto restore = [&params]() { params.enable_delim_direct_lowering = true; };
+  try {
+    // Nothing in the doubly-correlated plan may be lowered, so the pass changes it not at all:
+    // its plan must be operator-for-operator identical to the knob-off plan.
+    auto const nested_on                = shape_of(nested_delim_query);
+    params.enable_delim_direct_lowering = false;
+    CHECK(shape_of(nested_delim_query) == nested_on);
+    params.enable_delim_direct_lowering = true;
+  } catch (...) {
+    restore();
+    throw;
+  }
+  restore();
+
+  // No false positive: a singly-correlated candidate has no live enclosing delim join and is
+  // still lowered.
+  auto plan = generate_sirius_plan(exists_query);
+  REQUIRE(plan);
+  CHECK_FALSE(contains_delim_machinery(plan.get()));
+}
+
+TEST_CASE_METHOD(delim_classify_fixture,
+                 "delim direct - a retyped DELIM_GET column is refused",
+                 "[delim_direct][isolated_context]")
+{
+  // The rewrite substitutes the outer source column for the dedup key, so the two must agree on
+  // type; matching counts alone does not establish that.
+  CHECK(classify_query(exists_query, [](LogicalComparisonJoin& delim) {
+          auto& join            = sandwich_inner_join(delim);
+          const bool delim_left = join.children[0]->type == LogicalOperatorType::LOGICAL_DELIM_GET;
+          auto& delim_get       = join.children[delim_left ? 0 : 1]->Cast<LogicalDelimGet>();
+          REQUIRE_FALSE(delim_get.chunk_types.empty());
+          REQUIRE(delim_get.chunk_types[0] != LogicalType::BIGINT);
+          delim_get.chunk_types[0] = LogicalType::BIGINT;
+        }) == "delim_column_type_mismatch");
+}
+
+TEST_CASE_METHOD(delim_classify_fixture,
+                 "delim direct - the rewrite drops metadata indexed against the old conditions",
+                 "[delim_direct][isolated_context]")
+{
+  scoped_planning_session session{*con};
+  auto plan   = build_logical_plan(*con, exists_query);
+  auto* delim = find_delim_join(plan.get());
+  REQUIRE(delim != nullptr);
+
+  // Seed both carriers so the assertions below cannot pass by never having been populated.
+  delim->join_stats.push_back(nullptr);
+  delim->filter_pushdown = make_uniq<JoinFilterPushdownInfo>();
+  REQUIRE_FALSE(delim->join_stats.empty());
+  REQUIRE(delim->filter_pushdown != nullptr);
+
+  auto analysis = classify_delim_direct_lowering(*delim);
+  REQUIRE(analysis.eligible());
+  sirius::planner::apply_delim_direct_lowering(*delim, std::move(analysis));
+
+  CHECK(delim->join_stats.empty());
+  CHECK(delim->filter_pushdown == nullptr);
+}
+
+TEST_CASE_METHOD(delim_direct_fixture,
+                 "delim direct - the lowered join emits only build-side columns",
+                 "[delim_direct][isolated_context]")
+{
+  // Why clearing the probe's projection map is exact rather than lossy: a right-family join
+  // gathers nothing from its probe side, so every emitted column comes from the build.
+  auto verify = [this](const char* sql, JoinType expected_type) {
+    auto plan = generate_sirius_plan(sql);
+    REQUIRE(plan);
+    auto joins = collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+    REQUIRE(joins.size() == 1);
+    auto& hj = joins[0]->Cast<sirius::op::sirius_physical_hash_join>();
+    REQUIRE(hj.join_type == expected_type);
+    CHECK(hj.rhs_output_columns.col_types == hj.types);
+  };
+  verify(exists_query, JoinType::RIGHT_SEMI);
+  verify(not_exists_query, JoinType::RIGHT_ANTI);
 }

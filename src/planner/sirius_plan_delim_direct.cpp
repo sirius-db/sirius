@@ -71,6 +71,8 @@ const char* to_string(delim_direct_refusal refusal)
     case delim_direct_refusal::inner_condition_shape: return "inner_condition_shape";
     case delim_direct_refusal::join_back_shape: return "join_back_shape";
     case delim_direct_refusal::delim_column_mismatch: return "delim_column_mismatch";
+    case delim_direct_refusal::delim_column_type_mismatch: return "delim_column_type_mismatch";
+    case delim_direct_refusal::nested_delim_context: return "nested_delim_context";
     case delim_direct_refusal::null_safety: return "null_safety";
     case delim_direct_refusal::residual_predicate: return "residual_predicate";
   }
@@ -218,6 +220,16 @@ delim_direct_analysis classify_delim_direct_lowering(duckdb::LogicalComparisonJo
         return column && column->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF;
       })) {
     return refuse(delim_direct_refusal::join_back_shape);
+  }
+  // The rewrite substitutes each duplicate-eliminated source column for the DELIM_GET key it
+  // produced, so the two must agree on type: a mismatch means the correlated condition was typed
+  // against a different value than the one the direct join would compare. Proven rather than
+  // assumed, like every other obligation in this pass.
+  for (std::size_t k = 0; k < key_width; k++) {
+    if (delim_get.chunk_types[k] !=
+        op.duplicate_eliminated_columns[k]->Cast<duckdb::BoundReferenceExpression>().return_type) {
+      return refuse(delim_direct_refusal::delim_column_type_mismatch);
+    }
   }
 
   // --- Match: the correlated conditions must be equality-family with a plain dedup-key side. ---
@@ -379,8 +391,12 @@ void apply_delim_direct_lowering(duckdb::LogicalComparisonJoin& op,
   op.children[0]                = std::move(inner_relation);
   op.children[1]                = std::move(outer_relation);
 
-  // The outer side's projection map moves with it to the right slot; the probe side contributes
-  // no output columns (right-family join), so its map is cleared.
+  // The outer side's projection map moves with it to the right slot. Clearing the probe's map is
+  // exact rather than lossy: a right-family join gathers no columns from its probe side
+  // (gather_join_output sets collect_left = false for RIGHT_SEMI / RIGHT_ANTI, leaving
+  // lhs_output_columns unread), so that map contributes nothing. Sirius applies these maps only
+  // at the join's output gather, never below the join, so neither map has ever narrowed what the
+  // probe's PARTITION / CONCAT carry.
   auto outer_map = std::move(outer_index == 0 ? op.left_projection_map : op.right_projection_map);
   op.left_projection_map.clear();
   op.right_projection_map = std::move(outer_map);
@@ -393,6 +409,14 @@ void apply_delim_direct_lowering(duckdb::LogicalComparisonJoin& op,
   op.duplicate_eliminated_columns.clear();
   op.delim_flipped = false;
   op.type          = duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN;
+
+  // The conditions these describe no longer exist: the dedup-key side was replaced by its outer
+  // source column and the sides were swapped into right-family orientation. Anything indexed
+  // against the old conditions is now wrong rather than merely stale, so drop it instead of
+  // leaving a future reader -- plan_comparison_join moves join_stats into the physical join -- to
+  // be misled by it.
+  op.join_stats.clear();
+  op.filter_pushdown.reset();
 }
 
 }  // namespace sirius::planner

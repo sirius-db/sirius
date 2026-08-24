@@ -35,14 +35,29 @@ namespace sirius::planner {
 
 namespace {
 
-/// Read the delim-direct-lowering enable flag from the active SiriusContext config. Defaults to
-/// enabled (the registered default) when the state is unavailable.
+/// Read the delim-direct-lowering enable flag from the active SiriusContext config. Absent state
+/// means the knob cannot be read, and a default-deny rewrite must not run on an unread
+/// configuration, so the lowering is refused rather than assumed.
 bool delim_direct_lowering_enabled(duckdb::ClientContext& context)
 {
   auto state = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!state) { return true; }
+  if (!state) { return false; }
   return state->get_config().get_operator_params().enable_delim_direct_lowering;
 }
+
+/// Raises the enclosing-DELIM-join depth for a scope. See
+/// sirius_physical_plan_generator::open_delim_join_depth_.
+class open_delim_join_scope {
+ public:
+  explicit open_delim_join_scope(std::size_t& depth) noexcept : _depth(depth) { ++_depth; }
+  ~open_delim_join_scope() { --_depth; }
+
+  open_delim_join_scope(const open_delim_join_scope&)            = delete;
+  open_delim_join_scope& operator=(const open_delim_join_scope&) = delete;
+
+ private:
+  std::size_t& _depth;
+};
 
 // Translate a vector of DuckDB expressions into Sirius AST nodes at the planner
 // boundary. The source vector is drained; size and order are preserved, with a
@@ -90,22 +105,31 @@ sirius_physical_plan_generator::plan_delim_join(duckdb::LogicalComparisonJoin& o
   // (sirius_plan_delim_direct.cpp). Ineligible shapes — with the typed reason logged — keep the
   // regular delim lowering below.
   if (delim_direct_lowering_enabled(context)) {
-    auto analysis = classify_delim_direct_lowering(op);
+    // A DELIM_GET reached under a still-live enclosing delim join is not provably ours, so the
+    // context gate short-circuits the structural classifier.
+    auto analysis = open_delim_join_depth_ > 0
+                      ? delim_direct_analysis{delim_direct_refusal::nested_delim_context}
+                      : classify_delim_direct_lowering(op);
     if (analysis.eligible()) {
       apply_delim_direct_lowering(op, std::move(analysis));
-      SIRIUS_LOG_INFO(
+      SIRIUS_LOG_DEBUG(
         "[delim_direct] Lowered a DELIM join to a direct {} hash join with {} condition(s).",
         duckdb::EnumUtil::ToString(op.join_type),
         op.conditions.size());
       return plan_comparison_join(op);
     }
-    SIRIUS_LOG_INFO("[delim_direct] Keeping the DELIM lowering for a {} delim join: {}.",
-                    duckdb::EnumUtil::ToString(op.join_type),
-                    to_string(analysis.refusal));
+    SIRIUS_LOG_DEBUG("[delim_direct] Keeping the DELIM lowering for a {} delim join: {}.",
+                     duckdb::EnumUtil::ToString(op.join_type),
+                     to_string(analysis.refusal));
   }
 
-  // first create the underlying join
-  auto plan = plan_comparison_join(op);
+  // first create the underlying join. This delim join keeps its lowering, so its
+  // duplicate-eliminated data stays live for everything planned beneath it.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan;
+  {
+    open_delim_join_scope nested_guard(open_delim_join_depth_);
+    plan = plan_comparison_join(op);
+  }
   // this should create a join, not a cross product
   D_ASSERT(plan && plan->type != sirius::op::SiriusPhysicalOperatorType::CROSS_PRODUCT);
   // duplicate eliminated join

@@ -892,6 +892,24 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
      .join_mode                      = _join_mode,
      .estimated_probe_to_build_ratio = estimated_probe_to_build_ratio});
 
+  // Residual R2: this join took build-driven sizing so its membership filter could publish from a
+  // single folded build, but the build did not fit one partition, so nothing will publish. The
+  // probe is then both unfiltered and -- because the build is the side that was measured --
+  // unbounded by the partition count, leaving it to the fold guard in gpu_merge_impl::concat.
+  if (in.is_build_side && strategy.num_partitions > 1 &&
+      sizes_build_driven_for_filter_publication()) {
+    SIRIUS_LOG_WARN(
+      "sirius_physical_hash_join id {}: {} join sized {} partitions from a {}-byte build, so no "
+      "dynamic filter can publish; its probe will be neither filtered nor bounded by the "
+      "partition count (build_card_est {}, probe_card_est {})",
+      this->get_operator_id(),
+      duckdb::JoinTypeToString(join_type),
+      strategy.num_partitions,
+      in.total_bytes,
+      build_card_est,
+      probe_card_est);
+  }
+
   if (join_type == duckdb::JoinType::MARK && _num_gpus > 1 && in.is_build_side &&
       in.total_bytes >= partition_small_table_bytes(_num_gpus)) {
     SIRIUS_LOG_WARN(
