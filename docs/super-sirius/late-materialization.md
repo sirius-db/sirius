@@ -159,6 +159,10 @@ deferral with a single half, admitted only over pinned columns with no nulls. Of
 
 - A column an outer join could null is withheld: a null rowid must materialize a null, which the
   materializer does not do yet.
+- A nullable PINNED SOURCE column is admitted only for a single, uncompressed chunk — the one
+  gather shape (a plain `cudf::gather`) that propagates validity. A multi-batch column or a
+  compressed origin is still refused if it has any nulls: the multi-batch raw gather and every
+  compressed decode route write values only, with no output validity buffer at all.
 - A compressed origin cannot skip its decode — the scan substitutes on the FINISHED output, so a
   deferred column from a compressed pin is decompressed and then discarded.
 - Filtered scans of compressed pins are refused (above).
