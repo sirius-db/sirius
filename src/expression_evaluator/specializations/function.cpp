@@ -64,8 +64,7 @@ like_multiliteral_cache::entry_ptr const& expression_evaluator::get_or_classify_
 
   auto classification = _like_cache->get_or_classify(pattern);
   ++_like_shared_cache_lookup_count;
-  return _like_classifications
-    .emplace(std::string(pattern), std::move(classification))
+  return _like_classifications.emplace(std::string(pattern), std::move(classification))
     .first->second;
 }
 

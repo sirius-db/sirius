@@ -218,8 +218,8 @@ TEST_CASE("like_multiliteral classifier accepts %lit...% shapes",
 TEST_CASE("like_multiliteral classifier refuses everything else",
           "[expression_evaluator][like_multiliteral]")
 {
-  STATIC_REQUIRE_FALSE((std::is_constructible_v<sirius::like_multiliteral_pattern,
-                                                std::vector<std::string>>));
+  STATIC_REQUIRE_FALSE(
+    (std::is_constructible_v<sirius::like_multiliteral_pattern, std::vector<std::string>>));
 
   // Anchored / non-%-delimited shapes (q16's 'PROMO POLISHED%' shape included).
   CHECK_FALSE(classify_like_multiliteral("PROMO POLISHED%", {}).has_value());

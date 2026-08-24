@@ -36,10 +36,10 @@ constexpr int max_literals      = like_multiliteral_max_literals;
 constexpr int max_chunks        = detail::like_multiliteral_max_chunks;
 constexpr int threads_per_block = 256;
 constexpr int word_shift        = 3;
-constexpr int bytes_per_word     = 1 << word_shift;
-constexpr int word_mask          = bytes_per_word - 1;
-constexpr int bits_per_byte      = 8;
-constexpr int bits_per_word      = bytes_per_word * bits_per_byte;
+constexpr int bytes_per_word    = 1 << word_shift;
+constexpr int word_mask         = bytes_per_word - 1;
+constexpr int bits_per_byte     = 8;
+constexpr int bits_per_word     = bytes_per_word * bits_per_byte;
 
 static_assert(bytes_per_word == sizeof(uint64_t));
 
@@ -68,9 +68,7 @@ __device__ __forceinline__ uint64_t load_aligned_word(uint64_t const* __restrict
 {
   auto const byte_pos = word_index << word_shift;
   if (byte_pos >= chars_size) { return 0; }
-  if (chars_size - byte_pos >= static_cast<int64_t>(bytes_per_word)) {
-    return words[word_index];
-  }
+  if (chars_size - byte_pos >= static_cast<int64_t>(bytes_per_word)) { return words[word_index]; }
   auto const* tail = reinterpret_cast<unsigned char const*>(words) + byte_pos;
   uint64_t value   = 0;
 #pragma unroll

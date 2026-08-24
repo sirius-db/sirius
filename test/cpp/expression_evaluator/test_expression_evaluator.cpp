@@ -1742,8 +1742,8 @@ TEMPLATE_TEST_CASE("select LIKE and NOT LIKE",
                           /*like_swar_fastpath=*/true,
                           like_cache);
 
-    auto first  = executor.select(repr.get_table_view());
-    auto second = executor.select(repr.get_table_view());
+    auto first               = executor.select(repr.get_table_view());
+    auto second              = executor.select(repr.get_table_view());
     auto const input_strings = copy_string_column_to_host(repr.get_table_view().column(0));
     std::vector<std::string> expected;
     for (auto const& value : input_strings) {
