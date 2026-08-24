@@ -427,6 +427,26 @@ class sirius_scan_manager {
   ///        still running.
   void reset();
 
+  /// \brief Drop every ioctx's prefetching cache and build a fresh one.
+  ///
+  /// Every cached chunk is released and the file entries go with them, so the
+  /// next query starts from an empty cache rather than one carrying the last
+  /// query's residency and counters.  That is the point of it: a benchmark run
+  /// that wants each iteration to pay its own IO cannot get there by waiting,
+  /// because the cache holds what it holds until something evicts it.
+  ///
+  /// A no-op for any context the configuration or the backend does not give a
+  /// cache to -- @c cache.mode other than @c sirius, or a backend that cannot
+  /// serve vector host reads.  Such a context has nothing to drop and nothing
+  /// to rebuild, and this leaves it exactly as it was rather than teaching it
+  /// to cache.
+  ///
+  /// NOT safe against a running query: dropping a cache frees the chunk buffers
+  /// live @c prefetching_handle instances point at.  The caller is responsible
+  /// for excluding execution -- through the extension this runs under a
+  /// @c SiriusContext::SlotGuard, which is what makes it safe there.
+  void reset_caches();
+
   /// \brief Start the worker thread pool. Idempotent.
   void start();
 

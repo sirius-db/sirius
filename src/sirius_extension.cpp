@@ -1508,6 +1508,49 @@ void SiriusExtension::UnpinTableFunction(ClientContext& context,
   data.finished = true;
 }
 
+struct ResetSiriusCacheFunctionData : public TableFunctionData {
+  bool finished = false;
+};
+
+unique_ptr<FunctionData> SiriusExtension::ResetSiriusCacheBind(ClientContext& context,
+                                                               TableFunctionBindInput& input,
+                                                               vector<LogicalType>& return_types,
+                                                               vector<string>& names)
+{
+  return_types.emplace_back(LogicalType::BOOLEAN);
+  names.emplace_back("Success");
+  return make_uniq<ResetSiriusCacheFunctionData>();
+}
+
+void SiriusExtension::ResetSiriusCacheFunction(ClientContext& context,
+                                               TableFunctionInput& data_p,
+                                               DataChunk& output)
+{
+  auto& data = data_p.bind_data->CastNoConst<ResetSiriusCacheFunctionData>();
+  if (data.finished) { return; }
+
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw InvalidInputException("reset_sirius_cache requires the Sirius context to be initialized");
+  }
+  if (sirius_ctx->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE) {
+    sirius_ctx->throw_runtime_unavailable();
+  }
+  {
+    // The slot is what makes this safe rather than merely usually safe: dropping
+    // a cache frees the chunk buffers a running query's prefetching handles
+    // point at, so the reset has to be serialized against execution windows the
+    // same way pinned-registry mutation is.  A lock-only guard suffices --
+    // rebuilding a cache creates no per-query runtime state to clean up.
+    duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
+    sirius_ctx->get_scan_manager().reset_caches();
+  }
+
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value::BOOLEAN(true));
+  data.finished = true;
+}
+
 struct ProfilerFunctionData : public GlobalTableFunctionState {
   bool finished = false;
 };
@@ -1661,6 +1704,13 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     "unpin_table", {LogicalType::VARCHAR}, UnpinTableFunction, UnpinTableBind);
   CreateTableFunctionInfo unpin_table_info(unpin_table);
   catalog.CreateTableFunction(transaction, unpin_table_info);
+
+  // Drop and rebuild the prefetching caches — a benchmark that wants each
+  // iteration to pay its own IO has no other way to get a cold cache.
+  TableFunction reset_sirius_cache(
+    "reset_sirius_cache", {}, ResetSiriusCacheFunction, ResetSiriusCacheBind);
+  CreateTableFunctionInfo reset_sirius_cache_info(reset_sirius_cache);
+  catalog.CreateTableFunction(transaction, reset_sirius_cache_info);
 }
 
 // Process-global Config writes are refused once the Sirius runtime is

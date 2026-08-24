@@ -922,6 +922,53 @@ void sirius_scan_manager::reset()
   _dispatcher = std::make_unique<exec::scoped_dispatcher>(_thread_pool, _thread_pool.num_threads());
 }
 
+void sirius_scan_manager::reset_caches()
+{
+  // Rebuild one context's cache.  shutdown_cache drains the evictor and every
+  // in-flight IO before releasing the chunks, so by the time it returns nothing
+  // is left pointing into what we are about to replace.
+  auto refresh = [this](sirius::io::ioctx& io_ctx) {
+    bool const had_cache = io_ctx.cache() != nullptr;
+    io_ctx.shutdown_cache();
+    // Asking the same two questions the wiring in the constructor asks, so a
+    // context that was never given a cache is not given one here either.
+    if (!_config.cache.use_prefetching_cache() || !io_ctx.can_use_prefetching_cache()) {
+      // Nothing to rebuild.  Only worth a word when there WAS a cache: a
+      // configuration that never had one is not a surprise worth logging on
+      // every call.
+      if (had_cache) {
+        SIRIUS_LOG_INFO(
+          "[sirius_scan_manager] dropped the prefetching cache for backend {}; the "
+          "configuration does not support caching, so none was rebuilt",
+          static_cast<int>(io_ctx.type()));
+      }
+      return;
+    }
+    io_ctx.initialize_cache(_reservation_manager, _config.cache, _topology_index);
+  };
+
+  if (_io_ctx) {
+    if (_io_ctx->cache()) {
+      // The last account of what this cache did, on the way out -- the counters
+      // go with it, so this is the final moment they mean anything.
+      SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary before reset: {}",
+                      _io_ctx->cache()->summary());
+    }
+    refresh(*_io_ctx);
+  }
+
+  // Held across the rebuild rather than over a copy of the map: a routed
+  // context built while we are half-way through would come up with a cache of
+  // its own and then be handed one again here.  The build path takes
+  // _routed_io_ctxs_build_mtx too, so a concurrent first-touch waits rather
+  // than racing.
+  std::lock_guard build_lk{_routed_io_ctxs_build_mtx};
+  std::lock_guard lk{_routed_io_ctxs_mtx};
+  for (auto& [type, io_ctx] : _routed_io_ctxs) {
+    if (io_ctx) { refresh(*io_ctx); }
+  }
+}
+
 void sirius_scan_manager::start() {}
 
 void sirius_scan_manager::stop()

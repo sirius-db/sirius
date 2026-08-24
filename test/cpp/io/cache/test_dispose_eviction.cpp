@@ -128,14 +128,16 @@ TEST_CASE("dispose_on_idle reclaims a disposed request's chunks on the next swee
     auto ds = manager.create_datasource(file.path.string());
     REQUIRE(ds != nullptr);
     ds->fadvise(ranges, 0);
-    // Let the prepare loop attach staging buffers before the request is
-    // disposed, so the chunks are genuinely reclaimable rather than never
-    // allocated in the first place.
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    // Attach staging buffers before the request is disposed, so the chunks are
+    // genuinely reclaimable rather than never allocated in the first place.
+    // Nothing does this on its own -- fadvise only registers the request and the
+    // chunks it names -- so without this call there is no buffer to reclaim and
+    // the evictor correctly evicts nothing.
+    REQUIRE(ds->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
   }  // ~sirius_datasource -> ~prefetching_handle -> the consumer is disposed
 
-  // The evictor only sweeps when a request reaches it from the prepare loop, so
-  // a second insert is what gives the disposed request its sweep. Reclaiming
+  // The evictor only sweeps when a request reaches it, so a second insert is
+  // what gives the disposed request its sweep. Reclaiming
   // then is the behavior under test: before the size_t/double ternary fix, the
   // `need` target computed to 0 and the reclaim passes were skipped outright,
   // so a disposed request's chunks were never freed under any amount of
