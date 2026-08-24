@@ -58,11 +58,25 @@ operator in between sees the shape it expected and needs to know nothing about a
 both halves carry their own schema and positions, and the consumer matches a batch by its WHOLE
 schema — materializing against the wrong batch would read arbitrary rows of the pinned table.
 `port_materialize_directive` (`defer_directive.hpp`) carries only that schema and the origins it
-was installed for — no producer or operator id. This defends against a loose matcher (a check
-that only asked "is there a rowid-shaped column here" could fire on an unrelated batch), but not
-against two structurally identical batches from different producers at the same port — a
-self-join, or two scans of the same table each installing a bundle. Schema equality is the entire
-identity check today.
+was installed for — no producer or operator id. Schema equality is the entire identity check.
+
+That sounds thinner than it is. Two structurally identical batches from different producers can
+only collide at a PORT that has more than one producer feeding it — and `trace_through`'s switch
+(`late_mat_plan_pass.cpp`) gives ride-preserving handling to only PARTITION, CONCAT, HASH_JOIN,
+DYNAMIC_FILTER, the two group-by shapes, TOP_N/MERGE_TOP_N, FILTER, and PROJECTION. Every other
+operator type — UNION, CROSS_PRODUCT, and every join variant except HASH_JOIN (NESTED_LOOP_JOIN,
+BLOCKWISE_NL_JOIN, PIECEWISE_MERGE_JOIN, IE_JOIN, the delim joins, POSITIONAL_JOIN, ASOF_JOIN) —
+falls to the walk's default (`return step::reads()`), which ends any ride there: no rowid crosses
+a UNION or a non-hash join, so neither can converge two independently-deferred batches on one
+port. HASH_JOIN is therefore the only multi-producer operator a ride can cross — which is exactly
+the self-join / two-scans-of-one-table case — and it is handled by the RIDER mechanism, not by
+hoping schemas differ: `install_rider` (`late_mat_plan_pass.cpp`) requires the merged directive's
+`expected_schema` to match the existing one at every position except the new rider's own, and
+`port_materialize_directive::valid()` re-checks self-consistency and position collisions before
+the merge is accepted. Two scans converging at one port get ONE directive with each side's rowid
+at its own fixed position — disambiguated structurally, not by a runtime schema coincidence. No
+code change identified as necessary; recorded here because the reasoning isn't obvious from the
+"schema equality is the entire identity check" statement alone.
 
 ## Which columns, and how far
 

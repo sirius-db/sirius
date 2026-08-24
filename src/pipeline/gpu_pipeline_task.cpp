@@ -546,7 +546,12 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
   auto pipeline     = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
   auto operators    = pipeline->get_operators();
-  auto& first_op    = operators[local_state._start_operator_index].get();
+  // A resume index of operators.size() (set when a prior attempt OOM'd restoring a deferral at
+  // the sink, below) means "the operator loop already ran; only the sink is left" -- there is no
+  // operators[start_index] to name in that case, so fall back to the sink for logging.
+  auto* first_op = local_state._start_operator_index < operators.size()
+                     ? &operators[local_state._start_operator_index].get()
+                     : pipeline->get_sink().get();
 
   std::string op_chain;
   auto source_op = pipeline->get_source();
@@ -633,11 +638,13 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   auto const prepare_end = std::chrono::high_resolution_clock::now();
   auto const prepare_duration =
     std::chrono::duration_cast<std::chrono::microseconds>(prepare_end - prepare_start);
-  SIRIUS_LOG_TRACE("Pipeline {}: operator {} (id={}) prepare execution time: {:.2f} ms",
-                   pipeline->get_pipeline_id(),
-                   first_op.get_name(),
-                   first_op.get_operator_id(),
-                   prepare_duration.count() / 1000.0);
+  if (first_op != nullptr) {
+    SIRIUS_LOG_TRACE("Pipeline {}: operator {} (id={}) prepare execution time: {:.2f} ms",
+                     pipeline->get_pipeline_id(),
+                     first_op->get_name(),
+                     first_op->get_operator_id(),
+                     prepare_duration.count() / 1000.0);
+  }
 
   // All input batches are now locked for reading via _read_only_data_batches inside
   // local_state._input_data. The locks are released when the pipelineable_operator_data
@@ -663,7 +670,51 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   auto input_basis = local_state.get_reservation_size_info()->input_basis;
   std::unique_ptr<op::operator_data> output_data = compute_task(stream);
 
-  // Record memory metrics for future reservation estimates
+  // Restoring a deferral at the sink (materialize_deferred_input inside publish_output) can
+  // allocate as much as any mid-pipeline operator -- the restored payload, carrier casts, a copy
+  // of every passthrough column, a full decode of any touched compressed chunk -- so it gets the
+  // same OOM-reschedule coverage compute_task's operator loop already has. Resume index
+  // operators.size() means "the loop already ran; only the sink is left" (compute_task's loop is
+  // a no-op for that index, see the guard on first_op above).
+  if (output_data) {
+    try {
+      publish_output(*output_data, stream);
+    } catch (const rmm::out_of_memory& oom) {
+      auto peak_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
+      auto const bytes_to_materialize_input =
+        local_state.get_reservation_size_info()->bytes_to_materialize_input;
+      peak_bytes =
+        peak_bytes > bytes_to_materialize_input ? peak_bytes - bytes_to_materialize_input : 0;
+      size_t requested_bytes = 0;
+      size_t global_usage    = 0;
+      if (auto const* cc_oom =
+            dynamic_cast<const cucascade::memory::cucascade_out_of_memory*>(&oom)) {
+        requested_bytes = cc_oom->requested_bytes;
+        global_usage    = cc_oom->global_usage;
+      }
+      SIRIUS_LOG_WARN(
+        "Pipeline {}: OOM restoring a deferral at the sink, requested {} bytes ({:.2f} MB), "
+        "global usage {} bytes ({:.2f} MB), peak allocated {} bytes ({:.2f} MB), rescheduling "
+        "task {}",
+        pipeline->get_pipeline_id(),
+        requested_bytes,
+        static_cast<double>(requested_bytes) / (1024.0 * 1024.0),
+        global_usage,
+        static_cast<double>(global_usage) / (1024.0 * 1024.0),
+        peak_bytes,
+        static_cast<double>(peak_bytes) / (1024.0 * 1024.0),
+        get_task_id());
+      auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
+      global.get_memory_history().record_on_failure(input_basis, peak_bytes);
+      throw oom_reschedule_exception(
+        std::move(output_data), operators.size(), "OOM restoring a deferral at the sink");
+    }
+  }
+
+  // Record memory metrics for future reservation estimates. Measured after publish_output, not
+  // before: peak_allocated_bytes is a running high-water mark for the whole stream, so recording
+  // here also captures whatever the sink's own deferral restoration allocated -- otherwise a
+  // reservation sized from this history would systematically undercount a sink port's true peak.
   if (output_data) {
     auto peak_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
     // Subtract the peak allocated bytes to the input data to get the peak allocated bytes for the
@@ -695,8 +746,6 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
       peak_bytes,
       local_state.get_reservation_size_info()->bytes_to_materialize_input);
   }
-
-  if (output_data) { publish_output(*output_data, stream); }
 
   // The input pipelineable_operator_data (with its _read_only_data_batches) was destroyed
   // when compute_task replaced operator_input_output_data, releasing all shared locks.

@@ -306,6 +306,25 @@ stub_operator::execute_fn make_passthrough_execute_fn()
 }
 
 //------------------------------------------------------------------------------
+// Helper: create an on_sink lambda that allocates exec_size bytes via the
+// reservation-aware MR and never deallocates them — models the sink-side
+// deferral restoration (materialize_deferred_input) that publish_output runs
+// before sink(), which the OOM-reschedule path must also cover.
+//------------------------------------------------------------------------------
+stub_operator::sink_fn make_allocating_sink_fn(cucascade::memory::memory_space* gpu_space,
+                                               std::size_t exec_size)
+{
+  return [gpu_space, exec_size](const sirius::op::operator_data&, rmm::cuda_stream_view s) {
+    auto* mr =
+      gpu_space->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
+    REQUIRE(mr != nullptr);
+    void* scratch = mr->allocate(s, exec_size, alignof(std::max_align_t));
+    s.synchronize();
+    mr->deallocate(s, scratch, exec_size, alignof(std::max_align_t));
+  };
+}
+
+//------------------------------------------------------------------------------
 // Helper: build a gpu_pipeline_task from a data batch and reservation size.
 // Pass reservation_size = 0 to skip reservation (for estimation flow).
 //------------------------------------------------------------------------------
@@ -648,6 +667,62 @@ TEST_CASE("gpu_pipeline_task execute OOM in operator execute records to pipeline
   REQUIRE_THROWS_AS(task->execute(stream), sirius::pipeline::oom_reschedule_exception);
 
   // Verify: memory history should have one record with the OOM peak_bytes
+  REQUIRE(global_state->get_memory_history().size() == 1);
+  auto estimate = global_state->get_memory_history().estimate_peak_memory(kInputDataSize);
+  REQUIRE(estimate.has_value());
+  REQUIRE(*estimate == kInputDataSize);
+}
+
+// ---------------------------------------------------------------------------
+// Test: an OOM restoring a deferral at the SINK (publish_output, after the operator
+// loop / compute_task has already succeeded) reschedules the task instead of
+// propagating an uncaught rmm::out_of_memory. Resume index must be operators.size()
+// (1, here) -- the sentinel meaning "the operator loop already ran; only the sink
+// is left" -- and the task's own memory history must record the failure.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("gpu_pipeline_task execute OOM at the sink reschedules instead of propagating",
+          "[gpu_pipeline_task][history][sink]")
+{
+  constexpr std::size_t kReservationSize     = 200ULL * 1024 * 1024;  // 200 MB
+  constexpr std::size_t kInputDataSize       = 300ULL * 1024 * 1024;  // 300 MB
+  constexpr std::size_t kInputNumRows        = kInputDataSize / sizeof(int64_t);
+  constexpr std::size_t kSinkConsumptionSize = kInputDataSize;
+
+  pipeline_task_history_fixture f;
+  if (!f.setup()) {
+    WARN("Skipping test — no GPU available");
+    return;
+  }
+
+  rmm::cuda_stream stream, stream_data_init;
+
+  auto input_batch = f.create_host_data_batch(kInputNumRows, stream_data_init);
+
+  auto ctx                = create_pipeline_context();
+  ctx.stub_op->on_execute = make_passthrough_execute_fn();
+  ctx.stub_op->on_sink    = make_allocating_sink_fn(f.gpu_space, kSinkConsumptionSize);
+
+  auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+    ctx.pipeline, sirius::test::make_test_telemetry_context());
+
+  auto task =
+    create_pipeline_task(f, global_state, std::move(input_batch), kReservationSize, /*task_id=*/1);
+
+  auto const operator_count = ctx.pipeline->get_operators().size();
+
+  try {
+    task->execute(stream);
+    FAIL("expected an oom_reschedule_exception");
+  } catch (const sirius::pipeline::oom_reschedule_exception& ex) {
+    // The sentinel resume index this fix relies on: compute_task's operator loop
+    // (i < operators.size()) is a no-op at this index, so a retry skips straight
+    // back to publish_output instead of re-running an operator that already
+    // succeeded.
+    REQUIRE(ex.get_resume_operator_index() == operator_count);
+  }
+
+  // The sink-side OOM must still reach memory history, same as a mid-pipeline one.
   REQUIRE(global_state->get_memory_history().size() == 1);
   auto estimate = global_state->get_memory_history().estimate_peak_memory(kInputDataSize);
   REQUIRE(estimate.has_value());
