@@ -654,6 +654,7 @@ mod tests {
             .execute_substrait_result(&local_files_plan_ranged(&[(p, 10, 5)], names()))
             .expect("empty split plan");
         assert_eq!(rows(&empty).len(), 0);
+    }
 
     /// A missing config file is rejected before any GPU work (`load_from_file`
     /// throws first), so this exercises the fallible config path and the cxx
