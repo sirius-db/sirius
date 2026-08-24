@@ -75,7 +75,6 @@ class stream_bind_catalog : public duckdb::ClientContextState {
   static constexpr const char* kStateKey = "sirius_stream_catalog";
 
   void declare(stream_id_t id, stream_input_binding binding);  // overwrites same-id entry
-  void clear();                                                 // drop every declaration
   void erase(stream_id_t id);                                   // drop one; no-op if absent
 
   const stream_input_binding& get(stream_id_t id) const;        // @throws if undeclared
@@ -107,11 +106,10 @@ otherwise return anything the fragment layer can see) gets back to the session t
 
 - **Multiple fragments may share one connection at once.** A `Context` in the FFI layer can host
   several live `Fragment` objects — that is the whole point of `relay_from()` chaining several
-  fragments together. `clear()` drops *every* declaration on the connection and is only safe for a
-  caller that owns the whole catalog outright; a fragment that shares a connection with a peer must
-  use `erase()`, which touches only the ids it declared itself. Both `streaming_fragment` (its
-  destructor and the start of `build()`, for idempotent rebuilds) and `sirius::ffi::Fragment::Impl`
-  follow this discipline — neither ever calls `clear()`.
+  fragments together. Cleanup is per-id: `streaming_fragment` calls `erase()` on the ids it
+  declared (destructor, and the start of `build()` for idempotent rebuilds). There is no
+  catalog-wide wipe. When the connection closes, `OnConnectionClosed` removes the
+  `ClientContextState` itself.
 - **A declared stream may be read by at most one plan leaf.** `set_built()` rejects a second bind
   for an id that already has one, instead of silently overwriting the pointer. Without this guard,
   a plan that reads the same declared stream twice (a self-join, or two independent scans of one

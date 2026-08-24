@@ -112,8 +112,8 @@ streaming_fragment::streaming_fragment(duckdb::ClientContext& context, fragment_
 
 streaming_fragment::~streaming_fragment()
 {
-  // Drop only the ids this fragment declared. clear() would wipe the whole per-connection
-  // catalog, including a peer fragment's declarations; swallow in dtor.
+  // Drop only the ids this fragment declared, so a peer sharing this connection keeps its own.
+  // Swallow in dtor.
   try {
     auto catalog = catalog_for(_context);
     for (const auto& [id, _] : _spec.inputs) {

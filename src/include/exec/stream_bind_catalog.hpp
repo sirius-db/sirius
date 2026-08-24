@@ -43,7 +43,9 @@ struct stream_input_binding {
 
 /// Per-connection declared input streams. ClientContextState so DuckDB bind can resolve schema
 /// before physical planning. Multiple fragments may share one connection at once (e.g. chained
-/// via relay_from), each owning a disjoint set of ids — see clear() vs erase() below.
+/// via relay_from), each owning a disjoint set of ids. Teardown is per-id via erase() so one
+/// fragment cannot wipe a peer's declarations. The connection owner drops the whole catalog by
+/// removing this ClientContextState, not by emptying it in place.
 class stream_bind_catalog : public duckdb::ClientContextState {
  public:
   static constexpr const char* kStateKey = "sirius_stream_catalog";
@@ -52,10 +54,6 @@ class stream_bind_catalog : public duckdb::ClientContextState {
   /// @throws sirius::invalid_input_exception on null repository, names/types size mismatch, or
   ///         empty names.
   void declare(stream_id_t id, stream_input_binding binding);
-
-  /// Drop every declaration on this connection. Only safe when the caller owns the whole
-  /// catalog; a fragment sharing a connection must use erase() so it cannot wipe a peer's ids.
-  void clear();
 
   /// Drop one declaration. No-op when `id` was never declared, so teardown paths can call it
   /// unconditionally.

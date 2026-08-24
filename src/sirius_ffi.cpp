@@ -309,9 +309,9 @@ struct Fragment::Impl {
     const std::map<sirius::exec::stream_id_t, sirius::exec::stream_input_spec>& resolved)
   {
     // declare() overwrites any prior entry for the same id, so there is nothing of this
-    // fragment's own to pre-clear. Must NOT call catalog.clear() here: this catalog is shared
-    // by every Fragment on the same Context (e.g. fragments chained via relay_from), and
-    // clear() would wipe a peer fragment's still-live declarations.
+    // fragment's own to pre-erase. This catalog is shared by every Fragment on the same
+    // Context (fragments chained via relay_from), and a bulk wipe would drop a peer's
+    // still-live declarations.
     auto& catalog = *ctx.stream_catalog;
     for (const auto& [id, spec] : resolved) {
       auto repository = std::make_shared<cucascade::shared_data_repository>();

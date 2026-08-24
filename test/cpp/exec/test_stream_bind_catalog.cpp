@@ -119,30 +119,11 @@ TEST_CASE("stream_bind_catalog CAT-4: the built operator is recorded", "[stream_
 }
 
 // ============================================================================
-// CAT-5: a fragment's declarations do not leak into the next one
-// ============================================================================
-
-TEST_CASE("stream_bind_catalog CAT-5: clear drops every declaration", "[stream_bind_catalog]")
-{
-  stream_bind_catalog catalog;
-  catalog.declare(1, make_binding());
-  catalog.declare(2, make_binding());
-  REQUIRE(catalog.declared_streams() == std::vector<stream_id_t>{1, 2});
-
-  catalog.clear();
-
-  REQUIRE(catalog.declared_streams().empty());
-  REQUIRE_FALSE(catalog.contains(1));
-  // A reused connection must not serve a stale schema for a recycled id.
-  REQUIRE_THROWS_AS(catalog.get(1), sirius::invalid_input_exception);
-}
-
-// ============================================================================
-// CAT-5b: erase is scoped to one id, so fragments sharing a connection don't
+// CAT-5: erase is scoped to one id, so fragments sharing a connection don't
 // wipe each other's declarations
 // ============================================================================
 
-TEST_CASE("stream_bind_catalog CAT-5b: erase drops only the named stream", "[stream_bind_catalog]")
+TEST_CASE("stream_bind_catalog CAT-5: erase drops only the named stream", "[stream_bind_catalog]")
 {
   stream_bind_catalog catalog;
   catalog.declare(1, make_binding());
@@ -151,7 +132,7 @@ TEST_CASE("stream_bind_catalog CAT-5b: erase drops only the named stream", "[str
   catalog.erase(1);
 
   // The catalog is one ClientContextState per connection. A fragment tearing down must remove
-  // only the ids it declared — clear() here would take a peer fragment's schema with it.
+  // only the ids it declared, or a peer fragment's schema goes with it.
   REQUIRE_FALSE(catalog.contains(1));
   REQUIRE(catalog.contains(2));
   REQUIRE(catalog.declared_streams() == std::vector<stream_id_t>{2});
