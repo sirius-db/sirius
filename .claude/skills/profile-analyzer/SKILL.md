@@ -32,11 +32,11 @@ This is the complete workflow: profile for GPU analysis, then run without profil
 
 **Step 1: Profiled run** (for GPU analysis data)
 ```bash
-# Profile TPC-H queries via nsys_report.sh (delegates to performance_test.py --mode nsys-profile)
+# Profile TPC-H queries via nsys_report.sh (delegates to performance_test.py --nsys-profile)
 bash test/tpch_performance/nsys_report.sh --sf <scale_factor> [query_numbers...]
 ```
 
-`nsys_report.sh` orchestrates the profiling under the hood: it calls `performance_test.py --mode nsys-profile` (the same runner the `benchmark` skill uses) to produce one `.nsys-rep` + `.sqlite` per query, then runs `nsys_analyze.sh` to emit `report.md` and `summary.json`.
+`nsys_report.sh` orchestrates the profiling under the hood: it calls `performance_test.py --nsys-profile` (the same runner the `benchmark` skill uses) to produce one `.nsys-rep` + `.sqlite` per query, then runs `nsys_analyze.sh` to emit `report.md` and `summary.json`.
 
 **Step 2: Non-profiled timing run** (for accurate cold/hot times)
 ```bash
@@ -85,7 +85,7 @@ reports/<label>_<YYYYMMDD_HHMMSS>/
   metadata.json    - Hardware, git commit, config, driver version
   comparison.md    - (if --compare used) Regression/improvement analysis
   profiles/        - Flat raw artifacts (one set per query, flattened from the
-                     per-query subdirs produced by performance_test.py --mode nsys-profile)
+                     per-query subdirs produced by performance_test.py --nsys-profile)
     q1.sqlite, q1.nsys-rep, q1_timings.csv, q1_result.txt, ...
   profiles_tree/   - Original per-query layout from performance_test.py:
     sirius/q<N>/{nsys.nsys-rep, nsys.sqlite, nsys.sql, timings.csv, log_dir/}
