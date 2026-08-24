@@ -167,7 +167,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::execute(
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_vector_join_materialize::execute"};
 
-  auto const& input         = dynamic_cast<const partitioned_operator_data&>(input_data);
+  auto const& input         = dynamic_cast<const pipelineable_operator_data&>(input_data);
   auto const& input_batches = input.get_read_only_batches();
 
   cucascade::memory::memory_space* space = nullptr;
