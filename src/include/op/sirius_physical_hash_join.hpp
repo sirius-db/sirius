@@ -420,7 +420,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   bool is_all_inequality_join = true;
 
-  HASH_JOIN_MODE _join_mode            = HASH_JOIN_MODE::STANDARD;
+  // Atomic: the size estimator polls probe_bytes_are_unweighted() without op_state_mutex.
+  std::atomic<HASH_JOIN_MODE> _join_mode{HASH_JOIN_MODE::STANDARD};
   uint64_t _max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
   // Maximum build-side bytes eligible for a broadcast join (see get_partition_strategy). Set from
   // operator_params at construction.

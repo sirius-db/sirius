@@ -777,7 +777,7 @@ TEST_CASE("data_size_estimator: a fan-in with too few completed tasks yields no 
   CHECK(f.estimate().has_value());
 }
 
-TEST_CASE("data_size_estimator: a fan-in does not correct its ratio from task counts",
+TEST_CASE("data_size_estimator: a fan-in is withheld while probe tasks are in flight",
           "[data_size_estimator][estimation][fan_in]")
 {
   fan_in_dag f;
@@ -786,16 +786,66 @@ TEST_CASE("data_size_estimator: a fan-in does not correct its ratio from task co
   estimator_dag::source_of(*f.join).primary_port     = "default";
   estimator_dag::source_of(*f.join).consumed_primary = 200 * kMiB;
 
-  auto const before = f.estimate();
-  REQUIRE(before.has_value());
-  CHECK(before->bytes == 256 * kMiB);
+  auto const quiescent = f.estimate();
+  REQUIRE(quiescent.has_value());
+  CHECK(quiescent->bytes == 256 * kMiB);
 
-  // Regression: join tasks consume unequal shares because only a probe's first pairing advances
-  // the denominator, so task completion counts must not scale it.
+  // One enormous in-flight task could hold the ratio near zero however many small tasks have
+  // completed, so in-flight snapshots are withheld rather than sample-floored.
   f.set_join_task_counters(/*created=*/25, /*completed=*/20);
+  CHECK_FALSE(f.estimate().has_value());
+
+  // Quiescent again: the totals cover the same tasks and the estimate returns.
+  f.set_join_task_counters(/*created=*/0, /*completed=*/5);
   auto const after = f.estimate();
   REQUIRE(after.has_value());
-  CHECK(after->bytes == before->bytes);
+  CHECK(after->bytes == quiescent->bytes);
+}
+
+TEST_CASE("data_size_estimator: a fan-in rejects a task racing the ratio reads",
+          "[data_size_estimator][estimation][fan_in]")
+{
+  fan_in_dag f;
+  f.give_both_sides_totals();
+  f.record_join_ratio(100 * kMiB, 50 * kMiB);
+  auto& src            = estimator_dag::source_of(*f.join);
+  src.primary_port     = "default";
+  src.consumed_primary = 200 * kMiB;
+
+  // A task starts and completes while `consumed` is read: the counters end equal, so only a
+  // comparison against the pre-read snapshot can catch it.
+  bool fired           = false;
+  src.on_consumed_read = [&] {
+    if (fired) { return; }
+    fired = true;
+    f.join->mark_task_created();
+    f.join->mark_task_completed();
+  };
+  CHECK_FALSE(f.estimate().has_value());
+  REQUIRE(fired);
+
+  // Quiescent and stable again: the estimate returns.
+  auto est = f.estimate();
+  REQUIRE(est.has_value());
+  CHECK(est->bytes == 256 * kMiB);
+}
+
+TEST_CASE("data_size_estimator: a zero fan-in floor still requires completed output",
+          "[data_size_estimator][estimation][fan_in]")
+{
+  fan_in_dag f;
+  f.give_both_sides_totals();
+  estimator_dag::source_of(*f.join).primary_port     = "default";
+  estimator_dag::source_of(*f.join).consumed_primary = 200 * kMiB;
+
+  // No join task has completed; a zero floor must not turn 0 / consumed into a confident zero.
+  auto& op = *f.consumer->get_source();
+  CHECK_FALSE(estimate_port_total_input_bytes(op,
+                                              op.get_port_ids().front(),
+                                              size_estimate_options{
+                                                .min_fan_in_ratio_samples = 0,
+                                              })
+                .has_value());
 }
 
 TEST_CASE("data_size_estimator: a projection that would overflow is reported as unknown",

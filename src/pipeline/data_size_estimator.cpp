@@ -148,13 +148,30 @@ std::optional<data_size_estimate> estimate_output_bytes_impl(sirius_pipeline& pi
     auto const port_name = source->primary_input_port();
     if (!port_name.has_value()) { return std::nullopt; }
 
-    // Read output before consumed input. A concurrent task can then only bias the ratio low;
-    // reversing the order could omit its input while including its output.
+    // Probe bytes enter `consumed` when a task starts but its output lands only at completion,
+    // so any task active while the two terms are read can drive the ratio toward zero — a
+    // byte-weighted skew no task-count floor bounds. Bracket the reads with the task counters:
+    // equal before and unchanged after means no task ran at any point in between, so both terms
+    // cover exactly the same tasks.
+    auto const completed_before = pipeline.get_tasks_completed();
+    auto const created_before   = pipeline.get_tasks_created();
+    if (completed_before != created_before) { return std::nullopt; }
+
     auto const totals = pipeline.get_memory_history().totals();
-    if (totals.output_records < options.min_fan_in_ratio_samples) { return std::nullopt; }
+    // Never estimable with zero completed outputs, whatever the configured floor.
+    if (totals.output_records == 0 || totals.output_records < options.min_fan_in_ratio_samples) {
+      return std::nullopt;
+    }
 
     auto const consumed = source->consumed_primary_input_bytes();
     if (!consumed.has_value() || *consumed == 0) { return std::nullopt; }
+
+    // Unchanged, not merely equal: a task that started and completed mid-read would leave the
+    // counters equal while its bytes sit in `consumed` with no matching output in `totals`.
+    if (pipeline.get_tasks_completed() != completed_before ||
+        pipeline.get_tasks_created() != created_before) {
+      return std::nullopt;
+    }
 
     auto* p = resolve_data_port(*source, *port_name);
     if (p == nullptr) { return std::nullopt; }
@@ -162,7 +179,6 @@ std::optional<data_size_estimate> estimate_output_bytes_impl(sirius_pipeline& pi
     auto upstream = estimate_output_bytes_impl(*p->src_pipeline, options, hops + 1);
     if (!upstream.has_value()) { return std::nullopt; }
 
-    // The sample threshold bounds the conservative in-flight bias.
     auto const ratio  = static_cast<double>(totals.output_bytes) / static_cast<double>(*consumed);
     auto const scaled = scale_bytes_checked(upstream->bytes, ratio);
     if (!scaled.has_value()) { return std::nullopt; }

@@ -284,21 +284,25 @@ It is the innermost lock: nothing waits on a batch lock or `op_state_mutex` whil
 
 - `min_ratio_samples` (4) — single-input. That ratio accrues both terms on task completion and is
   unbiased at any count; the floor only rules out one unrepresentative batch.
-- `min_fan_in_ratio_samples` (16) — fan-in. That ratio divides a completion-accrued numerator by a
-  denominator advancing at task *start*, so it reads low by roughly
-  `in_flight / (samples + in_flight)`. More samples shrink a systematic bias, which is why this
-  floor is far higher — and why it is a **hard gate**: below it there is no estimate even under
-  `assume_unit_ratio`. A unit ratio is a reasonable stand-in for a single-input pipeline
-  (assume pass-through), but a join can multiply or divide its input volume by orders of
-  magnitude, so 1:1 carries no information there.
+- `min_fan_in_ratio_samples` (16) — fan-in. A join can multiply or divide its input volume by
+  orders of magnitude, so a handful of completed tasks is no evidence of its ratio — and this
+  floor is a **hard gate**: below it there is no estimate even under `assume_unit_ratio`, because
+  1:1 carries no information for a join. Zero completed outputs are never estimable, whatever the
+  floor is configured to.
 
-There is deliberately no task-count correction for in-flight tasks: `consumed` does not advance
-once per task, so the completed fraction of tasks does not map onto the consumed fraction of bytes.
+The fan-in ratio is additionally taken only from **bracketed quiescent snapshots**. Probe bytes
+enter `consumed` when a task starts while its output lands at completion, so any task active while
+the terms are read can drive the ratio toward zero — the skew is byte-weighted, so no task-count
+floor bounds it, and a completed-task-fraction correction cannot either (`consumed` does not
+advance once per task). The task counters are therefore read before the terms and re-read after:
+equal and unchanged means no task started or completed at any point in between — unchanged, not
+merely equal, since a task starting *and* completing mid-read would leave them equal while its
+bytes sit in `consumed` with no matching output. Both terms then cover exactly the same tasks.
 
-The in-flight skew described above is not the only bias on the fan-in ratio, and `16` does not
-bound the other one. See [why STANDARD and MIXED_JOIN are not estimated](#why-standard-and-mixed_join-are-not-estimated):
-under build or partition skew the pairing weighting pushes the ratio high by roughly `B/16`, in the
-opposite direction to the in-flight effect and not necessarily smaller than it.
+The in-flight skew was never the fan-in ratio's only bias, and quiescence does not address the
+other one. See [why STANDARD and MIXED_JOIN are not estimated](#why-standard-and-mixed_join-are-not-estimated):
+under build or partition skew the pairing weighting pushes the ratio high by roughly `B/16`, which
+is why those modes are withheld outright.
 
 ## Coverage
 
