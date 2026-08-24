@@ -17,6 +17,7 @@
 #include "op/sirius_physical_concat.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "log/logging.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -30,12 +31,14 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<sirius::logical_ty
                                                std::size_t estimated_cardinality,
                                                sirius_physical_operator* downstream_join,
                                                bool is_build,
-                                               uint64_t concat_batch_bytes)
+                                               uint64_t concat_batch_bytes,
+                                               uint64_t max_fold_rows)
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::CONCAT, std::move(types), estimated_cardinality)
 {
   _is_build           = is_build;
   _concat_batch_bytes = concat_batch_bytes;
+  _max_fold_rows      = max_fold_rows;
   // `downstream_join` (the HJ/NLJ this CONCAT feeds — not the tree parent) picks
   // `_concat_all` and is stashed for the legacy converter's destination lookup.
   _downstream_join = downstream_join;
@@ -176,8 +179,25 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
     auto output = cucascade::data_batch::to_idle(std::move(copy));
     output_batches.push_back(std::move(output));
   } else {
-    auto merged_batch = gpu_merge_impl::concat(input_batches, stream, *space, batch_telemetry());
-    output_batches.push_back(std::move(merged_batch));
+    try {
+      output_batches.push_back(
+        gpu_merge_impl::concat(input_batches, stream, *space, batch_telemetry(), _max_fold_rows));
+    } catch (const std::exception& e) {
+      // Attribute the refusal before it unwinds: the message from gpu_merge_impl names the counts
+      // but not which fold produced them, and a query can hold many CONCATs.
+      SIRIUS_LOG_ERROR(
+        "[fold_limit] CONCAT id {} (partition {}, concat_all={}, {} side of {} id {}) cannot fold "
+        "{} input batches into one cuDF table: {}",
+        get_operator_id(),
+        partition_idx,
+        _concat_all,
+        _is_build ? "build" : "probe",
+        SiriusPhysicalOperatorToString(_downstream_join->type),
+        _downstream_join->get_operator_id(),
+        input_batches.size(),
+        e.what());
+      throw;
+    }
   }
   return std::make_unique<partitioned_operator_data>(output_batches, partition_idx);
 }

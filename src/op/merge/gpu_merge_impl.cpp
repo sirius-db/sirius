@@ -34,7 +34,8 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::concat(
   const std::vector<cucascade::read_only_data_batch>& input,
   rmm::cuda_stream_view stream,
   cucascade::memory::memory_space& memory_space,
-  const telemetry::batch_telemetry_info& telemetry_info)
+  const telemetry::batch_telemetry_info& telemetry_info,
+  uint64_t max_fold_rows)
 {
   // Sanity check.
   if (input.size() < 2) {
@@ -44,9 +45,12 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::concat(
   // Pull input cudf tables and merge.
   std::vector<cudf::table_view> input_cudf_table_views;
   input_cudf_table_views.reserve(input.size());
+  uint64_t total_rows = 0;
   for (const auto& batch : input) {
     input_cudf_table_views.push_back(get_cudf_table_view(batch));
+    total_rows += static_cast<uint64_t>(input_cudf_table_views.back().num_rows());
   }
+  check_fold_row_limit(total_rows, input.size(), max_fold_rows);
   auto output_cudf_table =
     cudf::concatenate(input_cudf_table_views, stream, memory_space.get_default_allocator());
 

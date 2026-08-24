@@ -17,6 +17,7 @@
 #pragma once
 
 #include "duckdb/execution/physical_operator.hpp"
+#include "op/fold_limits.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -47,7 +48,8 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
     std::size_t estimated_cardinality,
     sirius_physical_operator* downstream_join,
     bool is_build,
-    uint64_t concat_batch_bytes = sirius::config::DEFAULT_CONCAT_BATCH_BYTES);
+    uint64_t concat_batch_bytes = sirius::config::DEFAULT_CONCAT_BATCH_BYTES,
+    uint64_t max_fold_rows      = k_fold_row_limit);
 
   std::string get_name() const override;
 
@@ -95,6 +97,12 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
    * pipeline finishes. Finishing the pipeline also releases an under-threshold tail. When
    * `_concat_all` is set, the complete partition becomes one group after the pipeline finishes.
    *
+   * Either way the group must satisfy INV-FOLD (`op/fold_limits.hpp`): it becomes one cuDF table.
+   * Under `_concat_all` nothing here can shrink the group, so the invariant rests entirely on the
+   * partition count the join chose (`compute_hash_join_partition_strategy`); otherwise
+   * `_concat_batch_bytes` bounds it. `gpu_merge_impl::concat` refuses a group that violates it
+   * either way.
+   *
    * The caller must hold the operator mutex `lock`. The plan remains valid while the lock is held
    * because consumers remove batches under the same lock and producers only append batches.
    *
@@ -111,6 +119,9 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   bool _is_build;
   bool _concat_all;
   uint64_t _concat_batch_bytes;
+  //! Rows one folded output batch may hold (INV-FOLD; see `op/fold_limits.hpp`). Passed to
+  //! `gpu_merge_impl::concat`, which enforces it.
+  uint64_t _max_fold_rows;
   //! Non-owning. Captured at construction from the `downstream_join` ctor argument.
   sirius_physical_operator* _downstream_join = nullptr;
 };
