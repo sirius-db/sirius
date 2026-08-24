@@ -99,6 +99,12 @@ CALL unpin_table('lineitem');
 `tier = 'gpu'` pins columns in GPU memory for the fastest scans; `tier = 'host'` pins them in
 pinned host memory instead, for tables larger than GPU memory.
 
+Deletes and committed inserts on pinned DuckDB tables are reconciled per query. `UPDATE`,
+`MERGE ... UPDATE`, and `INSERT ... ON CONFLICT DO UPDATE` are rejected while the target table is
+pinned; run `CALL unpin_table(...)` before updating it. An explicit `CHECKPOINT` while a pin is
+live makes that pin ineligible to serve: subsequent queries fall back or error until the table is
+unpinned and pinned again.
+
 ## Configuration
 
 Sirius loads its settings from a YAML config file, searched in this order:
@@ -170,6 +176,6 @@ For a full list of current limitations and ongoing work, please refer to our [Gi
 ## Future Roadmap
 Sirius is still under major development and we are working on adding more features to Sirius, such as multi-node, more operators, data types, accelerating more engines, and many more.
 
-Sirius always welcomes new contributors! If you are interested, check our [website](https://www.sirius-db.com/), reach out to our [email](siriusdb@cs.wisc.edu), or join our [slack channel](https://join.slack.com/t/sirius-db/shared_invite/zt-33tuwt1sk-aa2dk0EU_dNjklSjIGW3vg).
+Sirius always welcomes new contributors! If you are interested, check our [website](https://www.sirius-db.com/), reach out to our [email](mailto:siriusdb@cs.wisc.edu), or join our [slack channel](https://join.slack.com/t/sirius-db/shared_invite/zt-33tuwt1sk-aa2dk0EU_dNjklSjIGW3vg).
 
 **Let's kickstart the GPU eras for Data Analytics!**

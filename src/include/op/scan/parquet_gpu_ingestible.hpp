@@ -250,6 +250,14 @@ class parquet_file_scan_info : public scan_info {
   [[nodiscard]] std::vector<fadvise_entry> fadvise_entries() const override;
 };
 
+/// A top-level `<col> IS [NOT] NULL` conjunct, recorded so the row groups it
+/// excludes can still be pruned from the parquet null_count statistic even
+/// though cuDF's stats filter cannot evaluate the predicate itself.
+struct null_prune_predicate {
+  duckdb::idx_t batch_index;  ///< index into the scan's batch column order
+  bool expects_null;          ///< true for IS NULL, false for IS NOT NULL
+};
+
 //===----------------------------------------------------------------------===//
 // parquet_gpu_ingestible
 //===----------------------------------------------------------------------===//
@@ -296,9 +304,16 @@ class parquet_gpu_ingestible : public gpu_ingestible {
 
   [[nodiscard]] std::vector<std::size_t> materialized_column_order() const override;
 
+  [[nodiscard]] bool output_assembly_is_leading_identity() const noexcept override;
+
   [[nodiscard]] bool has_row_filter() const noexcept override
   {
     return _duckdb_filter_expression != nullptr;
+  }
+
+  [[nodiscard]] scan_filter_analysis const& filter_analysis() const override
+  {
+    return _filter_analysis;
   }
 
  private:
@@ -321,6 +336,18 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   // Coalesced DuckDB filter expression. Empty when no filters survived the
   // partition-column drop pass.
   std::shared_ptr<duckdb::Expression> _duckdb_filter_expression;
+
+  // This scan's pushed-down filter digested once at bind — what filter_analysis()
+  // advertises. Empty when the scan has no pushed-down filter.
+  scan_filter_analysis _filter_analysis;
+  // The same filter as the predicate the scan must still evaluate after the
+  // decode, decomposed into conjuncts at bind. Which conjuncts a given batch
+  // still needs is a per-batch fact — a pinned compressed chunk answers a
+  // column only when its plan can, and the same scan's disk splits never do —
+  // so post_filter_and_project assembles the residual from what the batch
+  // reports rather than from anything precomputed here.
+  residual_filter _residual;
+
   // The part of _duckdb_filter_expression safe to push into the reader: the
   // full predicate minus any top-level AND conjunct that cuDF's row-group
   // stats filter cannot handle (a null test, or a bare column reference used
@@ -335,6 +362,12 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   // partially filtered, so the scan must NOT be reported ROW_FILTERED or the
   // dropped conjuncts would never be applied.
   bool _static_pushdown_is_complete = true;
+
+  // Only the simple `IS [NOT] NULL` over a bare column reference shape is
+  // recorded; anything compound is left to the post-decode filter. Empty when
+  // the predicate has no such conjunct.
+  std::vector<null_prune_predicate> _null_prune_predicates;
+
   std::vector<std::string> _file_paths;
 
   // Per-file metadata-scan cursor. next_split_provider hands out one file index

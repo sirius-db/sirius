@@ -28,9 +28,14 @@
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
 #include "scan_manager/insert_delta_job.hpp"
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
+#include "scan_manager/memory_prefetcher.hpp"
 #include "scan_manager/mvcc_mask_job.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
 #include "scan_manager/split_provider.hpp"
+
+namespace sirius::op {
+class sirius_dynamic_filter_set;  // membership pushdown channel (op/sirius_dynamic_filter.hpp)
+}
 
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
@@ -42,6 +47,7 @@
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
+#include <duckdb/storage/storage_lock.hpp>
 #include <io/types.hpp>
 
 namespace cucascade::memory {
@@ -190,11 +196,10 @@ struct pinned_entry {
   /// (the plain, non-compression GPU pin path) when non-empty.
   std::vector<sirius::device_pin_chunk> device_chunks;
   /// Chunk-major stored-column metadata, positional with the cached data:
-  /// column_storage[c][i] is the recorded carrier of cached column i in chunk c
-  /// (for a compressed chunk, the type its decompression reproduces) plus whether
-  /// that carrier is narrower than the pin-time native mapping. Recorded by the
-  /// pin driver at the moment of storage; insertion requires a matrix covering
-  /// every chunk and column and cross-checks recorded carriers against
+  /// column_storage[c][i] records the carrier, pin-time native mapping, and
+  /// narrowing marker for cached column i in chunk c. Recorded by the pin driver
+  /// at the moment of storage; insertion requires a matrix covering every chunk
+  /// and column and cross-checks recorded carriers against
   /// uncompressed storage. An empty matrix reads as all-native — a legitimate
   /// state for a zero-chunk or hand-built entry, which is why the serving
   /// validator still accepts it. The plan-time narrowing folds and the
@@ -296,15 +301,22 @@ void validate_recorded_column_storage(sirius::pinned_column_storage_matrix const
 [[nodiscard]] bool pinned_column_narrowed_in_all_chunks(pinned_entry const& entry,
                                                         std::size_t entry_position);
 
-/// The narrow plan-target carrier for the cached column at @p entry_position (a position into
-/// cache_info.column_ids): the widest recorded carrier across all chunks. A pure fold over the
-/// entry's @c column_storage metadata — compressed and uncompressed chunks, both tiers, answer
-/// identically and no storage is touched. Returns `std::nullopt` unless
-/// pinned_column_narrowed_in_all_chunks passes and every recorded carrier is a strict same-family
-/// narrowing of @p native_type (can_narrow_to, the defense against metadata that contradicts the
-/// pin-time logical type). Chunks narrower than the returned target widen at serve through the
-/// verified same-family restore. Non-owning read of @p entry: obtain and read it inside one
-/// slot-scoped window, and never hold it across a pin or unpin.
+/**
+ * @brief Derives the widest validated narrow carrier recorded for a cached column.
+ *
+ * Reads only @p entry's column-storage metadata. Returns no target unless @p entry_position is
+ * covered by the cached-column identity and every chunk marks the column narrowed, records
+ * @p native_type as its pin-time native type, and records a strict same-family narrowing of that
+ * type. Chunks narrower than the returned target widen when served.
+ *
+ * Call only while @p entry is protected from concurrent pin or unpin; this function does not
+ * retain it.
+ *
+ * @param entry Pinned entry to inspect.
+ * @param entry_position Position in `entry.cache_info.column_ids`.
+ * @param native_type Current scan's native cuDF type.
+ * @return Widest valid recorded carrier, or `std::nullopt`.
+ */
 [[nodiscard]] std::optional<cudf::data_type> pinned_column_narrow_carrier(
   pinned_entry const& entry, std::size_t entry_position, cudf::data_type native_type);
 
@@ -331,15 +343,27 @@ struct cached_scan_plan {
 /// conversion allocates. Declared here so the chunk↔mask pairing and the
 /// conversion sizing are unit-testable; the provider type itself stays internal
 /// to the scan manager.
+/// @p pushdown_req is the scan's filter as a decompressor can use it, parallel
+/// to @p selected_columns: a GPU-tier compressed chunk may answer an equality/IN
+/// filter off its dictionary (the column then arrives as the boolean answer) and
+/// may drop rows against the ranges while decoding, handing back an
+/// already-filtered batch. See @c sirius::pushdown_request; an empty request
+/// (the default) leaves every chunk decoding unfiltered.
+/// @p dynamic_filters is the operator's dynamic-filter channel (join builds
+/// publish into it mid-scan); the provider snapshots it PER BATCH onto the
+/// attached scan, so later batches legitimately see more filters. Null (the
+/// default) disables it.
 std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   pinned_entry const& entry,
   std::span<std::size_t const> selected_columns,
   cached_scan_plan plan,
   const telemetry::batch_telemetry_info& telemetry_info,
-  mvcc_chunk_mask_set mvcc_masks                     = {},
-  std::vector<insert_delta_split> delta_splits       = {},
-  std::vector<cudf::data_type> normalization_targets = {},
-  bool has_physical_overrides                        = false);
+  mvcc_chunk_mask_set mvcc_masks                                         = {},
+  std::vector<insert_delta_split> delta_splits                           = {},
+  std::vector<cudf::data_type> normalization_targets                     = {},
+  bool has_physical_overrides                                            = false,
+  sirius::pushdown_request pushdown_req                                  = {},
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters = nullptr);
 
 /**
  * @brief Build the survivor plan for serving @p entry to a scan into @p requiested_column_ids with
@@ -416,7 +440,12 @@ class sirius_scan_manager {
   ///                                        changes must be forwarded per query by the caller).
   ///                                        Consulted by try_assign_cached_entries when building
   ///                                        the survivor plan.
-  void prepare_for_query(const sirius::planner::query& query, bool enable_pinned_zone_map_pruning);
+  /// @param allocated_gpu_ids GPU IDs allocated to this query (from
+  ///        SiriusContext::compute_allocated_gpu_ids). Scan splits are
+  ///        distributed round-robin across this subset instead of all GPUs.
+  void prepare_for_query(const sirius::planner::query& query,
+                         bool enable_pinned_zone_map_pruning,
+                         const std::vector<int>& allocated_gpu_ids);
 
   /// \brief Clear the providers map and join the driver thread if it is
   ///        still running.
@@ -629,6 +658,11 @@ class sirius_scan_manager {
   [[nodiscard]] std::optional<cached_assignment> try_match_cached_entry(
     op::scan::sirius_gpu_scan_operator* op);
 
+  /// Build and start the per-query host->GPU memory prefetcher when enabled
+  /// via the sirius.executor.scan_manager.memory_prefetcher config block (see
+  /// memory_prefetcher.hpp). No-op otherwise.
+  void maybe_start_memory_prefetcher();
+
   /// Resolve the ioctx that should serve @p path (normalized internally, so callers
   /// — including the scan resolver — may pass a raw `file://` / `s3://` URI),
   /// building it once per backend on first use.  Routes by path through the registry
@@ -673,6 +707,10 @@ class sirius_scan_manager {
   /// table has no rows beyond the pinned prefix.
   std::vector<insert_delta_job_request> _pending_insert_delta_jobs;
 
+  /// Prevents DuckDB checkpoints from replacing row groups between pinned
+  /// query validation and completion.
+  std::vector<duckdb::unique_ptr<duckdb::StorageLockKey>> _checkpoint_locks;
+
   /// Per-query sequencer for opportunistic fadvise calls.  Built fresh
   /// in @ref prepare_for_query, gets one @c pipeline_slot per scan,
   /// registered before the pinned-cache match.  The
@@ -681,6 +719,10 @@ class sirius_scan_manager {
   /// dispatcher's @c request_stop() in @ref reset() therefore tears the
   /// sequencer down without an extra side-channel.
   std::unique_ptr<load_balancing_scan_batch_coalescer> _metadata_processor;
+  /// Per-query background host->GPU upgrader for queued pinned-cache splits
+  /// (built in start_metadata_processing when the memory_prefetcher config
+  /// block enables it, torn down in reset()).
+  std::unique_ptr<memory_prefetcher> _prefetcher;
   io::io_context_registry _ioctx_registry;
 };
 

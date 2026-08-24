@@ -22,7 +22,7 @@
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>
-#include <op/dynamic_filter_replica_transfer.hpp>
+#include <op/dynamic_filter/dynamic_filter_replica_transfer.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -73,7 +73,6 @@ replica_transfer_route enqueue_replica_copy(
   }
   auto const source_device = rmm::cuda_device_id{source_space.get_device_id()};
 
-  //===----------local----------===//
   if (destination_device == source_device && policy == replica_transfer_policy::automatic) {
     rmm::cuda_set_device_raii guard{destination_device};
     CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
@@ -81,7 +80,6 @@ replica_transfer_route enqueue_replica_copy(
     return replica_transfer_route::local;
   }
 
-  //===----------peer DMA----------===//
   bool const peer_dma =
     policy == replica_transfer_policy::automatic &&
     cucascade::memory::probe_peer_dma_works(source_device.value(), destination_device.value());
@@ -96,12 +94,10 @@ replica_transfer_route enqueue_replica_copy(
     return replica_transfer_route::peer_dma;
   }
 
-  //===----------fallback: host staging----------===//
   auto& staging_resource = get_host_staging_resource(host_staging_space);
   auto staging           = staging_resource.allocate_multiple_blocks(bytes);
   auto& allocation       = *staging;
 
-  // src device -> host staging
   std::vector<void*> d2h_destinations;
   std::vector<void const*> d2h_sources;
   std::vector<std::size_t> d2h_sizes;
@@ -161,7 +157,6 @@ replica_transfer_route enqueue_replica_copy(
     CUCASCADE_CUDA_TRY(cudaStreamSynchronize(source_stream.value()));
   }
 
-  // host staging -> dst device
   std::vector<void*> h2d_destinations;
   std::vector<void const*> h2d_sources;
   std::vector<std::size_t> h2d_sizes;

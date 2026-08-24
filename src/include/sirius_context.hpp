@@ -21,6 +21,7 @@
 #include "downgrade/downgrade_executor.hpp"
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/dynamic_filter/dynamic_filter_stats.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "planner/query.hpp"
@@ -42,6 +43,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <shared_mutex>
 #include <string_view>
 #include <unordered_set>
 #include <utility>
@@ -90,6 +92,17 @@ class SiriusConnectionState : public ClientContextState {
 
   /// A new query on this connection invalidates any leftover capture.
   void QueryBegin(ClientContext& context) final { captured_plan_.reset(); }
+
+  void QueryEnd() final { pinned_update_guard_.reset(); }
+
+  [[nodiscard]] bool has_pinned_update_guard() const noexcept
+  {
+    return pinned_update_guard_.has_value();
+  }
+  void set_pinned_update_guard(std::shared_lock<std::shared_mutex> guard)
+  {
+    pinned_update_guard_.emplace(std::move(guard));
+  }
 
   /// \brief Per-connection monotonic query ordinal, advanced by the shared
   /// SiriusContext's QueryBegin for SQL↔(instance, connection, query) log
@@ -174,6 +187,7 @@ class SiriusConnectionState : public ClientContextState {
   std::optional<std::string> pending_query_label_;
   std::atomic<int> internal_query_depth_{0};
   std::atomic<int> cpu_fallback_depth_{0};
+  std::optional<std::shared_lock<std::shared_mutex>> pinned_update_guard_;
   uint64_t connection_id_;
   uint64_t query_ordinal_ = 0;
 };
@@ -499,6 +513,10 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] sirius::scan_manager::sirius_scan_manager& get_scan_manager();
   [[nodiscard]] const sirius::scan_manager::sirius_scan_manager& get_scan_manager() const;
 
+  /// Coordinate update execution with pin-registry mutations.
+  std::shared_lock<std::shared_mutex> lock_pinned_table_updates();
+  std::unique_lock<std::shared_mutex> lock_pinned_table_registry();
+
   [[nodiscard]] std::shared_ptr<const sirius::telemetry::telemetry_context> get_telemetry_context()
     const;
 
@@ -527,6 +545,16 @@ class SiriusContext : public ClientContextState {
 
   /// \brief Snapshot counters for transparent execution observability.
   [[nodiscard]] transparent_execution_stats get_transparent_execution_stats() const noexcept;
+
+  [[nodiscard]] sirius::op::dynamic_filter_stats& get_dynamic_filter_stats() noexcept
+  {
+    return dynamic_filter_stats_;
+  }
+  [[nodiscard]] sirius::op::dynamic_filter_stats_snapshot get_dynamic_filter_stats_snapshot()
+    const noexcept
+  {
+    return dynamic_filter_stats_.snapshot();
+  }
 
   /// \brief Record a successful transparent rebind to Sirius.
   void record_transparent_rebind_success() noexcept;
@@ -573,8 +601,9 @@ class SiriusContext : public ClientContextState {
   void acquire_query_lifecycle_slot(ClientContext* context);
   void release_query_lifecycle_slot() noexcept;
   /// The begin-of-window shared mutations (repository-manager registration,
-  /// task_creator reset/bind) — runs INSIDE the held slot, per the frozen
+  /// task_creator reset) — runs INSIDE the held slot, per the frozen
   /// "after acquire + health check, before final create_plan" placement.
+  /// GPU admission happens later, in sirius_engine::initialize_internal().
   void begin_execution_window(ClientContext& context,
                               sirius::query_id_t query_id,
                               std::string_view window_label,
@@ -603,6 +632,9 @@ class SiriusContext : public ClientContextState {
   // DuckDB's user-visible result lifetime, so an abandoned stream or pending
   // result holds nothing.
   std::mutex query_lifecycle_mutex_;
+  // Pin and unpin take this exclusively; updates hold it from validation
+  // through QueryEnd so neither operation can pass the other between checks.
+  std::shared_mutex pinned_table_update_mutex_;
   std::atomic<bool> query_lifecycle_held_{false};
   // Hash of the holder's thread id, written under the gate while held, 0 when
   // free. Read (relaxed) before acquiring ONLY to detect a same-thread
@@ -662,6 +694,7 @@ class SiriusContext : public ClientContextState {
   std::unique_ptr<sirius::scan_manager::sirius_scan_manager> scan_manager_;
   duckdb::shared_ptr<sirius::planner::query> query_;
 
+  sirius::op::dynamic_filter_stats dynamic_filter_stats_;
   std::atomic<uint64_t> transparent_rebind_success_count_{0};
   std::atomic<uint64_t> transparent_fallback_count_{0};
   std::atomic<uint64_t> transparent_execution_count_{0};

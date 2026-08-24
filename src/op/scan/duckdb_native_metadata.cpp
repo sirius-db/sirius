@@ -44,7 +44,6 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
-#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <string>
@@ -55,14 +54,9 @@ namespace sirius::op::scan {
 
 std::size_t metadata_parse_chunk()
 {
-  constexpr std::size_t kDefaultParseChunk = 8;
-  if (const char* env = std::getenv("SIRIUS_METADATA_PARSE_CHUNK")) {
-    try {
-      if (const auto v = std::stoull(env); v > 0) return static_cast<std::size_t>(v);
-    } catch (...) { /* fall through to default */
-    }
-  }
-  return kDefaultParseChunk;
+  // This is an internal scheduling granularity, not a user tuning surface.
+  constexpr std::size_t kParseChunk = 8;
+  return kParseChunk;
 }
 
 namespace {
@@ -450,12 +444,9 @@ bool row_group_pruned_by_filter_stats(duckdb::PartitionRowGroup& prg,
   return false;
 }
 
-/// @brief Mark row groups a pushed-down filter proves can hold no matching rows.
-///
-/// Runs during prepare, before worker-thread segment walks, because statistics
-/// are available from PartitionRowGroup handles and do not require segment
-/// metadata. This avoids parsing metadata for row groups that will be skipped
-/// and lets the all-pruned case route to DuckDB CPU before the async scan starts.
+// Mark row groups a pushed-down filter proves can hold no matching rows. This
+// runs before concurrent segment walks so pruned groups need no segment
+// metadata. An all-pruned plan remains viable and reaches the empty-split path.
 void mark_row_groups_pruned_by_filter_stats(duckdb_native_walk_plan& plan)
 {
   if (plan.table_filters == nullptr || plan.table_filters->filters.empty() ||

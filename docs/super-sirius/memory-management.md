@@ -23,9 +23,9 @@ Each tier has configurable thresholds:
 
 | Parameter | GPU | Host | Purpose |
 |-----------|-----|------|---------|
-| `reservation_limit_fraction` | 0.9 | 0.9 | Max fraction reservable |
-| `downgrade_trigger_fraction` | 1.0 | 0.8 | When to start downgrading |
-| `downgrade_stop_fraction` | 0.7 | 0.7 | When to stop downgrading |
+| `reservation_limit_fraction` | 1.0 | 1.0 | Max fraction reservable |
+| `downgrade_trigger_fraction` | 0.8 | 0.9 | When to start downgrading |
+| `downgrade_stop_fraction` | 0.6 | 0.8 | When to stop downgrading; configuration requires `0 < stop < trigger <= 1` |
 
 ## cuCascade Integration
 
@@ -45,19 +45,20 @@ From `sirius_config`:
 **GPU Memory Space:**
 ```cpp
 device_id;                      // GPU device number
-reservation_limit_fraction = 0.9;
-downgrade_trigger_fraction = 1.0;
-downgrade_stop_fraction = 0.7;
+reservation_limit_fraction = 1.0;
+downgrade_trigger_fraction = 0.8;
+downgrade_stop_fraction = 0.6;
 ```
 
 **Host Memory Space:**
 ```cpp
 numa_id;                        // NUMA node affinity
-reservation_limit_fraction = 0.9;
-downgrade_trigger_fraction = 0.8;
-downgrade_stop_fraction = 0.7;
-block_size = 64MB;              // cuCascade block size
-pool_size = 1024;               // blocks per pool
+reservation_limit_fraction = 1.0;
+downgrade_trigger_fraction = 0.9;
+downgrade_stop_fraction = 0.8;
+block_size = 1MiB;              // cuCascade block size
+pool_size = 128;                // blocks per pool
+initial_number_pools = 4;       // pools allocated at startup
 ```
 
 **Disk Memory Space:**
@@ -83,6 +84,10 @@ Wraps RMM device memory resource. On each allocation:
 - If exhausted → fails gracefully, triggering `oom_reschedule_exception`
 - Enables predictable memory usage per task
 
+### Caller reservations for HOST conversions
+
+Conversions that land data on the HOST tier draw down a caller-owned reservation instead of double-committing host capacity: the caller obtains a reservation with `make_reservation_or_null(size)` and passes it to the reservation-taking `convert_to`/`clone_to` overloads, so the converter's allocation is charged against capacity the caller already holds. If the reservation cannot be made, the call falls back — with a warning — to the `memory_space*` overload (no reservation; the converter may OOM). Call sites: `lock_or_prepare_batch` in `src/include/pipeline/batch_lock_utils.hpp` and the materialized result collector (`src/op/sirius_physical_result_collector.cpp`). The `memory_space*` overloads remain the path for GPU/DISK targets and viability probes.
+
 ## Downgrade Executor
 
 **File:** `src/include/downgrade/downgrade_executor.hpp`, `src/downgrade/downgrade_executor.cpp`
@@ -97,6 +102,8 @@ One `downgrade_executor` per memory space monitors pressure and moves data to lo
   - Without DISK, only a GPU source has a lower tier (HOST). Viability is confirmed by probing each HOST space with a chunk-sized `make_reservation_or_null` (released immediately) — the ground truth for whether downgraded data can actually land, since HOST capacity reflects both live reservations and already-stored downgraded data.
   - If no target is viable (e.g. idle GPU batches whose only lower tier is a full HOST with no DISK configured), the monitor **backs off** for that cycle without enqueuing, warning once per stall episode. The gate is re-evaluated every cycle with no latched state, so the monitor resumes automatically the instant HOST frees space or GPU pressure drops.
 - **Worker thread pool** (`exec::bounded_thread_pool`): executes actual data movement concurrently
+
+The monitor sleeps on an interruptible condition-variable wait rather than a plain sleep, so `stop()` wakes it immediately instead of blocking shutdown for up to a full `monitor_period`.
 
 The monitor is not on the correctness-critical path: the pipeline executor drives downgrade on demand via `request_downgrade()` independently, so monitor back-off can never wedge a query. Monitor-issued requests are fire-and-forget.
 
@@ -144,6 +151,8 @@ Each GPU pipeline maintains a `pipeline_memory_history` — a thread-safe ring b
 
 `gpu_pipeline_task::get_estimated_reservation_size_info(target_space)` uses `estimate_peak_memory()` for the reservation, adding `_bytes_to_materialize_input` — the bytes needed to materialize inputs into the task's target memory space (HOST/disk upgrades plus cross-GPU clones) — and subtracting it from recorded peak to keep operator history clean of materialization overhead. Materialization allocations are charged to the task's reservation through the default per-thread allocation tracking; with the non-default `track_per_stream_reservation: true`, converter allocations made on internal pool streams bypass the task's reservation and are only checked against space capacity.
 
+A cached scan input (a resident `scan_operator_input`) is sized by a dedicated branch before the pipelineable-input walk: it contributes its uncompressed GPU footprint when the cached batch is not already GPU-resident (since `prepare_for_processing()` uploads HOST-cached batches before execution), and zero when it is. Resident classification is deliberately unchanged by this sizing — a HOST cache hit must not be treated as a fresh read, which would apply the fresh-read decode heuristic instead.
+
 ## Memory Pool Defragmentation
 
 **File:** `src/include/memory/defragmenter_oom_policy.hpp`, `src/memory/defragmenter_oom_policy.cpp`
@@ -163,7 +172,7 @@ On allocation failure:
 
 `small_pinned_host_memory_resource` provides fast host memory allocation:
 
-- Fixed-size block pools: 64MB blocks, 1024 blocks per pool
+- Fixed-size block pools: 1 MiB blocks, 128 blocks per pool, with four pools initially
 - Automatic NUMA node affinity
 - Used for GPU↔CPU transfers and scan caching
 - Configured via `sirius.yaml` (see [Configuration](configuration.md))

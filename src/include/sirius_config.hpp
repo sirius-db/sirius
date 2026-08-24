@@ -24,6 +24,7 @@
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 
+#include <cmath>
 #include <filesystem>
 #include <string>
 
@@ -39,7 +40,9 @@ constexpr uint64_t DEFAULT_BATCH_SIZE = 800ULL * 1024 * 1024;  // 800 MiB
 /// Shared operator batch default: 2.5% of the smallest visible GPU's total memory,
 /// clamped to [512 MiB, 5 GiB]; DEFAULT_BATCH_SIZE when no GPU is visible. Queried
 /// once per process (memoized). operator_params derives its batch members from this,
-/// so every default-constructed instance (config, SET registration) agrees.
+/// so every default-constructed instance agrees. When YAML explicitly configures an
+/// effective GPU capacity, sirius_config narrows the shared defaults from the resolved
+/// memory-space configs before applying explicit operator_params overrides.
 uint64_t derived_default_batch_size();
 
 constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE       = DEFAULT_BATCH_SIZE;
@@ -71,6 +74,29 @@ constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
 /// that the crossover is hardware- and workload-dependent. Recalibrate per GPU; set to 0 to
 /// disable (always use filtered_join).
 constexpr double DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO = 8.0;
+
+struct valid_domain_coverage_threshold {
+  [[nodiscard]] bool operator()(double value) const noexcept
+  {
+    return std::isfinite(value) && value > 0.0;
+  }
+  [[nodiscard]] static constexpr char const* description() noexcept
+  {
+    return "must be finite and greater than 0.0";
+  }
+};
+
+/// Test build-key uniqueness at runtime when the planner could not prove it statically.
+///
+/// cudf's general hash join probes twice — a count pass to size the output, then a retrieve pass —
+/// while cudf::distinct_hash_join probes once, because a distinct build bounds the output by the
+/// probe row count. Sirius already implements both, but the distinct path is gated on a *proof* of
+/// uniqueness, which only a declared PRIMARY KEY on a catalog table can supply. The runtime test is
+/// one cudf::distinct_count pass over the build keys, taken only in BUILD_PROBE mode.
+///
+/// Temporarily off by default (issue #1600): cudf::distinct_count can hit a cuCollections bug
+/// (NVIDIA/cuCollections#834) on some key distributions. Re-enable once the fix ships in libcudf.
+constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
 }  // namespace config
 
@@ -114,27 +140,30 @@ struct operator_params {
   /// disable (always use filtered_join).
   double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
 
-  /// Wire dynamic table-filter pushdown: an eligible BUILD_PROBE hash-join build publishes a raw
-  /// exact IN-list for 1..12 supported build rows, otherwise a hash IN-list if it fits the smallest
-  /// probe-GPU L2, or a Bloom, into the probe-side scan. The scan applies membership post-decode to
-  /// drop non-matching rows before the join. On by default; the master switch for the feature.
-  bool enable_dynamic_filter_pushdown = true;
+  /// Engine-owned policy: when enabled and the planner could not prove build-key uniqueness, test
+  /// it at runtime (one cudf::distinct_count pass over the build keys) and take the single-pass
+  /// cudf::distinct_hash_join when the keys are distinct. Temporarily disabled pending issue #1600.
+  /// BUILD_PROBE mode only, INNER/LEFT equality joins with null-unequal semantics. Tests retain
+  /// direct programmatic control of this field to exercise both implementations. See
+  /// DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE.
+  bool enable_runtime_distinct_build_probe = config::DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE;
 
-  /// Additionally emit a runtime zone-map (build-key [min,max]) alongside the membership filter,
-  /// for READ-time row-group pruning on parquet scans; duckdb-native scans apply it row-wise
-  /// post-decode instead. Off by default and requires enable_dynamic_filter_pushdown: on
-  /// TPC-H-shaped joins DuckDB's static transitive-predicate pushdown already prunes
-  /// range-derivable builds, and scattered keys prune nothing, so the zone-map only pays off on
-  /// clustered-keyset joins whose narrow key range is runtime-determined.
+  /// Enable dynamic filters for eligible hash joins.
+  bool enable_dynamic_filter = true;
+
+  /// Emit build-key min/max filters in addition to membership filters.
   bool enable_dynamic_zone_map_filter = false;
 
-  /// Skip publishing a key's dynamic filters when the build covers at least this fraction of the
-  /// key's domain (rows gate and zone-map range gate). Values >= 1.0 effectively disable the gate.
+  /// Skip a proven-unique key when its complete build meets this known-domain coverage. Values
+  /// above 1 disable the gate.
   double dynamic_filter_domain_coverage_threshold = 0.9;
 
-  /// Consumer-side scan gate: disable a scan's post-decode dynamic filtering once a measured split
-  /// keeps more than this fraction of its rows (too unselective to repay the mask kernel). In
-  /// [0, 1]; 1.0 keeps filtering always on.
+  /// Hash-IN-list size limit as a fraction of the smallest known probe-GPU L2, in [0, 1]. Larger
+  /// sets use Bloom; unknown L2 makes the hash IN-list ineligible.
+  double dynamic_filter_inlist_max_l2_fraction = 0.125;
+
+  /// Disable post-decode filtering above this measured keep ratio. Values are in [0, 1]; 1 keeps
+  /// the scan-level gate active.
   double dynamic_filter_keep_threshold = 0.9;
 
   /// Zone-map pruning of pinned-table chunks at cache-serve time: skip cached chunks whose pin-time
@@ -148,6 +177,17 @@ struct operator_params {
   /// metadata; other scans use native carriers. Logical types remain unchanged, and type-sensitive
   /// boundaries restore native carriers.
   bool enable_compressed_materialization = true;
+
+  /// Admission-time GPU allocation: target bytes of projected scan output per GPU.
+  /// At query start, the engine estimates total scan output bytes from the plan's
+  /// estimated_cardinality × per-column width, then assigns
+  /// ceil(total_bytes / admission_bytes_per_gpu) GPUs, clamped to [1, active_gpu_count].
+  /// 0 disables dynamic estimation and falls back to topology.gpus_per_query.
+  uint64_t admission_bytes_per_gpu = 0;
+
+  /// Bytes assumed per variable-width column (VARCHAR, LIST, etc.) when computing
+  /// per-row byte estimates for admission. Only used when admission_bytes_per_gpu > 0.
+  uint64_t avg_variable_column_bytes = 32;
 };
 
 struct telemetry_config {
@@ -177,6 +217,8 @@ struct compression_config {
   /// size, for the compressed form to be kept.  When the compressed header +
   /// payload exceeds this fraction of the original (i.e. compression saved too
   /// little), the compressed data is discarded and the uncompressed batch is used.
+  /// Must be finite and non-negative. Values above 1 deliberately allow compressed
+  /// representations that expand relative to the original batch.
   //  Default 0.75 (that coincides with a 1.33x compression ratio).
   double max_compressed_fraction{0.75};
 
@@ -240,6 +282,11 @@ struct sirius_config {
     return _compression_config;
   }
 
+  /// How many GPUs to allocate per query. 0 = use all active GPUs (default).
+  /// Limits each query to the first @c gpus_per_query entries of the sorted
+  /// active-GPU list; the rest are left available for future concurrent queries.
+  [[nodiscard]] int gpus_per_query() const noexcept { return _gpus_per_query; }
+
  private:
   /// When @c _memory_space_configs contains more than one GPU memory space,
   /// force @c _scan_manager_config.use_sirius_datasource to true (sirius
@@ -248,6 +295,7 @@ struct sirius_config {
   void enforce_sirius_datasource_for_multi_gpu();
 
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
+  int _gpus_per_query = 0;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   creator::task_creator_config _task_creator_config;
   scan_manager::scan_manager_config _scan_manager_config{};

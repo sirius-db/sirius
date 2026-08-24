@@ -25,8 +25,12 @@
 #include <duckdb/planner/table_filter.hpp>
 
 // standard library
+#include <cstdint>
 #include <optional>
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace sirius::op {
 
@@ -46,6 +50,73 @@ namespace sirius::op {
  */
 std::vector<std::optional<std::size_t>> build_batch_column_map(
   const duckdb::vector<duckdb::idx_t>& projection_ids, std::size_t column_ids_count);
+
+/// Where a filter's column lands in the decoded batch.
+enum class filter_column_status : std::uint8_t {
+  /// Resolved: the filter constrains @c batch_position of the decoded batch.
+  usable,
+  /// Not this scan's to apply — a hive partition, which DuckDB already enforced
+  /// at the file-list level, or a filter naming no column of the scan.
+  skipped,
+  /// The column is the scan's but is not in the batch. Every caller has to
+  /// decide this one for itself: a filter that must be evaluated cannot
+  /// reference a column that was never materialized (a wiring bug worth
+  /// failing on), while a filter used only to PRUNE can be dropped silently.
+  not_in_batch,
+};
+
+struct resolved_filter_column {
+  filter_column_status status = filter_column_status::skipped;
+  std::size_t primary_index   = 0;
+  std::size_t batch_position  = 0;
+};
+
+/**
+ * @brief Resolve one entry of a TableFilterSet onto the decoded batch.
+ *
+ * The bookkeeping every walk over a filter set repeats: column_index → primary
+ * index → is it ours → which batch column. Shared so the skip rules and the
+ * bounds checks are stated once; what each walk does with a given filter TYPE
+ * is its own business and deliberately not here.
+ */
+[[nodiscard]] resolved_filter_column resolve_filtered_column(
+  duckdb::idx_t column_index,
+  const duckdb::vector<duckdb::ColumnIndex>& column_ids,
+  const std::vector<std::optional<std::size_t>>& batch_position_by_column_id,
+  const std::unordered_set<std::size_t>& skip_primary_indices);
+
+/**
+ * @brief One top-level conjunct of a scan's pushed-down filter.
+ *
+ * @c expr is the comparison over batch positions, exactly as
+ * @ref convert_table_filters_to_expression would have emitted it. @c primary_index
+ * and @c batch_position name the column it constrains, so a caller that learns
+ * the column arrived already reduced to a boolean answer can swap this conjunct
+ * for a reference to it instead of re-expressing the comparison.
+ */
+struct table_filter_conjunct {
+  std::size_t primary_index  = 0;
+  std::size_t batch_position = 0;
+  duckdb::unique_ptr<duckdb::Expression> expr;
+};
+
+/**
+ * @brief Decompose @p filters into its top-level conjuncts.
+ *
+ * The conjunct set is exactly what @ref convert_table_filters_to_expression
+ * ANDs together — same skips (optional / IS NOT NULL / @p skip_primary_indices),
+ * same order — because that function is implemented on top of this one. A caller
+ * that needs to vary the conjunction per batch decomposes once here rather than
+ * rebuilding the whole expression each time.
+ *
+ * @throws std::runtime_error if a filtered column is not present in the batch.
+ */
+std::vector<table_filter_conjunct> decompose_table_filters(
+  const duckdb::TableFilterSet& filters,
+  const duckdb::vector<duckdb::ColumnIndex>& column_ids,
+  const duckdb::vector<sirius::logical_type>& returned_types,
+  const std::vector<std::optional<std::size_t>>& batch_position_by_column_id,
+  const std::unordered_set<std::size_t>& skip_primary_indices = {});
 
 /**
  * @brief Convert a DuckDB TableFilterSet into a single bound DuckDB expression (conjunction of

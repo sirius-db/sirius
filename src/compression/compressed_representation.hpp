@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "compressed_scan.hpp"
+
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 
@@ -187,6 +189,24 @@ class compressed_host_representation : public cucascade::idata_representation {
     return _selected_indices;
   }
 
+  /// Attach the scan whose filter this projection decodes under.
+  ///
+  /// Call only on a freshly projected representation the caller owns outright
+  /// (as @ref select_columns returns): the scan's filter is a property of one
+  /// query, never of the shared pinned chunk. One carrier for the whole
+  /// request, so a clone copies a pointer and nothing can be forgotten.
+  void set_pushdown_scan(std::shared_ptr<const decompression_pushdown_scan> scan)
+  {
+    _pushdown_scan = std::move(scan);
+  }
+
+  /// The attached scan, or null when the columns decompress unfiltered.
+  [[nodiscard]] std::shared_ptr<const decompression_pushdown_scan> const& pushdown_scan()
+    const noexcept
+  {
+    return _pushdown_scan;
+  }
+
  private:
   /// Construct a projection sharing the same backing blob.
   compressed_host_representation(cucascade::memory::memory_space& memory_space,
@@ -204,6 +224,7 @@ class compressed_host_representation : public cucascade::idata_representation {
   std::size_t _uncompressed_bytes;
   std::int64_t _num_rows;
   std::optional<std::vector<std::size_t>> _selected_indices;
+  std::shared_ptr<const decompression_pushdown_scan> _pushdown_scan;
   std::shared_ptr<const per_column_byte_sizes> _column_sizes;
 };
 
@@ -273,6 +294,24 @@ class compressed_device_representation : public cucascade::idata_representation 
     return _selected_indices;
   }
 
+  /// Attach the scan whose filter this projection decodes under.
+  ///
+  /// Call only on a freshly projected representation the caller owns outright
+  /// (as @ref select_columns returns): the scan's filter is a property of one
+  /// query, never of the shared pinned chunk. One carrier for the whole
+  /// request, so a clone copies a pointer and nothing can be forgotten.
+  void set_pushdown_scan(std::shared_ptr<const decompression_pushdown_scan> scan)
+  {
+    _pushdown_scan = std::move(scan);
+  }
+
+  /// The attached scan, or null when the columns decompress unfiltered.
+  [[nodiscard]] std::shared_ptr<const decompression_pushdown_scan> const& pushdown_scan()
+    const noexcept
+  {
+    return _pushdown_scan;
+  }
+
  private:
   compressed_device_representation(cucascade::memory::memory_space& memory_space,
                                    std::shared_ptr<compressed_device_blob> blob,
@@ -289,6 +328,7 @@ class compressed_device_representation : public cucascade::idata_representation 
   std::size_t _uncompressed_bytes;
   std::int64_t _num_rows;
   std::optional<std::vector<std::size_t>> _selected_indices;
+  std::shared_ptr<const decompression_pushdown_scan> _pushdown_scan;
   std::shared_ptr<const per_column_byte_sizes> _column_sizes;
 };
 

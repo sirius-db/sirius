@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-#include "duckdb/common/types/column/column_data_collection.hpp"
-#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
@@ -46,13 +44,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalCTERef& op)
     }
 
     chunk_scan->collection = cte->second.get();
-    // materialized_cte->second.push_back(*chunk_scan.get())
-
-    // auto gpu_cte = gpu_recursive_cte_tables.find(op.cte_index);
-    // if (gpu_cte == gpu_recursive_cte_tables.end()) {
-    //   throw duckdb::InvalidInputException("Referenced materialized CTE does not exist.");
-    // }
-    // chunk_scan->intermediate_relation = gpu_cte->second;
 
     materialized_cte->second.push_back(*chunk_scan.get());
 
@@ -60,29 +51,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalCTERef& op)
   }
 
   throw duckdb::NotImplementedException("Recursive CTE is not implemented");
-
-  auto cte = recursive_cte_tables.find(op.cte_index);
-  if (cte == recursive_cte_tables.end()) {
-    throw duckdb::InvalidInputException("Referenced recursive CTE does not exist.");
-  }
-
-  // If we found a recursive CTE and we want to scan the recurring table, we search for it,
-  if (op.is_recurring) {
-    cte = recurring_cte_tables.find(op.cte_index);
-    if (cte == recurring_cte_tables.end()) {
-      throw duckdb::InvalidInputException(
-        "RECURRING can only be used with USING KEY in recursive CTE.");
-    }
-  }
-
-  auto chunk_scan = duckdb::make_uniq<sirius::op::sirius_physical_column_data_scan>(
-    sirius::from_duckdb_vec(cte->second.get()->Types()),
-    sirius::op::SiriusPhysicalOperatorType::RECURSIVE_CTE_SCAN,
-    op.estimated_cardinality,
-    op.cte_index);
-
-  chunk_scan->collection = cte->second.get();
-  return std::move(chunk_scan);
 }
 
 }  // namespace sirius::planner

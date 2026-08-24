@@ -40,7 +40,6 @@ enum class task_request_kind {
 
 struct task_request {
   int device_id;
-  bool is_scan{false};
   task_request_kind kind{task_request_kind::device_ready};
   std::chrono::high_resolution_clock::time_point created_at{
     std::chrono::high_resolution_clock::now()};

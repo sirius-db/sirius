@@ -31,6 +31,16 @@
 //! | `HDFS_SCAN_NODE`     | `ReadRel` (named table) |
 //! | `SELECT_NODE`        | `FilterRel`        |
 //! | `PROJECT_NODE`       | `ProjectRel`       |
+//! | `AGGREGATION_NODE`   | `AggregateRel` (finalized one-phase only, `new_planner_agg_stage=1`) |
+//! | `SORT_NODE`          | `ProjectRel` (sort tuple) + `SortRel` (global row-number top-N only) |
+//! | `HASH_JOIN_NODE`     | `JoinRel` (inner/outer/left-semi; anti joins are rejected) |
+//! | `NESTLOOP_JOIN_NODE` | `CrossRel` (+ `FilterRel`), inner/cross only |
+//!
+//! Node-level `conjuncts` (scan/filter predicates, HAVING, post-join filters) become a
+//! `FilterRel` over the node's output on every supported node.
+//!
+//! Any node's non-negative `limit` (plus a sort offset) becomes a `FetchRel` on top of its
+//! relation.
 //!
 //! | Expression node   | Substrait expression |
 //! |-------------------|----------------------|
@@ -44,6 +54,10 @@
 //! | `IN_PRED`         | singular-or-list (wrapped in `not` for `NOT IN`) |
 //! | `CASE_EXPR`       | if-then chain (no leading case operand) |
 //! | `FUNCTION_CALL`   | allowlisted scalar functions (`like`, `if`, `substring`, `year`, ...) |
+//!
+//! Aggregate functions (`sum`, `count`, `min`, `max`, `avg`, and the
+//! `multi_distinct_*` distinct forms) are decomposed by `expr_translator::aggregate_call` for
+//! `AggregateRel` measures; only non-merge (one-phase) aggregates are accepted.
 //!
 //! Type mapping lives in `type_mapper`. Intentional v1 omissions return
 //! [`TranslateError::UnsupportedType`]: `LARGEINT` (128-bit), `DECIMAL256` and
@@ -99,6 +113,8 @@ pub const URN_ARITHMETIC: &str = "extension:io.substrait:functions_arithmetic";
 pub const URN_STRING: &str = "extension:io.substrait:functions_string";
 /// Substrait datetime function extension URN.
 pub const URN_DATETIME: &str = "extension:io.substrait:functions_datetime";
+/// Substrait aggregate function extension URN.
+pub const URN_AGGREGATE: &str = "extension:io.substrait:functions_aggregate_generic";
 
 /// Result of translating one StarRocks plan fragment.
 pub struct TranslatedPlan {

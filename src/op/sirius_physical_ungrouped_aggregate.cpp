@@ -192,14 +192,23 @@ aggregate_layout build_aggregate_layout(
         layout.merge_kinds.push_back(cudf::aggregation::Kind::MAX);
         layout.merge_nth_index.push_back(std::nullopt);
         break;
-      case sirius::aggregate_id::avg:
+      case sirius::aggregate_id::avg: {
         if (children.empty()) {
           throw not_implemented_exception("avg() without arguments not supported");
         }
         spec.kind          = aggregate_kind::AVG;
         spec.input_idx     = child_ref_index();
         spec.local_sum_idx = local_idx++;
-        layout.local_types.push_back(agg_return_type);
+        // AVG's local carrier is the input type, not AVG's final return type. Execution widens
+        // signed 8/16/32-bit inputs to INT64 before reducing so partial sums merge without a
+        // cross-type reduction; keep the declared local schema on the same rule.
+        auto local_sum_type = sirius::to_duckdb(children[0]->return_type());
+        if (local_sum_type.id() == duckdb::LogicalTypeId::TINYINT ||
+            local_sum_type.id() == duckdb::LogicalTypeId::SMALLINT ||
+            local_sum_type.id() == duckdb::LogicalTypeId::INTEGER) {
+          local_sum_type = duckdb::LogicalType::BIGINT;
+        }
+        layout.local_types.push_back(std::move(local_sum_type));
         layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
         layout.merge_nth_index.push_back(std::nullopt);
         spec.local_count_idx = local_idx++;
@@ -208,6 +217,7 @@ aggregate_layout build_aggregate_layout(
         layout.merge_nth_index.push_back(std::nullopt);
         layout.has_avg = true;
         break;
+      }
       case sirius::aggregate_id::first:
         spec.kind          = aggregate_kind::FIRST;
         spec.input_idx     = child_ref_index();
@@ -263,6 +273,26 @@ std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
 }
 
 }  // namespace
+
+duckdb::vector<sirius::logical_type> sirius_physical_ungrouped_aggregate::get_local_output_types()
+  const
+{
+  aggregate_layout layout;
+  try {
+    layout = build_aggregate_layout(aggregates);
+  } catch (const not_implemented_exception&) {
+    // Keep unsupported aggregates on their established runtime-fallback path. Their local output
+    // is never consumed, so retaining the declared schema here avoids turning a runtime fallback
+    // into an earlier planning refusal merely to describe an output that will not be produced.
+    return types;
+  }
+  duckdb::vector<sirius::logical_type> local_types;
+  local_types.reserve(layout.local_types.size());
+  for (auto const& type : layout.local_types) {
+    local_types.push_back(sirius::from_duckdb(type));
+  }
+  return local_types;
+}
 
 std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
@@ -390,7 +420,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
       }
     }
 
-    auto out_table = std::make_unique<cudf::table>(std::move(cols), stream);
+    auto out_table = std::make_unique<cudf::table>(std::move(cols));
     // STREAM-LINEAGE: cudf::table ctor + cudf::make_column_from_scalar wrote
     // on `stream`; the constructor records the writer event for downstream
     // cross-device readers.

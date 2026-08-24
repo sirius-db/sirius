@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "op/sirius_dynamic_filter.hpp"
+#include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 
 #include <cudf/ast/expressions.hpp>
 #include <cudf/scalar/scalar.hpp>
@@ -42,6 +42,18 @@ namespace {
 std::unique_ptr<cudf::scalar> make_int32_scalar(int32_t v)
 {
   return std::make_unique<cudf::numeric_scalar<int32_t>>(
+    v, true, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+}
+
+std::unique_ptr<cudf::scalar> make_int64_scalar(int64_t v)
+{
+  return std::make_unique<cudf::numeric_scalar<int64_t>>(
+    v, true, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+}
+
+std::unique_ptr<cudf::scalar> make_float64_scalar(double v)
+{
+  return std::make_unique<cudf::numeric_scalar<double>>(
     v, true, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
 }
 
@@ -223,49 +235,14 @@ TEST_CASE("sirius_dynamic_filter_set tracks wired producers", "[dynamic_filter]"
   }
 }
 
-TEST_CASE("set_consumer_column_remap translates producer column_ids to output positions",
-          "[dynamic_filter]")
+TEST_CASE("ignore_columns drops pushes for the marked output columns", "[dynamic_filter]")
 {
-  // Producers reference probe columns in the consumer's column_ids space, but the channel must
-  // key by output-column position (what the AST merge and post-decode apply index). The remap is
-  // column_ids index -> output position, with size_t(-1) (scan_plan::no_output_position) marking a
-  // column_ids entry that produces no output column.
-  constexpr auto kNoOutput = static_cast<std::size_t>(-1);
-
+  // Hive-partition values are path-derived, so their output positions reject filter pushes.
   sirius_dynamic_filter_set set;
-  // column_ids = [A(0), B(1), C(2)]; output = [C, A] -> A(0)->out 1, B(1)->pruned, C(2)->out 0.
-  set.set_consumer_column_remap({1, kNoOutput, 0});
+  set.ignore_columns({0});
 
-  REQUIRE(set.push_filter(2, make_single_zone_filter(0, 100)));        // C -> output position 0
-  REQUIRE(set.push_filter(0, make_single_zone_filter(0, 100)));        // A -> output position 1
-  REQUIRE_FALSE(set.push_filter(1, make_single_zone_filter(0, 100)));  // B pruned from output
-  REQUIRE_FALSE(set.push_filter(9, make_single_zone_filter(0, 100)));  // out of column_ids range
-
-  auto cols = set.filtered_columns();
-  std::sort(cols.begin(), cols.end());
-  REQUIRE(cols == std::vector<std::size_t>{0, 1});  // output positions, not column_ids indices
-  REQUIRE(set.filters_for_column(0).size() == 1);   // C's filter, keyed by output position
-  REQUIRE(set.filters_for_column(1).size() == 1);   // A's filter, keyed by output position
-  REQUIRE(set.filters_for_column(2).empty());       // nothing keyed by the raw column_ids index
-}
-
-TEST_CASE("empty consumer column remap is identity", "[dynamic_filter]")
-{
-  sirius_dynamic_filter_set set;
-  set.set_consumer_column_remap({});  // empty -> identity, indices stored unchanged
-  REQUIRE(set.push_filter(5, make_single_zone_filter(0, 100)));
-  REQUIRE(set.filters_for_column(5).size() == 1);
-}
-
-TEST_CASE("consumer column remap composes with ignore_columns in output-position space",
-          "[dynamic_filter]")
-{
-  sirius_dynamic_filter_set set;
-  set.set_consumer_column_remap({1, 0});  // column_ids 0 -> out 1, column_ids 1 -> out 0
-  set.ignore_columns({0});                // ignore output position 0
-
-  REQUIRE_FALSE(set.push_filter(1, make_single_zone_filter(0, 100)));  // -> out 0, ignored
-  REQUIRE(set.push_filter(0, make_single_zone_filter(0, 100)));        // -> out 1, kept
+  REQUIRE_FALSE(set.push_filter(0, make_single_zone_filter(0, 100)));
+  REQUIRE(set.push_filter(1, make_single_zone_filter(0, 100)));
   REQUIRE(set.filtered_columns() == std::vector<std::size_t>{1});
 }
 
@@ -284,6 +261,62 @@ TEST_CASE("sirius_dynamic_zone_map_filter rejects null bounds", "[dynamic_filter
   std::vector<zone_map_entry> zones2;
   zones2.push_back(zone_map_entry{make_int32_scalar(0), nullptr});
   REQUIRE_THROWS_AS(sirius_dynamic_zone_map_filter(std::move(zones2)), std::invalid_argument);
+}
+
+TEST_CASE("sirius_dynamic_zone_map_filter::supports allowlists lowerable non-float types",
+          "[dynamic_filter]")
+{
+  REQUIRE_FALSE(sirius_dynamic_zone_map_filter::supports(cudf::data_type{cudf::type_id::FLOAT32}));
+  REQUIRE_FALSE(sirius_dynamic_zone_map_filter::supports(cudf::data_type{cudf::type_id::FLOAT64}));
+
+  for (auto const id : {cudf::type_id::INT8,
+                        cudf::type_id::INT16,
+                        cudf::type_id::INT32,
+                        cudf::type_id::INT64,
+                        cudf::type_id::UINT8,
+                        cudf::type_id::UINT16,
+                        cudf::type_id::UINT32,
+                        cudf::type_id::UINT64,
+                        cudf::type_id::BOOL8,
+                        cudf::type_id::TIMESTAMP_DAYS,
+                        cudf::type_id::TIMESTAMP_SECONDS,
+                        cudf::type_id::TIMESTAMP_MILLISECONDS,
+                        cudf::type_id::TIMESTAMP_MICROSECONDS,
+                        cudf::type_id::TIMESTAMP_NANOSECONDS,
+                        cudf::type_id::DECIMAL32,
+                        cudf::type_id::DECIMAL64,
+                        cudf::type_id::DECIMAL128,
+                        cudf::type_id::STRING}) {
+    REQUIRE(sirius_dynamic_zone_map_filter::supports(cudf::data_type{id}));
+  }
+
+  for (auto const id : {cudf::type_id::EMPTY,
+                        cudf::type_id::DURATION_SECONDS,
+                        cudf::type_id::LIST,
+                        cudf::type_id::STRUCT,
+                        cudf::type_id::DICTIONARY32}) {
+    REQUIRE_FALSE(sirius_dynamic_zone_map_filter::supports(cudf::data_type{id}));
+  }
+}
+
+TEST_CASE("sirius_dynamic_zone_map_filter rejects unsupported and mismatched bound types",
+          "[dynamic_filter]")
+{
+  std::vector<zone_map_entry> float64_zones;
+  float64_zones.push_back(zone_map_entry{make_float64_scalar(0.0), make_float64_scalar(10.0)});
+  REQUIRE_THROWS_AS(sirius_dynamic_zone_map_filter(std::move(float64_zones)),
+                    std::invalid_argument);
+
+  std::vector<zone_map_entry> mismatched_zones;
+  mismatched_zones.push_back(zone_map_entry{make_int32_scalar(0), make_int64_scalar(10)});
+  REQUIRE_THROWS_AS(sirius_dynamic_zone_map_filter(std::move(mismatched_zones)),
+                    std::invalid_argument);
+
+  std::vector<zone_map_entry> cross_zone_mismatch;
+  cross_zone_mismatch.push_back(zone_map_entry{make_int32_scalar(0), make_int32_scalar(10)});
+  cross_zone_mismatch.push_back(zone_map_entry{make_int64_scalar(20), make_int64_scalar(30)});
+  REQUIRE_THROWS_AS(sirius_dynamic_zone_map_filter(std::move(cross_zone_mismatch)),
+                    std::invalid_argument);
 }
 
 TEST_CASE("sirius_dynamic_zone_map_filter::to_ast emits a single bounded conjunction for N=1",

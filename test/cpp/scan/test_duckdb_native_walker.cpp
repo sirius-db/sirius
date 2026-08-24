@@ -893,30 +893,6 @@ TEST_CASE("statistics pruning keeps every row group when the filter matches all"
   REQUIRE(md.pruned_decoded_bytes == 0);
 }
 
-TEST_CASE("statistics pruning refuses CPU fallback when every row group is pruned",
-          "[scan][duckdb_native_walker][pruning]")
-{
-  auto [db_owner, con] = sirius::make_test_db_and_connection();
-  auto& storage        = make_monotonic_int_table(con);
-
-  std::vector<projected_column> cols   = {real_col(0)};
-  std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::INTEGER)};
-
-  auto base = walk_all(storage, *con.context, cols, ts);
-  REQUIRE(base.viable);
-
-  // a >= 1_000_000 exceeds every value -> every row group is
-  // FILTER_ALWAYS_FALSE. Reject so the query routes to DuckDB CPU, which can
-  // produce the correct empty result without relying on a zero-split GPU scan.
-  auto ctx = make_constant_filter(
-    0, 0, duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::INTEGER(1000000));
-  auto md = walk_all(storage, *con.context, cols, ts, &ctx.filters, &ctx.column_ids);
-
-  REQUIRE_FALSE(md.viable);
-  REQUIRE(md.viability_failure_reason.find("pruned") != std::string::npos);
-  REQUIRE(md.pruned_row_groups == base.row_groups.size());
-}
-
 // Guards the relaxation that lets us prune on any static filter, not just the
 // subset re-applied post-decode. An OPTIONAL_FILTER ("not required for query
 // correctness") wrapping a lower-bound still prunes, because OptionalFilter

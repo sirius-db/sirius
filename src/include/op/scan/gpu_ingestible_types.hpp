@@ -149,6 +149,16 @@ enum class filter_state {
 struct filtered_table {
   owning_table_view table;
   filter_state state{filter_state::UNFILTERED};
+  /// Positions in @c table delivered as a BOOL8 predicate result rather than
+  /// values (see sirius::pushdown_outcome::predicate_columns). Their filter
+  /// conjunct is already answered, so post_filter_and_project references the
+  /// column instead of re-expressing the comparison. Empty on every path that
+  /// substitutes nothing.
+  std::vector<std::size_t> predicate_columns;
+  /// The decode also applied those conjuncts to the rows (see
+  /// sirius::pushdown_outcome::predicates_enforced), so post_filter_and_project
+  /// drops them from the residual instead of referencing the answer.
+  bool predicates_enforced{false};
 };
 
 }  // namespace sirius::op::scan

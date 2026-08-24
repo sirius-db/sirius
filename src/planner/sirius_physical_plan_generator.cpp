@@ -33,11 +33,11 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "log/logging.hpp"
+#include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
-#include "op/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -105,15 +105,6 @@ bool is_nested_logical_type(duckdb::LogicalType const& type)
   auto const id = type.id();
   return id == duckdb::LogicalTypeId::STRUCT || id == duckdb::LogicalTypeId::LIST ||
          id == duckdb::LogicalTypeId::MAP;
-}
-
-/// Read the dynamic-filter-pushdown enable flag from the active SiriusContext config. Defaults to
-/// disabled when the state is unavailable (no config to consult outside a configured query).
-bool dynamic_filter_pushdown_enabled(duckdb::ClientContext& context)
-{
-  auto state = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!state) { return false; }
-  return state->get_config().get_operator_params().enable_dynamic_filter_pushdown;
 }
 
 //! Insert `factory(std::move(parent.children[i]))` between `parent` and its i-th child. The
@@ -251,20 +242,11 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
   return info;
 }
 
-//! Build the GPU scan source leaf for a table scan, wrapping it in a `DYNAMIC_FILTER` operator
-//! when a producing join wired runtime dynamic filters into this scan.
-//!
-//! Shared by every scan format; `InfoT` is the concrete `ingestible_table_info` subtype. The
-//! template body relies on two per-format properties it resolves statically: `InfoT` exposes a
-//! `sirius_dynamic_filters` channel field, and a `make_ingestible` overload accepts
-//! `unique_ptr<InfoT>`.
-//!
-//! `mode` selects the wrapped operator's post-decode capability and is the scan format's only
-//! behavioral input here: a parquet scan already evaluated AST-capable filters (zone maps)
-//! through the reader's `set_filter`, so it wraps in `membership_masks_only`; a duckdb-native
-//! scan has no read-time dynamic path, so it wraps in `include_ast_row_masks` to also evaluate
-//! zone maps row-wise. Filters are elided when no producer ultimately registered — this runs
-//! after the whole tree is built, so `has_producers()` is settled.
+/**
+ * @brief Builds a GPU scan, wrapping it when registered dynamic-filter producers exist
+ *
+ * @p mode selects membership-only or AST-plus-membership post-decode filtering.
+ */
 template <typename InfoT>
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
   std::unique_ptr<InfoT> info,
@@ -284,21 +266,16 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
       scan.estimated_cardinality,
       std::move(ingestible),
       compressed_materialization_observer);
-  // The propagation pass already forced every planned dynamic-filter target column native in the
-  // scan sidecar, so the leaf advertises the scan's actual output carriers: scan normalization
-  // reads them to decide per-chunk casts, and execution validation compares batches against them.
+  // Preserve propagated carriers; dynamic-filter targets are already native.
   if (scan.has_physical_overrides()) { leaf->set_physical_types(scan.get_physical_types()); }
 
   if (dynamic_filters) {
-    // Under a PARTITION parent this emits the [GPU_SCAN, DYNAMIC_FILTER] pipeline (filter as
-    // sink); in inline contexts both join the current pipeline.
     auto dynamic_filter_op = duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
       scan.types,
       scan.estimated_cardinality,
       std::move(dynamic_filters),
       op_params.dynamic_filter_keep_threshold,
       mode);
-    // The filter only drops rows of the scan output, so its column carriers are the scan's.
     if (scan.has_physical_overrides()) {
       dynamic_filter_op->set_physical_types(scan.get_physical_types());
     }
@@ -347,24 +324,20 @@ void wrap_table_scan_source(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf;
   bool replace_slot = false;
   if (fn == "seq_scan") {
-    // The duckdb-native scan has no read-time dynamic-filter path, so its wrapped DYNAMIC_FILTER
-    // also evaluates AST-capable filters (zone maps) row-wise, not membership masks alone.
-    leaf = make_gpu_scan_leaf(build_duckdb_native_table_info(scan, op_params, context),
+    // Native scans apply AST-capable filters post-decode.
+    leaf         = make_gpu_scan_leaf(build_duckdb_native_table_info(scan, op_params, context),
                               scan,
                               op_params,
                               sirius::op::scan::dynamic_filter_apply_mode::include_ast_row_masks,
                               sirius_ctx.get());
-    // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
     replace_slot = true;
   } else if (fn == "parquet_scan" || fn == "read_parquet" || fn == "sirius_read_parquet") {
-    // The parquet ingestible consumes AST filters for read-time row-group pruning, so its wrapped
-    // DYNAMIC_FILTER applies membership masks only.
-    leaf = make_gpu_scan_leaf(build_parquet_table_info(scan, op_params),
+    // Parquet applies AST filters in the reader; post-decode uses membership only.
+    leaf         = make_gpu_scan_leaf(build_parquet_table_info(scan, op_params),
                               scan,
                               op_params,
                               sirius::op::scan::dynamic_filter_apply_mode::membership_masks_only,
                               sirius_ctx.get());
-    // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
     replace_slot = true;
   } else {
     throw std::runtime_error(
@@ -428,6 +401,23 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
   wrap_above(slot, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> hgb_op) {
     auto* hgb_ptr = hgb_op.get();
 
+    // Construct the merge while the child still carries the final SQL schema. COUNT(DISTINCT)
+    // emits LIST sets locally and only becomes BIGINT after merge post-processing.
+    auto merge = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(
+      &hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>(),
+      op_params.hash_partition_bytes);
+    if (hgb_ptr->has_physical_overrides()) {
+      merge->set_physical_types(hgb_ptr->get_physical_types());
+    }
+
+    auto& grouped = hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+    bool const has_supported_count_distinct_layout =
+      grouped.has_count_distinct && !grouped.has_avg && !hgb_ptr->has_physical_overrides() &&
+      hgb_ptr->types.size() == grouped.group_idx.size() + grouped.aggregate_slots.size();
+    if (has_supported_count_distinct_layout) {
+      hgb_ptr->types = grouped.get_count_distinct_local_output_types();
+    }
+
     auto partition =
       duckdb::make_uniq<sirius::op::sirius_physical_partition>(hgb_ptr->types,
                                                                hgb_ptr->estimated_cardinality,
@@ -440,12 +430,6 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
     }
     partition->children.push_back(std::move(hgb_op));
 
-    auto merge = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(
-      &hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>(),
-      op_params.hash_partition_bytes);
-    if (hgb_ptr->has_physical_overrides()) {
-      merge->set_physical_types(hgb_ptr->get_physical_types());
-    }
     // The partition's downstream sizing consumer is the merge (key_source hgb only supplies keys).
     partition_ptr->set_downstream_consumer_op(merge.get());
     merge->children.push_back(std::move(partition));
@@ -461,6 +445,11 @@ void wrap_ungrouped_aggregate(duckdb::unique_ptr<sirius::op::sirius_physical_ope
     auto* ungrouped_ptr = ungrouped_op.get();
     auto merge          = duckdb::make_uniq<sirius::op::sirius_physical_ungrouped_aggregate_merge>(
       &ungrouped_ptr->Cast<sirius::op::sirius_physical_ungrouped_aggregate>());
+    // MERGE_AGGREGATE keeps the final SQL schema copied above. The child emits per-task
+    // accumulator carriers instead: AVG is SUM + COUNT, so its runtime width is larger than the
+    // final width. Recording that schema on the child keeps task-level output validation exact.
+    ungrouped_ptr->types = ungrouped_ptr->Cast<sirius::op::sirius_physical_ungrouped_aggregate>()
+                             .get_local_output_types();
     merge->children.push_back(std::move(ungrouped_op));
     return merge;
   });
@@ -809,19 +798,6 @@ sirius_physical_plan_generator::sirius_physical_plan_generator(duckdb::ClientCon
 
 sirius_physical_plan_generator::~sirius_physical_plan_generator() {}
 
-std::shared_ptr<sirius::op::sirius_dynamic_filter_set>
-sirius_physical_plan_generator::get_or_create_dynamic_filter_channel(
-  duckdb::DynamicTableFilterSet const* key)
-{
-  if (!key) { return nullptr; }
-  // Central gate: when dynamic-filter pushdown is disabled, return no channel so neither the
-  // producer (join) nor the consumer (scan) wires anything.
-  if (!dynamic_filter_pushdown_enabled(context)) { return nullptr; }
-  auto [it, inserted] = dynamic_filter_channels.try_emplace(key, nullptr);
-  if (inserted) { it->second = std::make_shared<sirius::op::sirius_dynamic_filter_set>(); }
-  return it->second;
-}
-
 void sirius_physical_plan_generator::set_parent_ops(sirius::op::sirius_physical_operator& op,
                                                     sirius::op::sirius_physical_operator* parent)
 {
@@ -905,9 +881,10 @@ bool merge_downstream_is_streaming_dead_end(const sirius::op::sirius_physical_op
 void sirius_physical_plan_generator::mark_fusable_merge_pipelines(
   duckdb::ClientContext& context, sirius::op::sirius_physical_operator& op)
 {
-  // Keep the fusion decision consistent throughout this plan traversal.
+  // Merge fusion is the engine-owned production policy. Unit tests can expose a guarded setting
+  // to exercise the unfused reference path without making that implementation detail a user knob.
   duckdb::Value setting;
-  bool fusion_enabled = true;  // matches the registered default
+  bool fusion_enabled = true;
   if (context.TryGetCurrentSetting("fuse_merge_pipelines", setting) && !setting.IsNull()) {
     fusion_enabled = setting.GetValue<bool>();
   }

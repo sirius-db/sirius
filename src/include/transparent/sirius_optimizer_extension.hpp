@@ -21,6 +21,27 @@
 
 namespace sirius::transparent {
 
+/// \brief Pre-optimization hook that derives single-table restrictions out of OR-ed filters.
+///
+/// For a filter `(a1 AND b1) OR (a2 AND b2) OR ...` where the branches span more than one table,
+/// every branch implies the AND of its own single-table conjuncts, so the disjunction implies the
+/// OR of those per-table restrictions. AND-ing that implied restriction onto the filter is
+/// row-preserving and lets DuckDB's own filter pushdown, join-order and build/probe-side passes
+/// push it into the base scans.
+///
+/// DuckDB has this rewrite (JoinDependentFilterRule) but only applies it when the OR is the *root*
+/// of a filter expression. Its DistributivityRule runs first and hoists the conjuncts common to
+/// every branch (for TPC-H q19: the join key, `l_shipmode IN ...`, `l_shipinstruct = ...`) into an
+/// enclosing AND; ExpressionRewriter::ApplyRules then re-runs on the rewritten node with
+/// `is_root = false`, so the surviving OR is never offered to the rule again and nothing is
+/// derived. Running the derivation here — before any built-in optimizer — sidesteps that ordering
+/// entirely; the derived conjuncts then travel through the normal pipeline.
+///
+/// Gated on the `gpu_execution` setting: it applies exactly when the user asked for GPU execution,
+/// leaving `SET gpu_execution = false` CPU baselines byte-for-byte unchanged.
+void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
+                               duckdb::unique_ptr<duckdb::LogicalOperator>& plan);
+
 /// \brief Post-optimization hook that captures the optimized logical plan for GPU execution.
 ///
 /// Copies the optimized logical plan into the connection's per-connection state,
@@ -34,15 +55,11 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
 
 /// \brief Copy a logical plan for Sirius's transparent execution path.
 ///
-/// Wraps \c duckdb::LogicalOperator::Copy and additionally preserves the dynamic-filter metadata
-/// from the source plan onto the copy: \c LogicalComparisonJoin::filter_pushdown and \c
-/// LogicalGet::dynamic_filters. Neither field is in DuckDB's serialization schema, so a plain \c
-/// Copy (serialize → deserialize) strips them, and the downstream Sirius wiring would never see the
-/// optimizer's pushdown work. Use this at every site that copies a captured logical plan for GPU
-/// execution.
+/// Wraps \c duckdb::LogicalOperator::Copy. Serialization omits DuckDB join-filter metadata, but
+/// Sirius discovers targets from plan structure and does not consume that metadata. The original
+/// plan remains unchanged for CPU fallback.
 ///
-/// \param plan     The plan to copy. Not consumed; \c filter_pushdown / \c dynamic_filters are left
-///                 on the original so DuckDB's CPU fallback path can still see them.
+/// \param plan     The plan to copy. Not consumed.
 /// \param context  DuckDB client context for \c LogicalOperator::Copy.
 [[nodiscard]] duckdb::unique_ptr<duckdb::LogicalOperator> copy_logical_plan(
   duckdb::LogicalOperator const& plan, duckdb::ClientContext& context);
