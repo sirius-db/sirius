@@ -52,11 +52,20 @@
 
 namespace sirius::op {
 
-/// Rows cuDF can address in ONE table: `cudf::size_type` is `int32_t`, so `cudf::concatenate`
-/// throws "Total number of concatenated rows exceeds the column size limit" beyond this. A
-/// hardware/library truth, not a tuning target.
+/// Rows `cudf::concatenate` accepts in ONE table, for the widest column kind a fold may contain.
+/// A library truth, not a tuning target.
+///
+/// cuDF applies two separate limits, and this is the smaller of the two. Rows are capped at
+/// `cudf::size_type`'s maximum. Offsets are capped at the same maximum, but a variable-width
+/// column carries one more offset than it has rows, so `cudf::concatenate` requires
+/// `sum(rows) + 1 <= size_type::max` for every STRING and LIST column -- one row lower. Sirius
+/// folds string columns routinely, and the offsets check is the one that fires first, so the
+/// conservative constant is the correct one to plan against: it costs a single row and needs no
+/// schema inspection. It also keeps INV-FOLD violations inside `check_fold_row_limit`, which
+/// reports them attributably, instead of surfacing as a cuDF `std::overflow_error` that carries
+/// no marker.
 inline constexpr uint64_t k_fold_row_limit =
-  static_cast<uint64_t>(std::numeric_limits<cudf::size_type>::max());
+  static_cast<uint64_t>(std::numeric_limits<cudf::size_type>::max()) - 1;
 
 /// Per-partition row target used ONLY when a measured side has to be split: half of @p limit.
 /// Splitting means hash-partitioning, which is not perfectly uniform, so a count computed against

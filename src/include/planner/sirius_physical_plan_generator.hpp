@@ -203,7 +203,6 @@ class sirius_physical_plan_generator {
                                         std::string_view column_name,
                                         std::string_view operation);
 
-  // private:
   bool preserve_insertion_order(sirius::op::sirius_physical_operator& plan);
   // bool use_batch_index(sirius::op::sirius_physical_operator &plan);
 
@@ -221,8 +220,6 @@ class sirius_physical_plan_generator {
 
  public:
   std::size_t delim_index = 0;
-
- public:
   duckdb::ClientContext& context;
   // duckdb::GPUContext& gpu_context;
 

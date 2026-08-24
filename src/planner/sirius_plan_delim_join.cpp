@@ -53,7 +53,7 @@ bool delim_direct_lowering_enabled(duckdb::ClientContext& context)
 }
 
 /// Raises the enclosing-DELIM-join depth for a scope. See
-/// sirius_physical_plan_generator::open_delim_join_depth_.
+/// sirius_physical_plan_generator::open_delim_join_depth.
 class open_delim_join_scope {
  public:
   explicit open_delim_join_scope(std::size_t& depth) noexcept : _depth(depth) { ++_depth; }

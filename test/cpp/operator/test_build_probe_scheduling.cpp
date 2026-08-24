@@ -98,13 +98,16 @@ partition_strategy strategy(uint64_t total_bytes,
      .estimated_probe_to_build_ratio = estimated_probe_to_build_ratio});
 }
 
-// Rows one folded partition is planned for. The row-aware cases below are stated as multiples of
-// it so they read the same whatever cudf::size_type is.
+// The INV-FOLD constants the row-aware cases below are stated against, so they read the same
+// whatever cudf::size_type is. kFoldLimit is what one fold may hold; kFoldTarget is the smaller
+// per-partition target that applies only once a side genuinely has to be split.
 constexpr uint64_t kFoldLimit  = sirius::op::k_fold_row_limit;
 constexpr uint64_t kFoldTarget = sirius::op::fold_row_target(kFoldLimit);
 
 // The byte-side knobs the `strategy(...)` helper defaults to, so a row-aware case states only the
-// fields it is actually about.
+// fields it is actually about. `total_rows_exact` is deliberately inverted from the production
+// aggregate's fail-safe default: these cases are about the decisions an exact measurement is
+// allowed to make, and the inexact arms set it back to false explicitly.
 hash_join_sizing_inputs sizing_defaults()
 {
   return {.total_rows_exact           = true,

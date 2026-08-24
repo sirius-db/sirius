@@ -38,8 +38,15 @@ enum class PartitionType { HASH, RANGE, EVENLY, CUSTOM, NONE };
 /// sirius_physical_partition::measure_input for how each field is obtained.
 struct partition_input_measurement {
   uint64_t bytes;       ///< Sum of the resident batch sizes.
-  uint64_t rows_bound;  ///< Sound UPPER bound on the total rows; exact when `rows_exact`.
-  bool rows_exact;      ///< Every batch reported its own row count, so `rows_bound` is the truth.
+  uint64_t rows_bound;  ///< Total rows; see `rows_exact` for what this is worth when that is false.
+  /// Every batch on the port contributed its own exact row count, so `rows_bound` is the truth.
+  ///
+  /// When false, `rows_bound` is best-effort and may err in EITHER direction: a batch on a tier
+  /// that reports no row count is charged a byte-derived over-estimate, while a batch that could
+  /// not be measured at all is simply missing. Consumers must not fail a query or refuse a
+  /// broadcast on it, and INV-FOLD then rests on the fold guard in `gpu_merge_impl` rather than on
+  /// the partition count.
+  bool rows_exact;
 };
 
 // PartitionType to string
@@ -155,10 +162,15 @@ class sirius_physical_partition : public sirius_physical_operator {
    * operator's schema can have: one byte per column, since cuDF's narrowest fixed-width carrier is
    * one byte and a variable-width column spends at least four offset bytes per row. That
    * over-counts rows, which over-partitions -- the safe direction for the partition floor, but not
-   * for any decision that fails or disables, which is what `rows_exact` exists to gate. The bound
-   * is deliberately derived from the schema rather than from `planner::estimate_bytes_per_row`:
-   * that helper reads *logical* widths and so over-charges the narrow carriers compressed
-   * materialization installs, which would UNDER-count rows.
+   * for a decision that fails the query or refuses a broadcast, which is what `rows_exact` gates.
+   * The bound is deliberately derived from the schema rather than from
+   * `planner::estimate_bytes_per_row`: that helper reads *logical* widths and so over-charges the
+   * narrow carriers compressed materialization installs, which would UNDER-count rows.
+   *
+   * A batch that cannot be measured at all is skipped and clears `rows_exact`. That leaves an
+   * under-count, which no flag can turn into a bound: the partition floor may then be too low and
+   * the publication gate may admit a fold that does not fit. Both land on the fold guard in
+   * `gpu_merge_impl`, which fails attributably rather than silently.
    */
   [[nodiscard]] partition_input_measurement measure_input();
 

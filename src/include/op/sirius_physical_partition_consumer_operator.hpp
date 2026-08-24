@@ -33,9 +33,11 @@ namespace op {
 struct partition_sizing_input {
   uint64_t total_bytes;   ///< Bytes waiting on the sizing partition's input port.
   uint64_t total_rows;    ///< Sound UPPER bound on the rows waiting there.
-  bool total_rows_exact;  ///< `total_rows` is the exact count rather than an upper bound. A
-                          ///< consumer may over-partition on an inexact bound but must not fail
-                          ///< or disable on one; see sirius_physical_partition::measure_input.
+  bool total_rows_exact;  ///< `total_rows` is the exact count rather than a best-effort figure. A
+                          ///< consumer must not fail the query or refuse a broadcast on an inexact
+                          ///< value; it MAY raise the partition count on one, which can cost a
+                          ///< single-partition dynamic filter (residual R5). See
+                          ///< sirius_physical_partition::measure_input.
   bool is_build_side;     ///< The sizing partition drives the build side (only the build side can
                           ///< drive broadcast / build-probe).
   bool build_foldable;    ///< A downstream build-side CONCAT can concat_all to a single batch.

@@ -11,10 +11,13 @@ This document catalogs Super Sirius performance optimizations by category. Each 
 **Mechanism:** the sizing PARTITION measures its resident input (`measure_input()`) and hands bytes *and* a sound upper bound on rows to its downstream consumer, which turns them into a count:
 ```
 natural  = max(1, ceil(total_bytes / hash_partition_bytes))
-floor    = folding side ? ceil(total_rows / fold_row_target(max_fold_rows)) : 1
+floor    = folding side ? fold_partition_count(total_rows, max_fold_rows) : 1
 count    = max(natural, floor)
+
+fold_partition_count(rows, limit) = rows <= limit ? 1
+                                                  : ceil(rows / fold_row_target(limit))
 ```
-Bytes alone are the wrong unit for a side the join folds into one cuDF table: at a 32 GB target a partition of 8-byte rows holds 4.0 G rows, which `cudf::size_type` cannot address. The row term is the fold budget; see [INV-FOLD](operators.md#inv-fold-every-group-becomes-one-cudf-table).
+Bytes alone are the wrong unit for a side the join folds into one cuDF table: at a 32 GB target a partition of 8-byte rows holds 4.0 G rows, which `cudf::size_type` cannot address. The row term is the fold budget. It splits only when the measurement genuinely does not fit one fold — the halved target exists to reserve skew headroom for a split, and charging it at a count of one would split partitions cuDF handles perfectly well. See [INV-FOLD](operators.md#inv-fold-every-group-becomes-one-cudf-table).
 
 **Code path:** `src/op/sirius_physical_partition.cpp` — `measure_input()`; `src/op/sirius_physical_hash_join.cpp` — `compute_hash_join_partition_strategy()`
 

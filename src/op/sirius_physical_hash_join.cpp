@@ -854,14 +854,19 @@ partition_strategy compute_hash_join_partition_strategy(const hash_join_sizing_i
 
   bool const broadcast = broadcast_candidate && build_probe;
 
-  // BUILD_PROBE runs at the count its eligibility was measured at; broadcast takes num_gpus;
-  // everything else the natural count. The MARK arm is currently unreachable -- MARK is forced
-  // into BUILD_PROBE above, where build_probe_partitions is already min(natural, num_gpus) == 1 on
-  // a single GPU -- and is kept as the backstop that clamps MARK if that forcing is ever relaxed.
-  int const selected = broadcast                    ? num_gpus
-                       : build_probe                ? build_probe_partitions
-                       : (is_mark && num_gpus <= 1) ? 1
-                                                    : natural;
+  // MARK's count is pinned by its semantics, not by sizing: build_has_null is join-wide, so its
+  // whole build must be visible to every probe row. That means broadcast (one replica per GPU) or
+  // exactly one partition -- never a hash-partitioned build, which would compute the sentinel per
+  // partition and return wrong results rather than fail. Deciding it here, before the general
+  // arms, is what makes the guarantee structural: the throw above covers the case where neither
+  // count can hold the fold, but MARK never depends on that throw to avoid being split.
+  //
+  // Otherwise: BUILD_PROBE runs at the count its eligibility was measured at, broadcast takes
+  // num_gpus, everything else the natural count.
+  int const selected = is_mark       ? (broadcast ? num_gpus : 1)
+                       : broadcast   ? num_gpus
+                       : build_probe ? build_probe_partitions
+                                     : natural;
 
   // INV-FOLD floor. Applies when the build folds -- by the join's shape, or because BUILD_PROBE
   // concat_alls it -- and only to the hash-partitioned outcomes: a broadcast build is already
@@ -869,10 +874,13 @@ partition_strategy compute_hash_join_partition_strategy(const hash_join_sizing_i
   // the count only shrinks each per-partition build and BUILD_PROBE's byte eligibility (measured
   // at min(natural, num_gpus)) still holds.
   //
-  // measured_side_folds excludes MARK, whose build must stay in one partition (or broadcast) for
-  // its join-wide build_has_null sentinel to be computable at all. The throw above is what makes
-  // that exclusion safe; the exclusion is what keeps it safe if the throw is ever softened,
-  // because hash-partitioning a MARK build yields wrong results rather than a failure.
+  // measured_side_folds excludes MARK, whose count is already pinned above.
+  //
+  // Residual R5: this is the one `total_rows` consumer that is NOT gated on an exact measurement.
+  // Raising the count past 1 turns `build_arrives_whole` false, so an over-estimated inexact bound
+  // can cost a single-partition dynamic filter. Gating it would be worse: an inexact bound cannot
+  // tell a real overflow from a phantom one, and leaving a possibly-overflowing fold unfloored is
+  // a query failure rather than a lost optimization.
   bool const build_folds =
     sirius_physical_hash_join::measured_side_folds(in.join_type, true, build_probe);
   int const num_partitions =
@@ -958,18 +966,22 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
                               : _join_mode == HASH_JOIN_MODE::MIXED_JOIN ? "MIXED_JOIN"
                                                                          : "STANDARD";
 
-  // The fold floor is reported as APPLIED, not as computed: a right-family build-driven join
-  // (residual R1') measures a side it does not fold, and a line claiming a floor there would say
-  // the opposite of the truth in exactly the case a reader most needs to recognise.
-  bool const measured_side_is_folded =
-    measured_side_folds(join_type, in.is_build_side, strategy.build_probe);
+  // The fold floor is reported as APPLIED, not as computed. A right-family build-driven join
+  // (residual R1') measures a side it does not fold, and a broadcast build is exempted after the
+  // fact; a line claiming a floor in either case would say the opposite of the truth exactly where
+  // a reader most needs to recognise it. The field is named for what the predicate means -- "the
+  // floor applies to the measured side" -- rather than "this side folds", which is a different
+  // statement: a MARK build is the most unconditionally folded thing in the engine and still has
+  // no floor, because its count is pinned instead.
+  bool const floor_applies =
+    measured_side_folds(join_type, in.is_build_side, strategy.build_probe) && !strategy.broadcast;
   int const applied_fold_floor =
-    measured_side_is_folded ? fold_partition_count(in.total_rows, _max_fold_rows) : 1;
+    floor_applies ? fold_partition_count(in.total_rows, _max_fold_rows) : 1;
 
   SIRIUS_LOG_DEBUG(
     "sirius_physical_hash_join id {} partition strategy: {} partitions ({} GPUs), build side {} "
     "bytes. Join Type: {}. Join Mode: {} {}. build_card_est {} probe_card_est {}. sizing side "
-    "total_rows {} ({}) folds {} applied fold_floor {} max_fold_rows {}",
+    "total_rows {} ({}) floor_applies {} applied fold_floor {} max_fold_rows {}",
     this->get_operator_id(),
     strategy.num_partitions,
     _num_gpus,
@@ -981,7 +993,7 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
     probe_card_est,
     in.total_rows,
     (in.total_rows_exact ? "exact" : "upper bound"),
-    measured_side_is_folded,
+    floor_applies,
     applied_fold_floor,
     _max_fold_rows);
   return strategy;

@@ -309,15 +309,37 @@ partition_input_measurement sirius_physical_partition::measure_input()
   auto& repo     = ports.at("default")->repo;
   auto batch_ids = repo->get_batch_ids(0);
   partition_input_measurement measurement{.bytes = 0, .rows_bound = 0, .rows_exact = true};
+  // A batch the repository listed but cannot produce, or one with no representation at all,
+  // contributes nothing to either total. The result is then an UNDER-count, not a bound, so it
+  // must not be reported as exact. Anomalous on a FULL-barriered sizing port -- it needs a
+  // concurrent pop or an in-flight conversion -- and worth a line when it happens.
+  auto note_unmeasured_batch = [this, &measurement](uint64_t batch_id) {
+    SIRIUS_LOG_WARN(
+      "sirius_physical_partition id {}: batch {} could not be measured while sizing the input; "
+      "the partition count is being chosen from an incomplete measurement",
+      this->get_operator_id(),
+      batch_id);
+    measurement.rows_exact = false;
+  };
+
   for (auto batch_id : batch_ids) {
     auto batch = repo->get_data_batch_by_id(batch_id, 0);
-    if (!batch) { continue; }
+    if (!batch) {
+      note_unmeasured_batch(batch_id);
+      continue;
+    }
     auto ro          = batch->to_read_only();
     const auto* data = ro.get_data();
-    if (data == nullptr) { continue; }
+    if (data == nullptr) {
+      note_unmeasured_batch(batch_id);
+      continue;
+    }
     measurement.bytes += data->get_size_in_bytes();
     auto const num_rows = try_batch_num_rows(ro);
-    if (num_rows) {
+    // A negative count cannot come from any tier in tree (every one derives it from a
+    // cudf::size_type), but an exact-flagged value must never be one nobody checked: unsigned
+    // wraparound here would read as ~1.8e19 rows and fail the query on garbage.
+    if (num_rows && *num_rows >= 0) {
       measurement.rows_bound += static_cast<uint64_t>(*num_rows);
     } else {
       measurement.rows_bound += data->get_uncompressed_data_size_in_bytes() / min_bytes_per_row;
@@ -459,22 +481,17 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
                                    "single batch (concat_all)");
         }
         build_arrives_whole = strategy.num_partitions == 1 || strategy.broadcast;
-      } else if (in.is_build_side && strategy.num_partitions == 1 && hash_join != nullptr &&
-                 hash_join->publishes_dynamic_filters() &&
-                 in.total_bytes < hash_join->max_build_hash_table_bytes() &&
-                 !(in.total_rows_exact && in.total_rows > hash_join->max_fold_rows())) {
+      } else if (hash_join != nullptr &&
+                 sirius_physical_hash_join::build_folds_for_filter_publication(
+                   in,
+                   strategy.num_partitions,
+                   hash_join->publishes_dynamic_filters(),
+                   hash_join->max_build_hash_table_bytes(),
+                   hash_join->max_fold_rows())) {
         // Not BUILD_PROBE, but the build lands in one partition and this join publishes a filter
-        // from a single build batch, so folding it only moves a batch boundary. Best-effort: no
-        // build-side CONCAT means no publication. Build-side sizing is required — right-family
-        // joins size from the probe, where one partition says nothing about the build's size.
-        // The byte bound matters when hash_partition_bytes exceeds the build budget: a build
-        // refused BUILD_PROBE for being too large must not be folded whole for a filter either.
-        // The row bound is INV-FOLD: this fold is opt-in and is not covered by the partition
-        // count, so a build cuDF cannot address in one table gives up the filter instead. The
-        // hard limit rather than fold_row_target applies here — the count is already fixed at
-        // one, so there is no skew headroom to reserve. Only an EXACT measurement may withhold
-        // the filter: an inexact upper bound that turned out to be pessimistic would surrender
-        // the publication and thereby cause the very overflow this gate exists to prevent.
+        // from a single build batch, so folding it only moves a batch boundary. Every obligation
+        // the predicate encodes is argued where it is defined. Best-effort in one further respect
+        // the predicate cannot see: no build-side CONCAT means no publication.
         bool const found_this    = enable_build_concat_all(*this);
         bool const found_sibling = enable_build_concat_all(sibling);
         build_arrives_whole      = found_this || found_sibling;

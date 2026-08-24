@@ -146,9 +146,11 @@ struct hash_join_sizing_inputs {
 /// `fold_partition_count` so every fold stays addressable. A broadcast build is replicated rather
 /// than split, so it is refused outright when it does not fit one fold; a MARK join, whose count
 /// is pinned at one partition or at broadcast and can never be raised, throws instead of reaching
-/// `cudf::concatenate`. Neither the refusal nor the throw fires on a measurement that is only an
-/// upper bound (`total_rows_exact`): an inexact measurement may cost extra partitions but must
-/// never fail or disable.
+/// `cudf::concatenate`. Neither the refusal nor the throw fires on a measurement that is not exact
+/// (`total_rows_exact`): a best-effort figure must never fail the query or refuse a broadcast. It
+/// may still raise the partition count, which on the build side can cost a single-partition
+/// dynamic filter -- residual R5, argued at the floor itself in
+/// `compute_hash_join_partition_strategy`.
 ///
 /// The floor deliberately bounds only the *measured* side. It does not try to bound the opposite
 /// side from a cardinality estimate: an estimate-derived floor can under-count and would create a
@@ -389,10 +391,10 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// reports, so the log can never claim a floor that was not applied.
   ///
   /// MARK is excluded on purpose. It folds its build under BUILD_PROBE like any other join, but
-  /// its `build_has_null` sentinel is join-wide, so its count must stay at one partition (single
-  /// GPU) or at broadcast and may never be raised. `compute_hash_join_partition_strategy` refuses
-  /// an over-limit MARK build outright instead; excluding MARK here is what keeps that safe even
-  /// if the refusal is ever softened.
+  /// its `build_has_null` sentinel is join-wide, so its count is pinned at one partition (single
+  /// GPU) or at broadcast and may never be raised. `compute_hash_join_partition_strategy` selects
+  /// that count directly for MARK rather than deriving it, and refuses an over-limit MARK build
+  /// outright; this exclusion keeps the floor from raising a count that is already decided.
   [[nodiscard]] static constexpr bool measured_side_folds(duckdb::JoinType type,
                                                           bool is_build,
                                                           bool build_probe)
@@ -417,6 +419,34 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   {
     return (type == duckdb::JoinType::RIGHT_SEMI || type == duckdb::JoinType::RIGHT_ANTI) &&
            publishes_filters;
+  }
+
+  /// Whether the build should be folded whole so a dynamic filter can publish from a single
+  /// batch, for a join that did NOT take BUILD_PROBE (which folds the build regardless).
+  ///
+  /// All five terms are obligations, not heuristics. The measurement must come from the build side
+  /// -- a right-family join sizes from the probe, where one partition says nothing about the
+  /// build's size. The build must land in one partition, or there is no single batch to publish
+  /// from. The join must actually publish. The build must fit `max_build_hash_table_bytes`, which
+  /// matters when `hash_partition_bytes` exceeds that budget: a build refused BUILD_PROBE for
+  /// being too large must not be folded whole for a filter either. And the fold must satisfy
+  /// INV-FOLD -- but only an EXACT measurement may withhold the filter on that last ground, since
+  /// a pessimistic bound would surrender the publication for a fold that was never too big.
+  ///
+  /// Best-effort by design: it decides only whether to *offer* the fold. When the measurement is
+  /// not exact this can admit a fold that does not fit, which `gpu_merge_impl`'s guard then
+  /// reports attributably. Pure so the predicate can be pinned; `sirius_physical_partition` is its
+  /// only caller.
+  [[nodiscard]] static constexpr bool build_folds_for_filter_publication(
+    const partition_sizing_input& in,
+    int num_partitions,
+    bool publishes_filters,
+    uint64_t max_build_hash_table_bytes,
+    uint64_t max_fold_rows)
+  {
+    return in.is_build_side && num_partitions == 1 && publishes_filters &&
+           in.total_bytes < max_build_hash_table_bytes &&
+           !(in.total_rows_exact && in.total_rows > max_fold_rows);
   }
 
   /// Member form of right_family_join_sizes_build_driven over this join's own state.

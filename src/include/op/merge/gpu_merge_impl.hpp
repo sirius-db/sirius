@@ -66,8 +66,9 @@ class gpu_merge_impl {
    *                      configurable keep the cuDF limit.
    *
    * @return The output data batch.
-   * @throws std::runtime_error (marker `[fold_limit]`) when @p input holds more rows in total than
-   *         @p max_fold_rows.
+   * @throws fold_row_limit_exceeded (message marker `[fold_limit]`) when @p input holds more rows
+   *         in total than @p max_fold_rows. A distinct type so a caller can tell an INV-FOLD
+   *         violation from the other ways a fold fails -- device OOM, a non-GPU-resident batch.
    */
   static std::shared_ptr<cucascade::data_batch> concat(
     const std::vector<cucascade::read_only_data_batch>& input,
