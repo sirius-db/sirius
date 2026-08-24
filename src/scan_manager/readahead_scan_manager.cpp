@@ -102,6 +102,9 @@ void readahead_scan_manager::start(prefetch_strategy strategy)
   _stop_source = std::stop_source{};
   _prefetch_worker =
     std::jthread([this](const std::stop_token& st) { worker_loop(st); }, _stop_source.get_token());
+  // Only now start draining the stage-manager mailbox: the hooks below arm
+  // prefetching, and there must be a worker for them to arm.
+  exec::query_stage_listener::start();
 
   // Eager does not wait to be invited: it reads ahead as far as the budget
   // allows from the moment there is anything to read.  Opportunistic stays
@@ -111,6 +114,9 @@ void readahead_scan_manager::start(prefetch_strategy strategy)
 
 void readahead_scan_manager::stop() noexcept
 {
+  // First, so no hook can be dispatched into this object -- or re-arm the
+  // prefetching we are about to tear down -- while the rest of teardown runs.
+  exec::query_stage_listener::stop();
   _stop_source.request_stop();
   // Cuts short the worker's wait for a ticket, which is otherwise the one place
   // teardown can sit for a full timeout -- and a ticket handed out now would

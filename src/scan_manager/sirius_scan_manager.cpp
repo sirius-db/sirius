@@ -602,10 +602,9 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
       widest != nullptr ? backend_prefetch_strategy(widest->type()) : prefetch_strategy::eager;
     auto const plan = _config.resolve_readahead(backend_budget, backend_strategy);
 
-    _readahead = std::make_shared<readahead_scan_manager>(plan.budget);
+    // Registers its mailbox for the query's lifetime; unregistered in reset().
+    _readahead = std::make_shared<readahead_scan_manager>(*_query_stage_manager, plan.budget);
     _readahead->prepare_for_query(query);
-    // Subscribe for the query's lifetime; unsubscribed in reset().
-    _query_stage_manager->subscribe(_readahead);
     _readahead->start(plan.strategy);
   }
 
@@ -914,10 +913,9 @@ void sirius_scan_manager::reset()
   // coalescer's slots, in-flight splits) may still own a shared_ptr copy, so
   // dropping ours would otherwise leave the worker running past query teardown.
   if (_readahead) {
-    // Unsubscribe before dropping ours: the manager shares ownership, so a
-    // subscription left behind would keep this query's readahead alive for the
-    // rest of the context's life and let the next query's events reach it.
-    _query_stage_manager->unsubscribe(_readahead.get());
+    // Stops the listener too, so the next query's events cannot reach this
+    // query's readahead through a mailbox that other holders keep alive.  The
+    // registration itself is dropped when the last holder releases it.
     _readahead->stop();
   }
   _readahead.reset();

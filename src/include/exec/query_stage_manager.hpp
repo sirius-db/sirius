@@ -16,39 +16,402 @@
 
 #pragma once
 
+#include "blockingconcurrentqueue.h"
 #include "exec/queue_priority.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "query_id.hpp"
 
-#include <algorithm>
+#include <pthread.h>
+
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
+#include <stop_token>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <tuple>
+#include <utility>
+#include <variant>
 #include <vector>
 
 namespace sirius::exec {
 
+/// Discriminator for @ref query_stage_event.  One entry per @c notify_* entry
+/// point on @ref query_stage_manager; the enumerator is what the dispatch in
+/// @ref query_stage_listener switches on, so the two must stay in step.
+enum class query_stage_event_type : std::uint8_t {
+  task_created,
+  task_deployed,
+  failed_to_create_task,
+  task_queue_empty,
+  pipeline_closed,
+  executor_awaiting_task,
+  memory_downgrade_for_task,
+  wait_for_memory_for_task
+};
+
+/// One published event: the tag that says which it is, and the arguments the
+/// reporter passed, kept together so the event can be queued and replayed on
+/// another thread exactly as it was raised.
+///
+/// The tag is a template parameter rather than a member so every event is a
+/// distinct type, which is what lets @ref system_events be a @c std::variant
+/// and the dispatch be a compile-time @c if @c constexpr chain rather than a
+/// switch that could silently fall through.
+template <query_stage_event_type EventType, typename... Types>
+struct query_stage_event {
+  using param_type = std::tuple<Types...>;
+
+  static constexpr query_stage_event_type event_type = EventType;
+
+  param_type data;
+};
+
+using task_created_event = query_stage_event<query_stage_event_type::task_created,
+                                             query_id_t,
+                                             std::size_t,
+                                             op::SiriusPhysicalOperatorType,
+                                             queue_priority>;
+
+using task_deployed_event = query_stage_event<query_stage_event_type::task_deployed,
+                                              query_id_t,
+                                              std::size_t,
+                                              op::SiriusPhysicalOperatorType,
+                                              int>;
+
+using failed_to_create_task_event = query_stage_event<query_stage_event_type::failed_to_create_task,
+                                                      query_id_t,
+                                                      std::size_t,
+                                                      std::size_t>;
+
+using task_queue_empty_event = query_stage_event<query_stage_event_type::task_queue_empty>;
+
+using pipeline_closed_event =
+  query_stage_event<query_stage_event_type::pipeline_closed, query_id_t, std::size_t, std::size_t>;
+
+using executor_awaiting_task_event =
+  query_stage_event<query_stage_event_type::executor_awaiting_task, int>;
+
+using memory_downgrade_for_task_event =
+  query_stage_event<query_stage_event_type::memory_downgrade_for_task,
+                    query_id_t,
+                    std::size_t,
+                    int,
+                    std::size_t>;
+
+using wait_for_memory_for_task_event =
+  query_stage_event<query_stage_event_type::wait_for_memory_for_task,
+                    query_id_t,
+                    std::size_t,
+                    int,
+                    std::size_t>;
+
+/// Every event a @ref query_stage_manager can publish.  Listeners receive this
+/// and nothing else, so adding an event is: an enumerator, an alias, an arm
+/// here, and an arm in the dispatch.
+using system_events = std::variant<task_created_event,
+                                   task_deployed_event,
+                                   failed_to_create_task_event,
+                                   task_queue_empty_event,
+                                   pipeline_closed_event,
+                                   executor_awaiting_task_event,
+                                   memory_downgrade_for_task_event,
+                                   wait_for_memory_for_task_event>;
+
+/// The mailbox a single listener is fed through.  Events travel as a
+/// @c shared_ptr because one raised event goes to every subscriber: the payload
+/// is built once and the queues carry references to it.  A null entry is the
+/// close sentinel -- see @ref query_stage_manager::stop.
+using system_event_queue =
+  duckdb_moodycamel::BlockingConcurrentQueue<std::shared_ptr<system_events>>;
+
+/// What @ref query_stage_manager::register_listener hands back: the queue the
+/// listener drains, and the token that tells it when to stop draining.
+struct listener_registration {
+  std::shared_ptr<system_event_queue> queue;
+  std::stop_token stop_token;
+};
+
+/**
+ * @brief Observer of where a query is in its execution, assembled from the
+ *        points at which work is created, dispatched, and runs out.
+ *
+ * The task creator and the task scheduler each see one half of the picture: the
+ * creator knows what work exists and why it could not make more, the scheduler
+ * knows what got dispatched and when a GPU went hungry.  Neither can say on its
+ * own whether a query is scan-bound, waiting on a barrier, or simply done.
+ * Reporting both halves here is what lets that be answered in one place.
+ *
+ * Reporters call the @c notify_* entry points, which build the event once and
+ * hand a reference to it to every registered listener's queue.  Publishing is
+ * therefore a push and never a callback: a reporter is never made to wait on
+ * what a listener does with the event, which matters because these are raised
+ * from the creator, scheduler and executor hot paths.  Nothing here is virtual:
+ * the manager is the fixed relay and the listener is the extension point.
+ *
+ * Lifetime: constructed by SiriusContext into a @c shared_ptr and handed to its
+ * reporters by reference, each of which extends it via @c shared_from_this ---
+ * so a reporter's handle is never null and never dangles.  Queues are owned by
+ * their listeners and only referenced here, so the manager never keeps a
+ * listener alive.
+ *
+ * Thread safety: the queue set is guarded by a shared mutex.  Publishing takes
+ * it shared, so the reporting threads do not serialise against each other;
+ * @ref register_listener and @ref unregister_listener take it exclusively.
+ */
+class query_stage_manager : public std::enable_shared_from_this<query_stage_manager> {
+ public:
+  query_stage_manager()  = default;
+  ~query_stage_manager() = default;
+
+  query_stage_manager(query_stage_manager const&)            = delete;
+  query_stage_manager& operator=(query_stage_manager const&) = delete;
+
+  // -- registration ----------------------------------------------------------
+  //
+  // Components that want these events register rather than being reached into,
+  // so the creator and scheduler keep one collaborator and know nothing about
+  // who is listening.
+
+  /// Mint a mailbox for one listener.  The returned queue is owned by the
+  /// caller -- the manager holds only a reference to it -- and the returned
+  /// token is the manager's, so every listener stops when the manager does.
+  ///
+  /// Registering after events have started flowing is safe; the listener simply
+  /// misses what was published before it arrived.  Registering after @ref stop
+  /// yields an already-stopped token and a queue nothing will ever be pushed
+  /// to, so the listener finishes immediately rather than hanging.
+  [[nodiscard]] listener_registration register_listener()
+  {
+    auto queue = std::make_shared<system_event_queue>();
+    {
+      std::unique_lock g{_queues_mtx};
+      if (!_stopped) { _queues.push_back(queue); }
+    }
+    return listener_registration{std::move(queue), _stop_source.get_token()};
+  }
+
+  /// Drop @p queue's registration.  Blocks until any in-flight publish has
+  /// finished, so no further event reaches @p queue once this returns.  Safe to
+  /// call with a queue that was never registered, or twice.
+  void unregister_listener(std::shared_ptr<system_event_queue> const& queue) noexcept
+  {
+    std::unique_lock g{_queues_mtx};
+    std::erase_if(_queues, [&queue](auto const& q) { return q == queue; });
+  }
+
+  /// Stop every listener and close the manager to further publishing.  Requests
+  /// stop on the shared token and pushes the null sentinel to each queue, which
+  /// is what wakes a listener parked on an empty mailbox; subsequent @c notify_*
+  /// calls are no-ops.  Does not join the listeners: a listener owns its own
+  /// thread and joins it in its own destructor.
+  void stop() noexcept
+  {
+    _stop_source.request_stop();
+    std::vector<std::shared_ptr<system_event_queue>> queues;
+    {
+      std::unique_lock g{_queues_mtx};
+      _stopped = true;
+      queues.swap(_queues);
+    }
+    for (auto const& q : queues) {
+      // try_ so this stays genuinely noexcept: the allocating enqueue could
+      // throw, and a listener that misses the sentinel still comes out on the
+      // stop token within a poll interval.  The sentinel only buys promptness.
+      std::ignore = q->try_enqueue(nullptr);
+    }
+  }
+
+  // -- reporting -------------------------------------------------------------
+
+  void notify_task_created(query_id_t query_id,
+                           std::size_t operator_id,
+                           op::SiriusPhysicalOperatorType operator_type,
+                           queue_priority priority) noexcept
+  {
+    publish(task_created_event{{query_id, operator_id, operator_type, priority}});
+  }
+
+  void notify_task_deployed(query_id_t query_id,
+                            std::size_t operator_id,
+                            op::SiriusPhysicalOperatorType operator_type,
+                            int gpu_id) noexcept
+  {
+    publish(task_deployed_event{{query_id, operator_id, operator_type, gpu_id}});
+  }
+
+  void notify_failed_to_create_task(query_id_t query_id,
+                                    std::size_t source_operator_id,
+                                    std::size_t failed_operator_id) noexcept
+  {
+    publish(failed_to_create_task_event{{query_id, source_operator_id, failed_operator_id}});
+  }
+
+  void notify_task_queue_empty() noexcept { publish(task_queue_empty_event{}); }
+
+  void notify_pipeline_closed(query_id_t query_id,
+                              std::size_t pipeline_id,
+                              std::size_t source_operator_id) noexcept
+  {
+    publish(pipeline_closed_event{{query_id, pipeline_id, source_operator_id}});
+  }
+
+  void notify_executor_awaiting_task(int gpu_id) noexcept
+  {
+    publish(executor_awaiting_task_event{{gpu_id}});
+  }
+
+  void notify_memory_downgrade_for_task(query_id_t query_id,
+                                        std::size_t operator_id,
+                                        int gpu_id,
+                                        std::size_t shortfall_bytes) noexcept
+  {
+    publish(memory_downgrade_for_task_event{{query_id, operator_id, gpu_id, shortfall_bytes}});
+  }
+
+  void notify_wait_for_memory_for_task(query_id_t query_id,
+                                       std::size_t operator_id,
+                                       int gpu_id,
+                                       std::size_t bytes_needed) noexcept
+  {
+    publish(wait_for_memory_for_task_event{{query_id, operator_id, gpu_id, bytes_needed}});
+  }
+
+ private:
+  /// Build the event once and fan a reference to it out to every mailbox.
+  ///
+  /// The empty check ahead of the allocation is not just an optimisation: with
+  /// nobody listening these entry points sit on hot paths and should cost a
+  /// lock and a branch, not a heap allocation.  Publishing is @c noexcept, so a
+  /// failed allocation drops the event rather than propagating out into a
+  /// reporter that has no way to handle it.
+  template <typename Event>
+  void publish(Event&& event) noexcept
+  {
+    try {
+      std::shared_lock g{_queues_mtx};
+      if (_queues.empty()) { return; }
+      auto payload = std::make_shared<system_events>(std::forward<Event>(event));
+      for (auto const& q : _queues) {
+        q->enqueue(payload);
+      }
+    } catch (...) {  // NOLINT(bugprone-empty-catch)
+      // Telemetry is not worth failing execution over.
+    }
+  }
+
+  /// Shared by every listener: one request_stop takes them all down together.
+  std::stop_source _stop_source;
+
+  mutable std::shared_mutex _queues_mtx;
+  std::vector<std::shared_ptr<system_event_queue>> _queues;
+  bool _stopped{false};
+};
+
+/// Always-false, but dependent on its argument, so the exhaustiveness
+/// @c static_assert in the dispatch only fires for a tag with no arm.
+template <query_stage_event_type>
+inline constexpr bool unhandled_event_type = false;
+
 /**
  * @brief Receives the execution-stage events a @ref query_stage_manager
- *        publishes.
+ *        publishes, on a thread of its own.
  *
- * Every hook is an observation, not a decision: they are @c noexcept, must not
- * block, and run on the creator/scheduler hot paths.  Implementations that need
- * to do real work should hand it off rather than do it inline.
+ * The listener registers a mailbox with the manager at construction and drains
+ * it from a single worker started by @ref start.  That indirection is the
+ * point: the hooks below run on the listener's thread, not on the creator,
+ * scheduler or executor thread that raised the event, so an implementation is
+ * free to do real work in them and cannot stall execution by doing so.
  *
- * Thread safety: hooks are called concurrently from creator, scheduler and
- * executor threads.  Implementations must be safe under that; the defaults do
- * nothing and so trivially are.
+ * The flip side is that a hook is a report of something that already happened
+ * and may no longer be true by the time it is read.  Implementations should
+ * treat the arguments as a snapshot rather than as live state.
+ *
+ * Thread safety: hooks are called from the listener's worker and nowhere else,
+ * so they are serialised against each other and see events in publication
+ * order.  They still race against the implementation's own public API, which is
+ * called from elsewhere.
+ *
+ * Subclassing: the worker dispatches into virtual hooks, so it must be stopped
+ * before the derived part of the object is destroyed.  A derived class whose
+ * destructor can run while events are in flight must call @ref stop itself ---
+ * the base destructor is too late, the derived members are already gone by
+ * then.
  */
 class query_stage_listener {
  public:
-  query_stage_listener()          = default;
-  virtual ~query_stage_listener() = default;
+  /// Registers a mailbox with @p manager; no thread runs until @ref start.
+  explicit query_stage_listener(query_stage_manager& manager) : _manager(manager.weak_from_this())
+  {
+    // Straight off the reference rather than through the weak handle: a manager
+    // not owned by a shared_ptr has no weak_from_this, and a listener that
+    // silently registered with nothing would be a very quiet bug.
+    adopt(manager.register_listener());
+  }
+
+  virtual ~query_stage_listener() { stop(); }
 
   query_stage_listener(query_stage_listener const&)            = delete;
   query_stage_listener& operator=(query_stage_listener const&) = delete;
+
+  /// Start draining the mailbox.  Idempotent: a second call while the worker
+  /// runs does nothing.  A no-op once the manager has stopped.
+  ///
+  /// Restarting after @ref stop works and takes a fresh mailbox: the old one
+  /// was handed back so that a stopped listener costs the publishers nothing,
+  /// which also means events raised while it was stopped are gone rather than
+  /// backed up waiting.
+  void start()
+  {
+    if (_worker.joinable()) { return; }
+    if (!_registered) { register_mailbox(); }
+    if (_queue == nullptr || _stop_token.stop_requested()) { return; }
+    _draining.store(true, std::memory_order_relaxed);
+    // Armed here rather than in the constructor so a listener that is never
+    // started never gets the callback -- and so @ref on_stop_requested cannot
+    // fire before the derived object is fully built.
+    _stop_cb.emplace(_stop_token, [this] { on_stop_requested(); });
+    _worker = std::jthread([this] { run(); });
+    set_thread_name();
+  }
+
+  /// Stop this listener's worker and join it.  Safe to call when not started,
+  /// and safe to call twice.  Does not stop the manager: other listeners keep
+  /// running.
+  ///
+  /// The mailbox is handed back first, so nothing further is published to a
+  /// queue that has no worker left to drain it.  That matters for the per-query
+  /// listeners: one that is stopped but still held elsewhere would otherwise go
+  /// on accumulating the whole context's events, unread.
+  void stop() noexcept
+  {
+    unregister_mailbox();
+    if (!_worker.joinable()) {
+      _stop_cb.reset();
+      return;
+    }
+    // The sentinel is what wakes a worker parked on an empty mailbox; the flag
+    // is what stops it from working through whatever is queued behind it.
+    _draining.store(false, std::memory_order_relaxed);
+    std::ignore = _queue->try_enqueue(nullptr);  // see query_stage_manager::stop
+    _worker.join();
+    _stop_cb.reset();
+  }
+
+  /// Whether the worker is up.  Named apart from any @c is_running a subclass
+  /// has for its own work, which is a different question.
+  [[nodiscard]] bool is_listening() const noexcept { return _worker.joinable(); }
+
+  /// Name for logs and for the worker's thread name, which is
+  /// @c "listener-<name>" truncated to what pthread accepts.
+  [[nodiscard]] virtual std::string_view name() const noexcept = 0;
 
   /// A task has been created for @p operator_id and handed to the scheduler.
   virtual void on_task_created(query_id_t query_id,
@@ -127,149 +490,113 @@ class query_stage_listener {
                                            std::size_t bytes_needed) noexcept
   {
   }
-};
 
-/**
- * @brief Observer of where a query is in its execution, assembled from the
- *        points at which work is created, dispatched, and runs out.
- *
- * The task creator and the task scheduler each see one half of the picture: the
- * creator knows what work exists and why it could not make more, the scheduler
- * knows what got dispatched and when a GPU went hungry.  Neither can say on its
- * own whether a query is scan-bound, waiting on a barrier, or simply done.
- * Reporting both halves here is what lets that be answered in one place.
- *
- * Reporters call the @c notify_* entry points, which relay to every subscribed
- * @ref query_stage_listener.  Nothing here is virtual: the manager is the fixed
- * relay and the listener is the extension point.
- *
- * Lifetime: constructed by SiriusContext into a @c shared_ptr and handed to its
- * reporters by reference, each of which extends it via @c shared_from_this ---
- * so a reporter's handle is never null and never dangles.
- *
- * Thread safety: the listener set is guarded by a shared mutex.  Publishing
- * takes it shared, so the reporting threads do not serialise against each
- * other; @ref subscribe and @ref unsubscribe take it exclusively.  Subscription
- * is expected to happen before events flow, but the lock means a late one --
- * the per-query readahead registering while the scheduler's event loop is
- * live -- is safe rather than merely unlikely.
- */
-class query_stage_manager : public std::enable_shared_from_this<query_stage_manager> {
- public:
-  query_stage_manager()  = default;
-  ~query_stage_manager() = default;
-
-  query_stage_manager(query_stage_manager const&)            = delete;
-  query_stage_manager& operator=(query_stage_manager const&) = delete;
-
-  // -- subscription ----------------------------------------------------------
-  //
-  // Components that want these events subscribe rather than being reached into,
-  // so the creator and scheduler keep one collaborator and know nothing about
-  // who is listening.  The manager shares ownership of its listeners, so a
-  // listener cannot die while still subscribed.
-
-  void subscribe(std::shared_ptr<query_stage_listener> listener)
-  {
-    if (listener == nullptr) { return; }
-    std::unique_lock g{_listeners_mtx};
-    _listeners.push_back(std::move(listener));
-  }
-
-  /// Drops @p listener's subscription along with this manager's share of its
-  /// ownership.  Blocks until any in-flight publish has finished, so the
-  /// listener is not being called once this returns.
-  void unsubscribe(query_stage_listener const* listener) noexcept
-  {
-    std::unique_lock g{_listeners_mtx};
-    std::erase_if(_listeners, [listener](auto const& l) { return l.get() == listener; });
-  }
-
-  // -- reporting -------------------------------------------------------------
-
-  void notify_task_created(query_id_t query_id,
-                           std::size_t operator_id,
-                           op::SiriusPhysicalOperatorType operator_type,
-                           queue_priority priority) noexcept
-  {
-    std::shared_lock g{_listeners_mtx};
-    for (auto const& l : _listeners) {
-      l->on_task_created(query_id, operator_id, operator_type, priority);
-    }
-  }
-
-  void notify_task_deployed(query_id_t query_id,
-                            std::size_t operator_id,
-                            op::SiriusPhysicalOperatorType operator_type,
-                            int gpu_id) noexcept
-  {
-    std::shared_lock g{_listeners_mtx};
-    for (auto const& l : _listeners) {
-      l->on_task_deployed(query_id, operator_id, operator_type, gpu_id);
-    }
-  }
-
-  void notify_failed_to_create_task(query_id_t query_id,
-                                    std::size_t source_operator_id,
-                                    std::size_t failed_operator_id) noexcept
-  {
-    std::shared_lock g{_listeners_mtx};
-    for (auto const& l : _listeners) {
-      l->on_failed_to_create_task(query_id, source_operator_id, failed_operator_id);
-    }
-  }
-
-  void notify_task_queue_empty() noexcept
-  {
-    std::shared_lock g{_listeners_mtx};
-    for (auto const& l : _listeners) {
-      l->on_task_queue_empty();
-    }
-  }
-
-  void notify_pipeline_closed(query_id_t query_id,
-                              std::size_t pipeline_id,
-                              std::size_t source_operator_id) noexcept
-  {
-    std::shared_lock g{_listeners_mtx};
-    for (auto const& l : _listeners) {
-      l->on_pipeline_closed(query_id, pipeline_id, source_operator_id);
-    }
-  }
-
-  void notify_executor_awaiting_task(int gpu_id) noexcept
-  {
-    std::shared_lock g{_listeners_mtx};
-    for (auto const& l : _listeners) {
-      l->on_executor_awaiting_task(gpu_id);
-    }
-  }
-
-  void notify_memory_downgrade_for_task(query_id_t query_id,
-                                        std::size_t operator_id,
-                                        int gpu_id,
-                                        std::size_t shortfall_bytes) noexcept
-  {
-    std::shared_lock g{_listeners_mtx};
-    for (auto const& l : _listeners) {
-      l->on_memory_downgrade_for_task(query_id, operator_id, gpu_id, shortfall_bytes);
-    }
-  }
-
-  void notify_wait_for_memory_for_task(query_id_t query_id,
-                                       std::size_t operator_id,
-                                       int gpu_id,
-                                       std::size_t bytes_needed) noexcept
-  {
-    std::shared_lock g{_listeners_mtx};
-    for (auto const& l : _listeners) {
-      l->on_wait_for_memory_for_task(query_id, operator_id, gpu_id, bytes_needed);
-    }
-  }
+ protected:
+  /// Invoked once when the manager requests stop, on the thread that called
+  /// @ref query_stage_manager::stop -- not on the worker, which may still be
+  /// finishing an event.  The hook for tearing down whatever the listener was
+  /// driving; the worker's own exit needs no help.
+  virtual void on_stop_requested() noexcept {}
 
  private:
-  mutable std::shared_mutex _listeners_mtx;
-  std::vector<std::shared_ptr<query_stage_listener>> _listeners;
+  /// Take a mailbox and the manager's stop token.  A manager that has already
+  /// gone away leaves an unregistered listener holding a queue nobody writes
+  /// to, which is exactly what a listener with nothing to hear should be.
+  void register_mailbox() noexcept
+  {
+    if (auto manager = _manager.lock()) { adopt(manager->register_listener()); }
+  }
+
+  void adopt(listener_registration reg) noexcept
+  {
+    _queue      = std::move(reg.queue);
+    _stop_token = std::move(reg.stop_token);
+    _registered = true;
+  }
+
+  void unregister_mailbox() noexcept
+  {
+    if (!_registered) { return; }
+    if (auto manager = _manager.lock()) { manager->unregister_listener(_queue); }
+    _registered = false;
+  }
+
+  /// Drain until stopped, replaying each event into its hook.
+  ///
+  /// The timed wait rather than a plain blocking one is what makes the token a
+  /// real stop signal: a manager that goes away without pushing the sentinel
+  /// still gets the worker out within the poll interval, instead of leaving a
+  /// thread parked forever on a queue nobody will write to again.
+  void run() noexcept
+  {
+    using namespace std::chrono_literals;
+    constexpr auto poll_interval = 100ms;
+
+    while (_draining.load(std::memory_order_relaxed) && !_stop_token.stop_requested()) {
+      std::shared_ptr<system_events> event;
+      if (!_queue->wait_dequeue_timed(event, poll_interval)) { continue; }
+      if (event == nullptr) { break; }  // close sentinel
+      dispatch(*event);
+    }
+  }
+
+  /// Replay one event into the hook that matches its tag.  The @c if
+  /// @c constexpr chain is exhaustive over @ref query_stage_event_type, so a new
+  /// event that forgets an arm here fails to compile rather than being dropped.
+  void dispatch(system_events const& event) noexcept
+  {
+    std::visit(
+      [this](auto const& e) {
+        constexpr auto type = std::decay_t<decltype(e)>::event_type;
+        std::apply(
+          [this](auto const&... args) {
+            if constexpr (type == query_stage_event_type::task_created) {
+              on_task_created(args...);
+            } else if constexpr (type == query_stage_event_type::task_deployed) {
+              on_task_deployed(args...);
+            } else if constexpr (type == query_stage_event_type::failed_to_create_task) {
+              on_failed_to_create_task(args...);
+            } else if constexpr (type == query_stage_event_type::task_queue_empty) {
+              on_task_queue_empty(args...);
+            } else if constexpr (type == query_stage_event_type::pipeline_closed) {
+              on_pipeline_closed(args...);
+            } else if constexpr (type == query_stage_event_type::executor_awaiting_task) {
+              on_executor_awaiting_task(args...);
+            } else if constexpr (type == query_stage_event_type::memory_downgrade_for_task) {
+              on_memory_downgrade_for_task(args...);
+            } else if constexpr (type == query_stage_event_type::wait_for_memory_for_task) {
+              on_wait_for_memory_for_task(args...);
+            } else {
+              static_assert(unhandled_event_type<type>, "unhandled query_stage_event_type");
+            }
+          },
+          e.data);
+      },
+      event);
+  }
+
+  void set_thread_name() noexcept
+  {
+    // pthread caps thread names at 16 bytes including the terminator, and
+    // silently keeps the old name when given more -- so truncate rather than
+    // hand it something it will reject.
+    constexpr std::size_t max_len = 15;
+    std::string thread_name       = "listener-";
+    thread_name.append(name());
+    if (thread_name.size() > max_len) { thread_name.resize(max_len); }
+    pthread_setname_np(_worker.native_handle(), thread_name.c_str());
+  }
+
+  /// Weak so a listener never keeps the manager alive; used only to deregister.
+  std::weak_ptr<query_stage_manager> _manager;
+  std::shared_ptr<system_event_queue> _queue;
+  std::stop_token _stop_token;
+  /// Whether @c _queue is still in the manager's fan-out set.
+  bool _registered{false};
+  std::optional<std::stop_callback<std::function<void()>>> _stop_cb;
+  /// Cleared by @ref stop so the worker leaves without draining the backlog.
+  std::atomic<bool> _draining{true};
+  std::jthread _worker;
 };
 
 }  // namespace sirius::exec

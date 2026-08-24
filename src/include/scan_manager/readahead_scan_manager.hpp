@@ -149,19 +149,26 @@ struct readahead_counters {
 class readahead_scan_manager : public std::enable_shared_from_this<readahead_scan_manager>,
                                public exec::query_stage_listener {
  public:
+  /// Registers for @p stage_manager's events; the mailbox is only drained once
+  /// @ref start runs.
+  ///
   /// @p budget is the serving backend's @c ioctx::n_max_concurrent_scans -- the
   /// number of scan IOs worth keeping in flight, which the gatekeeper rations
   /// between the readahead and the executor.  Zero means the backend opts out,
   /// and @ref start is then a no-op: there is no point running a worker that may
   /// never issue anything.
-  explicit readahead_scan_manager(std::size_t budget)
-    : _budget(budget), _gatekeeper(static_cast<int>(budget))
+  readahead_scan_manager(exec::query_stage_manager& stage_manager, std::size_t budget)
+    : exec::query_stage_listener(stage_manager),
+      _budget(budget),
+      _gatekeeper(static_cast<int>(budget))
   {
   }
-  /// Stops and joins the worker.
+  /// Stops and joins both workers -- the prefetch worker and the event listener.
   ~readahead_scan_manager() override;
   readahead_scan_manager(readahead_scan_manager const&)            = delete;
   readahead_scan_manager& operator=(readahead_scan_manager const&) = delete;
+
+  [[nodiscard]] std::string_view name() const noexcept override { return "readahead"; }
 
   /// Seed the per-operator readahead order for @p query.
   void prepare_for_query(const sirius::planner::query& query);

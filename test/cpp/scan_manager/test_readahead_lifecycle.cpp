@@ -36,6 +36,13 @@ using sirius::io::cache::eviction_policy;
 using sirius::io::cache::scan_stage;
 using sirius::scan_manager::gatekeeper;
 using sirius::scan_manager::readahead_scan_manager;
+
+namespace {
+/// A live stage manager for the readahead under test to register its mailbox
+/// with.  Held by shared_ptr because the listener keeps only a weak reference,
+/// and declared before the readahead in each test so it outlives it.
+auto make_stage_manager() { return std::make_shared<sirius::exec::query_stage_manager>(); }
+}  // namespace
 using sirius::scan_manager::scan_manager_config;
 
 namespace {
@@ -248,7 +255,8 @@ TEST_CASE("a returning ticket wakes a waiter", "[scan_manager][gatekeeper]")
 TEST_CASE("a zero budget means the backend opted out and no worker runs",
           "[scan_manager][readahead]")
 {
-  readahead_scan_manager m{0};
+  auto sm = make_stage_manager();
+  readahead_scan_manager m{*sm, 0};
   m.start();
   CHECK_FALSE(m.is_running());
 
@@ -259,7 +267,8 @@ TEST_CASE("a zero budget means the backend opted out and no worker runs",
 
 TEST_CASE("start runs a worker and stop joins it", "[scan_manager][readahead]")
 {
-  readahead_scan_manager m{4};
+  auto sm = make_stage_manager();
+  readahead_scan_manager m{*sm, 4};
   REQUIRE_FALSE(m.is_running());
 
   m.start();
@@ -271,7 +280,8 @@ TEST_CASE("start runs a worker and stop joins it", "[scan_manager][readahead]")
 
 TEST_CASE("start and stop are idempotent", "[scan_manager][readahead]")
 {
-  readahead_scan_manager m{4};
+  auto sm = make_stage_manager();
+  readahead_scan_manager m{*sm, 4};
 
   m.start();
   m.start();  // already running -- must not spawn a second worker
@@ -286,7 +296,8 @@ TEST_CASE("the destructor stops a running worker", "[scan_manager][readahead]")
 {
   // The interesting failure here is a hang, not a wrong value: a worker parked
   // on the gate with nothing to wake it would never be joined.
-  auto m = std::make_unique<readahead_scan_manager>(4);
+  auto sm = make_stage_manager();
+  auto m  = std::make_unique<readahead_scan_manager>(*sm, 4);
   m->start();
   REQUIRE(m->is_running());
   m.reset();
@@ -299,7 +310,8 @@ TEST_CASE("teardown does not wait out the drain on a gate that never armed",
   // Opportunistic never arms without an idle signal, so the gate holds no
   // tickets and has none outstanding -- but it still reads as undrained, and
   // waiting on that would cost the full timeout for nothing.
-  readahead_scan_manager m{4};
+  auto sm = make_stage_manager();
+  readahead_scan_manager m{*sm, 4};
   m.start(sirius::scan_manager::prefetch_strategy::opportunistic);
   REQUIRE(m.is_running());
 
@@ -310,7 +322,8 @@ TEST_CASE("teardown does not wait out the drain on a gate that never armed",
 
 TEST_CASE("update is safe on a manager that was never started", "[scan_manager][readahead]")
 {
-  readahead_scan_manager m{4};
+  auto sm = make_stage_manager();
+  readahead_scan_manager m{*sm, 4};
   m.update_scan_state(7, nullptr, scan_stage::reading);
   m.update_scan_state(7, nullptr, scan_stage::disposed);
   CHECK_FALSE(m.is_running());
@@ -319,7 +332,8 @@ TEST_CASE("update is safe on a manager that was never started", "[scan_manager][
 TEST_CASE("update tolerates a null split", "[scan_manager][readahead]")
 {
   // A resident cached batch has no scan_info and reports a null task.
-  readahead_scan_manager m{4};
+  auto sm = make_stage_manager();
+  readahead_scan_manager m{*sm, 4};
   m.start();
 
   for (int i = 0; i < 200; ++i) {
@@ -335,7 +349,8 @@ TEST_CASE("update tolerates a null split", "[scan_manager][readahead]")
 
 TEST_CASE("a stopped manager can be restarted", "[scan_manager][readahead]")
 {
-  readahead_scan_manager m{4};
+  auto sm = make_stage_manager();
+  readahead_scan_manager m{*sm, 4};
   m.start();
   m.stop();
   REQUIRE_FALSE(m.is_running());
@@ -423,7 +438,8 @@ TEST_CASE("a fresh manager reports an all-zero readahead summary",
           "[scan_manager][readahead][counters]")
 {
   using kind = sirius::scan_manager::prefetch_outcome_kind;
-  readahead_scan_manager m{4};
+  auto sm    = make_stage_manager();
+  readahead_scan_manager m{*sm, 4};
   auto const& c = m.counters();
 
   CHECK(c.outcome(kind::prefetched) == 0);

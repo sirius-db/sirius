@@ -854,6 +854,11 @@ void SiriusContext::terminate()
 {
   throw_if_not_initialized();
 
+  // Before the reporters, so nothing published during teardown reaches a
+  // listener whose subject is already half gone; the notify_* calls below this
+  // point are no-ops.
+  if (query_stage_manager_) { query_stage_manager_->stop(); }
+
   task_scheduler_->stop();
   task_scheduler_.reset();
   if (scan_manager_) { scan_manager_->stop(); }
