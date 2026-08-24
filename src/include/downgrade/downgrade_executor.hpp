@@ -53,6 +53,10 @@ namespace parallel {
  */
 struct downgrade_request {
   std::function<bool()> predicate;
+  /// Bytes this request is trying to free, when it was made with an explicit
+  /// target. 0 for predicate-only requests (the monitor's), which cannot be
+  /// priced against a candidate set and so never take the in-place path.
+  std::size_t requested_bytes{0};
   std::promise<size_t> result;
   std::atomic<size_t> bytes_freed{0};
   std::atomic<size_t> batches_downgraded{0};
@@ -151,6 +155,11 @@ class downgrade_executor {
    * @return std::future<size_t> Resolves to total bytes freed
    */
   std::future<size_t> request_downgrade(std::function<bool()> predicate);
+
+  /**
+   * @brief This executor's configuration (callers read downgrade_wait_timeout).
+   */
+  [[nodiscard]] const exec::downgrade_executor_config& config() const { return _config; }
 
   /**
    * @brief Whether a DISK tier is configured (an effectively unbounded spill sink).

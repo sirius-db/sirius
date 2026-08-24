@@ -219,22 +219,73 @@ void gpu_pipeline_executor::manager_loop()
       std::unique_ptr<cucascade::memory::reservation> new_reservation;
       auto* mem_space = _memory_space;
       size_t freed    = 0;
-      std::mutex reservation_mutex;
+
+      // State shared with the request's predicate. Heap-allocated and captured by
+      // VALUE, not by reference into this frame: the wait below is bounded, and on
+      // timeout the request stays queued in the downgrade executor holding this
+      // predicate. Capturing `&new_reservation` / `&reservation_mutex` (as this did
+      // while the wait was unbounded) would leave the predicate dereferencing a dead
+      // stack frame the moment we stop waiting.
+      struct pending_reservation {
+        std::mutex mutex;
+        std::unique_ptr<cucascade::memory::reservation> reservation;
+        //! Set when the caller has stopped waiting. The predicate then reports
+        //! satisfied so the downgrade executor stops spilling on behalf of a task
+        //! that has already given up, and takes no further reservation — otherwise
+        //! it could acquire a second one that nobody ever consumes.
+        bool abandoned = false;
+      };
+      auto pending = std::make_shared<pending_reservation>();
+
+      auto downgrade_future =
+        _downgrade_executor->request_downgrade([mem_space, bytes_needs, pending]() {
+          std::lock_guard<std::mutex> lock(pending->mutex);
+          if (pending->abandoned || pending->reservation) { return true; }
+          auto res = mem_space->make_reservation_or_null(bytes_needs);
+          if (res && res->size() >= bytes_needs) { pending->reservation = std::move(res); }
+          return pending->reservation != nullptr;
+        });
+
+      const auto wait_timeout = _downgrade_executor->config().downgrade_wait_timeout;
+      bool timed_out          = false;
       try {
-        freed =
-          _downgrade_executor
-            ->request_downgrade([mem_space, bytes_needs, &new_reservation, &reservation_mutex]() {
-              std::lock_guard<std::mutex> lock(reservation_mutex);
-              if (new_reservation) { return true; }
-              auto res = mem_space->make_reservation_or_null(bytes_needs);
-              if (res && res->size() >= bytes_needs) { new_reservation = std::move(res); }
-              return new_reservation != nullptr;
-            })
-            .get();
+        if (wait_timeout.count() <= 0) {
+          freed = downgrade_future.get();
+        } else if (downgrade_future.wait_for(wait_timeout) == std::future_status::ready) {
+          freed = downgrade_future.get();
+        } else {
+          timed_out = true;
+        }
       } catch (const std::exception& e) {
         SIRIUS_LOG_INFO("GPU Pipeline Executor: downgrade request cancelled for task {}: {}",
                         gpu_task->get_task_id(),
                         e.what());
+        break;
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(pending->mutex);
+        if (timed_out) { pending->abandoned = true; }
+        new_reservation = std::move(pending->reservation);
+      }
+
+      // Fail the query rather than fall through to make_reservation(), which can
+      // itself block: a downgrade that has not answered in this long is not going
+      // to, and the point of the timeout is to surface that as an error instead of
+      // an indefinite hang holding the whole device.
+      if (timed_out && !new_reservation) {
+        SIRIUS_LOG_ERROR(
+          "GPU Pipeline Executor: downgrade request for task {} did not complete within {} ms "
+          "(needed {} bytes); failing the query rather than waiting indefinitely",
+          gpu_task->get_task_id(),
+          wait_timeout.count(),
+          bytes_needs);
+        if (_completion_handler) {
+          _completion_handler->report_error(
+            "GPU Pipeline Executor: timed out waiting for a memory downgrade for task " +
+            std::to_string(gpu_task->get_task_id()) + " (needed " + std::to_string(bytes_needs) +
+            " bytes)");
+        }
         break;
       }
 

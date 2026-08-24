@@ -44,6 +44,8 @@ extern "C" int cudaProfilerStop();
 #include "compression/compressed_representation.hpp"
 #include "compression/compression_converters.hpp"
 #include "compression/plan_register.hpp"
+#include "compression/simpatico_bridge.hpp"
+#include "compression/spill_context.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
@@ -1358,9 +1360,13 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       "pin_table_input_compression_plan_dir is empty; pinning uncompressed",
       data.args.name);
   }
-  const bool comp_globally_enabled =
-    comp_cfg.enable_pin_table_compression && !comp_cfg.input_plan_dir.empty();
-  if (comp_globally_enabled) {
+  // Two separate questions. The table plans are loaded into the register whenever
+  // a plan directory is configured, because the *spill* path seeds its per-column
+  // plans from them through column lineage and does not care whether pinning
+  // compresses. Compressing the pinned table itself stays gated on its own flag.
+  const bool plans_available   = !comp_cfg.input_plan_dir.empty();
+  const bool pin_compress_here = comp_cfg.enable_pin_table_compression && plans_available;
+  if (plans_available) {
     namespace fs     = std::filesystem;
     const auto& name = data.args.name;
     if (!sirius::compression::plan_register::global().resolve_table_plan(name).has_value()) {
@@ -1385,7 +1391,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   }
 
   sirius::compression_pin_config pin_comp{};
-  if (comp_globally_enabled) {
+  if (pin_compress_here) {
     if (auto plan_dsl =
           sirius::compression::plan_register::global().resolve_table_plan(data.args.name);
         plan_dsl.has_value()) {
@@ -2287,20 +2293,116 @@ static void SetPinTableCompressionMinBatchSizeBytes(ClientContext& context,
   SIRIUS_LOG_DEBUG("Updated pin_table_compression_min_batch_size_bytes");
 }
 
-static void SetPinTableCompressionMaxCompressedFraction(ClientContext& context,
-                                                        SetScope scope,
-                                                        Value& parameter)
+// Mirror the spill-compression config into the process-global state the
+// cuCascade converters read (they have no access to a SiriusContext).
+// SiriusContext::initialize() performs the same push at startup.
+static void PushSpillCompressionSettings(const sirius::compression_config& cfg)
+{
+  sirius::compression::set_spill_compression_settings(cfg.enable_spill_compression,
+                                                      cfg.spill_explore_beam_width,
+                                                      cfg.spill_explore_max_bytes,
+                                                      cfg.max_compressed_fraction,
+                                                      cfg.spill_replan_after_uses,
+                                                      cfg.spill_error_tolerance,
+                                                      cfg.spill_replan_change_threshold,
+                                                      cfg.spill_explore_sample_rows,
+                                                      cfg.spill_min_batch_bytes,
+                                                      cfg.spill_release_columns_early,
+                                                      cfg.spill_encode_reserve_fraction,
+                                                      cfg.spill_encode_min_headroom_fraction);
+}
+
+static void SetCompressionMaxCompressedFraction(ClientContext& context,
+                                                SetScope scope,
+                                                Value& parameter)
 {
   const double fraction = DoubleValue::Get(parameter);
   if (!std::isfinite(fraction) || fraction < 0.0) {
     throw InvalidInputException(
-      "pin_table_compression_max_compressed_fraction must be finite and non-negative, got %f",
-      fraction);
+      "compression_max_compressed_fraction must be finite and non-negative, got %f", fraction);
   }
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) { return; }
-  sirius_ctx->get_config().get_compression_config().max_compressed_fraction = fraction;
-  SIRIUS_LOG_DEBUG("Updated pin_table_compression_max_compressed_fraction");
+  auto& cfg                   = sirius_ctx->get_config().get_compression_config();
+  cfg.max_compressed_fraction = fraction;
+  // Shared with the spill path, whose converters read a process global.
+  PushSpillCompressionSettings(cfg);
+  SIRIUS_LOG_DEBUG("Updated compression_max_compressed_fraction to {}",
+                   cfg.max_compressed_fraction);
+}
+
+static void SetSpillCompression(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  auto& cfg                    = sirius_ctx->get_config().get_compression_config();
+  cfg.enable_spill_compression = BooleanValue::Get(parameter);
+  PushSpillCompressionSettings(cfg);
+  SIRIUS_LOG_DEBUG("Updated spill_compression to {}", cfg.enable_spill_compression);
+}
+
+static void SetSpillCompressionExploreBeamWidth(ClientContext& context,
+                                                SetScope scope,
+                                                Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  auto& cfg                    = sirius_ctx->get_config().get_compression_config();
+  cfg.spill_explore_beam_width = static_cast<uint32_t>(BigIntValue::Get(parameter));
+  PushSpillCompressionSettings(cfg);
+  SIRIUS_LOG_DEBUG("Updated spill_compression_explore_beam_width to {}",
+                   cfg.spill_explore_beam_width);
+}
+
+static void SetSpillCompressionReplanAfterUses(ClientContext& context,
+                                               SetScope scope,
+                                               Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  auto& cfg                   = sirius_ctx->get_config().get_compression_config();
+  cfg.spill_replan_after_uses = static_cast<uint64_t>(UBigIntValue::Get(parameter));
+  PushSpillCompressionSettings(cfg);
+  SIRIUS_LOG_DEBUG("Updated spill_compression_replan_after_uses to {}",
+                   cfg.spill_replan_after_uses);
+}
+
+static void SetSpillCompressionErrorTolerance(ClientContext& context,
+                                              SetScope scope,
+                                              Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  auto& cfg                 = sirius_ctx->get_config().get_compression_config();
+  cfg.spill_error_tolerance = static_cast<uint32_t>(BigIntValue::Get(parameter));
+  PushSpillCompressionSettings(cfg);
+  SIRIUS_LOG_DEBUG("Updated spill_compression_error_tolerance to {}", cfg.spill_error_tolerance);
+}
+
+static void SetSpillCompressionReplanChangeThreshold(ClientContext& context,
+                                                     SetScope scope,
+                                                     Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  auto& cfg                         = sirius_ctx->get_config().get_compression_config();
+  cfg.spill_replan_change_threshold = DoubleValue::Get(parameter);
+  PushSpillCompressionSettings(cfg);
+  SIRIUS_LOG_DEBUG("Updated spill_compression_replan_change_threshold to {}",
+                   cfg.spill_replan_change_threshold);
+}
+
+static void SetSpillCompressionExploreSampleRows(ClientContext& context,
+                                                 SetScope scope,
+                                                 Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  auto& cfg                     = sirius_ctx->get_config().get_compression_config();
+  cfg.spill_explore_sample_rows = static_cast<std::size_t>(UBigIntValue::Get(parameter));
+  PushSpillCompressionSettings(cfg);
+  SIRIUS_LOG_DEBUG("Updated spill_compression_explore_sample_rows to {}",
+                   cfg.spill_explore_sample_rows);
 }
 
 static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
@@ -2710,13 +2812,74 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     SetPinTableCompressionMinBatchSizeBytes);
 
   config.AddExtensionOption(
-    "pin_table_compression_max_compressed_fraction",
-    "Discard the compressed form and pin uncompressed when the compressed size exceeds this "
-    "finite, non-negative fraction of the batch's original size (values above 1 permit "
-    "expansion); inert until compression is enabled and a matching plan resolves",
+    "compression_max_compressed_fraction",
+    "Discard the compressed form when the compressed size exceeds this fraction of the batch's "
+    "original size (i.e. compression saved too little). Applies to both the pin-time compress "
+    "path (the chunk is pinned uncompressed) and the spill path (the batch is downgraded "
+    "uncompressed)",
     LogicalType::DOUBLE,
     Value::DOUBLE(compression_defaults.max_compressed_fraction),
-    SetPinTableCompressionMaxCompressedFraction);
+    SetCompressionMaxCompressedFraction);
+
+  config.AddExtensionOption(
+    "spill_compression",
+    "Compress data batches with Simpatico when they are spilled off the GPU (GPU->HOST and "
+    "GPU->DISK downgrades). The compression plan is discovered once per operator output edge by "
+    "Simpatico's beam-search explorer on the first batch to spill from that edge, then reused. "
+    "Falls back to an uncompressed spill whenever compression fails or saves too little",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(false),
+    SetSpillCompression);
+
+  config.AddExtensionOption(
+    "spill_compression_explore_beam_width",
+    "Beam width for the per-column explorer that runs on the first spill from each operator "
+    "output edge. Smaller values pick a plan faster but compress less well; the spill path "
+    "defaults well below the offline default (100) since it runs under memory pressure",
+    LogicalType::BIGINT,
+    Value::BIGINT(20),
+    SetSpillCompressionExploreBeamWidth);
+
+  config.AddExtensionOption(
+    "spill_compression_replan_after_uses",
+    "Re-run the explorer for an operator output edge after its cached plan has been used this "
+    "many times (0 = never re-explore). This also expires the 'compression is not worth it here' "
+    "verdict recorded when a batch misses compression_max_compressed_fraction, so an edge is "
+    "periodically re-tested rather than being written off for the whole query",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(128),
+    SetSpillCompressionReplanAfterUses);
+
+  config.AddExtensionOption(
+    "spill_compression_error_tolerance",
+    "Consecutive compression errors on one operator output edge to absorb before treating that "
+    "edge as not worth compressing (minimum 1). Compression runs under memory pressure, so an "
+    "exception is as likely to be a transient allocation failure as a real signal about the data; "
+    "missing compression_max_compressed_fraction is a measurement and still applies immediately",
+    LogicalType::BIGINT,
+    Value::BIGINT(3),
+    SetSpillCompressionErrorTolerance);
+
+  config.AddExtensionOption(
+    "spill_compression_replan_change_threshold",
+    "Relative change in a column's compression ratio or in either of its throughputs below which "
+    "a re-explored plan counts as equivalent to the cached one, and the cached plan is kept "
+    "(0.2 = 20%). The explorer readily returns a differently spelled plan that performs the same; "
+    "adopting those churns the cache and registers as a change, which resets the replan backoff "
+    "and locks the edge into re-exploring. 0 adopts every re-explored plan",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(0.20),
+    SetSpillCompressionReplanChangeThreshold);
+
+  config.AddExtensionOption(
+    "spill_compression_explore_sample_rows",
+    "Row prefix the spill-path explorer runs on (0 = the whole column). The beam search "
+    "allocates for hundreds of trial encodes, and on the spill path it runs exactly when the GPU "
+    "is out of memory, so on full columns it mostly fails. Sampling bounds allocation and search "
+    "time, but picks markedly worse plans for sorted/monotonic columns",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(65536),
+    SetSpillCompressionExploreSampleRows);
 
   config.AddExtensionOption(
     "dynamic_filter_domain_coverage_threshold",

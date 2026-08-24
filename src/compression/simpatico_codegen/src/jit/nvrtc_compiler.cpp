@@ -97,22 +97,39 @@ CUfunction CompiledKernel::func_for_current_device() const
 {
   if (!kern) return nullptr;
 
-  int device_id = 0;
-  cudaGetDevice(&device_id);  // runtime API — no driver context required
+  // Key by CONTEXT, not by device. cuKernelGetFunction binds the kernel to the
+  // context current on the calling thread, and the resulting CUfunction is only
+  // launchable from that context — cuLaunchKernel rejects it anywhere else with
+  // CUDA_ERROR_INVALID_HANDLE ("invalid resource handle"). Several threads on one
+  // device can hold different contexts, so a device-keyed cache hands every thread
+  // but the first a handle it cannot launch.
+  //
+  // The previous version keyed on cudaGetDevice() and relied on "RMM/cuDF sets the
+  // context up correctly per-thread". That holds for pool workers, which are bound
+  // at startup, and not for a thread that was never bound: Sirius's downgrade
+  // processing thread had no current context, won the race to populate the cache,
+  // and every in-place compression attempt on it failed to launch.
+  CUcontext ctx = nullptr;
+  if (cuCtxGetCurrent(&ctx) != CUDA_SUCCESS) return nullptr;
+  if (ctx == nullptr) {
+    // No context on this thread. Make the device's primary context current via the
+    // runtime API rather than deriving a handle against no context at all, so an
+    // unbound caller gets a usable function instead of one that fails at launch.
+    cudaFree(nullptr);
+    if (cuCtxGetCurrent(&ctx) != CUDA_SUCCESS || ctx == nullptr) return nullptr;
+  }
 
   {
     std::lock_guard<std::mutex> lock(func_mu_);
-    auto it = func_per_dev_.find(device_id);
-    if (it != func_per_dev_.end()) return it->second;
+    auto it = func_per_ctx_.find(ctx);
+    if (it != func_per_ctx_.end()) return it->second;
   }
 
-  // cuKernelGetFunction binds the kernel to the current device context,
-  // which RMM/cuDF sets up correctly per-thread before calling encode/decode.
   CUfunction fn = nullptr;
   if (cuKernelGetFunction(&fn, kern) != CUDA_SUCCESS) return nullptr;
 
   std::lock_guard<std::mutex> lock(func_mu_);
-  func_per_dev_[device_id] = fn;
+  func_per_ctx_[ctx] = fn;
   return fn;
 }
 
@@ -131,7 +148,7 @@ CompiledKernel::CompiledKernel(CompiledKernel&& other) noexcept
     cubin(std::move(other.cubin)),
     rendered_source(std::move(other.rendered_source))
 {
-  func_per_dev_ = std::move(other.func_per_dev_);
+  func_per_ctx_ = std::move(other.func_per_ctx_);
   other.library = nullptr;
   other.kern    = nullptr;
 }
@@ -144,7 +161,7 @@ CompiledKernel& CompiledKernel::operator=(CompiledKernel&& other) noexcept
     kern            = other.kern;
     cubin           = std::move(other.cubin);
     rendered_source = std::move(other.rendered_source);
-    func_per_dev_   = std::move(other.func_per_dev_);
+    func_per_ctx_   = std::move(other.func_per_ctx_);
     other.library   = nullptr;
     other.kern      = nullptr;
   }

@@ -577,32 +577,79 @@ std::string write_compressed_table(compressed_table const& table,
                                    rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"simpatico::io::write_table[file]"};
-  // Build the header + payload buffer list once (shared with the in-memory
-  // writer), then gather the payload into one contiguous blob for the file.
   std::vector<std::uint8_t> hdr;
   std::vector<payload_buffer_ref> buffers;
   std::uint64_t payload_bytes = 0;
   std::string err = build_compressed_table_header(table, hdr, buffers, payload_bytes, stream);
   if (!err.empty()) return err;
 
-  std::vector<std::uint8_t> payload(static_cast<std::size_t>(payload_bytes));
-  for (auto const& b : buffers) {
-    if (b.size_bytes > 0 && b.device_ptr) {
-      cudaMemcpyAsync(payload.data() + b.offset,
-                      b.device_ptr,
-                      static_cast<std::size_t>(b.size_bytes),
-                      cudaMemcpyDeviceToHost,
-                      stream.value());
-    }
+  // Stream the payload through a bounded pinned window rather than materializing
+  // it whole. The obvious form -- one host vector of payload_bytes, D2H every
+  // buffer into it, then write -- costs a transient host allocation as large as
+  // the batch at the moment a spill is already conceding memory pressure, and
+  // pageable memory forces the driver to stage each D2H through its own bounce
+  // buffers anyway. Each buffer already carries the file offset it belongs at, so
+  // the copies can be issued window by window and written as they land.
+  constexpr std::size_t kWindowBytes = 32ULL * 1024 * 1024;
+
+  void* staging = nullptr;
+  if (cudaMallocHost(&staging, kWindowBytes) != cudaSuccess || staging == nullptr) {
+    return "failed to allocate pinned staging window for '" + path + "'";
   }
-  stream.synchronize();  // D→H copies must complete before the file write
+  auto* staging_bytes = static_cast<std::uint8_t*>(staging);
 
   std::ofstream f(path, std::ios::binary | std::ios::trunc);
-  if (!f) return "failed to open '" + path + "' for writing";
+  if (!f) {
+    cudaFreeHost(staging);
+    return "failed to open '" + path + "' for writing";
+  }
   f.write(reinterpret_cast<const char*>(hdr.data()), static_cast<std::streamsize>(hdr.size()));
-  f.write(reinterpret_cast<const char*>(payload.data()),
-          static_cast<std::streamsize>(payload.size()));
-  if (!f) return "write error on '" + path + "'";
+
+  // Buffers are emitted in ascending offset order by build_compressed_table_header,
+  // so a sequential write reproduces the payload layout without seeking. Assert it
+  // rather than trust it: an out-of-order entry would silently corrupt the file.
+  std::uint64_t expected_offset = 0;
+  for (auto const& b : buffers) {
+    if (b.size_bytes == 0) { continue; }
+    if (b.offset != expected_offset) {
+      cudaFreeHost(staging);
+      return "payload buffers are not in ascending offset order for '" + path + "'";
+    }
+    std::uint64_t done = 0;
+    while (done < b.size_bytes) {
+      const std::size_t chunk =
+        static_cast<std::size_t>(std::min<std::uint64_t>(b.size_bytes - done, kWindowBytes));
+      if (b.device_ptr != nullptr) {
+        const auto rc = cudaMemcpyAsync(staging_bytes,
+                                        static_cast<const std::uint8_t*>(b.device_ptr) + done,
+                                        chunk,
+                                        cudaMemcpyDeviceToHost,
+                                        stream.value());
+        if (rc != cudaSuccess) {
+          cudaFreeHost(staging);
+          return std::string{"D2H copy failed for '"} + path + "': " + cudaGetErrorString(rc);
+        }
+        stream.synchronize();  // the window is reused on the next iteration
+      } else {
+        // A sized buffer with no device pointer contributes its extent to the
+        // payload but has nothing to copy. The previous implementation wrote a
+        // value-initialized host vector, so those bytes reached the file as zeros;
+        // reproduce that instead of skipping them and truncating the payload.
+        std::memset(staging_bytes, 0, chunk);
+      }
+      f.write(reinterpret_cast<const char*>(staging_bytes),
+              static_cast<std::streamsize>(chunk));
+      if (!f) {
+        cudaFreeHost(staging);
+        return "write error on '" + path + "'";
+      }
+      done += chunk;
+    }
+    expected_offset += b.size_bytes;
+  }
+
+  cudaFreeHost(staging);
+  if (!f) { return "write error on '" + path + "'"; }
   return {};
 }
 

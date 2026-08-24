@@ -403,6 +403,10 @@ void task_creator::manager_loop()
         while (!node->all_ports_empty()) {
           auto task_lock  = pipeline->get_task_creation_lock();
           auto input_data = node->get_next_task_input_data();
+          // Every override funnels through here, so this is the one place that can
+          // give the spill path an edge key for operators whose own
+          // get_next_task_input_data does not record one.
+          if (input_data) { node->record_source_repos_if_absent(*input_data); }
           auto* pipelineable_input =
             dynamic_cast<op::pipelineable_operator_data*>(input_data.get());
           if (!input_data ||
@@ -456,7 +460,7 @@ void task_creator::manager_loop()
                 auto ro     = batch->to_read_only();
                 auto* space = ro.get_memory_space();
                 if (!space || !ro.get_data()) { continue; }
-                auto size = ro.get_data()->get_size_in_bytes();
+                auto size = ro.get_data()->get_uncompressed_data_size_in_bytes();
                 if (space->get_tier() == cucascade::memory::Tier::GPU) {
                   gpu_bytes[space->get_device_id()] += size;
                 } else if (space->get_tier() == cucascade::memory::Tier::HOST) {

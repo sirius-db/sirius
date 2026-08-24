@@ -245,10 +245,18 @@ endif()
 
 # cmake-format: off
 set(EXTENSION_SOURCES
+    src/compression/compression_alloc_stats.cpp
+    src/compression/compressed_disk_representation.cpp
     src/compression/compressed_representation.cpp
     src/compression/compressed_scan.cpp
     src/compression/compression_converters.cpp
+    src/compression/compression_device_pool.cpp
+    src/compression/device_compressed_blob.cpp
+    src/compression/output_compression.cpp
     src/compression/plan_register.cpp
+    src/compression/simpatico_bridge.cpp
+    src/compression/spill_context.cpp
+    src/planner/column_origin.cpp
     src/config.cpp
     src/helper/numeric_narrowing.cpp
     src/helper/type_conversions.cpp
@@ -658,6 +666,7 @@ endif()
 # cmake-format: off
 set(TEST_SOURCES
     test/cpp/compression/test_compression.cpp
+    test/cpp/compression/test_spill_compression.cpp
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
     test/cpp/config/test_object_store_config.cpp

@@ -23,10 +23,16 @@
 
 #include <cuda/memory_resource>
 
+#include <api/compressed_table_io.hpp>
 #include <api/simpatico_codegen.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <span>
 #include <vector>
 
 namespace sirius {
@@ -106,7 +112,87 @@ struct compressed_device_blob {
   std::vector<std::uint64_t> offsets;
   std::size_t slab_cursor{0};  // owns the slab's advance cursor (see slab_memory_resource)
   slab_memory_resource slab_mr;
+
+  /// The structural header the payload was staged from, retained so `table` can be
+  /// rebuilt on first use. Small (a compact binary node array) and host-side, so
+  /// holding it costs no device memory.
+  std::vector<std::uint8_t> header;
+  std::once_flag table_built;
+  /// Set once `table` is usable. `once_flag` cannot be queried, and the pin path
+  /// needs to distinguish "already reconstructed" from "needs a stream and
+  /// scratch to build" without doing the build. See table() in
+  /// compressed_representation.hpp.
+  std::atomic<bool> table_ready{false};
+
   simpatico::compressed_table table;
+
+  /// Reconstruct `table` on first call and return it. Thread-safe: a blob is shared
+  /// between every projection and clone of the same chunk, and the decode path may
+  /// reach several of them concurrently.
+  ///
+  /// Reconstruction is not free — for a non-fused codec (ans, lz4, snappy, dictionary,
+  /// str_split, ALP) it takes decode scratch from @p scratch_mr — which is why the
+  /// tiers that decompress a batch at most once defer it to here rather than paying
+  /// it at staging time, when the device is at its most constrained.
+  ///
+  /// A throw leaves the flag unset, so a later call retries rather than handing back
+  /// a half-built table.
+  const simpatico::compressed_table& ensure_table(rmm::cuda_stream_view stream,
+                                                  rmm::device_async_resource_ref scratch_mr);
+
+  /// Whether `table` has been reconstructed and can be read without a stream.
+  [[nodiscard]] bool has_table() const noexcept
+  {
+    return table_ready.load(std::memory_order_acquire);
+  }
 };
+
+/**
+ * @brief Stage compressed leaf buffers into one contiguous device payload and
+ *        reconstruct the compressed_table as views into it.
+ *
+ * Shared by the pin path and the task-output compression converter — the layout
+ * rules below are subtle enough that a second copy would drift:
+ *
+ * - Leaves are placed at ALIGNED offsets, not the header's dense ones: nvcomp's
+ *   batched decode requires aligned input pointers.
+ * - Each slice is sized to the leaf's *reconstructed* footprint (`alloc_bytes`),
+ *   not its compressed `size_bytes`: the re-read allocates each leaf at its
+ *   decoded element count and a decode kernel touches the whole column, so a
+ *   slice sized to size_bytes would run off its end into the next leaf.
+ * - A zero-footprint buffer (e.g. the empty "output" leaf of an all-null chunk)
+ *   gets no offset slot at all: cudf allocates nothing for it, so rmm never calls
+ *   the slab and the cursor does not advance. Giving it a slot would hand every
+ *   later leaf the wrong slice.
+ *
+ * @p reconstruct_now decides whether the compressed_table is built here or on
+ * first use. Build it here only when the chunk will be decompressed many times
+ * and the parse amortises — that is the pin path. The output and downgrade tiers
+ * decompress a batch at most once, so for them an eager reconstruct is pure cost
+ * paid at the worst possible moment; they pass false and let
+ * compressed_device_blob::ensure_table do it later. Either way the header is
+ * retained on the blob.
+ *
+ * @p scratch_mr supplies codec decode scratch during an eager reconstruct, kept
+ * separate from the slab so it neither disturbs the slab's positional placement
+ * nor lands inside the payload. It is unused when @p reconstruct_now is false.
+ *
+ * Synchronizes @p stream before returning, so the caller may release the source
+ * buffers enumerated in @p buffers.
+ */
+/// Called with each buffer index once its bytes are safely in the payload, so a
+/// caller can drop the source that owns it and keep peak residency down. The
+/// copies are enqueued on @p stream and synchronized before the *next* callback,
+/// so releasing inside it is ordered.
+using buffer_copied_fn = std::function<void(std::size_t buffer_index)>;
+
+[[nodiscard]] std::shared_ptr<compressed_device_blob> build_device_compressed_blob(
+  std::span<const std::uint8_t> header,
+  std::span<const simpatico::payload_buffer_ref> buffers,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref payload_mr,
+  rmm::device_async_resource_ref scratch_mr,
+  bool reconstruct_now,
+  const buffer_copied_fn& on_buffer_copied = {});
 
 }  // namespace sirius

@@ -336,6 +336,26 @@ static void from_yaml(const YAML::Node& node, compression_config& opt)
     return std::isfinite(value) && value >= 0.0;
   });
   r.optional("input_plan_dir", opt.input_plan_dir);
+  r.optional("enable_spill_compression", opt.enable_spill_compression);
+  r.optional(
+    "spill_explore_beam_width", opt.spill_explore_beam_width, yaml::greater_than<uint32_t>{0});
+  r.optional("spill_explore_max_bytes", yaml::bytes(opt.spill_explore_max_bytes));
+  r.optional("spill_replan_after_uses", opt.spill_replan_after_uses);
+  r.optional("spill_error_tolerance", opt.spill_error_tolerance, yaml::greater_than<uint32_t>{0});
+  r.optional("spill_replan_change_threshold", opt.spill_replan_change_threshold);
+  r.optional("spill_explore_sample_rows", yaml::bytes(opt.spill_explore_sample_rows));
+  r.optional("spill_min_batch_bytes", yaml::bytes(opt.spill_min_batch_bytes));
+  r.optional("enable_output_compression", opt.enable_output_compression);
+  r.optional("output_compression_min_ratio", opt.output_compression_min_ratio);
+  r.optional("output_compression_min_compress_gbps", opt.output_compression_min_compress_gbps);
+  r.optional("output_compression_min_decompress_gbps", opt.output_compression_min_decompress_gbps);
+  r.optional("output_compression_min_batch_bytes",
+             yaml::bytes(opt.output_compression_min_batch_bytes));
+  r.optional("enable_device_compression_downgrade", opt.enable_device_compression_downgrade);
+  r.optional("device_pool_bytes", yaml::bytes(opt.device_pool_bytes));
+  r.optional("spill_release_columns_early", opt.spill_release_columns_early);
+  r.optional("spill_encode_reserve_fraction", opt.spill_encode_reserve_fraction);
+  r.optional("spill_encode_min_headroom_fraction", opt.spill_encode_min_headroom_fraction);
   r.reject_unknown();
 }
 
@@ -345,6 +365,7 @@ static void from_yaml(const YAML::Node& node, exec::downgrade_executor_config& o
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("monitor_period", opt.monitor_period);
+  r.optional("wait_timeout", opt.downgrade_wait_timeout);
   r.reject_unknown();
 }
 
@@ -507,18 +528,15 @@ struct host_mem_config {
     // SiriusContext::initialize() which asserts host_spaces.size() ==
     // topology.num_numa_nodes on the default path. YAML configs may override
     // by explicitly setting per-space numa_id.
-    builder.use_numa_id_as_host_id();
+    builder.use_host_per_numa();
     if (std::holds_alternative<double>(reservation_limit)) {
-      builder.set_reservation_fraction_per_numa_region(std::get<double>(reservation_limit));
+      builder.set_reservation_fraction_per_host(std::get<double>(reservation_limit));
     } else {
-      builder.set_reservation_limit_per_numa_region(std::get<std::uint64_t>(reservation_limit));
+      builder.set_reservation_limit_per_host(std::get<std::uint64_t>(reservation_limit));
     }
-    builder.set_downgrade_fractions_per_numa_region(downgrade_trigger_fraction,
-                                                    downgrade_stop_fraction);
-    if (std::holds_alternative<double>(capacity)) {
-      builder.set_usage_limit_ratio_per_numa_region(std::get<double>(capacity));
-    } else {
-      builder.set_per_numa_region_capacity(std::get<std::uint64_t>(capacity));
+    builder.set_downgrade_fractions_per_host(downgrade_trigger_fraction, downgrade_stop_fraction);
+    if (std::holds_alternative<std::uint64_t>(capacity)) {
+      builder.set_per_host_capacity(std::get<std::uint64_t>(capacity));
     }
     // NOTE on argument order: cucascade's set_host_pool_features has confusingly-named
     // parameters (chunk_size, block_size, initial_block_count) that it internally remaps onto

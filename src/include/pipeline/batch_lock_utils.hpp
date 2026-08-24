@@ -99,10 +99,34 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
     requested_memory_space != nullptr ? requested_memory_space : read_accessor.get_memory_space();
   if (target_space == nullptr) { return std::nullopt; }
 
-  // Memory space matches — return the read-only accessor directly
+  // Memory space matches — return the read-only accessor directly, unless the
+  // batch is GPU-resident in a representation the operator cannot read.
+  //
+  // A GPU-tier batch may be held compressed (compressed_device_representation —
+  // from a compressed pin, or from eager task-output compression). Its memory
+  // space is the same GPU space the task asked for, so the space comparison
+  // matches and every conversion branch below is skipped — but an operator casts
+  // its input to gpu_table_representation, so handing one back uncompressed-but-
+  // -not-decoded fails at the cast. Decompress in place instead. Mirrors the same
+  // test in scan_operator_input::prepare_for_processing.
   if (read_accessor.get_memory_space() != nullptr &&
       read_accessor.get_memory_space()->get_id() == target_space->get_id()) {
-    return std::move(read_accessor);
+    const bool needs_decode =
+      target_space->get_tier() == cucascade::memory::Tier::GPU &&
+      dynamic_cast<const cucascade::gpu_table_representation*>(read_accessor.get_data()) == nullptr;
+    if (!needs_decode) { return std::move(read_accessor); }
+
+    auto& decode_registry = sirius::converter_registry::get();
+    auto mut_accessor     = cucascade::data_batch::readonly_to_mutable(std::move(read_accessor));
+    // readonly_to_mutable is not atomic (shared released, then exclusive
+    // acquired), so a concurrent consumer of the same shared batch may already
+    // have decoded it in the gap. Re-test under the exclusive lock.
+    if (dynamic_cast<const cucascade::gpu_table_representation*>(mut_accessor.get_data()) ==
+        nullptr) {
+      mut_accessor.convert_to<cucascade::gpu_table_representation>(
+        decode_registry, target_space, stream);
+    }
+    return cucascade::data_batch::mutable_to_readonly(std::move(mut_accessor));
   }
 
   // Memory space mismatch — clone or move depending on where the data lives.

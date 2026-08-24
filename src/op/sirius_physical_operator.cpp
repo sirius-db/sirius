@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_operator.hpp"
 
+#include "compression/output_compression.hpp"
 #include "config.hpp"
 #include "log/logging.hpp"
 #include "pipeline/batch_lock_utils.hpp"
@@ -249,6 +250,23 @@ void sirius_physical_operator::sink(const operator_data& output_data, rmm::cuda_
 {
   auto& pipelineable_output = dynamic_cast<const pipelineable_operator_data&>(output_data);
   for (auto& batch : pipelineable_output.get_data_batches()) {
+    // The task's output is final here and not yet in any repository, so the batch
+    // is still exclusively ours — this is the one point where it can be rewritten
+    // without contending with a consumer.
+    //
+    // Once per batch, not once per (batch, port): on a fan-out every consumer
+    // receives the same shared batch, and every out-edge of this operator was
+    // wired with *this* operator's column origins, so they all resolve to the
+    // same per-column plans. Keying off the first port is therefore well defined.
+    // The helper itself only acts on a FULL barrier — where the batch will sit
+    // until the upstream pipeline drains — so a streaming consumer never pays to
+    // have its input compressed and immediately decompressed again.
+    if (batch && !next_port_after_sink.empty()) {
+      auto& first = next_port_after_sink.front();
+      if (auto* p = first.next_operator->get_port(first.next_operator_port_name)) {
+        compression::try_compress_output_batch(*batch, p->repo, p->type, stream);
+      }
+    }
     for (auto& next_port_info : next_port_after_sink) {
       next_port_info.next_operator->push_data_batch(next_port_info.next_operator_port_name, batch);
     }
@@ -333,15 +351,43 @@ std::unique_ptr<operator_data> sirius_physical_operator::get_next_task_input_dat
   // take one data batch from each port and schedule a task (a task takes one data batch from each
   // port), do this repeatedly until all ports are empty
   std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
+  // Kept in step with input_batch: this is the only point where a batch and the
+  // repository it came from are both in hand, and the spill path needs that
+  // origin to key its compression plan (see pipelineable_operator_data::
+  // set_source_repos).
+  std::vector<const ::cucascade::shared_data_repository*> source_repos;
   for (auto& [port_name, port_ptr] : ports) {
     if (!port_ptr->repo) { continue; }  // dependency-only port; nothing to pop
     // For Pipeline barrier: need at least one data batch in the port's repository
     // TODO: later on we will adjust to the new data repository interface in cuCascade
     auto batch_and_handle = port_ptr->repo->pop_next_data_batch();
-    if (batch_and_handle) { input_batch.push_back(std::move(batch_and_handle)); }
+    if (batch_and_handle) {
+      input_batch.push_back(std::move(batch_and_handle));
+      source_repos.push_back(port_ptr->repo);
+    }
   }
   if (input_batch.empty()) { return nullptr; }
-  return std::make_unique<pipelineable_operator_data>(input_batch);
+  auto data = std::make_unique<pipelineable_operator_data>(input_batch);
+  data->set_source_repos(std::move(source_repos));
+  return data;
+}
+
+void sirius_physical_operator::record_source_repos_if_absent(operator_data& data) const
+{
+  auto* pipelineable = dynamic_cast<pipelineable_operator_data*>(&data);
+  if (pipelineable == nullptr || pipelineable->has_source_repos()) { return; }
+
+  const ::cucascade::shared_data_repository* only_repo = nullptr;
+  for (auto const& [port_name, port_ptr] : ports) {
+    if (port_ptr == nullptr || port_ptr->repo == nullptr) { continue; }
+    if (only_repo != nullptr && only_repo != port_ptr->repo) { return; }  // ambiguous
+    only_repo = port_ptr->repo;
+  }
+  if (only_repo == nullptr) { return; }
+
+  pipelineable->set_source_repos(
+    std::vector<const ::cucascade::shared_data_repository*>(
+      pipelineable->get_data_batches().size(), only_repo));
 }
 
 bool sirius_physical_operator::all_ports_empty()

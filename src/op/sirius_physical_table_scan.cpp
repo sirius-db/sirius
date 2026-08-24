@@ -90,7 +90,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::get_next_task_input_d
     uint64_t batch_bytes = 0;
     {
       auto ro = batch->to_read_only();
-      if (ro.get_data()) { batch_bytes = ro.get_data()->get_size_in_bytes(); }
+      if (ro.get_data()) { batch_bytes = ro.get_data()->get_uncompressed_data_size_in_bytes(); }
     }
     accumulated_bytes += batch_bytes;
     input_batch.push_back(std::move(batch));
@@ -244,7 +244,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
 
     cudf::table_view projected_view(selected);
     std::size_t const referenced_bytes = sirius::estimate_referenced_column_bytes(
-      input_view, referenced_indices, output_ro.get_data()->get_size_in_bytes());
+      input_view, referenced_indices, output_ro.get_data()->get_uncompressed_data_size_in_bytes());
     output_batch = sirius::make_data_batch_from_view(
       projected_view, std::move(output_ro), referenced_bytes, *space, stream, batch_telemetry());
   }

@@ -847,7 +847,7 @@ TEST_CASE("pin_table compression - fallback when compression saves too little",
     con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
   // Require a 99% saving — no realistic plan meets this, so the compressed form
   // is discarded and the batch is pinned uncompressed.
-  run_ok(con, "SET pin_table_compression_max_compressed_fraction = 0.01;", "set max_fraction");
+  run_ok(con, "SET compression_max_compressed_fraction = 0.01;", "set max_fraction");
 
   auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='t_ratio');");
   require_ok(pin, "pin");
@@ -1011,7 +1011,7 @@ TEST_CASE("pin_table compression - single-op sweep over narrowed carriers",
       // delta, zigzag and for re-emit one element per input element, so they are size-neutral or
       // slightly expanding by construction and the default fraction gate would store their chunks
       // uncompressed. Accept any compressed size: this sweep measures encodability, not ratio.
-      run_ok(con, "SET pin_table_compression_max_compressed_fraction = 1.5;", "set fraction");
+      run_ok(con, "SET compression_max_compressed_fraction = 1.5;", "set fraction");
       run_ok(con, "SET enable_compressed_materialization = true;", "set narrowing");
 
       auto plan_dir = tmp / "plans";
@@ -1068,7 +1068,7 @@ TEST_CASE("pin_table compression - a native SMALLINT column compresses",
 
   run_ok(con, "SET pin_table_compression = true;", "set compression");
   run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
-  run_ok(con, "SET pin_table_compression_max_compressed_fraction = 1.5;", "set fraction");
+  run_ok(con, "SET compression_max_compressed_fraction = 1.5;", "set fraction");
   // enable_compressed_materialization stays at its default (off): this case is about the native
   // carrier, not a narrowed one.
 
@@ -1632,7 +1632,7 @@ TEST_CASE("pin_table compression - heterogeneous narrow widths widen post-decode
   // compressed form anyway: this fixture is about heterogeneous widths inside
   // compressed chunks, not the fraction gate (the fail-soft test covers mixed
   // storage forms).
-  run_ok(con, "SET pin_table_compression_max_compressed_fraction = 1.5;", "set fraction");
+  run_ok(con, "SET compression_max_compressed_fraction = 1.5;", "set fraction");
   run_ok(con, "SET enable_compressed_materialization = true;", "set narrowing");
   auto plan_dir = tmp / "plans";
   write_plan_file(

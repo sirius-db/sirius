@@ -200,17 +200,25 @@ struct telemetry_config {
   std::string engine_name{"siriusDB"};
 };
 
-/// Parameters controlling Simpatico compression for pin_table(tier=>'host').
-/// These settings apply exclusively to cached input-table pinning and have no
-/// effect on spill-path compression (Phase 3).
+/// Parameters controlling Simpatico compression.
+///
+/// Two independent paths are configured here:
+///   - **pin** — caching an input table via pin_table(), gated by
+///     `enable_pin_table_compression`
+///   - **spill** — compressing batches downgraded off the GPU, gated by
+///     `enable_spill_compression`
+///
+/// Fields named `pin_*` / `spill_*` affect only that path; the rest
+/// (`max_compressed_fraction`) apply to both.
 struct compression_config {
   /// When true, pin_table(tier=>'host') attempts to compress each chunk with
   /// Simpatico before storing it in host memory. Falls back to uncompressed
   /// host storage when no plan file is found for a table or compression fails.
   bool enable_pin_table_compression{false};
 
-  /// Minimum chunk size (uncompressed bytes) below which compression is
+  /// Minimum chunk size (uncompressed bytes) below which pin compression is
   /// skipped and the chunk is stored uncompressed.  0 = no threshold.
+  /// Pin path only — the spill path compresses regardless of batch size.
   std::size_t min_batch_size_bytes{1ULL * 1024 * 1024};  // 1 MiB
 
   /// Maximum compressed footprint, as a fraction of the batch's original device
@@ -220,6 +228,9 @@ struct compression_config {
   /// Must be finite and non-negative. Values above 1 deliberately allow compressed
   /// representations that expand relative to the original batch.
   //  Default 0.75 (that coincides with a 1.33x compression ratio).
+  ///
+  /// Applies to BOTH paths: a pin chunk is stored uncompressed, and a spilled
+  /// batch is downgraded uncompressed, when it fails this test.
   double max_compressed_fraction{0.75};
 
   /// Directory containing per-table Simpatico plan files for input-table
@@ -229,6 +240,172 @@ struct compression_config {
   /// exists for a table, that table is pinned uncompressed regardless of the
   /// enable flag.  Empty string = feature disabled.
   std::string input_plan_dir{};
+
+  // ── Spill-path compression (Phase 3) ──────────────────────────────────────
+
+  /// When true, GPU→HOST and GPU→DISK downgrades compress the batch with
+  /// Simpatico before writing to host/disk memory. Falls back to uncompressed
+  /// on any compression failure.
+  bool enable_spill_compression{false};
+
+  /// Beam width for the per-column explorer that runs on first spill from a
+  /// given operator output. Smaller values are faster but find less optimal
+  /// plans. Default 20 is a fast-path setting; the full default (100) is
+  /// better for offline profiling.
+  uint32_t spill_explore_beam_width{20};
+
+  /// Per-column byte cap for the spill-path explorer. Columns larger than this
+  /// are explored on a trimmed prefix so that the beam search stays within
+  /// device memory. Default 256 MiB.
+  std::size_t spill_explore_max_bytes{256ULL * 1024 * 1024};
+
+  /// Re-run the explorer for an operator output edge after its cached plan has
+  /// been used this many times. 0 = never re-explore (cache the first plan for
+  /// the rest of the query).
+  ///
+  /// Two things expire on this schedule: a plan that no longer suits the data
+  /// (distributions drift as a query progresses), and the "compression is not
+  /// worth it here" verdict recorded when a batch misses
+  /// `max_compressed_fraction`. Without expiry that verdict is permanent, so an
+  /// unrepresentative first batch could disable compression for an edge for the
+  /// whole query. The default amortizes one explore over many batches, which is
+  /// a small fraction of spill cost while still self-correcting.
+  std::uint64_t spill_replan_after_uses{128};
+
+  /// Consecutive compression *errors* on one edge to absorb before treating the
+  /// edge as not worth compressing. Minimum 1 (write off on the first error).
+  ///
+  /// Distinct from `max_compressed_fraction`, which is a measurement and applies
+  /// immediately. Compression runs under memory pressure, so an exception is as
+  /// likely to be a transient allocation failure as a real signal about the data;
+  /// writing the edge off on the first one would disable compression for a whole
+  /// replan interval — and stretch that interval — over a passing blip.
+  std::uint32_t spill_error_tolerance{3};
+
+  /// Relative change in a column's compression ratio or in either of its
+  /// throughputs below which a re-explored plan counts as equivalent to the
+  /// cached one, and the cached plan is kept. 0.2 = 20%.
+  ///
+  /// The explorer is a beam search over a large space and readily returns a
+  /// differently spelled plan that performs the same. Adopting those churns the
+  /// cache and, worse, registers as a change — which resets the replan backoff
+  /// and locks the edge into re-exploring for the rest of the query. Set to 0 to
+  /// adopt every re-explored plan.
+  double spill_replan_change_threshold{0.20};
+
+  /// Row prefix the spill-path explorer runs on (0 = the whole column).
+  ///
+  /// The beam search allocates for hundreds of trial encodes, and on the spill
+  /// path it runs exactly when the GPU is out of memory — on full columns it
+  /// mostly throws bad_alloc, costing the full search and yielding no plan.
+  /// Sampling bounds both allocation and search time. Note the explorer's own
+  /// caveat: a row prefix picks markedly worse plans for sorted/monotonic
+  /// columns, whose best cascade exploits global structure.
+  std::size_t spill_explore_sample_rows{65536};
+
+  // ── Eager task-output compression ─────────────────────────────────────────
+
+  /// When true, a finished task's output batch is compressed on the GPU before
+  /// publication, for those columns whose base-table plan (reached through
+  /// column lineage) is measurably both fast and high-ratio. Falls back to
+  /// publishing uncompressed on any failure or when nothing qualifies.
+  ///
+  /// Distinct from spill compression in intent: that one compresses because it
+  /// must, this one only when the offline measurements say the GPU time is worth
+  /// it. An edge with no qualifying column costs one lookup per query.
+  bool enable_output_compression{false};
+
+  /// Minimum recorded compression ratio for a column's plan to be used eagerly.
+  ///
+  /// Also re-checked against the ratio actually *achieved* on the first batch, so
+  /// a plan whose offline ratio does not survive the operator output — notably a
+  /// delta cascade, whose base-table ratio comes from sorted storage that a join
+  /// or hash partition has destroyed — is dropped after one wasted pass.
+  double output_compression_min_ratio{3.0};
+
+  /// Minimum recorded compress throughput (GB/s) for a plan to be used eagerly.
+  ///
+  /// Gated separately from decompression because output is written once and read
+  /// back at most once, so encode speed is on the critical path. Note the shipped
+  /// SF1000 plans were Pareto-picked for *decompress* only, so this is the gate
+  /// that actually binds: at 250 GB/s it admits 13 of 53 TPC-H columns, and every
+  /// column it rejects with a good ratio is rejected on compress speed.
+  double output_compression_min_compress_gbps{250.0};
+
+  /// Minimum recorded decompress throughput (GB/s) for a plan to be used eagerly.
+  double output_compression_min_decompress_gbps{250.0};
+
+  /// Smallest output batch worth compressing eagerly.
+  ///
+  /// Compressing a batch costs a roughly fixed amount regardless of its size —
+  /// a per-column, per-plan-node `cudaStreamSynchronize` (compress.cpp, needed
+  /// because variable-output codecs report their size from device memory), plus
+  /// the blob staging. The SF100 sweep measured ~2.95 ms per batch against
+  /// ~30 us of actual codec work for a 13.4 MiB batch, i.e. ~1-2% of the codecs'
+  /// rated throughput: below some size a batch simply cannot repay the setup.
+  ///
+  /// Separate from `min_batch_size_bytes` (the pin path's threshold) because the
+  /// two pay different fixed costs and run under different pressure.
+  std::size_t output_compression_min_batch_bytes{64ULL * 1024 * 1024};
+
+  /// Smallest batch worth compressing on the spill path.
+  ///
+  /// The same fixed per-batch cost applies here, but the spill path cannot choose
+  /// its batch sizes: they are whatever the operators produced, and shrinking
+  /// operator batch limits to relieve GPU pressure shrinks spill batches with
+  /// them. Measured at SF1000 with 500 MB operator batches, spill batches landed
+  /// around 500 KB and a downgrade request moved 1.06 GB across 79 of them in
+  /// 14.1 s — 71.7 MB/s, against 9,056 MB/s for the same request uncompressed.
+  /// Below this size the setup cost dominates so heavily that compressing is
+  /// worse than spilling raw, however good the ratio.
+  std::size_t spill_min_batch_bytes{64ULL * 1024 * 1024};
+  /// Device memory reserved exclusively for spill-compression transients.
+  /// 0 (the default) keeps the encoder allocating from the query's pool.
+  ///
+  /// Sharing that pool is circular: a downgrade happens *because* the pool is
+  /// full, so the encode that would relieve the pressure is the one allocation
+  /// certain to fail. Measured on q3/SF1000 with no arena, compression latched
+  /// off and on 11 times while the monitor issued 111,641 downgrade requests.
+  ///
+  /// This is a partition of the device, not extra memory: reserving N bytes
+  /// requires lowering `memory.gpu.usage_limit_fraction` by the same N. Undersizing
+  /// is a cliff rather than a gradient — at 1 GiB, too small for the concurrent
+  /// encodes, the same query failed outright. Size it for
+  /// `downgrade.num_threads` concurrent encodes of the largest spill batch.
+  std::size_t device_pool_bytes{0};
+
+  /// Free each uncompressed source column as soon as it has been encoded, instead
+  /// of holding the whole batch until the converter returns.
+  ///
+  /// This is the memory the spill exists to reclaim, and releasing it during the
+  /// encode rather than after is what lets the compression arena be small: per
+  /// encode the device carries one column's source instead of the batch's.
+  ///
+  /// Opt-in because it forfeits the fall-back. Once a column has been freed the
+  /// batch cannot be spilled uncompressed any more, so the encode must run to
+  /// completion — a column that cannot even be stored raw (identity, no codec
+  /// scratch) becomes fatal for the batch rather than a decline. Requires
+  /// ownership of the table; batches viewing externally-owned memory are skipped.
+  bool spill_release_columns_early{false};
+
+  /// Fraction of a batch's uncompressed size reserved on the device for encode
+  /// working memory when no compression arena is configured. See
+  /// spill_context.hpp::encode_reserve_fraction.
+  double spill_encode_reserve_fraction{0.5};
+
+  /// Decline spill compression when free device memory is below this fraction of
+  /// capacity and no arena is configured. See
+  /// spill_context.hpp::encode_min_headroom_fraction.
+  double spill_encode_min_headroom_fraction{0.10};
+
+  /// When true, the downgrade executor may satisfy a request by compressing
+  /// batches in place on the device, instead of spilling them to host/disk.
+  ///
+  /// Independent of `enable_output_compression`: that one compresses task output
+  /// speculatively at the sink, this one only when a downgrade request has proven
+  /// the memory is needed. They share the plan-quality gate but are separate
+  /// policies and are measured separately.
+  bool enable_device_compression_downgrade{false};
 };
 
 struct sirius_config {

@@ -131,7 +131,7 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
       }
       cudf::table_view out_view(cols);
       std::size_t const referenced_bytes = sirius::estimate_referenced_column_bytes(
-        input_view, referenced_indices, input_ro.get_data()->get_size_in_bytes());
+        input_view, referenced_indices, input_ro.get_data()->get_uncompressed_data_size_in_bytes());
       // Owner = the input read-only lock: keeps the source columns alive AND pinned read-only for
       // the output batch's lifetime, so the view can never be freed/downgraded out from under us.
       output_batches.push_back(sirius::make_data_batch_from_view(
@@ -163,7 +163,9 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
     // the freshly-evaluated columns we just allocated.
     std::size_t const referenced_bytes =
       sirius::estimate_referenced_column_bytes(
-        input_view, passthrough_indices, input_ro.get_data()->get_size_in_bytes()) +
+        input_view,
+        passthrough_indices,
+        input_ro.get_data()->get_uncompressed_data_size_in_bytes()) +
       evaluated->alloc_size();
 
     // Composite owner keeps BOTH lifetimes alive: the freshly-evaluated columns (shared_ptr) and

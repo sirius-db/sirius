@@ -78,9 +78,9 @@ struct prefetcher_env {
     builder.set_number_of_gpus(1)
       .set_gpu_usage_limit(gpu_capacity)
       .set_reservation_fraction_per_gpu(limit_ratio)
-      .set_per_numa_region_capacity(1ull << 30)
-      .use_gpu_id_as_host_id()
-      .set_reservation_fraction_per_numa_region(limit_ratio)
+      .set_per_host_capacity(1ull << 30)
+      .use_host_per_gpu()
+      .set_reservation_fraction_per_host(limit_ratio)
       // Per-thread tracking, the production default: with per-stream tracking
       // the conversion's allocations would bypass the attached reservation.
       .track_reservation_per_stream(false);

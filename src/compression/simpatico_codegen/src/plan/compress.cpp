@@ -494,9 +494,15 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
   }
 
   auto repr = compressor->compress(col_to_compress, stream, mr);
-  // Single-stream mode: sync so async compressors complete before we read
-  // output column views/sizes.
-  cudaStreamSynchronize(stream.value());
+  // No sync here. Everything the walk reads below — describe_meta(),
+  // named_channels(), column sizes — is host-side metadata of columns that are
+  // already allocated, and every variable-output compressor reachable from
+  // make_compressor already syncs internally where it has to read an output size
+  // back from the device (nvcomp_batched_codec after compress/scatter, dictionary,
+  // str_split, alp/alp_rd, bitextract). The fixed-output ones (identity) need no
+  // sync at all. All the barrier did was stall this column's walk once per plan
+  // node, which is pure per-node latency on the spill/output/downgrade paths where
+  // a batch is compressed once and never re-read here.
   if (!repr) {
     set_error("compressor '" + node.op + "' returned null representation");
     return;

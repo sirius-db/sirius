@@ -16,6 +16,9 @@
 
 #include "downgrade/downgrade_executor.hpp"
 
+#include "compression/compression_alloc_stats.hpp"
+#include "compression/output_compression.hpp"
+#include "compression/spill_context.hpp"
 #include "data/convertible_data.hpp"
 #include "data/convertible_data_batch.hpp"
 #include "data/convertible_gpu_pipeline_task.hpp"
@@ -143,6 +146,32 @@ void downgrade_executor::drain()
 
 void downgrade_executor::processing_loop()
 {
+  // Bind this thread to the GPU, exactly as the worker pool's per_thread_init does.
+  //
+  // The in-place compression pass below runs HERE, on the processing thread, not on a
+  // pool worker — so without this the thread has no current CUDA context. That is not
+  // merely untidy: cudaSetDevice is what makes the device's primary context current,
+  // and simpatico derives its JIT CUfunction lazily on whichever thread first asks
+  // (CompiledKernel::func_for_current_device, keyed by device id, not by context). If
+  // this thread got there first, cuKernelGetFunction handed back a function that
+  // cuLaunchKernel then rejected with CUDA_ERROR_INVALID_HANDLE — "invalid resource
+  // handle" — and every in-place compression attempt declined.
+  //
+  // That failure was previously read as memory pressure, because it only ever showed
+  // up during a downgrade. It is not: with task-output compression also enabled, some
+  // task-executor thread populates the CUfunction cache first, this thread hits the
+  // warm entry, and the identical q3/SF100 run goes from 0/78 batches compressed to
+  // 76/76. The trigger was cache-warm order, not free memory.
+  if (_memory_space && _space_id.tier == cucascade::memory::Tier::GPU) {
+    const int device_id   = _memory_space->get_device_id();
+    const cudaError_t err = cudaSetDevice(device_id);
+    if (err != cudaSuccess) {
+      SIRIUS_LOG_ERROR("downgrade_executor processing_loop: cudaSetDevice({}) failed: {}",
+                       device_id,
+                       cudaGetErrorString(err));
+    }
+  }
+
   while (_running.load()) {
     auto request = _request_queue.pop();
     if (!request) break;  // interrupted
@@ -200,6 +229,98 @@ void downgrade_executor::processing_loop()
       target_spaces.push_back(ds);
     }
 
+    // === TIER 0: Compress in place on the device ===
+    //
+    // Cheapest option when it works: the batch stays on the GPU and stays usable,
+    // so there is no D2H copy now and no readback later — only a decode when a
+    // consumer materializes it.
+    //
+    // Runs for every request, with or without an explicit byte target. Almost all
+    // downgrade traffic is the monitor's predicate-only request (measured: 24414
+    // monitor vs ~0 explicit on an SF100 sweep), so gating this on
+    // `requested_bytes > 0` made it dead code — it never executed once across a
+    // full 4-arm sweep despite 18137 requests.
+    //
+    // Where a target exists, the set is still priced against it first:
+    // compressing frees size*(1 - 1/ratio), so candidate bytes C against request R
+    // need a ratio of at least C/(C-R), and C <= R cannot be satisfied at any
+    // ratio. That check is worth keeping because a compression that under-delivers
+    // is worse than a spill that under-delivers — it spent GPU time, freed too
+    // little, AND left a batch that must be decoded before use. With no target
+    // there is nothing to price against, so each candidate is judged on its own
+    // predicted saving and the loop stops as soon as the request's predicate is
+    // satisfied.
+    std::size_t inplace_batches = 0;
+    std::size_t inplace_freed   = 0;
+    if (compression::device_compression_downgrade_enabled() && !req->satisfied.load()) {
+      const std::size_t requested = req->requested_bytes;  // 0 = predicate-only
+      std::vector<std::unique_ptr<convertible_data>> picks;
+      std::size_t predicted_total = 0;
+
+      // Same traversal as TIER 1 below: memory pressure is global, so candidates come
+      // from every in-flight query, newest first (get_all() is ascending by query id).
+      auto const managers = _data_repo_registry.get_all();
+      for (auto const& manager : std::views::reverse(managers)) {
+        if (requested > 0 && predicted_total >= requested) break;
+        for (auto* repo : manager->get_repositories()) {
+          if (requested > 0 && predicted_total >= requested) break;
+          convertible_data_batch_provider provider(repo);
+          for (auto& cand : provider.get_all_convertible(source_space,
+                                                         /*front_to_back=*/false,
+                                                         /*ignore_subscribed=*/true)) {
+            if (!cand) continue;
+            const std::size_t saving = cand->predicted_compression_saving();
+            if (saving == 0) continue;
+            predicted_total += saving;
+            picks.push_back(std::move(cand));
+            if (requested > 0 && predicted_total >= requested) break;
+          }
+        }
+      }
+
+      const bool set_is_sufficient = requested == 0 || predicted_total >= requested;
+      if (set_is_sufficient && !picks.empty()) {
+        auto exc_stream = _stream_pool->acquire_stream(
+          cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
+        for (auto& cand : picks) {
+          const std::size_t freed = cand->compress_in_place(exc_stream);
+          if (freed > 0) {
+            ++inplace_batches;
+            inplace_freed += freed;
+            req->bytes_freed.fetch_add(freed, std::memory_order_relaxed);
+            req->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
+          }
+          // With no byte target the predicate is the only stopping condition, so
+          // check it per batch rather than compressing every candidate we found.
+          if (req->predicate && req->predicate()) {
+            req->satisfied.store(true);
+            break;
+          }
+        }
+        SIRIUS_LOG_DEBUG(
+          "[downgrade] [{}] in-place compression: {}/{} batches compressed, predicted {} bytes, "
+          "freed {} bytes (request target {} bytes)",
+          _source_label,
+          inplace_batches,
+          picks.size(),
+          predicted_total,
+          inplace_freed,
+          requested);
+      } else if (!picks.empty()) {
+        // Targeted request the set cannot meet: deliberately all-or-nothing.
+        // Compressing a subset would spend GPU time, still leave the request
+        // unmet, and leave every batch it touched needing a decode — strictly
+        // worse than spilling those same batches.
+        SIRIUS_LOG_DEBUG(
+          "[downgrade] [{}] in-place compression declined: {} candidates predict only {} of {} "
+          "bytes; spilling instead",
+          _source_label,
+          picks.size(),
+          predicted_total,
+          requested);
+      }
+    }
+
     // === TIER 1: Data repositories ===
     // Memory pressure is a global condition, so candidates are drawn from EVERY in-flight
     // query: outer loop DESCENDING by query id (newest query first), inner loop in
@@ -230,6 +351,25 @@ void downgrade_executor::processing_loop()
         convertible_data_batch_provider provider(repo);
         auto candidates = provider.get_all_convertible(
           source_space, /*front_to_back=*/false, /*ignore_subscribed=*/true);
+
+        // Spill uncompressed batches first; already-compressed ones last.
+        //
+        // A device-compressed batch has been downgraded once already. It is small,
+        // so evicting it frees less than an uncompressed batch of the same logical
+        // size, and it cost GPU time to produce which spilling discards. Preferring
+        // the uncompressed candidates therefore frees more memory per unit of work
+        // and keeps the compression already paid for.
+        //
+        // stable_partition, not sort: the existing order is meaningful (repos are
+        // visited in ascending {operator_id, port_id} and batches back-to-front),
+        // and this must reorder only across the compressed/uncompressed boundary.
+        if (compression::device_compression_downgrade_enabled()) {
+          std::stable_partition(
+            candidates.begin(), candidates.end(), [](const std::unique_ptr<convertible_data>& c) {
+              return c && !c->is_device_compressed();
+            });
+        }
+
         for (auto& candidate : candidates) {
           if (req->satisfied.load()) break;
 
@@ -451,9 +591,61 @@ void downgrade_executor::monitor_loop()
   // Monitor-thread-local; throttles the back-off warning to once per stall episode.
   bool backed_off = false;
 
+  // Periodic tier-occupancy sample. The eviction logs report how many bytes a
+  // downgrade moved, but not the level the tier was at when it moved them, so a
+  // tier that fills and drains within a query is indistinguishable from one that
+  // never gives memory back. Sampled on a wall-clock interval rather than per
+  // cycle because the monitor runs ~100x/s.
+  auto last_occupancy_log      = std::chrono::steady_clock::now();
+  constexpr auto kOccupancyLog = std::chrono::seconds(1);
+
+  // Cycles observing pressure, split by whether the monitor could act on it. Only
+  // one monitor request may be outstanding at a time, and the flag clears when
+  // that request completes, so a slow request leaves the monitor unable to
+  // respond to pressure that develops while it runs. The suppressed count says
+  // how much of an episode was spent in that state.
+  std::uint64_t pressure_cycles   = 0;
+  std::uint64_t suppressed_cycles = 0;
+
   while (_running.load()) {
-    if (_memory_space && _memory_space->should_downgrade_memory() &&
-        !_monitor_request_enqueued.load(std::memory_order_relaxed)) {
+    const bool pressure  = _memory_space && _memory_space->should_downgrade_memory();
+    const bool in_flight = _monitor_request_enqueued.load(std::memory_order_relaxed);
+    if (pressure) {
+      ++pressure_cycles;
+      if (in_flight) { ++suppressed_cycles; }
+    }
+
+    if (_memory_space) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now - last_occupancy_log >= kOccupancyLog) {
+        last_occupancy_log     = now;
+        const std::size_t cap  = _memory_space->get_max_memory();
+        const std::size_t free = _memory_space->get_available_memory();
+        const std::size_t used = cap > free ? cap - free : 0;
+        SIRIUS_LOG_DEBUG(
+          "[occupancy] [{}] used={}B free={}B capacity={}B ({:.1f}%) | pressure_cycles={} "
+          "suppressed={} ({:.0f}%)",
+          _source_label,
+          used,
+          free,
+          cap,
+          cap > 0 ? 100.0 * static_cast<double>(used) / static_cast<double>(cap) : 0.0,
+          pressure_cycles,
+          suppressed_cycles,
+          pressure_cycles > 0 ? 100.0 * static_cast<double>(suppressed_cycles) /
+                                  static_cast<double>(pressure_cycles)
+                              : 0.0);
+        // Same cadence as occupancy so the two can be read together: what the
+        // encode is asking the allocator for, against how much room there was.
+        if (compression::alloc_stats_enabled()) {
+          SIRIUS_LOG_DEBUG("[compression_alloc] [{}] {}",
+                           _source_label,
+                           compression::alloc_stats_format());
+        }
+      }
+    }
+
+    if (pressure && !in_flight) {
       // Stateless viability gate: only issue a downgrade request when one could plausibly free
       // memory. When idle GPU batches' only lower tier is a full HOST and no DISK is configured,
       // re-firing would just re-scan every repository and the task queue, free nothing, and spam
@@ -485,6 +677,15 @@ void downgrade_executor::monitor_loop()
     } else {
       // Pressure gone -- reset so the next stall episode warns again.
       backed_off = false;
+      // Release the OOM policy's compression suppression here rather than on a
+      // successful retry: should_downgrade_memory() is debounced by the
+      // trigger/stop fractions, so it reports recovery once the space has real
+      // headroom again instead of after a single allocation squeaks through.
+      if (compression::spill_compression_suppressed()) {
+        compression::set_spill_compression_suppressed(false);
+        SIRIUS_LOG_DEBUG("[downgrade] [{}] memory pressure resolved; re-enabling spill compression",
+                         _source_label);
+      }
     }
     // Wait for the monitor period, but wake immediately on shutdown.
     std::unique_lock<std::mutex> lock(_monitor_cv_mutex);
@@ -519,7 +720,11 @@ std::future<size_t> downgrade_executor::request_free_memory(size_t bytes)
   req->predicate = [&freed = req->bytes_freed, bytes]() {
     return freed.load(std::memory_order_relaxed) >= bytes;
   };
-  auto future = req->result.get_future();
+  // The in-place compression pass needs the target as a number, not just as a
+  // predicate: it has to price a whole candidate set against it before it will
+  // compress any of it.
+  req->requested_bytes = bytes;
+  auto future          = req->result.get_future();
   if (!_request_queue.push(std::move(req))) {
     SIRIUS_LOG_WARN(
       "[downgrade] request_free_memory: queue inactive, dropping request for {} bytes", bytes);

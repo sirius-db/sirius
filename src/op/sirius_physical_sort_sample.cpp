@@ -40,7 +40,7 @@ uint64_t get_batch_bytes(const std::shared_ptr<::cucascade::data_batch>& batch)
   if (!batch) { return 0; }
   auto ro = batch->to_read_only();
   if (!ro.get_data()) { return 0; }
-  return ro.get_data()->get_size_in_bytes();
+  return ro.get_data()->get_uncompressed_data_size_in_bytes();
 }
 
 bool repo_has_enough_sample_bytes(::cucascade::shared_data_repository* repo,
@@ -197,7 +197,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   try {
     size_t total_sample_bytes = 0;
     for (auto const& batch : valid_batches) {
-      total_sample_bytes += batch.get_data()->get_size_in_bytes();
+      total_sample_bytes += batch.get_data()->get_uncompressed_data_size_in_bytes();
     }
 
     // 2. Build cudf order vectors from BoundOrderByNode
