@@ -24,10 +24,10 @@ namespace sirius::op {
 void check_fold_row_limit(uint64_t total_rows, std::size_t num_batches, uint64_t limit)
 {
   if (total_rows <= limit) { return; }
-  throw std::runtime_error("[fold_limit] cannot fold " + std::to_string(num_batches) +
-                           " batches holding " + std::to_string(total_rows) +
-                           " rows into one cuDF table: the limit is " + std::to_string(limit) +
-                           " rows");
+  throw fold_row_limit_exceeded("[fold_limit] cannot fold " + std::to_string(num_batches) +
+                                " batches holding " + std::to_string(total_rows) +
+                                " rows into one cuDF table: the limit is " + std::to_string(limit) +
+                                " rows");
 }
 
 }  // namespace sirius::op

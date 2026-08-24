@@ -100,13 +100,15 @@ partition_strategy strategy(uint64_t total_bytes,
 
 // Rows one folded partition is planned for. The row-aware cases below are stated as multiples of
 // it so they read the same whatever cudf::size_type is.
-constexpr uint64_t kFoldTarget = sirius::op::fold_row_target(sirius::op::k_fold_row_limit);
+constexpr uint64_t kFoldLimit  = sirius::op::k_fold_row_limit;
+constexpr uint64_t kFoldTarget = sirius::op::fold_row_target(kFoldLimit);
 
 // The byte-side knobs the `strategy(...)` helper defaults to, so a row-aware case states only the
 // fields it is actually about.
 hash_join_sizing_inputs sizing_defaults()
 {
-  return {.hash_partition_bytes       = kBigPartitionBytes,
+  return {.total_rows_exact           = true,
+          .hash_partition_bytes       = kBigPartitionBytes,
           .max_build_hash_table_bytes = kMaxBuildBytes,
           .max_broadcast_join_size    = kMaxBroadcastBytes};
 }
@@ -439,21 +441,31 @@ TEST_CASE("compute_hash_join_partition_strategy - num_gpus < 1 is a precondition
 // INV-FOLD: the row-aware partition floor (see op/fold_limits.hpp)
 //===----------------------------------------------------------------------===//
 
-TEST_CASE(
-  "compute_hash_join_partition_strategy - a folding side under the row target keeps the "
-  "byte-driven count",
-  "[hash_join][build_probe][unit]")
+TEST_CASE("compute_hash_join_partition_strategy - a folding side that fits one fold is never split",
+          "[hash_join][build_probe][unit]")
 {
-  // SEMI folds its build. Below the target the row term contributes nothing and the answer is
-  // still the byte-driven one.
+  // SEMI folds its build. Everything up to the HARD limit fits one cuDF table, so the row term
+  // contributes nothing across that whole band -- including above fold_row_target, where charging
+  // the skew margin would split a build that never needed splitting and cost it the
+  // single-partition dynamic filter.
   auto in           = sizing_defaults();
   in.total_bytes    = k100MB;
-  in.total_rows     = kFoldTarget - 1;
   in.is_build_side  = true;
   in.build_foldable = false;  // keep BUILD_PROBE out of it; this is about the SEMI fold
   in.num_gpus       = 1;
   in.join_type      = duckdb::JoinType::SEMI;
-  CHECK(compute_hash_join_partition_strategy(in).num_partitions == 1);
+
+  for (uint64_t const rows :
+       {uint64_t{0}, kFoldTarget - 1, kFoldTarget, kFoldTarget + 1, kFoldLimit}) {
+    INFO("rows " << rows);
+    in.total_rows = rows;
+    CHECK(compute_hash_join_partition_strategy(in).num_partitions == 1);
+  }
+
+  // One row past the limit a split is unavoidable, and only then is the skew margin charged: the
+  // count is computed against the halved target, so it lands on 3 rather than 2.
+  in.total_rows = kFoldLimit + 1;
+  CHECK(compute_hash_join_partition_strategy(in).num_partitions == 3);
 }
 
 TEST_CASE(
@@ -468,6 +480,11 @@ TEST_CASE(
   in.build_foldable = false;
   in.num_gpus       = 1;
   in.join_type      = duckdb::JoinType::SEMI;
+  CHECK(compute_hash_join_partition_strategy(in).num_partitions >= 4);
+
+  // An inexact upper bound still raises the count: over-partitioning is the safe direction, and
+  // leaving a fold unbounded is what this layer exists to prevent.
+  in.total_rows_exact = false;
   CHECK(compute_hash_join_partition_strategy(in).num_partitions >= 4);
 }
 
@@ -565,13 +582,20 @@ TEST_CASE("compute_hash_join_partition_strategy - a build over the row target is
   in.num_gpus       = 4;
   in.join_type      = duckdb::JoinType::INNER;
 
+  // A replicated build is refused only once it genuinely cannot fit one cuDF table -- not at the
+  // halved target, which reserves headroom for a split broadcast never performs.
   auto fitting       = in;
-  fitting.total_rows = kFoldTarget;
+  fitting.total_rows = kFoldLimit;
   CHECK(compute_hash_join_partition_strategy(fitting).broadcast);
 
   auto oversized       = in;
-  oversized.total_rows = kFoldTarget + 1;
+  oversized.total_rows = kFoldLimit + 1;
   CHECK_FALSE(compute_hash_join_partition_strategy(oversized).broadcast);
+
+  // An inexact measurement may cost partitions but must never disable broadcast.
+  auto inexact             = oversized;
+  inexact.total_rows_exact = false;
+  CHECK(compute_hash_join_partition_strategy(inexact).broadcast);
 }
 
 TEST_CASE(
@@ -583,7 +607,7 @@ TEST_CASE(
   // one partition on a single GPU, broadcast to every GPU on multi-GPU. Neither can be raised.
   auto in           = sizing_defaults();
   in.total_bytes    = k100MB;
-  in.total_rows     = kFoldTarget + 1;
+  in.total_rows     = kFoldLimit + 1;
   in.is_build_side  = true;
   in.build_foldable = true;
   in.join_type      = duckdb::JoinType::MARK;
@@ -596,10 +620,20 @@ TEST_CASE(
   multi_gpu.num_gpus = 4;
   REQUIRE_THROWS_AS(compute_hash_join_partition_strategy(multi_gpu), std::runtime_error);
 
-  // Exactly at the target there is still a legal count.
-  auto fitting       = single_gpu;
-  fitting.total_rows = kFoldTarget;
-  CHECK(compute_hash_join_partition_strategy(fitting).num_partitions == 1);
+  // Anywhere up to the HARD limit the build still folds into one table, so a legal count exists
+  // and the query must not be failed. Charging the halved skew target here would reject builds
+  // cuDF handles perfectly well, and MARK's failure mode is a silent CPU fallback.
+  for (uint64_t const rows : {kFoldTarget, kFoldTarget + 1, kFoldLimit}) {
+    INFO("rows " << rows);
+    auto fitting       = single_gpu;
+    fitting.total_rows = rows;
+    CHECK(compute_hash_join_partition_strategy(fitting).num_partitions == 1);
+  }
+
+  // An inexact measurement must not fail the query: the fold guard reports the real count instead.
+  auto inexact             = single_gpu;
+  inexact.total_rows_exact = false;
+  CHECK(compute_hash_join_partition_strategy(inexact).num_partitions == 1);
 }
 
 TEST_CASE("compute_hash_join_partition_strategy - the floor scales with max_fold_rows",

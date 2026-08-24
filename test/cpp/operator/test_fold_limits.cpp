@@ -38,6 +38,7 @@
 #include <stdexcept>
 
 using sirius::op::check_fold_row_limit;
+using sirius::op::fold_partition_count;
 using sirius::op::fold_partition_floor;
 using sirius::op::fold_row_target;
 using sirius::op::k_fold_row_limit;
@@ -133,11 +134,39 @@ TEST_CASE("fold_partition_floor is the smallest count keeping a fold under the t
   STATIC_REQUIRE(fold_partition_floor(5, 0) == 5);
 }
 
+TEST_CASE("fold_partition_count charges the skew margin only to a genuine split",
+          "[fold_limit][unit]")
+{
+  constexpr uint64_t limit  = k_fold_row_limit;
+  constexpr uint64_t target = fold_row_target(limit);
+
+  // The whole band between the target and the hard limit fits ONE cuDF table, so it must not be
+  // split: the fold is the measurement there, and there is no distribution to be skewed.
+  STATIC_REQUIRE(fold_partition_count(0, limit) == 1);
+  STATIC_REQUIRE(fold_partition_count(target, limit) == 1);
+  STATIC_REQUIRE(fold_partition_count(target + 1, limit) == 1);
+  STATIC_REQUIRE(fold_partition_count(limit, limit) == 1);
+
+  // Past the limit a split is unavoidable, and only then is it costed against the halved target so
+  // key skew has headroom. One row past an odd limit needs three folds rather than two: the target
+  // is (limit - 1) / 2, so two of them fall one row short.
+  STATIC_REQUIRE(fold_partition_count(limit + 1, limit) == 3);
+  STATIC_REQUIRE(fold_partition_count(4 * target, limit) == 4);
+
+  // The same shape at a lowered limit, which is what the max_concat_fold_rows setting drives.
+  STATIC_REQUIRE(fold_partition_count(200, 200) == 1);
+  STATIC_REQUIRE(fold_partition_count(201, 200) == 3);  // ceil(201 / 100)
+}
+
 TEST_CASE("check_fold_row_limit admits exactly the limit and names the overflow",
           "[fold_limit][unit]")
 {
   REQUIRE_NOTHROW(check_fold_row_limit(k_fold_row_limit, 4, k_fold_row_limit));
   REQUIRE_NOTHROW(check_fold_row_limit(0, 0, k_fold_row_limit));
+  REQUIRE_THROWS_AS(check_fold_row_limit(k_fold_row_limit + 1, 4, k_fold_row_limit),
+                    sirius::op::fold_row_limit_exceeded);
+  // A distinct type, so a handler can tell an INV-FOLD violation from a device OOM or a
+  // non-resident batch; still a runtime_error, so existing handlers keep working.
   REQUIRE_THROWS_AS(check_fold_row_limit(k_fold_row_limit + 1, 4, k_fold_row_limit),
                     std::runtime_error);
 

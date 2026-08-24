@@ -22,8 +22,12 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <compression/compressed_representation.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/disk_data_representation.hpp>
+#include <cucascade/memory/column_metadata.hpp>
 
 #include <atomic>
 #include <cstdint>
@@ -66,21 +70,58 @@ inline cudf::table_view get_cudf_table_view(const cucascade::read_only_data_batc
 }
 
 /**
- * @brief Exact cuDF row count of @p batch, or `std::nullopt` when it holds no GPU cuDF table.
+ * @brief Rows described by a spilled batch's per-column metadata.
  *
- * A batch that has been spilled to the host or disk tier carries no tier-agnostic row count, and
- * that is a normal state rather than an error — so this probes with a pointer `dynamic_cast`
- * instead of `idata_representation::cast<>()`, which throws.
+ * Every column of one table has the same row count, so the first column answers for the table. A
+ * zero-column table reports 0: it has no column for cuDF to index, so no row count of it can
+ * violate INV-FOLD.
+ */
+[[nodiscard]] inline int64_t rows_from_column_metadata(
+  const std::vector<cucascade::memory::column_metadata>& columns)
+{
+  return columns.empty() ? 0 : static_cast<int64_t>(columns.front().num_rows);
+}
+
+/**
+ * @brief Exact row count of @p batch, or `std::nullopt` when its tier cannot report one.
  *
- * The caller MUST already hold the read-only lock, exactly as for get_cudf_table_view.
+ * Every tier a batch can be resident on records its row count, and it survives the round trip: a
+ * GPU table answers from its `cudf::table_view`, host and disk allocations from the
+ * `column_metadata` the spill wrote, and a compressed representation from the count it was built
+ * with. The one exception is `cucascade::host_data_packed_representation`, whose `cudf::pack`
+ * metadata blob carries no directly readable row count; callers must treat `std::nullopt` as "not
+ * measured" rather than as zero.
+ *
+ * Probes with a pointer `dynamic_cast` rather than `idata_representation::cast<>()`, which throws,
+ * so an unrecognised tier is a normal, silent outcome.
+ *
+ * The caller MUST already hold the read-only lock, exactly as for get_cudf_table_view. Deliberately
+ * not `noexcept`: building a `cudf::table_view` allocates, so a host `bad_alloc` must propagate
+ * rather than terminate the process.
  */
 [[nodiscard]] inline std::optional<int64_t> try_batch_num_rows(
-  const cucascade::read_only_data_batch& batch) noexcept
+  const cucascade::read_only_data_batch& batch)
 {
-  const auto* gpu_table =
-    dynamic_cast<const cucascade::gpu_table_representation*>(batch.get_data());
-  if (gpu_table == nullptr) { return std::nullopt; }
-  return static_cast<int64_t>(gpu_table->get_table_view().num_rows());
+  const auto* data = batch.get_data();
+  if (data == nullptr) { return std::nullopt; }
+  if (const auto* gpu = dynamic_cast<const cucascade::gpu_table_representation*>(data)) {
+    return static_cast<int64_t>(gpu->get_table_view().num_rows());
+  }
+  if (const auto* host = dynamic_cast<const cucascade::host_data_representation*>(data)) {
+    const auto& allocation = host->get_host_table();
+    if (!allocation) { return std::nullopt; }
+    return rows_from_column_metadata(allocation->columns);
+  }
+  if (const auto* disk = dynamic_cast<const cucascade::disk_data_representation*>(data)) {
+    return rows_from_column_metadata(disk->get_disk_table().columns);
+  }
+  if (const auto* compressed_host = dynamic_cast<const compressed_host_representation*>(data)) {
+    return compressed_host->num_rows();
+  }
+  if (const auto* compressed_gpu = dynamic_cast<const compressed_device_representation*>(data)) {
+    return compressed_gpu->num_rows();
+  }
+  return std::nullopt;
 }
 
 /**

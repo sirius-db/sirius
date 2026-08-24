@@ -38,7 +38,8 @@ enum class PartitionType { HASH, RANGE, EVENLY, CUSTOM, NONE };
 /// sirius_physical_partition::measure_input for how each field is obtained.
 struct partition_input_measurement {
   uint64_t bytes;       ///< Sum of the resident batch sizes.
-  uint64_t rows_bound;  ///< Sound UPPER bound on the total rows.
+  uint64_t rows_bound;  ///< Sound UPPER bound on the total rows; exact when `rows_exact`.
+  bool rows_exact;      ///< Every batch reported its own row count, so `rows_bound` is the truth.
 };
 
 // PartitionType to string
@@ -144,15 +145,20 @@ class sirius_physical_partition : public sirius_physical_operator {
    * partition count. Both sides of a join get a FULL barrier when either drives sizing, so the
    * measured side's input is entirely resident here -- this is a measurement, not a sample.
    *
-   * `rows_bound` is exact whenever every batch is GPU-resident, which is the normal case. A batch
-   * on any other tier exposes no tier-agnostic row count, so it is bounded instead by its
-   * uncompressed byte size divided by the smallest per-row footprint this operator's schema can
-   * have: one byte per column, since cuDF's narrowest fixed-width carrier is one byte and a
-   * variable-width column spends at least four offset bytes per row. That over-counts rows, which
-   * over-partitions, which is the safe direction. It is deliberately derived from the schema
-   * rather than from `planner::estimate_bytes_per_row`: that helper reads *logical* widths and so
-   * over-charges the narrow carriers compressed materialization installs, which would UNDER-count
-   * rows.
+   * Every tier a batch can rest on reports its own row count (`try_batch_num_rows`), including a
+   * batch the downgrade executor has spilled to host or disk -- which is exactly the state a
+   * FULL-barriered build port gets into under memory pressure, when the partition count matters
+   * most. `rows_exact` is then true and `rows_bound` is the truth.
+   *
+   * A tier that cannot report one (only `cucascade::host_data_packed_representation` today) is
+   * bounded instead by its uncompressed byte size divided by the smallest per-row footprint this
+   * operator's schema can have: one byte per column, since cuDF's narrowest fixed-width carrier is
+   * one byte and a variable-width column spends at least four offset bytes per row. That
+   * over-counts rows, which over-partitions -- the safe direction for the partition floor, but not
+   * for any decision that fails or disables, which is what `rows_exact` exists to gate. The bound
+   * is deliberately derived from the schema rather than from `planner::estimate_bytes_per_row`:
+   * that helper reads *logical* widths and so over-charges the narrow carriers compressed
+   * materialization installs, which would UNDER-count rows.
    */
   [[nodiscard]] partition_input_measurement measure_input();
 

@@ -293,8 +293,13 @@ TEST_CASE_METHOD(DelimDirectFixture,
   // row-aware floor spread the probe across partitions first. Dynamic filters are off so the
   // probe -- the side that folds -- is also the side that drives the count, which is the regime
   // the floor governs.
+  //
+  // The 5000-value key domain is load-bearing: three partitions of a 300k-row probe average 100k
+  // rows against a 200k limit, so the test must not depend on the hash landing those keys evenly.
+  // A handful of keys could put most of the probe in one bucket and fail on the hash function
+  // rather than on the behaviour under test.
   run_ok(
-    "CREATE TABLE inner_many AS SELECT (((i % 6) + 1) * 10)::INTEGER AS k, i::INTEGER AS qty "
+    "CREATE TABLE inner_many AS SELECT ((i % 5000) * 10)::INTEGER AS k, i::INTEGER AS qty "
     "FROM range(300000) t(i);");
   run_ok("CHECKPOINT;");
 

@@ -35,11 +35,18 @@ namespace sirius::planner {
 
 namespace {
 
-/// Read the delim-direct-lowering enable flag from the active SiriusContext config. Absent state
-/// means the knob cannot be read, and a default-deny rewrite must not run on an unread
-/// configuration, so the lowering is refused rather than assumed.
+/// Read the delim-direct-lowering enable flag from the active SiriusContext config.
+///
+/// Refuses when the state cannot be read at all. This is a deliberate divergence from the
+/// surrounding convention, where an absent SiriusContext falls back to a default-constructed
+/// `operator_params` and so to the registered default (see
+/// sirius_physical_plan_generator.cpp's compressed-materialization gate): those are *sizing*
+/// defaults, where guessing costs performance, whereas this knob gates a semantics-preserving
+/// rewrite that is default-deny by construction. A default-deny pass must not run on a
+/// configuration it never read.
 bool delim_direct_lowering_enabled(duckdb::ClientContext& context)
 {
+  if (!context.registered_state) { return false; }
   auto state = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!state) { return false; }
   return state->get_config().get_operator_params().enable_delim_direct_lowering;
@@ -107,7 +114,7 @@ sirius_physical_plan_generator::plan_delim_join(duckdb::LogicalComparisonJoin& o
   if (delim_direct_lowering_enabled(context)) {
     // A DELIM_GET reached under a still-live enclosing delim join is not provably ours, so the
     // context gate short-circuits the structural classifier.
-    auto analysis = open_delim_join_depth_ > 0
+    auto analysis = open_delim_join_depth > 0
                       ? delim_direct_analysis{delim_direct_refusal::nested_delim_context}
                       : classify_delim_direct_lowering(op);
     if (analysis.eligible()) {
@@ -127,7 +134,7 @@ sirius_physical_plan_generator::plan_delim_join(duckdb::LogicalComparisonJoin& o
   // duplicate-eliminated data stays live for everything planned beneath it.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan;
   {
-    open_delim_join_scope nested_guard(open_delim_join_depth_);
+    open_delim_join_scope nested_guard(open_delim_join_depth);
     plan = plan_comparison_join(op);
   }
   // this should create a join, not a cross product

@@ -179,15 +179,15 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
     auto output = cucascade::data_batch::to_idle(std::move(copy));
     output_batches.push_back(std::move(output));
   } else {
-    try {
-      output_batches.push_back(
-        gpu_merge_impl::concat(input_batches, stream, *space, batch_telemetry(), _max_fold_rows));
-    } catch (const std::exception& e) {
-      // Attribute the refusal before it unwinds: the message from gpu_merge_impl names the counts
-      // but not which fold produced them, and a query can hold many CONCATs.
+    // Attribute a failed fold before it unwinds: gpu_merge_impl names the counts but not which
+    // fold produced them, and a query can hold many CONCATs. Only an INV-FOLD violation carries
+    // the [fold_limit] marker -- a fold also fails on device OOM and on a batch that is not
+    // GPU-resident, and a marker stamped on those would classify nothing.
+    auto log_fold_failure = [&](const char* marker, const char* what) {
       SIRIUS_LOG_ERROR(
-        "[fold_limit] CONCAT id {} (partition {}, concat_all={}, {} side of {} id {}) cannot fold "
-        "{} input batches into one cuDF table: {}",
+        "{}CONCAT id {} (partition {}, concat_all={}, {} side of {} id {}) failed folding {} input "
+        "batches into one cuDF table: {}",
+        marker,
         get_operator_id(),
         partition_idx,
         _concat_all,
@@ -195,7 +195,16 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
         SiriusPhysicalOperatorToString(_downstream_join->type),
         _downstream_join->get_operator_id(),
         input_batches.size(),
-        e.what());
+        what);
+    };
+    try {
+      output_batches.push_back(
+        gpu_merge_impl::concat(input_batches, stream, *space, batch_telemetry(), _max_fold_rows));
+    } catch (const fold_row_limit_exceeded& e) {
+      log_fold_failure("[fold_limit] ", e.what());
+      throw;
+    } catch (const std::exception& e) {
+      log_fold_failure("", e.what());
       throw;
     }
   }

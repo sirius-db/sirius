@@ -207,6 +207,7 @@ class sirius_physical_plan_generator {
   bool preserve_insertion_order(sirius::op::sirius_physical_operator& plan);
   // bool use_batch_index(sirius::op::sirius_physical_operator &plan);
 
+ private:
   //! How many DELIM joins are currently being planned above the cursor that KEPT their delim
   //! lowering, i.e. whose duplicate-eliminated data is still live in the subtree below. A DELIM_GET
   //! reached while this is non-zero may belong to one of them rather than to the delim join being
@@ -216,7 +217,7 @@ class sirius_physical_plan_generator {
   //! refuses the delim-direct lowering (reason `nested_delim_context`) rather than assuming
   //! ownership. A delim join that WAS lowered contributes nothing: the rewrite destroys its
   //! sandwich, and its DELIM_GET with it.
-  std::size_t open_delim_join_depth_ = 0;
+  std::size_t open_delim_join_depth = 0;
 
  public:
   std::size_t delim_index = 0;

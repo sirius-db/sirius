@@ -105,8 +105,9 @@ struct build_probe_decision {
 /// long positional list: several of the fields are interchangeable `bool` / `uint64_t` pairs, so
 /// both call sites aggregate-initialise it with designators and no argument can be transposed.
 struct hash_join_sizing_inputs {
-  uint64_t total_bytes                  = 0;  ///< Measured bytes on the sizing side.
-  uint64_t total_rows                   = 0;  ///< Sound upper bound on rows on the sizing side.
+  uint64_t total_bytes                  = 0;      ///< Measured bytes on the sizing side.
+  uint64_t total_rows                   = 0;      ///< Sound upper bound on rows on the sizing side.
+  bool total_rows_exact                 = false;  ///< `total_rows` is exact, not a bound.
   bool is_build_side                    = false;
   bool build_foldable                   = false;
   int num_gpus                          = 1;
@@ -141,12 +142,13 @@ struct hash_join_sizing_inputs {
 /// shuffling a much larger probe across GPUs.
 ///
 /// INV-FOLD (see `op/fold_limits.hpp`): when the sizing side is one a CONCAT folds into a single
-/// batch per partition -- by this join's shape (`join_folds_side`), or because BUILD_PROBE
-/// concat_alls the build -- the count is additionally floored so each fold stays within
-/// `fold_row_target(max_fold_rows)` rows. A broadcast build is replicated rather than split, so it
-/// is refused outright when it exceeds that target. A MARK join, whose count is pinned at one
-/// partition or at broadcast and can never be raised, throws rather than reaching
-/// `cudf::concatenate`.
+/// batch per partition (`measured_side_folds`), the count is additionally floored by
+/// `fold_partition_count` so every fold stays addressable. A broadcast build is replicated rather
+/// than split, so it is refused outright when it does not fit one fold; a MARK join, whose count
+/// is pinned at one partition or at broadcast and can never be raised, throws instead of reaching
+/// `cudf::concatenate`. Neither the refusal nor the throw fires on a measurement that is only an
+/// upper bound (`total_rows_exact`): an inexact measurement may cost extra partitions but must
+/// never fail or disable.
 ///
 /// The floor deliberately bounds only the *measured* side. It does not try to bound the opposite
 /// side from a cardinality estimate: an estimate-derived floor can under-count and would create a
@@ -378,6 +380,25 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     }
     throw std::runtime_error("sirius_physical_hash_join::join_folds_side: unsupported join type: " +
                              duckdb::JoinTypeToString(type));
+  }
+
+  /// Whether the side a partition-sizing measurement came from is one that gets folded into a
+  /// single batch per partition -- by the join's shape (`join_folds_side`), or because the
+  /// PARTITION operator concat_alls the build once BUILD_PROBE is selected. This is the predicate
+  /// the INV-FOLD partition floor is applied under, and the one the partition-strategy DEBUG line
+  /// reports, so the log can never claim a floor that was not applied.
+  ///
+  /// MARK is excluded on purpose. It folds its build under BUILD_PROBE like any other join, but
+  /// its `build_has_null` sentinel is join-wide, so its count must stay at one partition (single
+  /// GPU) or at broadcast and may never be raised. `compute_hash_join_partition_strategy` refuses
+  /// an over-limit MARK build outright instead; excluding MARK here is what keeps that safe even
+  /// if the refusal is ever softened.
+  [[nodiscard]] static constexpr bool measured_side_folds(duckdb::JoinType type,
+                                                          bool is_build,
+                                                          bool build_probe)
+  {
+    if (type == duckdb::JoinType::MARK) { return false; }
+    return join_folds_side(type, is_build) || (is_build && build_probe);
   }
 
   /// Pure sizing-exception predicate: a right-family join takes BUILD-driven partition sizing

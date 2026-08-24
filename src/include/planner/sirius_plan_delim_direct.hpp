@@ -62,6 +62,9 @@ enum class delim_direct_refusal : uint8_t {
   /// A DELIM_GET column's type differs from the duplicate-eliminated column that produced it, so
   /// the correlated condition was typed against a different value than the one the rewrite
   /// substitutes. Also the type half of the DELIM_GET-ownership proof (see nested_delim_context).
+  /// The comparison is `duckdb::LogicalType` equality, which also distinguishes an alias or other
+  /// `extra_type_info`, so two physically identical types can land here; that is the correct
+  /// posture for a default-deny pass, but it is worth knowing when tracing a refusal.
   delim_column_type_mismatch,
   /// The candidate sits inside another DELIM join that kept its delim lowering, so the matched
   /// DELIM_GET's owner is not locally provable -- it could be the enclosing join's. Supplied by

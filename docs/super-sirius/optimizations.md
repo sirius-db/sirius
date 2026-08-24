@@ -88,7 +88,7 @@ look-ahead is not a user-selectable YAML setting.
 **Motivation:** For small build-side datasets, building the hash table once and probing many times is more efficient than the standard multi-partition Cartesian product approach.
 
 **Mechanism:** `compute_hash_join_partition_strategy()` selects BUILD_PROBE mode when:
-- `num_partitions <= num_gpus` (one hash table per partition, at most one partition per GPU; reduces to a single partition when `num_gpus == 1`)
+- eligibility is measured at `min(natural, num_gpus)` partitions (one hash table per partition; reduces to a single partition when `num_gpus == 1`). The final count can exceed `num_gpus` when the INV-FOLD floor raises it, which leaves total build bytes unchanged and simply places several hash tables on one GPU
 - per-partition average build side < `max_build_hash_table_bytes`, foldable to a single batch per partition
 - the join is neither RIGHT-family nor `MIXED_JOIN`
 

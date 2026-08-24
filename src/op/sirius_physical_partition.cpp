@@ -308,7 +308,7 @@ partition_input_measurement sirius_physical_partition::measure_input()
 
   auto& repo     = ports.at("default")->repo;
   auto batch_ids = repo->get_batch_ids(0);
-  partition_input_measurement measurement{.bytes = 0, .rows_bound = 0};
+  partition_input_measurement measurement{.bytes = 0, .rows_bound = 0, .rows_exact = true};
   for (auto batch_id : batch_ids) {
     auto batch = repo->get_data_batch_by_id(batch_id, 0);
     if (!batch) { continue; }
@@ -317,9 +317,12 @@ partition_input_measurement sirius_physical_partition::measure_input()
     if (data == nullptr) { continue; }
     measurement.bytes += data->get_size_in_bytes();
     auto const num_rows = try_batch_num_rows(ro);
-    measurement.rows_bound += num_rows
-                                ? static_cast<uint64_t>(*num_rows)
-                                : data->get_uncompressed_data_size_in_bytes() / min_bytes_per_row;
+    if (num_rows) {
+      measurement.rows_bound += static_cast<uint64_t>(*num_rows);
+    } else {
+      measurement.rows_bound += data->get_uncompressed_data_size_in_bytes() / min_bytes_per_row;
+      measurement.rows_exact = false;
+    }
   }
   return measurement;
 }
@@ -433,10 +436,11 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
       auto& sizing_partition = _drives_partition_count ? *this : sibling;
       auto const measured    = sizing_partition.measure_input();
       partition_sizing_input const in{
-        .total_bytes    = measured.bytes,
-        .total_rows     = measured.rows_bound,
-        .is_build_side  = sizing_partition._is_build,
-        .build_foldable = has_build_concat(*this) || has_build_concat(sibling)};
+        .total_bytes      = measured.bytes,
+        .total_rows       = measured.rows_bound,
+        .total_rows_exact = measured.rows_exact,
+        .is_build_side    = sizing_partition._is_build,
+        .build_foldable   = has_build_concat(*this) || has_build_concat(sibling)};
       // The consumer owns the decision: it computes the count / broadcast flag, updates its own
       // execution state (e.g. hash-join BUILD_PROBE mode), and pre-sizes its own input repos.
       auto const strategy      = consumer->get_partition_strategy(in);
@@ -458,7 +462,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
       } else if (in.is_build_side && strategy.num_partitions == 1 && hash_join != nullptr &&
                  hash_join->publishes_dynamic_filters() &&
                  in.total_bytes < hash_join->max_build_hash_table_bytes() &&
-                 in.total_rows <= hash_join->max_fold_rows()) {
+                 !(in.total_rows_exact && in.total_rows > hash_join->max_fold_rows())) {
         // Not BUILD_PROBE, but the build lands in one partition and this join publishes a filter
         // from a single build batch, so folding it only moves a batch boundary. Best-effort: no
         // build-side CONCAT means no publication. Build-side sizing is required — right-family
@@ -468,7 +472,9 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
         // The row bound is INV-FOLD: this fold is opt-in and is not covered by the partition
         // count, so a build cuDF cannot address in one table gives up the filter instead. The
         // hard limit rather than fold_row_target applies here — the count is already fixed at
-        // one, so there is no skew headroom to reserve.
+        // one, so there is no skew headroom to reserve. Only an EXACT measurement may withhold
+        // the filter: an inexact upper bound that turned out to be pessimistic would surrender
+        // the publication and thereby cause the very overflow this gate exists to prevent.
         bool const found_this    = enable_build_concat_all(*this);
         bool const found_sibling = enable_build_concat_all(sibling);
         build_arrives_whole      = found_this || found_sibling;
@@ -492,10 +498,11 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
     std::lock_guard<std::mutex> guard(lock);
     if (!_num_partitions.has_value()) {
       auto const measured = measure_input();
-      partition_sizing_input const in{.total_bytes    = measured.bytes,
-                                      .total_rows     = measured.rows_bound,
-                                      .is_build_side  = _is_build,
-                                      .build_foldable = false};
+      partition_sizing_input const in{.total_bytes      = measured.bytes,
+                                      .total_rows       = measured.rows_bound,
+                                      .total_rows_exact = measured.rows_exact,
+                                      .is_build_side    = _is_build,
+                                      .build_foldable   = false};
       auto const strategy = consumer->get_partition_strategy(in);
       _num_partitions     = strategy.num_partitions;
       SIRIUS_LOG_DEBUG("sirius_physical_partition id {} sized {} partitions",

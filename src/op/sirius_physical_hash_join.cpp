@@ -772,21 +772,22 @@ partition_strategy compute_hash_join_partition_strategy(const hash_join_sizing_i
 
   int const natural = natural_num_partitions(total_bytes, in.hash_partition_bytes, num_gpus);
 
-  // INV-FOLD: partitions needed for the measured side to fold within the per-partition row target
-  // if that side is folded at all. Computed for every join type because a side can be folded
-  // either by the join's shape (join_folds_side) or by BUILD_PROBE, which folds the build
-  // whatever the shape says.
-  int const measured_fold_floor =
-    fold_partition_floor(in.total_rows, fold_row_target(in.max_fold_rows));
-  bool const shape_folds_measured_side =
-    sirius_physical_hash_join::join_folds_side(in.join_type, in.is_build_side);
+  // INV-FOLD: partitions the measured side needs before each of its folds is addressable. One
+  // whenever the whole measurement already fits max_fold_rows -- that fold is the measurement, so
+  // there is no skew to reserve against; only a genuine split is costed against the halved target
+  // (fold_partition_count). Computed for every join type because a side can be folded either by
+  // the join's shape or by BUILD_PROBE, which concat_alls the build whatever the shape says.
+  int const measured_fold_floor = fold_partition_count(in.total_rows, in.max_fold_rows);
+  bool const one_fold_suffices  = measured_fold_floor <= 1;
 
   // Only the build side can drive broadcast / BUILD_PROBE. Right-family joins are probe-driven
   // (probe partition sizes the join), so they always take the plain STANDARD natural count --
   // floored so the probe fold the join requires stays addressable.
   if (!in.is_build_side) {
     int const probe_partitions =
-      shape_folds_measured_side ? std::max(natural, measured_fold_floor) : natural;
+      sirius_physical_hash_join::measured_side_folds(in.join_type, false, /*build_probe=*/false)
+        ? std::max(natural, measured_fold_floor)
+        : natural;
     return {probe_partitions, /*broadcast=*/false, /*build_probe=*/false};
   }
 
@@ -804,10 +805,11 @@ partition_strategy compute_hash_join_partition_strategy(const hash_join_sizing_i
   // the build avoids shuffling a much larger probe across GPUs).
   //
   // A broadcast build is replicated rather than split, so every replica folds the WHOLE build and
-  // raising the partition count cannot shrink that fold. A build over the fold target is therefore
-  // inadmissible for broadcast and must be hash-partitioned instead.
+  // raising the partition count cannot shrink that fold. A build that does not fit one fold is
+  // therefore inadmissible for broadcast and must be hash-partitioned instead -- but only an EXACT
+  // measurement may withhold broadcast, since an inexact upper bound must never disable anything.
   bool const broadcast_candidate =
-    measured_fold_floor <= 1 &&
+    (one_fold_suffices || !in.total_rows_exact) &&
     (is_mark ? num_gpus > 1
              : (total_bytes < small ||
                 (total_bytes < in.max_broadcast_join_size &&
@@ -816,15 +818,16 @@ partition_strategy compute_hash_join_partition_strategy(const hash_join_sizing_i
   // The one shape with no legal partition count: MARK is always BUILD_PROBE, so its build always
   // folds, and its count is pinned either way -- one partition on a single GPU, or broadcast to
   // every GPU (build_has_null must be globally consistent). Raising the count is not available to
-  // it, so a build past the fold target can be satisfied at no count. Fail here, naming the
-  // counts, rather than letting cudf::concatenate discover it. Unreachable in practice; present
-  // so the invariant has no silent hole.
-  if (is_mark && measured_fold_floor > 1) {
+  // it, so a build that cannot fit one cuDF table can be satisfied at no count. Fail here, naming
+  // the counts, rather than letting cudf::concatenate discover it. Only an EXACT measurement may
+  // fail the query; an inexact upper bound is left to the fold guard in gpu_merge_impl, which
+  // reports an attributable [fold_limit] error against the real row count.
+  if (is_mark && !one_fold_suffices && in.total_rows_exact) {
     throw std::runtime_error(
       "compute_hash_join_partition_strategy: a MARK join folds its whole build and cannot be "
-      "hash-partitioned, but its build of up to " +
-      std::to_string(in.total_rows) + " rows exceeds the " +
-      std::to_string(fold_row_target(in.max_fold_rows)) + "-row target for a single folded batch");
+      "hash-partitioned, but its build of " +
+      std::to_string(in.total_rows) + " rows exceeds the " + std::to_string(in.max_fold_rows) +
+      " rows one folded batch can hold");
   }
 
   // BUILD_PROBE eligibility. MARK/SEMI/ANTI are eligible (persistent filtered_join built on the
@@ -851,8 +854,10 @@ partition_strategy compute_hash_join_partition_strategy(const hash_join_sizing_i
 
   bool const broadcast = broadcast_candidate && build_probe;
 
-  // BUILD_PROBE runs at the count its eligibility was measured at; MARK single-GPU is clamped to
-  // one partition; broadcast takes num_gpus; everything else the natural count.
+  // BUILD_PROBE runs at the count its eligibility was measured at; broadcast takes num_gpus;
+  // everything else the natural count. The MARK arm is currently unreachable -- MARK is forced
+  // into BUILD_PROBE above, where build_probe_partitions is already min(natural, num_gpus) == 1 on
+  // a single GPU -- and is kept as the backstop that clamps MARK if that forcing is ever relaxed.
   int const selected = broadcast                    ? num_gpus
                        : build_probe                ? build_probe_partitions
                        : (is_mark && num_gpus <= 1) ? 1
@@ -863,7 +868,13 @@ partition_strategy compute_hash_join_partition_strategy(const hash_join_sizing_i
   // excluded above, while `natural` and `build_probe_partitions` both split the build, so raising
   // the count only shrinks each per-partition build and BUILD_PROBE's byte eligibility (measured
   // at min(natural, num_gpus)) still holds.
-  bool const build_folds = shape_folds_measured_side || build_probe;
+  //
+  // measured_side_folds excludes MARK, whose build must stay in one partition (or broadcast) for
+  // its join-wide build_has_null sentinel to be computable at all. The throw above is what makes
+  // that exclusion safe; the exclusion is what keeps it safe if the throw is ever softened,
+  // because hash-partitioning a MARK build yields wrong results rather than a failure.
+  bool const build_folds =
+    sirius_physical_hash_join::measured_side_folds(in.join_type, true, build_probe);
   int const num_partitions =
     (build_folds && !broadcast) ? std::max(selected, measured_fold_floor) : selected;
   return {num_partitions, broadcast, build_probe};
@@ -881,6 +892,7 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
   auto const strategy = compute_hash_join_partition_strategy(
     {.total_bytes                    = in.total_bytes,
      .total_rows                     = in.total_rows,
+     .total_rows_exact               = in.total_rows_exact,
      .is_build_side                  = in.is_build_side,
      .build_foldable                 = in.build_foldable,
      .num_gpus                       = _num_gpus,
@@ -946,10 +958,18 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
                               : _join_mode == HASH_JOIN_MODE::MIXED_JOIN ? "MIXED_JOIN"
                                                                          : "STANDARD";
 
+  // The fold floor is reported as APPLIED, not as computed: a right-family build-driven join
+  // (residual R1') measures a side it does not fold, and a line claiming a floor there would say
+  // the opposite of the truth in exactly the case a reader most needs to recognise.
+  bool const measured_side_is_folded =
+    measured_side_folds(join_type, in.is_build_side, strategy.build_probe);
+  int const applied_fold_floor =
+    measured_side_is_folded ? fold_partition_count(in.total_rows, _max_fold_rows) : 1;
+
   SIRIUS_LOG_DEBUG(
     "sirius_physical_hash_join id {} partition strategy: {} partitions ({} GPUs), build side {} "
     "bytes. Join Type: {}. Join Mode: {} {}. build_card_est {} probe_card_est {}. sizing side "
-    "total_rows {} fold_floor {} max_fold_rows {}",
+    "total_rows {} ({}) folds {} applied fold_floor {} max_fold_rows {}",
     this->get_operator_id(),
     strategy.num_partitions,
     _num_gpus,
@@ -960,7 +980,9 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
     build_card_est,
     probe_card_est,
     in.total_rows,
-    fold_partition_floor(in.total_rows, fold_row_target(_max_fold_rows)),
+    (in.total_rows_exact ? "exact" : "upper bound"),
+    measured_side_is_folded,
+    applied_fold_floor,
     _max_fold_rows);
   return strategy;
 }
@@ -1128,8 +1150,10 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
   }
 
   // How a partition's tasks are tagged for GPU routing (task_creator uses tag % num_gpus):
-  //  - Multiple partitions: tag with the real partition index p, so partitions spread one-per-GPU
-  //    and execute() can select the matching hash-table slot from the tag.
+  //  - Multiple partitions: tag with the real partition index p, so partitions spread round-robin
+  //    across GPUs and execute() can select the matching hash-table slot from the tag. The count
+  //    may exceed num_gpus -- the INV-FOLD floor can raise it (see
+  //    compute_hash_join_partition_strategy) -- in which case several slots share a GPU.
   //  - Single partition: tag with operator_id, preserving the historical routing where several
   //    small single-partition BUILD_PROBE joins in one query spread across GPUs instead of all
   //    pinning to GPU 0. execute() maps the lone partition back to slot 0.
@@ -2378,8 +2402,9 @@ void sirius_physical_hash_join::on_finalize_operator()
     std::memory_order_acquire);
 
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
-    // Each partition's hash table lives on its own GPU (partition_idx % num_gpus). Free every slot
-    // on the device it was built on so cuco/rmm releases memory in the right device context.
+    // Each partition's hash table lives on the GPU its tasks were routed to
+    // (partition_idx % num_gpus, so several partitions may share a GPU). Free every slot on the
+    // device it was actually built on so cuco/rmm releases memory in the right device context.
     for (auto& slot : _partition_build_states) {
       std::optional<rmm::cuda_set_device_raii> device_guard;
       if (slot.device_id >= 0) { device_guard.emplace(rmm::cuda_device_id{slot.device_id}); }
