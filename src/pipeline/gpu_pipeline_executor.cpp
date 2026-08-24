@@ -235,6 +235,20 @@ void gpu_pipeline_executor::manager_loop()
         SIRIUS_LOG_INFO("GPU Pipeline Executor: downgrade request cancelled for task {}: {}",
                         gpu_task->get_task_id(),
                         e.what());
+        // This break leaves the manager loop, so no epilogue will run for this task: destroy it
+        // now and fail the query if its completion parked an error nobody else would observe.
+        const auto* task_pipeline = gpu_task->get_pipeline();
+        gpu_task                  = nullptr;
+        pipeline_task.reset();
+        if (task_pipeline) {
+          if (auto completion = task_pipeline->get_completion_status(); completion.error) {
+            SIRIUS_LOG_ERROR(
+              "GPU Pipeline Executor: pipeline {} failed while completing a cancelled task; "
+              "failing the query",
+              task_pipeline->get_pipeline_id());
+            if (_completion_handler) { _completion_handler->report_error(completion.error); }
+          }
+        }
         break;
       }
 
@@ -440,13 +454,30 @@ void gpu_pipeline_executor::manager_loop()
         }
         task.reset();
 
+        // ~gpu_pipeline_task is noexcept, so a throw out of mark_task_completed() above is
+        // parked on the pipeline rather than propagated. Read it here, the first frame that can
+        // still reach the completion handler: a pre-flip throw leaves nobody able to finish the
+        // pipeline, so only failing the query keeps it from waiting forever. The snapshot pairs
+        // pipeline_finished with the parked error, so a sibling task's finalize failure can
+        // never lose to the completion this epilogue would otherwise signal.
+        sirius_pipeline::completion_status completion;
+        if (pipeline) { completion = pipeline->get_completion_status(); }
+        if (completion.error) {
+          SIRIUS_LOG_ERROR(
+            "GPU Pipeline Executor: pipeline {} failed while completing a task; failing the "
+            "query",
+            pipeline->get_pipeline_id());
+          if (_completion_handler) { _completion_handler->report_error(completion.error); }
+          return;
+        }
+
         // Check if query is complete BEFORE scheduling downstream tasks.
         // mark_completed() signals the future that engine.execute() is waiting on,
         // which may destroy the engine and its operators. We must not schedule
         // tasks that reference those operators after signaling completion.
         bool query_complete = false;
         if (_completion_handler && pipeline && pipeline->is_query_terminal()) {
-          query_complete = pipeline->is_pipeline_finished();
+          query_complete = completion.finished;
         }
 
         if (!query_complete && _task_creator) {
