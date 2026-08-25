@@ -220,6 +220,52 @@ TEST_CASE("dense_count_join: NULL counted keys never match", "[dense_count_join]
   }
 }
 
+TEST_CASE("dense_count_join: a matched key whose COUNT(col) values are all NULL counts zero",
+          "[dense_count_join]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space);
+
+  // Key 2 is present on both sides, so it matches, but every counted argument for it is NULL.
+  std::vector<std::shared_ptr<cucascade::data_batch>> preserved{
+    make_numeric_batch<int32_t>(*space, {1, 2, 2}, cudf::type_id::INT32)};
+  std::vector<std::shared_ptr<cucascade::data_batch>> counted{
+    make_counted_batch(*space, {1, 2, 2}, {10, 0, 0}, {true, false, false})};
+
+  SECTION("COUNT(col) keeps the matched all-NULL group at zero")
+  {
+    const std::vector<group_row> expected{{1, 1}, {2, 0}};
+    for (auto [max_bytes, strategy] :
+         {std::pair{k_default_max_bytes, sirius_physical_dense_count_join::strategy::DENSE},
+          std::pair{k_tiny_max_bytes, sirius_physical_dense_count_join::strategy::SPARSE}}) {
+      auto rows = run_dense_count_join<int32_t>(*space,
+                                                duckdb::LogicalTypeId::INTEGER,
+                                                preserved,
+                                                counted,
+                                                std::size_t{1},
+                                                max_bytes,
+                                                strategy);
+      REQUIRE(rows == expected);
+    }
+  }
+  SECTION("COUNT(*) counts the matched rows regardless of argument NULLs")
+  {
+    const std::vector<group_row> expected{{1, 1}, {2, 4}};
+    for (auto [max_bytes, strategy] :
+         {std::pair{k_default_max_bytes, sirius_physical_dense_count_join::strategy::DENSE},
+          std::pair{k_tiny_max_bytes, sirius_physical_dense_count_join::strategy::SPARSE}}) {
+      auto rows = run_dense_count_join<int32_t>(*space,
+                                                duckdb::LogicalTypeId::INTEGER,
+                                                preserved,
+                                                counted,
+                                                std::nullopt,
+                                                max_bytes,
+                                                strategy);
+      REQUIRE(rows == expected);
+    }
+  }
+}
+
 TEST_CASE("dense_count_join: offset BIGINT key range", "[dense_count_join]")
 {
   auto* space = get_default_gpu_space();
@@ -474,37 +520,26 @@ TEST_CASE("dense_count_join rejects malformed batch metadata with diagnostics",
                                                               k_default_max_bytes);
   };
 
-  SECTION("null batches are rejected before generic materialization can drop them")
-  {
-    std::shared_ptr<cucascade::data_batch> null_batch;
-    REQUIRE_THROWS_WITH(dense_count_join_input({batch, null_batch}, {}),
-                        Catch::Contains("null preserved batch at index 1"));
-    REQUIRE_THROWS_WITH(dense_count_join_input({}, {null_batch}),
-                        Catch::Contains("null counted batch at index 0"));
-  }
-
-  SECTION("batch side identity is explicit and aligned")
+  SECTION("the batch split index records both sides")
   {
     dense_count_join_input input({batch}, {batch});
-    REQUIRE(input.input_sides() == std::vector<dense_count_join_input::input_side>{
-                                     dense_count_join_input::input_side::PRESERVED,
-                                     dense_count_join_input::input_side::COUNTED});
+    REQUIRE(input.preserved_count() == 1);
+    REQUIRE(input.counted_count() == 1);
+    REQUIRE(input.get_data_batches().size() == 2);
   }
 
-  SECTION("preserved key index is checked before narrowing")
+  SECTION("an out-of-range preserved key index fails instead of reading past the batch")
   {
     auto op = make_operator(1, 0, std::nullopt);
     dense_count_join_input input({batch}, {});
-    REQUIRE_THROWS_WITH(op->execute(input, default_stream()),
-                        Catch::Contains("preserved key column index 1 is out of range"));
+    REQUIRE_THROWS_AS(op->execute(input, default_stream()), std::out_of_range);
   }
 
-  SECTION("COUNT argument index is checked before narrowing")
+  SECTION("an out-of-range COUNT argument index fails instead of reading past the batch")
   {
     auto op = make_operator(0, 0, std::size_t{1});
     dense_count_join_input input({}, {batch});
-    REQUIRE_THROWS_WITH(op->execute(input, default_stream()),
-                        Catch::Contains("COUNT argument column index 1 is out of range"));
+    REQUIRE_THROWS_AS(op->execute(input, default_stream()), std::out_of_range);
   }
 }
 TEST_CASE("dense_count_join owns direct child port and barrier wiring",

@@ -165,6 +165,13 @@ children[0]->build_pipelines(current, meta_pipeline);  // Probe in current
 state.set_pipeline_source(current, *this);
 ```
 
+**Sink parents** (PARTITION, RIGHT_DELIM_JOIN, DENSE_COUNT_JOIN): the base `is_sink()` returns true for any operator whose tree parent is one of these, because the parent consumes each child's output through a repository. The parent therefore only creates its own meta-pipeline and lets each child's `build_pipelines()` terminate the child's pipeline (PARTITION shown; DENSE_COUNT_JOIN applies the same call to its counted and then preserved child):
+```
+D_ASSERT(children[0]->is_sink());
+auto& partition_meta = meta_pipeline.create_child_meta_pipeline(current, *this);
+children[0]->build_pipelines(*partition_meta.get_base_pipeline(), partition_meta);
+```
+
 **CTE operator**:
 ```
 auto& child = meta_pipeline.create_child_meta_pipeline(current, *this);
@@ -314,6 +321,19 @@ graph LR
 > Pipeline 3 is usually not standalone: Sirius automatically folds MERGE_GROUP_BY into the
 > downstream sink's pipeline as an intermediate. See [Merge fusion](#merge-fusion) below.
 
+### DENSE_COUNT_JOIN
+
+```mermaid
+graph LR
+    P1["Pipeline 1<br/>[..., preserved root]"] -->|"FULL (preserved)"| P3["Pipeline 3<br/>[DENSE_COUNT_JOIN]"]
+    P2["Pipeline 2<br/>[..., counted root]"] -->|"FULL (counted)"| P3
+    P3 -->|"FULL"| DS["downstream"]
+```
+
+DENSE_COUNT_JOIN is a sink parent (see [`build_pipelines()` Patterns](#build_pipelines-patterns)), so each direct child terminates its own producer pipeline and feeds one input port through a `FULL` barrier; the counted producer is built first. Each root may itself be a scan, a streaming chain over a scan, `[HASH_JOIN]` (fed by its own CONCAT/PARTITION chains), `[MERGE_GROUP_BY, FILTER]` (a fused merge under a HAVING filter), `[MERGE_SORT]`, or another `[DENSE_COUNT_JOIN]`. Delim-join, materialized-CTE and delim/CTE scan roots are declined at plan time because their output does not arrive through a child-owned pipeline, and a delim join is declined at any depth of an input because the DENSE_COUNT_JOIN task hint can poll a MARK hash join inside the delim subtree before its sizing partitions have run.
+
+The repository to downstream uses `FULL` barrier (`PARTIAL` is only used when DENSE_COUNT_JOIN feeds the probe-side PARTITION of a HASH_JOIN outside the right family, see `sirius_physical_partition::input_barrier_for`).
+
 ### UNGROUPED_AGGREGATE
 
 ```mermaid
@@ -349,7 +369,7 @@ graph LR
 
 Eligibility is decided at plan time by `mark_fusable_merge_pipelines` (`sirius_physical_plan_generator.cpp`), which walks parent pointers from each merge to the first downstream sink. Fusion applies when that path is unary and streaming and the sink accepts a fused input; the merge's own `build_pipelines` override then adds itself to the current pipeline and recurses into its child (which still cuts the upstream boundary). The following are **excluded** and keep the standalone merge boundary:
 
-- **Join / CTE / delim terminals** (`HASH_JOIN`, `NESTED_LOOP_JOIN`, `CTE`, `LEFT/RIGHT_DELIM_JOIN`) — multiple inputs or bespoke sink wiring.
+- **Join / CTE / delim terminals** (`HASH_JOIN`, `NESTED_LOOP_JOIN`, `CTE`, `LEFT/RIGHT_DELIM_JOIN`, `DENSE_COUNT_JOIN`) — multiple inputs or bespoke sink wiring. A streaming operator directly under a sink parent is itself the fusion terminal (e.g. `[MERGE_GROUP_BY, FILTER]` feeding a PARTITION or DENSE_COUNT_JOIN port).
 - **Partition sinks** (`PARTITION`, `SORT_PARTITION`) — require complete upstream input in one task.
 - **Delim-owned merges** — the distinct-root merge inside a delim join needs its dedicated sink wiring.
 - **`MERGE_AGGREGATE`** (ungrouped aggregate) — uses a different partial-result handoff.

@@ -22,6 +22,7 @@
 #include "pipeline/sirius_pipeline_converter.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "utils/pipeline_conversion_test_utils.hpp"
+#include "utils/scoped_sirius_setting.hpp"
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -39,6 +40,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -234,6 +236,78 @@ std::vector<sirius::op::sirius_physical_operator*> collect(
   return out;
 }
 
+// Join inputs whose physical root owns a producer pipeline of its own: a nested hash join, a
+// grouped aggregate under a HAVING filter, and a nested dense count-join.
+constexpr char const* nested_hash_join_counted_query =
+  "SELECT c_id, count(o.o_id) FROM cust LEFT JOIN ("
+  "  SELECT o1.o_id, o1.o_cust FROM ord o1 JOIN ord o2 ON o1.o_cust = o2.o_cust"
+  ") o ON c_id = o.o_cust GROUP BY c_id";
+constexpr char const* nested_hash_join_preserved_query =
+  "SELECT c.c_id, count(o_id) FROM ("
+  "  SELECT c1.c_id FROM cust c1 JOIN cust c2 ON c1.c_grp = c2.c_grp"
+  ") c LEFT JOIN ord ON c.c_id = o_cust GROUP BY c.c_id";
+constexpr char const* nested_hash_join_right_preserved_query =
+  "SELECT c.c_id, count(o_id) FROM ord RIGHT JOIN ("
+  "  SELECT c1.c_id FROM cust c1 JOIN cust c2 ON c1.c_grp = c2.c_grp"
+  ") c ON o_cust = c.c_id GROUP BY c.c_id";
+constexpr char const* having_counted_query =
+  "SELECT c_id, count(t.o_cust) FROM cust LEFT JOIN ("
+  "  SELECT o_cust FROM ord GROUP BY o_cust HAVING count(*) > 1"
+  ") t ON c_id = t.o_cust GROUP BY c_id";
+constexpr char const* nested_dense_count_join_query =
+  "SELECT c_id, count(t.n) FROM cust LEFT JOIN ("
+  "  SELECT o_cust AS k, count(c2.c_id) AS n FROM ord LEFT JOIN cust c2 ON o_cust = c2.c_id"
+  "  GROUP BY o_cust"
+  ") t ON c_id = t.k GROUP BY c_id";
+
+sirius::pipeline::sirius_pipeline const* pipeline_containing(
+  sirius::pipeline::pipeline_conversion_result const& result,
+  sirius::op::SiriusPhysicalOperatorType type)
+{
+  for (auto const& pipeline : result.scheduled_pipelines) {
+    for (auto const& op_ref : pipeline->get_operators()) {
+      if (op_ref.get().type == type) { return pipeline.get(); }
+    }
+  }
+  return nullptr;
+}
+
+// Require the single-operator DENSE_COUNT_JOIN pipeline with exactly two FULL input wirings, each
+// sourced at the direct child that terminates the producer pipeline; returns the fused operator.
+sirius::op::sirius_physical_operator const* require_dense_count_join_conversion(
+  sirius::pipeline::pipeline_conversion_result const& result)
+{
+  using sirius::op::MemoryBarrierType;
+  using sirius::op::sirius_physical_dense_count_join;
+  using sirius::op::SiriusPhysicalOperatorType;
+
+  auto const* dense_pipeline =
+    pipeline_containing(result, SiriusPhysicalOperatorType::DENSE_COUNT_JOIN);
+  REQUIRE(dense_pipeline != nullptr);
+  auto const operators = dense_pipeline->get_operators();
+  REQUIRE(operators.size() == 1);
+  auto const* dense = &operators[0].get();
+  CHECK(dense_pipeline->get_source().get() == dense);
+  CHECK(dense_pipeline->get_sink().get() == dense);
+  REQUIRE(dense->children.size() == 2);
+
+  std::size_t input_count = 0;
+  for (auto const& wiring : result.repository_wirings) {
+    if (wiring.dest_pipeline.get() != dense_pipeline) { continue; }
+    ++input_count;
+    std::size_t const child_index =
+      wiring.port_id == sirius_physical_dense_count_join::PRESERVED_PORT ? 0 : 1;
+    CHECK((wiring.port_id == sirius_physical_dense_count_join::PRESERVED_PORT ||
+           wiring.port_id == sirius_physical_dense_count_join::COUNTED_PORT));
+    CHECK(wiring.barrier_type == MemoryBarrierType::FULL);
+    CHECK(wiring.source_op == dense->children[child_index].get());
+    REQUIRE(wiring.source_pipeline);
+    CHECK(wiring.source_pipeline->get_sink().get() == dense->children[child_index].get());
+  }
+  REQUIRE(input_count == 2);
+  return dense;
+}
+
 const sirius::op::scan::duckdb_native_ingestible_table_info& require_native_scan(
   sirius::op::sirius_physical_operator* root, std::string_view table_name, bool has_row_filter)
 {
@@ -303,6 +377,23 @@ struct dense_count_join_fixture {
     REQUIRE(collect(plan.get(), T::NESTED_LOOP_JOIN).empty());
     REQUIRE(fused[0]->children.size() == 2);
     return true;
+  }
+
+  struct fused_plan {
+    duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan;
+    sirius::op::sirius_physical_operator* fused;
+  };
+
+  // Plan `query` and require exactly one DENSE_COUNT_JOIN with two children.
+  fused_plan require_fused(std::string const& query)
+  {
+    auto plan = generate_sirius_plan(*con, query);
+    REQUIRE(plan);
+    auto const fused =
+      collect(plan.get(), sirius::op::SiriusPhysicalOperatorType::DENSE_COUNT_JOIN);
+    REQUIRE(fused.size() == 1);
+    REQUIRE(fused[0]->children.size() == 2);
+    return {std::move(plan), fused[0]};
   }
 
   scoped_temp_db_path db_path;
@@ -420,6 +511,51 @@ TEST_CASE_METHOD(dense_count_join_fixture,
 }
 
 TEST_CASE_METHOD(dense_count_join_fixture,
+                 "dense_count_join conversion hosts nested producers behind its input ports",
+                 "[dense_count_join][pipeline]")
+{
+  using T = sirius::op::SiriusPhysicalOperatorType;
+
+  SECTION("nested hash join on the counted side")
+  {
+    sirius::test::with_conversion_result(
+      *con, nested_hash_join_counted_query, [](auto const& result) {
+        auto const* dense         = require_dense_count_join_conversion(result);
+        auto const* join_pipeline = pipeline_containing(result, T::HASH_JOIN);
+        REQUIRE(join_pipeline != nullptr);
+        CHECK(join_pipeline->get_sink().get() == dense->children[1].get());
+        std::vector<std::string_view> ports;
+        for (auto const& wiring : result.repository_wirings) {
+          if (wiring.dest_pipeline.get() == join_pipeline) { ports.push_back(wiring.port_id); }
+        }
+        std::sort(ports.begin(), ports.end());
+        CHECK(ports == std::vector<std::string_view>{"build", "default"});
+      });
+  }
+
+  SECTION("merge fusion terminates at the streaming root feeding the counted port")
+  {
+    auto const check_merge_boundary = [&](bool fused) {
+      sirius::test::with_conversion_result(*con, having_counted_query, [&](auto const& result) {
+        auto const* dense          = require_dense_count_join_conversion(result);
+        auto const* merge_pipeline = pipeline_containing(result, T::MERGE_GROUP_BY);
+        REQUIRE(merge_pipeline != nullptr);
+        REQUIRE(merge_pipeline->get_sink());
+        if (fused) {
+          CHECK(merge_pipeline->get_sink().get() == dense->children[1].get());
+          CHECK(merge_pipeline->get_sink()->type != T::MERGE_GROUP_BY);
+        } else {
+          CHECK(merge_pipeline->get_sink()->type == T::MERGE_GROUP_BY);
+        }
+      });
+    };
+    check_merge_boundary(true);
+    sirius::test::scoped_sirius_setting unfused{*con, "fuse_merge_pipelines", false};
+    check_merge_boundary(false);
+  }
+}
+
+TEST_CASE_METHOD(dense_count_join_fixture,
                  "dense_count_join declines off-shape aggregates and joins",
                  "[dense_count_join][plan]")
 {
@@ -465,18 +601,15 @@ TEST_CASE_METHOD(dense_count_join_fixture,
 }
 
 TEST_CASE_METHOD(dense_count_join_fixture,
-                 "dense_count_join rejects COUNT with non-system provenance",
+                 "dense_count_join identifies COUNT by host callbacks, not declared provenance",
                  "[dense_count_join][plan]")
 {
   auto const query =
     "SELECT c_id, count(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id";
-  auto plan = generate_sirius_plan(
-    *con, query, plan_generation_options{.mutate = assign_non_system_count_provenance});
-  REQUIRE(plan);
-  using T = sirius::op::SiriusPhysicalOperatorType;
-  CHECK(collect(plan.get(), T::DENSE_COUNT_JOIN).empty());
-  CHECK(collect(plan.get(), T::HASH_JOIN).size() == 1);
-  CHECK(collect(plan.get(), T::HASH_GROUP_BY).size() == 1);
+  plan_generation_options const options{.mutate = assign_non_system_count_provenance};
+  REQUIRE(has_dense_count_join(query, options));
+  auto plan = generate_sirius_plan(*con, query, options);
+  REQUIRE(collect(plan.get(), sirius::op::SiriusPhysicalOperatorType::HASH_GROUP_BY).empty());
 }
 
 TEST_CASE_METHOD(dense_count_join_fixture,
@@ -526,7 +659,7 @@ TEST_CASE_METHOD(dense_count_join_fixture,
 }
 
 TEST_CASE_METHOD(dense_count_join_fixture,
-                 "dense_count_join declines intervening operators and non-linear join children",
+                 "dense_count_join declines intervening operators and counted-side group keys",
                  "[dense_count_join][plan]")
 {
   CHECK_FALSE(
@@ -534,11 +667,166 @@ TEST_CASE_METHOD(dense_count_join_fixture,
                          "WHERE (o_id IS NULL OR c_grp = 0) GROUP BY c_id"));
   CHECK_FALSE(has_dense_count_join(
     "SELECT o_cust, count(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY o_cust"));
-  // Identity projection can be elided, exposing the non-linear join child.
-  CHECK_FALSE(
-    has_dense_count_join("SELECT c_id, count(o.o_id) FROM cust LEFT JOIN ("
-                         "  SELECT o1.o_id, o1.o_cust FROM ord o1 JOIN ord o2 ON o1.o_id = o2.o_id"
-                         ") o ON c_id = o.o_cust GROUP BY c_id"));
+}
+
+TEST_CASE_METHOD(dense_count_join_fixture,
+                 "dense_count_join fires over nested joins and aggregates on either input",
+                 "[dense_count_join][plan]")
+{
+  using T = sirius::op::SiriusPhysicalOperatorType;
+
+  SECTION("nested hash join on the counted side")
+  {
+    auto const [plan, fused] = require_fused(nested_hash_join_counted_query);
+    CHECK(collect(fused->children[1].get(), T::HASH_JOIN).size() == 1);
+    CHECK(collect(fused->children[0].get(), T::HASH_JOIN).empty());
+  }
+
+  SECTION("nested hash join on the preserved side")
+  {
+    auto const [plan, fused] = require_fused(nested_hash_join_preserved_query);
+    CHECK(collect(fused->children[0].get(), T::HASH_JOIN).size() == 1);
+    CHECK(collect(fused->children[1].get(), T::HASH_JOIN).empty());
+  }
+
+  SECTION("GROUP BY + HAVING subquery on the counted side")
+  {
+    auto const [plan, fused] = require_fused(having_counted_query);
+    CHECK(collect(fused->children[1].get(), T::HASH_GROUP_BY).size() == 1);
+    CHECK(collect(fused->children[1].get(), T::FILTER).size() == 1);
+    CHECK(collect(plan.get(), T::HASH_GROUP_BY).size() == 1);
+  }
+
+  SECTION("RIGHT orientation with the nested hash join on the preserved side")
+  {
+    auto const [plan, fused] = require_fused(nested_hash_join_right_preserved_query);
+    CHECK(collect(fused->children[0].get(), T::HASH_JOIN).size() == 1);
+    CHECK(collect(fused->children[1].get(), T::HASH_JOIN).empty());
+  }
+
+  SECTION("nested dense count-join as the counted input")
+  {
+    auto plan = generate_sirius_plan(*con, nested_dense_count_join_query);
+    REQUIRE(plan);
+    // collect() is pre-order, so the outer operator comes first.
+    auto const fused = collect(plan.get(), T::DENSE_COUNT_JOIN);
+    REQUIRE(fused.size() == 2);
+    REQUIRE(fused[0]->children.size() == 2);
+    CHECK(collect(fused[0]->children[1].get(), T::DENSE_COUNT_JOIN).size() == 1);
+    CHECK(collect(fused[0]->children[0].get(), T::DENSE_COUNT_JOIN).empty());
+    CHECK(collect(plan.get(), T::HASH_JOIN).empty());
+  }
+}
+
+TEST_CASE_METHOD(dense_count_join_fixture,
+                 "dense_count_join declines bespoke-wired input roots",
+                 "[dense_count_join][plan]")
+{
+  using T = sirius::op::SiriusPhysicalOperatorType;
+
+  SECTION("materialized CTE reference")
+  {
+    auto const query =
+      "WITH t AS MATERIALIZED (SELECT o_cust, o_id FROM ord) "
+      "SELECT c_id, count(t.o_id) FROM cust LEFT JOIN t ON c_id = t.o_cust GROUP BY c_id";
+    CHECK_FALSE(has_dense_count_join(query));
+    auto plan = generate_sirius_plan(*con, query);
+    REQUIRE(plan);
+    CHECK(collect(plan.get(), T::CTE).size() == 1);
+  }
+
+  // Correlated subqueries whose delim join survives the optimizer's deliminator (the correlated
+  // column reaches a non-equality predicate or an aggregate argument) and roots the join input.
+  auto const require_delim_root_declined = [&](std::string const& query) {
+    CHECK_FALSE(has_dense_count_join(query));
+    auto plan = generate_sirius_plan(*con, query);
+    REQUIRE(plan);
+    CHECK(collect(plan.get(), T::LEFT_DELIM_JOIN).size() +
+            collect(plan.get(), T::RIGHT_DELIM_JOIN).size() ==
+          1);
+  };
+
+  SECTION("semi delim join from a correlated EXISTS")
+  {
+    require_delim_root_declined(
+      "SELECT c_id, count(t.o_id) FROM cust LEFT JOIN ("
+      "  SELECT o_id, o_cust FROM ord o"
+      "  WHERE EXISTS (SELECT 1 FROM ord o2 WHERE o2.o_cust = o.o_cust AND o2.o_id > o.o_id)"
+      ") t ON c_id = t.o_cust GROUP BY c_id");
+  }
+
+  SECTION("single delim join from a correlated scalar subquery")
+  {
+    require_delim_root_declined(
+      "SELECT c_id, count(t.a) FROM cust LEFT JOIN ("
+      "  SELECT o_cust, (SELECT sum(o2.o_id - o.o_id) FROM ord o2 WHERE o2.o_cust = o.o_cust) AS a"
+      "  FROM ord o"
+      ") t ON c_id = t.o_cust GROUP BY c_id");
+  }
+}
+
+TEST_CASE_METHOD(dense_count_join_fixture,
+                 "dense_count_join declines a delim join at any depth of an input",
+                 "[dense_count_join][plan]")
+{
+  using T = sirius::op::SiriusPhysicalOperatorType;
+
+  // A correlated EXISTS compared as a value keeps a MARK delim join below the input's root. These
+  // plans contain hash joins, so the fused operator's absence is checked directly.
+  auto const require_declined = [&](std::string const& query) {
+    auto plan = generate_sirius_plan(*con, query);
+    REQUIRE(plan);
+    CHECK(collect(plan.get(), T::DENSE_COUNT_JOIN).empty());
+    CHECK(collect(plan.get(), T::LEFT_DELIM_JOIN).size() +
+            collect(plan.get(), T::RIGHT_DELIM_JOIN).size() ==
+          1);
+  };
+
+  SECTION("below a FILTER root")
+  {
+    require_declined(
+      "SELECT c.c_id, count(o_id) FROM ord RIGHT JOIN ("
+      "  SELECT c_id FROM cust c1 WHERE (EXISTS (SELECT 1 FROM cust c2"
+      "    WHERE c2.c_grp = c1.c_grp AND c2.c_id > c1.c_id)) = (c_id % 2 = 0)"
+      ") c ON o_cust = c.c_id GROUP BY c.c_id");
+  }
+
+  SECTION("below a FILTER root, counting every joined row")
+  {
+    require_declined(
+      "SELECT c.c_id, count(*) FROM ord RIGHT JOIN ("
+      "  SELECT c_id FROM cust c1 WHERE (EXISTS (SELECT 1 FROM cust c2"
+      "    WHERE c2.c_grp = c1.c_grp AND c2.c_id > c1.c_id)) = (c_id % 2 = 0)"
+      ") c ON o_cust = c.c_id GROUP BY c.c_id");
+  }
+
+  SECTION("below a FILTER root, equality-only correlation")
+  {
+    require_declined(
+      "SELECT c.c_id, count(o_id) FROM ord RIGHT JOIN ("
+      "  SELECT c_id FROM cust c1 WHERE (EXISTS (SELECT 1 FROM cust c2"
+      "    WHERE c2.c_grp = c1.c_grp AND c2.c_id = c1.c_id + 1)) = (c_id % 2 = 0)"
+      ") c ON o_cust = c.c_id GROUP BY c.c_id");
+  }
+
+  SECTION("below a non-identity PROJECTION")
+  {
+    require_declined(
+      "SELECT c.k, count(o_id) FROM ord RIGHT JOIN ("
+      "  SELECT c_id + 0 AS k FROM cust c1 WHERE (EXISTS (SELECT 1 FROM cust c2"
+      "    WHERE c2.c_grp = c1.c_grp AND c2.c_id > c1.c_id)) = (c_id % 2 = 0)"
+      ") c ON o_cust = c.k GROUP BY c.k");
+  }
+
+  SECTION("below a GROUP BY")
+  {
+    require_declined(
+      "SELECT c.c_id, count(o_id) FROM ord RIGHT JOIN ("
+      "  SELECT c_id FROM cust c1 WHERE (EXISTS (SELECT 1 FROM cust c2"
+      "    WHERE c2.c_grp = c1.c_grp AND c2.c_id > c1.c_id)) = (c_id % 2 = 0)"
+      "  GROUP BY c_id"
+      ") c ON o_cust = c.c_id GROUP BY c.c_id");
+  }
 }
 
 TEST_CASE("dense_count_join recognizes host COUNT callbacks through a dynamically loaded extension",

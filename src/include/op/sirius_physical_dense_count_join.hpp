@@ -24,34 +24,54 @@
 
 namespace sirius::op {
 
+/**
+ * @brief Carries dense-count input batches split by normalized join side
+ *
+ * `pipelineable_operator_data` owns one flattened batch sequence. This subclass appends all
+ * preserved-side batches followed by all counted-side batches, so the two side counts describe
+ * every position: batch `i` belongs to the preserved input exactly when `i < preserved_count()`.
+ */
 class dense_count_join_input : public pipelineable_operator_data {
  public:
-  enum class input_side : uint8_t { PRESERVED, COUNTED };
-
+  /**
+   * @brief Combine the two normalized inputs into one batch container
+   *
+   * Either side may be empty. Every supplied batch pointer must be non-null.
+   *
+   * @param preserved_batches Batches from the outer-join-preserved input
+   * @param counted_batches Batches from the input whose matches contribute to COUNT
+   */
   dense_count_join_input(std::vector<std::shared_ptr<::cucascade::data_batch>> preserved_batches,
                          std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches);
 
-  [[nodiscard]] std::vector<input_side> const& input_sides() const noexcept { return _input_sides; }
+  /** @brief Number of leading batches that belong to the preserved input. */
+  [[nodiscard]] std::size_t preserved_count() const noexcept { return _preserved_count; }
+
+  /** @brief Number of trailing batches that belong to the counted input. */
+  [[nodiscard]] std::size_t counted_count() const noexcept { return _counted_count; }
 
  private:
-  struct tagged_batches {
-    std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
-    std::vector<input_side> sides;
-  };
-
-  explicit dense_count_join_input(tagged_batches input);
-  [[nodiscard]] static tagged_batches tag_batches(
-    std::vector<std::shared_ptr<::cucascade::data_batch>> preserved_batches,
-    std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches);
-
-  std::vector<input_side> _input_sides;
+  std::size_t _preserved_count;
+  std::size_t _counted_count;
 };
 
 /**
- * @brief Fuse an eligible preserved-side outer equi-join and grouped COUNT
+ * @brief Execute a grouped COUNT over an outer equi-join without materializing joined rows
  *
- * Children are [preserved, counted] and output is [key, BIGINT]. Runtime selects direct-address or
- * exact sparse aggregation while preserving outer-join NULL semantics.
+ * The planner normalizes LEFT and RIGHT joins so `children[0]` is the preserved, grouped input and
+ * `children[1]` is the counted input. For each non-NULL key, let `P` be its preserved-side
+ * multiplicity, `M` its counted-side match count, and `V` the number of matches whose COUNT
+ * argument is non-NULL. The emitted values are:
+ *
+ * - `COUNT(*) = P * max(M, 1)`
+ * - `COUNT(col) = P * V`
+ *
+ * Counted-side NULL keys never match. Preserved-side NULL keys form one group whose result is the
+ * number of preserved NULL-key rows for COUNT(*) and zero for COUNT(col).
+ *
+ * Both inputs use FULL barriers and are drained into one task. Runtime uses direct-address
+ * histograms when the observed key domain satisfies its layout, density, and memory gates;
+ * otherwise it uses exact sparse aggregation. Both paths emit `[key, BIGINT count]`.
  */
 class sirius_physical_dense_count_join : public sirius_physical_operator {
  public:
@@ -60,7 +80,18 @@ class sirius_physical_dense_count_join : public sirius_physical_operator {
   static constexpr std::string_view PRESERVED_PORT = "preserved";
   static constexpr std::string_view COUNTED_PORT   = "counted";
 
-  /// @p counted_value_idx selects COUNT(col) validity; std::nullopt means COUNT(*).
+  /**
+   * @brief Configure the normalized join inputs and runtime histogram budget
+   *
+   * @param types Output schema `[group key, BIGINT count]`
+   * @param estimated_cardinality Estimated number of output groups
+   * @param preserved_key_idx Join-key column within the preserved child's output
+   * @param counted_key_idx Join-key column within the counted child's output
+   * @param counted_value_idx COUNT(col) argument within the counted child's output, or
+   *        `std::nullopt` for COUNT(*)
+   * @param max_bins_bytes Maximum combined direct-address histogram allocation; the runtime density
+   *        and input-size gates may still select sparse aggregation below this limit
+   */
   sirius_physical_dense_count_join(duckdb::vector<sirius::logical_type> types,
                                    std::size_t estimated_cardinality,
                                    std::size_t preserved_key_idx,
@@ -69,24 +100,83 @@ class sirius_physical_dense_count_join : public sirius_physical_operator {
                                    uint64_t max_bins_bytes);
 
   std::string params_to_string() const override;
+
+  /**
+   * @brief Map a direct child to its normalized preserved or counted input port
+   *
+   * @throw sirius::internal_exception If @p producer is not one of this operator's children
+   *
+   * @param producer Direct child whose destination port is requested
+   * @return `PRESERVED_PORT` for child zero or `COUNTED_PORT` for child one
+   */
   [[nodiscard]] std::string_view input_port_for(
     sirius_physical_operator const& producer) const override;
+
+  /**
+   * @brief Require the producer to finish before its batches are consumed
+   *
+   * @param producer Direct preserved or counted child
+   * @return `MemoryBarrierType::FULL`
+   */
   [[nodiscard]] MemoryBarrierType input_barrier_for(
     sirius_physical_operator const& producer) const override;
 
-  std::unique_ptr<operator_data> execute(const operator_data& input_data,
+  /**
+   * @brief Aggregate all input batches into one `[key, BIGINT count]` batch
+   *
+   * Selects the dense or sparse strategy from the materialized inputs and records it in
+   * `last_strategy()`.
+   *
+   * @param input_data A prepared `dense_count_join_input`
+   * @param stream CUDA stream used for aggregation and output materialization
+   * @return Pipelineable data containing one output batch
+   */
+  std::unique_ptr<operator_data> execute(operator_data const& input_data,
                                          rmm::cuda_stream_view stream) override;
 
   bool is_source() const override { return true; }
   bool is_sink() const override { return true; }
 
+  /**
+   * @brief Build one FULL-barrier producer pipeline per input
+   *
+   * This operator is a sink parent: each direct child reports `is_sink()` and terminates its own
+   * pipeline through the generic per-operator protocol, so any subtree that plans to a
+   * repository-fed root (scans, streaming chains, joins, aggregates, sorts) can feed either input.
+   * The counted input is built first.
+   *
+   * @param current Pipeline that consumes the fused result
+   * @param meta_pipeline Meta-pipeline that hosts this operator's pipeline and both producers
+   */
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
+  /**
+   * @brief Wait for both producers to finish before scheduling the fused task
+   *
+   * Unlike the base implementation, this permits either input port to be empty so an empty counted
+   * side can still produce the preserved groups.
+   *
+   * @return A wait hint while a producer is active, a ready hint when queued input can be drained,
+   *         or `std::nullopt` when no task remains
+   */
   std::optional<task_creation_hint> get_next_task_hint() override;
 
+  /**
+   * @brief Drain both input repositories into one preserved-then-counted task input
+   *
+   * @return All queued batches as `dense_count_join_input`, or `nullptr` when both ports are empty
+   */
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
+  /**
+   * @brief Estimate a conservative first-run peak across all execution strategies
+   *
+   * Arithmetic saturates rather than wrapping when the input bounds are too large to represent.
+   *
+   * @param stats Number and total logical size of the input batches
+   * @return Maximum estimated peak for extrema reduction, dense histograms, and sparse aggregation
+   */
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const input_stats& stats) const override;
 
@@ -98,7 +188,14 @@ class sirius_physical_dense_count_join : public sirius_physical_operator {
   }
   [[nodiscard]] uint64_t max_bins_bytes() const noexcept { return _max_bins_bytes; }
 
-  enum class strategy : uint8_t { NOT_RUN, DENSE, SPARSE };
+  /** @brief Runtime implementation most recently selected by `execute()`. */
+  enum class strategy : uint8_t {
+    NOT_RUN,  ///< No strategy has yet been selected
+    DENSE,    ///< Direct-address path or the no-non-NULL-key shortcut
+    SPARSE    ///< Exact groupby-and-join path
+  };
+
+  /** @brief Return the strategy most recently selected by `execute()`. */
   [[nodiscard]] strategy last_strategy() const noexcept { return _last_strategy; }
 
  private:

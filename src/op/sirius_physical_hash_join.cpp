@@ -579,8 +579,8 @@ void sirius_physical_hash_join::build_join_pipelines(pipeline::sirius_pipeline& 
 void sirius_physical_hash_join::build_pipelines(pipeline::sirius_pipeline& current,
                                                 pipeline::sirius_meta_pipeline& meta_pipeline)
 {
-  // is_sink() is true iff the tree parent is a PARTITION (nested-join case); otherwise HJ
-  // contributes to the downstream chain's pipeline as its source.
+  // is_sink() is true iff the tree parent is a sink parent (PARTITION or DENSE_COUNT_JOIN);
+  // otherwise HJ contributes to the downstream chain's pipeline as its source.
   pipeline::sirius_meta_pipeline* host_meta;
   pipeline::sirius_pipeline* host_current;
   if (is_sink()) {

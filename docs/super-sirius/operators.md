@@ -27,7 +27,7 @@ An operator's position in a pipeline is determined by `sirius_engine::initialize
 | `execute(input_data, stream)` | Called on **every** operator during `compute_task()` |
 | `sink(output_data, stream)` | Called on the **last** operator after `compute_task()` to push results downstream |
 | `is_source()` | Whether this operator can produce data (has scan state or owns accumulated data) |
-| `is_sink()` | Whether this operator has a `sink()` implementation for pushing data to downstream ports |
+| `is_sink()` | Whether this operator has a `sink()` implementation for pushing data to downstream ports — true for unconditional sinks, or when the tree parent is a sink parent (PARTITION, RIGHT_DELIM_JOIN, DENSE_COUNT_JOIN) |
 | `get_next_task_hint()` | Checks port readiness, returns `READY` or `WAITING_FOR_INPUT_DATA` |
 | `get_next_task_input_data()` | Pops one data batch from each input port |
 | `can_create_more_tasks()` / `has_processed_all_tasks()` | Signals task exhaustion |
@@ -354,6 +354,14 @@ partitioned join and aggregate fragment. Children are normalized as [preserved, 
 
 Both inputs are FULL barriers. Execution uses direct-address histograms or exact sparse aggregation;
 ineligible and disabled plans retain the standard path. See [Configuration](configuration.md).
+
+DENSE_COUNT_JOIN is a sink parent: each direct child reports `is_sink()` and terminates its own
+pipeline through the generic `build_pipelines()` protocol, so scans, streaming chains, joins,
+aggregates and sorts can feed either input; the counted producer is built first. Delim-join,
+materialized-CTE and delim/CTE scan roots are declined at plan time because their output does not
+arrive through a child-owned pipeline, and a delim join is declined at any depth of an input
+because the operator's task hint can poll a MARK hash join inside the delim subtree before its
+sizing partitions have run.
 
 ## Pipeline Breakers (Sirius-Specific)
 
