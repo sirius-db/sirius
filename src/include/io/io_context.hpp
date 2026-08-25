@@ -210,24 +210,24 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
     std::span<const cudf::io::text::byte_range_info> ranges,
     std::optional<size_t> alignment = std::nullopt) const noexcept = 0;
 
-  virtual size_t host_read_io(const sirius_io_object& obj,
+  virtual size_t host_read_io(const io_object& obj,
                               size_t offset,
                               size_t size,
                               uint8_t* dst) = 0;
 
-  virtual exec::semi_future<size_t> host_read_async_io(const sirius_io_object& obj,
+  virtual exec::semi_future<size_t> host_read_async_io(const io_object& obj,
                                                        size_t offset,
                                                        size_t size,
                                                        uint8_t* dst) noexcept = 0;
 
-  virtual exec::semi_future<size_t> device_read_async_io(const sirius_io_object& obj,
+  virtual exec::semi_future<size_t> device_read_async_io(const io_object& obj,
                                                          size_t offset,
                                                          size_t size,
                                                          uint8_t* dst,
                                                          rmm::cuda_stream_view stream) noexcept = 0;
 
   virtual exec::semi_future<size_t> host_to_device_read_async_io(
-    const sirius_io_object& obj,
+    const io_object& obj,
     std::span<io_object_segment> slices,
     size_t offset,
     size_t size,
@@ -235,7 +235,7 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
     rmm::cuda_stream_view stream) noexcept = 0;
 
   virtual exec::semi_future<size_t> host_read_ranges_async_io(
-    const sirius_io_object& obj, std::span<io_object_segment> segments) noexcept = 0;
+    const io_object& obj, std::span<io_object_segment> segments) noexcept = 0;
 
   bool can_use_prefetching_cache() const noexcept
   {
@@ -247,21 +247,21 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// return a populated io_object.  Invoked by @c open_datasource; not part of
   /// the public surface (callers receive a ready @c sirius_datasource).  Throws
   /// on unsupported / unreachable paths.
-  virtual std::shared_ptr<sirius_io_object> create_io_object(std::string path) = 0;
+  virtual std::shared_ptr<io_object> create_io_object(std::string path) = 0;
 
   /// Hinted variant.  The base implementation ignores @p hint and delegates to
   /// the required @c create_io_object(path); a backend that can act on the hint
   /// (e.g. rest_ioctx's suffix-range footer probe) overrides this.  Kept a
   /// distinct virtual — not a defaulted argument on the pure virtual above — so
   /// the hint dispatches on the dynamic type instead of binding statically.
-  virtual std::shared_ptr<sirius_io_object> create_io_object(std::string path, open_hint hint);
+  virtual std::shared_ptr<io_object> create_io_object(std::string path, open_hint hint);
 
   /// Known-size variant.  The base implementation ignores @p known_size and
   /// delegates to the required @c create_io_object(path); a backend whose size
   /// discovery would otherwise cost a round-trip overrides this to build the
   /// io_object without one.  Same distinct-virtual rationale as the hint
   /// variant above.
-  virtual std::shared_ptr<sirius_io_object> create_io_object(std::string path,
+  virtual std::shared_ptr<io_object> create_io_object(std::string path,
                                                              std::uint64_t known_size);
 
   /// Owned by this ioctx.  Built by @ref initialize_cache, destroyed

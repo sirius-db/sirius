@@ -2663,10 +2663,10 @@ TEST_CASE("S3 direct and glob routes share the literal object cache identity",
   REQUIRE(glob_datasource != nullptr);
 
   CHECK(glob_files.front().path == direct_uri);
-  CHECK(glob_datasource->io_object().object_path() == direct_datasource->io_object().object_path());
-  CHECK(glob_datasource->io_object().raw_file_cache_id() ==
-        direct_datasource->io_object().raw_file_cache_id());
-  CHECK(glob_datasource->io_object().size() == direct_datasource->io_object().size());
+  CHECK(glob_datasource->get_io_object().object_path() == direct_datasource->get_io_object().object_path());
+  CHECK(glob_datasource->get_io_object().raw_file_cache_id() ==
+        direct_datasource->get_io_object().raw_file_cache_id());
+  CHECK(glob_datasource->get_io_object().size() == direct_datasource->get_io_object().size());
 }
 
 TEST_CASE("transparent S3 non-glob reads distinguish literal percent keys from spaces",

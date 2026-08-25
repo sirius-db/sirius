@@ -78,13 +78,13 @@ struct head_object_result {
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Concrete @c sirius_io_object backed by a RESTful object-store key.
+ * @brief Concrete @c io_object backed by a RESTful object-store key.
  *
  * Passive bag of identity: the original URL/path (also the cache id), the
  * bucket + key the reactor authorizes against, and the object size discovered
  * by a one-time HEAD at construction.  Does no I/O of its own.
  */
-class rest_io_object : public sirius_io_object {
+class rest_io_object : public io_object {
  public:
   rest_io_object(
     std::string path, std::string bucket, std::string key, size_t size, std::string etag = {})
@@ -119,7 +119,7 @@ class rest_io_object : public sirius_io_object {
   [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _path; }
   [[nodiscard]] const std::string& object_path() const noexcept override { return _path; }
   [[nodiscard]] size_t size() const noexcept override { return _file_size; }
-  [[nodiscard]] std::string_view validation_etag() const noexcept override { return _etag; }
+  [[nodiscard]] std::string_view validation_tag() const noexcept override { return _etag; }
 
   [[nodiscard]] const std::string& bucket() const noexcept { return _bucket; }
   [[nodiscard]] const std::string& key() const noexcept { return _key; }

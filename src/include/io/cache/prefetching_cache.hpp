@@ -54,7 +54,7 @@ namespace sirius::io::cache {
 enum class prefetching_handle_state { idle, active, cancelled };
 
 struct prefetch_request_context {
-  explicit prefetch_request_context(const sirius_io_object& file, std::uint32_t ts) noexcept
+  explicit prefetch_request_context(const io_object& file, std::uint32_t ts) noexcept
     : timestamp(ts),
       obj(file.shared_from_this()),
       state(std::make_shared<entry_state>()),
@@ -76,7 +76,7 @@ struct prefetch_request_context {
   }
 
   const std::uint32_t timestamp;
-  const std::shared_ptr<const sirius_io_object> obj;
+  const std::shared_ptr<const io_object> obj;
   std::shared_ptr<entry_state> state;
   std::shared_ptr<std::atomic<prefetching_handle_state>> user_state;
   std::vector<cached_chunk*> chunks;
@@ -150,21 +150,21 @@ class prefetching_cache {
 
   [[nodiscard]] bool is_armed() const noexcept { return _armed; }
 
-  [[nodiscard]] std::size_t host_read(const sirius_io_object& obj,
+  [[nodiscard]] std::size_t host_read(const io_object& obj,
                                       size_t offset,
                                       size_t size,
                                       uint8_t* dst,
                                       prefetching_handle* out_handle = nullptr);
 
   [[nodiscard]] exec::semi_future<std::size_t> host_read_async(
-    const sirius_io_object& obj,
+    const io_object& obj,
     size_t offset,
     size_t size,
     uint8_t* dst,
     prefetching_handle* out_handle = nullptr);
 
   [[nodiscard]] exec::semi_future<std::size_t> device_read_async(
-    const sirius_io_object& obj,
+    const io_object& obj,
     size_t offset,
     size_t size,
     uint8_t* device_ptr,
@@ -181,11 +181,11 @@ class prefetching_cache {
   }
 
  private:
-  [[nodiscard]] prefetching_handle insert(const sirius_io_object& obj,
+  [[nodiscard]] prefetching_handle insert(const io_object& obj,
                                           std::span<const byte_range> ranges,
                                           std::optional<int> gpu_id = {});
 
-  [[nodiscard]] bool host_read_from_cache_only(const sirius_io_object& obj,
+  [[nodiscard]] bool host_read_from_cache_only(const io_object& obj,
                                                size_t offset,
                                                size_t size,
                                                uint8_t* dst,
@@ -200,7 +200,7 @@ class prefetching_cache {
                                             std::size_t chunk_size) const;
 
     mutable std::shared_mutex mtx;
-    std::shared_ptr<const sirius_io_object> io_obj;
+    std::shared_ptr<const io_object> io_obj;
     std::vector<std::unique_ptr<cached_chunk>> chunks;
     size_t file_size{0};
   };
@@ -209,7 +209,7 @@ class prefetching_cache {
   void prefetch_loop(const std::stop_token& st);
   void evict_loop(const std::stop_token& st);
 
-  file_entry& get_or_create_file_entry(const sirius_io_object& obj);
+  file_entry& get_or_create_file_entry(const io_object& obj);
 
   const config _cfg;
   std::unique_ptr<buffer_pool> _pool;

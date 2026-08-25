@@ -35,7 +35,7 @@ namespace sirius::io {
 // ---------------------------------------------------------------------------
 
 /**
- * @brief @c sirius_io_object that holds a cudf::io::datasource (kvikio-backed
+ * @brief @c io_object that holds a cudf::io::datasource (kvikio-backed
  *        on the default cudf build).
  *
  * Owns the datasource for the file's lifetime; @c kvikio_context's read
@@ -43,7 +43,7 @@ namespace sirius::io {
  * translate cudf's future-returning API into the push/callback shape that
  * the base class's protected @c _io primitives expect.
  */
-class kvikio_io_object final : public sirius_io_object {
+class kvikio_io_object final : public io_object {
  public:
   kvikio_io_object(std::string path, std::shared_ptr<cudf::io::datasource> ds, size_t file_size)
     : _path(std::move(path)), _datasource(std::move(ds)), _file_size(file_size)
@@ -123,21 +123,21 @@ class kvikio_context final : public ioctx {
   // instantiable; any future caller that bypasses the public API will see
   // a clear failure rather than silent misbehaviour.
 
-  size_t host_read_io(const sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst) final;
+  size_t host_read_io(const io_object& obj, size_t offset, size_t size, uint8_t* dst) final;
 
-  exec::semi_future<size_t> host_read_async_io(const sirius_io_object& obj,
+  exec::semi_future<size_t> host_read_async_io(const io_object& obj,
                                                size_t offset,
                                                size_t size,
                                                uint8_t* dst) noexcept final;
 
-  exec::semi_future<size_t> device_read_async_io(const sirius_io_object& obj,
+  exec::semi_future<size_t> device_read_async_io(const io_object& obj,
                                                  size_t offset,
                                                  size_t size,
                                                  uint8_t* dst,
                                                  rmm::cuda_stream_view stream) noexcept final;
 
   exec::semi_future<size_t> host_to_device_read_async_io(
-    const sirius_io_object& obj,
+    const io_object& obj,
     std::span<io_object_segment> slices,
     size_t offset,
     size_t size,
@@ -145,11 +145,11 @@ class kvikio_context final : public ioctx {
     rmm::cuda_stream_view stream) noexcept final;
 
   exec::semi_future<size_t> host_read_ranges_async_io(
-    const sirius_io_object& obj, std::span<io_object_segment> segments) noexcept final;
+    const io_object& obj, std::span<io_object_segment> segments) noexcept final;
 
  protected:
   /// Backend hook invoked by @c ioctx::open_datasource.
-  std::shared_ptr<sirius_io_object> create_io_object(std::string path) override;
+  std::shared_ptr<io_object> create_io_object(std::string path) override;
 };
 
 }  // namespace sirius::io

@@ -73,14 +73,14 @@ struct bounce_slot {
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Concrete @c sirius_io_object backed by a filesystem path.
+ * @brief Concrete @c io_object backed by a filesystem path.
  *
  * Passive bag of native handles.  The buffered @c O_RDONLY fd
  * (for @c pread / host_read) and the @c O_DIRECT fd (for reactor-driven
  * device reads) are produced by @c uring_reactor::create_io_object — this
  * class does no I/O of its own.
  */
-class local_io_object : public sirius_io_object {
+class local_io_object : public io_object {
  public:
   local_io_object(std::string path,
                   file_descriptor fd,

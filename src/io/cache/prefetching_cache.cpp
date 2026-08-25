@@ -303,7 +303,7 @@ prefetching_cache::~prefetching_cache()
 // ===========================================================================
 
 prefetching_cache::file_entry& prefetching_cache::get_or_create_file_entry(
-  const sirius_io_object& obj)
+  const io_object& obj)
 {
   const auto& key = obj.raw_file_cache_id();
   std::shared_lock lk(_map_mtx);
@@ -322,7 +322,7 @@ prefetching_cache::file_entry& prefetching_cache::get_or_create_file_entry(
   return *it->second;
 }
 
-prefetching_handle prefetching_cache::insert(const sirius_io_object& obj,
+prefetching_handle prefetching_cache::insert(const io_object& obj,
                                              std::span<const byte_range> ranges,
                                              std::optional<int> gpu_id)
 {
@@ -367,7 +367,7 @@ prefetching_handle prefetching_cache::insert(const sirius_io_object& obj,
   return handle;
 }
 
-bool prefetching_cache::host_read_from_cache_only(const sirius_io_object& obj,
+bool prefetching_cache::host_read_from_cache_only(const io_object& obj,
                                                   size_t offset,
                                                   size_t size,
                                                   uint8_t* dst,
@@ -418,7 +418,7 @@ bool prefetching_cache::host_read_from_cache_only(const sirius_io_object& obj,
   return false;
 }
 
-exec::semi_future<std::size_t> prefetching_cache::host_read_async(const sirius_io_object& obj,
+exec::semi_future<std::size_t> prefetching_cache::host_read_async(const io_object& obj,
                                                                   size_t offset,
                                                                   size_t size,
                                                                   uint8_t* dst,
@@ -431,7 +431,7 @@ exec::semi_future<std::size_t> prefetching_cache::host_read_async(const sirius_i
   return _io_ctx->host_read_async_io(obj, offset, size, dst);
 }
 
-std::size_t prefetching_cache::host_read(const sirius_io_object& obj,
+std::size_t prefetching_cache::host_read(const io_object& obj,
                                          size_t offset,
                                          size_t size,
                                          uint8_t* dst,
@@ -444,7 +444,7 @@ std::size_t prefetching_cache::host_read(const sirius_io_object& obj,
   return _io_ctx->host_read_io(obj, offset, size, dst);
 }
 
-exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius_io_object& obj,
+exec::semi_future<std::size_t> prefetching_cache::device_read_async(const io_object& obj,
                                                                     size_t offset,
                                                                     size_t size,
                                                                     uint8_t* dst,

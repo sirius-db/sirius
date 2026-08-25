@@ -94,17 +94,17 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// Backend hook invoked by @c ioctx::open_datasource: parse @p path
   /// (s3://bucket/key), HEAD it for the size, and build a @c rest_io_object.
   /// Throws on a non-s3 scheme or a failed HEAD.
-  std::shared_ptr<sirius_io_object> create_io_object(std::string path) override;
+  std::shared_ptr<io_object> create_io_object(std::string path) override;
 
   /// @c open_hint::parquet_footer_probe resolves the size and stashes the
   /// parquet footer together via a single suffix-range GET, carried on the
   /// returned io_object; every other hint falls back to the plain HEAD path above.
-  std::shared_ptr<sirius_io_object> create_io_object(std::string path, open_hint hint) override;
+  std::shared_ptr<io_object> create_io_object(std::string path, open_hint hint) override;
 
   /// Known-size open: the caller already learned the object's size (e.g. from a
   /// ListObjectsV2 response), so the io_object is built with ZERO network — no
   /// HEAD, no probe.
-  std::shared_ptr<sirius_io_object> create_io_object(std::string path,
+  std::shared_ptr<io_object> create_io_object(std::string path,
                                                      std::uint64_t known_size) override;
 
  private:
@@ -113,7 +113,7 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// footer reads are served locally by @c rest_reactor::host_read.  Falls back
   /// to a HEAD when the suffix response is unusable.  The stash lives only as
   /// long as the returned io_object — a per-open transport shortcut, not a cache.
-  std::shared_ptr<sirius_io_object> create_footer_probe_object(std::string path);
+  std::shared_ptr<io_object> create_footer_probe_object(std::string path);
 };
 
 }  // namespace sirius::io::rest

@@ -50,22 +50,22 @@ class metadata_store {
   /// @p metadata is silently ignored — symmetric with the older
   /// @c prefetching_cache::register_metadata contract so callers that
   /// pass through pre-parsed metadata don't have to null-check.
-  void register_metadata(sirius_io_object const& obj,
-                         std::shared_ptr<sirius_io_object_metadata> metadata);
+  void register_metadata(io_object const& obj,
+                         std::shared_ptr<io_object_metadata> metadata);
 
   /// Look up the metadata for @p obj's cache key.  Returns nullptr on
   /// miss.
-  [[nodiscard]] std::shared_ptr<sirius_io_object_metadata> get_metadata(
-    sirius_io_object const& obj) const;
+  [[nodiscard]] std::shared_ptr<io_object_metadata> get_metadata(
+    io_object const& obj) const;
 
   /// As above but keyed directly by @c raw_file_cache_id() — for callers that
   /// know the path but have not built an io_object yet.  Returns nullptr on miss.
-  [[nodiscard]] std::shared_ptr<sirius_io_object_metadata> get_metadata(
+  [[nodiscard]] std::shared_ptr<io_object_metadata> get_metadata(
     std::string const& cache_key) const;
 
  private:
   mutable std::shared_mutex _mtx;
-  std::unordered_map<std::string, std::shared_ptr<sirius_io_object_metadata>> _by_key;
+  std::unordered_map<std::string, std::shared_ptr<io_object_metadata>> _by_key;
 };
 
 }  // namespace sirius::io::cache

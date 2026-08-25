@@ -85,13 +85,13 @@ std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path,
                                              create_io_object(std::move(path), known_size));
 }
 
-std::shared_ptr<sirius_io_object> ioctx::create_io_object(std::string path,
+std::shared_ptr<io_object> ioctx::create_io_object(std::string path,
                                                                  open_hint /*hint*/)
 {
   return create_io_object(std::move(path));
 }
 
-std::shared_ptr<sirius_io_object> ioctx::create_io_object(std::string path,
+std::shared_ptr<io_object> ioctx::create_io_object(std::string path,
                                                                  std::uint64_t /*known_size*/)
 {
   return create_io_object(std::move(path));

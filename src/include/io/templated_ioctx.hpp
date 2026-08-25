@@ -312,7 +312,7 @@ class templated_ioctx : public ioctx {
 
   // -- Host reads (generic: delegate to io_object_type + std::async) --------
 
-  size_t host_read_io(const sirius_io_object& obj,
+  size_t host_read_io(const io_object& obj,
                       size_t offset,
                       size_t size,
                       uint8_t* dst) override
@@ -323,7 +323,7 @@ class templated_ioctx : public ioctx {
     return next_reactor(tobj, 1, io_op_type::host).at(0)->host_read(tobj, offset, size, dst);
   }
 
-  exec::semi_future<size_t> host_read_async_io(const sirius_io_object& obj,
+  exec::semi_future<size_t> host_read_async_io(const io_object& obj,
                                                size_t offset,
                                                size_t size,
                                                uint8_t* dst) noexcept override
@@ -354,7 +354,7 @@ class templated_ioctx : public ioctx {
 
   // -- Device reads (generic chunking; reactor-backed) ----------------------
 
-  exec::semi_future<size_t> device_read_async_io(const sirius_io_object& obj,
+  exec::semi_future<size_t> device_read_async_io(const io_object& obj,
                                                  size_t offset,
                                                  size_t size,
                                                  uint8_t* dst,
@@ -389,7 +389,7 @@ class templated_ioctx : public ioctx {
   }
 
   exec::semi_future<size_t> host_to_device_read_async_io(
-    const sirius_io_object& obj,
+    const io_object& obj,
     std::span<io_object_segment> slices,
     size_t offset,
     size_t size,
@@ -426,7 +426,7 @@ class templated_ioctx : public ioctx {
   // -- Batch host reads (generic: dispatch to reactor host_read_async) ------
 
   exec::semi_future<size_t> host_read_ranges_async_io(
-    const sirius_io_object& obj, std::span<io_object_segment> segments) noexcept override
+    const io_object& obj, std::span<io_object_segment> segments) noexcept override
   {
     if constexpr (reactor_traits_t::supports_vector_host_read) {
       try {
@@ -457,9 +457,9 @@ class templated_ioctx : public ioctx {
   }
 
  protected:
-  std::shared_ptr<sirius_io_object> create_io_object(std::string path) override
+  std::shared_ptr<io_object> create_io_object(std::string path) override
   {
-    return std::shared_ptr<sirius_io_object>(Reactor::create_io_object(std::move(path)));
+    return std::shared_ptr<io_object>(Reactor::create_io_object(std::move(path)));
   }
 
   reactor_config_type _config{};
@@ -468,7 +468,7 @@ class templated_ioctx : public ioctx {
   bool _started{false};
 
  private:
-  static const io_object_type& as_typed(const sirius_io_object& obj) noexcept
+  static const io_object_type& as_typed(const io_object& obj) noexcept
   {
     return static_cast<const io_object_type&>(obj);
   }
