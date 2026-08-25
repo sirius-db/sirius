@@ -60,7 +60,7 @@ std::future<size_t> bridge_semi_to_std(exec::semi_future<size_t>&& sf)
 
 }  // namespace
 
-sirius_datasource::sirius_datasource(std::shared_ptr<sirius_ioctx> io_ctx,
+sirius_datasource::sirius_datasource(std::shared_ptr<ioctx> io_ctx,
                                      std::shared_ptr<sirius_io_object> io_object)
   : _io_ctx(std::move(io_ctx)), _io_object(std::move(io_object))
 {

@@ -183,13 +183,13 @@ struct reactor_traits {
 // ---------------------------------------------------------------------------
 //
 // Generic ioctx implementation parameterised on a backend Reactor.  Owns a
-// pool of reactors, the cache (via sirius_ioctx base), and implements all of
-// the sirius_ioctx read API using only the operations named by io_reactor_c
+// pool of reactors, the cache (via ioctx base), and implements all of
+// the ioctx read API using only the operations named by io_reactor_c
 // and io_object_c.  Backends plug in by providing a Reactor + io_object type
 // pair that satisfies those concepts.
 
 template <io_reactor_c Reactor>
-class templated_ioctx : public sirius_ioctx {
+class templated_ioctx : public ioctx {
  public:
   using reactor_type        = Reactor;
   using io_object_type      = typename Reactor::io_object_type;
@@ -227,7 +227,7 @@ class templated_ioctx : public sirius_ioctx {
   {
     // pre_destroy() drains the cache (if any) so its workers stop
     // issuing IO BEFORE we tear down the reactors below.  Must be the
-    // first statement in every derived dtor — see sirius_ioctx for
+    // first statement in every derived dtor — see ioctx for
     // the full contract.
     this->pre_destroy();
     shutdown();

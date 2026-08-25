@@ -278,7 +278,7 @@ class rest_reactor {
   /// Allocate the pinned bounce slots and launch the worker thread.  Split out
   /// of the constructor so a reactor can be built cheaply (it only copies its
   /// config and creates its wakeup fd) and parked until it is actually needed —
-  /// see @c sirius_ioctx::start.  Idempotent: a second call (while the worker is
+  /// see @c ioctx::start.  Idempotent: a second call (while the worker is
   /// already running) is a no-op.
   void start();
 

@@ -29,7 +29,7 @@ namespace sirius::io::cache {
  * @brief Thread-safe per-file metadata cache, keyed by an io_object's
  *        raw_file_cache_id().
  *
- * Owned by @c sirius_ioctx and always present, independent of the
+ * Owned by @c ioctx and always present, independent of the
  * @c prefetching_cache.  Callers that have parsed file metadata (e.g.
  * a parquet footer) park it here so a later scan of the same path can
  * skip the parse — without depending on whether the prefetching cache

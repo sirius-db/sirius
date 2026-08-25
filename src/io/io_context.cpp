@@ -29,10 +29,10 @@
 
 namespace sirius::io {
 
-sirius_ioctx::sirius_ioctx()  = default;
-sirius_ioctx::~sirius_ioctx() = default;
+ioctx::ioctx()  = default;
+ioctx::~ioctx() = default;
 
-void sirius_ioctx::initialize_cache(
+void ioctx::initialize_cache(
   cucascade::memory::memory_reservation_manager& reservation_manager,
   io::cache::config const& cache_config,
   std::shared_ptr<const sirius::memory::topology_index> topology_index) noexcept
@@ -41,12 +41,12 @@ void sirius_ioctx::initialize_cache(
   // robust to multiple wiring sites.
   if (_cache) {
     SIRIUS_LOG_WARN(
-      "sirius_ioctx::initialize_cache() called but prefetching_cache already present");
+      "ioctx::initialize_cache() called but prefetching_cache already present");
     return;
   }
   if (!can_use_prefetching_cache()) {
     SIRIUS_LOG_WARN(
-      "sirius_ioctx::initialize_cache() called but backend does not support vector host read");
+      "ioctx::initialize_cache() called but backend does not support vector host read");
     return;
   }
   try {
@@ -61,9 +61,9 @@ void sirius_ioctx::initialize_cache(
   }
 }
 
-void sirius_ioctx::shutdown_cache() noexcept { _cache.reset(); }
+void ioctx::shutdown_cache() noexcept { _cache.reset(); }
 
-std::unique_ptr<sirius_datasource> sirius_ioctx::open_datasource(std::string path)
+std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path)
 {
   // Create the backend-appropriate io_object (local fds / object-store HEAD /
   // ...) and wrap it in a sirius_datasource bound to this ioctx.  Datasource
@@ -72,26 +72,26 @@ std::unique_ptr<sirius_datasource> sirius_ioctx::open_datasource(std::string pat
   return std::make_unique<sirius_datasource>(shared_from_this(), create_io_object(std::move(path)));
 }
 
-std::unique_ptr<sirius_datasource> sirius_ioctx::open_datasource(std::string path, open_hint hint)
+std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path, open_hint hint)
 {
   return std::make_unique<sirius_datasource>(shared_from_this(),
                                              create_io_object(std::move(path), hint));
 }
 
-std::unique_ptr<sirius_datasource> sirius_ioctx::open_datasource(std::string path,
+std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path,
                                                                  std::uint64_t known_size)
 {
   return std::make_unique<sirius_datasource>(shared_from_this(),
                                              create_io_object(std::move(path), known_size));
 }
 
-std::shared_ptr<sirius_io_object> sirius_ioctx::create_io_object(std::string path,
+std::shared_ptr<sirius_io_object> ioctx::create_io_object(std::string path,
                                                                  open_hint /*hint*/)
 {
   return create_io_object(std::move(path));
 }
 
-std::shared_ptr<sirius_io_object> sirius_ioctx::create_io_object(std::string path,
+std::shared_ptr<sirius_io_object> ioctx::create_io_object(std::string path,
                                                                  std::uint64_t /*known_size*/)
 {
   return create_io_object(std::move(path));

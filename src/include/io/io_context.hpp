@@ -65,7 +65,7 @@ class memory_reservation_manager;
 namespace sirius::io {
 
 // ---------------------------------------------------------------------------
-// sirius_ioctx
+// ioctx
 // ---------------------------------------------------------------------------
 
 /**
@@ -74,17 +74,17 @@ namespace sirius::io {
  * Holds resources that are shared across all datasources (cache, reactor
  * threads, ...). Extend this class to provide a concrete I/O backend.
  */
-class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
+class ioctx : public std::enable_shared_from_this<ioctx> {
   // prefetching_cache's worker_loop is the only caller of the protected
-  // host_read_ranges_async_io entry point through a sirius_ioctx* base
+  // host_read_ranges_async_io entry point through a ioctx* base
   // pointer.  Friending the cache lets that single call site reach in
   // without forcing the vector-read primitive (which most callers never
   // touch) into the public API.
   friend class cache::prefetching_cache;
 
  public:
-  sirius_ioctx();
-  virtual ~sirius_ioctx();
+  ioctx();
+  virtual ~ioctx();
 
   [[nodiscard]] virtual io_context_type type() const noexcept = 0;
 
@@ -170,7 +170,7 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// statement in its destructor.  It drains the cache (so its workers
   /// stop issuing IO) while the derived object's reactors / handles
   /// are still alive.  Without this, the cache's defensive shutdown
-  /// in @c ~sirius_ioctx would run AFTER the derived part of the
+  /// in @c ~ioctx would run AFTER the derived part of the
   /// object has been destroyed, and worker callbacks would reach
   /// already-destroyed reactors.
   ///
@@ -276,6 +276,6 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
 
 /// Resolves the ioctx that serves a given file path (s3:// -> rest, local ->
 /// uring/kvikio).  Returns a valid ioctx or throws if no backend supports the path.
-using ioctx_resolver = std::function<std::shared_ptr<sirius_ioctx>(std::string_view)>;
+using ioctx_resolver = std::function<std::shared_ptr<ioctx>(std::string_view)>;
 
 }  // namespace sirius::io

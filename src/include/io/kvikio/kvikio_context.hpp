@@ -67,7 +67,7 @@ class kvikio_io_object final : public sirius_io_object {
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Fallback @c sirius_ioctx that defers to cudf's default datasource
+ * @brief Fallback @c ioctx that defers to cudf's default datasource
  *        (kvikio-backed for file paths on a stock cudf build).
  *
  * Why override the public read API directly instead of the protected
@@ -85,12 +85,12 @@ class kvikio_io_object final : public sirius_io_object {
  *   - @c supports_vector_host_read: false — no batched dispatch path.
  *   - @c preferred_prefetching_stage: @c none.
  */
-class kvikio_context final : public sirius_ioctx {
+class kvikio_context final : public ioctx {
  public:
   kvikio_context() = default;
   ~kvikio_context() override
   {
-    // See sirius_ioctx::pre_destroy — drains the cache (if any) while
+    // See ioctx::pre_destroy — drains the cache (if any) while
     // this derived part of the object is still alive.  No reactors to
     // tear down for kvikio_context, but the contract still applies.
     this->pre_destroy();
@@ -148,7 +148,7 @@ class kvikio_context final : public sirius_ioctx {
     const sirius_io_object& obj, std::span<io_object_segment> segments) noexcept final;
 
  protected:
-  /// Backend hook invoked by @c sirius_ioctx::open_datasource.
+  /// Backend hook invoked by @c ioctx::open_datasource.
   std::shared_ptr<sirius_io_object> create_io_object(std::string path) override;
 };
 

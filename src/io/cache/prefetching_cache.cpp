@@ -265,7 +265,7 @@ std::vector<cached_chunk*> prefetching_cache::file_entry::fetch_chunks(std::size
 
 prefetching_cache::prefetching_cache(
   cucascade::memory::memory_reservation_manager& reservation_manager,
-  sirius_ioctx* io_ctx,
+  ioctx* io_ctx,
   const config& cfg,
   std::shared_ptr<const sirius::memory::topology_index> topology_index)
   : _cfg(cfg),

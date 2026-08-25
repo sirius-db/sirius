@@ -37,7 +37,7 @@
 #include <vector>
 
 namespace sirius::io {
-class sirius_ioctx;
+class ioctx;
 class sirius_datasource;
 }  // namespace sirius::io
 
@@ -140,7 +140,7 @@ class prefetching_cache {
   using request_queue_type = duckdb_moodycamel::BlockingConcurrentQueue<prefetch_request>;
 
   prefetching_cache(cucascade::memory::memory_reservation_manager& reservation_manager,
-                    sirius_ioctx* io_ctx,
+                    ioctx* io_ctx,
                     const config& cfg,
                     std::shared_ptr<const sirius::memory::topology_index> topology_index);
   ~prefetching_cache();
@@ -215,7 +215,7 @@ class prefetching_cache {
   std::unique_ptr<buffer_pool> _pool;
   size_t _chunk_size = 1;
 
-  sirius_ioctx* const _io_ctx;
+  ioctx* const _io_ctx;
 
   // Hardware GPU/NUMA topology index, shared from the scan_manager.  Used to
   // place prefetch staging buffers on the NUMA node closest to the target GPU.
