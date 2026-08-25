@@ -25,7 +25,6 @@
 
 #include <cuda_runtime_api.h>
 
-#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -124,16 +123,13 @@ TEST_CASE("task_scheduler matches tasks to ready devices", "[task_scheduler][mgp
 {
   int device_count = 0;
   REQUIRE(cudaGetDeviceCount(&device_count) == cudaSuccess);
-  if (device_count == 0) {
-    WARN("Task scheduler routing test requires a GPU; skipping");
+  if (device_count < 2) {
+    INFO("Task scheduler routing test requires at least two GPUs; skipping");
     return;
   }
-  if (device_count == 1) {
-    WARN("Only one GPU is visible; multi-GPU routing assertions will not run");
-  }
 
-  auto const tested_device_count = std::min(device_count, 2);
-  auto manager                   = initialize_memory_manager(tested_device_count);
+  constexpr int tested_device_count = 2;
+  auto manager                      = initialize_memory_manager(tested_device_count);
   sirius::exec::thread_pool_config gpu_config{1};
   sirius::pipeline::task_scheduler scheduler(
     gpu_config, *manager, sirius::test::make_test_telemetry_context());
@@ -141,12 +137,10 @@ TEST_CASE("task_scheduler matches tasks to ready devices", "[task_scheduler][mgp
 
   scheduler.schedule(std::make_unique<routing_test_task>(0, 0, state));
   scheduler.schedule(std::make_unique<routing_test_task>(1, std::nullopt, state));
-  if (tested_device_count == 2) {
-    scheduler.schedule(std::make_unique<routing_test_task>(2, 1, state));
-  }
+  scheduler.schedule(std::make_unique<routing_test_task>(2, 1, state));
   scheduler.start();
 
-  REQUIRE(state->wait_for_executions(tested_device_count == 2 ? 3 : 2));
+  REQUIRE(state->wait_for_executions(3));
   scheduler.stop();
 
   auto const [status_0, device_0] = state->execution_for(0);
@@ -158,9 +152,7 @@ TEST_CASE("task_scheduler matches tasks to ready devices", "[task_scheduler][mgp
   REQUIRE(device_1 >= 0);
   REQUIRE(device_1 < tested_device_count);
 
-  if (tested_device_count == 2) {
-    auto const [status_2, device_2] = state->execution_for(2);
-    REQUIRE(status_2 == cudaSuccess);
-    REQUIRE(device_2 == 1);
-  }
+  auto const [status_2, device_2] = state->execution_for(2);
+  REQUIRE(status_2 == cudaSuccess);
+  REQUIRE(device_2 == 1);
 }
