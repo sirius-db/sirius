@@ -171,7 +171,6 @@ class s3_tpch_config_guard {
     }
     out << "        tls_verify: false\n"
            "      rest:\n"
-           "        max_connections: 8\n"
            "        request_timeout_s: 30\n";
     out.close();
     REQUIRE(out);
