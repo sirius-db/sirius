@@ -77,13 +77,13 @@ void cuvs_index_cache::insert(std::string name,
   entry->index       = std::move(index);
   entry->reservation = std::move(reservation);
 
-  std::lock_guard<std::mutex> lock(_mutex);
+  std::scoped_lock lock(_mutex);
   _entries[std::move(name)] = std::move(entry);
 }
 
 std::shared_ptr<const pinned_index_entry> cuvs_index_cache::find(std::string_view name) const
 {
-  std::lock_guard<std::mutex> lock(_mutex);
+  std::scoped_lock lock(_mutex);
   auto it = _entries.find(std::string(name));
   return it == _entries.end() ? nullptr : it->second;
 }
@@ -95,7 +95,7 @@ std::shared_ptr<const pinned_index_entry> cuvs_index_cache::find_by_column(
   std::string_view column,
   cuvs::distance::DistanceType metric) const
 {
-  std::lock_guard<std::mutex> lock(_mutex);
+  std::scoped_lock lock(_mutex);
   auto const wanted = canonical_metric(metric);
   for (auto const& kv : _entries) {
     auto const& entry = kv.second;
@@ -110,13 +110,13 @@ std::shared_ptr<const pinned_index_entry> cuvs_index_cache::find_by_column(
 
 bool cuvs_index_cache::contains(std::string_view name) const
 {
-  std::lock_guard<std::mutex> lock(_mutex);
+  std::scoped_lock lock(_mutex);
   return _entries.contains(std::string(name));
 }
 
 bool cuvs_index_cache::erase(std::string_view name)
 {
-  std::lock_guard<std::mutex> lock(_mutex);
+  std::scoped_lock lock(_mutex);
   return _entries.erase(std::string(name)) > 0;
 }
 
@@ -126,7 +126,7 @@ std::size_t cuvs_index_cache::erase_by_column(std::string_view catalog,
                                               std::string_view column,
                                               cuvs::distance::DistanceType metric)
 {
-  std::lock_guard<std::mutex> lock(_mutex);
+  std::scoped_lock lock(_mutex);
   auto const wanted   = canonical_metric(metric);
   std::size_t removed = 0;
   for (auto it = _entries.begin(); it != _entries.end();) {
@@ -144,13 +144,13 @@ std::size_t cuvs_index_cache::erase_by_column(std::string_view catalog,
 
 void cuvs_index_cache::clear()
 {
-  std::lock_guard<std::mutex> lock(_mutex);
+  std::scoped_lock lock(_mutex);
   _entries.clear();
 }
 
 std::size_t cuvs_index_cache::size() const
 {
-  std::lock_guard<std::mutex> lock(_mutex);
+  std::scoped_lock lock(_mutex);
   return _entries.size();
 }
 

@@ -1850,7 +1850,7 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
                                 "' must be pinned on the GPU tier before building an index");
   }
 
-  // Collect the vector column's GPU chunks as views:
+  // Collect the vector column's batches as views:
   // a full coalesce of a large dataset overflows cudf's 2^31-element per-column limit
   // in the LIST child. The chunked builder feeds cuVS one chunk at a time via ivf_flat::extend.
   auto chunk_views = sirius::vss::pinned_column_chunk_views(*pin, data.column_name, *target_space);
@@ -1868,6 +1868,20 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   n_lists64          = std::min<int64_t>(n_lists64, std::numeric_limits<std::uint32_t>::max());
   auto const n_lists = static_cast<std::uint32_t>(n_lists64);
 
+  // Reject when the largest batch is smaller than n_lists here so a bad n_lists never
+  // removes the existing index.
+  int64_t max_chunk_rows = 0;
+  for (auto const& v : chunk_views) {
+    max_chunk_rows = std::max(max_chunk_rows, static_cast<int64_t>(v.size()));
+  }
+  if (std::cmp_greater(n_lists, max_chunk_rows)) {
+    throw InvalidInputException(
+      "sirius_create_ann_index: n_lists=" + std::to_string(n_lists) +
+      " exceeds the largest batch size (" + std::to_string(max_chunk_rows) +
+      " rows) available to train IVF-Flat centroids; lower n_lists. The existing "
+      "index for this column, if any, was left in place.");
+  }
+
   // Reserve the index footprint (heuristic, over-estimated to cover build-time
   // scratch): ~2x the stored vectors + 2x centroids + 1 MiB slack
   std::size_t const vec_bytes =
@@ -1878,27 +1892,58 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
 
   auto& index_cache = sirius_ctx->get_cuvs_index_cache();
 
-  // Drop any existing index before reserving the new one
-  index_cache.erase_by_column(entry_catalog, entry_schema, entry.name, data.column_name, metric);
-  auto reservation = index_cache.reserve_index_memory(footprint, target_gpu);
+  // The index's management name contains the index identity and then a suffix (index's name)
+  std::string index_name = entry_catalog + "_" + entry_schema + "_" + entry.name + "_" +
+                           data.column_name + "_" + data.metric + "_ann_" +
+                           (data.index_name.empty() ? "default" : data.index_name);
+
+  // Check if there's enough memory to build the index before releasing the current one
+  auto reservation      = index_cache.reserve_index_memory(footprint, target_gpu);
+  bool released_first   = false;
+  bool removed_existing = false;
+  // Destructive path: not enough memory to hold both indexes at once so release the current one
   if (!reservation) {
-    auto const avail = target_space->get_available_memory();
-    throw InvalidInputException(
-      "sirius_create_ann_index: not enough free GPU memory to build the index for '" + entry.name +
-      "." + data.column_name + "': need ~" + std::to_string(footprint >> 20) + " MiB, only ~" +
-      std::to_string(avail >> 20) + " MiB free on GPU " + std::to_string(target_gpu));
+    removed_existing = index_cache.erase_by_column(
+                         entry_catalog, entry_schema, entry.name, data.column_name, metric) > 0;
+    released_first = true;
+    reservation    = index_cache.reserve_index_memory(footprint, target_gpu);
+    if (!reservation) {
+      auto const avail = target_space->get_available_memory();
+      std::string msg =
+        "sirius_create_ann_index: not enough free GPU memory to build the index for '" +
+        entry.name + "." + data.column_name + "': need ~" + std::to_string(footprint >> 20) +
+        " MiB, only ~" + std::to_string(avail >> 20) + " MiB free on GPU " +
+        std::to_string(target_gpu) + ".";
+      if (removed_existing) {
+        msg += " The previous index for this column and metric was removed to make room.";
+      }
+      throw InvalidInputException(msg);
+    }
   }
 
-  // Build IVF-Flat through the reservation's resource, then pin it
-  auto handle = sirius::vss::build_ivf_flat_index_from_chunks(
-    chunk_views, dim, n_lists, metric, reservation->get_memory_resource());
+  // Build IVF-Flat through the reservation's resource
+  std::unique_ptr<sirius::vss::any_cuvs_index> handle;
+  try {
+    handle = sirius::vss::build_ivf_flat_index_from_chunks(
+      chunk_views, dim, n_lists, metric, reservation->get_memory_resource());
+  } catch (std::exception const& e) {
+    if (removed_existing) {
+      throw InvalidInputException(
+        std::string("sirius_create_ann_index: failed to build the index for '") + entry.name + "." +
+        data.column_name +
+        "' after the previous index was removed to make room, so this column and metric now has "
+        "no index. Underlying error: " +
+        e.what());
+    }
+    throw;
+  }
   reservation->shrink_to_fit();
 
   sirius::vss::index_metadata meta;
   meta.kind           = ann_index_kind_from_type(data.index_type);
-  meta.catalog_name   = entry_catalog;  // resolved identity, matches the pin cache + query side
+  meta.catalog_name   = entry_catalog;
   meta.schema_name    = entry_schema;
-  meta.table_name     = entry.name;  // catalog-resolved name (matches query-side derivation)
+  meta.table_name     = entry.name;
   meta.column_name    = data.column_name;
   meta.dim            = dim;
   meta.num_rows       = n_rows;
@@ -1906,11 +1951,9 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   meta.metric         = metric;
   meta.reserved_bytes = reservation->size();
 
-  // Default the management name from its identity when not given.
-  std::string index_name = data.index_name;
-  if (index_name.empty()) {
-    index_name = entry_catalog + "_" + entry_schema + "_" + entry.name + "_" + data.column_name +
-                 "_" + data.metric + "_ann";
+  // Non-destructive path: remove the old one now that the new one is built
+  if (!released_first) {
+    index_cache.erase_by_column(entry_catalog, entry_schema, entry.name, data.column_name, metric);
   }
   index_cache.insert(
     std::move(index_name), std::move(meta), std::move(handle), std::move(reservation));

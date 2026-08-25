@@ -20,10 +20,12 @@
  */
 
 #include <catch.hpp>
+#include <cuvs/distance/distance.hpp>
 #include <duckdb.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <sirius_context.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <vss/cuvs_index_cache.hpp>
 
 #include <cstdlib>
 #include <numbers>
@@ -245,4 +247,135 @@ TEST_CASE_METHOD(VectorSearchFixture,
   }
 
   run_ok("SELECT * FROM unpin_table('vs_reexec');");
+}
+
+// A deterministic (non-OOM) failed rebuild must not destroy the existing index.
+// The builder trains centroids on a single batch, so n_lists that exceeds the
+// largest batch can never build even though it is within the total row count.
+// We force a two-batch pin (one batch per storage row group) so the largest
+// batch (122880 rows) sits strictly below a chosen n_lists that is still under
+// the total, then assert the rejected rebuild left the prior index in place.
+TEST_CASE_METHOD(VectorSearchFixture,
+                 "sirius_create_ann_index - failed rebuild leaves the existing index in place",
+                 "[integration][gpu_execution][array][vss][vector_search]")
+{
+  // One storage row group is 122880 rows; 200000 rows spans two. A tiny scan
+  // batch target puts each row group in its own batch, so the largest batch is
+  // 122880 < 150000 <= 200000 total. (scan_task_batch_size is a test-only option,
+  // enabled for the C++ test binary.)
+  run_ok("SET scan_task_batch_size = 1;");
+  run_ok(
+    "CREATE TABLE vs_badrebuild AS "
+    "SELECT i AS id, [i, i, i]::FLOAT[3] AS vec FROM range(200000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'vs_badrebuild', tier => 'gpu', format => 'duckdb');");
+
+  // Build a valid index. Routing looks it up by identity, so we assert on that.
+  run_ok(
+    "SELECT * FROM sirius_create_ann_index('vs_badrebuild', 'vec', "
+    "metric => 'l2', n_lists => 64);");
+
+  // The identity's catalog is the attached database this fixture routed DDL into.
+  auto catq = con->Query("SELECT current_database();");
+  REQUIRE(catq);
+  REQUIRE_FALSE(catq->HasError());
+  auto const catalog = catq->GetValue(0, 0).ToString();
+  using Metric       = cuvs::distance::DistanceType;
+
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx);
+  auto& index_cache = sirius_ctx->get_cuvs_index_cache();
+  {
+    auto entry =
+      index_cache.find_by_column(catalog, "main", "vs_badrebuild", "vec", Metric::L2SqrtExpanded);
+    REQUIRE(entry != nullptr);
+    REQUIRE(entry->meta.n_lists == 64);
+  }
+
+  // Rebuild with n_lists above the largest batch but within the total row count.
+  // This is deterministic: it cannot build regardless of free memory.
+  auto bad = con->Query(
+    "SELECT * FROM sirius_create_ann_index('vs_badrebuild', 'vec', "
+    "metric => 'l2', n_lists => 150000);");
+  REQUIRE(bad);
+  REQUIRE(bad->HasError());
+  INFO("rebuild error: " << bad->GetError());
+  REQUIRE(bad->GetError().find("largest batch size") != std::string::npos);
+  REQUIRE(bad->GetError().find("left in place") != std::string::npos);
+
+  // The failure contract: the rebuild was rejected before any erase, so the
+  // original index is unchanged, not removed.
+  auto entry =
+    index_cache.find_by_column(catalog, "main", "vs_badrebuild", "vec", Metric::L2SqrtExpanded);
+  REQUIRE(entry != nullptr);
+  REQUIRE(entry->meta.n_lists == 64);
+
+  run_ok("SELECT * FROM unpin_table('vs_badrebuild');");
+  run_ok("SET scan_task_batch_size = 1048576;");
+}
+
+// A created index must resolve two ways: by its management name (the key always
+// embeds the routing identity, then the user's name or "default"), and by its
+// routing identity via find_by_column. Rebuilding under a different name moves
+// the management key but keeps exactly one entry for the identity, so identity
+// lookup still resolves.
+TEST_CASE_METHOD(VectorSearchFixture,
+                 "sirius_create_ann_index - findable by identity and management name",
+                 "[integration][gpu_execution][array][vss][vector_search]")
+{
+  run_ok(
+    "CREATE TABLE vs_lookup AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec FROM range(1000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'vs_lookup', tier => 'gpu', format => 'duckdb');");
+
+  auto catq = con->Query("SELECT current_database();");
+  REQUIRE(catq);
+  REQUIRE_FALSE(catq->HasError());
+  auto const catalog = catq->GetValue(0, 0).ToString();
+  using Metric       = cuvs::distance::DistanceType;
+
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx);
+  auto& index_cache = sirius_ctx->get_cuvs_index_cache();
+
+  auto const identity_prefix = catalog + "_main_vs_lookup_vec_l2_ann_";
+
+  // The cache is shared across test cases in this process, so assert on the net
+  // change this test makes rather than an absolute count.
+  auto const baseline = index_cache.size();
+
+  // Explicit name => the management key ends with that name; identity lookup
+  // resolves to the same entry.
+  run_ok(
+    "SELECT * FROM sirius_create_ann_index('vs_lookup', 'vec', name => 'my_idx', "
+    "metric => 'l2', n_lists => 16);");
+  {
+    auto by_name = index_cache.find(identity_prefix + "my_idx");
+    auto by_identity =
+      index_cache.find_by_column(catalog, "main", "vs_lookup", "vec", Metric::L2SqrtExpanded);
+    REQUIRE(by_name != nullptr);
+    REQUIRE(by_identity != nullptr);
+    REQUIRE(by_name == by_identity);              // same entry, reached two ways
+    REQUIRE(index_cache.size() == baseline + 1);  // one entry added
+  }
+
+  // No name => the suffix defaults to "default". Rebuilding the same identity
+  // replaces the old entry, so the old "my_idx" key is gone but identity lookup
+  // still resolves (to the new "default" entry).
+  run_ok(
+    "SELECT * FROM sirius_create_ann_index('vs_lookup', 'vec', "
+    "metric => 'l2', n_lists => 16);");
+  {
+    // The old name is gone (replaced, not appended) and identity still resolves.
+    REQUIRE(index_cache.find(identity_prefix + "my_idx") == nullptr);
+    auto by_name = index_cache.find(identity_prefix + "default");
+    auto by_identity =
+      index_cache.find_by_column(catalog, "main", "vs_lookup", "vec", Metric::L2SqrtExpanded);
+    REQUIRE(by_name != nullptr);
+    REQUIRE(by_identity != nullptr);
+    REQUIRE(by_name == by_identity);
+    REQUIRE(index_cache.size() == baseline + 1);  // replaced, not appended
+  }
+
+  run_ok("SELECT * FROM unpin_table('vs_lookup');");
 }
