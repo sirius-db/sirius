@@ -371,7 +371,7 @@ After a task completes:
 
 The completion check happens **before** scheduling downstream tasks to prevent scheduling tasks that reference already-destroyed operators.
 
-This epilogue is the usual signaller, but not the only one — see the completion contract below.
+See the [Completion Contract](#completion-contract) for other finish drivers.
 
 ### Completion Contract
 
@@ -384,10 +384,33 @@ parent-cascade paths can finish a pipeline without returning through the GPU epi
 The pipeline obtains a strong reference under `_status_mutex` and calls `mark_completed()` only
 after releasing the lock and finishing all pipeline access.
 
-The GPU epilogue also keeps its completion signal. Duplicate signals are safe because
-`completion_handler` accepts only the first one. After the future resolves,
-`task_scheduler::wait_for_completion()` joins the task creator and in-flight GPU work before
-operators are destroyed.
+| Caller | Thread |
+|---|---|
+| `mark_task_completed()` ← `~gpu_pipeline_task` | GPU pool worker (the epilogue) |
+| `task_creator`'s creation-exit re-evaluation | creator pool worker |
+| `task_creator`'s visited-pipelines re-evaluation | creator manager thread |
+| `sirius_physical_streaming_source`'s end-of-stream hook | producer thread |
+| `notify_downstream_pipelines()`'s `parent->update_pipeline_status(false)` cascade | whichever thread finished the child |
+
+Every one of those but the epilogue ends in `notify_downstream_pipelines()`, which early-returns
+for a query-terminal pipeline: there is no downstream to schedule, and returning early avoids
+racing the teardown that `mark_completed()` unleashes. The epilogue, in turn, re-reads the flag
+only on the transitions it drives itself. Make completion depend on the epilogue observing the
+flag and any other driver leaves the query finished but unsignalled, with `execute()`'s
+`future.get()` waiting forever and nothing in the log (#1486).
+
+So `update_pipeline_status()` signals on its own:
+
+- `task_scheduler::prepare_for_query()` installs the query's `completion_handler` on every
+  query-terminal pipeline via `sirius_pipeline::set_completion_handler()`.
+- The pipeline holds it as a `std::weak_ptr`. Replacing the handler at the next
+  `prepare_for_query()` expires it, so a pipeline left over from a finished query cannot signal
+  the next one.
+- On any call where the pipeline is both query-terminal and finished, the handler is sampled under
+  `_status_mutex` and `mark_completed()` is called **after** the lock is dropped, as the function's
+  last act — nothing may touch pipeline or operator state after the signal.
+
+Post-signal safety is enforced by `wait_for_completion()` and the work ledger described below.
 
 ### Task Request Flow
 
@@ -411,8 +434,29 @@ Thread-safe signaling for query completion using promise/future:
 | `get_awaitable()` | Returns the future for blocking |
 | `is_completed()` / `has_error()` | Atomic status checks |
 
-All methods are idempotent: the GPU epilogue and terminal pipeline may signal the same completion,
-and only the first call takes effect.
+`report_error()` returns whether its error won the completion race. An error that loses is
+preserved for `take_late_error()` instead of being discarded. `terminate_query()` only reports
+the error; engine teardown remains in `drain_after_error()` because `stop()` is terminal.
+
+### The work ledger
+
+The handler owns an `exec::work_tracker` that counts work objects rather than queue entries.
+Pipeline tasks, creation requests, worker epilogues, and producer callbacks hold RAII slots
+through their full lifetimes and hand-offs. A zero count therefore means no query work remains
+in a queue, thread, or destructor.
+
+`wait_for_completion()` lets existing work drain, parks the task creator, closes the ledger, and
+waits once more for acquisitions that raced the close. Producers abort when they cannot acquire
+a slot. `interruptible_mpmc::interrupt()` similarly acts as a producer barrier, ensuring a queue
+stays empty after teardown drains it. A late execution error is then safe to consume.
+
+A non-zero count after the timeout indicates premature completion. Error teardown closes the
+ledger, drains workers and queues, and waits rather than destroying a live plan.
+`prepare_for_query()` re-arms the creator for the next query.
+
+All methods are idempotent — subsequent calls after the first are no-ops. That is load-bearing:
+both the GPU epilogue and the terminal pipeline's finish transition may signal the same completion
+(see the completion contract above), and the loser must be a silent no-op.
 
 ## Reschedule Handling (OOM and CUDA launch failures)
 

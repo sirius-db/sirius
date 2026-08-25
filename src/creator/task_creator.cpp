@@ -20,6 +20,7 @@
 #include "memory/topology_index.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_physical_delim_join.hpp"
+#include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "planner/query.hpp"
@@ -214,31 +215,23 @@ task_creator::compute_pipeline_priorities(const sirius::planner::query& query) c
   return priorities;
 }
 
-void task_creator::drain_pending_tasks()
+void task_creator::drain_pending_tasks(bool reactivate)
 {
   std::lock_guard<std::mutex> lock(_global_state_mutex);
-  // Drain any queued task creation requests that haven't been picked up yet
+  // Serialize _bounded_pool lifetime across pool start and stop.
+  std::lock_guard<std::mutex> shutdown_lock(_shutdown_mutex);
+  // Discard requests that have not reached the worker pool.
   _task_creation_queue.interrupt();
   _task_creation_queue.drain();
-  // Wait for any in-flight task creation lambdas to finish. When called from
-  // task_scheduler::drain_after_error(), stop_thread_pool() has already joined
-  // the worker pool and reset _bounded_pool to null — in that case the pool's
-  // own destructor already drained in-flight work, so this wait_all is
-  // redundant. Dereferencing the null pointer here throws std::system_error
-  // (EPERM) from the pthread_mutex call on garbage memory, surfacing to the
-  // caller as "Operation not permitted" and breaking otherwise-successful
-  // multi-file SF1000 scans.
+  // The pool is null when stop_thread_pool() has already joined its workers.
   if (_bounded_pool) { _bounded_pool->wait_all(); }
-  // Clear lookahead state so any schedule_lookahead() call from the
-  // management_eventloop that races with QueryEnd (after query_.reset() destroys
-  // operators but before task_creator_->reset() clears the queue) finds an
-  // empty queue and exits cleanly instead of dereferencing dangling pointers.
+  // Lookahead entries are raw pointers into the retiring plan.
   {
     std::lock_guard<std::mutex> lookahead_lock(_lookahead_mutex);
     _lookahead_queue.clear();
     _index_of_next_lookahead = 0;
   }
-  _task_creation_queue.reactivate();
+  if (reactivate) { _task_creation_queue.reactivate(); }
 }
 
 void task_creator::reset()
@@ -286,12 +279,11 @@ void task_creator::stop()
 void task_creator::start_thread_pool()
 {
   std::lock_guard<std::mutex> lock(_global_state_mutex);
+  // Do not recreate the pool while a concurrent shutdown is still joining workers.
+  std::lock_guard<std::mutex> shutdown_lock(_shutdown_mutex);
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
-  // Re-arm the request queue. stop_thread_pool() calls
-  // _task_creation_queue.interrupt() so the manager's pop() unblocks; without
-  // a paired reactivate() here, subsequent schedule() pushes silently no-op
-  // and the next query's manager_loop sees an empty/inactive queue forever.
+  // Reopen the queue parked by stop_thread_pool().
   _task_creation_queue.reactivate();
   _bounded_pool =
     std::make_unique<exec::bounded_thread_pool>(_config.thread_pool.num_threads,
@@ -302,6 +294,8 @@ void task_creator::start_thread_pool()
 
 void task_creator::do_stop_thread_pool()
 {
+  // Serialize joining and resetting the pool.
+  std::lock_guard<std::mutex> shutdown_lock(_shutdown_mutex);
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
   _bounded_pool->interrupt();
@@ -310,6 +304,10 @@ void task_creator::do_stop_thread_pool()
   _bounded_pool->wait_all();
   _bounded_pool->stop();
   _bounded_pool.reset();
+  // Lookahead entries are raw operator pointers owned by the retiring plan.
+  std::lock_guard<std::mutex> lookahead_lock(_lookahead_mutex);
+  _lookahead_queue.clear();
+  _index_of_next_lookahead = 0;
 }
 
 void task_creator::stop_thread_pool()
@@ -318,10 +316,27 @@ void task_creator::stop_thread_pool()
   do_stop_thread_pool();
 }
 
+void task_creator::set_completion_handler(std::shared_ptr<pipeline::completion_handler> handler)
+{
+  std::lock_guard<std::mutex> lock(_completion_handler_mutex);
+  _completion_handler = std::move(handler);
+}
+
+std::shared_ptr<pipeline::completion_handler> task_creator::current_completion_handler() const
+{
+  std::lock_guard<std::mutex> lock(_completion_handler_mutex);
+  return _completion_handler;
+}
+
 void task_creator::schedule(op::sirius_physical_operator* node)
 {
   auto request  = std::make_unique<task_creation_request>();
   request->node = node;
+  if (auto handler = current_completion_handler()) {
+    request->work_slot = handler->acquire_work();
+    // A closed ledger means teardown owns the query; untracked work must not enter.
+    if (!request->work_slot) { return; }
+  }
   _task_creation_queue.push(std::move(request));
 }
 
@@ -344,6 +359,10 @@ void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
       auto request  = std::make_unique<task_creation_request>();
       request->node = node;
       request->type = request_type::lookahead;
+      if (auto handler = current_completion_handler()) {
+        request->work_slot = handler->acquire_work();
+        if (!request->work_slot) { return; }
+      }
       _task_creation_queue.push(std::move(request));
       ++_index_of_next_lookahead;
       return;
@@ -361,7 +380,7 @@ void task_creator::manager_loop()
     }
     auto request = _task_creation_queue.pop();
     if (!request) {
-      // This is likely because the task creator was interrupted and the queue was drained
+      // The queue was interrupted while the manager was blocked.
       continue;
     }
 
@@ -374,11 +393,7 @@ void task_creator::manager_loop()
     node = get_operator_for_next_task(node, visited_pipelines);
 
     if (node == nullptr) {
-      // Same re-evaluation the creation path does on exit: get_next_task_hint()
-      // can have drained ports (hash join's discard sweep) in ANY pipeline the
-      // hint walk visited, making it finishable. A visited upstream pipeline
-      // whose tasks all completed earlier gets no later mark_task_completed(),
-      // so this is its only chance to be marked finished.
+      // Hint traversal can drain ports, so re-evaluate every pipeline it visited.
       std::sort(visited_pipelines.begin(), visited_pipelines.end());
       visited_pipelines.erase(std::unique(visited_pipelines.begin(), visited_pipelines.end()),
                               visited_pipelines.end());
@@ -388,209 +403,183 @@ void task_creator::manager_loop()
       continue;
     }
 
-    // Dispatch the task creation work to the pool
-    _bounded_pool->dispatch(std::move(slot), [this, node, request_kind]() mutable {
-      try {
-        // Get what we need to create the task
-        auto pipeline = node->get_pipeline();
-        std::vector<cucascade::shared_data_repository*> destination_data_repositories;
+    // Keep the request's work slot through the queue-to-pool hand-off.
+    auto handler = current_completion_handler();
+    _bounded_pool->dispatch(
+      std::move(slot),
+      [this,
+       node,
+       request_kind,
+       request = std::move(request),
+       handler = std::move(handler)]() mutable {
+        try {
+          // Get what we need to create the task
+          auto pipeline = node->get_pipeline();
+          std::vector<cucascade::shared_data_repository*> destination_data_repositories;
 
-        for (const auto& port_info : pipeline->get_next_ports_after_sink()) {
-          destination_data_repositories.push_back(
-            port_info.next_operator->get_port(port_info.next_operator_port_name)->repo);
-        }
-
-        while (!node->all_ports_empty()) {
-          auto task_lock  = pipeline->get_task_creation_lock();
-          auto input_data = node->get_next_task_input_data();
-          auto* pipelineable_input =
-            dynamic_cast<op::pipelineable_operator_data*>(input_data.get());
-          if (!input_data ||
-              (pipelineable_input && pipelineable_input->get_data_batches().empty())) {
-            // no data to create task for
-            break;
+          for (const auto& port_info : pipeline->get_next_ports_after_sink()) {
+            destination_data_repositories.push_back(
+              port_info.next_operator->get_port(port_info.next_operator_port_name)->repo);
           }
 
-          size_t operator_id                  = node->get_operator_id();
-          auto gpu_pipeline_task_global_state = _gpu_operator_global_state_map.at(operator_id);
-          auto local_state =
-            std::make_unique<pipeline::gpu_pipeline_task_local_state>(std::move(input_data));
+          while (!node->all_ports_empty()) {
+            auto task_lock  = pipeline->get_task_creation_lock();
+            auto input_data = node->get_next_task_input_data();
+            auto* pipelineable_input =
+              dynamic_cast<op::pipelineable_operator_data*>(input_data.get());
+            if (!input_data ||
+                (pipelineable_input && pipelineable_input->get_data_batches().empty())) {
+              // no data to create task for
+              break;
+            }
 
-          // pipelineable_input remains valid here: the cast happened before
-          // the move into local_state, and unique_ptr move transfers
-          // ownership without relocating the object.
-          {
-            std::optional<int> preferred_device_id;
-            // Operating-data preference (highest priority): the scan manager
-            // round-robins fresh-read scan splits across the available GPUs and
-            // stamps the chosen device onto the split's operating data. Honor it
-            // first so each split's task lands on its assigned GPU; the locality
-            // heuristics below only run when no upstream preference was set.
-            if (local_state->_input_data) {
-              preferred_device_id = local_state->_input_data->get_preferred_device_id();
-            }
-            // Partition affinity: if the input is tagged with a partition
-            // index, pin the task to partition_idx % num_gpus.
-            // Partition-based operators (hash_join, grouped_aggregate_merge,
-            // …) use cuco hash tables under the hood, and cuco tables must
-            // live on a single device — a stream bound to GPU A touching a
-            // counter built under GPU B trips cudaErrorInvalidValue at
-            // counter_storage.cuh. Routing on partition_idx keeps every
-            // task of a given partition on one GPU while still spreading
-            // partitions across GPUs.
-            // Partitioned data with no index asks to be placed by affinity instead: its producer
-            // built a single partition, so no other task shares its device requirement.
-            if (auto* partitioned =
-                  dynamic_cast<op::partitioned_operator_data*>(pipelineable_input);
-                !preferred_device_id.has_value() && partitioned && !_active_gpu_ids.empty()) {
-              // Index the active executor set so every task of a partition lands
-              // on the same real GPU (required for cuco tables); the physical
-              // topology would yield phantom pins when num_gpus < physical count.
-              if (auto const partition_idx = partitioned->get_partition_idx()) {
-                auto idx            = *partition_idx % _active_gpu_ids.size();
-                preferred_device_id = _active_gpu_ids[idx];
+            size_t operator_id                  = node->get_operator_id();
+            auto gpu_pipeline_task_global_state = _gpu_operator_global_state_map.at(operator_id);
+            auto local_state =
+              std::make_unique<pipeline::gpu_pipeline_task_local_state>(std::move(input_data));
+
+            // pipelineable_input remains valid after moving input_data.
+            {
+              std::optional<int> preferred_device_id;
+              // Honor an upstream device assignment before applying locality heuristics.
+              if (local_state->_input_data) {
+                preferred_device_id = local_state->_input_data->get_preferred_device_id();
               }
-            }
-            if (!preferred_device_id.has_value() && pipelineable_input &&
-                !pipelineable_input->get_data_batches().empty()) {
-              std::unordered_map<int, size_t> gpu_bytes;
-              std::unordered_map<int, size_t> host_bytes;
-              for (const auto& batch : pipelineable_input->get_data_batches()) {
-                if (!batch) { continue; }
-                auto ro     = batch->to_read_only();
-                auto* space = ro.get_memory_space();
-                if (!space || !ro.get_data()) { continue; }
-                auto size = ro.get_data()->get_size_in_bytes();
-                if (space->get_tier() == cucascade::memory::Tier::GPU) {
-                  gpu_bytes[space->get_device_id()] += size;
-                } else if (space->get_tier() == cucascade::memory::Tier::HOST) {
-                  // Key by the host space's NUMA node verbatim; topology_index
-                  // groups GPUs under that same key (including the -1 "unknown"
-                  // sentinel for non-NUMA / single-NUMA hosts), so gpus_of()
-                  // resolves without any normalization.
-                  host_bytes[space->get_device_id()] += size;
+              // Keep each indexed partition on one GPU because its cuco state is device-local.
+              // Partitioned data with no index asks to be placed by affinity instead: its producer
+              // built a single partition, so no other task shares its device requirement.
+              if (auto* partitioned =
+                    dynamic_cast<op::partitioned_operator_data*>(pipelineable_input);
+                  !preferred_device_id.has_value() && partitioned && !_active_gpu_ids.empty()) {
+                // Index active executors, not physical GPUs, to avoid excluded devices.
+                if (auto const partition_idx = partitioned->get_partition_idx()) {
+                  auto idx            = *partition_idx % _active_gpu_ids.size();
+                  preferred_device_id = _active_gpu_ids[idx];
                 }
               }
-              if (!gpu_bytes.empty()) {
-                // Data-locality: route to GPU with most data by bytes
-                preferred_device_id =
-                  std::max_element(gpu_bytes.begin(),
-                                   gpu_bytes.end(),
-                                   [](const auto& a, const auto& b) { return a.second < b.second; })
-                    ->first;
-              } else if (!host_bytes.empty() && _topology_index) {
-                // NUMA-affinity: no GPU data, route to a GPU on the same
-                // NUMA as the host data. When that NUMA hosts multiple
-                // GPUs, pick round-robin across them — pinning every
-                // host-sourced pipeline task to a single GPU defeats
-                // multi-GPU speedup.
-                auto top_host =
-                  std::max_element(host_bytes.begin(),
-                                   host_bytes.end(),
-                                   [](const auto& a, const auto& b) { return a.second < b.second; })
-                    ->first;
-                auto gpus = _topology_index->gpus_of(top_host);
-                if (!gpus.empty()) {
-                  auto idx            = _numa_affinity_rr.fetch_add(1) % gpus.size();
-                  preferred_device_id = gpus[idx];
-                }
-              }
-              SIRIUS_LOG_DEBUG(
-                "Task Creator: locality score gpu_sources={} host_sources={} preferred_device={}",
-                gpu_bytes.size(),
-                host_bytes.size(),
-                preferred_device_id.value_or(-1));
-            }
-            // Cached-scan locality: a resident scan_operator_input is
-            // NOT a pipelineable_operator_data (see
-            // sirius_gpu_scan_operator_data.hpp), so the data-locality block
-            // above skipped it wholesale. Without this branch, every
-            // pinned-table scan task gets dispatched round-robin by the
-            // scheduler and triggers a peer DMA or host staging when the
-            // consumer GPU differs from the chunk's home GPU. The pinned
-            // chunk's GPU residency is preserved on the batch
-            // (the cached provider pins each chunk_memory_space
-            // into the gpu_table_representation), so we just read it here.
-            if (!preferred_device_id.has_value()) {
-              if (auto* cached =
-                    dynamic_cast<op::scan::scan_operator_input*>(local_state->_input_data.get())) {
-                if (cached->is_resident()) {
-                  auto ro     = cached->get_cached_batch()->to_read_only();
+              if (!preferred_device_id.has_value() && pipelineable_input &&
+                  !pipelineable_input->get_data_batches().empty()) {
+                std::unordered_map<int, size_t> gpu_bytes;
+                std::unordered_map<int, size_t> host_bytes;
+                for (const auto& batch : pipelineable_input->get_data_batches()) {
+                  if (!batch) { continue; }
+                  auto ro     = batch->to_read_only();
                   auto* space = ro.get_memory_space();
-                  if (space) {
-                    if (space->get_tier() == cucascade::memory::Tier::GPU) {
-                      preferred_device_id = space->get_device_id();
-                    } else if (space->get_tier() == cucascade::memory::Tier::HOST &&
-                               _topology_index) {
-                      // tier='host' pinned chunks carry a NUMA-local host
-                      // memory_space; map back through the topology index to
-                      // pick a GPU on the same NUMA. The host space's device id
-                      // is the NUMA key verbatim (-1 = "unknown"), matching the
-                      // pipelineable locality block above.
-                      auto gpus = _topology_index->gpus_of(space->get_device_id());
-                      if (!gpus.empty()) {
-                        auto idx            = _numa_affinity_rr.fetch_add(1) % gpus.size();
-                        preferred_device_id = gpus[idx];
+                  if (!space || !ro.get_data()) { continue; }
+                  auto size = ro.get_data()->get_size_in_bytes();
+                  if (space->get_tier() == cucascade::memory::Tier::GPU) {
+                    gpu_bytes[space->get_device_id()] += size;
+                  } else if (space->get_tier() == cucascade::memory::Tier::HOST) {
+                    // Host device IDs are topology NUMA keys, including -1 for unknown.
+                    host_bytes[space->get_device_id()] += size;
+                  }
+                }
+                if (!gpu_bytes.empty()) {
+                  // Data-locality: route to GPU with most data by bytes
+                  preferred_device_id = std::max_element(gpu_bytes.begin(),
+                                                         gpu_bytes.end(),
+                                                         [](const auto& a, const auto& b) {
+                                                           return a.second < b.second;
+                                                         })
+                                          ->first;
+                } else if (!host_bytes.empty() && _topology_index) {
+                  // With host-only data, spread tasks across GPUs on the closest NUMA node.
+                  auto top_host = std::max_element(host_bytes.begin(),
+                                                   host_bytes.end(),
+                                                   [](const auto& a, const auto& b) {
+                                                     return a.second < b.second;
+                                                   })
+                                    ->first;
+                  auto gpus = _topology_index->gpus_of(top_host);
+                  if (!gpus.empty()) {
+                    auto idx            = _numa_affinity_rr.fetch_add(1) % gpus.size();
+                    preferred_device_id = gpus[idx];
+                  }
+                }
+                SIRIUS_LOG_DEBUG(
+                  "Task Creator: locality score gpu_sources={} host_sources={} preferred_device={}",
+                  gpu_bytes.size(),
+                  host_bytes.size(),
+                  preferred_device_id.value_or(-1));
+              }
+              // Resident scan inputs bypass pipelineable data, so derive locality from the
+              // cached batch to avoid peer copies or host staging.
+              if (!preferred_device_id.has_value()) {
+                if (auto* cached = dynamic_cast<op::scan::scan_operator_input*>(
+                      local_state->_input_data.get())) {
+                  if (cached->is_resident()) {
+                    auto ro     = cached->get_cached_batch()->to_read_only();
+                    auto* space = ro.get_memory_space();
+                    if (space) {
+                      if (space->get_tier() == cucascade::memory::Tier::GPU) {
+                        preferred_device_id = space->get_device_id();
+                      } else if (space->get_tier() == cucascade::memory::Tier::HOST &&
+                                 _topology_index) {
+                        // Host device IDs map directly to topology NUMA keys.
+                        auto gpus = _topology_index->gpus_of(space->get_device_id());
+                        if (!gpus.empty()) {
+                          auto idx            = _numa_affinity_rr.fetch_add(1) % gpus.size();
+                          preferred_device_id = gpus[idx];
+                        }
                       }
+                      SIRIUS_LOG_DEBUG(
+                        "Task Creator: cached-scan locality tier={} device_id={} "
+                        "preferred_device={}",
+                        static_cast<int>(space->get_tier()),
+                        space->get_device_id(),
+                        preferred_device_id.value_or(-1));
                     }
-                    SIRIUS_LOG_DEBUG(
-                      "Task Creator: cached-scan locality tier={} device_id={} "
-                      "preferred_device={}",
-                      static_cast<int>(space->get_tier()),
-                      space->get_device_id(),
-                      preferred_device_id.value_or(-1));
                   }
                 }
               }
-            }
-            // Confine the task to the admitted subset. Every preference above except the
-            // partition pin comes from where data lives rather than from the subset, and the
-            // scheduler treats a preference as binding — so an excluded id would be honoured.
-            // Clamping a residency-derived one costs the locality it encoded, but honouring
-            // it would put the query on a GPU it was not admitted to. An unpreferred task
-            // escapes too: the scheduler gives those to whichever executor asks first. Pin
-            // those as well, but only on a real subset, since a pin costs the scheduler's
-            // freedom to place them wherever frees up first.
-            if (!_active_gpu_ids.empty()) {
-              bool const names_excluded_device =
-                preferred_device_id.has_value() &&
-                std::find(_active_gpu_ids.begin(), _active_gpu_ids.end(), *preferred_device_id) ==
-                  _active_gpu_ids.end();
-              bool const unpinned_on_a_subset =
-                !preferred_device_id.has_value() && _active_gpu_ids.size() < _full_gpu_count;
-              if (names_excluded_device || unpinned_on_a_subset) {
-                auto const idx      = _admission_rr.fetch_add(1) % _active_gpu_ids.size();
-                preferred_device_id = _active_gpu_ids[idx];
+              // Device preferences are binding, so clamp them to the query's admitted subset.
+              // Unpreferred tasks also need a pin when the subset excludes available executors.
+              if (!_active_gpu_ids.empty()) {
+                bool const names_excluded_device =
+                  preferred_device_id.has_value() &&
+                  std::find(_active_gpu_ids.begin(), _active_gpu_ids.end(), *preferred_device_id) ==
+                    _active_gpu_ids.end();
+                bool const unpinned_on_a_subset =
+                  !preferred_device_id.has_value() && _active_gpu_ids.size() < _full_gpu_count;
+                if (names_excluded_device || unpinned_on_a_subset) {
+                  auto const idx      = _admission_rr.fetch_add(1) % _active_gpu_ids.size();
+                  preferred_device_id = _active_gpu_ids[idx];
+                }
+              }
+              if (preferred_device_id.has_value()) {
+                local_state->set_preferred_device_id(preferred_device_id.value());
               }
             }
-            if (preferred_device_id.has_value()) {
-              local_state->set_preferred_device_id(preferred_device_id.value());
+
+            // Acquire before constructing the task: on a closed ledger, abandon here — a
+            // constructed task's destructor would re-enter the pipeline mutex this scope holds.
+            exec::work_tracker::slot task_slot;
+            if (handler) {
+              task_slot = handler->acquire_work();
+              if (!task_slot) { return; }
             }
+            auto task_id = get_next_task_id();
+            auto task =
+              std::make_unique<pipeline::gpu_pipeline_task>(task_id,
+                                                            destination_data_repositories,
+                                                            std::move(local_state),
+                                                            gpu_pipeline_task_global_state);
+            task->set_work_slot(std::move(task_slot));
+            task_lock.unlock();
+            _task_scheduler->schedule(std::move(task));
+
+            if (request_kind == request_type::lookahead) { break; }
           }
-
-          auto task_id = get_next_task_id();
-          auto task    = std::make_unique<pipeline::gpu_pipeline_task>(task_id,
-                                                                    destination_data_repositories,
-                                                                    std::move(local_state),
-                                                                    gpu_pipeline_task_global_state);
-          task_lock.unlock();
-          _task_scheduler->schedule(std::move(task));
-
-          if (request_kind == request_type::lookahead) { break; }
+          // Re-evaluate after source exhaustion; there may be no later task completion.
+          pipeline->update_pipeline_status(false);
+        } catch (const std::exception& e) {
+          SIRIUS_LOG_ERROR("Task Creator: Exception during task creation: {}", e.what());
+          _task_scheduler->terminate_query(std::current_exception());
+          // Do not stop from a pool worker; wake the manager and let engine teardown join it.
+          _task_creation_queue.interrupt();
+          _bounded_pool->interrupt();
         }
-        // Unconditional re-evaluation at every creation exit: with the
-        // source-exhaustion finish guard, "last task completed at T1,
-        // connector closed at T2>T1" has no later mark_task_completed() to
-        // re-check the pipeline — this call, observing the now-exhausted
-        // source, is the paired re-evaluation. Without it, normal fast-GPU
-        // queries would hang.
-        pipeline->update_pipeline_status(false);
-      } catch (const std::exception& e) {
-        SIRIUS_LOG_ERROR("Task Creator: Exception during task creation: {}", e.what());
-        _task_scheduler->terminate_query(std::current_exception());
-        stop();
-      }
-    });
+      });
   }
 }
 

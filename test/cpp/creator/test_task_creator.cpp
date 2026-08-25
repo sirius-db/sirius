@@ -20,6 +20,7 @@
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_scheduler.hpp"
+#include "scan_manager/split_connector.hpp"
 #include "utils/telemetry_utils.hpp"
 
 #include <cucascade/data/data_repository.hpp>
@@ -986,3 +987,89 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
 
 //   REQUIRE(completed.load() == num_calls);
 // }
+
+namespace {
+
+/// A source whose puller parks in a real split wait, like a scan whose producer has gone idle.
+class blocking_split_source final : public mock_sirius_physical_operator {
+ public:
+  blocking_split_source()
+  {
+    set_custom_hint(task_creation_hint{.hint = TaskCreationHint::READY, .producer = this});
+  }
+
+  bool all_ports_empty() override { return false; }
+
+  std::unique_ptr<op::operator_data> get_next_task_input_data() override
+  {
+    pulling.store(true);
+    auto split = connector.get_next_split();
+    return split.has_value() ? std::move(*split) : nullptr;
+  }
+
+  void interrupt_source() override { connector.interrupt(); }
+
+  scan_manager::split_connector connector;
+  std::atomic<bool> pulling{false};
+};
+
+}  // namespace
+
+// Early-LIMIT teardown shape: the query completes while this source's connector is still open
+// and its producer idle, so a creator worker parks in the split wait and nothing will ever
+// push or close. Joining the creator without interrupt_source() hangs forever; both
+// wait_for_completion() and drain_after_error() interrupt sources before the join.
+TEST_CASE("interrupt_source releases a creator worker parked in the split wait",
+          "[task_creator][completion-race]")
+{
+  test_fixture fixture;
+  // Declared before the creator: its destructor joins workers that still reference these.
+  mock_sirius_physical_operator sink_op;
+  auto pipeline = fixture.create_mock_pipeline();
+  sirius_pipeline_build_state build_state;
+  build_state.set_pipeline_sink(*pipeline, &sink_op, 0);
+  blocking_split_source source;
+  source.set_pipeline(pipeline);
+
+  task_creator creator(
+    creator::task_creator_config{
+      .thread_pool = {.num_threads = 1, .thread_name_prefix = "task_creator"}},
+    *fixture.memory_manager);
+  creator.set_client_context(*fixture.con.context);
+  creator.set_task_scheduler(fixture.pipeline_exec);
+
+  creator.start_thread_pool();
+  creator.schedule(&source);
+
+  const auto deadline   = std::chrono::steady_clock::now() + 15s;
+  const auto wait_until = [&deadline](auto&& done) {
+    while (!done()) {
+      if (std::chrono::steady_clock::now() > deadline) { return false; }
+      std::this_thread::sleep_for(5ms);
+    }
+    return true;
+  };
+
+  if (!wait_until([&] { return source.pulling.load(); })) {
+    // Free any half-parked worker and join before unwinding the stack it references.
+    source.interrupt_source();
+    creator.stop_thread_pool();
+    FAIL("worker never reached the pull");
+  }
+  // Give the worker time to enter the connector wait, not just set the flag.
+  std::this_thread::sleep_for(20ms);
+
+  source.interrupt_source();
+
+  std::atomic<bool> stopped{false};
+  std::thread stopper([&] {
+    creator.stop_thread_pool();
+    stopped.store(true);
+  });
+  const bool join_returned = wait_until([&] { return stopped.load(); });
+  // Never detach past stack references: re-interrupt (idempotent) and block on the join. A
+  // wedged join is the regression under test; the bounded check above already recorded it.
+  source.interrupt_source();
+  stopper.join();
+  if (!join_returned) { FAIL("creator join hung despite interrupt_source()"); }
+}

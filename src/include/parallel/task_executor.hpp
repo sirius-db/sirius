@@ -110,19 +110,6 @@ class itask_executor {
    */
   void drain_and_wait();
 
-  /**
-   * @brief Like drain_and_wait(), but VALIDATES the queue is empty instead of
-   * draining it.
-   *
-   * Stops the kiosk and interrupts the queue so the manager exits, waits for all
-   * in-flight thread-pool tasks, then — instead of draining — checks that the
-   * task queue is empty. If it is not, logs an error and throws: a non-empty queue
-   * at query completion means tasks were still scheduled when we declared the query
-   * done. Re-enables the queue/pool and restarts the manager thread either way
-   * (the throw happens after the executor is left in a restartable state).
-   */
-  void wait_and_validate_empty();
-
  protected:
   /**
    * @brief Main dispatch loop — must be implemented by each subclass.

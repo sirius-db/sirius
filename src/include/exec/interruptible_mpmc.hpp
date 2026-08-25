@@ -20,9 +20,11 @@
 
 #include <atomic>
 #include <concepts>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <thread>
 #include <vector>
 
 namespace sirius::exec {
@@ -57,6 +59,9 @@ class interruptible_mpmc {
   // Atomic flag to manage the shutdown state
   std::atomic<bool> _is_active{true};
 
+  // Pushes that passed the active check but have not finished enqueueing.
+  std::atomic<std::size_t> _pending_pushes{0};
+
   // Backstop poll interval (us) for wait_dequeue_timed. interrupt() wakes consumers directly, so
   // this only bounds the (not expected) case of a missed sentinel.
   static constexpr std::int64_t kPollBackstopUs = 10000;
@@ -78,17 +83,22 @@ class interruptible_mpmc {
   template <typename... Args>
   [[nodiscard]] bool emplace(Args&&... args)
   {
-    if (!_is_active.load(std::memory_order_relaxed)) { return false; }
-    queue.enqueue(std::make_unique<value_type>(std::forward<Args>(args)...));
-    return true;
+    return push(std::make_unique<value_type>(std::forward<Args>(args)...));
   }
 
   bool push(pointer_type item)
   {
     assert(item != nullptr);
-    if (!_is_active.load(std::memory_order_relaxed)) { return false; }
-    queue.enqueue(std::move(item));
-    return true;
+    // Register before checking the flag so interrupt() can wait for this enqueue.
+    _pending_pushes.fetch_add(1, std::memory_order_seq_cst);
+    if (!_is_active.load(std::memory_order_seq_cst)) {
+      _pending_pushes.fetch_sub(1, std::memory_order_release);
+      return false;
+    }
+    // Preserve enqueue allocation failures as rejected pushes.
+    const bool enqueued = queue.enqueue(std::move(item));
+    _pending_pushes.fetch_sub(1, std::memory_order_release);
+    return enqueued;
   }
 
   /**
@@ -129,14 +139,19 @@ class interruptible_mpmc {
   /**
    * \brief Clears the active flag AND wakes any blocked consumer immediately.
    *
-   * A consumer blocked in wait_dequeue_timed would otherwise not notice the interrupt until its
-   * poll interval elapsed, a stall paid on the teardown path of every query. Enqueuing null
-   * sentinels wakes the waiter at once; pop() maps a null item to its existing "interrupted"
-   * return. kWakeSentinels covers multiple consumers.
+   * Null sentinels wake blocked consumers immediately; pop() treats them as interruption.
+   *
+   * This is also a producer barrier: all pushes that observed an active queue finish before
+   * return. A subsequent drain therefore remains empty until reactivate().
    */
   void interrupt()
   {
-    _is_active.store(false);
+    _is_active.store(false, std::memory_order_seq_cst);
+    // This load must join the seq_cst order: acquire alone could miss an accepted producer's
+    // increment. Observing its release decrement also makes the enqueue visible to drain().
+    while (_pending_pushes.load(std::memory_order_seq_cst) != 0) {
+      std::this_thread::yield();
+    }
     for (int i = 0; i < kWakeSentinels; ++i) {
       queue.enqueue(pointer_type{});
     }

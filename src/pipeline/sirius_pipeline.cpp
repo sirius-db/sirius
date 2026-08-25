@@ -350,12 +350,19 @@ void sirius_pipeline::set_task_creator(sirius::creator::task_creator* tc) { _tas
 void sirius_pipeline::set_completion_handler(std::weak_ptr<completion_handler> handler)
 {
   std::lock_guard<std::mutex> lock(_status_mutex);
-  _completion_handler = std::move(handler);
+  _completion_handler           = std::move(handler);
+  _completion_handler_installed = true;
+}
+
+sirius_pipeline::completion_gate sirius_pipeline::lock_completion_gate()
+{
+  std::lock_guard<std::mutex> lock(_status_mutex);
+  return {_completion_handler.lock(), _completion_handler_installed};
 }
 
 void sirius_pipeline::notify_downstream_pipelines(bool original_pipeline)
 {
-  // Query-terminal: no downstream; early return avoids teardown race after mark_completed().
+  // Terminal pipelines have no downstream work after completion.
   if (is_query_terminal()) { return; }
 
   // Schedule output consumers via the task_creator so downstream pipelines
@@ -435,16 +442,14 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
       if (!pipeline_finished.load()) { end_nvtx_range_if_finished(); }
     }
 
-    // Signal from the transition so non-epilogue finish paths cannot strand execute() (#1486).
-    // Sampling under the lock pairs with set_completion_handler().
+    // Signal from the finish transition; some finish paths never reach the GPU epilogue.
     if (should_notify && is_query_terminal()) { completion = _completion_handler.lock(); }
-  }  // _status_mutex released here — notify_downstream_pipelines must run outside the lock
-     // to avoid holding the child pipeline mutex while acquiring a parent's
+  }
 
+  // Avoid holding the child status lock while acquiring a parent's.
   if (should_notify) { notify_downstream_pipelines(original_pipeline); }
 
-  // Keep this last: waking execute() permits teardown. The epilogue may also signal, but
-  // completion_handler makes duplicate calls no-ops.
+  // Keep this last: waking execute() permits teardown.
   if (completion) { completion->mark_completed(); }
 }
 

@@ -422,6 +422,8 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
   return std::move(*next);
 }
 
+void sirius_gpu_scan_operator::interrupt_source() { _split_connector->interrupt(); }
+
 //===----------------------------------------------------------------------===//
 // scan_manager wiring
 //===----------------------------------------------------------------------===//

@@ -17,8 +17,10 @@
 #include "catch.hpp"
 #include "exec/channel.hpp"
 #include "exec/config.hpp"
+#include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
+#include "pipeline/oom_reschedule_exception.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
 #include "pipeline/task_request.hpp"
 #include "scan/test_utils.hpp"
@@ -244,5 +246,161 @@ TEST_CASE("GPU pipeline executor schedules GPU tasks directly (push-model)",
     for (auto consumed_bytes : global_state->memory_consumption) {
       REQUIRE(consumed_bytes >= kReservationBytes);
     }
+  }
+}
+
+namespace {
+
+/// Records, at destructor entry, whether the query ledger still tracked this task. The ledger's
+/// lifetime guarantee is that a task's destructor — mark_task_completed() included — runs while
+/// the closure's slot still covers it, on every path out of the worker.
+class ledger_observing_task final : public sirius::pipeline::gpu_pipeline_task {
+ public:
+  enum class failure_mode { throw_error, reschedule_abort, reschedule_secondary_failure };
+
+  ledger_observing_task(uint64_t task_id,
+                        std::unique_ptr<test_gpu_pipeline_task_local_state> local_state,
+                        std::shared_ptr<test_gpu_pipeline_task_global_state> global_state,
+                        sirius::pipeline::completion_handler& handler,
+                        failure_mode mode,
+                        std::atomic<bool>& tracked_at_destruction,
+                        std::atomic<bool>& destroyed)
+    : gpu_pipeline_task(task_id,
+                        std::vector<cucascade::shared_data_repository*>{},
+                        std::move(local_state),
+                        std::move(global_state)),
+      _handler(handler),
+      _mode(mode),
+      _tracked_at_destruction(tracked_at_destruction),
+      _destroyed(destroyed)
+  {
+  }
+
+  ~ledger_observing_task() override
+  {
+    _tracked_at_destruction.store(_handler.outstanding_work() != 0);
+    _destroyed.store(true);
+  }
+
+  void execute(rmm::cuda_stream_view) override
+  {
+    if (_mode != failure_mode::throw_error) {
+      throw sirius::pipeline::task_reschedule_exception(nullptr, 0, "staged reschedule");
+    }
+    throw std::runtime_error("staged task failure");
+  }
+
+  // Secondary failure inside the reschedule handler; only reached when has_error is unset.
+  std::unique_ptr<sirius::pipeline::gpu_pipeline_task> create_rescheduled_task(
+    uint64_t, std::unique_ptr<sirius::pipeline::sirius_pipeline_task_local_state>) override
+  {
+    throw std::runtime_error("staged retry-construction failure");
+  }
+
+  sirius::pipeline::reservation_size_info get_estimated_reservation_size_info(
+    const cucascade::memory::memory_space*) const override
+  {
+    sirius::pipeline::reservation_size_info info;
+    info.reservation_size = kReservationBytes;
+    return info;
+  }
+
+  std::vector<sirius::op::sirius_physical_operator*> get_output_consumers() override { return {}; }
+
+ private:
+  sirius::pipeline::completion_handler& _handler;
+  failure_mode _mode;
+  std::atomic<bool>& _tracked_at_destruction;
+  std::atomic<bool>& _destroyed;
+};
+
+}  // namespace
+
+TEST_CASE("early-return paths destroy the task while the ledger still tracks it",
+          "[gpu_pipeline_executor][completion-race]")
+{
+  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
+  try {
+    cucascade::memory::reservation_manager_configurator builder;
+    builder.set_number_of_gpus(1)
+      .set_gpu_usage_limit(256 * 1024 * 1024)
+      .set_reservation_fraction_per_gpu(0.75)
+      .set_per_numa_region_capacity(1 * 1024 * 1024 * 1024)
+      .use_gpu_id_as_host_id()
+      .track_reservation_per_stream(false)
+      .set_reservation_fraction_per_numa_region(0.75);
+    auto space_configs = builder.build();
+    manager =
+      std::make_unique<sirius::memory::sirius_memory_reservation_manager>(std::move(space_configs));
+  } catch (const std::exception& e) {
+    WARN("Skipping test due to insufficient GPUs: " << e.what());
+    return;
+  }
+  auto* mem_space = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  if (!mem_space) {
+    WARN("Skipping test because no GPU memory space is available.");
+    return;
+  }
+
+  const auto run_mode = [&](ledger_observing_task::failure_mode mode, bool pre_error) {
+    sirius::exec::channel<std::unique_ptr<sirius::pipeline::task_request>> request_channel;
+    sirius::exec::thread_pool_config config;
+    config.num_threads        = 1;
+    config.thread_name_prefix = "gpu-pipeline-test";
+    sirius::pipeline::gpu_pipeline_executor executor(config,
+                                                     mem_space,
+                                                     request_channel.make_publisher(),
+                                                     nullptr,
+                                                     sirius::test::make_test_telemetry_context());
+    sirius::pipeline::completion_handler handler;
+    executor.set_completion_handler(&handler);
+    if (pre_error) {
+      // has_error without a failed future: an error that lost the completion race.
+      handler.mark_completed();
+      handler.report_error(std::string_view("late failure"));
+    }
+
+    std::atomic<bool> tracked_at_destruction{false};
+    std::atomic<bool> destroyed{false};
+    auto local_state = std::make_unique<test_gpu_pipeline_task_local_state>(
+      std::make_unique<sirius::op::pipelineable_operator_data>(
+        std::vector<std::shared_ptr<cucascade::data_batch>>{}));
+    auto task = std::make_unique<ledger_observing_task>(
+      1,
+      std::move(local_state),
+      std::make_shared<test_gpu_pipeline_task_global_state>(),
+      handler,
+      mode,
+      tracked_at_destruction,
+      destroyed);
+    task->set_work_slot(handler.acquire_work());
+
+    executor.start();
+    executor.schedule(std::move(task));
+
+    const auto start = std::chrono::steady_clock::now();
+    while (!destroyed.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      if (std::chrono::steady_clock::now() - start > std::chrono::seconds(20)) {
+        executor.stop();
+        FAIL("staged task was never destroyed");
+      }
+    }
+    executor.stop();
+    REQUIRE(tracked_at_destruction.load());
+    REQUIRE(handler.has_error());
+  };
+
+  SECTION("generic error path")
+  {
+    run_mode(ledger_observing_task::failure_mode::throw_error, false);
+  }
+  SECTION("reschedule abort path (has_error set by a late error)")
+  {
+    run_mode(ledger_observing_task::failure_mode::reschedule_abort, true);
+  }
+  SECTION("secondary failure inside the reschedule handler is reported, not swallowed")
+  {
+    run_mode(ledger_observing_task::failure_mode::reschedule_secondary_failure, false);
   }
 }

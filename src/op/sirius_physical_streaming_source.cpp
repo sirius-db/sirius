@@ -17,6 +17,8 @@
 #include "op/sirius_physical_streaming_source.hpp"
 
 #include "creator/task_creator.hpp"
+#include "exec/work_tracker.hpp"
+#include "pipeline/completion_handler.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
 
@@ -49,19 +51,34 @@ void sirius_physical_streaming_source::set_pipeline(
 {
   sirius_physical_operator::set_pipeline(pipeline);
 
-  // Weak: callbacks run on producer threads.
+  // Work slots gate teardown; the weak pointer avoids extending the plan lifetime.
   duckdb::weak_ptr<pipeline::sirius_pipeline> weak_pipeline = pipeline;
 
-  // Empty/late-closed stream finishes with no task in flight; original_pipeline=false re-arms
-  // downstream consumers.
+  // A stream can end with no task available to update pipeline status.
   _input->set_on_end_of_stream([weak_pipeline] {
-    if (auto p = weak_pipeline.lock()) { p->update_pipeline_status(false); }
+    auto p = weak_pipeline.lock();
+    if (!p) { return; }
+    auto gate = p->lock_completion_gate();
+    exec::work_tracker::slot work;
+    if (gate.installed) {
+      if (!gate.handler) { return; }  // query over: never touch a retired pipeline
+      work = gate.handler->acquire_work();
+      if (!work) { return; }  // ledger closed: teardown owns the plan now
+    }
+    p->update_pipeline_status(false);
   });
 
   // Self-nomination (on_data → schedule(head)); schedule() only enqueues.
   _input->set_on_data([weak_pipeline] {
     auto p = weak_pipeline.lock();
     if (!p) { return; }
+    auto gate = p->lock_completion_gate();
+    exec::work_tracker::slot work;
+    if (gate.installed) {
+      if (!gate.handler) { return; }
+      work = gate.handler->acquire_work();
+      if (!work) { return; }
+    }
     auto* creator = p->get_task_creator();
     auto head     = p->get_source();
     if (creator && head) { creator->schedule(head.get()); }

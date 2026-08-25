@@ -82,6 +82,12 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   /// \throws The exception passed to close() (if any) once the queue is drained.
   std::optional<std::unique_ptr<op::operator_data>> get_next_split();
 
+  /// \brief Permanently wake blocked get_next_split() callers; they return nullopt.
+  ///
+  /// For teardown, where the producer may never push or close again. Unlike close(),
+  /// push_split() stays legal afterwards; late splits are simply never consumed.
+  void interrupt();
+
   /// \brief True iff close() has been called and the queue is drained.
   [[nodiscard]] bool is_closed() const;
 
@@ -129,6 +135,7 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   std::condition_variable _cv;
   std::deque<std::unique_ptr<op::operator_data>> _splits;
   bool _closed{false};
+  bool _interrupted{false};
   std::exception_ptr _exception;
   /// steady_clock ms timestamp of the last get_next_split() pop (0 = never).
   std::atomic<std::int64_t> _last_pop_ms{0};

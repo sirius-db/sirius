@@ -118,10 +118,14 @@ After meta-pipeline construction, `initialize_internal()` applies Sirius-specifi
 
 **File:** `src/sirius_engine.cpp` — `execute()`
 
-1. Calls `SiriusContext::create_query()` with the finalized pipelines
-2. Query preparation creates a `completion_handler` and installs it on the GPU executors and query-terminal pipelines
-3. Calls `task_scheduler::start_query()`, which schedules the initial scan operator and returns the completion future
-4. The main thread blocks on `future.get()` and then drains in-flight work before returning
+1. Creates a `query` object from `new_scheduled` pipelines with a pipeline hashmap
+2. `task_scheduler::prepare_for_query(query)` (from `SiriusContext::create_query`) installs the
+   per-query `completion_handler` on executors, the task creator, and pipelines
+3. Calls `task_scheduler.start_query()`, which schedules the first scan operator and returns the
+   future
+4. The main thread waits on the future, then calls `wait_for_completion()` to drain the work
+   ledger and surface late errors before plan teardown — see
+   [The work ledger](pipeline-execution.md#the-work-ledger)
 
 ## Step 6: Scan Execution
 
@@ -152,8 +156,9 @@ The GPU executor's manager loop:
    - If not complete: schedule downstream consumers via `task_creator->schedule()`
    - If complete: `completion_handler->mark_completed()`
 
-The GPU epilogue usually signals completion. A query-terminal pipeline also signals from
-`sirius_pipeline::update_pipeline_status()`, covering finish transitions driven by other threads.
+The GPU epilogue may signal completion, but terminal pipelines also signal from
+`update_pipeline_status()` — see the
+[Completion Contract](pipeline-execution.md#completion-contract).
 
 ## Step 8: Task Creation Cycle
 
@@ -187,9 +192,9 @@ If any task throws an exception during execution:
 1. The GPU executor catches it and calls `completion_handler->report_error(exception)`
 2. `drain_after_error()` is called on the pipeline executor which:
    - Stops the task creator threads
-   - Drains the task queue
-   - Calls `drain_and_wait()` on the GPU executors
-   - Restarts the task creator for the next query
+   - Stops downgrade workers and drains scheduler and executor queues
+   - Waits for the work ledger to reach zero
+   - Leaves the task creator parked until the next `prepare_for_query()`
 3. The error propagates through the future to the main thread, surfacing as an error-carrying result at `PhysicalSiriusExecution::GetData()`
 
 On the transparent path, that error triggers the runtime CPU fallback described in Step 2 (unless `enable_duckdb_fallback` is false, the error is a user interrupt, or the query reads S3). The fallback runs the stashed DuckDB CPU plan in the same transaction, so a runtime GPU failure completes on CPU rather than failing the query.
@@ -214,9 +219,11 @@ sequenceDiagram
     Iface->>Engine: initialize(result_collector)
     Engine->>Engine: Build pipelines, rewrite scans to GPU scan source, wire repos
     Iface->>Engine: execute()
-    Engine->>PE: start_query(pipelines)
+    Engine->>PE: prepare_for_query(pipelines)
     PE->>CH: create completion_handler
-    PE->>SM: prepare_for_query (split providers + connectors)
+    Engine->>TC: prepare_for_query (global states + lookahead)
+    Engine->>SM: prepare_for_query (split providers + connectors)
+    Engine->>PE: start_query()
     SM->>SM: drive splits through io_context + prefetch cache
     PE->>GPE: schedule initial GPU scan tasks
     GPE->>SM: pull splits via split_connector

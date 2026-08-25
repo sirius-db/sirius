@@ -696,6 +696,7 @@ set(TEST_SOURCES
     test/cpp/exec/test_stream_bind_catalog.cpp
     test/cpp/exec/test_stream_session.cpp
     test/cpp/exec/test_streaming_fragment.cpp
+    test/cpp/exec/test_work_tracker.cpp
     test/cpp/expression/test_ast_aggregate.cpp
     test/cpp/expression/test_ast_clone.cpp
     test/cpp/expression/test_ast_substitute.cpp
@@ -776,6 +777,7 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_insert_delta_job.cpp
     test/cpp/scan_manager/test_memory_prefetcher_accounting.cpp
     test/cpp/scan_manager/test_mvcc_mask_job.cpp
+    test/cpp/scan_manager/test_split_connector.cpp
     test/cpp/scan_manager/test_pinned_chunk_stats.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp

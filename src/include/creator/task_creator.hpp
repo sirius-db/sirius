@@ -22,6 +22,7 @@
 #include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
 #include "exec/queue_priority.hpp"
+#include "exec/work_tracker.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -41,6 +42,7 @@
 namespace sirius::pipeline {
 class task_scheduler;
 class sirius_pipeline_task_global_state;
+class completion_handler;
 }  // namespace sirius::pipeline
 
 namespace sirius::planner {
@@ -69,6 +71,8 @@ namespace sirius::creator {
  */
 
 struct task_creation_request {
+  //! Counts the pending request as query work. Declared first so it is released last.
+  exec::work_tracker::slot work_slot;
   op::sirius_physical_operator* node;
   request_type type = request_type::active;
 };
@@ -113,6 +117,9 @@ class task_creator {
   /// \brief sets pipeline executor reference
   void set_task_scheduler(sirius::pipeline::task_scheduler& task_scheduler);
 
+  /// \brief Set the handler used to account for requests and tasks created for this query.
+  void set_completion_handler(std::shared_ptr<pipeline::completion_handler> handler);
+
   /// \brief prepare global states for all pipelines in the query
   void prepare_for_query(const sirius::planner::query& query);
 
@@ -145,8 +152,10 @@ class task_creator {
    *
    * Call this after a query completes (future resolved) but before destroying the engine/operators
    * to ensure no stale operator pointers are accessed by the task creator threads.
+   *
+   * @param reactivate Reopen the request queue after draining. Pass false to leave it parked.
    */
-  void drain_pending_tasks();
+  void drain_pending_tasks(bool reactivate = true);
 
   /**
    * @brief Schedule a task creation info for processing.
@@ -215,6 +224,9 @@ class task_creator {
    */
   void manager_loop();
 
+  /// Return a synchronized snapshot of the current completion handler.
+  [[nodiscard]] std::shared_ptr<pipeline::completion_handler> current_completion_handler() const;
+
   std::atomic<bool> _running;
   task_creator_config _config;
   std::unique_ptr<exec::bounded_thread_pool> _bounded_pool;
@@ -222,6 +234,9 @@ class task_creator {
   ::duckdb::ClientContext* _client_context;
   // Non-owning; SiriusContext stops and joins this creator before destroying the scheduler.
   sirius::pipeline::task_scheduler* _task_scheduler{nullptr};
+  /// Guarded because scheduling may continue from executor epilogues.
+  std::shared_ptr<pipeline::completion_handler> _completion_handler;
+  mutable std::mutex _completion_handler_mutex;
   sirius::memory::sirius_memory_reservation_manager& _mem_res_mgr;
   std::atomic<uint64_t> _task_id{0};
 
@@ -240,6 +255,8 @@ class task_creator {
   std::unique_ptr<duckdb::ThreadContext> _thread_context;
   std::unique_ptr<duckdb::ExecutionContext> _execution_context;
   std::mutex _global_state_mutex;  // Protect concurrent access to the map
+  /// Serializes pool start/stop. Lock order: global state, shutdown, then lookahead.
+  std::mutex _shutdown_mutex;
 
   /// Shared GPU<->NUMA topology index for NUMA-aware GPU routing (may be null).
   /// Scoped to the memory manager's reserved GPU/HOST spaces:

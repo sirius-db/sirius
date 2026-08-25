@@ -201,7 +201,17 @@ void sirius_engine::execute()
   auto future = sirius_ctx->get_task_scheduler().start_query();
   try {
     future.get();
+    // Rethrows any error preserved after losing the completion race.
     sirius_ctx->get_task_scheduler().wait_for_completion();
+  } catch (const pipeline::premature_completion_error& e) {
+    SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
+    sirius_ctx->get_task_scheduler().drain_after_error();
+    // Teardown has now joined every reporter; a real error recorded meanwhile explains the
+    // outstanding work and outranks the generic timeout.
+    if (auto real_error = sirius_ctx->get_task_scheduler().take_preserved_error()) {
+      std::rethrow_exception(real_error);
+    }
+    throw;
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
     // Drain all in-flight GPU tasks before returning.  QueryEnd() will call

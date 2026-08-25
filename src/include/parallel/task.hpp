@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "exec/work_tracker.hpp"
 #include "helper/helper.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
@@ -26,6 +27,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <utility>
 
 namespace sirius {
 namespace parallel {
@@ -78,6 +80,9 @@ class itask_global_state {
  * Interface for concrete executor tasks.
  */
 class itask {
+  //! Query-work slot. Declared first so it is released after task state and input batches.
+  exec::work_tracker::slot _work_slot;
+
  public:
   itask(uint64_t task_id,
         std::unique_ptr<itask_local_state> local_state,
@@ -120,6 +125,12 @@ class itask {
   itask_local_state* local_state() noexcept { return _local_state.get(); }
   [[nodiscard]] itask_global_state* global_state() noexcept { return _global_state.get(); }
   [[nodiscard]] uint64_t get_task_id() const noexcept { return _task_id; }
+
+  /// Set this task's query-work slot.
+  void set_work_slot(exec::work_tracker::slot slot) noexcept { _work_slot = std::move(slot); }
+
+  /// Move the slot to a continuation of this task.
+  [[nodiscard]] exec::work_tracker::slot take_work_slot() noexcept { return std::move(_work_slot); }
 
  protected:
   uint64_t _task_id;
