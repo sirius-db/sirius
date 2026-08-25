@@ -1332,6 +1332,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     if (file_paths.empty()) {
       throw InvalidInputException("pin_table: no parquet files matched path: " + data.args.path);
     }
+    sirius::op::scan::order_pin_file_paths(
+      file_paths, sirius_ctx->get_config().get_operator_params().pin_table_natural_file_order);
     auto info =
       build_parquet_pin_info(scan_mgr, file_paths, data.args.cols, batch_size, pinned_column_types);
     ingestible = sirius::op::scan::make_ingestible(std::move(info));
@@ -2328,6 +2330,16 @@ static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
                    params->enable_runtime_distinct_build_probe);
 }
 
+static void SetPinTableNaturalFileOrder(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                            = lock_operator_params_slot(context);
+  params->pin_table_natural_file_order = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config PIN_TABLE_NATURAL_FILE_ORDER to {}",
+                   params->pin_table_natural_file_order);
+}
+
 static void SetEnableDynamicFilter(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2598,6 +2610,13 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                     LogicalType::UBIGINT,
                     Value::UBIGINT(operator_defaults.concat_batch_bytes),
                     SetConcatBatchBytes);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "pin_table_natural_file_order",
+                    "opt in to natural multi-file parquet ordering while pinning",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.pin_table_natural_file_order),
+                    SetPinTableNaturalFileOrder);
 
   // Add in config options for special JIT implementation for regex
   add_sirius_option(config,

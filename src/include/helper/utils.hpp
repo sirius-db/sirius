@@ -17,9 +17,57 @@
 #pragma once
 
 // standard library
+#include <cstddef>
+#include <string_view>
 #include <type_traits>
 
 namespace sirius::utils {
+
+/**
+ * @brief Compares names in natural numeric order
+ *
+ * ASCII digit runs compare by magnitude, with fewer leading zeros first on ties; other bytes
+ * compare unsigned.
+ *
+ * @param lhs Left name
+ * @param rhs Right name
+ * @return True if `lhs` precedes `rhs` in natural order
+ */
+inline bool natural_name_less(std::string_view lhs, std::string_view rhs)
+{
+  std::size_t i = 0, j = 0;
+  auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
+  while (i < lhs.size() && j < rhs.size()) {
+    if (is_digit(lhs[i]) && is_digit(rhs[j])) {
+      std::size_t li = i, rj = j;
+      while (li < lhs.size() && lhs[li] == '0')
+        ++li;
+      while (rj < rhs.size() && rhs[rj] == '0')
+        ++rj;
+      std::size_t le = li, re = rj;
+      while (le < lhs.size() && is_digit(lhs[le]))
+        ++le;
+      while (re < rhs.size() && is_digit(rhs[re]))
+        ++re;
+      auto const llen = le - li;
+      auto const rlen = re - rj;
+      if (llen != rlen) { return llen < rlen; }
+      auto const lrun = lhs.substr(li, llen);
+      auto const rrun = rhs.substr(rj, rlen);
+      if (lrun != rrun) { return lrun < rrun; }
+      if ((li - i) != (rj - j)) { return (li - i) < (rj - j); }
+      i = le;
+      j = re;
+      continue;
+    }
+    auto const lc = static_cast<unsigned char>(lhs[i]);
+    auto const rc = static_cast<unsigned char>(rhs[j]);
+    if (lc != rc) { return lc < rc; }
+    ++i;
+    ++j;
+  }
+  return (lhs.size() - i) < (rhs.size() - j);
+}
 
 template <typename T>
 inline constexpr T ceil_div(T a, T b)

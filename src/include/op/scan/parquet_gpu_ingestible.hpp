@@ -94,17 +94,20 @@ class parquet_ingestible_table_info : public ingestible_table_info {
 };
 
 /// Canonical identity form for a parquet file path so pinned-cache matching
-/// (@ref cache_entry_info::can_serve_with_columns, a raw set-equality on
-/// resolved_file_paths) is independent of spelling: relative vs absolute,
-/// redundant '/', './..', 'file://', and symlinks all collapse. Remote URIs
-/// (scheme://) pass through. Apply ONLY at the cache-identity boundary
-/// (cache_entry_info): resolved_file_paths on the bind info stay as bound, so
-/// Hive partition parsing reads the original path and is not confused by a
-/// symlink-resolved 'key=value' directory segment.
+/// (@ref cache_entry_info::can_serve_with_columns) is independent of spelling: relative vs
+/// absolute, redundant '/', './..', 'file://', and symlinks all collapse. Remote URIs (scheme://)
+/// pass through. Canonical paths are also comparison keys for opt-in natural pin ordering, but
+/// resolved_file_paths on the bind info stay as bound so Hive partition parsing reads the original
+/// path and is not confused by a symlink-resolved 'key=value' directory segment.
 [[nodiscard]] std::string canonical_scan_file_path(std::string const& raw);
 
 /// In-place @ref canonical_scan_file_path over a resolved-file-path vector.
 void canonicalize_scan_file_paths(std::vector<std::string>& paths);
+
+/// Orders paths in place by natural comparison of precomputed canonical keys when enabled.
+/// Raw spellings stay in @p paths; comparison ties use raw spelling, then input order. When
+/// disabled, the input order is unchanged.
+void order_pin_file_paths(std::vector<std::string>& paths, bool natural_order);
 
 //===----------------------------------------------------------------------===//
 // parquet_split_info

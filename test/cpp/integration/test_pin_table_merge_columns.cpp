@@ -29,21 +29,26 @@
 // single-GPU CI — which is exactly how this bug slipped through. This test runs
 // on a single GPU so the regression is caught in standard CI.
 
+#include "op/scan/parquet_gpu_ingestible.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <duckdb/common/file_system.hpp>
 #include <unistd.h>
 #include <utils/sirius_test_env.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <set>
 #include <string>
 #include <system_error>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -52,6 +57,39 @@ namespace {
 // Small fixture: 100k rows x 3 int64 columns -> ~2.4 MiB decoded, trivially
 // GPU-resident. The merge-union assertion does not need a multi-chunk surface.
 constexpr std::int64_t kRows = 100'000;
+
+constexpr std::size_t kNumberedFileCount = 12;
+
+class scoped_test_options {
+ public:
+  scoped_test_options()
+  {
+    if (auto const* value = std::getenv("SIRIUS_ENABLE_TEST_OPTIONS")) { _original = value; }
+    setenv("SIRIUS_ENABLE_TEST_OPTIONS", "1", 1);
+  }
+
+  ~scoped_test_options()
+  {
+    if (_original) {
+      setenv("SIRIUS_ENABLE_TEST_OPTIONS", _original->c_str(), 1);
+    } else {
+      unsetenv("SIRIUS_ENABLE_TEST_OPTIONS");
+    }
+  }
+
+  scoped_test_options(scoped_test_options const&)            = delete;
+  scoped_test_options& operator=(scoped_test_options const&) = delete;
+
+ private:
+  std::optional<std::string> _original;
+};
+
+struct pinned_entry_snapshot {
+  std::vector<std::string> resolved_file_paths;
+  std::vector<std::string> column_names;
+  std::set<std::string> materialized_columns;
+  std::size_t num_rows;
+};
 
 // A throwaway, Sirius-disabled DuckDB writes the parquet so the extension callback does not
 // build a SiriusContext on it — the real instance is created later from the yaml.
@@ -65,6 +103,27 @@ void generate_parquet(fs::path const& path)
                        std::to_string(kRows) + ")) TO '" + path.string() + "' (FORMAT PARQUET);");
     REQUIRE(r);
     REQUIRE_FALSE(r->HasError());
+  }
+  unsetenv("SIRIUS_DISABLE");
+}
+
+void generate_numbered_parquet_surface(fs::path const& root)
+{
+  setenv("SIRIUS_DISABLE", "1", 1);
+  {
+    duckdb::DuckDB gen_db(nullptr);
+    duckdb::Connection gen(gen_db);
+    for (std::size_t file_index = 0; file_index < kNumberedFileCount; ++file_index) {
+      auto const file_dir = root / ("p" + std::to_string(file_index));
+      fs::create_directories(file_dir);
+      auto const path = file_dir / "data.parquet";
+      auto r          = gen.Query("COPY (SELECT CAST(" + std::to_string(file_index) +
+                         " AS BIGINT) AS k, CAST(" + std::to_string(file_index * 2) +
+                         " AS BIGINT) AS v, CAST(" + std::to_string(file_index * 3) +
+                         " AS BIGINT) AS w) TO '" + path.string() + "' (FORMAT PARQUET);");
+      REQUIRE(r);
+      REQUIRE_FALSE(r->HasError());
+    }
   }
   unsetenv("SIRIUS_DISABLE");
 }
@@ -105,7 +164,135 @@ void write_config(fs::path const& yaml_path)
        "    max_build_hash_table_bytes: 90000000\n";
 }
 
+std::optional<pinned_entry_snapshot> snapshot_pinned_entry(
+  sirius::scan_manager::sirius_scan_manager const& manager, std::string_view wanted_name)
+{
+  std::optional<pinned_entry_snapshot> snapshot;
+  manager.visit_pinned_entries([&](std::string_view name, auto const& entry) {
+    if (name != wanted_name) { return true; }
+
+    pinned_entry_snapshot value;
+    value.resolved_file_paths = entry.cache_info.resolved_file_paths;
+    value.column_names        = entry.cache_info.column_names();
+    value.num_rows            = entry.num_rows;
+    for (auto const& column : entry.data_batches_by_column) {
+      value.materialized_columns.insert(column.first);
+    }
+    snapshot = std::move(value);
+    return false;
+  });
+  return snapshot;
+}
+
 }  // namespace
+
+TEST_CASE("pin_table - natural-order re-pin replaces an incompatible ordered source identity",
+          "[pin_table][replacement][natural_file_order][scan_manager]")
+{
+  if (sirius::test::g_shared_env && sirius::test::g_shared_env->is_active()) {
+    sirius::test::g_shared_env->pause();
+  }
+  if (sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()) {
+    sirius::test::g_integration_env->pause();
+  }
+  if (sirius::test::g_integration_env_2gpu && sirius::test::g_integration_env_2gpu->is_active()) {
+    sirius::test::g_integration_env_2gpu->pause();
+  }
+
+  auto tmp = fs::temp_directory_path() / ("sirius-pin-natural-repin-" + std::to_string(::getpid()));
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp);
+  generate_numbered_parquet_surface(tmp);
+
+  auto yaml_path = tmp / "pin_natural_repin.yaml";
+  write_config(yaml_path);
+  REQUIRE(fs::exists(yaml_path));
+
+  auto relative_dir = fs::relative(tmp, fs::current_path(), ec);
+  REQUIRE_FALSE(ec);
+  auto const absolute_glob = (tmp / "p*" / "data.parquet").string();
+  auto const relative_glob = (relative_dir / "p*" / "data.parquet").generic_string();
+
+  std::vector<std::string> explicit_natural_identity;
+  explicit_natural_identity.reserve(kNumberedFileCount);
+  for (std::size_t file_index = 0; file_index < kNumberedFileCount; ++file_index) {
+    explicit_natural_identity.push_back(sirius::op::scan::canonical_scan_file_path(
+      (tmp / ("p" + std::to_string(file_index)) / "data.parquet").string()));
+  }
+
+  scoped_test_options test_options;
+  {
+    sirius::test::shared_test_env local_env(yaml_path);
+    auto con        = local_env.make_connection();
+    auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(sirius_ctx != nullptr);
+    REQUIRE_FALSE(sirius_ctx->get_config().get_operator_params().pin_table_natural_file_order);
+
+    auto& file_system   = duckdb::FileSystem::GetFileSystem(*con.context);
+    auto absolute_files = file_system.GlobFiles(absolute_glob);
+    std::vector<std::string> expected_default_identity;
+    expected_default_identity.reserve(absolute_files.size());
+    for (auto const& file : absolute_files) {
+      expected_default_identity.push_back(file.path);
+    }
+    auto expected_natural_identity = expected_default_identity;
+    sirius::op::scan::canonicalize_scan_file_paths(expected_default_identity);
+    sirius::op::scan::order_pin_file_paths(expected_natural_identity, true);
+    sirius::op::scan::canonicalize_scan_file_paths(expected_natural_identity);
+    REQUIRE(expected_default_identity.size() == kNumberedFileCount);
+    REQUIRE(expected_default_identity != expected_natural_identity);
+    REQUIRE(expected_natural_identity == explicit_natural_identity);
+
+    auto first_pin = con.Query("CALL pin_table('" + absolute_glob +
+                               "', tier='gpu', name='natural_repin', cols=['k', 'v']);");
+    REQUIRE(first_pin);
+    if (first_pin->HasError()) { UNSCOPED_INFO("first pin error: " << first_pin->GetError()); }
+    REQUIRE_FALSE(first_pin->HasError());
+
+    auto const& manager = sirius_ctx->get_scan_manager();
+    auto first          = snapshot_pinned_entry(manager, "natural_repin");
+    REQUIRE(first.has_value());
+    REQUIRE(first->resolved_file_paths == expected_default_identity);
+    REQUIRE(first->column_names == std::vector<std::string>{"k", "v"});
+    REQUIRE(first->materialized_columns == std::set<std::string>{"k", "v"});
+    REQUIRE(first->num_rows == kNumberedFileCount);
+
+    auto enable_natural = con.Query("SET pin_table_natural_file_order = true;");
+    REQUIRE(enable_natural);
+    REQUIRE_FALSE(enable_natural->HasError());
+    REQUIRE(sirius_ctx->get_config().get_operator_params().pin_table_natural_file_order);
+
+    auto relative_files = file_system.GlobFiles(relative_glob);
+    std::vector<std::string> relative_natural_identity;
+    relative_natural_identity.reserve(relative_files.size());
+    for (auto const& file : relative_files) {
+      relative_natural_identity.push_back(file.path);
+    }
+    sirius::op::scan::order_pin_file_paths(relative_natural_identity, true);
+    sirius::op::scan::canonicalize_scan_file_paths(relative_natural_identity);
+    REQUIRE(relative_natural_identity == explicit_natural_identity);
+
+    auto second_pin = con.Query("CALL pin_table('" + relative_glob +
+                                "', tier='gpu', name='natural_repin', cols=['k', 'w']);");
+    REQUIRE(second_pin);
+    if (second_pin->HasError()) { UNSCOPED_INFO("second pin error: " << second_pin->GetError()); }
+    REQUIRE_FALSE(second_pin->HasError());
+
+    auto second = snapshot_pinned_entry(manager, "natural_repin");
+    REQUIRE(second.has_value());
+    REQUIRE(second->resolved_file_paths == explicit_natural_identity);
+    REQUIRE(second->column_names == std::vector<std::string>{"k", "w"});
+    REQUIRE(second->materialized_columns == std::set<std::string>{"k", "w"});
+    REQUIRE(second->num_rows == kNumberedFileCount);
+
+    auto unpin = con.Query("CALL unpin_table('natural_repin');");
+    REQUIRE(unpin);
+    REQUIRE_FALSE(unpin->HasError());
+  }
+
+  fs::remove_all(tmp, ec);
+}
 
 // NB: no [integration]/[shared_context] tag — those make the Catch2 listener bind a shared
 // env, which would fight this test's own local_env. Like the other isolated-context

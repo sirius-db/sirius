@@ -98,6 +98,8 @@ struct valid_domain_coverage_threshold {
 /// (NVIDIA/cuCollections#834) on some key distributions. Re-enable once the fix ships in libcudf.
 constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
+constexpr bool DEFAULT_PIN_TABLE_NATURAL_FILE_ORDER = false;
+
 }  // namespace config
 
 /// Operator parameters shared between planning and execution.
@@ -151,6 +153,10 @@ struct operator_params {
   /// direct programmatic control of this field to exercise both implementations. See
   /// DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE.
   bool enable_runtime_distinct_build_probe = config::DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE;
+
+  /// Opt in to sorting multi-file Parquet inputs by canonical-path natural order before pinning.
+  /// This can change pinned row order; the DuckDB setting is exposed only with test options.
+  bool pin_table_natural_file_order = config::DEFAULT_PIN_TABLE_NATURAL_FILE_ORDER;
 
   /// Enable dynamic filters for eligible hash joins.
   bool enable_dynamic_filter = true;

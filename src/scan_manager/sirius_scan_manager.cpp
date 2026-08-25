@@ -1235,10 +1235,10 @@ void sirius_scan_manager::insert_pinned_entry(
 
   auto existing_it = _pinned_entries.find(name);
   if (existing_it != _pinned_entries.end()) {
-    // Same-row-count merge only applies when the completeness contracts match.
+    // Positional merge only applies when row coverage and ordered source identity match.
     // Mixing a full pin with a partial pin produces an entry whose columns came
     // from different row coverage — drop and rebuild instead.
-    if (existing_it->second.num_rows == new_num_rows) {
+    if (pinned_entry_merge_eligible(existing_it->second, cache_info, new_num_rows)) {
       // A merge is only valid when the new pin reproduces the existing batch
       // boundaries and placement. The round-robin counter restarts at chunk 0
       // per pin_table call, and chunks at index i across all columns share a
@@ -1376,7 +1376,13 @@ void sirius_scan_manager::insert_pinned_entry(
       }
       return;
     }
-    // Row count or completeness contract differs → drop the stale entry and rebuild below.
+    if (existing_it->second.num_rows == new_num_rows) {
+      SIRIUS_LOG_INFO(
+        "[sirius_scan_manager::insert_pinned_entry] replacing pinned entry '{}' because its "
+        "ordered source identity changed",
+        name);
+    }
+    // Row count or ordered source identity differs → drop the stale entry and rebuild below.
     _pinned_entries.erase(existing_it);
   }
 
@@ -1593,6 +1599,28 @@ pinned_entry const* sirius_scan_manager::find_pinned_entry_for_parquet_files(
     if (entry.cache_info.matches_parquet_files(resolved_file_paths)) { return &entry; }
   }
   return nullptr;
+}
+
+bool merge_source_identity_matches(const cache_entry_info& existing,
+                                   const cache_entry_info& incoming) noexcept
+{
+  bool const existing_is_parquet = !existing.resolved_file_paths.empty();
+  bool const incoming_is_parquet = !incoming.resolved_file_paths.empty();
+  if (existing_is_parquet || incoming_is_parquet) {
+    return existing_is_parquet == incoming_is_parquet &&
+           existing.resolved_file_paths == incoming.resolved_file_paths;
+  }
+
+  return existing.catalog_name == incoming.catalog_name &&
+         existing.schema_name == incoming.schema_name && existing.table_name == incoming.table_name;
+}
+
+bool pinned_entry_merge_eligible(const pinned_entry& existing,
+                                 const cache_entry_info& incoming,
+                                 std::size_t incoming_num_rows) noexcept
+{
+  return existing.num_rows == incoming_num_rows &&
+         merge_source_identity_matches(existing.cache_info, incoming);
 }
 
 void validate_column_storage_shape(pinned_column_storage_matrix const& matrix,

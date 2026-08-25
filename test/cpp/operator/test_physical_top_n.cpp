@@ -23,6 +23,8 @@
 #include <op/sirius_physical_top_n.hpp>
 #include <op/sirius_physical_top_n_merge.hpp>
 
+#include <limits>
+
 using namespace sirius::op;
 using sirius::op::pipelineable_operator_data;
 using namespace cucascade;
@@ -242,4 +244,130 @@ TEST_CASE("sirius_physical_top_n_merge handles empty batches", "[physical_top_n_
   auto view = sirius::get_cudf_table_view(
     *dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches()[0]);
   REQUIRE(view.num_rows() == 0);
+}
+
+TEST_CASE("sirius_physical_top_n reduces only oversized input batches", "[physical_top_n]")
+{
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+
+  // Pipeline tasks can pass multiple batches to TOP_N.
+  std::vector<std::shared_ptr<data_batch>> batches;
+  batches.push_back(make_batch(*space, {1, 2, 3, 4, 5, 6, 7}, {10, 20, 30, 40, 50, 60, 70}));
+  batches.push_back(make_batch(*space, {0, 2}, {0, 20}));
+  batches.push_back(make_batch(*space, {}, {}));
+
+  duckdb::vector<duckdb::LogicalType> types;
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+
+  auto make_top_n_orders = [] {
+    duckdb::vector<duckdb::BoundOrderByNode> orders;
+    orders.push_back(make_order(0, duckdb::OrderType::DESCENDING));
+    return orders;
+  };
+
+  constexpr std::size_t limit  = 3;
+  constexpr std::size_t offset = 2;
+
+  sirius_physical_top_n topn(
+    sirius::from_duckdb_vec(types), make_top_n_orders(), limit, offset, nullptr, 0);
+
+  auto local_out = topn.execute(pipelineable_operator_data(batches), cudf::get_default_stream());
+  auto const& candidates =
+    dynamic_cast<const pipelineable_operator_data&>(*local_out).get_data_batches();
+
+  REQUIRE(candidates.size() == 2);
+  REQUIRE(candidates[0] != batches[0]);
+  REQUIRE(candidates[1] == batches[1]);
+
+  std::vector<std::vector<int64_t>> const expected_candidates{{7, 6, 5, 4, 3}, {0, 2}};
+  for (std::size_t index = 0; index < candidates.size(); ++index) {
+    auto const view = sirius::get_cudf_table_view(*candidates[index]);
+    INFO("candidate batch " << index);
+    REQUIRE(copy_column_to_host<int64_t>(view.column(0)) == expected_candidates[index]);
+  }
+
+  sirius_physical_top_n_merge topn_merge(
+    sirius::from_duckdb_vec(types), make_top_n_orders(), limit, offset, nullptr, 0);
+
+  auto merged =
+    topn_merge.execute(pipelineable_operator_data(candidates), cudf::get_default_stream());
+  auto const& merged_batches =
+    dynamic_cast<const pipelineable_operator_data&>(*merged).get_data_batches();
+  REQUIRE(merged_batches.size() == 1);
+
+  auto const merged_view = sirius::get_cudf_table_view(*merged_batches.front());
+  REQUIRE(copy_column_to_host<int64_t>(merged_view.column(0)) == std::vector<int64_t>{5, 4, 3});
+  REQUIRE(copy_column_to_host<int64_t>(merged_view.column(1)) == std::vector<int64_t>{50, 40, 30});
+}
+
+TEST_CASE("sirius_physical_top_n returns no batches for limit 0", "[physical_top_n]")
+{
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+
+  std::vector<std::shared_ptr<data_batch>> batches;
+  batches.push_back(make_range_batch(*space, 0, 5, 1));
+  batches.push_back(make_range_batch(*space, 5, 5, 1));
+
+  duckdb::vector<duckdb::LogicalType> types;
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(0, duckdb::OrderType::DESCENDING));
+
+  sirius_physical_top_n topn(sirius::from_duckdb_vec(types),
+                             std::move(orders),
+                             /*limit=*/0,
+                             /*offset=*/2,
+                             nullptr,
+                             0);
+
+  auto out = topn.execute(pipelineable_operator_data(batches), cudf::get_default_stream());
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches().empty());
+}
+
+TEST_CASE("sirius_physical_top_n candidate cap saturates on overflow", "[physical_top_n]")
+{
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+
+  auto batch = make_batch(*space, {1, 3, 2}, {10, 30, 20});
+
+  duckdb::vector<duckdb::LogicalType> types;
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+
+  auto make_top_n_orders = [] {
+    duckdb::vector<duckdb::BoundOrderByNode> orders;
+    orders.push_back(make_order(0, duckdb::OrderType::DESCENDING));
+    return orders;
+  };
+
+  constexpr std::size_t limit  = 2;
+  constexpr std::size_t offset = std::numeric_limits<std::size_t>::max();
+  sirius_physical_top_n topn(
+    sirius::from_duckdb_vec(types), make_top_n_orders(), limit, offset, nullptr, 0);
+
+  auto local = topn.execute(pipelineable_operator_data({batch}), cudf::get_default_stream());
+  auto const& candidates =
+    dynamic_cast<const pipelineable_operator_data&>(*local).get_data_batches();
+  REQUIRE(candidates.size() == 1);
+  REQUIRE(candidates.front() == batch);
+
+  auto const candidate_view = sirius::get_cudf_table_view(*candidates.front());
+  REQUIRE(copy_column_to_host<int64_t>(candidate_view.column(0)) == std::vector<int64_t>{1, 3, 2});
+
+  sirius_physical_top_n_merge merge(
+    sirius::from_duckdb_vec(types), make_top_n_orders(), limit, offset, nullptr, 0);
+  auto merged = merge.execute(pipelineable_operator_data(candidates), cudf::get_default_stream());
+  auto const& merged_batches =
+    dynamic_cast<const pipelineable_operator_data&>(*merged).get_data_batches();
+  REQUIRE(merged_batches.size() == 1);
+  REQUIRE(sirius::get_cudf_table_view(*merged_batches.front()).num_rows() == 0);
 }

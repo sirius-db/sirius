@@ -123,3 +123,18 @@ TEST_CASE("sirius_config accepts a zero admission_bytes_per_gpu", "[topology_con
   REQUIRE_NOTHROW(cfg.load_from_file(yaml.path));
   CHECK(cfg.get_operator_params().admission_bytes_per_gpu == 0);
 }
+
+TEST_CASE("sirius_config accepts opt-in natural pin file order", "[topology_config][config]")
+{
+  sirius::operator_params defaults;
+  CHECK_FALSE(defaults.pin_table_natural_file_order);
+
+  scoped_yaml yaml("sirius_natural_pin_file_order.yaml",
+                   "sirius:\n"
+                   "  operator_params:\n"
+                   "    pin_table_natural_file_order: true\n");
+
+  sirius::sirius_config cfg;
+  REQUIRE_NOTHROW(cfg.load_from_file(yaml.path));
+  CHECK(cfg.get_operator_params().pin_table_natural_file_order);
+}

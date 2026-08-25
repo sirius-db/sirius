@@ -280,6 +280,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 0);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
+    REQUIRE(setting_count(con, "pin_table_natural_file_order") == 0);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
@@ -304,6 +305,9 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     result = con.Query("SET concat_batch_bytes = 1048576");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
+    result = con.Query("SET pin_table_natural_file_order = true");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
   }
 
   setenv("SIRIUS_ENABLE_TEST_OPTIONS", "true", 1);
@@ -318,6 +322,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 0);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
+    REQUIRE(setting_count(con, "pin_table_natural_file_order") == 0);
   }
 
   setenv("SIRIUS_ENABLE_TEST_OPTIONS", "1", 1);
@@ -332,6 +337,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 1);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 1);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 1);
+    REQUIRE(setting_count(con, "pin_table_natural_file_order") == 1);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
@@ -375,6 +381,12 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     result = con.Query("RESET concat_batch_bytes");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET pin_table_natural_file_order = true");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("RESET pin_table_natural_file_order");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
   }

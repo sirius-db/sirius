@@ -413,6 +413,7 @@ individually.
 | `dynamic_filter_inlist_max_l2_fraction` | 0.125 | Finite threshold in [0, 1]: maximum estimated cuco-set size for the exact hash IN-list, as a fraction of the smallest probe-GPU L2. Larger sets use Bloom when supported. For keys not handled by the raw IN-list, 0 selects Bloom when supported, while 1.0 reproduces the legacy L2-fit rule only when L2 size is known. If L2 size is unknown, the hash IN-list is ineligible and selection falls back to Bloom or no membership filter. The 0.125 default comes from a GB300 residency sweep: hash-set probe cost is flat below ~0.28 of L2 and degrades beyond it, while Bloom was at least 2.2x faster at every swept set size. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
+| `pin_table_natural_file_order` | false | Opt in to digit-aware ordering of multi-file Parquet pins. Canonical paths are compared while the original path spellings are passed to the reader. |
 | `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU. At admission the engine estimates a query's total scan output and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. |
 | `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns (VARCHAR, LIST, STRUCT, ARRAY) when estimating scan output. Fixed-width columns use their real carrier width. Only consulted when `admission_bytes_per_gpu` is non-zero. |
 
@@ -609,6 +610,13 @@ benchmark and test envelopes may still override `concat_batch_bytes` in YAML
 under `sirius.operator_params`, but it is not a normal session setting.
 
 Runtime distinct-build probing is also engine-owned and is temporarily disabled pending #1600.
+
+`pin_table_natural_file_order` is accepted in YAML under `sirius.operator_params` and exposed as a
+DuckDB setting only when Sirius test options are enabled. It is deliberately off by default:
+enabling it sorts canonicalized comparison keys such that `part.2` precedes `part.10`, which changes
+the physical row order of a multi-file pin relative to DuckDB's `GlobFiles` order. The raw paths
+remain unchanged for Hive partition parsing and file reads. Re-pinning a name after changing this
+option replaces the old cache entry when the ordered source identity differs.
 
 ### GPU Admission
 
