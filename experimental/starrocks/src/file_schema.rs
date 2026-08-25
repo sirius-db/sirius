@@ -50,6 +50,47 @@ pub(crate) async fn parquet_file_schema(path: &str) -> Result<Vec<PSlotDescripto
     Ok(slots)
 }
 
+/// Infers one schema for a multi-file FILES() call.
+///
+/// The schema comes from the first file; every other file must agree on column names
+/// (ASCII case-insensitive, matching StarRocks name resolution) and types. Positional
+/// slot fields (id/slot_idx/column_pos) are per-file bookkeeping and are not compared.
+///
+/// Deliberately stricter than native StarRocks, which samples `schema_sample_file_count`
+/// files and promotes conflicting types: the scan reads every file with the inferred
+/// schema, so whole-set agreement is the correct fail-closed contract here.
+pub(crate) async fn parquet_files_schema(paths: &[String]) -> Result<Vec<PSlotDescriptor>, String> {
+    let (first, rest) = paths
+        .split_first()
+        .ok_or_else(|| "no file paths to infer a schema from".to_string())?;
+    let slots = parquet_file_schema(first).await?;
+    for path in rest {
+        let other = parquet_file_schema(path).await?;
+        if other.len() != slots.len() {
+            return Err(format!(
+                "FILES() schema mismatch: '{path}' has {} columns but '{first}' has {}",
+                other.len(),
+                slots.len()
+            ));
+        }
+        for (idx, (expected, found)) in slots.iter().zip(&other).enumerate() {
+            if !expected.col_name.eq_ignore_ascii_case(&found.col_name) {
+                return Err(format!(
+                    "FILES() schema mismatch: column {idx} is named '{}' in '{first}' but '{}' in '{path}'",
+                    expected.col_name, found.col_name
+                ));
+            }
+            if expected.slot_type != found.slot_type {
+                return Err(format!(
+                    "FILES() schema mismatch: column '{}' has a different type in '{path}' than in '{first}'",
+                    expected.col_name
+                ));
+            }
+        }
+    }
+    Ok(slots)
+}
+
 /// Resolves a StarRocks file path to a local filesystem path, rejecting remote URIs.
 ///
 /// Accepts `file:/abs`, `file:///abs`, and `file://localhost/abs`; remote schemes
@@ -207,19 +248,17 @@ fn slot_descriptor(idx: i32, name: &str, scalar: PScalarType) -> PSlotDescriptor
     }
 }
 
+/// Parquet fixture writing shared with the compute-node service tests.
 #[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
+pub(crate) mod test_support {
     use std::sync::Arc;
 
     use parquet::file::properties::WriterProperties;
     use parquet::file::writer::SerializedFileWriter;
     use parquet::schema::parser::parse_message_type;
 
-    use super::*;
-
     /// Writes a schema-only parquet file (no row groups) to a unique temp path.
-    fn write_parquet(tag: &str, message: &str) -> std::path::PathBuf {
+    pub(crate) fn write_parquet(tag: &str, message: &str) -> std::path::PathBuf {
         let schema = Arc::new(parse_message_type(message).unwrap());
         let path = std::env::temp_dir().join(format!("sr_cn_{}_{tag}.parquet", std::process::id()));
         let file = std::fs::File::create(&path).unwrap();
@@ -230,6 +269,14 @@ mod tests {
             .unwrap();
         path
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::test_support::write_parquet;
+    use super::*;
 
     fn scalar(slot: &PSlotDescriptor) -> &PScalarType {
         slot.slot_type.types[0].scalar_type.as_ref().unwrap()
@@ -346,6 +393,99 @@ mod tests {
             result
                 .as_ref()
                 .is_err_and(|err| err.contains("case-insensitively")),
+            "{result:?}"
+        );
+    }
+
+    /// Runs `parquet_files_schema` over already-written fixture files and removes them.
+    async fn files_schema(paths: &[&std::path::PathBuf]) -> Result<Vec<PSlotDescriptor>, String> {
+        let strings: Vec<String> = paths
+            .iter()
+            .map(|p| p.to_str().unwrap().to_string())
+            .collect();
+        let result = parquet_files_schema(&strings).await;
+        for path in paths {
+            std::fs::remove_file(path).ok();
+        }
+        result
+    }
+
+    #[tokio::test]
+    async fn multi_file_agreeing_schemas_infer_the_single_file_slots() {
+        let message = "message m { optional int64 a; optional double b; }";
+        let first = write_parquet("agree_a", message);
+        let second = write_parquet("agree_b", message);
+        let single = parquet_file_schema(first.to_str().unwrap()).await.unwrap();
+        let multi = files_schema(&[&first, &second]).await.unwrap();
+        assert_eq!(multi, single);
+    }
+
+    #[tokio::test]
+    async fn multi_file_rejects_column_count_mismatch() {
+        let first = write_parquet(
+            "arity_a",
+            "message m { optional int64 a; optional double b; }",
+        );
+        let second = write_parquet("arity_b", "message m { optional int64 a; }");
+        let result = files_schema(&[&first, &second]).await;
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("has 1 columns but") && err.contains("has 2"),
+            "{err}"
+        );
+        assert!(
+            err.contains(first.to_str().unwrap()) && err.contains(second.to_str().unwrap()),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_file_rejects_column_name_mismatch() {
+        let first = write_parquet(
+            "name_a",
+            "message m { optional int64 a; optional double l_tax; }",
+        );
+        let second = write_parquet(
+            "name_b",
+            "message m { optional int64 a; optional double l_taxx; }",
+        );
+        let err = files_schema(&[&first, &second]).await.unwrap_err();
+        assert!(
+            err.contains("column 1 is named 'l_tax'") && err.contains("but 'l_taxx'"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_file_rejects_column_type_mismatch() {
+        let first = write_parquet("type_a", "message m { optional int64 l_quantity; }");
+        let second = write_parquet("type_b", "message m { optional double l_quantity; }");
+        let err = files_schema(&[&first, &second]).await.unwrap_err();
+        assert!(
+            err.contains("column 'l_quantity' has a different type"),
+            "{err}"
+        );
+        assert!(err.contains(second.to_str().unwrap()), "{err}");
+    }
+
+    #[tokio::test]
+    async fn multi_file_accepts_case_differing_column_names() {
+        let first = write_parquet("case_a", "message m { optional int64 L_ORDERKEY; }");
+        let second = write_parquet("case_b", "message m { optional int64 l_orderkey; }");
+        let slots = files_schema(&[&first, &second]).await.unwrap();
+        // The first file wins the spelling, matching StarRocks case-insensitive resolution.
+        assert_eq!(slots[0].col_name, "L_ORDERKEY");
+    }
+
+    #[tokio::test]
+    async fn multi_file_missing_file_error_names_its_path() {
+        let first = write_parquet("missing_a", "message m { optional int64 a; }");
+        let missing = "/nonexistent/sr_cn_missing_b.parquet".to_string();
+        let result =
+            parquet_files_schema(&[first.to_str().unwrap().to_string(), missing.clone()]).await;
+        std::fs::remove_file(&first).ok();
+        assert!(
+            result.as_ref().is_err_and(|err| err.contains(&missing)),
             "{result:?}"
         );
     }

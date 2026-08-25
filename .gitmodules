@@ -23,9 +23,13 @@
 [submodule "vcpkg"]
 	path = vcpkg
 	url = https://github.com/Microsoft/vcpkg.git
+# Pinned to an upstream commit; patches/*.patch are applied into the working tree
+# by `bash experimental/starrocks/scripts/apply-starrocks-patches.sh`, so this
+# submodule is dirty by design.
 [submodule "starrocks/starrocks"]
 	path = experimental/starrocks/starrocks
 	url = https://github.com/starrocks/starrocks
+	ignore = dirty
 [submodule "starrocks/brpc"]
 	path = experimental/starrocks/brpc
 	url = https://github.com/apache/brpc

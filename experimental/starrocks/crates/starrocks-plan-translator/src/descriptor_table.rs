@@ -297,21 +297,37 @@ impl DescriptorTable {
         row_tuples: &[i32],
     ) -> Result<usize> {
         let mut offset = 0;
+        let mut by_slot_id = Vec::new();
         for &candidate_tuple in row_tuples {
             let materialized = self.materialized_slot_ids(candidate_tuple)?;
-            if candidate_tuple == tuple_id
-                && let Some(index) = materialized
-                    .iter()
-                    .position(|candidate| *candidate == slot_id)
+            if let Some(index) = materialized
+                .iter()
+                .position(|candidate| *candidate == slot_id)
             {
-                return Ok(offset + index);
+                if candidate_tuple == tuple_id {
+                    return Ok(offset + index);
+                }
+                by_slot_id.push(offset + index);
             }
             offset += materialized.len();
         }
 
-        Err(TranslateError::descriptor(format!(
-            "slot {slot_id} (tuple {tuple_id}) is not part of row_tuples {row_tuples:?}"
-        )))
+        // The FE never rebinds grouping-column refs above a multi-stage aggregation
+        // (buildAggregateTuple keeps the pre-agg tuple in colRefToExpr), so a node can
+        // name a slot through a tuple absent from its row. Exact match wins above; a
+        // unique same-id slot in the row is that column post-aggregation. Ambiguity
+        // stays a loud error.
+        match by_slot_id.as_slice() {
+            [index] => Ok(*index),
+            [] => Err(TranslateError::descriptor(format!(
+                "slot {slot_id} (tuple {tuple_id}) is not part of row_tuples {row_tuples:?}"
+            ))),
+            _ => Err(TranslateError::descriptor(format!(
+                "slot {slot_id} (tuple {tuple_id}) is not part of row_tuples {row_tuples:?}, and {} \
+                 of those tuples carry a slot {slot_id} to fall back on",
+                by_slot_id.len()
+            ))),
+        }
     }
 
     /// Returns the Substrait named-table path for a tuple's backing table.

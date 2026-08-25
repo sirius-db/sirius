@@ -136,6 +136,47 @@ impl SiriusContext {
             }
         })
     }
+
+    /// Lease `len` bytes of the exchange staging arena, returning the lease's byte offset from
+    /// [`staging_base`](Self::staging_base).
+    ///
+    /// The arena exists only when `SIRIUS_EXCHANGE_STAGING_BYTES` was set at context bring-up;
+    /// without one, every staging call is an error rather than a silent slow path. Exhaustion is
+    /// an error naming the requested/free/capacity byte counts.
+    pub fn staging_lease(&self, len: u64) -> Result<u64, Exception> {
+        self.inner.borrow_mut().pin_mut().staging_lease(len)
+    }
+
+    /// Return the staging lease at `offset`. Leases are short-lived by design
+    /// (copy-out-on-arrival); a released block goes back to the arena's free list and coalesces
+    /// with its free neighbours.
+    pub fn staging_release(&self, offset: u64) -> Result<(), Exception> {
+        self.inner.borrow_mut().pin_mut().staging_release(offset)
+    }
+
+    /// Device base address of the staging arena, for transport memory registration.
+    pub fn staging_base(&self) -> Result<usize, Exception> {
+        self.inner.borrow().staging_base()
+    }
+
+    /// Capacity of the staging arena in bytes.
+    pub fn staging_capacity(&self) -> Result<u64, Exception> {
+        self.inner.borrow().staging_capacity()
+    }
+
+    /// Thread-safe handle to the exchange staging arena, or `None` when no arena is configured
+    /// (`SIRIUS_EXCHANGE_STAGING_BYTES` unset at bring-up).
+    ///
+    /// Unlike the `staging_*` methods above — which go through this `!Sync` context and
+    /// therefore its owning thread — the handle is `Send + Sync` and serves leases from any
+    /// thread, concurrently with the context thread's own staging traffic. It shares ownership
+    /// of the ONE C++ allocator ([`Fragment::export_packed`] leases from the same arena), so
+    /// the two sides can never double-book a region, and the handle stays valid even if this
+    /// context is dropped first.
+    pub fn staging_arena(&self) -> Option<StagingArena> {
+        let handle = self.inner.borrow().staging_arena_handle();
+        (!handle.is_null()).then(|| StagingArena { inner: handle })
+    }
 }
 
 /// Name of the DuckDB view a plan reads to consume input stream `stream_id`.
@@ -254,6 +295,56 @@ impl Fragment<'_> {
         )
     }
 
+    /// Pack the next batch parked on output stream `stream_id` into a fresh staging-arena lease,
+    /// as cudf packed bytes.
+    ///
+    /// `Ok(None)` means nothing is parked right now — for a fragment that finished
+    /// [`run`](Fragment::run), the stream is drained. The packed device bytes are complete when
+    /// this returns, so a transport may transmit from
+    /// `[staging_base() + offset, + len)` immediately; the lease stays live until the caller
+    /// hands it back with [`SiriusContext::staging_release`] after the transmit completes.
+    ///
+    /// A zero-row batch comes back metadata-only: `offset == 0` with `len == 0` means NO lease
+    /// exists for it, and the caller must not release anything.
+    pub fn export_packed(&mut self, stream_id: u64) -> Result<Option<PackedBatch>, Exception> {
+        let mut offset = 0u64;
+        let mut len = 0u64;
+        let metadata = self
+            .inner
+            .pin_mut()
+            .export_packed(stream_id, &mut offset, &mut len)?;
+        if metadata.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(PackedBatch {
+            metadata: metadata.as_slice().to_vec(),
+            offset,
+            len,
+        }))
+    }
+
+    /// Push a packed batch sitting in the staging arena into input stream `stream_id`: the
+    /// receive-side mirror of [`export_packed`](Fragment::export_packed).
+    ///
+    /// The table is deep-copied out of the lease into ordinary pool memory before this returns
+    /// (copy-out-on-arrival), so the lease is immediately reusable — and releasable. Legal
+    /// between [`build`](Fragment::build) and [`run`](Fragment::run), like
+    /// [`relay_from`](Fragment::relay_from); pushing after the stream ended is an error, never a
+    /// silent drop.
+    pub fn push_packed(&mut self, stream_id: u64, batch: &PackedBatch) -> Result<(), Exception> {
+        // SAFETY: the metadata pointer/length name `batch.metadata`'s buffer, which this borrow
+        // keeps alive and readable for the duration of the call.
+        unsafe {
+            self.inner.pin_mut().push_packed(
+                stream_id,
+                batch.metadata.as_ptr() as usize,
+                batch.metadata.len(),
+                batch.offset,
+                batch.len,
+            )
+        }
+    }
+
     /// Close `sender_id` on input stream `stream_id`.
     ///
     /// The end-of-stream mirror for senders that are not local fragments — [`relay_from`] closes
@@ -301,6 +392,81 @@ impl Fragment<'_> {
             // `FFI_ArrowArrayStream` it owns for the closure's duration.
             unsafe { self.inner.pin_mut().result_to_arrow(out_stream_addr) }
         })
+    }
+}
+
+/// One batch exported into the exchange staging arena as cudf packed bytes.
+///
+/// `metadata` is the host-side cudf pack metadata (it travels with the payload on the wire);
+/// `offset`/`len` locate the packed device payload inside the staging arena of the context that
+/// exported it. The exporter's lease at `offset` stays outstanding until
+/// [`SiriusContext::staging_release`] is called with it — except for a metadata-only zero-row
+/// batch (`offset == 0`, `len == 0`), which holds no lease and must not be released.
+pub struct PackedBatch {
+    /// cudf pack metadata bytes (host memory).
+    pub metadata: Vec<u8>,
+    /// Byte offset of the packed payload from the arena base.
+    pub offset: u64,
+    /// Length of the packed payload in bytes.
+    pub len: u64,
+}
+
+/// Thread-safe handle to a context's exchange staging arena, from
+/// [`SiriusContext::staging_arena`].
+///
+/// This is what lets a transport/RPC thread serve `lease`/`release` while the context's owning
+/// thread is busy running a fragment: the two contend on nothing but the arena's own mutex, so
+/// an engine stall can never starve a peer's staging lease.
+pub struct StagingArena {
+    inner: UniquePtr<sirius_sys::StagingArena>,
+}
+
+// SAFETY: the C++ `StagingArena` is a `shared_ptr` to the one `exchange_staging_arena`. Every
+// method (`lease`, `release`, and the immutable `base`/`capacity` reads) serializes on the
+// arena's internal `std::mutex` and makes NO CUDA calls — the region is a single `cudaMalloc`
+// made at arena construction — so there is no thread-affine state behind any operation. The
+// `shared_ptr` keeps the device region alive independently of the `SiriusContext`, so the
+// handle cannot dangle if the context is torn down first.
+unsafe impl Send for StagingArena {}
+unsafe impl Sync for StagingArena {}
+
+impl StagingArena {
+    /// Lease `len` bytes, returning the lease's byte offset from [`base`](Self::base). Errors
+    /// on exhaustion or a zero-length request — the arena never blocks.
+    pub fn lease(&self, len: u64) -> Result<u64, Exception> {
+        self.inner.lease(len)
+    }
+
+    /// Return the lease at `offset`; the block goes back to the arena's free list and
+    /// coalesces with its free neighbours, so the space is reusable regardless of release
+    /// order.
+    pub fn release(&self, offset: u64) -> Result<(), Exception> {
+        self.inner.release(offset)
+    }
+
+    /// Device base address of the arena, for transport memory registration.
+    pub fn base(&self) -> usize {
+        self.inner.base()
+    }
+
+    /// Capacity of the arena in bytes.
+    pub fn capacity(&self) -> u64 {
+        self.inner.capacity()
+    }
+
+    /// Leases currently held. Nonzero once a query has quiesced means a leaked lease — this is
+    /// the only way a caller outside C++ can observe one.
+    pub fn outstanding(&self) -> Result<usize, Exception> {
+        self.inner.outstanding()
+    }
+}
+
+impl std::fmt::Debug for StagingArena {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StagingArena")
+            .field("base", &self.base())
+            .field("capacity", &self.capacity())
+            .finish()
     }
 }
 
@@ -665,5 +831,330 @@ mod tests {
             "/nonexistent/sirius-config-does-not-exist.yaml",
         ));
         assert!(result.is_err(), "missing config file should fail bring-up");
+    }
+
+    /// Writes the 3-row `(id BIGINT, name VARCHAR)` users fixture.
+    fn write_users_parquet(path: &Path) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let ids: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        let names: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![ids, names]).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// A plan whose only read is the engine's stream view for input stream `stream_id`,
+    /// projecting the users fixture's `(id BIGINT, name VARCHAR)` schema — the shape a front
+    /// end emits where it would otherwise emit a file scan.
+    fn stream_read_plan(stream_id: u64) -> Vec<u8> {
+        use substrait::proto::read_rel::{NamedTable, ReadType};
+        use substrait::proto::{
+            NamedStruct, Plan, PlanRel, ReadRel, Rel, RelRoot, Type, plan_rel, rel, r#type,
+        };
+
+        let names = vec!["id".to_string(), "name".to_string()];
+        let types = vec![
+            Type {
+                kind: Some(r#type::Kind::I64(r#type::I64 {
+                    type_variation_reference: 0,
+                    nullability: r#type::Nullability::Nullable as i32,
+                })),
+            },
+            Type {
+                kind: Some(r#type::Kind::String(r#type::String {
+                    type_variation_reference: 0,
+                    nullability: r#type::Nullability::Nullable as i32,
+                })),
+            },
+        ];
+        let read = Rel {
+            rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
+                base_schema: Some(NamedStruct {
+                    names: names.clone(),
+                    r#struct: Some(r#type::Struct {
+                        types,
+                        type_variation_reference: 0,
+                        nullability: r#type::Nullability::Required as i32,
+                    }),
+                }),
+                read_type: Some(ReadType::NamedTable(NamedTable {
+                    names: vec![super::stream_view_name(stream_id)],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }))),
+        };
+        Plan {
+            relations: vec![PlanRel {
+                rel_type: Some(plan_rel::RelType::Root(RelRoot {
+                    input: Some(read),
+                    names,
+                })),
+            }],
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    /// Runs `work` on its own engine thread and fails the test if it does not finish.
+    ///
+    /// A plan the engine never finishes is the one outcome that must not reach a human as
+    /// silence, so the watchdog turns it into a failure with a name attached. The engine call
+    /// cannot be cancelled once it is stuck, so the process is torn down with it.
+    fn under_watchdog<T: Send + 'static>(
+        label: String,
+        work: impl FnOnce() -> Result<T, String> + Send + 'static,
+    ) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let engine = std::thread::spawn(move || {
+            let _ = sender.send(work());
+        });
+
+        match receiver.recv_timeout(std::time::Duration::from_secs(120)) {
+            Ok(Ok(value)) => {
+                // Join before returning: the engine context is dropped on that thread, and a
+                // teardown racing the process exit is not what these tests are measuring.
+                engine.join().expect("engine thread");
+                value
+            }
+            Ok(Err(message)) => panic!("{label} failed: {message}"),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("{label}: the engine thread panicked (see the panic above)")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // The engine thread is wedged inside a GPU call and cannot be joined or
+                // cancelled; report loudly and take the process down rather than hang the suite.
+                eprintln!("{label} did not finish within 120s: the engine hung");
+                std::process::exit(101);
+            }
+        }
+    }
+
+    /// An input stream that ends without ever carrying a batch is what a hash fan-out hands the
+    /// compute node that owns no keys. Reading it must finish with no rows: a fragment that
+    /// waits forever for data that is never coming takes the whole query down with it, and does
+    /// it silently. Requires a GPU.
+    #[test]
+    fn fragment_over_an_empty_input_stream_terminates() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let rows = under_watchdog("empty input stream".to_string(), || {
+            let ctx = SiriusContext::new().expect("bring up sirius context");
+            let mut receiver = ctx.fragment().map_err(|err| err.to_string())?;
+            receiver
+                .declare_input_column(0, "id", "BIGINT")
+                .map_err(|err| err.to_string())?;
+            receiver
+                .declare_input_column(0, "name", "VARCHAR")
+                .map_err(|err| err.to_string())?;
+            receiver
+                .build(&stream_read_plan(0))
+                .map_err(|err| err.to_string())?;
+            // No sender ever parked a batch for this partition; the stream just ends.
+            receiver.close_input(0, 0).map_err(|err| err.to_string())?;
+            receiver.run().map_err(|err| err.to_string())?;
+            receiver
+                .result_to_arrow()
+                .map(|result| rows(&result))
+                .map_err(|err| err.to_string())
+        });
+        assert!(rows.is_empty(), "an empty stream yields no rows: {rows:?}");
+    }
+
+    /// The decisive equivalence for the packed FFI pair: a fragment hop carried by the staging
+    /// arena (`export_packed` → transmit-from-lease → `push_packed`) must deliver exactly the
+    /// values the proven in-process `relay_from` hop delivers for the identical plan pair.
+    /// Also pins the surrounding contracts: drained-stream export is `None`, push after EOS is
+    /// a loud error, and leases release (with the free list coalescing back to one whole-arena
+    /// block) before the receiver runs — which only works if push really copied the data out of
+    /// the lease. Requires a GPU.
+    #[test]
+    fn packed_hop_matches_relay_hop() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        // The arena is constructed at context bring-up, only when this is set.
+        // SAFETY: the GPU lock is held, so no other thread touches the environment here.
+        unsafe { std::env::set_var("SIRIUS_EXCHANGE_STAGING_BYTES", "64MiB") };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.parquet");
+        write_users_parquet(&path);
+        let sender_plan = local_files_plan(
+            path.to_str().unwrap(),
+            vec!["id".to_string(), "name".to_string()],
+        );
+        let receiver_plan = stream_read_plan(0);
+
+        let ctx = SiriusContext::new().expect("bring up sirius context");
+        assert_eq!(ctx.staging_capacity().unwrap(), 64 << 20);
+        assert_ne!(ctx.staging_base().unwrap(), 0);
+
+        // Declares `(id, name)` on input stream 0 and builds the stream-view read.
+        let make_receiver = || {
+            let mut receiver = ctx.fragment().unwrap();
+            receiver.declare_input_column(0, "id", "BIGINT").unwrap();
+            receiver.declare_input_column(0, "name", "VARCHAR").unwrap();
+            receiver.build(&receiver_plan).unwrap();
+            receiver
+        };
+
+        // Reference: the proven in-process native relay.
+        let relay_result = {
+            let mut sender = ctx.fragment().unwrap();
+            sender.declare_output(0).unwrap();
+            sender.build(&sender_plan).unwrap();
+            sender.run().unwrap();
+
+            let mut receiver = make_receiver();
+            let moved = receiver.relay_from(&mut sender, 0, 0, 0).unwrap();
+            assert!(moved > 0, "the relay hop must carry batches");
+            receiver.run().unwrap();
+            receiver.result_to_arrow().unwrap()
+        };
+
+        // The same hop through the staging arena as packed bytes.
+        let packed_result = {
+            let mut sender = ctx.fragment().unwrap();
+            sender.declare_output(0).unwrap();
+            sender.build(&sender_plan).unwrap();
+            sender.run().unwrap();
+
+            let mut staged = Vec::new();
+            while let Some(batch) = sender.export_packed(0).unwrap() {
+                assert!(batch.len > 0, "a packed batch carries payload bytes");
+                assert!(!batch.metadata.is_empty(), "pack metadata is never empty");
+                staged.push(batch);
+            }
+            assert!(!staged.is_empty(), "the sender parked batches to export");
+            // A drained stream is `None`, not an error.
+            assert!(sender.export_packed(0).unwrap().is_none());
+
+            let mut receiver = make_receiver();
+            for batch in &staged {
+                receiver.push_packed(0, batch).unwrap();
+            }
+            receiver.close_input(0, 0).unwrap();
+
+            // A push after EOS must refuse loudly, never vanish.
+            let refused = receiver.push_packed(0, &staged[0]);
+            assert!(refused.is_err(), "push_packed after close_input must error");
+            assert!(refused.unwrap_err().what().contains("already ended"));
+
+            // Copy-out-on-arrival: the data left the leases at push time, so they can all go
+            // back before the receiver runs...
+            for batch in &staged {
+                ctx.staging_release(batch.offset).unwrap();
+            }
+            // ...and with nothing outstanding the free list coalesced back to one whole-arena
+            // block, so the next lease lands at the base.
+            let probe = ctx.staging_lease(1024).unwrap();
+            assert_eq!(probe, 0);
+            ctx.staging_release(probe).unwrap();
+
+            receiver.run().unwrap();
+            receiver.result_to_arrow().unwrap()
+        };
+
+        assert_eq!(rows(&relay_result), rows(&packed_result));
+        assert_eq!(
+            rows(&packed_result),
+            vec![
+                (1, "a".to_string()),
+                (2, "b".to_string()),
+                (3, "c".to_string()),
+            ]
+        );
+
+        // Keep the arena out of the other tests' context bring-ups.
+        // SAFETY: the GPU lock is still held.
+        unsafe { std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES") };
+    }
+
+    /// The zero-row export contract: a zero-row batch leaves `export_packed` as a metadata-only
+    /// frame (`offset == 0`, `len == 0`) holding NO staging lease, and the frame round-trips
+    /// through `push_packed` into an empty result. Pins the leak the demo hit on q15:
+    /// `export_packed` used to lease `total + slack` even for `total == 0`, while the transport
+    /// contract says `len == 0` means nothing to release — every empty cross-CN batch orphaned
+    /// a >= 8 MiB lease that pinned staging space for the process lifetime. The zero-row batch
+    /// comes from an empty byte-range split (a range inside one row group scans zero row groups
+    /// and emits exactly one empty batch). Requires a GPU.
+    #[test]
+    fn zero_row_export_is_metadata_only_and_holds_no_lease() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        // The arena is constructed at context bring-up, only when this is set.
+        // SAFETY: the GPU lock is held, so no other thread touches the environment here.
+        unsafe { std::env::set_var("SIRIUS_EXCHANGE_STAGING_BYTES", "64MiB") };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.parquet");
+        write_users_parquet(&path);
+        let names = vec!["id".to_string(), "name".to_string()];
+        // A byte range strictly inside the file's single row group owns no row groups: the
+        // zero-row sender instance of a distributed scan.
+        let empty_split_plan =
+            local_files_plan_ranged(&[(path.to_str().unwrap(), 10, 5)], names.clone());
+
+        let ctx = SiriusContext::new().expect("bring up sirius context");
+        let capacity = ctx.staging_capacity().unwrap();
+
+        let mut sender = ctx.fragment().unwrap();
+        sender.declare_output(0).unwrap();
+        sender.build(&empty_split_plan).unwrap();
+        sender.run().unwrap();
+
+        let mut staged = Vec::new();
+        while let Some(batch) = sender.export_packed(0).unwrap() {
+            assert!(!batch.metadata.is_empty(), "pack metadata is never empty");
+            staged.push(batch);
+        }
+        assert!(
+            staged.iter().any(|batch| batch.len == 0),
+            "the empty split must park a zero-row batch to export"
+        );
+        for batch in &staged {
+            if batch.len == 0 {
+                assert_eq!(batch.offset, 0, "a metadata-only frame names no lease");
+            } else {
+                ctx.staging_release(batch.offset).unwrap();
+            }
+        }
+
+        // The reclaim guarantee: with only `len > 0` leases released (a metadata-only frame has
+        // nothing to release), zero leases are outstanding, so the ENTIRE arena is grantable as
+        // one lease. Under the leak this throws exhaustion — the orphaned slack lease still
+        // pins its block.
+        let probe = ctx.staging_lease(capacity).expect(
+            "the whole arena must be grantable again after a zero-row export cycle \
+             (an outstanding lease here is the orphaned-slack leak)",
+        );
+        assert_eq!(probe, 0);
+        ctx.staging_release(probe).unwrap();
+
+        // The frame is a legitimate wire citizen: pushing it delivers an empty stream, not an
+        // error, and the receiver terminates with zero rows.
+        let mut receiver = ctx.fragment().unwrap();
+        receiver.declare_input_column(0, "id", "BIGINT").unwrap();
+        receiver.declare_input_column(0, "name", "VARCHAR").unwrap();
+        receiver.build(&stream_read_plan(0)).unwrap();
+        for batch in &staged {
+            receiver.push_packed(0, batch).unwrap();
+        }
+        receiver.close_input(0, 0).unwrap();
+        receiver.run().unwrap();
+        let result = receiver.result_to_arrow().unwrap();
+        assert_eq!(rows(&result), Vec::new(), "an empty split carries no rows");
+
+        // Keep the arena out of the other tests' context bring-ups.
+        // SAFETY: the GPU lock is still held.
+        unsafe { std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES") };
     }
 }

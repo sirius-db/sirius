@@ -57,6 +57,55 @@ mod ffi {
             out_stream_addr: usize,
         ) -> Result<()>;
 
+        /// Lease `len` bytes of the exchange staging arena, returning the
+        /// lease's byte offset from `staging_base()`. Fallible: no configured
+        /// arena (`SIRIUS_EXCHANGE_STAGING_BYTES` unset) and exhaustion both
+        /// surface as `Err`.
+        fn staging_lease(self: Pin<&mut Context>, len: u64) -> Result<u64>;
+
+        /// Return the staging lease at `offset`; the block goes back to the
+        /// arena's free list and coalesces with its free neighbours.
+        fn staging_release(self: Pin<&mut Context>, offset: u64) -> Result<()>;
+
+        /// Device base address of the staging arena, for transport memory
+        /// registration.
+        fn staging_base(self: &Context) -> Result<usize>;
+
+        /// Capacity of the staging arena in bytes.
+        fn staging_capacity(self: &Context) -> Result<u64>;
+
+        /// Thread-safe handle to the context's exchange staging arena, sharing
+        /// ownership of the ONE allocator with the context (whose
+        /// `export_packed` leases from the same arena). Unlike the `staging_*`
+        /// methods on [`Context`] — reachable only through the context's owning
+        /// thread — every method here may be called from any thread: the C++
+        /// side serializes on the arena's internal mutex and makes no CUDA
+        /// calls.
+        type StagingArena;
+
+        /// The context's staging arena handle, or a null `UniquePtr` when no
+        /// arena is configured (`SIRIUS_EXCHANGE_STAGING_BYTES` unset).
+        fn staging_arena_handle(self: &Context) -> UniquePtr<StagingArena>;
+
+        /// Lease `len` bytes of the arena, returning the lease's byte offset
+        /// from `base()`. Fallible on exhaustion (the arena never blocks).
+        fn lease(self: &StagingArena, len: u64) -> Result<u64>;
+
+        /// Return the lease at `offset`; the block goes back to the arena's
+        /// free list and coalesces with its free neighbours.
+        fn release(self: &StagingArena, offset: u64) -> Result<()>;
+
+        /// Device base address of the arena, for transport memory registration.
+        fn base(self: &StagingArena) -> usize;
+
+        /// Capacity of the arena in bytes.
+        fn capacity(self: &StagingArena) -> u64;
+
+        /// Leases currently held. Nonzero at quiesce means a leaked lease.
+        /// `Result` rather than a bare `usize` because, unlike `base`/`capacity`,
+        /// the C++ side takes the arena mutex and is therefore not `noexcept`.
+        fn outstanding(self: &StagingArena) -> Result<usize>;
+
         /// One plan fragment of a multi-fragment query. Either declares output
         /// streams (an intermediate fragment, whose results park as native GPU
         /// batches that outlive its own query) or none (a result fragment, which
@@ -135,6 +184,41 @@ mod ffi {
             sender_id: u32,
         ) -> Result<usize>;
 
+        /// Pack the next batch parked on an output stream into a fresh
+        /// staging-arena lease. Returns the cudf pack metadata (a null
+        /// `UniquePtr` when nothing is parked right now) and writes the lease
+        /// offset and packed payload length; the device bytes are complete on
+        /// return (the packing stream is synchronized). Releasing the lease —
+        /// via `staging_release(offset)`, after the transmit completes — is
+        /// the caller's job. A zero-row batch is metadata-only: `offset == 0`
+        /// with `length == 0` names NO lease, and nothing must be released.
+        fn export_packed(
+            self: Pin<&mut Fragment>,
+            stream_id: u64,
+            offset: &mut u64,
+            length: &mut u64,
+        ) -> Result<UniquePtr<CxxVector<u8>>>;
+
+        /// Unpack `length` packed bytes at staging offset `offset` with the
+        /// cudf pack metadata at `metadata_addr` (`metadata_len` bytes of host
+        /// memory), deep-copy the table out of the lease into pool memory, and
+        /// push it into an input stream. Legal between `build()` and `run()`;
+        /// the lease is reusable on return. A push after the stream ended is
+        /// an `Err`, never a silent drop.
+        ///
+        /// # Safety
+        /// `metadata_addr` must point at `metadata_len` readable bytes of pack
+        /// metadata that outlive this call. The safe
+        /// [`sirius`](https://docs.rs/sirius) wrapper upholds this.
+        unsafe fn push_packed(
+            self: Pin<&mut Fragment>,
+            stream_id: u64,
+            metadata_addr: usize,
+            metadata_len: usize,
+            offset: u64,
+            length: u64,
+        ) -> Result<()>;
+
         /// Close `sender_id` on input stream `stream_id`. The end-of-stream mirror
         /// for senders that are not local fragments — `relay_from` closes its own.
         /// Idempotent per sender.
@@ -165,5 +249,6 @@ mod ffi {
 }
 
 pub use ffi::{
-    Context, Fragment, make_context, make_context_from_config, make_fragment, stream_view_name,
+    Context, Fragment, StagingArena, make_context, make_context_from_config, make_fragment,
+    stream_view_name,
 };
