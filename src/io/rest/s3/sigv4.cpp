@@ -30,7 +30,7 @@
 #include <ctime>
 #include <stdexcept>
 
-namespace sirius::io::s3 {
+namespace sirius::io::rest::s3 {
 
 namespace {
 
@@ -435,4 +435,4 @@ std::string presign_url(std::string_view method,
   return out;
 }
 
-}  // namespace sirius::io::s3
+}  // namespace sirius::io::rest::s3

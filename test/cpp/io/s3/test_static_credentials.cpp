@@ -19,7 +19,7 @@
 
 #include <chrono>
 
-using sirius::io::s3::static_credentials;
+using sirius::io::rest::s3::static_credentials;
 
 TEST_CASE("static_credentials default constructs to empty inert values",
           "[s3][authorizer][static_credentials]")

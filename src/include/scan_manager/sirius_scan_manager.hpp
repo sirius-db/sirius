@@ -624,7 +624,7 @@ class sirius_scan_manager {
   void list_objects_paged(
     std::string const& s3_prefix_uri,
     std::size_t page_size,
-    std::function<bool(sirius::io::s3::list_objects_v2_page const&)> const& sink,
+    std::function<bool(sirius::io::rest::s3::list_objects_v2_page const&)> const& sink,
     std::optional<std::size_t> max_scanned = std::nullopt);
 
   /// \brief The configured glob-match cap (@c rest.list_max_matches) for the
