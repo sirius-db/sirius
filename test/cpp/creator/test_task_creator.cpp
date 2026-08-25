@@ -386,9 +386,12 @@ TEST_CASE("get_operator_for_next_task records every pipeline the hint walk visit
     task_creation_hint{.hint = TaskCreationHint::WAITING_FOR_INPUT_DATA, .producer = op_b.get()});
 
   std::vector<duckdb::shared_ptr<sirius_pipeline>> visited;
-  auto* next = creator.get_operator_for_next_task(op_a.get(), visited);
+  auto const next = creator.get_operator_for_next_task(op_a.get(), visited);
 
-  REQUIRE(next == nullptr);
+  REQUIRE(next.state == next_task_state::depleted);
+  // The last operator actually asked, not the one the request named -- that is
+  // what makes a depleted walk attributable.
+  REQUIRE(next.op == op_b.get());
   // The caller re-evaluates every visited pipeline on the nullptr path. If the
   // walk reported only the requesting pipeline, an upstream pipeline whose
   // tasks all completed earlier would never be marked finished — no later
@@ -412,10 +415,10 @@ TEST_CASE("get_operator_for_next_task with monostate hint and empty priority_sca
   // process_next_task should just return nullptr because there its not really connected to anything
   // and has no data
   std::vector<duckdb::shared_ptr<sirius_pipeline>> visited;
-  auto next_op = creator.get_operator_for_next_task(mock_op.get(), visited);
+  auto const next_op = creator.get_operator_for_next_task(mock_op.get(), visited);
 
   // Nothing should be scheduled
-  REQUIRE(next_op == nullptr);
+  REQUIRE(next_op.state == next_task_state::depleted);
 }
 
 TEST_CASE("get_operator_for_next_task for operator with data returns the operator",
@@ -453,9 +456,10 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
 
   // Following source_op's READY hint must land on hint_op.
   std::vector<duckdb::shared_ptr<sirius_pipeline>> visited;
-  auto next_op = creator.get_operator_for_next_task(source_op.get(), visited);
+  auto const next_op = creator.get_operator_for_next_task(source_op.get(), visited);
 
-  REQUIRE(next_op == hint_op.get());
+  REQUIRE(next_op.state == next_task_state::ready);
+  REQUIRE(next_op.op == hint_op.get());
 
   // // Verify that schedule was called with the hint_op
   // auto scheduled_nodes = creator.get_scheduled_nodes();

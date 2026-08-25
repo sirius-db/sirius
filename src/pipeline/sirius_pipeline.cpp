@@ -378,6 +378,9 @@ std::unique_lock<std::mutex> sirius_pipeline::get_task_creation_lock()
 void sirius_pipeline::update_pipeline_status(bool original_pipeline)
 {
   bool should_notify = false;
+  // Distinct from should_notify, which is also set on the already-finished path:
+  // this marks the one-shot transition, so the closure is reported exactly once.
+  bool just_closed = false;
   {
     std::lock_guard<std::mutex> lock(_status_mutex);
 
@@ -417,6 +420,7 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
                               first_node->all_ports_empty())) {
         if (tasks_created.load() == tasks_completed.load()) {
           pipeline_finished.store(true);
+          just_closed = true;
           for (auto& op : get_operators()) {
             op.get().finalize_operator();
           }
@@ -428,6 +432,18 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
     }
   }  // _status_mutex released here — notify_downstream_pipelines must run outside the lock
      // to avoid holding the child pipeline mutex while acquiring a parent's
+
+  // Outside _status_mutex: an observer must not run under the pipeline lock.
+  if (just_closed && _task_creator != nullptr) {
+    // Observation only, so an unnumbered source is reported as the sentinel
+    // rather than throwing out of pipeline teardown: plans that never ran
+    // assign_operator_ids still close their pipelines. 0 would not do — it is a
+    // valid operator id, so it would name operator 0 as the source.
+    auto const source_id = source != nullptr && source->has_operator_id()
+                             ? source->get_operator_id()
+                             : op::sirius_physical_operator::invalid_operator_id;
+    _task_creator->notify_pipeline_closure(get_pipeline_id(), source_id);
+  }
 
   if (should_notify) { notify_downstream_pipelines(original_pipeline); }
 }

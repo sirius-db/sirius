@@ -61,7 +61,7 @@ gpu_pipeline_executor::gpu_pipeline_executor(
 
 gpu_pipeline_executor::~gpu_pipeline_executor() { stop(); }
 
-absl::AnyInvocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
+sirius::exec::invocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
 {
   int device_id          = _memory_space->get_device_id();
   auto thread_id_counter = std::make_shared<std::atomic<uint32_t>>(0);
@@ -183,7 +183,27 @@ void gpu_pipeline_executor::manager_loop()
       _memory_space->get_available_memory(),
       _memory_space->get_total_reserved_memory(),
       _memory_space->get_max_memory());
-    auto reservation = _memory_space->make_reservation(bytes_needs);
+    // Try without blocking first, purely so the blocking case can be reported.
+    // make_reservation() parks until the memory frees up, and a listener told
+    // only once it returns learns nothing it can act on -- by then the stall it
+    // would have exploited is over.  A reservation that succeeds outright is the
+    // common case and raises nothing.
+    auto reservation = _memory_space->make_reservation_or_null(bytes_needs);
+    if (!reservation) {
+      if (_query_stage_manager) {
+        auto const* pipe               = gpu_task->get_pipeline();
+        auto const stalled_operator_id = pipe != nullptr
+                                           ? pipe->get_source_operator().first
+                                           : op::sirius_physical_operator::invalid_operator_id;
+        _query_stage_manager->notify_wait_for_memory_for_task(
+          make_query_id(
+            static_cast<std::uint32_t>(static_cast<std::uint64_t>(gpu_task->get_priority()) >> 32)),
+          stalled_operator_id,
+          _memory_space != nullptr ? _memory_space->get_device_id() : -1,
+          bytes_needs);
+      }
+      reservation = _memory_space->make_reservation(bytes_needs);
+    }
     if (!reservation) {
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to acquire memory reservation for task {}",
                        gpu_task->get_task_id());
@@ -213,6 +233,20 @@ void gpu_pipeline_executor::manager_loop()
         shortfall,
         gpu_task->get_pipeline_id(),
         gpu_task->get_task_id());
+
+      // Reported before the (blocking) downgrade rather than after: the value of
+      // knowing is that the GPU is about to stall, and a listener told only once
+      // it has finished learns nothing it can act on.
+      auto const* downgrade_pipe     = gpu_task->get_pipeline();
+      auto const stalled_operator_id = downgrade_pipe != nullptr
+                                         ? downgrade_pipe->get_source_operator().first
+                                         : op::sirius_physical_operator::invalid_operator_id;
+      _query_stage_manager->notify_memory_downgrade_for_task(
+        make_query_id(
+          static_cast<std::uint32_t>(static_cast<std::uint64_t>(gpu_task->get_priority()) >> 32)),
+        stalled_operator_id,
+        _memory_space != nullptr ? _memory_space->get_device_id() : -1,
+        shortfall);
 
       reservation.reset();  // release partial reservation before downgrade
 
