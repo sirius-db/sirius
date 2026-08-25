@@ -16,8 +16,9 @@
 
 #include "late_mat/prepared_selection.hpp"
 
-#include <codegen/selection/row_id_space.hpp>
 #include <nvtx3/nvtx3.hpp>
+
+#include <codegen/selection/row_id_space.hpp>
 
 #include <stdexcept>
 #include <string>

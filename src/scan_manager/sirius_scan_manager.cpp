@@ -843,6 +843,16 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
     if (!entry.host_chunks.empty()) {
       return decline("the scan restricts rows and its pin is host-tier");
     }
+    // Accepting the survivors out-parameter is not the same as answering it:
+    // the duckdb-native ingestible filters with a plain select and hands back a
+    // compacted table with no record of which rows lived. Without those
+    // positions the rowid would have to be invented, so refuse here rather than
+    // at substitution time, where the only symptom is a row count that no
+    // longer matches the pinned chunk.
+    if (!scan_op.get_ingestible().can_report_survivors()) {
+      return decline(
+        "the scan restricts rows and its ingestible cannot report which rows survived");
+    }
   }
 
   // A bundle whose pinned columns are COMPRESSED is worth more than its ride

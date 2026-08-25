@@ -164,6 +164,22 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    */
   [[nodiscard]] virtual bool has_row_filter() const noexcept { return false; }
 
+  /**
+   * @brief Whether @ref post_filter_and_project actually POPULATES its
+   *        @c survivors out-parameter when one is passed.
+   *
+   * Accepting the parameter is not the same as answering it: an implementation
+   * that filters with a plain select ignores it and hands back a compacted
+   * table with no record of which rows survived. A late-materialization rowid
+   * over a filtered scan is built from exactly those positions, so a scan whose
+   * ingestible cannot report them must be refused at install rather than
+   * discovered at runtime, when the only signal left is a row count that no
+   * longer matches the pinned chunk.
+   *
+   * Defaults to FALSE so a new ingestible is refused until it opts in.
+   */
+  [[nodiscard]] virtual bool can_report_survivors() const noexcept { return false; }
+
   /// Whether @ref post_filter_and_project's assembly is a leading-identity
   /// projection: output column k is materialized column k, and no partition or
   /// other synthesized column joins the output. When true, a decode-row-filtered

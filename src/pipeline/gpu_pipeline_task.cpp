@@ -513,7 +513,28 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
   return operator_input_output_data;
 }
 
+std::unique_ptr<op::operator_data> gpu_pipeline_task::materialize_sink_input(
+  op::operator_data& output_data, rmm::cuda_stream_view stream)
+{
+  auto pipeline       = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
+  auto sink_operators = pipeline->get_sink();
+  if (!sink_operators) { throw std::runtime_error("Sink operator not found"); }
+  // A port can be a sink as easily as a mid-pipeline operator — q10's is a
+  // HASH_GROUP_BY — so the far end of a deferral is restored on both paths.
+  return materialize_deferred_input(*sink_operators, output_data, stream);
+}
+
 void gpu_pipeline_task::publish_output(op::operator_data& output_data, rmm::cuda_stream_view stream)
+{
+  // Interface entry point: restore and publish as one step. gpu_pipeline_task::execute takes the
+  // two-step overload instead, so it can bound the OOM-reschedule window to the restoration.
+  auto materialized = materialize_sink_input(output_data, stream);
+  publish_output(output_data, materialized.get(), stream);
+}
+
+void gpu_pipeline_task::publish_output(op::operator_data& output_data,
+                                       op::operator_data* materialized,
+                                       rmm::cuda_stream_view stream)
 {
   auto pipeline       = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
   auto sink_operators = pipeline->get_sink();
@@ -524,9 +545,6 @@ void gpu_pipeline_task::publish_output(op::operator_data& output_data, rmm::cuda
                                   sink_operators->get_operator_id());
     nvtx3::scoped_range nvtx_range{nvtx_label.c_str()};
     auto const sink_start = std::chrono::high_resolution_clock::now();
-    // A port can be a sink as easily as a mid-pipeline operator — q10's is a
-    // HASH_GROUP_BY — so the far end of a deferral is restored on both paths.
-    auto const materialized = materialize_deferred_input(*sink_operators, output_data, stream);
     sink_operators.get()->sink(materialized ? *materialized : output_data, stream);
     auto const sink_end = std::chrono::high_resolution_clock::now();
     auto const sink_duration =
@@ -677,8 +695,13 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   // operators.size() means "the loop already ran; only the sink is left" (compute_task's loop is
   // a no-op for that index, see the guard on first_op above).
   if (output_data) {
+    // ONLY the restoration is retryable. A sink publishes incrementally — a partition writes
+    // batches to its repositories as it goes — so an OOM inside sink() has already committed
+    // some of them, and replaying the whole sink input would emit those rows twice. The
+    // reschedule window therefore closes before sink() is entered; an OOM there propagates.
+    std::unique_ptr<op::operator_data> materialized;
     try {
-      publish_output(*output_data, stream);
+      materialized = materialize_sink_input(*output_data, stream);
     } catch (const rmm::out_of_memory& oom) {
       auto peak_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
       auto const bytes_to_materialize_input =
@@ -709,6 +732,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
       throw oom_reschedule_exception(
         std::move(output_data), operators.size(), "OOM restoring a deferral at the sink");
     }
+    publish_output(*output_data, materialized.get(), stream);
   }
 
   // Record memory metrics for future reservation estimates. Measured after publish_output, not

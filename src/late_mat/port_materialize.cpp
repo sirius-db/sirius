@@ -16,8 +16,6 @@
 
 #include "late_mat/port_materialize.hpp"
 
-#include <nvtx3/nvtx3.hpp>
-
 #include "helper/numeric_narrowing.hpp"
 #include "late_mat/materialize.hpp"
 #include "late_mat/prepared_selection.hpp"
@@ -25,6 +23,8 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/unary.hpp>
+
+#include <nvtx3/nvtx3.hpp>
 
 #include <map>
 #include <stdexcept>

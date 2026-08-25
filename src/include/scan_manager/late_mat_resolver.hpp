@@ -28,8 +28,9 @@
 //
 // Both entry points return nullopt rather than throwing, because every reason
 // they can fail is a reason to simply not defer: a stale origin, an entry
-// living on the host, a nullable column. A deferral that cannot be resolved
-// must degrade to the ordinary path, not to an error.
+// living on the host, a compressed origin, chunks that disagree on their
+// carrier width. A deferral that cannot be resolved must degrade to the
+// ordinary path, not to an error.
 //
 // The views are NON-OWNING and valid for the query's lifetime, which pin/unpin
 // serialization against query execution is what guarantees.
@@ -59,8 +60,11 @@ namespace sirius::scan_manager {
 /// read the right number of rows out of the wrong chunks.
 ///
 /// nullopt for a stale or host-resident origin, a column position the entry
-/// does not have, or a nullable column — nulls would need their validity
-/// gathered alongside the values, which no materialization route does.
+/// does not have, a COMPRESSED origin (the decode routes write values only,
+/// with no output validity buffer), or a column whose chunks were narrowed to
+/// different carrier widths — the view carries one dtype and the gather reads
+/// every batch at it. An uncompressed origin MAY be nullable: every such gather
+/// shape propagates validity.
 [[nodiscard]] std::optional<late_mat::pinned_column_view> resolve_pinned_column(
   late_mat::column_origin const& origin);
 

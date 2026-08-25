@@ -313,6 +313,11 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     return _duckdb_filter_expression != nullptr;
   }
 
+  /// post_filter_and_project routes its filter through
+  /// expression_evaluator::select_with_survivors, which writes the surviving
+  /// positions into the out-parameter.
+  [[nodiscard]] bool can_report_survivors() const noexcept override { return true; }
+
   [[nodiscard]] scan_filter_analysis const& filter_analysis() const override
   {
     return _filter_analysis;

@@ -192,8 +192,11 @@ deferral with a single half, admitted only over pinned columns with no nulls. Of
   `unpin_table`, a re-pin that replaces the entry, or an in-place column merge — bumps or
   invalidates the entry's generation (`pin_entry_handle`, `column_origin.hpp`). A consumer
   resolving an origin against a generation that no longer matches gets `nullopt`, never a stale or
-  dangling pointer: resolution fails closed, at the cost of a re-read, rather than materializing
-  against data that already changed underneath the rowid.
+  dangling pointer. Fail-closed here means the PORT THROWS, not that the query quietly re-reads:
+  by that point the scan has already emitted rowids in place of the values, so there is nothing to
+  fall back to locally. A re-read happens only if an outer layer catches the error and replays the
+  query. The guarantee is that changed data is never materialized against — not that the query
+  survives it unaided.
 - **Multi-GPU pins are refused.** `resolve_pinned_column`/`materialize()` pass a pin's raw column
   views and compressed-table pointers straight to a gather on the consumer's current GPU, with no
   per-device tag and no P2P check, clone, or host-staging fallback — a chunk pinned on a different

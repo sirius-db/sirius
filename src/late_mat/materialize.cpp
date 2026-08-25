@@ -16,8 +16,6 @@
 
 #include "late_mat/materialize.hpp"
 
-#include <nvtx3/nvtx3.hpp>
-
 #include "compression/compressed_representation.hpp"
 #include "late_mat/multi_source_gather.hpp"
 
@@ -32,6 +30,7 @@
 #include <rmm/device_buffer.hpp>
 
 #include <cuda_runtime.h>
+#include <nvtx3/nvtx3.hpp>
 
 #include <api/simpatico_codegen.hpp>
 #include <codegen/selection/chunk_row_set.hpp>
