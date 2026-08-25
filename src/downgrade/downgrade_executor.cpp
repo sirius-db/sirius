@@ -46,7 +46,9 @@ downgrade_executor::downgrade_executor(
   cucascade::memory::memory_space_id space_id,
   cucascade::memory::memory_space* memory_space,
   sirius::memory::sirius_memory_reservation_manager& reservation_manager,
-  sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* pipeline_task_queue)
+  std::optional<
+    std::reference_wrapper<sirius::exec::multi_index_priority_queue<sirius::parallel::itask>>>
+    pipeline_task_queue)
   : _config(std::move(config)),
     _data_repo_registry(data_repo_registry),
     _space_id(space_id),
@@ -292,9 +294,10 @@ void downgrade_executor::processing_loop()
 
     // === TIER 2: task_scheduler task queue ===
     if (!req->satisfied.load() && _pipeline_task_queue) {
-      size_t max_tasks_to_convert = _pipeline_task_queue->size();
+      auto& pipeline_task_queue   = _pipeline_task_queue->get();
+      size_t max_tasks_to_convert = pipeline_task_queue.size();
       size_t tasks_converted      = 0;
-      convertible_gpu_pipeline_task_provider pipeline_provider(*_pipeline_task_queue);
+      convertible_gpu_pipeline_task_provider pipeline_provider(pipeline_task_queue);
       while (!req->satisfied.load() && tasks_converted < max_tasks_to_convert) {
         auto candidate =
           pipeline_provider.get_next_convertible(source_space, /*front_to_back=*/false);
@@ -506,9 +509,9 @@ void downgrade_executor::cancel_pending_requests()
 }
 
 void downgrade_executor::set_pipeline_task_queue(
-  sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* pipeline_task_queue)
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask>& pipeline_task_queue)
 {
-  _pipeline_task_queue = pipeline_task_queue;
+  _pipeline_task_queue = std::ref(pipeline_task_queue);
 }
 
 // --- Public request API ---

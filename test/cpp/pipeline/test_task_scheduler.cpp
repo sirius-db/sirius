@@ -214,7 +214,7 @@ TEST_CASE("Tasks extracted and RAII-returned while executors are parked still ru
   task_scheduler sched(gpu_config, *manager, sirius::test::make_test_telemetry_context());
 
   auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
-  auto* queue       = sched.get_pipeline_task_queue();
+  auto& queue       = sched.get_pipeline_task_queue();
 
   // Schedule before start() so the extraction below cannot race the matcher.
   const int num_tasks = 2;
@@ -227,10 +227,10 @@ TEST_CASE("Tasks extracted and RAII-returned while executors are parked still ru
   // Extract every task, wrapped so the RAII destructor returns it (as the
   // downgrade's TIER-2 pass does).
   std::vector<std::unique_ptr<sirius::convertible_gpu_pipeline_task>> extracted;
-  while (auto t = queue->mutable_pop_if([](sirius::parallel::itask&) { return true; },
-                                        /*front_to_back=*/false)) {
+  while (auto t = queue.mutable_pop_if([](sirius::parallel::itask&) { return true; },
+                                       /*front_to_back=*/false)) {
     extracted.push_back(
-      std::make_unique<sirius::convertible_gpu_pipeline_task>(std::move(*t), *queue));
+      std::make_unique<sirius::convertible_gpu_pipeline_task>(std::move(*t), queue));
   }
   REQUIRE(extracted.size() == num_tasks);
 

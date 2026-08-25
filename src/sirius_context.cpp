@@ -222,7 +222,21 @@ SiriusContext::SiriusContext() = default;
 
 SiriusContext::~SiriusContext() noexcept
 {
-  if (is_initialized_) { terminate(); }
+  if (!is_initialized_) { return; }
+
+  try {
+    terminate();
+  } catch (const std::exception& e) {
+    try {
+      SIRIUS_LOG_ERROR("SiriusContext teardown failed: {}", e.what());
+    } catch (...) {
+    }
+  } catch (...) {
+    try {
+      SIRIUS_LOG_ERROR("SiriusContext teardown failed with an unknown error");
+    } catch (...) {
+    }
+  }
 }
 
 // Log host and GPU memory pool stats at a labeled point.
@@ -850,8 +864,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
                                                        &downgrade_executors_);
 
   task_creator_ = std::make_unique<sirius::creator::task_creator>(
-    config_.get_task_creator_config(), *memory_manager_, topology_index_);
-  task_creator_->set_task_scheduler(*task_scheduler_);
+    config_.get_task_creator_config(), *memory_manager_, *task_scheduler_, topology_index_);
   task_scheduler_->set_task_creator(*task_creator_);
 
   scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
@@ -878,14 +891,17 @@ void SiriusContext::terminate()
 {
   throw_if_not_initialized();
 
+  // Stop every producer and borrower before destroying the scheduler. Task-creator workers call
+  // into the scheduler, while downgrade workers hold a non-owning reference to its task queue.
   task_scheduler_->stop();
-  task_scheduler_.reset();
   if (scan_manager_) { scan_manager_->stop(); }
   task_creator_->stop_thread_pool();
-  task_creator_.reset();
   for (auto& executor : downgrade_executors_) {
     executor->stop();
   }
+
+  task_scheduler_.reset();
+  task_creator_.reset();
   downgrade_executors_.clear();
   sirius::telemetry::batch_telemetry_registry::instance().uninstall();
   telemetry_context_.reset();

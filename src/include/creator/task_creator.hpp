@@ -25,6 +25,7 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "pipeline/itask_scheduler.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <blockingconcurrentqueue.h>
@@ -34,12 +35,12 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
 namespace sirius::pipeline {
-class task_scheduler;
 class sirius_pipeline_task_global_state;
 }  // namespace sirius::pipeline
 
@@ -80,10 +81,12 @@ class task_creator {
    *
    * @param config Configuration for the thread pool (thread count, name prefix, CPU affinity).
    * @param mem_res_mgr Reference to the memory reservation manager.
+   * @param task_scheduler Scheduler that receives created tasks and terminal errors.
    * @param topology_index Optional shared GPU<->NUMA index for NUMA-aware GPU routing.
    */
   task_creator(task_creator_config config,
                sirius::memory::sirius_memory_reservation_manager& mem_res_mgr,
+               sirius::pipeline::itask_scheduler& task_scheduler,
                std::shared_ptr<const sirius::memory::topology_index> topology_index = nullptr);
 
   /**
@@ -109,9 +112,6 @@ class task_creator {
 
   /// \brief sets client context needed for task creation
   void set_client_context(::duckdb::ClientContext& client_context);
-
-  /// \brief sets pipeline executor reference
-  void set_task_scheduler(sirius::pipeline::task_scheduler& task_scheduler);
 
   /// \brief prepare global states for all pipelines in the query
   void prepare_for_query(const sirius::planner::query& query);
@@ -220,7 +220,7 @@ class task_creator {
   std::unique_ptr<exec::bounded_thread_pool> _bounded_pool;
   std::thread _manager_thread;
   ::duckdb::ClientContext* _client_context;
-  sirius::pipeline::task_scheduler* _task_scheduler{nullptr};
+  sirius::pipeline::itask_scheduler& _task_scheduler;
   sirius::memory::sirius_memory_reservation_manager& _mem_res_mgr;
   std::atomic<uint64_t> _task_id{0};
 

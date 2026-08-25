@@ -21,7 +21,6 @@
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
-#include "pipeline/task_scheduler.hpp"
 #include "planner/query.hpp"
 #include "planner/query_index.hpp"
 #include "sirius_context.hpp"
@@ -47,9 +46,11 @@ namespace sirius::creator {
 
 task_creator::task_creator(task_creator_config config,
                            sirius::memory::sirius_memory_reservation_manager& mem_res_mgr,
+                           sirius::pipeline::itask_scheduler& task_scheduler,
                            std::shared_ptr<const sirius::memory::topology_index> topology_index)
   : _running(false),
     _config(std::move(config)),
+    _task_scheduler(task_scheduler),
     _mem_res_mgr(mem_res_mgr),
     _topology_index(std::move(topology_index))
 {
@@ -91,12 +92,6 @@ void task_creator::set_client_context(::duckdb::ClientContext& client_context)
   _thread_context = std::make_unique<duckdb::ThreadContext>(client_context);
   _execution_context =
     std::make_unique<duckdb::ExecutionContext>(client_context, *_thread_context, nullptr);
-}
-
-void task_creator::set_task_scheduler(sirius::pipeline::task_scheduler& task_scheduler)
-{
-  std::lock_guard<std::mutex> lock(_global_state_mutex);
-  _task_scheduler = &task_scheduler;
 }
 
 void task_creator::prepare_for_query(const sirius::planner::query& query)
@@ -570,7 +565,7 @@ void task_creator::manager_loop()
                                                                     std::move(local_state),
                                                                     gpu_pipeline_task_global_state);
           task_lock.unlock();
-          _task_scheduler->schedule(std::move(task));
+          _task_scheduler.schedule(std::move(task));
 
           if (request_kind == request_type::lookahead) { break; }
         }
@@ -583,7 +578,7 @@ void task_creator::manager_loop()
         pipeline->update_pipeline_status(false);
       } catch (const std::exception& e) {
         SIRIUS_LOG_ERROR("Task Creator: Exception during task creation: {}", e.what());
-        _task_scheduler->terminate_query(std::current_exception());
+        _task_scheduler.terminate_query(std::current_exception());
         stop();
       }
     });
