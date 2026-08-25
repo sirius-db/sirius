@@ -27,6 +27,7 @@ endif()
 # Optional features
 option(ENABLE_STREAM_CHECK
        "Enable stream check library for debugging default stream usage" OFF)
+option(BUILD_WITH_CTRACK "Build with CTrack profiling support" OFF)
 
 # The [s3] integration tests launch MinIO via a patched build of upstream
 # testcontainers-native, fetched + patched at configure time and built as a Go
@@ -144,6 +145,25 @@ else()
     set_target_properties(cuco::cuco PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
                                                 "${cuco_SOURCE_DIR}/include")
   endif()
+endif()
+
+# CTrack is retained as an opt-in profiling dependency.
+if(BUILD_WITH_CTRACK)
+# --- ctrack (profiling instrumentation) --- #
+include(FetchContent)
+FetchContent_Declare(
+  ctrack
+  GIT_REPOSITORY https://github.com/Compaile/ctrack.git
+  GIT_TAG 6dfa9b0eef26507cfa9bc17ae4d817ab011a28f5 # v1.1.0
+  SOURCE_SUBDIR do-not-build)
+FetchContent_MakeAvailable(ctrack)
+if(NOT TARGET ctrack::ctrack)
+  add_library(ctrack::ctrack INTERFACE IMPORTED)
+  set_target_properties(
+    ctrack::ctrack PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
+                              "${ctrack_SOURCE_DIR}/include")
+endif()
+
 endif()
 
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
@@ -586,6 +606,9 @@ foreach(_target sirius_extension sirius_loadable_extension)
     core_functions_extension
     parquet_extension
     simpatico)
+  if(BUILD_WITH_CTRACK)
+    target_link_libraries(${_target} ctrack::ctrack)
+  endif()
 
   add_dependencies(${_target} duckdb_static)
 endforeach()
