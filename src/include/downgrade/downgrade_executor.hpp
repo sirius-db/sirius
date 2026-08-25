@@ -36,7 +36,6 @@
 #include <future>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <thread>
 #include <vector>
 
@@ -82,7 +81,7 @@ class downgrade_executor {
    * @param memory_space Pointer to the memory space (for pressure queries; nullptr disables
    * monitor)
    * @param reservation_manager Reference to the memory reservation manager
-   * @param pipeline_task_queue Optional reference to the pipeline task queue for tiered fallback
+   * @param pipeline_task_queue Optional pointer to pipeline task queue for tiered fallback
    */
   explicit downgrade_executor(
     exec::downgrade_executor_config config,
@@ -90,9 +89,8 @@ class downgrade_executor {
     cucascade::memory::memory_space_id space_id,
     cucascade::memory::memory_space* memory_space,
     sirius::memory::sirius_memory_reservation_manager& reservation_manager,
-    std::optional<
-      std::reference_wrapper<sirius::exec::multi_index_priority_queue<sirius::parallel::itask>>>
-      pipeline_task_queue = std::nullopt);
+    sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* pipeline_task_queue =
+      nullptr);
 
   ~downgrade_executor();
 
@@ -133,15 +131,15 @@ class downgrade_executor {
   size_t request_free_memory_and_wait(size_t bytes);
 
   /**
-   * @brief Set the pipeline task queue reference for tiered downgrade scanning.
+   * @brief Set the pipeline task queue pointer for tiered downgrade scanning.
    *
    * Must be called before start(). Allows deferred wiring when the queue
    * is not available at construction time.
    *
-   * @param pipeline_task_queue The task scheduler's task queue
+   * @param pipeline_task_queue Pointer to the task_scheduler's task queue
    */
   void set_pipeline_task_queue(
-    sirius::exec::multi_index_priority_queue<sirius::parallel::itask>& pipeline_task_queue);
+    sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* pipeline_task_queue);
 
   /**
    * @brief Asynchronously request a predicate-driven downgrade.
@@ -209,9 +207,9 @@ class downgrade_executor {
   cucascade::memory::memory_space* _memory_space;
   std::string _source_label;
   sirius::memory::sirius_memory_reservation_manager& _reservation_manager;
-  std::optional<
-    std::reference_wrapper<sirius::exec::multi_index_priority_queue<sirius::parallel::itask>>>
-    _pipeline_task_queue;
+  // Non-owning pointer into task_scheduler. SiriusContext stops this executor before destroying
+  // the scheduler and its queue.
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* _pipeline_task_queue{nullptr};
 };
 
 }  // namespace parallel

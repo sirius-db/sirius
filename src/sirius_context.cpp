@@ -864,7 +864,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
                                                        &downgrade_executors_);
 
   task_creator_ = std::make_unique<sirius::creator::task_creator>(
-    config_.get_task_creator_config(), *memory_manager_, *task_scheduler_, topology_index_);
+    config_.get_task_creator_config(), *memory_manager_, topology_index_);
+  task_creator_->set_task_scheduler(*task_scheduler_);
   task_scheduler_->set_task_creator(*task_creator_);
 
   scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
@@ -891,8 +892,8 @@ void SiriusContext::terminate()
 {
   throw_if_not_initialized();
 
-  // Stop every producer and borrower before destroying the scheduler. Task-creator workers call
-  // into the scheduler, while downgrade workers hold a non-owning reference to its task queue.
+  // task_creator_ and downgrade_executors_ hold non-owning pointers into task_scheduler_. Stop and
+  // join every borrower before destroying the scheduler and its task queue.
   task_scheduler_->stop();
   if (scan_manager_) { scan_manager_->stop(); }
   task_creator_->stop_thread_pool();

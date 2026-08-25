@@ -23,7 +23,6 @@
 #include "parallel/task.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
-#include "pipeline/itask_scheduler.hpp"
 #include "pipeline/task_request.hpp"
 #include "planner/query.hpp"
 
@@ -59,7 +58,7 @@ namespace pipeline {
  * task scheduling. It manages a pool of threads dedicated to executing GPU pipeline
  * tasks with specialized GPU resource management.
  */
-class task_scheduler : public itask_scheduler {
+class task_scheduler {
  public:
   /**
    * @brief Constructs a new task_scheduler with task execution configuration
@@ -97,7 +96,7 @@ class task_scheduler : public itask_scheduler {
    *
    * @param task The task to schedule (must be a gpu_pipeline_task)
    */
-  void schedule(std::unique_ptr<sirius::parallel::itask> task) override;
+  void schedule(std::unique_ptr<sirius::parallel::itask> task);
 
   /**
    * @brief Starts the executor and initializes worker threads
@@ -124,12 +123,12 @@ class task_scheduler : public itask_scheduler {
   void set_task_creator(sirius::creator::task_creator& task_creator);
 
   /**
-   * @brief Get the pipeline-level task queue.
+   * @brief Get a pointer to the pipeline-level task queue.
    */
-  [[nodiscard]] exec::multi_index_priority_queue<sirius::parallel::itask>&
+  [[nodiscard]] exec::multi_index_priority_queue<sirius::parallel::itask>*
   get_pipeline_task_queue() noexcept
   {
-    return _task_queue;
+    return &_task_queue;
   }
 
   /**
@@ -172,7 +171,7 @@ class task_scheduler : public itask_scheduler {
    *
    * @param error The error to report.
    */
-  void terminate_query(std::exception_ptr error) override;
+  void terminate_query(std::exception_ptr error);
 
   /**
    * @brief Drain all in-flight tasks after a query error.

@@ -19,7 +19,8 @@
 #include "exec/config.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/sirius_pipeline.hpp"
-#include "utils/fake_task_scheduler.hpp"
+#include "pipeline/task_scheduler.hpp"
+#include "utils/telemetry_utils.hpp"
 
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
@@ -156,15 +157,15 @@ class testable_task_creator : public task_creator {
  public:
   testable_task_creator(int num_threads,
                         duckdb::ClientContext& client_context,
-                        itask_scheduler& task_sched,
+                        task_scheduler& task_sched,
                         sirius::memory::sirius_memory_reservation_manager& mem_res_mgr)
     : task_creator(
         creator::task_creator_config{
           .thread_pool = {.num_threads = num_threads, .thread_name_prefix = "task_creator"}},
-        mem_res_mgr,
-        task_sched)
+        mem_res_mgr)
   {
     this->set_client_context(client_context);
+    this->set_task_scheduler(task_sched);
   }
 
   void schedule(op::sirius_physical_operator* request) override
@@ -241,6 +242,9 @@ class test_fixture {
         return std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
           std::move(space_configs));
       }()),
+      pipeline_exec(exec::thread_pool_config{.num_threads = 1},
+                    *memory_manager,
+                    sirius::test::make_test_telemetry_context()),
       empty_pipelines()
   {
   }
@@ -257,7 +261,7 @@ class test_fixture {
   duckdb::Connection con;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager;
   pipeline::pipeline_build_context build_ctx{nullptr, true};
-  sirius::test::fake_task_scheduler pipeline_exec;
+  task_scheduler pipeline_exec;
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> empty_pipelines;
 };
 

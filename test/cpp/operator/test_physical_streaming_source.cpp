@@ -34,7 +34,6 @@
 #include <op/sirius_physical_streaming_source.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 #include <sirius/exception.hpp>
-#include <utils/fake_task_scheduler.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -103,9 +102,8 @@ static duckdb::shared_ptr<sirius::pipeline::sirius_pipeline> make_single_op_pipe
 /// task_creator that only records what would have been scheduled.
 class recording_task_creator : public sirius::creator::task_creator {
  public:
-  recording_task_creator(sirius::memory::sirius_memory_reservation_manager& mem_mgr,
-                         sirius::pipeline::itask_scheduler& task_scheduler)
-    : task_creator(sirius::creator::task_creator_config{}, mem_mgr, task_scheduler)
+  explicit recording_task_creator(sirius::memory::sirius_memory_reservation_manager& mem_mgr)
+    : task_creator(sirius::creator::task_creator_config{}, mem_mgr)
   {
   }
 
@@ -921,8 +919,7 @@ TEST_CASE("streaming_source BUG-3: closing an empty stream schedules downstream 
           "[streaming_source][pipeline_completion]")
 {
   auto mem_mgr = sirius::test::operator_utils::initialize_memory_manager();
-  sirius::test::fake_task_scheduler task_scheduler;
-  recording_task_creator creator(*mem_mgr, task_scheduler);
+  recording_task_creator creator(*mem_mgr);
 
   auto [op, repo] = make_source();
   auto pipeline   = make_single_op_pipeline(*op);
@@ -946,8 +943,7 @@ TEST_CASE("streaming_source BUG-4: late close after last task schedules downstre
   auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
   auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
-  sirius::test::fake_task_scheduler task_scheduler;
-  recording_task_creator creator(*mem_mgr, task_scheduler);
+  recording_task_creator creator(*mem_mgr);
 
   auto [op, repo] = make_source();
   auto pipeline   = make_single_op_pipeline(*op);
@@ -984,8 +980,7 @@ TEST_CASE("streaming_source REARM-1: a push after a WAITING hint re-schedules th
   auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
   auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
-  sirius::test::fake_task_scheduler task_scheduler;
-  recording_task_creator creator(*mem_mgr, task_scheduler);
+  recording_task_creator creator(*mem_mgr);
 
   auto [op, repo] = make_source();
   auto pipeline   = make_single_op_pipeline(*op);
@@ -1023,8 +1018,7 @@ TEST_CASE("streaming_source REARM-2: a push after a drained drain loop re-schedu
   auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
   auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
-  sirius::test::fake_task_scheduler task_scheduler;
-  recording_task_creator creator(*mem_mgr, task_scheduler);
+  recording_task_creator creator(*mem_mgr);
 
   auto [op, repo] = make_source();
   auto pipeline   = make_single_op_pipeline(*op);
@@ -1062,8 +1056,7 @@ TEST_CASE("streaming_source REARM-3: a batch already queued turns the hint into 
   auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
   auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
-  sirius::test::fake_task_scheduler task_scheduler;
-  recording_task_creator creator(*mem_mgr, task_scheduler);
+  recording_task_creator creator(*mem_mgr);
 
   auto [op, repo] = make_source();
   auto pipeline   = make_single_op_pipeline(*op);
@@ -1104,8 +1097,7 @@ TEST_CASE("streaming_source SRC-26: a producer error is rethrown to the puller",
           "[streaming_source][pipeline_completion]")
 {
   auto mem_mgr = sirius::test::operator_utils::initialize_memory_manager();
-  sirius::test::fake_task_scheduler task_scheduler;
-  recording_task_creator creator(*mem_mgr, task_scheduler);
+  recording_task_creator creator(*mem_mgr);
 
   auto [op, repo] = make_source();
   auto pipeline   = make_single_op_pipeline(*op);
