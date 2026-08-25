@@ -215,7 +215,7 @@ narrowed_pin_chunk narrow_pin_chunk(std::unique_ptr<cudf::table> table,
 /// (the host tier frees each table in @p on_batch before the next is materialized).
 void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
                              std::span<cucascade::memory::memory_space* const> gpu_spaces,
-                             io::sirius_ioctx& io_ctx,
+                             io::ioctx& io_ctx,
                              duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
                              pin_materialization_options options,
                              const pin_batch_sink& on_batch)
@@ -238,7 +238,7 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
   }
   scan_manager::round_robin_strategy placement(std::move(device_ids));
 
-  // next_split_provider takes the io_ctx by shared_ptr; sirius_ioctx derives
+  // next_split_provider takes the io_ctx by shared_ptr; ioctx derives
   // std::enable_shared_from_this and the scan manager owns it via a shared_ptr, so
   // this hands the metadata reads a valid owning reference for the read's duration.
   auto io_ctx_sp = io_ctx.shared_from_this();
@@ -465,7 +465,7 @@ bool compress_and_stage_batch(cudf::table const& tbl,
 materialized_pin materialize_all_batches(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
-  io::sirius_ioctx& io_ctx,
+  io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   pin_materialization_options options)
 {
@@ -497,7 +497,7 @@ host_pin_result materialize_pin_to_host(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   const std::unordered_map<int, cucascade::memory::memory_space*>& host_space_by_gpu,
-  io::sirius_ioctx& io_ctx,
+  io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   compression_pin_config const& compression,
   pin_materialization_options options)
@@ -606,7 +606,7 @@ host_pin_result materialize_pin_to_host(
 device_pin_result materialize_all_batches_compressed(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
-  io::sirius_ioctx& io_ctx,
+  io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   compression_pin_config const& compression,
   pin_materialization_options options)

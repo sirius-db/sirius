@@ -18,6 +18,7 @@
 
 #include "exec/channel.hpp"
 #include "exec/config.hpp"
+#include "exec/query_stage_manager.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
@@ -85,6 +86,14 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
    */
   ~gpu_pipeline_executor();
 
+  /// Attach the query-stage observer, sharing ownership so the handle is
+  /// neither null nor dangling.  Propagated by task_scheduler; until then this
+  /// executor reports into its own listener-less manager.
+  void set_query_stage_manager(sirius::exec::query_stage_manager& manager)
+  {
+    _query_stage_manager = manager.shared_from_this();
+  }
+
   // Non-copyable but movable
   gpu_pipeline_executor(const gpu_pipeline_executor&)            = delete;
   gpu_pipeline_executor& operator=(const gpu_pipeline_executor&) = delete;
@@ -131,7 +140,7 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
  protected:
   void manager_loop() override;
 
-  absl::AnyInvocable<void() noexcept> get_per_thread_init() override;
+  sirius::exec::invocable<void() noexcept> get_per_thread_init() override;
 
  private:
   /**
@@ -147,6 +156,9 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   exec::publisher<std::unique_ptr<task_request>> _task_request_publisher;
   cucascade::memory::memory_space* _memory_space;
   sirius::parallel::downgrade_executor* _downgrade_executor{nullptr};
+  /// Observer of query stage transitions.  Never null; see task_creator.
+  std::shared_ptr<sirius::exec::query_stage_manager> _query_stage_manager{
+    std::make_shared<sirius::exec::query_stage_manager>()};
   sirius::creator::task_creator* _task_creator{nullptr};
   completion_handler* _completion_handler{nullptr};
   std::atomic<size_t> _tasks_executed{0};

@@ -17,7 +17,7 @@
 #pragma once
 
 // sirius
-#include <io/io_context.hpp>  // sirius_ioctx + sirius_io_object
+#include <io/io_context.hpp>  // ioctx + io_object
 #include <op/scan/duckdb_native_metadata.hpp>
 
 // duckdb

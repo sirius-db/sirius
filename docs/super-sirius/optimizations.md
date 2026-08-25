@@ -364,13 +364,13 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 
 **Motivation:** Repeated parquet reads pay full file-system cost on every query. A pinned-memory cache between the file and cuDF's parquet reader can serve subsequent reads at H2D-copy speed without re-reading from disk.
 
-**Mechanism:** `sirius::io` provides a `cudf::io::datasource` (`sirius_datasource`) backed by io_uring reactors and an optional pinned-memory `prefetching_cache`. The cache hit path issues `cudaMemcpyAsync` from pinned host memory directly to device; the miss path falls through to backend I/O, which uses `O_DIRECT` reads through pinned bounce slots and round-robin dispatch across reactor threads. A packed atomic state machine (4-bit state + 28-bit pin count in one `atomic<uint32_t>`) eliminates TOCTOU between readability checks and pin acquisition. Eviction is driven by a tiered LRU score; admission control caps concurrent in-flight chunks to keep memory bounded.
+**Mechanism:** `sirius::io` provides a `cudf::io::datasource` (`sirius_datasource`) backed by io_uring reactors and an optional pinned-memory `prefetching_cache`. The cache converts hits, claimed chunks, and gaps into one logical prepared-slice batch; `templated_ioctx` balances that batch across the two least-busy reactors with one shared coordinator. The worker chooses 256 KiB–16 MiB physical operations, uses `O_DIRECT` when the complete operation is compatible, and holds any multi-block CuCascade staging through its CUDA event. Cache-hit H2D copies likewise hold pins and a completion credit until the stream reaches them. A packed `atomic<uint64_t>` state machine combines lifecycle, reader pins, populated extent, and subscribers so coverage checks and claims are one CAS. Eviction is driven by a tiered LRU score; read-ahead budgets bound work while completion credits make teardown wait for all cache-owned accesses.
 
 **Code path:**
 - `src/io/sirius_datasource.cpp` — `cudf::io::datasource` implementation
 - `src/io/cache/prefetching_cache.cpp` — chunk cache, worker, evictor, buffer pool
 - `src/io/uring/uring_reactor.cpp` — io_uring backend reactor
-- `src/exec/admission_control.cpp` — RAII budget enforcement
+- `src/include/io/io_request.hpp` — prepared request grouping and exact completion fan-in
 
 ### DuckDB-Native Scan Metadata Walk (PRs #868, #895, #936, #900)
 
@@ -389,9 +389,9 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 
 **Motivation:** The DuckDB-native decoder issues many small segment reads. Synchronous `host_read()` calls bypass the datasource backend in favor of direct `pread()`, serializing I/O and inflating the request count per split.
 
-**Mechanism:** The decoder coalesces file-adjacent segment reads — bridging the small per-block header gaps up to a `coalesce_max_gap` derived from the block header size — into large sequential ranges, then issues them as one batch via `sirius_ioctx::host_read_ranges_async_io()` into pinned host blocks. Each coalesced range maps to a contiguous destination span, and the decoder issues bulk asynchronous H2D memcpy into aligned device memory. This cuts read requests per split several-fold and raises read throughput, especially on warm runs.
+**Mechanism:** The decoder coalesces file-adjacent segment reads — bridging the small per-block header gaps up to a `coalesce_max_gap` derived from the block header size — into large sequential ranges, then issues them as one batch via `sirius_datasource::host_read_ranges_async()` into pinned host blocks. Each coalesced range maps to a contiguous destination span, and the decoder issues bulk asynchronous H2D memcpy into aligned device memory. This cuts read requests per split several-fold and raises read throughput, especially on warm runs.
 
-**Code path:** `src/op/scan/duckdb_native_decoder.cpp` — range coalescing and `host_read_ranges_async_io()` dispatch
+**Code path:** `src/op/scan/duckdb_native_decoder.cpp` — range coalescing and `host_read_ranges_async()` dispatch
 
 ### Async S3 / REST Reactor Backend (PR #859)
 
@@ -440,7 +440,7 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 - `src/io/io_context.cpp` — `sirius_ioctx` cache integration and coverage policy
 - `src/include/exec/semi_future.hpp` — async I/O completion primitive
 
-**Config:** `enable_prefetch_cache` and the `cache` sub-config under `executor.scan_manager`
+**Config:** the `cache` block under `executor.scan_manager` — `mode: sirius` arms it, `eviction` (`lru` / `idle`) picks what retires an idle chunk, and `eviction_threshold_fraction` / `min_prefetching_budget_fraction` size it
 
 ### Load-Balanced Scan Batch Coalescing (PR #997)
 

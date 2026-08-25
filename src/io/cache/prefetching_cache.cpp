@@ -16,11 +16,13 @@
 
 #include "io/cache/prefetching_cache.hpp"
 
-#include "cucascade/cuda/event.hpp"
+#include "cuda/device_copy_batch.hpp"
 #include "exec/semi_future.hpp"
 #include "exec/try.hpp"
 #include "io/cache/types.hpp"
 #include "io/io_context.hpp"
+#include "io/io_request.hpp"
+#include "io/prefetch_census.hpp"
 #include "io/types.hpp"
 #include "log/logging.hpp"
 #include "memory/topology_index.hpp"
@@ -31,222 +33,207 @@
 
 #include <cuda_runtime.h>
 
+#include <ctrack.hpp>
+
 #include <algorithm>
-#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <exception>
 #include <format>
-#include <iterator>
+#include <latch>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <span>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace sirius::io::cache {
 
 namespace {
-
-using chunk_iter = std::vector<std::unique_ptr<cached_chunk>>::iterator;
-
-// Locates the first chunk with offset >= `off` within [first, last) using a
-// galloping (exponential) search seeded at `first`.
-//
-// The incoming offsets are sorted and clustered — successive queries are
-// usually exactly one chunk apart — so we probe `first`, then `first+1`,
-// `first+2`, `first+4`, ... until we overshoot, then binary-search the bounded
-// window.  This collapses the common neighboring case to O(1) and keeps gaps at
-// O(log gap) rather than O(log N) over the whole (20-40K-element) vector that a
-// plain lower_bound(first, last, ...) would incur on every single offset.
-chunk_iter gallop_lower_bound(chunk_iter first, chunk_iter last, size_t off)
-{
-  auto cmp = [](const std::unique_ptr<cached_chunk>& c, size_t v) { return c->offset < v; };
-
-  if (first == last || (*first)->offset >= off) { return first; }
-
-  auto probe  = first;  // invariant: (*probe)->offset < off
-  size_t step = 1;
-  while (true) {
-    const auto remaining = static_cast<size_t>(last - probe);
-    if (step >= remaining) {
-      // `off` lies in (probe, last): bounded binary search of the tail.
-      return std::lower_bound(probe + 1, last, off, cmp);
-    }
-    const auto hi = probe + static_cast<std::ptrdiff_t>(step);
-    if ((*hi)->offset < off) {
-      probe = hi;
-      step <<= 1U;
-    } else {
-      // `off` lies in (probe, hi]: binary search that bounded window.
-      return std::lower_bound(probe + 1, hi + 1, off, cmp);
-    }
-  }
+using size_terminal = exec::invocable<void(exec::try_t<std::size_t>&&) &&>;
 }
 
-}  // namespace
+struct prefetching_cache::cached_copy_retirement {
+  std::vector<cached_chunk*> pins;
+  std::shared_ptr<exec::completion_controller::slot> lifetime;
+  std::shared_ptr<grouped_coordinator> coordinator;
+  std::exception_ptr async_error;
+  std::latch published{1};
+  cudaEvent_t event{};
+  cudaStream_t stream{};
+  int device_id{-1};
+  bool enqueue_ok{false};
+  bool event_recorded{false};
+  bool pins_released{false};
 
-class prefetching_handle::prefetch_lifecycle_manager {
- public:
-  explicit prefetch_lifecycle_manager(
-    prefetching_cache::prefetch_request ctx,
-    prefetching_cache::request_queue_type& eviction_queue,
-    prefetching_cache::request_queue_type& prefetch_queue) noexcept
-    : _eviction_queue(eviction_queue), _prefetch_queue(prefetch_queue)
+  ~cached_copy_retirement()
   {
-    if (ctx) {
-      _user_state        = ctx->user_state;
-      _prefetching_state = ctx->state;
-      _ctx               = std::move(ctx);
+    release_pins();
+    if (event == nullptr) { return; }
+    try {
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
+      std::ignore = cudaEventDestroy(event);
+      event       = nullptr;
+    } catch (...) {  // Best effort during prepublication rollback.
     }
   }
 
-  ~prefetch_lifecycle_manager() noexcept { evict(); }
-
-  void activate() noexcept
+  void release_pins() noexcept
   {
-    if (!_ctx) { return; }
-    prefetching_handle_state expected = prefetching_handle_state::idle;
-    if (_user_state->compare_exchange_strong(expected, prefetching_handle_state::active)) {
-      if (_ctx and _prefetching_state->mark_loading()) { _prefetch_queue.enqueue(_ctx); }
+    if (pins_released) { return; }
+    for (auto* chunk : pins) {
+      chunk->state.release_read();
+    }
+    pins_released = true;
+  }
+
+  void wait_and_finish() noexcept
+  {
+    published.wait();
+    cudaError_t wait_status = cudaErrorUnknown;
+    try {
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
+      wait_status = event_recorded ? cudaEventSynchronize(event) : cudaStreamSynchronize(stream);
+      if (event != nullptr) {
+        std::ignore = cudaEventDestroy(event);
+        event       = nullptr;
+      }
+    } catch (...) {
+      wait_status = cudaErrorUnknown;
+    }
+    finish(enqueue_ok && wait_status == cudaSuccess);
+  }
+
+  void finish(bool copy_ok) noexcept
+  {
+    release_pins();
+    if (copy_ok) {
+      coordinator->on_complete();
+    } else {
+      coordinator->report_error(async_error);
     }
   }
-
-  void cancel() noexcept { _user_state->store(prefetching_handle_state::cancelled); }
-
-  [[nodiscard]] bool is_active() const noexcept
-  {
-    return _user_state->load(std::memory_order_acquire) == prefetching_handle_state::active;
-  }
-
-  [[nodiscard]] std::shared_ptr<prefetch_request_context> get_context() const noexcept
-  {
-    return _ctx;
-  }
-
-  void evict() noexcept
-  {
-    cancel();
-    if (_ctx) { _eviction_queue.enqueue(std::move(_ctx)); }
-  }
-
- private:
-  std::shared_ptr<prefetch_request_context> _ctx;
-  std::shared_ptr<std::atomic<prefetching_handle_state>> _user_state;
-  std::shared_ptr<entry_state> _prefetching_state;
-  prefetching_cache::request_queue_type& _eviction_queue;
-  prefetching_cache::request_queue_type& _prefetch_queue;
 };
 
-prefetching_handle::prefetching_handle() noexcept = default;
-prefetching_handle::~prefetching_handle()         = default;
+prefetching_handle::prefetching_handle(prefetch_request req) noexcept : _req(std::move(req)) {}
 
-prefetching_handle::prefetching_handle(prefetching_handle&& o) noexcept            = default;
-prefetching_handle& prefetching_handle::operator=(prefetching_handle&& o) noexcept = default;
-
-void prefetching_handle::activate() noexcept
+prefetching_handle::~prefetching_handle()
 {
-  if (_state) { _state->activate(); }
+  if (_req.consumer) { _req.consumer->mark_disposed(); }
 }
 
-void prefetching_handle::cancel() noexcept
+prefetching_handle::prefetching_handle(prefetching_handle&& o) noexcept : _req(std::move(o._req))
 {
-  if (_state) { _state->cancel(); }
+  o._req = {};
 }
 
-bool prefetching_handle::is_active() const noexcept { return _state && _state->is_active(); }
-
-std::shared_ptr<prefetch_request_context> prefetching_handle::get_context() const noexcept
+prefetching_handle& prefetching_handle::operator=(prefetching_handle&& o) noexcept
 {
-  return _state ? _state->get_context() : nullptr;
+  if (this != &o) {
+    if (_req.consumer) { _req.consumer->mark_disposed(); }
+    _req   = std::move(o._req);
+    o._req = {};
+  }
+  return *this;
 }
 
-prefetching_handle::prefetching_handle(std::unique_ptr<prefetch_lifecycle_manager> mgr) noexcept
-  : _state(std::move(mgr))
+void prefetching_handle::update(scan_stage stage) noexcept
 {
+  if (!_req.consumer) { return; }
+  auto const mapped = to_consumer_stage(stage);
+  if (!mapped) { return; }
+  std::ignore = _req.consumer->mark(*mapped);
 }
 
-prefetching_handle::operator bool() const noexcept { return _state != nullptr; }
+bool prefetching_handle::is_active() const noexcept { return _req.is_active(); }
+
+producer_stage::value prefetching_handle::producer_state() const noexcept
+{
+  return _req.producer ? _req.producer->get() : producer_stage::initialized;
+}
+
+bool prefetching_handle::is_prefetch_in_flight() const noexcept
+{
+  return _req.producer && _req.producer->get() == producer_stage::loading;
+}
+
+bool prefetching_handle::has_started_reading() const noexcept
+{
+  return _req.consumer && _req.consumer->get() >= consumer_stage::reading;
+}
+
+bool prefetching_handle::wait_until_ready() noexcept
+{
+  if (!_req.producer) { return false; }
+  return _req.producer->wait_till_not_loading();
+}
+
+bool prefetching_handle::wait_until_prepared() noexcept
+{
+  if (!_req.producer) { return false; }
+  return _req.producer->wait_until_prepared();
+}
+
+std::shared_ptr<const std::vector<cached_chunk*>> prefetching_handle::chunks() const noexcept
+{
+  return _req.chunks;
+}
+
+prefetching_handle::operator bool() const noexcept { return static_cast<bool>(_req); }
 
 std::vector<cached_chunk*> prefetching_cache::file_entry::update_and_get_chunks(
-  std::span<size_t> incoming, uint32_t ticker)
+  std::span<const size_t> incoming, std::span<const chunk_fill> desired)
 {
-  std::vector<cached_chunk*> result(incoming.size());
+  assert(incoming.size() == desired.size());
+  std::vector<cached_chunk*> result(incoming.size(), nullptr);
 
-  // Phase 1: classify under shared lock — find which offsets already exist.
-  // Track the indices of incoming items that need to be inserted.
+  // Claim an already-materialised chunk for this request: count the subscriber
+  // and widen the extent it is expected to hold.  merge_fill is itself gated on
+  // the chunk's state — it widens only a chunk that has not been loaded yet, so
+  // a chunk already `cached` at a narrower extent keeps advertising exactly the
+  // bytes somebody wrote, and a request needing more of it correctly misses.
+  auto claim = [](cached_chunk* c, chunk_fill want) {
+    c->state.add_subscriber();
+    std::ignore = c->state.merge_fill(want);
+  };
+
+  // Phase 1: under the shared lock, take every slot that is already populated.
+  // Only the offsets whose slot is still empty need the exclusive lock.
   std::vector<size_t> missing_indices;  // indices into `incoming`/`result`
   {
     std::shared_lock lock(mtx);
-
-    auto s           = chunks.begin();
-    const auto s_end = chunks.end();
-
     for (size_t i = 0; i < incoming.size(); ++i) {
-      const size_t off = incoming[i];
-      s                = gallop_lower_bound(s, s_end, off);
-
-      if (s != s_end && (*s)->offset == off) {
-        s->get()->lifecycle.on_request(ticker);
-        result[i] = s->get();  // existing
+      auto const slot = slot_of(incoming[i]);
+      if (slot >= slots.size()) { continue; }  // past EOF: leave result[i] null
+      if (auto* c = slots[slot]) {
+        claim(c, desired[i]);
+        result[i] = c;
       } else {
-        missing_indices.push_back(i);  // mark for insertion
+        missing_indices.push_back(i);
       }
     }
-
-    if (missing_indices.empty()) {
-      return result;  // fast path: nothing to insert
-    }
+    if (missing_indices.empty()) { return result; }
   }
 
-  // Phase 2: upgrade to exclusive lock and insert missing chunks.
-  // Another writer may have inserted some of our "missing" offsets in the
-  // gap between unlocking and re-locking, so re-check each one.
-  std::vector<std::unique_ptr<cached_chunk>> to_insert;
-  to_insert.reserve(missing_indices.size());
-
+  // Phase 2: materialise the missing chunks.  Another writer may have filled
+  // some of our slots between unlocking and re-locking, so re-check each one.
   {
     std::unique_lock lock(mtx);
-
-    auto s     = chunks.begin();
-    auto s_end = chunks.end();
-
     for (size_t idx : missing_indices) {
-      const size_t off = incoming[idx];
-      s                = gallop_lower_bound(s, s_end, off);
-
-      if (s != s_end && (*s)->offset == off) {
-        result[idx] = s->get();  // someone else inserted it
-      } else {
-        auto chunk = std::make_unique<cached_chunk>(off);
-        chunk->lifecycle.on_request(ticker);
-        result[idx] = chunk.get();  // capture raw ptr before move
-        to_insert.push_back(std::move(chunk));
-      }
+      auto const slot = slot_of(incoming[idx]);
+      auto*& entry    = slots[slot];
+      if (entry == nullptr) { entry = arena.emplace(incoming[idx]); }
+      claim(entry, desired[idx]);
+      result[idx] = entry;
     }
-
-    if (to_insert.empty()) {
-      return result;  // all races lost, but result is filled
-    }
-
-    // Bulk merge: to_insert is sorted because missing_indices is in order
-    // and incoming is sorted+unique.
-    const auto mid = chunks.size();
-    chunks.reserve(mid + to_insert.size());
-    chunks.insert(chunks.end(),
-                  std::make_move_iterator(to_insert.begin()),
-                  std::make_move_iterator(to_insert.end()));
-    std::inplace_merge(
-      chunks.begin(),
-      chunks.begin() + mid,
-      chunks.end(),
-      [](const std::unique_ptr<cached_chunk>& a, const std::unique_ptr<cached_chunk>& b) {
-        return a->offset < b->offset;
-      });
   }
 
   return result;
@@ -254,18 +241,33 @@ std::vector<cached_chunk*> prefetching_cache::file_entry::update_and_get_chunks(
 
 std::vector<cached_chunk*> prefetching_cache::file_entry::fetch_chunks(std::size_t offset,
                                                                        std::size_t size,
-                                                                       coverage_policy policy,
-                                                                       std::size_t chunk_size) const
+                                                                       coverage_policy policy) const
 {
-  std::shared_lock lock(mtx);
+  if (size == 0) { return {}; }
 
-  auto result = find_entry(chunks, offset, size, policy, chunk_size);
+  auto const first_slot = slot_of(offset);
+  auto const last_slot  = slot_of(offset + size - 1);
+
+  std::vector<cached_chunk*> result;
+  result.reserve(last_slot - first_slot + 1);
+
+  std::shared_lock lock(mtx);
+  if (last_slot >= slots.size()) { return {}; }  // request runs past EOF
+
+  for (auto slot = first_slot; slot <= last_slot; ++slot) {
+    auto* c = slots[slot];
+    if (c == nullptr) {
+      if (policy == coverage_policy::full) { return {}; }  // gap: no positional coverage
+      continue;
+    }
+    result.push_back(c);
+  }
   return result;
 }
 
 prefetching_cache::prefetching_cache(
   cucascade::memory::memory_reservation_manager& reservation_manager,
-  sirius_ioctx* io_ctx,
+  ioctx* io_ctx,
   const config& cfg,
   std::shared_ptr<const sirius::memory::topology_index> topology_index)
   : _cfg(cfg),
@@ -273,28 +275,53 @@ prefetching_cache::prefetching_cache(
       reservation_manager, cfg.min_prefetching_budget_fraction, cfg.eviction_threshold_fraction)),
     _io_ctx(io_ctx),
     _topology_index(std::move(topology_index)),
-    _armed(_io_ctx->can_use_prefetching_cache()),
-    _rate_limiter(_cfg.inflight_io_chunk_budget)
+    _armed(_io_ctx->can_use_prefetching_cache())
 {
-  _preparation_thread = std::jthread([this](const std::stop_token& st) { prepare_loop(st); },
-                                     _preparation_stop_source.get_token());
-  _prefetch_thread    = std::jthread([this](const std::stop_token& st) { prefetch_loop(st); },
-                                  _prefetch_stop_source.get_token());
-  _evictor_thread     = std::jthread([this](const std::stop_token& st) { evict_loop(st); },
+  _chunk_size          = _pool->chunk_size();
+  auto const max_bytes = static_cast<size_t>(chunk_state::max_fill_pages()) * io::IO_BLOCK_SIZE;
+  if (_chunk_size == 0) {
+    throw std::invalid_argument("prefetching_cache: chunk size must be non-zero");
+  }
+  if (_chunk_size > max_bytes) {
+    throw std::invalid_argument(
+      std::format("prefetching_cache: chunk size {} exceeds the {}-byte packed fill limit",
+                  _chunk_size,
+                  max_bytes));
+  }
+
+  _evictor_thread = std::jthread([this](const std::stop_token& st) { evict_loop(st); },
                                  _evictor_stop_source.get_token());
-  _chunk_size         = _pool->chunk_size();
+}
+
+exec::completion_controller::slot prefetching_cache::acquire_inflight_io() noexcept
+{
+  std::lock_guard lock(_inflight_io_mtx);
+  if (_shutting_down.load(std::memory_order_acquire)) { return {}; }
+  return _inflight_io.acquire();
+}
+
+void prefetching_cache::drain_inflight_io() noexcept
+{
+  std::latch drained{1};
+  // Armed before close(), so both orderings land exactly once: with no IO
+  // outstanding the callback runs inline on close(), otherwise the last slot to
+  // drop fires it from its IO thread.
+  auto subscription = _inflight_io.on_completion([&drained] { drained.count_down(); });
+  {
+    std::lock_guard lock(_inflight_io_mtx);
+    _inflight_io.close();
+  }
+  drained.wait();
 }
 
 prefetching_cache::~prefetching_cache()
 {
   _shutting_down.store(true, std::memory_order_release);
-  _preparation_stop_source.request_stop();
-  _prefetch_stop_source.request_stop();
   _evictor_stop_source.request_stop();
 
-  _rate_limiter.wait_for_all();
-  _preparation_thread.join();
-  _prefetch_thread.join();
+  // The IO completions write into file entries this object owns, so they have
+  // to have run before any of it is torn down.
+  drain_inflight_io();
   _evictor_thread.join();
 }
 
@@ -302,8 +329,7 @@ prefetching_cache::~prefetching_cache()
 // insert
 // ===========================================================================
 
-prefetching_cache::file_entry& prefetching_cache::get_or_create_file_entry(
-  const sirius_io_object& obj)
+prefetching_cache::file_entry& prefetching_cache::get_or_create_file_entry(const io_object& obj)
 {
   const auto& key = obj.raw_file_cache_id();
   std::shared_lock lk(_map_mtx);
@@ -314,316 +340,558 @@ prefetching_cache::file_entry& prefetching_cache::get_or_create_file_entry(
     auto [new_it, inserted] = _file_cache.try_emplace(key, std::make_unique<file_entry>());
     it                      = new_it;
     if (inserted) {
-      it->second->file_size = obj.size();
-      it->second->io_obj    = obj.shared_from_this();
-      it->second->chunks.reserve((obj.size() + _chunk_size - 1) / _chunk_size);
+      it->second->file_size  = obj.size();
+      it->second->io_obj     = obj.shared_from_this();
+      it->second->chunk_size = _chunk_size;
+      // One slot per chunk-aligned position in the file — the same capacity the
+      // sorted chunk vector used to reserve, but indexable instead of searchable.
+      auto const n_slots =
+        obj.size() / _chunk_size + static_cast<size_t>(obj.size() % _chunk_size != 0);
+      it->second->slots.assign(n_slots, nullptr);
     }
   }
   return *it->second;
 }
 
-prefetching_handle prefetching_cache::insert(const sirius_io_object& obj,
-                                             std::span<const byte_range> ranges,
-                                             std::optional<int> gpu_id)
+prefetching_handle prefetching_cache::initiate_prefetching_request(
+  const io_object& obj, std::span<const byte_range> ranges, std::optional<int> gpu_id)
 {
-  if (!_armed) { return prefetching_handle(nullptr); }
+  if (!_armed) { return prefetching_handle(); }
 
   auto& file = get_or_create_file_entry(obj);
 
   const size_t chunk_bytes = _chunk_size;
-  auto coalesced_ranges    = _io_ctx->align_and_coalesce(ranges, chunk_bytes);
 
-  // Enumerate the chunk-aligned offsets covered by the coalesced ranges.  The
-  // ranges come back aligned to chunk_bytes, sorted, and non-overlapping, so the
-  // resulting offsets are sorted, unique, and chunk_bytes apart within each
-  // range — the contract update_and_get_chunks' galloping search relies on.
-  std::vector<size_t> chunk_offsets;  // sorted, unique, chunk-aligned
-  size_t total_chunks = 0;
-  for (const auto& r : coalesced_ranges) {
-    total_chunks += (static_cast<size_t>(r.size()) + chunk_bytes - 1) / chunk_bytes;
+  // Normalise the request set to what the backend actually addresses BEFORE
+  // mapping it onto chunks.
+  //
+  // Widen each range to the backend's alignment (a page for an O_DIRECT file, a
+  // single byte for an object store), then fuse ranges close enough that
+  // bridging the gap beats issuing a second request.  Doing it here, once, is
+  // what stops a chunk being touched by several small ranges anchored to
+  // opposite edges -- `merge` folds those to a whole-chunk fill, and the whole
+  // chunk is then read to serve a few kilobytes.
+  auto const alignment = std::max<size_t>(1, _io_ctx->min_alignment_requirement());
+  auto const gap       = _io_ctx->merge_gap_size();
+
+  std::vector<std::pair<size_t, size_t>> spans;  // [lo, hi), aligned and EOF-clamped
+  spans.reserve(ranges.size());
+  for (const auto& r : ranges) {
+    if (r.offset() < 0 || r.size() <= 0) { continue; }
+    auto const lo = static_cast<size_t>(r.offset());
+    if (lo >= obj.size()) { continue; }
+
+    auto const requested    = static_cast<size_t>(r.size());
+    auto const logical_size = std::min(requested, obj.size() - lo);
+    auto const logical_hi   = lo + logical_size;
+    auto const aligned_lo   = lo - (lo % alignment);
+    auto aligned_hi         = logical_hi;
+    if (auto const remainder = aligned_hi % alignment; remainder != 0) {
+      auto const delta = alignment - remainder;
+      aligned_hi       = delta > obj.size() - aligned_hi ? obj.size() : aligned_hi + delta;
+    }
+    if (aligned_hi > aligned_lo) { spans.emplace_back(aligned_lo, aligned_hi); }
   }
-  chunk_offsets.reserve(total_chunks);
-  for (const auto& r : coalesced_ranges) {
-    const auto start = static_cast<size_t>(r.offset());
-    const auto end   = start + static_cast<size_t>(r.size());
-    for (size_t off = start; off < end; off += chunk_bytes) {
-      chunk_offsets.push_back(off);
+  std::ranges::sort(spans);
+
+  std::vector<std::pair<size_t, size_t>> merged;
+  merged.reserve(spans.size());
+  for (auto const& [lo, hi] : spans) {
+    // `<=` so exactly-adjacent ranges fuse even at gap 0.
+    if (!merged.empty() && (lo <= merged.back().second || lo - merged.back().second <= gap)) {
+      merged.back().second = std::max(merged.back().second, hi);
+    } else {
+      merged.emplace_back(lo, hi);
     }
   }
 
-  auto chunks_to_fetch =
-    file.update_and_get_chunks(chunk_offsets, _ticker.load(std::memory_order_relaxed));
+  // Enumerate the chunk-aligned positions the merged ranges touch, together
+  // with the extent each one is actually wanted for.  Still derived from the
+  // ranges rather than a chunk-aligned coalesce of them: coalescing to chunk
+  // granularity would pull in whole chunks that no range touches, and since
+  // every chunk issues its own IO segment sized to its extent, those chunks
+  // would be pure over-read.
+  std::vector<std::pair<size_t, chunk_fill>> wanted;
+  for (auto const& [lo, hi] : merged) {
+    auto off = (lo / chunk_bytes) * chunk_bytes;
+    while (off < hi) {
+      wanted.emplace_back(off, needed_fill(off, chunk_bytes, lo, hi));
+      if (chunk_bytes > std::numeric_limits<size_t>::max() - off) { break; }
+      off += chunk_bytes;
+    }
+  }
+  std::ranges::sort(wanted, {}, [](auto const& w) { return w.first; });
 
-  auto work    = std::make_shared<prefetch_request_context>(obj, _ticker.load());
-  work->chunks = std::move(chunks_to_fetch);
+  // Collapse to unique offsets, folding the extents of ranges that share a chunk.
+  std::vector<size_t> chunk_offsets;  // sorted, unique, chunk-aligned
+  std::vector<chunk_fill> desired;    // index-parallel with chunk_offsets
+  chunk_offsets.reserve(wanted.size());
+  desired.reserve(wanted.size());
+  for (auto const& [off, fill] : wanted) {
+    if (!chunk_offsets.empty() && chunk_offsets.back() == off) {
+      desired.back() = merge(desired.back(), fill);
+    } else {
+      chunk_offsets.push_back(off);
+      desired.push_back(fill);
+    }
+  }
+
+  auto chunks_to_fetch = file.update_and_get_chunks(chunk_offsets, desired);
+  std::erase(chunks_to_fetch, nullptr);  // offsets past EOF have no slot
+
+  prefetch_request req;
+  req.obj       = obj.shared_from_this();
+  req.producer  = std::make_shared<producer_stage>();
+  req.consumer  = std::make_shared<consumer_stage>();
+  req.chunks    = std::make_shared<const std::vector<cached_chunk*>>(std::move(chunks_to_fetch));
+  req.timestamp = _ticker.load(std::memory_order_relaxed);
   // Resolve the preferred NUMA node for staging buffers from the target GPU's
   // topology; -1 (no preference) when no GPU hint or the GPU is out of scope.
-  if (gpu_id && _topology_index) { work->preferred_numa = _topology_index->numa_node_of(*gpu_id); }
+  if (gpu_id && _topology_index) { req.preferred_numa = _topology_index->numa_node_of(*gpu_id); }
 
-  prefetching_handle handle(std::make_unique<prefetching_handle::prefetch_lifecycle_manager>(
-    work, _eviction_queue, _prefetch_queue));
-  _preparation_queue.enqueue(std::move(work));
+  std::ignore = req.producer->mark_queued();
+  _eviction_queue.enqueue(cache_request{req});
 
-  return handle;
+  return prefetching_handle(std::move(req));
 }
 
-bool prefetching_cache::host_read_from_cache_only(const sirius_io_object& obj,
-                                                  size_t offset,
-                                                  size_t size,
-                                                  uint8_t* dst,
-                                                  prefetching_handle* out_handle)
+bool prefetching_cache::prepare_request(prefetch_request& req, bool wait_for_eviction)
 {
-  if (size == 0) return true;
+  // Never allocate for a request the consumer has already moved past.  A request
+  // is handed to the evictor when it is created, and once its consumer disposes
+  // the evictor releases its subscriber references and retires it from the
+  // batch -- so buffers attached after that point are named by nothing, and
+  // nothing will ever reclaim them.  Abandon instead: terminal and notified, so
+  // no waiter is stranded on the transient `preparing` stage.
+  if (!req.chunks || req.has_fallen_behind()) {
+    req.producer->mark_abandoned();
+    return false;
+  }
 
+  if (!req.producer->mark_preparing()) { return false; }
+
+  auto const& chunks = *req.chunks;
+
+  std::size_t n_chunks_needed = std::ranges::count_if(
+    chunks, [](cached_chunk* c) { return c->state.get_state() == chunk_state::empty; });
+
+  int numa_allocated = req.preferred_numa;
+  auto buffers       = _pool->allocate_bulk(n_chunks_needed, numa_allocated);
+  if (buffers.size() != n_chunks_needed) {
+    if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
+    req.producer->mark_abandoned();
+    return false;
+  }
+
+  for (auto* c : chunks) {
+    if (buffers.empty()) { break; }
+    if (c->state.mark_queued()) {
+      auto* buffer = buffers.back();
+      buffers.pop_back();
+      c->data      = reinterpret_cast<uint8_t*>(buffer);
+      c->numa_node = numa_allocated;
+      if (!c->state.mark_allocated()) { buffers.push_back(buffer); }
+    }
+  }
+
+  if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
+
+  std::ignore = req.producer->mark_prepared();
+  return true;
+}
+
+std::vector<cached_chunk*> prefetching_cache::ranges_in_cache(const io_object& obj,
+                                                              size_t offset,
+                                                              size_t size,
+                                                              coverage_policy policy,
+                                                              prefetching_handle* out_handle) const
+{
   std::vector<cached_chunk*> chunks;
   if (out_handle && *out_handle) {
-    if (auto ctx = out_handle->get_context()) {
-      chunks = find_entry(ctx->chunks, offset, size, coverage_policy::full, _chunk_size);
+    if (auto requested = out_handle->chunks()) {
+      chunks = find_entry(*requested, offset, size, policy, _chunk_size);
     }
   }
-  if (chunks.empty()) {
-    std::shared_lock lk(_map_mtx);
-    auto it = _file_cache.find(obj.raw_file_cache_id());
-    if (it != _file_cache.end()) {
-      lk.unlock();
-      chunks = it->second->fetch_chunks(offset, size, coverage_policy::full, _chunk_size);
-    }
-  }
+  if (!chunks.empty()) { return chunks; }
 
-  while (!chunks.empty()) {
-    auto iter =
-      std::ranges::find_if(chunks, [](cached_chunk* c) { return !c->state.acquire_read(); });
-
-    if (iter != chunks.end()) {
-      std::for_each(chunks.begin(), iter, [](cached_chunk* c) { c->state.release_read(); });
-      break;
-    }
-
-    auto const end_offset = offset + size;
-    auto const chunk_size = _chunk_size;
-
-    for (auto* chunk : chunks) {
-      auto const chunk_begin = std::max(offset, chunk->offset);
-      auto const chunk_end   = std::min(end_offset, chunk->offset + chunk_size);
-      auto const copy_size   = chunk_end - chunk_begin;
-      auto const src_offset  = chunk_begin - chunk->offset;
-      auto const dst_offset  = chunk_begin - offset;
-
-      std::memcpy(dst + dst_offset, chunk->data + src_offset, copy_size);
-      chunk->state.release_read();
-    }
-    _counters.hits.fetch_add(chunks.size(), std::memory_order_relaxed);
-    return true;
-  }
-  return false;
+  std::shared_lock lk(_map_mtx);
+  auto const it = _file_cache.find(obj.raw_file_cache_id());
+  if (it == _file_cache.end()) { return {}; }
+  auto* file = it->second.get();
+  lk.unlock();
+  return file->fetch_chunks(offset, size, policy);
 }
 
-exec::semi_future<std::size_t> prefetching_cache::host_read_async(const sirius_io_object& obj,
-                                                                  size_t offset,
-                                                                  size_t size,
-                                                                  uint8_t* dst,
-                                                                  prefetching_handle* out_handle)
+exec::semi_future<std::size_t> prefetching_cache::host_read_async(
+  const io_object& obj, size_t offset, size_t size, uint8_t* dst, prefetching_handle* out_handle)
 {
-  bool status = host_read_from_cache_only(obj, offset, size, dst, out_handle);
-  if (status) { return exec::make_semi_future<std::size_t>(size); }
-  size_t n_chunks = (size + _chunk_size - 1) / _chunk_size;
-  _counters.misses.fetch_add(n_chunks, std::memory_order_relaxed);
-  return _io_ctx->host_read_async_io(obj, offset, size, dst);
+  if (size == 0) { return exec::make_semi_future<std::size_t>(0); }
+  if (dst == nullptr) {
+    return exec::make_semi_future<std::size_t>(
+      std::make_exception_ptr(std::invalid_argument("host read destination is null")));
+  }
+  if (offset >= obj.size()) { return exec::make_semi_future<std::size_t>(0); }
+  size = std::min(size, obj.size() - offset);
+  slice request{offset, size, dst};
+  return host_read_ranges_async(obj, std::span<slice const>{&request, 1}, out_handle);
 }
 
-std::size_t prefetching_cache::host_read(const sirius_io_object& obj,
-                                         size_t offset,
-                                         size_t size,
-                                         uint8_t* dst,
-                                         prefetching_handle* out_handle)
+std::size_t prefetching_cache::host_read(
+  const io_object& obj, size_t offset, size_t size, uint8_t* dst, prefetching_handle* out_handle)
 {
-  bool status = host_read_from_cache_only(obj, offset, size, dst, out_handle);
-  if (status) { return size; }
-  size_t n_chunks = (size + _chunk_size - 1) / _chunk_size;
-  _counters.misses.fetch_add(n_chunks, std::memory_order_relaxed);
-  return _io_ctx->host_read_io(obj, offset, size, dst);
+  auto future = host_read_async(obj, offset, size, dst, out_handle);
+  return std::move(future).get();
 }
 
-exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius_io_object& obj,
+exec::semi_future<std::size_t> prefetching_cache::host_read_ranges_async(
+  const io_object& obj, std::span<const slice> requests, prefetching_handle* out_handle)
+{
+  if (requests.empty()) { return exec::make_semi_future<std::size_t>(0); }
+
+  struct hit_copy {
+    cached_chunk* chunk;
+    range requested;
+    std::uint8_t* dst;
+  };
+
+  std::vector<cached_chunk*> claimed;
+  std::vector<hit_copy> hits;
+  try {
+    std::vector<prepared_io_slice> prepared;
+    std::size_t logical_bytes = 0;
+    std::size_t n_hits        = 0;
+    std::size_t n_loads       = 0;
+    std::size_t n_misses      = 0;
+    auto admission            = acquire_inflight_io();
+    if (!admission) { throw std::runtime_error("prefetching_cache is shutting down"); }
+    auto lifetime = std::make_shared<exec::completion_controller::slot>(std::move(admission));
+
+    for (auto const& raw : requests) {
+      if (raw.size() == 0) { continue; }
+      if (raw.dst == nullptr) { throw std::invalid_argument("host readv destination is null"); }
+      if (raw.offset() >= obj.size()) { continue; }
+      auto const request_size = std::min(raw.size(), obj.size() - raw.offset());
+      if (request_size > std::numeric_limits<std::size_t>::max() - logical_bytes) {
+        throw std::overflow_error("host cache read byte count overflow");
+      }
+      logical_bytes += request_size;
+
+      range const request_rng{raw.offset(), request_size};
+      auto chunks = ranges_in_cache(
+        obj, request_rng.offset, request_rng.size, coverage_policy::partial, out_handle);
+      std::size_t ci       = 0;
+      auto const first     = (request_rng.offset / _chunk_size) * _chunk_size;
+      auto const last      = ((request_rng.end() - 1) / _chunk_size) * _chunk_size;
+      auto const positions = ((last - first) / _chunk_size) + 1;
+
+      for (std::size_t position = 0; position < positions; ++position) {
+        auto const off = first + position * _chunk_size;
+        while (ci < chunks.size() && chunks[ci]->offset < off) {
+          ++ci;
+        }
+        cached_chunk* chunk =
+          ci < chunks.size() && chunks[ci]->offset == off ? chunks[ci] : nullptr;
+        range const needed = intersect(request_rng, range{off, _chunk_size});
+        auto* piece_dst    = raw.dst + (needed.offset - request_rng.offset);
+
+        if (chunk != nullptr &&
+            chunk->state.try_pin_covering(off, _chunk_size, needed.offset, needed.end())) {
+          hits.push_back(hit_copy{chunk, needed, piece_dst});
+          ++n_hits;
+          continue;
+        }
+
+        chunk_fill fill;
+        if (chunk != nullptr && _io_ctx->supports_vector_host_read() &&
+            chunk->state.take_loading_merging(
+              needed_fill(off, _chunk_size, needed.offset, needed.end()), fill)) {
+          claimed.push_back(chunk);
+          auto completion = std::make_shared<prepared_io_completion>(
+            [this, needed, piece_dst, lifetime](std::span<cached_chunk* const> completed,
+                                                bool host_ok) noexcept {
+              std::ignore = lifetime;
+              if (!host_ok) {
+                for (auto* current : completed) {
+                  std::ignore = current->state.mark_load_failed();
+                }
+                return;
+              }
+              for (auto* current : completed) {
+                auto const copy_rng = intersect(needed, range{current->offset, _chunk_size});
+                if (!copy_rng.empty()) {
+                  std::memcpy(piece_dst + (copy_rng.offset - needed.offset),
+                              current->data + (copy_rng.offset - current->offset),
+                              copy_rng.size);
+                }
+              }
+              for (auto* current : completed) {
+                std::ignore = current->state.mark_cached();
+              }
+            });
+          prepared_io_slice io_slice{needed, host_buffer{std::vector<cached_chunk*>{chunk}}};
+          io_slice.on_complete = std::move(completion);
+          prepared.push_back(std::move(io_slice));
+          ++n_loads;
+          continue;
+        }
+
+        prepared.emplace_back(needed, host_buffer{piece_dst});
+        ++n_misses;
+      }
+    }
+
+    bool const has_backend = !prepared.empty();
+    exec::semi_future<std::size_t> result_future;
+    if (has_backend) {
+      auto coordinator = std::make_shared<grouped_coordinator>(logical_bytes, 1);
+      result_future    = coordinator->get_future();
+      size_terminal terminal{[coordinator](exec::try_t<std::size_t>&& result) mutable noexcept {
+        if (result.has_exception()) {
+          coordinator->report_error(std::move(result).exception());
+        } else {
+          coordinator->on_complete();
+        }
+      }};
+
+      auto io_future = _io_ctx->host_device_readv_async_io(obj, std::move(prepared));
+      claimed.clear();
+      std::move(io_future).install_callback(std::move(terminal));
+    } else {
+      claimed.clear();
+    }
+
+    // Dispatch first, then satisfy resident pieces while the backend is already
+    // filling the misses. A read pin keeps each source stable for the memcpy.
+    for (auto const& copy : hits) {
+      std::memcpy(copy.dst,
+                  copy.chunk->data + (copy.requested.offset - copy.chunk->offset),
+                  copy.requested.size);
+      copy.chunk->state.release_read();
+    }
+    hits.clear();
+
+    _counters.hits.fetch_add(n_hits, std::memory_order_relaxed);
+    _counters.h2d.fetch_add(n_loads, std::memory_order_relaxed);
+    _counters.misses.fetch_add(n_misses, std::memory_order_relaxed);
+
+    if (has_backend) { return std::move(result_future); }
+    return exec::make_semi_future<std::size_t>(logical_bytes);
+  } catch (...) {
+    for (auto const& copy : hits) {
+      copy.chunk->state.release_read();
+    }
+    for (auto* chunk : claimed) {
+      std::ignore = chunk->state.mark_load_failed();
+    }
+    return exec::make_semi_future<std::size_t>(std::current_exception());
+  }
+}
+
+exec::semi_future<std::size_t> prefetching_cache::device_read_async(const io_object& obj,
                                                                     size_t offset,
                                                                     size_t size,
                                                                     uint8_t* dst,
                                                                     rmm::cuda_stream_view stream,
                                                                     prefetching_handle* out_handle)
 {
-  if (size == 0 || dst == nullptr) { return std::size_t{0}; }
-
-  _counters.n_reads.fetch_add(1, std::memory_order_relaxed);
-
-  coverage_policy policy =
-    _io_ctx->supports_host_to_device_read() ? coverage_policy::partial : coverage_policy::full;
-
-  size_t n_chunks = (size + _chunk_size - 1) / _chunk_size;
-  std::vector<cached_chunk*> chunks;
-  chunks.reserve(n_chunks);
-  if (out_handle && *out_handle) {
-    if (auto ctx = out_handle->get_context()) {
-      chunks = find_entry(ctx->chunks, offset, size, policy, _chunk_size);
-    }
+  CTRACK_NAME("cache::device_read_async");
+  if (size == 0) { return exec::make_semi_future<std::size_t>(0); }
+  if (dst == nullptr) {
+    return exec::make_semi_future<std::size_t>(
+      std::make_exception_ptr(std::invalid_argument("device read destination is null")));
   }
-  if (chunks.empty()) {
-    std::shared_lock lk(_map_mtx);
-    auto it = _file_cache.find(obj.raw_file_cache_id());
-    if (it != _file_cache.end()) {
-      lk.unlock();
-      chunks = it->second->fetch_chunks(offset, size, policy, _chunk_size);
-    }
-  }
+  if (offset >= obj.size()) { return exec::make_semi_future<std::size_t>(0); }
+  size = std::min(size, obj.size() - offset);
+  slice request{offset, size, dst};
+  return device_read_ranges_async(obj, std::span<slice const>{&request, 1}, stream, out_handle);
+}
 
-  while (!chunks.empty()) {
-    size_t const chunk_bytes     = _chunk_size;
-    size_t const first_chunk_off = (offset / chunk_bytes) * chunk_bytes;
-    size_t const last_chunk_off  = ((offset + size - 1) / chunk_bytes) * chunk_bytes;
+exec::semi_future<std::size_t> prefetching_cache::device_read_ranges_async(
+  const io_object& obj,
+  std::span<const io::slice> requests,
+  rmm::cuda_stream_view stream,
+  prefetching_handle* out_handle)
+{
+  if (requests.empty()) { return exec::make_semi_future<std::size_t>(0); }
 
-    // Classify every chunk-aligned position covering the request into one of:
-    //   (1) already populated         -> acquire a read pin and copy it to the
-    //       device now;
-    //   (2) allocated but not loaded  -> take it `loading` and read
-    //       file -> its own bounce buffer -> device, publishing it to the cache
-    //       on success;
-    //   (3) missing or busy           -> a gap (no chunk), or a chunk we could
-    //       neither read-pin nor take for loading: read file -> an internal
-    //       bounce slot -> device with a null host buffer, leaving the cache
-    //       untouched.
-    // Cases (2) and (3) are issued together through host_to_device_read_async_io.
-    std::vector<cached_chunk*> cached_chunks;        // case 1
-    std::vector<cached_chunk*> io_chunks;            // case 2
-    std::vector<io::io_object_segment> io_segments;  // cases 2 + 3, in file order
+  bool const cache_while_reading = _io_ctx->supports_host_to_device_read();
+  auto const device_id           = rmm::get_current_cuda_device();
 
-    bool cache_while_reading_enabled = _io_ctx->supports_host_to_device_read();
-    bool every_chunk_is_cached       = true;
-    std::size_t hits                 = 0;
-    std::size_t h2d                  = 0;
-    std::size_t misses               = 0;
-    size_t ci                        = 0;  // cursor into `chunks` (sorted by offset)
-    for (size_t off = first_chunk_off; off <= last_chunk_off; off += chunk_bytes) {
-      while (ci < chunks.size() && chunks[ci]->offset < off) {
-        ++ci;
+  std::vector<cached_chunk*> pinned;
+  std::vector<cached_chunk*> claimed;
+  sirius::cuda::device_copy_batch cached_copies;
+  std::vector<prepared_io_slice> prepared;
+  std::size_t logical_bytes = 0;
+  std::size_t reads         = 0;
+  std::size_t hits          = 0;
+  std::size_t loads         = 0;
+  std::size_t misses        = 0;
+
+  std::shared_ptr<exec::completion_controller::slot> lifetime;
+  std::shared_ptr<prepared_io_completion> completion;
+  std::shared_ptr<cached_copy_retirement> retirement;
+  std::shared_ptr<grouped_coordinator> coordinator;
+  exec::semi_future<std::size_t> result_future;
+  size_terminal backend_terminal;
+  bool has_backend{false};
+  bool has_cached{false};
+
+  try {
+    auto admission = acquire_inflight_io();
+    if (!admission) { throw std::runtime_error("prefetching_cache is shutting down"); }
+    lifetime   = std::make_shared<exec::completion_controller::slot>(std::move(admission));
+    completion = std::make_shared<prepared_io_completion>(
+      [lifetime](std::span<cached_chunk* const> completed, bool host_ok) noexcept {
+        std::ignore = lifetime;
+        for (auto* chunk : completed) {
+          std::ignore = host_ok ? chunk->state.mark_cached() : chunk->state.mark_load_failed();
+        }
+      });
+    for (auto const& raw : requests) {
+      if (raw.size() == 0) { continue; }
+      if (raw.dst == nullptr) { throw std::invalid_argument("device readv destination is null"); }
+      if (raw.offset() >= obj.size()) { continue; }
+      auto const request_size = std::min(raw.size(), obj.size() - raw.offset());
+      if (request_size > std::numeric_limits<std::size_t>::max() - logical_bytes) {
+        throw std::overflow_error("device cache read byte count overflow");
       }
-      cached_chunk* c = (ci < chunks.size() && chunks[ci]->offset == off) ? chunks[ci] : nullptr;
+      logical_bytes += request_size;
+      ++reads;
 
-      if (c != nullptr && c->state.acquire_read()) {
-        cached_chunks.push_back(c);  // (1) hit -- a cached chunk is always fully valid
-        hits++;
-      } else {
-        if (!cache_while_reading_enabled) {
-          every_chunk_is_cached = false;
-          break;  // (3) miss, but we can't do H2D IO, so fall back to direct device read
+      range const request_rng{raw.offset(), request_size};
+      auto chunks = ranges_in_cache(
+        obj, request_rng.offset, request_rng.size, coverage_policy::partial, out_handle);
+      std::size_t ci       = 0;
+      auto const first     = (request_rng.offset / _chunk_size) * _chunk_size;
+      auto const last      = ((request_rng.end() - 1) / _chunk_size) * _chunk_size;
+      auto const positions = ((last - first) / _chunk_size) + 1;
+
+      for (std::size_t position = 0; position < positions; ++position) {
+        auto const off = first + position * _chunk_size;
+        while (ci < chunks.size() && chunks[ci]->offset < off) {
+          ++ci;
         }
-        // Stage a read through the chunk's cache buffer only when caching the
-        // WHOLE chunk is cheap enough -- a cached chunk must be fully valid, so
-        // caching a partially-requested chunk costs reading its non-overlapping
-        // remainder from disk (boundary over-read, the dominant cold-pass cost).
-        // Cache when that over-read is < 25% of the chunk (so a read covering
-        // >75% of the chunk still warms it); otherwise read just the needed,
-        // block-aligned span through an internal bounce slot (null host buffer)
-        // and leave the chunk uncached -- zero over-read.  (Short-term: a heavily
-        // partial boundary chunk is re-read each pass; full partial caching is a
-        // larger redesign.)
-        size_t const need_lo     = std::max(off, offset);
-        size_t const need_hi     = std::min(off + chunk_bytes, offset + size);
-        size_t const overread    = chunk_bytes - (need_hi - need_lo);
-        bool const worth_caching = overread * 4 < chunk_bytes;  // over-read < 25% of chunk
-        if (worth_caching && c != nullptr && c->state.mark_loading()) {
-          assert(c->data != nullptr);
-          io_chunks.push_back(c);  // (2) host-to-device load into the cache buffer
-          io_segments.emplace_back(off, chunk_bytes, c->data);
-          h2d++;
-        } else {
-          // (3) partial head/tail (or busy / missing chunk): read just the needed,
-          // block-aligned span via an internal bounce slot; do not touch the cache.
-          size_t const seg_lo = need_lo & ~(io::IO_BLOCK_SIZE - 1);
-          size_t const seg_hi = std::min(
-            off + chunk_bytes, (need_hi + io::IO_BLOCK_SIZE - 1) & ~(io::IO_BLOCK_SIZE - 1));
-          io_segments.emplace_back(seg_lo, seg_hi - seg_lo, nullptr);  // (3) miss
-          misses++;
+        cached_chunk* chunk =
+          ci < chunks.size() && chunks[ci]->offset == off ? chunks[ci] : nullptr;
+        range const needed = intersect(request_rng, range{off, _chunk_size});
+        auto* device_dst   = raw.dst + (needed.offset - request_rng.offset);
+
+        prefetch_census::instance().bytes_logical.fetch_add(needed.size, std::memory_order_relaxed);
+        if (chunk != nullptr &&
+            chunk->state.try_pin_covering(off, _chunk_size, needed.offset, needed.end())) {
+          pinned.push_back(chunk);
+          cached_copies.add(device_dst, chunk->data + (needed.offset - chunk->offset), needed.size);
+          prefetch_census::instance().bytes_hit.fetch_add(needed.size, std::memory_order_relaxed);
+          ++hits;
+          continue;
         }
+
+        chunk_fill fill;
+        if (cache_while_reading && chunk != nullptr &&
+            chunk->state.take_loading_merging(
+              needed_fill(off, _chunk_size, needed.offset, needed.end()), fill)) {
+          claimed.push_back(chunk);
+          prepared_io_slice io_slice{needed,
+                                     host_buffer{std::vector<cached_chunk*>{chunk}},
+                                     device_buffer{device_dst, stream, device_id.value()}};
+          io_slice.on_complete = completion;
+          prepared.push_back(std::move(io_slice));
+          prefetch_census::instance().bytes_h2d.fetch_add(needed.size, std::memory_order_relaxed);
+          ++loads;
+          continue;
+        }
+
+        prepared.emplace_back(needed, device_buffer{device_dst, stream, device_id.value()});
+        prefetch_census::instance().bytes_miss.fetch_add(needed.size, std::memory_order_relaxed);
+        ++misses;
       }
     }
 
-    // Without host-to-device IO we can only serve positions already in the cache.
-    // If anything needs loading/bouncing, undo our marks and let the caller fall
-    // back to a direct device read.
-    if (!cache_while_reading_enabled && !every_chunk_is_cached) {
-      std::ranges::for_each(cached_chunks, [](cached_chunk* c) { c->state.release_read(); });
-      break;
-    }
+    has_backend = !prepared.empty();
+    has_cached  = !pinned.empty();
+    auto const task_count =
+      static_cast<std::size_t>(has_backend) + static_cast<std::size_t>(has_cached);
+    if (task_count != 0) {
+      coordinator   = std::make_shared<grouped_coordinator>(logical_bytes, task_count);
+      result_future = coordinator->get_future();
+      if (has_backend) {
+        backend_terminal =
+          size_terminal{[coordinator](exec::try_t<std::size_t>&& result) mutable noexcept {
+            if (result.has_exception()) {
+              coordinator->report_error(std::move(result).exception());
+            } else {
+              coordinator->on_complete();
+            }
+          }};
+      }
 
-    _counters.hits.fetch_add(hits, std::memory_order_relaxed);
-    _counters.h2d.fetch_add(h2d, std::memory_order_relaxed);
-    _counters.misses.fetch_add(misses, std::memory_order_relaxed);
+      if (has_cached) {
+        retirement              = std::make_shared<cached_copy_retirement>();
+        retirement->pins        = std::move(pinned);
+        retirement->lifetime    = lifetime;
+        retirement->coordinator = coordinator;
+        retirement->async_error = std::make_exception_ptr(
+          std::runtime_error("prefetching_cache: asynchronous cached host-to-device copy failed"));
+        retirement->stream    = stream.value();
+        retirement->device_id = device_id.value();
 
-    // (1) copy the already-cached chunks straight to the device on `stream`.
-    for (cached_chunk* c : cached_chunks) {
-      size_t const copy_start = std::max(c->offset, offset);
-      size_t const copy_end   = std::min(c->offset + chunk_bytes, offset + size);
-      cudaMemcpyAsync(dst + (copy_start - offset),
-                      c->data + (copy_start - c->offset),
-                      copy_end - copy_start,
-                      cudaMemcpyHostToDevice,
-                      stream);
-    }
-
-    auto device_id = rmm::get_current_cuda_device();
-
-    // (2)+(3): file -> (own bounce | internal bounce) -> device through the IO
-    // context.  The future resolves once the H2D copies are *enqueued*; we then
-    // synchronize the stream (covering both these copies and the case-(1) copies
-    // above) before mutating chunk state, since releasing a read pin or publishing
-    // loading -> cached makes a chunk evictable.  Run the continuation on the IO
-    // callback pool, not inline on the reactor thread, because it blocks on
-    // stream.synchronize().  When there are no IO segments (cache-only path) we
-    // synthesize a ready future so both paths share one continuation; stream.synchronize()
-    // is equivalent to the previous event.synchronize() since only case-(1) copies are
-    // on the stream at that point.
-    auto io_fut = io_segments.empty() ? exec::make_semi_future<size_t>(size)
-                                      : _io_ctx->host_to_device_read_async_io(
-                                          obj, io_segments, offset, size, dst, stream);
-    return std::move(io_fut)
-      .via(exec::inline_executor::instance())
-      .then_try([this,
-                 stream,
-                 device_id,
-                 size,
-                 read_pinned = std::move(cached_chunks),
-                 loading     = std::move(io_chunks)](exec::try_t<size_t>&& res) -> size_t {
-        bool ok = !res.has_exception();
-
-        rmm::cuda_set_device_raii guard(device_id);
-        std::unique_ptr<cucascade::cuda::cuda_event> event;
-        if (ok) {
-          event = std::make_unique<cucascade::cuda::cuda_event>();
-          event->record(stream);
+        auto const create_error =
+          cudaEventCreateWithFlags(&retirement->event, cudaEventDisableTiming);
+        if (create_error != cudaSuccess) {
+          throw std::runtime_error(std::string("prefetching_cache: CUDA event creation failed: ") +
+                                   cudaGetErrorString(create_error));
         }
-
-        _io_cb_dispatcher.enqueue([read_pinned = std::move(read_pinned),
-                                   loading     = std::move(loading),
-                                   event       = std::move(event),
-                                   ok          = ok]() mutable {
-          if (event) {
-            SIRIUS_TRY_AND_LOG_EXCEPTION(
-              event->synchronize(),
-              "prefetching_cache: failed to synchronize CUDA stream after host-to-device copies");
-          }
-
-          std::ranges::for_each(read_pinned, [](cached_chunk* c) { c->state.release_read(); });
-          auto transition = ok ? &entry_state::mark_cached : &entry_state::mark_load_failed;
-          std::ranges::for_each(loading,
-                                [transition](cached_chunk* c) { (c->state.*transition)(); });
-        });
-
-        if (res.has_exception()) { std::rethrow_exception(std::move(res).exception()); }
-        return size;
-      })
-      .semi();
+        exec::invocable<void()> completion_task{
+          [retirement]() noexcept { retirement->wait_and_finish(); }};
+        _io_cb_thread_pool.schedule(std::move(completion_task));
+      }
+    }
+  } catch (...) {
+    for (auto* chunk : pinned) {
+      chunk->state.release_read();
+    }
+    for (auto* chunk : claimed) {
+      std::ignore = chunk->state.mark_load_failed();
+    }
+    return exec::make_semi_future<std::size_t>(std::current_exception());
   }
-  _counters.misses.fetch_add(n_chunks, std::memory_order_relaxed);
-  return _io_ctx->device_read_async_io(obj, offset, size, dst, stream);
+
+  _counters.n_reads.fetch_add(reads, std::memory_order_relaxed);
+  _counters.hits.fetch_add(hits, std::memory_order_relaxed);
+  _counters.h2d.fetch_add(loads, std::memory_order_relaxed);
+  _counters.misses.fetch_add(misses, std::memory_order_relaxed);
+
+  if (has_backend) {
+    auto io_future = _io_ctx->host_device_readv_async_io(obj, std::move(prepared));
+    // From this point the prepared-slice callbacks own every loading transition.
+    claimed.clear();
+    std::move(io_future).install_callback(std::move(backend_terminal));
+  } else {
+    claimed.clear();
+  }
+
+  if (has_cached) { retire_pins_after_stream(stream, cached_copies, std::move(retirement)); }
+
+  if (has_backend || has_cached) { return std::move(result_future); }
+  return exec::make_semi_future<std::size_t>(logical_bytes);
+}
+
+void prefetching_cache::retire_pins_after_stream(
+  rmm::cuda_stream_view stream,
+  sirius::cuda::device_copy_batch const& copies,
+  std::shared_ptr<cached_copy_retirement> retirement) noexcept
+{
+  CTRACK_NAME("cache::retire_pins_after_stream");
+  cudaError_t enqueue_status = cudaErrorUnknown;
+  try {
+    enqueue_status = copies.enqueue(stream);
+  } catch (...) {
+    enqueue_status = cudaErrorUnknown;
+  }
+  retirement->enqueue_ok     = enqueue_status == cudaSuccess;
+  auto const record_status   = cudaEventRecord(retirement->event, stream.value());
+  retirement->event_recorded = record_status == cudaSuccess;
+  retirement->published.count_down();
 }
 
 std::string prefetching_cache::summary() const
@@ -652,7 +920,7 @@ std::string prefetching_cache::summary() const
     evict - _last_reported.evictions);
 }
 
-void prefetching_cache::prepare_for_query(const sirius::planner::query& query) noexcept
+void prefetching_cache::prepare_for_query() noexcept
 {
   SIRIUS_LOG_TRACE("prefetching_cache: summary of cache performance {}", summary());
 
@@ -670,228 +938,269 @@ void prefetching_cache::prepare_for_query(const sirius::planner::query& query) n
 
 // ===========================================================================
 
-void prefetching_cache::prepare_loop(const std::stop_token& st)
+std::size_t prefetching_cache::claimed_bytes() const noexcept
 {
-  std::stop_callback cb(st, [this]() {
-    SIRIUS_LOG_TRACE("prefetching_cache: prepare_loop received stop request, unblocking queue");
-    _preparation_queue.enqueue(nullptr);  // unblock the worker if it's waiting on an empty queueue
-  });
+  return _pool ? _pool->total_allocated_bytes() : 0;
+}
 
-  while (!_shutting_down && !st.stop_requested()) {
-    prefetch_request req = nullptr;
-    _preparation_queue.wait_dequeue(req);
-    if (req == nullptr) { continue; }  // spurious wakeup or shutdown
+void prefetching_cache::evict(std::size_t bytes_to_free)
+{
+  // Nothing to free, nothing holding memory, or a cache on its way down -- in
+  // the last case the evictor is already reclaiming everything it can, and a
+  // demand queued behind the stop sentinel would never be looked at.
+  if (bytes_to_free == 0 || !_armed || _shutting_down.load(std::memory_order_relaxed)) { return; }
+  _eviction_queue.enqueue(cache_request{eviction_request{bytes_to_free}});
+}
 
-    if (req->is_cancelled()) { continue; }  // request was cancelled
-
-    std::ignore = req->state->mark_queued();
-
-    auto& chunks = req->chunks;
-
-    // how many buffers we need to allocate from the pool to prepare this request?
-    std::size_t n_chunks_needed = std::ranges::count_if(
-      chunks, [](cached_chunk* c) { return c->state.get_state() == entry_state::empty; });
-
-    // Allocate from the arena on the request's preferred NUMA node, falling
-    // back to any other arena (allocate_bulk wraps around).  numa_allocated is
-    // updated to the arena we actually drew from — the whole batch comes from a
-    // single arena, so all chunks share that NUMA node.
-    int numa_allocated = req->preferred_numa;
-    auto buffers       = _pool->allocate_bulk(n_chunks_needed, numa_allocated);
-    if (buffers.size() != n_chunks_needed) {
-      // No single arena could satisfy the request.  Return whatever we got and
-      // re-enqueue the work for a retry after the evictor frees some.
-      if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
-      _eviction_queue.enqueue(nullptr);  // request the evictor to free some buffers
-      continue;
+void prefetching_cache::drain_and_abandon(request_queue_type& queue) noexcept
+{
+  cache_request entry;
+  while (queue.try_dequeue(entry)) {
+    // Only prefetch requests have anything to abandon: an eviction request owns
+    // no stage machine and no waiter, so dropping it strands nobody.
+    if (auto* req = std::get_if<prefetch_request>(&entry); req != nullptr && *req) {
+      req->producer->mark_abandoned();
     }
-
-    for (auto* c : chunks) {
-      if (buffers.empty()) { break; }
-      if (c->state.mark_queued()) {
-        auto* buffer = buffers.back();
-        buffers.pop_back();
-        c->data      = reinterpret_cast<uint8_t*>(buffer);
-        c->numa_node = numa_allocated;
-        if (!c->state.mark_allocated()) {
-          buffers.push_back(buffer);  // return the buffer to the pool
-          SIRIUS_LOG_ERROR(
-            "prefetching_cache: chunk at offset {} was marked queued but failed to mark "
-            "allocated",
-            c->offset);
-        }
-      }
-    }
-
-    if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
-
-    std::ignore = req->state->mark_allocated();
-
-    if (!_io_ctx->supports_vector_host_read() ||
-        _io_ctx->preferred_prefetching_stage() == prefetching_stage::just_in_time ||
-        _io_ctx->preferred_prefetching_stage() == prefetching_stage::none) {
-      // either the backend doesn't support scatter-gather reads or it prefers not to reuse
-      // buffers for multiple reads.  In either case, we can skip the prefetching step and let the
-      // read() path handle the IO directly into the caller's buffer.
-      continue;
-    }
-
-    if (req->is_active() && !st.stop_requested()) { _prefetch_queue.enqueue(std::move(req)); }
+    entry = {};
   }
 }
 
-void prefetching_cache::prefetch_loop(const std::stop_token& st)
+bool prefetching_cache::prepare(prefetching_handle& handle, bool wait_for_eviction)
 {
-  std::stop_callback cb(st, [this]() {
-    SIRIUS_LOG_TRACE("prefetching_cache: prefetch_loop received stop request, unblocking queue");
-    _prefetch_queue.enqueue(nullptr);  // unblock the worker if it's waiting on an empty queueue
-  });
-  while (!_shutting_down && !st.stop_requested()) {
-    prefetch_request req = nullptr;
-    _prefetch_queue.wait_dequeue(req);
-    if (req == nullptr || req->is_cancelled()) { continue; }
+  if (!handle) { return false; }
+  return prepare_request(handle._req, wait_for_eviction);
+}
 
-    auto& allocated_chunks = req->chunks;
-    auto& io_obj           = req->obj;
-    std::vector<io::io_object_segment> segments;
+bool prefetching_cache::prefetch(prefetching_handle& handle,
+                                 exec::invocable<void(bool) noexcept> on_done)
+{
+  CTRACK_NAME("cache::prefetch");
+  auto& req   = handle._req;
+  auto settle = [&on_done](bool ok) {
+    on_done(ok);
+    return false;
+  };
 
-    segments.reserve(allocated_chunks.size());
-    allocated_chunks.erase(std::remove_if(allocated_chunks.begin(),
-                                          allocated_chunks.end(),
-                                          [&](cached_chunk* c) {
-                                            if (c->state.mark_loading()) {
-                                              segments.emplace_back(
-                                                c->offset, _chunk_size, c->data);
-                                              return false;
-                                            }
-                                            return true;
-                                          }),
-                           allocated_chunks.end());
+  if (!req || req.has_fallen_behind() || !req.chunks) { return settle(false); }
+  if (!_io_ctx->supports_vector_host_read()) { return settle(false); }
+  // Read the stage before mark_loading advances it: a request that has not
+  // reached `prepared` has no buffers attached yet, so the claim loop below
+  // will find every chunk in empty/queued and read nothing.
+  bool const was_prepared = req.producer->get() >= producer_stage::prepared;
+  if (!req.producer->mark_loading()) { return settle(false); }
 
-    std::ignore = req->state->mark_loading();
-
-    auto token = _rate_limiter.acquire(segments.size());
-
-    if (req->is_cancelled() || st.stop_requested()) {
-      std::ranges::for_each(allocated_chunks,
-                            [](cached_chunk* c) { std::ignore = c->state.mark_load_failed(); });
-      std::ignore = req->state->mark_load_failed();
-      continue;
+  std::vector<prepared_io_slice> prepared;
+  std::vector<cached_chunk*> claimed_chunks;
+  std::shared_ptr<exec::invocable<void(bool) noexcept>> done_owner;
+  size_terminal terminal;
+  auto fail_setup = [&](bool inflight_counted) noexcept {
+    for (auto* chunk : claimed_chunks) {
+      std::ignore = chunk->state.mark_load_failed();
     }
+    std::ignore = req.producer->mark_load_failed();
+    if (inflight_counted) {
+      prefetch_census::instance().inflight_prefetches.fetch_sub(1, std::memory_order_relaxed);
+    }
+    if (done_owner != nullptr) {
+      (*done_owner)(false);
+    } else {
+      on_done(false);
+    }
+    return false;
+  };
 
-    _io_ctx->host_read_ranges_async_io(*io_obj, segments)
-      .via(&_io_cb_dispatcher)
-      .then_try([req, chunks = std::move(allocated_chunks), _ = std::move(token)](
-                  exec::try_t<size_t>&& res) mutable {
-        auto transition =
-          res.has_value() ? &entry_state::mark_cached : &entry_state::mark_load_failed;
-        std::ignore = (*req->state.*transition)();
-        std::ranges::for_each(
-          chunks, [transition](cached_chunk* c) { std::ignore = (c->state.*transition)(); });
-      });
+  try {
+    prepared.reserve(req.chunks->size());
+    claimed_chunks.reserve(req.chunks->size());
+    for (cached_chunk* c : *req.chunks) {
+      // Claim the chunk and preserve the promised fill as this prefetch's logical
+      // range. The reactor owns any further physical chunking and alignment.
+      chunk_fill fill;
+      if (c->state.take_loading(fill)) {
+        auto const [seg_lo, seg_hi] = fill_span(fill, c->offset, _chunk_size);
+        prefetch_census::instance().bytes_prefetch.fetch_add(seg_hi - seg_lo,
+                                                             std::memory_order_relaxed);
+        claimed_chunks.push_back(c);
+        prepared.emplace_back(range{seg_lo, seg_hi - seg_lo},
+                              host_buffer{std::vector<cached_chunk*>{c}});
+      }
+    }
+  } catch (...) {
+    return fail_setup(false);
   }
+  if (prepared.empty()) {
+    // Nothing was claimable.  Either the request genuinely had no IO left to do
+    // (already cached / host-backed), or it was issued before anything prepared
+    // it and no chunk had a buffer yet — in which case this `ready` is a lie the
+    // reader will pay for, so the two are counted apart.
+    auto& census = prefetch_census::instance();
+    (was_prepared ? census.skipped_no_ranges : census.prefetch_unprepared)
+      .fetch_add(1, std::memory_order_relaxed);
+    std::ignore = req.producer->mark_ready();
+    return settle(true);
+  }
+  prefetch_census::instance().prefetch_issued.fetch_add(1, std::memory_order_relaxed);
+
+  if (req.is_cancelled()) { return fail_setup(false); }
+
+  bool inflight_counted = false;
+  try {
+    prefetch_census::instance().inflight_prefetches.fetch_add(1, std::memory_order_relaxed);
+    inflight_counted = true;
+    auto admission   = acquire_inflight_io();
+    if (!admission) { throw std::runtime_error("prefetching_cache is shutting down"); }
+    auto lifetime   = std::make_shared<exec::completion_controller::slot>(std::move(admission));
+    auto completion = std::make_shared<prepared_io_completion>(
+      [lifetime](std::span<cached_chunk* const> completed, bool host_ok) noexcept {
+        std::ignore = lifetime;
+        for (auto* chunk : completed) {
+          std::ignore = host_ok ? chunk->state.mark_cached() : chunk->state.mark_load_failed();
+        }
+      });
+    done_owner = std::make_shared<exec::invocable<void(bool) noexcept>>(std::move(on_done));
+    terminal   = size_terminal{[req, done_owner](exec::try_t<size_t>&& res) mutable noexcept {
+      auto const ok = res.has_value();
+      std::ignore   = ok ? req.producer->mark_ready() : req.producer->mark_load_failed();
+      prefetch_census::instance().inflight_prefetches.fetch_sub(1, std::memory_order_relaxed);
+      (*done_owner)(ok);
+    }};
+    for (auto& slice : prepared) {
+      slice.on_complete = completion;
+    }
+  } catch (...) {
+    return fail_setup(inflight_counted);
+  }
+
+  auto io_future = _io_ctx->host_device_readv_async_io(*req.obj, std::move(prepared));
+  std::move(io_future).install_callback(std::move(terminal));
+  return true;
 }
 
 void prefetching_cache::evict_loop(const std::stop_token& st)
 {
   std::stop_callback cb(st, [this]() {
     SIRIUS_LOG_TRACE("prefetching_cache: evict_loop received stop request, unblocking queue");
-    _eviction_queue.enqueue(nullptr);  // unblock the worker if it's waiting on an empty queueue
+    // unblock the worker if it's waiting on an empty queueue
+    _eviction_queue.enqueue(cache_request{});
   });
 
-  // One queued prefetch request plus how many of its chunks have been reclaimed
-  // so far.  The request is dropped once n_evicted reaches its chunk count.
-  struct eviction_request {
+  // One queued prefetch request plus whether its per-chunk subscriber
+  // references have been handed back yet.
+  struct tracked_request {
     prefetch_request req;
-    size_t n_evicted{0};
+    bool released{false};
   };
 
-  std::vector<eviction_request> eviction_batch;
+  std::vector<tracked_request> eviction_batch;
   // Reclaimed buffers grouped by their origin NUMA node so each group can be
   // returned to the arena it came from.
   std::unordered_map<int, std::vector<std::byte*>> reclaim_by_numa;
   while (!_shutting_down && !st.stop_requested()) {
-    prefetch_request req    = nullptr;
-    bool eviction_requested = false;
-    _eviction_queue.wait_dequeue(req);
-    if (req == nullptr) {
-      if (!_shutting_down && !st.stop_requested()) {  // spurious wakeup
-        eviction_requested = true;
-      }
-      continue;
-    }
+    cache_request entry;
+    _eviction_queue.wait_dequeue(entry);
+
+    // Bytes explicitly demanded this round, summed across every eviction
+    // request absorbed below.  Summed rather than maxed: two callers each short
+    // by their own amount are short by the total, and serving only the larger
+    // leaves the other one still waiting.
+    std::size_t requested_bytes = 0;
+    bool eviction_requested     = false;
+    auto absorb                 = [&](cache_request&& e) {
+      std::visit(
+        [&](auto&& r) {
+          using T = std::decay_t<decltype(r)>;
+          if constexpr (std::is_same_v<T, prefetch_request>) {
+            // A falsy request is the wakeup sentinel and names no chunks, so
+            // there is nothing to track -- it has already done its job by
+            // getting the loop past wait_dequeue.
+            if (r) { eviction_batch.push_back({std::move(r), false}); }
+          } else {
+            // An explicit demand has to survive into the eviction decision
+            // below rather than be skipped past, or the back-pressure signal
+            // does nothing and the pool never recovers.
+            eviction_requested = true;
+            requested_bytes += r.bytes_to_free;
+          }
+        },
+        std::move(e));
+    };
 
     // Accumulate newly-queued requests into the persistent batch.  The batch is
-    // NOT cleared each round: a request is dropped only once all of its chunks
-    // have been evicted.  Chunks that are busy this round — or skipped once the
-    // free target is met — therefore stay candidates for a later round instead
-    // of being lost forever.
-    eviction_batch.push_back({std::move(req), 0});
-    while (_eviction_queue.try_dequeue(req)) {
-      if (req != nullptr) { eviction_batch.push_back({std::move(req), 0}); }
+    // NOT cleared each round: a request is retired only once every chunk it
+    // named has been reclaimed or taken over, so chunks that are busy this
+    // round stay candidates for a later one instead of being lost.
+    absorb(std::move(entry));
+    while (_eviction_queue.try_dequeue(entry)) {
+      absorb(std::move(entry));
     }
 
-    // When disposing after use we reclaim everything; otherwise we only evict
+    if (_shutting_down || st.stop_requested()) { break; }
+
+    // Hand back the subscriber reference of every request whose consumer is
+    // gone — exactly once, which is what makes the count an accurate reference
+    // count rather than a heuristic.  Pairing the decrement with the request's
+    // retirement (and not with reads) is what lets a chunk be shared: a chunk
+    // stops being protected only when its LAST subscriber goes away.
+    for (auto& er : eviction_batch) {
+      if (er.released || !er.req || !er.req.chunks || !er.req.is_cancelled()) { continue; }
+      for (cached_chunk* c : *er.req.chunks) {
+        c->state.drop_subscriber();
+      }
+      er.released = true;
+    }
+
+    // When disposing on idle we reclaim everything; otherwise we only evict
     // under memory pressure and stop once enough chunks are free again.  Memory
     // pressure is scored as outstanding (handed-out) chunks against the pool's
     // aggregate reserved capacity.
     bool const should_evict =
-      _cfg.dispose_after_use || eviction_requested || _pool->should_start_evicting();
+      _cfg.dispose_on_idle || eviction_requested || _pool->should_start_evicting();
     if (!should_evict) { continue; }
 
-    size_t const need = _cfg.dispose_after_use ? std::numeric_limits<size_t>::max()
-                                               : _pool->total_allocated_chunks() * 0.25;
-
-    auto const query_tick = static_cast<uint32_t>(_ticker.load(std::memory_order_relaxed));
-
-    // Pass 1: in a single sweep, histogram the currently-evictable chunks
-    // (cached/allocated with pin == 0) by demand tier.  This lets us pick the
-    // exact tier bar up-front instead of re-sweeping the batch once per tier.
-    std::array<size_t, chunk_lifecycle::FRESH_SCORE + 1> tier_count{};
-    for (auto const& er : eviction_batch) {
-      if (er.req == nullptr) { continue; }
-      for (cached_chunk* c : er.req->chunks) {
-        auto const s = c->state.get_state();
-        if (s != entry_state::cached && s != entry_state::allocated) { continue; }
-        ++tier_count[c->lifecycle.load().eviction_tier(query_tick)];
+    // Under pressure the target is a fraction of what the pool holds; an
+    // explicit demand raises it to at least what was asked for.  A floor rather
+    // than a replacement, so a demand that arrives while the pool is ALSO over
+    // its own threshold does not talk the evictor down to the smaller of the
+    // two -- both reasons to free memory are still true.
+    size_t need = 0;
+    if (_cfg.dispose_on_idle) {
+      need = std::numeric_limits<size_t>::max();
+    } else {
+      if (_pool->should_start_evicting()) {
+        need = static_cast<size_t>(static_cast<double>(_pool->total_allocated_chunks()) * 0.25);
       }
+      // Rounded up: freeing whole chunks is the only granularity there is, so a
+      // demand for part of one still costs the whole thing.
+      auto const chunk_bytes = std::max<size_t>(_pool->chunk_size(), 1);
+      need                   = std::max(need, (requested_bytes + chunk_bytes - 1) / chunk_bytes);
     }
 
-    // The cutoff is the lowest tier whose cumulative evictable count meets the
-    // target (or the top tier if even all evictable chunks fall short).  We
-    // evict everything strictly below the cutoff and just enough of the cutoff
-    // tier to reach the target — keeping the most in-demand chunks resident.
-    uint16_t cutoff   = chunk_lifecycle::FRESH_SCORE;
-    size_t cumulative = 0;
-    for (uint16_t t = 0; t <= chunk_lifecycle::FRESH_SCORE; ++t) {
-      cumulative += tier_count[t];
-      if (cumulative >= need) {
-        cutoff = t;
-        break;
-      }
-    }
-
-    // Pass 2: a single sweep evicts every chunk below the cutoff tier, plus
-    // chunks at the cutoff tier until the target is met.  Reclaimed buffers are
-    // bucketed by their origin NUMA node so they go back to the right arena.
     for (auto& [_, buffers] : reclaim_by_numa) {
       buffers.clear();
     }
+
+    // Pass 0 reclaims only chunks no live request is subscribed to.  If that
+    // cannot meet the target, pass 1 sweeps again ignoring subscriptions: a
+    // starved allocator is worse than a cache miss, and mark_evicting still
+    // refuses any chunk a reader has pinned, so the fallback can never pull a
+    // buffer out from under a live read — it only costs a future hit.
     size_t reclaimed = 0;
-    for (auto& er : eviction_batch) {
-      if (er.req == nullptr) { continue; }
-      for (cached_chunk* c : er.req->chunks) {
-        uint16_t const tier = c->lifecycle.load().eviction_tier(query_tick);
-        if (tier > cutoff) { continue; }
-        if (tier == cutoff && reclaimed >= need) { continue; }  // top bar satisfied
-        // mark_evicting only succeeds from cached/allocated with pin == 0, so
-        // in-use, loading, queued or already-evicted chunks are skipped.
-        if (c->state.mark_evicting()) {
+    for (int pass = 0; pass < 2 && reclaimed < need; ++pass) {
+      bool const respect_subscribers = (pass == 0);
+      for (auto& er : eviction_batch) {
+        if (!er.released || !er.req || !er.req.chunks) { continue; }
+        for (cached_chunk* c : *er.req.chunks) {
+          if (reclaimed >= need) { break; }
+          // A single relaxed load answers the whole question: does this chunk
+          // hold a reclaimable buffer, and is anybody still subscribed to it?
+          auto const snap = c->state.load();
+          if (!snap.is_reclaimable()) { continue; }
+          if (respect_subscribers && snap.subscribers() != 0) { continue; }
+          if (!c->state.mark_evicting(respect_subscribers)) { continue; }
           reclaim_by_numa[c->numa_node].push_back(reinterpret_cast<std::byte*>(c->data));
-          c->data = nullptr;
-          static_cast<void>(c->state.mark_empty());
+          c->data     = nullptr;
+          std::ignore = c->state.mark_empty();  // also clears the populated extent
           ++reclaimed;
-          ++er.n_evicted;
           _counters.evictions.fetch_add(1, std::memory_order_relaxed);
         }
       }
@@ -902,10 +1211,17 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
       if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa); }
     }
 
-    // Drop requests whose chunks have all been evicted; keep the rest for a
-    // later round.
-    std::erase_if(eviction_batch, [](eviction_request const& er) {
-      return er.req == nullptr || er.n_evicted >= er.req->chunks.size();
+    // Retire a request once it has released its references and every chunk it
+    // named is either reclaimed or now owned by somebody else.  Counting our
+    // own evictions instead would strand every request that shares a chunk:
+    // whoever loses the race to reclaim it could never reach its own count.
+    std::erase_if(eviction_batch, [](tracked_request const& er) {
+      if (!er.req || !er.req.chunks) { return true; }
+      if (!er.released) { return false; }
+      return std::ranges::all_of(*er.req.chunks, [](cached_chunk const* c) {
+        auto const snap = c->state.load();
+        return snap.state() == chunk_state::empty || snap.subscribers() != 0;
+      });
     });
   }
 }

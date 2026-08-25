@@ -18,6 +18,7 @@
 
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "sirius_config.hpp"
 
 #include <cstddef>
 #include <memory>
@@ -49,6 +50,37 @@ struct build_probe {};
 struct build_index_options {
   /// How branches are formed from the pipeline DAG. Defaults to pipeline_order.
   std::variant<pipeline_order, barrier_order, build_probe> branch_order{pipeline_order{}};
+};
+
+/**
+ * @brief How a scan's tasks are gated by the barrier it eventually feeds.
+ *
+ * - @c barrier_all: the scan feeds a FULL port of the first branch operator it reaches, so
+ *   every one of its tasks must finish before that branch can produce any task. There is no
+ *   point rationing its prefetch — take everything.
+ * - @c barrier_serial: the scan feeds a PARTIAL/PIPELINE port, but somewhere downstream its
+ *   data reaches a FULL port of a branch operator. Tasks flow, but a barrier is waiting, so
+ *   prefetch a concat batch's worth at a time.
+ * - @c pipeline: the scan's data never meets a FULL branch port. Every batch can create a
+ *   task, so one split of look-ahead is enough.
+ */
+enum class scheduling_mode { barrier_all, barrier_serial, pipeline };
+
+/// One entry of @ref query_index::prefetching_orders.
+struct prefetch_step {
+  /// The scan. Always a @c SiriusPhysicalOperatorType::GPU_SCAN.
+  op::sirius_physical_operator* scan{nullptr};
+  /// Operator id of the branch operator (e.g. a join) this scan belongs to.
+  ///
+  /// For @c barrier_all and @c barrier_serial this is the branch whose FULL port gates the
+  /// scan — the scan's own data must pass through that port; a branch merely *having* a FULL
+  /// port on some other side does not gate it. For @c pipeline nothing gates the scan, so it
+  /// falls back to the first branch the traversal visits.
+  std::size_t branch_id{0};
+  scheduling_mode mode{scheduling_mode::pipeline};
+  /// How many splits are worth prefetching ahead: @c SIZE_MAX for @c barrier_all,
+  /// concat-batch/scan-batch for @c barrier_serial, 1 for @c pipeline.
+  std::size_t count{0};
 };
 
 /**
@@ -114,6 +146,26 @@ class query_index {
   [[nodiscard]] branch get_consumer_pipelines_till_next_branch(
     const op::sirius_physical_operator* op) const;
 
+  /**
+   * @brief Every GPU scan, in the order downstream operators will ask it for tasks.
+   *
+   * Walks the DAG upstream from the plan's final operator. At each branch operator it
+   * descends the FULL-barrier side first — nothing downstream of that branch can produce a
+   * task until the FULL side is complete — and only then the other side. When neither or
+   * both sides are FULL, the lower pipeline id goes first, so the order is deterministic.
+   * Scans are emitted as they are reached, and each is classified by the barrier its data
+   * eventually meets (see @ref scheduling_mode).
+   *
+   * @param concat_batch_bytes    operator_params::concat_batch_bytes, for the
+   *                              @c barrier_serial count.
+   * @param scan_task_batch_size  operator_params::scan_task_batch_size, likewise. Zero is
+   *                              treated as 1 so the division is safe.
+   * @return One step per GPU scan, in prefetch order. Empty when the query has no GPU scan.
+   */
+  [[nodiscard]] std::vector<prefetch_step> prefetching_orders(
+    std::size_t concat_batch_bytes   = sirius::config::DEFAULT_CONCAT_BATCH_BYTES,
+    std::size_t scan_task_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE) const;
+
  private:
   query_index() = default;
 
@@ -123,6 +175,9 @@ class query_index {
   std::vector<branch> _branch_views;
   //! Head operator id -> index of the first branch that operator heads.
   std::unordered_map<std::size_t, std::size_t> _head_op_to_branch;
+  //! Every pipeline in the query, in execution order. Retained so prefetching_orders() can
+  //! rebuild the port-level DAG it needs; the pipelines outlive the index by contract.
+  std::vector<pipeline_ptr> _pipelines;
 };
 
 }  // namespace sirius::planner

@@ -135,6 +135,27 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   sirius::optional_ptr<op::sirius_physical_operator> get_source() const noexcept { return source; }
 
+  /// The source operator's identity as the query stage manager wants it: its id
+  /// and its type.
+  ///
+  /// Every @c notify_* that names "the operator this pipeline is stuck on" means
+  /// this one, so the lookup lives here rather than being re-derived at each
+  /// call site.  Reporting must not throw -- a plan that never ran
+  /// @c assign_operator_ids still has to dispatch -- so a missing source or an
+  /// unnumbered one yields the sentinels rather than aborting.
+  [[nodiscard]] std::pair<std::size_t, op::SiriusPhysicalOperatorType> get_source_operator()
+    const noexcept
+  {
+    auto src = get_source();
+    if (!src) {
+      return {op::sirius_physical_operator::invalid_operator_id,
+              op::SiriusPhysicalOperatorType::INVALID};
+    }
+    return {src->has_operator_id() ? src->get_operator_id()
+                                   : op::sirius_physical_operator::invalid_operator_id,
+            src->type};
+  }
+
   // Returns the next ports of the pipeline's sink operator, handling special-cased composite
   // operators like left and right delim joins. Returns an empty vector if the sink is not set.
   [[nodiscard]] std::vector<op::sirius_physical_operator::next_port_info>

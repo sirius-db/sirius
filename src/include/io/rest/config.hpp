@@ -16,7 +16,8 @@
 
 #pragma once
 
-#include "io/s3/s3_list_parser.hpp"
+#include "exec/config.hpp"
+#include "io/rest/s3/list_parser.hpp"
 
 #include <chrono>
 #include <cstddef>
@@ -24,6 +25,31 @@
 namespace sirius::io::rest {
 
 struct config {
+  /// An object store addresses single bytes: a ranged GET for an odd offset
+  /// costs exactly what it asks for, so nothing is gained by widening.
+  [[nodiscard]] std::size_t min_alignment_requirement() const noexcept { return 1; }
+
+  /// Bridging is worth a great deal here -- the alternative is a second round
+  /// trip -- so the gap the reactor already fuses on is the gap to merge on.
+  [[nodiscard]] std::size_t merge_gap_size() const noexcept { return merge_max_gap; }
+
+  /// How many scan tasks the readahead manager may keep in flight against this
+  /// backend at once.  Zero disables readahead for it entirely.
+  ///
+  /// Object-store reads are latency-bound rather than bandwidth-bound, so more
+  /// concurrency is needed to cover the round trips before the link itself is
+  /// the limit.  This struct default can only name the compile-time pipeline
+  /// width; @c sirius_config::derive_rest_scan_budget scales it to the
+  /// configured pipeline pool size unless the config sets it explicitly.
+  std::size_t n_max_concurrent_scans{8};
+
+  /// Whether the config named @c n_max_concurrent_scans explicitly.  Needed
+  /// because the derived default is computed from the pipeline width and can
+  /// legitimately land on the struct default -- without this flag, a config that
+  /// sets the value to exactly the struct default is indistinguishable from one
+  /// that says nothing, and gets silently overridden.
+  bool n_max_concurrent_scans_explicit{false};
+
   /// Whole-request timeout (seconds, 0 = no limit) and presigned-URL TTL.
   long request_timeout_s{30};
 
@@ -32,32 +58,24 @@ struct config {
   std::string ca_bundle_path;
   bool tls_verify{true};
 
-  /// Max concurrent in-flight easy handles per reactor.
-  std::size_t max_connections{16};
+  /// Max concurrent in-flight easy handles per reactor, i.e. the ceiling on
+  /// simultaneous ranged GETs this reactor drives.  Fixed at 64, not exposed to
+  /// YAML: the useful value is a property of one reactor thread rather than of a
+  /// deployment.
+  ///
+  /// More is not better, and past the point where the link is full it is
+  /// actively worse: extra connections only split the same bandwidth into
+  /// thinner streams.  Each socket then delivers a few KiB per read, so the
+  /// reactor thread spends its time in per-read callback and TLS-record overhead
+  /// rather than moving bytes, and time-to-first-byte climbs because it cannot
+  /// service that many sockets promptly.  To drive more concurrency, add
+  /// reactors (@c rest_n_reactors) rather than sockets per reactor — each
+  /// reactor brings its own thread to service them.
+  std::size_t max_connections{64};
 
-  /// Target maximum bytes per ranged GET for the vector / device-staging
-  /// paths: file-adjacent segments are fused into one scatter GET up to this
-  /// size, and an oversized segment is split into ceil(size / chunk_size)
-  /// pieces.  A single contiguous host read instead splits by
-  /// @c max_read_split (see prep_host_rx_request).
-  std::size_t chunk_size{8UL << 20};
-
-  /// Cap on destination buffers fused into a single scatter GET (i.e. how
-  /// many file-adjacent segments may merge into one request).
-  std::size_t max_n_chunks{16};
-
-  /// How many parallel ranged GETs a single contiguous host read is broken
-  /// into (@c prep_host_rx_request).  The split picks the largest chunk count
-  /// <= max_read_split that keeps every piece at least 1 MiB; a read smaller
-  /// than 2 MiB stays a single GET.
-  std::size_t max_read_split{16};
-
-  /// Bounce-slot size (bytes) for the reactor-staged device path, cached from
-  /// the staging resource's block size by @c rest_ioctx.  Zero disables the
-  /// reactor-staged device read (the static @c prep_device_rx_request needs
-  /// this size without access to the live resource, which lives on the
-  /// @c reactor_context).
-  std::size_t bounce_block_size{0};
+  /// Logical range coalescing hint exposed to the cache/read planner. Physical
+  /// GET segmentation is deliberately worker-owned and does not use this value.
+  std::size_t merge_max_gap{512UL << 10};  // 0.5 MiB
 
   /// Idle-connection keepalive.  While the reactor is idle, every
   /// @c upkeep_interval the worker calls @c curl_easy_upkeep on its pooled
@@ -84,12 +102,6 @@ struct config {
   std::chrono::milliseconds retry_backoff_base{50};
   std::chrono::milliseconds retry_jitter{50};
   bool honor_retry_after{true};
-
-  /// When set, the reactor records the per-chunk micro timings (chunk_get,
-  /// queue_wait, ttfb, h2d_observed) into its perf counters.  The retry,
-  /// terminal-failure and device-stream-sync counters are always recorded,
-  /// independent of this flag.
-  bool perf_instrumentation{false};
 
   /// Suffix-range window (bytes) for the parquet footer probe
   /// (@c open_hint::parquet_footer_probe): one `Range: bytes=-N` GET resolves the

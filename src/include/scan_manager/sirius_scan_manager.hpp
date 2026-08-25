@@ -17,10 +17,11 @@
 #pragma once
 
 #include "duckdb/planner/table_filter.hpp"
+#include "exec/query_stage_manager.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/datasource_factory.hpp"
-#include "io/s3/s3_list_parser.hpp"
+#include "io/rest/s3/list_parser.hpp"
 #include "io/sirius_datasource.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "pin_table.hpp"
@@ -31,6 +32,7 @@
 #include "scan_manager/memory_prefetcher.hpp"
 #include "scan_manager/mvcc_mask_job.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
+#include "scan_manager/readahead_scan_manager.hpp"
 #include "scan_manager/split_provider.hpp"
 
 namespace sirius::op {
@@ -76,10 +78,13 @@ class topology_index;
 }  // namespace sirius::memory
 
 namespace sirius::io {
-class sirius_ioctx;
+class ioctx;
 namespace cache {
 class buffer_pool;
 }  // namespace cache
+namespace rest {
+class rest_ioctx;
+}  // namespace rest
 }  // namespace sirius::io
 
 namespace sirius::op::scan {
@@ -451,6 +456,26 @@ class sirius_scan_manager {
   ///        still running.
   void reset();
 
+  /// \brief Drop every ioctx's prefetching cache and build a fresh one.
+  ///
+  /// Every cached chunk is released and the file entries go with them, so the
+  /// next query starts from an empty cache rather than one carrying the last
+  /// query's residency and counters.  That is the point of it: a benchmark run
+  /// that wants each iteration to pay its own IO cannot get there by waiting,
+  /// because the cache holds what it holds until something evicts it.
+  ///
+  /// A no-op for any context the configuration or the backend does not give a
+  /// cache to -- @c cache.mode other than @c sirius, or a backend that cannot
+  /// serve vector host reads.  Such a context has nothing to drop and nothing
+  /// to rebuild, and this leaves it exactly as it was rather than teaching it
+  /// to cache.
+  ///
+  /// NOT safe against a running query: dropping a cache frees the chunk buffers
+  /// live @c prefetching_handle instances point at.  The caller is responsible
+  /// for excluding execution -- through the extension this runs under a
+  /// @c SiriusContext::SlotGuard, which is what makes it safe there.
+  void reset_caches();
+
   /// \brief Start the worker thread pool. Idempotent.
   void start();
 
@@ -606,25 +631,61 @@ class sirius_scan_manager {
 
   parquet_bind_result describe_parquet(std::string const& uri);
 
+  /// \brief Pin @p file_paths' column-chunk bytes into the prefetching cache.
+  ///
+  /// The pin is the cache itself: the selected columns' chunks are inserted,
+  /// staged and read, and the ordinary scan path then finds them resident and
+  /// serves from them. Nothing is decoded and nothing is materialised on the
+  /// GPU, which is what separates this from the gpu/host tiers.
+  ///
+  /// Residency is held by keeping each file's @c sirius_datasource -- and so its
+  /// @c prefetching_handle -- alive under @p name until @ref remove_pinned_entry
+  /// drops it. That is load-bearing rather than incidental: the evictor only
+  /// considers a request's chunks once its consumer is disposed, so a live
+  /// handle is what keeps them out of the reclaim sweep entirely.
+  ///
+  /// @param cols  columns to pin, or all of them when unset.
+  /// @return bytes of column-chunk data requested across every file.
+  /// @throws std::runtime_error when the configuration gives this backend no
+  ///         prefetching cache -- there is nowhere to pin to, and silently
+  ///         doing nothing would read as a successful pin.
+  std::size_t pin_parquet_ranges(std::string const& name,
+                                 std::vector<std::string> const& file_paths,
+                                 std::optional<std::vector<std::string>> const& cols);
+
   /// \brief Process-wide ioctx used to mint @c sirius_datasource instances.
   ///        Holds a @c uring_ioctx, or a @c kvikio_context when the manager
-  ///        was configured with @c use_sirius_datasource=false.
-  [[nodiscard]] sirius::io::sirius_ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
+  ///        was configured with @c backend=kvikio.
+  [[nodiscard]] sirius::io::ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
+
+  /// \brief Concatenated @c perf_report_and_reset() of every live ioctx (the
+  ///        default one plus any path-routed backend), for the per-query
+  ///        observability dump.  Backends with no counters contribute nothing,
+  ///        so this is empty unless something instrumented actually ran.
+  [[nodiscard]] std::string io_perf_report_and_reset() noexcept;
+
+  /// Where the readahead subscribes for execution events.  Set once at startup;
+  /// the readahead itself is per-query, so it registers and unregisters around
+  /// its own lifetime rather than this one.
+  void set_query_stage_manager(sirius::exec::query_stage_manager& manager)
+  {
+    _query_stage_manager = manager.shared_from_this();
+  }
 
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
     std::string_view path, sirius::io::open_hint hint = sirius::io::open_hint::generic);
 
   /// \brief Stream ListObjectsV2 pages for @p s3_prefix_uri ("s3://bucket/prefix")
   ///        to @p sink, one call per page; @p sink returns false to stop early.
-  ///        Routes via @ref ioctx_for_path to the object-store backend (throws a
-  ///        clear error when the path does not resolve to one). page_size /
+  ///        Uses @ref rest_ioctx_for_list (throws a clear error when the REST
+  ///        backend is not configured). page_size /
   ///        early-stop semantics are the backend's (@c rest_ioctx::list_objects_paged).
   ///        @p max_scanned unset → the backend's configured cap
   ///        (@c rest.list_max_scanned); a value overrides it.
   void list_objects_paged(
     std::string const& s3_prefix_uri,
     std::size_t page_size,
-    std::function<bool(sirius::io::s3::list_objects_v2_page const&)> const& sink,
+    std::function<bool(sirius::io::rest::s3::list_objects_v2_page const&)> const& sink,
     std::optional<std::size_t> max_scanned = std::nullopt);
 
   /// \brief The configured glob-match cap (@c rest.list_max_matches) for the
@@ -633,7 +694,9 @@ class sirius_scan_manager {
   [[nodiscard]] std::size_t s3_list_max_matches(std::string const& s3_uri);
 
  private:
-  /// \brief Run providers sequentially: start each, wait on its future, advance.
+  /// \brief Enqueue every file's metadata task, then the per-slot coalescer
+  /// loops.  See the definition: the producer-before-consumer order is what
+  /// keeps the shared dispatcher from deadlocking.
   void start_metadata_processing();
 
   /// One matched (scan op ← pinned entry) pairing from the cache-match pass.
@@ -668,7 +731,18 @@ class sirius_scan_manager {
   /// building it once per backend on first use.  Routes by path through the registry
   /// so an `s3://` URI reaches the rest_ioctx even when the local default `_io_ctx`
   /// is uring/kvikio.  Returns nullptr when no backend supports the path.
-  std::shared_ptr<sirius::io::sirius_ioctx> ioctx_for_path(std::string_view path);
+  std::shared_ptr<sirius::io::ioctx> ioctx_for_path(std::string_view path);
+
+  /// Resolve the ioctx of @p type, building and caching it on first use (the
+  /// by-path routing above resolves to a type and then lands here).  Returns
+  /// nullptr when the registry cannot build that backend.
+  std::shared_ptr<sirius::io::ioctx> ioctx_for_type(sirius::io::io_context_type type);
+
+  /// The REST ioctx, which owns LIST / glob regardless of which backend serves
+  /// object READS (with @c backend=kvikio, `s3://` reads route to kvikIO).
+  /// Returns nullptr when the object store is not configured, i.e. the REST
+  /// backend cannot be built.  The returned ioctx stays owned by this manager.
+  sirius::io::rest::rest_ioctx* rest_ioctx_for_list();
 
   scan_manager_config _config;
   cucascade::memory::memory_reservation_manager& _reservation_manager;
@@ -677,7 +751,7 @@ class sirius_scan_manager {
   std::shared_ptr<const sirius::memory::topology_index> _topology_index;
   exec::static_thread_pool _thread_pool;
   std::unique_ptr<exec::scoped_dispatcher> _dispatcher;
-  std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
+  std::shared_ptr<sirius::io::ioctx> _io_ctx;
   /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
   /// rest_ioctx alongside the local uring/kvikio `_io_ctx`).  Built exactly once
   /// per type: `_routed_io_ctxs_build_mtx` serializes construction (reactor
@@ -686,12 +760,18 @@ class sirius_scan_manager {
   /// in the dtor.
   std::mutex _routed_io_ctxs_build_mtx;
   std::mutex _routed_io_ctxs_mtx;
-  std::unordered_map<sirius::io::io_context_type, std::shared_ptr<sirius::io::sirius_ioctx>>
+  std::unordered_map<sirius::io::io_context_type, std::shared_ptr<sirius::io::ioctx>>
     _routed_io_ctxs;
   std::unordered_map<op::scan::sirius_gpu_scan_operator*, std::unique_ptr<split_provider>>
     _providers_by_op;
   std::vector<op::scan::sirius_gpu_scan_operator*> _scan_op_order;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
+
+  /// Datasources retained by @ref pin_parquet_ranges, keyed by pin name. Holding
+  /// them is the pin: each owns the prefetching_handle whose live consumer keeps
+  /// its chunks out of the evictor's reach.
+  std::unordered_map<std::string, std::vector<std::shared_ptr<sirius::io::sirius_datasource>>>
+    _pinned_parquet_sources;
   bool _pruning_enabled{true};
 
   /// One mask computation per distinct pinned entry matched this query
@@ -723,6 +803,14 @@ class sirius_scan_manager {
   /// (built in start_metadata_processing when the memory_prefetcher config
   /// block enables it, torn down in reset()).
   std::unique_ptr<memory_prefetcher> _prefetcher;
+  /// Per-query readahead bookkeeping, seeded from the query's prefetching
+  /// order and shared with every scan split this query emits.
+  std::shared_ptr<readahead_scan_manager> _readahead;
+  /// Shared with the context, so it outlives every readahead registered with
+  /// it.  Never null: seeded with a listener-less manager until the context
+  /// hands over its own.
+  std::shared_ptr<sirius::exec::query_stage_manager> _query_stage_manager{
+    std::make_shared<sirius::exec::query_stage_manager>()};
   io::io_context_registry _ioctx_registry;
 };
 

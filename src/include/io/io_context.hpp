@@ -19,8 +19,9 @@
 #include "exec/semi_future.hpp"
 #include "io/cache/config.hpp"
 #include "io/cache/metadata_store.hpp"
-#include "io/cache/types.hpp"
 #include "io/types.hpp"
+
+#include <cudf/io/text/byte_range_info.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 
@@ -32,6 +33,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace sirius::io {
@@ -65,7 +67,7 @@ class memory_reservation_manager;
 namespace sirius::io {
 
 // ---------------------------------------------------------------------------
-// sirius_ioctx
+// ioctx
 // ---------------------------------------------------------------------------
 
 /**
@@ -74,17 +76,10 @@ namespace sirius::io {
  * Holds resources that are shared across all datasources (cache, reactor
  * threads, ...). Extend this class to provide a concrete I/O backend.
  */
-class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
-  // prefetching_cache's worker_loop is the only caller of the protected
-  // host_read_ranges_async_io entry point through a sirius_ioctx* base
-  // pointer.  Friending the cache lets that single call site reach in
-  // without forcing the vector-read primitive (which most callers never
-  // touch) into the public API.
-  friend class cache::prefetching_cache;
-
+class ioctx : public std::enable_shared_from_this<ioctx> {
  public:
-  sirius_ioctx();
-  virtual ~sirius_ioctx();
+  ioctx();
+  virtual ~ioctx();
 
   [[nodiscard]] virtual io_context_type type() const noexcept = 0;
 
@@ -117,6 +112,26 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   [[nodiscard]] std::unique_ptr<sirius_datasource> open_datasource(std::string path,
                                                                    std::uint64_t known_size);
 
+  /// Open the backend's connections to whatever serves @p bucket_url, ahead of
+  /// the first read, so a query does not pay connection setup on its hot path.
+  ///
+  /// @p bucket_url names a container, not an object -- @c "s3://my-bucket".  A
+  /// full object URL is accepted and its key ignored, since connections are per
+  /// endpoint and the object adds nothing to the identity.  Deliberately not an
+  /// @c io_object: opening one is itself a round trip over the connection being
+  /// warmed, which would leave the warm-up nothing left to hide, and it would
+  /// tie warm-up traffic to individual data files.
+  ///
+  /// Best-effort by contract: it must not throw and must not block the caller,
+  /// and a failed warm-up is never a reason to fail a read.  For a transport
+  /// that is what warms, even a rejected request is a success -- a 403 still
+  /// completed the DNS lookup, the TCP connect and the TLS handshake, which is
+  /// all that was being bought.
+  ///
+  /// The default is a no-op, which is the right answer for every backend whose
+  /// "connection" is a file descriptor it already holds.
+  virtual void warmup(std::string_view /*bucket_url*/) noexcept {}
+
   /// Whether this backend can serve reads for @p path.  Backends should
   /// validate scheme/protocol support and any backend-specific
   /// preconditions (e.g. file existence for local-disk backends).
@@ -132,17 +147,62 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   [[nodiscard]] virtual bool supports_host_to_device_read() const noexcept = 0;
 
   /// Whether the backend can serve a batch of host reads in a single dispatch
-  /// (cf. @c host_read_ranges_async_io).  When false, the prefetching layer
+  /// (cf. @c host_readv_async_io).  When false, the prefetching layer
   /// cannot amortise per-request overhead and must fall back to
-  /// @c prefetching_stage::none.
+  /// @c scan_stage::none.
   [[nodiscard]] virtual bool supports_vector_host_read() const noexcept = 0;
 
-  /// Prefetching strategy the prefetching layer should use against this
-  /// backend.  Returns @c prefetching_stage::none whenever
-  /// @c supports_vector_host_read() is false; otherwise the backend picks
-  /// between eager prefill and on-demand read-ahead based on its IO
-  /// characteristics.
-  [[nodiscard]] virtual cache::prefetching_stage preferred_prefetching_stage() const noexcept = 0;
+  /// Whether the backend can efficiently serve a batch of device reads.
+  /// Backends may still process mixed slices serially when this is false.
+  [[nodiscard]] virtual bool supports_device_range_read() const noexcept = 0;
+
+  /// Whether this backend would rather be handed one batched request covering
+  /// everything a reader needs than a stream of small reads as the reader walks
+  /// the file.
+  ///
+  /// Unlike the supports_* flags this is a preference, not a capability: a
+  /// backend that says no can still serve a batch, and one that says yes can
+  /// still serve small reads.  It reflects what the request itself costs.  For
+  /// an object store a read is a round trip, so the shape of the request set
+  /// dominates and knowing all of it up front is worth a great deal; for a local
+  /// file a read is a syscall against page cache or NVMe, and batching buys
+  /// little while forcing the caller to materialise ranges it may not need.
+  ///
+  /// Conservatively false: a backend opts in.
+  [[nodiscard]] virtual bool prefers_bulk_io() const noexcept { return false; }
+
+  /// The smallest unit this backend can address, in bytes.  A read is widened
+  /// out to a multiple of it before being issued: a local file opened O_DIRECT
+  /// can only transfer whole pages, while an object store addresses single
+  /// bytes and pays nothing for an odd offset.
+  ///
+  /// Conservatively 1 -- a backend that has not opted in is never widened.
+  [[nodiscard]] virtual std::size_t min_alignment_requirement() const noexcept { return 1; }
+
+  /// The largest gap between two ranges still worth bridging into one request,
+  /// in bytes.  The bridged bytes are fetched and discarded, traded against the
+  /// cost of a second request: a page for a local file, a whole round trip for
+  /// an object store, which is why the two want very different answers.
+  ///
+  /// Conservatively 0 -- only adjacent ranges are fused.
+  [[nodiscard]] virtual std::size_t merge_gap_size() const noexcept { return 0; }
+
+  /// How many scan tasks the readahead manager may keep in flight against this
+  /// backend at once, as configured on its reactors.  Zero means this backend
+  /// opts out of readahead scheduling entirely.
+  ///
+  /// The bound is a property of the backend, not of the query: it reflects the
+  /// queue depth the device is worth driving at (see the per-backend defaults
+  /// on each reactor config).  The base returns 0 so a backend that has not
+  /// opted in is never scheduled against.
+  [[nodiscard]] virtual std::size_t n_max_concurrent_scans() const noexcept { return 0; }
+
+  /// Backend-specific perf counters, formatted for a log/stderr dump, with the
+  /// counters zeroed on the way out so successive calls report per-window
+  /// deltas.  Empty when the backend keeps no counters.  Best-effort
+  /// observability: implementations read racy relaxed atomics and must not
+  /// throw.
+  [[nodiscard]] virtual std::string perf_report_and_reset() noexcept { return {}; }
 
   /// Build the prefetching cache.  One-shot — calling twice is a no-op
   /// after the first successful build.  The cache holds a raw
@@ -170,7 +230,7 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// statement in its destructor.  It drains the cache (so its workers
   /// stop issuing IO) while the derived object's reactors / handles
   /// are still alive.  Without this, the cache's defensive shutdown
-  /// in @c ~sirius_ioctx would run AFTER the derived part of the
+  /// in @c ~ioctx would run AFTER the derived part of the
   /// object has been destroyed, and worker callbacks would reach
   /// already-destroyed reactors.
   ///
@@ -210,32 +270,37 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
     std::span<const cudf::io::text::byte_range_info> ranges,
     std::optional<size_t> alignment = std::nullopt) const noexcept = 0;
 
-  virtual size_t host_read_io(const sirius_io_object& obj,
-                              size_t offset,
-                              size_t size,
-                              uint8_t* dst) = 0;
+  virtual size_t host_read_io(const io_object& obj, size_t offset, size_t size, uint8_t* dst) = 0;
 
-  virtual exec::semi_future<size_t> host_read_async_io(const sirius_io_object& obj,
+  virtual exec::semi_future<size_t> host_read_async_io(const io_object& obj,
                                                        size_t offset,
                                                        size_t size,
-                                                       uint8_t* dst) noexcept = 0;
+                                                       uint8_t* dst) noexcept;
 
-  virtual exec::semi_future<size_t> device_read_async_io(const sirius_io_object& obj,
+  virtual exec::semi_future<size_t> device_read_async_io(const io_object& obj,
                                                          size_t offset,
                                                          size_t size,
                                                          uint8_t* dst,
-                                                         rmm::cuda_stream_view stream) noexcept = 0;
+                                                         rmm::cuda_stream_view stream) noexcept;
 
-  virtual exec::semi_future<size_t> host_to_device_read_async_io(
-    const sirius_io_object& obj,
-    std::span<io_object_segment> slices,
-    size_t offset,
-    size_t size,
-    uint8_t* device_dst,
-    rmm::cuda_stream_view stream) noexcept = 0;
+  virtual exec::semi_future<size_t> host_readv_async_io(const io_object& obj,
+                                                        std::span<const slice> slices) noexcept;
 
-  virtual exec::semi_future<size_t> host_read_ranges_async_io(
-    const sirius_io_object& obj, std::span<io_object_segment> segments) noexcept = 0;
+  virtual exec::semi_future<size_t> device_readv_async_io(const io_object& obj,
+                                                          std::span<const slice> slices,
+                                                          rmm::cuda_stream_view stream) noexcept;
+
+  /// The sole asynchronous backend hook. All scalar/vector host/device APIs
+  /// construct prepared slices and forward here; reactors perform physical
+  /// chunking only after queue and slot pressure are known.
+  virtual exec::semi_future<size_t> mixed_readv_async_io(
+    const io_object& obj, std::vector<prepared_io_slice>&& slices) noexcept = 0;
+
+  exec::semi_future<size_t> host_device_readv_async_io(
+    const io_object& obj, std::vector<prepared_io_slice>&& slices) noexcept
+  {
+    return mixed_readv_async_io(obj, std::move(slices));
+  }
 
   bool can_use_prefetching_cache() const noexcept
   {
@@ -247,22 +312,21 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// return a populated io_object.  Invoked by @c open_datasource; not part of
   /// the public surface (callers receive a ready @c sirius_datasource).  Throws
   /// on unsupported / unreachable paths.
-  virtual std::shared_ptr<sirius_io_object> create_io_object(std::string path) = 0;
+  virtual std::shared_ptr<io_object> create_io_object(std::string path) = 0;
 
   /// Hinted variant.  The base implementation ignores @p hint and delegates to
   /// the required @c create_io_object(path); a backend that can act on the hint
   /// (e.g. rest_ioctx's suffix-range footer probe) overrides this.  Kept a
   /// distinct virtual — not a defaulted argument on the pure virtual above — so
   /// the hint dispatches on the dynamic type instead of binding statically.
-  virtual std::shared_ptr<sirius_io_object> create_io_object(std::string path, open_hint hint);
+  virtual std::shared_ptr<io_object> create_io_object(std::string path, open_hint hint);
 
   /// Known-size variant.  The base implementation ignores @p known_size and
   /// delegates to the required @c create_io_object(path); a backend whose size
   /// discovery would otherwise cost a round-trip overrides this to build the
   /// io_object without one.  Same distinct-virtual rationale as the hint
   /// variant above.
-  virtual std::shared_ptr<sirius_io_object> create_io_object(std::string path,
-                                                             std::uint64_t known_size);
+  virtual std::shared_ptr<io_object> create_io_object(std::string path, std::uint64_t known_size);
 
   /// Owned by this ioctx.  Built by @ref initialize_cache, destroyed
   /// by @ref shutdown_cache (or the ioctx destructor as a safety net,
@@ -276,6 +340,6 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
 
 /// Resolves the ioctx that serves a given file path (s3:// -> rest, local ->
 /// uring/kvikio).  Returns a valid ioctx or throws if no backend supports the path.
-using ioctx_resolver = std::function<std::shared_ptr<sirius_ioctx>(std::string_view)>;
+using ioctx_resolver = std::function<std::shared_ptr<ioctx>(std::string_view)>;
 
 }  // namespace sirius::io

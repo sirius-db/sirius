@@ -33,6 +33,7 @@
 
 // cudf
 #include <cudf/io/parquet.hpp>
+#include <cudf/io/text/byte_range_info.hpp>
 
 // standard library
 #include <atomic>
@@ -121,6 +122,27 @@ void canonicalize_scan_file_paths(std::vector<std::string>& paths);
  */
 class parquet_split_info : public scan_info {
  public:
+  explicit parquet_split_info(std::vector<fadvise_entry> hints) : scan_info(std::move(hints)) {}
+
+  /// The column-chunk byte ranges this split reads, one vector per entry of
+  /// @c rg_slices (empty for a slice with no metadata or no row groups).
+  ///
+  /// Computed once by the coalescer, which already walks them to build this
+  /// split's fadvise hints, and handed over here so materialization can reuse
+  /// them: each computation builds a @c hybrid_scan_reader and walks the
+  /// footer's row groups, which is far from free on a many-row-group file.
+  [[nodiscard]] std::span<std::vector<cudf::io::text::byte_range_info> const>
+  column_chunk_byte_ranges() const
+  {
+    return _column_chunk_ranges;
+  }
+
+  void set_column_chunk_byte_ranges(
+    std::vector<std::vector<cudf::io::text::byte_range_info>> ranges)
+  {
+    _column_chunk_ranges = std::move(ranges);
+  }
+
   /// Row-group slices for this batch — possibly across multiple parquet
   /// files when the per-file row groups don't fill the byte budget.
   std::vector<row_group_slice> rg_slices;
@@ -163,12 +185,9 @@ class parquet_split_info : public scan_info {
     return total;
   }
 
-  /// One fadvise_entry per row-group slice: the slice's datasource paired with
-  /// the column-chunk byte ranges the read will fetch for that file's row groups
-  /// (computed via @c hybrid_scan_reader::all_column_chunks_byte_ranges, honoring
-  /// the reader_options column projection). Drives prefetch for the materialize
-  /// read across every file in the batch.
-  [[nodiscard]] std::vector<fadvise_entry> fadvise_entries() const override;
+ private:
+  /// Parallel to @c rg_slices. See @ref column_chunk_byte_ranges.
+  std::vector<std::vector<cudf::io::text::byte_range_info>> _column_chunk_ranges;
 };
 
 //===----------------------------------------------------------------------===//
@@ -213,10 +232,6 @@ class parquet_file_scan_info : public scan_info {
   std::shared_ptr<io::sirius_datasource> datasource;
   /// Pruned row groups for this file, in file order, with byte accounting.
   std::vector<row_group_entry> row_groups;
-  /// Shared reader options (column projection), used to compute the column-chunk
-  /// byte ranges for @ref fadvise_entries. Same options the coalescer stamps onto
-  /// the emitted @c parquet_split_info.
-  std::shared_ptr<cudf::io::parquet_reader_options> reader_options;
   /// Hive partition values for this file, in @c scan_plan::partition_columns
   /// order. Empty when the plan has no partition columns.
   std::vector<std::string> partition_values;
@@ -242,12 +257,6 @@ class parquet_file_scan_info : public scan_info {
     }
     return total;
   }
-
-  /// A single fadvise_entry: this file's datasource paired with the column-chunk
-  /// byte ranges the read will fetch for its row groups (via
-  /// @c hybrid_scan_reader::all_column_chunks_byte_ranges, honoring the
-  /// reader_options column projection).
-  [[nodiscard]] std::vector<fadvise_entry> fadvise_entries() const override;
 };
 
 /// A top-level `<col> IS [NOT] NULL` conjunct, recorded so the row groups it
@@ -327,7 +336,7 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   /// Runs on a scan-manager dispatcher thread (the task returned by
   /// @ref next_split_provider).
   std::unique_ptr<scan_info> build_file_scan_info(std::string const& file_path,
-                                                  std::shared_ptr<io::sirius_ioctx> const& io_ctx);
+                                                  std::shared_ptr<io::ioctx> const& io_ctx);
 
   std::unique_ptr<parquet_ingestible_table_info> _info;
 

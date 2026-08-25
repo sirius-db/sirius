@@ -413,7 +413,7 @@ TEST_CASE("materialize_table applies the mvcc keep-mask to metadata splits",
     sinfo->row_groups        = std::move(md);
     sinfo->host_backed_only  = true;
     sinfo->staging_keepalive = keepalive;
-    scan_operator_input input(std::unique_ptr<scan_info>(std::move(sinfo)));
+    scan_operator_input input(std::shared_ptr<scan_info>(std::move(sinfo)));
     input.gpu_memory_space = gpu_space;
     input.mvcc_keep_mask   = sirius::scan_manager::mvcc_chunk_mask{
       std::shared_ptr<std::uint32_t[]>(words, words->data()), n_rows};
@@ -433,7 +433,7 @@ TEST_CASE("materialize_table applies the mvcc keep-mask to metadata splits",
     sinfo->row_groups        = std::move(md);
     sinfo->host_backed_only  = true;
     sinfo->staging_keepalive = keepalive;
-    scan_operator_input input(std::unique_ptr<scan_info>(std::move(sinfo)));
+    scan_operator_input input(std::shared_ptr<scan_info>(std::move(sinfo)));
     input.gpu_memory_space = gpu_space;
     input.mvcc_keep_mask   = sirius::scan_manager::mvcc_chunk_mask{
       std::shared_ptr<std::uint32_t[]>(words, words->data()), n_rows - 1};

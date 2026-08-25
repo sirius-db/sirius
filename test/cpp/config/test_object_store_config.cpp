@@ -243,43 +243,12 @@ TEST_CASE("sirius_config defaults chunk prewarm to enabled when YAML omits the k
     out << "sirius:\n"
            "  executor:\n"
            "    scan_manager:\n"
-           "      use_sirius_datasource: true\n";
+           "      backend: sirius\n";
     REQUIRE(out);
   }
 
   sirius::sirius_config cfg;
   cfg.load_from_file(path);
-
-  std::error_code ec;
-  std::filesystem::remove(path, ec);
-}
-
-TEST_CASE("sirius_config parses rest perf instrumentation flag",
-          "[scan_manager][config][s3][rest][perf]")
-{
-  CHECK_FALSE(sirius::io::rest::config{}.perf_instrumentation);
-  CHECK(sirius::io::rest::config{}.footer_probe_bytes == 512UL * 1024);
-  CHECK(sirius::io::rest::config{}.list_max_matches == 100'000);
-  CHECK(sirius::io::rest::config{}.list_max_scanned == 1'000'000);
-
-  auto const path =
-    std::filesystem::temp_directory_path() / "sirius_rest_perf_instrumentation.yaml";
-  write_yaml(path,
-             "sirius:\n"
-             "  executor:\n"
-             "    scan_manager:\n"
-             "      rest:\n"
-             "        perf_instrumentation: true\n"
-             "        footer_probe_bytes: 256KiB\n"
-             "        list_max_matches: 5\n"
-             "        list_max_scanned: 50\n");
-
-  sirius::sirius_config cfg;
-  REQUIRE_NOTHROW(cfg.load_from_file(path));
-  CHECK(cfg.get_scan_manager_config().rest.perf_instrumentation);
-  CHECK(cfg.get_scan_manager_config().rest.footer_probe_bytes == 256UL * 1024);
-  CHECK(cfg.get_scan_manager_config().rest.list_max_matches == 5);
-  CHECK(cfg.get_scan_manager_config().rest.list_max_scanned == 50);
 
   std::error_code ec;
   std::filesystem::remove(path, ec);
@@ -293,7 +262,7 @@ TEST_CASE("sirius_config rejects unknown rest config keys", "[scan_manager][conf
              "  executor:\n"
              "    scan_manager:\n"
              "      rest:\n"
-             "        perf_instrumentation_typo: true\n");
+             "        unknown_rest_option: true\n");
 
   sirius::sirius_config cfg;
   CHECK_THROWS(cfg.load_from_file(path));
@@ -340,31 +309,31 @@ TEST_CASE("sirius_config still loads unrelated REST YAML fields",
              "    scan_manager:\n"
              "      rest:\n"
              "        request_timeout_s: 11\n"
-             "        max_connections: 7\n");
+             "        merge_max_gap: 1MiB\n");
 
   sirius::sirius_config cfg;
   REQUIRE_NOTHROW(cfg.load_from_file(path));
   CHECK(cfg.get_scan_manager_config().rest.request_timeout_s == 11);
-  CHECK(cfg.get_scan_manager_config().rest.max_connections == 7);
+  CHECK(cfg.get_scan_manager_config().rest.merge_max_gap == 1UL << 20);
 
   std::error_code ec;
   std::filesystem::remove(path, ec);
 }
 
-TEST_CASE("sirius_config keeps REST bounce sizing internal", "[scan_manager][config][rest]")
+TEST_CASE("sirius_config keeps REST connection count internal", "[scan_manager][config][rest]")
 {
-  auto const path = std::filesystem::temp_directory_path() / "sirius_rest_bounce_size.yaml";
+  auto const path = std::filesystem::temp_directory_path() / "sirius_rest_max_connections.yaml";
   write_yaml(path,
              "sirius:\n"
              "  executor:\n"
              "    scan_manager:\n"
              "      rest:\n"
-             "        bounce_block_size: 4MiB\n");
+             "        max_connections: 7\n");
 
   sirius::sirius_config cfg;
   REQUIRE_THROWS_WITH(cfg.load_from_file(path),
-                      Catch::Contains("unknown config key: 'bounce_block_size' in rest"));
-  CHECK(cfg.get_scan_manager_config().rest.bounce_block_size == 0);
+                      Catch::Contains("unknown config key: 'max_connections' in rest"));
+  CHECK(cfg.get_scan_manager_config().rest.max_connections == 64);
 
   std::error_code ec;
   std::filesystem::remove(path, ec);
