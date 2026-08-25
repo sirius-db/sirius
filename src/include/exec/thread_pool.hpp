@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "exec/thread_util.hpp"
 #include "log/logging.hpp"
 
 #include <absl/functional/any_invocable.h>
@@ -28,6 +29,7 @@
 #include <queue>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -41,11 +43,6 @@ class static_thread_pool {
                               absl::AnyInvocable<void() noexcept> per_thread_init = nullptr)
   {
     threads_.reserve(num_threads);
-
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    std::for_each(
-      cpu_ids.begin(), cpu_ids.end(), [&cpuset](int cpu_id) { CPU_SET(cpu_id, &cpuset); });
 
     std::unique_ptr<std::latch> init_latch;
     if (per_thread_init) { init_latch = std::make_unique<std::latch>(num_threads); }
@@ -62,10 +59,10 @@ class static_thread_pool {
         work_loop();
       });
       if (!name.empty()) {
-        pthread_setname_np(t.native_handle(), (name + "_" + std::to_string(i)).c_str());
+        std::ignore = sirius::exec::thread_util::set_thread_name(t, name + "_" + std::to_string(i));
       }
       if (!cpu_ids.empty()) {
-        pthread_setaffinity_np(t.native_handle(), sizeof(cpu_set_t), &cpuset);
+        std::ignore = sirius::exec::thread_util::set_thread_affinity(t, cpu_ids);
       }
     }
 
