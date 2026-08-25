@@ -746,22 +746,38 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
   }
 
   /**
-   * @brief Enable version guessing with SESSION scope, deliberately not GLOBAL.
+   * @brief Assert the user's own session can read this table, which is what Sirius relies on.
    *
-   * pyiceberg's SqlCatalog writes no version-hint, so reading these tables needs this. The
-   * scope is the point: a plain SET applies to THIS connection only. The delete gate's probe
-   * opens its own fresh Connection, which does not inherit it — so if the probe does not set
-   * the flag itself, the probe errors, the conservative "any failure => decline" fires, and
-   * the case below routes plan_fallback instead of gpu.
+   * pyiceberg's SqlCatalog writes no `version-hint.text`, so reading these tables needs
+   * `unsafe_enable_version_guessing`. These cases used to `SET` it, and Sirius's metadata
+   * connection used to force it on -- both because an older extension build defaulted it OFF.
    *
-   * That makes `SET` + a gpu route assertion the direct test for the probe fix. Using SET
-   * GLOBAL here would reach the probe's connection too and silently destroy that coverage.
+   * It is ON by default in the build this branch targets, and that is a per-build fact that has
+   * already flipped once:
+   *
+   *     iceberg 75726455 (DuckDB v1.5.4) -> default false
+   *     iceberg 45163a28 (DuckDB v1.5.5) -> default true    <- kVerifiedIcebergVersion
+   *
+   * So Sirius must not be the thing that makes these tables legible. It mirrors the session's
+   * value rather than forcing one, which means the precondition is exactly this: the OUTER
+   * connection can already read the table. That is what this asserts -- deliberately not the
+   * flag's value, which is the extension's business and is the part that moved.
+   *
+   * If a future build defaults it off again, this fails HERE naming the cause, instead of every
+   * conformance case re-routing to plan_fallback and reading like a Sirius gate bug.
    */
-  void enable_version_guessing_session_scope()
+  void require_session_can_read(const std::string& table_path)
   {
-    auto r = con->Query("SET unsafe_enable_version_guessing = true;");
+    auto r = con->Query("SELECT count(*) FROM iceberg_scan('" + table_path + "');");
     REQUIRE(r);
-    REQUIRE_FALSE(r->HasError());
+    if (r->HasError()) {
+      auto flag = con->Query("SELECT current_setting('unsafe_enable_version_guessing');");
+      FAIL("this session cannot read conformance table '"
+           << table_path << "': " << r->GetError() << "\nunsafe_enable_version_guessing is "
+           << (flag && !flag->HasError() ? flag->GetValue(0, 0).ToString() : "unreadable")
+           << "; the corpus has no version-hint, and Sirius deliberately does not force that flag "
+              "on. Check the loaded iceberg build against kVerifiedIcebergVersion.");
+    }
   }
 
   std::string v1_path;
@@ -839,10 +855,10 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 {
   // The baseline. No evolution, no deletes — so if this ever declines, the gate has begun
   // over-refusing. It is also the case that proves the delete-gate probe can read a table
-  // with no version hint: pyiceberg's SqlCatalog writes none, and before the probe set
-  // unsafe_enable_version_guessing on its own connection this table was refused with the
-  // message that it had equality-delete files, having zero delete files.
-  enable_version_guessing_session_scope();
+  // with no version hint: pyiceberg's SqlCatalog writes none. Sirius does not force
+  // unsafe_enable_version_guessing on its metadata connection, so the session must already be
+  // able to read this table -- asserted rather than assumed.
+  require_session_can_read(conf_append_only_path);
   REQUIRE(delete_file_count(conf_append_only_path) == 0);
   expect_iceberg_rows(
     "SELECT id, name FROM " + pinned_scan(conf_append_only_path) + " ORDER BY id;",
@@ -878,7 +894,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - conformance dropped-and-re-added column reads NULL",
                  "[integration][gpu_execution][iceberg]")
 {
-  enable_version_guessing_session_scope();
+  require_session_can_read(conf_drop_readd_path);
   expect_iceberg_rows(
     "SELECT id, x, y FROM iceberg_scan('" + conf_drop_readd_path + "') ORDER BY id;",
     gpu_route::plan_fallback,
@@ -897,7 +913,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - conformance renamed column declines at plan time",
                  "[integration][gpu_execution][iceberg]")
 {
-  enable_version_guessing_session_scope();
+  require_session_can_read(conf_rename_col_path);
   expect_iceberg_rows(
     "SELECT id, value FROM " + pinned_scan(conf_rename_col_path) + " ORDER BY id;",
     gpu_route::plan_fallback,
@@ -911,7 +927,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - conformance added column declines at plan time",
                  "[integration][gpu_execution][iceberg]")
 {
-  enable_version_guessing_session_scope();
+  require_session_can_read(conf_add_column_path);
   expect_iceberg_rows(
     "SELECT id, a, b FROM " + pinned_scan(conf_add_column_path) + " ORDER BY id;",
     gpu_route::plan_fallback,
@@ -957,6 +973,28 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   // just returns the file's narrower type. Only comparing the TYPE catches it.
   auto const path =
     (get_project_root() / "test/cpp/integration/data/iceberg_v1_promoted_type").string();
+  expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
+                      gpu_route::plan_fallback,
+                      {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - reordered data file declines",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // The same two fields with the same ids and types, stored in the opposite physical order. This
+  // is a VALID Iceberg table -- ids identify fields, so order carries no meaning, and DuckDB reads
+  // it BY_FIELD_ID and returns the snapshot's order.
+  //
+  // The GPU path does not: for a full `SELECT *` build_scan_plan installs no reader projection, so
+  // cuDF emits the file's order while the rest of the plan expects the bound snapshot's. `fruit`
+  // and `count` are castable to each other's declared types, so nothing throws -- the values come
+  // back swapped and converted. A (name, field id) membership comparison cannot see it; only
+  // comparing the ORDER can.
+  //
+  // Declining a valid layout is the gate's fail-closed bias, and DuckDB returns the right rows.
+  auto const path =
+    (get_project_root() / "test/cpp/integration/data/iceberg_v1_reordered").string();
   expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(path) + " ORDER BY count;",
                       gpu_route::plan_fallback,
                       {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}});

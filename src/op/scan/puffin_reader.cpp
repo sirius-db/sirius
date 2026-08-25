@@ -397,9 +397,23 @@ void validate_footer_descriptor(std::ifstream& f,
     }
   }
 
-  // Required for every blob, but its contents are unconstrained for a deletion vector.
-  if (duckdb_yyjson::yyjson_obj_get(descriptor, "fields") == nullptr) {
+  // Required for every blob. Puffin constrains it to a list of field ids; a deletion vector puts
+  // no meaning in the contents, but a descriptor that spells it as anything other than an array of
+  // integers is not a Puffin blob descriptor and should not be read as one.
+  auto* fields = duckdb_yyjson::yyjson_obj_get(descriptor, "fields");
+  if (fields == nullptr) {
     throw std::runtime_error("[puffin] Blob descriptor in " + ref.puffin_path + " has no 'fields'");
+  }
+  if (!duckdb_yyjson::yyjson_is_arr(fields)) {
+    throw std::runtime_error("[puffin] Blob descriptor in " + ref.puffin_path +
+                             " spells 'fields' as something other than a JSON array");
+  }
+  size_t const n_fields = duckdb_yyjson::yyjson_arr_size(fields);
+  for (size_t i = 0; i < n_fields; ++i) {
+    if (!duckdb_yyjson::yyjson_is_int(duckdb_yyjson::yyjson_arr_get(fields, i))) {
+      throw std::runtime_error("[puffin] Blob descriptor in " + ref.puffin_path +
+                               " has a non-integer element at 'fields'[" + std::to_string(i) + "]");
+    }
   }
 
   // An explicit JSON null is how some writers spell "absent", so only a real codec is a problem.
@@ -426,7 +440,7 @@ void validate_footer_descriptor(std::ifstream& f,
     throw std::runtime_error("[puffin] Blob descriptor in " + ref.puffin_path +
                              " has no cardinality property");
   }
-  if (ref.record_count >= 0 && cardinality != std::to_string(ref.record_count)) {
+  if (cardinality != std::to_string(ref.record_count)) {
     throw std::runtime_error("[puffin] Blob at offset " + std::to_string(ref.content_offset) +
                              " in " + ref.puffin_path + " declares cardinality " + cardinality +
                              ", but its manifest entry records " +
@@ -447,6 +461,23 @@ std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref)
     throw std::runtime_error(
       "[puffin] Invalid offset/size: offset=" + std::to_string(content_offset) +
       " size=" + std::to_string(content_size_in_bytes));
+  }
+
+  // Bound the decode BEFORE opening the file, and on a constant rather than on anything the table
+  // wrote. `record_count` is a required manifest field; absent, both cardinality cross-checks
+  // below are vacuous and the expansion is unbounded.
+  if (record_count < 0) {
+    throw std::runtime_error(
+      "[puffin] Manifest entry for the deletion vector at offset " +
+      std::to_string(content_offset) + " in " + puffin_path +
+      " carries no record_count, so neither its footer cardinality nor its decoded position count "
+      "can be checked against anything, and nothing bounds how far the blob may expand");
+  }
+  if (record_count > kMaxDeletionVectorPositions) {
+    throw std::runtime_error(
+      "[puffin] Deletion vector at offset " + std::to_string(content_offset) + " in " +
+      puffin_path + " declares " + std::to_string(record_count) + " deleted positions, above the " +
+      std::to_string(kMaxDeletionVectorPositions) + " this reader will materialize while planning");
   }
 
   // Apache manifests record URIs; this reader bypasses sirius_ioctx, so nothing else strips them.
@@ -549,11 +580,9 @@ std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref)
                              ") in " + puffin_path);
   }
 
-  // The decoded count is already required to equal record_count, so anything beyond it is corrupt
-  // by definition. Absent that, an absolute cap on what may be materialized while planning.
-  static constexpr size_t kMaxPositionsWithoutRecordCount = 32u * 1024u * 1024u;
-  size_t const max_positions =
-    record_count >= 0 ? static_cast<size_t>(record_count) : kMaxPositionsWithoutRecordCount;
+  // Validated against kMaxDeletionVectorPositions above, so this is a bounded budget and not a
+  // number the table chose. The decoded count is separately required to EQUAL it.
+  size_t const max_positions = static_cast<size_t>(record_count);
 
   std::vector<int64_t> positions;
 
@@ -562,6 +591,17 @@ std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref)
     int32_t key = read_i32_le(p);
     p += 4;
     roaring_len -= 4;
+
+    // A negative key widens to [0x80000000, 0xffffffff] and the shift then sets bit 63, so every
+    // position assembled under it is negative. positional_delete_filter binary-searches a sorted
+    // list against non-negative row offsets, so those entries match nothing and their deletes are
+    // silently dropped -- and the record_count check cannot see it, because the COUNT is right.
+    // Puffin positions are non-negative 64-bit, so such a key is out of range by construction.
+    if (key < 0) {
+      throw std::runtime_error("[puffin] Bitmap key " + std::to_string(key) + " in " + puffin_path +
+                               " has bit 31 set, which would encode a row position at or above "
+                               "2^63; deletion-vector positions are non-negative");
+    }
 
     int64_t high = static_cast<int64_t>(static_cast<uint32_t>(key)) << 32;
 

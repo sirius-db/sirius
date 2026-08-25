@@ -22,6 +22,20 @@
 
 namespace sirius::op::scan {
 
+/// Hard ceiling on the positions one deletion vector may decode into, independent of anything the
+/// table says about itself.
+///
+/// A Roaring run container costs 4 bytes on disk and expands to up to 65,536 positions, so a
+/// sub-megabyte blob can ask for tens of gigabytes of host memory. The manifest's `record_count`
+/// and the Puffin footer's `cardinality` are cross-checked against each other, but BOTH are
+/// written by the table, so neither can be the allocation bound: a table declaring 5e9 in both
+/// places passes every consistency check and still OOM-kills the planning thread.
+///
+/// 32M deleted positions in a single data file is already far past any real table, and a valid
+/// vector above this bound is DECLINED (the scan falls back to DuckDB, which streams) rather than
+/// letting file metadata size a plan-time allocation.
+inline constexpr int64_t kMaxDeletionVectorPositions = 32LL * 1024 * 1024;
+
 /// What a manifest entry claims about the deletion vector it points at. The reader checks every
 /// field against the Puffin footer, so a wrong pointer is caught rather than silently followed.
 struct DeletionVectorRef {

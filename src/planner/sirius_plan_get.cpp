@@ -40,6 +40,7 @@
 #include "io/uri_parser.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_mvcc_visibility.hpp"
+#include "op/scan/iceberg_metadata_connection.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -125,26 +126,34 @@ using iceberg_field_key = std::pair<std::string, int32_t>;
 using iceberg_field_map = std::map<iceberg_field_key, std::string>;
 
 /// Descends into children so nested fields count toward the schema each file must match.
+///
+/// @p order receives the same ids in recursive PREORDER — the walk order is load-bearing, because
+/// it is what a file's physical layout is compared against.
 void collect_field_id_names(std::vector<duckdb::MultiFileColumnDefinition> const& columns,
-                            iceberg_field_map& out)
+                            iceberg_field_map& out,
+                            std::vector<int32_t>& order)
 {
   for (auto const& column : columns) {
     if (!column.identifier.IsNull() &&
         column.identifier.type().id() == duckdb::LogicalTypeId::INTEGER) {
-      out.emplace(iceberg_field_key{column.name, column.identifier.GetValue<int32_t>()},
+      auto const id = column.identifier.GetValue<int32_t>();
+      out.emplace(iceberg_field_key{column.name, id},
                   column.children.empty() ? column.type.ToString() : std::string{});
+      order.push_back(id);
     }
-    collect_field_id_names(column.children, out);
+    collect_field_id_names(column.children, out, order);
   }
 }
 
 /**
  * @brief Refuse tables whose data files do not all carry the table's current (name, field id,
- *        type) schema.
+ *        type) schema, in the same physical ORDER.
  *
- * The scan resolves columns by NAME, so every evolution mis-reads: rename and add throw at SCAN
- * time, which takes the runtime fallback and deadlocks the connection, while promotion (int ->
- * long) throws nothing and returns the file's narrower type. Over-declining is the intended bias.
+ * The scan resolves columns by NAME and emits them in the FILE's order, so every evolution
+ * mis-reads: rename and add throw at SCAN time, which takes the runtime fallback and deadlocks the
+ * connection; promotion (int -> long) throws nothing and returns the file's narrower type; and a
+ * permutation returns the right columns under the wrong names. Over-declining is the intended
+ * bias, and a valid-but-declined Iceberg layout is read correctly by DuckDB.
  *
  * Replaced wholesale once columns resolve by field id (DuckDB's MultiFileColumnMapper).
  *
@@ -158,9 +167,11 @@ std::optional<std::string> iceberg_schema_evolution_decline_reason(duckdb::Logic
   if (bind_data == nullptr) { return std::nullopt; }
 
   iceberg_field_map table_schema;
+  std::vector<int32_t> table_field_order;
   collect_field_id_names(
     bind_data->reader_bind.schema.empty() ? bind_data->columns : bind_data->reader_bind.schema,
-    table_schema);
+    table_schema,
+    table_field_order);
   // No field ids at all means a name-mapped table, which is what this path already assumes.
   if (table_schema.empty()) { return std::nullopt; }
 
@@ -184,26 +195,40 @@ std::optional<std::string> iceberg_schema_evolution_decline_reason(duckdb::Logic
 
   // Do NOT filter `field_id IS NOT NULL` here: that drops every row of a file that has no ids,
   // and a file with no rows is indistinguishable from one that was never probed.
-  auto result = conn.Query("SELECT file_name, name, field_id, duckdb_type FROM parquet_schema(" +
-                           file_list + ")");
+  // column_id is the row's index into the Parquet footer's flattened schema, i.e. its position in
+  // the file's own recursive preorder. It is how physical ORDER is compared, which membership in a
+  // (name, field id) map cannot see.
+  auto result =
+    conn.Query("SELECT file_name, name, field_id, duckdb_type, column_id FROM parquet_schema(" +
+               file_list + ")");
   if (!result || result->HasError()) {
     return "the iceberg schema probe could not read this table's data-file footers (" +
            std::string(result ? result->GetError() : "null result") +
            "), so the files could not be proven to carry the table's current schema";
   }
 
-  std::map<std::string, iceberg_field_map> per_file;
+  struct file_footer {
+    iceberg_field_map schema;
+    /// (column_id, field_id) for every ID-bearing footer row, sorted into physical order below.
+    std::vector<std::pair<int64_t, int32_t>> id_order;
+  };
+  std::map<std::string, file_footer> per_file;
   while (true) {
     auto chunk = result->Fetch();
     if (!chunk || chunk->size() == 0) { break; }
     for (duckdb::idx_t i = 0; i < chunk->size(); ++i) {
-      auto& file_schema = per_file[chunk->GetValue(0, i).ToString()];
-      auto const id     = chunk->GetValue(2, i);
+      auto& footer  = per_file[chunk->GetValue(0, i).ToString()];
+      auto const id = chunk->GetValue(2, i);
+      // A row with no field id is either the schema root or a synthetic nesting level (a 3-level
+      // list's `list` group, a map's `key_value`); neither is a field the table declares.
       if (id.IsNull()) { continue; }
-      auto const type = chunk->GetValue(3, i);
-      file_schema.emplace(iceberg_field_key{chunk->GetValue(1, i).ToString(),
-                                            static_cast<int32_t>(id.GetValue<int64_t>())},
-                          type.IsNull() ? std::string{} : type.ToString());
+      auto const type     = chunk->GetValue(3, i);
+      auto const field_id = static_cast<int32_t>(id.GetValue<int64_t>());
+      footer.schema.emplace(iceberg_field_key{chunk->GetValue(1, i).ToString(), field_id},
+                            type.IsNull() ? std::string{} : type.ToString());
+      auto const column_id = chunk->GetValue(4, i);
+      footer.id_order.emplace_back(column_id.IsNull() ? 0 : column_id.GetValue<int64_t>(),
+                                   field_id);
     }
   }
 
@@ -214,7 +239,7 @@ std::optional<std::string> iceberg_schema_evolution_decline_reason(duckdb::Logic
              "' returned no Parquet schema rows, so it could not be proven to carry the table's "
              "current schema";
     }
-    auto const& file_schema = it->second;
+    auto const& file_schema = it->second.schema;
     if (file_schema.empty()) {
       return "iceberg_scan data file '" + path +
              "' carries no Parquet field ids while the table's schema declares them, so it is "
@@ -246,6 +271,27 @@ std::optional<std::string> iceberg_schema_evolution_decline_reason(duckdb::Logic
              " field ids where the table declares " + std::to_string(table_schema.size()) +
              ", so the table's schema has evolved; this scan path resolves columns by name and "
              "would read the wrong column or fail at scan time";
+    }
+
+    // Everything above is MEMBERSHIP, which a permuted file satisfies. Order matters because the
+    // GPU path does not map columns by field id: for a full `SELECT *`, build_scan_plan leaves
+    // needs_reader_projection false, so cuDF emits columns in the first footer's order while the
+    // rest of the plan expects the bound snapshot's. DuckDB's own reader uses BY_FIELD_ID and is
+    // unaffected, so the two disagree silently -- and a castable permutation converts the values
+    // rather than erroring, since the runtime schema check only logs. Nested children are included
+    // because a reordered struct child fails the same way.
+    auto id_order = it->second.id_order;
+    std::sort(id_order.begin(), id_order.end());
+    std::vector<int32_t> file_field_order;
+    file_field_order.reserve(id_order.size());
+    for (auto const& [column_id, field_id] : id_order) {
+      file_field_order.push_back(field_id);
+    }
+    if (file_field_order != table_field_order) {
+      return "iceberg_scan data file '" + path +
+             "' stores the table's fields in a different physical order than the bound snapshot's "
+             "schema declares; this scan path emits columns in the file's own order and would hand "
+             "back the right columns under the wrong names";
     }
   }
 
@@ -375,23 +421,12 @@ std::optional<std::string> iceberg_gpu_scan_decline_reason(duckdb::LogicalGet& o
     }
     duckdb::SiriusContext::InternalQueryGuard guard(context);
 
-    duckdb::Connection conn(*context.db);
-    // Per-connection bracket: guarding `context` above does not cover this fresh connection.
-    // Without it the probe contends for the plan-generation slot the outer query holds, fails,
-    // and "any failure declines" then refuses every table.
-    duckdb::SiriusContext::InternalQueryGuard conn_guard(*conn.context);
-    // The probe runs on a FRESH connection, which does not inherit the session's settings. Without
-    // this, a table whose metadata carries no version hint fails the probe outright — and because
-    // any failure declines, a table with ZERO delete files was refused and told it had equality
-    // deletes. Only a user who had typed `SET GLOBAL unsafe_enable_version_guessing` (global scope
-    // reaches new connections; plain `SET` does not) ever got past this.
-    //
-    // Matches discover_from_manifests (iceberg_metadata_reader.cpp), which sets it on its own
-    // connection for the same reason. Both read the same manifests through iceberg_metadata(), so
-    // they must agree on which tables are legible; if they disagree, the gate's verdict is about a
-    // different table than the one the scan goes on to read.
-    conn.Query("SET unsafe_enable_version_guessing = true");
-    auto result = conn.Query(query);
+    // See iceberg_metadata_connection: one entry point, shared with discover_from_manifests so
+    // both agree on which tables are legible, and pinned to the same snapshot the scan was bound
+    // to. It mirrors the session's `unsafe_enable_version_guessing` rather than forcing it; a
+    // table the outer session cannot read fails here and the decline below sends it to DuckDB.
+    sirius::op::scan::iceberg_metadata_connection metadata_conn(context);
+    auto result = metadata_conn.Query(query);
     if (!result || result->HasError()) {
       SIRIUS_LOG_DEBUG("[sirius_plan_get] iceberg delete probe failed for '{}': {} — CPU fallback",
                        table_path,
@@ -419,7 +454,9 @@ std::optional<std::string> iceberg_gpu_scan_decline_reason(duckdb::LogicalGet& o
     // Reuses this connection deliberately: it is already bracketed as an internal query, and a
     // third Connection here would re-register the same SiriusContext underneath the query being
     // planned.
-    if (auto reason = iceberg_schema_evolution_decline_reason(op, conn)) { return reason; }
+    if (auto reason = iceberg_schema_evolution_decline_reason(op, metadata_conn.get())) {
+      return reason;
+    }
 
     return std::nullopt;
   } catch (std::exception const& e) {

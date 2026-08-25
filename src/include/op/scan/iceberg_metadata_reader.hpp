@@ -101,7 +101,11 @@ EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
  *
  * @param metadata_ioctx Routes the equality-delete parquet and footer reads. Single-GPU is
  *                       sufficient (planning-time reads). Must outlive the call; nullptr throws.
- * @param snapshot_id    Latest if omitted.
+ * @param snapshot_id    The snapshot the SCAN was bound to. Callers on the GPU path always pass
+ *                       one: an unpinned iceberg_scan is declined at plan time precisely so that
+ *                       this pass cannot resolve "current" independently and pair one snapshot's
+ *                       data files with another's deletes. Omitting it reads whatever is current
+ *                       now, which is correct only when no bound scan depends on the answer.
  */
 std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
   duckdb::ClientContext& context,

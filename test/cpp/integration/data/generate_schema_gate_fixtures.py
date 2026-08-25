@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build fixtures for the two holes the (name, field id) schema probe used to have.
+"""Build fixtures for the three holes the (name, field id) schema probe used to have.
 
 Run from the repo root:
     python3 test/cpp/integration/data/generate_schema_gate_fixtures.py
@@ -24,6 +24,14 @@ without any manifest saying so.
       scan reads the file's own physical type and hands back a column narrower than the plan
       declared. The probe must therefore compare the TYPE as well.
 
+  iceberg_v1_reordered      the same two fields, in the opposite physical order.
+      Iceberg identifies fields by id, so a file may store them in any order and the table is
+      entirely valid -- DuckDB reads it with BY_FIELD_ID and returns the snapshot's order. The
+      probe compared MEMBERSHIP in a (name, field id) map, which a permutation satisfies exactly.
+      For a full `SELECT *` the GPU path installs no reader projection, so cuDF emits columns in
+      the FILE's order while the rest of the plan expects the bound snapshot's: the values come
+      back under each other's names, and because the types here are castable nothing throws.
+
 Hand-forged rather than produced by pyiceberg for the same reason as the retired-entry fixtures:
 pyiceberg writes neither an id-less data file for a table whose schema has ids, nor a table left
 mid-promotion. Both are states real engines produce and readers must handle.
@@ -38,7 +46,57 @@ import sys
 
 DATA = pathlib.Path(__file__).resolve().parent
 SOURCE = "iceberg_v1"
-DUCKDB = pathlib.Path("duckdb/build/release/duckdb")
+
+# Candidates in preference order. `duckdb/build/release/duckdb` is the trap: it is written by
+# DuckDB's OWN build, survives every `/var/tmp` wipe because it lives inside the repo, and so goes
+# stale by whole DuckDB versions while everything else moves on. A fixture written by one DuckDB
+# version and read by a suite linked against another is not a fixture, it is a coincidence -- and
+# the same stale binary, used as an oracle for whether a table needs a setting, will answer for a
+# different iceberg extension build than the tests resolve. Hence require_duckdb() below.
+DUCKDB_CANDIDATES = [
+    pathlib.Path("build/release/duckdb"),
+    pathlib.Path("duckdb/build/release/duckdb"),
+]
+
+
+def submodule_version() -> str:
+    """The version the suite links against, from the duckdb submodule's own tag."""
+    out = subprocess.run(
+        ["git", "-C", "duckdb", "describe", "--tags"], capture_output=True, text=True
+    )
+    if out.returncode != 0:
+        sys.exit(f"cannot read the duckdb submodule version:\n{out.stderr}")
+    return out.stdout.strip().split("-")[0]
+
+
+def require_duckdb() -> pathlib.Path:
+    """Pick a CLI and REFUSE one whose version differs from the submodule's."""
+    wanted = submodule_version()
+    tried = []
+    for candidate in DUCKDB_CANDIDATES:
+        if not candidate.exists():
+            tried.append(f"  {candidate} -- not built")
+            continue
+        out = subprocess.run(
+            [str(candidate), "-noheader", "-list", "-c", "SELECT version();"],
+            capture_output=True,
+            text=True,
+        )
+        found = out.stdout.strip()
+        if out.returncode == 0 and found == wanted:
+            return candidate
+        tried.append(
+            f"  {candidate} -- reports {found or out.stderr.strip()!r}, want {wanted}"
+        )
+    sys.exit(
+        "no DuckDB CLI matching the submodule ("
+        + wanted
+        + ") was found:\n"
+        + "\n".join(tried)
+        + "\n\nBuild one (`pixi run make release`) rather than using a stale binary: these "
+        "fixtures are read by a suite linked against " + wanted + "."
+    )
+
 
 # (destination, SELECT list rewriting the data file, COPY options)
 # Iceberg's own mechanism for reading a file that carries no field ids: the table property maps
@@ -64,6 +122,12 @@ FIXTURES = [
         "FORMAT PARQUET, FIELD_IDS {fruit: 1, count: 2}",
         {},
     ),
+    (
+        "iceberg_v1_reordered",
+        "count, fruit",
+        "FORMAT PARQUET, FIELD_IDS {fruit: 1, count: 2}",
+        {},
+    ),
 ]
 
 
@@ -77,10 +141,10 @@ def data_file(table: pathlib.Path) -> pathlib.Path:
 
 
 def duckdb_sql(sql: str) -> str:
-    if not DUCKDB.exists():
-        sys.exit(f"{DUCKDB} not found -- build it first (make release)")
     out = subprocess.run(
-        [str(DUCKDB), "-noheader", "-list", "-c", sql], capture_output=True, text=True
+        [str(require_duckdb()), "-noheader", "-list", "-c", sql],
+        capture_output=True,
+        text=True,
     )
     if out.returncode != 0:
         sys.exit(f"duckdb failed:\n{out.stderr}")
@@ -178,8 +242,13 @@ def verify(dst_name: str) -> bool:
     print(f"{dst_name}:\n{rows}")
     if dst_name == "iceberg_v1_no_field_ids":
         ok = "NULL" in rows and "|1|" not in rows
-    else:
+    elif dst_name == "iceberg_v1_promoted_type":
         ok = "count|2|INTEGER" in rows
+    else:
+        # Order is the whole fixture, so assert the ORDER of the rows: parquet_schema() returns
+        # the footer's flattened schema in its own preorder. Membership is deliberately unchanged.
+        names = [line.split("|")[0] for line in rows.splitlines()]
+        ok = names == ["count", "fruit"]
     print("  OK" if ok else "  UNEXPECTED")
     return ok
 

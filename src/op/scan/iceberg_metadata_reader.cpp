@@ -29,7 +29,9 @@
 #include <duckdb/main/connection.hpp>
 #include <duckdb/transaction/meta_transaction.hpp>
 #include <io/sirius_datasource.hpp>
+#include <io/uri_parser.hpp>
 #include <log/logging.hpp>
+#include <op/scan/iceberg_metadata_connection.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
 #include <op/scan/puffin_reader.hpp>
 #include <sirius_context.hpp>
@@ -38,6 +40,7 @@
 #include <atomic>
 #include <mutex>
 #include <numeric>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -68,6 +71,13 @@ struct IcebergDeleteFileEntry {
   [[nodiscard]] bool has_complete_descriptor() const
   {
     return content_offset >= 0 && content_size_in_bytes > 0;
+  }
+
+  /// Whether this vector's decode is bounded. `record_count` is a required manifest field: absent,
+  /// both cardinality cross-checks compare against nothing and the Roaring expansion is unbounded.
+  [[nodiscard]] bool has_decodable_record_count() const
+  {
+    return record_count >= 0 && record_count <= kMaxDeletionVectorPositions;
   }
 };
 
@@ -149,6 +159,18 @@ std::vector<IcebergDeleteFileEntry> read_deletion_vectors_from_manifest(
                                  "' with no referenced_data_file, so the data file its deletes "
                                  "apply to is unknown");
       }
+      // record_count is what bounds the Roaring expansion, and it is a required field. Refuse
+      // here rather than at decode time so the verdict is reached while the plan can still
+      // decline. See kMaxDeletionVectorPositions for why the bound cannot come from the table.
+      if (entry.is_deletion_vector() && !entry.has_decodable_record_count()) {
+        throw std::runtime_error(
+          "[iceberg] Manifest '" + manifest_path + "' lists a live deletion vector at '" +
+          entry.file_path + "' with record_count=" + std::to_string(entry.record_count) +
+          ", which is either absent (leaving its decoded size unchecked and unbounded) or above "
+          "the " +
+          std::to_string(kMaxDeletionVectorPositions) +
+          " positions this reader will materialize while planning");
+      }
       entries.push_back(std::move(entry));
     }
   }
@@ -164,11 +186,10 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
 {
   IcebergManifestDiscovery result;
 
-  duckdb::Connection conn(*context.db);
-  // Per-connection bracket: the caller's guard does not cover this one, and unbracketed these
-  // queries contend for the instance-wide plan slot the query being planned already holds.
-  duckdb::SiriusContext::InternalQueryGuard conn_guard(*conn.context);
-  conn.Query("SET unsafe_enable_version_guessing = true");
+  // See iceberg_metadata_connection for why this is a connection, why it cannot observe a
+  // different snapshot than the bind did, and why it mirrors settings instead of forcing them.
+  iceberg_metadata_connection metadata_conn(context);
+  auto& conn = metadata_conn.get();
 
   std::string query =
     "SELECT content, file_path, manifest_sequence_number, file_format, manifest_path "
@@ -210,6 +231,18 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
   // and materialize_positional_deletes opens the Puffin file once per entry.
   std::unordered_set<std::string> expanded_manifests;
 
+  // Every PUFFIN row iceberg_metadata() reported, as (manifest, vector path). The two queries read
+  // the same manifests by different routes; if the second one comes back without a vector the
+  // first one saw, marking the manifest expanded discards that entry's deletes in silence -- a
+  // fail-OPEN, and deleted rows come back. Checked after the loop because one manifest is expanded
+  // once no matter how many of its rows the discovery query returns.
+  //
+  // Keyed on the MANIFEST too, not the vector path alone: one Puffin file can be referenced from
+  // more than one manifest, and a path-only key would let a manifest that expanded correctly cover
+  // for one that did not.
+  std::set<std::pair<std::string, std::string>> puffin_rows_from_metadata;
+  std::set<std::pair<std::string, std::string>> expanded_vectors;
+
   while (true) {
     auto chunk = meta_result->Fetch();
     if (!chunk || chunk->size() == 0) break;
@@ -224,9 +257,12 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
         if (file_format == kFormatPuffin) {
           // iceberg_metadata() omits the V3 fields, so re-read the manifest via read_avro.
           auto manifest_path = chunk->GetValue(4, i).ToString();
+          puffin_rows_from_metadata.emplace(manifest_path, sirius::io::strip_file_scheme(filepath));
           if (expanded_manifests.insert(manifest_path).second) {
             for (auto& dv : read_deletion_vectors_from_manifest(conn, manifest_path)) {
               if (dv.is_deletion_vector()) {
+                expanded_vectors.emplace(manifest_path,
+                                         sirius::io::strip_file_scheme(dv.file_path));
                 result.deletion_vector_entries.push_back(std::move(dv));
               }
             }
@@ -254,6 +290,23 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
           "'; this scan path knows only POSITION_DELETES, EQUALITY_DELETES and EXISTING (data), "
           "and guessing which one it resembles would risk applying or skipping deletes wrongly");
       }
+    }
+  }
+
+  // Hold the read_avro pass to what iceberg_metadata() reported. Under-delivery is the dangerous
+  // direction and the only one checked: a vector the discovery query saw but the manifest pass did
+  // not return (it read a different content kind, the entry was not spelled as PUFFIN, or the
+  // manifest came back empty) would otherwise be dropped with no error. Over-delivery is safe --
+  // read_avro returns a whole manifest at once, so it legitimately sees vectors whose discovery
+  // rows are still ahead in the result.
+  for (auto const& [manifest_path, vector_path] : puffin_rows_from_metadata) {
+    if (expanded_vectors.count({manifest_path, vector_path}) == 0) {
+      throw std::runtime_error(
+        "[iceberg] iceberg_metadata() reports a live deletion vector at '" + vector_path +
+        "' in manifest '" + manifest_path + "' for table '" + table_path +
+        "', but re-reading that manifest did not return the vector; the two metadata passes "
+        "disagree about which deletes are live, and proceeding would drop this vector's deleted "
+        "rows back into the result");
     }
   }
 
