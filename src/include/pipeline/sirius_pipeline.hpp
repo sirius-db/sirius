@@ -23,6 +23,7 @@
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/pipeline_build_context.hpp"
+#include "pipeline/pipeline_memory_history.hpp"
 #include "telemetry-bridge/gen/uuid.rs.h"
 
 #include <nvtx3/nvtx3.hpp>
@@ -216,6 +217,14 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   [[nodiscard]] uuid::UUID pipeline_uuid() const { return _pipeline_uuid; }
 
+  //! Completed-task memory and size history, owned here so upstream estimators can access it
+  //! through `port::src_pipeline`.
+  [[nodiscard]] pipeline_memory_history& get_memory_history() noexcept { return _memory_history; }
+  [[nodiscard]] const pipeline_memory_history& get_memory_history() const noexcept
+  {
+    return _memory_history;
+  }
+
   //! The SiriusContext-wide telemetry context carried in this pipeline's build
   //! context (set at convert time in sirius_engine). Operators read it via
   //! sirius_physical_operator::get_telemetry_context() to build data_batch probes.
@@ -274,6 +283,9 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   std::atomic<std::size_t> tasks_created   = 0;
   std::atomic<std::size_t> tasks_completed = 0;
+
+  //! Completed-task history; see get_memory_history().
+  pipeline_memory_history _memory_history;
 
   //! NVTX process-wide range tracking the pipeline's active lifetime
   std::atomic<bool> _nvtx_range_started{false};

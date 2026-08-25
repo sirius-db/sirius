@@ -97,9 +97,16 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
    *
    * Used to record and query historical memory consumption patterns so that
    * future tasks can make better reservation estimates.
+   * Delegates to the pipeline-owned history; uses detached history when tests provide no pipeline.
    */
-  pipeline_memory_history& get_memory_history() { return _memory_history; }
-  const pipeline_memory_history& get_memory_history() const { return _memory_history; }
+  pipeline_memory_history& get_memory_history()
+  {
+    return _pipeline ? _pipeline->get_memory_history() : _detached_memory_history;
+  }
+  const pipeline_memory_history& get_memory_history() const
+  {
+    return _pipeline ? _pipeline->get_memory_history() : _detached_memory_history;
+  }
 
   /**
    * @brief Set the preferred GPU device ID for this pipeline's tasks.
@@ -133,9 +140,10 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
 
  private:
   duckdb::shared_ptr<sirius_pipeline> _pipeline;  ///< Shared pointer to the GPU pipeline to execute
-  pipeline_memory_history _memory_history;        ///< Historical memory metrics for estimation
-  std::optional<int> _preferred_device_id;        ///< Pipeline-level preferred GPU device
-  exec::queue_priority _priority{0};              ///< Pipeline-level scheduling priority
+  /// Test fallback when @c _pipeline is null.
+  pipeline_memory_history _detached_memory_history;
+  std::optional<int> _preferred_device_id;  ///< Pipeline-level preferred GPU device
+  exec::queue_priority _priority{0};        ///< Pipeline-level scheduling priority
   std::shared_ptr<const telemetry::telemetry_context>
     _telemetry_context;  ///< SiriusContext telemetry
 };

@@ -624,7 +624,10 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
       }
     }
     auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
-    global.get_memory_history().record({input_basis, peak_bytes, output_bytes});
+    // Mid-pipeline retries use intermediate input units and must not affect the aggregate ratio.
+    // An OOM before processing restarts at index 0 with the original input and remains eligible.
+    bool const ratio_eligible = local_state._start_operator_index == 0;
+    global.get_memory_history().record({input_basis, peak_bytes, output_bytes, ratio_eligible});
     SIRIUS_LOG_TRACE(
       "[GPU:{}] Pipeline {}: memory history record - task={}, input_basis={}, output_bytes={}, "
       "reservation_bytes={}, peak_bytes={}, peak_bytes_to_materialize_input={}",

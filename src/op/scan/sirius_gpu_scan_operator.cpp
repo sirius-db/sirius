@@ -26,6 +26,7 @@
 #include <op/scan/sirius_gpu_scan_operator.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <op/sirius_physical_operator.hpp>
+#include <pipeline/data_size_estimator.hpp>
 #include <scan_manager/split_connector.hpp>
 #include <sirius/exception.hpp>
 #include <sirius_context.hpp>
@@ -47,6 +48,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -258,6 +260,26 @@ std::optional<task_creation_hint> sirius_gpu_scan_operator::get_next_task_hint()
 
 bool sirius_gpu_scan_operator::all_ports_empty() { return _split_connector->is_closed(); }
 
+std::optional<std::size_t> sirius_gpu_scan_operator::total_source_input_bytes() const
+{
+  if (!_split_connector->is_discovery_complete()) { return std::nullopt; }
+  // An unsized split may still emit rows, so discovered bytes are not a total.
+  if (_split_connector->has_unsized_splits()) { return std::nullopt; }
+  return _split_connector->discovered_bytes();
+}
+
+std::optional<std::size_t> sirius_gpu_scan_operator::total_source_output_bytes() const
+{
+  std::size_t rows  = 0;
+  std::size_t bytes = 0;
+  {
+    std::lock_guard<std::mutex> guard(_emitted_mutex);
+    rows  = _emitted_rows;
+    bytes = _emitted_bytes;
+  }
+  return pipeline::project_source_output_bytes(estimated_cardinality, rows, bytes);
+}
+
 std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input_data()
 {
   auto next = _split_connector->get_next_split();
@@ -351,8 +373,21 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
                                                mem_space->get_default_allocator());
     }
   }
+
+  // Read the size before moving the table into a batch to avoid locking the batch. Publish rows
+  // and bytes together because they form one sample.
+  auto const emitted_rows  = static_cast<std::size_t>(output_table->num_rows());
+  auto const emitted_bytes = output_table->alloc_size();
+
   auto batch =
     sirius::make_data_batch(std::move(output_table), *mem_space, stream, batch_telemetry());
+  // Published only after make_data_batch succeeds: an OOM there reschedules the task into
+  // re-running the same split, and these bytes floor total_source_output_bytes().
+  {
+    std::lock_guard<std::mutex> guard(_emitted_mutex);
+    _emitted_rows += emitted_rows;
+    _emitted_bytes += emitted_bytes;
+  }
   std::vector<std::shared_ptr<::cucascade::data_batch>> batches{std::move(batch)};
   return std::make_unique<pipelineable_operator_data>(std::move(batches));
 }
