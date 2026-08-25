@@ -18,8 +18,12 @@
 
 #include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
 
+// libcudf's AST header uses std::variant without including <variant>.
+// clang-format off
+#include <variant>
 #include <cudf/ast/ast_operator.hpp>
 #include <cudf/ast/expressions.hpp>
+// clang-format on
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/scalar/scalar.hpp>
