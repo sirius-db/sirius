@@ -293,7 +293,7 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
     // Membership channel for the decode-time snapshot (join builds publish
     // during execution — only a snapshot taken at prepare/decode can see them).
     scan_input->dynamic_filters = _dynamic_filters_channel;
-    scan_input->prefetch(io::cache::prefetching_stage::immediate);
+    scan_input->update(io::cache::scan_stage::queued);
   }
   return std::move(*next);
 }
