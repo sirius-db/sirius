@@ -19,9 +19,8 @@
 #include "exec/bounded_thread_pool.hpp"
 #include "exec/config.hpp"
 #include "exec/inspectable_mpsc.hpp"
+#include "exec/invocable.hpp"
 #include "parallel/task.hpp"
-
-#include <absl/functional/any_invocable.h>
 
 #include <atomic>
 #include <memory>
@@ -140,7 +139,7 @@ class itask_executor {
    * returns nullptr (no per-thread init). Override to set the CUDA device or
    * perform other per-thread setup.
    */
-  virtual absl::AnyInvocable<void() noexcept> get_per_thread_init() { return nullptr; }
+  virtual sirius::exec::invocable<void() noexcept> get_per_thread_init() { return nullptr; }
 
   /**
    * @brief Called from start() after the manager thread is launched.

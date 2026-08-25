@@ -16,7 +16,8 @@
 
 #pragma once
 
-#include <absl/functional/any_invocable.h>
+#include "exec/invocable.hpp"
+
 #include <exec/thread_pool.hpp>
 
 #include <concepts>
@@ -107,7 +108,7 @@ class scoped_dispatcher {
   }
 
  private:
-  using task_t = absl::AnyInvocable<void()>;
+  using task_t = sirius::exec::invocable<void()>;
 
   static void log_exception_ptr(const std::exception_ptr& eptr,
                                 std::source_location loc = std::source_location::current())
