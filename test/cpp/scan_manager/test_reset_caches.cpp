@@ -204,6 +204,49 @@ TEST_CASE("reset_caches is idempotent", "[scan_manager][cache][reset_cache]")
   CHECK(cache->claimed_bytes() == 0);
 }
 
+TEST_CASE("reset_caches reclaims still-resident chunk buffers, not just evicted ones",
+          "[scan_manager][cache][reset_cache]")
+{
+  // claim_some_cache() only attaches buffers (fadvise + prepare_prefetch); unlike
+  // the "replaces a populated cache" test above, nothing here evicts them before
+  // reset_caches() runs. This is the exact shape that used to leak: the old
+  // prefetching_cache destructor tore down _file_cache and _pool without ever
+  // returning a still-resident chunk's buffer to the underlying
+  // fixed_size_host_memory_resource, so the block was gone from its free list
+  // for the rest of the process's life even though the cache object reporting
+  // it was destroyed.
+  temp_data_file file(8ull << 20);  // 8 MiB
+  auto memory   = initialize_memory_manager(1);
+  auto topology = single_gpu_index_for_reset();
+
+  auto* host_space = sirius::scan_test_utils::get_space(*memory, cucascade::memory::Tier::HOST);
+  REQUIRE(host_space != nullptr);
+  auto* host_mr =
+    host_space->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  REQUIRE(host_mr != nullptr);
+
+  sirius_scan_manager manager{
+    config_with_cache(sirius::io::cache::cache_mode::sirius), *memory, topology};
+  REQUIRE(manager.io_ctx()->cache() != nullptr);
+
+  // Baseline AFTER construction: the scan manager's own io/uring buffers are
+  // blocks too, and they legitimately stay held while `manager` is alive. Only
+  // the delta the cache claim adds on top is what a reset has to give back.
+  auto const free_before = host_mr->get_free_blocks();
+
+  REQUIRE(claim_some_cache(manager, file) > 0);
+  // The claim checked real blocks out of the free list -- confirms the test is
+  // actually exercising the resident (non-evicted) case, not a no-op.
+  REQUIRE(host_mr->get_free_blocks() < free_before);
+
+  manager.reset_caches();
+
+  // Every block the populated cache was holding must be back on the free list --
+  // not merely accounted as "reservation released" but actually deallocated
+  // from the shared resource that later resets and queries draw from.
+  CHECK(host_mr->get_free_blocks() == free_before);
+}
+
 TEST_CASE("reset_caches is a no-op where the configuration does not cache",
           "[scan_manager][cache][reset_cache]")
 {

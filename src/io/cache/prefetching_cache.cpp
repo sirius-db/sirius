@@ -314,6 +314,43 @@ void prefetching_cache::drain_inflight_io() noexcept
   drained.wait();
 }
 
+void prefetching_cache::reclaim_all_chunks() noexcept
+{
+  std::unordered_map<int, std::vector<std::byte*>> reclaim_by_numa;
+  std::size_t stuck = 0;
+  {
+    std::unique_lock lk(_map_mtx);
+    for (auto& [_, entry] : _file_cache) {
+      std::unique_lock elk(entry->mtx);
+      for (cached_chunk* c : entry->slots) {
+        if (c == nullptr) { continue; }
+        if (c->state.load().state() == chunk_state::empty) { continue; }
+        // Ignoring subscribers is safe here: no query can be concurrently
+        // executing while a cache is reset/torn down. mark_evicting() still
+        // unconditionally refuses a chunk with an active pin, so this can
+        // never pull a buffer out from under a live reader.
+        if (!c->state.mark_evicting(/*only_unsubscribed=*/false)) {
+          ++stuck;
+          continue;
+        }
+        reclaim_by_numa[c->numa_node].push_back(reinterpret_cast<std::byte*>(c->data));
+        c->data = nullptr;
+        std::ignore = c->state.mark_empty();
+      }
+    }
+    _file_cache.clear();
+  }
+  for (auto& [numa, buffers] : reclaim_by_numa) {
+    if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa); }
+  }
+  if (stuck > 0) {
+    SIRIUS_LOG_WARN(
+      "[prefetching_cache] {} chunk(s) still pinned at cache teardown; their buffers were not "
+      "reclaimed",
+      stuck);
+  }
+}
+
 prefetching_cache::~prefetching_cache()
 {
   _shutting_down.store(true, std::memory_order_release);
@@ -323,6 +360,13 @@ prefetching_cache::~prefetching_cache()
   // to have run before any of it is torn down.
   drain_inflight_io();
   _evictor_thread.join();
+
+  // evict_loop breaks out on the stop signal without reclaiming (see its
+  // shutdown check), so every chunk still resident here would otherwise leak
+  // its buffer out of the underlying fixed_size_host_memory_resource for the
+  // rest of the process's life. Reclaim everything ourselves now that no IO
+  // or evictor activity can race chunk state.
+  reclaim_all_chunks();
 }
 
 // ===========================================================================

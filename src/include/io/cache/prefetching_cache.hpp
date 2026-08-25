@@ -402,6 +402,21 @@ class prefetching_cache {
 
   void evict_loop(const std::stop_token& st);
 
+  /// Teardown-only final sweep: hand every still-resident chunk buffer back to
+  /// @c _pool before it is destroyed. @c evict_loop breaks out on the stop
+  /// signal without reclaiming (see its shutdown check), so without this every
+  /// chunk that was cached/allocated at reset/destruction time would leak its
+  /// block out of the underlying @c fixed_size_host_memory_resource for the
+  /// rest of the process's life -- @c buffer_pool's destructor only releases
+  /// its reservation (a budget claim), not blocks the resource was never told
+  /// to free. Must run after @c drain_inflight_io() and joining the evictor,
+  /// so nothing else can be racing chunk state. Ignores subscriber counts (no
+  /// query can be concurrently executing while a cache is reset/torn down) but
+  /// never reclaims a chunk with an active pin -- @c mark_evicting refuses
+  /// those unconditionally, so this can never pull a buffer out from under a
+  /// live reader; any such chunk is left alone and logged instead.
+  void reclaim_all_chunks() noexcept;
+
   file_entry& get_or_create_file_entry(const io_object& obj);
 
   const config _cfg;

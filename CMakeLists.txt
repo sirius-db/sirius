@@ -753,6 +753,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_pin_table_mvcc_update.cpp
     test/cpp/integration/test_pin_table_type_drift.cpp
     test/cpp/integration/test_pin_table_zone_map_pruning.cpp
+    test/cpp/integration/test_reset_sirius_cache.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/integration/test_transparent_runtime_fallback.cpp
     test/cpp/io/cache/test_chunk_state.cpp
