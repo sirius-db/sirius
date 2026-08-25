@@ -16,6 +16,8 @@
 
 #include "late_mat/materialize.hpp"
 
+#include <nvtx3/nvtx3.hpp>
+
 #include "compression/compressed_representation.hpp"
 #include "late_mat/multi_source_gather.hpp"
 
@@ -281,6 +283,7 @@ std::unique_ptr<cudf::column> materialize(pinned_column_view const& column,
                                           rmm::cuda_stream_view stream,
                                           rmm::device_async_resource_ref mr)
 {
+  nvtx3::scoped_range nvtx_range{"sirius::late_mat::materialize"};
   auto const& layout = selection.layout();
   if (column.batches.size() != layout.num_batches()) {
     throw std::runtime_error(

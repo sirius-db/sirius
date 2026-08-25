@@ -16,6 +16,8 @@
 
 #include "late_mat/port_materialize.hpp"
 
+#include <nvtx3/nvtx3.hpp>
+
 #include "helper/numeric_narrowing.hpp"
 #include "late_mat/materialize.hpp"
 #include "late_mat/prepared_selection.hpp"
@@ -125,6 +127,7 @@ std::unique_ptr<cudf::table> materialize_at_port(port_materialize_directive cons
                                                  rmm::cuda_stream_view stream,
                                                  rmm::device_async_resource_ref mr)
 {
+  nvtx3::scoped_range nvtx_range{"sirius::late_mat::materialize_at_port"};
   if (!port_directive_matches(directive, batch)) {
     throw std::runtime_error(
       "late_mat::materialize_at_port: the batch is not the one this directive was installed for");
