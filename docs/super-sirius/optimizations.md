@@ -295,17 +295,9 @@ and positions are unchanged and every operator in between is unaffected. A direc
 consuming operator gathers the values back out of the pinned chunks, matching its batch by whole
 schema. Both halves install together or not at all. A plan pass reports how far each column travels
 and how many port crossings it survives; a policy with measured floors decides whether the ride
-repays the rowid.
-
-Where the deferred columns are GROUP BY keys, the ride can continue PAST the aggregates and
-materialize at their far side — one row per group instead of one per join match — when a column
-that rides real (or one of the deferred columns itself) is proven distinct over the whole pinned
-table and is a group key at every ridden aggregate. That proof is established once at pin time:
-per chunk, sorted with distinct == rows and pairwise-disjoint value ranges; then, for what that
-leaves undecided, an exact concatenate-sort-count under a row cap. Absence of a fact reads as
-UNKNOWN, never as "not unique". A second pinned table may join the same ride as a rider, carrying
-its own rowid, when its own columns prove it or when it meets the ride's scan on the two sides of
-one join equality with its side proven distinct.
+repays the rowid. Where the deferred columns are GROUP BY keys, the ride can continue past the
+aggregate to materialize one row per group instead of one per join match, subject to a pin-time
+distinctness proof.
 
 **Code path:**
 - `src/planner/late_mat_plan_pass.cpp` — column lifetimes, group-by/top-n/join modelling
