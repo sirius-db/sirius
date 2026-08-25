@@ -240,7 +240,6 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
       "Sirius context is not initialized. Check that SIRIUS_DISABLE is not set "
       "and review extension loading logs for errors.");
   }
-  const sirius::operator_params& op_params = sirius_ctx_ptr->get_config().get_operator_params();
 
   sirius_physical_plan = &plan;
 
@@ -269,13 +268,17 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   } catch (...) {  // best-effort observability
   }
 
-  // Create plan-time build context (decoupled from engine).
+  auto query_operator_params =
+    std::make_shared<sirius::operator_params>(sirius_ctx_ptr->get_config().get_operator_params());
+  query_operator_params->like_swar_fastpath = duckdb::like_swar_fastpath_enabled(context);
+
+  // Create the plan-time context with one immutable snapshot of query policy.
   const pipeline::pipeline_build_context build_ctx{
     sirius_ctx_ptr->get_telemetry_context(),
     duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context),
-    std::move(active_gpu_ids)};
+    std::move(active_gpu_ids),
+    std::move(query_operator_params)};
 
-  // The collector is added after planning, so refresh parent pointers before marking fusion.
   sirius::planner::sirius_physical_plan_generator::set_parent_ops(*sirius_physical_plan,
                                                                   /*parent=*/nullptr);
   sirius::planner::sirius_physical_plan_generator::mark_fusable_merge_pipelines(
@@ -291,7 +294,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   root_pipeline_idx = 0;
 
   // Convert meta-pipelines into execution-ready pipelines
-  pipeline::sirius_pipeline_converter converter(build_ctx, op_params);
+  pipeline::sirius_pipeline_converter converter(build_ctx);
   auto result = converter.convert(*root_pipeline);
 
   auto repo_manager = sirius_ctx_ptr->get_data_repository_manager(query_id_);

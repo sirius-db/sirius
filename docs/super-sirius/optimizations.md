@@ -81,6 +81,19 @@ look-ahead is not a user-selectable YAML setting.
 
 ## Operator-Level Optimizations
 
+### Multi-Literal LIKE SWAR Fast Path (PR #1610)
+
+**Motivation:** cuDF's thread-per-row, byte-at-a-time LIKE matcher is load-instruction-bound on wide text columns. The TPC-H q13 predicate `%special%requests%` measured about 6x faster in the specialized kernel, reducing the query's LIKE work without changing SQL semantics.
+
+**Mechanism:** Constant patterns of the form `%lit1%lit2%...%litN%` are classified and compiled once per query and pattern value, then shared immutably across task-local evaluators. The CUDA kernel scans aligned 64-bit words, uses SWAR digram masks to find candidates, and verifies complete literals in order. Unsupported pattern shapes and ineligible column layouts fall back to `cudf::strings::like`; NOT LIKE is fused into the output write.
+
+**Code path:**
+- `src/expression_evaluator/specializations/function.cpp` — query-cache lookup and dispatch
+- `src/cuda/sirius_like_multiliteral.cu` — classifier, query-cache implementation, compiled descriptors, and SWAR kernel
+- `src/include/expression_evaluator/like_multiliteral.hpp` — launcher and input contracts
+
+**Config:** `like_swar_fastpath` (default: `true`, connection-local). The query snapshots this setting at engine initialization. Supported Sirius ingestion must supply valid UTF-8 for DuckDB VARCHAR/cuDF STRING input; the hot path treats that as a precondition and does not add a redundant validation scan.
+
 ### Adaptive Join BUILD_PROBE Mode (PR #423)
 
 **Motivation:** For small build-side datasets, building the hash table once and probing many times is more efficient than the standard multi-partition Cartesian product approach.

@@ -284,7 +284,9 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
 filtered_table duckdb_native_gpu_ingestible::materialize_metadata_to_table(
   scan_info const& info,
   ::cucascade::memory::memory_space const& mem_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  bool /*like_swar_fastpath*/,
+  std::shared_ptr<const like_multiliteral_cache> /*like_cache*/)
 {
   auto const& split = static_cast<duckdb_native_scan_info const&>(info);
   if (!split.datasource && !split.host_backed_only) {
@@ -325,7 +327,9 @@ std::unique_ptr<batch_coalescer> duckdb_native_gpu_ingestible::create_batch_coal
 std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_project(
   filtered_table&& input,
   ::cucascade::memory::memory_space const& mem_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  bool like_swar_fastpath,
+  std::shared_ptr<const like_multiliteral_cache> like_cache)
 {
   auto const output_arity = _info->output_types.size();
   auto const decoded_cols =
@@ -338,7 +342,13 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
   owning_table_view final_table;
   if (_filter_expression) {
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_filter_expression);
-    sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
+    sirius::expression_evaluator exec(sirius_filter_ast.get(),
+                                      mr_ref,
+                                      stream,
+                                      strategy_from_config(),
+                                      sirius::expression_evaluator::default_min_ast_size,
+                                      like_swar_fastpath,
+                                      std::move(like_cache));
     if (projection_required) {
       // Fold the projection into the filter gather so pure-filter columns are never materialized.
       std::vector<cudf::size_type> output_indices(output_arity);

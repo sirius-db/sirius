@@ -761,6 +761,9 @@ class SiriusContextExtensionCallback : public ExtensionCallback {
 /// connection via `SET enable_duckdb_fallback = ...`.
 bool duckdb_fallback_enabled(ClientContext& context);
 
+/// \brief Read the per-session `like_swar_fastpath` setting (default true).
+bool like_swar_fastpath_enabled(ClientContext& context);
+
 /// \brief Read the per-session `enable_compressed_materialization` setting.
 ///
 /// DuckDB stores this value per connection, so it is the only authority on whether narrowing
