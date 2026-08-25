@@ -142,7 +142,8 @@ pixi run python test/tpch_performance/performance_test.py \
 - `--data-source {parquet,duckdb}` (default `parquet`) — input source/format. `parquet`: `--input` is a parquet directory (`read_parquet` scan). `duckdb`: `--input` is a single `.duckdb` file (GPU-native `seq_scan`). Works in all modes; `--pin` works for both.
 - `--engine {gpu,cpu,both}` (default `both`) — `gpu`/`both` load the Sirius extension; `cpu` does not.
 - `--iterations <N>` (default `1`) and `--queries 1,3,6-10` (default: all 22).
-- `--mode {grouped,sequential,isolated,nsys-profile}` (default `grouped`) — `grouped` is hot-cache; `isolated` is true cold-start (needs the sudo setup below); `nsys-profile` is GPU-only and owned by the `profile-analyzer` skill.
+- `--execution {cold,lukewarm,hot}` (optional; omit to change nothing) — the cache state to measure. Each value also sets `cache.mode` / `cache.eviction` in the Sirius config, overriding `--config`. `cold` drops the OS page cache and calls `reset_sirius_cache()` before every run (needs the sudo setup below); `lukewarm` drops the OS cache once then lets caches fill under LRU; `hot` runs iterations back-to-back per query.
+- `--nsys-profile` — GPU-only, owned by the `profile-analyzer` skill. Has its own execution model; passing it with an explicit `--execution` is an error.
 - `--pin {none,gpu,host}` (default `none`) — Sirius cache pre-load tier; rejected with `--engine cpu`.
 - `--pin-compression` (default off) — Simpatico-compressed pins; requires `--pin gpu|host`. Plan dir via `--compression-plan-dir` (defaults to the shipped `plans/tpch_sf1000`).
 - `--validation` — byte-compare GPU vs CPU results after timing (`abs_tol=1e-10` on floats); requires `--engine both`.
@@ -155,7 +156,7 @@ The CLAUDE.md is the source of truth for the rest of the surface (`--config`, `-
 # SF1, hot cache, both engines, 2 iterations (parquet directory)
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
-    --iterations 2 --mode grouped --engine both
+    --iterations 2 --engine both
 
 # Validate GPU vs CPU after timing (queries 1/3/6)
 pixi run python test/tpch_performance/performance_test.py \
@@ -182,9 +183,9 @@ pixi run python test/tpch_performance/performance_test.py \
   - *pinned*: `--pin gpu` or `--pin host` pre-loads the referenced columns into the Sirius cache.
 - To confirm a pinned run actually hit the cache, grep `<benchmark_dir>/sirius/q<N>/sirius.log` for `using cached_split_provider` (cache hit) vs `not all the columns are pinned for this query` (fell through to disk).
 
-### Cold-Run Benchmarking (`--mode isolated`)
+### Cold-Run Benchmarking (`--execution cold`)
 
-`drop_os_cache()` writes `3` to `/proc/sys/vm/drop_caches` via passwordless `sudo`. Before running `--mode isolated`, ask the user to run this one-time setup (do not proceed until the user confirms it is done):
+`drop_os_cache()` writes `3` to `/proc/sys/vm/drop_caches` via passwordless `sudo`. Before running `--execution cold`, ask the user to run this one-time setup (do not proceed until the user confirms it is done):
 
 ```bash
 echo "$(whoami) ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches" | sudo tee /etc/sudoers.d/drop_caches
@@ -273,7 +274,7 @@ Ask in ~3 grouped rounds (`AskUserQuestion` allows up to 4 questions per call). 
 4. **Engine** (`--engine`) — `gpu`, `cpu`, or `both` (default `both`).
 
 **Round 2 — execution shape**
-1. **Mode** (`--mode`) — `grouped` (default, hot cache), `sequential` (round-robin), `isolated` (true cold-start; needs the sudo setup below), or `nsys-profile` (GPU-only; owned by the `profile-analyzer` skill).
+1. **Execution profile** (`--execution`, optional — omitted leaves the config untouched and runs iterations back-to-back) — `hot`, `lukewarm` (OS cache dropped once, LRU retention, round-robin), or `cold` (per-query OS cache drop + `reset_sirius_cache()`; needs the sudo setup below). `--nsys-profile` is a separate GPU-only flag owned by the `profile-analyzer` skill.
 2. **Pin** (`--pin`) — `none` (from disk), `gpu`, or `host` (pinned cache tier; rejected with `--engine cpu`). This is how "from disk vs pinned" is chosen, for either source.
 3. **Pin compression** (`--pin-compression`) — only ask when Pin is `gpu` or `host`; skip it entirely for `none` (the runner rejects the combination). Off (Recommended) or Simpatico-compressed pins. When compression is chosen, always ask which plan directory to use — the shipped `src/compression/simpatico_codegen/plans/tpch_sf1000` (Recommended) or a user-supplied `--compression-plan-dir` path; never assume the default without confirming it.
 4. **Iterations** (`--iterations`) — per-query iteration count (default `1`).
