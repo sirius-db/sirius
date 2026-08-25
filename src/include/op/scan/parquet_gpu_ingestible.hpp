@@ -291,16 +291,21 @@ class parquet_gpu_ingestible : public gpu_ingestible {
 
   metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve) override;
 
-  filtered_table materialize_metadata_to_table(scan_info const& info,
-                                               const cucascade::memory::memory_space& mem_space,
-                                               rmm::cuda_stream_view stream) override;
+  filtered_table materialize_metadata_to_table(
+    scan_info const& info,
+    const cucascade::memory::memory_space& mem_space,
+    rmm::cuda_stream_view stream,
+    bool like_swar_fastpath,
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache) override;
 
   std::unique_ptr<cudf::table> post_filter_and_project(
     filtered_table&& table,
     const cucascade::memory::memory_space& mem_space,
     rmm::cuda_stream_view stream,
-    std::unique_ptr<cudf::column>* survivors = nullptr,
-    std::span<std::size_t const> elided      = {}) override;
+    bool like_swar_fastpath,
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
+    std::unique_ptr<cudf::column>* survivors,
+    std::span<std::size_t const> elided) override;
 
   [[nodiscard]] const ingestible_table_info& table_info() const noexcept override { return *_info; }
 

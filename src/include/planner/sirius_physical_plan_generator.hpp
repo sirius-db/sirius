@@ -221,9 +221,9 @@ class sirius_physical_plan_generator {
   // duckdb::GPUContext& gpu_context;
 
  public:
-  //! Recursive post-pass that derives each operator's `_parent_op` from the final tree's
-  //! `children[]` after tree rewrites finish. The engine calls it again after adding the
-  //! RESULT_COLLECTOR wrapper to update the wrapped child's parent for tree-parent wiring.
+  //! Recursive post-pass that derives each operator's `_parent_op` from the final tree after
+  //! rewrites finish. The engine calls it again after adding the RESULT_COLLECTOR wrapper to
+  //! update the wrapped child's parent for tree-parent wiring.
   static void set_parent_ops(sirius::op::sirius_physical_operator& op,
                              sirius::op::sirius_physical_operator* parent);
 

@@ -455,6 +455,7 @@ set(CUDA_SOURCES
     src/cuda/sirius_dynamic_bloom_filter.cu
     src/cuda/sirius_dynamic_in_list_filter.cu
     src/cuda/sirius_dynamic_small_in_list_filter.cu
+    src/cuda/sirius_like_multiliteral.cu
     src/cuda/scan/gpu_decode_alp.cu
     src/cuda/scan/gpu_decode_bitpacking.cu
     src/cuda/scan/gpu_decode_rle.cu
@@ -704,6 +705,7 @@ set(TEST_SOURCES
     test/cpp/expression_evaluator/test_expression_evaluator.cpp
     test/cpp/expression_evaluator/test_expression_evaluator_ast_equivalence.cpp
     test/cpp/expression_evaluator/test_gpu_expression_translator.cpp
+    test/cpp/expression_evaluator/test_like_multiliteral.cpp
     test/cpp/expression_evaluator/test_nonduckdb_frontend_proof.cpp
     test/cpp/helper/test_cudf_utils.cpp
     test/cpp/helper/test_logical_type.cpp

@@ -15,11 +15,13 @@
  */
 
 // sirius
+#include <config.hpp>
 #include <expression/ast/node.hpp>
 #include <expression/function_id.hpp>
 #include <expression/value.hpp>
 #include <expression_evaluator/ast_supported_types.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
+#include <expression_evaluator/like_multiliteral.hpp>
 #include <expression_evaluator/regex/regex_playground.hpp>
 #include <helper/logical_type.hpp>
 #include <sirius/exception.hpp>
@@ -51,6 +53,20 @@
 
 namespace sirius {
 using evaluate_result = expression_evaluator::evaluate_result;
+
+like_multiliteral_cache::entry_ptr const& expression_evaluator::get_or_classify_like(
+  std::string_view pattern)
+{
+  if (auto const found = _like_classifications.find(pattern);
+      found != _like_classifications.end()) {
+    return found->second;
+  }
+
+  auto classification = _like_cache->get_or_classify(pattern);
+  ++_like_shared_cache_lookup_count;
+  return _like_classifications.emplace(std::string(pattern), std::move(classification))
+    .first->second;
+}
 
 evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const& alt,
                                                evaluation_mode mode)
@@ -178,22 +194,37 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   }
 
   //----------String Matching Functions----------//
-  auto setup_string_matching = [&]() -> std::pair<evaluate_result, std::string> {
+  auto setup_string_matching = [&]() -> std::pair<evaluate_result, std::string_view> {
     D_ASSERT(args.size() == 2);
     D_ASSERT(args[1]->holds<sirius::ast::constant>());
 
-    auto input     = evaluate(*args[0], evaluation_mode::MATERIALIZE);
-    auto match_str = std::get<std::string>(args[1]->get<sirius::ast::constant>().payload);
-    return {evaluate_result(std::move(input)), std::move(match_str)};
+    auto input            = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    auto const& match_str = std::get<std::string>(args[1]->get<sirius::ast::constant>().payload);
+    return {evaluate_result(std::move(input)), std::string_view(match_str)};
   };
   if (resolved_id == function_id::like || resolved_id == function_id::not_like) {
     auto [input, match_str] = setup_string_matching();
+    auto const invert       = resolved_id == function_id::not_like;
+
+    // `%lit1%lit2%...%litN%` patterns take a SWAR digram fast path (NOT fused in);
+    // everything else — and any ineligible column layout — takes cudf::strings::like.
+    if (_like_swar_fastpath && !input.is_scalar()) {
+      auto const& parsed = get_or_classify_like(match_str);
+      if (*parsed) {
+        if (auto result_column = like_multiliteral(
+              cudf::strings_column_view(input.get_column_view()), **parsed, invert, _stream, _mr)) {
+          return evaluate_result(std::move(result_column));
+        }
+      }
+    }
+
+    // cuDF fallback
     auto result_column = cudf::strings::like(cudf::strings_column_view(input.get_column_view()),
                                              std::string_view(match_str),
                                              std::string_view(),
                                              _stream,
                                              _mr);
-    if (resolved_id == function_id::not_like) {
+    if (invert) {
       result_column =
         cudf::unary_operation(result_column->view(), cudf::unary_operator::NOT, _stream, _mr);
     }

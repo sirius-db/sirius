@@ -45,6 +45,10 @@ namespace cucascade::memory {
 class memory_space;
 }  // namespace cucascade::memory
 
+namespace sirius {
+class like_multiliteral_cache;
+}  // namespace sirius
+
 namespace sirius::scan_manager {
 class sirius_scan_manager;
 }  // namespace sirius::scan_manager
@@ -85,8 +89,22 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
   gpu_ingestible(gpu_ingestible&&)                 = delete;
   gpu_ingestible& operator=(gpu_ingestible&&)      = delete;
 
-  filtered_table materialize_table(const op::scan::scan_operator_input& split,
-                                   rmm::cuda_stream_view stream);
+  /**
+   * @brief Materialize one scan split using query-local expression policy
+   *
+   * @param split Scan split to materialize
+   * @param stream Task-local CUDA stream
+   * @param like_swar_fastpath Whether eligible LIKE expressions use the SWAR kernel. Defaults
+   *        fail closed for non-query callers.
+   * @param like_cache Query-owned immutable LIKE classifications. A null value gives any
+   *        evaluator a private cache.
+   * @return Materialized table and filtering state
+   */
+  filtered_table materialize_table(
+    const op::scan::scan_operator_input& split,
+    rmm::cuda_stream_view stream,
+    bool like_swar_fastpath                                           = false,
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr);
 
   virtual std::unique_ptr<batch_coalescer> create_batch_coalescer() const = 0;
 
@@ -115,7 +133,13 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    * @brief Materialize the cudf table for one split. Called by
    *        @c sirius_gpu_scan_operator::execute on the task-local stream.
    *
+   * @param info Metadata for the split
    * @param mem_space Destination memory space for decoded columns.
+   * @param stream Task-local CUDA stream
+   * @param like_swar_fastpath Whether eligible LIKE expressions use the SWAR kernel. Defaults
+   *        fail closed for non-query callers.
+   * @param like_cache Query-owned immutable LIKE classifications. A null value gives any
+   *        evaluator a private cache.
    *
    * Implementations allocate through this space's allocator. The caller must
    * make its device current before calling this method. I/O uses the datasource
@@ -124,7 +148,9 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
   virtual filtered_table materialize_metadata_to_table(
     const scan_info& info,
     const cucascade::memory::memory_space& mem_space,
-    rmm::cuda_stream_view stream) = 0;
+    rmm::cuda_stream_view stream,
+    bool like_swar_fastpath                                           = false,
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr) = 0;
 
   /**
    * @brief Apply post-decode filter and/or projection to the materialized
@@ -136,25 +162,38 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    * @c assemble_scan_output (which consumes its input by rvalue) can
    * move-forward without an extra view→owning copy on the dominant
    * fresh-read + assembly path.
+   *
+   * @param input Materialized table and filtering state
+   * @param mem_space Destination memory space
+   * @param stream Task-local CUDA stream
+   * @param like_swar_fastpath Whether eligible LIKE expressions use the SWAR kernel. Defaults
+   *        fail closed for non-query callers.
+   * @param like_cache Query-owned immutable LIKE classifications. A null value gives any
+   *        evaluator a private cache.
+   * @param survivors When non-null AND this call applies a row filter here,
+   *        receives an INT32 column of the input row positions that survived,
+   *        ascending. Late materialization needs it: a filtered batch is no
+   *        longer the chunk's rows in order, so the pin-order rowid can only be
+   *        rebuilt from where the survivors were. Left untouched when the rows
+   *        were filtered somewhere this call cannot see (the decoder), which is
+   *        exactly the case a deferral must refuse rather than guess at. An
+   *        implementation that ignores it must leave @ref can_report_survivors
+   *        false.
+   * @param elided Output positions the caller is going to overwrite regardless
+   *        (a deferral's rowid and placeholders). Dropped from the selection
+   *        before it is realized, so the copy never reads them; the caller puts
+   *        columns back at those positions and restores the arity. Ignored when
+   *        it would leave nothing to size the batch by.
+   * @return Filtered and projected table
    */
-  /// \param survivors When non-null AND this call applies a row filter here,
-  ///        receives an INT32 column of the input row positions that survived,
-  ///        ascending. Late materialization needs it: a filtered batch is no
-  ///        longer the chunk's rows in order, so the pin-order rowid can only be
-  ///        rebuilt from where the survivors were. Left untouched when the rows
-  ///        were filtered somewhere this call cannot see (the decoder), which is
-  ///        exactly the case a deferral must refuse rather than guess at.
-  /// \param elided Output positions the caller is going to overwrite regardless
-  ///        (a deferral's rowid and placeholders). Dropped from the selection
-  ///        before it is realized, so the copy never reads them; the caller puts
-  ///        columns back at those positions and restores the arity. Ignored when
-  ///        it would leave nothing to size the batch by.
   virtual std::unique_ptr<cudf::table> post_filter_and_project(
     filtered_table&& input,
     const cucascade::memory::memory_space& mem_space,
     rmm::cuda_stream_view stream,
-    std::unique_ptr<cudf::column>* survivors = nullptr,
-    std::span<std::size_t const> elided      = {}) = 0;
+    bool like_swar_fastpath                                           = false,
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr,
+    std::unique_ptr<cudf::column>* survivors                          = nullptr,
+    std::span<std::size_t const> elided                               = {}) = 0;
 
   /**
    * @brief Whether this ingestible holds a row-filter expression that

@@ -995,7 +995,9 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
 filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   op::scan::scan_info const& info,
   const cucascade::memory::memory_space& mem_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  bool like_swar_fastpath,
+  std::shared_ptr<const like_multiliteral_cache> like_cache)
 {
   auto const& split = static_cast<parquet_split_info const&>(info);
 
@@ -1102,7 +1104,13 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
     owning_table_view view{std::move(table)};
     if (!reader_applied_full_filter && _duckdb_filter_expression) {
       auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
-      sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
+      sirius::expression_evaluator exec(sirius_filter_ast.get(),
+                                        mr_ref,
+                                        stream,
+                                        strategy_from_config(),
+                                        sirius::expression_evaluator::default_min_ast_size,
+                                        like_swar_fastpath,
+                                        like_cache);
       auto const data_positions = output_data_positions(*_plan);
       view = data_positions.empty() ? owning_table_view{exec.select(view.view())}
                                     : owning_table_view{exec.select(view.view(), data_positions)};
@@ -1146,6 +1154,8 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
   filtered_table&& input,
   ::cucascade::memory::memory_space const& mem_space,
   rmm::cuda_stream_view stream,
+  bool like_swar_fastpath,
+  std::shared_ptr<const like_multiliteral_cache> like_cache,
   std::unique_ptr<cudf::column>* survivors,
   std::span<std::size_t const> elided)
 {
@@ -1166,7 +1176,13 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
     // `exec`, which only borrows the AST.
     auto sirius_filter_ast = _residual.against(input.predicate_columns, input.predicates_enforced);
     if (sirius_filter_ast) {
-      sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
+      sirius::expression_evaluator exec(sirius_filter_ast.get(),
+                                        mr_ref,
+                                        stream,
+                                        strategy_from_config(),
+                                        sirius::expression_evaluator::default_min_ast_size,
+                                        like_swar_fastpath,
+                                        std::move(like_cache));
       auto const data_positions = output_data_positions(*_plan);
       std::unique_ptr<cudf::table> filtered;
       if (survivors != nullptr && !data_positions.empty()) {

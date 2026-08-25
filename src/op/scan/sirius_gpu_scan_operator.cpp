@@ -499,13 +499,18 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
   } else {
     // Every non-candidate path remains unchanged: materialize, filter/project if needed, then
     // normalize the resulting owned table.
-    auto materialized_table = _ingestible->materialize_table(*scan_input, stream);
+    auto const like_swar_fastpath = like_swar_fastpath_enabled();
+    auto like_pattern_cache       = like_cache();
+    auto materialized_table =
+      _ingestible->materialize_table(*scan_input, stream, like_swar_fastpath, like_pattern_cache);
     if (materialized_table.state != filter_state::ROW_FILTERED_AND_PROJECTED) {
       // Elide the deferred columns from the projection: realizing the batch would
       // copy values this scan is about to replace with a rowid.
       output_table = _ingestible->post_filter_and_project(std::move(materialized_table),
                                                           *mem_space,
                                                           stream,
+                                                          like_swar_fastpath,
+                                                          std::move(like_pattern_cache),
                                                           wants_survivors ? &survivors : nullptr,
                                                           deferred_output().output_positions);
     } else {

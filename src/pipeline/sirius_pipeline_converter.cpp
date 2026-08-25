@@ -42,9 +42,8 @@
 
 namespace sirius::pipeline {
 
-sirius_pipeline_converter::sirius_pipeline_converter(const pipeline_build_context& ctx,
-                                                     const sirius::operator_params& op_params)
-  : build_ctx_(ctx), op_params_(op_params)
+sirius_pipeline_converter::sirius_pipeline_converter(const pipeline_build_context& ctx)
+  : build_ctx_(ctx)
 {
 }
 

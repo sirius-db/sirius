@@ -1251,6 +1251,15 @@ bool duckdb_fallback_enabled(ClientContext& context)
   return true;
 }
 
+bool like_swar_fastpath_enabled(ClientContext& context)
+{
+  Value setting;
+  if (context.TryGetCurrentSetting("like_swar_fastpath", setting) && !setting.IsNull()) {
+    return setting.GetValue<bool>();
+  }
+  return true;
+}
+
 bool compressed_materialization_enabled(ClientContext& context)
 {
   Value setting;
