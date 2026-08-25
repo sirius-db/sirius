@@ -16,8 +16,8 @@
 
 #include "catch.hpp"
 #include "io/rest/rest_ioctx.hpp"
-#include "io/s3/s3_list_parser.hpp"
-#include "io/s3/s3_request_authorizer.hpp"
+#include "io/rest/s3/list_parser.hpp"
+#include "io/rest/authorizer.hpp"
 #include "io/sirius_datasource.hpp"
 #include "io/types.hpp"
 #include "memory/topology_index.hpp"

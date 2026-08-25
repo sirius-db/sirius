@@ -15,7 +15,7 @@
  */
 
 #include "catch.hpp"
-#include "io/s3/sigv4.hpp"
+#include "io/rest/s3/sigv4.hpp"
 
 #include <algorithm>
 #include <cctype>

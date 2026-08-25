@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
-#include "io/s3/sirius_sigv4_authorizer.hpp"
+#include "io/rest/s3/sigv4_authorizer.hpp"
 
 #include "io/io_errors.hpp"
-#include "io/s3/sigv4.hpp"
+#include "io/rest/s3/sigv4.hpp"
 
 #include <algorithm>
 #include <cctype>

@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "io/s3/sigv4.hpp"
+#include "io/rest/s3/sigv4.hpp"
 
 #include <openssl/evp.h>
 #include <openssl/hmac.h>

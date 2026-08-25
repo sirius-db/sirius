@@ -10,7 +10,7 @@
 #include "io/rest/rest_ioctx.hpp"
 #include "io/s3/s3_object_ref.hpp"
 #include "io/s3/sirius_httpfs.hpp"
-#include "io/s3/sirius_sigv4_authorizer.hpp"
+#include "io/rest/s3/sigv4_authorizer.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "utils/s3_container.hpp"

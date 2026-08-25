@@ -17,10 +17,10 @@
 #include "catch.hpp"
 #include "io/io_errors.hpp"
 #include "io/object_store_config.hpp"
-#include "io/s3/mock_request_authorizer.hpp"
-#include "io/s3/s3_list_parser.hpp"
-#include "io/s3/sirius_sigv4_authorizer.hpp"
-#include "io/s3/static_credentials.hpp"
+#include "io/rest/mock_authorizer.hpp"
+#include "io/rest/s3/list_parser.hpp"
+#include "io/rest/s3/sigv4_authorizer.hpp"
+#include "io/rest/s3/static_credentials.hpp"
 
 #include <algorithm>
 #include <atomic>

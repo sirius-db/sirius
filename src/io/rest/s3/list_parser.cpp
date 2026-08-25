@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "io/s3/s3_list_parser.hpp"
+#include "io/rest/s3/list_parser.hpp"
 
 #include <cctype>
 #include <limits>

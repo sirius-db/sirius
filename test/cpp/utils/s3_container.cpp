@@ -43,7 +43,7 @@ bool env_set(char const* name)
 
 }  // namespace sirius::test
 
-#include "io/s3/sigv4.hpp"
+#include "io/rest/s3/sigv4.hpp"
 
 #include <curl/curl.h>
 #include <duckdb.hpp>

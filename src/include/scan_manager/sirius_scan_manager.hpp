@@ -20,7 +20,7 @@
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/datasource_factory.hpp"
-#include "io/s3/s3_list_parser.hpp"
+#include "io/rest/s3/list_parser.hpp"
 #include "io/sirius_datasource.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "pin_table.hpp"

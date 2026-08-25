@@ -20,7 +20,7 @@
 #include "io/rest/config.hpp"
 #include "io/rest/types.hpp"
 #include "io/s3/s3_object_ref.hpp"
-#include "io/s3/s3_request_authorizer.hpp"
+#include "io/rest/authorizer.hpp"
 #include "io/types.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
