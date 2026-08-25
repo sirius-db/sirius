@@ -231,18 +231,28 @@ void sirius_physical_operator::add_port(std::string_view port_id, std::unique_pt
   ports[std::string(port_id)] = raw;
 }
 
-sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_view port_id)
+sirius_physical_operator::port* sirius_physical_operator::try_get_port(std::string_view port_id)
 {
   auto it = ports.find(std::string(port_id));
-  if (it == ports.end()) {
-    std::string ports_string = "";
-    for (auto& [port_name, port_ptr] : ports) {
-      ports_string += port_name + ", ";
-    }
-    throw internal_exception("Port " + std::string(port_id) + " not found in operator " +
-                             get_name() + " existing ports are: " + ports_string);
+  return it == ports.end() ? nullptr : it->second;
+}
+
+const sirius_physical_operator::port* sirius_physical_operator::try_get_port(
+  std::string_view port_id) const
+{
+  auto it = ports.find(std::string(port_id));
+  return it == ports.end() ? nullptr : it->second;
+}
+
+sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_view port_id)
+{
+  if (auto* found = try_get_port(port_id); found != nullptr) { return found; }
+  std::string ports_string = "";
+  for (auto& [port_name, port_ptr] : ports) {
+    ports_string += port_name + ", ";
   }
-  return it->second;
+  throw internal_exception("Port " + std::string(port_id) + " not found in operator " + get_name() +
+                           " existing ports are: " + ports_string);
 }
 
 void sirius_physical_operator::sink(const operator_data& output_data, rmm::cuda_stream_view stream)

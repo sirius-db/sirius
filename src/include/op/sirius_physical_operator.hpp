@@ -575,6 +575,34 @@ class sirius_physical_operator {
     return sirius::OrderPreservationType::INSERTION_ORDER;
   }
 
+  // Data-size estimator hooks. nullopt means unavailable; see
+  // docs/super-sirius/data-size-estimation.md.
+
+  /// Whole-query leaf input in `pipeline_memory_history::input_basis` units.
+  [[nodiscard]] virtual std::optional<std::size_t> total_source_input_bytes() const
+  {
+    return std::nullopt;
+  }
+
+  /// Whole-query leaf output, used unscaled only when @ref total_source_input_bytes is nullopt.
+  /// Planner-based overrides must floor totals at emitted bytes; results are `planner_derived`.
+  [[nodiscard]] virtual std::optional<std::size_t> total_source_output_bytes() const
+  {
+    return std::nullopt;
+  }
+
+  /// Fan-in port that drives output volume. Must pair with @ref consumed_primary_input_bytes.
+  [[nodiscard]] virtual std::optional<std::string_view> primary_input_port() const
+  {
+    return std::nullopt;
+  }
+
+  /// Bytes processed from @ref primary_input_port, counted at task entry once per distinct batch.
+  [[nodiscard]] virtual std::optional<std::size_t> consumed_primary_input_bytes() const
+  {
+    return std::nullopt;
+  }
+
  public:
   // Sink interface
   virtual void sink(const operator_data& input_data, rmm::cuda_stream_view stream);
@@ -677,10 +705,16 @@ class sirius_physical_operator {
   void push_data_batch(std::string_view port_id, std::shared_ptr<::cucascade::data_batch> batch);
   //! Add a port to the operator
   void add_port(std::string_view port_id, std::unique_ptr<port> p);
-  //! Get a port from the operator
+  //! Look up a port, or nullptr if absent. Use @ref get_port when absence is an error.
+  [[nodiscard]] port* try_get_port(std::string_view port_id);
+  [[nodiscard]] const port* try_get_port(std::string_view port_id) const;
+  //! Look up a port; throws if absent.
   port* get_port(std::string_view port_id);
   //! Get all ports from the operator
   std::vector<std::string_view> get_port_ids();
+  //! Ports in ownership order. Allocation-free, and reaches each port without the per-name
+  //! map lookup get_port_ids() implies.
+  [[nodiscard]] const std::list<std::unique_ptr<port>>& get_ports() const { return _ports_list; }
   //! Check if the source pipeline is finished
   bool is_source_pipeline_finished();
   //! Returns true if any FULL-barrier port has src_pipeline == src
@@ -705,6 +739,10 @@ class sirius_physical_operator {
 
   /// \brief check if this operator has exhausted its limit, allowing the pipeline to finish early
   virtual bool is_limit_exhausted() const { return false; }
+
+  /// \brief Whether this operator caps pipeline output regardless of input volume.
+  /// True before the cap binds; the data-size estimator will not extrapolate through it.
+  [[nodiscard]] virtual bool caps_pipeline_output() const { return false; }
 
   //! Get the input batch
   virtual std::unique_ptr<operator_data> get_next_task_input_data();

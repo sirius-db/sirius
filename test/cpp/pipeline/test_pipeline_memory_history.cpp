@@ -77,13 +77,21 @@ TEST_CASE("pipeline_memory_history skips records with zero estimated_bytes",
 {
   pipeline_memory_history history;
 
-  history.record({0, 500, 300});    // Should be skipped
+  history.record({0, 500, 300});    // Skipped by the ring: peak estimation divides by the basis
   history.record({100, 300, 200});  // ratio = 3.0
 
   auto estimate = history.estimate_peak_memory(100);
   REQUIRE(estimate.has_value());
   // Only the second record contributes: 100 * 3.0 = 300
   REQUIRE(*estimate == 300);
+
+  REQUIRE(history.totals().output_records == 2);
+  REQUIRE(history.totals().output_bytes == 500);
+  REQUIRE(history.totals().ratio_records == 1);
+  REQUIRE(history.totals().ratio_input_bytes == 100);
+  auto ratio = history.totals().ratio();
+  REQUIRE(ratio.has_value());
+  REQUIRE(*ratio == Approx(2.0));
 }
 
 TEST_CASE("pipeline_memory_history ring buffer evicts oldest records",
@@ -140,4 +148,88 @@ TEST_CASE("pipeline_memory_history is thread-safe for concurrent recording",
   auto estimate = history.estimate_peak_memory(200);
   REQUIRE(estimate.has_value());
   REQUIRE(*estimate > 0);
+
+  // Running totals are not capped by the ring buffer.
+  REQUIRE(history.totals().ratio_records ==
+          static_cast<std::size_t>(num_threads) * static_cast<std::size_t>(records_per_thread));
+}
+
+TEST_CASE("pipeline_memory_history has no output/input ratio without records",
+          "[pipeline_memory_history][ratio]")
+{
+  pipeline_memory_history history;
+  REQUIRE_FALSE(history.totals().ratio().has_value());
+  REQUIRE(history.totals().output_bytes == 0);
+}
+
+TEST_CASE("pipeline_memory_history aggregates the output/input ratio over all records",
+          "[pipeline_memory_history][ratio]")
+{
+  pipeline_memory_history history;
+
+  history.record({100, 200, 60});
+  history.record({300, 600, 140});
+
+  auto ratio = history.totals().ratio();
+  REQUIRE(ratio.has_value());
+  REQUIRE(*ratio == Approx(0.5));
+
+  REQUIRE(history.totals().output_bytes == 200);
+  REQUIRE(history.totals().ratio_input_bytes == 400);
+  REQUIRE(history.totals().ratio_records == 2);
+}
+
+TEST_CASE("pipeline_memory_history totals survive ring-buffer eviction",
+          "[pipeline_memory_history][ratio][ring_buffer]")
+{
+  pipeline_memory_history history;
+
+  for (std::size_t i = 0; i < 200; ++i) {
+    history.record({100, 200, 25});
+  }
+
+  REQUIRE(history.size() == 64);
+  REQUIRE(history.totals().ratio_records == 200);
+  REQUIRE(history.totals().output_bytes == std::size_t{200} * 25);
+
+  auto ratio = history.totals().ratio();
+  REQUIRE(ratio.has_value());
+  REQUIRE(*ratio == Approx(0.25));
+}
+
+TEST_CASE("pipeline_memory_history excludes failed tasks from the output/input ratio",
+          "[pipeline_memory_history][ratio]")
+{
+  pipeline_memory_history history;
+
+  history.record({100, 200, 50});
+  history.record_on_failure(400, 900);
+
+  auto ratio = history.totals().ratio();
+  REQUIRE(ratio.has_value());
+  REQUIRE(*ratio == Approx(0.5));
+  REQUIRE(history.totals().ratio_records == 1);
+  REQUIRE(history.totals().ratio_input_bytes == 100);
+}
+
+TEST_CASE("pipeline_memory_history excludes resumed tasks from the output/input ratio",
+          "[pipeline_memory_history][ratio]")
+{
+  pipeline_memory_history history;
+
+  history.record({100, 200, 50});
+  // A resumed task's intermediate input is not a valid pipeline ratio basis.
+  history.record({10, 200, 50, /*ratio_eligible=*/false});
+
+  REQUIRE(history.size() == 2);
+
+  auto ratio = history.totals().ratio();
+  REQUIRE(ratio.has_value());
+  REQUIRE(*ratio == Approx(0.5));
+  REQUIRE(history.totals().ratio_records == 1);
+  REQUIRE(history.totals().ratio_input_bytes == 100);
+
+  // Resumed-task output still contributes to the pipeline total.
+  REQUIRE(history.totals().output_records == 2);
+  REQUIRE(history.totals().output_bytes == 100);
 }

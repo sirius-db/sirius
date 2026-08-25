@@ -37,11 +37,14 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Scan](scan.md) | Scan subsystem: unified GPU scan operator, `gpu_ingestible` (parquet + DuckDB-native), scan manager, pinned tables, DuckDB-native decode, row-group pruning, Sirius IO layer (uring/REST/kvikio + prefetching cache) |
 | [Memory Management](memory-management.md) | cuCascade tiers, reservations, downgrade executor |
 | [Data Management](data-management.md) | Data batches, repositories, ports, barrier semantics |
+| [Streaming Sessions](streaming-sessions.md) | Fragment boundaries for distributed queries: `exec::batch_stream`, streaming source/sink, the id-addressed `stream_session` |
+| [Streaming Fragments](streaming-fragments.md) | Building and running one fragment: `stream_bind_catalog`, `exec::streaming_fragment`, the cross-language `sirius::ffi::Fragment`/`Context` lifecycle |
+| [Data Size Estimation](data-size-estimation.md) | Runtime projection of the total bytes that will reach an operator's input port |
 | [Configuration](configuration.md) | sirius_config, operator_params, SET variables |
 | [Optimizations](optimizations.md) | Performance optimizations with PRs, code paths, configs |
 | [Compressed Pinning](compressed-pinning.md) | Simpatico-compressed pin_table on host/GPU tiers — which tier to compress on, plan selection vs the H2D link, GB300 SF1000 results |
 | [Compressed Materialization](compressed-materialization.md) | Value-preserving narrow integer and DECIMAL carriers, restoration boundaries, and pin-cache invariants |
-| [Multi-GPU Architecture](multi-gpu-architecture.md) | How Sirius executes SQL across every GPU on a node — tiers, pin tables, SCHED-RR, cross-GPU transfers, downgrade, concurrency invariants |
+| [Multi-GPU Architecture](multi-gpu-architecture.md) | How Sirius executes SQL across every GPU on a node — tiers, pin tables, ready-device scheduling, cross-GPU transfers, downgrade, concurrency invariants |
 | [Late Materialization](late-materialization.md) | Carrying a pin-order rowid instead of wide column values — the scan/port pair, group-by-rowid rides, riders, the pin-time uniqueness proof, and the `SIRIUS_EXP_LATE_MAT_*` gates |
 | [Dynamic Filters](dynamic-filters.md) | Ordered hash-build publication, zone-map/IN-list/Bloom consumers, multi-GPU replicas, join-edge (SIP) endpoint placement, and the refinement design that remains future work |
 | [Debugging](debugging.md) | Practical guide to debugging crashes and races — building/running with ASan & TSan, the `tsan.supp` file, and capturing/inspecting core dumps with gdb |
