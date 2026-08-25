@@ -91,6 +91,15 @@ class sirius_physical_partition : public sirius_physical_operator {
     _sibling_partition_op = sibling_partition_op;
   }
 
+  /// Hold off sizing until the sibling partition's input pipeline has also finished. Set for
+  /// consumers whose `get_partition_strategy` reads `combined_total_bytes`: the driving partition
+  /// otherwise measures the pair as soon as its own side completes, while the sibling is still
+  /// filling. Costs nothing once the count is decided.
+  void set_sizing_requires_sibling_input(bool requires_sibling)
+  {
+    _sizing_requires_sibling_input = requires_sibling;
+  }
+
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
@@ -157,6 +166,8 @@ class sirius_physical_partition : public sirius_physical_operator {
   std::optional<int> _num_partitions;
   bool _is_build;
   bool _drives_partition_count{false};
+  /// See set_sizing_requires_sibling_input.
+  bool _sizing_requires_sibling_input{false};
   bool _has_sibling_partition_op;
   PartitionType _partition_type;
   /// Sorted, deduped active GPU device ids (see set_active_gpu_ids). Empty when unset / single-GPU.

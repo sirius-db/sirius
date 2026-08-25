@@ -17,6 +17,7 @@
 #pragma once
 
 #include "op/sirius_physical_operator.hpp"
+#include "op/sirius_physical_partition_consumer_operator.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -30,8 +31,13 @@ namespace sirius::op {
  * `pipelineable_operator_data` owns one flattened batch sequence. This subclass appends all
  * preserved-side batches followed by all counted-side batches, so the two side counts describe
  * every position: batch `i` belongs to the preserved input exactly when `i < preserved_count()`.
+ *
+ * The batches are one partition of each side. A partition index is carried only when the operator
+ * produced more than one partition: an indexed task is pinned to `_active_gpu_ids[idx % size]` so
+ * every task of a partition shares a device, while a single-partition task has no such constraint
+ * and is better placed by data affinity.
  */
-class dense_count_join_input : public pipelineable_operator_data {
+class dense_count_join_input : public partitioned_operator_data {
  public:
   /**
    * @brief Combine the two normalized inputs into one batch container
@@ -43,6 +49,17 @@ class dense_count_join_input : public pipelineable_operator_data {
    */
   dense_count_join_input(std::vector<std::shared_ptr<::cucascade::data_batch>> preserved_batches,
                          std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches);
+
+  /**
+   * @brief As above, tagging the batches with the partition they were drained from
+   *
+   * @param preserved_batches Batches from the outer-join-preserved input
+   * @param counted_batches Batches from the input whose matches contribute to COUNT
+   * @param partition_idx Partition these batches came from; pins the task to one GPU
+   */
+  dense_count_join_input(std::vector<std::shared_ptr<::cucascade::data_batch>> preserved_batches,
+                         std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches,
+                         std::size_t partition_idx);
 
   /** @brief Number of leading batches that belong to the preserved input. */
   [[nodiscard]] std::size_t preserved_count() const noexcept { return _preserved_count; }
@@ -73,7 +90,7 @@ class dense_count_join_input : public pipelineable_operator_data {
  * histograms when the observed key domain satisfies its layout, density, and memory gates;
  * otherwise it uses exact sparse aggregation. Both paths emit `[key, BIGINT count]`.
  */
-class sirius_physical_dense_count_join : public sirius_physical_operator {
+class sirius_physical_dense_count_join : public sirius_physical_partition_consumer_operator {
  public:
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::DENSE_COUNT_JOIN;
 
@@ -91,13 +108,17 @@ class sirius_physical_dense_count_join : public sirius_physical_operator {
    *        `std::nullopt` for COUNT(*)
    * @param max_bins_bytes Maximum combined direct-address histogram allocation; the runtime density
    *        and input-size gates may still select sparse aggregation below this limit
+   * @param hash_partition_bytes Configured per-partition byte target; get_partition_strategy
+   *        doubles it because one task of this operator holds a partition of both inputs
    */
-  sirius_physical_dense_count_join(duckdb::vector<sirius::logical_type> types,
-                                   std::size_t estimated_cardinality,
-                                   std::size_t preserved_key_idx,
-                                   std::size_t counted_key_idx,
-                                   std::optional<std::size_t> counted_value_idx,
-                                   uint64_t max_bins_bytes);
+  sirius_physical_dense_count_join(
+    duckdb::vector<sirius::logical_type> types,
+    std::size_t estimated_cardinality,
+    std::size_t preserved_key_idx,
+    std::size_t counted_key_idx,
+    std::optional<std::size_t> counted_value_idx,
+    uint64_t max_bins_bytes,
+    uint64_t hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES);
 
   std::string params_to_string() const override;
 
@@ -170,6 +191,19 @@ class sirius_physical_dense_count_join : public sirius_physical_operator {
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   /**
+   * @brief Decide how many partitions the upstream PARTITIONs should produce
+   *
+   * Sizes from both inputs combined, since one task holds a partition of each side, and uses twice
+   * the configured `hash_partition_bytes` as both the per-partition target and the small-table
+   * threshold. Never broadcasts and never drives BUILD_PROBE.
+   *
+   * @param in What the sizing partition measured, including both siblings' byte totals
+   * @return The partition count to apply to both input PARTITIONs
+   */
+  [[nodiscard]] partition_strategy get_partition_strategy(
+    const partition_sizing_input& in) override;
+
+  /**
    * @brief Estimate a conservative first-run peak across all execution strategies
    *
    * Arithmetic saturates rather than wrapping when the input bounds are too large to represent.
@@ -199,11 +233,21 @@ class sirius_physical_dense_count_join : public sirius_physical_operator {
   [[nodiscard]] strategy last_strategy() const noexcept { return _last_strategy; }
 
  private:
+  /// Number of partitions decided by get_partition_strategy, mirrored from the input repositories.
+  /// One until sizing runs.
+  [[nodiscard]] std::size_t partition_count() const;
+
   std::size_t _preserved_key_idx;
   std::size_t _counted_key_idx;
   std::optional<std::size_t> _counted_value_idx;
   uint64_t _max_bins_bytes;
   strategy _last_strategy = strategy::NOT_RUN;
+  /// Next partition to hand to a task; guarded by the base `lock`.
+  std::size_t _current_partition_index = 0;
+  /// Set once a task has emitted the SQL NULL group. Hash partitioning co-locates null keys, so a
+  /// second such task means the partitioning contract broke and the output would carry duplicate
+  /// NULL groups. Guarded by the base `lock`.
+  bool _null_group_emitted = false;
 };
 
 }  // namespace sirius::op

@@ -351,6 +351,17 @@ class partitioned_operator_data : public pipelineable_operator_data {
   {
   }
 
+  /// Partitioned data with no index. The scheduler pins a task to
+  /// `_active_gpu_ids[partition_idx % size]` only when an index is present; without one it falls
+  /// through to its byte-affinity heuristic and places the task on the GPU already holding the
+  /// data. Used when a consumer produced a single partition, where no cross-task device agreement
+  /// is required.
+  explicit partitioned_operator_data(
+    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
+    : pipelineable_operator_data(std::move(data_batches))
+  {
+  }
+
   [[nodiscard]] operator_data_type get_type() const override
   {
     return operator_data_type::PARTITIONED;
@@ -358,12 +369,13 @@ class partitioned_operator_data : public pipelineable_operator_data {
 
   /**
    * @brief Get the partition index.
-   * @return Partition index
+   * @return The partition index, or std::nullopt when this data carries none — which means
+   *         "place by data affinity", not "partition 0".
    */
-  [[nodiscard]] std::size_t get_partition_idx() const { return _partition_idx; }
+  [[nodiscard]] std::optional<std::size_t> get_partition_idx() const { return _partition_idx; }
 
  private:
-  std::size_t _partition_idx = 0;
+  std::optional<std::size_t> _partition_idx;
 };
 
 /**

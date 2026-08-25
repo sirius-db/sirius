@@ -1771,8 +1771,17 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
     // With a single partition the task is tagged with operator_id (for cross-join GPU spread), so
     // map any tag back to the lone slot 0; with multiple partitions the tag is the real partition
     // index and selects its slot directly.
-    std::size_t const partition =
-      _partition_build_states.size() == 1 ? std::size_t{0} : partitioned->get_partition_idx();
+    std::size_t partition = 0;
+    if (_partition_build_states.size() != 1) {
+      auto const partition_idx = partitioned->get_partition_idx();
+      if (!partition_idx.has_value()) {
+        throw std::runtime_error(
+          "In sirius_physical_hash_join::execute: BUILD_PROBE input carries no partition index "
+          "but the join has " +
+          std::to_string(_partition_build_states.size()) + " build partitions");
+      }
+      partition = *partition_idx;
+    }
     if (partition >= _partition_build_states.size()) {
       throw std::runtime_error(
         "In sirius_physical_hash_join::execute: BUILD_PROBE partition index " +

@@ -378,7 +378,8 @@ sirius_physical_plan_generator::try_plan_dense_count_join(duckdb::LogicalAggrega
     detection->preserved_key_idx,
     detection->counted_key_idx,
     detection->counted_value_idx,
-    op_params.dense_count_join_max_bytes);
+    op_params.dense_count_join_max_bytes,
+    op_params.hash_partition_bytes);
   fused->children.push_back(std::move(preserved));
   fused->children.push_back(std::move(counted));
   return fused;

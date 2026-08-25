@@ -178,7 +178,13 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
       "sirius_physical_concat: input_data is not a partitioned_operator_data");
   }
   const auto& input_batches = partitioned_input_data->get_read_only_batches();
-  auto partition_idx        = partitioned_input_data->get_partition_idx();
+  // CONCAT coalesces one partition at a time, so its input is always indexed; unindexed data
+  // would silently collapse every partition into slot 0.
+  auto const partition_idx_opt = partitioned_input_data->get_partition_idx();
+  if (!partition_idx_opt.has_value()) {
+    throw std::runtime_error("sirius_physical_concat: input_data carries no partition index");
+  }
+  auto partition_idx = *partition_idx_opt;
   if (input_batches.empty()) {
     return std::make_unique<partitioned_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{}, partition_idx);
@@ -204,7 +210,11 @@ void sirius_physical_concat::sink(const operator_data& output_data, rmm::cuda_st
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_concat::sink"};
   auto partitioned_output_data = dynamic_cast<const partitioned_operator_data*>(&output_data);
-  auto partition_idx           = partitioned_output_data->get_partition_idx();
+  auto const partition_idx_opt = partitioned_output_data->get_partition_idx();
+  if (!partition_idx_opt.has_value()) {
+    throw std::runtime_error("sirius_physical_concat: output_data carries no partition index");
+  }
+  auto partition_idx = *partition_idx_opt;
   for (auto& batch : partitioned_output_data->get_data_batches()) {
     for (auto& next_port_info : next_port_after_sink) {
       auto partition_consumer_op =

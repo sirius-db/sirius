@@ -861,7 +861,7 @@ TEST_CASE("sirius_physical_concat pulls from a later partition when earlier ones
   auto group = concat_op.get_next_task_input_data();
   REQUIRE(group != nullptr);
   const auto& group_data = dynamic_cast<const partitioned_operator_data&>(*group);
-  REQUIRE(group_data.get_partition_idx() == 1);
+  REQUIRE(group_data.get_partition_idx() == std::optional<std::size_t>{1});
   const auto& group_batches = group_data.get_data_batches();
   REQUIRE(group_batches.size() == 2);
   REQUIRE(group_batches[0]->get_batch_id() == p1_ids[0]);
@@ -876,10 +876,12 @@ TEST_CASE("sirius_physical_concat pulls from a later partition when earlier ones
   source.pipeline->set_finished(true);
   auto tail0 = concat_op.get_next_task_input_data();
   REQUIRE(tail0 != nullptr);
-  REQUIRE(dynamic_cast<const partitioned_operator_data&>(*tail0).get_partition_idx() == 0);
+  REQUIRE(dynamic_cast<const partitioned_operator_data&>(*tail0).get_partition_idx() ==
+          std::optional<std::size_t>{0});
   auto tail1 = concat_op.get_next_task_input_data();
   REQUIRE(tail1 != nullptr);
-  REQUIRE(dynamic_cast<const partitioned_operator_data&>(*tail1).get_partition_idx() == 1);
+  REQUIRE(dynamic_cast<const partitioned_operator_data&>(*tail1).get_partition_idx() ==
+          std::optional<std::size_t>{1});
   REQUIRE(concat_op.get_next_task_input_data() == nullptr);
 }
 

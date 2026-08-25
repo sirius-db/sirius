@@ -359,6 +359,27 @@ void sirius_pipeline_converter::finalize_pipeline_structure()
 void sirius_pipeline_converter::link_join_partition_siblings()
 {
   for (const auto& pipeline : scheduled_) {
+    // DENSE_COUNT_JOIN feeds from bare PARTITIONs with no CONCAT between, so its dependencies are
+    // the partition pipelines directly. Sides are identified by is_build_partition() rather than
+    // by dependency position: dependency order follows build_pipelines' child order, which is not
+    // the same for this operator as for the joins below.
+    if (pipeline->source->type == op::SiriusPhysicalOperatorType::DENSE_COUNT_JOIN) {
+      if (pipeline->dependencies.size() != 2) { continue; }
+      auto* first  = pipeline->dependencies[0]->get_sink().get();
+      auto* second = pipeline->dependencies[1]->get_sink().get();
+      if (first == nullptr || second == nullptr ||
+          first->type != op::SiriusPhysicalOperatorType::PARTITION ||
+          second->type != op::SiriusPhysicalOperatorType::PARTITION) {
+        continue;
+      }
+      auto& first_partition  = first->Cast<op::sirius_physical_partition>();
+      auto& second_partition = second->Cast<op::sirius_physical_partition>();
+      // Exactly one side is the build (preserved) side; it drives the partition count.
+      D_ASSERT(first_partition.is_build_partition() != second_partition.is_build_partition());
+      first_partition.set_sibling_partition_op(&second_partition);
+      second_partition.set_sibling_partition_op(&first_partition);
+      continue;
+    }
     // Both join types use the same CONCAT/PARTITION wrap. Probe input is PARTIAL except for
     // right-family hash joins whose complete probe drives partition sizing; RIGHT_DELIM_JOIN
     // inner joins use their build side instead.

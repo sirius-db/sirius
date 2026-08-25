@@ -438,14 +438,18 @@ void task_creator::manager_loop()
             // counter_storage.cuh. Routing on partition_idx keeps every
             // task of a given partition on one GPU while still spreading
             // partitions across GPUs.
+            // Partitioned data with no index asks to be placed by affinity instead: its producer
+            // built a single partition, so no other task shares its device requirement.
             if (auto* partitioned =
                   dynamic_cast<op::partitioned_operator_data*>(pipelineable_input);
                 !preferred_device_id.has_value() && partitioned && !_active_gpu_ids.empty()) {
               // Index the active executor set so every task of a partition lands
               // on the same real GPU (required for cuco tables); the physical
               // topology would yield phantom pins when num_gpus < physical count.
-              auto idx            = partitioned->get_partition_idx() % _active_gpu_ids.size();
-              preferred_device_id = _active_gpu_ids[idx];
+              if (auto const partition_idx = partitioned->get_partition_idx()) {
+                auto idx            = *partition_idx % _active_gpu_ids.size();
+                preferred_device_id = _active_gpu_ids[idx];
+              }
             }
             if (!preferred_device_id.has_value() && pipelineable_input &&
                 !pipelineable_input->get_data_batches().empty()) {

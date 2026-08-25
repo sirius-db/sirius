@@ -23,8 +23,10 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression/ast/to_duckdb.hpp"
 #include "log/logging.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
 #include "op/sirius_physical_concat.hpp"
+#include "op/sirius_physical_dense_count_join.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -161,6 +163,17 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     //     }
     //   }
     // }
+  } else if (op->type == SiriusPhysicalOperatorType::DENSE_COUNT_JOIN) {
+    // The fused count-join is both the key source and the downstream sizing consumer. Its two
+    // inputs partition on their respective join keys so equal keys co-locate.
+    _downstream_consumer_op = op;
+    _partition_type         = PartitionType::HASH;
+    auto& dense_count_op    = op->Cast<sirius_physical_dense_count_join>();
+    _partition_keys.push_back(static_cast<int>(is_build ? dense_count_op.preserved_key_idx()
+                                                        : dense_count_op.counted_key_idx()));
+    // No hash-alignment cast: detect_dense_count_join admits the fusion only when both join keys
+    // share a LogicalTypeId, so the two sides already hash identically.
+    _partition_key_cast_types.push_back(cudf::data_type{cudf::type_id::EMPTY});
   } else if (op->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY) {
     // key_source is the merge itself, which is also the downstream sizing consumer.
     _downstream_consumer_op          = op;
@@ -368,6 +381,19 @@ std::size_t sirius_physical_partition::slot_for_device(int device_id) const
 std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint()
 {
   std::lock_guard<std::mutex> guard(lock);
+  // Consumers that size from both inputs cannot be measured until both sides have stopped
+  // producing, and the driving partition's own readiness says nothing about the sibling's.
+  if (_sizing_requires_sibling_input && !_num_partitions.has_value() &&
+      _sibling_partition_op != nullptr) {
+    auto& sibling = _sibling_partition_op->Cast<sirius_physical_partition>();
+    if (sibling.ports.size() == 1) {
+      auto sibling_port = sibling.ports.begin()->second;
+      if (sibling_port->src_pipeline && !sibling_port->src_pipeline->is_pipeline_finished()) {
+        auto* producer = &(sibling_port->src_pipeline->get_operators()[0].get());
+        return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+      }
+    }
+  }
   if (!_num_partitions.has_value() && !_drives_partition_count &&
       _sibling_partition_op != nullptr) {
     // The non-driver normally waits for the sizing side. If that side finished
@@ -455,9 +481,14 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
     std::scoped_lock guard(lock, sibling.lock);
     if (!_num_partitions.has_value()) {
       auto& sizing_partition = _drives_partition_count ? *this : sibling;
+      // Both locks are held here, so the two sides can be measured together for consumers that
+      // size from the combined input.
+      auto const this_bytes    = compute_total_bytes();
+      auto const sibling_bytes = sibling.compute_total_bytes();
       partition_sizing_input const in{sizing_partition.compute_total_bytes(),
                                       sizing_partition._is_build,
-                                      has_build_concat(*this) || has_build_concat(sibling)};
+                                      has_build_concat(*this) || has_build_concat(sibling),
+                                      sirius::memory::saturating_add(this_bytes, sibling_bytes)};
       // The consumer owns the decision: it computes the count / broadcast flag, updates its own
       // execution state (e.g. hash-join BUILD_PROBE mode), and pre-sizes its own input repos.
       auto const strategy      = consumer->get_partition_strategy(in);
@@ -507,9 +538,11 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
   } else {
     std::lock_guard<std::mutex> guard(lock);
     if (!_num_partitions.has_value()) {
-      partition_sizing_input const in{compute_total_bytes(),
+      auto const total_bytes = compute_total_bytes();
+      partition_sizing_input const in{total_bytes,
                                       _is_build,
-                                      /*build_foldable=*/false};
+                                      /*build_foldable=*/false,
+                                      /*combined_total_bytes=*/total_bytes};
       auto const strategy = consumer->get_partition_strategy(in);
       _num_partitions     = strategy.num_partitions;
       SIRIUS_LOG_DEBUG("sirius_physical_partition id {} sized {} partitions",

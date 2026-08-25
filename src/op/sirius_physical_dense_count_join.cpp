@@ -170,11 +170,22 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> combine_sides(
 dense_count_join_input::dense_count_join_input(
   std::vector<std::shared_ptr<::cucascade::data_batch>> preserved_batches,
   std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches)
-  : pipelineable_operator_data(combine_sides(preserved_batches, counted_batches)),
+  : partitioned_operator_data(combine_sides(preserved_batches, counted_batches)),
     _preserved_count(preserved_batches.size()),
     _counted_count(counted_batches.size())
 {
 }
+
+dense_count_join_input::dense_count_join_input(
+  std::vector<std::shared_ptr<::cucascade::data_batch>> preserved_batches,
+  std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches,
+  std::size_t partition_idx)
+  : partitioned_operator_data(combine_sides(preserved_batches, counted_batches), partition_idx),
+    _preserved_count(preserved_batches.size()),
+    _counted_count(counted_batches.size())
+{
+}
+
 
 sirius_physical_dense_count_join::sirius_physical_dense_count_join(
   duckdb::vector<sirius::logical_type> types,
@@ -182,14 +193,16 @@ sirius_physical_dense_count_join::sirius_physical_dense_count_join(
   std::size_t preserved_key_idx,
   std::size_t counted_key_idx,
   std::optional<std::size_t> counted_value_idx,
-  uint64_t max_bins_bytes)
-  : sirius_physical_operator(
+  uint64_t max_bins_bytes,
+  uint64_t hash_partition_bytes)
+  : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::DENSE_COUNT_JOIN, std::move(types), estimated_cardinality),
     _preserved_key_idx(preserved_key_idx),
     _counted_key_idx(counted_key_idx),
     _counted_value_idx(counted_value_idx),
     _max_bins_bytes(max_bins_bytes)
 {
+  _hash_partition_bytes = hash_partition_bytes;
   D_ASSERT(this->types.size() == 2);  // [group key, BIGINT count]
 }
 
@@ -234,39 +247,113 @@ void sirius_physical_dense_count_join::build_pipelines(
   D_ASSERT(host_current.get_operators().size() == 1);
 }
 
+std::size_t sirius_physical_dense_count_join::partition_count() const
+{
+  std::size_t count = 1;
+  for (auto const& [_, input_port] : ports) {
+    if (input_port->repo != nullptr) {
+      count = std::max(count, input_port->repo->num_partitions());
+    }
+  }
+  return count;
+}
+
+partition_strategy sirius_physical_dense_count_join::get_partition_strategy(
+  const partition_sizing_input& in)
+{
+  // A task of this operator holds one partition of BOTH sides at once, so size against the
+  // combined input and give each partition twice the configured per-partition target.
+  uint64_t const bytes_per_partition = sirius::memory::saturating_mul(2, _hash_partition_bytes);
+  if (bytes_per_partition == 0) {
+    throw sirius::internal_exception("dense_count_join: hash_partition_bytes must be non-zero");
+  }
+  uint64_t const total_bytes = in.combined_total_bytes;
+
+  auto num_partitions =
+    static_cast<int>(std::max(uint64_t{1},
+                              total_bytes / bytes_per_partition +
+                                static_cast<uint64_t>(total_bytes % bytes_per_partition != 0)));
+  // Multi-GPU floor, using the same doubled value as the small-table threshold rather than
+  // partition_small_table_bytes: below one partition's worth of input there is nothing to spread.
+  int const min_parts = partition_min_num_partitions(_num_gpus);
+  if (min_parts > 1 && total_bytes >= bytes_per_partition) {
+    num_partitions = std::max(num_partitions, min_parts);
+  }
+
+  // Pre-size both input repositories so every partition slot exists before batches arrive.
+  // Guarded on strictly-greater to respect the repository's set_num_partitions contract.
+  if (num_partitions > 1) {
+    std::lock_guard<std::mutex> guard(lock);
+    for (auto& [_, input_port] : ports) {
+      if (input_port->repo != nullptr &&
+          static_cast<std::size_t>(num_partitions) > input_port->repo->num_partitions()) {
+        input_port->repo->set_num_partitions(static_cast<std::size_t>(num_partitions));
+      }
+    }
+  }
+  return {num_partitions, /*broadcast=*/false, /*build_probe=*/false};
+}
+
 std::optional<task_creation_hint> sirius_physical_dense_count_join::get_next_task_hint()
 {
+  std::lock_guard<std::mutex> guard(lock);
   if (ports.empty()) { return std::nullopt; }
 
-  // Either input may be empty, but both producers must finish before the task runs.
+  // Either input may be empty, but both producers must finish before any task runs: the partition
+  // count is negotiated from the two sides combined, and a task owns a partition of each.
   for (auto const& p : _ports_list) {
     if (p->src_pipeline && !p->src_pipeline->is_pipeline_finished()) {
       auto* producer = &(p->src_pipeline->get_operators()[0].get());
       return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
     }
   }
-  if (!all_ports_empty()) { return task_creation_hint{TaskCreationHint::READY, this}; }
+  if (_current_partition_index < partition_count()) {
+    return task_creation_hint{TaskCreationHint::READY, this};
+  }
   return std::nullopt;
 }
 
 std::unique_ptr<operator_data> sirius_physical_dense_count_join::get_next_task_input_data()
 {
-  std::vector<std::shared_ptr<::cucascade::data_batch>> preserved_batches;
-  std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches;
+  // Concurrent task creation can reach this for the same operator; the partition cursor and the
+  // two repositories must advance together or two tasks would share a partition.
+  std::lock_guard<std::mutex> guard(lock);
+
+  auto* preserved_port = get_port(PRESERVED_PORT);
+  auto* counted_port   = get_port(COUNTED_PORT);
+  if (preserved_port == nullptr || counted_port == nullptr) { return nullptr; }
 
   auto drain = [](port* input_port,
+                  std::size_t partition_idx,
                   std::vector<std::shared_ptr<::cucascade::data_batch>>& destination) {
     if (input_port->repo == nullptr) { return; }
-    while (auto batch = input_port->repo->pop_next_data_batch()) {
+    while (auto batch = input_port->repo->pop_next_data_batch(partition_idx)) {
       destination.push_back(std::move(batch));
     }
   };
-  drain(get_port(PRESERVED_PORT), preserved_batches);
-  drain(get_port(COUNTED_PORT), counted_batches);
 
-  if (preserved_batches.empty() && counted_batches.empty()) { return nullptr; }
-  return std::make_unique<dense_count_join_input>(std::move(preserved_batches),
-                                                  std::move(counted_batches));
+  auto const num_partitions = partition_count();
+  // Skip forward over empty partitions rather than reporting exhaustion: returning nullptr here
+  // ends task creation, which would drop every partition after the first empty one.
+  while (_current_partition_index < num_partitions) {
+    auto const this_partition = _current_partition_index++;
+    std::vector<std::shared_ptr<::cucascade::data_batch>> preserved_batches;
+    std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches;
+    drain(preserved_port, this_partition, preserved_batches);
+    drain(counted_port, this_partition, counted_batches);
+    if (preserved_batches.empty() && counted_batches.empty()) { continue; }
+
+    // A single partition imposes no cross-task device agreement, so leave it untagged and let the
+    // scheduler place it on whichever GPU already holds the data. With more than one, every task
+    // of a partition must share a device, which the partition index pins.
+    if (num_partitions == 1) {
+      return std::make_unique<dense_count_join_input>(std::move(preserved_batches),
+                                                      std::move(counted_batches));
+    }
+    return std::make_unique<dense_count_join_input>(
+      std::move(preserved_batches), std::move(counted_batches), this_partition);
+  }
+  return nullptr;
 }
 
 std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
@@ -395,6 +482,20 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
   bool const check_product_overflow =
     count_product_needs_validation(preserved_rows, counted_rows, count_star);
   auto const non_null_keys = preserved_rows - preserved_null_keys;
+
+  // NULL is one SQL group, so exactly one task may emit it. Hash partitioning sends every null key
+  // to the same partition; if that ever stopped holding, the output would carry one NULL group per
+  // task carrying null keys and the row would silently duplicate.
+  if (preserved_null_keys > 0) {
+    std::lock_guard<std::mutex> guard(lock);
+    if (_null_group_emitted) {
+      throw sirius::internal_exception(
+        "dense_count_join: a second task received {} NULL preserved keys; null keys must all land "
+        "in one partition or the NULL group is emitted more than once",
+        preserved_null_keys);
+    }
+    _null_group_emitted = true;
+  }
 
   std::unique_ptr<cudf::table> output;
   if (non_null_keys == 0) {

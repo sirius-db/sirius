@@ -17,6 +17,7 @@
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_dense_count_join.hpp"
+#include "op/sirius_physical_partition.hpp"
 #include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"
@@ -259,6 +260,17 @@ constexpr char const* nested_dense_count_join_query =
   "  SELECT o_cust AS k, count(c2.c_id) AS n FROM ord LEFT JOIN cust c2 ON o_cust = c2.c_id"
   "  GROUP BY o_cust"
   ") t ON c_id = t.k GROUP BY c_id";
+
+// The fused operator's inputs are hash-partitioned, so its direct child is a PARTITION and the
+// producer that terminates its own pipeline sits one level below that.
+sirius::op::sirius_physical_operator const* dense_input_root(
+  sirius::op::sirius_physical_operator const* dense, std::size_t child_index)
+{
+  auto const* child = dense->children[child_index].get();
+  REQUIRE(child->type == sirius::op::SiriusPhysicalOperatorType::PARTITION);
+  REQUIRE(child->children.size() == 1);
+  return child->children[0].get();
+}
 
 sirius::pipeline::sirius_pipeline const* pipeline_containing(
   sirius::pipeline::pipeline_conversion_result const& result,
@@ -523,7 +535,7 @@ TEST_CASE_METHOD(dense_count_join_fixture,
         auto const* dense         = require_dense_count_join_conversion(result);
         auto const* join_pipeline = pipeline_containing(result, T::HASH_JOIN);
         REQUIRE(join_pipeline != nullptr);
-        CHECK(join_pipeline->get_sink().get() == dense->children[1].get());
+        CHECK(join_pipeline->get_sink().get() == dense_input_root(dense, 1));
         std::vector<std::string_view> ports;
         for (auto const& wiring : result.repository_wirings) {
           if (wiring.dest_pipeline.get() == join_pipeline) { ports.push_back(wiring.port_id); }
@@ -542,7 +554,7 @@ TEST_CASE_METHOD(dense_count_join_fixture,
         REQUIRE(merge_pipeline != nullptr);
         REQUIRE(merge_pipeline->get_sink());
         if (fused) {
-          CHECK(merge_pipeline->get_sink().get() == dense->children[1].get());
+          CHECK(merge_pipeline->get_sink().get() == dense_input_root(dense, 1));
           CHECK(merge_pipeline->get_sink()->type != T::MERGE_GROUP_BY);
         } else {
           CHECK(merge_pipeline->get_sink()->type == T::MERGE_GROUP_BY);
@@ -553,6 +565,52 @@ TEST_CASE_METHOD(dense_count_join_fixture,
     sirius::test::scoped_sirius_setting unfused{*con, "fuse_merge_pipelines", false};
     check_merge_boundary(false);
   }
+}
+
+TEST_CASE_METHOD(dense_count_join_fixture,
+                 "dense_count_join feeds from a PARTITION on each side",
+                 "[dense_count_join][pipeline][partition]")
+{
+  auto const query =
+    "SELECT c_id, count(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust "
+    "GROUP BY c_id";
+
+  REQUIRE(has_dense_count_join(query));
+
+  sirius::test::with_conversion_result(
+    *con, query, [](sirius::pipeline::pipeline_conversion_result& result) {
+      using sirius::op::SiriusPhysicalOperatorType;
+      using sirius::op::sirius_physical_partition;
+
+      sirius::op::sirius_physical_operator* dense = nullptr;
+      for (auto const& pipeline : result.scheduled_pipelines) {
+        for (auto const& op_ref : pipeline->get_operators()) {
+          if (op_ref.get().type != SiriusPhysicalOperatorType::DENSE_COUNT_JOIN) { continue; }
+          REQUIRE(dense == nullptr);
+          dense = &op_ref.get();
+        }
+      }
+      REQUIRE(dense != nullptr);
+      REQUIRE(dense->children.size() == 2);
+
+      // Both inputs are partitioned, so a task can take one partition of each side rather than
+      // both inputs whole. No CONCAT sits between: this operator builds no hash table.
+      REQUIRE(dense->children[0]->type == SiriusPhysicalOperatorType::PARTITION);
+      REQUIRE(dense->children[1]->type == SiriusPhysicalOperatorType::PARTITION);
+      auto& preserved_partition = dense->children[0]->Cast<sirius_physical_partition>();
+      auto& counted_partition   = dense->children[1]->Cast<sirius_physical_partition>();
+
+      // The preserved side is the build side, which makes it the sizing driver.
+      CHECK(preserved_partition.is_build_partition());
+      CHECK_FALSE(counted_partition.is_build_partition());
+
+      // Sizing reads both sides' bytes, so each partition must be able to reach the other and
+      // must route its count decision through the fused operator.
+      CHECK(preserved_partition.get_downstream_consumer_op() == dense);
+      CHECK(counted_partition.get_downstream_consumer_op() == dense);
+      CHECK(preserved_partition.get_sibling_partition_op() == &counted_partition);
+      CHECK(counted_partition.get_sibling_partition_op() == &preserved_partition);
+    });
 }
 
 TEST_CASE_METHOD(dense_count_join_fixture,
