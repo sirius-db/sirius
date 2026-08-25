@@ -19,7 +19,7 @@
 #include "memory/topology_index.hpp"
 
 #include <cuda/memory_resource>
-#include <cuda/stream_ref>
+#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>

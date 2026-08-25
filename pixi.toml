@@ -38,6 +38,7 @@ mold = "*"
 libprotobuf = "*"
 rust = "*"
 cuda-nvrtc-dev = "*"
+boto3 = ">=1.43.68,<2"
 
 [pypi-dependencies]
 rumdl = "==0.2.44"
@@ -79,8 +80,13 @@ platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
 
 [feature.cuda13.dependencies]
 cuda-version = "13.2.*"
-libcudf = "26.06.*"
-libcuvs = "26.06.*"
+# 26.08 for the hybrid-scan multi-file reader
+# (cudf/io/experimental/hybrid_scan_multifile.hpp), which does not exist in
+# 26.06. Pinned to the release build on the `rapidsai` channel rather than a
+# nightly, so a build is reproducible instead of tracking whatever was
+# published that day.
+libcudf = "==26.08.01"
+libcuvs = "==26.08.01"
 
 [feature.cuda13.activation.env]
 # GPU architectures: Turing through Blackwell (75, 80, 86, 89, 90a, 100f, 120a, 120)
@@ -92,8 +98,8 @@ platforms = ["linux-64-cuda12", "linux-aarch64-cuda12"]
 
 [feature.cuda12.dependencies]
 cuda-version = "12.*"
-libcudf = "26.06.*"
-libcuvs = "26.06.*"
+libcudf = "==26.08.01"
+libcuvs = "==26.08.01"
 
 [feature.cuda12.activation.env]
 # GPU architectures: Turing through Hopper (75, 80, 86, 89, 90a)
