@@ -3,6 +3,9 @@ name: Validate
 on:
   pull_request_target:
     types: [opened, reopened, edited, synchronize]
+  pull_request:
+    paths:
+      - .github/workflows/validate.yml
   merge_group:
 
 jobs:
