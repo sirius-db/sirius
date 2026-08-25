@@ -108,8 +108,19 @@ DEFAULT_PROFILE = {
 
 CACHE_CONFIG_PATH = ("sirius", "executor", "scan_manager", "cache")
 
+# --pin parquet pins undecoded column chunks into the prefetching cache, so it
+# needs a cache that keeps them: 'sirius' to have one at all, 'lru' because
+# 'idle' drops a chunk the moment nothing is reading it, and a threshold of 1.0
+# so the evictor only starts once the pool is genuinely full. Without these the
+# pin populates the cache and the evictor empties it again.
+PARQUET_PIN_CACHE = {
+    "mode": "sirius",
+    "eviction": "lru",
+    "eviction_threshold_fraction": 1.0,
+}
+
 ENGINE_CHOICES = ("gpu", "cpu", "both")
-PIN_CHOICES = ("none", "gpu", "host")
+PIN_CHOICES = ("none", "gpu", "host", "parquet")
 DATA_SOURCE_CHOICES = ("parquet", "duckdb")
 TPCH_TABLES = (
     "customer",
@@ -333,13 +344,16 @@ def _plant(doc, keys, values):
     return node
 
 
-def check_execution_sanity(execution, config_path, engine, pin):
-    """Validate the run's inputs against the execution profile before anything runs.
+def check_execution_sanity(execution, overrides, config_path, engine, pin):
+    """Validate the run's inputs before anything runs.
 
     Every check here catches a mistake that would otherwise yield a plausible
     number rather than an error.
     """
-    profile = EXECUTION_PROFILES[execution]
+    profile = (
+        EXECUTION_PROFILES[execution] if execution is not None else DEFAULT_PROFILE
+    )
+    label = f"--execution {execution}" if execution is not None else f"--pin {pin}"
     problems = []
     warnings = []
 
@@ -361,21 +375,18 @@ def check_execution_sanity(execution, config_path, engine, pin):
                 # is how two results become incomparable for reasons nobody can
                 # reconstruct later.
                 existing = _dig(doc, CACHE_CONFIG_PATH) or {}
-                for key, wanted in (
-                    ("mode", profile["cache_mode"]),
-                    ("eviction", profile["eviction"]),
-                ):
+                for key, wanted in overrides.items():
                     have = existing.get(key)
                     if have is not None and have != wanted:
                         warnings.append(
                             f"config sets cache.{key}={have!r}; "
-                            f"--execution {execution} overrides it to {wanted!r}"
+                            f"{label} overrides it to {wanted!r}"
                         )
     else:
         warnings.append(
             "no Sirius config given (--config / $SIRIUS_CONFIG_FILE); the cache "
-            f"settings for --execution {execution} will be written into a "
-            "generated config over Sirius defaults"
+            f"settings for {label} will be written into a generated config over "
+            "Sirius defaults"
         )
 
     # Fail now rather than after the first query was measured against a warm cache.
@@ -390,8 +401,8 @@ def check_execution_sanity(execution, config_path, engine, pin):
             )
         else:
             warnings.append(
-                f"{detail}; --execution {execution} wanted one drop at startup, so "
-                "the first query may read warm"
+                f"{detail}; {label} wanted one drop at startup, so the first "
+                "query may read warm"
             )
 
     if profile["reset_cache_between"] and engine == "cpu":
@@ -400,7 +411,10 @@ def check_execution_sanity(execution, config_path, engine, pin):
             "does nothing for --engine cpu"
         )
 
-    if pin != "none" and execution == "cold":
+    if pin == "parquet" and engine == "cpu":
+        problems.append("--pin parquet is Sirius-only; it cannot serve --engine cpu")
+
+    if pin != "none" and pin != "parquet" and execution == "cold":
         warnings.append(
             "--pin keeps table data resident on the GPU, which is not something "
             "--execution cold flushes; the scan is cold but the pinned columns "
@@ -415,30 +429,47 @@ def check_execution_sanity(execution, config_path, engine, pin):
         )
 
 
-def derive_execution_config(execution, config_path, benchmark_dir):
+def cache_overrides_for(execution, pin):
+    """The cache settings this run needs, or {} to leave the config alone.
+
+    Both inputs can ask for settings and --pin parquet wins where they disagree:
+    a pin the evictor immediately undoes is not a pin, whereas an execution
+    profile whose eviction policy shifted still measures something coherent.
+    """
+    overrides = {}
+    if execution is not None:
+        profile = EXECUTION_PROFILES[execution]
+        overrides["mode"] = profile["cache_mode"]
+        overrides["eviction"] = profile["eviction"]
+    if pin == "parquet":
+        for key, value in PARQUET_PIN_CACHE.items():
+            if key in overrides and overrides[key] != value:
+                log(
+                    f"  WARNING: --execution {execution} wants cache.{key}="
+                    f"{overrides[key]!r}, but --pin parquet requires {value!r}; "
+                    "using the pin's value"
+                )
+            overrides[key] = value
+    return overrides
+
+
+def derive_execution_config(overrides, config_path, benchmark_dir):
     """Write the config this run will actually use and return its path.
 
     The user's file is the base and only the profile's cache settings are
     planted over it, so everything else survives untouched. Written beside the
     results as `effective_config.yml`; the original stays as `config.yml`.
     """
-    profile = EXECUTION_PROFILES[execution]
     doc = _load_yaml(config_path) if config_path and os.path.isfile(config_path) else {}
     if not isinstance(doc, dict):
         doc = {}
 
-    _plant(
-        doc,
-        CACHE_CONFIG_PATH,
-        {"mode": profile["cache_mode"], "eviction": profile["eviction"]},
-    )
+    _plant(doc, CACHE_CONFIG_PATH, overrides)
 
     effective_path = os.path.join(benchmark_dir, "effective_config.yml")
     _dump_yaml(doc, effective_path)
-    log(
-        f"  cache.mode={profile['cache_mode']} cache.eviction={profile['eviction']} "
-        f"-> {effective_path}"
-    )
+    settings = " ".join(f"cache.{k}={v}" for k, v in overrides.items())
+    log(f"  {settings} -> {effective_path}")
     return effective_path
 
 
@@ -1247,7 +1278,10 @@ def parse_args():
             "Pin TPC-H tables into the Sirius cache (Sirius-only). 'gpu' or "
             "'host' selects the cache tier; 'none' disables pinning. Pin is "
             "per-query under the hot profile and a single union-pin at "
-            "session start under cold/lukewarm. (default: none)"
+            "session start under cold/lukewarm. 'parquet' pins the undecoded "
+            "column-chunk bytes into the Sirius prefetching cache instead of "
+            "materialising on the GPU, so it needs cache.mode='sirius' and "
+            "--data-source parquet. (default: none)"
         ),
     )
     p.add_argument(
@@ -1349,11 +1383,16 @@ def main():
         if args.execution is not None
         else DEFAULT_PROFILE
     )
+    cache_overrides = (
+        {} if nsys_profile else cache_overrides_for(args.execution, args.pin)
+    )
     if not nsys_profile:
         log(f"Execution:     {args.execution or '(unset)'} — {profile['summary']}")
-        if args.execution is not None:
+        if cache_overrides:
             log("Checking execution sanity")
-            check_execution_sanity(args.execution, config_path, args.engine, args.pin)
+            check_execution_sanity(
+                args.execution, cache_overrides, config_path, args.engine, args.pin
+            )
 
     if args.pin != "none":
         os.environ["SIRIUS_PIN_TIER"] = args.pin
@@ -1376,7 +1415,7 @@ def main():
     os.environ["SIRIUS_LOG_DIR"] = log_dir
 
     # Set before any connection opens: Sirius reads SIRIUS_CONFIG_FILE at LOAD.
-    if nsys_profile or args.execution is None:
+    if not cache_overrides:
         if config_path:
             os.environ["SIRIUS_CONFIG_FILE"] = config_path
         else:
@@ -1387,7 +1426,7 @@ def main():
     else:
         log("Deriving effective Sirius config")
         config_path = derive_execution_config(
-            args.execution, config_path, benchmark_dir
+            cache_overrides, config_path, benchmark_dir
         )
         os.environ["SIRIUS_CONFIG_FILE"] = config_path
 

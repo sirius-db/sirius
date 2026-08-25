@@ -1099,9 +1099,10 @@ unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
     throw BinderException("pin_table requires a 'tier' named parameter");
   }
   result->args.tier = tier_it->second.ToString();
-  if (result->args.tier != "gpu" && result->args.tier != "host") {
+  if (result->args.tier != "gpu" && result->args.tier != "host" &&
+      result->args.tier != "parquet") {
     throw NotImplementedException("pin_table tier='" + result->args.tier +
-                                  "' is not supported (only 'gpu' and 'host')");
+                                  "' is not supported (only 'gpu', 'host' and 'parquet')");
   }
 
   auto name_it = input.named_parameters.find("name");
@@ -1158,6 +1159,12 @@ unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
       throw BinderException("pin_table: format 'parquet' requires a positional path argument");
     }
   } else {
+    if (result->args.tier == "parquet") {
+      // The tier pins undecoded parquet bytes, so there have to be some.
+      throw BinderException(
+        "pin_table tier='parquet' only applies to format 'parquet'; a duckdb-native table has "
+        "no parquet column chunks to pin");
+    }
     // duckdb: 'name' is the (optionally qualified) table to pin, resolved from the
     // catalog — no path needed. 'schema' is a SQL reserved word, so the optional
     // schema override is the 'schema_name' parameter.
@@ -1280,6 +1287,22 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     if (file_paths.empty()) {
       throw InvalidInputException("pin_table: no parquet files matched path: " + data.args.path);
     }
+
+    // tier='parquet' pins the undecoded bytes and stops there: there is no
+    // decode, no GPU materialisation and no pinned_entry, because the residency
+    // it creates lives in the IO cache and the ordinary scan path finds it by
+    // path and offset. Everything below this point is the decode-and-place
+    // machinery the other two tiers need, so this returns rather than falls
+    // through it.
+    if (data.args.tier == "parquet") {
+      scan_mgr.pin_parquet_ranges(data.args.name, file_paths, data.args.cols);
+      window.finish();
+      output.SetCardinality(1);
+      output.SetValue(0, 0, Value::BOOLEAN(true));
+      data.finished = true;
+      return;
+    }
+
     auto info =
       build_parquet_pin_info(scan_mgr, file_paths, data.args.cols, batch_size, pinned_column_types);
     ingestible = sirius::op::scan::make_ingestible(std::move(info));

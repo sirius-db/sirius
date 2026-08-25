@@ -602,6 +602,28 @@ class sirius_scan_manager {
 
   parquet_bind_result describe_parquet(std::string const& uri);
 
+  /// \brief Pin @p file_paths' column-chunk bytes into the prefetching cache.
+  ///
+  /// The pin is the cache itself: the selected columns' chunks are inserted,
+  /// staged and read, and the ordinary scan path then finds them resident and
+  /// serves from them. Nothing is decoded and nothing is materialised on the
+  /// GPU, which is what separates this from the gpu/host tiers.
+  ///
+  /// Residency is held by keeping each file's @c sirius_datasource -- and so its
+  /// @c prefetching_handle -- alive under @p name until @ref remove_pinned_entry
+  /// drops it. That is load-bearing rather than incidental: the evictor only
+  /// considers a request's chunks once its consumer is disposed, so a live
+  /// handle is what keeps them out of the reclaim sweep entirely.
+  ///
+  /// @param cols  columns to pin, or all of them when unset.
+  /// @return bytes of column-chunk data requested across every file.
+  /// @throws std::runtime_error when the configuration gives this backend no
+  ///         prefetching cache -- there is nowhere to pin to, and silently
+  ///         doing nothing would read as a successful pin.
+  std::size_t pin_parquet_ranges(std::string const& name,
+                                 std::vector<std::string> const& file_paths,
+                                 std::optional<std::vector<std::string>> const& cols);
+
   /// \brief Process-wide ioctx used to mint @c sirius_datasource instances.
   ///        Holds a @c uring_ioctx, or a @c kvikio_context when the manager
   ///        was configured with @c backend=kvikio.
@@ -710,6 +732,12 @@ class sirius_scan_manager {
     _providers_by_op;
   std::vector<op::scan::sirius_gpu_scan_operator*> _scan_op_order;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
+
+  /// Datasources retained by @ref pin_parquet_ranges, keyed by pin name. Holding
+  /// them is the pin: each owns the prefetching_handle whose live consumer keeps
+  /// its chunks out of the evictor's reach.
+  std::unordered_map<std::string, std::vector<std::shared_ptr<sirius::io::sirius_datasource>>>
+    _pinned_parquet_sources;
   bool _pruning_enabled{true};
 
   /// One mask computation per distinct pinned entry matched this query

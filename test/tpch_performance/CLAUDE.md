@@ -168,6 +168,26 @@ sirius,TOTAL,0,1.062193
 A query that failed or timed out records `nan` and is left out of the total rather than
 poisoning it; the run log says how many queries a short total covers.
 
+#### `--pin parquet`
+
+A fourth pin tier alongside `gpu` / `host`. Instead of decoding and materialising columns, it
+pins the **undecoded parquet column-chunk bytes** into Sirius's prefetching cache; the ordinary
+scan path then finds them resident and serves from them. Parquet sources only — a duckdb-native
+table has no column chunks to pin, and the bind rejects it.
+
+It forces three cache settings into the effective config, overriding both `--config` and any
+`--execution` profile (with a warning when they disagree):
+
+| key | value | why |
+|---|---|---|
+| `cache.mode` | `sirius` | there is no cache to pin into otherwise |
+| `cache.eviction` | `lru` | `idle` drops a chunk the moment nothing reads it |
+| `cache.eviction_threshold_fraction` | `1.0` | the evictor should not start until the pool is full |
+
+Residency is held by keeping each file's datasource (and so its prefetching handle) alive until
+`unpin_table`. Passing `--pin parquet` is enough to trigger the config rewrite — `--execution` is
+not required.
+
 #### Execution profiles (`--execution`)
 
 `--execution` names a **cache state to measure**, not just an iteration order. Each value fixes

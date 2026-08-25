@@ -30,6 +30,7 @@
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/scan/parquet_materialize.hpp"
 #include "op/scan/parquet_metadata.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
@@ -69,6 +70,7 @@
 #include <iterator>
 #include <latch>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <unordered_map>
@@ -1522,6 +1524,126 @@ void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
 void sirius_scan_manager::remove_pinned_entry(const std::string& name)
 {
   _pinned_entries.erase(name);
+  // Dropping the datasources releases their prefetching handles, which disposes
+  // each request's consumer and hands the chunks back to the evictor. That is
+  // the whole of unpinning a parquet-tier entry.
+  _pinned_parquet_sources.erase(name);
+}
+
+std::size_t sirius_scan_manager::pin_parquet_ranges(
+  std::string const& name,
+  std::vector<std::string> const& file_paths,
+  std::optional<std::vector<std::string>> const& cols)
+{
+  auto* cache = _io_ctx ? _io_ctx->cache() : nullptr;
+  if (cache == nullptr || !cache->is_armed()) {
+    throw std::runtime_error(
+      "pin_table tier='parquet' needs the Sirius prefetching cache: set "
+      "sirius.executor.scan_manager.cache.mode to 'sirius' on a backend that supports it");
+  }
+  // Worth warning rather than failing: the pin still populates the cache and
+  // still serves reads either way, it is just not durable.
+  if (_config.cache.dispose_on_idle) {
+    SIRIUS_LOG_WARN(
+      "[pin_table] cache.eviction is 'idle', so pinned parquet chunks are reclaimed as soon "
+      "as nothing is reading them; set eviction to 'lru' for a durable pin");
+  } else if (_config.cache.eviction_threshold_fraction < 1.0) {
+    SIRIUS_LOG_WARN(
+      "[pin_table] cache.eviction_threshold_fraction is {}, so the evictor starts before the "
+      "pool is full and can reclaim pinned chunks; set it to 1.0 for a durable pin",
+      _config.cache.eviction_threshold_fraction);
+  }
+
+  // Replace rather than accumulate: a re-pin under the same name should leave
+  // one set of handles, not two covering the same chunks.
+  _pinned_parquet_sources.erase(name);
+  auto& retained = _pinned_parquet_sources[name];
+  retained.reserve(file_paths.size());
+
+  std::size_t total_bytes = 0;
+  for (auto const& path : file_paths) {
+    auto const cache_key = normalize_path(path);
+    auto const io_ctx    = ioctx_for_path(path);
+    bool const footer_cached =
+      io_ctx && io_ctx->metadata_store().get_metadata(cache_key) != nullptr;
+    auto datasource = create_datasource(
+      path,
+      footer_cached ? sirius::io::open_hint::generic
+                    : sirius::io::open_hint::parquet_footer_probe);
+    if (!datasource) {
+      throw std::runtime_error("[pin_table] no backend supports parquet path: " + path);
+    }
+
+    // Same footer resolution as describe_parquet / build_file_scan_info, so a
+    // file is parsed at most once per process however it is first touched.
+    std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
+    if (auto cached_md = datasource->metadata()) {
+      if (auto pm = std::dynamic_pointer_cast<op::scan::parquet_metadata>(std::move(cached_md))) {
+        file_metadata = pm->file_metadata();
+      }
+    }
+    if (!file_metadata) {
+      auto footer_buffer         = cudf::io::parquet::fetch_footer_to_host(*datasource);
+      auto const footer_byte_len = footer_buffer->size();
+      auto probe_options         = cudf::io::parquet_reader_options::builder().build();
+      cudf::io::parquet::experimental::hybrid_scan_reader reader{
+        cudf::host_span<std::uint8_t const>(footer_buffer->data(), footer_buffer->size()),
+        probe_options};
+      file_metadata =
+        std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata());
+      std::ignore = datasource->store_metadata(
+        std::make_shared<op::scan::parquet_metadata>(file_metadata, footer_byte_len));
+    }
+
+    if (file_metadata->row_groups.empty()) { continue; }
+    std::vector<cudf::size_type> row_groups(file_metadata->row_groups.size());
+    std::iota(row_groups.begin(), row_groups.end(), 0);
+
+    // The column selection rides on the reader options, which is what narrows
+    // the enumerated chunks to the pinned columns.
+    auto builder = cudf::io::parquet_reader_options::builder();
+    if (cols && !cols->empty()) { builder.columns(*cols); }
+    auto reader_options = builder.build();
+
+    auto ranges = op::scan::column_chunk_ranges(*file_metadata, reader_options, row_groups);
+    if (ranges.empty()) { continue; }
+    for (auto const& r : ranges) {
+      total_bytes += static_cast<std::size_t>(r.size());
+    }
+
+    // insert -> stage -> read. prepare_prefetch is what attaches the staging
+    // buffers; without it the request names chunks but owns no memory and the
+    // prefetch settles having done nothing.
+    datasource->fadvise(ranges, std::nullopt);
+    auto const prepared = datasource->prepare_prefetch(/*wait_for_eviction=*/true);
+    if (prepared == sirius::io::prepare_result::allocation_failed) {
+      throw std::runtime_error(
+        "[pin_table] the prefetching cache could not stage " + path +
+        ": the pool is too small for the requested columns");
+    }
+    // Block until the bytes are actually resident: a pin that returned with its
+    // IO still in flight would report success before it was true. on_done fires
+    // exactly once either way -- inline when no IO was issued -- so the latch
+    // cannot be left waiting.
+    std::latch settled{1};
+    bool loaded = false;
+    std::ignore = datasource->prefetch_async([&settled, &loaded](bool ok) noexcept {
+      loaded = ok;
+      settled.count_down();
+    });
+    settled.wait();
+    if (!loaded) {
+      throw std::runtime_error("[pin_table] prefetch failed while pinning " + path);
+    }
+
+    retained.push_back(std::move(datasource));
+  }
+
+  SIRIUS_LOG_INFO("[pin_table] pinned {} parquet file(s) as '{}' ({} bytes of column chunks)",
+                  retained.size(),
+                  name,
+                  total_bytes);
+  return total_bytes;
 }
 
 void sirius_scan_manager::visit_pinned_entries(
