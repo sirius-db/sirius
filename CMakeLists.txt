@@ -755,7 +755,9 @@ set(TEST_SOURCES
     test/cpp/io/s3/test_s3_default_visibility_guard.cpp
     test/cpp/io/s3/test_sirius_sigv4_authorizer.cpp
     test/cpp/io/s3/test_static_credentials.cpp
+    test/cpp/io/test_io_request.cpp
     test/cpp/io/test_parquet_helpers.cpp
+    test/cpp/io/test_templated_ioctx.cpp
     test/cpp/io/test_uri_parser.cpp
     test/cpp/io/uring/test_uring_readv.cpp
     test/cpp/io/rest/test_rest_reactor.cpp
