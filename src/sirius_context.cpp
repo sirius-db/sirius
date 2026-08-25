@@ -222,7 +222,21 @@ SiriusContext::SiriusContext() = default;
 
 SiriusContext::~SiriusContext() noexcept
 {
-  if (is_initialized_) { terminate(); }
+  if (!is_initialized_) { return; }
+
+  try {
+    terminate();
+  } catch (const std::exception& e) {
+    try {
+      SIRIUS_LOG_ERROR("SiriusContext teardown failed: {}", e.what());
+    } catch (...) {
+    }
+  } catch (...) {
+    try {
+      SIRIUS_LOG_ERROR("SiriusContext teardown failed with an unknown error");
+    } catch (...) {
+    }
+  }
 }
 
 // Log host and GPU memory pool stats at a labeled point.
@@ -878,14 +892,17 @@ void SiriusContext::terminate()
 {
   throw_if_not_initialized();
 
+  // task_creator_ and downgrade_executors_ hold non-owning pointers into task_scheduler_. Stop and
+  // join every borrower before destroying the scheduler and its task queue.
   task_scheduler_->stop();
-  task_scheduler_.reset();
   if (scan_manager_) { scan_manager_->stop(); }
   task_creator_->stop_thread_pool();
-  task_creator_.reset();
   for (auto& executor : downgrade_executors_) {
     executor->stop();
   }
+
+  task_scheduler_.reset();
+  task_creator_.reset();
   downgrade_executors_.clear();
   sirius::telemetry::batch_telemetry_registry::instance().uninstall();
   telemetry_context_.reset();
