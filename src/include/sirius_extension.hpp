@@ -129,6 +129,18 @@ class SiriusExtension : public Extension {
                                                  vector<LogicalType>& return_types,
                                                  vector<string>& names);
 
+  /// reset_sirius_cache(): drop every ioctx's prefetching cache and rebuild it
+  /// empty, so the next query pays its own IO instead of reading what the last
+  /// one left resident.  A no-op where the configuration or the backend gives
+  /// no cache in the first place.
+  static void ResetSiriusCacheFunction(ClientContext& context,
+                                       TableFunctionInput& data_p,
+                                       DataChunk& output);
+  static unique_ptr<FunctionData> ResetSiriusCacheBind(ClientContext& context,
+                                                       TableFunctionBindInput& input,
+                                                       vector<LogicalType>& return_types,
+                                                       vector<string>& names);
+
 #ifdef SIRIUS_ENABLE_LEGACY
   static bool buffer_is_initialized;
 #endif
