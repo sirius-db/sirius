@@ -23,6 +23,8 @@
 
 #include <pthread.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -32,11 +34,13 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <stop_token>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -125,6 +129,35 @@ using system_events = std::variant<task_created_event,
                                    memory_downgrade_for_task_event,
                                    wait_for_memory_for_task_event>;
 
+/// Number of distinct events, and so the width of the manager's routing table.
+inline constexpr std::size_t n_system_events = std::variant_size_v<system_events>;
+
+/// An event's slot in that table. The variant arms are declared in enumerator
+/// order, which is what lets the tag double as the index -- reorder one list
+/// without the other and every event routes to the wrong subscribers.
+template <typename Event>
+inline constexpr std::size_t event_index_v = static_cast<std::size_t>(Event::event_type);
+
+static_assert(
+  std::is_same_v<std::variant_alternative_t<event_index_v<task_created_event>, system_events>,
+                 task_created_event>);
+static_assert(
+  std::is_same_v<
+    std::variant_alternative_t<event_index_v<wait_for_memory_for_task_event>, system_events>,
+    wait_for_memory_for_task_event>);
+
+/// Every event, for the @ref query_stage_manager::register_listener overload
+/// that takes no subscription list.
+inline constexpr std::array<query_stage_event_type, n_system_events> all_system_events{
+  query_stage_event_type::task_created,
+  query_stage_event_type::task_deployed,
+  query_stage_event_type::failed_to_create_task,
+  query_stage_event_type::task_queue_empty,
+  query_stage_event_type::pipeline_closed,
+  query_stage_event_type::executor_awaiting_task,
+  query_stage_event_type::memory_downgrade_for_task,
+  query_stage_event_type::wait_for_memory_for_task};
+
 /// The mailbox a single listener is fed through.  Events travel as a
 /// @c shared_ptr because one raised event goes to every subscriber: the payload
 /// is built once and the queues carry references to it.  A null entry is the
@@ -188,14 +221,50 @@ class query_stage_manager : public std::enable_shared_from_this<query_stage_mana
   /// misses what was published before it arrived.  Registering after @ref stop
   /// yields an already-stopped token and a queue nothing will ever be pushed
   /// to, so the listener finishes immediately rather than hanging.
+  /// Mint a mailbox subscribed to every event.
   [[nodiscard]] listener_registration register_listener()
+  {
+    return register_listener(all_system_events);
+  }
+
+  /// Mint a mailbox subscribed to @p events and nothing else.
+  ///
+  /// Publishing walks one subscriber list per event, so a listener that names
+  /// two events is skipped outright by the other six rather than being handed a
+  /// payload it will drop. With a handful of listeners that is a rounding error;
+  /// it is worth having because the cost grows with listeners x events while the
+  /// useful work does not.
+  ///
+  /// The list is the subscription -- a callback the listener overrides but does
+  /// not name here is never called. Keeping the two in step is the caller's job,
+  /// which is the trade for @c override still catching a misspelt or drifted
+  /// callback signature.
+  [[nodiscard]] listener_registration register_listener(
+    std::span<query_stage_event_type const> events)
   {
     auto queue = std::make_shared<system_event_queue>();
     {
       std::unique_lock g{_queues_mtx};
-      if (!_stopped) { _queues.push_back(queue); }
+      if (!_stopped) {
+        _queues.push_back(queue);
+        for (auto e : events) {
+          auto& bucket = _by_event[static_cast<std::size_t>(e)];
+          // A repeated event would double-deliver, and a caller assembling the
+          // list from overlapping sets should not have to care.
+          if (std::ranges::find(bucket, queue.get()) == bucket.end()) {
+            bucket.push_back(queue.get());
+          }
+        }
+      }
     }
     return listener_registration{std::move(queue), _stop_source.get_token()};
+  }
+
+  [[nodiscard]] listener_registration register_listener(
+    std::initializer_list<query_stage_event_type> events)
+  {
+    return register_listener(
+      std::span<query_stage_event_type const>{events.begin(), events.size()});
   }
 
   /// Drop @p queue's registration.  Blocks until any in-flight publish has
@@ -205,6 +274,13 @@ class query_stage_manager : public std::enable_shared_from_this<query_stage_mana
   {
     std::unique_lock g{_queues_mtx};
     std::erase_if(_queues, [&queue](auto const& q) { return q == queue; });
+    // The buckets hold raw pointers into what _queues owns, so they have to be
+    // cleared in the same critical section: a pointer left behind would outlive
+    // the queue it names.
+    auto* raw = queue.get();
+    for (auto& bucket : _by_event) {
+      std::erase(bucket, raw);
+    }
   }
 
   /// Stop every listener and close the manager to further publishing.  Requests
@@ -220,6 +296,9 @@ class query_stage_manager : public std::enable_shared_from_this<query_stage_mana
       std::unique_lock g{_queues_mtx};
       _stopped = true;
       queues.swap(_queues);
+      for (auto& bucket : _by_event) {
+        bucket.clear();
+      }
     }
     for (auto const& q : queues) {
       // try_ so this stays genuinely noexcept: the allocating enqueue could
@@ -297,9 +376,10 @@ class query_stage_manager : public std::enable_shared_from_this<query_stage_mana
   {
     try {
       std::shared_lock g{_queues_mtx};
-      if (_queues.empty()) { return; }
+      auto const& subscribers = _by_event[event_index_v<std::decay_t<Event>>];
+      if (subscribers.empty()) { return; }
       auto payload = std::make_shared<system_events>(std::forward<Event>(event));
-      for (auto const& q : _queues) {
+      for (auto* q : subscribers) {
         q->enqueue(payload);
       }
     } catch (...) {  // NOLINT(bugprone-empty-catch)
@@ -311,7 +391,11 @@ class query_stage_manager : public std::enable_shared_from_this<query_stage_mana
   std::stop_source _stop_source;
 
   mutable std::shared_mutex _queues_mtx;
+  /// Owns the registered queues; the buckets below only point into it.
   std::vector<std::shared_ptr<system_event_queue>> _queues;
+  /// One subscriber list per event, indexed by @ref event_index_v. This is what
+  /// makes a notify cost only the listeners that asked for that event.
+  std::array<std::vector<system_event_queue*>, n_system_events> _by_event;
   bool _stopped{false};
 };
 
@@ -347,13 +431,33 @@ inline constexpr bool unhandled_event_type = false;
  */
 class query_stage_listener {
  public:
-  /// Registers a mailbox with @p manager; no thread runs until @ref start.
-  explicit query_stage_listener(query_stage_manager& manager) : _manager(manager.weak_from_this())
+  /// Registers a mailbox for every event; no thread runs until @ref start.
+  explicit query_stage_listener(query_stage_manager& manager)
+    : query_stage_listener(manager, all_system_events)
+  {
+  }
+
+  /// Registers a mailbox for @p events only.
+  ///
+  /// Name the events whose hooks you override and no others: the manager skips
+  /// this listener entirely when publishing anything else, so an overridden hook
+  /// left out of the list is simply never called. That is the cost of keeping
+  /// the hooks virtual -- @c override still catches a misspelt or drifted
+  /// signature, which a callback-detecting scheme cannot.
+  query_stage_listener(query_stage_manager& manager, std::span<query_stage_event_type const> events)
+    : _manager(manager.weak_from_this()), _events(events.begin(), events.end())
   {
     // Straight off the reference rather than through the weak handle: a manager
     // not owned by a shared_ptr has no weak_from_this, and a listener that
     // silently registered with nothing would be a very quiet bug.
-    adopt(manager.register_listener());
+    adopt(manager.register_listener(events));
+  }
+
+  query_stage_listener(query_stage_manager& manager,
+                       std::initializer_list<query_stage_event_type> events)
+    : query_stage_listener(manager,
+                           std::span<query_stage_event_type const>{events.begin(), events.size()})
+  {
   }
 
   virtual ~query_stage_listener() { stop(); }
@@ -504,7 +608,9 @@ class query_stage_listener {
   /// to, which is exactly what a listener with nothing to hear should be.
   void register_mailbox() noexcept
   {
-    if (auto manager = _manager.lock()) { adopt(manager->register_listener()); }
+    // Same subscription as the first time: a restarted listener must not quietly
+    // widen to every event.
+    if (auto manager = _manager.lock()) { adopt(manager->register_listener(_events)); }
   }
 
   void adopt(listener_registration reg) noexcept
@@ -589,6 +695,9 @@ class query_stage_listener {
 
   /// Weak so a listener never keeps the manager alive; used only to deregister.
   std::weak_ptr<query_stage_manager> _manager;
+  /// The events this listener subscribed to, kept so a restart re-subscribes to
+  /// the same set rather than to all of them.
+  std::vector<query_stage_event_type> _events;
   std::shared_ptr<system_event_queue> _queue;
   std::stop_token _stop_token;
   /// Whether @c _queue is still in the manager's fan-out set.

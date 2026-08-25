@@ -17,6 +17,7 @@
 #include "catch.hpp"
 #include "exec/query_stage_manager.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -110,7 +111,8 @@ class recording_listener : public query_stage_listener {
 /// poll rather than a read.  Fails by timing out, which is the honest outcome:
 /// an event that never shows up is indistinguishable from one that is merely
 /// slow, and the test should not pretend otherwise.
-bool wait_for(recording_listener const& l, std::size_t n, std::chrono::milliseconds timeout = 2s)
+template <typename Listener>
+bool wait_for(Listener const& l, std::size_t n, std::chrono::milliseconds timeout = 2s)
 {
   auto const deadline = std::chrono::steady_clock::now() + timeout;
   while (std::chrono::steady_clock::now() < deadline) {
@@ -118,6 +120,120 @@ bool wait_for(recording_listener const& l, std::size_t n, std::chrono::milliseco
     std::this_thread::sleep_for(1ms);
   }
   return l.count() >= n;
+}
+
+/// Records every event it is given, and is subscribed to only one.
+///
+/// The recording is what makes this discriminating. A listener that merely
+/// omitted the other hooks would inherit the base's empty defaults, so a
+/// wrongly-delivered event would land on a no-op and the test would pass with
+/// the routing table deleted. Overriding them all means an event this listener
+/// did not subscribe to cannot arrive unnoticed.
+class selective_listener : public query_stage_listener {
+ public:
+  explicit selective_listener(query_stage_manager& manager,
+                              std::initializer_list<query_stage_event_type> events)
+    : query_stage_listener(manager, events), _subscribed(events)
+  {
+  }
+
+  ~selective_listener() override { stop(); }
+
+  [[nodiscard]] std::string_view name() const noexcept override { return "selective"; }
+
+  void on_task_created(query_id_t,
+                       std::size_t,
+                       op::SiriusPhysicalOperatorType,
+                       queue_priority) noexcept override
+  {
+    record(query_stage_event_type::task_created, "task_created");
+  }
+
+  void on_task_deployed(query_id_t,
+                        std::size_t,
+                        op::SiriusPhysicalOperatorType,
+                        int) noexcept override
+  {
+    record(query_stage_event_type::task_deployed, "task_deployed");
+  }
+
+  void on_failed_to_create_task(query_id_t, std::size_t, std::size_t) noexcept override
+  {
+    record(query_stage_event_type::failed_to_create_task, "failed_to_create_task");
+  }
+
+  void on_task_queue_empty() noexcept override
+  {
+    record(query_stage_event_type::task_queue_empty, "task_queue_empty");
+  }
+
+  void on_pipeline_closed(query_id_t, std::size_t, std::size_t) noexcept override
+  {
+    record(query_stage_event_type::pipeline_closed, "pipeline_closed");
+  }
+
+  void on_executor_awaiting_task(int) noexcept override
+  {
+    record(query_stage_event_type::executor_awaiting_task, "executor_awaiting_task");
+  }
+
+  void on_memory_downgrade_for_task(query_id_t, std::size_t, int, std::size_t) noexcept override
+  {
+    record(query_stage_event_type::memory_downgrade_for_task, "memory_downgrade_for_task");
+  }
+
+  void on_wait_for_memory_for_task(query_id_t, std::size_t, int, std::size_t) noexcept override
+  {
+    record(query_stage_event_type::wait_for_memory_for_task, "wait_for_memory_for_task");
+  }
+
+  [[nodiscard]] std::vector<std::string> seen() const
+  {
+    std::lock_guard g{_mtx};
+    return _seen;
+  }
+
+  [[nodiscard]] std::size_t count() const
+  {
+    std::lock_guard g{_mtx};
+    return _seen.size();
+  }
+
+  /// Deliveries of events this listener did NOT subscribe to. The routing is
+  /// correct only while this stays zero -- and unlike the recorded names, it
+  /// says so without the test having to know which events were published.
+  [[nodiscard]] std::size_t unsubscribed_count() const noexcept
+  {
+    return _unsubscribed.load(std::memory_order_relaxed);
+  }
+
+ private:
+  void record(query_stage_event_type type, std::string what)
+  {
+    if (std::ranges::find(_subscribed, type) == _subscribed.end()) {
+      _unsubscribed.fetch_add(1, std::memory_order_relaxed);
+    }
+    std::lock_guard g{_mtx};
+    _seen.push_back(std::move(what));
+  }
+
+  mutable std::mutex _mtx;
+  std::vector<std::string> _seen;
+  std::vector<query_stage_event_type> _subscribed;
+  std::atomic<std::size_t> _unsubscribed{0};
+};
+
+/// Publish one of every event, in enumerator order.
+void publish_one_of_each(query_stage_manager& manager)
+{
+  manager.notify_task_created(make_query_id(1), 2, op::SiriusPhysicalOperatorType::GPU_SCAN, 0);
+  manager.notify_task_deployed(make_query_id(1), 2, op::SiriusPhysicalOperatorType::GPU_SCAN, 0);
+  manager.notify_failed_to_create_task(make_query_id(1), 2, 3);
+  manager.notify_task_queue_empty();
+  manager.notify_pipeline_closed(make_query_id(1), 2, 3);
+  manager.notify_executor_awaiting_task(0);
+  manager.notify_memory_downgrade_for_task(make_query_id(1), 2, 0, 4096);
+  manager.notify_wait_for_memory_for_task(make_query_id(1), 2, 0, 4096);
 }
 
 constexpr auto some_op_type               = op::SiriusPhysicalOperatorType::GPU_SCAN;
@@ -371,4 +487,170 @@ TEST_CASE("reporters publishing concurrently all get through", "[exec][query_sta
   }
 
   CHECK(wait_for(listener, n_reporters * per_reporter, 10s));
+}
+
+// =============================================================================
+// per-event routing
+// =============================================================================
+
+// The tag doubles as the routing index, so a reordered enum or variant would
+// misroute every event; the header static_asserts the ends of that mapping.
+static_assert(n_system_events == all_system_events.size());
+
+TEST_CASE("an unsubscribed event is never delivered", "[exec][query_stage_manager]")
+{
+  auto manager = std::make_shared<query_stage_manager>();
+  // Records all eight, subscribed to one. Anything but "task_queue_empty" in
+  // the result means the routing delivered something nobody asked for.
+  selective_listener listener{*manager, {query_stage_event_type::task_queue_empty}};
+  // A listener subscribed to everything, purely as the sync point: once it has
+  // all eight, every delivery this round has been made.
+  selective_listener witness{*manager,
+                             {query_stage_event_type::task_created,
+                              query_stage_event_type::task_deployed,
+                              query_stage_event_type::failed_to_create_task,
+                              query_stage_event_type::task_queue_empty,
+                              query_stage_event_type::pipeline_closed,
+                              query_stage_event_type::executor_awaiting_task,
+                              query_stage_event_type::memory_downgrade_for_task,
+                              query_stage_event_type::wait_for_memory_for_task}};
+  listener.start();
+  witness.start();
+
+  publish_one_of_each(*manager);
+
+  REQUIRE(wait_for(witness, 8));
+  CHECK(listener.unsubscribed_count() == 0);
+  CHECK(listener.seen() == std::vector<std::string>{"task_queue_empty"});
+  // The witness subscribed to all eight, so nothing it got was unsubscribed
+  // either -- otherwise the counter would be measuring the wrong thing.
+  CHECK(witness.unsubscribed_count() == 0);
+}
+
+TEST_CASE("a listener subscribed to nothing receives nothing", "[exec][query_stage_manager]")
+{
+  auto manager = std::make_shared<query_stage_manager>();
+  selective_listener listener{*manager, {}};
+  selective_listener witness{*manager, {query_stage_event_type::wait_for_memory_for_task}};
+  listener.start();
+  witness.start();
+
+  publish_one_of_each(*manager);
+
+  REQUIRE(wait_for(witness, 1));
+  CHECK(listener.unsubscribed_count() == 0);
+  CHECK(listener.count() == 0);
+}
+
+TEST_CASE("each event reaches exactly its own subscriber", "[exec][query_stage_manager]")
+{
+  // One listener per event, each recording all eight: a payload routed to the
+  // wrong bucket shows up as a second entry on somebody.
+  auto manager = std::make_shared<query_stage_manager>();
+  std::vector<std::unique_ptr<selective_listener>> listeners;
+  std::vector<std::string> const names{"task_created",
+                                       "task_deployed",
+                                       "failed_to_create_task",
+                                       "task_queue_empty",
+                                       "pipeline_closed",
+                                       "executor_awaiting_task",
+                                       "memory_downgrade_for_task",
+                                       "wait_for_memory_for_task"};
+  for (std::size_t i = 0; i < n_system_events; ++i) {
+    listeners.push_back(std::make_unique<selective_listener>(
+      *manager,
+      std::initializer_list<query_stage_event_type>{static_cast<query_stage_event_type>(i)}));
+    listeners.back()->start();
+  }
+
+  publish_one_of_each(*manager);
+
+  for (std::size_t i = 0; i < listeners.size(); ++i) {
+    INFO("listener for " << names[i]);
+    REQUIRE(wait_for(*listeners[i], 1));
+    CHECK(listeners[i]->unsubscribed_count() == 0);
+    CHECK(listeners[i]->seen() == std::vector<std::string>{names[i]});
+  }
+}
+
+TEST_CASE("unregistering drops a listener from every event's routing",
+          "[exec][query_stage_manager]")
+{
+  auto manager = std::make_shared<query_stage_manager>();
+  selective_listener narrow{*manager, {query_stage_event_type::task_queue_empty}};
+  narrow.start();
+  manager->notify_task_queue_empty();
+  auto const deadline = std::chrono::steady_clock::now() + 2s;
+  while (std::chrono::steady_clock::now() < deadline && narrow.count() == 0) {
+    std::this_thread::sleep_for(1ms);
+  }
+  REQUIRE(narrow.count() == 1);
+
+  narrow.stop();
+  // The routing table holds raw pointers into the queue the listener owns, so a
+  // stale entry here would be a dangling write rather than a wasted one.
+  manager->notify_task_queue_empty();
+  std::this_thread::sleep_for(50ms);
+  CHECK(narrow.count() == 1);
+}
+
+TEST_CASE("every event is published and no unsubscribed one is delivered",
+          "[exec][query_stage_manager]")
+{
+  // Each listener subscribes to one event; every event is then published. The
+  // counter is the assertion: it counts callbacks that fired for an event the
+  // listener never asked for, so zero across all eight means the routing
+  // delivered nothing it should not have.
+  auto manager = std::make_shared<query_stage_manager>();
+  std::vector<std::unique_ptr<selective_listener>> listeners;
+  for (std::size_t i = 0; i < n_system_events; ++i) {
+    listeners.push_back(std::make_unique<selective_listener>(
+      *manager,
+      std::initializer_list<query_stage_event_type>{static_cast<query_stage_event_type>(i)}));
+    listeners.back()->start();
+  }
+
+  // Twice, so a stale routing entry has a second chance to show up.
+  publish_one_of_each(*manager);
+  publish_one_of_each(*manager);
+
+  for (auto const& l : listeners) {
+    REQUIRE(wait_for(*l, 2));
+  }
+  // Settle: a wrongly-routed payload would arrive around now, not before.
+  std::this_thread::sleep_for(100ms);
+  for (std::size_t i = 0; i < listeners.size(); ++i) {
+    INFO("listener " << i);
+    CHECK(listeners[i]->unsubscribed_count() == 0);
+    CHECK(listeners[i]->count() == 2);
+  }
+}
+
+TEST_CASE("registration alone decides delivery", "[exec][query_stage_manager]")
+{
+  // Two listeners of the SAME class, so they implement the same callbacks and
+  // differ in exactly one thing: what each registered for. Publish one event and
+  // one of them must fire while the other stays at zero. Nothing but the routing
+  // can produce that difference.
+  auto manager = std::make_shared<query_stage_manager>();
+  selective_listener empties{*manager, {query_stage_event_type::task_queue_empty}};
+  selective_listener closes{*manager, {query_stage_event_type::pipeline_closed}};
+  empties.start();
+  closes.start();
+
+  manager->notify_task_queue_empty();
+
+  REQUIRE(wait_for(empties, 1));
+  std::this_thread::sleep_for(100ms);  // a misroute would land about now
+  CHECK(empties.count() == 1);
+  CHECK(closes.count() == 0);
+
+  // And the mirror, so the result cannot be an artefact of which listener was
+  // registered first or which event happens to be published.
+  manager->notify_pipeline_closed(make_query_id(1), 2, 3);
+
+  REQUIRE(wait_for(closes, 1));
+  std::this_thread::sleep_for(100ms);
+  CHECK(closes.count() == 1);
+  CHECK(empties.count() == 1);
 }

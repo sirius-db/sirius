@@ -158,7 +158,14 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   /// and @ref start is then a no-op: there is no point running a worker that may
   /// never issue anything.
   readahead_scan_manager(exec::query_stage_manager& stage_manager, std::size_t budget)
-    : exec::query_stage_listener(stage_manager),
+    : exec::query_stage_listener(stage_manager,
+                                 // The four executor-idle signals this readahead acts on, and
+                                 // nothing else. Must list every hook overridden below: one left
+                                 // out here is never delivered, however correctly it is written.
+                                 {exec::query_stage_event_type::task_deployed,
+                                  exec::query_stage_event_type::task_queue_empty,
+                                  exec::query_stage_event_type::memory_downgrade_for_task,
+                                  exec::query_stage_event_type::wait_for_memory_for_task}),
       _budget(budget),
       _gatekeeper(static_cast<int>(budget))
   {
