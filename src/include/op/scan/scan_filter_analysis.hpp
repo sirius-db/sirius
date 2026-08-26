@@ -79,6 +79,12 @@ struct scan_filter_analysis {
  * inequalities tighten by one; a decimal constant finer than the column's scale
  * is floored or ceiled on the side that cannot drop a surviving row.
  *
+ * The EXPRESSION_FILTER shape `CAST(date_col AS TIMESTAMP[_S|_MS|_NS]) CMP
+ * <timestamp constant>` — what DuckDB's constant folding makes of qgen-style
+ * date arithmetic — is recognized too, in either operand order, by lowering
+ * the constant to the stored-day domain. That range is exact, so it keeps
+ * full coverage; TRY_CAST, TIMESTAMP_TZ, and ±infinity constants are refused.
+ *
  * Filters that do not restrict the emitted rows are skipped WITHOUT clearing
  * coverage — OPTIONAL_FILTER and IS_NOT_NULL, which
  * @ref convert_table_filters_to_expression also drops, and @p
