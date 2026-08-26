@@ -18,6 +18,8 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/join/distinct_hash_join.hpp>
+#include <cudf/reduction.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/sorting.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/utilities/error.hpp>
@@ -25,6 +27,7 @@
 #include <rmm/device_buffer.hpp>
 
 #include <numeric>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -56,6 +59,7 @@ group_key_labels make_group_key_labels(cudf::table_view const& keys,
     std::vector<cudf::null_order>(keys.num_columns(), cudf::null_order::AFTER);
   auto sorted_unique_keys =
     cudf::sort(unique_keys->view(), column_order, null_precedence, stream, mr);
+  unique_keys.reset();
 
   // The build table is unique and sorted, so each matched build row index is the dense label.
   // distinct_hash_join has no build-resource parameter; Sirius installs the active memory-space
@@ -68,6 +72,17 @@ group_key_labels make_group_key_labels(cudf::table_view const& keys,
                                                label_indices->release(),
                                                rmm::device_buffer{},
                                                0);
+
+  auto min_label        = cudf::reduce(labels->view(),
+                                *cudf::make_min_aggregation<cudf::reduce_aggregation>(),
+                                labels->type(),
+                                stream,
+                                mr);
+  auto const& typed_min = static_cast<cudf::numeric_scalar<cudf::size_type> const&>(*min_label);
+  if (!typed_min.is_valid(stream) || typed_min.value(stream) < 0) {
+    throw std::runtime_error(
+      "Group key label lookup did not match every input row to its distinct key");
+  }
 
   return {.sorted_unique_keys = std::move(sorted_unique_keys), .labels = std::move(labels)};
 }

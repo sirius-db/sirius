@@ -43,6 +43,7 @@ struct group_key_labels {
  * Null keys compare equal, and all NaN values compare equal.
  *
  * @throw cudf::logic_error if `keys` has no columns
+ * @throw std::runtime_error if an input row does not match its distinct key
  *
  * @param keys Group key columns
  * @param stream CUDA stream used for device operations
