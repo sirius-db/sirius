@@ -81,12 +81,22 @@ struct pinned_column_view {
 /// prepared against, since a positional mismatch would read the right number of
 /// rows from the wrong batches.
 ///
-/// COMPRESSED ORIGINS ARE NOT YET SERVED and are refused rather than silently
-/// decoded full width. The sparse decode they need exists and is tested
-/// (codegen/selection/chunk_row_set.hpp, and the CSR each batch already
-/// carries), but reaching it needs a decompression entry point that takes a
-/// selection for a column subset; the shipped surface only takes one inside
-/// decompress_scan_filter, which builds its own.
+/// A COMPRESSED origin IS served here, by materialize_compressed: a dense batch
+/// takes an ordinary full decode, and a selective one tries the sparse walk
+/// (simpatico::decompress_column_rows over the CSR each batch already carries),
+/// falling back to the mask route for the shapes with no random access
+/// (dictionary, str_split, render rejections) and to a full decode as the last
+/// resort. None of these routes writes an output validity buffer, so a decoded
+/// column that turns out to contain nulls is rejected rather than returned
+/// half-formed (require_non_null).
+///
+/// What this materializer can serve and what the INSTALLER admits are two
+/// different questions. Today no compressed origin reaches here: the install
+/// gate refuses one outright, because pinned_column_null_count cannot read a
+/// compressed chunk's null count without decoding it and so reports "unknown",
+/// which the nullability check treats as unsafe. These routes are therefore
+/// exercised by their own tests rather than by a query, and they are what a
+/// future relaxation of that gate would rest on.
 std::unique_ptr<cudf::column> materialize(pinned_column_view const& column,
                                           prepared_selection const& selection,
                                           rmm::cuda_stream_view stream,

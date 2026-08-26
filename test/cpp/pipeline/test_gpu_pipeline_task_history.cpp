@@ -32,6 +32,7 @@
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/error.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
@@ -674,14 +675,19 @@ TEST_CASE("gpu_pipeline_task execute OOM in operator execute records to pipeline
 }
 
 // ---------------------------------------------------------------------------
-// Test: an OOM restoring a deferral at the SINK (publish_output, after the operator
-// loop / compute_task has already succeeded) reschedules the task instead of
-// propagating an uncaught rmm::out_of_memory. Resume index must be operators.size()
-// (1, here) -- the sentinel meaning "the operator loop already ran; only the sink
-// is left" -- and the task's own memory history must record the failure.
+// Test: an OOM raised by the SINK ITSELF propagates instead of rescheduling.
+//
+// A sink publishes incrementally -- a partition writes batches to its repositories
+// as it goes -- so by the time one of its allocations fails, some of that output is
+// already committed. Replaying the task would re-publish it, duplicating rows. The
+// OOM-reschedule window therefore closes before sink() is entered, and the
+// exception travels out uncaught.
+//
+// The deferral restoration that runs just before sink() IS retryable; that is a
+// different boundary and has its own case below.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("gpu_pipeline_task execute OOM at the sink reschedules instead of propagating",
+TEST_CASE("gpu_pipeline_task sink OOM propagates without rescheduling",
           "[gpu_pipeline_task][history][sink]")
 {
   constexpr std::size_t kReservationSize     = 200ULL * 1024 * 1024;  // 200 MB
@@ -709,24 +715,12 @@ TEST_CASE("gpu_pipeline_task execute OOM at the sink reschedules instead of prop
   auto task =
     create_pipeline_task(f, global_state, std::move(input_batch), kReservationSize, /*task_id=*/1);
 
-  auto const operator_count = ctx.pipeline->get_operators().size();
+  REQUIRE_THROWS_AS(task->execute(stream), rmm::out_of_memory);
 
-  try {
-    task->execute(stream);
-    FAIL("expected an oom_reschedule_exception");
-  } catch (const sirius::pipeline::oom_reschedule_exception& ex) {
-    // The sentinel resume index this fix relies on: compute_task's operator loop
-    // (i < operators.size()) is a no-op at this index, so a retry skips straight
-    // back to publish_output instead of re-running an operator that already
-    // succeeded.
-    REQUIRE(ex.get_resume_operator_index() == operator_count);
-  }
-
-  // The sink-side OOM must still reach memory history, same as a mid-pipeline one.
-  REQUIRE(global_state->get_memory_history().size() == 1);
-  auto estimate = global_state->get_memory_history().estimate_peak_memory(kInputDataSize);
-  REQUIRE(estimate.has_value());
-  REQUIRE(*estimate == kInputDataSize);
+  // Nothing is recorded: record_on_failure sits in the restoration catch, which this
+  // OOM never entered, and the success-path record is downstream of the sink call.
+  // A reschedule would have been the bug -- the sink had already published.
+  REQUIRE(global_state->get_memory_history().size() == 0);
 }
 
 // ---------------------------------------------------------------------------
