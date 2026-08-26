@@ -13,42 +13,10 @@ of the three approved paths applies — most work is **Self-contained** (push to
 not `origin`); dependent changes use **Stacked PRs**; CI/critical changes that need same-repo
 write permissions are the third, narrower exception.
 
-### Choosing self-contained vs. Stacked
-
-Decide this before starting work, not partway through — it's possible to split already-started
-work into a stack later, but retrofitting costs more than planning it upfront. Default to
-self-contained. Choose a stack only when reviewability is genuinely better served by splitting
-into ordered layers: each layer should stand on its own as something a reviewer can fully
-understand and approve without reading ahead, even though later layers depend on earlier ones
-merging first. Size alone isn't a reason to stack — a large self-contained PR is still
-self-contained if it can be reviewed as one coherent unit. If unsure, ask the user before deciding
-to stack: the setup has real, sticky side effects (see "Remote gotcha" below) and requires
-maintainer push access (check `MAINTAINERS.md`), so it isn't something to default into
-unilaterally. If a stack is chosen, aim for every layer to be reviewable on its own merits, not
-just the stack as a whole. If a stack turns out to be the wrong call after starting, `gh stack
-unstack` converts the PRs back to self-contained targeting `dev`; see `CONTRIBUTING.md`'s
-"Managing a stack" section.
-
-### Stacked PR tips
-
-Use `stacked/`-prefixed branches with the `gh-stack` CLI extension (`gh stack add`,
-`gh stack submit`) instead of a single branch off `dev`, and push `stacked/` branches to `origin`
-— see `CONTRIBUTING.md`'s "Stacked PRs" section for the full convention (requires push access to
-`sirius-db/sirius`).
-
-**Remote gotcha**: setting up for Stacked PRs (per `CONTRIBUTING.md`) involves renaming a fork
-clone's `origin` remote to the main `sirius-db/sirius` repo — that change is local and sticky, so
-in a clone that's been set up this way, `origin` no longer points at your fork. Always run `git
-remote -v` before pushing rather than assuming `origin` = your fork; a self-contained PR from
-such a clone needs to push to the renamed fork remote instead.
-
-**Merging a stack**: never use "Enqueue stack" (Web UI) or `gh stack merge` (CLI). Tested against
-this repo's actual merge queue settings and confirmed neither reliably walks a whole stack
-through; the bottom PR merges, then the rest stalls with a stale base and nothing continues
-automatically. Always merge bottom-up instead: `gh stack bottom` to find the bottom PR, confirm
-it's approved and passing, `gh pr merge <number> --auto` to merge just that one PR (ask before
-running this, since it's a real merge), then `gh stack sync --prune` once it lands, then repeat
-for the next layer. See `CONTRIBUTING.md`'s "Merging a stack" section for the full steps.
+**Doing a chain of dependent changes (Stacked PRs)?** Read `CONTRIBUTING.md`'s "Stacked PRs" and
+"Merging a stack" sections first. One thing worth knowing without opening that doc: never use
+"Enqueue stack" or `gh stack merge`, they don't reliably work with this repo's merge queue;
+stacks merge bottom-up instead.
 
 ## Build & test
 
