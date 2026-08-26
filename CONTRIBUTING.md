@@ -200,31 +200,41 @@ self-contained PRs targeting `dev`.
 
 #### Merging a stack
 
-**Merging as a stack (recommended)**
+**Note:** each PR's page always shows "wants to merge into `<branch>`" pointing at the layer
+directly below it; that's just its git base for diffing, not the actual merge order. Merges
+always land bottom-up regardless of what that header displays.
 
-By design stacked PRs are merged as a stack, once every PR passes required checks and has
-reviewer approval. You can merge the whole stack at once with either method:
-- **Web UI**: the top-most PR's page shows an **"Enqueue stack"** button with a count of the PRs
-  still open in the stack. It stays disabled (showing "Unable to merge as a stack") until every
-  open PR in the stack passes required checks and has reviewer approval.
-- **CLI**: `gh stack merge` only checks that each PR is open and not a draft locally; branch
-  protection and repository rules are still evaluated by GitHub when the merge runs.
+:warning: **Do not use "Enqueue stack" (Web UI) or `gh stack merge` (CLI).** We tested both
+against this repo's actual merge queue settings (1 PR built and merged at a time) and confirmed
+they do not reliably merge the whole stack through. This is a tested limitation of GitHub's
+support for merge queues using squash commits. Until this is fixed, we can use the following
+bottom-up merging method in this repo.
 
-Both methods respect this repo's merge queue: the stack is added to the queue and merges once
-it's processed, rather than merging directly.
+**Merging bottom-up**
 
-**Merging from the bottom**
+Steps 1-4 and 7 only need GitHub, so any maintainer with merge permission can do them, not just
+the stack's author. Steps 5-6 need the stack's actual local checkout (where `gh-stack` tracks the
+stack), so only whoever has that clone, normally the author, can do them. If you're merging
+someone else's stack, do steps 1-4, then ping the author to run steps 5-6 before you continue.
 
-Sometimes, it may be necessary to merge the bottom layer(s) of a stack instead of the entire
-stack at once. While this is not the recommended flow, there is support for this. Starting with
-the bottom PR, merge the PR using the "Enqueue pull request" button. Once the PR has cleared the
-merge queue and is merged, run `gh stack sync --prune` to rebase the remaining branches onto the
-updated `dev` and clean up local branches for the merged PR. Confirm it worked via `gh stack view`:
-the merged layer should show a ✓ under a `╌╌╌ merged ╌╌╌` marker, and the remaining branches
-shouldn't show a `⚠` warning icon. If they still do, repeat the sync.
+1. Open the bottom-most unmerged PR of the stack (the stack
+   panel on any PR in it, click the `N/M` badge next to the PR title, shows the whole stack in
+   order).
+2. Confirm it's approved and its required checks have passed.
+3. Click **"Enqueue pull request"** on that PR's own page to
+   merge just that one PR. Do not click "Enqueue stack" (this is only on the top-most layer of
+   the stack) and don't use `gh stack merge`.
+4. Wait for it to clear the merge queue and merge to `dev`.
+5. **(Stack author)** Run `gh stack sync --prune` to rebase the
+   remaining branches onto the updated `dev` and clean up local branches for the merged PR.
+6. **(Stack author)** Confirm it worked via `gh stack view`: the
+   merged layer should show a ✓ under a `╌╌╌ merged ╌╌╌` marker, and the remaining branches
+   shouldn't show a `⚠` warning icon. If they still do, repeat step 5.
+7. Back in the web UI, open the new bottom-most unmerged PR
+   and repeat from step 2, until the whole stack is merged.
 
-Once the sync has taken effect, the new bottom of the stack will target `dev` while the top of
-the stack will be able to merge as a whole stack minus the merged PR.
+Our goal is to automate this process in the future; however, this is the current merge method
+that works with our repo's merge queue settings.
 
 ### Commit and title convention
 

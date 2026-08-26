@@ -42,13 +42,13 @@ in a clone that's been set up this way, `origin` no longer points at your fork. 
 remote -v` before pushing rather than assuming `origin` = your fork; a self-contained PR from
 such a clone needs to push to the renamed fork remote instead.
 
-**Merging a stack** happens all at once, not PR by PR: either the web UI's "Enqueue stack" button
-on the top-most PR, or `gh stack merge`. Both respect this repo's merge queue. Don't merge stack
-PRs individually with `gh pr merge` even if asked, and don't pass `--yes` to `gh stack merge`
-without asking first, since it merges multiple PRs at once and both humans and agents should
-confirm before that happens. If a layer ends up merged out of order anyway, run `gh stack sync
---prune` to fix it. See `CONTRIBUTING.md`'s "Merging a stack" section for the full verification
-steps.
+**Merging a stack**: never use "Enqueue stack" (Web UI) or `gh stack merge` (CLI). Tested against
+this repo's actual merge queue settings and confirmed neither reliably walks a whole stack
+through; the bottom PR merges, then the rest stalls with a stale base and nothing continues
+automatically. Always merge bottom-up instead: `gh stack bottom` to find the bottom PR, confirm
+it's approved and passing, `gh pr merge <number> --auto` to merge just that one PR (ask before
+running this, since it's a real merge), then `gh stack sync --prune` once it lands, then repeat
+for the next layer. See `CONTRIBUTING.md`'s "Merging a stack" section for the full steps.
 
 ## Build & test
 
