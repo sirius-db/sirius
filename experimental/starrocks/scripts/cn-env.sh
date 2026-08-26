@@ -48,7 +48,10 @@ export UCX_TLS=${UCX_TLS:-cuda_copy,cuda_ipc,tcp,self}
 # Engine .so first; the repo pixi env's lib/ supplies the GLIBCXX_3.4.31 that libcudf and the
 # extension need when launched outside pixi activation.
 _pixi_env=$REPO_ROOT/.pixi/envs/default
-export LD_LIBRARY_PATH="$REPO_ROOT/build/release/extension/sirius:$_pixi_env/lib:$_nixl_lib:$UCX_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# nixl + UCX must precede the pixi env lib: the UCX plugin is built against the system
+# toolchain, and a pixi lib ahead of it shadows a dependency so dlopen of
+# libplugin_UCX.so fails -- nixl then reports the opaque "backend 'UCX' not found".
+export LD_LIBRARY_PATH="$REPO_ROOT/build/release/extension/sirius:$_nixl_lib:$UCX_PREFIX/lib:$_pixi_env/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export PKG_CONFIG_PATH="$UCX_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 
 # System gcc/g++ must compile nixl-sys: pixi activation injects CXXFLAGS mixing /usr/include
