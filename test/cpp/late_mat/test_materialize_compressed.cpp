@@ -101,8 +101,8 @@ std::unique_ptr<cudf::column> make_batch(std::int64_t first_row,
                   stream.value());
 
   if (nullable) {
-    auto const words = static_cast<std::size_t>(cudf::bitmask_allocation_size_bytes(
-                         static_cast<cudf::size_type>(rows))) /
+    auto const words = static_cast<std::size_t>(
+                         cudf::bitmask_allocation_size_bytes(static_cast<cudf::size_type>(rows))) /
                        sizeof(cudf::bitmask_type);
     std::vector<cudf::bitmask_type> host_mask(words, 0);
     cudf::size_type nulls = 0;
@@ -149,7 +149,7 @@ struct fake_compressed_pin {
       auto source = make_batch(next, rows, nullable, stream);
       next += rows;
 
-      auto blob   = std::make_shared<sirius::compressed_device_blob>();
+      auto blob = std::make_shared<sirius::compressed_device_blob>();
       blob->table =
         simpatico::compress_with_plan(cudf::table_view{{source->view()}}, dsl, stream, mr);
       cudaStreamSynchronize(stream.value());
@@ -196,15 +196,13 @@ std::vector<bool> read_validity(cudf::column_view const& col)
 {
   std::vector<bool> valid(static_cast<std::size_t>(col.size()), true);
   if (col.null_mask() == nullptr) { return valid; }
-  auto const words =
-    static_cast<std::size_t>(cudf::bitmask_allocation_size_bytes(col.size())) /
-    sizeof(cudf::bitmask_type);
+  auto const words = static_cast<std::size_t>(cudf::bitmask_allocation_size_bytes(col.size())) /
+                     sizeof(cudf::bitmask_type);
   std::vector<cudf::bitmask_type> host(words, 0);
   cudaMemcpy(
     host.data(), col.null_mask(), host.size() * sizeof(cudf::bitmask_type), cudaMemcpyDeviceToHost);
   for (cudf::size_type i = 0; i < col.size(); ++i) {
-    valid[static_cast<std::size_t>(i)] =
-      (host[static_cast<std::size_t>(i) / 32] >> (i % 32)) & 1u;
+    valid[static_cast<std::size_t>(i)] = (host[static_cast<std::size_t>(i) / 32] >> (i % 32)) & 1u;
   }
   return valid;
 }
@@ -340,7 +338,7 @@ constexpr char const* kBitpackPlan = "input -> bitpack -> packed\n";
 constexpr char const* kDeltaPlan =
   "input -> delta -> differences\n"
   "delta.differences -> bitpack\n";
-constexpr char const* kFullPlan    = "input -> ans\n";
+constexpr char const* kFullPlan = "input -> ans\n";
 
 }  // namespace
 
@@ -548,7 +546,7 @@ TEST_CASE("an all-null compressed column materializes as all null",
                                           stream);
   cudaStreamSynchronize(stream.value());
 
-  auto blob   = std::make_shared<sirius::compressed_device_blob>();
+  auto blob = std::make_shared<sirius::compressed_device_blob>();
   blob->table =
     simpatico::compress_with_plan(cudf::table_view{{source->view()}}, kBitpackPlan, stream, mr);
   cudaStreamSynchronize(stream.value());

@@ -445,6 +445,11 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     auto const& col = table.columns[idx];
     if (!col.plan_tree || col.num_rows != num_rows)
       return refuse("selected column missing plan_tree or row-count mismatch");
+    // A compacted decode returns the surviving rows while the stored bitmask
+    // still spans the whole chunk, and nothing on this path compacts one against
+    // the other. Refused here, before any device work, rather than as a
+    // per-column failure that unwinds the whole batch mid-flight.
+    if (!col.plan_tree->validity.empty()) return refuse("selected column is nullable");
   }
   for (auto const& f : request.filters) {
     if (f.column >= selected.size()) return refuse("filter directive column out of range");
