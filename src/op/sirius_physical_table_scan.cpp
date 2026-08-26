@@ -114,7 +114,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   // Passthrough inputs arrive with filter and projection already applied upstream, in
   // batches small enough that concatenation is not needed.
   if (passthrough) {
-    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
   if (ro_input_batches.empty()) { return std::make_unique<pipelineable_operator_data>(); }
@@ -184,7 +184,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     output_batch = sirius::make_data_batch(
       std::move(filtered_table), *batch_ref.get_memory_space(), stream, batch_telemetry());
   } else {
-    output_batch = ::cucascade::data_batch::to_idle(std::move(batch_ref));
+    output_batch = single_batch;
   }
 
   // After filtering, project away filter-only columns if the batch has more

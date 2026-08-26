@@ -253,7 +253,7 @@ std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_in
   std::size_t input_size   = 0;
   auto* pipelineable_input = dynamic_cast<const op::pipelineable_operator_data*>(_input_data.get());
   if (pipelineable_input) {
-    for (const auto& ro : pipelineable_input->get_read_only_batches(false)) {
+    for (const auto& ro : pipelineable_input->get_read_only_batches()) {
       if (!ro.get_data()) { continue; }
       const bool non_gpu     = ro.get_current_tier() != cucascade::memory::Tier::GPU;
       const bool cross_space = target_space != nullptr && ro.get_memory_space() != nullptr &&
@@ -619,7 +619,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     auto* pipelineable_output =
       dynamic_cast<const op::pipelineable_operator_data*>(output_data.get());
     if (pipelineable_output) {
-      for (const auto& batch : pipelineable_output->get_read_only_batches(false)) {
+      for (const auto& batch : pipelineable_output->get_read_only_batches()) {
         output_bytes += batch.get_data()->get_size_in_bytes();
       }
     }
@@ -655,7 +655,7 @@ std::size_t gpu_pipeline_task::get_input_size() const
   auto* pipelineable_input =
     dynamic_cast<const op::pipelineable_operator_data*>(local_state._input_data.get());
   if (!pipelineable_input) { return 0; }
-  for (const auto& batch : pipelineable_input->get_read_only_batches(false)) {
+  for (const auto& batch : pipelineable_input->get_read_only_batches()) {
     input_size += batch.get_data()->get_size_in_bytes();
   }
   return input_size;

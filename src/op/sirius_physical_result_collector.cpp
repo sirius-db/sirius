@@ -69,7 +69,7 @@ std::unique_ptr<operator_data> sirius_physical_result_collector::execute(
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_result_collector::execute"};
   return std::make_unique<pipelineable_operator_data>(
-    dynamic_cast<const pipelineable_operator_data&>(input_data).get_read_only_batches());
+    dynamic_cast<const pipelineable_operator_data&>(input_data).get_data_batches());
 }
 
 duckdb::vector<duckdb::const_reference<sirius_physical_operator>>

@@ -501,7 +501,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   auto layout = build_aggregate_layout(aggregates);
   std::shared_ptr<cucascade::data_batch> merged_batch;
   if (input_batches.size() == 1) {
-    merged_batch = cucascade::data_batch::to_idle(std::move(input_batches[0]));
+    merged_batch = input.get_data_batches()[0];  // forward the owned input batch (idle at park)
   } else {
     merged_batch = gpu_merge_impl::merge_ungrouped_aggregate(
       input_batches, layout.merge_kinds, layout.merge_nth_index, stream, *space, batch_telemetry());

@@ -188,7 +188,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
   // slot and the probe side streams through unpartitioned. In both cases execute() just forwards
   // the input batches; the fan-out to slots happens in sink().
   if (_broadcast || _num_partitions.value() < 2 || _partition_keys.empty()) {
-    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> partitioned_results;

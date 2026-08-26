@@ -166,7 +166,7 @@ class convertible_gpu_pipeline_task : public convertible_data {
     if (!operator_data) { return 0; }
 
     std::size_t total = 0;
-    for (const auto& ro : operator_data->get_read_only_batches(false)) {
+    for (const auto& ro : operator_data->get_read_only_batches()) {
       if (ro.get_memory_space() == space) { total += ro.get_data()->get_size_in_bytes(); }
     }
     return total;

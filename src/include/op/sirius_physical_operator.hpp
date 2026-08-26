@@ -67,12 +67,12 @@ enum class TaskCreationHint { WAITING_FOR_INPUT_DATA, READY };
 /**
  * @brief Display name of a memory tier for telemetry attributes.
  */
-[[nodiscard]] constexpr const char* tier_display_name(::cucascade::memory::Tier tier)
+[[nodiscard]] constexpr const char* tier_display_name(cucascade::memory::Tier tier)
 {
   switch (tier) {
-    case ::cucascade::memory::Tier::GPU: return "GPU";
-    case ::cucascade::memory::Tier::HOST: return "HOST";
-    case ::cucascade::memory::Tier::DISK: return "DISK";
+    case cucascade::memory::Tier::GPU: return "GPU";
+    case cucascade::memory::Tier::HOST: return "HOST";
+    case cucascade::memory::Tier::DISK: return "DISK";
     default: return "UNKNOWN";
   }
 }
@@ -165,9 +165,8 @@ class operator_data {
    * that own no data requiring locking and need no per-task setup.
    * Override when either condition changes.
    */
-  virtual void prepare_for_processing(
-    const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream) {
-  };
+  virtual void prepare_for_processing(const cucascade::memory::memory_space* requested_memory_space,
+                                      rmm::cuda_stream_view stream) {};
 
   /**
    * @brief Estimate the uncompressed GPU memory footprint of this data.
@@ -238,16 +237,11 @@ class pipelineable_operator_data : public operator_data {
  public:
   pipelineable_operator_data()
   {
-    _data_batches = std::vector<std::shared_ptr<::cucascade::data_batch>>();
+    _data_batches = std::vector<std::shared_ptr<cucascade::data_batch>>();
   }
   explicit pipelineable_operator_data(
-    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
+    std::vector<std::shared_ptr<cucascade::data_batch>> data_batches)
     : _data_batches(std::move(data_batches))
-  {
-  }
-  explicit pipelineable_operator_data(
-    std::vector<::cucascade::read_only_data_batch> read_only_data_batches)
-    : _read_only_data_batches(std::move(read_only_data_batches))
   {
   }
 
@@ -259,14 +253,13 @@ class pipelineable_operator_data : public operator_data {
   /**
    * @brief Get idle data batch pointers, lazily populating from read-only batches if needed.
    */
-  [[nodiscard]] const std::vector<std::shared_ptr<::cucascade::data_batch>>& get_data_batches()
-    const;
+  [[nodiscard]] const std::vector<std::shared_ptr<cucascade::data_batch>>& get_data_batches() const;
 
   /**
-   * @brief Get read-only locked batches, lazily populating from idle batches if needed.
+   * @brief Get read-only accessors for the batches. Returns the pin locks acquired by
+   * prepare_for_processing if present, otherwise transient read locks built from the idle batches.
    */
-  [[nodiscard]] std::vector<::cucascade::read_only_data_batch> get_read_only_batches(
-    bool leave_locked = false) const;
+  [[nodiscard]] std::vector<cucascade::read_only_data_batch> get_read_only_batches() const;
 
   /**
    * @brief Release all read-only locks by resetting _read_only_data_batches.
@@ -274,9 +267,6 @@ class pipelineable_operator_data : public operator_data {
   void remove_read_only_lock()
   {
     // Releasing the lock means getting rid of any _read_only_data_batches that we may have cached.
-    // But we want to make sure we do keep the data alive. So we ensure that the data_batches are
-    // populated.
-    if (!_data_batches) { auto _ = get_data_batches(); }
     _read_only_data_batches = std::nullopt;
   }
 
@@ -287,13 +277,13 @@ class pipelineable_operator_data : public operator_data {
    * storing the results in _read_only_data_batches. Throws sirius::internal_exception
    * if any batch pointer is null or any batch fails to lock. Propagates rmm::out_of_memory.
    */
-  void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
+  void prepare_for_processing(const cucascade::memory::memory_space* requested_memory_space,
                               rmm::cuda_stream_view stream) override;
 
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
   {
     std::size_t total = 0;
-    auto ro_batches   = get_read_only_batches(false);
+    auto ro_batches   = get_read_only_batches();
     for (auto const& ro : ro_batches) {
       if (ro.get_data()) { total += ro.get_data()->get_uncompressed_data_size_in_bytes(); }
     }
@@ -302,8 +292,8 @@ class pipelineable_operator_data : public operator_data {
 
   [[nodiscard]] std::string get_origin_tiers() const override
   {
-    std::array<bool, static_cast<std::size_t>(::cucascade::memory::Tier::SIZE)> present{};
-    for (auto const& ro : get_read_only_batches(false)) {
+    std::array<bool, static_cast<std::size_t>(cucascade::memory::Tier::SIZE)> present{};
+    for (auto const& ro : get_read_only_batches()) {
       if (!ro.get_data()) { continue; }
       auto tier = static_cast<std::size_t>(ro.get_current_tier());
       if (tier < present.size()) { present[tier] = true; }
@@ -312,14 +302,14 @@ class pipelineable_operator_data : public operator_data {
     for (std::size_t i = 0; i < present.size(); ++i) {
       if (!present[i]) { continue; }
       if (!result.empty()) { result += '+'; }
-      result += tier_display_name(static_cast<::cucascade::memory::Tier>(i));
+      result += tier_display_name(static_cast<cucascade::memory::Tier>(i));
     }
     return result.empty() ? "UNKNOWN" : result;
   }
 
  private:
-  mutable std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> _data_batches;
-  mutable std::optional<std::vector<::cucascade::read_only_data_batch>> _read_only_data_batches;
+  std::vector<std::shared_ptr<cucascade::data_batch>> _data_batches;
+  std::optional<std::vector<cucascade::read_only_data_batch>> _read_only_data_batches;
 };
 
 /**
@@ -331,7 +321,7 @@ class pipelineable_operator_data : public operator_data {
 class partitioned_operator_data : public pipelineable_operator_data {
  public:
   partitioned_operator_data() = default;
-  partitioned_operator_data(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
+  partitioned_operator_data(std::vector<std::shared_ptr<cucascade::data_batch>> data_batches,
                             std::size_t partition_idx)
     : pipelineable_operator_data(std::move(data_batches)), _partition_idx(partition_idx)
   {
@@ -649,7 +639,7 @@ class sirius_physical_operator {
     /// May be NULL for dependency-only ports that carry no data flow (e.g., "dependency").
     /// Null repos are treated as "empty, not data-gating" by the base-class port handling methods
     /// (get_next_task_hint, get_next_task_input_data, all_ports_empty, push_data_batch).
-    ::cucascade::shared_data_repository* repo;
+    cucascade::shared_data_repository* repo;
     duckdb::shared_ptr<pipeline::sirius_pipeline> src_pipeline;
     duckdb::shared_ptr<pipeline::sirius_pipeline> dest_pipeline;
     //! A UUID for a port on an operator at the beginning of a
@@ -679,7 +669,7 @@ class sirius_physical_operator {
   };
 
   // source pipeline pushed to repo of the ports
-  void push_data_batch(std::string_view port_id, std::shared_ptr<::cucascade::data_batch> batch);
+  void push_data_batch(std::string_view port_id, std::shared_ptr<cucascade::data_batch> batch);
   //! Add a port to the operator
   void add_port(std::string_view port_id, std::unique_ptr<port> p);
   //! Look up a port, or nullptr if absent. Use @ref get_port when absence is an error.
