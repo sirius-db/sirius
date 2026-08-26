@@ -5,7 +5,40 @@ operations to the GPU (via cuDF/RMM/cuCascade) and falling back to DuckDB's CPU 
 otherwise. Once the extension is loaded it **transparently intercepts** normal SQL and runs it
 on the GPU — no special syntax needed.
 
+## Contributions & PRs
+
 **The default/main branch is `dev`** (not `main`/`master`) — branch and open PRs against it.
+Before opening a PR, read `CONTRIBUTING.md`'s "PR branching strategy" section to determine which
+of the three approved paths applies — most work is **Self-contained** (push to a personal fork,
+not `origin`); dependent changes use **Stacked PRs**; CI/critical changes that need same-repo
+write permissions are the third, narrower exception.
+
+### Choosing self-contained vs. Stacked
+
+Decide this before starting work, not partway through — it's possible to split already-started
+work into a stack later, but retrofitting costs more than planning it upfront. Default to
+self-contained. Choose a stack only when reviewability is genuinely better served by splitting
+into ordered layers: each layer should stand on its own as something a reviewer can fully
+understand and approve without reading ahead, even though later layers depend on earlier ones
+merging first. Size alone isn't a reason to stack — a large self-contained PR is still
+self-contained if it can be reviewed as one coherent unit. If unsure, ask the user before deciding
+to stack: the setup has real, sticky side effects (see "Remote gotcha" below) and requires
+maintainer push access (check `MAINTAINERS.md`), so it isn't something to default into
+unilaterally. If a stack is chosen, aim for every layer to be reviewable on its own merits, not
+just the stack as a whole.
+
+### Stacked PR tips
+
+Use `stacked/`-prefixed branches with the `gh-stack` CLI extension (`gh stack add`,
+`gh stack submit`) instead of a single branch off `dev`, and push `stacked/` branches to `origin`
+— see `CONTRIBUTING.md`'s "Stacked PRs" section for the full convention (requires push access to
+`sirius-db/sirius`).
+
+**Remote gotcha**: setting up for Stacked PRs (per `CONTRIBUTING.md`) involves renaming a fork
+clone's `origin` remote to the main `sirius-db/sirius` repo — that change is local and sticky, so
+in a clone that's been set up this way, `origin` no longer points at your fork. Always run `git
+remote -v` before pushing rather than assuming `origin` = your fork; a self-contained PR from
+such a clone needs to push to the renamed fork remote instead.
 
 ## Build & test
 
