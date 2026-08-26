@@ -166,11 +166,29 @@ NAME, since a re-pin that merges columns would make a positional attach mark the
 ## Filtered scans, and count-on-deferred
 
 A filtered batch is no longer the chunk's rows in order, so the rowid comes from the surviving
-row positions, taken from the same mask the scan filters with. It is refused where the survivors
-are decided somewhere this path cannot see them — a compressed pin filters inside the fused
-decode (see [Compressed Pinning](compressed-pinning.md)).
+row positions, taken from the same mask the scan filters with.
 
-Dynamic membership filters cannot meet a deferral during decode today: the decode attaches them only to compressed pins, and install refuses every compressed origin (see Known limits). A guard keeps it that way should compressed origins become deferrable: `sirius_gpu_scan_operator::decode_consumer` is null once a deferral is installed, and `prepare_for_query` installs every deferral, riders included, before it builds any provider, so the scan's dynamic-filter endpoint would apply those filters after substitution instead. Should a deferring scan's decode remove rows anyway, `execute` fails with a named internal error, before any filtering or projection, rather than addressing rows the batch no longer holds.
+**A batch off a compressed pin can be restricted twice.** The fused decode drops rows while
+decoding (see [Compressed Pinning](compressed-pinning.md)), and whatever conjuncts it could not
+carry are evaluated again on what it kept. Each stage reports positions in ITS OWN input, so the
+second stage's positions index the first stage's output rather than the chunk, and the pin-order
+rowid is only right once the two are composed — `compose_survivors`
+(`sirius_gpu_scan_operator.cpp`) gathers the decode's list by the residual's.
+
+The decode reports its half because it is asked to: a split carrying a deferral sets
+`late_mat_wants_survivors`, which `prepare_for_processing` turns into
+`decompression_pushdown_scan::with_survivor_reporting()`, and the decode then expands the
+selection mask it already balloted into an ascending INT32 index list
+(`pushdown_outcome::survivor_rows`). Off a deferring scan the decode does neither, so the cost is
+one index-list expansion plus 4 bytes per surviving row, paid only where a ride uses it.
+
+Both directions fail closed. A decode that compacted without accounting for its survivors throws
+rather than emit a rowid, at `prepare_for_processing` and again at substitution; a survivor list
+whose length does not match the rows handed on throws too. A scan whose INGESTIBLE cannot report
+survivors (the duckdb-native one filters with a plain select) is still refused at install, since
+the residual half would have nothing to say.
+
+Dynamic membership filters do not meet a deferral during decode: `sirius_gpu_scan_operator::decode_consumer` is null once a deferral is installed, and `prepare_for_query` installs every deferral, riders included, before it builds any provider, so the scan's dynamic-filter endpoint applies those filters after substitution instead. Should a deferring scan's decode remove rows without reporting its survivors, `execute` fails with a named internal error, before any filtering or projection, rather than addressing rows the batch no longer holds.
 
 With the internal resident Parquet checkpoint enabled, the scan can apply membership masks before substitution. It checks the original materialized row count against the chunk origin before any mask, then selects original positions with the same conjunction used for the payload. Substitution forms each rowid from the origin offset plus that selected position, including when all deferred output columns were elided. The scan keeps the ordinary owned output representation. The placement flag is true by default.
 
@@ -193,8 +211,10 @@ deferral with a single half, admitted only over pinned columns with no nulls. Of
   bitmask by the same rows they selected the values by — the mask describes the whole chunk while
   a compacted output holds only the selection, so copying it verbatim would pair each value with
   another row's validity. A chunk carrying no blob still answers nothing and is refused.
-- Admitting compressed origins would not make them pay on their own: the scan substitutes on the FINISHED output, so a deferred column from a compressed pin would be decompressed and then discarded. A deferring scan's decode would also give up dynamic membership compaction (`decode_consumer` withholds the probes).
-- Filtered scans of compressed pins are refused (above). Lifting that refusal, and the lost membership compaction above, both need a decode that reports its survivor positions (or a cached-view checkpoint that gathers a row-index sequence with its residual mask); that one capability would lift both limits together.
+- A compressed origin cannot skip its decode — the scan substitutes on the FINISHED output, so a
+  deferred column from a compressed pin is decompressed and then discarded. A deferring scan's
+  decode also gives up dynamic membership compaction (`decode_consumer` withholds the probes),
+  although the decode's survivor reporting above is what lifting that would need.
 - Deferred-value widths are ESTIMATED for variable-width columns, not measured, and the error runs
   both ways: underestimating a wide column can refuse a bundle that would have qualified, but
   overestimating a short one can just as easily admit a bundle that does not actually repay (a
