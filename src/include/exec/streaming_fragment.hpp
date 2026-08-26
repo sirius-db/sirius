@@ -112,9 +112,19 @@ class streaming_fragment {
   [[nodiscard]] const std::shared_ptr<cucascade::shared_data_repository>& output_repository(
     stream_id_t id) const;
 
+  /// The logical types the sink emits (the plan subtree root's types). A downstream fragment
+  /// validates its declared input schema against these before moving any batch: the declared
+  /// schema is what its plan binds against, so a disagreement would silently reinterpret the
+  /// columns. Populated by `build()`.
+  [[nodiscard]] const duckdb::vector<sirius::logical_type>& sink_types() const
+  {
+    return _sink_types;
+  }
+
  private:
   duckdb::ClientContext& _context;
   fragment_spec _spec;
+  duckdb::vector<sirius::logical_type> _sink_types;
 
   // Declaration order IS the lifetime contract (members are destroyed in reverse): the
   // repositories outlive the engine, the engine owns the plan, and the session -- which only

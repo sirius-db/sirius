@@ -80,6 +80,15 @@ sirius_physical_streaming_sink::sirius_physical_streaming_sink(
   }
 }
 
+std::unique_ptr<operator_data> sirius_physical_streaming_sink::execute(
+  const operator_data& input_data, rmm::cuda_stream_view /*stream*/)
+{
+  // Mirrors sirius_physical_result_collector::execute: hand the chain's batches straight back so
+  // publish_output() can deliver them to sink(). The base implementation would drop them.
+  return std::make_unique<pipelineable_operator_data>(
+    dynamic_cast<const pipelineable_operator_data&>(input_data).get_read_only_batches());
+}
+
 void sirius_physical_streaming_sink::sink(const operator_data& input_data,
                                           rmm::cuda_stream_view stream)
 {
@@ -160,6 +169,23 @@ std::size_t sirius_physical_streaming_sink::no_history_peak_memory_estimate(
 {
   // Pushing a handle into the output repository allocates nothing new.
   return stats.bytes;
+}
+
+void sirius_physical_streaming_sink::build_pipelines(pipeline::sirius_pipeline& current,
+                                                     pipeline::sirius_meta_pipeline& meta_pipeline)
+{
+  if (children.size() != 1) {
+    throw sirius::internal_exception(
+      "sirius_physical_streaming_sink: expects exactly one child subtree");
+  }
+
+  // Same shape as the RESULT_COLLECTOR: append to `current` so the terminal operator is part of
+  // the root pipeline, then start the real pipeline from the child.
+  auto& state = meta_pipeline.get_state();
+  state.add_pipeline_operator(current, *this);
+
+  auto& child_meta_pipeline = meta_pipeline.create_child_meta_pipeline(current, *this);
+  child_meta_pipeline.build(*children[0]);
 }
 
 void sirius_physical_streaming_sink::on_finalize_operator()
