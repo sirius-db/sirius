@@ -797,10 +797,11 @@ int main()
     }
 
     {
-      // str_split: decompose STRING into offsets/chars[/null_mask], compress each
-      // channel independently (offsets -> delta -> bitpack fused; chars -> lz4),
-      // reassemble via make_strings_column. Conditional arity: a non-null column
-      // uses a 2-channel plan; a nullable column MUST route null_mask (guarded).
+      // str_split: decompose STRING into offsets/chars, compress each channel
+      // independently (offsets -> delta -> bitpack fused; chars -> lz4),
+      // reassemble via make_strings_column. Validity never reaches str_split --
+      // compress_column strips it into the tree's sidecar -- so ONE 2-channel
+      // plan serves nullable and non-nullable columns alike.
       // NOTE the nested path str_split.offsets.differences (offsets is non-root).
       auto stream                   = cudf::get_default_stream();
       std::vector<std::string> vals = {
@@ -815,28 +816,32 @@ int main()
       roundtrip_once(t->view(), dsl2, 1, "str_split");
       roundtrip_once(t->view(), dsl2, 2, "str_split_mt");
 
-      // Nullable: 3-channel plan carries the mask (null_mask declared on line 1).
-      std::string const dsl3 =
-        "input -> str_split -> offsets, chars, null_mask\n"
-        "str_split.offsets -> delta -> differences\n"
-        "str_split.offsets.differences -> bitpack\n"
-        "str_split.chars -> lz4\n"
-        "str_split.null_mask -> identity\n";
+      // The SAME plan on a nullable column: the mask rides the tree's sidecar, so
+      // the plan needs no null_mask leg and the walk is identical to the
+      // non-nullable case above.
       std::vector<bool> valid = {true, false, true, true, false, true, true, false};  // 3 nulls
       auto tn                 = make_strings_table(vals, valid, stream);
-      auto ct                 = roundtrip_once(tn->view(), dsl3, 1, "str_split_nulls");
+      auto ct                 = roundtrip_once(tn->view(), dsl2, 1, "str_split_nulls");
       // strings_equal ignores validity, so assert null preservation explicitly.
       auto decoded = decompress(ct, stream, rmm::mr::get_current_device_resource_ref());
       expect(decoded->view().column(0).null_count() == 3, "str_split_nulls: null_count preserved");
+      expect(validity_equal(tn->view().column(0), decoded->view().column(0)),
+             "str_split_nulls: null positions preserved");
+      expect(ct.columns[0].plan_tree->validity.kind == simpatico::validity_kind::mask,
+             "str_split_nulls: sidecar carries a mask");
 
-      // Guard: nullable column + 2-channel plan must ERROR, not drop nulls silently.
-      bool threw = false;
+      // A plan that still declares null_mask must ERROR: str_split no longer
+      // produces that channel, and silently ignoring a declared output would
+      // hide plan typos.
+      std::string const dsl_mask = dsl2 + "str_split.null_mask -> identity\n";
+      bool threw                 = false;
       try {
-        compress_with_plan(tn->view(), dsl2, stream, rmm::mr::get_current_device_resource_ref());
+        compress_with_plan(
+          tn->view(), dsl_mask, stream, rmm::mr::get_current_device_resource_ref());
       } catch (std::runtime_error const&) {
         threw = true;
       }
-      expect(threw, "str_split: nullable input without null_mask must throw");
+      expect(threw, "str_split: a plan routing null_mask must throw");
     }
 
     {
@@ -890,9 +895,9 @@ int main()
     }
 
     {
-      // Nullable STRING through the byte codecs must be REJECTED (the payload
-      // carries no mask), and a decomposed dictionary plan that fails to
-      // route null_mask must error rather than silently drop validity.
+      // STRING through the raw byte codecs is still rejected -- but on dtype
+      // grounds ("only fixed-width columns supported; use str_split"), which has
+      // nothing to do with validity and applies equally to a non-null column.
       auto stream = cudf::get_default_stream();
       auto mr     = rmm::mr::get_current_device_resource_ref();
       auto tn     = make_strings_table({"a", "b"}, {true, false}, stream);
@@ -903,24 +908,21 @@ int main()
         } catch (std::exception const&) {
           threw = true;
         }
-        expect(threw, "nullable STRING through ans/bitcomp must throw");
+        expect(threw, "STRING through ans/bitcomp must throw (not fixed-width)");
       }
-      bool threw = false;
-      try {
-        compress_with_plan(
-          tn->view(), "input -> dictionary -> keys_offsets, keys_chars, indices\n", stream, mr);
-      } catch (std::exception const&) {
-        threw = true;
-      }
-      expect(threw, "nullable decomposed dictionary without null_mask must throw");
+      // A decomposed dictionary plan no longer has to route null_mask.
+      auto ctd = compress_with_plan(
+        tn->view(), "input -> dictionary -> keys_offsets, keys_chars, indices\n", stream, mr);
+      auto decd = decompress(ctd, stream, mr);
+      expect(validity_equal(tn->view().column(0), decd->view().column(0)),
+             "nullable decomposed dictionary preserves validity");
     }
 
     {
-      // Nullable NUMERIC input through a non-null-aware op must be REJECTED,
-      // not silently stripped of validity. No numeric op carries a null_mask
-      // channel, so both the fused codegen path (delta -> bitpack) and the
-      // generic byte codecs (ans) must fail closed rather than decode garbage
-      // under the null slots.
+      // Nullable NUMERIC input. No numeric op carries a null_mask channel, so
+      // every one of these used to fail closed; with validity stripped into the
+      // sidecar they all round-trip, through both the fused codegen path
+      // (delta / bitpack) and the generic byte codecs (ans).
       auto stream = cudf::get_default_stream();
       auto mr     = rmm::mr::get_current_device_resource_ref();
       // Build a nullable INT32 column (offset 0, one null at row 5) directly so
@@ -934,43 +936,72 @@ int main()
                      host.data(),
                      host.size() * sizeof(std::int32_t),
                      cudaMemcpyHostToDevice) != cudaSuccess)
-        throw std::runtime_error("nullable numeric guard: cudaMemcpy failed");
+        throw std::runtime_error("nullable numeric: cudaMemcpy failed");
       cudf::set_null_mask(col->mutable_view().null_mask(), 5, 6, /*valid=*/false, stream);
       col->set_null_count(1);
       cudf::table_view nullable_tbl({col->view()});
-      expect(col->null_count() == 1, "nullable numeric guard: input has one null");
+      expect(col->null_count() == 1, "nullable numeric: input has one null");
       for (char const* plan :
            {"input -> delta -> differences\n", "input -> ans\n", "input -> bitpack\n"}) {
-        bool threw = false;
-        try {
-          compress_with_plan(nullable_tbl, plan, stream, mr);
-        } catch (std::exception const&) {
-          threw = true;
-        }
-        expect(threw, "nullable numeric input through a non-null-aware op must throw");
+        auto ct = compress_with_plan(nullable_tbl, plan, stream, mr);
+        expect(ct.columns[0].plan_tree->validity.kind == simpatico::validity_kind::mask,
+               "nullable numeric: sidecar carries a mask");
+        auto dec = decompress(ct, stream, mr);
+        // columns_equal compares the payload bytes AND validity, so a roundtrip
+        // that moved or lost the null fails here.
+        expect(columns_equal(nullable_tbl.column(0), dec->view().column(0)),
+               "nullable numeric roundtrip preserves data and validity");
       }
     }
 
     {
-      // Nullable decomposed dictionary WITH the null_mask channel routed:
-      // validity must survive the from_outputs rebuild.
+      // Validity fast paths. An all-valid column must carry no sidecar at all
+      // (byte-identical to the pre-sidecar behaviour), and an all-null column
+      // must record only the kind -- no bitmask is copied or serialized.
+      auto stream = cudf::get_default_stream();
+      auto mr     = rmm::mr::get_current_device_resource_ref();
+
+      auto plain = make_int32_table(1, 256, 7);
+      auto ctv   = compress_with_plan(plain->view(), "input -> delta -> differences\n", stream, mr);
+      expect(ctv.columns[0].plan_tree->validity.kind == simpatico::validity_kind::all_valid,
+             "all-valid column carries no sidecar");
+      expect(ctv.columns[0].plan_tree->validity.mask.size() == 0,
+             "all-valid column allocates no mask");
+
+      auto all_null = cudf::make_numeric_column(
+        cudf::data_type{cudf::type_id::INT32}, 32, cudf::mask_state::ALL_NULL, stream, mr);
+      all_null->set_null_count(32);
+      cudf::table_view an_tbl({all_null->view()});
+      auto cta = compress_with_plan(an_tbl, "input -> delta -> differences\n", stream, mr);
+      expect(cta.columns[0].plan_tree->validity.kind == simpatico::validity_kind::all_null,
+             "all-null column takes the all_null fast path");
+      expect(cta.columns[0].plan_tree->validity.mask.size() == 0,
+             "all-null column stores no bitmask");
+      auto deca = decompress(cta, stream, mr);
+      expect(deca->view().column(0).null_count() == 32, "all-null column decodes back to all-null");
+    }
+
+    {
+      // Nullable decomposed dictionary: validity must survive the from_outputs
+      // rebuild, carried by the sidecar rather than a routed channel.
       auto stream             = cudf::get_default_stream();
       std::vector<bool> valid = {true, false, true, true};
       auto tn                 = make_strings_table({"apple", "", "cherry", "apple"}, valid, stream);
       auto ct                 = roundtrip_once(tn->view(),
-                               "input -> dictionary -> keys_offsets, keys_chars, indices, "
-                                               "null_mask\n"
-                                               "dictionary.indices -> bitpack\n"
-                                               "dictionary.null_mask -> identity\n",
+                               "input -> dictionary -> keys_offsets, keys_chars, indices\n"
+                                               "dictionary.indices -> bitpack\n",
                                1,
                                "dictionary_decomposed_nulls");
       auto decoded            = decompress(ct, stream, rmm::mr::get_current_device_resource_ref());
       expect(decoded->view().column(0).null_count() == 1, "dictionary_decomposed_nulls: count");
+      expect(validity_equal(tn->view().column(0), decoded->view().column(0)),
+             "dictionary_decomposed_nulls: positions");
     }
 
     {
-      // u8 codegen on string sub-channels: RLE on the (mostly 0xFF) null_mask
-      // bytes and a fused delta->bitpack cascade on the chars bytes.
+      // u8 codegen on string sub-channels: a fused delta->bitpack cascade on the
+      // offsets and lz4 on the chars bytes, with a sparse null pattern riding the
+      // sidecar alongside.
       auto stream = cudf::get_default_stream();
       std::vector<std::string> v64;
       std::vector<bool> b64;
@@ -980,15 +1011,16 @@ int main()
       }
       auto tn      = make_strings_table(v64, b64, stream);
       auto ct      = roundtrip_once(tn->view(),
-                               "input -> str_split -> offsets, chars, null_mask\n"
+                               "input -> str_split -> offsets, chars\n"
                                     "str_split.offsets -> delta -> differences\n"
                                     "str_split.offsets.differences -> bitpack\n"
-                                    "str_split.chars -> lz4\n"
-                                    "str_split.null_mask -> rle -> runs, values\n",
+                                    "str_split.chars -> lz4\n",
                                1,
-                               "str_split_null_mask_rle_u8");
+                               "str_split_sparse_nulls_u8");
       auto decoded = decompress(ct, stream, rmm::mr::get_current_device_resource_ref());
-      expect(decoded->view().column(0).null_count() == 2, "str_split_null_mask_rle_u8: count");
+      expect(decoded->view().column(0).null_count() == 2, "str_split_sparse_nulls_u8: count");
+      expect(validity_equal(tn->view().column(0), decoded->view().column(0)),
+             "str_split_sparse_nulls_u8: positions");
 
       std::vector<std::string> vals8 = {"aa", "bb", "cc", "aa", "dd", "bb", "ee", "aa"};
       auto t8                        = make_strings_table(vals8, {}, stream);

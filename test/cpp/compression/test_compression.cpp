@@ -24,6 +24,7 @@
 //    * fallback when no plan / chunk below threshold
 
 #include <catch.hpp>
+#include <compression/compressed_scan.hpp>
 #include <compression/plan_register.hpp>
 #include <utils/log_test_utils.hpp>
 
@@ -1883,4 +1884,51 @@ TEST_CASE("pin_table compression - device tier driver returns uniqueness verdict
 
   run_ok(con, "CALL unpin_table('t_uniqcompressed');", "unpin");
   fs::remove_all(tmp);
+}
+
+// ─── Survivor reporting (no GPU required) ────────────────────────────────────
+
+TEST_CASE("with_survivor_reporting sets the obligation and survives per-batch narrowing",
+          "[compression][pushdown_survivors]")
+{
+  sirius::pushdown_request request;
+  request.columns.resize(2);
+  request.columns[0].range          = sirius::decode_range{0, 10};
+  request.columns[1].equals_any     = {"a"};
+  request.ranges_cover_whole_filter = true;
+
+  auto const base = std::make_shared<const sirius::decompression_pushdown_scan>(request);
+  REQUIRE_FALSE(base->request().report_survivors);
+
+  auto const asked = base->with_survivor_reporting();
+  REQUIRE(asked);
+  REQUIRE(asked->request().report_survivors);
+  // The obligation is added to a copy; other batches keep reading the original.
+  REQUIRE_FALSE(base->request().report_survivors);
+  // Nothing else about the request changes.
+  REQUIRE(asked->request().columns.size() == 2);
+  REQUIRE(asked->request().ranges_cover_whole_filter);
+
+  // A batch that stops compacting still reports for whatever it does drop, and
+  // a fresher join-filter snapshot must not silently clear the obligation.
+  auto const narrowed = asked->without_row_selection();
+  REQUIRE(narrowed);
+  REQUIRE(narrowed->request().report_survivors);
+  auto const refreshed = asked->with_membership_probes({}, /*generation=*/7);
+  REQUIRE(refreshed);
+  REQUIRE(refreshed->request().report_survivors);
+}
+
+TEST_CASE("a decode that dropped rows is reported apart from one that carried the whole filter",
+          "[compression][pushdown_survivors]")
+{
+  sirius::pushdown_outcome outcome;
+  REQUIRE_FALSE(outcome.any());
+
+  // Compaction alone is worth reporting: a consumer addressing the chunk by
+  // position needs it even when the residual filter still has to run.
+  outcome.compacted = true;
+  REQUIRE(outcome.any());
+  REQUIRE_FALSE(outcome.row_filtered);
+  REQUIRE_FALSE(outcome.survivor_rows);
 }

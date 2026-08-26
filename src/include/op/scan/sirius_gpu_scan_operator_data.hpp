@@ -242,6 +242,23 @@ class scan_operator_input : public op::operator_data {
   /// again. False whenever the answers came from the plain predicated decode,
   /// which drops no rows.
   bool pushdown_predicates_enforced{false};
+  /// True when the decode DROPPED rows (pushdown_outcome::compacted), whether
+  /// or not it carried the whole filter. A deferral's rowid addresses the
+  /// pinned chunk by position, so a compacted batch is only addressable
+  /// together with @ref pushdown_survivors.
+  bool pushdown_compacted{false};
+  /// Chunk-local positions of the rows the decode kept, ascending INT32, one
+  /// per row of the decoded batch (pushdown_outcome::survivor_rows). Requested
+  /// only by a split carrying a deferral (@ref late_mat_wants_survivors) and
+  /// only produced when the decode compacted; null otherwise. Composed with the
+  /// post-decode residual filter's own survivors in
+  /// sirius_gpu_scan_operator::execute.
+  std::shared_ptr<cudf::column const> pushdown_survivors;
+  /// Whether this split's scan carries a late-materialization deferral, so the
+  /// decode must be asked to report which rows it kept. Stamped by
+  /// sirius_gpu_scan_operator::get_next_task_input_data, which is the only
+  /// place that knows. False leaves the decode exactly as it was.
+  bool late_mat_wants_survivors{false};
   /// The operator's dynamic-filter channel (may be null), stamped by
   /// sirius_gpu_scan_operator::get_next_task_input_data. prepare_for_processing
   /// snapshots it at DECODE time — the scan-manager drain runs at query

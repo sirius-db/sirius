@@ -16,6 +16,9 @@
 //       name_len (uint16 LE) + name bytes   [0 = no name]
 //       dtype_tag (uint8)                   [decoded column type]
 //       num_rows (int64 LE)
+//       validity_kind (uint8)               [0=all_valid 1=all_null 2=mask]
+//         if kind != all_valid: null_count (int64 LE)
+//         if kind == mask:      mask_size_bytes (uint64 LE) + payload_offset (uint64 LE)
 //       num_nodes (uint16 LE)
 //       per node:
 //         op_len (uint16 LE) + op bytes

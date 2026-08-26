@@ -81,22 +81,18 @@ struct pinned_column_view {
 /// prepared against, since a positional mismatch would read the right number of
 /// rows from the wrong batches.
 ///
-/// A COMPRESSED origin IS served here, by materialize_compressed: a dense batch
-/// takes an ordinary full decode, and a selective one tries the sparse walk
+/// A compressed origin is handled by materialize_compressed: a dense batch takes
+/// an ordinary full decode, and a selective one tries the sparse walk
 /// (simpatico::decompress_column_rows over the CSR each batch already carries),
 /// falling back to the mask route for the shapes with no random access
-/// (dictionary, str_split, render rejections) and to a full decode as the last
-/// resort. None of these routes writes an output validity buffer, so a decoded
-/// column that turns out to contain nulls is rejected rather than returned
-/// half-formed (require_non_null).
+/// (dictionary, str_split, render rejections) and to a full decode otherwise.
 ///
-/// What this materializer can serve and what the INSTALLER admits are two
-/// different questions. Today no compressed origin reaches here: the install
-/// gate refuses one outright, because pinned_column_null_count cannot read a
-/// compressed chunk's null count without decoding it and so reports "unknown",
-/// which the nullability check treats as unsafe. These routes are therefore
-/// exercised by their own tests rather than by a query, and they are what a
-/// future relaxation of that gate would rest on.
+/// Every route carries validity. Compression strips a column's nulls into a
+/// sidecar beside its plan tree, so a full decode reattaches them itself, and
+/// the two compacting routes gather the stored bitmask by the same rows they
+/// selected the values by: that mask describes the whole chunk, and returning it
+/// verbatim beside a compacted column would pair each value with another row's
+/// validity.
 std::unique_ptr<cudf::column> materialize(pinned_column_view const& column,
                                           prepared_selection const& selection,
                                           rmm::cuda_stream_view stream,

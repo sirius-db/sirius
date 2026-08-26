@@ -272,30 +272,58 @@ std::unique_ptr<cudf::table> decompress(
 // dtype. That is not cosmetic: a DECIMAL64 returned as its INT64 storage silently drops
 // its scale, which is a wrong-results bug rather than a type complaint.
 
+/// The validity one column of @p table carries, or nullptr when the column has
+/// no plan tree.
+///
+/// Compression strips a column's nulls into this sidecar before the walk and
+/// reattaches them after the decode, so the record is readable straight from a
+/// loaded header — no decode, no device work.
+[[nodiscard]] validity_sidecar const* column_validity(const compressed_table& table,
+                                                      std::size_t column_index);
+
+/// How many of one column's rows are null, or nullopt when the blob cannot say.
+///
+/// Fails closed: a column with no plan tree, an index past the table's width and
+/// a negative recorded count all read as unknown rather than as "no nulls". A
+/// blob written before the validity record existed does not reach here at all —
+/// the reader rejects any header version it does not know.
+[[nodiscard]] std::optional<std::int64_t> column_null_count(const compressed_table& table,
+                                                            std::size_t column_index);
+
 /// One column decoded for a chunk-bucketed row set — the sparse walk, one block
 /// per touched chunk. Refuses any plan without random access (dictionary,
 /// str_split, delta roots). Re-tags the decode's storage type to the column's
 /// stored dtype (see the per-column decode note above).
+///
+/// A compacted output holds only the selected rows, while the stored bitmask
+/// describes every row of the chunk, so a nullable column is refused unless the
+/// caller opts in by passing @p stripped_validity. Doing so returns the values
+/// alone and points @p stripped_validity at the chunk's full-width sidecar,
+/// which the caller must compact against the very selection it passed here.
 std::unique_ptr<cudf::column> decompress_column_rows(
   const compressed_table& table,
   std::size_t column_index,
   sirius::codegen::chunk_row_set const& rows,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
-  std::string* error_out            = nullptr);
+  rmm::cuda_stream_view stream               = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr          = rmm::mr::get_current_device_resource_ref(),
+  std::string* error_out                     = nullptr,
+  validity_sidecar const** stripped_validity = nullptr);
 
 /// One column decoded compacted against a mask the caller already holds — the
 /// shipped mask route, reached as the capability fallback when the sparse walk
 /// refuses. The mask must have been counted (chunk_offsets present). Re-tags
 /// the decode's storage type to the column's stored dtype (see the per-column
 /// decode note above).
+///
+/// Carries validity on the same opt-in terms as decompress_column_rows.
 std::unique_ptr<cudf::column> decompress_column_compacted(
   const compressed_table& table,
   std::size_t column_index,
   sirius::codegen::selection_mask const& mask,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
-  std::string* error_out            = nullptr);
+  rmm::cuda_stream_view stream               = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr          = rmm::mr::get_current_device_resource_ref(),
+  std::string* error_out                     = nullptr,
+  validity_sidecar const** stripped_validity = nullptr);
 
 /// One column decoded full width — the end of every cascade, so it refuses only
 /// on a genuine decode failure. Re-tags the decode's storage type to the

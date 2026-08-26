@@ -103,7 +103,45 @@ __global__ void gather_fixed_kernel(void const* const* __restrict__ bases,
   }
 }
 
+__global__ void gather_validity_kernel(cudf::bitmask_type const* __restrict__ source_mask,
+                                       std::int32_t const* __restrict__ map,
+                                       std::int64_t count,
+                                       cudf::bitmask_type* __restrict__ out_mask)
+{
+  auto const stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+  for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+       i += stride) {
+    if (cudf::bit_is_set(source_mask, static_cast<cudf::size_type>(map[i]))) {
+      cudf::set_bit(out_mask, static_cast<cudf::size_type>(i));
+    } else {
+      cudf::clear_bit(out_mask, static_cast<cudf::size_type>(i));
+    }
+  }
+}
+
 }  // namespace
+
+void gather_validity_bits(std::uint32_t const* source_mask,
+                          std::int32_t const* map,
+                          std::int64_t count,
+                          std::uint32_t* out_mask,
+                          rmm::cuda_stream_view stream)
+{
+  if (count == 0) { return; }
+  if (source_mask == nullptr || map == nullptr || out_mask == nullptr) {
+    throw std::runtime_error("multi_source_gather: validity gather over unbound buffers");
+  }
+
+  std::int64_t blocks = (count + kBlock - 1) / kBlock;
+  if (blocks > 4096) { blocks = 4096; }  // grid-stride covers the rest
+
+  gather_validity_kernel<<<static_cast<unsigned>(blocks), kBlock, 0, stream.value()>>>(
+    reinterpret_cast<cudf::bitmask_type const*>(source_mask),
+    map,
+    count,
+    reinterpret_cast<cudf::bitmask_type*>(out_mask));
+  throw_on_cuda(cudaPeekAtLastError(), "gather_validity launch");
+}
 
 void multi_source_gather_fixed(void const* const* bases_dev,
                                std::int64_t const* row_start_dev,
