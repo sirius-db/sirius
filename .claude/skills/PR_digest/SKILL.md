@@ -134,8 +134,14 @@ Keep each entry genuinely short. The temptation is to front-load explanation her
 detailed section redundant — resist it. The overview answers "what is this change and why should I
 care", the detailed section answers "how does it work and where does it live".
 
-Number the entries to match the detailed sections below (Key Change 1 → the `## Key Change 1 —
 ...` heading), and link each entry to its section so the reader can jump straight there.
+
+After the glance list, add a **"Suggested reading order"**: 5–8 numbered steps naming which
+files and functions to open, in which order, for someone reviewing this PR for the first time.
+Start from the artifact that defines the target shape (often a test), then the mechanism, then
+the guards. Tag the load-bearing line each step exists to protect ("this emit mapping is the
+line the rest depends on") so the reader knows what to slow down for. This is pedagogy, not a
+verdict — no severity labels, no "must fix", no approval language.
 
 ## Step 7 — Write each key change
 
