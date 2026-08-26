@@ -760,7 +760,7 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
     if (operator_node) { sirius::from_yaml(*operator_node, resolved_operator_params); }
     _operator_params = std::move(resolved_operator_params);
 
-    enforce_sirius_datasource_for_multi_gpu();
+    validate_sirius_datasource_for_multi_gpu();
 
   } catch (const std::exception& e) {
     throw std::runtime_error("Failed to load config from " + config_path.string() + ": " +
@@ -768,18 +768,15 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
   }
 }
 
-void sirius_config::enforce_sirius_datasource_for_multi_gpu()
+void sirius_config::validate_sirius_datasource_for_multi_gpu() const
 {
-  size_t num_gpus = std::ranges::count_if(_memory_space_configs, [](auto const& space) {
+  size_t const num_gpus = std::ranges::count_if(_memory_space_configs, [](auto const& space) {
     return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space);
   });
   if (num_gpus > 1 && !_scan_manager_config.use_sirius_datasource) {
-    SIRIUS_LOG_WARN(
-      "sirius_config: use_sirius_datasource was false but {} GPUs are configured; "
-      "the sirius datasource is required for multi-GPU IO routing. Overriding "
-      "use_sirius_datasource to true.",
-      num_gpus);
-    _scan_manager_config.use_sirius_datasource = true;
+    throw std::runtime_error(
+      "sirius.executor.scan_manager.use_sirius_datasource=false is only supported with one "
+      "configured GPU; the Sirius datasource is required for multi-GPU IO routing");
   }
 }
 
