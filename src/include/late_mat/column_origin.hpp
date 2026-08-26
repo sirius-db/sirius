@@ -43,6 +43,8 @@
 // range.start + local, at the consumer's edge —
 // codegen/selection/row_id_space.hpp is where they are narrowed back.
 
+#include <rmm/device_buffer.hpp>
+
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -50,10 +52,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-
-namespace rmm {
-class device_buffer;
-}
 
 namespace sirius::scan_manager {
 struct pinned_entry;  // scan_manager/sirius_scan_manager.hpp

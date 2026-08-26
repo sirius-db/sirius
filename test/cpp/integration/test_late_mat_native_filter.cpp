@@ -28,6 +28,7 @@
 #include <late_mat/defer_policy.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
+#include <cstdint>
 #include <cstdlib>
 #include <string>
 #include <vector>

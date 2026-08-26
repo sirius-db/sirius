@@ -49,6 +49,7 @@
 #include <scan_manager/sirius_scan_manager.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <functional>
 #include <memory>
