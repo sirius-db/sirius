@@ -39,8 +39,10 @@
 
 #include <cuda_runtime.h>
 
+#include <api/simpatico_codegen.hpp>
 #include <catch.hpp>
 #include <compression/compressed_representation.hpp>
+#include <compression/device_compressed_blob.hpp>
 #include <late_mat/materialize.hpp>
 #include <scan_manager/late_mat_resolver.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
@@ -464,4 +466,127 @@ TEST_CASE("a multi-batch column carries nulls through the multi-source gather ke
   auto const values = read_back(out->view());
   REQUIRE(values[1] == 40);
   REQUIRE(values[4] == 20);
+}
+
+namespace {
+
+/// A GPU pin whose chunks are Simpatico-compressed and carry nulls, addressed
+/// the way the scan manager stores a compressed pin: through device_chunks
+/// rather than data_batches_by_column.
+struct fake_compressed_entry {
+  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
+  pinned_entry entry;
+  std::shared_ptr<pin_entry_handle> handle;
+
+  fake_compressed_entry(std::vector<std::int64_t> const& batch_rows,
+                        std::vector<std::int64_t> const& null_rows,
+                        std::string const& name,
+                        rmm::cuda_stream_view stream)
+  {
+    auto const mr   = rmm::mr::get_current_device_resource_ref();
+    manager         = sirius::test::operator_utils::initialize_memory_manager();
+    auto* gpu_space = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+
+    entry.tier = cucascade::memory::Tier::GPU;
+    entry.cache_info.names.push_back(name);
+
+    std::int64_t next = 0;
+    for (auto const rows : batch_rows) {
+      std::vector<std::int32_t> host(static_cast<std::size_t>(rows));
+      std::iota(host.begin(), host.end(), static_cast<std::int32_t>(next));
+
+      auto col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                           static_cast<cudf::size_type>(rows),
+                                           cudf::mask_state::ALL_VALID,
+                                           stream);
+      cudaMemcpyAsync(col->mutable_view().data<std::int32_t>(),
+                      host.data(),
+                      host.size() * sizeof(std::int32_t),
+                      cudaMemcpyHostToDevice,
+                      stream.value());
+      cudf::size_type null_count = 0;
+      for (auto const global_row : null_rows) {
+        if (global_row < next || global_row >= next + rows) { continue; }
+        auto const local = static_cast<cudf::size_type>(global_row - next);
+        cudf::set_null_mask(col->mutable_view().null_mask(), local, local + 1, false, stream);
+        ++null_count;
+      }
+      col->set_null_count(null_count);
+      cudaStreamSynchronize(stream.value());
+      next += rows;
+
+      auto blob   = std::make_shared<sirius::compressed_device_blob>();
+      blob->table = simpatico::compress_with_plan(
+        cudf::table_view{{col->view()}}, "input -> bitpack -> packed\n", stream, mr);
+      cudaStreamSynchronize(stream.value());
+
+      sirius::device_pin_chunk chunk;
+      chunk.memory_space = gpu_space;
+      chunk.compressed   = std::make_shared<sirius::compressed_device_representation>(
+        *gpu_space,
+        blob,
+        std::vector<std::string>{name},
+        /*compressed_bytes=*/64,
+        /*uncompressed_bytes=*/static_cast<std::size_t>(rows) * sizeof(std::int32_t),
+        rows);
+      entry.device_chunks.push_back(std::move(chunk));
+      entry.num_rows += static_cast<std::size_t>(rows);
+    }
+
+    handle = std::make_shared<pin_entry_handle>(name, 5);
+    handle->set_entry(&entry);
+  }
+
+  [[nodiscard]] column_origin origin(std::uint32_t pos = 0) const
+  {
+    column_origin o;
+    o.handle     = handle;
+    o.column_pos = pos;
+    o.generation = handle->generation();
+    return o;
+  }
+};
+
+}  // namespace
+
+TEST_CASE("a nullable compressed pin resolves and materializes with its nulls",
+          "[late_mat][resolver]")
+{
+  auto const stream = rmm::cuda_stream_view{};
+  auto const mr     = rmm::mr::get_current_device_resource_ref();
+  // Rows 5 and 60 are null, and 60 falls in the third chunk, so the selection
+  // below crosses chunk boundaries with nulls on either side of one.
+  fake_compressed_entry pin({32, 16, 24}, /*null_rows=*/{5, 60}, "c_mktsegment", stream);
+
+  auto const column = resolve_pinned_column(pin.origin());
+  REQUIRE(column.has_value());
+  REQUIRE(column->batches.size() == 3);
+  REQUIRE(column->batches[0].is_compressed());
+
+  auto const layout = resolve_pinned_layout(pin.origin());
+  REQUIRE(layout.has_value());
+
+  // Out of order and with a repeat, touching both null rows.
+  std::vector<std::uint64_t> const ids{5, 40, 60, 5, 20};
+  auto d_ids = upload_ids(ids, stream);
+  prepared_selection const prepared(*layout,
+                                    row_id_list{static_cast<std::uint64_t const*>(d_ids.data()),
+                                                static_cast<std::int64_t>(ids.size()),
+                                                false});
+  auto const out = materialize(*column, prepared, stream, mr);
+  cudaStreamSynchronize(stream.value());
+
+  REQUIRE(out->view().nullable());
+  auto const host_mask = read_back_mask(out->view());
+  auto const* mask     = host_mask.data();
+  REQUIRE_FALSE(cudf::bit_is_set(mask, 0));
+  REQUIRE(cudf::bit_is_set(mask, 1));
+  REQUIRE_FALSE(cudf::bit_is_set(mask, 2));
+  REQUIRE_FALSE(cudf::bit_is_set(mask, 3));
+  REQUIRE(cudf::bit_is_set(mask, 4));
+
+  // The values are the row ids themselves, so a decode that read other rows
+  // shows up here rather than only in the mask.
+  auto const values = read_back(out->view());
+  REQUIRE(values == std::vector<std::int32_t>{5, 40, 60, 5, 20});
 }
