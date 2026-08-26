@@ -141,6 +141,10 @@ gh extension install github/gh-stack
 - `stacked/`-prefixed branches may be pushed directly to `origin` (this repo)
   - If you are working on a local copy that is your fork, you will need to ensure `origin` points
     to this repo and not your fork.
+  - This is a workaround for [gh-stack#381](https://github.com/github/gh-stack/issues/381), where
+    `gh stack`'s `--remote` flag doesn't actually control which repo it operates against, only
+    `origin` does. Once that's fixed upstream, this remote-renaming step should no longer be
+    necessary.
   - Run the following command replacing `$USER` with your name; otherwise it will use your local username:
       ```bash
       # Rename current origin to local user's name and set origin to main Sirius repo
@@ -158,6 +162,69 @@ gh stack add stacked/<branch>                           # add a branch on top of
 gh stack submit                                         # push all branches and create/update PRs
 gh stack sync                                           # rebase and sync the stack with GitHub
 ```
+
+#### Navigating a stack
+
+Move between layers without typing branch names:
+
+```bash
+gh stack top       # check out the top branch (furthest from dev)
+gh stack bottom    # check out the bottom branch (closest to dev)
+gh stack up        # check out one branch up (further from dev)
+gh stack down      # check out one branch down (closer to dev)
+gh stack trunk     # check out dev
+gh stack switch    # interactively pick a branch in the stack
+```
+
+`gh stack checkout <stack-number|PR-number|PR-URL|branch>` resumes a stack you don't currently
+have checked out, for example one someone else started or one you left a while ago.
+
+`gh stack modify` opens an interactive editor to reorder, insert, drop, or fold branches in a
+stack, useful if a stack's layering needs to change after the fact.
+
+#### Managing a stack
+
+**Adding layers to a stack**
+
+`gh stack` CLI can manage the stack, adding layers as needed with `gh stack add stacked/<branch>`.
+This can also be done in the Web UI by clicking on the stack icon (next to the PR status button,
+in the top left of the PR page). There you can see the full stack of PRs, and an option to add
+to the stack.
+
+**Unstacking PRs**
+
+Sometimes it may be necessary to unstack PRs. This can be done in the CLI with
+`gh stack unstack` or in the Web UI clicking on the stack icon and selecting the stack icon with
+an "x" labeled "Unstack pull requests." Both methods remove the stack and convert the PRs to
+self-contained PRs targeting `dev`.
+
+#### Merging a stack
+
+**Merging as a stack (recommended)**
+
+By design stacked PRs are merged as a stack, once every PR passes required checks and has
+reviewer approval. You can merge the whole stack at once with either method:
+- **Web UI**: the top-most PR's page shows an **"Enqueue stack"** button with a count of the PRs
+  still open in the stack. It stays disabled (showing "Unable to merge as a stack") until every
+  open PR in the stack passes required checks and has reviewer approval.
+- **CLI**: `gh stack merge` only checks that each PR is open and not a draft locally; branch
+  protection and repository rules are still evaluated by GitHub when the merge runs.
+
+Both methods respect this repo's merge queue: the stack is added to the queue and merges once
+it's processed, rather than merging directly.
+
+**Merging from the bottom**
+
+Sometimes, it may be necessary to merge the bottom layer(s) of a stack instead of the entire
+stack at once. While this is not the recommended flow, there is support for this. Starting with
+the bottom PR, merge the PR using the "Enqueue pull request" button. Once the PR has cleared the
+merge queue and is merged, run `gh stack sync --prune` to rebase the remaining branches onto the
+updated `dev` and clean up local branches for the merged PR. Confirm it worked via `gh stack view`:
+the merged layer should show a ✓ under a `╌╌╌ merged ╌╌╌` marker, and the remaining branches
+shouldn't show a `⚠` warning icon. If they still do, repeat the sync.
+
+Once the sync has taken effect, the new bottom of the stack will target `dev` while the top of
+the stack will be able to merge as a whole stack minus the merged PR.
 
 ### Commit and title convention
 

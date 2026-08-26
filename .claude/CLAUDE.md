@@ -25,7 +25,9 @@ self-contained if it can be reviewed as one coherent unit. If unsure, ask the us
 to stack: the setup has real, sticky side effects (see "Remote gotcha" below) and requires
 maintainer push access (check `MAINTAINERS.md`), so it isn't something to default into
 unilaterally. If a stack is chosen, aim for every layer to be reviewable on its own merits, not
-just the stack as a whole.
+just the stack as a whole. If a stack turns out to be the wrong call after starting, `gh stack
+unstack` converts the PRs back to self-contained targeting `dev`; see `CONTRIBUTING.md`'s
+"Managing a stack" section.
 
 ### Stacked PR tips
 
@@ -39,6 +41,14 @@ clone's `origin` remote to the main `sirius-db/sirius` repo — that change is l
 in a clone that's been set up this way, `origin` no longer points at your fork. Always run `git
 remote -v` before pushing rather than assuming `origin` = your fork; a self-contained PR from
 such a clone needs to push to the renamed fork remote instead.
+
+**Merging a stack** happens all at once, not PR by PR: either the web UI's "Enqueue stack" button
+on the top-most PR, or `gh stack merge`. Both respect this repo's merge queue. Don't merge stack
+PRs individually with `gh pr merge` even if asked, and don't pass `--yes` to `gh stack merge`
+without asking first, since it merges multiple PRs at once and both humans and agents should
+confirm before that happens. If a layer ends up merged out of order anyway, run `gh stack sync
+--prune` to fix it. See `CONTRIBUTING.md`'s "Merging a stack" section for the full verification
+steps.
 
 ## Build & test
 
