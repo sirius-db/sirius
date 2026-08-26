@@ -59,6 +59,10 @@ constexpr uint64_t k_bigint_max = static_cast<uint64_t>(std::numeric_limits<int6
 // Largest histogram, in bytes, that accumulate_impl privatizes into shared memory. 48 KiB is the
 // default per-block dynamic-shared limit, so no cudaFuncSetAttribute opt-in is required.
 constexpr std::size_t k_max_privatized_smem_bytes = 48 * 1024;
+// Rows per slot at which the histogram is contended enough to be atomic-latency bound. Below it,
+// accumulation is a scatter with no contention to hide, which changes both whether privatization
+// pays for itself and how the grid should be sized.
+constexpr int64_t k_contended_rows_per_slot = 8;
 
 // Attribute of the current device, cached per thread; 0 when the query fails.
 template <cudaDeviceAttr Attr>
@@ -84,13 +88,38 @@ template <cudaDeviceAttr Attr>
                   static_cast<std::size_t>(device_attribute<cudaDevAttrMaxSharedMemoryPerBlock>()));
 }
 
-// Every kernel here is grid-stride and so correct at any positive grid: size it to what the kernel
-// can keep resident rather than to one block per k_block_size rows. Falls back to the full ceiling
-// when the device queries fail.
-template <typename KernelT>
-[[nodiscard]] unsigned grid_size_for(int64_t n, KernelT kernel, std::size_t dynamic_smem_bytes = 0)
+// Every kernel here is grid-stride and so correct at any positive grid, but the two sizing policies
+// below are not interchangeable: which one wins depends on what bounds the kernel. Both were
+// measured on SF1000, and the gap either way is far larger than the launch overhead that usually
+// motivates capping a grid.
+
+/** @brief One block per k_block_size rows, uncapped.
+ *
+ * For a kernel bound by scattered-atomic latency rather than occupancy, blocks queued behind the
+ * resident set are what hides that latency and smooths tail imbalance. accumulate_kernel measured
+ * monotonically faster with more blocks: 60.2 ms uncapped against 65.8 ms at resident capacity,
+ * accumulating 1.5B rows into a 150M-slot histogram.
+ */
+[[nodiscard]] unsigned full_grid_for(int64_t n)
 {
-  auto const blocks   = std::max<int64_t>(sirius::utils::ceil_div<int64_t>(n, k_block_size), 1);
+  return static_cast<unsigned>(
+    std::max<int64_t>(sirius::utils::ceil_div<int64_t>(n, k_block_size), 1));
+}
+
+/** @brief Capped at what the kernel can keep resident; falls back to @ref full_grid_for.
+ *
+ * For a kernel that pays a fixed per-block cost, extra blocks buy nothing and cost that price
+ * again. accumulate_privatized_kernel zeroes and flushes `slots` shared slots per block, so an
+ * uncapped grid reintroduces the very contention privatization removes: 266 us resident against
+ * 1329 us uncapped over 150M rows into 25 slots. emit_kernel is bandwidth bound and prefers
+ * resident sizing for the same reason, 615 us against 877 us over 150M output rows.
+ */
+template <typename KernelT>
+[[nodiscard]] unsigned resident_grid_for(int64_t n,
+                                         KernelT kernel,
+                                         std::size_t dynamic_smem_bytes = 0)
+{
+  auto const blocks   = full_grid_for(n);
   auto const sm_count = device_attribute<cudaDevAttrMultiProcessorCount>();
   int blocks_per_sm   = 0;
   if (sm_count > 0 &&
@@ -100,7 +129,7 @@ template <typename KernelT>
     return static_cast<unsigned>(
       std::min<int64_t>(blocks, static_cast<int64_t>(sm_count) * blocks_per_sm));
   }
-  return static_cast<unsigned>(blocks);
+  return blocks;
 }
 
 // Invokes fn with an INT32 or INT64 tag; what names the column in the diagnostic message.
@@ -335,17 +364,20 @@ void accumulate_impl(cudf::column_view const& keys,
 
   auto const min_key = layout.min_key();
   auto const slots   = static_cast<int64_t>(layout.slots());
+  // Rows per slot is what makes the histogram contended, and both decisions below turn on it.
+  auto const contended = n >= k_contended_rows_per_slot * slots;
   // Privatize whenever the domain fits in shared memory, except when the batch is too short for
   // the zeroing and flush passes to pay for the contention they remove.
   auto const budget_slots = static_cast<int64_t>(smem_histogram_budget() / sizeof(uint32_t));
-  auto const privatize    = slots <= budget_slots && n >= 8 * slots;
+  auto const privatize    = slots <= budget_slots && contended;
   auto const smem_bytes =
     privatize ? static_cast<std::size_t>(slots) * sizeof(uint32_t) : std::size_t{0};
 
   auto launch = [&](auto key_tag) {
     using KeyT = decltype(key_tag);
     if (privatize) {
-      auto const grid = grid_size_for(n, accumulate_privatized_kernel<KeyT, CountT>, smem_bytes);
+      auto const grid =
+        resident_grid_for(n, accumulate_privatized_kernel<KeyT, CountT>, smem_bytes);
       accumulate_privatized_kernel<KeyT, CountT>
         <<<grid, k_block_size, smem_bytes, stream.value()>>>(keys.template data<KeyT>(),
                                                              key_mask,
@@ -359,7 +391,11 @@ void accumulate_impl(cudf::column_view const& keys,
                                                              bins);
       return;
     }
-    auto const grid = grid_size_for(n, accumulate_kernel<KeyT, CountT>);
+    // Only a contended histogram is atomic-latency bound. One row per slot is a pure scatter, and
+    // there the queued blocks are overhead: 807 us uncapped against 420 us resident over 150M rows
+    // into 150M slots.
+    auto const grid =
+      contended ? full_grid_for(n) : resident_grid_for(n, accumulate_kernel<KeyT, CountT>);
     accumulate_kernel<KeyT, CountT>
       <<<grid, k_block_size, 0, stream.value()>>>(keys.template data<KeyT>(),
                                                   key_mask,
@@ -488,7 +524,7 @@ std::unique_ptr<cudf::table> emit_impl(CountT const* presence,
 
     auto launch = [&](auto key_tag) {
       using KeyT      = decltype(key_tag);
-      auto const grid = grid_size_for(group_rows, emit_kernel<KeyT, CountT>);
+      auto const grid = resident_grid_for(group_rows, emit_kernel<KeyT, CountT>);
       emit_kernel<KeyT, CountT><<<grid, k_block_size, 0, stream.value()>>>(
         selected ? selected->data() : nullptr,
         group_rows,
@@ -653,7 +689,7 @@ void throw_if_count_product_overflows(cudf::column_view const& lhs,
   if (lhs.size() == 0) { return; }
 
   cudf::numeric_scalar<int32_t> status(0, true, stream, mr);
-  validate_product_kernel<<<grid_size_for(lhs.size(), validate_product_kernel),
+  validate_product_kernel<<<resident_grid_for(lhs.size(), validate_product_kernel),
                             k_block_size,
                             0,
                             stream.value()>>>(
