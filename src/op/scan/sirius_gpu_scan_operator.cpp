@@ -35,6 +35,7 @@
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_stream.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/scalar/scalar.hpp>
@@ -60,6 +61,52 @@
 namespace sirius::op::scan {
 namespace {
 constexpr std::size_t kMaxNumericCarrierExpansion = 8;
+
+/// One filtered scan's surviving row positions, however many stages produced
+/// them.
+///
+/// A batch off a compressed pin can be restricted twice: the fused decode drops
+/// rows while decoding, and whatever conjuncts it could not carry are evaluated
+/// again afterwards. Each stage reports positions in ITS OWN input, so the
+/// second stage's positions index the first stage's output, not the chunk. The
+/// composition that turns them back into chunk positions is a gather of the
+/// decode's list by the residual's.
+struct composed_survivors {
+  /// Non-null when this call built the composition.
+  std::unique_ptr<cudf::column> column;
+  /// A view of a list that already existed, used when nothing had to be built.
+  std::optional<cudf::column_view> borrowed;
+};
+
+/// @param decoded Positions the decode kept, chunk-local; null when it kept all.
+/// @param residual Positions the post-decode filter kept, indexing the decoded
+///        batch; null when no filter ran there.
+/// @param decode_compacted Whether the decode dropped rows at all. A compaction
+///        with no positions to account for it cannot be composed, and emitting
+///        the residual's positions alone would address the wrong rows.
+composed_survivors compose_survivors(cudf::column const* decoded,
+                                     cudf::column const* residual,
+                                     bool decode_compacted,
+                                     rmm::cuda_stream_view stream,
+                                     rmm::device_async_resource_ref mr)
+{
+  if (decode_compacted && decoded == nullptr) {
+    throw std::runtime_error(
+      "[sirius_gpu_scan_operator] the decode compacted this batch without reporting which rows "
+      "it kept; a pin-order rowid cannot be rebuilt from it");
+  }
+  if (decoded == nullptr) {
+    return {nullptr, residual ? std::optional<cudf::column_view>{residual->view()} : std::nullopt};
+  }
+  if (residual == nullptr) { return {nullptr, std::optional<cudf::column_view>{decoded->view()}}; }
+  auto gathered = cudf::gather(cudf::table_view{{decoded->view()}},
+                               residual->view(),
+                               cudf::out_of_bounds_policy::DONT_CHECK,
+                               stream,
+                               mr);
+  auto columns  = gathered->release();
+  return {std::move(columns.front()), std::nullopt};
+}
 
 /// Emit the deferred positions as a rowid and placeholders instead of values.
 ///
@@ -427,6 +474,9 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
     // Membership channel for the decode-time snapshot (join builds publish
     // during execution — only a snapshot taken at prepare/decode can see them).
     scan_input->dynamic_filters = _dynamic_filters_channel;
+    // Only this side knows a deferral is installed, and only a decode told
+    // before it runs can report which rows it kept.
+    scan_input->late_mat_wants_survivors = !deferred_output().empty();
     scan_input->prefetch(io::cache::prefetching_stage::immediate);
   }
   return std::move(*next);
@@ -503,6 +553,15 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
     auto like_pattern_cache       = like_cache();
     auto materialized_table =
       _ingestible->materialize_table(*scan_input, stream, like_swar_fastpath, like_pattern_cache);
+    // The decode's survivor list must describe exactly the rows the residual
+    // filter is about to index, or composing the two addresses the wrong rows.
+    if (wants_survivors && scan_input->pushdown_survivors &&
+        scan_input->pushdown_survivors->size() != materialized_table.table.view().num_rows()) {
+      throw std::runtime_error("[sirius_gpu_scan_operator::execute] the decode reported " +
+                               std::to_string(scan_input->pushdown_survivors->size()) +
+                               " surviving rows but handed on " +
+                               std::to_string(materialized_table.table.view().num_rows()));
+    }
     if (materialized_table.state != filter_state::ROW_FILTERED_AND_PROJECTED) {
       // Elide the deferred columns from the projection: realizing the batch would
       // copy values this scan is about to replace with a rowid.
@@ -528,8 +587,14 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
           "[sirius_gpu_scan_operator::execute] a deferral is installed but this split carries no "
           "origin; the scan cannot say where its rows came from");
       }
+      auto const composed = compose_survivors(scan_input->pushdown_survivors.get(),
+                                              survivors.get(),
+                                              scan_input->pushdown_compacted,
+                                              stream,
+                                              mem_space->get_default_allocator());
       std::optional<cudf::column_view> const survivor_view =
-        survivors ? std::optional<cudf::column_view>{survivors->view()} : std::nullopt;
+        composed.column ? std::optional<cudf::column_view>{composed.column->view()}
+                        : composed.borrowed;
       output_table = substitute_deferred_columns(std::move(output_table),
                                                  deferred_output(),
                                                  *scan_input->origin,
