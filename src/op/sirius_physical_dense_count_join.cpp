@@ -186,7 +186,6 @@ dense_count_join_input::dense_count_join_input(
 {
 }
 
-
 sirius_physical_dense_count_join::sirius_physical_dense_count_join(
   duckdb::vector<sirius::logical_type> types,
   std::size_t estimated_cardinality,
@@ -483,18 +482,22 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
     count_product_needs_validation(preserved_rows, counted_rows, count_star);
   auto const non_null_keys = preserved_rows - preserved_null_keys;
 
-  // NULL is one SQL group, so exactly one task may emit it. Hash partitioning sends every null key
-  // to the same partition; if that ever stopped holding, the output would carry one NULL group per
-  // task carrying null keys and the row would silently duplicate.
+  // NULL is one SQL group, so only one partition may carry null keys. Hash partitioning sends
+  // every null key to the same partition; if that stopped holding, the output would carry one NULL
+  // group per task carrying them and the row would silently duplicate.
+  //
+  // Keyed by partition rather than by a bare flag because an OOM'd task is rescheduled with this
+  // same input and re-enters execute() from the start: a retry must not read as a second partition.
   if (preserved_null_keys > 0) {
+    auto const this_partition = input.get_partition_idx();
     std::lock_guard<std::mutex> guard(lock);
-    if (_null_group_emitted) {
+    if (_null_group_partition.has_value() && *_null_group_partition != this_partition) {
       throw sirius::internal_exception(
-        "dense_count_join: a second task received {} NULL preserved keys; null keys must all land "
-        "in one partition or the NULL group is emitted more than once",
+        "dense_count_join: a second partition received {} NULL preserved keys; null keys must all "
+        "land in one partition or the NULL group is emitted more than once",
         preserved_null_keys);
     }
-    _null_group_emitted = true;
+    _null_group_partition = this_partition;
   }
 
   std::unique_ptr<cudf::table> output;

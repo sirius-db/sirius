@@ -244,10 +244,12 @@ class sirius_physical_dense_count_join : public sirius_physical_partition_consum
   strategy _last_strategy = strategy::NOT_RUN;
   /// Next partition to hand to a task; guarded by the base `lock`.
   std::size_t _current_partition_index = 0;
-  /// Set once a task has emitted the SQL NULL group. Hash partitioning co-locates null keys, so a
-  /// second such task means the partitioning contract broke and the output would carry duplicate
-  /// NULL groups. Guarded by the base `lock`.
-  bool _null_group_emitted = false;
+  /// Partition of the task that carried NULL preserved keys, once one has. Hash partitioning
+  /// co-locates null keys, so a *different* partition carrying them means the partitioning contract
+  /// broke and the output would carry duplicate NULL groups. The inner optional is empty in the
+  /// single-partition case, where the input is deliberately left untagged. Retrying the same
+  /// partition after an OOM compares equal and is allowed. Guarded by the base `lock`.
+  std::optional<std::optional<std::size_t>> _null_group_partition;
 };
 
 }  // namespace sirius::op

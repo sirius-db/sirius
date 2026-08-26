@@ -659,3 +659,64 @@ TEST_CASE("dense_count_join exact rare-path BIGINT product validation",
   REQUIRE_THROWS_WITH(throw_if_count_product_overflows(lhs_view, overflow_rhs_view, stream, mr),
                       Catch::Contains("COUNT result exceeds BIGINT max"));
 }
+
+TEST_CASE("dense_count_join: a retried task re-executes on the same input",
+          "[dense_count_join][validation]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space);
+  auto const stream = default_stream();
+
+  // NULL preserved keys, so the NULL-group accounting is exercised on every run.
+  std::vector<std::shared_ptr<cucascade::data_batch>> preserved{
+    make_numeric_batch_with_nulls<int32_t>(
+      *space, {1, 2, 2, 0, 0}, {true, true, true, false, false}, cudf::type_id::INT32)};
+  std::vector<std::shared_ptr<cucascade::data_batch>> counted{make_counted_batch(
+    *space, {1, 1, 2, 2, 0}, {10, 0, 10, 10, 10}, {true, false, true, true, true})};
+
+  duckdb::vector<duckdb::LogicalType> types;
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER));
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+
+  // An OOM'd task is rescheduled carrying the same input_data and re-enters execute() from the
+  // start, so a second execute() on one operator instance must behave exactly like the first.
+  auto const require_repeatable = [&](uint64_t max_bins_bytes,
+                                      sirius_physical_dense_count_join::strategy expected) {
+    sirius_physical_dense_count_join op(sirius::from_duckdb_vec(types),
+                                        /*estimated_cardinality=*/16,
+                                        /*preserved_key_idx=*/0,
+                                        /*counted_key_idx=*/0,
+                                        std::size_t{1},
+                                        max_bins_bytes);
+    dense_count_join_input input(preserved, counted);
+
+    auto first = op.execute(input, stream);
+    stream.synchronize();
+    REQUIRE(op.last_strategy() == expected);
+
+    std::unique_ptr<sirius::op::operator_data> second;
+    REQUIRE_NOTHROW(second = op.execute(input, stream));
+    stream.synchronize();
+    REQUIRE(op.last_strategy() == expected);
+
+    auto const rows_of = [](sirius::op::operator_data const& data) {
+      auto const& batches =
+        dynamic_cast<const pipelineable_operator_data&>(data).get_data_batches();
+      REQUIRE(batches.size() == 1);
+      auto const view = sirius::get_cudf_table_view(*batches[0]);
+      return std::pair{copy_column_to_host<int32_t>(view.column(0)),
+                       copy_column_to_host<int64_t>(view.column(1))};
+    };
+    // The input is read through column views only, so the retry sees identical bytes.
+    CHECK(rows_of(*first) == rows_of(*second));
+  };
+
+  SECTION("dense path")
+  {
+    require_repeatable(k_default_max_bytes, sirius_physical_dense_count_join::strategy::DENSE);
+  }
+  SECTION("sparse path")
+  {
+    require_repeatable(k_tiny_max_bytes, sirius_physical_dense_count_join::strategy::SPARSE);
+  }
+}
