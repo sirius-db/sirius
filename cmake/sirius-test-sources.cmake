@@ -199,6 +199,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_late_mat_deferred_query.cpp
     test/cpp/integration/test_pin_unique_join.cpp
     test/cpp/integration/test_late_mat_native_filter.cpp
+    test/cpp/integration/test_late_mat_compressed_filter.cpp
     test/cpp/late_mat/test_defer_policy.cpp
     test/cpp/late_mat/test_defer_directive.cpp
     test/cpp/late_mat/test_late_mat_plan_pass.cpp
