@@ -887,8 +887,8 @@ void sirius_physical_plan_generator::set_parent_ops(sirius::op::sirius_physical_
   op.set_parent_op(parent);
 
   // CTE is transparent on its consumer side: children[0] materializes into the CTE while
-  // children[1]'s result IS the CTE's output (CTE::execute just forwards it). Stamp
-  // children[1] with CTE's own parent so the tree-parent wiring never emits
+  // children[1]'s result IS the CTE's output (CTE::execute just forwards it). Assign the CTE's
+  // own parent to children[1] so the tree-parent wiring never emits
   // consumer_sink -> CTE_pipeline edges, which would close a cycle with the CTE sink's own
   // CTE_pipeline -> consumer emissions.
   if (op.type == sirius::op::SiriusPhysicalOperatorType::CTE) {

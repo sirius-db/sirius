@@ -676,6 +676,20 @@ test options; it is not part of the normal user surface.
 Both size gates are evaluated on the narrowed table when compressed materialization is active.
 See [Compressed Pinning](compressed-pinning.md) for tier selection, plan authoring, and results.
 
+### Late Materialization (experimental)
+
+Off by default, and gated by environment variables rather than `sirius_config`/`SET` — this is
+still an experimental optimization, not a normal session choice.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SIRIUS_EXP_LATE_MAT` | off | The master gate. Carries a pin-order rowid instead of scanned values for a GPU-tier pinned table, restoring them at the far end. |
+| `SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS` | off | Columns the pin-time uniqueness probe observes: `all`, a name list, or `none`. Required for a group-by-rowid ride or a rider to be admissible at all. |
+
+Five further `SIRIUS_EXP_LATE_MAT_*` knobs tune the deferral floors and the count-on-deferred
+path; see [Late Materialization](late-materialization.md#turning-it-on-experimental) for the full
+gate table, the mechanism, and results.
+
 ### Transparent Execution
 
 | Variable | Default | Description |
@@ -688,6 +702,7 @@ See [Compressed Pinning](compressed-pinning.md) for tier selection, plan authori
 |----------|---------|-------------|
 | `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates both plan-time fallback (unsupported operator/type) and runtime fallback (GPU execution failure) on the transparent path, plus the legacy `CALL gpu_execution(...)` path. Set to `false` to surface Sirius errors instead of falling back. |
 | `enable_regex_jit_impl` | true | Use JIT regex implementation |
+| `like_swar_fastpath` | true | Dispatch `%lit1%lit2%...%` LIKE/NOT LIKE patterns to the SWAR digram fast-path kernel instead of `cudf::strings::like` |
 
 
 ## Legacy Config Flags

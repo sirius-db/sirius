@@ -25,6 +25,7 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "exec/stream_bind_catalog.hpp"
 #include "log/duckdb_sink.hpp"
 #include "log/logging.hpp"
 #include "log/noop_sink.hpp"
@@ -222,7 +223,21 @@ SiriusContext::SiriusContext() = default;
 
 SiriusContext::~SiriusContext() noexcept
 {
-  if (is_initialized_) { terminate(); }
+  if (!is_initialized_) { return; }
+
+  try {
+    terminate();
+  } catch (const std::exception& e) {
+    try {
+      SIRIUS_LOG_ERROR("SiriusContext teardown failed: {}", e.what());
+    } catch (...) {
+    }
+  } catch (...) {
+    try {
+      SIRIUS_LOG_ERROR("SiriusContext teardown failed with an unknown error");
+    } catch (...) {
+    }
+  }
 }
 
 // Log host and GPU memory pool stats at a labeled point.
@@ -891,14 +906,17 @@ void SiriusContext::terminate()
 {
   throw_if_not_initialized();
 
+  // task_creator_ and downgrade_executors_ hold non-owning pointers into task_scheduler_. Stop and
+  // join every borrower before destroying the scheduler and its task queue.
   task_scheduler_->stop();
-  task_scheduler_.reset();
   if (scan_manager_) { scan_manager_->stop(); }
   task_creator_->stop_thread_pool();
-  task_creator_.reset();
   for (auto& executor : downgrade_executors_) {
     executor->stop();
   }
+
+  task_scheduler_.reset();
+  task_creator_.reset();
   downgrade_executors_.clear();
   sirius::telemetry::batch_telemetry_registry::instance().uninstall();
   telemetry_context_.reset();
@@ -1264,6 +1282,15 @@ bool duckdb_fallback_enabled(ClientContext& context)
   return true;
 }
 
+bool like_swar_fastpath_enabled(ClientContext& context)
+{
+  Value setting;
+  if (context.TryGetCurrentSetting("like_swar_fastpath", setting) && !setting.IsNull()) {
+    return setting.GetValue<bool>();
+  }
+  return true;
+}
+
 bool compressed_materialization_enabled(ClientContext& context)
 {
   Value setting;
@@ -1615,6 +1642,11 @@ void SiriusContextExtensionCallback::OnConnectionOpened(ClientContext& context)
     // capture, label, guard depths) — unlike the shared SiriusContext above.
     context.registered_state->Insert("sirius_connection_state",
                                      duckdb::make_shared_ptr<SiriusConnectionState>());
+    // sirius_stream_source's bind, and any streaming_fragment built on this connection, resolve
+    // declared-stream schemas through a per-connection catalog — without this, both fail
+    // immediately on every normal (transparent) connection instead of just the FFI's own.
+    context.registered_state->Insert(sirius::exec::stream_bind_catalog::kStateKey,
+                                     duckdb::make_shared_ptr<sirius::exec::stream_bind_catalog>());
   }
 }
 
@@ -1624,6 +1656,7 @@ void SiriusContextExtensionCallback::OnConnectionClosed(ClientContext& context)
   // remove the context from the registered state
   context.registered_state->Remove("sirius_state");
   context.registered_state->Remove("sirius_connection_state");
+  context.registered_state->Remove(sirius::exec::stream_bind_catalog::kStateKey);
 }
 
 void SiriusContextExtensionCallback::OnExtensionLoaded(DatabaseInstance& db, const string& name)

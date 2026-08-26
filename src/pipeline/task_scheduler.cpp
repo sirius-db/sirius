@@ -189,18 +189,21 @@ void task_scheduler::prepare_for_query(duckdb::shared_ptr<planner::query> query)
   std::lock_guard lock(_query_mutex);
   _query = std::move(query);
 
-  _completion_handler = std::make_unique<completion_handler>();
+  _completion_handler = std::make_shared<completion_handler>();
 
-  // Set completion handler on all executors
+  // Executors keep raw references owned by the scheduler.
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->set_completion_handler(_completion_handler.get());
   }
 
-  // Reset the round-robin counter so the walk is reproducible across
-  // iterations of the same query (cache=table_gpu warm path keys cache
-  // entries by device_id; without this reset the second iteration's source
-  // tasks would assign to a different GPU and miss the cache entries).
-  _no_pref_rr_counter.store(0, std::memory_order_relaxed);
+  // Terminal pipelines keep weak references so replacing the handler retires the previous query.
+  if (_query) {
+    for (auto& pipeline : _query->get_pipelines()) {
+      if (pipeline && pipeline->is_query_terminal()) {
+        pipeline->set_completion_handler(_completion_handler);
+      }
+    }
+  }
 }
 
 std::future<void> task_scheduler::start_query()
@@ -221,7 +224,12 @@ std::future<void> task_scheduler::start_query()
 
 void task_scheduler::terminate_query(std::exception_ptr error)
 {
-  _completion_handler->report_error(std::move(error));
+  std::shared_ptr<completion_handler> completion;
+  {
+    std::scoped_lock lock(_query_mutex);
+    completion = _completion_handler;
+  }
+  if (completion) { completion->report_error(std::move(error)); }
   stop();
 }
 
@@ -372,7 +380,7 @@ void task_scheduler::management_eventloop()
       // (lowest value) task preferring exactly this device.
       task = _task_queue.try_pop_from(exec::gpu_index{device_id}).value_or(nullptr);
       if (!task) {
-        // pick a task with no preference (any device will do). The round-robin counter
+        // Pick a task with no preference; any ready device may claim it.
         task =
           _task_queue.try_pop_from(exec::gpu_index{exec::no_preferred_device}).value_or(nullptr);
       }

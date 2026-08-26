@@ -172,6 +172,17 @@ jobs:
           nvidia-smi
           timeout 45m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort 2>&1 | tee /tmp/unittest.log
 
+      # The late-materialization gate is read from the environment once per process, so the
+      # feature is entirely absent from the run above. Without this step the end-to-end case
+      # (planning -> scan substitution -> transport -> restoration) returns successfully without
+      # executing, and a green suite says nothing about the feature.
+      - name: Run late-materialization tests with the gate on
+        run: |
+          set -o pipefail
+          SIRIUS_EXP_LATE_MAT=1 \
+            timeout 20m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort \
+            "[late_mat],[deferred_query],[native_filter]" 2>&1 | tee /tmp/unittest_late_mat.log
+
       - name: Iceberg conformance (correctness + connection liveness)
         # The C++ suite asserts routes and rows, but every case shares one in-process
         # connection, so it cannot observe the failure mode this guards: a RUNTIME GPU fallback
@@ -200,6 +211,7 @@ jobs:
           echo '## Test failures' >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           grep -B 5 -A 10 'FAILED:' /tmp/unittest.log | head -80 >> "$GITHUB_STEP_SUMMARY" || true
+          grep -B 5 -A 10 'FAILED:' /tmp/unittest_late_mat.log | head -80 >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload unit test logs

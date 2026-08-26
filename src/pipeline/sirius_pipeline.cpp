@@ -347,6 +347,12 @@ bool sirius_pipeline::is_query_terminal() const
 
 void sirius_pipeline::set_task_creator(sirius::creator::task_creator* tc) { _task_creator = tc; }
 
+void sirius_pipeline::set_completion_handler(std::weak_ptr<completion_handler> handler)
+{
+  std::lock_guard<std::mutex> lock(_status_mutex);
+  _completion_handler = std::move(handler);
+}
+
 void sirius_pipeline::notify_downstream_pipelines(bool original_pipeline)
 {
   // Query-terminal: no downstream; early return avoids teardown race after mark_completed().
@@ -378,6 +384,8 @@ std::unique_lock<std::mutex> sirius_pipeline::get_task_creation_lock()
 void sirius_pipeline::update_pipeline_status(bool original_pipeline)
 {
   bool should_notify = false;
+  // Snapshot under the lock; signal only after all pipeline access is complete.
+  std::shared_ptr<completion_handler> completion;
   {
     std::lock_guard<std::mutex> lock(_status_mutex);
 
@@ -426,10 +434,18 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
       }
       if (!pipeline_finished.load()) { end_nvtx_range_if_finished(); }
     }
+
+    // Signal from the transition so non-epilogue finish paths cannot strand execute() (#1486).
+    // Sampling under the lock pairs with set_completion_handler().
+    if (should_notify && is_query_terminal()) { completion = _completion_handler.lock(); }
   }  // _status_mutex released here — notify_downstream_pipelines must run outside the lock
      // to avoid holding the child pipeline mutex while acquiring a parent's
 
   if (should_notify) { notify_downstream_pipelines(original_pipeline); }
+
+  // Keep this last: waking execute() permits teardown. The epilogue may also signal, but
+  // completion_handler makes duplicate calls no-ops.
+  if (completion) { completion->mark_completed(); }
 }
 
 void sirius_pipeline::mark_task_created()

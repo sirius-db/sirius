@@ -42,6 +42,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -192,6 +193,14 @@ struct cross_schedule_pair {
 /// >= 1 batch), and symmetrically for build batches. Idempotent.
 [[nodiscard]] std::vector<cross_schedule_discard> collect_cross_schedule_discards(
   std::vector<partition_cross_schedule>& cross, bool probe_finished, bool build_finished);
+
+/// Reference arithmetic for a pairing-weighted probe-byte denominator: sum
+/// `probe bytes * completed pairings / build batches`. Unused — the STANDARD/MIXED estimate is
+/// withheld — but kept with its tests for the eventual fix. See
+/// data-size-estimation.md#why-standard-and-mixed_join-are-not-estimated.
+[[nodiscard]] std::size_t pairing_weighted_probe_bytes(
+  std::vector<partition_cross_schedule> const& cross,
+  std::unordered_map<uint64_t, std::size_t> const& probe_bytes);
 
 /// Find and claim the next unscheduled (probe,build) pair across partitions, marking it scheduled
 /// and bumping the paired counts. If none is schedulable now, reports whether to wait on the build
@@ -371,7 +380,33 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
+  /// Nominates the streaming probe port for INNER/LEFT/SEMI/ANTI/MARK joins. Returns nullopt for
+  /// RIGHT-family and OUTER joins, which would require build-byte accounting. See
+  /// sirius_physical_operator::primary_input_port.
+  [[nodiscard]] std::optional<std::string_view> primary_input_port() const override
+  {
+    if (is_right_family() || join_type == duckdb::JoinType::OUTER) { return std::nullopt; }
+    return std::string_view{"default"};
+  }
+
+  /// True only in BUILD_PROBE, where each probe batch is popped exactly once and `consumed` is
+  /// a plain running total. A cross schedule would need pairing weights, which read high under
+  /// skew, so the estimate is withheld there. See
+  /// data-size-estimation.md#why-standard-and-mixed_join-are-not-estimated.
+  [[nodiscard]] bool probe_bytes_are_unweighted() const
+  {
+    return _join_mode == HASH_JOIN_MODE::BUILD_PROBE;
+  }
+
+  /// Whole-counted probe bytes, or nullopt until the build side is complete — and always nullopt
+  /// unless @ref probe_bytes_are_unweighted. Out of line because the check needs `sirius_pipeline`.
+  [[nodiscard]] std::optional<std::size_t> consumed_primary_input_bytes() const override;
+
  protected:
+  /// Count @p bytes once for a popped probe batch. Takes @ref _probe_bytes_mutex but no batch
+  /// lock, so callers may hold a batch lock.
+  void note_probe_bytes_counted(uint64_t batch_id, std::size_t bytes);
+
   // double get_progress(duckdb::ClientContext &context, duckdb::GlobalSourceState &gstate) const
   // override;
 
@@ -385,7 +420,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   bool is_all_inequality_join = true;
 
-  HASH_JOIN_MODE _join_mode            = HASH_JOIN_MODE::STANDARD;
+  // Atomic: the size estimator polls probe_bytes_are_unweighted() without op_state_mutex.
+  std::atomic<HASH_JOIN_MODE> _join_mode{HASH_JOIN_MODE::STANDARD};
   uint64_t _max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
   // Maximum build-side bytes eligible for a broadcast join (see get_partition_strategy). Set from
   // operator_params at construction.
@@ -400,6 +436,16 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   // Guarded by op_state_mutex.
   bool _build_not_whole_reported = false;
+
+  // Whole-counted BUILD_PROBE and orphan bytes. Relaxed reads may be slightly stale.
+  std::atomic<std::size_t> _whole_probe_bytes{0};
+
+  // Deduplicates _whole_probe_bytes. Guarded by _probe_bytes_mutex.
+  std::unordered_set<uint64_t> _counted_probe_batch_ids;
+
+  // Lock order: op_state_mutex -> _probe_bytes_mutex. execute() may take this mutex while holding
+  // a batch lock; nothing may wait on a batch lock or op_state_mutex while holding it.
+  std::mutex _probe_bytes_mutex;
 
   // Whether any build-side join key column contains a NULL. Used exclusively for MARK join
   // three-valued logic. Sentinel -1 = unset, 0 = false, 1 = true. Join-wide (not per-partition)

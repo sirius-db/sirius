@@ -81,6 +81,19 @@ look-ahead is not a user-selectable YAML setting.
 
 ## Operator-Level Optimizations
 
+### Multi-Literal LIKE SWAR Fast Path (PR #1610)
+
+**Motivation:** cuDF's thread-per-row, byte-at-a-time LIKE matcher is load-instruction-bound on wide text columns. The TPC-H q13 predicate `%special%requests%` measured about 6x faster in the specialized kernel, reducing the query's LIKE work without changing SQL semantics.
+
+**Mechanism:** Constant patterns of the form `%lit1%lit2%...%litN%` are classified and compiled once per query and pattern value, then shared immutably across task-local evaluators. The CUDA kernel scans aligned 64-bit words, uses SWAR digram masks to find candidates, and verifies complete literals in order. Unsupported pattern shapes and ineligible column layouts fall back to `cudf::strings::like`; NOT LIKE is fused into the output write.
+
+**Code path:**
+- `src/expression_evaluator/specializations/function.cpp` — query-cache lookup and dispatch
+- `src/cuda/sirius_like_multiliteral.cu` — classifier, query-cache implementation, compiled descriptors, and SWAR kernel
+- `src/include/expression_evaluator/like_multiliteral.hpp` — launcher and input contracts
+
+**Config:** `like_swar_fastpath` (default: `true`, connection-local). The query snapshots this setting at engine initialization. Supported Sirius ingestion must supply valid UTF-8 for DuckDB VARCHAR/cuDF STRING input; the hot path treats that as a precondition and does not add a redundant validation scan.
+
 ### Adaptive Join BUILD_PROBE Mode (PR #423)
 
 **Motivation:** For small build-side datasets, building the hash table once and probing many times is more efficient than the standard multi-partition Cartesian product approach.
@@ -280,6 +293,43 @@ result materialization restore native carriers.
 **Config:** `enable_compressed_materialization` (default: `true`), settable through YAML under
 `sirius.operator_params` and the DuckDB SET option. See
 [Compressed Materialization](compressed-materialization.md).
+
+### Late Materialization (unreleased, experimental)
+
+**Motivation:** A query that selects wide columns carries them from the scan to whatever finally
+reads them — through joins that copy them beside their keys, partitions that write them to a
+repository and read them back, and aggregates that group on them. Nothing in that stretch reads
+what is IN them. On TPC-H q10 at SF1000 the five wide `customer` columns are 158 B/row and cross
+eleven port boundaries before anything needs their values.
+
+**Mechanism:** For a PINNED table, the scan emits a pin-order rowid (UINT32 where the table's rows
+fit 32 bits, UINT64 otherwise) in place of the deferred columns plus 1-byte placeholders, so arity
+and positions are unchanged and every operator in between is unaffected. A directive on the
+consuming operator gathers the values back out of the pinned chunks, matching its batch by whole
+schema. Both halves install together or not at all. A plan pass reports how far each column travels
+and how many port crossings it survives; a policy with measured floors decides whether the ride
+repays the rowid. Where the deferred columns are GROUP BY keys, the ride can continue past the
+aggregate to materialize one row per group instead of one per join match, subject to a pin-time
+distinctness proof.
+
+**Code path:**
+- `src/planner/late_mat_plan_pass.cpp` — column lifetimes, group-by/top-n/join modelling
+- `src/include/late_mat/defer_directive.hpp` — the pair, the substituted schemas, rowid widths
+- `src/include/late_mat/defer_policy.hpp` — value/boundary floors and their measurements
+- `src/late_mat/pin_uniqueness.cpp` — the pin-time distinctness proof
+- `src/scan_manager/sirius_scan_manager.cpp` — admission, the port hop, riders
+- `src/late_mat/port_materialize.cpp`, `materialize.cpp` — putting the values back
+- `src/op/scan/sirius_gpu_scan_operator.cpp` — rowid emission, including for filtered scans
+
+**Config:** `SIRIUS_EXP_LATE_MAT=1` gates the feature (off by default, inert when off);
+`SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS` selects the columns the uniqueness probe observes, without
+which no group-by-rowid ride is admissible. Five further `SIRIUS_EXP_LATE_MAT_*` knobs tune the
+floors and the dark count-on-deferred path. Composes with `enable_compressed_materialization`
+(default on) — a deferred column riding through a carrier-restore cast is carried past it rather
+than suppressing the deferral.
+
+**Measured:** GB300 SF1000, default `enable_compressed_materialization`. See
+[Late Materialization](late-materialization.md) for the full results table.
 
 ### Row Group Pruning with Filter Pushdown (PR #363)
 

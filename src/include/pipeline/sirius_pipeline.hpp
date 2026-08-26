@@ -22,11 +22,14 @@
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
+#include "pipeline/completion_handler.hpp"
 #include "pipeline/pipeline_build_context.hpp"
+#include "pipeline/pipeline_memory_history.hpp"
 #include "telemetry-bridge/gen/uuid.rs.h"
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <memory>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -200,6 +203,10 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   //! Set the task_creator pointer so this pipeline can schedule downstream consumers on finish.
   void set_task_creator(sirius::creator::task_creator* tc);
 
+  //! Install a query-terminal pipeline's weak completion reference.
+  //! Weak ownership prevents retired pipelines from keeping a query alive.
+  void set_completion_handler(std::weak_ptr<completion_handler> handler);
+
   //! task_creator for schedule(), or nullptr when unwired. Streaming sources use this to
   //! re-arm a starved head; schedule() only enqueues, so off-thread calls are safe.
   [[nodiscard]] sirius::creator::task_creator* get_task_creator() const noexcept
@@ -216,12 +223,31 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   [[nodiscard]] uuid::UUID pipeline_uuid() const { return _pipeline_uuid; }
 
+  //! Completed-task memory and size history, owned here so upstream estimators can access it
+  //! through `port::src_pipeline`.
+  [[nodiscard]] pipeline_memory_history& get_memory_history() noexcept { return _memory_history; }
+  [[nodiscard]] const pipeline_memory_history& get_memory_history() const noexcept
+  {
+    return _memory_history;
+  }
+
   //! The SiriusContext-wide telemetry context carried in this pipeline's build
   //! context (set at convert time in sirius_engine). Operators read it via
   //! sirius_physical_operator::get_telemetry_context() to build data_batch probes.
   [[nodiscard]] const telemetry::telemetry_context* get_telemetry_context() const
   {
     return build_ctx_.telemetry_context().get();
+  }
+
+  [[nodiscard]] const sirius::operator_params& get_operator_params() const noexcept
+  {
+    return build_ctx_.get_operator_params();
+  }
+
+  [[nodiscard]] const std::shared_ptr<const sirius::like_multiliteral_cache>&
+  get_like_multiliteral_cache() const noexcept
+  {
+    return build_ctx_.get_like_multiliteral_cache();
   }
 
  private:
@@ -259,6 +285,9 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   //! Task creator pointer for scheduling downstream consumers when this pipeline finishes
   sirius::creator::task_creator* _task_creator{nullptr};
 
+  //! Per-query completion reference for terminal pipelines. Guarded by _status_mutex.
+  std::weak_ptr<completion_handler> _completion_handler;
+
   //! The unique ID of this pipeline (assigned based on new_scheduled order)
   size_t pipeline_id = 0;
   //! Plan-time context (replaces sirius_engine& for plan-time needs)
@@ -274,6 +303,9 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   std::atomic<std::size_t> tasks_created   = 0;
   std::atomic<std::size_t> tasks_completed = 0;
+
+  //! Completed-task history; see get_memory_history().
+  pipeline_memory_history _memory_history;
 
   //! NVTX process-wide range tracking the pipeline's active lifetime
   std::atomic<bool> _nvtx_range_started{false};

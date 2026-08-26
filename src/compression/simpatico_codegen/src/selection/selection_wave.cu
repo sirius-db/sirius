@@ -191,6 +191,20 @@ __global__ void mask_from_bool8_kernel(uint8_t const* __restrict__ flags,
   }
 }
 
+// Chunk c is touched iff it holds a survivor, i.e. its offsets differ.
+__global__ void count_touched_kernel(uint32_t const* __restrict__ offsets,
+                                     int64_t num_chunks,
+                                     int32_t* __restrict__ out)
+{
+  int32_t local     = 0;
+  auto const stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t c = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; c < num_chunks;
+       c += stride) {
+    if (offsets[c + 1] > offsets[c]) { ++local; }
+  }
+  if (local != 0) { atomicAdd(out, local); }
+}
+
 }  // namespace
 
 void combine_masks_and(uint32_t* dst_words,
@@ -270,6 +284,25 @@ void mask_from_bool8(uint8_t const* flags,
   mask_from_bool8_kernel<<<grid_for(num_words, warps_per_block), kBlock, 0, stream.value()>>>(
     flags, num_rows, num_words, mask_words);
   throw_on_cuda(cudaPeekAtLastError(), "mask_from_bool8 launch");
+}
+
+int64_t count_touched_chunks(uint32_t const* chunk_offsets, int64_t num_chunks)
+{
+  if (chunk_offsets == nullptr || num_chunks <= 0) { return -1; }
+  int32_t* counter = nullptr;
+  if (cudaMalloc(&counter, sizeof(int32_t)) != cudaSuccess) { return -1; }
+  int64_t touched = -1;
+  if (cudaMemset(counter, 0, sizeof(int32_t)) == cudaSuccess) {
+    count_touched_kernel<<<grid_for(num_chunks, kBlock), kBlock>>>(
+      chunk_offsets, num_chunks, counter);
+    int32_t host = 0;
+    if (cudaDeviceSynchronize() == cudaSuccess &&
+        cudaMemcpy(&host, counter, sizeof(int32_t), cudaMemcpyDeviceToHost) == cudaSuccess) {
+      touched = host;
+    }
+  }
+  cudaFree(counter);
+  return touched;
 }
 
 void mask_to_row_indices(selection_mask const& mask,
