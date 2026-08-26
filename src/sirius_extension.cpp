@@ -1887,7 +1887,8 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   // Index building footprint reservation
   std::size_t const footprint = sirius::vss::ivf_flat_reservation_bytes(n_rows, dim, n_lists);
 
-  [[maybe_unused]] auto* pool = target_space->get_memory_resource_of<cucascade::memory::Tier::GPU>();
+  [[maybe_unused]] auto* pool =
+    target_space->get_memory_resource_of<cucascade::memory::Tier::GPU>();
   SIRIUS_LOG_DEBUG(
     "[ann_index] build begin, GPU:{} allocated={} bytes reserved={} bytes footprint={} bytes "
     "(rows={} dim={} n_lists={})",
@@ -1977,7 +1978,7 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   meta.n_lists      = static_cast<int64_t>(n_lists);
   meta.metric       = metric;
   // Resident index footprint, read while the reservation still tracks the arena.
-  meta.resident_bytes                = allocator->get_allocated_bytes(build_stream.view());
+  meta.resident_bytes = allocator->get_allocated_bytes(build_stream.view());
   [[maybe_unused]] std::size_t const build_peak_bytes =
     allocator->get_peak_allocated_bytes(build_stream.view());
 

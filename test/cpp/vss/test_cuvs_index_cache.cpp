@@ -437,7 +437,7 @@ TEST_CASE("cuvs_index_cache reservation covers the build peak for a large low-di
   auto* adaptor = gpu_space->get_memory_resource_of<mem::Tier::GPU>();
   REQUIRE(adaptor != nullptr);
 
-  constexpr cudf::size_type dim = 3;
+  constexpr cudf::size_type dim   = 3;
   constexpr std::uint32_t n_lists = 1;
   constexpr cudf::size_type per   = 100000;
   constexpr int n_batches         = 10;
