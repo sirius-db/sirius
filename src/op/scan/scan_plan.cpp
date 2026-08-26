@@ -20,6 +20,10 @@
 #include <op/scan/scan_plan.hpp>
 #include <sirius/exception.hpp>
 
+#include <optional>
+#include <span>
+#include <stdexcept>
+
 // duckdb
 #include <duckdb/common/hive_partitioning.hpp>
 
@@ -115,12 +119,75 @@ std::vector<cudf::size_type> output_data_positions(scan_plan const& plan)
   return positions;
 }
 
+std::vector<std::optional<std::size_t>> renumber_output_for_withheld(
+  scan_plan const& plan, std::span<std::size_t const> withheld_data_positions)
+{
+  auto const width = plan.data_columns.size();
+  for (std::size_t i = 0; i < withheld_data_positions.size(); ++i) {
+    if (withheld_data_positions[i] >= width) {
+      throw std::invalid_argument("[assemble_scan_output] withheld data position " +
+                                  std::to_string(withheld_data_positions[i]) +
+                                  " is outside the plan's " + std::to_string(width) +
+                                  " data column(s)");
+    }
+    if (i > 0 && withheld_data_positions[i] <= withheld_data_positions[i - 1]) {
+      throw std::invalid_argument(
+        "[assemble_scan_output] withheld data positions must be ascending and unique");
+    }
+  }
+
+  // Rank among the columns that ARE present; nullopt for the ones that are not.
+  std::vector<std::optional<std::size_t>> rank(width);
+  std::size_t next = 0;
+  auto withheld_at = withheld_data_positions.begin();
+  for (std::size_t d = 0; d < width; ++d) {
+    if (withheld_at != withheld_data_positions.end() && *withheld_at == d) {
+      ++withheld_at;
+      continue;
+    }
+    rank[d] = next++;
+  }
+
+  std::vector<std::optional<std::size_t>> out;
+  out.reserve(plan.output_layout.size());
+  for (auto const& entry : plan.output_layout) {
+    if (entry.source != scan_plan::output_entry::DATA) {
+      out.push_back(std::nullopt);
+      continue;
+    }
+    if (!rank[entry.idx].has_value()) { continue; }  // withheld: no output entry
+    out.push_back(rank[entry.idx]);
+  }
+  return out;
+}
+
 owning_table_view assemble_scan_output(scan_plan const& plan,
                                        owning_table_view&& table,
                                        std::vector<std::string> const& partition_values,
-                                       rmm::cuda_stream_view stream)
+                                       rmm::cuda_stream_view stream,
+                                       std::span<std::size_t const> withheld_data_positions)
 {
   if (!table) { return std::move(table); }
+
+  // A narrowed batch: the producer left some data columns out, so the layout's
+  // D indices no longer describe it and are renumbered before use. Partition
+  // synthesis is not supported alongside it — the caller refuses that pairing
+  // rather than guessing which injected column a withheld one displaced.
+  if (!withheld_data_positions.empty()) {
+    if (plan.output_layout.empty() || plan.has_partitions()) {
+      throw std::invalid_argument(
+        "[assemble_scan_output] a narrowed batch has no assembly for a partitioned or "
+        "count-only plan");
+    }
+    auto const renumbered = renumber_output_for_withheld(plan, withheld_data_positions);
+    std::vector<std::size_t> positions;
+    positions.reserve(renumbered.size());
+    for (auto const& slot : renumbered) {
+      positions.push_back(slot.value());
+    }
+    table.select_columns(positions);
+    return std::move(table);
+  }
 
   // Nothing to reshape (SELECT count(*) — empty output layout). Emitting a
   // 0-column table would erase the row count downstream aggregations consume.

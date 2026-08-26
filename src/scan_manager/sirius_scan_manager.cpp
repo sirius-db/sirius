@@ -828,6 +828,41 @@ struct late_mat_outcome {
   op::sirius_physical_operator const* port = nullptr;
 };
 
+/// Deferred output positions the scan may leave unserved, or empty when it may not.
+///
+/// Withholding is admissible only where the batch that arrives without those
+/// columns can still be assembled by a renumbered layout, and where nothing but
+/// the substitution reads them:
+///
+///  * a deferral must be installed, with at least one position;
+///  * every deferred position must be an ordinary output column of a parquet
+///    plan (the duckdb-native reader has no layout to renumber, and a partition
+///    column is synthesized rather than read);
+///  * the scan must not RESTRICT ROWS. A post-decode filter evaluates over the
+///    reader's D-order batch, so a column missing from it shifts every filter
+///    reference past it — and a deferred column can itself be a filter column.
+///
+/// Ascending and duplicate-free, which the erase below depends on.
+std::vector<std::size_t> admissible_withheld_positions(op::scan::sirius_gpu_scan_operator& scan_op,
+                                                       std::size_t served_width)
+{
+  auto const& deferred = scan_op.deferred_output();
+  if (deferred.output_positions.empty()) { return {}; }
+  if (scan_op.get_ingestible().has_row_filter()) { return {}; }
+  auto const* parquet = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(
+    &scan_op.get_ingestible().table_info());
+  if (parquet == nullptr) { return {}; }
+
+  std::vector<std::size_t> positions(deferred.output_positions.begin(),
+                                     deferred.output_positions.end());
+  std::sort(positions.begin(), positions.end());
+  if (std::adjacent_find(positions.begin(), positions.end()) != positions.end()) { return {}; }
+  // A position outside the served set has no slot to drop, and withholding every
+  // column would leave a batch with no rows to count.
+  if (positions.back() >= served_width || positions.size() >= served_width) { return {}; }
+  return positions;
+}
+
 late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator& scan_op,
                                               pinned_entry const& entry,
                                               std::span<std::size_t const> selected_columns,
@@ -1693,13 +1728,36 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     } else if (late_mat.port != nullptr) {
       installed_rides.push_back(installed_ride{late_mat.port, assignment.op});
     }
+    // Withhold the deferred columns from what the provider serves, when that is
+    // admissible. The substitution overwrites them with a rowid, so serving them
+    // buys nothing and on a HOST-tier pin costs a bulk transfer across the link.
+    // Refusing leaves the ordinary path, which serves them and elides them from
+    // the projection instead.
+    auto served_columns = assignment.columns;
+    auto served_targets = assignment.op->normalization_targets();
+    auto const withheld = admissible_withheld_positions(*assignment.op, served_columns.size());
+    if (!withheld.empty()) {
+      // Served slot p is output column p for every output column, so dropping the
+      // deferred output positions from both keeps the provider's two parallel
+      // views of a slot — its entry column and its carrier target — in step.
+      for (auto it = withheld.rbegin(); it != withheld.rend(); ++it) {
+        served_columns.erase(served_columns.begin() + static_cast<std::ptrdiff_t>(*it));
+        if (*it < served_targets.size()) {
+          served_targets.erase(served_targets.begin() + static_cast<std::ptrdiff_t>(*it));
+        }
+      }
+      assignment.op->set_withheld_output_positions(withheld);
+      SIRIUS_LOG_INFO("[late-mat] operator {}: withholding {} deferred column(s) from the scan",
+                      assignment.op->get_operator_id(),
+                      withheld.size());
+    }
     auto provider = make_provider_for_pinned_entry(*assignment.entry,
-                                                   assignment.columns,
+                                                   served_columns,
                                                    std::move(assignment.plan),
                                                    assignment.op->batch_telemetry(),
                                                    std::move(masks),
                                                    std::move(delta_splits),
-                                                   assignment.op->normalization_targets(),
+                                                   served_targets,
                                                    assignment.op->has_physical_overrides(),
                                                    std::move(pushdown_req),
                                                    std::move(dynamic_filters));

@@ -349,8 +349,17 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
   bool like_swar_fastpath,
   std::shared_ptr<const like_multiliteral_cache> like_cache,
   std::unique_ptr<cudf::column>* /*survivors*/,
-  std::span<std::size_t const> elided)
+  std::span<std::size_t const> elided,
+  std::span<std::size_t const> withheld)
 {
+  // Column withholding is a pinned-parquet arrangement; this reader's output
+  // assembly has no layout to renumber, so a narrowed batch would be assembled
+  // against positions that no longer describe it.
+  if (!withheld.empty()) {
+    throw internal_exception(
+      "[duckdb_native_gpu_ingestible::post_filter_and_project] this reader cannot assemble a "
+      "batch with withheld columns");
+  }
   auto const output_arity = _info->output_types.size();
   auto const decoded_cols =
     _info->projection_ids.empty() ? _info->column_ids.size() : _info->projection_ids.size();

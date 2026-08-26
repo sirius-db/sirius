@@ -180,7 +180,8 @@ deferral with a single half, admitted only over pinned columns with no nulls. Of
   handful of short strings can clear the floor on the estimate while saving fewer bytes/row than
   the measured value would show). The real fix is measuring the width — the scan already has the
   offsets for it.
-- **A host-tier pin rides only FIXED-WIDTH, uncompressed columns** (see below).
+- **A host-tier pin rides only FIXED-WIDTH, uncompressed columns**; see
+  [Host-tier pins](#host-tier-pins).
 - **A non-pinned scan cannot defer at all.** A fresh parquet or DuckDB-native read consumes its
   decoded batch, so there is nothing for the port to gather from. Deferring against a file would
   mean a rowid addressing a file offset and a re-read per gather — the shape classic disk-based
@@ -211,22 +212,49 @@ representation PER EMITTED BATCH, each carrying every pinned column, where a GPU
 vector per column. The resolver is what bridges the two orientations, and there is no per-column
 merge path on the host side because of it.
 
-**The gather reads the rows where they lie.** The alternative — staging the needed chunk back to
-the device per materialization — was rejected on two counts, one measured and one structural:
+**The gather reads the rows where they lie**, rather than staging the chunk back to the device per
+materialization. Measured on GB300 (Grace-Blackwell, C2C rather than PCIe), a 150M x 8 B pinned
+column stages H2D at 163 GB/s, so a full stage costs 7.4 ms whatever the selection, while a blocked
+zero-copy gather of the same column costs 0.012 ms at 0.01% selectivity, 0.42 ms at 1%, and 5.1 ms
+even when the selection covers every row. Cheaper at every selectivity, and it allocates only its
+output rather than putting the whole column back in device memory, which is what pinning on the
+host was avoiding.
 
-- *Measured.* On GB300 (Grace-Blackwell, C2C rather than PCIe), a 150M x 8 B pinned column stages
-  H2D at 163 GB/s, so a full stage costs 7.4 ms whatever the selection. A blocked zero-copy gather
-  of the same column costs 0.012 ms at 0.01% selectivity, 0.42 ms at 1%, and 5.1 ms even when the
-  selection covers every row — cheaper than staging at EVERY selectivity, and by two to three
-  orders of magnitude for the sparse ones a ride actually produces.
-- *Structural.* Staging puts the whole column in device memory, which is exactly what pinning on
-  the host was avoiding. The in-place gather allocates only its output.
+**The deferred columns are never served.** A pinned scan carrying a deferral withholds them: the
+provider drops their entry positions from what it projects, so a HOST-tier chunk never stages them
+across the link and a GPU-tier chunk never copies them. The batch then arrives NARROWER than the
+scan's arity, which two things downstream absorb — `assemble_scan_output` renumbers the output
+layout past the missing columns (`renumber_output_for_withheld`), and `substitute_deferred_columns`
+INSERTS the rowid and its placeholders at their positions instead of overwriting values that are
+there. Withholding and the older elision are alternatives, never both: elision drops columns the
+batch DID carry, and paid to read them.
+
+Measured, 500k customers x 40 deferred BIGINTs over two joins and two group-by stages, host pin:
+
+| | H2D bytes | of which the pinned scan | GPU kernel time |
+|---|---|---|---|
+| Gate off | 196.231 MB | 55.983 + 22.0 + 4.0 MB | 27.6 ms |
+| Gate on, serving the deferred columns | 196.259 MB | 55.983 + 22.0 + 4.0 MB | 33.0 ms |
+| Gate on, withholding them | **116.259 MB** | **2.0 MB** | 33.5 ms |
+
+The middle row is what the ride cost before withholding existed: per-copy sizes identical to gate
+off, not merely the totals, so the payload crossed in full whether or not it rode. The last row
+lands on the 116.228 MB a control that projects only the key measures, which is what identifies
+the bytes that disappeared as exactly the deferred payload.
+
+**Withholding is refused rather than guessed at.** It requires a parquet plan (the duckdb-native
+reader has no output layout to renumber), no row filter (a post-decode filter evaluates over the
+reader's D-order batch, so a missing column shifts every filter reference past it, and a deferred
+column can itself be a filter column), no partition columns (synthesized rather than read, so
+nothing could have withheld one), and at least one column left over. Where any of those fails the
+scan serves the columns and elides them from the projection, exactly as before.
 
 Against a device gather the same column costs 2.0x, 8.1x, 10.6x, 12.2x, 11.0x and 6.6x at those
 selectivities. That worst case is `SIRIUS_EXP_LATE_MAT_HOST_COST_MULTIPLIER`: the value x crossings
 floor is calibrated against a device gather, and both the floor and the gather scale with the same
 row count, so a host-tier bundle is weighed against `128 x 12` instead of `128`. It bounds one
-operation rather than calibrating a query, which is why it is a knob.
+operation rather than calibrating a query, which is why it is a knob. It does NOT price the
+scan-time staging above, which no floor currently accounts for.
 
 **How a chunk-major host chunk becomes a column-major view.** A host chunk's storage is a list of
 equally sized pinned blocks that are NOT contiguous with one another, so a column's buffer has no

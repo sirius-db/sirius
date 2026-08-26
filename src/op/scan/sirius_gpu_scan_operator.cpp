@@ -506,13 +506,22 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
     if (materialized_table.state != filter_state::ROW_FILTERED_AND_PROJECTED) {
       // Elide the deferred columns from the projection: realizing the batch would
       // copy values this scan is about to replace with a rowid.
-      output_table = _ingestible->post_filter_and_project(std::move(materialized_table),
-                                                          *mem_space,
-                                                          stream,
-                                                          like_swar_fastpath,
-                                                          std::move(like_pattern_cache),
-                                                          wants_survivors ? &survivors : nullptr,
-                                                          deferred_output().output_positions);
+      // Two ways for a deferred column not to reach the output, and they are not
+      // interchangeable. WITHHELD: the pinned provider never served it, so the
+      // batch arrives without it and the layout is renumbered past it — no bytes
+      // were read, staged or copied. ELIDED: the batch carries it and the
+      // projection drops it, which still paid for reading it. Withholding wins
+      // where it is admissible; elision is the fallback everywhere else.
+      auto const withheld = withheld_output_positions();
+      output_table        = _ingestible->post_filter_and_project(
+        std::move(materialized_table),
+        *mem_space,
+        stream,
+        like_swar_fastpath,
+        std::move(like_pattern_cache),
+        wants_survivors ? &survivors : nullptr,
+        withheld.empty() ? deferred_output().output_positions : std::span<std::size_t const>{},
+        withheld);
     } else {
       output_table = materialized_table.table.release(stream, mem_space->get_default_allocator());
     }
