@@ -253,6 +253,10 @@ what keeps it honest instead of silently confident.
      count), closes, supersedes.
   4. The PR description, quoted.
   5. A short plain-language summary in your own words — what problem this solves, one paragraph.
+     It must OPEN with a concrete, user-visible or plan-visible before/after taken from the PR —
+     a query, a row shape, a setting, an error message — and only then introduce type names,
+     file names, or API terms. A reader who knows nothing about this subsystem should get
+     the example before the vocabulary. If the PR contains no such example, say so explicitly and do not invent one.
   6. "Key changes at a glance" — the numbered overview list, 1–3 sentences each, linked to the
      detailed sections (Step 6).
   7. Ranked key changes in detail (Steps 5, 7), separated by `---`.
