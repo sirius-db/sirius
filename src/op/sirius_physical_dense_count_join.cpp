@@ -55,14 +55,31 @@
 namespace sirius::op {
 
 namespace {
-[[nodiscard]] bool count_product_needs_validation(int64_t preserved_rows,
-                                                  int64_t counted_rows,
-                                                  bool count_star) noexcept
+/** @brief Byte ceiling under which a dense histogram is admitted.
+ *
+ * The one fact shared by the dense-versus-sparse gate and no_history_peak_memory_estimate. The
+ * estimator has no key domain, so this bound -- not the layout -- is what the two have in common.
+ */
+[[nodiscard]] std::size_t max_admitted_histogram_bytes(uint64_t max_bins_bytes,
+                                                       std::size_t input_logical_bytes) noexcept
 {
-  auto const lhs     = preserved_rows;
-  auto const rhs     = count_star ? std::max<int64_t>(counted_rows, 1) : counted_rows;
-  auto constexpr max = std::numeric_limits<int64_t>::max();
-  return rhs != 0 && lhs > max / rhs;
+  // Lossless on the 64-bit targets this builds for.
+  return std::min(static_cast<std::size_t>(max_bins_bytes),
+                  sirius::memory::saturating_mul(4, input_logical_bytes));
+}
+
+/** @brief Whether a representable layout is also desirable: within budget and not sparse. */
+[[nodiscard]] bool dense_admits(dense_count_layout const& layout,
+                                std::size_t non_null_preserved_rows,
+                                std::size_t total_input_rows,
+                                std::size_t input_logical_bytes,
+                                uint64_t max_bins_bytes) noexcept
+{
+  using sirius::memory::saturating_mul;
+  return layout.total_bytes() <=
+           max_admitted_histogram_bytes(max_bins_bytes, input_logical_bytes) &&
+         layout.slots() <= saturating_mul(8, non_null_preserved_rows) &&
+         layout.slots() <= saturating_mul(2, total_input_rows);
 }
 
 // EXCLUDE implements COUNT(col); INCLUDE implements COUNT(*) and preserved-key presence.
@@ -82,10 +99,7 @@ std::unique_ptr<cudf::table> sparse_partial_count(cudf::column_view const& keys,
   auto count64 =
     cudf::cast(results[0].results[0]->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
   auto key_cols = group_keys->release();
-  std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.push_back(std::move(key_cols[0]));
-  columns.push_back(std::move(count64));
-  return std::make_unique<cudf::table>(std::move(columns));
+  return sirius::make_table(std::move(key_cols[0]), std::move(count64));
 }
 
 std::unique_ptr<cudf::table> sparse_merge_pair(std::unique_ptr<cudf::table> lhs,
@@ -106,10 +120,7 @@ std::unique_ptr<cudf::table> sparse_merge_pair(std::unique_ptr<cudf::table> lhs,
     requests[0].aggregations.push_back(cudf::make_sum_aggregation<cudf::groupby_aggregation>());
     auto [group_keys, results] = gb.aggregate(requests, stream, mr);
     auto key_cols              = group_keys->release();
-    std::vector<std::unique_ptr<cudf::column>> columns;
-    columns.push_back(std::move(key_cols[0]));
-    columns.push_back(std::move(results[0].results[0]));
-    return std::make_unique<cudf::table>(std::move(columns));
+    return sirius::make_table(std::move(key_cols[0]), std::move(results[0].results[0]));
   }();
   combined.reset();
   return merged;
@@ -380,9 +391,7 @@ std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
     return (padded / allocation_alignment) * allocation_alignment;
   };
 
-  // Dense execution: histogram bytes are capped at min(max_bins_bytes, 4 * input bytes).
-  auto const histogram_cap   = static_cast<std::size_t>(_max_bins_bytes);
-  auto const histogram_bytes = std::min(histogram_cap, saturating_mul(4, stats.bytes));
+  auto const histogram_bytes = max_admitted_histogram_bytes(_max_bins_bytes, stats.bytes);
 
   auto const key_width      = sirius::get_cudf_type(types[0]).id() == cudf::type_id::INT32
                                 ? sizeof(int32_t)
@@ -403,11 +412,10 @@ std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
   dense_peak      = saturating_add(dense_peak, histogram_bytes);  // selection/CUB workspace
 
   // Min/max calculation
-  auto const global_extrema = aligned_charge(2 * sizeof(int64_t));
   auto const scalar_bytes = saturating_add(aligned_charge(key_width), aligned_charge(sizeof(bool)));
   auto const extrema_per_batch = saturating_mul(2, scalar_bytes);
-  auto minmax_peak             = saturating_add(allocation_floor, global_extrema);
-  minmax_peak = saturating_add(minmax_peak, saturating_mul(stats.num_batches, extrema_per_batch));
+  auto const minmax_peak =
+    saturating_add(allocation_floor, saturating_mul(stats.num_batches, extrema_per_batch));
 
   // Sparse execution: 16 is a heuristic expansion factor
   auto const sparse_peak = saturating_add(allocation_floor, saturating_mul(16, stats.bytes));
@@ -481,10 +489,20 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
     }
   }
 
-  bool const count_star = !_counted_value_idx.has_value();
-  bool const check_product_overflow =
-    count_product_needs_validation(preserved_rows, counted_rows, count_star);
+  auto const semantics = dense_count_semantics::for_count_star(!_counted_value_idx.has_value());
+  dense_count_bounds const bounds{preserved_rows, semantics.max_matched(counted_rows)};
   auto const non_null_keys = preserved_rows - preserved_null_keys;
+  auto const non_null_rows = static_cast<std::size_t>(non_null_keys);
+  auto const total_rows = sirius::memory::saturating_add(static_cast<std::size_t>(preserved_rows),
+                                                         static_cast<std::size_t>(counted_rows));
+
+  std::optional<std::pair<int64_t, int64_t>> min_max;
+  if (non_null_keys != 0) { min_max = dense_count_global_minmax(preserved_keys, stream, mr); }
+  std::optional<dense_count_layout> layout;
+  if (min_max) {
+    layout =
+      dense_count_layout::plan(min_max->first, min_max->second, preserved_rows, counted_rows);
+  }
 
   // NULL is one SQL group, so only one partition may carry null keys. Hash partitioning sends
   // every null key to the same partition; if that stopped holding, the output would carry one NULL
@@ -505,163 +523,127 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
   }
 
   std::unique_ptr<cudf::table> output;
-  if (non_null_keys == 0) {
+  if (!min_max) {
     _last_strategy = strategy::DENSE;
-    output = dense_count_empty_output(key_type, count_star, preserved_null_keys, stream, mr);
-  } else {
-    auto const min_max = dense_count_global_minmax(preserved_keys, stream, mr);
-    if (!min_max) {
-      throw sirius::internal_exception(
-        "dense_count_join: minmax reported no valid keys but null accounting found {}",
-        non_null_keys);
+    output         = make_null_group_table(key_type, semantics, preserved_null_keys, stream, mr);
+  } else if (layout &&
+             dense_admits(
+               *layout, non_null_rows, total_rows, input_logical_bytes, _max_bins_bytes)) {
+    _last_strategy = strategy::DENSE;
+    SIRIUS_LOG_INFO(
+      "[dense_count_join] dense path: keys in [{}, {}] (range {}, {}-bit slots), preserved "
+      "rows {} (null keys {}), counted rows {}",
+      min_max->first,
+      min_max->second,
+      layout->slots(),
+      8 * layout->slot_bytes(),
+      preserved_rows,
+      preserved_null_keys,
+      counted_rows);
+    dense_count_state state(*layout, stream, mr);
+    for (auto const& col : preserved_keys) {
+      state.accumulate_preserved(col, stream);
     }
-
-    // A zero unsigned range denotes the full 64-bit domain and forces the sparse path.
-    uint64_t const range_u =
-      static_cast<uint64_t>(min_max->second) - static_cast<uint64_t>(min_max->first) + 1;
-    bool const wide =
-      std::cmp_greater_equal(preserved_rows, std::numeric_limits<uint32_t>::max()) ||
-      std::cmp_greater_equal(counted_rows, std::numeric_limits<uint32_t>::max());
-    auto const slot_bytes          = wide ? sizeof(uint64_t) : sizeof(uint32_t);
-    auto const combined_slot_bytes = 2 * slot_bytes;
-    auto const size_max            = std::numeric_limits<std::size_t>::max();
-    // The layout is valid if
-    // - The domain is not the unrepresentable full INT64 range
-    // - range x bytes_per_key fits in size_t
-    // - The range is within the limits of int64_t (expected by dense_count_state)
-    bool const layout_valid = range_u != 0 && range_u <= size_max / combined_slot_bytes &&
-                              range_u <= std::numeric_limits<int64_t>::max();
-    auto const histogram_bytes =
-      layout_valid ? static_cast<std::size_t>(range_u * combined_slot_bytes) : size_max;
-    auto const non_null_rows = static_cast<std::size_t>(non_null_keys);
-    auto const total_rows = sirius::memory::saturating_add(static_cast<std::size_t>(preserved_rows),
-                                                           static_cast<std::size_t>(counted_rows));
-    // The DENSE path is chosen if
-    // - The layout is valid
-    // - The histogram fits the configured memory budget
-    // - The key range is not large relative to a) preserved non-null rows and b) all input rows
-    // - The histogram storage is at most 4 x logical input size
-    bool const dense_ok = layout_valid && range_u <= _max_bins_bytes / combined_slot_bytes &&
-                          range_u <= sirius::memory::saturating_mul(8, non_null_rows) &&
-                          range_u <= sirius::memory::saturating_mul(2, total_rows) &&
-                          histogram_bytes <= sirius::memory::saturating_mul(4, input_logical_bytes);
-
-    if (dense_ok) {
-      _last_strategy   = strategy::DENSE;
-      auto const range = static_cast<int64_t>(range_u);
-      SIRIUS_LOG_INFO(
-        "[dense_count_join] dense path: keys in [{}, {}] (range {}, {}-bit slots), preserved "
-        "rows {} (null keys {}), counted rows {}",
-        min_max->first,
-        min_max->second,
-        range,
-        wide ? 64 : 32,
-        preserved_rows,
-        preserved_null_keys,
-        counted_rows);
-      dense_count_state state(min_max->first, range, wide, stream, mr);
-      for (auto const& col : preserved_keys) {
-        state.accumulate_preserved(col, stream);
-      }
-      for (std::size_t i = 0; i < counted_keys.size(); ++i) {
-        state.accumulate_counted(
-          counted_keys[i], counted_values[i] ? &*counted_values[i] : nullptr, stream);
-      }
-      output =
-        state.emit(key_type, count_star, preserved_null_keys, stream, mr, check_product_overflow);
-    } else {
-      _last_strategy = strategy::SPARSE;
+    for (std::size_t i = 0; i < counted_keys.size(); ++i) {
+      state.accumulate_counted(counted_keys[i], counted_values[i], stream);
+    }
+    output = state.emit(key_type, semantics, preserved_null_keys, bounds, stream, mr);
+  } else {
+    _last_strategy = strategy::SPARSE;
+    if (layout) {
       SIRIUS_LOG_INFO(
         "[dense_count_join] sparse path: keys in [{}, {}], range {}, histogram bytes {}, "
         "input bytes {}, budget {}",
         min_max->first,
         min_max->second,
-        range_u,
-        histogram_bytes,
+        layout->slots(),
+        layout->total_bytes(),
         input_logical_bytes,
         _max_bins_bytes);
+    } else {
+      SIRIUS_LOG_INFO(
+        "[dense_count_join] sparse path: keys in [{}, {}] span a domain no histogram can "
+        "represent, input bytes {}, budget {}",
+        min_max->first,
+        min_max->second,
+        input_logical_bytes,
+        _max_bins_bytes);
+    }
 
-      std::vector<std::unique_ptr<cudf::table>> counted_partials;
-      for (std::size_t i = 0; i < counted_keys.size(); ++i) {
-        if (counted_keys[i].size() == 0) { continue; }
-        auto const& values = counted_values[i] ? *counted_values[i] : counted_keys[i];
-        auto const policy  = count_star ? cudf::null_policy::INCLUDE : cudf::null_policy::EXCLUDE;
-        counted_partials.push_back(
-          sparse_partial_count(counted_keys[i], values, policy, stream, mr));
-      }
-      auto counted_agg = sparse_merge_partials(std::move(counted_partials), key_type, stream, mr);
+    std::vector<std::unique_ptr<cudf::table>> counted_partials;
+    for (std::size_t i = 0; i < counted_keys.size(); ++i) {
+      if (counted_keys[i].size() == 0) { continue; }
+      auto const& values = counted_values[i] ? *counted_values[i] : counted_keys[i];
+      counted_partials.push_back(
+        sparse_partial_count(counted_keys[i], values, semantics.counted_null_policy, stream, mr));
+    }
+    auto counted_agg = sparse_merge_partials(std::move(counted_partials), key_type, stream, mr);
 
-      // Preserved side: distinct keys with their multiplicity (duplicate preserved keys multiply
-      // the per-key match count, matching join-then-group-by semantics).
-      std::vector<std::unique_ptr<cudf::table>> preserved_partials;
-      for (auto const& col : preserved_keys) {
-        if (col.size() == 0) { continue; }
-        preserved_partials.push_back(
-          sparse_partial_count(col, col, cudf::null_policy::INCLUDE, stream, mr));
-      }
-      auto preserved_agg =
-        sparse_merge_partials(std::move(preserved_partials), key_type, stream, mr);
+    // Preserved side: distinct keys with their multiplicity (duplicate preserved keys multiply
+    // the per-key match count, matching join-then-group-by semantics).
+    std::vector<std::unique_ptr<cudf::table>> preserved_partials;
+    for (auto const& col : preserved_keys) {
+      if (col.size() == 0) { continue; }
+      preserved_partials.push_back(
+        sparse_partial_count(col, col, cudf::null_policy::INCLUDE, stream, mr));
+    }
+    auto preserved_agg = sparse_merge_partials(std::move(preserved_partials), key_type, stream, mr);
 
-      auto const preserved_view          = preserved_agg->view();
-      auto const preserved_key_view      = cudf::table_view({preserved_view.column(0)});
-      auto const counted_key_view        = cudf::table_view({counted_agg->view().column(0)});
-      auto [left_indices, right_indices] = cudf::left_join(
-        preserved_key_view, counted_key_view, cudf::null_equality::UNEQUAL, stream, mr);
+    auto const preserved_view          = preserved_agg->view();
+    auto const preserved_key_view      = cudf::table_view({preserved_view.column(0)});
+    auto const counted_key_view        = cudf::table_view({counted_agg->view().column(0)});
+    auto [left_indices, right_indices] = cudf::left_join(
+      preserved_key_view, counted_key_view, cudf::null_equality::UNEQUAL, stream, mr);
 
-      // One gather over [group key, preserved multiplicity] keeps both columns row-aligned with the
-      // join result.
-      auto preserved_joined = cudf::gather(preserved_view,
-                                           gather_map_view(*left_indices),
-                                           cudf::out_of_bounds_policy::DONT_CHECK,
-                                           stream,
-                                           mr);
-      auto matched          = cudf::gather(cudf::table_view({counted_agg->view().column(1)}),
-                                  gather_map_view(*right_indices),
-                                  cudf::out_of_bounds_policy::NULLIFY,
-                                  stream,
-                                  mr);
-      left_indices.reset();
-      right_indices.reset();
-      preserved_agg.reset();
-      counted_agg.reset();
+    // One gather over [group key, preserved multiplicity] keeps both columns row-aligned with the
+    // join result.
+    auto preserved_joined = cudf::gather(preserved_view,
+                                         gather_map_view(*left_indices),
+                                         cudf::out_of_bounds_policy::DONT_CHECK,
+                                         stream,
+                                         mr);
+    auto matched          = cudf::gather(cudf::table_view({counted_agg->view().column(1)}),
+                                gather_map_view(*right_indices),
+                                cudf::out_of_bounds_policy::NULLIFY,
+                                stream,
+                                mr);
+    left_indices.reset();
+    right_indices.reset();
+    preserved_agg.reset();
+    counted_agg.reset();
 
-      auto preserved_columns = preserved_joined->release();
-      D_ASSERT(preserved_columns.size() == 2);  // [key, presence]
-      auto keys_out = std::move(preserved_columns[0]);
-      auto presence = std::move(preserved_columns[1]);
+    auto preserved_columns = preserved_joined->release();
+    D_ASSERT(preserved_columns.size() == 2);  // [key, presence]
+    auto keys_out = std::move(preserved_columns[0]);
+    auto presence = std::move(preserved_columns[1]);
 
-      // A preserved key with no counted match survives the outer join as one row per preserved row,
-      // so COUNT(*) fills 1 and COUNT(col) fills 0. Matched groups need no floor: a counted group
-      // exists only for a key with at least one counted row, and the COUNT(*) partials are taken
-      // with null_policy::INCLUDE, so a matched COUNT(*) count is never below 1.
-      cudf::numeric_scalar<int64_t> const unmatched_fill(count_star ? 1 : 0, true, stream, mr);
-      auto matched_filled =
-        cudf::replace_nulls(matched->view().column(0), unmatched_fill, stream, mr);
-      matched.reset();
-      if (check_product_overflow) {
-        throw_if_count_product_overflows(presence->view(), matched_filled->view(), stream, mr);
-      }
-      auto values = cudf::binary_operation(presence->view(),
-                                           matched_filled->view(),
-                                           cudf::binary_operator::MUL,
-                                           cudf::data_type{cudf::type_id::INT64},
-                                           stream,
-                                           mr);
-      presence.reset();
-      matched_filled.reset();
+    // A preserved key with no counted match survives the outer join as one row per preserved row,
+    // so COUNT(*) fills 1 and COUNT(col) fills 0. Matched groups need no floor: a counted group
+    // exists only for a key with at least one counted row, and the COUNT(*) partials are taken
+    // with null_policy::INCLUDE, so a matched COUNT(*) count is never below 1.
+    cudf::numeric_scalar<int64_t> const unmatched_fill(semantics.unmatched_fill, true, stream, mr);
+    auto matched_filled =
+      cudf::replace_nulls(matched->view().column(0), unmatched_fill, stream, mr);
+    matched.reset();
+    if (bounds.may_exceed_bigint()) {
+      throw_if_count_product_overflows(presence->view(), matched_filled->view(), stream, mr);
+    }
+    auto values = cudf::binary_operation(presence->view(),
+                                         matched_filled->view(),
+                                         cudf::binary_operator::MUL,
+                                         cudf::data_type{cudf::type_id::INT64},
+                                         stream,
+                                         mr);
+    presence.reset();
+    matched_filled.reset();
 
-      std::vector<std::unique_ptr<cudf::column>> columns;
-      columns.push_back(std::move(keys_out));
-      columns.push_back(std::move(values));
-      output = std::make_unique<cudf::table>(std::move(columns));
+    output = sirius::make_table(std::move(keys_out), std::move(values));
 
-      if (preserved_null_keys > 0) {
-        // cudf::concatenate rejects a total row count beyond cudf::size_type.
-        auto null_group =
-          dense_count_empty_output(key_type, count_star, preserved_null_keys, stream, mr);
-        std::vector<cudf::table_view> parts{output->view(), null_group->view()};
-        output = cudf::concatenate(parts, stream, mr);
-      }
+    if (preserved_null_keys > 0) {
+      // cudf::concatenate rejects a total row count beyond cudf::size_type.
+      auto null_group = make_null_group_table(key_type, semantics, preserved_null_keys, stream, mr);
+      std::vector<cudf::table_view> parts{output->view(), null_group->view()};
+      output = cudf::concatenate(parts, stream, mr);
     }
   }
 

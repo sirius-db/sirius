@@ -353,7 +353,9 @@ Fuses eligible `COUNT(col | *) GROUP BY key` over a preserved-side outer equi-jo
 partitioned join and aggregate fragment. Children are normalized as [preserved, counted].
 
 Both inputs are FULL barriers. Execution uses direct-address histograms or exact sparse aggregation;
-ineligible and disabled plans retain the standard path. See [Configuration](configuration.md).
+ineligible and disabled plans retain the standard path. See [Configuration](configuration.md) and
+[Fused Dense Count Join](optimizations.md#fused-dense-count-join-pr-1606) for the value rule, the
+dense-versus-sparse gate and the dense fast paths.
 
 DENSE_COUNT_JOIN is a sink parent: each direct child reports `is_sink()` and terminates its own
 pipeline through the generic `build_pipelines()` protocol, so scans, streaming chains, joins,

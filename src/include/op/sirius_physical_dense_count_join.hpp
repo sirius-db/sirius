@@ -76,15 +76,9 @@ class dense_count_join_input : public partitioned_operator_data {
  * @brief Execute a grouped COUNT over an outer equi-join without materializing joined rows
  *
  * The planner normalizes LEFT and RIGHT joins so `children[0]` is the preserved, grouped input and
- * `children[1]` is the counted input. For each non-NULL key, let `P` be its preserved-side
- * multiplicity, `M` its counted-side match count, and `V` the number of matches whose COUNT
- * argument is non-NULL. The emitted values are:
- *
- * - `COUNT(*) = P * max(M, 1)`
- * - `COUNT(col) = P * V`
- *
- * Counted-side NULL keys never match. Preserved-side NULL keys form one group whose result is the
- * number of preserved NULL-key rows for COUNT(*) and zero for COUNT(col).
+ * `children[1]` is the counted input. Counted-side NULL keys never match, and preserved-side NULL
+ * keys form one group; both strategies derive the emitted COUNT value from the rule stated on
+ * `sirius::op::dense_count_semantics`.
  *
  * Both inputs use FULL barriers and are drained into one task. Runtime uses direct-address
  * histograms when the observed key domain satisfies its layout, density, and memory gates;

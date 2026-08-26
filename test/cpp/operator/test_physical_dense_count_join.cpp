@@ -92,6 +92,83 @@ std::vector<group_row> run_dense_count_join(
   return rows;
 }
 
+// Host reference for one COUNT(col) dense shape: every preserved key contributes its multiplicity
+// and every in-domain counted key one match.
+std::vector<std::pair<int32_t, int64_t>> expected_dense_groups(
+  const std::vector<int32_t>& preserved,
+  const std::vector<int32_t>& counted,
+  int32_t min_key,
+  std::size_t slots)
+{
+  std::vector<int64_t> presence(slots, 0);
+  std::vector<int64_t> matches(slots, 0);
+  for (auto key : preserved) {
+    ++presence[static_cast<std::size_t>(key - min_key)];
+  }
+  for (auto key : counted) {
+    auto const offset = static_cast<int64_t>(key) - min_key;
+    if (offset >= 0 && offset < static_cast<int64_t>(slots)) {
+      ++matches[static_cast<std::size_t>(offset)];
+    }
+  }
+  std::vector<std::pair<int32_t, int64_t>> rows;
+  for (std::size_t k = 0; k < slots; ++k) {
+    if (presence[k] > 0) {
+      rows.emplace_back(min_key + static_cast<int32_t>(k), presence[k] * matches[k]);
+    }
+  }
+  return rows;
+}
+
+// Drives dense_count_state directly, so a test can choose the emit and accumulate paths by shape.
+// A layout may be wider than the data needs, so an inflated preserved-row bound is how
+// forced_slot_bytes reaches the 64-bit slots without changing the keys under test.
+std::vector<std::pair<int32_t, int64_t>> run_dense_count_state(
+  cucascade::memory::memory_space& space,
+  const std::vector<int32_t>& preserved,
+  const std::vector<int32_t>& counted,
+  int32_t min_key,
+  int32_t max_key,
+  std::size_t forced_slot_bytes = sizeof(uint32_t))
+{
+  auto mr     = get_resource_ref(space);
+  auto stream = default_stream();
+
+  auto const preserved_bound = forced_slot_bytes == sizeof(uint64_t)
+                                 ? int64_t{1} << 32
+                                 : static_cast<int64_t>(preserved.size());
+  auto const layout          = dense_count_layout::plan(
+    min_key, max_key, preserved_bound, static_cast<int64_t>(counted.size()));
+  REQUIRE(layout);
+  REQUIRE(layout->slot_bytes() == forced_slot_bytes);
+  dense_count_state state(*layout, stream, mr);
+
+  auto preserved_batch = make_numeric_batch<int32_t>(space, preserved, cudf::type_id::INT32);
+  state.accumulate_preserved(sirius::get_cudf_table_view(*preserved_batch).column(0), stream);
+  std::shared_ptr<cucascade::data_batch> counted_batch;
+  if (!counted.empty()) {
+    counted_batch = make_numeric_batch<int32_t>(space, counted, cudf::type_id::INT32);
+    state.accumulate_counted(
+      sirius::get_cudf_table_view(*counted_batch).column(0), std::nullopt, stream);
+  }
+
+  auto table        = state.emit(cudf::data_type{cudf::type_id::INT32},
+                          dense_count_semantics::for_count_star(false),
+                          /*null_group_rows=*/0,
+                          dense_count_bounds{static_cast<int64_t>(preserved.size()),
+                                             static_cast<int64_t>(counted.size())},
+                          stream,
+                          mr);
+  auto const keys   = copy_column_to_host<int32_t>(table->view().column(0));
+  auto const counts = copy_column_to_host<int64_t>(table->view().column(1));
+  std::vector<std::pair<int32_t, int64_t>> rows;
+  rows.reserve(keys.size());
+  for (std::size_t i = 0; i < keys.size(); ++i) {
+    rows.emplace_back(keys[i], counts[i]);
+  }
+  return rows;
+}
+
 constexpr uint64_t k_default_max_bytes = 2ULL * 1024 * 1024 * 1024;
 // Eight bytes admit one u32 presence/count slot and force these tests through the sparse path.
 constexpr uint64_t k_tiny_max_bytes = 8;
@@ -392,21 +469,116 @@ TEST_CASE("dense_count_join: wide (u64) histogram slots match the u32 result", "
   auto const preserved_keys = sirius::get_cudf_table_view(*preserved).column(0);
   auto const counted_keys   = sirius::get_cudf_table_view(*counted).column(0);
 
-  for (bool wide : {false, true}) {
-    dense_count_state state(/*min_key=*/5, /*range=*/4, wide, stream, mr);
-    REQUIRE(state.wide() == wide);
+  // A layout may be wider than the data needs, so an inflated preserved-row count is what forces
+  // the wide slots without changing the keys under test.
+  for (auto [preserved_bound, expected_slot_bytes] :
+       {std::pair{int64_t{4}, sizeof(uint32_t)}, std::pair{int64_t{1} << 32, sizeof(uint64_t)}}) {
+    auto const layout = dense_count_layout::plan(/*min_key=*/5,
+                                                 /*max_key=*/8,
+                                                 preserved_bound,
+                                                 /*counted_rows=*/5);
+    REQUIRE(layout);
+    REQUIRE(layout->slot_bytes() == expected_slot_bytes);
+    dense_count_state state(*layout, stream, mr);
     state.accumulate_preserved(preserved_keys, stream);
-    state.accumulate_counted(counted_keys, nullptr, stream);
+    state.accumulate_counted(counted_keys, std::nullopt, stream);
     auto table        = state.emit(cudf::data_type{cudf::type_id::INT32},
-                            /*count_star=*/false,
+                            dense_count_semantics::for_count_star(false),
                             /*null_group_rows=*/0,
+                            dense_count_bounds{4, 5},
                             stream,
-                            mr,
-                            /*check_product_overflow=*/false);
+                            mr);
     auto const keys   = copy_column_to_host<int32_t>(table->view().column(0));
     auto const counts = copy_column_to_host<int64_t>(table->view().column(1));
     REQUIRE(keys == std::vector<int32_t>{5, 6, 8});
     REQUIRE(counts == std::vector<int64_t>{0, 6, 0});
+  }
+}
+
+TEST_CASE("dense_count_join emit covers the identity and gathered shapes", "[dense_count_join]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space);
+
+  SECTION("a gap-free preserved domain needs no gather map")
+  {
+    const std::vector<int32_t> preserved{0, 1, 1, 2, 3};
+    const std::vector<int32_t> counted{1, 2, 2, 7};
+    CHECK(run_dense_count_state(*space, preserved, counted, 0, 3) ==
+          expected_dense_groups(preserved, counted, 0, 4));
+  }
+
+  SECTION("a gapped preserved domain counts before gathering")
+  {
+    const std::vector<int32_t> preserved{5, 6, 6, 8};
+    const std::vector<int32_t> counted{6, 6, 6, 9, 4};
+    CHECK(run_dense_count_state(*space, preserved, counted, 5, 8) ==
+          expected_dense_groups(preserved, counted, 5, 4));
+  }
+
+  SECTION("a domain far wider than the preserved rows gathers the occupied slots")
+  {
+    const std::vector<int32_t> preserved{0, 9};
+    const std::vector<int32_t> counted{0, 0, 9};
+    CHECK(run_dense_count_state(*space, preserved, counted, 0, 9) ==
+          expected_dense_groups(preserved, counted, 0, 10));
+  }
+}
+
+TEST_CASE("dense_count_join accumulation agrees across the shared-memory gate",
+          "[dense_count_join]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space);
+
+  // Accumulation is privatized into shared memory when the domain fits the 48 KiB budget and the
+  // batch carries at least eight rows per slot.
+  constexpr int32_t gate_slots = 48 * 1024 / static_cast<int32_t>(sizeof(uint32_t));
+
+  auto keys_covering = [](int32_t slots, int64_t rows) {
+    std::vector<int32_t> keys;
+    keys.reserve(static_cast<std::size_t>(rows));
+    for (int64_t i = 0; i < rows; ++i) {
+      keys.push_back(static_cast<int32_t>(i % slots));
+    }
+    return keys;
+  };
+  auto check_domain = [&](int32_t slots, int64_t rows, std::size_t slot_bytes = sizeof(uint32_t)) {
+    auto const keys = keys_covering(slots, rows);
+    CHECK(run_dense_count_state(*space, keys, keys, 0, slots - 1, slot_bytes) ==
+          expected_dense_groups(keys, keys, 0, static_cast<std::size_t>(slots)));
+  };
+
+  SECTION("a single slot") { check_domain(1, 4096); }
+  SECTION("a low-cardinality domain") { check_domain(25, 4096); }
+  SECTION("a low-cardinality domain in wide slots") { check_domain(25, 4096, sizeof(uint64_t)); }
+  SECTION("exactly at the gate") { check_domain(gate_slots, int64_t{8} * gate_slots); }
+  SECTION("just above the gate") { check_domain(gate_slots + 1, int64_t{8} * (gate_slots + 1)); }
+  SECTION("too few rows per slot to privatize") { check_domain(1024, 8 * 1024 - 1); }
+}
+
+TEST_CASE("dense_count_join admits a histogram at exactly the configured byte budget",
+          "[dense_count_join]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space);
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> preserved{
+    make_numeric_batch<int32_t>(*space, {0, 1, 2, 3, 4, 5, 6, 7}, cudf::type_id::INT32)};
+  auto const layout = dense_count_layout::plan(/*min_key=*/0,
+                                               /*max_key=*/7,
+                                               /*preserved_rows=*/8,
+                                               /*counted_rows=*/0);
+  REQUIRE(layout);
+
+  const std::vector<group_row> expected{
+    {0, 0}, {1, 0}, {2, 0}, {3, 0}, {4, 0}, {5, 0}, {6, 0}, {7, 0}};
+  for (auto [max_bytes, strategy] :
+       {std::pair{layout->total_bytes(), sirius_physical_dense_count_join::strategy::DENSE},
+        std::pair{layout->total_bytes() - 1, sirius_physical_dense_count_join::strategy::SPARSE}}) {
+    auto rows = run_dense_count_join<int32_t>(
+      *space, duckdb::LogicalTypeId::INTEGER, preserved, {}, std::size_t{0}, max_bytes, strategy);
+    REQUIRE(rows == expected);
   }
 }
 
@@ -624,18 +796,81 @@ TEST_CASE("dense_count_join first-run estimate is proportional and saturates",
         std::numeric_limits<std::size_t>::max());
 }
 
-TEST_CASE("dense_count_join rejects histogram allocation arithmetic overflow",
+TEST_CASE("dense_count_join rejects an unrepresentable histogram layout",
+          "[dense_count_join][validation]")
+{
+  CHECK_FALSE(dense_count_layout::plan(
+                0, std::numeric_limits<int64_t>::max(), int64_t{1} << 32, int64_t{1} << 32)
+                .has_value());
+  CHECK_FALSE(dense_count_layout::plan(
+                std::numeric_limits<int64_t>::min(), std::numeric_limits<int64_t>::max(), 1, 1)
+                .has_value());
+  CHECK_FALSE(dense_count_layout::plan(5, 4, 0, 0).has_value());
+}
+
+TEST_CASE("dense_count_layout sizes slots from the domain and slot width from the row counts",
+          "[dense_count_join]")
+{
+  constexpr auto uint32_max = std::numeric_limits<uint32_t>::max();
+
+  auto const narrow = dense_count_layout::plan(-4, 5, int64_t{uint32_max} - 1, 0);
+  REQUIRE(narrow);
+  CHECK(narrow->min_key() == -4);
+  CHECK(narrow->slots() == 10);
+  CHECK(narrow->slot_bytes() == sizeof(uint32_t));
+  CHECK(narrow->total_bytes() == 2 * narrow->slots() * narrow->slot_bytes());
+
+  auto const wide = dense_count_layout::plan(-4, 5, int64_t{uint32_max}, 0);
+  REQUIRE(wide);
+  CHECK(wide->slot_bytes() == sizeof(uint64_t));
+  CHECK(wide->total_bytes() == 2 * wide->slots() * wide->slot_bytes());
+}
+
+TEST_CASE("dense_count_bounds gates BIGINT overflow detection", "[dense_count_join][validation]")
+{
+  constexpr auto int64_max = std::numeric_limits<int64_t>::max();
+
+  CHECK_FALSE(dense_count_bounds{int64_max, 0}.may_exceed_bigint());
+  CHECK_FALSE(dense_count_bounds{int64_max, 1}.may_exceed_bigint());
+  CHECK_FALSE(dense_count_bounds{int64_max / 5, 5}.may_exceed_bigint());
+  CHECK(dense_count_bounds{int64_max / 5 + 1, 5}.may_exceed_bigint());
+  CHECK(dense_count_bounds{int64_max / 2 + 1, 2}.may_exceed_bigint());
+
+  // COUNT(*) floors an unmatched group at one match, so its match bound is never zero and its
+  // products are never exempt from validation.
+  CHECK(dense_count_semantics::for_count_star(true).max_matched(0) == 1);
+  CHECK(dense_count_semantics::for_count_star(false).max_matched(0) == 0);
+}
+
+TEST_CASE("dense_count_join emit validates products when the bounds allow overflow",
           "[dense_count_join][validation]")
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space);
+  auto mr     = get_resource_ref(*space);
+  auto stream = default_stream();
 
-  REQUIRE_THROWS_WITH(dense_count_state(/*min_key=*/0,
-                                        std::numeric_limits<int64_t>::max(),
-                                        /*wide=*/true,
-                                        default_stream(),
-                                        get_resource_ref(*space)),
-                      Catch::Contains("exceeds size_t allocation capacity"));
+  auto preserved = make_numeric_batch<int32_t>(*space, {5, 6, 6, 8}, cudf::type_id::INT32);
+  auto counted   = make_numeric_batch<int32_t>(*space, {6, 6, 6, 9, 4}, cudf::type_id::INT32);
+
+  auto const layout = dense_count_layout::plan(/*min_key=*/5, /*max_key=*/8, 4, 5);
+  REQUIRE(layout);
+  dense_count_state state(*layout, stream, mr);
+  state.accumulate_preserved(sirius::get_cudf_table_view(*preserved).column(0), stream);
+  state.accumulate_counted(sirius::get_cudf_table_view(*counted).column(0), std::nullopt, stream);
+
+  // Bounds this coarse cannot rule the product out, so emit arms the device overflow flag and reads
+  // it back; the actual products are tiny, so it must report clean and emit the unvalidated result.
+  dense_count_bounds const bounds{std::numeric_limits<int64_t>::max(), 2};
+  REQUIRE(bounds.may_exceed_bigint());
+  auto table = state.emit(cudf::data_type{cudf::type_id::INT32},
+                          dense_count_semantics::for_count_star(false),
+                          /*null_group_rows=*/0,
+                          bounds,
+                          stream,
+                          mr);
+  CHECK(copy_column_to_host<int32_t>(table->view().column(0)) == std::vector<int32_t>{5, 6, 8});
+  CHECK(copy_column_to_host<int64_t>(table->view().column(1)) == std::vector<int64_t>{0, 6, 0});
 }
 
 TEST_CASE("dense_count_join exact rare-path BIGINT product validation",
