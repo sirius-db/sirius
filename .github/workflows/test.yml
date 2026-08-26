@@ -160,7 +160,7 @@ jobs:
           set -o pipefail
           SIRIUS_EXP_LATE_MAT=1 \
             timeout 20m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort \
-            "[late_mat],[deferred_query]" 2>&1 | tee /tmp/unittest_late_mat.log
+            "[late_mat],[deferred_query],[native_filter]" 2>&1 | tee /tmp/unittest_late_mat.log
 
       - name: Surface test failures
         if: failure()
