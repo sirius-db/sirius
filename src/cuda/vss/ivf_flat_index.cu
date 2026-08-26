@@ -65,15 +65,16 @@ struct scoped_current_device_resource {
 
 }  // namespace
 
-std::unique_ptr<any_cuvs_index> build_ivf_flat_index_from_chunks(
-  std::vector<cudf::column_view> const& chunks,
+std::unique_ptr<any_cuvs_index> build_ivf_flat_index_from_batches(
+  std::vector<cudf::column_view> const& batches,
   std::int64_t dim,
   std::uint32_t n_lists,
   cuvs::distance::DistanceType metric,
-  rmm::device_async_resource_ref index_mr)
+  rmm::device_async_resource_ref index_mr,
+  rmm::cuda_stream_view stream)
 {
-  if (chunks.empty()) {
-    throw std::invalid_argument("build_ivf_flat_index_from_chunks: no chunks to index");
+  if (batches.empty()) {
+    throw std::invalid_argument("build_ivf_flat_index_from_batches: no batches to index");
   }
 
   cuvs::neighbors::ivf_flat::index_params index_params;
@@ -95,49 +96,50 @@ std::unique_ptr<any_cuvs_index> build_ivf_flat_index_from_chunks(
   // the build, restoring the prior current device resource.
   auto index = [&] {
     scoped_current_device_resource route{index_mr};
-    raft::device_resources res;
-    auto const stream = raft::resource::get_cuda_stream(res);
+    // Build on the caller's stream so the index's device buffers are bound to it
+    // and so allocations charge the reservation attached to it.
+    raft::device_resources res{stream};
 
     // Train centroids on the first batch that has at least n_lists rows.
-    // NOTE: could improve recall if we do a cross-chunk training sample
-    cudf::column_view const* train_chunk = nullptr;
+    // NOTE: could improve recall if we do a cross-batch training sample
+    cudf::column_view const* train_batch = nullptr;
     bool any_non_empty                   = false;
-    for (auto const& chunk : chunks) {
-      auto const rows = static_cast<std::int64_t>(chunk.size());
+    for (auto const& batch : batches) {
+      auto const rows = static_cast<std::int64_t>(batch.size());
       if (rows == 0) { continue; }
       any_non_empty = true;
       if (rows >= static_cast<std::int64_t>(n_lists)) {
-        train_chunk = &chunk;
+        train_batch = &batch;
         break;
       }
     }
-    if (train_chunk == nullptr) {
+    if (train_batch == nullptr) {
       if (!any_non_empty) {
-        throw std::invalid_argument("build_ivf_flat_index_from_chunks: all chunks are empty");
+        throw std::invalid_argument("build_ivf_flat_index_from_batches: all batches are empty");
       }
       throw std::invalid_argument(
-        "build_ivf_flat_index_from_chunks: no batch has at least n_lists=" +
+        "build_ivf_flat_index_from_batches: no batch has at least n_lists=" +
         std::to_string(n_lists) + " rows to train IVF-Flat centroids; lower n_lists");
     }
-    auto const train_view = list_column_as_dataset_view(*train_chunk, dim);
+    auto const train_view = list_column_as_dataset_view(*train_batch, dim);
     auto idx              = cuvs::neighbors::ivf_flat::build(res, index_params, train_view);
 
-    // Populate the index chunk by chunk, tagging each vector with its global row id
+    // Populate the index batch by batch, tagging each vector with its global row id
     // (offset by the rows already added) so search returns dataset-global indices.
     std::int64_t base = 0;
-    for (auto const& chunk : chunks) {
-      auto const chunk_view = list_column_as_dataset_view(chunk, dim);
-      auto const rows       = chunk_view.extent(0);
+    for (auto const& batch : batches) {
+      auto const batch_view = list_column_as_dataset_view(batch, dim);
+      auto const rows       = batch_view.extent(0);
       if (rows == 0) { continue; }
       if (base == 0) {
         // Index is still empty: nullopt implies the contiguous range [0, rows).
-        cuvs::neighbors::ivf_flat::extend(res, chunk_view, std::nullopt, &idx);
+        cuvs::neighbors::ivf_flat::extend(res, batch_view, std::nullopt, &idx);
       } else {
         rmm::device_uvector<std::int64_t> ids(static_cast<std::size_t>(rows), stream, index_mr);
         thrust::sequence(rmm::exec_policy(stream), ids.begin(), ids.end(), base);
         auto const ids_view =
           raft::make_device_vector_view<const std::int64_t, std::int64_t>(ids.data(), rows);
-        cuvs::neighbors::ivf_flat::extend(res, chunk_view, std::optional{ids_view}, &idx);
+        cuvs::neighbors::ivf_flat::extend(res, batch_view, std::optional{ids_view}, &idx);
         // ids is freed async on `stream` at scope exit, ordered after this extend.
       }
       base += rows;

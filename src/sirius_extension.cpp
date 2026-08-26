@@ -31,12 +31,14 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <absl/cleanup/cleanup.h>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
 // Forward-declare CUDA profiler API functions (linked via libcudart).
 extern "C" int cudaProfilerStart();
@@ -1882,13 +1884,25 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
       "index for this column, if any, was left in place.");
   }
 
-  // Reserve the index footprint (heuristic, over-estimated to cover build-time
-  // scratch): ~2x the stored vectors + 2x centroids + 1 MiB slack
+  // Reserve the index footprint: ~2x the stored vectors + 2x centroids + 1 MiB slack
+  // NOTE: this is very conservative and can be tightened
   std::size_t const vec_bytes =
     static_cast<std::size_t>(n_rows) * static_cast<std::size_t>(dim) * sizeof(float);
   std::size_t const centroid_bytes =
     static_cast<std::size_t>(n_lists) * static_cast<std::size_t>(dim) * sizeof(float);
   std::size_t const footprint = vec_bytes * 2 + centroid_bytes * 2 + (std::size_t{1} << 20);
+
+  [[maybe_unused]] auto* pool = target_space->get_memory_resource_of<cucascade::memory::Tier::GPU>();
+  SIRIUS_LOG_DEBUG(
+    "[ann_index] build begin, GPU:{} allocated={} bytes reserved={} bytes footprint={} bytes "
+    "(rows={} dim={} n_lists={})",
+    target_gpu,
+    pool ? pool->get_total_allocated_bytes() : 0,
+    pool ? pool->get_total_reserved_bytes() : 0,
+    footprint,
+    n_rows,
+    dim,
+    n_lists);
 
   auto& index_cache = sirius_ctx->get_cuvs_index_cache();
 
@@ -1921,11 +1935,30 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
     }
   }
 
-  // Build IVF-Flat through the reservation's resource
+  // Bind the reservation to the build stream for the build only. The reservation
+  // is released after the build, so the index is just ordinary allocated GPU memory.
+  rmm::cuda_stream build_stream;
+  auto* allocator = reservation->get_memory_resource_of<cucascade::memory::Tier::GPU>();
+  if (allocator == nullptr ||
+      !allocator->attach_reservation_to_tracker(build_stream.view(), std::move(reservation))) {
+    throw InvalidInputException(
+      "sirius_create_ann_index: failed to bind the index build to its GPU reservation");
+  }
+  // Release the reservation whether the build succeeds or throws. On release the
+  // arena hands back its unused slack and keeps the resident index accounted.
+  absl::Cleanup reset_reservation = [allocator, &build_stream] {
+    allocator->reset_stream_reservation(build_stream.view());
+  };
+
+  // Build IVF-Flat on the build stream
   std::unique_ptr<sirius::vss::any_cuvs_index> handle;
   try {
-    handle = sirius::vss::build_ivf_flat_index_from_chunks(
-      chunk_views, dim, n_lists, metric, reservation->get_memory_resource());
+    handle = sirius::vss::build_ivf_flat_index_from_batches(chunk_views,
+                                                            dim,
+                                                            n_lists,
+                                                            metric,
+                                                            target_space->get_default_allocator(),
+                                                            build_stream.view());
   } catch (std::exception const& e) {
     if (removed_existing) {
       throw InvalidInputException(
@@ -1937,26 +1970,40 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
     }
     throw;
   }
-  reservation->shrink_to_fit();
 
   sirius::vss::index_metadata meta;
-  meta.kind           = ann_index_kind_from_type(data.index_type);
-  meta.catalog_name   = entry_catalog;
-  meta.schema_name    = entry_schema;
-  meta.table_name     = entry.name;
-  meta.column_name    = data.column_name;
-  meta.dim            = dim;
-  meta.num_rows       = n_rows;
-  meta.n_lists        = static_cast<int64_t>(n_lists);
-  meta.metric         = metric;
-  meta.reserved_bytes = reservation->size();
+  meta.kind         = ann_index_kind_from_type(data.index_type);
+  meta.catalog_name = entry_catalog;
+  meta.schema_name  = entry_schema;
+  meta.table_name   = entry.name;
+  meta.column_name  = data.column_name;
+  meta.dim          = dim;
+  meta.num_rows     = n_rows;
+  meta.n_lists      = static_cast<int64_t>(n_lists);
+  meta.metric       = metric;
+  // Resident index footprint, read while the reservation still tracks the arena.
+  meta.resident_bytes                = allocator->get_allocated_bytes(build_stream.view());
+  [[maybe_unused]] std::size_t const build_peak_bytes =
+    allocator->get_peak_allocated_bytes(build_stream.view());
+
+  // Release the reservation before the build stream moves into the cache.
+  std::move(reset_reservation).Invoke();
+
+  SIRIUS_LOG_DEBUG(
+    "[ann_index] build end, GPU:{} allocated={} bytes reserved={} bytes index_footprint={} bytes "
+    "build_peak={} bytes",
+    target_gpu,
+    allocator->get_total_allocated_bytes(),
+    allocator->get_total_reserved_bytes(),
+    meta.resident_bytes,
+    build_peak_bytes);
 
   // Non-destructive path: remove the old one now that the new one is built
   if (!released_first) {
     index_cache.erase_by_column(entry_catalog, entry_schema, entry.name, data.column_name, metric);
   }
   index_cache.insert(
-    std::move(index_name), std::move(meta), std::move(handle), std::move(reservation));
+    std::move(index_name), std::move(meta), std::move(handle), std::move(build_stream));
 
   output.SetCardinality(1);
   output.SetValue(0, 0, Value::BOOLEAN(true));

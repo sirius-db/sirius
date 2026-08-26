@@ -51,8 +51,6 @@ cuvs_index_cache::cuvs_index_cache(
 {
 }
 
-// Out-of-line so pinned_index_entry's reservation (a forward-declared type in
-// the header) is destroyed here, where cucascade::memory::reservation is complete.
 cuvs_index_cache::~cuvs_index_cache() = default;
 
 std::unique_ptr<cucascade::memory::reservation> cuvs_index_cache::reserve_index_memory(
@@ -70,12 +68,12 @@ std::unique_ptr<cucascade::memory::reservation> cuvs_index_cache::reserve_index_
 void cuvs_index_cache::insert(std::string name,
                               index_metadata meta,
                               std::unique_ptr<any_cuvs_index> index,
-                              std::unique_ptr<cucascade::memory::reservation> reservation)
+                              rmm::cuda_stream build_stream)
 {
-  auto entry         = std::make_shared<pinned_index_entry>();
-  entry->meta        = std::move(meta);
-  entry->index       = std::move(index);
-  entry->reservation = std::move(reservation);
+  auto entry          = std::make_shared<pinned_index_entry>();
+  entry->meta         = std::move(meta);
+  entry->build_stream = std::move(build_stream);
+  entry->index        = std::move(index);
 
   std::scoped_lock lock(_mutex);
   _entries[std::move(name)] = std::move(entry);

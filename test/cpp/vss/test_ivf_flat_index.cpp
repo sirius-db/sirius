@@ -39,12 +39,12 @@
 
 namespace {
 
-using sirius::vss::build_ivf_flat_index_from_chunks;
+using sirius::vss::build_ivf_flat_index_from_batches;
 using sirius::vss::search_ivf_flat_index;
 using Metric = cuvs::distance::DistanceType;
 
 // Build a Sirius-style ARRAY<FLOAT>[dim] column (cudf LIST with a contiguous,
-// uniform FLOAT32 values child); i.e., the shape the builder wraps per chunk.
+// uniform FLOAT32 values child); i.e., the shape the builder wraps per batch.
 std::unique_ptr<cudf::column> make_fixed_size_float_list(std::vector<float> const& values,
                                                          cudf::size_type n_rows,
                                                          cudf::size_type dim)
@@ -97,7 +97,7 @@ std::vector<float> to_host_f(cudf::column_view const& col)
 
 }  // namespace
 
-TEST_CASE("build_ivf_flat_index_from_chunks + search finds exact nearest neighbours", "[vss]")
+TEST_CASE("build_ivf_flat_index_from_batches + search finds exact nearest neighbours", "[vss]")
 {
   constexpr cudf::size_type dim = 2;
   auto const stream             = cudf::get_default_stream();
@@ -124,8 +124,8 @@ TEST_CASE("build_ivf_flat_index_from_chunks + search finds exact nearest neighbo
   // is exact; the ANN approximation only kicks in when fewer lists are probed.
   constexpr std::uint32_t n_lists  = 2;
   constexpr std::uint32_t n_probes = n_lists;
-  auto index                       = build_ivf_flat_index_from_chunks(
-    {dataset_col->view()}, dim, n_lists, Metric::L2SqrtExpanded, mr);
+  auto index                       = build_ivf_flat_index_from_batches(
+    {dataset_col->view()}, dim, n_lists, Metric::L2SqrtExpanded, mr, stream);
 
   SECTION("query in the origin cluster returns row 0")
   {
@@ -163,27 +163,27 @@ TEST_CASE("build_ivf_flat_index_from_chunks + search finds exact nearest neighbo
   }
 }
 
-// The chunked builder populates the index chunk by chunk via ivf_flat::extend,
+// The batched builder populates the index batch by batch via ivf_flat::extend,
 // tagging each vector with its GLOBAL row id (offset by the rows already added)
-// so search returns dataset-global indices in chunk order. A per-chunk-local id
-// regression would return 0-based ids from the far chunk and this test would catch it.
-TEST_CASE("build_ivf_flat_index_from_chunks tags global ids across chunks", "[vss]")
+// so search returns dataset-global indices in batch order. A per-batch-local id
+// regression would return 0-based ids from the far batch and this test would catch it.
+TEST_CASE("build_ivf_flat_index_from_batches tags global ids across batches", "[vss]")
 {
   constexpr cudf::size_type dim = 2;
   auto const stream             = cudf::get_default_stream();
   auto const mr                 = cudf::get_current_device_resource_ref();
 
-  // Chunk A -> global rows 0,1,2 near the origin.
-  auto chunk_a = make_fixed_size_float_list({0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f}, 3, dim);
-  // Chunk B -> global rows 3,4,5 near (10,10).
-  auto chunk_b = make_fixed_size_float_list({10.0f, 10.0f, 11.0f, 10.0f, 10.0f, 11.0f}, 3, dim);
+  // batch A -> global rows 0,1,2 near the origin.
+  auto batch_a = make_fixed_size_float_list({0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f}, 3, dim);
+  // batch B -> global rows 3,4,5 near (10,10).
+  auto batch_b = make_fixed_size_float_list({10.0f, 10.0f, 11.0f, 10.0f, 10.0f, 11.0f}, 3, dim);
 
   constexpr std::uint32_t n_lists  = 2;
   constexpr std::uint32_t n_probes = n_lists;  // exact
-  auto index                       = build_ivf_flat_index_from_chunks(
-    {chunk_a->view(), chunk_b->view()}, dim, n_lists, Metric::L2SqrtExpanded, mr);
+  auto index                       = build_ivf_flat_index_from_batches(
+    {batch_a->view(), batch_b->view()}, dim, n_lists, Metric::L2SqrtExpanded, mr, stream);
 
-  SECTION("a query in chunk B returns its global id 3, not a chunk-local 0")
+  SECTION("a query in batch B returns its global id 3, not a batch-local 0")
   {
     auto q      = upload({10.1f, 10.1f}, stream);
     auto result = search_ivf_flat_index(
@@ -191,11 +191,11 @@ TEST_CASE("build_ivf_flat_index_from_chunks tags global ids across chunks", "[vs
     auto neighbors = to_host_i64(result.neighbors->view());
     REQUIRE(neighbors[0] == 3);
     for (auto id : neighbors) {
-      REQUIRE(id >= 3);  // every near neighbour lives in the far chunk
+      REQUIRE(id >= 3);  // every near neighbor lives in the far batch
     }
   }
 
-  SECTION("a query in chunk A still returns global id 0")
+  SECTION("a query in batch A still returns global id 0")
   {
     auto q      = upload({0.1f, 0.1f}, stream);
     auto result = search_ivf_flat_index(
@@ -203,68 +203,75 @@ TEST_CASE("build_ivf_flat_index_from_chunks tags global ids across chunks", "[vs
     auto neighbors = to_host_i64(result.neighbors->view());
     REQUIRE(neighbors[0] == 0);
     for (auto id : neighbors) {
-      REQUIRE(id < 3);  // every near neighbour lives in the origin chunk
+      REQUIRE(id < 3);  // every near neighbor lives in the origin batch
     }
   }
 }
 
-// An empty leading chunk must be skipped without shifting the global ids: the
-// first non-empty chunk still occupies [0, rows), so a subsequent chunk's ids are
+// An empty leading batch must be skipped without shifting the global ids: the
+// first non-empty batch still occupies [0, rows), so a subsequent batch's ids are
 // offset only by real rows.
-TEST_CASE("build_ivf_flat_index_from_chunks skips empty chunks without shifting ids", "[vss]")
+TEST_CASE("build_ivf_flat_index_from_batches skips empty batches without shifting ids", "[vss]")
 {
   constexpr cudf::size_type dim = 2;
   auto const stream             = cudf::get_default_stream();
   auto const mr                 = cudf::get_current_device_resource_ref();
 
   auto empty   = make_fixed_size_float_list({}, 0, dim);
-  auto chunk_a = make_fixed_size_float_list({0.0f, 0.0f, 1.0f, 0.0f}, 2, dim);      // ids 0,1
-  auto chunk_b = make_fixed_size_float_list({10.0f, 10.0f, 11.0f, 10.0f}, 2, dim);  // ids 2,3
+  auto batch_a = make_fixed_size_float_list({0.0f, 0.0f, 1.0f, 0.0f}, 2, dim);      // ids 0,1
+  auto batch_b = make_fixed_size_float_list({10.0f, 10.0f, 11.0f, 10.0f}, 2, dim);  // ids 2,3
 
-  auto index = build_ivf_flat_index_from_chunks(
-    {empty->view(), chunk_a->view(), empty->view(), chunk_b->view()},
+  auto index = build_ivf_flat_index_from_batches(
+    {empty->view(), batch_a->view(), empty->view(), batch_b->view()},
     dim,
     /*n_lists=*/2,
     Metric::L2SqrtExpanded,
-    mr);
+    mr,
+    stream);
 
   auto q      = upload({10.1f, 10.1f}, stream);
   auto result = search_ivf_flat_index(
     *index, static_cast<const float*>(q.data()), dim, /*k=*/1, /*n_probes=*/2, stream, mr);
-  // Chunk B follows exactly 2 real rows, so its first vector is global id 2.
+  // batch B follows exactly 2 real rows, so its first vector is global id 2.
   REQUIRE(to_host_i64(result.neighbors->view())[0] == 2);
 }
 
-TEST_CASE("build_ivf_flat_index_from_chunks rejects n_lists larger than every batch", "[vss]")
+TEST_CASE("build_ivf_flat_index_from_batches rejects n_lists larger than every batch", "[vss]")
 {
   constexpr cudf::size_type dim = 2;
   auto const mr                 = cudf::get_current_device_resource_ref();
 
   // Two non-empty batches of 2 rows each: 4 rows total, but no single batch reaches
   // n_lists=4, so kmeans cannot train the requested clusters.
-  auto chunk_a = make_fixed_size_float_list({0.0f, 0.0f, 1.0f, 0.0f}, 2, dim);
-  auto chunk_b = make_fixed_size_float_list({10.0f, 10.0f, 11.0f, 10.0f}, 2, dim);
+  auto batch_a = make_fixed_size_float_list({0.0f, 0.0f, 1.0f, 0.0f}, 2, dim);
+  auto batch_b = make_fixed_size_float_list({10.0f, 10.0f, 11.0f, 10.0f}, 2, dim);
 
-  REQUIRE_THROWS_WITH(
-    build_ivf_flat_index_from_chunks(
-      {chunk_a->view(), chunk_b->view()}, dim, /*n_lists=*/4, Metric::L2SqrtExpanded, mr),
-    Catch::Contains("no batch has at least n_lists=4"));
+  REQUIRE_THROWS_WITH(build_ivf_flat_index_from_batches({batch_a->view(), batch_b->view()},
+                                                        dim,
+                                                        /*n_lists=*/4,
+                                                        Metric::L2SqrtExpanded,
+                                                        mr,
+                                                        cudf::get_default_stream()),
+                      Catch::Contains("no batch has at least n_lists=4"));
 }
 
-TEST_CASE("build_ivf_flat_index_from_chunks rejects all-empty input", "[vss]")
+TEST_CASE("build_ivf_flat_index_from_batches rejects all-empty input", "[vss]")
 {
   constexpr cudf::size_type dim = 2;
   auto const mr                 = cudf::get_current_device_resource_ref();
 
   auto empty = make_fixed_size_float_list({}, 0, dim);
 
-  REQUIRE_THROWS_WITH(
-    build_ivf_flat_index_from_chunks(
-      {empty->view(), empty->view()}, dim, /*n_lists=*/1, Metric::L2SqrtExpanded, mr),
-    Catch::Contains("all chunks are empty"));
+  REQUIRE_THROWS_WITH(build_ivf_flat_index_from_batches({empty->view(), empty->view()},
+                                                        dim,
+                                                        /*n_lists=*/1,
+                                                        Metric::L2SqrtExpanded,
+                                                        mr,
+                                                        cudf::get_default_stream()),
+                      Catch::Contains("all batches are empty"));
 }
 
-TEST_CASE("build_ivf_flat_index_from_chunks trains on a later batch when the first is too small",
+TEST_CASE("build_ivf_flat_index_from_batches trains on a later batch when the first is too small",
           "[vss]")
 {
   constexpr cudf::size_type dim = 2;
@@ -277,8 +284,8 @@ TEST_CASE("build_ivf_flat_index_from_chunks trains on a later batch when the fir
   auto big   = make_fixed_size_float_list(
     {10.0f, 10.0f, 11.0f, 10.0f, 12.0f, 10.0f, 13.0f, 10.0f}, 4, dim);  // ids 1..4
 
-  auto index = build_ivf_flat_index_from_chunks(
-    {small->view(), big->view()}, dim, /*n_lists=*/2, Metric::L2SqrtExpanded, mr);
+  auto index = build_ivf_flat_index_from_batches(
+    {small->view(), big->view()}, dim, /*n_lists=*/2, Metric::L2SqrtExpanded, mr, stream);
 
   // Query at the first batch's only vector: it is present and returned as id 0.
   auto q      = upload({0.0f, 0.0f}, stream);
@@ -310,8 +317,8 @@ TEST_CASE("search_ivf_flat_index returns Euclidean distances for L2SqrtExpanded"
   auto dataset_col = make_fixed_size_float_list(dataset_vals, 4, dim);
 
   // Single list so every point is in it; probing it is a full (exact) scan.
-  auto index = build_ivf_flat_index_from_chunks(
-    {dataset_col->view()}, dim, /*n_lists=*/1, Metric::L2SqrtExpanded, mr);
+  auto index = build_ivf_flat_index_from_batches(
+    {dataset_col->view()}, dim, /*n_lists=*/1, Metric::L2SqrtExpanded, mr, stream);
 
   auto q      = upload({0.0f, 0.0f}, stream);
   auto result = search_ivf_flat_index(
@@ -334,8 +341,8 @@ TEST_CASE("search_ivf_flat_index handles k == n_rows", "[vss]")
 
   std::vector<float> dataset_vals = {1.0f, 5.0f, 2.0f};  // distances to 0: 1, 5, 2
   auto dataset_col                = make_fixed_size_float_list(dataset_vals, 3, dim);
-  auto index                      = build_ivf_flat_index_from_chunks(
-    {dataset_col->view()}, dim, /*n_lists=*/1, Metric::L2SqrtExpanded, mr);
+  auto index                      = build_ivf_flat_index_from_batches(
+    {dataset_col->view()}, dim, /*n_lists=*/1, Metric::L2SqrtExpanded, mr, stream);
 
   auto q      = upload({0.0f}, stream);
   auto result = search_ivf_flat_index(
@@ -371,8 +378,8 @@ TEST_CASE("build/search IVF-Flat ranks by direction for CosineExpanded", "[vss]"
     1.0f,  // row 3 -> 135 deg
   };
   auto dataset_col = make_fixed_size_float_list(dataset_vals, 4, dim);
-  auto index       = build_ivf_flat_index_from_chunks(
-    {dataset_col->view()}, dim, /*n_lists=*/1, Metric::CosineExpanded, mr);
+  auto index       = build_ivf_flat_index_from_batches(
+    {dataset_col->view()}, dim, /*n_lists=*/1, Metric::CosineExpanded, mr, stream);
 
   auto q      = upload({1.0f, 0.0f}, stream);
   auto result = search_ivf_flat_index(
@@ -386,7 +393,7 @@ TEST_CASE("build/search IVF-Flat ranks by direction for CosineExpanded", "[vss]"
   REQUIRE(distances[2] <= distances[3]);
 }
 
-TEST_CASE("build_ivf_flat_index_from_chunks rejects a dim that mismatches the column width",
+TEST_CASE("build_ivf_flat_index_from_batches rejects a dim that mismatches the column width",
           "[vss]")
 {
   constexpr cudf::size_type dim = 2;
@@ -396,28 +403,37 @@ TEST_CASE("build_ivf_flat_index_from_chunks rejects a dim that mismatches the co
 
   // Column rows are width 2; asking the builder to read them as width 3 must be
   // rejected by the dataset-view validation, not silently misinterpreted.
-  REQUIRE_THROWS(build_ivf_flat_index_from_chunks(
-    {col->view()}, /*dim=*/3, /*n_lists=*/1, Metric::L2SqrtExpanded, mr));
+  REQUIRE_THROWS(build_ivf_flat_index_from_batches({col->view()},
+                                                   /*dim=*/3,
+                                                   /*n_lists=*/1,
+                                                   Metric::L2SqrtExpanded,
+                                                   mr,
+                                                   cudf::get_default_stream()));
 }
 
-TEST_CASE("build_ivf_flat_index_from_chunks rejects empty chunk sets", "[vss]")
+TEST_CASE("build_ivf_flat_index_from_batches rejects empty batch sets", "[vss]")
 {
   constexpr cudf::size_type dim = 2;
   auto const mr                 = cudf::get_current_device_resource_ref();
 
-  SECTION("no chunks at all throws")
+  SECTION("no batches at all throws")
   {
     std::vector<cudf::column_view> none;
     REQUIRE_THROWS_AS(
-      build_ivf_flat_index_from_chunks(none, dim, /*n_lists=*/1, Metric::L2SqrtExpanded, mr),
+      build_ivf_flat_index_from_batches(
+        none, dim, /*n_lists=*/1, Metric::L2SqrtExpanded, mr, cudf::get_default_stream()),
       std::invalid_argument);
   }
 
-  SECTION("all-empty chunks throw")
+  SECTION("all-empty batches throw")
   {
     auto empty = make_fixed_size_float_list({}, 0, dim);
-    REQUIRE_THROWS_AS(build_ivf_flat_index_from_chunks(
-                        {empty->view()}, dim, /*n_lists=*/1, Metric::L2SqrtExpanded, mr),
+    REQUIRE_THROWS_AS(build_ivf_flat_index_from_batches({empty->view()},
+                                                        dim,
+                                                        /*n_lists=*/1,
+                                                        Metric::L2SqrtExpanded,
+                                                        mr,
+                                                        cudf::get_default_stream()),
                       std::invalid_argument);
   }
 }

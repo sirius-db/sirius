@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <rmm/cuda_stream.hpp>
+
 #include <cuvs/distance/distance.hpp>
 
 #include <cstdint>
@@ -59,8 +61,8 @@ struct index_metadata {
   std::int64_t num_rows{0};  ///< Number of indexed vectors
   std::int64_t n_lists{0};   ///< IVF-Flat inverted-list count (0 if not applicable).
   cuvs::distance::DistanceType metric{cuvs::distance::DistanceType::L2Expanded};
-  std::size_t reserved_bytes{
-    0};  ///< GPU bytes reserved from the reservation manager to hold this index
+  std::size_t resident_bytes{
+    0};  ///< Resident GPU bytes the finished index occupies (capacity-accounted)
 };
 
 /// Type-erased owner of a cuVS index. The cache stores indexes through
@@ -90,22 +92,22 @@ template <class Index>
 }
 
 /// One pinned cuVS index: its metadata, the type-erased index payload, and the
-/// GPU reservation that pins the index's memory.
+/// stream the index was built on.
 ///
-/// The reservation keeps the index's footprint reserved and accounted in the
-/// reservation manager until the entry is dropped (unpin or session end). The
-/// index's device buffers were allocated through
-/// @c reservation->get_memory_resource(), so Sirius owns every byte and
-/// releasing the reservation frees the index. Move-only (owns unique resources).
+/// The index's device memory is ordinary capacity-accounted GPU memory: it was
+/// charged to a reservation only during the build, which was released once the
+/// build finished. The entry keeps the build stream so the index can be freed on
+/// it when the entry is dropped (unpin or session end). Move-only.
 ///
 /// The cache stores entries as @c shared_ptr, and lookups hand back a shared
-/// handle, so a caller that is mid-search keeps the whole entry (index +
-/// reservation) alive even if it is dropped or replaced concurrently.
+/// handle, so a caller that is mid-search keeps the whole entry alive even if it
+/// is dropped or replaced concurrently.
 struct pinned_index_entry {
-  // The index's device buffers were allocated through reservation,
-  // so the index must be freed before the reservation.
   index_metadata meta;
-  std::unique_ptr<cucascade::memory::reservation> reservation;
+  // The index's device buffers were built on this stream and are freed on it
+  // when the index is destroyed. It is declared before the index because members
+  // are destroyed in reverse order, and the index needs to be freed first.
+  rmm::cuda_stream build_stream;
   std::unique_ptr<any_cuvs_index> index;
 
   /// Recover the concrete cuVS index, or nullptr if the held index is not of
@@ -126,17 +128,19 @@ struct pinned_index_entry {
 /// pin-table cache) so each future index type can add its own search operator
 /// without touching shared scan code.
 ///
-/// Memory ownership: GPU memory for an index is taken as an explicit reservation
-/// from the reservation manager via @ref reserve_index_memory; the caller builds
-/// the cuVS index through that reservation's memory resource and hands the
-/// reservation to @ref insert, which stores it on the entry. Nothing here ever
-/// allocates outside Sirius's cucascade reservation manager.
+/// Memory ownership: @ref reserve_index_memory reserves the build's footprint so
+/// the caller can admit it against the GPU budget. The caller attaches that
+/// reservation to the build stream for the build only, so cuVS's allocations are
+/// charged and bounded by it, then releases the reservation. The finished index's
+/// device memory stays as ordinary capacity-accounted GPU memory, and the entry
+/// keeps only the build stream so the index can be freed on it later. Nothing here
+/// ever allocates outside the GPU memory space's allocator.
 ///
 /// Lifetime: entries live until @ref erase / @ref clear or session teardown.
 /// There is no eviction or spilling yet (future work). Lookups return a shared
-/// handle to the entry, so the entry (and its reservation) stays alive for as
-/// long as any caller holds the handle, even if the named entry is erased or
-/// replaced in the meantime.
+/// handle to the entry, so the entry (and its index) stays alive for as long as
+/// any caller holds the handle, even if the named entry is erased or replaced in
+/// the meantime.
 ///
 /// Thread-safety: all members are guarded by an internal mutex. The mutex only
 /// guards the map itself; the shared handle returned by a lookup is what keeps
@@ -151,10 +155,9 @@ class cuvs_index_cache {
   cuvs_index_cache(cuvs_index_cache&&)                 = delete;  // move ctor not allowed
   cuvs_index_cache& operator=(cuvs_index_cache&&)      = delete;  // move assignment not allowed
 
-  /// Reserve @p bytes of GPU memory for building an index, so cuVS allocates the
-  /// index through Sirius's reservation manager: build the index with
-  /// @c reservation->get_memory_resource() set as the current device resource,
-  /// then move the same reservation into @ref insert to pin it.
+  /// Reserve @p bytes of GPU memory for building an index. The caller attaches
+  /// this reservation to the build stream so cuVS's allocations are charged and
+  /// bounded by it, then releases it once the index is built.
   ///
   /// Non-blocking, and pinned to @p preferred_gpu: the index must be reserved on
   /// the same GPU that holds the table's pinned data. Returns null instead of
@@ -169,13 +172,13 @@ class cuvs_index_cache {
     std::size_t bytes, int preferred_gpu = -1);
 
   /// Pin a built index under @p name, replacing any existing entry with that
-  /// name. The old entry is unlinked here; its index and reservation are freed
-  /// once no outstanding lookup handle still refers to it. Takes ownership of
-  /// both the index payload and its reservation.
+  /// name. The old entry is unlinked here; its index is freed once no outstanding
+  /// lookup handle still refers to it. Takes ownership of the index payload and
+  /// the stream it was built on (the index is freed on that stream).
   void insert(std::string name,
               index_metadata meta,
               std::unique_ptr<any_cuvs_index> index,
-              std::unique_ptr<cucascade::memory::reservation> reservation);
+              rmm::cuda_stream build_stream);
 
   /// Look up a pinned index by its management name, or nullptr if absent. The
   /// returned handle keeps the entry alive for as long as it is held, even if the
