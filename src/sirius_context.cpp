@@ -114,13 +114,14 @@ optional_ptr<TableCatalogEntry const> find_update_target(PhysicalOperator const&
   return nullptr;
 }
 
+/// Find the pin for this table incarnation. A recreated same-name table does not match.
 std::optional<std::string> pinned_name_for_table(
   sirius::scan_manager::sirius_scan_manager const& scan_manager, TableCatalogEntry const& table)
 {
   std::optional<std::string> result;
   scan_manager.visit_pinned_entries([&](std::string_view name, auto const& entry) {
     if (!entry.cache_info.matches_duckdb_table(
-          table.ParentCatalog().GetName(), table.ParentSchema().name, table.name)) {
+          table.ParentCatalog().GetName(), table.ParentSchema().name, table.name, table.oid)) {
       return true;
     }
     result = name;

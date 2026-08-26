@@ -24,6 +24,7 @@
 #include "duckdb/storage/block_manager.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/segment/uncompressed.hpp"
+#include "duckdb/storage/single_file_block_manager.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/statistics/string_stats.hpp"
 #include "duckdb/storage/storage_manager.hpp"
@@ -44,6 +45,7 @@
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <unordered_map>
@@ -260,9 +262,35 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   if (sirius_state && op.function.name == "seq_scan") {
     auto* bind = dynamic_cast<duckdb::TableScanBindData*>(op.bind_data.get());
     if (bind != nullptr && bind->table.IsDuckTable()) {
-      auto& table = bind->table.Cast<duckdb::DuckTableEntry>();
-      pinned      = sirius_state->get_scan_manager().find_pinned_entry_for_duckdb_table(
-        table.ParentCatalog().GetName(), table.ParentSchema().name, table.name);
+      auto& table        = bind->table.Cast<duckdb::DuckTableEntry>();
+      auto& scan_manager = sirius_state->get_scan_manager();
+      auto const catalog = table.ParentCatalog().GetName();
+      auto const& schema = table.ParentSchema().name;
+      pinned =
+        scan_manager.find_pinned_entry_for_duckdb_table(catalog, schema, table.name, table.oid);
+      // A same-name pin for an older table cannot serve this scan. Until a
+      // checkpoint rewrites the on-disk image, the disk-native path is also unsafe,
+      // so decline here while transparent CPU fallback is still available.
+      if (pinned == nullptr) {
+        auto const* checkpoint_block_manager = dynamic_cast<duckdb::SingleFileBlockManager const*>(
+          &table.GetStorage().GetAttached().GetStorageManager().GetBlockManager());
+        // Unreachable while pin_table admits only single-file databases.
+        std::optional<std::uint64_t> current_iteration;
+        if (checkpoint_block_manager != nullptr) {
+          current_iteration = checkpoint_block_manager->GetCheckpointIteration();
+        }
+        auto const superseded = scan_manager.pinned_entry_name_for_superseded_duckdb_table(
+          catalog, schema, table.name, table.oid, current_iteration);
+        if (superseded) {
+          throw duckdb::NotImplementedException(
+            "duckdb-native scan: table '%s' was dropped and recreated (or altered) after "
+            "pin_table, so pinned entry '%s' holds a different table and cannot serve this scan. "
+            "Run CALL unpin_table('%s'), then pin_table again",
+            table.name,
+            *superseded,
+            *superseded);
+        }
+      }
       // Rows beyond the pinned prefix serve as insert-delta splits, decoded fresh at native
       // width. A narrow sidecar over them would pay per-batch exact-range verification and, on
       // an out-of-range inserted value, fail the query over to the CPU fallback — so the

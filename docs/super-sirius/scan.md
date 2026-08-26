@@ -234,18 +234,30 @@ narrowing marker. It also carries a `pinned_zone_maps` sidecar — the pin-time 
 min/max statistics, absent when capture was disabled (see [Zone maps](#zone-maps)).
 
 `cache_entry_info` captures format identity — the resolved parquet **file set**, or the DuckDB
-**catalog.schema.table** — plus the cached columns (by storage index) and their names.
-`can_serve_with_columns(other)` returns a gather projection when this entry can serve a scan: same
-format, same identity, and a **column superset** of the scan's request. A Parquet pin never serves a
-DuckDB scan or vice versa. DuckDB cache serving additionally requires every projected column's
-current native cuDF mapping to equal the mapping recorded at pin time; a mismatch is a clean cache
-miss rather than a conversion of stale data under a new type.
+**catalog.schema.table plus the table's catalog object id** — plus the cached columns (by storage
+index) and their names. `can_serve_with_columns(other)` returns a gather projection when this entry
+can serve a scan: same format, same identity, and a **column superset** of the scan's request. A
+Parquet pin never serves a DuckDB scan or vice versa. DuckDB cache serving additionally requires
+every projected column's current native cuDF mapping to equal the mapping recorded at pin time; a
+mismatch is a clean cache miss rather than a conversion of stale data under a new type.
+
+The object id is the DuckDB identity's **incarnation** half. `DROP TABLE t; CREATE TABLE t (...)`
+rebuilds a different table under the same qualified name, and neither the name, the column layout
+nor the chunk shape tells the two apart — but DuckDB hands each catalog entry a fresh id from an
+instance-global monotonic counter and never reuses one, so requiring it to match pins each entry to
+exactly the table that was cached. A scan of a recreated table therefore misses the pin. Whether it
+may then fall through to a fresh disk-native read depends on the checkpoint generation: that path is
+MVCC-blind, so while the pin's checkpoint suppression still holds, the on-disk image is the dropped
+table's and the scan instead declines at plan time into the transparent CPU fallback. An explicit
+`CHECKPOINT` after the recreate rewrites that image to the live table, and the superseded pin
+becomes an ordinary clean miss served by a fresh read. Either way `CALL unpin_table(...)` then
+`pin_table` again to cache the new table.
 
 During `prepare_for_query`, `try_assign_cached_entries` matches each `GPU_SCAN` operator's `table_info` against the pinned entries. On a hit it builds a `cached_databatch_provider` over the matched entry, ordering columns by the ingestible's `materialized_column_order()` so a cached batch is laid out identically to a fresh disk read and `post_filter_and_project` resolves the same columns on both paths. The provider emits one cached chunk as one resident split and bypasses the fresh-read coalescer. Each split carries whether its selected columns are actually narrow, and `GPU_SCAN` normalizes that chunk to the query's planned physical schema (or the native logical schema when there is no override) before downstream operators can combine batches.
 
 ### Re-pin semantics
 
-For the GPU tier, `insert_pinned_entry` merges into an existing entry when the row count matches (adding only columns not already cached; per-chunk memory-space placement must match) and replaces it otherwise. The HOST tier always replaces, since each host chunk already holds every column.
+For the GPU tier, `insert_pinned_entry` merges into an existing entry when that entry reads the **same source** (`same_source_as`: same table incarnation, or same file set) and the row count matches — adding only columns not already cached, with per-chunk memory-space placement required to match — and replaces it otherwise. The identity half of that test is what stops a pin name reused across a `DROP`/`CREATE` from fusing two unrelated tables into one entry: an equally-sized different table passes every chunk-shape guard the merge applies. The HOST tier always replaces, since each host chunk already holds every column.
 
 ### MVCC under concurrent DML (duckdb pins)
 
