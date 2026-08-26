@@ -615,8 +615,9 @@ under `sirius.operator_params`, but it is not a normal session setting.
 Runtime distinct-build probing is also engine-owned and is temporarily disabled pending #1600.
 
 Dense count-join is enabled by default and can be disabled with
-`sirius.operator_params.enable_dense_count_join: false`. Both inputs are FULL barriers, so the
-inputs and workspace must fit one GPU task. Its histogram budget is engine-owned.
+`sirius.operator_params.enable_dense_count_join: false`. Both inputs are FULL barriers and are
+hash-partitioned on the join key, so one partition of each input plus its workspace must fit one
+GPU task. Its histogram budget is engine-owned and applies per partition task.
 
 ### GPU Admission
 

@@ -45,6 +45,7 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -59,6 +60,11 @@ namespace {
  *
  * The one fact shared by the dense-versus-sparse gate and no_history_peak_memory_estimate. The
  * estimator has no key domain, so this bound -- not the layout -- is what the two have in common.
+ *
+ * Both terms are measured over the one partition a task holds, and the budget is not divided by the
+ * partition count: hash partitioning gives every task the full key domain, so tasks replicate a
+ * full-width histogram rather than splitting one, and a smaller budget would drop the fused path
+ * without reclaiming the replication.
  */
 [[nodiscard]] std::size_t max_admitted_histogram_bytes(uint64_t max_bins_bytes,
                                                        std::size_t input_logical_bytes) noexcept
@@ -68,7 +74,13 @@ namespace {
                   sirius::memory::saturating_mul(4, input_logical_bytes));
 }
 
-/** @brief Whether a representable layout is also desirable: within budget and not sparse. */
+/** @brief Whether a representable layout is also desirable: within budget and not sparse.
+ *
+ * Hash partitioning divides the rows but not the key domain, so a task plans a full-width histogram
+ * over its share of the rows. Comparing that width against the rows of this task alone is
+ * deliberate: it holds the operator's total slot work to the same multiple of the row count
+ * whatever the partition count, which relaxing the row terms by the partition count would forfeit.
+ */
 [[nodiscard]] bool dense_admits(dense_count_layout const& layout,
                                 std::size_t non_null_preserved_rows,
                                 std::size_t total_input_rows,
@@ -523,13 +535,14 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
   }
 
   std::unique_ptr<cudf::table> output;
+  auto chosen = strategy::NOT_RUN;
   if (!min_max) {
-    _last_strategy = strategy::DENSE;
-    output         = make_null_group_table(key_type, semantics, preserved_null_keys, stream, mr);
+    chosen = strategy::DENSE;
+    output = make_null_group_table(key_type, semantics, preserved_null_keys, stream, mr);
   } else if (layout &&
              dense_admits(
                *layout, non_null_rows, total_rows, input_logical_bytes, _max_bins_bytes)) {
-    _last_strategy = strategy::DENSE;
+    chosen = strategy::DENSE;
     SIRIUS_LOG_INFO(
       "[dense_count_join] dense path: keys in [{}, {}] (range {}, {}-bit slots), preserved "
       "rows {} (null keys {}), counted rows {}",
@@ -549,7 +562,7 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
     }
     output = state.emit(key_type, semantics, preserved_null_keys, bounds, stream, mr);
   } else {
-    _last_strategy = strategy::SPARSE;
+    chosen = strategy::SPARSE;
     if (layout) {
       SIRIUS_LOG_INFO(
         "[dense_count_join] sparse path: keys in [{}, {}], range {}, histogram bytes {}, "
@@ -647,9 +660,10 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
     }
   }
 
+  _last_strategy.store(chosen, std::memory_order_relaxed);
   SIRIUS_LOG_INFO("[dense_count_join] emitted {} group rows ({} strategy)",
                   output->num_rows(),
-                  _last_strategy == strategy::DENSE ? "dense" : "sparse");
+                  chosen == strategy::DENSE ? "dense" : "sparse");
 
   std::vector<std::shared_ptr<::cucascade::data_batch>> results;
   results.push_back(sirius::make_data_batch(std::move(output), *space, stream, batch_telemetry()));

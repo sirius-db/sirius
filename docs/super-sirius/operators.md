@@ -352,7 +352,8 @@ Hash-based GROUP BY.
 Fuses eligible `COUNT(col | *) GROUP BY key` over a preserved-side outer equi-join, replacing the
 partitioned join and aggregate fragment. Children are normalized as [preserved, counted].
 
-Both inputs are FULL barriers. Execution uses direct-address histograms or exact sparse aggregation;
+Both inputs are FULL barriers and are hash-partitioned on the join key, and the operator runs one
+task per partition. Execution uses direct-address histograms or exact sparse aggregation;
 ineligible and disabled plans retain the standard path. See [Configuration](configuration.md) and
 [Fused Dense Count Join](optimizations.md#fused-dense-count-join-pr-1606) for the value rule, the
 dense-versus-sparse gate and the dense fast paths.

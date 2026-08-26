@@ -19,6 +19,7 @@
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <string_view>
@@ -80,9 +81,13 @@ class dense_count_join_input : public partitioned_operator_data {
  * keys form one group; both strategies derive the emitted COUNT value from the rule stated on
  * `sirius::op::dense_count_semantics`.
  *
- * Both inputs use FULL barriers and are drained into one task. Runtime uses direct-address
- * histograms when the observed key domain satisfies its layout, density, and memory gates;
- * otherwise it uses exact sparse aggregation. Both paths emit `[key, BIGINT count]`.
+ * Both inputs use FULL barriers and are hash-partitioned on the join key, and one task drains one
+ * partition of each side. That partitioning co-locates equal keys, including NULL keys, so a task
+ * sees every row of every key it sees and the per-task outputs concatenate without a merge step.
+ *
+ * Runtime uses direct-address histograms when the observed key domain satisfies its layout,
+ * density, and memory gates; otherwise it uses exact sparse aggregation. Both paths emit
+ * `[key, BIGINT count]`.
  */
 class sirius_physical_dense_count_join : public sirius_physical_partition_consumer_operator {
  public:
@@ -100,8 +105,8 @@ class sirius_physical_dense_count_join : public sirius_physical_partition_consum
    * @param counted_key_idx Join-key column within the counted child's output
    * @param counted_value_idx COUNT(col) argument within the counted child's output, or
    *        `std::nullopt` for COUNT(*)
-   * @param max_bins_bytes Maximum combined direct-address histogram allocation; the runtime density
-   *        and input-size gates may still select sparse aggregation below this limit
+   * @param max_bins_bytes Budget for one partition task's direct-address histograms; the runtime
+   *        density and input-size gates may still select sparse aggregation below it
    * @param hash_partition_bytes Configured per-partition byte target; get_partition_strategy
    *        doubles it because one task of this operator holds a partition of both inputs
    */
@@ -137,7 +142,7 @@ class sirius_physical_dense_count_join : public sirius_physical_partition_consum
     sirius_physical_operator const& producer) const override;
 
   /**
-   * @brief Aggregate all input batches into one `[key, BIGINT count]` batch
+   * @brief Aggregate one partition of each input into one `[key, BIGINT count]` batch
    *
    * Selects the dense or sparse strategy from the materialized inputs and records it in
    * `last_strategy()`.
@@ -167,7 +172,7 @@ class sirius_physical_dense_count_join : public sirius_physical_partition_consum
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
   /**
-   * @brief Wait for both producers to finish before scheduling the fused task
+   * @brief Wait for both producers to finish before scheduling any fused task
    *
    * Unlike the base implementation, this permits either input port to be empty so an empty counted
    * side can still produce the preserved groups.
@@ -178,9 +183,12 @@ class sirius_physical_dense_count_join : public sirius_physical_partition_consum
   std::optional<task_creation_hint> get_next_task_hint() override;
 
   /**
-   * @brief Drain both input repositories into one preserved-then-counted task input
+   * @brief Drain the next partition of both inputs into one preserved-then-counted task input
    *
-   * @return All queued batches as `dense_count_join_input`, or `nullptr` when both ports are empty
+   * Partitions holding no batches on either side are skipped rather than ending task creation.
+   *
+   * @return The partition's batches as `dense_count_join_input`, or `nullptr` once every
+   *         partition has been handed out
    */
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
@@ -216,15 +224,23 @@ class sirius_physical_dense_count_join : public sirius_physical_partition_consum
   }
   [[nodiscard]] uint64_t max_bins_bytes() const noexcept { return _max_bins_bytes; }
 
-  /** @brief Runtime implementation most recently selected by `execute()`. */
+  /** @brief Runtime implementation selected by an `execute()` call. */
   enum class strategy : uint8_t {
     NOT_RUN,  ///< No strategy has yet been selected
     DENSE,    ///< Direct-address path or the no-non-NULL-key shortcut
     SPARSE    ///< Exact groupby-and-join path
   };
 
-  /** @brief Return the strategy most recently selected by `execute()`. */
-  [[nodiscard]] strategy last_strategy() const noexcept { return _last_strategy; }
+  /**
+   * @brief Return the strategy chosen by whichever `execute()` call completed most recently
+   *
+   * Diagnostic only. Partition tasks run concurrently and each picks its own strategy, so this
+   * reports one arbitrary task's choice whenever more than one partition exists.
+   */
+  [[nodiscard]] strategy last_strategy() const noexcept
+  {
+    return _last_strategy.load(std::memory_order_relaxed);
+  }
 
  private:
   /// Number of partitions decided by get_partition_strategy, mirrored from the input repositories.
@@ -235,12 +251,12 @@ class sirius_physical_dense_count_join : public sirius_physical_partition_consum
   std::size_t _counted_key_idx;
   std::optional<std::size_t> _counted_value_idx;
   uint64_t _max_bins_bytes;
-  strategy _last_strategy = strategy::NOT_RUN;
+  /// Written by every task, read by nothing the operator decides on; see last_strategy().
+  std::atomic<strategy> _last_strategy{strategy::NOT_RUN};
   /// Next partition to hand to a task; guarded by the base `lock`.
   std::size_t _current_partition_index = 0;
-  /// Partition of the task that carried NULL preserved keys, once one has. Hash partitioning
-  /// co-locates null keys, so a *different* partition carrying them means the partitioning contract
-  /// broke and the output would carry duplicate NULL groups. The inner optional is empty in the
+  /// Partition of the task that carried NULL preserved keys, once one has; a *different* partition
+  /// carrying them means the co-location contract above broke. The inner optional is empty in the
   /// single-partition case, where the input is deliberately left untagged. Retrying the same
   /// partition after an OOM compares equal and is allowed. Guarded by the base `lock`.
   std::optional<std::optional<std::size_t>> _null_group_partition;
