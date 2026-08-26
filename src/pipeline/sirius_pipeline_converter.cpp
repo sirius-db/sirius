@@ -25,12 +25,14 @@
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
+#include "op/sirius_physical_dense_count_join.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "pipeline/repository_wiring.hpp"
+#include "sirius/exception.hpp"
 
 #include <algorithm>
 #include <functional>
@@ -187,71 +189,6 @@ duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> sirius_pipeline_converter::s
   return sirius_scheduled;
 }
 
-std::string_view sirius_pipeline_converter::resolve_port_id(
-  const op::sirius_physical_operator& sink, const op::sirius_physical_operator& /*parent*/)
-{
-  using T = op::SiriusPhysicalOperatorType;
-  // Build-side CONCATs feed the join's "build" port; everything else feeds "default".
-  if (sink.type == T::CONCAT) {
-    return sink.Cast<op::sirius_physical_concat>().is_build_concat() ? "build" : "default";
-  }
-  return "default";
-}
-
-op::MemoryBarrierType sirius_pipeline_converter::resolve_barrier(
-  const op::sirius_physical_operator& sink, const sirius_pipeline& dest)
-{
-  using T = op::SiriusPhysicalOperatorType;
-  // Sort sinks process batches as they arrive. GPU_SCAN is intentionally excluded
-  // (legacy gives it FULL/PARTIAL, not PIPELINE); SORT_SAMPLE is never a pipeline
-  // sink (it runs as an intermediate in the SORT_PARTITION pipeline).
-  if (sink.type == T::ORDER_BY) { return op::MemoryBarrierType::PIPELINE; }
-  // Producers that feed CONCAT can drain incrementally (PARTIAL); otherwise wait
-  // for the upstream pipeline to finish (FULL).
-  if (sink.type == T::PARTITION || sink.type == T::UNGROUPED_AGGREGATE || sink.type == T::TOP_N ||
-      sink.type == T::SORT_PARTITION) {
-    const auto ops                  = dest.get_operators();
-    const bool downstream_is_concat = (!ops.empty() && ops[0].get().type == T::CONCAT) ||
-                                      (dest.get_sink() && dest.get_sink()->type == T::CONCAT);
-    return downstream_is_concat ? op::MemoryBarrierType::PARTIAL : op::MemoryBarrierType::FULL;
-  }
-  // Probe-side PARTITION under a join streams batches → PARTIAL; build-side PARTITION is
-  // FULL (build must accumulate every partition before the probe can join). Aggregate-
-  // fanout PARTITIONs are also FULL — the merge operator needs every per-thread bucket.
-  // Join-feeders sit under a CONCAT (wrap_join_child's wrap chain); aggregate-fanouts sit
-  // under MERGE_GROUP_BY / GROUPED_AGGREGATE_MERGE. Exception: a RIGHT-family join sizes
-  // from the complete probe input (CONCAT retains the whole probe partition), so its probe
-  // PARTITION stays FULL — unless it is a RIGHT_DELIM_JOIN's internal join, which
-  // bootstraps its probe subtree from build-side distinct data.
-  if (dest.get_sink() && dest.get_sink()->type == T::PARTITION) {
-    auto& partition        = dest.get_sink()->Cast<op::sirius_physical_partition>();
-    auto* partition_parent = partition.get_parent_op();
-    const bool join_feeder = partition_parent != nullptr && partition_parent->type == T::CONCAT;
-    // Tree-parent walk: PARTITION -> CONCAT -> owning join (stamped at plan-gen).
-    auto* join = join_feeder ? partition_parent->get_parent_op() : nullptr;
-    const bool right_family_full =
-      join && join->type == T::HASH_JOIN &&
-      join->Cast<op::sirius_physical_hash_join>().is_right_family() &&
-      !(join->get_parent_op() && join->get_parent_op()->type == T::RIGHT_DELIM_JOIN);
-    if (!partition.is_build_partition() && join_feeder && !right_family_full) {
-      return op::MemoryBarrierType::PARTIAL;
-    }
-  }
-  // A CONCAT feeding a HASH_JOIN drives the join's own "build"/"default" input ports. Make those
-  // ports PARTIAL so the join consumes build and probe batches progressively (partial barrier)
-  // rather than waiting (via the base FULL-barrier hint) for both upstream pipelines to finish. The
-  // hash join's overridden get_next_task_hint / get_next_task_input_data schedule per-partition
-  // build x probe pairs as batches arrive; the concat still folds whichever side must be seen whole
-  // (LEFT/SEMI/ANTI -> build, RIGHT-family -> probe, OUTER -> both) to a single batch, so results
-  // stay correct for every join type. BUILD_PROBE mode is unaffected (it overrides its hint
-  // regardless of the port barrier). See docs/super-sirius/operators.md.
-  if (sink.type == T::CONCAT && sink.get_parent_op() &&
-      sink.get_parent_op()->type == T::HASH_JOIN) {
-    return op::MemoryBarrierType::PARTIAL;
-  }
-  return op::MemoryBarrierType::FULL;
-}
-
 void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_state& state)
 {
   // Lookup: operator -> the pipeline that starts at it, i.e. its operators[0]
@@ -270,11 +207,12 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
     scheduled_[i]->set_pipeline_id(i);
   }
 
-  auto emit = [&](std::string_view port_id,
-                  op::MemoryBarrierType barrier,
+  auto emit = [&](op::sirius_physical_operator const& consumer,
                   op::sirius_physical_operator* source_op,
                   const duckdb::shared_ptr<sirius_pipeline>& src,
                   const duckdb::shared_ptr<sirius_pipeline>& dst) {
+    auto const port_id = consumer.input_port_for(*source_op);
+    auto const barrier = consumer.input_barrier_for(*source_op);
     repository_wirings_.push_back({port_id, barrier, source_op, src, dst});
   };
 
@@ -296,10 +234,11 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
         auto it = state.cte_scan_consumers.find(cte_scan);
         if (it == state.cte_scan_consumers.end()) { continue; }
         auto dest_pipeline = it->second.get().shared_from_this();
-        // Per-consumer barrier: probe-side CTE_SCAN consumers resolve to PARTIAL via the
-        // join-feeder rule; build-side consumers resolve to FULL.
-        emit(
-          "default", resolve_barrier(*sink_op, *dest_pipeline), sink_op, pipeline, dest_pipeline);
+        auto* consumer     = cte_scan.get().get_parent_op();
+        if (consumer == nullptr) {
+          throw sirius::internal_exception("CTE_SCAN repository wiring has no logical consumer");
+        }
+        emit(*consumer, sink_op, pipeline, dest_pipeline);
       }
       continue;
     }
@@ -324,11 +263,7 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
         if (!branch) { continue; }
         auto it = dest_for_op.find(branch);
         if (it == dest_for_op.end()) { continue; }
-        emit(resolve_port_id(*sink_op, *branch),
-             resolve_barrier(*sink_op, *it->second),
-             sink_op,
-             pipeline,
-             it->second);
+        emit(*branch, sink_op, pipeline, it->second);
       }
       continue;
     }
@@ -344,11 +279,7 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
         if (!scan_parent) { continue; }
         auto cit = dest_for_op.find(scan_parent);
         if (cit == dest_for_op.end()) { continue; }
-        emit(resolve_port_id(*sink_op, *scan_parent),
-             resolve_barrier(*sink_op, *cit->second),
-             sink_op,
-             pipeline,
-             cit->second);
+        emit(*scan_parent, sink_op, pipeline, cit->second);
       }
       continue;
     }
@@ -367,11 +298,7 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
       if (grand) {
         auto it_gp = dest_for_op.find(grand);
         if (it_gp != dest_for_op.end()) {
-          emit(resolve_port_id(*sink_op, *grand),
-               resolve_barrier(*sink_op, *it_gp->second),
-               sink_op,
-               pipeline,
-               it_gp->second);
+          emit(*grand, sink_op, pipeline, it_gp->second);
           continue;
         }
       }
@@ -381,11 +308,7 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
     if (it == dest_for_op.end()) { continue; }
 
     const auto& dest = it->second;
-    emit(resolve_port_id(*sink_op, *parent_op),
-         resolve_barrier(*sink_op, *dest),
-         sink_op,
-         pipeline,
-         dest);
+    emit(*parent_op, sink_op, pipeline, dest);
   }
 }
 
@@ -436,8 +359,30 @@ void sirius_pipeline_converter::finalize_pipeline_structure()
 void sirius_pipeline_converter::link_join_partition_siblings()
 {
   for (const auto& pipeline : scheduled_) {
-    // Both join types get the same CONCAT/PARTITION build+probe wrap from `wrap_join`, and
-    // both can stream the probe, so the upstream→probe-partition edge is PARTIAL for both.
+    // DENSE_COUNT_JOIN feeds from bare PARTITIONs with no CONCAT between, so its dependencies are
+    // the partition pipelines directly. Sides are identified by is_build_partition() rather than
+    // by dependency position: dependency order follows build_pipelines' child order, which is not
+    // the same for this operator as for the joins below.
+    if (pipeline->source->type == op::SiriusPhysicalOperatorType::DENSE_COUNT_JOIN) {
+      if (pipeline->dependencies.size() != 2) { continue; }
+      auto* first  = pipeline->dependencies[0]->get_sink().get();
+      auto* second = pipeline->dependencies[1]->get_sink().get();
+      if (first == nullptr || second == nullptr ||
+          first->type != op::SiriusPhysicalOperatorType::PARTITION ||
+          second->type != op::SiriusPhysicalOperatorType::PARTITION) {
+        continue;
+      }
+      auto& first_partition  = first->Cast<op::sirius_physical_partition>();
+      auto& second_partition = second->Cast<op::sirius_physical_partition>();
+      // Exactly one side is the build (preserved) side; it drives the partition count.
+      D_ASSERT(first_partition.is_build_partition() != second_partition.is_build_partition());
+      first_partition.set_sibling_partition_op(&second_partition);
+      second_partition.set_sibling_partition_op(&first_partition);
+      continue;
+    }
+    // Both join types use the same CONCAT/PARTITION wrap. Probe input is PARTIAL except for
+    // right-family hash joins whose complete probe drives partition sizing; RIGHT_DELIM_JOIN
+    // inner joins use their build side instead.
     if (pipeline->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
         pipeline->source->type == op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
       auto build_concat_pipeline    = pipeline->dependencies[0];
@@ -450,10 +395,6 @@ void sirius_pipeline_converter::link_join_partition_siblings()
       D_ASSERT(
         build_concat_pipeline->get_sink()->type == op::SiriusPhysicalOperatorType::CONCAT &&
         build_concat_pipeline->get_sink()->Cast<op::sirius_physical_concat>().is_build_concat());
-      // A RIGHT_DELIM_JOIN's inner join bootstraps its probe subtree from build-side (distinct)
-      // data, so the build side drives the partition count. Detect it off the join's tree parent
-      // (the same predicate resolve_barrier uses), since the build partition is a plain PARTITION
-      // that the sink type alone does not distinguish.
       bool const inner_join_of_rdj =
         pipeline->source->get_parent_op() != nullptr &&
         pipeline->source->get_parent_op()->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN;

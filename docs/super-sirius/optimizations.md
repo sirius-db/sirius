@@ -130,6 +130,27 @@ In BUILD_PROBE mode, each partition's first task builds a `cudf::hash_join` hash
 
 **Config:** none (thresholds are internal). TPC-H SF1000 GB300 measured workload: q16 0.490 s -> 0.298 s.
 
+### Fused Dense Count Join (PR #1606)
+
+**Motivation:** A `COUNT(col | *) GROUP BY key` over a preserved-side outer equi-join on the same key materializes the whole join result only to collapse it again. The count is a pure cardinality product, so the joined rows never have to exist.
+
+**Mechanism:** `sirius_physical_dense_count_join` replaces the join-plus-aggregate fragment with two direct-address histograms over the preserved key domain: one holding each key's preserved-side multiplicity `P`, one holding its counted-side match count `M`. For a key with `V` matches whose COUNT argument is non-NULL, the emitted value is `P * max(M, 1)` for COUNT(*) and `P * V` for COUNT(col) — the rule `sirius::op::dense_count_semantics` states once for both strategies. Preserved-side NULL keys form a single group carrying the same formula at `M == 0`.
+
+The dense path is taken only when `dense_count_layout::plan` succeeds — the domain must be non-empty and not the full 64-bit range, `2 * slots * slot_bytes` must fit `size_t`, and `slots` must fit `int64_t` — and the domain is then dense enough to be worth direct addressing: `total_bytes() <= min(max_bins_bytes, 4 x input bytes)`, `slots <= 8 x non-NULL preserved rows`, and `slots <= 2 x total input rows`. Every term is measured over the one partition a task holds, and the budget is not divided by the partition count: hash partitioning gives every task the full key domain, so tasks replicate a full-width histogram rather than splitting one — a domain worth direct addressing over the whole input is rejected once it would have to be replicated per partition. Otherwise the operator falls back to exact sparse aggregation (per-batch groupby, balanced partial merge, left join, multiply).
+
+Slots are 32-bit unless either side has at least `UINT32_MAX` rows, in which case they widen to 64-bit. Narrow slots halve the per-key footprint and so double the key range admitted under the same `max_bins_bytes` budget.
+
+**Why this is not a group-by strategy:** direct addressing needs the key domain of everything a task will accumulate before the first row lands, which is why both inputs take FULL barriers. Both inputs are also hash-partitioned on the join key, so equal keys — NULL keys included — land in one partition: each task sizes its histogram from its own partition's preserved min/max, and the per-task outputs concatenate with no merge step. `sirius_physical_dense_count_join::execute` asserts that co-location at runtime, rejecting a second partition that arrives carrying NULL preserved keys. `gpu_aggregate_impl::local_grouped_aggregate` sees one batch of one table and has no min/max at all to size a histogram against.
+
+Two fast paths live inside the dense path. When every slot in the domain is occupied, the selected-group list is the identity permutation, so no gather map is built and the histogram reads stream instead of gathering; otherwise the map is sized from the exact group count, which a duplicate-heavy preserved side keeps far below both the domain and the row count. Below a 48 KiB shared-memory budget, and with at least eight rows per slot, accumulation privatizes the histogram per block to keep a low-cardinality domain off a handful of global atomic addresses.
+
+**Code path:**
+- `src/op/sirius_physical_dense_count_join.cpp` — strategy gate (`dense_admits`, `max_admitted_histogram_bytes`), sparse fallback
+- `src/cuda/dense_count_join_impl.cu` — histogram accumulation and emit kernels
+- `src/include/op/aggregate/dense_count_join_impl.hpp` — `dense_count_layout`, `dense_count_semantics`, `dense_count_bounds`, `dense_count_state`
+
+**Config:** `enable_dense_count_join` (default: `true`, see [Configuration](configuration.md)); the histogram byte budget is engine-internal and not user-tunable. Operator entry: [Operators](operators.md).
+
 ### Distinct Hash Join (PR #558)
 
 **Motivation:** `cudf::hash_join` does not exploit build-side uniqueness, performing unnecessary work for 1:1 joins.

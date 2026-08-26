@@ -46,6 +46,7 @@
 #include "log/logging.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
+#include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -198,6 +199,23 @@ static cudf::mark_join make_left_mark_join(cudf::table_view const& left_keys,
                                            rmm::cuda_stream_view stream)
 {
   return cudf::mark_join(left_keys, compare_nulls, cudf::join_prefilter::NO, stream);
+}
+
+std::string_view sirius_physical_hash_join::input_port_for(
+  sirius_physical_operator const& producer) const
+{
+  if (producer.type == SiriusPhysicalOperatorType::CONCAT) {
+    return producer.Cast<sirius_physical_concat>().is_build_concat() ? "build" : "default";
+  }
+  return sirius_physical_operator::input_port_for(producer);
+}
+
+MemoryBarrierType sirius_physical_hash_join::input_barrier_for(
+  sirius_physical_operator const& producer) const
+{
+  return producer.type == SiriusPhysicalOperatorType::CONCAT
+           ? MemoryBarrierType::PARTIAL
+           : sirius_physical_operator::input_barrier_for(producer);
 }
 
 bool sirius_physical_hash_join::is_join_type_supported(duckdb::JoinType join_type)
@@ -561,8 +579,8 @@ void sirius_physical_hash_join::build_join_pipelines(pipeline::sirius_pipeline& 
 void sirius_physical_hash_join::build_pipelines(pipeline::sirius_pipeline& current,
                                                 pipeline::sirius_meta_pipeline& meta_pipeline)
 {
-  // is_sink() is true iff the tree parent is a PARTITION (nested-join case); otherwise HJ
-  // contributes to the downstream chain's pipeline as its source.
+  // is_sink() is true iff the tree parent is a sink parent (PARTITION or DENSE_COUNT_JOIN);
+  // otherwise HJ contributes to the downstream chain's pipeline as its source.
   pipeline::sirius_meta_pipeline* host_meta;
   pipeline::sirius_pipeline* host_current;
   if (is_sink()) {
@@ -1753,8 +1771,17 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
     // With a single partition the task is tagged with operator_id (for cross-join GPU spread), so
     // map any tag back to the lone slot 0; with multiple partitions the tag is the real partition
     // index and selects its slot directly.
-    std::size_t const partition =
-      _partition_build_states.size() == 1 ? std::size_t{0} : partitioned->get_partition_idx();
+    std::size_t partition = 0;
+    if (_partition_build_states.size() != 1) {
+      auto const partition_idx = partitioned->get_partition_idx();
+      if (!partition_idx.has_value()) {
+        throw std::runtime_error(
+          "In sirius_physical_hash_join::execute: BUILD_PROBE input carries no partition index "
+          "but the join has " +
+          std::to_string(_partition_build_states.size()) + " build partitions");
+      }
+      partition = *partition_idx;
+    }
     if (partition >= _partition_build_states.size()) {
       throw std::runtime_error(
         "In sirius_physical_hash_join::execute: BUILD_PROBE partition index " +

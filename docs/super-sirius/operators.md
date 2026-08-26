@@ -27,7 +27,7 @@ An operator's position in a pipeline is determined by `sirius_engine::initialize
 | `execute(input_data, stream)` | Called on **every** operator during `compute_task()` |
 | `sink(output_data, stream)` | Called on the **last** operator after `compute_task()` to push results downstream |
 | `is_source()` | Whether this operator can produce data (has scan state or owns accumulated data) |
-| `is_sink()` | Whether this operator has a `sink()` implementation for pushing data to downstream ports |
+| `is_sink()` | Whether this operator has a `sink()` implementation for pushing data to downstream ports — true for unconditional sinks, or when the tree parent is a sink parent (PARTITION, RIGHT_DELIM_JOIN, DENSE_COUNT_JOIN) |
 | `get_next_task_hint()` | Checks port readiness, returns `READY` or `WAITING_FOR_INPUT_DATA` |
 | `get_next_task_input_data()` | Pops one data batch from each input port |
 | `can_create_more_tasks()` / `has_processed_all_tasks()` | Signals task exhaustion |
@@ -238,7 +238,7 @@ By execution time every equality-condition side is a plain column reference: a c
 
 #### Partial-barrier scheduling (STANDARD / MIXED_JOIN)
 
-The join's own `build` and `default`/probe input ports are **PARTIAL** barriers (stamped in `resolve_barrier` for the `CONCAT → HASH_JOIN` edge). Batches arrive progressively on each side, and `get_next_task_hint` / `get_next_task_input_data` schedule per-partition **build × probe** cross-product pairs as they become available (state tracked in `partition_cross_schedule`, guarded by `op_state_mutex`), freeing each batch once it has been paired with every batch of a finished opposite side. This mirrors how BUILD_PROBE already streams its probe side; BUILD_PROBE is unaffected by the port barrier because it overrides its hint regardless.
+The join's own `build` and `default`/probe input ports are **PARTIAL** barriers (owned by the HASH_JOIN `input_port_for` / `input_barrier_for` hooks for `CONCAT → HASH_JOIN` edges). Batches arrive progressively on each side, and `get_next_task_hint` / `get_next_task_input_data` schedule per-partition **build × probe** cross-product pairs as they become available (state tracked in `partition_cross_schedule`, guarded by `op_state_mutex`), freeing each batch once it has been paired with every batch of a finished opposite side. This mirrors how BUILD_PROBE already streams its probe side; BUILD_PROBE is unaffected by the port barrier because it overrides its hint regardless.
 
 Joining each build batch against each probe batch and unioning the results is only *inherently* correct for INNER. For every other join type, `sirius_physical_concat` folds the side that must be seen whole into a **single batch** (an implicit full barrier), so the streamed side is joined against that one folded batch — correct for all types. `refresh_cross_schedule` asserts this "whole side stays one batch" invariant and throws if a concat regression ever violates it.
 
@@ -345,6 +345,26 @@ Hash-based GROUP BY.
 - **COUNT(DISTINCT):** Implemented via `COLLECT_SET` aggregation with struct column synthesis
 - **Label-encoded group keys:** when a COLLECT_SET aggregation is present, the input has at least 1,048,576 rows, the non-nested key is not already a single null-free fixed-width column, and an HLL estimate puts group cardinality below 1% of rows, distinct key rows are sorted lexicographically with nulls last and installed as the build side of a `cudf::distinct_hash_join`. Probing the original rows yields their dense sorted-key indices, so cuDF's `stable_sorted_order` takes its single-column INT32 radix path; representative keys are recovered by a gather at group cardinality. A single nullable or variable-width key can therefore qualify, as can a multi-column key. Non-fatal label construction failures fall back to the original key columns, and an active label path bypasses STRING dictionary encoding.
 - **Key members:** `group_idx`, `cudf_aggregates`, `cudf_aggregate_idx`, `aggregate_slots`, `has_avg`, `has_count_distinct`
+
+### `sirius_physical_dense_count_join` — `DENSE_COUNT_JOIN`
+**File:** `src/include/op/sirius_physical_dense_count_join.hpp`, `src/op/sirius_physical_dense_count_join.cpp`, kernels in `src/cuda/dense_count_join_impl.cu`
+
+Fuses eligible `COUNT(col | *) GROUP BY key` over a preserved-side outer equi-join, replacing the
+partitioned join and aggregate fragment. Children are normalized as [preserved, counted].
+
+Both inputs are FULL barriers and are hash-partitioned on the join key, and the operator runs one
+task per partition. Execution uses direct-address histograms or exact sparse aggregation;
+ineligible and disabled plans retain the standard path. See [Configuration](configuration.md) and
+[Fused Dense Count Join](optimizations.md#fused-dense-count-join-pr-1606) for the value rule, the
+dense-versus-sparse gate and the dense fast paths.
+
+DENSE_COUNT_JOIN is a sink parent: each direct child reports `is_sink()` and terminates its own
+pipeline through the generic `build_pipelines()` protocol, so scans, streaming chains, joins,
+aggregates and sorts can feed either input; the counted producer is built first. Delim-join,
+materialized-CTE and delim/CTE scan roots are declined at plan time because their output does not
+arrive through a child-owned pipeline, and a delim join is declined at any depth of an input
+because the operator's task hint can poll a MARK hash join inside the delim subtree before its
+sizing partitions have run.
 
 ## Pipeline Breakers (Sirius-Specific)
 
@@ -466,6 +486,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | MERGE_AGGREGATE | Agg | Merge ungrouped partitions |
 | MERGE_GROUP_BY | Agg | Merge grouped partitions |
 | HASH_JOIN | Join | `cudf::{inner,left,right,outer}_join()`, `cudf::distinct_hash_join`, or `cudf::{filtered,mark}_join` (MARK) |
+| DENSE_COUNT_JOIN | Join+Agg | Fused dense/sparse COUNT over an outer join |
 | NESTED_LOOP_JOIN | Join | Fallback nested loops |
 | LEFT_DELIM_JOIN | Join | Correlated subquery wrapper |
 | RIGHT_DELIM_JOIN | Join | Correlated subquery wrapper |

@@ -2385,6 +2385,29 @@ static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
                    params->enable_runtime_distinct_build_probe);
 }
 
+static void SetEnableDenseCountJoin(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                       = lock_operator_params_slot(context);
+  params->enable_dense_count_join = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DENSE_COUNT_JOIN to {}", params->enable_dense_count_join);
+}
+
+static void SetDenseCountJoinMaxBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const bytes = UBigIntValue::Get(parameter);
+  if (bytes == 0) {
+    throw InvalidInputException("dense_count_join_max_bytes must be greater than zero");
+  }
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                          = lock_operator_params_slot(context);
+  params->dense_count_join_max_bytes = bytes;
+  SIRIUS_LOG_DEBUG("Updated config DENSE_COUNT_JOIN_MAX_BYTES to {}",
+                   params->dense_count_join_max_bytes);
+}
+
 static void SetEnableDynamicFilter(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2648,6 +2671,20 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_runtime_distinct_build_probe),
                     SetEnableRuntimeDistinctBuildProbe);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_dense_count_join",
+                    "runtime override for dense count-join planning",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_dense_count_join),
+                    SetEnableDenseCountJoin);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "dense_count_join_max_bytes",
+                    "internal test hook for the dense count-join histogram budget",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(operator_defaults.dense_count_join_max_bytes),
+                    SetDenseCountJoinMaxBytes);
   add_sirius_option(config,
                     option_visibility::internal,
                     "concat_batch_bytes",

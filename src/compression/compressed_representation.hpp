@@ -17,6 +17,7 @@
 #pragma once
 
 #include "compressed_scan.hpp"
+#include "compression/simpatico_compressed_representation.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
@@ -103,7 +104,7 @@ void copy_pinned_blocks_to_device(
  * Multiple compressed_host_representation objects may share the same underlying
  * blob (e.g. after select_columns() or clone()).
  */
-class compressed_host_representation : public cucascade::idata_representation {
+class compressed_host_representation : public simpatico_compressed_representation {
  public:
   /**
    * @brief Construct a compressed_host_representation owning a share of @p blob.
@@ -247,7 +248,7 @@ class compressed_host_representation : public cucascade::idata_representation {
  * simpatico::decompress() directly on the cached table, decompressing only the selected
  * columns when a projection is set.
  */
-class compressed_device_representation : public cucascade::idata_representation {
+class compressed_device_representation : public simpatico_compressed_representation {
  public:
   compressed_device_representation(
     cucascade::memory::memory_space& memory_space,

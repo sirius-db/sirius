@@ -21,6 +21,7 @@
 #include <data/sirius_converter_registry.hpp>
 #include <helper/numeric_narrowing.hpp>
 #include <log/logging.hpp>
+#include <memory/size_arithmetic.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/sirius_gpu_scan_operator.hpp>
@@ -50,7 +51,6 @@
 // standard library
 #include <algorithm>
 #include <cstdint>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -60,6 +60,9 @@
 namespace sirius::op::scan {
 namespace {
 constexpr std::size_t kMaxNumericCarrierExpansion = 8;
+
+using sirius::memory::saturating_add;
+using sirius::memory::saturating_mul;
 
 /// Emit the deferred positions as a rowid and placeholders instead of values.
 ///
@@ -174,19 +177,6 @@ std::unique_ptr<cudf::table> substitute_deferred_columns(
     columns[position] = cudf::make_column_from_scalar(zero, rows, stream, mr);
   }
   return std::make_unique<cudf::table>(std::move(columns));
-}
-
-constexpr std::size_t saturating_add(std::size_t lhs, std::size_t rhs) noexcept
-{
-  auto const max = std::numeric_limits<std::size_t>::max();
-  return rhs > max - lhs ? max : lhs + rhs;
-}
-
-constexpr std::size_t saturating_mul(std::size_t value, std::size_t factor) noexcept
-{
-  auto const max = std::numeric_limits<std::size_t>::max();
-  if (value == 0 || factor == 0) { return 0; }
-  return value > max / factor ? max : value * factor;
 }
 
 enum class carrier_conversion_kind : uint8_t { NONE, RESTORE, NARROW };

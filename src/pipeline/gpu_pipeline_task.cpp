@@ -20,6 +20,7 @@
 #include "late_mat/port_materialize.hpp"
 #include "log/logging.hpp"
 #include "memory/defragmenter_oom_policy.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
@@ -134,7 +135,7 @@ void log_operator_data(const op::sirius_physical_operator& op,
       if (batch.get_data()) {
         auto view = get_cudf_table_view(batch);
         batch_rows += std::to_string(view.num_rows()) + "  ";
-        total_bytes += batch.get_data()->get_size_in_bytes();
+        total_bytes = memory::saturating_add(total_bytes, batch.get_data()->get_size_in_bytes());
       }
     }
   } else {
@@ -313,7 +314,9 @@ std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_in
       const bool non_gpu     = ro.get_current_tier() != cucascade::memory::Tier::GPU;
       const bool cross_space = target_space != nullptr && ro.get_memory_space() != nullptr &&
                                ro.get_memory_space()->get_id() != target_space->get_id();
-      if (non_gpu || cross_space) { input_size += peak_materialization_bytes(ro.get_data()); }
+      if (non_gpu || cross_space) {
+        input_size = memory::saturating_add(input_size, peak_materialization_bytes(ro.get_data()));
+      }
     }
   }
   return input_size;
@@ -440,13 +443,18 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
       }
       size_t requested_bytes = 0;
       size_t global_usage    = 0;
+      std::optional<std::size_t> retry_requested_bytes;
       if (auto const* cc_oom =
             dynamic_cast<const cucascade::memory::cucascade_out_of_memory*>(&oom)) {
-        requested_bytes = cc_oom->requested_bytes;
-        global_usage    = cc_oom->global_usage;
+        requested_bytes       = cc_oom->requested_bytes;
+        global_usage          = cc_oom->global_usage;
+        retry_requested_bytes = requested_bytes;
       }
       size_t reservation_bytes =
         _local_state->cast<gpu_pipeline_task_local_state>().get_reservation_bytes();
+      auto const live_allocated_bytes = _allocator ? _allocator->get_allocated_bytes(stream) : 0;
+      local_state.update_retry_reservation_floor_after_oom(
+        reservation_bytes, live_allocated_bytes, retry_requested_bytes);
       SIRIUS_LOG_WARN(
         "Pipeline {}: OOM at operator {} (id={}, index {}/{}), "
         "requested {} bytes ({:.2f} MB), global usage {} bytes ({:.2f} MB), "
@@ -628,7 +636,15 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     // is accurate.
     stream.synchronize();
   } catch (const rmm::out_of_memory& oom) {
-    auto peak_bytes           = allocator->get_peak_allocated_bytes(stream);
+    auto peak_bytes = allocator->get_peak_allocated_bytes(stream);
+    std::optional<std::size_t> retry_requested_bytes;
+    if (auto const* cc_oom =
+          dynamic_cast<const cucascade::memory::cucascade_out_of_memory*>(&oom)) {
+      retry_requested_bytes = cc_oom->requested_bytes;
+    }
+    auto const live_allocated_bytes = allocator->get_allocated_bytes(stream);
+    local_state.update_retry_reservation_floor_after_oom(
+      reservation_bytes, live_allocated_bytes, retry_requested_bytes);
     const auto& res_info      = local_state.get_reservation_size_info();
     auto bytes_to_materialize = res_info->bytes_to_materialize_input;
     auto input_basis          = res_info->input_basis;
@@ -753,7 +769,8 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
       dynamic_cast<const op::pipelineable_operator_data*>(output_data.get());
     if (pipelineable_output) {
       for (const auto& batch : pipelineable_output->get_read_only_batches(false)) {
-        output_bytes += batch.get_data()->get_size_in_bytes();
+        if (!batch.get_data()) { continue; }
+        output_bytes = memory::saturating_add(output_bytes, batch.get_data()->get_size_in_bytes());
       }
     }
     auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
@@ -787,7 +804,8 @@ std::size_t gpu_pipeline_task::get_input_size() const
     dynamic_cast<const op::pipelineable_operator_data*>(local_state._input_data.get());
   if (!pipelineable_input) { return 0; }
   for (const auto& batch : pipelineable_input->get_read_only_batches(false)) {
-    input_size += batch.get_data()->get_size_in_bytes();
+    if (!batch.get_data()) { continue; }
+    input_size = memory::saturating_add(input_size, batch.get_data()->get_size_in_bytes());
   }
   return input_size;
 }
@@ -834,6 +852,7 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
   pipeline::reservation_size_info info;
   info.input_basis                = input_basis;
   info.bytes_to_materialize_input = bytes_to_materialize;
+  info.retry_reservation_floor    = ls.get_retry_reservation_floor();
   info.had_history                = peak_opt.has_value();
 
   if (peak_opt.has_value()) {
@@ -858,10 +877,13 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
       }
     }
     // Preserve the task-level 2× fallback when no operator supplies a positive estimate.
-    info.peak_memory_estimate = (max_estimate > 0) ? max_estimate : (input_basis * 2);
+    info.peak_memory_estimate =
+      (max_estimate > 0) ? max_estimate : memory::saturating_mul(input_basis, 2);
   }
 
-  info.reservation_size = info.peak_memory_estimate + bytes_to_materialize;
+  auto const normal_reservation =
+    memory::saturating_add(info.peak_memory_estimate, bytes_to_materialize);
+  info.reservation_size = std::max(normal_reservation, info.retry_reservation_floor);
   return info;
 }
 

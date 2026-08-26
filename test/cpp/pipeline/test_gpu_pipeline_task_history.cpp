@@ -24,6 +24,7 @@
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
+#include "pipeline/pipeline_memory_history.hpp"
 #include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
@@ -52,8 +53,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <vector>
 
 namespace {
@@ -94,20 +97,44 @@ class stub_operator : public sirius::op::sirius_physical_operator {
 
   bool is_sink() const override { return acts_as_sink; }
 
+  [[nodiscard]] std::size_t no_history_peak_memory_estimate(
+    const sirius::op::input_stats& stats) const override
+  {
+    if (no_history_estimate_override) { return *no_history_estimate_override; }
+    return sirius_physical_operator::no_history_peak_memory_estimate(stats);
+  }
+
   execute_fn on_execute;
   sink_fn on_sink;
+  std::optional<std::size_t> no_history_estimate_override;
   bool acts_as_sink = false;
+};
+
+class sized_input : public sirius::op::operator_data {
+ public:
+  explicit sized_input(std::size_t bytes) : bytes_(bytes) {}
+
+  [[nodiscard]] sirius::op::operator_data_type get_type() const override
+  {
+    return sirius::op::operator_data_type::BASE;
+  }
+  [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override { return bytes_; }
+
+ private:
+  std::size_t bytes_;
 };
 
 // Minimal idata_representation stub that reports different compressed vs uncompressed
 // sizes without requiring the full compressed_host_representation infrastructure.
 // Used to test the peak_materialization_bytes logic in get_estimated_bytes_to_materialize_input.
-class fake_compressed_representation : public cucascade::idata_representation {
+class fake_compressed_representation : public sirius::simpatico_compressed_representation {
  public:
   fake_compressed_representation(cucascade::memory::memory_space& host_space,
                                  std::size_t compressed,
                                  std::size_t uncompressed)
-    : idata_representation(host_space), compressed_(compressed), uncompressed_(uncompressed)
+    : simpatico_compressed_representation(host_space),
+      compressed_(compressed),
+      uncompressed_(uncompressed)
   {
   }
   [[nodiscard]] std::size_t get_size_in_bytes() const override { return compressed_; }
@@ -124,6 +151,30 @@ class fake_compressed_representation : public cucascade::idata_representation {
  private:
   std::size_t compressed_;
   std::size_t uncompressed_;
+};
+
+class fake_noncompressed_representation : public cucascade::idata_representation {
+ public:
+  fake_noncompressed_representation(cucascade::memory::memory_space& host_space,
+                                    std::size_t physical,
+                                    std::size_t logical)
+    : idata_representation(host_space), physical_(physical), logical_(logical)
+  {
+  }
+  [[nodiscard]] std::size_t get_size_in_bytes() const override { return physical_; }
+  [[nodiscard]] std::size_t get_uncompressed_data_size_in_bytes() const override
+  {
+    return logical_;
+  }
+  [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
+    rmm::cuda_stream_view) override
+  {
+    return nullptr;
+  }
+
+ private:
+  std::size_t physical_;
+  std::size_t logical_;
 };
 
 class scan_sizing_input : public sirius::op::operator_data {
@@ -481,6 +532,137 @@ std::shared_ptr<cucascade::data_batch> make_riding_batch(std::size_t num_rows,
 }
 
 }  // namespace
+
+TEST_CASE("materialization peak classifies Simpatico compression by representation type",
+          "[gpu_pipeline_task][materialization][compression]")
+{
+  pipeline_task_history_fixture fixture;
+  if (!fixture.setup()) {
+    WARN("Skipping test — no GPU available");
+    return;
+  }
+
+  fake_compressed_representation compressed_smaller{*fixture.host_space, 100, 400};
+  fake_compressed_representation compressed_equal{*fixture.host_space, 400, 400};
+  fake_compressed_representation compressed_expanded{*fixture.host_space, 600, 400};
+  fake_compressed_representation compressed_saturated{
+    *fixture.host_space, std::numeric_limits<std::size_t>::max(), 1};
+  fake_noncompressed_representation ordinary_smaller{*fixture.host_space, 100, 400};
+  fake_noncompressed_representation ordinary_expanded{*fixture.host_space, 600, 400};
+
+  CHECK(sirius::peak_materialization_bytes(&compressed_smaller) == 500);
+  CHECK(sirius::peak_materialization_bytes(&compressed_equal) == 800);
+  CHECK(sirius::peak_materialization_bytes(&compressed_expanded) == 1000);
+  CHECK(sirius::peak_materialization_bytes(&compressed_saturated) ==
+        std::numeric_limits<std::size_t>::max());
+  CHECK(sirius::peak_materialization_bytes(&ordinary_smaller) == 400);
+  CHECK(sirius::peak_materialization_bytes(&ordinary_expanded) == 400);
+}
+
+TEST_CASE("pipeline memory history clamps extrapolated estimates",
+          "[pipeline_memory_history][history][estimation]")
+{
+  SECTION("ordinary estimates preserve ratio scaling")
+  {
+    sirius::pipeline::pipeline_memory_history history;
+    history.record({100, 250, 100});
+
+    auto const estimate = history.estimate_peak_memory(200);
+    REQUIRE(estimate.has_value());
+    CHECK(*estimate == 500);
+  }
+
+  SECTION("huge peak ratios saturate at size max")
+  {
+    constexpr auto max_size = std::numeric_limits<std::size_t>::max();
+    sirius::pipeline::pipeline_memory_history history;
+    history.record({1, max_size, 1});
+
+    auto const estimate = history.estimate_peak_memory(max_size);
+    REQUIRE(estimate.has_value());
+    CHECK(*estimate == max_size);
+  }
+}
+
+TEST_CASE("gpu pipeline reservation estimates saturate instead of wrapping",
+          "[gpu_pipeline_task][history][estimation]")
+{
+  constexpr auto max_size = std::numeric_limits<std::size_t>::max();
+
+  SECTION("default operator multiplication saturates")
+  {
+    auto ctx          = create_pipeline_context();
+    auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+      ctx.pipeline, sirius::test::make_test_telemetry_context());
+    auto task = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
+      1,
+      std::vector<cucascade::shared_data_repository*>{},
+      std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(
+        std::make_unique<sized_input>(max_size / 2 + 1)),
+      std::move(global_state));
+
+    auto const estimate = task->get_estimated_reservation_size_info(nullptr);
+    CHECK_FALSE(estimate.had_history);
+    CHECK(estimate.peak_memory_estimate == max_size);
+    CHECK(estimate.reservation_size == max_size);
+  }
+
+  SECTION("history peak plus materialization saturates")
+  {
+    pipeline_task_history_fixture fixture;
+    if (!fixture.setup()) {
+      WARN("Skipping test — no GPU available");
+      return;
+    }
+
+    constexpr auto large_size = max_size / 2 + 1;
+    auto ctx                  = create_pipeline_context();
+    auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+      ctx.pipeline, sirius::test::make_test_telemetry_context());
+    global_state->get_memory_history().record({large_size, large_size, large_size});
+    auto batch = fixture.create_compressed_host_data_batch(1, large_size);
+    auto task  = create_pipeline_task(fixture, global_state, std::move(batch), 0, 1);
+
+    auto const estimate = task->get_estimated_reservation_size_info(nullptr);
+    CHECK(estimate.had_history);
+    CHECK(estimate.peak_memory_estimate == large_size);
+    CHECK(estimate.bytes_to_materialize_input == large_size + 1);
+    CHECK(estimate.reservation_size == max_size);
+  }
+
+  SECTION("reported representation sizes saturate before reservation arithmetic")
+  {
+    pipeline_task_history_fixture fixture;
+    if (!fixture.setup()) {
+      WARN("Skipping test — no GPU available");
+      return;
+    }
+
+    constexpr auto large_size = max_size / 2 + 1;
+    fake_compressed_representation compressed_representation{
+      *fixture.host_space, max_size / 2, max_size / 2 + 2};
+    CHECK(sirius::peak_materialization_bytes(&compressed_representation) == max_size);
+
+    std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+    batches.push_back(fixture.create_compressed_host_data_batch(large_size, large_size));
+    batches.push_back(fixture.create_compressed_host_data_batch(large_size, large_size));
+    auto input = std::make_unique<sirius::op::pipelineable_operator_data>(std::move(batches));
+    auto local_state =
+      std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(input));
+    CHECK(local_state->get_estimated_bytes_to_materialize_input(nullptr) == max_size);
+    CHECK(local_state->get_task_consumption_basis() == max_size);
+
+    auto ctx          = create_pipeline_context();
+    auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+      ctx.pipeline, sirius::test::make_test_telemetry_context());
+    auto task = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
+      1,
+      std::vector<cucascade::shared_data_repository*>{},
+      std::move(local_state),
+      std::move(global_state));
+    CHECK(task->get_input_size() == max_size);
+  }
+}
 
 TEST_CASE("cached scan input materialization contributes to task reservations",
           "[gpu_pipeline_task][history][scan]")
@@ -1131,4 +1313,46 @@ TEST_CASE("record_on_failure deduplicates OOM records and keeps max peak",
   }
 
   REQUIRE(global_state->get_memory_history().size() == 2);
+}
+
+TEST_CASE("retry reservation floor grows and survives reschedule",
+          "[gpu_pipeline_task][reservation][retry]")
+{
+  constexpr std::size_t kMiB = 1024 * 1024;
+  auto ctx                   = create_pipeline_context();
+  auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+    ctx.pipeline, sirius::test::make_test_telemetry_context());
+
+  auto original_state = std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(
+    std::make_unique<sized_input>(128));
+  auto* original_state_ptr = original_state.get();
+  original_state_ptr->update_retry_reservation_floor_after_oom(256, 64, std::nullopt);
+  auto const first_floor = original_state_ptr->get_retry_reservation_floor();
+  CHECK(first_floor == kMiB + 64);
+
+  auto task = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
+    1, std::vector<cucascade::shared_data_repository*>{}, std::move(original_state), global_state);
+  auto const first_estimate = task->get_estimated_reservation_size_info(nullptr);
+  CHECK(first_estimate.retry_reservation_floor == first_floor);
+  CHECK(first_estimate.reservation_size == first_floor);
+
+  original_state_ptr->update_retry_reservation_floor_after_oom(
+    first_floor, 2 * kMiB, std::optional<std::size_t>{3 * kMiB});
+  auto const second_floor = original_state_ptr->get_retry_reservation_floor();
+  CHECK(second_floor > first_floor);
+  CHECK(second_floor == 5 * kMiB);
+  CHECK(task->get_estimated_reservation_size_info(nullptr).reservation_size == second_floor);
+
+  auto retry_state = std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(
+    std::make_unique<sized_input>(128));
+  retry_state->inherit_retry_reservation_floor(*original_state_ptr);
+  CHECK(retry_state->get_retry_reservation_floor() == second_floor);
+  auto retry_task = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
+    2,
+    std::vector<cucascade::shared_data_repository*>{},
+    std::move(retry_state),
+    std::move(global_state));
+  auto const retry_estimate = retry_task->get_estimated_reservation_size_info(nullptr);
+  CHECK(retry_estimate.retry_reservation_floor == second_floor);
+  CHECK(retry_estimate.reservation_size == second_floor);
 }
