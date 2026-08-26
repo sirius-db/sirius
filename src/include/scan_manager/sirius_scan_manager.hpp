@@ -22,6 +22,7 @@
 #include "io/datasource_factory.hpp"
 #include "io/s3/s3_list_parser.hpp"
 #include "io/sirius_datasource.hpp"
+#include "late_mat/column_origin.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "pin_table.hpp"
 #include "scan_manager/config.hpp"
@@ -220,6 +221,20 @@ struct pinned_entry {
   /// capture was statless or degraded; see @ref pinned_zone_maps for the
   /// invariant and merge semantics.
   pinned_zone_maps zone_maps;
+  /// Late-mat uniqueness proof, positional with @c cache_info.column_ids: true =
+  /// the column's values were proven distinct across the whole pinned table at
+  /// pin time (see @c late_mat::unique_probe). A false — or an empty vector —
+  /// means UNKNOWN, never "known duplicated": the fact only ever unlocks an
+  /// optimization, so absence must cost speed, not correctness. Attached by
+  /// @ref attach_proven_unique_columns after insert, BY NAME, because the merge
+  /// path appends columns and a positional attach would then describe the wrong
+  /// ones.
+  std::vector<bool> proven_unique_columns;
+  /// Generation-checked handle for late materialization: what a deferred
+  /// column holds instead of a pointer to this entry, so an unpin or a
+  /// replacing re-pin makes every outstanding origin fail closed rather than
+  /// dangle. Null unless the late-mat gate is on.
+  std::shared_ptr<late_mat::pin_entry_handle> late_mat_handle;
   /// MVCC snapshot metadata for duckdb-native pins, attached by
   /// @ref sirius_scan_manager::attach_mvcc_metadata right after insert. nullptr
   /// for parquet pins (immutable sources need no visibility reconciliation).
@@ -499,7 +514,13 @@ class sirius_scan_manager {
   /// \param column_storage        Chunk-major stored-column metadata as the pin driver
   ///                              recorded it; must cover every chunk and cached column. A
   ///                              recorded carrier that contradicts a stored column type throws.
-  void insert_pinned_entry(
+  /// \return The names of the columns whose data this call actually STORED. On the replace
+  ///         path that is every column; on the merge path it is only the newly added ones —
+  ///         a column already cached keeps its previous chunks and the incoming ones are
+  ///         dropped, so anything derived from this materialization (uniqueness verdicts,
+  ///         say) describes data that never entered the cache. See
+  ///         @ref attach_proven_unique_columns.
+  [[nodiscard]] std::vector<std::string> insert_pinned_entry(
     const std::string& name,
     cache_entry_info cache_info,
     std::vector<std::unique_ptr<cudf::table>> data_tables,
@@ -582,6 +603,31 @@ class sirius_scan_manager {
   /// materializations whose per-chunk row counts differ from the existing
   /// chunks'. Throws std::invalid_argument when no entry exists for @p name.
   void attach_mvcc_metadata(const std::string& name, duckdb_mvcc_metadata metadata);
+
+  /// \brief Record which of @p name 's pinned columns were proven distinct at pin time.
+  ///
+  /// Called by every pin path right after its insert. Takes NAMES, not
+  /// positions: a re-pin that merges into an existing entry appends its new
+  /// columns to the entry's own order, which is not the incoming pin's order,
+  /// so a positional attach could mark the wrong column unique — and a false
+  /// positive here is wrong query results, not a slow query.
+  ///
+  /// Facts are OR-ed in and never cleared: a merge leaves the already-pinned
+  /// columns' data untouched, so a proof taken against THAT data still holds,
+  /// while a replacing re-pin builds a fresh entry with no facts at all. Names
+  /// absent from @p unique_column_names are left as they were — absence is
+  /// "unknown", so nothing is asserted by omission. A name that matches no
+  /// pinned column is ignored. Throws std::invalid_argument when no entry
+  /// exists for @p name.
+  ///
+  /// The caller must pass only columns whose data the accompanying insert
+  /// actually STORED (@ref insert_pinned_entry returns exactly that set). A
+  /// verdict describes the values the pin driver read; the merge path keeps an
+  /// already-cached column's earlier chunks and drops the incoming ones, so
+  /// attaching that verdict to the retained column would assert distinctness
+  /// about bytes nothing ever examined — and this flag admits a group key.
+  void attach_proven_unique_columns(const std::string& name,
+                                    std::span<std::string const> unique_column_names);
 
   /// \brief Remove the pinned entry for @p name. No-op if absent.
   void remove_pinned_entry(const std::string& name);
@@ -693,6 +739,17 @@ class sirius_scan_manager {
   std::vector<op::scan::sirius_gpu_scan_operator*> _scan_op_order;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
   bool _pruning_enabled{true};
+  /// Source of pin generations. Never 0 — that value means "invalidated", so
+  /// an origin holding it can never resolve.
+  std::atomic<late_mat::pin_generation_t> _next_pin_generation{1};
+
+  /// Give the entry now living at @p name a fresh late-mat handle, and
+  /// invalidate whatever handle it is replacing. Called after every insert;
+  /// a no-op when the late-mat gate is off.
+  void publish_late_mat_handle(const std::string& name);
+  /// Invalidate the handle of the entry at @p name, if any — every outstanding
+  /// origin against it then fails closed. Called before it is erased.
+  void retire_late_mat_handle(const std::string& name);
 
   /// One mask computation per distinct pinned entry matched this query
   /// (recorded by try_match_cached_entry, deduped by entry name); executed

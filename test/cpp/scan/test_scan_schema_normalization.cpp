@@ -158,7 +158,9 @@ class stub_ingestible final : public sirius::op::scan::gpu_ingestible {
     const cucascade::memory::memory_space&,
     rmm::cuda_stream_view,
     bool,
-    std::shared_ptr<const sirius::like_multiliteral_cache>) override
+    std::shared_ptr<const sirius::like_multiliteral_cache>,
+    std::unique_ptr<cudf::column>*,
+    std::span<std::size_t const> /*elided*/) override
   {
     return _produce();
   }
@@ -208,6 +210,20 @@ sirius::op::scan::sirius_gpu_scan_operator make_bigint_scan(
 constexpr std::size_t kRows = 8;
 
 }  // namespace
+
+TEST_CASE("an ingestible cannot report survivors until it says so", "[scan][late_mat]")
+{
+  // A late-materialization rowid over a FILTERED scan is built from the surviving row positions,
+  // and only an ingestible that populates the out-parameter has them. Accepting the parameter
+  // proves nothing: duckdb_native_gpu_ingestible takes it and filters with a plain select, so a
+  // scan served by it must be refused at install. The default is therefore false, and an
+  // implementation opts in only once it actually writes the positions.
+  stub_ingestible stub([] { return std::unique_ptr<cudf::table>{}; });
+  auto const& as_base = static_cast<sirius::op::scan::gpu_ingestible const&>(stub);
+  REQUIRE_FALSE(as_base.can_report_survivors());
+  // The unfiltered default too — the pair is what the install gate consults.
+  REQUIRE_FALSE(as_base.has_row_filter());
+}
 
 TEST_CASE("scan construction rejects an incomplete native carrier schema",
           "[scan_normalization][gpu_scan]")

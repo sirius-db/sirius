@@ -72,6 +72,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
@@ -360,7 +361,9 @@ struct stub_ingestible final : sirius::op::scan::gpu_ingestible {
     const cucascade::memory::memory_space& /*mem_space*/,
     rmm::cuda_stream_view /*stream*/,
     bool /*like_swar_fastpath*/,
-    std::shared_ptr<const sirius::like_multiliteral_cache> /*like_cache*/) override
+    std::shared_ptr<const sirius::like_multiliteral_cache> /*like_cache*/,
+    std::unique_ptr<cudf::column>* /*survivors*/,
+    std::span<std::size_t const> /*elided*/) override
   {
     throw std::logic_error("stub_ingestible::post_filter_and_project is unreachable");
   }

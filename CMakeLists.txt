@@ -249,6 +249,15 @@ set(EXTENSION_SOURCES
     src/compression/compressed_scan.cpp
     src/compression/compression_converters.cpp
     src/compression/plan_register.cpp
+    src/late_mat/prepared_selection.cpp
+    src/late_mat/materialize.cpp
+    src/late_mat/defer_policy.cpp
+    src/late_mat/defer_directive.cpp
+    src/late_mat/port_materialize.cpp
+    src/late_mat/pin_uniqueness.cpp
+    src/planner/late_mat_plan_pass.cpp
+    src/scan_manager/late_mat_resolver.cpp
+    src/late_mat/multi_source_gather.cu
     src/config.cpp
     src/helper/numeric_narrowing.cpp
     src/helper/type_conversions.cpp
@@ -735,6 +744,18 @@ set(TEST_SOURCES
     test/cpp/integration/test_pin_table_zone_map_pruning.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/integration/test_transparent_runtime_fallback.cpp
+    test/cpp/late_mat/test_column_origin.cpp
+    test/cpp/late_mat/test_prepared_selection.cpp
+    test/cpp/late_mat/test_materialize.cpp
+    test/cpp/late_mat/test_port_materialize.cpp
+    test/cpp/integration/test_late_mat_deferred_query.cpp
+    test/cpp/integration/test_late_mat_native_filter.cpp
+    test/cpp/late_mat/test_defer_policy.cpp
+    test/cpp/late_mat/test_defer_directive.cpp
+    test/cpp/late_mat/test_late_mat_plan_pass.cpp
+    test/cpp/late_mat/test_late_mat_resolver.cpp
+    test/cpp/late_mat/test_pin_handle_lifecycle.cpp
+    test/cpp/late_mat/test_pin_uniqueness.cpp
     test/cpp/io/s3/test_sigv4.cpp
     test/cpp/io/s3/test_s3_default_visibility_guard.cpp
     test/cpp/io/s3/test_sirius_sigv4_authorizer.cpp
@@ -902,6 +923,12 @@ target_include_directories(
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test/cpp>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+    # Late-materialization headers include codegen/selection/chunk_row_set.hpp
+    # and row_id_space.hpp, so a test that includes
+    # late_mat/prepared_selection.hpp needs the simpatico include root. It was
+    # dropped as dead in #1474 (8a3de03c), which was true until this feature
+    # landed.
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/compression/simpatico_codegen/include>
     $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
 )
 

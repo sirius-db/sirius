@@ -25,6 +25,7 @@
 
 // cudf
 #include <cudf/column/column_factories.hpp>
+#include <cudf/filling.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/types.hpp>
@@ -369,6 +370,33 @@ std::unique_ptr<cudf::table> expression_evaluator::select(
   auto mask = compute_mask(input);
   return cudf::apply_boolean_mask(
     input.select(output_indices.begin(), output_indices.end()), mask->view(), _stream, _mr);
+}
+
+std::unique_ptr<cudf::table> expression_evaluator::select_with_survivors(
+  cudf::table_view input,
+  std::span<cudf::size_type const> output_indices,
+  std::unique_ptr<cudf::column>& survivors)
+{
+  if (output_indices.empty()) {
+    throw internal_exception(
+      "[expression_evaluator] select_with_survivors(): output_indices must be non-empty");
+  }
+  // ONE mask, used twice: the survivors must be exactly the rows the output
+  // holds, so computing the predicate a second time would risk two answers.
+  auto mask     = compute_mask(input);
+  auto selected = cudf::apply_boolean_mask(
+    input.select(output_indices.begin(), output_indices.end()), mask->view(), _stream, _mr);
+
+  auto const rows = input.num_rows();
+  auto positions  = cudf::sequence(rows,
+                                  cudf::numeric_scalar<std::int32_t>(0, true, _stream, _mr),
+                                  cudf::numeric_scalar<std::int32_t>(1, true, _stream, _mr),
+                                  _stream,
+                                  _mr);
+  auto surviving =
+    cudf::apply_boolean_mask(cudf::table_view{{positions->view()}}, mask->view(), _stream, _mr);
+  survivors = std::make_unique<cudf::column>(surviving->get_column(0), _stream, _mr);
+  return selected;
 }
 
 std::unique_ptr<cudf::table> expression_evaluator::select(cudf::table_view input)

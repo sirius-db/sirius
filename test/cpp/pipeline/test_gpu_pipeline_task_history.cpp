@@ -30,19 +30,29 @@
 #include "utils/telemetry_utils.hpp"
 #include "utils/utils.hpp"
 
+#include <cudf/column/column_factories.hpp>
+#include <cudf/table/table.hpp>
+
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/device_buffer.hpp>
+#include <rmm/error.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
+#include <late_mat/column_origin.hpp>
+#include <late_mat/defer_directive.hpp>
+#include <planner/late_mat_plan_pass.hpp>
+#include <scan_manager/sirius_scan_manager.hpp>
 
 #include <cstddef>
 #include <cstdio>
 #include <functional>
 #include <memory>
+#include <numeric>
 #include <vector>
 
 namespace {
@@ -306,6 +316,25 @@ stub_operator::execute_fn make_passthrough_execute_fn()
 }
 
 //------------------------------------------------------------------------------
+// Helper: create an on_sink lambda that allocates exec_size bytes via the
+// reservation-aware MR and never deallocates them — models the sink-side
+// deferral restoration (materialize_deferred_input) that publish_output runs
+// before sink(), which the OOM-reschedule path must also cover.
+//------------------------------------------------------------------------------
+stub_operator::sink_fn make_allocating_sink_fn(cucascade::memory::memory_space* gpu_space,
+                                               std::size_t exec_size)
+{
+  return [gpu_space, exec_size](const sirius::op::operator_data&, rmm::cuda_stream_view s) {
+    auto* mr =
+      gpu_space->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
+    REQUIRE(mr != nullptr);
+    void* scratch = mr->allocate(s, exec_size, alignof(std::max_align_t));
+    s.synchronize();
+    mr->deallocate(s, scratch, exec_size, alignof(std::max_align_t));
+  };
+}
+
+//------------------------------------------------------------------------------
 // Helper: build a gpu_pipeline_task from a data batch and reservation size.
 // Pass reservation_size = 0 to skip reservation (for estimation flow).
 //------------------------------------------------------------------------------
@@ -356,6 +385,100 @@ std::unique_ptr<sirius::pipeline::gpu_pipeline_task> create_cached_scan_task(
     std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(op_data)),
     std::move(global_state));
 }
+
+//------------------------------------------------------------------------------
+// Late-materialization scaffolding for the restoration-OOM case.
+//
+// The restoration that runs just before sink() gathers a deferred column out of a
+// pinned entry, so exercising its OOM boundary needs a real pin, a real deferral
+// pair, and a batch whose WHOLE schema matches the port directive -- schema
+// equality is the directive's entire identity check.
+//------------------------------------------------------------------------------
+
+/// A GPU-tier pin of one INT32 column, row i holding i, in a single chunk.
+struct deferral_test_pin {
+  sirius::scan_manager::pinned_entry entry;
+  std::shared_ptr<sirius::late_mat::pin_entry_handle> handle;
+
+  deferral_test_pin(std::size_t rows, rmm::cuda_stream_view stream)
+  {
+    entry.tier = cucascade::memory::Tier::GPU;
+    std::vector<std::int32_t> host(rows);
+    std::iota(host.begin(), host.end(), 0);
+    for (auto const* name : {"payload_a", "payload_b"}) {
+      entry.cache_info.names.emplace_back(name);
+      auto col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                           static_cast<cudf::size_type>(rows),
+                                           cudf::mask_state::UNALLOCATED,
+                                           stream);
+      cudaMemcpyAsync(col->mutable_view().data<std::int32_t>(),
+                      host.data(),
+                      host.size() * sizeof(std::int32_t),
+                      cudaMemcpyHostToDevice,
+                      stream.value());
+      cudaStreamSynchronize(stream.value());
+      std::vector<std::shared_ptr<cudf::column>> chunks;
+      chunks.push_back(std::shared_ptr<cudf::column>(std::move(col)));
+      entry.data_batches_by_column.emplace(name, std::move(chunks));
+    }
+    entry.num_rows = rows;
+    handle         = std::make_shared<sirius::late_mat::pin_entry_handle>("deferral_pin", 1);
+    handle->set_entry(&entry);
+  }
+
+  [[nodiscard]] sirius::late_mat::column_origin origin(std::uint32_t pos) const
+  {
+    sirius::late_mat::column_origin o;
+    o.handle     = handle;
+    o.column_pos = pos;
+    o.generation = handle->generation();
+    return o;
+  }
+};
+
+/// The two deferred columns' ORIGINAL types — what make_defer_pair substitutes
+/// away and the port restores back to. The batch that actually rides is
+/// [rowid UINT64, placeholder INT8]; see make_riding_batch.
+std::vector<cudf::data_type> deferred_schema()
+{
+  return {cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT32}};
+}
+
+std::shared_ptr<cucascade::data_batch> make_riding_batch(std::size_t num_rows,
+                                                         std::size_t pin_rows,
+                                                         cucascade::memory::memory_space* gpu_space,
+                                                         rmm::cuda_stream_view stream)
+{
+  std::vector<std::uint64_t> rowids(num_rows);
+  for (std::size_t i = 0; i < num_rows; ++i) {
+    rowids[i] = static_cast<std::uint64_t>(i % pin_rows);
+  }
+  auto rowid_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::UINT64},
+                                             static_cast<cudf::size_type>(num_rows),
+                                             cudf::mask_state::UNALLOCATED,
+                                             stream,
+                                             gpu_space->get_default_allocator());
+  cudaMemcpyAsync(rowid_col->mutable_view().data<std::uint64_t>(),
+                  rowids.data(),
+                  rowids.size() * sizeof(std::uint64_t),
+                  cudaMemcpyHostToDevice,
+                  stream.value());
+  auto placeholder = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT8},
+                                               static_cast<cudf::size_type>(num_rows),
+                                               cudf::mask_state::UNALLOCATED,
+                                               stream,
+                                               gpu_space->get_default_allocator());
+  cudaMemsetAsync(placeholder->mutable_view().data<std::int8_t>(), 0, num_rows, stream.value());
+  stream.synchronize();
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(rowid_col));
+  columns.push_back(std::move(placeholder));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  return sirius::make_data_batch(
+    std::move(table), *gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
+}
+
 }  // namespace
 
 TEST_CASE("cached scan input materialization contributes to task reservations",
@@ -652,6 +775,149 @@ TEST_CASE("gpu_pipeline_task execute OOM in operator execute records to pipeline
   auto estimate = global_state->get_memory_history().estimate_peak_memory(kInputDataSize);
   REQUIRE(estimate.has_value());
   REQUIRE(*estimate == kInputDataSize);
+}
+
+// ---------------------------------------------------------------------------
+// Test: a task resumed at the sink sentinel restores its deferral and publishes.
+//
+// An OOM restoring a deferral reschedules with resume index operators.size() --
+// the sentinel meaning "the operator loop already ran; only the sink is left".
+// This drives that resumed state: the restoration must re-run, so the sink sees
+// the restored values rather than the rowid that rode.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("gpu_pipeline_task resumed at the sink sentinel restores and publishes once",
+          "[gpu_pipeline_task][history][sink][late_mat]")
+{
+  constexpr std::size_t kPinRows   = 1ULL << 20;    // 1 Mi rows of INT32 in the pin
+  constexpr std::size_t kBatchRows = 512ULL << 10;  // 512 Ki rows riding
+
+  pipeline_task_history_fixture f;
+  if (!f.setup()) {
+    WARN("Skipping test — no GPU available");
+    return;
+  }
+
+  rmm::cuda_stream stream, stream_data_init;
+
+  deferral_test_pin pin(kPinRows, stream_data_init);
+
+  auto ctx                = create_pipeline_context();
+  ctx.stub_op->on_execute = make_passthrough_execute_fn();
+  int sink_calls          = 0;
+  std::vector<cudf::type_id> sink_schema;
+  ctx.stub_op->on_sink = [&sink_calls, &sink_schema](const sirius::op::operator_data& in,
+                                                     rmm::cuda_stream_view) {
+    ++sink_calls;
+    sink_schema.clear();
+    auto const* pipelineable = dynamic_cast<const sirius::op::pipelineable_operator_data*>(&in);
+    if (pipelineable == nullptr) { return; }
+    for (auto const& b : pipelineable->get_read_only_batches()) {
+      auto view = b.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+      for (cudf::size_type c = 0; c < view.num_columns(); ++c) {
+        sink_schema.push_back(view.column(c).type().id());
+      }
+      break;
+    }
+  };
+
+  // Both halves, installed together: the source sheds the values, the sink puts them
+  // back. install_deferral requires two distinct operators and refuses to overwrite
+  // either half.
+  auto pair = sirius::late_mat::make_defer_pair(deferred_schema(),
+                                                /*scan_positions=*/{0, 1},
+                                                deferred_schema(),
+                                                /*port_positions=*/{0, 1},
+                                                {pin.origin(0), pin.origin(1)},
+                                                cudf::type_id::UINT64);
+  REQUIRE(pair.valid());
+  REQUIRE(sirius::planner::install_deferral(*ctx.stub_source, *ctx.stub_op, std::move(pair)));
+  REQUIRE_FALSE(ctx.stub_op->port_directive().empty());
+
+  auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+    ctx.pipeline, sirius::test::make_test_telemetry_context());
+  auto const operator_count = ctx.pipeline->get_operators().size();
+
+  auto batch = make_riding_batch(kBatchRows, kPinRows, f.gpu_space, stream_data_init);
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches{batch};
+  auto carried = std::make_unique<sirius::op::pipelineable_operator_data>(std::move(batches));
+
+  // The state an OOM in the restoration leaves behind: the operator loop already ran,
+  // so the retry resumes at the sentinel with the data the exception carried.
+  auto retry = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
+    /*task_id=*/2,
+    std::vector<cucascade::shared_data_repository*>{},
+    std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(carried),
+                                                                      operator_count),
+    global_state);
+  {
+    constexpr std::size_t kReservation = 128ULL * 1024 * 1024;
+    auto info                          = retry->get_estimated_reservation_size_info(f.gpu_space);
+    auto reservation                   = f.manager->request_reservation(
+      cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::GPU}, kReservation);
+    REQUIRE(reservation != nullptr);
+    auto* ls =
+      dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(retry->local_state());
+    REQUIRE(ls != nullptr);
+    ls->set_reservation(std::move(reservation), info);
+  }
+
+  retry->execute(stream);
+
+  // Published once — not once per attempt.
+  REQUIRE(sink_calls == 1);
+  // ...and with the VALUES back, not the rowid that rode: the resume path runs the
+  // restoration rather than skipping straight to the sink.
+  REQUIRE(sink_schema == std::vector<cudf::type_id>{cudf::type_id::INT32, cudf::type_id::INT32});
+}
+
+// ---------------------------------------------------------------------------
+// Test: an OOM raised by the SINK ITSELF propagates instead of rescheduling.
+//
+// A sink publishes incrementally -- a partition writes batches to its repositories
+// as it goes -- so by the time one of its allocations fails, some of that output is
+// already committed. Replaying the task would re-publish it, duplicating rows. The
+// OOM-reschedule window therefore closes before sink() is entered, and the
+// exception travels out uncaught.
+//
+// The deferral restoration that runs just before sink() IS retryable; that is a
+// different boundary and has its own case below.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("gpu_pipeline_task sink OOM propagates without rescheduling",
+          "[gpu_pipeline_task][history][sink]")
+{
+  constexpr std::size_t kReservationSize     = 200ULL * 1024 * 1024;  // 200 MB
+  constexpr std::size_t kInputDataSize       = 300ULL * 1024 * 1024;  // 300 MB
+  constexpr std::size_t kInputNumRows        = kInputDataSize / sizeof(int64_t);
+  constexpr std::size_t kSinkConsumptionSize = kInputDataSize;
+
+  pipeline_task_history_fixture f;
+  if (!f.setup()) {
+    WARN("Skipping test — no GPU available");
+    return;
+  }
+
+  rmm::cuda_stream stream, stream_data_init;
+
+  auto input_batch = f.create_host_data_batch(kInputNumRows, stream_data_init);
+
+  auto ctx                = create_pipeline_context();
+  ctx.stub_op->on_execute = make_passthrough_execute_fn();
+  ctx.stub_op->on_sink    = make_allocating_sink_fn(f.gpu_space, kSinkConsumptionSize);
+
+  auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+    ctx.pipeline, sirius::test::make_test_telemetry_context());
+
+  auto task =
+    create_pipeline_task(f, global_state, std::move(input_batch), kReservationSize, /*task_id=*/1);
+
+  REQUIRE_THROWS_AS(task->execute(stream), rmm::out_of_memory);
+
+  // Nothing is recorded: record_on_failure sits in the restoration catch, which this
+  // OOM never entered, and the success-path record is downstream of the sink call.
+  // A reschedule would have been the bug -- the sink had already published.
+  REQUIRE(global_state->get_memory_history().size() == 0);
 }
 
 // ---------------------------------------------------------------------------

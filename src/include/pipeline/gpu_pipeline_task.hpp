@@ -210,6 +210,19 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    */
   void publish_output(op::operator_data& output_batches, rmm::cuda_stream_view stream) override;
 
+  /// Restore the sink's deferred input, if it carries a port directive.
+  ///
+  /// Split out from @ref publish_output so the caller can bound the OOM-reschedule window to the
+  /// restoration alone: a sink publishes incrementally, so an OOM inside sink() has already
+  /// committed batches and replaying its input would duplicate them.
+  std::unique_ptr<op::operator_data> materialize_sink_input(op::operator_data& output_data,
+                                                            rmm::cuda_stream_view stream);
+
+  /// Publish @p materialized (or @p output_batches when there was nothing to restore) to the sink.
+  void publish_output(op::operator_data& output_batches,
+                      op::operator_data* materialized,
+                      rmm::cuda_stream_view stream);
+
   /**
    * @brief Get the input size for this task
    *
