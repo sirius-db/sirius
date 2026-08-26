@@ -973,6 +973,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_top_n.cpp
     test/cpp/operator/test_physical_ungrouped_aggregate.cpp
     test/cpp/operator/test_sirius_dynamic_filter.cpp
+    test/cpp/operator/test_dynamic_filter_probe.cpp
     test/cpp/operator/test_dynamic_filter_publication_claim.cpp
     test/cpp/operator/test_dynamic_filter_publisher.cpp
     test/cpp/operator/test_dynamic_filter_source_policy.cpp
@@ -1027,6 +1028,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_duckdb_native_host_backed_decode.cpp
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_dynamic_filter_merge.cpp
+    test/cpp/scan/test_fused_membership_mask.cpp
     test/cpp/scan/test_iceberg_batch_layout.cpp
     test/cpp/scan/test_iceberg_equality_delete.cpp
     test/cpp/scan/test_puffin_reader.cpp

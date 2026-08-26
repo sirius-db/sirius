@@ -34,6 +34,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -167,15 +168,33 @@ class sirius_mask_applicable {
   /**
    * @brief Returns `probe.size()` BOOL8 values (`true` keeps), or null for an incompatible probe
    *
-   * A probe whose carrier is a narrowed form of the filter's key type is restored first rather
-   * than declined -- a pinned chunk may store the key narrower than the type the filter was
-   * published with (@ref sirius::op::detail::restore_probe_to).
+   * The membership implementations accept any signed-integer carrier (INT8..INT64), converting
+   * per element in-kernel: a pinned chunk may store the key narrower than the type the filter
+   * was published with, and no consumer should have to materialize a widened copy to probe it.
    */
   [[nodiscard]] virtual std::unique_ptr<cudf::column> compute_mask(
     cudf::column_view const& probe,
     int device_id,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) const = 0;
+
+  /**
+   * @brief Prior-mask-aware variant: rows the prior keep-mask already killed skip the probe
+   *
+   * @p prior_mask_words is packed 1 bit/row over @p probe's rows (bit `row % 32` of word
+   * `row / 32`, 1 = keep), or null for no restriction. A pruning hint only: ignoring it is sound
+   * because every caller ANDs the result with that same mask.
+   */
+  [[nodiscard]] virtual std::unique_ptr<cudf::column> compute_mask(
+    cudf::column_view const& probe,
+    std::uint32_t const* prior_mask_words,
+    int device_id,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const
+  {
+    (void)prior_mask_words;
+    return compute_mask(probe, device_id, stream, mr);
+  }
 };
 
 /**
@@ -209,6 +228,13 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
 
   [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
     cudf::column_view const& probe,
+    int device_id,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const override;
+
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
+    cudf::column_view const& probe,
+    std::uint32_t const* prior_mask_words,
     int device_id,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) const override;
@@ -270,6 +296,13 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) const override;
 
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
+    cudf::column_view const& probe,
+    std::uint32_t const* prior_mask_words,
+    int device_id,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const override;
+
   void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
   [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;
 
@@ -317,6 +350,13 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
 
   [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
     cudf::column_view const& probe,
+    int device_id,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const override;
+
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
+    cudf::column_view const& probe,
+    std::uint32_t const* prior_mask_words,
     int device_id,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) const override;
