@@ -128,7 +128,7 @@ For a chain of dependent changes, Sirius uses the [`gh-stack`](https://github.co
 
 #### Install it once
 
-If needed, follow these [instructions](https://cli.github.com/) to install GitHub CLI. 
+If needed, follow these [instructions](https://cli.github.com/) to install GitHub CLI.
 ```bash
 # Install Stacked PRs extension
 gh extension install github/gh-stack
