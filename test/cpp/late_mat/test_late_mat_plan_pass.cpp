@@ -337,8 +337,9 @@ TEST_CASE("columns that stop at the same operator bundle together", "[late_mat][
   auto const candidates = build_defer_candidates(scan, analyze_column_lifetimes(scan));
   REQUIRE(candidates.size() == 1);  // one reader, one slot
   REQUIRE(candidates[0].columns.size() == 3);
-  // Four-byte integers: three of them, less the eight-byte rowid.
-  REQUIRE(candidates[0].net_value_bytes(8) == 3 * 4 - 8);
+  // Four-byte integers: three of them, less the eight-byte rowid and the two
+  // placeholders riding beside it.
+  REQUIRE(candidates[0].net_value_bytes(8) == 3 * 4 - (8 + 2));
 }
 
 TEST_CASE("a column nothing reads is not a candidate", "[late_mat][lifetime]")
@@ -559,7 +560,7 @@ TEST_CASE("a wide bundle over a long ride plans a deferral at its reader", "[lat
   REQUIRE(planned.restored_types.size() == 5);
   // Leaving the scan and leaving each of the three partitions.
   REQUIRE(planned.boundaries == 4);
-  REQUIRE(planned.net_value_bytes == 5 * 24 - 8);
+  REQUIRE(planned.net_value_bytes == 5 * 24 - (8 + 4));
   REQUIRE(planned.census.size() == 1);
   REQUIRE(planned.census.front().installed());
 }

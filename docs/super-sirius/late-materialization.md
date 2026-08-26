@@ -32,7 +32,10 @@ every refusal says which refusal it was — a deferral that silently did not hap
 like one that did nothing.
 
 The uniqueness probe costs pin-time work, so name the columns a ride actually needs rather than
-using `all`; without a proof there is no group-by-rowid ride and no riders.
+using `all`; without a proof there is no group-by-rowid ride and no riders. On TPC-H SF1000 that
+cost is the ONLY difference `all` makes (see Results): it proves eight more columns distinct and
+not one of them changes an admission, so the choice between `all` and the narrow list is a pin-time
+question, not a query-time one.
 
 | Variable | Default | Effect |
 |---|---|---|
@@ -94,7 +97,9 @@ end a ride early.
 Two things then decide whether the ride is taken:
 
 - **It has to repay.** Value per row and crossings saved TRADE OFF — a thin ride over many
-  crossings can pay where a fat one over few does not — so what is weighed is their product.
+  crossings can pay where a fat one over few does not — so what is weighed is their product. What
+  the ride saves is the values less the CARRIER: the rowid plus a 1-byte placeholder for every
+  column past the first, so an n-column bundle costs `rowid + (n - 1)` bytes per row to carry.
 - **It must not sit above a fan-out.** A join emits one scan row once per match, so a port above
   one gathers a row set larger than the scan produced. The walk tracks whether a join below a
   column multiplied the rows and whether a reduction has undone it, and a port that is still
@@ -298,6 +303,28 @@ q10; no other query moves outside noise.
 |---|---|---|---|
 | Gate off | 7.3911 s | 0.8481 s | 0.4991 s |
 | Gate on | **7.0031 s** | **0.7611 s** | **0.2250 s** |
+
+### `PIN_UNIQUE_COLS`: the narrow list versus `all`
+
+Same machine, ONE build (upstream `dev` at `8c88f2f3`), three arms back to back, best-of-3, 22/22
+results byte-identical across all three:
+
+| `PIN_UNIQUE_COLS` | Suite | q9 | q10 | Pin time, 72 `pin_table` calls |
+|---|---|---|---|---|
+| `none` | 6.6852 s | 0.8523 s | 0.4995 s | 77.6 s |
+| `c_custkey,n_name,n_nationkey` | 6.3065 s | 0.7596 s | 0.2264 s | 77.7 s |
+| `all` | **6.2992 s** | 0.7648 s | 0.2257 s | 91.5 s |
+
+`all` does not regress: no query moves by more than 0.7%, and the per-operator census is
+IDENTICAL between the narrow list and `all` — same installs, same refusals, same byte counts. The
+eight extra columns `all` proves distinct (`c_name`, `c_address`, `p_partkey`, `s_suppkey`,
+`s_name`, `s_address`, `r_name`, `r_regionkey`) do not unlock a single admission, because every
+other candidate is stopped by a floor, the fan-out guard, or the compressed-filtered-scan refusal
+— none of which uniqueness affects. The measured 0.7% spread is the run-to-run noise floor: a
+fourth arm executing an identical plan set moved q9 by the same amount.
+
+What `all` does cost is **+13.8 s of pin time (+17.8%)**, which grouped-mode query timings do not
+include. That is the price of not making the user name columns.
 
 ## Where the code is
 

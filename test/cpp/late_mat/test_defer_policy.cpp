@@ -24,6 +24,7 @@
 #include <catch.hpp>
 #include <late_mat/defer_policy.hpp>
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -55,7 +56,26 @@ TEST_CASE("a wide bundle over a long ride installs", "[late_mat][defer]")
   auto const out = choose_deferrals({bundle("agg", {25, 40, 89}, 6)});
   REQUIRE(out.size() == 1);
   REQUIRE(out[0].installed());
-  REQUIRE(out[0].net_value_bytes == 25 + 40 + 89 - 8);
+  // The carrier is the rowid plus a placeholder for each column past the first.
+  REQUIRE(out[0].net_value_bytes == 25 + 40 + 89 - (8 + 2));
+}
+
+TEST_CASE("the carrier costs a placeholder for every column past the first", "[late_mat][defer]")
+{
+  // A ride substitutes ONE rowid and keeps the other positions occupied with
+  // 1-byte placeholders, so a five-column bundle costs 12 B/row to carry. The
+  // placeholders are what a marginal multi-column bundle turns on: they are
+  // small per row and the floor they have to clear is a product.
+  defer_candidate five;
+  five.slot = "agg";
+  for (int i = 0; i < 5; ++i) {
+    five.columns.push_back(defer_column{static_cast<std::uint32_t>(i), 24});
+  }
+  REQUIRE(five.carrier_bytes(8) == 12);
+  REQUIRE(five.net_value_bytes(8) == 5 * 24 - 12);
+
+  // One column carries no placeholder at all.
+  REQUIRE(bundle("agg", {24}, 6).carrier_bytes(8) == 8);
 }
 
 TEST_CASE("a narrow dimension ride over a short one is refused", "[late_mat][defer]")
@@ -81,16 +101,20 @@ TEST_CASE("a wide bundle over a short ride is refused", "[late_mat][defer]")
   REQUIRE(out[0].refusal == defer_refusal::too_short_a_ride);
 }
 
-TEST_CASE("the floor is net of the rowid the ride carries instead", "[late_mat][defer]")
+TEST_CASE("the floor is net of what the ride carries instead", "[late_mat][defer]")
 {
   defer_policy const policy;  // 128 value x crossings, 8 B rowid
   // Over 6 crossings the floor needs 22 B net: 29 B of values is 21 net, and
   // 21 * 6 = 126 — just under.
   REQUIRE(choose_deferrals({bundle("agg", {29}, 6)}, policy)[0].refusal ==
           defer_refusal::below_value_x_boundaries);
-  // 30 B is 22 net and 132 — just over. The rowid is the difference, not a
+  // 30 B is 22 net and 132 — just over. The carrier is the difference, not a
   // rounding.
   REQUIRE(choose_deferrals({bundle("agg", {30}, 6)}, policy)[0].installed());
+  // Split the same 30 B across two columns and the placeholder pushes it back
+  // under: 29 net over 6 is 126.
+  REQUIRE(choose_deferrals({bundle("agg", {15, 15}, 6)}, policy)[0].refusal ==
+          defer_refusal::below_value_x_boundaries);
 }
 
 TEST_CASE("a wider bundle evicts a narrower one holding the same slot", "[late_mat][defer]")
