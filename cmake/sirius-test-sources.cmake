@@ -194,6 +194,7 @@ set(TEST_SOURCES
     test/cpp/late_mat/test_column_origin.cpp
     test/cpp/late_mat/test_prepared_selection.cpp
     test/cpp/late_mat/test_materialize.cpp
+    test/cpp/late_mat/test_materialize_compressed.cpp
     test/cpp/late_mat/test_port_materialize.cpp
     test/cpp/integration/test_late_mat_deferred_query.cpp
     test/cpp/integration/test_pin_unique_join.cpp
