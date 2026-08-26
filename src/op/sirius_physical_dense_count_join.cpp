@@ -260,9 +260,11 @@ std::size_t sirius_physical_dense_count_join::partition_count() const
 partition_strategy sirius_physical_dense_count_join::get_partition_strategy(
   const partition_sizing_input& in)
 {
-  // A task of this operator holds one partition of BOTH sides at once, so size against the
-  // combined input and give each partition twice the configured per-partition target.
-  uint64_t const bytes_per_partition = sirius::memory::saturating_mul(2, _hash_partition_bytes);
+  // A task of this operator holds one partition of BOTH sides at once.
+  // Additionally, the usage of a sirius_physical_dense_count_join operator is limited to narrow
+  // tables and the output is expected to be smaller due to the aggregating nature of the operator,
+  // so we want a larger target partition size.
+  uint64_t const bytes_per_partition = sirius::memory::saturating_mul(6, _hash_partition_bytes);
   if (bytes_per_partition == 0) {
     throw sirius::internal_exception("dense_count_join: hash_partition_bytes must be non-zero");
   }
@@ -272,10 +274,12 @@ partition_strategy sirius_physical_dense_count_join::get_partition_strategy(
     static_cast<int>(std::max(uint64_t{1},
                               total_bytes / bytes_per_partition +
                                 static_cast<uint64_t>(total_bytes % bytes_per_partition != 0)));
-  // Multi-GPU floor, using the same doubled value as the small-table threshold rather than
-  // partition_small_table_bytes: below one partition's worth of input there is nothing to spread.
+
   int const min_parts = partition_min_num_partitions(_num_gpus);
-  if (min_parts > 1 && total_bytes >= bytes_per_partition) {
+  // For multi-gpu execution, there is a balance between doing any partitioning (added compute) vs
+  // distributing the load across more GPUs. This is a rough heuristic threshold to determine if we
+  // would rather share the load or avoid partitioning which adds compute.
+  if (min_parts > 1 && total_bytes >= _hash_partition_bytes) {
     num_partitions = std::max(num_partitions, min_parts);
   }
 
