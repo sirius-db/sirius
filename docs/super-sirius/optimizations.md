@@ -124,11 +124,11 @@ In BUILD_PROBE mode, each partition's first task builds a `cudf::hash_join` hash
 
 **Motivation:** cuDF's sorted groupby finds group boundaries via `stable_sorted_order(keys)`, which takes the radix fast path only for a single key column. A multi-column group key falls to lexicographic merge sort — on TPC-H q16 at SF1000, 308.7 ms for 118.8M rows, 92% of the aggregate. The pre-existing dictionary-encode path narrows the comparators but leaves multiple key columns, so the single-column gate is never reached.
 
-**Mechanism:** `cudf::encode` collapses the key table into one dense INT32 label; the groupby sorts on that label, and original keys are recovered with a gather at group cardinality. `cudf::encode` returns distinct key rows in sorted order, so label ordering equals lexicographic key ordering; NULL key tuples get their own label (`null_policy::INCLUDE`). Gated on: a COLLECT_SET aggregation being present, ≥ 1M input rows, a multi-column non-nested key, and an HLL estimate putting group cardinality below 1% of rows (otherwise `cudf::encode`'s internal distinct+sort costs as much as the sort it replaces). Falls back silently to the plain multi-column sort if encoding throws; short-circuits the STRING dictionary-encode path when active.
+**Mechanism:** the key table collapses into one dense INT32 label; the groupby sorts on that label, and representative keys are recovered with a gather at group cardinality. Sirius first computes distinct keys with equal nulls and all NaNs equal, then sorts those keys lexicographically with nulls last. The sorted distinct table is the unique build side of a `cudf::distinct_hash_join`; probing the original rows returns one build-row index per input row, which is already the required dense label. Gated on: a COLLECT_SET aggregation, at least 1,048,576 input rows, a non-nested key that is not already a single null-free fixed-width column, and an HLL estimate below 1% of rows. A single nullable or variable-width key can qualify. Non-fatal label construction failures fall back to the original key columns; an active label path bypasses STRING dictionary encoding.
 
-**Code path:** `src/op/aggregate/gpu_aggregate_impl.cpp` — `local_grouped_agg()`, label path (`use_label_keys`)
+**Code path:** `src/op/aggregate/gpu_aggregate_impl.cpp` -- `gpu_aggregate_impl::local_grouped_aggregate()`, label path (`use_label_keys`)
 
-**Config:** none (thresholds hard-coded). TPC-H SF1000 GB300: q16 0.490 s → 0.298 s.
+**Config:** none (thresholds are internal). TPC-H SF1000 GB300 measured workload: q16 0.490 s -> 0.298 s.
 
 ### Distinct Hash Join (PR #558)
 
