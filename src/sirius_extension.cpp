@@ -2006,10 +2006,16 @@ static void SetLogFlushSeconds(ClientContext& context, SetScope scope, Value& pa
       "sirius_log_flush_seconds must be non-negative; zero disables periodic flushing; got %d",
       seconds);
   }
-  Config::LOG_FLUSH_SECONDS = seconds;
+  auto const previous_flush_seconds = Config::LOG_FLUSH_SECONDS;
+  Config::LOG_FLUSH_SECONDS         = seconds;
   // The flush interval is fixed at spdlog-sink construction, so rebuild it (only
   // the spdlog backend uses it).
-  if (Config::LOG_BACKEND == "spdlog") { install_configured_log_sink(context.db.get()); }
+  try {
+    if (Config::LOG_BACKEND == "spdlog") { install_configured_log_sink(context.db.get()); }
+  } catch (...) {
+    Config::LOG_FLUSH_SECONDS = previous_flush_seconds;
+    throw;
+  }
   SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_SECONDS to {}", Config::LOG_FLUSH_SECONDS);
 }
 

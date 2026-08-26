@@ -1589,9 +1589,9 @@ SiriusContextExtensionCallback::SiriusContextExtensionCallback()
   auto const previous_log_backend = Config::LOG_BACKEND;
   auto const previous_log_dir     = Config::LOG_DIR;
   auto const previous_log_level   = Config::LOG_LEVEL;
-  auto* backend_env               = std::getenv("SIRIUS_LOG_BACKEND");
-  auto* log_dir_env               = std::getenv("SIRIUS_LOG_DIR");
-  auto* level_env                 = std::getenv("SIRIUS_LOG_LEVEL");
+  auto const* backend_env         = std::getenv("SIRIUS_LOG_BACKEND");
+  auto const* log_dir_env         = std::getenv("SIRIUS_LOG_DIR");
+  auto const* level_env           = std::getenv("SIRIUS_LOG_LEVEL");
   if (backend_env) {
     std::string_view const backend{backend_env};
     if (backend != "duckdb" && backend != "spdlog" && backend != "noop") {

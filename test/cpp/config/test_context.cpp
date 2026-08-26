@@ -51,6 +51,7 @@
 #include <set>
 #include <source_location>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace {
@@ -359,7 +360,8 @@ TEST_CASE("DuckDB setting preserves the Sirius log backend when sink constructio
     duckdb::Config::LOG_BACKEND = previous_backend;
     duckdb::Config::LOG_DIR     = previous_log_dir;
     sirius::log::set_sink(previous_sink);
-    fs::remove_all(test_root);
+    std::error_code cleanup_error;
+    fs::remove_all(test_root, cleanup_error);
   }};
 
   fs::remove_all(test_root);
@@ -1437,7 +1439,8 @@ TEST_CASE("DuckDB setting preserves the Sirius log directory when sink construct
     duckdb::Config::LOG_BACKEND = previous_backend;
     duckdb::Config::LOG_DIR     = previous_log_dir;
     sirius::log::set_sink(previous_sink);
-    fs::remove_all(test_root);
+    std::error_code cleanup_error;
+    fs::remove_all(test_root, cleanup_error);
   }};
 
   fs::remove_all(test_root);
@@ -1511,7 +1514,8 @@ TEST_CASE("Sirius startup preserves logging settings when sink construction fail
     } else {
       unsetenv("SIRIUS_DISABLE");
     }
-    fs::remove_all(test_root);
+    std::error_code cleanup_error;
+    fs::remove_all(test_root, cleanup_error);
   }};
 
   fs::remove_all(test_root);
@@ -1583,6 +1587,64 @@ TEST_CASE("DuckDB setting rejects negative Sirius log flush intervals without mu
   REQUIRE(after_disabled != nullptr);
   REQUIRE_FALSE(after_disabled->HasError());
   REQUIRE(after_disabled->GetValue(0, 0).GetValue<int32_t>() == 0);
+}
+
+TEST_CASE("DuckDB setting preserves the Sirius log flush interval when sink construction fails",
+          "[sirius][context][config][isolated_context]")
+{
+  finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
+  setenv("SIRIUS_DISABLE", "1", 1);
+
+  auto const previous_backend       = duckdb::Config::LOG_BACKEND;
+  auto const previous_log_dir       = duckdb::Config::LOG_DIR;
+  auto const previous_flush_seconds = duckdb::Config::LOG_FLUSH_SECONDS;
+  auto const previous_sink          = sirius::log::get_sink();
+  auto const test_root              = fs::temp_directory_path() / "sirius-log-flush-rollback-test";
+  finally restore_logging{[&]() {
+    duckdb::Config::LOG_BACKEND       = previous_backend;
+    duckdb::Config::LOG_DIR           = previous_log_dir;
+    duckdb::Config::LOG_FLUSH_SECONDS = previous_flush_seconds;
+    sirius::log::set_sink(previous_sink);
+    std::error_code cleanup_error;
+    fs::remove_all(test_root, cleanup_error);
+  }};
+
+  fs::remove_all(test_root);
+  fs::create_directories(test_root);
+  auto const valid_dir = test_root / "valid";
+  auto const blocker   = test_root / "not-a-directory";
+  std::ofstream(blocker) << "file";
+  auto const invalid_dir = blocker / "child";
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+
+  auto noop = con.Query("SET sirius_log_backend = 'noop'");
+  REQUIRE(noop != nullptr);
+  REQUIRE_FALSE(noop->HasError());
+  auto set_valid_dir = con.Query("SET sirius_log_dir = '" + valid_dir.string() + "'");
+  REQUIRE(set_valid_dir != nullptr);
+  REQUIRE_FALSE(set_valid_dir->HasError());
+  auto spdlog = con.Query("SET sirius_log_backend = 'spdlog'");
+  REQUIRE(spdlog != nullptr);
+  REQUIRE_FALSE(spdlog->HasError());
+  auto positive = con.Query("SET sirius_log_flush_seconds = 7");
+  REQUIRE(positive != nullptr);
+  REQUIRE_FALSE(positive->HasError());
+  REQUIRE(duckdb::Config::LOG_FLUSH_SECONDS == 7);
+  auto const valid_sink = sirius::log::get_sink();
+
+  duckdb::Config::LOG_DIR = invalid_dir.string();
+  auto invalid            = con.Query("SET sirius_log_flush_seconds = 11");
+  REQUIRE(invalid != nullptr);
+  REQUIRE(invalid->HasError());
+
+  auto after_invalid = con.Query("SELECT current_setting('sirius_log_flush_seconds')::INTEGER");
+  REQUIRE(after_invalid != nullptr);
+  REQUIRE_FALSE(after_invalid->HasError());
+  REQUIRE(after_invalid->GetValue(0, 0).GetValue<int32_t>() == 7);
+  REQUIRE(duckdb::Config::LOG_FLUSH_SECONDS == 7);
+  REQUIRE(sirius::log::get_sink() == valid_sink);
 }
 
 TEST_CASE("Sirius configuration loading from file with spaces",
