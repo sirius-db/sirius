@@ -162,6 +162,14 @@ selection mask it already balloted into an ascending INT32 index list
 (`pushdown_outcome::survivor_rows`). Off a deferring scan the decode does neither, so the cost is
 one index-list expansion plus 4 bytes per surviving row, paid only where a ride uses it.
 
+Admitting the shape is not the same as it paying. On TPC-H SF1000 with
+`PIN_UNIQUE_COLS=all` it turns 39 structural refusals into ordinary policy decisions and installs
+no additional deferral: the newly reachable candidates are `lineitem` and `orders` filtered scans,
+and they are withheld because a partition hashes them or refused on the value-times-crossings
+floor. Suite time is unchanged (6.312 s before, 6.304 s / 6.326 s after, same build and machine),
+which is what a change that only removes a refusal should look like where the refusal was not the
+binding constraint on value.
+
 Both directions fail closed. A decode that compacted without accounting for its survivors throws
 rather than emit a rowid, at `prepare_for_processing` and again at substitution; a survivor list
 whose length does not match the rows handed on throws too. A scan whose INGESTIBLE cannot report
