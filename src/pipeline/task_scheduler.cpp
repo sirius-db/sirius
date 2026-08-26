@@ -224,7 +224,12 @@ std::future<void> task_scheduler::start_query()
 
 void task_scheduler::terminate_query(std::exception_ptr error)
 {
-  _completion_handler->report_error(std::move(error));
+  std::shared_ptr<completion_handler> completion;
+  {
+    std::scoped_lock lock(_query_mutex);
+    completion = _completion_handler;
+  }
+  if (completion) { completion->report_error(std::move(error)); }
   stop();
 }
 
