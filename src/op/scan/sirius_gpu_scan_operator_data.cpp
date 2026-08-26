@@ -405,6 +405,23 @@ void scan_operator_input::prepare_for_processing(
             refresh(rep);
           }
         }
+        // A deferral on this scan makes the rowid positional in the pinned chunk, so a decode
+        // that compacts has to say which rows it kept. Only added where a request already
+        // exists: with none the decode drops no rows.
+        if (late_mat_wants_survivors) {
+          auto ask_for_survivors = [](auto* rep) {
+            if (rep->pushdown_scan()) {
+              rep->set_pushdown_scan(rep->pushdown_scan()->with_survivor_reporting());
+            }
+          };
+          if (auto* device_rep =
+                dynamic_cast<::sirius::compressed_device_representation*>(mut.get_data())) {
+            ask_for_survivors(device_rep);
+          } else if (auto* host_rep =
+                       dynamic_cast<::sirius::compressed_host_representation*>(mut.get_data())) {
+            ask_for_survivors(host_rep);
+          }
+        }
         try {
           mut.convert_to<cucascade::gpu_table_representation>(
             registry, requested_memory_space, stream);
@@ -488,8 +505,16 @@ void scan_operator_input::record_decode_outcome(::cucascade::idata_representatio
   pushdown_filter_only_columns_dropped = outcome.filter_only_columns_dropped;
   pushdown_predicate_columns           = outcome.predicate_columns;
   pushdown_predicates_enforced         = outcome.predicates_enforced;
+  pushdown_compacted                   = outcome.compacted;
+  pushdown_survivors                   = outcome.survivor_rows;
   if (pushdown_selection_unprofitable && outcome.selection_unprofitable) {
     pushdown_selection_unprofitable->store(true, std::memory_order_relaxed);
+  }
+  if (late_mat_wants_survivors && pushdown_compacted && !pushdown_survivors) {
+    throw std::runtime_error(
+      "[scan_operator_input::prepare_for_processing] the decode compacted this split but could "
+      "not report which rows it kept, and a deferral needs those positions to build its "
+      "pin-order rowid");
   }
   // The decode consumed the mask: clear it, since re-applying selects wrong rows and clearing
   // re-enables the zero-copy steal in prepare_for_processing.

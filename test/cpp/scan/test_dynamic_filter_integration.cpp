@@ -1079,12 +1079,15 @@ TEST_CASE("a deferring scan decodes whole compressed chunks and its endpoint fil
 
   SECTION("an attaching consumer compacts the chunk, which the scan refuses to address")
   {
-    // The wiring before decode_consumer(): the scan's own consumer reaches the decode.
+    // The wiring before decode_consumer(): the scan's own consumer reaches the decode. A decode
+    // not asked for its survivors leaves the scan no way to address what it kept.
     serve(scan.consumer());
-    auto input     = scan.get_next_task_input_data();
-    auto& split    = dynamic_cast<scan_operator_input&>(*input);
-    split.consumer = scan.consumer();
+    auto input                     = scan.get_next_task_input_data();
+    auto& split                    = dynamic_cast<scan_operator_input&>(*input);
+    split.consumer                 = scan.consumer();
+    split.late_mat_wants_survivors = false;
     split.prepare_for_processing(space, stream);
+    REQUIRE(split.pushdown_survivors == nullptr);
     REQUIRE(split.decode_attached.size() == 1);
     // Membership compaction alone does not report pushdown_row_filtered.
     REQUIRE_FALSE(split.pushdown_row_filtered);
@@ -1097,6 +1100,29 @@ TEST_CASE("a deferring scan decodes whole compressed chunks and its endpoint fil
       scan.execute(split, stream),
       Catch::Matchers::ContainsSubstring(
         "the decode removed rows of a scan whose deferral addresses whole chunks"));
+  }
+  SECTION("a compacting decode that reports its survivors gives each kept row its own rowid")
+  {
+    serve(scan.consumer());
+    auto input     = scan.get_next_task_input_data();
+    auto& split    = dynamic_cast<scan_operator_input&>(*input);
+    split.consumer = scan.consumer();
+    REQUIRE(split.late_mat_wants_survivors);
+    split.prepare_for_processing(space, stream);
+    REQUIRE(split.decode_attached.size() == 1);
+    REQUIRE(split.pushdown_compacted);
+    REQUIRE(split.pushdown_survivors != nullptr);
+
+    std::vector<std::uint64_t> expected_rowids;
+    for (cudf::size_type row = 0; row < kRows; ++row) {
+      if (row % 100 < 10) { expected_rowids.push_back(static_cast<std::uint64_t>(row)); }
+    }
+    auto scanned = scan.execute(split, stream);
+    auto* output = dynamic_cast<scan_output_operator_data*>(scanned.get());
+    REQUIRE(output != nullptr);
+    auto lease = output->get_data_batches().front()->to_read_only();
+    auto view  = sirius::get_cudf_table_view(lease);
+    REQUIRE(to_host<std::uint64_t>(view.column(1), stream) == expected_rowids);
   }
   SECTION("the decode consumer leaves whole chunks for the endpoint")
   {
