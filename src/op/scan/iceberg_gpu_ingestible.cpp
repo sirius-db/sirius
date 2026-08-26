@@ -275,9 +275,16 @@ std::unique_ptr<batch_coalescer> iceberg_gpu_ingestible::create_batch_coalescer(
 filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
   scan_info const& info,
   const cucascade::memory::memory_space& mem_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  bool like_swar_fastpath,
+  std::shared_ptr<const sirius::like_multiliteral_cache> like_cache)
 {
-  auto base = parquet_gpu_ingestible::materialize_metadata_to_table(info, mem_space, stream);
+  // Forwarded untouched: these steer the base decode's LIKE evaluation and have nothing to say
+  // about deletes. The check below is what guards the case that matters -- if they cause the
+  // reader to filter rows, positions stop identifying file rows and we refuse rather than
+  // delete the wrong ones.
+  auto base = parquet_gpu_ingestible::materialize_metadata_to_table(
+    info, mem_space, stream, like_swar_fastpath, std::move(like_cache));
 
   if (_pipeline.empty()) { return base; }
 

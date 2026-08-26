@@ -64,9 +64,12 @@ class iceberg_gpu_ingestible : public parquet_gpu_ingestible {
 
   std::unique_ptr<batch_coalescer> create_batch_coalescer() const override;
 
-  filtered_table materialize_metadata_to_table(scan_info const& info,
-                                               const cucascade::memory::memory_space& mem_space,
-                                               rmm::cuda_stream_view stream) override;
+  filtered_table materialize_metadata_to_table(
+    scan_info const& info,
+    const cucascade::memory::memory_space& mem_space,
+    rmm::cuda_stream_view stream,
+    bool like_swar_fastpath,
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache) override;
 
  private:
   /// Resolves which scanned file each manifest-side key refers to, once. A mismatch would
