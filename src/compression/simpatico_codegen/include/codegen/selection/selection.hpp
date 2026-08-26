@@ -150,8 +150,16 @@ struct filter_column_directive {
 // the converter must never hand a probe that reads mutable live state.
 struct membership_filter_directive {
   std::size_t column;  // key column, indexes into `selected`
-  std::function<std::unique_ptr<cudf::column>(
-    cudf::column_view keys, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)>
+  // The second argument is an OPTIONAL prior keep-mask over the batch's rows
+  // (packed selection-mask words, 1 = keep, null = no restriction). When other
+  // mask sources exist, the orchestrator runs membership probes AFTER combining
+  // them and hands the combined words here so dead rows skip the membership
+  // lookup; the probe may ignore the hint (its result is ANDed with that same
+  // mask).
+  std::function<std::unique_ptr<cudf::column>(cudf::column_view keys,
+                                              uint32_t const* prior_mask_words,
+                                              rmm::cuda_stream_view stream,
+                                              rmm::device_async_resource_ref mr)>
     probe;
 };
 

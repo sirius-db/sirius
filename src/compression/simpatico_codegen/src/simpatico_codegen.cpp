@@ -21,6 +21,7 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -619,58 +620,118 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
         bool8_full[b] = std::move(flags);
       });
     }
-    for (size_t m = 0; m < k_member; ++m) {
-      submit_mask_source(
-        k_range + k_bool8 + m, [&](std::uint32_t* dst, rmm::cuda_stream_view stream) {
-          auto const& directive = request.membership_filters[m];
-          auto const& col       = table.columns[selected[directive.column]];
-          std::string err;
-          // Full-width key decode (any plan shape), then the type-erased
-          // device probe (in_list / cuco set / Bloom) -> BOOL8, then the
-          // packed-mask adapter. Probe contract: all work on `stream`.
-          auto keys = decompress_column(*col.plan_tree, stream, mr, &err);
-          if (!keys)
-            throw plan_error(err.empty() ? "filtered decode: membership key decode failed" : err);
-          auto keys_typed = apply_stored_dtype(std::move(keys), col.dtype);
-          auto flags      = directive.probe(keys_typed->view(), stream, mr);
-          // A null result is the probe DECLINING this column (the documented
-          // "caller skips it" answer — e.g. the chunk's stored carrier is
-          // narrower than the type the filter was published with). A join
-          // filter is never the whole filter, so dropping one only
-          // under-filters and the authoritative join still runs. Stand the
-          // source down to all-ones, the identity for the AND-combine, rather
-          // than abandoning the batch's whole filtered decode.
-          if (!flags) {
-            if (cudaMemsetAsync(dst,
-                                0xFF,
-                                static_cast<std::size_t>(alloc_words) * sizeof(std::uint32_t),
-                                stream.value()) != cudaSuccess) {
-              throw plan_error("filtered decode: declined-probe mask fill failed");
-            }
-            ++declined_members;
-            return;
+    // Mask-aware membership probes: when any other mask source exists, the
+    // probes are NOT submitted here — they run sequentially on s0 AFTER those
+    // masks are combined, each consuming the current combined words as a prior
+    // mask so dead rows skip the set/Bloom lookup (and each subsequent probe
+    // sees the previous probe's survivors — the capped ordering is ascending
+    // expected keep-rate, so the strongest filter tightens the mask first).
+    // With nothing to prime a prior from, they keep the concurrent round-robin
+    // submission below, prior-free.
+    size_t const k_static            = k_range + k_bool8;
+    bool const sequential_membership = k_member > 0 && k_static > 0;
+    for (size_t m = 0; !sequential_membership && m < k_member; ++m) {
+      submit_mask_source(k_static + m, [&](std::uint32_t* dst, rmm::cuda_stream_view stream) {
+        auto const& directive = request.membership_filters[m];
+        auto const& col       = table.columns[selected[directive.column]];
+        std::string err;
+        // Full-width key decode (any plan shape), then the type-erased
+        // device probe (in_list / cuco set / Bloom) -> BOOL8, then the
+        // packed-mask adapter. Probe contract: all work on `stream`.
+        auto keys = decompress_column(*col.plan_tree, stream, mr, &err);
+        if (!keys)
+          throw plan_error(err.empty() ? "filtered decode: membership key decode failed" : err);
+        auto keys_typed = apply_stored_dtype(std::move(keys), col.dtype);
+        auto flags = directive.probe(keys_typed->view(), /*prior_mask_words=*/nullptr, stream, mr);
+        // A null result is the probe DECLINING this column (the documented
+        // "caller skips it" answer — e.g. the chunk's stored carrier is
+        // narrower than the type the filter was published with). A join
+        // filter is never the whole filter, so dropping one only
+        // under-filters and the authoritative join still runs. Stand the
+        // source down to all-ones, the identity for the AND-combine, rather
+        // than abandoning the batch's whole filtered decode.
+        if (!flags) {
+          if (cudaMemsetAsync(dst,
+                              0xFF,
+                              static_cast<std::size_t>(alloc_words) * sizeof(std::uint32_t),
+                              stream.value()) != cudaSuccess) {
+            throw plan_error("filtered decode: declined-probe mask fill failed");
           }
-          // A wrong type or width is NOT a decline — it breaks the probe
-          // contract, so it stays fatal and names which side broke.
-          if (flags->type().id() != cudf::type_id::BOOL8 || flags->size() != num_rows)
-            throw plan_error("filtered decode: membership probe result shape mismatch (col=" +
-                             std::to_string(selected[directive.column]) + " got=type_id=" +
-                             std::to_string(static_cast<int>(flags->type().id())) +
-                             " size=" + std::to_string(flags->size()) + " want=type_id=" +
-                             std::to_string(static_cast<int>(cudf::type_id::BOOL8)) +
-                             " size=" + std::to_string(num_rows) + ")");
-          if (flags->null_count() != 0)
-            throw plan_error("filtered decode: null-masked membership probe result");
-          sc::mask_from_bool8(flags->view().data<std::uint8_t>(), num_rows, dst, stream);
-          // keys/flags die here: stream-ordered frees behind the adapter
-          // kernel on the same stream.
-        });
+          ++declined_members;
+          return;
+        }
+        // A wrong type or width is NOT a decline — it breaks the probe
+        // contract, so it stays fatal and names which side broke.
+        if (flags->type().id() != cudf::type_id::BOOL8 || flags->size() != num_rows)
+          throw plan_error("filtered decode: membership probe result shape mismatch (col=" +
+                           std::to_string(selected[directive.column]) +
+                           " got=type_id=" + std::to_string(static_cast<int>(flags->type().id())) +
+                           " size=" + std::to_string(flags->size()) + " want=type_id=" +
+                           std::to_string(static_cast<int>(cudf::type_id::BOOL8)) +
+                           " size=" + std::to_string(num_rows) + ")");
+        if (flags->null_count() != 0)
+          throw plan_error("filtered decode: null-masked membership probe result");
+        sc::mask_from_bool8(flags->view().data<std::uint8_t>(), num_rows, dst, stream);
+        // keys/flags die here: stream-ordered frees behind the adapter
+        // kernel on the same stream.
+      });
+    }
+
+    // ── Combine on stream 0: fold every source that wrote a strip into
+    // `combined`. mask_ptrs holds exactly those, so its size is the combine
+    // count on both the concurrent and the sequential-membership path.
+    if (mask_ptrs.size() > 1) {
+      sc::combine_masks_and(
+        combined, mask_ptrs.data(), static_cast<int>(mask_ptrs.size()), alloc_words, s0);
+    }
+
+    // ── Sequential membership cascade (mask-aware): `combined` now holds the
+    // AND of every other source. Each probe consumes it as the prior mask (dead
+    // rows skip the set/Bloom lookup) and its packed result immediately ANDs
+    // back in, so the next probe sees the tightened mask. Everything runs on
+    // s0, ordered behind the combine; one scratch strip serves every probe (its
+    // stream-ordered free is s0-local, so unwinding mid-flight cannot race a
+    // cross-stream reader). A declining probe leaves `combined` untouched —
+    // the AND identity, same stand-down as the concurrent path's all-ones fill.
+    if (sequential_membership) {
+      rmm::device_buffer membership_scratch(
+        static_cast<std::size_t>(alloc_words) * sizeof(std::uint32_t), s0, mr);
+      auto* member_dst = static_cast<std::uint32_t*>(membership_scratch.data());
+      std::array<std::uint32_t const*, 2> and_srcs{combined, member_dst};
+      for (size_t m = 0; m < k_member; ++m) {
+        auto const& directive = request.membership_filters[m];
+        auto const& col       = table.columns[selected[directive.column]];
+        std::string err;
+        auto keys = decompress_column(*col.plan_tree, s0, mr, &err);
+        if (!keys)
+          throw plan_error(err.empty() ? "filtered decode: membership key decode failed" : err);
+        auto keys_typed = apply_stored_dtype(std::move(keys), col.dtype);
+        auto flags      = directive.probe(keys_typed->view(), combined, s0, mr);
+        if (!flags) {
+          ++declined_members;
+          continue;
+        }
+        if (flags->type().id() != cudf::type_id::BOOL8 || flags->size() != num_rows)
+          throw plan_error("filtered decode: membership probe result shape mismatch (col=" +
+                           std::to_string(selected[directive.column]) +
+                           " got=type_id=" + std::to_string(static_cast<int>(flags->type().id())) +
+                           " size=" + std::to_string(flags->size()) + " want=type_id=" +
+                           std::to_string(static_cast<int>(cudf::type_id::BOOL8)) +
+                           " size=" + std::to_string(num_rows) + ")");
+        if (flags->null_count() != 0)
+          throw plan_error("filtered decode: null-masked membership probe result");
+        sc::mask_from_bool8(flags->view().data<std::uint8_t>(), num_rows, member_dst, s0);
+        sc::combine_masks_and(combined, and_srcs.data(), 2, alloc_words, s0);
+        // keys/flags die here: stream-ordered frees behind the combine on s0.
+      }
     }
 
     // An all-ones source is the AND identity only while a real source still
     // zeroes the tail bits past num_rows, which CNT and the gather require. If
     // every source declined there is nothing left to filter by anyway, so take
-    // the plain decode instead of counting a mask that is all ones.
+    // the plain decode instead of counting a mask that is all ones. Only
+    // reachable on the concurrent path: a sequential cascade runs behind at
+    // least one static source, which is never a decline.
     if (declined_members == k_total) {
       throw plan_error("filtered decode: every membership probe declined (" +
                        std::to_string(declined_members) + " of " + std::to_string(k_total) +
@@ -686,12 +747,9 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
                    static_cast<long long>(num_rows));
     }
 
-    // ── Combine + CNT on stream 0. run_selection_cnt host-syncs s0 once (the
-    // survivor count gates wave-2 allocations); after it returns, every wave-1
-    // kernel and the combine have completed, so per_filter teardown is safe.
-    if (k_total > 1) {
-      sc::combine_masks_and(combined, mask_ptrs.data(), static_cast<int>(k_total), alloc_words, s0);
-    }
+    // ── CNT on stream 0. run_selection_cnt host-syncs s0 once (the survivor
+    // count gates wave-2 allocations); after it returns, every wave-1 kernel
+    // and the combine have completed, so per_filter teardown is safe.
     sc::selection_mask sel{
       combined, num_rows, -1, static_cast<std::uint32_t*>(result.chunk_offsets.data())};
     sc::run_selection_cnt(sel, s0, mr);

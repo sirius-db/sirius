@@ -31,6 +31,7 @@
 #include <cuco/operator.hpp>
 #include <cuco/static_set.cuh>
 #include <cuco/storage.cuh>
+#include <cuda/dynamic_filter_probe.cuh>
 #include <cuda/sirius_rmm_cuco_allocator.cuh>
 #include <cuda/std/functional>
 #include <cuda/std/limits>
@@ -148,15 +149,29 @@ struct equals_sentinel {
   }
 };
 
-template <class KeyT, class SetRef>
+// Probe values arrive at whatever integer carrier the consumer decoded (a decode-time probe
+// commonly sees BIGINT keys stored as a narrow carrier); each value is widened/narrowed into the
+// set's key domain in-kernel, so callers never materialize a cast. A value the key domain cannot
+// represent is a definite non-member. Rows the optional prior keep-mask killed skip the set lookup
+// entirely (out = false; the caller ANDs with that same mask anyway).
+template <class ProbeT, class KeyT, class SetRef>
 struct contains_or_sentinel {
-  KeyT const* probe;
+  ProbeT const* probe;
   bool* out;
   SetRef set;
+  std::uint32_t const* prior_words;  // packed 1 bit/row keep-mask, or null
   __device__ __forceinline__ void operator()(cudf::size_type idx) const noexcept
   {
-    auto const& key = probe[idx];
-    out[idx]        = set.contains(key) || equals_sentinel<KeyT>{}(key);
+    if (!detail::prior_mask_keeps(prior_words, idx)) {
+      out[idx] = false;
+      return;
+    }
+    KeyT key;
+    if (!detail::probe_key_convert(probe[idx], key)) {
+      out[idx] = false;
+      return;
+    }
+    out[idx] = set.contains(key) || equals_sentinel<KeyT>{}(key);
   }
 };
 
@@ -382,26 +397,41 @@ std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask(
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr) const
 {
-  if (probe.type() != _key_type) { return nullptr; }
+  return compute_mask(probe, /*prior_mask_words=*/nullptr, device_id, stream, mr);
+}
+
+std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask(
+  cudf::column_view const& probe,
+  std::uint32_t const* prior_mask_words,
+  int device_id,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr) const
+{
   auto const* replica =
     _set ? _set->find(detail::resolve_dynamic_filter_device_id(device_id)) : nullptr;
   if (!replica) { return nullptr; }
 
-  auto const n = probe.size();
-  auto out     = cudf::make_numeric_column(
-    cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
-  auto* const outp = out->mutable_view().data<bool>();
-
-  std::visit(
-    [&](auto const& set) {
-      using owner_type = std::decay_t<decltype(set)>;
-      using key_type   = typename owner_type::element_type::key_type;
-      auto const* d    = probe.data<key_type>();
-      auto ref         = set->ref(cuco::contains);
-      cub::DeviceFor::Bulk(
-        n, contains_or_sentinel<key_type, decltype(ref)>{d, outp, ref}, stream.value());
-    },
-    replica->set);
+  std::unique_ptr<cudf::column> out;
+  auto const n          = probe.size();
+  auto const dispatched = detail::dispatch_signed_integer_probe(probe.type(), [&](auto probe_tag) {
+    using probe_type = decltype(probe_tag);
+    out              = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
+    auto* const outp = out->mutable_view().data<bool>();
+    auto const* d    = probe.data<probe_type>();
+    std::visit(
+      [&](auto const& set) {
+        using owner_type = std::decay_t<decltype(set)>;
+        using key_type   = typename owner_type::element_type::key_type;
+        auto ref         = set->ref(cuco::contains);
+        cub::DeviceFor::Bulk(
+          n,
+          contains_or_sentinel<probe_type, key_type, decltype(ref)>{d, outp, ref, prior_mask_words},
+          stream.value());
+      },
+      replica->set);
+  });
+  if (!dispatched) { return nullptr; }
   if (probe.nullable() && probe.null_count() > 0) {
     out->set_null_mask(cudf::copy_bitmask(probe, stream, mr), probe.null_count());
   }

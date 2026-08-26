@@ -74,8 +74,18 @@ struct decode_range {
 /// published device structure (small in-list / hash set / Bloom) over a decoded
 /// key column and returns a BOOL8 keep-mask. The closure co-owns the filter for
 /// the call's duration and must enqueue only on the handed stream.
-using membership_probe_fn = std::function<std::unique_ptr<cudf::column>(
-  cudf::column_view const&, rmm::cuda_stream_view, rmm::device_async_resource_ref)>;
+///
+/// The second argument is an OPTIONAL prior keep-mask over the key column's
+/// rows — packed 1 bit/row (bit `row % 32` of word `row / 32`, 1 = keep), or
+/// null for no restriction. The decoder hands the already-combined mask of the
+/// conjuncts it evaluated first, so the probe skips dead rows' set/Bloom
+/// lookups; the probe may ignore it (its result is ANDed with that same mask
+/// by the caller).
+using membership_probe_fn =
+  std::function<std::unique_ptr<cudf::column>(cudf::column_view const&,
+                                              std::uint32_t const*,
+                                              rmm::cuda_stream_view,
+                                              rmm::device_async_resource_ref)>;
 
 /// One membership test plus the signal used to order it.
 ///

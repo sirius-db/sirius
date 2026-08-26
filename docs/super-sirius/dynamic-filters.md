@@ -96,6 +96,12 @@ If no probe-GPU L2 size is available, the hash IN-list is not selected; the publ
 - The domain-coverage gate skips the key before either filter is built when a proven-unique native build key covers at least `dynamic_filter_domain_coverage_threshold` of its known base-table domain.
 - The consumer keep-ratio gate disables ineffective post-decode filtering when a measured batch retains more than `dynamic_filter_keep_threshold` of its rows.
 
+### Probe-side evaluation
+
+`compute_mask` accepts any signed-integer probe carrier (`INT8`..`INT64`) regardless of the build-key width, widening or narrowing each value in-kernel; a probe value the key domain cannot represent is a definite non-member. This matters where the probe column is decoded rather than stored natively: a `BIGINT` join key can decode to a narrow `INT32` carrier, and the consumer probes that carrier directly instead of materializing a full-width cast first. Non-integer probe carriers (decimals, dates, floats) still decline with `nullptr` — a semantic mismatch, not a width mismatch.
+
+`compute_mask` also has an overload taking an optional packed prior keep-mask (1 bit per row, cuDF-bitmask convention): rows the prior already killed skip the set or Bloom lookup entirely. The filtered decode uses it — when a chunk has other mask sources (ranges, dictionary-answered equalities), the membership probes run sequentially on one stream *after* those masks are AND-combined, each consuming the current combined mask as its prior and folding its own result back in, so a selective range removes most of a probe's random lookups and a second probe sees the first probe's survivors. Membership-only chunks keep the concurrent, prior-free submission. The prior is a pruning hint only: ignoring it is always sound, because the caller ANDs the probe's result with that same mask.
+
 Zone maps are off by default because DuckDB static pushdown already handles many known ranges, while scattered runtime keys often span most of the domain. Floating-point keys never receive a zone map: the lowered bounds compare with IEEE semantics under which NaN fails both, while the authoritative join matches NaN keys to each other (DuckDB total order), so a range filter could drop matching rows.
 
 ## Ordering and correctness

@@ -32,6 +32,7 @@
 
 // cccl
 #include <cub/device/device_for.cuh>
+#include <cuda/dynamic_filter_probe.cuh>
 
 // cucascade
 #include <cucascade/error.hpp>
@@ -60,18 +61,29 @@ namespace {
 
 /// @brief Per-row brute-force membership scan: out[idx] == true iff probe[idx] equals any of the m
 /// needles. For the small m this filter gates on (<= k_max_keys), a compare-all linear scan beats a
-/// hash probe and reserves no sentinel value.
-template <class KeyT>
+/// hash probe and reserves no sentinel value. Probe values are widened/narrowed into the needle
+/// domain per element (a value the domain cannot represent is a definite non-member), and rows the
+/// optional prior keep-mask killed skip the scan.
+template <class ProbeT, class KeyT>
 struct small_in_list_scan {
-  KeyT const* __restrict__ probe;
+  ProbeT const* __restrict__ probe;
   KeyT const* __restrict__ needles;
   int m;
   bool* __restrict__ out;
+  std::uint32_t const* __restrict__ prior_words;  // packed 1 bit/row keep-mask, or nullptr
 
   __device__ __forceinline__ void operator()(cudf::size_type idx) const noexcept
   {
-    auto const x = probe[idx];
-    bool hit     = false;
+    if (!sirius::op::detail::prior_mask_keeps(prior_words, idx)) {
+      out[idx] = false;
+      return;
+    }
+    KeyT x;
+    if (!sirius::op::detail::probe_key_convert(probe[idx], x)) {
+      out[idx] = false;
+      return;
+    }
+    bool hit = false;
     for (int j = 0; j < m; ++j) {
       hit |= (x == needles[j]);
     }
@@ -173,36 +185,50 @@ std::unique_ptr<cudf::column> sirius_dynamic_small_in_list_filter::compute_mask(
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr) const
 {
-  if (probe.type() != _key_type) { return nullptr; }
+  return compute_mask(probe, /*prior_mask_words=*/nullptr, device_id, stream, mr);
+}
+
+std::unique_ptr<cudf::column> sirius_dynamic_small_in_list_filter::compute_mask(
+  cudf::column_view const& probe,
+  std::uint32_t const* prior_mask_words,
+  int device_id,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr) const
+{
   auto const* replica =
     _store ? _store->find(detail::resolve_dynamic_filter_device_id(device_id)) : nullptr;
   if (!replica) { return nullptr; }
 
-  auto const n = probe.size();
-  auto out     = cudf::make_numeric_column(
-    cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
-  auto* const outp = out->mutable_view().data<bool>();
-  auto const m     = static_cast<int>(_num_keys);
-
-  switch (_key_type.id()) {
-    case cudf::type_id::INT32: {
-      auto const* needles = static_cast<std::int32_t const*>(replica->needles.data());
-      CUCASCADE_CUDA_TRY(cub::DeviceFor::Bulk(
-        n,
-        small_in_list_scan<std::int32_t>{probe.data<std::int32_t>(), needles, m, outp},
-        stream.value()));
-      break;
+  std::unique_ptr<cudf::column> out;
+  auto const n          = probe.size();
+  auto const m          = static_cast<int>(_num_keys);
+  auto const dispatched = detail::dispatch_signed_integer_probe(probe.type(), [&](auto probe_tag) {
+    using probe_type = decltype(probe_tag);
+    out              = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
+    auto* const outp = out->mutable_view().data<bool>();
+    auto const* d    = probe.data<probe_type>();
+    switch (_key_type.id()) {
+      case cudf::type_id::INT32: {
+        auto const* needles = static_cast<std::int32_t const*>(replica->needles.data());
+        CUCASCADE_CUDA_TRY(cub::DeviceFor::Bulk(
+          n,
+          small_in_list_scan<probe_type, std::int32_t>{d, needles, m, outp, prior_mask_words},
+          stream.value()));
+        break;
+      }
+      case cudf::type_id::INT64: {
+        auto const* needles = static_cast<std::int64_t const*>(replica->needles.data());
+        CUCASCADE_CUDA_TRY(cub::DeviceFor::Bulk(
+          n,
+          small_in_list_scan<probe_type, std::int64_t>{d, needles, m, outp, prior_mask_words},
+          stream.value()));
+        break;
+      }
+      default: out.reset(); break;
     }
-    case cudf::type_id::INT64: {
-      auto const* needles = static_cast<std::int64_t const*>(replica->needles.data());
-      CUCASCADE_CUDA_TRY(cub::DeviceFor::Bulk(
-        n,
-        small_in_list_scan<std::int64_t>{probe.data<std::int64_t>(), needles, m, outp},
-        stream.value()));
-      break;
-    }
-    default: return nullptr;
-  }
+  });
+  if (!dispatched || !out) { return nullptr; }
 
   if (probe.nullable() && probe.null_count() > 0) {
     out->set_null_mask(cudf::copy_bitmask(probe, stream, mr), probe.null_count());
