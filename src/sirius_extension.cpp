@@ -2174,8 +2174,8 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   // Optional params' default values
   req.metric                    = "l2";
   req.k                         = 10;
-  req.use_index           = true;
-  req.n_probes            = 0;
+  req.use_index                 = true;
+  req.n_probes                  = 0;
   std::string schema_name       = "main";
   bool output_columns_specified = false;
   for (auto& kv : input.named_parameters) {

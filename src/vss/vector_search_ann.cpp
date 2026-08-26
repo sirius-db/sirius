@@ -106,8 +106,8 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search_ann(
   auto const& req   = c.req;
   auto const metric = ann_distance_type_from_metric(req.metric);
 
-  const auto* index_entry =
-    c.ctx.get_cuvs_index_cache().find_by_column(req.table_name, req.column_name, metric);
+  auto index_entry = c.ctx.get_cuvs_index_cache().find_by_column(
+    req.catalog, req.schema, req.table_name, req.column_name, metric);
   if (index_entry == nullptr || !index_entry->index) {
     throw duckdb::InvalidInputException(
       "sirius_knn_search: no ANN index for '" + req.table_name + "." + req.column_name +
@@ -117,8 +117,8 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search_ann(
 
   auto const n_lists =
     index_entry->meta.n_lists > 0 ? static_cast<std::uint32_t>(index_entry->meta.n_lists) : 1u;
-  auto const n_probes =
-    req.n_probes > 0 ? std::min<std::uint32_t>(static_cast<std::uint32_t>(req.n_probes), n_lists)
+  std::uint32_t const n_probes =
+    req.n_probes > 0 ? static_cast<std::uint32_t>(std::min<std::int64_t>(req.n_probes, n_lists))
                      : std::min<std::uint32_t>(n_lists, 32u);
 
   auto search = search_ivf_flat_index(

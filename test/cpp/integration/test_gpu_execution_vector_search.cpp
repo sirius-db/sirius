@@ -35,6 +35,7 @@
 
 #include <cstdlib>
 #include <numbers>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -70,13 +71,13 @@ void expect_error(duckdb::Connection& con, const std::string& sql, const std::st
 }  // namespace
 
 TEST_CASE_METHOD(VectorSearchFixture,
-                 "sirius_knn_search - ANN (IVF-Flat) l2sq matches exact top-k",
+                 "sirius_knn_search - ANN (IVF-Flat) l2 matches exact top-k",
                  "[integration][gpu_execution][array][vss][vector_search]")
 {
   run_ok("CREATE TABLE vs_l2 AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec FROM range(5000) t(i);");
   run_ok("CHECKPOINT;");
   run_ok("SELECT * FROM pin_table(name => 'vs_l2', tier => 'gpu', format => 'duckdb');");
-  run_ok("SELECT * FROM sirius_create_ann_index('vs_l2', 'vec', metric => 'l2sq', n_lists => 16);");
+  run_ok("SELECT * FROM sirius_create_ann_index('vs_l2', 'vec', metric => 'l2', n_lists => 16);");
 
   // Exact reference (gpu off) vs. sirius_knn_search (gpu on), id set, several k.
   auto exact_ids = [&](const std::string& q, int k) {
@@ -111,6 +112,115 @@ TEST_CASE_METHOD(VectorSearchFixture,
 }
 
 TEST_CASE_METHOD(VectorSearchFixture,
+                 "sirius_knn_search - ANN underfill drops padding (fused path, k <= 256)",
+                 "[integration][gpu_execution][array][vss][vector_search]")
+{
+  // Many lists over few rows, so a single list holds far fewer than k vectors.
+  // Probing one list then underfills and cuVS pads the k slots. The result must
+  // drop that padding: fewer than k rows, every id real and none repeated. A leaked
+  // fused dummy maps to a list's first row, so it would show up as a repeated id.
+  run_ok("CREATE TABLE vs_uf AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec FROM range(5000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'vs_uf', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM sirius_create_ann_index('vs_uf', 'vec', metric => 'l2', n_lists => 64);");
+
+  constexpr int k = 200;  // <= 256 -> fused block-sort path
+  auto rows       = ok_col(*con,
+                     "SELECT id FROM sirius_knn_search('vs_uf', 'vec', [0.0, 0.0, 0.0]::FLOAT[3], "
+                           "k => " +
+                       std::to_string(k) + ", n_probes => 1, output_columns => ['id']);");
+
+  REQUIRE_FALSE(rows.empty());
+  REQUIRE(static_cast<int>(rows.size()) < k);  // underfill: padding was dropped
+
+  std::set<long long> ids;
+  for (auto const& row : rows) {
+    long long const id = std::stoll(row[0]);
+    REQUIRE(id >= 0);
+    REQUIRE(id < 5000);
+    ids.insert(id);
+  }
+  REQUIRE(ids.size() == rows.size());  // all unique: no repeated dummy id
+
+  run_ok("SELECT * FROM unpin_table('vs_uf');");
+}
+
+TEST_CASE_METHOD(VectorSearchFixture,
+                 "sirius_knn_search - ANN underfill drops padding (k > 256)",
+                 "[integration][gpu_execution][array][vss][vector_search]")
+{
+  // Two lists, probe one, ask for every row: k = n_rows > 256 takes the non-fused
+  // path whose padding id is INT64_MAX. The result must drop it: fewer than k rows,
+  // every id in range (an INT64_MAX would fail the range check).
+  run_ok(
+    "CREATE TABLE vs_uf2 AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec FROM range(5000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'vs_uf2', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM sirius_create_ann_index('vs_uf2', 'vec', metric => 'l2', n_lists => 2);");
+
+  constexpr int k = 5000;  // = n_rows, > 256 -> non-fused path
+  auto rows       = ok_col(*con,
+                     "SELECT id FROM sirius_knn_search('vs_uf2', 'vec', [0.0, 0.0, 0.0]::FLOAT[3], "
+                           "k => " +
+                       std::to_string(k) + ", n_probes => 1, output_columns => ['id']);");
+
+  REQUIRE_FALSE(rows.empty());
+  REQUIRE(static_cast<int>(rows.size()) < k);  // underfill: padding dropped
+
+  for (auto const& row : rows) {
+    long long const id = std::stoll(row[0]);
+    REQUIRE(id >= 0);
+    REQUIRE(id < 5000);
+  }
+
+  run_ok("SELECT * FROM unpin_table('vs_uf2');");
+}
+
+TEST_CASE_METHOD(VectorSearchFixture,
+                 "sirius_knn_search - rebuild after re-pin reflects a new nearest row",
+                 "[integration][gpu_execution][array][vss][vector_search]")
+{
+  // The index is built from the pinned GPU snapshot, so a post-pin INSERT shows up
+  // only after re-pinning and rebuilding. Insert a new nearest neighbor, re-pin,
+  // rebuild, and confirm the search now returns it.
+  run_ok(
+    "CREATE TABLE vs_rb AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec FROM range(1000, 2000) "
+    "t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'vs_rb', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM sirius_create_ann_index('vs_rb', 'vec', metric => 'l2', n_lists => 8);");
+
+  const std::string origin = "[0.0, 0.0, 0.0]::FLOAT[3]";
+  auto search              = [&]() {
+    return ok_col(*con,
+                  "SELECT id FROM sirius_knn_search('vs_rb', 'vec', " + origin +
+                    ", k => 1, output_columns => ['id']);");
+  };
+
+  // Data starts at id 1000, so the nearest to the origin is row 1000.
+  auto before = search();
+  REQUIRE(before.size() == 1);
+  REQUIRE(before[0][0] == "1000");
+
+  // A new row at the origin becomes the true nearest, but is invisible to the index
+  // built from the old pin.
+  run_ok("INSERT INTO vs_rb SELECT 0, [0.0, 0.0, 0.0]::FLOAT[3];");
+  run_ok("CHECKPOINT;");
+
+  // Re-pin to refresh the GPU snapshot, then rebuild the index over it.
+  run_ok("SELECT * FROM unpin_table('vs_rb');");
+  run_ok("SELECT * FROM pin_table(name => 'vs_rb', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM sirius_create_ann_index('vs_rb', 'vec', metric => 'l2', n_lists => 8);");
+
+  // The rebuilt index now returns the new row as nearest.
+  auto after = search();
+  REQUIRE(after.size() == 1);
+  REQUIRE(after[0][0] == "0");
+
+  run_ok("SELECT * FROM unpin_table('vs_rb');");
+}
+
+TEST_CASE_METHOD(VectorSearchFixture,
                  "sirius_knn_search - explicit n_probes and distance column",
                  "[integration][gpu_execution][array][vss][vector_search]")
 {
@@ -119,7 +229,7 @@ TEST_CASE_METHOD(VectorSearchFixture,
   run_ok("CHECKPOINT;");
   run_ok("SELECT * FROM pin_table(name => 'vs_probe', tier => 'gpu', format => 'duckdb');");
   run_ok(
-    "SELECT * FROM sirius_create_ann_index('vs_probe', 'vec', metric => 'l2sq', n_lists => 16);");
+    "SELECT * FROM sirius_create_ann_index('vs_probe', 'vec', metric => 'l2', n_lists => 16);");
 
   const std::string origin = "[0.0, 0.0, 0.0]::FLOAT[3]";
 
@@ -217,7 +327,7 @@ TEST_CASE_METHOD(VectorSearchFixture,
   // Baseline: naming only pinned columns works, so the pin itself is searchable.
   {
     auto r = con->Query("SELECT id FROM sirius_knn_search('vs_subset', 'vec', " + origin +
-                        ", k => 5, output_columns => ['id']);");
+                        ", k => 5, output_columns => ['id'], use_index => false);");
     REQUIRE(r);
     if (r->HasError()) { UNSCOPED_INFO("explicit output_columns error: " << r->GetError()); }
     REQUIRE_FALSE(r->HasError());
@@ -227,8 +337,8 @@ TEST_CASE_METHOD(VectorSearchFixture,
   // Same query with output_columns omitted: the default expands to the pinned
   // columns [id, vec] (not the catalog-wide [id, vec, payload]), so it succeeds.
   {
-    auto r =
-      con->Query("SELECT * FROM sirius_knn_search('vs_subset', 'vec', " + origin + ", k => 5);");
+    auto r = con->Query("SELECT * FROM sirius_knn_search('vs_subset', 'vec', " + origin +
+                        ", k => 5, use_index => false);");
     REQUIRE(r);
     if (r->HasError()) { UNSCOPED_INFO("default output_columns error: " << r->GetError()); }
     REQUIRE_FALSE(r->HasError());
@@ -620,7 +730,7 @@ TEST_CASE_METHOD(VectorSearchFixture,
   run_ok("CHECKPOINT;");
   run_ok("SELECT * FROM pin_table(name => 'vs_schema', tier => 'gpu', format => 'duckdb');");
   run_ok(
-    "SELECT * FROM sirius_create_ann_index('vs_schema', 'vec', metric => 'l2sq', n_lists => 4);");
+    "SELECT * FROM sirius_create_ann_index('vs_schema', 'vec', metric => 'l2', n_lists => 4);");
 
   const std::string origin = "[0.0, 0.0, 0.0]::FLOAT[3]";
 
@@ -672,6 +782,9 @@ TEST_CASE_METHOD(VectorSearchFixture,
 
   SECTION("bind errors (raised before execution)")
   {
+    // Search requires a GPU-pinned table, checked first at bind; pin so the
+    // remaining bind validations below are reached.
+    run_ok("SELECT * FROM pin_table(name => 'vs_err', tier => 'gpu', format => 'duckdb');");
     // Dimensionality mismatch: query is FLOAT[2] but the column is FLOAT[3].
     expect_error(*con,
                  "SELECT * FROM sirius_knn_search('vs_err', 'vec', [0.0, 0.0]::FLOAT[2], "
@@ -702,6 +815,7 @@ TEST_CASE_METHOD(VectorSearchFixture,
                  "SELECT * FROM sirius_knn_search('vs_err', 'vec', " + origin +
                    ", output_columns => ['id'], metric => 'bogus');",
                  "metric must be");
+    run_ok("SELECT * FROM unpin_table('vs_err');");
   }
 
   SECTION("execution errors")
@@ -757,7 +871,7 @@ TEST_CASE_METHOD(VectorSearchFixture,
     auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
     REQUIRE(sirius_ctx != nullptr);
     auto const& mgr   = sirius_ctx->get_scan_manager();
-    const auto* entry = mgr.find_pinned_entry("vs_mc");
+    const auto* entry = mgr.find_pinned_entry_for_duckdb_table(attach_alias, "main", "vs_mc");
     REQUIRE(entry != nullptr);
     auto it = entry->data_batches_by_column.find("vec");
     REQUIRE(it != entry->data_batches_by_column.end());
@@ -765,7 +879,7 @@ TEST_CASE_METHOD(VectorSearchFixture,
     REQUIRE(it->second.size() > 1);
   }
 
-  run_ok("SELECT * FROM sirius_create_ann_index('vs_mc', 'vec', metric => 'l2sq', n_lists => 16);");
+  run_ok("SELECT * FROM sirius_create_ann_index('vs_mc', 'vec', metric => 'l2', n_lists => 16);");
 
   const std::string origin = "[0.0, 0.0, 0.0]::FLOAT[3]";
   auto exact_ids           = [&](int k) {
@@ -853,7 +967,7 @@ TEST_CASE_METHOD(VectorSearchFixture,
   {
     run_ok("SELECT * FROM pin_table(name => 'idx_err', tier => 'gpu', format => 'duckdb');");
     // default_ivf_n_lists chooses the list count; the build must succeed.
-    run_ok("SELECT * FROM sirius_create_ann_index('idx_err', 'vec', metric => 'l2sq');");
+    run_ok("SELECT * FROM sirius_create_ann_index('idx_err', 'vec', metric => 'l2');");
 
     // n_probes large enough to probe every default list -> exact top-k.
     con->Query("SET gpu_execution = false;");
@@ -869,4 +983,3 @@ TEST_CASE_METHOD(VectorSearchFixture,
     run_ok("SELECT * FROM unpin_table('idx_err');");
   }
 }
-
