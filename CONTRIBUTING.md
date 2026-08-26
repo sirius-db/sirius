@@ -101,6 +101,64 @@ The component teams can also be mentioned directly in PR comments and issues to 
 
 When you open or update a PR, you will also be automatically assigned as the author. This helps maintainers track ownership and is not a request for you to review your own work.
 
+### PR branching strategy
+
+Sirius uses ***Self-contained*** PRs submitted from contributor forks as our **primary** method of
+contributing to Sirius. There are two approved exceptions, both restricted to [Maintainers](MAINTAINERS.md):
+Stacked PRs as a **secondary** contribution method, and **break-glass** CI & Critical changes.
+
+| PR Type | PR Author | Push To | Reasoning |
+| --- | --- | --- | --- |
+| ***Primary*** - Self-contained | Any Contributor | Personal fork | This allows all contributors to submit PRs from their forks, keeping the main repo focused on development, releases, and Stacked PRs |
+| ***Secondary*** - Stacked PRs (dependent changes)  | Only Maintainers | `sirius-db/sirius` repo  with `stacked/` prefix for branch names | Stacked PRs help developers contribute larger changes to the code base in smaller pieces that are easier to review and have fewer conflicts compared to a single large PR. See [Stacked PRs](#stacked-prs) below for more information |
+| ***Break-glass*** - CI & Critical | Only Maintainers | `sirius-db/sirius` repo | By exception there may be CI and Critical PRs that must be pushed to this repo if there are CI tests or other triggers necessary before merging; examples: `workflow_dispatch` and certain workflows using secrets and tokens not available in forks |
+
+**NOTE:** Branches of PRs pushed to the main repo and personal forks are cleaned up automatically; this
+repo has "Automatically delete head branches" enabled, so merged branches don't need manual deletion.
+
+### Stacked PRs
+
+:warning: Stacked PRs require push permissions to the `sirius-db/sirius` repo in order to work. Currently
+this development option is restricted to [Maintainers](MAINTAINERS.md). If you are interested in becoming a
+maintainer, see [GOVERNANCE.md](GOVERNANCE.md#becoming-a-maintainer) for details.
+
+For a chain of dependent changes, Sirius uses the [`gh-stack`](https://github.com/github/gh-stack)
+`gh` CLI extension — it's the only supported tool for stacked PRs. Don't use Graphite,
+`git-spice`, `ghstack`, or similar; a mix of tools operating on the same branches will conflict.
+
+#### Install it once
+
+If needed, follow these [instructions](https://cli.github.com/) to install GitHub CLI.
+```bash
+# Install Stacked PRs extension
+gh extension install github/gh-stack
+```
+
+#### Conventions
+
+- Every branch in a stack must be prefixed `stacked/` (e.g. `stacked/docs-contributing-gh-stacks`)
+  so stacked work is identifiable and groupable, separate from regular single-branch PRs.
+- `stacked/`-prefixed branches may be pushed directly to `origin` (this repo)
+  - If you are working on a local copy that is your fork, you will need to ensure `origin` points
+    to this repo and not your fork.
+  - Run the following command replacing `$USER` with your name; otherwise it will use your local username:
+      ```bash
+      # Rename current origin to local user's name and set origin to main Sirius repo
+      git remote rename origin $USER
+      git remote add origin "git@github.com:sirius-db/sirius.git"
+      ```
+
+#### Basic commands
+
+See `gh stack --help` for the full set:
+
+```bash
+gh stack init stacked/<branch1> stacked/<branch2> ...   # create a new stack
+gh stack add stacked/<branch>                           # add a branch on top of the current stack
+gh stack submit                                         # push all branches and create/update PRs
+gh stack sync                                           # rebase and sync the stack with GitHub
+```
+
 ### Commit and title convention
 
 Sirius squash-merges PRs, the PR titles become the commit message on merge. Commits and PR titles follow [Conventional Commits](https://www.conventionalcommits.org/) format for readability.
