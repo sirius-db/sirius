@@ -15,12 +15,16 @@
  */
 
 // sirius
+#include <duckdb/common/types/interval.hpp>
 #include <duckdb/common/types/value.hpp>
+#include <duckdb/planner/expression/bound_cast_expression.hpp>
 #include <duckdb/planner/expression/bound_comparison_expression.hpp>
 #include <duckdb/planner/expression/bound_conjunction_expression.hpp>
+#include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/filter/conjunction_filter.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
+#include <duckdb/planner/filter/expression_filter.hpp>
 #include <duckdb/planner/filter/in_filter.hpp>
 #include <expression/ast/constant_range.hpp>
 #include <expression/ast/from_duckdb.hpp>
@@ -122,6 +126,47 @@ int128 pow10_128(int e)
   return r;
 }
 
+struct timestamp_ticks {
+  std::int64_t ticks;
+  std::int64_t ticks_per_day;
+};
+
+/// @p value's ticks and day length, for timestamp flavors whose day boundary
+/// is session-independent and whose instant is finite. Refusals are what keep
+/// the day mapping below sound: TIMESTAMP_TZ's midnight moves with the session
+/// time zone, and DuckDB maps DATE ±infinity onto TIMESTAMP ±infinity directly
+/// rather than through day arithmetic, off the linear mapping entirely.
+std::optional<timestamp_ticks> finite_timestamp_ticks(duckdb::Value const& value)
+{
+  std::int64_t ticks;
+  std::int64_t per_day;
+  switch (value.type().id()) {
+    case duckdb::LogicalTypeId::TIMESTAMP:
+      ticks   = duckdb::TimestampValue::Get(value).value;
+      per_day = duckdb::Interval::MICROS_PER_DAY;
+      break;
+    case duckdb::LogicalTypeId::TIMESTAMP_SEC:
+      ticks   = duckdb::TimestampSValue::Get(value).value;
+      per_day = duckdb::Interval::SECS_PER_DAY;
+      break;
+    case duckdb::LogicalTypeId::TIMESTAMP_MS:
+      ticks = duckdb::TimestampMSValue::Get(value).value;
+      per_day =
+        static_cast<std::int64_t>(duckdb::Interval::SECS_PER_DAY) * duckdb::Interval::MSECS_PER_SEC;
+      break;
+    case duckdb::LogicalTypeId::TIMESTAMP_NS:
+      ticks   = duckdb::TimestampNSValue::Get(value).value;
+      per_day = duckdb::Interval::NANOS_PER_DAY;
+      break;
+    default: return std::nullopt;  // TIMESTAMP_TZ and non-timestamp types
+  }
+  if (ticks == std::numeric_limits<std::int64_t>::max() ||
+      ticks == -std::numeric_limits<std::int64_t>::max()) {
+    return std::nullopt;  // ±infinity
+  }
+  return timestamp_ticks{ticks, per_day};
+}
+
 /// The constant a conjunct compares against, lowered into the DECODED integer
 /// domain of a column of @p col_type: DATE → stored day count, DECIMAL →
 /// unscaled integer at the COLUMN's scale, integers as-is.
@@ -143,9 +188,29 @@ std::optional<sirius::numeric_range> to_decoded_bound(duckdb::Value const& value
   // DATE decodes to its stored day count, which is not a numeric literal domain
   // constant_numeric_range covers.
   if (col_type.id() == sirius::type_id::DATE) {
-    if (value.type().id() != duckdb::LogicalTypeId::DATE) { return std::nullopt; }
-    auto const days = static_cast<int128>(duckdb::DateValue::Get(value).days);
-    return sirius::numeric_range{sirius::numeric_range_domain::SIGNED_INTEGER, days, days, 0};
+    if (value.type().id() == duckdb::LogicalTypeId::DATE) {
+      auto const days = static_cast<int128>(duckdb::DateValue::Get(value).days);
+      return sirius::numeric_range{sirius::numeric_range_domain::SIGNED_INTEGER, days, days, 0};
+    }
+    // A timestamp constant against a DATE column: DuckDB constant-folds
+    // qgen-style date arithmetic (`d <= DATE '1998-12-01' - INTERVAL '72'
+    // DAY`) into `CAST(d AS TIMESTAMP) <= TIMESTAMP '1998-09-20 00:00:00'`.
+    // CAST maps day d to d * ticks_per_day (midnight), strictly monotonic in
+    // d, so the constant lowers to the rational ticks / ticks_per_day —
+    // floor/ceil exactly like a finer-scale decimal. Midnight lands on an
+    // integer (floor == ceil); any other instant falls strictly between two
+    // days, which is what makes the resulting bound exact for every
+    // comparison op rather than merely sound.
+    if (auto const ts = finite_timestamp_ticks(value)) {
+      auto const per_day = static_cast<int128>(ts->ticks_per_day);
+      auto const t       = static_cast<int128>(ts->ticks);
+      int128 quotient    = t / per_day;
+      int128 const rem   = t % per_day;
+      if (rem != 0 && t < 0) { quotient -= 1; }  // truncation → floor
+      return sirius::numeric_range{
+        sirius::numeric_range_domain::SIGNED_INTEGER, quotient, quotient + (rem != 0 ? 1 : 0), 0};
+    }
+    return std::nullopt;
   }
 
   if (!col_type.is_decimal() && !col_type.is_integer()) { return std::nullopt; }
@@ -213,6 +278,107 @@ sirius::numeric_range full_decoded_domain()
                                       std::numeric_limits<std::int64_t>::max());
 }
 
+/// Intersect one already-lowered @p bound into @p acc. Shared by the
+/// ConstantFilter and EXPRESSION_FILTER paths. False (clearing
+/// @p fully_covered) for comparison types that do not describe a range.
+bool fold_comparison_bound(duckdb::ExpressionType comparison,
+                           sirius::numeric_range const& bound,
+                           sirius::numeric_range& acc,
+                           bool& fully_covered)
+{
+  switch (comparison) {
+    case duckdb::ExpressionType::COMPARE_EQUAL:
+      // Non-integral constant ⇒ ceil > floor ⇒ lo > hi: provably empty.
+      acc.minimum = std::max(acc.minimum, bound.maximum);
+      acc.maximum = std::min(acc.maximum, bound.minimum);
+      return true;
+    case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+      acc.minimum = std::max(acc.minimum, bound.maximum);
+      return true;
+    case duckdb::ExpressionType::COMPARE_GREATERTHAN:
+      acc.minimum = std::max(acc.minimum, bound.minimum + 1);
+      return true;
+    case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
+      acc.maximum = std::min(acc.maximum, bound.minimum);
+      return true;
+    case duckdb::ExpressionType::COMPARE_LESSTHAN:
+      acc.maximum = std::min(acc.maximum, bound.maximum - 1);
+      return true;
+    default:  // <>, IS DISTINCT FROM, ... — not a range
+      fully_covered = false;
+      return false;
+  }
+}
+
+/// Fold an EXPRESSION_FILTER conjunct into @p acc. The only recognized
+/// restricting shape is `CAST(<column> AS TIMESTAMP[_S|_MS|_NS]) CMP
+/// <timestamp constant>`, either operand order, on a DATE column (see
+/// to_decoded_bound). AND conjunctions recurse; every other shape clears
+/// @p fully_covered.
+bool fold_expression_conjunct(duckdb::Expression const& expr,
+                              sirius::logical_type const& col_type,
+                              sirius::numeric_range& acc,
+                              bool& fully_covered)
+{
+  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONJUNCTION &&
+      expr.type == duckdb::ExpressionType::CONJUNCTION_AND) {
+    auto const& conjunction = expr.Cast<duckdb::BoundConjunctionExpression>();
+    bool any_bound          = false;
+    for (auto const& child : conjunction.children) {
+      any_bound |= fold_expression_conjunct(*child, col_type, acc, fully_covered);
+    }
+    return any_bound;
+  }
+  if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_COMPARISON) {
+    fully_covered = false;
+    return false;
+  }
+  auto const& cmp = expr.Cast<duckdb::BoundComparisonExpression>();
+  auto comparison = cmp.type;
+  switch (comparison) {
+    case duckdb::ExpressionType::COMPARE_EQUAL:
+    case duckdb::ExpressionType::COMPARE_LESSTHAN:
+    case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
+    case duckdb::ExpressionType::COMPARE_GREATERTHAN:
+    case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO: break;
+    default: fully_covered = false; return false;
+  }
+  auto const* cast_side  = cmp.left.get();
+  auto const* value_side = cmp.right.get();
+  if (cast_side->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CAST) {
+    std::swap(cast_side, value_side);  // constant-on-the-left: swap operands ⇒ flip
+    comparison = duckdb::FlipComparisonExpression(comparison);
+  }
+  if (cast_side->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CAST ||
+      value_side->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
+    fully_covered = false;
+    return false;
+  }
+  auto const& cast = cast_side->Cast<duckdb::BoundCastExpression>();
+  // TRY_CAST yields NULL where plain CAST errors, for dates whose midnight
+  // overflows the timestamp domain — a >-side range would wrongly keep them.
+  if (cast.try_cast) {
+    fully_covered = false;
+    return false;
+  }
+  // The BOUND_REF is the filter's placeholder for the filtered column, so its
+  // type must be the column's; only DATE → TIMESTAMP* lowers.
+  if (col_type.id() != sirius::type_id::DATE || !cast.child ||
+      cast.child->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF ||
+      cast.child->return_type.id() != duckdb::LogicalTypeId::DATE ||
+      cast.return_type != value_side->return_type) {
+    fully_covered = false;
+    return false;
+  }
+  auto const& constant = value_side->Cast<duckdb::BoundConstantExpression>().value;
+  auto const bound     = to_decoded_bound(constant, col_type);
+  if (!bound.has_value()) {
+    fully_covered = false;
+    return false;
+  }
+  return fold_comparison_bound(comparison, *bound, acc, fully_covered);
+}
+
 /// Fold @p filter into @p acc, returning true iff at least one bound was
 /// contributed. @p fully_covered is cleared whenever some restricting part of
 /// the filter could NOT be expressed in the range — the resulting range is then
@@ -238,28 +404,15 @@ bool fold_numeric_conjunct(duckdb::TableFilter const& filter,
         fully_covered = false;
         return false;
       }
-      switch (cmp.comparison_type) {
-        case duckdb::ExpressionType::COMPARE_EQUAL:
-          // Non-integral constant ⇒ ceil > floor ⇒ lo > hi: provably empty.
-          acc.minimum = std::max(acc.minimum, bound->maximum);
-          acc.maximum = std::min(acc.maximum, bound->minimum);
-          return true;
-        case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO:
-          acc.minimum = std::max(acc.minimum, bound->maximum);
-          return true;
-        case duckdb::ExpressionType::COMPARE_GREATERTHAN:
-          acc.minimum = std::max(acc.minimum, bound->minimum + 1);
-          return true;
-        case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
-          acc.maximum = std::min(acc.maximum, bound->minimum);
-          return true;
-        case duckdb::ExpressionType::COMPARE_LESSTHAN:
-          acc.maximum = std::min(acc.maximum, bound->maximum - 1);
-          return true;
-        default:  // <>, IS DISTINCT FROM, ... — not a range
-          fully_covered = false;
-          return false;
+      return fold_comparison_bound(cmp.comparison_type, *bound, acc, fully_covered);
+    }
+    case duckdb::TableFilterType::EXPRESSION_FILTER: {
+      auto const& expression_filter = filter.Cast<duckdb::ExpressionFilter>();
+      if (!expression_filter.expr) {
+        fully_covered = false;
+        return false;
       }
+      return fold_expression_conjunct(*expression_filter.expr, col_type, acc, fully_covered);
     }
     case duckdb::TableFilterType::CONJUNCTION_AND: {
       auto const& conjunction = filter.Cast<duckdb::ConjunctionAndFilter>();
