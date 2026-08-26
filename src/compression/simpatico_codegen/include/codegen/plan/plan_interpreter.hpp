@@ -125,6 +125,12 @@ struct decode_selection {
   /// the survivor index list (@c full), and are refused rather than silently
   /// decoded full width — the same footing the index walk was introduced on.
   sirius::codegen::chunk_row_set const* rows = nullptr;
+  /// The caller compacts the column's stripped validity itself, against this
+  /// same selection. Off by default, which refuses a nullable column outright:
+  /// the stored bitmask spans the whole chunk and a compacted output does not,
+  /// so anything that returns one against the other silently misaligns validity
+  /// with values.
+  bool caller_reattaches_validity = false;
 
   [[nodiscard]] bool active() const noexcept
   {

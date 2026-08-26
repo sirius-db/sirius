@@ -1304,7 +1304,7 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
   // every row of the chunk. Returning it verbatim would misalign validity with
   // values, so a nullable column is refused here; a caller that wants both
   // reattaches the mask itself against the same selection it passed in.
-  if (selecting && !tree.validity.empty()) {
+  if (selecting && !tree.validity.empty() && !sel->caller_reattaches_validity) {
     if (error_out) {
       *error_out = "decompress: selection on a null-masked column is not supported";
     }
@@ -1444,9 +1444,10 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
     cudaStreamSynchronize(stream.value());
   }
   // Reattach the validity the compress side detached. The walk decodes a
-  // null-free column, so this is the only place the mask re-enters the picture;
-  // a selecting decode was refused above and reaches here only when all-valid.
-  if (col) { attach_validity(*col, tree.validity, stream, mr); }
+  // null-free column, so this is the only place the mask re-enters the picture.
+  // A selecting decode is either all-valid or served an opting-in caller, which
+  // compacts the sidecar itself against the selection it supplied.
+  if (col && !selecting) { attach_validity(*col, tree.validity, stream, mr); }
   return col;
 }
 
