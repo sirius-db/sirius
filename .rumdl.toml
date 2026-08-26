@@ -3,4 +3,4 @@
 # without forcing an unrelated repo-wide Markdown rewrite.
 enable = ["MD051", "MD057"]
 # Illustrative example with links to non-existent files by design.
-exclude = [".claude/skills/PR_digest/references/example_digest.md"]
+exclude = [".claude/skills/pr-digest/references/example_digest.md"]

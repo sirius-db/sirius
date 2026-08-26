@@ -1,5 +1,5 @@
 ---
-name: PR_digest
+name: pr-digest
 description: Generates a "learning" PR-review digest — a markdown file at PR_digests/PR_digest_<N>.md that explains what a GitHub PR does, why, and exactly where in the code, with clickable file/line links and trimmed diffs. Use this whenever the user shares a GitHub PR URL (e.g. github.com/owner/repo/pull/1234) and wants to understand, summarize, review, walk through, or get up to speed on what changed — phrases like "can you review this PR", "what does this PR do", "help me understand this pull request", "summarize the changes in PR #1234", or simply pasting a PR link and asking about it. This explains what changed, why, and where — it deliberately does not hunt for bugs or critique the code, which is a separate concern handled by other review skills; still reach for this skill first even when the user's ultimate goal is a fuller review, since it builds the map that a deeper review needs anyway.
 ---
 
